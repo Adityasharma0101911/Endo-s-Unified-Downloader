@@ -40,6 +40,14 @@ struct Args {
     /// Proxy server URL (e.g. "http://127.0.0.1:8080" or "socks5://127.0.0.1:1080")
     #[arg(long = "proxy")]
     proxy: Option<String>,
+
+    /// Media quality preset: "best", "1080p", "720p", "mp3", "m4a"
+    #[arg(long = "media-preset")]
+    media_preset: Option<String>,
+
+    /// Extract cookies from browser: "chrome", "edge", "firefox", "brave", "opera", "vivaldi"
+    #[arg(long = "cookies-from-browser")]
+    cookies_from_browser: Option<String>,
 }
 
 #[tokio::main]
@@ -209,6 +217,9 @@ async fn run_cli_download(args: Args) -> Result<(), Box<dyn std::error::Error>> 
         parsed_urls.push(url);
     }
 
+    let media_preset = parse_media_preset(args.media_preset.as_deref());
+    let browser_cookies = parse_browser_cookie(args.cookies_from_browser.as_deref());
+
     let options = DownloadOptions {
         num_connections: args.connections,
         base_chunk_size: args.chunk_size_mb * 1024 * 1024,
@@ -218,6 +229,8 @@ async fn run_cli_download(args: Args) -> Result<(), Box<dyn std::error::Error>> 
         cookies_path: args.load_cookies,
         auth_header: args.header,
         proxy: args.proxy,
+        media_preset,
+        browser_cookies,
     };
 
     let engine = DownloadEngine::new(parsed_urls, options);
@@ -226,6 +239,29 @@ async fn run_cli_download(args: Args) -> Result<(), Box<dyn std::error::Error>> 
 
     execute_download(engine).await;
     Ok(())
+}
+
+fn parse_media_preset(preset: Option<&str>) -> Option<hyperfetch_core::media::MediaQualityPreset> {
+    match preset?.to_ascii_lowercase().as_str() {
+        "best" => Some(hyperfetch_core::media::MediaQualityPreset::BestVideoAudio),
+        "1080p" | "1080" | "fhd" => Some(hyperfetch_core::media::MediaQualityPreset::Fhd1080p),
+        "720p" | "720" | "hd" => Some(hyperfetch_core::media::MediaQualityPreset::Hd720p),
+        "mp3" => Some(hyperfetch_core::media::MediaQualityPreset::AudioMp3),
+        "m4a" | "aac" => Some(hyperfetch_core::media::MediaQualityPreset::AudioM4a),
+        custom => Some(hyperfetch_core::media::MediaQualityPreset::Custom(custom.to_string())),
+    }
+}
+
+fn parse_browser_cookie(browser: Option<&str>) -> Option<hyperfetch_core::media::BrowserCookieSource> {
+    match browser?.to_ascii_lowercase().as_str() {
+        "chrome" => Some(hyperfetch_core::media::BrowserCookieSource::Chrome),
+        "edge" => Some(hyperfetch_core::media::BrowserCookieSource::Edge),
+        "firefox" => Some(hyperfetch_core::media::BrowserCookieSource::Firefox),
+        "brave" => Some(hyperfetch_core::media::BrowserCookieSource::Brave),
+        "opera" => Some(hyperfetch_core::media::BrowserCookieSource::Opera),
+        "vivaldi" => Some(hyperfetch_core::media::BrowserCookieSource::Vivaldi),
+        _ => None,
+    }
 }
 
 async fn execute_download(engine: DownloadEngine) {

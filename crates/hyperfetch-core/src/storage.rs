@@ -251,6 +251,13 @@ impl DiskWriter {
         }
     }
 
+    /// Standalone verification of an existing file on disk against expected checksum
+    pub fn verify_file_checksum(path: &std::path::Path, expected: &str) -> Result<bool, String> {
+        let meta = std::fs::metadata(path).map_err(|e| format!("Failed to read file metadata: {}", e))?;
+        let writer = DiskWriter::open_or_create(path, meta.len()).map_err(|e| e.to_string())?;
+        writer.verify_checksum(expected)
+    }
+
     /// Verifies a chunk against an expected hash.
     pub fn verify_chunk(&self, range: &ByteRange, expected_hash: &[u8; 32]) -> Result<bool, StorageError> {
         let actual = self.compute_chunk_hash(range)?;

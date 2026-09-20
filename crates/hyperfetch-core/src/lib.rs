@@ -10,6 +10,7 @@ pub mod hls;
 pub mod metalink;
 pub mod torrent;
 pub mod queue;
+pub mod media;
 
 pub use range::{ByteRange, RangeError};
 pub use chunk::{Chunk, ChunkManager, ChunkStatus, ChunkError};
@@ -22,4 +23,8 @@ pub use hls::{HlsEngine, HlsSegment, HlsError, parse_hls_playlist};
 pub use metalink::{parse_metalink, MetalinkFile};
 pub use torrent::{parse_magnet_uri, parse_torrent_bytes, is_magnet_uri, MagnetInfo, TorrentInfo};
 pub use queue::{DownloadQueue, QueueItem, QueueItemStatus};
+pub use media::{
+    MediaQualityPreset, BrowserCookieSource, MediaDownloadOptions,
+    is_supported_media_site, download_media, find_ytdlp_path, find_js_runtime, find_ffmpeg_path,
+};
 

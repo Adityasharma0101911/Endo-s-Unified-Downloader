@@ -41,6 +41,8 @@ struct DownloaderApp {
     cookies_path_input: String,
     proxy_input: String,
     auth_header_input: String,
+    media_preset_idx: usize,
+    browser_cookies_idx: usize,
 
     // Tabs & Batch Queue
     active_tab: GuiTab,
@@ -104,6 +106,8 @@ impl DownloaderApp {
             cookies_path_input: String::new(),
             proxy_input: String::new(),
             auth_header_input: String::new(),
+            media_preset_idx: 0,
+            browser_cookies_idx: 0,
 
             active_tab: GuiTab::Downloader,
             queue: hyperfetch_core::queue::DownloadQueue::new(),
@@ -219,6 +223,8 @@ impl DownloaderApp {
         let cookies_opt = self.cookies_path_input.trim().to_string();
         let proxy_opt = self.proxy_input.trim().to_string();
         let auth_opt = self.auth_header_input.trim().to_string();
+        let media_preset_idx = self.media_preset_idx;
+        let browser_cookies_idx = self.browser_cookies_idx;
 
         let (async_snapshot_tx, mut async_snapshot_rx) = broadcast::channel::<EngineSnapshot>(128);
 
@@ -243,6 +249,25 @@ impl DownloaderApp {
 
         // Spawn engine download task
         self.tokio_rt.spawn(async move {
+            let media_preset = match media_preset_idx {
+                0 => Some(hyperfetch_core::media::MediaQualityPreset::BestVideoAudio),
+                1 => Some(hyperfetch_core::media::MediaQualityPreset::Fhd1080p),
+                2 => Some(hyperfetch_core::media::MediaQualityPreset::Hd720p),
+                3 => Some(hyperfetch_core::media::MediaQualityPreset::AudioMp3),
+                4 => Some(hyperfetch_core::media::MediaQualityPreset::AudioM4a),
+                _ => Some(hyperfetch_core::media::MediaQualityPreset::BestVideoAudio),
+            };
+
+            let browser_cookies = match browser_cookies_idx {
+                1 => Some(hyperfetch_core::media::BrowserCookieSource::Chrome),
+                2 => Some(hyperfetch_core::media::BrowserCookieSource::Edge),
+                3 => Some(hyperfetch_core::media::BrowserCookieSource::Firefox),
+                4 => Some(hyperfetch_core::media::BrowserCookieSource::Brave),
+                5 => Some(hyperfetch_core::media::BrowserCookieSource::Opera),
+                6 => Some(hyperfetch_core::media::BrowserCookieSource::Vivaldi),
+                _ => None,
+            };
+
             let options = DownloadOptions {
                 num_connections: connections,
                 base_chunk_size: 4 * 1024 * 1024,
@@ -252,6 +277,8 @@ impl DownloaderApp {
                 cookies_path: if cookies_opt.is_empty() { None } else { Some(PathBuf::from(cookies_opt)) },
                 proxy: if proxy_opt.is_empty() { None } else { Some(proxy_opt) },
                 auth_header: if auth_opt.is_empty() { None } else { Some(auth_opt) },
+                media_preset,
+                browser_cookies,
             };
 
             let engine = DownloadEngine::new(urls, options);
@@ -666,6 +693,52 @@ fn render_downloader_tab(app: &mut DownloaderApp, ui: &mut egui::Ui) {
                         egui::TextEdit::singleline(&mut app.auth_header_input)
                             .hint_text("Optional: Bearer <token>"),
                     );
+                });
+
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Media Quality:").size(12.0));
+                    egui::ComboBox::from_id_salt("media_preset_combo")
+                        .selected_text(match app.media_preset_idx {
+                            0 => "Best Available (Merged MP4)",
+                            1 => "1080p FHD (Merged MP4)",
+                            2 => "720p HD (Merged MP4)",
+                            3 => "Audio Only (MP3)",
+                            4 => "Audio Only (M4A)",
+                            _ => "Best Available",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut app.media_preset_idx, 0, "Best Available (Merged MP4)");
+                            ui.selectable_value(&mut app.media_preset_idx, 1, "1080p FHD (Merged MP4)");
+                            ui.selectable_value(&mut app.media_preset_idx, 2, "720p HD (Merged MP4)");
+                            ui.selectable_value(&mut app.media_preset_idx, 3, "Audio Only (MP3)");
+                            ui.selectable_value(&mut app.media_preset_idx, 4, "Audio Only (M4A)");
+                        });
+                });
+
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Browser Cookies:").size(12.0));
+                    egui::ComboBox::from_id_salt("browser_cookies_combo")
+                        .selected_text(match app.browser_cookies_idx {
+                            0 => "None",
+                            1 => "Google Chrome",
+                            2 => "Microsoft Edge",
+                            3 => "Mozilla Firefox",
+                            4 => "Brave Browser",
+                            5 => "Opera",
+                            6 => "Vivaldi",
+                            _ => "None",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut app.browser_cookies_idx, 0, "None");
+                            ui.selectable_value(&mut app.browser_cookies_idx, 1, "Google Chrome");
+                            ui.selectable_value(&mut app.browser_cookies_idx, 2, "Microsoft Edge");
+                            ui.selectable_value(&mut app.browser_cookies_idx, 3, "Mozilla Firefox");
+                            ui.selectable_value(&mut app.browser_cookies_idx, 4, "Brave Browser");
+                            ui.selectable_value(&mut app.browser_cookies_idx, 5, "Opera");
+                            ui.selectable_value(&mut app.browser_cookies_idx, 6, "Vivaldi");
+                        });
                 });
             }
         });

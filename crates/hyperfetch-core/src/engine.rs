@@ -37,6 +37,8 @@ pub struct DownloadOptions {
     pub cookies_path: Option<PathBuf>,
     pub auth_header: Option<String>,
     pub proxy: Option<String>,
+    pub media_preset: Option<crate::media::MediaQualityPreset>,
+    pub browser_cookies: Option<crate::media::BrowserCookieSource>,
 }
 
 impl Default for DownloadOptions {
@@ -50,6 +52,8 @@ impl Default for DownloadOptions {
             cookies_path: None,
             auth_header: None,
             proxy: None,
+            media_preset: None,
+            browser_cookies: None,
         }
     }
 }
@@ -186,6 +190,99 @@ impl DownloadEngine {
         &self,
         snapshot_tx: Option<broadcast::Sender<EngineSnapshot>>,
     ) -> Result<PathBuf, String> {
+        // Check if any URL is a supported media site (YouTube, Twitch, TikTok, etc.) or media preset requested
+        if let Some(media_url) = self.urls.iter().find(|u| crate::media::is_supported_media_site(u)).or_else(|| {
+            if self.options.media_preset.is_some() {
+                self.urls.first()
+            } else {
+                None
+            }
+        }) {
+            tracing::info!("Routing download to Media Engine: {}", media_url);
+            let (prog_tx, mut prog_rx) = tokio::sync::mpsc::channel::<crate::media::ProgressUpdate>(64);
+            let snapshot_tx_clone = snapshot_tx.clone();
+
+            // Forward progress updates to snapshot_tx
+            let forwarder = tokio::spawn(async move {
+                while let Some(update) = prog_rx.recv().await {
+                    if let Some(ref tx) = snapshot_tx_clone {
+                        let ratio = if update.total > 0 {
+                            (update.downloaded as f64 / update.total as f64).clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                        let _ = tx.send(EngineSnapshot {
+                            total_bytes: update.total,
+                            downloaded_bytes: update.downloaded,
+                            speed_bytes_per_sec: update.speed,
+                            progress_ratio: ratio,
+                            active_workers: update.active_connections,
+                            mirror_speeds: vec![],
+                            chunks: vec![],
+                            target_path: None,
+                        });
+                    }
+                }
+            });
+
+            let output_dir = match &self.options.output_path {
+                Some(p) if p.is_dir() => p.clone(),
+                Some(p) => p.parent().unwrap_or(std::path::Path::new(".")).to_path_buf(),
+                None => PathBuf::from("."),
+            };
+
+            let output_filename = match &self.options.output_path {
+                Some(p) if !p.is_dir() => p.file_name().map(|n| n.to_string_lossy().to_string()),
+                _ => None,
+            };
+
+            let cookie_source = if let Some(ref bc) = self.options.browser_cookies {
+                bc.clone()
+            } else if let Some(ref cp) = self.options.cookies_path {
+                crate::media::BrowserCookieSource::File(cp.clone())
+            } else {
+                crate::media::BrowserCookieSource::None
+            };
+
+            let media_opts = crate::media::MediaDownloadOptions {
+                preset: self.options.media_preset.clone().unwrap_or_default(),
+                cookies: cookie_source,
+                proxy: self.options.proxy.clone(),
+                output_dir,
+                output_filename,
+                custom_ytdlp_path: None,
+            };
+
+            let res = crate::media::download_media(
+                media_url,
+                &media_opts,
+                Some(prog_tx),
+                Some(Arc::clone(&self.cancel_flag)),
+            ).await;
+
+            let _ = forwarder.await;
+
+            let final_path = res?;
+
+            // Checksum verification if requested
+            if let Some(ref expected) = self.options.expected_checksum {
+                match crate::storage::DiskWriter::verify_file_checksum(&final_path, expected) {
+                    Ok(true) => tracing::info!("Checksum verification passed: {}", expected),
+                    Ok(false) => {
+                        let err = format!("Checksum verification failed: hash mismatch (expected {})", expected);
+                        tracing::error!("{}", err);
+                        return Err(err);
+                    }
+                    Err(e) => {
+                        tracing::error!("Checksum verification failed: {}", e);
+                        return Err(format!("Checksum verification failed: {}", e));
+                    }
+                }
+            }
+
+            return Ok(final_path);
+        }
+
         // Automatically resolve multi-cluster mirrors (e.g. Archive.org workable_servers)
         let mut resolved_urls = Vec::new();
         for url in &self.urls {
