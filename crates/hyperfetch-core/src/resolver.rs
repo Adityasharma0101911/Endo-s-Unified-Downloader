@@ -26,10 +26,25 @@ pub trait HostResolver: Send + Sync {
 pub struct ArchiveOrgResolver;
 
 #[derive(Debug, Deserialize)]
-struct ArchiveMetadata {
+struct ArchiveServerDir {
     server: Option<String>,
     dir: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArchiveAlternateLocations {
+    servers: Option<Vec<ArchiveServerDir>>,
+    workable: Option<Vec<ArchiveServerDir>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArchiveMetadata {
+    server: Option<String>,
+    d1: Option<String>,
+    d2: Option<String>,
+    dir: Option<String>,
     workable_servers: Option<Vec<String>>,
+    alternate_locations: Option<ArchiveAlternateLocations>,
 }
 
 impl HostResolver for ArchiveOrgResolver {
@@ -72,37 +87,76 @@ impl HostResolver for ArchiveOrgResolver {
             Err(_) => return Ok(vec![url.clone()]),
         };
 
-        let dir = match metadata.dir {
-            Some(d) => d,
-            None => return Ok(vec![url.clone()]),
-        };
-
-        let mut servers = Vec::new();
+        let mut server_dirs: Vec<(String, String)> = Vec::new();
         let mut seen = HashSet::new();
 
-        if let Some(primary) = metadata.server {
-            if seen.insert(primary.clone()) {
-                servers.push(primary);
+        if let Some(ref d) = metadata.dir {
+            if let Some(ref primary) = metadata.server {
+                if seen.insert((primary.clone(), d.clone())) {
+                    server_dirs.push((primary.clone(), d.clone()));
+                }
+            }
+            if let Some(ref d1) = metadata.d1 {
+                if seen.insert((d1.clone(), d.clone())) {
+                    server_dirs.push((d1.clone(), d.clone()));
+                }
+            }
+            if let Some(ref d2) = metadata.d2 {
+                if seen.insert((d2.clone(), d.clone())) {
+                    server_dirs.push((d2.clone(), d.clone()));
+                }
+            }
+            if let Some(ref workable) = metadata.workable_servers {
+                for ws in workable {
+                    if seen.insert((ws.clone(), d.clone())) {
+                        server_dirs.push((ws.clone(), d.clone()));
+                    }
+                }
             }
         }
 
-        if let Some(workable) = metadata.workable_servers {
-            for ws in workable {
-                if seen.insert(ws.clone()) {
-                    servers.push(ws);
+        if let Some(ref alt) = metadata.alternate_locations {
+            if let Some(ref servers) = alt.servers {
+                for entry in servers {
+                    if let (Some(s), Some(d)) = (&entry.server, &entry.dir) {
+                        if seen.insert((s.clone(), d.clone())) {
+                            server_dirs.push((s.clone(), d.clone()));
+                        }
+                    }
+                }
+            }
+            if let Some(ref workable) = alt.workable {
+                for entry in workable {
+                    if let (Some(s), Some(d)) = (&entry.server, &entry.dir) {
+                        if seen.insert((s.clone(), d.clone())) {
+                            server_dirs.push((s.clone(), d.clone()));
+                        }
+                    }
                 }
             }
         }
 
         let mut mirror_urls = Vec::new();
-        for s in servers {
-            let mirror_str = format!("https://{}{}/{}", s, dir, raw_filename);
+        for (s, d) in server_dirs {
+            let clean_s = if s.contains('.') {
+                s
+            } else {
+                format!("{}.archive.org", s)
+            };
+            let clean_d = d.trim_matches('/');
+            let clean_filename = raw_filename.trim_start_matches('/');
+            let mirror_str = if clean_d.is_empty() {
+                format!("https://{}/{}", clean_s, clean_filename)
+            } else {
+                format!("https://{}/{}/{}", clean_s, clean_d, clean_filename)
+            };
             if let Ok(m_url) = Url::parse(&mirror_str) {
                 mirror_urls.push(m_url);
             }
         }
 
-        let lb_url_str = format!("https://archive.org/download/{}/{}", identifier, raw_filename);
+        let clean_filename = raw_filename.trim_start_matches('/');
+        let lb_url_str = format!("https://archive.org/download/{}/{}", identifier, clean_filename);
         if let Ok(lb_url) = Url::parse(&lb_url_str) {
             if !mirror_urls.contains(&lb_url) {
                 mirror_urls.push(lb_url);
@@ -1054,6 +1108,50 @@ fn extract_html_video_sources(html: &str, base_url: &Url) -> Vec<Url> {
         }
     }
 
+    // 3. Scan for JSON / JS video attributes (e.g. Zoom cloud recordings, Panopto, Loom, custom players):
+    let json_video_keys = [
+        "\"viewMp4Url\"",
+        "\"downloadUrl\"",
+        "\"videoUrl\"",
+        "\"video_url\"",
+        "\"contentUrl\"",
+        "\"stream_url\"",
+        "\"fileUrl\"",
+    ];
+    for key in json_video_keys {
+        let mut cursor = 0;
+        while let Some(idx) = html[cursor..].find(key) {
+            let key_pos = cursor + idx + key.len();
+            let after_key = &html[key_pos..];
+            // Find colon followed by opening quote
+            if let Some(colon_idx) = after_key.find(':') {
+                let after_colon = &after_key[colon_idx + 1..];
+                let trimmed_start = after_colon.find(|c: char| !c.is_whitespace()).unwrap_or(after_colon.len());
+                let val_part = &after_colon[trimmed_start..];
+                let quote = val_part.chars().next();
+                if quote == Some('"') || quote == Some('\'') {
+                    let quote_char = quote.unwrap();
+                    let val_str = &val_part[1..];
+                    if let Some(end) = val_str.find(quote_char) {
+                        let raw = &val_str[..end];
+                        let cleaned = raw
+                            .replace("\\u0026", "&")
+                            .replace("\\/", "/")
+                            .replace("&amp;", "&");
+                        if is_probable_video_url(&cleaned) || cleaned.starts_with("http") {
+                            if let Ok(resolved) = base_url.join(&cleaned) {
+                                if seen.insert(resolved.to_string()) {
+                                    sources.push(resolved);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            cursor = key_pos;
+        }
+    }
+
     sources
 }
 
@@ -1215,5 +1313,22 @@ mod tests {
         assert!(!HtmlVideoResolver.can_handle(&Url::parse("https://example.com/archive.rar").unwrap()));
         assert!(!HtmlVideoResolver.can_handle(&Url::parse("https://example.com/installer.msi").unwrap()));
         assert!(HtmlVideoResolver.can_handle(&Url::parse("https://example.com/watch/video").unwrap()));
+    }
+
+    #[test]
+    fn test_extract_html_video_sources_json() {
+        let base_url = Url::parse("https://zoom.us/rec/play/abc123xyz").unwrap();
+        let html = r#"
+            <script>
+                window.__data__ = {
+                    "viewMp4Url": "https://ssrweb.zoom.us/rec/play/video_hd.mp4?auth=token123\u0026sig=abc",
+                    "downloadUrl": "https://ssrweb.zoom.us/rec/download/video_original.mp4"
+                };
+            </script>
+        "#;
+        let sources = extract_html_video_sources(html, &base_url);
+        assert_eq!(sources.len(), 2);
+        assert!(sources.contains(&Url::parse("https://ssrweb.zoom.us/rec/play/video_hd.mp4?auth=token123&sig=abc").unwrap()));
+        assert!(sources.contains(&Url::parse("https://ssrweb.zoom.us/rec/download/video_original.mp4").unwrap()));
     }
 }

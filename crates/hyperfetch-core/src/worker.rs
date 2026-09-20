@@ -79,6 +79,7 @@ impl HttpWorker {
 
         let mut headers = HeaderMap::new();
         headers.insert(RANGE, HeaderValue::from_str(&chunk.range.to_http_header()).unwrap());
+        headers.insert(reqwest::header::ACCEPT_ENCODING, HeaderValue::from_static("identity"));
 
         let response = match self
             .client

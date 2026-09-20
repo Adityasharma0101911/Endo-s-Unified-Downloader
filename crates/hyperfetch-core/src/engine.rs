@@ -58,7 +58,8 @@ impl DownloadEngine {
             .tcp_nodelay(true)
             .connect_timeout(Duration::from_secs(10))
             .tcp_keepalive(Duration::from_secs(30))
-            .pool_max_idle_per_host(32)
+            .pool_max_idle_per_host(64)
+            .pool_idle_timeout(Some(Duration::from_secs(90)))
             .default_headers(crate::resolver::SmartResolver::default_anti_qos_headers())
             .build()
             .unwrap_or_default();
@@ -105,6 +106,7 @@ impl DownloadEngine {
             if let Ok(resp) = self.client
                 .get(url.clone())
                 .header(RANGE, "bytes=0-0")
+                .header(reqwest::header::ACCEPT_ENCODING, "identity")
                 .send()
                 .await
             {
@@ -246,7 +248,7 @@ impl DownloadEngine {
 
         // Spawn workers
         let num_workers = if accepts_ranges {
-            self.options.num_connections.min(32)
+            self.options.num_connections.min(64)
         } else {
             1 // Single connection if server doesn't support ranges
         };

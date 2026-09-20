@@ -367,7 +367,7 @@ fn render_ui(app: &mut DownloaderApp, ui: &mut egui::Ui) {
             // Options and Actions Row
             ui.horizontal(|ui| {
                 ui.label("Streams:");
-                ui.add(egui::Slider::new(&mut app.connections, 1..=32).text("connections"));
+                ui.add(egui::Slider::new(&mut app.connections, 1..=64).text("connections"));
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     match app.status {
