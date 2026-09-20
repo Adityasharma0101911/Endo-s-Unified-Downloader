@@ -33,6 +33,10 @@ pub struct DownloadOptions {
     pub base_chunk_size: u64,
     pub min_steal_threshold: u64,
     pub output_path: Option<PathBuf>,
+    pub expected_checksum: Option<String>,
+    pub cookies_path: Option<PathBuf>,
+    pub auth_header: Option<String>,
+    pub proxy: Option<String>,
 }
 
 impl Default for DownloadOptions {
@@ -42,6 +46,10 @@ impl Default for DownloadOptions {
             base_chunk_size: 4 * 1024 * 1024,      // 4MB
             min_steal_threshold: 1024 * 1024,     // 1MB
             output_path: None,
+            expected_checksum: None,
+            cookies_path: None,
+            auth_header: None,
+            proxy: None,
         }
     }
 }
@@ -55,15 +63,40 @@ pub struct DownloadEngine {
 
 impl DownloadEngine {
     pub fn new(urls: Vec<Url>, options: DownloadOptions) -> Self {
-        let client = Client::builder()
+        let mut builder = Client::builder()
             .tcp_nodelay(true)
             .connect_timeout(Duration::from_secs(10))
             .tcp_keepalive(Duration::from_secs(30))
             .pool_max_idle_per_host(64)
-            .pool_idle_timeout(Some(Duration::from_secs(90)))
-            .default_headers(crate::resolver::SmartResolver::default_anti_qos_headers())
-            .build()
-            .unwrap_or_default();
+            .pool_idle_timeout(Some(Duration::from_secs(90)));
+
+        let mut headers = crate::resolver::SmartResolver::default_anti_qos_headers();
+        if let Some(ref auth) = options.auth_header {
+            if let Ok(val) = reqwest::header::HeaderValue::from_str(auth) {
+                headers.insert(reqwest::header::AUTHORIZATION, val);
+            }
+        }
+        builder = builder.default_headers(headers);
+
+        if let Some(ref proxy_url) = options.proxy {
+            if let Ok(proxy) = reqwest::Proxy::all(proxy_url) {
+                builder = builder.proxy(proxy);
+            } else {
+                tracing::warn!("Failed to parse proxy URL: {}", proxy_url);
+            }
+        }
+
+        if let Some(ref cookies_path) = options.cookies_path {
+            if let Ok(content) = std::fs::read_to_string(cookies_path) {
+                let jar = Arc::new(reqwest::cookie::Jar::default());
+                crate::resolver::parse_netscape_cookies(&content, &jar);
+                builder = builder.cookie_provider(jar);
+            } else {
+                tracing::warn!("Failed to read cookies file at: {:?}", cookies_path);
+            }
+        }
+
+        let client = builder.build().unwrap_or_default();
 
         Self {
             options,
@@ -457,6 +490,24 @@ impl DownloadEngine {
         // Compute final BLAKE3 hash
         let final_hash = disk_writer.compute_file_hash().map_err(|e| e.to_string())?;
         tracing::info!("Download completed! BLAKE3: {}", hex_encode(&final_hash));
+
+        // Post-download checksum verification
+        if let Some(ref expected) = self.options.expected_checksum {
+            match disk_writer.verify_checksum(expected) {
+                Ok(true) => {
+                    tracing::info!("Checksum verification succeeded for {:?}", output_path);
+                }
+                Ok(false) => {
+                    let err = format!("Checksum verification failed: hash mismatch (expected {})", expected);
+                    tracing::error!("{}", err);
+                    return Err(err);
+                }
+                Err(e) => {
+                    tracing::error!("Checksum verification failed: {}", e);
+                    return Err(format!("Checksum verification failed: {}", e));
+                }
+            }
+        }
 
         // Clean up state file on success
         let _ = DownloadState::remove(&state_path);

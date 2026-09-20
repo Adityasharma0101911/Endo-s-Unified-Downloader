@@ -22,12 +22,30 @@ enum DownloadStatus {
     Cancelled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuiTab {
+    Downloader,
+    BatchQueue,
+}
+
 struct DownloaderApp {
     url_input: String,
     save_dir: String,
     connections: usize,
     status: DownloadStatus,
     status_message: String,
+
+    // Advanced options
+    show_advanced: bool,
+    checksum_input: String,
+    cookies_path_input: String,
+    proxy_input: String,
+    auth_header_input: String,
+
+    // Tabs & Batch Queue
+    active_tab: GuiTab,
+    queue: hyperfetch_core::queue::DownloadQueue,
+    queue_url_input: String,
 
     // Metrics
     total_bytes: u64,
@@ -81,6 +99,16 @@ impl DownloaderApp {
             status: DownloadStatus::Idle,
             status_message: "Ready to accelerate download".to_string(),
 
+            show_advanced: false,
+            checksum_input: String::new(),
+            cookies_path_input: String::new(),
+            proxy_input: String::new(),
+            auth_header_input: String::new(),
+
+            active_tab: GuiTab::Downloader,
+            queue: hyperfetch_core::queue::DownloadQueue::new(),
+            queue_url_input: String::new(),
+
             total_bytes: 0,
             downloaded_bytes: 0,
             speed_bytes_per_sec: 0.0,
@@ -114,8 +142,38 @@ impl DownloaderApp {
             return;
         }
 
+        // Check for blob / UUID URL
+        if trimmed.starts_with("blob:") || (trimmed.contains("youtube.com") && trimmed.split('/').last().map_or(false, |s| s.len() == 36 && s.matches('-').count() == 4)) {
+            self.status = DownloadStatus::Failed(
+                "Browser-internal blob memory buffer detected. Browser blob: URLs exist only in temporary browser memory and cannot be downloaded by external tools. Please copy the standard video URL from your browser address bar (e.g. https://www.youtube.com/watch?v=... or https://youtu.be/...)."
+                    .to_string(),
+            );
+            return;
+        }
+
         let mut urls = Vec::new();
         for u in trimmed.split_whitespace() {
+            if hyperfetch_core::torrent::is_magnet_uri(u) {
+                match hyperfetch_core::torrent::parse_magnet_uri(u) {
+                    Ok(magnet) => {
+                        if !magnet.web_seeds.is_empty() {
+                            urls.extend(magnet.web_seeds);
+                            continue;
+                        } else {
+                            self.status = DownloadStatus::Failed(format!(
+                                "Magnet link ingested ({}), but no HTTP web seeds were found in the magnet URI.",
+                                magnet.info_hash
+                            ));
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        self.status = DownloadStatus::Failed(format!("Invalid magnet URI: {}", e));
+                        return;
+                    }
+                }
+            }
+
             match Url::parse(u) {
                 Ok(url) => urls.push(url),
                 Err(e) => {
@@ -157,6 +215,11 @@ impl DownloaderApp {
         let connections = self.connections;
         let save_dir = PathBuf::from(&self.save_dir);
 
+        let checksum_opt = self.checksum_input.trim().to_string();
+        let cookies_opt = self.cookies_path_input.trim().to_string();
+        let proxy_opt = self.proxy_input.trim().to_string();
+        let auth_opt = self.auth_header_input.trim().to_string();
+
         let (async_snapshot_tx, mut async_snapshot_rx) = broadcast::channel::<EngineSnapshot>(128);
 
         // Bridge Tokio broadcast to standard mpsc channel for UI thread
@@ -185,6 +248,10 @@ impl DownloaderApp {
                 base_chunk_size: 4 * 1024 * 1024,
                 min_steal_threshold: 1024 * 1024,
                 output_path: Some(save_dir),
+                expected_checksum: if checksum_opt.is_empty() { None } else { Some(checksum_opt) },
+                cookies_path: if cookies_opt.is_empty() { None } else { Some(PathBuf::from(cookies_opt)) },
+                proxy: if proxy_opt.is_empty() { None } else { Some(proxy_opt) },
+                auth_header: if auth_opt.is_empty() { None } else { Some(auth_opt) },
             };
 
             let engine = DownloadEngine::new(urls, options);
@@ -364,10 +431,41 @@ fn render_ui(app: &mut DownloaderApp, ui: &mut egui::Ui) {
                 .size(13.0)
                 .color(badge_color),
         );
+
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let is_queue = app.active_tab == GuiTab::BatchQueue;
+            let queue_btn = egui::Button::new(
+                egui::RichText::new(format!("Queue ({})", app.queue.items().len()))
+                    .strong()
+                    .color(if is_queue { Color32::WHITE } else { Color32::from_rgb(148, 163, 184) }),
+            )
+            .fill(if is_queue { Color32::from_rgb(37, 99, 235) } else { Color32::from_rgb(30, 32, 40) });
+            if ui.add_sized([100.0, 24.0], queue_btn).clicked() {
+                app.active_tab = GuiTab::BatchQueue;
+            }
+
+            let is_dl = app.active_tab == GuiTab::Downloader;
+            let dl_btn = egui::Button::new(
+                egui::RichText::new("Downloader")
+                    .strong()
+                    .color(if is_dl { Color32::WHITE } else { Color32::from_rgb(148, 163, 184) }),
+            )
+            .fill(if is_dl { Color32::from_rgb(37, 99, 235) } else { Color32::from_rgb(30, 32, 40) });
+            if ui.add_sized([100.0, 24.0], dl_btn).clicked() {
+                app.active_tab = GuiTab::Downloader;
+            }
+        });
     });
 
     ui.add_space(10.0);
 
+    match app.active_tab {
+        GuiTab::Downloader => render_downloader_tab(app, ui),
+        GuiTab::BatchQueue => render_queue_tab(app, ui),
+    }
+}
+
+fn render_downloader_tab(app: &mut DownloaderApp, ui: &mut egui::Ui) {
     // Input Group Box
     egui::Frame::none()
         .fill(Color32::from_rgb(24, 26, 33))
@@ -381,7 +479,7 @@ fn render_ui(app: &mut DownloaderApp, ui: &mut egui::Ui) {
                 let text_edit = ui.add_sized(
                     [ui.available_width() - 85.0, 26.0],
                     egui::TextEdit::singleline(&mut app.url_input)
-                        .hint_text("Paste media link or file URL (Archive.org, Vimeo, Reddit, Twitter, etc.)"),
+                        .hint_text("Paste media link or file URL (YouTube, Archive.org, Vimeo, Reddit, etc.)"),
                 );
 
                 if ui.button("Paste").clicked() {
@@ -393,6 +491,25 @@ fn render_ui(app: &mut DownloaderApp, ui: &mut egui::Ui) {
                 }
                 text_edit
             });
+
+            // Blob URL warning banner
+            let is_blob = app.url_input.trim().starts_with("blob:")
+                || (app.url_input.contains("youtube.com") && app.url_input.trim().split('/').last().map_or(false, |s| s.len() == 36 && s.matches('-').count() == 4));
+            if is_blob {
+                ui.add_space(6.0);
+                egui::Frame::none()
+                    .fill(Color32::from_rgb(45, 20, 20))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(220, 38, 38)))
+                    .inner_margin(8.0)
+                    .rounding(4.0)
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new("Notice: The URL entered is a browser-internal blob memory buffer. Web browsers generate these internally in RAM and they cannot be downloaded by external tools. Please copy the actual YouTube video link from your browser's address bar (e.g. https://www.youtube.com/watch?v=... or https://youtu.be/...).")
+                                .color(Color32::from_rgb(254, 202, 202))
+                                .size(12.0),
+                        );
+                    });
+            }
 
             ui.add_space(8.0);
 
@@ -495,6 +612,62 @@ fn render_ui(app: &mut DownloaderApp, ui: &mut egui::Ui) {
                     }
                 });
             });
+
+            // Collapsible Advanced Options
+            ui.add_space(6.0);
+            ui.separator();
+            ui.add_space(4.0);
+            let adv_text = if app.show_advanced { "[-] Advanced Options (Checksum, Cookies, Proxy)" } else { "[+] Advanced Options (Checksum, Cookies, Proxy)" };
+            if ui.button(egui::RichText::new(adv_text).size(12.0).color(Color32::from_rgb(148, 163, 184))).clicked() {
+                app.show_advanced = !app.show_advanced;
+            }
+
+            if app.show_advanced {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Checksum:").size(12.0));
+                    ui.add_sized(
+                        [ui.available_width() - 10.0, 24.0],
+                        egui::TextEdit::singleline(&mut app.checksum_input)
+                            .hint_text("Optional: sha256:..., md5:..., blake3:..., or hex"),
+                    );
+                });
+
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Cookies:").size(12.0));
+                    ui.add_sized(
+                        [ui.available_width() - 95.0, 24.0],
+                        egui::TextEdit::singleline(&mut app.cookies_path_input)
+                            .hint_text("Optional: path to Netscape cookies.txt"),
+                    );
+                    if ui.button("Browse...").clicked() {
+                        if let Some(file) = rfd::FileDialog::new().add_filter("Text", &["txt"]).pick_file() {
+                            app.cookies_path_input = file.to_string_lossy().to_string();
+                        }
+                    }
+                });
+
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Proxy:").size(12.0));
+                    ui.add_sized(
+                        [ui.available_width() - 10.0, 24.0],
+                        egui::TextEdit::singleline(&mut app.proxy_input)
+                            .hint_text("Optional: http://127.0.0.1:8080 or socks5://127.0.0.1:1080"),
+                    );
+                });
+
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Auth:").size(12.0));
+                    ui.add_sized(
+                        [ui.available_width() - 10.0, 24.0],
+                        egui::TextEdit::singleline(&mut app.auth_header_input)
+                            .hint_text("Optional: Bearer <token>"),
+                    );
+                });
+            }
         });
 
     ui.add_space(10.0);
@@ -703,6 +876,112 @@ fn render_ui(app: &mut DownloaderApp, ui: &mut egui::Ui) {
                 .color(Color32::from_rgb(148, 163, 184)),
         );
     });
+}
+
+fn render_queue_tab(app: &mut DownloaderApp, ui: &mut egui::Ui) {
+    egui::Frame::none()
+        .fill(Color32::from_rgb(24, 26, 33))
+        .stroke(Stroke::new(1.0, Color32::from_rgb(42, 45, 56)))
+        .inner_margin(12.0)
+        .rounding(6.0)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Add to Queue:").strong().size(13.0));
+                ui.add_sized(
+                    [ui.available_width() - 100.0, 26.0],
+                    egui::TextEdit::singleline(&mut app.queue_url_input)
+                        .hint_text("Enter file URL or media link to enqueue"),
+                );
+                if ui.button("Add Item").clicked() {
+                    let trimmed = app.queue_url_input.trim();
+                    if !trimmed.is_empty() {
+                        if let Ok(u) = Url::parse(trimmed) {
+                            let save_dir = PathBuf::from(&app.save_dir);
+                            let options = DownloadOptions {
+                                num_connections: app.connections,
+                                base_chunk_size: 4 * 1024 * 1024,
+                                min_steal_threshold: 1024 * 1024,
+                                output_path: Some(save_dir.clone()),
+                                ..Default::default()
+                            };
+                            app.queue.add_item(vec![u], save_dir, options);
+                            app.queue_url_input.clear();
+                        }
+                    }
+                }
+            });
+
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Clear Completed").clicked() {
+                    app.queue.retain_items(|i| i.status != hyperfetch_core::queue::QueueItemStatus::Completed);
+                }
+                if ui.button("Clear All").clicked() {
+                    app.queue.clear();
+                }
+            });
+        });
+
+    ui.add_space(10.0);
+    ui.label(egui::RichText::new("BATCH DOWNLOAD QUEUE").strong().size(13.0));
+    ui.add_space(4.0);
+
+    egui::Frame::none()
+        .fill(Color32::from_rgb(24, 26, 33))
+        .stroke(Stroke::new(1.0, Color32::from_rgb(42, 45, 56)))
+        .inner_margin(8.0)
+        .rounding(6.0)
+        .show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .max_height(350.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    if app.queue.items().is_empty() {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(30.0);
+                            ui.label(
+                                egui::RichText::new("Queue is empty. Add URLs above to build a batch queue.")
+                                    .color(Color32::from_rgb(113, 113, 122)),
+                            );
+                            ui.add_space(30.0);
+                        });
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.add_sized([40.0, 20.0], egui::Label::new(egui::RichText::new("ID").strong().size(11.0)));
+                            ui.add_sized([220.0, 20.0], egui::Label::new(egui::RichText::new("File").strong().size(11.0)));
+                            ui.add_sized([100.0, 20.0], egui::Label::new(egui::RichText::new("Status").strong().size(11.0)));
+                            ui.add_sized([120.0, 20.0], egui::Label::new(egui::RichText::new("Actions").strong().size(11.0)));
+                        });
+                        ui.separator();
+
+                        let mut to_remove = None;
+                        let mut to_load = None;
+                        for item in app.queue.items() {
+                            ui.horizontal(|ui| {
+                                ui.add_sized([40.0, 18.0], egui::Label::new(format!("#{}", item.id)));
+                                ui.add_sized([220.0, 18.0], egui::Label::new(&item.filename));
+                                let status_str = format!("{:?}", item.status);
+                                ui.add_sized([100.0, 18.0], egui::Label::new(status_str));
+                                if ui.small_button("Download").clicked() {
+                                    to_load = Some(item.urls.clone());
+                                }
+                                if ui.small_button("Remove").clicked() {
+                                    to_remove = Some(item.id);
+                                }
+                            });
+                        }
+
+                        if let Some(id) = to_remove {
+                            app.queue.remove_item(id);
+                        }
+                        if let Some(urls) = to_load {
+                            app.url_input = urls.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(" ");
+                            app.active_tab = GuiTab::Downloader;
+                            app.start_download();
+                        }
+                    }
+                });
+        });
 }
 
 fn format_bytes(bytes: u64) -> String {

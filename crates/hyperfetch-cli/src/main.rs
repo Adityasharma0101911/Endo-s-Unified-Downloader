@@ -24,6 +24,22 @@ struct Args {
     /// Output file path or directory
     #[arg(short = 'o', long = "output")]
     output: Option<PathBuf>,
+
+    /// Expected file checksum (sha256:..., md5:..., blake3:..., or hex)
+    #[arg(long = "checksum")]
+    checksum: Option<String>,
+
+    /// Path to Netscape cookies.txt file
+    #[arg(long = "load-cookies")]
+    load_cookies: Option<PathBuf>,
+
+    /// Custom authorization header (e.g. "Bearer <token>")
+    #[arg(long = "header")]
+    header: Option<String>,
+
+    /// Proxy server URL (e.g. "http://127.0.0.1:8080" or "socks5://127.0.0.1:1080")
+    #[arg(long = "proxy")]
+    proxy: Option<String>,
 }
 
 #[tokio::main]
@@ -69,6 +85,35 @@ async fn run_interactive_ui() -> Result<(), Box<dyn std::error::Error>> {
         let mut has_error = false;
 
         for u in raw_urls {
+            if u.starts_with("blob:") || (u.contains("youtube.com") && u.split('/').last().map_or(false, |s| s.len() == 36 && s.matches('-').count() == 4)) {
+                println!("\n[NOTICE] The URL entered is a browser-internal blob memory buffer.");
+                println!("Browser blob: URLs exist only in temporary browser memory and cannot be downloaded by external tools.");
+                println!("Please copy the standard video URL from your browser address bar (e.g. https://www.youtube.com/watch?v=... or https://youtu.be/...).");
+                has_error = true;
+                break;
+            }
+
+            if hyperfetch_core::torrent::is_magnet_uri(u) {
+                match hyperfetch_core::torrent::parse_magnet_uri(u) {
+                    Ok(magnet) => {
+                        println!("[MAGNET] Ingested magnet URI: {}", magnet.info_hash);
+                        if let Some(ref dn) = magnet.display_name {
+                            println!("         Name: {}", dn);
+                        }
+                        if !magnet.web_seeds.is_empty() {
+                            println!("         Discovered {} web seed mirror(s) for HTTP acceleration", magnet.web_seeds.len());
+                            parsed_urls.extend(magnet.web_seeds);
+                            continue;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[ERROR] Invalid magnet URI: {}", e);
+                        has_error = true;
+                        break;
+                    }
+                }
+            }
+
             match Url::parse(u) {
                 Ok(url) => parsed_urls.push(url),
                 Err(e) => {
@@ -106,6 +151,7 @@ async fn run_interactive_ui() -> Result<(), Box<dyn std::error::Error>> {
             base_chunk_size: 4 * 1024 * 1024,
             min_steal_threshold: 1024 * 1024,
             output_path: Some(target_dir),
+            ..Default::default()
         };
 
         println!("\nProbing mirrors and initializing chunk pipeline...");
@@ -128,8 +174,38 @@ async fn run_interactive_ui() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn run_cli_download(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut parsed_urls = Vec::new();
+    let expected_checksum = args.checksum;
+
     for u in &args.urls {
-        let url = Url::parse(u).map_err(|e| format!("Invalid URL '{}': {}", u, e))?;
+        let trimmed = u.trim();
+        if trimmed.starts_with("blob:") || (trimmed.contains("youtube.com") && trimmed.split('/').last().map_or(false, |s| s.len() == 36 && s.matches('-').count() == 4)) {
+            eprintln!("\n[NOTICE] The URL entered is a browser-internal blob memory buffer.");
+            eprintln!("Browser blob: URLs exist only in temporary browser memory and cannot be downloaded by external tools.");
+            eprintln!("Please copy the standard video URL from your browser address bar (e.g. https://www.youtube.com/watch?v=... or https://youtu.be/...).");
+            return Err("Cannot download browser-internal blob URL".into());
+        }
+
+        if hyperfetch_core::torrent::is_magnet_uri(trimmed) {
+            match hyperfetch_core::torrent::parse_magnet_uri(trimmed) {
+                Ok(magnet) => {
+                    println!("[MAGNET] Ingested magnet URI: {}", magnet.info_hash);
+                    if let Some(ref dn) = magnet.display_name {
+                        println!("         Name: {}", dn);
+                    }
+                    if !magnet.web_seeds.is_empty() {
+                        println!("         Discovered {} web seed mirror(s) for HTTP acceleration", magnet.web_seeds.len());
+                        parsed_urls.extend(magnet.web_seeds);
+                        continue;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[ERROR] Invalid magnet URI: {}", e);
+                    return Err(e.into());
+                }
+            }
+        }
+
+        let url = Url::parse(trimmed).map_err(|e| format!("Invalid URL '{}': {}", u, e))?;
         parsed_urls.push(url);
     }
 
@@ -138,6 +214,10 @@ async fn run_cli_download(args: Args) -> Result<(), Box<dyn std::error::Error>> 
         base_chunk_size: args.chunk_size_mb * 1024 * 1024,
         min_steal_threshold: 1024 * 1024,
         output_path: args.output,
+        expected_checksum,
+        cookies_path: args.load_cookies,
+        auth_header: args.header,
+        proxy: args.proxy,
     };
 
     let engine = DownloadEngine::new(parsed_urls, options);

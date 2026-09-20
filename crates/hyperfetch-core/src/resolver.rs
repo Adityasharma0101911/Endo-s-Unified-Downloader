@@ -589,6 +589,109 @@ impl HostResolver for InstagramResolver {
     }
 }
 
+/// YouTube Video Resolver (Extracts unthrottled streaming URLs via Innertube player API)
+pub struct YouTubeResolver;
+
+impl HostResolver for YouTubeResolver {
+    fn can_handle(&self, url: &Url) -> bool {
+        let host = url.host_str().unwrap_or("");
+        (host.ends_with("youtube.com") || host == "youtu.be" || host.ends_with("youtube-nocookie.com"))
+            && !is_blob_or_uuid_url(url)
+    }
+
+    async fn resolve(&self, client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
+        let video_id = extract_youtube_id(url)
+            .ok_or_else(|| ResolverError::NotFound("Could not extract YouTube video ID".to_string()))?;
+
+        let payload = serde_json::json!({
+            "videoId": video_id,
+            "context": {
+                "client": {
+                    "clientName": "ANDROID_VR",
+                    "clientVersion": "1.60.19",
+                    "deviceModel": "Quest 3",
+                    "osName": "Android",
+                    "osVersion": "12"
+                }
+            }
+        });
+
+        let resp = client.post("https://www.youtube.com/youtubei/v1/player")
+            .header("Content-Type", "application/json")
+            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+            .body(payload.to_string())
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(ResolverError::NotFound(format!("YouTube API returned HTTP {}", resp.status())));
+        }
+
+        let text = resp.text().await?;
+        let json: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| ResolverError::Parse(format!("Failed to parse YouTube player JSON: {}", e)))?;
+
+        // Check playabilityStatus
+        if let Some(status) = json.pointer("/playabilityStatus/status").and_then(|s| s.as_str()) {
+            if status != "OK" {
+                let reason = json.pointer("/playabilityStatus/reason")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("Video is unavailable or private");
+                return Err(ResolverError::NotFound(format!("YouTube error ({}): {}", status, reason)));
+            }
+        }
+
+        let mut direct_urls = Vec::new();
+
+        // 1. Progressive formats (contains both video and audio in single MP4)
+        if let Some(formats) = json.pointer("/streamingData/formats").and_then(|f| f.as_array()) {
+            let mut progressive: Vec<(u64, String)> = formats.iter().filter_map(|fmt| {
+                let u = fmt.get("url")?.as_str()?;
+                let height = fmt.get("height").and_then(|h| h.as_u64()).unwrap_or(0);
+                let bitrate = fmt.get("bitrate").and_then(|b| b.as_u64()).unwrap_or(0);
+                let score = height * 100_000_000 + bitrate;
+                Some((score, u.to_string()))
+            }).collect();
+
+            progressive.sort_by(|a, b| b.0.cmp(&a.0));
+            for (_, u_str) in progressive {
+                if let Ok(u) = Url::parse(&u_str) {
+                    if !direct_urls.contains(&u) {
+                        direct_urls.push(u);
+                    }
+                }
+            }
+        }
+
+        // 2. Adaptive formats (high-res video-only or audio-only) as secondary mirrors
+        if direct_urls.is_empty() {
+            if let Some(adaptive) = json.pointer("/streamingData/adaptiveFormats").and_then(|a| a.as_array()) {
+                let mut sorted: Vec<(u64, String)> = adaptive.iter().filter_map(|fmt| {
+                    let u = fmt.get("url")?.as_str()?;
+                    let bitrate = fmt.get("bitrate").and_then(|b| b.as_u64()).unwrap_or(0);
+                    Some((bitrate, u.to_string()))
+                }).collect();
+
+                sorted.sort_by(|a, b| b.0.cmp(&a.0));
+                for (_, u_str) in sorted {
+                    if let Ok(u) = Url::parse(&u_str) {
+                        if !direct_urls.contains(&u) {
+                            direct_urls.push(u);
+                        }
+                    }
+                }
+            }
+        }
+
+        if direct_urls.is_empty() {
+            return Err(ResolverError::NotFound("No direct video stream URLs found in YouTube response".to_string()));
+        }
+
+        Ok(direct_urls)
+    }
+}
+
+
 /// HTML5 Video Extractor (Extracts direct media streams from webpage <video>, <source>, and OpenGraph tags)
 pub struct HtmlVideoResolver;
 
@@ -759,6 +862,14 @@ impl SmartResolver {
             }
         }
 
+        if YouTubeResolver.can_handle(url) {
+            if let Ok(mirrors) = YouTubeResolver.resolve(client, url).await {
+                if mirrors != vec![url.clone()] && !mirrors.is_empty() {
+                    return mirrors;
+                }
+            }
+        }
+
         // Check for embedded HTML video sources on webpages
         if HtmlVideoResolver.can_handle(url) {
             if let Ok(video_sources) = HtmlVideoResolver.resolve(client, url).await {
@@ -790,6 +901,85 @@ impl SmartResolver {
         headers.insert("Sec-Fetch-Mode", HeaderValue::from_static("cors"));
         headers.insert("Sec-Fetch-Site", HeaderValue::from_static("cross-site"));
         headers
+    }
+}
+
+pub fn extract_youtube_id(url: &Url) -> Option<String> {
+    let host = url.host_str().unwrap_or("");
+    if host.ends_with("youtu.be") {
+        let segs: Vec<&str> = url.path_segments()?.filter(|s| !s.is_empty()).collect();
+        return segs.first().map(|s| s.to_string());
+    }
+
+    if host.ends_with("youtube.com") || host.ends_with("youtube-nocookie.com") {
+        // 1. Query parameter ?v=...
+        for (k, v) in url.query_pairs() {
+            if k == "v" && !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+
+        // 2. Path prefix /shorts/, /embed/, /v/, /live/
+        let segs: Vec<&str> = url.path_segments()?.filter(|s| !s.is_empty()).collect();
+        if let Some(pos) = segs.iter().position(|&s| s == "shorts" || s == "embed" || s == "v" || s == "live") {
+            if let Some(&id) = segs.get(pos + 1) {
+                return Some(id.to_string());
+            }
+        }
+    }
+
+    None
+}
+
+pub fn is_blob_or_uuid_url(url: &Url) -> bool {
+    let s = url.as_str();
+    if s.starts_with("blob:") {
+        return true;
+    }
+    let path = url.path().trim_matches('/');
+    if path.len() == 36 && path.matches('-').count() == 4 {
+        let is_hex_dash = path.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
+        if is_hex_dash {
+            return true;
+        }
+    }
+    false
+}
+
+/// Parses a Netscape / Mozilla cookies.txt file and loads cookies into a reqwest CookieJar.
+pub fn parse_netscape_cookies(content: &str, jar: &reqwest::cookie::Jar) {
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (line, _http_only) = if let Some(stripped) = line.strip_prefix("#HttpOnly_") {
+            (stripped, true)
+        } else if line.starts_with('#') {
+            continue;
+        } else {
+            (line, false)
+        };
+
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() < 7 {
+            continue;
+        }
+
+        let domain = parts[0];
+        let path = parts[2];
+        let secure = parts[3].eq_ignore_ascii_case("true");
+        let name = parts[5];
+        let value = parts[6];
+
+        let scheme = if secure { "https" } else { "http" };
+        let clean_domain = domain.trim_start_matches('.');
+        let url_str = format!("{}://{}{}", scheme, clean_domain, path);
+
+        if let Ok(cookie_url) = Url::parse(&url_str) {
+            let cookie_str = format!("{}={}; Domain={}; Path={}", name, value, domain, path);
+            jar.add_cookie_str(&cookie_str, &cookie_url);
+        }
     }
 }
 
@@ -1341,5 +1531,47 @@ mod tests {
             println!("Mirror {}: {}", i, m);
         }
         assert!(mirrors.len() >= 2);
+    }
+
+    #[test]
+    fn test_youtube_id_extraction() {
+        let u1 = Url::parse("https://www.youtube.com/watch?v=dQw4w9WgXcQ").unwrap();
+        assert_eq!(extract_youtube_id(&u1), Some("dQw4w9WgXcQ".to_string()));
+
+        let u2 = Url::parse("https://youtu.be/dQw4w9WgXcQ?t=10").unwrap();
+        assert_eq!(extract_youtube_id(&u2), Some("dQw4w9WgXcQ".to_string()));
+
+        let u3 = Url::parse("https://www.youtube.com/shorts/dQw4w9WgXcQ").unwrap();
+        assert_eq!(extract_youtube_id(&u3), Some("dQw4w9WgXcQ".to_string()));
+
+        let u4 = Url::parse("https://www.youtube.com/embed/dQw4w9WgXcQ").unwrap();
+        assert_eq!(extract_youtube_id(&u4), Some("dQw4w9WgXcQ".to_string()));
+    }
+
+    #[test]
+    fn test_blob_and_uuid_detection() {
+        let blob_url = Url::parse("blob:https://www.youtube.com/ce8ac223-1199-4640-ba84-14b5c8f10ac0").unwrap();
+        assert!(is_blob_or_uuid_url(&blob_url));
+
+        let uuid_url = Url::parse("https://www.youtube.com/ce8ac223-1199-4640-ba84-14b5c8f10ac0").unwrap();
+        assert!(is_blob_or_uuid_url(&uuid_url));
+
+        let standard_yt = Url::parse("https://www.youtube.com/watch?v=dQw4w9WgXcQ").unwrap();
+        assert!(!is_blob_or_uuid_url(&standard_yt));
+    }
+
+    #[test]
+    fn test_parse_netscape_cookies() {
+        use reqwest::cookie::CookieStore;
+        let cookie_content = "\
+# Netscape HTTP Cookie File
+.example.com\tTRUE\t/\tTRUE\t1735689600\tsession_id\tabc123xyz
+#HttpOnly_.example.com\tTRUE\t/\tFALSE\t1735689600\ttoken\tsecret_val
+";
+        let jar = reqwest::cookie::Jar::default();
+        parse_netscape_cookies(cookie_content, &jar);
+        let test_url = Url::parse("https://example.com/").unwrap();
+        let cookie_header = jar.cookies(&test_url);
+        assert!(cookie_header.is_some());
     }
 }

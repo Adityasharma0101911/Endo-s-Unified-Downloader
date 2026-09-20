@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use memmap2::MmapMut;
 use thiserror::Error;
+use sha2::{Digest as Sha2Digest, Sha256};
+use md5::Md5;
 use crate::range::ByteRange;
 
 #[derive(Error, Debug)]
@@ -161,6 +163,94 @@ impl DiskWriter {
         self.compute_chunk_hash(&full_range)
     }
 
+    /// Computes SHA-256 hash for the entire file as a lowercase hex string.
+    pub fn compute_sha256(&self) -> Result<String, StorageError> {
+        let mut hasher = Sha256::new();
+        if self.size > 0 {
+            let full_range = ByteRange::from_len(0, self.size).map_err(StorageError::from)?;
+            let data = self.storage.read_range(&full_range)?;
+            hasher.update(data);
+        }
+        Ok(hex::encode(&hasher.finalize()))
+    }
+
+    /// Computes MD5 hash for the entire file as a lowercase hex string.
+    pub fn compute_md5(&self) -> Result<String, StorageError> {
+        let mut hasher = Md5::new();
+        if self.size > 0 {
+            let full_range = ByteRange::from_len(0, self.size).map_err(StorageError::from)?;
+            let data = self.storage.read_range(&full_range)?;
+            hasher.update(data);
+        }
+        Ok(hex::encode(&hasher.finalize()))
+    }
+
+    /// Verifies checksum against an expected string (supports "sha256:...", "md5:...", "blake3:...", or raw hex).
+    pub fn verify_checksum(&self, expected: &str) -> Result<bool, String> {
+        let trimmed = expected.trim();
+        let (algo, hash_val) = if let Some(idx) = trimmed.find(':') {
+            let algo = trimmed[..idx].to_ascii_lowercase();
+            let hash = trimmed[idx + 1..].trim().to_ascii_lowercase();
+            (algo, hash)
+        } else {
+            let hash = trimmed.to_ascii_lowercase();
+            if hash.len() == 32 {
+                ("md5".to_string(), hash)
+            } else if hash.len() == 64 {
+                ("sha256".to_string(), hash)
+            } else {
+                ("unknown".to_string(), hash)
+            }
+        };
+
+        match algo.as_str() {
+            "sha256" | "sha-256" => {
+                let actual = self.compute_sha256().map_err(|e| e.to_string())?;
+                if actual.eq_ignore_ascii_case(&hash_val) {
+                    Ok(true)
+                } else {
+                    Err(format!("SHA-256 mismatch: expected {}, got {}", hash_val, actual))
+                }
+            }
+            "md5" => {
+                let actual = self.compute_md5().map_err(|e| e.to_string())?;
+                if actual.eq_ignore_ascii_case(&hash_val) {
+                    Ok(true)
+                } else {
+                    Err(format!("MD5 mismatch: expected {}, got {}", hash_val, actual))
+                }
+            }
+            "blake3" => {
+                let actual = self.compute_file_hash().map_err(|e| e.to_string())?;
+                let actual_hex = hex::encode(&actual);
+                if actual_hex.eq_ignore_ascii_case(&hash_val) {
+                    Ok(true)
+                } else {
+                    Err(format!("BLAKE3 mismatch: expected {}, got {}", hash_val, actual_hex))
+                }
+            }
+            _ => {
+                if let Ok(actual) = self.compute_sha256() {
+                    if actual.eq_ignore_ascii_case(&hash_val) {
+                        return Ok(true);
+                    }
+                }
+                if let Ok(actual) = self.compute_file_hash() {
+                    let actual_hex = hex::encode(&actual);
+                    if actual_hex.eq_ignore_ascii_case(&hash_val) {
+                        return Ok(true);
+                    }
+                }
+                if let Ok(actual) = self.compute_md5() {
+                    if actual.eq_ignore_ascii_case(&hash_val) {
+                        return Ok(true);
+                    }
+                }
+                Err(format!("Checksum verification failed: hash does not match any known algorithm (expected {})", hash_val))
+            }
+        }
+    }
+
     /// Verifies a chunk against an expected hash.
     pub fn verify_chunk(&self, range: &ByteRange, expected_hash: &[u8; 32]) -> Result<bool, StorageError> {
         let actual = self.compute_chunk_hash(range)?;
@@ -314,5 +404,28 @@ mod tests {
         let hash = writer.compute_file_hash().unwrap();
         let expected = *blake3::hash(&[]).as_bytes();
         assert_eq!(hash, expected);
+    }
+
+    #[test]
+    fn test_disk_writer_checksums() {
+        let temp = NamedTempFile::new().unwrap();
+        let path = temp.path().to_path_buf();
+        let writer = DiskWriter::open_or_create(&path, 5).unwrap();
+        writer.write_chunk_slice(0, b"hello").unwrap();
+        writer.sync().unwrap();
+
+        // sha256("hello") = 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
+        let sha256 = writer.compute_sha256().unwrap();
+        assert_eq!(sha256, "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
+
+        // md5("hello") = 5d41402abc4b2a76b9719d911017c592
+        let md5 = writer.compute_md5().unwrap();
+        assert_eq!(md5, "5d41402abc4b2a76b9719d911017c592");
+
+        assert!(writer.verify_checksum("sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824").unwrap());
+        assert!(writer.verify_checksum("md5:5d41402abc4b2a76b9719d911017c592").unwrap());
+        assert!(writer.verify_checksum("5d41402abc4b2a76b9719d911017c592").unwrap()); // auto-detect md5
+        assert!(writer.verify_checksum("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824").unwrap()); // auto-detect sha256
+        assert!(writer.verify_checksum("md5:wronghash").is_err());
     }
 }

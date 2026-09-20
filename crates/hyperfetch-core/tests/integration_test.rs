@@ -113,6 +113,7 @@ async fn test_multi_threaded_download_and_verification() {
         base_chunk_size: 256 * 1024,      // 256KB chunks (4 chunks total)
         min_steal_threshold: 64 * 1024,   // 64KB
         output_path: Some(out_file.clone()),
+        ..Default::default()
     };
 
     let engine = DownloadEngine::new(vec![mirror_url], options);
@@ -144,6 +145,7 @@ async fn test_zero_byte_download() {
         base_chunk_size: 64 * 1024,
         min_steal_threshold: 16 * 1024,
         output_path: Some(out_file.clone()),
+        ..Default::default()
     };
 
     let engine = DownloadEngine::new(vec![mirror_url], options);
@@ -233,6 +235,7 @@ async fn test_non_range_server_download() {
         base_chunk_size: 64 * 1024,
         min_steal_threshold: 16 * 1024,
         output_path: Some(out_file.clone()),
+        ..Default::default()
     };
 
     let engine = DownloadEngine::new(vec![mirror_url], options);
@@ -281,6 +284,7 @@ async fn test_resume_download_with_hfstate() {
         base_chunk_size: 64 * 1024,
         min_steal_threshold: 16 * 1024,
         output_path: Some(out_file.clone()),
+        ..Default::default()
     };
 
     let engine = DownloadEngine::new(vec![mirror_url], options);
@@ -317,6 +321,7 @@ async fn test_dynamic_work_stealing_integration() {
         base_chunk_size: 1024 * 1024,   // 1 single initial chunk
         min_steal_threshold: 32 * 1024, // 32KB threshold enables stealing
         output_path: Some(out_file.clone()),
+        ..Default::default()
     };
 
     let engine = DownloadEngine::new(vec![mirror_url], options);
@@ -364,6 +369,7 @@ async fn test_non_aligned_work_stolen_resume() {
         base_chunk_size: 256 * 1024,
         min_steal_threshold: 32 * 1024,
         output_path: Some(out_file.clone()),
+        ..Default::default()
     };
 
     let engine = DownloadEngine::new(vec![mirror_url], options);
@@ -421,6 +427,7 @@ async fn test_fatal_failure_detection() {
         base_chunk_size: 512 * 1024,
         min_steal_threshold: 64 * 1024,
         output_path: Some(out_file),
+        ..Default::default()
     };
 
     let engine = DownloadEngine::new(vec![mirror_url], options);
@@ -504,6 +511,7 @@ async fn test_premature_stream_closure_retries() {
         base_chunk_size: 256 * 1024,
         min_steal_threshold: 64 * 1024,
         output_path: Some(out_file.clone()),
+        ..Default::default()
     };
 
     let engine = DownloadEngine::new(vec![mirror_url], options);
