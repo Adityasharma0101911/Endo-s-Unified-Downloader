@@ -413,6 +413,106 @@ impl HostResolver for TikTokResolver {
     }
 }
 
+/// Facebook Video Resolver (Extracts direct playable HD and SD progressive streams)
+pub struct FacebookResolver;
+
+impl HostResolver for FacebookResolver {
+    fn can_handle(&self, url: &Url) -> bool {
+        url.host_str().map_or(false, |h| h.contains("facebook.com") || h.contains("fb.watch"))
+    }
+
+    async fn resolve(&self, client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
+        if let Ok(resp) = client.get(url.clone()).send().await {
+            if resp.status().is_success() {
+                let text = resp.text().await.unwrap_or_default();
+                let urls = extract_facebook_video_urls(&text);
+                if !urls.is_empty() {
+                    return Ok(urls);
+                }
+            }
+        }
+
+        Ok(vec![url.clone()])
+    }
+}
+
+/// Dailymotion Resolver (Extracts highest resolution MP4 or HLS master playlist from metadata API)
+pub struct DailymotionResolver;
+
+impl HostResolver for DailymotionResolver {
+    fn can_handle(&self, url: &Url) -> bool {
+        url.host_str().map_or(false, |h| h.contains("dailymotion.com") || h.contains("dai.ly"))
+    }
+
+    async fn resolve(&self, client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
+        let video_id = extract_dailymotion_id(url);
+        if let Some(id) = video_id {
+            let meta_url = format!("https://www.dailymotion.com/player/metadata/video/{}", id);
+            if let Ok(resp) = client.get(&meta_url).send().await {
+                if resp.status().is_success() {
+                    if let Ok(bytes) = resp.bytes().await {
+                        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                            let mut urls = Vec::new();
+
+                            if let Some(qualities) = json.get("qualities").and_then(|q| q.as_object()) {
+                                let mut quality_keys: Vec<&String> = qualities.keys().collect();
+                                quality_keys.sort_by(|a, b| {
+                                    let a_num = a.parse::<u64>().unwrap_or(0);
+                                    let b_num = b.parse::<u64>().unwrap_or(0);
+                                    b_num.cmp(&a_num)
+                                });
+
+                                for key in quality_keys {
+                                    if let Some(arr) = qualities.get(key).and_then(|v| v.as_array()) {
+                                        for item in arr {
+                                            if let Some(u_str) = item.get("url").and_then(|u| u.as_str()) {
+                                                if let Ok(u) = Url::parse(u_str) {
+                                                    if !urls.contains(&u) {
+                                                        urls.push(u);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            if !urls.is_empty() {
+                                return Ok(urls);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(vec![url.clone()])
+    }
+}
+
+/// Instagram Video Resolver (Extracts progressive MP4 streams from video versions metadata)
+pub struct InstagramResolver;
+
+impl HostResolver for InstagramResolver {
+    fn can_handle(&self, url: &Url) -> bool {
+        url.host_str().map_or(false, |h| h.contains("instagram.com"))
+    }
+
+    async fn resolve(&self, client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
+        if let Ok(resp) = client.get(url.clone()).send().await {
+            if resp.status().is_success() {
+                let text = resp.text().await.unwrap_or_default();
+                let urls = extract_instagram_video_urls(&text);
+                if !urls.is_empty() {
+                    return Ok(urls);
+                }
+            }
+        }
+
+        Ok(vec![url.clone()])
+    }
+}
+
 /// HTML5 Video Extractor (Extracts direct media streams from webpage <video>, <source>, and OpenGraph tags)
 pub struct HtmlVideoResolver;
 
@@ -539,6 +639,30 @@ impl SmartResolver {
             }
         }
 
+        if FacebookResolver.can_handle(url) {
+            if let Ok(mirrors) = FacebookResolver.resolve(client, url).await {
+                if mirrors != vec![url.clone()] && !mirrors.is_empty() {
+                    return mirrors;
+                }
+            }
+        }
+
+        if DailymotionResolver.can_handle(url) {
+            if let Ok(mirrors) = DailymotionResolver.resolve(client, url).await {
+                if mirrors != vec![url.clone()] && !mirrors.is_empty() {
+                    return mirrors;
+                }
+            }
+        }
+
+        if InstagramResolver.can_handle(url) {
+            if let Ok(mirrors) = InstagramResolver.resolve(client, url).await {
+                if mirrors != vec![url.clone()] && !mirrors.is_empty() {
+                    return mirrors;
+                }
+            }
+        }
+
         // Check for embedded HTML video sources on webpages
         if HtmlVideoResolver.can_handle(url) {
             if let Ok(video_sources) = HtmlVideoResolver.resolve(client, url).await {
@@ -638,6 +762,81 @@ fn extract_tiktok_addr(html: &str, key: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn extract_dailymotion_id(url: &Url) -> Option<String> {
+    let host = url.host_str()?;
+    let segments: Vec<&str> = url.path_segments()?.filter(|s| !s.is_empty()).collect();
+    if host.contains("dai.ly") {
+        return segments.first().map(|s| s.to_string());
+    }
+    if let Some(pos) = segments.iter().position(|&s| s == "video") {
+        if let Some(&id) = segments.get(pos + 1) {
+            let clean_id = id.split('_').next().unwrap_or(id);
+            return Some(clean_id.to_string());
+        }
+    }
+    None
+}
+
+fn extract_facebook_video_urls(html: &str) -> Vec<Url> {
+    let mut urls = Vec::new();
+    let keys = [
+        "playable_url_quality_hd",
+        "browser_native_hd_url",
+        "playable_url",
+        "browser_native_sd_url",
+    ];
+    for key in keys {
+        let pattern = format!("\"{}\":\"", key);
+        let mut search_idx = 0;
+        while let Some(idx) = html[search_idx..].find(&pattern) {
+            let actual_idx = search_idx + idx + pattern.len();
+            let sub = &html[actual_idx..];
+            if let Some(end) = sub.find('"') {
+                let raw_url = &sub[..end];
+                let cleaned = raw_url
+                    .replace("\\u0026", "&")
+                    .replace("\\/", "/")
+                    .replace("&amp;", "&");
+                if let Ok(u) = Url::parse(&cleaned) {
+                    if !urls.contains(&u) {
+                        urls.push(u);
+                    }
+                }
+                search_idx = actual_idx + end;
+            } else {
+                break;
+            }
+        }
+    }
+    urls
+}
+
+fn extract_instagram_video_urls(html: &str) -> Vec<Url> {
+    let mut urls = Vec::new();
+    let pattern = "\"video_url\":\"";
+    let mut search_idx = 0;
+    while let Some(idx) = html[search_idx..].find(pattern) {
+        let actual_idx = search_idx + idx + pattern.len();
+        let sub = &html[actual_idx..];
+        if let Some(end) = sub.find('"') {
+            let raw_url = &sub[..end];
+            let cleaned = raw_url
+                .replace("\\u0026", "&")
+                .replace("\\/", "/")
+                .replace("&amp;", "&");
+            if let Ok(u) = Url::parse(&cleaned) {
+                if !urls.contains(&u) {
+                    urls.push(u);
+                }
+            }
+            search_idx = actual_idx + end;
+        } else {
+            break;
+        }
+    }
+    urls
 }
 
 fn extract_google_drive_id(url: &Url) -> Option<String> {
@@ -863,6 +1062,19 @@ mod tests {
 
         let tiktok_html = r#"<script id="SIGI_STATE">{"playAddr":"https:\/\/v16.tiktokcdn.com\/video\/123\/?token=abc"}</script>"#;
         assert_eq!(extract_tiktok_addr(tiktok_html, "playAddr"), Some("https:\\/\\/v16.tiktokcdn.com\\/video\\/123\\/?token=abc".to_string()));
+
+        let dailymotion_url = Url::parse("https://www.dailymotion.com/video/x8xyz12_some-video-title").unwrap();
+        assert_eq!(extract_dailymotion_id(&dailymotion_url), Some("x8xyz12".to_string()));
+
+        let fb_html = r#"{"playable_url_quality_hd":"https:\/\/video.xx.fbcdn.net\/v\/hd.mp4?oh=123\u0026oe=456","playable_url":"https:\/\/video.xx.fbcdn.net\/v\/sd.mp4?oh=123\u0026oe=456"}"#;
+        let fb_urls = extract_facebook_video_urls(fb_html);
+        assert_eq!(fb_urls.len(), 2);
+        assert_eq!(fb_urls[0].as_str(), "https://video.xx.fbcdn.net/v/hd.mp4?oh=123&oe=456");
+
+        let ig_html = r#"{"video_url":"https:\/\/instagram.xx.fbcdn.net\/v\/t50.2886-16\/video.mp4?_nc_cat=100\u0026oh=789"}"#;
+        let ig_urls = extract_instagram_video_urls(ig_html);
+        assert_eq!(ig_urls.len(), 1);
+        assert_eq!(ig_urls[0].as_str(), "https://instagram.xx.fbcdn.net/v/t50.2886-16/video.mp4?_nc_cat=100&oh=789");
     }
 
     #[test]
@@ -871,5 +1083,8 @@ mod tests {
         assert!(RedditResolver.can_handle(&Url::parse("https://v.redd.it/xyz123").unwrap()));
         assert!(TwitterResolver.can_handle(&Url::parse("https://x.com/user/status/987654").unwrap()));
         assert!(TikTokResolver.can_handle(&Url::parse("https://www.tiktok.com/@user/video/12345").unwrap()));
+        assert!(FacebookResolver.can_handle(&Url::parse("https://www.facebook.com/watch/?v=12345").unwrap()));
+        assert!(DailymotionResolver.can_handle(&Url::parse("https://dai.ly/x8xyz").unwrap()));
+        assert!(InstagramResolver.can_handle(&Url::parse("https://www.instagram.com/reel/C12345/").unwrap()));
     }
 }

@@ -32,6 +32,9 @@ Endo features an extensible `HostResolver` pipeline that detects host patterns a
 - **Reddit (v.redd.it):** Automatically extracts synchronized video + audio HLS streams (`HLSPlaylist.m3u8`) and fallback DASH streams.
 - **Twitter / X:** Queries syndication APIs to extract all MP4 variants and auto-selects the highest bitrate stream.
 - **TikTok:** Automatically extracts raw `playAddr` and `downloadAddr` CDN streams from video pages.
+- **Facebook / FB Watch:** Automatically extracts direct playable HD and SD progressive streams (`playable_url_quality_hd` and `browser_native_hd_url`).
+- **Dailymotion:** Queries player metadata endpoints to harvest all resolution variants (1080p, 720p, 480p) and master HLS playlists.
+- **Instagram:** Extracts progressive MP4 video version endpoints from post and reel metadata.
 - **HLS (.m3u8) Stream Ingestion & Segment Stitching:** Automatically parses master and media HLS playlists, auto-selects the highest resolution variant (1080p/4K), downloads all `.ts` segments concurrently across 16–32 connections, and stitches them in-order into a single cohesive `.mp4` video file on disk.
 - **Web & HTML5 Video Extraction:** When given a webpage URL containing embedded video content, the engine parses `<video>`, `<source src="...">`, OpenGraph tags (`og:video`), and Twitter player streams to extract direct underlying media files (`.mp4`, `.webm`, `.mkv`, etc.) and downloads them directly across parallel range streams.
 - **Anti-QoS Browser Headers:** Emulates modern browser headers (`Sec-Ch-Ua`, Chrome 124 user-agent) to prevent hosters from routing connections to low-priority bandwidth queues.
