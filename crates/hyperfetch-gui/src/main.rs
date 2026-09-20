@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -43,6 +44,15 @@ struct DownloaderApp {
     auth_header_input: String,
     media_preset_idx: usize,
     browser_cookies_idx: usize,
+
+    // Clipboard Watcher
+    clipboard_watcher_enabled: bool,
+    last_clipboard_text: String,
+    clipboard_banner: Option<String>,
+    last_clipboard_check: Instant,
+
+    // Throughput History (Last 60 Seconds)
+    speed_history: VecDeque<(Instant, f64)>,
 
     // Tabs & Batch Queue
     active_tab: GuiTab,
@@ -108,6 +118,12 @@ impl DownloaderApp {
             auth_header_input: String::new(),
             media_preset_idx: 0,
             browser_cookies_idx: 0,
+
+            clipboard_watcher_enabled: true,
+            last_clipboard_text: String::new(),
+            clipboard_banner: None,
+            last_clipboard_check: Instant::now(),
+            speed_history: VecDeque::new(),
 
             active_tab: GuiTab::Downloader,
             queue: hyperfetch_core::queue::DownloadQueue::new(),
@@ -410,9 +426,44 @@ impl eframe::App for DownloaderApp {
             }
         }
 
-        // Request continuous repaint while downloading for smooth 60 FPS progress
-        if self.status == DownloadStatus::Downloading {
+        // Sample throughput history
+        let now = Instant::now();
+        self.speed_history.push_back((now, self.speed_bytes_per_sec));
+        while let Some((t, _)) = self.speed_history.front() {
+            if now.duration_since(*t).as_secs() > 60 {
+                self.speed_history.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        // Check clipboard periodically if watcher is enabled
+        if self.clipboard_watcher_enabled && self.last_clipboard_check.elapsed() >= std::time::Duration::from_millis(500) {
+            self.last_clipboard_check = Instant::now();
+            if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                if let Ok(text) = clipboard.get_text() {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() && trimmed != self.last_clipboard_text && trimmed != self.url_input.trim() {
+                        self.last_clipboard_text = trimmed.to_string();
+                        if trimmed.starts_with("http://")
+                            || trimmed.starts_with("https://")
+                            || trimmed.starts_with("magnet:?")
+                            || hyperfetch_core::torrent::is_magnet_uri(trimmed)
+                        {
+                            if self.url_input.trim() != trimmed {
+                                self.clipboard_banner = Some(trimmed.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Request continuous repaint while downloading for smooth 60 FPS progress, or 2 Hz for clipboard watcher
+        if self.status == DownloadStatus::Downloading || self.status == DownloadStatus::Resolving {
             ctx.request_repaint();
+        } else if self.clipboard_watcher_enabled {
+            ctx.request_repaint_after(std::time::Duration::from_millis(500));
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -481,10 +532,64 @@ fn render_ui(app: &mut DownloaderApp, ui: &mut egui::Ui) {
             if ui.add_sized([100.0, 24.0], dl_btn).clicked() {
                 app.active_tab = GuiTab::Downloader;
             }
+
+            let clip_text = if app.clipboard_watcher_enabled { "Clipboard Watch: ON" } else { "Clipboard Watch: OFF" };
+            let clip_btn = egui::Button::new(
+                egui::RichText::new(clip_text)
+                    .size(11.0)
+                    .color(if app.clipboard_watcher_enabled { Color32::from_rgb(56, 189, 248) } else { Color32::from_rgb(148, 163, 184) }),
+            )
+            .fill(Color32::from_rgb(26, 28, 35));
+            if ui.add_sized([135.0, 24.0], clip_btn).clicked() {
+                app.clipboard_watcher_enabled = !app.clipboard_watcher_enabled;
+                if !app.clipboard_watcher_enabled {
+                    app.clipboard_banner = None;
+                }
+            }
         });
     });
 
-    ui.add_space(10.0);
+    // Clipboard Ingest Banner
+    if let Some(ref detected_url) = app.clipboard_banner.clone() {
+        ui.add_space(6.0);
+        egui::Frame::none()
+            .fill(Color32::from_rgb(22, 27, 38))
+            .stroke(Stroke::new(1.0, Color32::from_rgb(37, 99, 235)))
+            .inner_margin(8.0)
+            .rounding(4.0)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Clipboard Link Detected:").strong().color(Color32::from_rgb(56, 189, 248)));
+                    let truncated = if detected_url.len() > 55 {
+                        format!("{}...", &detected_url[..52])
+                    } else {
+                        detected_url.clone()
+                    };
+                    ui.label(egui::RichText::new(truncated).monospace().color(Color32::from_rgb(228, 232, 240)));
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button(egui::RichText::new("Dismiss").size(11.0)).clicked() {
+                            app.clipboard_banner = None;
+                        }
+                        if ui.button(egui::RichText::new("Paste").size(11.0)).clicked() {
+                            app.url_input = detected_url.clone();
+                            app.clipboard_banner = None;
+                        }
+                        let dl_now = egui::Button::new(
+                            egui::RichText::new("Download Now").strong().size(11.0).color(Color32::WHITE),
+                        )
+                        .fill(Color32::from_rgb(37, 99, 235));
+                        if ui.add(dl_now).clicked() {
+                            app.url_input = detected_url.clone();
+                            app.clipboard_banner = None;
+                            app.start_download();
+                        }
+                    });
+                });
+            });
+    }
+
+    ui.add_space(8.0);
 
     match app.active_tab {
         GuiTab::Downloader => render_downloader_tab(app, ui),
@@ -949,6 +1054,148 @@ fn render_downloader_tab(app: &mut DownloaderApp, ui: &mut egui::Ui) {
                 .color(Color32::from_rgb(148, 163, 184)),
         );
     });
+
+    ui.add_space(10.0);
+
+    // Real-Time 60-Second Throughput Graph
+    render_throughput_graph(app, ui);
+}
+
+fn render_throughput_graph(app: &DownloaderApp, ui: &mut egui::Ui) {
+    let now = Instant::now();
+
+    let mut peak_speed: f64 = 0.0;
+    let mut sum_speed: f64 = 0.0;
+    let mut count = 0;
+
+    for (_, speed) in &app.speed_history {
+        if *speed > peak_speed {
+            peak_speed = *speed;
+        }
+        sum_speed += *speed;
+        count += 1;
+    }
+
+    let avg_speed = if count > 0 { sum_speed / count as f64 } else { 0.0 };
+
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("THROUGHPUT GRAPH (LAST 60 SECONDS)").strong().size(12.0));
+
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let stats = format!(
+                "Peak: {}/s  |  Avg: {}/s  |  Current: {}/s",
+                format_bytes(peak_speed as u64),
+                format_bytes(avg_speed as u64),
+                format_bytes(app.speed_bytes_per_sec as u64)
+            );
+            ui.label(
+                egui::RichText::new(stats)
+                    .size(11.0)
+                    .monospace()
+                    .color(Color32::from_rgb(148, 163, 184)),
+            );
+        });
+    });
+
+    ui.add_space(4.0);
+
+    let graph_height = 80.0;
+    let (response, painter) = ui.allocate_painter(Vec2::new(ui.available_width(), graph_height), egui::Sense::hover());
+    let rect = response.rect;
+
+    // Background and frame
+    painter.rect_filled(rect, 4.0, Color32::from_rgb(20, 22, 28));
+    painter.rect_stroke(rect, 4.0, Stroke::new(1.0, Color32::from_rgb(38, 42, 53)));
+
+    // Grid lines (50% and 100%)
+    let y_mid = rect.min.y + (rect.height() / 2.0);
+    painter.line_segment(
+        [Pos2::new(rect.min.x, y_mid), Pos2::new(rect.max.x, y_mid)],
+        Stroke::new(1.0, Color32::from_rgba_unmultiplied(45, 48, 60, 100)),
+    );
+
+    let max_y_speed = (peak_speed * 1.15).max(1024.0 * 1024.0);
+    let label_top = format!("{}/s", format_bytes(max_y_speed as u64));
+    let label_mid = format!("{}/s", format_bytes((max_y_speed / 2.0) as u64));
+
+    painter.text(
+        Pos2::new(rect.min.x + 6.0, rect.min.y + 4.0),
+        egui::Align2::LEFT_TOP,
+        label_top,
+        egui::FontId::monospace(9.0),
+        Color32::from_rgb(100, 116, 139),
+    );
+    painter.text(
+        Pos2::new(rect.min.x + 6.0, y_mid + 2.0),
+        egui::Align2::LEFT_TOP,
+        label_mid,
+        egui::FontId::monospace(9.0),
+        Color32::from_rgb(100, 116, 139),
+    );
+
+    // Render speed curve if points exist
+    if app.speed_history.len() >= 2 {
+        let mut line_points = Vec::new();
+        let width = rect.width();
+        let height = rect.height() - 6.0;
+
+        for (t, speed) in &app.speed_history {
+            let age_secs = now.duration_since(*t).as_secs_f32().min(60.0);
+            let x_ratio = 1.0 - (age_secs / 60.0);
+            let y_ratio = (*speed as f32 / max_y_speed as f32).clamp(0.0, 1.0);
+
+            let pt_x = rect.min.x + (x_ratio * width);
+            let pt_y = (rect.max.y - 2.0) - (y_ratio * height);
+            line_points.push(Pos2::new(pt_x, pt_y));
+        }
+
+        // Draw area fill using convex trapezoid segments
+        let fill_color = Color32::from_rgba_unmultiplied(37, 99, 235, 30);
+        for i in 0..line_points.len().saturating_sub(1) {
+            let p0 = line_points[i];
+            let p1 = line_points[i + 1];
+            let b0 = Pos2::new(p0.x, rect.max.y - 1.0);
+            let b1 = Pos2::new(p1.x, rect.max.y - 1.0);
+
+            painter.add(egui::Shape::convex_polygon(
+                vec![b0, b1, p1, p0],
+                fill_color,
+                Stroke::NONE,
+            ));
+        }
+
+        // Draw top speed stroke
+        if line_points.len() >= 2 {
+            painter.add(egui::Shape::line(
+                line_points,
+                Stroke::new(2.0, Color32::from_rgb(56, 189, 248)),
+            ));
+        }
+    }
+
+    // Hover tooltip
+    if let Some(hover_pos) = response.hover_pos() {
+        if rect.contains(hover_pos) {
+            let age_ratio = 1.0 - ((hover_pos.x - rect.min.x) / rect.width());
+            let target_age_secs = (age_ratio * 60.0) as u64;
+
+            if let Some((_, speed)) = app.speed_history.iter().min_by_key(|(t, _)| {
+                let age = now.duration_since(*t).as_secs();
+                (age as i64 - target_age_secs as i64).abs()
+            }) {
+                painter.line_segment(
+                    [Pos2::new(hover_pos.x, rect.min.y), Pos2::new(hover_pos.x, rect.max.y)],
+                    Stroke::new(1.0, Color32::from_rgb(148, 163, 184)),
+                );
+
+                response.show_tooltip_text(format!(
+                    "T-{}s: {}/s",
+                    target_age_secs,
+                    format_bytes(*speed as u64)
+                ));
+            }
+        }
+    }
 }
 
 fn render_queue_tab(app: &mut DownloaderApp, ui: &mut egui::Ui) {

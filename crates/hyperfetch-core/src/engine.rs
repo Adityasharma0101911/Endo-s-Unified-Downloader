@@ -251,6 +251,7 @@ impl DownloadEngine {
                 output_dir,
                 output_filename,
                 custom_ytdlp_path: None,
+                concurrent_fragments: self.options.num_connections.clamp(1, 32),
             };
 
             let res = crate::media::download_media(

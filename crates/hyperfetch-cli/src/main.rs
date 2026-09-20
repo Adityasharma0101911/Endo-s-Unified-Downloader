@@ -48,6 +48,10 @@ struct Args {
     /// Extract cookies from browser: "chrome", "edge", "firefox", "brave", "opera", "vivaldi"
     #[arg(long = "cookies-from-browser")]
     cookies_from_browser: Option<String>,
+
+    /// Concurrent fragment downloads for media streams (1-32)
+    #[arg(long = "concurrent-fragments", default_value_t = 8)]
+    concurrent_fragments: usize,
 }
 
 #[tokio::main]

@@ -123,6 +123,7 @@ pub struct MediaDownloadOptions {
     pub output_dir: PathBuf,
     pub output_filename: Option<String>,
     pub custom_ytdlp_path: Option<PathBuf>,
+    pub concurrent_fragments: usize,
 }
 
 impl Default for MediaDownloadOptions {
@@ -134,6 +135,7 @@ impl Default for MediaDownloadOptions {
             output_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             output_filename: None,
             custom_ytdlp_path: None,
+            concurrent_fragments: 8,
         }
     }
 }
@@ -476,6 +478,16 @@ pub async fn download_media(
         args.push("--proxy".to_string());
         args.push(proxy.clone());
     }
+
+    // High throughput buffers and concurrent fragments
+    if options.concurrent_fragments > 1 {
+        args.push("--concurrent-fragments".to_string());
+        args.push(options.concurrent_fragments.clamp(1, 32).to_string());
+    }
+    args.push("--buffer-size".to_string());
+    args.push("16M".to_string());
+    args.push("--http-chunk-size".to_string());
+    args.push("10M".to_string());
 
     // Output template
     let output_template = if let Some(ref name) = options.output_filename {
