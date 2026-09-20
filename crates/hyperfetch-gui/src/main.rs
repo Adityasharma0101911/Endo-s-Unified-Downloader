@@ -45,14 +45,21 @@ struct DownloaderApp {
     media_preset_idx: usize,
     browser_cookies_idx: usize,
 
-    // Clipboard Watcher
+    // Clipboard Watcher (Background worker - zero UI blocking)
     clipboard_watcher_enabled: bool,
-    last_clipboard_text: String,
+    clipboard_enable_flag: Arc<AtomicBool>,
+    clipboard_rx: std::sync::mpsc::Receiver<String>,
     clipboard_banner: Option<String>,
-    last_clipboard_check: Instant,
 
-    // Throughput History (Last 60 Seconds)
+    // Throughput History (Last 60 Seconds at 10 Hz)
     speed_history: VecDeque<(Instant, f64)>,
+    last_history_sample: Instant,
+
+    // Smooth animations & interpolation
+    animated_speed: f64,
+    animated_progress: f64,
+    last_frame_time: Instant,
+    pulse_phase: f32,
 
     // Tabs & Batch Queue
     active_tab: GuiTab,
@@ -104,6 +111,39 @@ impl DownloaderApp {
             .build()
             .expect("Failed to initialize Tokio runtime");
 
+        // Spawn background clipboard watcher to prevent any UI thread blocking
+        let (clipboard_tx, clipboard_rx) = std::sync::mpsc::channel();
+        let clipboard_enable = Arc::new(AtomicBool::new(true));
+        let clipboard_enable_clone = Arc::clone(&clipboard_enable);
+
+        std::thread::Builder::new()
+            .name("clipboard-watcher".to_string())
+            .spawn(move || {
+                let mut last_seen = String::new();
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    if !clipboard_enable_clone.load(Ordering::Relaxed) {
+                        continue;
+                    }
+                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                        if let Ok(text) = clipboard.get_text() {
+                            let trimmed = text.trim();
+                            if !trimmed.is_empty() && trimmed != last_seen {
+                                last_seen = trimmed.to_string();
+                                if trimmed.starts_with("http://")
+                                    || trimmed.starts_with("https://")
+                                    || trimmed.starts_with("magnet:?")
+                                    || hyperfetch_core::torrent::is_magnet_uri(trimmed)
+                                {
+                                    let _ = clipboard_tx.send(trimmed.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            })
+            .expect("Failed to spawn clipboard watcher thread");
+
         Self {
             url_input: String::new(),
             save_dir: default_dir,
@@ -120,10 +160,17 @@ impl DownloaderApp {
             browser_cookies_idx: 0,
 
             clipboard_watcher_enabled: true,
-            last_clipboard_text: String::new(),
+            clipboard_enable_flag: clipboard_enable,
+            clipboard_rx,
             clipboard_banner: None,
-            last_clipboard_check: Instant::now(),
+
             speed_history: VecDeque::new(),
+            last_history_sample: Instant::now(),
+
+            animated_speed: 0.0,
+            animated_progress: 0.0,
+            last_frame_time: Instant::now(),
+            pulse_phase: 0.0,
 
             active_tab: GuiTab::Downloader,
             queue: hyperfetch_core::queue::DownloadQueue::new(),
@@ -365,11 +412,40 @@ impl DownloaderApp {
         self.eta_secs = None;
         self.target_filepath = None;
         self.chunks.clear();
+        self.animated_speed = 0.0;
+        self.animated_progress = 0.0;
     }
 }
 
 impl eframe::App for DownloaderApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Calculate dt for silky smooth 60fps animations
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_frame_time).as_secs_f32().clamp(0.001, 0.1);
+        self.last_frame_time = now;
+
+        // Smooth 8x lerp for speed (smooth transition without jumping)
+        self.animated_speed += (self.speed_bytes_per_sec - self.animated_speed) * (dt as f64 * 8.0).clamp(0.0, 1.0);
+        if (self.speed_bytes_per_sec - self.animated_speed).abs() < 1.0 {
+            self.animated_speed = self.speed_bytes_per_sec;
+        }
+
+        // Smooth 10x lerp for progress bar
+        self.animated_progress += (self.progress_ratio - self.animated_progress) * (dt as f64 * 10.0).clamp(0.0, 1.0);
+
+        // Advance pulse phase for glowing active chunks and graph tracer
+        self.pulse_phase = (self.pulse_phase + dt * 3.5) % std::f32::consts::TAU;
+
+        // Sync clipboard enabled flag with background worker
+        self.clipboard_enable_flag.store(self.clipboard_watcher_enabled, Ordering::Relaxed);
+
+        // Non-blocking drain of background clipboard discoveries
+        while let Ok(url) = self.clipboard_rx.try_recv() {
+            if self.url_input.trim() != url {
+                self.clipboard_banner = Some(url);
+            }
+        }
+
         // Handle incoming snapshots
         if let Some(ref rx) = self.snapshot_rx {
             while let Ok(snapshot) = rx.try_recv() {
@@ -426,44 +502,26 @@ impl eframe::App for DownloaderApp {
             }
         }
 
-        // Sample throughput history
-        let now = Instant::now();
-        self.speed_history.push_back((now, self.speed_bytes_per_sec));
-        while let Some((t, _)) = self.speed_history.front() {
-            if now.duration_since(*t).as_secs() > 60 {
-                self.speed_history.pop_front();
-            } else {
-                break;
-            }
-        }
-
-        // Check clipboard periodically if watcher is enabled
-        if self.clipboard_watcher_enabled && self.last_clipboard_check.elapsed() >= std::time::Duration::from_millis(500) {
-            self.last_clipboard_check = Instant::now();
-            if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                if let Ok(text) = clipboard.get_text() {
-                    let trimmed = text.trim();
-                    if !trimmed.is_empty() && trimmed != self.last_clipboard_text && trimmed != self.url_input.trim() {
-                        self.last_clipboard_text = trimmed.to_string();
-                        if trimmed.starts_with("http://")
-                            || trimmed.starts_with("https://")
-                            || trimmed.starts_with("magnet:?")
-                            || hyperfetch_core::torrent::is_magnet_uri(trimmed)
-                        {
-                            if self.url_input.trim() != trimmed {
-                                self.clipboard_banner = Some(trimmed.to_string());
-                            }
-                        }
-                    }
+        // Sample speed history at fixed 10 Hz (every 100ms)
+        if now.duration_since(self.last_history_sample) >= std::time::Duration::from_millis(100) {
+            self.last_history_sample = now;
+            self.speed_history.push_back((now, self.animated_speed));
+            while let Some((t, _)) = self.speed_history.front() {
+                if now.duration_since(*t).as_secs() > 60 {
+                    self.speed_history.pop_front();
+                } else {
+                    break;
                 }
             }
         }
 
-        // Request continuous repaint while downloading for smooth 60 FPS progress, or 2 Hz for clipboard watcher
+        // Repaint continuously when downloading/animating (60 FPS), or at 30 FPS when idle for smooth pulse animations
         if self.status == DownloadStatus::Downloading || self.status == DownloadStatus::Resolving {
             ctx.request_repaint();
-        } else if self.clipboard_watcher_enabled {
-            ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        } else if self.clipboard_banner.is_some() || self.animated_progress > 0.0 && self.animated_progress < 1.0 {
+            ctx.request_repaint();
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(33)); // 30 FPS idle
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -857,11 +915,11 @@ fn render_downloader_tab(app: &mut DownloaderApp, ui: &mut egui::Ui) {
         .inner_margin(12.0)
         .rounding(6.0)
         .show(ui, |ui| {
-            // Main Progress Bar
-            let progress_percent = (app.progress_ratio * 100.0).clamp(0.0, 100.0);
+            // Main Progress Bar (smooth animated lerp)
+            let progress_percent = (app.animated_progress * 100.0).clamp(0.0, 100.0);
             let bar_text = format!("{:.1}%", progress_percent);
             ui.add(
-                egui::ProgressBar::new(app.progress_ratio as f32)
+                egui::ProgressBar::new(app.animated_progress as f32)
                     .show_percentage()
                     .animate(app.status == DownloadStatus::Downloading)
                     .text(bar_text),
@@ -882,10 +940,10 @@ fn render_downloader_tab(app: &mut DownloaderApp, ui: &mut egui::Ui) {
                     ui.label(egui::RichText::new(text).strong().size(13.0));
                 });
 
-                // Column 2: Speed
+                // Column 2: Speed (smooth animated lerp)
                 cols[1].vertical(|ui| {
                     ui.label(egui::RichText::new("Speed").size(11.0).color(Color32::from_rgb(148, 163, 184)));
-                    let speed_text = format!("{}/s", format_bytes(app.speed_bytes_per_sec as u64));
+                    let speed_text = format!("{}/s", format_bytes(app.animated_speed as u64));
                     ui.label(egui::RichText::new(speed_text).strong().size(13.0).color(Color32::from_rgb(56, 189, 248)));
                 });
 
@@ -959,8 +1017,12 @@ fn render_downloader_tab(app: &mut DownloaderApp, ui: &mut egui::Ui) {
                 let fill_rect = Rect::from_min_size(Pos2::new(seg_x, rect.min.y + 1.0), Vec2::new(fill_w, canvas_height - 2.0));
                 painter.rect_filled(fill_rect, 0.0, Color32::from_rgb(59, 130, 246));
             } else if chunk.status.contains("Worker") {
-                // Assigned worker: active cyan stroke
-                painter.rect_filled(seg_rect, 0.0, Color32::from_rgb(14, 116, 144));
+                // Assigned worker: active pulsing cyan wave
+                let pulse = ((app.pulse_phase.sin() + 1.0) * 0.5).clamp(0.0, 1.0);
+                let r = (14.0 + pulse * 20.0) as u8;
+                let g = (116.0 + pulse * 45.0) as u8;
+                let b = (144.0 + pulse * 70.0) as u8;
+                painter.rect_filled(seg_rect, 0.0, Color32::from_rgb(r, g, b));
             } else {
                 // Pending: dark gray
                 painter.rect_filled(seg_rect, 0.0, Color32::from_rgb(39, 39, 42));
@@ -1086,7 +1148,7 @@ fn render_throughput_graph(app: &DownloaderApp, ui: &mut egui::Ui) {
                 "Peak: {}/s  |  Avg: {}/s  |  Current: {}/s",
                 format_bytes(peak_speed as u64),
                 format_bytes(avg_speed as u64),
-                format_bytes(app.speed_bytes_per_sec as u64)
+                format_bytes(app.animated_speed as u64)
             );
             ui.label(
                 egui::RichText::new(stats)
@@ -1149,27 +1211,43 @@ fn render_throughput_graph(app: &DownloaderApp, ui: &mut egui::Ui) {
             line_points.push(Pos2::new(pt_x, pt_y));
         }
 
-        // Draw area fill using convex trapezoid segments
-        let fill_color = Color32::from_rgba_unmultiplied(37, 99, 235, 30);
-        for i in 0..line_points.len().saturating_sub(1) {
-            let p0 = line_points[i];
-            let p1 = line_points[i + 1];
-            let b0 = Pos2::new(p0.x, rect.max.y - 1.0);
-            let b1 = Pos2::new(p1.x, rect.max.y - 1.0);
+        // Draw area fill using a single lightweight egui::Mesh with vertical gradient
+        let mut mesh = egui::Mesh::default();
+        let top_color = Color32::from_rgba_unmultiplied(37, 99, 235, 40);
+        let bot_color = Color32::from_rgba_unmultiplied(37, 99, 235, 5);
 
-            painter.add(egui::Shape::convex_polygon(
-                vec![b0, b1, p1, p0],
-                fill_color,
-                Stroke::NONE,
-            ));
+        for p in &line_points {
+            let base = Pos2::new(p.x, rect.max.y - 1.0);
+            mesh.colored_vertex(*p, top_color);
+            mesh.colored_vertex(base, bot_color);
         }
 
+        for i in 0..(line_points.len() as u32 - 1) {
+            let top_left = i * 2;
+            let bot_left = i * 2 + 1;
+            let top_right = (i + 1) * 2;
+            let bot_right = (i + 1) * 2 + 1;
+            mesh.add_triangle(top_left, bot_left, bot_right);
+            mesh.add_triangle(top_left, bot_right, top_right);
+        }
+        painter.add(egui::Shape::mesh(mesh));
+
         // Draw top speed stroke
-        if line_points.len() >= 2 {
-            painter.add(egui::Shape::line(
-                line_points,
-                Stroke::new(2.0, Color32::from_rgb(56, 189, 248)),
-            ));
+        painter.add(egui::Shape::line(
+            line_points.clone(),
+            Stroke::new(2.0, Color32::from_rgb(56, 189, 248)),
+        ));
+
+        // Animated glowing tracer on the live edge (last point)
+        if let Some(&last_pt) = line_points.last() {
+            let pulse = ((app.pulse_phase.sin() + 1.0) * 0.5).clamp(0.0, 1.0);
+            let glow_radius = 4.0 + pulse * 3.0;
+            painter.circle_filled(
+                last_pt,
+                glow_radius,
+                Color32::from_rgba_unmultiplied(56, 189, 248, (40.0 + pulse * 50.0) as u8),
+            );
+            painter.circle_filled(last_pt, 3.0, Color32::from_rgb(255, 255, 255));
         }
     }
 
