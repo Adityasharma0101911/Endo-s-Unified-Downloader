@@ -21,10 +21,14 @@ Endo's Unified Downloader is a systems-level download utility engineered to maxi
 ### Adaptive Dynamic Chunking (Work Stealing)
 Instead of dividing files into fixed static ranges, the engine partitions files into dynamic chunks (default: 4 MB). Workers that complete their assigned ranges early inspect active streams and split the remaining byte-range of the slowest in-flight connection at its midpoint. This prevents single slow streams from gating overall download completion.
 
-### Archive.org Multi-Cluster Auto-Discovery
-Standard downloaders query single URLs (e.g. `archive.org/download/...`), which redirect to a single storage server subject to per-IP rate limits (typically 2–3 MB/s). 
-
-Endo's Unified Downloader automatically queries the Archive.org Metadata API (`/metadata/:id`) to extract all replica hosts listed in `workable_servers`. Connections are then distributed across multiple physical storage clusters concurrently, multiplying aggregate throughput.
+### Universal Host Resolvers & Landing Page Bypass
+Endo features an extensible `HostResolver` pipeline that detects host patterns and resolves them to direct multi-stream endpoints:
+- **Google Drive:** Automatically extracts file IDs and bypasses the "Google Drive can't scan this file for viruses" confirmation gate on files >100MB, streaming directly from `docs.googleusercontent.com`.
+- **MediaFire:** Automatically scrapes landing pages to extract direct high-speed CDN streaming links (`downloadXXXX.mediafire.com`), bypassing web countdowns and advertisements.
+- **Archive.org:** Queries the Metadata API (`/metadata/:id`) to extract all replica hosts in `workable_servers`, racing across 3–5 physical data-center clusters simultaneously.
+- **SourceForge:** Harvests 5+ global CDN mirrors (`fastly`, `heanet`, `jaist`, `liquidtelecom`) and feeds them into `MirrorRacer` concurrently.
+- **Dropbox:** Automatically normalizes preview links (`dl=0`) to raw binary streaming links (`dl=1`).
+- **Anti-QoS Browser Headers:** Emulates modern browser headers (`Sec-Ch-Ua`, Chrome 124 user-agent) to prevent hosters from routing connections to low-priority bandwidth queues.
 
 ### Mirror Racing
 When provided with multiple mirror URLs for a resource, the engine maintains an Exponential Weighted Moving Average (EWMA) of latency (TTFB) and throughput for each host. Requests are dynamically routed to whichever host currently yields the highest sustained transfer rate, with automated backoff for throttled endpoints.

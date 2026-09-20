@@ -55,7 +55,8 @@ impl DownloadEngine {
     pub fn new(urls: Vec<Url>, options: DownloadOptions) -> Self {
         let client = Client::builder()
             .tcp_nodelay(true)
-            .pool_max_idle_per_host(16)
+            .pool_max_idle_per_host(32)
+            .default_headers(crate::resolver::SmartResolver::default_anti_qos_headers())
             .build()
             .unwrap_or_default();
 
