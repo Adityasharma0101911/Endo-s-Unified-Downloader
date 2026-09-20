@@ -36,6 +36,17 @@ pub enum ChunkStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkSnapshot {
+    pub id: usize,
+    pub range_start: u64,
+    pub range_end: u64,
+    pub downloaded_bytes: u64,
+    pub total_bytes: u64,
+    pub status: String,
+    pub worker_id: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Chunk {
     pub id: usize,
     pub range: ByteRange,
@@ -295,6 +306,32 @@ impl ChunkManager {
         }
         ranges.sort();
         ranges
+    }
+
+    /// Returns a vector of snapshots for all current chunks for UI rendering.
+    pub fn chunk_snapshots(&self) -> Vec<ChunkSnapshot> {
+        self.chunks
+            .iter()
+            .map(|c| {
+                let (status_str, worker_id) = match &c.status {
+                    ChunkStatus::Unassigned => ("Pending".to_string(), None),
+                    ChunkStatus::Assigned { worker_id, .. } => (format!("Worker {}", worker_id), Some(*worker_id)),
+                    ChunkStatus::Downloading { worker_id, .. } => (format!("Worker {}", worker_id), Some(*worker_id)),
+                    ChunkStatus::Verifying => ("Verifying".to_string(), None),
+                    ChunkStatus::Completed => ("Completed".to_string(), None),
+                    ChunkStatus::Failed { reason, .. } => (format!("Failed: {}", reason), None),
+                };
+                ChunkSnapshot {
+                    id: c.id,
+                    range_start: c.range.start,
+                    range_end: c.range.end,
+                    downloaded_bytes: c.downloaded_bytes,
+                    total_bytes: c.range.len(),
+                    status: status_str,
+                    worker_id,
+                }
+            })
+            .collect()
     }
 
     fn get_chunk_mut(&mut self, chunk_id: usize) -> Result<&mut Chunk, ChunkError> {

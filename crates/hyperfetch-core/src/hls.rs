@@ -219,6 +219,27 @@ impl HlsEngine {
                     let total_bytes = total_bytes_downloaded.load(std::sync::atomic::Ordering::Relaxed);
                     let elapsed = now.duration_since(start_time).as_secs_f64();
                     let speed = if elapsed > 0.0 { total_bytes as f64 / elapsed } else { 0.0 };
+                    let mut chunks = Vec::new();
+                    let display_count = total_segments.min(64);
+                    for i in 0..display_count {
+                        let seg_idx = (i * total_segments) / display_count;
+                        let status = if seg_idx < next_index {
+                            "Completed".to_string()
+                        } else if seg_idx < next_index + num_connections {
+                            "Downloading".to_string()
+                        } else {
+                            "Pending".to_string()
+                        };
+                        chunks.push(crate::chunk::ChunkSnapshot {
+                            id: seg_idx,
+                            range_start: seg_idx as u64,
+                            range_end: (seg_idx + 1) as u64,
+                            downloaded_bytes: if seg_idx < next_index { 1 } else { 0 },
+                            total_bytes: 1,
+                            status,
+                            worker_id: Some(seg_idx % num_connections),
+                        });
+                    }
 
                     let snapshot = EngineSnapshot {
                         total_bytes: (total_bytes * total_segments as u64) / (next_index as u64).max(1),
@@ -227,6 +248,7 @@ impl HlsEngine {
                         progress_ratio: next_index as f64 / total_segments as f64,
                         active_workers: num_connections,
                         mirror_speeds: Vec::new(),
+                        chunks,
                     };
 
                     if let Some(ref tx) = snapshot_tx {

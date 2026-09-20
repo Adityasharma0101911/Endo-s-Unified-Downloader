@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/hyperfetch-core",
     "crates/hyperfetch-cli",
+    "crates/hyperfetch-gui",
 ]
 
 [workspace.package]

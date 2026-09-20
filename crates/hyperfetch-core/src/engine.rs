@@ -8,7 +8,7 @@ use reqwest::Client;
 use tokio::sync::{broadcast, mpsc};
 use url::Url;
 
-use crate::chunk::ChunkManager;
+use crate::chunk::{ChunkManager, ChunkSnapshot};
 use crate::mirror::MirrorRacer;
 use crate::range::ByteRange;
 use crate::state::DownloadState;
@@ -23,6 +23,7 @@ pub struct EngineSnapshot {
     pub progress_ratio: f64,
     pub active_workers: usize,
     pub mirror_speeds: Vec<(usize, String, f64)>, // (id, host, bytes_per_sec)
+    pub chunks: Vec<ChunkSnapshot>,
 }
 
 #[derive(Debug, Clone)]
@@ -314,6 +315,8 @@ impl DownloadEngine {
                     (m.id, m.url.host_str().unwrap_or("unknown").to_string(), m.speed_ewma)
                 }).collect();
 
+                let chunks = chunk_manager.lock().chunk_snapshots();
+
                 let snapshot = EngineSnapshot {
                     total_bytes: file_size,
                     downloaded_bytes: current_downloaded,
@@ -321,6 +324,7 @@ impl DownloadEngine {
                     progress_ratio: if file_size == 0 { 1.0 } else { current_downloaded as f64 / file_size as f64 },
                     active_workers: num_workers,
                     mirror_speeds,
+                    chunks,
                 };
 
                 if let Some(ref tx) = snapshot_tx {

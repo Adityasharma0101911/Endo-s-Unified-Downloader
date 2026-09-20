@@ -68,16 +68,17 @@ The compiled binary will be placed at `target/release/Endos-Unified-Downloader.e
 
 ## Usage
 
-### Interactive Mode
-Running the executable without arguments launches the interactive console interface:
+### Graphical User Interface (GUI)
+Double-clicking `Endo's Unified Downloader.exe` launches the native hardware-accelerated GUI application without opening a command prompt or terminal window.
 
-```powershell
-.\Endos-Unified-Downloader.exe
-```
+Key GUI Features:
+- **Visual Chunk Allocation Map:** Real-time multi-segment canvas visualizing file chunks, dynamic worker assignments, active in-flight byte transfers, and work-stealing splits.
+- **Detailed Stream Monitor:** Per-stream progress bars, byte offsets, and active worker status indicators.
+- **System Integration:** Native Windows directory picker dialog, one-click clipboard URL pasting, and direct file/folder revelation in Windows Explorer upon completion.
+- **Performance:** 60 FPS reactive updates with zero idle CPU overhead.
 
-Prompts will guide you through entering URLs, configuring connection limits, and choosing the output directory (defaults to the user's Downloads folder).
-
-### Command-Line Mode
+### Command-Line Mode (CLI)
+For headless environments, automated pipelines, or terminal workflows, use `Endos-Unified-Downloader.exe`:
 
 ```powershell
 # Basic download with 16 parallel connections
