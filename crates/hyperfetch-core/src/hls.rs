@@ -28,6 +28,7 @@ pub struct HlsSegment {
     pub index: usize,
     pub url: Url,
     pub duration_secs: f64,
+    pub byte_range: Option<crate::range::ByteRange>,
 }
 
 /// Parses an HLS (.m3u8) playlist. If it is a master playlist, it automatically
@@ -54,6 +55,8 @@ pub async fn parse_hls_playlist(client: &Client, playlist_url: &Url) -> Result<V
     // It is a media playlist containing segments
     let mut segments = Vec::new();
     let mut current_duration = 2.0;
+    let mut current_byte_range: Option<crate::range::ByteRange> = None;
+    let mut last_byte_range_end: u64 = 0;
     let mut segment_index = 0;
 
     for line in text.lines() {
@@ -66,6 +69,22 @@ pub async fn parse_hls_playlist(client: &Client, playlist_url: &Url) -> Result<V
             let info = &trimmed[8..];
             let dur_str = info.split(',').next().unwrap_or("2.0");
             current_duration = dur_str.parse::<f64>().unwrap_or(2.0);
+        } else if trimmed.starts_with("#EXT-X-BYTERANGE:") {
+            let info = &trimmed[17..];
+            let parts: Vec<&str> = info.split('@').collect();
+            let length: u64 = parts[0].parse().unwrap_or(0);
+            if length > 0 {
+                let start = if parts.len() > 1 {
+                    parts[1].parse().unwrap_or(last_byte_range_end.saturating_add(1))
+                } else if segment_index == 0 {
+                    0
+                } else {
+                    last_byte_range_end.saturating_add(1)
+                };
+                let end = start + length - 1;
+                last_byte_range_end = end;
+                current_byte_range = crate::range::ByteRange::new(start, end).ok();
+            }
         } else if !trimmed.starts_with('#') {
             // This is a segment URI
             let segment_url = playlist_url.join(trimmed).map_err(|e| {
@@ -76,6 +95,7 @@ pub async fn parse_hls_playlist(client: &Client, playlist_url: &Url) -> Result<V
                 index: segment_index,
                 url: segment_url,
                 duration_secs: current_duration,
+                byte_range: current_byte_range.take(),
             });
             segment_index += 1;
         }
@@ -135,6 +155,7 @@ impl HlsEngine {
         output_path: &Path,
         num_connections: usize,
         snapshot_tx: Option<broadcast::Sender<EngineSnapshot>>,
+        cancel_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<PathBuf, HlsError> {
         let total_segments = segments.len();
         let target_file = if output_path.extension().is_none() {
@@ -169,13 +190,26 @@ impl HlsEngine {
             let buf = Arc::clone(&completed_buffer);
             let bytes_counter = Arc::clone(&total_bytes_downloaded);
             let tx = notify_tx.clone();
+            let cancel = cancel_flag.clone();
 
             tokio::spawn(async move {
                 let _permit = sem.acquire().await.unwrap();
 
                 // Retry loop for transient network glitches
                 for _attempt in 0..3 {
-                    if let Ok(resp) = client.get(segment.url.clone()).send().await {
+                    if let Some(ref c) = cancel {
+                        if c.load(std::sync::atomic::Ordering::Relaxed) {
+                            let _ = tx.send(segment.index).await;
+                            return;
+                        }
+                    }
+
+                    let mut req = client.get(segment.url.clone());
+                    if let Some(ref r) = segment.byte_range {
+                        req = req.header(reqwest::header::RANGE, r.to_http_header());
+                    }
+
+                    if let Ok(resp) = req.send().await {
                         if resp.status().is_success() {
                             if let Ok(bytes) = resp.bytes().await {
                                 let len = bytes.len() as u64;
@@ -204,6 +238,12 @@ impl HlsEngine {
         let mut last_snapshot = Instant::now();
 
         while next_index < total_segments {
+            if let Some(ref c) = cancel_flag {
+                if c.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(HlsError::InvalidPlaylist("Download cancelled by user".to_string()));
+                }
+            }
+
             // Check if next segment is ready in memory
             let segment_data = {
                 let mut guard = completed_buffer.lock();
@@ -281,7 +321,12 @@ impl HlsEngine {
                 }
             } else {
                 // Wait for notification from worker
-                let _ = notify_rx.recv().await;
+                if notify_rx.recv().await.is_none() {
+                    return Err(HlsError::InvalidPlaylist(format!(
+                        "HLS download aborted: worker tasks terminated before segment {} arrived",
+                        next_index
+                    )));
+                }
             }
         }
 
@@ -310,5 +355,44 @@ mod tests {
         let base = Url::parse("https://cdn.example.com/hls/master.m3u8").unwrap();
         let best = parse_best_variant_url(master, &base).unwrap();
         assert_eq!(best, Url::parse("https://cdn.example.com/hls/1080p.m3u8").unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_parse_byterange_playlist() {
+        // Test parsing with byte ranges
+        let playlist = r#"#EXTM3U
+#EXT-X-VERSION:4
+#EXT-X-TARGETDURATION:10
+#EXTINF:10.0,
+#EXT-X-BYTERANGE:1000@0
+media.ts
+#EXTINF:10.0,
+#EXT-X-BYTERANGE:2000
+media.ts
+"#;
+        let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        let body = playlist.to_string();
+
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = server.accept().await {
+                let mut buf = vec![0u8; 1024];
+                let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, resp.as_bytes()).await;
+                let _ = tokio::io::AsyncWriteExt::shutdown(&mut socket).await;
+            }
+        });
+
+        let client = Client::new();
+        let url = Url::parse(&format!("http://{}/playlist.m3u8", addr)).unwrap();
+        let segments = parse_hls_playlist(&client, &url).await.unwrap();
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].byte_range, Some(crate::range::ByteRange::new(0, 999).unwrap()));
+        assert_eq!(segments[1].byte_range, Some(crate::range::ByteRange::new(1000, 2999).unwrap()));
     }
 }

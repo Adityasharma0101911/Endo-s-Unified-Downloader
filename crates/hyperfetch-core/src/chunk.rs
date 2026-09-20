@@ -55,6 +55,7 @@ pub struct Chunk {
     pub status: ChunkStatus,
     pub downloaded_bytes: u64,
     pub hash: Option<[u8; 32]>,
+    pub retries: u32,
     pub current_offset: Arc<AtomicU64>,
     pub end_offset: Arc<AtomicU64>,
 }
@@ -67,6 +68,7 @@ impl Clone for Chunk {
             status: self.status.clone(),
             downloaded_bytes: self.downloaded_bytes,
             hash: self.hash,
+            retries: self.retries,
             current_offset: Arc::clone(&self.current_offset),
             end_offset: Arc::clone(&self.end_offset),
         }
@@ -81,6 +83,7 @@ impl Chunk {
             status: ChunkStatus::Unassigned,
             downloaded_bytes: 0,
             hash: None,
+            retries: 0,
             current_offset: Arc::new(AtomicU64::new(range.start)),
             end_offset: Arc::new(AtomicU64::new(range.end)),
         }
@@ -151,18 +154,56 @@ impl ChunkManager {
         base_chunk_size: u64,
         completed_ranges: &[ByteRange],
     ) -> Result<Self, ChunkError> {
+        let base_chunk_size = base_chunk_size.max(64 * 1024);
         let merged_completed = crate::range::merge_ranges(completed_ranges.to_vec());
-        let mut manager = Self::new(total_size, base_chunk_size)?;
+        let gaps = crate::range::compute_gaps(total_size, &merged_completed);
 
+        let mut chunks = Vec::new();
+
+        // 1. Add completed chunks for each completed range
         for completed_range in &merged_completed {
-            for chunk in &mut manager.chunks {
-                if completed_range.contains_range(&chunk.range) {
-                    chunk.status = ChunkStatus::Completed;
-                    chunk.downloaded_bytes = chunk.range.len();
-                    chunk.current_offset.store(chunk.range.end.saturating_add(1), Ordering::SeqCst);
-                }
+            let mut chunk = Chunk::new(0, *completed_range);
+            chunk.status = ChunkStatus::Completed;
+            chunk.downloaded_bytes = completed_range.len();
+            chunk.current_offset.store(completed_range.end.saturating_add(1), Ordering::SeqCst);
+            chunks.push(chunk);
+        }
+
+        // 2. Partition each gap into chunks of base_chunk_size
+        for gap in &gaps {
+            let mut offset = gap.start;
+            while offset <= gap.end {
+                let chunk_len = (gap.end - offset + 1).min(base_chunk_size);
+                let range = ByteRange::from_len(offset, chunk_len)?;
+                chunks.push(Chunk::new(0, range));
+                offset += chunk_len;
             }
         }
+
+        // Sort chunks by range start to maintain ordered chunk layout
+        chunks.sort_by_key(|c| c.range.start);
+
+        // Assign contiguous IDs
+        for (idx, chunk) in chunks.iter_mut().enumerate() {
+            chunk.id = idx;
+        }
+
+        let num_chunks = chunks.len();
+        let mut completed_bitmap = bitvec![0; num_chunks];
+        for (idx, chunk) in chunks.iter().enumerate() {
+            if chunk.is_completed() {
+                completed_bitmap.set(idx, true);
+            }
+        }
+
+        let mut manager = Self {
+            total_size,
+            base_chunk_size,
+            chunks,
+            completed_bitmap,
+            total_downloaded: 0,
+            next_chunk_id: num_chunks,
+        };
 
         manager.recalculate_progress();
         Ok(manager)
@@ -204,7 +245,7 @@ impl ChunkManager {
                     chunk.status = ChunkStatus::Assigned { worker_id, mirror_id };
                     return Some(chunk.clone());
                 }
-                ChunkStatus::Failed { retries, .. } if retries < 5 => {
+                ChunkStatus::Failed { .. } if chunk.retries < 5 => {
                     chunk.status = ChunkStatus::Assigned { worker_id, mirror_id };
                     return Some(chunk.clone());
                 }
@@ -228,7 +269,8 @@ impl ChunkManager {
         let mut best_candidate: Option<(usize, u64)> = None;
 
         for (idx, chunk) in self.chunks.iter().enumerate() {
-            if chunk.is_in_flight() {
+            // Only steal from chunks actively downloading (data actively flowing)
+            if matches!(chunk.status, ChunkStatus::Downloading { .. }) {
                 let remaining = chunk.remaining_bytes();
                 if remaining >= min_steal_threshold {
                     match best_candidate {
@@ -262,6 +304,11 @@ impl ChunkManager {
 
         // Truncate victim range atomically
         victim.end_offset.store(victim_new_end, Ordering::SeqCst);
+        if victim.current_offset.load(Ordering::SeqCst) > victim_new_end {
+            // Victim already passed split point, roll back
+            victim.end_offset.store(cur_end, Ordering::SeqCst);
+            return None;
+        }
         victim.range.end = victim_new_end;
 
         // Create stolen chunk for [split_offset, cur_end]
@@ -325,15 +372,29 @@ impl ChunkManager {
     /// Marks a chunk as failed and increments retry counter.
     pub fn mark_failed(&mut self, chunk_id: usize, reason: &str) -> Result<(), ChunkError> {
         let chunk = self.get_chunk_mut(chunk_id)?;
-        let retries = match chunk.status {
-            ChunkStatus::Failed { retries, .. } => retries + 1,
-            _ => 1,
-        };
+        chunk.retries += 1;
         chunk.status = ChunkStatus::Failed {
             reason: reason.to_string(),
-            retries,
+            retries: chunk.retries,
         };
+        chunk.downloaded_bytes = 0;
+        chunk.current_offset.store(chunk.range.start, Ordering::SeqCst);
+        self.recalculate_progress();
         Ok(())
+    }
+
+    /// Returns a fatal failure if any chunk has exhausted its retries.
+    pub fn has_fatal_failure(&self) -> Option<(usize, String)> {
+        for chunk in &self.chunks {
+            if chunk.retries >= 5 {
+                let reason = match &chunk.status {
+                    ChunkStatus::Failed { reason, .. } => reason.clone(),
+                    _ => "Exhausted retries".to_string(),
+                };
+                return Some((chunk.id, reason));
+            }
+        }
+        None
     }
 
     /// Returns all completed byte ranges.
@@ -441,4 +502,42 @@ mod tests {
         assert_eq!(manager.total_downloaded(), 2 * 1024 * 1024);
         assert_eq!(manager.progress_ratio(), 0.5);
     }
+
+    #[test]
+    fn test_resume_non_aligned_work_stolen_ranges() {
+        // Suppose a previous run completed [0, 512KB - 1] (half of a 1MB chunk)
+        let completed = vec![ByteRange::new(0, 512 * 1024 - 1).unwrap()];
+        // Resume with 1MB base chunk size for a 2MB total file
+        let manager = ChunkManager::with_resumed_ranges(2 * 1024 * 1024, 1024 * 1024, &completed).unwrap();
+        
+        // Chunk 0 is the completed 512KB range
+        assert_eq!(manager.chunks()[0].is_completed(), true);
+        assert_eq!(manager.chunks()[0].range, ByteRange::new(0, 512 * 1024 - 1).unwrap());
+        
+        // Chunk 1 is [512KB, 1536KB - 1] (1MB chunk from gap)
+        assert_eq!(manager.chunks()[1].is_completed(), false);
+        assert_eq!(manager.chunks()[1].range, ByteRange::new(512 * 1024, 1536 * 1024 - 1).unwrap());
+        
+        // Chunk 2 is [1536KB, 2048KB - 1] (remaining 512KB from gap)
+        assert_eq!(manager.chunks()[2].is_completed(), false);
+        assert_eq!(manager.chunks()[2].range, ByteRange::new(1536 * 1024, 2 * 1024 * 1024 - 1).unwrap());
+
+        assert_eq!(manager.total_downloaded(), 512 * 1024);
+        assert_eq!(manager.progress_ratio(), 0.25);
+    }
+
+    #[test]
+    fn test_mark_failed_resets_progress() {
+        let mut manager = ChunkManager::new(2 * 1024 * 1024, 1024 * 1024).unwrap();
+        let _ = manager.get_next_work(0, 0).unwrap();
+        manager.update_chunk_progress(0, 512 * 1024, 0, 0).unwrap();
+        assert_eq!(manager.total_downloaded(), 512 * 1024);
+
+        // Fail chunk 0
+        manager.mark_failed(0, "connection drop").unwrap();
+        assert_eq!(manager.total_downloaded(), 0);
+        assert_eq!(manager.chunks()[0].downloaded_bytes, 0);
+        assert_eq!(manager.chunks()[0].current_offset.load(Ordering::SeqCst), 0);
+    }
 }
+

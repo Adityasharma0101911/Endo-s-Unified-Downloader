@@ -139,7 +139,7 @@ impl HttpWorker {
                 return;
             }
 
-            let current_end = chunk.end_offset.load(Ordering::Relaxed);
+            let current_end = chunk.end_offset.load(Ordering::SeqCst);
             if current_offset > current_end {
                 break;
             }
@@ -149,6 +149,12 @@ impl HttpWorker {
                     let len = bytes.len() as u64;
                     if len == 0 {
                         continue;
+                    }
+
+                    // Re-read current_end with SeqCst in case it was truncated during network await
+                    let current_end = chunk.end_offset.load(Ordering::SeqCst);
+                    if current_offset > current_end {
+                        break;
                     }
 
                     // Check bounds against dynamic chunk range end (can be truncated by work stealing)
@@ -165,7 +171,7 @@ impl HttpWorker {
                                 return;
                             }
                             current_offset += valid_len as u64;
-                            chunk.current_offset.store(current_offset, Ordering::Relaxed);
+                            chunk.current_offset.store(current_offset, Ordering::SeqCst);
                             pending_bytes += valid_len as u64;
                         }
                         break;
@@ -182,7 +188,7 @@ impl HttpWorker {
                     }
 
                     current_offset += len;
-                    chunk.current_offset.store(current_offset, Ordering::Relaxed);
+                    chunk.current_offset.store(current_offset, Ordering::SeqCst);
                     pending_bytes += len;
 
                     // Send batched progress (every 128KB or 50ms) to maximize throughput
@@ -226,8 +232,23 @@ impl HttpWorker {
             }).await;
         }
 
-        // Compute BLAKE3 chunk hash on completion of actual downloaded range
+        // Verify that the chunk was completely downloaded
         let final_end = chunk.end_offset.load(Ordering::SeqCst);
+        if current_offset <= final_end {
+            // Premature termination: connection closed before chunk was fully received
+            let _ = self.event_tx.send(WorkerEvent::ChunkFailed {
+                worker_id,
+                chunk_id,
+                mirror_id,
+                error: format!(
+                    "Connection closed prematurely: received up to offset {}, expected up to {}",
+                    current_offset, final_end
+                ),
+            }).await;
+            return;
+        }
+
+        // Compute BLAKE3 chunk hash on completion of actual downloaded range
         let actual_range = crate::range::ByteRange::new(chunk.range.start, final_end).unwrap_or(chunk.range);
         let hash = self.writer.compute_chunk_hash(&actual_range).ok();
 

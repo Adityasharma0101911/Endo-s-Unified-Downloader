@@ -40,15 +40,18 @@ impl HostResolver for ArchiveOrgResolver {
     }
 
     async fn resolve(&self, client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
-        let segments: Vec<&str> = url.path_segments()
-            .ok_or_else(|| ResolverError::Parse("Missing path segments".to_string()))?
-            .collect();
-
-        let (identifier, filename) = if segments.len() >= 3 && segments[0] == "download" {
-            (segments[1].to_string(), segments[2..].join("/"))
-        } else if let Some(pos) = segments.iter().position(|&s| s == "items") {
-            if segments.len() > pos + 2 {
-                (segments[pos + 1].to_string(), segments[pos + 2..].join("/"))
+        let path = url.path();
+        let (identifier, raw_filename) = if path.starts_with("/download/") {
+            let rest = &path["/download/".len()..];
+            if let Some(idx) = rest.find('/') {
+                (rest[..idx].to_string(), rest[idx + 1..].to_string())
+            } else {
+                return Ok(vec![url.clone()]);
+            }
+        } else if let Some(idx) = path.find("/items/") {
+            let rest = &path[idx + "/items/".len()..];
+            if let Some(idx2) = rest.find('/') {
+                (rest[..idx2].to_string(), rest[idx2 + 1..].to_string())
             } else {
                 return Ok(vec![url.clone()]);
             }
@@ -93,13 +96,13 @@ impl HostResolver for ArchiveOrgResolver {
 
         let mut mirror_urls = Vec::new();
         for s in servers {
-            let mirror_str = format!("https://{}{}/{}", s, dir, filename);
+            let mirror_str = format!("https://{}{}/{}", s, dir, raw_filename);
             if let Ok(m_url) = Url::parse(&mirror_str) {
                 mirror_urls.push(m_url);
             }
         }
 
-        let lb_url_str = format!("https://archive.org/download/{}/{}", identifier, filename);
+        let lb_url_str = format!("https://archive.org/download/{}/{}", identifier, raw_filename);
         if let Ok(lb_url) = Url::parse(&lb_url_str) {
             if !mirror_urls.contains(&lb_url) {
                 mirror_urls.push(lb_url);
@@ -136,7 +139,14 @@ impl HostResolver for GoogleDriveResolver {
 
         let text = resp.text().await.unwrap_or_default();
 
-        // Search for confirm token in HTML response
+        // 1. Search for direct uc-download-link or download form action URL
+        if let Some(direct_url) = extract_google_drive_direct(&text) {
+            if let Ok(u) = Url::parse(&direct_url) {
+                return Ok(vec![u]);
+            }
+        }
+
+        // 2. Search for confirm token in HTML response
         if let Some(confirm_token) = extract_confirm_token(&text) {
             let confirmed_url = format!(
                 "https://drive.google.com/uc?export=download&confirm={}&id={}",
@@ -537,13 +547,33 @@ impl HostResolver for HtmlVideoResolver {
             || path.ends_with(".tar")
             || path.ends_with(".gz")
             || path.ends_with(".7z")
-            || path.ends_with(".bin");
+            || path.ends_with(".bin")
+            || path.ends_with(".mp4")
+            || path.ends_with(".mkv")
+            || path.ends_with(".webm")
+            || path.ends_with(".avi")
+            || path.ends_with(".mov")
+            || path.ends_with(".flv")
+            || path.ends_with(".wmv")
+            || path.ends_with(".mp3")
+            || path.ends_with(".flac")
+            || path.ends_with(".wav")
+            || path.ends_with(".aac")
+            || path.ends_with(".ogg")
+            || path.ends_with(".rar")
+            || path.ends_with(".bz2")
+            || path.ends_with(".xz")
+            || path.ends_with(".pdf")
+            || path.ends_with(".dmg")
+            || path.ends_with(".pkg")
+            || path.ends_with(".msi")
+            || path.ends_with(".apk");
 
         !is_direct_file && (url.scheme() == "http" || url.scheme() == "https")
     }
 
     async fn resolve(&self, client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
-        let resp = match client.get(url.clone()).send().await {
+        let resp = match client.get(url.clone()).header(reqwest::header::RANGE, "bytes=0-102400").send().await {
             Ok(r) => r,
             Err(_) => return Ok(vec![url.clone()]),
         };
@@ -872,6 +902,42 @@ fn extract_google_drive_id(url: &Url) -> Option<String> {
     None
 }
 
+fn extract_google_drive_direct(html: &str) -> Option<String> {
+    // Check for <a id="uc-download-link" href="...">
+    let link_needle = "id=\"uc-download-link\"";
+    if let Some(idx) = html.find(link_needle) {
+        let tag_start = html[..idx].rfind('<').unwrap_or(idx);
+        let tag_end = html[idx..].find('>').map(|e| idx + e).unwrap_or(html.len());
+        let tag = &html[tag_start..tag_end];
+        if let Some(href) = extract_attribute_value(tag, "href") {
+            let cleaned = href.replace("&amp;", "&");
+            if cleaned.starts_with("http") {
+                return Some(cleaned);
+            } else if cleaned.starts_with('/') {
+                return Some(format!("https://drive.google.com{}", cleaned));
+            }
+        }
+    }
+
+    // Check for <form id="download-form" action="...">
+    let form_needle = "id=\"download-form\"";
+    if let Some(idx) = html.find(form_needle) {
+        let tag_start = html[..idx].rfind('<').unwrap_or(idx);
+        let tag_end = html[idx..].find('>').map(|e| idx + e).unwrap_or(html.len());
+        let tag = &html[tag_start..tag_end];
+        if let Some(action) = extract_attribute_value(tag, "action") {
+            let cleaned = action.replace("&amp;", "&");
+            if cleaned.starts_with("http") {
+                return Some(cleaned);
+            } else if cleaned.starts_with('/') {
+                return Some(format!("https://drive.google.com{}", cleaned));
+            }
+        }
+    }
+
+    None
+}
+
 fn extract_confirm_token(html: &str) -> Option<String> {
     // 1. Matches confirm=([0-9a-zA-Z_-]+)
     if let Some(idx) = html.find("confirm=") {
@@ -1130,5 +1196,24 @@ mod tests {
         assert!(InstagramResolver.can_handle(&Url::parse("https://www.instagram.com/reel/C12345/").unwrap()));
         assert!(ArchiveOrgResolver.can_handle(&Url::parse("https://archive.org/download/item/file.zip").unwrap()));
         assert!(ArchiveOrgResolver.can_handle(&Url::parse("https://dn720001.ca.archive.org/0/items/fn-v8-archive/builds/8.51-CL-6165369.7z").unwrap()));
+    }
+
+    #[test]
+    fn test_google_drive_direct_extraction() {
+        let html = r#"<html><body><a id="uc-download-link" class="goog-inline-block jfk-button jfk-button-action" href="https://doc-00-00-docs.googleusercontent.com/download?id=123&amp;confirm=t">Download anyway</a></body></html>"#;
+        let direct = extract_google_drive_direct(html).unwrap();
+        assert_eq!(direct, "https://doc-00-00-docs.googleusercontent.com/download?id=123&confirm=t");
+
+        let form_html = r#"<form id="download-form" action="/download?id=456&amp;confirm=xyz" method="post"></form>"#;
+        let form_direct = extract_google_drive_direct(form_html).unwrap();
+        assert_eq!(form_direct, "https://drive.google.com/download?id=456&confirm=xyz");
+    }
+
+    #[test]
+    fn test_html_video_resolver_exclusion() {
+        assert!(!HtmlVideoResolver.can_handle(&Url::parse("https://example.com/video.mp4").unwrap()));
+        assert!(!HtmlVideoResolver.can_handle(&Url::parse("https://example.com/archive.rar").unwrap()));
+        assert!(!HtmlVideoResolver.can_handle(&Url::parse("https://example.com/installer.msi").unwrap()));
+        assert!(HtmlVideoResolver.can_handle(&Url::parse("https://example.com/watch/video").unwrap()));
     }
 }

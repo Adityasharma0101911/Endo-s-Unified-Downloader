@@ -80,9 +80,9 @@ impl Mirror {
     pub fn record_failure(&mut self, now: Instant) {
         self.failures += 1;
         self.consecutive_successes = 0;
-        // Exponential backoff: 2^failures seconds, up to 60s
-        let backoff_secs = (1 << self.failures.min(6)).min(60);
-        self.cooldown_until = Some(now + Duration::from_secs(backoff_secs));
+        // Exponential backoff: 100ms * 2^failures, up to 2000ms
+        let backoff_ms = (100 * (1 << self.failures.min(4))).min(2000);
+        self.cooldown_until = Some(now + Duration::from_millis(backoff_ms));
     }
 }
 

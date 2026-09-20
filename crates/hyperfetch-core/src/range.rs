@@ -177,6 +177,39 @@ pub fn merge_ranges(mut ranges: Vec<ByteRange>) -> Vec<ByteRange> {
     merged
 }
 
+/// Computes the missing gap ranges in `[0, total_size - 1]` that are not covered by `completed`.
+pub fn compute_gaps(total_size: u64, completed: &[ByteRange]) -> Vec<ByteRange> {
+    if total_size == 0 {
+        return Vec::new();
+    }
+    let merged = merge_ranges(completed.to_vec());
+    let mut gaps = Vec::new();
+    let mut cursor = 0u64;
+
+    for range in &merged {
+        if range.start >= total_size {
+            break;
+        }
+        if range.start > cursor {
+            if let Ok(gap) = ByteRange::new(cursor, range.start - 1) {
+                gaps.push(gap);
+            }
+        }
+        cursor = (range.end.saturating_add(1)).max(cursor);
+        if cursor >= total_size {
+            break;
+        }
+    }
+
+    if cursor < total_size {
+        if let Ok(gap) = ByteRange::new(cursor, total_size - 1) {
+            gaps.push(gap);
+        }
+    }
+
+    gaps
+}
+
 impl fmt::Display for ByteRange {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}-{} ({} B)", self.start, self.end, self.len())
@@ -266,5 +299,29 @@ mod tests {
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0], ByteRange::new(0, 199).unwrap());
         assert_eq!(merged[1], ByteRange::new(250, 400).unwrap());
+    }
+
+    #[test]
+    fn test_compute_gaps() {
+        let total = 1000u64;
+        let completed = vec![
+            ByteRange::new(100, 199).unwrap(),
+            ByteRange::new(400, 599).unwrap(),
+        ];
+        let gaps = compute_gaps(total, &completed);
+        assert_eq!(gaps.len(), 3);
+        assert_eq!(gaps[0], ByteRange::new(0, 99).unwrap());
+        assert_eq!(gaps[1], ByteRange::new(200, 399).unwrap());
+        assert_eq!(gaps[2], ByteRange::new(600, 999).unwrap());
+
+        // Entirely completed
+        let all_done = vec![ByteRange::new(0, 999).unwrap()];
+        assert!(compute_gaps(total, &all_done).is_empty());
+
+        // Nothing completed
+        let none_done: Vec<ByteRange> = Vec::new();
+        let gaps_none = compute_gaps(total, &none_done);
+        assert_eq!(gaps_none.len(), 1);
+        assert_eq!(gaps_none[0], ByteRange::new(0, 999).unwrap());
     }
 }

@@ -330,3 +330,190 @@ async fn test_dynamic_work_stealing_integration() {
 
     let _ = shutdown_tx.send(());
 }
+
+#[tokio::test]
+async fn test_non_aligned_work_stolen_resume() {
+    let mut test_data = vec![0u8; 512 * 1024]; // 512KB
+    for (i, byte) in test_data.iter_mut().enumerate() {
+        *byte = ((i * 61) % 256) as u8;
+    }
+    let expected_hash = blake3::hash(&test_data);
+    let shared_data = Arc::new(test_data.clone());
+
+    let (addr, shutdown_tx) = run_mock_http_server(shared_data).await;
+    let mirror_url = Url::parse(&format!("http://{}/non_aligned_resume.bin", addr)).unwrap();
+
+    let temp = tempdir().unwrap();
+    let out_file = temp.path().join("non_aligned_resume.bin");
+
+    // Pre-populate only the first 128KB on disk (which is NOT a multiple of 256KB base chunk size)
+    std::fs::write(&out_file, &test_data[..128 * 1024]).unwrap();
+
+    let state_path = hyperfetch_core::state::DownloadState::state_file_path(&out_file);
+    let mut state = hyperfetch_core::state::DownloadState::new(
+        "non_aligned_resume.bin".to_string(),
+        512 * 1024,
+        256 * 1024, // 256KB base chunk size
+        vec![mirror_url.to_string()],
+    );
+    state.completed_ranges.push(hyperfetch_core::range::ByteRange::new(0, 128 * 1024 - 1).unwrap());
+    state.save_atomic(&state_path).unwrap();
+
+    let options = DownloadOptions {
+        num_connections: 4,
+        base_chunk_size: 256 * 1024,
+        min_steal_threshold: 32 * 1024,
+        output_path: Some(out_file.clone()),
+    };
+
+    let engine = DownloadEngine::new(vec![mirror_url], options);
+    let downloaded_path = engine.run(None).await.expect("Resumed download with non-aligned ranges should succeed");
+
+    assert_eq!(downloaded_path, out_file);
+    assert!(out_file.exists());
+    let downloaded_bytes = std::fs::read(&out_file).unwrap();
+    assert_eq!(downloaded_bytes.len(), 512 * 1024);
+    assert_eq!(blake3::hash(&downloaded_bytes), expected_hash);
+
+    let _ = shutdown_tx.send(());
+}
+
+#[tokio::test]
+async fn test_fatal_failure_detection() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                res = listener.accept() => {
+                    let (mut socket, _) = match res {
+                        Ok(c) => c,
+                        Err(_) => break,
+                    };
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 1024];
+                        let _ = socket.read(&mut buf).await;
+                        let first_line = String::from_utf8_lossy(&buf);
+                        if first_line.starts_with("HEAD") {
+                            let resp = "HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n";
+                            let _ = socket.write_all(resp.as_bytes()).await;
+                            let _ = socket.shutdown().await;
+                        } else {
+                            let resp = "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n";
+                            let _ = socket.write_all(resp.as_bytes()).await;
+                            let _ = socket.shutdown().await;
+                        }
+                    });
+                }
+            }
+        }
+    });
+
+    let mirror_url = Url::parse(&format!("http://{}/fatal_test.bin", addr)).unwrap();
+    let temp = tempdir().unwrap();
+    let out_file = temp.path().join("fatal_test.bin");
+
+    let options = DownloadOptions {
+        num_connections: 2,
+        base_chunk_size: 512 * 1024,
+        min_steal_threshold: 64 * 1024,
+        output_path: Some(out_file),
+    };
+
+    let engine = DownloadEngine::new(vec![mirror_url], options);
+    let result = engine.run(None).await;
+    assert!(result.is_err(), "Engine should fail promptly on persistent server errors rather than hanging");
+
+    let _ = shutdown_tx.send(());
+}
+
+#[tokio::test]
+async fn test_premature_stream_closure_retries() {
+    let mut test_data = vec![0u8; 256 * 1024]; // 256KB
+    for (i, byte) in test_data.iter_mut().enumerate() {
+        *byte = ((i * 73) % 256) as u8;
+    }
+    let expected_hash = blake3::hash(&test_data);
+    let shared_data = Arc::new(test_data);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let attempt_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    let sdata = Arc::clone(&shared_data);
+    let counter = Arc::clone(&attempt_counter);
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                res = listener.accept() => {
+                    let (mut socket, _) = match res {
+                        Ok(c) => c,
+                        Err(_) => break,
+                    };
+                    let file_data = Arc::clone(&sdata);
+                    let cnt = Arc::clone(&counter);
+
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 1024];
+                        let _ = socket.read(&mut buf).await;
+                        let first_line = String::from_utf8_lossy(&buf);
+                        if first_line.starts_with("HEAD") {
+                            let resp = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                                file_data.len()
+                            );
+                            let _ = socket.write_all(resp.as_bytes()).await;
+                        } else {
+                            let attempt = cnt.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            if attempt == 0 {
+                                // First attempt: send header indicating full 256KB slice, but close after sending only 16KB!
+                                let resp = format!(
+                                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-{}/{}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                                    file_data.len() - 1, file_data.len(), file_data.len()
+                                );
+                                let _ = socket.write_all(resp.as_bytes()).await;
+                                let _ = socket.write_all(&file_data[..16 * 1024]).await;
+                                let _ = socket.shutdown().await;
+                            } else {
+                                // Subsequent retry: send full slice
+                                let resp = format!(
+                                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-{}/{}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                                    file_data.len() - 1, file_data.len(), file_data.len()
+                                );
+                                let _ = socket.write_all(resp.as_bytes()).await;
+                                let _ = socket.write_all(&file_data).await;
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    });
+
+    let mirror_url = Url::parse(&format!("http://{}/retry_test.bin", addr)).unwrap();
+    let temp = tempdir().unwrap();
+    let out_file = temp.path().join("retry_test.bin");
+
+    let options = DownloadOptions {
+        num_connections: 1,
+        base_chunk_size: 256 * 1024,
+        min_steal_threshold: 64 * 1024,
+        output_path: Some(out_file.clone()),
+    };
+
+    let engine = DownloadEngine::new(vec![mirror_url], options);
+    let downloaded_path = engine.run(None).await.expect("Download should recover from premature EOF via retry");
+
+    assert_eq!(downloaded_path, out_file);
+    let downloaded_bytes = std::fs::read(&out_file).unwrap();
+    assert_eq!(downloaded_bytes.len(), 256 * 1024);
+    assert_eq!(blake3::hash(&downloaded_bytes), expected_hash);
+
+    let _ = shutdown_tx.send(());
+}
+

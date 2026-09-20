@@ -56,6 +56,8 @@ impl DownloadEngine {
     pub fn new(urls: Vec<Url>, options: DownloadOptions) -> Self {
         let client = Client::builder()
             .tcp_nodelay(true)
+            .connect_timeout(Duration::from_secs(10))
+            .tcp_keepalive(Duration::from_secs(30))
             .pool_max_idle_per_host(32)
             .default_headers(crate::resolver::SmartResolver::default_anti_qos_headers())
             .build()
@@ -116,8 +118,10 @@ impl DownloadEngine {
                     }
                 }
 
-                if let Some(cl) = resp.headers().get(CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok()) {
-                    return Ok((cl, accepts_ranges, filename));
+                if status == reqwest::StatusCode::OK {
+                    if let Some(cl) = resp.headers().get(CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok()) {
+                        return Ok((cl, false, filename));
+                    }
                 }
             }
 
@@ -177,6 +181,7 @@ impl DownloadEngine {
                             &out_path,
                             self.options.num_connections,
                             snapshot_tx,
+                            Some(Arc::clone(&self.cancel_flag)),
                         ).await.map_err(|e| e.to_string());
                     }
                     Err(e) => {
@@ -263,6 +268,10 @@ impl DownloadEngine {
                         break;
                     }
 
+                    if chunk_mgr.lock().has_fatal_failure().is_some() {
+                        break;
+                    }
+
                     // 1. Try to get unassigned work
                     let (work, mirror_id, mirror_url) = {
                         let mut mgr = chunk_mgr.lock();
@@ -290,9 +299,12 @@ impl DownloadEngine {
                         worker.download_chunk(chunk, mirror_id, mirror_url, Arc::clone(&cancel)).await;
                         racer.lock().release_mirror(mirror_id);
                     } else {
-                        // Check if download is completely finished
-                        let all_done = chunk_mgr.lock().is_all_completed();
-                        if all_done {
+                        // Check if download is completely finished or fatally failed
+                        let should_break = {
+                            let mgr = chunk_mgr.lock();
+                            mgr.is_all_completed() || mgr.has_fatal_failure().is_some()
+                        };
+                        if should_break {
                             break;
                         }
                         // Sleep briefly before polling again
@@ -376,14 +388,30 @@ impl DownloadEngine {
                     self.options.base_chunk_size,
                     self.urls.iter().map(|u| u.to_string()).collect(),
                 );
-                state.completed_ranges = completed;
+                state.completed_ranges = crate::range::merge_ranges(completed);
                 let _ = state.save_atomic(&state_path);
                 last_state_save = now;
+            }
+
+            if chunk_manager.lock().has_fatal_failure().is_some() {
+                break;
             }
 
             if chunk_manager.lock().is_all_completed() {
                 break;
             }
+        }
+
+        // Verify that the download actually finished
+        let is_completed = chunk_manager.lock().is_all_completed();
+        if !is_completed {
+            if self.cancel_flag.load(Ordering::Relaxed) {
+                return Err("Download cancelled by user".to_string());
+            }
+            if let Some((failed_id, reason)) = chunk_manager.lock().has_fatal_failure() {
+                return Err(format!("Download failed: chunk {} failed after max retries: {}", failed_id, reason));
+            }
+            return Err("Download aborted: workers terminated before all chunks completed".to_string());
         }
 
         // Finalize
@@ -407,10 +435,8 @@ fn extract_filename(headers: &reqwest::header::HeaderMap, url: &Url) -> String {
             let sub = &cd[idx + 10..];
             let raw = sub.trim_matches('"').split(';').next().unwrap_or("").trim();
             // Format: UTF-8''encoded_name
-            let name = if let Some(stripped) = raw.strip_prefix("UTF-8''") {
-                percent_decode_str(stripped)
-            } else if let Some(stripped) = raw.strip_prefix("utf-8''") {
-                percent_decode_str(stripped)
+            let name = if let Some(pos) = raw.to_ascii_lowercase().find("utf-8''") {
+                percent_decode_str(&raw[pos + 7..])
             } else {
                 raw.to_string()
             };
