@@ -224,6 +224,56 @@ impl HostResolver for SourceForgeResolver {
     }
 }
 
+/// HTML5 Video Extractor (Extracts direct media streams from webpage <video>, <source>, and OpenGraph tags)
+pub struct HtmlVideoResolver;
+
+impl HostResolver for HtmlVideoResolver {
+    fn can_handle(&self, url: &Url) -> bool {
+        // Handle web pages that are not direct binary/archive downloads
+        let path = url.path().to_ascii_lowercase();
+        let is_direct_file = path.ends_with(".zip")
+            || path.ends_with(".iso")
+            || path.ends_with(".exe")
+            || path.ends_with(".tar")
+            || path.ends_with(".gz")
+            || path.ends_with(".7z")
+            || path.ends_with(".bin");
+
+        !is_direct_file && (url.scheme() == "http" || url.scheme() == "https")
+    }
+
+    async fn resolve(&self, client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
+        let resp = match client.get(url.clone()).send().await {
+            Ok(r) => r,
+            Err(_) => return Ok(vec![url.clone()]),
+        };
+
+        // Check if content-type is HTML
+        let is_html = resp.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map_or(false, |ct| ct.contains("text/html"));
+
+        if !is_html {
+            return Ok(vec![url.clone()]);
+        }
+
+        let html = resp.text().await.unwrap_or_default();
+        let sources = extract_html_video_sources(&html, url);
+
+        if !sources.is_empty() {
+            tracing::info!(
+                "HtmlVideoResolver: discovered {} video stream source(s) in {}",
+                sources.len(),
+                url
+            );
+            return Ok(sources);
+        }
+
+        Ok(vec![url.clone()])
+    }
+}
+
 /// Master Smart Resolver registry that chains all host resolvers
 pub struct SmartResolver;
 
@@ -266,6 +316,15 @@ impl SmartResolver {
             if let Ok(mirrors) = SourceForgeResolver.resolve(client, url).await {
                 if !mirrors.is_empty() {
                     return mirrors;
+                }
+            }
+        }
+
+        // Check for embedded HTML video sources on webpages
+        if HtmlVideoResolver.can_handle(url) {
+            if let Ok(video_sources) = HtmlVideoResolver.resolve(client, url).await {
+                if video_sources != vec![url.clone()] && !video_sources.is_empty() {
+                    return video_sources;
                 }
             }
         }
@@ -348,9 +407,128 @@ fn extract_mediafire_direct(html: &str) -> Option<String> {
     None
 }
 
+fn extract_html_video_sources(html: &str, base_url: &Url) -> Vec<Url> {
+    let mut sources = Vec::new();
+    let mut seen = HashSet::new();
+
+    // 1. Scan for <source ... src="..."> and <video ... src="...">
+    let tag_targets = ["<source", "<video", "<SOURCE", "<VIDEO"];
+    for tag in tag_targets {
+        let mut cursor = 0;
+        while let Some(idx) = html[cursor..].find(tag) {
+            let start = cursor + idx;
+            let sub = &html[start..];
+            if let Some(tag_end) = sub.find('>') {
+                let tag_content = &sub[..tag_end];
+                if let Some(src) = extract_attribute_value(tag_content, "src") {
+                    if is_probable_video_url(&src) {
+                        if let Ok(resolved) = base_url.join(&src) {
+                            if seen.insert(resolved.to_string()) {
+                                sources.push(resolved);
+                            }
+                        }
+                    }
+                }
+                cursor = start + tag_end;
+            } else {
+                break;
+            }
+        }
+    }
+
+    // 2. Scan for OpenGraph and Twitter video metadata:
+    // <meta property="og:video" content="..."> or <meta name="twitter:player:stream" content="...">
+    let meta_targets = ["og:video", "og:video:url", "og:video:secure_url", "twitter:player:stream"];
+    for target in meta_targets {
+        let mut cursor = 0;
+        while let Some(idx) = html[cursor..].find(target) {
+            let meta_pos = cursor + idx;
+            // Look backward for <meta and forward for >
+            let line_start = html[..meta_pos].rfind('<').unwrap_or(meta_pos);
+            let line_end = html[meta_pos..].find('>').map(|e| meta_pos + e).unwrap_or(html.len());
+            let meta_tag = &html[line_start..line_end];
+
+            if let Some(content) = extract_attribute_value(meta_tag, "content") {
+                if is_probable_video_url(&content) || content.starts_with("http") {
+                    if let Ok(resolved) = base_url.join(&content) {
+                        if seen.insert(resolved.to_string()) {
+                            sources.push(resolved);
+                        }
+                    }
+                }
+            }
+            cursor = line_end;
+        }
+    }
+
+    sources
+}
+
+fn extract_attribute_value(tag: &str, attr_name: &str) -> Option<String> {
+    let target = format!("{}=", attr_name);
+    let idx = tag.find(&target)?;
+    let after_eq = &tag[idx + target.len()..];
+    let quote = after_eq.chars().next()?;
+
+    if quote == '"' || quote == '\'' {
+        let value = &after_eq[1..];
+        let end_idx = value.find(quote)?;
+        Some(value[..end_idx].trim().to_string())
+    } else {
+        // Unquoted attribute
+        let end_idx = after_eq.find(|c: char| c.is_whitespace() || c == '>').unwrap_or(after_eq.len());
+        Some(after_eq[..end_idx].trim().to_string())
+    }
+}
+
+fn is_probable_video_url(url_str: &str) -> bool {
+    let lower = url_str.to_ascii_lowercase();
+    lower.contains(".mp4")
+        || lower.contains(".webm")
+        || lower.contains(".mkv")
+        || lower.contains(".m4v")
+        || lower.contains(".mov")
+        || lower.contains(".flv")
+        || lower.contains(".avi")
+        || lower.contains(".ts")
+        || lower.contains(".m3u8")
+        || lower.contains(".mpd")
+        || lower.contains("video/")
+        || lower.contains("/video")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_extract_html_video_sources() {
+        let base_url = Url::parse("https://example.com/watch/video1").unwrap();
+        let html = r#"
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <meta property="og:video" content="https://cdn.example.com/og_video.mp4" />
+                <meta name="twitter:player:stream" content="/stream/twitter_video.webm" />
+            </head>
+            <body>
+                <video controls width="800">
+                    <source src="/media/720p.mp4" type="video/mp4">
+                    <source src="https://cdn.example.com/1080p.mp4" type="video/mp4">
+                    <source src="/media/fallback.webm" type="video/webm">
+                </video>
+            </body>
+            </html>
+        "#;
+
+        let sources = extract_html_video_sources(html, &base_url);
+        assert_eq!(sources.len(), 5);
+        assert!(sources.contains(&Url::parse("https://example.com/media/720p.mp4").unwrap()));
+        assert!(sources.contains(&Url::parse("https://cdn.example.com/1080p.mp4").unwrap()));
+        assert!(sources.contains(&Url::parse("https://example.com/media/fallback.webm").unwrap()));
+        assert!(sources.contains(&Url::parse("https://cdn.example.com/og_video.mp4").unwrap()));
+        assert!(sources.contains(&Url::parse("https://example.com/stream/twitter_video.webm").unwrap()));
+    }
 
     #[tokio::test]
     async fn test_dropbox_url_normalization() {
