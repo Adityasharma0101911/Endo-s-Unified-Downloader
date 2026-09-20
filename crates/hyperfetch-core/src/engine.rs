@@ -24,6 +24,7 @@ pub struct EngineSnapshot {
     pub active_workers: usize,
     pub mirror_speeds: Vec<(usize, String, f64)>, // (id, host, bytes_per_sec)
     pub chunks: Vec<ChunkSnapshot>,
+    pub target_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -219,10 +220,39 @@ impl DownloadEngine {
             return Ok(output_path);
         }
 
+        // Determine worker concurrency
+        let num_workers = if accepts_ranges {
+            self.options.num_connections.clamp(1, 64)
+        } else {
+            1 // Single connection if server doesn't support ranges
+        };
+
         let effective_chunk_size = if accepts_ranges {
-            self.options.base_chunk_size
+            if self.options.base_chunk_size != 4 * 1024 * 1024 {
+                // User explicitly configured custom chunk size
+                self.options.base_chunk_size
+            } else if file_size >= 1024 * 1024 * 1024 { // >= 1GB (e.g. 17.6GB)
+                // For multi-gigabyte files, scale chunks up to 64MB - 256MB so connections
+                // remain in continuous high-speed streaming mode (similar to aria2c stream segments).
+                let dynamic_size = file_size / (num_workers as u64 * 2);
+                dynamic_size.clamp(64 * 1024 * 1024, 256 * 1024 * 1024)
+            } else if file_size >= 100 * 1024 * 1024 { // >= 100MB
+                let dynamic_size = file_size / (num_workers as u64 * 2);
+                dynamic_size.clamp(16 * 1024 * 1024, 64 * 1024 * 1024)
+            } else if file_size >= 16 * 1024 * 1024 { // >= 16MB
+                let dynamic_size = file_size / num_workers as u64;
+                dynamic_size.clamp(4 * 1024 * 1024, 16 * 1024 * 1024)
+            } else {
+                (file_size / num_workers as u64).max(64 * 1024)
+            }
         } else {
             file_size
+        };
+
+        let effective_min_steal = if self.options.min_steal_threshold != 1024 * 1024 {
+            self.options.min_steal_threshold
+        } else {
+            (effective_chunk_size / 4).max(1024 * 1024)
         };
 
         // Check for resume state
@@ -246,13 +276,6 @@ impl DownloadEngine {
 
         let (event_tx, mut event_rx) = mpsc::channel::<WorkerEvent>(1024);
 
-        // Spawn workers
-        let num_workers = if accepts_ranges {
-            self.options.num_connections.min(64)
-        } else {
-            1 // Single connection if server doesn't support ranges
-        };
-
         for worker_id in 0..num_workers {
             let chunk_mgr = Arc::clone(&chunk_manager);
             let racer = Arc::clone(&mirror_racer);
@@ -260,7 +283,7 @@ impl DownloadEngine {
             let tx = event_tx.clone();
             let cancel = Arc::clone(&self.cancel_flag);
             let client = self.client.clone();
-            let min_steal = self.options.min_steal_threshold;
+            let min_steal = effective_min_steal;
 
             tokio::spawn(async move {
                 let worker = HttpWorker::new(worker_id, client, writer, tx);
@@ -371,6 +394,7 @@ impl DownloadEngine {
                     active_workers: num_workers,
                     mirror_speeds,
                     chunks,
+                    target_path: Some(output_path.clone()),
                 };
 
                 if let Some(ref tx) = snapshot_tx {
@@ -408,6 +432,17 @@ impl DownloadEngine {
         let is_completed = chunk_manager.lock().is_all_completed();
         if !is_completed {
             if self.cancel_flag.load(Ordering::Relaxed) {
+                // Flush dirty pages and save completed ranges so user can resume anytime!
+                let _ = disk_writer.sync();
+                let completed = chunk_manager.lock().completed_ranges();
+                let mut state = DownloadState::new(
+                    output_path.file_name().unwrap_or_default().to_string_lossy().to_string(),
+                    file_size,
+                    effective_chunk_size,
+                    self.urls.iter().map(|u| u.to_string()).collect(),
+                );
+                state.completed_ranges = crate::range::merge_ranges(completed);
+                let _ = state.save_atomic(&state_path);
                 return Err("Download cancelled by user".to_string());
             }
             if let Some((failed_id, reason)) = chunk_manager.lock().has_fatal_failure() {

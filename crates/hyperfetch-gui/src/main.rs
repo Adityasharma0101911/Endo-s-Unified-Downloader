@@ -100,6 +100,14 @@ impl DownloaderApp {
     }
 
     fn start_download(&mut self) {
+        self.start_download_internal(false);
+    }
+
+    fn resume_download(&mut self) {
+        self.start_download_internal(true);
+    }
+
+    fn start_download_internal(&mut self, is_resume: bool) {
         let trimmed = self.url_input.trim();
         if trimmed.is_empty() {
             self.status = DownloadStatus::Failed("Please provide a valid download URL".to_string());
@@ -118,16 +126,24 @@ impl DownloaderApp {
         }
 
         self.status = DownloadStatus::Resolving;
-        self.status_message = "Resolving mirrors and probing endpoints...".to_string();
-        self.total_bytes = 0;
-        self.downloaded_bytes = 0;
+        self.status_message = if is_resume {
+            "Resuming multi-connection download...".to_string()
+        } else {
+            "Resolving mirrors and probing endpoints...".to_string()
+        };
+
+        if !is_resume {
+            self.total_bytes = 0;
+            self.downloaded_bytes = 0;
+            self.progress_ratio = 0.0;
+            self.target_filepath = None;
+            self.chunks.clear();
+        }
+
         self.speed_bytes_per_sec = 0.0;
-        self.progress_ratio = 0.0;
         self.start_time = Some(Instant::now());
         self.elapsed_secs = 0;
         self.eta_secs = None;
-        self.target_filepath = None;
-        self.chunks.clear();
 
         self.cancel_flag.store(false, Ordering::Relaxed);
         let cancel_flag = Arc::clone(&self.cancel_flag);
@@ -192,8 +208,38 @@ impl DownloaderApp {
     fn cancel_download(&mut self) {
         self.cancel_flag.store(true, Ordering::Relaxed);
         self.status = DownloadStatus::Cancelled;
-        self.status_message = "Download cancelled".to_string();
+        self.status_message = "Download cancelled / paused".to_string();
         self.speed_bytes_per_sec = 0.0;
+    }
+
+    fn delete_leftovers(&mut self) {
+        use hyperfetch_core::state::DownloadState;
+        if let Some(ref path) = self.target_filepath {
+            let _ = std::fs::remove_file(path);
+            let state_file = DownloadState::state_file_path(path);
+            let _ = std::fs::remove_file(state_file);
+        } else {
+            let trimmed = self.url_input.trim();
+            for u in trimmed.split_whitespace() {
+                if let Ok(url) = Url::parse(u) {
+                    if let Some(filename) = url.path_segments().and_then(|s| s.last()) {
+                        if !filename.is_empty() {
+                            let path = PathBuf::from(&self.save_dir).join(filename);
+                            let _ = std::fs::remove_file(&path);
+                            let state_file = DownloadState::state_file_path(&path);
+                            let _ = std::fs::remove_file(state_file);
+                        }
+                    }
+                }
+            }
+        }
+        self.reset_state();
+        self.status_message = "Leftover files permanently deleted".to_string();
+    }
+
+    fn start_over(&mut self) {
+        self.delete_leftovers();
+        self.start_download();
     }
 
     fn reset_state(&mut self) {
@@ -220,6 +266,9 @@ impl eframe::App for DownloaderApp {
                 if self.status == DownloadStatus::Resolving {
                     self.status = DownloadStatus::Downloading;
                     self.status_message = "Accelerating multi-connection download...".to_string();
+                }
+                if self.target_filepath.is_none() {
+                    self.target_filepath = snapshot.target_path;
                 }
                 self.total_bytes = snapshot.total_bytes;
                 self.downloaded_bytes = snapshot.downloaded_bytes;
@@ -372,8 +421,42 @@ fn render_ui(app: &mut DownloaderApp, ui: &mut egui::Ui) {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     match app.status {
                         DownloadStatus::Downloading | DownloadStatus::Resolving => {
-                            if ui.button(egui::RichText::new("Cancel").color(Color32::from_rgb(239, 68, 68))).clicked() {
+                            if ui.button(egui::RichText::new("Pause / Cancel").color(Color32::from_rgb(239, 68, 68))).clicked() {
                                 app.cancel_download();
+                            }
+                        }
+                        DownloadStatus::Cancelled => {
+                            if ui.button("Start Over").clicked() {
+                                app.start_over();
+                            }
+                            if ui.button(egui::RichText::new("Delete Leftovers").color(Color32::from_rgb(239, 68, 68))).clicked() {
+                                app.delete_leftovers();
+                            }
+                            let resume_btn = egui::Button::new(
+                                egui::RichText::new("Resume Download")
+                                    .strong()
+                                    .color(Color32::from_rgb(255, 255, 255)),
+                            )
+                            .fill(Color32::from_rgb(16, 185, 129));
+                            if ui.add_sized([130.0, 26.0], resume_btn).clicked() {
+                                app.resume_download();
+                            }
+                        }
+                        DownloadStatus::Failed(_) => {
+                            if ui.button("Start Over").clicked() {
+                                app.start_over();
+                            }
+                            if ui.button(egui::RichText::new("Delete Leftovers").color(Color32::from_rgb(239, 68, 68))).clicked() {
+                                app.delete_leftovers();
+                            }
+                            let retry_btn = egui::Button::new(
+                                egui::RichText::new("Retry / Resume")
+                                    .strong()
+                                    .color(Color32::from_rgb(255, 255, 255)),
+                            )
+                            .fill(Color32::from_rgb(16, 185, 129));
+                            if ui.add_sized([120.0, 26.0], retry_btn).clicked() {
+                                app.resume_download();
                             }
                         }
                         DownloadStatus::Completed => {

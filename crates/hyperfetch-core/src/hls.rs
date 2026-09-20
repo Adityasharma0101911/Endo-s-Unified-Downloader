@@ -312,6 +312,7 @@ impl HlsEngine {
                         active_workers: num_connections,
                         mirror_speeds: Vec::new(),
                         chunks,
+                        target_path: Some(target_file.clone()),
                     };
 
                     if let Some(ref tx) = snapshot_tx {

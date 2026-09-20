@@ -192,9 +192,9 @@ impl HttpWorker {
                     chunk.current_offset.store(current_offset, Ordering::SeqCst);
                     pending_bytes += len;
 
-                    // Send batched progress (every 128KB or 50ms) to maximize throughput
+                    // Send batched progress (every 1MB or 100ms) to maximize throughput
                     let now = Instant::now();
-                    if pending_bytes >= 128 * 1024 || now.duration_since(last_progress_time) >= Duration::from_millis(50) {
+                    if pending_bytes >= 1024 * 1024 || now.duration_since(last_progress_time) >= Duration::from_millis(100) {
                         let elapsed = now.duration_since(last_progress_time);
                         last_progress_time = now;
                         let bytes_to_report = pending_bytes;

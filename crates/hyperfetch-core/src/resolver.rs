@@ -1331,4 +1331,15 @@ mod tests {
         assert!(sources.contains(&Url::parse("https://ssrweb.zoom.us/rec/play/video_hd.mp4?auth=token123&sig=abc").unwrap()));
         assert!(sources.contains(&Url::parse("https://ssrweb.zoom.us/rec/download/video_original.mp4").unwrap()));
     }
+
+    #[tokio::test]
+    async fn test_archive_org_resolver() {
+        let client = Client::new();
+        let url = Url::parse("https://dn720001.ca.archive.org/0/items/fn-v8-archive/builds/8.51-CL-6165369.7z").unwrap();
+        let mirrors = ArchiveOrgResolver.resolve(&client, &url).await.unwrap();
+        for (i, m) in mirrors.iter().enumerate() {
+            println!("Mirror {}: {}", i, m);
+        }
+        assert!(mirrors.len() >= 2);
+    }
 }
