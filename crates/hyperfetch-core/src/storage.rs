@@ -22,7 +22,7 @@ pub enum StorageError {
 pub struct ConcurrentMmap {
     ptr: *mut u8,
     len: usize,
-    _mmap: MmapMut,
+    _mmap: Option<MmapMut>,
 }
 
 unsafe impl Send for ConcurrentMmap {}
@@ -35,15 +35,26 @@ impl ConcurrentMmap {
         Self {
             ptr,
             len,
-            _mmap: mmap,
+            _mmap: Some(mmap),
+        }
+    }
+
+    pub fn empty() -> Self {
+        Self {
+            ptr: std::ptr::NonNull::dangling().as_ptr(),
+            len: 0,
+            _mmap: None,
         }
     }
 
     /// Writes data directly at the specified offset.
     /// Safety: Callers must guarantee that concurrent calls write to disjoint byte ranges.
     pub unsafe fn write_at(&self, offset: u64, data: &[u8]) -> Result<(), StorageError> {
-        let offset = offset as usize;
         let data_len = data.len();
+        if data_len == 0 {
+            return Ok(());
+        }
+        let offset = offset as usize;
         if offset.checked_add(data_len).map_or(true, |end| end > self.len) {
             return Err(StorageError::OutOfBounds(offset as u64, data_len, self.len as u64));
         }
@@ -54,6 +65,9 @@ impl ConcurrentMmap {
 
     /// Reads a slice of data from the mmap.
     pub fn read_range(&self, range: &ByteRange) -> Result<&[u8], StorageError> {
+        if self.len == 0 || range.len() == 0 {
+            return Ok(&[]);
+        }
         let start = range.start as usize;
         let end = range.end as usize;
         if end >= self.len {
@@ -67,7 +81,11 @@ impl ConcurrentMmap {
 
     /// Flushes dirty pages to disk.
     pub fn flush(&self) -> std::io::Result<()> {
-        self._mmap.flush()
+        if let Some(ref mmap) = self._mmap {
+            mmap.flush()
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -96,12 +114,14 @@ impl DiskWriter {
             .truncate(false)
             .open(&path)?;
 
-        // Preallocate disk space
-        preallocate_file(&file, total_size)?;
-
-        // Memory map the file
-        let mmap = unsafe { MmapMut::map_mut(&file)? };
-        let storage = Arc::new(ConcurrentMmap::new(mmap));
+        let storage = if total_size > 0 {
+            preallocate_file(&file, total_size)?;
+            let mmap = unsafe { MmapMut::map_mut(&file)? };
+            Arc::new(ConcurrentMmap::new(mmap))
+        } else {
+            file.set_len(0)?;
+            Arc::new(ConcurrentMmap::empty())
+        };
 
         Ok(Self {
             path,
@@ -134,6 +154,9 @@ impl DiskWriter {
 
     /// Computes BLAKE3 root hash for the entire file.
     pub fn compute_file_hash(&self) -> Result<[u8; 32], StorageError> {
+        if self.size == 0 {
+            return Ok(*blake3::hash(&[]).as_bytes());
+        }
         let full_range = ByteRange::from_len(0, self.size).map_err(StorageError::from)?;
         self.compute_chunk_hash(&full_range)
     }
@@ -277,5 +300,19 @@ mod tests {
         let expected_hash1 = *expected_hasher.finalize().as_bytes();
 
         assert_eq!(hash1, expected_hash1);
+    }
+
+    #[test]
+    fn test_disk_writer_zero_byte() {
+        let temp = NamedTempFile::new().unwrap();
+        let path = temp.path().to_path_buf();
+
+        let writer = DiskWriter::open_or_create(&path, 0).unwrap();
+        assert_eq!(writer.size(), 0);
+
+        writer.sync().unwrap();
+        let hash = writer.compute_file_hash().unwrap();
+        let expected = *blake3::hash(&[]).as_bytes();
+        assert_eq!(hash, expected);
     }
 }

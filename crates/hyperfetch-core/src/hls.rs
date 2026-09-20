@@ -195,6 +195,9 @@ impl HlsEngine {
             });
         }
 
+        // Drop the master sender so notify_rx will terminate if all workers fail
+        drop(notify_tx);
+
         // In-order streaming file writer
         let mut next_index = 0;
         let start_time = Instant::now();
@@ -217,32 +220,52 @@ impl HlsEngine {
                 let now = Instant::now();
                 if now.duration_since(last_snapshot) >= Duration::from_millis(150) {
                     let total_bytes = total_bytes_downloaded.load(std::sync::atomic::Ordering::Relaxed);
+                    let est_total_bytes = (total_bytes * total_segments as u64) / (next_index as u64).max(1);
                     let elapsed = now.duration_since(start_time).as_secs_f64();
                     let speed = if elapsed > 0.0 { total_bytes as f64 / elapsed } else { 0.0 };
                     let mut chunks = Vec::new();
                     let display_count = total_segments.min(64);
                     for i in 0..display_count {
-                        let seg_idx = (i * total_segments) / display_count;
-                        let status = if seg_idx < next_index {
+                        let seg_start_idx = (i * total_segments) / display_count;
+                        let seg_end_idx = ((i + 1) * total_segments) / display_count;
+                        let status = if seg_end_idx <= next_index {
                             "Completed".to_string()
-                        } else if seg_idx < next_index + num_connections {
+                        } else if seg_start_idx <= next_index + num_connections {
                             "Downloading".to_string()
                         } else {
                             "Pending".to_string()
                         };
+
+                        let range_start = if total_segments > 0 {
+                            (seg_start_idx as u64 * est_total_bytes) / total_segments as u64
+                        } else {
+                            0
+                        };
+                        let range_end = if total_segments > 0 {
+                            (seg_end_idx as u64 * est_total_bytes) / total_segments as u64
+                        } else {
+                            1
+                        };
+                        let chunk_total = range_end.saturating_sub(range_start).max(1);
+                        let downloaded = if seg_end_idx <= next_index {
+                            chunk_total
+                        } else {
+                            0
+                        };
+
                         chunks.push(crate::chunk::ChunkSnapshot {
-                            id: seg_idx,
-                            range_start: seg_idx as u64,
-                            range_end: (seg_idx + 1) as u64,
-                            downloaded_bytes: if seg_idx < next_index { 1 } else { 0 },
-                            total_bytes: 1,
+                            id: i,
+                            range_start,
+                            range_end,
+                            downloaded_bytes: downloaded,
+                            total_bytes: chunk_total,
                             status,
-                            worker_id: Some(seg_idx % num_connections),
+                            worker_id: Some(i % num_connections),
                         });
                     }
 
                     let snapshot = EngineSnapshot {
-                        total_bytes: (total_bytes * total_segments as u64) / (next_index as u64).max(1),
+                        total_bytes: est_total_bytes,
                         downloaded_bytes: total_bytes,
                         speed_bytes_per_sec: speed,
                         progress_ratio: next_index as f64 / total_segments as f64,

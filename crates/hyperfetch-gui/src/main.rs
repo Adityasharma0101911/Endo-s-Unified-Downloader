@@ -145,9 +145,19 @@ impl DownloaderApp {
 
         // Bridge Tokio broadcast to standard mpsc channel for UI thread
         self.tokio_rt.spawn(async move {
-            while let Ok(snapshot) = async_snapshot_rx.recv().await {
-                if sync_snapshot_tx.send(snapshot).is_err() {
-                    break;
+            loop {
+                match async_snapshot_rx.recv().await {
+                    Ok(snapshot) => {
+                        if sync_snapshot_tx.send(snapshot).is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        break;
+                    }
                 }
             }
         });
@@ -370,7 +380,7 @@ fn render_ui(app: &mut DownloaderApp, ui: &mut egui::Ui) {
                             if let Some(ref path) = app.target_filepath {
                                 if ui.button("Open File").clicked() {
                                     #[cfg(target_os = "windows")]
-                                    let _ = std::process::Command::new("explorer").arg(path).spawn();
+                                    let _ = std::process::Command::new("cmd").args(["/C", "start", "", &path.to_string_lossy()]).spawn();
                                     #[cfg(not(target_os = "windows"))]
                                     let _ = std::process::Command::new("xdg-open").arg(path).spawn();
                                 }
@@ -497,7 +507,7 @@ fn render_ui(app: &mut DownloaderApp, ui: &mut egui::Ui) {
 
         for chunk in &app.chunks {
             let start_ratio = (chunk.range_start as f32 / total_b).clamp(0.0, 1.0);
-            let end_ratio = (chunk.range_end as f32 / total_b).clamp(0.0, 1.0);
+            let end_ratio = ((chunk.range_end + 1) as f32 / total_b).clamp(0.0, 1.0);
             let seg_x = rect.min.x + (start_ratio * width);
             let seg_w = ((end_ratio - start_ratio) * width).max(1.0);
 

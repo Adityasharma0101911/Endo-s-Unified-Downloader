@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use bitvec::prelude::*;
 use crate::range::{ByteRange, RangeError};
@@ -46,13 +48,29 @@ pub struct ChunkSnapshot {
     pub worker_id: Option<usize>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug)]
 pub struct Chunk {
     pub id: usize,
     pub range: ByteRange,
     pub status: ChunkStatus,
     pub downloaded_bytes: u64,
     pub hash: Option<[u8; 32]>,
+    pub current_offset: Arc<AtomicU64>,
+    pub end_offset: Arc<AtomicU64>,
+}
+
+impl Clone for Chunk {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id,
+            range: self.range,
+            status: self.status.clone(),
+            downloaded_bytes: self.downloaded_bytes,
+            hash: self.hash,
+            current_offset: Arc::clone(&self.current_offset),
+            end_offset: Arc::clone(&self.end_offset),
+        }
+    }
 }
 
 impl Chunk {
@@ -63,6 +81,8 @@ impl Chunk {
             status: ChunkStatus::Unassigned,
             downloaded_bytes: 0,
             hash: None,
+            current_offset: Arc::new(AtomicU64::new(range.start)),
+            end_offset: Arc::new(AtomicU64::new(range.end)),
         }
     }
 
@@ -75,7 +95,13 @@ impl Chunk {
     }
 
     pub fn remaining_bytes(&self) -> u64 {
-        self.range.len().saturating_sub(self.downloaded_bytes)
+        let cur_pos = self.current_offset.load(Ordering::SeqCst).max(self.range.start);
+        let cur_end = self.end_offset.load(Ordering::SeqCst);
+        if cur_end >= cur_pos {
+            cur_end - cur_pos + 1
+        } else {
+            0
+        }
     }
 }
 
@@ -125,13 +151,15 @@ impl ChunkManager {
         base_chunk_size: u64,
         completed_ranges: &[ByteRange],
     ) -> Result<Self, ChunkError> {
+        let merged_completed = crate::range::merge_ranges(completed_ranges.to_vec());
         let mut manager = Self::new(total_size, base_chunk_size)?;
 
-        for completed_range in completed_ranges {
+        for completed_range in &merged_completed {
             for chunk in &mut manager.chunks {
                 if completed_range.contains_range(&chunk.range) {
                     chunk.status = ChunkStatus::Completed;
                     chunk.downloaded_bytes = chunk.range.len();
+                    chunk.current_offset.store(chunk.range.end.saturating_add(1), Ordering::SeqCst);
                 }
             }
         }
@@ -214,20 +242,30 @@ impl ChunkManager {
             }
         }
 
-        let (victim_idx, remaining) = best_candidate?;
+        let (victim_idx, _) = best_candidate?;
         let victim = &mut self.chunks[victim_idx];
 
-        // Split the remaining portion: [victim.range.start + victim.downloaded_bytes, victim.range.end]
-        let remaining_start = victim.range.start + victim.downloaded_bytes;
-        let split_offset = remaining_start + (remaining / 2);
+        let cur_pos = victim.current_offset.load(Ordering::SeqCst).max(victim.range.start);
+        let cur_end = victim.end_offset.load(Ordering::SeqCst);
 
-        // Truncate victim range to end right before split_offset
+        if cur_end < cur_pos {
+            return None;
+        }
+
+        let remaining = cur_end - cur_pos + 1;
+        if remaining < min_steal_threshold {
+            return None;
+        }
+
+        let split_offset = cur_pos + (remaining / 2);
         let victim_new_end = split_offset - 1;
-        let old_end = victim.range.end;
+
+        // Truncate victim range atomically
+        victim.end_offset.store(victim_new_end, Ordering::SeqCst);
         victim.range.end = victim_new_end;
 
-        // Create stolen chunk for [split_offset, old_end]
-        let stolen_range = ByteRange::new(split_offset, old_end).ok()?;
+        // Create stolen chunk for [split_offset, cur_end]
+        let stolen_range = ByteRange::new(split_offset, cur_end).ok()?;
         let new_chunk_id = self.next_chunk_id;
         self.next_chunk_id += 1;
 
@@ -259,6 +297,7 @@ impl ChunkManager {
             mirror_id,
             downloaded_bytes: chunk.downloaded_bytes,
         };
+        chunk.current_offset.store(chunk.range.start + chunk.downloaded_bytes, Ordering::SeqCst);
         self.total_downloaded = (self.total_downloaded + bytes_just_received).min(self.total_size);
         Ok(())
     }
@@ -273,6 +312,7 @@ impl ChunkManager {
         chunk.status = ChunkStatus::Completed;
         chunk.downloaded_bytes = chunk.range.len();
         chunk.hash = hash;
+        chunk.current_offset.store(chunk.range.end.saturating_add(1), Ordering::SeqCst);
 
         if chunk_id < self.completed_bitmap.len() {
             self.completed_bitmap.set(chunk_id, true);

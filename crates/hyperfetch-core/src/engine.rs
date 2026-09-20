@@ -91,7 +91,7 @@ impl DownloadEngine {
                         .and_then(|v| v.to_str().ok())
                         .and_then(|v| v.parse::<u64>().ok());
 
-                    let filename = extract_filename(&resp.headers(), url);
+                    let filename = extract_filename(resp.headers(), url);
 
                     if let Some(len) = content_len {
                         return Ok((len, accepts_ranges, filename));
@@ -108,7 +108,7 @@ impl DownloadEngine {
             {
                 let status = resp.status();
                 let accepts_ranges = status == reqwest::StatusCode::PARTIAL_CONTENT;
-                let filename = extract_filename(&resp.headers(), url);
+                let filename = extract_filename(resp.headers(), url);
 
                 if let Some(cr) = resp.headers().get(CONTENT_RANGE).and_then(|v| v.to_str().ok()) {
                     if let Ok((_, Some(total))) = ByteRange::parse_content_range(cr) {
@@ -118,6 +118,22 @@ impl DownloadEngine {
 
                 if let Some(cl) = resp.headers().get(CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok()) {
                     return Ok((cl, accepts_ranges, filename));
+                }
+            }
+
+            // Fallback to standard GET without Range (handles servers that block HEAD or reject Range 0-0)
+            if let Ok(resp) = self.client.get(url.clone()).send().await {
+                if resp.status().is_success() {
+                    let accepts_ranges = resp.headers()
+                        .get(ACCEPT_RANGES)
+                        .and_then(|v| v.to_str().ok())
+                        .map(|v| v.eq_ignore_ascii_case("bytes"))
+                        .unwrap_or(false);
+                    let filename = extract_filename(resp.headers(), url);
+
+                    if let Some(cl) = resp.headers().get(CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok()) {
+                        return Ok((cl, accepts_ranges, filename));
+                    }
                 }
             }
         }
@@ -186,17 +202,33 @@ impl DownloadEngine {
             output_path
         );
 
+        if file_size == 0 {
+            let disk_writer = DiskWriter::open_or_create(&output_path, 0)
+                .map_err(|e| e.to_string())?;
+            disk_writer.sync().map_err(|e| e.to_string())?;
+            let final_hash = disk_writer.compute_file_hash().map_err(|e| e.to_string())?;
+            tracing::info!("Download completed! (0-byte file) BLAKE3: {}", hex_encode(&final_hash));
+            let _ = DownloadState::remove(&state_path);
+            return Ok(output_path);
+        }
+
+        let effective_chunk_size = if accepts_ranges {
+            self.options.base_chunk_size
+        } else {
+            file_size
+        };
+
         // Check for resume state
         let resumed_state = DownloadState::load_from_path(&state_path).ok().flatten();
         let chunk_manager = if let Some(ref state) = resumed_state {
             tracing::info!("Found existing .hfstate with {} completed ranges", state.completed_ranges.len());
             ChunkManager::with_resumed_ranges(
                 file_size,
-                self.options.base_chunk_size,
+                effective_chunk_size,
                 &state.completed_ranges,
             ).map_err(|e| e.to_string())?
         } else {
-            ChunkManager::new(file_size, self.options.base_chunk_size)
+            ChunkManager::new(file_size, effective_chunk_size)
                 .map_err(|e| e.to_string())?
         };
 
@@ -370,24 +402,102 @@ impl DownloadEngine {
 
 fn extract_filename(headers: &reqwest::header::HeaderMap, url: &Url) -> String {
     if let Some(cd) = headers.get(CONTENT_DISPOSITION).and_then(|v| v.to_str().ok()) {
+        // First check filename*= (RFC 5987 / 6266)
+        if let Some(idx) = cd.find("filename*=") {
+            let sub = &cd[idx + 10..];
+            let raw = sub.trim_matches('"').split(';').next().unwrap_or("").trim();
+            // Format: UTF-8''encoded_name
+            let name = if let Some(stripped) = raw.strip_prefix("UTF-8''") {
+                percent_decode_str(stripped)
+            } else if let Some(stripped) = raw.strip_prefix("utf-8''") {
+                percent_decode_str(stripped)
+            } else {
+                raw.to_string()
+            };
+            let sanitized = sanitize_filename(&name);
+            if !sanitized.is_empty() {
+                return sanitized;
+            }
+        }
+
+        // Then check filename=
         if let Some(idx) = cd.find("filename=") {
             let sub = &cd[idx + 9..];
             let name = sub.trim_matches('"').split(';').next().unwrap_or("").trim();
-            if !name.is_empty() {
-                return name.to_string();
+            let sanitized = sanitize_filename(name);
+            if !sanitized.is_empty() {
+                return sanitized;
             }
         }
     }
 
     if let Some(mut segments) = url.path_segments() {
         if let Some(last) = segments.next_back() {
-            if !last.is_empty() {
-                return last.to_string();
+            let decoded = percent_decode_str(last);
+            let sanitized = sanitize_filename(&decoded);
+            if !sanitized.is_empty() {
+                return sanitized;
             }
         }
     }
 
     "downloaded_file.bin".to_string()
+}
+
+fn percent_decode_str(input: &str) -> String {
+    let mut bytes = Vec::with_capacity(input.len());
+    let mut chars = input.bytes();
+    while let Some(b) = chars.next() {
+        if b == b'%' {
+            let h1 = chars.next();
+            let h2 = chars.next();
+            if let (Some(c1), Some(c2)) = (h1, h2) {
+                let hex_str = [c1, c2];
+                if let Ok(s) = std::str::from_utf8(&hex_str) {
+                    if let Ok(val) = u8::from_str_radix(s, 16) {
+                        bytes.push(val);
+                        continue;
+                    }
+                }
+                bytes.push(b'%');
+                bytes.push(c1);
+                bytes.push(c2);
+            } else {
+                bytes.push(b'%');
+                if let Some(c1) = h1 { bytes.push(c1); }
+            }
+        } else {
+            bytes.push(b);
+        }
+    }
+    String::from_utf8_lossy(&bytes).to_string()
+}
+
+fn sanitize_filename(name: &str) -> String {
+    // Replace illegal Windows characters: < > : " / \ | ? *
+    let cleaned: String = name
+        .chars()
+        .map(|c| match c {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+            c if (c as u32) < 32 => '_',
+            c => c,
+        })
+        .collect();
+
+    let trimmed = cleaned.trim().trim_matches('.').to_string();
+    let upper = trimmed.to_ascii_uppercase();
+    let is_reserved = matches!(
+        upper.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL"
+            | "COM1" | "COM2" | "COM3" | "COM4" | "COM5" | "COM6" | "COM7" | "COM8" | "COM9"
+            | "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9"
+    );
+
+    if is_reserved {
+        format!("{}_file", trimmed)
+    } else {
+        trimmed
+    }
 }
 
 fn hex_encode(data: &[u8]) -> String {

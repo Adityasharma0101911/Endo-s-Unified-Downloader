@@ -142,6 +142,39 @@ impl ByteRange {
     pub fn as_inclusive_range(&self) -> RangeInclusive<u64> {
         self.start..=self.end
     }
+
+    /// Merges two ranges if they overlap or are directly contiguous.
+    pub fn merge(&self, other: &ByteRange) -> Option<ByteRange> {
+        if self.intersects(other) || self.end.saturating_add(1) == other.start || other.end.saturating_add(1) == self.start {
+            Some(ByteRange {
+                start: self.start.min(other.start),
+                end: self.end.max(other.end),
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// Merges a list of byte ranges into contiguous, non-overlapping ranges.
+pub fn merge_ranges(mut ranges: Vec<ByteRange>) -> Vec<ByteRange> {
+    if ranges.is_empty() {
+        return Vec::new();
+    }
+    ranges.sort();
+    let mut merged = Vec::with_capacity(ranges.len());
+    let mut current = ranges[0];
+
+    for next in ranges.into_iter().skip(1) {
+        if let Some(m) = current.merge(&next) {
+            current = m;
+        } else {
+            merged.push(current);
+            current = next;
+        }
+    }
+    merged.push(current);
+    merged
 }
 
 impl fmt::Display for ByteRange {
@@ -216,5 +249,22 @@ mod tests {
         assert_eq!(total_star, None);
 
         assert!(ByteRange::parse_content_range("invalid").is_err());
+    }
+
+    #[test]
+    fn test_merge_and_merge_ranges() {
+        let r1 = ByteRange::new(0, 99).unwrap();
+        let r2 = ByteRange::new(100, 199).unwrap();
+        let r3 = ByteRange::new(250, 300).unwrap();
+        let r4 = ByteRange::new(280, 400).unwrap();
+
+        assert_eq!(r1.merge(&r2), Some(ByteRange::new(0, 199).unwrap()));
+        assert_eq!(r3.merge(&r4), Some(ByteRange::new(250, 400).unwrap()));
+        assert_eq!(r1.merge(&r3), None);
+
+        let merged = merge_ranges(vec![r3, r1, r4, r2]);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0], ByteRange::new(0, 199).unwrap());
+        assert_eq!(merged[1], ByteRange::new(250, 400).unwrap());
     }
 }

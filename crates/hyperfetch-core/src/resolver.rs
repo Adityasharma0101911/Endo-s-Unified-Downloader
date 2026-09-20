@@ -130,8 +130,7 @@ impl HostResolver for GoogleDriveResolver {
         let resp = client.get(&initial_url).send().await?;
 
         // If it directly redirected to the download stream
-        if let Some(final_url) = resp.url().as_str().strip_prefix("https://docs.googleusercontent.com/") {
-            let _ = final_url;
+        if resp.url().host_str().map_or(false, |h| h.ends_with("googleusercontent.com")) {
             return Ok(vec![resp.url().clone()]);
         }
 
@@ -874,7 +873,7 @@ fn extract_google_drive_id(url: &Url) -> Option<String> {
 }
 
 fn extract_confirm_token(html: &str) -> Option<String> {
-    // Matches confirm=([0-9a-zA-Z_-]+)
+    // 1. Matches confirm=([0-9a-zA-Z_-]+)
     if let Some(idx) = html.find("confirm=") {
         let sub = &html[idx + 8..];
         let token: String = sub.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '-').collect();
@@ -882,26 +881,56 @@ fn extract_confirm_token(html: &str) -> Option<String> {
             return Some(token);
         }
     }
+
+    // 2. Matches name="confirm" value="([0-9a-zA-Z_-]+)"
+    let needle = "name=\"confirm\"";
+    if let Some(idx) = html.find(needle) {
+        let sub = &html[idx + needle.len()..];
+        if let Some(val_idx) = sub.find("value=\"") {
+            let val_sub = &sub[val_idx + 7..];
+            let token: String = val_sub.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '-').collect();
+            if !token.is_empty() {
+                return Some(token);
+            }
+        }
+    }
+
+    // 3. Matches value="([0-9a-zA-Z_-]+)" name="confirm"
+    if let Some(idx) = html.find(needle) {
+        let pre = &html[..idx];
+        if let Some(val_idx) = pre.rfind("value=\"") {
+            let val_sub = &pre[val_idx + 7..];
+            let token: String = val_sub.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '-').collect();
+            if !token.is_empty() {
+                return Some(token);
+            }
+        }
+    }
+
     None
 }
 
 fn extract_mediafire_direct(html: &str) -> Option<String> {
-    // Matches https://download[0-9]+\.mediafire\.com/[^"'\s]+
-    let target = "https://download";
-    let mut cursor = 0;
-
-    while let Some(idx) = html[cursor..].find(target) {
-        let start = cursor + idx;
-        let sub = &html[start..];
-        if let Some(end) = sub.find(|c| c == '"' || c == '\'' || c == ' ' || c == '<') {
-            let candidate = &sub[..end];
-            if candidate.contains(".mediafire.com/") {
-                return Some(candidate.to_string());
+    let targets = ["https://download", "http://download", "//download"];
+    for target in targets {
+        let mut cursor = 0;
+        while let Some(idx) = html[cursor..].find(target) {
+            let start = cursor + idx;
+            let sub = &html[start..];
+            if let Some(end) = sub.find(|c| c == '"' || c == '\'' || c == ' ' || c == '<') {
+                let candidate = &sub[..end];
+                if candidate.contains(".mediafire.com/") {
+                    let full = if candidate.starts_with("//") {
+                        format!("https:{}", candidate)
+                    } else {
+                        candidate.to_string()
+                    };
+                    return Some(full);
+                }
             }
+            cursor = start + target.len();
         }
-        cursor = start + target.len();
     }
-
     None
 }
 

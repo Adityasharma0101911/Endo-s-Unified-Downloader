@@ -69,13 +69,16 @@ impl HttpWorker {
         cancel_flag: Arc<AtomicBool>,
     ) {
         let chunk_id = chunk.id;
-        let range = chunk.range;
         let worker_id = self.worker_id;
+
+        // Ensure atomic offsets are initialized to current chunk range
+        chunk.current_offset.store(chunk.range.start, Ordering::SeqCst);
+        chunk.end_offset.store(chunk.range.end, Ordering::SeqCst);
 
         let request_start = Instant::now();
 
         let mut headers = HeaderMap::new();
-        headers.insert(RANGE, HeaderValue::from_str(&range.to_http_header()).unwrap());
+        headers.insert(RANGE, HeaderValue::from_str(&chunk.range.to_http_header()).unwrap());
 
         let response = match self
             .client
@@ -114,14 +117,31 @@ impl HttpWorker {
             return;
         }
 
+        // If server returned 200 OK for a chunk starting at non-zero, server does not support ranges!
+        if status == StatusCode::OK && chunk.range.start != 0 {
+            let _ = self.event_tx.send(WorkerEvent::ChunkFailed {
+                worker_id,
+                chunk_id,
+                mirror_id,
+                error: format!("Server returned 200 OK for partial range starting at {}", chunk.range.start),
+            }).await;
+            return;
+        }
+
         let mut stream = response.bytes_stream();
-        let mut current_offset = range.start;
+        let mut current_offset = chunk.range.start;
         let mut last_progress_time = Instant::now();
+        let mut pending_bytes: u64 = 0;
 
         while let Some(item) = stream.next().await {
             if cancel_flag.load(Ordering::Relaxed) {
-                // Cooperative cancellation (e.g. download paused or range stolen)
+                // Cooperative cancellation (e.g. download paused or cancelled)
                 return;
+            }
+
+            let current_end = chunk.end_offset.load(Ordering::Relaxed);
+            if current_offset > current_end {
+                break;
             }
 
             match item {
@@ -131,9 +151,9 @@ impl HttpWorker {
                         continue;
                     }
 
-                    // Check bounds against chunk range
-                    if current_offset + len - 1 > range.end {
-                        let valid_len = (range.end + 1).saturating_sub(current_offset) as usize;
+                    // Check bounds against dynamic chunk range end (can be truncated by work stealing)
+                    if current_offset + len - 1 > current_end {
+                        let valid_len = (current_end + 1).saturating_sub(current_offset) as usize;
                         if valid_len > 0 {
                             if let Err(e) = self.writer.write_chunk_slice(current_offset, &bytes[..valid_len]) {
                                 let _ = self.event_tx.send(WorkerEvent::ChunkFailed {
@@ -144,6 +164,9 @@ impl HttpWorker {
                                 }).await;
                                 return;
                             }
+                            current_offset += valid_len as u64;
+                            chunk.current_offset.store(current_offset, Ordering::Relaxed);
+                            pending_bytes += valid_len as u64;
                         }
                         break;
                     }
@@ -159,17 +182,25 @@ impl HttpWorker {
                     }
 
                     current_offset += len;
-                    let now = Instant::now();
-                    let elapsed = now.duration_since(last_progress_time);
-                    last_progress_time = now;
+                    chunk.current_offset.store(current_offset, Ordering::Relaxed);
+                    pending_bytes += len;
 
-                    let _ = self.event_tx.send(WorkerEvent::Progress {
-                        worker_id,
-                        chunk_id,
-                        mirror_id,
-                        bytes_received: len,
-                        duration: elapsed,
-                    }).await;
+                    // Send batched progress (every 128KB or 50ms) to maximize throughput
+                    let now = Instant::now();
+                    if pending_bytes >= 128 * 1024 || now.duration_since(last_progress_time) >= Duration::from_millis(50) {
+                        let elapsed = now.duration_since(last_progress_time);
+                        last_progress_time = now;
+                        let bytes_to_report = pending_bytes;
+                        pending_bytes = 0;
+
+                        let _ = self.event_tx.send(WorkerEvent::Progress {
+                            worker_id,
+                            chunk_id,
+                            mirror_id,
+                            bytes_received: bytes_to_report,
+                            duration: elapsed,
+                        }).await;
+                    }
                 }
                 Err(err) => {
                     let _ = self.event_tx.send(WorkerEvent::ChunkFailed {
@@ -183,8 +214,22 @@ impl HttpWorker {
             }
         }
 
-        // Compute BLAKE3 chunk hash on completion
-        let hash = self.writer.compute_chunk_hash(&range).ok();
+        // Flush any remaining batched progress
+        if pending_bytes > 0 {
+            let elapsed = last_progress_time.elapsed();
+            let _ = self.event_tx.send(WorkerEvent::Progress {
+                worker_id,
+                chunk_id,
+                mirror_id,
+                bytes_received: pending_bytes,
+                duration: elapsed,
+            }).await;
+        }
+
+        // Compute BLAKE3 chunk hash on completion of actual downloaded range
+        let final_end = chunk.end_offset.load(Ordering::SeqCst);
+        let actual_range = crate::range::ByteRange::new(chunk.range.start, final_end).unwrap_or(chunk.range);
+        let hash = self.writer.compute_chunk_hash(&actual_range).ok();
 
         let _ = self.event_tx.send(WorkerEvent::ChunkCompleted {
             worker_id,

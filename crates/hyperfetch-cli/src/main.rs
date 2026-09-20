@@ -161,9 +161,19 @@ async fn execute_download(engine: DownloadEngine) {
 
     let pb_clone = pb.clone();
     let monitor_handle = tokio::spawn(async move {
-        while let Ok(snapshot) = snapshot_rx.recv().await {
-            pb_clone.set_length(snapshot.total_bytes);
-            pb_clone.set_position(snapshot.downloaded_bytes);
+        loop {
+            match snapshot_rx.recv().await {
+                Ok(snapshot) => {
+                    pb_clone.set_length(snapshot.total_bytes);
+                    pb_clone.set_position(snapshot.downloaded_bytes);
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    continue;
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    break;
+                }
+            }
         }
     });
 
