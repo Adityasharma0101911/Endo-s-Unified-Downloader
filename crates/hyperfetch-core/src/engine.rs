@@ -136,6 +136,39 @@ impl DownloadEngine {
             resolved_urls.extend(mirrors);
         }
 
+        // Check if any resolved URL is an HLS streaming playlist (.m3u8)
+        for url in &resolved_urls {
+            if url.path().ends_with(".m3u8") || url.as_str().contains(".m3u8") {
+                tracing::info!("Detected HLS video stream: {}", url);
+                match crate::hls::parse_hls_playlist(&self.client, url).await {
+                    Ok(segments) => {
+                        let base_filename = extract_filename(&reqwest::header::HeaderMap::new(), url);
+                        let mut target_name = PathBuf::from(base_filename);
+                        if target_name.extension().map_or(true, |ext| ext == "m3u8") {
+                            target_name.set_extension("mp4");
+                        }
+
+                        let out_path = match &self.options.output_path {
+                            Some(p) if p.is_dir() => p.join(&target_name),
+                            Some(p) => p.clone(),
+                            None => target_name,
+                        };
+
+                        return crate::hls::HlsEngine::download(
+                            &self.client,
+                            segments,
+                            &out_path,
+                            self.options.num_connections,
+                            snapshot_tx,
+                        ).await.map_err(|e| e.to_string());
+                    }
+                    Err(e) => {
+                        tracing::warn!("HLS playlist parsing failed, falling back to direct download: {}", e);
+                    }
+                }
+            }
+        }
+
         let (file_size, accepts_ranges, filename) = self.probe_mirrors(&resolved_urls).await?;
 
         let output_path = match &self.options.output_path {

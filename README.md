@@ -28,6 +28,7 @@ Endo features an extensible `HostResolver` pipeline that detects host patterns a
 - **Archive.org:** Queries the Metadata API (`/metadata/:id`) to extract all replica hosts in `workable_servers`, racing across 3–5 physical data-center clusters simultaneously.
 - **SourceForge:** Harvests 5+ global CDN mirrors (`fastly`, `heanet`, `jaist`, `liquidtelecom`) and feeds them into `MirrorRacer` concurrently.
 - **Dropbox:** Automatically normalizes preview links (`dl=0`) to raw binary streaming links (`dl=1`).
+- **HLS (.m3u8) Stream Ingestion & Segment Stitching:** Automatically parses master and media HLS playlists, auto-selects the highest resolution variant (1080p/4K), downloads all `.ts` segments concurrently across 16–32 connections, and stitches them in-order into a single cohesive `.mp4` video file on disk.
 - **Web & HTML5 Video Extraction:** When given a webpage URL containing embedded video content, the engine parses `<video>`, `<source src="...">`, OpenGraph tags (`og:video`), and Twitter player streams to extract direct underlying media files (`.mp4`, `.webm`, `.mkv`, etc.) and downloads them directly across parallel range streams.
 - **Anti-QoS Browser Headers:** Emulates modern browser headers (`Sec-Ch-Ua`, Chrome 124 user-agent) to prevent hosters from routing connections to low-priority bandwidth queues.
 
