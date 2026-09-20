@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
+  <defs>
+    <!-- Background Gradient -->
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0a0e17" />
+      <stop offset="50%" stop-color="#0f172a" />
+      <stop offset="100%" stop-color="#050811" />
+    </linearGradient>
+
+    <!-- Border Glow Gradient -->
+    <linearGradient id="borderGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.8" />
+      <stop offset="50%" stop-color="#818cf8" stop-opacity="0.3" />
+      <stop offset="100%" stop-color="#c084fc" stop-opacity="0.8" />
+    </linearGradient>
+
+    <!-- Core Cyan/Violet Gradient -->
+    <linearGradient id="streamGrad1" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#38bdf8" />
+      <stop offset="100%" stop-color="#0284c7" />
+    </linearGradient>
+
+    <linearGradient id="streamGrad2" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#a855f7" />
+      <stop offset="100%" stop-color="#6366f1" />
+    </linearGradient>
+
+    <linearGradient id="arrowGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#00f2fe" />
+      <stop offset="50%" stop-color="#4facfe" />
+      <stop offset="100%" stop-color="#7000ff" />
+    </linearGradient>
+
+    <!-- Outer Glow Filter -->
+    <filter id="neonGlow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="12" result="blur" />
+      <feComposite in="SourceGraphic" in2="blur" operator="over" />
+    </filter>
+
+    <!-- Soft Ambient Glow -->
+    <radialGradient id="centerGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#00f2fe" stop-opacity="0.15" />
+      <stop offset="100%" stop-color="#00f2fe" stop-opacity="0" />
+    </radialGradient>
+  </defs>
+
+  <!-- Squircle Background Canvas -->
+  <rect x="16" y="16" width="480" height="480" rx="108" fill="url(#bgGrad)" stroke="url(#borderGrad)" stroke-width="2.5" />
+
+  <!-- Ambient Light Orb -->
+  <circle cx="256" cy="256" r="180" fill="url(#centerGlow)" />
+
+  <g filter="url(#neonGlow)">
+    <!-- Multi-Stream Speed Lines (Converging Multi-Connection Chunks) -->
+    <!-- Outer Left Stream -->
+    <path d="M 160 110 L 160 210" stroke="url(#streamGrad1)" stroke-width="8" stroke-linecap="round" stroke-dasharray="24 16" opacity="0.6" />
+    <!-- Inner Left Stream -->
+    <path d="M 208 80 L 208 240" stroke="url(#streamGrad1)" stroke-width="10" stroke-linecap="round" stroke-dasharray="32 16" opacity="0.85" />
+    <!-- Center Acceleration Stream -->
+    <path d="M 256 65 L 256 260" stroke="#00f2fe" stroke-width="12" stroke-linecap="round" stroke-dasharray="40 20" />
+    <!-- Inner Right Stream -->
+    <path d="M 304 80 L 304 240" stroke="url(#streamGrad2)" stroke-width="10" stroke-linecap="round" stroke-dasharray="32 16" opacity="0.85" />
+    <!-- Outer Right Stream -->
+    <path d="M 352 110 L 352 210" stroke="url(#streamGrad2)" stroke-width="8" stroke-linecap="round" stroke-dasharray="24 16" opacity="0.6" />
+
+    <!-- Unified Downloader Arrowhead (Precision Geometric Minimalist) -->
+    <path d="M 156 270 
+             L 256 370 
+             L 356 270 
+             L 306 270 
+             L 256 320 
+             L 206 270 Z" 
+          fill="url(#arrowGrad)" />
+
+    <!-- Anchor / Ingestion Base Line -->
+    <rect x="176" y="405" width="160" height="10" rx="5" fill="url(#streamGrad1)" opacity="0.9" />
+    <circle cx="256" cy="410" r="4" fill="#ffffff" />
+  </g>
+</svg>
