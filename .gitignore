@@ -1,0 +1,30 @@
+# Build artifacts
+target/
+**/*.rs.bk
+
+# Compiled executables and libraries
+*.exe
+*.dll
+*.so
+*.dylib
+*.pdb
+
+# Runtime & State Files
+*.hfstate
+*.hfstate.tmp
+*.tmp
+*.bin
+*.iso
+*.zip
+
+# System & IDE files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.log
+
+# AI & Agent artifacts
+.gemini/
+.antigravity/
+.system_generated/
