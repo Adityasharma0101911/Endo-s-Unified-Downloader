@@ -34,8 +34,9 @@ struct ArchiveMetadata {
 
 impl HostResolver for ArchiveOrgResolver {
     fn can_handle(&self, url: &Url) -> bool {
-        url.host_str().map_or(false, |h| h.ends_with("archive.org"))
-            && url.path().starts_with("/download/")
+        let is_archive_host = url.host_str().map_or(false, |h| h.ends_with("archive.org"));
+        let path = url.path();
+        is_archive_host && (path.starts_with("/download/") || path.contains("/items/"))
     }
 
     async fn resolve(&self, client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
@@ -43,12 +44,17 @@ impl HostResolver for ArchiveOrgResolver {
             .ok_or_else(|| ResolverError::Parse("Missing path segments".to_string()))?
             .collect();
 
-        if segments.len() < 3 || segments[0] != "download" {
+        let (identifier, filename) = if segments.len() >= 3 && segments[0] == "download" {
+            (segments[1].to_string(), segments[2..].join("/"))
+        } else if let Some(pos) = segments.iter().position(|&s| s == "items") {
+            if segments.len() > pos + 2 {
+                (segments[pos + 1].to_string(), segments[pos + 2..].join("/"))
+            } else {
+                return Ok(vec![url.clone()]);
+            }
+        } else {
             return Ok(vec![url.clone()]);
-        }
-
-        let identifier = segments[1];
-        let filename = segments[2..].join("/");
+        };
 
         let metadata_url = format!("https://archive.org/metadata/{}", identifier);
         let resp = client.get(&metadata_url).send().await?;
@@ -90,6 +96,13 @@ impl HostResolver for ArchiveOrgResolver {
             let mirror_str = format!("https://{}{}/{}", s, dir, filename);
             if let Ok(m_url) = Url::parse(&mirror_str) {
                 mirror_urls.push(m_url);
+            }
+        }
+
+        let lb_url_str = format!("https://archive.org/download/{}/{}", identifier, filename);
+        if let Ok(lb_url) = Url::parse(&lb_url_str) {
+            if !mirror_urls.contains(&lb_url) {
+                mirror_urls.push(lb_url);
             }
         }
 
@@ -1086,5 +1099,7 @@ mod tests {
         assert!(FacebookResolver.can_handle(&Url::parse("https://www.facebook.com/watch/?v=12345").unwrap()));
         assert!(DailymotionResolver.can_handle(&Url::parse("https://dai.ly/x8xyz").unwrap()));
         assert!(InstagramResolver.can_handle(&Url::parse("https://www.instagram.com/reel/C12345/").unwrap()));
+        assert!(ArchiveOrgResolver.can_handle(&Url::parse("https://archive.org/download/item/file.zip").unwrap()));
+        assert!(ArchiveOrgResolver.can_handle(&Url::parse("https://dn720001.ca.archive.org/0/items/fn-v8-archive/builds/8.51-CL-6165369.7z").unwrap()));
     }
 }
