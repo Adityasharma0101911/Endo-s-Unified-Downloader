@@ -43,7 +43,7 @@ async fn run_interactive_ui() -> Result<(), Box<dyn std::error::Error>> {
     use std::io::{self, Write};
 
     println!("\n===================================================================");
-    println!("   ⚡ Endo's Unified Downloader - Next-Gen Acceleration Engine");
+    println!("   Endo's Unified Downloader - High-Speed Ingestion Engine");
     println!("===================================================================");
 
     let default_download_dir = std::env::var("USERPROFILE")
@@ -51,8 +51,8 @@ async fn run_interactive_ui() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| PathBuf::from("."));
 
     loop {
-        println!("\n📌 Paste download link(s) (separate multiple mirrors with a space),");
-        print!("   or press Enter to exit:\n   > ");
+        println!("\nEnter download URL(s) (space-separated for multiple mirrors),");
+        print!("or press Enter to exit:\n> ");
         io::stdout().flush()?;
 
         let mut input = String::new();
@@ -60,7 +60,7 @@ async fn run_interactive_ui() -> Result<(), Box<dyn std::error::Error>> {
         let trimmed = input.trim();
 
         if trimmed.is_empty() {
-            println!("Exiting Endo's Unified Downloader. Goodbye!");
+            println!("Exiting Endo's Unified Downloader. Goodbye.");
             break;
         }
 
@@ -72,7 +72,7 @@ async fn run_interactive_ui() -> Result<(), Box<dyn std::error::Error>> {
             match Url::parse(u) {
                 Ok(url) => parsed_urls.push(url),
                 Err(e) => {
-                    eprintln!("❌ Invalid URL '{}': {}", u, e);
+                    eprintln!("[ERROR] Invalid URL '{}': {}", u, e);
                     has_error = true;
                     break;
                 }
@@ -84,14 +84,14 @@ async fn run_interactive_ui() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Ask for connection count
-        print!("🚀 Concurrent connections [default: 16]: ");
+        print!("Concurrent connections [default: 16]: ");
         io::stdout().flush()?;
         let mut conn_input = String::new();
         io::stdin().read_line(&mut conn_input)?;
         let connections = conn_input.trim().parse::<usize>().unwrap_or(16).max(1);
 
         // Ask for save folder
-        print!("📁 Save directory [default: {}]: ", default_download_dir.display());
+        print!("Save directory [default: {}]: ", default_download_dir.display());
         io::stdout().flush()?;
         let mut dir_input = String::new();
         io::stdin().read_line(&mut dir_input)?;
@@ -108,17 +108,17 @@ async fn run_interactive_ui() -> Result<(), Box<dyn std::error::Error>> {
             output_path: Some(target_dir),
         };
 
-        println!("\n🔍 Probing mirrors and initiating high-speed download...");
+        println!("\nProbing mirrors and initializing chunk pipeline...");
         let engine = DownloadEngine::new(parsed_urls, options);
         execute_download(engine).await;
 
         println!("\n-------------------------------------------------------------------");
-        print!("Download another file? [Y/n]: ");
+        print!("Download another file? [y/N]: ");
         io::stdout().flush()?;
         let mut again = String::new();
         io::stdin().read_line(&mut again)?;
-        if again.trim().eq_ignore_ascii_case("n") {
-            println!("Goodbye!");
+        if !again.trim().eq_ignore_ascii_case("y") {
+            println!("Goodbye.");
             break;
         }
     }
@@ -141,7 +141,7 @@ async fn run_cli_download(args: Args) -> Result<(), Box<dyn std::error::Error>> 
     };
 
     let engine = DownloadEngine::new(parsed_urls, options);
-    println!("⚡ Endo's Unified Downloader v0.1.0 - Next-Gen Acceleration Engine");
+    println!("Endo's Unified Downloader v0.1.0");
     println!("Probing mirrors and preparing dynamic chunk pipeline...");
 
     execute_download(engine).await;
@@ -156,7 +156,7 @@ async fn execute_download(engine: DownloadEngine) {
         ProgressStyle::default_bar()
             .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, ETA {eta})")
             .unwrap()
-            .progress_chars("█▓▒░ "),
+            .progress_chars("=>-"),
     );
 
     let pb_clone = pb.clone();
@@ -172,12 +172,12 @@ async fn execute_download(engine: DownloadEngine) {
 
     match result {
         Ok(path) => {
-            pb.finish_with_message("Complete!");
-            println!("\n✅ Successfully downloaded to: {}", path.display());
+            pb.finish_with_message("Complete");
+            println!("\n[OK] Downloaded to: {}", path.display());
         }
         Err(err) => {
-            pb.abandon_with_message("Failed!");
-            eprintln!("\n❌ Download error: {}", err);
+            pb.abandon_with_message("Failed");
+            eprintln!("\n[ERROR] Download failed: {}", err);
         }
     }
 }
