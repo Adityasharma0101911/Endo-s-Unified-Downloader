@@ -224,12 +224,200 @@ impl HostResolver for SourceForgeResolver {
     }
 }
 
+/// Vimeo Resolver (Extracts unthrottled progressive MP4 and HLS streams via player config API)
+pub struct VimeoResolver;
+
+impl HostResolver for VimeoResolver {
+    fn can_handle(&self, url: &Url) -> bool {
+        url.host_str().map_or(false, |h| h.contains("vimeo.com"))
+    }
+
+    async fn resolve(&self, client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
+        let video_id = extract_vimeo_id(url);
+        if let Some(id) = video_id {
+            let config_url = format!("https://player.vimeo.com/video/{}/config", id);
+            if let Ok(resp) = client.get(&config_url).send().await {
+                if resp.status().is_success() {
+                    if let Ok(bytes) = resp.bytes().await {
+                        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                            let mut urls = Vec::new();
+
+                            // 1. Check progressive MP4 files (highest quality first)
+                            if let Some(files) = json.pointer("/request/files/progressive").and_then(|v| v.as_array()) {
+                                let mut progressive: Vec<(u64, String)> = files.iter().filter_map(|f| {
+                                    let u = f.get("url")?.as_str()?;
+                                    let height = f.get("height").and_then(|h| h.as_u64()).unwrap_or(0);
+                                    Some((height, u.to_string()))
+                                }).collect();
+
+                                progressive.sort_by(|a, b| b.0.cmp(&a.0));
+                                for (_, u_str) in progressive {
+                                    if let Ok(u) = Url::parse(&u_str) {
+                                        urls.push(u);
+                                    }
+                                }
+                            }
+
+                            // 2. Fallback to HLS master playlist
+                            if urls.is_empty() {
+                                if let Some(cdns) = json.pointer("/request/files/hls/cdns").and_then(|v| v.as_object()) {
+                                    for (_cdn, cdn_obj) in cdns {
+                                        if let Some(hls_url_str) = cdn_obj.get("url").and_then(|u| u.as_str()) {
+                                            if let Ok(u) = Url::parse(hls_url_str) {
+                                                urls.push(u);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            if !urls.is_empty() {
+                                return Ok(urls);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(vec![url.clone()])
+    }
+}
+
+/// Reddit Video Resolver (Extracts combined video+audio HLS streams and fallback DASH URLs)
+pub struct RedditResolver;
+
+impl HostResolver for RedditResolver {
+    fn can_handle(&self, url: &Url) -> bool {
+        url.host_str().map_or(false, |h| h.contains("reddit.com") || h.contains("redd.it"))
+    }
+
+    async fn resolve(&self, client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
+        // Case 1: Direct v.redd.it/:id
+        if url.host_str().map_or(false, |h| h.contains("v.redd.it")) {
+            let id = url.path().trim_matches('/');
+            if !id.is_empty() && !id.contains('/') {
+                // v.redd.it provides an HLSPlaylist.m3u8 containing synchronized video + audio
+                let hls_url = format!("https://v.redd.it/{}/HLSPlaylist.m3u8", id);
+                if let Ok(u) = Url::parse(&hls_url) {
+                    return Ok(vec![u]);
+                }
+            }
+        }
+
+        // Case 2: reddit.com/r/.../comments/:id/...
+        if let Some(comment_id) = extract_reddit_id(url) {
+            let json_url = format!("https://www.reddit.com/comments/{}.json", comment_id);
+            if let Ok(resp) = client.get(&json_url).send().await {
+                if resp.status().is_success() {
+                    if let Ok(bytes) = resp.bytes().await {
+                        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                            // Traverse post data to find reddit_video
+                            if let Some(hls_url_str) = find_json_string(&json, "hls_url") {
+                                if let Ok(u) = Url::parse(&hls_url_str) {
+                                    return Ok(vec![u]);
+                                }
+                            }
+                            if let Some(fb_url_str) = find_json_string(&json, "fallback_url") {
+                                if let Ok(u) = Url::parse(&fb_url_str) {
+                                    return Ok(vec![u]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(vec![url.clone()])
+    }
+}
+
+/// Twitter / X Video Resolver (Extracts highest bitrate MP4 streams via syndication API)
+pub struct TwitterResolver;
+
+impl HostResolver for TwitterResolver {
+    fn can_handle(&self, url: &Url) -> bool {
+        url.host_str().map_or(false, |h| h.contains("twitter.com") || h.contains("x.com"))
+            && url.path().contains("/status/")
+    }
+
+    async fn resolve(&self, client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
+        let status_id = extract_status_id(url);
+        if let Some(id) = status_id {
+            let syndication_url = format!("https://cdn.syndication.twimg.com/tweet-result?id={}&token=x", id);
+            if let Ok(resp) = client.get(&syndication_url).send().await {
+                if resp.status().is_success() {
+                    if let Ok(bytes) = resp.bytes().await {
+                        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                            if let Some(variants) = json.pointer("/video/variants").and_then(|v| v.as_array()) {
+                                let mut mp4s: Vec<(u64, String)> = variants.iter().filter_map(|v| {
+                                    let content_type = v.get("type")?.as_str()?;
+                                    if content_type == "video/mp4" {
+                                        let u = v.get("src")?.as_str()?;
+                                        let bitrate = v.get("bitrate").and_then(|b| b.as_u64()).unwrap_or(0);
+                                        Some((bitrate, u.to_string()))
+                                    } else {
+                                        None
+                                    }
+                                }).collect();
+
+                                mp4s.sort_by(|a, b| b.0.cmp(&a.0));
+                                let mut urls = Vec::new();
+                                for (_, u_str) in mp4s {
+                                    if let Ok(u) = Url::parse(&u_str) {
+                                        urls.push(u);
+                                    }
+                                }
+                                if !urls.is_empty() {
+                                    return Ok(urls);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(vec![url.clone()])
+    }
+}
+
+/// TikTok Video Resolver (Extracts direct play and download CDN streams)
+pub struct TikTokResolver;
+
+impl HostResolver for TikTokResolver {
+    fn can_handle(&self, url: &Url) -> bool {
+        url.host_str().map_or(false, |h| h.contains("tiktok.com"))
+    }
+
+    async fn resolve(&self, client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
+        if let Ok(resp) = client.get(url.clone()).send().await {
+            if resp.status().is_success() {
+                let text = resp.text().await.unwrap_or_default();
+                // Search for playAddr or downloadAddr in HTML / JSON rehydration state
+                if let Some(play_addr) = extract_tiktok_addr(&text, "playAddr")
+                    .or_else(|| extract_tiktok_addr(&text, "downloadAddr"))
+                {
+                    // Clean escaped unicode / backslashes in JSON (e.g. \u0026 -> &)
+                    let cleaned = play_addr.replace("\\u0026", "&").replace("\\/", "/");
+                    if let Ok(u) = Url::parse(&cleaned) {
+                        return Ok(vec![u]);
+                    }
+                }
+            }
+        }
+
+        Ok(vec![url.clone()])
+    }
+}
+
 /// HTML5 Video Extractor (Extracts direct media streams from webpage <video>, <source>, and OpenGraph tags)
 pub struct HtmlVideoResolver;
 
 impl HostResolver for HtmlVideoResolver {
     fn can_handle(&self, url: &Url) -> bool {
-        // Handle web pages that are not direct binary/archive downloads
         let path = url.path().to_ascii_lowercase();
         let is_direct_file = path.ends_with(".zip")
             || path.ends_with(".iso")
@@ -248,7 +436,6 @@ impl HostResolver for HtmlVideoResolver {
             Err(_) => return Ok(vec![url.clone()]),
         };
 
-        // Check if content-type is HTML
         let is_html = resp.headers()
             .get("content-type")
             .and_then(|v| v.to_str().ok())
@@ -320,6 +507,38 @@ impl SmartResolver {
             }
         }
 
+        if VimeoResolver.can_handle(url) {
+            if let Ok(mirrors) = VimeoResolver.resolve(client, url).await {
+                if mirrors != vec![url.clone()] && !mirrors.is_empty() {
+                    return mirrors;
+                }
+            }
+        }
+
+        if RedditResolver.can_handle(url) {
+            if let Ok(mirrors) = RedditResolver.resolve(client, url).await {
+                if mirrors != vec![url.clone()] && !mirrors.is_empty() {
+                    return mirrors;
+                }
+            }
+        }
+
+        if TwitterResolver.can_handle(url) {
+            if let Ok(mirrors) = TwitterResolver.resolve(client, url).await {
+                if mirrors != vec![url.clone()] && !mirrors.is_empty() {
+                    return mirrors;
+                }
+            }
+        }
+
+        if TikTokResolver.can_handle(url) {
+            if let Ok(mirrors) = TikTokResolver.resolve(client, url).await {
+                if mirrors != vec![url.clone()] && !mirrors.is_empty() {
+                    return mirrors;
+                }
+            }
+        }
+
         // Check for embedded HTML video sources on webpages
         if HtmlVideoResolver.can_handle(url) {
             if let Ok(video_sources) = HtmlVideoResolver.resolve(client, url).await {
@@ -352,6 +571,73 @@ impl SmartResolver {
         headers.insert("Sec-Fetch-Site", HeaderValue::from_static("cross-site"));
         headers
     }
+}
+
+fn extract_vimeo_id(url: &Url) -> Option<String> {
+    for seg in url.path_segments()? {
+        if !seg.is_empty() && seg.chars().all(|c| c.is_ascii_digit()) {
+            return Some(seg.to_string());
+        }
+    }
+    None
+}
+
+fn extract_reddit_id(url: &Url) -> Option<String> {
+    let segments: Vec<&str> = url.path_segments()?.collect();
+    if let Some(pos) = segments.iter().position(|&s| s == "comments") {
+        if let Some(&id) = segments.get(pos + 1) {
+            return Some(id.to_string());
+        }
+    }
+    None
+}
+
+fn extract_status_id(url: &Url) -> Option<String> {
+    let segments: Vec<&str> = url.path_segments()?.collect();
+    if let Some(pos) = segments.iter().position(|&s| s == "status") {
+        if let Some(&id) = segments.get(pos + 1) {
+            let num: String = id.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if !num.is_empty() {
+                return Some(num);
+            }
+        }
+    }
+    None
+}
+
+fn find_json_string(value: &serde_json::Value, key: &str) -> Option<String> {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(val) = map.get(key).and_then(|v| v.as_str()) {
+                return Some(val.to_string());
+            }
+            for v in map.values() {
+                if let Some(res) = find_json_string(v, key) {
+                    return Some(res);
+                }
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr {
+                if let Some(res) = find_json_string(v, key) {
+                    return Some(res);
+                }
+            }
+        }
+        _ => {}
+    }
+    None
+}
+
+fn extract_tiktok_addr(html: &str, key: &str) -> Option<String> {
+    let pattern = format!("\"{}\":\"", key);
+    if let Some(idx) = html.find(&pattern) {
+        let sub = &html[idx + pattern.len()..];
+        if let Some(end) = sub.find('"') {
+            return Some(sub[..end].to_string());
+        }
+    }
+    None
 }
 
 fn extract_google_drive_id(url: &Url) -> Option<String> {
@@ -562,5 +848,28 @@ mod tests {
         let html = r#"<div><a class="input popsok" aria-label="Download file" href="https://download1590.mediafire.com/xyz123/sample.zip" id="downloadButton">Download</a></div>"#;
         let direct = extract_mediafire_direct(html).unwrap();
         assert_eq!(direct, "https://download1590.mediafire.com/xyz123/sample.zip");
+    }
+
+    #[test]
+    fn test_platform_id_extractions() {
+        let vimeo_url = Url::parse("https://vimeo.com/123456789").unwrap();
+        assert_eq!(extract_vimeo_id(&vimeo_url), Some("123456789".to_string()));
+
+        let reddit_url = Url::parse("https://www.reddit.com/r/rust/comments/abc123z/awesome_post/").unwrap();
+        assert_eq!(extract_reddit_id(&reddit_url), Some("abc123z".to_string()));
+
+        let twitter_url = Url::parse("https://twitter.com/user/status/1789012345678901234?s=20").unwrap();
+        assert_eq!(extract_status_id(&twitter_url), Some("1789012345678901234".to_string()));
+
+        let tiktok_html = r#"<script id="SIGI_STATE">{"playAddr":"https:\/\/v16.tiktokcdn.com\/video\/123\/?token=abc"}</script>"#;
+        assert_eq!(extract_tiktok_addr(tiktok_html, "playAddr"), Some("https:\\/\\/v16.tiktokcdn.com\\/video\\/123\\/?token=abc".to_string()));
+    }
+
+    #[test]
+    fn test_resolver_can_handle() {
+        assert!(VimeoResolver.can_handle(&Url::parse("https://vimeo.com/123456").unwrap()));
+        assert!(RedditResolver.can_handle(&Url::parse("https://v.redd.it/xyz123").unwrap()));
+        assert!(TwitterResolver.can_handle(&Url::parse("https://x.com/user/status/987654").unwrap()));
+        assert!(TikTokResolver.can_handle(&Url::parse("https://www.tiktok.com/@user/video/12345").unwrap()));
     }
 }
