@@ -310,6 +310,25 @@ impl DownloadEngine {
                 }
             }
 
+            // Record media download into history
+            let file_size = std::fs::metadata(&final_path).map(|m| m.len()).unwrap_or(0);
+            let mut history = crate::history::DownloadHistoryManager::load();
+            let mut entry = crate::history::HistoryEntry::new(
+                final_path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "media_download".to_string()),
+                final_path.clone(),
+                file_size,
+                self.urls.iter().map(|u| u.to_string()).collect(),
+            );
+            entry.downloaded_bytes = file_size;
+            entry.status = crate::history::HistoryStatus::Completed;
+            entry.completed_at = Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+            );
+            history.add_or_update(entry);
+
             return Ok(final_path);
         }
 
@@ -638,6 +657,25 @@ impl DownloadEngine {
 
         // Clean up state file on success
         let _ = DownloadState::remove(&state_path);
+
+        // Record completed download into persistent history
+        let mut history = crate::history::DownloadHistoryManager::load();
+        let mut entry = crate::history::HistoryEntry::new(
+            filename.clone(),
+            output_path.clone(),
+            file_size,
+            self.urls.iter().map(|u| u.to_string()).collect(),
+        );
+        entry.downloaded_bytes = file_size;
+        entry.status = crate::history::HistoryStatus::Completed;
+        entry.blake3_hash = Some(hex_encode(&final_hash));
+        entry.completed_at = Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        );
+        history.add_or_update(entry);
 
         Ok(output_path)
     }

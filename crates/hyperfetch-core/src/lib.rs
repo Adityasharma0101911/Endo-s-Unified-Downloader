@@ -11,6 +11,8 @@ pub mod metalink;
 pub mod torrent;
 pub mod queue;
 pub mod media;
+pub mod history;
+pub mod verify;
 
 pub use range::{ByteRange, RangeError};
 pub use chunk::{Chunk, ChunkManager, ChunkStatus, ChunkError};
@@ -27,4 +29,6 @@ pub use media::{
     MediaQualityPreset, BrowserCookieSource, MediaDownloadOptions,
     is_supported_media_site, download_media, find_ytdlp_path, find_js_runtime, find_ffmpeg_path,
 };
+pub use history::{DownloadHistoryManager, HistoryEntry, HistoryStatus};
+pub use verify::{BuildVerificationResult, verify_build_file, repair_missing_ranges};
 

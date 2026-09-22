@@ -27,6 +27,7 @@ enum DownloadStatus {
 enum GuiTab {
     Downloader,
     BatchQueue,
+    History,
 }
 
 struct DownloaderApp {
@@ -65,6 +66,16 @@ struct DownloaderApp {
     active_tab: GuiTab,
     queue: hyperfetch_core::queue::DownloadQueue,
     queue_url_input: String,
+
+    // Download History & Build Verification
+    history_manager: hyperfetch_core::history::DownloadHistoryManager,
+    history_search_input: String,
+    verification_result: Option<hyperfetch_core::verify::BuildVerificationResult>,
+    verify_status_message: Option<String>,
+    is_repairing: bool,
+    repair_progress: (u64, u64),
+    repair_rx: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
+    repair_progress_rx: Option<std::sync::mpsc::Receiver<(u64, u64)>>,
 
     // Metrics
     total_bytes: u64,
@@ -175,6 +186,15 @@ impl DownloaderApp {
             active_tab: GuiTab::Downloader,
             queue: hyperfetch_core::queue::DownloadQueue::new(),
             queue_url_input: String::new(),
+
+            history_manager: hyperfetch_core::history::DownloadHistoryManager::load(),
+            history_search_input: String::new(),
+            verification_result: None,
+            verify_status_message: None,
+            is_repairing: false,
+            repair_progress: (0, 0),
+            repair_rx: None,
+            repair_progress_rx: None,
 
             total_bytes: 0,
             downloaded_bytes: 0,
@@ -494,16 +514,46 @@ impl eframe::App for DownloaderApp {
                         self.downloaded_bytes = self.total_bytes;
                         self.speed_bytes_per_sec = 0.0;
                         self.eta_secs = Some(0);
+                        self.history_manager = hyperfetch_core::history::DownloadHistoryManager::load();
                     }
                     Err(err) => {
                         if self.status != DownloadStatus::Cancelled {
                             self.status = DownloadStatus::Failed(err.clone());
                             self.status_message = format!("Error: {}", err);
+                            self.history_manager = hyperfetch_core::history::DownloadHistoryManager::load();
                         }
                     }
                 }
                 self.snapshot_rx = None;
                 self.result_rx = None;
+            }
+        }
+
+        // Handle chunk repair progress & result
+        if let Some(ref rx) = self.repair_progress_rx {
+            while let Ok(prog) = rx.try_recv() {
+                self.repair_progress = prog;
+            }
+        }
+
+        if let Some(ref rx) = self.repair_rx {
+            if let Ok(res) = rx.try_recv() {
+                self.is_repairing = false;
+                match res {
+                    Ok(()) => {
+                        self.verify_status_message = Some("Repair completed! All missing chunks downloaded and verified.".to_string());
+                        if let Some(ref cur) = self.verification_result.clone() {
+                            if let Ok(updated) = hyperfetch_core::verify::verify_build_file(&cur.file_path, cur.expected_size, None) {
+                                self.verification_result = Some(updated);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        self.verify_status_message = Some(format!("Repair failed: {}", e));
+                    }
+                }
+                self.repair_rx = None;
+                self.repair_progress_rx = None;
             }
         }
 
@@ -521,7 +571,7 @@ impl eframe::App for DownloaderApp {
         }
 
         // Repaint continuously when downloading/animating (60 FPS), or at 30 FPS when idle for smooth pulse animations
-        if self.status == DownloadStatus::Downloading || self.status == DownloadStatus::Resolving {
+        if self.status == DownloadStatus::Downloading || self.status == DownloadStatus::Resolving || self.is_repairing {
             ctx.request_repaint();
         } else if self.clipboard_banner.is_some() || self.animated_progress > 0.0 && self.animated_progress < 1.0 {
             ctx.request_repaint();
@@ -574,6 +624,18 @@ fn render_ui(app: &mut DownloaderApp, ui: &mut egui::Ui) {
         );
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let is_hist = app.active_tab == GuiTab::History;
+            let hist_btn = egui::Button::new(
+                egui::RichText::new(format!("History ({})", app.history_manager.entries().len()))
+                    .strong()
+                    .color(if is_hist { Color32::WHITE } else { Color32::from_rgb(148, 163, 184) }),
+            )
+            .fill(if is_hist { Color32::from_rgb(37, 99, 235) } else { Color32::from_rgb(30, 32, 40) });
+            if ui.add_sized([100.0, 24.0], hist_btn).clicked() {
+                app.history_manager = hyperfetch_core::history::DownloadHistoryManager::load();
+                app.active_tab = GuiTab::History;
+            }
+
             let is_queue = app.active_tab == GuiTab::BatchQueue;
             let queue_btn = egui::Button::new(
                 egui::RichText::new(format!("Queue ({})", app.queue.items().len()))
@@ -657,6 +719,7 @@ fn render_ui(app: &mut DownloaderApp, ui: &mut egui::Ui) {
     match app.active_tab {
         GuiTab::Downloader => render_downloader_tab(app, ui),
         GuiTab::BatchQueue => render_queue_tab(app, ui),
+        GuiTab::History => render_history_tab(app, ui),
     }
 }
 
@@ -785,6 +848,12 @@ fn render_downloader_tab(app: &mut DownloaderApp, ui: &mut egui::Ui) {
                                         let _ = std::process::Command::new("explorer").arg(parent).spawn();
                                         #[cfg(not(target_os = "windows"))]
                                         let _ = std::process::Command::new("xdg-open").arg(parent).spawn();
+                                    }
+                                }
+                                if ui.button(egui::RichText::new("Verify Build Chunks").color(Color32::from_rgb(56, 189, 248))).clicked() {
+                                    if let Ok(res) = hyperfetch_core::verify::verify_build_file(path, None, None) {
+                                        app.verification_result = Some(res);
+                                        app.active_tab = GuiTab::History;
                                     }
                                 }
                             }
@@ -1384,6 +1453,261 @@ fn render_queue_tab(app: &mut DownloaderApp, ui: &mut egui::Ui) {
                         }
                     }
                 });
+        });
+}
+
+fn render_history_tab(app: &mut DownloaderApp, ui: &mut egui::Ui) {
+    // Header & Actions
+    egui::Frame::none()
+        .fill(Color32::from_rgb(24, 26, 33))
+        .stroke(Stroke::new(1.0, Color32::from_rgb(42, 45, 56)))
+        .inner_margin(12.0)
+        .rounding(6.0)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Search History:").strong().size(13.0));
+                ui.add_sized(
+                    [ui.available_width() - 320.0, 26.0],
+                    egui::TextEdit::singleline(&mut app.history_search_input)
+                        .hint_text("Filter by filename, URL, or hash..."),
+                );
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Clear History").clicked() {
+                        app.history_manager.clear();
+                    }
+                    if ui.button("Refresh").clicked() {
+                        app.history_manager = hyperfetch_core::history::DownloadHistoryManager::load();
+                    }
+                    if ui.button("Verify Build File...").clicked() {
+                        if let Some(file) = rfd::FileDialog::new().pick_file() {
+                            if let Ok(res) = hyperfetch_core::verify::verify_build_file(&file, None, None) {
+                                app.verification_result = Some(res);
+                            }
+                        }
+                    }
+                });
+            });
+
+            // Verification Result Modal/Card if active
+            if let Some(ref res) = app.verification_result.clone() {
+                ui.add_space(10.0);
+                let is_comp = res.is_complete;
+                egui::Frame::none()
+                    .fill(Color32::from_rgb(18, 24, 38))
+                    .stroke(Stroke::new(1.0, if is_comp { Color32::from_rgb(16, 185, 129) } else { Color32::from_rgb(234, 179, 8) }))
+                    .inner_margin(10.0)
+                    .rounding(4.0)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let badge_text = if is_comp { "[ 100% VERIFIED ]" } else { "[ INCOMPLETE / CORRUPTED ]" };
+                            let badge_color = if is_comp { Color32::from_rgb(16, 185, 129) } else { Color32::from_rgb(234, 179, 8) };
+                            ui.label(egui::RichText::new(badge_text).monospace().strong().color(badge_color));
+                            ui.label(egui::RichText::new(&res.status_message).color(Color32::WHITE).size(12.0));
+
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button("Dismiss").clicked() {
+                                    app.verification_result = None;
+                                    app.verify_status_message = None;
+                                }
+                                if !is_comp && !app.is_repairing {
+                                    let repair_btn = egui::Button::new(
+                                        egui::RichText::new("Repair Missing Chunks Now")
+                                            .strong()
+                                            .color(Color32::WHITE),
+                                    )
+                                    .fill(Color32::from_rgb(37, 99, 235));
+
+                                    if ui.add(repair_btn).clicked() {
+                                        app.is_repairing = true;
+                                        let target_path = res.file_path.clone();
+                                        let missing = res.missing_ranges.clone();
+                                        let total_size = res.expected_size.unwrap_or(res.actual_size);
+
+                                        let urls: Vec<url::Url> = app.history_manager.entries()
+                                            .iter()
+                                            .find(|e| e.file_path == target_path || e.file_name == target_path.file_name().unwrap_or_default().to_string_lossy())
+                                            .map(|e| e.urls.iter().filter_map(|u| url::Url::parse(u).ok()).collect())
+                                            .unwrap_or_default();
+
+                                        if urls.is_empty() {
+                                            app.verify_status_message = Some("Cannot repair: No mirror URLs recorded for this build in history.".to_string());
+                                            app.is_repairing = false;
+                                        } else {
+                                            let (tx_res, rx_res) = std::sync::mpsc::channel();
+                                            let (tx_prog, rx_prog) = std::sync::mpsc::channel();
+                                            app.repair_rx = Some(rx_res);
+                                            app.repair_progress_rx = Some(rx_prog);
+
+                                            let cancel = Arc::clone(&app.cancel_flag);
+
+                                            app.tokio_rt.spawn(async move {
+                                                let res = hyperfetch_core::verify::repair_missing_ranges(
+                                                    &target_path,
+                                                    total_size,
+                                                    &missing,
+                                                    &urls,
+                                                    Some(cancel),
+                                                    move |cur, tot| {
+                                                        let _ = tx_prog.send((cur, tot));
+                                                    },
+                                                ).await;
+                                                let _ = tx_res.send(res);
+                                            });
+                                        }
+                                    }
+                                }
+                            });
+                        });
+
+                        if app.is_repairing {
+                            ui.add_space(6.0);
+                            let ratio = if app.repair_progress.1 > 0 {
+                                (app.repair_progress.0 as f32 / app.repair_progress.1 as f32).clamp(0.0, 1.0)
+                            } else {
+                                0.0
+                            };
+                            ui.add(egui::ProgressBar::new(ratio).show_percentage().text(format!(
+                                "Repairing missing chunks: {} / {}",
+                                format_bytes(app.repair_progress.0),
+                                format_bytes(app.repair_progress.1)
+                            )));
+                        }
+
+                        if let Some(ref msg) = app.verify_status_message {
+                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new(msg).size(11.0).color(Color32::from_rgb(148, 163, 184)));
+                        }
+                    });
+            }
+        });
+
+    ui.add_space(8.0);
+
+    // Entries List
+    egui::Frame::none()
+        .fill(Color32::from_rgb(24, 26, 33))
+        .stroke(Stroke::new(1.0, Color32::from_rgb(42, 45, 56)))
+        .inner_margin(12.0)
+        .rounding(6.0)
+        .show(ui, |ui| {
+            let search_lower = app.history_search_input.trim().to_lowercase();
+            let entries: Vec<_> = app.history_manager.entries()
+                .iter()
+                .filter(|e| {
+                    if search_lower.is_empty() {
+                        true
+                    } else {
+                        e.file_name.to_lowercase().contains(&search_lower)
+                            || e.urls.iter().any(|u| u.to_lowercase().contains(&search_lower))
+                            || e.blake3_hash.as_ref().map_or(false, |h| h.to_lowercase().contains(&search_lower))
+                    }
+                })
+                .cloned()
+                .collect();
+
+            if entries.is_empty() {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(30.0);
+                    ui.label(
+                        egui::RichText::new("No downloads recorded in history yet.")
+                            .color(Color32::from_rgb(113, 113, 122))
+                            .size(13.0),
+                    );
+                    ui.add_space(30.0);
+                });
+            } else {
+                egui::ScrollArea::vertical()
+                    .max_height(450.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for entry in entries {
+                            ui.group(|ui| {
+                                ui.horizontal(|ui| {
+                                    // Status Badge
+                                    let (badge, color) = match entry.status {
+                                        hyperfetch_core::history::HistoryStatus::Completed => ("[ COMPLETED ]", Color32::from_rgb(16, 185, 129)),
+                                        hyperfetch_core::history::HistoryStatus::Failed(_) => ("[ FAILED ]", Color32::from_rgb(239, 68, 68)),
+                                        hyperfetch_core::history::HistoryStatus::Cancelled => ("[ CANCELLED ]", Color32::from_rgb(148, 163, 184)),
+                                    };
+                                    ui.label(egui::RichText::new(badge).monospace().strong().size(11.0).color(color));
+
+                                    // File Name
+                                    ui.label(egui::RichText::new(&entry.file_name).strong().size(13.0).color(Color32::WHITE));
+
+                                    // Size
+                                    ui.label(
+                                        egui::RichText::new(format!("({})", format_bytes(entry.file_size)))
+                                            .size(11.0)
+                                            .color(Color32::from_rgb(148, 163, 184)),
+                                    );
+
+                                    // Actions on Right
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        let entry_id = entry.id.clone();
+                                        if ui.button(egui::RichText::new("Remove").size(11.0).color(Color32::from_rgb(239, 68, 68))).clicked() {
+                                            app.history_manager.remove_entry(&entry_id);
+                                        }
+
+                                        if ui.button(egui::RichText::new("Redownload").size(11.0)).clicked() {
+                                            if let Some(first_url) = entry.urls.first() {
+                                                app.url_input = first_url.clone();
+                                                app.active_tab = GuiTab::Downloader;
+                                            }
+                                        }
+
+                                        if ui.button(egui::RichText::new("Verify & Repair").size(11.0).color(Color32::from_rgb(56, 189, 248))).clicked() {
+                                            if let Ok(res) = hyperfetch_core::verify::verify_build_file(&entry.file_path, Some(entry.file_size), None) {
+                                                app.verification_result = Some(res);
+                                            } else {
+                                                app.verify_status_message = Some(format!("Could not verify {:?}: file may have been moved or deleted.", entry.file_path));
+                                            }
+                                        }
+
+                                        if ui.button(egui::RichText::new("Open Folder").size(11.0)).clicked() {
+                                            if let Some(parent) = entry.file_path.parent() {
+                                                #[cfg(target_os = "windows")]
+                                                let _ = std::process::Command::new("explorer").arg(parent).spawn();
+                                                #[cfg(not(target_os = "windows"))]
+                                                let _ = std::process::Command::new("xdg-open").arg(parent).spawn();
+                                            }
+                                        }
+
+                                        if ui.button(egui::RichText::new("Copy Link").size(11.0)).clicked() {
+                                            if let Some(first_url) = entry.urls.first() {
+                                                if let Ok(mut clip) = arboard::Clipboard::new() {
+                                                    let _ = clip.set_text(first_url.clone());
+                                                }
+                                            }
+                                        }
+                                    });
+                                });
+
+                                // Secondary line: Local path & URLs
+                                ui.horizontal(|ui| {
+                                    let path_str = entry.file_path.to_string_lossy().to_string();
+                                    ui.label(
+                                        egui::RichText::new(format!("Path: {}", path_str))
+                                            .size(11.0)
+                                            .monospace()
+                                            .color(Color32::from_rgb(113, 113, 122)),
+                                    );
+
+                                    if let Some(ref hash) = entry.blake3_hash {
+                                        let truncated_hash = if hash.len() > 16 { &hash[..16] } else { hash };
+                                        ui.label(
+                                            egui::RichText::new(format!("| BLAKE3: {}...", truncated_hash))
+                                                .size(11.0)
+                                                .monospace()
+                                                .color(Color32::from_rgb(113, 113, 122)),
+                                        );
+                                    }
+                                });
+                            });
+                            ui.add_space(4.0);
+                        }
+                    });
+            }
         });
 }
 

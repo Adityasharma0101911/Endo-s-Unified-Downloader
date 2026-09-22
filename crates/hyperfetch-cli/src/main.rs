@@ -52,11 +52,92 @@ struct Args {
     /// Concurrent fragment downloads for media streams (1-32)
     #[arg(long = "concurrent-fragments", default_value_t = 8)]
     concurrent_fragments: usize,
+
+    /// Display past download history
+    #[arg(long = "history")]
+    history: bool,
+
+    /// Verify chunk and build integrity of a local file
+    #[arg(long = "verify")]
+    verify: Option<PathBuf>,
+
+    /// Automatically repair missing chunks if verification detects gaps (requires URL or history)
+    #[arg(long = "repair")]
+    repair: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+
+    if args.history {
+        let manager = hyperfetch_core::history::DownloadHistoryManager::load();
+        let entries = manager.entries();
+        if entries.is_empty() {
+            println!("No past downloads found in history.");
+        } else {
+            println!("\n{:<30} {:<14} {:<15} {:<40}", "FILE NAME", "SIZE", "STATUS", "URL");
+            println!("{:-<100}", "");
+            for entry in entries {
+                let status_str = match entry.status {
+                    hyperfetch_core::history::HistoryStatus::Completed => "Completed",
+                    hyperfetch_core::history::HistoryStatus::Failed(_) => "Failed",
+                    hyperfetch_core::history::HistoryStatus::Cancelled => "Cancelled",
+                };
+                let url_str = entry.urls.first().map(|s| s.as_str()).unwrap_or("");
+                let size_str = format!("{:.2} MB", entry.file_size as f64 / (1024.0 * 1024.0));
+                println!("{:<30} {:<14} {:<15} {:<40}", entry.file_name, size_str, status_str, url_str);
+            }
+            println!();
+        }
+        return Ok(());
+    }
+
+    if let Some(ref verify_path) = args.verify {
+        println!("\nVerifying build file: {:?}", verify_path);
+        let res = hyperfetch_core::verify::verify_build_file(verify_path, None, args.checksum.as_deref())
+            .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+        println!("Status: {}", res.status_message);
+        println!("File Size on Disk: {} bytes", res.actual_size);
+        if let Some(exp) = res.expected_size {
+            println!("Expected File Size: {} bytes", exp);
+        }
+        println!("Missing / Incomplete Chunks: {}", res.missing_ranges.len());
+
+        if !res.is_complete && args.repair {
+            println!("\nAttempting automatic chunk repair...");
+            let history = hyperfetch_core::history::DownloadHistoryManager::load();
+            let urls: Vec<url::Url> = if !args.urls.is_empty() {
+                args.urls.iter().filter_map(|u| url::Url::parse(u).ok()).collect()
+            } else {
+                history.entries()
+                    .iter()
+                    .find(|e| e.file_path == *verify_path || e.file_name == verify_path.file_name().unwrap_or_default().to_string_lossy())
+                    .map(|e| e.urls.iter().filter_map(|u| url::Url::parse(u).ok()).collect())
+                    .unwrap_or_default()
+            };
+
+            if urls.is_empty() {
+                println!("Error: No download URL provided or found in history for repair.");
+            } else {
+                use std::io::Write;
+                let total_size = res.expected_size.unwrap_or(res.actual_size);
+                hyperfetch_core::verify::repair_missing_ranges(
+                    verify_path,
+                    total_size,
+                    &res.missing_ranges,
+                    &urls,
+                    None,
+                    |cur, tot| {
+                        print!("\rRepaired {} / {} bytes ({:.1}%)", cur, tot, (cur as f64 / tot as f64) * 100.0);
+                        let _ = std::io::stdout().flush();
+                    },
+                ).await.map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+                println!("\nBuild chunk repair successful! All chunks verified.");
+            }
+        }
+        return Ok(());
+    }
 
     if args.urls.is_empty() {
         run_interactive_ui().await?;
