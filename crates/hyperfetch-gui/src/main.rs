@@ -312,13 +312,18 @@ impl DownloaderApp {
 
         // Spawn engine download task
         self.tokio_rt.spawn(async move {
-            let media_preset = match media_preset_idx {
-                0 => Some(hyperfetch_core::media::MediaQualityPreset::BestVideoAudio),
-                1 => Some(hyperfetch_core::media::MediaQualityPreset::Fhd1080p),
-                2 => Some(hyperfetch_core::media::MediaQualityPreset::Hd720p),
-                3 => Some(hyperfetch_core::media::MediaQualityPreset::AudioMp3),
-                4 => Some(hyperfetch_core::media::MediaQualityPreset::AudioM4a),
-                _ => Some(hyperfetch_core::media::MediaQualityPreset::BestVideoAudio),
+            let is_media = urls.iter().any(|u| hyperfetch_core::media::is_supported_media_site(u));
+            let media_preset = if is_media {
+                match media_preset_idx {
+                    0 => Some(hyperfetch_core::media::MediaQualityPreset::BestVideoAudio),
+                    1 => Some(hyperfetch_core::media::MediaQualityPreset::Fhd1080p),
+                    2 => Some(hyperfetch_core::media::MediaQualityPreset::Hd720p),
+                    3 => Some(hyperfetch_core::media::MediaQualityPreset::AudioMp3),
+                    4 => Some(hyperfetch_core::media::MediaQualityPreset::AudioM4a),
+                    _ => Some(hyperfetch_core::media::MediaQualityPreset::BestVideoAudio),
+                }
+            } else {
+                None
             };
 
             let browser_cookies = match browser_cookies_idx {

@@ -190,14 +190,43 @@ impl DownloadEngine {
         &self,
         snapshot_tx: Option<broadcast::Sender<EngineSnapshot>>,
     ) -> Result<PathBuf, String> {
-        // Check if any URL is a supported media site (YouTube, Twitch, TikTok, etc.) or media preset requested
-        if let Some(media_url) = self.urls.iter().find(|u| crate::media::is_supported_media_site(u)).or_else(|| {
+        // Helper to check if a URL is a direct file or archive that should never be sent to the media engine
+        let is_direct_file_or_archive = |u: &Url| -> bool {
+            let path = u.path().to_ascii_lowercase();
+            let is_archive_host = u.host_str().map_or(false, |h| h.ends_with("archive.org"));
+            is_archive_host
+                || path.ends_with(".7z")
+                || path.ends_with(".zip")
+                || path.ends_with(".rar")
+                || path.ends_with(".tar")
+                || path.ends_with(".gz")
+                || path.ends_with(".bz2")
+                || path.ends_with(".xz")
+                || path.ends_with(".iso")
+                || path.ends_with(".bin")
+                || path.ends_with(".exe")
+                || path.ends_with(".msi")
+                || path.ends_with(".dmg")
+                || path.ends_with(".pkg")
+                || path.ends_with(".deb")
+                || path.ends_with(".rpm")
+                || path.ends_with(".apk")
+                || path.ends_with(".pdf")
+                || path.ends_with(".torrent")
+        };
+
+        // Check if any URL is a supported media site (YouTube, Twitch, TikTok, etc.)
+        // Non-media-site URLs are only routed to media engine if a media preset was explicitly provided
+        // AND the target is not a direct archive/binary file or Archive.org resource.
+        let media_target = self.urls.iter().find(|u| crate::media::is_supported_media_site(u)).cloned().or_else(|| {
             if self.options.media_preset.is_some() {
-                self.urls.first()
+                self.urls.iter().find(|u| !is_direct_file_or_archive(u)).cloned()
             } else {
                 None
             }
-        }) {
+        });
+
+        if let Some(media_url) = media_target {
             tracing::info!("Routing download to Media Engine: {}", media_url);
             let (prog_tx, mut prog_rx) = tokio::sync::mpsc::channel::<crate::media::ProgressUpdate>(64);
             let snapshot_tx_clone = snapshot_tx.clone();
@@ -255,7 +284,7 @@ impl DownloadEngine {
             };
 
             let res = crate::media::download_media(
-                media_url,
+                &media_url,
                 &media_opts,
                 Some(prog_tx),
                 Some(Arc::clone(&self.cancel_flag)),
