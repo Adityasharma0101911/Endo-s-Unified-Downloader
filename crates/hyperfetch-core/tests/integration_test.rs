@@ -525,3 +525,146 @@ async fn test_premature_stream_closure_retries() {
     let _ = shutdown_tx.send(());
 }
 
+#[tokio::test]
+async fn test_redownload_existing_complete_file_does_not_overwrite() {
+    let mut test_data = vec![0u8; 1024 * 1024];
+    for (i, byte) in test_data.iter_mut().enumerate() {
+        *byte = ((i * 43) % 256) as u8;
+    }
+    let expected_hash = blake3::hash(&test_data);
+    let shared_data = Arc::new(test_data);
+
+    let (addr, shutdown_tx) = run_mock_http_server(shared_data).await;
+    let mirror_url = Url::parse(&format!("http://{}/complete_file.bin", addr)).unwrap();
+
+    let temp = tempdir().unwrap();
+    let out_file = temp.path().join("complete_file.bin");
+
+    let options = DownloadOptions {
+        num_connections: 4,
+        base_chunk_size: 256 * 1024,
+        min_steal_threshold: 64 * 1024,
+        output_path: Some(out_file.clone()),
+        ..Default::default()
+    };
+
+    // First download
+    let engine = DownloadEngine::new(vec![mirror_url.clone()], options.clone());
+    let path1 = engine.run(None).await.expect("First download should succeed");
+    assert_eq!(path1, out_file);
+
+    let _meta1 = std::fs::metadata(&out_file).unwrap();
+
+    // Small delay to ensure timestamp difference if it were modified
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Second download with same URL and output path
+    let engine2 = DownloadEngine::new(vec![mirror_url], options);
+    let path2 = engine2.run(None).await.expect("Second download should detect existing complete file");
+    assert_eq!(path2, out_file);
+
+    // Verify file content is intact and verified
+    let content = std::fs::read(&out_file).unwrap();
+    assert_eq!(content.len(), 1024 * 1024);
+    assert_eq!(blake3::hash(&content), expected_hash);
+
+    let _ = shutdown_tx.send(());
+}
+
+#[tokio::test]
+async fn test_redownload_different_file_auto_renames() {
+    let mut test_data = vec![0u8; 1024 * 1024];
+    for (i, byte) in test_data.iter_mut().enumerate() {
+        *byte = ((i * 51) % 256) as u8;
+    }
+    let expected_hash = blake3::hash(&test_data);
+    let shared_data = Arc::new(test_data);
+
+    let (addr, shutdown_tx) = run_mock_http_server(shared_data).await;
+    let mirror_url = Url::parse(&format!("http://{}/collision_test.bin", addr)).unwrap();
+
+    let temp = tempdir().unwrap();
+    let out_file = temp.path().join("collision_test.bin");
+
+    // Create an existing file with different size/content
+    let existing_data = b"Existing pre-allocated unrelated file with different size";
+    std::fs::write(&out_file, existing_data).unwrap();
+
+    let options = DownloadOptions {
+        num_connections: 4,
+        base_chunk_size: 256 * 1024,
+        min_steal_threshold: 64 * 1024,
+        output_path: Some(out_file.clone()),
+        ..Default::default()
+    };
+
+    let engine = DownloadEngine::new(vec![mirror_url], options);
+    let downloaded_path = engine.run(None).await.expect("Download should auto-rename and succeed");
+
+    // The downloaded file must be auto-renamed to collision_test (1).bin
+    let expected_renamed = temp.path().join("collision_test (1).bin");
+    assert_eq!(downloaded_path, expected_renamed);
+    assert!(expected_renamed.exists());
+
+    // The original file must NOT be modified or deleted!
+    let original_content = std::fs::read(&out_file).unwrap();
+    assert_eq!(original_content, existing_data);
+
+    // The renamed file must contain the complete downloaded payload
+    let downloaded_content = std::fs::read(&expected_renamed).unwrap();
+    assert_eq!(downloaded_content.len(), 1024 * 1024);
+    assert_eq!(blake3::hash(&downloaded_content), expected_hash);
+
+    let _ = shutdown_tx.send(());
+}
+
+#[tokio::test]
+async fn test_resume_partial_file_without_state_preserves_existing_bytes() {
+    let mut test_data = vec![0u8; 1024 * 1024];
+    for (i, byte) in test_data.iter_mut().enumerate() {
+        *byte = ((i * 19) % 256) as u8;
+    }
+    let expected_hash = blake3::hash(&test_data);
+    let shared_data = Arc::new(test_data.clone());
+
+    let (addr, shutdown_tx) = run_mock_http_server(shared_data).await;
+    let mirror_url = Url::parse(&format!("http://{}/partial_resume.bin", addr)).unwrap();
+
+    let temp = tempdir().unwrap();
+    let out_file = temp.path().join("partial_resume.bin");
+
+    // Write first 512KB of valid data to out_file (simulating interrupted download without .hfstate)
+    std::fs::write(&out_file, &test_data[..512 * 1024]).unwrap();
+
+    // Record past download entry in history so engine knows this partial file is from this URL
+    let mut history = hyperfetch_core::history::DownloadHistoryManager::load();
+    let mut entry = hyperfetch_core::history::HistoryEntry::new(
+        "partial_resume.bin".to_string(),
+        out_file.clone(),
+        1024 * 1024,
+        vec![mirror_url.to_string()],
+    );
+    entry.downloaded_bytes = 512 * 1024;
+    entry.status = hyperfetch_core::history::HistoryStatus::Cancelled;
+    history.add_or_update(entry);
+
+    let options = DownloadOptions {
+        num_connections: 4,
+        base_chunk_size: 256 * 1024,
+        min_steal_threshold: 64 * 1024,
+        output_path: Some(out_file.clone()),
+        ..Default::default()
+    };
+
+    let engine = DownloadEngine::new(vec![mirror_url], options);
+    let downloaded_path = engine.run(None).await.expect("Download should resume and complete");
+
+    assert_eq!(downloaded_path, out_file);
+    let final_content = std::fs::read(&out_file).unwrap();
+    assert_eq!(final_content.len(), 1024 * 1024);
+    assert_eq!(blake3::hash(&final_content), expected_hash);
+
+    let _ = shutdown_tx.send(());
+}
+
+

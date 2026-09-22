@@ -508,10 +508,12 @@ impl eframe::App for DownloaderApp {
                 match result {
                     Ok(path) => {
                         self.status = DownloadStatus::Completed;
+                        let file_sz = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(self.total_bytes);
+                        self.total_bytes = file_sz;
+                        self.downloaded_bytes = file_sz;
                         self.status_message = format!("Completed: {}", path.display());
                         self.target_filepath = Some(path);
                         self.progress_ratio = 1.0;
-                        self.downloaded_bytes = self.total_bytes;
                         self.speed_bytes_per_sec = 0.0;
                         self.eta_secs = Some(0);
                         self.history_manager = hyperfetch_core::history::DownloadHistoryManager::load();

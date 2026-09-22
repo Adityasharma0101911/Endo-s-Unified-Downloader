@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -375,11 +375,16 @@ impl DownloadEngine {
 
         let (file_size, accepts_ranges, filename) = self.probe_mirrors(&resolved_urls).await?;
 
-        let output_path = match &self.options.output_path {
+        let base_output_path = match &self.options.output_path {
             Some(p) if p.is_dir() => p.join(&filename),
             Some(p) => p.clone(),
             None => PathBuf::from(&filename),
         };
+
+        // Collision detection & disambiguation:
+        // If an existing file is present and NOT the same file, auto-rename to `filename (1).ext`.
+        // If it IS the same file, preserve it for verification / resume / repair!
+        let output_path = disambiguate_output_path(&base_output_path, file_size, &resolved_urls);
         let state_path = DownloadState::state_file_path(&output_path);
 
         tracing::info!(
@@ -397,6 +402,63 @@ impl DownloadEngine {
             tracing::info!("Download completed! (0-byte file) BLAKE3: {}", hex_encode(&final_hash));
             let _ = DownloadState::remove(&state_path);
             return Ok(output_path);
+        }
+
+        // Check if output_path already exists as the same file and is already 100% complete
+        if output_path.exists() && is_same_file(&output_path, file_size, &resolved_urls) {
+            let existing_size = std::fs::metadata(&output_path).map(|m| m.len()).unwrap_or(0);
+            let resumed_state = DownloadState::load_from_path(&state_path).ok().flatten();
+
+            let is_already_complete = if existing_size == file_size {
+                if let Some(ref state) = resumed_state {
+                    crate::range::compute_gaps(file_size, &state.completed_ranges).is_empty()
+                } else if let Some(ref expected) = self.options.expected_checksum {
+                    DiskWriter::verify_file_checksum(&output_path, expected).unwrap_or(false)
+                } else {
+                    true
+                }
+            } else {
+                false
+            };
+
+            if is_already_complete {
+                tracing::info!("File {:?} already fully downloaded and verified ({} bytes)", output_path, file_size);
+                let _ = DownloadState::remove(&state_path);
+
+                // Record or update in history
+                let mut history = crate::history::DownloadHistoryManager::load();
+                let mut entry = crate::history::HistoryEntry::new(
+                    output_path.file_name().unwrap_or_default().to_string_lossy().to_string(),
+                    output_path.clone(),
+                    file_size,
+                    self.urls.iter().map(|u| u.to_string()).collect(),
+                );
+                entry.downloaded_bytes = file_size;
+                entry.status = crate::history::HistoryStatus::Completed;
+                entry.completed_at = Some(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0),
+                );
+                history.add_or_update(entry);
+
+                if let Some(ref tx) = snapshot_tx {
+                    let snapshot = EngineSnapshot {
+                        total_bytes: file_size,
+                        downloaded_bytes: file_size,
+                        speed_bytes_per_sec: 0.0,
+                        progress_ratio: 1.0,
+                        active_workers: 0,
+                        mirror_speeds: Vec::new(),
+                        chunks: Vec::new(),
+                        target_path: Some(output_path.clone()),
+                    };
+                    let _ = tx.send(snapshot);
+                }
+
+                return Ok(output_path);
+            }
         }
 
         // Determine worker concurrency
@@ -443,6 +505,20 @@ impl DownloadEngine {
                 effective_chunk_size,
                 &state.completed_ranges,
             ).map_err(|e| e.to_string())?
+        } else if output_path.exists() && is_same_file(&output_path, file_size, &resolved_urls) {
+            let existing_size = std::fs::metadata(&output_path).map(|m| m.len()).unwrap_or(0);
+            if existing_size > 0 && existing_size < file_size {
+                tracing::info!("Resuming partial download without state file: preserving {} existing bytes", existing_size);
+                let completed_range = ByteRange::new(0, existing_size - 1).map_err(|e| e.to_string())?;
+                ChunkManager::with_resumed_ranges(
+                    file_size,
+                    effective_chunk_size,
+                    &[completed_range],
+                ).map_err(|e| e.to_string())?
+            } else {
+                ChunkManager::new(file_size, effective_chunk_size)
+                    .map_err(|e| e.to_string())?
+            }
         } else {
             ChunkManager::new(file_size, effective_chunk_size)
                 .map_err(|e| e.to_string())?
@@ -452,6 +528,22 @@ impl DownloadEngine {
         let mirror_racer = Arc::new(Mutex::new(MirrorRacer::new(resolved_urls.clone())));
         let disk_writer = DiskWriter::open_or_create(&output_path, file_size)
             .map_err(|e| e.to_string())?;
+
+        // Broadcast initial snapshot so UI immediately reflects resumed progress
+        if let Some(ref tx) = snapshot_tx {
+            let mgr = chunk_manager.lock();
+            let initial_snapshot = EngineSnapshot {
+                total_bytes: file_size,
+                downloaded_bytes: mgr.total_downloaded(),
+                speed_bytes_per_sec: 0.0,
+                progress_ratio: mgr.progress_ratio(),
+                active_workers: num_workers,
+                mirror_speeds: Vec::new(),
+                chunks: mgr.chunk_snapshots(),
+                target_path: Some(output_path.clone()),
+            };
+            let _ = tx.send(initial_snapshot);
+        }
 
         let (event_tx, mut event_rx) = mpsc::channel::<WorkerEvent>(1024);
 
@@ -782,3 +874,82 @@ fn sanitize_filename(name: &str) -> String {
 fn hex_encode(data: &[u8]) -> String {
     data.iter().map(|b| format!("{:02x}", b)).collect()
 }
+
+/// Helper to determine if a local file on disk represents the same resource as the probed download.
+pub fn is_same_file(
+    path: &Path,
+    expected_size: u64,
+    resolved_urls: &[Url],
+) -> bool {
+    if !path.exists() {
+        return false;
+    }
+
+    // 1. Check if an associated .hfstate file exists and matches
+    let state_path = DownloadState::state_file_path(path);
+    if let Ok(Some(state)) = DownloadState::load_from_path(&state_path) {
+        if state.file_size == expected_size && expected_size > 0 {
+            return true;
+        }
+        if state.mirrors.iter().any(|m| resolved_urls.iter().any(|u| u.as_str() == m.as_str())) {
+            return true;
+        }
+    }
+
+    // 2. Check if DownloadHistoryManager has a matching entry
+    let history = crate::history::DownloadHistoryManager::load();
+    let target_filename = path.file_name().unwrap_or_default().to_string_lossy();
+    for entry in history.entries() {
+        let path_or_name_matches = entry.file_path == path || entry.file_name == target_filename;
+        let url_matches = entry.urls.iter().any(|u| resolved_urls.iter().any(|r| r.as_str() == u.as_str()));
+        let size_matches = entry.file_size == expected_size && expected_size > 0;
+
+        if (path_or_name_matches && (url_matches || size_matches)) || (url_matches && size_matches) {
+            return true;
+        }
+    }
+
+    // 3. Direct disk check: same file name and exact same size
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() == expected_size && expected_size > 0 {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Disambiguates an output path if an existing, non-matching file is present at `base_path`.
+/// Returns either `base_path` (if it doesn't exist or is the same file) or `base (1).ext`, `base (2).ext`, etc.
+pub fn disambiguate_output_path(
+    base_path: &Path,
+    expected_size: u64,
+    resolved_urls: &[Url],
+) -> PathBuf {
+    if !base_path.exists() {
+        return base_path.to_path_buf();
+    }
+
+    // If base_path is the same file, keep it so it can be verified/resumed/repaired
+    if is_same_file(base_path, expected_size, resolved_urls) {
+        return base_path.to_path_buf();
+    }
+
+    let parent = base_path.parent().unwrap_or_else(|| Path::new(""));
+    let stem = base_path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
+    let ext = base_path.extension().and_then(|s| s.to_str());
+
+    let mut counter = 1;
+    loop {
+        let new_name = match ext {
+            Some(e) => format!("{} ({}).{}", stem, counter, e),
+            None => format!("{} ({})", stem, counter),
+        };
+        let candidate = parent.join(new_name);
+        if !candidate.exists() || is_same_file(&candidate, expected_size, resolved_urls) {
+            return candidate;
+        }
+        counter += 1;
+    }
+}
+
