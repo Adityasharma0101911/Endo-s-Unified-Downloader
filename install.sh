@@ -55,11 +55,11 @@ build_binaries() {
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     cd "$SCRIPT_DIR"
 
-    echo -e "${COLOR_CYAN}Building CLI accelerator (Endos-Unified-Downloader)...${COLOR_RESET}"
+    echo -e "${COLOR_CYAN}Building CLI accelerator (Endos-Unified-Downloader-CLI)...${COLOR_RESET}"
     cargo build --release -p hyperfetch-cli
 
     if [ "$INSTALL_GUI" = "true" ]; then
-        echo -e "${COLOR_CYAN}Building Native GUI (Endos_Unified_Downloader_GUI)...${COLOR_RESET}"
+        echo -e "${COLOR_CYAN}Building Native GUI (Endos-Unified-Downloader)...${COLOR_RESET}"
         cargo build --release -p hyperfetch-gui || {
             echo -e "${COLOR_YELLOW}[WARN] GUI build skipped (display or X11 dependencies missing). CLI build succeeded.${COLOR_RESET}"
             INSTALL_GUI="false"
@@ -72,12 +72,13 @@ install_binaries() {
     echo -e "\n${COLOR_YELLOW}[4/4] Installing executables to /usr/local/bin...${COLOR_RESET}"
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     
-    sudo cp "$SCRIPT_DIR/target/release/Endos-Unified-Downloader" /usr/local/bin/endos-downloader
-    sudo chmod +x /usr/local/bin/endos-downloader
-    sudo ln -sf /usr/local/bin/endos-downloader /usr/local/bin/hyperfetch
+    sudo cp "$SCRIPT_DIR/target/release/Endos-Unified-Downloader-CLI" /usr/local/bin/endos-downloader-cli
+    sudo chmod +x /usr/local/bin/endos-downloader-cli
+    sudo ln -sf /usr/local/bin/endos-downloader-cli /usr/local/bin/endos-downloader
+    sudo ln -sf /usr/local/bin/endos-downloader-cli /usr/local/bin/hyperfetch
 
-    if [ "$INSTALL_GUI" = "true" ] && [ -f "$SCRIPT_DIR/target/release/Endos_Unified_Downloader_GUI" ]; then
-        sudo cp "$SCRIPT_DIR/target/release/Endos_Unified_Downloader_GUI" /usr/local/bin/endos-downloader-gui
+    if [ "$INSTALL_GUI" = "true" ] && [ -f "$SCRIPT_DIR/target/release/Endos-Unified-Downloader" ]; then
+        sudo cp "$SCRIPT_DIR/target/release/Endos-Unified-Downloader" /usr/local/bin/endos-downloader-gui
         sudo chmod +x /usr/local/bin/endos-downloader-gui
 
         # Install Desktop entry for application launchers

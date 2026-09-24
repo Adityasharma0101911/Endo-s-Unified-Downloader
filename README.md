@@ -62,33 +62,35 @@ cd Endo-s-Unified-Downloader
 cargo build --release
 ```
 
-The compiled binary will be placed at `target/release/Endos-Unified-Downloader.exe`.
+The compiled binaries will be placed at:
+- `target/release/Endos-Unified-Downloader.exe` (Native Hardware-Accelerated GUI)
+- `target/release/Endos-Unified-Downloader-CLI.exe` (High-Speed Command-Line Downloader)
 
 ---
 
 ## Usage
 
 ### Graphical User Interface (GUI)
-Double-clicking `Endo's Unified Downloader.exe` launches the native hardware-accelerated GUI application without opening a command prompt or terminal window.
+Running `Endos-Unified-Downloader.exe` launches the native hardware-accelerated GUI application without opening a command prompt or terminal window.
 
 Key GUI Features:
 - **Visual Chunk Allocation Map:** Real-time multi-segment canvas visualizing file chunks, dynamic worker assignments, active in-flight byte transfers, and work-stealing splits.
 - **Detailed Stream Monitor:** Per-stream progress bars, byte offsets, and active worker status indicators.
-- **System Integration:** Native Windows directory picker dialog, one-click clipboard URL pasting, and direct file/folder revelation in Windows Explorer upon completion.
+- **System Integration:** Native directory picker dialog, one-click clipboard URL pasting, and direct file/folder revelation in file explorer upon completion.
 - **Performance:** 60 FPS reactive updates with zero idle CPU overhead.
 
 ### Command-Line Mode (CLI)
-For headless environments, automated pipelines, or terminal workflows, use `Endos-Unified-Downloader.exe`:
+For headless environments, automated pipelines, or terminal workflows, use `Endos-Unified-Downloader-CLI.exe`:
 
 ```powershell
 # Basic download with 16 parallel connections
-.\Endos-Unified-Downloader.exe https://example.com/file.zip -s 16
+.\Endos-Unified-Downloader-CLI.exe https://example.com/file.zip -s 16
 
 # Racing multiple mirrors simultaneously
-.\Endos-Unified-Downloader.exe https://mirror1.com/file.iso https://mirror2.com/file.iso -s 32
+.\Endos-Unified-Downloader-CLI.exe https://mirror1.com/file.iso https://mirror2.com/file.iso -s 32
 
 # Custom destination and chunk size
-.\Endos-Unified-Downloader.exe https://example.com/file.zip -s 16 -c 8 -o "C:\Downloads\file.zip"
+.\Endos-Unified-Downloader-CLI.exe https://example.com/file.zip -s 16 -c 8 -o "C:\Downloads\file.zip"
 ```
 
 ### Options

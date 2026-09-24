@@ -6,7 +6,7 @@ license.workspace = true
 authors.workspace = true
 
 [[bin]]
-name = "Endos_Unified_Downloader_GUI"
+name = "Endos-Unified-Downloader"
 path = "src/main.rs"
 
 [dependencies]

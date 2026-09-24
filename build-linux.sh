@@ -13,13 +13,13 @@ cd "$SCRIPT_DIR"
 echo "Building CLI binary..."
 cargo build --release -p hyperfetch-cli
 
-echo "CLI binary built at: target/release/Endos-Unified-Downloader"
+echo "CLI binary built at: target/release/Endos-Unified-Downloader-CLI"
 
 # Check if GUI dependencies are available before attempting GUI build
 if [ "$1" = "--gui" ] || [ -n "$DISPLAY" ] || [ -n "$WAYLAND_DISPLAY" ]; then
     echo "Attempting to build Native GUI binary..."
     if cargo build --release -p hyperfetch-gui; then
-        echo "GUI binary built at: target/release/Endos_Unified_Downloader_GUI"
+        echo "GUI binary built at: target/release/Endos-Unified-Downloader"
     else
         echo "GUI build failed or dependencies missing. CLI binary remains ready for server use."
     fi
