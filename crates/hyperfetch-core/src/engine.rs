@@ -58,6 +58,7 @@ impl Default for DownloadOptions {
     }
 }
 
+#[derive(Clone)]
 pub struct DownloadEngine {
     options: DownloadOptions,
     urls: Vec<Url>,

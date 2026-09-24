@@ -197,6 +197,22 @@ pub fn find_ytdlp_path() -> Option<PathBuf> {
         }
     }
 
+    #[cfg(not(windows))]
+    {
+        if let Ok(home) = std::env::var("HOME") {
+            let local_bin = PathBuf::from(&home).join(".local").join("bin").join("yt-dlp");
+            if local_bin.is_file() {
+                return Some(local_bin);
+            }
+        }
+        for dir in ["/usr/local/bin", "/usr/bin", "/opt/homebrew/bin", "/usr/local/share/yt-dlp"] {
+            let candidate = PathBuf::from(dir).join("yt-dlp");
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
     // 3. Check system PATH
     let binary_name = if cfg!(windows) { "yt-dlp.exe" } else { "yt-dlp" };
     if let Ok(path_var) = std::env::var("PATH") {
@@ -252,6 +268,25 @@ pub fn find_js_runtime() -> Option<String> {
         }
     }
 
+    #[cfg(not(windows))]
+    {
+        if let Ok(home) = std::env::var("HOME") {
+            for sub in [".local/bin/node", ".bun/bin/bun", ".deno/bin/deno"] {
+                let p = PathBuf::from(&home).join(sub);
+                if p.is_file() {
+                    let kind = if sub.contains("bun") { "bun" } else if sub.contains("deno") { "deno" } else { "node" };
+                    return Some(format!("{}:{}", kind, p.to_string_lossy()));
+                }
+            }
+        }
+        for (kind, path) in [("node", "/usr/bin/node"), ("node", "/usr/local/bin/node"), ("deno", "/usr/local/bin/deno"), ("bun", "/usr/local/bin/bun")] {
+            let p = PathBuf::from(path);
+            if p.is_file() {
+                return Some(format!("{}:{}", kind, p.to_string_lossy()));
+            }
+        }
+    }
+
     None
 }
 
@@ -291,6 +326,22 @@ pub fn find_ffmpeg_path() -> Option<PathBuf> {
                         return Some(bin_candidate);
                     }
                 }
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        if let Ok(home) = std::env::var("HOME") {
+            let local_bin = PathBuf::from(&home).join(".local").join("bin").join("ffmpeg");
+            if local_bin.is_file() {
+                return Some(local_bin);
+            }
+        }
+        for dir in ["/usr/local/bin", "/usr/bin", "/opt/homebrew/bin"] {
+            let candidate = PathBuf::from(dir).join("ffmpeg");
+            if candidate.is_file() {
+                return Some(candidate);
             }
         }
     }

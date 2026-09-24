@@ -1,0 +1,6 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# Ensure shell scripts and service files retain LF endings on all platforms
+*.sh text eol=lf
+*.service text eol=lf

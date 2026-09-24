@@ -70,6 +70,20 @@ impl DownloadHistoryManager {
             return PathBuf::from(app_data).join("EndosUnifiedDownloader").join("history.json");
         }
 
+        #[cfg(not(windows))]
+        {
+            if let Ok(xdg_data) = std::env::var("XDG_DATA_HOME") {
+                return PathBuf::from(xdg_data).join("endos-downloader").join("history.json");
+            }
+            if let Ok(home) = std::env::var("HOME") {
+                let xdg_fallback = PathBuf::from(&home).join(".local").join("share").join("endos-downloader").join("history.json");
+                if xdg_fallback.exists() {
+                    return xdg_fallback;
+                }
+                return PathBuf::from(home).join(".hyperfetch").join("history.json");
+            }
+        }
+
         if let Ok(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
             return PathBuf::from(home).join(".hyperfetch").join("history.json");
         }

@@ -111,7 +111,8 @@ impl DownloaderApp {
         style.visuals.widgets.active.bg_fill = Color32::from_rgb(30, 64, 175);
         _cc.egui_ctx.set_style(style);
 
-        let default_dir = std::env::var("USERPROFILE")
+        let default_dir = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
             .map(|p| PathBuf::from(p).join("Downloads"))
             .unwrap_or_else(|_| PathBuf::from("."))
             .to_string_lossy()

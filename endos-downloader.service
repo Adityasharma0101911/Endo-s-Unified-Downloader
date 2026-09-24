@@ -1,0 +1,27 @@
+[Unit]
+Description=Endo's Unified Downloader Service
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# User to execute the service under (modify to your server username)
+# User=ubuntu
+# Group=ubuntu
+
+# Path to the endos-downloader executable and download parameters
+# Example: Process batch queue file automatically in the background
+ExecStart=/usr/local/bin/endos-downloader -i /var/downloads/queue.txt -d /var/downloads -q
+
+# Gracefully stop on systemctl stop: sends SIGTERM to flush memory maps and save .hfstate
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=5s
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

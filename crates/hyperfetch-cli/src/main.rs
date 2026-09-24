@@ -13,6 +13,10 @@ struct Args {
     #[arg(num_args = 0..)]
     urls: Vec<String>,
 
+    /// Read URLs from file (one download per line, supports multiple mirrors per line, # for comments)
+    #[arg(short = 'i', long = "input-file")]
+    input_file: Option<PathBuf>,
+
     /// Number of concurrent connections/workers
     #[arg(short = 's', long = "split", default_value_t = 16)]
     connections: usize,
@@ -24,6 +28,14 @@ struct Args {
     /// Output file path or directory
     #[arg(short = 'o', long = "output")]
     output: Option<PathBuf>,
+
+    /// Target directory for downloaded files (alias for -o if directory)
+    #[arg(short = 'd', long = "dir")]
+    dir: Option<PathBuf>,
+
+    /// Quiet mode: suppress interactive progress bar for headless servers and cron jobs
+    #[arg(short = 'q', long = "quiet")]
+    quiet: bool,
 
     /// Expected file checksum (sha256:..., md5:..., blake3:..., or hex)
     #[arg(long = "checksum")]
@@ -139,7 +151,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    if args.urls.is_empty() {
+    if args.urls.is_empty() && args.input_file.is_none() {
         run_interactive_ui().await?;
     } else {
         run_cli_download(args).await?;
@@ -155,7 +167,8 @@ async fn run_interactive_ui() -> Result<(), Box<dyn std::error::Error>> {
     println!("   Endo's Unified Downloader - High-Speed Ingestion Engine");
     println!("===================================================================");
 
-    let default_download_dir = std::env::var("USERPROFILE")
+    let default_download_dir = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
         .map(|p| PathBuf::from(p).join("Downloads"))
         .unwrap_or_else(|_| PathBuf::from("."));
 
@@ -249,7 +262,7 @@ async fn run_interactive_ui() -> Result<(), Box<dyn std::error::Error>> {
 
         println!("\nProbing mirrors and initializing chunk pipeline...");
         let engine = DownloadEngine::new(parsed_urls, options);
-        execute_download(engine).await;
+        let _ = execute_download(engine, false).await;
 
         println!("\n-------------------------------------------------------------------");
         print!("Download another file? [y/N]: ");
@@ -266,63 +279,127 @@ async fn run_interactive_ui() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run_cli_download(args: Args) -> Result<(), Box<dyn std::error::Error>> {
-    let mut parsed_urls = Vec::new();
-    let expected_checksum = args.checksum;
+    let mut tasks: Vec<Vec<String>> = Vec::new();
 
-    for u in &args.urls {
-        let trimmed = u.trim();
-        if trimmed.starts_with("blob:") || (trimmed.contains("youtube.com") && trimmed.split('/').last().map_or(false, |s| s.len() == 36 && s.matches('-').count() == 4)) {
-            eprintln!("\n[NOTICE] The URL entered is a browser-internal blob memory buffer.");
-            eprintln!("Browser blob: URLs exist only in temporary browser memory and cannot be downloaded by external tools.");
-            eprintln!("Please copy the standard video URL from your browser address bar (e.g. https://www.youtube.com/watch?v=... or https://youtu.be/...).");
-            return Err("Cannot download browser-internal blob URL".into());
+    // 1. Ingest batch file if provided
+    if let Some(ref input_path) = args.input_file {
+        let content = std::fs::read_to_string(input_path)
+            .map_err(|e| format!("Failed to read input file {:?}: {}", input_path, e))?;
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                let mirrors: Vec<String> = trimmed.split_whitespace().map(|s| s.to_string()).collect();
+                if !mirrors.is_empty() {
+                    tasks.push(mirrors);
+                }
+            }
+        }
+    }
+
+    // 2. Ingest command-line URLs if provided
+    if !args.urls.is_empty() {
+        tasks.push(args.urls.clone());
+    }
+
+    if tasks.is_empty() {
+        println!("No valid download URLs provided.");
+        return Ok(());
+    }
+
+    let output_target = args.output.clone().or_else(|| args.dir.clone());
+    let total_tasks = tasks.len();
+    let mut failed_tasks = 0;
+
+    for (task_idx, task_urls) in tasks.into_iter().enumerate() {
+        if total_tasks > 1 && !args.quiet {
+            println!("\n=======================================================");
+            println!("   [Task {}/{}] Processing download", task_idx + 1, total_tasks);
+            println!("=======================================================");
         }
 
-        if hyperfetch_core::torrent::is_magnet_uri(trimmed) {
-            match hyperfetch_core::torrent::parse_magnet_uri(trimmed) {
-                Ok(magnet) => {
-                    println!("[MAGNET] Ingested magnet URI: {}", magnet.info_hash);
-                    if let Some(ref dn) = magnet.display_name {
-                        println!("         Name: {}", dn);
+        let mut parsed_urls = Vec::new();
+        let mut task_error = false;
+
+        for u in &task_urls {
+            let trimmed = u.trim();
+            if trimmed.starts_with("blob:") || (trimmed.contains("youtube.com") && trimmed.split('/').last().map_or(false, |s| s.len() == 36 && s.matches('-').count() == 4)) {
+                eprintln!("\n[NOTICE] The URL entered is a browser-internal blob memory buffer.");
+                eprintln!("Browser blob: URLs exist only in temporary browser memory and cannot be downloaded by external tools.");
+                task_error = true;
+                break;
+            }
+
+            if hyperfetch_core::torrent::is_magnet_uri(trimmed) {
+                match hyperfetch_core::torrent::parse_magnet_uri(trimmed) {
+                    Ok(magnet) => {
+                        if !args.quiet {
+                            println!("[MAGNET] Ingested magnet URI: {}", magnet.info_hash);
+                            if let Some(ref dn) = magnet.display_name {
+                                println!("         Name: {}", dn);
+                            }
+                        }
+                        if !magnet.web_seeds.is_empty() {
+                            if !args.quiet {
+                                println!("         Discovered {} web seed mirror(s) for HTTP acceleration", magnet.web_seeds.len());
+                            }
+                            parsed_urls.extend(magnet.web_seeds);
+                            continue;
+                        }
                     }
-                    if !magnet.web_seeds.is_empty() {
-                        println!("         Discovered {} web seed mirror(s) for HTTP acceleration", magnet.web_seeds.len());
-                        parsed_urls.extend(magnet.web_seeds);
-                        continue;
+                    Err(e) => {
+                        eprintln!("[ERROR] Invalid magnet URI: {}", e);
+                        task_error = true;
+                        break;
                     }
                 }
+            }
+
+            match Url::parse(trimmed) {
+                Ok(url) => parsed_urls.push(url),
                 Err(e) => {
-                    eprintln!("[ERROR] Invalid magnet URI: {}", e);
-                    return Err(e.into());
+                    eprintln!("[ERROR] Invalid URL '{}': {}", u, e);
+                    task_error = true;
+                    break;
                 }
             }
         }
 
-        let url = Url::parse(trimmed).map_err(|e| format!("Invalid URL '{}': {}", u, e))?;
-        parsed_urls.push(url);
+        if task_error || parsed_urls.is_empty() {
+            failed_tasks += 1;
+            continue;
+        }
+
+        let media_preset = parse_media_preset(args.media_preset.as_deref());
+        let browser_cookies = parse_browser_cookie(args.cookies_from_browser.as_deref());
+
+        let options = DownloadOptions {
+            num_connections: args.connections,
+            base_chunk_size: args.chunk_size_mb * 1024 * 1024,
+            min_steal_threshold: 1024 * 1024,
+            output_path: output_target.clone(),
+            expected_checksum: args.checksum.clone(),
+            cookies_path: args.load_cookies.clone(),
+            auth_header: args.header.clone(),
+            proxy: args.proxy.clone(),
+            media_preset,
+            browser_cookies,
+        };
+
+        let engine = DownloadEngine::new(parsed_urls, options);
+        if !args.quiet && total_tasks == 1 {
+            println!("Endo's Unified Downloader v0.1.0");
+            println!("Probing mirrors and preparing dynamic chunk pipeline...");
+        }
+
+        if execute_download(engine, args.quiet).await.is_err() {
+            failed_tasks += 1;
+        }
     }
 
-    let media_preset = parse_media_preset(args.media_preset.as_deref());
-    let browser_cookies = parse_browser_cookie(args.cookies_from_browser.as_deref());
+    if failed_tasks > 0 {
+        return Err(format!("{} of {} download tasks failed or were interrupted", failed_tasks, total_tasks).into());
+    }
 
-    let options = DownloadOptions {
-        num_connections: args.connections,
-        base_chunk_size: args.chunk_size_mb * 1024 * 1024,
-        min_steal_threshold: 1024 * 1024,
-        output_path: args.output,
-        expected_checksum,
-        cookies_path: args.load_cookies,
-        auth_header: args.header,
-        proxy: args.proxy,
-        media_preset,
-        browser_cookies,
-    };
-
-    let engine = DownloadEngine::new(parsed_urls, options);
-    println!("Endo's Unified Downloader v0.1.0");
-    println!("Probing mirrors and preparing dynamic chunk pipeline...");
-
-    execute_download(engine).await;
     Ok(())
 }
 
@@ -349,24 +426,60 @@ fn parse_browser_cookie(browser: Option<&str>) -> Option<hyperfetch_core::media:
     }
 }
 
-async fn execute_download(engine: DownloadEngine) {
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigint = match signal(SignalKind::interrupt()) {
+            Ok(s) => s,
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = sigint.recv() => {},
+            _ = sigterm.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+async fn execute_download(engine: DownloadEngine, quiet: bool) -> Result<PathBuf, String> {
     let (snapshot_tx, mut snapshot_rx) = broadcast::channel::<EngineSnapshot>(64);
 
-    let pb = ProgressBar::new(100);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, ETA {eta})")
-            .unwrap()
-            .progress_chars("=>-"),
-    );
+    let pb = if quiet {
+        None
+    } else {
+        let bar = ProgressBar::new(100);
+        bar.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, ETA {eta})")
+                .unwrap()
+                .progress_chars("=>-"),
+        );
+        Some(bar)
+    };
 
     let pb_clone = pb.clone();
     let monitor_handle = tokio::spawn(async move {
         loop {
             match snapshot_rx.recv().await {
                 Ok(snapshot) => {
-                    pb_clone.set_length(snapshot.total_bytes);
-                    pb_clone.set_position(snapshot.downloaded_bytes);
+                    if let Some(ref bar) = pb_clone {
+                        bar.set_length(snapshot.total_bytes);
+                        bar.set_position(snapshot.downloaded_bytes);
+                    }
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
                     continue;
@@ -378,17 +491,37 @@ async fn execute_download(engine: DownloadEngine) {
         }
     });
 
-    let result = engine.run(Some(snapshot_tx)).await;
+    let cancel_engine = engine.clone();
+    let result = tokio::select! {
+        res = engine.run(Some(snapshot_tx)) => res,
+        _ = wait_for_shutdown_signal() => {
+            cancel_engine.cancel();
+            if let Some(ref bar) = pb {
+                bar.abandon_with_message("Paused");
+            }
+            eprintln!("\n[PAUSED] Download interrupted by signal (SIGINT/SIGTERM). State preserved for safe resume.");
+            return Err("Download interrupted by signal".to_string());
+        }
+    };
+
     let _ = monitor_handle.await;
 
     match result {
         Ok(path) => {
-            pb.finish_with_message("Complete");
-            println!("\n[OK] Downloaded to: {}", path.display());
+            if let Some(ref bar) = pb {
+                bar.finish_with_message("Complete");
+            }
+            if !quiet {
+                println!("\n[OK] Downloaded to: {}", path.display());
+            }
+            Ok(path)
         }
         Err(err) => {
-            pb.abandon_with_message("Failed");
+            if let Some(ref bar) = pb {
+                bar.abandon_with_message("Failed");
+            }
             eprintln!("\n[ERROR] Download failed: {}", err);
+            Err(err)
         }
     }
 }
