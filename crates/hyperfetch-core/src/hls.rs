@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -21,6 +21,8 @@ const MAX_MASTER_DEPTH: usize = 3;
 const MAX_ATTEMPTS: u32 = 5;
 const MAX_PLAYLIST_BYTES: u64 = if cfg!(test) { 64 * 1024 } else { 16 * 1024 * 1024 };
 const MAX_KEY_BYTES: u64 = 1024;
+/// Most AES keys fetched at once; more would risk a burst of 429s from the key server.
+const KEY_CONCURRENCY: usize = 16;
 /// Most of an oversized body read anyway, to tell a huge playlist from an ordinary file.
 const PEEK_BYTES: u64 = 1024;
 /// Largest segment or init section held in memory. Real segments are a few MiB.
@@ -289,13 +291,24 @@ async fn parse_media_playlist(
 
     let join = |uri: &str| base.join(uri).map_err(|e| malformed(format!("invalid URL '{}': {}", uri, e)));
 
+    // Playlists that rotate keys name hundreds of them: fetch them all up front, several at once,
+    // instead of one after another as the walk below reaches them. A key that could not be
+    // fetched fails the walk only where it is used, so errors come in playlist order.
+    let mut key_cache: HashMap<Url, Result<[u8; 16], String>> = futures_util::stream::iter(key_urls(text, base))
+        .map(|url| async move {
+            let key = fetch_key(client, auth, &url).await;
+            (url, key)
+        })
+        .buffer_unordered(KEY_CONCURRENCY)
+        .collect()
+        .await;
+
     let mut segments = Vec::new();
     let mut media_sequence: u64 = 0;
     let mut duration = 2.0;
     let mut byte_range = None;
     let mut next_range_start = 0;
     let mut key: Option<ActiveKey> = None;
-    let mut key_cache: HashMap<Url, [u8; 16]> = HashMap::new();
     let mut init = None;
 
     for line in text.lines() {
@@ -323,13 +336,14 @@ async fn parse_media_playlist(
                     let uri = attrs.get("URI").ok_or_else(|| malformed("#EXT-X-KEY without URI"))?;
                     let key_url = join(uri)?;
                     let key_bytes = match key_cache.get(&key_url) {
-                        Some(k) => *k,
+                        Some(k) => k.clone(),
                         None => {
-                            let k = fetch_key(client, auth, &key_url).await?;
-                            key_cache.insert(key_url, k);
+                            let k = fetch_key(client, auth, &key_url).await;
+                            key_cache.insert(key_url, k.clone());
                             k
                         }
-                    };
+                    }
+                    .map_err(HlsError::Unavailable)?;
                     let iv = match attrs.get("IV") {
                         Some(iv) => Some(parse_iv(iv).ok_or_else(|| malformed(format!("invalid IV '{}'", iv)))?),
                         None => None,
@@ -386,13 +400,31 @@ async fn parse_media_playlist(
     Ok(segments)
 }
 
-async fn fetch_key(client: &Client, auth: Option<&Auth>, url: &Url) -> Result<[u8; 16], HlsError> {
+/// The URLs of the AES-128 keys `text` names, each once, in playlist order. Lines the walk in
+/// [`parse_media_playlist`] rejects are skipped here and left for it to report.
+fn key_urls(text: &str, base: &Url) -> Vec<Url> {
+    let mut seen = HashSet::new();
+    text.lines()
+        .filter_map(|line| line.trim().strip_prefix("#EXT-X-KEY:"))
+        .filter_map(|list| {
+            let attrs = parse_attributes(list);
+            let identity = attrs.get("KEYFORMAT").is_none_or(|f| *f == "identity");
+            if attrs.get("METHOD") != Some(&"AES-128") || !identity {
+                return None;
+            }
+            base.join(attrs.get("URI")?).ok()
+        })
+        .filter(|url| seen.insert(url.clone()))
+        .collect()
+}
+
+/// Fetches a 16-byte AES key; the error is the reason it could not.
+async fn fetch_key(client: &Client, auth: Option<&Auth>, url: &Url) -> Result<[u8; 16], String> {
     let (bytes, _) = fetch_with_retry(client, auth, url, None, MAX_KEY_BYTES, &AtomicU64::new(0))
         .await
-        .map_err(|e| HlsError::Unavailable(format!("could not fetch AES key {}: {}", url, e.reason)))?;
-    <[u8; 16]>::try_from(bytes.as_slice()).map_err(|_| {
-        HlsError::Unavailable(format!("AES-128 key at {} is {} bytes, expected 16", url, bytes.len()))
-    })
+        .map_err(|e| format!("could not fetch AES key {}: {}", url, e.reason))?;
+    <[u8; 16]>::try_from(bytes.as_slice())
+        .map_err(|_| format!("AES-128 key at {} is {} bytes, expected 16", url, bytes.len()))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -905,7 +937,9 @@ pub(crate) mod tests {
     use super::*;
     use aes::cipher::BlockEncryptMut;
     use parking_lot::Mutex;
+    use std::future::Future;
     use std::net::SocketAddr;
+    use std::sync::atomic::AtomicUsize;
 
     /// Response of the mock server: status, extra header lines, body.
     /// Status 0 means "never answer" (a stalled connection).
@@ -915,6 +949,13 @@ pub(crate) mod tests {
     /// `/private/` answer 401 unless the request carries `Authorization: Bearer secret`.
     pub(crate) async fn serve(
         handler: impl Fn(&str, Option<ByteRange>) -> Reply + Send + Sync + 'static,
+    ) -> (SocketAddr, Arc<Mutex<HashMap<String, usize>>>) {
+        serve_async(move |path, range| std::future::ready(handler(path, range))).await
+    }
+
+    /// [`serve`] with a handler that may take its time to answer.
+    pub(crate) async fn serve_async<F: Future<Output = Reply> + Send + 'static>(
+        handler: impl Fn(&str, Option<ByteRange>) -> F + Send + Sync + 'static,
     ) -> (SocketAddr, Arc<Mutex<HashMap<String, usize>>>) {
         let handler = Arc::new(handler);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -948,7 +989,7 @@ pub(crate) mod tests {
                     let (status, headers, body) = if path.starts_with("/private/") && !authorized {
                         (401, String::new(), Vec::new())
                     } else {
-                        handler(&path, range)
+                        handler(&path, range).await
                     };
                     if status == 0 {
                         tokio::time::sleep(Duration::from_secs(60)).await;
@@ -1081,6 +1122,51 @@ video.m3u8
         let start = Url::parse(&format!("http://{}/start/master.m3u8", addr)).unwrap();
         let segments = parse_hls_playlist(&client, &start, None).await.unwrap();
         assert_eq!(segments[0].url.path(), "/cdn/abc/v/seg0.ts");
+    }
+
+    #[tokio::test]
+    async fn test_keys_are_fetched_in_parallel_up_to_the_cap() {
+        const KEYS: usize = KEY_CONCURRENCY + 4;
+        let rotating: String =
+            (0..KEYS).map(|n| format!("#EXT-X-KEY:METHOD=AES-128,URI=\"k{n}.bin\"\n#EXTINF:4,\ns{n}.ts\n")).collect();
+        let rotating = format!("#EXTM3U\n{rotating}#EXT-X-ENDLIST\n");
+        let (open, most, arrived) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let counters = (Arc::clone(&open), Arc::clone(&most), Arc::clone(&arrived));
+        let (addr, _) = serve_async(move |path: &str, _| {
+            let key: Option<u8> = path.strip_prefix("/k").and_then(|k| k.strip_suffix(".bin")?.parse().ok());
+            let reply = match path {
+                "/rotating.m3u8" => ok(rotating.clone()),
+                // A DRM key comes first: its error is the one reported, although the key after it is gone.
+                "/drm-first.m3u8" => ok("#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,KEYFORMAT=\"com.apple.streamingkeydelivery\",URI=\"skd://k\"\n\
+                    #EXTINF:4,\na.ts\n#EXT-X-KEY:METHOD=AES-128,URI=\"gone.bin\"\n#EXTINF:4,\nb.ts\n#EXT-X-ENDLIST\n"),
+                _ => (404, String::new(), Vec::new()),
+            };
+            let (open, most, arrived) = (Arc::clone(&counters.0), Arc::clone(&counters.1), Arc::clone(&counters.2));
+            async move {
+                let Some(key) = key else { return reply };
+                most.fetch_max(open.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+                arrived.fetch_add(1, Ordering::SeqCst);
+                // No key is answered before as many requests as the cap allows have arrived (or two
+                // seconds have passed), so all of those must be open at once.
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while arrived.load(Ordering::SeqCst) < KEY_CONCURRENCY && Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                open.fetch_sub(1, Ordering::SeqCst);
+                ok(vec![key; 16])
+            }
+        })
+        .await;
+        let client = Client::new();
+        let url = Url::parse(&format!("http://{addr}/rotating.m3u8")).unwrap();
+        let segments = parse_hls_playlist(&client, &url, None).await.unwrap();
+        assert_eq!(most.load(Ordering::SeqCst), KEY_CONCURRENCY, "at most {KEY_CONCURRENCY} key requests at once, and that many");
+        for (n, segment) in segments.iter().enumerate() {
+            assert_eq!(segment.encryption.as_ref().unwrap().key, [n as u8; 16], "segment {n} has its own key");
+        }
+
+        let url = Url::parse(&format!("http://{addr}/drm-first.m3u8")).unwrap();
+        assert!(matches!(parse_hls_playlist(&client, &url, None).await, Err(HlsError::Unsupported(_))));
     }
 
     #[tokio::test]
