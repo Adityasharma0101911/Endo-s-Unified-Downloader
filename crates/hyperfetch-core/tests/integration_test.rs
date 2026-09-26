@@ -99,6 +99,8 @@ struct Mock {
     etag: Option<&'static str>,
     /// Content-Disposition value sent with every GET response.
     disposition: Option<String>,
+    /// Content-Disposition value sent with HEAD responses only.
+    head_disposition: Option<&'static str>,
     /// Report this total in Content-Range instead of the real one (a broken mirror).
     content_range_total: Option<usize>,
     /// Report the total in Content-Range as `*` (unknown).
@@ -164,6 +166,7 @@ impl Mock {
             chunked: false,
             etag: None,
             disposition: None,
+            head_disposition: None,
             content_range_total: None,
             unknown_total: false,
             max_active: None,
@@ -265,7 +268,8 @@ async fn handle(mut socket: TcpStream, mock: Arc<Mock>) {
             } else {
                 accept
             };
-            format!("HTTP/1.1 200 OK\r\n{}{}{}Connection: close\r\n\r\n", length(total), accept, etag)
+            let disposition = mock.head_disposition.map(|d| format!("Content-Disposition: {}\r\n", d)).unwrap_or_default();
+            format!("HTTP/1.1 200 OK\r\n{}{}{}{}Connection: close\r\n\r\n", length(total), accept, etag, disposition)
         };
         let _ = socket.write_all(resp.as_bytes()).await;
         return;
@@ -1585,4 +1589,27 @@ async fn test_expired_redirect_target_falls_back_to_the_mirrors_own_url() {
     assert_file(&path, &data);
     assert!(file.stats.denied.load(Ordering::SeqCst) >= 1, "the redirect target was tried first");
     assert!(redirector.stats.gets.load(Ordering::SeqCst) >= 1, "then the mirror's own URL, redirecting afresh");
+}
+
+#[tokio::test]
+async fn test_head_is_not_awaited_once_the_ranged_get_says_it_all() {
+    let _history = setup().await;
+    let data = payload(PREFETCH + 256 * KB, 239);
+    // HEAD answers after the GET, well within its grace, and only it names the file "head.bin".
+    for (etag, expected) in [(Some("\"g1\""), "get.bin"), (None, "head.bin")] {
+        let mut mock = Mock::new(data.clone());
+        mock.etag = etag;
+        mock.head_delay = Duration::from_millis(150);
+        mock.head_disposition = Some("attachment; filename=\"head.bin\"");
+        let url = serve(Arc::new(mock), "get.bin").await;
+        let temp = tempdir().unwrap();
+
+        let engine = DownloadEngine::new(vec![url], options(temp.path(), 4, 64 * KB));
+        let path = run(&engine, None).await.expect("download should succeed");
+
+        // A 206 with size, validator and a name in the URL does not wait for HEAD; without a
+        // validator it does, and then takes HEAD's name.
+        assert_eq!(path, temp.path().join(expected), "etag: {etag:?}");
+        assert_file(&path, &data);
+    }
 }
