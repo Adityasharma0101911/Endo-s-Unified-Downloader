@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use futures_util::StreamExt;
-use reqwest::header::{CONTENT_RANGE, RANGE};
+use reqwest::header::{HeaderMap, CONTENT_RANGE, ETAG, IF_RANGE, LAST_MODIFIED, RANGE};
 use reqwest::{Client, StatusCode};
 use url::Url;
 use crate::history::{DownloadHistoryManager, HistoryEntry};
@@ -185,33 +185,76 @@ async fn until_cancelled<T>(fut: impl Future<Output = T>, cancel: Option<&Atomic
     }
 }
 
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T, String> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| format!("Background task failed: {}", e))
+}
+
+/// Validator for `If-Range`: a strong ETag, else Last-Modified (weak ETags are not allowed there).
+fn if_range(state: &DownloadState) -> Option<&str> {
+    state
+        .etag
+        .as_deref()
+        .filter(|e| !e.starts_with("W/"))
+        .or(state.last_modified.as_deref())
+}
+
+/// Whether a response carries an ETag (or, failing that, a Last-Modified) that differs from the
+/// one recorded when the download started.
+fn remote_changed(state: &DownloadState, headers: &HeaderMap) -> bool {
+    let header = |name| headers.get(name).and_then(|v| v.to_str().ok());
+    match (state.etag.as_deref(), header(ETAG)) {
+        (Some(recorded), Some(served)) => recorded != served,
+        _ => matches!(
+            (state.last_modified.as_deref(), header(LAST_MODIFIED)),
+            (Some(recorded), Some(served)) if recorded != served
+        ),
+    }
+}
+
 /// Fetches bytes `*offset..=end` from `url` into the file, advancing `*offset` past every byte
 /// actually written. Only a 206 whose Content-Range starts at `*offset`, ends at or before `end`
 /// and reports the file's full size is accepted; the server may return fewer bytes than asked for.
+/// A response showing that the file changed since its state was recorded aborts the repair.
 async fn fetch_range(
     client: &Client,
     url: &Url,
     offset: &mut u64,
     end: u64,
-    writer: &DiskWriter,
+    repair: &RepairTarget,
     cancel: Option<&AtomicBool>,
     on_bytes: &mut (dyn FnMut(u64) + Send),
 ) -> Result<(), FetchError> {
+    let RepairTarget { state, writer, .. } = repair;
     let total_size = writer.size();
-    let request = client
-        .get(url.clone())
-        .header(RANGE, format!("bytes={}-{}", *offset, end))
-        .send();
-    let resp = until_cancelled(request, cancel)
+    let validator = if_range(state);
+    let mut request = client.get(url.clone()).header(RANGE, format!("bytes={}-{}", *offset, end));
+    if let Some(validator) = validator {
+        request = request.header(IF_RANGE, validator);
+    }
+    let resp = until_cancelled(request.send(), cancel)
         .await?
         .map_err(|e| FetchError::Retry(format!("request to {} failed: {}", url, e)))?;
 
+    let changed = || {
+        FetchError::Fatal(format!(
+            "The file at {} changed since it was downloaded; repair aborted, nothing was written",
+            url
+        ))
+    };
+    if resp.status() == StatusCode::OK && validator.is_some() {
+        return Err(changed());
+    }
     if resp.status() != StatusCode::PARTIAL_CONTENT {
         return Err(FetchError::Retry(format!(
             "{} answered HTTP {} instead of 206 Partial Content",
             url,
             resp.status()
         )));
+    }
+    if remote_changed(state, resp.headers()) {
+        return Err(changed());
     }
     let header = resp
         .headers()
@@ -242,21 +285,134 @@ async fn fetch_range(
             }
         };
         let wanted = served.end + 1 - *offset;
-        let data = &chunk[..chunk.len().min(usize::try_from(wanted).unwrap_or(usize::MAX))];
-        writer
-            .write_chunk_slice(*offset, data)
+        let data = chunk.slice(..chunk.len().min(usize::try_from(wanted).unwrap_or(usize::MAX)));
+        let len = data.len() as u64;
+        let (writer, at) = (writer.clone(), *offset);
+        blocking(move || writer.write_chunk_slice(at, &data))
+            .await
+            .map_err(FetchError::Fatal)?
             .map_err(|e| FetchError::Fatal(format!("Failed writing repair data: {}", e)))?;
-        *offset += data.len() as u64;
-        on_bytes(data.len() as u64);
+        *offset += len;
+        on_bytes(len);
     }
     Ok(())
 }
 
-/// Selectively downloads and repairs missing chunk ranges directly into the file on disk.
+/// The in-progress file a repair writes into.
+struct RepairTarget {
+    final_path: PathBuf,
+    part: PathBuf,
+    state_path: PathBuf,
+    state: DownloadState,
+    writer: DiskWriter,
+}
+
+/// Sets up `<final>.part` + `<final>.part.hfstate` for repairing `file_path`, recording as complete
+/// only bytes known to be good: those the existing state (or, without one, the caller) vouches
+/// for, minus `missing_ranges` and anything past the end of the file. A damaged file at its final
+/// name is moved to the `.part` first, since a file at its final name must always be complete; an
+/// unfinished repair then leaves a download the engine can resume.
+fn prepare_repair(
+    file_path: &Path,
+    total_size: u64,
+    missing_ranges: &[ByteRange],
+    urls: &[Url],
+) -> Result<RepairTarget, String> {
+    let target = resolve_target(file_path);
+    let on_disk = match std::fs::metadata(&target) {
+        Ok(meta) => Some(meta.len()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("Cannot read {:?}: {}", target, e)),
+    };
+    let len = on_disk.unwrap_or(0);
+    if len > total_size {
+        return Err(format!(
+            "{:?} is larger than the expected {} bytes; refusing to truncate it",
+            target, total_size
+        ));
+    }
+
+    let target_state_path = DownloadState::state_file_path(&target);
+    let mut state = match DownloadState::load_from_path(&target_state_path) {
+        Ok(Some(state)) if state.file_size == total_size => state,
+        Ok(Some(state)) => {
+            return Err(format!(
+                "Download state records {} bytes but repair was asked for {} bytes",
+                state.file_size, total_size
+            ))
+        }
+        _ => {
+            // No usable bookkeeping: everything outside the reported gaps is taken as present.
+            let mut state = DownloadState::new(
+                target.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+                total_size,
+                crate::engine::DownloadOptions::default().base_chunk_size,
+                urls.iter().map(|u| u.to_string()).collect(),
+            );
+            state.completed_ranges.extend(ByteRange::from_len(0, total_size).ok());
+            state
+        }
+    };
+    let mut untrusted = compute_gaps(total_size, &state.completed_ranges);
+    untrusted.extend_from_slice(missing_ranges);
+    untrusted.extend(ByteRange::new(len, total_size.saturating_sub(1)).ok());
+    state.completed_ranges = compute_gaps(total_size, &merge_ranges(untrusted));
+
+    let final_path = final_name_of(&target).unwrap_or_else(|| target.clone());
+    let part = with_suffix(&final_path, ".part");
+    let state_path = DownloadState::state_file_path(&part);
+    if part != target {
+        if part.exists() {
+            return Err(format!("{:?} already exists; refusing to overwrite it", part));
+        }
+        // State first: a crash before the rename leaves only a stray state file behind.
+        state
+            .save_atomic(&state_path)
+            .map_err(|e| format!("Failed to save repair state: {}", e))?;
+        if on_disk.is_some() {
+            if let Err(e) = std::fs::rename(&target, &part) {
+                let _ = DownloadState::remove(&state_path);
+                return Err(format!("Failed to move {:?} to {:?} for repair: {}", target, part, e));
+            }
+        }
+        let _ = DownloadState::remove(&target_state_path);
+    }
+
+    let writer = DiskWriter::open_or_create(&part, total_size)
+        .map_err(|e| format!("Failed to open file for repair: {}", e))?;
+    Ok(RepairTarget { final_path, part, state_path, state, writer })
+}
+
+/// Makes the repair's progress durable; a complete `.part` is renamed to its final name.
+fn finish_repair(repair: RepairTarget, complete: bool) -> Result<(), String> {
+    let RepairTarget { final_path, part, state_path, mut state, writer } = repair;
+    // Record progress only once it is durable.
+    writer.sync().map_err(|e| format!("Failed to flush repaired data to disk: {}", e))?;
+    drop(writer);
+
+    state.completed_ranges = merge_ranges(std::mem::take(&mut state.completed_ranges));
+    if complete && !final_path.exists() {
+        std::fs::rename(&part, &final_path)
+            .map_err(|e| format!("Repaired {:?} but could not rename it to {:?}: {}", part, final_path, e))?;
+        let _ = DownloadState::remove(&state_path);
+        return Ok(());
+    }
+    if complete {
+        tracing::warn!("Repaired {:?} but {:?} already exists; leaving the .part in place", part, final_path);
+    }
+    state
+        .save_atomic(&state_path)
+        .map_err(|e| format!("Failed to save repair progress: {}", e))
+}
+
+/// Selectively downloads and repairs missing chunk ranges of a file.
 ///
-/// Bytes are recorded in the `.hfstate` only once they have actually been written, so an
-/// interrupted repair can be resumed. When the file becomes complete the state file is removed
-/// and an in-progress `<final>.part` is renamed to its final name.
+/// The repair always happens in `<final>.part` (a damaged file at its final name is moved there
+/// first) and bytes are recorded in its `.hfstate` only once they have actually been written, so
+/// an interrupted repair leaves a download the engine resumes. Every gap the state records is
+/// fetched, including `missing_ranges`. Only a complete file is renamed back to its final name.
+/// When the state records an ETag or Last-Modified, a server whose file has changed aborts the
+/// repair instead of mixing two versions.
 pub async fn repair_missing_ranges<F>(
     file_path: &Path,
     total_size: u64,
@@ -278,38 +434,6 @@ where
         return Err(format!("Missing range {} lies outside the {}-byte file", r, total_size));
     }
 
-    let target = resolve_target(file_path);
-    if let Ok(meta) = std::fs::metadata(&target) {
-        if meta.len() > total_size {
-            return Err(format!(
-                "{:?} is larger than the expected {} bytes; refusing to truncate it",
-                target, total_size
-            ));
-        }
-    }
-
-    let state_path = DownloadState::state_file_path(&target);
-    let mut state = match DownloadState::load_from_path(&state_path) {
-        Ok(Some(state)) if state.file_size == total_size => state,
-        Ok(Some(state)) => {
-            return Err(format!(
-                "Download state records {} bytes but repair was asked for {} bytes",
-                state.file_size, total_size
-            ))
-        }
-        _ => {
-            // No usable bookkeeping: everything outside the reported gaps is taken as present.
-            let mut state = DownloadState::new(
-                target.file_name().unwrap_or_default().to_string_lossy().into_owned(),
-                total_size,
-                crate::engine::DownloadOptions::default().base_chunk_size,
-                urls.iter().map(|u| u.to_string()).collect(),
-            );
-            state.completed_ranges = compute_gaps(total_size, &merge_ranges(missing_ranges.to_vec()));
-            state
-        }
-    };
-
     let client = Client::builder()
         .tcp_nodelay(true)
         .connect_timeout(CONNECT_TIMEOUT)
@@ -318,10 +442,13 @@ where
         .build()
         .map_err(|e| format!("Failed to build HTTP client for repair: {}", e))?;
 
-    let disk_writer = DiskWriter::open_or_create(&target, total_size)
-        .map_err(|e| format!("Failed to open file for repair: {}", e))?;
+    let mut repair = {
+        let (file_path, missing_ranges, urls) = (file_path.to_path_buf(), missing_ranges.to_vec(), urls.to_vec());
+        blocking(move || prepare_repair(&file_path, total_size, &missing_ranges, &urls)).await??
+    };
 
-    let total_repair_bytes: u64 = missing_ranges.iter().map(|r| r.len()).sum();
+    let gaps = compute_gaps(total_size, &repair.state.completed_ranges);
+    let total_repair_bytes: u64 = gaps.iter().map(|r| r.len()).sum();
     let mut repaired_bytes: u64 = 0;
     let mut on_bytes = |n: u64| {
         repaired_bytes += n;
@@ -330,15 +457,15 @@ where
     let cancel = cancel_flag.as_deref();
     let mut outcome = Ok(());
 
-    'ranges: for (range_idx, range) in missing_ranges.iter().enumerate() {
+    'ranges: for (range_idx, range) in gaps.iter().enumerate() {
         let mut offset = range.start;
         let mut failures = 0;
         while offset <= range.end {
             let before = offset;
             let url = &urls[(range_idx + failures) % urls.len()];
-            let result = fetch_range(&client, url, &mut offset, range.end, &disk_writer, cancel, &mut on_bytes).await;
+            let result = fetch_range(&client, url, &mut offset, range.end, &repair, cancel, &mut on_bytes).await;
             if offset > before {
-                state.completed_ranges.push(ByteRange { start: before, end: offset - 1 });
+                repair.state.completed_ranges.push(ByteRange { start: before, end: offset - 1 });
                 failures = 0;
             }
             match result {
@@ -365,31 +492,8 @@ where
         }
     }
 
-    // Record progress only once it is durable.
-    disk_writer.sync().map_err(|e| format!("Failed to flush repaired data to disk: {}", e))?;
-    drop(disk_writer);
-
-    state.completed_ranges = merge_ranges(std::mem::take(&mut state.completed_ranges));
-    let complete = outcome.is_ok() && compute_gaps(state.file_size, &state.completed_ranges).is_empty();
-    match final_name_of(&target) {
-        Some(final_path) if complete && !final_path.exists() => {
-            std::fs::rename(&target, &final_path)
-                .map_err(|e| format!("Repaired {:?} but could not rename it to {:?}: {}", target, final_path, e))?;
-            let _ = DownloadState::remove(&state_path);
-        }
-        None if complete => {
-            let _ = DownloadState::remove(&state_path);
-        }
-        final_path => {
-            if let Some(final_path) = final_path.filter(|_| complete) {
-                tracing::warn!("Repaired {:?} but {:?} already exists; leaving the .part in place", target, final_path);
-            }
-            state
-                .save_atomic(&state_path)
-                .map_err(|e| format!("Failed to save repair progress: {}", e))?;
-        }
-    }
-
+    let complete = outcome.is_ok() && compute_gaps(total_size, &repair.state.completed_ranges).is_empty();
+    blocking(move || finish_repair(repair, complete)).await??;
     outcome
 }
 
@@ -508,10 +612,11 @@ mod tests {
         assert_eq!(res.checksum_match, Some(false));
     }
 
-    /// Serves `content` over HTTP; `respond(attempt, start, end)` builds each raw response.
+    /// Serves `content` over HTTP; `respond(attempt, request, start, end, content)` builds each raw
+    /// response from the lowercased request head and its Range.
     async fn mock_server(
         content: Vec<u8>,
-        respond: fn(usize, u64, u64, &[u8]) -> Vec<u8>,
+        respond: fn(usize, &str, u64, u64, &[u8]) -> Vec<u8>,
     ) -> Url {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -530,7 +635,7 @@ mod tests {
                 let req = String::from_utf8_lossy(&req).to_ascii_lowercase();
                 let spec = req.split("range: bytes=").nth(1).unwrap().lines().next().unwrap();
                 let (s, e) = spec.trim().split_once('-').unwrap();
-                let resp = respond(attempt, s.parse().unwrap(), e.parse().unwrap(), &content);
+                let resp = respond(attempt, &req, s.parse().unwrap(), e.parse().unwrap(), &content);
                 let _ = sock.write_all(&resp).await;
                 let _ = sock.shutdown().await;
             }
@@ -559,6 +664,12 @@ mod tests {
         resp
     }
 
+    /// `resp` with `ETag: "v2"` added after its status line.
+    fn with_new_etag(resp: Vec<u8>) -> Vec<u8> {
+        let head_end = resp.windows(2).position(|w| w == b"\r\n").unwrap() + 2;
+        [&resp[..head_end], b"ETag: \"v2\"\r\n", &resp[head_end..]].concat()
+    }
+
     /// 1000-byte file whose bytes 100..=199 are missing; state records the rest as complete.
     fn damaged_file(dir: &Path, content: &[u8]) -> PathBuf {
         let path = dir.join("build.bin");
@@ -571,8 +682,27 @@ mod tests {
         path
     }
 
+    /// `damaged_file` whose state records that it was downloaded as ETag `"v1"`.
+    fn damaged_file_v1(dir: &Path, content: &[u8]) -> PathBuf {
+        let path = damaged_file(dir, content);
+        let state_path = DownloadState::state_file_path(&path);
+        let mut state = DownloadState::load_from_path(&state_path).unwrap().unwrap();
+        state.etag = Some("\"v1\"".into());
+        state.save_atomic(&state_path).unwrap();
+        path
+    }
+
     fn content() -> Vec<u8> {
         (0..1000u32).map(|i| (i % 251) as u8 + 1).collect()
+    }
+
+    fn part_of(path: &Path) -> PathBuf {
+        with_suffix(path, ".part")
+    }
+
+    fn gaps_on_disk(part: &Path) -> Vec<ByteRange> {
+        let state = DownloadState::load_from_path(&DownloadState::state_file_path(part)).unwrap().unwrap();
+        compute_gaps(state.file_size, &state.completed_ranges)
     }
 
     #[tokio::test]
@@ -580,17 +710,18 @@ mod tests {
         let dir = tempdir().unwrap();
         let content = content();
         let path = damaged_file(dir.path(), &content);
-        let url = mock_server(content.clone(), |_, _, _, c| full_200(c)).await;
+        let url = mock_server(content.clone(), |_, _, _, _, c| full_200(c)).await;
 
         let gap = ByteRange::new(100, 199).unwrap();
         let res = repair_missing_ranges(&path, 1000, &[gap], &[url], None, |_, _| {}).await;
         assert!(res.is_err());
 
-        let on_disk = std::fs::read(&path).unwrap();
+        // The unfinished repair is left as a resumable .part, never under the final name.
+        assert!(!path.exists() && !DownloadState::state_file_path(&path).exists());
+        let on_disk = std::fs::read(part_of(&path)).unwrap();
         assert_eq!(&on_disk[200..], &content[200..], "good data was overwritten");
         assert!(on_disk[100..200].iter().all(|&b| b == 0));
-        let state = DownloadState::load_from_path(&DownloadState::state_file_path(&path)).unwrap().unwrap();
-        assert_eq!(compute_gaps(1000, &state.completed_ranges), vec![gap]);
+        assert_eq!(gaps_on_disk(&part_of(&path)), vec![gap]);
     }
 
     #[tokio::test]
@@ -599,7 +730,7 @@ mod tests {
         let content = content();
         let path = damaged_file(dir.path(), &content);
         // First answer is cut off after 30 bytes, every later one ignores Range.
-        let url = mock_server(content.clone(), |attempt, s, e, c| {
+        let url = mock_server(content.clone(), |attempt, _, s, e, c| {
             if attempt == 0 { partial(s, e, c, 30) } else { full_200(c) }
         })
         .await;
@@ -607,9 +738,85 @@ mod tests {
         let res = repair_missing_ranges(&path, 1000, &[ByteRange::new(100, 199).unwrap()], &[url], None, |_, _| {}).await;
         assert!(res.is_err());
 
-        let state = DownloadState::load_from_path(&DownloadState::state_file_path(&path)).unwrap().unwrap();
-        assert_eq!(compute_gaps(1000, &state.completed_ranges), vec![ByteRange::new(130, 199).unwrap()]);
-        assert_eq!(std::fs::read(&path).unwrap()[100..130], content[100..130]);
+        assert_eq!(gaps_on_disk(&part_of(&path)), vec![ByteRange::new(130, 199).unwrap()]);
+        assert_eq!(std::fs::read(part_of(&path)).unwrap()[100..130], content[100..130]);
+    }
+
+    #[tokio::test]
+    async fn failed_repair_of_truncated_final_file_leaves_resumable_part() {
+        let dir = tempdir().unwrap();
+        let content = content();
+        let path = dir.path().join("build.bin");
+        std::fs::write(&path, &content[..500]).unwrap();
+        let url = mock_server(content.clone(), |_, _, _, _, c| full_200(c)).await;
+
+        let res = verify_with_history(&path, Some(1000), None, &empty_history()).unwrap();
+        let repaired = repair_missing_ranges(&path, 1000, &res.missing_ranges, std::slice::from_ref(&url), None, |_, _| {}).await;
+        assert!(repaired.is_err());
+
+        // No full-size file with a zero tail may sit under the final name.
+        assert!(!path.exists());
+        let part = part_of(&path);
+        let on_disk = std::fs::read(&part).unwrap();
+        assert_eq!(on_disk.len(), 1000, "preallocated like an engine .part");
+        assert_eq!(on_disk[..500], content[..500]);
+        assert_eq!(gaps_on_disk(&part), vec![ByteRange::new(500, 999).unwrap()]);
+        let state = DownloadState::load_from_path(&DownloadState::state_file_path(&part)).unwrap().unwrap();
+        assert_eq!(state.mirrors, vec![url.to_string()], "the engine resumes a .part only from its own mirrors");
+    }
+
+    #[tokio::test]
+    async fn repair_of_truncated_final_file_restores_it() {
+        let dir = tempdir().unwrap();
+        let content = content();
+        let path = dir.path().join("build.bin");
+        std::fs::write(&path, &content[..500]).unwrap();
+        let url = mock_server(content.clone(), |_, _, s, e, c| partial(s, e, c, usize::MAX)).await;
+
+        let res = verify_with_history(&path, Some(1000), None, &empty_history()).unwrap();
+        repair_missing_ranges(&path, 1000, &res.missing_ranges, &[url], None, |_, _| {}).await.unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), content);
+        let part = part_of(&path);
+        assert!(!part.exists());
+        assert!(!DownloadState::state_file_path(&part).exists());
+        assert!(!DownloadState::state_file_path(&path).exists());
+    }
+
+    #[tokio::test]
+    async fn repair_sends_if_range_and_aborts_when_file_changed() {
+        let dir = tempdir().unwrap();
+        let path = damaged_file_v1(dir.path(), &content());
+        // The server now has another build of the same size: it honors Range only while the
+        // client's If-Range still matches, which "v1" no longer does.
+        let new_build: Vec<u8> = content().iter().map(|b| b ^ 0xff).collect();
+        let url = mock_server(new_build, |_, req, s, e, c| {
+            if req.contains("if-range: \"v1\"") { with_new_etag(full_200(c)) } else { with_new_etag(partial(s, e, c, usize::MAX)) }
+        })
+        .await;
+
+        let gap = ByteRange::new(100, 199).unwrap();
+        let res = repair_missing_ranges(&path, 1000, &[gap], &[url], None, |_, _| {}).await;
+        assert!(res.as_ref().is_err_and(|e| e.contains("changed")), "{:?}", res);
+
+        assert!(!path.exists());
+        assert!(std::fs::read(part_of(&path)).unwrap()[100..200].iter().all(|&b| b == 0));
+        assert_eq!(gaps_on_disk(&part_of(&path)), vec![gap]);
+    }
+
+    #[tokio::test]
+    async fn repair_aborts_when_partial_response_has_new_etag() {
+        let dir = tempdir().unwrap();
+        let path = damaged_file_v1(dir.path(), &content());
+        // A server that ignores If-Range but reports the new build's ETag.
+        let new_build: Vec<u8> = content().iter().map(|b| b ^ 0xff).collect();
+        let url = mock_server(new_build, |_, _, s, e, c| with_new_etag(partial(s, e, c, usize::MAX))).await;
+
+        let gap = ByteRange::new(100, 199).unwrap();
+        let res = repair_missing_ranges(&path, 1000, &[gap], &[url], None, |_, _| {}).await;
+        assert!(res.as_ref().is_err_and(|e| e.contains("changed")), "{:?}", res);
+        assert!(std::fs::read(part_of(&path)).unwrap()[100..200].iter().all(|&b| b == 0));
+        assert_eq!(gaps_on_disk(&part_of(&path)), vec![gap]);
     }
 
     #[tokio::test]
@@ -621,7 +828,7 @@ mod tests {
         std::fs::rename(&path, &part).unwrap();
         std::fs::rename(DownloadState::state_file_path(&path), DownloadState::state_file_path(&part)).unwrap();
         // The server caps every answer at 40 bytes.
-        let url = mock_server(content.clone(), |_, s, e, c| partial(s, e.min(s + 39), c, usize::MAX)).await;
+        let url = mock_server(content.clone(), |_, _, s, e, c| partial(s, e.min(s + 39), c, usize::MAX)).await;
 
         let res = verify_with_history(&path, None, None, &empty_history()).unwrap();
         repair_missing_ranges(&path, 1000, &res.missing_ranges, &[url], None, |_, _| {}).await.unwrap();
