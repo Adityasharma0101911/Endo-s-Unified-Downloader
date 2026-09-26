@@ -105,6 +105,12 @@ struct Mock {
     unknown_total: bool,
     /// Answer 503 when more than this many GETs are being served at once.
     max_active: Option<usize>,
+    /// Redirect every request to this URL plus `?t=n`, as a signing redirector does: `t=0` for
+    /// HEAD and the probes, a fresh `n` for every other GET.
+    redirect: Option<String>,
+    /// Refuse GETs (other than probes) whose request target contains this with 403, as an
+    /// expired signed URL is.
+    expired: Option<&'static str>,
     /// What to do with each GET except the engine's probes, which are always served.
     plan: fn(usize) -> Reply,
     /// Pause between 16 KiB body writes, in microseconds (adjustable while running).
@@ -130,6 +136,8 @@ struct Stats {
     active: AtomicUsize,
     /// GETs refused with 503 for exceeding `max_active`.
     refused: AtomicUsize,
+    /// GETs refused with 403 for an `expired` target.
+    denied: AtomicUsize,
     /// Ranges served with 206, in request order.
     ranges: Mutex<Vec<ByteRange>>,
     missing_on_get: AtomicUsize,
@@ -159,6 +167,8 @@ impl Mock {
             content_range_total: None,
             unknown_total: false,
             max_active: None,
+            redirect: None,
+            expired: None,
             plan: |_| Reply::Normal,
             delay_us: AtomicU64::new(0),
             must_exist_on_get: Mutex::new(None),
@@ -212,8 +222,9 @@ async fn handle(mut socket: TcpStream, mock: Arc<Mock>) {
     let Some(head) = read_head(&mut socket).await else { return };
     s.requests.fetch_add(1, Ordering::SeqCst);
     tokio::time::sleep(mock.latency).await;
-    let mut lines = head.lines();
-    let method = lines.next().unwrap_or("").split(' ').next().unwrap_or("").to_string();
+    let mut request_line = head.lines().next().unwrap_or("").split(' ');
+    let method = request_line.next().unwrap_or("").to_string();
+    let target = request_line.next().unwrap_or("/").to_string();
     let header = |name: &str| {
         head.lines().skip(1).find_map(|l| {
             let (k, v) = l.split_once(':')?;
@@ -222,6 +233,17 @@ async fn handle(mut socket: TcpStream, mock: Arc<Mock>) {
     };
     if header("authorization").is_some() {
         s.authorized.fetch_add(1, Ordering::SeqCst);
+    }
+    let range = header("range");
+    let probe = range.as_deref() == Some("bytes=0-0") || range == Some(format!("bytes=0-{}", PREFETCH - 1));
+    if let Some(location) = &mock.redirect {
+        let n = if method == "HEAD" || probe { 0 } else { s.gets.fetch_add(1, Ordering::SeqCst) + 1 };
+        if probe {
+            s.probes.fetch_add(1, Ordering::SeqCst);
+        }
+        let resp = format!("HTTP/1.1 302 Found\r\nLocation: {location}?t={n}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let _ = socket.write_all(resp.as_bytes()).await;
+        return;
     }
     let total = mock.data.len();
     let etag = mock.etag.map(|e| format!("ETag: {}\r\n", e)).unwrap_or_default();
@@ -249,8 +271,6 @@ async fn handle(mut socket: TcpStream, mock: Arc<Mock>) {
         return;
     }
 
-    let range = header("range");
-    let probe = range.as_deref() == Some("bytes=0-0") || range == Some(format!("bytes=0-{}", PREFETCH - 1));
     let (reply, _guard) = if probe {
         s.probes.fetch_add(1, Ordering::SeqCst);
         let busy = mock.busy_probes.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok();
@@ -270,6 +290,9 @@ async fn handle(mut socket: TcpStream, mock: Arc<Mock>) {
         let reply = if mock.max_active.is_some_and(|max| active > max) {
             s.refused.fetch_add(1, Ordering::SeqCst);
             Reply::Status(503, Some(1))
+        } else if mock.expired.is_some_and(|token| target.contains(token)) {
+            s.denied.fetch_add(1, Ordering::SeqCst);
+            Reply::Status(403, None)
         } else {
             (mock.plan)(index)
         };
@@ -1515,4 +1538,51 @@ async fn test_connection_quiet_mid_body_is_replaced_long_before_the_stall_timeou
     assert!(started.elapsed() < Duration::from_secs(12), "took {:?}", started.elapsed());
     assert_file(&out, &data);
     assert_eq!(mock.served_ranges()[1].start, (PREFETCH + 32 * KB) as u64, "the retry continues where the first stopped");
+}
+
+/// A mirror at a redirector (`/latest.bin`) that sends every request to `file`, the real server.
+async fn redirected_to(file: &Arc<Mock>) -> (Arc<Mock>, Url) {
+    let target = serve(Arc::clone(file), "real.bin").await;
+    let mut redirector = Mock::new(Vec::new());
+    redirector.redirect = Some(target.to_string());
+    let redirector = Arc::new(redirector);
+    let url = serve(Arc::clone(&redirector), "latest.bin").await;
+    (redirector, url)
+}
+
+#[tokio::test]
+async fn test_chunk_requests_go_straight_to_the_redirect_target() {
+    let _history = setup().await;
+    let data = payload(PREFETCH + 1024 * KB, 227);
+    let file = Arc::new(Mock::new(data.clone()));
+    let (redirector, url) = redirected_to(&file).await;
+    let temp = tempdir().unwrap();
+
+    let engine = DownloadEngine::new(vec![url], options(temp.path(), 4, 128 * KB));
+    let path = run(&engine, None).await.expect("download should succeed");
+
+    assert_eq!(path, temp.path().join("real.bin"));
+    assert_file(&path, &data);
+    assert!(file.stats.gets.load(Ordering::SeqCst) >= 2, "the chunks come from the redirect target");
+    assert_eq!(redirector.stats.requests.load(Ordering::SeqCst), 2, "only the probe's HEAD and GET are redirected");
+}
+
+#[tokio::test]
+async fn test_expired_redirect_target_falls_back_to_the_mirrors_own_url() {
+    let _history = setup().await;
+    let data = payload(PREFETCH + 1024 * KB, 233);
+    let mut file = Mock::new(data.clone());
+    // The target the probe was sent to expires right away; fresh redirects work.
+    file.expired = Some("t=0");
+    let file = Arc::new(file);
+    let (redirector, url) = redirected_to(&file).await;
+    let temp = tempdir().unwrap();
+
+    // Every connection finds the target expired: that must not count against the only mirror.
+    let engine = DownloadEngine::new(vec![url], options(temp.path(), 4, 128 * KB));
+    let path = run(&engine, None).await.expect("the mirror's own URL still serves the file");
+
+    assert_file(&path, &data);
+    assert!(file.stats.denied.load(Ordering::SeqCst) >= 1, "the redirect target was tried first");
+    assert!(redirector.stats.gets.load(Ordering::SeqCst) >= 1, "then the mirror's own URL, redirecting afresh");
 }
