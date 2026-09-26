@@ -159,6 +159,11 @@ const POSTPROCESS_MARK: &str = "HFPOST";
 const PATH_TEMPLATE: &str = "after_move:HFPATH %(filepath)s";
 const PATH_MARK: &str = "HFPATH ";
 
+/// Turns YouTube's formats into 10 MiB range fragments that `--concurrent-fragments` fetches in
+/// parallel; otherwise one connection pulls the 10 MiB pieces one after another. Fragments report
+/// progress against an estimated total, which the progress parser reads.
+const YOUTUBE_DASHY: [&str; 2] = ["--extractor-args", "youtube:formats=dashy"];
+
 /// Number of trailing stderr lines kept to explain a failure without an `ERROR:` line.
 const STDERR_TAIL_LINES: usize = 5;
 
@@ -630,6 +635,8 @@ fn build_ytdlp_args(
         // (the format's `http_chunk_size`), which a global chunk size would override.
         "--buffer-size",
         "16M",
+        YOUTUBE_DASHY[0],
+        YOUTUBE_DASHY[1],
     ]
     .map(String::from)
     .to_vec();
@@ -1168,6 +1175,43 @@ mod tests {
             seen,
             vec![(400, 1100), (1000, 1100), (1050, 1100), (1050, 1100), (1100, 1100), (1100, 1100)]
         );
+    }
+
+    #[test]
+    fn args_fetch_youtube_fragments_in_parallel() {
+        let url = Url::parse("https://www.youtube.com/watch?v=abc").unwrap();
+        let options = MediaDownloadOptions { output_dir: PathBuf::from("out"), concurrent_fragments: 8, ..Default::default() };
+        let args = build_ytdlp_args(&url, &options, None, None, Some("2026.08.19"));
+        let at = args.iter().position(|a| a == "--extractor-args").expect("extractor arguments");
+        assert_eq!(args[at + 1], "youtube:formats=dashy");
+        let at = args.iter().position(|a| a == "--concurrent-fragments").expect("parallel fragments");
+        assert_eq!(args[at + 1], "8");
+    }
+
+    #[test]
+    fn progress_of_parallel_fragments_is_read() {
+        // Lines of a real dashy run with -N 8 (yt-dlp 2026.08.19), shortened: fragments report no
+        // exact total, only an estimate that moves (and overshoots) as they arrive.
+        let (video, audio) = ("C:\\out\\aqz-KE-bpKQ.f396.mp4", "C:\\out\\aqz-KE-bpKQ.f251.webm");
+        let lines = [
+            format!("{PLANNED_MARK}25501018"),
+            format!("{PROGRESS_MARK}downloading 1024 NA 9626096.0 1786.04 NA {video}"),
+            format!("{PROGRESS_MARK}downloading 145408 NA 21245952.0 2786.04 NA {video}"),
+            format!("{PROGRESS_MARK}downloading 9006328 NA 27638752.0 7689306.1 2 {video}"),
+            format!("{PROGRESS_MARK}finished 15298808 15298808 NA 7689306.1 NA {video}"),
+            format!("{PROGRESS_MARK}downloading 2096128 NA 11249762.0 5049125.2 1 {audio}"),
+            format!("{PROGRESS_MARK}finished 10202210 10202210 NA 5049125.2 NA {audio}"),
+            format!("{POSTPROCESS_MARK} aqz-KE-bpKQ"),
+        ];
+        let mut state = OutputState::default();
+        let seen: Vec<(u64, u64)> =
+            lines.iter().filter_map(|l| state.handle_line(l, false)).map(|u| (u.downloaded, u.total)).collect();
+        assert_eq!(seen.len(), 7, "every progress line counts");
+        assert!(seen.windows(2).all(|w| w[0].0 <= w[1].0), "never backwards: {seen:?}");
+        assert_eq!(seen[2], (9006328, 27638752), "the estimate stands in for the unknown total");
+        assert_eq!(seen[4], (15298808 + 2096128, 15298808 + 11249762), "audio adds to the finished video");
+        assert_eq!(seen[5], (25501018, 25501018), "done once both streams are");
+        assert_eq!(seen[6], (25501018, 25501018));
     }
 
     #[test]
