@@ -39,28 +39,22 @@ pub enum MediaQualityPreset {
     Custom(String),
 }
 
+/// Keeps ffmpeg from rewriting a merged mp4 a second time just to move its index (the moov atom)
+/// to the front. yt-dlp asks for that pass on every output (`-movflags +faststart`); a later
+/// `-movflags` replaces it. Players read the index wherever it is; only a file streamed over the
+/// web while it downloads wants it in front.
+const NO_FASTSTART: [&str; 2] = ["--postprocessor-args", "Merger+ffmpeg_o:-movflags -faststart"];
+
 impl MediaQualityPreset {
     /// Convert preset to yt-dlp arguments
     pub fn to_args(&self) -> Vec<String> {
+        let mp4 = |format: &str| {
+            ["-f", format, "--merge-output-format", "mp4", NO_FASTSTART[0], NO_FASTSTART[1]].map(String::from).to_vec()
+        };
         match self {
-            Self::BestVideoAudio => vec![
-                "-f".to_string(),
-                "bv*+ba/b".to_string(),
-                "--merge-output-format".to_string(),
-                "mp4".to_string(),
-            ],
-            Self::Fhd1080p => vec![
-                "-f".to_string(),
-                "bv*[height<=1080]+ba/b[height<=1080]/best".to_string(),
-                "--merge-output-format".to_string(),
-                "mp4".to_string(),
-            ],
-            Self::Hd720p => vec![
-                "-f".to_string(),
-                "bv*[height<=720]+ba/b[height<=720]/best".to_string(),
-                "--merge-output-format".to_string(),
-                "mp4".to_string(),
-            ],
+            Self::BestVideoAudio => mp4("bv*+ba/b"),
+            Self::Fhd1080p => mp4("bv*[height<=1080]+ba/b[height<=1080]/best"),
+            Self::Hd720p => mp4("bv*[height<=720]+ba/b[height<=720]/best"),
             Self::AudioMp3 => vec![
                 "-x".to_string(),
                 "--audio-format".to_string(),
@@ -1367,6 +1361,47 @@ mod tests {
         let mp3 = MediaQualityPreset::AudioMp3;
         let mp3_args = mp3.to_args();
         assert!(mp3_args.contains(&"mp3".to_string()));
+    }
+
+    #[test]
+    fn mp4_merges_skip_the_faststart_rewrite() {
+        for preset in [MediaQualityPreset::BestVideoAudio, MediaQualityPreset::Fhd1080p, MediaQualityPreset::Hd720p] {
+            let args = preset.to_args();
+            let at = args.iter().position(|a| a == "--postprocessor-args").expect("merger arguments");
+            // yt-dlp lower-cases the key and splits the value like a shell.
+            assert_eq!(args[at + 1], "Merger+ffmpeg_o:-movflags -faststart", "{preset:?}");
+            assert_eq!(args[args.iter().position(|a| a == "--merge-output-format").unwrap() + 1], "mp4");
+        }
+        assert!(!MediaQualityPreset::AudioMp3.to_args().contains(&"--postprocessor-args".to_string()));
+    }
+
+    /// yt-dlp puts `-movflags +faststart` before the merger's own output arguments; ffmpeg must
+    /// then keep the index where it wrote it, with no second pass. Needs ffmpeg.
+    #[test]
+    fn a_later_movflags_turns_faststart_off() {
+        let Some(ffmpeg) = find_ffmpeg_path() else {
+            eprintln!("skipped: ffmpeg not found");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let clip = dir.path().join("clip.mp4");
+        let ffmpeg_run = |args: &[&str]| {
+            let out = std::process::Command::new(&ffmpeg).args(["-hide_banner", "-y"]).args(args).output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stderr).into_owned()
+        };
+        let clip_arg = clip.to_str().unwrap();
+        ffmpeg_run(&["-loglevel", "error", "-f", "lavfi", "-i", "testsrc=duration=1:size=64x48:rate=5", clip_arg]);
+        let merged = dir.path().join("merged.mp4");
+        let (_, value) = NO_FASTSTART[1].split_once(':').unwrap();
+        let mut args = vec!["-loglevel", "info", "-i", clip_arg, "-c", "copy", "-movflags", "+faststart"];
+        args.extend(value.split(' '));
+        args.push(merged.to_str().unwrap());
+        let log = ffmpeg_run(&args);
+        assert!(!log.contains("second pass"), "{log}");
+        let bytes = std::fs::read(&merged).unwrap();
+        let at = |atom: &[u8]| bytes.windows(4).position(|w| w == atom).unwrap();
+        assert!(at(b"mdat") < at(b"moov"), "the index stays after the media data");
     }
 
     #[test]
