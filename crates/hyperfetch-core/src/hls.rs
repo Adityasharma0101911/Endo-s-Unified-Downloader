@@ -1,15 +1,30 @@
-use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use parking_lot::Mutex;
-use reqwest::Client;
-use tokio::fs::File;
-use tokio::io::AsyncWriteExt;
-use tokio::sync::{broadcast, Semaphore};
+use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
+use futures_util::StreamExt;
+use reqwest::{Client, StatusCode};
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use tokio::sync::broadcast;
 use url::Url;
 use thiserror::Error;
 use crate::engine::EngineSnapshot;
+use crate::range::ByteRange;
+
+const MAX_CONNECTIONS: usize = 64;
+/// Master playlists may point at further master playlists; stop following them after this many hops.
+const MAX_MASTER_DEPTH: usize = 3;
+const MAX_ATTEMPTS: u32 = 5;
+const MAX_PLAYLIST_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_KEY_BYTES: u64 = 1024;
+const SNAPSHOT_INTERVAL: Duration = Duration::from_millis(200);
+/// Time allowed for response headers to arrive, and for any gap between body chunks.
+const STALL_TIMEOUT: Duration = if cfg!(test) { Duration::from_millis(500) } else { Duration::from_secs(30) };
+/// First retry delay; doubles on every further attempt (0.5s, 1s, 2s, 4s).
+const RETRY_BASE_DELAY: Duration = if cfg!(test) { Duration::from_millis(20) } else { Duration::from_millis(500) };
 
 #[derive(Error, Debug)]
 pub enum HlsError {
@@ -21,6 +36,29 @@ pub enum HlsError {
     InvalidPlaylist(String),
     #[error("No video segments found in playlist")]
     NoSegments,
+    /// A real HLS stream this engine cannot download correctly. Falling back to a
+    /// plain download of the playlist URL would not help either.
+    #[error("Unsupported HLS stream: {0}")]
+    Unsupported(String),
+    #[error("HLS segment {index} could not be downloaded: {reason}")]
+    SegmentFailed { index: usize, reason: String },
+    #[error("Download cancelled by user")]
+    Cancelled,
+}
+
+/// AES-128-CBC parameters for one encrypted resource (`#EXT-X-KEY:METHOD=AES-128`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Aes128Key {
+    pub key: [u8; 16],
+    pub iv: [u8; 16],
+}
+
+/// Media initialization section (`#EXT-X-MAP`), e.g. the ftyp/moov header of fMP4 streams.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InitSection {
+    pub url: Url,
+    pub byte_range: Option<ByteRange>,
+    pub encryption: Option<Aes128Key>,
 }
 
 #[derive(Debug, Clone)]
@@ -28,36 +66,191 @@ pub struct HlsSegment {
     pub index: usize,
     pub url: Url,
     pub duration_secs: f64,
-    pub byte_range: Option<crate::range::ByteRange>,
+    pub byte_range: Option<ByteRange>,
+    pub encryption: Option<Aes128Key>,
+    /// Init section that must precede this segment in the output.
+    pub init: Option<InitSection>,
 }
 
-/// Parses an HLS (.m3u8) playlist. If it is a master playlist, it automatically
-/// selects the highest bandwidth/resolution variant and fetches its media segments.
+/// File extension matching the container the segments form: fMP4 streams need an
+/// init section (`#EXT-X-MAP`), everything else is MPEG-TS.
+pub fn container_extension(segments: &[HlsSegment]) -> &'static str {
+    if segments.iter().any(|s| s.init.is_some()) { "mp4" } else { "ts" }
+}
+
+/// Parses an HLS (.m3u8) playlist. If it is a master playlist, it selects the best
+/// variant that carries audio and returns that variant's media segments, with
+/// AES-128 keys already fetched.
 pub async fn parse_hls_playlist(client: &Client, playlist_url: &Url) -> Result<Vec<HlsSegment>, HlsError> {
-    let resp = client.get(playlist_url.clone()).send().await?;
-    if !resp.status().is_success() {
-        return Err(HlsError::InvalidPlaylist(format!("HTTP status {}", resp.status())));
+    let mut url = playlist_url.clone();
+    for _ in 0..=MAX_MASTER_DEPTH {
+        let (body, final_url) = fetch_with_retry(client, &url, None, MAX_PLAYLIST_BYTES, &AtomicU64::new(0))
+            .await
+            .map_err(|reason| HlsError::InvalidPlaylist(format!("could not fetch {}: {}", url, reason)))?;
+        let text = String::from_utf8_lossy(&body);
+        let text = text.trim_start_matches('\u{feff}').trim_start();
+        if !text.starts_with("#EXTM3U") {
+            return Err(HlsError::InvalidPlaylist("Missing #EXTM3U header".to_string()));
+        }
+
+        if text.lines().any(|l| l.trim_start().starts_with("#EXT-X-STREAM-INF:")) {
+            // Relative URIs resolve against where the playlist actually came from (post-redirect).
+            url = select_variant(text, &final_url)?;
+            tracing::info!("Selected HLS variant: {}", url);
+            continue;
+        }
+        return parse_media_playlist(client, text, &final_url).await;
+    }
+    Err(HlsError::InvalidPlaylist(format!(
+        "master playlists nested more than {} levels deep",
+        MAX_MASTER_DEPTH
+    )))
+}
+
+/// Splits an attribute list (`KEY=value,KEY2="quoted,value"`) into name/value pairs.
+fn parse_attributes(list: &str) -> HashMap<&str, &str> {
+    let mut attrs = HashMap::new();
+    let mut rest = list.trim();
+    while let Some(eq) = rest.find('=') {
+        let name = rest[..eq].trim();
+        rest = &rest[eq + 1..];
+        let value = if let Some(quoted) = rest.strip_prefix('"') {
+            let end = quoted.find('"').unwrap_or(quoted.len());
+            rest = quoted.get(end + 1..).unwrap_or("");
+            &quoted[..end]
+        } else {
+            let end = rest.find(',').unwrap_or(rest.len());
+            let value = &rest[..end];
+            rest = &rest[end..];
+            value
+        };
+        rest = rest.trim_start().strip_prefix(',').unwrap_or(rest).trim_start();
+        attrs.insert(name, value.trim());
+    }
+    attrs
+}
+
+/// Parses `<length>[@<offset>]`; without an offset the range continues from `next_start`.
+fn parse_byte_range(spec: &str, next_start: u64) -> Result<ByteRange, HlsError> {
+    let invalid = || HlsError::InvalidPlaylist(format!("Invalid byte range '{}'", spec));
+    let (len, offset) = match spec.split_once('@') {
+        Some((len, offset)) => (len, Some(offset.trim().parse::<u64>().map_err(|_| invalid())?)),
+        None => (spec, None),
+    };
+    let len = len.trim().parse::<u64>().map_err(|_| invalid())?;
+    ByteRange::from_len(offset.unwrap_or(next_start), len).map_err(|_| invalid())
+}
+
+fn parse_iv(hex: &str) -> Option<[u8; 16]> {
+    let digits = hex.strip_prefix("0x").or_else(|| hex.strip_prefix("0X"))?;
+    u128::from_str_radix(digits, 16).ok().filter(|_| digits.len() == 32).map(u128::to_be_bytes)
+}
+
+const AUDIO_CODEC_PREFIXES: [&str; 8] = ["mp4a", "ac-3", "ec-3", "ac-4", "opus", "flac", "alac", "dts"];
+
+/// Picks the best variant of a master playlist. Variants whose audio is muxed in are
+/// preferred; a variant whose audio lives only in a separate `#EXT-X-MEDIA` rendition
+/// would come out silent, so that case is an error.
+fn select_variant(master: &str, base: &Url) -> Result<Url, HlsError> {
+    struct Variant<'a> {
+        bandwidth: u64,
+        pixels: u64,
+        audio_group: Option<&'a str>,
+        codecs: Option<&'a str>,
+        uri: &'a str,
     }
 
-    let text = resp.text().await?;
-    if !text.starts_with("#EXTM3U") {
-        return Err(HlsError::InvalidPlaylist("Missing #EXTM3U header".to_string()));
+    // GROUP-ID -> whether every audio rendition of the group is a separate playlist.
+    let mut audio_groups: HashMap<&str, bool> = HashMap::new();
+    let mut variants = Vec::new();
+    let mut pending = None;
+    for line in master.lines() {
+        let trimmed = line.trim();
+        if let Some(list) = trimmed.strip_prefix("#EXT-X-MEDIA:") {
+            let attrs = parse_attributes(list);
+            if attrs.get("TYPE") == Some(&"AUDIO") {
+                if let Some(group) = attrs.get("GROUP-ID") {
+                    let separate = attrs.contains_key("URI");
+                    audio_groups.entry(*group).and_modify(|s| *s &= separate).or_insert(separate);
+                }
+            }
+        } else if let Some(list) = trimmed.strip_prefix("#EXT-X-STREAM-INF:") {
+            pending = Some(parse_attributes(list));
+        } else if !trimmed.is_empty() && !trimmed.starts_with('#') {
+            if let Some(attrs) = pending.take() {
+                let pixels = attrs
+                    .get("RESOLUTION")
+                    .and_then(|r| r.split_once('x'))
+                    .and_then(|(w, h)| Some(w.parse::<u64>().ok()?.saturating_mul(h.parse().ok()?)))
+                    .unwrap_or(0);
+                variants.push(Variant {
+                    bandwidth: attrs.get("BANDWIDTH").and_then(|b| b.parse().ok()).unwrap_or(0),
+                    pixels,
+                    audio_group: attrs.get("AUDIO").copied(),
+                    codecs: attrs.get("CODECS").copied(),
+                    uri: trimmed,
+                });
+            }
+        }
     }
 
-    // Check if this is a Master Playlist with multiple quality streams
-    if text.contains("#EXT-X-STREAM-INF") {
-        let best_variant_url = parse_best_variant_url(&text, playlist_url)?;
-        tracing::info!("Selected highest quality HLS variant: {}", best_variant_url);
-        // Recursively fetch media playlist
-        return Box::pin(parse_hls_playlist(client, &best_variant_url)).await;
+    let separate_audio = |v: &Variant| v.audio_group.is_some_and(|g| audio_groups.get(g) == Some(&true));
+    let muxed_audio = |v: &Variant| {
+        !separate_audio(v)
+            && v.codecs.is_none_or(|c| {
+                c.split(',').any(|codec| AUDIO_CODEC_PREFIXES.iter().any(|p| codec.trim().starts_with(p)))
+            })
+    };
+    let rank = |v: &&Variant| (v.bandwidth, v.pixels);
+
+    let chosen = match variants.iter().filter(|v| muxed_audio(v)).max_by_key(rank) {
+        Some(v) => v.uri,
+        None if variants.iter().any(separate_audio) => {
+            return Err(HlsError::Unsupported(
+                "the audio track is delivered as a separate EXT-X-MEDIA rendition, so the video \
+                 variant alone would be silent; download this stream with the media engine \
+                 (yt-dlp + ffmpeg) instead"
+                    .to_string(),
+            ))
+        }
+        // No variant advertises audio at all: the stream is video-only by design.
+        None => variants
+            .iter()
+            .max_by_key(rank)
+            .map(|v| v.uri)
+            .ok_or_else(|| HlsError::InvalidPlaylist("No variant stream URI found".to_string()))?,
+    };
+    base.join(chosen).map_err(|e| HlsError::InvalidPlaylist(format!("Invalid variant URL '{}': {}", chosen, e)))
+}
+
+/// Key currently in force while walking a media playlist.
+struct ActiveKey {
+    key: [u8; 16],
+    iv: Option<[u8; 16]>,
+}
+
+async fn parse_media_playlist(client: &Client, text: &str, base: &Url) -> Result<Vec<HlsSegment>, HlsError> {
+    let is_vod = text.lines().map(str::trim).any(|l| l == "#EXT-X-ENDLIST" || l == "#EXT-X-PLAYLIST-TYPE:VOD");
+    if !is_vod {
+        return Err(HlsError::Unsupported(
+            "live playlist (no #EXT-X-ENDLIST): only the segments currently listed exist, so the \
+             recording would be silently truncated; use the media engine to record live streams"
+                .to_string(),
+        ));
     }
 
-    // It is a media playlist containing segments
+    let join = |uri: &str| {
+        base.join(uri).map_err(|e| HlsError::InvalidPlaylist(format!("Invalid URL '{}': {}", uri, e)))
+    };
+
     let mut segments = Vec::new();
-    let mut current_duration = 2.0;
-    let mut current_byte_range: Option<crate::range::ByteRange> = None;
-    let mut last_byte_range_end: u64 = 0;
-    let mut segment_index = 0;
+    let mut media_sequence: u64 = 0;
+    let mut duration = 2.0;
+    let mut byte_range = None;
+    let mut next_range_start = 0;
+    let mut key: Option<ActiveKey> = None;
+    let mut key_cache: HashMap<Url, [u8; 16]> = HashMap::new();
+    let mut init = None;
 
     for line in text.lines() {
         let trimmed = line.trim();
@@ -65,283 +258,537 @@ pub async fn parse_hls_playlist(client: &Client, playlist_url: &Url) -> Result<V
             continue;
         }
 
-        if trimmed.starts_with("#EXTINF:") {
-            let info = &trimmed[8..];
-            let dur_str = info.split(',').next().unwrap_or("2.0");
-            current_duration = dur_str.parse::<f64>().unwrap_or(2.0);
-        } else if trimmed.starts_with("#EXT-X-BYTERANGE:") {
-            let info = &trimmed[17..];
-            let parts: Vec<&str> = info.split('@').collect();
-            let length: u64 = parts[0].parse().unwrap_or(0);
-            if length > 0 {
-                let start = if parts.len() > 1 {
-                    parts[1].parse().unwrap_or(last_byte_range_end.saturating_add(1))
-                } else if segment_index == 0 {
-                    0
-                } else {
-                    last_byte_range_end.saturating_add(1)
-                };
-                let end = start + length - 1;
-                last_byte_range_end = end;
-                current_byte_range = crate::range::ByteRange::new(start, end).ok();
-            }
-        } else if !trimmed.starts_with('#') {
-            // This is a segment URI
-            let segment_url = playlist_url.join(trimmed).map_err(|e| {
-                HlsError::InvalidPlaylist(format!("Invalid segment URL '{}': {}", trimmed, e))
+        if let Some(info) = trimmed.strip_prefix("#EXTINF:") {
+            duration = info.split(',').next().and_then(|d| d.trim().parse().ok()).unwrap_or(2.0);
+        } else if let Some(seq) = trimmed.strip_prefix("#EXT-X-MEDIA-SEQUENCE:") {
+            media_sequence = seq.trim().parse().map_err(|_| {
+                HlsError::InvalidPlaylist(format!("Invalid media sequence '{}'", seq))
             })?;
-
-            segments.push(HlsSegment {
-                index: segment_index,
-                url: segment_url,
-                duration_secs: current_duration,
-                byte_range: current_byte_range.take(),
+        } else if let Some(spec) = trimmed.strip_prefix("#EXT-X-BYTERANGE:") {
+            let range = parse_byte_range(spec, next_range_start)?;
+            next_range_start = range.end.saturating_add(1);
+            byte_range = Some(range);
+        } else if let Some(list) = trimmed.strip_prefix("#EXT-X-KEY:") {
+            let attrs = parse_attributes(list);
+            match attrs.get("METHOD").copied() {
+                Some("NONE") => key = None,
+                Some("AES-128") => {
+                    if attrs.get("KEYFORMAT").is_some_and(|f| *f != "identity") {
+                        return Err(HlsError::Unsupported("DRM-protected stream (non-identity KEYFORMAT)".to_string()));
+                    }
+                    let uri = attrs.get("URI").ok_or_else(|| {
+                        HlsError::InvalidPlaylist("#EXT-X-KEY without URI".to_string())
+                    })?;
+                    let key_url = join(uri)?;
+                    let key_bytes = match key_cache.get(&key_url) {
+                        Some(k) => *k,
+                        None => {
+                            let k = fetch_key(client, &key_url).await?;
+                            key_cache.insert(key_url, k);
+                            k
+                        }
+                    };
+                    let iv = match attrs.get("IV") {
+                        Some(iv) => Some(parse_iv(iv).ok_or_else(|| {
+                            HlsError::InvalidPlaylist(format!("Invalid IV '{}'", iv))
+                        })?),
+                        None => None,
+                    };
+                    key = Some(ActiveKey { key: key_bytes, iv });
+                }
+                other => {
+                    return Err(HlsError::Unsupported(format!(
+                        "encryption method {} is not supported (only AES-128)",
+                        other.unwrap_or("<missing>")
+                    )))
+                }
+            }
+        } else if let Some(list) = trimmed.strip_prefix("#EXT-X-MAP:") {
+            let attrs = parse_attributes(list);
+            let uri = attrs.get("URI").ok_or_else(|| {
+                HlsError::InvalidPlaylist("#EXT-X-MAP without URI".to_string())
+            })?;
+            let encryption = match &key {
+                None => None,
+                Some(ActiveKey { key, iv: Some(iv) }) => Some(Aes128Key { key: *key, iv: *iv }),
+                Some(_) => {
+                    return Err(HlsError::InvalidPlaylist(
+                        "encrypted #EXT-X-MAP requires an explicit IV".to_string(),
+                    ))
+                }
+            };
+            init = Some(InitSection {
+                url: join(uri)?,
+                byte_range: attrs.get("BYTERANGE").map(|r| parse_byte_range(r, 0)).transpose()?,
+                encryption,
             });
-            segment_index += 1;
+        } else if !trimmed.starts_with('#') {
+            let index = segments.len();
+            let sequence = media_sequence.saturating_add(index as u64);
+            segments.push(HlsSegment {
+                index,
+                url: join(trimmed)?,
+                duration_secs: duration,
+                byte_range: byte_range.take(),
+                encryption: key.as_ref().map(|k| Aes128Key {
+                    key: k.key,
+                    iv: k.iv.unwrap_or((sequence as u128).to_be_bytes()),
+                }),
+                init: init.clone(),
+            });
         }
     }
 
     if segments.is_empty() {
         return Err(HlsError::NoSegments);
     }
-
     Ok(segments)
 }
 
-fn parse_best_variant_url(master_text: &str, base_url: &Url) -> Result<Url, HlsError> {
-    let mut best_bandwidth: u64 = 0;
-    let mut best_uri = None;
-    let mut next_line_is_uri = false;
-    let mut current_bandwidth = 0;
-
-    for line in master_text.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        if trimmed.starts_with("#EXT-X-STREAM-INF:") {
-            next_line_is_uri = true;
-            current_bandwidth = extract_bandwidth(trimmed);
-        } else if next_line_is_uri {
-            next_line_is_uri = false;
-            if current_bandwidth >= best_bandwidth || best_uri.is_none() {
-                best_bandwidth = current_bandwidth;
-                best_uri = Some(trimmed.to_string());
-            }
-        }
-    }
-
-    let uri_str = best_uri.ok_or_else(|| HlsError::InvalidPlaylist("No variant stream URI found".to_string()))?;
-    base_url.join(&uri_str).map_err(|e| HlsError::InvalidPlaylist(e.to_string()))
+async fn fetch_key(client: &Client, url: &Url) -> Result<[u8; 16], HlsError> {
+    let (bytes, _) = fetch_with_retry(client, url, None, MAX_KEY_BYTES, &AtomicU64::new(0))
+        .await
+        .map_err(|reason| HlsError::InvalidPlaylist(format!("could not fetch AES key {}: {}", url, reason)))?;
+    <[u8; 16]>::try_from(bytes.as_slice()).map_err(|_| {
+        HlsError::InvalidPlaylist(format!("AES-128 key at {} is {} bytes, expected 16", url, bytes.len()))
+    })
 }
 
-fn extract_bandwidth(line: &str) -> u64 {
-    if let Some(idx) = line.find("BANDWIDTH=") {
-        let sub = &line[idx + 10..];
-        let num_str: String = sub.chars().take_while(|c| c.is_ascii_digit()).collect();
-        return num_str.parse().unwrap_or(0);
+struct FetchError {
+    retryable: bool,
+    reason: String,
+}
+
+impl FetchError {
+    fn retryable(reason: impl ToString) -> Self {
+        Self { retryable: true, reason: reason.to_string() }
     }
-    0
+
+    fn fatal(reason: impl ToString) -> Self {
+        Self { retryable: false, reason: reason.to_string() }
+    }
+}
+
+/// One GET with header and idle timeouts. Body bytes are added to `progress` as they
+/// arrive and taken back out if the attempt fails.
+async fn fetch_once(
+    client: &Client,
+    url: &Url,
+    range: Option<ByteRange>,
+    max_bytes: u64,
+    progress: &AtomicU64,
+) -> Result<(Vec<u8>, Url), FetchError> {
+    let mut req = client.get(url.clone());
+    if let Some(r) = range {
+        req = req.header(reqwest::header::RANGE, r.to_http_header());
+    }
+    let mut resp = tokio::time::timeout(STALL_TIMEOUT, req.send())
+        .await
+        .map_err(|_| FetchError::retryable("timed out waiting for a response"))?
+        .map_err(FetchError::retryable)?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let transient = status.is_server_error()
+            || status == StatusCode::REQUEST_TIMEOUT
+            || status == StatusCode::TOO_MANY_REQUESTS;
+        return Err(FetchError { retryable: transient, reason: format!("HTTP {}", status) });
+    }
+    if let Some(r) = range {
+        if status != StatusCode::PARTIAL_CONTENT {
+            return Err(FetchError::fatal(format!(
+                "server ignored the byte range request ({}), answered HTTP {}",
+                r.to_http_header(),
+                status
+            )));
+        }
+    }
+
+    let final_url = resp.url().clone();
+    let mut body = Vec::new();
+    let result = loop {
+        match tokio::time::timeout(STALL_TIMEOUT, resp.chunk()).await {
+            Err(_) => break Err(FetchError::retryable("connection stalled")),
+            Ok(Err(e)) => break Err(FetchError::retryable(e)),
+            Ok(Ok(None)) => break Ok(()),
+            Ok(Ok(Some(chunk))) => {
+                if body.len() as u64 + chunk.len() as u64 > max_bytes {
+                    break Err(FetchError::fatal(format!("response larger than {} bytes", max_bytes)));
+                }
+                progress.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                body.extend_from_slice(&chunk);
+            }
+        }
+    };
+    let result = result.and_then(|()| match range {
+        Some(r) if body.len() as u64 != r.len() => Err(FetchError::retryable(format!(
+            "expected {} bytes for range, got {}",
+            r.len(),
+            body.len()
+        ))),
+        _ => Ok(()),
+    });
+    if let Err(e) = result {
+        progress.fetch_sub(body.len() as u64, Ordering::Relaxed);
+        return Err(e);
+    }
+    Ok((body, final_url))
+}
+
+/// `fetch_once` with exponential backoff; client errors other than 408/429 are not retried.
+async fn fetch_with_retry(
+    client: &Client,
+    url: &Url,
+    range: Option<ByteRange>,
+    max_bytes: u64,
+    progress: &AtomicU64,
+) -> Result<(Vec<u8>, Url), String> {
+    let mut delay = RETRY_BASE_DELAY;
+    let mut attempt = 1;
+    loop {
+        match fetch_once(client, url, range, max_bytes, progress).await {
+            Ok(fetched) => return Ok(fetched),
+            Err(e) if e.retryable && attempt < MAX_ATTEMPTS => {
+                tracing::warn!("HLS fetch of {} failed (attempt {}): {}; retrying", url, attempt, e.reason);
+                tokio::time::sleep(delay).await;
+                delay *= 2;
+                attempt += 1;
+            }
+            Err(e) => return Err(format!("{} (after {} attempt(s))", e.reason, attempt)),
+        }
+    }
+}
+
+async fn decrypt(data: Vec<u8>, key: &Option<Aes128Key>) -> Result<Vec<u8>, String> {
+    let Some(key) = key.clone() else { return Ok(data) };
+    tokio::task::spawn_blocking(move || {
+        let mut data = data;
+        let plain_len = cbc::Decryptor::<aes::Aes128>::new(&key.key.into(), &key.iv.into())
+            .decrypt_padded_mut::<Pkcs7>(&mut data)
+            .map_err(|_| "AES-128 decryption failed (wrong key or corrupt data)".to_string())?
+            .len();
+        data.truncate(plain_len);
+        Ok(data)
+    })
+    .await
+    .map_err(|e| format!("decryption task failed: {}", e))?
+}
+
+/// Downloads and decrypts one segment, prefixed by its init section when that changes.
+async fn fetch_segment(
+    client: &Client,
+    segment: HlsSegment,
+    with_init: bool,
+    progress: &AtomicU64,
+) -> Result<Vec<u8>, HlsError> {
+    let failed = |reason: String| HlsError::SegmentFailed { index: segment.index, reason };
+    let mut out = Vec::new();
+    if let Some(init) = segment.init.as_ref().filter(|_| with_init) {
+        let (data, _) = fetch_with_retry(client, &init.url, init.byte_range, u64::MAX, progress)
+            .await
+            .map_err(|r| failed(format!("init section {}: {}", init.url, r)))?;
+        out = decrypt(data, &init.encryption).await.map_err(|r| failed(format!("init section: {}", r)))?;
+    }
+    let (data, _) = fetch_with_retry(client, &segment.url, segment.byte_range, u64::MAX, progress)
+        .await
+        .map_err(|r| failed(format!("{}: {}", segment.url, r)))?;
+    out.extend(decrypt(data, &segment.encryption).await.map_err(failed)?);
+    Ok(out)
+}
+
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(suffix);
+    PathBuf::from(s)
+}
+
+/// Identifies a segment list across runs. Query strings are left out because CDN tokens
+/// in them change between sessions while the media stays the same.
+fn playlist_fingerprint(segments: &[HlsSegment]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for s in segments {
+        let mut url = s.url.clone();
+        url.set_query(None);
+        hasher.update(url.as_str().as_bytes());
+        if let Some(r) = s.byte_range {
+            hasher.update(r.to_http_header().as_bytes());
+        }
+        hasher.update(b"\n");
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+/// Reads `<fingerprint> <segments written> <bytes written>` from the resume file and
+/// returns where to continue, or (0, 0) when the partial file cannot be trusted.
+async fn load_resume_point(state_path: &Path, part_path: &Path, fingerprint: &str, total: usize) -> (usize, u64) {
+    let Ok(state) = tokio::fs::read_to_string(state_path).await else { return (0, 0) };
+    let mut fields = state.split_whitespace();
+    let (Some(fp), Some(count), Some(bytes)) = (fields.next(), fields.next(), fields.next()) else { return (0, 0) };
+    let (Ok(count), Ok(bytes)) = (count.parse::<usize>(), bytes.parse::<u64>()) else { return (0, 0) };
+    let part_len = tokio::fs::metadata(part_path).await.map(|m| m.len()).unwrap_or(0);
+    if fp == fingerprint && count <= total && bytes <= part_len {
+        (count, bytes)
+    } else {
+        (0, 0)
+    }
 }
 
 /// High-speed parallel HLS segment downloader and in-order stream stitcher.
 pub struct HlsEngine;
 
 impl HlsEngine {
+    /// Downloads `segments` with at most `num_connections` requests in flight and writes
+    /// them in order to `<output_path>.part`, renamed to `output_path` once complete.
+    /// A failed or cancelled run keeps the `.part` file and resumes from it next time.
     pub async fn download(
         client: &Client,
         segments: Vec<HlsSegment>,
         output_path: &Path,
         num_connections: usize,
         snapshot_tx: Option<broadcast::Sender<EngineSnapshot>>,
-        cancel_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+        cancel_flag: Option<Arc<AtomicBool>>,
     ) -> Result<PathBuf, HlsError> {
+        let num_connections = num_connections.clamp(1, MAX_CONNECTIONS);
         let total_segments = segments.len();
+        if total_segments == 0 {
+            return Err(HlsError::NoSegments);
+        }
+        let is_cancelled = || cancel_flag.as_ref().is_some_and(|c| c.load(Ordering::Relaxed));
+
         let target_file = if output_path.extension().is_none() {
-            output_path.with_extension("mp4")
+            output_path.with_extension(container_extension(&segments))
         } else {
             output_path.to_path_buf()
         };
-
         if let Some(parent) = target_file.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
+        let part_path = with_suffix(&target_file, ".part");
+        let state_path = with_suffix(&part_path, ".hlsstate");
 
-        let mut out_file = File::create(&target_file).await?;
+        let fingerprint = playlist_fingerprint(&segments);
+        let (resume_from, mut written_bytes) =
+            load_resume_point(&state_path, &part_path, &fingerprint, total_segments).await;
+        let mut out_file = tokio::fs::OpenOptions::new().create(true).write(true).truncate(false).open(&part_path).await?;
+        out_file.set_len(written_bytes).await?;
+        out_file.seek(SeekFrom::End(0)).await?;
 
         tracing::info!(
-            "Starting HLS parallel ingestion: {} segments across {} streams -> {}",
+            "Starting HLS ingestion: {} segments ({} already done) across {} streams -> {}",
             total_segments,
+            resume_from,
             num_connections,
             target_file.display()
         );
 
-        let semaphore = Arc::new(Semaphore::new(num_connections.max(1).min(64)));
-        let completed_buffer = Arc::new(Mutex::new(BTreeMap::<usize, Vec<u8>>::new()));
-        let total_bytes_downloaded = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // An init section is written before the first segment that uses it and again whenever it changes.
+        let with_init: Vec<bool> = (0..total_segments)
+            .map(|i| segments[i].init.is_some() && (i == 0 || segments[i - 1].init != segments[i].init))
+            .collect();
+        let received = AtomicU64::new(written_bytes);
+        // `buffered` keeps at most `num_connections` fetches in flight and yields them in order,
+        // so no more than that many segments are ever held in memory. Dropping it aborts them.
+        let mut pipeline = futures_util::stream::iter(
+            segments
+                .into_iter()
+                .zip(with_init)
+                .skip(resume_from)
+                .map(|(segment, with_init)| fetch_segment(client, segment, with_init, &received)),
+        )
+        .buffered(num_connections);
 
-        let (notify_tx, mut notify_rx) = tokio::sync::mpsc::channel::<usize>(total_segments);
-
-        // Spawn worker download tasks
-        for segment in segments {
-            let sem = Arc::clone(&semaphore);
-            let client = client.clone();
-            let buf = Arc::clone(&completed_buffer);
-            let bytes_counter = Arc::clone(&total_bytes_downloaded);
-            let tx = notify_tx.clone();
-            let cancel = cancel_flag.clone();
-
-            tokio::spawn(async move {
-                let _permit = sem.acquire().await.unwrap();
-
-                // Retry loop for transient network glitches
-                for _attempt in 0..3 {
-                    if let Some(ref c) = cancel {
-                        if c.load(std::sync::atomic::Ordering::Relaxed) {
-                            let _ = tx.send(segment.index).await;
-                            return;
-                        }
-                    }
-
-                    let mut req = client.get(segment.url.clone());
-                    if let Some(ref r) = segment.byte_range {
-                        req = req.header(reqwest::header::RANGE, r.to_http_header());
-                    }
-
-                    if let Ok(resp) = req.send().await {
-                        if resp.status().is_success() {
-                            if let Ok(bytes) = resp.bytes().await {
-                                let len = bytes.len() as u64;
-                                bytes_counter.fetch_add(len, std::sync::atomic::Ordering::Relaxed);
-                                buf.lock().insert(segment.index, bytes.to_vec());
-                                let _ = tx.send(segment.index).await;
-                                return;
-                            }
-                        }
-                    }
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                }
-
-                // If all retries fail, insert empty segment to maintain ordering
-                buf.lock().insert(segment.index, Vec::new());
-                let _ = tx.send(segment.index).await;
-            });
-        }
-
-        // Drop the master sender so notify_rx will terminate if all workers fail
-        drop(notify_tx);
-
-        // In-order streaming file writer
-        let mut next_index = 0;
+        let mut written = resume_from;
         let start_time = Instant::now();
-        let mut last_snapshot = Instant::now();
-
-        while next_index < total_segments {
-            if let Some(ref c) = cancel_flag {
-                if c.load(std::sync::atomic::Ordering::Relaxed) {
-                    return Err(HlsError::InvalidPlaylist("Download cancelled by user".to_string()));
-                }
-            }
-
-            // Check if next segment is ready in memory
-            let segment_data = {
-                let mut guard = completed_buffer.lock();
-                guard.remove(&next_index)
-            };
-
-            if let Some(data) = segment_data {
-                if !data.is_empty() {
-                    out_file.write_all(&data).await?;
-                }
-                next_index += 1;
-
-                // Broadcast progress
-                let now = Instant::now();
-                if now.duration_since(last_snapshot) >= Duration::from_millis(150) {
-                    let total_bytes = total_bytes_downloaded.load(std::sync::atomic::Ordering::Relaxed);
-                    let est_total_bytes = (total_bytes * total_segments as u64) / (next_index as u64).max(1);
-                    let elapsed = now.duration_since(start_time).as_secs_f64();
-                    let speed = if elapsed > 0.0 { total_bytes as f64 / elapsed } else { 0.0 };
-                    let mut chunks = Vec::new();
-                    let display_count = total_segments.min(64);
-                    for i in 0..display_count {
-                        let seg_start_idx = (i * total_segments) / display_count;
-                        let seg_end_idx = ((i + 1) * total_segments) / display_count;
-                        let status = if seg_end_idx <= next_index {
-                            "Completed".to_string()
-                        } else if seg_start_idx <= next_index + num_connections {
-                            "Downloading".to_string()
-                        } else {
-                            "Pending".to_string()
-                        };
-
-                        let range_start = if total_segments > 0 {
-                            (seg_start_idx as u64 * est_total_bytes) / total_segments as u64
-                        } else {
-                            0
-                        };
-                        let range_end = if total_segments > 0 {
-                            (seg_end_idx as u64 * est_total_bytes) / total_segments as u64
-                        } else {
-                            1
-                        };
-                        let chunk_total = range_end.saturating_sub(range_start).max(1);
-                        let downloaded = if seg_end_idx <= next_index {
-                            chunk_total
-                        } else {
-                            0
-                        };
-
-                        chunks.push(crate::chunk::ChunkSnapshot {
-                            id: i,
-                            range_start,
-                            range_end,
-                            downloaded_bytes: downloaded,
-                            total_bytes: chunk_total,
-                            status,
-                            worker_id: Some(i % num_connections),
-                        });
+        let start_bytes = written_bytes;
+        let mut ticker = tokio::time::interval(SNAPSHOT_INTERVAL);
+        loop {
+            tokio::select! {
+                next = pipeline.next() => match next {
+                    None => break,
+                    Some(data) => {
+                        let data = data?;
+                        out_file.write_all(&data).await?;
+                        out_file.flush().await?;
+                        written += 1;
+                        written_bytes += data.len() as u64;
+                        tokio::fs::write(&state_path, format!("{} {} {}", fingerprint, written, written_bytes)).await?;
                     }
-
-                    let snapshot = EngineSnapshot {
-                        total_bytes: est_total_bytes,
-                        downloaded_bytes: total_bytes,
-                        speed_bytes_per_sec: speed,
-                        progress_ratio: next_index as f64 / total_segments as f64,
-                        active_workers: num_connections,
-                        mirror_speeds: Vec::new(),
-                        chunks,
-                        target_path: Some(target_file.clone()),
-                    };
-
-                    if let Some(ref tx) = snapshot_tx {
-                        let _ = tx.send(snapshot);
+                },
+                _ = ticker.tick() => {
+                    if is_cancelled() {
+                        return Err(HlsError::Cancelled);
                     }
-                    last_snapshot = now;
-                }
-            } else {
-                // Wait for notification from worker
-                if notify_rx.recv().await.is_none() {
-                    return Err(HlsError::InvalidPlaylist(format!(
-                        "HLS download aborted: worker tasks terminated before segment {} arrived",
-                        next_index
-                    )));
+                    if let Some(tx) = &snapshot_tx {
+                        let _ = tx.send(progress_snapshot(
+                            written,
+                            written_bytes,
+                            received.load(Ordering::Relaxed),
+                            total_segments,
+                            num_connections,
+                            (received.load(Ordering::Relaxed).saturating_sub(start_bytes)) as f64
+                                / start_time.elapsed().as_secs_f64().max(0.001),
+                            &target_file,
+                        ));
+                    }
                 }
             }
         }
+        drop(pipeline);
 
-        out_file.flush().await?;
         out_file.sync_all().await?;
+        drop(out_file);
+        tokio::fs::rename(&part_path, &target_file).await?;
+        let _ = tokio::fs::remove_file(&state_path).await;
 
+        if let Some(tx) = &snapshot_tx {
+            let _ = tx.send(progress_snapshot(
+                total_segments,
+                written_bytes,
+                written_bytes,
+                total_segments,
+                num_connections,
+                0.0,
+                &target_file,
+            ));
+        }
         tracing::info!("HLS download and stitching completed: {}", target_file.display());
         Ok(target_file)
+    }
+}
+
+/// Builds a progress snapshot, shown as up to 64 blocks of segments. The total size
+/// is extrapolated from the average size of the segments already written.
+fn progress_snapshot(
+    written: usize,
+    written_bytes: u64,
+    received_bytes: u64,
+    total_segments: usize,
+    num_connections: usize,
+    speed_bytes_per_sec: f64,
+    target: &Path,
+) -> EngineSnapshot {
+    let est_total_bytes = if written > 0 {
+        (written_bytes as u128 * total_segments as u128 / written as u128) as u64
+    } else {
+        0
+    }
+    .max(received_bytes);
+    let total = total_segments.max(1);
+    let display_count = total.min(64);
+    let chunks = (0..display_count)
+        .map(|i| {
+            let seg_start = i * total / display_count;
+            let seg_end = (i + 1) * total / display_count;
+            let status = if seg_end <= written {
+                "Completed"
+            } else if seg_start < written + num_connections {
+                "Downloading"
+            } else {
+                "Pending"
+            };
+            let range_start = (seg_start as u128 * est_total_bytes as u128 / total as u128) as u64;
+            let range_end = (seg_end as u128 * est_total_bytes as u128 / total as u128) as u64;
+            let chunk_total = range_end.saturating_sub(range_start).max(1);
+            crate::chunk::ChunkSnapshot {
+                id: i,
+                range_start,
+                range_end,
+                downloaded_bytes: if seg_end <= written { chunk_total } else { 0 },
+                total_bytes: chunk_total,
+                status: status.to_string(),
+                worker_id: Some(i % num_connections.max(1)),
+            }
+        })
+        .collect();
+
+    EngineSnapshot {
+        total_bytes: est_total_bytes,
+        downloaded_bytes: received_bytes,
+        speed_bytes_per_sec,
+        progress_ratio: written as f64 / total as f64,
+        active_workers: num_connections,
+        mirror_speeds: Vec::new(),
+        chunks,
+        target_path: Some(target.to_path_buf()),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aes::cipher::BlockEncryptMut;
+    use parking_lot::Mutex;
+    use std::net::SocketAddr;
+    use tokio::io::AsyncReadExt;
+
+    /// Response of the mock server: status, extra header lines, body.
+    /// Status 0 means "never answer" (a stalled connection).
+    type Reply = (u16, String, Vec<u8>);
+
+    /// Minimal HTTP/1.1 server that also counts requests per path.
+    async fn serve(
+        handler: impl Fn(&str, Option<ByteRange>) -> Reply + Send + Sync + 'static,
+    ) -> (SocketAddr, Arc<Mutex<HashMap<String, usize>>>) {
+        let handler = Arc::new(handler);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(Mutex::new(HashMap::new()));
+        let hits_srv = Arc::clone(&hits);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let handler = Arc::clone(&handler);
+                let hits = Arc::clone(&hits_srv);
+                tokio::spawn(async move {
+                    let mut req = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => req.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let req = String::from_utf8_lossy(&req).to_string();
+                    let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
+                    let range = req.lines().find_map(|l| {
+                        let (name, value) = l.split_once(':')?;
+                        let (start, end) = name.eq_ignore_ascii_case("range").then_some(())
+                            .and(value.trim().strip_prefix("bytes="))?
+                            .split_once('-')?;
+                        ByteRange::new(start.parse().ok()?, end.parse().ok()?).ok()
+                    });
+                    *hits.lock().entry(path.clone()).or_insert(0) += 1;
+                    let (status, headers, body) = handler(&path, range);
+                    if status == 0 {
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                        return;
+                    }
+                    let head = format!(
+                        "HTTP/1.1 {} X\r\nContent-Length: {}\r\nConnection: close\r\n{}\r\n",
+                        status,
+                        body.len(),
+                        headers
+                    );
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let _ = socket.write_all(&body).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        (addr, hits)
+    }
+
+    fn ok(body: impl Into<Vec<u8>>) -> Reply {
+        (200, String::new(), body.into())
+    }
+
+    fn encrypt(plain: &[u8], key: [u8; 16], iv: [u8; 16]) -> Vec<u8> {
+        let mut buf = plain.to_vec();
+        buf.resize(plain.len() + 16 - plain.len() % 16, 0);
+        cbc::Encryptor::<aes::Aes128>::new(&key.into(), &iv.into())
+            .encrypt_padded_mut::<Pkcs7>(&mut buf, plain.len())
+            .unwrap()
+            .to_vec()
+    }
 
     #[test]
     fn test_parse_best_variant() {
@@ -354,46 +801,234 @@ mod tests {
 1080p.m3u8
 "#;
         let base = Url::parse("https://cdn.example.com/hls/master.m3u8").unwrap();
-        let best = parse_best_variant_url(master, &base).unwrap();
+        let best = select_variant(master, &base).unwrap();
         assert_eq!(best, Url::parse("https://cdn.example.com/hls/1080p.m3u8").unwrap());
+    }
+
+    #[test]
+    fn test_variant_attributes_and_audio_preference() {
+        // AVERAGE-BANDWIDTH must not be mistaken for BANDWIDTH, and quoted CODECS contain commas.
+        let master = r#"#EXTM3U
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="en",URI="audio/en.m3u8"
+#EXT-X-STREAM-INF:AVERAGE-BANDWIDTH=9000000,BANDWIDTH=1000000,CODECS="avc1.4d401f,mp4a.40.2"
+low.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=2000000,CODECS="avc1.4d401f,mp4a.40.2"
+mid.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=8000000,CODECS="avc1.640028,mp4a.40.2",AUDIO="aud"
+high-silent.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=9000000,CODECS="avc1.640028"
+video-only.m3u8
+"#;
+        let base = Url::parse("https://cdn.example.com/hls/master.m3u8").unwrap();
+        assert_eq!(select_variant(master, &base).unwrap().as_str(), "https://cdn.example.com/hls/mid.m3u8");
+
+        let demuxed = r#"#EXTM3U
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="en",URI="audio/en.m3u8"
+#EXT-X-STREAM-INF:BANDWIDTH=8000000,CODECS="avc1.640028,mp4a.40.2",AUDIO="aud"
+video.m3u8
+"#;
+        assert!(matches!(select_variant(demuxed, &base), Err(HlsError::Unsupported(_))));
+
+        // An audio group whose rendition has no URI means the audio is muxed into the variant.
+        let muxed_group = r#"#EXTM3U
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="en",DEFAULT=YES
+#EXT-X-STREAM-INF:BANDWIDTH=8000000,AUDIO="aud"
+video.m3u8
+"#;
+        assert_eq!(select_variant(muxed_group, &base).unwrap().as_str(), "https://cdn.example.com/hls/video.m3u8");
+    }
+
+    #[test]
+    fn test_parse_iv_and_attributes() {
+        assert_eq!(parse_iv("0x00000000000000000000000000000001").unwrap()[15], 1);
+        assert!(parse_iv("0x01").is_none());
+        let attrs = parse_attributes(r#"METHOD=AES-128,URI="k.bin?a=1,b=2",IV=0x0A"#);
+        assert_eq!(attrs["URI"], "k.bin?a=1,b=2");
+        assert_eq!(attrs["IV"], "0x0A");
     }
 
     #[tokio::test]
     async fn test_parse_byterange_playlist() {
-        // Test parsing with byte ranges
-        let playlist = r#"#EXTM3U
-#EXT-X-VERSION:4
-#EXT-X-TARGETDURATION:10
-#EXTINF:10.0,
-#EXT-X-BYTERANGE:1000@0
-media.ts
-#EXTINF:10.0,
-#EXT-X-BYTERANGE:2000
-media.ts
-"#;
-        let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = server.local_addr().unwrap();
-        let body = playlist.to_string();
+        let playlist = "#EXTM3U\n#EXT-X-VERSION:4\n#EXT-X-TARGETDURATION:10\n#EXTINF:10.0,\n#EXT-X-BYTERANGE:1000@0\nmedia.ts\n#EXTINF:10.0,\n#EXT-X-BYTERANGE:2000\nmedia.ts\n#EXT-X-ENDLIST\n";
+        let (addr, _) = serve(move |_, _| ok(playlist)).await;
+        let url = Url::parse(&format!("http://{}/playlist.m3u8", addr)).unwrap();
+        let segments = parse_hls_playlist(&Client::new(), &url).await.unwrap();
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].byte_range, Some(ByteRange::new(0, 999).unwrap()));
+        assert_eq!(segments[1].byte_range, Some(ByteRange::new(1000, 2999).unwrap()));
+    }
 
-        tokio::spawn(async move {
-            if let Ok((mut socket, _)) = server.accept().await {
-                let mut buf = vec![0u8; 1024];
-                let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut buf).await;
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, resp.as_bytes()).await;
-                let _ = tokio::io::AsyncWriteExt::shutdown(&mut socket).await;
-            }
-        });
+    #[tokio::test]
+    async fn test_live_playlist_rejected_and_bom_redirect_handled() {
+        let (addr, _) = serve(|path: &str, _| match path {
+            "/live.m3u8" => ok("#EXTM3U\n#EXTINF:4,\nlive0.ts\n"),
+            "/start/master.m3u8" => (302, "Location: /cdn/abc/master.m3u8\r\n".to_string(), Vec::new()),
+            "/cdn/abc/master.m3u8" => ok("\u{feff}  \n#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nv/media.m3u8\n"),
+            "/cdn/abc/v/media.m3u8" => ok("#EXTM3U\n#EXTINF:4,\nseg0.ts\n#EXT-X-ENDLIST\n"),
+            _ => (404, String::new(), Vec::new()),
+        })
+        .await;
+        let client = Client::new();
+        let live = Url::parse(&format!("http://{}/live.m3u8", addr)).unwrap();
+        assert!(matches!(parse_hls_playlist(&client, &live).await, Err(HlsError::Unsupported(_))));
+
+        let start = Url::parse(&format!("http://{}/start/master.m3u8", addr)).unwrap();
+        let segments = parse_hls_playlist(&client, &start).await.unwrap();
+        assert_eq!(segments[0].url.path(), "/cdn/abc/v/seg0.ts");
+    }
+
+    #[tokio::test]
+    async fn test_master_recursion_is_depth_limited() {
+        let (addr, hits) = serve(|_, _| ok("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nself.m3u8\n")).await;
+        let url = Url::parse(&format!("http://{}/self.m3u8", addr)).unwrap();
+        assert!(matches!(parse_hls_playlist(&Client::new(), &url).await, Err(HlsError::InvalidPlaylist(_))));
+        assert_eq!(hits.lock()["/self.m3u8"], MAX_MASTER_DEPTH + 1);
+    }
+
+    #[tokio::test]
+    async fn test_download_aes128_with_init_map() {
+        let key = [7u8; 16];
+        let explicit_iv = [9u8; 16];
+        let init = b"INIT-SECTION".to_vec();
+        let seg0 = b"segment zero plaintext".to_vec();
+        let seg1 = b"segment one, a little longer than one block".to_vec();
+        let seg2 = b"segment two".to_vec();
+        // Segments 0 and 1 use the media sequence number (5, 6) as IV, segment 2 an explicit IV.
+        let enc0 = encrypt(&seg0, key, 5u128.to_be_bytes());
+        let enc1 = encrypt(&seg1, key, 6u128.to_be_bytes());
+        let enc2 = encrypt(&seg2, key, explicit_iv);
+        let media = "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:5\n#EXT-X-MAP:URI=\"init.mp4\"\n\
+            #EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\n#EXTINF:4,\ns0.m4s\n#EXTINF:4,\ns1.m4s\n\
+            #EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\",IV=0x09090909090909090909090909090909\n#EXTINF:4,\ns2.m4s\n#EXT-X-ENDLIST\n";
+        let flaky_calls = Arc::new(AtomicU64::new(0));
+        let flaky = Arc::clone(&flaky_calls);
+        let init_c = init.clone();
+        let (addr, hits) = serve(move |path: &str, _| match path {
+            "/master.m3u8" => ok("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1,CODECS=\"avc1.64001f,mp4a.40.2\"\nmedia.m3u8\n"),
+            "/media.m3u8" => ok(media),
+            "/key.bin" => ok(key.to_vec()),
+            "/init.mp4" => ok(init_c.clone()),
+            "/s0.m4s" => ok(enc0.clone()),
+            // First request stalls (idle timeout), second is a 503, third succeeds.
+            "/s1.m4s" => match flaky.fetch_add(1, Ordering::SeqCst) {
+                0 => (0, String::new(), Vec::new()),
+                1 => (503, String::new(), Vec::new()),
+                _ => ok(enc1.clone()),
+            },
+            "/s2.m4s" => ok(enc2.clone()),
+            _ => (404, String::new(), Vec::new()),
+        })
+        .await;
 
         let client = Client::new();
-        let url = Url::parse(&format!("http://{}/playlist.m3u8", addr)).unwrap();
+        let url = Url::parse(&format!("http://{}/master.m3u8", addr)).unwrap();
         let segments = parse_hls_playlist(&client, &url).await.unwrap();
-        assert_eq!(segments.len(), 2);
-        assert_eq!(segments[0].byte_range, Some(crate::range::ByteRange::new(0, 999).unwrap()));
-        assert_eq!(segments[1].byte_range, Some(crate::range::ByteRange::new(1000, 2999).unwrap()));
+        assert_eq!(container_extension(&segments), "mp4");
+
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("video.mp4");
+        let (tx, mut rx) = broadcast::channel(256);
+        // num_connections == 0 must be treated as 1, not panic.
+        let path = HlsEngine::download(&client, segments, &out, 0, Some(tx), None).await.unwrap();
+
+        let expected = [init, seg0, seg1, seg2].concat();
+        assert_eq!(path, out);
+        assert_eq!(std::fs::read(&out).unwrap(), expected);
+        assert!(!with_suffix(&out, ".part").exists());
+        assert!(!with_suffix(&out, ".part.hlsstate").exists());
+        let hits = hits.lock();
+        assert_eq!(hits["/key.bin"], 1, "the key must be fetched once");
+        assert_eq!(hits["/init.mp4"], 1, "an unchanged init section is written once");
+        assert_eq!(hits["/s1.m4s"], 3);
+
+        let mut last = None;
+        while let Ok(s) = rx.try_recv() {
+            assert!(s.progress_ratio <= 1.0);
+            last = Some(s);
+        }
+        let last = last.unwrap();
+        assert_eq!(last.progress_ratio, 1.0);
+        assert_eq!(last.downloaded_bytes, expected.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn test_failed_segment_fails_download_then_resumes() {
+        let broken = Arc::new(AtomicBool::new(true));
+        let broken_srv = Arc::clone(&broken);
+        let (addr, hits) = serve(move |path: &str, _| match path {
+            "/media.m3u8" => ok("#EXTM3U\n#EXTINF:4,\na.ts\n#EXTINF:4,\nb.ts\n#EXTINF:4,\nc.ts\n#EXT-X-ENDLIST\n"),
+            "/a.ts" => ok("AAAA"),
+            "/b.ts" if broken_srv.load(Ordering::SeqCst) => (404, String::new(), Vec::new()),
+            "/b.ts" => ok("BBBB"),
+            "/c.ts" => ok("CCCC"),
+            _ => (404, String::new(), Vec::new()),
+        })
+        .await;
+        let client = Client::new();
+        let url = Url::parse(&format!("http://{}/media.m3u8", addr)).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("clip.ts");
+        std::fs::write(&out, "previous download").unwrap();
+
+        let segments = parse_hls_playlist(&client, &url).await.unwrap();
+        let err = HlsEngine::download(&client, segments, &out, 1, None, None).await.unwrap_err();
+        assert!(matches!(err, HlsError::SegmentFailed { index: 1, .. }), "{err}");
+        assert_eq!(std::fs::read(&out).unwrap(), b"previous download", "a failed run must not touch the final name");
+        assert_eq!(hits.lock()["/b.ts"], 1, "404 is not retried");
+        assert_eq!(std::fs::read(with_suffix(&out, ".part")).unwrap(), b"AAAA");
+
+        broken.store(false, Ordering::SeqCst);
+        let segments = parse_hls_playlist(&client, &url).await.unwrap();
+        HlsEngine::download(&client, segments, &out, 4, None, None).await.unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"AAAABBBBCCCC");
+        assert_eq!(hits.lock()["/a.ts"], 1, "segments already written are not fetched again");
+    }
+
+    #[tokio::test]
+    async fn test_ranged_segment_rejects_full_body() {
+        let (addr, _) = serve(|path: &str, range: Option<ByteRange>| match (path, range) {
+            ("/media.m3u8", _) => ok("#EXTM3U\n#EXTINF:4,\n#EXT-X-BYTERANGE:4@0\nall.ts\n#EXT-X-ENDLIST\n"),
+            ("/honest.ts", Some(r)) => (206, String::new(), b"0123456789"[r.start as usize..=r.end as usize].to_vec()),
+            ("/all.ts", _) => ok("0123456789"),
+            _ => (404, String::new(), Vec::new()),
+        })
+        .await;
+        let client = Client::new();
+        let url = Url::parse(&format!("http://{}/media.m3u8", addr)).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let segments = parse_hls_playlist(&client, &url).await.unwrap();
+        let err = HlsEngine::download(&client, segments.clone(), &dir.path().join("a.ts"), 2, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("ignored the byte range"), "{err}");
+
+        let mut honest = segments;
+        honest[0].url.set_path("/honest.ts");
+        let path = HlsEngine::download(&client, honest, &dir.path().join("b.ts"), 2, None, None).await.unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"0123");
+    }
+
+    #[tokio::test]
+    async fn test_cancel_is_prompt_while_segment_stalls() {
+        let (addr, _) = serve(|path: &str, _| match path {
+            "/media.m3u8" => ok("#EXTM3U\n#EXTINF:4,\nstall.ts\n#EXT-X-ENDLIST\n"),
+            _ => (0, String::new(), Vec::new()),
+        })
+        .await;
+        let client = Client::new();
+        let url = Url::parse(&format!("http://{}/media.m3u8", addr)).unwrap();
+        let segments = parse_hls_playlist(&client, &url).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let setter = Arc::clone(&cancel);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            setter.store(true, Ordering::SeqCst);
+        });
+        let started = Instant::now();
+        let result = HlsEngine::download(&client, segments, &dir.path().join("x.ts"), 2, None, Some(cancel)).await;
+        assert!(matches!(result, Err(HlsError::Cancelled)));
+        // Well under the stall timeout: the cancel must not wait for the fetch to give up.
+        assert!(started.elapsed() < STALL_TIMEOUT);
     }
 }
