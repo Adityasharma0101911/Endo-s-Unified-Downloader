@@ -638,6 +638,7 @@ impl DownloadEngine {
             limiter: self.limiter(),
             file_size: size,
             min_steal: min_steal(&self.options),
+            host_limit: self.options.max_connections_per_host,
             stall_timeout: self.stall_timeout(),
             body_idle: self.stall_timeout().min(BODY_IDLE),
         };
