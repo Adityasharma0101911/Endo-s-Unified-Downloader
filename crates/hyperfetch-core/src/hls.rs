@@ -61,8 +61,7 @@ const MAX_SEGMENTS: usize = if cfg!(test) { 1000 } else { 1_000_000 };
 const SNAPSHOT_INTERVAL: Duration = Duration::from_millis(200);
 /// First retry delay; doubles on every further attempt (0.5s, 1s, 2s, 4s, 8s, 8s, ...).
 const RETRY_BASE_DELAY: Duration = if cfg!(test) { Duration::from_millis(20) } else { Duration::from_millis(500) };
-/// Longest pause between two attempts: the pauses of the default 8 retries add up to about 40 s,
-/// well inside the time the engine allows for fetching the playlist and its keys.
+/// Longest pause between two attempts; the pauses of the default 8 retries add up to about 40 s.
 const RETRY_MAX_DELAY: Duration = Duration::from_secs(8);
 
 /// Patience of every HLS request (playlists, keys, segments), from the user's settings.
@@ -72,6 +71,15 @@ pub struct FetchPolicy {
     pub stall_timeout: Duration,
     /// Failed attempts allowed per request before it gives up.
     pub max_retries: u32,
+}
+
+impl FetchPolicy {
+    /// About the longest a request that never gets an answer takes to give up: every attempt waits
+    /// out the stall timeout, with at most [`RETRY_MAX_DELAY`] before each retry.
+    pub fn give_up_after(&self) -> Duration {
+        let attempts = self.max_retries.saturating_add(1);
+        self.stall_timeout.saturating_mul(attempts).saturating_add(RETRY_MAX_DELAY.saturating_mul(self.max_retries))
+    }
 }
 
 /// How [`HlsEngine::download`] fetches and stores a stream.
@@ -2837,6 +2845,24 @@ video.m3u8
             // Segments 0-5 and 6-7 are each tried together once, then one at a time.
             assert_eq!(hits.lock()[&format!("/{name}.mp4")], 2 + 8, "{name}");
         }
+    }
+
+    #[tokio::test]
+    async fn test_a_request_that_never_gets_an_answer_gives_up_in_time() {
+        let (addr, _) = serve(|_, _| (0, String::new(), Vec::new())).await;
+        let url = Url::parse(&format!("http://{addr}/stalled.m3u8")).unwrap();
+        let fetch = FetchPolicy { stall_timeout: Duration::from_millis(300), max_retries: 2 };
+        let started = Instant::now();
+        assert!(parse_hls_playlist(&Client::new(), &url, None, fetch).await.is_err());
+        let (took, bound) = (started.elapsed(), fetch.give_up_after());
+        assert!(took >= fetch.stall_timeout * 3 && took <= bound, "{took:?} of at most {bound:?}");
+
+        // The default policy needs more than the two minutes the engine used to allow for the
+        // playlist and its keys, and no policy overflows.
+        let default = FetchPolicy { stall_timeout: Duration::from_secs(30), max_retries: 8 };
+        assert_eq!(default.give_up_after(), Duration::from_secs(9 * 30 + 8 * 8));
+        let endless = FetchPolicy { stall_timeout: Duration::MAX, max_retries: u32::MAX };
+        assert_eq!(endless.give_up_after(), Duration::MAX);
     }
 
     #[tokio::test]
