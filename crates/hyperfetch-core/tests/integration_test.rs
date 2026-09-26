@@ -1711,3 +1711,26 @@ async fn test_downloads_to_one_host_share_its_connection_budget() {
     let most = mock.stats.max_serving.load(Ordering::SeqCst);
     assert_eq!(most, 4, "two downloads of 8 connections each share the host's 4");
 }
+
+#[tokio::test]
+async fn test_probes_take_their_hosts_budget_slots() {
+    let _history = setup().await;
+    let data = payload(64 * KB, 251);
+    let mut mock = Mock::new(data.clone());
+    mock.etag = Some("\"s1\"");
+    let mock = Arc::new(mock);
+    let url = serve(Arc::clone(&mock), "slots.bin").await;
+    let temp = tempdir().unwrap();
+    let out = temp.path().join("slots.bin");
+
+    // One request to the host at a time: HEAD waits for the slot the ranged GET holds, and that
+    // GET's answer has everything HEAD could add.
+    let opts = DownloadOptions { max_connections_per_host: 1, ..options(&out, 4, 64 * KB) };
+    let engine = DownloadEngine::new(vec![url], opts);
+    run(&engine, None).await.expect("download should succeed");
+
+    assert_file(&out, &data);
+    let s = &mock.stats;
+    assert_eq!(s.max_open.load(Ordering::SeqCst), 1, "HEAD and GET were in flight together");
+    assert_eq!(s.requests.load(Ordering::SeqCst), 1, "HEAD never got a slot, and was not needed");
+}
