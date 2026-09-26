@@ -19,6 +19,7 @@ use url::Url;
 
 use crate::chunk::{ChunkManager, ChunkSnapshot};
 use crate::history::{DownloadHistoryManager, HistoryEntry, HistoryStatus};
+use crate::hls::HlsError;
 use crate::mirror::MirrorRacer;
 use crate::range::ByteRange;
 use crate::state::DownloadState;
@@ -149,7 +150,15 @@ impl DownloadEngine {
                 .await?;
             match parsed {
                 Ok(segments) => {
-                    let out_path = free_path(&self.hls_output_path(playlist));
+                    // Same name as last time when its `.part` is this stream, so a retry resumes.
+                    let base = self.hls_output_path(playlist, &segments);
+                    let out_path = (0..)
+                        .map(|n| numbered(&base, n))
+                        .find(|c| {
+                            !c.exists()
+                                && (!part_path(c).exists() || crate::hls::has_resumable_part(c, &segments))
+                        })
+                        .unwrap_or(base);
                     return crate::hls::HlsEngine::download(
                         &client,
                         segments,
@@ -161,7 +170,12 @@ impl DownloadEngine {
                     .await
                     .map_err(|e| e.to_string());
                 }
-                Err(e) => tracing::warn!("HLS playlist parsing failed, falling back to direct download: {}", e),
+                // Not a usable playlist after all: try it as a plain file.
+                Err(e @ (HlsError::InvalidPlaylist(_) | HlsError::NoSegments)) => {
+                    tracing::warn!("HLS playlist parsing failed, falling back to direct download: {}", e)
+                }
+                // A real stream this engine can't handle; downloading the playlist text would not help.
+                Err(e) => return Err(format!("{} (try a media preset to use the media engine)", e)),
             }
         }
 
@@ -196,6 +210,7 @@ impl DownloadEngine {
         snapshot_tx: Option<broadcast::Sender<EngineSnapshot>>,
     ) -> Result<PathBuf, String> {
         tracing::info!("Routing download to Media Engine: {}", media_url);
+        let started_at = unix_now();
         let (prog_tx, mut prog_rx) = mpsc::channel::<crate::media::ProgressUpdate>(64);
 
         let forwarder = tokio::spawn(async move {
@@ -277,6 +292,7 @@ impl DownloadEngine {
             let mut entry = HistoryEntry::new(name, absolute(&path), size, urls);
             entry.downloaded_bytes = size;
             entry.status = HistoryStatus::Completed;
+            entry.started_at = started_at;
             entry.completed_at = Some(unix_now());
             DownloadHistoryManager::load().add_or_update(entry);
         })
@@ -742,14 +758,15 @@ impl DownloadEngine {
         }
     }
 
-    fn hls_output_path(&self, playlist: &Url) -> PathBuf {
+    fn hls_output_path(&self, playlist: &Url, segments: &[crate::hls::HlsSegment]) -> PathBuf {
+        let ext = crate::hls::container_extension(segments);
         let mut name = PathBuf::from(filename_from_url(playlist).unwrap_or_else(|| "stream".to_string()));
-        if name.extension().is_none_or(|ext| ext == "m3u8") {
-            name.set_extension("mp4");
+        if name.extension().is_none_or(|e| e == "m3u8") {
+            name.set_extension(ext);
         }
         let mut out = self.output_path_for(&name.to_string_lossy());
         if out.extension().is_none() {
-            out.set_extension("mp4");
+            out.set_extension(ext);
         }
         out
     }
