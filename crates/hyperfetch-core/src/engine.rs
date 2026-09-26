@@ -22,6 +22,7 @@ use url::Url;
 use crate::chunk::{ChunkManager, ChunkSnapshot};
 use crate::history::{DownloadHistoryManager, HistoryEntry, HistoryStatus};
 use crate::hls::HlsError;
+use crate::hosts::{self, HostKey, HostSlot};
 use crate::mirror::MirrorRacer;
 use crate::range::{compute_gaps, ByteRange};
 use crate::state::DownloadState;
@@ -436,28 +437,27 @@ impl DownloadEngine {
     async fn probe_all(&self, client: &Client, urls: &[Url]) -> Result<(ProbeInfo, Vec<ProbeInfo>), String> {
         let (limiter, stall) = (self.limiter(), self.stall_timeout());
         let several_connections = self.options.num_connections > 1;
+        let limit = self.options.max_connections_per_host;
         // Owned values keep the future `Send` (a borrowing closure here is not general enough).
         let probes = futures_util::stream::iter(urls.iter().cloned().enumerate())
             .map(|(i, url)| {
                 let (client, auth, limiter) = (client.clone(), self.auth.clone(), limiter.clone());
                 async move {
                     // Only the first mirror fetches the file's start: the download uses one copy.
-                    let (mut info, body) =
-                        tokio::time::timeout(PROBE_TIMEOUT, probe_url(&client, auth.as_deref(), &url, i == 0))
-                            .await
-                            .unwrap_or_else(|_| Err(format!("{}: no answer within {}s", url, PROBE_TIMEOUT.as_secs())))?;
-                    if let Some(body) = body {
+                    let (mut info, body) = probe_url(&client, auth.as_deref(), &url, i == 0, limit).await?;
+                    if let Some(ProbeBody { response, slot, len, answered, setup }) = body {
                         // Only the start of a larger file keeps workers waiting.
-                        let deadline = (info.size != Some(body.len)).then(|| tokio::time::Instant::now() + PREFETCH_TIME);
+                        let deadline = (info.size != Some(len)).then(|| tokio::time::Instant::now() + PREFETCH_TIME);
                         // Workers can take over early only where ranges work (without them only the
                         // whole body is of use), there can be several, and no speed limit makes
                         // every connection look capped.
-                        let pace = body
-                            .setup
+                        let pace = setup
                             .filter(|_| info.accepts_ranges && several_connections && limiter.is_none())
-                            .map(|setup| Pace { answered: body.answered, setup });
+                            .map(|setup| Pace { answered, setup });
                         (info.prefetch, info.per_setup) =
-                            read_prefix(body.response, body.len, deadline, pace, stall, limiter.as_deref()).await;
+                            read_prefix(response, len, deadline, pace, stall, limiter.as_deref()).await;
+                        // Done with the answer: its request's slot goes back.
+                        drop(slot);
                     }
                     Ok::<_, String>(info)
                 }
@@ -1208,6 +1208,8 @@ impl ProbeInfo {
 /// A probe response whose body is the start of the file (or all of it).
 struct ProbeBody {
     response: Response,
+    /// The host slot the response's request holds.
+    slot: HostSlot,
     /// Body bytes to keep.
     len: u64,
     /// When the answer arrived.
@@ -1235,13 +1237,35 @@ struct Pace {
 /// With `prefetch` the GET asks for the first `PREFETCH` bytes instead of one, and its response
 /// comes back too, with how many body bytes to keep, when that body is the start of the file (or
 /// all of it, from a server ignoring ranges) and the validators found are the response's own.
+///
+/// HEAD and GET each hold a slot of their host's budget under `limit` (see [`crate::hosts`]).
+/// The GET waits for its slot before the probe's time runs, since a host busy with other
+/// downloads is no dead mirror, and keeps it for as long as its answer is read.
 async fn probe_url(
     client: &Client,
     auth: Option<&Auth>,
     url: &Url,
     prefetch: bool,
+    limit: usize,
+) -> Result<(ProbeInfo, Option<ProbeBody>), String> {
+    let slot = hosts::acquire(url, limit).await;
+    tokio::time::timeout(PROBE_TIMEOUT, probe_with(client, auth, url, prefetch, limit, slot))
+        .await
+        .unwrap_or_else(|_| Err(format!("{}: no answer within {}s", url, PROBE_TIMEOUT.as_secs())))
+}
+
+/// `probe_url` once the GET holds `slot`.
+async fn probe_with(
+    client: &Client,
+    auth: Option<&Auth>,
+    url: &Url,
+    prefetch: bool,
+    limit: usize,
+    slot: HostSlot,
 ) -> Result<(ProbeInfo, Option<ProbeBody>), String> {
     let head = async {
+        // Waiting for a slot here is bounded like HEAD itself: by the grace after the GET's answer.
+        let _slot = hosts::acquire(url, limit).await;
         match authorize(client.head(url.clone()), auth, url).send().await {
             Ok(resp) if resp.status().is_success() => Some(resp),
             Ok(resp) => {
@@ -1295,7 +1319,11 @@ async fn probe_url(
             (head, ranged)
         }
     };
-    let body = |response: Response, len: u64| ProbeBody { response, len, answered, setup };
+    // A body is read under the GET's slot, which a redirect moves to the host it came from.
+    let body = |response: Response, len: u64| {
+        let slot = slot_at(slot, response.url(), limit)?;
+        Some(ProbeBody { response, slot, len, answered, setup })
+    };
     let head_len = head.as_ref().and_then(|r| content_length(r.headers()));
     // Still busy or unreachable after every try: that says nothing about range support.
     let unanswered = ranged.as_ref().map_or(true, |resp| is_busy(resp.status()));
@@ -1329,7 +1357,7 @@ async fn probe_url(
             }
             let mut info = ProbeInfo::describe(url, &[&plain]);
             info.size = content_length(plain.headers());
-            let body = info.size.filter(|&n| prefetch && n <= PREFETCH).map(|n| body(plain, n));
+            let body = info.size.filter(|&n| prefetch && n <= PREFETCH).and_then(|n| body(plain, n));
             return Ok((info, body));
         }
     };
@@ -1369,8 +1397,18 @@ async fn probe_url(
     };
     let own = |name: HeaderName| get.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_string);
     let own_validators = own(ETAG) == info.etag && own(LAST_MODIFIED) == info.last_modified;
-    let body = keep.filter(|_| prefetch && own_validators).map(|len| body(get, len.min(PREFETCH)));
+    let body = keep.filter(|_| prefetch && own_validators).and_then(|len| body(get, len.min(PREFETCH)));
     Ok((info, body))
+}
+
+/// `slot` for a request whose answer came from `url`: a redirect to another host moves the
+/// request to that host's budget, if it has room; without room the answer is not read.
+fn slot_at(slot: HostSlot, url: &Url, limit: usize) -> Option<HostSlot> {
+    if *slot.host() == HostKey::of(url) {
+        Some(slot)
+    } else {
+        hosts::try_acquire(url, limit)
+    }
 }
 
 /// The racer over the mirrors serving the download. Requests go straight to where each probe was
@@ -2833,7 +2871,7 @@ mod tests {
         let client = Client::new();
         let probe = |path: &str| {
             let (client, url) = (client.clone(), base.join(path).unwrap());
-            async move { probe_url(&client, None, &url, false).await.unwrap().0 }
+            async move { probe_url(&client, None, &url, false, 0).await.unwrap().0 }
         };
         assert!(probe("file.bin").await.answer_time.is_some());
         // Chunk requests skip the redirect the probe went through, so its time says nothing.
