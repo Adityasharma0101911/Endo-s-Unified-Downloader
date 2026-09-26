@@ -1495,3 +1495,24 @@ async fn test_slow_hls_playlist_is_not_cut_off_by_the_probe_timeout() {
     assert!(!err.contains("Timed out"), "the playlist fetch was cut off: {err}");
     assert!(err.contains("404"), "{err}");
 }
+
+#[tokio::test]
+async fn test_connection_quiet_mid_body_is_replaced_long_before_the_stall_timeout() {
+    let _history = setup().await;
+    let data = payload(PREFETCH + 256 * KB, 229);
+    let mut mock = Mock::new(data.clone());
+    mock.plan = |i| if i == 0 { Reply::StallAfter(32 * KB) } else { Reply::Normal };
+    let mock = Arc::new(mock);
+    let url = serve(Arc::clone(&mock), "quiet.bin").await;
+    let temp = tempdir().unwrap();
+    let out = temp.path().join("quiet.bin");
+
+    // The default 30 s stall timeout: only the answer's wait gets that long, not a quiet body.
+    let engine = DownloadEngine::new(vec![url], options(&out, 1, 256 * KB));
+    let started = Instant::now();
+    run(&engine, None).await.expect("the quiet connection is replaced");
+
+    assert!(started.elapsed() < Duration::from_secs(12), "took {:?}", started.elapsed());
+    assert_file(&out, &data);
+    assert_eq!(mock.served_ranges()[1].start, (PREFETCH + 32 * KB) as u64, "the retry continues where the first stopped");
+}
