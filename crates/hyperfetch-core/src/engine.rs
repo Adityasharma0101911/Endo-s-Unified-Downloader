@@ -268,7 +268,8 @@ impl DownloadEngine {
                     )
                     .await
                     .map_err(|e| e.to_string())?;
-                    // Hashed as it was written: nothing is read back.
+                    // Hashed as it was written and, with fsync_on_complete, flushed before it took
+                    // its name: nothing is read back or flushed again.
                     return self.finish_external(path, started_at, Some(digest)).await;
                 }
                 // Fetched, but not a playlist after all: try it as a plain file.
@@ -384,10 +385,11 @@ impl DownloadEngine {
 
     /// Checks the expected checksum of a file another engine (yt-dlp, HLS) finished and records
     /// it in history. `digest`, from an engine that hashed the file as it wrote it (see
-    /// [`StreamHasher`]), spares reading it back; without one it is read once, off the runtime. A
+    /// [`StreamHasher`]) and flushed it before it took its name as fsync_on_complete asks, spares
+    /// reading it back and flushing it again; without one it is read once, off the runtime. A
     /// mismatch is an error; the file is left in place for the user to inspect.
     async fn finish_external(&self, path: PathBuf, started_at: u64, digest: Option<FileDigest>) -> Result<PathBuf, String> {
-        let written = digest.map_or(Written::File, Written::Digest);
+        let written = digest.map_or(Written::File, Written::Flushed);
         let blake3_hex = self.verify_written(&path, written).await.map_err(|e| e.to_string())?;
         if self.options.expected_checksum.is_some() {
             tracing::info!("Checksum verification passed for {}", path.display());
@@ -909,7 +911,8 @@ impl DownloadEngine {
 
     /// The BLAKE3 (hex) of the finished file at `path`, once its expected checksum is confirmed.
     /// The digest comes from `written` where it can, else from reading the file; with
-    /// fsync_on_complete the file is flushed to disk at the same time, and both must succeed. A
+    /// fsync_on_complete the file is flushed to disk at the same time (unless its writer already
+    /// did, see [`Written::Flushed`]), and both must succeed. A
     /// mismatch found without reading the whole file is confirmed by reading it before it counts:
     /// only the file itself can condemn it.
     async fn verify_written(&self, path: &Path, written: Written) -> Result<String, VerifyError> {
@@ -919,7 +922,7 @@ impl DownloadEngine {
             _ => None,
         };
         // Through a handle of its own, as the hash may be reading through the writer's.
-        let flush = self.options.fsync_on_complete.then(|| {
+        let flush = (self.options.fsync_on_complete && !matches!(written, Written::Flushed(_))).then(|| {
             let (writer, path) = (writer.clone(), path.to_path_buf());
             move || match writer {
                 Some(writer) => writer.sync_separately().map_err(|e| e.to_string()),
@@ -944,7 +947,7 @@ impl DownloadEngine {
             move || match written {
                 Written::File => crate::storage::hash_and_verify_file(&path, expected.as_deref()),
                 Written::Writer(writer) => checked(&path, writer.digest(expected.as_deref()), expected.as_deref()),
-                Written::Digest(digest) => verify_digest(&digest, expected.as_deref()),
+                Written::Digest(digest) | Written::Flushed(digest) => verify_digest(&digest, expected.as_deref()),
             }
         };
         hash_and_flush(hash, flush, reread).await
@@ -1024,6 +1027,8 @@ enum Written {
     Writer(DiskWriter),
     /// Taken while the file was written in order (see [`StreamHasher`]).
     Digest(FileDigest),
+    /// A [`Written::Digest`] of a file its writer has already flushed, as fsync_on_complete asks.
+    Flushed(FileDigest),
 }
 
 /// Runs `hash` and, if given, `flush` at the same time on blocking threads. A mismatch `hash`
@@ -2696,6 +2701,34 @@ mod tests {
         let path = engine("/busy.m3u8", 30, 6).run(None).await.unwrap();
         assert_eq!(std::fs::read(path).unwrap(), b"DATA");
         assert_eq!(hits.lock()["/busy.ts"], 7);
+    }
+
+    #[tokio::test]
+    async fn test_a_file_whose_writer_flushed_it_is_not_flushed_again() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("flushed.ts");
+        std::fs::write(&path, b"DATA").unwrap();
+        let digest = || {
+            let mut hasher = StreamHasher::new(None);
+            hasher.update(b"DATA");
+            hasher.finish()
+        };
+        // Read-only: a flush, which opens the file for writing, fails.
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&path, permissions.clone()).unwrap();
+        let options = DownloadOptions { fsync_on_complete: true, ..Default::default() };
+        let engine = DownloadEngine::new(Vec::new(), options);
+
+        let flushed = engine.finish_external(path.clone(), unix_now(), Some(digest())).await;
+        assert_eq!(flushed.unwrap(), path, "a file its engine flushed is not flushed again");
+        let err = engine.finish_external(path.clone(), unix_now(), None).await.unwrap_err();
+        assert!(err.contains("flush"), "any other is: {err}");
+        assert!(engine.verify_written(&path, Written::Digest(digest())).await.is_err(), "so is one with a digest alone");
+
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&path, permissions).unwrap();
     }
 
     #[tokio::test]
