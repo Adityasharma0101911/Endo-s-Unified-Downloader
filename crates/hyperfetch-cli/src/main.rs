@@ -1,528 +1,544 @@
-use std::path::PathBuf;
+mod cli;
+mod download;
+mod ingest;
+
+use std::io::{IsTerminal, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
 use clap::Parser;
-use indicatif::{ProgressBar, ProgressStyle};
-use tokio::sync::broadcast;
+use hyperfetch_core::engine::DownloadOptions;
+use hyperfetch_core::history::{DownloadHistoryManager, HistoryEntry, HistoryStatus};
+use hyperfetch_core::state::DownloadState;
+use hyperfetch_core::verify::{self, BuildVerificationResult};
+use indicatif::HumanBytes;
 use url::Url;
 
-use hyperfetch_core::engine::{DownloadEngine, DownloadOptions, EngineSnapshot};
+use cli::Args;
+use download::{run_jobs, stop_requested, truncate, Job, Shutdown, Ui, EXIT_FAILED, EXIT_OK, EXIT_USAGE};
+use ingest::{batch_lines, decode_text, http_url, ingest, Task};
 
-#[derive(Parser, Debug)]
-#[command(name = "Endo's Unified Downloader", author, version, about = "High-speed unified download accelerator & multi-source ingestion engine", long_about = None)]
-struct Args {
-    /// URLs to download (mirrors/sources for racing). If omitted, interactive UI mode is launched.
-    #[arg(num_args = 0..)]
-    urls: Vec<String>,
-
-    /// Read URLs from file (one download per line, supports multiple mirrors per line, # for comments)
-    #[arg(short = 'i', long = "input-file")]
-    input_file: Option<PathBuf>,
-
-    /// Number of concurrent connections/workers
-    #[arg(short = 's', long = "split", default_value_t = 16)]
-    connections: usize,
-
-    /// Base chunk size in MB
-    #[arg(short = 'c', long = "chunk-size", default_value_t = 4)]
-    chunk_size_mb: u64,
-
-    /// Output file path or directory
-    #[arg(short = 'o', long = "output")]
-    output: Option<PathBuf>,
-
-    /// Target directory for downloaded files (alias for -o if directory)
-    #[arg(short = 'd', long = "dir")]
-    dir: Option<PathBuf>,
-
-    /// Quiet mode: suppress interactive progress bar for headless servers and cron jobs
-    #[arg(short = 'q', long = "quiet")]
-    quiet: bool,
-
-    /// Expected file checksum (sha256:..., md5:..., blake3:..., or hex)
-    #[arg(long = "checksum")]
-    checksum: Option<String>,
-
-    /// Path to Netscape cookies.txt file
-    #[arg(long = "load-cookies")]
-    load_cookies: Option<PathBuf>,
-
-    /// Custom authorization header (e.g. "Bearer <token>")
-    #[arg(long = "header")]
-    header: Option<String>,
-
-    /// Proxy server URL (e.g. "http://127.0.0.1:8080" or "socks5://127.0.0.1:1080")
-    #[arg(long = "proxy")]
-    proxy: Option<String>,
-
-    /// Media quality preset: "best", "1080p", "720p", "mp3", "m4a"
-    #[arg(long = "media-preset")]
-    media_preset: Option<String>,
-
-    /// Extract cookies from browser: "chrome", "edge", "firefox", "brave", "opera", "vivaldi"
-    #[arg(long = "cookies-from-browser")]
-    cookies_from_browser: Option<String>,
-
-    /// Concurrent fragment downloads for media streams (1-32)
-    #[arg(long = "concurrent-fragments", default_value_t = 8)]
-    concurrent_fragments: usize,
-
-    /// Display past download history
-    #[arg(long = "history")]
-    history: bool,
-
-    /// Verify chunk and build integrity of a local file
-    #[arg(long = "verify")]
-    verify: Option<PathBuf>,
-
-    /// Automatically repair missing chunks if verification detects gaps (requires URL or history)
-    #[arg(long = "repair")]
-    repair: bool,
+fn main() {
+    let args = Args::parse();
+    let code = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime.block_on(app(args)),
+        Err(e) => {
+            eprintln!("error: cannot start the async runtime: {}", e);
+            EXIT_FAILED
+        }
+    };
+    let _ = std::io::stdout().flush();
+    // Exit without waiting for a blocking stdin read that may still be pending.
+    std::process::exit(code);
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
+async fn app(args: Args) -> i32 {
+    let ui = Ui::new(args.quiet);
+    init_tracing(args.verbose, &ui);
+    let shutdown = Shutdown::install();
 
     if args.history {
-        let manager = hyperfetch_core::history::DownloadHistoryManager::load();
-        let entries = manager.entries();
-        if entries.is_empty() {
-            println!("No past downloads found in history.");
-        } else {
-            println!("\n{:<30} {:<14} {:<15} {:<40}", "FILE NAME", "SIZE", "STATUS", "URL");
-            println!("{:-<100}", "");
-            for entry in entries {
-                let status_str = match entry.status {
-                    hyperfetch_core::history::HistoryStatus::Completed => "Completed",
-                    hyperfetch_core::history::HistoryStatus::Failed(_) => "Failed",
-                    hyperfetch_core::history::HistoryStatus::Cancelled => "Cancelled",
-                };
-                let url_str = entry.urls.first().map(|s| s.as_str()).unwrap_or("");
-                let size_str = format!("{:.2} MB", entry.file_size as f64 / (1024.0 * 1024.0));
-                println!("{:<30} {:<14} {:<15} {:<40}", entry.file_name, size_str, status_str, url_str);
-            }
-            println!();
-        }
-        return Ok(());
+        return show_history().await;
     }
-
-    if let Some(ref verify_path) = args.verify {
-        println!("\nVerifying build file: {:?}", verify_path);
-        let res = hyperfetch_core::verify::verify_build_file(verify_path, None, args.checksum.as_deref())
-            .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
-        println!("Status: {}", res.status_message);
-        println!("File Size on Disk: {} bytes", res.actual_size);
-        if let Some(exp) = res.expected_size {
-            println!("Expected File Size: {} bytes", exp);
-        }
-        println!("Missing / Incomplete Chunks: {}", res.missing_ranges.len());
-
-        if !res.is_complete && args.repair {
-            println!("\nAttempting automatic chunk repair...");
-            let history = hyperfetch_core::history::DownloadHistoryManager::load();
-            let urls: Vec<url::Url> = if !args.urls.is_empty() {
-                args.urls.iter().filter_map(|u| url::Url::parse(u).ok()).collect()
-            } else {
-                history.entries()
-                    .iter()
-                    .find(|e| e.file_path == *verify_path || e.file_name == verify_path.file_name().unwrap_or_default().to_string_lossy())
-                    .map(|e| e.urls.iter().filter_map(|u| url::Url::parse(u).ok()).collect())
-                    .unwrap_or_default()
-            };
-
-            if urls.is_empty() {
-                println!("Error: No download URL provided or found in history for repair.");
-            } else {
-                use std::io::Write;
-                let total_size = res.expected_size.unwrap_or(res.actual_size);
-                hyperfetch_core::verify::repair_missing_ranges(
-                    verify_path,
-                    total_size,
-                    &res.missing_ranges,
-                    &urls,
-                    None,
-                    |cur, tot| {
-                        print!("\rRepaired {} / {} bytes ({:.1}%)", cur, tot, (cur as f64 / tot as f64) * 100.0);
-                        let _ = std::io::stdout().flush();
-                    },
-                ).await.map_err(|e| Box::<dyn std::error::Error>::from(e))?;
-                println!("\nBuild chunk repair successful! All chunks verified.");
-            }
-        }
-        return Ok(());
+    if let Some(path) = &args.verify {
+        return verify_file(&args, path, &ui, &shutdown).await;
     }
-
+    let http = match descriptor_client(&args) {
+        Ok(client) => client,
+        Err(e) => return usage(&e),
+    };
     if args.urls.is_empty() && args.input_file.is_none() {
-        run_interactive_ui().await?;
+        interactive(&args, &ui, &shutdown, &http).await
     } else {
-        run_cli_download(args).await?;
+        batch(&args, &ui, &shutdown, &http).await
     }
+}
 
+fn usage(message: &str) -> i32 {
+    eprintln!("error: {}", message);
+    EXIT_USAGE
+}
+
+/// The exit code once every download has run.
+fn exit_code(signal: Option<i32>, failed: usize) -> i32 {
+    signal.unwrap_or(if failed > 0 { EXIT_FAILED } else { EXIT_OK })
+}
+
+/// Engine warnings go to stderr (above the progress bars); -v adds info/debug/trace, RUST_LOG wins.
+fn init_tracing(verbose: u8, ui: &Ui) {
+    use tracing_subscriber::filter::{LevelFilter, Targets};
+    use tracing_subscriber::prelude::*;
+
+    let level = match verbose {
+        0 => LevelFilter::WARN,
+        1 => LevelFilter::INFO,
+        2 => LevelFilter::DEBUG,
+        _ => LevelFilter::TRACE,
+    };
+    let filter = match std::env::var("RUST_LOG") {
+        Ok(spec) if !spec.trim().is_empty() => spec.parse::<Targets>().unwrap_or_else(|e| {
+            eprintln!("warning: ignoring invalid RUST_LOG '{}': {}", spec, e);
+            Targets::new().with_default(level)
+        }),
+        _ => Targets::new().with_default(level),
+    };
+    let writer = ui.log_writer();
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(move || writer.clone())
+                .without_time()
+                .with_ansi(std::io::stderr().is_terminal())
+                .with_target(verbose >= 2),
+        )
+        .with(filter)
+        .init();
+}
+
+/// Client for fetching remote .metalink/.torrent documents.
+fn descriptor_client(args: &Args) -> Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(60))
+        .user_agent(concat!("Endos-Unified-Downloader/", env!("CARGO_PKG_VERSION")));
+    if let Some(proxy) = &args.proxy {
+        builder = builder.proxy(reqwest::Proxy::all(proxy.as_str()).map_err(|e| format!("invalid proxy: {}", e))?);
+    }
+    builder.build().map_err(|e| format!("cannot create HTTP client: {}", e))
+}
+
+/// Rejects options that name a single file when there are several downloads.
+fn check_single_file_options(output: Option<&Path>, has_checksum: bool, tasks: usize) -> Result<(), String> {
+    if let Some(output) = output {
+        if output.is_dir() {
+            return Err(format!("-o expects a file path, but {} is a directory; use -d DIR", output.display()));
+        }
+        if tasks > 1 {
+            return Err(format!("-o names one file, but the input has {} downloads; use -d DIR instead", tasks));
+        }
+    }
+    if has_checksum && tasks > 1 {
+        return Err(format!("--checksum applies to one file, but the input has {} downloads", tasks));
+    }
     Ok(())
 }
 
-async fn run_interactive_ui() -> Result<(), Box<dyn std::error::Error>> {
-    use std::io::{self, Write};
-
-    println!("\n===================================================================");
-    println!("   Endo's Unified Downloader - High-Speed Ingestion Engine");
-    println!("===================================================================");
-
-    let default_download_dir = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .map(|p| PathBuf::from(p).join("Downloads"))
-        .unwrap_or_else(|_| PathBuf::from("."));
-
-    loop {
-        println!("\nEnter download URL(s) (space-separated for multiple mirrors),");
-        print!("or press Enter to exit:\n> ");
-        io::stdout().flush()?;
-
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-        let trimmed = input.trim();
-
-        if trimmed.is_empty() {
-            println!("Exiting Endo's Unified Downloader. Goodbye.");
-            break;
-        }
-
-        let raw_urls: Vec<&str> = trimmed.split_whitespace().collect();
-        let mut parsed_urls = Vec::new();
-        let mut has_error = false;
-
-        for u in raw_urls {
-            if u.starts_with("blob:") || (u.contains("youtube.com") && u.split('/').last().map_or(false, |s| s.len() == 36 && s.matches('-').count() == 4)) {
-                println!("\n[NOTICE] The URL entered is a browser-internal blob memory buffer.");
-                println!("Browser blob: URLs exist only in temporary browser memory and cannot be downloaded by external tools.");
-                println!("Please copy the standard video URL from your browser address bar (e.g. https://www.youtube.com/watch?v=... or https://youtu.be/...).");
-                has_error = true;
-                break;
-            }
-
-            if hyperfetch_core::torrent::is_magnet_uri(u) {
-                match hyperfetch_core::torrent::parse_magnet_uri(u) {
-                    Ok(magnet) => {
-                        println!("[MAGNET] Ingested magnet URI: {}", magnet.info_hash);
-                        if let Some(ref dn) = magnet.display_name {
-                            println!("         Name: {}", dn);
-                        }
-                        if !magnet.web_seeds.is_empty() {
-                            println!("         Discovered {} web seed mirror(s) for HTTP acceleration", magnet.web_seeds.len());
-                            parsed_urls.extend(magnet.web_seeds);
-                            continue;
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("[ERROR] Invalid magnet URI: {}", e);
-                        has_error = true;
-                        break;
-                    }
-                }
-            }
-
-            match Url::parse(u) {
-                Ok(url) => parsed_urls.push(url),
-                Err(e) => {
-                    eprintln!("[ERROR] Invalid URL '{}': {}", u, e);
-                    has_error = true;
-                    break;
-                }
-            }
-        }
-
-        if has_error || parsed_urls.is_empty() {
-            continue;
-        }
-
-        // Ask for connection count
-        print!("Concurrent connections [default: 16]: ");
-        io::stdout().flush()?;
-        let mut conn_input = String::new();
-        io::stdin().read_line(&mut conn_input)?;
-        let connections = conn_input.trim().parse::<usize>().unwrap_or(16).max(1);
-
-        // Ask for save folder
-        print!("Save directory [default: {}]: ", default_download_dir.display());
-        io::stdout().flush()?;
-        let mut dir_input = String::new();
-        io::stdin().read_line(&mut dir_input)?;
-        let target_dir = if dir_input.trim().is_empty() {
-            default_download_dir.clone()
-        } else {
-            PathBuf::from(dir_input.trim())
-        };
-
-        let options = DownloadOptions {
-            num_connections: connections,
-            base_chunk_size: 4 * 1024 * 1024,
-            min_steal_threshold: 1024 * 1024,
-            output_path: Some(target_dir),
-            ..Default::default()
-        };
-
-        println!("\nProbing mirrors and initializing chunk pipeline...");
-        let engine = DownloadEngine::new(parsed_urls, options);
-        let _ = execute_download(engine, false).await;
-
-        println!("\n-------------------------------------------------------------------");
-        print!("Download another file? [y/N]: ");
-        io::stdout().flush()?;
-        let mut again = String::new();
-        io::stdin().read_line(&mut again)?;
-        if !again.trim().eq_ignore_ascii_case("y") {
-            println!("Goodbye.");
-            break;
-        }
-    }
-
-    Ok(())
+/// The download directory, created if missing.
+async fn prepare_dir(dir: &Path) -> Result<PathBuf, String> {
+    tokio::fs::create_dir_all(dir)
+        .await
+        .map_err(|e| format!("cannot create directory {}: {}", dir.display(), e))?;
+    Ok(dir.to_path_buf())
 }
 
-async fn run_cli_download(args: Args) -> Result<(), Box<dyn std::error::Error>> {
-    let mut tasks: Vec<Vec<String>> = Vec::new();
+fn job(args: &Args, connections: u64, dir: &Path, task: Task) -> Job {
+    let label = task.label();
+    let output = match (&args.output, &task.name) {
+        (Some(file), _) => dir.join(file),
+        (None, Some(name)) => dir.join(name),
+        (None, None) => dir.to_path_buf(),
+    };
+    let media = args.media_preset.is_some() || task.urls.iter().any(hyperfetch_core::media::is_supported_media_site);
+    let options = DownloadOptions {
+        num_connections: if media { args.concurrent_fragments } else { connections } as usize,
+        base_chunk_size: args.chunk_size_mb * 1024 * 1024,
+        output_path: Some(output),
+        expected_checksum: args.checksum.clone().or(task.checksum),
+        cookies_path: args.load_cookies.clone(),
+        auth_header: args.auth_header.clone(),
+        proxy: args.proxy.clone(),
+        media_preset: args.media_preset.clone(),
+        browser_cookies: args.cookies_from_browser.map(Into::into),
+        max_speed: args.max_speed.filter(|&s| s > 0),
+        max_retries: args.max_retries,
+        stall_timeout_secs: args.stall_timeout,
+        ..Default::default()
+    };
+    Job { label, urls: task.urls, options }
+}
 
-    // 1. Ingest batch file if provided
-    if let Some(ref input_path) = args.input_file {
-        let content = std::fs::read_to_string(input_path)
-            .map_err(|e| format!("Failed to read input file {:?}: {}", input_path, e))?;
-        for line in content.lines() {
-            let trimmed = line.trim();
-            if !trimmed.is_empty() && !trimmed.starts_with('#') {
-                let mirrors: Vec<String> = trimmed.split_whitespace().map(|s| s.to_string()).collect();
-                if !mirrors.is_empty() {
-                    tasks.push(mirrors);
-                }
-            }
+async fn read_input(path: &Path) -> Result<String, String> {
+    let bytes = if path == Path::new("-") {
+        tokio::task::spawn_blocking(|| {
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut std::io::stdin(), &mut buf).map(|_| buf)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("cannot read stdin: {}", e))?
+    } else {
+        tokio::fs::read(path).await.map_err(|e| format!("cannot read {}: {}", path.display(), e))?
+    };
+    decode_text(&bytes).map_err(|e| format!("{}: {}", path.display(), e))
+}
+
+async fn batch(args: &Args, ui: &Ui, shutdown: &Shutdown, http: &reqwest::Client) -> i32 {
+    let mut inputs: Vec<Vec<String>> = Vec::new();
+    if let Some(path) = &args.input_file {
+        match read_input(path).await {
+            Ok(text) => inputs.extend(batch_lines(&text).map(|l| l.split_whitespace().map(String::from).collect())),
+            Err(e) => return usage(&e),
         }
     }
-
-    // 2. Ingest command-line URLs if provided
     if !args.urls.is_empty() {
-        tasks.push(args.urls.clone());
+        inputs.push(args.urls.clone());
     }
 
+    let mut tasks = Vec::new();
+    let mut failed = 0;
+    for input in &inputs {
+        let tokens: Vec<&str> = input.iter().map(String::as_str).collect();
+        match ingest(&tokens, http).await {
+            Ok(found) => tasks.extend(found),
+            Err(e) => {
+                ui.error(&format!("[FAILED] {}: {}", truncate(&tokens.join(" "), 60), e));
+                failed += 1;
+            }
+        }
+    }
+    if let Err(e) = check_single_file_options(args.output.as_deref(), args.checksum.is_some(), tasks.len()) {
+        return usage(&e);
+    }
     if tasks.is_empty() {
-        println!("No valid download URLs provided.");
-        return Ok(());
+        return if failed > 0 { EXIT_FAILED } else { usage("the input contains no downloads") };
     }
+    let dir = match prepare_dir(args.dir.as_deref().unwrap_or(Path::new("."))).await {
+        Ok(dir) => dir,
+        Err(e) => return usage(&e),
+    };
 
-    let output_target = args.output.clone().or_else(|| args.dir.clone());
-    let total_tasks = tasks.len();
-    let mut failed_tasks = 0;
+    let jobs = tasks.into_iter().map(|t| job(args, args.connections, &dir, t)).collect();
+    failed += run_jobs(jobs, args.jobs as usize, ui, shutdown).await;
+    exit_code(shutdown.requested(), failed)
+}
 
-    for (task_idx, task_urls) in tasks.into_iter().enumerate() {
-        if total_tasks > 1 && !args.quiet {
-            println!("\n=======================================================");
-            println!("   [Task {}/{}] Processing download", task_idx + 1, total_tasks);
-            println!("=======================================================");
+/// Prints `message` and reads one trimmed line; None at end of input.
+async fn prompt(message: String) -> Option<String> {
+    print!("{}", message);
+    let _ = std::io::stdout().flush();
+    tokio::task::spawn_blocking(|| {
+        let mut line = String::new();
+        match std::io::stdin().read_line(&mut line) {
+            Ok(0) | Err(_) => None,
+            Ok(_) => Some(line.trim().to_string()),
         }
+    })
+    .await
+    .ok()
+    .flatten()
+}
 
-        let mut parsed_urls = Vec::new();
-        let mut task_error = false;
+fn default_download_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(|home| PathBuf::from(home).join("Downloads"))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
 
-        for u in &task_urls {
-            let trimmed = u.trim();
-            if trimmed.starts_with("blob:") || (trimmed.contains("youtube.com") && trimmed.split('/').last().map_or(false, |s| s.len() == 36 && s.matches('-').count() == 4)) {
-                eprintln!("\n[NOTICE] The URL entered is a browser-internal blob memory buffer.");
-                eprintln!("Browser blob: URLs exist only in temporary browser memory and cannot be downloaded by external tools.");
-                task_error = true;
-                break;
-            }
-
-            if hyperfetch_core::torrent::is_magnet_uri(trimmed) {
-                match hyperfetch_core::torrent::parse_magnet_uri(trimmed) {
-                    Ok(magnet) => {
-                        if !args.quiet {
-                            println!("[MAGNET] Ingested magnet URI: {}", magnet.info_hash);
-                            if let Some(ref dn) = magnet.display_name {
-                                println!("         Name: {}", dn);
-                            }
-                        }
-                        if !magnet.web_seeds.is_empty() {
-                            if !args.quiet {
-                                println!("         Discovered {} web seed mirror(s) for HTTP acceleration", magnet.web_seeds.len());
-                            }
-                            parsed_urls.extend(magnet.web_seeds);
-                            continue;
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("[ERROR] Invalid magnet URI: {}", e);
-                        task_error = true;
-                        break;
-                    }
-                }
-            }
-
-            match Url::parse(trimmed) {
-                Ok(url) => parsed_urls.push(url),
-                Err(e) => {
-                    eprintln!("[ERROR] Invalid URL '{}': {}", u, e);
-                    task_error = true;
-                    break;
-                }
-            }
+/// Prompt loop used when no URL is given. Command-line options apply to every download.
+async fn interactive(args: &Args, ui: &Ui, shutdown: &Shutdown, http: &reqwest::Client) -> i32 {
+    println!("Endo's Unified Downloader {}", env!("CARGO_PKG_VERSION"));
+    let default_dir = args.dir.clone().unwrap_or_else(default_download_dir);
+    let mut failed = 0;
+    loop {
+        let Some(input) = prompt("\nURL(s) of one file (space-separated mirrors), magnet, metalink or torrent;\nEnter to exit:\n> ".to_string()).await
+        else {
+            break;
+        };
+        if input.is_empty() {
+            break;
         }
-
-        if task_error || parsed_urls.is_empty() {
-            failed_tasks += 1;
+        let tokens: Vec<&str> = input.split_whitespace().collect();
+        let tasks = match ingest(&tokens, http).await {
+            Ok(tasks) => tasks,
+            Err(e) => {
+                eprintln!("[ERROR] {}", e);
+                continue;
+            }
+        };
+        if let Err(e) = check_single_file_options(args.output.as_deref(), args.checksum.is_some(), tasks.len()) {
+            eprintln!("[ERROR] {}", e);
             continue;
         }
 
-        let media_preset = parse_media_preset(args.media_preset.as_deref());
-        let browser_cookies = parse_browser_cookie(args.cookies_from_browser.as_deref());
-
-        let options = DownloadOptions {
-            num_connections: args.connections,
-            base_chunk_size: args.chunk_size_mb * 1024 * 1024,
-            min_steal_threshold: 1024 * 1024,
-            output_path: output_target.clone(),
-            expected_checksum: args.checksum.clone(),
-            cookies_path: args.load_cookies.clone(),
-            auth_header: args.header.clone(),
-            proxy: args.proxy.clone(),
-            media_preset,
-            browser_cookies,
-            ..Default::default()
-        };
-
-        let engine = DownloadEngine::new(parsed_urls, options);
-        if !args.quiet && total_tasks == 1 {
-            println!("Endo's Unified Downloader v0.1.0");
-            println!("Probing mirrors and preparing dynamic chunk pipeline...");
-        }
-
-        if execute_download(engine, args.quiet).await.is_err() {
-            failed_tasks += 1;
-        }
-    }
-
-    if failed_tasks > 0 {
-        return Err(format!("{} of {} download tasks failed or were interrupted", failed_tasks, total_tasks).into());
-    }
-
-    Ok(())
-}
-
-fn parse_media_preset(preset: Option<&str>) -> Option<hyperfetch_core::media::MediaQualityPreset> {
-    match preset?.to_ascii_lowercase().as_str() {
-        "best" => Some(hyperfetch_core::media::MediaQualityPreset::BestVideoAudio),
-        "1080p" | "1080" | "fhd" => Some(hyperfetch_core::media::MediaQualityPreset::Fhd1080p),
-        "720p" | "720" | "hd" => Some(hyperfetch_core::media::MediaQualityPreset::Hd720p),
-        "mp3" => Some(hyperfetch_core::media::MediaQualityPreset::AudioMp3),
-        "m4a" | "aac" => Some(hyperfetch_core::media::MediaQualityPreset::AudioM4a),
-        custom => Some(hyperfetch_core::media::MediaQualityPreset::Custom(custom.to_string())),
-    }
-}
-
-fn parse_browser_cookie(browser: Option<&str>) -> Option<hyperfetch_core::media::BrowserCookieSource> {
-    match browser?.to_ascii_lowercase().as_str() {
-        "chrome" => Some(hyperfetch_core::media::BrowserCookieSource::Chrome),
-        "edge" => Some(hyperfetch_core::media::BrowserCookieSource::Edge),
-        "firefox" => Some(hyperfetch_core::media::BrowserCookieSource::Firefox),
-        "brave" => Some(hyperfetch_core::media::BrowserCookieSource::Brave),
-        "opera" => Some(hyperfetch_core::media::BrowserCookieSource::Opera),
-        "vivaldi" => Some(hyperfetch_core::media::BrowserCookieSource::Vivaldi),
-        _ => None,
-    }
-}
-
-async fn wait_for_shutdown_signal() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        let mut sigint = match signal(SignalKind::interrupt()) {
-            Ok(s) => s,
-            Err(_) => {
-                let _ = tokio::signal::ctrl_c().await;
-                return;
+        let answer = prompt(format!("Connections per download [{}]: ", args.connections)).await.unwrap_or_default();
+        let connections = match answer.parse::<u64>() {
+            Ok(n @ 1..=64) => n,
+            _ if answer.is_empty() => args.connections,
+            _ => {
+                println!("Using {} (enter a number from 1 to 64)", args.connections);
+                args.connections
             }
         };
-        let mut sigterm = match signal(SignalKind::terminate()) {
-            Ok(s) => s,
-            Err(_) => {
-                let _ = tokio::signal::ctrl_c().await;
-                return;
+        let answer = prompt(format!("Save directory [{}]: ", default_dir.display())).await.unwrap_or_default();
+        let dir = match prepare_dir(if answer.is_empty() { &default_dir } else { Path::new(&answer) }).await {
+            Ok(dir) => dir,
+            Err(e) => {
+                eprintln!("[ERROR] {}", e);
+                continue;
             }
         };
-        tokio::select! {
-            _ = sigint.recv() => {},
-            _ = sigterm.recv() => {},
+
+        let jobs = tasks.into_iter().map(|t| job(args, connections, &dir, t)).collect();
+        failed += run_jobs(jobs, args.jobs as usize, ui, shutdown).await;
+        if let Some(code) = shutdown.requested() {
+            return code;
+        }
+        let again = prompt("\nDownload another file? [y/N]: ".to_string()).await.unwrap_or_default();
+        if !again.eq_ignore_ascii_case("y") {
+            break;
         }
     }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
+    exit_code(None, failed)
+}
+
+fn history_row(entry: &HistoryEntry) -> String {
+    let (status, note) = match &entry.status {
+        HistoryStatus::Completed => ("Completed".to_string(), String::new()),
+        HistoryStatus::Cancelled => (stopped_at(entry), String::new()),
+        HistoryStatus::Failed(reason) => ("Failed".to_string(), truncate(reason, 60)),
+    };
+    let size = if entry.file_size > 0 { HumanBytes(entry.file_size).to_string() } else { "?".to_string() };
+    let host = entry
+        .urls
+        .first()
+        .and_then(|u| Url::parse(u).ok())
+        .and_then(|u| u.host_str().map(str::to_string))
+        .unwrap_or_else(|| "-".to_string());
+    format!("{:<14} {:>11}  {:<40}  {:<24} {}", status, size, truncate(&entry.file_name, 40), truncate(&host, 24), note)
+        .trim_end()
+        .to_string()
+}
+
+/// "Stopped 42%": how far a stopped download got (its .part can be resumed or repaired).
+fn stopped_at(entry: &HistoryEntry) -> String {
+    match entry.downloaded_bytes.saturating_mul(100).checked_div(entry.file_size) {
+        Some(percent) => format!("Stopped {}%", percent.min(100)),
+        None => "Stopped".to_string(),
     }
 }
 
-async fn execute_download(engine: DownloadEngine, quiet: bool) -> Result<PathBuf, String> {
-    let (snapshot_tx, mut snapshot_rx) = broadcast::channel::<EngineSnapshot>(64);
+async fn show_history() -> i32 {
+    let loaded = tokio::task::spawn_blocking(|| {
+        (DownloadHistoryManager::default_history_path(), DownloadHistoryManager::load().entries().to_vec())
+    })
+    .await;
+    let Ok((path, entries)) = loaded else {
+        eprintln!("error: cannot read the download history");
+        return EXIT_FAILED;
+    };
+    if entries.is_empty() {
+        println!("No downloads in history ({}).", path.display());
+        return EXIT_OK;
+    }
+    println!("{:<14} {:>11}  {:<40}  {:<24} NOTE", "STATUS", "SIZE", "FILE", "HOST");
+    for entry in &entries {
+        println!("{}", history_row(entry));
+    }
+    println!("\n{} entries, newest first ({})", entries.len(), path.display());
+    EXIT_OK
+}
 
-    let pb = if quiet {
-        None
+fn print_verification(res: &BuildVerificationResult) {
+    println!("File:     {}", res.file_path.display());
+    println!("Status:   {}", res.status_message);
+    match res.expected_size {
+        Some(expected) => println!("Size:     {} bytes on disk, {} expected", res.actual_size, expected),
+        None => println!("Size:     {} bytes on disk, expected size unknown", res.actual_size),
+    }
+    if !res.missing_ranges.is_empty() {
+        let bytes: u64 = res.missing_ranges.iter().map(|r| r.len()).sum();
+        println!("Missing:  {} range(s), {}", res.missing_ranges.len(), HumanBytes(bytes));
+    }
+    match res.checksum_match {
+        Some(true) => println!("Checksum: match"),
+        Some(false) => println!("Checksum: MISMATCH"),
+        None => {}
+    }
+}
+
+async fn run_verify(path: PathBuf, checksum: Option<String>) -> Result<BuildVerificationResult, String> {
+    tokio::task::spawn_blocking(move || verify::verify_build_file(&path, None, checksum.as_deref()))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// The final name of `<name>.part`, or the path itself.
+fn final_path(path: &Path) -> PathBuf {
+    if path.extension().is_some_and(|e| e == "part") {
+        path.with_extension("")
     } else {
-        let bar = ProgressBar::new(100);
-        bar.set_style(
-            ProgressStyle::default_bar()
-                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, ETA {eta})")
-                .unwrap()
-                .progress_chars("=>-"),
-        );
-        Some(bar)
-    };
+        path.to_path_buf()
+    }
+}
 
-    let pb_clone = pb.clone();
-    let monitor_handle = tokio::spawn(async move {
-        loop {
-            match snapshot_rx.recv().await {
-                Ok(snapshot) => {
-                    if let Some(ref bar) = pb_clone {
-                        bar.set_length(snapshot.total_bytes);
-                        bar.set_position(snapshot.downloaded_bytes);
-                    }
-                }
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    continue;
-                }
-                Err(broadcast::error::RecvError::Closed) => {
-                    break;
-                }
+/// Repair sources: URLs from the command line, else the mirrors in this file's resume state,
+/// else the URLs history recorded for exactly this path.
+fn repair_urls(explicit: &[String], data_path: &Path) -> Result<Vec<Url>, String> {
+    let candidates: Vec<String> = if !explicit.is_empty() {
+        explicit.to_vec()
+    } else {
+        let state = DownloadState::load_from_path(&DownloadState::state_file_path(data_path)).ok().flatten();
+        match state.map(|s| s.mirrors).filter(|m| !m.is_empty()) {
+            Some(mirrors) => mirrors,
+            None => {
+                let wanted = std::path::absolute(final_path(data_path)).map_err(|e| e.to_string())?;
+                DownloadHistoryManager::load()
+                    .entries()
+                    .iter()
+                    .find(|e| std::path::absolute(&e.file_path).is_ok_and(|p| p == wanted))
+                    .map(|e| e.urls.clone())
+                    .unwrap_or_default()
             }
-        }
-    });
-
-    let cancel_engine = engine.clone();
-    let result = tokio::select! {
-        res = engine.run(Some(snapshot_tx)) => res,
-        _ = wait_for_shutdown_signal() => {
-            cancel_engine.cancel();
-            if let Some(ref bar) = pb {
-                bar.abandon_with_message("Paused");
-            }
-            eprintln!("\n[PAUSED] Download interrupted by signal (SIGINT/SIGTERM). State preserved for safe resume.");
-            return Err("Download interrupted by signal".to_string());
         }
     };
-
-    let _ = monitor_handle.await;
-
-    match result {
-        Ok(path) => {
-            if let Some(ref bar) = pb {
-                bar.finish_with_message("Complete");
-            }
-            if !quiet {
-                println!("\n[OK] Downloaded to: {}", path.display());
-            }
-            Ok(path)
+    let mut urls = Vec::new();
+    for candidate in &candidates {
+        let url = http_url(candidate).ok_or_else(|| format!("'{}' is not an http(s) URL", candidate))?;
+        if !urls.contains(&url) {
+            urls.push(url);
         }
-        Err(err) => {
-            if let Some(ref bar) = pb {
-                bar.abandon_with_message("Failed");
+    }
+    Ok(urls)
+}
+
+async fn verify_file(args: &Args, path: &Path, ui: &Ui, shutdown: &Shutdown) -> i32 {
+    if !args.repair && !args.urls.is_empty() {
+        return usage("URLs after --verify are only used together with --repair");
+    }
+    let res = match run_verify(path.to_path_buf(), args.checksum.clone()).await {
+        Ok(res) => res,
+        Err(e) => return usage(&e),
+    };
+    print_verification(&res);
+    if res.is_complete {
+        return EXIT_OK;
+    }
+    if !args.repair {
+        return EXIT_USAGE;
+    }
+    if res.missing_ranges.is_empty() {
+        eprintln!("Nothing to repair: missing ranges are unknown or the contents are wrong; download the file again.");
+        return EXIT_USAGE;
+    }
+    let Some(total_size) = res.expected_size else {
+        eprintln!("Cannot repair: the expected file size is unknown.");
+        return EXIT_USAGE;
+    };
+    let urls = {
+        let (explicit, data_path) = (args.urls.clone(), res.file_path.clone());
+        match tokio::task::spawn_blocking(move || repair_urls(&explicit, &data_path)).await {
+            Ok(Ok(urls)) if !urls.is_empty() => urls,
+            Ok(Ok(_)) => {
+                return usage(&format!(
+                    "no download URL is known for {}; pass it: --verify FILE --repair URL",
+                    final_path(&res.file_path).display()
+                ))
             }
-            eprintln!("\n[ERROR] Download failed: {}", err);
-            Err(err)
+            Ok(Err(e)) => return usage(&e),
+            Err(e) => return usage(&e.to_string()),
         }
+    };
+
+    println!("\nRepairing from {} mirror(s)...", urls.len());
+    let cancel = Arc::new(AtomicBool::new(false));
+    let watcher = {
+        let (cancel, mut stop) = (Arc::clone(&cancel), shutdown.subscribe());
+        tokio::spawn(async move {
+            stop_requested(&mut stop).await;
+            cancel.store(true, Ordering::Relaxed);
+        })
+    };
+    let bar = ui.byte_bar("repair", Some(0), None);
+    let progress = bar.clone();
+    let repaired = verify::repair_missing_ranges(
+        &res.file_path,
+        total_size,
+        &res.missing_ranges,
+        &urls,
+        Some(cancel),
+        move |done, total| {
+            progress.set_length(total);
+            progress.set_position(done);
+        },
+    )
+    .await;
+    watcher.abort();
+    bar.finish_and_clear();
+
+    if let Err(e) = repaired {
+        if let Some(code) = shutdown.requested() {
+            eprintln!("[STOPPED] {}; repaired ranges are saved, run the command again to continue", e);
+            return code;
+        }
+        eprintln!("[FAILED] Repair: {}", e);
+        return EXIT_FAILED;
+    }
+
+    // A repaired .part is renamed to its final name.
+    let recheck = if res.file_path.exists() { res.file_path.clone() } else { final_path(&res.file_path) };
+    println!("\nRepair finished; verifying again...");
+    match run_verify(recheck, args.checksum.clone()).await {
+        Ok(res) => {
+            print_verification(&res);
+            if res.is_complete { EXIT_OK } else { EXIT_USAGE }
+        }
+        Err(e) => usage(&e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exit_codes() {
+        assert_eq!(exit_code(None, 0), 0);
+        assert_eq!(exit_code(None, 3), 1);
+        assert_eq!(exit_code(Some(130), 0), 130);
+        assert_eq!(exit_code(Some(143), 2), 143);
+    }
+
+    #[test]
+    fn single_file_options_need_a_single_task() {
+        let file = Path::new("does-not-exist-hf-cli/out.bin");
+        assert!(check_single_file_options(Some(file), true, 1).is_ok());
+        assert!(check_single_file_options(Some(file), false, 2).unwrap_err().contains("-d DIR"));
+        assert!(check_single_file_options(None, true, 2).unwrap_err().contains("--checksum"));
+        assert!(check_single_file_options(Some(Path::new(".")), false, 1).unwrap_err().contains("directory"));
+        assert!(check_single_file_options(None, false, 5).is_ok());
+    }
+
+    #[test]
+    fn part_files_map_to_their_final_name() {
+        assert_eq!(final_path(Path::new("dir/a.iso.part")), PathBuf::from("dir/a.iso"));
+        assert_eq!(final_path(Path::new("dir/a.iso")), PathBuf::from("dir/a.iso"));
+    }
+
+    #[test]
+    fn history_rows_are_compact() {
+        let url = "https://cdn.example.com/very/long/path/file.iso?token=secret".to_string();
+        let mut entry = HistoryEntry::new("x".repeat(60), PathBuf::from("/d/x"), 2048, vec![url]);
+        entry.status = HistoryStatus::Failed("connection reset".to_string());
+        entry.downloaded_bytes = 512;
+        let row = history_row(&entry);
+        assert!(row.starts_with("Failed "), "{}", row);
+        assert!(row.contains("cdn.example.com") && !row.contains("secret"), "{}", row);
+        assert!(row.contains(&format!("{}...", "x".repeat(37))), "{}", row);
+        assert!(row.ends_with("connection reset"), "{}", row);
+
+        entry.status = HistoryStatus::Cancelled;
+        assert!(history_row(&entry).starts_with("Stopped 25%"));
+        entry.file_size = 0;
+        assert!(history_row(&entry).starts_with("Stopped "));
+    }
+
+    #[test]
+    fn repair_prefers_explicit_urls_and_rejects_bad_ones() {
+        let urls = repair_urls(&["https://a.example/f".to_string(), "https://a.example/f".to_string()], Path::new("f"));
+        assert_eq!(urls.unwrap().len(), 1);
+        assert!(repair_urls(&["file.bin".to_string()], Path::new("f")).is_err());
     }
 }
