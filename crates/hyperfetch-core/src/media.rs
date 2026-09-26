@@ -645,7 +645,7 @@ fn install_onedir(bin_dir: &Path, tag: &str, zip: &[u8]) -> Result<PathBuf, Stri
         let _ = std::fs::remove_dir_all(&unpacked);
         return Err(e);
     }
-    if let Err(e) = std::fs::rename(&unpacked, &target) {
+    if let Err(e) = rename_patiently(&unpacked, &target) {
         let _ = std::fs::remove_dir_all(&unpacked);
         // Another process installed the same release meanwhile.
         if !target.join("yt-dlp.exe").is_file() {
@@ -654,6 +654,30 @@ fn install_onedir(bin_dir: &Path, tag: &str, zip: &[u8]) -> Result<PathBuf, Stri
     }
     remove_old_releases(bin_dir);
     Ok(target.join("yt-dlp.exe"))
+}
+
+/// Renames folder `from` to `to`, trying again for a moment while Windows refuses. Antivirus
+/// scanners open new programs right after they are written, and a folder with an open file in it
+/// cannot be renamed. Gives up at once once `to` exists (another process installed the same
+/// release). Blocking.
+#[cfg(windows)]
+fn rename_patiently(from: &Path, to: &Path) -> std::io::Result<()> {
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    let mut pause = Duration::from_millis(100);
+    // 100 + 200 + 400 + 800 ms of waiting at most.
+    for _ in 0..4 {
+        match std::fs::rename(from, to) {
+            Err(e)
+                if (e.kind() == std::io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(ERROR_SHARING_VIOLATION))
+                    && !to.exists() =>
+            {
+                std::thread::sleep(pause);
+                pause *= 2;
+            }
+            done => return done,
+        }
+    }
+    std::fs::rename(from, to)
 }
 
 /// Extracts `archive` into `into` with the tar.exe that ships with Windows (10 1803 and later),
@@ -2635,6 +2659,33 @@ mod tests {
         // and the old release nothing runs from any more goes.
         assert_eq!(install_verified(&bin, "2026.08.19", &zip, &good).unwrap(), exe);
         assert_eq!(left(), [".yt-dlp-2026.08.19-2.zip", "yt-dlp-2026.07.01", "yt-dlp-2026.08.19"]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_release_folder_is_renamed_once_the_scanner_lets_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let (unpacked, target) = (dir.path().join(".yt-dlp-2026.08.19-1.tmp"), dir.path().join("yt-dlp-2026.08.19"));
+        std::fs::create_dir(&unpacked).unwrap();
+        let exe = unpacked.join("yt-dlp.exe");
+        std::fs::write(&exe, b"build").unwrap();
+        // What an antivirus scanner does to a program it has not seen yet.
+        let scanning = std::fs::File::open(&exe).unwrap();
+        assert!(std::fs::rename(&unpacked, &target).is_err(), "a folder with an open file cannot be renamed");
+        let scanner = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(250));
+            drop(scanning);
+        });
+        rename_patiently(&unpacked, &target).unwrap();
+        scanner.join().unwrap();
+        assert_eq!(std::fs::read(target.join("yt-dlp.exe")).unwrap(), b"build");
+
+        // Another process installed the release meanwhile: no waiting for a rename that cannot work.
+        std::fs::create_dir(&unpacked).unwrap();
+        std::fs::write(unpacked.join("yt-dlp.exe"), b"build").unwrap();
+        let started = std::time::Instant::now();
+        assert!(rename_patiently(&unpacked, &target).is_err());
+        assert!(started.elapsed() < Duration::from_millis(100), "{:?}", started.elapsed());
     }
 
     #[cfg(windows)]
