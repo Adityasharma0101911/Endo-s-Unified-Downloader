@@ -1645,9 +1645,13 @@ async fn probe_with(
             None
         }
     };
-    // What the host answering the GET was seen to do: honour the range or not (an unknown length
-    // or an empty file tells neither), and take this long to answer over a new connection.
-    let ranges = if get.status() == StatusCode::OK { Some(false) } else { info.accepts_ranges.then_some(true) };
+    // What the host answering the GET was seen to do: honour the range or not, and take this long
+    // to answer over a new connection. An unknown length or an empty file tells neither, and nor
+    // does the whole file for a range that reaches past its end: a server may send that as it is.
+    let ranges = match get.status() {
+        StatusCode::OK => info.size.is_none_or(|size| size > asked).then_some(false),
+        _ => info.accepts_ranges.then_some(true),
+    };
     let setup_time = info.answer_time.filter(|_| cold);
     hosts::record(get.url(), HostProfile { accepts_ranges: ranges, setup_time, ..Default::default() });
 
