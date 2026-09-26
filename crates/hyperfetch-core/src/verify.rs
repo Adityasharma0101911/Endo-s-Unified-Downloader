@@ -7,6 +7,7 @@ use futures_util::StreamExt;
 use reqwest::header::{HeaderMap, CONTENT_RANGE, ETAG, IF_RANGE, LAST_MODIFIED, RANGE};
 use reqwest::{Client, StatusCode};
 use url::Url;
+use crate::engine::{claim_target, TargetClaim};
 use crate::history::{DownloadHistoryManager, HistoryEntry};
 use crate::range::{compute_gaps, merge_ranges, ByteRange};
 use crate::state::DownloadState;
@@ -298,27 +299,43 @@ async fn fetch_range(
     Ok(())
 }
 
-/// The in-progress file a repair writes into.
+/// The in-progress file a repair writes into, and the claim that keeps downloads away from it
+/// until the repair ends.
 struct RepairTarget {
     final_path: PathBuf,
     part: PathBuf,
     state_path: PathBuf,
     state: DownloadState,
     writer: DiskWriter,
+    _claim: TargetClaim,
 }
 
 /// Sets up `<final>.part` + `<final>.part.hfstate` for repairing `file_path`, recording as complete
 /// only bytes known to be good: those the existing state (or, without one, the caller) vouches
 /// for, minus `missing_ranges` and anything past the end of the file. A damaged file at its final
 /// name is moved to the `.part` first, since a file at its final name must always be complete; an
-/// unfinished repair then leaves a download the engine can resume.
+/// unfinished repair then leaves a download the engine can resume. Fails without touching
+/// anything while a download holds the target.
 fn prepare_repair(
     file_path: &Path,
     total_size: u64,
     missing_ranges: &[ByteRange],
     urls: &[Url],
 ) -> Result<RepairTarget, String> {
+    let final_of = |target: &Path| final_name_of(target).unwrap_or_else(|| target.to_path_buf());
+    let claimed = final_of(&resolve_target(file_path));
+    let Some(claim) = claim_target(&claimed)? else {
+        return Err(format!(
+            "{} is still being downloaded; stop that download before repairing it",
+            claimed.display()
+        ));
+    };
+    // Resolved again under the claim: a download that just finished has moved its `.part`.
     let target = resolve_target(file_path);
+    let final_path = final_of(&target);
+    if final_path != claimed {
+        return Err(format!("{} changed while the repair was starting; try again", file_path.display()));
+    }
     let on_disk = match std::fs::metadata(&target) {
         Ok(meta) => Some(meta.len()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -358,7 +375,6 @@ fn prepare_repair(
     untrusted.extend(ByteRange::new(len, total_size.saturating_sub(1)).ok());
     state.completed_ranges = compute_gaps(total_size, &merge_ranges(untrusted));
 
-    let final_path = final_name_of(&target).unwrap_or_else(|| target.clone());
     let part = with_suffix(&final_path, ".part");
     let state_path = DownloadState::state_file_path(&part);
     if part != target {
@@ -380,12 +396,13 @@ fn prepare_repair(
 
     let writer = DiskWriter::open_or_create(&part, total_size)
         .map_err(|e| format!("Failed to open file for repair: {}", e))?;
-    Ok(RepairTarget { final_path, part, state_path, state, writer })
+    Ok(RepairTarget { final_path, part, state_path, state, writer, _claim: claim })
 }
 
-/// Makes the repair's progress durable; a complete `.part` is renamed to its final name.
+/// Makes the repair's progress durable; a complete `.part` is renamed to its final name. The
+/// claim is released only after that.
 fn finish_repair(repair: RepairTarget, complete: bool) -> Result<(), String> {
-    let RepairTarget { final_path, part, state_path, mut state, writer } = repair;
+    let RepairTarget { final_path, part, state_path, mut state, writer, _claim } = repair;
     // Record progress only once it is durable.
     writer.sync().map_err(|e| format!("Failed to flush repaired data to disk: {}", e))?;
     drop(writer);
@@ -851,19 +868,65 @@ mod tests {
         });
 
         let cancel = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&cancel);
-        tokio::spawn(async move {
+        let (flag, target) = (Arc::clone(&cancel), path.clone());
+        let canceller = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(300)).await;
+            let claimed_by_repair = claim_target(&target).unwrap().is_none();
             flag.store(true, Ordering::Relaxed);
+            claimed_by_repair
         });
         let started = std::time::Instant::now();
         // Spawned, like the GUI does, which also proves the repair future is Send.
+        let repaired = path.clone();
         let res = tokio::spawn(async move {
-            repair_missing_ranges(&path, 1000, &[ByteRange::new(100, 199).unwrap()], &[url], Some(cancel), |_, _| {}).await
+            repair_missing_ranges(&repaired, 1000, &[ByteRange::new(100, 199).unwrap()], &[url], Some(cancel), |_, _| {}).await
         })
         .await
         .unwrap();
         assert_eq!(res, Err("Repair cancelled by user".to_string()));
         assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(canceller.await.unwrap(), "a running repair must hold the claim");
+        assert!(claim_target(&path).unwrap().is_some(), "a cancelled repair must release the claim");
+    }
+
+    #[tokio::test]
+    async fn repair_refuses_a_target_a_download_holds() {
+        let dir = tempdir().unwrap();
+        let content = content();
+        let path = damaged_file(dir.path(), &content);
+        let state_path = DownloadState::state_file_path(&path);
+        let (data, state) = (std::fs::read(&path).unwrap(), std::fs::read(&state_path).unwrap());
+        let url = mock_server(content.clone(), |_, _, s, e, c| partial(s, e, c, usize::MAX)).await;
+        let gap = ByteRange::new(100, 199).unwrap();
+
+        let download = claim_target(&path).unwrap().expect("free target");
+        let res = repair_missing_ranges(&path, 1000, &[gap], std::slice::from_ref(&url), None, |_, _| {}).await;
+        assert!(res.as_ref().is_err_and(|e| e.contains("still being downloaded")), "{:?}", res);
+        assert_eq!(std::fs::read(&path).unwrap(), data);
+        assert_eq!(std::fs::read(&state_path).unwrap(), state);
+        assert!(!part_of(&path).exists());
+        drop(download);
+
+        repair_missing_ranges(&path, 1000, &[gap], &[url], None, |_, _| {}).await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), content);
+        assert!(claim_target(&path).unwrap().is_some(), "a finished repair must release the claim");
+    }
+
+    #[tokio::test]
+    async fn failed_repair_releases_the_claim() {
+        let dir = tempdir().unwrap();
+        let path = damaged_file(dir.path(), &content());
+        let url = mock_server(content(), |_, _, _, _, c| full_200(c)).await;
+        let gap = ByteRange::new(100, 199).unwrap();
+        assert!(repair_missing_ranges(&path, 1000, &[gap], &[url], None, |_, _| {}).await.is_err());
+        assert!(claim_target(&path).unwrap().is_some());
+
+        // Also when the repair fails before it starts: the .part it would write is not its own.
+        std::fs::write(dir.path().join("fresh.bin"), vec![0u8; 1000]).unwrap();
+        std::fs::write(dir.path().join("fresh.bin.part"), b"other").unwrap();
+        let fresh = dir.path().join("fresh.bin");
+        let res = repair_missing_ranges(&fresh, 1000, &[gap], &[Url::parse("http://127.0.0.1:9/").unwrap()], None, |_, _| {}).await;
+        assert!(res.as_ref().is_err_and(|e| e.contains("refusing to overwrite")), "{:?}", res);
+        assert!(claim_target(&fresh).unwrap().is_some());
     }
 }

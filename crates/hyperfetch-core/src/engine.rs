@@ -186,15 +186,10 @@ impl DownloadEngine {
                 .await?;
             match parsed {
                 Ok(segments) => {
-                    // Same name as last time when its `.part` is this stream, so a retry resumes.
                     let base = self.hls_output_path(playlist, &segments);
-                    let out_path = (0..)
-                        .map(|n| numbered(&base, n))
-                        .find(|c| {
-                            !c.exists()
-                                && (!part_path(c).exists() || crate::hls::has_resumable_part(c, &segments))
-                        })
-                        .unwrap_or(base);
+                    // Held until this download returns, whichever way it ends.
+                    let (out_path, _claim, segments) =
+                        blocking(move || claim_hls_output(&base, &segments).map(|(p, c)| (p, c, segments))).await??;
                     let path = crate::hls::HlsEngine::download(
                         &client,
                         segments,
@@ -872,6 +867,28 @@ impl DownloadEngine {
 
     fn stall_timeout(&self) -> Duration {
         Duration::from_secs(self.options.stall_timeout_secs.max(1))
+    }
+}
+
+/// Chooses and claims the HLS output name. Walks `base`, `base (1)`, ... and takes the first name
+/// it can claim that is free or whose `.part` is this same stream, so a retry resumes. A name
+/// another running download holds is skipped even when its `.part` is this stream. Blocking.
+fn claim_hls_output(base: &Path, segments: &[crate::hls::HlsSegment]) -> Result<(PathBuf, Claim), String> {
+    if let Some(parent) = base.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create {}: {}", parent.display(), e))?;
+    }
+    let mut n = 0;
+    loop {
+        let candidate = numbered(base, n);
+        n += 1;
+        let Some(claim) = Claim::try_take(&candidate)? else {
+            continue;
+        };
+        if !candidate.exists()
+            && (!part_path(&candidate).exists() || crate::hls::has_resumable_part(&candidate, segments))
+        {
+            return Ok((candidate, claim));
+        }
     }
 }
 
@@ -1989,6 +2006,68 @@ mod tests {
         ] {
             let out = engine.hls_output_path(&Url::parse(playlist).unwrap(), &[]);
             assert_eq!(out, dir.path().join(expected), "{playlist}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_hls_downloads_of_one_stream_use_different_files() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!("http://{}/live/stream.m3u8", listener.local_addr().unwrap())).unwrap();
+        // The first request for the second segment is held until `release` fires.
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let mut hold = Some((held_tx, release_rx));
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut req = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let path = String::from_utf8_lossy(&req).split_whitespace().nth(1).unwrap_or("/").to_string();
+                let body: &[u8] = match path.as_str() {
+                    "/live/stream.m3u8" => b"#EXTM3U\n#EXTINF:4,\nseg0.ts\n#EXTINF:4,\nseg1.ts\n#EXT-X-ENDLIST\n",
+                    "/live/seg0.ts" => b"AAAA",
+                    _ => b"BBBB",
+                };
+                let gate = if path == "/live/seg1.ts" { hold.take() } else { None };
+                tokio::spawn(async move {
+                    if let Some((held, release)) = gate {
+                        let _ = held.send(());
+                        let _ = release.await;
+                    }
+                    let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let _ = socket.write_all(body).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+
+        let dir = tempdir().unwrap();
+        let engine = || {
+            let options =
+                DownloadOptions { output_path: Some(dir.path().to_path_buf()), num_connections: 1, ..Default::default() };
+            DownloadEngine::new(vec![url.clone()], options)
+        };
+        let first = engine();
+        let first = tokio::spawn(async move { first.run(None).await });
+        tokio::time::timeout(Duration::from_secs(10), held_rx).await.unwrap().unwrap();
+        // The first download's `.part` is now a resumable copy of this very stream.
+        assert!(dir.path().join("stream.ts.part.hlsstate").exists());
+
+        let second = tokio::time::timeout(Duration::from_secs(10), engine().run(None)).await.unwrap().unwrap();
+        assert_eq!(second, dir.path().join("stream (1).ts"), "a running download's .part must not be reused");
+        release_tx.send(()).unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(10), first).await.unwrap().unwrap().unwrap();
+        assert_eq!(first, dir.path().join("stream.ts"));
+        for path in [&first, &second] {
+            assert_eq!(std::fs::read(path).unwrap(), b"AAAABBBB");
+            assert!(!lock_path(path).exists(), "the claim is released when the download ends");
         }
     }
 
