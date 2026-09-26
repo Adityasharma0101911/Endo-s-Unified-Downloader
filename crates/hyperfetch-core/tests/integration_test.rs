@@ -9,6 +9,7 @@ use tokio::sync::{broadcast, RwLock, RwLockReadGuard};
 use url::Url;
 
 use hyperfetch_core::engine::{DownloadEngine, DownloadOptions, EngineSnapshot};
+use hyperfetch_core::history::{DownloadHistoryManager, HistoryEntry, HistoryStatus};
 use hyperfetch_core::range::ByteRange;
 use hyperfetch_core::state::DownloadState;
 
@@ -18,14 +19,20 @@ const KB: usize = 1024;
 /// recorded take this exclusively, so a parallel test's history write cannot race theirs.
 static HISTORY: RwLock<()> = RwLock::const_new(());
 
-/// Points download history at a per-process temp file so tests never touch the user's history.
+/// Points download history at a file under target/ so tests never touch the user's history.
+/// Each run starts it afresh and reuses it (and its lock file) instead of piling up temp files.
 fn isolate_history() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
-        let path = std::env::temp_dir().join(format!("endo-integration-history-{}.json", std::process::id()));
+        let path = Path::new(env!("CARGO_TARGET_TMPDIR")).join("integration-history.json");
         let _ = std::fs::remove_file(&path);
         std::env::set_var("ENDO_HISTORY_PATH", path);
     });
+}
+
+fn history_entry(path: &Path) -> Option<HistoryEntry> {
+    let path = std::path::absolute(path).unwrap();
+    DownloadHistoryManager::load().entries().iter().find(|e| e.file_path == path).cloned()
 }
 
 async fn setup() -> RwLockReadGuard<'static, ()> {
@@ -59,19 +66,36 @@ enum Reply {
     CloseAfter(usize),
     /// Send the headers and this many body bytes, then go silent without closing.
     StallAfter(usize),
+    /// Ignore Range and If-Range and send the whole file with 200.
+    IgnoreRange,
 }
 
 struct Mock {
     data: Vec<u8>,
     /// Advertise and honour byte ranges.
     ranges: bool,
+    /// HEAD advertises `Accept-Ranges: bytes` even though GETs ignore Range.
+    head_claims_ranges: bool,
+    /// HEAD answers only `Content-Length: 0`, as many dynamic endpoints do.
+    empty_head: bool,
+    /// HEAD answers with this status instead.
+    head_status: Option<u16>,
+    /// Any GET with a Range header gets 400.
+    rejects_range: bool,
+    /// This many probes are answered 503 before the server recovers.
+    busy_probes: AtomicUsize,
     /// No Content-Length anywhere; chunked transfer encoding; ranges ignored.
     chunked: bool,
     etag: Option<&'static str>,
+    /// Content-Disposition value sent with every GET response.
+    disposition: Option<String>,
     /// Report this total in Content-Range instead of the real one (a broken mirror).
     content_range_total: Option<usize>,
+    /// Report the total in Content-Range as `*` (unknown).
+    unknown_total: bool,
     /// Answer 503 when more than this many GETs are being served at once.
     max_active: Option<usize>,
+    /// What to do with each GET except the engine's one-byte probes, which are always served.
     plan: fn(usize) -> Reply,
     /// Pause between 16 KiB body writes, in microseconds (adjustable while running).
     delay_us: AtomicU64,
@@ -80,15 +104,22 @@ struct Mock {
     stats: Stats,
 }
 
+/// Counts cover GETs other than the probes (`Range: bytes=0-0`) unless noted.
 #[derive(Default)]
 struct Stats {
     gets: AtomicUsize,
+    probes: AtomicUsize,
     body_bytes: AtomicU64,
     active: AtomicUsize,
-    max_active_seen: AtomicUsize,
+    /// GETs refused with 503 for exceeding `max_active`.
+    refused: AtomicUsize,
     /// Ranges served with 206, in request order.
     ranges: Mutex<Vec<ByteRange>>,
     missing_on_get: AtomicUsize,
+    /// GETs sent with If-Range.
+    if_ranges: AtomicUsize,
+    /// Requests of any kind (HEAD, probe, GET) that carried an Authorization header.
+    authorized: AtomicUsize,
 }
 
 impl Mock {
@@ -96,9 +127,16 @@ impl Mock {
         Self {
             data,
             ranges: true,
+            head_claims_ranges: false,
+            empty_head: false,
+            head_status: None,
+            rejects_range: false,
+            busy_probes: AtomicUsize::new(0),
             chunked: false,
             etag: None,
+            disposition: None,
             content_range_total: None,
+            unknown_total: false,
             max_active: None,
             plan: |_| Reply::Normal,
             delay_us: AtomicU64::new(0),
@@ -155,39 +193,60 @@ async fn handle(mut socket: TcpStream, mock: Arc<Mock>) {
             k.trim().eq_ignore_ascii_case(name).then(|| v.trim().to_string())
         })
     };
+    let s = &mock.stats;
+    if header("authorization").is_some() {
+        s.authorized.fetch_add(1, Ordering::SeqCst);
+    }
     let total = mock.data.len();
     let etag = mock.etag.map(|e| format!("ETag: {}\r\n", e)).unwrap_or_default();
     let accept = if mock.ranges && !mock.chunked { "Accept-Ranges: bytes\r\n" } else { "" };
     let length = |n: usize| if mock.chunked { "Transfer-Encoding: chunked\r\n".to_string() } else { format!("Content-Length: {}\r\n", n) };
 
     if method == "HEAD" {
-        let resp = format!("HTTP/1.1 200 OK\r\n{}{}{}Connection: close\r\n\r\n", length(total), accept, etag);
+        let resp = if let Some(code) = mock.head_status {
+            format!("HTTP/1.1 {} Mock\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", code)
+        } else if mock.empty_head {
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+        } else {
+            let accept = if mock.head_claims_ranges && !mock.chunked { "Accept-Ranges: bytes\r\n" } else { accept };
+            format!("HTTP/1.1 200 OK\r\n{}{}{}Connection: close\r\n\r\n", length(total), accept, etag)
+        };
         let _ = socket.write_all(resp.as_bytes()).await;
         return;
     }
 
-    let s = &mock.stats;
-    let index = s.gets.fetch_add(1, Ordering::SeqCst);
-    let active = s.active.fetch_add(1, Ordering::SeqCst) + 1;
-    let _guard = ActiveGuard(&s.active);
-    if let Some(path) = mock.must_exist_on_get.lock().unwrap().as_ref() {
-        if !path.exists() {
-            s.missing_on_get.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
-    let reply = if mock.max_active.is_some_and(|max| active > max) {
-        Reply::Status(503, Some(1))
+    let probe = header("range").as_deref() == Some("bytes=0-0");
+    let (reply, _guard) = if probe {
+        s.probes.fetch_add(1, Ordering::SeqCst);
+        let busy = mock.busy_probes.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok();
+        (if busy { Reply::Status(503, None) } else { Reply::Normal }, None)
     } else {
-        (mock.plan)(index)
+        let index = s.gets.fetch_add(1, Ordering::SeqCst);
+        let active = s.active.fetch_add(1, Ordering::SeqCst) + 1;
+        let guard = ActiveGuard(&s.active);
+        if header("if-range").is_some() {
+            s.if_ranges.fetch_add(1, Ordering::SeqCst);
+        }
+        if let Some(path) = mock.must_exist_on_get.lock().unwrap().as_ref() {
+            if !path.exists() {
+                s.missing_on_get.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let reply = if mock.max_active.is_some_and(|max| active > max) {
+            s.refused.fetch_add(1, Ordering::SeqCst);
+            Reply::Status(503, Some(1))
+        } else {
+            (mock.plan)(index)
+        };
+        (reply, Some(guard))
     };
+    let reply = if mock.rejects_range && header("range").is_some() { Reply::Status(400, None) } else { reply };
     if let Reply::Status(code, retry_after) = reply {
         let retry = retry_after.map(|s| format!("Retry-After: {}\r\n", s)).unwrap_or_default();
         let resp = format!("HTTP/1.1 {} Mock\r\n{}Content-Length: 0\r\nConnection: close\r\n\r\n", code, retry);
         let _ = socket.write_all(resp.as_bytes()).await;
         return;
     }
-    s.max_active_seen.fetch_max(active, Ordering::SeqCst);
 
     let requested = header("range").and_then(|r| {
         let (a, b) = r.strip_prefix("bytes=")?.split_once('-')?;
@@ -199,7 +258,7 @@ async fn handle(mut socket: TcpStream, mock: Arc<Mock>) {
     };
 
     let (status, start, end) = match requested {
-        Some((a, b)) if mock.ranges && !mock.chunked && validator_ok => {
+        Some((a, b)) if mock.ranges && !mock.chunked && validator_ok && !matches!(reply, Reply::IgnoreRange) => {
             if a >= total {
                 let resp = format!(
                     "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -209,24 +268,29 @@ async fn handle(mut socket: TcpStream, mock: Arc<Mock>) {
                 return;
             }
             let end = b.unwrap_or(total - 1).min(total - 1);
-            s.ranges.lock().unwrap().push(ByteRange::new(a as u64, end as u64).unwrap());
+            if !probe {
+                s.ranges.lock().unwrap().push(ByteRange::new(a as u64, end as u64).unwrap());
+            }
             (206, a, end + 1)
         }
         _ => (200, 0, total),
     };
     let body = &mock.data[start..end];
     let content_range = if status == 206 {
-        format!("Content-Range: bytes {}-{}/{}\r\n", start, end - 1, mock.content_range_total.unwrap_or(total))
+        let total = if mock.unknown_total { "*".to_string() } else { mock.content_range_total.unwrap_or(total).to_string() };
+        format!("Content-Range: bytes {}-{}/{}\r\n", start, end - 1, total)
     } else {
         String::new()
     };
+    let disposition = mock.disposition.as_ref().map(|d| format!("Content-Disposition: {}\r\n", d)).unwrap_or_default();
     let resp = format!(
-        "HTTP/1.1 {} Mock\r\n{}{}{}{}Connection: close\r\n\r\n",
+        "HTTP/1.1 {} Mock\r\n{}{}{}{}{}Connection: close\r\n\r\n",
         status,
         length(body.len()),
         content_range,
         accept,
-        etag
+        etag,
+        disposition
     );
     if socket.write_all(resp.as_bytes()).await.is_err() {
         return;
@@ -251,7 +315,9 @@ async fn handle(mut socket: TcpStream, mock: Arc<Mock>) {
         if !ok {
             return;
         }
-        s.body_bytes.fetch_add(piece.len() as u64, Ordering::SeqCst);
+        if !probe {
+            s.body_bytes.fetch_add(piece.len() as u64, Ordering::SeqCst);
+        }
     }
     match reply {
         Reply::StallAfter(_) => tokio::time::sleep(Duration::from_secs(120)).await,
@@ -591,7 +657,11 @@ async fn test_server_allowing_fewer_connections_still_completes() {
 
     assert_eq!(path, out);
     assert_file(&out, &data);
-    assert!(mock.stats.max_active_seen.load(Ordering::SeqCst) <= 2);
+    // Adapting means lowering the connection cap after refusals, then probing one connection
+    // above it now and then (about 30 refusals here). An engine that kept all 8 connections
+    // retrying is refused hundreds of times.
+    let refused = mock.stats.refused.load(Ordering::SeqCst);
+    assert!(refused < 64, "{refused} requests refused: the engine did not adapt to the limit");
 }
 
 #[tokio::test]
@@ -680,7 +750,9 @@ async fn test_mirror_with_wrong_content_range_total_is_rejected() {
 
     assert_eq!(path, out);
     assert_file(&out, &data);
-    assert!(bad.stats.gets.load(Ordering::SeqCst) >= 1, "the bad mirror was never tried");
+    // The probe's ranged GET already reveals the wrong total, so no data is ever taken from it.
+    assert!(bad.stats.probes.load(Ordering::SeqCst) >= 1, "the bad mirror was never probed");
+    assert_eq!(bad.stats.gets.load(Ordering::SeqCst), 0, "a mirror reporting another total must be dropped at probe time");
     assert_eq!(other.stats.gets.load(Ordering::SeqCst), 0, "a mirror with a different size must be dropped at probe time");
 }
 
@@ -734,25 +806,37 @@ async fn test_redownload_existing_complete_file_does_not_overwrite() {
 
 #[tokio::test]
 async fn test_redownload_different_file_auto_renames() {
-    let _history = setup().await;
+    isolate_history();
+    let _history = HISTORY.write().await;
     let data = payload(1024 * KB, 51);
     let url = serve(Arc::new(Mock::new(data.clone())), "collision_test.bin").await;
     let existing = b"Existing pre-allocated unrelated file with different size";
 
-    // Twice, with the same history: the first run's record must not claim the second directory's file.
-    for _ in 0..2 {
-        let temp = tempdir().unwrap();
-        let out = temp.path().join("collision_test.bin");
-        std::fs::write(&out, existing).unwrap();
+    let first = tempdir().unwrap();
+    let out = first.path().join("collision_test.bin");
+    std::fs::write(&out, existing).unwrap();
+    let engine = DownloadEngine::new(vec![url.clone()], options(&out, 4, 256 * KB));
+    let recorded = run(&engine, None).await.expect("download should auto-rename and succeed");
+    assert_eq!(recorded, first.path().join("collision_test (1).bin"));
+    assert_eq!(std::fs::read(&out).unwrap(), existing);
+    assert_file(&recorded, &data);
+    assert!(history_entry(&recorded).is_some(), "the download must be recorded");
 
-        let engine = DownloadEngine::new(vec![url.clone()], options(&out, 4, 256 * KB));
-        let path = run(&engine, None).await.expect("download should auto-rename and succeed");
+    // Another directory with the same names, where `collision_test (1).bin` even has the recorded
+    // size and URL but other bytes: only a record of this exact path could vouch for it.
+    let second = tempdir().unwrap();
+    let out = second.path().join("collision_test.bin");
+    std::fs::write(&out, existing).unwrap();
+    let impostor = payload(1024 * KB, 7);
+    let same_name = second.path().join("collision_test (1).bin");
+    std::fs::write(&same_name, &impostor).unwrap();
+    let engine = DownloadEngine::new(vec![url], options(&out, 4, 256 * KB));
+    let path = run(&engine, None).await.expect("download should auto-rename and succeed");
 
-        let renamed = temp.path().join("collision_test (1).bin");
-        assert_eq!(path, renamed);
-        assert_eq!(std::fs::read(&out).unwrap(), existing);
-        assert_file(&renamed, &data);
-    }
+    assert_eq!(path, second.path().join("collision_test (2).bin"));
+    assert_file(&path, &data);
+    assert_eq!(std::fs::read(&same_name).unwrap(), impostor);
+    assert_eq!(std::fs::read(&out).unwrap(), existing);
 }
 
 #[tokio::test]
@@ -812,4 +896,270 @@ async fn test_missing_file_fails_fast() {
         assert!(err.contains("404"), "{err}");
         assert!(started.elapsed() < Duration::from_secs(5), "took {:?} (ranges: {ranges})", started.elapsed());
     }
+}
+
+/// Lists a directory's file names, sorted.
+fn names_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> =
+        std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    names.sort();
+    names
+}
+
+#[tokio::test]
+async fn test_concurrent_downloads_of_same_name_get_separate_files() {
+    let _history = setup().await;
+    let (a, b) = (payload(512 * KB, 3), payload(512 * KB, 5));
+    let mocks: Vec<Arc<Mock>> = [&a, &b]
+        .into_iter()
+        .map(|data| {
+            let mut mock = Mock::new(data.clone());
+            mock.ranges = false; // single stream: the .part appears only once the response arrives
+            mock.delay_us.store(2_000, Ordering::SeqCst);
+            Arc::new(mock)
+        })
+        .collect();
+    let url_a = serve(Arc::clone(&mocks[0]), "file.bin").await;
+    let url_b = serve(Arc::clone(&mocks[1]), "file.bin").await;
+    let temp = tempdir().unwrap();
+
+    let engine_a = DownloadEngine::new(vec![url_a], options(temp.path(), 4, 64 * KB));
+    let engine_b = DownloadEngine::new(vec![url_b], options(temp.path(), 4, 64 * KB));
+    let (res_a, res_b) = tokio::join!(run(&engine_a, None), run(&engine_b, None));
+    let (path_a, path_b) = (res_a.expect("download A"), res_b.expect("download B"));
+
+    assert_ne!(path_a, path_b);
+    assert_file(&path_a, &a);
+    assert_file(&path_b, &b);
+    assert_eq!(names_in(temp.path()), ["file (1).bin", "file.bin"], "no .part, state or lock may be left");
+}
+
+#[tokio::test]
+async fn test_output_directory_that_does_not_exist_yet() {
+    let _history = setup().await;
+    let data = payload(200 * KB, 111);
+    let url = serve(Arc::new(Mock::new(data.clone())), "server_name.bin").await;
+    let temp = tempdir().unwrap();
+    let dir = temp.path().join("newdir");
+    let mut dir_arg = dir.clone().into_os_string();
+    dir_arg.push(std::path::MAIN_SEPARATOR_STR);
+
+    let engine = DownloadEngine::new(vec![url], options(Path::new(&dir_arg), 2, 64 * KB));
+    let path = run(&engine, None).await.expect("the directory should be created");
+
+    assert_eq!(path, dir.join("server_name.bin"));
+    assert_file(&path, &data);
+}
+
+#[tokio::test]
+async fn test_server_ignoring_ranges_it_advertises_falls_back_to_one_stream() {
+    let _history = setup().await;
+    let data = payload(512 * KB, 113);
+    let mut mock = Mock::new(data.clone());
+    mock.ranges = false;
+    mock.head_claims_ranges = true;
+    let mock = Arc::new(mock);
+    let url = serve(Arc::clone(&mock), "liar.bin").await;
+    let temp = tempdir().unwrap();
+    let out = temp.path().join("liar.bin");
+
+    let engine = DownloadEngine::new(vec![url], options(&out, 4, 64 * KB));
+    let path = run(&engine, None).await.expect("a plain GET works, so the download must too");
+
+    assert_eq!(path, out);
+    assert_file(&out, &data);
+    assert_eq!(mock.stats.gets.load(Ordering::SeqCst), 1, "one stream, no failed range requests");
+}
+
+#[tokio::test]
+async fn test_unknown_total_in_content_range_uses_one_stream() {
+    let _history = setup().await;
+    let data = payload(300 * KB, 127);
+    let mut mock = Mock::new(data.clone());
+    mock.unknown_total = true;
+    let mock = Arc::new(mock);
+    let url = serve(Arc::clone(&mock), "star.bin").await;
+    let temp = tempdir().unwrap();
+    let out = temp.path().join("star.bin");
+
+    let engine = DownloadEngine::new(vec![url], options(&out, 4, 64 * KB));
+    let path = run(&engine, None).await.expect("download should succeed");
+
+    assert_eq!(path, out);
+    assert_file(&out, &data);
+    assert_eq!(mock.stats.gets.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn test_busy_probe_is_retried_instead_of_losing_ranges() {
+    let _history = setup().await;
+    let data = payload(512 * KB, 151);
+    let mock = Arc::new(Mock::new(data.clone()));
+    mock.busy_probes.store(1, Ordering::SeqCst);
+    let url = serve(Arc::clone(&mock), "busy_probe.bin").await;
+    let temp = tempdir().unwrap();
+    let out = temp.path().join("busy_probe.bin");
+
+    let engine = DownloadEngine::new(vec![url], options(&out, 4, 64 * KB));
+    run(&engine, None).await.expect("download should succeed");
+
+    assert_file(&out, &data);
+    assert_eq!(mock.stats.probes.load(Ordering::SeqCst), 2);
+    assert!(mock.served_ranges().len() >= 8, "a momentary 503 must not demote the download to one stream");
+}
+
+#[tokio::test]
+async fn test_server_rejecting_head_and_ranges_is_fetched_with_a_plain_get() {
+    let _history = setup().await;
+    let data = payload(256 * KB, 157);
+    let mut mock = Mock::new(data.clone());
+    mock.head_status = Some(405);
+    mock.rejects_range = true;
+    let url = serve(Arc::new(mock), "picky.bin").await;
+    let temp = tempdir().unwrap();
+    let out = temp.path().join("picky.bin");
+
+    let engine = DownloadEngine::new(vec![url], options(&out, 4, 64 * KB));
+    let path = run(&engine, None).await.expect("a plain GET works, so the download must too");
+
+    assert_eq!(path, out);
+    assert_file(&out, &data);
+}
+
+#[tokio::test]
+async fn test_get_probe_supplies_name_and_validator_missing_from_head() {
+    let _history = setup().await;
+    let data = payload(512 * KB, 131);
+    let mut mock = Mock::new(data.clone());
+    mock.empty_head = true;
+    mock.etag = Some("\"real-v1\"");
+    mock.disposition = Some("attachment; filename=\"real.zip\"".to_string());
+    let mock = Arc::new(mock);
+    let url = serve(Arc::clone(&mock), "dl.cgi").await;
+    let temp = tempdir().unwrap();
+
+    let engine = DownloadEngine::new(vec![url], options(temp.path(), 4, 64 * KB));
+    let path = run(&engine, None).await.expect("download should succeed");
+
+    assert_eq!(path, temp.path().join("real.zip"));
+    assert_file(&path, &data);
+    let (gets, validated) = (mock.stats.gets.load(Ordering::SeqCst), mock.stats.if_ranges.load(Ordering::SeqCst));
+    assert!(gets > 1 && validated == gets, "range requests must carry If-Range ({validated} of {gets})");
+}
+
+#[tokio::test]
+async fn test_long_server_file_name_is_shortened() {
+    let _history = setup().await;
+    let data = payload(64 * KB, 137);
+    let mut mock = Mock::new(data.clone());
+    mock.disposition = Some(format!("attachment; filename=\"{}.bin\"", "a".repeat(245)));
+    let url = serve(Arc::new(mock), "dl").await;
+    let temp = tempdir().unwrap();
+
+    let engine = DownloadEngine::new(vec![url], options(temp.path(), 2, 64 * KB));
+    let path = run(&engine, None).await.expect("a long server name must not break the download");
+
+    let name = path.file_name().unwrap().to_str().unwrap();
+    assert!(name.len() <= 200 && name.starts_with("aaaa") && name.ends_with(".bin"), "{name}");
+    assert_file(&path, &data);
+}
+
+#[tokio::test]
+async fn test_range_ignored_once_under_if_range_is_retried() {
+    let _history = setup().await;
+    let data = payload(512 * KB, 139);
+    let mut mock = Mock::new(data.clone());
+    mock.etag = Some("\"same\"");
+    // The second chunk's request gets the whole, unchanged file (same ETag) with 200.
+    mock.plan = |i| if i == 1 { Reply::IgnoreRange } else { Reply::Normal };
+    let mock = Arc::new(mock);
+    let url = serve(Arc::clone(&mock), "cdn.bin").await;
+    let temp = tempdir().unwrap();
+    let out = temp.path().join("cdn.bin");
+
+    let engine = DownloadEngine::new(vec![url], options(&out, 1, 128 * KB));
+    let path = run(&engine, None).await.expect("an unchanged file is no reason to abort");
+
+    assert_eq!(path, out);
+    assert_file(&out, &data);
+    assert_eq!(mock.served_ranges().len() + 1, mock.stats.gets.load(Ordering::SeqCst), "exactly one ignored range");
+}
+
+#[tokio::test]
+async fn test_authorization_reaches_the_user_host() {
+    let _history = setup().await;
+    let data = payload(256 * KB, 149);
+    let mock = Arc::new(Mock::new(data.clone()));
+    let url = serve(Arc::clone(&mock), "private.bin").await;
+    let temp = tempdir().unwrap();
+    let out = temp.path().join("private.bin");
+
+    let mut opts = options(&out, 2, 64 * KB);
+    opts.auth_header = Some("Bearer token".to_string());
+    let engine = DownloadEngine::new(vec![url], opts);
+    run(&engine, None).await.expect("download should succeed");
+
+    assert_file(&out, &data);
+    let s = &mock.stats;
+    let requests = 1 + s.probes.load(Ordering::SeqCst) + s.gets.load(Ordering::SeqCst); // HEAD + GETs
+    assert_eq!(s.authorized.load(Ordering::SeqCst), requests, "every request to the user's host is authorized");
+}
+
+const ONE_SEGMENT_PLAYLIST: &str = "#EXTM3U\n#EXT-X-TARGETDURATION:10\n#EXTINF:1,\nseg.ts\n#EXT-X-ENDLIST\n";
+
+#[tokio::test]
+async fn test_empty_hls_playlist_is_an_error_not_a_text_download() {
+    let _history = setup().await;
+    let playlist = b"#EXTM3U\n#EXT-X-TARGETDURATION:10\n#EXT-X-ENDLIST\n".to_vec();
+    let url = serve(Arc::new(Mock::new(playlist)), "index.m3u8").await;
+    let temp = tempdir().unwrap();
+
+    let engine = DownloadEngine::new(vec![url], options(temp.path(), 2, 64 * KB));
+    let err = run(&engine, None).await.expect_err("a stream without segments cannot succeed");
+
+    assert!(err.contains("segments"), "{err}");
+    assert!(names_in(temp.path()).is_empty(), "the playlist text must not be saved");
+}
+
+#[tokio::test]
+async fn test_hls_download_verifies_checksum_and_records_history() {
+    isolate_history();
+    let _history = HISTORY.write().await;
+    // Every path of the mock serves this text, so the single segment is the playlist itself.
+    let text = ONE_SEGMENT_PLAYLIST.as_bytes().to_vec();
+    let url = serve(Arc::new(Mock::new(text.clone())), "index.m3u8").await;
+    let temp = tempdir().unwrap();
+
+    let mut opts = options(temp.path(), 2, 64 * KB);
+    opts.expected_checksum = Some(format!("blake3:{}", "0".repeat(64)));
+    let engine = DownloadEngine::new(vec![url.clone()], opts.clone());
+    let err = run(&engine, None).await.expect_err("a wrong checksum must fail the download");
+    assert!(err.contains("Checksum verification failed"), "{err}");
+    assert!(history_entry(&temp.path().join("index.ts")).is_none());
+
+    let blake3 = blake3::hash(&text).to_hex().to_string();
+    opts.expected_checksum = Some(blake3.clone());
+    let engine = DownloadEngine::new(vec![url], opts);
+    let path = run(&engine, None).await.expect("the right checksum passes");
+    assert_file(&path, &text);
+    let entry = history_entry(&path).expect("HLS downloads are recorded");
+    assert_eq!(entry.status, HistoryStatus::Completed);
+    assert_eq!(entry.blake3_hash.as_deref(), Some(blake3.as_str()));
+}
+
+#[tokio::test]
+async fn test_slow_hls_playlist_is_not_cut_off_by_the_probe_timeout() {
+    let _history = setup().await;
+    let mut mock = Mock::new(ONE_SEGMENT_PLAYLIST.as_bytes().to_vec());
+    // The playlist takes 16s to arrive (well within HLS's own stall timeout); the segment is gone.
+    mock.plan = |i| if i == 0 { Reply::Normal } else { Reply::Status(404, None) };
+    mock.delay_us.store(16_000_000, Ordering::SeqCst);
+    let url = serve(Arc::new(mock), "slow.m3u8").await;
+    let temp = tempdir().unwrap();
+
+    let engine = DownloadEngine::new(vec![url], options(temp.path(), 2, 64 * KB));
+    let err = run(&engine, None).await.expect_err("the segment is missing");
+
+    assert!(!err.contains("Timed out"), "the playlist fetch was cut off: {err}");
+    assert!(err.contains("404"), "{err}");
 }
