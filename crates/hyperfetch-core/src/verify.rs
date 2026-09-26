@@ -12,6 +12,7 @@ use crate::history::{DownloadHistoryManager, HistoryEntry};
 use crate::range::{compute_gaps, merge_ranges, ByteRange};
 use crate::state::DownloadState;
 use crate::storage::DiskWriter;
+use crate::worker::carries_validator;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// A mirror that sends nothing for this long is treated as stalled.
@@ -169,6 +170,8 @@ fn verify_with_history(
 enum FetchError {
     /// This attempt failed; another attempt or mirror may succeed.
     Retry(String),
+    /// This mirror serves another version of the file; nothing from this answer was written.
+    WrongVersion(String),
     /// Stop the whole repair (cancelled, or the local file cannot be written).
     Fatal(String),
 }
@@ -192,35 +195,53 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
         .map_err(|e| format!("Background task failed: {}", e))
 }
 
-/// Validator for `If-Range`: a strong ETag, else Last-Modified (weak ETags are not allowed there).
-fn if_range(state: &DownloadState) -> Option<&str> {
-    state
-        .etag
-        .as_deref()
-        .filter(|e| !e.starts_with("W/"))
-        .or(state.last_modified.as_deref())
+/// The ETag and Last-Modified identifying one version of the file.
+#[derive(Clone)]
+struct Version {
+    etag: Option<String>,
+    last_modified: Option<String>,
 }
 
-/// Whether a response carries an ETag (or, failing that, a Last-Modified) that differs from the
-/// one recorded when the download started.
-fn remote_changed(state: &DownloadState, headers: &HeaderMap) -> bool {
-    let header = |name| headers.get(name).and_then(|v| v.to_str().ok());
-    match (state.etag.as_deref(), header(ETAG)) {
-        (Some(recorded), Some(served)) => recorded != served,
-        _ => matches!(
-            (state.last_modified.as_deref(), header(LAST_MODIFIED)),
-            (Some(recorded), Some(served)) if recorded != served
-        ),
+impl Version {
+    fn recorded(state: &DownloadState) -> Self {
+        Self { etag: state.etag.clone(), last_modified: state.last_modified.clone() }
+    }
+
+    fn served(headers: &HeaderMap) -> Self {
+        let header = |name| headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_string);
+        Self { etag: header(ETAG), last_modified: header(LAST_MODIFIED) }
+    }
+
+    /// Whether `other` may be this version: equal ETags where both have one, else equal
+    /// Last-Modified where both have one.
+    fn matches(&self, other: &Version) -> bool {
+        match (&self.etag, &other.etag) {
+            (Some(a), Some(b)) => a == b,
+            _ => match (&self.last_modified, &other.last_modified) {
+                (Some(a), Some(b)) => a == b,
+                _ => true,
+            },
+        }
+    }
+
+    /// Validator for `If-Range`: a strong ETag, else Last-Modified (weak ETags are not allowed there).
+    fn if_range(&self) -> Option<&str> {
+        self.etag.as_deref().filter(|e| !e.starts_with("W/")).or(self.last_modified.as_deref())
     }
 }
 
 /// Fetches bytes `*offset..=end` from `url` into the file, advancing `*offset` past every byte
 /// actually written. Only a 206 whose Content-Range starts at `*offset`, ends at or before `end`
 /// and reports the file's full size is accepted; the server may return fewer bytes than asked for.
-/// A response showing that the file changed since its state was recorded aborts the repair.
+///
+/// `seen` is the version this mirror served so far. Mirrors of one download may differ in their
+/// validators, so each mirror is held to its own: its first answer must match the version the
+/// state recorded, and later requests send its own validator in If-Range.
+#[allow(clippy::too_many_arguments)]
 async fn fetch_range(
     client: &Client,
     url: &Url,
+    seen: &mut Option<Version>,
     offset: &mut u64,
     end: u64,
     repair: &RepairTarget,
@@ -229,23 +250,22 @@ async fn fetch_range(
 ) -> Result<(), FetchError> {
     let RepairTarget { state, writer, .. } = repair;
     let total_size = writer.size();
-    let validator = if_range(state);
+    let validator = seen.as_ref().and_then(Version::if_range).map(str::to_string);
     let mut request = client.get(url.clone()).header(RANGE, format!("bytes={}-{}", *offset, end));
-    if let Some(validator) = validator {
-        request = request.header(IF_RANGE, validator);
+    if let Some(validator) = &validator {
+        request = request.header(IF_RANGE, validator.as_str());
     }
     let resp = until_cancelled(request.send(), cancel)
         .await?
         .map_err(|e| FetchError::Retry(format!("request to {} failed: {}", url, e)))?;
 
-    let changed = || {
-        FetchError::Fatal(format!(
-            "The file at {} changed since it was downloaded; repair aborted, nothing was written",
-            url
-        ))
-    };
-    if resp.status() == StatusCode::OK && validator.is_some() {
-        return Err(changed());
+    let changed = || FetchError::WrongVersion(format!("the file at {} changed since it was downloaded", url));
+    if resp.status() == StatusCode::OK {
+        // Under If-Range, a 200 still carrying our validator only means the range was ignored.
+        return Err(match &validator {
+            Some(v) if !carries_validator(resp.headers(), v) => changed(),
+            _ => FetchError::Retry(format!("{} ignored the range request and sent the whole file", url)),
+        });
     }
     if resp.status() != StatusCode::PARTIAL_CONTENT {
         return Err(FetchError::Retry(format!(
@@ -254,7 +274,12 @@ async fn fetch_range(
             resp.status()
         )));
     }
-    if remote_changed(state, resp.headers()) {
+    let version = Version::served(resp.headers());
+    let same = match seen.as_ref() {
+        Some(known) => known.matches(&version),
+        None => Version::recorded(state).matches(&version),
+    };
+    if !same {
         return Err(changed());
     }
     let header = resp
@@ -272,6 +297,7 @@ async fn fetch_range(
             )))
         }
     };
+    seen.get_or_insert(version);
 
     let mut stream = resp.bytes_stream();
     while *offset <= served.end {
@@ -428,8 +454,8 @@ fn finish_repair(repair: RepairTarget, complete: bool) -> Result<(), String> {
 /// first) and bytes are recorded in its `.hfstate` only once they have actually been written, so
 /// an interrupted repair leaves a download the engine resumes. Every gap the state records is
 /// fetched, including `missing_ranges`. Only a complete file is renamed back to its final name.
-/// When the state records an ETag or Last-Modified, a server whose file has changed aborts the
-/// repair instead of mixing two versions.
+/// A mirror is used only while it serves the version the state records (by ETag, else
+/// Last-Modified); with no such mirror left the repair stops instead of mixing two versions.
 pub async fn repair_missing_ranges<F>(
     file_path: &Path,
     total_size: u64,
@@ -473,14 +499,25 @@ where
     };
     let cancel = cancel_flag.as_deref();
     let mut outcome = Ok(());
+    // Per mirror: the version it served so far, and why it was dropped.
+    let mut seen: Vec<Option<Version>> = vec![None; urls.len()];
+    let mut dropped: Vec<Option<String>> = vec![None; urls.len()];
 
     'ranges: for (range_idx, range) in gaps.iter().enumerate() {
         let mut offset = range.start;
         let mut failures = 0;
         while offset <= range.end {
+            let usable: Vec<usize> = (0..urls.len()).filter(|&i| dropped[i].is_none()).collect();
+            if usable.is_empty() {
+                let reasons: Vec<&str> = dropped.iter().flatten().map(String::as_str).collect();
+                outcome = Err(format!("Repair stopped: {}", reasons.join("; ")));
+                break 'ranges;
+            }
+            let mirror = usable[(range_idx + failures) % usable.len()];
             let before = offset;
-            let url = &urls[(range_idx + failures) % urls.len()];
-            let result = fetch_range(&client, url, &mut offset, range.end, &repair, cancel, &mut on_bytes).await;
+            let result =
+                fetch_range(&client, &urls[mirror], &mut seen[mirror], &mut offset, range.end, &repair, cancel, &mut on_bytes)
+                    .await;
             if offset > before {
                 repair.state.completed_ranges.push(ByteRange { start: before, end: offset - 1 });
                 failures = 0;
@@ -491,10 +528,14 @@ where
                     outcome = Err(e);
                     break 'ranges;
                 }
+                Err(FetchError::WrongVersion(e)) => {
+                    tracing::warn!("Repair no longer uses {}: {}", urls[mirror], e);
+                    dropped[mirror] = Some(e);
+                }
                 Err(FetchError::Retry(e)) => {
                     failures += 1;
                     tracing::warn!("Repair of range {} failed: {}", range, e);
-                    if failures >= urls.len() * ATTEMPTS_PER_MIRROR {
+                    if failures >= usable.len() * ATTEMPTS_PER_MIRROR {
                         outcome = Err(format!("Could not repair range {}: {}", range, e));
                         break 'ranges;
                     }
@@ -681,10 +722,10 @@ mod tests {
         resp
     }
 
-    /// `resp` with `ETag: "v2"` added after its status line.
-    fn with_new_etag(resp: Vec<u8>) -> Vec<u8> {
+    /// `resp` with `header` added after its status line.
+    fn with_header(resp: Vec<u8>, header: &str) -> Vec<u8> {
         let head_end = resp.windows(2).position(|w| w == b"\r\n").unwrap() + 2;
-        [&resp[..head_end], b"ETag: \"v2\"\r\n", &resp[head_end..]].concat()
+        [&resp[..head_end], header.as_bytes(), b"\r\n", &resp[head_end..]].concat()
     }
 
     /// 1000-byte file whose bytes 100..=199 are missing; state records the rest as complete.
@@ -801,14 +842,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repair_sends_if_range_and_aborts_when_file_changed() {
+    async fn repair_sends_if_range_and_stops_when_the_file_changes() {
         let dir = tempdir().unwrap();
-        let path = damaged_file_v1(dir.path(), &content());
-        // The server now has another build of the same size: it honors Range only while the
-        // client's If-Range still matches, which "v1" no longer does.
-        let new_build: Vec<u8> = content().iter().map(|b| b ^ 0xff).collect();
-        let url = mock_server(new_build, |_, req, s, e, c| {
-            if req.contains("if-range: \"v1\"") { with_new_etag(full_200(c)) } else { with_new_etag(partial(s, e, c, usize::MAX)) }
+        let content = content();
+        let path = damaged_file_v1(dir.path(), &content);
+        // The first answer, capped at 40 bytes, is still build "v1". Then the server has a new
+        // build: it honors Range only while If-Range still matches, and without If-Range it would
+        // pass the new bytes off as "v1".
+        let url = mock_server(content.clone(), |attempt, req, s, e, c| {
+            let new_build: Vec<u8> = c.iter().map(|b| b ^ 0xff).collect();
+            match attempt {
+                0 => with_header(partial(s, e.min(s + 39), c, usize::MAX), "ETag: \"v1\""),
+                _ if req.contains("if-range: \"v1\"") => with_header(full_200(&new_build), "ETag: \"v2\""),
+                _ => with_header(partial(s, e, &new_build, usize::MAX), "ETag: \"v1\""),
+            }
         })
         .await;
 
@@ -817,8 +864,67 @@ mod tests {
         assert!(res.as_ref().is_err_and(|e| e.contains("changed")), "{:?}", res);
 
         assert!(!path.exists());
-        assert!(std::fs::read(part_of(&path)).unwrap()[100..200].iter().all(|&b| b == 0));
-        assert_eq!(gaps_on_disk(&part_of(&path)), vec![gap]);
+        let on_disk = std::fs::read(part_of(&path)).unwrap();
+        assert_eq!(on_disk[100..140], content[100..140]);
+        assert!(on_disk[140..200].iter().all(|&b| b == 0), "no byte of the new build may be written");
+        assert_eq!(gaps_on_disk(&part_of(&path)), vec![ByteRange::new(140, 199).unwrap()]);
+    }
+
+    /// 1000-byte file missing bytes 100..=199 and 500..=599, downloaded as ETag "v1" from a
+    /// mirror whose Last-Modified was `MON`.
+    fn damaged_twice(dir: &Path, content: &[u8]) -> PathBuf {
+        let path = dir.join("build.bin");
+        let mut data = content.to_vec();
+        data[100..200].fill(0);
+        data[500..600].fill(0);
+        std::fs::write(&path, &data).unwrap();
+        let mut state = DownloadState::new("build.bin".into(), 1000, 250, vec![]);
+        state.completed_ranges =
+            vec![ByteRange::new(0, 99).unwrap(), ByteRange::new(200, 499).unwrap(), ByteRange::new(600, 999).unwrap()];
+        state.etag = Some("\"v1\"".into());
+        state.last_modified = Some(MON.into());
+        state.save_atomic(&DownloadState::state_file_path(&path)).unwrap();
+        path
+    }
+
+    const MON: &str = "Mon, 06 Nov 2023 08:49:37 GMT";
+
+    #[tokio::test]
+    async fn repair_skips_a_mirror_whose_validators_differ_instead_of_aborting() {
+        let dir = tempdir().unwrap();
+        let content = content();
+        let path = damaged_twice(dir.path(), &content);
+        // Both serve the same bytes, as the download accepted, but only `a` has the recorded
+        // validators; `b` has no ETag and a later Last-Modified.
+        let a = mock_server(content.clone(), |_, _, s, e, c| {
+            with_header(with_header(partial(s, e, c, usize::MAX), "ETag: \"v1\""), &format!("Last-Modified: {MON}"))
+        })
+        .await;
+        let b = mock_server(content.clone(), |_, _, s, e, c| {
+            with_header(partial(s, e, c, usize::MAX), "Last-Modified: Tue, 07 Nov 2023 08:49:37 GMT")
+        })
+        .await;
+
+        let gaps = [ByteRange::new(100, 199).unwrap(), ByteRange::new(500, 599).unwrap()];
+        repair_missing_ranges(&path, 1000, &gaps, &[a, b], None, |_, _| {}).await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), content);
+    }
+
+    #[tokio::test]
+    async fn repair_takes_a_200_with_our_validator_as_an_ignored_range() {
+        let dir = tempdir().unwrap();
+        let content = content();
+        let path = damaged_file_v1(dir.path(), &content);
+        // `a` sends 40 bytes, then ignores Range for the unchanged file; `b` honors it.
+        let a = mock_server(content.clone(), |attempt, _, s, e, c| match attempt {
+            0 => with_header(partial(s, e.min(s + 39), c, usize::MAX), "ETag: \"v1\""),
+            _ => with_header(full_200(c), "ETag: \"v1\""),
+        })
+        .await;
+        let b = mock_server(content.clone(), |_, _, s, e, c| with_header(partial(s, e, c, usize::MAX), "ETag: \"v1\"")).await;
+
+        repair_missing_ranges(&path, 1000, &[ByteRange::new(100, 199).unwrap()], &[a, b], None, |_, _| {}).await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), content);
     }
 
     #[tokio::test]
@@ -827,7 +933,7 @@ mod tests {
         let path = damaged_file_v1(dir.path(), &content());
         // A server that ignores If-Range but reports the new build's ETag.
         let new_build: Vec<u8> = content().iter().map(|b| b ^ 0xff).collect();
-        let url = mock_server(new_build, |_, _, s, e, c| with_new_etag(partial(s, e, c, usize::MAX))).await;
+        let url = mock_server(new_build, |_, _, s, e, c| with_header(partial(s, e, c, usize::MAX), "ETag: \"v2\"")).await;
 
         let gap = ByteRange::new(100, 199).unwrap();
         let res = repair_missing_ranges(&path, 1000, &[gap], &[url], None, |_, _| {}).await;

@@ -10,7 +10,7 @@ authors.workspace = true
 tokio = { version = "1.43", features = ["full"] }
 tokio-util = "0.7"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "http2", "cookies", "socks"] }
-blake3 = { version = "1.5", features = ["rayon", "mmap"] }
+blake3 = { version = "1.5", features = ["rayon"] }
 sha2 = "0.10"
 md-5 = "0.10"
 quick-xml = "0.37"

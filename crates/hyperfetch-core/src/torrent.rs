@@ -16,7 +16,8 @@ pub struct MagnetInfo {
 
 #[derive(Debug, Clone)]
 pub struct TorrentFile {
-    /// Path components below the torrent's root directory (just the name for single-file torrents).
+    /// Path components below the torrent's root directory (just the name for single-file
+    /// torrents), each made a valid file name on every OS.
     pub path: Vec<String>,
     pub length: u64,
     /// URLs this file can be downloaded from, built from the web seeds per BEP 19.
@@ -25,6 +26,7 @@ pub struct TorrentFile {
 
 #[derive(Debug, Clone)]
 pub struct TorrentInfo {
+    /// The root directory (the file, for single-file torrents), made a valid file name on every OS.
     pub name: String,
     pub total_length: u64,
     pub piece_length: u64,
@@ -41,7 +43,13 @@ pub fn is_magnet_uri(s: &str) -> bool {
 
 /// A single path component that cannot escape the download directory.
 fn is_safe_component(s: &str) -> bool {
-    !s.is_empty() && s != "." && s != ".." && !s.contains(['/', '\\', ':', '\0'])
+    !s.is_empty() && s != "." && s != ".." && !s.contains(['/', '\\'])
+}
+
+/// `raw` as a file or directory name that is valid on every OS, or `None` if it tries to escape
+/// the download directory or has nothing usable. Web seed URLs keep the raw name.
+fn local_name(raw: &str) -> Option<String> {
+    is_safe_component(raw).then(|| crate::engine::sanitize_filename(raw)).filter(|name| !name.is_empty())
 }
 
 /// BEP 19: a web seed ending in '/' is a directory; the torrent name (and, for
@@ -191,13 +199,11 @@ pub fn parse_torrent_bytes(data: &[u8]) -> Result<TorrentInfo, String> {
         _ => return Err("Invalid torrent: missing 'info' dictionary".to_string()),
     };
 
-    let name = match dict_get(info_dict, b"name") {
+    let raw_name = match dict_get(info_dict, b"name") {
         Some(BValue::Bytes(b)) => String::from_utf8_lossy(b).to_string(),
         _ => "torrent_download".to_string(),
     };
-    if !is_safe_component(&name) {
-        return Err(format!("Invalid torrent: unsafe name '{}'", name));
-    }
+    let name = local_name(&raw_name).ok_or_else(|| format!("Invalid torrent: unsafe name {:?}", raw_name))?;
 
     let piece_length = match dict_get(info_dict, b"piece length") {
         Some(BValue::Int(i)) => non_negative(*i, "piece length")?,
@@ -215,7 +221,7 @@ pub fn parse_torrent_bytes(data: &[u8]) -> Result<TorrentInfo, String> {
         let urls = web_seeds
             .iter()
             .filter_map(|seed| {
-                if seed.path().ends_with('/') { web_seed_file_url(seed, &[&name]) } else { Some(seed.clone()) }
+                if seed.path().ends_with('/') { web_seed_file_url(seed, &[&raw_name]) } else { Some(seed.clone()) }
             })
             .collect();
         files.push(TorrentFile { path: vec![name.clone()], length: non_negative(*len, "length")?, urls });
@@ -228,7 +234,7 @@ pub fn parse_torrent_bytes(data: &[u8]) -> Result<TorrentInfo, String> {
                 Some(BValue::Int(l)) => non_negative(*l, "file length")?,
                 _ => return Err("Invalid torrent: file entry without length".to_string()),
             };
-            let path = match dict_get(fd, b"path") {
+            let raw_path = match dict_get(fd, b"path") {
                 Some(BValue::List(parts)) => parts
                     .iter()
                     .map(|p| match p {
@@ -238,11 +244,14 @@ pub fn parse_torrent_bytes(data: &[u8]) -> Result<TorrentInfo, String> {
                     .collect::<Result<Vec<_>, _>>()?,
                 _ => return Err("Invalid torrent: file entry without path".to_string()),
             };
-            if path.is_empty() || !path.iter().all(|c| is_safe_component(c)) {
-                return Err(format!("Invalid torrent: unsafe file path {:?}", path));
-            }
-            let mut components = vec![name.as_str()];
-            components.extend(path.iter().map(String::as_str));
+            let path = raw_path
+                .iter()
+                .map(|c| local_name(c))
+                .collect::<Option<Vec<_>>>()
+                .filter(|p| !p.is_empty())
+                .ok_or_else(|| format!("Invalid torrent: unsafe file path {:?}", raw_path))?;
+            let mut components = vec![raw_name.as_str()];
+            components.extend(raw_path.iter().map(String::as_str));
             // A multi-file web seed is always a directory, even if the trailing '/' is missing.
             let urls = web_seeds.iter().filter_map(|seed| web_seed_file_url(seed, &components)).collect();
             files.push(TorrentFile { path, length, urls });
@@ -378,6 +387,9 @@ mod tests {
         // A directory seed without a safe name cannot be resolved and is dropped.
         let info = parse_magnet_uri("magnet:?xt=urn:btih:ab&dn=..&ws=http://mirror/pub/").unwrap();
         assert!(info.web_seeds.is_empty());
+        // A name that is merely invalid on Windows still names the file on the seed.
+        let info = parse_magnet_uri("magnet:?xt=urn:btih:ab&dn=Ep+1%3A+Pilot.mkv&ws=http://mirror/pub/").unwrap();
+        assert_eq!(info.web_seeds[0].as_str(), "http://mirror/pub/Ep%201:%20Pilot.mkv");
     }
 
     #[test]
@@ -428,5 +440,25 @@ mod tests {
         // Path traversal in names and file paths.
         assert!(parse_torrent_bytes(b"d4:infod6:lengthi1e4:name2:..ee").is_err());
         assert!(parse_torrent_bytes(b"d4:infod5:filesld6:lengthi1e4:pathl2:..6:.bashrceee4:name1:dee").is_err());
+        assert!(parse_torrent_bytes(b"d4:infod6:lengthi1e4:name5:..\\..ee").is_err());
+        assert!(parse_torrent_bytes(b"d4:infod5:filesld6:lengthi1e4:pathl0:1:xeee4:name1:dee").is_err(), "empty component");
+        assert!(parse_torrent_bytes(b"d4:infod5:filesld6:lengthi1e4:pathleee4:name1:dee").is_err(), "empty path");
+    }
+
+    #[test]
+    fn test_names_invalid_on_windows_are_cleaned_not_rejected() {
+        let seed = "20:https://s.example/d/";
+        let single = format!("d8:url-list{seed}4:infod6:lengthi1e4:name16:Ep 1: Pilot?.mkvee");
+        let info = parse_torrent_bytes(single.as_bytes()).unwrap();
+        assert_eq!(info.name, "Ep 1_ Pilot_.mkv");
+        assert_eq!(info.files[0].path, vec!["Ep 1_ Pilot_.mkv"]);
+        // The web seed serves the file under its real name.
+        assert_eq!(info.files[0].urls[0].as_str(), "https://s.example/d/Ep%201:%20Pilot%3F.mkv");
+
+        let multi = format!("d8:url-list{seed}4:infod5:filesld6:lengthi1e4:pathl9:S1: \"a\"|b6:x\u{7f}.nfoeee4:name3:C:xee");
+        let info = parse_torrent_bytes(multi.as_bytes()).unwrap();
+        assert_eq!(info.name, "C_x");
+        assert_eq!(info.files[0].path, vec!["S1_ _a__b", "x_.nfo"]);
+        assert_eq!(info.files[0].urls[0].as_str(), "https://s.example/d/C:x/S1:%20%22a%22|b/x%7F.nfo");
     }
 }

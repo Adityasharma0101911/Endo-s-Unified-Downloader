@@ -39,6 +39,8 @@ const PROBE_CONCURRENCY: usize = 8;
 const PROBE_ATTEMPTS: u32 = 3;
 /// Longest pause between probe tries, whatever Retry-After asks for.
 const PROBE_RETRY_CAP: Duration = Duration::from_secs(5);
+/// How long the probe still waits for HEAD once the ranged GET has answered.
+const HEAD_GRACE: Duration = Duration::from_millis(500);
 /// The first mirror's probe fetches this much of the file: a file this small needs no other
 /// request, and a larger one has its start on disk before the workers begin.
 const PREFETCH: u64 = 1024 * 1024;
@@ -1093,7 +1095,8 @@ impl ProbeInfo {
 /// Learns size, range support, name and validators. HEAD is only a hint: servers and proxies
 /// advertise ranges (and sizes) their GETs do not honour, so a ranged GET always decides range
 /// support and size, and supplies the name and validators wherever it has them. HEAD and GET go
-/// out together, so probing takes one round trip.
+/// out together, so probing takes one round trip. A GET still busy or failing after its tries is
+/// an error: it tells nothing about range support.
 ///
 /// With `prefetch` the GET asks for the first `PREFETCH` bytes instead of one, and its response
 /// comes back too, with how many body bytes to keep, when that body is the start of the file (or
@@ -1128,13 +1131,8 @@ async fn probe_url(
                 .send()
                 .await;
             let retry_in = match &sent {
-                Ok(resp) => match resp.status() {
-                    StatusCode::TOO_MANY_REQUESTS
-                    | StatusCode::SERVICE_UNAVAILABLE
-                    | StatusCode::BAD_GATEWAY
-                    | StatusCode::GATEWAY_TIMEOUT => Some(retry_after(resp.headers()).unwrap_or_default()),
-                    _ => None,
-                },
+                Ok(resp) if is_busy(resp.status()) => Some(retry_after(resp.headers()).unwrap_or_default()),
+                Ok(_) => None,
                 Err(_) => Some(Duration::ZERO),
             };
             match retry_in {
@@ -1146,7 +1144,13 @@ async fn probe_url(
             }
         }
     };
-    let (head, ranged) = tokio::join!(head, ranged);
+    // Once the GET has answered, a HEAD that is still out only gets a short grace: some servers
+    // never answer HEAD, and the GET alone has everything needed.
+    tokio::pin!(head, ranged);
+    let (head, ranged) = tokio::select! {
+        head = &mut head => (head, ranged.await),
+        ranged = &mut ranged => (tokio::time::timeout(HEAD_GRACE, head).await.ok().flatten(), ranged),
+    };
     let head_len = head.as_ref().and_then(|r| content_length(r.headers()));
 
     let get = match ranged {
@@ -1154,7 +1158,11 @@ async fn probe_url(
             resp.status(),
             StatusCode::PARTIAL_CONTENT | StatusCode::OK | StatusCode::RANGE_NOT_SATISFIABLE
         ) => resp,
-        // Neither ranges nor size could be confirmed: go by HEAD, with a single stream.
+        // Still busy or unreachable after every try, which says nothing about range support:
+        // taking it for "no ranges" would demote the download to one stream that cannot resume.
+        Ok(resp) if is_busy(resp.status()) => return Err(format!("{}: server busy (HTTP {})", url, resp.status())),
+        Err(e) => return Err(format!("{}: {}", url, e)),
+        // The server refused the range request: go by HEAD, with a single stream.
         _ if head.is_some() => {
             let head: Vec<&Response> = head.iter().collect();
             let mut info = ProbeInfo::describe(url, &head);
@@ -1176,7 +1184,6 @@ async fn probe_url(
             let body = info.size.filter(|&n| prefetch && n <= PREFETCH).map(|n| (plain, n));
             return Ok((info, body));
         }
-        Err(e) => return Err(format!("{}: {}", url, e)),
     };
 
     let sources: Vec<&Response> = std::iter::once(&get).chain(head.as_ref()).collect();
@@ -1214,6 +1221,14 @@ async fn probe_url(
     let own_validators = own(ETAG) == info.etag && own(LAST_MODIFIED) == info.last_modified;
     let body = keep.filter(|_| prefetch && own_validators).map(|len| (get, len.min(PREFETCH)));
     Ok((info, body))
+}
+
+/// Answers that mean "not now", not "no ranges" or "no such file".
+fn is_busy(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE | StatusCode::BAD_GATEWAY | StatusCode::GATEWAY_TIMEOUT
+    )
 }
 
 /// Reads up to `len` bytes of a probe's body, waiting at most `stall` for each read and never
@@ -1322,15 +1337,49 @@ impl Claim {
                 Err(TryLockError::Error(e)) => return Err(fail(e)),
             }
             // A finishing holder deletes the lock file. If that happened between our open and our
-            // lock, we hold a lock on a file nobody else can see; only a lock on the file now at
-            // `path` counts. A second handle to the file we locked cannot lock it too.
-            let at_path = OpenOptions::new().write(true).open(&path);
-            if at_path.is_ok_and(|other| matches!(other.try_lock(), Err(TryLockError::WouldBlock))) {
+            // lock, we hold a lock on a file nobody else can see, while another download may hold
+            // one on a new file at `path`: only a lock on the very file now at `path` counts.
+            if is_file_at(&lock, &path).map_err(fail)? {
                 return Ok(Some(Self { path, _lock: lock }));
             }
         }
         denied.map_or(Ok(None), |e| Err(fail(e)))
     }
+}
+
+/// Whether `file` is the file now at `path`, not one deleted from there meanwhile.
+fn is_file_at(file: &File, path: &Path) -> std::io::Result<bool> {
+    match File::open(path) {
+        Ok(at_path) => Ok(file_id(&at_path)? == file_id(file)?),
+        // Deleted meanwhile, or still being deleted.
+        Err(_) => Ok(false),
+    }
+}
+
+/// Identity of an open file: device and inode.
+#[cfg(unix)]
+fn file_id(file: &File) -> std::io::Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = file.metadata()?;
+    Ok((meta.dev(), meta.ino()))
+}
+
+/// Identity of an open file: volume serial number and file index.
+#[cfg(windows)]
+fn file_id(file: &File) -> std::io::Result<(u64, u64)> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
+
+    // SAFETY: a plain C struct, for which all zeroes is a valid value.
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: the handle is owned by `file` and outlives this synchronous call; `info` is a valid
+    // place for the result.
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE, &mut info) };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+    Ok((u64::from(info.dwVolumeSerialNumber), index))
 }
 
 impl Drop for Claim {
@@ -1377,7 +1426,8 @@ pub fn discard_partial(final_path: &Path) -> Result<usize, String> {
 /// Chooses the output path. Walks `name`, `name (1)`, `name (2)`... and takes the first one that
 /// is already this exact file, or that it can claim and that holds our resumable (or stale)
 /// `.part` or is free. Existing files, claimed names and other downloads' `.part` files are never
-/// touched.
+/// touched. Our `.part` holding progress the server cannot resume right now fails the plan and
+/// is kept.
 fn plan_target(
     base: &Path,
     remote: &ProbeInfo,
@@ -1406,8 +1456,22 @@ fn plan_target(
         if part.exists() {
             match DownloadState::load_from_path(&part_state).ok().flatten() {
                 Some(state) if state.mirrors.iter().any(|m| urls.contains(m)) => {
-                    if can_resume(&state, remote, &part) {
+                    let same_file = remote.size.is_none_or(|size| size == state.file_size)
+                        && validators_compatible(&state, remote)
+                        && std::fs::metadata(&part).map(|m| m.len()).ok() == Some(state.file_size);
+                    if same_file && remote.accepts_ranges {
                         return Ok(Plan::Fetch { final_path: candidate, resume: Some(Box::new(state)), claim });
+                    }
+                    // Downloaded bytes go only once they are proven stale, or the probe brought the
+                    // whole file anyway: without range support now, they may still resume later.
+                    let whole_file_fetched = remote.size == Some(remote.prefetch.len() as u64);
+                    if same_file && !state.completed_ranges.is_empty() && !whole_file_fetched {
+                        return Err(format!(
+                            "{} does not accept range requests right now, so the partial download {} cannot \
+                             resume; it was kept. Try again later, or delete it to download from the start.",
+                            remote.url,
+                            part.display()
+                        ));
                     }
                     tracing::info!("Discarding stale partial download {}", part.display());
                     std::fs::remove_file(&part).map_err(|e| format!("Failed to remove {}: {}", part.display(), e))?;
@@ -1491,13 +1555,6 @@ fn migrate_legacy(candidate: &Path, part: &Path, remote: &ProbeInfo, urls: &[Str
     std::fs::rename(candidate, part).map_err(fail)?;
     std::fs::rename(&legacy_state, DownloadState::state_file_path(part)).map_err(fail)?;
     Ok(true)
-}
-
-fn can_resume(state: &DownloadState, remote: &ProbeInfo, part: &Path) -> bool {
-    remote.accepts_ranges
-        && remote.size == Some(state.file_size)
-        && validators_compatible(state, remote)
-        && std::fs::metadata(part).map(|m| m.len()).ok() == Some(state.file_size)
 }
 
 /// If both sides have an ETag they must match; otherwise, if both have Last-Modified, those must.
@@ -1734,14 +1791,14 @@ fn percent_decode(input: &str) -> Vec<u8> {
     out
 }
 
-/// Makes a server-provided name safe as a single path component on every OS, at most
-/// `MAX_NAME_BYTES` long.
-fn sanitize_filename(name: &str) -> String {
+/// Makes an untrusted name safe as a single path component on every OS, at most
+/// `MAX_NAME_BYTES` long. Empty when nothing usable is left.
+pub(crate) fn sanitize_filename(name: &str) -> String {
     let cleaned: String = name
         .chars()
         .map(|c| match c {
             '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
-            c if (c as u32) < 32 => '_',
+            c if c.is_control() => '_',
             c => c,
         })
         .collect();
@@ -1897,6 +1954,8 @@ mod tests {
         headers.insert(CONTENT_DISPOSITION, HeaderValue::from_static("attachment; filename=\"..\""));
         assert_eq!(extract_filename([&headers], &url), "final name.iso");
         assert_eq!(sanitize_filename("con.txt"), "_con.txt");
+        // C0 and C1 control characters alike (NEL, DEL and CSI can drive terminals).
+        assert_eq!(sanitize_filename("a\u{1b}b\u{7f}c\u{85}d\u{9b}.txt"), "a_b_c_d_.txt");
         assert_eq!(extract_filename([&HeaderMap::new()], &Url::parse("http://h/").unwrap()), "downloaded_file.bin");
         assert_eq!(String::from_utf8_lossy(&percent_decode("100%-%zz%4")), "100%-%zz%4");
     }
@@ -2084,6 +2143,22 @@ mod tests {
     }
 
     #[test]
+    fn test_a_lock_on_a_deleted_lock_file_is_no_claim() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("file.bin");
+        let first = Claim::try_take(&target).unwrap().unwrap();
+        // A second download opened the lock file just before the first finished and deleted it.
+        let late = OpenOptions::new().write(true).open(lock_path(&target)).unwrap();
+        drop(first);
+        // Where an open handle keeps a deleted name taken, no new claim (and no race) can happen.
+        let Ok(Some(third)) = Claim::try_take(&target) else { return };
+        late.try_lock().unwrap();
+        // Both hold a lock, but only the lock on the file at the path is a claim.
+        assert!(!is_file_at(&late, &lock_path(&target)).unwrap(), "a lock on a deleted file must not count");
+        assert!(is_file_at(&third._lock, &lock_path(&target)).unwrap());
+    }
+
+    #[test]
     fn test_plan_skips_a_name_claimed_by_another_download() {
         let dir = tempdir().unwrap();
         let base = dir.path().join("file.bin");
@@ -2240,11 +2315,40 @@ mod tests {
             other => panic!("{other:?}"),
         }
 
+        // The same file, but the server takes no range requests right now (a CDN cache miss,
+        // say): the progress cannot resume, and it is not stale either, so it is kept.
+        let mut no_ranges = remote(1000);
+        no_ranges.accepts_ranges = false;
+        let err = plan_target(&base, &no_ranges, &urls(), &history, None).unwrap_err();
+        assert!(err.contains("kept"), "{err}");
+        assert!(part.exists() && part_state.exists() && !lock_path(&base).exists());
+        // Unless the probe brought the whole file: then nothing is lost.
+        let mut whole = no_ranges.clone();
+        whole.prefetch = Bytes::from(vec![1u8; 1000]);
+        assert!(matches!(
+            plan_target(&base, &whole, &urls(), &history, None).unwrap(),
+            Plan::Fetch { resume: None, ref final_path, .. } if *final_path == base
+        ));
+        assert!(!part.exists() && !part_state.exists());
+        std::fs::write(&part, vec![1u8; 1000]).unwrap();
+        state_for(1000, "\"v1\"", urls()).save_atomic(&part_state).unwrap();
+
         // The server's ETag changed: the partial data is stale and gets thrown away.
         let mut changed = remote(1000);
         changed.etag = Some("\"v2\"".into());
         assert!(matches!(
             plan_target(&base, &changed, &urls(), &history, None).unwrap(),
+            Plan::Fetch { resume: None, ref final_path, .. } if *final_path == base
+        ));
+        assert!(!part.exists() && !part_state.exists());
+
+        // An interrupted single-stream download recorded no progress: nothing to keep.
+        std::fs::write(&part, vec![1u8; 1000]).unwrap();
+        let mut nothing = state_for(1000, "\"v1\"", urls());
+        nothing.completed_ranges.clear();
+        nothing.save_atomic(&part_state).unwrap();
+        assert!(matches!(
+            plan_target(&base, &no_ranges, &urls(), &history, None).unwrap(),
             Plan::Fetch { resume: None, ref final_path, .. } if *final_path == base
         ));
         assert!(!part.exists() && !part_state.exists());

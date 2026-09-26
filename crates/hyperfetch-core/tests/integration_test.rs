@@ -1042,6 +1042,64 @@ async fn test_busy_probe_is_retried_instead_of_losing_ranges() {
 }
 
 #[tokio::test]
+async fn test_probe_busy_on_every_try_keeps_the_progress_for_a_later_resume() {
+    let _history = setup().await;
+    let size = 2 * PREFETCH;
+    let data = payload(size, 193);
+    let mut mock = Mock::new(data.clone());
+    mock.etag = Some("\"b1\"");
+    let mock = Arc::new(mock);
+    let url = serve(Arc::clone(&mock), "busy_resume.bin").await;
+    let temp = tempdir().unwrap();
+    let out = temp.path().join("busy_resume.bin");
+    let part = part_of(&out);
+
+    // A previous run got 90% of the file.
+    let done_len = size - 200 * KB;
+    let mut on_disk = vec![0u8; size];
+    on_disk[..done_len].copy_from_slice(&data[..done_len]);
+    std::fs::write(&part, &on_disk).unwrap();
+    let mut state = DownloadState::new("busy_resume.bin".into(), size as u64, 256 * KB as u64, vec![url.to_string()]);
+    state.etag = Some("\"b1\"".into());
+    state.completed_ranges.push(ByteRange::new(0, done_len as u64 - 1).unwrap());
+    state.save_atomic(&DownloadState::state_file_path(&part)).unwrap();
+
+    // HEAD answers, but every try of the ranged probe finds the server busy: that says nothing
+    // about range support, so the download must neither become one stream nor drop the .part.
+    mock.busy_probes.store(100, Ordering::SeqCst);
+    let engine = DownloadEngine::new(vec![url.clone()], options(&out, 4, 64 * KB));
+    let err = run(&engine, None).await.unwrap_err();
+    assert!(err.contains("busy"), "{err}");
+    assert_eq!(std::fs::read(&part).unwrap(), on_disk, "the progress must survive");
+    assert!(DownloadState::state_file_path(&part).exists());
+    assert_eq!(mock.stats.gets.load(Ordering::SeqCst), 0, "no single-stream fallback");
+
+    mock.busy_probes.store(0, Ordering::SeqCst);
+    let engine = DownloadEngine::new(vec![url], options(&out, 4, 64 * KB));
+    run(&engine, None).await.expect("the recovered server resumes the download");
+    assert_file(&out, &data);
+    assert_eq!(mock.stats.body_bytes.load(Ordering::SeqCst), (size - done_len) as u64);
+}
+
+#[tokio::test]
+async fn test_head_that_never_answers_does_not_hold_up_the_download() {
+    let _history = setup().await;
+    let data = payload(PREFETCH + 256 * KB, 197);
+    let mut mock = Mock::new(data.clone());
+    mock.head_delay = Duration::from_secs(120);
+    let mock = Arc::new(mock);
+    let url = serve(Arc::clone(&mock), "no_head.bin").await;
+    let temp = tempdir().unwrap();
+    let out = temp.path().join("no_head.bin");
+
+    let started = Instant::now();
+    let engine = DownloadEngine::new(vec![url], options(&out, 4, 64 * KB));
+    run(&engine, None).await.expect("the ranged GET alone is enough");
+    assert_file(&out, &data);
+    assert!(started.elapsed() < Duration::from_secs(10), "took {:?}", started.elapsed());
+}
+
+#[tokio::test]
 async fn test_server_rejecting_head_and_ranges_is_fetched_with_a_plain_get() {
     let _history = setup().await;
     let data = payload(256 * KB, 157);
