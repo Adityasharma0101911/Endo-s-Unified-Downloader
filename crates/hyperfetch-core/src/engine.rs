@@ -1308,7 +1308,7 @@ fn select_mirrors(probes: Vec<Result<ProbeInfo, String>>) -> Result<(ProbeInfo, 
             }
         }
     }
-    let first = ok.first().ok_or_else(|| format!("Failed to probe file information: {}", errors.join("; ")))?;
+    let first = ok.first().cloned().ok_or_else(|| format!("Failed to probe file information: {}", errors.join("; ")))?;
     // Why mirror `m` cannot serve the download `reference` describes, if it cannot.
     let mismatch = |m: &ProbeInfo, reference: &ProbeInfo| match (m.strong_etag(), reference.strong_etag()) {
         _ if m.size != reference.size => Some(format!("size {:?} differs from {:?}", m.size, reference.size)),
@@ -1317,16 +1317,18 @@ fn select_mirrors(probes: Vec<Result<ProbeInfo, String>>) -> Result<(ProbeInfo, 
         _ => None,
     };
     let reference = if first.accepts_ranges || first.size == Some(first.prefetch.len() as u64) {
-        first
+        &first
     } else {
-        ok.iter().find(|m| m.accepts_ranges && mismatch(m, first).is_none()).unwrap_or(first)
+        ok.iter().find(|m| m.accepts_ranges && mismatch(m, &first).is_none()).unwrap_or(&first)
     }
     .clone();
 
+    // The first probe keeps defining the file even when another mirror leads: a reference
+    // without an ETag must not let in a mirror whose ETag the first probe rules out.
     let mirrors = ok
         .into_iter()
         .filter(|m| {
-            let mismatch = mismatch(m, &reference);
+            let mismatch = mismatch(m, &first).or_else(|| mismatch(m, &reference));
             if let Some(reason) = &mismatch {
                 tracing::warn!("Dropping mirror {}: {}", m.url, reason);
             }
@@ -2444,6 +2446,26 @@ mod tests {
         assert_eq!(select_mirrors(vec![Ok(edge.clone()), Ok(bigger)]).unwrap().0.url, edge.url);
         edge.prefetch = Bytes::from(vec![0u8; 1000]);
         assert_eq!(select_mirrors(vec![Ok(edge.clone()), Ok(origin)]).unwrap().0.url, edge.url);
+    }
+
+    #[test]
+    fn test_select_mirrors_keeps_the_first_probes_identity_after_a_reference_swap() {
+        // A defines the file (ETag "X") but ignores ranges; C is a stale copy (ETag "Y");
+        // B serves the file with ranges but sends no ETag, so B leads.
+        let mut a = remote(1000);
+        a.accepts_ranges = false;
+        a.etag = Some("\"X\"".into());
+        let mut c = remote(1000);
+        c.url = Url::parse("http://c.example.com/file.bin").unwrap();
+        c.etag = Some("\"Y\"".into());
+        let mut b = remote(1000);
+        b.url = Url::parse("http://b.example.com/file.bin").unwrap();
+        b.etag = None;
+
+        let (reference, mirrors) = select_mirrors(vec![Ok(a), Ok(c), Ok(b.clone())]).unwrap();
+        assert_eq!(reference.url, b.url);
+        let hosts: Vec<_> = mirrors.iter().map(|m| m.url.host_str().unwrap().to_string()).collect();
+        assert_eq!(hosts, vec!["b.example.com"], "the stale copy must never be mixed in");
     }
 
     #[test]
