@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use base64::Engine as _;
-use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE, USER_AGENT};
+use reqwest::header::{HeaderMap, HeaderValue, CONTENT_DISPOSITION, CONTENT_TYPE, USER_AGENT};
 use reqwest::{Client, Response};
 use serde::Deserialize;
 use url::Url;
@@ -453,13 +453,21 @@ async fn read_capped(mut resp: Response, cap: usize) -> Result<String, ResolverE
     Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
-/// Fails unless `url` answers with a successful, non-HTML response. The body is never read.
+fn is_attachment(resp: &Response) -> bool {
+    resp.headers()
+        .get(CONTENT_DISPOSITION)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|cd| cd.trim_start().to_ascii_lowercase().starts_with("attachment"))
+}
+
+/// Fails unless `url` answers with a successful response that is the file: not HTML, or HTML
+/// sent as an attachment (a hosted .html file rather than a warning page). The body is never read.
 async fn ensure_file_response(client: &Client, url: &Url, host: &str) -> Result<(), ResolverError> {
     let resp = client.get(url.clone()).send().await?;
     if !resp.status().is_success() {
         return Err(ResolverError::NotFound(format!("{} returned HTTP {}", host, resp.status())));
     }
-    if is_html(&resp) {
+    if is_html(&resp) && !is_attachment(&resp) {
         return Err(ResolverError::NotFound(format!(
             "{} served a web page instead of the file (it may be private, deleted, or over its download quota)",
             host
@@ -775,6 +783,10 @@ mod tests {
 
         let file = serve_once("application/octet-stream", vec![0u8; 64]).await;
         assert!(ensure_file_response(&client, &file, "Google Drive").await.is_ok());
+
+        // A hosted .html file is served as an attachment; the warning/quota page is not.
+        let html_file = serve_once("text/html\r\nContent-Disposition: attachment; filename=\"page.html\"", b"<html></html>".to_vec()).await;
+        assert!(ensure_file_response(&client, &html_file, "Google Drive").await.is_ok());
     }
 
     #[test]

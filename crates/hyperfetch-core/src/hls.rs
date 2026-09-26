@@ -20,6 +20,12 @@ const MAX_MASTER_DEPTH: usize = 3;
 const MAX_ATTEMPTS: u32 = 5;
 const MAX_PLAYLIST_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_KEY_BYTES: u64 = 1024;
+/// Largest segment or init section held in memory. Real segments are a few MiB.
+// ponytail: up to num_connections segments are buffered at once, so peak memory is
+// num_connections x this; spool segments to disk if streams with huge segments must work.
+const MAX_SEGMENT_BYTES: u64 = if cfg!(test) { 64 * 1024 } else { 256 * 1024 * 1024 };
+/// Longest media playlist accepted (a day of 2-second segments is about 43,000).
+const MAX_SEGMENTS: usize = if cfg!(test) { 1000 } else { 1_000_000 };
 const SNAPSHOT_INTERVAL: Duration = Duration::from_millis(200);
 /// Time allowed for response headers to arrive, and for any gap between body chunks.
 const STALL_TIMEOUT: Duration = if cfg!(test) { Duration::from_millis(500) } else { Duration::from_secs(30) };
@@ -32,8 +38,12 @@ pub enum HlsError {
     Network(#[from] reqwest::Error),
     #[error("I/O error during HLS assembly: {0}")]
     Io(#[from] std::io::Error),
+    /// The response is not an HLS playlist (or is too large to be one).
     #[error("Invalid HLS playlist: {0}")]
     InvalidPlaylist(String),
+    /// A playlist or key could not be fetched (network error, HTTP error status, bad key).
+    #[error("HLS stream unavailable: {0}")]
+    Unavailable(String),
     #[error("No video segments found in playlist")]
     NoSegments,
     /// A real HLS stream this engine cannot download correctly. Falling back to a
@@ -68,8 +78,9 @@ pub struct HlsSegment {
     pub duration_secs: f64,
     pub byte_range: Option<ByteRange>,
     pub encryption: Option<Aes128Key>,
-    /// Init section that must precede this segment in the output.
-    pub init: Option<InitSection>,
+    /// Init section that must precede this segment in the output, shared by every
+    /// segment it applies to.
+    pub init: Option<Arc<InitSection>>,
 }
 
 /// File extension matching the container the segments form: fMP4 streams need an
@@ -86,7 +97,14 @@ pub async fn parse_hls_playlist(client: &Client, playlist_url: &Url) -> Result<V
     for _ in 0..=MAX_MASTER_DEPTH {
         let (body, final_url) = fetch_with_retry(client, &url, None, MAX_PLAYLIST_BYTES, &AtomicU64::new(0))
             .await
-            .map_err(|reason| HlsError::InvalidPlaylist(format!("could not fetch {}: {}", url, reason)))?;
+            .map_err(|e| {
+                let reason = format!("could not fetch {}: {}", url, e.reason);
+                if e.kind == FetchErrorKind::TooLarge {
+                    HlsError::InvalidPlaylist(reason)
+                } else {
+                    HlsError::Unavailable(reason)
+                }
+            })?;
         let text = String::from_utf8_lossy(&body);
         let text = text.trim_start_matches('\u{feff}').trim_start();
         if !text.starts_with("#EXTM3U") {
@@ -317,13 +335,20 @@ async fn parse_media_playlist(client: &Client, text: &str, base: &Url) -> Result
                     ))
                 }
             };
-            init = Some(InitSection {
+            init = Some(Arc::new(InitSection {
                 url: join(uri)?,
                 byte_range: attrs.get("BYTERANGE").map(|r| parse_byte_range(r, 0)).transpose()?,
                 encryption,
-            });
+            }));
         } else if !trimmed.starts_with('#') {
             let index = segments.len();
+            if index == MAX_SEGMENTS {
+                return Err(HlsError::Unsupported(format!("playlist has more than {} segments", MAX_SEGMENTS)));
+            }
+            // Parsing a huge playlist takes a while; let other tasks (and timeouts) run.
+            if index % 1024 == 1023 {
+                tokio::task::yield_now().await;
+            }
             let sequence = media_sequence.saturating_add(index as u64);
             segments.push(HlsSegment {
                 index,
@@ -348,29 +373,42 @@ async fn parse_media_playlist(client: &Client, text: &str, base: &Url) -> Result
 async fn fetch_key(client: &Client, url: &Url) -> Result<[u8; 16], HlsError> {
     let (bytes, _) = fetch_with_retry(client, url, None, MAX_KEY_BYTES, &AtomicU64::new(0))
         .await
-        .map_err(|reason| HlsError::InvalidPlaylist(format!("could not fetch AES key {}: {}", url, reason)))?;
+        .map_err(|e| HlsError::Unavailable(format!("could not fetch AES key {}: {}", url, e.reason)))?;
     <[u8; 16]>::try_from(bytes.as_slice()).map_err(|_| {
-        HlsError::InvalidPlaylist(format!("AES-128 key at {} is {} bytes, expected 16", url, bytes.len()))
+        HlsError::Unavailable(format!("AES-128 key at {} is {} bytes, expected 16", url, bytes.len()))
     })
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum FetchErrorKind {
+    /// Worth retrying: network trouble, 5xx, 408, 429, a short body.
+    Transient,
+    Fatal,
+    /// The body is larger than the caller's limit.
+    TooLarge,
+}
+
 struct FetchError {
-    retryable: bool,
+    kind: FetchErrorKind,
     reason: String,
 }
 
 impl FetchError {
     fn retryable(reason: impl ToString) -> Self {
-        Self { retryable: true, reason: reason.to_string() }
+        Self { kind: FetchErrorKind::Transient, reason: reason.to_string() }
     }
 
     fn fatal(reason: impl ToString) -> Self {
-        Self { retryable: false, reason: reason.to_string() }
+        Self { kind: FetchErrorKind::Fatal, reason: reason.to_string() }
+    }
+
+    fn too_large(max_bytes: u64) -> Self {
+        Self { kind: FetchErrorKind::TooLarge, reason: format!("response larger than the {} byte limit", max_bytes) }
     }
 }
 
-/// One GET with header and idle timeouts. Body bytes are added to `progress` as they
-/// arrive and taken back out if the attempt fails.
+/// One GET with header and idle timeouts, reading at most `max_bytes` of body. Body bytes
+/// are added to `progress` as they arrive and taken back out if the attempt fails.
 async fn fetch_once(
     client: &Client,
     url: &Url,
@@ -392,7 +430,8 @@ async fn fetch_once(
         let transient = status.is_server_error()
             || status == StatusCode::REQUEST_TIMEOUT
             || status == StatusCode::TOO_MANY_REQUESTS;
-        return Err(FetchError { retryable: transient, reason: format!("HTTP {}", status) });
+        let reason = format!("HTTP {}", status);
+        return Err(if transient { FetchError::retryable(reason) } else { FetchError::fatal(reason) });
     }
     if let Some(r) = range {
         if status != StatusCode::PARTIAL_CONTENT {
@@ -404,6 +443,10 @@ async fn fetch_once(
         }
     }
 
+    if resp.content_length().is_some_and(|len| len > max_bytes) {
+        return Err(FetchError::too_large(max_bytes));
+    }
+
     let final_url = resp.url().clone();
     let mut body = Vec::new();
     let result = loop {
@@ -413,7 +456,7 @@ async fn fetch_once(
             Ok(Ok(None)) => break Ok(()),
             Ok(Ok(Some(chunk))) => {
                 if body.len() as u64 + chunk.len() as u64 > max_bytes {
-                    break Err(FetchError::fatal(format!("response larger than {} bytes", max_bytes)));
+                    break Err(FetchError::too_large(max_bytes));
                 }
                 progress.fetch_add(chunk.len() as u64, Ordering::Relaxed);
                 body.extend_from_slice(&chunk);
@@ -442,19 +485,22 @@ async fn fetch_with_retry(
     range: Option<ByteRange>,
     max_bytes: u64,
     progress: &AtomicU64,
-) -> Result<(Vec<u8>, Url), String> {
+) -> Result<(Vec<u8>, Url), FetchError> {
     let mut delay = RETRY_BASE_DELAY;
     let mut attempt = 1;
     loop {
         match fetch_once(client, url, range, max_bytes, progress).await {
             Ok(fetched) => return Ok(fetched),
-            Err(e) if e.retryable && attempt < MAX_ATTEMPTS => {
+            Err(e) if e.kind == FetchErrorKind::Transient && attempt < MAX_ATTEMPTS => {
                 tracing::warn!("HLS fetch of {} failed (attempt {}): {}; retrying", url, attempt, e.reason);
                 tokio::time::sleep(delay).await;
                 delay *= 2;
                 attempt += 1;
             }
-            Err(e) => return Err(format!("{} (after {} attempt(s))", e.reason, attempt)),
+            Err(mut e) => {
+                e.reason = format!("{} (after {} attempt(s))", e.reason, attempt);
+                return Err(e);
+            }
         }
     }
 }
@@ -482,18 +528,25 @@ async fn fetch_segment(
     progress: &AtomicU64,
 ) -> Result<Vec<u8>, HlsError> {
     let failed = |reason: String| HlsError::SegmentFailed { index: segment.index, reason };
-    let mut out = Vec::new();
+    let limit = |range: Option<ByteRange>| range.map_or(MAX_SEGMENT_BYTES, |r| r.len().min(MAX_SEGMENT_BYTES));
+    let mut init_data = None;
     if let Some(init) = segment.init.as_ref().filter(|_| with_init) {
-        let (data, _) = fetch_with_retry(client, &init.url, init.byte_range, u64::MAX, progress)
+        let (data, _) = fetch_with_retry(client, &init.url, init.byte_range, limit(init.byte_range), progress)
             .await
-            .map_err(|r| failed(format!("init section {}: {}", init.url, r)))?;
-        out = decrypt(data, &init.encryption).await.map_err(|r| failed(format!("init section: {}", r)))?;
+            .map_err(|e| failed(format!("init section {}: {}", init.url, e.reason)))?;
+        init_data = Some(decrypt(data, &init.encryption).await.map_err(|r| failed(format!("init section: {}", r)))?);
     }
-    let (data, _) = fetch_with_retry(client, &segment.url, segment.byte_range, u64::MAX, progress)
+    let (data, _) = fetch_with_retry(client, &segment.url, segment.byte_range, limit(segment.byte_range), progress)
         .await
-        .map_err(|r| failed(format!("{}: {}", segment.url, r)))?;
-    out.extend(decrypt(data, &segment.encryption).await.map_err(failed)?);
-    Ok(out)
+        .map_err(|e| failed(format!("{}: {}", segment.url, e.reason)))?;
+    let data = decrypt(data, &segment.encryption).await.map_err(failed)?;
+    Ok(match init_data {
+        Some(mut out) => {
+            out.extend_from_slice(&data);
+            out
+        }
+        None => data,
+    })
 }
 
 fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
@@ -502,14 +555,13 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// Identifies a segment list across runs. Query strings are left out because CDN tokens
-/// in them change between sessions while the media stays the same.
+/// Identifies a segment list across runs. Full URLs are hashed, query included: the query can
+/// be all that tells two streams apart, so a rotated CDN token restarts the download rather
+/// than risk splicing another stream into the `.part`.
 fn playlist_fingerprint(segments: &[HlsSegment]) -> String {
     let mut hasher = blake3::Hasher::new();
     for s in segments {
-        let mut url = s.url.clone();
-        url.set_query(None);
-        hasher.update(url.as_str().as_bytes());
+        hasher.update(s.url.as_str().as_bytes());
         if let Some(r) = s.byte_range {
             hasher.update(r.to_http_header().as_bytes());
         }
@@ -1013,6 +1065,110 @@ video.m3u8
         honest[0].url.set_path("/honest.ts");
         let path = HlsEngine::download(&client, honest, &dir.path().join("b.ts"), 2, None, None).await.unwrap();
         assert_eq!(std::fs::read(path).unwrap(), b"0123");
+    }
+
+    #[tokio::test]
+    async fn test_segment_bodies_are_size_limited() {
+        let big = vec![b'x'; MAX_SEGMENT_BYTES as usize + 1];
+        let (addr, hits) = serve(move |path: &str, range: Option<ByteRange>| match (path, range) {
+            ("/big.m3u8", _) => ok("#EXTM3U\n#EXTINF:4,\nbig.ts\n#EXT-X-ENDLIST\n"),
+            ("/big.ts", _) => ok(big.clone()),
+            ("/ranged.m3u8", _) => ok("#EXTM3U\n#EXTINF:4,\n#EXT-X-BYTERANGE:4@0\nover.ts\n#EXT-X-ENDLIST\n"),
+            // Answers the range with more bytes than were asked for.
+            ("/over.ts", Some(_)) => (206, String::new(), b"0123456789".to_vec()),
+            _ => (404, String::new(), Vec::new()),
+        })
+        .await;
+        let client = Client::new();
+        let dir = tempfile::tempdir().unwrap();
+        for (playlist, segment) in [("/big.m3u8", "/big.ts"), ("/ranged.m3u8", "/over.ts")] {
+            let url = Url::parse(&format!("http://{}{}", addr, playlist)).unwrap();
+            let segments = parse_hls_playlist(&client, &url).await.unwrap();
+            let err = HlsEngine::download(&client, segments, &dir.path().join("out.ts"), 1, None, None)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, HlsError::SegmentFailed { index: 0, .. }), "{err}");
+            assert!(err.to_string().contains("byte limit"), "{err}");
+            assert_eq!(hits.lock()[segment], 1, "an oversized body is not retried");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_unreachable_playlist_is_unavailable_not_invalid() {
+        let (addr, _) = serve(|path: &str, _| match path {
+            "/page.m3u8" => ok("<html>not a playlist</html>"),
+            "/keyless.m3u8" => ok("#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"gone.key\"\n#EXTINF:4,\na.ts\n#EXT-X-ENDLIST\n"),
+            _ => (404, String::new(), Vec::new()),
+        })
+        .await;
+        let client = Client::new();
+        let parse = |path: &str| {
+            let url = Url::parse(&format!("http://{}{}", addr, path)).unwrap();
+            let client = client.clone();
+            async move { parse_hls_playlist(&client, &url).await }
+        };
+        assert!(matches!(parse("/missing.m3u8").await, Err(HlsError::Unavailable(_))));
+        assert!(matches!(parse("/keyless.m3u8").await, Err(HlsError::Unavailable(_))));
+        assert!(matches!(parse("/page.m3u8").await, Err(HlsError::InvalidPlaylist(_))));
+    }
+
+    #[tokio::test]
+    async fn test_resume_never_splices_streams_differing_only_by_query() {
+        let broken = Arc::new(AtomicBool::new(true));
+        let broken_srv = Arc::clone(&broken);
+        let (addr, _) = serve(move |path: &str, _| match path {
+            "/one/index.m3u8" => ok("#EXTM3U\n#EXTINF:4,\n/seg.ts?v=1&n=0\n#EXTINF:4,\n/seg.ts?v=1&n=1\n#EXT-X-ENDLIST\n"),
+            "/two/index.m3u8" => ok("#EXTM3U\n#EXTINF:4,\n/seg.ts?v=2&n=0\n#EXTINF:4,\n/seg.ts?v=2&n=1\n#EXT-X-ENDLIST\n"),
+            "/seg.ts?v=1&n=0" => ok("ONE-0 "),
+            "/seg.ts?v=1&n=1" if broken_srv.load(Ordering::SeqCst) => (404, String::new(), Vec::new()),
+            "/seg.ts?v=1&n=1" => ok("ONE-1"),
+            "/seg.ts?v=2&n=0" => ok("TWO-0 "),
+            "/seg.ts?v=2&n=1" => ok("TWO-1"),
+            _ => (404, String::new(), Vec::new()),
+        })
+        .await;
+        let client = Client::new();
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("index.ts");
+        let playlist = |name: &str| Url::parse(&format!("http://{}/{}/index.m3u8", addr, name)).unwrap();
+
+        let one = parse_hls_playlist(&client, &playlist("one")).await.unwrap();
+        assert!(HlsEngine::download(&client, one, &out, 1, None, None).await.is_err());
+        assert_eq!(std::fs::read(with_suffix(&out, ".part")).unwrap(), b"ONE-0 ");
+
+        let two = parse_hls_playlist(&client, &playlist("two")).await.unwrap();
+        assert!(!has_resumable_part(&out, &two), "another stream's .part must not look resumable");
+        HlsEngine::download(&client, two, &out, 1, None, None).await.unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"TWO-0 TWO-1");
+
+        // The same stream still resumes.
+        broken.store(false, Ordering::SeqCst);
+        let out = dir.path().join("again.ts");
+        let one = parse_hls_playlist(&client, &playlist("one")).await.unwrap();
+        std::fs::write(with_suffix(&out, ".part"), "ONE-0 ").unwrap();
+        std::fs::write(with_suffix(&out, ".part.hlsstate"), format!("{} 1 6", playlist_fingerprint(&one))).unwrap();
+        assert!(has_resumable_part(&out, &one));
+        HlsEngine::download(&client, one, &out, 1, None, None).await.unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"ONE-0 ONE-1");
+    }
+
+    #[tokio::test]
+    async fn test_init_section_is_shared_and_segment_count_bounded() {
+        let many = format!("#EXTM3U\n{}#EXT-X-ENDLIST\n", "#EXTINF:1,\ns.ts\n".repeat(MAX_SEGMENTS + 1));
+        let (addr, _) = serve(move |path: &str, _| match path {
+            "/fmp4.m3u8" => ok("#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:4,\na.m4s\n#EXTINF:4,\nb.m4s\n#EXT-X-ENDLIST\n"),
+            "/many.m3u8" => ok(many.clone()),
+            _ => (404, String::new(), Vec::new()),
+        })
+        .await;
+        let client = Client::new();
+        let url = Url::parse(&format!("http://{}/fmp4.m3u8", addr)).unwrap();
+        let segments = parse_hls_playlist(&client, &url).await.unwrap();
+        let (a, b) = (segments[0].init.as_ref().unwrap(), segments[1].init.as_ref().unwrap());
+        assert!(Arc::ptr_eq(a, b), "segments must share one init section, not copies");
+
+        let url = Url::parse(&format!("http://{}/many.m3u8", addr)).unwrap();
+        assert!(matches!(parse_hls_playlist(&client, &url).await, Err(HlsError::Unsupported(_))));
     }
 
     #[tokio::test]
