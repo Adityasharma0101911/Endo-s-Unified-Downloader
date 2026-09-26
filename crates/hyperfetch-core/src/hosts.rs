@@ -80,6 +80,12 @@ pub async fn acquire(url: &Url, limit: usize) -> HostSlot {
     HOSTS.acquire(HostKey::of(url), limit).await
 }
 
+/// The most requests `url`'s host has had open at once.
+#[cfg(test)]
+pub(crate) fn peak(url: &Url) -> usize {
+    HOSTS.entries.lock().get(&HostKey::of(url)).map_or(0, |entry| entry.peak)
+}
+
 /// A slot for a request to `url`'s host under `limit`, if one is free now.
 pub fn try_acquire(url: &Url, limit: usize) -> Option<HostSlot> {
     HOSTS.try_acquire(&HostKey::of(url), limit, Instant::now())
@@ -204,6 +210,9 @@ struct Entry {
     waiting: Limits,
     /// When the connection cap was last raised.
     cap_raised: Option<Instant>,
+    /// The most requests ever open at once.
+    #[cfg(test)]
+    peak: usize,
 }
 
 impl Entry {
@@ -259,6 +268,10 @@ impl Hosts {
         }
         entry.open += 1;
         add_limit(&mut entry.held, limit);
+        #[cfg(test)]
+        {
+            entry.peak = entry.peak.max(entry.open);
+        }
         Some(HostSlot { hosts: self, key: key.clone(), limit })
     }
 

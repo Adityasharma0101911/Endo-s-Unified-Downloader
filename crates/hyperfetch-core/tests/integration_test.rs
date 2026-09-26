@@ -1693,7 +1693,8 @@ async fn test_downloads_to_one_host_share_its_connection_budget() {
             // Slot waits sit outside every timeout.
             stall_timeout_secs: 1,
             // No steals: a stolen-from request is dropped once its part is in, which the mock
-            // only notices at its next write.
+            // only notices at its next write. (With steals and takeovers the engine's own tests
+            // count the slots held instead.)
             min_steal_threshold: u64::MAX,
             ..options(&out, 8, 128 * KB)
         };
