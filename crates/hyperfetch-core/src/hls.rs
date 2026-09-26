@@ -52,8 +52,8 @@ const MAX_SEGMENTS: usize = if cfg!(test) { 1000 } else { 1_000_000 };
 const SNAPSHOT_INTERVAL: Duration = Duration::from_millis(200);
 /// First retry delay; doubles on every further attempt (0.5s, 1s, 2s, 4s, 8s, 8s, ...).
 const RETRY_BASE_DELAY: Duration = if cfg!(test) { Duration::from_millis(20) } else { Duration::from_millis(500) };
-/// Longest pause between two attempts: with the default 8 retries a playlist or key gives up
-/// within about 40 s, inside the time the engine allows for fetching the playlist.
+/// Longest pause between two attempts: the pauses of the default 8 retries add up to about 40 s,
+/// well inside the time the engine allows for fetching the playlist and its keys.
 const RETRY_MAX_DELAY: Duration = Duration::from_secs(8);
 
 /// Patience of every HLS request (playlists, keys, segments), from the user's settings.
@@ -801,7 +801,8 @@ async fn part_matches(
 ) -> Result<bool, HlsError> {
     for index in std::iter::once(0).chain((count > 1).then_some(count - 1)) {
         let uncounted = AtomicU64::new(0);
-        let segment = fetch_segment(client, auth, segments[index].clone(), writes_init(segments, index), &uncounted, fetch);
+        let with_init = writes_init(segments, index);
+        let segment = fetch_segment(client, auth, segments[index].clone(), with_init, &uncounted, fetch);
         let data = tokio::select! {
             data = segment => data?,
             _ = cancelled(cancel_flag) => return Err(HlsError::Cancelled),
@@ -933,11 +934,15 @@ where
 
     /// Starts the units after the last one started, as far as connections and the window allow.
     fn launch(&mut self) {
-        while self.requests < self.connections && self.slots.len() < self.window && self.head + self.slots.len() < self.count {
+        while self.requests < self.connections && self.slots.len() < self.window {
             let unit = self.head + self.slots.len();
+            if unit == self.count {
+                break;
+            }
             let (hedge, second) = oneshot::channel();
             self.jobs.push(Box::pin(race(unit, (self.fetch)(unit), second)));
-            self.slots.push_back(Slot::Fetching { since: tokio::time::Instant::now(), requests: 1, hedge: Some(hedge) });
+            let since = tokio::time::Instant::now();
+            self.slots.push_back(Slot::Fetching { since, requests: 1, hedge: Some(hedge) });
             self.requests += 1;
         }
     }
@@ -1177,10 +1182,10 @@ impl HlsEngine {
             .map_err(std::io::Error::other)??
         };
         // Written on a thread of its own, fed by a short queue: the fetches go on while it writes.
-        let (to_disk, from_fetches) = mpsc::channel(WRITE_QUEUE);
+        let (to_disk, queued) = mpsc::channel(WRITE_QUEUE);
         let (fsync, hasher) = (options.fsync_on_complete, StreamHasher::new(options.expected_checksum.as_deref()));
         let writer =
-            tokio::task::spawn_blocking(move || write_segments(part, state, total_segments, fsync, hasher, from_fetches));
+            tokio::task::spawn_blocking(move || write_segments(part, state, total_segments, fsync, hasher, queued));
 
         tracing::info!(
             "Starting HLS ingestion: {} segments ({} already done) across {} streams -> {}",
@@ -1574,7 +1579,9 @@ video.m3u8
         .await;
         let client = Client::new();
         let url = Url::parse(&format!("http://{addr}/rotating.m3u8")).unwrap();
-        let segments = parse_hls_playlist(&client, &url, None, FETCH).await.unwrap();
+        // Patient: a key request given up on and sent again would count twice.
+        let patient = FetchPolicy { stall_timeout: Duration::from_secs(10), ..FETCH };
+        let segments = parse_hls_playlist(&client, &url, None, patient).await.unwrap();
         assert_eq!(most.load(Ordering::SeqCst), KEY_CONCURRENCY, "at most {KEY_CONCURRENCY} key requests at once, and that many");
         for (n, segment) in segments.iter().enumerate() {
             assert_eq!(segment.encryption.as_ref().unwrap().key, [n as u8; 16], "segment {n} has its own key");
@@ -2337,7 +2344,9 @@ video.m3u8
         let dir = tempfile::tempdir().unwrap();
         for (max_retries, succeeds) in [(1, false), (2, true)] {
             failures.store(0, Ordering::SeqCst);
-            let options = HlsOptions { fetch: FetchPolicy { max_retries, ..FETCH }, ..options(1) };
+            // Only the 503s count as failures, however slow the machine.
+            let fetch = FetchPolicy { max_retries, stall_timeout: Duration::from_secs(10) };
+            let options = HlsOptions { fetch, ..options(1) };
             let out = dir.path().join(format!("{max_retries}.ts"));
             let target = HlsEngine::prepare(&client, None, &url, &segments, &out, FETCH, &None).await.unwrap().unwrap();
             let result = HlsEngine::download(&client, None, segments.clone(), target, &options, None, None).await;
