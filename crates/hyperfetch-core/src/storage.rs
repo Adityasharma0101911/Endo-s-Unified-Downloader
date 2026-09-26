@@ -34,7 +34,8 @@ const FILE_HASH_BLOCK: usize = 8 * 1024 * 1024;
 const MIN_HASH_BLOCK: u64 = 256 * 1024;
 /// Most blocks per file, which keeps their hashes to a few MiB: larger files get larger blocks.
 const MAX_HASH_BLOCKS: u64 = 1 << 16;
-/// Most the prefix hasher reads at once: it shares the file handle with the writers.
+/// Most the prefix hasher reads at once (unless a block is larger): it shares the file handle with
+/// the writers.
 const FOLLOW_STEP: u64 = 1024 * 1024;
 
 /// Preallocated output file shared by all workers. Writes are positional (`pwrite` /
@@ -129,8 +130,8 @@ impl DiskWriter {
     /// never asked for a digest (a repair) does without. Counts `on_disk`, bytes an earlier run
     /// wrote, as written, so blocks they complete are hashed too. When `expected_checksum` needs
     /// SHA-256 or MD5, also starts hashing the file's written prefix with it in the background as
-    /// the prefix grows, so `digest` reads only the rest. That hashing stops once the last clone
-    /// of this writer is dropped.
+    /// the prefix grows, with BLAKE3 for any block in it never hashed, so `digest` reads only the
+    /// rest. That hashing stops once the last clone of this writer is dropped.
     pub fn track_digest(&self, on_disk: &[ByteRange], expected_checksum: Option<&str>) {
         let (sha256, md5) = needs(expected_checksum).unwrap_or_default();
         let hashes = &self.inner.hashes;
@@ -152,9 +153,10 @@ impl DiskWriter {
     }
 
     /// The file's digest, once writing is done: BLAKE3 merged from the blocks hashed as they were
-    /// written, reading back (on every core) only the blocks never written through this writer,
-    /// plus SHA-256/MD5 when `expected_checksum` needs them, reading only what the prefix hasher
-    /// had not reached. Reads through this writer's handle; blocking.
+    /// written, plus SHA-256/MD5 when `expected_checksum` needs them. Reads each byte at most once,
+    /// through this writer's handle: SHA-256/MD5 goes on from where the prefix hasher stopped,
+    /// hashing the blocks never hashed that it passes on the way, and whatever blocks are left
+    /// unhashed after that are read back on every core. Blocking.
     pub fn digest(&self, expected_checksum: Option<&str>) -> std::io::Result<FileDigest> {
         let (sha256, md5) = needs(expected_checksum).unwrap_or_default();
         let (hashes, file) = (&*self.inner.hashes, &*self.inner.file);
@@ -162,13 +164,24 @@ impl DiskWriter {
             .stop_follower()
             .filter(|p| p.has(sha256, md5))
             .unwrap_or_else(|| PrefixHash::new(sha256, md5));
-        let (blake3, tail) = std::thread::scope(|s| {
-            let tail = (sha256 || md5).then(|| s.spawn(|| prefix.read_to(file, self.size)));
-            let blake3 = hashes.root(file);
-            (blake3, tail.map(joined))
-        });
-        tail.transpose()?;
-        Ok(FileDigest::new(blake3?, prefix))
+        if sha256 || md5 {
+            // The prefix hasher stops on a block boundary, and these reads are whole blocks.
+            let tail = prefix.len..self.size;
+            let unhashed = hashes.unhashed(&hashes.state.lock(), tail.clone());
+            let mut at = tail.start;
+            read_ahead(file, tail, FILE_HASH_BLOCK.max(hashes.block as usize), |data| {
+                #[cfg(test)]
+                hashes.read.fetch_add(data.len(), Ordering::Relaxed);
+                std::thread::scope(|s| {
+                    if !unhashed.is_empty() {
+                        s.spawn(|| hashes.hash_read(&unhashed, at, data));
+                    }
+                    prefix.update(data);
+                });
+                at += data.len() as u64;
+            })?;
+        }
+        Ok(FileDigest::new(hashes.root(file)?, prefix))
     }
 
     /// The file's digest from reading all of it back through this writer's handle, ignoring
@@ -303,6 +316,8 @@ struct Block {
     /// The block's chaining value, or the file's hash when it is the only block; `None` until
     /// the block is hashed.
     hash: Option<ChainingValue>,
+    /// A write left the block written in full and is hashing it.
+    hashing: bool,
     /// While the block is not written in full: its first bytes, hashed from the writes that wrote
     /// them in order, so that a write going on from there hashes on instead of the block being
     /// read back. Taken out while a write hashes into it.
@@ -391,7 +406,8 @@ impl Hashes {
             for (i, block) in blocks.iter_mut().enumerate().take(last + 1).skip(first) {
                 block.version = block.version.wrapping_add(1);
                 block.hash = None;
-                touched.push((i, block.version, covers(written, &self.span(i)), block.head.take()));
+                block.hashing = covers(written, &self.span(i));
+                touched.push((i, block.version, block.hashing, block.head.take()));
             }
             if written_prefix(written) > prefix {
                 self.changed.notify_all();
@@ -422,9 +438,40 @@ impl Hashes {
                 continue;
             }
             match hash {
-                Some(hash) => block.hash = hash,
+                Some(hash) => {
+                    block.hash = hash;
+                    block.hashing = false;
+                }
                 None if at > span.start => block.head = Some(Box::new(Head { hasher, end: at })),
                 None => {}
+            }
+        }
+    }
+
+    /// The blocks within `range` (which starts on a block boundary) that nothing hashed or is
+    /// hashing, with their versions.
+    fn unhashed(&self, state: &HashState, range: Range<u64>) -> Vec<(usize, u32)> {
+        let blocks = state.blocks.iter().enumerate();
+        blocks
+            .take(range.end.div_ceil(self.block) as usize)
+            .skip((range.start / self.block) as usize)
+            .filter(|(_, b)| b.hash.is_none() && !b.hashing)
+            .map(|(i, b)| (i, b.version))
+            .collect()
+    }
+
+    /// Hashes those blocks of `unhashed` (see `Hashes::unhashed`) that lie within `data`, the
+    /// file's bytes from `at` on, and keeps each hash unless its block was written since.
+    fn hash_read(&self, unhashed: &[(usize, u32)], at: u64, data: &[u8]) {
+        let end = at + data.len() as u64;
+        let from = unhashed.partition_point(|&(i, _)| self.span(i).start < at);
+        let to = unhashed.partition_point(|&(i, _)| self.span(i).end <= end);
+        for &(i, version) in unhashed.get(from..to).unwrap_or_default() {
+            let span = self.span(i);
+            let hash = self.hash_block(i, &data[(span.start - at) as usize..(span.end - at) as usize]);
+            let mut state = self.state.lock();
+            if state.blocks[i].version == version {
+                state.blocks[i].hash = Some(hash);
             }
         }
     }
@@ -481,31 +528,45 @@ impl Hashes {
 }
 
 /// Hashes `file`'s written prefix into `prefix` as the prefix grows, until the whole file is
-/// hashed or the hasher is stopped; returns what it hashed.
+/// hashed or the hasher is stopped; returns what it hashed. Reads whole blocks, and hashes with
+/// BLAKE3 those that nothing hashed or is hashing (an earlier run wrote them), so that they are
+/// not read again.
 fn follow(hashes: &Hashes, file: &File, mut prefix: PrefixHash) -> PrefixHash {
+    let step = FOLLOW_STEP.max(hashes.block);
     let mut buf = Vec::new();
     loop {
-        let end = {
+        let (end, unhashed) = {
             let mut state = hashes.state.lock();
             loop {
                 if state.stopped || prefix.len >= hashes.size {
                     return prefix;
                 }
-                let end = written_prefix(&state.written).min(prefix.len + FOLLOW_STEP);
+                let mut end = written_prefix(&state.written).min(prefix.len + step);
+                if end < hashes.size {
+                    end -= end % hashes.block;
+                }
                 if end > prefix.len {
                     // A write below this from now on may be missed by the read, so it voids the hash.
                     state.followed = end;
-                    break end;
+                    break (end, hashes.unhashed(&state, prefix.len..end));
                 }
                 hashes.changed.wait(&mut state);
             }
         };
-        buf.resize((end - prefix.len) as usize, 0);
+        let at = prefix.len;
+        buf.resize((end - at) as usize, 0);
         // `DiskWriter::digest` reads on from here, and reports the error if it persists.
-        if read_exact_at(file, &mut buf, prefix.len).is_err() {
+        if read_exact_at(file, &mut buf, at).is_err() {
             return prefix;
         }
-        prefix.update(&buf);
+        #[cfg(test)]
+        hashes.read.fetch_add(buf.len(), Ordering::Relaxed);
+        std::thread::scope(|s| {
+            if !unhashed.is_empty() {
+                s.spawn(|| hashes.hash_read(&unhashed, at, &buf));
+            }
+            prefix.update(&buf);
+        });
     }
 }
 
@@ -581,11 +642,6 @@ impl PrefixHash {
             h.update(data);
         }
         self.len += data.len() as u64;
-    }
-
-    /// Hashes on up to `end` of `file`. Blocking.
-    fn read_to(&mut self, file: &File, end: u64) -> std::io::Result<()> {
-        read_ahead(file, self.len..end, FILE_HASH_BLOCK, |data| self.update(data))
     }
 }
 
@@ -1485,6 +1541,27 @@ mod tests {
             assert_eq!(digest.blake3, *blake3::hash(&data).as_bytes(), "in order: {in_order}");
             assert!(verify_digest(&digest, checksum).is_ok());
         }
+    }
+
+    #[test]
+    fn test_what_an_earlier_run_wrote_is_read_once() {
+        // It left all but the file's first 64 KiB. The SHA-256 pass reads its blocks anyway, and
+        // hashes them with BLAKE3 on the way instead of leaving them to be read again.
+        let (size, fresh) = (3 * 1024 * 1024 + 777u64, 64 * 1024usize);
+        let data = pattern(size);
+        let checksum = format!("sha256:{}", hex::encode(&Sha256::digest(&data)));
+        let temp = NamedTempFile::new().unwrap();
+        std::fs::write(temp.path(), [vec![0; fresh], data[fresh..].to_vec()].concat()).unwrap();
+        let writer = DiskWriter::open_or_create(temp.path(), size).unwrap();
+        writer.track_digest(&[ByteRange::new(fresh as u64, size - 1).unwrap()], Some(&checksum));
+        writer.write_chunk_slice(0, &data[..fresh]).unwrap();
+
+        let digest = writer.digest(Some(&checksum)).unwrap();
+        assert_eq!(digest.blake3, *blake3::hash(&data).as_bytes());
+        assert!(verify_digest(&digest, Some(&checksum)).is_ok());
+        // Once for SHA-256, plus the rest of the first block for its BLAKE3 when it was written.
+        let block = writer.inner.hashes.block as usize;
+        assert_eq!(writer.inner.hashes.read.load(Ordering::Relaxed), size as usize + block - fresh);
     }
 
     #[test]
