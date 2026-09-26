@@ -52,13 +52,15 @@ enum Dialog {
 /// Results of background work, delivered to the UI thread (each send also requests a repaint).
 enum AppEvent {
     JobFinished { id: usize, result: Result<(PathBuf, Option<u64>), String> },
-    History { generation: u64, result: Result<Vec<HistoryEntry>, String> },
+    /// The history as read by the `generation`-th history operation to run.
+    History(Result<(u64, Vec<HistoryEntry>), String>),
+    /// Leftovers of a stopped download were deleted (the count), or kept because of the error.
+    Discarded { id: usize, name: String, result: Result<usize, String> },
     Verified(Result<(BuildVerificationResult, Vec<Url>), String>),
     RepairFinished(Result<(), String>),
     Picked(Dialog, Option<PathBuf>),
     Pasted(Result<String, String>),
     ClipboardLink(String),
-    Notice(Result<String, String>),
 }
 
 /// Handles to a running engine task.
@@ -115,6 +117,8 @@ struct Verification {
 }
 
 struct Repair {
+    /// Final path of the file being repaired.
+    target: PathBuf,
     cancel: Arc<AtomicBool>,
     task: JoinHandle<()>,
     progress: Arc<Mutex<(u64, u64)>>,
@@ -159,7 +163,8 @@ struct App {
     pulse_phase: f32,
 
     history: Vec<HistoryEntry>,
-    history_generation: u64,
+    /// Serializes history operations and counts them in the order they run.
+    history_sequence: Arc<Mutex<u64>>,
     history_applied: u64,
     history_search: String,
     verify_request: Option<VerifyRequest>,
@@ -219,7 +224,7 @@ impl App {
             last_frame: Instant::now(),
             pulse_phase: 0.0,
             history: Vec::new(),
-            history_generation: 0,
+            history_sequence: Arc::new(Mutex::new(0)),
             history_applied: 0,
             history_search: String::new(),
             verify_request: None,
@@ -252,8 +257,18 @@ impl App {
         self.jobs.get(&id).is_none_or(|view| !view.got_snapshot)
     }
 
+    /// Once every byte has arrived the engine verifies and renames the file without progress
+    /// reports; that is not a stall.
     fn stalled_for(&self, id: usize) -> Option<Duration> {
+        if self.queue.get_item(id).is_some_and(QueueItem::is_finishing) {
+            return None;
+        }
         self.jobs.get(&id).and_then(JobView::stalled_for)
+    }
+
+    /// The download's file is being repaired, so it must not be started or cleaned up.
+    fn under_repair(&self, id: usize) -> bool {
+        self.repair.as_ref().is_some_and(|repair| self.queue.get_item(id).is_some_and(|item| item.targets(&repair.target)))
     }
 
     // ---- history -------------------------------------------------------------------------
@@ -261,16 +276,17 @@ impl App {
     /// Applies `op` to the on-disk history off the UI thread (the core reloads the file under its
     /// lock, so entries written meanwhile by the engine or the CLI are kept) and shows the result.
     fn update_history(&mut self, op: impl FnOnce(&mut DownloadHistoryManager) + Send + 'static) {
-        self.history_generation += 1;
-        let generation = self.history_generation;
+        let sequence = Arc::clone(&self.history_sequence);
         self.spawn_event(async move {
             let result = unblock(move || {
-                let mut manager = DownloadHistoryManager::load();
-                op(&mut manager);
-                manager.entries().to_vec()
+                in_sequence(&sequence, || {
+                    let mut manager = DownloadHistoryManager::load();
+                    op(&mut manager);
+                    manager.entries().to_vec()
+                })
             })
             .await;
-            AppEvent::History { generation, result }
+            AppEvent::History(result)
         });
     }
 
@@ -354,6 +370,10 @@ impl App {
             )));
             return false;
         }
+        if self.under_repair(id) {
+            self.notice = Some(Err(format!("The file of download #{} is being repaired; wait for the repair to finish", id)));
+            return false;
+        }
         let Some(item) = self.queue.get_item(id) else { return false };
         let (urls, options) = (item.urls.clone(), item.options.clone());
         let leftovers_of = if fresh { item.target_path.clone() } else { None };
@@ -403,29 +423,29 @@ impl App {
         }
     }
 
-    /// Removes a stopped download from the list and deletes its partial file and resume state.
+    /// Deletes the partial file and resume state of a stopped download, then removes it from the
+    /// list. Nothing is deleted while any download (in this app or another) is using the file.
     fn discard_job(&mut self, id: usize) {
         if let Some(other) = self.queue.active_conflict(id) {
             self.notice = Some(Err(format!("Download #{} is using the same partial file right now", other)));
             return;
         }
-        let target = self.queue.get_item(id).and_then(|item| item.target_path.clone());
-        if !self.remove_job(id) {
+        if self.under_repair(id) {
+            self.notice = Some(Err(format!("The file of download #{} is being repaired right now", id)));
             return;
         }
-        match target {
+        let Some(item) = self.queue.get_item(id).filter(|item| !item.status.is_active()) else { return };
+        match item.target_path.clone() {
             Some(final_path) => {
+                let name = item.filename.clone();
                 self.spawn_event(async move {
-                    let name = final_path.file_name().unwrap_or_default().to_string_lossy().into_owned();
-                    let result = unblock(move || util::delete_leftovers(&final_path)).await.and_then(|r| r);
-                    AppEvent::Notice(result.map(|n| match n {
-                        0 => format!("No leftover files of {} were found", name),
-                        n => format!("Deleted {} leftover file(s) of {}", n, name),
-                    }))
+                    AppEvent::Discarded { id, name, result: discard_leftovers(final_path).await }
                 });
             }
             None => {
-                self.notice = Some(Ok("Removed the download; no partial file was recorded for it".to_string()));
+                if self.remove_job(id) {
+                    self.notice = Some(Ok("Removed the download; no partial file was recorded for it".to_string()));
+                }
             }
         }
     }
@@ -549,6 +569,12 @@ impl App {
                 Some("Cannot repair: no download URLs are recorded for exactly this file".to_string());
             return;
         }
+        let target = util::final_path_of(&result.file_path);
+        if let Some(id) = self.queue.active_on_target(&target) {
+            self.verify_message =
+                Some(format!("Cannot repair: download #{} is fetching this file right now; pause it first", id));
+            return;
+        }
         let (path, missing, urls) =
             (result.file_path.clone(), result.missing_ranges.clone(), verification.repair_urls.clone());
         let cancel = Arc::new(AtomicBool::new(false));
@@ -565,7 +591,7 @@ impl App {
                 AppEvent::RepairFinished(result)
             })
         };
-        self.repair = Some(Repair { cancel, task, progress });
+        self.repair = Some(Repair { target, cancel, task, progress });
         self.verify_message = None;
     }
 
@@ -590,13 +616,23 @@ impl App {
                 // The engine records completed downloads in the history.
                 self.refresh_history();
             }
-            AppEvent::History { generation, result } => match result {
-                Ok(entries) if generation > self.history_applied => {
+            AppEvent::History(result) => match result {
+                Ok((generation, entries)) if generation > self.history_applied => {
                     self.history_applied = generation;
                     self.history = entries;
                 }
                 Ok(_) => {}
                 Err(e) => self.notice = Some(Err(format!("Could not read the download history: {}", e))),
+            },
+            AppEvent::Discarded { id, name, result } => match result {
+                Ok(removed) => {
+                    self.remove_job(id);
+                    self.notice = Some(Ok(match removed {
+                        0 => format!("Removed the download; no leftover files of {} were found", name),
+                        n => format!("Removed the download and deleted {} leftover file(s) of {}", n, name),
+                    }));
+                }
+                Err(e) => self.notice = Some(Err(format!("Kept the leftovers of {}: {}", name, e))),
             },
             AppEvent::Verified(result) => {
                 self.verifying = false;
@@ -638,9 +674,7 @@ impl App {
                 if self.clipboard_enabled.load(Ordering::Relaxed) && self.url_input.trim() != link {
                     self.clipboard_banner = Some(link);
                 }
-            }
-            AppEvent::Notice(notice) => self.notice = Some(notice),
-        }
+            }        }
     }
 
     fn open_dialog(&mut self, dialog: Dialog, frame: &eframe::Frame) {
@@ -755,15 +789,8 @@ impl eframe::App for App {
             repair.cancel.store(true, Ordering::Relaxed);
             tasks.push(repair.task);
         }
-        if !tasks.is_empty() {
-            let wait_all = async {
-                for task in tasks {
-                    let _ = task.await;
-                }
-            };
-            if self.rt.block_on(tokio::time::timeout(EXIT_GRACE, wait_all)).is_err() {
-                tracing::warn!("Some downloads did not stop within {}s", EXIT_GRACE.as_secs());
-            }
+        if !wait_for_tasks(&self.rt, tasks, EXIT_GRACE) {
+            tracing::warn!("Some downloads did not stop within {}s", EXIT_GRACE.as_secs());
         }
         // Record how the stopped downloads ended; any still stopping are saved as paused.
         while let Ok(event) = self.events_rx.try_recv() {
@@ -787,6 +814,33 @@ async fn unblock<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> R
     tokio::task::spawn_blocking(f).await.map_err(|e| format!("Background task failed: {}", e))
 }
 
+/// Waits up to `grace` for `tasks` from a thread outside the runtime (such as the UI thread).
+/// True if all of them finished.
+fn wait_for_tasks(rt: &tokio::runtime::Handle, tasks: Vec<JoinHandle<()>>, grace: Duration) -> bool {
+    // The timer must be created inside the runtime: outside it, tokio panics.
+    rt.block_on(async move {
+        let wait_all = async {
+            for task in tasks {
+                let _ = task.await;
+            }
+        };
+        tokio::time::timeout(grace, wait_all).await.is_ok()
+    })
+}
+
+/// Runs a history operation after every earlier one has finished and numbers it in that order,
+/// so the latest number always belongs to the latest read of the file.
+fn in_sequence<T>(sequence: &Mutex<u64>, op: impl FnOnce() -> T) -> (u64, T) {
+    let mut generation = lock(sequence);
+    *generation += 1;
+    (*generation, op())
+}
+
+/// Deletes the partial files of `final_path` unless a download (in any process) holds it.
+async fn discard_leftovers(final_path: PathBuf) -> Result<usize, String> {
+    unblock(move || hyperfetch_core::discard_partial(&final_path)).await?
+}
+
 /// One engine run. A cancel request calls `engine.cancel()` and keeps awaiting `run()`, so the
 /// engine flushes data, saves its resume state and stops yt-dlp before this returns.
 async fn run_job(
@@ -798,7 +852,7 @@ async fn run_job(
     ctx: egui::Context,
 ) -> Result<(PathBuf, Option<u64>), String> {
     if let Some(final_path) = leftovers_of {
-        unblock(move || util::delete_leftovers(&final_path)).await??;
+        discard_leftovers(final_path).await.map_err(|e| format!("Could not start over: {}", e))?;
     }
     // The engine treats a missing output directory as a file name.
     if let Some(dir) = options.output_path.clone() {
@@ -1023,6 +1077,60 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(60), job).await.unwrap().unwrap()
     }
 
+    /// The `.part.hfstate` and `.part` of a download of `final_path`.
+    fn part_files(final_path: &std::path::Path) -> (PathBuf, PathBuf) {
+        let mut part = final_path.as_os_str().to_owned();
+        part.push(".part");
+        let part = PathBuf::from(part);
+        (DownloadState::state_file_path(&part), part)
+    }
+
+    /// Closing the window runs on the UI thread, which is not part of the runtime.
+    #[test]
+    fn exit_waits_for_tasks_from_outside_the_runtime() {
+        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        let rt = runtime.handle();
+        let quick = rt.spawn(async { tokio::time::sleep(Duration::from_millis(50)).await });
+        assert!(wait_for_tasks(rt, vec![quick], Duration::from_secs(10)));
+        let stuck = rt.spawn(std::future::pending());
+        let started = Instant::now();
+        assert!(!wait_for_tasks(rt, vec![stuck], Duration::from_millis(100)), "the grace period ends the wait");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(wait_for_tasks(rt, Vec::new(), Duration::ZERO));
+    }
+
+    /// A read that completes later wins, even if it was issued earlier, and it sees every
+    /// earlier write.
+    #[test]
+    fn history_operations_run_and_count_in_order() {
+        let sequence = Arc::new(Mutex::new(0));
+        let file = Arc::new(Mutex::new(vec!["old entry"]));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        // A slow "clear" holds its turn while a "refresh" is issued.
+        let clear = {
+            let (sequence, file) = (Arc::clone(&sequence), Arc::clone(&file));
+            std::thread::spawn(move || {
+                in_sequence(&sequence, || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    lock(&file).clear();
+                    lock(&file).clone()
+                })
+            })
+        };
+        entered_rx.recv().unwrap();
+        let refresh = {
+            let (sequence, file) = (Arc::clone(&sequence), Arc::clone(&file));
+            std::thread::spawn(move || in_sequence(&sequence, || lock(&file).clone()))
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        release_tx.send(()).unwrap();
+        let (clear, refresh) = (clear.join().unwrap(), refresh.join().unwrap());
+        assert_eq!(clear, (1, vec![]));
+        assert_eq!(refresh, (2, vec![]), "the refresh reads after the clear and is numbered after it");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn pause_keeps_resume_state_and_start_over_restarts() {
         let dir = tempfile::tempdir().unwrap();
@@ -1036,7 +1144,7 @@ mod tests {
         // Pause: run() returns only after saving the resume state next to the .part.
         let url = Url::parse(&format!("http://{}/file.bin", addr)).unwrap();
         let final_path = downloads.join("file.bin");
-        let [hfstate, _, part] = util::leftover_paths(&final_path);
+        let (hfstate, part) = part_files(&final_path);
         assert!(run(&url, &options, None, Some(Duration::from_millis(700))).await.is_err());
         assert!(part.exists() && !final_path.exists());
         let saved = DownloadState::load_from_path(&hfstate).unwrap().expect("resume state saved");
@@ -1054,7 +1162,7 @@ mod tests {
             let name = format!("other-{}.bin", start_over);
             let url = Url::parse(&format!("http://{}/{}", addr, name)).unwrap();
             let other = downloads.join(&name);
-            let [_, _, other_part] = util::leftover_paths(&other);
+            let (_, other_part) = part_files(&other);
             assert!(run(&url, &options, None, Some(Duration::from_millis(700))).await.is_err());
             let mut file = std::fs::OpenOptions::new().write(true).open(&other_part).unwrap();
             std::io::Write::write_all(&mut file, &[0xAA; 16 * 1024]).unwrap();
@@ -1063,6 +1171,19 @@ mod tests {
             run(&url, &options, leftovers_of, None).await.unwrap();
             assert_eq!(std::fs::read(&other).unwrap() == *body, start_over);
         }
+
+        // Start Over never deletes a partial file that another download holds.
+        let url = Url::parse(&format!("http://{}/held.bin", addr)).unwrap();
+        let held = downloads.join("held.bin");
+        let (held_state, held_part) = part_files(&held);
+        assert!(run(&url, &options, None, Some(Duration::from_millis(700))).await.is_err());
+        let claim = hyperfetch_core::claim_target(&held).unwrap().expect("nothing is downloading it");
+        let error = run(&url, &options, Some(held.clone()), None).await.unwrap_err();
+        assert!(error.starts_with("Could not start over") && error.contains("still being downloaded"), "{}", error);
+        assert!(held_part.exists() && held_state.exists(), "the partial file is kept");
+        drop(claim);
+        assert!(discard_leftovers(held.clone()).await.unwrap() >= 2);
+        assert!(!held_part.exists() && !held_state.exists());
         assert!(std::fs::read(&final_path).unwrap() == *body, "other files are untouched");
     }
 }

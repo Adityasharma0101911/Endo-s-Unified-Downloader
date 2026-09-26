@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -53,6 +53,20 @@ impl QueueItem {
     fn conflicts_with(&self, other: &QueueItem) -> bool {
         self.urls.iter().any(|u| other.urls.contains(u))
             || self.target_path.is_some() && self.target_path == other.target_path
+    }
+
+    /// The engine reported `path` as the item's target file.
+    pub fn targets(&self, path: &Path) -> bool {
+        self.target_path.as_deref().is_some_and(|target| {
+            target == path
+                || matches!((std::path::absolute(target), std::path::absolute(path)), (Ok(a), Ok(b)) if a == b)
+        })
+    }
+
+    /// Every byte has arrived and the engine is verifying the file and moving it into place, which
+    /// sends no progress: not a stall.
+    pub fn is_finishing(&self) -> bool {
+        self.status == QueueItemStatus::Downloading && self.total_bytes > 0 && self.downloaded_bytes >= self.total_bytes
     }
 }
 
@@ -149,6 +163,11 @@ impl DownloadQueue {
             .map(|other| other.id)
     }
 
+    /// An active item whose engine reported `path` as its target file.
+    pub fn active_on_target(&self, path: &Path) -> Option<usize> {
+        self.items.iter().find(|i| i.status.is_active() && i.targets(path)).map(|i| i.id)
+    }
+
     /// Marks the item as running and clears its speed. Returns false if it is missing or already active.
     pub fn mark_started(&mut self, id: usize) -> bool {
         match self.get_item_mut(id) {
@@ -176,7 +195,8 @@ impl DownloadQueue {
         let Some(item) = self.get_item_mut(id) else { return };
         item.total_bytes = snapshot.total_bytes;
         item.downloaded_bytes = snapshot.downloaded_bytes;
-        item.speed_bytes_per_sec = snapshot.speed_bytes_per_sec;
+        // Nothing is transferred any more once every byte has arrived.
+        item.speed_bytes_per_sec = if item.is_finishing() { 0.0 } else { snapshot.speed_bytes_per_sec };
         // NaN (0/0 from an empty stream) would make the saved queue unreadable JSON.
         item.progress_ratio =
             if snapshot.progress_ratio.is_nan() { 0.0 } else { snapshot.progress_ratio.clamp(0.0, 1.0) };
@@ -361,6 +381,45 @@ mod tests {
         q.apply_snapshot(ids[0], &snapshot("/dl/x.bin"));
         q.apply_snapshot(ids[2], &snapshot("/dl/x.bin"));
         assert_eq!(q.active_conflict(ids[2]), Some(ids[0]), "same target file");
+    }
+
+    #[test]
+    fn active_item_on_a_target_is_found_by_path() {
+        let (mut q, ids) = queue_of(&["https://e.com/a", "https://e.com/b"]);
+        let target = std::env::temp_dir().join("x.bin");
+        q.mark_started(ids[0]);
+        assert_eq!(q.active_on_target(&target), None, "the target is not known yet");
+        q.apply_snapshot(ids[0], &snapshot(target.to_str().unwrap()));
+        assert_eq!(q.active_on_target(&target), Some(ids[0]));
+        q.apply_snapshot(ids[1], &snapshot("relative.bin"));
+        let spelled_out = std::env::current_dir().unwrap().join("relative.bin");
+        assert!(q.get_item(ids[1]).unwrap().targets(&spelled_out), "same file, other spelling");
+        assert_eq!(q.active_on_target(&std::env::temp_dir().join("y.bin")), None);
+        assert!(q.get_item(ids[0]).unwrap().targets(&target));
+        assert!(!q.get_item(ids[1]).unwrap().targets(&target));
+        assert_eq!(q.active_on_target(&spelled_out), None, "only active items count");
+        q.mark_pausing(ids[0]);
+        q.finish(ids[0], Err("cancelled".into()));
+        assert_eq!(q.active_on_target(&target), None, "a paused item is not active");
+    }
+
+    #[test]
+    fn all_bytes_received_is_finishing_with_no_speed() {
+        let (mut q, ids) = queue_of(&["https://e.com/a"]);
+        q.mark_started(ids[0]);
+        q.apply_snapshot(ids[0], &snapshot("/dl/a"));
+        assert!(!q.get_item(ids[0]).unwrap().is_finishing());
+        q.apply_snapshot(ids[0], &EngineSnapshot { downloaded_bytes: 100, progress_ratio: 1.0, ..snapshot("/dl/a") });
+        let item = q.get_item(ids[0]).unwrap();
+        assert!(item.is_finishing());
+        assert_eq!(item.speed_bytes_per_sec, 0.0);
+        q.finish(ids[0], Ok((PathBuf::from("/dl/a"), Some(100))));
+        assert!(!q.get_item(ids[0]).unwrap().is_finishing(), "completed is not finishing");
+        // An unknown size never counts as finished.
+        let unknown = q.add_item(vec![url("https://e.com/s")], DownloadOptions::default());
+        q.mark_started(unknown);
+        q.apply_snapshot(unknown, &EngineSnapshot { total_bytes: 0, ..snapshot("/dl/s") });
+        assert!(!q.get_item(unknown).unwrap().is_finishing());
     }
 
     #[test]
