@@ -1843,12 +1843,16 @@ async fn test_probes_take_their_hosts_budget_slots() {
 async fn test_what_downloads_see_of_their_hosts_is_remembered() {
     let _history = setup().await;
     let data = payload(3 * PREFETCH, 263);
-    // A server capping each connection (~3 MB/s), one sending a small file as fast as it can,
-    // one ignoring ranges, and one sending a file within the probe's range whole, as a server
-    // may however it takes ranges.
+    // A server capping each connection (~3 MB/s); one far away (new connections take 200 ms)
+    // sending a small file as fast as it can; one sending a small file too slowly to tell either
+    // way; one ignoring ranges; and one sending a file within the probe's range whole, as a
+    // server may however it takes ranges.
     let capped = Mock::new(data.clone());
     capped.delay_us.store(5_000, Ordering::SeqCst);
-    let fast = Mock::new(data[..256 * KB].to_vec());
+    let mut fast = Mock::new(data[..256 * KB].to_vec());
+    fast.latency = Duration::from_millis(200);
+    let short = Mock::new(data[..20 * KB].to_vec());
+    short.delay_us.store(30_000, Ordering::SeqCst);
     let mut whole = Mock::new(data.clone());
     whole.ranges = false;
     let mut small_whole = Mock::new(data[..256 * KB].to_vec());
@@ -1856,6 +1860,7 @@ async fn test_what_downloads_see_of_their_hosts_is_remembered() {
     for (mock, ranges, is_capped) in [
         (capped, Some(true), Some(true)),
         (fast, Some(true), Some(false)),
+        (short, Some(true), None),
         (whole, Some(false), None),
         (small_whole, None, None),
     ] {
@@ -1985,6 +1990,29 @@ async fn test_an_answer_waiting_for_the_other_probes_holds_no_host_slot() {
 
     run(&DownloadEngine::new(vec![first, second], options(&out, 4, 64 * KB)), None).await.expect("download should succeed");
     assert_file(&out, &data);
+}
+
+#[tokio::test]
+async fn test_a_capped_host_is_learned_from_a_download_its_probe_could_not_measure() {
+    let _history = setup().await;
+    let data = payload(4 * PREFETCH, 307);
+    // ~3 MB/s per connection, from a host every answer takes 200 ms to come from: the rate is
+    // looked at every 100 ms, so when the workers stop waiting for the probe's answer it had held
+    // only once.
+    let mut mock = Mock::new(data.clone());
+    mock.latency = Duration::from_millis(200);
+    mock.delay_us.store(5_000, Ordering::SeqCst);
+    let mock = Arc::new(mock);
+    let url = serve(Arc::clone(&mock), "far.bin").await;
+    let temp = tempdir().unwrap();
+    let out = temp.path().join("far.bin");
+
+    run(&DownloadEngine::new(vec![url.clone()], options(&out, 4, 256 * KB)), None).await.expect("download should succeed");
+    assert_file(&out, &data);
+    // Going on as the first chunk, alone until the workers' answers came, it told the rest.
+    let seen = hosts::profile(&url);
+    assert_eq!(seen.capped_per_connection, Some(true), "{seen:?}");
+    assert!(seen.connection_rate.is_some(), "{seen:?}");
 }
 
 #[tokio::test]
