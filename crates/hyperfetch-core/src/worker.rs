@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::chunk::{Chunk, ChunkManager, StealRule, StealTiming};
-use crate::hosts::{self, HostKey, HostSlot};
+use crate::hosts::{self, HostKey, HostProfile, HostSlot};
 use crate::mirror::{Mirror, MirrorRacer};
 use crate::range::ByteRange;
 use crate::storage::DiskWriter;
@@ -403,11 +403,14 @@ impl HttpWorker {
         check_response(response.status(), response.headers(), start, end, s.file_size, if_range.as_deref())
             .map_err(|failure| if redirected { at_redirect_target(response.status(), failure) } else { failure })?;
         slot.accepted();
-        let _ = s.events.try_send(WorkerEvent::Ttfb {
-            worker_id: self.worker_id,
-            mirror_id,
-            ttfb: sent_at.elapsed(),
-        });
+        let ttfb = sent_at.elapsed();
+        // The host answering honours ranges (a 200 from the file's start says nothing) and, on a
+        // new connection straight to it, takes this long to answer: the next download from it
+        // starts from that.
+        let accepts_ranges = (response.status() == StatusCode::PARTIAL_CONTENT).then_some(true);
+        let setup_time = (response.url() == url && crate::engine::opens_connection(slot)).then_some(ttfb);
+        hosts::record(response.url(), HostProfile { accepts_ranges, setup_time, ..Default::default() });
+        let _ = s.events.try_send(WorkerEvent::Ttfb { worker_id: self.worker_id, mirror_id, ttfb });
         self.receive(chunk, mirror_id, response, start).await
     }
 
@@ -1071,6 +1074,41 @@ mod tests {
         worker.shared.body_idle = Duration::from_millis(100);
         worker.download_chunk(&chunk, 0, &url, None, false, &slot(&url)).await.unwrap();
         assert_eq!(chunk.current_offset.load(Ordering::SeqCst), SIZE as u64);
+    }
+
+    #[tokio::test]
+    async fn test_an_answered_range_tells_what_its_host_does() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        const SIZE: usize = 16 * 1024;
+        let listener = hosts::unseen_listener().await;
+        let url = Url::parse(&format!("http://{}/f", listener.local_addr().unwrap())).unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut head = [0u8; 4096];
+                let _ = socket.read(&mut head).await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let header = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-{}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    SIZE - 1, SIZE, SIZE
+                );
+                let _ = socket.write_all(header.as_bytes()).await;
+                let _ = socket.write_all(&[5u8; SIZE]).await;
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+
+        // Nothing went to the host before: the connection is new, and its wait what one needs.
+        let (worker, chunk, _events) = test_worker(&url, &dir.path().join("a.part"), SIZE as u64);
+        worker.download_chunk(&chunk, 0, &url, None, false, &slot(&url)).await.unwrap();
+        let seen = hosts::profile(&url);
+        assert_eq!(seen.accepts_ranges, Some(true));
+        assert!(seen.setup_time.is_some_and(|t| t >= Duration::from_millis(50)), "{seen:?}");
+        // Right after a request to the host ended, the next may reuse its connection.
+        let cold = Duration::from_secs(7);
+        hosts::record(&url, HostProfile { setup_time: Some(cold), ..Default::default() });
+        let (worker, chunk, _events) = test_worker(&url, &dir.path().join("b.part"), SIZE as u64);
+        worker.download_chunk(&chunk, 0, &url, None, false, &slot(&url)).await.unwrap();
+        assert_eq!(hosts::profile(&url).setup_time, Some(cold));
     }
 
     #[tokio::test]
