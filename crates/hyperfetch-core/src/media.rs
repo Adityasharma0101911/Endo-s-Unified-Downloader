@@ -234,6 +234,13 @@ fn managed_bin_dir() -> Option<PathBuf> {
     Some(app_data_dir()?.join("bin"))
 }
 
+/// `p` made absolute against the current directory. An empty path (the parent of a bare file
+/// name) is the current directory itself.
+fn absolute(p: &Path) -> Result<PathBuf, String> {
+    let p = if p.as_os_str().is_empty() { Path::new(".") } else { p };
+    std::path::absolute(p).map_err(|e| format!("Invalid path {}: {e}", p.display()))
+}
+
 /// Empty per-user directory yt-dlp runs in, so nothing in the user's current directory
 /// (such as a planted `yt-dlp.conf`) can influence it.
 fn ytdlp_work_dir() -> PathBuf {
@@ -591,7 +598,7 @@ fn version_at_least(version: &str, min: (u32, u32, u32)) -> bool {
 }
 
 /// yt-dlp arguments for one run. Paths in `options` must be absolute: yt-dlp runs in
-/// [`ytdlp_work_dir`]. The proxy is not among them (see [`ytdlp_command`]).
+/// [`ytdlp_work_dir`].
 fn build_ytdlp_args(
     url: &Url,
     options: &MediaDownloadOptions,
@@ -639,6 +646,16 @@ fn build_ytdlp_args(
     }
     args.extend(options.preset.to_args());
     args.extend(options.cookies.to_args());
+    if let Some(proxy) = &options.proxy {
+        // Only --proxy reaches the ffmpeg yt-dlp starts for live streams as well. The tradeoff:
+        // proxy credentials in the command line are visible to other local users' process lists.
+        // ffmpeg ignores a proxy without a scheme, which reqwest and yt-dlp read as http://.
+        let has_scheme = proxy.split_once("://").is_some_and(|(scheme, _)| {
+            !scheme.is_empty() && scheme.bytes().all(|b| b.is_ascii_alphanumeric())
+        });
+        let proxy = if has_scheme { proxy.clone() } else { format!("http://{proxy}") };
+        args.extend(["--proxy".to_string(), proxy]);
+    }
     if options.concurrent_fragments > 1 {
         args.extend(["--concurrent-fragments".to_string(), options.concurrent_fragments.min(32).to_string()]);
     }
@@ -924,21 +941,11 @@ fn tree_command(program: &Path) -> Command {
     cmd
 }
 
-/// The yt-dlp invocation, run in `work_dir`. A proxy goes into the child's environment,
-/// which yt-dlp (and the ffmpeg it starts) honor: on the command line its credentials
-/// would be visible to every local user.
-fn ytdlp_command(bin: &Path, args: &[String], proxy: Option<&str>, work_dir: &Path) -> Command {
+/// The yt-dlp invocation, run in `work_dir`.
+fn ytdlp_command(bin: &Path, args: &[String], work_dir: &Path) -> Command {
     let mut cmd = tree_command(bin);
     // Otherwise Python encodes piped output in the locale code page (cp1252 on Windows).
     cmd.args(args).current_dir(work_dir).env("PYTHONIOENCODING", "utf-8");
-    if let Some(proxy) = proxy {
-        // Python prefers the lower-case names; set both so an inherited value cannot win.
-        for var in ["http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"] {
-            cmd.env(var, proxy);
-        }
-        // --proxy applied to every host; an inherited exemption list must not change that.
-        cmd.env_remove("no_proxy").env_remove("NO_PROXY");
-    }
     cmd
 }
 
@@ -1016,7 +1023,6 @@ pub async fn download_media(
             .map_err(|e| format!("Tool discovery failed: {e}"))?;
 
     // yt-dlp runs in its own working directory, so every path it gets must be absolute.
-    let absolute = |p: &Path| std::path::absolute(p).map_err(|e| format!("Invalid path {}: {e}", p.display()));
     let mut options = options.clone();
     options.output_dir = absolute(&options.output_dir)?;
     if let BrowserCookieSource::File(path) = &mut options.cookies {
@@ -1050,7 +1056,7 @@ pub async fn download_media(
     loop {
         let version = ytdlp_version(&ytdlp_bin, &work_dir).await;
         let args = build_ytdlp_args(url, &options, ffmpeg_dir, js_runtime.as_deref(), version.as_deref());
-        let cmd = ytdlp_command(&ytdlp_bin, &args, options.proxy.as_deref(), &work_dir);
+        let cmd = ytdlp_command(&ytdlp_bin, &args, &work_dir);
 
         let err = match run_ytdlp(cmd, progress_tx.as_ref(), cancel_flag.clone()).await {
             Ok(path) => return Ok(path),
@@ -1235,31 +1241,39 @@ mod tests {
     }
 
     #[test]
-    fn command_runs_in_work_dir_with_proxy_only_in_environment() {
+    fn proxy_goes_on_the_command_line_with_a_scheme() {
         let url = Url::parse("https://www.youtube.com/watch?v=abc").unwrap();
-        let proxy = "http://alice:S3cret@proxy:3128";
-        let options = MediaDownloadOptions {
-            output_dir: PathBuf::from("out"),
-            proxy: Some(proxy.to_string()),
-            ..Default::default()
+        let proxy_arg = |proxy: &str| {
+            let options = MediaDownloadOptions {
+                output_dir: PathBuf::from("out"),
+                proxy: Some(proxy.to_string()),
+                ..Default::default()
+            };
+            let args = build_ytdlp_args(&url, &options, None, None, None);
+            let at = args.iter().position(|a| a == "--proxy").expect("--proxy passed");
+            args[at + 1].clone()
         };
+        // Without a scheme ffmpeg (started by yt-dlp for live streams) would bypass the proxy.
+        assert_eq!(proxy_arg("127.0.0.1:8080"), "http://127.0.0.1:8080");
+        assert_eq!(proxy_arg("user:pw@proxy:3128"), "http://user:pw@proxy:3128");
+        assert_eq!(proxy_arg("socks5://proxy:1080"), "socks5://proxy:1080");
+        assert_eq!(proxy_arg("http://alice:S3cret@proxy:3128"), "http://alice:S3cret@proxy:3128");
+
+        let options = MediaDownloadOptions { output_dir: PathBuf::from("out"), ..Default::default() };
         let args = build_ytdlp_args(&url, &options, None, None, None);
-        assert!(!args.iter().any(|a| a == "--proxy" || a.contains("S3cret")), "{args:?}");
-
+        assert!(!args.contains(&"--proxy".to_string()));
         let work_dir = std::env::temp_dir();
-        let cmd = ytdlp_command(Path::new("yt-dlp"), &args, options.proxy.as_deref(), &work_dir);
-        let cmd = cmd.as_std();
-        assert_eq!(cmd.get_current_dir(), Some(work_dir.as_path()));
-        let env = |name: &str| {
-            cmd.get_envs().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.map(|v| v.to_owned()))
-        };
-        for var in ["http_proxy", "https_proxy", "all_proxy"] {
-            assert_eq!(env(var), Some(Some(proxy.into())), "{var}");
-        }
-        assert_eq!(env("no_proxy"), Some(None), "inherited NO_PROXY is removed");
+        let cmd = ytdlp_command(Path::new("yt-dlp"), &args, &work_dir);
+        assert_eq!(cmd.as_std().get_current_dir(), Some(work_dir.as_path()));
+        assert!(!cmd.as_std().get_envs().any(|(k, _)| k.to_string_lossy().to_ascii_lowercase().contains("proxy")));
+    }
 
-        let without_proxy = ytdlp_command(Path::new("yt-dlp"), &args, None, &work_dir);
-        assert!(!without_proxy.as_std().get_envs().any(|(k, _)| k.eq_ignore_ascii_case("http_proxy")));
+    #[test]
+    fn empty_directory_is_the_current_one() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(absolute(Path::new("")).unwrap(), absolute(Path::new(".")).unwrap());
+        assert!(absolute(Path::new("")).unwrap().starts_with(&cwd));
+        assert_eq!(absolute(Path::new("clip.mp4")).unwrap(), cwd.join("clip.mp4"));
     }
 
     #[test]
