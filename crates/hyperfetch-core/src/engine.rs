@@ -939,9 +939,10 @@ impl DownloadEngine {
 
     /// Records `path` as completed in the download history, which is read only once, under its
     /// lock: it may have been edited (entries removed, other downloads finished) while this
-    /// download ran. `size` is looked up if not given.
+    /// download ran. `size` is looked up if not given. Waits for the history file to reach the
+    /// disk only with fsync_on_complete, as for the file itself.
     async fn record_completed(&self, path: PathBuf, size: Option<u64>, blake3_hex: String, started_at: u64) {
-        let urls = self.url_strings();
+        let (urls, durable) = (self.url_strings(), self.options.fsync_on_complete);
         let _ = blocking(move || {
             let size = size.unwrap_or_else(|| std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0));
             let mut entry = HistoryEntry::new(file_name_of(&path), absolute(&path), size, urls);
@@ -951,7 +952,7 @@ impl DownloadEngine {
             entry.started_at = started_at;
             entry.completed_at = Some(unix_now());
             let history = DownloadHistoryManager::default_history_path();
-            if let Err(e) = DownloadHistoryManager::record(&history, entry) {
+            if let Err(e) = DownloadHistoryManager::record(&history, entry, durable) {
                 tracing::warn!("Failed to update history file {:?}: {}", history, e);
             }
         })
