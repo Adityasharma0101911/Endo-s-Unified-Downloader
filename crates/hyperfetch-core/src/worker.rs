@@ -408,7 +408,7 @@ impl HttpWorker {
         // new connection straight to it, takes this long to answer: the next download from it
         // starts from that.
         let accepts_ranges = (response.status() == StatusCode::PARTIAL_CONTENT).then_some(true);
-        let setup_time = (response.url() == url && crate::engine::opens_connection(slot)).then_some(ttfb);
+        let setup_time = (response.url() == url && slot.opens_connection()).then_some(ttfb);
         hosts::record(response.url(), HostProfile { accepts_ranges, setup_time, ..Default::default() });
         let _ = s.events.try_send(WorkerEvent::Ttfb { worker_id: self.worker_id, mirror_id, ttfb });
         self.receive(chunk, mirror_id, response, start).await
