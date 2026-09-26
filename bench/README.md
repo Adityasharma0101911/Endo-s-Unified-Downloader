@@ -45,6 +45,38 @@ All runs also pass `-q -d <tempdir>`. Pick scenarios with `--only large,stall`; 
 server with `--rate-mib`, `--latency-ms`, `--large-mib`, `--small-count`, `--small-kib`,
 `--medium-count`, `--medium-mib`.
 
+## Results (2026-09-26, Windows 11, 32 threads)
+
+Default server (2 MiB/s per connection, 40 ms per request):
+
+| Scenario | Binary | Median wall | MB/s | Passed |
+|---|---|---:|---:|---:|
+| Large file, -s 16 | v1.0 | 8.50 s | 31.6 | 3/3 |
+| Large file, -s 16 | new | 8.48 s | 31.7 | 3/3 |
+| Small-file batch via -i | v1.0 (sequential) | 5.98 s | 3.5 | 3/3 |
+| Small-file batch via -i | new -j 1 | 9.93 s | 2.1 | 3/3 |
+| Small-file batch via -i | new -j 4 | 2.71 s | 7.7 | 3/3 |
+| Large file, HEAD without Accept-Ranges | v1.0 | 128.56 s | 2.1 | 3/3 |
+| Large file, HEAD without Accept-Ranges | new | 8.41 s | 31.9 | 3/3 |
+| Large file, one connection stalls forever | v1.0 | - | - | 0/3 (hung) |
+| Large file, one connection stalls forever | new | 35.65 s | 7.5 | 3/3 |
+
+`--rate-mib 0 --only small,large` (no per-connection cap, 40 ms per request):
+
+| Scenario | Binary | Median wall | MB/s | Passed |
+|---|---|---:|---:|---:|
+| Large file, -s 16 | v1.0 | 0.52 s | 516.7 | 3/3 |
+| Large file, -s 16 | new | 0.90 s | 296.7 | 3/3 |
+| Small-file batch via -i | v1.0 (sequential) | 4.65 s | 4.5 | 3/3 |
+| Small-file batch via -i | new -j 1 | 2.76 s | 7.6 | 3/3 |
+| Small-file batch via -i | new -j 4 | 0.77 s | 27.1 | 3/3 |
+
+The uncapped large-file runs move 300–500 MB/s over loopback and are noisy (v1.0 0.51–1.68 s,
+new 0.57–2.64 s); at that speed the new build is slower, which is not investigated yet. A small
+file comes over the connection
+that probed it unless that connection is capped, so v1.0's fixed 16-way split still wins for
+tiny files from a server that caps every connection when they are fetched one at a time.
+
 ## Server alone
 
 ```sh
