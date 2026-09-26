@@ -252,7 +252,7 @@ impl HttpWorker {
 
     /// A chunk for the mirror `slot` was taken for, if it can still take a connection there:
     /// fresh work, else what is left of a chunk gone silent, else part of a slow chunk, timed by
-    /// what a new request to that mirror costs. Lock order: mirrors, then chunks.
+    /// what a new request to each mirror costs. Lock order: mirrors, then chunks.
     fn next_job(&self, mirror_id: usize, slot: &HostSlot) -> Option<(Chunk, Url, Option<String>)> {
         let s = &self.shared;
         let mut racer = s.mirrors.lock();
@@ -261,10 +261,8 @@ impl HttpWorker {
             .get_mirror(mirror_id)
             .filter(|m| m.score(Instant::now()) >= 0.0 && HostKey::of(&m.url) == *slot.host())?;
         let (url, if_range) = (mirror.url.clone(), mirror.if_range.clone());
-        let timing = StealTiming { startup: mirror.ttfb(), thief_rate: mirror.speed_ewma };
         let chunk = {
             let mut mgr = s.chunks.lock();
-            let steal = StealRule { min_bytes: s.min_steal, timing: Some(timing) };
             mgr.get_next_work(self.worker_id, mirror_id)
                 .or_else(|| {
                     let taken = mgr.take_over_silent(self.worker_id, mirror_id, |m| takeover_after(racer.get_mirror(m)));
@@ -273,7 +271,12 @@ impl HttpWorker {
                     }
                     taken
                 })
-                .or_else(|| mgr.steal_work(self.worker_id, mirror_id, steal).map(|(_, c)| c))?
+                .or_else(|| {
+                    let costs: Vec<StealTiming> =
+                        racer.mirrors().iter().map(|m| StealTiming { startup: m.ttfb(), rate: m.speed_ewma }).collect();
+                    let steal = StealRule { min_bytes: s.min_steal, timing: Some(&costs) };
+                    mgr.steal_work(self.worker_id, mirror_id, steal).map(|(_, c)| c)
+                })?
         };
         racer.acquire_mirror(mirror_id);
         Some((chunk, url, if_range))

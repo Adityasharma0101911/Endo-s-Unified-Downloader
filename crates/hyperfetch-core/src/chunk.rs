@@ -16,24 +16,25 @@ const STEAL_MIN_STARTUPS: f64 = 2.0;
 
 /// How a thief may split a chunk.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct StealRule {
-    /// Fewest bytes a steal hands the thief.
+pub struct StealRule<'a> {
+    /// Fewest bytes a steal hands the thief: a split that would give it less is not made.
     pub min_bytes: u64,
-    /// What the split is timed by; without it the rest of the chunk is split in half.
-    pub timing: Option<StealTiming>,
+    /// What a new request to each mirror costs, by mirror id. Without it the rest of a chunk is
+    /// split in half.
+    pub timing: Option<&'a [StealTiming]>,
 }
 
-/// What a timed steal knows about the thief.
+/// What a new request to a mirror costs.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StealTiming {
-    /// Time the thief's new request needs before its first byte.
+    /// Time the request needs before its first byte.
     pub startup: Duration,
-    /// Bytes per second the thief's connection is expected to reach.
-    pub thief_rate: f64,
+    /// Bytes per second its connection is expected to reach.
+    pub rate: f64,
 }
 
 /// A steal of at least this many bytes, split in half.
-impl From<u64> for StealRule {
+impl From<u64> for StealRule<'_> {
     fn from(min_bytes: u64) -> Self {
         Self { min_bytes, timing: None }
     }
@@ -168,10 +169,23 @@ impl Chunk {
         (received > 0 && elapsed > 0.0).then(|| received as f64 / elapsed)
     }
 
-    /// Estimated seconds to finish at the rate observed since assignment (infinite if nothing arrived yet).
-    fn eta_secs(&self, remaining: u64, now: Instant) -> f64 {
-        self.rate(now).map_or(f64::INFINITY, |rate| remaining as f64 / rate)
+    /// How the chunk's worker is expected to go on: seconds until its next byte, and bytes per
+    /// second from then on. Once it has a rate since assignment, that rate at once; before, what
+    /// a request to its mirror costs (`expected`), less the part of the startup already behind it.
+    /// `None` without either.
+    fn pace(&self, now: Instant, expected: Option<&StealTiming>) -> Option<(f64, f64)> {
+        if let Some(rate) = self.rate(now) {
+            return Some((0.0, rate));
+        }
+        let expected = expected.filter(|t| t.rate > 0.0)?;
+        let waited = self.assigned_at.map_or(Duration::ZERO, |at| now.saturating_duration_since(at));
+        Some((expected.startup.saturating_sub(waited).as_secs_f64(), expected.rate))
     }
+}
+
+/// Seconds until a worker going on at `pace` has written `remaining` bytes (infinite without a pace).
+fn eta_secs(remaining: u64, pace: Option<(f64, f64)>) -> f64 {
+    pace.map_or(f64::INFINITY, |(wait, rate)| wait + remaining as f64 / rate)
 }
 
 /// Manages chunk partitioning, assignment, retries and work stealing.
@@ -369,57 +383,59 @@ impl ChunkManager {
         Some(self.assign(id, thief_worker_id, thief_mirror_id, now))
     }
 
-    /// Splits the in-flight chunk with the longest estimated time remaining (ties: most bytes left).
-    /// A timed steal splits where both sides finish together, the victim going on at the rate it
-    /// has had since assignment and the thief starting after `startup` at `thief_rate`, and leaves
-    /// a chunk alone if its worker finishes within `STEAL_MIN_STARTUPS` startups anyway. Without
-    /// timing, or before the victim has a rate, the rest is split in half. The thief gets at least
-    /// `min_bytes`, the victim keeps at least one. The victim is always truncated and the thief
-    /// always gets `[split, old_end]`; if the victim's worker already wrote past the split, those
-    /// bytes are identical and simply get written twice.
+    /// Splits the in-flight chunk expected to finish last (ties: most bytes left). Its worker is
+    /// expected to go on at the rate it has had since assignment, or before it has one, at its
+    /// mirror's rate once its mirror's startup is over. A timed steal splits where both sides
+    /// finish together, the thief starting after its mirror's startup at its mirror's rate, and
+    /// leaves the chunk alone if its worker finishes within `STEAL_MIN_STARTUPS` of those startups
+    /// anyway. Without timing the rest is split in half. A split that would hand the thief fewer
+    /// than `min_bytes` is not made, and the victim keeps at least one byte. The victim is always
+    /// truncated and the thief always gets `[split, old_end]`; if the victim's worker already
+    /// wrote past the split, those bytes are identical and simply get written twice.
     /// Returns `(victim_chunk_id, new_stolen_chunk)`.
-    pub fn steal_work(
+    pub fn steal_work<'a>(
         &mut self,
         thief_worker_id: usize,
         thief_mirror_id: usize,
-        rule: impl Into<StealRule>,
+        rule: impl Into<StealRule<'a>>,
     ) -> Option<(usize, Chunk)> {
         if self.fatal.is_some() {
             return None;
         }
         let rule = rule.into();
         let min_bytes = rule.min_bytes.max(1);
+        let expected = |mirror_id: usize| rule.timing.and_then(|t| t.get(mirror_id));
         let now = Instant::now();
-        let (victim_id, _, eta) = self
+        let (victim_id, _, pace) = self
             .chunks
             .iter()
-            .filter(|c| c.is_in_flight())
-            .filter_map(|c| {
-                let remaining = c.remaining_bytes();
-                (remaining > min_bytes).then(|| (c.id, remaining, c.eta_secs(remaining, now)))
+            .filter_map(|c| match c.status {
+                ChunkStatus::Assigned { mirror_id, .. } => {
+                    let remaining = c.remaining_bytes();
+                    (remaining > min_bytes).then(|| (c.id, remaining, c.pace(now, expected(mirror_id))))
+                }
+                _ => None,
             })
-            .max_by(|a, b| a.2.total_cmp(&b.2).then(a.1.cmp(&b.1)))?;
-        if rule.timing.is_some_and(|t| eta <= STEAL_MIN_STARTUPS * t.startup.as_secs_f64()) {
-            return None;
-        }
+            .max_by(|a, b| eta_secs(a.1, a.2).total_cmp(&eta_secs(b.1, b.2)).then(a.1.cmp(&b.1)))?;
 
         let victim = &mut self.chunks[victim_id];
         let cur_pos = victim.current_offset.load(Ordering::SeqCst).max(victim.range.start);
         let cur_end = victim.end_offset.load(Ordering::SeqCst);
         let remaining = cur_end.checked_sub(cur_pos)?.saturating_add(1);
-        if remaining <= min_bytes {
-            return None;
-        }
-        let keep = match (rule.timing, victim.rate(now)) {
-            (Some(t), Some(victim_rate)) if t.thief_rate > 0.0 => {
-                // keep / victim_rate == startup + (remaining - keep) / thief_rate
-                let (startup, left) = (t.startup.as_secs_f64(), remaining as f64);
-                ((startup * t.thief_rate + left) * victim_rate / (victim_rate + t.thief_rate)) as u64
+        let keep = match (expected(thief_mirror_id).filter(|t| t.rate > 0.0), pace) {
+            (Some(thief), Some((wait, victim_rate))) => {
+                let (startup, left) = (thief.startup.as_secs_f64(), remaining as f64);
+                if eta_secs(remaining, pace) <= STEAL_MIN_STARTUPS * startup {
+                    return None;
+                }
+                // wait + keep / victim_rate == startup + (remaining - keep) / thief.rate
+                (((startup - wait) * thief.rate + left) * victim_rate / (victim_rate + thief.rate)) as u64
             }
             _ => remaining / 2,
         };
+        let stolen = remaining.checked_sub(keep.max(1)).filter(|&n| n >= min_bytes)?;
 
-        let split_offset = cur_pos + keep.clamp(1, remaining - min_bytes);
+        let split_offset = cur_end + 1 - stolen;
         victim.end_offset.store(split_offset - 1, Ordering::SeqCst);
         victim.range.end = split_offset - 1;
 
@@ -624,8 +640,13 @@ mod tests {
         manager
     }
 
-    fn timed(min_bytes: u64, startup_secs: f64, thief_rate: f64) -> StealRule {
-        StealRule { min_bytes, timing: Some(StealTiming { startup: Duration::from_secs_f64(startup_secs), thief_rate }) }
+    /// What a request to a mirror costs: `startup_secs` before its first byte, then `rate`.
+    fn cost(startup_secs: f64, rate: f64) -> StealTiming {
+        StealTiming { startup: Duration::from_secs_f64(startup_secs), rate }
+    }
+
+    fn timed(min_bytes: u64, mirrors: &[StealTiming]) -> StealRule<'_> {
+        StealRule { min_bytes, timing: Some(mirrors) }
     }
 
     #[test]
@@ -633,34 +654,70 @@ mod tests {
         // 90 MB left at 1 MB/s; the thief starts after 4 s, then moves 3 MB/s. Both finish after
         // 25.5 s: the victim with 25.5 MB, the thief with 64.5 MB in 4 + 21.5 s.
         let mut manager = one_victim(100 * MB, 10 * MB, 10);
-        let (victim, stolen) = manager.steal_work(1, 0, timed(64 * 1024, 4.0, 3.0 * MB as f64)).unwrap();
+        let (victim, stolen) = manager.steal_work(1, 0, timed(64 * 1024, &[cost(4.0, 3.0 * MB as f64)])).unwrap();
         let split = 10 * MB + (25.5 * MB as f64) as u64;
         assert_eq!(victim, 0);
         assert!(stolen.range.start.abs_diff(split) < MB, "split at {} instead of about {split}", stolen.range.start);
         assert_eq!(stolen.range.end, 100 * MB - 1);
         assert_eq!(manager.chunks()[0].end_offset.load(Ordering::SeqCst), stolen.range.start - 1);
+    }
 
-        // A thief far slower than the victim still takes the minimum, never less.
+    #[test]
+    fn test_a_steal_whose_fair_share_is_under_the_floor_is_not_made() {
+        // A thief far slower than the victim would finish its share after the victim anyway:
+        // topping it up to the floor would only make the download end later.
         let mut manager = one_victim(100 * MB, 10 * MB, 10);
-        let (_, stolen) = manager.steal_work(1, 0, timed(MB, 0.1, 1000.0)).unwrap();
-        assert_eq!(stolen.range.len(), MB);
+        assert!(manager.steal_work(1, 0, timed(MB, &[cost(0.1, 1000.0)])).is_none());
+        assert_eq!(manager.chunks()[0].end_offset.load(Ordering::SeqCst), 100 * MB - 1, "the victim keeps it all");
+
+        // 9 MB left at 1 MB/s, a thief as fast after 0.5 s: its fair share is 4.25 MB, so a
+        // user's 8 MB floor steals nothing rather than hand a new connection 8 MB.
+        let mut manager = one_victim(19 * MB, 10 * MB, 10);
+        let even = [cost(0.5, MB as f64)];
+        assert!(manager.steal_work(1, 0, timed(8 * MB, &even)).is_none());
+        let (_, stolen) = manager.steal_work(1, 0, timed(4 * MB, &even)).unwrap();
+        assert!(stolen.range.len().abs_diff(17 * MB / 4) < 64 * 1024, "{}", stolen.range.len());
     }
 
     #[test]
     fn test_timed_steal_leaves_a_chunk_that_ends_within_two_startups() {
         // 5 MB left at 1 MB/s: 5 s.
         let mut manager = one_victim(15 * MB, 10 * MB, 10);
-        assert!(manager.steal_work(1, 0, timed(64 * 1024, 3.0, MB as f64)).is_none(), "5 s is under two 3 s startups");
-        assert!(manager.steal_work(1, 0, timed(64 * 1024, 2.0, MB as f64)).is_some(), "5 s is over two 2 s startups");
+        assert!(manager.steal_work(1, 0, timed(64 * 1024, &[cost(3.0, MB as f64)])).is_none(), "5 s is under two 3 s startups");
+        assert!(manager.steal_work(1, 0, timed(64 * 1024, &[cost(2.0, MB as f64)])).is_some(), "5 s is over two 2 s startups");
     }
 
     #[test]
-    fn test_timed_steal_from_a_chunk_without_a_rate_splits_in_half() {
-        // Assigned, nothing written yet (waiting for its answer, say): no rate to time by.
+    fn test_a_chunk_without_a_rate_is_timed_by_what_a_request_to_its_mirror_costs() {
+        // Assigned to slow mirror 1 and still waiting for its answer: it is expected to start after
+        // 0.5 s at 0.5 MB/s. A thief on mirror 0 starts after 0.1 s at 2 MB/s. Both finish after
+        // 1.78 s: the victim with 0.64 MB, the thief with 3.36 MB.
         let mut manager = ChunkManager::new(4 * MB, 4 * MB).unwrap();
-        manager.get_next_work(0, 0).unwrap();
-        let (_, stolen) = manager.steal_work(1, 0, timed(64 * 1024, 0.5, MB as f64)).unwrap();
-        assert_eq!(stolen.range.start, 2 * MB);
+        manager.get_next_work(0, 1).unwrap();
+        let mirrors = [cost(0.1, 2.0 * MB as f64), cost(0.5, 0.5 * MB as f64)];
+        let (_, stolen) = manager.steal_work(1, 0, timed(64 * 1024, &mirrors)).unwrap();
+        let split = (0.64 * MB as f64) as u64;
+        assert!(stolen.range.start.abs_diff(split) < 64 * 1024, "split at {} instead of about {split}", stolen.range.start);
+    }
+
+    #[test]
+    fn test_thieves_in_a_row_split_the_straggler_not_each_others_fresh_chunks() {
+        // 18 MiB left at 2 MiB/s: 9 s. Seven idle workers arrive one after the other, each a new
+        // request that starts after 0.3 s and then moves 2 MiB/s, as the straggler does.
+        let mut manager = one_victim(20 * MB, 2 * MB, 1);
+        let mirror = [cost(0.3, 2.0 * MB as f64)];
+        let victims: Vec<usize> =
+            (1..=7).map(|thief| manager.steal_work(thief, 0, timed(64 * 1024, &mirror)).unwrap().0).collect();
+        // The second thief finds the straggler, not the first thief's chunk that has yet to start,
+        // still the one to finish last.
+        assert_eq!(victims[..2], [0, 0], "{victims:?}");
+
+        // All eight pieces finish together, as soon as eight connections can: after about 1.39 s.
+        let now = Instant::now();
+        let finish: Vec<f64> =
+            manager.chunks().iter().map(|c| eta_secs(c.remaining_bytes(), c.pace(now, Some(&mirror[0])))).collect();
+        assert_eq!(finish.len(), 8);
+        assert!(finish.iter().all(|&secs| (1.3..1.5).contains(&secs)), "{finish:?}");
     }
 
     const SILENT: Duration = Duration::from_secs(2);
