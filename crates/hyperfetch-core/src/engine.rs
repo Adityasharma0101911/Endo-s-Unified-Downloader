@@ -183,8 +183,13 @@ impl DownloadEngine {
         if let Some(playlist) = resolved.iter().find(|u| u.as_str().contains(".m3u8")) {
             tracing::info!("Detected HLS video stream: {}", playlist);
             let started_at = unix_now();
+            let auth = self.auth.as_deref();
             let parsed = self
-                .guarded(HLS_PARSE_TIMEOUT, "fetching the HLS playlist", crate::hls::parse_hls_playlist(&client, playlist))
+                .guarded(
+                    HLS_PARSE_TIMEOUT,
+                    "fetching the HLS playlist",
+                    crate::hls::parse_hls_playlist(&client, playlist, auth),
+                )
                 .await?;
             match parsed {
                 Ok(segments) => {
@@ -194,6 +199,7 @@ impl DownloadEngine {
                         blocking(move || claim_hls_output(&base, &segments).map(|(p, c)| (p, c, segments))).await??;
                     let path = crate::hls::HlsEngine::download(
                         &client,
+                        auth,
                         segments,
                         &out_path,
                         self.options.num_connections,
@@ -873,8 +879,9 @@ impl DownloadEngine {
 }
 
 /// Chooses and claims the HLS output name. Walks `base`, `base (1)`, ... and takes the first name
-/// it can claim that is free or whose `.part` is this same stream, so a retry resumes. A name
-/// another running download holds is skipped even when its `.part` is this stream. Blocking.
+/// it can claim that is free or whose `.part` is this same stream (up to rotated URL tokens), so
+/// a retry resumes it, or restarts it in place if its bytes prove otherwise, and never orphans it.
+/// A name another running download holds is skipped even when its `.part` is this stream. Blocking.
 fn claim_hls_output(base: &Path, segments: &[crate::hls::HlsSegment]) -> Result<(PathBuf, Claim), String> {
     if let Some(parent) = base.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create {}: {}", parent.display(), e))?;
@@ -887,7 +894,7 @@ fn claim_hls_output(base: &Path, segments: &[crate::hls::HlsSegment]) -> Result<
             continue;
         };
         if !candidate.exists()
-            && (!part_path(&candidate).exists() || crate::hls::has_resumable_part(&candidate, segments))
+            && (!part_path(&candidate).exists() || crate::hls::part_is_same_stream(&candidate, segments))
         {
             return Ok((candidate, claim));
         }
@@ -2128,6 +2135,65 @@ mod tests {
             assert_eq!(std::fs::read(path).unwrap(), b"AAAABBBB");
             assert!(!lock_path(path).exists(), "the claim is released when the download ends");
         }
+    }
+
+    #[tokio::test]
+    async fn test_hls_run_authorizes_and_never_saves_playlist_text() {
+        use crate::hls::tests::{ok, serve};
+        let (addr, _) = serve(|path: &str, _| match path {
+            "/private/stream.m3u8" => ok("#EXTM3U\n#EXTINF:4,\nseg.ts\n#EXT-X-ENDLIST\n"),
+            "/private/seg.ts" => ok("SEGMENT"),
+            "/master.m3u8" => ok("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nexpired.m3u8\n"),
+            "/expired.m3u8" => ok("<html>token expired</html>"),
+            _ => (404, String::new(), Vec::new()),
+        })
+        .await;
+        let dir = tempdir().unwrap();
+        let engine = |path: &str, auth_header: Option<String>| {
+            let options = DownloadOptions { output_path: Some(dir.path().to_path_buf()), auth_header, ..Default::default() };
+            DownloadEngine::new(vec![Url::parse(&format!("http://{addr}{path}")).unwrap()], options)
+        };
+
+        let path = engine("/private/stream.m3u8", Some("Bearer secret".into())).run(None).await.unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"SEGMENT");
+
+        let err = engine("/master.m3u8", None).run(None).await.unwrap_err();
+        assert!(err.contains("not an HLS playlist"), "{err}");
+        assert!(!dir.path().join("master.m3u8").exists(), "the playlist text must not pass for the download");
+    }
+
+    #[tokio::test]
+    async fn test_hls_retry_with_rotated_tokens_keeps_the_name() {
+        use crate::hls::tests::{ok, serve};
+        let playlist_fetches = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let broken = Arc::new(AtomicBool::new(true));
+        let (fetches_srv, broken_srv) = (Arc::clone(&playlist_fetches), Arc::clone(&broken));
+        let (addr, _) = serve(move |path: &str, _| match path.split('?').next().unwrap_or(path) {
+            "/live/stream.m3u8" => {
+                let t = fetches_srv.fetch_add(1, Ordering::SeqCst);
+                ok(format!("#EXTM3U\n#EXTINF:4,\nseg0.ts?t={t}\n#EXTINF:4,\nseg1.ts?t={t}\n#EXT-X-ENDLIST\n"))
+            }
+            "/live/seg0.ts" => ok("AAAA"),
+            "/live/seg1.ts" if broken_srv.load(Ordering::SeqCst) => (404, String::new(), Vec::new()),
+            "/live/seg1.ts" => ok("BBBB"),
+            _ => (404, String::new(), Vec::new()),
+        })
+        .await;
+        let dir = tempdir().unwrap();
+        let url = Url::parse(&format!("http://{addr}/live/stream.m3u8")).unwrap();
+        let engine = || {
+            let options =
+                DownloadOptions { output_path: Some(dir.path().to_path_buf()), num_connections: 1, ..Default::default() };
+            DownloadEngine::new(vec![url.clone()], options)
+        };
+
+        assert!(engine().run(None).await.is_err());
+        broken.store(false, Ordering::SeqCst);
+        let path = engine().run(None).await.unwrap();
+        assert_eq!(path, dir.path().join("stream.ts"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"AAAABBBB");
+        let names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names, ["stream.ts"], "the first run's .part must be resumed, not orphaned");
     }
 
     #[test]
