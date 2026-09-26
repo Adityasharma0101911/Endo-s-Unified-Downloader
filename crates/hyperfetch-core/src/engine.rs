@@ -560,7 +560,7 @@ impl DownloadEngine {
                 self.fetch_ranges(client, size, &reference, &mirrors, live, state, &part, &state_path, &final_path, &snapshot_tx)
                     .await?
             }
-            _ => self.fetch_stream(&client, &reference, &part, &final_path, &snapshot_tx).await?,
+            _ => self.fetch_stream(&client, &reference, live, &part, &final_path, &snapshot_tx).await?,
         }
         self.finalize(part, final_path, state_path, claim, started_at, &snapshot_tx).await
     }
@@ -601,11 +601,13 @@ impl DownloadEngine {
         let mut manager = ChunkManager::with_resumed_ranges(size, chunk_size, &have).map_err(|e| e.to_string())?;
         manager.set_max_retries(self.options.max_retries);
         // The probe's answer is worker 0's first attempt.
-        let seed = live.and_then(|Live { response, slot, end }| {
-            let mirror_id = mirrors.iter().position(|m| m.url == reference.url)?;
-            let chunk = manager.assign_at(0, mirror_id, prefetch.len() as u64, end)?;
-            Some(Seed { chunk, mirror_id, url: reference.final_url.clone(), response, slot })
-        });
+        let seed = match live {
+            Some(Live::Range { response, slot, end }) => mirrors.iter().position(|m| m.url == reference.url).and_then(|mirror_id| {
+                let chunk = manager.assign_at(0, mirror_id, prefetch.len() as u64, end)?;
+                Some(Seed { chunk, mirror_id, url: reference.final_url.clone(), response, slot })
+            }),
+            _ => None,
+        };
 
         let racer = build_racer(mirrors);
 
@@ -715,20 +717,27 @@ impl DownloadEngine {
     }
 
     /// Single-connection download for servers without range support or without a known length.
-    /// Such a download cannot resume, so every retry starts from byte 0.
+    /// Such a download cannot resume, so every retry starts from byte 0. The probe's answer, if
+    /// `live` brought the whole file, is the first try.
     async fn fetch_stream(
         &self,
         client: &Client,
         remote: &ProbeInfo,
+        live: Option<Live>,
         part: &Path,
         final_path: &Path,
         snapshot_tx: &Option<broadcast::Sender<EngineSnapshot>>,
     ) -> Result<(), String> {
         let limiter = self.limiter();
+        let mut answered = match live {
+            Some(Live::Stream { response, slot }) => Some((response, slot)),
+            _ => None,
+        };
         let mut failures = 0u32;
         let mut bad_responses = 0u32;
         loop {
-            let (kind, error) = match self.stream_once(client, remote, part, final_path, limiter.as_deref(), snapshot_tx).await {
+            let attempt = self.stream_once(client, remote, answered.take(), part, final_path, limiter.as_deref(), snapshot_tx);
+            let (kind, error) = match attempt.await {
                 Ok(()) => return Ok(()),
                 Err(failure) => failure,
             };
@@ -758,10 +767,14 @@ impl DownloadEngine {
         }
     }
 
+    /// One try at the whole file: `answered`, an answer already in with the host slot its request
+    /// holds, or else a new request under a slot of the host the probe was sent on to.
+    #[allow(clippy::too_many_arguments)]
     async fn stream_once(
         &self,
         client: &Client,
         remote: &ProbeInfo,
+        answered: Option<(Response, HostSlot)>,
         part: &Path,
         final_path: &Path,
         limiter: Option<&RateLimiter>,
@@ -769,17 +782,29 @@ impl DownloadEngine {
     ) -> Result<(), (FailureKind, String)> {
         let stall = self.stall_timeout();
         let transient = |msg: String| (FailureKind::Transient, msg);
-        let request = authorize(client.get(remote.url.clone()), self.auth.as_deref(), &remote.url)
-            .header(ACCEPT_ENCODING, "identity")
-            .send();
-        let response = tokio::select! {
-            biased;
-            _ = self.cancel_token.cancelled() => return Err(transient(CANCELLED.to_string())),
-            res = tokio::time::timeout(stall, request) => match res {
-                Err(_) => return Err(transient(format!("no response within {}s", stall.as_secs()))),
-                Ok(Err(e)) => return Err(transient(format!("request failed: {}", e))),
-                Ok(Ok(resp)) => resp,
-            },
+        let (response, _slot) = match answered {
+            Some(answered) => answered,
+            None => {
+                // Waiting for the host's other requests is no stall.
+                let slot = tokio::select! {
+                    biased;
+                    _ = self.cancel_token.cancelled() => return Err(transient(CANCELLED.to_string())),
+                    slot = hosts::acquire(&remote.final_url, self.options.max_connections_per_host) => slot,
+                };
+                let request = authorize(client.get(remote.url.clone()), self.auth.as_deref(), &remote.url)
+                    .header(ACCEPT_ENCODING, "identity")
+                    .send();
+                let response = tokio::select! {
+                    biased;
+                    _ = self.cancel_token.cancelled() => return Err(transient(CANCELLED.to_string())),
+                    res = tokio::time::timeout(stall, request) => match res {
+                        Err(_) => return Err(transient(format!("no response within {}s", stall.as_secs()))),
+                        Ok(Err(e)) => return Err(transient(format!("request failed: {}", e))),
+                        Ok(Ok(resp)) => resp,
+                    },
+                };
+                (response, slot)
+            }
         };
         let status = response.status();
         if !status.is_success() {
@@ -1211,13 +1236,12 @@ impl ProbeInfo {
     }
 }
 
-/// A probe response whose body is the start of the file (or all of it).
+/// A probe response whose body is the file, or its start.
 struct ProbeBody {
     response: Response,
     /// The host slot the response's request holds.
     slot: HostSlot,
-    /// Body bytes to keep.
-    len: u64,
+    holds: Holds,
     /// When the answer arrived.
     answered: tokio::time::Instant,
     /// How long the request waited for it, when that was the first try: a retry may reuse the
@@ -1225,12 +1249,22 @@ struct ProbeBody {
     setup: Option<Duration>,
 }
 
-/// A probe's ranged answer whose body is still coming: the file's bytes from where the probe
-/// stopped reading up to `end`, with the host slot its request holds.
-struct Live {
-    response: Response,
-    slot: HostSlot,
-    end: u64,
+/// What a probe response's body holds for the download.
+enum Holds {
+    /// The file's first bytes, this many (all of it when that is its size).
+    Start(u64),
+    /// The whole file, too large to read in advance or of unknown size: what a single stream goes
+    /// on with.
+    Whole,
+}
+
+/// A probe's answer whose body is still coming, with the host slot its request holds.
+enum Live {
+    /// The rest of a ranged answer: the file's bytes from where the probe stopped reading up to
+    /// `end`.
+    Range { response: Response, slot: HostSlot, end: u64 },
+    /// A server ignoring the probe's range sent the whole file, none of it read yet.
+    Stream { response: Response, slot: HostSlot },
 }
 
 /// What the probes found, for the download.
@@ -1259,8 +1293,9 @@ struct Pace {
 /// out the busy server; only without HEAD is it an error.
 ///
 /// With `prefetch` the GET asks for the first `PREFETCH` bytes instead of one, and its response
-/// comes back too, with how many body bytes to keep, when that body is the start of the file (or
-/// all of it, from a server ignoring ranges) and the validators found are the response's own.
+/// comes back too when its body is of use: the start of the file (or all of it, if that small)
+/// under the validators found, which must be the response's own, or else the whole file from a
+/// server ignoring ranges, for a single stream to take up.
 ///
 /// HEAD and GET each hold a slot of their host's budget under `limit` (see [`crate::hosts`]).
 /// The GET waits for its slot before the probe's time runs, since a host busy with other
@@ -1344,9 +1379,9 @@ async fn probe_with(
         }
     };
     // A body is read under the GET's slot, which a redirect moves to the host it came from.
-    let body = |response: Response, len: u64| {
+    let body = |response: Response, holds: Holds| {
         let slot = slot_at(slot, response.url(), limit)?;
-        Some(ProbeBody { response, slot, len, answered, setup })
+        Some(ProbeBody { response, slot, holds, answered, setup })
     };
     let head_len = head.as_ref().and_then(|r| content_length(r.headers()));
     // Still busy or unreachable after every try: that says nothing about range support.
@@ -1381,7 +1416,7 @@ async fn probe_with(
             }
             let mut info = ProbeInfo::describe(url, &[&plain]);
             info.size = content_length(plain.headers());
-            let body = info.size.filter(|&n| prefetch && n <= PREFETCH).and_then(|n| body(plain, n));
+            let body = if prefetch { body(plain, whole_file(info.size)) } else { None };
             return Ok((info, body));
         }
     };
@@ -1391,12 +1426,12 @@ async fn probe_with(
     // Chunk requests go straight to the final URL, skipping the hops the probe took to get there.
     info.answer_time = setup.filter(|_| info.final_url == *url);
     let content_range = get.headers().get(CONTENT_RANGE).and_then(|v| v.to_str().ok());
-    let keep = match get.status() {
+    let holds = match get.status() {
         StatusCode::PARTIAL_CONTENT => match content_range.map(ByteRange::parse_content_range) {
             Some(Ok((range, Some(total)))) if range.start == 0 => {
                 info.accepts_ranges = true;
                 info.size = Some(total);
-                Some(range.len())
+                Some(Holds::Start(range.len().min(PREFETCH)))
             }
             // `bytes 0-0/*`: the length is unknown, so only a single stream can fetch the file.
             Some(Ok((range, None))) if range.start == 0 => None,
@@ -1404,8 +1439,7 @@ async fn probe_with(
         },
         StatusCode::OK => {
             info.size = content_length(get.headers());
-            // Without ranges only the whole file is of use.
-            info.size.filter(|&n| n <= PREFETCH)
+            Some(whole_file(info.size))
         }
         // Only an empty file cannot satisfy a range from byte 0.
         _ => {
@@ -1421,8 +1455,19 @@ async fn probe_with(
     };
     let own = |name: HeaderName| get.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_string);
     let own_validators = own(ETAG) == info.etag && own(LAST_MODIFIED) == info.last_modified;
-    let body = keep.filter(|_| prefetch && own_validators).and_then(|len| body(get, len.min(PREFETCH)));
+    // A stream that cannot resume goes by no validator.
+    let body = holds
+        .filter(|holds| prefetch && (own_validators || matches!(holds, Holds::Whole)))
+        .and_then(|holds| body(get, holds));
     Ok((info, body))
+}
+
+/// What a 200's body, the whole file, holds: read in advance when that is small enough.
+fn whole_file(size: Option<u64>) -> Holds {
+    match size {
+        Some(size) if size <= PREFETCH => Holds::Start(size),
+        _ => Holds::Whole,
+    }
 }
 
 /// `slot` for a request whose answer came from `url`: a redirect to another host moves the
@@ -1581,8 +1626,8 @@ async fn read_prefix(
 
 /// Reads the file's start from the first mirror's probe answer, as much of it as the workers
 /// should wait for (see `read_prefix`), and returns the answer while the rest of it is still
-/// coming: the download goes on with it as its first chunk instead of asking for those bytes
-/// again.
+/// coming: the download goes on with it (as its first chunk, or as its one stream) instead of
+/// asking for those bytes again.
 async fn take_start(
     info: &mut ProbeInfo,
     body: ProbeBody,
@@ -1590,7 +1635,11 @@ async fn take_start(
     limiter: Option<&RateLimiter>,
     stall: Duration,
 ) -> Option<Live> {
-    let ProbeBody { mut response, slot, len, answered, setup } = body;
+    let ProbeBody { mut response, slot, holds, answered, setup } = body;
+    let len = match holds {
+        Holds::Start(len) => len,
+        Holds::Whole => return Some(Live::Stream { response, slot }),
+    };
     // Only the start of a larger file keeps workers waiting.
     let deadline = (info.size != Some(len)).then(|| tokio::time::Instant::now() + PREFETCH_TIME);
     // Workers can take over early only where ranges work (without them only the whole body is of
@@ -1601,7 +1650,7 @@ async fn take_start(
     let prefix = read_prefix(&mut response, len, deadline, pace, stall, limiter).await;
     info.prefetch = prefix.bytes;
     info.per_setup = prefix.per_setup;
-    prefix.live.then(|| Live { response, slot, end: len.saturating_sub(1) })
+    prefix.live.then(|| Live::Range { response, slot, end: len.saturating_sub(1) })
 }
 
 /// Picks the reference probe and keeps the mirrors that serve the same file. The first successful
