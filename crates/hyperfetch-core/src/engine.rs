@@ -56,8 +56,9 @@ const MIN_RATE_TICK: Duration = Duration::from_millis(20);
 const BYTES_PER_CONNECTION: u64 = 1024 * 1024;
 /// Fewest missing bytes that justify one more connection, whatever the probe measured.
 const MIN_BYTES_PER_CONNECTION: u64 = 64 * 1024;
-/// Fetching the playlists and each AES key may retry every request with backoff.
-const HLS_PARSE_TIMEOUT: Duration = Duration::from_secs(120);
+/// Fetching the playlists and their AES keys may take this long, besides what one request takes
+/// that uses every retry the user allows (see [`crate::hls::FetchPolicy::give_up_after`]).
+const HLS_PARSE_TIMEOUT: Duration = if cfg!(test) { Duration::from_secs(1) } else { Duration::from_secs(120) };
 /// Longest file name we create, in bytes: leaves room for " (n)" and ".part.hfstate.tmp" under
 /// the 255-byte (Linux) and 255 UTF-16 unit (NTFS) limits.
 const MAX_NAME_BYTES: usize = 200;
@@ -235,7 +236,7 @@ impl DownloadEngine {
                 crate::hls::FetchPolicy { stall_timeout: self.stall_timeout(), max_retries: self.options.max_retries };
             let parsed = self
                 .guarded(
-                    HLS_PARSE_TIMEOUT,
+                    HLS_PARSE_TIMEOUT.saturating_add(fetch.give_up_after()),
                     "fetching the HLS playlist",
                     crate::hls::parse_hls_playlist(&client, playlist, auth, fetch),
                 )
@@ -2695,6 +2696,24 @@ mod tests {
         let path = engine("/busy.m3u8", 30, 6).run(None).await.unwrap();
         assert_eq!(std::fs::read(path).unwrap(), b"DATA");
         assert_eq!(hits.lock()["/busy.ts"], 7);
+    }
+
+    #[tokio::test]
+    async fn test_hls_playlist_may_take_every_retry_the_options_allow() {
+        use crate::hls::tests::serve;
+        let (addr, _) = serve(|_, _| (0, String::new(), Vec::new())).await;
+        let dir = tempdir().unwrap();
+        let options = DownloadOptions {
+            output_path: Some(dir.path().to_path_buf()),
+            stall_timeout_secs: 1,
+            max_retries: 1,
+            ..Default::default()
+        };
+        let engine = DownloadEngine::new(vec![Url::parse(&format!("http://{addr}/stalled.m3u8")).unwrap()], options);
+        // Two attempts of a second each outlast HLS_PARSE_TIMEOUT, which is a second in tests: the
+        // playlist fetch's own error ends the download, not the time limit.
+        let err = engine.run(None).await.unwrap_err();
+        assert!(err.contains("after 2 attempt(s)"), "{err}");
     }
 
     #[test]
