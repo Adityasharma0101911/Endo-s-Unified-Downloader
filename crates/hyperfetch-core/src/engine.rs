@@ -195,17 +195,18 @@ impl DownloadEngine {
             match parsed {
                 Ok(segments) => {
                     let base = self.hls_output_path(playlist, &segments);
-                    // Held until this download returns, whichever way it ends.
-                    let (out_path, _claim, segments) =
-                        blocking(move || claim_hls_output(&base, &segments).map(|(p, c)| (p, c, segments))).await??;
+                    let cancel_flag = Some(Arc::clone(&self.cancel_flag));
+                    // The claim is held until this download returns, whichever way it ends.
+                    let (target, _claim) =
+                        claim_hls_output(&client, auth, playlist, &segments, base, &cancel_flag).await?;
                     let path = crate::hls::HlsEngine::download(
                         &client,
                         auth,
                         segments,
-                        &out_path,
+                        target,
                         self.options.num_connections,
                         snapshot_tx,
-                        Some(Arc::clone(&self.cancel_flag)),
+                        cancel_flag,
                     )
                     .await
                     .map_err(|e| e.to_string())?;
@@ -880,24 +881,36 @@ impl DownloadEngine {
 }
 
 /// Chooses and claims the HLS output name. Walks `base`, `base (1)`, ... and takes the first name
-/// it can claim that is free or whose `.part` is this same stream (up to rotated URL tokens), so
-/// a retry resumes it, or restarts it in place if its bytes prove otherwise, and never orphans it.
-/// A name another running download holds is skipped even when its `.part` is this stream. Blocking.
-fn claim_hls_output(base: &Path, segments: &[crate::hls::HlsSegment]) -> Result<(PathBuf, Claim), String> {
-    if let Some(parent) = base.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create {}: {}", parent.display(), e))?;
+/// it can claim with no finished file whose `.part` is absent or proven to be this same stream (see
+/// [`crate::hls::HlsEngine::prepare`]), so a retry resumes it and never orphans it, while another
+/// paused download's `.part` is never touched. A name another running download holds is skipped
+/// even when its `.part` is this stream.
+async fn claim_hls_output(
+    client: &Client,
+    auth: Option<&Auth>,
+    playlist: &Url,
+    segments: &[crate::hls::HlsSegment],
+    base: PathBuf,
+    cancel_flag: &Option<Arc<AtomicBool>>,
+) -> Result<(crate::hls::HlsTarget, Claim), String> {
+    if let Some(parent) = base.parent().filter(|p| !p.as_os_str().is_empty()).map(Path::to_path_buf) {
+        blocking(move || {
+            std::fs::create_dir_all(&parent).map_err(|e| format!("Failed to create {}: {}", parent.display(), e))
+        })
+        .await??;
     }
     let mut n = 0;
     loop {
-        let candidate = numbered(base, n);
+        let candidate = numbered(&base, n);
         n += 1;
-        let Some(claim) = Claim::try_take(&candidate)? else {
+        let path = candidate.clone();
+        let claim = blocking(move || Ok::<_, String>(Claim::try_take(&path)?.filter(|_| !path.exists()))).await??;
+        let Some(claim) = claim else {
             continue;
         };
-        if !candidate.exists()
-            && (!part_path(&candidate).exists() || crate::hls::part_is_same_stream(&candidate, segments))
-        {
-            return Ok((candidate, claim));
+        let prepared = crate::hls::HlsEngine::prepare(client, auth, playlist, segments, &candidate, cancel_flag).await;
+        if let Some(target) = prepared.map_err(|e| e.to_string())? {
+            return Ok((target, claim));
         }
     }
 }
@@ -2235,6 +2248,62 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"AAAABBBB");
         let names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
         assert_eq!(names, ["stream.ts"], "the first run's .part must be resumed, not orphaned");
+    }
+
+    #[tokio::test]
+    async fn test_hls_never_takes_over_another_streams_part() {
+        use crate::hls::tests::{ok, serve};
+        let fetches = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let broken = Arc::new(AtomicBool::new(true));
+        let (fetches_srv, broken_srv) = (Arc::clone(&fetches), Arc::clone(&broken));
+        // Both qualities open with the same intro, differ only by queries and rotate their tokens.
+        let (addr, hits) = serve(move |path: &str, _| {
+            let (route, query) = path.split_once('?').unwrap_or((path, ""));
+            let param = |name: &str| {
+                query.split('&').find_map(|kv| kv.strip_prefix(name)?.strip_prefix('=')).unwrap_or("").to_string()
+            };
+            match route {
+                "/video/index.m3u8" => {
+                    let (q, t) = (param("q"), fetches_srv.fetch_add(1, Ordering::SeqCst));
+                    let segments: String = (0..3).map(|n| format!("#EXTINF:4,\nseg.ts?q={q}&t={t}&n={n}\n")).collect();
+                    ok(format!("#EXTM3U\n{segments}#EXT-X-ENDLIST\n"))
+                }
+                "/video/seg.ts" => match param("n").as_str() {
+                    "0" => ok("INTRO "),
+                    "2" if param("q") == "720" && broken_srv.load(Ordering::SeqCst) => (404, String::new(), Vec::new()),
+                    n => ok(format!("{}-{n} ", param("q"))),
+                },
+                _ => (404, String::new(), Vec::new()),
+            }
+        })
+        .await;
+        let dir = tempdir().unwrap();
+        let engine = |q: &str| {
+            let url = Url::parse(&format!("http://{addr}/video/index.m3u8?q={q}")).unwrap();
+            let options =
+                DownloadOptions { output_path: Some(dir.path().to_path_buf()), num_connections: 1, ..Default::default() };
+            DownloadEngine::new(vec![url], options)
+        };
+        let part = dir.path().join("index.ts.part");
+
+        // The 720p download fails (as if paused) after two segments.
+        assert!(engine("720").run(None).await.is_err());
+        let paused = std::fs::read(&part).unwrap();
+        assert_eq!(paused, b"INTRO 720-1 ");
+
+        // 1080p maps to the same name and starts alike, but must neither splice onto nor wipe it.
+        let path = engine("1080").run(None).await.unwrap();
+        assert_eq!(path, dir.path().join("index (1).ts"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"INTRO 1080-1 1080-2 ");
+        assert_eq!(std::fs::read(&part).unwrap(), paused, "the paused .part is untouched");
+
+        // 720p again, with new tokens: it resumes in place.
+        broken.store(false, Ordering::SeqCst);
+        let path = engine("720").run(None).await.unwrap();
+        assert_eq!(path, dir.path().join("index.ts"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"INTRO 720-1 720-2 ");
+        let fetched = |seg: &str| hits.lock().iter().filter(|(p, _)| p.contains("q=720&") && p.ends_with(seg)).map(|(_, n)| n).sum::<usize>();
+        assert_eq!((fetched("n=0"), fetched("n=1")), (2, 2), "checked once each after the first run, not refetched");
     }
 
     #[test]
