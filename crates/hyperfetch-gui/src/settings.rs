@@ -40,6 +40,10 @@ pub struct Settings {
     pub max_speed_in_mb: bool,
     pub max_retries: u32,
     pub stall_timeout_secs: u64,
+    /// Wait for each finished file to reach the disk before reporting it done.
+    pub fsync_on_complete: bool,
+    /// Connections all running downloads may hold to one host together (0 = no limit).
+    pub max_connections_per_host: usize,
     pub clipboard_watch: bool,
     pub auto_run_queue: bool,
     pub max_concurrent: usize,
@@ -59,9 +63,11 @@ impl Default for Settings {
             max_speed_in_mb: true,
             max_retries: engine.max_retries,
             stall_timeout_secs: engine.stall_timeout_secs,
+            fsync_on_complete: engine.fsync_on_complete,
+            max_connections_per_host: engine.max_connections_per_host,
             clipboard_watch: true,
             auto_run_queue: true,
-            max_concurrent: 2,
+            max_concurrent: 4,
         }
     }
 }
@@ -137,7 +143,6 @@ impl Settings {
             _ => None,
         };
         Ok(DownloadOptions {
-            num_connections: self.connections.clamp(1, 64),
             output_path: Some(PathBuf::from(save_dir)),
             expected_checksum: checksum,
             cookies_path: non_empty(&self.cookies_path).map(PathBuf::from),
@@ -145,11 +150,22 @@ impl Settings {
             proxy: non_empty(&self.proxy),
             media_preset,
             browser_cookies,
+            ..self.tuning()
+        })
+    }
+
+    /// The engine settings shared by every download and repair: connections, speed limit,
+    /// retries, timeouts, disk flushing and the per-host connection budget.
+    pub fn tuning(&self) -> DownloadOptions {
+        DownloadOptions {
+            num_connections: self.connections.clamp(1, 64),
             max_speed: speed_limit_bytes(self.max_speed, self.max_speed_in_mb),
             max_retries: self.max_retries,
             stall_timeout_secs: self.stall_timeout_secs.max(1),
+            fsync_on_complete: self.fsync_on_complete,
+            max_connections_per_host: self.max_connections_per_host,
             ..Default::default()
-        })
+        }
     }
 }
 
@@ -272,6 +288,8 @@ mod tests {
             stall_timeout_secs: 0,
             browser_cookies: 2,
             media_preset: 3,
+            fsync_on_complete: true,
+            max_connections_per_host: 0,
             ..Settings::default()
         };
         let file = [Url::parse("https://example.com/a.iso").unwrap()];
@@ -285,6 +303,7 @@ mod tests {
         assert_eq!(opts.max_speed, Some(2 * 1024 * 1024));
         assert_eq!((opts.max_retries, opts.stall_timeout_secs), (3, 1));
         assert_eq!(opts.browser_cookies, Some(BrowserCookieSource::Edge));
+        assert_eq!((opts.fsync_on_complete, opts.max_connections_per_host), (true, 0));
         assert_eq!(opts.media_preset, None, "a preset would send a plain file URL to yt-dlp");
 
         let video = [Url::parse("https://www.youtube.com/watch?v=x").unwrap()];
@@ -305,5 +324,17 @@ mod tests {
         let partial: Settings = serde_json::from_str(r#"{"connections": 4}"#).unwrap();
         assert_eq!(partial.connections, 4);
         assert_eq!(partial.max_retries, Settings::default().max_retries);
+    }
+
+    #[test]
+    fn new_defaults_leave_saved_choices_alone() {
+        let defaults = Settings::default();
+        assert_eq!((defaults.max_concurrent, defaults.fsync_on_complete, defaults.max_connections_per_host), (4, false, 32));
+        // Saved by an older version: the user's own limit stays, the new settings take their defaults.
+        let saved: Settings = serde_json::from_str(r#"{"max_concurrent": 2}"#).unwrap();
+        assert_eq!((saved.max_concurrent, saved.fsync_on_complete, saved.max_connections_per_host), (2, false, 32));
+        let chosen = Settings { fsync_on_complete: true, max_connections_per_host: 8, ..defaults };
+        let json = serde_json::to_string(&chosen).unwrap();
+        assert_eq!(serde_json::from_str::<Settings>(&json).unwrap(), chosen);
     }
 }

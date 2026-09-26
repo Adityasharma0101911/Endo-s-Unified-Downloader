@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use clap::{ArgAction, Parser, ValueEnum};
+use hyperfetch_core::engine::DownloadOptions;
 use hyperfetch_core::media::{BrowserCookieSource, MediaQualityPreset};
 
 #[derive(Parser, Debug)]
@@ -33,9 +34,14 @@ pub struct Args {
     #[arg(short = 'c', long = "chunk-size", default_value_t = 4, value_parser = clap::value_parser!(u64).range(1..=1024))]
     pub chunk_size_mb: u64,
 
-    /// Downloads to run at the same time in batch mode (1-32)
-    #[arg(short = 'j', long = "max-concurrent-downloads", default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..=32))]
+    /// Downloads to run at the same time in batch mode (1-32); above 1, results are printed as
+    /// they finish, each naming its input
+    #[arg(short = 'j', long = "max-concurrent-downloads", default_value_t = 4, value_parser = clap::value_parser!(u64).range(1..=32))]
     pub jobs: u64,
+
+    /// Connections all running downloads may open to one host together (0 = no limit)
+    #[arg(long = "max-connections-per-host", value_name = "N", default_value_t = DownloadOptions::default().max_connections_per_host)]
+    pub max_connections_per_host: usize,
 
     /// Output FILE path (single download only; relative to -d when both are given)
     #[arg(short = 'o', long = "output", value_name = "FILE")]
@@ -64,6 +70,12 @@ pub struct Args {
     /// Seconds without data before a connection is considered stalled and retried (1-3600)
     #[arg(long = "stall-timeout", value_name = "SECS", default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3600))]
     pub stall_timeout: u64,
+
+    /// Wait until each finished file is on the disk before reporting it done. Without it the OS
+    /// writes the file out on its own schedule, so a power loss right after a download finishes
+    /// can damage the file (--verify detects that)
+    #[arg(long = "fsync")]
+    pub fsync: bool,
 
     /// Expected checksum (sha256:HEX, md5:HEX, blake3:HEX or bare hex); single download or --verify
     #[arg(long = "checksum", value_parser = parse_checksum)]
@@ -280,5 +292,15 @@ mod tests {
         assert!(parse(&["--verify", "f", "--repair", "--cookies-from-browser", "firefox"]).is_err());
         let args = parse(&["-vv", "--max-speed", "2M", "--header", "Authorization: Bearer t", "u"]).unwrap();
         assert_eq!((args.verbose, args.max_speed, args.auth_header.as_deref()), (2, Some(2 << 20), Some("Bearer t")));
+    }
+
+    #[test]
+    fn batch_and_disk_defaults() {
+        let parse = |args: &[&str]| Args::try_parse_from(std::iter::once("cli").chain(args.iter().copied()));
+        let args = parse(&["u"]).unwrap();
+        assert_eq!((args.jobs, args.fsync, args.max_connections_per_host), (4, false, 32));
+        let args = parse(&["-j", "1", "--fsync", "--max-connections-per-host", "0", "u"]).unwrap();
+        assert_eq!((args.jobs, args.fsync, args.max_connections_per_host), (1, true, 0));
+        assert!(parse(&["--max-connections-per-host", "-1", "u"]).is_err());
     }
 }

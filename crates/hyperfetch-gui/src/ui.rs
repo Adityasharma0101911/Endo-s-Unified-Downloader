@@ -437,6 +437,19 @@ fn advanced_options(app: &mut App, ui: &mut egui::Ui) {
         ui.add(egui::DragValue::new(&mut app.settings.stall_timeout_secs).range(5..=600).suffix(" s"))
             .on_hover_text("A connection that receives nothing for this long is retried");
     });
+
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Connections per Host:").size(12.0));
+        ui.add(egui::DragValue::new(&mut app.settings.max_connections_per_host).range(0..=256))
+            .on_hover_text("Connections all running downloads may open to one server together");
+        ui.label(RichText::new("(0 = no limit)").size(11.0).color(MUTED));
+        ui.add_space(12.0);
+        ui.checkbox(&mut app.settings.fsync_on_complete, "Flush finished files to disk").on_hover_text(
+            "Wait until each finished file is on the disk before showing it as done. Slower; without it a \
+             power loss right after a download finishes can damage the file (Verify detects that).",
+        );
+    });
     ui.label(RichText::new("Settings apply to downloads started or queued afterwards.").size(11.0).color(DIM));
 }
 
