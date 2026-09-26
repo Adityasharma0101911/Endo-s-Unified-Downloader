@@ -383,6 +383,7 @@ async fn run_cli_download(args: Args) -> Result<(), Box<dyn std::error::Error>> 
             proxy: args.proxy.clone(),
             media_preset,
             browser_cookies,
+            ..Default::default()
         };
 
         let engine = DownloadEngine::new(parsed_urls, options);

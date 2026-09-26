@@ -368,6 +368,7 @@ impl DownloaderApp {
                 auth_header: if auth_opt.is_empty() { None } else { Some(auth_opt) },
                 media_preset,
                 browser_cookies,
+                ..Default::default()
             };
 
             let engine = DownloadEngine::new(urls, options);

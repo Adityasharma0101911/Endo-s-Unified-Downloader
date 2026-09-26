@@ -764,6 +764,12 @@ impl HostResolver for HtmlVideoResolver {
 pub struct SmartResolver;
 
 impl SmartResolver {
+    /// Resolves `url` into download sources that are byte-identical copies of one file.
+    /// `Ok` is never empty. `Err` means a resolver recognized the host but could not extract a direct link.
+    pub async fn resolve(client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
+        Ok(Self::resolve_mirrors(client, url).await)
+    }
+
     /// Resolves an incoming URL into direct, multi-mirror streaming URLs.
     pub async fn resolve_mirrors(client: &Client, url: &Url) -> Vec<Url> {
         if ArchiveOrgResolver.can_handle(url) {

@@ -65,6 +65,10 @@ pub struct DownloadHistoryManager {
 
 impl DownloadHistoryManager {
     pub fn default_history_path() -> PathBuf {
+        if let Some(p) = std::env::var_os("ENDO_HISTORY_PATH") {
+            return PathBuf::from(p);
+        }
+
         #[cfg(windows)]
         if let Ok(app_data) = std::env::var("LOCALAPPDATA") {
             return PathBuf::from(app_data).join("EndosUnifiedDownloader").join("history.json");
