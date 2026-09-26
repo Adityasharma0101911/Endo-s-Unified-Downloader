@@ -46,10 +46,11 @@ fn is_safe_component(s: &str) -> bool {
     !s.is_empty() && s != "." && s != ".." && !s.contains(['/', '\\'])
 }
 
-/// `raw` as a file or directory name that is valid on every OS, or `None` if it tries to escape
-/// the download directory or has nothing usable. Web seed URLs keep the raw name.
+/// `raw` as a file or directory name that is valid on every OS (dotfiles keep their leading dot),
+/// or `None` if it tries to escape the download directory or has nothing usable. Web seed URLs
+/// keep the raw name.
 fn local_name(raw: &str) -> Option<String> {
-    is_safe_component(raw).then(|| crate::engine::sanitize_filename(raw)).filter(|name| !name.is_empty())
+    is_safe_component(raw).then(|| crate::engine::sanitize_component(raw)).filter(|name| !name.is_empty())
 }
 
 /// BEP 19: a web seed ending in '/' is a directory; the torrent name (and, for
@@ -460,5 +461,18 @@ mod tests {
         assert_eq!(info.name, "C_x");
         assert_eq!(info.files[0].path, vec!["S1_ _a__b", "x_.nfo"]);
         assert_eq!(info.files[0].urls[0].as_str(), "https://s.example/d/C:x/S1:%20%22a%22|b/x%7F.nfo");
+    }
+
+    #[test]
+    fn test_dotfiles_and_dot_directories_keep_their_names() {
+        let multi = b"d4:infod5:filesld6:lengthi1e4:pathl10:.gitignoreeed6:lengthi1e4:pathl7:.config13:settings.jsoneed6:lengthi1e4:pathl9:gitignoreeee4:name5:.repoee";
+        let info = parse_torrent_bytes(multi).unwrap();
+        assert_eq!(info.name, ".repo");
+        let paths: Vec<_> = info.files.iter().map(|f| f.path.clone()).collect();
+        assert_eq!(paths, vec![vec![".gitignore"], vec![".config", "settings.json"], vec!["gitignore"]]);
+        // Only the trailing dots and spaces Windows drops go.
+        let trailing = b"d4:infod5:filesld6:lengthi1e4:pathl6:.env. eee4:name4:dir.ee";
+        let info = parse_torrent_bytes(trailing).unwrap();
+        assert_eq!((info.name.as_str(), info.files[0].path.clone()), ("dir", vec![".env".to_string()]));
     }
 }
