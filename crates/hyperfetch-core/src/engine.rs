@@ -25,6 +25,7 @@ use crate::hls::HlsError;
 use crate::hosts::{self, HostKey, HostProfile, HostSlot};
 use crate::mirror::MirrorRacer;
 use crate::range::{compute_gaps, ByteRange};
+use crate::resolver::GoogleDriveResolver;
 use crate::state::DownloadState;
 use crate::storage::{DiskWriter, StorageError, VerifyError};
 use crate::worker::{
@@ -440,7 +441,7 @@ impl DownloadEngine {
     /// (every one before it having failed) defines the file: when it takes ranges or brought the
     /// whole file it is the reference, and the download starts without waiting for the other
     /// probes, which come with it as `late`. Otherwise another mirror may have to lead, so every
-    /// probe is waited for.
+    /// probe is waited for. A Google Drive answer that is a web page fails its mirror's probe.
     async fn probe_all(&self, client: &Client, urls: &[Url]) -> Result<Probed, String> {
         let (limiter, stall) = (self.limiter(), self.stall_timeout());
         let several_connections = self.options.num_connections > 1;
@@ -454,6 +455,7 @@ impl DownloadEngine {
                     let probe = async {
                         // Only the first mirror fetches the file's start: the download uses one copy.
                         let (mut info, body) = probe_url(&client, auth.as_deref(), &url, i == 0, limit).await?;
+                        GoogleDriveResolver::check_answer(&url, &info.headers).map_err(|e| format!("{}: {}", url, e))?;
                         let live = match body {
                             Some(body) => take_start(&mut info, body, several_connections, limiter.as_deref(), stall).await,
                             None => None,
@@ -1257,6 +1259,8 @@ struct ProbeInfo {
     /// connection) or a redirect (whose hops chunk requests skip), or when HEAD or a plain GET
     /// had to stand in for it.
     answer_time: Option<Duration>,
+    /// The headers of the answer that decided the rest: what it served shows there.
+    headers: HeaderMap,
 }
 
 impl ProbeInfo {
@@ -1270,8 +1274,8 @@ impl ProbeInfo {
     }
 
     /// Name and validators of `url` from the first of `responses` that has each; without a
-    /// Content-Disposition name, the first response's final (post-redirect) URL names the file.
-    /// Size and range support are left for the caller.
+    /// Content-Disposition name, the first response's final (post-redirect) URL names the file,
+    /// and its headers are kept. Size and range support are left for the caller.
     fn describe(url: &Url, responses: &[&Response]) -> Self {
         let header = |name: HeaderName| {
             responses.iter().find_map(|r| r.headers().get(&name)?.to_str().ok().map(str::to_string))
@@ -1288,6 +1292,7 @@ impl ProbeInfo {
             prefetch: Bytes::new(),
             per_setup: None,
             answer_time: None,
+            headers: responses.first().map(|r| r.headers().clone()).unwrap_or_default(),
         }
     }
 }
@@ -2446,6 +2451,7 @@ mod tests {
             prefetch: Bytes::new(),
             per_setup: None,
             answer_time: None,
+            headers: HeaderMap::new(),
         }
     }
 
@@ -3237,6 +3243,37 @@ mod tests {
         let busy = probe("busy/file.bin").await;
         assert!(busy.accepts_ranges);
         assert_eq!(busy.answer_time, None);
+    }
+
+    #[tokio::test]
+    async fn test_a_web_page_from_google_drive_fails_its_probe() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // Every answer comes through this proxy: a web page, as Drive sends for a private or
+        // deleted file.
+        let proxy = crate::hosts::unseen_listener().await;
+        let options = DownloadOptions { proxy: Some(format!("http://{}", proxy.local_addr().unwrap())), ..Default::default() };
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = proxy.accept().await {
+                tokio::spawn(async move {
+                    let mut head = [0u8; 4096];
+                    let _ = socket.read(&mut head).await;
+                    let page = "<html>You can't view or download this file at this time.</html>";
+                    let answer = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page}",
+                        page.len()
+                    );
+                    let _ = socket.write_all(answer.as_bytes()).await;
+                });
+            }
+        });
+        let drive = Url::parse("http://drive.usercontent.google.com/download?id=abc&export=download&confirm=t").unwrap();
+        let engine = DownloadEngine::new(vec![drive.clone()], options);
+        let client = engine.client.clone().unwrap();
+        let err = engine.probe_all(&client, &[drive]).await.err().expect("a web page is no file");
+        assert!(err.contains("Google Drive served a web page instead of the file"), "{err}");
+        // The same answer from anywhere else is what was asked for.
+        let elsewhere = Url::parse("http://files.engine.invalid/download?id=abc").unwrap();
+        assert!(engine.probe_all(&client, &[elsewhere]).await.is_ok());
     }
 
     #[tokio::test]
