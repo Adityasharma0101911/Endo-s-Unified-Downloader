@@ -8,7 +8,11 @@ const MAX_BAD_RESPONSES: u32 = 2;
 #[derive(Debug, Clone)]
 pub struct Mirror {
     pub id: usize,
+    /// Where requests go: where the mirror's probe was redirected, if it was.
     pub url: Url,
+    /// The mirror's own URL while `url` is its redirect target. Requests fall back to it (and its
+    /// fresh redirects) once, when the target stops serving the file: signed targets expire.
+    pub fallback: Option<Url>,
     /// Validator this mirror issued (strong ETag, else Last-Modified), sent back as `If-Range`.
     pub if_range: Option<String>,
     pub speed_ewma: f64,    // bytes per second
@@ -28,6 +32,7 @@ impl Mirror {
         Self {
             id,
             url,
+            fallback: None,
             if_range: None,
             speed_ewma: 1_000_000.0, // Initial optimistic estimate: 1 MB/s
             ttfb_ewma_ms: 100.0,     // Initial optimistic TTFB: 100ms

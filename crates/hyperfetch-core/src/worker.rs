@@ -37,8 +37,11 @@ pub enum FailureKind {
     Transient,
     /// 429/503, with the server's Retry-After if it sent one.
     Throttled(Option<Duration>),
-    /// This mirror cannot serve the file (401/403/404/410, wrong Content-Range, ignored Range).
+    /// This mirror cannot serve the file (wrong Content-Range, ignored Range).
     BadMirror,
+    /// The URL refused the request (401/403/404/410): an expired redirect target, or a mirror
+    /// that cannot serve the file.
+    Denied,
     /// Retrying cannot help (disk write error, remote file changed): fail the download.
     Fatal,
 }
@@ -195,7 +198,7 @@ impl HttpWorker {
                 }
             };
 
-            let outcome = self.download_chunk(&chunk, mirror_id, url, if_range).await;
+            let outcome = self.download_chunk(&chunk, mirror_id, &url, if_range).await;
             // Settle the chunk before looking for more work, so nobody (including this worker)
             // mistakes it for a live chunk to steal from.
             let event = {
@@ -213,7 +216,7 @@ impl HttpWorker {
                         WorkerEvent::ChunkCompleted { worker_id: self.worker_id, chunk_id: chunk.id }
                     }
                     Err((kind, error)) => {
-                        record_failure(&mut racer, &mut chunks, chunk.id, mirror_id, kind, &error);
+                        record_failure(&mut racer, &mut chunks, chunk.id, mirror_id, &url, kind, &error);
                         WorkerEvent::ChunkFailed { worker_id: self.worker_id, chunk_id: chunk.id, mirror_id, kind, error }
                     }
                 }
@@ -247,7 +250,7 @@ impl HttpWorker {
         &self,
         chunk: &Chunk,
         mirror_id: usize,
-        url: Url,
+        url: &Url,
         if_range: Option<String>,
     ) -> Result<(), Failure> {
         let s = &self.shared;
@@ -257,7 +260,7 @@ impl HttpWorker {
             return Ok(()); // stolen away entirely before we started
         }
 
-        let mut request = authorize(s.client.get(url.clone()), s.auth.as_deref(), &url)
+        let mut request = authorize(s.client.get(url.clone()), s.auth.as_deref(), url)
             .header(RANGE, format!("bytes={}-{}", start, end))
             .header(ACCEPT_ENCODING, "identity");
         if let Some(validator) = &if_range {
@@ -410,16 +413,18 @@ impl HttpWorker {
     }
 }
 
-/// Applies a failed attempt to mirror and chunk bookkeeping. This is the retry policy:
-/// transient errors cost the chunk a retry (unless it made progress) and back off;
-/// bad mirrors are dropped after repeated bad answers; throttling while other connections are
-/// being served lowers the connection cap instead of costing retries.
+/// Applies a failed attempt (a request to `url`) to mirror and chunk bookkeeping. This is the retry
+/// policy: transient errors cost the chunk a retry (unless it made progress) and back off;
+/// bad mirrors are dropped after repeated bad answers, though a redirect target that refuses
+/// first sends the mirror back to its own URL; throttling while other connections are being
+/// served lowers the connection cap instead of costing retries.
 /// `mirror.in_flight` must already exclude the failed connection.
 fn record_failure(
     racer: &mut MirrorRacer,
     chunks: &mut ChunkManager,
     chunk_id: usize,
     mirror_id: usize,
+    url: &Url,
     kind: FailureKind,
     error: &str,
 ) {
@@ -436,7 +441,16 @@ fn record_failure(
             mirror.record_failure();
             (Duration::ZERO, true)
         }
-        FailureKind::BadMirror => {
+        // Another connection already sent the mirror back to its own URL.
+        FailureKind::Denied if *url != mirror.url => (Duration::ZERO, false),
+        FailureKind::Denied if mirror.fallback.is_some() => {
+            if let Some(own) = mirror.fallback.take() {
+                tracing::info!("{} refused ({}); going back to {}", mirror.url, error, own);
+                mirror.url = own;
+            }
+            (Duration::ZERO, false)
+        }
+        FailureKind::BadMirror | FailureKind::Denied => {
             if mirror.record_bad_response() {
                 tracing::warn!("Disabling mirror {}: {}", mirror.url, error);
             }
@@ -524,7 +538,7 @@ fn check_response(
             format!("remote file changed: 416 Range Not Satisfiable for bytes {}-{}", start, end),
         )),
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND | StatusCode::GONE => {
-            Err((FailureKind::BadMirror, format!("HTTP {}", status)))
+            Err((FailureKind::Denied, format!("HTTP {}", status)))
         }
         StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE => {
             Err((FailureKind::Throttled(retry_after(headers)), format!("HTTP {}", status)))
@@ -586,7 +600,7 @@ mod tests {
 
         assert_eq!(check(416, &[], 0, 9, 10, V1), Some(FailureKind::Fatal));
         for status in [401, 403, 404, 410] {
-            assert_eq!(check(status, &[], 0, 9, 10, None), Some(FailureKind::BadMirror));
+            assert_eq!(check(status, &[], 0, 9, 10, None), Some(FailureKind::Denied));
         }
         assert_eq!(
             check(503, &[("retry-after", "3")], 0, 9, 10, None),
@@ -707,7 +721,7 @@ mod tests {
         let (mut worker, chunk, _events) = test_worker(&url, &dir.path().join("f.part"), SIZE as u64);
         worker.shared.stall_timeout = Duration::from_secs(10);
         worker.shared.body_idle = Duration::from_millis(100);
-        worker.download_chunk(&chunk, 0, url, None).await.unwrap();
+        worker.download_chunk(&chunk, 0, &url, None).await.unwrap();
         assert_eq!(chunk.current_offset.load(Ordering::SeqCst), SIZE as u64);
     }
 
@@ -740,7 +754,7 @@ mod tests {
         let path = dir.path().join("f.part");
         let (worker, chunk, _events) = test_worker(&url, &path, SIZE as u64);
         let offset = Arc::clone(&chunk.current_offset);
-        let task = tokio::spawn(async move { worker.download_chunk(&chunk, 0, url, None).await });
+        let task = tokio::spawn(async move { worker.download_chunk(&chunk, 0, &url, None).await });
 
         sent_rx.await.unwrap();
         // 64 KiB arrived, far less than a batch, and the server went quiet: within about
@@ -785,7 +799,7 @@ mod tests {
         let path = dir.path().join("f.part");
         let (worker, chunk, _events) = test_worker(&url, &path, SIZE as u64);
         let offset = Arc::clone(&chunk.current_offset);
-        let err = worker.download_chunk(&chunk, 0, url, None).await.unwrap_err();
+        let err = worker.download_chunk(&chunk, 0, &url, None).await.unwrap_err();
 
         assert_eq!(err.0, FailureKind::Transient, "{}", err.1);
         assert_eq!(offset.load(Ordering::SeqCst), 100_000);
@@ -799,6 +813,12 @@ mod tests {
         (MirrorRacer::new(urls), chunks)
     }
 
+    /// A failed request to the mirror's current URL.
+    fn fail(racer: &mut MirrorRacer, chunks: &mut ChunkManager, chunk: usize, mirror: usize, kind: FailureKind, error: &str) {
+        let url = racer.get_mirror(mirror).unwrap().url.clone();
+        record_failure(racer, chunks, chunk, mirror, &url, kind, error);
+    }
+
     #[test]
     fn test_throttling_with_other_connections_costs_no_retries() {
         let (mut racer, mut chunks) = setup(1);
@@ -807,7 +827,7 @@ mod tests {
         }
         for _ in 0..5 {
             let chunk = chunks.get_next_work(0, 0).map(|c| c.id).unwrap_or(0);
-            record_failure(&mut racer, &mut chunks, chunk, 0, FailureKind::Throttled(None), "HTTP 503");
+            fail(&mut racer, &mut chunks, chunk, 0, FailureKind::Throttled(None), "HTTP 503");
             assert!(chunks.chunks().iter().all(|c| c.retries == 0));
         }
         assert!(chunks.has_fatal_failure().is_none());
@@ -820,7 +840,7 @@ mod tests {
         let (mut racer, mut chunks) = setup(1);
         chunks.get_next_work(0, 0).unwrap();
         let busy = FailureKind::Throttled(Some(Duration::from_secs(2)));
-        record_failure(&mut racer, &mut chunks, 0, 0, busy, "HTTP 503");
+        fail(&mut racer, &mut chunks, 0, 0, busy, "HTTP 503");
         assert_eq!(chunks.chunks()[0].retries, 1);
         assert_eq!(racer.select_best_mirror(), None, "mirror pauses for Retry-After");
         assert!(chunks.get_next_work(0, 0).is_none_or(|c| c.id != 0), "chunk waits for Retry-After");
@@ -832,7 +852,7 @@ mod tests {
         for mirror in 0..2 {
             for _ in 0..2 {
                 let chunk = chunks.get_next_work(0, mirror).unwrap().id;
-                record_failure(&mut racer, &mut chunks, chunk, mirror, FailureKind::BadMirror, "HTTP 404");
+                fail(&mut racer, &mut chunks, chunk, mirror, FailureKind::BadMirror, "HTTP 404");
             }
         }
         assert!(racer.all_inactive());
@@ -842,10 +862,38 @@ mod tests {
     }
 
     #[test]
+    fn test_refused_redirect_target_sends_the_mirror_back_to_its_own_url_once() {
+        let target = Url::parse("https://cdn.example/f.bin?sig=expired").unwrap();
+        let own = Url::parse("https://example.com/releases/f.bin").unwrap();
+        let mut racer = MirrorRacer::new(vec![target.clone()]);
+        racer.get_mirror_mut(0).unwrap().fallback = Some(own.clone());
+        let (_, mut chunks) = setup(1);
+
+        // Every connection finds the signed target expired at once: none of that counts.
+        for _ in 0..3 {
+            let chunk = chunks.get_next_work(0, 0).unwrap().id;
+            record_failure(&mut racer, &mut chunks, chunk, 0, &target, FailureKind::Denied, "HTTP 403");
+        }
+        let mirror = racer.get_mirror(0).unwrap();
+        assert_eq!((&mirror.url, &mirror.fallback), (&own, &None));
+        assert_eq!((mirror.bad_responses, mirror.failures, mirror.is_active), (0, 0, true));
+        assert!(chunks.has_fatal_failure().is_none());
+        assert!(chunks.chunks().iter().all(|c| c.retries == 0));
+
+        // The mirror's own URL refusing is a bad mirror, as always.
+        for _ in 0..2 {
+            let chunk = chunks.get_next_work(0, 0).unwrap().id;
+            record_failure(&mut racer, &mut chunks, chunk, 0, &own, FailureKind::Denied, "HTTP 404");
+        }
+        assert!(racer.all_inactive());
+        assert!(chunks.has_fatal_failure().unwrap().1.contains("every mirror failed"));
+    }
+
+    #[test]
     fn test_fatal_failure_aborts() {
         let (mut racer, mut chunks) = setup(1);
         chunks.get_next_work(0, 0).unwrap();
-        record_failure(&mut racer, &mut chunks, 0, 0, FailureKind::Fatal, "Disk write error: no space");
+        fail(&mut racer, &mut chunks, 0, 0, FailureKind::Fatal, "Disk write error: no space");
         assert_eq!(chunks.has_fatal_failure().unwrap().1, "Disk write error: no space");
     }
 

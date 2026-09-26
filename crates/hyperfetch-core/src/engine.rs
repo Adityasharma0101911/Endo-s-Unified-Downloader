@@ -1146,6 +1146,8 @@ impl SpeedMeter {
 #[derive(Debug, Clone)]
 struct ProbeInfo {
     url: Url,
+    /// Where the probe's answer came from, after redirects.
+    final_url: Url,
     /// `None` when the server does not tell (chunked responses).
     size: Option<u64>,
     accepts_ranges: bool,
@@ -1182,6 +1184,7 @@ impl ProbeInfo {
         let final_url = responses.first().map_or(url, |r| r.url());
         Self {
             url: url.clone(),
+            final_url: final_url.clone(),
             size: None,
             accepts_ranges: false,
             filename: extract_filename(responses.iter().map(|r| r.headers()), final_url),
@@ -1358,11 +1361,14 @@ async fn probe_url(
     Ok((info, body))
 }
 
-/// The racer over the mirrors serving the download. Each mirror starts from the answer time its
-/// probe measured instead of an assumed one, so the first requests already favour near mirrors.
+/// The racer over the mirrors serving the download. Requests go straight to where each probe was
+/// redirected, saving a redirect per request, with the mirror's own URL to fall back to. Each
+/// mirror starts from the answer time its probe measured instead of an assumed one, so the first
+/// requests already favour near mirrors.
 fn build_racer(mirrors: &[ProbeInfo]) -> MirrorRacer {
-    let mut racer = MirrorRacer::new(mirrors.iter().map(|m| m.url.clone()).collect());
+    let mut racer = MirrorRacer::new(mirrors.iter().map(|m| m.final_url.clone()).collect());
     for (mirror, probe) in racer.mirrors_mut().iter_mut().zip(mirrors) {
+        mirror.fallback = (probe.final_url != probe.url).then(|| probe.url.clone());
         mirror.if_range = probe.if_range();
         if let Some(answer) = probe.answer_time {
             mirror.ttfb_ewma_ms = answer.as_secs_f64() * 1000.0;
@@ -2095,8 +2101,10 @@ mod tests {
     use tempfile::tempdir;
 
     fn remote(size: u64) -> ProbeInfo {
+        let url = Url::parse("http://example.com/file.bin").unwrap();
         ProbeInfo {
-            url: Url::parse("http://example.com/file.bin").unwrap(),
+            final_url: url.clone(),
+            url,
             size: Some(size),
             accepts_ranges: true,
             filename: "file.bin".to_string(),
@@ -2640,6 +2648,7 @@ mod tests {
         let mirror = |host: &str, answer_ms: Option<u64>| {
             let mut m = remote(1000);
             m.url = Url::parse(&format!("http://{host}/file.bin")).unwrap();
+            m.final_url = m.url.clone();
             m.answer_time = answer_ms.map(Duration::from_millis);
             m
         };
@@ -2653,6 +2662,16 @@ mod tests {
         assert_eq!(even.select_best_mirror(), Some(0));
         let unmeasured = build_racer(&[mirror("a.example", None), mirror("b.example", None)]);
         assert_eq!(unmeasured.select_best_mirror(), Some(0));
+    }
+
+    #[test]
+    fn test_requests_go_where_the_probe_was_redirected() {
+        let mut redirected = remote(1000);
+        redirected.final_url = Url::parse("https://cdn.example/file.bin?sig=1").unwrap();
+        let racer = build_racer(&[redirected.clone(), remote(1000)]);
+        let (first, second) = (racer.get_mirror(0).unwrap(), racer.get_mirror(1).unwrap());
+        assert_eq!((&first.url, first.fallback.as_ref()), (&redirected.final_url, Some(&redirected.url)));
+        assert_eq!((&second.url, second.fallback.as_ref()), (&remote(1000).url, None), "nothing to fall back to");
     }
 
     #[test]
