@@ -518,6 +518,13 @@ fn playlist_fingerprint(segments: &[HlsSegment]) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
+/// Whether `<output_path>.part` is a resumable partial download of exactly these segments.
+pub fn has_resumable_part(output_path: &Path, segments: &[HlsSegment]) -> bool {
+    let state_path = with_suffix(&with_suffix(output_path, ".part"), ".hlsstate");
+    std::fs::read_to_string(state_path)
+        .is_ok_and(|s| s.split_whitespace().next() == Some(playlist_fingerprint(segments).as_str()))
+}
+
 /// Reads `<fingerprint> <segments written> <bytes written>` from the resume file and
 /// returns where to continue, or (0, 0) when the partial file cannot be trusted.
 async fn load_resume_point(state_path: &Path, part_path: &Path, fingerprint: &str, total: usize) -> (usize, u64) {
