@@ -8,6 +8,34 @@ use thiserror::Error;
 /// Base and cap of the per-chunk exponential retry backoff.
 const BACKOFF_BASE: Duration = Duration::from_millis(500);
 const BACKOFF_CAP: Duration = Duration::from_secs(30);
+/// A timed steal leaves a chunk alone unless its worker needs more than this many times a new
+/// request's startup to finish it: otherwise the new request barely gets going before it ends.
+const STEAL_MIN_STARTUPS: f64 = 2.0;
+
+/// How a thief may split a chunk.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StealRule {
+    /// Fewest bytes a steal hands the thief.
+    pub min_bytes: u64,
+    /// What the split is timed by; without it the rest of the chunk is split in half.
+    pub timing: Option<StealTiming>,
+}
+
+/// What a timed steal knows about the thief.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StealTiming {
+    /// Time the thief's new request needs before its first byte.
+    pub startup: Duration,
+    /// Bytes per second the thief's connection is expected to reach.
+    pub thief_rate: f64,
+}
+
+/// A steal of at least this many bytes, split in half.
+impl From<u64> for StealRule {
+    fn from(min_bytes: u64) -> Self {
+        Self { min_bytes, timing: None }
+    }
+}
 
 #[derive(Error, Debug)]
 pub enum ChunkError {
@@ -107,15 +135,16 @@ impl Chunk {
         self.written_prefix().map_or(0, |r| r.len())
     }
 
-    /// Estimated seconds to finish at the rate observed since assignment (infinite if nothing arrived yet).
-    fn eta_secs(&self, remaining: u64, now: Instant) -> f64 {
+    /// Bytes per second written since assignment; `None` before anything arrived.
+    fn rate(&self, now: Instant) -> Option<f64> {
         let received = self.current_offset.load(Ordering::SeqCst).saturating_sub(self.assigned_offset);
         let elapsed = self.assigned_at.map_or(0.0, |t| now.duration_since(t).as_secs_f64());
-        if received == 0 || elapsed <= 0.0 {
-            f64::INFINITY
-        } else {
-            remaining as f64 / (received as f64 / elapsed)
-        }
+        (received > 0 && elapsed > 0.0).then(|| received as f64 / elapsed)
+    }
+
+    /// Estimated seconds to finish at the rate observed since assignment (infinite if nothing arrived yet).
+    fn eta_secs(&self, remaining: u64, now: Instant) -> f64 {
+        self.rate(now).map_or(f64::INFINITY, |rate| remaining as f64 / rate)
     }
 }
 
@@ -258,41 +287,57 @@ impl ChunkManager {
         chunk.clone()
     }
 
-    /// Splits the in-flight chunk with the longest estimated time remaining (ties: most bytes left)
-    /// at the midpoint of what is left. The victim is always truncated and the thief always gets
-    /// `[split, old_end]`; if the victim's worker already wrote past the split, those bytes are
-    /// identical and simply get written twice.
+    /// Splits the in-flight chunk with the longest estimated time remaining (ties: most bytes left).
+    /// A timed steal splits where both sides finish together, the victim going on at the rate it
+    /// has had since assignment and the thief starting after `startup` at `thief_rate`, and leaves
+    /// a chunk alone if its worker finishes within `STEAL_MIN_STARTUPS` startups anyway. Without
+    /// timing, or before the victim has a rate, the rest is split in half. The thief gets at least
+    /// `min_bytes`, the victim keeps at least one. The victim is always truncated and the thief
+    /// always gets `[split, old_end]`; if the victim's worker already wrote past the split, those
+    /// bytes are identical and simply get written twice.
     /// Returns `(victim_chunk_id, new_stolen_chunk)`.
     pub fn steal_work(
         &mut self,
         thief_worker_id: usize,
         thief_mirror_id: usize,
-        min_steal_threshold: u64,
+        rule: impl Into<StealRule>,
     ) -> Option<(usize, Chunk)> {
         if self.fatal.is_some() {
             return None;
         }
-        let threshold = min_steal_threshold.max(2);
+        let rule = rule.into();
+        let min_bytes = rule.min_bytes.max(1);
         let now = Instant::now();
-        let (victim_id, _, _) = self
+        let (victim_id, _, eta) = self
             .chunks
             .iter()
             .filter(|c| c.is_in_flight())
             .filter_map(|c| {
                 let remaining = c.remaining_bytes();
-                (remaining >= threshold).then(|| (c.id, remaining, c.eta_secs(remaining, now)))
+                (remaining > min_bytes).then(|| (c.id, remaining, c.eta_secs(remaining, now)))
             })
             .max_by(|a, b| a.2.total_cmp(&b.2).then(a.1.cmp(&b.1)))?;
+        if rule.timing.is_some_and(|t| eta <= STEAL_MIN_STARTUPS * t.startup.as_secs_f64()) {
+            return None;
+        }
 
         let victim = &mut self.chunks[victim_id];
         let cur_pos = victim.current_offset.load(Ordering::SeqCst).max(victim.range.start);
         let cur_end = victim.end_offset.load(Ordering::SeqCst);
         let remaining = cur_end.checked_sub(cur_pos)?.saturating_add(1);
-        if remaining < threshold {
+        if remaining <= min_bytes {
             return None;
         }
+        let keep = match (rule.timing, victim.rate(now)) {
+            (Some(t), Some(victim_rate)) if t.thief_rate > 0.0 => {
+                // keep / victim_rate == startup + (remaining - keep) / thief_rate
+                let (startup, left) = (t.startup.as_secs_f64(), remaining as f64);
+                ((startup * t.thief_rate + left) * victim_rate / (victim_rate + t.thief_rate)) as u64
+            }
+            _ => remaining / 2,
+        };
 
-        let split_offset = cur_pos + remaining / 2;
+        let split_offset = cur_pos + keep.clamp(1, remaining - min_bytes);
         victim.end_offset.store(split_offset - 1, Ordering::SeqCst);
         victim.range.end = split_offset - 1;
 
@@ -413,6 +458,13 @@ impl ChunkManager {
     fn get_chunk_mut(&mut self, chunk_id: usize) -> Result<&mut Chunk, ChunkError> {
         self.chunks.get_mut(chunk_id).ok_or(ChunkError::NotFound(chunk_id))
     }
+
+    /// Moves a chunk's assignment `by` into the past, as if its worker had been at it that long.
+    #[cfg(test)]
+    pub(crate) fn backdate(&mut self, chunk_id: usize, by: Duration) {
+        let chunk = &mut self.chunks[chunk_id];
+        chunk.assigned_at = chunk.assigned_at.and_then(|t| t.checked_sub(by));
+    }
 }
 
 /// Exponential backoff with equal jitter: `[d/2, d]` for `d = base * 2^(attempt-1)`, capped.
@@ -477,6 +529,53 @@ mod tests {
         let mut manager = ChunkManager::new(4 * MB, 4 * MB).unwrap();
         manager.get_next_work(0, 0).unwrap();
         assert!(manager.steal_work(1, 0, MB).is_some());
+    }
+
+    /// A manager with one chunk of `size` whose worker wrote `written` bytes over the last `secs`.
+    fn one_victim(size: u64, written: u64, secs: u64) -> ChunkManager {
+        let mut manager = ChunkManager::new(size, size).unwrap();
+        manager.get_next_work(0, 0).unwrap().current_offset.store(written, Ordering::SeqCst);
+        manager.backdate(0, Duration::from_secs(secs));
+        manager
+    }
+
+    fn timed(min_bytes: u64, startup_secs: f64, thief_rate: f64) -> StealRule {
+        StealRule { min_bytes, timing: Some(StealTiming { startup: Duration::from_secs_f64(startup_secs), thief_rate }) }
+    }
+
+    #[test]
+    fn test_timed_steal_splits_where_both_sides_finish_together() {
+        // 90 MB left at 1 MB/s; the thief starts after 4 s, then moves 3 MB/s. Both finish after
+        // 25.5 s: the victim with 25.5 MB, the thief with 64.5 MB in 4 + 21.5 s.
+        let mut manager = one_victim(100 * MB, 10 * MB, 10);
+        let (victim, stolen) = manager.steal_work(1, 0, timed(64 * 1024, 4.0, 3.0 * MB as f64)).unwrap();
+        let split = 10 * MB + (25.5 * MB as f64) as u64;
+        assert_eq!(victim, 0);
+        assert!(stolen.range.start.abs_diff(split) < MB, "split at {} instead of about {split}", stolen.range.start);
+        assert_eq!(stolen.range.end, 100 * MB - 1);
+        assert_eq!(manager.chunks()[0].end_offset.load(Ordering::SeqCst), stolen.range.start - 1);
+
+        // A thief far slower than the victim still takes the minimum, never less.
+        let mut manager = one_victim(100 * MB, 10 * MB, 10);
+        let (_, stolen) = manager.steal_work(1, 0, timed(MB, 0.1, 1000.0)).unwrap();
+        assert_eq!(stolen.range.len(), MB);
+    }
+
+    #[test]
+    fn test_timed_steal_leaves_a_chunk_that_ends_within_two_startups() {
+        // 5 MB left at 1 MB/s: 5 s.
+        let mut manager = one_victim(15 * MB, 10 * MB, 10);
+        assert!(manager.steal_work(1, 0, timed(64 * 1024, 3.0, MB as f64)).is_none(), "5 s is under two 3 s startups");
+        assert!(manager.steal_work(1, 0, timed(64 * 1024, 2.0, MB as f64)).is_some(), "5 s is over two 2 s startups");
+    }
+
+    #[test]
+    fn test_timed_steal_from_a_chunk_without_a_rate_splits_in_half() {
+        // Assigned, nothing written yet (waiting for its answer, say): no rate to time by.
+        let mut manager = ChunkManager::new(4 * MB, 4 * MB).unwrap();
+        manager.get_next_work(0, 0).unwrap();
+        let (_, stolen) = manager.steal_work(1, 0, timed(64 * 1024, 0.5, MB as f64)).unwrap();
+        assert_eq!(stolen.range.start, 2 * MB);
     }
 
     #[test]

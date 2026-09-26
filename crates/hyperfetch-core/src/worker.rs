@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-use crate::chunk::{Chunk, ChunkManager};
+use crate::chunk::{Chunk, ChunkManager, StealRule, StealTiming};
 use crate::mirror::MirrorRacer;
 use crate::range::ByteRange;
 use crate::storage::DiskWriter;
@@ -166,6 +166,7 @@ pub struct WorkerShared {
     pub cancel: CancellationToken,
     pub limiter: Option<Arc<RateLimiter>>,
     pub file_size: u64,
+    /// Fewest bytes a steal takes.
     pub min_steal: u64,
     /// Max wait for response headers.
     pub stall_timeout: Duration,
@@ -228,16 +229,20 @@ impl HttpWorker {
         }
     }
 
-    /// Picks the best available mirror, then a chunk for it. Lock order: mirrors, then chunks.
+    /// Picks the best available mirror, then a chunk for it: fresh work, else part of a slow chunk,
+    /// timed by what a new request to that mirror costs. Lock order: mirrors, then chunks.
     fn next_job(&self) -> Option<(Chunk, usize, Url, Option<String>)> {
         let s = &self.shared;
         let mut racer = s.mirrors.lock();
         let mirror_id = racer.select_best_mirror()?;
-        let (url, if_range) = racer.get_mirror(mirror_id).map(|m| (m.url.clone(), m.if_range.clone()))?;
+        let mirror = racer.get_mirror(mirror_id)?;
+        let (url, if_range) = (mirror.url.clone(), mirror.if_range.clone());
+        let timing = StealTiming { startup: mirror.ttfb(), thief_rate: mirror.speed_ewma };
         let chunk = {
             let mut mgr = s.chunks.lock();
+            let steal = StealRule { min_bytes: s.min_steal, timing: Some(timing) };
             mgr.get_next_work(self.worker_id, mirror_id)
-                .or_else(|| mgr.steal_work(self.worker_id, mirror_id, s.min_steal).map(|(_, c)| c))?
+                .or_else(|| mgr.steal_work(self.worker_id, mirror_id, steal).map(|(_, c)| c))?
         };
         racer.acquire_mirror(mirror_id);
         Some((chunk, mirror_id, url, if_range))
@@ -695,6 +700,28 @@ mod tests {
             assert!(waited >= expected && waited < expected + Duration::from_millis(50), "{waited:?}");
             assert_eq!(chunk.current_offset.load(Ordering::SeqCst), 128 * 1024, "what arrived is kept");
         }
+    }
+
+    #[test]
+    fn test_steals_are_timed_by_what_a_request_to_the_thiefs_mirror_costs() {
+        const MB: u64 = 1024 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let url = Url::parse("http://127.0.0.1:9/f").unwrap();
+        let (mut worker, chunk, _events) = test_worker(&url, &dir.path().join("f.part"), 100 * MB);
+        worker.shared.min_steal = 64 * 1024;
+        // Worker 0 wrote 10 MB in 10 s: 90 MB left at 1 MB/s.
+        chunk.current_offset.store(10 * MB, Ordering::SeqCst);
+        worker.shared.chunks.lock().backdate(0, Duration::from_secs(10));
+        {
+            let mut racer = worker.shared.mirrors.lock();
+            let mirror = racer.get_mirror_mut(0).unwrap();
+            (mirror.ttfb_ewma_ms, mirror.speed_ewma) = (4000.0, 3.0 * MB as f64);
+        }
+        let thief = HttpWorker::new(1, worker.shared.clone());
+        let (stolen, ..) = thief.next_job().unwrap();
+        // The mirror's 4 s answers and 3 MB/s connections: both sides finish after 25.5 s.
+        let split = 10 * MB + (25.5 * MB as f64) as u64;
+        assert!(stolen.range.start.abs_diff(split) < MB, "split at {} instead of about {split}", stolen.range.start);
     }
 
     #[tokio::test]

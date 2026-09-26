@@ -79,6 +79,11 @@ impl Mirror {
         self.speed_ewma = (ALPHA * instant_speed) + ((1.0 - ALPHA) * self.speed_ewma);
     }
 
+    /// How long a request to this mirror waits for its answer, smoothed.
+    pub fn ttfb(&self) -> Duration {
+        Duration::try_from_secs_f64(self.ttfb_ewma_ms / 1000.0).unwrap_or_default()
+    }
+
     pub fn record_ttfb(&mut self, ttfb: Duration) {
         let ttfb_ms = ttfb.as_secs_f64() * 1000.0;
         const ALPHA: f64 = 0.25;
