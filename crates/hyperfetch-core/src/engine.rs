@@ -913,28 +913,28 @@ impl DownloadEngine {
                 None => OpenOptions::new().write(true).open(&path).and_then(|f| f.sync_data()).map_err(|e| e.to_string()),
             }
         });
-        let read_back = matches!(written, Written::File);
-        let hash = {
+        let reread = (!matches!(written, Written::File)).then(|| {
             let (path, expected) = (path.to_path_buf(), expected.clone());
+            move || {
+                tracing::warn!(
+                    "The digest of {} taken while writing it does not match; reading it back to be sure",
+                    path.display()
+                );
+                match writer {
+                    Some(writer) => checked(&path, writer.full_digest(expected.as_deref()), expected.as_deref()),
+                    None => crate::storage::hash_and_verify_file(&path, expected.as_deref()),
+                }
+            }
+        });
+        let hash = {
+            let path = path.to_path_buf();
             move || match written {
                 Written::File => crate::storage::hash_and_verify_file(&path, expected.as_deref()),
                 Written::Writer(writer) => checked(&path, writer.digest(expected.as_deref()), expected.as_deref()),
                 Written::Digest(digest) => verify_digest(&digest, expected.as_deref()),
             }
         };
-        match hash_and_flush(hash, flush).await {
-            Err(VerifyError::Mismatch(e)) if !read_back => {
-                tracing::warn!("{}; reading {} back to be sure", e, path.display());
-                let path = path.to_path_buf();
-                blocking(move || match writer {
-                    Some(writer) => checked(&path, writer.full_digest(expected.as_deref()), expected.as_deref()),
-                    None => crate::storage::hash_and_verify_file(&path, expected.as_deref()),
-                })
-                .await
-                .map_err(VerifyError::Io)?
-            }
-            verified => verified,
-        }
+        hash_and_flush(hash, flush, reread).await
     }
 
     /// Records `path` as completed in the download history, which is read only once, under its
@@ -1012,11 +1012,13 @@ enum Written {
     Digest(FileDigest),
 }
 
-/// Runs `hash` and, if given, `flush` at the same time on blocking threads. `hash`'s result
-/// stands once both are done, unless the flush failed.
+/// Runs `hash` and, if given, `flush` at the same time on blocking threads. A mismatch `hash`
+/// reports is checked by `reread`, if given, before it counts. The file passes only if its digest
+/// matches and the flush succeeded; one that does not match is a mismatch, flushed or not.
 async fn hash_and_flush(
     hash: impl FnOnce() -> Result<String, VerifyError> + Send + 'static,
     flush: Option<impl FnOnce() -> Result<(), String> + Send + 'static>,
+    reread: Option<impl FnOnce() -> Result<String, VerifyError> + Send + 'static>,
 ) -> Result<String, VerifyError> {
     let flushed = async {
         match flush {
@@ -1025,7 +1027,10 @@ async fn hash_and_flush(
         }
     };
     let (hashed, flushed) = tokio::join!(blocking(hash), flushed);
-    let hashed = hashed.map_err(VerifyError::Io)??;
+    let hashed = match (hashed.map_err(VerifyError::Io)?, reread) {
+        (Err(VerifyError::Mismatch(_)), Some(reread)) => blocking(reread).await.map_err(VerifyError::Io)?,
+        (hashed, _) => hashed,
+    }?;
     flushed.map_err(|e| VerifyError::Io(format!("Failed to flush download to disk: {}", e)))?;
     Ok(hashed)
 }
@@ -3010,11 +3015,21 @@ mod tests {
             let _ = flush_started.send(());
             hash_rx.recv_timeout(Duration::from_secs(10)).map_err(|_| "the hash did not run alongside".to_string())
         };
-        assert_eq!(hash_and_flush(hash, Some(flush)).await.unwrap(), "digest");
+        let no_reread = None::<fn() -> Result<String, VerifyError>>;
+        assert_eq!(hash_and_flush(hash, Some(flush), no_reread).await.unwrap(), "digest");
 
         // A failed flush fails the download, so the file is not renamed.
-        let err = hash_and_flush(|| Ok("digest".to_string()), Some(|| Err("disk gone".to_string()))).await.unwrap_err();
+        let digest = || Ok("digest".to_string());
+        let (failed, mismatch) = (|| Err("disk gone".to_string()), || Err(VerifyError::Mismatch("differs".into())));
+        let err = hash_and_flush(digest, Some(failed), no_reread).await.unwrap_err();
         assert!(matches!(&err, VerifyError::Io(e) if e.contains("disk gone")), "{err}");
+        // Also when a mismatch the digest reported is overturned by reading the file back.
+        let err = hash_and_flush(mismatch, Some(failed), Some(digest)).await.unwrap_err();
+        assert!(matches!(&err, VerifyError::Io(e) if e.contains("disk gone")), "{err}");
+        assert_eq!(hash_and_flush(mismatch, Some(|| Ok(())), Some(digest)).await.unwrap(), "digest");
+        // A mismatch the file confirms is one, flushed or not: the file is discarded.
+        let err = hash_and_flush(mismatch, Some(failed), Some(mismatch)).await.unwrap_err();
+        assert!(matches!(err, VerifyError::Mismatch(_)), "{err}");
     }
 
     #[tokio::test]
