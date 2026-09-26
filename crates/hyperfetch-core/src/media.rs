@@ -1,9 +1,9 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -563,14 +563,96 @@ async fn update_managed_ytdlp(proxy: Option<&str>, current: Option<&str>) -> Res
     Ok(true)
 }
 
-/// Last successfully probed `yt-dlp --version`, keyed by binary path.
-static VERSION_CACHE: parking_lot::Mutex<Option<(PathBuf, String)>> = parking_lot::const_mutex(None);
+/// A name no other call in any process uses: time, process id and a counter.
+fn unique_suffix() -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    format!("{nanos:x}-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed))
+}
 
-async fn ytdlp_version(bin: &Path, work_dir: &Path) -> Option<String> {
-    let cached = VERSION_CACHE.lock().clone();
-    if let Some((path, version)) = cached {
-        if path == bin {
+/// One yt-dlp build: another build at the same path differs in size or modification time.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct BinaryId {
+    path: PathBuf,
+    size: u64,
+    /// Seconds and nanoseconds since the Unix epoch.
+    modified: (u64, u32),
+}
+
+impl BinaryId {
+    /// Blocking.
+    fn of(path: &Path) -> Option<Self> {
+        let meta = std::fs::metadata(path).ok()?;
+        let modified = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+        Some(Self { path: path.to_path_buf(), size: meta.len(), modified: (modified.as_secs(), modified.subsec_nanos()) })
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CachedVersion {
+    binary: BinaryId,
+    version: String,
+}
+
+/// Most yt-dlp builds whose version the cache file remembers.
+const VERSION_CACHE_ENTRIES: usize = 8;
+
+fn version_cache_file() -> Option<PathBuf> {
+    Some(app_data_dir()?.join("ytdlp-version.json"))
+}
+
+/// The version `file` records for exactly this build. Blocking.
+fn cached_version(file: &Path, binary: &BinaryId) -> Option<String> {
+    let entries: Vec<CachedVersion> = serde_json::from_slice(&std::fs::read(file).ok()?).ok()?;
+    entries.into_iter().find(|e| e.binary == *binary).map(|e| e.version)
+}
+
+/// Records `version` for `binary` in `file`, in place of what it held for that path. The file is
+/// replaced in one rename, so a reader never sees half of it. Blocking.
+fn store_version(file: &Path, binary: &BinaryId, version: &str) -> std::io::Result<()> {
+    let mut entries: Vec<CachedVersion> =
+        std::fs::read(file).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default();
+    entries.retain(|e| e.binary.path != binary.path);
+    entries.insert(0, CachedVersion { binary: binary.clone(), version: version.to_string() });
+    entries.truncate(VERSION_CACHE_ENTRIES);
+    if let Some(dir) = file.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut tmp = file.as_os_str().to_owned();
+    tmp.push(format!(".{}.tmp", unique_suffix()));
+    let tmp = PathBuf::from(tmp);
+    let written = serde_json::to_vec(&entries)
+        .map_err(std::io::Error::other)
+        .and_then(|json| std::fs::write(&tmp, json))
+        .and_then(|()| std::fs::rename(&tmp, file));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
+}
+
+/// Last probed `yt-dlp --version`, with the build it came from.
+static VERSION_CACHE: parking_lot::Mutex<Option<(BinaryId, String)>> = parking_lot::const_mutex(None);
+
+/// `yt-dlp --version` of `bin`. Asking costs a launch (a second or more on Windows), so the answer
+/// is kept in memory and in `cache_file` for as long as the build at `bin` keeps its size and
+/// modification time.
+async fn ytdlp_version(bin: &Path, work_dir: &Path, cache_file: Option<&Path>) -> Option<String> {
+    let binary = {
+        let bin = bin.to_path_buf();
+        tokio::task::spawn_blocking(move || BinaryId::of(&bin)).await.ok().flatten()
+    };
+    if let Some(binary) = &binary {
+        let cached = VERSION_CACHE.lock().clone();
+        if let Some((_, version)) = cached.filter(|(cached, _)| cached == binary) {
             return Some(version);
+        }
+        if let Some(file) = cache_file {
+            let (file, id) = (file.to_path_buf(), binary.clone());
+            if let Some(version) = tokio::task::spawn_blocking(move || cached_version(&file, &id)).await.ok().flatten() {
+                *VERSION_CACHE.lock() = Some((binary.clone(), version.clone()));
+                return Some(version);
+            }
         }
     }
 
@@ -586,7 +668,16 @@ async fn ytdlp_version(bin: &Path, work_dir: &Path) -> Option<String> {
     if !output.status.success() || version.is_empty() {
         return None;
     }
-    *VERSION_CACHE.lock() = Some((bin.to_path_buf(), version.clone()));
+    if let Some(binary) = binary {
+        *VERSION_CACHE.lock() = Some((binary.clone(), version.clone()));
+        if let Some(file) = cache_file.map(Path::to_path_buf) {
+            let stored = version.clone();
+            let saved = tokio::task::spawn_blocking(move || store_version(&file, &binary, &stored)).await;
+            if let Ok(Err(e)) = saved {
+                tracing::debug!("Could not cache the yt-dlp version: {e}");
+            }
+        }
+    }
     Some(version)
 }
 
@@ -1065,7 +1156,7 @@ pub async fn download_media(
 
     let mut updated = false;
     loop {
-        let version = ytdlp_version(&ytdlp_bin, &work_dir).await;
+        let version = ytdlp_version(&ytdlp_bin, &work_dir, version_cache_file().as_deref()).await;
         let args = build_ytdlp_args(url, &options, ffmpeg_dir, js_runtime.as_deref(), version.as_deref());
         let cmd = ytdlp_command(&ytdlp_bin, &args, options.proxy.as_deref(), &work_dir);
 
@@ -1244,6 +1335,50 @@ mod tests {
         let mut partial = b"tail".to_vec();
         assert_eq!(take_line(Ok(0), &mut partial, &mut open), Some("tail".to_string()));
         assert!(!open);
+    }
+
+    #[test]
+    fn version_cache_is_keyed_by_path_size_and_modification_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("cache").join("ytdlp-version.json");
+        let id = |path: &str, size, modified| BinaryId { path: PathBuf::from(path), size, modified };
+        let managed = id("/bin/yt-dlp", 100, (1_700_000_000, 5));
+
+        assert_eq!(cached_version(&file, &managed), None, "no cache file yet");
+        store_version(&file, &managed, "2026.08.19").unwrap();
+        store_version(&file, &id("/usr/bin/yt-dlp", 7, (1, 0)), "2025.01.01").unwrap();
+        assert_eq!(cached_version(&file, &managed).as_deref(), Some("2026.08.19"));
+        // A build swapped in at the same path is asked again.
+        assert_eq!(cached_version(&file, &id("/bin/yt-dlp", 101, (1_700_000_000, 5))), None);
+        assert_eq!(cached_version(&file, &id("/bin/yt-dlp", 100, (1_700_000_000, 6))), None);
+
+        // Recording a path again replaces its entry and keeps the others.
+        let updated = id("/bin/yt-dlp", 120, (1_800_000_000, 0));
+        store_version(&file, &updated, "2026.09.01").unwrap();
+        assert_eq!(cached_version(&file, &updated).as_deref(), Some("2026.09.01"));
+        assert_eq!(cached_version(&file, &managed), None);
+        assert_eq!(cached_version(&file, &id("/usr/bin/yt-dlp", 7, (1, 0))).as_deref(), Some("2025.01.01"));
+        for n in 0..VERSION_CACHE_ENTRIES + 3 {
+            store_version(&file, &id(&format!("/other/{n}"), 1, (1, 0)), "1").unwrap();
+        }
+        let kept: Vec<CachedVersion> = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert_eq!(kept.len(), VERSION_CACHE_ENTRIES);
+        assert_eq!(std::fs::read_dir(file.parent().unwrap()).unwrap().count(), 1, "no temp file left behind");
+    }
+
+    #[tokio::test]
+    async fn cached_version_spares_the_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        // Not a program: asking it for its version fails.
+        let bin = dir.path().join(exe_name("yt-dlp"));
+        std::fs::write(&bin, b"not a program").unwrap();
+        let cache = dir.path().join("ytdlp-version.json");
+        store_version(&cache, &BinaryId::of(&bin).unwrap(), "2026.08.19").unwrap();
+
+        assert_eq!(ytdlp_version(&bin, dir.path(), Some(&cache)).await.as_deref(), Some("2026.08.19"));
+        // Another build at the same path is asked, even though this process has seen the path.
+        std::fs::write(&bin, b"not a program either").unwrap();
+        assert_eq!(ytdlp_version(&bin, dir.path(), Some(&cache)).await, None);
     }
 
     #[test]
