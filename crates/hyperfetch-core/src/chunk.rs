@@ -318,6 +318,26 @@ impl ChunkManager {
         None
     }
 
+    /// Hands `worker_id` the unassigned chunk that starts at `start`, cut to end at `end` if it
+    /// goes further (the rest becomes a chunk of its own): for bytes an answer already on its way
+    /// brings, such as the probe's, whose range ends at `end`. `None` without such a chunk, as
+    /// when those bytes are on disk.
+    pub fn assign_at(&mut self, worker_id: usize, mirror_id: usize, start: u64, end: u64) -> Option<Chunk> {
+        if self.fatal.is_some() || end < start {
+            return None;
+        }
+        let id = self.chunks.iter().position(|c| c.status == ChunkStatus::Unassigned && c.range.start == start)?;
+        let chunk_end = self.chunks[id].range.end;
+        if chunk_end > end {
+            let rest = Chunk::new(self.chunks.len(), ByteRange::new(end + 1, chunk_end).ok()?);
+            let chunk = &mut self.chunks[id];
+            chunk.range.end = end;
+            chunk.end_offset.store(end, Ordering::SeqCst);
+            self.chunks.push(rest);
+        }
+        Some(self.assign(id, worker_id, mirror_id, Instant::now()))
+    }
+
     fn assign(&mut self, id: usize, worker_id: usize, mirror_id: usize, now: Instant) -> Chunk {
         let chunk = &mut self.chunks[id];
         chunk.status = ChunkStatus::Assigned { worker_id, mirror_id };
@@ -807,6 +827,36 @@ mod tests {
         assert!(manager.take_over_silent(1, 0, lands).is_none(), "nothing is left to hand over");
         assert!(silent.revoked.is_cancelled());
         assert!(manager.is_all_completed(), "the revoked worker will not complete it");
+    }
+
+    #[test]
+    fn test_an_answer_on_its_way_takes_the_chunk_it_brings() {
+        // The probe read [0, 100) of its answer for [0, 1 MB); a previous run left [3 MB, 4 MB).
+        let done = [ByteRange::new(0, 99).unwrap(), ByteRange::new(3 * MB, 4 * MB - 1).unwrap()];
+        let mut manager = ChunkManager::with_resumed_ranges(4 * MB, 2 * MB, &done).unwrap();
+        assert!(manager.assign_at(0, 0, 50, MB - 1).is_none(), "those bytes are on disk");
+        let live = manager.assign_at(0, 0, 100, MB - 1).unwrap();
+        assert_eq!((live.range, live.status.clone()), (ByteRange::new(100, MB - 1).unwrap(), ChunkStatus::Assigned { worker_id: 0, mirror_id: 0 }));
+        assert_eq!(live.end_offset.load(Ordering::SeqCst), MB - 1);
+        assert!(manager.assign_at(1, 0, 100, MB - 1).is_none(), "already taken");
+
+        // The rest of the chunk it was cut from goes to the other workers, and a thief can still
+        // split what the answer has left to bring.
+        let rest: Vec<Chunk> = std::iter::from_fn(|| manager.get_next_work(1, 0)).collect();
+        let mut ranges: Vec<ByteRange> = rest.iter().map(|c| c.range).collect();
+        ranges.sort_by_key(|r| r.start);
+        assert_eq!(ranges, [ByteRange::new(MB, 2 * MB + 99).unwrap(), ByteRange::new(2 * MB + 100, 3 * MB - 1).unwrap()]);
+        for chunk in &rest {
+            chunk.current_offset.store(chunk.range.end + 1, Ordering::SeqCst);
+            manager.mark_completed(chunk.id).unwrap();
+        }
+        let (victim, stolen) = manager.steal_work(2, 0, 64 * 1024).unwrap();
+        assert_eq!((victim, stolen.range.end), (live.id, MB - 1));
+        assert_eq!(live.end_offset.load(Ordering::SeqCst), stolen.range.start - 1);
+
+        // An answer that ends before the chunk would leaves the chunk whole when it does not.
+        let mut manager = ChunkManager::new(MB, 256 * 1024).unwrap();
+        assert_eq!(manager.assign_at(0, 0, 0, MB - 1).unwrap().range, ByteRange::new(0, 256 * 1024 - 1).unwrap());
     }
 
     #[test]

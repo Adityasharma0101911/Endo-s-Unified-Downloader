@@ -184,20 +184,48 @@ pub struct WorkerShared {
     pub body_idle: Duration,
 }
 
+/// An answer already bringing a chunk's bytes, from the chunk's start: the probe's, which its
+/// worker streams as its first attempt instead of asking for those bytes again.
+pub struct Seed {
+    /// The chunk, assigned to the worker.
+    pub chunk: Chunk,
+    pub mirror_id: usize,
+    /// Where the answer came from.
+    pub url: Url,
+    pub response: Response,
+    /// The host slot the answer's request holds.
+    pub slot: HostSlot,
+}
+
 pub struct HttpWorker {
     pub worker_id: usize,
     shared: WorkerShared,
+    seed: Option<Seed>,
 }
 
 impl HttpWorker {
     pub fn new(worker_id: usize, shared: WorkerShared) -> Self {
-        Self { worker_id, shared }
+        Self { worker_id, shared, seed: None }
+    }
+
+    /// A worker whose first attempt streams `seed`'s answer, which must be assigned to it.
+    pub fn seeded(worker_id: usize, shared: WorkerShared, seed: Seed) -> Self {
+        Self { worker_id, shared, seed: Some(seed) }
     }
 
     /// Takes chunks (or takes over or steals from slow ones) until cancelled or the engine goes away.
     /// Each request holds a slot of its host's connection budget, taken before any chunk: waiting
-    /// for one is neither a stall nor a failure, and leaves nothing for others to steal.
-    pub async fn run(self) {
+    /// for one is neither a stall nor a failure, and leaves nothing for others to steal. A seed
+    /// comes first, like any other attempt but for the request.
+    pub async fn run(mut self) {
+        if let Some(Seed { chunk, mirror_id, url, response, slot }) = self.seed.take() {
+            self.shared.mirrors.lock().acquire_mirror(mirror_id);
+            let start = chunk.current_offset.load(Ordering::SeqCst);
+            let outcome = self.receive(&chunk, mirror_id, response, start).await;
+            if !self.conclude(&chunk, mirror_id, &url, outcome, slot).await {
+                return;
+            }
+        }
         let s = &self.shared;
         loop {
             if s.cancel.is_cancelled() {
@@ -217,20 +245,28 @@ impl HttpWorker {
             };
 
             let outcome = self.download_chunk(&chunk, mirror_id, &url, if_range, redirected, &slot).await;
-            if s.cancel.is_cancelled() {
-                s.mirrors.lock().release_mirror(mirror_id);
+            if !self.conclude(&chunk, mirror_id, &url, outcome, slot).await {
                 return;
             }
-            // Settled before looking for more work, so nobody (including this worker) mistakes
-            // the chunk for a live one to steal from. The event wakes the engine so it notices
-            // completion or a fatal error.
-            let event = self.settle(&chunk, mirror_id, &url, outcome, &slot);
-            drop(slot);
-            if let Some(event) = event {
-                if s.events.send(event).await.is_err() {
-                    return;
-                }
-            }
+        }
+    }
+
+    /// Settles an attempt at `chunk` (a request to `url` under `slot`) and reports it; `false`
+    /// once the worker is to stop.
+    async fn conclude(&self, chunk: &Chunk, mirror_id: usize, url: &Url, outcome: Result<(), Failure>, slot: HostSlot) -> bool {
+        let s = &self.shared;
+        if s.cancel.is_cancelled() {
+            s.mirrors.lock().release_mirror(mirror_id);
+            return false;
+        }
+        // Settled before looking for more work, so nobody (including this worker) mistakes the
+        // chunk for a live one to steal from. The event wakes the engine so it notices completion
+        // or a fatal error.
+        let event = self.settle(chunk, mirror_id, url, outcome, &slot);
+        drop(slot);
+        match event {
+            Some(event) => s.events.send(event).await.is_ok(),
+            None => true,
         }
     }
 
@@ -834,6 +870,40 @@ mod tests {
         });
         let body = reqwest::Body::wrap_stream(steps.chain(futures_util::stream::pending()));
         Response::from(http::Response::new(body))
+    }
+
+    #[tokio::test]
+    async fn test_a_seeded_worker_streams_the_answer_it_was_given() {
+        const SIZE: usize = 256 * 1024;
+        let data: Vec<u8> = (0..SIZE).map(|i| (i % 253) as u8).collect();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.part");
+        // Nothing answers there: the bytes can only come from the answer the worker was given.
+        let url = Url::parse("http://seeded.worker.invalid/f").unwrap();
+        let (worker, chunk, mut events) = test_worker(&url, &path, SIZE as u64);
+        let shared = worker.shared.clone();
+        let response = Response::from(http::Response::new(reqwest::Body::from(data.clone())));
+        let slot = hosts::try_acquire(&url, 1).unwrap();
+        assert!(hosts::try_acquire(&url, 1).is_none(), "the answer's request holds the host's only slot");
+        let seed = Seed { chunk, mirror_id: 0, url: url.clone(), response, slot };
+        let task = tokio::spawn(HttpWorker::seeded(0, shared.clone(), seed).run());
+
+        let completed = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match events.recv().await {
+                    Some(WorkerEvent::ChunkCompleted { chunk_id, .. }) => break chunk_id,
+                    Some(_) => continue,
+                    None => panic!("the worker stopped"),
+                }
+            }
+        });
+        assert_eq!(completed.await.expect("the chunk completes"), 0);
+        assert!(shared.chunks.lock().is_all_completed());
+        assert_eq!(std::fs::read(&path).unwrap(), data);
+        assert!(hosts::try_acquire(&url, 1).is_some(), "the slot went back once the attempt was settled");
+        assert_eq!(shared.mirrors.lock().in_flight(), 0);
+        shared.cancel.cancel();
+        task.await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]

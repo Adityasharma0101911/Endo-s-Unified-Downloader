@@ -28,7 +28,7 @@ use crate::range::{compute_gaps, ByteRange};
 use crate::state::DownloadState;
 use crate::storage::{DiskWriter, StorageError, VerifyError};
 use crate::worker::{
-    authorize, content_length, retry_after, Auth, FailureKind, HttpWorker, RateLimiter, WorkerEvent, WorkerShared,
+    authorize, content_length, retry_after, Auth, FailureKind, HttpWorker, RateLimiter, Seed, WorkerEvent, WorkerShared,
 };
 
 const CANCELLED: &str = "Download cancelled by user";
@@ -284,8 +284,8 @@ impl DownloadEngine {
             }
         }
 
-        let (reference, mirrors) = self.probe_all(&client, &resolved).await?;
-        self.download(client, reference, mirrors, snapshot_tx).await
+        let probed = self.probe_all(&client, &resolved).await?;
+        self.download(client, probed, snapshot_tx).await
     }
 
     /// The first URL that should go to yt-dlp: a known media site, or with an explicit media
@@ -433,8 +433,9 @@ impl DownloadEngine {
         Ok(resolved)
     }
 
-    /// Probes all mirrors concurrently; returns the reference probe and the mirrors that serve the same file.
-    async fn probe_all(&self, client: &Client, urls: &[Url]) -> Result<(ProbeInfo, Vec<ProbeInfo>), String> {
+    /// Probes all mirrors concurrently; returns the reference probe, the mirrors that serve the
+    /// same file and the reference's answer while it is still coming.
+    async fn probe_all(&self, client: &Client, urls: &[Url]) -> Result<Probed, String> {
         let (limiter, stall) = (self.limiter(), self.stall_timeout());
         let several_connections = self.options.num_connections > 1;
         let limit = self.options.max_connections_per_host;
@@ -445,21 +446,11 @@ impl DownloadEngine {
                 async move {
                     // Only the first mirror fetches the file's start: the download uses one copy.
                     let (mut info, body) = probe_url(&client, auth.as_deref(), &url, i == 0, limit).await?;
-                    if let Some(ProbeBody { response, slot, len, answered, setup }) = body {
-                        // Only the start of a larger file keeps workers waiting.
-                        let deadline = (info.size != Some(len)).then(|| tokio::time::Instant::now() + PREFETCH_TIME);
-                        // Workers can take over early only where ranges work (without them only the
-                        // whole body is of use), there can be several, and no speed limit makes
-                        // every connection look capped.
-                        let pace = setup
-                            .filter(|_| info.accepts_ranges && several_connections && limiter.is_none())
-                            .map(|setup| Pace { answered, setup });
-                        (info.prefetch, info.per_setup) =
-                            read_prefix(response, len, deadline, pace, stall, limiter.as_deref()).await;
-                        // Done with the answer: its request's slot goes back.
-                        drop(slot);
-                    }
-                    Ok::<_, String>(info)
+                    let live = match body {
+                        Some(body) => take_start(&mut info, body, several_connections, limiter.as_deref(), stall).await,
+                        None => None,
+                    };
+                    Ok::<_, String>((info, live))
                 }
             })
             .buffered(PROBE_CONCURRENCY)
@@ -469,16 +460,29 @@ impl DownloadEngine {
             _ = self.cancel_token.cancelled() => return Err(CANCELLED.to_string()),
             probes = probes => probes,
         };
-        select_mirrors(probes)
+        // Only the first mirror's answer can still be coming.
+        let mut live = None;
+        let probes = probes
+            .into_iter()
+            .map(|probe| {
+                probe.map(|(info, answer)| {
+                    live = live.take().or(answer);
+                    info
+                })
+            })
+            .collect();
+        let (reference, mirrors) = select_mirrors(probes)?;
+        let live = live.filter(|_| urls.first() == Some(&reference.url));
+        Ok(Probed { reference, mirrors, live })
     }
 
     async fn download(
         &self,
         client: Client,
-        reference: ProbeInfo,
-        mirrors: Vec<ProbeInfo>,
+        probed: Probed,
         snapshot_tx: Option<broadcast::Sender<EngineSnapshot>>,
     ) -> Result<PathBuf, String> {
+        let Probed { reference, mirrors, live } = probed;
         let started_at = unix_now();
         let base = self.output_path_for(&reference.filename);
         let mut known_urls = self.url_strings();
@@ -553,22 +557,8 @@ impl DownloadEngine {
                 .map_err(|e| format!("Failed to write {}: {}", part.display(), e))?
             }
             Some(size) if reference.accepts_ranges => {
-                let per_connection = reference.per_setup.map_or(BYTES_PER_CONNECTION, |bytes| {
-                    bytes.clamp(MIN_BYTES_PER_CONNECTION, BYTES_PER_CONNECTION)
-                });
-                self.fetch_ranges(
-                    client,
-                    size,
-                    prefetched,
-                    per_connection,
-                    &mirrors,
-                    state,
-                    &part,
-                    &state_path,
-                    &final_path,
-                    &snapshot_tx,
-                )
-                .await?
+                self.fetch_ranges(client, size, &reference, &mirrors, live, state, &part, &state_path, &final_path, &snapshot_tx)
+                    .await?
             }
             _ => self.fetch_stream(&client, &reference, &part, &final_path, &snapshot_tx).await?,
         }
@@ -576,34 +566,46 @@ impl DownloadEngine {
     }
 
     /// Multi-connection download of a file whose size is known and whose server honours ranges.
-    /// `prefetch`, the file's first bytes from the probe, counts as downloaded; it is written
-    /// wherever the resumed state does not already hold those bytes. Every `per_connection`
-    /// missing bytes justify one connection, up to the limit.
+    /// The reference's prefetch, the file's first bytes from the probe, counts as downloaded; it
+    /// is written wherever the resumed state does not already hold those bytes. The probe's
+    /// answer, if `live`, goes on as the first chunk from where the probe stopped reading, when
+    /// those bytes are still missing. The bytes one connection carries in the time another takes
+    /// to start (the reference's `per_setup`) justify one connection each, up to the limit.
     #[allow(clippy::too_many_arguments)]
     async fn fetch_ranges(
         &self,
         client: Client,
         size: u64,
-        prefetch: Bytes,
-        per_connection: u64,
+        reference: &ProbeInfo,
         mirrors: &[ProbeInfo],
+        live: Option<Live>,
         state: DownloadState,
         part: &Path,
         state_path: &Path,
         final_path: &Path,
         snapshot_tx: &Option<broadcast::Sender<EngineSnapshot>>,
     ) -> Result<(), String> {
+        let prefetch = reference.prefetch.clone();
         let unwritten = compute_gaps(prefetch.len() as u64, &state.completed_ranges);
         let mut have = state.completed_ranges.clone();
         have.extend(ByteRange::from_len(0, prefetch.len() as u64));
         // A connection must carry enough to repay its handshakes: a small file arrives sooner over
         // one connection than over many, unless the server caps each connection's speed.
+        let per_connection = reference
+            .per_setup
+            .map_or(BYTES_PER_CONNECTION, |bytes| bytes.clamp(MIN_BYTES_PER_CONNECTION, BYTES_PER_CONNECTION));
         let remaining: u64 = compute_gaps(size, &have).iter().map(ByteRange::len).sum();
         let max_workers = self.options.num_connections.clamp(1, MAX_CONNECTIONS) as u64;
         let num_workers = remaining.div_ceil(per_connection).clamp(1, max_workers) as usize;
         let chunk_size = effective_chunk_size(remaining, num_workers as u64, self.options.base_chunk_size);
         let mut manager = ChunkManager::with_resumed_ranges(size, chunk_size, &have).map_err(|e| e.to_string())?;
         manager.set_max_retries(self.options.max_retries);
+        // The probe's answer is worker 0's first attempt.
+        let seed = live.and_then(|Live { response, slot, end }| {
+            let mirror_id = mirrors.iter().position(|m| m.url == reference.url)?;
+            let chunk = manager.assign_at(0, mirror_id, prefetch.len() as u64, end)?;
+            Some(Seed { chunk, mirror_id, url: reference.final_url.clone(), response, slot })
+        });
 
         let racer = build_racer(mirrors);
 
@@ -649,7 +651,11 @@ impl DownloadEngine {
             body_idle: self.stall_timeout().min(BODY_IDLE),
         };
         let mut workers = JoinSet::new();
-        for worker_id in 0..num_workers {
+        let seeded = seed.is_some() as usize;
+        if let Some(seed) = seed {
+            workers.spawn(HttpWorker::seeded(0, shared.clone(), seed).run());
+        }
+        for worker_id in seeded..num_workers {
             workers.spawn(HttpWorker::new(worker_id, shared.clone()).run());
         }
         drop(shared);
@@ -1219,6 +1225,24 @@ struct ProbeBody {
     setup: Option<Duration>,
 }
 
+/// A probe's ranged answer whose body is still coming: the file's bytes from where the probe
+/// stopped reading up to `end`, with the host slot its request holds.
+struct Live {
+    response: Response,
+    slot: HostSlot,
+    end: u64,
+}
+
+/// What the probes found, for the download.
+struct Probed {
+    /// The mirror whose answers the download goes by.
+    reference: ProbeInfo,
+    /// The mirrors serving the reference's file, the reference among them.
+    mirrors: Vec<ProbeInfo>,
+    /// The reference's probe answer, still coming.
+    live: Option<Live>,
+}
+
 /// Lets `read_prefix` measure the rate from when the answer arrived.
 #[derive(Clone, Copy)]
 struct Pace {
@@ -1466,6 +1490,16 @@ fn accepts_bytes(headers: &HeaderMap) -> bool {
         .any(|unit| unit.trim().eq_ignore_ascii_case("bytes"))
 }
 
+/// What `read_prefix` read.
+struct Prefix {
+    bytes: Bytes,
+    /// Bytes a capped connection carries in the time another needs to start.
+    per_setup: Option<u64>,
+    /// Whether reading stopped by choice, for a capped connection or at the deadline, while the
+    /// body is still coming: the rest of it can go on as the download's first chunk.
+    live: bool,
+}
+
 /// Reads up to `len` bytes of a probe's body until `deadline`, giving up after `stall` without
 /// data. Whatever arrived is kept, even if the body ends early.
 ///
@@ -1473,16 +1507,15 @@ fn accepts_bytes(headers: &HeaderMap) -> bool {
 /// climbing mean TCP slow start (which new connections would go through too) is over and the
 /// server caps the connection; the returned bytes-per-setup then says what one connection carries
 /// in the time another needs to start. Reading stops there if the rest would take over two setup
-/// times: workers fetch it in parallel sooner, even after losing the bytes still in flight.
+/// times: workers fetch it in parallel sooner, with this connection as one of them.
 async fn read_prefix(
-    response: Response,
+    response: &mut Response,
     len: u64,
     deadline: Option<tokio::time::Instant>,
     pace: Option<Pace>,
     stall: Duration,
     limiter: Option<&RateLimiter>,
-) -> (Bytes, Option<u64>) {
-    let mut body = response.bytes_stream();
+) -> Prefix {
     let mut kept = Vec::with_capacity(len as usize);
     let mut last_byte_at = tokio::time::Instant::now();
     let tick = pace.map_or(MIN_RATE_TICK, |p| (p.setup / 2).max(MIN_RATE_TICK));
@@ -1492,6 +1525,7 @@ async fn read_prefix(
     // The last rate measured, and whether it had stopped climbing.
     let mut last: Option<(f64, bool)> = None;
     let mut per_setup = None;
+    let mut live = false;
     while (kept.len() as u64) < len {
         let mut wake = last_byte_at + stall;
         if pace.is_some() {
@@ -1500,8 +1534,8 @@ async fn read_prefix(
         if let Some(deadline) = deadline {
             wake = wake.min(deadline);
         }
-        match tokio::time::timeout_at(wake, body.next()).await {
-            Ok(Some(Ok(bytes))) => {
+        match tokio::time::timeout_at(wake, response.chunk()).await {
+            Ok(Ok(Some(bytes))) => {
                 if let Some(limiter) = limiter {
                     limiter.acquire(bytes.len() as u64).await;
                 }
@@ -1509,14 +1543,17 @@ async fn read_prefix(
                 kept.extend_from_slice(&bytes[..take]);
                 last_byte_at = tokio::time::Instant::now();
             }
-            Ok(_) => break,
+            Ok(_) => break, // the body ended, or failed
             Err(_) => {
                 let now = tokio::time::Instant::now();
-                let (Some(p), false, false) =
-                    (pace, now >= last_byte_at + stall, deadline.is_some_and(|d| now >= d))
-                else {
-                    break; // stalled, or out of time
-                };
+                if now >= last_byte_at + stall {
+                    break; // stalled: nothing more is coming
+                }
+                if deadline.is_some_and(|d| now >= d) {
+                    live = true; // out of time: the rest goes on alongside the workers
+                    break;
+                }
+                let Some(p) = pace else { continue };
                 next_tick = now + tick;
                 let got = kept.len() - window_began_len;
                 if got == 0 {
@@ -1528,6 +1565,7 @@ async fn read_prefix(
                 if flat && last.is_some_and(|(_, was_flat)| was_flat) {
                     per_setup = Some((rate * setup) as u64);
                     if (len - kept.len() as u64) as f64 > 2.0 * rate * setup {
+                        live = true;
                         break;
                     }
                 } else if !flat {
@@ -1538,7 +1576,32 @@ async fn read_prefix(
             }
         }
     }
-    (kept.into(), per_setup)
+    Prefix { bytes: kept.into(), per_setup, live }
+}
+
+/// Reads the file's start from the first mirror's probe answer, as much of it as the workers
+/// should wait for (see `read_prefix`), and returns the answer while the rest of it is still
+/// coming: the download goes on with it as its first chunk instead of asking for those bytes
+/// again.
+async fn take_start(
+    info: &mut ProbeInfo,
+    body: ProbeBody,
+    several_connections: bool,
+    limiter: Option<&RateLimiter>,
+    stall: Duration,
+) -> Option<Live> {
+    let ProbeBody { mut response, slot, len, answered, setup } = body;
+    // Only the start of a larger file keeps workers waiting.
+    let deadline = (info.size != Some(len)).then(|| tokio::time::Instant::now() + PREFETCH_TIME);
+    // Workers can take over early only where ranges work (without them only the whole body is of
+    // use), there can be several, and no speed limit makes every connection look capped.
+    let pace = setup
+        .filter(|_| info.accepts_ranges && several_connections && limiter.is_none())
+        .map(|setup| Pace { answered, setup });
+    let prefix = read_prefix(&mut response, len, deadline, pace, stall, limiter).await;
+    info.prefetch = prefix.bytes;
+    info.per_setup = prefix.per_setup;
+    prefix.live.then(|| Live { response, slot, end: len.saturating_sub(1) })
 }
 
 /// Picks the reference probe and keeps the mirrors that serve the same file. The first successful
@@ -2404,9 +2467,18 @@ mod tests {
     }
 
     /// Reads all of `body` as a probe whose answer took 40 ms, so its rate ticks every 20 ms.
-    async fn read_paced(body: Response, len: u64, paced_read: bool) -> (Bytes, Option<u64>) {
+    async fn read_paced(body: &mut Response, len: u64, paced_read: bool) -> Prefix {
         let pace = Pace { answered: tokio::time::Instant::now(), setup: Duration::from_millis(40) };
         read_prefix(body, len, None, paced_read.then_some(pace), Duration::from_secs(1), None).await
+    }
+
+    /// What is left of a body, read to its end.
+    async fn rest_of(mut body: Response) -> usize {
+        let mut rest = 0;
+        while let Some(bytes) = body.chunk().await.unwrap() {
+            rest += bytes.len();
+        }
+        rest
     }
 
     #[tokio::test(start_paused = true)]
@@ -2414,14 +2486,18 @@ mod tests {
         // 8 KiB per 3 ms from the first byte on (~2.7 MB/s), for 1 MiB: the rest would take far
         // longer than two 40 ms setups, so workers take over, each worth ~40 ms of transfer.
         let capped = || paced(std::iter::once((0, 8 * 1024)).chain(std::iter::repeat_n((3, 8 * 1024), 127)).collect());
-        let (bytes, per_setup) = read_paced(capped(), PREFETCH, true).await;
-        assert!(bytes.len() <= 256 * 1024, "{}", bytes.len());
-        let per_setup = per_setup.expect("a capped rate is measured");
+        let mut body = capped();
+        let prefix = read_paced(&mut body, PREFETCH, true).await;
+        assert!(prefix.bytes.len() <= 256 * 1024, "{}", prefix.bytes.len());
+        let per_setup = prefix.per_setup.expect("a capped rate is measured");
         assert!((80 * 1024..=140 * 1024).contains(&per_setup), "{per_setup}");
+        // The probe's connection is one of them: the rest of its answer is still coming.
+        assert!(prefix.live);
+        assert_eq!(prefix.bytes.len() + rest_of(body).await, PREFETCH as usize, "nothing read was lost");
 
         // Without ranges only the whole body is of use.
-        let (bytes, _) = read_paced(capped(), PREFETCH, false).await;
-        assert_eq!(bytes.len() as u64, PREFETCH);
+        let prefix = read_paced(&mut capped(), PREFETCH, false).await;
+        assert_eq!((prefix.bytes.len() as u64, prefix.live), (PREFETCH, false));
     }
 
     #[tokio::test(start_paused = true)]
@@ -2430,18 +2506,35 @@ mod tests {
         // the first tick: one window looks flat (4+8 KiB, then 16), yet the rate is still
         // climbing and new connections would start as slowly, so the probe keeps the whole file.
         let steps = vec![(0, 4), (19, 8), (20, 16), (20, 32), (20, 64), (20, 128), (20, 4)];
-        let body = paced(steps.into_iter().map(|(ms, k)| (ms, k * 1024)).collect());
-        let (bytes, per_setup) = read_paced(body, 256 * 1024, true).await;
-        assert_eq!(bytes.len(), 256 * 1024);
-        assert_eq!(per_setup, None);
+        let mut body = paced(steps.into_iter().map(|(ms, k)| (ms, k * 1024)).collect());
+        let prefix = read_paced(&mut body, 256 * 1024, true).await;
+        assert_eq!(prefix.bytes.len(), 256 * 1024);
+        assert_eq!((prefix.per_setup, prefix.live), (None, false));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_prefix_read_out_of_time_leaves_the_rest_coming() {
+        // 8 KiB per 10 ms, and 95 ms to read it: the rest of the answer goes on with the workers.
+        let mut body = paced(std::iter::repeat_n((10, 8 * 1024), 32).collect());
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(95);
+        let prefix = read_prefix(&mut body, 256 * 1024, Some(deadline), None, Duration::from_secs(1), None).await;
+        assert!(prefix.live && prefix.per_setup.is_none());
+        assert_eq!(prefix.bytes.len(), 72 * 1024);
+        assert_eq!(rest_of(body).await, 184 * 1024);
     }
 
     #[tokio::test(start_paused = true)]
     async fn test_prefix_read_gives_up_on_a_stalled_body() {
         let silent = futures_util::stream::pending::<Result<Bytes, std::io::Error>>();
-        let body = Response::from(http::Response::new(reqwest::Body::wrap_stream(silent)));
-        let read = tokio::time::timeout(Duration::from_secs(5), read_paced(body, 256 * 1024, true)).await;
-        assert!(read.expect("the stall timeout ends the read").0.is_empty());
+        let mut body = Response::from(http::Response::new(reqwest::Body::wrap_stream(silent)));
+        let read = tokio::time::timeout(Duration::from_secs(5), read_paced(&mut body, 256 * 1024, true)).await;
+        let prefix = read.expect("the stall timeout ends the read");
+        assert!(prefix.bytes.is_empty() && !prefix.live, "nothing more is coming");
+
+        // Nor does a body that ended early leave anything to go on with.
+        let mut short = paced(vec![(0, 8 * 1024)]);
+        let prefix = read_paced(&mut short, 256 * 1024, false).await;
+        assert_eq!((prefix.bytes.len(), prefix.live), (8 * 1024, false));
     }
 
     #[test]

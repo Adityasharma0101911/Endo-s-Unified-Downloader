@@ -117,6 +117,9 @@ struct Mock {
     expired: Option<(&'static str, Reply)>,
     /// What to do with each GET except the engine's probes, which are always served.
     plan: fn(usize) -> Reply,
+    /// A probe's answer pauses this long once it has sent this many body bytes (a multiple of
+    /// 16 KiB).
+    probe_pause: Option<(usize, Duration)>,
     /// Pause between 16 KiB body writes, in microseconds (adjustable while running).
     delay_us: AtomicU64,
     /// If set, every GET checks that this file exists.
@@ -137,6 +140,8 @@ struct Stats {
     body_bytes: AtomicU64,
     /// Body bytes sent in answer to probes.
     probe_bytes: AtomicU64,
+    /// Body bytes sent in answer to probes when the first GET arrived.
+    probe_bytes_at_first_get: AtomicU64,
     active: AtomicUsize,
     /// GETs being answered now, each until just before its last write (so never after the client
     /// could have seen the whole answer), and the most ever answered at once.
@@ -179,6 +184,7 @@ impl Mock {
             redirect: None,
             expired: None,
             plan: |_| Reply::Normal,
+            probe_pause: None,
             delay_us: AtomicU64::new(0),
             must_exist_on_get: Mutex::new(None),
             stats: Stats::default(),
@@ -287,6 +293,9 @@ async fn handle(mut socket: TcpStream, mock: Arc<Mock>) {
         (if busy { Reply::Status(503, None) } else { Reply::Normal }, None, None)
     } else {
         let index = s.gets.fetch_add(1, Ordering::SeqCst);
+        if index == 0 {
+            s.probe_bytes_at_first_get.store(s.probe_bytes.load(Ordering::SeqCst), Ordering::SeqCst);
+        }
         let active = s.active.fetch_add(1, Ordering::SeqCst) + 1;
         let guard = ActiveGuard(&s.active);
         let serving = s.serving.fetch_add(1, Ordering::SeqCst) + 1;
@@ -397,6 +406,9 @@ Connection: close
         let delay = mock.delay_us.load(Ordering::SeqCst);
         if delay > 0 {
             tokio::time::sleep(Duration::from_micros(delay)).await;
+        }
+        if let Some((_, pause)) = mock.probe_pause.filter(|&(after, _)| probe && i * 16 * KB == after) {
+            tokio::time::sleep(pause).await;
         }
         if i + 1 == pieces {
             drop(serving.take());
@@ -1456,7 +1468,7 @@ async fn test_resume_with_prefetch_overlapping_completed_state() {
 async fn test_a_capped_probe_hands_the_rest_to_workers() {
     let _history = setup().await;
     // ~3 MB/s per connection, and new connections start at once: even a file the probe could
-    // bring alone is fetched over several.
+    // bring alone is fetched over several, the probe's own connection among them.
     for size in [PREFETCH, 3 * PREFETCH] {
         let data = payload(size, 191);
         let mock = Arc::new(Mock::new(data.clone()));
@@ -1470,9 +1482,36 @@ async fn test_a_capped_probe_hands_the_rest_to_workers() {
 
         assert_file(&out, &data);
         let s = &mock.stats;
-        let probed = s.probe_bytes.load(Ordering::SeqCst);
-        assert!(probed < size as u64 / 2, "workers waited for {probed} of {size} bytes from the probe");
+        let (waited, probed) = (s.probe_bytes_at_first_get.load(Ordering::SeqCst), s.probe_bytes.load(Ordering::SeqCst));
+        assert!(waited < size as u64 / 2, "workers waited for {waited} of {size} bytes from the probe");
         assert!(mock.served_ranges().len() >= 2, "{size}: the rest is fetched in parallel");
+        // The probe's answer is not dropped when the workers start: it goes on as the first chunk.
+        assert!(probed >= waited + 128 * KB as u64, "{size}: the probe's answer stopped at {probed} bytes when the workers started");
+    }
+}
+
+#[tokio::test]
+async fn test_a_probe_cut_short_goes_on_as_the_first_chunk() {
+    let _history = setup().await;
+    let data = payload(PREFETCH + 512 * KB, 257);
+    // The probe's answer pauses after 64 KiB, past the time the download waits for it: the
+    // download starts without the rest, which that answer still brings, on one connection or
+    // with a speed limit alike.
+    for (connections, max_speed) in [(1, None), (4, Some(2048 * KB as u64))] {
+        let mut mock = Mock::new(data.clone());
+        mock.probe_pause = Some((64 * KB, Duration::from_millis(600)));
+        let mock = Arc::new(mock);
+        let url = serve(Arc::clone(&mock), "cut.bin").await;
+        let temp = tempdir().unwrap();
+        let out = temp.path().join("cut.bin");
+
+        let engine = DownloadEngine::new(vec![url], DownloadOptions { max_speed, ..options(&out, connections, 128 * KB) });
+        run(&engine, None).await.expect("download should succeed");
+
+        assert_file(&out, &data);
+        let starts: Vec<u64> = mock.served_ranges().iter().map(|r| r.start).collect();
+        assert!(!starts.contains(&(64 * KB as u64)), "{connections}: the bytes after the probe's were asked for again: {starts:?}");
+        assert!(starts.contains(&(192 * KB as u64)), "{connections}: the first chunk is the rest of the probe's answer: {starts:?}");
     }
 }
 
