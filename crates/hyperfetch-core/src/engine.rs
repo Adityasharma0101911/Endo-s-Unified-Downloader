@@ -39,6 +39,12 @@ pub struct DownloadOptions {
     pub proxy: Option<String>,
     pub media_preset: Option<crate::media::MediaQualityPreset>,
     pub browser_cookies: Option<crate::media::BrowserCookieSource>,
+    /// Global download speed cap in bytes/sec across all connections (None = unlimited).
+    pub max_speed: Option<u64>,
+    /// Failed attempts allowed per chunk before the download fails. Attempts that made progress don't count.
+    pub max_retries: u32,
+    /// Seconds without receiving a byte before a connection is treated as stalled and retried.
+    pub stall_timeout_secs: u64,
 }
 
 impl Default for DownloadOptions {
@@ -54,6 +60,9 @@ impl Default for DownloadOptions {
             proxy: None,
             media_preset: None,
             browser_cookies: None,
+            max_speed: None,
+            max_retries: 8,
+            stall_timeout_secs: 30,
         }
     }
 }
