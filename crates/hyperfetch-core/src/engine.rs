@@ -25,7 +25,7 @@ use crate::hls::HlsError;
 use crate::mirror::MirrorRacer;
 use crate::range::{compute_gaps, ByteRange};
 use crate::state::DownloadState;
-use crate::storage::{DiskWriter, StorageError, VerifyError};
+use crate::storage::{verify_digest, DiskWriter, FileDigest, StorageError, VerifyError};
 use crate::worker::{
     authorize, content_length, retry_after, Auth, FailureKind, HttpWorker, RateLimiter, WorkerEvent, WorkerShared,
 };
@@ -256,7 +256,7 @@ impl DownloadEngine {
                     )
                     .await
                     .map_err(|e| e.to_string())?;
-                    return self.finish_external(path, started_at).await;
+                    return self.finish_external(path, started_at, None).await;
                 }
                 // Fetched, but not a playlist after all: try it as a plain file.
                 Err(HlsError::InvalidPlaylist(reason)) => {
@@ -366,38 +366,20 @@ impl DownloadEngine {
         )
         .await;
         let _ = forwarder.await;
-        self.finish_external(res?, started_at).await
+        self.finish_external(res?, started_at, None).await
     }
 
-    /// Checks the expected checksum of a file another engine (yt-dlp, HLS) finished, in one
-    /// read-only pass off the runtime, and records it in history. A mismatch is an error; the
-    /// file is left in place for the user to inspect.
-    async fn finish_external(&self, path: PathBuf, started_at: u64) -> Result<PathBuf, String> {
-        let hashed = {
-            let (path, expected) = (path.clone(), self.options.expected_checksum.clone());
-            blocking(move || crate::storage::hash_and_verify_file(&path, expected.as_deref())).await?
-        };
-        let blake3_hex = hashed.map_err(|e| e.to_string())?;
+    /// Checks the expected checksum of a file another engine (yt-dlp, HLS) finished and records
+    /// it in history. `digest`, from an engine that hashed the file as it wrote it (see
+    /// [`StreamHasher`]), spares reading it back; without one it is read once, off the runtime. A
+    /// mismatch is an error; the file is left in place for the user to inspect.
+    async fn finish_external(&self, path: PathBuf, started_at: u64, digest: Option<FileDigest>) -> Result<PathBuf, String> {
+        let written = digest.map_or(Written::File, Written::Digest);
+        let blake3_hex = self.verify_written(&path, written).await.map_err(|e| e.to_string())?;
         if self.options.expected_checksum.is_some() {
             tracing::info!("Checksum verification passed for {}", path.display());
         }
-
-        let urls = self.url_strings();
-        let recorded = path.clone();
-        let _ = blocking(move || {
-            let size = std::fs::metadata(&recorded).map(|m| m.len()).unwrap_or(0);
-            let mut entry = HistoryEntry::new(file_name_of(&recorded), absolute(&recorded), size, urls);
-            entry.downloaded_bytes = size;
-            entry.status = HistoryStatus::Completed;
-            entry.blake3_hash = Some(blake3_hex);
-            entry.started_at = started_at;
-            entry.completed_at = Some(unix_now());
-            let history = DownloadHistoryManager::default_history_path();
-            if let Err(e) = DownloadHistoryManager::record(&history, entry) {
-                tracing::warn!("Failed to update history file {:?}: {}", history, e);
-            }
-        })
-        .await;
+        self.record_completed(path.clone(), None, blake3_hex, started_at).await;
         Ok(path)
     }
 
@@ -530,45 +512,53 @@ impl DownloadEngine {
             reference.accepts_ranges
         );
         let prefetched = reference.prefetch.clone();
-        match reference.size {
+        let written = match reference.size {
             // The probe brought the whole file.
             Some(size) if size == prefetched.len() as u64 => {
                 let path = part.clone();
-                blocking(move || -> Result<(), StorageError> {
+                let writer = blocking(move || -> Result<DiskWriter, StorageError> {
                     let writer = DiskWriter::open_or_create(&path, size)?;
                     writer.write_chunk_slice(0, &prefetched)?;
-                    writer.sync()
+                    writer.sync()?;
+                    Ok(writer)
                 })
                 .await?
-                .map_err(|e| format!("Failed to write {}: {}", part.display(), e))?
+                .map_err(|e| format!("Failed to write {}: {}", part.display(), e))?;
+                Written::Writer(writer)
             }
             Some(size) if reference.accepts_ranges => {
                 let per_connection = reference.per_setup.map_or(BYTES_PER_CONNECTION, |bytes| {
                     bytes.clamp(MIN_BYTES_PER_CONNECTION, BYTES_PER_CONNECTION)
                 });
-                self.fetch_ranges(
-                    client,
-                    size,
-                    prefetched,
-                    per_connection,
-                    &mirrors,
-                    state,
-                    &part,
-                    &state_path,
-                    &final_path,
-                    &snapshot_tx,
-                )
-                .await?
+                let writer = self
+                    .fetch_ranges(
+                        client,
+                        size,
+                        prefetched,
+                        per_connection,
+                        &mirrors,
+                        state,
+                        &part,
+                        &state_path,
+                        &final_path,
+                        &snapshot_tx,
+                    )
+                    .await?;
+                Written::Writer(writer)
             }
-            _ => self.fetch_stream(&client, &reference, &part, &final_path, &snapshot_tx).await?,
-        }
-        self.finalize(part, final_path, state_path, claim, started_at, &snapshot_tx).await
+            _ => {
+                self.fetch_stream(&client, &reference, &part, &final_path, &snapshot_tx).await?;
+                Written::File
+            }
+        };
+        self.finalize(final_path, claim, written, started_at, &snapshot_tx).await
     }
 
     /// Multi-connection download of a file whose size is known and whose server honours ranges.
     /// `prefetch`, the file's first bytes from the probe, counts as downloaded; it is written
     /// wherever the resumed state does not already hold those bytes. Every `per_connection`
-    /// missing bytes justify one connection, up to the limit.
+    /// missing bytes justify one connection, up to the limit. Returns the writer, with what it
+    /// hashed on the way, for `finalize`.
     #[allow(clippy::too_many_arguments)]
     async fn fetch_ranges(
         &self,
@@ -582,7 +572,7 @@ impl DownloadEngine {
         state_path: &Path,
         final_path: &Path,
         snapshot_tx: &Option<broadcast::Sender<EngineSnapshot>>,
-    ) -> Result<(), String> {
+    ) -> Result<DiskWriter, String> {
         let unwritten = compute_gaps(prefetch.len() as u64, &state.completed_ranges);
         let mut have = state.completed_ranges.clone();
         have.extend(ByteRange::from_len(0, prefetch.len() as u64));
@@ -607,8 +597,10 @@ impl DownloadEngine {
 
         let writer = {
             let part = part.to_path_buf();
+            let (on_disk, checksum) = (state.completed_ranges.clone(), self.options.expected_checksum.clone());
             blocking(move || {
                 let writer = DiskWriter::open_or_create(&part, size)?;
+                writer.track_digest(&on_disk, checksum.as_deref());
                 for gap in unwritten {
                     writer.write_chunk_slice(gap.start, &prefetch[gap.start as usize..=gap.end as usize])?;
                 }
@@ -693,7 +685,8 @@ impl DownloadEngine {
                 let writer = job.writer.clone();
                 blocking(move || writer.sync())
                     .await?
-                    .map_err(|e| format!("Failed to flush download to disk: {}", e))
+                    .map_err(|e| format!("Failed to flush download to disk: {}", e))?;
+                Ok(job.writer)
             }
             Err(e) => {
                 if let Err(save_err) = job.persist().await {
@@ -850,23 +843,19 @@ impl DownloadEngine {
         }
     }
 
-    /// Verifies the finished `.part`, moves it to its final name and records it in history. The
-    /// claim on the name is released only once the file is in place (or discarded).
+    /// Verifies the finished `.part` of `final_path`, moves it to its final name and records it in
+    /// history. The claim on the name is released only once the file is in place (or discarded).
     async fn finalize(
         &self,
-        part: PathBuf,
         final_path: PathBuf,
-        state_path: PathBuf,
         claim: Claim,
+        written: Written,
         started_at: u64,
         snapshot_tx: &Option<broadcast::Sender<EngineSnapshot>>,
     ) -> Result<PathBuf, String> {
-        let expected = self.options.expected_checksum.clone();
-        let hashed = {
-            let part = part.clone();
-            blocking(move || crate::storage::hash_and_verify_file(&part, expected.as_deref())).await?
-        };
-        let blake3_hex = match hashed {
+        let part = part_path(&final_path);
+        let state_path = DownloadState::state_file_path(&part);
+        let blake3_hex = match self.verify_written(&part, written).await {
             Ok(hash) => hash,
             Err(VerifyError::Mismatch(e)) => {
                 // Resuming would only reproduce the same bytes, so start from scratch next time.
@@ -895,25 +884,65 @@ impl DownloadEngine {
         })
         .await??;
         tracing::info!("Download completed: {} (BLAKE3 {})", target.display(), blake3_hex);
+        self.record_completed(target.clone(), Some(size), blake3_hex, started_at).await;
 
-        let mut entry = HistoryEntry::new(file_name_of(&target), absolute(&target), size, self.url_strings());
-        entry.downloaded_bytes = size;
-        entry.status = HistoryStatus::Completed;
-        entry.blake3_hash = Some(blake3_hex);
-        entry.started_at = started_at;
-        entry.completed_at = Some(unix_now());
-        // Read once, under the history lock, rather than reuse the planning snapshot: the history
-        // may have been edited (entries removed, other downloads finished) while this one ran.
+        emit(snapshot_tx, || done_snapshot(size, &target));
+        Ok(target)
+    }
+
+    /// The BLAKE3 (hex) of the finished file at `path`, once its expected checksum is confirmed.
+    /// The digest comes from `written` where it can, else from reading the file. A mismatch found
+    /// without reading the whole file is confirmed by reading it before it counts: only the file
+    /// itself can condemn it.
+    async fn verify_written(&self, path: &Path, written: Written) -> Result<String, VerifyError> {
+        let expected = self.options.expected_checksum.clone();
+        let writer = match &written {
+            Written::Writer(writer) => Some(writer.clone()),
+            _ => None,
+        };
+        let read_back = matches!(written, Written::File);
+        let hash = {
+            let (path, expected) = (path.to_path_buf(), expected.clone());
+            move || match written {
+                Written::File => crate::storage::hash_and_verify_file(&path, expected.as_deref()),
+                Written::Writer(writer) => checked(&path, writer.digest(expected.as_deref()), expected.as_deref()),
+                Written::Digest(digest) => verify_digest(&digest, expected.as_deref()),
+            }
+        };
+        match blocking(hash).await.map_err(VerifyError::Io)? {
+            Err(VerifyError::Mismatch(e)) if !read_back => {
+                tracing::warn!("{}; reading {} back to be sure", e, path.display());
+                let path = path.to_path_buf();
+                blocking(move || match writer {
+                    Some(writer) => checked(&path, writer.full_digest(expected.as_deref()), expected.as_deref()),
+                    None => crate::storage::hash_and_verify_file(&path, expected.as_deref()),
+                })
+                .await
+                .map_err(VerifyError::Io)?
+            }
+            verified => verified,
+        }
+    }
+
+    /// Records `path` as completed in the download history, which is read only once, under its
+    /// lock: it may have been edited (entries removed, other downloads finished) while this
+    /// download ran. `size` is looked up if not given.
+    async fn record_completed(&self, path: PathBuf, size: Option<u64>, blake3_hex: String, started_at: u64) {
+        let urls = self.url_strings();
         let _ = blocking(move || {
+            let size = size.unwrap_or_else(|| std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0));
+            let mut entry = HistoryEntry::new(file_name_of(&path), absolute(&path), size, urls);
+            entry.downloaded_bytes = size;
+            entry.status = HistoryStatus::Completed;
+            entry.blake3_hash = Some(blake3_hex);
+            entry.started_at = started_at;
+            entry.completed_at = Some(unix_now());
             let history = DownloadHistoryManager::default_history_path();
             if let Err(e) = DownloadHistoryManager::record(&history, entry) {
                 tracing::warn!("Failed to update history file {:?}: {}", history, e);
             }
         })
         .await;
-
-        emit(snapshot_tx, || done_snapshot(size, &target));
-        Ok(target)
     }
 
     /// Runs `fut` with a timeout, returning early if the download is cancelled.
@@ -958,6 +987,22 @@ impl DownloadEngine {
     fn stall_timeout(&self) -> Duration {
         Duration::from_secs(self.options.stall_timeout_secs.max(1))
     }
+}
+
+/// What a finished download hands `finalize` for the file's digest.
+enum Written {
+    /// Nothing: the file is read back.
+    File,
+    /// The writer that wrote it, which hashed most of it on the way (see [`DiskWriter::digest`]).
+    Writer(DiskWriter),
+    /// Taken while the file was written in order (see [`StreamHasher`]).
+    Digest(FileDigest),
+}
+
+/// Checks `digest`, a digest of the file at `path` (reading it if needed), against `expected`.
+fn checked(path: &Path, digest: std::io::Result<FileDigest>, expected: Option<&str>) -> Result<String, VerifyError> {
+    let digest = digest.map_err(|e| VerifyError::Io(format!("Failed to read {}: {}", path.display(), e)))?;
+    verify_digest(&digest, expected)
 }
 
 /// Chooses and claims the HLS output name. Walks `base`, `base (1)`, ... and takes the first name
@@ -2864,6 +2909,42 @@ mod tests {
         std::fs::write(&base, vec![7u8; 1000]).unwrap();
         assert!(matches!(plan_target(&base, &remote(1000), &urls(), &history, None).unwrap(), Plan::AlreadyDone(_)));
         assert_eq!(reads(), before + 1);
+    }
+
+    fn engine_with(options: DownloadOptions) -> DownloadEngine {
+        DownloadEngine::new(vec![Url::parse("http://example.com/file.bin").unwrap()], options)
+    }
+
+    /// A `.part` of `final_path` holding `data`, written through a writer that hashed it.
+    fn written_part(final_path: &Path, data: &[u8]) -> DiskWriter {
+        let writer = DiskWriter::open_or_create(part_path(final_path), data.len() as u64).unwrap();
+        writer.write_chunk_slice(0, data).unwrap();
+        writer
+    }
+
+    #[tokio::test]
+    async fn test_a_mismatch_found_while_writing_is_confirmed_by_reading_the_file() {
+        let dir = tempdir().unwrap();
+        let (seen, on_disk) = (vec![1u8; 5000], vec![2u8; 5000]);
+        let checksum = Some(blake3::hash(&on_disk).to_hex().to_string());
+
+        // The bytes on disk are not the ones the writer hashed: the checksum decides by the file.
+        let target = dir.path().join("kept.bin");
+        let writer = written_part(&target, &seen);
+        std::io::Write::write_all(&mut File::options().write(true).open(part_path(&target)).unwrap(), &on_disk).unwrap();
+        let engine = engine_with(DownloadOptions { expected_checksum: checksum.clone(), ..Default::default() });
+        let claim = Claim::try_take(&target).unwrap().unwrap();
+        let done = engine.finalize(target.clone(), claim, Written::Writer(writer), unix_now(), &None).await;
+        assert_eq!(done.unwrap(), target);
+        assert_eq!(std::fs::read(&target).unwrap(), on_disk);
+
+        // A file that really differs is still discarded.
+        let target = dir.path().join("discarded.bin");
+        let writer = written_part(&target, &seen);
+        let claim = Claim::try_take(&target).unwrap().unwrap();
+        let err = engine.finalize(target.clone(), claim, Written::Writer(writer), unix_now(), &None).await.unwrap_err();
+        assert!(err.contains("Checksum verification failed"), "{err}");
+        assert!(!part_path(&target).exists() && !target.exists());
     }
 
     #[tokio::test]
