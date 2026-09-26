@@ -107,10 +107,18 @@ fn normalize(entries: &mut Vec<HistoryEntry>) {
     entries.truncate(MAX_ENTRIES);
 }
 
+#[cfg(test)]
+thread_local! {
+    /// History file reads made on this thread.
+    pub(crate) static READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Reads the history file. A file that cannot be parsed reads as an empty list; with `backup` it
 /// is also moved aside to `<path>.corrupt-<suffix>` (never overwritten). Only a caller holding the
 /// history lock may back up, or it could move away a valid file another process just wrote.
 fn read_entries(path: &Path, backup: bool) -> io::Result<Vec<HistoryEntry>> {
+    #[cfg(test)]
+    READS.with(|n| n.set(n.get() + 1));
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
@@ -297,6 +305,13 @@ impl DownloadHistoryManager {
         Ok(())
     }
 
+    /// Adds `entry` to the history file at `path`, replacing any entry with the same id or the
+    /// same file path, without loading the history first: the file is read once, under the lock,
+    /// as [`DownloadHistoryManager::save`] does.
+    pub fn record(path: &Path, entry: HistoryEntry) -> io::Result<()> {
+        Self { entries: Vec::new(), custom_path: Some(path.to_path_buf()), pending: vec![Change::Upsert(entry)] }.save()
+    }
+
     /// Adds `entry`, replacing any entry with the same id or the same file path.
     pub fn add_or_update(&mut self, entry: HistoryEntry) {
         self.modify(Change::Upsert(entry));
@@ -481,6 +496,25 @@ mod tests {
         assert!(gui.remove_entry(&x_id));
         cli.save().unwrap();
         assert_eq!(names_on_disk(&history_path), ["offline.bin"]);
+    }
+
+    #[test]
+    fn record_reads_the_history_once_and_keeps_other_entries() {
+        let dir = tempdir().unwrap();
+        let history_path = dir.path().join("history.json");
+        let mut other = DownloadHistoryManager::load_from_path(&history_path);
+        other.add_or_update(entry("old.bin", dir.path()));
+        let mut replaced = entry("same.bin", dir.path());
+        other.add_or_update(replaced.clone());
+
+        replaced.file_size = 99;
+        let reads = READS.with(std::cell::Cell::get);
+        DownloadHistoryManager::record(&history_path, replaced).unwrap();
+        assert_eq!(READS.with(std::cell::Cell::get) - reads, 1, "one read, under the lock");
+
+        assert_eq!(names_on_disk(&history_path), ["old.bin", "same.bin"]);
+        let on_disk = DownloadHistoryManager::load_from_path(&history_path);
+        assert_eq!(on_disk.entries().iter().find(|e| e.file_name == "same.bin").unwrap().file_size, 99);
     }
 
     #[test]

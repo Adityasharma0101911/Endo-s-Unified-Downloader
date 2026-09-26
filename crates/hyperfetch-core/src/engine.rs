@@ -392,7 +392,10 @@ impl DownloadEngine {
             entry.blake3_hash = Some(blake3_hex);
             entry.started_at = started_at;
             entry.completed_at = Some(unix_now());
-            DownloadHistoryManager::load().add_or_update(entry);
+            let history = DownloadHistoryManager::default_history_path();
+            if let Err(e) = DownloadHistoryManager::record(&history, entry) {
+                tracing::warn!("Failed to update history file {:?}: {}", history, e);
+            }
         })
         .await;
         Ok(path)
@@ -483,7 +486,7 @@ impl DownloadEngine {
                 if let Some(dir) = base.parent().filter(|d| !d.as_os_str().is_empty()) {
                     std::fs::create_dir_all(dir).map_err(|e| format!("Failed to create {}: {}", dir.display(), e))?;
                 }
-                let history = DownloadHistoryManager::load();
+                let history = DownloadHistoryManager::default_history_path();
                 plan_target(&base, &remote, &urls, &history, checksum.as_deref())
             })
             .await?
@@ -899,9 +902,15 @@ impl DownloadEngine {
         entry.blake3_hash = Some(blake3_hex);
         entry.started_at = started_at;
         entry.completed_at = Some(unix_now());
-        // Re-read rather than reuse the planning snapshot: the history may have been edited
-        // (entries removed, other downloads finished) while this one ran.
-        let _ = blocking(move || DownloadHistoryManager::load().add_or_update(entry)).await;
+        // Read once, under the history lock, rather than reuse the planning snapshot: the history
+        // may have been edited (entries removed, other downloads finished) while this one ran.
+        let _ = blocking(move || {
+            let history = DownloadHistoryManager::default_history_path();
+            if let Err(e) = DownloadHistoryManager::record(&history, entry) {
+                tracing::warn!("Failed to update history file {:?}: {}", history, e);
+            }
+        })
+        .await;
 
         emit(snapshot_tx, || done_snapshot(size, &target));
         Ok(target)
@@ -1623,14 +1632,17 @@ pub fn discard_partial(final_path: &Path) -> Result<usize, String> {
 /// is already this exact file, or that it can claim and that holds our resumable (or stale)
 /// `.part` or is free. Existing files, claimed names and other downloads' `.part` files are never
 /// touched. Our `.part` holding progress that no mirror can resume right now (`remote` takes ranges
-/// if any mirror serving the file does) fails the plan and is kept.
+/// if any mirror serving the file does) fails the plan and is kept. The history file at
+/// `history_path` is read only if an existing file has to be compared with it.
 fn plan_target(
     base: &Path,
     remote: &ProbeInfo,
     urls: &[String],
-    history: &DownloadHistoryManager,
+    history_path: &Path,
     checksum: Option<&str>,
 ) -> Result<Plan, String> {
+    let loaded = std::cell::OnceCell::new();
+    let history = || loaded.get_or_init(|| DownloadHistoryManager::load_from_path(history_path));
     let mut n = 0;
     loop {
         let candidate = numbered(base, n);
@@ -1684,12 +1696,12 @@ fn plan_target(
 
 /// An existing file counts as this download only if the checksum says so, or history recorded
 /// this exact path completing from one of these URLs with this size, and the server's
-/// Last-Modified is not newer than that download.
-fn already_downloaded(
+/// Last-Modified is not newer than that download. `history` is consulted only in that last case.
+fn already_downloaded<'h>(
     path: &Path,
     remote: &ProbeInfo,
     urls: &[String],
-    history: &DownloadHistoryManager,
+    history: impl FnOnce() -> &'h DownloadHistoryManager,
     checksum: Option<&str>,
 ) -> bool {
     if !path.is_file() {
@@ -1706,7 +1718,7 @@ fn already_downloaded(
     }
     let path = absolute(path);
     let modified = remote.last_modified.as_deref().and_then(parse_http_date);
-    history.entries().iter().any(|e| {
+    history().entries().iter().any(|e| {
         e.status == HistoryStatus::Completed
             && absolute(&e.file_path) == path
             && e.file_size == size
@@ -2557,7 +2569,7 @@ mod tests {
     fn test_plan_skips_a_name_claimed_by_another_download() {
         let dir = tempdir().unwrap();
         let base = dir.path().join("file.bin");
-        let history = DownloadHistoryManager::load_from_path(&dir.path().join("h.json"));
+        let history = dir.path().join("h.json");
         // Another download planned this name but has not created its .part yet.
         let other = Claim::try_take(&base).unwrap().unwrap();
         match plan_target(&base, &remote(1000), &urls(), &history, None).unwrap() {
@@ -2690,7 +2702,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let base = dir.path().join("file.bin");
         std::fs::write(&base, vec![7u8; 1000]).unwrap(); // same name AND same size
-        let history = DownloadHistoryManager::load_from_path(&dir.path().join("h.json"));
+        let history = dir.path().join("h.json");
         match plan_target(&base, &remote(1000), &urls(), &history, None).unwrap() {
             Plan::Fetch { final_path, resume: None, .. } => assert_eq!(final_path, dir.path().join("file (1).bin")),
             other => panic!("{other:?}"),
@@ -2704,14 +2716,15 @@ mod tests {
         let dir = tempdir().unwrap();
         let base = dir.path().join("file.bin");
         std::fs::write(&base, vec![7u8; 1000]).unwrap();
-        let mut history = DownloadHistoryManager::load_from_path(&dir.path().join("h.json"));
+        let history = dir.path().join("h.json");
+        let mut recorded = DownloadHistoryManager::load_from_path(&history);
 
         // Same name and URL, but recorded in another directory: not this file.
         let elsewhere = dir.path().join("other").join("file.bin");
-        history.add_or_update(completed_entry(&elsewhere, 1000, urls()));
+        recorded.add_or_update(completed_entry(&elsewhere, 1000, urls()));
         assert!(matches!(plan_target(&base, &remote(1000), &urls(), &history, None).unwrap(), Plan::Fetch { .. }));
 
-        history.add_or_update(completed_entry(&base, 1000, urls()));
+        recorded.add_or_update(completed_entry(&base, 1000, urls()));
         assert!(matches!(
             plan_target(&base, &remote(1000), &urls(), &history, None).unwrap(),
             Plan::AlreadyDone(p) if p == base
@@ -2728,7 +2741,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let base = dir.path().join("file.bin");
         std::fs::write(&base, b"hello").unwrap();
-        let history = DownloadHistoryManager::load_from_path(&dir.path().join("h.json"));
+        let history = dir.path().join("h.json");
         let good = Some("md5:5d41402abc4b2a76b9719d911017c592");
         let bad = Some("md5:00000000000000000000000000000000");
         assert!(matches!(plan_target(&base, &remote(5), &urls(), &history, good).unwrap(), Plan::AlreadyDone(_)));
@@ -2741,7 +2754,7 @@ mod tests {
         let base = dir.path().join("file.bin");
         let part = part_path(&base);
         let part_state = DownloadState::state_file_path(&part);
-        let history = DownloadHistoryManager::load_from_path(&dir.path().join("h.json"));
+        let history = dir.path().join("h.json");
 
         std::fs::write(&part, vec![1u8; 1000]).unwrap();
         state_for(1000, "\"v1\"", urls()).save_atomic(&part_state).unwrap();
@@ -2814,7 +2827,7 @@ mod tests {
         let base = dir.path().join("file.bin");
         std::fs::write(&base, vec![3u8; 1000]).unwrap();
         state_for(1000, "\"v1\"", urls()).save_atomic(&DownloadState::state_file_path(&base)).unwrap();
-        let history = DownloadHistoryManager::load_from_path(&dir.path().join("h.json"));
+        let history = dir.path().join("h.json");
 
         match plan_target(&base, &remote(1000), &urls(), &history, None).unwrap() {
             Plan::Fetch { final_path, resume: Some(_), .. } => assert_eq!(final_path, base),
@@ -2835,6 +2848,22 @@ mod tests {
         r.etag = None;
         r.last_modified = Some("Sun, 06 Nov 1994 08:49:37 GMT".into());
         assert!(validators_compatible(&state, &r), "nothing comparable");
+    }
+
+    #[test]
+    fn test_plan_reads_history_only_to_judge_an_existing_file() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().join("file.bin");
+        let history = dir.path().join("h.json");
+        DownloadHistoryManager::load_from_path(&history).add_or_update(completed_entry(&base, 1000, urls()));
+        let reads = || crate::history::READS.with(std::cell::Cell::get);
+        let before = reads();
+
+        assert!(matches!(plan_target(&base, &remote(1000), &urls(), &history, None).unwrap(), Plan::Fetch { .. }));
+        assert_eq!(reads(), before, "no file to judge, so no history to read");
+        std::fs::write(&base, vec![7u8; 1000]).unwrap();
+        assert!(matches!(plan_target(&base, &remote(1000), &urls(), &history, None).unwrap(), Plan::AlreadyDone(_)));
+        assert_eq!(reads(), before + 1);
     }
 
     #[tokio::test]
