@@ -1323,6 +1323,40 @@ impl Drop for Claim {
     }
 }
 
+/// Exclusive use of a download target: the same claim a running download holds, so tools such as
+/// repair or leftover cleanup never touch a `.part` another download (in any process) is writing.
+/// Released on drop.
+pub struct TargetClaim {
+    _claim: Claim,
+}
+
+/// Claims `final_path`, or returns `None` while a download holds it. Blocking.
+pub fn claim_target(final_path: &Path) -> Result<Option<TargetClaim>, String> {
+    Ok(Claim::try_take(final_path)?.map(|claim| TargetClaim { _claim: claim }))
+}
+
+/// Deletes the partial files of `final_path` (`.part`, `.part.hfstate`, `.part.hlsstate`) and
+/// returns how many existed. Never touches the final file. Fails while a download holds the
+/// target. Blocking.
+pub fn discard_partial(final_path: &Path) -> Result<usize, String> {
+    let Some(_claim) = claim_target(final_path)? else {
+        return Err(format!("{} is still being downloaded", final_path.display()));
+    };
+    let part = part_path(final_path);
+    let mut hls_state = part.clone().into_os_string();
+    hls_state.push(".hlsstate");
+    // The data goes first: if a state file then fails to delete, it no longer matches anything.
+    let mut removed = 0;
+    for path in [part.clone(), DownloadState::state_file_path(&part), PathBuf::from(hls_state)] {
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("Failed to delete {}: {}", path.display(), e)),
+        }
+    }
+    Ok(removed)
+}
+
 /// Chooses the output path. Walks `name`, `name (1)`, `name (2)`... and takes the first one that
 /// is already this exact file, or that it can claim and that holds our resumable (or stale)
 /// `.part` or is free. Existing files, claimed names and other downloads' `.part` files are never
@@ -1908,6 +1942,27 @@ mod tests {
         assert_eq!(to_user.headers()[reqwest::header::AUTHORIZATION], "Bearer secret");
         let to_other = authorize(client.get(third_party.clone()), auth, &third_party).build().unwrap();
         assert!(!to_other.headers().contains_key(reqwest::header::AUTHORIZATION));
+    }
+
+    #[test]
+    fn test_discard_partial_respects_the_claim_and_spares_the_final_file() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("file.bin");
+        std::fs::write(&target, b"finished").unwrap();
+        let part = part_path(&target);
+        for p in [part.clone(), DownloadState::state_file_path(&part), dir.path().join("file.bin.part.hlsstate")] {
+            std::fs::write(p, b"x").unwrap();
+        }
+
+        let running = claim_target(&target).unwrap().expect("free target");
+        assert!(discard_partial(&target).is_err(), "a claimed target must not be cleaned");
+        assert!(part.exists());
+        drop(running);
+
+        assert_eq!(discard_partial(&target).unwrap(), 3);
+        assert!(!part.exists() && !lock_path(&target).exists());
+        assert_eq!(std::fs::read(&target).unwrap(), b"finished");
+        assert_eq!(discard_partial(&target).unwrap(), 0);
     }
 
     #[test]

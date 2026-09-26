@@ -19,7 +19,7 @@ pub use chunk::{Chunk, ChunkManager, ChunkStatus, ChunkError};
 pub use mirror::{Mirror, MirrorRacer};
 pub use storage::{DiskWriter, StorageError};
 pub use state::{DownloadState, StateError};
-pub use engine::{DownloadEngine, DownloadOptions, EngineSnapshot};
+pub use engine::{claim_target, discard_partial, DownloadEngine, DownloadOptions, EngineSnapshot, TargetClaim};
 pub use resolver::SmartResolver;
 pub use hls::{HlsEngine, HlsSegment, HlsError, parse_hls_playlist};
 pub use metalink::{parse_metalink, MetalinkFile};
