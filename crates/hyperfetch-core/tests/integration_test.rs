@@ -86,6 +86,8 @@ struct Mock {
     head_status: Option<u16>,
     /// HEAD answers only after this long.
     head_delay: Duration,
+    /// Every request waits this long for its answer, like a round trip over a slow network.
+    latency: Duration,
     /// Only HEAD carries the ETag.
     etag_only_on_head: bool,
     /// Any GET with a Range header gets 400.
@@ -147,6 +149,7 @@ impl Mock {
             empty_head: false,
             head_status: None,
             head_delay: Duration::ZERO,
+            latency: Duration::ZERO,
             etag_only_on_head: false,
             rejects_range: false,
             busy_probes: AtomicUsize::new(0),
@@ -208,6 +211,7 @@ async fn handle(mut socket: TcpStream, mock: Arc<Mock>) {
     let _open = ActiveGuard(&s.open);
     let Some(head) = read_head(&mut socket).await else { return };
     s.requests.fetch_add(1, Ordering::SeqCst);
+    tokio::time::sleep(mock.latency).await;
     let mut lines = head.lines();
     let method = lines.next().unwrap_or("").split(' ').next().unwrap_or("").to_string();
     let header = |name: &str| {
@@ -1306,11 +1310,14 @@ async fn test_small_file_takes_one_get_and_no_worker() {
 }
 
 #[tokio::test]
-async fn test_connections_follow_the_size_of_the_file() {
+async fn test_connections_follow_the_size_of_the_file_on_a_fast_server() {
     let _history = setup().await;
     let data = payload(3 * PREFETCH, 167);
-    let mock = Arc::new(Mock::new(data.clone()));
-    mock.delay_us.store(1_000, Ordering::SeqCst); // long enough for connections to overlap
+    let mut mock = Mock::new(data.clone());
+    // Connections take 50 ms to answer, then the probe's MiB arrives before any rate is measured:
+    // a connection per MiB, as more would spend longer starting than fetching.
+    mock.latency = Duration::from_millis(50);
+    let mock = Arc::new(mock);
     let url = serve(Arc::clone(&mock), "three.bin").await;
     let temp = tempdir().unwrap();
     let out = temp.path().join("three.bin");
@@ -1385,12 +1392,14 @@ async fn test_resume_with_prefetch_overlapping_completed_state() {
 }
 
 #[tokio::test]
-async fn test_slow_probe_holds_up_the_workers_only_for_a_small_file() {
+async fn test_a_capped_probe_hands_the_rest_to_workers() {
     let _history = setup().await;
-    for (size, whole) in [(512 * KB, true), (3 * PREFETCH, false)] {
+    // ~3 MB/s per connection, and new connections start at once: even a file the probe could
+    // bring alone is fetched over several.
+    for size in [PREFETCH, 3 * PREFETCH] {
         let data = payload(size, 191);
         let mock = Arc::new(Mock::new(data.clone()));
-        mock.delay_us.store(20_000, Ordering::SeqCst); // ~0.8 MB/s per connection
+        mock.delay_us.store(5_000, Ordering::SeqCst);
         let url = serve(Arc::clone(&mock), "slow_probe.bin").await;
         let temp = tempdir().unwrap();
         let out = temp.path().join("slow_probe.bin");
@@ -1400,12 +1409,9 @@ async fn test_slow_probe_holds_up_the_workers_only_for_a_small_file() {
 
         assert_file(&out, &data);
         let s = &mock.stats;
-        if whole {
-            assert_eq!(s.gets.load(Ordering::SeqCst), 0, "the probe alone brings a small file, however slowly");
-        } else {
-            let probed = s.probe_bytes.load(Ordering::SeqCst);
-            assert!(probed < PREFETCH as u64 / 2, "workers waited for {probed} bytes from the probe");
-        }
+        let probed = s.probe_bytes.load(Ordering::SeqCst);
+        assert!(probed < size as u64 / 2, "workers waited for {probed} of {size} bytes from the probe");
+        assert!(mock.served_ranges().len() >= 2, "{size}: the rest is fetched in parallel");
     }
 }
 

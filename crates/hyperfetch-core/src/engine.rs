@@ -48,8 +48,14 @@ const PREFETCH: u64 = 1024 * 1024;
 /// Longest the probe reads the start of a file larger than `PREFETCH`: the workers wait for it,
 /// and together they fetch those bytes faster than one connection.
 const PREFETCH_TIME: Duration = Duration::from_millis(250);
-/// Missing bytes that justify one more connection: for less, its handshakes cost more than it saves.
+/// Shortest interval over which the probe measures its rate: shorter ones see bursts, not a rate.
+const MIN_RATE_TICK: Duration = Duration::from_millis(20);
+/// Missing bytes that justify one more connection when the probe measured no rate: for less, its
+/// handshakes cost more than it saves. Also the most one connection is asked to carry before
+/// another one pays off.
 const BYTES_PER_CONNECTION: u64 = 1024 * 1024;
+/// Fewest missing bytes that justify one more connection, whatever the probe measured.
+const MIN_BYTES_PER_CONNECTION: u64 = 64 * 1024;
 /// Fetching the playlists and each AES key may retry every request with backoff.
 const HLS_PARSE_TIMEOUT: Duration = Duration::from_secs(120);
 /// Longest file name we create, in bytes: leaves room for " (n)" and ".part.hfstate.tmp" under
@@ -376,6 +382,7 @@ impl DownloadEngine {
     /// Probes all mirrors concurrently; returns the reference probe and the mirrors that serve the same file.
     async fn probe_all(&self, client: &Client, urls: &[Url]) -> Result<(ProbeInfo, Vec<ProbeInfo>), String> {
         let (limiter, stall) = (self.limiter(), self.stall_timeout());
+        let several_connections = self.options.num_connections > 1;
         // Owned values keep the future `Send` (a borrowing closure here is not general enough).
         let probes = futures_util::stream::iter(urls.iter().cloned().enumerate())
             .map(|(i, url)| {
@@ -386,10 +393,18 @@ impl DownloadEngine {
                         tokio::time::timeout(PROBE_TIMEOUT, probe_url(&client, auth.as_deref(), &url, i == 0))
                             .await
                             .unwrap_or_else(|_| Err(format!("{}: no answer within {}s", url, PROBE_TIMEOUT.as_secs())))?;
-                    if let Some((response, len)) = body {
+                    if let Some(body) = body {
                         // Only the start of a larger file keeps workers waiting.
-                        let deadline = (info.size != Some(len)).then(|| tokio::time::Instant::now() + PREFETCH_TIME);
-                        info.prefetch = read_prefix(response, len, deadline, stall, limiter.as_deref()).await;
+                        let deadline = (info.size != Some(body.len)).then(|| tokio::time::Instant::now() + PREFETCH_TIME);
+                        // Workers can take over early only where ranges work (without them only the
+                        // whole body is of use), there can be several, and no speed limit makes
+                        // every connection look capped.
+                        let pace = body
+                            .setup
+                            .filter(|_| info.accepts_ranges && several_connections && limiter.is_none())
+                            .map(|setup| Pace { answered: body.answered, setup });
+                        (info.prefetch, info.per_setup) =
+                            read_prefix(body.response, body.len, deadline, pace, stall, limiter.as_deref()).await;
                     }
                     Ok::<_, String>(info)
                 }
@@ -485,8 +500,22 @@ impl DownloadEngine {
                 .map_err(|e| format!("Failed to write {}: {}", part.display(), e))?
             }
             Some(size) if reference.accepts_ranges => {
-                self.fetch_ranges(client, size, prefetched, &mirrors, state, &part, &state_path, &final_path, &snapshot_tx)
-                    .await?
+                let per_connection = reference.per_setup.map_or(BYTES_PER_CONNECTION, |bytes| {
+                    bytes.clamp(MIN_BYTES_PER_CONNECTION, BYTES_PER_CONNECTION)
+                });
+                self.fetch_ranges(
+                    client,
+                    size,
+                    prefetched,
+                    per_connection,
+                    &mirrors,
+                    state,
+                    &part,
+                    &state_path,
+                    &final_path,
+                    &snapshot_tx,
+                )
+                .await?
             }
             _ => self.fetch_stream(&client, &reference, &part, &final_path, &snapshot_tx).await?,
         }
@@ -495,13 +524,15 @@ impl DownloadEngine {
 
     /// Multi-connection download of a file whose size is known and whose server honours ranges.
     /// `prefetch`, the file's first bytes from the probe, counts as downloaded; it is written
-    /// wherever the resumed state does not already hold those bytes.
+    /// wherever the resumed state does not already hold those bytes. Every `per_connection`
+    /// missing bytes justify one connection, up to the limit.
     #[allow(clippy::too_many_arguments)]
     async fn fetch_ranges(
         &self,
         client: Client,
         size: u64,
         prefetch: Bytes,
+        per_connection: u64,
         mirrors: &[ProbeInfo],
         state: DownloadState,
         part: &Path,
@@ -512,11 +543,11 @@ impl DownloadEngine {
         let unwritten = compute_gaps(prefetch.len() as u64, &state.completed_ranges);
         let mut have = state.completed_ranges.clone();
         have.extend(ByteRange::from_len(0, prefetch.len() as u64));
-        // About one connection per MiB still missing, up to the limit: a small file arrives
-        // sooner over one connection than over many TCP and TLS handshakes.
+        // A connection must carry enough to repay its handshakes: a small file arrives sooner over
+        // one connection than over many, unless the server caps each connection's speed.
         let remaining: u64 = compute_gaps(size, &have).iter().map(ByteRange::len).sum();
         let max_workers = self.options.num_connections.clamp(1, 64) as u64;
-        let num_workers = remaining.div_ceil(BYTES_PER_CONNECTION).clamp(1, max_workers) as usize;
+        let num_workers = remaining.div_ceil(per_connection).clamp(1, max_workers) as usize;
         let chunk_size = effective_chunk_size(remaining, num_workers as u64, self.options.base_chunk_size);
         let min_steal = if self.options.min_steal_threshold != DEFAULT_MIN_STEAL {
             self.options.min_steal_threshold
@@ -1081,6 +1112,9 @@ struct ProbeInfo {
     last_modified: Option<String>,
     /// The file's first bytes, from the response whose validators these are.
     prefetch: Bytes,
+    /// Bytes the probe's connection moved, at the rate it reached, in the time a new connection
+    /// takes to answer. `None` when no rate was measured.
+    per_setup: Option<u64>,
 }
 
 impl ProbeInfo {
@@ -1109,8 +1143,29 @@ impl ProbeInfo {
             etag: header(ETAG),
             last_modified: header(LAST_MODIFIED),
             prefetch: Bytes::new(),
+            per_setup: None,
         }
     }
+}
+
+/// A probe response whose body is the start of the file (or all of it).
+struct ProbeBody {
+    response: Response,
+    /// Body bytes to keep.
+    len: u64,
+    /// When the answer arrived.
+    answered: tokio::time::Instant,
+    /// How long the request waited for it, when that was the first try: a retry may reuse the
+    /// connection, so its wait says nothing about what a new one needs.
+    setup: Option<Duration>,
+}
+
+/// Lets `read_prefix` measure the rate from when the answer arrived.
+#[derive(Clone, Copy)]
+struct Pace {
+    answered: tokio::time::Instant,
+    /// What a new connection needs before its first byte: the probe's own wait for an answer.
+    setup: Duration,
 }
 
 /// Learns size, range support, name and validators. HEAD is only a hint: servers and proxies
@@ -1128,7 +1183,7 @@ async fn probe_url(
     auth: Option<&Auth>,
     url: &Url,
     prefetch: bool,
-) -> Result<(ProbeInfo, Option<(Response, u64)>), String> {
+) -> Result<(ProbeInfo, Option<ProbeBody>), String> {
     let head = async {
         match authorize(client.head(url.clone()), auth, url).send().await {
             Ok(resp) if resp.status().is_success() => Some(resp),
@@ -1143,10 +1198,12 @@ async fn probe_url(
         }
     };
     let range = format!("bytes=0-{}", if prefetch { PREFETCH - 1 } else { 0 });
+    // Also when it answered and, for a first try, how long that took: what a connection needs to start.
     let ranged = async {
         let mut attempt = 0;
         loop {
             attempt += 1;
+            let sent_at = tokio::time::Instant::now();
             let sent = authorize(client.get(url.clone()), auth, url)
                 .header(RANGE, range.as_str())
                 .header(ACCEPT_ENCODING, "identity")
@@ -1162,17 +1219,21 @@ async fn probe_url(
                     drop(sent);
                     tokio::time::sleep(crate::chunk::backoff_delay(attempt).max(after).min(PROBE_RETRY_CAP)).await;
                 }
-                _ => break sent,
+                _ => {
+                    let answered = tokio::time::Instant::now();
+                    break (sent, answered, (attempt == 1).then(|| answered - sent_at));
+                }
             }
         }
     };
     // Once the GET has answered, a HEAD that is still out only gets a short grace: some servers
     // never answer HEAD, and the GET alone has everything needed.
     tokio::pin!(head, ranged);
-    let (head, ranged) = tokio::select! {
+    let (head, (ranged, answered, setup)) = tokio::select! {
         head = &mut head => (head, ranged.await),
         ranged = &mut ranged => (tokio::time::timeout(HEAD_GRACE, head).await.ok().flatten(), ranged),
     };
+    let body = |response: Response, len: u64| ProbeBody { response, len, answered, setup };
     let head_len = head.as_ref().and_then(|r| content_length(r.headers()));
     // Still busy or unreachable after every try: that says nothing about range support.
     let unanswered = ranged.as_ref().map_or(true, |resp| is_busy(resp.status()));
@@ -1206,7 +1267,7 @@ async fn probe_url(
             }
             let mut info = ProbeInfo::describe(url, &[&plain]);
             info.size = content_length(plain.headers());
-            let body = info.size.filter(|&n| prefetch && n <= PREFETCH).map(|n| (plain, n));
+            let body = info.size.filter(|&n| prefetch && n <= PREFETCH).map(|n| body(plain, n));
             return Ok((info, body));
         }
     };
@@ -1244,7 +1305,7 @@ async fn probe_url(
     };
     let own = |name: HeaderName| get.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_string);
     let own_validators = own(ETAG) == info.etag && own(LAST_MODIFIED) == info.last_modified;
-    let body = keep.filter(|_| prefetch && own_validators).map(|len| (get, len.min(PREFETCH)));
+    let body = keep.filter(|_| prefetch && own_validators).map(|len| body(get, len.min(PREFETCH)));
     Ok((info, body))
 }
 
@@ -1266,30 +1327,79 @@ fn accepts_bytes(headers: &HeaderMap) -> bool {
         .any(|unit| unit.trim().eq_ignore_ascii_case("bytes"))
 }
 
-/// Reads up to `len` bytes of a probe's body, waiting at most `stall` for each read and never
-/// past `deadline`. Whatever arrived is kept, even if the body ends early.
+/// Reads up to `len` bytes of a probe's body until `deadline`, giving up after `stall` without
+/// data. Whatever arrived is kept, even if the body ends early.
+///
+/// With `pace`, the rate is measured every half setup time. Two ticks in a row without it
+/// climbing mean TCP slow start (which new connections would go through too) is over and the
+/// server caps the connection; the returned bytes-per-setup then says what one connection carries
+/// in the time another needs to start. Reading stops there if the rest would take over two setup
+/// times: workers fetch it in parallel sooner, even after losing the bytes still in flight.
 async fn read_prefix(
     response: Response,
     len: u64,
     deadline: Option<tokio::time::Instant>,
+    pace: Option<Pace>,
     stall: Duration,
     limiter: Option<&RateLimiter>,
-) -> Bytes {
+) -> (Bytes, Option<u64>) {
     let mut body = response.bytes_stream();
     let mut kept = Vec::with_capacity(len as usize);
+    let mut last_byte_at = tokio::time::Instant::now();
+    let tick = pace.map_or(MIN_RATE_TICK, |p| (p.setup / 2).max(MIN_RATE_TICK));
+    // The window being measured, and when it is next looked at.
+    let (mut window_began, mut window_began_len) = (pace.map_or(last_byte_at, |p| p.answered), 0);
+    let mut next_tick = window_began + tick;
+    // The last rate measured, and whether it had stopped climbing.
+    let mut last: Option<(f64, bool)> = None;
+    let mut per_setup = None;
     while (kept.len() as u64) < len {
-        let wait = tokio::time::Instant::now() + stall;
-        let Ok(Some(Ok(bytes))) = tokio::time::timeout_at(deadline.map_or(wait, |d| d.min(wait)), body.next()).await
-        else {
-            break;
-        };
-        if let Some(limiter) = limiter {
-            limiter.acquire(bytes.len() as u64).await;
+        let mut wake = last_byte_at + stall;
+        if pace.is_some() {
+            wake = wake.min(next_tick);
         }
-        let take = bytes.len().min(len as usize - kept.len());
-        kept.extend_from_slice(&bytes[..take]);
+        if let Some(deadline) = deadline {
+            wake = wake.min(deadline);
+        }
+        match tokio::time::timeout_at(wake, body.next()).await {
+            Ok(Some(Ok(bytes))) => {
+                if let Some(limiter) = limiter {
+                    limiter.acquire(bytes.len() as u64).await;
+                }
+                let take = bytes.len().min(len as usize - kept.len());
+                kept.extend_from_slice(&bytes[..take]);
+                last_byte_at = tokio::time::Instant::now();
+            }
+            Ok(_) => break,
+            Err(_) => {
+                let now = tokio::time::Instant::now();
+                let (Some(p), false, false) =
+                    (pace, now >= last_byte_at + stall, deadline.is_some_and(|d| now >= d))
+                else {
+                    break; // stalled, or out of time
+                };
+                next_tick = now + tick;
+                let got = kept.len() - window_began_len;
+                if got == 0 {
+                    continue; // a pause, not a rate: the window stays open, and stalls are timed above
+                }
+                let rate = got as f64 / (now - window_began).as_secs_f64();
+                let setup = p.setup.as_secs_f64();
+                let flat = last.is_some_and(|(prev, _)| rate < prev * 1.5);
+                if flat && last.is_some_and(|(_, was_flat)| was_flat) {
+                    per_setup = Some((rate * setup) as u64);
+                    if (len - kept.len() as u64) as f64 > 2.0 * rate * setup {
+                        break;
+                    }
+                } else if !flat {
+                    per_setup = None;
+                }
+                last = Some((rate, flat));
+                (window_began, window_began_len) = (now, kept.len());
+            }
+        }
     }
-    kept.into()
+    (kept.into(), per_setup)
 }
 
 /// Picks the reference probe and keeps the mirrors that serve the same file. The first successful
@@ -1931,6 +2041,7 @@ mod tests {
             etag: Some("\"v1\"".to_string()),
             last_modified: None,
             prefetch: Bytes::new(),
+            per_setup: None,
         }
     }
 
@@ -2081,6 +2192,57 @@ mod tests {
         assert_eq!(to_user.headers()[reqwest::header::AUTHORIZATION], "Bearer secret");
         let to_other = authorize(client.get(third_party.clone()), auth, &third_party).build().unwrap();
         assert!(!to_other.headers().contains_key(reqwest::header::AUTHORIZATION));
+    }
+
+    /// A body that sends each `(ms, bytes)` step `ms` after the one before.
+    fn paced(steps: Vec<(u64, usize)>) -> Response {
+        let chunks = futures_util::stream::unfold(steps.into_iter(), |mut steps| async move {
+            let (ms, n) = steps.next()?;
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+            Some((Ok::<_, std::io::Error>(Bytes::from(vec![7u8; n])), steps))
+        });
+        Response::from(http::Response::new(reqwest::Body::wrap_stream(chunks)))
+    }
+
+    /// Reads all of `body` as a probe whose answer took 40 ms, so its rate ticks every 20 ms.
+    async fn read_paced(body: Response, len: u64, paced_read: bool) -> (Bytes, Option<u64>) {
+        let pace = Pace { answered: tokio::time::Instant::now(), setup: Duration::from_millis(40) };
+        read_prefix(body, len, None, paced_read.then_some(pace), Duration::from_secs(1), None).await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_prefix_read_hands_a_capped_connection_to_workers() {
+        // 8 KiB per 3 ms from the first byte on (~2.7 MB/s), for 1 MiB: the rest would take far
+        // longer than two 40 ms setups, so workers take over, each worth ~40 ms of transfer.
+        let capped = || paced(std::iter::once((0, 8 * 1024)).chain(std::iter::repeat_n((3, 8 * 1024), 127)).collect());
+        let (bytes, per_setup) = read_paced(capped(), PREFETCH, true).await;
+        assert!(bytes.len() <= 256 * 1024, "{}", bytes.len());
+        let per_setup = per_setup.expect("a capped rate is measured");
+        assert!((80 * 1024..=140 * 1024).contains(&per_setup), "{per_setup}");
+
+        // Without ranges only the whole body is of use.
+        let (bytes, _) = read_paced(capped(), PREFETCH, false).await;
+        assert_eq!(bytes.len() as u64, PREFETCH);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_prefix_read_keeps_a_connection_in_slow_start() {
+        // Bursts doubling every round trip, the first with the headers and the next just before
+        // the first tick: one window looks flat (4+8 KiB, then 16), yet the rate is still
+        // climbing and new connections would start as slowly, so the probe keeps the whole file.
+        let steps = vec![(0, 4), (19, 8), (20, 16), (20, 32), (20, 64), (20, 128), (20, 4)];
+        let body = paced(steps.into_iter().map(|(ms, k)| (ms, k * 1024)).collect());
+        let (bytes, per_setup) = read_paced(body, 256 * 1024, true).await;
+        assert_eq!(bytes.len(), 256 * 1024);
+        assert_eq!(per_setup, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_prefix_read_gives_up_on_a_stalled_body() {
+        let silent = futures_util::stream::pending::<Result<Bytes, std::io::Error>>();
+        let body = Response::from(http::Response::new(reqwest::Body::wrap_stream(silent)));
+        let read = tokio::time::timeout(Duration::from_secs(5), read_paced(body, 256 * 1024, true)).await;
+        assert!(read.expect("the stall timeout ends the read").0.is_empty());
     }
 
     #[test]
