@@ -580,6 +580,7 @@ async fn verify_file(args: &Args, path: &Path, ui: &Ui, shutdown: &Shutdown) -> 
         total_size,
         &res.missing_ranges,
         &urls,
+        &tuning(args, args.connections),
         Some(cancel),
         move |done, total| {
             progress.set_length(total);
@@ -824,6 +825,8 @@ mod tests {
         let data: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 251) as u8).collect();
         let server = serve(data.clone()).await;
         let dir = test_dir("repair");
+        // The repair runs through the engine, which records the finished file in history.
+        std::env::set_var("ENDO_HISTORY_PATH", dir.join("history.json"));
         let final_file = dir.join("data.bin");
         let part = dir.join("data.bin.part");
         let mut on_disk = data.clone();

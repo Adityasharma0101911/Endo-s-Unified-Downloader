@@ -115,9 +115,9 @@ pub struct Args {
     #[arg(long = "verify", value_name = "FILE", conflicts_with = "input_file")]
     pub verify: Option<PathBuf>,
 
-    /// With --verify: re-download missing ranges (URLs from the command line, the file's resume
-    /// state or history for that exact path). The repair connects directly, so it cannot be
-    /// combined with --proxy, --header or cookies
+    /// With --verify: re-download missing ranges over up to -s connections (URLs from the command
+    /// line, the file's resume state or history for that exact path). The repair connects
+    /// directly, so it cannot be combined with --proxy, --header or cookies
     #[arg(long = "repair", requires = "verify")]
     pub repair: bool,
 }

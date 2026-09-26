@@ -583,6 +583,7 @@ impl App {
         }
         let (path, missing, urls) =
             (result.file_path.clone(), result.missing_ranges.clone(), verification.repair_urls.clone());
+        let options = self.settings.tuning();
         let cancel = Arc::new(AtomicBool::new(false));
         let progress = Arc::new(Mutex::new((0, missing.iter().map(|r| r.len()).sum())));
         let task = {
@@ -593,7 +594,8 @@ impl App {
                     ctx.request_repaint();
                 };
                 let result =
-                    verify::repair_missing_ranges(&path, total_size, &missing, &urls, Some(cancel), on_progress).await;
+                    verify::repair_missing_ranges(&path, total_size, &missing, &urls, &options, Some(cancel), on_progress)
+                        .await;
                 AppEvent::RepairFinished(result)
             })
         };
