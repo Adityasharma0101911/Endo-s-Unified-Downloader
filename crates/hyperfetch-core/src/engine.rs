@@ -312,7 +312,15 @@ impl DownloadEngine {
                         mirrors.push(url);
                     }
                 }
-                return Box::pin(self.fetch_resolved(client, mirrors, snapshot_tx, false)).await;
+                // The video is downloaded as if named along with the page: its history entry lists
+                // it, as its resume state does, so a repair finds it without the page. Credentials
+                // still go only to the hosts the user named, as they were scoped to when this
+                // engine was built.
+                let mut engine = self.clone();
+                if !engine.urls.contains(&video) {
+                    engine.urls.push(video);
+                }
+                return Box::pin(engine.fetch_resolved(client, mirrors, snapshot_tx, false)).await;
             }
         }
         self.download(client, probed, snapshot_tx).await
