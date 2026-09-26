@@ -1,1760 +1,1026 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::collections::VecDeque;
+mod settings;
+mod ui;
+mod util;
+
+use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use eframe::egui;
-use egui::{Color32, Pos2, Rect, Stroke, Vec2};
+use egui::Color32;
 use hyperfetch_core::chunk::ChunkSnapshot;
 use hyperfetch_core::engine::{DownloadEngine, DownloadOptions, EngineSnapshot};
-use tokio::sync::broadcast;
+use hyperfetch_core::history::{DownloadHistoryManager, HistoryEntry};
+use hyperfetch_core::queue::{DownloadQueue, QueueItem};
+use hyperfetch_core::verify::{self, BuildVerificationResult};
+use tokio::sync::{broadcast, Notify};
+use tokio::task::JoinHandle;
 use url::Url;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum DownloadStatus {
-    Idle,
-    Resolving,
-    Downloading,
-    Completed,
-    Failed(String),
-    Cancelled,
-}
+use settings::Settings;
+use util::{lock, Verdict};
+
+/// How long closing the window waits for downloads to save their resume state.
+const EXIT_GRACE: Duration = Duration::from_secs(3);
+/// Span of the throughput graph.
+const GRAPH_WINDOW: Duration = Duration::from_secs(60);
+/// No new bytes for this long shows the stalled indicator.
+const STALL_HINT: Duration = Duration::from_secs(5);
+/// How often the clipboard is checked for links.
+const CLIPBOARD_POLL: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GuiTab {
+enum Tab {
     Downloader,
-    BatchQueue,
+    Queue,
     History,
 }
 
-struct DownloaderApp {
+#[derive(Debug, Clone, Copy)]
+enum Dialog {
+    SaveDir,
+    CookiesFile,
+    VerifyFile,
+}
+
+/// Results of background work, delivered to the UI thread (each send also requests a repaint).
+enum AppEvent {
+    JobFinished { id: usize, result: Result<(PathBuf, Option<u64>), String> },
+    History { generation: u64, result: Result<Vec<HistoryEntry>, String> },
+    Verified(Result<(BuildVerificationResult, Vec<Url>), String>),
+    RepairFinished(Result<(), String>),
+    Picked(Dialog, Option<PathBuf>),
+    Pasted(Result<String, String>),
+    ClipboardLink(String),
+    Notice(Result<String, String>),
+}
+
+/// Handles to a running engine task.
+struct Running {
+    /// Asks the task to call `engine.cancel()`; the task keeps awaiting `run()` so the engine
+    /// saves its resume state.
+    cancel: Arc<Notify>,
+    task: JoinHandle<()>,
+    /// Latest snapshot only; older ones are overwritten.
+    snapshot: Arc<Mutex<Option<EngineSnapshot>>>,
+}
+
+/// Live telemetry of one download, kept by the GUI next to its queue item.
+#[derive(Default)]
+struct JobView {
+    running: Option<Running>,
+    chunks: Vec<ChunkSnapshot>,
+    mirror_speeds: Vec<(usize, String, f64)>,
+    active_workers: usize,
+    speed_history: VecDeque<(Instant, f64)>,
+    started: Option<Instant>,
+    /// Duration of the last finished run.
+    elapsed: Duration,
+    last_progress: Option<Instant>,
+    got_snapshot: bool,
+}
+
+impl JobView {
+    fn elapsed(&self) -> Duration {
+        match (&self.running, self.started) {
+            (Some(_), Some(started)) => started.elapsed(),
+            _ => self.elapsed,
+        }
+    }
+
+    /// How long no new bytes have arrived, once that counts as stalled.
+    fn stalled_for(&self) -> Option<Duration> {
+        let since = self.last_progress?.elapsed();
+        (self.running.is_some() && self.got_snapshot && since >= STALL_HINT).then_some(since)
+    }
+}
+
+#[derive(Clone)]
+struct VerifyRequest {
+    path: PathBuf,
+    expected_size: Option<u64>,
+    checksum: Option<String>,
+}
+
+struct Verification {
+    result: BuildVerificationResult,
+    /// Mirrors recorded for exactly this file (only looked up when it is incomplete).
+    repair_urls: Vec<Url>,
+}
+
+struct Repair {
+    cancel: Arc<AtomicBool>,
+    task: JoinHandle<()>,
+    progress: Arc<Mutex<(u64, u64)>>,
+}
+
+struct App {
+    rt: tokio::runtime::Handle,
+    ctx: egui::Context,
+    events_tx: mpsc::Sender<AppEvent>,
+    events_rx: mpsc::Receiver<AppEvent>,
+
+    settings: Settings,
+    tab: Tab,
     url_input: String,
-    save_dir: String,
-    connections: usize,
-    status: DownloadStatus,
-    status_message: String,
-
-    // Advanced options
-    show_advanced: bool,
+    /// Per-download inputs; never saved.
     checksum_input: String,
-    cookies_path_input: String,
-    proxy_input: String,
-    auth_header_input: String,
-    media_preset_idx: usize,
-    browser_cookies_idx: usize,
+    auth_input: String,
+    queue_input: String,
+    show_advanced: bool,
+    form_error: Option<String>,
+    queue_error: Option<String>,
+    notice: Option<Result<String, String>>,
 
-    // Clipboard Watcher (Background worker - zero UI blocking)
-    clipboard_watcher_enabled: bool,
-    clipboard_enable_flag: Arc<AtomicBool>,
-    clipboard_rx: std::sync::mpsc::Receiver<String>,
+    clipboard_enabled: Arc<AtomicBool>,
+    /// Last clipboard text the watcher saw or the app copied itself; never offered again.
+    clipboard_seen: Arc<Mutex<String>>,
     clipboard_banner: Option<String>,
 
-    // Throughput History (Last 60 Seconds at 10 Hz)
-    speed_history: VecDeque<(Instant, f64)>,
-    last_history_sample: Instant,
+    queue: DownloadQueue,
+    jobs: HashMap<usize, JobView>,
+    /// The download shown on the Downloader tab.
+    focused: Option<usize>,
 
-    // Smooth animations & interpolation
-    animated_speed: f64,
-    animated_progress: f64,
-    last_frame_time: Instant,
+    anim_job: Option<usize>,
+    anim_progress: f64,
+    anim_speed: f64,
+    last_frame: Instant,
     pulse_phase: f32,
 
-    // Tabs & Batch Queue
-    active_tab: GuiTab,
-    queue: hyperfetch_core::queue::DownloadQueue,
-    queue_url_input: String,
+    history: Vec<HistoryEntry>,
+    history_generation: u64,
+    history_applied: u64,
+    history_search: String,
+    verify_request: Option<VerifyRequest>,
+    verifying: bool,
+    verification: Option<Verification>,
+    verify_message: Option<String>,
+    repair: Option<Repair>,
 
-    // Download History & Build Verification
-    history_manager: hyperfetch_core::history::DownloadHistoryManager,
-    history_search_input: String,
-    verification_result: Option<hyperfetch_core::verify::BuildVerificationResult>,
-    verify_status_message: Option<String>,
-    is_repairing: bool,
-    repair_progress: (u64, u64),
-    repair_rx: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
-    repair_progress_rx: Option<std::sync::mpsc::Receiver<(u64, u64)>>,
-
-    // Metrics
-    total_bytes: u64,
-    downloaded_bytes: u64,
-    speed_bytes_per_sec: f64,
-    progress_ratio: f64,
-    start_time: Option<Instant>,
-    elapsed_secs: u64,
-    eta_secs: Option<u64>,
-    target_filepath: Option<PathBuf>,
-
-    // Chunks
-    chunks: Vec<ChunkSnapshot>,
-
-    // Threading & sync
-    cancel_flag: Arc<AtomicBool>,
-    snapshot_rx: Option<std::sync::mpsc::Receiver<EngineSnapshot>>,
-    result_rx: Option<std::sync::mpsc::Receiver<Result<PathBuf, String>>>,
-    tokio_rt: Arc<tokio::runtime::Runtime>,
+    dialog_open: bool,
+    pending_dialog: Option<Dialog>,
 }
 
-impl DownloaderApp {
-    fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        // Setup dark theme
-        let mut style = (*_cc.egui_ctx.style()).clone();
-        style.visuals.dark_mode = true;
-        style.visuals.override_text_color = Some(Color32::from_rgb(228, 232, 240));
-        style.visuals.window_fill = Color32::from_rgb(18, 20, 24);
-        style.visuals.panel_fill = Color32::from_rgb(18, 20, 24);
-        style.visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(26, 28, 35);
-        style.visuals.widgets.inactive.bg_fill = Color32::from_rgb(32, 35, 45);
-        style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(45, 50, 65);
-        style.visuals.widgets.active.bg_fill = Color32::from_rgb(30, 64, 175);
-        _cc.egui_ctx.set_style(style);
+impl App {
+    fn new(cc: &eframe::CreationContext<'_>, rt: tokio::runtime::Handle) -> Self {
+        apply_theme(&cc.egui_ctx);
+        let settings = Settings::load();
+        let (events_tx, events_rx) = mpsc::channel();
+        let clipboard_enabled = Arc::new(AtomicBool::new(settings.clipboard_watch));
+        let clipboard_seen = Arc::new(Mutex::new(String::new()));
+        spawn_clipboard_watcher(
+            Arc::clone(&clipboard_enabled),
+            Arc::clone(&clipboard_seen),
+            events_tx.clone(),
+            cc.egui_ctx.clone(),
+        );
 
-        let default_dir = std::env::var("HOME")
-            .or_else(|_| std::env::var("USERPROFILE"))
-            .map(|p| PathBuf::from(p).join("Downloads"))
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .to_string_lossy()
-            .to_string();
+        let mut app = Self {
+            rt,
+            ctx: cc.egui_ctx.clone(),
+            events_tx,
+            events_rx,
+            settings,
+            tab: Tab::Downloader,
+            url_input: String::new(),
+            checksum_input: String::new(),
+            auth_input: String::new(),
+            queue_input: String::new(),
+            show_advanced: false,
+            form_error: None,
+            queue_error: None,
+            notice: None,
+            clipboard_enabled,
+            clipboard_seen,
+            clipboard_banner: None,
+            queue: DownloadQueue::new(),
+            jobs: HashMap::new(),
+            focused: None,
+            anim_job: None,
+            anim_progress: 0.0,
+            anim_speed: 0.0,
+            last_frame: Instant::now(),
+            pulse_phase: 0.0,
+            history: Vec::new(),
+            history_generation: 0,
+            history_applied: 0,
+            history_search: String::new(),
+            verify_request: None,
+            verifying: false,
+            verification: None,
+            verify_message: None,
+            repair: None,
+            dialog_open: false,
+            pending_dialog: None,
+        };
+        app.refresh_history();
+        app
+    }
 
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to initialize Tokio runtime");
+    /// Runs `fut` on the runtime and delivers its event to the UI thread.
+    fn spawn_event(&self, fut: impl Future<Output = AppEvent> + Send + 'static) -> JoinHandle<()> {
+        let (tx, ctx) = (self.events_tx.clone(), self.ctx.clone());
+        self.rt.spawn(async move {
+            if tx.send(fut.await).is_ok() {
+                ctx.request_repaint();
+            }
+        })
+    }
 
-        // Spawn background clipboard watcher to prevent any UI thread blocking
-        let (clipboard_tx, clipboard_rx) = std::sync::mpsc::channel();
-        let clipboard_enable = Arc::new(AtomicBool::new(true));
-        let clipboard_enable_clone = Arc::clone(&clipboard_enable);
+    fn focused_item(&self) -> Option<&QueueItem> {
+        self.focused.and_then(|id| self.queue.get_item(id))
+    }
 
-        std::thread::Builder::new()
-            .name("clipboard-watcher".to_string())
-            .spawn(move || {
-                let mut last_seen = String::new();
-                loop {
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-                    if !clipboard_enable_clone.load(Ordering::Relaxed) {
-                        continue;
-                    }
-                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                        if let Ok(text) = clipboard.get_text() {
-                            let trimmed = text.trim();
-                            if !trimmed.is_empty() && trimmed != last_seen {
-                                last_seen = trimmed.to_string();
-                                if trimmed.starts_with("http://")
-                                    || trimmed.starts_with("https://")
-                                    || trimmed.starts_with("magnet:?")
-                                    || hyperfetch_core::torrent::is_magnet_uri(trimmed)
-                                {
-                                    let _ = clipboard_tx.send(trimmed.to_string());
-                                }
-                            }
-                        }
-                    }
+    fn is_resolving(&self, id: usize) -> bool {
+        self.jobs.get(&id).is_none_or(|view| !view.got_snapshot)
+    }
+
+    fn stalled_for(&self, id: usize) -> Option<Duration> {
+        self.jobs.get(&id).and_then(JobView::stalled_for)
+    }
+
+    // ---- history -------------------------------------------------------------------------
+
+    /// Applies `op` to the on-disk history off the UI thread (the core reloads the file under its
+    /// lock, so entries written meanwhile by the engine or the CLI are kept) and shows the result.
+    fn update_history(&mut self, op: impl FnOnce(&mut DownloadHistoryManager) + Send + 'static) {
+        self.history_generation += 1;
+        let generation = self.history_generation;
+        self.spawn_event(async move {
+            let result = unblock(move || {
+                let mut manager = DownloadHistoryManager::load();
+                op(&mut manager);
+                manager.entries().to_vec()
+            })
+            .await;
+            AppEvent::History { generation, result }
+        });
+    }
+
+    fn refresh_history(&mut self) {
+        self.update_history(|_| {});
+    }
+
+    // ---- downloads -----------------------------------------------------------------------
+
+    /// Adds the download described by `text` (mirrors of one file) with the current settings.
+    fn add_download(&mut self, text: &str, checksum: &str, auth: &str) -> Result<usize, String> {
+        let urls = util::parse_urls(text)?;
+        let options = self.settings.download_options(&urls, checksum, auth)?;
+        Ok(self.queue.add_item(urls, options))
+    }
+
+    /// Adds a download, starts it immediately and shows it on the Downloader tab. A file that is
+    /// already downloading is shown instead of being started twice.
+    fn download_now(&mut self, text: &str, checksum: &str, auth: &str) {
+        self.tab = Tab::Downloader;
+        let id = match self.add_download(text, checksum, auth) {
+            Ok(id) => id,
+            Err(e) => {
+                self.form_error = Some(e);
+                return;
+            }
+        };
+        self.form_error = None;
+        self.notice = None;
+        if let Some(existing) = self.queue.active_conflict(id) {
+            self.queue.remove_item(id);
+            self.focused = Some(existing);
+            self.notice = Some(Err("That file is already downloading; showing it instead".to_string()));
+            return;
+        }
+        self.focused = Some(id);
+        self.url_input.clear();
+        self.checksum_input.clear();
+        self.start_job(id, false);
+    }
+
+    /// Adds each non-empty line of the queue input as one download.
+    fn add_queue_input(&mut self) {
+        let lines: Vec<String> =
+            self.queue_input.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect();
+        if lines.is_empty() {
+            self.queue_error = Some("Enter one download per line".to_string());
+            return;
+        }
+        let checksum = self.checksum_input.trim().to_string();
+        if lines.len() > 1 && !checksum.is_empty() {
+            self.queue_error = Some(
+                "The checksum in Advanced Options is for a single file: add that download on its own".to_string(),
+            );
+            return;
+        }
+        let auth = self.auth_input.clone();
+        let mut errors = Vec::new();
+        let mut rejected = Vec::new();
+        for (n, line) in lines.iter().enumerate() {
+            if let Err(e) = self.add_download(line, &checksum, &auth) {
+                errors.push(format!("Line {}: {}", n + 1, e));
+                rejected.push(line.as_str());
+            }
+        }
+        // Keep the lines that failed so they can be corrected.
+        self.queue_input = rejected.join("\n");
+        self.queue_error = (!errors.is_empty()).then(|| errors.join("\n"));
+        if errors.len() < lines.len() {
+            self.checksum_input.clear();
+        }
+    }
+
+    /// Starts (or resumes) the engine for a queue item. `fresh` first deletes the item's partial
+    /// files so the download starts from zero. Returns false if nothing was started.
+    fn start_job(&mut self, id: usize, fresh: bool) -> bool {
+        if let Some(other) = self.queue.active_conflict(id) {
+            self.notice = Some(Err(format!(
+                "Download #{} is already fetching the same file; pause it before starting #{}",
+                other, id
+            )));
+            return false;
+        }
+        let Some(item) = self.queue.get_item(id) else { return false };
+        let (urls, options) = (item.urls.clone(), item.options.clone());
+        let leftovers_of = if fresh { item.target_path.clone() } else { None };
+        if !self.queue.mark_started(id) {
+            return false;
+        }
+        if fresh {
+            self.queue.reset_progress(id);
+        }
+
+        let cancel = Arc::new(Notify::new());
+        let snapshot = Arc::new(Mutex::new(None));
+        let task = {
+            let (cancel, snapshot, ctx, tx) =
+                (Arc::clone(&cancel), Arc::clone(&snapshot), self.ctx.clone(), self.events_tx.clone());
+            self.rt.spawn(async move {
+                let result = run_job(urls, options, leftovers_of, cancel, snapshot, ctx.clone()).await;
+                if tx.send(AppEvent::JobFinished { id, result }).is_ok() {
+                    ctx.request_repaint();
                 }
             })
-            .expect("Failed to spawn clipboard watcher thread");
-
-        Self {
-            url_input: String::new(),
-            save_dir: default_dir,
-            connections: 16,
-            status: DownloadStatus::Idle,
-            status_message: "Ready to accelerate download".to_string(),
-
-            show_advanced: false,
-            checksum_input: String::new(),
-            cookies_path_input: String::new(),
-            proxy_input: String::new(),
-            auth_header_input: String::new(),
-            media_preset_idx: 0,
-            browser_cookies_idx: 0,
-
-            clipboard_watcher_enabled: true,
-            clipboard_enable_flag: clipboard_enable,
-            clipboard_rx,
-            clipboard_banner: None,
-
-            speed_history: VecDeque::new(),
-            last_history_sample: Instant::now(),
-
-            animated_speed: 0.0,
-            animated_progress: 0.0,
-            last_frame_time: Instant::now(),
-            pulse_phase: 0.0,
-
-            active_tab: GuiTab::Downloader,
-            queue: hyperfetch_core::queue::DownloadQueue::new(),
-            queue_url_input: String::new(),
-
-            history_manager: hyperfetch_core::history::DownloadHistoryManager::load(),
-            history_search_input: String::new(),
-            verification_result: None,
-            verify_status_message: None,
-            is_repairing: false,
-            repair_progress: (0, 0),
-            repair_rx: None,
-            repair_progress_rx: None,
-
-            total_bytes: 0,
-            downloaded_bytes: 0,
-            speed_bytes_per_sec: 0.0,
-            progress_ratio: 0.0,
-            start_time: None,
-            elapsed_secs: 0,
-            eta_secs: None,
-            target_filepath: None,
-
-            chunks: Vec::new(),
-
-            cancel_flag: Arc::new(AtomicBool::new(false)),
-            snapshot_rx: None,
-            result_rx: None,
-            tokio_rt: Arc::new(rt),
-        }
-    }
-
-    fn start_download(&mut self) {
-        self.start_download_internal(false);
-    }
-
-    fn resume_download(&mut self) {
-        self.start_download_internal(true);
-    }
-
-    fn start_download_internal(&mut self, is_resume: bool) {
-        let trimmed = self.url_input.trim();
-        if trimmed.is_empty() {
-            self.status = DownloadStatus::Failed("Please provide a valid download URL".to_string());
-            return;
-        }
-
-        // Check for blob / UUID URL
-        if trimmed.starts_with("blob:") || (trimmed.contains("youtube.com") && trimmed.split('/').last().map_or(false, |s| s.len() == 36 && s.matches('-').count() == 4)) {
-            self.status = DownloadStatus::Failed(
-                "Browser-internal blob memory buffer detected. Browser blob: URLs exist only in temporary browser memory and cannot be downloaded by external tools. Please copy the standard video URL from your browser address bar (e.g. https://www.youtube.com/watch?v=... or https://youtu.be/...)."
-                    .to_string(),
-            );
-            return;
-        }
-
-        let mut urls = Vec::new();
-        for u in trimmed.split_whitespace() {
-            if hyperfetch_core::torrent::is_magnet_uri(u) {
-                match hyperfetch_core::torrent::parse_magnet_uri(u) {
-                    Ok(magnet) => {
-                        if !magnet.web_seeds.is_empty() {
-                            urls.extend(magnet.web_seeds);
-                            continue;
-                        } else {
-                            self.status = DownloadStatus::Failed(format!(
-                                "Magnet link ingested ({}), but no HTTP web seeds were found in the magnet URI.",
-                                magnet.info_hash
-                            ));
-                            return;
-                        }
-                    }
-                    Err(e) => {
-                        self.status = DownloadStatus::Failed(format!("Invalid magnet URI: {}", e));
-                        return;
-                    }
-                }
-            }
-
-            match Url::parse(u) {
-                Ok(url) => urls.push(url),
-                Err(e) => {
-                    self.status = DownloadStatus::Failed(format!("Invalid URL '{}': {}", u, e));
-                    return;
-                }
-            }
-        }
-
-        self.status = DownloadStatus::Resolving;
-        self.status_message = if is_resume {
-            "Resuming multi-connection download...".to_string()
-        } else {
-            "Resolving mirrors and probing endpoints...".to_string()
         };
+        self.jobs.insert(
+            id,
+            JobView {
+                running: Some(Running { cancel, task, snapshot }),
+                started: Some(Instant::now()),
+                ..JobView::default()
+            },
+        );
+        true
+    }
 
-        if !is_resume {
-            self.total_bytes = 0;
-            self.downloaded_bytes = 0;
-            self.progress_ratio = 0.0;
-            self.target_filepath = None;
-            self.chunks.clear();
+    /// Asks a running download to stop; it stays "Pausing" until the engine has saved its state.
+    fn pause_job(&mut self, id: usize) {
+        let Some(running) = self.jobs.get(&id).and_then(|view| view.running.as_ref()) else { return };
+        if self.queue.mark_pausing(id) {
+            running.cancel.notify_one();
         }
+    }
 
-        self.speed_bytes_per_sec = 0.0;
-        self.start_time = Some(Instant::now());
-        self.elapsed_secs = 0;
-        self.eta_secs = None;
-
-        self.cancel_flag.store(false, Ordering::Relaxed);
-        let cancel_flag = Arc::clone(&self.cancel_flag);
-
-        let (sync_snapshot_tx, sync_snapshot_rx) = std::sync::mpsc::channel::<EngineSnapshot>();
-        self.snapshot_rx = Some(sync_snapshot_rx);
-
-        let (sync_result_tx, sync_result_rx) = std::sync::mpsc::channel::<Result<PathBuf, String>>();
-        self.result_rx = Some(sync_result_rx);
-
-        let connections = self.connections;
-        let save_dir = PathBuf::from(&self.save_dir);
-
-        let checksum_opt = self.checksum_input.trim().to_string();
-        let cookies_opt = self.cookies_path_input.trim().to_string();
-        let proxy_opt = self.proxy_input.trim().to_string();
-        let auth_opt = self.auth_header_input.trim().to_string();
-        let media_preset_idx = self.media_preset_idx;
-        let browser_cookies_idx = self.browser_cookies_idx;
-
-        let (async_snapshot_tx, mut async_snapshot_rx) = broadcast::channel::<EngineSnapshot>(128);
-
-        // Bridge Tokio broadcast to standard mpsc channel for UI thread
-        self.tokio_rt.spawn(async move {
-            loop {
-                match async_snapshot_rx.recv().await {
-                    Ok(snapshot) => {
-                        if sync_snapshot_tx.send(snapshot).is_err() {
-                            break;
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        continue;
-                    }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        break;
-                    }
-                }
+    /// Removes a stopped download from the list and deletes its partial file and resume state.
+    fn discard_job(&mut self, id: usize) {
+        if let Some(other) = self.queue.active_conflict(id) {
+            self.notice = Some(Err(format!("Download #{} is using the same partial file right now", other)));
+            return;
+        }
+        let target = self.queue.get_item(id).and_then(|item| item.target_path.clone());
+        if !self.remove_job(id) {
+            return;
+        }
+        match target {
+            Some(final_path) => {
+                self.spawn_event(async move {
+                    let name = final_path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                    let result = unblock(move || util::delete_leftovers(&final_path)).await.and_then(|r| r);
+                    AppEvent::Notice(result.map(|n| match n {
+                        0 => format!("No leftover files of {} were found", name),
+                        n => format!("Deleted {} leftover file(s) of {}", n, name),
+                    }))
+                });
             }
-        });
-
-        // Spawn engine download task
-        self.tokio_rt.spawn(async move {
-            let is_media = urls.iter().any(|u| hyperfetch_core::media::is_supported_media_site(u));
-            let media_preset = if is_media {
-                match media_preset_idx {
-                    0 => Some(hyperfetch_core::media::MediaQualityPreset::BestVideoAudio),
-                    1 => Some(hyperfetch_core::media::MediaQualityPreset::Fhd1080p),
-                    2 => Some(hyperfetch_core::media::MediaQualityPreset::Hd720p),
-                    3 => Some(hyperfetch_core::media::MediaQualityPreset::AudioMp3),
-                    4 => Some(hyperfetch_core::media::MediaQualityPreset::AudioM4a),
-                    _ => Some(hyperfetch_core::media::MediaQualityPreset::BestVideoAudio),
-                }
-            } else {
-                None
-            };
-
-            let browser_cookies = match browser_cookies_idx {
-                1 => Some(hyperfetch_core::media::BrowserCookieSource::Chrome),
-                2 => Some(hyperfetch_core::media::BrowserCookieSource::Edge),
-                3 => Some(hyperfetch_core::media::BrowserCookieSource::Firefox),
-                4 => Some(hyperfetch_core::media::BrowserCookieSource::Brave),
-                5 => Some(hyperfetch_core::media::BrowserCookieSource::Opera),
-                6 => Some(hyperfetch_core::media::BrowserCookieSource::Vivaldi),
-                _ => None,
-            };
-
-            let options = DownloadOptions {
-                num_connections: connections,
-                base_chunk_size: 4 * 1024 * 1024,
-                min_steal_threshold: 1024 * 1024,
-                output_path: Some(save_dir),
-                expected_checksum: if checksum_opt.is_empty() { None } else { Some(checksum_opt) },
-                cookies_path: if cookies_opt.is_empty() { None } else { Some(PathBuf::from(cookies_opt)) },
-                proxy: if proxy_opt.is_empty() { None } else { Some(proxy_opt) },
-                auth_header: if auth_opt.is_empty() { None } else { Some(auth_opt) },
-                media_preset,
-                browser_cookies,
-                ..Default::default()
-            };
-
-            let engine = DownloadEngine::new(urls, options);
-
-            // Spawn cancellation listener
-            let cancel_watcher = Arc::clone(&cancel_flag);
-            let result = tokio::select! {
-                res = engine.run(Some(async_snapshot_tx)) => res,
-                _ = async {
-                    while !cancel_watcher.load(Ordering::Relaxed) {
-                        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                    }
-                    engine.cancel();
-                } => Err("Download cancelled by user".to_string()),
-            };
-
-            let _ = sync_result_tx.send(result);
-        });
+            None => {
+                self.notice = Some(Ok("Removed the download; no partial file was recorded for it".to_string()));
+            }
+        }
     }
 
-    fn cancel_download(&mut self) {
-        self.cancel_flag.store(true, Ordering::Relaxed);
-        self.status = DownloadStatus::Cancelled;
-        self.status_message = "Download cancelled / paused".to_string();
-        self.speed_bytes_per_sec = 0.0;
+    /// Removes a stopped download from the list, keeping its files. Running ones are kept.
+    fn remove_job(&mut self, id: usize) -> bool {
+        if !self.queue.remove_item(id) {
+            return false;
+        }
+        self.jobs.remove(&id);
+        if self.focused == Some(id) {
+            self.new_download();
+        }
+        true
     }
 
-    fn delete_leftovers(&mut self) {
-        use hyperfetch_core::state::DownloadState;
-        if let Some(ref path) = self.target_filepath {
-            let _ = std::fs::remove_file(path);
-            let state_file = DownloadState::state_file_path(path);
-            let _ = std::fs::remove_file(state_file);
+    /// Clears completed downloads, or every download that is not running.
+    fn clear_queue(&mut self, completed_only: bool) {
+        if completed_only {
+            self.queue.clear_completed();
         } else {
-            let trimmed = self.url_input.trim();
-            for u in trimmed.split_whitespace() {
-                if let Ok(url) = Url::parse(u) {
-                    if let Some(filename) = url.path_segments().and_then(|s| s.last()) {
-                        if !filename.is_empty() {
-                            let path = PathBuf::from(&self.save_dir).join(filename);
-                            let _ = std::fs::remove_file(&path);
-                            let state_file = DownloadState::state_file_path(&path);
-                            let _ = std::fs::remove_file(state_file);
+            self.queue.clear_inactive();
+        }
+        let queue = &self.queue;
+        self.jobs.retain(|id, _| queue.get_item(*id).is_some());
+        if self.focused.is_some_and(|id| self.queue.get_item(id).is_none()) {
+            self.new_download();
+        }
+    }
+
+    /// Leaves the shown download running in the queue and clears the form for a new one.
+    fn new_download(&mut self) {
+        self.focused = None;
+        self.url_input.clear();
+        self.checksum_input.clear();
+        self.form_error = None;
+        self.notice = None;
+    }
+
+    fn show_job(&mut self, id: usize) {
+        self.focused = Some(id);
+        self.form_error = None;
+        self.notice = None;
+        self.tab = Tab::Downloader;
+    }
+
+    fn drain_snapshots(&mut self) {
+        let now = Instant::now();
+        for (&id, view) in &mut self.jobs {
+            let Some(snapshot) = view.running.as_ref().and_then(|r| lock(&r.snapshot).take()) else { continue };
+            let previous = self.queue.get_item(id).map_or(0, |item| item.downloaded_bytes);
+            if !view.got_snapshot || snapshot.downloaded_bytes > previous {
+                view.last_progress = Some(now);
+            }
+            view.got_snapshot = true;
+            view.active_workers = snapshot.active_workers;
+            view.speed_history.push_back((now, snapshot.speed_bytes_per_sec));
+            while view.speed_history.front().is_some_and(|(t, _)| now.duration_since(*t) > GRAPH_WINDOW) {
+                view.speed_history.pop_front();
+            }
+            self.queue.apply_snapshot(id, &snapshot);
+            view.mirror_speeds = snapshot.mirror_speeds;
+            if !snapshot.chunks.is_empty() {
+                view.chunks = snapshot.chunks;
+            }
+        }
+    }
+
+    /// Starts queued downloads while fewer than the configured number are running.
+    fn run_scheduler(&mut self) {
+        if !self.settings.auto_run_queue {
+            return;
+        }
+        while let Some(id) = self.queue.next_to_start(self.settings.max_concurrent.max(1)) {
+            if !self.start_job(id, false) {
+                break;
+            }
+        }
+    }
+
+    // ---- verify & repair -----------------------------------------------------------------
+
+    fn verify(&mut self, request: VerifyRequest) {
+        if self.verifying || self.repair.is_some() {
+            return;
+        }
+        self.verifying = true;
+        self.verification = None;
+        self.verify_message = None;
+        self.tab = Tab::History;
+        self.verify_request = Some(request.clone());
+        self.spawn_event(async move {
+            let result = unblock(move || {
+                let result =
+                    verify::verify_build_file(&request.path, request.expected_size, request.checksum.as_deref())?;
+                let repair_urls = if util::verdict(&result) == Verdict::Incomplete {
+                    util::repair_urls_for(&result.file_path)
+                } else {
+                    Vec::new()
+                };
+                Ok((result, repair_urls))
+            })
+            .await
+            .and_then(|r| r);
+            AppEvent::Verified(result)
+        });
+    }
+
+    fn start_repair(&mut self) {
+        let Some(verification) = &self.verification else { return };
+        if self.repair.is_some() {
+            return;
+        }
+        let result = &verification.result;
+        let Some(total_size) = result.expected_size else {
+            self.verify_message = Some("Cannot repair: the expected file size is unknown".to_string());
+            return;
+        };
+        if verification.repair_urls.is_empty() {
+            self.verify_message =
+                Some("Cannot repair: no download URLs are recorded for exactly this file".to_string());
+            return;
+        }
+        let (path, missing, urls) =
+            (result.file_path.clone(), result.missing_ranges.clone(), verification.repair_urls.clone());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let progress = Arc::new(Mutex::new((0, missing.iter().map(|r| r.len()).sum())));
+        let task = {
+            let (cancel, progress, ctx) = (Arc::clone(&cancel), Arc::clone(&progress), self.ctx.clone());
+            self.spawn_event(async move {
+                let on_progress = move |done, total| {
+                    *lock(&progress) = (done, total);
+                    ctx.request_repaint();
+                };
+                let result =
+                    verify::repair_missing_ranges(&path, total_size, &missing, &urls, Some(cancel), on_progress).await;
+                AppEvent::RepairFinished(result)
+            })
+        };
+        self.repair = Some(Repair { cancel, task, progress });
+        self.verify_message = None;
+    }
+
+    // ---- events --------------------------------------------------------------------------
+
+    fn handle_event(&mut self, event: AppEvent) {
+        match event {
+            AppEvent::JobFinished { id, result } => {
+                if let Some(view) = self.jobs.get_mut(&id) {
+                    if let (Some(_), Some(started)) = (view.running.take(), view.started) {
+                        view.elapsed = started.elapsed();
+                    }
+                    // The last snapshot predates the final bytes.
+                    if result.is_ok() {
+                        for chunk in &mut view.chunks {
+                            chunk.downloaded_bytes = chunk.total_bytes;
+                            chunk.status = "Completed".to_string();
                         }
                     }
                 }
+                self.queue.finish(id, result);
+                // The engine records completed downloads in the history.
+                self.refresh_history();
+            }
+            AppEvent::History { generation, result } => match result {
+                Ok(entries) if generation > self.history_applied => {
+                    self.history_applied = generation;
+                    self.history = entries;
+                }
+                Ok(_) => {}
+                Err(e) => self.notice = Some(Err(format!("Could not read the download history: {}", e))),
+            },
+            AppEvent::Verified(result) => {
+                self.verifying = false;
+                match result {
+                    Ok((result, repair_urls)) => self.verification = Some(Verification { result, repair_urls }),
+                    Err(e) => self.verify_message = Some(format!("Could not verify: {}", e)),
+                }
+            }
+            AppEvent::RepairFinished(result) => {
+                self.repair = None;
+                match result {
+                    Ok(()) => {
+                        // Show the file's state after the repair; a repaired `.part` has its final name now.
+                        if let Some(request) = self.verify_request.clone() {
+                            self.verify(VerifyRequest { path: util::final_path_of(&request.path), ..request });
+                        }
+                        self.verify_message = Some("Repair finished.".to_string());
+                    }
+                    Err(e) if e == "Repair cancelled by user" => {
+                        self.verify_message = Some("Repair cancelled; the bytes fetched so far are kept".to_string());
+                    }
+                    Err(e) => self.verify_message = Some(format!("Repair failed: {}", e)),
+                }
+            }
+            AppEvent::Picked(dialog, path) => {
+                self.dialog_open = false;
+                let Some(path) = path else { return };
+                match dialog {
+                    Dialog::SaveDir => self.settings.save_dir = path.to_string_lossy().into_owned(),
+                    Dialog::CookiesFile => self.settings.cookies_path = path.to_string_lossy().into_owned(),
+                    Dialog::VerifyFile => self.verify(VerifyRequest { path, expected_size: None, checksum: None }),
+                }
+            }
+            AppEvent::Pasted(result) => match result {
+                Ok(text) => self.url_input = text.trim().to_string(),
+                Err(e) => self.form_error = Some(format!("Could not read the clipboard: {}", e)),
+            },
+            AppEvent::ClipboardLink(link) => {
+                if self.clipboard_enabled.load(Ordering::Relaxed) && self.url_input.trim() != link {
+                    self.clipboard_banner = Some(link);
+                }
+            }
+            AppEvent::Notice(notice) => self.notice = Some(notice),
+        }
+    }
+
+    fn open_dialog(&mut self, dialog: Dialog, frame: &eframe::Frame) {
+        let picker = rfd::AsyncFileDialog::new().set_parent(frame);
+        self.dialog_open = true;
+        let picked = move |handle: Option<rfd::FileHandle>| AppEvent::Picked(dialog, handle.map(|h| h.path().to_path_buf()));
+        match dialog {
+            Dialog::SaveDir => {
+                let pick = picker.set_directory(&self.settings.save_dir).pick_folder();
+                self.spawn_event(async move { picked(pick.await) });
+            }
+            Dialog::CookiesFile => {
+                let pick = picker.add_filter("Netscape cookies", &["txt"]).pick_file();
+                self.spawn_event(async move { picked(pick.await) });
+            }
+            Dialog::VerifyFile => {
+                let pick = picker.set_directory(&self.settings.save_dir).pick_file();
+                self.spawn_event(async move { picked(pick.await) });
             }
         }
-        self.reset_state();
-        self.status_message = "Leftover files permanently deleted".to_string();
     }
 
-    fn start_over(&mut self) {
-        self.delete_leftovers();
-        self.start_download();
+    fn paste_url(&mut self) {
+        self.spawn_event(async {
+            let text = unblock(|| arboard::Clipboard::new().and_then(|mut c| c.get_text()).map_err(|e| e.to_string()))
+                .await
+                .and_then(|r| r);
+            AppEvent::Pasted(text)
+        });
     }
 
-    fn reset_state(&mut self) {
-        self.status = DownloadStatus::Idle;
-        self.status_message = "Ready to accelerate download".to_string();
-        self.url_input.clear();
-        self.total_bytes = 0;
-        self.downloaded_bytes = 0;
-        self.speed_bytes_per_sec = 0.0;
-        self.progress_ratio = 0.0;
-        self.start_time = None;
-        self.elapsed_secs = 0;
-        self.eta_secs = None;
-        self.target_filepath = None;
-        self.chunks.clear();
-        self.animated_speed = 0.0;
-        self.animated_progress = 0.0;
+    /// Copies text to the clipboard without the watcher offering it back as a download.
+    fn copy_text(&mut self, text: String) {
+        *lock(&self.clipboard_seen) = text.clone();
+        self.ctx.copy_text(text);
+    }
+
+    /// Eases the displayed progress and speed of the shown download; true while still moving.
+    fn animate(&mut self) -> bool {
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_frame).as_secs_f64().clamp(0.001, 0.1);
+        self.last_frame = now;
+        self.pulse_phase = (self.pulse_phase + dt as f32 * 3.5) % std::f32::consts::TAU;
+
+        let (progress, speed) = self
+            .focused_item()
+            .map_or((0.0, 0.0), |item| (item.progress_ratio, item.speed_bytes_per_sec));
+        if self.anim_job != self.focused {
+            self.anim_job = self.focused;
+            self.anim_progress = progress;
+            self.anim_speed = speed;
+        }
+        self.anim_speed += (speed - self.anim_speed) * (dt * 8.0).min(1.0);
+        self.anim_progress += (progress - self.anim_progress) * (dt * 10.0).min(1.0);
+        let speed_settled = (speed - self.anim_speed).abs() < 1.0;
+        let progress_settled = (progress - self.anim_progress).abs() < 1e-4;
+        if speed_settled {
+            self.anim_speed = speed;
+        }
+        if progress_settled {
+            self.anim_progress = progress;
+        }
+        !(speed_settled && progress_settled)
     }
 }
 
-impl eframe::App for DownloaderApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Calculate dt for silky smooth 60fps animations
-        let now = Instant::now();
-        let dt = now.duration_since(self.last_frame_time).as_secs_f32().clamp(0.001, 0.1);
-        self.last_frame_time = now;
-
-        // Smooth 8x lerp for speed (smooth transition without jumping)
-        self.animated_speed += (self.speed_bytes_per_sec - self.animated_speed) * (dt as f64 * 8.0).clamp(0.0, 1.0);
-        if (self.speed_bytes_per_sec - self.animated_speed).abs() < 1.0 {
-            self.animated_speed = self.speed_bytes_per_sec;
+impl eframe::App for App {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        while let Ok(event) = self.events_rx.try_recv() {
+            self.handle_event(event);
         }
+        self.drain_snapshots();
+        self.run_scheduler();
+        let animating = self.animate();
 
-        // Smooth 10x lerp for progress bar
-        self.animated_progress += (self.progress_ratio - self.animated_progress) * (dt as f64 * 10.0).clamp(0.0, 1.0);
+        egui::CentralPanel::default().show(ctx, |ui| ui::render(self, ui));
 
-        // Advance pulse phase for glowing active chunks and graph tracer
-        self.pulse_phase = (self.pulse_phase + dt * 3.5) % std::f32::consts::TAU;
+        if let Some(dialog) = self.pending_dialog.take() {
+            self.open_dialog(dialog, frame);
+        }
+        // Background work wakes the UI when it has news; otherwise only animations and the
+        // once-a-second clocks (elapsed time, stall timer) need frames.
+        if animating {
+            ctx.request_repaint();
+        } else if self.queue.active_count() > 0 || self.verifying || self.repair.is_some() {
+            ctx.request_repaint_after(Duration::from_secs(1));
+        }
+    }
 
-        // Sync clipboard enabled flag with background worker
-        self.clipboard_enable_flag.store(self.clipboard_watcher_enabled, Ordering::Relaxed);
-
-        // Non-blocking drain of background clipboard discoveries
-        while let Ok(url) = self.clipboard_rx.try_recv() {
-            if self.url_input.trim() != url {
-                self.clipboard_banner = Some(url);
+    /// Stops every download so it saves its resume state (and kills yt-dlp), waiting briefly.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.settings.clipboard_watch = self.clipboard_enabled.load(Ordering::Relaxed);
+        if let Err(e) = self.settings.save() {
+            tracing::warn!("Failed to save settings: {}", e);
+        }
+        let mut tasks = Vec::new();
+        for view in self.jobs.values_mut() {
+            if let Some(running) = view.running.take() {
+                running.cancel.notify_one();
+                tasks.push(running.task);
             }
         }
-
-        // Handle incoming snapshots
-        if let Some(ref rx) = self.snapshot_rx {
-            while let Ok(snapshot) = rx.try_recv() {
-                if self.status == DownloadStatus::Resolving {
-                    self.status = DownloadStatus::Downloading;
-                    self.status_message = "Accelerating multi-connection download...".to_string();
+        if let Some(repair) = self.repair.take() {
+            repair.cancel.store(true, Ordering::Relaxed);
+            tasks.push(repair.task);
+        }
+        if !tasks.is_empty() {
+            let wait_all = async {
+                for task in tasks {
+                    let _ = task.await;
                 }
-                if self.target_filepath.is_none() {
-                    self.target_filepath = snapshot.target_path;
-                }
-                self.total_bytes = snapshot.total_bytes;
-                self.downloaded_bytes = snapshot.downloaded_bytes;
-                self.speed_bytes_per_sec = snapshot.speed_bytes_per_sec;
-                self.progress_ratio = snapshot.progress_ratio;
-                if !snapshot.chunks.is_empty() {
-                    self.chunks = snapshot.chunks;
-                }
-
-                if let Some(start) = self.start_time {
-                    self.elapsed_secs = start.elapsed().as_secs();
-                }
-
-                if self.speed_bytes_per_sec > 1024.0 && self.total_bytes > self.downloaded_bytes {
-                    let remaining = self.total_bytes - self.downloaded_bytes;
-                    self.eta_secs = Some((remaining as f64 / self.speed_bytes_per_sec) as u64);
-                } else if self.total_bytes > 0 && self.downloaded_bytes >= self.total_bytes {
-                    self.eta_secs = Some(0);
-                }
+            };
+            if self.rt.block_on(tokio::time::timeout(EXIT_GRACE, wait_all)).is_err() {
+                tracing::warn!("Some downloads did not stop within {}s", EXIT_GRACE.as_secs());
             }
         }
+    }
+}
 
-        // Handle download completion or failure
-        if let Some(ref rx) = self.result_rx {
-            if let Ok(result) = rx.try_recv() {
-                match result {
-                    Ok(path) => {
-                        self.status = DownloadStatus::Completed;
-                        let file_sz = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(self.total_bytes);
-                        self.total_bytes = file_sz;
-                        self.downloaded_bytes = file_sz;
-                        self.status_message = format!("Completed: {}", path.display());
-                        self.target_filepath = Some(path);
-                        self.progress_ratio = 1.0;
-                        self.speed_bytes_per_sec = 0.0;
-                        self.eta_secs = Some(0);
-                        self.history_manager = hyperfetch_core::history::DownloadHistoryManager::load();
-                    }
-                    Err(err) => {
-                        if self.status != DownloadStatus::Cancelled {
-                            self.status = DownloadStatus::Failed(err.clone());
-                            self.status_message = format!("Error: {}", err);
-                            self.history_manager = hyperfetch_core::history::DownloadHistoryManager::load();
-                        }
-                    }
+async fn unblock<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T, String> {
+    tokio::task::spawn_blocking(f).await.map_err(|e| format!("Background task failed: {}", e))
+}
+
+/// One engine run. A cancel request calls `engine.cancel()` and keeps awaiting `run()`, so the
+/// engine flushes data, saves its resume state and stops yt-dlp before this returns.
+async fn run_job(
+    urls: Vec<Url>,
+    options: DownloadOptions,
+    leftovers_of: Option<PathBuf>,
+    cancel: Arc<Notify>,
+    slot: Arc<Mutex<Option<EngineSnapshot>>>,
+    ctx: egui::Context,
+) -> Result<(PathBuf, Option<u64>), String> {
+    if let Some(final_path) = leftovers_of {
+        unblock(move || util::delete_leftovers(&final_path)).await??;
+    }
+    // The engine treats a missing output directory as a file name.
+    if let Some(dir) = options.output_path.clone() {
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .map_err(|e| format!("Cannot create the download folder {}: {}", dir.display(), e))?;
+    }
+    // Building the engine reads the cookies file and TLS roots.
+    let engine = unblock(move || DownloadEngine::new(urls, options)).await?;
+
+    let (tx, mut rx) = broadcast::channel::<EngineSnapshot>(16);
+    let forward = tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(snapshot) => {
+                    *lock(&slot) = Some(snapshot);
+                    ctx.request_repaint();
                 }
-                self.snapshot_rx = None;
-                self.result_rx = None;
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => break,
             }
         }
+    });
 
-        // Handle chunk repair progress & result
-        if let Some(ref rx) = self.repair_progress_rx {
-            while let Ok(prog) = rx.try_recv() {
-                self.repair_progress = prog;
-            }
+    let run = engine.run(Some(tx));
+    tokio::pin!(run);
+    let finished = tokio::select! {
+        result = &mut run => Some(result),
+        _ = cancel.notified() => None,
+    };
+    let result = match finished {
+        Some(result) => result,
+        None => {
+            engine.cancel();
+            run.await
         }
+    };
+    forward.abort();
 
-        if let Some(ref rx) = self.repair_rx {
-            if let Ok(res) = rx.try_recv() {
-                self.is_repairing = false;
-                match res {
-                    Ok(()) => {
-                        self.verify_status_message = Some("Repair completed! All missing chunks downloaded and verified.".to_string());
-                        if let Some(ref cur) = self.verification_result.clone() {
-                            if let Ok(updated) = hyperfetch_core::verify::verify_build_file(&cur.file_path, cur.expected_size, None) {
-                                self.verification_result = Some(updated);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        self.verify_status_message = Some(format!("Repair failed: {}", e));
-                    }
+    let path = result?;
+    let size = tokio::fs::metadata(&path).await.ok().map(|m| m.len());
+    Ok((path, size))
+}
+
+#[cfg(windows)]
+fn clipboard_sequence() -> Option<u32> {
+    // SAFETY: takes no arguments and only reads a counter.
+    let seq = unsafe { windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber() };
+    (seq != 0).then_some(seq)
+}
+
+#[cfg(not(windows))]
+fn clipboard_sequence() -> Option<u32> {
+    None
+}
+
+/// Watches the clipboard on its own thread (one `Clipboard` for its lifetime) and reports new links.
+fn spawn_clipboard_watcher(
+    enabled: Arc<AtomicBool>,
+    seen: Arc<Mutex<String>>,
+    tx: mpsc::Sender<AppEvent>,
+    ctx: egui::Context,
+) {
+    let spawned = std::thread::Builder::new().name("clipboard-watcher".to_string()).spawn(move || {
+        let mut clipboard: Option<arboard::Clipboard> = None;
+        let mut last_sequence = None;
+        loop {
+            std::thread::sleep(CLIPBOARD_POLL);
+            if !enabled.load(Ordering::Relaxed) {
+                continue;
+            }
+            // On Windows only open the clipboard when its contents changed.
+            let sequence = clipboard_sequence();
+            if sequence.is_some() && sequence == last_sequence {
+                continue;
+            }
+            if clipboard.is_none() {
+                clipboard = arboard::Clipboard::new().ok();
+            }
+            let Some(board) = clipboard.as_mut() else { continue };
+            let text = match board.get_text() {
+                Ok(text) => text,
+                // Held by another program: try again next time.
+                Err(arboard::Error::ClipboardOccupied) => continue,
+                Err(_) => {
+                    last_sequence = sequence;
+                    continue;
                 }
-                self.repair_rx = None;
-                self.repair_progress_rx = None;
+            };
+            last_sequence = sequence;
+            let text = text.trim();
+            {
+                let mut seen = lock(&seen);
+                if *seen == text {
+                    continue;
+                }
+                text.clone_into(&mut seen);
             }
-        }
-
-        // Sample speed history at fixed 10 Hz (every 100ms)
-        if now.duration_since(self.last_history_sample) >= std::time::Duration::from_millis(100) {
-            self.last_history_sample = now;
-            self.speed_history.push_back((now, self.animated_speed));
-            while let Some((t, _)) = self.speed_history.front() {
-                if now.duration_since(*t).as_secs() > 60 {
-                    self.speed_history.pop_front();
-                } else {
+            if let Some(link) = util::clipboard_link(text) {
+                if tx.send(AppEvent::ClipboardLink(link)).is_err() {
                     break;
                 }
+                ctx.request_repaint();
             }
-        }
-
-        // Repaint continuously when downloading/animating (60 FPS), or at 30 FPS when idle for smooth pulse animations
-        if self.status == DownloadStatus::Downloading || self.status == DownloadStatus::Resolving || self.is_repairing {
-            ctx.request_repaint();
-        } else if self.clipboard_banner.is_some() || self.animated_progress > 0.0 && self.animated_progress < 1.0 {
-            ctx.request_repaint();
-        } else {
-            ctx.request_repaint_after(std::time::Duration::from_millis(33)); // 30 FPS idle
-        }
-
-        egui::CentralPanel::default().show(ctx, |ui| {
-            render_ui(self, ui);
-        });
-    }
-}
-
-fn render_ui(app: &mut DownloaderApp, ui: &mut egui::Ui) {
-    ui.add_space(8.0);
-
-    // Header Bar
-    ui.horizontal(|ui| {
-        ui.heading(
-            egui::RichText::new("ENDO'S UNIFIED DOWNLOADER")
-                .strong()
-                .size(19.0)
-                .color(Color32::from_rgb(255, 255, 255)),
-        );
-
-        ui.add_space(8.0);
-        let badge_color = match app.status {
-            DownloadStatus::Idle => Color32::from_rgb(100, 116, 139),
-            DownloadStatus::Resolving => Color32::from_rgb(234, 179, 8),
-            DownloadStatus::Downloading => Color32::from_rgb(59, 130, 246),
-            DownloadStatus::Completed => Color32::from_rgb(16, 185, 129),
-            DownloadStatus::Failed(_) => Color32::from_rgb(239, 68, 68),
-            DownloadStatus::Cancelled => Color32::from_rgb(148, 163, 184),
-        };
-
-        let status_text = match app.status {
-            DownloadStatus::Idle => "READY",
-            DownloadStatus::Resolving => "RESOLVING",
-            DownloadStatus::Downloading => "DOWNLOADING",
-            DownloadStatus::Completed => "COMPLETED",
-            DownloadStatus::Failed(_) => "FAILED",
-            DownloadStatus::Cancelled => "CANCELLED",
-        };
-
-        ui.label(
-            egui::RichText::new(format!("[ {} ]", status_text))
-                .monospace()
-                .size(13.0)
-                .color(badge_color),
-        );
-
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let is_hist = app.active_tab == GuiTab::History;
-            let hist_btn = egui::Button::new(
-                egui::RichText::new(format!("History ({})", app.history_manager.entries().len()))
-                    .strong()
-                    .color(if is_hist { Color32::WHITE } else { Color32::from_rgb(148, 163, 184) }),
-            )
-            .fill(if is_hist { Color32::from_rgb(37, 99, 235) } else { Color32::from_rgb(30, 32, 40) });
-            if ui.add_sized([100.0, 24.0], hist_btn).clicked() {
-                app.history_manager = hyperfetch_core::history::DownloadHistoryManager::load();
-                app.active_tab = GuiTab::History;
-            }
-
-            let is_queue = app.active_tab == GuiTab::BatchQueue;
-            let queue_btn = egui::Button::new(
-                egui::RichText::new(format!("Queue ({})", app.queue.items().len()))
-                    .strong()
-                    .color(if is_queue { Color32::WHITE } else { Color32::from_rgb(148, 163, 184) }),
-            )
-            .fill(if is_queue { Color32::from_rgb(37, 99, 235) } else { Color32::from_rgb(30, 32, 40) });
-            if ui.add_sized([100.0, 24.0], queue_btn).clicked() {
-                app.active_tab = GuiTab::BatchQueue;
-            }
-
-            let is_dl = app.active_tab == GuiTab::Downloader;
-            let dl_btn = egui::Button::new(
-                egui::RichText::new("Downloader")
-                    .strong()
-                    .color(if is_dl { Color32::WHITE } else { Color32::from_rgb(148, 163, 184) }),
-            )
-            .fill(if is_dl { Color32::from_rgb(37, 99, 235) } else { Color32::from_rgb(30, 32, 40) });
-            if ui.add_sized([100.0, 24.0], dl_btn).clicked() {
-                app.active_tab = GuiTab::Downloader;
-            }
-
-            let clip_text = if app.clipboard_watcher_enabled { "Clipboard Watch: ON" } else { "Clipboard Watch: OFF" };
-            let clip_btn = egui::Button::new(
-                egui::RichText::new(clip_text)
-                    .size(11.0)
-                    .color(if app.clipboard_watcher_enabled { Color32::from_rgb(56, 189, 248) } else { Color32::from_rgb(148, 163, 184) }),
-            )
-            .fill(Color32::from_rgb(26, 28, 35));
-            if ui.add_sized([135.0, 24.0], clip_btn).clicked() {
-                app.clipboard_watcher_enabled = !app.clipboard_watcher_enabled;
-                if !app.clipboard_watcher_enabled {
-                    app.clipboard_banner = None;
-                }
-            }
-        });
-    });
-
-    // Clipboard Ingest Banner
-    if let Some(ref detected_url) = app.clipboard_banner.clone() {
-        ui.add_space(6.0);
-        egui::Frame::none()
-            .fill(Color32::from_rgb(22, 27, 38))
-            .stroke(Stroke::new(1.0, Color32::from_rgb(37, 99, 235)))
-            .inner_margin(8.0)
-            .rounding(4.0)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Clipboard Link Detected:").strong().color(Color32::from_rgb(56, 189, 248)));
-                    let truncated = if detected_url.len() > 55 {
-                        format!("{}...", &detected_url[..52])
-                    } else {
-                        detected_url.clone()
-                    };
-                    ui.label(egui::RichText::new(truncated).monospace().color(Color32::from_rgb(228, 232, 240)));
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button(egui::RichText::new("Dismiss").size(11.0)).clicked() {
-                            app.clipboard_banner = None;
-                        }
-                        if ui.button(egui::RichText::new("Paste").size(11.0)).clicked() {
-                            app.url_input = detected_url.clone();
-                            app.clipboard_banner = None;
-                        }
-                        let dl_now = egui::Button::new(
-                            egui::RichText::new("Download Now").strong().size(11.0).color(Color32::WHITE),
-                        )
-                        .fill(Color32::from_rgb(37, 99, 235));
-                        if ui.add(dl_now).clicked() {
-                            app.url_input = detected_url.clone();
-                            app.clipboard_banner = None;
-                            app.start_download();
-                        }
-                    });
-                });
-            });
-    }
-
-    ui.add_space(8.0);
-
-    match app.active_tab {
-        GuiTab::Downloader => render_downloader_tab(app, ui),
-        GuiTab::BatchQueue => render_queue_tab(app, ui),
-        GuiTab::History => render_history_tab(app, ui),
-    }
-}
-
-fn render_downloader_tab(app: &mut DownloaderApp, ui: &mut egui::Ui) {
-    // Input Group Box
-    egui::Frame::none()
-        .fill(Color32::from_rgb(24, 26, 33))
-        .stroke(Stroke::new(1.0, Color32::from_rgb(42, 45, 56)))
-        .inner_margin(12.0)
-        .rounding(6.0)
-        .show(ui, |ui| {
-            // URL Input Row
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("URL:").strong().size(13.0));
-                let text_edit = ui.add_sized(
-                    [ui.available_width() - 85.0, 26.0],
-                    egui::TextEdit::singleline(&mut app.url_input)
-                        .hint_text("Paste media link or file URL (YouTube, Archive.org, Vimeo, Reddit, etc.)"),
-                );
-
-                if ui.button("Paste").clicked() {
-                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                        if let Ok(text) = clipboard.get_text() {
-                            app.url_input = text.trim().to_string();
-                        }
-                    }
-                }
-                text_edit
-            });
-
-            // Blob URL warning banner
-            let is_blob = app.url_input.trim().starts_with("blob:")
-                || (app.url_input.contains("youtube.com") && app.url_input.trim().split('/').last().map_or(false, |s| s.len() == 36 && s.matches('-').count() == 4));
-            if is_blob {
-                ui.add_space(6.0);
-                egui::Frame::none()
-                    .fill(Color32::from_rgb(45, 20, 20))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(220, 38, 38)))
-                    .inner_margin(8.0)
-                    .rounding(4.0)
-                    .show(ui, |ui| {
-                        ui.label(
-                            egui::RichText::new("Notice: The URL entered is a browser-internal blob memory buffer. Web browsers generate these internally in RAM and they cannot be downloaded by external tools. Please copy the actual YouTube video link from your browser's address bar (e.g. https://www.youtube.com/watch?v=... or https://youtu.be/...).")
-                                .color(Color32::from_rgb(254, 202, 202))
-                                .size(12.0),
-                        );
-                    });
-            }
-
-            ui.add_space(8.0);
-
-            // Save Directory Row
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Save to:").strong().size(13.0));
-                ui.add_sized(
-                    [ui.available_width() - 85.0, 26.0],
-                    egui::TextEdit::singleline(&mut app.save_dir),
-                );
-
-                if ui.button("Browse...").clicked() {
-                    if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                        app.save_dir = folder.to_string_lossy().to_string();
-                    }
-                }
-            });
-
-            ui.add_space(8.0);
-
-            // Options and Actions Row
-            ui.horizontal(|ui| {
-                ui.label("Streams:");
-                ui.add(egui::Slider::new(&mut app.connections, 1..=64).text("connections"));
-
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    match app.status {
-                        DownloadStatus::Downloading | DownloadStatus::Resolving => {
-                            if ui.button(egui::RichText::new("Pause / Cancel").color(Color32::from_rgb(239, 68, 68))).clicked() {
-                                app.cancel_download();
-                            }
-                        }
-                        DownloadStatus::Cancelled => {
-                            if ui.button("Start Over").clicked() {
-                                app.start_over();
-                            }
-                            if ui.button(egui::RichText::new("Delete Leftovers").color(Color32::from_rgb(239, 68, 68))).clicked() {
-                                app.delete_leftovers();
-                            }
-                            let resume_btn = egui::Button::new(
-                                egui::RichText::new("Resume Download")
-                                    .strong()
-                                    .color(Color32::from_rgb(255, 255, 255)),
-                            )
-                            .fill(Color32::from_rgb(16, 185, 129));
-                            if ui.add_sized([130.0, 26.0], resume_btn).clicked() {
-                                app.resume_download();
-                            }
-                        }
-                        DownloadStatus::Failed(_) => {
-                            if ui.button("Start Over").clicked() {
-                                app.start_over();
-                            }
-                            if ui.button(egui::RichText::new("Delete Leftovers").color(Color32::from_rgb(239, 68, 68))).clicked() {
-                                app.delete_leftovers();
-                            }
-                            let retry_btn = egui::Button::new(
-                                egui::RichText::new("Retry / Resume")
-                                    .strong()
-                                    .color(Color32::from_rgb(255, 255, 255)),
-                            )
-                            .fill(Color32::from_rgb(16, 185, 129));
-                            if ui.add_sized([120.0, 26.0], retry_btn).clicked() {
-                                app.resume_download();
-                            }
-                        }
-                        DownloadStatus::Completed => {
-                            if let Some(ref path) = app.target_filepath {
-                                if ui.button("Open File").clicked() {
-                                    #[cfg(target_os = "windows")]
-                                    let _ = std::process::Command::new("cmd").args(["/C", "start", "", &path.to_string_lossy()]).spawn();
-                                    #[cfg(not(target_os = "windows"))]
-                                    let _ = std::process::Command::new("xdg-open").arg(path).spawn();
-                                }
-                                if ui.button("Open Folder").clicked() {
-                                    if let Some(parent) = path.parent() {
-                                        #[cfg(target_os = "windows")]
-                                        let _ = std::process::Command::new("explorer").arg(parent).spawn();
-                                        #[cfg(not(target_os = "windows"))]
-                                        let _ = std::process::Command::new("xdg-open").arg(parent).spawn();
-                                    }
-                                }
-                                if ui.button(egui::RichText::new("Verify Build Chunks").color(Color32::from_rgb(56, 189, 248))).clicked() {
-                                    if let Ok(res) = hyperfetch_core::verify::verify_build_file(path, None, None) {
-                                        app.verification_result = Some(res);
-                                        app.active_tab = GuiTab::History;
-                                    }
-                                }
-                            }
-                            if ui.button("Download Another").clicked() {
-                                app.reset_state();
-                            }
-                        }
-                        _ => {
-                            let btn = egui::Button::new(
-                                egui::RichText::new("Start Download")
-                                    .strong()
-                                    .color(Color32::from_rgb(255, 255, 255)),
-                            )
-                            .fill(Color32::from_rgb(37, 99, 235));
-
-                            if ui.add_sized([130.0, 28.0], btn).clicked() {
-                                app.start_download();
-                            }
-                        }
-                    }
-                });
-            });
-
-            // Collapsible Advanced Options
-            ui.add_space(6.0);
-            ui.separator();
-            ui.add_space(4.0);
-            let adv_text = if app.show_advanced { "[-] Advanced Options (Checksum, Cookies, Proxy)" } else { "[+] Advanced Options (Checksum, Cookies, Proxy)" };
-            if ui.button(egui::RichText::new(adv_text).size(12.0).color(Color32::from_rgb(148, 163, 184))).clicked() {
-                app.show_advanced = !app.show_advanced;
-            }
-
-            if app.show_advanced {
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Checksum:").size(12.0));
-                    ui.add_sized(
-                        [ui.available_width() - 10.0, 24.0],
-                        egui::TextEdit::singleline(&mut app.checksum_input)
-                            .hint_text("Optional: sha256:..., md5:..., blake3:..., or hex"),
-                    );
-                });
-
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Cookies:").size(12.0));
-                    ui.add_sized(
-                        [ui.available_width() - 95.0, 24.0],
-                        egui::TextEdit::singleline(&mut app.cookies_path_input)
-                            .hint_text("Optional: path to Netscape cookies.txt"),
-                    );
-                    if ui.button("Browse...").clicked() {
-                        if let Some(file) = rfd::FileDialog::new().add_filter("Text", &["txt"]).pick_file() {
-                            app.cookies_path_input = file.to_string_lossy().to_string();
-                        }
-                    }
-                });
-
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Proxy:").size(12.0));
-                    ui.add_sized(
-                        [ui.available_width() - 10.0, 24.0],
-                        egui::TextEdit::singleline(&mut app.proxy_input)
-                            .hint_text("Optional: http://127.0.0.1:8080 or socks5://127.0.0.1:1080"),
-                    );
-                });
-
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Auth:").size(12.0));
-                    ui.add_sized(
-                        [ui.available_width() - 10.0, 24.0],
-                        egui::TextEdit::singleline(&mut app.auth_header_input)
-                            .hint_text("Optional: Bearer <token>"),
-                    );
-                });
-
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Media Quality:").size(12.0));
-                    egui::ComboBox::from_id_salt("media_preset_combo")
-                        .selected_text(match app.media_preset_idx {
-                            0 => "Best Available (Merged MP4)",
-                            1 => "1080p FHD (Merged MP4)",
-                            2 => "720p HD (Merged MP4)",
-                            3 => "Audio Only (MP3)",
-                            4 => "Audio Only (M4A)",
-                            _ => "Best Available",
-                        })
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut app.media_preset_idx, 0, "Best Available (Merged MP4)");
-                            ui.selectable_value(&mut app.media_preset_idx, 1, "1080p FHD (Merged MP4)");
-                            ui.selectable_value(&mut app.media_preset_idx, 2, "720p HD (Merged MP4)");
-                            ui.selectable_value(&mut app.media_preset_idx, 3, "Audio Only (MP3)");
-                            ui.selectable_value(&mut app.media_preset_idx, 4, "Audio Only (M4A)");
-                        });
-                });
-
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Browser Cookies:").size(12.0));
-                    egui::ComboBox::from_id_salt("browser_cookies_combo")
-                        .selected_text(match app.browser_cookies_idx {
-                            0 => "None",
-                            1 => "Google Chrome",
-                            2 => "Microsoft Edge",
-                            3 => "Mozilla Firefox",
-                            4 => "Brave Browser",
-                            5 => "Opera",
-                            6 => "Vivaldi",
-                            _ => "None",
-                        })
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut app.browser_cookies_idx, 0, "None");
-                            ui.selectable_value(&mut app.browser_cookies_idx, 1, "Google Chrome");
-                            ui.selectable_value(&mut app.browser_cookies_idx, 2, "Microsoft Edge");
-                            ui.selectable_value(&mut app.browser_cookies_idx, 3, "Mozilla Firefox");
-                            ui.selectable_value(&mut app.browser_cookies_idx, 4, "Brave Browser");
-                            ui.selectable_value(&mut app.browser_cookies_idx, 5, "Opera");
-                            ui.selectable_value(&mut app.browser_cookies_idx, 6, "Vivaldi");
-                        });
-                });
-            }
-        });
-
-    ui.add_space(10.0);
-
-    // Overall Progress & Metric Cards
-    egui::Frame::none()
-        .fill(Color32::from_rgb(24, 26, 33))
-        .stroke(Stroke::new(1.0, Color32::from_rgb(42, 45, 56)))
-        .inner_margin(12.0)
-        .rounding(6.0)
-        .show(ui, |ui| {
-            // Main Progress Bar (smooth animated lerp)
-            let progress_percent = (app.animated_progress * 100.0).clamp(0.0, 100.0);
-            let bar_text = format!("{:.1}%", progress_percent);
-            ui.add(
-                egui::ProgressBar::new(app.animated_progress as f32)
-                    .show_percentage()
-                    .animate(app.status == DownloadStatus::Downloading)
-                    .text(bar_text),
-            );
-
-            ui.add_space(8.0);
-
-            // Metrics Grid (4 columns)
-            ui.columns(4, |cols| {
-                // Column 1: Downloaded / Total
-                cols[0].vertical(|ui| {
-                    ui.label(egui::RichText::new("Transferred").size(11.0).color(Color32::from_rgb(148, 163, 184)));
-                    let text = if app.total_bytes > 0 {
-                        format!("{} / {}", format_bytes(app.downloaded_bytes), format_bytes(app.total_bytes))
-                    } else {
-                        format_bytes(app.downloaded_bytes)
-                    };
-                    ui.label(egui::RichText::new(text).strong().size(13.0));
-                });
-
-                // Column 2: Speed (smooth animated lerp)
-                cols[1].vertical(|ui| {
-                    ui.label(egui::RichText::new("Speed").size(11.0).color(Color32::from_rgb(148, 163, 184)));
-                    let speed_text = format!("{}/s", format_bytes(app.animated_speed as u64));
-                    ui.label(egui::RichText::new(speed_text).strong().size(13.0).color(Color32::from_rgb(56, 189, 248)));
-                });
-
-                // Column 3: Elapsed & ETA
-                cols[2].vertical(|ui| {
-                    ui.label(egui::RichText::new("Elapsed / ETA").size(11.0).color(Color32::from_rgb(148, 163, 184)));
-                    let eta_str = match app.eta_secs {
-                        Some(0) => "Done".to_string(),
-                        Some(s) => format_duration(s),
-                        None => "--:--".to_string(),
-                    };
-                    let time_text = format!("{} / {}", format_duration(app.elapsed_secs), eta_str);
-                    ui.label(egui::RichText::new(time_text).strong().size(13.0));
-                });
-
-                // Column 4: Connections
-                cols[3].vertical(|ui| {
-                    ui.label(egui::RichText::new("Active Streams").size(11.0).color(Color32::from_rgb(148, 163, 184)));
-                    let streams_text = format!("{} connections", app.connections);
-                    ui.label(egui::RichText::new(streams_text).strong().size(13.0));
-                });
-            });
-        });
-
-    ui.add_space(10.0);
-
-    // Visual Multi-Segment Chunk Map (IDM-style)
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("CHUNK ALLOCATION & WORK-STEALING MAP").strong().size(13.0));
-        if !app.chunks.is_empty() {
-            ui.label(
-                egui::RichText::new(format!("({} dynamic chunks)", app.chunks.len()))
-                    .size(11.0)
-                    .color(Color32::from_rgb(148, 163, 184)),
-            );
         }
     });
-
-    ui.add_space(4.0);
-
-    // Custom Canvas for Chunk Visualizer
-    let canvas_height = 26.0;
-    let (response, painter) = ui.allocate_painter(Vec2::new(ui.available_width(), canvas_height), egui::Sense::hover());
-    let rect = response.rect;
-
-    // Background of chunk bar
-    painter.rect_filled(rect, 4.0, Color32::from_rgb(26, 28, 36));
-    painter.rect_stroke(rect, 4.0, Stroke::new(1.0, Color32::from_rgb(45, 48, 60)));
-
-    if !app.chunks.is_empty() && app.total_bytes > 0 {
-        let total_b = app.total_bytes as f32;
-        let width = rect.width();
-
-        for chunk in &app.chunks {
-            let start_ratio = (chunk.range_start as f32 / total_b).clamp(0.0, 1.0);
-            let end_ratio = ((chunk.range_end + 1) as f32 / total_b).clamp(0.0, 1.0);
-            let seg_x = rect.min.x + (start_ratio * width);
-            let seg_w = ((end_ratio - start_ratio) * width).max(1.0);
-
-            let seg_rect = Rect::from_min_size(Pos2::new(seg_x, rect.min.y + 1.0), Vec2::new(seg_w, canvas_height - 2.0));
-
-            if chunk.downloaded_bytes >= chunk.total_bytes && chunk.total_bytes > 0 {
-                // Completed: solid green
-                painter.rect_filled(seg_rect, 0.0, Color32::from_rgb(16, 185, 129));
-            } else if chunk.downloaded_bytes > 0 && chunk.total_bytes > 0 {
-                // In-progress: background blue + bright fill
-                let filled_ratio = (chunk.downloaded_bytes as f32 / chunk.total_bytes as f32).clamp(0.0, 1.0);
-                painter.rect_filled(seg_rect, 0.0, Color32::from_rgb(30, 58, 138));
-
-                let fill_w = seg_w * filled_ratio;
-                let fill_rect = Rect::from_min_size(Pos2::new(seg_x, rect.min.y + 1.0), Vec2::new(fill_w, canvas_height - 2.0));
-                painter.rect_filled(fill_rect, 0.0, Color32::from_rgb(59, 130, 246));
-            } else if chunk.status.contains("Worker") {
-                // Assigned worker: active pulsing cyan wave
-                let pulse = ((app.pulse_phase.sin() + 1.0) * 0.5).clamp(0.0, 1.0);
-                let r = (14.0 + pulse * 20.0) as u8;
-                let g = (116.0 + pulse * 45.0) as u8;
-                let b = (144.0 + pulse * 70.0) as u8;
-                painter.rect_filled(seg_rect, 0.0, Color32::from_rgb(r, g, b));
-            } else {
-                // Pending: dark gray
-                painter.rect_filled(seg_rect, 0.0, Color32::from_rgb(39, 39, 42));
-            }
-
-            // Segment border separator
-            painter.line_segment(
-                [Pos2::new(seg_x + seg_w, rect.min.y + 1.0), Pos2::new(seg_x + seg_w, rect.max.y - 1.0)],
-                Stroke::new(1.0, Color32::from_rgb(18, 20, 24)),
-            );
-        }
-    }
-
-    ui.add_space(10.0);
-
-    // Detailed Per-Chunk Table Header
-    ui.label(egui::RichText::new("STREAM / CHUNK DETAILS").strong().size(13.0));
-    ui.add_space(4.0);
-
-    egui::Frame::none()
-        .fill(Color32::from_rgb(24, 26, 33))
-        .stroke(Stroke::new(1.0, Color32::from_rgb(42, 45, 56)))
-        .inner_margin(8.0)
-        .rounding(6.0)
-        .show(ui, |ui| {
-            egui::ScrollArea::vertical()
-                .max_height(200.0)
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    if app.chunks.is_empty() {
-                        ui.vertical_centered(|ui| {
-                            ui.add_space(20.0);
-                            ui.label(
-                                egui::RichText::new("No active download streams. Enter a URL above and click 'Start Download'.")
-                                    .color(Color32::from_rgb(113, 113, 122)),
-                            );
-                            ui.add_space(20.0);
-                        });
-                    } else {
-                        // Header row
-                        ui.horizontal(|ui| {
-                            ui.add_sized([50.0, 20.0], egui::Label::new(egui::RichText::new("ID").strong().size(11.0)));
-                            ui.add_sized([160.0, 20.0], egui::Label::new(egui::RichText::new("Byte Range").strong().size(11.0)));
-                            ui.add_sized([130.0, 20.0], egui::Label::new(egui::RichText::new("Downloaded").strong().size(11.0)));
-                            ui.add_sized([140.0, 20.0], egui::Label::new(egui::RichText::new("Progress").strong().size(11.0)));
-                            ui.add_sized([120.0, 20.0], egui::Label::new(egui::RichText::new("Status").strong().size(11.0)));
-                        });
-
-                        ui.separator();
-
-                        for chunk in &app.chunks {
-                            ui.horizontal(|ui| {
-                                ui.add_sized([50.0, 18.0], egui::Label::new(format!("#{}", chunk.id)));
-                                ui.add_sized(
-                                    [160.0, 18.0],
-                                    egui::Label::new(format!("{} - {}", format_bytes(chunk.range_start), format_bytes(chunk.range_end))),
-                                );
-                                ui.add_sized(
-                                    [130.0, 18.0],
-                                    egui::Label::new(format!("{} / {}", format_bytes(chunk.downloaded_bytes), format_bytes(chunk.total_bytes))),
-                                );
-
-                                let ratio = if chunk.total_bytes > 0 {
-                                    (chunk.downloaded_bytes as f32 / chunk.total_bytes as f32).clamp(0.0, 1.0)
-                                } else {
-                                    0.0
-                                };
-                                ui.add_sized([140.0, 18.0], egui::ProgressBar::new(ratio).show_percentage());
-
-                                let status_color = if chunk.status == "Completed" {
-                                    Color32::from_rgb(16, 185, 129)
-                                } else if chunk.status.contains("Worker") {
-                                    Color32::from_rgb(56, 189, 248)
-                                } else {
-                                    Color32::from_rgb(148, 163, 184)
-                                };
-                                ui.add_sized([120.0, 18.0], egui::Label::new(egui::RichText::new(&chunk.status).color(status_color)));
-                            });
-                        }
-                    }
-                });
-        });
-
-    ui.add_space(6.0);
-
-    // Status Footer
-    ui.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new(&app.status_message)
-                .size(12.0)
-                .color(Color32::from_rgb(148, 163, 184)),
-        );
-    });
-
-    ui.add_space(10.0);
-
-    // Real-Time 60-Second Throughput Graph
-    render_throughput_graph(app, ui);
-}
-
-fn render_throughput_graph(app: &DownloaderApp, ui: &mut egui::Ui) {
-    let now = Instant::now();
-
-    let mut peak_speed: f64 = 0.0;
-    let mut sum_speed: f64 = 0.0;
-    let mut count = 0;
-
-    for (_, speed) in &app.speed_history {
-        if *speed > peak_speed {
-            peak_speed = *speed;
-        }
-        sum_speed += *speed;
-        count += 1;
-    }
-
-    let avg_speed = if count > 0 { sum_speed / count as f64 } else { 0.0 };
-
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("THROUGHPUT GRAPH (LAST 60 SECONDS)").strong().size(12.0));
-
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let stats = format!(
-                "Peak: {}/s  |  Avg: {}/s  |  Current: {}/s",
-                format_bytes(peak_speed as u64),
-                format_bytes(avg_speed as u64),
-                format_bytes(app.animated_speed as u64)
-            );
-            ui.label(
-                egui::RichText::new(stats)
-                    .size(11.0)
-                    .monospace()
-                    .color(Color32::from_rgb(148, 163, 184)),
-            );
-        });
-    });
-
-    ui.add_space(4.0);
-
-    let graph_height = 80.0;
-    let (response, painter) = ui.allocate_painter(Vec2::new(ui.available_width(), graph_height), egui::Sense::hover());
-    let rect = response.rect;
-
-    // Background and frame
-    painter.rect_filled(rect, 4.0, Color32::from_rgb(20, 22, 28));
-    painter.rect_stroke(rect, 4.0, Stroke::new(1.0, Color32::from_rgb(38, 42, 53)));
-
-    // Grid lines (50% and 100%)
-    let y_mid = rect.min.y + (rect.height() / 2.0);
-    painter.line_segment(
-        [Pos2::new(rect.min.x, y_mid), Pos2::new(rect.max.x, y_mid)],
-        Stroke::new(1.0, Color32::from_rgba_unmultiplied(45, 48, 60, 100)),
-    );
-
-    let max_y_speed = (peak_speed * 1.15).max(1024.0 * 1024.0);
-    let label_top = format!("{}/s", format_bytes(max_y_speed as u64));
-    let label_mid = format!("{}/s", format_bytes((max_y_speed / 2.0) as u64));
-
-    painter.text(
-        Pos2::new(rect.min.x + 6.0, rect.min.y + 4.0),
-        egui::Align2::LEFT_TOP,
-        label_top,
-        egui::FontId::monospace(9.0),
-        Color32::from_rgb(100, 116, 139),
-    );
-    painter.text(
-        Pos2::new(rect.min.x + 6.0, y_mid + 2.0),
-        egui::Align2::LEFT_TOP,
-        label_mid,
-        egui::FontId::monospace(9.0),
-        Color32::from_rgb(100, 116, 139),
-    );
-
-    // Render speed curve if points exist
-    if app.speed_history.len() >= 2 {
-        let mut line_points = Vec::new();
-        let width = rect.width();
-        let height = rect.height() - 6.0;
-
-        for (t, speed) in &app.speed_history {
-            let age_secs = now.duration_since(*t).as_secs_f32().min(60.0);
-            let x_ratio = 1.0 - (age_secs / 60.0);
-            let y_ratio = (*speed as f32 / max_y_speed as f32).clamp(0.0, 1.0);
-
-            let pt_x = rect.min.x + (x_ratio * width);
-            let pt_y = (rect.max.y - 2.0) - (y_ratio * height);
-            line_points.push(Pos2::new(pt_x, pt_y));
-        }
-
-        // Draw area fill using a single lightweight egui::Mesh with vertical gradient
-        let mut mesh = egui::Mesh::default();
-        let top_color = Color32::from_rgba_unmultiplied(37, 99, 235, 40);
-        let bot_color = Color32::from_rgba_unmultiplied(37, 99, 235, 5);
-
-        for p in &line_points {
-            let base = Pos2::new(p.x, rect.max.y - 1.0);
-            mesh.colored_vertex(*p, top_color);
-            mesh.colored_vertex(base, bot_color);
-        }
-
-        for i in 0..(line_points.len() as u32 - 1) {
-            let top_left = i * 2;
-            let bot_left = i * 2 + 1;
-            let top_right = (i + 1) * 2;
-            let bot_right = (i + 1) * 2 + 1;
-            mesh.add_triangle(top_left, bot_left, bot_right);
-            mesh.add_triangle(top_left, bot_right, top_right);
-        }
-        painter.add(egui::Shape::mesh(mesh));
-
-        // Draw top speed stroke
-        painter.add(egui::Shape::line(
-            line_points.clone(),
-            Stroke::new(2.0, Color32::from_rgb(56, 189, 248)),
-        ));
-
-        // Animated glowing tracer on the live edge (last point)
-        if let Some(&last_pt) = line_points.last() {
-            let pulse = ((app.pulse_phase.sin() + 1.0) * 0.5).clamp(0.0, 1.0);
-            let glow_radius = 4.0 + pulse * 3.0;
-            painter.circle_filled(
-                last_pt,
-                glow_radius,
-                Color32::from_rgba_unmultiplied(56, 189, 248, (40.0 + pulse * 50.0) as u8),
-            );
-            painter.circle_filled(last_pt, 3.0, Color32::from_rgb(255, 255, 255));
-        }
-    }
-
-    // Hover tooltip
-    if let Some(hover_pos) = response.hover_pos() {
-        if rect.contains(hover_pos) {
-            let age_ratio = 1.0 - ((hover_pos.x - rect.min.x) / rect.width());
-            let target_age_secs = (age_ratio * 60.0) as u64;
-
-            if let Some((_, speed)) = app.speed_history.iter().min_by_key(|(t, _)| {
-                let age = now.duration_since(*t).as_secs();
-                (age as i64 - target_age_secs as i64).abs()
-            }) {
-                painter.line_segment(
-                    [Pos2::new(hover_pos.x, rect.min.y), Pos2::new(hover_pos.x, rect.max.y)],
-                    Stroke::new(1.0, Color32::from_rgb(148, 163, 184)),
-                );
-
-                response.show_tooltip_text(format!(
-                    "T-{}s: {}/s",
-                    target_age_secs,
-                    format_bytes(*speed as u64)
-                ));
-            }
-        }
+    if let Err(e) = spawned {
+        tracing::warn!("Clipboard watcher unavailable: {}", e);
     }
 }
 
-fn render_queue_tab(app: &mut DownloaderApp, ui: &mut egui::Ui) {
-    egui::Frame::none()
-        .fill(Color32::from_rgb(24, 26, 33))
-        .stroke(Stroke::new(1.0, Color32::from_rgb(42, 45, 56)))
-        .inner_margin(12.0)
-        .rounding(6.0)
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Add to Queue:").strong().size(13.0));
-                ui.add_sized(
-                    [ui.available_width() - 100.0, 26.0],
-                    egui::TextEdit::singleline(&mut app.queue_url_input)
-                        .hint_text("Enter file URL or media link to enqueue"),
-                );
-                if ui.button("Add Item").clicked() {
-                    let trimmed = app.queue_url_input.trim();
-                    if !trimmed.is_empty() {
-                        if let Ok(u) = Url::parse(trimmed) {
-                            let save_dir = PathBuf::from(&app.save_dir);
-                            let options = DownloadOptions {
-                                num_connections: app.connections,
-                                base_chunk_size: 4 * 1024 * 1024,
-                                min_steal_threshold: 1024 * 1024,
-                                output_path: Some(save_dir.clone()),
-                                ..Default::default()
-                            };
-                            app.queue.add_item(vec![u], save_dir, options);
-                            app.queue_url_input.clear();
-                        }
-                    }
-                }
-            });
-
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui.button("Clear Completed").clicked() {
-                    app.queue.retain_items(|i| i.status != hyperfetch_core::queue::QueueItemStatus::Completed);
-                }
-                if ui.button("Clear All").clicked() {
-                    app.queue.clear();
-                }
-            });
-        });
-
-    ui.add_space(10.0);
-    ui.label(egui::RichText::new("BATCH DOWNLOAD QUEUE").strong().size(13.0));
-    ui.add_space(4.0);
-
-    egui::Frame::none()
-        .fill(Color32::from_rgb(24, 26, 33))
-        .stroke(Stroke::new(1.0, Color32::from_rgb(42, 45, 56)))
-        .inner_margin(8.0)
-        .rounding(6.0)
-        .show(ui, |ui| {
-            egui::ScrollArea::vertical()
-                .max_height(350.0)
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    if app.queue.items().is_empty() {
-                        ui.vertical_centered(|ui| {
-                            ui.add_space(30.0);
-                            ui.label(
-                                egui::RichText::new("Queue is empty. Add URLs above to build a batch queue.")
-                                    .color(Color32::from_rgb(113, 113, 122)),
-                            );
-                            ui.add_space(30.0);
-                        });
-                    } else {
-                        ui.horizontal(|ui| {
-                            ui.add_sized([40.0, 20.0], egui::Label::new(egui::RichText::new("ID").strong().size(11.0)));
-                            ui.add_sized([220.0, 20.0], egui::Label::new(egui::RichText::new("File").strong().size(11.0)));
-                            ui.add_sized([100.0, 20.0], egui::Label::new(egui::RichText::new("Status").strong().size(11.0)));
-                            ui.add_sized([120.0, 20.0], egui::Label::new(egui::RichText::new("Actions").strong().size(11.0)));
-                        });
-                        ui.separator();
-
-                        let mut to_remove = None;
-                        let mut to_load = None;
-                        for item in app.queue.items() {
-                            ui.horizontal(|ui| {
-                                ui.add_sized([40.0, 18.0], egui::Label::new(format!("#{}", item.id)));
-                                ui.add_sized([220.0, 18.0], egui::Label::new(&item.filename));
-                                let status_str = format!("{:?}", item.status);
-                                ui.add_sized([100.0, 18.0], egui::Label::new(status_str));
-                                if ui.small_button("Download").clicked() {
-                                    to_load = Some(item.urls.clone());
-                                }
-                                if ui.small_button("Remove").clicked() {
-                                    to_remove = Some(item.id);
-                                }
-                            });
-                        }
-
-                        if let Some(id) = to_remove {
-                            app.queue.remove_item(id);
-                        }
-                        if let Some(urls) = to_load {
-                            app.url_input = urls.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(" ");
-                            app.active_tab = GuiTab::Downloader;
-                            app.start_download();
-                        }
-                    }
-                });
-        });
+fn apply_theme(ctx: &egui::Context) {
+    let mut style = (*ctx.style()).clone();
+    style.visuals.dark_mode = true;
+    style.visuals.override_text_color = Some(Color32::from_rgb(228, 232, 240));
+    style.visuals.window_fill = Color32::from_rgb(18, 20, 24);
+    style.visuals.panel_fill = Color32::from_rgb(18, 20, 24);
+    style.visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(26, 28, 35);
+    style.visuals.widgets.inactive.bg_fill = Color32::from_rgb(32, 35, 45);
+    style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(45, 50, 65);
+    style.visuals.widgets.active.bg_fill = Color32::from_rgb(30, 64, 175);
+    ctx.set_style(style);
 }
 
-fn render_history_tab(app: &mut DownloaderApp, ui: &mut egui::Ui) {
-    // Header & Actions
-    egui::Frame::none()
-        .fill(Color32::from_rgb(24, 26, 33))
-        .stroke(Stroke::new(1.0, Color32::from_rgb(42, 45, 56)))
-        .inner_margin(12.0)
-        .rounding(6.0)
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Search History:").strong().size(13.0));
-                ui.add_sized(
-                    [ui.available_width() - 320.0, 26.0],
-                    egui::TextEdit::singleline(&mut app.history_search_input)
-                        .hint_text("Filter by filename, URL, or hash..."),
-                );
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt().try_init();
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let handle = runtime.handle().clone();
 
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Clear History").clicked() {
-                        app.history_manager.clear();
-                    }
-                    if ui.button("Refresh").clicked() {
-                        app.history_manager = hyperfetch_core::history::DownloadHistoryManager::load();
-                    }
-                    if ui.button("Verify Build File...").clicked() {
-                        if let Some(file) = rfd::FileDialog::new().pick_file() {
-                            if let Ok(res) = hyperfetch_core::verify::verify_build_file(&file, None, None) {
-                                app.verification_result = Some(res);
-                            }
-                        }
-                    }
-                });
-            });
-
-            // Verification Result Modal/Card if active
-            if let Some(ref res) = app.verification_result.clone() {
-                ui.add_space(10.0);
-                let is_comp = res.is_complete;
-                egui::Frame::none()
-                    .fill(Color32::from_rgb(18, 24, 38))
-                    .stroke(Stroke::new(1.0, if is_comp { Color32::from_rgb(16, 185, 129) } else { Color32::from_rgb(234, 179, 8) }))
-                    .inner_margin(10.0)
-                    .rounding(4.0)
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            let badge_text = if is_comp { "[ 100% VERIFIED ]" } else { "[ INCOMPLETE / CORRUPTED ]" };
-                            let badge_color = if is_comp { Color32::from_rgb(16, 185, 129) } else { Color32::from_rgb(234, 179, 8) };
-                            ui.label(egui::RichText::new(badge_text).monospace().strong().color(badge_color));
-                            ui.label(egui::RichText::new(&res.status_message).color(Color32::WHITE).size(12.0));
-
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.button("Dismiss").clicked() {
-                                    app.verification_result = None;
-                                    app.verify_status_message = None;
-                                }
-                                if !is_comp && !app.is_repairing {
-                                    let repair_btn = egui::Button::new(
-                                        egui::RichText::new("Repair Missing Chunks Now")
-                                            .strong()
-                                            .color(Color32::WHITE),
-                                    )
-                                    .fill(Color32::from_rgb(37, 99, 235));
-
-                                    if ui.add(repair_btn).clicked() {
-                                        app.is_repairing = true;
-                                        let target_path = res.file_path.clone();
-                                        let missing = res.missing_ranges.clone();
-                                        let total_size = res.expected_size.unwrap_or(res.actual_size);
-
-                                        let urls: Vec<url::Url> = app.history_manager.entries()
-                                            .iter()
-                                            .find(|e| e.file_path == target_path || e.file_name == target_path.file_name().unwrap_or_default().to_string_lossy())
-                                            .map(|e| e.urls.iter().filter_map(|u| url::Url::parse(u).ok()).collect())
-                                            .unwrap_or_default();
-
-                                        if urls.is_empty() {
-                                            app.verify_status_message = Some("Cannot repair: No mirror URLs recorded for this build in history.".to_string());
-                                            app.is_repairing = false;
-                                        } else {
-                                            let (tx_res, rx_res) = std::sync::mpsc::channel();
-                                            let (tx_prog, rx_prog) = std::sync::mpsc::channel();
-                                            app.repair_rx = Some(rx_res);
-                                            app.repair_progress_rx = Some(rx_prog);
-
-                                            let cancel = Arc::clone(&app.cancel_flag);
-
-                                            app.tokio_rt.spawn(async move {
-                                                let res = hyperfetch_core::verify::repair_missing_ranges(
-                                                    &target_path,
-                                                    total_size,
-                                                    &missing,
-                                                    &urls,
-                                                    Some(cancel),
-                                                    move |cur, tot| {
-                                                        let _ = tx_prog.send((cur, tot));
-                                                    },
-                                                ).await;
-                                                let _ = tx_res.send(res);
-                                            });
-                                        }
-                                    }
-                                }
-                            });
-                        });
-
-                        if app.is_repairing {
-                            ui.add_space(6.0);
-                            let ratio = if app.repair_progress.1 > 0 {
-                                (app.repair_progress.0 as f32 / app.repair_progress.1 as f32).clamp(0.0, 1.0)
-                            } else {
-                                0.0
-                            };
-                            ui.add(egui::ProgressBar::new(ratio).show_percentage().text(format!(
-                                "Repairing missing chunks: {} / {}",
-                                format_bytes(app.repair_progress.0),
-                                format_bytes(app.repair_progress.1)
-                            )));
-                        }
-
-                        if let Some(ref msg) = app.verify_status_message {
-                            ui.add_space(4.0);
-                            ui.label(egui::RichText::new(msg).size(11.0).color(Color32::from_rgb(148, 163, 184)));
-                        }
-                    });
-            }
-        });
-
-    ui.add_space(8.0);
-
-    // Entries List
-    egui::Frame::none()
-        .fill(Color32::from_rgb(24, 26, 33))
-        .stroke(Stroke::new(1.0, Color32::from_rgb(42, 45, 56)))
-        .inner_margin(12.0)
-        .rounding(6.0)
-        .show(ui, |ui| {
-            let search_lower = app.history_search_input.trim().to_lowercase();
-            let entries: Vec<_> = app.history_manager.entries()
-                .iter()
-                .filter(|e| {
-                    if search_lower.is_empty() {
-                        true
-                    } else {
-                        e.file_name.to_lowercase().contains(&search_lower)
-                            || e.urls.iter().any(|u| u.to_lowercase().contains(&search_lower))
-                            || e.blake3_hash.as_ref().map_or(false, |h| h.to_lowercase().contains(&search_lower))
-                    }
-                })
-                .cloned()
-                .collect();
-
-            if entries.is_empty() {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(30.0);
-                    ui.label(
-                        egui::RichText::new("No downloads recorded in history yet.")
-                            .color(Color32::from_rgb(113, 113, 122))
-                            .size(13.0),
-                    );
-                    ui.add_space(30.0);
-                });
-            } else {
-                egui::ScrollArea::vertical()
-                    .max_height(450.0)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        for entry in entries {
-                            ui.group(|ui| {
-                                ui.horizontal(|ui| {
-                                    // Status Badge
-                                    let (badge, color) = match entry.status {
-                                        hyperfetch_core::history::HistoryStatus::Completed => ("[ COMPLETED ]", Color32::from_rgb(16, 185, 129)),
-                                        hyperfetch_core::history::HistoryStatus::Failed(_) => ("[ FAILED ]", Color32::from_rgb(239, 68, 68)),
-                                        hyperfetch_core::history::HistoryStatus::Cancelled => ("[ CANCELLED ]", Color32::from_rgb(148, 163, 184)),
-                                    };
-                                    ui.label(egui::RichText::new(badge).monospace().strong().size(11.0).color(color));
-
-                                    // File Name
-                                    ui.label(egui::RichText::new(&entry.file_name).strong().size(13.0).color(Color32::WHITE));
-
-                                    // Size
-                                    ui.label(
-                                        egui::RichText::new(format!("({})", format_bytes(entry.file_size)))
-                                            .size(11.0)
-                                            .color(Color32::from_rgb(148, 163, 184)),
-                                    );
-
-                                    // Actions on Right
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        let entry_id = entry.id.clone();
-                                        if ui.button(egui::RichText::new("Remove").size(11.0).color(Color32::from_rgb(239, 68, 68))).clicked() {
-                                            app.history_manager.remove_entry(&entry_id);
-                                        }
-
-                                        if ui.button(egui::RichText::new("Redownload").size(11.0)).clicked() {
-                                            if let Some(first_url) = entry.urls.first() {
-                                                app.url_input = first_url.clone();
-                                                app.active_tab = GuiTab::Downloader;
-                                            }
-                                        }
-
-                                        if ui.button(egui::RichText::new("Verify & Repair").size(11.0).color(Color32::from_rgb(56, 189, 248))).clicked() {
-                                            if let Ok(res) = hyperfetch_core::verify::verify_build_file(&entry.file_path, Some(entry.file_size), None) {
-                                                app.verification_result = Some(res);
-                                            } else {
-                                                app.verify_status_message = Some(format!("Could not verify {:?}: file may have been moved or deleted.", entry.file_path));
-                                            }
-                                        }
-
-                                        if ui.button(egui::RichText::new("Open Folder").size(11.0)).clicked() {
-                                            if let Some(parent) = entry.file_path.parent() {
-                                                #[cfg(target_os = "windows")]
-                                                let _ = std::process::Command::new("explorer").arg(parent).spawn();
-                                                #[cfg(not(target_os = "windows"))]
-                                                let _ = std::process::Command::new("xdg-open").arg(parent).spawn();
-                                            }
-                                        }
-
-                                        if ui.button(egui::RichText::new("Copy Link").size(11.0)).clicked() {
-                                            if let Some(first_url) = entry.urls.first() {
-                                                if let Ok(mut clip) = arboard::Clipboard::new() {
-                                                    let _ = clip.set_text(first_url.clone());
-                                                }
-                                            }
-                                        }
-                                    });
-                                });
-
-                                // Secondary line: Local path & URLs
-                                ui.horizontal(|ui| {
-                                    let path_str = entry.file_path.to_string_lossy().to_string();
-                                    ui.label(
-                                        egui::RichText::new(format!("Path: {}", path_str))
-                                            .size(11.0)
-                                            .monospace()
-                                            .color(Color32::from_rgb(113, 113, 122)),
-                                    );
-
-                                    if let Some(ref hash) = entry.blake3_hash {
-                                        let truncated_hash = if hash.len() > 16 { &hash[..16] } else { hash };
-                                        ui.label(
-                                            egui::RichText::new(format!("| BLAKE3: {}...", truncated_hash))
-                                                .size(11.0)
-                                                .monospace()
-                                                .color(Color32::from_rgb(113, 113, 122)),
-                                        );
-                                    }
-                                });
-                            });
-                            ui.add_space(4.0);
-                        }
-                    });
-            }
-        });
-}
-
-fn format_bytes(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
-
-    if bytes >= GB {
-        format!("{:.2} GiB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.2} MiB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.2} KiB", bytes as f64 / KB as f64)
-    } else {
-        format!("{} B", bytes)
-    }
-}
-
-fn format_duration(seconds: u64) -> String {
-    let hrs = seconds / 3600;
-    let mins = (seconds % 3600) / 60;
-    let secs = seconds % 60;
-
-    if hrs > 0 {
-        format!("{:02}:{:02}:{:02}", hrs, mins, secs)
-    } else {
-        format!("{:02}:{:02}", mins, secs)
-    }
-}
-
-fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([960.0, 680.0])
-            .with_min_inner_size([750.0, 500.0])
+            .with_inner_size([980.0, 720.0])
+            .with_min_inner_size([760.0, 520.0])
             .with_title("Endo's Unified Downloader"),
         ..Default::default()
     };
-
-    eframe::run_native(
+    let result = eframe::run_native(
         "Endo's Unified Downloader",
         options,
-        Box::new(|cc| Ok(Box::new(DownloaderApp::new(cc)))),
-    )
+        Box::new(move |cc| Ok(Box::new(App::new(cc, handle)))),
+    );
+    // Downloads were stopped in `on_exit`; leftover blocking work (e.g. hashing for a verify)
+    // must not keep the process alive.
+    runtime.shutdown_background();
+    Ok(result?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hyperfetch_core::state::DownloadState;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Minimal HTTP/1.1 file server with range support, sending about 800 KB/s per connection.
+    async fn serve(body: Arc<Vec<u8>>) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let body = Arc::clone(&body);
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let request = String::from_utf8_lossy(&request).to_ascii_lowercase();
+                    let last = body.len() - 1;
+                    let range = request.lines().find_map(|l| l.strip_prefix("range: bytes=")).map(|r| {
+                        let (a, b) = r.trim().split_once('-').unwrap();
+                        (a.parse::<usize>().unwrap(), b.parse::<usize>().map_or(last, |b| b.min(last)))
+                    });
+                    let (start, end) = range.unwrap_or((0, last));
+                    let status = match range {
+                        Some(_) => format!("206 Partial Content\r\nContent-Range: bytes {}-{}/{}", start, end, body.len()),
+                        None => "200 OK".to_string(),
+                    };
+                    let head = format!(
+                        "HTTP/1.1 {}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                        status,
+                        end + 1 - start
+                    );
+                    if socket.write_all(head.as_bytes()).await.is_err() || request.starts_with("head") {
+                        return;
+                    }
+                    for piece in body[start..=end].chunks(8 * 1024) {
+                        if socket.write_all(piece).await.is_err() {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    async fn run(
+        url: &Url,
+        options: &DownloadOptions,
+        leftovers_of: Option<PathBuf>,
+        pause_after: Option<Duration>,
+    ) -> Result<(PathBuf, Option<u64>), String> {
+        let cancel = Arc::new(Notify::new());
+        let slot = Arc::new(Mutex::new(None));
+        let job = tokio::spawn(run_job(
+            vec![url.clone()],
+            options.clone(),
+            leftovers_of,
+            Arc::clone(&cancel),
+            Arc::clone(&slot),
+            egui::Context::default(),
+        ));
+        if let Some(delay) = pause_after {
+            tokio::time::sleep(delay).await;
+            assert!(lock(&slot).is_some(), "snapshots reach the UI slot");
+            cancel.notify_one();
+        }
+        tokio::time::timeout(Duration::from_secs(60), job).await.unwrap().unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pause_keeps_resume_state_and_start_over_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("ENDO_HISTORY_PATH", dir.path().join("history.json"));
+        let body: Arc<Vec<u8>> = Arc::new((0..3 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect());
+        let addr = serve(Arc::clone(&body)).await;
+        // The folder does not exist yet: the job creates it instead of the engine treating it as a file name.
+        let downloads = dir.path().join("downloads");
+        let options = DownloadOptions { num_connections: 2, output_path: Some(downloads.clone()), ..Default::default() };
+
+        // Pause: run() returns only after saving the resume state next to the .part.
+        let url = Url::parse(&format!("http://{}/file.bin", addr)).unwrap();
+        let final_path = downloads.join("file.bin");
+        let [hfstate, _, part] = util::leftover_paths(&final_path);
+        assert!(run(&url, &options, None, Some(Duration::from_millis(700))).await.is_err());
+        assert!(part.exists() && !final_path.exists());
+        let saved = DownloadState::load_from_path(&hfstate).unwrap().expect("resume state saved");
+        assert!(!saved.completed_ranges.is_empty(), "progress was recorded");
+
+        // Resume completes the same file.
+        let (path, size) = run(&url, &options, None, None).await.unwrap();
+        assert_eq!((path, size), (final_path.clone(), Some(body.len() as u64)));
+        assert!(std::fs::read(&final_path).unwrap() == *body);
+        assert!(!part.exists() && !hfstate.exists());
+
+        // Corrupt already-downloaded bytes of a paused download: a resume keeps them, Start Over
+        // deletes the partial file and fetches everything again.
+        for start_over in [false, true] {
+            let name = format!("other-{}.bin", start_over);
+            let url = Url::parse(&format!("http://{}/{}", addr, name)).unwrap();
+            let other = downloads.join(&name);
+            let [_, _, other_part] = util::leftover_paths(&other);
+            assert!(run(&url, &options, None, Some(Duration::from_millis(700))).await.is_err());
+            let mut file = std::fs::OpenOptions::new().write(true).open(&other_part).unwrap();
+            std::io::Write::write_all(&mut file, &[0xAA; 16 * 1024]).unwrap();
+            drop(file);
+            let leftovers_of = start_over.then(|| other.clone());
+            run(&url, &options, leftovers_of, None).await.unwrap();
+            assert_eq!(std::fs::read(&other).unwrap() == *body, start_over);
+        }
+        assert!(std::fs::read(&final_path).unwrap() == *body, "other files are untouched");
+    }
 }
