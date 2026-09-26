@@ -2845,6 +2845,35 @@ mod tests {
         assert_eq!(busy.answer_time, None);
     }
 
+    #[tokio::test]
+    async fn test_downloads_sharing_a_host_stay_within_its_budget_through_steals_and_takeovers() {
+        const MIB: usize = 1024 * 1024;
+        let data: Vec<u8> = (0..9 * MIB).map(|i| (i % 251) as u8).collect();
+        let base = file_server(data.clone(), Duration::from_millis(2)).await;
+        let dir = tempdir().unwrap();
+        let engine = |path: &str, out: &str| {
+            let options = DownloadOptions {
+                num_connections: 8,
+                base_chunk_size: 256 * 1024,
+                max_connections_per_host: 4,
+                output_path: Some(dir.path().join(out)),
+                ..Default::default()
+            };
+            DownloadEngine::new(vec![base.join(path).unwrap()], options)
+        };
+        // Steals are on (the default floor), and one connection goes silent to be taken over.
+        let (a, b) = (engine("stall/a.bin", "a.bin"), engine("b.bin", "b.bin"));
+
+        let (a_done, b_done) = tokio::time::timeout(Duration::from_secs(30), async { tokio::join!(a.run(None), b.run(None)) })
+            .await
+            .expect("both downloads finish");
+        for (done, out) in [(a_done, "a.bin"), (b_done, "b.bin")] {
+            assert_eq!(done.unwrap(), dir.path().join(out));
+            assert!(std::fs::read(dir.path().join(out)).unwrap() == data, "{out} differs");
+        }
+        assert_eq!(crate::hosts::peak(&base), 4, "sixteen workers share the host's four slots");
+    }
+
     #[test]
     fn test_select_mirrors_drops_different_files() {
         let mut other_size = remote(2000);
