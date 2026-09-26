@@ -1168,7 +1168,8 @@ impl Drop for CookieRun<'_> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunKind {
     /// Finds what to download and prints it as JSON (`-J`), for the engine to download
-    /// (see [`fast_download`]). Its formats are plain files and playlists: no `formats=dashy`.
+    /// (see [`fast_download`]), or else a Download run of [`Source::Info`]. Its formats are plain
+    /// files and playlists: no `formats=dashy`.
     Extract,
     /// Downloads and post-processes, printing progress for [`OutputState`].
     Download,
