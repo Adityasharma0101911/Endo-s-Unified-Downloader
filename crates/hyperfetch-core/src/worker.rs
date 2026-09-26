@@ -1,13 +1,15 @@
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use futures_util::StreamExt;
+use bytes::Bytes;
+use futures_util::stream::BoxStream;
+use futures_util::{Stream, StreamExt};
 use parking_lot::Mutex;
 use reqwest::header::{
     HeaderMap, HeaderValue, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE, ETAG, IF_RANGE, LAST_MODIFIED,
     RANGE, RETRY_AFTER,
 };
-use reqwest::{Client, RequestBuilder, Response, StatusCode};
+use reqwest::{Client, RequestBuilder, StatusCode};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use url::Url;
@@ -184,6 +186,9 @@ pub struct WorkerShared {
     pub body_idle: Duration,
 }
 
+/// The body of an answer, as it comes.
+pub type Body = BoxStream<'static, reqwest::Result<Bytes>>;
+
 /// An answer already bringing a chunk's bytes, from the chunk's start: the probe's, which its
 /// worker streams as its first attempt instead of asking for those bytes again.
 pub struct Seed {
@@ -192,7 +197,7 @@ pub struct Seed {
     pub mirror_id: usize,
     /// Where the answer came from.
     pub url: Url,
-    pub response: Response,
+    pub body: Body,
     /// The host slot the answer's request holds.
     pub slot: HostSlot,
 }
@@ -200,28 +205,23 @@ pub struct Seed {
 pub struct HttpWorker {
     pub worker_id: usize,
     shared: WorkerShared,
-    seed: Option<Seed>,
 }
 
 impl HttpWorker {
     pub fn new(worker_id: usize, shared: WorkerShared) -> Self {
-        Self { worker_id, shared, seed: None }
-    }
-
-    /// A worker whose first attempt streams `seed`'s answer, which must be assigned to it.
-    pub fn seeded(worker_id: usize, shared: WorkerShared, seed: Seed) -> Self {
-        Self { worker_id, shared, seed: Some(seed) }
+        Self { worker_id, shared }
     }
 
     /// Takes chunks (or takes over or steals from slow ones) until cancelled or the engine goes away.
     /// Each request holds a slot of its host's connection budget, taken before any chunk: waiting
-    /// for one is neither a stall nor a failure, and leaves nothing for others to steal. A seed
-    /// comes first, like any other attempt but for the request.
-    pub async fn run(mut self) {
-        if let Some(Seed { chunk, mirror_id, url, response, slot }) = self.seed.take() {
+    /// for one is neither a stall nor a failure, and leaves nothing for others to steal. A `seed`,
+    /// whose chunk must be assigned to this worker, comes first, like any other attempt but for
+    /// the request.
+    pub async fn run(self, seed: Option<Seed>) {
+        if let Some(Seed { chunk, mirror_id, url, body, slot }) = seed {
             self.shared.mirrors.lock().acquire_mirror(mirror_id);
             let start = chunk.current_offset.load(Ordering::SeqCst);
-            let outcome = self.receive(&chunk, mirror_id, response, start).await;
+            let outcome = self.receive(&chunk, mirror_id, body, start).await;
             if !self.conclude(&chunk, mirror_id, &url, outcome, slot).await {
                 return;
             }
@@ -411,15 +411,21 @@ impl HttpWorker {
         let setup_time = (response.url() == url && slot.opens_connection()).then_some(ttfb);
         hosts::record(response.url(), HostProfile { accepts_ranges, setup_time, ..Default::default() });
         let _ = s.events.try_send(WorkerEvent::Ttfb { worker_id: self.worker_id, mirror_id, ttfb });
-        self.receive(chunk, mirror_id, response, start).await
+        self.receive(chunk, mirror_id, response.bytes_stream(), start).await
     }
 
-    /// Streams the body of `response`, the chunk's bytes from `start`, into the file. The attempt
-    /// ends once `body_idle` passes without a byte: what arrived is kept for the retry. It ends at
-    /// once when another worker takes the chunk over; what arrived is then left to that worker.
-    async fn receive(&self, chunk: &Chunk, mirror_id: usize, response: Response, start: u64) -> Result<(), Failure> {
+    /// Streams `body`, the chunk's bytes from `start`, into the file. The attempt ends once
+    /// `body_idle` passes without a byte: what arrived is kept for the retry. It ends at once when
+    /// another worker takes the chunk over; what arrived is then left to that worker.
+    async fn receive(
+        &self,
+        chunk: &Chunk,
+        mirror_id: usize,
+        body: impl Stream<Item = reqwest::Result<Bytes>>,
+        start: u64,
+    ) -> Result<(), Failure> {
         let s = &self.shared;
-        let mut stream = response.bytes_stream();
+        let mut stream = std::pin::pin!(body);
         let mut batch = Batch { pos: start, buf: Vec::with_capacity(WRITE_BATCH) };
         // Due `WRITE_INTERVAL` after the oldest byte in `batch` arrived.
         let flush_due = tokio::time::sleep(WRITE_INTERVAL);
@@ -865,14 +871,13 @@ mod tests {
         hosts::try_acquire(url, 0).unwrap()
     }
 
-    /// A 206 body that sends each `(ms, len)` step `ms` after the one before, then goes silent.
-    fn silent_after(steps: Vec<(u64, usize)>) -> Response {
+    /// A body that sends each `(ms, len)` step `ms` after the one before, then goes silent.
+    fn silent_after(steps: Vec<(u64, usize)>) -> Body {
         let steps = futures_util::stream::iter(steps).then(|(ms, len)| async move {
             tokio::time::sleep(Duration::from_millis(ms)).await;
-            Ok::<_, std::io::Error>(bytes::Bytes::from(vec![9u8; len]))
+            Ok(Bytes::from(vec![9u8; len]))
         });
-        let body = reqwest::Body::wrap_stream(steps.chain(futures_util::stream::pending()));
-        Response::from(http::Response::new(body))
+        steps.chain(futures_util::stream::pending()).boxed()
     }
 
     #[tokio::test]
@@ -885,11 +890,11 @@ mod tests {
         let url = Url::parse("http://seeded.worker.invalid/f").unwrap();
         let (worker, chunk, mut events) = test_worker(&url, &path, SIZE as u64);
         let shared = worker.shared.clone();
-        let response = Response::from(http::Response::new(reqwest::Body::from(data.clone())));
+        let response = reqwest::Response::from(http::Response::new(reqwest::Body::from(data.clone())));
         let slot = hosts::try_acquire(&url, 1).unwrap();
         assert!(hosts::try_acquire(&url, 1).is_none(), "the answer's request holds the host's only slot");
-        let seed = Seed { chunk, mirror_id: 0, url: url.clone(), response, slot };
-        let task = tokio::spawn(HttpWorker::seeded(0, shared.clone(), seed).run());
+        let seed = Seed { chunk, mirror_id: 0, url: url.clone(), body: response.bytes_stream().boxed(), slot };
+        let task = tokio::spawn(HttpWorker::new(0, shared.clone()).run(Some(seed)));
 
         let completed = tokio::time::timeout(Duration::from_secs(10), async {
             loop {

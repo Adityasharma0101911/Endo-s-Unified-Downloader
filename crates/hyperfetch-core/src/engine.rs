@@ -1,8 +1,10 @@
 use std::fs::{File, OpenOptions, TryLockError};
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -29,7 +31,8 @@ use crate::resolver::{GoogleDriveResolver, HtmlVideoResolver};
 use crate::state::DownloadState;
 use crate::storage::{DiskWriter, StorageError, VerifyError};
 use crate::worker::{
-    authorize, content_length, retry_after, Auth, FailureKind, HttpWorker, RateLimiter, Seed, WorkerEvent, WorkerShared,
+    authorize, content_length, retry_after, Auth, Body, FailureKind, HttpWorker, RateLimiter, Seed, WorkerEvent,
+    WorkerShared,
 };
 
 const CANCELLED: &str = "Download cancelled by user";
@@ -702,10 +705,11 @@ impl DownloadEngine {
     /// The reference's prefetch, the file's first bytes from the probe, counts as downloaded; it
     /// is written wherever the resumed state does not already hold those bytes. The probe's
     /// answer, if still `live`, goes on as the first chunk from where the probe stopped reading,
-    /// when those bytes are still missing. The bytes one connection carries in the time another
-    /// takes to start (the reference's `per_setup`) justify one connection each, up to the limit
-    /// and what the mirrors' hosts take at once. Mirrors whose probes come in `late` join as they
-    /// do, if they serve the reference's file.
+    /// when those bytes are still missing, its rate watched on until another connection answers
+    /// (see `Watched`). The bytes one connection carries in the time another takes to start (the
+    /// reference's `per_setup`) justify one connection each, up to the limit and what the
+    /// mirrors' hosts take at once. Mirrors whose probes come in `late` join as they do, if they
+    /// serve the reference's file.
     #[allow(clippy::too_many_arguments)]
     async fn fetch_ranges(
         &self,
@@ -736,11 +740,18 @@ impl DownloadEngine {
         let chunk_size = effective_chunk_size(remaining, num_workers as u64, self.options.base_chunk_size);
         let mut manager = ChunkManager::with_resumed_ranges(size, chunk_size, &have).map_err(|e| e.to_string())?;
         manager.set_max_retries(self.options.max_retries);
-        // The probe's answer is worker 0's first attempt.
+        // The probe's answer is worker 0's first attempt, its connection's rate watched on while no
+        // other connection of the download has an answer.
+        let alone = CancellationToken::new();
         let seed = match live {
-            Some(Live::Range { response, slot, end }) => mirrors.iter().position(|m| m.url == reference.url).and_then(|mirror_id| {
+            Some(Live::Range { response, slot, end, watch }) => mirrors.iter().position(|m| m.url == reference.url).and_then(|mirror_id| {
                 let chunk = manager.assign_at(0, mirror_id, prefetch.len() as u64, end)?;
-                Some(Seed { chunk, mirror_id, url: reference.final_url.clone(), response, slot })
+                let (body, url) = (response.bytes_stream().boxed(), reference.final_url.clone());
+                let body = match watch {
+                    Some(watch) => Watched { body, watch: Some(watch), alone: alone.clone(), url: url.clone() }.boxed(),
+                    None => body,
+                };
+                Some(Seed { chunk, mirror_id, url, body, slot })
             }),
             _ => None,
         };
@@ -791,10 +802,10 @@ impl DownloadEngine {
         let mut workers = JoinSet::new();
         let seeded = seed.is_some() as usize;
         if let Some(seed) = seed {
-            workers.spawn(HttpWorker::seeded(0, shared.clone(), seed).run());
+            workers.spawn(HttpWorker::new(0, shared.clone()).run(Some(seed)));
         }
         for worker_id in seeded..num_workers {
-            workers.spawn(HttpWorker::new(worker_id, shared.clone()).run());
+            workers.spawn(HttpWorker::new(worker_id, shared.clone()).run(None));
         }
         drop(shared);
 
@@ -814,6 +825,9 @@ impl DownloadEngine {
                 },
                 event = events.recv() => match event {
                     Some(event) => {
+                        if matches!(event, WorkerEvent::Ttfb { .. }) {
+                            alone.cancel();
+                        }
                         if let Err(e) = job.handle(event) {
                             break Err(e);
                         }
@@ -1427,8 +1441,8 @@ enum Holds {
 /// A probe's answer whose body is still coming, with the host slot its request holds.
 enum Live {
     /// The rest of a ranged answer: the file's bytes from where the probe stopped reading up to
-    /// `end`.
-    Range { response: Response, slot: HostSlot, end: u64 },
+    /// `end`, and the watch on its connection's rate while that told nothing yet.
+    Range { response: Response, slot: HostSlot, end: u64, watch: Option<RateWatch> },
     /// A server ignoring the probe's range sent the whole file, none of it read yet.
     Stream { response: Response, slot: HostSlot },
 }
@@ -1451,7 +1465,7 @@ struct Probed {
     late: Option<ProbeStream>,
 }
 
-/// Lets `read_prefix` measure the rate from when the answer arrived.
+/// Where a `RateWatch` measures a connection's rate from: when its answer arrived.
 #[derive(Clone, Copy)]
 struct Pace {
     answered: tokio::time::Instant,
@@ -1765,14 +1779,145 @@ fn accepts_bytes(headers: &HeaderMap) -> bool {
         .any(|unit| unit.trim().eq_ignore_ascii_case("bytes"))
 }
 
+/// Watches one connection's rate for a cap on it. Every half setup time (the time a new
+/// connection needs before its first byte), or at the first byte after, the rate over the bytes
+/// that came since the last look is measured; a look at nothing leaves the window open, as a pause
+/// is no rate. Two rates in a row without it climbing mean TCP slow start (which new connections
+/// would go through too) is over and the server caps the connection at that rate.
+struct RateWatch {
+    pace: Pace,
+    tick: Duration,
+    /// Bytes that came since the answer, and when the last of them came.
+    received: u64,
+    last_byte_at: tokio::time::Instant,
+    /// The window being measured: since when, from how many bytes, and when it is next looked at.
+    window_began: tokio::time::Instant,
+    window_began_len: u64,
+    next_tick: tokio::time::Instant,
+    /// The last rate measured, and whether it had stopped climbing.
+    last: Option<(f64, bool)>,
+    /// The rate, in bytes per second, the connection keeps to, once it kept to it twice in a row.
+    capped_at: Option<f64>,
+}
+
+impl RateWatch {
+    fn new(pace: Pace) -> Self {
+        let tick = (pace.setup / 2).max(MIN_RATE_TICK);
+        Self {
+            pace,
+            tick,
+            received: 0,
+            last_byte_at: pace.answered,
+            window_began: pace.answered,
+            window_began_len: 0,
+            next_tick: pace.answered + tick,
+            last: None,
+            capped_at: None,
+        }
+    }
+
+    /// `bytes` came at `now`, after the window a look then due measures.
+    fn arrived(&mut self, bytes: u64, now: tokio::time::Instant) {
+        self.look(now);
+        self.received += bytes;
+        self.last_byte_at = now;
+    }
+
+    /// Measures the rate over the window up to `now`, if a look is due.
+    fn look(&mut self, now: tokio::time::Instant) {
+        if now < self.next_tick {
+            return;
+        }
+        self.next_tick = now + self.tick;
+        let got = self.received - self.window_began_len;
+        if got == 0 {
+            return;
+        }
+        let rate = got as f64 / (now - self.window_began).as_secs_f64();
+        let flat = self.last.is_some_and(|(prev, _)| rate < prev * 1.5);
+        if flat && self.last.is_some_and(|(_, was_flat)| was_flat) {
+            self.capped_at = Some(rate);
+        } else if !flat {
+            self.capped_at = None;
+        }
+        self.last = Some((rate, flat));
+        (self.window_began, self.window_began_len) = (now, self.received);
+    }
+
+    /// What the connection told of its host so far: capped at `capped_at`; or not capped (`None`)
+    /// once it came, on average, so fast that in the time a new connection takes to start it
+    /// brings all one connection is ever asked to carry (`BYTES_PER_CONNECTION`), since whatever
+    /// cap it may have above that rate, no download would be split differently for it. Less tells
+    /// nothing: a cap may be just ahead.
+    fn verdict(&self) -> Option<Option<f64>> {
+        if self.capped_at.is_some() {
+            return Some(self.capped_at);
+        }
+        let secs = (self.last_byte_at - self.pace.answered).as_secs_f64();
+        let rate = (secs > 0.0).then(|| self.received as f64 / secs);
+        let fast = bytes_per_setup(rate, Some(self.pace.setup)).is_some_and(|bytes| bytes >= BYTES_PER_CONNECTION);
+        fast.then_some(None)
+    }
+
+    /// Records what the connection told of `url`'s host, if anything; whether it told anything.
+    fn record(&self, url: &Url) -> bool {
+        let Some(capped_at) = self.verdict() else { return false };
+        let seen = HostProfile { capped_per_connection: Some(capped_at.is_some()), connection_rate: capped_at, ..Default::default() };
+        hosts::record(url, seen);
+        true
+    }
+}
+
+/// The rest of the probe's answer as the first chunk's worker reads it, its connection's rate
+/// watched on (see `RateWatch`) for as long as the download has no other connection with an
+/// answer: what it tells of the host is recorded once it tells it, or once watching ends.
+struct Watched {
+    body: Body,
+    watch: Option<RateWatch>,
+    /// Cancelled once another connection of the download has its answer.
+    alone: CancellationToken,
+    url: Url,
+}
+
+impl Watched {
+    fn stop(&mut self) {
+        if let Some(watch) = self.watch.take() {
+            watch.record(&self.url);
+        }
+    }
+}
+
+impl futures_util::Stream for Watched {
+    type Item = reqwest::Result<Bytes>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        let item = std::task::ready!(this.body.poll_next_unpin(cx));
+        let over = match (&item, this.watch.as_mut()) {
+            (Some(Ok(bytes)), Some(watch)) if !this.alone.is_cancelled() => {
+                watch.arrived(bytes.len() as u64, tokio::time::Instant::now());
+                watch.capped_at.is_some()
+            }
+            _ => true,
+        };
+        if over {
+            this.stop();
+        }
+        Poll::Ready(item)
+    }
+}
+
+impl Drop for Watched {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 /// What `read_prefix` read.
 struct Prefix {
     bytes: Bytes,
-    /// The rate, in bytes per second, of a connection found capped.
-    capped_at: Option<f64>,
-    /// Whether the rate measured tells if the connection is capped, as `capped_at` says: reading
-    /// stopped for a capped one, or brought all that was asked for.
-    told: bool,
+    /// The connection's rate, as watched while reading.
+    watch: Option<RateWatch>,
     /// Whether reading stopped by choice, for a capped connection or at the deadline, while the
     /// body is still coming: the rest of it can go on as the download's first chunk.
     live: bool,
@@ -1781,32 +1926,24 @@ struct Prefix {
 /// Reads up to `len` bytes of a probe's body until `deadline`, giving up after `stall` without
 /// data. Whatever arrived is kept, even if the body ends early.
 ///
-/// With `pace`, the rate is measured every half setup time. Two ticks in a row without it
-/// climbing mean TCP slow start (which new connections would go through too) is over and the
-/// server caps the connection at that rate. Reading stops there if the rest would take over two
-/// setup times: workers fetch it in parallel sooner, with this connection as one of them.
+/// With `watch`, the connection's rate is watched for a cap (see `RateWatch`). Reading stops at
+/// one if the rest would take over two setup times: workers fetch it in parallel sooner, with this
+/// connection as one of them.
 async fn read_prefix(
     response: &mut Response,
     len: u64,
     deadline: Option<tokio::time::Instant>,
-    pace: Option<Pace>,
+    mut watch: Option<RateWatch>,
     stall: Duration,
     limiter: Option<&RateLimiter>,
 ) -> Prefix {
     let mut kept = Vec::with_capacity(len as usize);
     let mut last_byte_at = tokio::time::Instant::now();
-    let tick = pace.map_or(MIN_RATE_TICK, |p| (p.setup / 2).max(MIN_RATE_TICK));
-    // The window being measured, and when it is next looked at.
-    let (mut window_began, mut window_began_len) = (pace.map_or(last_byte_at, |p| p.answered), 0);
-    let mut next_tick = window_began + tick;
-    // The last rate measured, and whether it had stopped climbing.
-    let mut last: Option<(f64, bool)> = None;
-    let mut capped_at = None;
-    let (mut told, mut live) = (false, false);
+    let mut live = false;
     while (kept.len() as u64) < len {
         let mut wake = last_byte_at + stall;
-        if pace.is_some() {
-            wake = wake.min(next_tick);
+        if let Some(watch) = &watch {
+            wake = wake.min(watch.next_tick);
         }
         if let Some(deadline) = deadline {
             wake = wake.min(deadline);
@@ -1819,6 +1956,9 @@ async fn read_prefix(
                 let take = bytes.len().min(len as usize - kept.len());
                 kept.extend_from_slice(&bytes[..take]);
                 last_byte_at = tokio::time::Instant::now();
+                if let Some(watch) = &mut watch {
+                    watch.arrived(take as u64, last_byte_at);
+                }
             }
             Ok(_) => break, // the body ended, or failed
             Err(_) => {
@@ -1830,31 +1970,20 @@ async fn read_prefix(
                     live = true; // out of time: the rest goes on alongside the workers
                     break;
                 }
-                let Some(p) = pace else { continue };
-                next_tick = now + tick;
-                let got = kept.len() - window_began_len;
-                if got == 0 {
-                    continue; // a pause, not a rate: the window stays open, and stalls are timed above
+                if let Some(watch) = &mut watch {
+                    watch.look(now);
                 }
-                let rate = got as f64 / (now - window_began).as_secs_f64();
-                let setup = p.setup.as_secs_f64();
-                let flat = last.is_some_and(|(prev, _)| rate < prev * 1.5);
-                if flat && last.is_some_and(|(_, was_flat)| was_flat) {
-                    capped_at = Some(rate);
-                    if (len - kept.len() as u64) as f64 > 2.0 * rate * setup {
-                        (told, live) = (true, true);
-                        break;
-                    }
-                } else if !flat {
-                    capped_at = None;
-                }
-                last = Some((rate, flat));
-                (window_began, window_began_len) = (now, kept.len());
+            }
+        }
+        if let Some(watch) = &watch {
+            let rest = (len - kept.len() as u64) as f64;
+            if watch.capped_at.is_some_and(|rate| rest > 2.0 * rate * watch.pace.setup.as_secs_f64()) {
+                live = true;
+                break;
             }
         }
     }
-    told |= pace.is_some() && kept.len() as u64 == len;
-    Prefix { bytes: kept.into(), capped_at, told, live }
+    Prefix { bytes: kept.into(), watch, live }
 }
 
 /// Reads the file's start from the first mirror's probe answer, as much of it as the workers
@@ -1865,7 +1994,8 @@ async fn read_prefix(
 /// What its host was seen to do (see [`crate::hosts`]) spares measuring it again: on a host known
 /// to cap each connection the workers start at once, at the rate it was capped at; on one known
 /// not to, the start is read as if no rate could be measured. Otherwise what the measurement
-/// tells is recorded for the next download.
+/// tells is recorded for the next download, and while it tells nothing yet, the answer's
+/// connection is watched on as the first chunk (see `Watched`).
 async fn take_start(
     info: &mut ProbeInfo,
     body: ProbeBody,
@@ -1887,22 +2017,22 @@ async fn take_start(
     let splits = info.accepts_ranges && several_connections;
     if splits && known.capped_per_connection == Some(true) {
         info.per_setup = bytes_per_setup(known.connection_rate, setup);
-        return Some(Live::Range { response, slot, end: len.saturating_sub(1) });
+        return Some(Live::Range { response, slot, end: len.saturating_sub(1), watch: None });
     }
     // Only the start of a larger file keeps workers waiting.
     let deadline = (info.size != Some(len)).then(|| tokio::time::Instant::now() + PREFETCH_TIME);
     // A speed limit would make every connection look capped.
-    let pace = setup
+    let watch = setup
         .filter(|_| splits && limiter.is_none() && known.capped_per_connection.is_none())
-        .map(|setup| Pace { answered, setup });
-    let prefix = read_prefix(&mut response, len, deadline, pace, stall, limiter).await;
-    if prefix.told {
-        let capped = Some(prefix.capped_at.is_some());
-        hosts::record(&info.final_url, HostProfile { capped_per_connection: capped, connection_rate: prefix.capped_at, ..Default::default() });
-    }
+        .map(|setup| RateWatch::new(Pace { answered, setup }));
+    let prefix = read_prefix(&mut response, len, deadline, watch, stall, limiter).await;
     info.prefetch = prefix.bytes;
-    info.per_setup = bytes_per_setup(prefix.capped_at, setup);
-    prefix.live.then(|| Live::Range { response, slot, end: len.saturating_sub(1) })
+    info.per_setup = bytes_per_setup(prefix.watch.as_ref().and_then(|watch| watch.capped_at), setup);
+    let mut watch = prefix.watch;
+    if watch.as_ref().is_some_and(|watch| watch.record(&info.final_url)) {
+        watch = None;
+    }
+    prefix.live.then(|| Live::Range { response, slot, end: len.saturating_sub(1), watch })
 }
 
 /// Bytes a connection at `rate` carries in the time `setup` another needs to start.
@@ -2779,7 +2909,17 @@ mod tests {
     /// Reads all of `body` as a probe whose answer took 40 ms, so its rate ticks every 20 ms.
     async fn read_paced(body: &mut Response, len: u64, paced_read: bool) -> Prefix {
         let pace = Pace { answered: tokio::time::Instant::now(), setup: Duration::from_millis(40) };
-        read_prefix(body, len, None, paced_read.then_some(pace), Duration::from_secs(1), None).await
+        read_prefix(body, len, None, paced_read.then(|| RateWatch::new(pace)), Duration::from_secs(1), None).await
+    }
+
+    /// What a read's connection told of its host.
+    fn verdict(prefix: &Prefix) -> Option<Option<f64>> {
+        prefix.watch.as_ref().and_then(RateWatch::verdict)
+    }
+
+    /// The rate a read found its connection capped at.
+    fn capped_at(prefix: &Prefix) -> Option<f64> {
+        prefix.watch.as_ref().and_then(|watch| watch.capped_at)
     }
 
     /// What is left of a body, read to its end.
@@ -2799,15 +2939,15 @@ mod tests {
         let mut body = capped();
         let prefix = read_paced(&mut body, PREFETCH, true).await;
         assert!(prefix.bytes.len() <= 256 * 1024, "{}", prefix.bytes.len());
-        let per_setup = bytes_per_setup(prefix.capped_at, Some(Duration::from_millis(40))).expect("a capped rate is measured");
+        let per_setup = bytes_per_setup(capped_at(&prefix), Some(Duration::from_millis(40))).expect("a capped rate is measured");
         assert!((80 * 1024..=140 * 1024).contains(&per_setup), "{per_setup}");
         // The probe's connection is one of them: the rest of its answer is still coming.
-        assert!(prefix.told && prefix.live);
+        assert!(verdict(&prefix).is_some() && prefix.live);
         assert_eq!(prefix.bytes.len() + rest_of(body).await, PREFETCH as usize, "nothing read was lost");
 
         // Without ranges only the whole body is of use, and no rate tells anything.
         let prefix = read_paced(&mut capped(), PREFETCH, false).await;
-        assert_eq!((prefix.bytes.len() as u64, prefix.live, prefix.told), (PREFETCH, false, false));
+        assert_eq!((prefix.bytes.len() as u64, prefix.live, verdict(&prefix)), (PREFETCH, false, None));
     }
 
     #[tokio::test(start_paused = true)]
@@ -2819,8 +2959,78 @@ mod tests {
         let mut body = paced(steps.into_iter().map(|(ms, k)| (ms, k * 1024)).collect());
         let prefix = read_paced(&mut body, 256 * 1024, true).await;
         assert_eq!(prefix.bytes.len(), 256 * 1024);
-        assert_eq!((prefix.capped_at, prefix.live), (None, false));
-        assert!(prefix.told, "all of it came before the rate stopped climbing: no cap");
+        assert_eq!((capped_at(&prefix), prefix.live), (None, false));
+        // All of it came before the rate stopped climbing, but a cap may have been just ahead:
+        // ~2 MB/s brings far less than a connection is asked to carry in the 40 ms another needs.
+        assert_eq!(verdict(&prefix), None, "too little came too slowly to tell there is no cap");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_what_a_connection_tells_of_its_host() {
+        let setup = Duration::from_millis(40);
+        let url = Url::parse("http://told.engine.invalid/f").unwrap();
+        // Too short to measure: two pieces, 20 KiB at ~0.6 MB/s. Nothing is recorded, so the next
+        // file from the host, as capped, is measured and split, not kept on one connection.
+        let mut info = probed(url.as_str(), 20 * 1024);
+        let body = probe_body(&url, paced(vec![(0, 16 * 1024), (32, 4 * 1024)]), 20 * 1024, setup);
+        assert!(take_start(&mut info, body, true, None, Duration::from_secs(1)).await.is_none());
+        assert_eq!(info.prefetch.len(), 20 * 1024);
+        assert_eq!(hosts::profile(&url).capped_per_connection, None);
+        let mut info = probed(url.as_str(), PREFETCH);
+        let body = probe_body(&url, capped_body(), PREFETCH, setup);
+        assert!(matches!(take_start(&mut info, body, true, None, Duration::from_secs(1)).await, Some(Live::Range { .. })));
+        assert_eq!(hosts::profile(&url).capped_per_connection, Some(true));
+
+        // So fast that, in the time a new connection needs, it brings all a connection is asked
+        // to carry: whatever cap it has, splitting could not pay off.
+        let url = Url::parse("http://told-fast.engine.invalid/f").unwrap();
+        let mut info = probed(url.as_str(), PREFETCH);
+        let body = probe_body(&url, paced(vec![(0, 256 * 1024), (2, 256 * 1024), (2, 256 * 1024), (2, 256 * 1024)]), PREFETCH, setup);
+        assert!(take_start(&mut info, body, true, None, Duration::from_secs(1)).await.is_none());
+        let seen = hosts::profile(&url);
+        assert_eq!((seen.capped_per_connection, seen.connection_rate), (Some(false), None));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_a_connection_that_told_nothing_yet_is_watched_on_as_the_first_chunk() {
+        // New connections take 200 ms, so the rate is looked at every 100 ms: by the 250 ms the
+        // workers wait for the start of a larger file, the capped rate held only once.
+        let taken = |url: &Url| {
+            hosts::record(url, HostProfile { setup_time: Some(Duration::from_millis(200)), ..Default::default() });
+            let info = probed(url.as_str(), 4 * PREFETCH);
+            let body = probe_body(url, capped_body(), PREFETCH, Duration::from_millis(200));
+            async move {
+                let mut info = info;
+                match take_start(&mut info, body, true, None, Duration::from_secs(1)).await {
+                    Some(Live::Range { response, watch: Some(watch), .. }) => (response, watch),
+                    _ => panic!("the answer goes on, still watched"),
+                }
+            }
+        };
+        let url = Url::parse("http://watched.engine.invalid/f").unwrap();
+        let (response, watch) = taken(&url).await;
+        assert_eq!(hosts::profile(&url).capped_per_connection, None, "nothing told yet");
+        // Read on as the only connection with an answer, it tells: the next download knows.
+        let alone = CancellationToken::new();
+        let mut watched = Watched { body: response.bytes_stream().boxed(), watch: Some(watch), alone, url: url.clone() };
+        let mut rest = 0;
+        while let Some(bytes) = watched.next().await {
+            rest += bytes.unwrap().len();
+        }
+        assert!(rest > 0);
+        let seen = hosts::profile(&url);
+        assert_eq!(seen.capped_per_connection, Some(true));
+        assert!(seen.connection_rate.is_some_and(|rate| (2e6..3.5e6).contains(&rate)), "{seen:?}");
+
+        // Once another connection has its answer, what the rate does may be the others' doing.
+        let url = Url::parse("http://watched-shared.engine.invalid/f").unwrap();
+        let (response, watch) = taken(&url).await;
+        let alone = CancellationToken::new();
+        alone.cancel();
+        let watched = Watched { body: response.bytes_stream().boxed(), watch: Some(watch), alone, url: url.clone() };
+        let rest: Vec<Bytes> = watched.map(Result::unwrap).collect().await;
+        assert!(!rest.is_empty());
+        assert_eq!(hosts::profile(&url).capped_per_connection, None);
     }
 
     #[tokio::test(start_paused = true)]
@@ -2829,7 +3039,7 @@ mod tests {
         let mut body = paced(std::iter::repeat_n((10, 8 * 1024), 32).collect());
         let deadline = tokio::time::Instant::now() + Duration::from_millis(95);
         let prefix = read_prefix(&mut body, 256 * 1024, Some(deadline), None, Duration::from_secs(1), None).await;
-        assert!(prefix.live && prefix.capped_at.is_none() && !prefix.told);
+        assert!(prefix.live && prefix.watch.is_none());
         assert_eq!(prefix.bytes.len(), 72 * 1024);
         assert_eq!(rest_of(body).await, 184 * 1024);
     }
@@ -2915,7 +3125,7 @@ mod tests {
         let read = tokio::time::timeout(Duration::from_secs(5), read_paced(&mut body, 256 * 1024, true)).await;
         let prefix = read.expect("the stall timeout ends the read");
         assert!(prefix.bytes.is_empty() && !prefix.live, "nothing more is coming");
-        assert!(!prefix.told, "a silent connection tells nothing of a cap");
+        assert_eq!(verdict(&prefix), None, "a silent connection tells nothing of a cap");
 
         // Nor does a body that ended early leave anything to go on with.
         let mut short = paced(vec![(0, 8 * 1024)]);
