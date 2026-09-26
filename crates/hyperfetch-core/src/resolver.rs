@@ -63,7 +63,7 @@ struct ArchiveAlternateLocations {
     workable: Option<Vec<ArchiveServerDir>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 struct ArchiveMetadata {
     server: Option<String>,
     d1: Option<String>,
@@ -71,6 +71,44 @@ struct ArchiveMetadata {
     dir: Option<String>,
     workable_servers: Option<Vec<String>>,
     alternate_locations: Option<ArchiveAlternateLocations>,
+}
+
+/// archive.org's item metadata: `/{id}` is the whole record (megabytes for an item with thousands
+/// of files), `/{id}/{field}` one field of it.
+const ARCHIVE_METADATA: &str = "https://archive.org/metadata";
+
+/// One field of an item's metadata: `{"result": ...}`, or `{"error": ...}` when the item or the
+/// field does not exist.
+#[derive(Debug, Deserialize)]
+struct ArchiveField<T> {
+    result: Option<T>,
+}
+
+impl ArchiveMetadata {
+    /// Fetches the fields the resolver reads, all at once, from the metadata at `base`.
+    async fn fetch(client: &Client, base: &str, identifier: &str) -> Result<Self, ResolverError> {
+        async fn field<T: serde::de::DeserializeOwned>(
+            client: &Client,
+            base: &str,
+            identifier: &str,
+            name: &str,
+        ) -> Result<Option<T>, ResolverError> {
+            let url = format!("{}/{}/{}", base, identifier, name);
+            let bytes = client.get(&url).send().await?.error_for_status()?.bytes().await?;
+            let field: ArchiveField<T> = serde_json::from_slice(&bytes)
+                .map_err(|e| ResolverError::Parse(format!("archive.org metadata {}: {}", name, e)))?;
+            Ok(field.result)
+        }
+        let (server, d1, d2, dir, workable_servers, alternate_locations) = tokio::try_join!(
+            field(client, base, identifier, "server"),
+            field(client, base, identifier, "d1"),
+            field(client, base, identifier, "d2"),
+            field(client, base, identifier, "dir"),
+            field(client, base, identifier, "workable_servers"),
+            field(client, base, identifier, "alternate_locations"),
+        )?;
+        Ok(Self { server, d1, d2, dir, workable_servers, alternate_locations })
+    }
 }
 
 /// Splits an archive.org file URL into (item identifier, percent-encoded file path).
@@ -102,10 +140,7 @@ impl HostResolver for ArchiveOrgResolver {
         let (identifier, file) = archive_item_path(url)
             .ok_or_else(|| ResolverError::Parse(format!("Not an archive.org file URL: {}", url)))?;
 
-        let metadata_url = format!("https://archive.org/metadata/{}", identifier);
-        let bytes = client.get(&metadata_url).send().await?.error_for_status()?.bytes().await?;
-        let metadata: ArchiveMetadata = serde_json::from_slice(&bytes)
-            .map_err(|e| ResolverError::Parse(format!("archive.org metadata: {}", e)))?;
+        let metadata = ArchiveMetadata::fetch(client, ARCHIVE_METADATA, &identifier).await?;
 
         let mut server_dirs: Vec<(String, String)> = Vec::new();
         let mut seen = HashSet::new();
@@ -864,6 +899,61 @@ mod tests {
         ] {
             assert!(!ArchiveOrgResolver.can_handle(&Url::parse(rejected).unwrap()), "{}", rejected);
         }
+    }
+
+    #[tokio::test]
+    async fn test_archive_org_metadata_fetches_only_the_fields_it_reads() {
+        // archive.org's answers for the item "nasa" (d2 made missing).
+        fn reply(path: &str) -> &'static str {
+            match path {
+                "/metadata/nasa/server" => r#"{"result":"ia801607.us.archive.org"}"#,
+                "/metadata/nasa/d1" => r#"{"result":"ia601607.us.archive.org"}"#,
+                "/metadata/nasa/d2" => r#"{"error":"Couldn't get 'd2' for item nasa"}"#,
+                "/metadata/nasa/dir" => r#"{"result":"/6/items/nasa"}"#,
+                "/metadata/nasa/workable_servers" => r#"{"result":["ia801607.us.archive.org","ia601607.us.archive.org"]}"#,
+                "/metadata/nasa/alternate_locations" => {
+                    r#"{"result":{"servers":[{"server":"dn790001.ca.archive.org","dir":"/0/items/nasa"}],"workable":[]}}"#
+                }
+                _ => r#"{"files":[]}"#,
+            }
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/metadata", listener.local_addr().unwrap());
+        let requested = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let log = requested.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let log = log.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let path = String::from_utf8_lossy(&buf[..n]).split_whitespace().nth(1).unwrap_or("").to_string();
+                    let body = reply(&path);
+                    log.lock().push(path);
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(body.as_bytes()).await;
+                });
+            }
+        });
+
+        let metadata = ArchiveMetadata::fetch(&local_client(), &base, "nasa").await.unwrap();
+        assert_eq!(metadata.server.as_deref(), Some("ia801607.us.archive.org"));
+        assert_eq!(metadata.d1.as_deref(), Some("ia601607.us.archive.org"));
+        assert_eq!(metadata.d2, None);
+        assert_eq!(metadata.dir.as_deref(), Some("/6/items/nasa"));
+        assert_eq!(metadata.workable_servers.map(|s| s.len()), Some(2));
+        let alternate = metadata.alternate_locations.and_then(|a| a.servers).unwrap();
+        assert_eq!(alternate[0].server.as_deref(), Some("dn790001.ca.archive.org"));
+
+        // Never the whole record.
+        let mut paths = requested.lock().clone();
+        paths.sort();
+        let fields = ["alternate_locations", "d1", "d2", "dir", "server", "workable_servers"];
+        assert_eq!(paths, fields.map(|f| format!("/metadata/nasa/{}", f)));
     }
 
     #[tokio::test]
