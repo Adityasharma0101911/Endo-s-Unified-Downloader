@@ -1557,8 +1557,6 @@ pub(crate) struct MediaStream {
     pub path: PathBuf,
     /// Size of the requests the site asks for (the format's `http_chunk_size`).
     pub chunk_size: Option<u64>,
-    /// The stream's part of the download's size, and so of a speed limit.
-    pub share: f64,
 }
 
 /// Downloads a [`MediaStream`] to its path, or a free name next to it, and returns where it went.
@@ -2054,9 +2052,8 @@ async fn fast_download(
     }
 
     let sizes: Vec<u64> = plan.streams.iter().map(|s| s.size.unwrap_or(0)).collect();
-    let total: u64 = sizes.iter().sum();
     let mut streams = Vec::new();
-    for (planned, size) in plan.streams.iter().zip(&sizes) {
+    for planned in &plan.streams {
         streams.push(MediaStream {
             url: planned.url.clone(),
             key: planned.key.clone(),
@@ -2064,7 +2061,6 @@ async fn fast_download(
             client: stream_client(planned, options.proxy.as_deref())?,
             path: stream_path(&output, &planned.format_id, &planned.ext),
             chunk_size: planned.chunk_size,
-            share: if total > 0 { *size as f64 / total as f64 } else { 1.0 / plan.streams.len() as f64 },
         });
     }
     let mut leftovers: Vec<PathBuf> = streams.iter().map(|s| s.path.clone()).collect();
@@ -3445,7 +3441,6 @@ mod tests {
             client: stream_client(&planned, None).unwrap(),
             path: path.clone(),
             chunk_size: None,
-            share: 1.0,
         };
         let engine = crate::engine::DownloadEngine::new(Vec::new(), crate::engine::DownloadOptions::default());
         let (tx, _rx) = broadcast::channel(16);
@@ -3476,12 +3471,67 @@ mod tests {
             client: stream_client(&planned, None).unwrap(),
             path: path.clone(),
             chunk_size: None,
-            share: 1.0,
         };
         let engine = crate::engine::DownloadEngine::new(Vec::new(), crate::engine::DownloadOptions::default());
         let (tx, _rx) = broadcast::channel(16);
         let done = engine.download_media_stream(stream, tx, CancellationToken::new()).await.unwrap();
         assert_eq!(done, path);
         assert_eq!(std::fs::read(&path).unwrap(), [vec![1; 1000], vec![2; 500]].concat());
+    }
+
+    /// Makes `file` with ffmpeg from a lavfi source.
+    fn lavfi(ffmpeg: &Path, source: &str, extra: &[&str], file: &Path) -> Vec<u8> {
+        let made = std::process::Command::new(ffmpeg)
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", source])
+            .args(extra)
+            .arg(file)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
+        std::fs::read(file).unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_streams_share_the_speed_limit_whatever_ytdlp_knows_of_their_sizes() {
+        let Some(ffmpeg) = find_ffmpeg_path() else {
+            eprintln!("skipped: ffmpeg not found");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        // About 50 KB each; every frame a key frame keeps the video that large.
+        let video = lavfi(&ffmpeg, "testsrc=duration=2:size=320x240:rate=10", &["-g", "1"], &dir.path().join("v.mp4"));
+        let audio = lavfi(&ffmpeg, "sine=duration=5", &[], &dir.path().join("a.m4a"));
+        assert!(video.len().min(audio.len()) > 20_000, "{} and {} bytes", video.len(), audio.len());
+        let out = dir.path().join("out");
+        let mut info = mp4_merge_info(&out);
+        for (i, body) in [video.clone(), audio.clone()].into_iter().enumerate() {
+            let (addr, _) = serve_media(body).await;
+            let format = &mut info["requested_formats"][i];
+            format["url"] = format!("http://{addr}/videoplayback?stream={i}").into();
+            format["http_headers"] = serde_json::json!({"X-Format": "yes"});
+            format["cookies"] = "session=abc; Path=/".into();
+        }
+        // yt-dlp knows the size of the video only.
+        info["requested_formats"][0]["filesize"] = video.len().into();
+        info["requested_formats"][1]["filesize"] = Value::Null;
+
+        let limit = 48 * 1024;
+        let options = crate::engine::DownloadOptions { max_speed: Some(limit), ..Default::default() };
+        let engine = crate::engine::DownloadEngine::new(Vec::new(), options);
+        // What `DownloadEngine::run_media` passes.
+        let fetch: &StreamFetcher<'_> = &|stream, tx, stop| Box::pin(engine.download_media_stream(stream, tx, stop));
+        let media_options = MediaDownloadOptions::default();
+        let started = tokio::time::Instant::now();
+        let download = fast_download(&info, &media_options, Some(&ffmpeg), None, &None, fetch);
+        let path = tokio::time::timeout(Duration::from_secs(60), download)
+            .await
+            .expect("a stream of unknown size is held to the limit, not all but stopped")
+            .unwrap();
+        let took = started.elapsed();
+        assert_eq!(media_streams(&path), (true, true));
+        // Both streams at the whole limit each would take half as long; the limiter lets 0.1 s
+        // of idle credit go at once.
+        let together = Duration::from_secs_f64((video.len() + audio.len()) as f64 / limit as f64);
+        assert!(took + Duration::from_millis(200) >= together, "{took:?} for what takes {together:?} at the limit");
     }
 }
