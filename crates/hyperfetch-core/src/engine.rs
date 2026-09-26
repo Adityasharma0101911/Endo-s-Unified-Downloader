@@ -1707,19 +1707,23 @@ pub fn claim_target(final_path: &Path) -> Result<Option<TargetClaim>, String> {
     Ok(Claim::try_take(final_path)?.map(|claim| TargetClaim { _claim: claim }))
 }
 
-/// Deletes the partial files of `final_path` (`.part`, `.part.hfstate`, `.part.hlsstate`) and
-/// returns how many existed. Never touches the final file. Fails while a download holds the
-/// target. Blocking.
+/// Deletes the partial files of `final_path` (`.part`, `.part.hfstate`, `.part.hlsstate`, and the
+/// `.tmp` files a crash can leave of the latter two) and returns how many existed. Never touches
+/// the final file. Fails while a download holds the target. Blocking.
 pub fn discard_partial(final_path: &Path) -> Result<usize, String> {
     let Some(_claim) = claim_target(final_path)? else {
         return Err(format!("{} is still being downloaded", final_path.display()));
     };
     let part = part_path(final_path);
-    let mut hls_state = part.clone().into_os_string();
-    hls_state.push(".hlsstate");
+    let beside_part = |suffix: &str| {
+        let mut path = part.clone().into_os_string();
+        path.push(suffix);
+        PathBuf::from(path)
+    };
     // The data goes first: if a state file then fails to delete, it no longer matches anything.
     let mut removed = 0;
-    for path in [part.clone(), DownloadState::state_file_path(&part), PathBuf::from(hls_state)] {
+    let states = [".hfstate", ".hlsstate", ".hfstate.tmp", ".hlsstate.tmp"].map(beside_part);
+    for path in std::iter::once(part.clone()).chain(states) {
         match std::fs::remove_file(&path) {
             Ok(()) => removed += 1,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -2432,6 +2436,19 @@ mod tests {
         assert!(!part.exists() && !lock_path(&target).exists());
         assert_eq!(std::fs::read(&target).unwrap(), b"finished");
         assert_eq!(discard_partial(&target).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_discard_partial_removes_the_temporary_state_files() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("file.ts");
+        // What a crash while saving a state leaves behind, for either engine.
+        let tmps = ["file.ts.part.hlsstate.tmp", "file.ts.part.hfstate.tmp"].map(|name| dir.path().join(name));
+        for tmp in &tmps {
+            std::fs::write(tmp, b"x").unwrap();
+        }
+        assert_eq!(discard_partial(&target).unwrap(), 2);
+        assert!(tmps.iter().all(|tmp| !tmp.exists()));
     }
 
     #[test]
