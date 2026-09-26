@@ -164,8 +164,6 @@ fn job(args: &Args, connections: u64, dir: &Path, task: Task) -> Job {
     };
     let media = args.media_preset.is_some() || task.urls.iter().any(hyperfetch_core::media::is_supported_media_site);
     let options = DownloadOptions {
-        num_connections: if media { args.concurrent_fragments } else { connections } as usize,
-        base_chunk_size: args.chunk_size_mb * 1024 * 1024,
         output_path: Some(output),
         expected_checksum: args.checksum.clone().or(task.checksum),
         cookies_path: args.load_cookies.clone(),
@@ -173,12 +171,23 @@ fn job(args: &Args, connections: u64, dir: &Path, task: Task) -> Job {
         proxy: args.proxy.clone(),
         media_preset: args.media_preset.clone(),
         browser_cookies: args.cookies_from_browser.map(Into::into),
+        ..tuning(args, if media { args.concurrent_fragments } else { connections })
+    };
+    Job { label, urls: task.urls, options }
+}
+
+/// The engine settings every download of this run shares, with `connections` per download.
+fn tuning(args: &Args, connections: u64) -> DownloadOptions {
+    DownloadOptions {
+        num_connections: connections as usize,
+        base_chunk_size: args.chunk_size_mb * 1024 * 1024,
         max_speed: args.max_speed.filter(|&s| s > 0),
         max_retries: args.max_retries,
         stall_timeout_secs: args.stall_timeout,
+        fsync_on_complete: args.fsync,
+        max_connections_per_host: args.max_connections_per_host,
         ..Default::default()
-    };
-    Job { label, urls: task.urls, options }
+    }
 }
 
 async fn read_input(path: &Path) -> Result<String, String> {
@@ -666,6 +675,16 @@ mod tests {
         let output = job(&args, 4, Path::new("gone"), task).options.output_path.unwrap();
         let last = *output.as_os_str().as_encoded_bytes().last().unwrap();
         assert!(std::path::is_separator(last as char), "{}", output.display());
+    }
+
+    #[test]
+    fn every_download_gets_the_disk_and_host_settings() {
+        let args = parse(&["--fsync", "--max-connections-per-host", "6", "-s", "3", "https://a.example/f"]);
+        let task = Task { urls: vec![Url::parse("https://a.example/f").unwrap()], ..Default::default() };
+        let options = job(&args, args.connections, Path::new("d"), task).options;
+        assert_eq!((options.fsync_on_complete, options.max_connections_per_host, options.num_connections), (true, 6, 3));
+        let defaults = tuning(&parse(&["u"]), 16);
+        assert_eq!((defaults.fsync_on_complete, defaults.max_connections_per_host), (false, 32));
     }
 
     #[test]

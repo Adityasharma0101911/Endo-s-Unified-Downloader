@@ -231,15 +231,20 @@ enum Outcome {
 }
 
 /// Runs `jobs` with at most `concurrency` at a time and returns how many failed. After a
-/// shutdown request no new job starts and running ones stop with their state saved.
+/// shutdown request no new job starts and running ones stop with their state saved. Running
+/// several at once, results arrive in completion order, so each result line names its input.
 pub async fn run_jobs(jobs: Vec<Job>, concurrency: usize, ui: &Ui, shutdown: &Shutdown) -> usize {
     let overall = (jobs.len() > 1 && !ui.quiet).then(|| {
         let bar = ui.multi.add(ProgressBar::new(jobs.len() as u64).with_style(style(OVERALL)).with_prefix("Total"));
         bar.tick();
         bar
     });
-    let mut outcomes = futures_util::stream::iter(jobs)
-        .map(|job| run_job(job, ui, shutdown, overall.as_ref()))
+    let named = concurrency > 1 && jobs.len() > 1;
+    let mut outcomes = futures_util::stream::iter(jobs.into_iter().enumerate())
+        .map(|(index, job)| {
+            let input = named.then(|| input_name(index, &job.urls));
+            run_job(job, input, ui, shutdown, overall.as_ref())
+        })
         .buffer_unordered(concurrency.max(1));
     let mut failed = 0;
     while let Some(outcome) = outcomes.next().await {
@@ -262,7 +267,31 @@ pub async fn run_jobs(jobs: Vec<Job>, concurrency: usize, ui: &Ui, shutdown: &Sh
     failed
 }
 
-async fn run_job(job: Job, ui: &Ui, shutdown: &Shutdown, overall: Option<&ProgressBar>) -> Outcome {
+/// "#3 https://host/path/file": the job's place in the input and its first URL, without the
+/// query and fragment, which may carry access tokens.
+fn input_name(index: usize, urls: &[Url]) -> String {
+    let number = format!("#{}", index + 1);
+    match urls.first() {
+        Some(url) => {
+            let mut shown = url.clone();
+            shown.set_query(None);
+            shown.set_fragment(None);
+            format!("{} {}", number, truncate(shown.as_str(), 100))
+        }
+        None => number,
+    }
+}
+
+/// The line reporting a finished download; `input` names it when results arrive out of order.
+fn done_line(input: Option<&str>, path: &std::path::Path) -> String {
+    match input {
+        Some(input) => format!("[OK] {} -> {}", input, path.display()),
+        None => format!("[OK] {}", path.display()),
+    }
+}
+
+/// `input` is what result lines call the download (see [`input_name`]); None uses its file name.
+async fn run_job(job: Job, input: Option<String>, ui: &Ui, shutdown: &Shutdown, overall: Option<&ProgressBar>) -> Outcome {
     let mut stop = shutdown.subscribe();
     if stop.borrow().is_some() {
         return Outcome::Interrupted;
@@ -308,16 +337,17 @@ async fn run_job(job: Job, ui: &Ui, shutdown: &Shutdown, overall: Option<&Progre
     match result {
         Ok(path) => {
             if !ui.quiet {
-                ui.print(&format!("[OK] {}", path.display()));
+                ui.print(&done_line(input.as_deref(), &path));
             }
             Outcome::Done
         }
         Err(err) => {
             let interrupted = shutdown.requested().is_some();
+            let subject = input.as_deref().unwrap_or(&view.label);
             if interrupted {
-                ui.error(&format!("[STOPPED] {}: run the same command again to resume ({})", view.label, err));
+                ui.error(&format!("[STOPPED] {}: run the same command again to resume ({})", subject, err));
             } else {
-                ui.error(&format!("[FAILED] {}: {}", view.label, err));
+                ui.error(&format!("[FAILED] {}: {}", subject, err));
             }
             if let Some(snapshot) = last.filter(|s| s.target_path.is_some()) {
                 let status = if interrupted { HistoryStatus::Cancelled } else { HistoryStatus::Failed(err) };
@@ -477,6 +507,17 @@ mod tests {
     fn control_characters_are_not_printed() {
         assert_eq!(printable("\u{1b}[31mRED\u{1b}]52;c;x\u{7}\u{9b}.bin"), "?[31mRED?]52;c;x??.bin");
         assert_eq!(printable("\nStopping\tnow"), "\nStopping\tnow");
+    }
+
+    #[test]
+    fn parallel_results_name_their_input() {
+        let urls = [Url::parse("https://cdn.example/dl/a.iso?token=secret#part").unwrap()];
+        assert_eq!(input_name(2, &urls), "#3 https://cdn.example/dl/a.iso");
+        assert_eq!(input_name(0, &[]), "#1");
+        let path = std::path::Path::new("out").join("a.iso");
+        let named = done_line(Some("#3 https://cdn.example/dl/a.iso"), &path);
+        assert_eq!(named, format!("[OK] #3 https://cdn.example/dl/a.iso -> {}", path.display()));
+        assert_eq!(done_line(None, &path), format!("[OK] {}", path.display()));
     }
 
     #[test]
