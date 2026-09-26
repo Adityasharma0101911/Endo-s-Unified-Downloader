@@ -163,6 +163,9 @@ pub struct DownloadEngine {
     client: Result<Client, String>,
     /// Added per request, only for the hosts in `urls`; never a client default header.
     auth: Option<Arc<Auth>>,
+    /// The speed limit, one for every connection of the download (and every stream of a media
+    /// download, see `download_media_stream`).
+    limiter: Option<Arc<RateLimiter>>,
     cancel_flag: Arc<AtomicBool>,
     cancel_token: CancellationToken,
 }
@@ -187,6 +190,7 @@ impl DownloadEngine {
             _ => client,
         };
         Self {
+            limiter: options.max_speed.filter(|&s| s > 0).map(|s| Arc::new(RateLimiter::new(s))),
             options,
             urls,
             client,
@@ -374,9 +378,11 @@ impl DownloadEngine {
     }
 
     /// Downloads one stream of a media download (see `crate::media`) with this download's
-    /// settings, but the stream's own client, file and request size, and its share of the speed
-    /// limit. The stream's key is one of its URLs, so its resume state and history outlive the
-    /// stream URL. Cancelling `stop` stops it as `cancel` stops a download.
+    /// settings, but the stream's own client, file and request size. The streams draw on this
+    /// download's one speed limit together, whatever their sizes; HLS streams are not held to it,
+    /// as no HLS download is (and no yt-dlp download). The stream's key is one of its URLs, so its
+    /// resume state and history outlive the stream URL. Cancelling `stop` stops it as `cancel`
+    /// stops a download.
     pub(crate) async fn download_media_stream(
         &self,
         stream: crate::media::MediaStream,
@@ -386,7 +392,6 @@ impl DownloadEngine {
         let options = DownloadOptions {
             output_path: Some(stream.path.clone()),
             base_chunk_size: stream.chunk_size.unwrap_or(self.options.base_chunk_size),
-            max_speed: self.options.max_speed.map(|cap| ((cap as f64 * stream.share) as u64).max(1)),
             // The checksum, the user's credentials and cookies are for the page, not this stream.
             expected_checksum: None,
             cookies_path: None,
@@ -397,7 +402,8 @@ impl DownloadEngine {
             ..self.options.clone()
         };
         let urls = vec![stream.url.clone(), stream.key.clone()];
-        let engine = DownloadEngine::with_client(urls, options, stream.client.clone());
+        let mut engine = DownloadEngine::with_client(urls, options, stream.client.clone());
+        engine.limiter = self.limiter.clone();
         let download = engine.fetch_media_stream(&stream, snapshot_tx);
         tokio::pin!(download);
         tokio::select! {
@@ -1013,7 +1019,7 @@ impl DownloadEngine {
     }
 
     fn limiter(&self) -> Option<Arc<RateLimiter>> {
-        self.options.max_speed.filter(|&s| s > 0).map(|s| Arc::new(RateLimiter::new(s)))
+        self.limiter.clone()
     }
 
     fn stall_timeout(&self) -> Duration {
