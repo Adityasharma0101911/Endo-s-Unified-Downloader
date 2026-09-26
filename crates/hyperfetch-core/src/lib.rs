@@ -17,7 +17,7 @@ pub mod verify;
 pub use range::{ByteRange, RangeError};
 pub use chunk::{Chunk, ChunkManager, ChunkStatus, ChunkError};
 pub use mirror::{Mirror, MirrorRacer};
-pub use storage::{DiskWriter, StorageError, ConcurrentMmap};
+pub use storage::{DiskWriter, StorageError};
 pub use state::{DownloadState, StateError};
 pub use engine::{DownloadEngine, DownloadOptions, EngineSnapshot};
 pub use resolver::SmartResolver;

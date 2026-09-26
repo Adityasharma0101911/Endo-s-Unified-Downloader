@@ -18,9 +18,25 @@ pub enum RangeError {
 /// Represents an inclusive byte range [start, end].
 /// E.g., `ByteRange::new(0, 999)` contains 1000 bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "RawByteRange")]
 pub struct ByteRange {
     pub start: u64,
     pub end: u64,
+}
+
+/// Unvalidated wire form, so deserialized ranges go through `ByteRange::new`.
+#[derive(Deserialize)]
+struct RawByteRange {
+    start: u64,
+    end: u64,
+}
+
+impl TryFrom<RawByteRange> for ByteRange {
+    type Error = RangeError;
+
+    fn try_from(raw: RawByteRange) -> Result<Self, Self::Error> {
+        ByteRange::new(raw.start, raw.end)
+    }
 }
 
 impl ByteRange {
@@ -42,10 +58,10 @@ impl ByteRange {
         Ok(Self { start, end })
     }
 
-    /// Returns the total number of bytes in this range.
+    /// Returns the total number of bytes in this range (saturating at `u64::MAX` for `[0, u64::MAX]`).
     #[inline]
     pub fn len(&self) -> u64 {
-        self.end - self.start + 1
+        (self.end - self.start).saturating_add(1)
     }
 
     /// Returns true if length is 0 (which is impossible for valid ranges, but provided for convention).
@@ -110,31 +126,30 @@ impl ByteRange {
     }
 
     /// Parses an HTTP `Content-Range` header (e.g. `bytes 0-999/5000` or `bytes 0-999/*`).
-    /// Returns the parsed `ByteRange` and optional total file size.
+    /// Returns the parsed `ByteRange` and optional total file size. Anything that is not exactly
+    /// `bytes <digits>-<digits>/<digits or *>` with `start <= end < total` is rejected.
     pub fn parse_content_range(header: &str) -> Result<(ByteRange, Option<u64>), RangeError> {
-        let trimmed = header.trim();
-        let stripped = trimmed
-            .strip_prefix("bytes ")
-            .ok_or_else(|| RangeError::InvalidHeader(trimmed.to_string()))?;
-
-        let mut parts = stripped.split('/');
-        let range_part = parts.next().ok_or_else(|| RangeError::InvalidHeader(trimmed.to_string()))?;
-        let total_part = parts.next().ok_or_else(|| RangeError::InvalidHeader(trimmed.to_string()))?;
-
-        let mut range_bounds = range_part.split('-');
-        let start_str = range_bounds.next().ok_or_else(|| RangeError::InvalidHeader(trimmed.to_string()))?;
-        let end_str = range_bounds.next().ok_or_else(|| RangeError::InvalidHeader(trimmed.to_string()))?;
-
-        let start: u64 = start_str.parse().map_err(|_| RangeError::InvalidHeader(trimmed.to_string()))?;
-        let end: u64 = end_str.parse().map_err(|_| RangeError::InvalidHeader(trimmed.to_string()))?;
-
-        let total = if total_part == "*" {
-            None
-        } else {
-            Some(total_part.parse().map_err(|_| RangeError::InvalidHeader(trimmed.to_string()))?)
+        let invalid = || RangeError::InvalidHeader(header.to_string());
+        let number = |s: &str| -> Result<u64, RangeError> {
+            if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(invalid());
+            }
+            s.parse().map_err(|_| invalid())
         };
 
-        Ok((ByteRange::new(start, end)?, total))
+        let (unit, spec) = header.trim().split_once(' ').ok_or_else(invalid)?;
+        if !unit.eq_ignore_ascii_case("bytes") {
+            return Err(invalid());
+        }
+        let (range_part, total_part) = spec.trim().split_once('/').ok_or_else(invalid)?;
+        let (start_str, end_str) = range_part.split_once('-').ok_or_else(invalid)?;
+
+        let range = ByteRange::new(number(start_str)?, number(end_str)?)?;
+        let total = if total_part == "*" { None } else { Some(number(total_part)?) };
+        if total.is_some_and(|t| range.end >= t) {
+            return Err(invalid());
+        }
+        Ok((range, total))
     }
 
     /// Converts to standard Rust `RangeInclusive<u64>`.
@@ -282,6 +297,38 @@ mod tests {
         assert_eq!(total_star, None);
 
         assert!(ByteRange::parse_content_range("invalid").is_err());
+        assert_eq!(ByteRange::parse_content_range("Bytes 5-9/10").unwrap().1, Some(10));
+    }
+
+    #[test]
+    fn test_parse_content_range_is_strict() {
+        for bad in [
+            "bytes +0-499/1234",   // sign accepted by u64::from_str
+            "bytes 0-499/1234/5",  // trailing garbage
+            "bytes 0-4-9/1234",    // extra dash
+            "bytes 0-1234/1234",   // end beyond total
+            "bytes 500-499/1234",  // start > end
+            "bytes */1234",        // unsatisfied-range form carries no range
+            "bytes 0-/1234",
+            "items 0-499/1234",
+        ] {
+            assert!(ByteRange::parse_content_range(bad).is_err(), "accepted {bad:?}");
+        }
+    }
+
+    #[test]
+    fn test_len_does_not_overflow_at_u64_max() {
+        assert_eq!(ByteRange::new(0, u64::MAX).unwrap().len(), u64::MAX);
+        assert_eq!(ByteRange::new(u64::MAX, u64::MAX).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_deserialize_rejects_inverted_range() {
+        let good = bincode::serialize(&(10u64, 20u64)).unwrap();
+        assert_eq!(bincode::deserialize::<ByteRange>(&good).unwrap(), ByteRange::new(10, 20).unwrap());
+        let bad = bincode::serialize(&(20u64, 10u64)).unwrap();
+        assert!(bincode::deserialize::<ByteRange>(&bad).is_err());
+        assert!(serde_json::from_str::<ByteRange>(r#"{"start":5,"end":1}"#).is_err());
     }
 
     #[test]

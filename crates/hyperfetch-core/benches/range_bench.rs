@@ -1,3 +1,4 @@
+use std::sync::atomic::Ordering;
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use hyperfetch_core::range::ByteRange;
 use hyperfetch_core::chunk::ChunkManager;
@@ -30,10 +31,11 @@ fn bench_chunk_manager_work_stealing(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let mut mgr = ChunkManager::new(total_size, chunk_size).unwrap();
-                // Assign first 32 chunks to workers and simulate partial progress
+                // Assign first 32 chunks to workers and simulate 1MB of progress on each
                 for worker_id in 0..32 {
-                    let _ = mgr.get_next_work(worker_id, 0);
-                    let _ = mgr.update_chunk_progress(worker_id, 1024 * 1024, worker_id, 0);
+                    if let Some(chunk) = mgr.get_next_work(worker_id, 0) {
+                        chunk.current_offset.store(chunk.range.start + 1024 * 1024, Ordering::SeqCst);
+                    }
                 }
                 mgr
             },
