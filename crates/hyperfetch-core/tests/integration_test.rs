@@ -1998,7 +1998,8 @@ async fn test_a_mirror_answering_later_joins_the_download() {
 
 #[tokio::test]
 async fn test_a_web_page_is_downloaded_as_the_video_it_plays() {
-    let _history = setup().await;
+    isolate_history();
+    let _history = HISTORY.write().await;
     let video = payload(PREFETCH + 256 * KB, 293);
     let video_url = serve(Arc::new(Mock::new(video.clone())), "clip.mp4").await;
     // A page the probe reads whole, one of unknown length whose answer the probe leaves
@@ -2014,12 +2015,15 @@ async fn test_a_web_page_is_downloaded_as_the_video_it_plays() {
         let temp = tempdir().unwrap();
         let out = temp.path().join("clip.mp4");
 
-        run(&DownloadEngine::new(vec![page_url], options(&out, 4, 256 * KB)), None).await.expect("the video should download");
+        run(&DownloadEngine::new(vec![page_url.clone()], options(&out, 4, 256 * KB)), None).await.expect("the video should download");
         assert_file(&out, &video);
         let s = &page.stats;
         let seen = (s.requests.load(Ordering::SeqCst), s.gets.load(Ordering::SeqCst));
         assert_eq!(seen, (requests, gets), "chunked: {chunked}, padding: {padding}");
         assert!(page.served_ranges().is_empty(), "the page was asked for in parts");
+        // History lists the video along with the page: a repair finds it there.
+        let urls = history_entry(&out).expect("the download is recorded").urls;
+        assert_eq!(urls, [page_url.to_string(), video_url.to_string()]);
     }
 }
 
