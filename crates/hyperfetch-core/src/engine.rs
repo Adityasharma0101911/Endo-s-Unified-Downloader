@@ -62,7 +62,8 @@ pub struct EngineSnapshot {
     pub target_path: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct DownloadOptions {
     pub num_connections: usize,
     pub base_chunk_size: u64,
@@ -73,6 +74,8 @@ pub struct DownloadOptions {
     pub output_path: Option<PathBuf>,
     pub expected_checksum: Option<String>,
     pub cookies_path: Option<PathBuf>,
+    /// Never serialized, so saved options (e.g. a persisted queue) don't leak the credential.
+    #[serde(skip)]
     pub auth_header: Option<String>,
     pub proxy: Option<String>,
     pub media_preset: Option<crate::media::MediaQualityPreset>,
@@ -1667,6 +1670,24 @@ mod tests {
 
     fn urls() -> Vec<String> {
         vec!["http://example.com/file.bin".to_string()]
+    }
+
+    #[test]
+    fn serialized_options_round_trip_without_the_credential() {
+        let opts = DownloadOptions {
+            auth_header: Some("Bearer secret".into()),
+            max_speed: Some(1024),
+            media_preset: Some(crate::media::MediaQualityPreset::Custom("bv*".into())),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&opts).unwrap();
+        assert!(!json.contains("secret"));
+        let back: DownloadOptions = serde_json::from_str(&json).unwrap();
+        assert_eq!((back.auth_header, back.max_speed), (None, Some(1024)));
+        assert_eq!(back.media_preset, opts.media_preset);
+        // Fields missing from older saved data take their defaults.
+        let old: DownloadOptions = serde_json::from_str(r#"{"num_connections":4}"#).unwrap();
+        assert_eq!((old.num_connections, old.max_retries), (4, DownloadOptions::default().max_retries));
     }
 
     #[test]
