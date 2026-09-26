@@ -1,8 +1,9 @@
-use std::collections::VecDeque;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
@@ -93,15 +94,23 @@ pub enum BrowserCookieSource {
 
 impl BrowserCookieSource {
     pub fn to_args(&self) -> Vec<String> {
+        match (self, self.browser()) {
+            (Self::File(p), _) => vec!["--cookies".to_string(), p.to_string_lossy().to_string()],
+            (_, Some(browser)) => vec!["--cookies-from-browser".to_string(), browser.to_string()],
+            _ => vec![],
+        }
+    }
+
+    /// The browser, as yt-dlp's `--cookies-from-browser` names it.
+    fn browser(&self) -> Option<&'static str> {
         match self {
-            Self::None => vec![],
-            Self::Chrome => vec!["--cookies-from-browser".to_string(), "chrome".to_string()],
-            Self::Edge => vec!["--cookies-from-browser".to_string(), "edge".to_string()],
-            Self::Firefox => vec!["--cookies-from-browser".to_string(), "firefox".to_string()],
-            Self::Brave => vec!["--cookies-from-browser".to_string(), "brave".to_string()],
-            Self::Opera => vec!["--cookies-from-browser".to_string(), "opera".to_string()],
-            Self::Vivaldi => vec!["--cookies-from-browser".to_string(), "vivaldi".to_string()],
-            Self::File(p) => vec!["--cookies".to_string(), p.to_string_lossy().to_string()],
+            Self::None | Self::File(_) => None,
+            Self::Chrome => Some("chrome"),
+            Self::Edge => Some("edge"),
+            Self::Firefox => Some("firefox"),
+            Self::Brave => Some("brave"),
+            Self::Opera => Some("opera"),
+            Self::Vivaldi => Some("vivaldi"),
         }
     }
 }
@@ -868,11 +877,174 @@ fn version_at_least(version: &str, min: (u32, u32, u32)) -> bool {
     version_parts(version).is_some_and(|p| (p[0], p[1], p[2]) >= min)
 }
 
+/// Browser cookies, read from the browser once per process. yt-dlp takes 0.2-0.5 s to read them
+/// (it copies and decrypts the browser's cookie database), so the first run that reads a browser
+/// also saves what it read: given `--cookies <file>` next to `--cookies-from-browser`, yt-dlp writes
+/// its whole cookie jar to that file when it exits. Later runs get the jar through `--cookies`.
+/// Cookies the browser changes after that reach yt-dlp at the next start.
+///
+/// The jar is kept in memory. It is on disk only while a yt-dlp run uses it, as a file of that run
+/// (see [`CookieRun`]) in a per-user folder: under %LOCALAPPDATA%, which only the user may open, or
+/// made private to the user elsewhere.
+struct BrowserCookies {
+    /// `None` without a per-user directory: every run then reads the browser.
+    dir: Option<PathBuf>,
+    /// Whether `dir` is ready, cleared of what crashed processes left there.
+    ready: tokio::sync::OnceCell<bool>,
+    jars: parking_lot::Mutex<HashMap<&'static str, Jar>>,
+}
+
+enum Jar {
+    /// A run reads the browser and saves the jar.
+    Saving,
+    Saved(Arc<str>),
+}
+
+static BROWSER_COOKIES: LazyLock<BrowserCookies> =
+    LazyLock::new(|| BrowserCookies::new(app_data_dir().map(|dir| dir.join("cookies"))));
+
+impl BrowserCookies {
+    fn new(dir: Option<PathBuf>) -> Self {
+        Self { dir, ready: tokio::sync::OnceCell::new(), jars: parking_lot::Mutex::new(HashMap::new()) }
+    }
+
+    /// The cookie arguments of one yt-dlp run with `source`.
+    async fn for_run(&self, source: &BrowserCookieSource) -> CookieRun<'_> {
+        let mut run = CookieRun { cookies: self, args: source.to_args(), file: None, saving: None };
+        let (Some(browser), Some(dir)) = (source.browser(), &self.dir) else {
+            return run;
+        };
+        let ready = self.ready.get_or_init(|| async {
+            let dir = dir.clone();
+            let prepared = tokio::task::spawn_blocking(move || prepare_cookie_dir(&dir)).await;
+            match prepared.map_err(|e| e.to_string()).and_then(|r| r.map_err(|e| e.to_string())) {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!("Browser cookies will be read for every download: {e}");
+                    false
+                }
+            }
+        });
+        if !*ready.await {
+            return run;
+        }
+        let saved = match self.jars.lock().entry(browser) {
+            Entry::Occupied(jar) => match jar.get() {
+                Jar::Saved(jar) => Some(Arc::clone(jar)),
+                // Another run reads the browser right now.
+                Jar::Saving => return run,
+            },
+            Entry::Vacant(jar) => {
+                jar.insert(Jar::Saving);
+                run.saving = Some(browser);
+                None
+            }
+        };
+        let dir = dir.clone();
+        let file = tokio::task::spawn_blocking(move || cookie_file(&dir, saved.as_deref())).await;
+        match file.map_err(|e| e.to_string()).and_then(|r| r) {
+            Ok((path, claim)) => {
+                let file_args = ["--cookies".to_string(), path.to_string_lossy().into_owned()];
+                if run.saving.is_some() {
+                    run.args.extend(file_args);
+                } else {
+                    run.args = file_args.to_vec();
+                }
+                run.file = Some((path, claim));
+            }
+            Err(e) => tracing::warn!("Could not keep the browser cookies for later downloads: {e}"),
+        }
+        run
+    }
+}
+
+/// Creates the cookie folder, private to the user, and deletes the files of runs no process holds
+/// any more (it crashed or was killed). Blocking.
+fn prepare_cookie_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(dir)?;
+    for entry in std::fs::read_dir(dir)?.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // A run's file, or the lock of its claim.
+        let file = dir.join(name.strip_suffix(".part.lock").unwrap_or(&name));
+        if let Ok(Some(_claim)) = crate::engine::claim_target(&file) {
+            let _ = std::fs::remove_file(&file);
+        }
+    }
+    Ok(())
+}
+
+/// A new file in `dir` for one run, claimed: holding `jar`, readable by the user only, or not
+/// created yet, for yt-dlp to save the jar in. Blocking.
+fn cookie_file(dir: &Path, jar: Option<&str>) -> Result<(PathBuf, crate::engine::TargetClaim), String> {
+    use std::io::Write;
+    let path = dir.join(format!("{}.txt", unique_suffix()));
+    let claim = crate::engine::claim_target(&path)?.ok_or_else(|| format!("{} is in use", path.display()))?;
+    if let Some(jar) = jar {
+        let mut file = std::fs::OpenOptions::new();
+        file.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut file, 0o600);
+        if let Err(e) = file.open(&path).and_then(|mut f| f.write_all(jar.as_bytes())) {
+            let _ = std::fs::remove_file(&path);
+            return Err(format!("Failed to write {}: {e}", path.display()));
+        }
+    }
+    Ok((path, claim))
+}
+
+/// The cookie arguments of one yt-dlp run, and the file they name.
+struct CookieRun<'a> {
+    cookies: &'a BrowserCookies,
+    args: Vec<String>,
+    /// The run's file, deleted on drop. Claimed for as long as it exists, which tells other
+    /// processes (see [`prepare_cookie_dir`]) that it is in use.
+    file: Option<(PathBuf, crate::engine::TargetClaim)>,
+    /// The browser whose cookies the run saves into `file`.
+    saving: Option<&'static str>,
+}
+
+impl CookieRun<'_> {
+    /// Keeps the jar yt-dlp saved, if the run was to save one. Only for a yt-dlp that exited by
+    /// itself: one that was killed may have written half a jar.
+    async fn finish(mut self) {
+        let (Some(browser), Some((path, _))) = (self.saving, &self.file) else {
+            return;
+        };
+        // yt-dlp starts the file with this header, even when it read no cookies.
+        let jar = tokio::fs::read_to_string(path).await.ok().filter(|jar| jar.starts_with("# Netscape HTTP Cookie File"));
+        if let Some(jar) = jar {
+            self.cookies.jars.lock().insert(browser, Jar::Saved(jar.into()));
+            self.saving = None;
+        }
+    }
+}
+
+impl Drop for CookieRun<'_> {
+    fn drop(&mut self) {
+        // Nothing saved: the next run reads the browser again.
+        if let Some(browser) = self.saving {
+            self.cookies.jars.lock().remove(browser);
+        }
+        if let Some((path, _claim)) = self.file.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 /// yt-dlp arguments for one run. Paths in `options` must be absolute: yt-dlp runs in
-/// [`ytdlp_work_dir`]. The proxy is not among them (see [`ytdlp_command`]).
+/// [`ytdlp_work_dir`]. The cookie arguments come from [`BrowserCookies::for_run`]; the proxy is not
+/// among them (see [`ytdlp_command`]).
 fn build_ytdlp_args(
     url: &Url,
     options: &MediaDownloadOptions,
+    cookie_args: &[String],
     ffmpeg_dir: Option<&Path>,
     js_runtime: Option<&str>,
     version: Option<&str>,
@@ -919,7 +1091,7 @@ fn build_ytdlp_args(
         args.extend(["--ffmpeg-location".to_string(), dir.to_string_lossy().to_string()]);
     }
     args.extend(options.preset.to_args());
-    args.extend(options.cookies.to_args());
+    args.extend_from_slice(cookie_args);
     if options.concurrent_fragments > 1 {
         args.extend(["--concurrent-fragments".to_string(), options.concurrent_fragments.min(32).to_string()]);
     }
@@ -1334,10 +1506,15 @@ pub async fn download_media(
     let mut updated = false;
     loop {
         let version = ytdlp_version(&ytdlp_bin, &work_dir, version_cache_file().as_deref()).await;
-        let args = build_ytdlp_args(url, &options, ffmpeg_dir, js_runtime.as_deref(), version.as_deref());
+        let cookies = BROWSER_COOKIES.for_run(&options.cookies).await;
+        let args = build_ytdlp_args(url, &options, &cookies.args, ffmpeg_dir, js_runtime.as_deref(), version.as_deref());
         let cmd = ytdlp_command(&ytdlp_bin, &args, options.proxy.as_deref(), &work_dir);
 
-        let err = match run_ytdlp(cmd, progress_tx.as_ref(), cancel_flag.clone()).await {
+        let result = run_ytdlp(cmd, progress_tx.as_ref(), cancel_flag.clone()).await;
+        if !is_cancelled(&cancel_flag) {
+            cookies.finish().await;
+        }
+        let err = match result {
             Ok(path) => return Ok(path),
             Err(err) => err,
         };
@@ -1452,7 +1629,7 @@ mod tests {
     fn args_fetch_youtube_fragments_in_parallel() {
         let url = Url::parse("https://www.youtube.com/watch?v=abc").unwrap();
         let options = MediaDownloadOptions { output_dir: PathBuf::from("out"), concurrent_fragments: 8, ..Default::default() };
-        let args = build_ytdlp_args(&url, &options, None, None, Some("2026.08.19"));
+        let args = build_ytdlp_args(&url, &options, &[], None, None, Some("2026.08.19"));
         let at = args.iter().position(|a| a == "--extractor-args").expect("extractor arguments");
         assert_eq!(args[at + 1], "youtube:formats=dashy");
         let at = args.iter().position(|a| a == "--concurrent-fragments").expect("parallel fragments");
@@ -1575,14 +1752,14 @@ mod tests {
         let options = MediaDownloadOptions { output_dir: PathBuf::from("out"), ..Default::default() };
 
         let node = Some("node:/usr/bin/node");
-        let args = build_ytdlp_args(&url, &options, None, node, Some("2025.10.22"));
+        let args = build_ytdlp_args(&url, &options, &[], None, node, Some("2025.10.22"));
         assert!(!args.contains(&"--js-runtimes".to_string()));
         assert!(args.contains(&"--no-playlist".to_string()));
         assert!(args.contains(&PATH_TEMPLATE.to_string()));
         assert!(args.contains(&PROGRESS_TEMPLATE.to_string()));
         assert_eq!(args.last(), Some(&url.to_string()));
 
-        let args = build_ytdlp_args(&url, &options, None, node, Some("2025.11.12"));
+        let args = build_ytdlp_args(&url, &options, &[], None, node, Some("2025.11.12"));
         let at = args.iter().position(|a| a == "--js-runtimes").expect("flag present");
         assert_eq!(args[at + 1], "node:/usr/bin/node");
     }
@@ -1593,7 +1770,7 @@ mod tests {
         // 10 MiB YouTube asks for in each format.
         let url = Url::parse("https://vimeo.com/123").unwrap();
         let options = MediaDownloadOptions { output_dir: PathBuf::from("out"), ..Default::default() };
-        let args = build_ytdlp_args(&url, &options, None, None, Some("2026.08.19"));
+        let args = build_ytdlp_args(&url, &options, &[], None, None, Some("2026.08.19"));
         assert!(!args.iter().any(|a| a == "--http-chunk-size"), "{args:?}");
     }
 
@@ -1602,11 +1779,11 @@ mod tests {
         let url = Url::parse("https://www.youtube.com/watch?v=abc").unwrap();
         let options = MediaDownloadOptions { output_dir: PathBuf::from("out"), ..Default::default() };
         for version in [None, Some("2024.12.23"), Some("2026.08.19")] {
-            let args = build_ytdlp_args(&url, &options, None, None, version);
+            let args = build_ytdlp_args(&url, &options, &[], None, None, version);
             assert_eq!(args[0], "--ignore-config", "{version:?}");
         }
         let has_no_plugin_dirs = |version| {
-            build_ytdlp_args(&url, &options, None, None, version).contains(&"--no-plugin-dirs".to_string())
+            build_ytdlp_args(&url, &options, &[], None, None, version).contains(&"--no-plugin-dirs".to_string())
         };
         assert!(has_no_plugin_dirs(Some("2025.03.21")));
         assert!(!has_no_plugin_dirs(Some("2025.02.19")), "older builds abort on the unknown flag");
@@ -1622,7 +1799,7 @@ mod tests {
             proxy: Some(secret.to_string()),
             ..Default::default()
         };
-        let args = build_ytdlp_args(&url, &options, None, None, None);
+        let args = build_ytdlp_args(&url, &options, &[], None, None, None);
         assert!(!args.iter().any(|a| a == "--proxy" || a.contains("S3cret")), "{args:?}");
 
         let work_dir = std::env::temp_dir();
@@ -1867,6 +2044,109 @@ mod tests {
             MediaQualityPreset::AudioM4a.to_args(),
             ["-f", "ba[acodec^=mp4a]/ba/b", "-x", "--audio-format", "m4a"]
         );
+    }
+
+    /// A cookie jar as yt-dlp saves it.
+    const JAR: &str = "# Netscape HTTP Cookie File\n# This file is generated by yt-dlp.  Do not edit.\n\n\
+                       .youtube.com\tTRUE\t/\tTRUE\t0\tSID\tsecret\n";
+
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> =
+            std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        names
+    }
+
+    #[tokio::test]
+    async fn browser_cookies_are_read_once_and_handed_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("cookies");
+        let cookies = BrowserCookies::new(Some(folder.clone()));
+
+        // The first run reads the browser and has yt-dlp save what it read.
+        let first = cookies.for_run(&BrowserCookieSource::Edge).await;
+        assert_eq!(first.args[..3], ["--cookies-from-browser", "edge", "--cookies"]);
+        let saved_to = PathBuf::from(&first.args[3]);
+        assert!(saved_to.starts_with(&folder) && !saved_to.exists(), "{saved_to:?}");
+        // Runs that start before it is saved read the browser themselves.
+        let meanwhile = cookies.for_run(&BrowserCookieSource::Edge).await;
+        assert_eq!(meanwhile.args, ["--cookies-from-browser", "edge"]);
+        drop(meanwhile);
+        // What yt-dlp does as it exits.
+        std::fs::write(&saved_to, JAR).unwrap();
+        first.finish().await;
+        assert!(!saved_to.exists());
+
+        // Later runs get a copy of their own, gone after the run.
+        let later = cookies.for_run(&BrowserCookieSource::Edge).await;
+        assert_eq!(later.args.len(), 2);
+        assert_eq!(later.args[0], "--cookies");
+        let copy = PathBuf::from(&later.args[1]);
+        assert_eq!(std::fs::read_to_string(&copy).unwrap(), JAR);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&copy).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(std::fs::metadata(&folder).unwrap().permissions().mode() & 0o777, 0o700);
+        }
+        drop(later);
+        assert!(!copy.exists());
+
+        // Each browser has its own jar; a cookie file is passed on as it is.
+        let firefox = cookies.for_run(&BrowserCookieSource::Firefox).await;
+        assert_eq!(firefox.args[..2], ["--cookies-from-browser", "firefox"]);
+        drop(firefox);
+        let file = PathBuf::from("/home/me/cookies.txt");
+        assert_eq!(cookies.for_run(&BrowserCookieSource::File(file.clone())).await.args, BrowserCookieSource::File(file).to_args());
+        assert_eq!(cookies.for_run(&BrowserCookieSource::None).await.args, Vec::<String>::new());
+        // Nothing is left on disk, claim locks included.
+        assert_eq!(names_in(&folder), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn browser_cookies_are_read_again_until_a_jar_is_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let cookies = BrowserCookies::new(Some(dir.path().to_path_buf()));
+        let saves = |run: &CookieRun| run.args.len() == 4 && run.args[..2] == ["--cookies-from-browser", "chrome"];
+
+        // yt-dlp failed before saving anything.
+        let run = cookies.for_run(&BrowserCookieSource::Chrome).await;
+        assert!(saves(&run));
+        run.finish().await;
+        // It was killed as it wrote the jar (a killed run is not finished).
+        let run = cookies.for_run(&BrowserCookieSource::Chrome).await;
+        assert!(saves(&run));
+        std::fs::write(&run.args[3], &JAR[..20]).unwrap();
+        drop(run);
+        // It wrote something else.
+        let run = cookies.for_run(&BrowserCookieSource::Chrome).await;
+        assert!(saves(&run));
+        std::fs::write(&run.args[3], "ERROR").unwrap();
+        run.finish().await;
+
+        let run = cookies.for_run(&BrowserCookieSource::Chrome).await;
+        assert!(saves(&run));
+        std::fs::write(&run.args[3], JAR).unwrap();
+        run.finish().await;
+        assert_eq!(cookies.for_run(&BrowserCookieSource::Chrome).await.args[0], "--cookies");
+        assert_eq!(names_in(dir.path()), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn cookie_files_no_process_holds_are_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        // Left by a run that crashed: its file and its claim's lock.
+        std::fs::write(dir.path().join("crashed.txt"), JAR).unwrap();
+        std::fs::write(dir.path().join("crashed.txt.part.lock"), b"").unwrap();
+        // A run in another process, which holds its file.
+        let live = dir.path().join("live.txt");
+        let claim = crate::engine::claim_target(&live).unwrap().unwrap();
+        std::fs::write(&live, JAR).unwrap();
+
+        let cookies = BrowserCookies::new(Some(dir.path().to_path_buf()));
+        drop(cookies.for_run(&BrowserCookieSource::Brave).await);
+        assert_eq!(names_in(dir.path()), ["live.txt", "live.txt.part.lock"]);
+        drop(claim);
     }
 
     /// Spawn a shell that starts a long-running grandchild (standing in for yt-dlp's ffmpeg)
