@@ -88,34 +88,30 @@ impl DiskWriter {
 
     /// Computes BLAKE3 root hash for the entire file.
     pub fn compute_file_hash(&self) -> Result<[u8; 32], StorageError> {
-        Ok(Digests::of(&self.file, self.size, false, false)?.blake3)
+        Ok(Digests::of(&self.path, false, false)?.blake3)
     }
 
     /// Computes SHA-256 hash for the entire file as a lowercase hex string.
     pub fn compute_sha256(&self) -> Result<String, StorageError> {
-        Ok(Digests::of(&self.file, self.size, true, false)?.sha256.unwrap_or_default())
+        Ok(Digests::of(&self.path, true, false)?.sha256.unwrap_or_default())
     }
 
     /// Computes MD5 hash for the entire file as a lowercase hex string.
     pub fn compute_md5(&self) -> Result<String, StorageError> {
-        Ok(Digests::of(&self.file, self.size, false, true)?.md5.unwrap_or_default())
+        Ok(Digests::of(&self.path, false, true)?.md5.unwrap_or_default())
     }
 
     /// Verifies the file against an expected checksum ("sha256:...", "md5:...", "blake3:...", or raw hex).
     /// `Ok(false)` means the hash does not match; `Err` means the file could not be read or the
     /// algorithm prefix is unknown.
     pub fn verify_checksum(&self, expected: &str) -> Result<bool, String> {
-        let checksum = Checksum::parse(expected)?;
-        let digests = Digests::of(&self.file, self.size, checksum.needs_sha256(), checksum.needs_md5())
-            .map_err(|e| e.to_string())?;
-        Ok(checksum.matches(&digests))
+        Self::verify_file_checksum(&self.path, expected)
     }
 
     /// Verifies an existing file against an expected checksum. Opens the file read-only and never modifies it.
     pub fn verify_file_checksum(path: &Path, expected: &str) -> Result<bool, String> {
         let checksum = Checksum::parse(expected)?;
-        let (file, len) = open_read_only(path)?;
-        let digests = Digests::of(&file, len, checksum.needs_sha256(), checksum.needs_md5())
+        let digests = Digests::of(path, checksum.needs_sha256(), checksum.needs_md5())
             .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
         Ok(checksum.matches(&digests))
     }
@@ -158,14 +154,13 @@ pub fn validate_checksum(expected: &str) -> Result<(), String> {
     Checksum::parse(expected).map(|_| ())
 }
 
-/// Hashes a finished file in a single read pass: always BLAKE3 (returned as hex), plus whatever
-/// `expected_checksum` needs. Opens the file read-only; call it from a blocking context.
+/// Hashes a finished file: always BLAKE3 (returned as hex), plus whatever `expected_checksum`
+/// needs, all at once (see [`Digests::of`]). Opens the file read-only; call it from a blocking
+/// context.
 pub fn hash_and_verify_file(path: &Path, expected_checksum: Option<&str>) -> Result<String, VerifyError> {
     let checksum = expected_checksum.map(Checksum::parse).transpose().map_err(VerifyError::Io)?;
-    let (file, len) = open_read_only(path).map_err(VerifyError::Io)?;
     let digests = Digests::of(
-        &file,
-        len,
+        path,
         checksum.as_ref().is_some_and(Checksum::needs_sha256),
         checksum.as_ref().is_some_and(Checksum::needs_md5),
     )
@@ -180,15 +175,6 @@ pub fn hash_and_verify_file(path: &Path, expected_checksum: Option<&str>) -> Res
         ))),
         _ => Ok(digests.blake3_hex),
     }
-}
-
-fn open_read_only(path: &Path) -> Result<(File, u64), String> {
-    let file = File::open(path).map_err(|e| format!("Failed to open {}: {}", path.display(), e))?;
-    let len = file
-        .metadata()
-        .map_err(|e| format!("Failed to read file metadata: {}", e))?
-        .len();
-    Ok((file, len))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -303,28 +289,40 @@ struct Digests {
 }
 
 impl Digests {
-    /// Reads `[0, len)` once, feeding every requested hasher.
-    fn of(file: &File, len: u64, sha256: bool, md5: bool) -> Result<Self, StorageError> {
-        let mut blake = blake3::Hasher::new();
-        let mut sha = sha256.then(Sha256::new);
-        let mut md = md5.then(Md5::new);
-        read_blocks(file, 0, len, |block| {
-            blake.update(block);
-            if let Some(h) = sha.as_mut() {
-                h.update(block);
-            }
-            if let Some(h) = md.as_mut() {
-                h.update(block);
-            }
-        })?;
-        let blake3 = *blake.finalize().as_bytes();
-        Ok(Self {
-            blake3,
-            blake3_hex: hex::encode(&blake3),
-            sha256: sha.map(|h| hex::encode(&h.finalize())),
-            md5: md.map(|h| hex::encode(&h.finalize())),
+    /// Hashes the file at `path` without writing to it: BLAKE3 over a memory map on every core
+    /// and, at the same time on another thread, the requested SHA-256/MD5 in one buffered pass,
+    /// so it takes about as long as the slower of the two rather than their sum. Blocking.
+    fn of(path: &Path, sha256: bool, md5: bool) -> std::io::Result<Self> {
+        std::thread::scope(|s| {
+            let others = (sha256 || md5).then(|| s.spawn(|| sha256_md5(path, sha256, md5)));
+            let mut blake = blake3::Hasher::new();
+            let hashed = blake.update_mmap_rayon(path).map(|_| ());
+            let (sha, md) = match others {
+                Some(thread) => thread.join().map_err(|_| std::io::Error::other("hashing thread panicked"))??,
+                None => (None, None),
+            };
+            hashed?;
+            let blake3 = *blake.finalize().as_bytes();
+            Ok(Self { blake3, blake3_hex: hex::encode(&blake3), sha256: sha, md5: md })
         })
     }
+}
+
+/// SHA-256 and/or MD5 of the file at `path` as lowercase hex, from one sequential read.
+fn sha256_md5(path: &Path, sha256: bool, md5: bool) -> std::io::Result<(Option<String>, Option<String>)> {
+    let file = File::open(path)?;
+    let len = file.metadata()?.len();
+    let mut sha = sha256.then(Sha256::new);
+    let mut md = md5.then(Md5::new);
+    read_blocks(&file, 0, len, |block| {
+        if let Some(h) = sha.as_mut() {
+            h.update(block);
+        }
+        if let Some(h) = md.as_mut() {
+            h.update(block);
+        }
+    })?;
+    Ok((sha.map(|h| hex::encode(&h.finalize())), md.map(|h| hex::encode(&h.finalize()))))
 }
 
 /// Streams `[offset, offset + len)` of `file` through `f` in `HASH_BUF_SIZE` blocks.
@@ -588,6 +586,27 @@ mod tests {
         assert!(matches!(&err, VerifyError::Mismatch(m) if m.contains("5d41402abc4b2a76b9719d911017c592")), "{err}");
         assert!(matches!(hash_and_verify_file(&temp.path().with_extension("missing"), None), Err(VerifyError::Io(_))));
         assert!(validate_checksum("crc32:3610a686").is_err());
+    }
+
+    #[test]
+    fn test_parallel_hashes_equal_single_threaded_ones() {
+        // Big enough to be memory mapped and split across threads, with a partial last block.
+        let data: Vec<u8> = (0..9 * 1024 * 1024 + 4099u32).map(|i| (i ^ (i >> 11)).wrapping_mul(31) as u8).collect();
+        let temp = NamedTempFile::new().unwrap();
+        std::fs::write(temp.path(), &data).unwrap();
+        let blake = blake3::hash(&data).to_hex().to_string();
+        let sha = hex::encode(&Sha256::digest(&data));
+        let md5 = hex::encode(&Md5::digest(&data));
+
+        assert_eq!(hash_and_verify_file(temp.path(), None).unwrap(), blake);
+        assert_eq!(hash_and_verify_file(temp.path(), Some(&format!("sha256:{sha}"))).unwrap(), blake);
+        assert_eq!(hash_and_verify_file(temp.path(), Some(&format!("md5:{md5}"))).unwrap(), blake);
+        assert_eq!(hash_and_verify_file(temp.path(), Some(&blake)).unwrap(), blake);
+        let err = hash_and_verify_file(temp.path(), Some(&format!("sha256:{}", "0".repeat(64)))).unwrap_err();
+        assert!(matches!(&err, VerifyError::Mismatch(m) if m.contains(&sha)), "{err}");
+        // Files too small to map take the plain read path.
+        std::fs::write(temp.path(), &data[..100]).unwrap();
+        assert_eq!(hash_and_verify_file(temp.path(), None).unwrap(), blake3::hash(&data[..100]).to_hex().to_string());
     }
 
     #[test]
