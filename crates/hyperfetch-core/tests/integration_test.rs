@@ -115,8 +115,10 @@ struct Mock {
     /// Answer GETs (other than probes) whose request target contains the text this way, as an
     /// expired signed URL is answered.
     expired: Option<(&'static str, Reply)>,
-    /// What to do with each GET except the engine's probes, which are always served.
+    /// What to do with each GET except the engine's probes, which are served as `probe_reply`.
     plan: fn(usize) -> Reply,
+    /// What to do with the engine's probes once `busy_probes` are through.
+    probe_reply: Reply,
     /// A probe's answer pauses this long once it has sent this many body bytes (a multiple of
     /// 16 KiB).
     probe_pause: Option<(usize, Duration)>,
@@ -184,6 +186,7 @@ impl Mock {
             redirect: None,
             expired: None,
             plan: |_| Reply::Normal,
+            probe_reply: Reply::Normal,
             probe_pause: None,
             delay_us: AtomicU64::new(0),
             must_exist_on_get: Mutex::new(None),
@@ -290,7 +293,7 @@ async fn handle(mut socket: TcpStream, mock: Arc<Mock>) {
     let (reply, _guard, mut serving) = if probe {
         s.probes.fetch_add(1, Ordering::SeqCst);
         let busy = mock.busy_probes.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok();
-        (if busy { Reply::Status(503, None) } else { Reply::Normal }, None, None)
+        (if busy { Reply::Status(503, None) } else { mock.probe_reply }, None, None)
     } else {
         let index = s.gets.fetch_add(1, Ordering::SeqCst);
         if index == 0 {
@@ -1004,6 +1007,11 @@ async fn test_missing_file_fails_fast() {
         let mut mock = Mock::new(payload(PREFETCH + 512 * KB, 109));
         mock.ranges = ranges;
         mock.plan = |_| Reply::Status(404, None);
+        if !ranges {
+            // The probe's answer would be the download itself: the file is gone by then, and only
+            // HEAD (from a stale cache, say) still finds it.
+            mock.probe_reply = Reply::Status(404, None);
+        }
         let url = serve(Arc::new(mock), "gone.bin").await;
         let temp = tempdir().unwrap();
         let out = temp.path().join("gone.bin");
@@ -1087,7 +1095,49 @@ async fn test_server_ignoring_ranges_it_advertises_falls_back_to_one_stream() {
 
     assert_eq!(path, out);
     assert_file(&out, &data);
-    assert_eq!(mock.stats.gets.load(Ordering::SeqCst), 1, "one stream, no failed range requests");
+    assert_eq!(mock.stats.gets.load(Ordering::SeqCst), 0, "the probe's answer was the one stream, no range requests");
+}
+
+#[tokio::test]
+async fn test_a_single_stream_goes_on_with_the_probes_answer() {
+    let _history = setup().await;
+    let data = payload(PREFETCH + 512 * KB, 257);
+    const CUT: usize = 256 * KB;
+    // A server ignoring ranges, one that cannot say how long the file is, and a probe answer that
+    // breaks off, so the stream has to ask again.
+    for (chunked, probe_reply, gets) in [(false, Reply::Normal, 0), (true, Reply::Normal, 0), (false, Reply::CloseAfter(CUT), 1)] {
+        let mut mock = Mock::new(data.clone());
+        mock.ranges = false;
+        mock.chunked = chunked;
+        mock.probe_reply = probe_reply;
+        mock.delay_us.store(5_000, Ordering::SeqCst);
+        let mock = Arc::new(mock);
+        let url = serve(Arc::clone(&mock), "whole.bin").await;
+        let temp = tempdir().unwrap();
+        let out = temp.path().join("whole.bin");
+
+        let opts = DownloadOptions { max_connections_per_host: 1, ..options(&out, 4, 64 * KB) };
+        let engine = DownloadEngine::new(vec![url.clone()], opts);
+        let (tx, mut rx) = broadcast::channel::<EngineSnapshot>(256);
+        // Whichever answer it reads, the stream holds its host's one slot. (Past the cut: a
+        // snapshot of the broken answer may be looked at only once that answer is given up.)
+        let watch = async {
+            let mut seen = 0;
+            while let Ok(snapshot) = rx.recv().await {
+                if (CUT as u64 + 1..data.len() as u64).contains(&snapshot.downloaded_bytes) {
+                    assert!(hyperfetch_core::hosts::try_acquire(&url, 1).is_none(), "the stream holds no slot");
+                    seen += 1;
+                }
+            }
+            seen
+        };
+        let (done, seen) = tokio::join!(run(&engine, Some(tx)), watch);
+        done.expect("download should succeed");
+
+        assert_file(&out, &data);
+        assert!(seen > 0, "the stream was never seen under way");
+        assert_eq!(mock.stats.gets.load(Ordering::SeqCst), gets, "chunked: {chunked}, probe: {probe_reply:?}");
+    }
 }
 
 #[tokio::test]
