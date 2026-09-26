@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+use std::ffi::OsString;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -468,14 +470,16 @@ fn finish_repair(repair: RepairTarget, complete: bool) -> Result<(), String> {
 /// an interrupted repair leaves a download the engine resumes. Every gap the state records is
 /// fetched, including `missing_ranges`. Only a complete file is renamed back to its final name.
 ///
-/// The prepared `.part` is handed to the download engine, which fetches the gaps over several
+/// First every mirror must show it serves the version the state records (by ETag, else
+/// Last-Modified); the others are left out, and with none left the repair stops. The prepared
+/// `.part` then goes to the download engine, which fetches the gaps from one of them over several
 /// connections (`options` gives their number, the speed limit, retries and timeouts; its output,
-/// checksum and credentials are not used: the repair connects directly). Before that, every mirror
-/// must show it serves the version the state records (by ETag, else Last-Modified), since the
-/// engine compares mirrors only with each other and with the first one's answer; with no such
-/// mirror left the repair stops instead of mixing two versions. A `.part` whose final name is
-/// taken, or media and playlist URLs the engine would hand to other tools, are repaired here
-/// range by range instead, holding each mirror to its version on every answer.
+/// checksum and credentials are not used: the repair connects directly). The engine holds a mirror
+/// to its version only through If-Range, so it gets only a mirror that has a validator allowed
+/// there and honors it (see [`VersionCheck::mirror`]). Without such a mirror, for a `.part` whose
+/// final name is taken, and for media and playlist URLs the engine would hand to other tools, the
+/// gaps are fetched here range by range instead, holding each mirror to its version on every
+/// answer. Either way a repair never mixes two versions of a file.
 pub async fn repair_missing_ranges<F>(
     file_path: &Path,
     total_size: u64,
@@ -519,121 +523,230 @@ where
     let total_repair_bytes: u64 = gaps.iter().map(|r| r.len()).sum();
     let cancel = cancel_flag.as_deref();
 
+    let mut repaired_bytes: u64 = 0;
+    let mut on_bytes = |n: u64| {
+        repaired_bytes += n;
+        progress_callback(repaired_bytes, total_repair_bytes);
+    };
     // The engine would save beside a final file that exists, and sends media and playlist URLs to
     // yt-dlp or the HLS engine.
     let engine_urls = !urls.iter().any(|u| crate::media::is_supported_media_site(u) || u.as_str().contains(".m3u8"));
     if final_taken || !engine_urls {
-        let mut repaired_bytes: u64 = 0;
-        let mut on_bytes = |n: u64| {
-            repaired_bytes += n;
-            progress_callback(repaired_bytes, total_repair_bytes);
-        };
         return repair_in_place(&client, repair, &gaps, urls, cancel, &mut on_bytes).await;
     }
 
-    let first_gap = gaps.first().map_or(0, |g| g.start);
-    let serving = mirrors_serving(&client, urls, &Version::recorded(&repair.state), first_gap, total_size, cancel).await;
+    let check = VersionCheck {
+        client: &client,
+        recorded: Version::recorded(&repair.state),
+        at: gaps.first().map_or(0, |g| g.start),
+        total_size,
+        cancel,
+    };
+    let serving = match check.mirrors(urls).await {
+        Ok(serving) => serving,
+        Err(e) => {
+            blocking(move || drop(repair)).await?;
+            return Err(e);
+        }
+    };
+    let Some(mirror) = serving.iter().find(|m| m.engine).map(|m| m.url.clone()) else {
+        let urls: Vec<Url> = serving.into_iter().map(|m| m.url).collect();
+        return repair_in_place(&client, repair, &gaps, &urls, cancel, &mut on_bytes).await;
+    };
     let final_path = repair.final_path.clone();
     // The engine takes the claim itself.
     blocking(move || drop(repair)).await?;
-    let mirrors = serving?;
+    let recorded_hash = {
+        let path = final_path.clone();
+        blocking(move || {
+            history_entry_for(&DownloadHistoryManager::load(), &path).filter(|e| e.blake3_hash.is_some()).cloned()
+        })
+        .await?
+    };
     let progress = move |downloaded: u64| {
         let done = downloaded.saturating_sub(total_size - total_repair_bytes).min(total_repair_bytes);
         progress_callback(done, total_repair_bytes);
     };
-    repair_with_engine(final_path, mirrors, options, cancel, progress).await
+    repair_with_engine(final_path.clone(), mirror.clone(), options, cancel, progress).await?;
+    match recorded_hash {
+        Some(recorded) => keep_recorded_hash(&check, &mirror, &final_path, recorded).await,
+        None => Ok(()),
+    }
 }
 
-/// The mirrors among `urls` that answer a one-byte range request at `at` with the version
-/// `recorded` and the file's size. Transient failures are tried again; a mirror serving another
-/// version is left out at once. With none left, the error says why each was.
-async fn mirrors_serving(
-    client: &Client,
-    urls: &[Url],
-    recorded: &Version,
+/// A mirror that serves the version a repair expects.
+struct Serving {
+    url: Url,
+    /// The download engine can hold this mirror to that version (see [`VersionCheck::mirror`]).
+    engine: bool,
+}
+
+/// Asks mirrors for byte `at` of the `total_size`-byte file and holds their answers to the
+/// version `recorded`.
+struct VersionCheck<'a> {
+    client: &'a Client,
+    recorded: Version,
     at: u64,
     total_size: u64,
-    cancel: Option<&AtomicBool>,
-) -> Result<Vec<Url>, String> {
-    let checks = urls.iter().map(|url| async move {
-        let mut last = String::new();
-        for attempt in 0..ATTEMPTS_PER_MIRROR {
-            if attempt > 0 {
-                until_cancelled(tokio::time::sleep(RETRY_DELAY), cancel).await?;
+    cancel: Option<&'a AtomicBool>,
+}
+
+impl VersionCheck<'_> {
+    /// Runs `attempt` until it gives anything but a transient failure, at most
+    /// `ATTEMPTS_PER_MIRROR` times.
+    async fn retrying<T, Fut>(&self, mut attempt: impl FnMut() -> Fut) -> Result<T, FetchError>
+    where
+        Fut: Future<Output = Result<T, FetchError>>,
+    {
+        let mut tries = 1;
+        loop {
+            match attempt().await {
+                Err(FetchError::Retry(_)) if tries < ATTEMPTS_PER_MIRROR => {
+                    tries += 1;
+                    until_cancelled(tokio::time::sleep(RETRY_DELAY), self.cancel).await?;
+                }
+                result => return result,
             }
-            match serves_version(client, url, recorded, at, total_size, cancel).await {
-                Ok(()) => return Ok(Ok(url.clone())),
-                Err(FetchError::Retry(e)) => last = e,
-                Err(FetchError::WrongVersion(e)) => return Ok(Err(e)),
+        }
+    }
+
+    /// The version `url` serves, once its answer shows it is byte `at` of the file in the
+    /// recorded version.
+    async fn serves(&self, url: &Url) -> Result<Version, FetchError> {
+        let request = self.client.get(url.clone()).header(RANGE, format!("bytes={}-{}", self.at, self.at));
+        let resp = until_cancelled(request.send(), self.cancel)
+            .await?
+            .map_err(|e| FetchError::Retry(format!("request to {} failed: {}", url, e)))?;
+        if resp.status() == StatusCode::OK {
+            return Err(FetchError::Retry(format!("{} ignored the range request and sent the whole file", url)));
+        }
+        if resp.status() != StatusCode::PARTIAL_CONTENT {
+            return Err(FetchError::Retry(format!("{} answered HTTP {} instead of 206 Partial Content", url, resp.status())));
+        }
+        let served = Version::served(resp.headers());
+        if !self.recorded.matches(&served) {
+            return Err(FetchError::WrongVersion(format!("the file at {} changed since it was downloaded", url)));
+        }
+        let header = resp.headers().get(CONTENT_RANGE).and_then(|v| v.to_str().ok());
+        match header.map(ByteRange::parse_content_range) {
+            Some(Ok((range, Some(total)))) if range.start == self.at && total == self.total_size => Ok(served),
+            _ => Err(FetchError::Retry(format!(
+                "{} answered Content-Range {:?} for byte {} of a {}-byte file",
+                url,
+                header.unwrap_or("(missing)"),
+                self.at,
+                self.total_size
+            ))),
+        }
+    }
+
+    /// Whether `url` answers a range request even under an If-Range that does not match: asks for
+    /// byte `at` with a validator of the kind of `validator` (ETag or date) that the file does not
+    /// have. A server honoring If-Range sends the whole file instead; that body is not read.
+    async fn ignores_if_range(&self, url: &Url, validator: &str) -> Result<bool, FetchError> {
+        let other = if validator.starts_with('"') { "\"endo-if-range-check\"" } else { "Thu, 01 Jan 1970 00:00:00 GMT" };
+        let request = self
+            .client
+            .get(url.clone())
+            .header(RANGE, format!("bytes={}-{}", self.at, self.at))
+            .header(IF_RANGE, other);
+        let resp = until_cancelled(request.send(), self.cancel)
+            .await?
+            .map_err(|e| FetchError::Retry(format!("request to {} failed: {}", url, e)))?;
+        match resp.status() {
+            StatusCode::OK => Ok(false),
+            StatusCode::PARTIAL_CONTENT => Ok(true),
+            status => Err(FetchError::Retry(format!("{} answered HTTP {} to a range request", url, status))),
+        }
+    }
+
+    /// Checks that `url` serves the recorded version, trying again after transient failures.
+    ///
+    /// The engine compares a mirror's answers with nothing but the If-Range it sends, built from
+    /// the validator its probe finds: a strong ETag, else Last-Modified. It can hold a mirror to
+    /// its version only if that validator exists and the mirror honors it; one that names no
+    /// version at all gives no path anything to check.
+    async fn mirror(&self, url: &Url) -> Result<Serving, FetchError> {
+        let served = self.retrying(|| self.serves(url)).await?;
+        let engine = match served.if_range() {
+            Some(validator) => match self.retrying(|| self.ignores_if_range(url, validator)).await {
+                Ok(ignores) => !ignores,
                 Err(FetchError::Fatal(e)) => return Err(FetchError::Fatal(e)),
-            }
-        }
-        Ok(Err(last))
-    });
-    let mut serving = Vec::new();
-    let mut reasons = Vec::new();
-    for checked in futures_util::future::join_all(checks).await {
-        match checked {
-            Ok(Ok(url)) => serving.push(url),
-            Ok(Err(reason)) => {
-                tracing::warn!("Not repairing from this mirror: {}", reason);
-                reasons.push(reason);
-            }
-            Err(FetchError::Fatal(e) | FetchError::Retry(e) | FetchError::WrongVersion(e)) => return Err(e),
-        }
+                Err(FetchError::Retry(e) | FetchError::WrongVersion(e)) => {
+                    tracing::warn!("Could not tell whether {} honors If-Range: {}", url, e);
+                    false
+                }
+            },
+            None => served.etag.is_none() && served.last_modified.is_none(),
+        };
+        Ok(Serving { url: url.clone(), engine })
     }
-    if serving.is_empty() {
-        return Err(format!("Repair stopped: {}", reasons.join("; ")));
-    }
-    Ok(serving)
-}
 
-/// Asks `url` for byte `at` and checks that the answer is that byte of the `total_size`-byte file
-/// in the version `recorded`.
-async fn serves_version(
-    client: &Client,
-    url: &Url,
-    recorded: &Version,
-    at: u64,
-    total_size: u64,
-    cancel: Option<&AtomicBool>,
-) -> Result<(), FetchError> {
-    let request = client.get(url.clone()).header(RANGE, format!("bytes={}-{}", at, at));
-    let resp = until_cancelled(request.send(), cancel)
-        .await?
-        .map_err(|e| FetchError::Retry(format!("request to {} failed: {}", url, e)))?;
-    if resp.status() == StatusCode::OK {
-        return Err(FetchError::Retry(format!("{} ignored the range request and sent the whole file", url)));
-    }
-    if resp.status() != StatusCode::PARTIAL_CONTENT {
-        return Err(FetchError::Retry(format!("{} answered HTTP {} instead of 206 Partial Content", url, resp.status())));
-    }
-    if !recorded.matches(&Version::served(resp.headers())) {
-        return Err(FetchError::WrongVersion(format!("the file at {} changed since it was downloaded", url)));
-    }
-    let header = resp.headers().get(CONTENT_RANGE).and_then(|v| v.to_str().ok());
-    match header.map(ByteRange::parse_content_range) {
-        Some(Ok((served, Some(total)))) if served.start == at && total == total_size => Ok(()),
-        _ => Err(FetchError::Retry(format!(
-            "{} answered Content-Range {:?} for byte {} of a {}-byte file",
-            url,
-            header.unwrap_or("(missing)"),
-            at,
-            total_size
-        ))),
+    /// The mirrors among `urls` that serve the recorded version and the file's size. A mirror
+    /// serving another version is left out at once. With none left, the error says why each was.
+    async fn mirrors(&self, urls: &[Url]) -> Result<Vec<Serving>, String> {
+        let mut serving = Vec::new();
+        let mut reasons = Vec::new();
+        for checked in futures_util::future::join_all(urls.iter().map(|url| self.mirror(url))).await {
+            match checked {
+                Ok(mirror) => serving.push(mirror),
+                Err(FetchError::Fatal(e)) => return Err(e),
+                Err(FetchError::Retry(reason) | FetchError::WrongVersion(reason)) => {
+                    tracing::warn!("Not repairing from this mirror: {}", reason);
+                    reasons.push(reason);
+                }
+            }
+        }
+        if serving.is_empty() {
+            return Err(format!("Repair stopped: {}", reasons.join("; ")));
+        }
+        Ok(serving)
     }
 }
 
-/// Resumes the prepared `<final_path>.part` with the download engine from `mirrors`, which verifies
-/// the result and renames it to `final_path`. `progress` gets the engine's downloaded byte count.
+/// Keeps the entry history recorded for `final_path` when it was downloaded, `recorded`, where the
+/// engine recorded another hash for the repaired file. The hashes differ when bytes the repair
+/// kept are damaged; the old one must then stay, so verify still shows it. They also differ when
+/// the file changed on `mirror` just before the engine started: the engine then discarded the
+/// `.part` and downloaded the new version whole, which the old hash would condemn. That new
+/// version keeps its own hash and the repair reports the change. When the mirror cannot tell, the
+/// old hash stays.
+async fn keep_recorded_hash(
+    check: &VersionCheck<'_>,
+    mirror: &Url,
+    final_path: &Path,
+    recorded: HistoryEntry,
+) -> Result<(), String> {
+    let saved = {
+        let path = final_path.to_path_buf();
+        blocking(move || history_entry_for(&DownloadHistoryManager::load(), &path).and_then(|e| e.blake3_hash.clone()))
+            .await?
+    };
+    if saved == recorded.blake3_hash {
+        return Ok(());
+    }
+    if let Err(FetchError::WrongVersion(e)) = check.retrying(|| check.serves(mirror)).await {
+        return Err(format!("{}; {} now holds the new version, downloaded in full", e, final_path.display()));
+    }
+    blocking(move || DownloadHistoryManager::load().add_or_update(recorded)).await
+}
+
+/// The names in the directory of `path`, or None when it cannot be read.
+fn names_beside(path: &Path) -> Option<HashSet<OsString>> {
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    std::fs::read_dir(dir).ok()?.map(|entry| entry.map(|e| e.file_name())).collect::<Result<_, _>>().ok()
+}
+
+/// Resumes the prepared `<final_path>.part` with the download engine from `mirror`, which verifies
+/// the result, renames it to `final_path` and records it in history. `progress` gets the engine's
+/// downloaded byte count.
 ///
 /// The claim is free while the engine starts; if another download takes the name meanwhile, the
-/// engine picks another name, which is stopped and cleaned up as soon as it shows. The engine
-/// records the finished file in history; a BLAKE3 hash recorded there before stays, as the
-/// reference the repaired file is checked against.
+/// engine picks another name, which is stopped as soon as it shows. What the engine started there
+/// is removed; a `.part` it resumed there is another download's saved progress and stays.
 async fn repair_with_engine(
     final_path: PathBuf,
-    mirrors: Vec<Url>,
+    mirror: Url,
     options: &DownloadOptions,
     cancel: Option<&AtomicBool>,
     progress: impl Fn(u64),
@@ -648,15 +761,12 @@ async fn repair_with_engine(
         browser_cookies: None,
         ..options.clone()
     };
-    let recorded_hash = {
+    let names_before = {
         let path = final_path.clone();
-        blocking(move || {
-            history_entry_for(&DownloadHistoryManager::load(), &path).filter(|e| e.blake3_hash.is_some()).cloned()
-        })
-        .await?
+        blocking(move || names_beside(&path)).await?
     };
     // Building the client reads the TLS roots.
-    let engine = blocking(move || DownloadEngine::new(mirrors, options)).await?;
+    let engine = blocking(move || DownloadEngine::new(vec![mirror], options)).await?;
 
     let (tx, mut rx) = broadcast::channel::<EngineSnapshot>(16);
     let run = engine.run(Some(tx));
@@ -690,20 +800,21 @@ async fn repair_with_engine(
     };
 
     match (result, elsewhere) {
-        (Ok(path), _) if path == final_path => {
-            if let Some(entry) = recorded_hash {
-                blocking(move || DownloadHistoryManager::load().add_or_update(entry)).await?;
-            }
-            Ok(())
-        }
+        (Ok(path), _) if path == final_path => Ok(()),
         (Ok(path), _) => Err(format!(
             "another download took {} while the repair was starting; a complete copy was saved as {}",
             final_path.display(),
             path.display()
         )),
         (Err(_), Some(other)) => {
-            if let Err(e) = blocking(move || discard_partial(&other)).await? {
-                tracing::warn!("Could not remove what the repair started under another name: {}", e);
+            let part = with_suffix(&other, ".part");
+            let started_here = part
+                .file_name()
+                .is_some_and(|name| names_before.as_ref().is_some_and(|before| !before.contains(name)));
+            if started_here {
+                if let Err(e) = blocking(move || discard_partial(&other)).await? {
+                    tracing::warn!("Could not remove what the repair started under another name: {}", e);
+                }
             }
             Err(format!("{} is still being downloaded; stop that download before repairing it", final_path.display()))
         }
@@ -968,70 +1079,86 @@ mod tests {
     enum Mode {
         /// Every body at 16 KiB per this pause.
         Paced(Duration),
-        /// The file is "v1" until the first request with an If-Range, answered as the new build
-        /// "v2" (200, as a server honoring If-Range does), like every request after it.
+        /// The file is "v1" until the first request with If-Range "v1" (the engine's workers),
+        /// and the new build "v2" from then on.
         NewBuildOnIfRange,
-        /// Requests carrying If-Range (the engine's workers) get their headers, then nothing.
+        /// Requests with If-Range "v1" (the engine's workers) get their headers, then nothing.
         StallIfRange,
         /// The first request from byte 0 (the engine's probe) waits for `Served::release`.
         HoldProbe,
+        /// The file is the new build "v2" from the `get`-th GET on (counting from 0). The ETags
+        /// are `weak`, and with `ignores_if_range` ranges are answered whatever If-Range says.
+        NewBuildFrom { get: usize, weak: bool, ignores_if_range: bool },
     }
 
     #[derive(Default)]
     struct Served {
+        gets: AtomicUsize,
+        /// Ranged answers to requests with If-Range (the engine's workers) being sent.
         busy: AtomicUsize,
-        /// The most requests past the file's first byte answered at once.
+        /// The most of those sent at once.
         most_busy: AtomicUsize,
         probe: Notify,
         release: Notify,
     }
 
-    /// Serves `content` as ETag "v1" to many connections at once, HEAD refused.
+    /// Serves `content` as ETag "v1" to many connections at once, HEAD refused. An If-Range that
+    /// does not match gets the whole file, as from any server honoring it.
     async fn engine_server(content: Vec<u8>, mode: Mode) -> (Url, Arc<Served>) {
         isolate_history();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let served = Arc::new(Served::default());
-        let (content, stats) = (Arc::new(content), Arc::clone(&served));
+        let new_build: Vec<u8> = content.iter().map(|b| b ^ 0xff).collect();
+        let (builds, stats) = (Arc::new([content, new_build]), Arc::clone(&served));
         let (held, changed) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
         tokio::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
-                let (content, served, held, changed) =
-                    (Arc::clone(&content), Arc::clone(&stats), Arc::clone(&held), Arc::clone(&changed));
+                let (builds, served, held, changed) =
+                    (Arc::clone(&builds), Arc::clone(&stats), Arc::clone(&held), Arc::clone(&changed));
                 tokio::spawn(async move {
                     let Some(req) = read_head(&mut sock).await else { return };
                     if req.starts_with("head ") {
                         let _ = sock.write_all(NO_HEAD).await;
                         return;
                     }
-                    let (start, end) = requested(&req, content.len() as u64);
+                    let get = served.gets.fetch_add(1, Ordering::SeqCst);
+                    let (start, end) = requested(&req, builds[0].len() as u64);
                     if mode == Mode::HoldProbe && start == 0 && !held.swap(true, Ordering::SeqCst) {
                         served.probe.notify_one();
                         served.release.notified().await;
                     }
-                    if mode == Mode::NewBuildOnIfRange && req.contains("if-range:") {
+                    let if_range = req.lines().find_map(|l| l.strip_prefix("if-range:")).map(str::trim);
+                    if mode == Mode::NewBuildOnIfRange && if_range == Some("\"v1\"") {
                         changed.store(true, Ordering::SeqCst);
                     }
-                    if changed.load(Ordering::SeqCst) {
-                        let new_build: Vec<u8> = content.iter().map(|b| b ^ 0xff).collect();
-                        let _ = sock.write_all(&with_header(full_200(&new_build), "ETag: \"v2\"")).await;
+                    let (weak, ignores_if_range, new) = match mode {
+                        Mode::NewBuildFrom { get: from, weak, ignores_if_range } => (weak, ignores_if_range, get >= from),
+                        _ => (false, false, changed.load(Ordering::SeqCst)),
+                    };
+                    let content = &builds[usize::from(new)];
+                    let etag = format!("{}\"v{}\"", if weak { "W/" } else { "" }, 1 + usize::from(new));
+                    let etag_header = format!("ETag: {}", etag);
+                    if if_range.is_some_and(|v| v != etag.to_ascii_lowercase()) && !ignores_if_range {
+                        let _ = sock.write_all(&with_header(full_200(content), &etag_header)).await;
                         return;
                     }
                     let body = &content[start as usize..=end as usize];
                     let head = format!(
-                        "HTTP/1.1 206 Partial Content\r\nETag: \"v1\"\r\nContent-Range: bytes {}-{}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        "HTTP/1.1 206 Partial Content\r\n{}\r\nContent-Range: bytes {}-{}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        etag_header,
                         start,
                         end,
                         content.len(),
                         body.len()
                     );
-                    let past_start = start > 0;
-                    if past_start {
+                    let worker = if_range.is_some();
+                    if worker {
                         let now = served.busy.fetch_add(1, Ordering::SeqCst) + 1;
                         served.most_busy.fetch_max(now, Ordering::SeqCst);
                     }
                     if sock.write_all(head.as_bytes()).await.is_ok() {
-                        if mode == Mode::StallIfRange && req.contains("if-range:") {
+                        if mode == Mode::StallIfRange && worker {
                             std::future::pending::<()>().await;
                         }
                         for piece in body.chunks(16 * 1024) {
@@ -1043,7 +1170,7 @@ mod tests {
                             }
                         }
                     }
-                    if past_start {
+                    if worker {
                         served.busy.fetch_sub(1, Ordering::SeqCst);
                     }
                 });
@@ -1456,6 +1583,18 @@ mod tests {
         assert!(most >= 2, "the missing 4 MiB came over {} connection(s) at a time", most);
     }
 
+    /// `damaged_big` at `path` after a repair that stopped: still a `.part` missing `big_gap()`
+    /// that holds no byte of another build, and verify does not pass it.
+    fn assert_repair_stopped(path: &Path, content: &[u8]) {
+        assert!(!path.exists());
+        let on_disk = std::fs::read(part_of(path)).unwrap();
+        assert!(on_disk[..MIB] == content[..MIB]);
+        assert!(on_disk[MIB..].iter().all(|&b| b == 0), "no byte of the new build may be written");
+        assert_eq!(gaps_on_disk(&part_of(path)), vec![big_gap()]);
+        let res = verify_build_file(path, None, None).unwrap();
+        assert!(!res.is_complete, "{}", res.status_message);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn engine_repair_stops_when_the_file_changes() {
         let dir = tempdir().unwrap();
@@ -1464,12 +1603,64 @@ mod tests {
 
         let res = repair_missing_ranges(&path, content.len() as u64, &[big_gap()], &[url], &DownloadOptions::default(), None, |_, _| {}).await;
         assert!(res.as_ref().is_err_and(|e| e.contains("changed")), "{:?}", res);
+        assert_repair_stopped(&path, &content);
+    }
 
-        assert!(!path.exists());
-        let on_disk = std::fs::read(part_of(&path)).unwrap();
-        assert!(on_disk[..MIB] == content[..MIB]);
-        assert!(on_disk[MIB..].iter().all(|&b| b == 0), "no byte of the new build may be written");
-        assert_eq!(gaps_on_disk(&part_of(&path)), vec![big_gap()]);
+    /// The engine checks a ranged answer only through the If-Range it sent, so a server ignoring
+    /// If-Range could hand it the ranges of a new build. Such a server is repaired from range by
+    /// range, every answer checked.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn repair_never_mixes_versions_from_a_server_ignoring_if_range() {
+        let dir = tempdir().unwrap();
+        let (path, content) = damaged_big(dir.path());
+        // The new build appears after the repair's two checks.
+        let mode = Mode::NewBuildFrom { get: 2, weak: false, ignores_if_range: true };
+        let (url, _) = engine_server(content.clone(), mode).await;
+
+        let res = repair_missing_ranges(&path, content.len() as u64, &[big_gap()], &[url], &DownloadOptions::default(), None, |_, _| {}).await;
+        assert!(res.as_ref().is_err_and(|e| e.contains("changed")), "{:?}", res);
+        assert_repair_stopped(&path, &content);
+    }
+
+    /// A weak ETag may not go into If-Range, so the engine would send none and could not tell a
+    /// new build from the old one at all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn repair_never_mixes_versions_behind_a_weak_etag() {
+        let dir = tempdir().unwrap();
+        let (path, content) = damaged_big(dir.path());
+        let state_path = DownloadState::state_file_path(&path);
+        let mut state = DownloadState::load_from_path(&state_path).unwrap().unwrap();
+        state.etag = Some("W/\"v1\"".into());
+        state.save_atomic(&state_path).unwrap();
+        // The new build appears after the repair's check.
+        let mode = Mode::NewBuildFrom { get: 1, weak: true, ignores_if_range: false };
+        let (url, _) = engine_server(content.clone(), mode).await;
+
+        let res = repair_missing_ranges(&path, content.len() as u64, &[big_gap()], &[url], &DownloadOptions::default(), None, |_, _| {}).await;
+        assert!(res.as_ref().is_err_and(|e| e.contains("changed")), "{:?}", res);
+        assert_repair_stopped(&path, &content);
+    }
+
+    /// The file changes on the server after the repair's checks but before the engine starts,
+    /// which then downloads the new build whole instead of resuming. The hash history recorded for
+    /// the old build must not condemn that file, and the repair says what happened.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_new_build_the_engine_downloads_whole_keeps_its_own_hash() {
+        let dir = tempdir().unwrap();
+        let (path, content) = damaged_big(dir.path());
+        let mode = Mode::NewBuildFrom { get: 2, weak: false, ignores_if_range: false };
+        let (url, _) = engine_server(content.clone(), mode).await;
+        let size = content.len() as u64;
+        let mut entry = HistoryEntry::new("big.bin".into(), std::path::absolute(&path).unwrap(), size, vec![url.to_string()]);
+        entry.blake3_hash = Some(blake3::hash(&content).to_hex().to_string());
+        DownloadHistoryManager::load().add_or_update(entry);
+
+        let res = repair_missing_ranges(&path, size, &[big_gap()], &[url], &DownloadOptions::default(), None, |_, _| {}).await;
+        assert!(res.as_ref().is_err_and(|e| e.contains("changed") && e.contains("new version")), "{:?}", res);
+        let new_build: Vec<u8> = content.iter().map(|b| b ^ 0xff).collect();
+        assert!(std::fs::read(&path).unwrap() == new_build, "the engine saved something else");
+        let res = verify_build_file(&path, None, None).unwrap();
+        assert!(res.is_complete && res.checksum_match == Some(true), "{}", res.status_message);
     }
 
     /// Checked only against each other, a mirror serving another version would lead the engine
@@ -1517,6 +1708,41 @@ mod tests {
             std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
         left.sort();
         assert_eq!(left, ["big.bin.part", "big.bin.part.hfstate", "big.bin.part.lock"]);
+        assert_eq!(gaps_on_disk(&part_of(&path)), vec![big_gap()]);
+        drop(download);
+    }
+
+    /// Under another name the engine may resume a `.part` that another download left there, here
+    /// a paused download of the same file. Stopping the engine must leave that progress alone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn repair_keeps_the_progress_it_found_under_another_name() {
+        let dir = tempdir().unwrap();
+        let (path, content) = damaged_big(dir.path());
+        let (url, served) = engine_server(content.clone(), Mode::HoldProbe).await;
+        let paused = dir.path().join("big (1).bin.part");
+        let mut data = content.clone();
+        data[2 * MIB..].fill(0);
+        std::fs::write(&paused, &data).unwrap();
+        let mut state = DownloadState::new("big (1).bin".into(), content.len() as u64, MIB as u64, vec![url.to_string()]);
+        state.completed_ranges = vec![ByteRange::from_len(0, 2 * MIB as u64).unwrap()];
+        state.etag = Some("\"v1\"".into());
+        state.save_atomic(&DownloadState::state_file_path(&paused)).unwrap();
+
+        let repair = {
+            let (path, total) = (path.clone(), content.len() as u64);
+            tokio::spawn(async move {
+                repair_missing_ranges(&path, total, &[big_gap()], &[url], &DownloadOptions::default(), None, |_, _| {}).await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(20), served.probe.notified()).await.expect("the engine never probed");
+        let download = claim_target(&path).unwrap().expect("the repair left the claim to the engine");
+        served.release.notify_one();
+
+        let res = repair.await.unwrap();
+        assert!(res.as_ref().is_err_and(|e| e.contains("still being downloaded")), "{:?}", res);
+        assert!(std::fs::read(&paused).unwrap()[..2 * MIB] == content[..2 * MIB]);
+        let gaps = gaps_on_disk(&paused);
+        assert!(gaps.iter().all(|g| g.start >= 2 * MIB as u64), "the paused download lost its progress: {:?}", gaps);
         assert_eq!(gaps_on_disk(&part_of(&path)), vec![big_gap()]);
         drop(download);
     }
