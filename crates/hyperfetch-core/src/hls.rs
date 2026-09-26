@@ -16,6 +16,7 @@ use url::Url;
 use thiserror::Error;
 use crate::engine::EngineSnapshot;
 use crate::range::ByteRange;
+use crate::storage::{FileDigest, StreamHasher};
 use crate::worker::{authorize, Auth};
 
 const MAX_CONNECTIONS: usize = 64;
@@ -69,6 +70,9 @@ pub struct HlsOptions {
     pub fetch: FetchPolicy,
     /// Flush the finished file to disk before it takes its final name.
     pub fsync_on_complete: bool,
+    /// The checksum the file will be checked against: it says which digests to take while
+    /// writing it.
+    pub expected_checksum: Option<String>,
 }
 
 #[derive(Error, Debug)]
@@ -990,19 +994,25 @@ impl ResumeState {
 /// Appends the segments it receives to `part`, which holds what `state` (as saved) says, saving
 /// the state at most every [`PERSIST_INTERVAL`] and once more if the sender goes away before all
 /// `total` segments are written (the download failed or was cancelled). With them all written,
-/// flushes the file to disk if `fsync`. Blocking: runs on a thread of its own, so the fetches never
-/// wait for the disk unless its queue is full.
+/// flushes the file to disk if `fsync`. Returns the digest of the file, taken with `hasher` as it
+/// was written (after reading what an earlier run wrote), so it never has to be read back.
+/// Blocking: runs on a thread of its own, so the fetches never wait for the disk unless its queue
+/// is full.
 fn write_segments(
     mut part: std::fs::File,
     mut state: ResumeState,
     total: usize,
     fsync: bool,
+    mut hasher: StreamHasher,
     mut segments: mpsc::Receiver<Vec<u8>>,
-) -> std::io::Result<()> {
-    use std::io::Write;
+) -> std::io::Result<FileDigest> {
+    use std::io::{Seek, Write};
+    hasher.update_from_file(&part, state.bytes)?;
+    part.seek(SeekFrom::Start(state.bytes))?;
     let (mut saved, mut saved_at) = (state.segments, Instant::now());
     while let Some(data) = segments.blocking_recv() {
         part.write_all(&data)?;
+        hasher.update(&data);
         state.segments += 1;
         state.bytes += data.len() as u64;
         if saved_at.elapsed() >= PERSIST_INTERVAL {
@@ -1011,12 +1021,13 @@ fn write_segments(
         }
     }
     if state.segments == total {
-        return if fsync { part.sync_data() } else { Ok(()) };
-    }
-    if state.segments > saved {
+        if fsync {
+            part.sync_data()?;
+        }
+    } else if state.segments > saved {
         state.save(&part)?;
     }
-    Ok(())
+    Ok(hasher.finish())
 }
 
 /// Where an HLS download goes and how much of its `.part` it keeps, from [`HlsEngine::prepare`].
@@ -1081,8 +1092,9 @@ impl HlsEngine {
     /// Downloads `segments` with at most `options.connections` requests in flight (see
     /// [`InOrder`]) and writes them in order (see [`write_segments`]) to the `.part` of `target`
     /// (from [`HlsEngine::prepare`] for these segments), renamed to the target path once complete.
-    /// A failed or cancelled run keeps the `.part` file, with its state saved, and resumes from it
-    /// next time. `auth` is added to every request it covers.
+    /// Returns that path and the file's digest, taken while writing it. A failed or cancelled run
+    /// keeps the `.part` file, with its state saved, and resumes from it next time. `auth` is added
+    /// to every request it covers.
     pub async fn download(
         client: &Client,
         auth: Option<&Auth>,
@@ -1091,7 +1103,7 @@ impl HlsEngine {
         options: &HlsOptions,
         snapshot_tx: Option<broadcast::Sender<EngineSnapshot>>,
         cancel_flag: Option<Arc<AtomicBool>>,
-    ) -> Result<PathBuf, HlsError> {
+    ) -> Result<(PathBuf, FileDigest), HlsError> {
         let num_connections = options.connections.clamp(1, MAX_CONNECTIONS);
         let total_segments = segments.len();
         if total_segments == 0 {
@@ -1109,9 +1121,9 @@ impl HlsEngine {
                 if let Some(dir) = dir {
                     std::fs::create_dir_all(dir)?;
                 }
-                let mut part = std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(&part_path)?;
+                let part =
+                    std::fs::OpenOptions::new().create(true).read(true).write(true).truncate(false).open(&part_path)?;
                 part.set_len(state.bytes)?;
-                std::io::Seek::seek(&mut part, SeekFrom::End(0))?;
                 // A new `.part` names its stream from the start: without a state it would pass for
                 // another download's and be left behind.
                 if state.segments == 0 {
@@ -1124,8 +1136,9 @@ impl HlsEngine {
         };
         // Written on a thread of its own, fed by a short queue: the fetches go on while it writes.
         let (to_disk, from_fetches) = mpsc::channel(WRITE_QUEUE);
-        let fsync = options.fsync_on_complete;
-        let writer = tokio::task::spawn_blocking(move || write_segments(part, state, total_segments, fsync, from_fetches));
+        let (fsync, hasher) = (options.fsync_on_complete, StreamHasher::new(options.expected_checksum.as_deref()));
+        let writer =
+            tokio::task::spawn_blocking(move || write_segments(part, state, total_segments, fsync, hasher, from_fetches));
 
         tracing::info!(
             "Starting HLS ingestion: {} segments ({} already done) across {} streams -> {}",
@@ -1200,7 +1213,7 @@ impl HlsEngine {
             }
             return Err(e);
         }
-        wrote?;
+        let digest = wrote?;
         tokio::fs::rename(&part_path, &target_file).await?;
         let _ = tokio::fs::remove_file(&state_path).await;
 
@@ -1216,7 +1229,7 @@ impl HlsEngine {
             ));
         }
         tracing::info!("HLS download and stitching completed: {}", target_file.display());
-        Ok(target_file)
+        Ok((target_file, digest))
     }
 }
 
@@ -1365,11 +1378,11 @@ pub(crate) mod tests {
     const FETCH: FetchPolicy = FetchPolicy { stall_timeout: Duration::from_millis(500), max_retries: 4 };
 
     fn options(connections: usize) -> HlsOptions {
-        HlsOptions { connections, fetch: FETCH, fsync_on_complete: false }
+        HlsOptions { connections, fetch: FETCH, fsync_on_complete: false, expected_checksum: None }
     }
 
     /// Prepares `out` for `segments` of `playlist`, which must be free or hold this stream, and
-    /// downloads them there.
+    /// downloads them there, checking the digest it returns against the file.
     async fn download_to(
         client: &Client,
         auth: Option<&Auth>,
@@ -1379,7 +1392,15 @@ pub(crate) mod tests {
         num_connections: usize,
     ) -> Result<PathBuf, HlsError> {
         let target = HlsEngine::prepare(client, auth, playlist, &segments, out, FETCH, &None).await?.expect("usable name");
-        HlsEngine::download(client, auth, segments, target, &options(num_connections), None, None).await
+        let (path, digest) = HlsEngine::download(client, auth, segments, target, &options(num_connections), None, None).await?;
+        assert_digest(&digest, &path);
+        Ok(path)
+    }
+
+    /// `digest` must be the digest of the file at `path`.
+    fn assert_digest(digest: &FileDigest, path: &Path) {
+        let file = std::fs::read(path).unwrap();
+        assert_eq!(digest.blake3_hex(), blake3::hash(&file).to_hex().as_str(), "digest of {}", path.display());
     }
 
     fn encrypt(plain: &[u8], key: [u8; 16], iv: [u8; 16]) -> Vec<u8> {
@@ -1576,11 +1597,12 @@ video.m3u8
         let (tx, mut rx) = broadcast::channel(256);
         let target = HlsEngine::prepare(&client, None, &url, &segments, &out, FETCH, &None).await.unwrap().unwrap();
         // num_connections == 0 must be treated as 1, not panic.
-        let path = HlsEngine::download(&client, None, segments, target, &options(0), Some(tx), None).await.unwrap();
+        let (path, digest) = HlsEngine::download(&client, None, segments, target, &options(0), Some(tx), None).await.unwrap();
 
         let expected = [init, seg0, seg1, seg2].concat();
         assert_eq!(path, out);
         assert_eq!(std::fs::read(&out).unwrap(), expected);
+        assert_digest(&digest, &out);
         assert!(!with_suffix(&out, ".part").exists());
         assert!(!with_suffix(&out, ".part.hlsstate").exists());
         let hits = hits.lock();
@@ -2127,6 +2149,39 @@ video.m3u8
         assert_eq!(std::fs::read(&out).unwrap(), b"0000111122223333444455556666777788889999");
         let hits = hits.lock();
         assert!((0..10).all(|n| hits[&format!("/s{n}.ts")] == if n == 7 { 2 } else { 1 }), "{hits:?}");
+    }
+
+    #[tokio::test]
+    async fn test_digest_covers_a_resumed_part_and_the_checksum() {
+        use sha2::Digest;
+        let broken = Arc::new(AtomicBool::new(true));
+        let broken_srv = Arc::clone(&broken);
+        let (addr, _) = serve(move |path: &str, _| match path {
+            "/media.m3u8" => ok("#EXTM3U\n#EXTINF:4,\na.ts\n#EXTINF:4,\nb.ts\n#EXTINF:4,\nc.ts\n#EXT-X-ENDLIST\n"),
+            "/c.ts" if broken_srv.load(Ordering::SeqCst) => (404, String::new(), Vec::new()),
+            p => ok(p.repeat(3000)),
+        })
+        .await;
+        let client = Client::new();
+        let url = Url::parse(&format!("http://{addr}/media.m3u8")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("hashed.ts");
+        let segments = parse_hls_playlist(&client, &url, None, FETCH).await.unwrap();
+        assert!(download_to(&client, None, &url, segments.clone(), &out, 1).await.is_err());
+
+        // The rest, after a and b from the first run, with a SHA-256 checksum to take as well.
+        broken.store(false, Ordering::SeqCst);
+        let expected = ["/a.ts", "/b.ts", "/c.ts"].map(|p| p.repeat(3000)).concat();
+        let checksum = format!("sha256:{:x}", sha2::Sha256::digest(expected.as_bytes()));
+        let options = HlsOptions { expected_checksum: Some(checksum.clone()), ..options(2) };
+        let target = HlsEngine::prepare(&client, None, &url, &segments, &out, FETCH, &None).await.unwrap().unwrap();
+        assert_eq!(target.resume_from, 2);
+        let (path, digest) = HlsEngine::download(&client, None, segments, target, &options, None, None).await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), expected.as_bytes());
+        let blake3 = blake3::hash(expected.as_bytes()).to_hex().to_string();
+        assert_eq!(crate::storage::verify_digest(&digest, Some(&checksum)).unwrap(), blake3);
+        let wrong = format!("sha256:{}", "0".repeat(64));
+        assert!(crate::storage::verify_digest(&digest, Some(&wrong)).is_err());
     }
 
     #[tokio::test]

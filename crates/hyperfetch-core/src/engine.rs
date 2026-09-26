@@ -250,8 +250,9 @@ impl DownloadEngine {
                         connections: self.options.num_connections,
                         fetch,
                         fsync_on_complete: self.options.fsync_on_complete,
+                        expected_checksum: self.options.expected_checksum.clone(),
                     };
-                    let path = crate::hls::HlsEngine::download(
+                    let (path, digest) = crate::hls::HlsEngine::download(
                         &client,
                         auth,
                         segments,
@@ -262,7 +263,8 @@ impl DownloadEngine {
                     )
                     .await
                     .map_err(|e| e.to_string())?;
-                    return self.finish_external(path, started_at, None).await;
+                    // Hashed as it was written: nothing is read back.
+                    return self.finish_external(path, started_at, Some(digest)).await;
                 }
                 // Fetched, but not a playlist after all: try it as a plain file.
                 Err(HlsError::InvalidPlaylist(reason)) => {
