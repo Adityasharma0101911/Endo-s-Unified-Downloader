@@ -223,12 +223,12 @@ mod tests {
             ..Settings::default()
         };
         let file = [Url::parse("https://example.com/a.iso").unwrap()];
-        let opts = settings.download_options(&file, "sha256:abcd", "Bearer t").unwrap();
+        let opts = settings.download_options(&file, "sha256:abababababababababababababababababababababababababababababababab", "Bearer t").unwrap();
         assert_eq!(opts.num_connections, 64);
         assert_eq!(opts.output_path, Some(PathBuf::from("dl")));
         assert_eq!(opts.proxy.as_deref(), Some("socks5://127.0.0.1:1080"));
         assert_eq!(opts.cookies_path, Some(PathBuf::from("c.txt")));
-        assert_eq!(opts.expected_checksum.as_deref(), Some("sha256:abcd"));
+        assert_eq!(opts.expected_checksum.as_deref(), Some("sha256:abababababababababababababababababababababababababababababababab"));
         assert_eq!(opts.auth_header.as_deref(), Some("Bearer t"));
         assert_eq!(opts.max_speed, Some(2 * 1024 * 1024));
         assert_eq!((opts.max_retries, opts.stall_timeout_secs), (3, 1));
