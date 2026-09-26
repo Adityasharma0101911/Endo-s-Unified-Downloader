@@ -107,9 +107,10 @@ fn normalize(entries: &mut Vec<HistoryEntry>) {
     entries.truncate(MAX_ENTRIES);
 }
 
-/// Reads the history file. A file that cannot be parsed is moved aside to
-/// `<path>.corrupt-<suffix>` (never overwritten) and an empty list is returned.
-fn read_entries(path: &Path) -> io::Result<Vec<HistoryEntry>> {
+/// Reads the history file. A file that cannot be parsed reads as an empty list; with `backup` it
+/// is also moved aside to `<path>.corrupt-<suffix>` (never overwritten). Only a caller holding the
+/// history lock may back up, or it could move away a valid file another process just wrote.
+fn read_entries(path: &Path, backup: bool) -> io::Result<Vec<HistoryEntry>> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
@@ -117,7 +118,7 @@ fn read_entries(path: &Path) -> io::Result<Vec<HistoryEntry>> {
     };
     match serde_json::from_slice(&bytes) {
         Ok(entries) => Ok(entries),
-        Err(parse_err) => {
+        Err(parse_err) if backup => {
             let backup = with_suffix(path, &format!(".corrupt-{}", unique_suffix()));
             fs::rename(path, &backup)?;
             tracing::warn!(
@@ -126,6 +127,10 @@ fn read_entries(path: &Path) -> io::Result<Vec<HistoryEntry>> {
                 parse_err,
                 backup
             );
+            Ok(Vec::new())
+        }
+        Err(parse_err) => {
+            tracing::warn!("History file {:?} could not be parsed ({}); showing an empty history", path, parse_err);
             Ok(Vec::new())
         }
     }
@@ -174,11 +179,40 @@ fn lock_history(path: &Path) -> io::Result<File> {
     }
 }
 
+/// A change made through a manager, kept until it has been written to the history file.
+#[derive(Debug, Clone)]
+enum Change {
+    Upsert(HistoryEntry),
+    Remove(String),
+    Clear,
+}
+
+impl Change {
+    /// Applies the change; returns whether it altered `entries`.
+    fn apply(&self, entries: &mut Vec<HistoryEntry>) -> bool {
+        let before = entries.len();
+        match self {
+            Change::Upsert(entry) => {
+                entries.retain(|e| e.id != entry.id && e.file_path != entry.file_path);
+                entries.insert(0, entry.clone());
+                return true;
+            }
+            Change::Remove(id) => entries.retain(|e| e.id != *id),
+            Change::Clear => entries.clear(),
+        }
+        entries.len() != before
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DownloadHistoryManager {
     entries: Vec<HistoryEntry>,
     #[serde(skip)]
     custom_path: Option<PathBuf>,
+    /// Changes not yet written to disk. Saving replays only these onto the current file, so it
+    /// never brings back entries another manager or process removed.
+    #[serde(skip)]
+    pending: Vec<Change>,
 }
 
 impl DownloadHistoryManager {
@@ -219,13 +253,14 @@ impl DownloadHistoryManager {
     }
 
     pub fn load_from_path(path: &Path) -> Self {
-        let entries = read_entries(path).unwrap_or_else(|e| {
+        let entries = read_entries(path, false).unwrap_or_else(|e| {
             tracing::warn!("Failed to read history file at {:?}: {}", path, e);
             Vec::new()
         });
         Self {
             entries,
             custom_path: Some(path.to_path_buf()),
+            pending: Vec::new(),
         }
     }
 
@@ -233,66 +268,51 @@ impl DownloadHistoryManager {
         self.custom_path.clone().unwrap_or_else(Self::default_history_path)
     }
 
-    /// Under the history lock: reloads the file, applies `op`, and writes the result back, so
-    /// changes made by other processes since this manager loaded are never lost.
-    fn locked_update(&self, mut op: impl FnMut(&mut Vec<HistoryEntry>)) -> io::Result<Vec<HistoryEntry>> {
+    /// Applies `change` in memory and writes it, with any earlier unsaved changes, to the history
+    /// file. If the file cannot be updated the change stays pending for the next write.
+    fn modify(&mut self, change: Change) -> bool {
+        let changed = change.apply(&mut self.entries);
+        normalize(&mut self.entries);
+        self.pending.push(change);
+        if let Err(e) = self.save() {
+            tracing::warn!("Failed to update history file {:?}: {}", self.path(), e);
+        }
+        changed
+    }
+
+    /// Writes this manager's unsaved changes to the history file and refreshes it from the result.
+    /// Under the history lock the file is reloaded and only those changes are replayed onto it, so
+    /// updates made by other managers or processes since this one loaded are never lost or undone.
+    pub fn save(&mut self) -> Result<(), std::io::Error> {
         let path = self.path();
         let _lock = lock_history(&path)?;
-        let mut entries = read_entries(&path)?;
-        op(&mut entries);
+        let mut entries = read_entries(&path, true)?;
+        for change in &self.pending {
+            change.apply(&mut entries);
+        }
         normalize(&mut entries);
         write_entries(&path, &entries)?;
-        Ok(entries)
-    }
-
-    /// Applies `op` to the on-disk history and refreshes this manager from the result. If the file
-    /// cannot be updated the change is still applied in memory.
-    fn modify(&mut self, mut op: impl FnMut(&mut Vec<HistoryEntry>)) {
-        match self.locked_update(&mut op) {
-            Ok(entries) => self.entries = entries,
-            Err(e) => {
-                tracing::warn!("Failed to update history file {:?}: {}", self.path(), e);
-                op(&mut self.entries);
-                normalize(&mut self.entries);
-            }
-        }
-    }
-
-    /// Writes this manager's entries, merged with entries other processes saved since it loaded.
-    /// On an id clash the in-memory entry wins.
-    pub fn save(&self) -> Result<(), std::io::Error> {
-        self.locked_update(|disk| {
-            let ids: HashSet<&str> = self.entries.iter().map(|e| e.id.as_str()).collect();
-            disk.retain(|e| !ids.contains(e.id.as_str()));
-            disk.extend(self.entries.iter().cloned());
-        })
-        .map(|_| ())
+        self.pending.clear();
+        self.entries = entries;
+        Ok(())
     }
 
     /// Adds `entry`, replacing any entry with the same id or the same file path.
     pub fn add_or_update(&mut self, entry: HistoryEntry) {
-        self.modify(|entries| {
-            entries.retain(|e| e.id != entry.id && e.file_path != entry.file_path);
-            entries.insert(0, entry.clone());
-        });
+        self.modify(Change::Upsert(entry));
     }
 
     pub fn entries(&self) -> &[HistoryEntry] {
         &self.entries
     }
 
+    /// Removes the entry with this id; returns whether this manager had it.
     pub fn remove_entry(&mut self, id: &str) -> bool {
-        let mut removed = false;
-        self.modify(|entries| {
-            let original_len = entries.len();
-            entries.retain(|e| e.id != id);
-            removed = entries.len() != original_len;
-        });
-        removed
+        self.modify(Change::Remove(id.to_string()))
     }
 
     pub fn clear(&mut self) {
-        self.modify(|entries| entries.clear());
+        self.modify(Change::Clear);
     }
 }
 
@@ -351,8 +371,12 @@ mod tests {
         let history_path = dir.path().join("history.json");
         std::fs::write(&history_path, b"[{\"id\": \"truncated").unwrap();
 
+        // A plain load holds no lock, so it must leave the file where it is.
         let mut manager = DownloadHistoryManager::load_from_path(&history_path);
         assert!(manager.entries().is_empty());
+        assert_eq!(std::fs::read(&history_path).unwrap(), b"[{\"id\": \"truncated");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+
         manager.add_or_update(entry("a.bin", dir.path()));
 
         let backups: Vec<_> = std::fs::read_dir(dir.path())
@@ -405,12 +429,58 @@ mod tests {
         assert!(gui.remove_entry(&old_id));
         let names: Vec<_> = gui.entries().iter().map(|e| e.file_name.as_str()).collect();
         assert_eq!(names, ["new.bin"]);
+    }
 
-        // A plain save() merges instead of overwriting.
-        gui.entries.push(entry("extra.bin", dir.path()));
-        cli.add_or_update(entry("cli2.bin", dir.path()));
-        gui.save().unwrap();
-        assert_eq!(DownloadHistoryManager::load_from_path(&history_path).entries().len(), 3);
+    fn names_on_disk(path: &Path) -> Vec<String> {
+        let mut names: Vec<_> = DownloadHistoryManager::load_from_path(path)
+            .entries()
+            .iter()
+            .map(|e| e.file_name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn save_does_not_resurrect_entries_removed_elsewhere() {
+        let dir = tempdir().unwrap();
+        let history_path = dir.path().join("history.json");
+        let mut gui = DownloadHistoryManager::load_from_path(&history_path);
+        gui.add_or_update(entry("x.bin", dir.path()));
+        gui.add_or_update(entry("y.bin", dir.path()));
+        let x_id = gui.entries().iter().find(|e| e.file_name == "x.bin").unwrap().id.clone();
+
+        let mut cli = DownloadHistoryManager::load_from_path(&history_path);
+        assert!(gui.remove_entry(&x_id));
+        cli.save().unwrap();
+        assert_eq!(names_on_disk(&history_path), ["y.bin"]);
+        assert_eq!(cli.entries().len(), 1);
+
+        gui.clear();
+        cli.save().unwrap();
+        assert!(names_on_disk(&history_path).is_empty());
+    }
+
+    #[test]
+    fn unsaved_change_is_written_later_without_undoing_others() {
+        let dir = tempdir().unwrap();
+        let history_path = dir.path().join("history.json");
+        let mut gui = DownloadHistoryManager::load_from_path(&history_path);
+        gui.add_or_update(entry("x.bin", dir.path()));
+        let x_id = gui.entries()[0].id.clone();
+        let mut cli = DownloadHistoryManager::load_from_path(&history_path);
+
+        // A directory in place of the lock file makes every write fail.
+        let lock_path = with_suffix(&history_path, ".lock");
+        std::fs::remove_file(&lock_path).unwrap();
+        std::fs::create_dir(&lock_path).unwrap();
+        cli.add_or_update(entry("offline.bin", dir.path()));
+        assert_eq!(cli.entries().len(), 2, "the change is kept in memory");
+        std::fs::remove_dir(&lock_path).unwrap();
+
+        assert!(gui.remove_entry(&x_id));
+        cli.save().unwrap();
+        assert_eq!(names_on_disk(&history_path), ["offline.bin"]);
     }
 
     #[test]
