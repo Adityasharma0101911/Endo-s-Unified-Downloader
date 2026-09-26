@@ -671,32 +671,30 @@ async fn decrypt(data: Vec<u8>, key: &Option<Aes128Key>) -> Result<Vec<u8>, Stri
 }
 
 /// Downloads and decrypts one segment, prefixed by its init section when that changes. Its body
-/// bytes count in `progress` as they arrive, and stay counted only if it succeeds.
+/// bytes count in `tally` as they arrive.
 async fn fetch_segment(
     client: &Client,
     auth: Option<&Auth>,
-    segment: HlsSegment,
+    segment: &HlsSegment,
     with_init: bool,
-    progress: &AtomicU64,
+    tally: &Tally<'_>,
     fetch: FetchPolicy,
 ) -> Result<Vec<u8>, HlsError> {
     let failed = |reason: String| HlsError::SegmentFailed { index: segment.index, reason };
     let limit = |range: Option<ByteRange>| range.map_or(MAX_SEGMENT_BYTES, |r| r.len().min(MAX_SEGMENT_BYTES));
-    let tally = Tally::new(progress);
     let mut init_data = None;
     if let Some(init) = segment.init.as_ref().filter(|_| with_init) {
         let (data, _) =
-            fetch_with_retry(client, auth, &init.url, init.byte_range, limit(init.byte_range), Some(&tally), fetch)
+            fetch_with_retry(client, auth, &init.url, init.byte_range, limit(init.byte_range), Some(tally), fetch)
                 .await
                 .map_err(|e| failed(format!("init section {}: {}", init.url, e.reason)))?;
         init_data = Some(decrypt(data, &init.encryption).await.map_err(|r| failed(format!("init section: {}", r)))?);
     }
     let (data, _) =
-        fetch_with_retry(client, auth, &segment.url, segment.byte_range, limit(segment.byte_range), Some(&tally), fetch)
+        fetch_with_retry(client, auth, &segment.url, segment.byte_range, limit(segment.byte_range), Some(tally), fetch)
             .await
             .map_err(|e| failed(format!("{}: {}", segment.url, e.reason)))?;
     let data = decrypt(data, &segment.encryption).await.map_err(failed)?;
-    tally.keep();
     Ok(match init_data {
         Some(mut out) => {
             out.extend_from_slice(&data);
@@ -704,6 +702,44 @@ async fn fetch_segment(
         }
         None => data,
     })
+}
+
+/// Downloads what `request` covers. Its body bytes count in `progress` as they arrive, and stay
+/// counted only if it succeeds. Segments merged into one request are tried together once: a server
+/// may cut a long range short or refuse it, so if that fails, each of them is fetched on its own,
+/// with every retry `fetch` allows.
+async fn fetch_request(
+    client: &Client,
+    auth: Option<&Auth>,
+    request: &Request,
+    progress: &AtomicU64,
+    fetch: FetchPolicy,
+) -> Result<Vec<u8>, HlsError> {
+    let first = &request.segment;
+    if !request.merged.is_empty() {
+        let tally = Tally::new(progress);
+        let once = FetchPolicy { max_retries: 0, ..fetch };
+        match fetch_segment(client, auth, first, request.with_init, &tally, once).await {
+            Ok(data) => {
+                tally.keep();
+                return Ok(data);
+            }
+            Err(e) => tracing::warn!("{}; fetching those {} segments one at a time", e, request.merged.len()),
+        }
+    }
+    let tally = Tally::new(progress);
+    let data = if request.merged.is_empty() {
+        fetch_segment(client, auth, first, request.with_init, &tally, fetch).await?
+    } else {
+        let mut data = Vec::new();
+        for (i, range) in request.merged.iter().enumerate() {
+            let segment = HlsSegment { index: first.index + i, byte_range: Some(*range), ..first.clone() };
+            data.extend(fetch_segment(client, auth, &segment, request.with_init && i == 0, &tally, fetch).await?);
+        }
+        data
+    };
+    tally.keep();
+    Ok(data)
 }
 
 fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
@@ -759,9 +795,18 @@ fn writes_init(segments: &[HlsSegment], i: usize) -> bool {
 /// One request of a download: a segment (with its init section if [`writes_init`]), or several
 /// consecutive segments whose byte ranges it fetches together.
 struct Request {
+    /// The (first) segment, with the byte range of all of them.
     segment: HlsSegment,
     with_init: bool,
-    segments: usize,
+    /// The byte ranges of the segments fetched together; empty for a single segment.
+    merged: Vec<ByteRange>,
+}
+
+impl Request {
+    /// How many segments it fetches.
+    fn segments(&self) -> usize {
+        self.merged.len().max(1)
+    }
 }
 
 /// Most bytes one request may fetch for several segments with `connections` connections: the
@@ -784,10 +829,13 @@ fn plan_requests(segments: Vec<HlsSegment>, from: usize, limit: u64) -> Vec<Requ
             requests.last().filter(|_| !with_init).and_then(|last| merged_range(&last.segment, &segment, limit));
         match (merged, requests.last_mut()) {
             (Some(range), Some(last)) => {
+                if last.merged.is_empty() {
+                    last.merged.extend(last.segment.byte_range);
+                }
+                last.merged.extend(segment.byte_range);
                 last.segment.byte_range = Some(range);
-                last.segments += 1;
             }
-            _ => requests.push(Request { segment, with_init, segments: 1 }),
+            _ => requests.push(Request { segment, with_init, merged: Vec::new() }),
         }
     }
     requests
@@ -820,8 +868,8 @@ async fn part_matches(
 ) -> Result<bool, HlsError> {
     for index in std::iter::once(0).chain((count > 1).then_some(count - 1)) {
         let uncounted = AtomicU64::new(0);
-        let with_init = writes_init(segments, index);
-        let segment = fetch_segment(client, auth, segments[index].clone(), with_init, &uncounted, fetch);
+        let tally = Tally::new(&uncounted);
+        let segment = fetch_segment(client, auth, &segments[index], writes_init(segments, index), &tally, fetch);
         let data = tokio::select! {
             data = segment => data?,
             _ = cancelled(cancel_flag) => return Err(HlsError::Cancelled),
@@ -1315,8 +1363,7 @@ impl HlsEngine {
         // Dropping it aborts the fetches in flight.
         let window = WINDOW_PER_CONNECTION * num_connections;
         let mut window = InOrder::new(requests.len(), num_connections, window, options.fetch.stall_timeout, |i| {
-            let request = &requests[i];
-            fetch_segment(client, auth, request.segment.clone(), request.with_init, &received, options.fetch)
+            fetch_request(client, auth, &requests[i], &received, options.fetch)
         });
 
         // Segments handed to the writer.
@@ -1335,9 +1382,9 @@ impl HlsEngine {
                     let Ok(room) = room else { break None };
                     match window.pop() {
                         Some(Ok((i, data))) => {
-                            written += requests[i].segments;
+                            written += requests[i].segments();
                             written_bytes += data.len() as u64;
-                            room.send((requests[i].segments, data));
+                            room.send((requests[i].segments(), data));
                         }
                         Some(Err(e)) => break Some(e),
                         None => {}
@@ -2619,7 +2666,7 @@ video.m3u8
                 init: None,
             })
             .collect();
-        let largest = |connections| plan_requests(segments.clone(), 0, merge_limit(connections)).iter().map(|r| r.segments).max();
+        let largest = |connections| plan_requests(segments.clone(), 0, merge_limit(connections)).iter().map(Request::segments).max();
         // One connection merges as much as ever; more share the memory, down to one segment a request.
         assert_eq!(largest(1), Some((MAX_MERGED_BYTES / SEGMENT) as usize));
         assert_eq!(largest(8), Some(5));
@@ -2667,7 +2714,7 @@ video.m3u8
         let plan = |from: usize| {
             plan_requests(segments.clone(), from, MAX_MERGED_BYTES)
                 .iter()
-                .map(|r| (r.segment.index, r.segments, r.segment.byte_range.map(|b| (b.start, b.end)), r.with_init))
+                .map(|r| (r.segment.index, r.segments(), r.segment.byte_range.map(|b| (b.start, b.end)), r.with_init))
                 .collect::<Vec<_>>()
         };
         assert_eq!(
@@ -2714,7 +2761,8 @@ video.m3u8
         let out = dir.path().join("ranged.mp4");
         let segments = parse_hls_playlist(&client, &url, None, FETCH).await.unwrap();
 
-        // Six segments (60 KiB) per request: the first two requests are written, the third fails.
+        // Six segments (60 KiB) per request: the first two requests are written, the third fails,
+        // and so does its first segment on its own.
         let err = download_to(&client, None, &url, segments.clone(), &out, 1).await.unwrap_err();
         assert!(matches!(err, HlsError::SegmentFailed { index: 12, .. }), "{err}");
         let state = std::fs::read_to_string(with_suffix(&out, ".part.hlsstate")).unwrap();
@@ -2723,7 +2771,43 @@ video.m3u8
         broken.store(false, Ordering::SeqCst);
         download_to(&client, None, &url, segments, &out, 2).await.unwrap();
         assert_eq!(std::fs::read(&out).unwrap(), file);
-        assert_eq!(hits.lock()["/all.mp4"], 3 + 2, "segments 12-16 and 17-19 on resume (five at a time with two connections), not 8 requests");
+        assert_eq!(hits.lock()["/all.mp4"], 3 + 1 + 2, "segments 12-16 and 17-19 on resume (five at a time with two connections), not 8 requests");
+    }
+
+    #[tokio::test]
+    async fn test_ranges_a_server_will_not_serve_together_are_fetched_one_at_a_time() {
+        const SEGMENT: usize = 10 * 1024;
+        let file: Vec<u8> = (0..8 * SEGMENT).map(|i| (i % 251) as u8).collect();
+        let playlist = |name: &str| {
+            let segments: String =
+                (0..8).map(|n| format!("#EXTINF:4,\n#EXT-X-BYTERANGE:{SEGMENT}@{}\n{name}\n", n * SEGMENT)).collect();
+            ok(format!("#EXTM3U\n{segments}#EXT-X-ENDLIST\n"))
+        };
+        let file_srv = file.clone();
+        let (addr, hits) = serve(move |path: &str, range: Option<ByteRange>| match (path, range) {
+            ("/capped.m3u8", _) => playlist("capped.mp4"),
+            ("/refused.m3u8", _) => playlist("refused.mp4"),
+            // Longer ranges are cut short to one segment's worth, or refused.
+            ("/capped.mp4", Some(r)) => {
+                let end = (r.end as usize).min(r.start as usize + SEGMENT - 1);
+                (206, String::new(), file_srv[r.start as usize..=end].to_vec())
+            }
+            ("/refused.mp4", Some(r)) if r.len() > SEGMENT as u64 => (416, String::new(), Vec::new()),
+            ("/refused.mp4", Some(r)) => (206, String::new(), file_srv[r.start as usize..=r.end as usize].to_vec()),
+            _ => (404, String::new(), Vec::new()),
+        })
+        .await;
+        let client = Client::new();
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["capped", "refused"] {
+            let url = Url::parse(&format!("http://{addr}/{name}.m3u8")).unwrap();
+            let segments = parse_hls_playlist(&client, &url, None, FETCH).await.unwrap();
+            let out = dir.path().join(format!("{name}.mp4"));
+            download_to(&client, None, &url, segments, &out, 1).await.unwrap();
+            assert_eq!(std::fs::read(&out).unwrap(), file, "{name}");
+            // Segments 0-5 and 6-7 are each tried together once, then one at a time.
+            assert_eq!(hits.lock()[&format!("/{name}.mp4")], 2 + 8, "{name}");
+        }
     }
 
     #[tokio::test]
