@@ -1,10 +1,11 @@
 //! Runs downloads with progress output and graceful Ctrl+C / SIGTERM handling.
 
+use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt;
-use hyperfetch_core::engine::{DownloadEngine, DownloadOptions, EngineSnapshot};
+use hyperfetch_core::engine::{build_client, ClientKey, DownloadEngine, DownloadOptions, EngineSnapshot};
 use hyperfetch_core::history::{DownloadHistoryManager, HistoryEntry, HistoryStatus};
 use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use tokio::sync::{broadcast, mpsc, watch};
@@ -230,6 +231,39 @@ enum Outcome {
     Interrupted,
 }
 
+/// One HTTP client per [`ClientKey`] among a batch's downloads, so later downloads reuse the
+/// connections and TLS sessions earlier ones opened.
+struct Clients(HashMap<ClientKey, Result<reqwest::Client, String>>);
+
+impl Clients {
+    /// Builds, off the runtime, the client of every key among `jobs`.
+    async fn for_jobs(jobs: &[Job]) -> Self {
+        let mut wanted: HashMap<ClientKey, DownloadOptions> = HashMap::new();
+        for job in jobs {
+            wanted.entry(ClientKey::of(&job.options)).or_insert_with(|| job.options.clone());
+        }
+        let keys: Vec<ClientKey> = wanted.keys().cloned().collect();
+        let built = tokio::task::spawn_blocking(move || {
+            wanted.into_iter().map(|(key, options)| (key, build_client(&options))).collect()
+        })
+        .await;
+        match built {
+            Ok(clients) => Self(clients),
+            Err(e) => Self(keys.into_iter().map(|key| (key, Err(format!("cannot create HTTP client: {}", e)))).collect()),
+        }
+    }
+
+    /// An engine for these URLs and options on the shared client of their key, or why that
+    /// client could not be built (a bad proxy, an unreadable cookies file).
+    fn engine(&self, urls: Vec<Url>, options: DownloadOptions) -> Result<DownloadEngine, String> {
+        match self.0.get(&ClientKey::of(&options)) {
+            Some(Ok(client)) => Ok(DownloadEngine::with_client(urls, options, client.clone())),
+            Some(Err(e)) => Err(e.clone()),
+            None => Err("no HTTP client was built for this download".to_string()),
+        }
+    }
+}
+
 /// Runs `jobs` with at most `concurrency` at a time and returns how many failed. After a
 /// shutdown request no new job starts and running ones stop with their state saved. Running
 /// several at once, results arrive in completion order, so each result line names its input.
@@ -240,10 +274,11 @@ pub async fn run_jobs(jobs: Vec<Job>, concurrency: usize, ui: &Ui, shutdown: &Sh
         bar
     });
     let named = concurrency > 1 && jobs.len() > 1;
+    let clients = Clients::for_jobs(&jobs).await;
     let mut outcomes = futures_util::stream::iter(jobs.into_iter().enumerate())
         .map(|(index, job)| {
             let input = named.then(|| input_name(index, &job.urls));
-            run_job(job, input, ui, shutdown, overall.as_ref())
+            run_job(job, input, &clients, ui, shutdown, overall.as_ref())
         })
         .buffer_unordered(concurrency.max(1));
     let mut failed = 0;
@@ -291,14 +326,27 @@ fn done_line(input: Option<&str>, path: &std::path::Path) -> String {
 }
 
 /// `input` is what result lines call the download (see [`input_name`]); None uses its file name.
-async fn run_job(job: Job, input: Option<String>, ui: &Ui, shutdown: &Shutdown, overall: Option<&ProgressBar>) -> Outcome {
+async fn run_job(
+    job: Job,
+    input: Option<String>,
+    clients: &Clients,
+    ui: &Ui,
+    shutdown: &Shutdown,
+    overall: Option<&ProgressBar>,
+) -> Outcome {
     let mut stop = shutdown.subscribe();
     if stop.borrow().is_some() {
         return Outcome::Interrupted;
     }
     let started_at = unix_now();
     let urls: Vec<String> = job.urls.iter().map(Url::to_string).collect();
-    let engine = DownloadEngine::new(job.urls, job.options);
+    let engine = match clients.engine(job.urls, job.options) {
+        Ok(engine) => engine,
+        Err(err) => {
+            ui.error(&format!("[FAILED] {}: {}", input.as_deref().unwrap_or(&job.label), err));
+            return Outcome::Failed;
+        }
+    };
     let mut view = TaskView::new(ui, &job.label, overall);
 
     let (tx, mut rx) = broadcast::channel::<EngineSnapshot>(64);
@@ -473,6 +521,92 @@ impl StallClock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Serves `body` at every path over keep-alive HTTP/1.1 (HEAD, and GET with or without a
+    /// Range) and counts the connections it accepts.
+    async fn keep_alive_server(body: Vec<u8>) -> (String, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let mut pending = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        let Some(end) = pending.windows(4).position(|w| w == b"\r\n\r\n") else {
+                            match socket.read(&mut buf).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => pending.extend_from_slice(&buf[..n]),
+                            }
+                            continue;
+                        };
+                        let head = String::from_utf8_lossy(&pending[..end]).to_ascii_lowercase();
+                        pending.drain(..end + 4);
+                        let last = body.len() - 1;
+                        let range = head.lines().find_map(|l| l.strip_prefix("range: bytes=")).and_then(|r| {
+                            let (a, b) = r.trim().split_once('-')?;
+                            Some((a.parse::<usize>().ok()?, b.parse::<usize>().map_or(last, |b| b.min(last))))
+                        });
+                        let (start, end) = range.unwrap_or((0, last));
+                        let status = match range {
+                            Some(_) => format!("206 Partial Content\r\nContent-Range: bytes {}-{}/{}", start, end, body.len()),
+                            None => "200 OK".to_string(),
+                        };
+                        let mut response = format!(
+                            "HTTP/1.1 {}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\n\r\n",
+                            status,
+                            end + 1 - start
+                        )
+                        .into_bytes();
+                        if !head.starts_with("head ") {
+                            response.extend_from_slice(&body[start..=end]);
+                        }
+                        if socket.write_all(&response).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (format!("http://{}", addr), accepted)
+    }
+
+    /// Later downloads of a batch reuse the connections of earlier ones instead of each opening
+    /// its own (each download here needs two: the probe's HEAD and GET).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_batch_shares_one_client() {
+        let dir = std::env::temp_dir().join(format!("hf-cli-shared-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("ENDO_HISTORY_PATH", dir.join("history.json"));
+        let body: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
+        let (server, accepted) = keep_alive_server(body.clone()).await;
+        let job = |name: &str| Job {
+            label: name.to_string(),
+            urls: vec![Url::parse(&format!("{}/{}.bin", server, name)).unwrap()],
+            options: DownloadOptions { output_path: Some(dir.join("")), ..Default::default() },
+        };
+        let mut jobs: Vec<Job> = ["a", "b", "c"].iter().map(|name| job(name)).collect();
+        // A client that cannot be built fails only the downloads that need it.
+        let mut no_cookies = job("d");
+        no_cookies.options.cookies_path = Some(dir.join("missing-cookies.txt"));
+        jobs.insert(1, no_cookies);
+        let failed = run_jobs(jobs, 1, &Ui::new(true), &Shutdown::install()).await;
+        assert_eq!(failed, 1);
+        assert!(!dir.join("d.bin").exists());
+        for name in ["a", "b", "c"] {
+            assert_eq!(std::fs::read(dir.join(format!("{}.bin", name))).unwrap(), body);
+        }
+        let accepted = accepted.load(Ordering::SeqCst);
+        assert!(accepted < 6, "{} connections for 3 downloads: the later ones did not reuse any", accepted);
+    }
 
     #[test]
     fn templates_parse() {

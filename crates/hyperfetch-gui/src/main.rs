@@ -10,12 +10,12 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use eframe::egui;
 use egui::Color32;
 use hyperfetch_core::chunk::ChunkSnapshot;
-use hyperfetch_core::engine::{DownloadEngine, DownloadOptions, EngineSnapshot};
+use hyperfetch_core::engine::{build_client, ClientKey, DownloadEngine, DownloadOptions, EngineSnapshot};
 use hyperfetch_core::history::{DownloadHistoryManager, HistoryEntry};
 use hyperfetch_core::queue::{DownloadQueue, QueueItem};
 use hyperfetch_core::verify::{self, BuildVerificationResult};
@@ -116,6 +116,9 @@ struct Verification {
     repair_urls: Vec<Url>,
 }
 
+/// Creates the engine of a download (blocking: it may build an HTTP client). See [`shared_clients`].
+type EngineMaker = Arc<dyn Fn(Vec<Url>, DownloadOptions) -> Result<DownloadEngine, String> + Send + Sync>;
+
 struct Repair {
     /// Final path of the file being repaired.
     target: PathBuf,
@@ -148,6 +151,7 @@ struct App {
     clipboard_banner: Option<String>,
 
     queue: DownloadQueue,
+    engines: EngineMaker,
     /// Saves the queue in the background; `None` if its thread could not start.
     queue_saver: Option<queue_store::Saver>,
     /// Revision of the queue last handed to the saver.
@@ -215,6 +219,7 @@ impl App {
             clipboard_banner: None,
             queue_saved: queue.revision(),
             queue,
+            engines: shared_clients(),
             queue_saver,
             jobs: HashMap::new(),
             focused: None,
@@ -389,8 +394,9 @@ impl App {
         let task = {
             let (cancel, snapshot, ctx, tx) =
                 (Arc::clone(&cancel), Arc::clone(&snapshot), self.ctx.clone(), self.events_tx.clone());
+            let engines = Arc::clone(&self.engines);
             self.rt.spawn(async move {
-                let result = run_job(urls, options, leftovers_of, cancel, snapshot, ctx.clone()).await;
+                let result = run_job(&engines, urls, options, leftovers_of, cancel, snapshot, ctx.clone()).await;
                 if tx.send(AppEvent::JobFinished { id, result }).is_ok() {
                     ctx.request_repaint();
                 }
@@ -841,9 +847,40 @@ async fn discard_leftovers(final_path: PathBuf) -> Result<usize, String> {
     unblock(move || hyperfetch_core::discard_partial(&final_path)).await?
 }
 
+/// Engines that share one HTTP client per [`ClientKey`], so a download reuses the connections and
+/// TLS sessions of earlier ones (see [`cached_client`]).
+fn shared_clients() -> EngineMaker {
+    let cache = Mutex::new(HashMap::new());
+    Arc::new(move |urls, options| {
+        let client = cached_client(&cache, &options, build_client)?;
+        Ok(DownloadEngine::with_client(urls, options, client))
+    })
+}
+
+/// The client `cache` holds for the key of `options`, built with `build` if there is none yet or
+/// the cookies file changed since, so cookies exported anew reach the next download. A client that
+/// fails to build is not kept: each download needing it reports the error.
+fn cached_client<C: Clone>(
+    cache: &Mutex<HashMap<ClientKey, (C, Option<SystemTime>)>>,
+    options: &DownloadOptions,
+    build: impl FnOnce(&DownloadOptions) -> Result<C, String>,
+) -> Result<C, String> {
+    let key = ClientKey::of(options);
+    let cookies_changed_at = options.cookies_path.as_ref().and_then(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
+    // Held while building, so downloads starting together build their client once.
+    let mut cache = lock(cache);
+    if let Some((client, _)) = cache.get(&key).filter(|(_, built_for)| *built_for == cookies_changed_at) {
+        return Ok(client.clone());
+    }
+    let client = build(options)?;
+    cache.insert(key, (client.clone(), cookies_changed_at));
+    Ok(client)
+}
+
 /// One engine run. A cancel request calls `engine.cancel()` and keeps awaiting `run()`, so the
 /// engine flushes data, saves its resume state and stops yt-dlp before this returns.
 async fn run_job(
+    engines: &EngineMaker,
     urls: Vec<Url>,
     options: DownloadOptions,
     leftovers_of: Option<PathBuf>,
@@ -860,8 +897,11 @@ async fn run_job(
             .await
             .map_err(|e| format!("Cannot create the download folder {}: {}", dir.display(), e))?;
     }
-    // Building the engine reads the cookies file and TLS roots.
-    let engine = unblock(move || DownloadEngine::new(urls, options)).await?;
+    // Building the engine may read the cookies file and TLS roots.
+    let engine = {
+        let engines = Arc::clone(engines);
+        unblock(move || engines(urls, options)).await??
+    };
 
     let (tx, mut rx) = broadcast::channel::<EngineSnapshot>(16);
     let forward = tokio::spawn(async move {
@@ -1061,14 +1101,11 @@ mod tests {
     ) -> Result<(PathBuf, Option<u64>), String> {
         let cancel = Arc::new(Notify::new());
         let slot = Arc::new(Mutex::new(None));
-        let job = tokio::spawn(run_job(
-            vec![url.clone()],
-            options.clone(),
-            leftovers_of,
-            Arc::clone(&cancel),
-            Arc::clone(&slot),
-            egui::Context::default(),
-        ));
+        let (url, options, cancel_job, job_slot) = (url.clone(), options.clone(), Arc::clone(&cancel), Arc::clone(&slot));
+        let job = tokio::spawn(async move {
+            let engines = shared_clients();
+            run_job(&engines, vec![url], options, leftovers_of, cancel_job, job_slot, egui::Context::default()).await
+        });
         if let Some(delay) = pause_after {
             tokio::time::sleep(delay).await;
             assert!(lock(&slot).is_some(), "snapshots reach the UI slot");
@@ -1083,6 +1120,39 @@ mod tests {
         part.push(".part");
         let part = PathBuf::from(part);
         (DownloadState::state_file_path(&part), part)
+    }
+
+    /// Downloads with the same client settings get the same client; other settings, a changed
+    /// cookies file or an earlier failed build get a new one.
+    #[test]
+    fn downloads_share_a_client_per_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let cookies = dir.path().join("cookies.txt");
+        std::fs::write(&cookies, "# Netscape HTTP Cookie File\n").unwrap();
+        let cache = Mutex::new(HashMap::new());
+        let builds = std::cell::Cell::new(0);
+        let build = |_: &DownloadOptions| {
+            builds.set(builds.get() + 1);
+            Ok::<_, String>(builds.get())
+        };
+        let plain = DownloadOptions::default();
+        let other_folder = DownloadOptions { output_path: Some(dir.path().into()), num_connections: 2, ..plain.clone() };
+        let proxied = DownloadOptions { proxy: Some("http://127.0.0.1:9".into()), ..plain.clone() };
+        let with_cookies = DownloadOptions { cookies_path: Some(cookies.clone()), ..plain.clone() };
+
+        assert_eq!(cached_client(&cache, &plain, build), Ok(1));
+        assert_eq!(cached_client(&cache, &other_folder, build), Ok(1), "same key, same client");
+        assert_eq!(cached_client(&cache, &proxied, build), Ok(2));
+        assert_eq!(cached_client(&cache, &with_cookies, build), Ok(3));
+        assert_eq!(cached_client(&cache, &with_cookies, build), Ok(3));
+        let later = std::fs::metadata(&cookies).unwrap().modified().unwrap() + Duration::from_secs(5);
+        std::fs::File::options().write(true).open(&cookies).unwrap().set_modified(later).unwrap();
+        assert_eq!(cached_client(&cache, &with_cookies, build), Ok(4), "a changed cookies file is read again");
+        assert_eq!(builds.get(), 4);
+
+        let failing = DownloadOptions { proxy: Some("http://127.0.0.1:10".into()), ..plain };
+        assert!(cached_client(&cache, &failing, |_: &DownloadOptions| Err::<u32, _>("bad proxy".to_string())).is_err());
+        assert_eq!(cached_client(&cache, &failing, build), Ok(5), "a failed build is not kept");
     }
 
     /// Closing the window runs on the UI thread, which is not part of the runtime.
