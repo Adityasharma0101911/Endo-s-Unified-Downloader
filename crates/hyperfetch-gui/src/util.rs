@@ -1,3 +1,4 @@
+#[cfg(windows)]
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -80,39 +81,12 @@ pub fn truncate_chars(s: &str, max: usize) -> String {
     out
 }
 
-fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
-    let mut name: OsString = path.as_os_str().to_owned();
-    name.push(suffix);
-    PathBuf::from(name)
-}
-
 /// `path` without a trailing `.part`: the final name of an in-progress download.
 pub fn final_path_of(path: &Path) -> PathBuf {
     match path.extension() {
         Some(ext) if ext == "part" => path.with_extension(""),
         _ => path.to_path_buf(),
     }
-}
-
-/// The files an unfinished download of `final_path` leaves behind; never the final file itself.
-pub fn leftover_paths(final_path: &Path) -> [PathBuf; 3] {
-    let part = with_suffix(final_path, ".part");
-    [with_suffix(&part, ".hfstate"), with_suffix(&part, ".hlsstate"), part]
-}
-
-/// Deletes the partial file and resume state of `final_path` and returns how many files were
-/// removed. The `.part` goes first so a failure leaves the download resumable. Blocking.
-pub fn delete_leftovers(final_path: &Path) -> Result<usize, String> {
-    let [hfstate, hlsstate, part] = leftover_paths(final_path);
-    let mut removed = 0;
-    for path in [part, hfstate, hlsstate] {
-        match std::fs::remove_file(&path) {
-            Ok(()) => removed += 1,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(format!("Could not delete {}: {}", path.display(), e)),
-        }
-    }
-    Ok(removed)
 }
 
 /// Seconds left at the current speed; `None` while stalled (under 1 KiB/s) or when the size is unknown.
@@ -195,48 +169,86 @@ pub fn repair_urls_for(target: &Path) -> Vec<Url> {
         .collect()
 }
 
+/// Starts `command` without waiting for it and returns its process id. A thread waits for it to
+/// exit, so no zombie process is left behind.
+fn launch(mut command: Command) -> std::io::Result<u32> {
+    let mut child = command.spawn()?;
+    let pid = child.id();
+    // Without the thread the child is merely not reaped until the app exits.
+    let _ = std::thread::Builder::new().name("reap-child".to_string()).spawn(move || child.wait());
+    Ok(pid)
+}
+
+/// `explorer.exe` in the Windows directory. Never looked up by bare name: that searches the
+/// app's own folder (often the download folder) first.
+#[cfg(windows)]
+fn explorer_path(system_root: Option<OsString>) -> PathBuf {
+    system_root
+        .map(PathBuf::from)
+        .filter(|root| root.is_absolute())
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+        .join("explorer.exe")
+}
+
+/// Explorer with `arg` passed verbatim (it parses its own command line).
+#[cfg(windows)]
+fn explorer(arg: OsString) -> Command {
+    use std::os::windows::process::CommandExt;
+    let mut command = Command::new(explorer_path(std::env::var_os("SystemRoot")));
+    command.raw_arg(arg);
+    command
+}
+
 /// Opens a file or folder with its default application. Arguments go straight to the
 /// program, never through a shell.
 pub fn open_path(path: &Path) -> std::io::Result<()> {
     let path = std::path::absolute(path)?;
     #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
+    let command = {
         // Windows paths cannot contain '"', so quoting keeps commas and spaces inside the one argument.
         let mut arg = OsString::from("\"");
         arg.push(&path);
         arg.push("\"");
-        Command::new("explorer").raw_arg(arg).spawn().map(|_| ())
-    }
+        explorer(arg)
+    };
     #[cfg(target_os = "macos")]
-    {
-        Command::new("open").arg(&path).spawn().map(|_| ())
-    }
+    let command = {
+        let mut command = Command::new("open");
+        command.arg(&path);
+        command
+    };
     #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        Command::new("xdg-open").arg(&path).spawn().map(|_| ())
-    }
+    let command = {
+        let mut command = Command::new("xdg-open");
+        command.arg(&path);
+        command
+    };
+    launch(command).map(|_| ())
 }
 
 /// Shows `path` selected in the system file manager (its folder where selecting isn't supported).
 pub fn reveal_in_folder(path: &Path) -> std::io::Result<()> {
     let path = std::path::absolute(path)?;
     #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
+    let command = {
         let mut arg = OsString::from("/select,\"");
         arg.push(&path);
         arg.push("\"");
-        Command::new("explorer").raw_arg(arg).spawn().map(|_| ())
-    }
+        explorer(arg)
+    };
     #[cfg(target_os = "macos")]
-    {
-        Command::new("open").arg("-R").arg(&path).spawn().map(|_| ())
-    }
+    let command = {
+        let mut command = Command::new("open");
+        command.arg("-R").arg(&path);
+        command
+    };
     #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        Command::new("xdg-open").arg(path.parent().unwrap_or(path.as_path())).spawn().map(|_| ())
-    }
+    let command = {
+        let mut command = Command::new("xdg-open");
+        command.arg(path.parent().unwrap_or(path.as_path()));
+        command
+    };
+    launch(command).map(|_| ())
 }
 
 #[cfg(test)]
@@ -285,22 +297,31 @@ mod tests {
         assert_eq!(truncate_chars("héllo!", 5), "hé...");
     }
 
+    #[cfg(windows)]
     #[test]
-    fn delete_leftovers_only_touches_partial_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let final_path = dir.path().join("setup.exe");
-        let keep = [final_path.clone(), dir.path().join("setup (1).exe"), dir.path().join("setup.exe.hfstate")];
-        let [hfstate, hlsstate, part] = leftover_paths(&final_path);
-        for p in keep.iter().chain([&part, &hfstate, &hlsstate]) {
-            std::fs::write(p, b"x").unwrap();
+    fn explorer_is_launched_from_the_windows_directory() {
+        assert_eq!(explorer_path(None), PathBuf::from(r"C:\Windows\explorer.exe"));
+        assert_eq!(explorer_path(Some(r"D:\WinNT".into())), PathBuf::from(r"D:\WinNT\explorer.exe"));
+        assert_eq!(explorer_path(Some("Windows".into())), PathBuf::from(r"C:\Windows\explorer.exe"), "never relative");
+        assert!(explorer_path(std::env::var_os("SystemRoot")).is_file());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn launched_programs_are_reaped() {
+        let pid = launch(Command::new("true")).unwrap();
+        let proc_entry = PathBuf::from(format!("/proc/{}", pid));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        // A zombie keeps its /proc entry until it is waited for.
+        while proc_entry.exists() {
+            assert!(std::time::Instant::now() < deadline, "the child was never reaped");
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        assert_eq!(delete_leftovers(&final_path), Ok(3));
-        assert!(keep.iter().all(|p| p.exists()));
-        assert!(!part.exists() && !hfstate.exists() && !hlsstate.exists());
-        assert_eq!(delete_leftovers(&final_path), Ok(0), "nothing left to delete");
-        assert_eq!(part.file_name().unwrap(), "setup.exe.part");
-        assert_eq!(hfstate.file_name().unwrap(), "setup.exe.part.hfstate");
-        assert_eq!(hlsstate.file_name().unwrap(), "setup.exe.part.hlsstate");
+    }
+
+    #[test]
+    fn launch_reports_missing_programs() {
+        assert!(launch(Command::new("endo-no-such-program-4f1c")).is_err());
     }
 
     #[test]

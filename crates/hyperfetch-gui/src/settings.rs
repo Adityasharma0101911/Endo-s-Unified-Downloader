@@ -163,9 +163,13 @@ pub fn speed_limit_bytes(value: f64, in_mb: bool) -> Option<u64> {
     (value > 0.0).then(|| ((value * unit) as u64).max(1))
 }
 
-/// The user's Downloads folder: `%USERPROFILE%\Downloads` on Windows, the XDG download
-/// directory (from `user-dirs.dirs`) on Linux, `~/Downloads` otherwise.
+/// The user's Downloads folder: the Downloads known folder on Windows (wherever it was moved),
+/// the XDG download directory (from `user-dirs.dirs`) on Linux, `~/Downloads` otherwise.
 pub fn default_download_dir() -> PathBuf {
+    #[cfg(windows)]
+    if let Some(downloads) = known_downloads_dir() {
+        return downloads;
+    }
     #[cfg(windows)]
     if let Some(profile) = std::env::var_os("USERPROFILE") {
         return PathBuf::from(profile).join("Downloads");
@@ -182,6 +186,29 @@ pub fn default_download_dir() -> PathBuf {
             .unwrap_or_else(|| home.join("Downloads"));
     }
     PathBuf::from(".")
+}
+
+/// The current location of the Downloads known folder, which the user may have moved.
+#[cfg(windows)]
+fn known_downloads_dir() -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{FOLDERID_Downloads, SHGetKnownFolderPath};
+
+    let mut raw: windows_sys::core::PWSTR = std::ptr::null_mut();
+    // SAFETY: valid pointers to the folder id and the out-parameter; no access token.
+    let result = unsafe { SHGetKnownFolderPath(&FOLDERID_Downloads, 0, std::ptr::null_mut(), &mut raw) };
+    let path = (result >= 0 && !raw.is_null()).then(|| {
+        // SAFETY: on success `raw` is a NUL-terminated UTF-16 string that stays valid until freed below.
+        let wide = unsafe {
+            let len = (0..).take_while(|&i| *raw.add(i) != 0).count();
+            std::slice::from_raw_parts(raw, len)
+        };
+        PathBuf::from(std::ffi::OsString::from_wide(wide))
+    });
+    // SAFETY: the buffer is freed exactly once, as documented, also when the call failed (null is allowed).
+    unsafe { CoTaskMemFree(raw as *const std::ffi::c_void) };
+    path.filter(|p| p.is_absolute())
 }
 
 /// `XDG_DOWNLOAD_DIR` from the contents of `user-dirs.dirs` (values are `"$HOME/..."` or absolute).
@@ -213,6 +240,14 @@ mod tests {
         assert_eq!(xdg_download_dir("XDG_MUSIC_DIR=\"$HOME/Music\"", home), None);
         let absolute = if cfg!(windows) { "C:\\dl" } else { "/mnt/dl" };
         assert_eq!(xdg_download_dir(&format!("XDG_DOWNLOAD_DIR=\"{}\"", absolute), home), Some(PathBuf::from(absolute)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_default_is_the_downloads_known_folder() {
+        let known = known_downloads_dir().expect("every Windows profile has a Downloads known folder");
+        assert!(known.is_absolute());
+        assert_eq!(default_download_dir(), known);
     }
 
     #[test]

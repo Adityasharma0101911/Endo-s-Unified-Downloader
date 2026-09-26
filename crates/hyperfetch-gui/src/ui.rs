@@ -66,6 +66,7 @@ fn status_badge(app: &App, item: &QueueItem) -> (&'static str, Color32) {
     match &item.status {
         QueueItemStatus::Queued => ("QUEUED", SLATE),
         QueueItemStatus::Downloading if app.is_resolving(item.id) => ("RESOLVING", AMBER),
+        QueueItemStatus::Downloading if item.is_finishing() => ("FINISHING", CYAN),
         QueueItemStatus::Downloading if app.stalled_for(item.id).is_some() => ("STALLED", AMBER),
         QueueItemStatus::Downloading => ("DOWNLOADING", BRIGHT_BLUE),
         QueueItemStatus::Pausing => ("PAUSING", MUTED),
@@ -521,6 +522,9 @@ fn status_line(app: &App, item: Option<&QueueItem>) -> (String, Color32) {
         QueueItemStatus::Queued => ("Queued: starts when a download slot is free (see the Queue tab)".to_string(), MUTED),
         QueueItemStatus::Downloading if app.is_resolving(item.id) => {
             ("Resolving mirrors and probing endpoints...".to_string(), MUTED)
+        }
+        QueueItemStatus::Downloading if item.is_finishing() => {
+            (format!("Finishing {}: verifying the file and moving it into place...", item.filename), MUTED)
         }
         QueueItemStatus::Downloading => (format!("Downloading {}", item.filename), MUTED),
         QueueItemStatus::Pausing => ("Pausing: saving resume state...".to_string(), MUTED),
