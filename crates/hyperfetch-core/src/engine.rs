@@ -1277,11 +1277,16 @@ async fn probe_url(
         }
     };
     // Once the GET has answered, a HEAD that is still out only gets a short grace: some servers
-    // never answer HEAD, and the GET alone has everything needed.
+    // never answer HEAD, and the GET alone has everything needed. None at all once the GET has
+    // everything HEAD could add.
     tokio::pin!(head, ranged);
     let (head, (ranged, answered, waited, first_try)) = tokio::select! {
         head = &mut head => (head, ranged.await),
-        ranged = &mut ranged => (tokio::time::timeout(HEAD_GRACE, head).await.ok().flatten(), ranged),
+        ranged = &mut ranged => {
+            let complete = ranged.0.as_ref().is_ok_and(|r| says_it_all(r.status(), r.headers(), r.url()));
+            let head = if complete { None } else { tokio::time::timeout(HEAD_GRACE, head).await.ok().flatten() };
+            (head, ranged)
+        }
     };
     let setup = first_try.then_some(waited);
     let body = |response: Response, len: u64| ProbeBody { response, len, answered, setup };
@@ -1375,6 +1380,20 @@ fn build_racer(mirrors: &[ProbeInfo]) -> MirrorRacer {
         }
     }
     racer
+}
+
+/// Whether a probe's ranged GET, answered from `final_url`, leaves HEAD nothing to add: a 206
+/// with the total size, a validator, and a file name (its own Content-Disposition or a name in
+/// the URL's path).
+fn says_it_all(status: StatusCode, headers: &HeaderMap, final_url: &Url) -> bool {
+    let has_total = headers
+        .get(CONTENT_RANGE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| matches!(ByteRange::parse_content_range(v), Ok((_, Some(_)))));
+    status == StatusCode::PARTIAL_CONTENT
+        && has_total
+        && (headers.contains_key(ETAG) || headers.contains_key(LAST_MODIFIED))
+        && (disposition_name(headers).is_some() || filename_from_url(final_url).is_some())
 }
 
 /// Answers that mean "not now", not "no ranges" or "no such file".
@@ -1902,14 +1921,17 @@ fn stream_snapshot(size: Option<u64>, written: u64, speed: f64, path: &Path) -> 
 fn extract_filename<'a>(headers: impl IntoIterator<Item = &'a HeaderMap>, url: &Url) -> String {
     headers
         .into_iter()
-        .find_map(|h| {
-            let value = String::from_utf8_lossy(h.get(CONTENT_DISPOSITION)?.as_bytes()).into_owned();
-            content_disposition_filename(&value)
-                .map(|name| sanitize_filename(&name))
-                .filter(|name| !name.is_empty())
-        })
+        .find_map(disposition_name)
         .or_else(|| filename_from_url(url))
         .unwrap_or_else(|| "downloaded_file.bin".to_string())
+}
+
+/// The usable file name in a response's Content-Disposition, if it has one.
+fn disposition_name(headers: &HeaderMap) -> Option<String> {
+    let value = String::from_utf8_lossy(headers.get(CONTENT_DISPOSITION)?.as_bytes()).into_owned();
+    content_disposition_filename(&value)
+        .map(|name| sanitize_filename(&name))
+        .filter(|name| !name.is_empty())
 }
 
 fn filename_from_url(url: &Url) -> Option<String> {
@@ -2203,6 +2225,35 @@ mod tests {
         assert_eq!(sanitize_filename("a\u{1b}b\u{7f}c\u{85}d\u{9b}.txt"), "a_b_c_d_.txt");
         assert_eq!(extract_filename([&HeaderMap::new()], &Url::parse("http://h/").unwrap()), "downloaded_file.bin");
         assert_eq!(String::from_utf8_lossy(&percent_decode("100%-%zz%4")), "100%-%zz%4");
+    }
+
+    #[test]
+    fn test_a_complete_ranged_answer_leaves_head_nothing_to_add() {
+        let headers = |pairs: &[(&'static str, &'static str)]| {
+            let mut map = HeaderMap::new();
+            for (k, v) in pairs {
+                map.insert(*k, HeaderValue::from_static(v));
+            }
+            map
+        };
+        let (named, unnamed) = (Url::parse("http://h/files/tool.zip").unwrap(), Url::parse("http://h/").unwrap());
+        let tagged = headers(&[("content-range", "bytes 0-0/1000"), ("etag", "\"v1\"")]);
+        assert!(says_it_all(StatusCode::PARTIAL_CONTENT, &tagged, &named));
+        // Last-Modified is a validator too, and Content-Disposition a name.
+        let dated = headers(&[
+            ("content-range", "bytes 0-0/1000"),
+            ("last-modified", "Sun, 06 Nov 1994 08:49:37 GMT"),
+            ("content-disposition", "attachment; filename=\"a.bin\""),
+        ]);
+        assert!(says_it_all(StatusCode::PARTIAL_CONTENT, &dated, &unnamed));
+
+        // Anything missing leaves HEAD its grace.
+        assert!(!says_it_all(StatusCode::PARTIAL_CONTENT, &tagged, &unnamed), "no name");
+        let untagged = headers(&[("content-range", "bytes 0-0/1000")]);
+        assert!(!says_it_all(StatusCode::PARTIAL_CONTENT, &untagged, &named), "no validator");
+        let no_total = headers(&[("content-range", "bytes 0-0/*"), ("etag", "\"v1\"")]);
+        assert!(!says_it_all(StatusCode::PARTIAL_CONTENT, &no_total, &named), "no size");
+        assert!(!says_it_all(StatusCode::OK, &tagged, &named), "no ranges");
     }
 
     #[test]
