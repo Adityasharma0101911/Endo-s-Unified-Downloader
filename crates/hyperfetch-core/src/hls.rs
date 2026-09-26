@@ -343,17 +343,17 @@ async fn parse_media_playlist(
 
     let join = |uri: &str| base.join(uri).map_err(|e| malformed(format!("invalid URL '{}': {}", uri, e)));
 
-    // Playlists that rotate keys name hundreds of them: fetch them all up front, several at once,
-    // instead of one after another as the walk below reaches them. A key that could not be
-    // fetched fails the walk only where it is used, so errors come in playlist order.
-    let mut key_cache: HashMap<Url, Result<[u8; 16], String>> = futures_util::stream::iter(key_urls(text, base))
+    // Playlists that rotate keys name hundreds of them: they are fetched several at once, ahead of
+    // the walk below, which waits only for the key it has reached. A key that could not be fetched
+    // ends the walk where it is used, so errors come in playlist order, and the fetches still in
+    // flight then, never needed, are dropped.
+    let mut prefetched = futures_util::stream::iter(key_urls(text, base))
         .map(|url| async move {
             let key = fetch_key(client, auth, &url, fetch).await;
             (url, key)
         })
-        .buffer_unordered(KEY_CONCURRENCY)
-        .collect()
-        .await;
+        .buffer_unordered(KEY_CONCURRENCY);
+    let mut key_cache: HashMap<Url, Result<[u8; 16], String>> = HashMap::new();
 
     let mut segments = Vec::new();
     let mut media_sequence: u64 = 0;
@@ -387,12 +387,20 @@ async fn parse_media_playlist(
                     }
                     let uri = attrs.get("URI").ok_or_else(|| malformed("#EXT-X-KEY without URI"))?;
                     let key_url = join(uri)?;
-                    let key_bytes = match key_cache.get(&key_url) {
-                        Some(k) => k.clone(),
-                        None => {
-                            let k = fetch_key(client, auth, &key_url, fetch).await;
-                            key_cache.insert(key_url, k.clone());
-                            k
+                    let key_bytes = loop {
+                        if let Some(k) = key_cache.get(&key_url) {
+                            break k.clone();
+                        }
+                        match prefetched.next().await {
+                            Some((url, k)) => {
+                                key_cache.insert(url, k);
+                            }
+                            // Not among the keys fetched ahead: fetch it now.
+                            None => {
+                                let k = fetch_key(client, auth, &key_url, fetch).await;
+                                key_cache.insert(key_url, k.clone());
+                                break k;
+                            }
                         }
                     }
                     .map_err(HlsError::Unavailable)?;
@@ -1791,7 +1799,7 @@ video.m3u8
         let rotating = format!("#EXTM3U\n{rotating}#EXT-X-ENDLIST\n");
         let (open, most, arrived) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
         let counters = (Arc::clone(&open), Arc::clone(&most), Arc::clone(&arrived));
-        let (addr, _) = serve_async(move |path: &str, _| {
+        let (addr, hits) = serve_async(move |path: &str, _| {
             let key: Option<u8> = path.strip_prefix("/k").and_then(|k| k.strip_suffix(".bin")?.parse().ok());
             let reply = match path {
                 "/rotating.m3u8" => ok(rotating.clone()),
@@ -1828,6 +1836,27 @@ video.m3u8
 
         let url = Url::parse(&format!("http://{addr}/drm-first.m3u8")).unwrap();
         assert!(matches!(parse_hls_playlist(&client, &url, None, FETCH).await, Err(HlsError::Unsupported(_))));
+        assert!(!hits.lock().contains_key("/gone.bin"), "no key is fetched for a playlist rejected before it");
+    }
+
+    #[tokio::test]
+    async fn test_a_missing_key_fails_the_parse_without_waiting_for_the_others() {
+        let (addr, _) = serve(|path: &str, _| match path {
+            "/media.m3u8" => {
+                let keys: String = (0..3).map(|n| format!("#EXT-X-KEY:METHOD=AES-128,URI=\"k{n}.bin\"\n#EXTINF:4,\ns{n}.ts\n")).collect();
+                ok(format!("#EXTM3U\n{keys}#EXT-X-ENDLIST\n"))
+            }
+            "/k0.bin" => (404, String::new(), Vec::new()),
+            // The other keys never come.
+            _ => (0, String::new(), Vec::new()),
+        })
+        .await;
+        let url = Url::parse(&format!("http://{addr}/media.m3u8")).unwrap();
+        let patient = FetchPolicy { stall_timeout: Duration::from_secs(10), max_retries: 0 };
+        let started = Instant::now();
+        let err = parse_hls_playlist(&Client::new(), &url, None, patient).await.unwrap_err();
+        assert!(matches!(&err, HlsError::Unavailable(reason) if reason.contains("k0.bin")), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
     }
 
     #[tokio::test]
