@@ -70,6 +70,8 @@ enum Reply {
     StallAfter(usize),
     /// Ignore Range and If-Range and send the whole file with 200.
     IgnoreRange,
+    /// Send a small HTML error page with 200 instead of the file.
+    ErrorPage,
 }
 
 struct Mock {
@@ -110,9 +112,9 @@ struct Mock {
     /// Redirect every request to this URL plus `?t=n`, as a signing redirector does: `t=0` for
     /// HEAD and the probes, a fresh `n` for every other GET.
     redirect: Option<String>,
-    /// Refuse GETs (other than probes) whose request target contains this with 403, as an
-    /// expired signed URL is.
-    expired: Option<&'static str>,
+    /// Answer GETs (other than probes) whose request target contains the text this way, as an
+    /// expired signed URL is answered.
+    expired: Option<(&'static str, Reply)>,
     /// What to do with each GET except the engine's probes, which are always served.
     plan: fn(usize) -> Reply,
     /// Pause between 16 KiB body writes, in microseconds (adjustable while running).
@@ -142,7 +144,7 @@ struct Stats {
     max_serving: AtomicUsize,
     /// GETs refused with 503 for exceeding `max_active`.
     refused: AtomicUsize,
-    /// GETs refused with 403 for an `expired` target.
+    /// GETs refused for an `expired` target.
     denied: AtomicUsize,
     /// Ranges served with 206, in request order.
     ranges: Mutex<Vec<ByteRange>>,
@@ -301,9 +303,9 @@ async fn handle(mut socket: TcpStream, mock: Arc<Mock>) {
         let reply = if mock.max_active.is_some_and(|max| active > max) {
             s.refused.fetch_add(1, Ordering::SeqCst);
             Reply::Status(503, Some(1))
-        } else if mock.expired.is_some_and(|token| target.contains(token)) {
+        } else if let Some((_, answer)) = mock.expired.filter(|(token, _)| target.contains(token)) {
             s.denied.fetch_add(1, Ordering::SeqCst);
-            Reply::Status(403, None)
+            answer
         } else {
             (mock.plan)(index)
         };
@@ -313,6 +315,22 @@ async fn handle(mut socket: TcpStream, mock: Arc<Mock>) {
     if let Reply::Status(code, retry_after) = reply {
         let retry = retry_after.map(|s| format!("Retry-After: {}\r\n", s)).unwrap_or_default();
         let resp = format!("HTTP/1.1 {} Mock\r\n{}Content-Length: 0\r\nConnection: close\r\n\r\n", code, retry);
+        drop(serving);
+        let _ = socket.write_all(resp.as_bytes()).await;
+        return;
+    }
+    if let Reply::ErrorPage = reply {
+        let page = "<html><body>Request has expired</body></html>";
+        let resp = format!(
+            "HTTP/1.1 200 OK
+Content-Type: text/html
+Content-Length: {}
+Connection: close
+
+{}",
+            page.len(),
+            page
+        );
         drop(serving);
         let _ = socket.write_all(resp.as_bytes()).await;
         return;
@@ -1613,20 +1631,27 @@ async fn test_chunk_requests_go_straight_to_the_redirect_target() {
 async fn test_expired_redirect_target_falls_back_to_the_mirrors_own_url() {
     let _history = setup().await;
     let data = payload(PREFETCH + 1024 * KB, 233);
-    let mut file = Mock::new(data.clone());
-    // The target the probe was sent to expires right away; fresh redirects work.
-    file.expired = Some("t=0");
-    let file = Arc::new(file);
-    let (redirector, url) = redirected_to(&file).await;
-    let temp = tempdir().unwrap();
+    // However the expired target answers: refused, a 400 (Google Cloud Storage's ExpiredToken),
+    // or an error page with 200 that is not the file (not the version If-Range asks for).
+    for answer in [Reply::Status(403, None), Reply::Status(400, None), Reply::ErrorPage] {
+        let mut file = Mock::new(data.clone());
+        file.etag = Some("\"v1\"");
+        // The target the probe was sent to expires right away; fresh redirects work.
+        file.expired = Some(("t=0", answer));
+        let file = Arc::new(file);
+        let (redirector, url) = redirected_to(&file).await;
+        let temp = tempdir().unwrap();
 
-    // Every connection finds the target expired: that must not count against the only mirror.
-    let engine = DownloadEngine::new(vec![url], options(temp.path(), 4, 128 * KB));
-    let path = run(&engine, None).await.expect("the mirror's own URL still serves the file");
+        // Every connection finds the target expired: that must neither count against the only
+        // mirror nor end the download, and the retries must not keep asking the dead target.
+        let opts = DownloadOptions { max_retries: 1, ..options(temp.path(), 4, 128 * KB) };
+        let engine = DownloadEngine::new(vec![url], opts);
+        let path = run(&engine, None).await.unwrap_or_else(|e| panic!("{answer:?}: the mirror's own URL still serves the file: {e}"));
 
-    assert_file(&path, &data);
-    assert!(file.stats.denied.load(Ordering::SeqCst) >= 1, "the redirect target was tried first");
-    assert!(redirector.stats.gets.load(Ordering::SeqCst) >= 1, "then the mirror's own URL, redirecting afresh");
+        assert_file(&path, &data);
+        assert!(file.stats.denied.load(Ordering::SeqCst) >= 1, "{answer:?}: the redirect target was tried first");
+        assert!(redirector.stats.gets.load(Ordering::SeqCst) >= 1, "{answer:?}: then the mirror's own URL, redirecting afresh");
+    }
 }
 
 #[tokio::test]

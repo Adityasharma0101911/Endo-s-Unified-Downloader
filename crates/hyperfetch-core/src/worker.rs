@@ -44,8 +44,9 @@ pub enum FailureKind {
     Throttled(Option<Duration>),
     /// This mirror cannot serve the file (wrong Content-Range, ignored Range).
     BadMirror,
-    /// The URL refused the request (401/403/404/410): an expired redirect target, or a mirror
-    /// that cannot serve the file.
+    /// The URL refused the request (401/403/404/410), or a redirect target answered with anything
+    /// but the file, throttling or a server error: an expired redirect target, or a mirror that
+    /// cannot serve the file.
     Denied,
     /// Retrying cannot help (disk write error, remote file changed): fail the download.
     Fatal,
@@ -208,14 +209,14 @@ impl HttpWorker {
                 slot = self.take_slot() => slot,
             };
             let job = slot.and_then(|(mirror_id, slot)| Some((self.next_job(mirror_id, &slot)?, mirror_id, slot)));
-            let Some(((chunk, url, if_range), mirror_id, slot)) = job else {
+            let Some(((chunk, url, if_range, redirected), mirror_id, slot)) = job else {
                 tokio::select! {
                     _ = s.cancel.cancelled() => return,
                     _ = tokio::time::sleep(IDLE_POLL) => continue,
                 }
             };
 
-            let outcome = self.download_chunk(&chunk, mirror_id, &url, if_range, &slot).await;
+            let outcome = self.download_chunk(&chunk, mirror_id, &url, if_range, redirected, &slot).await;
             if s.cancel.is_cancelled() {
                 s.mirrors.lock().release_mirror(mirror_id);
                 return;
@@ -252,15 +253,17 @@ impl HttpWorker {
 
     /// A chunk for the mirror `slot` was taken for, if it can still take a connection there:
     /// fresh work, else what is left of a chunk gone silent, else part of a slow chunk, timed by
-    /// what a new request to each mirror costs. Lock order: mirrors, then chunks.
-    fn next_job(&self, mirror_id: usize, slot: &HostSlot) -> Option<(Chunk, Url, Option<String>)> {
+    /// what a new request to each mirror costs. Also where to send the request, with its If-Range
+    /// validator and whether that URL is the mirror's redirect target. Lock order: mirrors, then
+    /// chunks.
+    fn next_job(&self, mirror_id: usize, slot: &HostSlot) -> Option<(Chunk, Url, Option<String>, bool)> {
         let s = &self.shared;
         let mut racer = s.mirrors.lock();
         // Meanwhile the mirror may have filled up, cooled down or gone back to its own URL.
         let mirror = racer
             .get_mirror(mirror_id)
             .filter(|m| m.score(Instant::now()) >= 0.0 && HostKey::of(&m.url) == *slot.host())?;
-        let (url, if_range) = (mirror.url.clone(), mirror.if_range.clone());
+        let (url, if_range, redirected) = (mirror.url.clone(), mirror.if_range.clone(), mirror.fallback.is_some());
         let chunk = {
             let mut mgr = s.chunks.lock();
             mgr.get_next_work(self.worker_id, mirror_id)
@@ -279,7 +282,7 @@ impl HttpWorker {
                 })?
         };
         racer.acquire_mirror(mirror_id);
-        Some((chunk, url, if_range))
+        Some((chunk, url, if_range, redirected))
     }
 
     /// Applies an attempt's outcome to mirror, host and chunk bookkeeping and returns the event to
@@ -323,15 +326,17 @@ impl HttpWorker {
         }
     }
 
-    /// Streams the chunk's remaining range into the file. Bytes are written in batches on the
-    /// blocking pool, never on the async runtime. Only this worker advances
-    /// `chunk.current_offset`, and only once a batch is on disk.
+    /// Streams the chunk's remaining range from `url` (the mirror's redirect target if
+    /// `redirected`) into the file. Bytes are written in batches on the blocking pool, never on
+    /// the async runtime. Only this worker advances `chunk.current_offset`, and only once a batch
+    /// is on disk.
     async fn download_chunk(
         &self,
         chunk: &Chunk,
         mirror_id: usize,
         url: &Url,
         if_range: Option<String>,
+        redirected: bool,
         slot: &HostSlot,
     ) -> Result<(), Failure> {
         let s = &self.shared;
@@ -359,7 +364,8 @@ impl HttpWorker {
                 Ok(Ok(resp)) => resp,
             },
         };
-        check_response(response.status(), response.headers(), start, end, s.file_size, if_range.as_deref())?;
+        check_response(response.status(), response.headers(), start, end, s.file_size, if_range.as_deref())
+            .map_err(|failure| if redirected { at_redirect_target(response.status(), failure) } else { failure })?;
         slot.accepted();
         let _ = s.events.try_send(WorkerEvent::Ttfb {
             worker_id: self.worker_id,
@@ -658,6 +664,20 @@ fn check_response(
     }
 }
 
+/// Reclassifies `failure`, `check_response`'s verdict on a `status` answer from a mirror's
+/// redirect target. A signed target that expired may answer with any client error (Google Cloud
+/// Storage sends 400) or an error page that is not the file (a 200, maybe after a redirect of its
+/// own), so all of these are Denied there: the mirror goes back to its own URL, whose fresh
+/// redirect decides, before anything counts against the mirror or ends the download. Throttling
+/// and server errors say nothing about the target's signature and keep their kind.
+fn at_redirect_target(status: StatusCode, (kind, error): Failure) -> Failure {
+    match kind {
+        FailureKind::Throttled(_) => (kind, error),
+        _ if status.is_server_error() => (kind, error),
+        _ => (FailureKind::Denied, error),
+    }
+}
+
 /// Whether a response carries the `If-Range` validator we sent: our strong ETag (always quoted),
 /// or else our Last-Modified date.
 pub(crate) fn carries_validator(headers: &HeaderMap, validator: &str) -> bool {
@@ -719,6 +739,30 @@ mod tests {
         );
         assert_eq!(check(429, &[], 0, 9, 10, None), Some(FailureKind::Throttled(None)));
         assert_eq!(check(502, &[], 0, 9, 10, None), Some(FailureKind::Transient));
+    }
+
+    #[test]
+    fn test_a_redirect_target_answering_anything_but_the_file_sends_the_mirror_home() {
+        // The answer to bytes 500-999 of a 1000-byte file, asked of a redirect target with If-Range.
+        let at_target = |status: u16, headers: &[(&'static str, &'static str)]| {
+            let mut map = HeaderMap::new();
+            for (k, v) in headers {
+                map.insert(*k, HeaderValue::from_static(v));
+            }
+            let status = StatusCode::from_u16(status).unwrap();
+            check_response(status, &map, 500, 999, 1000, V1).err().map(|failure| at_redirect_target(status, failure).0)
+        };
+        assert_eq!(at_target(206, &[("content-range", "bytes 500-999/1000")]), None);
+        // An expired signature: a client error of any kind, an error page, a wrong range.
+        for status in [400, 401, 403, 404, 410, 416] {
+            assert_eq!(at_target(status, &[]), Some(FailureKind::Denied), "HTTP {status}");
+        }
+        assert_eq!(at_target(200, &[("content-length", "41"), ("content-type", "text/html")]), Some(FailureKind::Denied));
+        assert_eq!(at_target(206, &[("content-range", "bytes 500-999/77")]), Some(FailureKind::Denied));
+        // Neither throttling nor a server error says the signature expired.
+        assert_eq!(at_target(429, &[]), Some(FailureKind::Throttled(None)));
+        assert_eq!(at_target(503, &[]), Some(FailureKind::Throttled(None)));
+        assert_eq!(at_target(502, &[]), Some(FailureKind::Transient));
     }
 
     #[test]
@@ -955,7 +999,7 @@ mod tests {
         let (mut worker, chunk, _events) = test_worker(&url, &dir.path().join("f.part"), SIZE as u64);
         worker.shared.stall_timeout = Duration::from_secs(10);
         worker.shared.body_idle = Duration::from_millis(100);
-        worker.download_chunk(&chunk, 0, &url, None, &slot(&url)).await.unwrap();
+        worker.download_chunk(&chunk, 0, &url, None, false, &slot(&url)).await.unwrap();
         assert_eq!(chunk.current_offset.load(Ordering::SeqCst), SIZE as u64);
     }
 
@@ -988,7 +1032,7 @@ mod tests {
         let path = dir.path().join("f.part");
         let (worker, chunk, _events) = test_worker(&url, &path, SIZE as u64);
         let offset = Arc::clone(&chunk.current_offset);
-        let task = tokio::spawn(async move { worker.download_chunk(&chunk, 0, &url, None, &slot(&url)).await });
+        let task = tokio::spawn(async move { worker.download_chunk(&chunk, 0, &url, None, false, &slot(&url)).await });
 
         sent_rx.await.unwrap();
         // 64 KiB arrived, far less than a batch, and the server went quiet: within about
@@ -1033,7 +1077,7 @@ mod tests {
         let path = dir.path().join("f.part");
         let (worker, chunk, _events) = test_worker(&url, &path, SIZE as u64);
         let offset = Arc::clone(&chunk.current_offset);
-        let err = worker.download_chunk(&chunk, 0, &url, None, &slot(&url)).await.unwrap_err();
+        let err = worker.download_chunk(&chunk, 0, &url, None, false, &slot(&url)).await.unwrap_err();
 
         assert_eq!(err.0, FailureKind::Transient, "{}", err.1);
         assert_eq!(offset.load(Ordering::SeqCst), 100_000);
