@@ -19,8 +19,10 @@ const MAX_CONNECTIONS: usize = 64;
 /// Master playlists may point at further master playlists; stop following them after this many hops.
 const MAX_MASTER_DEPTH: usize = 3;
 const MAX_ATTEMPTS: u32 = 5;
-const MAX_PLAYLIST_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_PLAYLIST_BYTES: u64 = if cfg!(test) { 64 * 1024 } else { 16 * 1024 * 1024 };
 const MAX_KEY_BYTES: u64 = 1024;
+/// Most of an oversized body read anyway, to tell a huge playlist from an ordinary file.
+const PEEK_BYTES: u64 = 1024;
 /// Largest segment or init section held in memory. Real segments are a few MiB.
 // ponytail: up to num_connections segments are buffered at once, so peak memory is
 // num_connections x this; spool segments to disk if streams with huge segments must work.
@@ -105,17 +107,18 @@ pub async fn parse_hls_playlist(
             .await
             .map_err(|e| {
                 let reason = format!("could not fetch {}: {}", url, e.reason);
-                // Without the body there is no telling a huge playlist from a file, and saving
-                // a playlist's text as the download would be a fake success.
-                if e.kind == FetchErrorKind::TooLarge {
-                    HlsError::Unsupported(reason)
-                } else {
-                    HlsError::Unavailable(reason)
+                match e.kind {
+                    // A large file whose URL merely mentions .m3u8: download it as a plain file.
+                    FetchErrorKind::TooLarge { playlist: false } if hop == 0 => HlsError::InvalidPlaylist(reason),
+                    // A real playlist, or a variant: saving playlist text as the download would be
+                    // a fake success.
+                    FetchErrorKind::TooLarge { .. } => HlsError::Unsupported(reason),
+                    _ => HlsError::Unavailable(reason),
                 }
             })?;
         let text = String::from_utf8_lossy(&body);
         let text = text.trim_start_matches('\u{feff}').trim_start();
-        if !text.starts_with("#EXTM3U") {
+        if !is_playlist_start(&body) {
             // Only the URL the caller named may turn out to be a plain file. A variant that is not
             // a playlist (typically an error page for an expired token) means the stream failed.
             return Err(if hop == 0 {
@@ -134,6 +137,11 @@ pub async fn parse_hls_playlist(
         return parse_media_playlist(client, auth, text, &final_url).await;
     }
     Err(malformed(format!("master playlists nested more than {} levels deep", MAX_MASTER_DEPTH)))
+}
+
+/// Whether `body` starts like an HLS playlist: `#EXTM3U` after an optional BOM and whitespace.
+fn is_playlist_start(body: &[u8]) -> bool {
+    body.strip_prefix("\u{feff}".as_bytes()).unwrap_or(body).trim_ascii_start().starts_with(b"#EXTM3U")
 }
 
 /// A fault inside a real playlist. Never `InvalidPlaylist`: falling back to a plain download
@@ -392,8 +400,8 @@ enum FetchErrorKind {
     /// Worth retrying: network trouble, 5xx, 408, 429, a short body.
     Transient,
     Fatal,
-    /// The body is larger than the caller's limit.
-    TooLarge,
+    /// The body is larger than the caller's limit; `playlist` if it starts like an HLS playlist.
+    TooLarge { playlist: bool },
 }
 
 struct FetchError {
@@ -410,8 +418,12 @@ impl FetchError {
         Self { kind: FetchErrorKind::Fatal, reason: reason.to_string() }
     }
 
-    fn too_large(max_bytes: u64) -> Self {
-        Self { kind: FetchErrorKind::TooLarge, reason: format!("response larger than the {} byte limit", max_bytes) }
+    /// `head` is the start of the body, as far as it was read.
+    fn too_large(max_bytes: u64, head: &[u8]) -> Self {
+        Self {
+            kind: FetchErrorKind::TooLarge { playlist: is_playlist_start(head) },
+            reason: format!("response larger than the {} byte limit", max_bytes),
+        }
     }
 }
 
@@ -452,9 +464,9 @@ async fn fetch_once(
         }
     }
 
-    if resp.content_length().is_some_and(|len| len > max_bytes) {
-        return Err(FetchError::too_large(max_bytes));
-    }
+    // Of a body declared too large only the start is read, to tell what it is.
+    let declared_too_large = resp.content_length().is_some_and(|len| len > max_bytes);
+    let read_limit = if declared_too_large { PEEK_BYTES.min(max_bytes) } else { max_bytes };
 
     let final_url = resp.url().clone();
     let mut body = Vec::new();
@@ -462,10 +474,12 @@ async fn fetch_once(
         match tokio::time::timeout(STALL_TIMEOUT, resp.chunk()).await {
             Err(_) => break Err(FetchError::retryable("connection stalled")),
             Ok(Err(e)) => break Err(FetchError::retryable(e)),
+            Ok(Ok(None)) if declared_too_large => break Err(FetchError::too_large(max_bytes, &body)),
             Ok(Ok(None)) => break Ok(()),
             Ok(Ok(Some(chunk))) => {
-                if body.len() as u64 + chunk.len() as u64 > max_bytes {
-                    break Err(FetchError::too_large(max_bytes));
+                if body.len() as u64 + chunk.len() as u64 > read_limit {
+                    let head: Vec<u8> = body.iter().chain(chunk.iter()).take(PEEK_BYTES as usize).copied().collect();
+                    break Err(FetchError::too_large(max_bytes, &head));
                 }
                 progress.fetch_add(chunk.len() as u64, Ordering::Relaxed);
                 body.extend_from_slice(&chunk);
@@ -566,18 +580,21 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// Identifies a segment list across runs. `exact` hashes the full segment URLs; `stream` leaves
-/// out their queries. CDN tokens in the query often change on every playlist fetch, yet the
-/// query can also be all that tells two streams apart, so a `stream`-only match is trusted only
-/// once the stream's bytes confirm it (see [`HlsEngine::download`]).
+/// Identifies a segment list across runs. `exact` hashes the full segment URLs; `stream` hashes
+/// the playlist URL and the segment URLs, all without their queries. CDN tokens in the query often
+/// change on every playlist fetch, yet the query can also be all that tells two streams apart, so
+/// a `stream`-only match is trusted only once the stream's bytes confirm it (see
+/// [`HlsEngine::prepare`]).
 struct Fingerprints {
     exact: String,
     stream: String,
 }
 
 impl Fingerprints {
-    fn of(segments: &[HlsSegment]) -> Self {
+    fn of(playlist: &Url, segments: &[HlsSegment]) -> Self {
         let (mut exact, mut stream) = (blake3::Hasher::new(), blake3::Hasher::new());
+        stream.update(playlist[..url::Position::AfterPath].as_bytes());
+        stream.update(b"\n");
         for s in segments {
             exact.update(s.url.as_str().as_bytes());
             stream.update(s.url[..url::Position::AfterPath].as_bytes());
@@ -592,42 +609,56 @@ impl Fingerprints {
     }
 }
 
-/// Whether `<output_path>.part` is a partial download of this stream (its segment URLs up to
-/// their queries), which a download to `output_path` resumes or, if its bytes turn out to be
-/// another stream's, restarts in place.
-pub fn part_is_same_stream(output_path: &Path, segments: &[HlsSegment]) -> bool {
-    let state_path = with_suffix(&with_suffix(output_path, ".part"), ".hlsstate");
-    std::fs::read_to_string(state_path)
-        .is_ok_and(|s| s.split_whitespace().nth(1) == Some(Fingerprints::of(segments).stream.as_str()))
-}
-
 /// Reads `<exact fingerprint> <stream fingerprint> <segments written> <bytes written>` from the
-/// resume file. Returns where to continue and whether the exact fingerprint matched, or `None`
-/// when there is nothing of this stream to resume.
-async fn load_resume_point(
-    state_path: &Path,
-    part_path: &Path,
-    fingerprints: &Fingerprints,
-    total: usize,
-) -> Option<(usize, u64, bool)> {
+/// resume file, or `None` if there is none or it is not one.
+async fn read_state(state_path: &Path) -> Option<(String, String, usize, u64)> {
     let state = tokio::fs::read_to_string(state_path).await.ok()?;
     let mut fields = state.split_whitespace();
-    let (exact, stream) = (fields.next()?, fields.next()?);
-    let count = fields.next()?.parse::<usize>().ok()?;
-    let bytes = fields.next()?.parse::<u64>().ok()?;
-    let part_len = tokio::fs::metadata(part_path).await.map(|m| m.len()).unwrap_or(0);
-    (stream == fingerprints.stream && (1..=total).contains(&count) && bytes <= part_len)
-        .then_some((count, bytes, exact == fingerprints.exact))
+    let (exact, stream) = (fields.next()?.to_string(), fields.next()?.to_string());
+    Some((exact, stream, fields.next()?.parse().ok()?, fields.next()?.parse().ok()?))
 }
 
-/// Whether the first `written` bytes of `part_path` begin with `first` (the first segment).
-async fn part_starts_with(part_path: &Path, first: &[u8], written: u64) -> std::io::Result<bool> {
-    if first.len() as u64 > written {
-        return Ok(false);
+/// Whether segment `i` is written with its init section: the first segment that has one does,
+/// and so does every segment where it changes.
+fn writes_init(segments: &[HlsSegment], i: usize) -> bool {
+    segments[i].init.is_some() && (i == 0 || segments[i - 1].init != segments[i].init)
+}
+
+/// Whether the `count` segments written to `part_path` (`bytes` long) are these: the first and the
+/// last of them, fetched again, must equal the bytes that start and end the `.part`.
+async fn part_matches(
+    client: &Client,
+    auth: Option<&Auth>,
+    segments: &[HlsSegment],
+    part_path: &Path,
+    count: usize,
+    bytes: u64,
+    cancel_flag: &Option<Arc<AtomicBool>>,
+) -> Result<bool, HlsError> {
+    for index in std::iter::once(0).chain((count > 1).then_some(count - 1)) {
+        let uncounted = AtomicU64::new(0);
+        let fetch = fetch_segment(client, auth, segments[index].clone(), writes_init(segments, index), &uncounted);
+        let data = tokio::select! {
+            data = fetch => data?,
+            _ = cancelled(cancel_flag) => return Err(HlsError::Cancelled),
+        };
+        let len = data.len() as u64;
+        let offset = if index == 0 { (len <= bytes).then_some(0) } else { bytes.checked_sub(len) };
+        match offset {
+            Some(offset) if part_holds(part_path, offset, &data).await? => {}
+            _ => return Ok(false),
+        }
     }
-    let mut head = vec![0; first.len()];
-    tokio::fs::File::open(part_path).await?.read_exact(&mut head).await?;
-    Ok(head == first)
+    Ok(true)
+}
+
+/// Whether `part_path` holds `expected` at `offset`.
+async fn part_holds(part_path: &Path, offset: u64, expected: &[u8]) -> std::io::Result<bool> {
+    let mut file = tokio::fs::File::open(part_path).await?;
+    file.seek(SeekFrom::Start(offset)).await?;
+    let mut actual = vec![0; expected.len()];
+    file.read_exact(&mut actual).await?;
+    Ok(actual == expected)
 }
 
 /// Completes once `cancel_flag` is set; never without one.
@@ -641,19 +672,73 @@ async fn cancelled(cancel_flag: &Option<Arc<AtomicBool>>) {
     }
 }
 
+/// Where an HLS download goes and how much of its `.part` it keeps, from [`HlsEngine::prepare`].
+pub struct HlsTarget {
+    path: PathBuf,
+    fingerprints: Fingerprints,
+    resume_from: usize,
+    resume_bytes: u64,
+}
+
 /// High-speed parallel HLS segment downloader and in-order stream stitcher.
 pub struct HlsEngine;
 
 impl HlsEngine {
-    /// Downloads `segments` with at most `num_connections` requests in flight and writes
-    /// them in order to `<output_path>.part`, renamed to `output_path` once complete.
-    /// A failed or cancelled run keeps the `.part` file and resumes from it next time; a
-    /// `.part` of another stream is overwritten. `auth` is added to every request it covers.
+    /// Decides how a download of `segments` (from `playlist`) to `output_path` starts. A `.part`
+    /// of exactly this stream is resumed. One whose playlist and segment URLs match only up to
+    /// their queries (rotated CDN tokens, or another stream told apart only by them) is resumed
+    /// only if its first and last written segments, fetched again, equal its bytes. `None` means
+    /// the `.part` belongs to another download: it stays untouched and needs another name.
+    pub async fn prepare(
+        client: &Client,
+        auth: Option<&Auth>,
+        playlist: &Url,
+        segments: &[HlsSegment],
+        output_path: &Path,
+        cancel_flag: &Option<Arc<AtomicBool>>,
+    ) -> Result<Option<HlsTarget>, HlsError> {
+        let path = if output_path.extension().is_none() {
+            output_path.with_extension(container_extension(segments))
+        } else {
+            output_path.to_path_buf()
+        };
+        let part_path = with_suffix(&path, ".part");
+        let fingerprints = Fingerprints::of(playlist, segments);
+        let part_len = match tokio::fs::metadata(&part_path).await {
+            Ok(meta) => meta.len(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Some(HlsTarget { path, fingerprints, resume_from: 0, resume_bytes: 0 }))
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let Some((exact, stream, count, bytes)) = read_state(&with_suffix(&part_path, ".hlsstate")).await else {
+            return Ok(None);
+        };
+        let resumable = (1..=segments.len()).contains(&count) && bytes <= part_len;
+        let (resume_from, resume_bytes) = if exact == fingerprints.exact {
+            // Surely this stream: resume it, or restart it in place if its state is unusable.
+            if resumable { (count, bytes) } else { (0, 0) }
+        } else if stream == fingerprints.stream
+            && resumable
+            && part_matches(client, auth, segments, &part_path, count, bytes, cancel_flag).await?
+        {
+            (count, bytes)
+        } else {
+            tracing::info!("{} holds another stream; leaving it alone", part_path.display());
+            return Ok(None);
+        };
+        Ok(Some(HlsTarget { path, fingerprints, resume_from, resume_bytes }))
+    }
+
+    /// Downloads `segments` with at most `num_connections` requests in flight and writes them in
+    /// order to the `.part` of `target` (from [`HlsEngine::prepare`] for these segments), renamed
+    /// to the target path once complete. A failed or cancelled run keeps the `.part` file and
+    /// resumes from it next time. `auth` is added to every request it covers.
     pub async fn download(
         client: &Client,
         auth: Option<&Auth>,
         segments: Vec<HlsSegment>,
-        output_path: &Path,
+        target: HlsTarget,
         num_connections: usize,
         snapshot_tx: Option<broadcast::Sender<EngineSnapshot>>,
         cancel_flag: Option<Arc<AtomicBool>>,
@@ -665,39 +750,12 @@ impl HlsEngine {
         }
         let is_cancelled = || cancel_flag.as_ref().is_some_and(|c| c.load(Ordering::Relaxed));
 
-        let target_file = if output_path.extension().is_none() {
-            output_path.with_extension(container_extension(&segments))
-        } else {
-            output_path.to_path_buf()
-        };
+        let HlsTarget { path: target_file, fingerprints, resume_from, resume_bytes: mut written_bytes } = target;
         if let Some(parent) = target_file.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
         let part_path = with_suffix(&target_file, ".part");
         let state_path = with_suffix(&part_path, ".hlsstate");
-
-        let fingerprints = Fingerprints::of(&segments);
-        let (resume_from, mut written_bytes) =
-            match load_resume_point(&state_path, &part_path, &fingerprints, total_segments).await {
-                None => (0, 0),
-                Some((count, bytes, true)) => (count, bytes),
-                // Same segment URLs but other queries: a rotated CDN token, or another stream
-                // told apart only by its query. Its first segment as served now decides.
-                Some((count, bytes, false)) => {
-                    let first = segments[0].clone();
-                    let (with_init, uncounted) = (first.init.is_some(), AtomicU64::new(0));
-                    let first = tokio::select! {
-                        first = fetch_segment(client, auth, first, with_init, &uncounted) => first?,
-                        _ = cancelled(&cancel_flag) => return Err(HlsError::Cancelled),
-                    };
-                    if part_starts_with(&part_path, &first, bytes).await? {
-                        (count, bytes)
-                    } else {
-                        tracing::info!("{} holds another stream; restarting it", part_path.display());
-                        (0, 0)
-                    }
-                }
-            };
         let mut out_file = tokio::fs::OpenOptions::new().create(true).write(true).truncate(false).open(&part_path).await?;
         out_file.set_len(written_bytes).await?;
         out_file.seek(SeekFrom::End(0)).await?;
@@ -711,9 +769,7 @@ impl HlsEngine {
         );
 
         // An init section is written before the first segment that uses it and again whenever it changes.
-        let with_init: Vec<bool> = (0..total_segments)
-            .map(|i| segments[i].init.is_some() && (i == 0 || segments[i - 1].init != segments[i].init))
-            .collect();
+        let with_init: Vec<bool> = (0..total_segments).map(|i| writes_init(&segments, i)).collect();
         let received = AtomicU64::new(written_bytes);
         // `buffered` keeps at most `num_connections` fetches in flight and yields them in order,
         // so no more than that many segments are ever held in memory. Dropping it aborts them.
@@ -917,6 +973,20 @@ pub(crate) mod tests {
         (200, String::new(), body.into())
     }
 
+    /// Prepares `out` for `segments` of `playlist`, which must be free or hold this stream, and
+    /// downloads them there.
+    async fn download_to(
+        client: &Client,
+        auth: Option<&Auth>,
+        playlist: &Url,
+        segments: Vec<HlsSegment>,
+        out: &Path,
+        num_connections: usize,
+    ) -> Result<PathBuf, HlsError> {
+        let target = HlsEngine::prepare(client, auth, playlist, &segments, out, &None).await?.expect("usable name");
+        HlsEngine::download(client, auth, segments, target, num_connections, None, None).await
+    }
+
     fn encrypt(plain: &[u8], key: [u8; 16], iv: [u8; 16]) -> Vec<u8> {
         let mut buf = plain.to_vec();
         buf.resize(plain.len() + 16 - plain.len() % 16, 0);
@@ -1064,8 +1134,9 @@ video.m3u8
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("video.mp4");
         let (tx, mut rx) = broadcast::channel(256);
+        let target = HlsEngine::prepare(&client, None, &url, &segments, &out, &None).await.unwrap().unwrap();
         // num_connections == 0 must be treated as 1, not panic.
-        let path = HlsEngine::download(&client, None, segments, &out, 0, Some(tx), None).await.unwrap();
+        let path = HlsEngine::download(&client, None, segments, target, 0, Some(tx), None).await.unwrap();
 
         let expected = [init, seg0, seg1, seg2].concat();
         assert_eq!(path, out);
@@ -1107,7 +1178,7 @@ video.m3u8
         std::fs::write(&out, "previous download").unwrap();
 
         let segments = parse_hls_playlist(&client, &url, None).await.unwrap();
-        let err = HlsEngine::download(&client, None, segments, &out, 1, None, None).await.unwrap_err();
+        let err = download_to(&client, None, &url, segments, &out, 1).await.unwrap_err();
         assert!(matches!(err, HlsError::SegmentFailed { index: 1, .. }), "{err}");
         assert_eq!(std::fs::read(&out).unwrap(), b"previous download", "a failed run must not touch the final name");
         assert_eq!(hits.lock()["/b.ts"], 1, "404 is not retried");
@@ -1115,7 +1186,7 @@ video.m3u8
 
         broken.store(false, Ordering::SeqCst);
         let segments = parse_hls_playlist(&client, &url, None).await.unwrap();
-        HlsEngine::download(&client, None, segments, &out, 4, None, None).await.unwrap();
+        download_to(&client, None, &url, segments, &out, 4).await.unwrap();
         assert_eq!(std::fs::read(&out).unwrap(), b"AAAABBBBCCCC");
         assert_eq!(hits.lock()["/a.ts"], 1, "segments already written are not fetched again");
     }
@@ -1133,14 +1204,12 @@ video.m3u8
         let url = Url::parse(&format!("http://{}/media.m3u8", addr)).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let segments = parse_hls_playlist(&client, &url, None).await.unwrap();
-        let err = HlsEngine::download(&client, None, segments.clone(), &dir.path().join("a.ts"), 2, None, None)
-            .await
-            .unwrap_err();
+        let err = download_to(&client, None, &url, segments.clone(), &dir.path().join("a.ts"), 2).await.unwrap_err();
         assert!(err.to_string().contains("ignored the byte range"), "{err}");
 
         let mut honest = segments;
         honest[0].url.set_path("/honest.ts");
-        let path = HlsEngine::download(&client, None, honest, &dir.path().join("b.ts"), 2, None, None).await.unwrap();
+        let path = download_to(&client, None, &url, honest, &dir.path().join("b.ts"), 2).await.unwrap();
         assert_eq!(std::fs::read(path).unwrap(), b"0123");
     }
 
@@ -1161,9 +1230,8 @@ video.m3u8
         for (playlist, segment) in [("/big.m3u8", "/big.ts"), ("/ranged.m3u8", "/over.ts")] {
             let url = Url::parse(&format!("http://{}{}", addr, playlist)).unwrap();
             let segments = parse_hls_playlist(&client, &url, None).await.unwrap();
-            let err = HlsEngine::download(&client, None, segments, &dir.path().join("out.ts"), 1, None, None)
-                .await
-                .unwrap_err();
+            let out = dir.path().join(&segment[1..]);
+            let err = download_to(&client, None, &url, segments, &out, 1).await.unwrap_err();
             assert!(matches!(err, HlsError::SegmentFailed { index: 0, .. }), "{err}");
             assert!(err.to_string().contains("byte limit"), "{err}");
             assert_eq!(hits.lock()[segment], 1, "an oversized body is not retried");
@@ -1172,8 +1240,16 @@ video.m3u8
 
     #[tokio::test]
     async fn test_only_a_non_playlist_url_is_invalid_playlist() {
-        let (addr, _) = serve(|path: &str, _| match path {
+        let oversized = |head: &str| {
+            let mut body = head.as_bytes().to_vec();
+            body.resize(MAX_PLAYLIST_BYTES as usize + 1, b'\n');
+            ok(body)
+        };
+        let (addr, _) = serve(move |path: &str, _| match path {
             "/page.m3u8" => ok("<html>not a playlist</html>"),
+            "/channels.m3u8.zip" => oversized("PK\u{3}\u{4}"),
+            "/huge.m3u8" => oversized("\u{feff}\n#EXTM3U\n#EXT-X-TARGETDURATION:4\n"),
+            "/huge-variant.m3u8" => ok("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nchannels.m3u8.zip\n"),
             "/keyless.m3u8" => ok("#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"gone.key\"\n#EXTINF:4,\na.ts\n#EXT-X-ENDLIST\n"),
             "/master.m3u8" => ok("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nexpired.m3u8\n"),
             "/expired.m3u8" => ok("<html>token expired</html>"),
@@ -1191,6 +1267,11 @@ video.m3u8
         assert!(matches!(parse("/missing.m3u8").await, Err(HlsError::Unavailable(_))));
         assert!(matches!(parse("/keyless.m3u8").await, Err(HlsError::Unavailable(_))));
         assert!(matches!(parse("/page.m3u8").await, Err(HlsError::InvalidPlaylist(_))));
+        // A large ordinary file whose URL mentions .m3u8 falls back to a plain download, but a
+        // real playlist too large to read, or an oversized variant, does not.
+        assert!(matches!(parse("/channels.m3u8.zip").await, Err(HlsError::InvalidPlaylist(_))));
+        assert!(matches!(parse("/huge.m3u8").await, Err(HlsError::Unsupported(_))));
+        assert!(matches!(parse("/huge-variant.m3u8").await, Err(HlsError::Unsupported(_))));
         // Inside a real stream nothing may look like "not a playlist", or the engine would save
         // the playlist text as the download.
         assert!(matches!(parse("/master.m3u8").await, Err(HlsError::Unavailable(_))));
@@ -1218,58 +1299,73 @@ video.m3u8
 
         let segments = parse_hls_playlist(&client, &url, Some(&auth)).await.unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let out = dir.path().join("private.mp4");
-        let err = HlsEngine::download(&client, None, segments.clone(), &out, 1, None, None).await.unwrap_err();
+        let err = download_to(&client, None, &url, segments.clone(), &dir.path().join("public.mp4"), 1).await.unwrap_err();
         assert!(err.to_string().contains("401"), "{err}");
-        HlsEngine::download(&client, Some(&auth), segments, &out, 1, None, None).await.unwrap();
+        let out = dir.path().join("private.mp4");
+        download_to(&client, Some(&auth), &url, segments, &out, 1).await.unwrap();
         assert_eq!(std::fs::read(&out).unwrap(), b"INITDATA");
     }
 
     #[tokio::test]
-    async fn test_resume_never_splices_streams_differing_only_by_query() {
+    async fn test_resume_never_splices_or_overwrites_another_stream() {
+        fn media(v: &str) -> Reply {
+            let segments: String = (0..3).map(|n| format!("#EXTINF:4,\n/seg.ts?v={v}&n={n}\n")).collect();
+            ok(format!("#EXTM3U\n{segments}#EXT-X-ENDLIST\n"))
+        }
         let broken = Arc::new(AtomicBool::new(true));
         let broken_srv = Arc::clone(&broken);
+        // Every stream opens with the same intro and is told apart by queries only.
         let (addr, hits) = serve(move |path: &str, _| match path {
-            "/one/index.m3u8" => ok("#EXTM3U\n#EXTINF:4,\n/seg.ts?v=1&n=0\n#EXTINF:4,\n/seg.ts?v=1&n=1\n#EXT-X-ENDLIST\n"),
-            "/two/index.m3u8" => ok("#EXTM3U\n#EXTINF:4,\n/seg.ts?v=2&n=0\n#EXTINF:4,\n/seg.ts?v=2&n=1\n#EXT-X-ENDLIST\n"),
-            "/seg.ts?v=1&n=0" => ok("ONE-0 "),
-            "/seg.ts?v=1&n=1" if broken_srv.load(Ordering::SeqCst) => (404, String::new(), Vec::new()),
-            "/seg.ts?v=1&n=1" => ok("ONE-1"),
-            "/seg.ts?v=2&n=0" => ok("TWO-0 "),
-            "/seg.ts?v=2&n=1" => ok("TWO-1"),
-            _ => (404, String::new(), Vec::new()),
+            "/one/index.m3u8" => media("one"),
+            "/two/index.m3u8" => media("two"),
+            "/video/index.m3u8?q=720" => media("720"),
+            "/video/index.m3u8?q=1080" => media("1080"),
+            p if p.ends_with("&n=0") => ok("INTRO "),
+            p if p.ends_with("&n=2") && broken_srv.load(Ordering::SeqCst) => (404, String::new(), Vec::new()),
+            p => ok(format!("{p} ")),
         })
         .await;
         let client = Client::new();
         let dir = tempfile::tempdir().unwrap();
-        let out = dir.path().join("index.ts");
-        let playlist = |name: &str| Url::parse(&format!("http://{}/{}/index.m3u8", addr, name)).unwrap();
+        let playlist = |path: &str| Url::parse(&format!("http://{addr}{path}")).unwrap();
+        let prepare = |path: &'static str, out: PathBuf| {
+            let client = client.clone();
+            async move {
+                let url = playlist(path);
+                let segments = parse_hls_playlist(&client, &url, None).await.unwrap();
+                let target = HlsEngine::prepare(&client, None, &url, &segments, &out, &None).await.unwrap();
+                (target, segments)
+            }
+        };
+        let fetches = |v: &str| hits.lock().iter().filter(|(p, _)| p.contains(&format!("v={v}&"))).map(|(_, n)| n).sum::<usize>();
 
-        let one = parse_hls_playlist(&client, &playlist("one"), None).await.unwrap();
-        assert!(HlsEngine::download(&client, None, one, &out, 1, None, None).await.is_err());
-        assert_eq!(std::fs::read(with_suffix(&out, ".part")).unwrap(), b"ONE-0 ");
+        let pairs = [("/one/index.m3u8", "/two/index.m3u8"), ("/video/index.m3u8?q=720", "/video/index.m3u8?q=1080")];
+        for (i, (paused, other)) in pairs.into_iter().enumerate() {
+            let out = dir.path().join(format!("{i}.ts"));
+            let (target, segments) = prepare(paused, out.clone()).await;
+            let err = HlsEngine::download(&client, None, segments, target.unwrap(), 1, None, None).await.unwrap_err();
+            assert!(matches!(err, HlsError::SegmentFailed { index: 2, .. }), "{err}");
+            let part = std::fs::read(with_suffix(&out, ".part")).unwrap();
+            let state = std::fs::read(with_suffix(&out, ".part.hlsstate")).unwrap();
 
-        // Same URLs up to the query: the name is reused, but the bytes show another stream.
-        let two = parse_hls_playlist(&client, &playlist("two"), None).await.unwrap();
-        assert!(part_is_same_stream(&out, &two));
-        HlsEngine::download(&client, None, two, &out, 1, None, None).await.unwrap();
-        assert_eq!(std::fs::read(&out).unwrap(), b"TWO-0 TWO-1");
+            // Another stream whose URLs differ only by queries and which starts the same: the
+            // other playlist, or else the last written segment, tells them apart.
+            let (target, _) = prepare(other, out.clone()).await;
+            assert!(target.is_none(), "{other} must not take over the .part of {paused}");
+            assert_eq!(std::fs::read(with_suffix(&out, ".part")).unwrap(), part, "the paused .part is untouched");
+            assert_eq!(std::fs::read(with_suffix(&out, ".part.hlsstate")).unwrap(), state);
+        }
+        assert_eq!(fetches("two"), 0, "another playlist is rejected without fetching anything");
+        assert_eq!(fetches("1080"), 2, "the first and the last written segment are checked");
 
-        // An exact match resumes without checking the first segment again.
+        // An exact match resumes without checking any segment again.
         broken.store(false, Ordering::SeqCst);
-        let out = dir.path().join("again.ts");
-        let one = parse_hls_playlist(&client, &playlist("one"), None).await.unwrap();
-        let fingerprints = Fingerprints::of(&one);
-        std::fs::write(with_suffix(&out, ".part"), "ONE-0 ").unwrap();
-        std::fs::write(
-            with_suffix(&out, ".part.hlsstate"),
-            format!("{} {} 1 6", fingerprints.exact, fingerprints.stream),
-        )
-        .unwrap();
-        let first_fetches = hits.lock()["/seg.ts?v=1&n=0"];
-        HlsEngine::download(&client, None, one, &out, 1, None, None).await.unwrap();
-        assert_eq!(std::fs::read(&out).unwrap(), b"ONE-0 ONE-1");
-        assert_eq!(hits.lock()["/seg.ts?v=1&n=0"], first_fetches);
+        let out = dir.path().join("1.ts");
+        let before = fetches("720");
+        let (target, segments) = prepare("/video/index.m3u8?q=720", out.clone()).await;
+        HlsEngine::download(&client, None, segments, target.unwrap(), 1, None, None).await.unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"INTRO /seg.ts?v=720&n=1 /seg.ts?v=720&n=2 ");
+        assert_eq!(fetches("720"), before + 1, "only the missing segment is fetched");
     }
 
     #[tokio::test]
@@ -1281,29 +1377,35 @@ video.m3u8
         let (addr, hits) = serve(move |path: &str, _| match path.split('?').next().unwrap_or(path) {
             "/index.m3u8" => {
                 let t = fetches_srv.fetch_add(1, Ordering::SeqCst);
-                ok(format!("#EXTM3U\n#EXTINF:4,\na.ts?t={t}\n#EXTINF:4,\nb.ts?t={t}\n#EXT-X-ENDLIST\n"))
+                ok(format!("#EXTM3U\n#EXTINF:4,\na.ts?t={t}\n#EXTINF:4,\nb.ts?t={t}\n#EXTINF:4,\nc.ts?t={t}\n#EXT-X-ENDLIST\n"))
             }
             "/a.ts" => ok("AAAA"),
-            "/b.ts" if broken_srv.load(Ordering::SeqCst) => (404, String::new(), Vec::new()),
             "/b.ts" => ok("BBBB"),
+            "/c.ts" if broken_srv.load(Ordering::SeqCst) => (404, String::new(), Vec::new()),
+            "/c.ts" => ok("CCCC"),
             _ => (404, String::new(), Vec::new()),
         })
         .await;
         let client = Client::new();
-        let url = Url::parse(&format!("http://{}/index.m3u8", addr)).unwrap();
+        // The playlist URL's own token rotates as well.
+        let url = |session: u32| Url::parse(&format!("http://{addr}/index.m3u8?session={session}")).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("index.ts");
 
-        let segments = parse_hls_playlist(&client, &url, None).await.unwrap();
-        assert!(HlsEngine::download(&client, None, segments, &out, 1, None, None).await.is_err());
+        let segments = parse_hls_playlist(&client, &url(1), None).await.unwrap();
+        assert!(download_to(&client, None, &url(1), segments, &out, 1).await.is_err());
 
         broken.store(false, Ordering::SeqCst);
-        let segments = parse_hls_playlist(&client, &url, None).await.unwrap();
-        assert!(part_is_same_stream(&out, &segments), "a rotated token must not orphan the .part");
-        HlsEngine::download(&client, None, segments, &out, 1, None, None).await.unwrap();
-        assert_eq!(std::fs::read(&out).unwrap(), b"AAAABBBB");
-        let first_fetches: usize = hits.lock().iter().filter(|(p, _)| p.starts_with("/a.ts")).map(|(_, n)| n).sum();
-        assert_eq!(first_fetches, 2, "resumed after one check of the first segment, not restarted");
+        let segments = parse_hls_playlist(&client, &url(2), None).await.unwrap();
+        // download_to panics unless the .part is accepted as this stream.
+        download_to(&client, None, &url(2), segments, &out, 1).await.unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"AAAABBBBCCCC");
+        let fetches = |seg: &str| hits.lock().iter().filter(|(p, _)| p.starts_with(seg)).map(|(_, n)| n).sum::<usize>();
+        assert_eq!(
+            (fetches("/a.ts"), fetches("/b.ts")),
+            (2, 2),
+            "resumed after one check of the first and the last written segment, not restarted"
+        );
     }
 
     #[tokio::test]
@@ -1342,8 +1444,9 @@ video.m3u8
             tokio::time::sleep(Duration::from_millis(100)).await;
             setter.store(true, Ordering::SeqCst);
         });
+        let target = HlsEngine::prepare(&client, None, &url, &segments, &dir.path().join("x.ts"), &None).await.unwrap();
         let started = Instant::now();
-        let result = HlsEngine::download(&client, None, segments, &dir.path().join("x.ts"), 2, None, Some(cancel)).await;
+        let result = HlsEngine::download(&client, None, segments, target.unwrap(), 2, None, Some(cancel)).await;
         assert!(matches!(result, Err(HlsError::Cancelled)));
         // Well under the stall timeout: the cancel must not wait for the fetch to give up.
         assert!(started.elapsed() < STALL_TIMEOUT);
