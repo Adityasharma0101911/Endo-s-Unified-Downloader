@@ -22,7 +22,7 @@ pub struct ProgressUpdate {
 }
 
 /// Supported media quality presets
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MediaQualityPreset {
     /// Best available video and audio merged into MP4
     #[default]
@@ -80,7 +80,7 @@ impl MediaQualityPreset {
 }
 
 /// Browser cookie sources for bypassing age gates and bot verification
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BrowserCookieSource {
     #[default]
     None,
