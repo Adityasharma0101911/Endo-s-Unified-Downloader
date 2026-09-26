@@ -1,4 +1,3 @@
-use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -1013,11 +1012,12 @@ impl Drop for PrivateFile {
     }
 }
 
-/// Browser cookies, read from the browser once per process. yt-dlp takes 0.2-0.5 s to read them
-/// (it copies and decrypts the browser's cookie database), so the first run that reads a browser
-/// also saves what it read: given `--cookies <file>` next to `--cookies-from-browser`, yt-dlp writes
-/// its whole cookie jar to that file when it exits. Later runs get the jar through `--cookies`.
-/// Cookies the browser changes after that reach yt-dlp at the next start.
+/// Browser cookies, read from the browser once in a while rather than for every run. yt-dlp takes
+/// 0.2-0.5 s to read them (it copies and decrypts the browser's cookie database), so a run that
+/// reads a browser also saves what it read: given `--cookies <file>` next to
+/// `--cookies-from-browser`, yt-dlp writes its whole cookie jar to that file when it exits. Later
+/// runs get the jar through `--cookies`, and yt-dlp writes it back with what the site renewed.
+/// After [`JAR_LIFETIME`], or once a run fails with it, the next run reads the browser again.
 ///
 /// The jar is kept in memory. It is on disk only while a yt-dlp run uses it, as a file of that run
 /// in the [`PrivateDir`].
@@ -1026,10 +1026,16 @@ struct BrowserCookies {
     jars: parking_lot::Mutex<HashMap<&'static str, Jar>>,
 }
 
+/// How long a jar read from the browser stands in for it. The browser renews some cookies as the
+/// user browses (YouTube rotates its session cookies, and then rejects the old ones), which only
+/// a new read picks up.
+const JAR_LIFETIME: Duration = Duration::from_secs(15 * 60);
+
 enum Jar {
     /// A run reads the browser and saves the jar.
     Saving,
-    Saved(Arc<str>),
+    /// A jar read from the browser at `read_at`, with what the sites renewed since.
+    Saved { jar: Arc<str>, read_at: tokio::time::Instant },
 }
 
 static BROWSER_COOKIES: LazyLock<BrowserCookies> =
@@ -1043,39 +1049,59 @@ impl BrowserCookies {
 
     /// The cookie arguments of one yt-dlp run with `source`.
     async fn for_run(&self, source: &BrowserCookieSource) -> CookieRun<'_> {
-        let mut run = CookieRun { cookies: self, args: source.to_args(), file: None, saving: None };
+        let mut run = CookieRun { cookies: self, args: source.to_args(), file: None, jar: None };
         let Some(browser) = source.browser() else {
             return run;
         };
         if self.files.get().await.is_none() {
             return run;
         }
-        let saved = match self.jars.lock().entry(browser) {
-            Entry::Occupied(jar) => match jar.get() {
-                Jar::Saved(jar) => Some(Arc::clone(jar)),
+        let now = tokio::time::Instant::now();
+        let saved = {
+            let mut jars = self.jars.lock();
+            match jars.get(browser) {
                 // Another run reads the browser right now.
-                Jar::Saving => return run,
-            },
-            Entry::Vacant(jar) => {
-                jar.insert(Jar::Saving);
-                run.saving = Some(browser);
-                None
+                Some(Jar::Saving) => return run,
+                Some(Jar::Saved { jar, read_at }) if now.duration_since(*read_at) < JAR_LIFETIME => Some((Arc::clone(jar), *read_at)),
+                _ => {
+                    jars.insert(browser, Jar::Saving);
+                    None
+                }
             }
         };
-        match self.files.file(saved.map(|jar| jar.as_bytes().to_vec()), "txt").await {
+        let contents = saved.as_ref().map(|(jar, _)| jar.as_bytes().to_vec());
+        run.jar = Some(match saved {
+            Some((jar, read_at)) => JarUse::Uses { browser, jar, read_at },
+            None => JarUse::Reads { browser, started: now },
+        });
+        match self.files.file(contents, "txt").await {
             Ok(file) => {
                 let file_args = ["--cookies".to_string(), file.path.to_string_lossy().into_owned()];
-                if run.saving.is_some() {
+                if let Some(JarUse::Reads { .. }) = run.jar {
                     run.args.extend(file_args);
                 } else {
                     run.args = file_args.to_vec();
                 }
                 run.file = Some(file);
             }
-            Err(e) => tracing::warn!("Could not keep the browser cookies for later downloads: {e}"),
+            Err(e) => {
+                tracing::warn!("Could not keep the browser cookies for later downloads: {e}");
+                // It reads the browser, as its arguments say, and has nowhere to save the jar.
+                if let Some(JarUse::Uses { .. }) = run.jar {
+                    run.jar = None;
+                }
+            }
         }
         run
     }
+}
+
+/// What a yt-dlp run does with the jar of a browser.
+enum JarUse {
+    /// It reads the browser (it starts at `started`), and yt-dlp saves the jar into its file.
+    Reads { browser: &'static str, started: tokio::time::Instant },
+    /// It got `jar`, which yt-dlp saves back with what the site renewed.
+    Uses { browser: &'static str, jar: Arc<str>, read_at: tokio::time::Instant },
 }
 
 /// The cookie arguments of one yt-dlp run, and the file they name.
@@ -1083,30 +1109,56 @@ struct CookieRun<'a> {
     cookies: &'a BrowserCookies,
     args: Vec<String>,
     file: Option<PrivateFile>,
-    /// The browser whose cookies the run saves into `file`.
-    saving: Option<&'static str>,
+    jar: Option<JarUse>,
 }
 
 impl CookieRun<'_> {
-    /// Keeps the jar yt-dlp saved, if the run was to save one. Only for a yt-dlp that exited by
-    /// itself: one that was killed may have written half a jar.
-    async fn finish(mut self) {
-        let (Some(browser), Some(file)) = (self.saving, &self.file) else {
+    /// Keeps the jar yt-dlp saved: the one it read from the browser, or the jar it got with what
+    /// the site renewed. A run that fails with a jar it got drops it instead, so the next run reads
+    /// the browser again: the site may reject cookies the browser has renewed since. Only for a
+    /// yt-dlp that exited by itself: one that was killed may have written half a jar.
+    async fn finish(mut self, succeeded: bool) {
+        let Some(jar_use) = self.jar.take() else {
             return;
         };
-        // yt-dlp starts the file with this header, even when it read no cookies.
-        let jar = tokio::fs::read_to_string(&file.path).await.ok().filter(|jar| jar.starts_with("# Netscape HTTP Cookie File"));
-        if let Some(jar) = jar {
-            self.cookies.jars.lock().insert(browser, Jar::Saved(jar.into()));
-            self.saving = None;
+        let written = match &self.file {
+            // yt-dlp starts the file with this header, even when it read no cookies.
+            Some(file) => tokio::fs::read_to_string(&file.path).await.ok().filter(|jar| jar.starts_with("# Netscape HTTP Cookie File")),
+            None => None,
+        };
+        let mut jars = self.cookies.jars.lock();
+        match jar_use {
+            JarUse::Reads { browser, started } => match written {
+                Some(jar) => {
+                    jars.insert(browser, Jar::Saved { jar: jar.into(), read_at: started });
+                }
+                // Nothing saved: the next run reads the browser again.
+                None => {
+                    jars.remove(browser);
+                }
+            },
+            JarUse::Uses { browser, jar, read_at } => {
+                // Unless the jar has been replaced meanwhile.
+                if matches!(jars.get(browser), Some(Jar::Saved { jar: current, .. }) if Arc::ptr_eq(current, &jar)) {
+                    match written {
+                        _ if !succeeded => {
+                            jars.remove(browser);
+                        }
+                        Some(renewed) => {
+                            jars.insert(browser, Jar::Saved { jar: renewed.into(), read_at });
+                        }
+                        None => {}
+                    }
+                }
+            }
         }
     }
 }
 
 impl Drop for CookieRun<'_> {
     fn drop(&mut self) {
-        // Nothing saved: the next run reads the browser again.
-        if let Some(browser) = self.saving {
+        // Killed before it saved the jar it read: the next run reads the browser again.
+        if let Some(JarUse::Reads { browser, .. }) = self.jar.take() {
             self.cookies.jars.lock().remove(browser);
         }
     }
@@ -2341,7 +2393,7 @@ async fn download_with(
                 let cookies = tools.cookies.for_run(&options.cookies).await;
                 let extracted = run_to_end(command(Source::Url(url), RunKind::Extract, &cookies), cancel_flag.clone()).await;
                 if !is_cancelled(&cancel_flag) {
-                    cookies.finish().await;
+                    cookies.finish(extracted.is_ok()).await;
                 }
                 // The download would only extract the video again and fail the same way.
                 let json = match extracted {
@@ -2372,7 +2424,7 @@ async fn download_with(
             let cookies = tools.cookies.for_run(&options.cookies).await;
             let result = run_ytdlp(command(source, RunKind::Download, &cookies), progress_tx.as_ref(), cancel_flag.clone()).await;
             if !is_cancelled(&cancel_flag) {
-                cookies.finish().await;
+                cookies.finish(result.is_ok()).await;
             }
             result
         };
@@ -2994,7 +3046,7 @@ mod tests {
         drop(meanwhile);
         // What yt-dlp does as it exits.
         std::fs::write(&saved_to, JAR).unwrap();
-        first.finish().await;
+        first.finish(true).await;
         assert!(!saved_to.exists());
 
         // Later runs get a copy of their own, gone after the run.
@@ -3032,7 +3084,7 @@ mod tests {
         // yt-dlp failed before saving anything.
         let run = cookies.for_run(&BrowserCookieSource::Chrome).await;
         assert!(saves(&run));
-        run.finish().await;
+        run.finish(false).await;
         // It was killed as it wrote the jar (a killed run is not finished).
         let run = cookies.for_run(&BrowserCookieSource::Chrome).await;
         assert!(saves(&run));
@@ -3042,12 +3094,12 @@ mod tests {
         let run = cookies.for_run(&BrowserCookieSource::Chrome).await;
         assert!(saves(&run));
         std::fs::write(&run.args[3], "ERROR").unwrap();
-        run.finish().await;
+        run.finish(true).await;
 
         let run = cookies.for_run(&BrowserCookieSource::Chrome).await;
         assert!(saves(&run));
         std::fs::write(&run.args[3], JAR).unwrap();
-        run.finish().await;
+        run.finish(true).await;
         assert_eq!(cookies.for_run(&BrowserCookieSource::Chrome).await.args[0], "--cookies");
         assert_eq!(names_in(dir.path()), Vec::<String>::new());
     }
@@ -3999,5 +4051,59 @@ mod tests {
         assert_eq!(runs_in(dir.path()), ["extract"], "no second extraction to fail the same way");
         // Swept at the first media download, though this one uses no browser cookies.
         assert_eq!(names_in(&private), Vec::<String>::new());
+    }
+
+    /// Whether `run` reads the browser (and saves what it read).
+    fn reads_browser(run: &CookieRun) -> bool {
+        run.args.len() == 4 && run.args[..3] == ["--cookies-from-browser", "chrome", "--cookies"]
+    }
+
+    /// Saves `jar` as the jar a run read from Chrome.
+    async fn save_jar(cookies: &BrowserCookies, jar: &str) {
+        let run = cookies.for_run(&BrowserCookieSource::Chrome).await;
+        assert!(reads_browser(&run), "{:?}", run.args);
+        std::fs::write(&run.args[3], jar).unwrap();
+        run.finish(true).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_browser_is_read_again_once_its_jar_is_old() {
+        let dir = tempfile::tempdir().unwrap();
+        let cookies = BrowserCookies::new(Some(dir.path().to_path_buf()));
+        save_jar(&cookies, JAR).await;
+        tokio::time::advance(JAR_LIFETIME - Duration::from_secs(1)).await;
+        let run = cookies.for_run(&BrowserCookieSource::Chrome).await;
+        assert_eq!(run.args[0], "--cookies");
+        // What yt-dlp writes back is no newer than the browser read it came from.
+        run.finish(true).await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let run = cookies.for_run(&BrowserCookieSource::Chrome).await;
+        assert!(reads_browser(&run), "{:?}", run.args);
+    }
+
+    #[tokio::test]
+    async fn a_jar_keeps_what_the_site_renews_and_goes_when_a_run_fails_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let cookies = BrowserCookies::new(Some(dir.path().to_path_buf()));
+        save_jar(&cookies, JAR).await;
+        // The site renewed a cookie, which yt-dlp saved back.
+        let renewed = JAR.replace("secret", "renewed");
+        let run = cookies.for_run(&BrowserCookieSource::Chrome).await;
+        assert_eq!(std::fs::read_to_string(&run.args[1]).unwrap(), JAR);
+        std::fs::write(&run.args[1], &renewed).unwrap();
+        run.finish(true).await;
+
+        let run = cookies.for_run(&BrowserCookieSource::Chrome).await;
+        assert_eq!(std::fs::read_to_string(&run.args[1]).unwrap(), renewed);
+        // A run that got the jar before a new read replaced it leaves the new jar alone.
+        let late = cookies.for_run(&BrowserCookieSource::Chrome).await;
+        // "Sign in to confirm you're not a bot": the site no longer takes these cookies.
+        run.finish(false).await;
+        let again = cookies.for_run(&BrowserCookieSource::Chrome).await;
+        assert!(reads_browser(&again), "{:?}", again.args);
+        std::fs::write(&again.args[3], JAR).unwrap();
+        again.finish(true).await;
+        late.finish(false).await;
+        assert_eq!(cookies.for_run(&BrowserCookieSource::Chrome).await.args[0], "--cookies");
     }
 }
