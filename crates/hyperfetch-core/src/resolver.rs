@@ -1,9 +1,32 @@
 use std::collections::HashSet;
-use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
-use reqwest::Client;
+use std::future::Future;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use base64::Engine as _;
+use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE, USER_AGENT};
+use reqwest::{Client, Response};
 use serde::Deserialize;
 use url::Url;
 use thiserror::Error;
+
+/// Upper bound for one resolver, including every request it makes and its body reads.
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Upper bound on how much of a landing page is read for scraping.
+const MAX_HTML_BYTES: usize = 2 * 1024 * 1024;
+
+/// Last-segment extensions of URLs that are web pages rather than files.
+const PAGE_EXTENSIONS: &[&str] = &["html", "htm", "shtml", "xhtml", "php", "asp", "aspx", "jsp", "cfm"];
+
+/// Extensions of media URLs the engine can download (HLS playlists go to the HLS engine).
+const MEDIA_EXTENSIONS: &[&str] = &["mp4", "m4v", "webm", "mkv", "mov", "avi", "flv", "ogv", "ts", "m3u8"];
+
+/// `<meta property|name=...>` keys whose `content` points at the page's video.
+const META_VIDEO_KEYS: &[&str] = &["og:video", "og:video:url", "og:video:secure_url", "twitter:player:stream"];
+
+/// JSON keys used by custom players (Zoom recordings, Panopto, Loom, ...) for the video file.
+const JSON_VIDEO_KEYS: &[&str] = &["viewMp4Url", "downloadUrl", "videoUrl", "video_url", "contentUrl", "stream_url", "fileUrl"];
+
+const SOURCEFORGE_MIRRORS: &[&str] = &["autoselect", "netix", "phoenixnap", "netcologne", "jaist", "liquidtelecom"];
 
 #[derive(Error, Debug)]
 pub enum ResolverError {
@@ -13,13 +36,16 @@ pub enum ResolverError {
     Parse(String),
     #[error("Direct download link not found: {0}")]
     NotFound(String),
+    #[error("Link resolution timed out after {0}s")]
+    Timeout(u64),
 }
 
 /// Trait implemented by host-specific resolvers to unpack landing pages,
 /// bypass confirmation gates, and discover multi-cluster mirrors.
+/// `Ok` is never empty, and every URL in it serves the same bytes.
 pub trait HostResolver: Send + Sync {
     fn can_handle(&self, url: &Url) -> bool;
-    fn resolve(&self, client: &Client, url: &Url) -> impl std::future::Future<Output = Result<Vec<Url>, ResolverError>> + Send;
+    fn resolve(&self, client: &Client, url: &Url) -> impl Future<Output = Result<Vec<Url>, ResolverError>> + Send;
 }
 
 /// Archive.org Multi-Cluster Resolver
@@ -47,124 +73,81 @@ struct ArchiveMetadata {
     alternate_locations: Option<ArchiveAlternateLocations>,
 }
 
+/// Splits an archive.org file URL into (item identifier, percent-encoded file path).
+/// Accepts `/download/{id}/{file}` and data-node paths `[/{n}]/items/{id}/{file}`; never Wayback URLs.
+fn archive_item_path(url: &Url) -> Option<(String, String)> {
+    let host = url.host_str()?;
+    if !(host == "archive.org" || host.ends_with(".archive.org")) || host == "web.archive.org" {
+        return None;
+    }
+    let segs: Vec<&str> = url.path_segments()?.collect();
+    let rest = match segs.as_slice() {
+        ["download", rest @ ..] | ["items", rest @ ..] => rest,
+        [n, "items", rest @ ..] if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => rest,
+        _ => return None,
+    };
+    let [id, file @ ..] = rest else { return None };
+    if id.is_empty() || file.iter().all(|s| s.is_empty()) {
+        return None;
+    }
+    Some((id.to_string(), file.join("/")))
+}
+
 impl HostResolver for ArchiveOrgResolver {
     fn can_handle(&self, url: &Url) -> bool {
-        let is_archive_host = url.host_str().map_or(false, |h| h.ends_with("archive.org"));
-        let path = url.path();
-        is_archive_host && (path.starts_with("/download/") || path.contains("/items/"))
+        archive_item_path(url).is_some()
     }
 
     async fn resolve(&self, client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
-        let path = url.path();
-        let (identifier, raw_filename) = if path.starts_with("/download/") {
-            let rest = &path["/download/".len()..];
-            if let Some(idx) = rest.find('/') {
-                (rest[..idx].to_string(), rest[idx + 1..].to_string())
-            } else {
-                return Ok(vec![url.clone()]);
-            }
-        } else if let Some(idx) = path.find("/items/") {
-            let rest = &path[idx + "/items/".len()..];
-            if let Some(idx2) = rest.find('/') {
-                (rest[..idx2].to_string(), rest[idx2 + 1..].to_string())
-            } else {
-                return Ok(vec![url.clone()]);
-            }
-        } else {
-            return Ok(vec![url.clone()]);
-        };
+        let (identifier, file) = archive_item_path(url)
+            .ok_or_else(|| ResolverError::Parse(format!("Not an archive.org file URL: {}", url)))?;
 
         let metadata_url = format!("https://archive.org/metadata/{}", identifier);
-        let resp = client.get(&metadata_url).send().await?;
-
-        if !resp.status().is_success() {
-            return Ok(vec![url.clone()]);
-        }
-
-        let bytes = resp.bytes().await?;
-        let metadata: ArchiveMetadata = match serde_json::from_slice(&bytes) {
-            Ok(m) => m,
-            Err(_) => return Ok(vec![url.clone()]),
-        };
+        let bytes = client.get(&metadata_url).send().await?.error_for_status()?.bytes().await?;
+        let metadata: ArchiveMetadata = serde_json::from_slice(&bytes)
+            .map_err(|e| ResolverError::Parse(format!("archive.org metadata: {}", e)))?;
 
         let mut server_dirs: Vec<(String, String)> = Vec::new();
         let mut seen = HashSet::new();
+        let mut add = |s: &String, d: &String| {
+            if seen.insert((s.clone(), d.clone())) {
+                server_dirs.push((s.clone(), d.clone()));
+            }
+        };
 
         if let Some(ref d) = metadata.dir {
-            if let Some(ref primary) = metadata.server {
-                if seen.insert((primary.clone(), d.clone())) {
-                    server_dirs.push((primary.clone(), d.clone()));
-                }
-            }
-            if let Some(ref d1) = metadata.d1 {
-                if seen.insert((d1.clone(), d.clone())) {
-                    server_dirs.push((d1.clone(), d.clone()));
-                }
-            }
-            if let Some(ref d2) = metadata.d2 {
-                if seen.insert((d2.clone(), d.clone())) {
-                    server_dirs.push((d2.clone(), d.clone()));
-                }
-            }
-            if let Some(ref workable) = metadata.workable_servers {
-                for ws in workable {
-                    if seen.insert((ws.clone(), d.clone())) {
-                        server_dirs.push((ws.clone(), d.clone()));
-                    }
-                }
+            let named = [&metadata.server, &metadata.d1, &metadata.d2];
+            for s in named.into_iter().flatten().chain(metadata.workable_servers.iter().flatten()) {
+                add(s, d);
             }
         }
-
         if let Some(ref alt) = metadata.alternate_locations {
-            if let Some(ref servers) = alt.servers {
-                for entry in servers {
-                    if let (Some(s), Some(d)) = (&entry.server, &entry.dir) {
-                        if seen.insert((s.clone(), d.clone())) {
-                            server_dirs.push((s.clone(), d.clone()));
-                        }
-                    }
-                }
-            }
-            if let Some(ref workable) = alt.workable {
-                for entry in workable {
-                    if let (Some(s), Some(d)) = (&entry.server, &entry.dir) {
-                        if seen.insert((s.clone(), d.clone())) {
-                            server_dirs.push((s.clone(), d.clone()));
-                        }
-                    }
+            for entry in alt.servers.iter().flatten().chain(alt.workable.iter().flatten()) {
+                if let (Some(s), Some(d)) = (&entry.server, &entry.dir) {
+                    add(s, d);
                 }
             }
         }
 
         let mut mirror_urls = Vec::new();
         for (s, d) in server_dirs {
-            let clean_s = if s.contains('.') {
-                s
+            let host = if s.contains('.') { s } else { format!("{}.archive.org", s) };
+            let dir = d.trim_matches('/');
+            let mirror_str = if dir.is_empty() {
+                format!("https://{}/{}", host, file)
             } else {
-                format!("{}.archive.org", s)
-            };
-            let clean_d = d.trim_matches('/');
-            let clean_filename = raw_filename.trim_start_matches('/');
-            let mirror_str = if clean_d.is_empty() {
-                format!("https://{}/{}", clean_s, clean_filename)
-            } else {
-                format!("https://{}/{}/{}", clean_s, clean_d, clean_filename)
+                format!("https://{}/{}/{}", host, dir, file)
             };
             if let Ok(m_url) = Url::parse(&mirror_str) {
                 mirror_urls.push(m_url);
             }
         }
 
-        let clean_filename = raw_filename.trim_start_matches('/');
-        let lb_url_str = format!("https://archive.org/download/{}/{}", identifier, clean_filename);
-        if let Ok(lb_url) = Url::parse(&lb_url_str) {
-            if !mirror_urls.contains(&lb_url) {
-                mirror_urls.push(lb_url);
+        let lb_url_str = format!("https://archive.org/download/{}/{}", identifier, file);
+        for candidate in [Url::parse(&lb_url_str).ok(), Some(url.clone())].into_iter().flatten() {
+            if !mirror_urls.contains(&candidate) {
+                mirror_urls.push(candidate);
             }
-        }
-
-        if !mirror_urls.iter().any(|u| u == url) {
-            mirror_urls.push(url.clone());
         }
 
         Ok(mirror_urls)
@@ -176,44 +159,26 @@ pub struct GoogleDriveResolver;
 
 impl HostResolver for GoogleDriveResolver {
     fn can_handle(&self, url: &Url) -> bool {
-        url.host_str().map_or(false, |h| h.contains("drive.google.com"))
+        matches!(url.host_str(), Some("drive.google.com" | "drive.usercontent.google.com"))
     }
 
     async fn resolve(&self, client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
         let file_id = extract_google_drive_id(url)
             .ok_or_else(|| ResolverError::Parse("Could not extract Google Drive file ID".to_string()))?;
-
-        let initial_url = format!("https://drive.google.com/uc?export=download&id={}", file_id);
-        let resp = client.get(&initial_url).send().await?;
-
-        // If it directly redirected to the download stream
-        if resp.url().host_str().map_or(false, |h| h.ends_with("googleusercontent.com")) {
-            return Ok(vec![resp.url().clone()]);
-        }
-
-        let text = resp.text().await.unwrap_or_default();
-
-        // 1. Search for direct uc-download-link or download form action URL
-        if let Some(direct_url) = extract_google_drive_direct(&text) {
-            if let Ok(u) = Url::parse(&direct_url) {
-                return Ok(vec![u]);
-            }
-        }
-
-        // 2. Search for confirm token in HTML response
-        if let Some(confirm_token) = extract_confirm_token(&text) {
-            let confirmed_url = format!(
-                "https://drive.google.com/uc?export=download&confirm={}&id={}",
-                confirm_token, file_id
-            );
-            if let Ok(u) = Url::parse(&confirmed_url) {
-                return Ok(vec![u]);
-            }
-        }
-
-        // Fallback to standard export URL
-        Ok(vec![Url::parse(&initial_url).unwrap_or_else(|_| url.clone())])
+        let direct = google_drive_direct_url(&file_id)?;
+        ensure_file_response(client, &direct, "Google Drive").await?;
+        Ok(vec![direct])
     }
+}
+
+/// The usercontent download endpoint serves every file size directly; `confirm=t` skips the
+/// virus-scan interstitial that large files otherwise get.
+fn google_drive_direct_url(file_id: &str) -> Result<Url, ResolverError> {
+    Url::parse_with_params(
+        "https://drive.usercontent.google.com/download",
+        &[("id", file_id), ("export", "download"), ("confirm", "t")],
+    )
+    .map_err(|e| ResolverError::Parse(e.to_string()))
 }
 
 /// MediaFire Resolver (Bypasses landing page to extract direct CDN link)
@@ -221,23 +186,30 @@ pub struct MediaFireResolver;
 
 impl HostResolver for MediaFireResolver {
     fn can_handle(&self, url: &Url) -> bool {
-        url.host_str().map_or(false, |h| h.contains("mediafire.com"))
-            && (url.path().starts_with("/file/") || url.query().is_some())
+        let path = url.path();
+        matches!(url.host_str(), Some("mediafire.com" | "www.mediafire.com"))
+            && (path.starts_with("/file/")
+                || path.starts_with("/file_premium/")
+                || path.starts_with("/download/")
+                || url.query().is_some())
     }
 
     async fn resolve(&self, client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
         let resp = client.get(url.clone()).send().await?;
-        let text = resp.text().await.unwrap_or_default();
-
-        // Match direct download link from MediaFire landing page HTML
-        // E.g.: aria-label="Download file" href="https://downloadXXXX.mediafire.com/..."
-        if let Some(direct) = extract_mediafire_direct(&text) {
-            if let Ok(direct_url) = Url::parse(&direct) {
-                return Ok(vec![direct_url]);
-            }
+        if !resp.status().is_success() {
+            return Err(ResolverError::NotFound(format!("MediaFire returned HTTP {}", resp.status())));
         }
-
-        Ok(vec![url.clone()])
+        if !is_html(&resp) {
+            // The link already streams the file.
+            return Ok(vec![resp.url().clone()]);
+        }
+        let page_url = resp.url().clone();
+        let html = read_capped(resp, MAX_HTML_BYTES).await?;
+        extract_mediafire_direct(&html, &page_url).map(|u| vec![u]).ok_or_else(|| {
+            ResolverError::NotFound(
+                "MediaFire download link not found on the page (the file may be removed or the page layout changed)".to_string(),
+            )
+        })
     }
 }
 
@@ -246,7 +218,7 @@ pub struct DropboxResolver;
 
 impl HostResolver for DropboxResolver {
     fn can_handle(&self, url: &Url) -> bool {
-        url.host_str().map_or(false, |h| h.contains("dropbox.com"))
+        matches!(url.host_str(), Some("dropbox.com" | "www.dropbox.com"))
     }
 
     async fn resolve(&self, _client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
@@ -270,493 +242,74 @@ impl HostResolver for DropboxResolver {
     }
 }
 
-/// SourceForge Resolver (Extracts multi-mirror CDN endpoints)
+/// SourceForge Resolver (Generates direct mirror-CDN download URLs)
 pub struct SourceForgeResolver;
+
+/// Splits `/projects/{project}/files/{path}[/download]` into (project, percent-encoded file path).
+/// Folder listings (trailing slash) and the moving `latest` alias are left alone.
+fn sourceforge_file_path(url: &Url) -> Option<(String, String)> {
+    if url.path().ends_with('/') {
+        return None;
+    }
+    let segs: Vec<&str> = url.path_segments()?.collect();
+    let ["projects", project, "files", rest @ ..] = segs.as_slice() else { return None };
+    let rest = rest.strip_suffix(&["download"]).unwrap_or(rest);
+    if project.is_empty() || rest.is_empty() || rest == ["latest"] || rest.iter().any(|s| s.is_empty()) {
+        return None;
+    }
+    Some((project.to_string(), rest.join("/")))
+}
 
 impl HostResolver for SourceForgeResolver {
     fn can_handle(&self, url: &Url) -> bool {
-        url.host_str().map_or(false, |h| h.contains("sourceforge.net"))
-            && url.path().contains("/files/")
+        matches!(url.host_str(), Some("sourceforge.net" | "www.sourceforge.net")) && sourceforge_file_path(url).is_some()
     }
 
     async fn resolve(&self, _client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
-        let mut mirrors = Vec::new();
-        let base_url = url.as_str().trim_end_matches("/download");
-
-        // Generate direct mirrors across top global CDNs
-        let mirror_codes = ["autoselect", "fastly", "heanet", "jaist", "netcologne", "liquidtelecom"];
-        for code in mirror_codes {
-            let mirror_str = format!("{}/download?use_mirror={}", base_url, code);
-            if let Ok(u) = Url::parse(&mirror_str) {
-                mirrors.push(u);
-            }
-        }
-
-        if mirrors.is_empty() {
-            mirrors.push(url.clone());
-        }
-
-        Ok(mirrors)
+        let (project, file) = sourceforge_file_path(url)
+            .ok_or_else(|| ResolverError::Parse(format!("Not a SourceForge file URL: {}", url)))?;
+        // downloads.sourceforge.net always redirects straight to the mirror, never to the HTML
+        // "your download will start shortly" page that sourceforge.net serves to browsers.
+        let base = Url::parse(&format!("https://downloads.sourceforge.net/project/{}/{}", project, file))
+            .map_err(|e| ResolverError::Parse(e.to_string()))?;
+        Ok(SOURCEFORGE_MIRRORS
+            .iter()
+            .map(|code| {
+                let mut mirror = base.clone();
+                mirror.query_pairs_mut().append_pair("use_mirror", code);
+                mirror
+            })
+            .collect())
     }
 }
 
-/// Vimeo Resolver (Extracts unthrottled progressive MP4 and HLS streams via player config API)
-pub struct VimeoResolver;
-
-impl HostResolver for VimeoResolver {
-    fn can_handle(&self, url: &Url) -> bool {
-        url.host_str().map_or(false, |h| h.contains("vimeo.com"))
-    }
-
-    async fn resolve(&self, client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
-        let video_id = extract_vimeo_id(url);
-        if let Some(id) = video_id {
-            let config_url = format!("https://player.vimeo.com/video/{}/config", id);
-            if let Ok(resp) = client.get(&config_url).send().await {
-                if resp.status().is_success() {
-                    if let Ok(bytes) = resp.bytes().await {
-                        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                            let mut urls = Vec::new();
-
-                            // 1. Check progressive MP4 files (highest quality first)
-                            if let Some(files) = json.pointer("/request/files/progressive").and_then(|v| v.as_array()) {
-                                let mut progressive: Vec<(u64, String)> = files.iter().filter_map(|f| {
-                                    let u = f.get("url")?.as_str()?;
-                                    let height = f.get("height").and_then(|h| h.as_u64()).unwrap_or(0);
-                                    Some((height, u.to_string()))
-                                }).collect();
-
-                                progressive.sort_by(|a, b| b.0.cmp(&a.0));
-                                for (_, u_str) in progressive {
-                                    if let Ok(u) = Url::parse(&u_str) {
-                                        urls.push(u);
-                                    }
-                                }
-                            }
-
-                            // 2. Fallback to HLS master playlist
-                            if urls.is_empty() {
-                                if let Some(cdns) = json.pointer("/request/files/hls/cdns").and_then(|v| v.as_object()) {
-                                    for (_cdn, cdn_obj) in cdns {
-                                        if let Some(hls_url_str) = cdn_obj.get("url").and_then(|u| u.as_str()) {
-                                            if let Ok(u) = Url::parse(hls_url_str) {
-                                                urls.push(u);
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            if !urls.is_empty() {
-                                return Ok(urls);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(vec![url.clone()])
-    }
-}
-
-/// Reddit Video Resolver (Extracts combined video+audio HLS streams and fallback DASH URLs)
-pub struct RedditResolver;
-
-impl HostResolver for RedditResolver {
-    fn can_handle(&self, url: &Url) -> bool {
-        url.host_str().map_or(false, |h| h.contains("reddit.com") || h.contains("redd.it"))
-    }
-
-    async fn resolve(&self, client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
-        // Case 1: Direct v.redd.it/:id
-        if url.host_str().map_or(false, |h| h.contains("v.redd.it")) {
-            let id = url.path().trim_matches('/');
-            if !id.is_empty() && !id.contains('/') {
-                // v.redd.it provides an HLSPlaylist.m3u8 containing synchronized video + audio
-                let hls_url = format!("https://v.redd.it/{}/HLSPlaylist.m3u8", id);
-                if let Ok(u) = Url::parse(&hls_url) {
-                    return Ok(vec![u]);
-                }
-            }
-        }
-
-        // Case 2: reddit.com/r/.../comments/:id/...
-        if let Some(comment_id) = extract_reddit_id(url) {
-            let json_url = format!("https://www.reddit.com/comments/{}.json", comment_id);
-            if let Ok(resp) = client.get(&json_url).send().await {
-                if resp.status().is_success() {
-                    if let Ok(bytes) = resp.bytes().await {
-                        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                            // Traverse post data to find reddit_video
-                            if let Some(hls_url_str) = find_json_string(&json, "hls_url") {
-                                if let Ok(u) = Url::parse(&hls_url_str) {
-                                    return Ok(vec![u]);
-                                }
-                            }
-                            if let Some(fb_url_str) = find_json_string(&json, "fallback_url") {
-                                if let Ok(u) = Url::parse(&fb_url_str) {
-                                    return Ok(vec![u]);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(vec![url.clone()])
-    }
-}
-
-/// Twitter / X Video Resolver (Extracts highest bitrate MP4 streams via syndication API)
-pub struct TwitterResolver;
-
-impl HostResolver for TwitterResolver {
-    fn can_handle(&self, url: &Url) -> bool {
-        url.host_str().map_or(false, |h| h.contains("twitter.com") || h.contains("x.com"))
-            && url.path().contains("/status/")
-    }
-
-    async fn resolve(&self, client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
-        let status_id = extract_status_id(url);
-        if let Some(id) = status_id {
-            let syndication_url = format!("https://cdn.syndication.twimg.com/tweet-result?id={}&token=x", id);
-            if let Ok(resp) = client.get(&syndication_url).send().await {
-                if resp.status().is_success() {
-                    if let Ok(bytes) = resp.bytes().await {
-                        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                            if let Some(variants) = json.pointer("/video/variants").and_then(|v| v.as_array()) {
-                                let mut mp4s: Vec<(u64, String)> = variants.iter().filter_map(|v| {
-                                    let content_type = v.get("type")?.as_str()?;
-                                    if content_type == "video/mp4" {
-                                        let u = v.get("src")?.as_str()?;
-                                        let bitrate = v.get("bitrate").and_then(|b| b.as_u64()).unwrap_or(0);
-                                        Some((bitrate, u.to_string()))
-                                    } else {
-                                        None
-                                    }
-                                }).collect();
-
-                                mp4s.sort_by(|a, b| b.0.cmp(&a.0));
-                                let mut urls = Vec::new();
-                                for (_, u_str) in mp4s {
-                                    if let Ok(u) = Url::parse(&u_str) {
-                                        urls.push(u);
-                                    }
-                                }
-                                if !urls.is_empty() {
-                                    return Ok(urls);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(vec![url.clone()])
-    }
-}
-
-/// TikTok Video Resolver (Extracts direct play and download CDN streams)
-pub struct TikTokResolver;
-
-impl HostResolver for TikTokResolver {
-    fn can_handle(&self, url: &Url) -> bool {
-        url.host_str().map_or(false, |h| h.contains("tiktok.com"))
-    }
-
-    async fn resolve(&self, client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
-        if let Ok(resp) = client.get(url.clone()).send().await {
-            if resp.status().is_success() {
-                let text = resp.text().await.unwrap_or_default();
-                // Search for playAddr or downloadAddr in HTML / JSON rehydration state
-                if let Some(play_addr) = extract_tiktok_addr(&text, "playAddr")
-                    .or_else(|| extract_tiktok_addr(&text, "downloadAddr"))
-                {
-                    // Clean escaped unicode / backslashes in JSON (e.g. \u0026 -> &)
-                    let cleaned = play_addr.replace("\\u0026", "&").replace("\\/", "/");
-                    if let Ok(u) = Url::parse(&cleaned) {
-                        return Ok(vec![u]);
-                    }
-                }
-            }
-        }
-
-        Ok(vec![url.clone()])
-    }
-}
-
-/// Facebook Video Resolver (Extracts direct playable HD and SD progressive streams)
-pub struct FacebookResolver;
-
-impl HostResolver for FacebookResolver {
-    fn can_handle(&self, url: &Url) -> bool {
-        url.host_str().map_or(false, |h| h.contains("facebook.com") || h.contains("fb.watch"))
-    }
-
-    async fn resolve(&self, client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
-        if let Ok(resp) = client.get(url.clone()).send().await {
-            if resp.status().is_success() {
-                let text = resp.text().await.unwrap_or_default();
-                let urls = extract_facebook_video_urls(&text);
-                if !urls.is_empty() {
-                    return Ok(urls);
-                }
-            }
-        }
-
-        Ok(vec![url.clone()])
-    }
-}
-
-/// Dailymotion Resolver (Extracts highest resolution MP4 or HLS master playlist from metadata API)
-pub struct DailymotionResolver;
-
-impl HostResolver for DailymotionResolver {
-    fn can_handle(&self, url: &Url) -> bool {
-        url.host_str().map_or(false, |h| h.contains("dailymotion.com") || h.contains("dai.ly"))
-    }
-
-    async fn resolve(&self, client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
-        let video_id = extract_dailymotion_id(url);
-        if let Some(id) = video_id {
-            let meta_url = format!("https://www.dailymotion.com/player/metadata/video/{}", id);
-            if let Ok(resp) = client.get(&meta_url).send().await {
-                if resp.status().is_success() {
-                    if let Ok(bytes) = resp.bytes().await {
-                        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                            let mut urls = Vec::new();
-
-                            if let Some(qualities) = json.get("qualities").and_then(|q| q.as_object()) {
-                                let mut quality_keys: Vec<&String> = qualities.keys().collect();
-                                quality_keys.sort_by(|a, b| {
-                                    let a_num = a.parse::<u64>().unwrap_or(0);
-                                    let b_num = b.parse::<u64>().unwrap_or(0);
-                                    b_num.cmp(&a_num)
-                                });
-
-                                for key in quality_keys {
-                                    if let Some(arr) = qualities.get(key).and_then(|v| v.as_array()) {
-                                        for item in arr {
-                                            if let Some(u_str) = item.get("url").and_then(|u| u.as_str()) {
-                                                if let Ok(u) = Url::parse(u_str) {
-                                                    if !urls.contains(&u) {
-                                                        urls.push(u);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            if !urls.is_empty() {
-                                return Ok(urls);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(vec![url.clone()])
-    }
-}
-
-/// Instagram Video Resolver (Extracts progressive MP4 streams from video versions metadata)
-pub struct InstagramResolver;
-
-impl HostResolver for InstagramResolver {
-    fn can_handle(&self, url: &Url) -> bool {
-        url.host_str().map_or(false, |h| h.contains("instagram.com"))
-    }
-
-    async fn resolve(&self, client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
-        if let Ok(resp) = client.get(url.clone()).send().await {
-            if resp.status().is_success() {
-                let text = resp.text().await.unwrap_or_default();
-                let urls = extract_instagram_video_urls(&text);
-                if !urls.is_empty() {
-                    return Ok(urls);
-                }
-            }
-        }
-
-        Ok(vec![url.clone()])
-    }
-}
-
-/// YouTube Video Resolver (Extracts unthrottled streaming URLs via Innertube player API)
-pub struct YouTubeResolver;
-
-impl HostResolver for YouTubeResolver {
-    fn can_handle(&self, url: &Url) -> bool {
-        let host = url.host_str().unwrap_or("");
-        (host.ends_with("youtube.com") || host == "youtu.be" || host.ends_with("youtube-nocookie.com"))
-            && !is_blob_or_uuid_url(url)
-    }
-
-    async fn resolve(&self, client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
-        let video_id = extract_youtube_id(url)
-            .ok_or_else(|| ResolverError::NotFound("Could not extract YouTube video ID".to_string()))?;
-
-        let payload = serde_json::json!({
-            "videoId": video_id,
-            "context": {
-                "client": {
-                    "clientName": "ANDROID_VR",
-                    "clientVersion": "1.60.19",
-                    "deviceModel": "Quest 3",
-                    "osName": "Android",
-                    "osVersion": "12"
-                }
-            }
-        });
-
-        let resp = client.post("https://www.youtube.com/youtubei/v1/player")
-            .header("Content-Type", "application/json")
-            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-            .body(payload.to_string())
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            return Err(ResolverError::NotFound(format!("YouTube API returned HTTP {}", resp.status())));
-        }
-
-        let text = resp.text().await?;
-        let json: serde_json::Value = serde_json::from_str(&text)
-            .map_err(|e| ResolverError::Parse(format!("Failed to parse YouTube player JSON: {}", e)))?;
-
-        // Check playabilityStatus
-        if let Some(status) = json.pointer("/playabilityStatus/status").and_then(|s| s.as_str()) {
-            if status != "OK" {
-                let reason = json.pointer("/playabilityStatus/reason")
-                    .and_then(|r| r.as_str())
-                    .unwrap_or("Video is unavailable or private");
-                return Err(ResolverError::NotFound(format!("YouTube error ({}): {}", status, reason)));
-            }
-        }
-
-        let mut direct_urls = Vec::new();
-
-        // 1. Progressive formats (contains both video and audio in single MP4)
-        if let Some(formats) = json.pointer("/streamingData/formats").and_then(|f| f.as_array()) {
-            let mut progressive: Vec<(u64, String)> = formats.iter().filter_map(|fmt| {
-                let u = fmt.get("url")?.as_str()?;
-                let height = fmt.get("height").and_then(|h| h.as_u64()).unwrap_or(0);
-                let bitrate = fmt.get("bitrate").and_then(|b| b.as_u64()).unwrap_or(0);
-                let score = height * 100_000_000 + bitrate;
-                Some((score, u.to_string()))
-            }).collect();
-
-            progressive.sort_by(|a, b| b.0.cmp(&a.0));
-            for (_, u_str) in progressive {
-                if let Ok(u) = Url::parse(&u_str) {
-                    if !direct_urls.contains(&u) {
-                        direct_urls.push(u);
-                    }
-                }
-            }
-        }
-
-        // 2. Adaptive formats (high-res video-only or audio-only) as secondary mirrors
-        if direct_urls.is_empty() {
-            if let Some(adaptive) = json.pointer("/streamingData/adaptiveFormats").and_then(|a| a.as_array()) {
-                let mut sorted: Vec<(u64, String)> = adaptive.iter().filter_map(|fmt| {
-                    let u = fmt.get("url")?.as_str()?;
-                    let bitrate = fmt.get("bitrate").and_then(|b| b.as_u64()).unwrap_or(0);
-                    Some((bitrate, u.to_string()))
-                }).collect();
-
-                sorted.sort_by(|a, b| b.0.cmp(&a.0));
-                for (_, u_str) in sorted {
-                    if let Ok(u) = Url::parse(&u_str) {
-                        if !direct_urls.contains(&u) {
-                            direct_urls.push(u);
-                        }
-                    }
-                }
-            }
-        }
-
-        if direct_urls.is_empty() {
-            return Err(ResolverError::NotFound("No direct video stream URLs found in YouTube response".to_string()));
-        }
-
-        Ok(direct_urls)
-    }
-}
-
-
-/// HTML5 Video Extractor (Extracts direct media streams from webpage <video>, <source>, and OpenGraph tags)
+/// HTML5 Video Extractor (Finds the video a web page plays via <video>, <source>, OpenGraph or player JSON)
 pub struct HtmlVideoResolver;
 
 impl HostResolver for HtmlVideoResolver {
+    /// Only URLs that can be web pages: no extension on the last path segment, or a page extension.
     fn can_handle(&self, url: &Url) -> bool {
-        let path = url.path().to_ascii_lowercase();
-        let is_direct_file = path.ends_with(".zip")
-            || path.ends_with(".iso")
-            || path.ends_with(".exe")
-            || path.ends_with(".tar")
-            || path.ends_with(".gz")
-            || path.ends_with(".7z")
-            || path.ends_with(".bin")
-            || path.ends_with(".mp4")
-            || path.ends_with(".mkv")
-            || path.ends_with(".webm")
-            || path.ends_with(".avi")
-            || path.ends_with(".mov")
-            || path.ends_with(".flv")
-            || path.ends_with(".wmv")
-            || path.ends_with(".mp3")
-            || path.ends_with(".flac")
-            || path.ends_with(".wav")
-            || path.ends_with(".aac")
-            || path.ends_with(".ogg")
-            || path.ends_with(".rar")
-            || path.ends_with(".bz2")
-            || path.ends_with(".xz")
-            || path.ends_with(".pdf")
-            || path.ends_with(".dmg")
-            || path.ends_with(".pkg")
-            || path.ends_with(".msi")
-            || path.ends_with(".apk");
-
-        !is_direct_file && (url.scheme() == "http" || url.scheme() == "https")
+        matches!(url.scheme(), "http" | "https")
+            && match last_segment_extension(url) {
+                None => true,
+                Some(ext) => PAGE_EXTENSIONS.contains(&ext.as_str()),
+            }
     }
 
     async fn resolve(&self, client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
-        let resp = match client.get(url.clone()).header(reqwest::header::RANGE, "bytes=0-102400").send().await {
-            Ok(r) => r,
-            Err(_) => return Ok(vec![url.clone()]),
-        };
-
-        let is_html = resp.headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .map_or(false, |ct| ct.contains("text/html"));
-
-        if !is_html {
+        let resp = client.get(url.clone()).send().await?;
+        if !resp.status().is_success() || !is_html(&resp) {
             return Ok(vec![url.clone()]);
         }
-
-        let html = resp.text().await.unwrap_or_default();
-        let sources = extract_html_video_sources(&html, url);
-
-        if !sources.is_empty() {
-            tracing::info!(
-                "HtmlVideoResolver: discovered {} video stream source(s) in {}",
-                sources.len(),
-                url
-            );
-            return Ok(sources);
+        let page_url = resp.url().clone();
+        let html = read_capped(resp, MAX_HTML_BYTES).await?;
+        match extract_html_video_source(&html, &page_url) {
+            Some(video) => {
+                tracing::info!("HtmlVideoResolver: {} plays {}", url, video);
+                Ok(vec![video])
+            }
+            None => Ok(vec![url.clone()]),
         }
-
-        Ok(vec![url.clone()])
     }
 }
 
@@ -767,126 +320,40 @@ impl SmartResolver {
     /// Resolves `url` into download sources that are byte-identical copies of one file.
     /// `Ok` is never empty. `Err` means a resolver recognized the host but could not extract a direct link.
     pub async fn resolve(client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
-        Ok(Self::resolve_mirrors(client, url).await)
+        // The landing pages of these hosts are never the file, so a failed extraction is an error.
+        if GoogleDriveResolver.can_handle(url) {
+            return with_timeout(GoogleDriveResolver.resolve(client, url)).await;
+        }
+        if MediaFireResolver.can_handle(url) {
+            return with_timeout(MediaFireResolver.resolve(client, url)).await;
+        }
+        if DropboxResolver.can_handle(url) {
+            return DropboxResolver.resolve(client, url).await;
+        }
+        if SourceForgeResolver.can_handle(url) {
+            return SourceForgeResolver.resolve(client, url).await;
+        }
+
+        // These only add mirrors or find an embedded stream; the input URL remains a valid source.
+        let found = if ArchiveOrgResolver.can_handle(url) {
+            with_timeout(ArchiveOrgResolver.resolve(client, url)).await
+        } else if HtmlVideoResolver.can_handle(url) {
+            with_timeout(HtmlVideoResolver.resolve(client, url)).await
+        } else {
+            return Ok(vec![url.clone()]);
+        };
+        Ok(found.unwrap_or_else(|e| {
+            tracing::warn!("Link resolution for {} failed, downloading it as given: {}", url, e);
+            vec![url.clone()]
+        }))
     }
 
-    /// Resolves an incoming URL into direct, multi-mirror streaming URLs.
+    /// Infallible form of [`SmartResolver::resolve`]: falls back to `url` itself on error.
     pub async fn resolve_mirrors(client: &Client, url: &Url) -> Vec<Url> {
-        if ArchiveOrgResolver.can_handle(url) {
-            if let Ok(mirrors) = ArchiveOrgResolver.resolve(client, url).await {
-                if !mirrors.is_empty() {
-                    return mirrors;
-                }
-            }
-        }
-
-        if GoogleDriveResolver.can_handle(url) {
-            if let Ok(mirrors) = GoogleDriveResolver.resolve(client, url).await {
-                if !mirrors.is_empty() {
-                    return mirrors;
-                }
-            }
-        }
-
-        if MediaFireResolver.can_handle(url) {
-            if let Ok(mirrors) = MediaFireResolver.resolve(client, url).await {
-                if !mirrors.is_empty() {
-                    return mirrors;
-                }
-            }
-        }
-
-        if DropboxResolver.can_handle(url) {
-            if let Ok(mirrors) = DropboxResolver.resolve(client, url).await {
-                if !mirrors.is_empty() {
-                    return mirrors;
-                }
-            }
-        }
-
-        if SourceForgeResolver.can_handle(url) {
-            if let Ok(mirrors) = SourceForgeResolver.resolve(client, url).await {
-                if !mirrors.is_empty() {
-                    return mirrors;
-                }
-            }
-        }
-
-        if VimeoResolver.can_handle(url) {
-            if let Ok(mirrors) = VimeoResolver.resolve(client, url).await {
-                if mirrors != vec![url.clone()] && !mirrors.is_empty() {
-                    return mirrors;
-                }
-            }
-        }
-
-        if RedditResolver.can_handle(url) {
-            if let Ok(mirrors) = RedditResolver.resolve(client, url).await {
-                if mirrors != vec![url.clone()] && !mirrors.is_empty() {
-                    return mirrors;
-                }
-            }
-        }
-
-        if TwitterResolver.can_handle(url) {
-            if let Ok(mirrors) = TwitterResolver.resolve(client, url).await {
-                if mirrors != vec![url.clone()] && !mirrors.is_empty() {
-                    return mirrors;
-                }
-            }
-        }
-
-        if TikTokResolver.can_handle(url) {
-            if let Ok(mirrors) = TikTokResolver.resolve(client, url).await {
-                if mirrors != vec![url.clone()] && !mirrors.is_empty() {
-                    return mirrors;
-                }
-            }
-        }
-
-        if FacebookResolver.can_handle(url) {
-            if let Ok(mirrors) = FacebookResolver.resolve(client, url).await {
-                if mirrors != vec![url.clone()] && !mirrors.is_empty() {
-                    return mirrors;
-                }
-            }
-        }
-
-        if DailymotionResolver.can_handle(url) {
-            if let Ok(mirrors) = DailymotionResolver.resolve(client, url).await {
-                if mirrors != vec![url.clone()] && !mirrors.is_empty() {
-                    return mirrors;
-                }
-            }
-        }
-
-        if InstagramResolver.can_handle(url) {
-            if let Ok(mirrors) = InstagramResolver.resolve(client, url).await {
-                if mirrors != vec![url.clone()] && !mirrors.is_empty() {
-                    return mirrors;
-                }
-            }
-        }
-
-        if YouTubeResolver.can_handle(url) {
-            if let Ok(mirrors) = YouTubeResolver.resolve(client, url).await {
-                if mirrors != vec![url.clone()] && !mirrors.is_empty() {
-                    return mirrors;
-                }
-            }
-        }
-
-        // Check for embedded HTML video sources on webpages
-        if HtmlVideoResolver.can_handle(url) {
-            if let Ok(video_sources) = HtmlVideoResolver.resolve(client, url).await {
-                if video_sources != vec![url.clone()] && !video_sources.is_empty() {
-                    return video_sources;
-                }
-            }
-        }
-
-        // Default fallback: single mirror
-        vec![url.clone()]
+        Self::resolve(client, url).await.unwrap_or_else(|e| {
+            tracing::warn!("Link resolution for {} failed: {}", url, e);
+            vec![url.clone()]
+        })
     }
 
     /// Generates browser-grade anti-QoS headers to prevent CDNs from throttling traffic.
@@ -910,225 +377,107 @@ impl SmartResolver {
     }
 }
 
-pub fn extract_youtube_id(url: &Url) -> Option<String> {
-    let host = url.host_str().unwrap_or("");
-    if host.ends_with("youtu.be") {
-        let segs: Vec<&str> = url.path_segments()?.filter(|s| !s.is_empty()).collect();
-        return segs.first().map(|s| s.to_string());
-    }
-
-    if host.ends_with("youtube.com") || host.ends_with("youtube-nocookie.com") {
-        // 1. Query parameter ?v=...
-        for (k, v) in url.query_pairs() {
-            if k == "v" && !v.is_empty() {
-                return Some(v.to_string());
-            }
-        }
-
-        // 2. Path prefix /shorts/, /embed/, /v/, /live/
-        let segs: Vec<&str> = url.path_segments()?.filter(|s| !s.is_empty()).collect();
-        if let Some(pos) = segs.iter().position(|&s| s == "shorts" || s == "embed" || s == "v" || s == "live") {
-            if let Some(&id) = segs.get(pos + 1) {
-                return Some(id.to_string());
-            }
-        }
-    }
-
-    None
-}
-
-pub fn is_blob_or_uuid_url(url: &Url) -> bool {
-    let s = url.as_str();
-    if s.starts_with("blob:") {
-        return true;
-    }
-    let path = url.path().trim_matches('/');
-    if path.len() == 36 && path.matches('-').count() == 4 {
-        let is_hex_dash = path.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
-        if is_hex_dash {
-            return true;
-        }
-    }
-    false
+async fn with_timeout(
+    fut: impl Future<Output = Result<Vec<Url>, ResolverError>>,
+) -> Result<Vec<Url>, ResolverError> {
+    tokio::time::timeout(RESOLVE_TIMEOUT, fut)
+        .await
+        .unwrap_or(Err(ResolverError::Timeout(RESOLVE_TIMEOUT.as_secs())))
 }
 
 /// Parses a Netscape / Mozilla cookies.txt file and loads cookies into a reqwest CookieJar.
 pub fn parse_netscape_cookies(content: &str, jar: &reqwest::cookie::Jar) {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    // `lines()` already strips "\n" / "\r\n". Tabs are not trimmed: an empty value leaves a trailing tab.
     for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let (line, _http_only) = if let Some(stripped) = line.strip_prefix("#HttpOnly_") {
-            (stripped, true)
-        } else if line.starts_with('#') {
-            continue;
-        } else {
-            (line, false)
+        let (line, http_only) = match line.strip_prefix("#HttpOnly_") {
+            Some(rest) => (rest, true),
+            None if line.trim().is_empty() || line.trim_start().starts_with('#') => continue,
+            None => (line, false),
         };
 
-        let parts: Vec<&str> = line.split('\t').collect();
-        if parts.len() < 7 {
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() < 6 {
+            continue;
+        }
+        let domain = fields[0].trim();
+        let include_subdomains = fields[1].eq_ignore_ascii_case("true");
+        let path = fields[2];
+        let secure = fields[3].eq_ignore_ascii_case("true");
+        let expires = fields[4].trim().parse::<u64>().unwrap_or(0);
+        let name = fields[5];
+        let value = fields.get(6).copied().unwrap_or("");
+
+        // Expiry 0 marks a session cookie.
+        if name.is_empty() || (expires != 0 && expires <= now) {
             continue;
         }
 
-        let domain = parts[0];
-        let path = parts[2];
-        let secure = parts[3].eq_ignore_ascii_case("true");
-        let name = parts[5];
-        let value = parts[6];
-
+        let host = domain.trim_start_matches('.');
         let scheme = if secure { "https" } else { "http" };
-        let clean_domain = domain.trim_start_matches('.');
-        let url_str = format!("{}://{}{}", scheme, clean_domain, path);
+        let Ok(cookie_url) = Url::parse(&format!("{}://{}{}", scheme, host, path)) else { continue };
 
-        if let Ok(cookie_url) = Url::parse(&url_str) {
-            let cookie_str = format!("{}={}; Domain={}; Path={}", name, value, domain, path);
-            jar.add_cookie_str(&cookie_str, &cookie_url);
+        let mut cookie = format!("{}={}; Path={}", name, value, path);
+        // Without a Domain attribute the jar keeps the cookie host-only.
+        if include_subdomains {
+            cookie.push_str("; Domain=");
+            cookie.push_str(host);
         }
+        if secure {
+            cookie.push_str("; Secure");
+        }
+        if http_only {
+            cookie.push_str("; HttpOnly");
+        }
+        jar.add_cookie_str(&cookie, &cookie_url);
     }
 }
 
-fn extract_vimeo_id(url: &Url) -> Option<String> {
-    for seg in url.path_segments()? {
-        if !seg.is_empty() && seg.chars().all(|c| c.is_ascii_digit()) {
-            return Some(seg.to_string());
-        }
-    }
-    None
+fn is_html(resp: &Response) -> bool {
+    resp.headers()
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| {
+            let ct = ct.to_ascii_lowercase();
+            ct.contains("text/html") || ct.contains("application/xhtml")
+        })
 }
 
-fn extract_reddit_id(url: &Url) -> Option<String> {
-    let segments: Vec<&str> = url.path_segments()?.collect();
-    if let Some(pos) = segments.iter().position(|&s| s == "comments") {
-        if let Some(&id) = segments.get(pos + 1) {
-            return Some(id.to_string());
-        }
+/// Reads at most `cap` bytes of the body; the rest is never downloaded.
+async fn read_capped(mut resp: Response, cap: usize) -> Result<String, ResolverError> {
+    let mut body = Vec::new();
+    while body.len() < cap {
+        let Some(chunk) = resp.chunk().await? else { break };
+        body.extend_from_slice(&chunk[..chunk.len().min(cap - body.len())]);
     }
-    None
+    Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
-fn extract_status_id(url: &Url) -> Option<String> {
-    let segments: Vec<&str> = url.path_segments()?.collect();
-    if let Some(pos) = segments.iter().position(|&s| s == "status") {
-        if let Some(&id) = segments.get(pos + 1) {
-            let num: String = id.chars().take_while(|c| c.is_ascii_digit()).collect();
-            if !num.is_empty() {
-                return Some(num);
-            }
-        }
+/// Fails unless `url` answers with a successful, non-HTML response. The body is never read.
+async fn ensure_file_response(client: &Client, url: &Url, host: &str) -> Result<(), ResolverError> {
+    let resp = client.get(url.clone()).send().await?;
+    if !resp.status().is_success() {
+        return Err(ResolverError::NotFound(format!("{} returned HTTP {}", host, resp.status())));
     }
-    None
+    if is_html(&resp) {
+        return Err(ResolverError::NotFound(format!(
+            "{} served a web page instead of the file (it may be private, deleted, or over its download quota)",
+            host
+        )));
+    }
+    Ok(())
 }
 
-fn find_json_string(value: &serde_json::Value, key: &str) -> Option<String> {
-    match value {
-        serde_json::Value::Object(map) => {
-            if let Some(val) = map.get(key).and_then(|v| v.as_str()) {
-                return Some(val.to_string());
-            }
-            for v in map.values() {
-                if let Some(res) = find_json_string(v, key) {
-                    return Some(res);
-                }
-            }
-        }
-        serde_json::Value::Array(arr) => {
-            for v in arr {
-                if let Some(res) = find_json_string(v, key) {
-                    return Some(res);
-                }
-            }
-        }
-        _ => {}
-    }
-    None
+/// Lower-cased extension of the last path segment, if it has one.
+fn last_segment_extension(url: &Url) -> Option<String> {
+    let last = url.path_segments()?.next_back()?;
+    let (_, ext) = last.rsplit_once('.')?;
+    Some(ext.to_ascii_lowercase())
 }
 
-fn extract_tiktok_addr(html: &str, key: &str) -> Option<String> {
-    let pattern = format!("\"{}\":\"", key);
-    if let Some(idx) = html.find(&pattern) {
-        let sub = &html[idx + pattern.len()..];
-        if let Some(end) = sub.find('"') {
-            return Some(sub[..end].to_string());
-        }
-    }
-    None
-}
-
-fn extract_dailymotion_id(url: &Url) -> Option<String> {
-    let host = url.host_str()?;
-    let segments: Vec<&str> = url.path_segments()?.filter(|s| !s.is_empty()).collect();
-    if host.contains("dai.ly") {
-        return segments.first().map(|s| s.to_string());
-    }
-    if let Some(pos) = segments.iter().position(|&s| s == "video") {
-        if let Some(&id) = segments.get(pos + 1) {
-            let clean_id = id.split('_').next().unwrap_or(id);
-            return Some(clean_id.to_string());
-        }
-    }
-    None
-}
-
-fn extract_facebook_video_urls(html: &str) -> Vec<Url> {
-    let mut urls = Vec::new();
-    let keys = [
-        "playable_url_quality_hd",
-        "browser_native_hd_url",
-        "playable_url",
-        "browser_native_sd_url",
-    ];
-    for key in keys {
-        let pattern = format!("\"{}\":\"", key);
-        let mut search_idx = 0;
-        while let Some(idx) = html[search_idx..].find(&pattern) {
-            let actual_idx = search_idx + idx + pattern.len();
-            let sub = &html[actual_idx..];
-            if let Some(end) = sub.find('"') {
-                let raw_url = &sub[..end];
-                let cleaned = raw_url
-                    .replace("\\u0026", "&")
-                    .replace("\\/", "/")
-                    .replace("&amp;", "&");
-                if let Ok(u) = Url::parse(&cleaned) {
-                    if !urls.contains(&u) {
-                        urls.push(u);
-                    }
-                }
-                search_idx = actual_idx + end;
-            } else {
-                break;
-            }
-        }
-    }
-    urls
-}
-
-fn extract_instagram_video_urls(html: &str) -> Vec<Url> {
-    let mut urls = Vec::new();
-    let pattern = "\"video_url\":\"";
-    let mut search_idx = 0;
-    while let Some(idx) = html[search_idx..].find(pattern) {
-        let actual_idx = search_idx + idx + pattern.len();
-        let sub = &html[actual_idx..];
-        if let Some(end) = sub.find('"') {
-            let raw_url = &sub[..end];
-            let cleaned = raw_url
-                .replace("\\u0026", "&")
-                .replace("\\/", "/")
-                .replace("&amp;", "&");
-            if let Ok(u) = Url::parse(&cleaned) {
-                if !urls.contains(&u) {
-                    urls.push(u);
-                }
-            }
-            search_idx = actual_idx + end;
-        } else {
-            break;
-        }
-    }
-    urls
+fn is_media_url(url: &Url) -> bool {
+    matches!(url.scheme(), "http" | "https")
+        && last_segment_extension(url).is_some_and(|ext| MEDIA_EXTENSIONS.contains(&ext.as_str()))
 }
 
 fn extract_google_drive_id(url: &Url) -> Option<String> {
@@ -1152,35 +501,56 @@ fn extract_google_drive_id(url: &Url) -> Option<String> {
     None
 }
 
-fn extract_google_drive_direct(html: &str) -> Option<String> {
-    // Check for <a id="uc-download-link" href="...">
-    let link_needle = "id=\"uc-download-link\"";
-    if let Some(idx) = html.find(link_needle) {
-        let tag_start = html[..idx].rfind('<').unwrap_or(idx);
-        let tag_end = html[idx..].find('>').map(|e| idx + e).unwrap_or(html.len());
-        let tag = &html[tag_start..tag_end];
-        if let Some(href) = extract_attribute_value(tag, "href") {
-            let cleaned = href.replace("&amp;", "&");
-            if cleaned.starts_with("http") {
-                return Some(cleaned);
-            } else if cleaned.starts_with('/') {
-                return Some(format!("https://drive.google.com{}", cleaned));
+/// Finds the download button's link: a plain `href` to a downloadNNNN.mediafire.com host, or the
+/// base64 `data-scrambled-url` newer pages use instead.
+fn extract_mediafire_direct(html: &str, page_url: &Url) -> Option<Url> {
+    let is_download_host = |u: &Url| {
+        matches!(u.scheme(), "http" | "https")
+            && u.host_str().is_some_and(|h| h.starts_with("download") && h.ends_with(".mediafire.com"))
+    };
+    let lower = html.to_ascii_lowercase();
+    start_tags(html, &lower, "a").into_iter().find_map(|tag| {
+        let href = attr_value(tag, "href").and_then(|h| page_url.join(&h).ok()).filter(is_download_host);
+        href.or_else(|| {
+            let scrambled = attr_value(tag, "data-scrambled-url")?;
+            let decoded = base64::engine::general_purpose::STANDARD.decode(scrambled.trim()).ok()?;
+            Url::parse(std::str::from_utf8(&decoded).ok()?).ok().filter(is_download_host)
+        })
+    })
+}
+
+/// Picks the one video a page plays. Candidates are often different encodes of the same video,
+/// which are not byte-identical, so only the first media URL found is returned:
+/// the page's own <video>/<source> tags, then OpenGraph/Twitter metadata, then player JSON.
+fn extract_html_video_source(html: &str, base_url: &Url) -> Option<Url> {
+    let lower = html.to_ascii_lowercase();
+    let media = |raw: String| base_url.join(&raw).ok().filter(is_media_url);
+
+    for name in ["video", "source"] {
+        for tag in start_tags(html, &lower, name) {
+            if let Some(url) = attr_value(tag, "src").and_then(media) {
+                return Some(url);
             }
         }
     }
 
-    // Check for <form id="download-form" action="...">
-    let form_needle = "id=\"download-form\"";
-    if let Some(idx) = html.find(form_needle) {
-        let tag_start = html[..idx].rfind('<').unwrap_or(idx);
-        let tag_end = html[idx..].find('>').map(|e| idx + e).unwrap_or(html.len());
-        let tag = &html[tag_start..tag_end];
-        if let Some(action) = extract_attribute_value(tag, "action") {
-            let cleaned = action.replace("&amp;", "&");
-            if cleaned.starts_with("http") {
-                return Some(cleaned);
-            } else if cleaned.starts_with('/') {
-                return Some(format!("https://drive.google.com{}", cleaned));
+    for tag in start_tags(html, &lower, "meta") {
+        let key = attr_value(tag, "property").or_else(|| attr_value(tag, "name"));
+        if !key.is_some_and(|k| META_VIDEO_KEYS.contains(&k.to_ascii_lowercase().as_str())) {
+            continue;
+        }
+        if let Some(url) = attr_value(tag, "content").and_then(media) {
+            return Some(url);
+        }
+    }
+
+    for key in JSON_VIDEO_KEYS {
+        let needle = format!("\"{}\"", key);
+        let mut from = 0;
+        while let Some(idx) = html[from..].find(&needle) {
+            from += idx + needle.len();
+            if let Some(url) = json_string_after_key(&html[from..]).and_then(media) {
+                return Some(url);
             }
         }
     }
@@ -1188,233 +558,178 @@ fn extract_google_drive_direct(html: &str) -> Option<String> {
     None
 }
 
-fn extract_confirm_token(html: &str) -> Option<String> {
-    // 1. Matches confirm=([0-9a-zA-Z_-]+)
-    if let Some(idx) = html.find("confirm=") {
-        let sub = &html[idx + 8..];
-        let token: String = sub.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '-').collect();
-        if !token.is_empty() {
-            return Some(token);
-        }
-    }
-
-    // 2. Matches name="confirm" value="([0-9a-zA-Z_-]+)"
-    let needle = "name=\"confirm\"";
-    if let Some(idx) = html.find(needle) {
-        let sub = &html[idx + needle.len()..];
-        if let Some(val_idx) = sub.find("value=\"") {
-            let val_sub = &sub[val_idx + 7..];
-            let token: String = val_sub.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '-').collect();
-            if !token.is_empty() {
-                return Some(token);
-            }
-        }
-    }
-
-    // 3. Matches value="([0-9a-zA-Z_-]+)" name="confirm"
-    if let Some(idx) = html.find(needle) {
-        let pre = &html[..idx];
-        if let Some(val_idx) = pre.rfind("value=\"") {
-            let val_sub = &pre[val_idx + 7..];
-            let token: String = val_sub.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '-').collect();
-            if !token.is_empty() {
-                return Some(token);
-            }
-        }
-    }
-
-    None
+/// Given the text right after a JSON object key, returns its string value with every JSON escape decoded.
+fn json_string_after_key(after_key: &str) -> Option<String> {
+    let value = after_key.trim_start().strip_prefix(':')?.trim_start();
+    serde_json::Deserializer::from_str(value).into_iter::<String>().next()?.ok()
 }
 
-fn extract_mediafire_direct(html: &str) -> Option<String> {
-    let targets = ["https://download", "http://download", "//download"];
-    for target in targets {
-        let mut cursor = 0;
-        while let Some(idx) = html[cursor..].find(target) {
-            let start = cursor + idx;
-            let sub = &html[start..];
-            if let Some(end) = sub.find(|c| c == '"' || c == '\'' || c == ' ' || c == '<') {
-                let candidate = &sub[..end];
-                if candidate.contains(".mediafire.com/") {
-                    let full = if candidate.starts_with("//") {
-                        format!("https:{}", candidate)
-                    } else {
-                        candidate.to_string()
-                    };
-                    return Some(full);
-                }
-            }
-            cursor = start + target.len();
+/// Source text of every `<name ...>` start tag (case-insensitive), up to but excluding `>`.
+/// `lower` must be `html.to_ascii_lowercase()`, which keeps byte offsets identical.
+fn start_tags<'a>(html: &'a str, lower: &str, name: &str) -> Vec<&'a str> {
+    let open = format!("<{}", name);
+    let mut tags = Vec::new();
+    let mut from = 0;
+    while let Some(idx) = lower[from..].find(&open) {
+        let start = from + idx;
+        let attrs = start + open.len();
+        let Some(len) = lower[attrs..].find('>') else { break };
+        if lower[attrs..].starts_with(|c: char| c.is_ascii_whitespace()) {
+            tags.push(&html[start..attrs + len]);
         }
+        from = attrs + len;
+    }
+    tags
+}
+
+/// Value of attribute `attr` (exact name, case-insensitive) in a start tag's source, with `&amp;` decoded.
+fn attr_value(tag: &str, attr: &str) -> Option<String> {
+    let lower = tag.to_ascii_lowercase();
+    let needle = format!("{}=", attr);
+    let mut from = 0;
+    while let Some(idx) = lower[from..].find(&needle) {
+        let start = from + idx;
+        from = start + needle.len();
+        // Require a word boundary so `src` does not match `data-src`.
+        if start == 0 || !lower.as_bytes()[start - 1].is_ascii_whitespace() {
+            continue;
+        }
+        let rest = &tag[from..];
+        let value = match rest.chars().next() {
+            Some(q @ ('"' | '\'')) => {
+                let inner = &rest[1..];
+                &inner[..inner.find(q)?]
+            }
+            _ => &rest[..rest.find(|c: char| c.is_whitespace() || c == '>').unwrap_or(rest.len())],
+        };
+        return Some(value.trim().replace("&amp;", "&"));
     }
     None
-}
-
-fn extract_html_video_sources(html: &str, base_url: &Url) -> Vec<Url> {
-    let mut sources = Vec::new();
-    let mut seen = HashSet::new();
-
-    // 1. Scan for <source ... src="..."> and <video ... src="...">
-    let tag_targets = ["<source", "<video", "<SOURCE", "<VIDEO"];
-    for tag in tag_targets {
-        let mut cursor = 0;
-        while let Some(idx) = html[cursor..].find(tag) {
-            let start = cursor + idx;
-            let sub = &html[start..];
-            if let Some(tag_end) = sub.find('>') {
-                let tag_content = &sub[..tag_end];
-                if let Some(src) = extract_attribute_value(tag_content, "src") {
-                    if is_probable_video_url(&src) {
-                        if let Ok(resolved) = base_url.join(&src) {
-                            if seen.insert(resolved.to_string()) {
-                                sources.push(resolved);
-                            }
-                        }
-                    }
-                }
-                cursor = start + tag_end;
-            } else {
-                break;
-            }
-        }
-    }
-
-    // 2. Scan for OpenGraph and Twitter video metadata:
-    // <meta property="og:video" content="..."> or <meta name="twitter:player:stream" content="...">
-    let meta_targets = ["og:video", "og:video:url", "og:video:secure_url", "twitter:player:stream"];
-    for target in meta_targets {
-        let mut cursor = 0;
-        while let Some(idx) = html[cursor..].find(target) {
-            let meta_pos = cursor + idx;
-            // Look backward for <meta and forward for >
-            let line_start = html[..meta_pos].rfind('<').unwrap_or(meta_pos);
-            let line_end = html[meta_pos..].find('>').map(|e| meta_pos + e).unwrap_or(html.len());
-            let meta_tag = &html[line_start..line_end];
-
-            if let Some(content) = extract_attribute_value(meta_tag, "content") {
-                if is_probable_video_url(&content) || content.starts_with("http") {
-                    if let Ok(resolved) = base_url.join(&content) {
-                        if seen.insert(resolved.to_string()) {
-                            sources.push(resolved);
-                        }
-                    }
-                }
-            }
-            cursor = line_end;
-        }
-    }
-
-    // 3. Scan for JSON / JS video attributes (e.g. Zoom cloud recordings, Panopto, Loom, custom players):
-    let json_video_keys = [
-        "\"viewMp4Url\"",
-        "\"downloadUrl\"",
-        "\"videoUrl\"",
-        "\"video_url\"",
-        "\"contentUrl\"",
-        "\"stream_url\"",
-        "\"fileUrl\"",
-    ];
-    for key in json_video_keys {
-        let mut cursor = 0;
-        while let Some(idx) = html[cursor..].find(key) {
-            let key_pos = cursor + idx + key.len();
-            let after_key = &html[key_pos..];
-            // Find colon followed by opening quote
-            if let Some(colon_idx) = after_key.find(':') {
-                let after_colon = &after_key[colon_idx + 1..];
-                let trimmed_start = after_colon.find(|c: char| !c.is_whitespace()).unwrap_or(after_colon.len());
-                let val_part = &after_colon[trimmed_start..];
-                let quote = val_part.chars().next();
-                if quote == Some('"') || quote == Some('\'') {
-                    let quote_char = quote.unwrap();
-                    let val_str = &val_part[1..];
-                    if let Some(end) = val_str.find(quote_char) {
-                        let raw = &val_str[..end];
-                        let cleaned = raw
-                            .replace("\\u0026", "&")
-                            .replace("\\/", "/")
-                            .replace("&amp;", "&");
-                        if is_probable_video_url(&cleaned) || cleaned.starts_with("http") {
-                            if let Ok(resolved) = base_url.join(&cleaned) {
-                                if seen.insert(resolved.to_string()) {
-                                    sources.push(resolved);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            cursor = key_pos;
-        }
-    }
-
-    sources
-}
-
-fn extract_attribute_value(tag: &str, attr_name: &str) -> Option<String> {
-    let target = format!("{}=", attr_name);
-    let idx = tag.find(&target)?;
-    let after_eq = &tag[idx + target.len()..];
-    let quote = after_eq.chars().next()?;
-
-    if quote == '"' || quote == '\'' {
-        let value = &after_eq[1..];
-        let end_idx = value.find(quote)?;
-        Some(value[..end_idx].trim().to_string())
-    } else {
-        // Unquoted attribute
-        let end_idx = after_eq.find(|c: char| c.is_whitespace() || c == '>').unwrap_or(after_eq.len());
-        Some(after_eq[..end_idx].trim().to_string())
-    }
-}
-
-fn is_probable_video_url(url_str: &str) -> bool {
-    let lower = url_str.to_ascii_lowercase();
-    lower.contains(".mp4")
-        || lower.contains(".webm")
-        || lower.contains(".mkv")
-        || lower.contains(".m4v")
-        || lower.contains(".mov")
-        || lower.contains(".flv")
-        || lower.contains(".avi")
-        || lower.contains(".ts")
-        || lower.contains(".m3u8")
-        || lower.contains(".mpd")
-        || lower.contains("video/")
-        || lower.contains("/video")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Serves one HTTP response with the given content type and body on a local port.
+    async fn serve_once(content_type: &'static str, body: Vec<u8>) -> Url {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                content_type,
+                body.len()
+            );
+            let _ = sock.write_all(head.as_bytes()).await;
+            let _ = sock.write_all(&body).await;
+        });
+        Url::parse(&format!("http://{}/watch/page", addr)).unwrap()
+    }
+
+    fn local_client() -> Client {
+        Client::builder().no_proxy().build().unwrap()
+    }
 
     #[test]
-    fn test_extract_html_video_sources() {
+    fn test_html_video_source_picks_one_best_candidate() {
         let base_url = Url::parse("https://example.com/watch/video1").unwrap();
         let html = r#"
-            <!DOCTYPE html>
-            <html>
-            <head>
+            <html><head>
+                <meta property="og:video:type" content="video/mp4" />
                 <meta property="og:video" content="https://cdn.example.com/og_video.mp4" />
-                <meta name="twitter:player:stream" content="/stream/twitter_video.webm" />
-            </head>
-            <body>
-                <video controls width="800">
-                    <source src="/media/720p.mp4" type="video/mp4">
+            </head><body>
+                <VIDEO controls width="800">
+                    <source data-src="/lazy.mp4" src="/media/720p.mp4" type="video/mp4">
                     <source src="https://cdn.example.com/1080p.mp4" type="video/mp4">
-                    <source src="/media/fallback.webm" type="video/webm">
-                </video>
-            </body>
-            </html>
+                </VIDEO>
+            </body></html>
         "#;
+        assert_eq!(
+            extract_html_video_source(html, &base_url),
+            Some(Url::parse("https://example.com/media/720p.mp4").unwrap())
+        );
+    }
 
-        let sources = extract_html_video_sources(html, &base_url);
-        assert_eq!(sources.len(), 5);
-        assert!(sources.contains(&Url::parse("https://example.com/media/720p.mp4").unwrap()));
-        assert!(sources.contains(&Url::parse("https://cdn.example.com/1080p.mp4").unwrap()));
-        assert!(sources.contains(&Url::parse("https://example.com/media/fallback.webm").unwrap()));
-        assert!(sources.contains(&Url::parse("https://cdn.example.com/og_video.mp4").unwrap()));
-        assert!(sources.contains(&Url::parse("https://example.com/stream/twitter_video.webm").unwrap()));
+    #[test]
+    fn test_html_video_source_meta_exact_and_media_only() {
+        let base_url = Url::parse("https://news.example.com/story").unwrap();
+        // og:video:type must not be read as a URL, and a YouTube embed is not a downloadable file.
+        let embed_only = r#"
+            <meta property="og:video:type" content="video/mp4">
+            <meta property="og:video" content="https://www.youtube.com/embed/abc123">
+            <meta property="og:image" content="https://cdn.example.com/video/poster.jpg">
+        "#;
+        assert_eq!(extract_html_video_source(embed_only, &base_url), None);
+
+        let with_stream = r#"
+            <meta property="og:video" content="https://www.youtube.com/embed/abc123">
+            <meta name="twitter:player:stream" content="/stream/clip.webm">
+        "#;
+        assert_eq!(
+            extract_html_video_source(with_stream, &base_url),
+            Some(Url::parse("https://news.example.com/stream/clip.webm").unwrap())
+        );
+
+        // The extension is checked on the parsed path, so ".tsx" or a ".mp4" query value do not count.
+        let not_media = r#"<video src="/app/Player.tsx"></video><source src="/page?file=a.mp4">"#;
+        assert_eq!(extract_html_video_source(not_media, &base_url), None);
+    }
+
+    #[test]
+    fn test_html_video_source_json_unescape() {
+        let base_url = Url::parse("https://zoom.us/rec/play/abc123xyz").unwrap();
+        let html = r#"
+            <script>
+                window.__data__ = {
+                    "viewMp4Url": "https:\/\/ssrweb.zoom.us/rec\/play\/video_hd.mp4?auth=token123&sig=a\"b",
+                    "downloadUrl": "https://ssrweb.zoom.us/rec/download/video_original.mp4"
+                };
+            </script>
+        "#;
+        assert_eq!(
+            extract_html_video_source(html, &base_url).unwrap().as_str(),
+            "https://ssrweb.zoom.us/rec/play/video_hd.mp4?auth=token123&sig=a%22b"
+        );
+    }
+
+    #[test]
+    fn test_html_video_resolver_can_handle() {
+        for file in ["video.mp4", "archive.rar", "installer.msi", "pkg.deb", "App.AppImage", "lib-1.0-py3-none-any.whl", "a.tar.zst"] {
+            let url = Url::parse(&format!("https://example.com/dl/{}", file)).unwrap();
+            assert!(!HtmlVideoResolver.can_handle(&url), "{}", file);
+        }
+        assert!(HtmlVideoResolver.can_handle(&Url::parse("https://example.com/watch/video").unwrap()));
+        assert!(HtmlVideoResolver.can_handle(&Url::parse("https://example.com/").unwrap()));
+        assert!(HtmlVideoResolver.can_handle(&Url::parse("https://example.com/view.php?id=4").unwrap()));
+        assert!(!HtmlVideoResolver.can_handle(&Url::parse("ftp://example.com/watch").unwrap()));
+    }
+
+    #[tokio::test]
+    async fn test_smart_resolver_scrapes_html_page() {
+        let html = br#"<video controls><source src="/media/clip.mp4" type="video/mp4"></video>"#.to_vec();
+        let page = serve_once("text/html; charset=utf-8", html).await;
+        let resolved = SmartResolver::resolve(&local_client(), &page).await.unwrap();
+        assert_eq!(resolved, vec![page.join("/media/clip.mp4").unwrap()]);
+    }
+
+    #[tokio::test]
+    async fn test_html_video_resolver_ignores_non_html() {
+        let body = br#"<video src="/media/clip.mp4"></video>"#.to_vec();
+        let page = serve_once("application/octet-stream", body).await;
+        let resolved = HtmlVideoResolver.resolve(&local_client(), &page).await.unwrap();
+        assert_eq!(resolved, vec![page]);
+    }
+
+    #[tokio::test]
+    async fn test_read_capped_stops_at_cap() {
+        let url = serve_once("text/html", vec![b'a'; 100_000]).await;
+        let resp = local_client().get(url).send().await.unwrap();
+        assert_eq!(read_capped(resp, 10).await.unwrap(), "aaaaaaaaaa");
     }
 
     #[tokio::test]
@@ -1426,8 +741,8 @@ mod tests {
         assert_eq!(resolved[0].query(), Some("dl=1"));
     }
 
-    #[tokio::test]
-    async fn test_google_drive_id_extraction() {
+    #[test]
+    fn test_google_drive_id_extraction() {
         let url1 = Url::parse("https://drive.google.com/file/d/1BxyzABC_12345/view?usp=sharing").unwrap();
         assert_eq!(extract_google_drive_id(&url1), Some("1BxyzABC_12345".to_string()));
 
@@ -1435,149 +750,151 @@ mod tests {
         assert_eq!(extract_google_drive_id(&url2), Some("1BxyzABC_12345".to_string()));
     }
 
+    #[test]
+    fn test_google_drive_direct_url() {
+        let direct = google_drive_direct_url("1BxyzABC_12345").unwrap();
+        assert_eq!(
+            direct.as_str(),
+            "https://drive.usercontent.google.com/download?id=1BxyzABC_12345&export=download&confirm=t"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_google_drive_without_file_id_is_an_error() {
+        let folder = Url::parse("https://drive.google.com/drive/folders/abc").unwrap();
+        let result = SmartResolver::resolve(&Client::new(), &folder).await;
+        assert!(matches!(result, Err(ResolverError::Parse(_))));
+        assert_eq!(SmartResolver::resolve_mirrors(&Client::new(), &folder).await, vec![folder]);
+    }
+
+    #[tokio::test]
+    async fn test_ensure_file_response_rejects_html() {
+        let client = local_client();
+        let page = serve_once("text/html", b"<html>Quota exceeded</html>".to_vec()).await;
+        assert!(matches!(ensure_file_response(&client, &page, "Google Drive").await, Err(ResolverError::NotFound(_))));
+
+        let file = serve_once("application/octet-stream", vec![0u8; 64]).await;
+        assert!(ensure_file_response(&client, &file, "Google Drive").await.is_ok());
+    }
+
+    #[test]
+    fn test_sourceforge_file_path_parsing() {
+        let url = Url::parse("https://sourceforge.net/projects/sevenzip/files/7-Zip/24.09/7z%202409.exe/download?use_mirror=foo&ts=1").unwrap();
+        assert_eq!(
+            sourceforge_file_path(&url),
+            Some(("sevenzip".to_string(), "7-Zip/24.09/7z%202409.exe".to_string()))
+        );
+        for skipped in [
+            "https://sourceforge.net/projects/sevenzip/files/7-Zip/24.09/",
+            "https://sourceforge.net/projects/sevenzip/files/latest/download",
+            "https://sourceforge.net/projects/sevenzip/",
+        ] {
+            assert!(!SourceForgeResolver.can_handle(&Url::parse(skipped).unwrap()), "{}", skipped);
+        }
+    }
+
     #[tokio::test]
     async fn test_sourceforge_mirror_generation() {
         let client = Client::new();
-        let url = Url::parse("https://sourceforge.net/projects/sevenzip/files/7-Zip/24.09/7z2409-x64.exe/download").unwrap();
+        let url = Url::parse("https://sourceforge.net/projects/sevenzip/files/7-Zip/24.09/7z2409-x64.exe/download?ts=123").unwrap();
         let resolved = SourceForgeResolver.resolve(&client, &url).await.unwrap();
-        assert!(resolved.len() >= 5);
-        assert!(resolved.iter().any(|u| u.query().unwrap_or("").contains("use_mirror=fastly")));
+        assert_eq!(resolved.len(), SOURCEFORGE_MIRRORS.len());
+        assert_eq!(
+            resolved[1].as_str(),
+            "https://downloads.sourceforge.net/project/sevenzip/7-Zip/24.09/7z2409-x64.exe?use_mirror=netix"
+        );
+        assert!(resolved.iter().all(|u| u.query_pairs().count() == 1));
     }
 
     #[test]
     fn test_mediafire_html_extraction() {
+        let page = Url::parse("https://www.mediafire.com/file/abc/sample.zip/file").unwrap();
         let html = r#"<div><a class="input popsok" aria-label="Download file" href="https://download1590.mediafire.com/xyz123/sample.zip" id="downloadButton">Download</a></div>"#;
-        let direct = extract_mediafire_direct(html).unwrap();
-        assert_eq!(direct, "https://download1590.mediafire.com/xyz123/sample.zip");
-    }
+        assert_eq!(
+            extract_mediafire_direct(html, &page).unwrap().as_str(),
+            "https://download1590.mediafire.com/xyz123/sample.zip"
+        );
 
-    #[test]
-    fn test_platform_id_extractions() {
-        let vimeo_url = Url::parse("https://vimeo.com/123456789").unwrap();
-        assert_eq!(extract_vimeo_id(&vimeo_url), Some("123456789".to_string()));
+        // base64("https://download2390.mediafire.com/q/sample.zip")
+        let scrambled = r#"<a class="input popsok" href="javascript:void(0)" data-scrambled-url="aHR0cHM6Ly9kb3dubG9hZDIzOTAubWVkaWFmaXJlLmNvbS9xL3NhbXBsZS56aXA=">Download</a>"#;
+        assert_eq!(
+            extract_mediafire_direct(scrambled, &page).unwrap().as_str(),
+            "https://download2390.mediafire.com/q/sample.zip"
+        );
 
-        let reddit_url = Url::parse("https://www.reddit.com/r/rust/comments/abc123z/awesome_post/").unwrap();
-        assert_eq!(extract_reddit_id(&reddit_url), Some("abc123z".to_string()));
-
-        let twitter_url = Url::parse("https://twitter.com/user/status/1789012345678901234?s=20").unwrap();
-        assert_eq!(extract_status_id(&twitter_url), Some("1789012345678901234".to_string()));
-
-        let tiktok_html = r#"<script id="SIGI_STATE">{"playAddr":"https:\/\/v16.tiktokcdn.com\/video\/123\/?token=abc"}</script>"#;
-        assert_eq!(extract_tiktok_addr(tiktok_html, "playAddr"), Some("https:\\/\\/v16.tiktokcdn.com\\/video\\/123\\/?token=abc".to_string()));
-
-        let dailymotion_url = Url::parse("https://www.dailymotion.com/video/x8xyz12_some-video-title").unwrap();
-        assert_eq!(extract_dailymotion_id(&dailymotion_url), Some("x8xyz12".to_string()));
-
-        let fb_html = r#"{"playable_url_quality_hd":"https:\/\/video.xx.fbcdn.net\/v\/hd.mp4?oh=123\u0026oe=456","playable_url":"https:\/\/video.xx.fbcdn.net\/v\/sd.mp4?oh=123\u0026oe=456"}"#;
-        let fb_urls = extract_facebook_video_urls(fb_html);
-        assert_eq!(fb_urls.len(), 2);
-        assert_eq!(fb_urls[0].as_str(), "https://video.xx.fbcdn.net/v/hd.mp4?oh=123&oe=456");
-
-        let ig_html = r#"{"video_url":"https:\/\/instagram.xx.fbcdn.net\/v\/t50.2886-16\/video.mp4?_nc_cat=100\u0026oh=789"}"#;
-        let ig_urls = extract_instagram_video_urls(ig_html);
-        assert_eq!(ig_urls.len(), 1);
-        assert_eq!(ig_urls[0].as_str(), "https://instagram.xx.fbcdn.net/v/t50.2886-16/video.mp4?_nc_cat=100&oh=789");
-    }
-
-    #[test]
-    fn test_resolver_can_handle() {
-        assert!(VimeoResolver.can_handle(&Url::parse("https://vimeo.com/123456").unwrap()));
-        assert!(RedditResolver.can_handle(&Url::parse("https://v.redd.it/xyz123").unwrap()));
-        assert!(TwitterResolver.can_handle(&Url::parse("https://x.com/user/status/987654").unwrap()));
-        assert!(TikTokResolver.can_handle(&Url::parse("https://www.tiktok.com/@user/video/12345").unwrap()));
-        assert!(FacebookResolver.can_handle(&Url::parse("https://www.facebook.com/watch/?v=12345").unwrap()));
-        assert!(DailymotionResolver.can_handle(&Url::parse("https://dai.ly/x8xyz").unwrap()));
-        assert!(InstagramResolver.can_handle(&Url::parse("https://www.instagram.com/reel/C12345/").unwrap()));
-        assert!(ArchiveOrgResolver.can_handle(&Url::parse("https://archive.org/download/item/file.zip").unwrap()));
-        assert!(ArchiveOrgResolver.can_handle(&Url::parse("https://dn720001.ca.archive.org/0/items/fn-v8-archive/builds/8.51-CL-6165369.7z").unwrap()));
-    }
-
-    #[test]
-    fn test_google_drive_direct_extraction() {
-        let html = r#"<html><body><a id="uc-download-link" class="goog-inline-block jfk-button jfk-button-action" href="https://doc-00-00-docs.googleusercontent.com/download?id=123&amp;confirm=t">Download anyway</a></body></html>"#;
-        let direct = extract_google_drive_direct(html).unwrap();
-        assert_eq!(direct, "https://doc-00-00-docs.googleusercontent.com/download?id=123&confirm=t");
-
-        let form_html = r#"<form id="download-form" action="/download?id=456&amp;confirm=xyz" method="post"></form>"#;
-        let form_direct = extract_google_drive_direct(form_html).unwrap();
-        assert_eq!(form_direct, "https://drive.google.com/download?id=456&confirm=xyz");
-    }
-
-    #[test]
-    fn test_html_video_resolver_exclusion() {
-        assert!(!HtmlVideoResolver.can_handle(&Url::parse("https://example.com/video.mp4").unwrap()));
-        assert!(!HtmlVideoResolver.can_handle(&Url::parse("https://example.com/archive.rar").unwrap()));
-        assert!(!HtmlVideoResolver.can_handle(&Url::parse("https://example.com/installer.msi").unwrap()));
-        assert!(HtmlVideoResolver.can_handle(&Url::parse("https://example.com/watch/video").unwrap()));
-    }
-
-    #[test]
-    fn test_extract_html_video_sources_json() {
-        let base_url = Url::parse("https://zoom.us/rec/play/abc123xyz").unwrap();
-        let html = r#"
-            <script>
-                window.__data__ = {
-                    "viewMp4Url": "https://ssrweb.zoom.us/rec/play/video_hd.mp4?auth=token123\u0026sig=abc",
-                    "downloadUrl": "https://ssrweb.zoom.us/rec/download/video_original.mp4"
-                };
-            </script>
-        "#;
-        let sources = extract_html_video_sources(html, &base_url);
-        assert_eq!(sources.len(), 2);
-        assert!(sources.contains(&Url::parse("https://ssrweb.zoom.us/rec/play/video_hd.mp4?auth=token123&sig=abc").unwrap()));
-        assert!(sources.contains(&Url::parse("https://ssrweb.zoom.us/rec/download/video_original.mp4").unwrap()));
+        let other_links = r#"<a href="https://www.mediafire.com/upgrade">Upgrade</a><a href="https://download.evil.com/x">x</a>"#;
+        assert_eq!(extract_mediafire_direct(other_links, &page), None);
     }
 
     #[tokio::test]
+    async fn test_mediafire_missing_link_is_an_error() {
+        let page = serve_once("text/html", b"<html><a href=\"/help\">Help</a></html>".to_vec()).await;
+        let result = MediaFireResolver.resolve(&local_client(), &page).await;
+        assert!(matches!(result, Err(ResolverError::NotFound(_))));
+    }
+
+    #[test]
+    fn test_archive_org_url_parsing() {
+        let data_node = Url::parse("https://dn720001.ca.archive.org/0/items/fn-v8-archive/builds/8.51-CL-6165369.7z").unwrap();
+        assert_eq!(
+            archive_item_path(&data_node),
+            Some(("fn-v8-archive".to_string(), "builds/8.51-CL-6165369.7z".to_string()))
+        );
+        let download = Url::parse("https://archive.org/download/item/file.zip").unwrap();
+        assert_eq!(archive_item_path(&download), Some(("item".to_string(), "file.zip".to_string())));
+
+        for rejected in [
+            "https://web.archive.org/web/2020/http://example.com/items/foo/bar.zip",
+            "https://archive.org/details/item",
+            "https://archive.org/download/item",
+            "https://example.com/download/item/file.zip",
+            "https://notarchive.org/download/item/file.zip",
+        ] {
+            assert!(!ArchiveOrgResolver.can_handle(&Url::parse(rejected).unwrap()), "{}", rejected);
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires network"]
     async fn test_archive_org_resolver() {
         let client = Client::new();
         let url = Url::parse("https://dn720001.ca.archive.org/0/items/fn-v8-archive/builds/8.51-CL-6165369.7z").unwrap();
         let mirrors = ArchiveOrgResolver.resolve(&client, &url).await.unwrap();
-        for (i, m) in mirrors.iter().enumerate() {
-            println!("Mirror {}: {}", i, m);
-        }
         assert!(mirrors.len() >= 2);
-    }
-
-    #[test]
-    fn test_youtube_id_extraction() {
-        let u1 = Url::parse("https://www.youtube.com/watch?v=dQw4w9WgXcQ").unwrap();
-        assert_eq!(extract_youtube_id(&u1), Some("dQw4w9WgXcQ".to_string()));
-
-        let u2 = Url::parse("https://youtu.be/dQw4w9WgXcQ?t=10").unwrap();
-        assert_eq!(extract_youtube_id(&u2), Some("dQw4w9WgXcQ".to_string()));
-
-        let u3 = Url::parse("https://www.youtube.com/shorts/dQw4w9WgXcQ").unwrap();
-        assert_eq!(extract_youtube_id(&u3), Some("dQw4w9WgXcQ".to_string()));
-
-        let u4 = Url::parse("https://www.youtube.com/embed/dQw4w9WgXcQ").unwrap();
-        assert_eq!(extract_youtube_id(&u4), Some("dQw4w9WgXcQ".to_string()));
-    }
-
-    #[test]
-    fn test_blob_and_uuid_detection() {
-        let blob_url = Url::parse("blob:https://www.youtube.com/ce8ac223-1199-4640-ba84-14b5c8f10ac0").unwrap();
-        assert!(is_blob_or_uuid_url(&blob_url));
-
-        let uuid_url = Url::parse("https://www.youtube.com/ce8ac223-1199-4640-ba84-14b5c8f10ac0").unwrap();
-        assert!(is_blob_or_uuid_url(&uuid_url));
-
-        let standard_yt = Url::parse("https://www.youtube.com/watch?v=dQw4w9WgXcQ").unwrap();
-        assert!(!is_blob_or_uuid_url(&standard_yt));
     }
 
     #[test]
     fn test_parse_netscape_cookies() {
         use reqwest::cookie::CookieStore;
         let cookie_content = "\
-# Netscape HTTP Cookie File
-.example.com\tTRUE\t/\tTRUE\t1735689600\tsession_id\tabc123xyz
-#HttpOnly_.example.com\tTRUE\t/\tFALSE\t1735689600\ttoken\tsecret_val
+# Netscape HTTP Cookie File\r
+.example.com\tTRUE\t/\tTRUE\t0\tsession_id\tabc123xyz\r
+#HttpOnly_.example.com\tTRUE\t/\tFALSE\t4102444800\ttoken\tsecret_val
+.example.com\tTRUE\t/\tFALSE\t0\tflag\t
+host.example.com\tFALSE\t/\tFALSE\t0\thostonly\t1
+.example.com\tTRUE\t/\tFALSE\t1000000000\texpired\t1
 ";
         let jar = reqwest::cookie::Jar::default();
         parse_netscape_cookies(cookie_content, &jar);
-        let test_url = Url::parse("https://example.com/").unwrap();
-        let cookie_header = jar.cookies(&test_url);
-        assert!(cookie_header.is_some());
+        let header = |u: &str| {
+            jar.cookies(&Url::parse(u).unwrap())
+                .map(|h| h.to_str().unwrap().to_string())
+                .unwrap_or_default()
+        };
+
+        let https = header("https://example.com/");
+        assert!(https.contains("session_id=abc123xyz"), "{}", https);
+        assert!(https.contains("token=secret_val"), "{}", https);
+        assert!(https.contains("flag="), "{}", https);
+        assert!(!https.contains("expired"), "{}", https);
+
+        // Secure cookies never go over plain HTTP.
+        let http = header("http://example.com/");
+        assert!(!http.contains("session_id"), "{}", http);
+        assert!(http.contains("token=secret_val"), "{}", http);
+
+        // Host-only cookies are not widened to subdomains.
+        assert!(header("http://host.example.com/").contains("hostonly=1"));
+        assert!(!header("http://sub.host.example.com/").contains("hostonly"));
     }
 }
