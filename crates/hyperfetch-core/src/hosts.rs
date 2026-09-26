@@ -1,14 +1,20 @@
-//! What this process knows about the hosts it downloads from, shared by every download: what each
-//! host was seen to do, so the next download from it can start from that instead of finding out
-//! again.
+//! What this process knows about the hosts it downloads from, shared by every download: how many
+//! requests each has open, within a budget every open request holds a slot of, and what each host
+//! was seen to do, so the next download from it can start from that instead of finding out again.
 //!
 //! Hosts are told apart by scheme, host and port. A fact is trusted for `PROFILE_TTL` after it was
 //! learned, each on its own: hosts change, and a fact nobody sees again is forgotten.
+//!
+//! A host takes a new request while fewer are open than the smallest nonzero limit among that
+//! request's and those of the requests already open (downloads with differing
+//! `max_connections_per_host` share one host at the strictest), and than the connection cap the
+//! host was seen to enforce. A limit of 0 sets none.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 use parking_lot::Mutex;
+use tokio::sync::Notify;
 use url::Url;
 
 /// How long a learned fact about a host is trusted.
@@ -62,6 +68,51 @@ pub fn record(url: &Url, seen: HostProfile) {
     HOSTS.record(&HostKey::of(url), seen, Instant::now())
 }
 
+/// Waits until a request to `url`'s host may be opened under `limit` (see the module docs) and
+/// returns its slot. Waiting is no failure: nothing else is held meanwhile, and dropping the
+/// future gives up the wait. Never wait for a slot while holding another.
+pub async fn acquire(url: &Url, limit: usize) -> HostSlot {
+    HOSTS.acquire(HostKey::of(url), limit).await
+}
+
+/// A slot for a request to `url`'s host under `limit`, if one is free now.
+pub fn try_acquire(url: &Url, limit: usize) -> Option<HostSlot> {
+    HOSTS.try_acquire(&HostKey::of(url), limit, Instant::now())
+}
+
+/// One request open to a host, counted against the host's budget until dropped.
+#[must_use = "the slot is given back when dropped"]
+pub struct HostSlot {
+    hosts: &'static Hosts,
+    key: HostKey,
+    limit: usize,
+}
+
+impl HostSlot {
+    /// The host this slot is for.
+    pub fn host(&self) -> &HostKey {
+        &self.key
+    }
+
+    /// The host refused this request with 429/503. With other requests to it open at the time, it
+    /// serves no more than those at once: every download to it is held to that, for
+    /// `PROFILE_TTL`. With none, the host was just busy.
+    pub fn throttled(&self) {
+        self.hosts.throttled(&self.key, Instant::now())
+    }
+
+    /// The host accepted this request. At the cap it was seen to enforce, it may take one more.
+    pub fn accepted(&self) {
+        self.hosts.accepted(&self.key, Instant::now())
+    }
+}
+
+impl Drop for HostSlot {
+    fn drop(&mut self) {
+        self.hosts.release(&self.key, self.limit, Instant::now())
+    }
+}
+
 /// A fact and when it was learned.
 type Fact<T> = Option<(T, Instant)>;
 
@@ -107,18 +158,34 @@ impl Facts {
 #[derive(Debug, Default)]
 struct Entry {
     facts: Facts,
+    /// Requests open to the host.
+    open: usize,
+    /// The nonzero limits those requests were opened under, and how many hold each.
+    held: BTreeMap<usize, usize>,
 }
 
 impl Entry {
     /// Whether nothing would be lost by forgetting the host.
     fn is_idle(&self, now: Instant) -> bool {
-        self.facts.profile(now) == HostProfile::default()
+        self.open == 0 && self.facts.profile(now) == HostProfile::default()
+    }
+
+    /// Requests the host may have open once one under `limit` joins them.
+    fn allowance(&self, limit: usize, now: Instant) -> usize {
+        let own = (limit > 0).then_some(limit);
+        [own, self.held.keys().next().copied(), fresh(self.facts.connection_cap, now)]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(usize::MAX)
     }
 }
 
 #[derive(Debug, Default)]
 struct Hosts {
     entries: Mutex<HashMap<HostKey, Entry>>,
+    /// Woken whenever a host may take more requests: a slot was freed or a cap rose.
+    freed: Notify,
 }
 
 impl Hosts {
@@ -127,9 +194,83 @@ impl Hosts {
     }
 
     fn record(&self, key: &HostKey, seen: HostProfile, now: Instant) {
+        {
+            let mut entries = self.entries.lock();
+            entries.entry(key.clone()).or_default().facts.record(seen, now);
+            forget_idle(&mut entries, now);
+        }
+        if seen.connection_cap.is_some() {
+            self.freed.notify_waiters();
+        }
+    }
+
+    fn try_acquire(&'static self, key: &HostKey, limit: usize, now: Instant) -> Option<HostSlot> {
         let mut entries = self.entries.lock();
-        entries.entry(key.clone()).or_default().facts.record(seen, now);
-        forget_idle(&mut entries, now);
+        let entry = entries.entry(key.clone()).or_default();
+        if entry.open >= entry.allowance(limit, now) {
+            return None;
+        }
+        entry.open += 1;
+        if limit > 0 {
+            *entry.held.entry(limit).or_default() += 1;
+        }
+        Some(HostSlot { hosts: self, key: key.clone(), limit })
+    }
+
+    async fn acquire(&'static self, key: HostKey, limit: usize) -> HostSlot {
+        loop {
+            // Registered before looking, so a slot freed in between still wakes us.
+            let freed = self.freed.notified();
+            tokio::pin!(freed);
+            freed.as_mut().enable();
+            if let Some(slot) = self.try_acquire(&key, limit, Instant::now()) {
+                return slot;
+            }
+            freed.await;
+        }
+    }
+
+    fn release(&self, key: &HostKey, limit: usize, now: Instant) {
+        {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.get_mut(key) {
+                entry.open = entry.open.saturating_sub(1);
+                if let Some(holders) = entry.held.get_mut(&limit) {
+                    *holders = holders.saturating_sub(1);
+                    if *holders == 0 {
+                        entry.held.remove(&limit);
+                    }
+                }
+            }
+            forget_idle(&mut entries, now);
+        }
+        self.freed.notify_waiters();
+    }
+
+    fn throttled(&self, key: &HostKey, now: Instant) {
+        if let Some(entry) = self.entries.lock().get_mut(key) {
+            // The refused request still holds its slot.
+            let others = entry.open.saturating_sub(1);
+            if others > 0 {
+                entry.facts.connection_cap = Some((others, now));
+            }
+        }
+    }
+
+    fn accepted(&self, key: &HostKey, now: Instant) {
+        let raised = self.entries.lock().get_mut(key).is_some_and(|entry| {
+            match (entry.facts.connection_cap, fresh(entry.facts.connection_cap, now)) {
+                // The cap keeps the time it was learned at, so it still expires.
+                (Some((cap, learned)), Some(_)) if entry.open >= cap => {
+                    entry.facts.connection_cap = Some((cap + 1, learned));
+                    true
+                }
+                _ => false,
+            }
+        });
+        if raised {
+            self.freed.notify_waiters();
+        }
     }
 }
 
@@ -191,6 +332,80 @@ mod tests {
         assert_eq!(hosts.entries.lock().len(), KEEP_HOSTS + 1, "fresh facts are kept");
         hosts.record(&key("http://new.example/"), cap, t0 + PROFILE_TTL);
         assert_eq!(hosts.entries.lock().len(), 1);
+    }
+
+    fn leaked() -> &'static Hosts {
+        Box::leak(Box::default())
+    }
+
+    #[test]
+    fn test_a_host_takes_no_more_requests_than_the_strictest_download_using_it_allows() {
+        let (hosts, host, now) = (leaked(), key("http://files.example/"), Instant::now());
+        let mut four: Vec<HostSlot> = (0..4).map(|_| hosts.try_acquire(&host, 4, now).unwrap()).collect();
+        assert!(hosts.try_acquire(&host, 4, now).is_none());
+        assert!(hosts.try_acquire(&host, 8, now).is_none(), "the requests open allow no more than 4");
+        assert!(hosts.try_acquire(&key("http://other.example/"), 4, now).is_some(), "each host has its own budget");
+
+        four.truncate(1);
+        let two = hosts.try_acquire(&host, 2, now).unwrap();
+        assert!(hosts.try_acquire(&host, 4, now).is_none(), "a download allowing 2 holds the host to 2");
+        assert!(hosts.try_acquire(&host, 0, now).is_none(), "one without a limit too");
+        drop((two, four));
+        let unlimited: Vec<HostSlot> = (0..100).map(|_| hosts.try_acquire(&host, 0, now).unwrap()).collect();
+        assert_eq!(hosts.entries.lock()[&host].open, 100);
+        drop(unlimited);
+        assert_eq!(hosts.entries.lock()[&host].open, 0, "every slot is given back");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_a_waiting_request_gets_the_slot_another_frees() {
+        let (hosts, host) = (leaked(), key("http://files.example/"));
+        let first = hosts.try_acquire(&host, 1, Instant::now()).unwrap();
+        // A wait given up holds nothing.
+        assert!(tokio::time::timeout(Duration::from_secs(60), hosts.acquire(host.clone(), 1)).await.is_err());
+        let waiting = tokio::spawn(hosts.acquire(host.clone(), 1));
+        tokio::task::yield_now().await;
+        drop(first);
+        let second = tokio::time::timeout(Duration::from_secs(60), waiting).await.expect("the waiter gets the freed slot");
+        assert_eq!(second.unwrap().host(), &host);
+        assert_eq!(hosts.entries.lock()[&host].open, 0);
+    }
+
+    #[test]
+    fn test_a_cap_seen_in_refusals_holds_every_download_until_it_expires() {
+        let (hosts, host, t0) = (leaked(), key("http://capped.example/"), Instant::now());
+        // Refused with nothing else open, the host was only busy.
+        let alone = hosts.try_acquire(&host, 32, t0).unwrap();
+        alone.throttled();
+        drop(alone);
+        assert_eq!(hosts.profile(&host, t0).connection_cap, None);
+        // Refused with two others open, it serves two at once.
+        let three: Vec<HostSlot> = (0..3).map(|_| hosts.try_acquire(&host, 32, t0).unwrap()).collect();
+        three[2].throttled();
+        drop(three);
+        assert_eq!(hosts.profile(&host, Instant::now()).connection_cap, Some(2));
+
+        // A later download from the host starts at that cap, whatever its own limit allows.
+        let now = Instant::now();
+        let mut later: Vec<HostSlot> = (0..2).map(|_| hosts.try_acquire(&host, 32, now).unwrap()).collect();
+        assert!(hosts.try_acquire(&host, 32, now).is_none());
+        // Served in full at the cap, the host is offered one more request.
+        later[0].accepted();
+        later.push(hosts.try_acquire(&host, 32, now).unwrap());
+        assert!(hosts.try_acquire(&host, 32, now).is_none());
+        assert_eq!(hosts.profile(&host, now).connection_cap, Some(3));
+        // Ten minutes after it was seen, the cap is forgotten.
+        assert!(hosts.try_acquire(&host, 32, now + PROFILE_TTL).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_the_process_wide_budget() {
+        let url = Url::parse("http://budget-test.hosts.example/f.bin").unwrap();
+        let slot = acquire(&url, 1).await;
+        assert_eq!(slot.host(), &HostKey::of(&url));
+        assert!(try_acquire(&Url::parse("http://budget-test.hosts.example/other.bin").unwrap(), 1).is_none());
+        drop(slot);
+        assert!(try_acquire(&url, 1).is_some());
     }
 
     #[test]

@@ -157,13 +157,17 @@ impl MirrorRacer {
     /// Selects the best mirror that can take another connection right now, if any. Equal scores
     /// go to the mirror listed first: the user's or the resolver's preferred source.
     pub fn select_best_mirror(&self) -> Option<usize> {
+        self.ranked().first().copied()
+    }
+
+    /// Every mirror that can take another connection right now, best first; equal scores keep
+    /// the listed order.
+    pub fn ranked(&self) -> Vec<usize> {
         let now = Instant::now();
-        self.mirrors
-            .iter()
-            .map(|m| (m.id, m.score(now)))
-            .filter(|&(_, score)| score >= 0.0)
-            .max_by(|a, b| a.1.total_cmp(&b.1).then(b.0.cmp(&a.0)))
-            .map(|(id, _)| id)
+        let mut usable: Vec<(usize, f64)> =
+            self.mirrors.iter().map(|m| (m.id, m.score(now))).filter(|&(_, score)| score >= 0.0).collect();
+        usable.sort_by(|a, b| b.1.total_cmp(&a.1));
+        usable.into_iter().map(|(id, _)| id).collect()
     }
 
     pub fn get_mirror(&self, id: usize) -> Option<&Mirror> {
@@ -240,9 +244,13 @@ mod tests {
         assert_eq!(racer.select_best_mirror(), Some(0));
         racer.acquire_mirror(0);
         assert_eq!(racer.select_best_mirror(), Some(1), "a busier mirror scores lower");
+        assert_eq!(racer.ranked(), [1, 2, 0]);
         racer.acquire_mirror(1);
         racer.acquire_mirror(2);
         assert_eq!(racer.select_best_mirror(), Some(0));
+        assert_eq!(racer.ranked(), [0, 1, 2]);
+        racer.get_mirror_mut(1).unwrap().is_active = false;
+        assert_eq!(racer.ranked(), [0, 2], "only mirrors that can take a connection");
     }
 
     #[test]

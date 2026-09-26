@@ -136,6 +136,10 @@ struct Stats {
     /// Body bytes sent in answer to probes.
     probe_bytes: AtomicU64,
     active: AtomicUsize,
+    /// GETs being answered now, each until just before its last write (so never after the client
+    /// could have seen the whole answer), and the most ever answered at once.
+    serving: AtomicUsize,
+    max_serving: AtomicUsize,
     /// GETs refused with 503 for exceeding `max_active`.
     refused: AtomicUsize,
     /// GETs refused with 403 for an `expired` target.
@@ -275,14 +279,17 @@ async fn handle(mut socket: TcpStream, mock: Arc<Mock>) {
         return;
     }
 
-    let (reply, _guard) = if probe {
+    let (reply, _guard, mut serving) = if probe {
         s.probes.fetch_add(1, Ordering::SeqCst);
         let busy = mock.busy_probes.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok();
-        (if busy { Reply::Status(503, None) } else { Reply::Normal }, None)
+        (if busy { Reply::Status(503, None) } else { Reply::Normal }, None, None)
     } else {
         let index = s.gets.fetch_add(1, Ordering::SeqCst);
         let active = s.active.fetch_add(1, Ordering::SeqCst) + 1;
         let guard = ActiveGuard(&s.active);
+        let serving = s.serving.fetch_add(1, Ordering::SeqCst) + 1;
+        s.max_serving.fetch_max(serving, Ordering::SeqCst);
+        let serving = ActiveGuard(&s.serving);
         if header("if-range").is_some() {
             s.if_ranges.fetch_add(1, Ordering::SeqCst);
         }
@@ -300,12 +307,13 @@ async fn handle(mut socket: TcpStream, mock: Arc<Mock>) {
         } else {
             (mock.plan)(index)
         };
-        (reply, Some(guard))
+        (reply, Some(guard), Some(serving))
     };
     let reply = if mock.rejects_range && header("range").is_some() { Reply::Status(400, None) } else { reply };
     if let Reply::Status(code, retry_after) = reply {
         let retry = retry_after.map(|s| format!("Retry-After: {}\r\n", s)).unwrap_or_default();
         let resp = format!("HTTP/1.1 {} Mock\r\n{}Content-Length: 0\r\nConnection: close\r\n\r\n", code, retry);
+        drop(serving);
         let _ = socket.write_all(resp.as_bytes()).await;
         return;
     }
@@ -326,6 +334,7 @@ async fn handle(mut socket: TcpStream, mock: Arc<Mock>) {
                     "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                     total
                 );
+                drop(serving);
                 let _ = socket.write_all(resp.as_bytes()).await;
                 return;
             }
@@ -354,18 +363,25 @@ async fn handle(mut socket: TcpStream, mock: Arc<Mock>) {
         get_etag,
         disposition
     );
-    if socket.write_all(resp.as_bytes()).await.is_err() {
-        return;
-    }
-
     let limit = match reply {
         Reply::CloseAfter(n) | Reply::StallAfter(n) => n.min(body.len()),
         _ => body.len(),
     };
-    for piece in body[..limit].chunks(16 * KB) {
+    let pieces = limit.div_ceil(16 * KB);
+    if pieces == 0 {
+        drop(serving.take());
+    }
+    if socket.write_all(resp.as_bytes()).await.is_err() {
+        return;
+    }
+
+    for (i, piece) in body[..limit].chunks(16 * KB).enumerate() {
         let delay = mock.delay_us.load(Ordering::SeqCst);
         if delay > 0 {
             tokio::time::sleep(Duration::from_micros(delay)).await;
+        }
+        if i + 1 == pieces {
+            drop(serving.take());
         }
         let ok = if mock.chunked {
             socket.write_all(format!("{:x}\r\n", piece.len()).as_bytes()).await.is_ok()
@@ -1634,4 +1650,38 @@ async fn test_head_is_not_awaited_once_the_ranged_get_says_it_all() {
         assert_eq!(path, temp.path().join(expected), "etag: {etag:?}");
         assert_file(&path, &data);
     }
+}
+
+#[tokio::test]
+async fn test_downloads_to_one_host_share_its_connection_budget() {
+    let _history = setup().await;
+    let data = payload(PREFETCH + 4096 * KB, 241);
+    let mock = Arc::new(Mock::new(data.clone()));
+    mock.delay_us.store(10_000, Ordering::SeqCst);
+    let first = serve(Arc::clone(&mock), "first.bin").await;
+    let second = first.join("second.bin").unwrap();
+    let temp = tempdir().unwrap();
+    let engine = |url: Url, name: &str| {
+        let out = temp.path().join(name);
+        let opts = DownloadOptions {
+            max_connections_per_host: 4,
+            // Slot waits sit outside every timeout.
+            stall_timeout_secs: 1,
+            // No steals: a stolen-from request is dropped once its part is in, which the mock
+            // only notices at its next write.
+            min_steal_threshold: u64::MAX,
+            ..options(&out, 8, 128 * KB)
+        };
+        (DownloadEngine::new(vec![url], opts), out)
+    };
+    let ((a, a_out), (b, b_out)) = (engine(first, "first.bin"), engine(second, "second.bin"));
+
+    let (a_done, b_done) = tokio::join!(run(&a, None), run(&b, None));
+    a_done.expect("the first download should succeed");
+    b_done.expect("the second download should succeed");
+
+    assert_file(&a_out, &data);
+    assert_file(&b_out, &data);
+    let most = mock.stats.max_serving.load(Ordering::SeqCst);
+    assert_eq!(most, 4, "two downloads of 8 connections each share the host's 4");
 }

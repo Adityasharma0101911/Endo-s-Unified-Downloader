@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::chunk::{Chunk, ChunkManager, StealRule, StealTiming};
+use crate::hosts::{self, HostKey, HostSlot};
 use crate::mirror::{Mirror, MirrorRacer};
 use crate::range::ByteRange;
 use crate::storage::DiskWriter;
@@ -172,6 +173,9 @@ pub struct WorkerShared {
     pub file_size: u64,
     /// Fewest bytes a steal takes.
     pub min_steal: u64,
+    /// Most connections this download opens to one host, together with every other download
+    /// there (see [`crate::hosts`]); 0 for no limit of its own.
+    pub host_limit: usize,
     /// Max wait for response headers.
     pub stall_timeout: Duration,
     /// Max wait between body reads once the answer has started. Shorter than `stall_timeout`:
@@ -190,20 +194,28 @@ impl HttpWorker {
     }
 
     /// Takes chunks (or takes over or steals from slow ones) until cancelled or the engine goes away.
+    /// Each request holds a slot of its host's connection budget, taken before any chunk: waiting
+    /// for one is neither a stall nor a failure, and leaves nothing for others to steal.
     pub async fn run(self) {
         let s = &self.shared;
         loop {
             if s.cancel.is_cancelled() {
                 return;
             }
-            let Some((chunk, mirror_id, url, if_range)) = self.next_job() else {
+            let slot = tokio::select! {
+                biased;
+                _ = s.cancel.cancelled() => return,
+                slot = self.take_slot() => slot,
+            };
+            let job = slot.and_then(|(mirror_id, slot)| Some((self.next_job(mirror_id, &slot)?, mirror_id, slot)));
+            let Some(((chunk, url, if_range), mirror_id, slot)) = job else {
                 tokio::select! {
                     _ = s.cancel.cancelled() => return,
                     _ = tokio::time::sleep(IDLE_POLL) => continue,
                 }
             };
 
-            let outcome = self.download_chunk(&chunk, mirror_id, &url, if_range).await;
+            let outcome = self.download_chunk(&chunk, mirror_id, &url, if_range, &slot).await;
             if s.cancel.is_cancelled() {
                 s.mirrors.lock().release_mirror(mirror_id);
                 return;
@@ -211,7 +223,9 @@ impl HttpWorker {
             // Settled before looking for more work, so nobody (including this worker) mistakes
             // the chunk for a live one to steal from. The event wakes the engine so it notices
             // completion or a fatal error.
-            if let Some(event) = self.settle(&chunk, mirror_id, &url, outcome) {
+            let event = self.settle(&chunk, mirror_id, &url, outcome, &slot);
+            drop(slot);
+            if let Some(event) = event {
                 if s.events.send(event).await.is_err() {
                     return;
                 }
@@ -219,14 +233,33 @@ impl HttpWorker {
         }
     }
 
-    /// Picks the best available mirror, then a chunk for it: fresh work, else what is left of a
-    /// chunk gone silent, else part of a slow chunk, timed by what a new request to that mirror
-    /// costs. Lock order: mirrors, then chunks.
-    fn next_job(&self) -> Option<(Chunk, usize, Url, Option<String>)> {
+    /// A slot on the host of a mirror that can take another connection: the best such mirror
+    /// whose host has one free, else the best one's, once it has. `None` while no mirror can.
+    async fn take_slot(&self) -> Option<(usize, HostSlot)> {
+        let s = &self.shared;
+        let ranked: Vec<(usize, Url)> = {
+            let racer = s.mirrors.lock();
+            racer.ranked().into_iter().filter_map(|id| Some((id, racer.get_mirror(id)?.url.clone()))).collect()
+        };
+        for (mirror_id, url) in &ranked {
+            if let Some(slot) = hosts::try_acquire(url, s.host_limit) {
+                return Some((*mirror_id, slot));
+            }
+        }
+        let (mirror_id, url) = ranked.into_iter().next()?;
+        Some((mirror_id, hosts::acquire(&url, s.host_limit).await))
+    }
+
+    /// A chunk for the mirror `slot` was taken for, if it can still take a connection there:
+    /// fresh work, else what is left of a chunk gone silent, else part of a slow chunk, timed by
+    /// what a new request to that mirror costs. Lock order: mirrors, then chunks.
+    fn next_job(&self, mirror_id: usize, slot: &HostSlot) -> Option<(Chunk, Url, Option<String>)> {
         let s = &self.shared;
         let mut racer = s.mirrors.lock();
-        let mirror_id = racer.select_best_mirror()?;
-        let mirror = racer.get_mirror(mirror_id)?;
+        // Meanwhile the mirror may have filled up, cooled down or gone back to its own URL.
+        let mirror = racer
+            .get_mirror(mirror_id)
+            .filter(|m| m.score(Instant::now()) >= 0.0 && HostKey::of(&m.url) == *slot.host())?;
         let (url, if_range) = (mirror.url.clone(), mirror.if_range.clone());
         let timing = StealTiming { startup: mirror.ttfb(), thief_rate: mirror.speed_ewma };
         let chunk = {
@@ -243,13 +276,20 @@ impl HttpWorker {
                 .or_else(|| mgr.steal_work(self.worker_id, mirror_id, steal).map(|(_, c)| c))?
         };
         racer.acquire_mirror(mirror_id);
-        Some((chunk, mirror_id, url, if_range))
+        Some((chunk, url, if_range))
     }
 
-    /// Applies an attempt's outcome to mirror and chunk bookkeeping and returns the event to send.
-    /// A chunk another worker took over is no longer this worker's to complete or retry: only a
-    /// disk error still counts, and the silence against the mirror.
-    fn settle(&self, chunk: &Chunk, mirror_id: usize, url: &Url, outcome: Result<(), Failure>) -> Option<WorkerEvent> {
+    /// Applies an attempt's outcome to mirror, host and chunk bookkeeping and returns the event to
+    /// send. A chunk another worker took over is no longer this worker's to complete or retry:
+    /// only a disk error still counts, and the silence against the mirror.
+    fn settle(
+        &self,
+        chunk: &Chunk,
+        mirror_id: usize,
+        url: &Url,
+        outcome: Result<(), Failure>,
+        slot: &HostSlot,
+    ) -> Option<WorkerEvent> {
         let s = &self.shared;
         let mut racer = s.mirrors.lock();
         racer.release_mirror(mirror_id);
@@ -266,6 +306,9 @@ impl HttpWorker {
             }
             Err((kind, error)) => {
                 if !revoked {
+                    if matches!(kind, FailureKind::Throttled(_)) {
+                        slot.throttled();
+                    }
                     record_failure(&mut racer, &mut chunks, chunk_id, mirror_id, url, kind, &error);
                 } else if kind == FailureKind::Fatal {
                     chunks.abort(chunk_id, &error);
@@ -286,6 +329,7 @@ impl HttpWorker {
         mirror_id: usize,
         url: &Url,
         if_range: Option<String>,
+        slot: &HostSlot,
     ) -> Result<(), Failure> {
         let s = &self.shared;
         let start = chunk.current_offset.load(Ordering::SeqCst);
@@ -313,6 +357,7 @@ impl HttpWorker {
             },
         };
         check_response(response.status(), response.headers(), start, end, s.file_size, if_range.as_deref())?;
+        slot.accepted();
         let _ = s.events.try_send(WorkerEvent::Ttfb {
             worker_id: self.worker_id,
             mirror_id,
@@ -722,10 +767,16 @@ mod tests {
             limiter: None,
             file_size: size,
             min_steal: size,
+            host_limit: 0,
             stall_timeout: Duration::from_secs(10),
             body_idle: Duration::from_secs(5),
         };
         (HttpWorker::new(0, shared), chunk, rx)
+    }
+
+    /// A connection slot on `url`'s host, from no budget.
+    fn slot(url: &Url) -> HostSlot {
+        hosts::try_acquire(url, 0).unwrap()
     }
 
     /// A 206 body that sends each `(ms, len)` step `ms` after the one before, then goes silent.
@@ -809,21 +860,50 @@ mod tests {
             chunks.take_over_silent(1, 0, |_| Duration::from_secs(2)).unwrap()
         };
         let thiefs = || worker.shared.chunks.lock().chunks()[0].status == ChunkStatus::Assigned { worker_id: 1, mirror_id: 0 };
+        let held = slot(&url);
 
         // However the silent worker's attempt ends, the chunk stays the thief's.
-        assert!(worker.settle(&old, 0, &url, Ok(())).is_none());
+        assert!(worker.settle(&old, 0, &url, Ok(()), &held).is_none());
         assert!(thiefs());
-        assert!(matches!(worker.settle(&old, 0, &url, Err(taken_over())), Some(WorkerEvent::ChunkFailed { .. })));
+        assert!(matches!(worker.settle(&old, 0, &url, Err(taken_over()), &held), Some(WorkerEvent::ChunkFailed { .. })));
         assert!(thiefs(), "nor is it queued for a retry");
         assert_eq!(worker.shared.mirrors.lock().get_mirror(0).unwrap().failures, 1, "the silence counts against the mirror");
 
         let thief = HttpWorker::new(1, worker.shared.clone());
         taken.current_offset.store(1 << 20, Ordering::SeqCst);
-        assert!(matches!(thief.settle(&taken, 0, &url, Ok(())), Some(WorkerEvent::ChunkCompleted { .. })));
+        assert!(matches!(thief.settle(&taken, 0, &url, Ok(()), &held), Some(WorkerEvent::ChunkCompleted { .. })));
         assert!(worker.shared.chunks.lock().is_all_completed());
         // A disk error in the silent attempt still ends the download.
-        worker.settle(&old, 0, &url, Err((FailureKind::Fatal, "Disk write error: no space".into())));
+        worker.settle(&old, 0, &url, Err((FailureKind::Fatal, "Disk write error: no space".into())), &held);
         assert!(worker.shared.chunks.lock().has_fatal_failure().is_some());
+    }
+
+    #[test]
+    fn test_a_refusal_holds_every_download_to_the_connections_the_host_served() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = Url::parse("http://refusing.worker.example/f").unwrap();
+        let (worker, chunk, _events) = test_worker(&url, &dir.path().join("f.part"), 1 << 20);
+        let mut open: Vec<HostSlot> = (0..4).map(|_| slot(&url)).collect();
+        let refused = FailureKind::Throttled(None);
+        worker.settle(&chunk, 0, &url, Err((refused, "HTTP 503".into())), &open[3]);
+        open.pop();
+
+        assert_eq!(hosts::profile(&url).connection_cap, Some(3));
+        assert!(hosts::try_acquire(&url, 0).is_none(), "three are open");
+        open.pop();
+        assert!(hosts::try_acquire(&url, 0).is_some());
+    }
+
+    #[test]
+    fn test_a_slot_is_only_good_for_its_own_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = Url::parse("http://127.0.0.1:9/f").unwrap();
+        let (worker, ..) = test_worker(&url, &dir.path().join("f.part"), 1 << 20);
+        *worker.shared.chunks.lock() = ChunkManager::new(1 << 20, 1 << 19).unwrap();
+        // Say the mirror went back to its own URL on another host after the slot was taken.
+        let elsewhere = Url::parse("http://127.0.0.1:10/f").unwrap();
+        assert!(worker.next_job(0, &slot(&elsewhere)).is_none());
+        assert!(worker.next_job(0, &slot(&url)).is_some());
     }
 
     #[test]
@@ -842,7 +922,7 @@ mod tests {
             (mirror.ttfb_ewma_ms, mirror.speed_ewma) = (4000.0, 3.0 * MB as f64);
         }
         let thief = HttpWorker::new(1, worker.shared.clone());
-        let (stolen, ..) = thief.next_job().unwrap();
+        let (stolen, ..) = thief.next_job(0, &slot(&url)).unwrap();
         // The mirror's 4 s answers and 3 MB/s connections: both sides finish after 25.5 s.
         let split = 10 * MB + (25.5 * MB as f64) as u64;
         assert!(stolen.range.start.abs_diff(split) < MB, "split at {} instead of about {split}", stolen.range.start);
@@ -872,7 +952,7 @@ mod tests {
         let (mut worker, chunk, _events) = test_worker(&url, &dir.path().join("f.part"), SIZE as u64);
         worker.shared.stall_timeout = Duration::from_secs(10);
         worker.shared.body_idle = Duration::from_millis(100);
-        worker.download_chunk(&chunk, 0, &url, None).await.unwrap();
+        worker.download_chunk(&chunk, 0, &url, None, &slot(&url)).await.unwrap();
         assert_eq!(chunk.current_offset.load(Ordering::SeqCst), SIZE as u64);
     }
 
@@ -905,7 +985,7 @@ mod tests {
         let path = dir.path().join("f.part");
         let (worker, chunk, _events) = test_worker(&url, &path, SIZE as u64);
         let offset = Arc::clone(&chunk.current_offset);
-        let task = tokio::spawn(async move { worker.download_chunk(&chunk, 0, &url, None).await });
+        let task = tokio::spawn(async move { worker.download_chunk(&chunk, 0, &url, None, &slot(&url)).await });
 
         sent_rx.await.unwrap();
         // 64 KiB arrived, far less than a batch, and the server went quiet: within about
@@ -950,7 +1030,7 @@ mod tests {
         let path = dir.path().join("f.part");
         let (worker, chunk, _events) = test_worker(&url, &path, SIZE as u64);
         let offset = Arc::clone(&chunk.current_offset);
-        let err = worker.download_chunk(&chunk, 0, &url, None).await.unwrap_err();
+        let err = worker.download_chunk(&chunk, 0, &url, None, &slot(&url)).await.unwrap_err();
 
         assert_eq!(err.0, FailureKind::Transient, "{}", err.1);
         assert_eq!(offset.load(Ordering::SeqCst), 100_000);
