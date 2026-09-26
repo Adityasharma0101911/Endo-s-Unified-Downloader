@@ -1,18 +1,26 @@
 use std::time::{Duration, Instant};
 use url::Url;
 
+/// Consecutive bad responses (401/403/404/410, wrong Content-Range) after which a mirror is dropped.
+const MAX_BAD_RESPONSES: u32 = 2;
+
 /// Represents a single download source / mirror.
 #[derive(Debug, Clone)]
 pub struct Mirror {
     pub id: usize,
     pub url: Url,
+    /// Validator this mirror issued (strong ETag, else Last-Modified), sent back as `If-Range`.
+    pub if_range: Option<String>,
     pub speed_ewma: f64,    // bytes per second
     pub ttfb_ewma_ms: f64,  // milliseconds
     pub in_flight: usize,
     pub failures: u32,
     pub consecutive_successes: u32,
+    pub bad_responses: u32,
     pub is_active: bool,
     pub cooldown_until: Option<Instant>,
+    /// Concurrent connections the server tolerates; lowered when it throttles extra connections.
+    pub max_connections: usize,
 }
 
 impl Mirror {
@@ -20,19 +28,22 @@ impl Mirror {
         Self {
             id,
             url,
+            if_range: None,
             speed_ewma: 1_000_000.0, // Initial optimistic estimate: 1 MB/s
             ttfb_ewma_ms: 100.0,     // Initial optimistic TTFB: 100ms
             in_flight: 0,
             failures: 0,
             consecutive_successes: 0,
+            bad_responses: 0,
             is_active: true,
             cooldown_until: None,
+            max_connections: usize::MAX,
         }
     }
 
-    /// Calculates a composite fitness score. Higher is better.
+    /// Calculates a composite fitness score. Higher is better; negative means "do not use now".
     pub fn score(&self, now: Instant) -> f64 {
-        if !self.is_active {
+        if !self.is_active || self.in_flight >= self.max_connections {
             return -1.0;
         }
 
@@ -69,20 +80,43 @@ impl Mirror {
         self.ttfb_ewma_ms = (ALPHA * ttfb_ms) + ((1.0 - ALPHA) * self.ttfb_ewma_ms);
     }
 
+    /// The mirror answered a request with usable data. Also probes for one more connection
+    /// if it throttled us earlier (additive increase).
     pub fn record_success(&mut self) {
         self.consecutive_successes += 1;
         if self.consecutive_successes > 3 && self.failures > 0 {
             self.failures -= 1;
         }
-        self.cooldown_until = None;
+        self.bad_responses = 0;
+        self.max_connections = self.max_connections.saturating_add(1);
     }
 
-    pub fn record_failure(&mut self, now: Instant) {
+    /// A transient failure: lowers the mirror's score.
+    pub fn record_failure(&mut self) {
         self.failures += 1;
         self.consecutive_successes = 0;
-        // Exponential backoff: 100ms * 2^failures, up to 2000ms
-        let backoff_ms = (100 * (1 << self.failures.min(4))).min(2000);
-        self.cooldown_until = Some(now + Duration::from_millis(backoff_ms));
+    }
+
+    /// A response proving the mirror unusable. Returns true if the mirror was just deactivated.
+    pub fn record_bad_response(&mut self) -> bool {
+        self.record_failure();
+        self.bad_responses += 1;
+        let deactivate = self.is_active && self.bad_responses >= MAX_BAD_RESPONSES;
+        if deactivate {
+            self.is_active = false;
+        }
+        deactivate
+    }
+
+    /// The server rejected a connection (429/503) while `others_in_flight` of ours were being served.
+    pub fn record_throttled(&mut self, others_in_flight: usize) {
+        self.record_failure();
+        self.max_connections = self.max_connections.min(others_in_flight.max(1));
+    }
+
+    /// Stops new requests to this mirror until `until`.
+    pub fn cool_down(&mut self, until: Instant) {
+        self.cooldown_until = Some(self.cooldown_until.map_or(until, |c| c.max(until)));
     }
 }
 
@@ -110,18 +144,15 @@ impl MirrorRacer {
         &mut self.mirrors
     }
 
-    /// Selects the best performing mirror currently available.
+    /// Selects the best mirror that can take another connection right now, if any.
     pub fn select_best_mirror(&self) -> Option<usize> {
         let now = Instant::now();
         self.mirrors
             .iter()
-            .filter(|m| m.score(now) >= 0.0)
-            .max_by(|a, b| {
-                a.score(now)
-                    .partial_cmp(&b.score(now))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .map(|m| m.id)
+            .map(|m| (m.id, m.score(now)))
+            .filter(|&(_, score)| score >= 0.0)
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(id, _)| id)
     }
 
     pub fn get_mirror(&self, id: usize) -> Option<&Mirror> {
@@ -143,19 +174,32 @@ impl MirrorRacer {
             m.in_flight = m.in_flight.saturating_sub(1);
         }
     }
+
+    /// True once every mirror has been deactivated.
+    pub fn all_inactive(&self) -> bool {
+        self.mirrors.iter().all(|m| !m.is_active)
+    }
+
+    /// Connections currently open across all mirrors.
+    pub fn in_flight(&self) -> usize {
+        self.mirrors.iter().map(|m| m.in_flight).sum()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_mirror_racing_selection() {
-        let urls = vec![
+    fn racer() -> MirrorRacer {
+        MirrorRacer::new(vec![
             Url::parse("https://fast.example.com/file.iso").unwrap(),
             Url::parse("https://slow.example.com/file.iso").unwrap(),
-        ];
-        let mut racer = MirrorRacer::new(urls);
+        ])
+    }
+
+    #[test]
+    fn test_mirror_racing_selection() {
+        let mut racer = racer();
 
         // Fast mirror: 10 MB/s, 20ms TTFB
         racer.get_mirror_mut(0).unwrap().speed_ewma = 10_000_000.0;
@@ -165,12 +209,41 @@ mod tests {
         racer.get_mirror_mut(1).unwrap().speed_ewma = 500_000.0;
         racer.get_mirror_mut(1).unwrap().ttfb_ewma_ms = 200.0;
 
-        let best = racer.select_best_mirror().unwrap();
-        assert_eq!(best, 0);
+        assert_eq!(racer.select_best_mirror(), Some(0));
 
-        // Simulate failure on fast mirror
-        racer.get_mirror_mut(0).unwrap().record_failure(Instant::now());
-        let best_after_fail = racer.select_best_mirror().unwrap();
-        assert_eq!(best_after_fail, 1);
+        // A cooling-down mirror is skipped, and success elsewhere must not lift the cooldown.
+        racer.get_mirror_mut(0).unwrap().cool_down(Instant::now() + Duration::from_secs(60));
+        racer.get_mirror_mut(0).unwrap().record_success();
+        assert_eq!(racer.select_best_mirror(), Some(1));
+
+        // With every mirror unavailable there is no fallback to mirror 0.
+        racer.get_mirror_mut(1).unwrap().cool_down(Instant::now() + Duration::from_secs(60));
+        assert_eq!(racer.select_best_mirror(), None);
+    }
+
+    #[test]
+    fn test_bad_mirror_is_deactivated_after_consecutive_bad_responses() {
+        let mut racer = racer();
+        let m = racer.get_mirror_mut(0).unwrap();
+        assert!(!m.record_bad_response());
+        m.record_success(); // a good response in between resets the streak
+        assert!(!m.record_bad_response());
+        assert!(m.record_bad_response());
+        assert!(!racer.all_inactive());
+        assert_eq!(racer.select_best_mirror(), Some(1));
+        assert!(!racer.get_mirror_mut(1).unwrap().record_bad_response());
+        assert!(racer.get_mirror_mut(1).unwrap().record_bad_response());
+        assert!(racer.all_inactive());
+    }
+
+    #[test]
+    fn test_throttling_caps_connections_then_probes_upward() {
+        let mut racer = MirrorRacer::new(vec![Url::parse("https://a.example.com/f").unwrap()]);
+        racer.acquire_mirror(0);
+        racer.acquire_mirror(0);
+        racer.get_mirror_mut(0).unwrap().record_throttled(2);
+        assert_eq!(racer.select_best_mirror(), None, "at the cap");
+        racer.get_mirror_mut(0).unwrap().record_success();
+        assert_eq!(racer.select_best_mirror(), Some(0), "one more connection is allowed after a success");
     }
 }
