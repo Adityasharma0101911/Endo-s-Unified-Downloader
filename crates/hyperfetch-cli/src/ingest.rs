@@ -1,6 +1,6 @@
 //! Turns user input (command-line URLs, batch-file lines, interactive input) into download tasks.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use hyperfetch_core::{metalink, torrent};
 use url::Url;
@@ -73,10 +73,34 @@ fn descriptor_source(token: &str) -> Option<(Source, Descriptor)> {
     }
 }
 
-/// A magnet display name usable as a file name (no directories, no traversal).
-fn safe_file_name(name: &str) -> Option<&str> {
-    let name = name.trim();
-    (!name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\', ':', '\0'])).then_some(name)
+/// `name` (from a torrent, metalink or magnet, so untrusted) made safe as one path component on
+/// every OS: control characters and characters Windows forbids become '_', and the trailing dots
+/// and spaces Windows drops are removed. None when nothing is left, as for "." and "..".
+fn clean_component(name: &str) -> Option<String> {
+    let cleaned: String =
+        name.chars().map(|c| if c.is_control() || "<>:\"/\\|?*".contains(c) { '_' } else { c }).collect();
+    let cleaned = cleaned.trim().trim_end_matches(['.', ' ']);
+    (!cleaned.is_empty()).then(|| cleaned.to_string())
+}
+
+/// A relative path built from untrusted name components, each cleaned by [`clean_component`].
+fn clean_path<'a>(components: impl IntoIterator<Item = &'a str>) -> Result<PathBuf, String> {
+    components
+        .into_iter()
+        .map(|c| clean_component(c).ok_or_else(|| format!("unusable file name {:?}", c)))
+        .collect()
+}
+
+/// Splits one line of input into mirror tokens. A line naming a single existing local file (a
+/// .torrent path with spaces, possibly quoted by drag and drop) stays one token; quotes around
+/// tokens are removed.
+pub async fn input_tokens(line: &str) -> Vec<String> {
+    let unquote = |s: &str| s.trim().trim_matches(['"', '\'']).to_string();
+    let whole = unquote(line);
+    if tokio::fs::metadata(&whole).await.is_ok_and(|m| m.is_file()) {
+        return vec![whole];
+    }
+    line.split_whitespace().map(unquote).filter(|t| !t.is_empty()).collect()
 }
 
 /// Parses one input (a batch line split on whitespace, or the command-line URLs) into tasks.
@@ -119,7 +143,7 @@ pub async fn ingest(tokens: &[&str], http: &reqwest::Client) -> Result<Vec<Task>
                 ));
             }
             if task.name.is_none() {
-                task.name = magnet.display_name.as_deref().and_then(safe_file_name).map(PathBuf::from);
+                task.name = magnet.display_name.as_deref().and_then(clean_component).map(PathBuf::from);
             }
             magnet.web_seeds
         } else {
@@ -169,7 +193,7 @@ fn metalink_tasks(bytes: &[u8]) -> Result<Vec<Task>, String> {
             let checksum = ["sha256", "md5"]
                 .iter()
                 .find_map(|algo| file.hashes.iter().find(|(t, _)| t == algo).map(|(t, h)| format!("{}:{}", t, h)));
-            Ok(Task { urls: file.urls, name: Some(PathBuf::from(file.name)), checksum })
+            Ok(Task { name: Some(clean_path([file.name.as_str()])?), urls: file.urls, checksum })
         })
         .collect()
 }
@@ -180,14 +204,14 @@ fn torrent_tasks(bytes: &[u8]) -> Result<Vec<Task>, String> {
     info.files
         .iter()
         .map(|file| {
-            let relative: PathBuf = file.path.iter().collect();
+            let relative = clean_path(file.path.iter().map(String::as_str))?;
             if file.urls.is_empty() {
                 return Err(format!(
                     "torrent file '{}' has no HTTP web seeds (url-list); BitTorrent swarm downloads are not supported",
                     relative.display()
                 ));
             }
-            let name = if single_file { relative } else { Path::new(&info.name).join(relative) };
+            let name = if single_file { relative } else { clean_path([info.name.as_str()])?.join(relative) };
             Ok(Task { urls: file.urls.clone(), name: Some(name), checksum: None })
         })
         .collect()
@@ -218,6 +242,7 @@ pub fn batch_lines(text: &str) -> impl Iterator<Item = &str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn run(line: &str) -> Result<Vec<Task>, String> {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -285,6 +310,42 @@ d6:lengthi4e4:pathl5:y.bineee4:name4:root12:piece lengthi16384e6:pieces20:aaaaaa
 
         let no_seeds = b"d4:infod6:lengthi3e4:name5:x.bin12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaaee";
         assert!(torrent_tasks(no_seeds).unwrap_err().contains("no HTTP web seeds"));
+    }
+
+    #[test]
+    fn untrusted_names_are_cleaned() {
+        let name = "\u{1b}[31mRED\u{1b}[0m?.bin";
+        let torrent = format!(
+            "d8:url-list20:https://s.example/d/4:infod6:lengthi3e4:name{}:{}12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaaee",
+            name.len(),
+            name
+        );
+        let tasks = torrent_tasks(torrent.as_bytes()).unwrap();
+        assert_eq!(tasks[0].name, Some(PathBuf::from("_[31mRED_[0m_.bin")));
+
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        let tasks = run(&format!("magnet:?xt=urn:btih:{}&dn=Ep+1%3A+Pilot%1B.mkv..&ws=https%3A%2F%2Fs.example%2Fx", hash)).unwrap();
+        assert_eq!(tasks[0].name, Some(PathBuf::from("Ep 1_ Pilot_.mkv")));
+
+        assert_eq!(clean_component(".."), None);
+        assert_eq!(clean_component(" . "), None);
+        assert!(clean_path(["ok", ".."]).unwrap_err().contains("unusable"));
+    }
+
+    #[test]
+    fn a_local_path_with_spaces_stays_one_token() {
+        let dir = std::env::temp_dir().join(format!("hf cli tokens {}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("my file.torrent");
+        std::fs::write(&path, b"x").unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let plain = rt.block_on(input_tokens(path.to_str().unwrap()));
+        let quoted = rt.block_on(input_tokens(&format!("\"{}\"", path.display())));
+        let mirrors = rt.block_on(input_tokens("\"https://a.example/f\"  https://b.example/f"));
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(plain, [path.to_str().unwrap()]);
+        assert_eq!(quoted, plain);
+        assert_eq!(mirrors, ["https://a.example/f", "https://b.example/f"]);
     }
 
     #[test]
