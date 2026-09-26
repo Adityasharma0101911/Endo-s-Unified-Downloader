@@ -141,6 +141,8 @@ const RELEASE_BASE: &str = "https://github.com/yt-dlp/yt-dlp/releases/latest";
 
 /// First yt-dlp release that understands `--js-runtimes`; older builds abort on the unknown flag.
 const JS_RUNTIMES_MIN_VERSION: (u32, u32, u32) = (2025, 11, 12);
+/// First yt-dlp release that understands `--no-plugin-dirs`.
+const NO_PLUGIN_DIRS_MIN_VERSION: (u32, u32, u32) = (2025, 3, 21);
 
 // yt-dlp prints these machine-readable lines for us (see `build_ytdlp_args`).
 // Fields: status, downloaded, total, total estimate ('~' sizes), speed, eta, stream file name.
@@ -207,22 +209,35 @@ fn next_to_current_exe(name: &str) -> Option<PathBuf> {
     candidate.is_file().then_some(candidate)
 }
 
+/// Searches the absolute PATH entries; a relative entry would depend on the current directory.
 fn find_in_path(name: &str) -> Option<PathBuf> {
     std::env::split_paths(&std::env::var_os("PATH")?)
+        .filter(|dir| dir.is_absolute())
         .map(|dir| dir.join(name))
         .find(|candidate| candidate.is_file())
 }
 
-/// Per-user directory the managed yt-dlp is installed into (always writable, unlike the
-/// application directory under Program Files or /usr/local/bin).
-fn managed_bin_dir() -> Option<PathBuf> {
+/// Per-user application data directory.
+fn app_data_dir() -> Option<PathBuf> {
     #[cfg(windows)]
     let data_dir = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
     #[cfg(not(windows))]
     let data_dir = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local").join("share")));
-    Some(data_dir?.join("EndosUnifiedDownloader").join("bin"))
+    Some(data_dir?.join("EndosUnifiedDownloader"))
+}
+
+/// Per-user directory the managed yt-dlp is installed into (always writable, unlike the
+/// application directory under Program Files or /usr/local/bin).
+fn managed_bin_dir() -> Option<PathBuf> {
+    Some(app_data_dir()?.join("bin"))
+}
+
+/// Empty per-user directory yt-dlp runs in, so nothing in the user's current directory
+/// (such as a planted `yt-dlp.conf`) can influence it.
+fn ytdlp_work_dir() -> PathBuf {
+    app_data_dir().map_or_else(std::env::temp_dir, |dir| dir.join("ytdlp-work"))
 }
 
 fn managed_ytdlp_path() -> Option<PathBuf> {
@@ -295,7 +310,7 @@ fn discover_js_runtime() -> Option<String> {
     }
 
     if let Some(path_var) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path_var) {
+        for dir in std::env::split_paths(&path_var).filter(|dir| dir.is_absolute()) {
             for kind in ["node", "deno", "bun"] {
                 let candidate = dir.join(exe_name(kind));
                 if candidate.is_file() {
@@ -541,7 +556,7 @@ async fn update_managed_ytdlp(proxy: Option<&str>, current: Option<&str>) -> Res
 /// Last successfully probed `yt-dlp --version`, keyed by binary path.
 static VERSION_CACHE: parking_lot::Mutex<Option<(PathBuf, String)>> = parking_lot::const_mutex(None);
 
-async fn ytdlp_version(bin: &Path) -> Option<String> {
+async fn ytdlp_version(bin: &Path, work_dir: &Path) -> Option<String> {
     let cached = VERSION_CACHE.lock().clone();
     if let Some((path, version)) = cached {
         if path == bin {
@@ -550,7 +565,11 @@ async fn ytdlp_version(bin: &Path) -> Option<String> {
     }
 
     let mut cmd = Command::new(bin);
-    cmd.arg("--version").stdin(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true);
+    cmd.args(["--ignore-config", "--version"])
+        .current_dir(work_dir)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
     hide_console(&mut cmd);
     let output = tokio::time::timeout(Duration::from_secs(30), cmd.output()).await.ok()?.ok()?;
     let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -571,13 +590,20 @@ fn version_at_least(version: &str, min: (u32, u32, u32)) -> bool {
     }
 }
 
+/// yt-dlp arguments for one run. Paths in `options` must be absolute: yt-dlp runs in
+/// [`ytdlp_work_dir`]. The proxy is not among them (see [`ytdlp_command`]).
 fn build_ytdlp_args(
     url: &Url,
     options: &MediaDownloadOptions,
     ffmpeg_dir: Option<&Path>,
     js_runtime: Option<&str>,
+    version: Option<&str>,
 ) -> Vec<String> {
+    let supports = |min| version.is_some_and(|v| version_at_least(v, min));
     let mut args: Vec<String> = [
+        // Config files (next to the binary, in the working directory, per user, system wide)
+        // can run arbitrary commands via --exec and would break our output parsing.
+        "--ignore-config",
         "--newline",
         "--progress",
         "--no-colors",
@@ -602,7 +628,10 @@ fn build_ytdlp_args(
     .map(String::from)
     .to_vec();
 
-    if let Some(runtime) = js_runtime {
+    if supports(NO_PLUGIN_DIRS_MIN_VERSION) {
+        args.push("--no-plugin-dirs".to_string());
+    }
+    if let Some(runtime) = js_runtime.filter(|_| supports(JS_RUNTIMES_MIN_VERSION)) {
         args.extend(["--js-runtimes".to_string(), runtime.to_string()]);
     }
     if let Some(dir) = ffmpeg_dir {
@@ -610,9 +639,6 @@ fn build_ytdlp_args(
     }
     args.extend(options.preset.to_args());
     args.extend(options.cookies.to_args());
-    if let Some(ref proxy) = options.proxy {
-        args.extend(["--proxy".to_string(), proxy.clone()]);
-    }
     if options.concurrent_fragments > 1 {
         args.extend(["--concurrent-fragments".to_string(), options.concurrent_fragments.min(32).to_string()]);
     }
@@ -898,18 +924,33 @@ fn tree_command(program: &Path) -> Command {
     cmd
 }
 
+/// The yt-dlp invocation, run in `work_dir`. A proxy goes into the child's environment,
+/// which yt-dlp (and the ffmpeg it starts) honor: on the command line its credentials
+/// would be visible to every local user.
+fn ytdlp_command(bin: &Path, args: &[String], proxy: Option<&str>, work_dir: &Path) -> Command {
+    let mut cmd = tree_command(bin);
+    // Otherwise Python encodes piped output in the locale code page (cp1252 on Windows).
+    cmd.args(args).current_dir(work_dir).env("PYTHONIOENCODING", "utf-8");
+    if let Some(proxy) = proxy {
+        // Python prefers the lower-case names; set both so an inherited value cannot win.
+        for var in ["http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"] {
+            cmd.env(var, proxy);
+        }
+        // --proxy applied to every host; an inherited exemption list must not change that.
+        cmd.env_remove("no_proxy").env_remove("NO_PROXY");
+    }
+    cmd
+}
+
 /// Run yt-dlp once and return the file it produced.
 async fn run_ytdlp(
-    bin: &Path,
-    args: &[String],
+    mut cmd: Command,
     progress_tx: Option<&Sender<ProgressUpdate>>,
     cancel_flag: Option<Arc<AtomicBool>>,
 ) -> Result<PathBuf, String> {
-    let mut cmd = tree_command(bin);
-    // Otherwise Python encodes piped output in the locale code page (cp1252 on Windows).
-    cmd.args(args).env("PYTHONIOENCODING", "utf-8");
-
-    let mut child = cmd.spawn().map_err(|e| format!("Failed to spawn yt-dlp ({}): {e}", bin.display()))?;
+    let mut child = cmd.spawn().map_err(|e| {
+        format!("Failed to spawn yt-dlp ({}): {e}", Path::new(cmd.as_std().get_program()).display())
+    })?;
     let mut tree = ProcessTree::attach(&child);
     let mut stdout = BufReader::new(child.stdout.take().ok_or("Failed to capture yt-dlp stdout")?);
     let mut stderr = BufReader::new(child.stderr.take().ok_or("Failed to capture yt-dlp stderr")?);
@@ -974,8 +1015,20 @@ pub async fn download_media(
             .await
             .map_err(|e| format!("Tool discovery failed: {e}"))?;
 
+    // yt-dlp runs in its own working directory, so every path it gets must be absolute.
+    let absolute = |p: &Path| std::path::absolute(p).map_err(|e| format!("Invalid path {}: {e}", p.display()));
+    let mut options = options.clone();
+    options.output_dir = absolute(&options.output_dir)?;
+    if let BrowserCookieSource::File(path) = &mut options.cookies {
+        *path = absolute(path)?;
+    }
+    let work_dir = ytdlp_work_dir();
+    tokio::fs::create_dir_all(&work_dir)
+        .await
+        .map_err(|e| format!("Failed to create {}: {e}", work_dir.display()))?;
+
     let ytdlp_bin = match (&options.custom_ytdlp_path, found_ytdlp) {
-        (Some(path), _) => path.clone(),
+        (Some(path), _) => absolute(path)?,
         (None, Some(path)) => path,
         (None, None) => tokio::select! {
             installed = install_managed_ytdlp(options.proxy.as_deref()) => installed?,
@@ -995,11 +1048,11 @@ pub async fn download_media(
 
     let mut updated = false;
     loop {
-        let version = ytdlp_version(&ytdlp_bin).await;
-        let supports_js = version.as_deref().is_some_and(|v| version_at_least(v, JS_RUNTIMES_MIN_VERSION));
-        let args = build_ytdlp_args(url, options, ffmpeg_dir, js_runtime.as_deref().filter(|_| supports_js));
+        let version = ytdlp_version(&ytdlp_bin, &work_dir).await;
+        let args = build_ytdlp_args(url, &options, ffmpeg_dir, js_runtime.as_deref(), version.as_deref());
+        let cmd = ytdlp_command(&ytdlp_bin, &args, options.proxy.as_deref(), &work_dir);
 
-        let err = match run_ytdlp(&ytdlp_bin, &args, progress_tx.as_ref(), cancel_flag.clone()).await {
+        let err = match run_ytdlp(cmd, progress_tx.as_ref(), cancel_flag.clone()).await {
             Ok(path) => return Ok(path),
             Err(err) => err,
         };
@@ -1152,16 +1205,61 @@ mod tests {
         let url = Url::parse("https://www.youtube.com/watch?v=abc&list=PL123").unwrap();
         let options = MediaDownloadOptions { output_dir: PathBuf::from("out"), ..Default::default() };
 
-        let args = build_ytdlp_args(&url, &options, None, None);
+        let node = Some("node:/usr/bin/node");
+        let args = build_ytdlp_args(&url, &options, None, node, Some("2025.10.22"));
         assert!(!args.contains(&"--js-runtimes".to_string()));
         assert!(args.contains(&"--no-playlist".to_string()));
         assert!(args.contains(&PATH_TEMPLATE.to_string()));
         assert!(args.contains(&PROGRESS_TEMPLATE.to_string()));
         assert_eq!(args.last(), Some(&url.to_string()));
 
-        let args = build_ytdlp_args(&url, &options, None, Some("node:/usr/bin/node"));
+        let args = build_ytdlp_args(&url, &options, None, node, Some("2025.11.12"));
         let at = args.iter().position(|a| a == "--js-runtimes").expect("flag present");
         assert_eq!(args[at + 1], "node:/usr/bin/node");
+    }
+
+    #[test]
+    fn args_never_load_config_files_or_plugins() {
+        let url = Url::parse("https://www.youtube.com/watch?v=abc").unwrap();
+        let options = MediaDownloadOptions { output_dir: PathBuf::from("out"), ..Default::default() };
+        for version in [None, Some("2024.12.23"), Some("2026.08.19")] {
+            let args = build_ytdlp_args(&url, &options, None, None, version);
+            assert_eq!(args[0], "--ignore-config", "{version:?}");
+        }
+        let has_no_plugin_dirs = |version| {
+            build_ytdlp_args(&url, &options, None, None, version).contains(&"--no-plugin-dirs".to_string())
+        };
+        assert!(has_no_plugin_dirs(Some("2025.03.21")));
+        assert!(!has_no_plugin_dirs(Some("2025.02.19")), "older builds abort on the unknown flag");
+        assert!(!has_no_plugin_dirs(None));
+    }
+
+    #[test]
+    fn command_runs_in_work_dir_with_proxy_only_in_environment() {
+        let url = Url::parse("https://www.youtube.com/watch?v=abc").unwrap();
+        let proxy = "http://alice:S3cret@proxy:3128";
+        let options = MediaDownloadOptions {
+            output_dir: PathBuf::from("out"),
+            proxy: Some(proxy.to_string()),
+            ..Default::default()
+        };
+        let args = build_ytdlp_args(&url, &options, None, None, None);
+        assert!(!args.iter().any(|a| a == "--proxy" || a.contains("S3cret")), "{args:?}");
+
+        let work_dir = std::env::temp_dir();
+        let cmd = ytdlp_command(Path::new("yt-dlp"), &args, options.proxy.as_deref(), &work_dir);
+        let cmd = cmd.as_std();
+        assert_eq!(cmd.get_current_dir(), Some(work_dir.as_path()));
+        let env = |name: &str| {
+            cmd.get_envs().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.map(|v| v.to_owned()))
+        };
+        for var in ["http_proxy", "https_proxy", "all_proxy"] {
+            assert_eq!(env(var), Some(Some(proxy.into())), "{var}");
+        }
+        assert_eq!(env("no_proxy"), Some(None), "inherited NO_PROXY is removed");
+
+        let without_proxy = ytdlp_command(Path::new("yt-dlp"), &args, None, &work_dir);
+        assert!(!without_proxy.as_std().get_envs().any(|(k, _)| k.eq_ignore_ascii_case("http_proxy")));
     }
 
     #[test]
