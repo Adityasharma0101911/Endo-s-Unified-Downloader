@@ -517,28 +517,39 @@ impl DownloadEngine {
     }
 
     /// Probes all mirrors concurrently; returns the reference probe, the mirrors that serve the
-    /// same file and the reference's answer while it is still coming. The first successful probe
-    /// (every one before it having failed) defines the file: when it takes ranges or brought the
-    /// whole file it is the reference, and the download starts without waiting for the other
-    /// probes, which come with it as `late`. Otherwise another mirror may have to lead, so every
-    /// probe is waited for. A Google Drive answer that is a web page fails its mirror's probe.
+    /// same file and the reference's answer while it is still coming. The mirror that leads is the
+    /// first, in URL order, of those whose probes answered (failures aside), the first mirror's
+    /// counting from when its answer is in, while its start is read. When that mirror takes ranges
+    /// or brought the whole file it is the reference, and the download starts without waiting for
+    /// the probes still out, which come with it as `late`: a mirror that answers later, listed
+    /// before it or not, only joins if it serves the same file. Otherwise another mirror may have
+    /// to lead, so every probe is waited for, and no answer holds its host slot meanwhile: another
+    /// probe may need it. A Google Drive answer that is a web page fails its mirror's probe.
     async fn probe_all(&self, client: &Client, urls: &[Url]) -> Result<Probed, String> {
         let (limiter, stall) = (self.limiter(), self.stall_timeout());
         let several_connections = self.options.num_connections > 1;
         let limit = self.options.max_connections_per_host;
+        // Whether the first mirror's start is being read, and whether the download went ahead
+        // without its answer, which then has no start to read.
+        let (reading, started) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
         // Owned, as the probes may still be out once this returns.
         let (client, auth, owned) = (client.clone(), self.auth.clone(), urls.to_vec());
+        let flags = (Arc::clone(&reading), Arc::clone(&started));
         let mut probes: ProbeStream = futures_util::stream::iter(owned.into_iter().enumerate())
             .map(move |(i, url)| {
                 let (client, auth, limiter) = (client.clone(), auth.clone(), limiter.clone());
+                let (reading, started) = (Arc::clone(&flags.0), Arc::clone(&flags.1));
                 async move {
                     let probe = async {
                         // Only the first mirror fetches the file's start: the download uses one copy.
                         let (mut info, body) = probe_url(&client, auth.as_deref(), &url, i == 0, limit).await?;
                         GoogleDriveResolver::check_answer(&url, &info.headers).map_err(|e| format!("{}: {}", url, e))?;
                         let live = match body {
-                            Some(body) => take_start(&mut info, body, several_connections, limiter.as_deref(), stall).await,
-                            None => None,
+                            Some(body) if !started.load(Ordering::Relaxed) => {
+                                reading.store(true, Ordering::Relaxed);
+                                take_start(&mut info, body, several_connections, limiter.as_deref(), stall).await
+                            }
+                            _ => None,
                         };
                         Ok((info, live))
                     };
@@ -559,14 +570,25 @@ impl DownloadEngine {
             if let Some(slot) = done.get_mut(i) {
                 *slot = Some(probe);
             }
-            let first = done.iter().find(|probe| !matches!(probe, Some(Err(_))));
-            if let Some(Some(Ok((info, _)))) = first {
+            let lead = done.iter().enumerate().find(|&(i, probe)| match probe {
+                Some(probe) => probe.is_ok(),
+                None => i == 0 && reading.load(Ordering::Relaxed),
+            });
+            if let Some((_, Some(Ok((info, _))))) = lead {
                 if info.accepts_ranges || info.size == Some(info.prefetch.len() as u64) {
                     break true;
                 }
             }
+            if done.iter().any(Option::is_none) {
+                for (_, live) in done.iter_mut().flatten().flatten() {
+                    *live = None;
+                }
+            }
         };
-        let late = (starts && done.iter().any(Option::is_none)).then_some(probes);
+        let late = (starts && done.iter().any(Option::is_none)).then(|| {
+            started.store(true, Ordering::Relaxed);
+            probes
+        });
         // Only the first mirror's answer can still be coming.
         let mut live = None;
         let probes = done
@@ -591,6 +613,9 @@ impl DownloadEngine {
         snapshot_tx: Option<broadcast::Sender<EngineSnapshot>>,
     ) -> Result<PathBuf, String> {
         let Probed { reference, mirrors, live, late } = probed;
+        // Mirrors answering late only join a download over ranges: otherwise their probes, and
+        // the host slots they hold, are given up now.
+        let late = late.filter(|_| reference.accepts_ranges && reference.size != Some(reference.prefetch.len() as u64));
         let started_at = unix_now();
         let base = self.output_path_for(&reference.filename);
         let mut known_urls = self.url_strings();
@@ -1448,7 +1473,10 @@ struct Pace {
 ///
 /// HEAD and GET each hold a slot of their host's budget under `limit` (see [`crate::hosts`]).
 /// The GET waits for its slot before the probe's time runs, since a host busy with other
-/// downloads is no dead mirror, and keeps it for as long as its answer is read.
+/// downloads is no dead mirror, and keeps it for as long as its answer is read. HEAD goes out
+/// alongside only with a slot free at once: waiting for one while the GET holds another could be
+/// waiting for the GET's own. Without one, HEAD goes out after a GET that left no body to read,
+/// under the GET's slot, and is left out otherwise.
 async fn probe_url(
     client: &Client,
     auth: Option<&Auth>,
@@ -1472,9 +1500,7 @@ async fn probe_with(
     slot: HostSlot,
 ) -> Result<(ProbeInfo, Option<ProbeBody>), String> {
     let cold = slot.opens_connection();
-    let head = async {
-        // Waiting for a slot here is bounded like HEAD itself: by the grace after the GET's answer.
-        let _slot = hosts::acquire(url, limit).await;
+    let send_head = || async move {
         match authorize(client.head(url.clone()), auth, url).send().await {
             Ok(resp) if resp.status().is_success() => Some(resp),
             Ok(resp) => {
@@ -1487,7 +1513,15 @@ async fn probe_with(
             }
         }
     };
-    let range = format!("bytes=0-{}", if prefetch { PREFETCH - 1 } else { 0 });
+    let head_slot = hosts::try_acquire(url, limit);
+    let alongside = head_slot.is_some();
+    let head = async {
+        let _slot = head_slot?;
+        send_head().await
+    };
+    // The bytes the GET asks for.
+    let asked = if prefetch { PREFETCH } else { 1 };
+    let range = format!("bytes=0-{}", asked - 1);
     // Also when it answered and, for a first try, how long that took: what a connection needs to start.
     let ranged = async {
         let mut attempt = 0;
@@ -1528,20 +1562,26 @@ async fn probe_with(
             (head, ranged)
         }
     };
+    // Still busy or unreachable after every try: that says nothing about range support.
+    let unanswered = ranged.as_ref().map_or(true, |resp| is_busy(resp.status()));
+    let usable = ranged.as_ref().is_ok_and(|resp| {
+        matches!(resp.status(), StatusCode::PARTIAL_CONTENT | StatusCode::OK | StatusCode::RANGE_NOT_SATISFIABLE)
+    });
+    // HEAD without a slot of its own goes out now if the GET left nothing to read under its slot:
+    // it is all the probe has to go by then.
+    let head = match head {
+        None if !alongside && !usable => send_head().await,
+        head => head,
+    };
     // A body is read under the GET's slot, which a redirect moves to the host it came from.
     let body = |response: Response, holds: Holds| {
         let slot = slot_at(slot, response.url(), limit)?;
         Some(ProbeBody { response, slot, holds, answered, setup })
     };
     let head_len = head.as_ref().and_then(|r| content_length(r.headers()));
-    // Still busy or unreachable after every try: that says nothing about range support.
-    let unanswered = ranged.as_ref().map_or(true, |resp| is_busy(resp.status()));
 
     let get = match (ranged, &head) {
-        (Ok(resp), _) if matches!(
-            resp.status(),
-            StatusCode::PARTIAL_CONTENT | StatusCode::OK | StatusCode::RANGE_NOT_SATISFIABLE
-        ) => resp,
+        (Ok(resp), _) if usable => resp,
         // Go by HEAD. A refused range request means a single stream. An unanswered one is no
         // reason to demote the download to one stream that cannot resume, so range support is as
         // a ranged GET to the host found before, else as HEAD's Accept-Ranges says, and the
@@ -3238,8 +3278,9 @@ mod tests {
 
     /// A local server of `data` at every path: HEAD, and GETs honouring `Range` whose bodies come
     /// 64 KiB per `pace`. `/moved/<name>` redirects to `/<name>`, the first GET of `/busy/<name>`
-    /// is refused with 503, and the first GET of `/stall/<name>` past the file's start goes
-    /// silent after 64 KiB.
+    /// and every GET of `/refused/<name>` are refused with 503, GETs of `/untagged/<name>` carry
+    /// no ETag, and the first GET of `/stall/<name>` past the file's start goes silent after
+    /// 64 KiB.
     async fn file_server(data: Vec<u8>, pace: Duration) -> Url {
         use tokio::io::AsyncReadExt;
         let listener = crate::hosts::unseen_listener().await;
@@ -3270,13 +3311,14 @@ mod tests {
                     let first = method == "get" && (!stall || start > 0) && seen.lock().insert(path.clone());
                     let answer = if let Some(name) = path.strip_prefix("/moved/") {
                         format!("HTTP/1.1 302 Found\r\nLocation: /{name}\r\nContent-Length: 0\r\n")
-                    } else if first && path.starts_with("/busy/") {
+                    } else if (first && path.starts_with("/busy/")) || (method == "get" && path.starts_with("/refused/")) {
                         "HTTP/1.1 503 Busy\r\nRetry-After: 0\r\nContent-Length: 0\r\n".to_string()
                     } else if method == "head" {
                         format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nETag: \"v1\"\r\n", data.len())
                     } else {
                         let (total, len) = (data.len(), end + 1 - start);
-                        format!("HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{total}\r\nContent-Length: {len}\r\nETag: \"v1\"\r\n")
+                        let etag = if path.starts_with("/untagged/") { "" } else { "ETag: \"v1\"\r\n" };
+                        format!("HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{total}\r\nContent-Length: {len}\r\n{etag}")
                     };
                     if socket.write_all(format!("{answer}Connection: close\r\n\r\n").as_bytes()).await.is_err() {
                         return;
@@ -3316,6 +3358,54 @@ mod tests {
         let busy = probe("busy/file.bin").await;
         assert!(busy.accepts_ranges);
         assert_eq!(busy.answer_time, None);
+    }
+
+    #[tokio::test]
+    async fn test_head_without_a_slot_of_its_own_holds_up_no_probe() {
+        let base = file_server(vec![7u8; 4096], Duration::ZERO).await;
+        let client = Client::new();
+        // One request to the host at a time, which the ranged GET holds: HEAD has no slot. A GET
+        // naming the file without a validator would otherwise leave HEAD its grace.
+        let started = std::time::Instant::now();
+        let (info, _) = probe_url(&client, None, &base.join("untagged/f.bin").unwrap(), false, 1).await.unwrap();
+        assert!(started.elapsed() < HEAD_GRACE, "HEAD was waited for: {:?}", started.elapsed());
+        assert_eq!((info.size, info.accepts_ranges, info.etag), (Some(4096), true, None));
+        // A GET refused on every try leaves nothing to read: HEAD goes out after it, under its
+        // slot, and says what the file is.
+        let refused = base.join("refused/f.bin").unwrap();
+        let (info, body) = probe_url(&client, None, &refused, true, 1).await.expect("HEAD answers for the refused GET");
+        assert_eq!((info.size, info.accepts_ranges, info.etag.as_deref()), (Some(4096), true, Some("\"v1\"")));
+        assert!(body.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_probes_still_out_are_given_up_when_the_probe_brought_the_whole_file() {
+        use tokio::io::AsyncReadExt;
+        let file = file_server(vec![7u8; 4096], Duration::ZERO).await.join("f.bin").unwrap();
+        // A second mirror that takes requests but never answers them, and tells when they are
+        // given up.
+        let listener = crate::hosts::unseen_listener().await;
+        let silent = Url::parse(&format!("http://{}/f.bin", listener.local_addr().unwrap())).unwrap();
+        let (given_up_tx, mut given_up) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let given_up_tx = given_up_tx.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    while socket.read(&mut buf).await.is_ok_and(|n| n > 0) {}
+                    let _ = given_up_tx.send(Instant::now());
+                });
+            }
+        });
+        let dir = tempdir().unwrap();
+        let options = DownloadOptions { output_path: Some(dir.path().to_path_buf()), ..Default::default() };
+        let path = DownloadEngine::new(vec![file, silent], options).run(None).await.unwrap();
+        // Nothing runs between the end of the download and this: whatever the mirror noticed
+        // before, it noticed while the download wrote and checked the file.
+        let finished = Instant::now();
+        assert_eq!(std::fs::read(path).unwrap(), vec![7u8; 4096]);
+        let given_up = tokio::time::timeout(Duration::from_secs(10), given_up.recv()).await.unwrap().unwrap();
+        assert!(given_up < finished, "the second mirror's probe held its host slot until the download was over");
     }
 
     #[tokio::test]
