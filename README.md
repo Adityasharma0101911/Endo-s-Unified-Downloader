@@ -203,7 +203,16 @@ The service downloads every line of the queue, two at a time, and then exits. Fi
 
 ## GUI
 
-`Endos-Unified-Downloader` (`endos-downloader-gui` on Linux) is a native desktop app built on the same engine. You can paste links, choose where files are saved, follow the progress of each download, and look through the download history and verify files. On Linux it needs a desktop session with OpenGL, and file dialogs use the desktop's xdg-desktop-portal.
+`Endos-Unified-Downloader` (`endos-downloader-gui` on Linux) is a native desktop app built on the same engine. On Linux it needs a desktop session with OpenGL, and file dialogs use the desktop's xdg-desktop-portal.
+
+- **Live view:** a chunk map, per-connection progress, a throughput graph, real open-connection count, smoothed speed and ETA. A **STALLED** warning appears after 5 s without data, and downloads with several mirrors get a per-mirror speed table.
+- **Pause, Resume, Start Over:** Pause waits until resume state is saved ("Pausing…"). Resume continues the same file with the same settings. Start Over and Delete Leftovers remove only the `.part` and its resume state, never a finished file.
+- **Batch queue:** add one download per line (mirrors of one file go on one line, separated by spaces). Each item keeps the folder and options it was added with. Auto-run handles 1–8 downloads at once, with per-item Start, Pause, Resume, Retry, Remove, Open and Folder.
+- **Verify & Repair:** checks a file against the BLAKE3 hash recorded when it was downloaded. Results are VERIFIED, INCOMPLETE (with a cancellable repair of just the missing ranges), CHECKSUM MISMATCH or UNVERIFIED.
+- **Clipboard watcher:** offers "Download Now" / "Add to Queue" for copied links. It ignores links the app copied itself and magnets without web seeds.
+- **Advanced options:** speed limit, retries per chunk, stall timeout, proxy, cookies (file or browser), Authorization header, checksum and media quality.
+- **Remembers settings:** folder, connections and advanced options are stored in `gui-settings.json` next to the history. The Authorization header and checksum are never saved.
+- **Safe to close:** closing the window pauses running downloads and saves their state (waiting at most 3 s). It also stops yt-dlp. The app uses no CPU while idle.
 
 ---
 
