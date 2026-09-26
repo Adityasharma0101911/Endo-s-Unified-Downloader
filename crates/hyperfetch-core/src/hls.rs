@@ -118,7 +118,7 @@ pub async fn parse_hls_playlist(
             })?;
         let text = String::from_utf8_lossy(&body);
         let text = text.trim_start_matches('\u{feff}').trim_start();
-        if !is_playlist_start(&body) {
+        if !text.starts_with("#EXTM3U") {
             // Only the URL the caller named may turn out to be a plain file. A variant that is not
             // a playlist (typically an error page for an expired token) means the stream failed.
             return Err(if hop == 0 {
