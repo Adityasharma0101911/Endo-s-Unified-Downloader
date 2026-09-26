@@ -26,6 +26,10 @@ const WINDOW_PER_CONNECTION: usize = 2;
 /// A segment is requested a second time once it has taken twice as long as a typical one, but
 /// never sooner than this: a second request saves too little on a fast one to be worth it.
 const HEDGE_MIN_WAIT: Duration = Duration::from_secs(1);
+/// Before any segment has been fetched, one is requested a second time after half the stall
+/// timeout, but never later than this: a first segment that stalls would otherwise wait out the
+/// stall timeout of every attempt.
+const FIRST_HEDGE_MAX_WAIT: Duration = Duration::from_secs(5);
 /// Master playlists may point at further master playlists; stop following them after this many hops.
 const MAX_MASTER_DEPTH: usize = 3;
 const MAX_PLAYLIST_BYTES: u64 = if cfg!(test) { 64 * 1024 } else { 16 * 1024 * 1024 };
@@ -839,9 +843,11 @@ async fn cancelled(cancel_flag: &Option<Arc<AtomicBool>>) {
 
 /// A unit of an [`InOrder`] download that was started and not yet handed out.
 enum Slot<Fut> {
-    /// Requested at `since`, by `requests` requests at once; `hedge` starts the second one.
+    /// Requested at `since`, by `requests` requests at once; `hedge` starts the second one, and
+    /// dropping it unused drops the first (see [`race`]).
     Fetching { since: tokio::time::Instant, requests: usize, hedge: Option<oneshot::Sender<Fut>> },
-    Ready(Vec<u8>),
+    /// Its data, or why it could not be fetched.
+    Done(Result<Vec<u8>, HlsError>),
 }
 
 type Job<'a> = Pin<Box<dyn Future<Output = (usize, Result<Vec<u8>, HlsError>)> + Send + 'a>>;
@@ -851,13 +857,19 @@ type Job<'a> = Pin<Box<dyn Future<Output = (usize, Result<Vec<u8>, HlsError>)> +
 /// one on, which bounds memory: a slow unit does not idle the other connections, which go on with
 /// the units after it until the window is full. Once a connection would sit idle while the next
 /// unit is still being fetched, and that fetch has taken twice as long as a typical one (at least
-/// [`HEDGE_MIN_WAIT`]), the unit is requested a second time, never a third: the first of the two
-/// to succeed is used and the other is dropped, which aborts it.
+/// [`HEDGE_MIN_WAIT`]; half the stall timeout, at most [`FIRST_HEDGE_MAX_WAIT`], while no unit has
+/// been fetched yet), the unit is requested a second time, never a third: the first of the two to
+/// succeed is used and the other is dropped, which aborts it. A unit that fails ends the download
+/// once every unit before it has been handed out; the units after it are dropped.
 struct InOrder<'a, F, Fut> {
     fetch: F,
+    /// Units to hand out: all of them, or up to the first one known to have failed.
     count: usize,
     connections: usize,
     window: usize,
+    /// How long the next unit may take before it is requested again, while no typical fetch time
+    /// is known.
+    first_hedge: Duration,
     /// The next unit to hand out; `slots` holds it and the units after it that were started.
     head: usize,
     slots: VecDeque<Slot<Fut>>,
@@ -874,12 +886,14 @@ where
     F: Fn(usize) -> Fut,
     Fut: Future<Output = Result<Vec<u8>, HlsError>> + Send + 'a,
 {
-    fn new(count: usize, connections: usize, window: usize, fetch: F) -> Self {
+    /// `stall` is the stall timeout of a request.
+    fn new(count: usize, connections: usize, window: usize, stall: Duration, fetch: F) -> Self {
         Self {
             fetch,
             count,
             connections,
             window,
+            first_hedge: (stall / 2).clamp(HEDGE_MIN_WAIT, FIRST_HEDGE_MAX_WAIT),
             head: 0,
             slots: VecDeque::new(),
             jobs: FuturesUnordered::new(),
@@ -894,23 +908,28 @@ where
         self.head == self.count
     }
 
-    /// Whether the next unit has arrived.
+    /// Whether the next unit has arrived, or failed.
     fn head_ready(&self) -> bool {
-        matches!(self.slots.front(), Some(Slot::Ready(_)))
+        matches!(self.slots.front(), Some(Slot::Done(_)))
     }
 
-    /// The next unit and its data, if it has arrived.
-    fn pop(&mut self) -> Option<(usize, Vec<u8>)> {
-        let Some(Slot::Ready(data)) = self.slots.front_mut() else { return None };
-        let data = std::mem::take(data);
-        self.slots.pop_front();
-        self.head += 1;
-        Some((self.head - 1, data))
+    /// The next unit and its data, or the error that ends the download, once it has arrived.
+    fn pop(&mut self) -> Option<Result<(usize, Vec<u8>), HlsError>> {
+        match self.slots.pop_front()? {
+            Slot::Done(result) => {
+                self.head += 1;
+                Some(result.map(|data| (self.head - 1, data)))
+            }
+            fetching => {
+                self.slots.push_front(fetching);
+                None
+            }
+        }
     }
 
-    /// Waits until a unit has been fetched, or the next one is due to be requested again. The
-    /// error of a unit that could not be fetched ends the download.
-    async fn progress(&mut self) -> Result<(), HlsError> {
+    /// Waits until a unit has been fetched (or failed), or the next one is due to be requested
+    /// again.
+    async fn progress(&mut self) {
         self.launch();
         let hedge_at = self.hedge_at();
         let lag = async move {
@@ -925,10 +944,7 @@ where
                 // Nothing in flight: every unit started waits to be handed out.
                 None => std::future::pending().await,
             },
-            () = lag => {
-                self.hedge();
-                Ok(())
-            }
+            () = lag => self.hedge(),
         }
     }
 
@@ -948,14 +964,17 @@ where
     }
 
     /// When the next unit is due to be requested again, if it may be: it is still being fetched
-    /// by one request, a connection is free for another (so nothing else can be started), and a
-    /// typical fetch time is known.
+    /// by one request, and a connection is free for another (so nothing else can be started).
     fn hedge_at(&self) -> Option<tokio::time::Instant> {
         let Some(Slot::Fetching { since, hedge: Some(_), .. }) = self.slots.front() else { return None };
-        if self.requests >= self.connections || self.fetched == 0 {
+        if self.requests >= self.connections {
             return None;
         }
-        Some(*since + (self.fetch_time / self.fetched * 2).max(HEDGE_MIN_WAIT))
+        let patience = match self.fetched {
+            0 => self.first_hedge,
+            fetched => (self.fetch_time / fetched * 2).max(HEDGE_MIN_WAIT),
+        };
+        Some(*since + patience)
     }
 
     /// Requests the next unit a second time.
@@ -970,23 +989,33 @@ where
         }
     }
 
-    fn finish(&mut self, unit: usize, result: Result<Vec<u8>, HlsError>) -> Result<(), HlsError> {
-        let Some(slot) = unit.checked_sub(self.head).and_then(|i| self.slots.get_mut(i)) else { return Ok(()) };
-        if let Slot::Fetching { since, requests, .. } = slot {
-            self.requests -= *requests;
-            if *requests == 1 {
-                self.fetch_time += since.elapsed();
-                self.fetched += 1;
+    /// Records how `unit` ended. A failure makes it the last unit: those after it are dropped, and
+    /// the ones still being fetched stop.
+    fn finish(&mut self, unit: usize, result: Result<Vec<u8>, HlsError>) {
+        // Units dropped after a failure end here too.
+        let Some(at) = unit.checked_sub(self.head).filter(|&at| at < self.slots.len()) else { return };
+        let Slot::Fetching { since, requests, .. } = &self.slots[at] else { return };
+        let (since, requests) = (*since, *requests);
+        self.requests -= requests;
+        if result.is_err() {
+            self.count = unit + 1;
+            for dropped in self.slots.drain(at + 1..) {
+                if let Slot::Fetching { requests, .. } = dropped {
+                    self.requests -= requests;
+                }
             }
+        } else if requests == 1 {
+            self.fetch_time += since.elapsed();
+            self.fetched += 1;
         }
-        *slot = Slot::Ready(result?);
-        Ok(())
+        self.slots[at] = Slot::Done(result);
     }
 }
 
 /// Fetches `unit` with `first` until it succeeds or fails, or until a second request for it arrives
 /// on `hedge`: then the first of the two to succeed is used, and the other dropped. When both fail,
-/// the first request's error is returned.
+/// the first request's error is returned. If `hedge` is dropped unused, the unit is no longer
+/// wanted: `first` is dropped as well.
 async fn race<Fut>(unit: usize, first: Fut, hedge: oneshot::Receiver<Fut>) -> (usize, Result<Vec<u8>, HlsError>)
 where
     Fut: Future<Output = Result<Vec<u8>, HlsError>>,
@@ -995,7 +1024,10 @@ where
     let second = tokio::select! {
         biased;
         result = &mut first => return (unit, result),
-        Ok(second) = hedge => second,
+        second = hedge => match second {
+            Ok(second) => second,
+            Err(_) => return (unit, Err(HlsError::Cancelled)),
+        },
     };
     tokio::pin!(second);
     let result = tokio::select! {
@@ -1198,7 +1230,8 @@ impl HlsEngine {
         let requests = plan_requests(segments, resume_from);
         let received = AtomicU64::new(written_bytes);
         // Dropping it aborts the fetches in flight.
-        let mut window = InOrder::new(requests.len(), num_connections, WINDOW_PER_CONNECTION * num_connections, |i| {
+        let window = WINDOW_PER_CONNECTION * num_connections;
+        let mut window = InOrder::new(requests.len(), num_connections, window, options.fetch.stall_timeout, |i| {
             let request = &requests[i];
             fetch_segment(client, auth, request.segment.clone(), request.with_init, &received, options.fetch)
         });
@@ -1217,17 +1250,17 @@ impl HlsEngine {
             tokio::select! {
                 room = to_disk.reserve(), if window.head_ready() => {
                     let Ok(room) = room else { break None };
-                    if let Some((i, data)) = window.pop() {
-                        written += requests[i].segments;
-                        written_bytes += data.len() as u64;
-                        room.send((requests[i].segments, data));
+                    match window.pop() {
+                        Some(Ok((i, data))) => {
+                            written += requests[i].segments;
+                            written_bytes += data.len() as u64;
+                            room.send((requests[i].segments, data));
+                        }
+                        Some(Err(e)) => break Some(e),
+                        None => {}
                     }
                 }
-                progress = window.progress() => {
-                    if let Err(e) = progress {
-                        break Some(e);
-                    }
-                }
+                () = window.progress() => {}
                 _ = ticker.tick() => {
                     if is_cancelled() {
                         break Some(HlsError::Cancelled);
@@ -1701,6 +1734,35 @@ video.m3u8
     }
 
     #[tokio::test]
+    async fn test_segments_before_a_failed_one_are_written() {
+        // The last segment fails at once, the others answer a little later.
+        let (addr, _) = serve_async(|path: &str, _| {
+            let path = path.to_string();
+            async move {
+                match path.as_str() {
+                    "/media.m3u8" => ok(format!("#EXTM3U\n{}#EXT-X-ENDLIST\n", (0..6).map(|n| format!("#EXTINF:4,\ns{n}.ts\n")).collect::<String>())),
+                    "/s5.ts" => (404, String::new(), Vec::new()),
+                    p => {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        ok(p.trim_start_matches("/s").trim_end_matches(".ts").repeat(4))
+                    }
+                }
+            }
+        })
+        .await;
+        let client = Client::new();
+        let url = Url::parse(&format!("http://{addr}/media.m3u8")).unwrap();
+        let segments = parse_hls_playlist(&client, &url, None, FETCH).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("partial.ts");
+        let err = download_to(&client, None, &url, segments, &out, 6).await.unwrap_err();
+        assert!(matches!(err, HlsError::SegmentFailed { index: 5, .. }), "{err}");
+        assert_eq!(std::fs::read(with_suffix(&out, ".part")).unwrap(), b"00001111222233334444");
+        let state = std::fs::read_to_string(with_suffix(&out, ".part.hlsstate")).unwrap();
+        assert!(state.ends_with(" 5 20"), "the segments before the failed one are kept: {state}");
+    }
+
+    #[tokio::test]
     async fn test_ranged_segment_rejects_full_body() {
         let (addr, _) = serve(|path: &str, range: Option<ByteRange>| match (path, range) {
             ("/media.m3u8", _) => ok("#EXTM3U\n#EXTINF:4,\n#EXT-X-BYTERANGE:4@0\nall.ts\n#EXT-X-ENDLIST\n"),
@@ -2008,17 +2070,18 @@ video.m3u8
     }
 
     /// Runs `window` to the end as `download` does, returning what it handed out, in order.
-    async fn drain(mut window: InOrder<'_, impl Fn(usize) -> FakeFetch, FakeFetch>, requests: &Requests) -> Result<Vec<u8>, HlsError> {
+    async fn drain(window: &mut InOrder<'_, impl Fn(usize) -> FakeFetch, FakeFetch>, requests: &Requests) -> Result<Vec<u8>, HlsError> {
         let mut out = Vec::new();
         loop {
-            while let Some((unit, data)) = window.pop() {
+            while let Some(next) = window.pop() {
+                let (unit, data) = next?;
                 assert_eq!(unit, requests.handed_out.fetch_add(1, Ordering::SeqCst), "units come out in order");
                 out.extend(data);
             }
             if window.is_done() {
                 return Ok(out);
             }
-            window.progress().await?;
+            window.progress().await;
         }
     }
 
@@ -2026,13 +2089,17 @@ video.m3u8
         requests.per_unit.lock().get(&unit).copied().unwrap_or(0)
     }
 
+    /// The stall timeout of the fake fetches: no unit is requested again before 5 s unless a
+    /// typical fetch time is known.
+    const STALL: Duration = Duration::from_secs(30);
+
     #[tokio::test(start_paused = true)]
     async fn test_window_goes_past_a_stalled_unit_and_requests_it_once_more() {
         let requests = Arc::new(Requests::default());
         // The first request of unit 0 stalls; everything else takes a second.
         let fetch = fake(&requests, |unit, n| (if (unit, n) == (0, 0) { 100_000 } else { 1_000 }, true));
         let started = tokio::time::Instant::now();
-        let out = drain(InOrder::new(12, 3, 6, fetch), &requests).await.unwrap();
+        let out = drain(&mut InOrder::new(12, 3, 6, STALL, fetch), &requests).await.unwrap();
 
         assert_eq!(out, (0..12).collect::<Vec<u8>>(), "handed out in order");
         assert_eq!(requests_of(&requests, 0), 2, "the stalled unit is requested once more");
@@ -2048,7 +2115,7 @@ video.m3u8
         let requests = Arc::new(Requests::default());
         // Between 1 and 1.4 s each, the tail included: no unit lags.
         let fetch = fake(&requests, |unit, _| (1_000 + (unit * 37 % 5) as u64 * 100, true));
-        let out = drain(InOrder::new(30, 4, 8, fetch), &requests).await.unwrap();
+        let out = drain(&mut InOrder::new(30, 4, 8, STALL, fetch), &requests).await.unwrap();
         assert_eq!(out, (0..30).collect::<Vec<u8>>());
         assert!((0..30).all(|unit| requests_of(&requests, unit) == 1), "{:?}", requests.per_unit.lock());
     }
@@ -2064,7 +2131,7 @@ video.m3u8
             _ => (1_000, true),
         });
         let started = tokio::time::Instant::now();
-        let out = drain(InOrder::new(4, 2, 4, fetch), &requests).await.unwrap();
+        let out = drain(&mut InOrder::new(4, 2, 4, STALL, fetch), &requests).await.unwrap();
         assert_eq!(out, [0, 1, 2, 3]);
         assert_eq!(requests_of(&requests, 0), 2);
         let elapsed = started.elapsed();
@@ -2073,9 +2140,55 @@ video.m3u8
         // Both requests fail: the first one's error ends the download, and no third is made.
         let requests = Arc::new(Requests::default());
         let fetch = fake(&requests, |unit, _| if unit == 0 { (5_000, false) } else { (1_000, true) });
-        let err = drain(InOrder::new(4, 2, 4, fetch), &requests).await.unwrap_err();
+        let err = drain(&mut InOrder::new(4, 2, 4, STALL, fetch), &requests).await.unwrap_err();
         assert!(err.to_string().contains("request 0 failed"), "{err}");
         assert_eq!(requests_of(&requests, 0), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_a_failed_unit_ends_the_download_only_after_the_units_before_it() {
+        // The last unit fails at once, the others arrive later: they are all handed out first.
+        let requests = Arc::new(Requests::default());
+        let fetch = fake(&requests, |unit, _| if unit == 5 { (0, false) } else { (300, true) });
+        let err = drain(&mut InOrder::new(6, 6, 12, STALL, fetch), &requests).await.unwrap_err();
+        assert!(matches!(err, HlsError::SegmentFailed { index: 5, .. }), "{err}");
+        assert_eq!(requests.handed_out.load(Ordering::SeqCst), 5);
+
+        // Unit 3 fails first, unit 1 later: unit 1's error is the one reported, nothing after unit
+        // 3 is requested, and unit 2, which was still being fetched, is dropped once unit 1 fails.
+        let requests = Arc::new(Requests::default());
+        let fetch = fake(&requests, |unit, _| match unit {
+            1 => (200, false),
+            2 => (10_000, true),
+            3 => (0, false),
+            _ => (300, true),
+        });
+        let started = tokio::time::Instant::now();
+        let mut window = InOrder::new(8, 4, 8, STALL, fetch);
+        let err = drain(&mut window, &requests).await.unwrap_err();
+        assert!(matches!(err, HlsError::SegmentFailed { index: 1, .. }), "{err}");
+        let elapsed = started.elapsed().as_millis();
+        assert!((300..310).contains(&elapsed), "as soon as unit 0 is in: {elapsed} ms");
+        assert_eq!(requests.handed_out.load(Ordering::SeqCst), 1);
+        assert!((0..4).all(|unit| requests_of(&requests, unit) == 1), "{:?}", requests.per_unit.lock());
+        assert_eq!(requests.per_unit.lock().len(), 4, "no unit after a failed one is requested");
+        assert_eq!(requests.open.load(Ordering::SeqCst), 0, "unit 2 is no longer fetched");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_a_first_unit_that_stalls_is_requested_again_before_any_arrived() {
+        // A single unit and a free connection: no typical fetch time is known yet.
+        for (stall, answered) in [(STALL, 6_000), (Duration::from_secs(4), 3_000)] {
+            let requests = Arc::new(Requests::default());
+            let fetch = fake(&requests, |_, n| (if n == 0 { 100_000 } else { 1_000 }, true));
+            let started = tokio::time::Instant::now();
+            let out = drain(&mut InOrder::new(1, 2, 2, stall, fetch), &requests).await.unwrap();
+            assert_eq!(out, [0]);
+            assert_eq!(requests_of(&requests, 0), 2);
+            // Half the stall timeout, at most 5 s, and the second request's second.
+            let elapsed = started.elapsed().as_millis();
+            assert!((answered..answered + 10).contains(&elapsed), "stall timeout {stall:?}: {elapsed} ms");
+        }
     }
 
     #[test]
