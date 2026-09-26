@@ -18,6 +18,8 @@ use parking_lot::Mutex;
 use tokio::sync::Notify;
 use url::Url;
 
+use crate::engine::{POOL_IDLE, POOL_MAX_IDLE};
+
 /// How long a learned fact about a host is trusted.
 pub const PROFILE_TTL: Duration = Duration::from_secs(10 * 60);
 /// Least time between the refusal a connection cap was learned from (or its last rise) and the
@@ -113,7 +115,7 @@ pub struct HostSlot {
     hosts: &'static Hosts,
     key: HostKey,
     limit: usize,
-    idle_before: Option<Duration>,
+    opens_connection: bool,
 }
 
 impl HostSlot {
@@ -122,11 +124,13 @@ impl HostSlot {
         &self.key
     }
 
-    /// How long no request to the host had ended when this slot was taken; `None` if none had
-    /// since the host was last forgotten. A client keeps a connection for reuse only so long
-    /// after its request ends, so after longer than that this request opens a new one.
-    pub fn idle_before(&self) -> Option<Duration> {
-        self.idle_before
+    /// Whether this slot's request opens a new connection: no request to the host that ended
+    /// within `POOL_IDLE` left one that another request has not taken since. A client keeps up to
+    /// `POOL_MAX_IDLE` connections to a host for reuse, each for `POOL_IDLE` after its request
+    /// ends; a request made without a slot, as resolvers make theirs, may have left one all the
+    /// same.
+    pub fn opens_connection(&self) -> bool {
+        self.opens_connection
     }
 
     /// The host refused this request with 429/503. With other requests to it open at the time, it
@@ -232,8 +236,9 @@ struct Entry {
     held: Limits,
     /// The limits of requests waiting for a slot.
     waiting: Limits,
-    /// When a request to the host last ended.
-    released: Option<Instant>,
+    /// When the requests to the host whose connections may still be kept for reuse ended, oldest
+    /// first: a request taking a slot takes the latest.
+    idle: Vec<Instant>,
     /// When the connection cap was last raised.
     cap_raised: Option<Instant>,
     /// The most requests ever open at once.
@@ -244,7 +249,10 @@ struct Entry {
 impl Entry {
     /// Whether nothing would be lost by forgetting the host.
     fn is_idle(&self, now: Instant) -> bool {
-        self.open == 0 && self.waiting.is_empty() && self.facts.profile(now) == HostProfile::default()
+        self.open == 0
+            && self.waiting.is_empty()
+            && self.facts.profile(now) == HostProfile::default()
+            && self.idle.iter().all(|&at| now.saturating_duration_since(at) >= POOL_IDLE)
     }
 
     /// The smallest limit among the requests open or waiting.
@@ -298,8 +306,9 @@ impl Hosts {
         {
             entry.peak = entry.peak.max(entry.open);
         }
-        let idle_before = entry.released.map(|at| now.saturating_duration_since(at));
-        Some(HostSlot { hosts: self, key: key.clone(), limit, idle_before })
+        entry.idle.retain(|&at| now.saturating_duration_since(at) < POOL_IDLE);
+        let opens_connection = entry.idle.pop().is_none();
+        Some(HostSlot { hosts: self, key: key.clone(), limit, opens_connection })
     }
 
     async fn acquire(&'static self, key: HostKey, limit: usize) -> HostSlot {
@@ -344,7 +353,10 @@ impl Hosts {
             if let Some(entry) = entries.get_mut(key) {
                 entry.open = entry.open.saturating_sub(1);
                 remove_limit(&mut entry.held, limit);
-                entry.released = Some(now);
+                if entry.idle.len() >= POOL_MAX_IDLE {
+                    entry.idle.remove(0);
+                }
+                entry.idle.push(now);
             }
             forget_idle(&mut entries, now);
         }
@@ -559,16 +571,29 @@ mod tests {
     }
 
     #[test]
-    fn test_a_slot_tells_how_long_no_request_to_the_host_had_ended() {
-        let (hosts, host) = (leaked(), key("http://idle.example/"));
-        let first = hosts.try_acquire(&host, 0, Instant::now()).unwrap();
-        let open = hosts.try_acquire(&host, 0, Instant::now()).unwrap();
-        assert_eq!(open.idle_before(), None, "a request still open leaves no connection to reuse");
-        drop(first);
-        let later = hosts.try_acquire(&host, 0, Instant::now() + Duration::from_secs(90)).unwrap();
-        let idle = later.idle_before().expect("a request ended before");
-        assert!(idle >= Duration::from_secs(90) && idle < Duration::from_secs(91), "{idle:?}");
-        drop(open);
+    fn test_a_slot_tells_whether_its_request_opens_a_connection() {
+        let (hosts, host, t0) = (leaked(), key("http://idle.example/"), Instant::now());
+        let first = hosts.try_acquire(&host, 0, t0).unwrap();
+        let open = hosts.try_acquire(&host, 0, t0).unwrap();
+        assert!(first.opens_connection());
+        assert!(open.opens_connection(), "a request still open leaves no connection to reuse");
+        drop((first, open));
+
+        // Two requests ended just now, so two more reuse their connections; a third, although
+        // requests to the host keep ending, finds none left to reuse.
+        let now = Instant::now();
+        let reused: Vec<HostSlot> = (0..2).map(|_| hosts.try_acquire(&host, 0, now).unwrap()).collect();
+        assert!(reused.iter().all(|slot| !slot.opens_connection()));
+        assert!(hosts.try_acquire(&host, 0, now).unwrap().opens_connection());
+        drop(reused);
+        // A connection is kept for so long after its request ended.
+        assert!(hosts.try_acquire(&host, 0, Instant::now() + POOL_IDLE).unwrap().opens_connection());
+        // And no more of them than a client keeps.
+        let many: Vec<HostSlot> = (0..POOL_MAX_IDLE + 1).map(|_| hosts.try_acquire(&host, 0, Instant::now()).unwrap()).collect();
+        drop(many);
+        let now = Instant::now();
+        let again: Vec<HostSlot> = (0..POOL_MAX_IDLE + 1).map(|_| hosts.try_acquire(&host, 0, now).unwrap()).collect();
+        assert_eq!(again.iter().filter(|slot| slot.opens_connection()).count(), 1);
     }
 
     #[tokio::test]

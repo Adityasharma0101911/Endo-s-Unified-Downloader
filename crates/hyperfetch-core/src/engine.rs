@@ -36,6 +36,8 @@ const CANCELLED: &str = "Download cancelled by user";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long a client keeps a connection whose request ended, for the next request to its host.
 pub(crate) const POOL_IDLE: Duration = Duration::from_secs(90);
+/// Most connections a client keeps that way per host.
+pub(crate) const POOL_MAX_IDLE: usize = 64;
 /// Longest a range worker waits between body reads (the stall timeout, if shorter): its retry
 /// keeps what arrived and starts at once, so a connection gone quiet is best replaced soon.
 const BODY_IDLE: Duration = Duration::from_secs(5);
@@ -1151,7 +1153,7 @@ pub fn build_client(options: &DownloadOptions) -> Result<Client, String> {
         .tcp_nodelay(true)
         .connect_timeout(CONNECT_TIMEOUT)
         .tcp_keepalive(Duration::from_secs(30))
-        .pool_max_idle_per_host(64)
+        .pool_max_idle_per_host(POOL_MAX_IDLE)
         .pool_idle_timeout(Some(POOL_IDLE))
         .default_headers(headers);
 
@@ -1469,7 +1471,7 @@ async fn probe_with(
     limit: usize,
     slot: HostSlot,
 ) -> Result<(ProbeInfo, Option<ProbeBody>), String> {
-    let cold = opens_connection(&slot);
+    let cold = slot.opens_connection();
     let head = async {
         // Waiting for a slot here is bounded like HEAD itself: by the grace after the GET's answer.
         let _slot = hosts::acquire(url, limit).await;
@@ -1634,13 +1636,6 @@ fn slot_at(slot: HostSlot, url: &Url, limit: usize) -> Option<HostSlot> {
     } else {
         hosts::try_acquire(url, limit)
     }
-}
-
-/// Whether the request taking `slot` opens a new connection: no request to its host had ended
-/// for as long as a client keeps a connection for reuse. (A request made without a slot, as
-/// resolvers make theirs, may have left one all the same.)
-pub(crate) fn opens_connection(slot: &HostSlot) -> bool {
-    slot.idle_before().is_none_or(|idle| idle >= POOL_IDLE)
 }
 
 /// The racer over the mirrors serving the download. Requests go straight to where each probe was
