@@ -70,6 +70,9 @@ const PERSIST_INTERVAL: Duration = Duration::from_secs(2);
 const SPEED_TAU_SECS: f64 = 2.0;
 const DEFAULT_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
 const DEFAULT_MIN_STEAL: u64 = 1024 * 1024;
+/// Most connections one download opens, whatever `num_connections` asks for; also the default
+/// per-host budget, so that alone never holds a download back.
+const MAX_CONNECTIONS: usize = 64;
 /// Fewest bytes a steal takes unless the user set `min_steal_threshold`. Whether a steal pays
 /// off is decided by time (see `ChunkManager::steal_work`); this only keeps rates measured over
 /// a few packets from splitting off slivers.
@@ -116,6 +119,9 @@ pub struct DownloadOptions {
     /// resume state consistent during the download happen either way.
     pub fsync_on_complete: bool,
     /// Connections all downloads in this process may hold to one host at once (0 = no limit).
+    /// When downloads sharing a host set different limits, the smallest nonzero one among those
+    /// with a request open or waiting for one applies to all of them. The default is the most
+    /// connections one download opens, so only several downloads to one host are held back.
     pub max_connections_per_host: usize,
 }
 
@@ -136,7 +142,7 @@ impl Default for DownloadOptions {
             max_retries: 8,
             stall_timeout_secs: 30,
             fsync_on_complete: false,
-            max_connections_per_host: 32,
+            max_connections_per_host: MAX_CONNECTIONS,
         }
     }
 }
@@ -593,7 +599,7 @@ impl DownloadEngine {
         // A connection must carry enough to repay its handshakes: a small file arrives sooner over
         // one connection than over many, unless the server caps each connection's speed.
         let remaining: u64 = compute_gaps(size, &have).iter().map(ByteRange::len).sum();
-        let max_workers = self.options.num_connections.clamp(1, 64) as u64;
+        let max_workers = self.options.num_connections.clamp(1, MAX_CONNECTIONS) as u64;
         let num_workers = remaining.div_ceil(per_connection).clamp(1, max_workers) as usize;
         let chunk_size = effective_chunk_size(remaining, num_workers as u64, self.options.base_chunk_size);
         let mut manager = ChunkManager::with_resumed_ranges(size, chunk_size, &have).map_err(|e| e.to_string())?;
@@ -2740,6 +2746,11 @@ mod tests {
         let (first, second) = (racer.get_mirror(0).unwrap(), racer.get_mirror(1).unwrap());
         assert_eq!((&first.url, first.fallback.as_ref()), (&redirected.final_url, Some(&redirected.url)));
         assert_eq!((&second.url, second.fallback.as_ref()), (&remote(1000).url, None), "nothing to fall back to");
+    }
+
+    #[test]
+    fn test_the_default_host_budget_never_holds_one_download_back() {
+        assert!(DownloadOptions::default().max_connections_per_host >= MAX_CONNECTIONS);
     }
 
     #[test]
