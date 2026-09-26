@@ -134,8 +134,13 @@ impl Default for MediaDownloadOptions {
 
 const CANCELLED: &str = "Download cancelled by user";
 
-/// Base URL of the newest stable yt-dlp release; GitHub redirects it to `/releases/tag/<version>`.
-const RELEASE_BASE: &str = "https://github.com/yt-dlp/yt-dlp/releases/latest";
+/// yt-dlp's GitHub releases. `/latest` redirects to `/tag/<version>`; the files of a release are
+/// under `/download/<version>/`.
+const RELEASES: &str = "https://github.com/yt-dlp/yt-dlp/releases";
+
+/// Process creation flag that keeps a console program from opening a window.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// First yt-dlp release that understands `--js-runtimes`; older builds abort on the unknown flag.
 const JS_RUNTIMES_MIN_VERSION: (u32, u32, u32) = (2025, 11, 12);
@@ -250,25 +255,32 @@ fn ytdlp_work_dir() -> PathBuf {
     app_data_dir().map_or_else(std::env::temp_dir, |dir| dir.join("ytdlp-work"))
 }
 
-fn managed_ytdlp_path() -> Option<PathBuf> {
-    Some(managed_bin_dir()?.join(exe_name("yt-dlp")))
+/// The managed yt-dlp, if one is installed: on Windows the unpacked build of the newest release
+/// installed (see [`install_onedir`]), else a single-file build (the only kind elsewhere, and what
+/// Windows installs used to be). Blocking.
+fn installed_managed_ytdlp() -> Option<PathBuf> {
+    let dir = managed_bin_dir()?;
+    #[cfg(windows)]
+    if let Some(exe) = newest_release(&dir) {
+        return Some(exe);
+    }
+    Some(dir.join(exe_name("yt-dlp"))).filter(|p| p.is_file())
 }
 
-/// Discover the path to yt-dlp executable. The result is cached for the process lifetime;
-/// call it from a blocking context (it stats every PATH entry the first time).
+/// Discover the path to yt-dlp executable: next to the application, then the managed install,
+/// then pip installs, well-known directories and PATH. Call it from a blocking context. Only the
+/// search past the managed install is cached for the process lifetime (it stats every PATH entry
+/// the first time): the managed install moves when it updates.
 pub fn find_ytdlp_path() -> Option<PathBuf> {
     static CACHE: OnceLock<Option<PathBuf>> = OnceLock::new();
-    CACHE.get_or_init(discover_ytdlp).clone()
+    next_to_current_exe(&exe_name("yt-dlp"))
+        .or_else(installed_managed_ytdlp)
+        .or_else(|| CACHE.get_or_init(discover_ytdlp).clone())
 }
 
+/// Installs of yt-dlp other than ours (see [`find_ytdlp_path`]).
 fn discover_ytdlp() -> Option<PathBuf> {
     let name = exe_name("yt-dlp");
-    if let Some(candidate) = next_to_current_exe(&name) {
-        return Some(candidate);
-    }
-    if let Some(candidate) = managed_ytdlp_path().filter(|p| p.is_file()) {
-        return Some(candidate);
-    }
 
     #[cfg(windows)]
     if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
@@ -407,14 +419,16 @@ fn discover_ffmpeg() -> Option<PathBuf> {
     None
 }
 
-/// Standalone yt-dlp build for this platform, as named in the GitHub release.
+/// The yt-dlp build installed on this platform, as named in the GitHub release. On Windows the
+/// unpacked ("onedir") build: the single-file one unpacks its Python runtime to %TEMP% on every
+/// launch, about 0.7 s more per run.
 fn ytdlp_release_asset() -> &'static str {
     if cfg!(all(windows, target_arch = "aarch64")) {
-        "yt-dlp_arm64.exe"
+        "yt-dlp_win_arm64.zip"
     } else if cfg!(all(windows, target_arch = "x86")) {
-        "yt-dlp_x86.exe"
+        "yt-dlp_win_x86.zip"
     } else if cfg!(windows) {
-        "yt-dlp.exe"
+        "yt-dlp_win.zip"
     } else if cfg!(target_os = "macos") {
         "yt-dlp_macos"
     } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
@@ -448,14 +462,50 @@ async fn http_get(client: &reqwest::Client, url: &str, timeout: Duration) -> Res
     Ok(resp)
 }
 
-/// Download the latest official yt-dlp standalone build into the per-user managed directory,
-/// verified against the release's SHA2-256SUMS and moved into place atomically, so a failed
-/// or interrupted download never leaves a truncated executable behind.
-pub async fn download_ytdlp_binary(client: &reqwest::Client) -> Result<PathBuf, String> {
-    let target = managed_ytdlp_path().ok_or("Cannot determine a per-user directory to install yt-dlp into")?;
-    let asset = ytdlp_release_asset();
+/// The tag (version) of the newest stable yt-dlp release.
+async fn latest_release_tag(client: &reqwest::Client) -> Result<String, String> {
+    let resp = client
+        .head(format!("{RELEASES}/latest"))
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|e| format!("Failed to check for a yt-dlp update: {e}"))?;
+    let tag = resp
+        .url()
+        .path()
+        .rsplit_once("/releases/tag/")
+        .map(|(_, tag)| tag.to_string())
+        .ok_or_else(|| format!("Unexpected yt-dlp release URL {}", resp.url()))?;
+    // The tag goes into URLs and, on Windows, names the install's folder.
+    if version_parts(&tag).is_none() {
+        return Err(format!("Unexpected yt-dlp release tag {tag}"));
+    }
+    Ok(tag)
+}
 
-    let sums_url = format!("{RELEASE_BASE}/download/SHA2-256SUMS");
+/// Download the latest official yt-dlp build into the per-user managed directory, verified
+/// against the release's SHA2-256SUMS and moved into place atomically, so a failed or
+/// interrupted download never leaves a broken yt-dlp behind. Returns the program to run.
+pub async fn download_ytdlp_binary(client: &reqwest::Client) -> Result<PathBuf, String> {
+    let tag = latest_release_tag(client).await?;
+    install_release(client, &tag).await
+}
+
+/// Installs release `tag` for this platform like [`download_ytdlp_binary`]. On Windows a release
+/// already unpacked (by a concurrent job or another process) is used as it is.
+async fn install_release(client: &reqwest::Client, tag: &str) -> Result<PathBuf, String> {
+    let bin_dir = managed_bin_dir().ok_or("Cannot determine a per-user directory to install yt-dlp into")?;
+    #[cfg(windows)]
+    {
+        let exe = release_dir(&bin_dir, tag).join("yt-dlp.exe");
+        if tokio::fs::metadata(&exe).await.is_ok_and(|m| m.is_file()) {
+            return Ok(exe);
+        }
+    }
+    let asset = ytdlp_release_asset();
+    let release = format!("{RELEASES}/download/{tag}");
+
+    let sums_url = format!("{release}/SHA2-256SUMS");
     let sums = http_get(client, &sums_url, Duration::from_secs(30))
         .await?
         .text()
@@ -465,33 +515,45 @@ pub async fn download_ytdlp_binary(client: &reqwest::Client) -> Result<PathBuf, 
         .ok_or_else(|| format!("yt-dlp SHA2-256SUMS has no entry for {asset}"))?
         .to_ascii_lowercase();
 
-    let asset_url = format!("{RELEASE_BASE}/download/{asset}");
+    let asset_url = format!("{release}/{asset}");
     let bytes = http_get(client, &asset_url, Duration::from_secs(600))
         .await?
         .bytes()
         .await
         .map_err(|e| format!("Failed to read {asset_url}: {e}"))?;
 
-    tokio::task::spawn_blocking(move || install_verified(&target, &bytes, &expected))
+    let tag = tag.to_string();
+    tokio::task::spawn_blocking(move || install_verified(&bin_dir, &tag, &bytes, &expected))
         .await
         .map_err(|e| format!("yt-dlp install task failed: {e}"))?
 }
 
-/// Check `bytes` against `expected_sha256`, then write them next to `target` and rename into place.
-fn install_verified(target: &Path, bytes: &[u8], expected_sha256: &str) -> Result<PathBuf, String> {
+/// Check `bytes` (the release asset) against `expected_sha256`, then install them into `bin_dir`:
+/// unpacked on Windows (see [`install_onedir`]), elsewhere as one file written next to its target
+/// and renamed into place. Returns the program to run. Blocking.
+fn install_verified(bin_dir: &Path, tag: &str, bytes: &[u8], expected_sha256: &str) -> Result<PathBuf, String> {
     let actual = format!("{:x}", Sha256::digest(bytes));
     if actual != expected_sha256 {
         return Err(format!(
             "Downloaded yt-dlp failed checksum verification (expected {expected_sha256}, got {actual})"
         ));
     }
+    std::fs::create_dir_all(bin_dir).map_err(|e| format!("Failed to create {}: {e}", bin_dir.display()))?;
+    #[cfg(windows)]
+    return install_onedir(bin_dir, tag, bytes);
+    #[cfg(not(windows))]
+    {
+        let _ = tag;
+        install_file(&bin_dir.join("yt-dlp"), bytes)
+    }
+}
 
+/// Writes `bytes` next to `target` and renames them into place.
+#[cfg(not(windows))]
+fn install_file(target: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
     let file_name = target.file_name().ok_or("Invalid yt-dlp install path")?.to_string_lossy();
-    let tmp = target.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
-    let installed = target
-        .parent()
-        .map_or(Ok(()), std::fs::create_dir_all)
-        .and_then(|_| std::fs::write(&tmp, bytes))
+    let tmp = target.with_file_name(format!(".{file_name}.{}.tmp", unique_suffix()));
+    let installed = std::fs::write(&tmp, bytes)
         .and_then(|_| make_executable(&tmp))
         .and_then(|_| std::fs::rename(&tmp, target));
     if let Err(e) = installed {
@@ -507,9 +569,135 @@ fn make_executable(path: &Path) -> std::io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(windows)))]
 fn make_executable(_path: &Path) -> std::io::Result<()> {
     Ok(())
+}
+
+/// Folder the unpacked build of release `tag` is installed in.
+#[cfg(windows)]
+fn release_dir(bin_dir: &Path, tag: &str) -> PathBuf {
+    bin_dir.join(format!("yt-dlp-{tag}"))
+}
+
+/// `yt-dlp.exe` of the newest release unpacked in `bin_dir`.
+#[cfg(windows)]
+fn newest_release(bin_dir: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(bin_dir)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let version = version_parts(entry.file_name().to_str()?.strip_prefix("yt-dlp-")?)?;
+            let exe = entry.path().join("yt-dlp.exe");
+            exe.is_file().then_some((version, exe))
+        })
+        .max_by(|a, b| a.0.cmp(&b.0))
+        .map(|(_, exe)| exe)
+}
+
+/// Unpacks the release zip into its own `yt-dlp-<tag>` folder. The folder is unpacked under a
+/// temporary name and appears complete in one rename, which is what switches the managed yt-dlp
+/// to this release (see [`newest_release`]); a running yt-dlp keeps running from its own folder,
+/// which Windows would not let us replace anyway. Older releases are cleared away afterwards (see
+/// [`remove_old_releases`]). Blocking.
+#[cfg(windows)]
+fn install_onedir(bin_dir: &Path, tag: &str, zip: &[u8]) -> Result<PathBuf, String> {
+    let target = release_dir(bin_dir, tag);
+    let temp = format!(".yt-dlp-{tag}-{}", unique_suffix());
+    let (archive, unpacked) = (bin_dir.join(format!("{temp}.zip")), bin_dir.join(format!("{temp}.tmp")));
+    let fail = |e: std::io::Error| format!("Failed to install yt-dlp to {}: {e}", target.display());
+    let extracted = std::fs::write(&archive, zip)
+        .and_then(|()| std::fs::create_dir(&unpacked))
+        .and_then(|()| unzip(&archive, &unpacked));
+    let _ = std::fs::remove_file(&archive);
+    let complete = extracted.map_err(fail).and_then(|()| {
+        if unpacked.join("yt-dlp.exe").is_file() {
+            Ok(())
+        } else {
+            Err(format!("The yt-dlp release {tag} has no yt-dlp.exe"))
+        }
+    });
+    if let Err(e) = complete {
+        let _ = std::fs::remove_dir_all(&unpacked);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&unpacked, &target) {
+        let _ = std::fs::remove_dir_all(&unpacked);
+        // Another process installed the same release meanwhile.
+        if !target.join("yt-dlp.exe").is_file() {
+            return Err(fail(e));
+        }
+    }
+    remove_old_releases(bin_dir);
+    Ok(target.join("yt-dlp.exe"))
+}
+
+/// Extracts `archive` into `into` with the tar.exe that ships with Windows (10 1803 and later),
+/// named by full path so no other tar on PATH is used. It refuses entries that would land outside
+/// `into`. Blocking.
+#[cfg(windows)]
+fn unzip(archive: &Path, into: &Path) -> std::io::Result<()> {
+    use std::os::windows::process::CommandExt;
+    let windows = std::env::var_os("SystemRoot").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
+    let output = std::process::Command::new(windows.join("System32").join("tar.exe"))
+        .arg("-xf")
+        .arg(archive)
+        .arg("-C")
+        .arg(into)
+        .stdin(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(std::io::Error::other(format!("tar exited with {}: {}", output.status, stderr.trim())))
+    }
+}
+
+/// Deletes what earlier installs left in `bin_dir`, except the two newest releases: a job that
+/// found the previous one before this install may still start it. Older releases (the single-file
+/// build counts as the oldest) go unless a program runs from them, and temporary files once they
+/// are an hour old. A release folder is renamed away before it is deleted, so no half-deleted
+/// folder ever passes for a release. Blocking.
+#[cfg(windows)]
+fn remove_old_releases(bin_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(bin_dir) else { return };
+    let stale = |path: &Path| {
+        std::fs::metadata(path)
+            .and_then(|m| m.modified())
+            .is_ok_and(|t| t.elapsed().is_ok_and(|age| age > Duration::from_secs(3600)))
+    };
+    let mut releases = Vec::new();
+    for entry in entries.flatten() {
+        let (path, name) = (entry.path(), entry.file_name().to_string_lossy().into_owned());
+        if name.eq_ignore_ascii_case("yt-dlp.exe") {
+            releases.push((Vec::new(), path));
+        } else if let Some(version) = name.strip_prefix("yt-dlp-").and_then(version_parts).filter(|_| path.is_dir()) {
+            releases.push((version, path));
+        } else if name.starts_with(".yt-dlp-") && stale(&path) {
+            let _ = std::fs::remove_dir_all(&path).or_else(|_| std::fs::remove_file(&path));
+        }
+    }
+    releases.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, path) in releases.into_iter().skip(2) {
+        if !path.is_dir() {
+            if !is_running(&path) {
+                let _ = std::fs::remove_file(&path);
+            }
+        } else if !is_running(&path.join("yt-dlp.exe")) {
+            let retired = bin_dir.join(format!(".yt-dlp-retired-{}", unique_suffix()));
+            if std::fs::rename(&path, &retired).is_ok() {
+                let _ = std::fs::remove_dir_all(&retired);
+            }
+        }
+    }
+}
+
+/// Whether a program runs from `exe`: Windows refuses to open a running program for writing.
+#[cfg(windows)]
+fn is_running(exe: &Path) -> bool {
+    exe.is_file() && std::fs::OpenOptions::new().write(true).open(exe).is_err()
 }
 
 fn http_client(proxy: Option<&str>) -> Result<reqwest::Client, String> {
@@ -528,39 +716,26 @@ static INSTALL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 async fn install_managed_ytdlp(proxy: Option<&str>) -> Result<PathBuf, String> {
     let _guard = INSTALL_LOCK.lock().await;
     // A concurrent job may have installed it while we waited for the lock.
-    if let Some(target) = managed_ytdlp_path() {
-        if tokio::fs::metadata(&target).await.is_ok_and(|m| m.is_file()) {
-            return Ok(target);
-        }
+    if let Ok(Some(installed)) = tokio::task::spawn_blocking(installed_managed_ytdlp).await {
+        return Ok(installed);
     }
     download_ytdlp_binary(&http_client(proxy)?).await
 }
 
-/// Replace the managed yt-dlp with the latest release if `current` is older.
-/// Returns whether a new binary was installed.
-async fn update_managed_ytdlp(proxy: Option<&str>, current: Option<&str>) -> Result<bool, String> {
+/// Installs the latest release as the managed yt-dlp if `current` is older, and returns the
+/// program to run from now on, if it changed.
+async fn update_managed_ytdlp(proxy: Option<&str>, current: Option<&str>) -> Result<Option<PathBuf>, String> {
     let client = http_client(proxy)?;
-    let resp = client
-        .head(RELEASE_BASE)
-        .timeout(Duration::from_secs(30))
-        .send()
-        .await
-        .map_err(|e| format!("Failed to check for a yt-dlp update: {e}"))?;
-    let latest = resp
-        .url()
-        .path()
-        .rsplit_once("/releases/tag/")
-        .map(|(_, tag)| tag.to_string())
-        .ok_or_else(|| format!("Unexpected yt-dlp release URL {}", resp.url()))?;
+    let latest = latest_release_tag(&client).await?;
     if current == Some(latest.as_str()) {
-        return Ok(false);
+        return Ok(None);
     }
 
     let _guard = INSTALL_LOCK.lock().await;
-    download_ytdlp_binary(&client).await?;
+    let installed = install_release(&client, &latest).await?;
     *VERSION_CACHE.lock() = None;
     tracing::info!("Updated managed yt-dlp from {} to {latest}", current.unwrap_or("an unknown version"));
-    Ok(true)
+    Ok(Some(installed))
 }
 
 /// A name no other call in any process uses: time, process id and a counter.
@@ -681,14 +856,16 @@ async fn ytdlp_version(bin: &Path, work_dir: &Path, cache_file: Option<&Path>) -
     Some(version)
 }
 
-/// Compare a yt-dlp version ("2025.11.12", nightly "2025.11.12.232810") against `min`.
-/// Unparseable versions count as too old.
+/// The numbers of a yt-dlp version ("2025.11.12", nightly "2025.11.12.232810"), which compare in
+/// release order; `None` unless it has at least year, month and day.
+fn version_parts(version: &str) -> Option<Vec<u32>> {
+    let parts = version.trim().split('.').map(|p| p.parse().ok()).collect::<Option<Vec<u32>>>()?;
+    (parts.len() >= 3).then_some(parts)
+}
+
+/// Compare a yt-dlp version against `min`. Unparseable versions count as too old.
 fn version_at_least(version: &str, min: (u32, u32, u32)) -> bool {
-    let mut parts = version.trim().split('.').map(|p| p.parse::<u32>());
-    match (parts.next(), parts.next(), parts.next()) {
-        (Some(Ok(year)), Some(Ok(month)), Some(Ok(day))) => (year, month, day) >= min,
-        _ => false,
-    }
+    version_parts(version).is_some_and(|p| (p[0], p[1], p[2]) >= min)
 }
 
 /// yt-dlp arguments for one run. Paths in `options` must be absolute: yt-dlp runs in
@@ -898,9 +1075,9 @@ fn take_line(read: std::io::Result<usize>, buf: &mut Vec<u8>, open: &mut bool) -
 }
 
 fn hide_console(cmd: &mut Command) {
-    // CREATE_NO_WINDOW so no blank console window pops up
+    // So no blank console window pops up.
     #[cfg(windows)]
-    cmd.creation_flags(0x0800_0000);
+    cmd.creation_flags(CREATE_NO_WINDOW);
     #[cfg(not(windows))]
     let _ = cmd;
 }
@@ -1135,7 +1312,7 @@ pub async fn download_media(
         .await
         .map_err(|e| format!("Failed to create {}: {e}", work_dir.display()))?;
 
-    let ytdlp_bin = match (&options.custom_ytdlp_path, found_ytdlp) {
+    let mut ytdlp_bin = match (&options.custom_ytdlp_path, found_ytdlp) {
         (Some(path), _) => absolute(path)?,
         (None, Some(path)) => path,
         (None, None) => tokio::select! {
@@ -1152,7 +1329,7 @@ pub async fn download_media(
         );
     }
     let ffmpeg_dir = ffmpeg.as_deref().and_then(Path::parent);
-    let managed = managed_ytdlp_path().is_some_and(|m| m == ytdlp_bin);
+    let managed = managed_bin_dir().is_some_and(|dir| ytdlp_bin.starts_with(dir));
 
     let mut updated = false;
     loop {
@@ -1174,8 +1351,11 @@ pub async fn download_media(
             _ = wait_cancelled(cancel_flag.clone()) => return Err(CANCELLED.to_string()),
         };
         match update {
-            Ok(true) => updated = true,
-            Ok(false) => return Err(err),
+            Ok(Some(installed)) => {
+                ytdlp_bin = installed;
+                updated = true;
+            }
+            Ok(None) => return Err(err),
             Err(update_err) => {
                 tracing::warn!("Could not update yt-dlp: {update_err}");
                 return Err(err);
@@ -1487,20 +1667,117 @@ mod tests {
         assert_eq!(expected_sha256(sums, "yt-dlp_macos"), None);
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn install_verified_rejects_bad_checksum_and_installs_good_one() {
         let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("bin").join("yt-dlp");
+        let bin = dir.path().join("bin");
+        let target = bin.join("yt-dlp");
         let body = b"binary";
         let good = format!("{:x}", Sha256::digest(body));
 
-        assert!(install_verified(&target, body, &"0".repeat(64)).is_err());
+        assert!(install_verified(&bin, "2026.08.19", body, &"0".repeat(64)).is_err());
         assert!(!target.exists());
 
-        assert_eq!(install_verified(&target, body, &good).unwrap(), target);
+        assert_eq!(install_verified(&bin, "2026.08.19", body, &good).unwrap(), target);
         assert_eq!(std::fs::read(&target).unwrap(), body);
         // No temp file left behind.
-        assert_eq!(std::fs::read_dir(dir.path().join("bin")).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(&bin).unwrap().count(), 1);
+    }
+
+    /// A zip laid out like yt-dlp_win.zip: yt-dlp.exe next to its `_internal` folder.
+    #[cfg(windows)]
+    fn release_zip(dir: &Path, exe: &[u8]) -> Vec<u8> {
+        let src = dir.join("release-src");
+        std::fs::create_dir_all(src.join("_internal")).unwrap();
+        std::fs::write(src.join("yt-dlp.exe"), exe).unwrap();
+        std::fs::write(src.join("_internal").join("python.dll"), b"runtime").unwrap();
+        let zip = dir.join("release.zip");
+        let tar = Path::new(&std::env::var_os("SystemRoot").unwrap()).join("System32").join("tar.exe");
+        let status = std::process::Command::new(tar)
+            .args(["-a", "-cf"])
+            .arg(&zip)
+            .arg("-C")
+            .arg(&src)
+            .args(["yt-dlp.exe", "_internal"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::read(zip).unwrap()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn install_verified_unpacks_each_release_into_its_own_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        let zip = release_zip(dir.path(), b"new build");
+        let good = format!("{:x}", Sha256::digest(&zip));
+
+        assert!(install_verified(&bin, "2026.08.19", &zip, &"0".repeat(64)).is_err());
+        assert!(!release_dir(&bin, "2026.08.19").exists());
+
+        // What earlier installs left: the previous release, an older one still running and one
+        // nothing runs from, the single-file build, and temporary files of an install that
+        // crashed hours ago (deleted) or may still be running (kept).
+        let previous = release_dir(&bin, "2026.07.01");
+        let running = release_dir(&bin, "2026.06.01");
+        let idle = release_dir(&bin, "2026.05.01");
+        for (release, build) in [(&previous, b"previous build"), (&idle, b"old build 1234")] {
+            std::fs::create_dir_all(release).unwrap();
+            std::fs::write(release.join("yt-dlp.exe"), build).unwrap();
+        }
+        std::fs::create_dir_all(&running).unwrap();
+        let system32 = Path::new(&std::env::var_os("SystemRoot").unwrap()).join("System32");
+        std::fs::copy(system32.join("PING.EXE"), running.join("yt-dlp.exe")).unwrap();
+        let mut child = std::process::Command::new(running.join("yt-dlp.exe"))
+            .args(["-n", "60", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        std::fs::write(bin.join("yt-dlp.exe"), b"single-file build").unwrap();
+        let (crashed, fresh) = (bin.join(".yt-dlp-2026.05.01-1.zip"), bin.join(".yt-dlp-2026.08.19-2.zip"));
+        for leftover in [&crashed, &fresh] {
+            std::fs::write(leftover, b"partial").unwrap();
+        }
+        let hours_ago = SystemTime::now() - Duration::from_secs(2 * 3600);
+        std::fs::File::options().write(true).open(&crashed).unwrap().set_modified(hours_ago).unwrap();
+
+        let exe = install_verified(&bin, "2026.08.19", &zip, &good).unwrap();
+        assert_eq!(exe, release_dir(&bin, "2026.08.19").join("yt-dlp.exe"));
+        assert_eq!(std::fs::read(&exe).unwrap(), b"new build");
+        assert!(release_dir(&bin, "2026.08.19").join("_internal").join("python.dll").is_file());
+        assert_eq!(newest_release(&bin), Some(exe.clone()));
+        assert!(running.join("yt-dlp.exe").is_file(), "a release a program runs from stays whole");
+        let left = || {
+            let mut names: Vec<String> =
+                std::fs::read_dir(&bin).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+            names.sort();
+            names
+        };
+        assert_eq!(left(), [".yt-dlp-2026.08.19-2.zip", "yt-dlp-2026.06.01", "yt-dlp-2026.07.01", "yt-dlp-2026.08.19"]);
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+        // The same release again (as when another process installed it first) is kept as it is,
+        // and the old release nothing runs from any more goes.
+        assert_eq!(install_verified(&bin, "2026.08.19", &zip, &good).unwrap(), exe);
+        assert_eq!(left(), [".yt-dlp-2026.08.19-2.zip", "yt-dlp-2026.07.01", "yt-dlp-2026.08.19"]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn newest_release_compares_versions_as_numbers() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, exe) in [("yt-dlp-2026.9.30", true), ("yt-dlp-2026.10.01", true), ("yt-dlp-2026.12.01", false), ("yt-dlp-nightly", true)] {
+            let folder = dir.path().join(name);
+            std::fs::create_dir_all(&folder).unwrap();
+            if exe {
+                std::fs::write(folder.join("yt-dlp.exe"), b"x").unwrap();
+            }
+        }
+        // 10 > 9, and a folder without yt-dlp.exe is no release.
+        assert_eq!(newest_release(dir.path()), Some(dir.path().join("yt-dlp-2026.10.01").join("yt-dlp.exe")));
     }
 
     #[test]
