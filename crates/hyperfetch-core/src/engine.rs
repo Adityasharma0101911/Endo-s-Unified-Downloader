@@ -1,3 +1,4 @@
+use std::fs::{File, OpenOptions, TryLockError};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -6,10 +7,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use futures_util::StreamExt;
 use parking_lot::Mutex;
 use reqwest::header::{
-    HeaderMap, HeaderValue, ACCEPT_ENCODING, ACCEPT_RANGES, AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_RANGE,
-    ETAG, LAST_MODIFIED, RANGE,
+    HeaderMap, HeaderName, ACCEPT_ENCODING, CONTENT_DISPOSITION, CONTENT_RANGE, ETAG, LAST_MODIFIED, RANGE,
 };
-use reqwest::{Client, StatusCode};
+use reqwest::{Client, Response, StatusCode};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinSet;
@@ -24,13 +24,25 @@ use crate::mirror::MirrorRacer;
 use crate::range::ByteRange;
 use crate::state::DownloadState;
 use crate::storage::{DiskWriter, VerifyError};
-use crate::worker::{content_length, retry_after, FailureKind, HttpWorker, RateLimiter, WorkerEvent, WorkerShared};
+use crate::worker::{
+    authorize, content_length, retry_after, Auth, FailureKind, HttpWorker, RateLimiter, WorkerEvent, WorkerShared,
+};
 
 const CANCELLED: &str = "Download cancelled by user";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(30);
-const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Bound on one mirror's whole probe: HEAD, the ranged GET's tries and the pauses between them.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 const PROBE_CONCURRENCY: usize = 8;
+/// Tries of a probe's ranged GET while the server is busy or the connection fails.
+const PROBE_ATTEMPTS: u32 = 3;
+/// Longest pause between probe tries, whatever Retry-After asks for.
+const PROBE_RETRY_CAP: Duration = Duration::from_secs(5);
+/// Fetching the playlists and each AES key may retry every request with backoff.
+const HLS_PARSE_TIMEOUT: Duration = Duration::from_secs(120);
+/// Longest file name we create, in bytes: leaves room for " (n)" and ".part.hfstate.tmp" under
+/// the 255-byte (Linux) and 255 UTF-16 unit (NTFS) limits.
+const MAX_NAME_BYTES: usize = 200;
 const SNAPSHOT_INTERVAL: Duration = Duration::from_millis(150);
 const PERSIST_INTERVAL: Duration = Duration::from_secs(2);
 /// Time constant of the smoothed speed shown to the user.
@@ -55,6 +67,9 @@ pub struct DownloadOptions {
     pub num_connections: usize,
     pub base_chunk_size: u64,
     pub min_steal_threshold: u64,
+    /// Where to save. A path that ends with a path separator, or is an existing directory, is a
+    /// directory (created if missing) that receives the file under its server-provided name.
+    /// Any other path is the output file itself. `None` saves into the working directory.
     pub output_path: Option<PathBuf>,
     pub expected_checksum: Option<String>,
     pub cookies_path: Option<PathBuf>,
@@ -97,17 +112,24 @@ pub struct DownloadEngine {
     /// A client that failed to build (bad proxy, header or cookies file) is reported by `run()`
     /// instead of silently downloading without the user's settings.
     client: Result<Client, String>,
+    /// Added per request, only for the hosts in `urls`; never a client default header.
+    auth: Option<Arc<Auth>>,
     cancel_flag: Arc<AtomicBool>,
     cancel_token: CancellationToken,
 }
 
 impl DownloadEngine {
     pub fn new(urls: Vec<Url>, options: DownloadOptions) -> Self {
-        let client = build_client(&options);
+        let auth = options.auth_header.as_deref().map(|value| Auth::new(value, &urls));
+        let client = match &auth {
+            Some(Err(e)) => Err(e.clone()),
+            _ => build_client(&options),
+        };
         Self {
             options,
             urls,
             client,
+            auth: auth.and_then(Result::ok).map(Arc::new),
             cancel_flag: Arc::new(AtomicBool::new(false)),
             cancel_token: CancellationToken::new(),
         }
@@ -117,8 +139,9 @@ impl DownloadEngine {
     ///
     /// Callers should keep awaiting `run()` afterwards: it stops every connection, flushes written
     /// data, saves the resume state and returns `Err("Download cancelled by user")`, normally within
-    /// about two seconds. Dropping the `run()` future instead skips that final state save, so up to
-    /// two seconds of progress would be downloaded again on resume.
+    /// about two seconds (longer only while the disk is still flushing written data). Dropping the
+    /// `run()` future instead skips that final state save, so up to two seconds of progress would
+    /// be downloaded again on resume.
     pub fn cancel(&self) {
         self.cancel_flag.store(true, Ordering::Relaxed);
         self.cancel_token.cancel();
@@ -145,8 +168,9 @@ impl DownloadEngine {
 
         if let Some(playlist) = resolved.iter().find(|u| u.as_str().contains(".m3u8")) {
             tracing::info!("Detected HLS video stream: {}", playlist);
+            let started_at = unix_now();
             let parsed = self
-                .guarded(PROBE_TIMEOUT, "fetching the HLS playlist", crate::hls::parse_hls_playlist(&client, playlist))
+                .guarded(HLS_PARSE_TIMEOUT, "fetching the HLS playlist", crate::hls::parse_hls_playlist(&client, playlist))
                 .await?;
             match parsed {
                 Ok(segments) => {
@@ -159,7 +183,7 @@ impl DownloadEngine {
                                 && (!part_path(c).exists() || crate::hls::has_resumable_part(c, &segments))
                         })
                         .unwrap_or(base);
-                    return crate::hls::HlsEngine::download(
+                    let path = crate::hls::HlsEngine::download(
                         &client,
                         segments,
                         &out_path,
@@ -168,14 +192,18 @@ impl DownloadEngine {
                         Some(Arc::clone(&self.cancel_flag)),
                     )
                     .await
-                    .map_err(|e| e.to_string());
+                    .map_err(|e| e.to_string())?;
+                    return self.finish_external(path, started_at).await;
                 }
-                // Not a usable playlist after all: try it as a plain file.
-                Err(e @ (HlsError::InvalidPlaylist(_) | HlsError::NoSegments)) => {
-                    tracing::warn!("HLS playlist parsing failed, falling back to direct download: {}", e)
+                // Fetched, but not a playlist after all: try it as a plain file.
+                Err(HlsError::InvalidPlaylist(reason)) => {
+                    tracing::warn!("Not an HLS playlist ({}); falling back to a direct download", reason)
                 }
-                // A real stream this engine can't handle; downloading the playlist text would not help.
-                Err(e) => return Err(format!("{} (try a media preset to use the media engine)", e)),
+                // A real stream; downloading the playlist text instead would only fake a success.
+                Err(e) if matches!(e, HlsError::Unsupported(_)) => {
+                    return Err(format!("{} (try a media preset to use the media engine)", e))
+                }
+                Err(e) => return Err(e.to_string()),
             }
         }
 
@@ -235,15 +263,20 @@ impl DownloadEngine {
             }
         });
 
-        let output_dir = match &self.options.output_path {
-            Some(p) if p.is_dir() => p.clone(),
-            Some(p) => p.parent().unwrap_or(Path::new(".")).to_path_buf(),
-            None => PathBuf::from("."),
+        let (output_dir, output_filename) = match &self.options.output_path {
+            Some(p) if is_dir_target(p) => (p.clone(), None),
+            Some(p) => (
+                p.parent().unwrap_or(Path::new(".")).to_path_buf(),
+                p.file_name().map(|n| n.to_string_lossy().to_string()),
+            ),
+            None => (PathBuf::from("."), None),
         };
-        let output_filename = match &self.options.output_path {
-            Some(p) if !p.is_dir() => p.file_name().map(|n| n.to_string_lossy().to_string()),
-            _ => None,
-        };
+        {
+            let dir = output_dir.clone();
+            blocking(move || std::fs::create_dir_all(&dir))
+                .await?
+                .map_err(|e| format!("Failed to create {}: {}", output_dir.display(), e))?;
+        }
         let cookie_source = if let Some(ref bc) = self.options.browser_cookies {
             bc.clone()
         } else if let Some(ref cp) = self.options.cookies_path {
@@ -270,35 +303,36 @@ impl DownloadEngine {
         )
         .await;
         let _ = forwarder.await;
-        let final_path = res?;
+        self.finish_external(res?, started_at).await
+    }
 
-        if let Some(expected) = self.options.expected_checksum.clone() {
-            let path = final_path.clone();
-            match blocking(move || DiskWriter::verify_file_checksum(&path, &expected)).await? {
-                Ok(true) => tracing::info!("Checksum verification passed for {}", final_path.display()),
-                Ok(false) => {
-                    let expected = self.options.expected_checksum.as_deref().unwrap_or_default();
-                    return Err(format!("Checksum verification failed: hash mismatch (expected {})", expected));
-                }
-                Err(e) => return Err(format!("Checksum verification failed: {}", e)),
-            }
+    /// Checks the expected checksum of a file another engine (yt-dlp, HLS) finished, in one
+    /// read-only pass off the runtime, and records it in history. A mismatch is an error; the
+    /// file is left in place for the user to inspect.
+    async fn finish_external(&self, path: PathBuf, started_at: u64) -> Result<PathBuf, String> {
+        let hashed = {
+            let (path, expected) = (path.clone(), self.options.expected_checksum.clone());
+            blocking(move || crate::storage::hash_and_verify_file(&path, expected.as_deref())).await?
+        };
+        let blake3_hex = hashed.map_err(|e| e.to_string())?;
+        if self.options.expected_checksum.is_some() {
+            tracing::info!("Checksum verification passed for {}", path.display());
         }
 
         let urls = self.url_strings();
-        let path = final_path.clone();
+        let recorded = path.clone();
         let _ = blocking(move || {
-            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-            let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "media_download".to_string());
-            let mut entry = HistoryEntry::new(name, absolute(&path), size, urls);
+            let size = std::fs::metadata(&recorded).map(|m| m.len()).unwrap_or(0);
+            let mut entry = HistoryEntry::new(file_name_of(&recorded), absolute(&recorded), size, urls);
             entry.downloaded_bytes = size;
             entry.status = HistoryStatus::Completed;
+            entry.blake3_hash = Some(blake3_hex);
             entry.started_at = started_at;
             entry.completed_at = Some(unix_now());
             DownloadHistoryManager::load().add_or_update(entry);
         })
         .await;
-
-        Ok(final_path)
+        Ok(path)
     }
 
     /// Resolves every URL into direct mirrors. A resolver error fails the download instead of
@@ -327,9 +361,9 @@ impl DownloadEngine {
         // Owned values keep the future `Send` (a borrowing closure here is not general enough).
         let probes = futures_util::stream::iter(urls.to_vec())
             .map(|url| {
-                let client = client.clone();
+                let (client, auth) = (client.clone(), self.auth.clone());
                 async move {
-                    tokio::time::timeout(PROBE_TIMEOUT, probe_url(&client, &url))
+                    tokio::time::timeout(PROBE_TIMEOUT, probe_url(&client, auth.as_deref(), &url))
                         .await
                         .unwrap_or_else(|_| Err(format!("{}: no answer within {}s", url, PROBE_TIMEOUT.as_secs())))
                 }
@@ -365,18 +399,21 @@ impl DownloadEngine {
             let (base, remote, urls) = (base.clone(), reference.clone(), known_urls.clone());
             let checksum = self.options.expected_checksum.clone();
             blocking(move || {
+                if let Some(dir) = base.parent().filter(|d| !d.as_os_str().is_empty()) {
+                    std::fs::create_dir_all(dir).map_err(|e| format!("Failed to create {}: {}", dir.display(), e))?;
+                }
                 let history = DownloadHistoryManager::load();
                 plan_target(&base, &remote, &urls, &history, checksum.as_deref())
             })
             .await?
         };
-        let (final_path, resume) = match plan? {
+        let (final_path, resume, claim) = match plan? {
             Plan::AlreadyDone(path) => {
                 tracing::info!("{} is already downloaded", path.display());
                 emit(&snapshot_tx, || done_snapshot(reference.size.unwrap_or(0), &path));
                 return Ok(path);
             }
-            Plan::Fetch { final_path, resume } => (final_path, resume),
+            Plan::Fetch { final_path, resume, claim } => (final_path, resume, claim),
         };
 
         let part = part_path(&final_path);
@@ -396,17 +433,12 @@ impl DownloadEngine {
             tracing::info!("Resuming {} with {} completed range(s)", part.display(), previous.completed_ranges.len());
             state.completed_ranges = previous.completed_ranges;
         }
-        // Claim the .part and record the validators before the first byte arrives.
+        // Record the sources and validators before the first byte arrives.
         {
             let (state, path) = (state.clone(), state_path.clone());
-            blocking(move || -> std::io::Result<()> {
-                if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-                    std::fs::create_dir_all(dir)?;
-                }
-                state.save_atomic(&path).map_err(std::io::Error::other)
-            })
-            .await?
-            .map_err(|e| format!("Failed to save download state: {}", e))?;
+            blocking(move || state.save_atomic(&path))
+                .await?
+                .map_err(|e| format!("Failed to save download state: {}", e))?;
         }
 
         tracing::info!(
@@ -423,7 +455,7 @@ impl DownloadEngine {
             }
             _ => self.fetch_stream(&client, &reference, &part, &final_path, &snapshot_tx).await?,
         }
-        self.finalize(part, final_path, state_path, started_at, &snapshot_tx).await
+        self.finalize(part, final_path, state_path, claim, started_at, &snapshot_tx).await
     }
 
     /// Multi-connection download of a file whose size is known and whose server honours ranges.
@@ -471,13 +503,16 @@ impl DownloadEngine {
         emit(snapshot_tx, || job.snapshot(size, &mut meter, final_path));
 
         let (events_tx, mut events) = mpsc::channel(1024);
+        // Workers stop when the user cancels or when this download is over.
+        let stop = self.cancel_token.child_token();
         let shared = WorkerShared {
             client,
+            auth: self.auth.clone(),
             writer: job.writer.clone(),
             chunks: Arc::clone(&job.chunks),
             mirrors: Arc::clone(&job.mirrors),
             events: events_tx,
-            cancel: self.cancel_token.clone(),
+            cancel: stop.clone(),
             limiter: self.limiter(),
             file_size: size,
             min_steal,
@@ -519,9 +554,13 @@ impl DownloadEngine {
             }
         };
 
-        // Nothing may keep downloading, or hold the file open, once this returns.
-        workers.shutdown().await;
+        // Nothing may keep downloading, or write to or hold the file, once this returns. Every
+        // worker writes out what it received and awaits its own disk writes before exiting, so
+        // once all have exited no write is in flight. They are not aborted: an aborted worker
+        // would leave its blocking write running on its own.
+        stop.cancel();
         drop(events);
+        while workers.join_next().await.is_some() {}
 
         match outcome {
             Ok(()) => {
@@ -594,7 +633,9 @@ impl DownloadEngine {
     ) -> Result<(), (FailureKind, String)> {
         let stall = self.stall_timeout();
         let transient = |msg: String| (FailureKind::Transient, msg);
-        let request = client.get(remote.url.clone()).header(ACCEPT_ENCODING, "identity").send();
+        let request = authorize(client.get(remote.url.clone()), self.auth.as_deref(), &remote.url)
+            .header(ACCEPT_ENCODING, "identity")
+            .send();
         let response = tokio::select! {
             biased;
             _ = self.cancel_token.cancelled() => return Err(transient(CANCELLED.to_string())),
@@ -683,12 +724,14 @@ impl DownloadEngine {
         }
     }
 
-    /// Verifies the finished `.part`, moves it to its final name and records it in history.
+    /// Verifies the finished `.part`, moves it to its final name and records it in history. The
+    /// claim on the name is released only once the file is in place (or discarded).
     async fn finalize(
         &self,
         part: PathBuf,
         final_path: PathBuf,
         state_path: PathBuf,
+        claim: Claim,
         started_at: u64,
         snapshot_tx: &Option<broadcast::Sender<EngineSnapshot>>,
     ) -> Result<PathBuf, String> {
@@ -704,6 +747,7 @@ impl DownloadEngine {
                 let _ = blocking(move || {
                     let _ = std::fs::remove_file(&part);
                     let _ = DownloadState::remove(&state_path);
+                    drop(claim);
                 })
                 .await;
                 return Err(e);
@@ -720,6 +764,7 @@ impl DownloadEngine {
             if let Err(e) = DownloadState::remove(&state_path) {
                 tracing::warn!("Failed to remove {}: {}", state_path.display(), e);
             }
+            drop(claim);
             Ok((target, size))
         })
         .await??;
@@ -752,7 +797,7 @@ impl DownloadEngine {
 
     fn output_path_for(&self, filename: &str) -> PathBuf {
         match &self.options.output_path {
-            Some(p) if p.is_dir() => p.join(filename),
+            Some(p) if is_dir_target(p) => p.join(filename),
             Some(p) => p.clone(),
             None => PathBuf::from(filename),
         }
@@ -760,10 +805,9 @@ impl DownloadEngine {
 
     fn hls_output_path(&self, playlist: &Url, segments: &[crate::hls::HlsSegment]) -> PathBuf {
         let ext = crate::hls::container_extension(segments);
+        // The playlist URL's extension (.m3u8, .php, ...) says nothing about the media.
         let mut name = PathBuf::from(filename_from_url(playlist).unwrap_or_else(|| "stream".to_string()));
-        if name.extension().is_none_or(|e| e == "m3u8") {
-            name.set_extension(ext);
-        }
+        name.set_extension(ext);
         let mut out = self.output_path_for(&name.to_string_lossy());
         if out.extension().is_none() {
             out.set_extension(ext);
@@ -784,12 +828,10 @@ impl DownloadEngine {
     }
 }
 
+/// The user's Authorization header is deliberately not a default header here: it is added per
+/// request, only for the hosts the user named (see [`Auth`]).
 fn build_client(options: &DownloadOptions) -> Result<Client, String> {
-    let mut headers = crate::resolver::SmartResolver::default_anti_qos_headers();
-    if let Some(auth) = &options.auth_header {
-        let value = HeaderValue::from_str(auth).map_err(|_| "Invalid Authorization header value".to_string())?;
-        headers.insert(AUTHORIZATION, value);
-    }
+    let headers = crate::resolver::SmartResolver::default_anti_qos_headers();
 
     let mut builder = Client::builder()
         // One TCP connection per worker: over HTTP/2 every "connection" would be a stream
@@ -801,6 +843,22 @@ fn build_client(options: &DownloadOptions) -> Result<Client, String> {
         .pool_max_idle_per_host(64)
         .pool_idle_timeout(Some(Duration::from_secs(90)))
         .default_headers(headers);
+
+    if options.auth_header.is_some() {
+        // reqwest drops Authorization on a redirect to another host, but keeps it on a
+        // same-host redirect from https to http, which would send it in cleartext.
+        builder = builder.redirect(reqwest::redirect::Policy::custom(|attempt| {
+            let downgrade = attempt.url().scheme() == "http"
+                && attempt.previous().last().is_some_and(|prev| prev.scheme() == "https");
+            if downgrade {
+                attempt.error("refusing an HTTPS to HTTP redirect while sending credentials")
+            } else if attempt.previous().len() >= 10 {
+                attempt.error("too many redirects")
+            } else {
+                attempt.follow()
+            }
+        }));
+    }
 
     if let Some(proxy_url) = &options.proxy {
         let proxy = reqwest::Proxy::all(proxy_url).map_err(|e| format!("Invalid proxy URL {}: {}", proxy_url, e))?;
@@ -946,71 +1004,114 @@ impl ProbeInfo {
         self.strong_etag().map(str::to_string).or_else(|| self.last_modified.clone())
     }
 
-    fn absorb(&mut self, headers: &HeaderMap, final_url: &Url) {
-        self.filename = extract_filename(headers, final_url);
-        let header = |name| headers.get(name).and_then(|v: &HeaderValue| v.to_str().ok()).map(str::to_string);
-        self.etag = header(ETAG);
-        self.last_modified = header(LAST_MODIFIED);
+    /// Name and validators of `url` from the first of `responses` that has each; without a
+    /// Content-Disposition name, the first response's final (post-redirect) URL names the file.
+    /// Size and range support are left for the caller.
+    fn describe(url: &Url, responses: &[&Response]) -> Self {
+        let header = |name: HeaderName| {
+            responses.iter().find_map(|r| r.headers().get(&name)?.to_str().ok().map(str::to_string))
+        };
+        let final_url = responses.first().map_or(url, |r| r.url());
+        Self {
+            url: url.clone(),
+            size: None,
+            accepts_ranges: false,
+            filename: extract_filename(responses.iter().map(|r| r.headers()), final_url),
+            etag: header(ETAG),
+            last_modified: header(LAST_MODIFIED),
+        }
     }
 }
 
-/// Learns size, range support, name and validators with HEAD, confirming range support (and a
-/// size HEAD would not give) with a one-byte ranged GET.
-async fn probe_url(client: &Client, url: &Url) -> Result<ProbeInfo, String> {
-    let mut info = ProbeInfo {
-        url: url.clone(),
-        size: None,
-        accepts_ranges: false,
-        filename: extract_filename(&HeaderMap::new(), url),
-        etag: None,
-        last_modified: None,
+/// Learns size, range support, name and validators. HEAD is only a hint: servers and proxies
+/// advertise ranges (and sizes) their GETs do not honour, so a one-byte ranged GET always decides
+/// range support and size, and supplies the name and validators wherever it has them.
+async fn probe_url(client: &Client, auth: Option<&Auth>, url: &Url) -> Result<ProbeInfo, String> {
+    let head = match authorize(client.head(url.clone()), auth, url).send().await {
+        Ok(resp) if resp.status().is_success() => Some(resp),
+        Ok(resp) => {
+            tracing::debug!("HEAD {} returned {}", url, resp.status());
+            None
+        }
+        Err(e) => {
+            tracing::debug!("HEAD {} failed: {}", url, e);
+            None
+        }
+    };
+    let head_len = head.as_ref().and_then(|r| content_length(r.headers()));
+
+    let mut attempt = 0;
+    let ranged = loop {
+        attempt += 1;
+        let sent = authorize(client.get(url.clone()), auth, url)
+            .header(RANGE, "bytes=0-0")
+            .header(ACCEPT_ENCODING, "identity")
+            .send()
+            .await;
+        let retry_in = match &sent {
+            Ok(resp) => match resp.status() {
+                StatusCode::TOO_MANY_REQUESTS
+                | StatusCode::SERVICE_UNAVAILABLE
+                | StatusCode::BAD_GATEWAY
+                | StatusCode::GATEWAY_TIMEOUT => Some(retry_after(resp.headers()).unwrap_or_default()),
+                _ => None,
+            },
+            Err(_) => Some(Duration::ZERO),
+        };
+        match retry_in {
+            Some(after) if attempt < PROBE_ATTEMPTS => {
+                drop(sent);
+                tokio::time::sleep(crate::chunk::backoff_delay(attempt).max(after).min(PROBE_RETRY_CAP)).await;
+            }
+            _ => break sent,
+        }
     };
 
-    let mut head_len = None;
-    match client.head(url.clone()).send().await {
-        Ok(resp) if resp.status().is_success() => {
-            info.absorb(resp.headers(), resp.url());
-            head_len = content_length(resp.headers());
-            // A HEAD Content-Length of 0 is common for dynamic content; confirm it below.
+    let get = match ranged {
+        Ok(resp) if matches!(
+            resp.status(),
+            StatusCode::PARTIAL_CONTENT | StatusCode::OK | StatusCode::RANGE_NOT_SATISFIABLE
+        ) => resp,
+        // Neither ranges nor size could be confirmed: go by HEAD, with a single stream.
+        _ if head.is_some() => {
+            let head: Vec<&Response> = head.iter().collect();
+            let mut info = ProbeInfo::describe(url, &head);
             info.size = head_len.filter(|&n| n > 0);
-            info.accepts_ranges = accepts_bytes(resp.headers());
-            if info.size.is_some() && info.accepts_ranges {
-                return Ok(info);
-            }
+            return Ok(info);
         }
-        Ok(resp) => tracing::debug!("HEAD {} returned {}", url, resp.status()),
-        Err(e) => tracing::debug!("HEAD {} failed: {}", url, e),
-    }
-
-    let resp = client
-        .get(url.clone())
-        .header(RANGE, "bytes=0-0")
-        .header(ACCEPT_ENCODING, "identity")
-        .send()
-        .await;
-    let resp = match resp {
-        Ok(resp) => resp,
-        Err(_) if head_len.is_some() => return Ok(info),
+        // Some servers reject HEAD and any Range header: a plain GET is the last resort.
+        Ok(_) => {
+            let plain = authorize(client.get(url.clone()), auth, url)
+                .header(ACCEPT_ENCODING, "identity")
+                .send()
+                .await
+                .map_err(|e| format!("{}: {}", url, e))?;
+            if !plain.status().is_success() {
+                return Err(format!("{}: HTTP {}", url, plain.status()));
+            }
+            let mut info = ProbeInfo::describe(url, &[&plain]);
+            info.size = content_length(plain.headers());
+            return Ok(info);
+        }
         Err(e) => return Err(format!("{}: {}", url, e)),
     };
-    if head_len.is_none() {
-        info.absorb(resp.headers(), resp.url());
-    }
-    let content_range = resp.headers().get(CONTENT_RANGE).and_then(|v| v.to_str().ok());
-    match resp.status() {
+
+    let sources: Vec<&Response> = std::iter::once(&get).chain(head.as_ref()).collect();
+    let mut info = ProbeInfo::describe(url, &sources);
+    let content_range = get.headers().get(CONTENT_RANGE).and_then(|v| v.to_str().ok());
+    match get.status() {
         StatusCode::PARTIAL_CONTENT => match content_range.map(ByteRange::parse_content_range) {
-            Some(Ok((range, total))) if range.start == 0 => {
+            Some(Ok((range, Some(total)))) if range.start == 0 => {
                 info.accepts_ranges = true;
-                info.size = total.or(info.size);
+                info.size = Some(total);
             }
+            // `bytes 0-0/*`: the length is unknown, so only a single stream can fetch the file.
+            Some(Ok((range, None))) if range.start == 0 => {}
             _ => return Err(format!("{}: invalid Content-Range {:?}", url, content_range)),
         },
-        StatusCode::OK => {
-            info.accepts_ranges = false;
-            info.size = content_length(resp.headers());
-        }
+        StatusCode::OK => info.size = content_length(get.headers()),
         // Only an empty file cannot satisfy bytes=0-0.
-        StatusCode::RANGE_NOT_SATISFIABLE => {
+        _ => {
             info.size = content_range
                 .and_then(|h| h.trim().strip_prefix("bytes */"))
                 .and_then(|n| n.parse().ok())
@@ -1019,8 +1120,6 @@ async fn probe_url(client: &Client, url: &Url) -> Result<ProbeInfo, String> {
                 return Err(format!("{}: 416 for bytes=0-0 without a size", url));
             }
         }
-        _ if head_len.is_some() => {}
-        status => return Err(format!("{}: HTTP {}", url, status)),
     }
     Ok(info)
 }
@@ -1061,27 +1160,72 @@ fn select_mirrors(probes: Vec<Result<ProbeInfo, String>>) -> Result<(ProbeInfo, 
     Ok((reference, mirrors))
 }
 
-fn accepts_bytes(headers: &HeaderMap) -> bool {
-    headers
-        .get_all(ACCEPT_RANGES)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(','))
-        .any(|unit| unit.trim().eq_ignore_ascii_case("bytes"))
-}
-
 /// Where the download goes and whether it can pick up a previous partial download.
 #[derive(Debug)]
 enum Plan {
     /// This path already holds the exact file.
     AlreadyDone(PathBuf),
-    /// Download into `<final_path>.part`, resuming from `resume` if set.
-    Fetch { final_path: PathBuf, resume: Option<DownloadState> },
+    /// Download into `<final_path>.part`, resuming from `resume` if set, while holding `claim`.
+    Fetch { final_path: PathBuf, resume: Option<Box<DownloadState>>, claim: Claim },
+}
+
+/// Exclusive ownership of an output name for a whole download: an OS lock on
+/// `<final>.part.lock`, which the OS also releases if the process dies. Other downloads, in this
+/// process or another, skip a claimed name even before its `.part` exists. Dropping the claim
+/// deletes the lock file.
+#[derive(Debug)]
+struct Claim {
+    path: PathBuf,
+    _lock: File,
+}
+
+impl Claim {
+    /// Claims `final_path`, or returns `None` while another download holds it. Blocking.
+    fn try_take(final_path: &Path) -> Result<Option<Self>, String> {
+        let path = lock_path(final_path);
+        let fail = |e: std::io::Error| format!("Failed to lock {}: {}", path.display(), e);
+        let mut denied = None;
+        for _ in 0..3 {
+            let lock = match OpenOptions::new().write(true).create(true).truncate(false).open(&path) {
+                Ok(lock) => lock,
+                // Windows refuses to open a lock file while its holder deletes it, for an instant.
+                // Anything longer is a real permission problem.
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    denied = Some(e);
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(e) => return Err(fail(e)),
+            };
+            denied = None;
+            match lock.try_lock() {
+                Ok(()) => {}
+                Err(TryLockError::WouldBlock) => return Ok(None),
+                Err(TryLockError::Error(e)) => return Err(fail(e)),
+            }
+            // A finishing holder deletes the lock file. If that happened between our open and our
+            // lock, we hold a lock on a file nobody else can see; only a lock on the file now at
+            // `path` counts. A second handle to the file we locked cannot lock it too.
+            let at_path = OpenOptions::new().write(true).open(&path);
+            if at_path.is_ok_and(|other| matches!(other.try_lock(), Err(TryLockError::WouldBlock))) {
+                return Ok(Some(Self { path, _lock: lock }));
+            }
+        }
+        denied.map_or(Ok(None), |e| Err(fail(e)))
+    }
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        // Deleted while still locked, so nobody can take a claim on the file as it goes away.
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 /// Chooses the output path. Walks `name`, `name (1)`, `name (2)`... and takes the first one that
-/// is already this exact file, holds our resumable (or stale) `.part`, or is free. Existing files
-/// and other downloads' `.part` files are never touched.
+/// is already this exact file, or that it can claim and that holds our resumable (or stale)
+/// `.part` or is free. Existing files, claimed names and other downloads' `.part` files are never
+/// touched.
 fn plan_target(
     base: &Path,
     remote: &ProbeInfo,
@@ -1093,23 +1237,25 @@ fn plan_target(
     loop {
         let candidate = numbered(base, n);
         n += 1;
+        if already_downloaded(&candidate, remote, urls, history, checksum) {
+            return Ok(Plan::AlreadyDone(candidate));
+        }
+        // A running download owns this name, whether or not its `.part` exists yet.
+        let Some(claim) = Claim::try_take(&candidate)? else {
+            continue;
+        };
         let part = part_path(&candidate);
         let part_state = DownloadState::state_file_path(&part);
 
-        if candidate.exists() {
-            if already_downloaded(&candidate, remote, urls, history, checksum) {
-                return Ok(Plan::AlreadyDone(candidate));
-            }
-            if part.exists() || !migrate_legacy(&candidate, &part, remote, urls)? {
-                continue;
-            }
+        if candidate.exists() && (part.exists() || !migrate_legacy(&candidate, &part, remote, urls)?) {
+            continue;
         }
 
         if part.exists() {
             match DownloadState::load_from_path(&part_state).ok().flatten() {
                 Some(state) if state.mirrors.iter().any(|m| urls.contains(m)) => {
                     if can_resume(&state, remote, &part) {
-                        return Ok(Plan::Fetch { final_path: candidate, resume: Some(state) });
+                        return Ok(Plan::Fetch { final_path: candidate, resume: Some(Box::new(state)), claim });
                     }
                     tracing::info!("Discarding stale partial download {}", part.display());
                     std::fs::remove_file(&part).map_err(|e| format!("Failed to remove {}: {}", part.display(), e))?;
@@ -1120,7 +1266,7 @@ fn plan_target(
             }
         }
 
-        return Ok(Plan::Fetch { final_path: candidate, resume: None });
+        return Ok(Plan::Fetch { final_path: candidate, resume: None, claim });
     }
 }
 
@@ -1242,11 +1388,11 @@ fn numbered(base: &Path, n: usize) -> PathBuf {
     base.with_file_name(name)
 }
 
-/// First of `base`, `base (1)`, ... where neither the file nor its `.part` exists.
+/// First of `base`, `base (1)`, ... where neither the file, its `.part` nor a claim exists.
 fn free_path(base: &Path) -> PathBuf {
     (0..)
         .map(|n| numbered(base, n))
-        .find(|c| !c.exists() && !part_path(c).exists())
+        .find(|c| !c.exists() && !part_path(c).exists() && !lock_path(c).exists())
         .unwrap_or_else(|| base.to_path_buf())
 }
 
@@ -1254,6 +1400,19 @@ fn part_path(final_path: &Path) -> PathBuf {
     let mut name = final_path.file_name().unwrap_or_default().to_os_string();
     name.push(".part");
     final_path.with_file_name(name)
+}
+
+/// `<final>.part.lock`, the file a [`Claim`] locks.
+fn lock_path(final_path: &Path) -> PathBuf {
+    let mut name = part_path(final_path).into_os_string();
+    name.push(".lock");
+    PathBuf::from(name)
+}
+
+/// Whether an output path names a directory to save into: it ends with a path separator or is
+/// an existing directory.
+fn is_dir_target(path: &Path) -> bool {
+    path.as_os_str().as_encoded_bytes().last().is_some_and(|&b| std::path::is_separator(b as char)) || path.is_dir()
 }
 
 fn file_name_of(path: &Path) -> String {
@@ -1306,14 +1465,17 @@ fn stream_snapshot(size: Option<u64>, written: u64, speed: f64, path: &Path) -> 
     }
 }
 
-/// File name from Content-Disposition, else the last segment of the (final, post-redirect) URL.
-fn extract_filename(headers: &HeaderMap, url: &Url) -> String {
+/// File name from the first Content-Disposition among `headers` that names one, else the last
+/// segment of the (final, post-redirect) URL. Raw UTF-8 in the header is accepted, as browsers do.
+fn extract_filename<'a>(headers: impl IntoIterator<Item = &'a HeaderMap>, url: &Url) -> String {
     headers
-        .get(CONTENT_DISPOSITION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(content_disposition_filename)
-        .map(|name| sanitize_filename(&name))
-        .filter(|name| !name.is_empty())
+        .into_iter()
+        .find_map(|h| {
+            let value = String::from_utf8_lossy(h.get(CONTENT_DISPOSITION)?.as_bytes()).into_owned();
+            content_disposition_filename(&value)
+                .map(|name| sanitize_filename(&name))
+                .filter(|name| !name.is_empty())
+        })
         .or_else(|| filename_from_url(url))
         .unwrap_or_else(|| "downloaded_file.bin".to_string())
 }
@@ -1420,7 +1582,8 @@ fn percent_decode(input: &str) -> Vec<u8> {
     out
 }
 
-/// Makes a server-provided name safe as a single path component on every OS.
+/// Makes a server-provided name safe as a single path component on every OS, at most
+/// `MAX_NAME_BYTES` long.
 fn sanitize_filename(name: &str) -> String {
     let cleaned: String = name
         .chars()
@@ -1439,10 +1602,25 @@ fn sanitize_filename(name: &str) -> String {
             | "COM1" | "COM2" | "COM3" | "COM4" | "COM5" | "COM6" | "COM7" | "COM8" | "COM9"
             | "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9"
     );
-    if is_reserved {
-        format!("_{}", trimmed)
-    } else {
-        trimmed
+    let safe = if is_reserved { format!("_{}", trimmed) } else { trimmed };
+    truncate_name(safe)
+}
+
+/// Cuts `name` to at most `MAX_NAME_BYTES` on a character boundary, keeping a short extension.
+fn truncate_name(name: String) -> String {
+    if name.len() <= MAX_NAME_BYTES {
+        return name;
+    }
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() && ext.len() <= 16 => (stem, Some(ext)),
+        _ => (name.as_str(), None),
+    };
+    let budget = MAX_NAME_BYTES - ext.map_or(0, |e| e.len() + 1);
+    let cut = (0..=budget).rev().find(|&i| stem.is_char_boundary(i)).unwrap_or(0);
+    let stem = stem[..cut].trim_end_matches(|c: char| c == '.' || c.is_whitespace());
+    match ext {
+        Some(ext) => format!("{}.{}", stem, ext),
+        None => stem.to_string(),
     }
 }
 
@@ -1473,6 +1651,7 @@ fn parse_http_date(value: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reqwest::header::HeaderValue;
     use tempfile::tempdir;
 
     fn remote(size: u64) -> ProbeInfo {
@@ -1538,17 +1717,143 @@ mod tests {
     fn test_extract_filename_is_safe() {
         let url = Url::parse("http://example.com/dir/final%20name.iso?x=1").unwrap();
         let mut headers = HeaderMap::new();
-        assert_eq!(extract_filename(&headers, &url), "final name.iso");
+        assert_eq!(extract_filename([&headers], &url), "final name.iso");
 
         headers.insert(CONTENT_DISPOSITION, HeaderValue::from_static("attachment; filename=\"../../etc/passwd\""));
-        let name = extract_filename(&headers, &url);
+        let name = extract_filename([&headers], &url);
         assert!(!name.contains('/') && !name.contains('\\') && !name.starts_with('.'), "{name}");
 
         headers.insert(CONTENT_DISPOSITION, HeaderValue::from_static("attachment; filename=\"..\""));
-        assert_eq!(extract_filename(&headers, &url), "final name.iso");
+        assert_eq!(extract_filename([&headers], &url), "final name.iso");
         assert_eq!(sanitize_filename("con.txt"), "_con.txt");
-        assert_eq!(extract_filename(&HeaderMap::new(), &Url::parse("http://h/").unwrap()), "downloaded_file.bin");
+        assert_eq!(extract_filename([&HeaderMap::new()], &Url::parse("http://h/").unwrap()), "downloaded_file.bin");
         assert_eq!(String::from_utf8_lossy(&percent_decode("100%-%zz%4")), "100%-%zz%4");
+    }
+
+    #[test]
+    fn test_raw_utf8_content_disposition_is_used() {
+        let url = Url::parse("http://example.com/dl.cgi").unwrap();
+        let mut headers = HeaderMap::new();
+        let raw = HeaderValue::from_bytes("attachment; filename=\"café.zip\"".as_bytes()).unwrap();
+        headers.insert(CONTENT_DISPOSITION, raw);
+        assert_eq!(extract_filename([&headers], &url), "café.zip");
+        // The first response that names the file wins; later ones only fill gaps.
+        let none = HeaderMap::new();
+        assert_eq!(extract_filename([&none, &headers], &url), "café.zip");
+    }
+
+    #[test]
+    fn test_long_names_are_capped_keeping_the_extension() {
+        let url = Url::parse("http://example.com/x").unwrap();
+        for long in ["a".repeat(300) + ".bin", "é".repeat(150) + ".tar.gz", "b".repeat(300)] {
+            let mut headers = HeaderMap::new();
+            let value = format!("attachment; filename=\"{}\"", long);
+            headers.insert(CONTENT_DISPOSITION, HeaderValue::from_bytes(value.as_bytes()).unwrap());
+            let name = extract_filename([&headers], &url);
+            assert!(name.len() <= MAX_NAME_BYTES, "{} bytes", name.len());
+            assert_eq!(Path::new(&name).extension(), Path::new(&long).extension(), "{name}");
+            assert!(long.starts_with(Path::new(&name).file_stem().unwrap().to_str().unwrap()));
+            // Every file the download creates next to it still fits a 255-byte component.
+            let state_tmp = format!("{} (99).part.hfstate.tmp", name);
+            assert!(state_tmp.len() <= 255, "{} bytes", state_tmp.len());
+        }
+        assert_eq!(filename_from_url(&Url::parse(&format!("http://h/{}.iso", "c".repeat(400))).unwrap()).unwrap().len(), 200);
+    }
+
+    #[tokio::test]
+    async fn test_authorization_is_not_a_client_default_header() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let third_party = Url::parse(&format!("http://{}/v.mp4", listener.local_addr().unwrap())).unwrap();
+        let (head_tx, head_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut head = [0u8; 4096];
+            let n = socket.read(&mut head).await.unwrap();
+            let _ = head_tx.send(String::from_utf8_lossy(&head[..n]).to_ascii_lowercase());
+            let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await;
+        });
+
+        let user_url = Url::parse("https://intranet.example/videos/42").unwrap();
+        let options = DownloadOptions { auth_header: Some("Bearer secret".into()), ..Default::default() };
+        let engine = DownloadEngine::new(vec![user_url.clone()], options);
+        let client = engine.client.clone().unwrap();
+        // What resolvers, HLS and anything else using the client send to a host the user never named.
+        client.get(third_party.clone()).send().await.unwrap();
+        let head = head_rx.await.unwrap();
+        assert!(!head.contains("authorization") && !head.contains("secret"), "{head}");
+
+        let auth = engine.auth.as_deref();
+        let to_user = authorize(client.get(user_url.clone()), auth, &user_url).build().unwrap();
+        assert_eq!(to_user.headers()[reqwest::header::AUTHORIZATION], "Bearer secret");
+        let to_other = authorize(client.get(third_party.clone()), auth, &third_party).build().unwrap();
+        assert!(!to_other.headers().contains_key(reqwest::header::AUTHORIZATION));
+    }
+
+    #[test]
+    fn test_directory_targets() {
+        let dir = tempdir().unwrap();
+        let sep = std::path::MAIN_SEPARATOR;
+        assert!(is_dir_target(dir.path()));
+        assert!(is_dir_target(Path::new(&format!("{}{}missing{}", dir.path().display(), sep, sep))));
+        assert!(is_dir_target(Path::new("missing/")));
+        assert!(!is_dir_target(&dir.path().join("missing")));
+        assert!(!is_dir_target(&dir.path().join("file.bin")));
+    }
+
+    #[test]
+    fn test_hls_output_takes_the_container_extension() {
+        let dir = tempdir().unwrap();
+        let options = DownloadOptions { output_path: Some(dir.path().to_path_buf()), ..Default::default() };
+        let engine = DownloadEngine::new(Vec::new(), options);
+        for (playlist, expected) in [
+            ("http://h/stream.php?f=main.m3u8", "stream.ts"),
+            ("http://h/INDEX.M3U8", "INDEX.ts"),
+            ("http://h/live/index.m3u8", "index.ts"),
+            ("http://h/video", "video.ts"),
+        ] {
+            let out = engine.hls_output_path(&Url::parse(playlist).unwrap(), &[]);
+            assert_eq!(out, dir.path().join(expected), "{playlist}");
+        }
+    }
+
+    #[test]
+    fn test_claim_is_exclusive_and_removed_when_released() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("file.bin");
+        let claim = Claim::try_take(&target).unwrap().expect("free name");
+        assert!(lock_path(&target).exists());
+        assert!(Claim::try_take(&target).unwrap().is_none(), "a claimed name must not be claimed twice");
+        drop(claim);
+        assert!(!lock_path(&target).exists());
+        assert!(Claim::try_take(&target).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_plan_skips_a_name_claimed_by_another_download() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().join("file.bin");
+        let history = DownloadHistoryManager::load_from_path(&dir.path().join("h.json"));
+        // Another download planned this name but has not created its .part yet.
+        let other = Claim::try_take(&base).unwrap().unwrap();
+        match plan_target(&base, &remote(1000), &urls(), &history, None).unwrap() {
+            Plan::Fetch { final_path, resume: None, .. } => assert_eq!(final_path, dir.path().join("file (1).bin")),
+            other => panic!("{other:?}"),
+        }
+        drop(other);
+
+        // Same for a live download of the same URL: its .part is not stale, however it looks.
+        std::fs::write(part_path(&base), vec![1u8; 1000]).unwrap();
+        let mut state = state_for(1000, "\"v2\"", urls());
+        state.completed_ranges.clear();
+        state.save_atomic(&DownloadState::state_file_path(&part_path(&base))).unwrap();
+        let live = Claim::try_take(&base).unwrap().unwrap();
+        assert!(matches!(
+            plan_target(&base, &remote(1000), &urls(), &history, None).unwrap(),
+            Plan::Fetch { ref final_path, .. } if *final_path == dir.path().join("file (1).bin")
+        ));
+        assert!(part_path(&base).exists(), "a live download's .part must survive");
+        drop(live);
     }
 
     #[test]
@@ -1620,10 +1925,11 @@ mod tests {
         std::fs::write(&base, vec![7u8; 1000]).unwrap(); // same name AND same size
         let history = DownloadHistoryManager::load_from_path(&dir.path().join("h.json"));
         match plan_target(&base, &remote(1000), &urls(), &history, None).unwrap() {
-            Plan::Fetch { final_path, resume: None } => assert_eq!(final_path, dir.path().join("file (1).bin")),
+            Plan::Fetch { final_path, resume: None, .. } => assert_eq!(final_path, dir.path().join("file (1).bin")),
             other => panic!("{other:?}"),
         }
         assert_eq!(std::fs::read(&base).unwrap(), vec![7u8; 1000]);
+        assert!(!lock_path(&base).exists(), "no lock file may be left next to a skipped name");
     }
 
     #[test]
@@ -1673,7 +1979,7 @@ mod tests {
         std::fs::write(&part, vec![1u8; 1000]).unwrap();
         state_for(1000, "\"v1\"", urls()).save_atomic(&part_state).unwrap();
         match plan_target(&base, &remote(1000), &urls(), &history, None).unwrap() {
-            Plan::Fetch { final_path, resume: Some(state) } => {
+            Plan::Fetch { final_path, resume: Some(state), .. } => {
                 assert_eq!(final_path, base);
                 assert_eq!(state.completed_ranges, vec![ByteRange::new(0, 499).unwrap()]);
             }
@@ -1685,7 +1991,7 @@ mod tests {
         changed.etag = Some("\"v2\"".into());
         assert!(matches!(
             plan_target(&base, &changed, &urls(), &history, None).unwrap(),
-            Plan::Fetch { resume: None, ref final_path } if *final_path == base
+            Plan::Fetch { resume: None, ref final_path, .. } if *final_path == base
         ));
         assert!(!part.exists() && !part_state.exists());
 
@@ -1715,7 +2021,7 @@ mod tests {
         let history = DownloadHistoryManager::load_from_path(&dir.path().join("h.json"));
 
         match plan_target(&base, &remote(1000), &urls(), &history, None).unwrap() {
-            Plan::Fetch { final_path, resume: Some(_) } => assert_eq!(final_path, base),
+            Plan::Fetch { final_path, resume: Some(_), .. } => assert_eq!(final_path, base),
             other => panic!("{other:?}"),
         }
         assert!(!base.exists());

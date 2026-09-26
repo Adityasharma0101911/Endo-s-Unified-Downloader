@@ -31,8 +31,9 @@ pub struct DiskWriter {
 }
 
 impl DiskWriter {
-    /// Opens or creates the file and sets its length to `total_size`, reserving disk space where
-    /// the OS supports it. A full disk is reported here instead of failing mid-download.
+    /// Opens or creates the file and sets its length to `total_size`. On Linux and macOS the space
+    /// is reserved, so a full disk is reported here; on Windows the file is sparse and a full disk
+    /// surfaces as a write error.
     pub fn open_or_create(path: impl AsRef<Path>, total_size: u64) -> Result<Self, StorageError> {
         let path = path.as_ref().to_path_buf();
 
@@ -151,7 +152,8 @@ pub enum VerifyError {
     Mismatch(String),
 }
 
-/// Checks that `expected` names a supported algorithm, so bad input fails before downloading.
+/// Checks that `expected` is a well-formed digest of a supported algorithm, so input that could
+/// never match fails before downloading.
 pub fn validate_checksum(expected: &str) -> Result<(), String> {
     Checksum::parse(expected).map(|_| ())
 }
@@ -174,7 +176,7 @@ pub fn hash_and_verify_file(path: &Path, expected_checksum: Option<&str>) -> Res
             "Checksum verification failed: expected {} {}, got {}",
             c.algo.name(),
             c.hex,
-            c.actual(&digests).unwrap_or("no matching algorithm"),
+            c.actual(&digests),
         ))),
         _ => Ok(digests.blake3_hex),
     }
@@ -194,8 +196,8 @@ enum Algo {
     Sha256,
     Md5,
     Blake3,
-    /// Raw hex of unknown length: accept a match from any supported algorithm.
-    Any,
+    /// A bare 64-digit digest: SHA-256 and BLAKE3 digests look alike, so either may match.
+    Sha256OrBlake3,
 }
 
 impl Algo {
@@ -204,7 +206,14 @@ impl Algo {
             Algo::Sha256 => "SHA-256",
             Algo::Md5 => "MD5",
             Algo::Blake3 => "BLAKE3",
-            Algo::Any => "checksum",
+            Algo::Sha256OrBlake3 => "SHA-256 or BLAKE3",
+        }
+    }
+
+    fn hex_len(self) -> usize {
+        match self {
+            Algo::Md5 => 32,
+            Algo::Sha256 | Algo::Blake3 | Algo::Sha256OrBlake3 => 64,
         }
     }
 }
@@ -215,6 +224,8 @@ struct Checksum {
 }
 
 impl Checksum {
+    /// Accepts `sha256:`, `md5:` or `blake3:` followed by the digest, or a bare digest of 32 (MD5)
+    /// or 64 (SHA-256 or BLAKE3) hex digits. Rejects anything no supported algorithm can produce.
     fn parse(expected: &str) -> Result<Self, String> {
         let trimmed = expected.trim();
         let (algo, hex) = match trimmed.split_once(':') {
@@ -225,41 +236,61 @@ impl Checksum {
                     "blake3" => Algo::Blake3,
                     other => return Err(format!("Unsupported checksum algorithm: {}", other)),
                 };
-                (algo, hash.trim())
+                (Some(algo), hash.trim())
             }
-            None => match trimmed.len() {
-                32 => (Algo::Md5, trimmed),
-                64 => (Algo::Sha256, trimmed),
-                _ => (Algo::Any, trimmed),
+            None => (None, trimmed),
+        };
+        if hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(format!(
+                "Checksum {:?} is not a hex digest; give only the hash (e.g. sha256:<64 hex digits>), not a whole checksum-file line",
+                hex
+            ));
+        }
+        let algo = match algo {
+            Some(algo) => algo,
+            None => match hex.len() {
+                32 => Algo::Md5,
+                64 => Algo::Sha256OrBlake3,
+                n => {
+                    return Err(format!(
+                        "Unsupported checksum of {} hex digits: use MD5 (32) or SHA-256/BLAKE3 (64), optionally prefixed with md5:, sha256: or blake3:",
+                        n
+                    ))
+                }
             },
         };
+        if hex.len() != algo.hex_len() {
+            return Err(format!("A {} checksum has {} hex digits, not {}", algo.name(), algo.hex_len(), hex.len()));
+        }
         Ok(Self { algo, hex: hex.to_ascii_lowercase() })
     }
 
     fn needs_sha256(&self) -> bool {
-        matches!(self.algo, Algo::Sha256 | Algo::Any)
+        matches!(self.algo, Algo::Sha256 | Algo::Sha256OrBlake3)
     }
 
     fn needs_md5(&self) -> bool {
-        matches!(self.algo, Algo::Md5 | Algo::Any)
+        self.algo == Algo::Md5
     }
 
-    fn actual<'a>(&self, d: &'a Digests) -> Option<&'a str> {
+    fn actual(&self, d: &Digests) -> String {
+        let sha256 = d.sha256.as_deref().unwrap_or_default();
         match self.algo {
-            Algo::Sha256 => d.sha256.as_deref(),
-            Algo::Md5 => d.md5.as_deref(),
-            Algo::Blake3 => Some(d.blake3_hex.as_str()),
-            Algo::Any => None,
+            Algo::Sha256 => sha256.to_string(),
+            Algo::Md5 => d.md5.clone().unwrap_or_default(),
+            Algo::Blake3 => d.blake3_hex.clone(),
+            Algo::Sha256OrBlake3 => format!("SHA-256 {} / BLAKE3 {}", sha256, d.blake3_hex),
         }
     }
 
     fn matches(&self, d: &Digests) -> bool {
+        let hex = Some(self.hex.as_str());
+        let blake3 = Some(d.blake3_hex.as_str());
         match self.algo {
-            Algo::Any => [Some(d.blake3_hex.as_str()), d.sha256.as_deref(), d.md5.as_deref()]
-                .into_iter()
-                .flatten()
-                .any(|h| h == self.hex),
-            _ => self.actual(d) == Some(self.hex.as_str()),
+            Algo::Sha256 => d.sha256.as_deref() == hex,
+            Algo::Md5 => d.md5.as_deref() == hex,
+            Algo::Blake3 => blake3 == hex,
+            Algo::Sha256OrBlake3 => d.sha256.as_deref() == hex || blake3 == hex,
         }
     }
 }
@@ -360,36 +391,36 @@ impl From<crate::range::RangeError> for StorageError {
     }
 }
 
-/// OS-native preallocation without zero-fill stalls
+/// Marks the file sparse, then sets its length. On a non-sparse NTFS file a write beyond the
+/// valid data length first zero-fills everything up to its offset, inside that write: the first
+/// far-offset chunk write would write most of the file twice and stall every other writer.
+/// Sparse files skip that; disk space is allocated as data arrives.
 #[cfg(windows)]
 fn preallocate_file(file: &File, size: u64) -> Result<(), StorageError> {
     use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{
-        SetFileInformationByHandle, FileAllocationInfo, FILE_ALLOCATION_INFO,
-    };
+    use windows_sys::Win32::System::Ioctl::FSCTL_SET_SPARSE;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
 
-    file.set_len(size)?;
-    if size == 0 {
-        return Ok(());
-    }
-
-    // SAFETY: the handle is owned by `file` and outlives the call; the buffer matches the info class.
-    let res = unsafe {
-        let handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
-        let alloc_info = FILE_ALLOCATION_INFO {
-            AllocationSize: size as i64,
-        };
-        SetFileInformationByHandle(
-            handle,
-            FileAllocationInfo,
-            &alloc_info as *const _ as *const std::ffi::c_void,
-            std::mem::size_of::<FILE_ALLOCATION_INFO>() as u32,
+    let mut returned = 0u32;
+    // SAFETY: the handle is owned by `file` and outlives this synchronous call. No buffers are
+    // passed (no input buffer means "make sparse"); `returned` is required without OVERLAPPED.
+    let ok = unsafe {
+        DeviceIoControl(
+            file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
+            FSCTL_SET_SPARSE,
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
         )
     };
-    if res == 0 {
-        // Non-fatal: set_len already reserved the logical size.
-        tracing::warn!("SetFileInformationByHandle(FileAllocationInfo) failed: {}", std::io::Error::last_os_error());
+    if ok == 0 {
+        // FAT32/exFAT have no sparse files; writes past the valid data length zero-fill there.
+        tracing::debug!("FSCTL_SET_SPARSE failed: {}", std::io::Error::last_os_error());
     }
+    file.set_len(size)?;
     Ok(())
 }
 
@@ -538,8 +569,9 @@ mod tests {
         assert!(writer.verify_checksum("md5:5d41402abc4b2a76b9719d911017c592").unwrap());
         assert!(writer.verify_checksum("5d41402abc4b2a76b9719d911017c592").unwrap()); // auto-detect md5
         assert!(writer.verify_checksum("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824").unwrap()); // auto-detect sha256
-        // A mismatch is Ok(false); an unknown algorithm is an error.
-        assert!(!writer.verify_checksum("md5:wronghash").unwrap());
+        // A mismatch is Ok(false); an unknown algorithm or a malformed digest is an error.
+        assert!(!writer.verify_checksum("md5:00000000000000000000000000000000").unwrap());
+        assert!(writer.verify_checksum("md5:wronghash").is_err());
         assert!(writer.verify_checksum("crc32:3610a686").is_err());
     }
 
@@ -556,6 +588,69 @@ mod tests {
         assert!(matches!(&err, VerifyError::Mismatch(m) if m.contains("5d41402abc4b2a76b9719d911017c592")), "{err}");
         assert!(matches!(hash_and_verify_file(&temp.path().with_extension("missing"), None), Err(VerifyError::Io(_))));
         assert!(validate_checksum("crc32:3610a686").is_err());
+    }
+
+    #[test]
+    fn test_checksums_that_can_never_match_are_rejected_up_front() {
+        let sums_line = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824  hello.txt";
+        let sha512 = "ab".repeat(64);
+        for bad in [
+            "da39a3ee5e6b4b0d3255bfef95601890afd80709", // SHA-1
+            sha512.as_str(),
+            sums_line,
+            "md5:wronghash",
+            "md5:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+            "sha256:5d41402abc4b2a76b9719d911017c592",
+            "blake3:",
+            "",
+        ] {
+            assert!(validate_checksum(bad).is_err(), "{bad:?} was accepted");
+        }
+        for good in [
+            "5d41402abc4b2a76b9719d911017c592",
+            "SHA256:2CF24DBA5FB0A30E26E83B2AC5B9E29E1B161E5C1FA7425E73043362938B9824",
+            " blake3:ea8f163db38682925e4491c5e58d4bb3506ef8c14eb78a86e908c5624a67200f ",
+        ] {
+            assert!(validate_checksum(good).is_ok(), "{good:?} was rejected");
+        }
+    }
+
+    #[test]
+    fn test_bare_64_hex_matches_sha256_or_blake3() {
+        let temp = NamedTempFile::new().unwrap();
+        std::fs::write(temp.path(), b"hello").unwrap();
+        let blake = blake3::hash(b"hello").to_hex().to_string();
+        let sha = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+        // The app logs and records bare BLAKE3 digests; pasting one back must verify.
+        assert_eq!(DiskWriter::verify_file_checksum(temp.path(), &blake), Ok(true));
+        assert_eq!(hash_and_verify_file(temp.path(), Some(&blake)).unwrap(), blake);
+        assert_eq!(DiskWriter::verify_file_checksum(temp.path(), sha), Ok(true));
+        assert_eq!(DiskWriter::verify_file_checksum(temp.path(), &"0".repeat(64)), Ok(false));
+        // An explicit prefix still means exactly that algorithm.
+        assert_eq!(DiskWriter::verify_file_checksum(temp.path(), &format!("sha256:{blake}")), Ok(false));
+    }
+
+    /// Without the sparse flag NTFS zero-fills up to the offset of the first far write, inside
+    /// that write, stalling every other writer of the file.
+    #[cfg(windows)]
+    #[test]
+    fn test_preallocated_file_is_sparse_on_windows() {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_SPARSE_FILE: u32 = 0x200;
+        const SIZE: u64 = 4 << 30;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.part");
+        let writer = DiskWriter::open_or_create(&path, SIZE).unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.len(), SIZE);
+        assert_ne!(meta.file_attributes() & FILE_ATTRIBUTE_SPARSE_FILE, 0, "the .part must be sparse");
+
+        writer.write_chunk_slice(SIZE - 4096, &[7u8; 4096]).unwrap();
+        writer.write_chunk_slice(0, &[1u8; 4096]).unwrap();
+        writer.sync().unwrap();
+        let mut tail = [0u8; 4096];
+        read_exact_at(&File::open(&path).unwrap(), &mut tail, SIZE - 4096).unwrap();
+        assert_eq!(tail, [7u8; 4096]);
     }
 
     #[test]

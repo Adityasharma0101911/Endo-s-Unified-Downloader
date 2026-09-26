@@ -3,8 +3,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use futures_util::StreamExt;
 use parking_lot::Mutex;
-use reqwest::header::{HeaderMap, ACCEPT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, IF_RANGE, RANGE, RETRY_AFTER};
-use reqwest::{Client, StatusCode};
+use reqwest::header::{
+    HeaderMap, HeaderValue, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE, ETAG, IF_RANGE, LAST_MODIFIED,
+    RANGE, RETRY_AFTER,
+};
+use reqwest::{Client, RequestBuilder, StatusCode};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use url::Url;
@@ -22,6 +25,10 @@ const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 const THROTTLE_RETRY: Duration = Duration::from_millis(500);
 /// Mirror pause after a 429/503 with nothing else in flight and no Retry-After.
 const THROTTLE_COOLDOWN: Duration = Duration::from_secs(1);
+/// Received bytes collected before one disk write: few blocking writes, little memory per connection.
+const WRITE_BATCH: usize = 512 * 1024;
+/// Longest a received byte waits in memory, so progress and resume state keep up on slow links.
+const WRITE_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Why an attempt failed, which decides how the engine retries it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +73,21 @@ pub enum WorkerEvent {
 
 type Failure = (FailureKind, String);
 
+/// Received bytes not yet on disk; they belong at `pos..`.
+struct Batch {
+    pos: u64,
+    buf: Vec<u8>,
+    /// When the oldest byte in `buf` arrived.
+    since: Instant,
+}
+
+impl Batch {
+    /// Offset just past the last received byte.
+    fn end(&self) -> u64 {
+        self.pos + self.buf.len() as u64
+    }
+}
+
 /// Download-wide bandwidth cap shared by every connection. Each caller reserves the next time
 /// slot for its bytes (the GCRA form of a token bucket), so callers are served in order and
 /// waiting is a single timer, not polling.
@@ -99,14 +121,47 @@ impl RateLimiter {
     }
 }
 
+/// The user's `Authorization` header, scoped to the hosts the user named: resolved, scraped and
+/// third-party URLs never receive it, and neither does plain HTTP to a host given as HTTPS.
+#[derive(Debug)]
+pub struct Auth {
+    value: HeaderValue,
+    user_urls: Vec<Url>,
+}
+
+impl Auth {
+    pub(crate) fn new(value: &str, user_urls: &[Url]) -> Result<Self, String> {
+        let mut value = HeaderValue::from_str(value).map_err(|_| "Invalid Authorization header value".to_string())?;
+        value.set_sensitive(true);
+        Ok(Self { value, user_urls: user_urls.to_vec() })
+    }
+
+    fn allows(&self, url: &Url) -> bool {
+        url.host_str().is_some()
+            && self.user_urls.iter().any(|u| {
+                u.host_str() == url.host_str() && (u.scheme() != "https" || url.scheme() == "https")
+            })
+    }
+}
+
+/// Adds the user's `Authorization` header to a request for `url` when `auth` covers that URL.
+pub(crate) fn authorize(request: RequestBuilder, auth: Option<&Auth>, url: &Url) -> RequestBuilder {
+    match auth.filter(|a| a.allows(url)) {
+        Some(a) => request.header(AUTHORIZATION, a.value.clone()),
+        None => request,
+    }
+}
+
 /// State shared by all workers of one download.
 #[derive(Clone)]
 pub struct WorkerShared {
     pub client: Client,
+    pub auth: Option<Arc<Auth>>,
     pub writer: DiskWriter,
     pub chunks: Arc<Mutex<ChunkManager>>,
     pub mirrors: Arc<Mutex<MirrorRacer>>,
     pub events: mpsc::Sender<WorkerEvent>,
+    /// Stops the workers: the user cancelled, or the engine is done with them.
     pub cancel: CancellationToken,
     pub limiter: Option<Arc<RateLimiter>>,
     pub file_size: u64,
@@ -184,8 +239,9 @@ impl HttpWorker {
         Some((chunk, mirror_id, url, if_range))
     }
 
-    /// Streams the chunk's remaining range into the file. Only this worker advances
-    /// `chunk.current_offset`, and it does so after each write lands.
+    /// Streams the chunk's remaining range into the file. Bytes are written in batches on the
+    /// blocking pool, never on the async runtime. Only this worker advances
+    /// `chunk.current_offset`, and only once a batch is on disk.
     async fn download_chunk(
         &self,
         chunk: &Chunk,
@@ -200,9 +256,7 @@ impl HttpWorker {
             return Ok(()); // stolen away entirely before we started
         }
 
-        let mut request = s
-            .client
-            .get(url)
+        let mut request = authorize(s.client.get(url.clone()), s.auth.as_deref(), &url)
             .header(RANGE, format!("bytes={}-{}", start, end))
             .header(ACCEPT_ENCODING, "identity");
         if let Some(validator) = &if_range {
@@ -219,7 +273,7 @@ impl HttpWorker {
                 Ok(Ok(resp)) => resp,
             },
         };
-        check_response(response.status(), response.headers(), start, end, s.file_size, if_range.is_some())?;
+        check_response(response.status(), response.headers(), start, end, s.file_size, if_range.as_deref())?;
         let _ = s.events.try_send(WorkerEvent::Ttfb {
             worker_id: self.worker_id,
             mirror_id,
@@ -227,7 +281,7 @@ impl HttpWorker {
         });
 
         let mut stream = response.bytes_stream();
-        let mut pos = start;
+        let mut batch = Batch { pos: start, buf: Vec::with_capacity(WRITE_BATCH), since: Instant::now() };
         let mut pending: u64 = 0;
         let mut last_report = Instant::now();
         let result = loop {
@@ -239,10 +293,12 @@ impl HttpWorker {
             let bytes = match item {
                 Err(_) => break Err((
                     FailureKind::Transient,
-                    format!("stalled: no data for {}s at offset {}", s.stall_timeout.as_secs(), pos),
+                    format!("stalled: no data for {}s at offset {}", s.stall_timeout.as_secs(), batch.end()),
                 )),
                 Ok(None) => break Ok(()),
-                Ok(Some(Err(e))) => break Err((FailureKind::Transient, format!("read error at offset {}: {}", pos, e))),
+                Ok(Some(Err(e))) => {
+                    break Err((FailureKind::Transient, format!("read error at offset {}: {}", batch.end(), e)))
+                }
                 Ok(Some(Ok(bytes))) => bytes,
             };
             if let Some(limiter) = &s.limiter {
@@ -253,18 +309,28 @@ impl HttpWorker {
                 }
             }
 
+            if batch.buf.len() + bytes.len() > WRITE_BATCH {
+                if let Err(e) = self.flush(chunk, &mut batch).await {
+                    break Err(e);
+                }
+            }
             // Re-read the end: a thief may have taken the tail of this chunk.
             let end = chunk.end_offset.load(Ordering::SeqCst);
-            if pos > end {
+            let received = batch.end();
+            if received > end {
                 break Ok(());
             }
-            let take = (bytes.len() as u64).min(end - pos + 1) as usize;
-            if let Err(e) = s.writer.write_chunk_slice(pos, &bytes[..take]) {
-                break Err((FailureKind::Fatal, format!("Disk write error: {}", e)));
+            let take = (bytes.len() as u64).min(end - received + 1) as usize;
+            if batch.buf.is_empty() {
+                batch.since = Instant::now();
             }
-            pos += take as u64;
-            chunk.current_offset.store(pos, Ordering::SeqCst);
+            batch.buf.extend_from_slice(&bytes[..take]);
             pending += take as u64;
+            if batch.since.elapsed() >= WRITE_INTERVAL {
+                if let Err(e) = self.flush(chunk, &mut batch).await {
+                    break Err(e);
+                }
+            }
 
             if pending >= 1024 * 1024 || last_report.elapsed() >= Duration::from_millis(100) {
                 self.report_progress(chunk.id, mirror_id, &mut pending, &mut last_report);
@@ -273,16 +339,43 @@ impl HttpWorker {
                 break Ok(());
             }
         };
+        // What arrived is kept even when the attempt failed or was cancelled: a retry resumes
+        // after it. A disk error outranks the network outcome.
+        let flushed = self.flush(chunk, &mut batch).await;
         self.report_progress(chunk.id, mirror_id, &mut pending, &mut last_report);
-        result?;
+        flushed.and(result)?;
 
         let end = chunk.end_offset.load(Ordering::SeqCst);
-        if pos <= end {
+        if batch.pos <= end {
             return Err((
                 FailureKind::Transient,
-                format!("connection closed at offset {}, expected data up to {}", pos, end),
+                format!("connection closed at offset {}, expected data up to {}", batch.pos, end),
             ));
         }
+        Ok(())
+    }
+
+    /// Writes the batch at its offset on the blocking pool, then advances the chunk's offset.
+    /// Bytes past the chunk's current end belong to whoever stole that tail and are dropped.
+    async fn flush(&self, chunk: &Chunk, batch: &mut Batch) -> Result<(), Failure> {
+        let end = chunk.end_offset.load(Ordering::SeqCst);
+        let keep = (end + 1).saturating_sub(batch.pos).min(batch.buf.len() as u64) as usize;
+        batch.buf.truncate(keep);
+        if batch.buf.is_empty() {
+            return Ok(());
+        }
+        let (writer, pos, data) = (self.shared.writer.clone(), batch.pos, std::mem::take(&mut batch.buf));
+        let (mut data, written) = tokio::task::spawn_blocking(move || {
+            let written = writer.write_chunk_slice(pos, &data);
+            (data, written)
+        })
+        .await
+        .map_err(|e| (FailureKind::Fatal, format!("Disk write task failed: {}", e)))?;
+        written.map_err(|e| (FailureKind::Fatal, format!("Disk write error: {}", e)))?;
+        batch.pos += data.len() as u64;
+        chunk.current_offset.store(batch.pos, Ordering::SeqCst);
+        data.clear();
+        batch.buf = data;
         Ok(())
     }
 
@@ -363,14 +456,15 @@ fn cancelled() -> Failure {
     (FailureKind::Transient, "cancelled".to_string())
 }
 
-/// Classifies the response to `Range: bytes=start-end` for a file of `file_size` bytes.
+/// Classifies the response to `Range: bytes=start-end` (with `If-Range: if_range` when set) for
+/// a file of `file_size` bytes.
 fn check_response(
     status: StatusCode,
     headers: &HeaderMap,
     start: u64,
     end: u64,
     file_size: u64,
-    sent_if_range: bool,
+    if_range: Option<&str>,
 ) -> Result<(), Failure> {
     match status {
         StatusCode::PARTIAL_CONTENT => {
@@ -389,22 +483,28 @@ fn check_response(
                 )),
             }
         }
-        // A full 200 is only usable from offset 0. Under If-Range it means the validator no
-        // longer matches, unless we asked for the whole file anyway.
-        StatusCode::OK if start == 0 && (!sent_if_range || end + 1 == file_size) => {
-            match content_length(headers) {
-                Some(len) if len != file_size => Err((
-                    FailureKind::BadMirror,
-                    format!("200 response is {} bytes, expected {}", len, file_size),
-                )),
-                _ => Ok(()),
+        // A full 200 is only usable from offset 0. Under If-Range it is the same file with the
+        // Range ignored only if it carries the validator we sent; otherwise the file may have
+        // changed, which matters unless we asked for the whole file anyway.
+        StatusCode::OK => {
+            let same_file = if_range.is_none_or(|v| carries_validator(headers, v));
+            if start == 0 && (same_file || end + 1 == file_size) {
+                match content_length(headers) {
+                    Some(len) if len != file_size => Err((
+                        FailureKind::BadMirror,
+                        format!("200 response is {} bytes, expected {}", len, file_size),
+                    )),
+                    _ => Ok(()),
+                }
+            } else if same_file {
+                Err((FailureKind::BadMirror, format!("server ignored Range and sent 200 for offset {}", start)))
+            } else {
+                Err((
+                    FailureKind::Fatal,
+                    "remote file changed: server ignored If-Range and sent a different version".to_string(),
+                ))
             }
         }
-        StatusCode::OK if sent_if_range => Err((
-            FailureKind::Fatal,
-            "remote file changed: server ignored If-Range and sent a different version".to_string(),
-        )),
-        StatusCode::OK => Err((FailureKind::BadMirror, format!("server ignored Range and sent 200 for offset {}", start))),
         StatusCode::RANGE_NOT_SATISFIABLE => Err((
             FailureKind::Fatal,
             format!("remote file changed: 416 Range Not Satisfiable for bytes {}-{}", start, end),
@@ -417,6 +517,13 @@ fn check_response(
         }
         _ => Err((FailureKind::Transient, format!("HTTP {}", status))),
     }
+}
+
+/// Whether a response carries the `If-Range` validator we sent: our strong ETag (always quoted),
+/// or else our Last-Modified date.
+fn carries_validator(headers: &HeaderMap, validator: &str) -> bool {
+    let name = if validator.starts_with('"') { ETAG } else { LAST_MODIFIED };
+    headers.get(name).and_then(|v| v.to_str().ok()).is_some_and(|v| v.trim() == validator)
 }
 
 /// `Retry-After` in delta-seconds form, capped.
@@ -434,7 +541,9 @@ mod tests {
     use super::*;
     use reqwest::header::HeaderValue;
 
-    fn check(status: u16, headers: &[(&'static str, &'static str)], start: u64, end: u64, size: u64, if_range: bool) -> Option<FailureKind> {
+    const V1: Option<&str> = Some("\"v1\"");
+
+    fn check(status: u16, headers: &[(&'static str, &'static str)], start: u64, end: u64, size: u64, if_range: Option<&str>) -> Option<FailureKind> {
         let mut map = HeaderMap::new();
         for (k, v) in headers {
             map.insert(*k, HeaderValue::from_static(v));
@@ -447,30 +556,158 @@ mod tests {
     #[test]
     fn test_check_response_classification() {
         let cr = [("content-range", "bytes 100-199/1000")];
-        assert_eq!(check(206, &cr, 100, 199, 1000, true), None);
+        assert_eq!(check(206, &cr, 100, 199, 1000, V1), None);
         // Wrong start, or a total from a different file.
-        assert_eq!(check(206, &cr, 50, 199, 1000, true), Some(FailureKind::BadMirror));
-        assert_eq!(check(206, &[("content-range", "bytes 100-199/2000")], 100, 199, 1000, false), Some(FailureKind::BadMirror));
-        assert_eq!(check(206, &[], 0, 9, 10, false), Some(FailureKind::BadMirror));
+        assert_eq!(check(206, &cr, 50, 199, 1000, V1), Some(FailureKind::BadMirror));
+        assert_eq!(check(206, &[("content-range", "bytes 100-199/2000")], 100, 199, 1000, None), Some(FailureKind::BadMirror));
+        assert_eq!(check(206, &[], 0, 9, 10, None), Some(FailureKind::BadMirror));
 
         let full = [("content-length", "1000")];
-        assert_eq!(check(200, &full, 0, 499, 1000, false), None);
-        assert_eq!(check(200, &full, 0, 999, 1000, true), None);
-        assert_eq!(check(200, &full, 0, 499, 1000, true), Some(FailureKind::Fatal));
-        assert_eq!(check(200, &full, 500, 999, 1000, true), Some(FailureKind::Fatal));
-        assert_eq!(check(200, &full, 500, 999, 1000, false), Some(FailureKind::BadMirror));
-        assert_eq!(check(200, &[("content-length", "512")], 0, 999, 1000, false), Some(FailureKind::BadMirror));
+        assert_eq!(check(200, &full, 0, 499, 1000, None), None);
+        assert_eq!(check(200, &full, 0, 999, 1000, V1), None);
+        assert_eq!(check(200, &full, 0, 499, 1000, V1), Some(FailureKind::Fatal));
+        assert_eq!(check(200, &full, 500, 999, 1000, V1), Some(FailureKind::Fatal));
+        assert_eq!(check(200, &full, 500, 999, 1000, None), Some(FailureKind::BadMirror));
+        assert_eq!(check(200, &[("content-length", "512")], 0, 999, 1000, None), Some(FailureKind::BadMirror));
 
-        assert_eq!(check(416, &[], 0, 9, 10, true), Some(FailureKind::Fatal));
+        assert_eq!(check(416, &[], 0, 9, 10, V1), Some(FailureKind::Fatal));
         for status in [401, 403, 404, 410] {
-            assert_eq!(check(status, &[], 0, 9, 10, false), Some(FailureKind::BadMirror));
+            assert_eq!(check(status, &[], 0, 9, 10, None), Some(FailureKind::BadMirror));
         }
         assert_eq!(
-            check(503, &[("retry-after", "3")], 0, 9, 10, false),
+            check(503, &[("retry-after", "3")], 0, 9, 10, None),
             Some(FailureKind::Throttled(Some(Duration::from_secs(3))))
         );
-        assert_eq!(check(429, &[], 0, 9, 10, false), Some(FailureKind::Throttled(None)));
-        assert_eq!(check(502, &[], 0, 9, 10, false), Some(FailureKind::Transient));
+        assert_eq!(check(429, &[], 0, 9, 10, None), Some(FailureKind::Throttled(None)));
+        assert_eq!(check(502, &[], 0, 9, 10, None), Some(FailureKind::Transient));
+    }
+
+    #[test]
+    fn test_200_to_if_range_with_our_validator_is_an_ignored_range_not_a_new_file() {
+        let same = [("content-length", "1000"), ("etag", "\"v1\"")];
+        let other = [("content-length", "1000"), ("etag", "\"v2\"")];
+        // The server ignored Range once; the file is unchanged, so the chunk is just retried.
+        assert_eq!(check(200, &same, 500, 999, 1000, V1), Some(FailureKind::BadMirror));
+        // From offset 0 the body is usable as is.
+        assert_eq!(check(200, &same, 0, 499, 1000, V1), None);
+        assert_eq!(check(200, &other, 500, 999, 1000, V1), Some(FailureKind::Fatal));
+        assert_eq!(check(200, &other, 0, 499, 1000, V1), Some(FailureKind::Fatal));
+
+        let date = "Sun, 06 Nov 1994 08:49:37 GMT";
+        let dated = [("content-length", "1000"), ("last-modified", "Sun, 06 Nov 1994 08:49:37 GMT")];
+        assert_eq!(check(200, &dated, 500, 999, 1000, Some(date)), Some(FailureKind::BadMirror));
+        let newer = [("content-length", "1000"), ("last-modified", "Mon, 07 Nov 1994 08:49:37 GMT")];
+        assert_eq!(check(200, &newer, 500, 999, 1000, Some(date)), Some(FailureKind::Fatal));
+    }
+
+    #[test]
+    fn test_auth_is_scoped_to_user_hosts() {
+        let user = [Url::parse("https://files.example.com/a.bin").unwrap(), Url::parse("http://plain.example/b").unwrap()];
+        let auth = Auth::new("Bearer secret", &user).unwrap();
+        let allows = |u: &str| auth.allows(&Url::parse(u).unwrap());
+        assert!(allows("https://files.example.com/other/path?x=1"));
+        assert!(allows("https://FILES.example.com:443/a.bin"));
+        assert!(allows("http://plain.example/c"));
+        assert!(allows("https://plain.example/c"), "an upgrade to HTTPS is fine");
+        assert!(!allows("http://files.example.com/a.bin"), "never downgrade to cleartext");
+        assert!(!allows("https://cdn.example.com/a.bin"));
+        assert!(!allows("https://evil.example/files.example.com"));
+        assert!(Auth::new("bad\nvalue", &user).is_err());
+    }
+
+    /// A worker for a one-chunk download of `size` bytes from `url` into `path`.
+    fn test_worker(url: &Url, path: &std::path::Path, size: u64) -> (HttpWorker, Chunk, mpsc::Receiver<WorkerEvent>) {
+        let mut chunks = ChunkManager::new(size, size).unwrap();
+        let chunk = chunks.get_next_work(0, 0).unwrap();
+        let (events, rx) = mpsc::channel(64);
+        let shared = WorkerShared {
+            client: Client::new(),
+            auth: None,
+            writer: DiskWriter::open_or_create(path, size).unwrap(),
+            chunks: Arc::new(Mutex::new(chunks)),
+            mirrors: Arc::new(Mutex::new(MirrorRacer::new(vec![url.clone()]))),
+            events,
+            cancel: CancellationToken::new(),
+            limiter: None,
+            file_size: size,
+            min_steal: size,
+            stall_timeout: Duration::from_secs(10),
+        };
+        (HttpWorker::new(0, shared), chunk, rx)
+    }
+
+    #[tokio::test]
+    async fn test_chunk_offset_advances_only_once_a_batch_is_on_disk() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        const SIZE: usize = 256 * 1024;
+        let data: Vec<u8> = (0..SIZE).map(|i| (i % 251) as u8).collect();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!("http://{}/f", listener.local_addr().unwrap())).unwrap();
+        let (sent_tx, sent_rx) = tokio::sync::oneshot::channel();
+        let (go_tx, go_rx) = tokio::sync::oneshot::channel::<()>();
+        let body = data.clone();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut head = [0u8; 4096];
+            let _ = socket.read(&mut head).await.unwrap();
+            let header = format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-{}/{}\r\nContent-Length: {}\r\n\r\n",
+                SIZE - 1, SIZE, SIZE
+            );
+            socket.write_all(header.as_bytes()).await.unwrap();
+            socket.write_all(&body[..64 * 1024]).await.unwrap();
+            let _ = sent_tx.send(());
+            let _ = go_rx.await;
+            socket.write_all(&body[64 * 1024..]).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.part");
+        let (worker, chunk, _events) = test_worker(&url, &path, SIZE as u64);
+        let offset = Arc::clone(&chunk.current_offset);
+        let task = tokio::spawn(async move { worker.download_chunk(&chunk, 0, url, None).await });
+
+        sent_rx.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // 64 KiB arrived, but a partial batch is neither on disk nor counted as written.
+        assert_eq!(offset.load(Ordering::SeqCst), 0);
+
+        go_tx.send(()).unwrap();
+        task.await.unwrap().unwrap();
+        assert_eq!(offset.load(Ordering::SeqCst), SIZE as u64);
+        assert_eq!(std::fs::read(&path).unwrap(), data);
+    }
+
+    #[tokio::test]
+    async fn test_failed_attempt_keeps_the_bytes_it_received() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        const SIZE: usize = 256 * 1024;
+        let data: Vec<u8> = (0..SIZE).map(|i| (i % 13) as u8).collect();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!("http://{}/f", listener.local_addr().unwrap())).unwrap();
+        let body = data.clone();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut head = [0u8; 4096];
+            let _ = socket.read(&mut head).await.unwrap();
+            let header = format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-{}/{}\r\nContent-Length: {}\r\n\r\n",
+                SIZE - 1, SIZE, SIZE
+            );
+            socket.write_all(header.as_bytes()).await.unwrap();
+            socket.write_all(&body[..100_000]).await.unwrap();
+            // Connection drops mid-body.
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.part");
+        let (worker, chunk, _events) = test_worker(&url, &path, SIZE as u64);
+        let offset = Arc::clone(&chunk.current_offset);
+        let err = worker.download_chunk(&chunk, 0, url, None).await.unwrap_err();
+
+        assert_eq!(err.0, FailureKind::Transient, "{}", err.1);
+        assert_eq!(offset.load(Ordering::SeqCst), 100_000);
+        assert_eq!(std::fs::read(&path).unwrap()[..100_000], data[..100_000]);
     }
 
     fn setup(mirrors: usize) -> (MirrorRacer, ChunkManager) {
