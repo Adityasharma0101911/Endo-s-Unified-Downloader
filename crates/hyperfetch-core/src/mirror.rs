@@ -150,6 +150,13 @@ impl MirrorRacer {
         &self.mirrors
     }
 
+    /// Adds a mirror at `url` after the others, keeping their ids; returns it.
+    pub fn add(&mut self, url: Url) -> &mut Mirror {
+        let id = self.mirrors.len();
+        self.mirrors.push(Mirror::new(id, url));
+        &mut self.mirrors[id]
+    }
+
     pub fn mirrors_mut(&mut self) -> &mut [Mirror] {
         &mut self.mirrors
     }
@@ -251,6 +258,17 @@ mod tests {
         assert_eq!(racer.ranked(), [0, 1, 2]);
         racer.get_mirror_mut(1).unwrap().is_active = false;
         assert_eq!(racer.ranked(), [0, 2], "only mirrors that can take a connection");
+    }
+
+    #[test]
+    fn test_a_mirror_added_later_takes_the_next_id() {
+        let mut racer = racer();
+        racer.acquire_mirror(0);
+        let added = racer.add(Url::parse("https://late.example.com/file.iso").unwrap());
+        assert_eq!(added.id, 2);
+        added.ttfb_ewma_ms = 5.0;
+        assert_eq!(racer.select_best_mirror(), Some(2), "it is raced like the others");
+        assert_eq!(racer.get_mirror(0).unwrap().in_flight, 1, "the others keep their ids and state");
     }
 
     #[test]
