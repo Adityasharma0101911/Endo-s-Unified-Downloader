@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use bytes::Bytes;
 use futures_util::StreamExt;
 use parking_lot::Mutex;
 use reqwest::header::{
@@ -21,9 +22,9 @@ use crate::chunk::{ChunkManager, ChunkSnapshot};
 use crate::history::{DownloadHistoryManager, HistoryEntry, HistoryStatus};
 use crate::hls::HlsError;
 use crate::mirror::MirrorRacer;
-use crate::range::ByteRange;
+use crate::range::{compute_gaps, ByteRange};
 use crate::state::DownloadState;
-use crate::storage::{DiskWriter, VerifyError};
+use crate::storage::{DiskWriter, StorageError, VerifyError};
 use crate::worker::{
     authorize, content_length, retry_after, Auth, FailureKind, HttpWorker, RateLimiter, WorkerEvent, WorkerShared,
 };
@@ -38,6 +39,14 @@ const PROBE_CONCURRENCY: usize = 8;
 const PROBE_ATTEMPTS: u32 = 3;
 /// Longest pause between probe tries, whatever Retry-After asks for.
 const PROBE_RETRY_CAP: Duration = Duration::from_secs(5);
+/// The first mirror's probe fetches this much of the file: a file this small needs no other
+/// request, and a larger one has its start on disk before the workers begin.
+const PREFETCH: u64 = 1024 * 1024;
+/// Longest the probe reads the start of a file larger than `PREFETCH`: the workers wait for it,
+/// and together they fetch those bytes faster than one connection.
+const PREFETCH_TIME: Duration = Duration::from_millis(250);
+/// Missing bytes that justify one more connection: for less, its handshakes cost more than it saves.
+const BYTES_PER_CONNECTION: u64 = 1024 * 1024;
 /// Fetching the playlists and each AES key may retry every request with backoff.
 const HLS_PARSE_TIMEOUT: Duration = Duration::from_secs(120);
 /// Longest file name we create, in bytes: leaves room for " (n)" and ".part.hfstate.tmp" under
@@ -361,14 +370,23 @@ impl DownloadEngine {
 
     /// Probes all mirrors concurrently; returns the reference probe and the mirrors that serve the same file.
     async fn probe_all(&self, client: &Client, urls: &[Url]) -> Result<(ProbeInfo, Vec<ProbeInfo>), String> {
+        let (limiter, stall) = (self.limiter(), self.stall_timeout());
         // Owned values keep the future `Send` (a borrowing closure here is not general enough).
-        let probes = futures_util::stream::iter(urls.to_vec())
-            .map(|url| {
-                let (client, auth) = (client.clone(), self.auth.clone());
+        let probes = futures_util::stream::iter(urls.iter().cloned().enumerate())
+            .map(|(i, url)| {
+                let (client, auth, limiter) = (client.clone(), self.auth.clone(), limiter.clone());
                 async move {
-                    tokio::time::timeout(PROBE_TIMEOUT, probe_url(&client, auth.as_deref(), &url))
-                        .await
-                        .unwrap_or_else(|_| Err(format!("{}: no answer within {}s", url, PROBE_TIMEOUT.as_secs())))
+                    // Only the first mirror fetches the file's start: the download uses one copy.
+                    let (mut info, body) =
+                        tokio::time::timeout(PROBE_TIMEOUT, probe_url(&client, auth.as_deref(), &url, i == 0))
+                            .await
+                            .unwrap_or_else(|_| Err(format!("{}: no answer within {}s", url, PROBE_TIMEOUT.as_secs())))?;
+                    if let Some((response, len)) = body {
+                        // Only the start of a larger file keeps workers waiting.
+                        let deadline = (info.size != Some(len)).then(|| tokio::time::Instant::now() + PREFETCH_TIME);
+                        info.prefetch = read_prefix(response, len, deadline, stall, limiter.as_deref()).await;
+                    }
+                    Ok::<_, String>(info)
                 }
             })
             .buffered(PROBE_CONCURRENCY)
@@ -421,13 +439,10 @@ impl DownloadEngine {
 
         let part = part_path(&final_path);
         let state_path = DownloadState::state_file_path(&part);
-        let num_workers = self.options.num_connections.clamp(1, 64);
-        let chunk_size = effective_chunk_size(reference.size.unwrap_or(0), num_workers as u64, self.options.base_chunk_size);
-
         let mut state = DownloadState::new(
             file_name_of(&final_path),
             reference.size.unwrap_or(0),
-            chunk_size,
+            self.options.base_chunk_size,
             known_urls,
         );
         state.etag = reference.etag.clone();
@@ -451,9 +466,21 @@ impl DownloadEngine {
             mirrors.len(),
             reference.accepts_ranges
         );
+        let prefetched = reference.prefetch.clone();
         match reference.size {
+            // The probe brought the whole file.
+            Some(size) if size == prefetched.len() as u64 => {
+                let path = part.clone();
+                blocking(move || -> Result<(), StorageError> {
+                    let writer = DiskWriter::open_or_create(&path, size)?;
+                    writer.write_chunk_slice(0, &prefetched)?;
+                    writer.sync()
+                })
+                .await?
+                .map_err(|e| format!("Failed to write {}: {}", part.display(), e))?
+            }
             Some(size) if reference.accepts_ranges => {
-                self.fetch_ranges(client, size, chunk_size, num_workers, &mirrors, state, &part, &state_path, &final_path, &snapshot_tx)
+                self.fetch_ranges(client, size, prefetched, &mirrors, state, &part, &state_path, &final_path, &snapshot_tx)
                     .await?
             }
             _ => self.fetch_stream(&client, &reference, &part, &final_path, &snapshot_tx).await?,
@@ -462,13 +489,14 @@ impl DownloadEngine {
     }
 
     /// Multi-connection download of a file whose size is known and whose server honours ranges.
+    /// `prefetch`, the file's first bytes from the probe, counts as downloaded; it is written
+    /// wherever the resumed state does not already hold those bytes.
     #[allow(clippy::too_many_arguments)]
     async fn fetch_ranges(
         &self,
         client: Client,
         size: u64,
-        chunk_size: u64,
-        num_workers: usize,
+        prefetch: Bytes,
         mirrors: &[ProbeInfo],
         state: DownloadState,
         part: &Path,
@@ -476,13 +504,21 @@ impl DownloadEngine {
         final_path: &Path,
         snapshot_tx: &Option<broadcast::Sender<EngineSnapshot>>,
     ) -> Result<(), String> {
+        let unwritten = compute_gaps(prefetch.len() as u64, &state.completed_ranges);
+        let mut have = state.completed_ranges.clone();
+        have.extend(ByteRange::from_len(0, prefetch.len() as u64));
+        // About one connection per MiB still missing, up to the limit: a small file arrives
+        // sooner over one connection than over many TCP and TLS handshakes.
+        let remaining: u64 = compute_gaps(size, &have).iter().map(ByteRange::len).sum();
+        let max_workers = self.options.num_connections.clamp(1, 64) as u64;
+        let num_workers = remaining.div_ceil(BYTES_PER_CONNECTION).clamp(1, max_workers) as usize;
+        let chunk_size = effective_chunk_size(remaining, num_workers as u64, self.options.base_chunk_size);
         let min_steal = if self.options.min_steal_threshold != DEFAULT_MIN_STEAL {
             self.options.min_steal_threshold
         } else {
             (chunk_size / 4).max(DEFAULT_MIN_STEAL)
         };
-        let mut manager = ChunkManager::with_resumed_ranges(size, chunk_size, &state.completed_ranges)
-            .map_err(|e| e.to_string())?;
+        let mut manager = ChunkManager::with_resumed_ranges(size, chunk_size, &have).map_err(|e| e.to_string())?;
         manager.set_max_retries(self.options.max_retries);
 
         let mut racer = MirrorRacer::new(mirrors.iter().map(|m| m.url.clone()).collect());
@@ -492,7 +528,15 @@ impl DownloadEngine {
 
         let writer = {
             let part = part.to_path_buf();
-            blocking(move || DiskWriter::open_or_create(&part, size)).await?.map_err(|e| e.to_string())?
+            blocking(move || {
+                let writer = DiskWriter::open_or_create(&part, size)?;
+                for gap in unwritten {
+                    writer.write_chunk_slice(gap.start, &prefetch[gap.start as usize..=gap.end as usize])?;
+                }
+                Ok::<_, StorageError>(writer)
+            })
+            .await?
+            .map_err(|e| e.to_string())?
         };
         let job = RangeJob {
             chunks: Arc::new(Mutex::new(manager)),
@@ -995,6 +1039,8 @@ struct ProbeInfo {
     filename: String,
     etag: Option<String>,
     last_modified: Option<String>,
+    /// The file's first bytes, from the response whose validators these are.
+    prefetch: Bytes,
 }
 
 impl ProbeInfo {
@@ -1022,53 +1068,69 @@ impl ProbeInfo {
             filename: extract_filename(responses.iter().map(|r| r.headers()), final_url),
             etag: header(ETAG),
             last_modified: header(LAST_MODIFIED),
+            prefetch: Bytes::new(),
         }
     }
 }
 
 /// Learns size, range support, name and validators. HEAD is only a hint: servers and proxies
-/// advertise ranges (and sizes) their GETs do not honour, so a one-byte ranged GET always decides
-/// range support and size, and supplies the name and validators wherever it has them.
-async fn probe_url(client: &Client, auth: Option<&Auth>, url: &Url) -> Result<ProbeInfo, String> {
-    let head = match authorize(client.head(url.clone()), auth, url).send().await {
-        Ok(resp) if resp.status().is_success() => Some(resp),
-        Ok(resp) => {
-            tracing::debug!("HEAD {} returned {}", url, resp.status());
-            None
-        }
-        Err(e) => {
-            tracing::debug!("HEAD {} failed: {}", url, e);
-            None
-        }
-    };
-    let head_len = head.as_ref().and_then(|r| content_length(r.headers()));
-
-    let mut attempt = 0;
-    let ranged = loop {
-        attempt += 1;
-        let sent = authorize(client.get(url.clone()), auth, url)
-            .header(RANGE, "bytes=0-0")
-            .header(ACCEPT_ENCODING, "identity")
-            .send()
-            .await;
-        let retry_in = match &sent {
-            Ok(resp) => match resp.status() {
-                StatusCode::TOO_MANY_REQUESTS
-                | StatusCode::SERVICE_UNAVAILABLE
-                | StatusCode::BAD_GATEWAY
-                | StatusCode::GATEWAY_TIMEOUT => Some(retry_after(resp.headers()).unwrap_or_default()),
-                _ => None,
-            },
-            Err(_) => Some(Duration::ZERO),
-        };
-        match retry_in {
-            Some(after) if attempt < PROBE_ATTEMPTS => {
-                drop(sent);
-                tokio::time::sleep(crate::chunk::backoff_delay(attempt).max(after).min(PROBE_RETRY_CAP)).await;
+/// advertise ranges (and sizes) their GETs do not honour, so a ranged GET always decides range
+/// support and size, and supplies the name and validators wherever it has them. HEAD and GET go
+/// out together, so probing takes one round trip.
+///
+/// With `prefetch` the GET asks for the first `PREFETCH` bytes instead of one, and its response
+/// comes back too, with how many body bytes to keep, when that body is the start of the file (or
+/// all of it, from a server ignoring ranges) and the validators found are the response's own.
+async fn probe_url(
+    client: &Client,
+    auth: Option<&Auth>,
+    url: &Url,
+    prefetch: bool,
+) -> Result<(ProbeInfo, Option<(Response, u64)>), String> {
+    let head = async {
+        match authorize(client.head(url.clone()), auth, url).send().await {
+            Ok(resp) if resp.status().is_success() => Some(resp),
+            Ok(resp) => {
+                tracing::debug!("HEAD {} returned {}", url, resp.status());
+                None
             }
-            _ => break sent,
+            Err(e) => {
+                tracing::debug!("HEAD {} failed: {}", url, e);
+                None
+            }
         }
     };
+    let range = format!("bytes=0-{}", if prefetch { PREFETCH - 1 } else { 0 });
+    let ranged = async {
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let sent = authorize(client.get(url.clone()), auth, url)
+                .header(RANGE, range.as_str())
+                .header(ACCEPT_ENCODING, "identity")
+                .send()
+                .await;
+            let retry_in = match &sent {
+                Ok(resp) => match resp.status() {
+                    StatusCode::TOO_MANY_REQUESTS
+                    | StatusCode::SERVICE_UNAVAILABLE
+                    | StatusCode::BAD_GATEWAY
+                    | StatusCode::GATEWAY_TIMEOUT => Some(retry_after(resp.headers()).unwrap_or_default()),
+                    _ => None,
+                },
+                Err(_) => Some(Duration::ZERO),
+            };
+            match retry_in {
+                Some(after) if attempt < PROBE_ATTEMPTS => {
+                    drop(sent);
+                    tokio::time::sleep(crate::chunk::backoff_delay(attempt).max(after).min(PROBE_RETRY_CAP)).await;
+                }
+                _ => break sent,
+            }
+        }
+    };
+    let (head, ranged) = tokio::join!(head, ranged);
+    let head_len = head.as_ref().and_then(|r| content_length(r.headers()));
 
     let get = match ranged {
         Ok(resp) if matches!(
@@ -1080,7 +1142,7 @@ async fn probe_url(client: &Client, auth: Option<&Auth>, url: &Url) -> Result<Pr
             let head: Vec<&Response> = head.iter().collect();
             let mut info = ProbeInfo::describe(url, &head);
             info.size = head_len.filter(|&n| n > 0);
-            return Ok(info);
+            return Ok((info, None));
         }
         // Some servers reject HEAD and any Range header: a plain GET is the last resort.
         Ok(_) => {
@@ -1094,7 +1156,8 @@ async fn probe_url(client: &Client, auth: Option<&Auth>, url: &Url) -> Result<Pr
             }
             let mut info = ProbeInfo::describe(url, &[&plain]);
             info.size = content_length(plain.headers());
-            return Ok(info);
+            let body = info.size.filter(|&n| prefetch && n <= PREFETCH).map(|n| (plain, n));
+            return Ok((info, body));
         }
         Err(e) => return Err(format!("{}: {}", url, e)),
     };
@@ -1102,29 +1165,64 @@ async fn probe_url(client: &Client, auth: Option<&Auth>, url: &Url) -> Result<Pr
     let sources: Vec<&Response> = std::iter::once(&get).chain(head.as_ref()).collect();
     let mut info = ProbeInfo::describe(url, &sources);
     let content_range = get.headers().get(CONTENT_RANGE).and_then(|v| v.to_str().ok());
-    match get.status() {
+    let keep = match get.status() {
         StatusCode::PARTIAL_CONTENT => match content_range.map(ByteRange::parse_content_range) {
             Some(Ok((range, Some(total)))) if range.start == 0 => {
                 info.accepts_ranges = true;
                 info.size = Some(total);
+                Some(range.len())
             }
             // `bytes 0-0/*`: the length is unknown, so only a single stream can fetch the file.
-            Some(Ok((range, None))) if range.start == 0 => {}
+            Some(Ok((range, None))) if range.start == 0 => None,
             _ => return Err(format!("{}: invalid Content-Range {:?}", url, content_range)),
         },
-        StatusCode::OK => info.size = content_length(get.headers()),
-        // Only an empty file cannot satisfy bytes=0-0.
+        StatusCode::OK => {
+            info.size = content_length(get.headers());
+            // Without ranges only the whole file is of use.
+            info.size.filter(|&n| n <= PREFETCH)
+        }
+        // Only an empty file cannot satisfy a range from byte 0.
         _ => {
             info.size = content_range
                 .and_then(|h| h.trim().strip_prefix("bytes */"))
                 .and_then(|n| n.parse().ok())
                 .or(head_len.filter(|&n| n == 0));
             if info.size.is_none() {
-                return Err(format!("{}: 416 for bytes=0-0 without a size", url));
+                return Err(format!("{}: 416 for {} without a size", url, range));
             }
+            None
         }
+    };
+    let own = |name: HeaderName| get.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_string);
+    let own_validators = own(ETAG) == info.etag && own(LAST_MODIFIED) == info.last_modified;
+    let body = keep.filter(|_| prefetch && own_validators).map(|len| (get, len.min(PREFETCH)));
+    Ok((info, body))
+}
+
+/// Reads up to `len` bytes of a probe's body, waiting at most `stall` for each read and never
+/// past `deadline`. Whatever arrived is kept, even if the body ends early.
+async fn read_prefix(
+    response: Response,
+    len: u64,
+    deadline: Option<tokio::time::Instant>,
+    stall: Duration,
+    limiter: Option<&RateLimiter>,
+) -> Bytes {
+    let mut body = response.bytes_stream();
+    let mut kept = Vec::with_capacity(len as usize);
+    while (kept.len() as u64) < len {
+        let wait = tokio::time::Instant::now() + stall;
+        let Ok(Some(Ok(bytes))) = tokio::time::timeout_at(deadline.map_or(wait, |d| d.min(wait)), body.next()).await
+        else {
+            break;
+        };
+        if let Some(limiter) = limiter {
+            limiter.acquire(bytes.len() as u64).await;
+        }
+        let take = bytes.len().min(len as usize - kept.len());
+        kept.extend_from_slice(&bytes[..take]);
     }
-    Ok(info)
+    kept.into()
 }
 
 /// Picks the first successful probe as the reference and keeps the mirrors that serve the same file.
@@ -1665,6 +1763,7 @@ mod tests {
             filename: "file.bin".to_string(),
             etag: Some("\"v1\"".to_string()),
             last_modified: None,
+            prefetch: Bytes::new(),
         }
     }
 

@@ -395,6 +395,8 @@ dependencies = [
  "cfg-if",
  "constant_time_eq",
  "cpufeatures 0.3.1",
+ "memmap2",
+ "rayon-core",
 ]
 
 [[package]]
