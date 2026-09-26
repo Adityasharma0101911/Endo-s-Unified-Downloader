@@ -246,7 +246,11 @@ impl DownloadEngine {
                     // The claim is held until this download returns, whichever way it ends.
                     let (target, _claim) =
                         claim_hls_output(&client, auth, playlist, &segments, base, fetch, &cancel_flag).await?;
-                    let options = crate::hls::HlsOptions { connections: self.options.num_connections, fetch };
+                    let options = crate::hls::HlsOptions {
+                        connections: self.options.num_connections,
+                        fetch,
+                        fsync_on_complete: self.options.fsync_on_complete,
+                    };
                     let path = crate::hls::HlsEngine::download(
                         &client,
                         auth,
