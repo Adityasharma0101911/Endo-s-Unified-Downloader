@@ -1,27 +1,66 @@
+# Endo's Unified Downloader - batch queue service.
+#
+# Downloads every line of /var/downloads/queue.txt into /var/downloads, then exits.
+# Finished files are skipped on the next run and interrupted ones resume from their .part file.
+# Installed by `./install.sh --service`, which creates the endos-downloader user and
+# /var/downloads (group-writable: add yourself to the endos-downloader group to edit the queue).
+#
+#   sudo systemctl start endos-downloader     process the queue now
+#   sudo systemctl enable endos-downloader    also process it at every boot
+#   journalctl -u endos-downloader -f         follow progress
+
 [Unit]
-Description=Endo's Unified Downloader Service
-After=network.target network-online.target
+Description=Endo's Unified Downloader batch queue
+Documentation=https://github.com/Adityasharma0101911/Endo-s-Unified-Downloader
 Wants=network-online.target
+After=network-online.target
+# At most 3 automatic restarts after crashes within 10 minutes.
+StartLimitIntervalSec=600
+StartLimitBurst=3
 
 [Service]
-Type=simple
-# User to execute the service under (modify to your server username)
-# User=ubuntu
-# Group=ubuntu
+Type=exec
+User=endos-downloader
+Group=endos-downloader
+UMask=0002
+ExecStart=/usr/local/bin/endos-downloader-cli -i /var/downloads/queue.txt -d /var/downloads -j 2
+# History and the managed yt-dlp are kept in the state directory.
+StateDirectory=endos-downloader
+Environment=HOME=/var/lib/endos-downloader XDG_DATA_HOME=/var/lib/endos-downloader
 
-# Path to the endos-downloader executable and download parameters
-# Example: Process batch queue file automatically in the background
-ExecStart=/usr/local/bin/endos-downloader -i /var/downloads/queue.txt -d /var/downloads -q
+# Exit codes: 0 done, 1 a download failed, 2 bad queue/arguments, 143 stopped by SIGTERM.
+# Only a crash restarts the service; failed downloads are not retried in a loop.
+Restart=on-abnormal
+RestartSec=30
+SuccessExitStatus=130 143
 
-# Gracefully stop on systemctl stop: sends SIGTERM to flush memory maps and save .hfstate
+# SIGTERM makes the CLI stop every download and save its resume state (bounded to 10 s);
+# yt-dlp children are stopped by the CLI itself.
 KillSignal=SIGTERM
+KillMode=mixed
 TimeoutStopSec=30
-Restart=on-failure
-RestartSec=5s
 
-# Security hardening
-NoNewPrivileges=true
-PrivateTmp=true
+# Hardening
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ReadWritePaths=/var/downloads
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target

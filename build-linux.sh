@@ -1,28 +1,24 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Endo's Unified Downloader - Linux Build Script
+# Endo's Unified Downloader - Linux build script (no install; see install.sh)
+#   ./build-linux.sh          CLI, plus the GUI when a display is present
+#   ./build-linux.sh --gui    CLI and GUI
 # ==============================================================================
 
-set -e
+set -euo pipefail
 
-echo "=== Building Endo's Unified Downloader for Linux ==="
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# Build headless CLI binary (works on any Linux server)
-echo "Building CLI binary..."
-cargo build --release -p hyperfetch-cli
+echo "=== Building Endo's Unified Downloader for Linux ($(rustc --version)) ==="
 
-echo "CLI binary built at: target/release/Endos-Unified-Downloader-CLI"
+cargo build --release --locked -p hyperfetch-cli
+echo "CLI: target/release/Endos-Unified-Downloader-CLI"
 
-# Check if GUI dependencies are available before attempting GUI build
-if [ "$1" = "--gui" ] || [ -n "$DISPLAY" ] || [ -n "$WAYLAND_DISPLAY" ]; then
-    echo "Attempting to build Native GUI binary..."
-    if cargo build --release -p hyperfetch-gui; then
-        echo "GUI binary built at: target/release/Endos-Unified-Downloader"
+if [ "${1:-}" = "--gui" ] || [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; then
+    if cargo build --release --locked -p hyperfetch-gui; then
+        echo "GUI: target/release/Endos-Unified-Downloader"
     else
-        echo "GUI build failed or dependencies missing. CLI binary remains ready for server use."
+        echo "GUI build failed; the CLI binary is ready." >&2
     fi
 fi
-
-echo "=== Build finished successfully ==="
