@@ -42,7 +42,7 @@ impl Shutdown {
                 std::process::exit(code);
             }
             listener.send_replace(Some(code));
-            eprintln!("\nStopping: saving resume state... (press Ctrl+C again to quit immediately)");
+            stderr_line("\nStopping: saving resume state... (press Ctrl+C again to quit immediately)");
             let code = sig_rx.recv().await.unwrap_or(code);
             std::process::exit(code);
         });
@@ -108,14 +108,19 @@ impl Ui {
         Self { multi, quiet, plain: !quiet && !std::io::stderr().is_terminal() }
     }
 
+    /// -q was given: no progress or status output.
+    pub fn quiet(&self) -> bool {
+        self.quiet
+    }
+
     /// Prints to stdout without tearing the progress bars.
     pub fn print(&self, line: &str) {
-        self.multi.suspend(|| println!("{}", line));
+        self.multi.suspend(|| stdout_line(line));
     }
 
     /// Prints to stderr without tearing the progress bars.
     pub fn error(&self, line: &str) {
-        self.multi.suspend(|| eprintln!("{}", line));
+        self.multi.suspend(|| stderr_line(line));
     }
 
     /// A writer for log output that keeps the progress bars intact.
@@ -164,6 +169,23 @@ fn style(template: &str) -> ProgressStyle {
     ProgressStyle::with_template(template)
         .unwrap_or_else(|_| ProgressStyle::default_bar())
         .progress_chars("=>-")
+}
+
+/// `s` with control characters other than newline and tab shown as '?', so names and messages
+/// from untrusted sources (torrents, servers, history) cannot drive the terminal.
+pub fn printable(s: &str) -> String {
+    s.chars().map(|c| if c.is_control() && c != '\n' && c != '\t' { '?' } else { c }).collect()
+}
+
+/// Prints a line to stdout. Write errors are ignored: a reader that went away (`| head`) must
+/// not abort the process and the downloads still running in it.
+pub fn stdout_line(line: &str) {
+    let _ = writeln!(std::io::stdout(), "{}", printable(line));
+}
+
+/// Prints a line to stderr, ignoring write errors like [`stdout_line`].
+pub fn stderr_line(line: &str) {
+    let _ = writeln!(std::io::stderr(), "{}", printable(line));
 }
 
 /// Shortens `s` to at most `max` characters, marking the cut with "...".
@@ -339,8 +361,7 @@ struct TaskView {
     label: String,
     sized: bool,
     named: bool,
-    last_bytes: u64,
-    last_progress: Instant,
+    stall: StallClock,
     /// When the last plain progress line was printed; None when plain lines are off.
     last_plain: Option<Instant>,
     ui: Ui,
@@ -353,8 +374,7 @@ impl TaskView {
             label: label.to_string(),
             sized: false,
             named: false,
-            last_bytes: 0,
-            last_progress: Instant::now(),
+            stall: StallClock::default(),
             last_plain: ui.plain.then(Instant::now),
             ui: ui.clone(),
         }
@@ -377,13 +397,9 @@ impl TaskView {
             self.bar.set_length(s.total_bytes);
         }
         self.bar.set_position(s.downloaded_bytes);
-        if s.downloaded_bytes != self.last_bytes {
-            self.last_bytes = s.downloaded_bytes;
-            self.last_progress = now;
-        }
+        let idle = self.stall.idle(s.downloaded_bytes, now);
 
         let finished = s.total_bytes > 0 && s.downloaded_bytes >= s.total_bytes;
-        let idle = now.duration_since(self.last_progress);
         let stalled = (!finished && idle >= STALL_AFTER).then_some(idle);
         let remaining = (s.total_bytes > 0).then(|| s.total_bytes.saturating_sub(s.downloaded_bytes));
         let status = status_text(s.speed_bytes_per_sec, s.active_workers, remaining, stalled);
@@ -401,6 +417,26 @@ impl TaskView {
             self.last_plain = Some(now);
         }
         self.bar.set_message(status);
+    }
+}
+
+/// How long a download has gone without new bytes. The clock starts at the first snapshot, not
+/// when the view was created, so a slow probe or setup does not show as a stall.
+#[derive(Default)]
+struct StallClock {
+    last_bytes: u64,
+    last_progress: Option<Instant>,
+}
+
+impl StallClock {
+    fn idle(&mut self, downloaded: u64, now: Instant) -> Duration {
+        let since = match self.last_progress {
+            Some(since) if downloaded == self.last_bytes => since,
+            _ => now,
+        };
+        self.last_bytes = downloaded;
+        self.last_progress = Some(since);
+        now.duration_since(since)
     }
 }
 
@@ -425,6 +461,22 @@ mod tests {
             status_text(9.0, 2, Some(1), Some(Duration::from_secs(75))),
             "STALLED: no data for 1m15s, 2 conn"
         );
+    }
+
+    #[test]
+    fn stall_clock_starts_at_the_first_snapshot() {
+        let mut clock = StallClock::default();
+        let start = Instant::now() + Duration::from_secs(60);
+        assert_eq!(clock.idle(0, start), Duration::ZERO);
+        assert_eq!(clock.idle(0, start + Duration::from_secs(6)), Duration::from_secs(6));
+        assert_eq!(clock.idle(10, start + Duration::from_secs(7)), Duration::ZERO);
+        assert_eq!(clock.idle(10, start + Duration::from_secs(9)), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn control_characters_are_not_printed() {
+        assert_eq!(printable("\u{1b}[31mRED\u{1b}]52;c;x\u{7}\u{9b}.bin"), "?[31mRED?]52;c;x??.bin");
+        assert_eq!(printable("\nStopping\tnow"), "\nStopping\tnow");
     }
 
     #[test]

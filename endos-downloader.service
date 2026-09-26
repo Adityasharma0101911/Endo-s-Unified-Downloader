@@ -28,7 +28,7 @@ ExecStart=/usr/local/bin/endos-downloader-cli -i /var/downloads/queue.txt -d /va
 StateDirectory=endos-downloader
 Environment=HOME=/var/lib/endos-downloader XDG_DATA_HOME=/var/lib/endos-downloader
 
-# Exit codes: 0 done, 1 a download failed, 2 bad queue/arguments, 143 stopped by SIGTERM.
+# Exit codes: 0 done (or nothing queued), 1 a download failed, 2 bad queue/arguments, 143 stopped by SIGTERM.
 # Only a crash restarts the service; failed downloads are not retried in a loop.
 Restart=on-abnormal
 RestartSec=30

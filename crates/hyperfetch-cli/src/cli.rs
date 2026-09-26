@@ -70,15 +70,15 @@ pub struct Args {
     pub checksum: Option<String>,
 
     /// Netscape cookies.txt file
-    #[arg(long = "load-cookies", value_name = "FILE", value_parser = existing_file)]
+    #[arg(long = "load-cookies", value_name = "FILE", value_parser = existing_file, conflicts_with = "repair")]
     pub load_cookies: Option<PathBuf>,
 
     /// Authorization header, e.g. "Authorization: Bearer TOKEN" or just "Bearer TOKEN"
-    #[arg(long = "header", value_name = "HEADER", value_parser = parse_auth_header)]
+    #[arg(long = "header", value_name = "HEADER", value_parser = parse_auth_header, conflicts_with = "repair")]
     pub auth_header: Option<String>,
 
     /// Proxy URL (http://, https://, socks5:// or socks5h://)
-    #[arg(long = "proxy", value_name = "URL", value_parser = parse_proxy)]
+    #[arg(long = "proxy", value_name = "URL", value_parser = parse_proxy, conflicts_with = "repair")]
     pub proxy: Option<String>,
 
     /// Media quality: best, 1080p, 720p, mp3, m4a, or any other yt-dlp format selector
@@ -87,7 +87,7 @@ pub struct Args {
     pub media_preset: Option<MediaQualityPreset>,
 
     /// Browser to read cookies from for media sites
-    #[arg(long = "cookies-from-browser", value_enum, value_name = "BROWSER")]
+    #[arg(long = "cookies-from-browser", value_enum, value_name = "BROWSER", conflicts_with = "repair")]
     pub cookies_from_browser: Option<Browser>,
 
     /// Connections (parallel fragments) for yt-dlp media downloads: URLs of supported media sites,
@@ -104,7 +104,8 @@ pub struct Args {
     pub verify: Option<PathBuf>,
 
     /// With --verify: re-download missing ranges (URLs from the command line, the file's resume
-    /// state or history for that exact path)
+    /// state or history for that exact path). The repair connects directly, so it cannot be
+    /// combined with --proxy, --header or cookies
     #[arg(long = "repair", requires = "verify")]
     pub repair: bool,
 }
@@ -273,6 +274,10 @@ mod tests {
         assert!(parse(&["--proxy", "ftp://x", "u"]).is_err());
         assert!(parse(&["--checksum", "crc32:abcd", "u"]).is_err());
         assert!(parse(&["--history", "u"]).is_err());
+        // The repair cannot honor these, so it must not silently connect without them.
+        assert!(parse(&["--verify", "f", "--repair", "--proxy", "socks5h://127.0.0.1:9050"]).is_err());
+        assert!(parse(&["--verify", "f", "--repair", "--header", "Bearer t"]).is_err());
+        assert!(parse(&["--verify", "f", "--repair", "--cookies-from-browser", "firefox"]).is_err());
         let args = parse(&["-vv", "--max-speed", "2M", "--header", "Authorization: Bearer t", "u"]).unwrap();
         assert_eq!((args.verbose, args.max_speed, args.auth_header.as_deref()), (2, Some(2 << 20), Some("Bearer t")));
     }
