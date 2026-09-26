@@ -54,6 +54,8 @@ const MAX_SEGMENT_BYTES: u64 = if cfg!(test) { 64 * 1024 } else { 256 * 1024 * 1
 /// Most bytes one request fetches when it merges the byte ranges of several segments of one file:
 /// enough to spare most of the per-request round trips, small enough to keep every connection busy.
 const MAX_MERGED_BYTES: u64 = if MAX_SEGMENT_BYTES < 8 * 1024 * 1024 { MAX_SEGMENT_BYTES } else { 8 * 1024 * 1024 };
+/// Most bytes that merged requests hold in memory at once (see [`merge_limit`]).
+const MERGE_BUDGET: u64 = 8 * MAX_MERGED_BYTES;
 /// Longest media playlist accepted (a day of 2-second segments is about 43,000).
 const MAX_SEGMENTS: usize = if cfg!(test) { 1000 } else { 1_000_000 };
 const SNAPSHOT_INTERVAL: Duration = Duration::from_millis(200);
@@ -762,15 +764,24 @@ struct Request {
     segments: usize,
 }
 
+/// Most bytes one request may fetch for several segments with `connections` connections: the
+/// requests held in memory at once (the window, the writer's queue and the one it writes, and a
+/// second request) share [`MERGE_BUDGET`].
+fn merge_limit(connections: usize) -> u64 {
+    let held = WINDOW_PER_CONNECTION * connections + WRITE_QUEUE + 2;
+    (MERGE_BUDGET / held as u64).min(MAX_MERGED_BYTES)
+}
+
 /// The requests that fetch `segments[from..]`: one per segment, except that consecutive byte
-/// ranges of one file, each starting where the one before ends, are fetched together, up to
-/// [`MAX_MERGED_BYTES`] at a time. Encrypted segments are never merged, as each is decrypted on its
-/// own with its own IV, and neither is a segment its init section must precede.
-fn plan_requests(segments: Vec<HlsSegment>, from: usize) -> Vec<Request> {
+/// ranges of one file, each starting where the one before ends, are fetched together, up to `limit`
+/// bytes at a time. Encrypted segments are never merged, as each is decrypted on its own with its
+/// own IV, and neither is a segment its init section must precede.
+fn plan_requests(segments: Vec<HlsSegment>, from: usize, limit: u64) -> Vec<Request> {
     let with_init: Vec<bool> = (0..segments.len()).map(|i| writes_init(&segments, i)).collect();
     let mut requests: Vec<Request> = Vec::new();
     for (segment, with_init) in segments.into_iter().zip(with_init).skip(from) {
-        let merged = requests.last().filter(|_| !with_init).and_then(|last| merged_range(&last.segment, &segment));
+        let merged =
+            requests.last().filter(|_| !with_init).and_then(|last| merged_range(&last.segment, &segment, limit));
         match (merged, requests.last_mut()) {
             (Some(range), Some(last)) => {
                 last.segment.byte_range = Some(range);
@@ -782,12 +793,13 @@ fn plan_requests(segments: Vec<HlsSegment>, from: usize) -> Vec<Request> {
     requests
 }
 
-/// The byte range of `request` extended by that of `next`, if one request may fetch both.
-fn merged_range(request: &HlsSegment, next: &HlsSegment) -> Option<ByteRange> {
+/// The byte range of `request` extended by that of `next`, if one request of at most `limit` bytes
+/// may fetch both.
+fn merged_range(request: &HlsSegment, next: &HlsSegment, limit: u64) -> Option<ByteRange> {
     let (range, more) = (request.byte_range?, next.byte_range?);
     let adjoining = range.end.checked_add(1) == Some(more.start) && request.url == next.url;
     let plain = request.encryption.is_none() && next.encryption.is_none();
-    if !adjoining || !plain || range.len() + more.len() > MAX_MERGED_BYTES {
+    if !adjoining || !plain || range.len() + more.len() > limit {
         return None;
     }
     ByteRange::new(range.start, more.end).ok()
@@ -1298,7 +1310,7 @@ impl HlsEngine {
             target_file.display()
         );
 
-        let requests = plan_requests(segments, resume_from);
+        let requests = plan_requests(segments, resume_from, merge_limit(num_connections));
         let received = AtomicU64::new(written_bytes);
         // Dropping it aborts the fetches in flight.
         let window = WINDOW_PER_CONNECTION * num_connections;
@@ -2595,6 +2607,30 @@ video.m3u8
     }
 
     #[test]
+    fn test_merged_requests_shrink_as_connections_grow() {
+        const SEGMENT: u64 = 4 * 1024;
+        let segments: Vec<HlsSegment> = (0..200)
+            .map(|index| HlsSegment {
+                index,
+                url: Url::parse("http://h/all.mp4").unwrap(),
+                duration_secs: 4.0,
+                byte_range: Some(ByteRange::from_len(index as u64 * SEGMENT, SEGMENT).unwrap()),
+                encryption: None,
+                init: None,
+            })
+            .collect();
+        let largest = |connections| plan_requests(segments.clone(), 0, merge_limit(connections)).iter().map(|r| r.segments).max();
+        // One connection merges as much as ever; more share the memory, down to one segment a request.
+        assert_eq!(largest(1), Some((MAX_MERGED_BYTES / SEGMENT) as usize));
+        assert_eq!(largest(8), Some(5));
+        assert_eq!(largest(MAX_CONNECTIONS), Some(1));
+        for connections in 1..=MAX_CONNECTIONS {
+            let held = (WINDOW_PER_CONNECTION * connections + WRITE_QUEUE + 2) as u64;
+            assert!(merge_limit(connections) * held <= MERGE_BUDGET, "{connections} connections");
+        }
+    }
+
+    #[test]
     fn test_plan_merges_adjoining_plain_ranges_of_one_file() {
         let init = |name: &str| Arc::new(InitSection { url: Url::parse(&format!("http://h/{name}")).unwrap(), byte_range: None, encryption: None });
         let (x, y) = (init("x.mp4"), init("y.mp4"));
@@ -2629,7 +2665,7 @@ video.m3u8
         }
         // (first segment, segments, byte range, with init section) of each request.
         let plan = |from: usize| {
-            plan_requests(segments.clone(), from)
+            plan_requests(segments.clone(), from, MAX_MERGED_BYTES)
                 .iter()
                 .map(|r| (r.segment.index, r.segments, r.segment.byte_range.map(|b| (b.start, b.end)), r.with_init))
                 .collect::<Vec<_>>()
@@ -2687,7 +2723,7 @@ video.m3u8
         broken.store(false, Ordering::SeqCst);
         download_to(&client, None, &url, segments, &out, 2).await.unwrap();
         assert_eq!(std::fs::read(&out).unwrap(), file);
-        assert_eq!(hits.lock()["/all.mp4"], 3 + 2, "segments 12-17 and 18-19 on resume, not 8 requests");
+        assert_eq!(hits.lock()["/all.mp4"], 3 + 2, "segments 12-16 and 17-19 on resume (five at a time with two connections), not 8 requests");
     }
 
     #[tokio::test]
