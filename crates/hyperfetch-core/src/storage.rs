@@ -41,9 +41,8 @@ const FOLLOW_STEP: u64 = 1024 * 1024;
 /// `WriteFile` with an offset), so concurrent writers never share a cursor or a mapping.
 ///
 /// Once told to with [`DiskWriter::track_digest`], the writer also hashes what it writes: each
-/// aligned block is hashed with BLAKE3 as soon as it has been written in full, so
-/// [`DiskWriter::digest`] reads back only the blocks it never saw whole (and SHA-256/MD5, see
-/// `track_digest`).
+/// aligned block with BLAKE3 as its bytes come in, so [`DiskWriter::digest`] reads back only the
+/// blocks it never saw written (and SHA-256/MD5, see `track_digest`).
 #[derive(Clone)]
 pub struct DiskWriter {
     path: PathBuf,
@@ -113,6 +112,10 @@ impl DiskWriter {
     }
 
     /// Writes `data` at `offset`. Safe to call concurrently from many threads.
+    ///
+    /// Writes that overlap while they run must carry the same bytes (as a steal's or a retry's do,
+    /// the file being the same version), or [`DiskWriter::digest`] may describe the bytes of one
+    /// while the file holds the other's. Overlapping writes one after the other may differ.
     pub fn write_chunk_slice(&self, offset: u64, data: &[u8]) -> Result<(), StorageError> {
         if offset.checked_add(data.len() as u64).is_none_or(|end| end > self.size) {
             return Err(StorageError::OutOfBounds(offset, data.len(), self.size));
@@ -149,9 +152,9 @@ impl DiskWriter {
     }
 
     /// The file's digest, once writing is done: BLAKE3 merged from the blocks hashed as they were
-    /// written, reading back (on every core) only the blocks never written whole through this
-    /// writer, plus SHA-256/MD5 when `expected_checksum` needs them, reading only what the prefix
-    /// hasher had not reached. Reads through this writer's handle; blocking.
+    /// written, reading back (on every core) only the blocks never written through this writer,
+    /// plus SHA-256/MD5 when `expected_checksum` needs them, reading only what the prefix hasher
+    /// had not reached. Reads through this writer's handle; blocking.
     pub fn digest(&self, expected_checksum: Option<&str>) -> std::io::Result<FileDigest> {
         let (sha256, md5) = needs(expected_checksum).unwrap_or_default();
         let (hashes, file) = (&*self.inner.hashes, &*self.inner.file);
@@ -293,13 +296,24 @@ struct HashState {
     stopped: bool,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Default)]
 struct Block {
     /// Counts the writes into the block, so a hash of older contents is never kept.
     version: u32,
     /// The block's chaining value, or the file's hash when it is the only block; `None` until
     /// the block is hashed.
     hash: Option<ChainingValue>,
+    /// While the block is not written in full: its first bytes, hashed from the writes that wrote
+    /// them in order, so that a write going on from there hashes on instead of the block being
+    /// read back. Taken out while a write hashes into it.
+    head: Option<Box<Head>>,
+}
+
+/// A block's first bytes, hashed.
+struct Head {
+    hasher: blake3::Hasher,
+    /// Where in the file the hashed bytes end.
+    end: u64,
 }
 
 impl Hashes {
@@ -307,7 +321,7 @@ impl Hashes {
         let state = HashState {
             tracking: false,
             written: Vec::new(),
-            blocks: vec![Block::default(); size.div_ceil(block) as usize],
+            blocks: std::iter::repeat_with(Block::default).take(size.div_ceil(block) as usize).collect(),
             follower: None,
             followed: 0,
             refollow: false,
@@ -329,24 +343,42 @@ impl Hashes {
         start..(start + self.block).min(self.size)
     }
 
-    /// Hash of block `i`, which holds `data`.
-    fn hash_block(&self, i: usize, data: &[u8]) -> ChainingValue {
-        if self.size <= self.block {
-            return *blake3::hash(data).as_bytes();
+    /// A hasher for block `i`'s bytes, to be finished with [`Hashes::finish_block`].
+    fn block_hasher(&self, i: usize) -> blake3::Hasher {
+        let mut hasher = blake3::Hasher::new();
+        if self.size > self.block {
+            hasher.set_input_offset(i as u64 * self.block);
         }
-        blake3::Hasher::new().set_input_offset(i as u64 * self.block).update(data).finalize_non_root()
+        hasher
     }
 
-    /// Records that `data` was written at `offset`, then hashes each block this leaves written in
-    /// full: from `data` where it holds the whole block, else read back from `file` (just
-    /// written, so from the page cache). A block that cannot be read back is left for `root`.
+    /// The block's hash from its hasher, fed all of the block: its chaining value, or the file's
+    /// hash when it is the only block.
+    fn finish_block(&self, hasher: &blake3::Hasher) -> ChainingValue {
+        if self.size <= self.block {
+            return *hasher.finalize().as_bytes();
+        }
+        hasher.finalize_non_root()
+    }
+
+    /// Hash of block `i`, which holds `data`.
+    fn hash_block(&self, i: usize, data: &[u8]) -> ChainingValue {
+        self.finish_block(self.block_hasher(i).update(data))
+    }
+
+    /// Records that `data` was written at `offset` and hashes on each block it wrote into: a
+    /// block's bytes as they come in order (see `Block::head`), then, once the block is written in
+    /// full, whatever did not come in order, read back from `file` (just written, so from the
+    /// page cache). Blocks written in order by one writer after another, as each connection
+    /// writes its part of the file batch by batch, are hashed without reading anything back. A
+    /// block that cannot be read back is left for `root`.
     fn wrote(&self, file: &File, offset: u64, data: &[u8]) {
         if data.is_empty() {
             return;
         }
         let end = offset + data.len() as u64;
         let (first, last) = ((offset / self.block) as usize, ((end - 1) / self.block) as usize);
-        let mut complete = Vec::new();
+        let mut touched = Vec::with_capacity(last - first + 1);
         {
             let mut state = self.state.lock();
             let HashState { tracking, written, blocks, followed, refollow, .. } = &mut *state;
@@ -359,32 +391,40 @@ impl Hashes {
             for (i, block) in blocks.iter_mut().enumerate().take(last + 1).skip(first) {
                 block.version = block.version.wrapping_add(1);
                 block.hash = None;
-                if covers(written, &self.span(i)) {
-                    complete.push((i, block.version));
-                }
+                touched.push((i, block.version, covers(written, &self.span(i)), block.head.take()));
             }
             if written_prefix(written) > prefix {
                 self.changed.notify_all();
             }
         }
-        for (i, version) in complete {
+        for (i, version, complete, head) in touched {
             let span = self.span(i);
-            let hash = if offset <= span.start && span.end <= end {
-                let at = (span.start - offset) as usize;
-                self.hash_block(i, &data[at..at + (span.end - span.start) as usize])
-            } else {
-                let mut buf = vec![0; (span.end - span.start) as usize];
-                #[cfg(test)]
-                self.read.fetch_add(buf.len(), Ordering::Relaxed);
-                if read_exact_at(file, &mut buf, span.start).is_err() {
-                    continue;
-                }
-                self.hash_block(i, &buf)
+            let piece = offset.max(span.start)..end.min(span.end);
+            // Go on from the head unless this write rewrites some of what it hashed.
+            let (mut hasher, mut at) = match head {
+                Some(head) if head.end <= piece.start => (head.hasher, head.end),
+                _ => (self.block_hasher(i), span.start),
             };
-            // A later write into the block hashes it again; this hash would be stale.
+            if at == piece.start {
+                hasher.update(&data[(piece.start - offset) as usize..(piece.end - offset) as usize]);
+                at = piece.end;
+            }
+            let hash = complete.then(|| {
+                let mut rest = vec![0; (span.end - at) as usize];
+                #[cfg(test)]
+                self.read.fetch_add(rest.len(), Ordering::Relaxed);
+                read_exact_at(file, &mut rest, at).ok().map(|()| self.finish_block(hasher.update(&rest)))
+            });
             let mut state = self.state.lock();
-            if state.blocks[i].version == version {
-                state.blocks[i].hash = Some(hash);
+            let block = &mut state.blocks[i];
+            // A later write into the block took over: what this one hashed may be stale.
+            if block.version != version {
+                continue;
+            }
+            match hash {
+                Some(hash) => block.hash = hash,
+                None if at > span.start => block.head = Some(Box::new(Head { hasher, end: at })),
+                None => {}
             }
         }
     }
@@ -1336,11 +1376,7 @@ mod tests {
         // The back half first: there is no prefix to follow until the front arrives.
         writer.write_chunk_slice(half as u64, &data[half..]).unwrap();
         writer.write_chunk_slice(0, &data[..half]).unwrap();
-        let started = std::time::Instant::now();
-        while !writer.inner.hashes.state.lock().follower.as_ref().is_some_and(|f| f.is_finished()) {
-            assert!(started.elapsed() < std::time::Duration::from_secs(10), "the prefix was never hashed");
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
+        wait_for_prefix(&writer);
 
         // Change the file behind the writer's back: its digest does not notice, a full read does.
         let other = File::options().write(true).open(temp.path()).unwrap();
@@ -1357,6 +1393,15 @@ mod tests {
         (0..len).map(|i| (i.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as u8).collect()
     }
 
+    /// Waits for the prefix hasher to have hashed the whole file.
+    fn wait_for_prefix(writer: &DiskWriter) {
+        let started = std::time::Instant::now();
+        while !writer.inner.hashes.state.lock().follower.as_ref().is_some_and(|f| f.is_finished()) {
+            assert!(started.elapsed() < std::time::Duration::from_secs(20), "the prefix was never hashed");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
     #[test]
     fn test_a_writer_never_asked_for_a_digest_hashes_nothing() {
         // As a repair writes: no digest follows, so nothing is recorded, read back or hashed.
@@ -1367,11 +1412,79 @@ mod tests {
         writer.write_chunk_slice(0, &data[..100_000]).unwrap();
         {
             let state = writer.inner.hashes.state.lock();
-            assert!(state.written.is_empty() && state.blocks.iter().all(|b| b.hash.is_none()));
+            assert!(state.written.is_empty() && state.blocks.iter().all(|b| b.hash.is_none() && b.head.is_none()));
         }
         assert_eq!(writer.inner.hashes.read.load(Ordering::Relaxed), 0);
         // Its digest reads the file instead.
         assert_eq!(writer.digest(None).unwrap().blake3, *blake3::hash(&data).as_bytes());
+    }
+
+    #[test]
+    fn test_workers_batches_are_hashed_as_written_at_the_real_block_size() {
+        const THREADS: u64 = 16;
+        const KIB: u64 = 1024;
+        let size = 32 * KIB * KIB + 4099;
+        let data = pattern(size);
+        let mut rng = Rng(0xD1B5_4A32_D192_ED03);
+        // Each worker's stretch of the file starts at an unaligned offset and is written in
+        // batches of 448 to 512 KiB, as workers write what arrives.
+        let mut edges: Vec<u64> = (0..THREADS).map(|k| k * (size / THREADS) + rng.below(64 * KIB) * u64::from(k > 0)).collect();
+        edges.push(size);
+        let stretches: Vec<Vec<Range<u64>>> = edges
+            .windows(2)
+            .map(|w| {
+                let (mut at, mut batches) = (w[0], Vec::new());
+                while at < w[1] {
+                    let end = (at + 448 * KIB + rng.below(64 * KIB + 1)).min(w[1]);
+                    batches.push(at..end);
+                    at = end;
+                }
+                batches
+            })
+            .collect();
+        let in_file_order = stretches.concat();
+        let sha256 = format!("sha256:{}", hex::encode(&Sha256::digest(&data)));
+
+        // Each thread its own stretch, as today; then whichever batch comes next in the file, as
+        // chunks handed out in file order would be written, with a checksum to hash the prefix.
+        for in_order in [false, true] {
+            let checksum = in_order.then_some(sha256.as_str());
+            let temp = NamedTempFile::new().unwrap();
+            let writer = DiskWriter::open_or_create(temp.path(), size).unwrap();
+            let block = writer.inner.hashes.block;
+            assert_eq!(block, 256 * KIB, "files of up to 16 GiB are hashed in blocks of 256 KiB");
+            writer.track_digest(&[], checksum);
+            let next = AtomicUsize::new(0);
+            std::thread::scope(|s| {
+                for stretch in &stretches {
+                    let (writer, data, next, in_file_order) = (&writer, &data, &next, &in_file_order);
+                    s.spawn(move || {
+                        let write = |r: &Range<u64>| writer.write_chunk_slice(r.start, &data[r.start as usize..r.end as usize]).unwrap();
+                        if in_order {
+                            while let Some(batch) = in_file_order.get(next.fetch_add(1, Ordering::Relaxed)) {
+                                write(batch);
+                            }
+                        } else {
+                            stretch.iter().for_each(write);
+                        }
+                    });
+                }
+            });
+
+            let read = writer.inner.hashes.read.load(Ordering::Relaxed);
+            if in_order {
+                // The prefix grew as fast as the file, so its hasher had it all before the end.
+                wait_for_prefix(&writer);
+                assert_eq!(writer.inner.hashes.state.lock().followed, size);
+            } else {
+                // A batch hashes on where the one before it stopped: only blocks astride the
+                // edges of the stretches are read back, and only in part.
+                assert!(read <= (THREADS * block) as usize, "{read} bytes read back");
+            }
+            let digest = writer.digest(checksum).unwrap();
+            assert_eq!(digest.blake3, *blake3::hash(&data).as_bytes(), "in order: {in_order}");
+            assert!(verify_digest(&digest, checksum).is_ok());
+        }
     }
 
     #[test]
