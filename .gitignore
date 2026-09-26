@@ -28,3 +28,6 @@ Thumbs.db
 .gemini/
 .antigravity/
 .system_generated/
+
+# Python
+__pycache__/
