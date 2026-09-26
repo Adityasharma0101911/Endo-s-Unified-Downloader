@@ -310,20 +310,36 @@ impl HostResolver for HtmlVideoResolver {
             }
     }
 
-    async fn resolve(&self, client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
-        let resp = client.get(url.clone()).send().await?;
-        if !resp.status().is_success() || !is_html(&resp) {
-            return Ok(vec![url.clone()]);
-        }
-        let page_url = resp.url().clone();
-        let html = read_capped(resp, MAX_HTML_BYTES).await?;
-        match extract_html_video_source(&html, &page_url) {
-            Some(video) => {
-                tracing::info!("HtmlVideoResolver: {} plays {}", url, video);
-                Ok(vec![video])
-            }
-            None => Ok(vec![url.clone()]),
-        }
+    /// The URL itself, sending nothing: whether it is a web page, and which video it plays, shows
+    /// in its answer, which the download's own probe fetches (see `is_page`).
+    async fn resolve(&self, _client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
+        Ok(vec![url.clone()])
+    }
+}
+
+impl HtmlVideoResolver {
+    /// Whether the answer to `url`, with these headers, is a web page to look into for the video
+    /// it plays: HTML, for a URL this resolver would be handed (one that can be a page, and that
+    /// no resolver `SmartResolver` tries first takes).
+    pub fn is_page(url: &Url, headers: &HeaderMap) -> bool {
+        let taken = GoogleDriveResolver.can_handle(url)
+            || MediaFireResolver.can_handle(url)
+            || DropboxResolver.can_handle(url)
+            || SourceForgeResolver.can_handle(url)
+            || ArchiveOrgResolver.can_handle(url);
+        !taken && HtmlVideoResolver.can_handle(url) && html_type(headers)
+    }
+
+    /// Reads as much of a page's body as is looked into.
+    pub async fn read_page(resp: Response) -> Result<String, ResolverError> {
+        read_capped(resp, MAX_HTML_BYTES).await
+    }
+
+    /// The video file the page `html`, from `page_url`, plays, if one is found.
+    pub fn video_in(html: &str, page_url: &Url) -> Option<Url> {
+        let video = extract_html_video_source(html, page_url)?;
+        tracing::info!("HtmlVideoResolver: {} plays {}", page_url, video);
+        Some(video)
     }
 }
 
@@ -724,23 +740,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_smart_resolver_scrapes_html_page() {
-        let html = br#"<video controls><source src="/media/clip.mp4" type="video/mp4"></video>"#.to_vec();
-        let page = serve_once("text/html; charset=utf-8", html).await;
+    async fn test_smart_resolver_leaves_pages_to_the_probe() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let page = Url::parse(&format!("http://{}/watch/page", listener.local_addr().unwrap())).unwrap();
         let resolved = SmartResolver::resolve(&local_client(), &page).await.unwrap();
-        assert_eq!(resolved, vec![page.join("/media/clip.mp4").unwrap()]);
-    }
-
-    #[tokio::test]
-    async fn test_html_video_resolver_ignores_non_html() {
-        let body = br#"<video src="/media/clip.mp4"></video>"#.to_vec();
-        let page = serve_once("application/octet-stream", body).await;
-        let resolved = HtmlVideoResolver.resolve(&local_client(), &page).await.unwrap();
         assert_eq!(resolved, vec![page]);
+        assert!(!contacted(&listener).await, "the page was fetched before the download's probe");
     }
 
     fn headers(pairs: &[(reqwest::header::HeaderName, &'static str)]) -> HeaderMap {
         pairs.iter().map(|(name, value)| (name.clone(), HeaderValue::from_static(value))).collect()
+    }
+
+    #[test]
+    fn test_only_html_answers_to_urls_left_to_the_video_resolver_are_pages() {
+        let html = headers(&[(CONTENT_TYPE, "text/html; charset=utf-8")]);
+        let page = Url::parse("https://example.com/watch/video").unwrap();
+        assert!(HtmlVideoResolver::is_page(&page, &html));
+        assert!(HtmlVideoResolver::is_page(&Url::parse("https://example.com/view.php?id=4").unwrap(), &html));
+        assert!(!HtmlVideoResolver::is_page(&page, &headers(&[(CONTENT_TYPE, "application/octet-stream")])));
+        assert!(!HtmlVideoResolver::is_page(&page, &HeaderMap::new()));
+        for file_or_taken in [
+            "https://example.com/dl/video.mp4",
+            "https://drive.usercontent.google.com/download?id=abc&export=download&confirm=t",
+            "https://www.mediafire.com/file/abc/name",
+            "https://www.dropbox.com/s/abc/name?dl=1",
+        ] {
+            assert!(!HtmlVideoResolver::is_page(&Url::parse(file_or_taken).unwrap(), &html), "{file_or_taken}");
+        }
     }
 
     #[tokio::test]

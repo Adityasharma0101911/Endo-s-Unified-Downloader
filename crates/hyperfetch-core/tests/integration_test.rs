@@ -102,6 +102,8 @@ struct Mock {
     etag: Option<&'static str>,
     /// Content-Disposition value sent with every GET response.
     disposition: Option<String>,
+    /// Content-Type value sent with every HEAD and GET response.
+    content_type: Option<&'static str>,
     /// Content-Disposition value sent with HEAD responses only.
     head_disposition: Option<&'static str>,
     /// Report this total in Content-Range instead of the real one (a broken mirror).
@@ -178,6 +180,7 @@ impl Mock {
             chunked: false,
             etag: None,
             disposition: None,
+            content_type: None,
             head_disposition: None,
             content_range_total: None,
             unknown_total: false,
@@ -277,6 +280,7 @@ async fn handle(mut socket: TcpStream, mock: Arc<Mock>) {
     let get_etag = if mock.etag_only_on_head { "" } else { etag.as_str() };
     let accept = if mock.ranges && !mock.chunked { "Accept-Ranges: bytes\r\n" } else { "" };
     let length = |n: usize| if mock.chunked { "Transfer-Encoding: chunked\r\n".to_string() } else { format!("Content-Length: {}\r\n", n) };
+    let content_type = mock.content_type.map(|t| format!("Content-Type: {}\r\n", t)).unwrap_or_default();
 
     if method == "HEAD" {
         tokio::time::sleep(mock.head_delay).await;
@@ -293,7 +297,7 @@ async fn handle(mut socket: TcpStream, mock: Arc<Mock>) {
                 accept
             };
             let disposition = mock.head_disposition.map(|d| format!("Content-Disposition: {}\r\n", d)).unwrap_or_default();
-            format!("HTTP/1.1 200 OK\r\n{}{}{}{}Connection: close\r\n\r\n", length(total), accept, etag, disposition)
+            format!("HTTP/1.1 200 OK\r\n{}{}{}{}{}Connection: close\r\n\r\n", length(total), accept, etag, disposition, content_type)
         };
         let _ = socket.write_all(resp.as_bytes()).await;
         return;
@@ -391,13 +395,14 @@ Connection: close
     };
     let disposition = mock.disposition.as_ref().map(|d| format!("Content-Disposition: {}\r\n", d)).unwrap_or_default();
     let resp = format!(
-        "HTTP/1.1 {} Mock\r\n{}{}{}{}{}Connection: close\r\n\r\n",
+        "HTTP/1.1 {} Mock\r\n{}{}{}{}{}{}Connection: close\r\n\r\n",
         status,
         length(body.len()),
         content_range,
         accept,
         get_etag,
-        disposition
+        disposition,
+        content_type
     );
     let limit = match reply {
         Reply::CloseAfter(n) | Reply::StallAfter(n) => n.min(body.len()),
@@ -1989,6 +1994,49 @@ async fn test_a_mirror_answering_later_joins_the_download() {
     assert_eq!(seen.iter().max(), Some(&2), "{seen:?}");
     assert!(second.stats.gets.load(Ordering::SeqCst) > 0);
     assert_eq!(other.stats.gets.load(Ordering::SeqCst), 0, "a mirror of another file joined");
+}
+
+#[tokio::test]
+async fn test_a_web_page_is_downloaded_as_the_video_it_plays() {
+    let _history = setup().await;
+    let video = payload(PREFETCH + 256 * KB, 293);
+    let video_url = serve(Arc::new(Mock::new(video.clone())), "clip.mp4").await;
+    // A page the probe reads whole, one of unknown length whose answer the probe leaves
+    // coming, and one larger than the probe reads, with the video past that: each is looked
+    // into from what the probe brought, else asked for again, all of it.
+    for (chunked, padding, requests, gets) in [(false, 0, 2, 0), (true, 0, 2, 0), (false, PREFETCH, 3, 1)] {
+        let html = format!("<html><body>{}<video controls src=\"{}\"></video></body></html>", " ".repeat(padding), video_url);
+        let mut page = Mock::new(html.into_bytes());
+        page.content_type = Some("text/html; charset=utf-8");
+        page.chunked = chunked;
+        let page = Arc::new(page);
+        let page_url = serve(Arc::clone(&page), "watch").await;
+        let temp = tempdir().unwrap();
+        let out = temp.path().join("clip.mp4");
+
+        run(&DownloadEngine::new(vec![page_url], options(&out, 4, 256 * KB)), None).await.expect("the video should download");
+        assert_file(&out, &video);
+        let s = &page.stats;
+        let seen = (s.requests.load(Ordering::SeqCst), s.gets.load(Ordering::SeqCst));
+        assert_eq!(seen, (requests, gets), "chunked: {chunked}, padding: {padding}");
+        assert!(page.served_ranges().is_empty(), "the page was asked for in parts");
+    }
+}
+
+#[tokio::test]
+async fn test_a_web_page_without_a_video_is_downloaded_as_it_is() {
+    let _history = setup().await;
+    let html = b"<html><body><p>Nothing to play here.</p></body></html>".to_vec();
+    let mut page = Mock::new(html.clone());
+    page.content_type = Some("text/html");
+    let page = Arc::new(page);
+    let url = serve(Arc::clone(&page), "about").await;
+    let temp = tempdir().unwrap();
+    let out = temp.path().join("about.html");
+
+    run(&DownloadEngine::new(vec![url], options(&out, 4, 64 * KB)), None).await.expect("the page should download");
+    assert_file(&out, &html);
+    assert_eq!(page.stats.requests.load(Ordering::SeqCst), 2, "the probe brought all of it");
 }
 
 #[tokio::test]
