@@ -66,7 +66,11 @@ impl MediaQualityPreset {
                 "--audio-format".to_string(),
                 "mp3".to_string(),
             ],
+            // An AAC source is only copied into the .m4a. The best audio is often Opus, which
+            // ffmpeg would have to re-encode: slower, and a second lossy encode.
             Self::AudioM4a => vec![
+                "-f".to_string(),
+                "ba[acodec^=mp4a]/ba/b".to_string(),
                 "-x".to_string(),
                 "--audio-format".to_string(),
                 "m4a".to_string(),
@@ -1363,6 +1367,15 @@ mod tests {
         let mp3 = MediaQualityPreset::AudioMp3;
         let mp3_args = mp3.to_args();
         assert!(mp3_args.contains(&"mp3".to_string()));
+    }
+
+    #[test]
+    fn m4a_preset_prefers_an_aac_source() {
+        // yt-dlp copies AAC into the .m4a and re-encodes anything else.
+        assert_eq!(
+            MediaQualityPreset::AudioM4a.to_args(),
+            ["-f", "ba[acodec^=mp4a]/ba/b", "-x", "--audio-format", "m4a"]
+        );
     }
 
     /// Spawn a shell that starts a long-running grandchild (standing in for yt-dlp's ffmpeg)
