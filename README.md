@@ -16,9 +16,11 @@
 - Splits a file into chunks and downloads them over several HTTP/1.1 connections at once (one TCP connection per worker, up to 64). Workers that finish early take over part of the slowest remaining range (work stealing).
 - Several mirror URLs of the same file are used together. Every mirror is probed first, and a mirror that reports a different size or a different strong ETag is dropped, so bytes from different files are never mixed.
 - An optional speed limit (`--max-speed`) is shared by all connections of a download.
+- Batches run 4 downloads at once by default (`-j`). All running downloads together open at most 32 connections to one host (`--max-connections-per-host`), and the downloads of a batch share their HTTP connections and TLS sessions, so later files skip the handshakes.
 
 **Safe, resumable files**
-- A download is written to `<name>.part`. Its resume state is saved to `<name>.part.hfstate` before the first byte arrives and again every 2 seconds. When the download finishes, the data is flushed to disk and the file is renamed to its final name, so a file at its final name is always complete.
+- A download is written to `<name>.part`. Its resume state is saved to `<name>.part.hfstate` before the first byte arrives and again every 2 seconds, each time after the data it records has been flushed to disk. When the download finishes, the file is renamed to its final name, so a file at its final name is always complete.
+- A finished file is not flushed to disk before it is reported done; the operating system writes it out on its own schedule, as with curl, wget and browsers. A power loss right after a download finishes can therefore leave a damaged file, which `--verify` detects. `--fsync` (GUI: **Flush finished files to disk**) waits for each finished file to reach the disk first.
 - Stopping (Ctrl+C, `systemctl stop`) saves the resume state. Running the same command again continues where it stopped, but only if the server still reports the same size, validators (ETag/Last-Modified) and range support. Otherwise the stale `.part` is discarded and the download starts over.
 - Existing files are never overwritten. A different file with the same name is saved as `name (1).ext`. A file that is already complete (the checksum matches, or history recorded it as completed at that exact path) is not downloaded again.
 - Checksums: `sha256:`, `md5:`, `blake3:` or bare hex. The BLAKE3 hash of every finished download is recorded in the history, so `--verify` can check the file later.
@@ -83,7 +85,9 @@ All `URLS` given on the command line are **mirrors of one file**. To download se
 | Option | Description | Default |
 | :--- | :--- | :--- |
 | `-i, --input-file FILE` | Batch file with one download per line (see below). `-` reads the list from stdin. | |
-| `-j, --max-concurrent-downloads N` | Number of batch downloads that run at the same time (1-32). | `1` |
+| `-j, --max-concurrent-downloads N` | Number of batch downloads that run at the same time (1-32). Above 1, each result line names its input (see below). | `4` |
+| `--max-connections-per-host N` | Connections all running downloads may open to one host together. `0` means no limit. | `32` |
+| `--fsync` | Wait until each finished file is on the disk before reporting it done. | off |
 | `-d, --dir DIR` | Directory to save into. It is created if it is missing. | current directory |
 | `-o, --output FILE` | Output file name for a single download. It is relative to `-d` when both are given. | name from the server |
 | `-s, --split N` | Connections per download (1-64). | `16` |
@@ -114,6 +118,8 @@ magnet:?xt=urn:btih:...&dn=file.bin&ws=https://seed.example.com/files/
 https://example.com/release.meta4
 /home/me/debian.torrent
 ```
+
+**Results.** Each finished download prints `[OK] <path>`, and a failed one `[FAILED] <name>: <reason>` on stderr. With `-j` above 1 results arrive in the order the downloads finish, so each line names its input by its position in the batch and its first URL (without the query string, which may hold tokens): `[OK] #3 https://example.com/file.iso -> /srv/downloads/file.iso`.
 
 **Progress.** Each running download shows a bar with the engine's measured speed, the number of open connections and the ETA. If no data arrives for 5 seconds, the bar shows `STALLED`. Batches also show a total bar. When stderr is not a terminal (journald, cron, pipes), a plain progress line is printed every 10 seconds instead of the bars.
 
@@ -173,7 +179,7 @@ Get-Content .\links.txt | .\Endos-Unified-Downloader-CLI.exe -i - -d D:\Download
 
 `--verify FILE` checks the file, or its `FILE.part` while the download is unfinished. It uses the strongest evidence available: the `--checksum` you give, else the BLAKE3 hash in the history for that exact path, then the `.hfstate` range records and the expected size. A file with no evidence at all is reported as unverifiable, never as complete.
 
-`--repair` downloads only the missing ranges. It takes the URLs from the command line if you give any. Otherwise it uses the mirrors in the file's resume state, then the history entry for the same path. File names alone are never matched. Repair accepts only `206 Partial Content` responses whose range and total size match the file, and it verifies the file again afterwards. A checksum mismatch cannot be repaired, because nothing shows which bytes are wrong. Download the file again instead.
+`--repair` downloads only the missing ranges. It takes the URLs from the command line if you give any. Otherwise it uses the mirrors in the file's resume state, then the history entry for the same path. File names alone are never matched. Each mirror must first show that it still serves the version the file was downloaded as (same ETag, else Last-Modified) and its size; the others are left out, so a repair never mixes two versions of a file. The missing ranges then come through the download engine, over up to `-s` connections with work stealing and retries, and the file is verified again afterwards. A `.part` whose final name is already taken by another file is repaired in place over one connection and keeps its `.part` name. A checksum mismatch cannot be repaired, because nothing shows which bytes are wrong. Download the file again instead.
 
 ### History
 
@@ -207,10 +213,10 @@ The service downloads every line of the queue, two at a time, and then exits. Fi
 
 - **Live view:** a chunk map, per-connection progress, a throughput graph, real open-connection count, smoothed speed and ETA. A **STALLED** warning appears after 5 s without data, and downloads with several mirrors get a per-mirror speed table.
 - **Pause, Resume, Start Over:** Pause waits until resume state is saved ("Pausing…"). Resume continues the same file with the same settings. Start Over and Delete Leftovers remove only the `.part` and its resume state, never a finished file.
-- **Batch queue:** add one download per line (mirrors of one file go on one line, separated by spaces). Each item keeps the folder and options it was added with. Auto-run handles 1–8 downloads at once, with per-item Start, Pause, Resume, Retry, Remove, Open and Folder.
+- **Batch queue:** add one download per line (mirrors of one file go on one line, separated by spaces). Each item keeps the folder and options it was added with. Auto-run handles 1–8 downloads at once (4 by default; a number you saved before is kept), with per-item Start, Pause, Resume, Retry, Remove, Open and Folder. Downloads share their HTTP connections and TLS sessions.
 - **Verify & Repair:** checks a file against the BLAKE3 hash recorded when it was downloaded. Results are VERIFIED, INCOMPLETE (with a cancellable repair of just the missing ranges), CHECKSUM MISMATCH or UNVERIFIED.
 - **Clipboard watcher:** offers "Download Now" / "Add to Queue" for copied links. It ignores links the app copied itself and magnets without web seeds.
-- **Advanced options:** speed limit, retries per chunk, stall timeout, proxy, cookies (file or browser), Authorization header, checksum and media quality.
+- **Advanced options:** speed limit, retries per chunk, stall timeout, connections per host (32 by default, 0 = no limit), flushing finished files to disk (off by default, see above), proxy, cookies (file or browser), Authorization header, checksum and media quality.
 - **Remembers settings:** folder, connections and advanced options are stored in `gui-settings.json` next to the history. The Authorization header and checksum are never saved.
 - **Safe to close:** closing the window pauses running downloads and saves their state (waiting at most 3 s). It also stops yt-dlp. The app uses no CPU while idle.
 
@@ -259,7 +265,7 @@ SHA-256, Windows 11, 32 threads):
 
 Small files come over the single connection that probed them unless that connection turns out to
 be capped, so a batch of tiny files from a server that caps every connection is slower one at a
-time than v1.0's fixed 16-way split. Use `-j 4` there. Hashing a finished 2 GiB file (BLAKE3,
+time than v1.0's fixed 16-way split; `-j 4`, now the default, is faster. Hashing a finished 2 GiB file (BLAKE3,
 warm cache) takes 0.34 s instead of 0.64 s. Reproduce with `bench/README.md`.
 
 ---
