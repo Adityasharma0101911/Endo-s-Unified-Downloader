@@ -6,8 +6,9 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use reqwest::header::{HeaderMap, CONTENT_RANGE, ETAG, IF_RANGE, LAST_MODIFIED, RANGE};
 use reqwest::{Client, StatusCode};
+use tokio::sync::broadcast;
 use url::Url;
-use crate::engine::{claim_target, TargetClaim};
+use crate::engine::{claim_target, discard_partial, DownloadEngine, DownloadOptions, EngineSnapshot, TargetClaim};
 use crate::history::{DownloadHistoryManager, HistoryEntry};
 use crate::range::{compute_gaps, merge_ranges, ByteRange};
 use crate::state::DownloadState;
@@ -20,8 +21,9 @@ const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// How often a pending network operation checks the cancel flag.
 const CANCEL_POLL: Duration = Duration::from_millis(200);
 const RETRY_DELAY: Duration = Duration::from_millis(500);
-/// Failed attempts per mirror (without any progress) before a range is given up.
+/// Failed attempts per mirror (without any progress) before a range, or the mirror, is given up.
 const ATTEMPTS_PER_MIRROR: usize = 2;
+const CANCELLED: &str = "Repair cancelled by user";
 
 #[derive(Debug, Clone)]
 pub struct BuildVerificationResult {
@@ -181,7 +183,7 @@ async fn until_cancelled<T>(fut: impl Future<Output = T>, cancel: Option<&Atomic
     tokio::pin!(fut);
     loop {
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
-            return Err(FetchError::Fatal("Repair cancelled by user".to_string()));
+            return Err(FetchError::Fatal(CANCELLED.to_string()));
         }
         if let Ok(out) = tokio::time::timeout(CANCEL_POLL, &mut fut).await {
             return Ok(out);
@@ -389,7 +391,7 @@ fn prepare_repair(
             let mut state = DownloadState::new(
                 target.file_name().unwrap_or_default().to_string_lossy().into_owned(),
                 total_size,
-                crate::engine::DownloadOptions::default().base_chunk_size,
+                DownloadOptions::default().base_chunk_size,
                 urls.iter().map(|u| u.to_string()).collect(),
             );
             state.completed_ranges.extend(ByteRange::from_len(0, total_size).ok());
@@ -400,10 +402,21 @@ fn prepare_repair(
     untrusted.extend_from_slice(missing_ranges);
     untrusted.extend(ByteRange::new(len, total_size.saturating_sub(1)).ok());
     state.completed_ranges = compute_gaps(total_size, &merge_ranges(untrusted));
+    // The engine resumes a `.part` only for a download from one of the mirrors its state lists.
+    for url in urls.iter().map(Url::to_string) {
+        if !state.mirrors.contains(&url) {
+            state.mirrors.push(url);
+        }
+    }
 
     let part = with_suffix(&final_path, ".part");
     let state_path = DownloadState::state_file_path(&part);
-    if part != target {
+    if part == target {
+        // Nothing was written yet: the state records only bytes the file already holds.
+        state
+            .save_atomic(&state_path)
+            .map_err(|e| format!("Failed to save repair state: {}", e))?;
+    } else {
         if part.exists() {
             return Err(format!("{:?} already exists; refusing to overwrite it", part));
         }
@@ -454,13 +467,21 @@ fn finish_repair(repair: RepairTarget, complete: bool) -> Result<(), String> {
 /// first) and bytes are recorded in its `.hfstate` only once they have actually been written, so
 /// an interrupted repair leaves a download the engine resumes. Every gap the state records is
 /// fetched, including `missing_ranges`. Only a complete file is renamed back to its final name.
-/// A mirror is used only while it serves the version the state records (by ETag, else
-/// Last-Modified); with no such mirror left the repair stops instead of mixing two versions.
+///
+/// The prepared `.part` is handed to the download engine, which fetches the gaps over several
+/// connections (`options` gives their number, the speed limit, retries and timeouts; its output,
+/// checksum and credentials are not used: the repair connects directly). Before that, every mirror
+/// must show it serves the version the state records (by ETag, else Last-Modified), since the
+/// engine compares mirrors only with each other and with the first one's answer; with no such
+/// mirror left the repair stops instead of mixing two versions. A `.part` whose final name is
+/// taken, or media and playlist URLs the engine would hand to other tools, are repaired here
+/// range by range instead, holding each mirror to its version on every answer.
 pub async fn repair_missing_ranges<F>(
     file_path: &Path,
     total_size: u64,
     missing_ranges: &[ByteRange],
     urls: &[Url],
+    options: &DownloadOptions,
     cancel_flag: Option<Arc<AtomicBool>>,
     progress_callback: F,
 ) -> Result<(), String>
@@ -485,19 +506,224 @@ where
         .build()
         .map_err(|e| format!("Failed to build HTTP client for repair: {}", e))?;
 
-    let mut repair = {
+    let (repair, final_taken) = {
         let (file_path, missing_ranges, urls) = (file_path.to_path_buf(), missing_ranges.to_vec(), urls.to_vec());
-        blocking(move || prepare_repair(&file_path, total_size, &missing_ranges, &urls)).await??
+        blocking(move || {
+            let repair = prepare_repair(&file_path, total_size, &missing_ranges, &urls)?;
+            let final_taken = repair.final_path.exists();
+            Ok::<_, String>((repair, final_taken))
+        })
+        .await??
     };
-
     let gaps = compute_gaps(total_size, &repair.state.completed_ranges);
     let total_repair_bytes: u64 = gaps.iter().map(|r| r.len()).sum();
-    let mut repaired_bytes: u64 = 0;
-    let mut on_bytes = |n: u64| {
-        repaired_bytes += n;
-        progress_callback(repaired_bytes, total_repair_bytes);
-    };
     let cancel = cancel_flag.as_deref();
+
+    // The engine would save beside a final file that exists, and sends media and playlist URLs to
+    // yt-dlp or the HLS engine.
+    let engine_urls = !urls.iter().any(|u| crate::media::is_supported_media_site(u) || u.as_str().contains(".m3u8"));
+    if final_taken || !engine_urls {
+        let mut repaired_bytes: u64 = 0;
+        let mut on_bytes = |n: u64| {
+            repaired_bytes += n;
+            progress_callback(repaired_bytes, total_repair_bytes);
+        };
+        return repair_in_place(&client, repair, &gaps, urls, cancel, &mut on_bytes).await;
+    }
+
+    let first_gap = gaps.first().map_or(0, |g| g.start);
+    let serving = mirrors_serving(&client, urls, &Version::recorded(&repair.state), first_gap, total_size, cancel).await;
+    let final_path = repair.final_path.clone();
+    // The engine takes the claim itself.
+    blocking(move || drop(repair)).await?;
+    let mirrors = serving?;
+    let progress = move |downloaded: u64| {
+        let done = downloaded.saturating_sub(total_size - total_repair_bytes).min(total_repair_bytes);
+        progress_callback(done, total_repair_bytes);
+    };
+    repair_with_engine(final_path, mirrors, options, cancel, progress).await
+}
+
+/// The mirrors among `urls` that answer a one-byte range request at `at` with the version
+/// `recorded` and the file's size. Transient failures are tried again; a mirror serving another
+/// version is left out at once. With none left, the error says why each was.
+async fn mirrors_serving(
+    client: &Client,
+    urls: &[Url],
+    recorded: &Version,
+    at: u64,
+    total_size: u64,
+    cancel: Option<&AtomicBool>,
+) -> Result<Vec<Url>, String> {
+    let checks = urls.iter().map(|url| async move {
+        let mut last = String::new();
+        for attempt in 0..ATTEMPTS_PER_MIRROR {
+            if attempt > 0 {
+                until_cancelled(tokio::time::sleep(RETRY_DELAY), cancel).await?;
+            }
+            match serves_version(client, url, recorded, at, total_size, cancel).await {
+                Ok(()) => return Ok(Ok(url.clone())),
+                Err(FetchError::Retry(e)) => last = e,
+                Err(FetchError::WrongVersion(e)) => return Ok(Err(e)),
+                Err(FetchError::Fatal(e)) => return Err(FetchError::Fatal(e)),
+            }
+        }
+        Ok(Err(last))
+    });
+    let mut serving = Vec::new();
+    let mut reasons = Vec::new();
+    for checked in futures_util::future::join_all(checks).await {
+        match checked {
+            Ok(Ok(url)) => serving.push(url),
+            Ok(Err(reason)) => {
+                tracing::warn!("Not repairing from this mirror: {}", reason);
+                reasons.push(reason);
+            }
+            Err(FetchError::Fatal(e) | FetchError::Retry(e) | FetchError::WrongVersion(e)) => return Err(e),
+        }
+    }
+    if serving.is_empty() {
+        return Err(format!("Repair stopped: {}", reasons.join("; ")));
+    }
+    Ok(serving)
+}
+
+/// Asks `url` for byte `at` and checks that the answer is that byte of the `total_size`-byte file
+/// in the version `recorded`.
+async fn serves_version(
+    client: &Client,
+    url: &Url,
+    recorded: &Version,
+    at: u64,
+    total_size: u64,
+    cancel: Option<&AtomicBool>,
+) -> Result<(), FetchError> {
+    let request = client.get(url.clone()).header(RANGE, format!("bytes={}-{}", at, at));
+    let resp = until_cancelled(request.send(), cancel)
+        .await?
+        .map_err(|e| FetchError::Retry(format!("request to {} failed: {}", url, e)))?;
+    if resp.status() == StatusCode::OK {
+        return Err(FetchError::Retry(format!("{} ignored the range request and sent the whole file", url)));
+    }
+    if resp.status() != StatusCode::PARTIAL_CONTENT {
+        return Err(FetchError::Retry(format!("{} answered HTTP {} instead of 206 Partial Content", url, resp.status())));
+    }
+    if !recorded.matches(&Version::served(resp.headers())) {
+        return Err(FetchError::WrongVersion(format!("the file at {} changed since it was downloaded", url)));
+    }
+    let header = resp.headers().get(CONTENT_RANGE).and_then(|v| v.to_str().ok());
+    match header.map(ByteRange::parse_content_range) {
+        Some(Ok((served, Some(total)))) if served.start == at && total == total_size => Ok(()),
+        _ => Err(FetchError::Retry(format!(
+            "{} answered Content-Range {:?} for byte {} of a {}-byte file",
+            url,
+            header.unwrap_or("(missing)"),
+            at,
+            total_size
+        ))),
+    }
+}
+
+/// Resumes the prepared `<final_path>.part` with the download engine from `mirrors`, which verifies
+/// the result and renames it to `final_path`. `progress` gets the engine's downloaded byte count.
+///
+/// The claim is free while the engine starts; if another download takes the name meanwhile, the
+/// engine picks another name, which is stopped and cleaned up as soon as it shows. The engine
+/// records the finished file in history; a BLAKE3 hash recorded there before stays, as the
+/// reference the repaired file is checked against.
+async fn repair_with_engine(
+    final_path: PathBuf,
+    mirrors: Vec<Url>,
+    options: &DownloadOptions,
+    cancel: Option<&AtomicBool>,
+    progress: impl Fn(u64),
+) -> Result<(), String> {
+    let options = DownloadOptions {
+        output_path: Some(final_path.clone()),
+        expected_checksum: None,
+        cookies_path: None,
+        auth_header: None,
+        proxy: None,
+        media_preset: None,
+        browser_cookies: None,
+        ..options.clone()
+    };
+    let recorded_hash = {
+        let path = final_path.clone();
+        blocking(move || {
+            history_entry_for(&DownloadHistoryManager::load(), &path).filter(|e| e.blake3_hash.is_some()).cloned()
+        })
+        .await?
+    };
+    // Building the client reads the TLS roots.
+    let engine = blocking(move || DownloadEngine::new(mirrors, options)).await?;
+
+    let (tx, mut rx) = broadcast::channel::<EngineSnapshot>(16);
+    let run = engine.run(Some(tx));
+    tokio::pin!(run);
+    let mut snapshots_open = true;
+    let mut poll = tokio::time::interval(CANCEL_POLL);
+    // Where the engine went instead of `final_path`, if it did.
+    let mut elsewhere: Option<PathBuf> = None;
+    let result = loop {
+        tokio::select! {
+            result = &mut run => break result,
+            snapshot = rx.recv(), if snapshots_open => match snapshot {
+                Ok(snapshot) => match snapshot.target_path {
+                    Some(target) if target != final_path => {
+                        if elsewhere.is_none() {
+                            engine.cancel();
+                        }
+                        elsewhere = Some(target);
+                    }
+                    _ => progress(snapshot.downloaded_bytes),
+                },
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => snapshots_open = false,
+            },
+            _ = poll.tick() => {
+                if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                    engine.cancel();
+                }
+            }
+        }
+    };
+
+    match (result, elsewhere) {
+        (Ok(path), _) if path == final_path => {
+            if let Some(entry) = recorded_hash {
+                blocking(move || DownloadHistoryManager::load().add_or_update(entry)).await?;
+            }
+            Ok(())
+        }
+        (Ok(path), _) => Err(format!(
+            "another download took {} while the repair was starting; a complete copy was saved as {}",
+            final_path.display(),
+            path.display()
+        )),
+        (Err(_), Some(other)) => {
+            if let Err(e) = blocking(move || discard_partial(&other)).await? {
+                tracing::warn!("Could not remove what the repair started under another name: {}", e);
+            }
+            Err(format!("{} is still being downloaded; stop that download before repairing it", final_path.display()))
+        }
+        (Err(_), None) if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) => Err(CANCELLED.to_string()),
+        (Err(e), None) => Err(e),
+    }
+}
+
+/// Fetches `gaps` range by range from `urls` into the prepared `.part`, holding each mirror to the
+/// version it first served (see [`fetch_range`]), then records the progress; a complete `.part`
+/// whose final name is free gets that name.
+async fn repair_in_place(
+    client: &Client,
+    mut repair: RepairTarget,
+    gaps: &[ByteRange],
+    urls: &[Url],
+    cancel: Option<&AtomicBool>,
+    on_bytes: &mut (dyn FnMut(u64) + Send),
+) -> Result<(), String> {
+    let total_size = repair.writer.size();
     let mut outcome = Ok(());
     // Per mirror: the version it served so far, and why it was dropped.
     let mut seen: Vec<Option<Version>> = vec![None; urls.len()];
@@ -516,8 +742,7 @@ where
             let mirror = usable[(range_idx + failures) % usable.len()];
             let before = offset;
             let result =
-                fetch_range(&client, &urls[mirror], &mut seen[mirror], &mut offset, range.end, &repair, cancel, &mut on_bytes)
-                    .await;
+                fetch_range(client, &urls[mirror], &mut seen[mirror], &mut offset, range.end, &repair, cancel, on_bytes).await;
             if offset > before {
                 repair.state.completed_ranges.push(ByteRange { start: before, end: offset - 1 });
                 failures = 0;
@@ -558,8 +783,22 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Once;
     use tempfile::{tempdir, NamedTempFile};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::Notify;
+
+    /// A repair through the engine records the finished file in the history file; point that at a
+    /// file of this test process, never the user's.
+    fn isolate_history() {
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            let path = std::env::temp_dir().join(format!("hf-verify-history-{}.json", std::process::id()));
+            let _ = std::fs::remove_file(&path);
+            std::env::set_var("ENDO_HISTORY_PATH", path);
+        });
+    }
 
     fn empty_history() -> DownloadHistoryManager {
         let dir = tempdir().unwrap();
@@ -670,35 +909,147 @@ mod tests {
         assert_eq!(res.checksum_match, Some(false));
     }
 
-    /// Serves `content` over HTTP; `respond(attempt, request, start, end, content)` builds each raw
-    /// response from the lowercased request head and its Range.
+    /// The lowercased head of the request on `sock`, None if the client went away first.
+    async fn read_head(sock: &mut tokio::net::TcpStream) -> Option<String> {
+        let mut req = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+            match sock.read(&mut buf).await {
+                Ok(0) | Err(_) => return None,
+                Ok(n) => req.extend_from_slice(&buf[..n]),
+            }
+        }
+        Some(String::from_utf8_lossy(&req).to_ascii_lowercase())
+    }
+
+    /// The bytes a request head asks for from a `len`-byte file: its Range, cut at the end of the
+    /// file, or all of it.
+    fn requested(req: &str, len: u64) -> (u64, u64) {
+        let range = req.lines().find_map(|l| l.strip_prefix("range: bytes=")).and_then(|spec| {
+            let (s, e) = spec.trim().split_once('-')?;
+            Some((s.parse().ok()?, e.parse::<u64>().map_or(len - 1, |e| e.min(len - 1))))
+        });
+        range.unwrap_or((0, len - 1))
+    }
+
+    const NO_HEAD: &[u8] = b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+    /// Serves `content` over HTTP, one connection at a time; `respond(n, request, start, end, content)`
+    /// builds the raw response to the n-th GET from its lowercased head and the bytes it asks for.
+    /// HEAD is refused, so the engine's probe goes by its ranged GET.
     async fn mock_server(
         content: Vec<u8>,
         respond: fn(usize, &str, u64, u64, &[u8]) -> Vec<u8>,
     ) -> Url {
+        isolate_history();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            for attempt in 0.. {
+            let mut gets = 0;
+            loop {
                 let Ok((mut sock, _)) = listener.accept().await else { return };
-                let mut req = Vec::new();
-                let mut buf = [0u8; 1024];
-                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
-                    let n = sock.read(&mut buf).await.unwrap();
-                    if n == 0 {
-                        break;
-                    }
-                    req.extend_from_slice(&buf[..n]);
+                let Some(req) = read_head(&mut sock).await else { continue };
+                if req.starts_with("head ") {
+                    let _ = sock.write_all(NO_HEAD).await;
+                    continue;
                 }
-                let req = String::from_utf8_lossy(&req).to_ascii_lowercase();
-                let spec = req.split("range: bytes=").nth(1).unwrap().lines().next().unwrap();
-                let (s, e) = spec.trim().split_once('-').unwrap();
-                let resp = respond(attempt, &req, s.parse().unwrap(), e.parse().unwrap(), &content);
+                let (s, e) = requested(&req, content.len() as u64);
+                let resp = respond(gets, &req, s, e, &content);
+                gets += 1;
                 let _ = sock.write_all(&resp).await;
                 let _ = sock.shutdown().await;
             }
         });
         Url::parse(&format!("http://{}/file.bin", addr)).unwrap()
+    }
+
+    /// How [`engine_server`] answers.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Mode {
+        /// Every body at 16 KiB per this pause.
+        Paced(Duration),
+        /// The file is "v1" until the first request with an If-Range, answered as the new build
+        /// "v2" (200, as a server honoring If-Range does), like every request after it.
+        NewBuildOnIfRange,
+        /// Requests carrying If-Range (the engine's workers) get their headers, then nothing.
+        StallIfRange,
+        /// The first request from byte 0 (the engine's probe) waits for `Served::release`.
+        HoldProbe,
+    }
+
+    #[derive(Default)]
+    struct Served {
+        busy: AtomicUsize,
+        /// The most requests past the file's first byte answered at once.
+        most_busy: AtomicUsize,
+        probe: Notify,
+        release: Notify,
+    }
+
+    /// Serves `content` as ETag "v1" to many connections at once, HEAD refused.
+    async fn engine_server(content: Vec<u8>, mode: Mode) -> (Url, Arc<Served>) {
+        isolate_history();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let served = Arc::new(Served::default());
+        let (content, stats) = (Arc::new(content), Arc::clone(&served));
+        let (held, changed) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let (content, served, held, changed) =
+                    (Arc::clone(&content), Arc::clone(&stats), Arc::clone(&held), Arc::clone(&changed));
+                tokio::spawn(async move {
+                    let Some(req) = read_head(&mut sock).await else { return };
+                    if req.starts_with("head ") {
+                        let _ = sock.write_all(NO_HEAD).await;
+                        return;
+                    }
+                    let (start, end) = requested(&req, content.len() as u64);
+                    if mode == Mode::HoldProbe && start == 0 && !held.swap(true, Ordering::SeqCst) {
+                        served.probe.notify_one();
+                        served.release.notified().await;
+                    }
+                    if mode == Mode::NewBuildOnIfRange && req.contains("if-range:") {
+                        changed.store(true, Ordering::SeqCst);
+                    }
+                    if changed.load(Ordering::SeqCst) {
+                        let new_build: Vec<u8> = content.iter().map(|b| b ^ 0xff).collect();
+                        let _ = sock.write_all(&with_header(full_200(&new_build), "ETag: \"v2\"")).await;
+                        return;
+                    }
+                    let body = &content[start as usize..=end as usize];
+                    let head = format!(
+                        "HTTP/1.1 206 Partial Content\r\nETag: \"v1\"\r\nContent-Range: bytes {}-{}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        start,
+                        end,
+                        content.len(),
+                        body.len()
+                    );
+                    let past_start = start > 0;
+                    if past_start {
+                        let now = served.busy.fetch_add(1, Ordering::SeqCst) + 1;
+                        served.most_busy.fetch_max(now, Ordering::SeqCst);
+                    }
+                    if sock.write_all(head.as_bytes()).await.is_ok() {
+                        if mode == Mode::StallIfRange && req.contains("if-range:") {
+                            std::future::pending::<()>().await;
+                        }
+                        for piece in body.chunks(16 * 1024) {
+                            if sock.write_all(piece).await.is_err() {
+                                break;
+                            }
+                            if let Mode::Paced(pause) = mode {
+                                tokio::time::sleep(pause).await;
+                            }
+                        }
+                    }
+                    if past_start {
+                        served.busy.fetch_sub(1, Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        (Url::parse(&format!("http://{}/big.bin", addr)).unwrap(), served)
     }
 
     fn partial(start: u64, end: u64, content: &[u8], body_len: usize) -> Vec<u8> {
@@ -771,7 +1122,7 @@ mod tests {
         let url = mock_server(content.clone(), |_, _, _, _, c| full_200(c)).await;
 
         let gap = ByteRange::new(100, 199).unwrap();
-        let res = repair_missing_ranges(&path, 1000, &[gap], &[url], None, |_, _| {}).await;
+        let res = repair_missing_ranges(&path, 1000, &[gap], &[url], &DownloadOptions::default(), None, |_, _| {}).await;
         assert!(res.is_err());
 
         // The unfinished repair is left as a resumable .part, never under the final name.
@@ -782,22 +1133,55 @@ mod tests {
         assert_eq!(gaps_on_disk(&part_of(&path)), vec![gap]);
     }
 
+    /// `damaged_file` recorded as ETag `etag`, moved to `build.bin.part` beside a finished
+    /// `build.bin` with other contents, so its repair cannot give it that name. Returns the `.part`.
+    fn damaged_part_beside_final(dir: &Path, content: &[u8], etag: Option<&str>) -> PathBuf {
+        let path = damaged_file(dir, content);
+        let part = part_of(&path);
+        let mut state = DownloadState::load_from_path(&DownloadState::state_file_path(&path)).unwrap().unwrap();
+        state.etag = etag.map(str::to_string);
+        state.save_atomic(&DownloadState::state_file_path(&part)).unwrap();
+        DownloadState::remove(&DownloadState::state_file_path(&path)).unwrap();
+        std::fs::rename(&path, &part).unwrap();
+        std::fs::write(&path, b"a newer finished download").unwrap();
+        part
+    }
+
+    // Was `repair_records_only_bytes_that_arrived`: through the engine, a server that sends the
+    // whole file once it ignores ranges now completes the repair with that file. The range by range
+    // path this checks is now the one taken beside a finished file.
     #[tokio::test]
-    async fn repair_records_only_bytes_that_arrived() {
+    async fn in_place_repair_records_only_bytes_that_arrived() {
         let dir = tempdir().unwrap();
         let content = content();
-        let path = damaged_file(dir.path(), &content);
+        let part = damaged_part_beside_final(dir.path(), &content, None);
         // First answer is cut off after 30 bytes, every later one ignores Range.
         let url = mock_server(content.clone(), |attempt, _, s, e, c| {
             if attempt == 0 { partial(s, e, c, 30) } else { full_200(c) }
         })
         .await;
 
-        let res = repair_missing_ranges(&path, 1000, &[ByteRange::new(100, 199).unwrap()], &[url], None, |_, _| {}).await;
+        let res = repair_missing_ranges(&part, 1000, &[ByteRange::new(100, 199).unwrap()], &[url], &DownloadOptions::default(), None, |_, _| {}).await;
         assert!(res.is_err());
 
-        assert_eq!(gaps_on_disk(&part_of(&path)), vec![ByteRange::new(130, 199).unwrap()]);
-        assert_eq!(std::fs::read(part_of(&path)).unwrap()[100..130], content[100..130]);
+        assert_eq!(gaps_on_disk(&part), vec![ByteRange::new(130, 199).unwrap()]);
+        assert_eq!(std::fs::read(&part).unwrap()[100..130], content[100..130]);
+        assert_eq!(std::fs::read(dir.path().join("build.bin")).unwrap(), b"a newer finished download");
+    }
+
+    #[tokio::test]
+    async fn a_part_beside_a_finished_file_is_repaired_in_place() {
+        let dir = tempdir().unwrap();
+        let content = content();
+        let part = damaged_part_beside_final(dir.path(), &content, None);
+        let url = mock_server(content.clone(), |_, _, s, e, c| partial(s, e, c, usize::MAX)).await;
+
+        let res = verify_with_history(&part, None, None, &empty_history()).unwrap();
+        repair_missing_ranges(&part, 1000, &res.missing_ranges, &[url], &DownloadOptions::default(), None, |_, _| {}).await.unwrap();
+
+        assert_eq!(std::fs::read(&part).unwrap(), content);
+        assert!(gaps_on_disk(&part).is_empty());
+        assert_eq!(std::fs::read(dir.path().join("build.bin")).unwrap(), b"a newer finished download");
     }
 
     #[tokio::test]
@@ -809,7 +1193,7 @@ mod tests {
         let url = mock_server(content.clone(), |_, _, _, _, c| full_200(c)).await;
 
         let res = verify_with_history(&path, Some(1000), None, &empty_history()).unwrap();
-        let repaired = repair_missing_ranges(&path, 1000, &res.missing_ranges, std::slice::from_ref(&url), None, |_, _| {}).await;
+        let repaired = repair_missing_ranges(&path, 1000, &res.missing_ranges, std::slice::from_ref(&url), &DownloadOptions::default(), None, |_, _| {}).await;
         assert!(repaired.is_err());
 
         // No full-size file with a zero tail may sit under the final name.
@@ -832,7 +1216,7 @@ mod tests {
         let url = mock_server(content.clone(), |_, _, s, e, c| partial(s, e, c, usize::MAX)).await;
 
         let res = verify_with_history(&path, Some(1000), None, &empty_history()).unwrap();
-        repair_missing_ranges(&path, 1000, &res.missing_ranges, &[url], None, |_, _| {}).await.unwrap();
+        repair_missing_ranges(&path, 1000, &res.missing_ranges, &[url], &DownloadOptions::default(), None, |_, _| {}).await.unwrap();
 
         assert_eq!(std::fs::read(&path).unwrap(), content);
         let part = part_of(&path);
@@ -841,11 +1225,13 @@ mod tests {
         assert!(!DownloadState::state_file_path(&path).exists());
     }
 
+    // Was `repair_sends_if_range_and_stops_when_the_file_changes` on a file at its final name, which
+    // now goes through the engine (see `engine_repair_stops_when_the_file_changes`).
     #[tokio::test]
-    async fn repair_sends_if_range_and_stops_when_the_file_changes() {
+    async fn in_place_repair_sends_if_range_and_stops_when_the_file_changes() {
         let dir = tempdir().unwrap();
         let content = content();
-        let path = damaged_file_v1(dir.path(), &content);
+        let path = damaged_part_beside_final(dir.path(), &content, Some("\"v1\""));
         // The first answer, capped at 40 bytes, is still build "v1". Then the server has a new
         // build: it honors Range only while If-Range still matches, and without If-Range it would
         // pass the new bytes off as "v1".
@@ -860,14 +1246,13 @@ mod tests {
         .await;
 
         let gap = ByteRange::new(100, 199).unwrap();
-        let res = repair_missing_ranges(&path, 1000, &[gap], &[url], None, |_, _| {}).await;
+        let res = repair_missing_ranges(&path, 1000, &[gap], &[url], &DownloadOptions::default(), None, |_, _| {}).await;
         assert!(res.as_ref().is_err_and(|e| e.contains("changed")), "{:?}", res);
 
-        assert!(!path.exists());
-        let on_disk = std::fs::read(part_of(&path)).unwrap();
+        let on_disk = std::fs::read(&path).unwrap();
         assert_eq!(on_disk[100..140], content[100..140]);
         assert!(on_disk[140..200].iter().all(|&b| b == 0), "no byte of the new build may be written");
-        assert_eq!(gaps_on_disk(&part_of(&path)), vec![ByteRange::new(140, 199).unwrap()]);
+        assert_eq!(gaps_on_disk(&path), vec![ByteRange::new(140, 199).unwrap()]);
     }
 
     /// 1000-byte file missing bytes 100..=199 and 500..=599, downloaded as ETag "v1" from a
@@ -906,7 +1291,7 @@ mod tests {
         .await;
 
         let gaps = [ByteRange::new(100, 199).unwrap(), ByteRange::new(500, 599).unwrap()];
-        repair_missing_ranges(&path, 1000, &gaps, &[a, b], None, |_, _| {}).await.unwrap();
+        repair_missing_ranges(&path, 1000, &gaps, &[a, b], &DownloadOptions::default(), None, |_, _| {}).await.unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), content);
     }
 
@@ -923,7 +1308,7 @@ mod tests {
         .await;
         let b = mock_server(content.clone(), |_, _, s, e, c| with_header(partial(s, e, c, usize::MAX), "ETag: \"v1\"")).await;
 
-        repair_missing_ranges(&path, 1000, &[ByteRange::new(100, 199).unwrap()], &[a, b], None, |_, _| {}).await.unwrap();
+        repair_missing_ranges(&path, 1000, &[ByteRange::new(100, 199).unwrap()], &[a, b], &DownloadOptions::default(), None, |_, _| {}).await.unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), content);
     }
 
@@ -936,7 +1321,7 @@ mod tests {
         let url = mock_server(new_build, |_, _, s, e, c| with_header(partial(s, e, c, usize::MAX), "ETag: \"v2\"")).await;
 
         let gap = ByteRange::new(100, 199).unwrap();
-        let res = repair_missing_ranges(&path, 1000, &[gap], &[url], None, |_, _| {}).await;
+        let res = repair_missing_ranges(&path, 1000, &[gap], &[url], &DownloadOptions::default(), None, |_, _| {}).await;
         assert!(res.as_ref().is_err_and(|e| e.contains("changed")), "{:?}", res);
         assert!(std::fs::read(part_of(&path)).unwrap()[100..200].iter().all(|&b| b == 0));
         assert_eq!(gaps_on_disk(&part_of(&path)), vec![gap]);
@@ -954,7 +1339,7 @@ mod tests {
         let url = mock_server(content.clone(), |_, _, s, e, c| partial(s, e.min(s + 39), c, usize::MAX)).await;
 
         let res = verify_with_history(&path, None, None, &empty_history()).unwrap();
-        repair_missing_ranges(&path, 1000, &res.missing_ranges, &[url], None, |_, _| {}).await.unwrap();
+        repair_missing_ranges(&path, 1000, &res.missing_ranges, &[url], &DownloadOptions::default(), None, |_, _| {}).await.unwrap();
 
         assert_eq!(std::fs::read(&path).unwrap(), content);
         assert!(!part.exists());
@@ -985,7 +1370,7 @@ mod tests {
         // Spawned, like the GUI does, which also proves the repair future is Send.
         let repaired = path.clone();
         let res = tokio::spawn(async move {
-            repair_missing_ranges(&repaired, 1000, &[ByteRange::new(100, 199).unwrap()], &[url], Some(cancel), |_, _| {}).await
+            repair_missing_ranges(&repaired, 1000, &[ByteRange::new(100, 199).unwrap()], &[url], &DownloadOptions::default(), Some(cancel), |_, _| {}).await
         })
         .await
         .unwrap();
@@ -1006,14 +1391,14 @@ mod tests {
         let gap = ByteRange::new(100, 199).unwrap();
 
         let download = claim_target(&path).unwrap().expect("free target");
-        let res = repair_missing_ranges(&path, 1000, &[gap], std::slice::from_ref(&url), None, |_, _| {}).await;
+        let res = repair_missing_ranges(&path, 1000, &[gap], std::slice::from_ref(&url), &DownloadOptions::default(), None, |_, _| {}).await;
         assert!(res.as_ref().is_err_and(|e| e.contains("still being downloaded")), "{:?}", res);
         assert_eq!(std::fs::read(&path).unwrap(), data);
         assert_eq!(std::fs::read(&state_path).unwrap(), state);
         assert!(!part_of(&path).exists());
         drop(download);
 
-        repair_missing_ranges(&path, 1000, &[gap], &[url], None, |_, _| {}).await.unwrap();
+        repair_missing_ranges(&path, 1000, &[gap], &[url], &DownloadOptions::default(), None, |_, _| {}).await.unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), content);
         assert!(claim_target(&path).unwrap().is_some(), "a finished repair must release the claim");
     }
@@ -1024,15 +1409,171 @@ mod tests {
         let path = damaged_file(dir.path(), &content());
         let url = mock_server(content(), |_, _, _, _, c| full_200(c)).await;
         let gap = ByteRange::new(100, 199).unwrap();
-        assert!(repair_missing_ranges(&path, 1000, &[gap], &[url], None, |_, _| {}).await.is_err());
+        assert!(repair_missing_ranges(&path, 1000, &[gap], &[url], &DownloadOptions::default(), None, |_, _| {}).await.is_err());
         assert!(claim_target(&path).unwrap().is_some());
 
         // Also when the repair fails before it starts: the .part it would write is not its own.
         std::fs::write(dir.path().join("fresh.bin"), vec![0u8; 1000]).unwrap();
         std::fs::write(dir.path().join("fresh.bin.part"), b"other").unwrap();
         let fresh = dir.path().join("fresh.bin");
-        let res = repair_missing_ranges(&fresh, 1000, &[gap], &[Url::parse("http://127.0.0.1:9/").unwrap()], None, |_, _| {}).await;
+        let res = repair_missing_ranges(&fresh, 1000, &[gap], &[Url::parse("http://127.0.0.1:9/").unwrap()], &DownloadOptions::default(), None, |_, _| {}).await;
         assert!(res.as_ref().is_err_and(|e| e.contains("refusing to overwrite")), "{:?}", res);
         assert!(claim_target(&fresh).unwrap().is_some());
+    }
+
+    const MIB: usize = 1024 * 1024;
+
+    /// A 5 MiB file downloaded as ETag "v1" of which only the first MiB arrived (see `big_gap`).
+    fn damaged_big(dir: &Path) -> (PathBuf, Vec<u8>) {
+        let content: Vec<u8> = (0..5 * MIB).map(|i| (i % 251) as u8 ^ (i >> 12) as u8).collect();
+        let path = dir.join("big.bin");
+        let mut data = content.clone();
+        data[MIB..].fill(0);
+        std::fs::write(&path, &data).unwrap();
+        let mut state = DownloadState::new("big.bin".into(), content.len() as u64, MIB as u64, vec![]);
+        state.completed_ranges = vec![ByteRange::from_len(0, MIB as u64).unwrap()];
+        state.etag = Some("\"v1\"".into());
+        state.save_atomic(&DownloadState::state_file_path(&path)).unwrap();
+        (path, content)
+    }
+
+    fn big_gap() -> ByteRange {
+        ByteRange::new(MIB as u64, 5 * MIB as u64 - 1).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn repair_fetches_the_gaps_over_several_connections() {
+        let dir = tempdir().unwrap();
+        let (path, content) = damaged_big(dir.path());
+        let (url, served) = engine_server(content.clone(), Mode::Paced(Duration::from_millis(5))).await;
+        let options = DownloadOptions { num_connections: 4, ..DownloadOptions::default() };
+
+        repair_missing_ranges(&path, content.len() as u64, &[big_gap()], &[url], &options, None, |_, _| {}).await.unwrap();
+
+        assert!(std::fs::read(&path).unwrap() == content, "repaired file differs");
+        assert!(!part_of(&path).exists() && !DownloadState::state_file_path(&part_of(&path)).exists());
+        let most = served.most_busy.load(Ordering::SeqCst);
+        assert!(most >= 2, "the missing 4 MiB came over {} connection(s) at a time", most);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn engine_repair_stops_when_the_file_changes() {
+        let dir = tempdir().unwrap();
+        let (path, content) = damaged_big(dir.path());
+        let (url, _) = engine_server(content.clone(), Mode::NewBuildOnIfRange).await;
+
+        let res = repair_missing_ranges(&path, content.len() as u64, &[big_gap()], &[url], &DownloadOptions::default(), None, |_, _| {}).await;
+        assert!(res.as_ref().is_err_and(|e| e.contains("changed")), "{:?}", res);
+
+        assert!(!path.exists());
+        let on_disk = std::fs::read(part_of(&path)).unwrap();
+        assert!(on_disk[..MIB] == content[..MIB]);
+        assert!(on_disk[MIB..].iter().all(|&b| b == 0), "no byte of the new build may be written");
+        assert_eq!(gaps_on_disk(&part_of(&path)), vec![big_gap()]);
+    }
+
+    /// Checked only against each other, a mirror serving another version would lead the engine
+    /// when listed first, and the repair would fetch that version instead.
+    #[tokio::test]
+    async fn repair_leaves_out_a_mirror_serving_another_version() {
+        let dir = tempdir().unwrap();
+        let content = content();
+        let path = damaged_twice(dir.path(), &content);
+        let other_build: Vec<u8> = content.iter().map(|b| b ^ 0xff).collect();
+        let other = mock_server(other_build, |_, _, s, e, c| {
+            with_header(partial(s, e, c, usize::MAX), "Last-Modified: Tue, 07 Nov 2023 08:49:37 GMT")
+        })
+        .await;
+        let good = mock_server(content.clone(), |_, _, s, e, c| {
+            with_header(with_header(partial(s, e, c, usize::MAX), "ETag: \"v1\""), &format!("Last-Modified: {MON}"))
+        })
+        .await;
+
+        let gaps = [ByteRange::new(100, 199).unwrap(), ByteRange::new(500, 599).unwrap()];
+        repair_missing_ranges(&path, 1000, &gaps, &[other, good], &DownloadOptions::default(), None, |_, _| {}).await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), content);
+    }
+
+    /// The engine takes the name's claim itself; if a download takes it first, the engine would
+    /// fetch the file again under another name. That is stopped and cleaned up.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn repair_never_continues_under_another_name() {
+        let dir = tempdir().unwrap();
+        let (path, content) = damaged_big(dir.path());
+        let (url, served) = engine_server(content.clone(), Mode::HoldProbe).await;
+        let repair = {
+            let (path, total) = (path.clone(), content.len() as u64);
+            tokio::spawn(async move {
+                repair_missing_ranges(&path, total, &[big_gap()], &[url], &DownloadOptions::default(), None, |_, _| {}).await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(20), served.probe.notified()).await.expect("the engine never probed");
+        let download = claim_target(&path).unwrap().expect("the repair left the claim to the engine");
+        served.release.notify_one();
+
+        let res = repair.await.unwrap();
+        assert!(res.as_ref().is_err_and(|e| e.contains("still being downloaded")), "{:?}", res);
+        let mut left: Vec<String> =
+            std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        left.sort();
+        assert_eq!(left, ["big.bin.part", "big.bin.part.hfstate", "big.bin.part.lock"]);
+        assert_eq!(gaps_on_disk(&part_of(&path)), vec![big_gap()]);
+        drop(download);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn engine_repair_honors_cancel() {
+        let dir = tempdir().unwrap();
+        let (path, content) = damaged_big(dir.path());
+        let (url, served) = engine_server(content.clone(), Mode::StallIfRange).await;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let repair = {
+            let (path, total, flag) = (path.clone(), content.len() as u64, Arc::clone(&cancel));
+            tokio::spawn(async move {
+                repair_missing_ranges(&path, total, &[big_gap()], &[url], &DownloadOptions::default(), Some(flag), |_, _| {}).await
+            })
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while served.busy.load(Ordering::SeqCst) == 0 {
+            assert!(std::time::Instant::now() < deadline, "the engine never started fetching");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(claim_target(&path).unwrap().is_none(), "the engine holds the claim while it runs");
+        let stopping = std::time::Instant::now();
+        cancel.store(true, Ordering::Relaxed);
+
+        assert_eq!(repair.await.unwrap(), Err(CANCELLED.to_string()));
+        assert!(stopping.elapsed() < Duration::from_secs(10));
+        assert!(!path.exists());
+        assert_eq!(gaps_on_disk(&part_of(&path)), vec![big_gap()], "the .part stays resumable");
+        assert!(claim_target(&path).unwrap().is_some(), "a cancelled repair releases the claim");
+    }
+
+    /// The engine records the repaired file's hash in history. A hash recorded when the file was
+    /// downloaded stays instead: damage in bytes the repair kept must still show.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn repair_keeps_the_hash_history_recorded() {
+        let dir = tempdir().unwrap();
+        let (_, content) = damaged_big(dir.path());
+        let (url, _) = engine_server(content.clone(), Mode::Paced(Duration::ZERO)).await;
+        // Cut off after 3 MiB, and damaged past the first MiB, which the engine fetches anyway.
+        let path = dir.path().join("cut.bin");
+        let mut truncated = content[..3 * MIB].to_vec();
+        truncated[2 * MIB] ^= 0xff;
+        std::fs::write(&path, &truncated).unwrap();
+        let original = blake3::hash(&content).to_hex().to_string();
+        let size = content.len() as u64;
+        let mut entry = HistoryEntry::new("cut.bin".into(), std::path::absolute(&path).unwrap(), size, vec![url.to_string()]);
+        entry.blake3_hash = Some(original.clone());
+        DownloadHistoryManager::load().add_or_update(entry);
+
+        let res = verify_build_file(&path, None, None).unwrap();
+        assert_eq!(res.missing_ranges, vec![ByteRange::new(3 * MIB as u64, size - 1).unwrap()]);
+        repair_missing_ranges(&path, size, &res.missing_ranges, &[url], &DownloadOptions::default(), None, |_, _| {}).await.unwrap();
+
+        let recorded = history_entry_for(&DownloadHistoryManager::load(), &path).and_then(|e| e.blake3_hash.clone());
+        assert_eq!(recorded, Some(original));
+        let res = verify_build_file(&path, None, None).unwrap();
+        assert_eq!(res.checksum_match, Some(false), "{}", res.status_message);
     }
 }
