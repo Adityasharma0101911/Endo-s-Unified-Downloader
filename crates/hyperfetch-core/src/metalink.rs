@@ -4,7 +4,7 @@ use url::Url;
 
 #[derive(Debug, Clone)]
 pub struct MetalinkFile {
-    /// Plain file name; directory parts of the metalink name are dropped.
+    /// Plain file name, valid on every OS; directory parts of the metalink name are dropped.
     pub name: String,
     pub size: Option<u64>,
     /// HTTP(S) URLs, best priority first.
@@ -14,18 +14,24 @@ pub struct MetalinkFile {
     pub hashes: Vec<(String, String)>,
 }
 
-/// Returns the last path component of a metalink file name, rejecting names that are
-/// absolute or climb out of the download directory (RFC 5854 section 4.1.2.1).
+/// Returns the last path component of a metalink file name, made valid on every OS. Rejects
+/// names that are absolute (including `C:\...`) or climb out of the download directory
+/// (RFC 5854 section 4.1.2.1).
 fn safe_file_name(name: &str) -> Result<String, String> {
-    let unsafe_name = || format!("Unsafe file name in Metalink: '{}'", name);
-    if name.starts_with(['/', '\\']) || name.contains([':', '\0']) {
+    let unsafe_name = || format!("Unsafe file name in Metalink: {:?}", name);
+    let drive = matches!(name.as_bytes(), [letter, b':', b'/' | b'\\', ..] if letter.is_ascii_alphabetic());
+    if name.starts_with(['/', '\\']) || drive {
         return Err(unsafe_name());
     }
     let parts: Vec<&str> = name.split(['/', '\\']).filter(|p| !p.is_empty() && *p != ".").collect();
     if parts.contains(&"..") {
         return Err(unsafe_name());
     }
-    parts.last().map(|p| p.to_string()).ok_or_else(unsafe_name)
+    parts
+        .last()
+        .map(|p| crate::engine::sanitize_filename(p))
+        .filter(|p| !p.is_empty())
+        .ok_or_else(unsafe_name)
 }
 
 /// Parses RFC 5854 (.meta4) and Metalink 3.0 (.metalink) XML documents.
@@ -54,7 +60,10 @@ pub fn parse_metalink(xml_content: &str) -> Result<Vec<MetalinkFile>, String> {
                     e.attributes()
                         .flatten()
                         .find(|a| a.key.local_name().as_ref().eq_ignore_ascii_case(wanted))
-                        .map(|a| String::from_utf8_lossy(&a.value).to_string())
+                        .map(|a| match a.unescape_value() {
+                            Ok(value) => value.into_owned(),
+                            Err(_) => String::from_utf8_lossy(&a.value).into_owned(),
+                        })
                 };
 
                 match name.as_str() {
@@ -219,9 +228,24 @@ mod tests {
 
         assert!(parse_metalink(r#"<metalink><file name="t.iso"><url>http://m/t.iso</url>"#).is_err());
 
-        for bad in ["../../.bashrc", "/etc/passwd", "C:\\Windows\\x.dll", "a\\..\\..\\b", ""] {
+        for bad in ["../../.bashrc", "/etc/passwd", "C:\\Windows\\x.dll", "c:/x.dll", "a\\..\\..\\b", "", "sub/..."] {
             let xml = format!(r#"<metalink><file name="{}"><url>http://m/x</url></file></metalink>"#, bad);
             assert!(parse_metalink(&xml).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn test_names_invalid_on_windows_are_cleaned_not_rejected() {
+        for (name, expected) in [
+            ("Ep 1: Pilot.mkv", "Ep 1_ Pilot.mkv"),
+            ("A: Tale.mkv", "A_ Tale.mkv"),
+            ("show/S01: &quot;Pilot&quot;?.mkv", "S01_ _Pilot__.mkv"),
+            ("x&#x85;y&#9;.bin", "x_y_.bin"),
+            ("Tom &amp; Jerry.mkv", "Tom & Jerry.mkv"),
+            ("con.txt", "_con.txt"),
+        ] {
+            let xml = format!(r#"<metalink><file name="{}"><url>http://m/x</url></file></metalink>"#, name);
+            assert_eq!(parse_metalink(&xml).unwrap()[0].name, expected, "{name:?}");
         }
     }
 }

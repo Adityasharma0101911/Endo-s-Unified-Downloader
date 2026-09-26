@@ -20,6 +20,10 @@ pub enum StorageError {
 
 /// Read size for hashing passes.
 const HASH_BUF_SIZE: usize = 4 * 1024 * 1024;
+/// Read size for whole-file hashing: enough work per block to spread BLAKE3 across every core,
+/// small enough to stay in cache between being read and being hashed (on a 4 GiB file, 8 MiB
+/// beat both 4 and 16 MiB).
+const FILE_HASH_BLOCK: usize = 8 * 1024 * 1024;
 
 /// Preallocated output file shared by all workers. Writes are positional (`pwrite` /
 /// `WriteFile` with an offset), so concurrent writers never share a cursor or a mapping.
@@ -289,40 +293,77 @@ struct Digests {
 }
 
 impl Digests {
-    /// Hashes the file at `path` without writing to it: BLAKE3 over a memory map on every core
-    /// and, at the same time on another thread, the requested SHA-256/MD5 in one buffered pass,
-    /// so it takes about as long as the slower of the two rather than their sum. Blocking.
+    /// Hashes the file at `path` without writing to it (see [`Digests::of_file`]). Blocking.
     fn of(path: &Path, sha256: bool, md5: bool) -> std::io::Result<Self> {
-        std::thread::scope(|s| {
-            let others = (sha256 || md5).then(|| s.spawn(|| sha256_md5(path, sha256, md5)));
-            let mut blake = blake3::Hasher::new();
-            let hashed = blake.update_mmap_rayon(path).map(|_| ());
-            let (sha, md) = match others {
-                Some(thread) => thread.join().map_err(|_| std::io::Error::other("hashing thread panicked"))??,
-                None => (None, None),
-            };
-            hashed?;
-            let blake3 = *blake.finalize().as_bytes();
-            Ok(Self { blake3, blake3_hex: hex::encode(&blake3), sha256: sha, md5: md })
+        let file = File::open(path)?;
+        let len = file.metadata()?.len();
+        Self::of_file(&file, len, FILE_HASH_BLOCK, sha256, md5)
+    }
+
+    /// Hashes the first `len` bytes of `file` in one sequential pass of `block`-sized reads, the
+    /// next block read on another thread while this one is hashed: BLAKE3 on every core and the
+    /// requested SHA-256/MD5 on one more thread, so the pass takes about as long as the slowest of
+    /// reading, BLAKE3 and SHA-256/MD5. A read error, or a file shorter than `len`, is an `Err`.
+    fn of_file(file: &File, len: u64, block: usize, sha256: bool, md5: bool) -> std::io::Result<Self> {
+        let mut blake = blake3::Hasher::new();
+        let mut sha = sha256.then(Sha256::new);
+        let mut md = md5.then(Md5::new);
+        read_ahead(file, len, block, |data| {
+            std::thread::scope(|s| {
+                if sha.is_some() || md.is_some() {
+                    s.spawn(|| {
+                        if let Some(h) = sha.as_mut() {
+                            h.update(data);
+                        }
+                        if let Some(h) = md.as_mut() {
+                            h.update(data);
+                        }
+                    });
+                }
+                blake.update_rayon(data);
+            })
+        })?;
+        let blake3 = *blake.finalize().as_bytes();
+        Ok(Self {
+            blake3,
+            blake3_hex: hex::encode(&blake3),
+            sha256: sha.map(|h| hex::encode(&h.finalize())),
+            md5: md.map(|h| hex::encode(&h.finalize())),
         })
     }
 }
 
-/// SHA-256 and/or MD5 of the file at `path` as lowercase hex, from one sequential read.
-fn sha256_md5(path: &Path, sha256: bool, md5: bool) -> std::io::Result<(Option<String>, Option<String>)> {
-    let file = File::open(path)?;
-    let len = file.metadata()?.len();
-    let mut sha = sha256.then(Sha256::new);
-    let mut md = md5.then(Md5::new);
-    read_blocks(&file, 0, len, |block| {
-        if let Some(h) = sha.as_mut() {
-            h.update(block);
+/// Streams `[0, len)` of `file` through `f` in `block`-sized pieces, in order, reading the next
+/// piece on another thread while `f` runs. Two buffers take turns, so at most two blocks are in
+/// memory.
+fn read_ahead(file: &File, len: u64, block: usize, mut f: impl FnMut(&[u8])) -> std::io::Result<()> {
+    // No slot: the reader hands over a block only when `f` is ready for it.
+    let (full_tx, full_rx) = std::sync::mpsc::sync_channel::<std::io::Result<Vec<u8>>>(0);
+    let (empty_tx, empty_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    std::thread::scope(|s| {
+        s.spawn(move || {
+            let mut pos = 0;
+            while pos < len {
+                let n = (len - pos).min(block as u64) as usize;
+                let mut buf = empty_rx.try_recv().unwrap_or_default();
+                buf.resize(n, 0);
+                let read = read_exact_at(file, &mut buf, pos).map(|()| buf);
+                let failed = read.is_err();
+                // A closed channel means the consumer stopped early.
+                if full_tx.send(read).is_err() || failed {
+                    return;
+                }
+                pos += n as u64;
+            }
+        });
+        // Returning early drops `full_rx`, which stops the reader; the scope then joins it.
+        for data in full_rx {
+            let data = data?;
+            f(&data);
+            let _ = empty_tx.send(data);
         }
-        if let Some(h) = md.as_mut() {
-            h.update(block);
-        }
-    })?;
-    Ok((sha.map(|h| hex::encode(&h.finalize())), md.map(|h| hex::encode(&h.finalize()))))
+        Ok(())
+    })
 }
 
 /// Streams `[offset, offset + len)` of `file` through `f` in `HASH_BUF_SIZE` blocks.
@@ -590,7 +631,7 @@ mod tests {
 
     #[test]
     fn test_parallel_hashes_equal_single_threaded_ones() {
-        // Big enough to be memory mapped and split across threads, with a partial last block.
+        // Big enough for BLAKE3 to split across threads.
         let data: Vec<u8> = (0..9 * 1024 * 1024 + 4099u32).map(|i| (i ^ (i >> 11)).wrapping_mul(31) as u8).collect();
         let temp = NamedTempFile::new().unwrap();
         std::fs::write(temp.path(), &data).unwrap();
@@ -604,9 +645,27 @@ mod tests {
         assert_eq!(hash_and_verify_file(temp.path(), Some(&blake)).unwrap(), blake);
         let err = hash_and_verify_file(temp.path(), Some(&format!("sha256:{}", "0".repeat(64)))).unwrap_err();
         assert!(matches!(&err, VerifyError::Mismatch(m) if m.contains(&sha)), "{err}");
-        // Files too small to map take the plain read path.
         std::fs::write(temp.path(), &data[..100]).unwrap();
         assert_eq!(hash_and_verify_file(temp.path(), None).unwrap(), blake3::hash(&data[..100]).to_hex().to_string());
+
+        // Many blocks, a partial last one, and buffers handed back and forth between the threads.
+        std::fs::write(temp.path(), &data).unwrap();
+        let file = File::open(temp.path()).unwrap();
+        let d = Digests::of_file(&file, data.len() as u64, 1024 * 1024 + 17, true, true).unwrap();
+        assert_eq!((d.blake3_hex, d.sha256, d.md5), (blake, Some(sha), Some(md5)));
+    }
+
+    #[test]
+    fn test_file_shorter_than_its_length_is_a_read_error_not_a_crash() {
+        // As when another program truncates the file while it is hashed (which a memory-mapped
+        // hash would answer with SIGBUS): the missing bytes are a read error.
+        let temp = NamedTempFile::new().unwrap();
+        std::fs::write(temp.path(), vec![5u8; 3 * 4096 + 1]).unwrap();
+        let file = File::open(temp.path()).unwrap();
+        for block in [4096, FILE_HASH_BLOCK] {
+            let err = Digests::of_file(&file, 8 * 4096, block, true, false).err().expect("truncated file hashed");
+            assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        }
     }
 
     #[test]

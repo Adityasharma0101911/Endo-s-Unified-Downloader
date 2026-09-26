@@ -77,8 +77,6 @@ type Failure = (FailureKind, String);
 struct Batch {
     pos: u64,
     buf: Vec<u8>,
-    /// When the oldest byte in `buf` arrived.
-    since: Instant,
 }
 
 impl Batch {
@@ -281,13 +279,23 @@ impl HttpWorker {
         });
 
         let mut stream = response.bytes_stream();
-        let mut batch = Batch { pos: start, buf: Vec::with_capacity(WRITE_BATCH), since: Instant::now() };
+        let mut batch = Batch { pos: start, buf: Vec::with_capacity(WRITE_BATCH) };
+        // Due `WRITE_INTERVAL` after the oldest byte in `batch` arrived.
+        let flush_due = tokio::time::sleep(WRITE_INTERVAL);
+        tokio::pin!(flush_due);
         let mut pending: u64 = 0;
         let mut last_report = Instant::now();
         let result = loop {
             let item = tokio::select! {
                 biased;
                 _ = s.cancel.cancelled() => break Err(cancelled()),
+                // Also while the server pauses: received bytes must not wait for the next ones.
+                _ = &mut flush_due, if !batch.buf.is_empty() => {
+                    if let Err(e) = self.flush(chunk, &mut batch).await {
+                        break Err(e);
+                    }
+                    continue;
+                }
                 item = tokio::time::timeout(s.stall_timeout, stream.next()) => item,
             };
             let bytes = match item {
@@ -322,15 +330,10 @@ impl HttpWorker {
             }
             let take = (bytes.len() as u64).min(end - received + 1) as usize;
             if batch.buf.is_empty() {
-                batch.since = Instant::now();
+                flush_due.as_mut().reset(tokio::time::Instant::now() + WRITE_INTERVAL);
             }
             batch.buf.extend_from_slice(&bytes[..take]);
             pending += take as u64;
-            if batch.since.elapsed() >= WRITE_INTERVAL {
-                if let Err(e) = self.flush(chunk, &mut batch).await {
-                    break Err(e);
-                }
-            }
 
             if pending >= 1024 * 1024 || last_report.elapsed() >= Duration::from_millis(100) {
                 self.report_progress(chunk.id, mirror_id, &mut pending, &mut last_report);
@@ -521,7 +524,7 @@ fn check_response(
 
 /// Whether a response carries the `If-Range` validator we sent: our strong ETag (always quoted),
 /// or else our Last-Modified date.
-fn carries_validator(headers: &HeaderMap, validator: &str) -> bool {
+pub(crate) fn carries_validator(headers: &HeaderMap, validator: &str) -> bool {
     let name = if validator.starts_with('"') { ETAG } else { LAST_MODIFIED };
     headers.get(name).and_then(|v| v.to_str().ok()).is_some_and(|v| v.trim() == validator)
 }
@@ -637,7 +640,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_chunk_offset_advances_only_once_a_batch_is_on_disk() {
+    async fn test_received_bytes_reach_disk_while_the_server_pauses() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         const SIZE: usize = 256 * 1024;
         let data: Vec<u8> = (0..SIZE).map(|i| (i % 251) as u8).collect();
@@ -668,9 +671,16 @@ mod tests {
         let task = tokio::spawn(async move { worker.download_chunk(&chunk, 0, url, None).await });
 
         sent_rx.await.unwrap();
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        // 64 KiB arrived, but a partial batch is neither on disk nor counted as written.
-        assert_eq!(offset.load(Ordering::SeqCst), 0);
+        // 64 KiB arrived, far less than a batch, and the server went quiet: within about
+        // WRITE_INTERVAL those bytes are on disk, and only then counted as written.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while offset.load(Ordering::SeqCst) < 64 * 1024 {
+            assert!(Instant::now() < deadline, "received bytes still only in memory");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let written = offset.load(Ordering::SeqCst) as usize;
+        assert_eq!(written, 64 * 1024);
+        assert_eq!(std::fs::read(&path).unwrap()[..written], data[..written]);
 
         go_tx.send(()).unwrap();
         task.await.unwrap().unwrap();
