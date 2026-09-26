@@ -436,36 +436,60 @@ impl DownloadEngine {
     }
 
     /// Probes all mirrors concurrently; returns the reference probe, the mirrors that serve the
-    /// same file and the reference's answer while it is still coming.
+    /// same file and the reference's answer while it is still coming. The first successful probe
+    /// (every one before it having failed) defines the file: when it takes ranges or brought the
+    /// whole file it is the reference, and the download starts without waiting for the other
+    /// probes, which come with it as `late`. Otherwise another mirror may have to lead, so every
+    /// probe is waited for.
     async fn probe_all(&self, client: &Client, urls: &[Url]) -> Result<Probed, String> {
         let (limiter, stall) = (self.limiter(), self.stall_timeout());
         let several_connections = self.options.num_connections > 1;
         let limit = self.options.max_connections_per_host;
-        // Owned values keep the future `Send` (a borrowing closure here is not general enough).
-        let probes = futures_util::stream::iter(urls.iter().cloned().enumerate())
-            .map(|(i, url)| {
-                let (client, auth, limiter) = (client.clone(), self.auth.clone(), limiter.clone());
+        // Owned, as the probes may still be out once this returns.
+        let (client, auth, owned) = (client.clone(), self.auth.clone(), urls.to_vec());
+        let mut probes: ProbeStream = futures_util::stream::iter(owned.into_iter().enumerate())
+            .map(move |(i, url)| {
+                let (client, auth, limiter) = (client.clone(), auth.clone(), limiter.clone());
                 async move {
-                    // Only the first mirror fetches the file's start: the download uses one copy.
-                    let (mut info, body) = probe_url(&client, auth.as_deref(), &url, i == 0, limit).await?;
-                    let live = match body {
-                        Some(body) => take_start(&mut info, body, several_connections, limiter.as_deref(), stall).await,
-                        None => None,
+                    let probe = async {
+                        // Only the first mirror fetches the file's start: the download uses one copy.
+                        let (mut info, body) = probe_url(&client, auth.as_deref(), &url, i == 0, limit).await?;
+                        let live = match body {
+                            Some(body) => take_start(&mut info, body, several_connections, limiter.as_deref(), stall).await,
+                            None => None,
+                        };
+                        Ok((info, live))
                     };
-                    Ok::<_, String>((info, live))
+                    (i, probe.await)
                 }
             })
-            .buffered(PROBE_CONCURRENCY)
-            .collect::<Vec<_>>();
-        let probes = tokio::select! {
-            biased;
-            _ = self.cancel_token.cancelled() => return Err(CANCELLED.to_string()),
-            probes = probes => probes,
+            .buffer_unordered(PROBE_CONCURRENCY)
+            .boxed();
+        // Each mirror's probe, in URL order, once it is in.
+        let mut done: Vec<Option<Probe>> = urls.iter().map(|_| None).collect();
+        let starts = loop {
+            let next = tokio::select! {
+                biased;
+                _ = self.cancel_token.cancelled() => return Err(CANCELLED.to_string()),
+                next = probes.next() => next,
+            };
+            let Some((i, probe)) = next else { break false };
+            if let Some(slot) = done.get_mut(i) {
+                *slot = Some(probe);
+            }
+            let first = done.iter().find(|probe| !matches!(probe, Some(Err(_))));
+            if let Some(Some(Ok((info, _)))) = first {
+                if info.accepts_ranges || info.size == Some(info.prefetch.len() as u64) {
+                    break true;
+                }
+            }
         };
+        let late = (starts && done.iter().any(Option::is_none)).then_some(probes);
         // Only the first mirror's answer can still be coming.
         let mut live = None;
-        let probes = probes
+        let probes = done
             .into_iter()
+            .flatten()
             .map(|probe| {
                 probe.map(|(info, answer)| {
                     live = live.take().or(answer);
@@ -475,7 +499,7 @@ impl DownloadEngine {
             .collect();
         let (reference, mirrors) = select_mirrors(probes)?;
         let live = live.filter(|_| urls.first() == Some(&reference.url));
-        Ok(Probed { reference, mirrors, live })
+        Ok(Probed { reference, mirrors, live, late })
     }
 
     async fn download(
@@ -484,7 +508,7 @@ impl DownloadEngine {
         probed: Probed,
         snapshot_tx: Option<broadcast::Sender<EngineSnapshot>>,
     ) -> Result<PathBuf, String> {
-        let Probed { reference, mirrors, live } = probed;
+        let Probed { reference, mirrors, live, late } = probed;
         let started_at = unix_now();
         let base = self.output_path_for(&reference.filename);
         let mut known_urls = self.url_strings();
@@ -559,8 +583,8 @@ impl DownloadEngine {
                 .map_err(|e| format!("Failed to write {}: {}", part.display(), e))?
             }
             Some(size) if reference.accepts_ranges => {
-                self.fetch_ranges(client, size, &reference, &mirrors, live, state, &part, &state_path, &final_path, &snapshot_tx)
-                    .await?
+                let probes = Probed { reference, mirrors, live, late };
+                self.fetch_ranges(client, size, probes, state, &part, &state_path, &final_path, &snapshot_tx).await?
             }
             _ => self.fetch_stream(&client, &reference, live, &part, &final_path, &snapshot_tx).await?,
         }
@@ -570,24 +594,24 @@ impl DownloadEngine {
     /// Multi-connection download of a file whose size is known and whose server honours ranges.
     /// The reference's prefetch, the file's first bytes from the probe, counts as downloaded; it
     /// is written wherever the resumed state does not already hold those bytes. The probe's
-    /// answer, if `live`, goes on as the first chunk from where the probe stopped reading, when
-    /// those bytes are still missing. The bytes one connection carries in the time another takes
-    /// to start (the reference's `per_setup`) justify one connection each, up to the limit and
-    /// what the mirrors' hosts take at once.
+    /// answer, if still `live`, goes on as the first chunk from where the probe stopped reading,
+    /// when those bytes are still missing. The bytes one connection carries in the time another
+    /// takes to start (the reference's `per_setup`) justify one connection each, up to the limit
+    /// and what the mirrors' hosts take at once. Mirrors whose probes come in `late` join as they
+    /// do, if they serve the reference's file.
     #[allow(clippy::too_many_arguments)]
     async fn fetch_ranges(
         &self,
         client: Client,
         size: u64,
-        reference: &ProbeInfo,
-        mirrors: &[ProbeInfo],
-        live: Option<Live>,
+        probed: Probed,
         state: DownloadState,
         part: &Path,
         state_path: &Path,
         final_path: &Path,
         snapshot_tx: &Option<broadcast::Sender<EngineSnapshot>>,
     ) -> Result<(), String> {
+        let Probed { reference, mirrors, live, mut late } = probed;
         let prefetch = reference.prefetch.clone();
         let unwritten = compute_gaps(prefetch.len() as u64, &state.completed_ranges);
         let mut have = state.completed_ranges.clone();
@@ -598,7 +622,8 @@ impl DownloadEngine {
             .per_setup
             .map_or(BYTES_PER_CONNECTION, |bytes| bytes.clamp(MIN_BYTES_PER_CONNECTION, BYTES_PER_CONNECTION));
         let remaining: u64 = compute_gaps(size, &have).iter().map(ByteRange::len).sum();
-        let room = host_room(mirrors, self.options.max_connections_per_host);
+        // Mirrors still to come may bring hosts with room of their own.
+        let room = if late.is_some() { usize::MAX } else { host_room(&mirrors, self.options.max_connections_per_host) };
         let max_workers = self.options.num_connections.clamp(1, MAX_CONNECTIONS).min(room).max(1) as u64;
         let num_workers = remaining.div_ceil(per_connection).clamp(1, max_workers) as usize;
         let chunk_size = effective_chunk_size(remaining, num_workers as u64, self.options.base_chunk_size);
@@ -613,7 +638,7 @@ impl DownloadEngine {
             _ => None,
         };
 
-        let racer = build_racer(mirrors);
+        let racer = build_racer(&mirrors);
 
         let writer = {
             let part = part.to_path_buf();
@@ -627,7 +652,7 @@ impl DownloadEngine {
             .await?
             .map_err(|e| e.to_string())?
         };
-        let job = RangeJob {
+        let mut job = RangeJob {
             chunks: Arc::new(Mutex::new(manager)),
             mirrors: Arc::new(Mutex::new(racer)),
             writer,
@@ -676,6 +701,10 @@ impl DownloadEngine {
             tokio::select! {
                 biased;
                 _ = self.cancel_token.cancelled() => break Err(CANCELLED.to_string()),
+                probe = next_late(&mut late) => match probe {
+                    Some((_, probe)) => job.admit(probe.map(|(info, _)| info), &reference),
+                    None => late = None,
+                },
                 event = events.recv() => match event {
                     Some(event) => {
                         if let Err(e) = job.handle(event) {
@@ -701,7 +730,8 @@ impl DownloadEngine {
         // once all have exited no write is in flight. They are not aborted: an aborted worker
         // would leave its blocking write running on its own.
         stop.cancel();
-        drop(events);
+        // Probes still out are given up, and the host slots they hold with them.
+        drop((events, late));
         while workers.join_next().await.is_some() {}
 
         match outcome {
@@ -1114,6 +1144,28 @@ impl RangeJob {
         }
     }
 
+    /// Adds the mirror a probe that came in after the download started found, if it serves the
+    /// file `reference` describes, and keeps its URL for a resume.
+    fn admit(&mut self, probe: Result<ProbeInfo, String>, reference: &ProbeInfo) {
+        let info = match probe {
+            Ok(info) => info,
+            Err(e) => {
+                tracing::warn!("Mirror probe failed: {}", e);
+                return;
+            }
+        };
+        if let Some(reason) = mismatch(&info, reference) {
+            tracing::warn!("Dropping mirror {}: {}", info.url, reason);
+            return;
+        }
+        tracing::info!("Mirror {} joins the download", info.url);
+        add_mirror(&mut self.mirrors.lock(), &info);
+        let url = info.url.to_string();
+        if !self.state.mirrors.contains(&url) {
+            self.state.mirrors.push(url);
+        }
+    }
+
     fn snapshot(&self, size: u64, meter: &mut SpeedMeter, target: &Path) -> EngineSnapshot {
         let (downloaded, chunks) = {
             let m = self.chunks.lock();
@@ -1271,6 +1323,12 @@ enum Live {
     Stream { response: Response, slot: HostSlot },
 }
 
+/// A probe's outcome: what it found, and the answer still coming when it is the first mirror's.
+type Probe = Result<(ProbeInfo, Option<Live>), String>;
+
+/// Probes as they come in, each with its mirror's place among the URLs probed.
+type ProbeStream = futures_util::stream::BoxStream<'static, (usize, Probe)>;
+
 /// What the probes found, for the download.
 struct Probed {
     /// The mirror whose answers the download goes by.
@@ -1279,6 +1337,8 @@ struct Probed {
     mirrors: Vec<ProbeInfo>,
     /// The reference's probe answer, still coming.
     live: Option<Live>,
+    /// The probes still out when the download could start without them.
+    late: Option<ProbeStream>,
 }
 
 /// Lets `read_prefix` measure the rate from when the answer arrived.
@@ -1505,15 +1565,29 @@ pub(crate) fn opens_connection(slot: &HostSlot) -> bool {
 /// mirror starts from the answer time its probe measured, where it measured one, instead of an
 /// assumed one, so the first requests already favour near mirrors.
 fn build_racer(mirrors: &[ProbeInfo]) -> MirrorRacer {
-    let mut racer = MirrorRacer::new(mirrors.iter().map(|m| m.final_url.clone()).collect());
-    for (mirror, probe) in racer.mirrors_mut().iter_mut().zip(mirrors) {
-        mirror.fallback = (probe.final_url != probe.url).then(|| probe.url.clone());
-        mirror.if_range = probe.if_range();
-        if let Some(answer) = probe.answer_time {
-            mirror.ttfb_ewma_ms = answer.as_secs_f64() * 1000.0;
-        }
+    let mut racer = MirrorRacer::new(Vec::new());
+    for probe in mirrors {
+        add_mirror(&mut racer, probe);
     }
     racer
+}
+
+/// Adds the mirror `probe` found to `racer` (see `build_racer`).
+fn add_mirror(racer: &mut MirrorRacer, probe: &ProbeInfo) {
+    let mirror = racer.add(probe.final_url.clone());
+    mirror.fallback = (probe.final_url != probe.url).then(|| probe.url.clone());
+    mirror.if_range = probe.if_range();
+    if let Some(answer) = probe.answer_time {
+        mirror.ttfb_ewma_ms = answer.as_secs_f64() * 1000.0;
+    }
+}
+
+/// The next probe of those still out, if any are; never while none are.
+async fn next_late(late: &mut Option<ProbeStream>) -> Option<(usize, Probe)> {
+    match late {
+        Some(probes) => probes.next().await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Requests the mirrors' hosts take at once from a download under `limit` (0 for none): per host,
@@ -1731,13 +1805,6 @@ fn select_mirrors(probes: Vec<Result<ProbeInfo, String>>) -> Result<(ProbeInfo, 
         }
     }
     let first = ok.first().cloned().ok_or_else(|| format!("Failed to probe file information: {}", errors.join("; ")))?;
-    // Why mirror `m` cannot serve the download `reference` describes, if it cannot.
-    let mismatch = |m: &ProbeInfo, reference: &ProbeInfo| match (m.strong_etag(), reference.strong_etag()) {
-        _ if m.size != reference.size => Some(format!("size {:?} differs from {:?}", m.size, reference.size)),
-        (Some(a), Some(b)) if a != b => Some(format!("ETag {} differs from {}", a, b)),
-        _ if reference.accepts_ranges && !m.accepts_ranges => Some("no range support".to_string()),
-        _ => None,
-    };
     let reference = if first.accepts_ranges || first.size == Some(first.prefetch.len() as u64) {
         &first
     } else {
@@ -1758,6 +1825,16 @@ fn select_mirrors(probes: Vec<Result<ProbeInfo, String>>) -> Result<(ProbeInfo, 
         })
         .collect();
     Ok((reference, mirrors))
+}
+
+/// Why mirror `m` cannot serve the download `reference` describes, if it cannot.
+fn mismatch(m: &ProbeInfo, reference: &ProbeInfo) -> Option<String> {
+    match (m.strong_etag(), reference.strong_etag()) {
+        _ if m.size != reference.size => Some(format!("size {:?} differs from {:?}", m.size, reference.size)),
+        (Some(a), Some(b)) if a != b => Some(format!("ETag {} differs from {}", a, b)),
+        _ if reference.accepts_ranges && !m.accepts_ranges => Some("no range support".to_string()),
+        _ => None,
+    }
 }
 
 /// Where the download goes and whether it can pick up a previous partial download.

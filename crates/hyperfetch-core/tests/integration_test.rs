@@ -1931,6 +1931,67 @@ async fn test_a_busy_probe_goes_by_the_ranges_its_host_was_seen_to_take() {
 }
 
 #[tokio::test]
+async fn test_a_mirror_slow_to_answer_does_not_hold_up_the_download() {
+    let _history = setup().await;
+    let data = payload(2 * PREFETCH, 281);
+    let fast = Arc::new(Mock::new(data.clone()));
+    let mut slow = Mock::new(data.clone());
+    slow.latency = Duration::from_secs(60);
+    let slow = Arc::new(slow);
+    let fast_url = serve(Arc::clone(&fast), "late.bin").await;
+    let slow_url = serve(Arc::clone(&slow), "late.bin").await;
+    let temp = tempdir().unwrap();
+    let out = temp.path().join("late.bin");
+
+    let started = Instant::now();
+    run(&DownloadEngine::new(vec![fast_url, slow_url], options(&out, 4, 64 * KB)), None).await.expect("the first mirror serves it");
+    assert_file(&out, &data);
+    assert!(started.elapsed() < Duration::from_secs(10), "took {:?}", started.elapsed());
+}
+
+#[tokio::test]
+async fn test_a_mirror_answering_later_joins_the_download() {
+    let _history = setup().await;
+    let data = payload(4 * PREFETCH, 283);
+    // The first mirror sends ~0.8 MB/s per connection, and stops serving the file six requests
+    // in: by then the second mirror's answer, 400 ms late, has come in, and it serves the rest.
+    // The third, as late, has another file.
+    let mut first = Mock::new(data.clone());
+    first.delay_us.store(20_000, Ordering::SeqCst);
+    first.plan = |i| if i < 6 { Reply::Normal } else { Reply::Status(404, None) };
+    let mut second = Mock::new(data.clone());
+    second.latency = Duration::from_millis(400);
+    let mut other = Mock::new(payload(4 * PREFETCH + 1, 283));
+    other.latency = Duration::from_millis(400);
+    let (second, other) = (Arc::new(second), Arc::new(other));
+    let urls = vec![
+        serve(Arc::new(first), "joined.bin").await,
+        serve(Arc::clone(&second), "joined.bin").await,
+        serve(Arc::clone(&other), "joined.bin").await,
+    ];
+    let temp = tempdir().unwrap();
+    let out = temp.path().join("joined.bin");
+
+    let engine = DownloadEngine::new(urls, options(&out, 4, 256 * KB));
+    let (tx, mut rx) = broadcast::channel::<EngineSnapshot>(1024);
+    let mirrors_seen = async {
+        let mut seen = Vec::new();
+        while let Ok(snapshot) = rx.recv().await {
+            seen.push(snapshot.mirror_speeds.len());
+        }
+        seen
+    };
+    let (done, seen) = tokio::join!(run(&engine, Some(tx)), mirrors_seen);
+    done.expect("the mirror that joined serves the rest");
+
+    assert_file(&out, &data);
+    assert_eq!(seen.first(), Some(&1), "the download waited for the other mirrors' answers: {seen:?}");
+    assert_eq!(seen.iter().max(), Some(&2), "{seen:?}");
+    assert!(second.stats.gets.load(Ordering::SeqCst) > 0);
+    assert_eq!(other.stats.gets.load(Ordering::SeqCst), 0, "a mirror of another file joined");
+}
+
+#[tokio::test]
 async fn test_a_download_starts_at_the_connection_cap_its_host_was_seen_to_enforce() {
     let _history = setup().await;
     let data = payload(5 * PREFETCH, 277);
