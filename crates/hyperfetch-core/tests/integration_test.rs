@@ -1844,13 +1844,21 @@ async fn test_what_downloads_see_of_their_hosts_is_remembered() {
     let _history = setup().await;
     let data = payload(3 * PREFETCH, 263);
     // A server capping each connection (~3 MB/s), one sending a small file as fast as it can,
-    // and one ignoring ranges.
+    // one ignoring ranges, and one sending a file within the probe's range whole, as a server
+    // may however it takes ranges.
     let capped = Mock::new(data.clone());
     capped.delay_us.store(5_000, Ordering::SeqCst);
     let fast = Mock::new(data[..256 * KB].to_vec());
     let mut whole = Mock::new(data.clone());
     whole.ranges = false;
-    for (mock, ranges, is_capped) in [(capped, Some(true), Some(true)), (fast, Some(true), Some(false)), (whole, Some(false), None)] {
+    let mut small_whole = Mock::new(data[..256 * KB].to_vec());
+    small_whole.ranges = false;
+    for (mock, ranges, is_capped) in [
+        (capped, Some(true), Some(true)),
+        (fast, Some(true), Some(false)),
+        (whole, Some(false), None),
+        (small_whole, None, None),
+    ] {
         let data = mock.data.clone();
         let url = serve(Arc::new(mock), "seen.bin").await;
         let temp = tempdir().unwrap();
