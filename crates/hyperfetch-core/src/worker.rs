@@ -7,7 +7,7 @@ use reqwest::header::{
     HeaderMap, HeaderValue, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE, ETAG, IF_RANGE, LAST_MODIFIED,
     RANGE, RETRY_AFTER,
 };
-use reqwest::{Client, RequestBuilder, StatusCode};
+use reqwest::{Client, RequestBuilder, Response, StatusCode};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use url::Url;
@@ -164,8 +164,11 @@ pub struct WorkerShared {
     pub limiter: Option<Arc<RateLimiter>>,
     pub file_size: u64,
     pub min_steal: u64,
-    /// Max wait for response headers and between body reads.
+    /// Max wait for response headers.
     pub stall_timeout: Duration,
+    /// Max wait between body reads once the answer has started. Shorter than `stall_timeout`:
+    /// a retry keeps what arrived and starts at once, so a quiet connection is best replaced.
+    pub body_idle: Duration,
 }
 
 pub struct HttpWorker {
@@ -277,12 +280,21 @@ impl HttpWorker {
             mirror_id,
             ttfb: sent_at.elapsed(),
         });
+        self.receive(chunk, mirror_id, response, start).await
+    }
 
+    /// Streams the body of `response`, the chunk's bytes from `start`, into the file. The attempt
+    /// ends once `body_idle` passes without a byte: what arrived is kept for the retry.
+    async fn receive(&self, chunk: &Chunk, mirror_id: usize, response: Response, start: u64) -> Result<(), Failure> {
+        let s = &self.shared;
         let mut stream = response.bytes_stream();
         let mut batch = Batch { pos: start, buf: Vec::with_capacity(WRITE_BATCH) };
         // Due `WRITE_INTERVAL` after the oldest byte in `batch` arrived.
         let flush_due = tokio::time::sleep(WRITE_INTERVAL);
         tokio::pin!(flush_due);
+        // Due `body_idle` after the last byte arrived (or waiting on the rate limit ended).
+        let idle = tokio::time::sleep(s.body_idle);
+        tokio::pin!(idle);
         let mut pending: u64 = 0;
         let mut last_report = Instant::now();
         let result = loop {
@@ -296,18 +308,16 @@ impl HttpWorker {
                     }
                     continue;
                 }
-                item = tokio::time::timeout(s.stall_timeout, stream.next()) => item,
+                item = stream.next() => item,
+                _ = &mut idle => break Err((
+                    FailureKind::Transient,
+                    format!("stalled: no data for {:?} at offset {}", s.body_idle, batch.end()),
+                )),
             };
             let bytes = match item {
-                Err(_) => break Err((
-                    FailureKind::Transient,
-                    format!("stalled: no data for {}s at offset {}", s.stall_timeout.as_secs(), batch.end()),
-                )),
-                Ok(None) => break Ok(()),
-                Ok(Some(Err(e))) => {
-                    break Err((FailureKind::Transient, format!("read error at offset {}: {}", batch.end(), e)))
-                }
-                Ok(Some(Ok(bytes))) => bytes,
+                None => break Ok(()),
+                Some(Err(e)) => break Err((FailureKind::Transient, format!("read error at offset {}: {}", batch.end(), e))),
+                Some(Ok(bytes)) => bytes,
             };
             if let Some(limiter) = &s.limiter {
                 tokio::select! {
@@ -316,6 +326,7 @@ impl HttpWorker {
                     _ = limiter.acquire(bytes.len() as u64) => {}
                 }
             }
+            idle.as_mut().reset(tokio::time::Instant::now() + s.body_idle);
 
             if batch.buf.len() + bytes.len() > WRITE_BATCH {
                 if let Err(e) = self.flush(chunk, &mut batch).await {
@@ -635,8 +646,69 @@ mod tests {
             file_size: size,
             min_steal: size,
             stall_timeout: Duration::from_secs(10),
+            body_idle: Duration::from_secs(5),
         };
         (HttpWorker::new(0, shared), chunk, rx)
+    }
+
+    /// A 206 body that sends each `(ms, len)` step `ms` after the one before, then goes silent.
+    fn silent_after(steps: Vec<(u64, usize)>) -> Response {
+        let steps = futures_util::stream::iter(steps).then(|(ms, len)| async move {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+            Ok::<_, std::io::Error>(bytes::Bytes::from(vec![9u8; len]))
+        });
+        let body = reqwest::Body::wrap_stream(steps.chain(futures_util::stream::pending()));
+        Response::from(http::Response::new(body))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_a_body_gone_quiet_ends_the_attempt_after_the_idle_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = Url::parse("http://127.0.0.1:9/f").unwrap();
+        for (stall, idle) in [(30, 5), (3, 3)] {
+            let (mut worker, chunk, _events) = test_worker(&url, &dir.path().join(format!("{stall}.part")), 1 << 20);
+            worker.shared.stall_timeout = Duration::from_secs(stall);
+            worker.shared.body_idle = Duration::from_secs(stall).min(Duration::from_secs(5));
+            let started = tokio::time::Instant::now();
+            // A pause just under the idle timeout is fine; one as long ends the attempt.
+            let body = silent_after(vec![(0, 64 * 1024), (idle * 1000 - 100, 64 * 1024)]);
+            let err = worker.receive(&chunk, 0, body, 0).await.unwrap_err();
+
+            assert_eq!(err.0, FailureKind::Transient, "{}", err.1);
+            assert!(err.1.contains(&format!("no data for {idle}s")), "{}", err.1);
+            let waited = started.elapsed();
+            let expected = Duration::from_millis(idle * 2000 - 100);
+            assert!(waited >= expected && waited < expected + Duration::from_millis(50), "{waited:?}");
+            assert_eq!(chunk.current_offset.load(Ordering::SeqCst), 128 * 1024, "what arrived is kept");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_slow_answer_gets_the_full_stall_timeout() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        const SIZE: usize = 64 * 1024;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!("http://{}/f", listener.local_addr().unwrap())).unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut head = [0u8; 4096];
+            let _ = socket.read(&mut head).await.unwrap();
+            // Headers come well after the body idle timeout, within the stall timeout.
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            let header = format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-{}/{}\r\nContent-Length: {}\r\n\r\n",
+                SIZE - 1, SIZE, SIZE
+            );
+            socket.write_all(header.as_bytes()).await.unwrap();
+            socket.write_all(&[5u8; SIZE]).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut worker, chunk, _events) = test_worker(&url, &dir.path().join("f.part"), SIZE as u64);
+        worker.shared.stall_timeout = Duration::from_secs(10);
+        worker.shared.body_idle = Duration::from_millis(100);
+        worker.download_chunk(&chunk, 0, url, None).await.unwrap();
+        assert_eq!(chunk.current_offset.load(Ordering::SeqCst), SIZE as u64);
     }
 
     #[tokio::test]

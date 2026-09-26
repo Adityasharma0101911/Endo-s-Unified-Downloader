@@ -32,6 +32,9 @@ use crate::worker::{
 
 const CANCELLED: &str = "Download cancelled by user";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Longest a range worker waits between body reads (the stall timeout, if shorter): its retry
+/// keeps what arrived and starts at once, so a connection gone quiet is best replaced soon.
+const BODY_IDLE: Duration = Duration::from_secs(5);
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Bound on one mirror's whole probe: HEAD, the ranged GET's tries and the pauses between them.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -640,6 +643,7 @@ impl DownloadEngine {
             file_size: size,
             min_steal,
             stall_timeout: self.stall_timeout(),
+            body_idle: self.stall_timeout().min(BODY_IDLE),
         };
         let mut workers = JoinSet::new();
         for worker_id in 0..num_workers {
