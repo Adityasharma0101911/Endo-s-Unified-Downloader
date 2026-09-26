@@ -8,7 +8,8 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use parking_lot::Mutex;
 use reqwest::header::{
-    HeaderMap, HeaderName, ACCEPT_ENCODING, CONTENT_DISPOSITION, CONTENT_RANGE, ETAG, LAST_MODIFIED, RANGE,
+    HeaderMap, HeaderName, ACCEPT_ENCODING, ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_RANGE, ETAG, LAST_MODIFIED,
+    RANGE,
 };
 use reqwest::{Client, Response, StatusCode};
 use tokio::io::AsyncWriteExt;
@@ -1102,8 +1103,9 @@ impl ProbeInfo {
 /// Learns size, range support, name and validators. HEAD is only a hint: servers and proxies
 /// advertise ranges (and sizes) their GETs do not honour, so a ranged GET always decides range
 /// support and size, and supplies the name and validators wherever it has them. HEAD and GET go
-/// out together, so probing takes one round trip. A GET still busy or failing after its tries is
-/// an error: it tells nothing about range support.
+/// out together, so probing takes one round trip. A GET still busy or failing after its tries
+/// tells nothing, so HEAD's word is taken then (ranges included) and the download itself waits
+/// out the busy server; only without HEAD is it an error.
 ///
 /// With `prefetch` the GET asks for the first `PREFETCH` bytes instead of one, and its response
 /// comes back too, with how many body bytes to keep, when that body is the start of the file (or
@@ -1159,25 +1161,28 @@ async fn probe_url(
         ranged = &mut ranged => (tokio::time::timeout(HEAD_GRACE, head).await.ok().flatten(), ranged),
     };
     let head_len = head.as_ref().and_then(|r| content_length(r.headers()));
+    // Still busy or unreachable after every try: that says nothing about range support.
+    let unanswered = ranged.as_ref().map_or(true, |resp| is_busy(resp.status()));
 
-    let get = match ranged {
-        Ok(resp) if matches!(
+    let get = match (ranged, &head) {
+        (Ok(resp), _) if matches!(
             resp.status(),
             StatusCode::PARTIAL_CONTENT | StatusCode::OK | StatusCode::RANGE_NOT_SATISFIABLE
         ) => resp,
-        // Still busy or unreachable after every try, which says nothing about range support:
-        // taking it for "no ranges" would demote the download to one stream that cannot resume.
-        Ok(resp) if is_busy(resp.status()) => return Err(format!("{}: server busy (HTTP {})", url, resp.status())),
-        Err(e) => return Err(format!("{}: {}", url, e)),
-        // The server refused the range request: go by HEAD, with a single stream.
-        _ if head.is_some() => {
-            let head: Vec<&Response> = head.iter().collect();
-            let mut info = ProbeInfo::describe(url, &head);
+        // Go by HEAD. A refused range request means a single stream. An unanswered one is no
+        // reason to demote the download to one stream that cannot resume, so HEAD's Accept-Ranges
+        // decides, and the download retries the busy server as Retry-After and max_retries allow.
+        // A HEAD Content-Length of 0 is common for dynamic content: it is no size.
+        (_, Some(head)) => {
+            let mut info = ProbeInfo::describe(url, &[head]);
             info.size = head_len.filter(|&n| n > 0);
+            info.accepts_ranges = unanswered && info.size.is_some() && accepts_bytes(head.headers());
             return Ok((info, None));
         }
+        (Ok(resp), None) if unanswered => return Err(format!("{}: server busy (HTTP {})", url, resp.status())),
+        (Err(e), None) => return Err(format!("{}: {}", url, e)),
         // Some servers reject HEAD and any Range header: a plain GET is the last resort.
-        Ok(_) => {
+        (Ok(_), None) => {
             let plain = authorize(client.get(url.clone()), auth, url)
                 .header(ACCEPT_ENCODING, "identity")
                 .send()
@@ -1238,6 +1243,16 @@ fn is_busy(status: StatusCode) -> bool {
     )
 }
 
+/// Whether `Accept-Ranges` lists the `bytes` unit.
+fn accepts_bytes(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(ACCEPT_RANGES)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|unit| unit.trim().eq_ignore_ascii_case("bytes"))
+}
+
 /// Reads up to `len` bytes of a probe's body, waiting at most `stall` for each read and never
 /// past `deadline`. Whatever arrived is kept, even if the body ends early.
 async fn read_prefix(
@@ -1264,7 +1279,10 @@ async fn read_prefix(
     kept.into()
 }
 
-/// Picks the first successful probe as the reference and keeps the mirrors that serve the same file.
+/// Picks the reference probe and keeps the mirrors that serve the same file. The first successful
+/// probe defines the file; a mirror serving it that takes ranges is the reference if that one does
+/// not, since only ranges resume a partial download or split the work, unless the first probe
+/// brought the whole file.
 fn select_mirrors(probes: Vec<Result<ProbeInfo, String>>) -> Result<(ProbeInfo, Vec<ProbeInfo>), String> {
     let mut ok = Vec::new();
     let mut errors = Vec::new();
@@ -1277,20 +1295,25 @@ fn select_mirrors(probes: Vec<Result<ProbeInfo, String>>) -> Result<(ProbeInfo, 
             }
         }
     }
-    let reference = ok
-        .first()
-        .cloned()
-        .ok_or_else(|| format!("Failed to probe file information: {}", errors.join("; ")))?;
+    let first = ok.first().ok_or_else(|| format!("Failed to probe file information: {}", errors.join("; ")))?;
+    // Why mirror `m` cannot serve the download `reference` describes, if it cannot.
+    let mismatch = |m: &ProbeInfo, reference: &ProbeInfo| match (m.strong_etag(), reference.strong_etag()) {
+        _ if m.size != reference.size => Some(format!("size {:?} differs from {:?}", m.size, reference.size)),
+        (Some(a), Some(b)) if a != b => Some(format!("ETag {} differs from {}", a, b)),
+        _ if reference.accepts_ranges && !m.accepts_ranges => Some("no range support".to_string()),
+        _ => None,
+    };
+    let reference = if first.accepts_ranges || first.size == Some(first.prefetch.len() as u64) {
+        first
+    } else {
+        ok.iter().find(|m| m.accepts_ranges && mismatch(m, first).is_none()).unwrap_or(first)
+    }
+    .clone();
 
     let mirrors = ok
         .into_iter()
         .filter(|m| {
-            let mismatch = match (m.strong_etag(), reference.strong_etag()) {
-                _ if m.size != reference.size => Some(format!("size {:?} differs from {:?}", m.size, reference.size)),
-                (Some(a), Some(b)) if a != b => Some(format!("ETag {} differs from {}", a, b)),
-                _ if reference.accepts_ranges && !m.accepts_ranges => Some("no range support".to_string()),
-                _ => None,
-            };
+            let mismatch = mismatch(m, &reference);
             if let Some(reason) = &mismatch {
                 tracing::warn!("Dropping mirror {}: {}", m.url, reason);
             }
@@ -1433,8 +1456,8 @@ pub fn discard_partial(final_path: &Path) -> Result<usize, String> {
 /// Chooses the output path. Walks `name`, `name (1)`, `name (2)`... and takes the first one that
 /// is already this exact file, or that it can claim and that holds our resumable (or stale)
 /// `.part` or is free. Existing files, claimed names and other downloads' `.part` files are never
-/// touched. Our `.part` holding progress the server cannot resume right now fails the plan and
-/// is kept.
+/// touched. Our `.part` holding progress that no mirror can resume right now (`remote` takes ranges
+/// if any mirror serving the file does) fails the plan and is kept.
 fn plan_target(
     base: &Path,
     remote: &ProbeInfo,
@@ -1798,28 +1821,42 @@ fn percent_decode(input: &str) -> Vec<u8> {
     out
 }
 
-/// Makes an untrusted name safe as a single path component on every OS, at most
-/// `MAX_NAME_BYTES` long. Empty when nothing usable is left.
-pub(crate) fn sanitize_filename(name: &str) -> String {
-    let cleaned: String = name
-        .chars()
+/// Makes a server-provided name safe as a single path component on every OS, at most
+/// `MAX_NAME_BYTES` long. Leading dots go too, so a download is never hidden. Empty when nothing
+/// usable is left.
+fn sanitize_filename(name: &str) -> String {
+    finish_name(replace_invalid_chars(name).trim().trim_matches('.').trim())
+}
+
+/// Makes a name from a torrent or metalink safe as a single path component on every OS, at most
+/// `MAX_NAME_BYTES` long. Unlike a server's file name it keeps leading dots (`.gitignore`,
+/// `.config`): only the trailing dots and spaces Windows drops go. Empty when nothing usable is
+/// left.
+pub(crate) fn sanitize_component(name: &str) -> String {
+    finish_name(replace_invalid_chars(name).trim_end_matches(['.', ' ']))
+}
+
+/// Replaces control characters and the characters Windows forbids in names with '_'.
+fn replace_invalid_chars(name: &str) -> String {
+    name.chars()
         .map(|c| match c {
             '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
             c if c.is_control() => '_',
             c => c,
         })
-        .collect();
+        .collect()
+}
 
-    let trimmed = cleaned.trim().trim_matches('.').trim().to_string();
-    let stem = trimmed.split('.').next().unwrap_or_default().to_ascii_uppercase();
+/// Prefixes names Windows reserves for devices with '_' and caps the length.
+fn finish_name(name: &str) -> String {
+    let stem = name.split('.').next().unwrap_or_default().to_ascii_uppercase();
     let is_reserved = matches!(
         stem.as_str(),
         "CON" | "PRN" | "AUX" | "NUL"
             | "COM1" | "COM2" | "COM3" | "COM4" | "COM5" | "COM6" | "COM7" | "COM8" | "COM9"
             | "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9"
     );
-    let safe = if is_reserved { format!("_{}", trimmed) } else { trimmed };
-    truncate_name(safe)
+    truncate_name(if is_reserved { format!("_{}", name) } else { name.to_string() })
 }
 
 /// Cuts `name` to at most `MAX_NAME_BYTES` on a character boundary, keeping a short extension.
@@ -1961,6 +1998,10 @@ mod tests {
         headers.insert(CONTENT_DISPOSITION, HeaderValue::from_static("attachment; filename=\"..\""));
         assert_eq!(extract_filename([&headers], &url), "final name.iso");
         assert_eq!(sanitize_filename("con.txt"), "_con.txt");
+        // A server's name never hides the download; a torrent's or metalink's dotfile keeps its name.
+        assert_eq!(sanitize_filename(".bashrc"), "bashrc");
+        assert_eq!(sanitize_component(".bashrc"), ".bashrc");
+        assert_eq!(sanitize_component(" a: b. . "), " a_ b");
         // C0 and C1 control characters alike (NEL, DEL and CSI can drive terminals).
         assert_eq!(sanitize_filename("a\u{1b}b\u{7f}c\u{85}d\u{9b}.txt"), "a_b_c_d_.txt");
         assert_eq!(extract_filename([&HeaderMap::new()], &Url::parse("http://h/").unwrap()), "downloaded_file.bin");
@@ -2311,6 +2352,29 @@ mod tests {
         let hosts: Vec<_> = mirrors.iter().map(|m| m.url.host_str().unwrap().to_string()).collect();
         assert_eq!(hosts, vec!["example.com", "d.example.com"]);
         assert!(select_mirrors(vec![Err("x".into())]).unwrap_err().contains("x"));
+    }
+
+    #[test]
+    fn test_select_mirrors_prefers_a_mirror_that_takes_ranges() {
+        let mut edge = remote(1000);
+        edge.accepts_ranges = false;
+        edge.etag = None;
+        let mut bigger = remote(2000);
+        bigger.url = Url::parse("http://b.example.com/file.bin").unwrap();
+        let mut origin = remote(1000);
+        origin.url = Url::parse("http://c.example.com/file.bin").unwrap();
+
+        // The first probe defines the file; the first mirror serving it with ranges leads.
+        let probes = vec![Ok(edge.clone()), Ok(bigger.clone()), Ok(origin.clone())];
+        let (reference, mirrors) = select_mirrors(probes).unwrap();
+        assert_eq!(reference.url, origin.url);
+        let hosts: Vec<_> = mirrors.iter().map(|m| m.url.host_str().unwrap().to_string()).collect();
+        assert_eq!(hosts, vec!["c.example.com"]);
+
+        // Without such a mirror, or when the first probe brought the whole file, the first leads.
+        assert_eq!(select_mirrors(vec![Ok(edge.clone()), Ok(bigger)]).unwrap().0.url, edge.url);
+        edge.prefetch = Bytes::from(vec![0u8; 1000]);
+        assert_eq!(select_mirrors(vec![Ok(edge.clone()), Ok(origin)]).unwrap().0.url, edge.url);
     }
 
     #[test]

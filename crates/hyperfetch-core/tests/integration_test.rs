@@ -78,6 +78,8 @@ struct Mock {
     ranges: bool,
     /// HEAD advertises `Accept-Ranges: bytes` even though GETs ignore Range.
     head_claims_ranges: bool,
+    /// HEAD leaves out `Accept-Ranges`, as many servers do, even though GETs honour Range.
+    head_hides_ranges: bool,
     /// HEAD answers only `Content-Length: 0`, as many dynamic endpoints do.
     empty_head: bool,
     /// HEAD answers with this status instead.
@@ -141,6 +143,7 @@ impl Mock {
             data,
             ranges: true,
             head_claims_ranges: false,
+            head_hides_ranges: false,
             empty_head: false,
             head_status: None,
             head_delay: Duration::ZERO,
@@ -229,7 +232,13 @@ async fn handle(mut socket: TcpStream, mock: Arc<Mock>) {
         } else if mock.empty_head {
             "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
         } else {
-            let accept = if mock.head_claims_ranges && !mock.chunked { "Accept-Ranges: bytes\r\n" } else { accept };
+            let accept = if mock.head_hides_ranges {
+                ""
+            } else if mock.head_claims_ranges && !mock.chunked {
+                "Accept-Ranges: bytes\r\n"
+            } else {
+                accept
+            };
             format!("HTTP/1.1 200 OK\r\n{}{}{}Connection: close\r\n\r\n", length(total), accept, etag)
         };
         let _ = socket.write_all(resp.as_bytes()).await;
@@ -1042,43 +1051,111 @@ async fn test_busy_probe_is_retried_instead_of_losing_ranges() {
 }
 
 #[tokio::test]
-async fn test_probe_busy_on_every_try_keeps_the_progress_for_a_later_resume() {
+async fn test_probe_busy_on_every_try_never_loses_the_progress() {
     let _history = setup().await;
     let size = 2 * PREFETCH;
     let data = payload(size, 193);
-    let mut mock = Mock::new(data.clone());
-    mock.etag = Some("\"b1\"");
-    let mock = Arc::new(mock);
-    let url = serve(Arc::clone(&mock), "busy_resume.bin").await;
+    let done_len = size - 200 * KB;
+    for head_hides_ranges in [true, false] {
+        let mut mock = Mock::new(data.clone());
+        mock.etag = Some("\"b1\"");
+        mock.head_hides_ranges = head_hides_ranges;
+        // HEAD answers, but every try of the ranged probe finds the server busy: that says
+        // nothing about range support.
+        mock.busy_probes = AtomicUsize::new(100);
+        let mock = Arc::new(mock);
+        let url = serve(Arc::clone(&mock), "busy_resume.bin").await;
+        let temp = tempdir().unwrap();
+        let out = temp.path().join("busy_resume.bin");
+        let part = part_of(&out);
+
+        // A previous run got 90% of the file.
+        let mut on_disk = vec![0u8; size];
+        on_disk[..done_len].copy_from_slice(&data[..done_len]);
+        std::fs::write(&part, &on_disk).unwrap();
+        let mut state =
+            DownloadState::new("busy_resume.bin".into(), size as u64, 256 * KB as u64, vec![url.to_string()]);
+        state.etag = Some("\"b1\"".into());
+        state.completed_ranges.push(ByteRange::new(0, done_len as u64 - 1).unwrap());
+        state.save_atomic(&DownloadState::state_file_path(&part)).unwrap();
+
+        if head_hides_ranges {
+            // Nothing says the server takes ranges, so the progress cannot resume yet: it is
+            // kept, never replaced by a single stream from the start.
+            let engine = DownloadEngine::new(vec![url.clone()], options(&out, 4, 64 * KB));
+            let err = run(&engine, None).await.unwrap_err();
+            assert!(err.contains("kept"), "{err}");
+            assert_eq!(std::fs::read(&part).unwrap(), on_disk, "the progress must survive");
+            assert!(DownloadState::state_file_path(&part).exists());
+            assert_eq!(mock.stats.gets.load(Ordering::SeqCst), 0, "no single-stream fallback");
+            mock.busy_probes.store(0, Ordering::SeqCst);
+        }
+        // HEAD's Accept-Ranges, or else the recovered server, resumes the download.
+        let engine = DownloadEngine::new(vec![url], options(&out, 4, 64 * KB));
+        run(&engine, None).await.expect("the download resumes");
+        assert_file(&out, &data);
+        assert_eq!(mock.stats.body_bytes.load(Ordering::SeqCst), (size - done_len) as u64, "only the missing bytes");
+    }
+}
+
+#[tokio::test]
+async fn test_fresh_download_completes_although_every_probe_is_busy() {
+    let _history = setup().await;
+    let data = payload(PREFETCH + 512 * KB, 199);
+    // The server answers 503 to the probes' range requests but serves the file: with ranges
+    // when HEAD advertises them, else as one stream.
+    for head_hides_ranges in [false, true] {
+        let mut mock = Mock::new(data.clone());
+        mock.head_hides_ranges = head_hides_ranges;
+        mock.busy_probes = AtomicUsize::new(100);
+        let mock = Arc::new(mock);
+        let url = serve(Arc::clone(&mock), "throttled.bin").await;
+        let temp = tempdir().unwrap();
+        let out = temp.path().join("throttled.bin");
+
+        let engine = DownloadEngine::new(vec![url], options(&out, 4, 64 * KB));
+        run(&engine, None).await.expect("a busy probe must not fail a download the server serves");
+        assert_file(&out, &data);
+        assert_no_leftovers(&out);
+        if head_hides_ranges {
+            assert_eq!(mock.stats.gets.load(Ordering::SeqCst), 1, "one stream");
+        } else {
+            assert!(mock.served_ranges().len() >= 8, "HEAD's Accept-Ranges keeps the connections");
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_partial_download_resumes_from_the_mirror_that_takes_ranges() {
+    let _history = setup().await;
+    let size = 2 * PREFETCH;
+    let data = payload(size, 211);
+    // The first mirror ignores Range (a CDN edge, say); the second honours it.
+    let mut edge = Mock::new(data.clone());
+    edge.ranges = false;
+    let edge = Arc::new(edge);
+    let origin = Arc::new(Mock::new(data.clone()));
+    let edge_url = serve(Arc::clone(&edge), "mirrored.bin").await;
+    let origin_url = serve(Arc::clone(&origin), "mirrored.bin").await;
     let temp = tempdir().unwrap();
-    let out = temp.path().join("busy_resume.bin");
+    let out = temp.path().join("mirrored.bin");
     let part = part_of(&out);
 
-    // A previous run got 90% of the file.
-    let done_len = size - 200 * KB;
+    // A previous run, while the first mirror was down, got most of the file from the second.
+    let done_len = size - 300 * KB;
     let mut on_disk = vec![0u8; size];
     on_disk[..done_len].copy_from_slice(&data[..done_len]);
     std::fs::write(&part, &on_disk).unwrap();
-    let mut state = DownloadState::new("busy_resume.bin".into(), size as u64, 256 * KB as u64, vec![url.to_string()]);
-    state.etag = Some("\"b1\"".into());
+    let urls = vec![edge_url.to_string(), origin_url.to_string()];
+    let mut state = DownloadState::new("mirrored.bin".into(), size as u64, 256 * KB as u64, urls);
     state.completed_ranges.push(ByteRange::new(0, done_len as u64 - 1).unwrap());
     state.save_atomic(&DownloadState::state_file_path(&part)).unwrap();
 
-    // HEAD answers, but every try of the ranged probe finds the server busy: that says nothing
-    // about range support, so the download must neither become one stream nor drop the .part.
-    mock.busy_probes.store(100, Ordering::SeqCst);
-    let engine = DownloadEngine::new(vec![url.clone()], options(&out, 4, 64 * KB));
-    let err = run(&engine, None).await.unwrap_err();
-    assert!(err.contains("busy"), "{err}");
-    assert_eq!(std::fs::read(&part).unwrap(), on_disk, "the progress must survive");
-    assert!(DownloadState::state_file_path(&part).exists());
-    assert_eq!(mock.stats.gets.load(Ordering::SeqCst), 0, "no single-stream fallback");
-
-    mock.busy_probes.store(0, Ordering::SeqCst);
-    let engine = DownloadEngine::new(vec![url], options(&out, 4, 64 * KB));
-    run(&engine, None).await.expect("the recovered server resumes the download");
+    let engine = DownloadEngine::new(vec![edge_url, origin_url], options(&out, 4, 64 * KB));
+    run(&engine, None).await.expect("the mirror taking ranges resumes the download");
     assert_file(&out, &data);
-    assert_eq!(mock.stats.body_bytes.load(Ordering::SeqCst), (size - done_len) as u64);
+    assert_eq!(edge.stats.gets.load(Ordering::SeqCst), 0, "the first mirror only answered the probe");
+    assert_eq!(origin.stats.body_bytes.load(Ordering::SeqCst), (size - done_len) as u64, "only the missing bytes");
 }
 
 #[tokio::test]

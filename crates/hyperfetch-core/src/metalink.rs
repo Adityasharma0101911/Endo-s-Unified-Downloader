@@ -29,7 +29,7 @@ fn safe_file_name(name: &str) -> Result<String, String> {
     }
     parts
         .last()
-        .map(|p| crate::engine::sanitize_filename(p))
+        .map(|p| crate::engine::sanitize_component(p))
         .filter(|p| !p.is_empty())
         .ok_or_else(unsafe_name)
 }
@@ -243,6 +243,10 @@ mod tests {
             ("x&#x85;y&#9;.bin", "x_y_.bin"),
             ("Tom &amp; Jerry.mkv", "Tom & Jerry.mkv"),
             ("con.txt", "_con.txt"),
+            // Dotfiles keep their names; only the trailing dots and spaces Windows drops go.
+            (".htaccess", ".htaccess"),
+            (".config/settings.json", "settings.json"),
+            ("site/.gitignore. ", ".gitignore"),
         ] {
             let xml = format!(r#"<metalink><file name="{}"><url>http://m/x</url></file></metalink>"#, name);
             assert_eq!(parse_metalink(&xml).unwrap()[0].name, expected, "{name:?}");
