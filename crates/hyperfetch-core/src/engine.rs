@@ -231,7 +231,8 @@ impl DownloadEngine {
             tracing::info!("Detected HLS video stream: {}", playlist);
             let started_at = unix_now();
             let auth = self.auth.as_deref();
-            let fetch = crate::hls::FetchPolicy { stall_timeout: self.stall_timeout(), max_retries: self.options.max_retries };
+            let fetch =
+                crate::hls::FetchPolicy { stall_timeout: self.stall_timeout(), max_retries: self.options.max_retries };
             let parsed = self
                 .guarded(
                     HLS_PARSE_TIMEOUT,
