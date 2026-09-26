@@ -104,6 +104,12 @@ pub struct DownloadOptions {
     pub max_retries: u32,
     /// Seconds without receiving a byte before a connection is treated as stalled and retried.
     pub stall_timeout_secs: u64,
+    /// Wait for the finished file to reach the disk before reporting it done. Off, the OS writes
+    /// it out on its own schedule, as curl, wget and browsers leave it; the flushes that keep
+    /// resume state consistent during the download happen either way.
+    pub fsync_on_complete: bool,
+    /// Connections all downloads in this process may hold to one host at once (0 = no limit).
+    pub max_connections_per_host: usize,
 }
 
 impl Default for DownloadOptions {
@@ -122,6 +128,28 @@ impl Default for DownloadOptions {
             max_speed: None,
             max_retries: 8,
             stall_timeout_secs: 30,
+            fsync_on_complete: false,
+            max_connections_per_host: 32,
+        }
+    }
+}
+
+/// Everything `build_client` depends on: downloads whose options have equal keys can share one
+/// client, and with it open connections and TLS sessions.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ClientKey {
+    /// Credentials change the redirect policy (no HTTPS to HTTP downgrade).
+    credentials: bool,
+    proxy: Option<String>,
+    cookies_path: Option<PathBuf>,
+}
+
+impl ClientKey {
+    pub fn of(options: &DownloadOptions) -> Self {
+        Self {
+            credentials: options.auth_header.is_some(),
+            proxy: options.proxy.clone(),
+            cookies_path: options.cookies_path.clone(),
         }
     }
 }
@@ -141,10 +169,22 @@ pub struct DownloadEngine {
 
 impl DownloadEngine {
     pub fn new(urls: Vec<Url>, options: DownloadOptions) -> Self {
+        let client = build_client(&options);
+        Self::with_client_result(urls, options, client)
+    }
+
+    /// Like `new`, but downloads through `client`, which must come from `build_client` with options
+    /// of the same `ClientKey`: a batch or queue shares one client so later downloads reuse its
+    /// connections. Credentials are still added per request, only for the hosts in `urls`.
+    pub fn with_client(urls: Vec<Url>, options: DownloadOptions, client: Client) -> Self {
+        Self::with_client_result(urls, options, Ok(client))
+    }
+
+    fn with_client_result(urls: Vec<Url>, options: DownloadOptions, client: Result<Client, String>) -> Self {
         let auth = options.auth_header.as_deref().map(|value| Auth::new(value, &urls));
         let client = match &auth {
             Some(Err(e)) => Err(e.clone()),
-            _ => build_client(&options),
+            _ => client,
         };
         Self {
             options,
@@ -948,7 +988,8 @@ async fn claim_hls_output(
 
 /// The user's Authorization header is deliberately not a default header here: it is added per
 /// request, only for the hosts the user named (see [`Auth`]).
-fn build_client(options: &DownloadOptions) -> Result<Client, String> {
+/// The HTTP client for downloads with these options; see `ClientKey` for what it depends on.
+pub fn build_client(options: &DownloadOptions) -> Result<Client, String> {
     let headers = crate::resolver::SmartResolver::default_anti_qos_headers();
 
     let mut builder = Client::builder()
@@ -2192,6 +2233,20 @@ mod tests {
         assert_eq!(to_user.headers()[reqwest::header::AUTHORIZATION], "Bearer secret");
         let to_other = authorize(client.get(third_party.clone()), auth, &third_party).build().unwrap();
         assert!(!to_other.headers().contains_key(reqwest::header::AUTHORIZATION));
+    }
+
+    #[test]
+    fn test_client_key_covers_what_the_client_is_built_from() {
+        let base = DownloadOptions::default();
+        let same = DownloadOptions { num_connections: 3, max_speed: Some(1), ..DownloadOptions::default() };
+        assert_eq!(ClientKey::of(&base), ClientKey::of(&same));
+        for other in [
+            DownloadOptions { auth_header: Some("Bearer x".into()), ..DownloadOptions::default() },
+            DownloadOptions { proxy: Some("http://p:8080".into()), ..DownloadOptions::default() },
+            DownloadOptions { cookies_path: Some("c.txt".into()), ..DownloadOptions::default() },
+        ] {
+            assert_ne!(ClientKey::of(&base), ClientKey::of(&other));
+        }
     }
 
     /// A body that sends each `(ms, bytes)` step `ms` after the one before.
