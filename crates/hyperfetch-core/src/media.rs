@@ -916,90 +916,52 @@ fn version_at_least(version: &str, min: (u32, u32, u32)) -> bool {
     version_parts(version).is_some_and(|p| (p[0], p[1], p[2]) >= min)
 }
 
-/// Browser cookies, read from the browser once per process. yt-dlp takes 0.2-0.5 s to read them
-/// (it copies and decrypts the browser's cookie database), so the first run that reads a browser
-/// also saves what it read: given `--cookies <file>` next to `--cookies-from-browser`, yt-dlp writes
-/// its whole cookie jar to that file when it exits. Later runs get the jar through `--cookies`.
-/// Cookies the browser changes after that reach yt-dlp at the next start.
-///
-/// The jar is kept in memory. It is on disk only while a yt-dlp run uses it, as a file of that run
-/// (see [`CookieRun`]) in a per-user folder: under %LOCALAPPDATA%, which only the user may open, or
-/// made private to the user elsewhere.
-struct BrowserCookies {
-    /// `None` without a per-user directory: every run then reads the browser.
+/// Per-user folder for files that hold secrets while a yt-dlp run reads them: cookie jars (see
+/// [`BrowserCookies`]) and what an extraction found, its cookies included (see [`download_with`]).
+/// It is under %LOCALAPPDATA%, which only the user may open, or made private to the user
+/// elsewhere. A file exists only while its run uses it; what a crashed process left is deleted by
+/// the next media download, of this process or a later one.
+struct PrivateDir {
+    /// `None` without a per-user directory.
     dir: Option<PathBuf>,
     /// Whether `dir` is ready, cleared of what crashed processes left there.
     ready: tokio::sync::OnceCell<bool>,
-    jars: parking_lot::Mutex<HashMap<&'static str, Jar>>,
 }
 
-enum Jar {
-    /// A run reads the browser and saves the jar.
-    Saving,
-    Saved(Arc<str>),
-}
-
-static BROWSER_COOKIES: LazyLock<BrowserCookies> =
-    LazyLock::new(|| BrowserCookies::new(app_data_dir().map(|dir| dir.join("cookies"))));
-
-impl BrowserCookies {
+impl PrivateDir {
     fn new(dir: Option<PathBuf>) -> Self {
-        Self { dir, ready: tokio::sync::OnceCell::new(), jars: parking_lot::Mutex::new(HashMap::new()) }
+        Self { dir, ready: tokio::sync::OnceCell::new() }
     }
 
-    /// The cookie arguments of one yt-dlp run with `source`.
-    async fn for_run(&self, source: &BrowserCookieSource) -> CookieRun<'_> {
-        let mut run = CookieRun { cookies: self, args: source.to_args(), file: None, saving: None };
-        let (Some(browser), Some(dir)) = (source.browser(), &self.dir) else {
-            return run;
-        };
+    /// The folder, prepared the first time (see [`prepare_private_dir`]).
+    async fn get(&self) -> Option<&Path> {
+        let dir = self.dir.as_deref()?;
         let ready = self.ready.get_or_init(|| async {
-            let dir = dir.clone();
-            let prepared = tokio::task::spawn_blocking(move || prepare_cookie_dir(&dir)).await;
+            let dir = dir.to_path_buf();
+            let prepared = tokio::task::spawn_blocking(move || prepare_private_dir(&dir)).await;
             match prepared.map_err(|e| e.to_string()).and_then(|r| r.map_err(|e| e.to_string())) {
                 Ok(()) => true,
                 Err(e) => {
-                    tracing::warn!("Browser cookies will be read for every download: {e}");
+                    tracing::warn!("No private folder for yt-dlp's cookies and extractions: {e}");
                     false
                 }
             }
         });
-        if !*ready.await {
-            return run;
-        }
-        let saved = match self.jars.lock().entry(browser) {
-            Entry::Occupied(jar) => match jar.get() {
-                Jar::Saved(jar) => Some(Arc::clone(jar)),
-                // Another run reads the browser right now.
-                Jar::Saving => return run,
-            },
-            Entry::Vacant(jar) => {
-                jar.insert(Jar::Saving);
-                run.saving = Some(browser);
-                None
-            }
-        };
-        let dir = dir.clone();
-        let file = tokio::task::spawn_blocking(move || cookie_file(&dir, saved.as_deref())).await;
-        match file.map_err(|e| e.to_string()).and_then(|r| r) {
-            Ok((path, claim)) => {
-                let file_args = ["--cookies".to_string(), path.to_string_lossy().into_owned()];
-                if run.saving.is_some() {
-                    run.args.extend(file_args);
-                } else {
-                    run.args = file_args.to_vec();
-                }
-                run.file = Some((path, claim));
-            }
-            Err(e) => tracing::warn!("Could not keep the browser cookies for later downloads: {e}"),
-        }
-        run
+        ready.await.then_some(dir)
+    }
+
+    /// A new file for one run, holding `contents`, or not created yet, for yt-dlp to write.
+    async fn file(&self, contents: Option<Vec<u8>>, ext: &'static str) -> Result<PrivateFile, String> {
+        let dir = self.get().await.ok_or("No private folder")?.to_path_buf();
+        tokio::task::spawn_blocking(move || private_file(&dir, contents.as_deref(), ext))
+            .await
+            .map_err(|e| format!("Background task failed: {e}"))?
     }
 }
 
-/// Creates the cookie folder, private to the user, and deletes the files of runs no process holds
-/// any more (it crashed or was killed). Blocking.
-fn prepare_cookie_dir(dir: &Path) -> std::io::Result<()> {
+/// Creates the private folder and deletes the files of runs no process holds any more (it
+/// crashed or was killed). Blocking.
+fn prepare_private_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -1019,32 +981,108 @@ fn prepare_cookie_dir(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// A new file in `dir` for one run, claimed: holding `jar`, readable by the user only, or not
-/// created yet, for yt-dlp to save the jar in. Blocking.
-fn cookie_file(dir: &Path, jar: Option<&str>) -> Result<(PathBuf, crate::engine::TargetClaim), String> {
+/// A new file `<unique>.<ext>` in `dir`, claimed, readable by the user only: holding `contents`,
+/// or not created yet. Blocking.
+fn private_file(dir: &Path, contents: Option<&[u8]>, ext: &str) -> Result<PrivateFile, String> {
     use std::io::Write;
-    let path = dir.join(format!("{}.txt", unique_suffix()));
+    let path = dir.join(format!("{}.{ext}", unique_suffix()));
     let claim = crate::engine::claim_target(&path)?.ok_or_else(|| format!("{} is in use", path.display()))?;
-    if let Some(jar) = jar {
+    if let Some(contents) = contents {
         let mut file = std::fs::OpenOptions::new();
         file.write(true).create_new(true);
         #[cfg(unix)]
         std::os::unix::fs::OpenOptionsExt::mode(&mut file, 0o600);
-        if let Err(e) = file.open(&path).and_then(|mut f| f.write_all(jar.as_bytes())) {
+        if let Err(e) = file.open(&path).and_then(|mut f| f.write_all(contents)) {
             let _ = std::fs::remove_file(&path);
             return Err(format!("Failed to write {}: {e}", path.display()));
         }
     }
-    Ok((path, claim))
+    Ok(PrivateFile { path, _claim: claim })
+}
+
+/// A file in the [`PrivateDir`], deleted on drop. Claimed for as long as it exists, which tells
+/// other processes (see [`prepare_private_dir`]) that it is in use.
+struct PrivateFile {
+    path: PathBuf,
+    _claim: crate::engine::TargetClaim,
+}
+
+impl Drop for PrivateFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Browser cookies, read from the browser once per process. yt-dlp takes 0.2-0.5 s to read them
+/// (it copies and decrypts the browser's cookie database), so the first run that reads a browser
+/// also saves what it read: given `--cookies <file>` next to `--cookies-from-browser`, yt-dlp writes
+/// its whole cookie jar to that file when it exits. Later runs get the jar through `--cookies`.
+/// Cookies the browser changes after that reach yt-dlp at the next start.
+///
+/// The jar is kept in memory. It is on disk only while a yt-dlp run uses it, as a file of that run
+/// in the [`PrivateDir`].
+struct BrowserCookies {
+    files: PrivateDir,
+    jars: parking_lot::Mutex<HashMap<&'static str, Jar>>,
+}
+
+enum Jar {
+    /// A run reads the browser and saves the jar.
+    Saving,
+    Saved(Arc<str>),
+}
+
+static BROWSER_COOKIES: LazyLock<BrowserCookies> =
+    LazyLock::new(|| BrowserCookies::new(app_data_dir().map(|dir| dir.join("cookies"))));
+
+impl BrowserCookies {
+    /// Cookies whose files go to `dir` (see [`PrivateDir`]).
+    fn new(dir: Option<PathBuf>) -> Self {
+        Self { files: PrivateDir::new(dir), jars: parking_lot::Mutex::new(HashMap::new()) }
+    }
+
+    /// The cookie arguments of one yt-dlp run with `source`.
+    async fn for_run(&self, source: &BrowserCookieSource) -> CookieRun<'_> {
+        let mut run = CookieRun { cookies: self, args: source.to_args(), file: None, saving: None };
+        let Some(browser) = source.browser() else {
+            return run;
+        };
+        if self.files.get().await.is_none() {
+            return run;
+        }
+        let saved = match self.jars.lock().entry(browser) {
+            Entry::Occupied(jar) => match jar.get() {
+                Jar::Saved(jar) => Some(Arc::clone(jar)),
+                // Another run reads the browser right now.
+                Jar::Saving => return run,
+            },
+            Entry::Vacant(jar) => {
+                jar.insert(Jar::Saving);
+                run.saving = Some(browser);
+                None
+            }
+        };
+        match self.files.file(saved.map(|jar| jar.as_bytes().to_vec()), "txt").await {
+            Ok(file) => {
+                let file_args = ["--cookies".to_string(), file.path.to_string_lossy().into_owned()];
+                if run.saving.is_some() {
+                    run.args.extend(file_args);
+                } else {
+                    run.args = file_args.to_vec();
+                }
+                run.file = Some(file);
+            }
+            Err(e) => tracing::warn!("Could not keep the browser cookies for later downloads: {e}"),
+        }
+        run
+    }
 }
 
 /// The cookie arguments of one yt-dlp run, and the file they name.
 struct CookieRun<'a> {
     cookies: &'a BrowserCookies,
     args: Vec<String>,
-    /// The run's file, deleted on drop. Claimed for as long as it exists, which tells other
-    /// processes (see [`prepare_cookie_dir`]) that it is in use.
-    file: Option<(PathBuf, crate::engine::TargetClaim)>,
+    file: Option<PrivateFile>,
     /// The browser whose cookies the run saves into `file`.
     saving: Option<&'static str>,
 }
@@ -1053,11 +1091,11 @@ impl CookieRun<'_> {
     /// Keeps the jar yt-dlp saved, if the run was to save one. Only for a yt-dlp that exited by
     /// itself: one that was killed may have written half a jar.
     async fn finish(mut self) {
-        let (Some(browser), Some((path, _))) = (self.saving, &self.file) else {
+        let (Some(browser), Some(file)) = (self.saving, &self.file) else {
             return;
         };
         // yt-dlp starts the file with this header, even when it read no cookies.
-        let jar = tokio::fs::read_to_string(path).await.ok().filter(|jar| jar.starts_with("# Netscape HTTP Cookie File"));
+        let jar = tokio::fs::read_to_string(&file.path).await.ok().filter(|jar| jar.starts_with("# Netscape HTTP Cookie File"));
         if let Some(jar) = jar {
             self.cookies.jars.lock().insert(browser, Jar::Saved(jar.into()));
             self.saving = None;
@@ -1070,9 +1108,6 @@ impl Drop for CookieRun<'_> {
         // Nothing saved: the next run reads the browser again.
         if let Some(browser) = self.saving {
             self.cookies.jars.lock().remove(browser);
-        }
-        if let Some((path, _claim)) = self.file.take() {
-            let _ = std::fs::remove_file(path);
         }
     }
 }
@@ -1087,11 +1122,19 @@ enum RunKind {
     Download,
 }
 
+/// What a yt-dlp run works on.
+#[derive(Debug, Clone, Copy)]
+enum Source<'a> {
+    Url(&'a Url),
+    /// What an extraction found (its `-J` output), downloaded as it is (`--load-info-json`).
+    Info(&'a Path),
+}
+
 /// yt-dlp arguments for one run. Paths in `options` must be absolute: yt-dlp runs in
 /// [`ytdlp_work_dir`]. The cookie arguments come from [`BrowserCookies::for_run`]; the proxy is not
 /// among them (see [`ytdlp_command`]).
 fn build_ytdlp_args(
-    url: &Url,
+    source: Source<'_>,
     options: &MediaDownloadOptions,
     kind: RunKind,
     cookie_args: &[String],
@@ -1157,7 +1200,12 @@ fn build_ytdlp_args(
 
     let file_template = options.output_filename.as_deref().unwrap_or("%(title)s.%(ext)s");
     args.extend(["-o".to_string(), options.output_dir.join(file_template).to_string_lossy().to_string()]);
-    args.push(url.to_string());
+    match source {
+        Source::Url(url) => args.push(url.to_string()),
+        // yt-dlp neither extracts the video again nor picks up the formats' URLs anew, unless
+        // their download fails: it then extracts from the video's page.
+        Source::Info(file) => args.extend(["--load-info-json".to_string(), file.to_string_lossy().into_owned()]),
+    }
     args
 }
 
@@ -1537,8 +1585,12 @@ async fn run_to_end(mut cmd: Command, cancel_flag: Option<Arc<AtomicBool>>) -> R
     let stderr = String::from_utf8_lossy(&output.stderr);
     let lines: Vec<&str> = stderr.lines().filter(|l| !l.trim().is_empty()).collect();
     let errors: Vec<&str> = lines.iter().copied().filter(|l| l.starts_with("ERROR:")).collect();
-    let detail = if errors.is_empty() { &lines[lines.len().saturating_sub(STDERR_TAIL_LINES)..] } else { &errors[..] };
-    Err(format!("{program} exited with {}: {}", output.status, detail.join("\n")))
+    // As a yt-dlp download reports them (see `OutputState::failure_message`).
+    if !errors.is_empty() {
+        return Err(errors.join("\n"));
+    }
+    let tail = &lines[lines.len().saturating_sub(STDERR_TAIL_LINES)..];
+    Err(format!("{program} exited with {}: {}", output.status, tail.join("\n")))
 }
 
 /// One stream of a media download, which the engine fetches itself (see [`fast_download`]).
@@ -2270,42 +2322,60 @@ async fn download_with(
     cancel_flag: Option<Arc<AtomicBool>>,
     fetch: Option<&StreamFetcher<'_>>,
 ) -> Result<PathBuf, String> {
+    // Clears what crashed runs left in the private folder, whatever this download uses.
+    tools.cookies.files.get().await;
     let ffmpeg_dir = tools.ffmpeg.as_deref().and_then(Path::parent).map(Path::to_path_buf);
     // Audio presets convert with ffmpeg as yt-dlp's post-processor does; those stay with yt-dlp.
     let fast = fetch.filter(|_| !options.preset.extracts_audio());
-    if let Some(fetch) = fast {
-        let version = ytdlp_version(&tools.ytdlp, &tools.work_dir, tools.version_cache.as_deref()).await;
-        let cookies = tools.cookies.for_run(&options.cookies).await;
-        let args = build_ytdlp_args(url, options, RunKind::Extract, &cookies.args, ffmpeg_dir.as_deref(), tools.js_runtime.as_deref(), version.as_deref());
-        let extract = ytdlp_command(&tools.ytdlp, &args, options.proxy.as_deref(), &tools.work_dir);
-        let extracted = run_to_end(extract, cancel_flag.clone()).await;
-        if !is_cancelled(&cancel_flag) {
-            cookies.finish().await;
-        }
-        let downloaded = match extracted.and_then(|json| serde_json::from_slice(&json).map_err(|e| format!("yt-dlp -J: {e}"))) {
-            Ok(info) => fast_download(&info, options, tools.ffmpeg.as_deref(), progress_tx.as_ref(), &cancel_flag, fetch).await,
-            Err(e) => Err(FastError::Unsupported(e)),
-        };
-        match downloaded {
-            Ok(path) => return Ok(path),
-            Err(_) if is_cancelled(&cancel_flag) => return Err(CANCELLED.to_string()),
-            // yt-dlp would write the very file the other job is making.
-            Err(FastError::Busy(e)) => return Err(e),
-            Err(FastError::Unsupported(e) | FastError::Failed(e)) => tracing::info!("Leaving {url} to yt-dlp: {e}"),
-        }
-    }
-
     let mut updated = false;
     loop {
         let version = ytdlp_version(&tools.ytdlp, &tools.work_dir, tools.version_cache.as_deref()).await;
-        let cookies = tools.cookies.for_run(&options.cookies).await;
-        let args = build_ytdlp_args(url, options, RunKind::Download, &cookies.args, ffmpeg_dir.as_deref(), tools.js_runtime.as_deref(), version.as_deref());
-        let cmd = ytdlp_command(&tools.ytdlp, &args, options.proxy.as_deref(), &tools.work_dir);
-
-        let result = run_ytdlp(cmd, progress_tx.as_ref(), cancel_flag.clone()).await;
-        if !is_cancelled(&cancel_flag) {
-            cookies.finish().await;
-        }
+        let command = |source, kind, cookies: &CookieRun| {
+            let args = build_ytdlp_args(source, options, kind, &cookies.args, ffmpeg_dir.as_deref(), tools.js_runtime.as_deref(), version.as_deref());
+            ytdlp_command(&tools.ytdlp, &args, options.proxy.as_deref(), &tools.work_dir)
+        };
+        let result = 'attempt: {
+            // What yt-dlp found, for it to download when the engine does not.
+            let mut found = None;
+            if let Some(fetch) = fast {
+                let cookies = tools.cookies.for_run(&options.cookies).await;
+                let extracted = run_to_end(command(Source::Url(url), RunKind::Extract, &cookies), cancel_flag.clone()).await;
+                if !is_cancelled(&cancel_flag) {
+                    cookies.finish().await;
+                }
+                // The download would only extract the video again and fail the same way.
+                let json = match extracted {
+                    Ok(json) => json,
+                    Err(e) => break 'attempt Err(e),
+                };
+                match serde_json::from_slice::<Value>(&json) {
+                    Err(e) => tracing::info!("Leaving {url} to yt-dlp: yt-dlp -J: {e}"),
+                    Ok(info) => match fast_download(&info, options, tools.ffmpeg.as_deref(), progress_tx.as_ref(), &cancel_flag, fetch).await {
+                        Ok(path) => return Ok(path),
+                        Err(_) if is_cancelled(&cancel_flag) => return Err(CANCELLED.to_string()),
+                        // yt-dlp would write the very file the other job is making.
+                        Err(FastError::Busy(e)) => return Err(e),
+                        // Found moments ago: yt-dlp downloads it as it is. Not a playlist, whose
+                        // entries yt-dlp drops from a file it loads.
+                        Err(FastError::Unsupported(why)) => {
+                            tracing::info!("Leaving {url} to yt-dlp: {why}");
+                            if info.get("_type").and_then(Value::as_str).is_none_or(|t| t == "video") {
+                                found = tools.cookies.files.file(Some(json), "json").await.inspect_err(|e| tracing::debug!("{e}")).ok();
+                            }
+                        }
+                        // Maybe long after the extraction: the formats' URLs may have expired.
+                        Err(FastError::Failed(e)) => tracing::info!("Leaving {url} to yt-dlp: {e}"),
+                    },
+                }
+            }
+            let source = found.as_ref().map_or(Source::Url(url), |file| Source::Info(&file.path));
+            let cookies = tools.cookies.for_run(&options.cookies).await;
+            let result = run_ytdlp(command(source, RunKind::Download, &cookies), progress_tx.as_ref(), cancel_flag.clone()).await;
+            if !is_cancelled(&cancel_flag) {
+                cookies.finish().await;
+            }
+            result
+        };
         let err = match result {
             Ok(path) => {
                 if fast.is_some() {
@@ -2426,7 +2496,7 @@ mod tests {
     fn args_fetch_youtube_fragments_in_parallel() {
         let url = Url::parse("https://www.youtube.com/watch?v=abc").unwrap();
         let options = MediaDownloadOptions { output_dir: PathBuf::from("out"), concurrent_fragments: 8, ..Default::default() };
-        let args = build_ytdlp_args(&url, &options, RunKind::Download, &[], None, None, Some("2026.08.19"));
+        let args = build_ytdlp_args(Source::Url(&url), &options, RunKind::Download, &[], None, None, Some("2026.08.19"));
         let at = args.iter().position(|a| a == "--extractor-args").expect("extractor arguments");
         assert_eq!(args[at + 1], "youtube:formats=dashy");
         let at = args.iter().position(|a| a == "--concurrent-fragments").expect("parallel fragments");
@@ -2435,10 +2505,10 @@ mod tests {
         // selection may name; our presets pick adaptive formats.
         for preset in [MediaQualityPreset::Hd720p, MediaQualityPreset::AudioMp3, MediaQualityPreset::AudioM4a] {
             let options = MediaDownloadOptions { preset, ..options.clone() };
-            assert!(build_ytdlp_args(&url, &options, RunKind::Download, &[], None, None, None).contains(&YOUTUBE_DASHY[1].to_string()));
+            assert!(build_ytdlp_args(Source::Url(&url), &options, RunKind::Download, &[], None, None, None).contains(&YOUTUBE_DASHY[1].to_string()));
         }
         let custom = MediaDownloadOptions { preset: MediaQualityPreset::Custom("18".into()), ..options };
-        let args = build_ytdlp_args(&url, &custom, RunKind::Download, &[], None, None, Some("2026.08.19"));
+        let args = build_ytdlp_args(Source::Url(&url), &custom, RunKind::Download, &[], None, None, Some("2026.08.19"));
         assert!(!args.iter().any(|a| a == "--extractor-args"), "{args:?}");
     }
 
@@ -2447,7 +2517,7 @@ mod tests {
         let url = Url::parse("https://www.youtube.com/watch?v=abc").unwrap();
         let options = MediaDownloadOptions { output_dir: std::env::temp_dir(), concurrent_fragments: 8, ..Default::default() };
         let cookies = ["--cookies".to_string(), "jar.txt".to_string()];
-        let args = build_ytdlp_args(&url, &options, RunKind::Extract, &cookies, None, Some("node"), Some("2026.08.19"));
+        let args = build_ytdlp_args(Source::Url(&url), &options, RunKind::Extract, &cookies, None, Some("node"), Some("2026.08.19"));
         for flag in ["--ignore-config", "--no-playlist", "-J", "--flat-playlist", "--cookies", "--js-runtimes", "-o"] {
             assert!(args.iter().any(|a| a == flag), "{flag} missing from {args:?}");
         }
@@ -2575,14 +2645,14 @@ mod tests {
         let options = MediaDownloadOptions { output_dir: PathBuf::from("out"), ..Default::default() };
 
         let node = Some("node:/usr/bin/node");
-        let args = build_ytdlp_args(&url, &options, RunKind::Download, &[], None, node, Some("2025.10.22"));
+        let args = build_ytdlp_args(Source::Url(&url), &options, RunKind::Download, &[], None, node, Some("2025.10.22"));
         assert!(!args.contains(&"--js-runtimes".to_string()));
         assert!(args.contains(&"--no-playlist".to_string()));
         assert!(args.contains(&PATH_TEMPLATE.to_string()));
         assert!(args.contains(&PROGRESS_TEMPLATE.to_string()));
         assert_eq!(args.last(), Some(&url.to_string()));
 
-        let args = build_ytdlp_args(&url, &options, RunKind::Download, &[], None, node, Some("2025.11.12"));
+        let args = build_ytdlp_args(Source::Url(&url), &options, RunKind::Download, &[], None, node, Some("2025.11.12"));
         let at = args.iter().position(|a| a == "--js-runtimes").expect("flag present");
         assert_eq!(args[at + 1], "node:/usr/bin/node");
     }
@@ -2593,7 +2663,7 @@ mod tests {
         // 10 MiB YouTube asks for in each format.
         let url = Url::parse("https://vimeo.com/123").unwrap();
         let options = MediaDownloadOptions { output_dir: PathBuf::from("out"), ..Default::default() };
-        let args = build_ytdlp_args(&url, &options, RunKind::Download, &[], None, None, Some("2026.08.19"));
+        let args = build_ytdlp_args(Source::Url(&url), &options, RunKind::Download, &[], None, None, Some("2026.08.19"));
         assert!(!args.iter().any(|a| a == "--http-chunk-size"), "{args:?}");
     }
 
@@ -2602,11 +2672,11 @@ mod tests {
         let url = Url::parse("https://www.youtube.com/watch?v=abc").unwrap();
         let options = MediaDownloadOptions { output_dir: PathBuf::from("out"), ..Default::default() };
         for version in [None, Some("2024.12.23"), Some("2026.08.19")] {
-            let args = build_ytdlp_args(&url, &options, RunKind::Download, &[], None, None, version);
+            let args = build_ytdlp_args(Source::Url(&url), &options, RunKind::Download, &[], None, None, version);
             assert_eq!(args[0], "--ignore-config", "{version:?}");
         }
         let has_no_plugin_dirs = |version| {
-            build_ytdlp_args(&url, &options, RunKind::Download, &[], None, None, version).contains(&"--no-plugin-dirs".to_string())
+            build_ytdlp_args(Source::Url(&url), &options, RunKind::Download, &[], None, None, version).contains(&"--no-plugin-dirs".to_string())
         };
         assert!(has_no_plugin_dirs(Some("2025.03.21")));
         assert!(!has_no_plugin_dirs(Some("2025.02.19")), "older builds abort on the unknown flag");
@@ -2622,7 +2692,7 @@ mod tests {
             proxy: Some(secret.to_string()),
             ..Default::default()
         };
-        let args = build_ytdlp_args(&url, &options, RunKind::Download, &[], None, None, None);
+        let args = build_ytdlp_args(Source::Url(&url), &options, RunKind::Download, &[], None, None, None);
         assert!(!args.iter().any(|a| a == "--proxy" || a.contains("S3cret")), "{args:?}");
 
         let work_dir = std::env::temp_dir();
@@ -3740,7 +3810,7 @@ mod tests {
     /// Each run adds a line to `dir/runs.txt`: `extract`, or `download url` / `download info`, the
     /// latter for `--load-info-json`, whose file it copies to `dir/loaded.json`.
     fn fake_ytdlp(dir: &Path, output: &Path) -> PathBuf {
-        let (dir_s, out_s) = (dir.display(), output.display());
+        let (dir_s, out_s, out_dir) = (dir.display(), output.display(), output.parent().unwrap().display());
         #[cfg(windows)]
         let (bin, script) = (
             dir.join("yt-dlp.cmd"),
@@ -3756,6 +3826,7 @@ mod tests {
                  goto scan\r\n\
                  :download\r\n\
                  >>\"{dir_s}\\runs.txt\" echo download %source%\r\n\
+                 if not exist \"{out_dir}\" mkdir \"{out_dir}\"\r\n\
                  >\"{out_s}\" echo video\r\n\
                  echo HFPATH {out_s}\r\n\
                  exit /b 0\r\n\
@@ -3783,6 +3854,7 @@ mod tests {
                  shift\n\
                  done\n\
                  echo \"download $source\" >> '{dir_s}/runs.txt'\n\
+                 mkdir -p '{out_dir}'\n\
                  echo video > '{out_s}'\n\
                  echo 'HFPATH {out_s}'\n"
             ),
@@ -3876,6 +3948,56 @@ mod tests {
         let fetch: &StreamFetcher<'_> = &|_, _, _| panic!("yt-dlp downloads DASH fragments");
         let path = fake_download(dir.path(), &dash_info(&out), &cookies, fetch).await.unwrap();
         assert_eq!(path, out.join("clip.mp4"));
+        assert_eq!(runs_in(dir.path()), ["extract", "download info"]);
         assert_eq!(names_in(&out), ["clip.mp4"]);
+    }
+
+    #[test]
+    fn a_download_of_what_an_extraction_found_names_no_url() {
+        let url = Url::parse("https://www.youtube.com/watch?v=abc").unwrap();
+        let options = MediaDownloadOptions { output_dir: std::env::temp_dir(), ..Default::default() };
+        let found = std::env::temp_dir().join("found.json");
+        let args = build_ytdlp_args(Source::Info(&found), &options, RunKind::Download, &[], None, None, Some("2026.08.19"));
+        assert_eq!(args[args.len() - 2..], ["--load-info-json".to_string(), found.to_string_lossy().into_owned()]);
+        assert!(!args.contains(&url.to_string()), "{args:?}");
+        assert!(args.contains(&PATH_TEMPLATE.to_string()), "the download still reports its file");
+    }
+
+    #[tokio::test]
+    async fn what_the_engine_leaves_to_yt_dlp_is_not_extracted_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let private = dir.path().join("private");
+        let cookies = BrowserCookies::new(Some(private.clone()));
+        let fetch: &StreamFetcher<'_> = &|_, _, _| panic!("yt-dlp downloads DASH fragments");
+        let info = dash_info(&dir.path().join("out"));
+        fake_download(dir.path(), &info, &cookies, fetch).await.unwrap();
+        assert_eq!(runs_in(dir.path()), ["extract", "download info"]);
+        assert_eq!(std::fs::read(dir.path().join("loaded.json")).unwrap(), std::fs::read(dir.path().join("info.json")).unwrap());
+        // It holds the cookies the extraction used: gone with the run.
+        assert_eq!(names_in(&private), Vec::<String>::new());
+
+        // yt-dlp drops a playlist's entries from a file it loads: it gets the URL again.
+        std::fs::remove_file(dir.path().join("runs.txt")).unwrap();
+        let playlist = serde_json::json!({"_type": "playlist", "id": "PL1", "entries": [{"_type": "url", "url": "https://youtu.be/a"}]});
+        fake_download(dir.path(), &playlist, &cookies, fetch).await.unwrap();
+        assert_eq!(runs_in(dir.path()), ["extract", "download url"]);
+    }
+
+    #[tokio::test]
+    async fn an_extraction_error_is_the_download_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let private = dir.path().join("private");
+        // What a run of a crashed process left: its jar and its claim's lock.
+        std::fs::create_dir(&private).unwrap();
+        std::fs::write(private.join("crashed.txt"), JAR).unwrap();
+        std::fs::write(private.join("crashed.txt.part.lock"), b"").unwrap();
+        std::fs::write(dir.path().join("extract-error"), b"").unwrap();
+        let cookies = BrowserCookies::new(Some(private.clone()));
+        let fetch: &StreamFetcher<'_> = &|_, _, _| panic!("nothing was found");
+        let result = fake_download(dir.path(), &Value::Null, &cookies, fetch).await;
+        assert_eq!(result, Err("ERROR: [youtube] abc: Video unavailable".to_string()));
+        assert_eq!(runs_in(dir.path()), ["extract"], "no second extraction to fail the same way");
+        // Swept at the first media download, though this one uses no browser cookies.
+        assert_eq!(names_in(&private), Vec::<String>::new());
     }
 }
