@@ -627,10 +627,11 @@ fn build_ytdlp_args(
         POSTPROCESS_TEMPLATE,
         "--print",
         PATH_TEMPLATE,
+        // No --http-chunk-size: a file then streams in one response instead of one request per
+        // chunk, each a round trip of idle connection. YouTube asks for 10 MiB requests itself
+        // (the format's `http_chunk_size`), which a global chunk size would override.
         "--buffer-size",
         "16M",
-        "--http-chunk-size",
-        "10M",
     ]
     .map(String::from)
     .to_vec();
@@ -1227,6 +1228,16 @@ mod tests {
         let args = build_ytdlp_args(&url, &options, None, node, Some("2025.11.12"));
         let at = args.iter().position(|a| a == "--js-runtimes").expect("flag present");
         assert_eq!(args[at + 1], "node:/usr/bin/node");
+    }
+
+    #[test]
+    fn args_leave_request_sizes_to_the_site() {
+        // A global chunk size splits every progressive file into round trips and overrides the
+        // 10 MiB YouTube asks for in each format.
+        let url = Url::parse("https://vimeo.com/123").unwrap();
+        let options = MediaDownloadOptions { output_dir: PathBuf::from("out"), ..Default::default() };
+        let args = build_ytdlp_args(&url, &options, None, None, Some("2026.08.19"));
+        assert!(!args.iter().any(|a| a == "--http-chunk-size"), "{args:?}");
     }
 
     #[test]
