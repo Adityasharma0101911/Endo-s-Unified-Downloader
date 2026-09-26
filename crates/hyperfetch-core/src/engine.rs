@@ -2949,6 +2949,7 @@ mod tests {
     /// A `.part` of `final_path` holding `data`, written through a writer that hashed it.
     fn written_part(final_path: &Path, data: &[u8]) -> DiskWriter {
         let writer = DiskWriter::open_or_create(part_path(final_path), data.len() as u64).unwrap();
+        writer.track_digest(&[], None);
         writer.write_chunk_slice(0, data).unwrap();
         writer
     }

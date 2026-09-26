@@ -40,9 +40,10 @@ const FOLLOW_STEP: u64 = 1024 * 1024;
 /// Preallocated output file shared by all workers. Writes are positional (`pwrite` /
 /// `WriteFile` with an offset), so concurrent writers never share a cursor or a mapping.
 ///
-/// The writer also hashes what it writes: each aligned block is hashed with BLAKE3 as soon as it
-/// has been written in full, so [`DiskWriter::digest`] reads back only the blocks it never saw
-/// whole (and see [`DiskWriter::track_digest`] for SHA-256/MD5).
+/// Once told to with [`DiskWriter::track_digest`], the writer also hashes what it writes: each
+/// aligned block is hashed with BLAKE3 as soon as it has been written in full, so
+/// [`DiskWriter::digest`] reads back only the blocks it never saw whole (and SHA-256/MD5, see
+/// `track_digest`).
 #[derive(Clone)]
 pub struct DiskWriter {
     path: PathBuf,
@@ -121,14 +122,17 @@ impl DiskWriter {
         Ok(())
     }
 
-    /// Counts `on_disk`, bytes an earlier run wrote, as written, so blocks they complete are
-    /// hashed too. When `expected_checksum` needs SHA-256 or MD5, also starts hashing the file's
-    /// written prefix with it in the background as the prefix grows, so [`DiskWriter::digest`]
-    /// reads only the rest. That hashing stops once the last clone of this writer is dropped.
+    /// Starts hashing what is written from now on, for [`DiskWriter::digest`]; a writer that is
+    /// never asked for a digest (a repair) does without. Counts `on_disk`, bytes an earlier run
+    /// wrote, as written, so blocks they complete are hashed too. When `expected_checksum` needs
+    /// SHA-256 or MD5, also starts hashing the file's written prefix with it in the background as
+    /// the prefix grows, so `digest` reads only the rest. That hashing stops once the last clone
+    /// of this writer is dropped.
     pub fn track_digest(&self, on_disk: &[ByteRange], expected_checksum: Option<&str>) {
         let (sha256, md5) = needs(expected_checksum).unwrap_or_default();
         let hashes = &self.inner.hashes;
         let mut state = hashes.state.lock();
+        state.tracking = true;
         for range in on_disk.iter().filter(|r| r.start < self.size) {
             add(&mut state.written, range.start..range.end.saturating_add(1).min(self.size));
         }
@@ -268,9 +272,14 @@ struct Hashes {
     state: Mutex<HashState>,
     /// Signalled when the written prefix grows, and when the prefix hasher is to stop.
     changed: Condvar,
+    /// Bytes read back to hash.
+    #[cfg(test)]
+    read: AtomicUsize,
 }
 
 struct HashState {
+    /// Writes are recorded and hashed (see `DiskWriter::track_digest`).
+    tracking: bool,
     /// Written byte ranges: sorted, disjoint and not touching.
     written: Vec<Range<u64>>,
     blocks: Vec<Block>,
@@ -296,6 +305,7 @@ struct Block {
 impl Hashes {
     fn new(size: u64, block: u64) -> Self {
         let state = HashState {
+            tracking: false,
             written: Vec::new(),
             blocks: vec![Block::default(); size.div_ceil(block) as usize],
             follower: None,
@@ -303,7 +313,14 @@ impl Hashes {
             refollow: false,
             stopped: false,
         };
-        Self { size, block, state: Mutex::new(state), changed: Condvar::new() }
+        Self {
+            size,
+            block,
+            state: Mutex::new(state),
+            changed: Condvar::new(),
+            #[cfg(test)]
+            read: AtomicUsize::new(0),
+        }
     }
 
     /// The bytes of block `i`.
@@ -332,7 +349,10 @@ impl Hashes {
         let mut complete = Vec::new();
         {
             let mut state = self.state.lock();
-            let HashState { written, blocks, followed, refollow, .. } = &mut *state;
+            let HashState { tracking, written, blocks, followed, refollow, .. } = &mut *state;
+            if !*tracking {
+                return;
+            }
             *refollow |= offset < *followed;
             let prefix = written_prefix(written);
             add(written, offset..end);
@@ -354,6 +374,8 @@ impl Hashes {
                 self.hash_block(i, &data[at..at + (span.end - span.start) as usize])
             } else {
                 let mut buf = vec![0; (span.end - span.start) as usize];
+                #[cfg(test)]
+                self.read.fetch_add(buf.len(), Ordering::Relaxed);
                 if read_exact_at(file, &mut buf, span.start).is_err() {
                     continue;
                 }
@@ -383,6 +405,8 @@ impl Hashes {
                             let span = self.span(i);
                             buf.resize((span.end - span.start) as usize, 0);
                             read_exact_at(file, &mut buf, span.start)?;
+                            #[cfg(test)]
+                            self.read.fetch_add(buf.len(), Ordering::Relaxed);
                             found.push((i, self.hash_block(i, &buf)));
                         }
                         Ok::<_, std::io::Error>(found)
@@ -1326,6 +1350,28 @@ mod tests {
         assert_eq!(digest.blake3, *blake3::hash(&data).as_bytes());
         let reread = writer.full_digest(Some(&checksum)).unwrap();
         assert!(matches!(verify_digest(&reread, Some(&checksum)), Err(VerifyError::Mismatch(_))));
+    }
+
+    /// Bytes with no short period, so that blocks in the wrong place change the hash.
+    fn pattern(len: u64) -> Vec<u8> {
+        (0..len).map(|i| (i.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as u8).collect()
+    }
+
+    #[test]
+    fn test_a_writer_never_asked_for_a_digest_hashes_nothing() {
+        // As a repair writes: no digest follows, so nothing is recorded, read back or hashed.
+        let data = pattern(600 * 1024);
+        let temp = NamedTempFile::new().unwrap();
+        let writer = DiskWriter::open_or_create(temp.path(), data.len() as u64).unwrap();
+        writer.write_chunk_slice(100_000, &data[100_000..]).unwrap();
+        writer.write_chunk_slice(0, &data[..100_000]).unwrap();
+        {
+            let state = writer.inner.hashes.state.lock();
+            assert!(state.written.is_empty() && state.blocks.iter().all(|b| b.hash.is_none()));
+        }
+        assert_eq!(writer.inner.hashes.read.load(Ordering::Relaxed), 0);
+        // Its digest reads the file instead.
+        assert_eq!(writer.digest(None).unwrap().blake3, *blake3::hash(&data).as_bytes());
     }
 
     #[test]
