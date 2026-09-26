@@ -1986,32 +1986,92 @@ fn ffmpeg_args(streams: &[PlannedStream], inputs: &[PathBuf], output: &Path) -> 
     args
 }
 
-/// Deletes what is left of streams: finished files, partial ones, and the history entries the
-/// engine made for them. Blocking.
-fn remove_streams(paths: &[PathBuf]) {
+/// The stream of `output` that the file `name` next to it belongs to: a stream of any format
+/// (see [`stream_path`]), also under the name the engine numbers when the plain one is taken
+/// (`<stream> (1).<ext>`), or one of its partial files. Returns the stream's file name.
+fn stream_of(output: &Path, name: &str) -> Option<String> {
+    let file = [".part.hfstate", ".part.hlsstate", ".part"].iter().find_map(|partial| name.strip_suffix(partial)).unwrap_or(name);
+    let (stem, ext) = file.rsplit_once('.')?;
+    let plain = stem
+        .strip_suffix(')')
+        .and_then(|s| s.rsplit_once(" ("))
+        .filter(|(_, n)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        .map_or(stem, |(s, _)| s);
+    let head = plain.strip_suffix(".hf")?;
+    let plain = format!("{plain}.{ext}");
+    // Whichever `.f` starts the format id, only the very name `stream_path` makes counts.
+    head.match_indices(".f")
+        .any(|(at, _)| stream_path(output, &head[at + 2..], ext).file_name().and_then(|n| n.to_str()) == Some(plain.as_str()))
+        .then(|| file.to_string())
+}
+
+/// Deletes every stream of `output` next to it (see [`stream_of`]), finished or partial, with the
+/// history entries the engine made for them, except what a download holds. The caller holds the
+/// claim on `output`, so no job is downloading these streams for it or joining them. Blocking.
+fn remove_streams_of(output: &Path) {
+    let Some(dir) = output.parent() else { return };
+    let stream_name = |path: &Path| stream_of(output, path.file_name()?.to_str()?);
+    let mut streams: Vec<String> =
+        std::fs::read_dir(dir).into_iter().flatten().flatten().filter_map(|entry| stream_name(&entry.path())).collect();
     let mut history = crate::history::DownloadHistoryManager::load();
-    for path in paths {
-        if let Err(e) = crate::engine::discard_partial(path) {
-            tracing::warn!("{e}");
+    let entries: Vec<(String, String)> = history
+        .entries()
+        .iter()
+        .filter(|e| e.file_path.parent() == Some(dir))
+        .filter_map(|e| Some((e.id.clone(), stream_name(&e.file_path)?)))
+        .collect();
+    streams.extend(entries.iter().map(|(_, name)| name.clone()));
+    streams.sort();
+    streams.dedup();
+    for name in streams {
+        let path = dir.join(&name);
+        // A download that holds the stream keeps it, and its history.
+        if let Err(e) = crate::engine::discard_partial(&path) {
+            tracing::debug!("{e}");
+            continue;
         }
-        match std::fs::remove_file(path) {
+        let Ok(Some(_claim)) = crate::engine::claim_target(&path) else { continue };
+        match std::fs::remove_file(&path) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
                 tracing::warn!("Failed to delete {}: {e}", path.display());
+                continue;
             }
             _ => {}
         }
-        let path = std::path::absolute(path).unwrap_or_else(|_| path.clone());
-        let ids: Vec<String> = history.entries().iter().filter(|e| e.file_path == path).map(|e| e.id.clone()).collect();
-        for id in ids {
-            history.remove_entry(&id);
+        for (id, _) in entries.iter().filter(|(_, stream)| *stream == name) {
+            history.remove_entry(id);
         }
     }
 }
 
+/// [`remove_streams_of`] once something else (yt-dlp) has made `output`: the streams an earlier
+/// attempt kept to resume are of no use any more. Skipped while another job holds `output`.
+async fn remove_streams_after(output: &Path) {
+    let output = output.to_path_buf();
+    let _ = tokio::task::spawn_blocking(move || {
+        if let Ok(Some(_claim)) = crate::engine::claim_target(&output) {
+            remove_streams_of(&output);
+        }
+    })
+    .await;
+}
+
+/// Why the engine did not make a media download (see [`fast_download`]).
+#[derive(Debug, PartialEq)]
+enum FastError {
+    /// The engine does not download what yt-dlp found; yt-dlp does.
+    Unsupported(String),
+    /// Another job is making the same file right now.
+    Busy(String),
+    /// Downloading or joining the streams failed, or was cancelled.
+    Failed(String),
+}
+
 /// Downloads what yt-dlp found (`info`, its `-J` output) with the engine instead of yt-dlp: every
 /// stream at once, each over as many connections as the engine opens, then joined or remuxed
-/// with ffmpeg as yt-dlp would. `Err` leaves the download to yt-dlp. Unless the download was
-/// cancelled (it then resumes next time), the streams' files are deleted by then.
+/// with ffmpeg as yt-dlp would. Until the output is made, the streams stay for the next attempt
+/// to resume (see [`MediaStream::key`]); once it exists, or ffmpeg cannot join them, every stream
+/// of it goes (see [`remove_streams_of`]).
 async fn fast_download(
     info: &Value,
     options: &MediaDownloadOptions,
@@ -2019,25 +2079,32 @@ async fn fast_download(
     progress_tx: Option<&Sender<ProgressUpdate>>,
     cancel_flag: &Option<Arc<AtomicBool>>,
     fetch: &StreamFetcher<'_>,
-) -> Result<PathBuf, String> {
-    let plan = plan_fast(info, ffmpeg.is_some())?;
+) -> Result<PathBuf, FastError> {
+    let plan = plan_fast(info, ffmpeg.is_some()).map_err(FastError::Unsupported)?;
     let output = plan.output.clone();
-    // yt-dlp does not download a file that is already there either.
-    if tokio::fs::metadata(&output).await.is_ok_and(|m| m.is_file()) {
-        return Ok(output);
-    }
     if let Some(dir) = output.parent() {
-        tokio::fs::create_dir_all(dir).await.map_err(|e| format!("Failed to create {}: {e}", dir.display()))?;
+        tokio::fs::create_dir_all(dir)
+            .await
+            .map_err(|e| FastError::Failed(format!("Failed to create {}: {e}", dir.display())))?;
     }
     // Two jobs for the same video would write the same files.
     let claim = {
         let output = output.clone();
         tokio::task::spawn_blocking(move || crate::engine::claim_target(&output))
             .await
-            .map_err(|e| format!("Background task failed: {e}"))??
+            .map_err(|e| FastError::Failed(format!("Background task failed: {e}")))?
+            .map_err(FastError::Failed)?
     };
+    // yt-dlp does not download a file that is already there either.
+    if tokio::fs::metadata(&output).await.is_ok_and(|m| m.is_file()) {
+        if claim.is_some() {
+            let output = output.clone();
+            let _ = tokio::task::spawn_blocking(move || remove_streams_of(&output)).await;
+        }
+        return Ok(output);
+    }
     let Some(_claim) = claim else {
-        return Err(format!("{} is being downloaded already", output.display()));
+        return Err(FastError::Busy(format!("{} is being downloaded already", output.display())));
     };
 
     if let Some(at) = plan.available_at {
@@ -2046,7 +2113,7 @@ async fn fast_download(
             tracing::info!("Waiting {}s before downloading, as the site requires", at - now);
             tokio::select! {
                 () = tokio::time::sleep(Duration::from_secs(at - now)) => {}
-                () = wait_cancelled(cancel_flag.clone()) => return Err(CANCELLED.to_string()),
+                () = wait_cancelled(cancel_flag.clone()) => return Err(FastError::Failed(CANCELLED.to_string())),
             }
         }
     }
@@ -2058,25 +2125,23 @@ async fn fast_download(
             url: planned.url.clone(),
             key: planned.key.clone(),
             hls: planned.hls,
-            client: stream_client(planned, options.proxy.as_deref())?,
+            client: stream_client(planned, options.proxy.as_deref()).map_err(FastError::Unsupported)?,
             path: stream_path(&output, &planned.format_id, &planned.ext),
             chunk_size: planned.chunk_size,
         });
     }
-    let mut leftovers: Vec<PathBuf> = streams.iter().map(|s| s.path.clone()).collect();
-    let finished = match fetch_streams(streams, sizes, fetch, progress_tx, cancel_flag).await {
-        Ok(files) => {
-            leftovers.extend(files.iter().cloned());
-            joined(&plan, &files, ffmpeg, cancel_flag).await
-        }
-        Err(e) => Err(e),
-    };
-    // A cancelled download keeps its streams, to resume them.
-    if finished.is_err() && is_cancelled(cancel_flag) {
-        return Err(CANCELLED.to_string());
+    let files = fetch_streams(streams, sizes, fetch, progress_tx, cancel_flag).await.map_err(FastError::Failed)?;
+    let made = joined(&plan, &files, ffmpeg, cancel_flag).await;
+    // Cancelled while ffmpeg ran: the next attempt has every stream at hand.
+    if made.is_err() && is_cancelled(cancel_flag) {
+        return Err(FastError::Failed(CANCELLED.to_string()));
     }
-    let _ = tokio::task::spawn_blocking(move || remove_streams(&leftovers)).await;
-    finished
+    // In the output now, or what ffmpeg cannot join: of no further use either way.
+    let _ = {
+        let output = output.clone();
+        tokio::task::spawn_blocking(move || remove_streams_of(&output)).await
+    };
+    made.map_err(FastError::Failed)
 }
 
 /// Makes the plan's output from the streams' `files`: the one file itself, or what ffmpeg writes
@@ -2153,7 +2218,7 @@ pub(crate) async fn download_media_with(
         .await
         .map_err(|e| format!("Failed to create {}: {e}", work_dir.display()))?;
 
-    let mut ytdlp_bin = match (&options.custom_ytdlp_path, found_ytdlp) {
+    let ytdlp = match (&options.custom_ytdlp_path, found_ytdlp) {
         (Some(path), _) => absolute(path)?,
         (None, Some(path)) => path,
         (None, None) => tokio::select! {
@@ -2169,45 +2234,88 @@ pub(crate) async fn download_media_with(
              (e.g. `winget install Gyan.FFmpeg` or your package manager) or place it next to the application."
         );
     }
-    let ffmpeg_dir = ffmpeg.as_deref().and_then(Path::parent);
-    let managed = managed_bin_dir().is_some_and(|dir| ytdlp_bin.starts_with(dir));
+    let managed = managed_bin_dir().is_some_and(|dir| ytdlp.starts_with(dir));
+    let tools = Tools {
+        ytdlp,
+        managed,
+        ffmpeg,
+        js_runtime,
+        work_dir,
+        version_cache: version_cache_file(),
+        cookies: &BROWSER_COOKIES,
+    };
+    download_with(url, &options, tools, progress_tx, cancel_flag, fetch).await
+}
 
+/// The programs and places a media download works with.
+struct Tools<'a> {
+    ytdlp: PathBuf,
+    /// Whether `ytdlp` is ours to update (see [`update_managed_ytdlp`]).
+    managed: bool,
+    ffmpeg: Option<PathBuf>,
+    js_runtime: Option<String>,
+    /// See [`ytdlp_work_dir`].
+    work_dir: PathBuf,
+    /// See [`ytdlp_version`].
+    version_cache: Option<PathBuf>,
+    cookies: &'a BrowserCookies,
+}
+
+/// [`download_media_with`] with `tools`. Paths in `options` must be absolute.
+async fn download_with(
+    url: &Url,
+    options: &MediaDownloadOptions,
+    mut tools: Tools<'_>,
+    progress_tx: Option<Sender<ProgressUpdate>>,
+    cancel_flag: Option<Arc<AtomicBool>>,
+    fetch: Option<&StreamFetcher<'_>>,
+) -> Result<PathBuf, String> {
+    let ffmpeg_dir = tools.ffmpeg.as_deref().and_then(Path::parent).map(Path::to_path_buf);
     // Audio presets convert with ffmpeg as yt-dlp's post-processor does; those stay with yt-dlp.
-    if let Some(fetch) = fetch.filter(|_| !options.preset.extracts_audio()) {
-        let version = ytdlp_version(&ytdlp_bin, &work_dir, version_cache_file().as_deref()).await;
-        let cookies = BROWSER_COOKIES.for_run(&options.cookies).await;
-        let args = build_ytdlp_args(url, &options, RunKind::Extract, &cookies.args, ffmpeg_dir, js_runtime.as_deref(), version.as_deref());
-        let extracted = run_to_end(ytdlp_command(&ytdlp_bin, &args, options.proxy.as_deref(), &work_dir), cancel_flag.clone()).await;
+    let fast = fetch.filter(|_| !options.preset.extracts_audio());
+    if let Some(fetch) = fast {
+        let version = ytdlp_version(&tools.ytdlp, &tools.work_dir, tools.version_cache.as_deref()).await;
+        let cookies = tools.cookies.for_run(&options.cookies).await;
+        let args = build_ytdlp_args(url, options, RunKind::Extract, &cookies.args, ffmpeg_dir.as_deref(), tools.js_runtime.as_deref(), version.as_deref());
+        let extract = ytdlp_command(&tools.ytdlp, &args, options.proxy.as_deref(), &tools.work_dir);
+        let extracted = run_to_end(extract, cancel_flag.clone()).await;
         if !is_cancelled(&cancel_flag) {
             cookies.finish().await;
         }
         let downloaded = match extracted.and_then(|json| serde_json::from_slice(&json).map_err(|e| format!("yt-dlp -J: {e}"))) {
-            Ok(info) => fast_download(&info, &options, ffmpeg.as_deref(), progress_tx.as_ref(), &cancel_flag, fetch).await,
-            Err(e) => Err(e),
+            Ok(info) => fast_download(&info, options, tools.ffmpeg.as_deref(), progress_tx.as_ref(), &cancel_flag, fetch).await,
+            Err(e) => Err(FastError::Unsupported(e)),
         };
         match downloaded {
             Ok(path) => return Ok(path),
             Err(_) if is_cancelled(&cancel_flag) => return Err(CANCELLED.to_string()),
-            Err(e) => tracing::info!("Leaving {url} to yt-dlp: {e}"),
+            // yt-dlp would write the very file the other job is making.
+            Err(FastError::Busy(e)) => return Err(e),
+            Err(FastError::Unsupported(e) | FastError::Failed(e)) => tracing::info!("Leaving {url} to yt-dlp: {e}"),
         }
     }
 
     let mut updated = false;
     loop {
-        let version = ytdlp_version(&ytdlp_bin, &work_dir, version_cache_file().as_deref()).await;
-        let cookies = BROWSER_COOKIES.for_run(&options.cookies).await;
-        let args = build_ytdlp_args(url, &options, RunKind::Download, &cookies.args, ffmpeg_dir, js_runtime.as_deref(), version.as_deref());
-        let cmd = ytdlp_command(&ytdlp_bin, &args, options.proxy.as_deref(), &work_dir);
+        let version = ytdlp_version(&tools.ytdlp, &tools.work_dir, tools.version_cache.as_deref()).await;
+        let cookies = tools.cookies.for_run(&options.cookies).await;
+        let args = build_ytdlp_args(url, options, RunKind::Download, &cookies.args, ffmpeg_dir.as_deref(), tools.js_runtime.as_deref(), version.as_deref());
+        let cmd = ytdlp_command(&tools.ytdlp, &args, options.proxy.as_deref(), &tools.work_dir);
 
         let result = run_ytdlp(cmd, progress_tx.as_ref(), cancel_flag.clone()).await;
         if !is_cancelled(&cancel_flag) {
             cookies.finish().await;
         }
         let err = match result {
-            Ok(path) => return Ok(path),
+            Ok(path) => {
+                if fast.is_some() {
+                    remove_streams_after(&path).await;
+                }
+                return Ok(path);
+            }
             Err(err) => err,
         };
-        if updated || !managed || is_cancelled(&cancel_flag) {
+        if updated || !tools.managed || is_cancelled(&cancel_flag) {
             return Err(err);
         }
 
@@ -2218,7 +2326,7 @@ pub(crate) async fn download_media_with(
         };
         match update {
             Ok(Some(installed)) => {
-                ytdlp_bin = installed;
+                tools.ytdlp = installed;
                 updated = true;
             }
             Ok(None) => return Err(err),
@@ -3269,7 +3377,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_stream_stops_the_others_and_leaves_the_download_to_ytdlp() {
+    async fn a_failed_stream_stops_the_others_and_keeps_what_they_fetched() {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("out");
         let stopped = AtomicBool::new(false);
@@ -3288,9 +3396,26 @@ mod tests {
         };
         let ffmpeg = Path::new("never-run");
         let result = fast_download(&mp4_merge_info(&out), &MediaDownloadOptions::default(), Some(ffmpeg), None, &None, fetch).await;
-        assert_eq!(result, Err("HTTP 403".to_string()));
+        assert_eq!(result, Err(FastError::Failed("HTTP 403".to_string())));
         assert!(stopped.load(Ordering::Relaxed));
-        assert_eq!(names_in(&out), Vec::<String>::new(), "yt-dlp starts afresh");
+        // For the next attempt to resume; yt-dlp's own files have other names.
+        assert_eq!(names_in(&out), ["clip.f137.hf.mp4.part"]);
+    }
+
+    #[tokio::test]
+    async fn streams_ffmpeg_cannot_join_are_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        let fetch: &StreamFetcher<'_> = &|stream, _tx, _stop| {
+            Box::pin(async move {
+                std::fs::write(&stream.path, b"not media").unwrap();
+                Ok(stream.path)
+            })
+        };
+        let ffmpeg = dir.path().join("no-ffmpeg-here");
+        let result = fast_download(&mp4_merge_info(&out), &MediaDownloadOptions::default(), Some(&ffmpeg), None, &None, fetch).await;
+        assert!(matches!(&result, Err(FastError::Failed(e)) if e.contains("no-ffmpeg-here")), "{result:?}");
+        assert_eq!(names_in(&out), Vec::<String>::new());
     }
 
     #[tokio::test]
@@ -3310,17 +3435,90 @@ mod tests {
         let ffmpeg = Path::new("never-run");
         let cancel_flag = Some(Arc::clone(&cancel));
         let result = fast_download(&mp4_merge_info(&out), &MediaDownloadOptions::default(), Some(ffmpeg), None, &cancel_flag, fetch).await;
-        assert_eq!(result, Err(CANCELLED.to_string()));
+        assert_eq!(result, Err(FastError::Failed(CANCELLED.to_string())));
         assert_eq!(names_in(&out), ["clip.f137.hf.mp4.part", "clip.f140.hf.m4a.part"]);
     }
 
     #[tokio::test]
-    async fn an_existing_output_is_not_downloaded_again() {
+    async fn a_file_another_job_is_making_is_left_to_it() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("clip.mp4"), b"done").unwrap();
+        let _other_job = crate::engine::claim_target(&dir.path().join("clip.mp4")).unwrap().unwrap();
         let fetch: &StreamFetcher<'_> = &|_, _, _| panic!("nothing to fetch");
         let result = fast_download(&mp4_merge_info(dir.path()), &MediaDownloadOptions::default(), Some(Path::new("never-run")), None, &None, fetch).await;
-        assert_eq!(result, Ok(dir.path().join("clip.mp4")));
+        assert!(matches!(&result, Err(FastError::Busy(e)) if e.contains("being downloaded already")), "{result:?}");
+    }
+
+    #[test]
+    fn stream_files_are_told_by_their_names() {
+        let dir = std::env::temp_dir();
+        let output = dir.join("My.fine clip.mp4");
+        let stream = |name: &str| stream_of(&output, name);
+        for (name, of) in [
+            ("My.fine clip.f137.hf.mp4", "My.fine clip.f137.hf.mp4"),
+            ("My.fine clip.f137.hf.mp4.part", "My.fine clip.f137.hf.mp4"),
+            ("My.fine clip.f137.hf.mp4.part.hfstate", "My.fine clip.f137.hf.mp4"),
+            ("My.fine clip.fhls-480.hf.mp4.part.hlsstate", "My.fine clip.fhls-480.hf.mp4"),
+            ("My.fine clip.f140.hf (2).m4a", "My.fine clip.f140.hf (2).m4a"),
+            ("My.fine clip.f140.hf (2).m4a.part", "My.fine clip.f140.hf (2).m4a"),
+        ] {
+            assert_eq!(stream(name).as_deref(), Some(of), "{name}");
+        }
+        for name in [
+            "My.fine clip.mp4",
+            "My.fine clip.f137.mp4.part",
+            "My.fine clip.hfmerge.mp4",
+            "My.fine clip.f137.hf.mp4.part.lock",
+            "Other.f137.hf.mp4",
+            "My.fine.f137.hf.mp4",
+            "My.fine clip.f137.hf ().mp4",
+        ] {
+            assert_eq!(stream(name), None, "{name}");
+        }
+        // A long title is cut differently for each format; each is still told apart.
+        let long = dir.join(format!("{}.mp4", "\u{e9}".repeat(150)));
+        for (format, ext) in [("137", "mp4"), ("hls-1080p-audio", "m4a")] {
+            let name = stream_path(&long, format, ext).file_name().unwrap().to_str().unwrap().to_string();
+            assert_eq!(stream_of(&long, &format!("{name}.part")), Some(name));
+        }
+    }
+
+    #[tokio::test]
+    async fn an_existing_output_is_not_downloaded_again_and_its_streams_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("clip.mp4");
+        std::fs::write(&output, b"done").unwrap();
+        // What earlier attempts left: a partial stream of another format, a finished stream the
+        // engine recorded in history and one under a numbered name, an HLS stream's state, and
+        // the history entry of a stream already deleted.
+        for name in ["clip.f136.hf.mp4.part", "clip.f136.hf.mp4.part.hfstate", "clip.f140.hf.m4a", "clip.f137.hf (1).mp4", "clip.fhls-1.hf.mp4.part.hlsstate"] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        let mut history = crate::history::DownloadHistoryManager::load();
+        for name in ["clip.f140.hf.m4a", "clip.f22.hf.mp4", "other.f137.hf.mp4"] {
+            let urls = vec![format!("hyperfetch-media:/Youtube/jNQXAC9IVRw/{name}")];
+            history.add_or_update(crate::history::HistoryEntry::new(name.to_string(), dir.path().join(name), 1, urls));
+        }
+        // A stream a download holds, yt-dlp's own partial file, another video's stream.
+        let held = dir.path().join("clip.f251.hf.webm");
+        let _held = crate::engine::claim_target(&held).unwrap().unwrap();
+        for name in ["clip.f251.hf.webm.part", "clip.f137.mp4.part", "other.f137.hf.mp4"] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+
+        let fetch: &StreamFetcher<'_> = &|_, _, _| panic!("nothing to fetch");
+        let result = fast_download(&mp4_merge_info(dir.path()), &MediaDownloadOptions::default(), Some(Path::new("never-run")), None, &None, fetch).await;
+        assert_eq!(result, Ok(output));
+        assert_eq!(
+            names_in(dir.path()),
+            ["clip.f137.mp4.part", "clip.f251.hf.webm.part", "clip.f251.hf.webm.part.lock", "clip.mp4", "other.f137.hf.mp4"]
+        );
+        let recorded: Vec<String> = crate::history::DownloadHistoryManager::load()
+            .entries()
+            .iter()
+            .filter(|e| e.file_path.starts_with(dir.path()))
+            .map(|e| e.file_name.clone())
+            .collect();
+        assert_eq!(recorded, ["other.f137.hf.mp4"]);
     }
 
     #[tokio::test(start_paused = true)]
@@ -3445,8 +3643,10 @@ mod tests {
         let engine = crate::engine::DownloadEngine::new(Vec::new(), crate::engine::DownloadOptions::default());
         let (tx, _rx) = broadcast::channel(16);
         let done = engine.download_media_stream(stream, tx, CancellationToken::new()).await;
-        remove_streams(std::slice::from_ref(&path));
         assert_eq!(done, Ok(path.clone()), "the partial download resumed rather than set aside");
+        assert!(std::fs::read(&path).unwrap() == body, "the resumed file holds the stream's bytes");
+        remove_streams_of(&dir.path().join("clip.mp4"));
+        assert_eq!(names_in(dir.path()), Vec::<String>::new());
         // The probe's first MiB and the missing one, not what was there.
         assert!(sent.load(Ordering::Relaxed) <= 2 << 20, "{} bytes sent", sent.load(Ordering::Relaxed));
     }
@@ -3533,5 +3733,149 @@ mod tests {
         // of idle credit go at once.
         let together = Duration::from_secs_f64((video.len() + audio.len()) as f64 / limit as f64);
         assert!(took + Duration::from_millis(200) >= together, "{took:?} for what takes {together:?} at the limit");
+    }
+
+    /// A stand-in for yt-dlp that works in `dir`. `-J` prints `dir/info.json`, or fails as an
+    /// extractor does while `dir/extract-error` exists; a download writes `output` and reports it.
+    /// Each run adds a line to `dir/runs.txt`: `extract`, or `download url` / `download info`, the
+    /// latter for `--load-info-json`, whose file it copies to `dir/loaded.json`.
+    fn fake_ytdlp(dir: &Path, output: &Path) -> PathBuf {
+        let (dir_s, out_s) = (dir.display(), output.display());
+        #[cfg(windows)]
+        let (bin, script) = (
+            dir.join("yt-dlp.cmd"),
+            format!(
+                "@echo off\r\n\
+                 if \"%~2\"==\"--version\" (echo 2026.08.19& exit /b 0)\r\n\
+                 if \"%~4\"==\"-J\" goto extract\r\n\
+                 set source=url\r\n\
+                 :scan\r\n\
+                 if \"%~1\"==\"\" goto download\r\n\
+                 if \"%~1\"==\"--load-info-json\" (set source=info& copy /y \"%~2\" \"{dir_s}\\loaded.json\" >nul)\r\n\
+                 shift\r\n\
+                 goto scan\r\n\
+                 :download\r\n\
+                 >>\"{dir_s}\\runs.txt\" echo download %source%\r\n\
+                 >\"{out_s}\" echo video\r\n\
+                 echo HFPATH {out_s}\r\n\
+                 exit /b 0\r\n\
+                 :extract\r\n\
+                 >>\"{dir_s}\\runs.txt\" echo extract\r\n\
+                 if exist \"{dir_s}\\extract-error\" (>&2 echo ERROR: [youtube] abc: Video unavailable& exit /b 1)\r\n\
+                 type \"{dir_s}\\info.json\"\r\n\
+                 exit /b 0\r\n"
+            ),
+        );
+        #[cfg(not(windows))]
+        let (bin, script) = (
+            dir.join("yt-dlp"),
+            format!(
+                "#!/bin/sh\n\
+                 [ \"$2\" = --version ] && {{ echo 2026.08.19; exit 0; }}\n\
+                 if [ \"$4\" = -J ]; then\n\
+                 echo extract >> '{dir_s}/runs.txt'\n\
+                 [ -e '{dir_s}/extract-error' ] && {{ echo 'ERROR: [youtube] abc: Video unavailable' >&2; exit 1; }}\n\
+                 cat '{dir_s}/info.json'; exit 0\n\
+                 fi\n\
+                 source=url\n\
+                 while [ $# -gt 0 ]; do\n\
+                 [ \"$1\" = --load-info-json ] && {{ source=info; cp \"$2\" '{dir_s}/loaded.json'; }}\n\
+                 shift\n\
+                 done\n\
+                 echo \"download $source\" >> '{dir_s}/runs.txt'\n\
+                 echo video > '{out_s}'\n\
+                 echo 'HFPATH {out_s}'\n"
+            ),
+        );
+        std::fs::write(&bin, script).unwrap();
+        #[cfg(unix)]
+        make_executable(&bin).unwrap();
+        bin
+    }
+
+    /// The runs `fake_ytdlp` saw in `dir`.
+    fn runs_in(dir: &Path) -> Vec<String> {
+        std::fs::read_to_string(dir.join("runs.txt")).unwrap_or_default().lines().map(|l| l.trim().to_string()).collect()
+    }
+
+    /// A media download with `fake_ytdlp`: what `info` describes goes to `out/clip.mp4`, private
+    /// files to `private`.
+    async fn fake_download(
+        dir: &Path,
+        info: &Value,
+        cookies: &BrowserCookies,
+        fetch: &StreamFetcher<'_>,
+    ) -> Result<PathBuf, String> {
+        let out = dir.join("out");
+        std::fs::write(dir.join("info.json"), serde_json::to_vec(info).unwrap()).unwrap();
+        let tools = Tools {
+            ytdlp: fake_ytdlp(dir, &out.join("clip.mp4")),
+            managed: false,
+            ffmpeg: Some(dir.join("no-ffmpeg-here")),
+            js_runtime: None,
+            work_dir: dir.to_path_buf(),
+            version_cache: None,
+            cookies,
+        };
+        let options = MediaDownloadOptions { output_dir: out, ..Default::default() };
+        let url = Url::parse("https://www.youtube.com/watch?v=jNQXAC9IVRw").unwrap();
+        download_with(&url, &options, tools, None, None, Some(fetch)).await
+    }
+
+    #[tokio::test]
+    async fn yt_dlp_never_writes_a_file_another_job_is_making() {
+        let dir = tempfile::tempdir().unwrap();
+        let cookies = BrowserCookies::new(Some(dir.path().join("private")));
+        std::fs::create_dir(dir.path().join("out")).unwrap();
+        let _other_job = crate::engine::claim_target(&dir.path().join("out").join("clip.mp4")).unwrap().unwrap();
+        let fetch: &StreamFetcher<'_> = &|_, _, _| panic!("nothing to fetch");
+        let result = fake_download(dir.path(), &mp4_merge_info(&dir.path().join("out")), &cookies, fetch).await;
+        assert!(result.as_ref().is_err_and(|e| e.contains("being downloaded already")), "{result:?}");
+        assert_eq!(runs_in(dir.path()), ["extract"]);
+    }
+
+    #[tokio::test]
+    async fn after_a_failed_attempt_yt_dlp_downloads_and_the_kept_streams_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let cookies = BrowserCookies::new(Some(dir.path().join("private")));
+        let fetch: &StreamFetcher<'_> = &|stream, _tx, _stop| {
+            Box::pin(async move {
+                std::fs::write(with_part(&stream.path), b"partial").unwrap();
+                Err("HTTP 403".to_string())
+            })
+        };
+        let out = dir.path().join("out");
+        let path = fake_download(dir.path(), &mp4_merge_info(&out), &cookies, fetch).await.unwrap();
+        assert_eq!(path, out.join("clip.mp4"));
+        // The attempt may have taken long enough for the formats' URLs to expire: yt-dlp finds
+        // them again.
+        assert_eq!(runs_in(dir.path()), ["extract", "download url"]);
+        assert_eq!(names_in(&out), ["clip.mp4"]);
+    }
+
+    /// yt-dlp's `-J` for a video of one DASH format (fragments), which the engine leaves to yt-dlp.
+    fn dash_info(out: &Path) -> Value {
+        let mut info = merge_info(out, Value::Null, Value::Null);
+        info["requested_formats"] = Value::Null;
+        for (key, value) in format_info("137", "mp4", "avc1", "none", 1000).as_object().unwrap() {
+            info[key] = value.clone();
+        }
+        info["protocol"] = "http_dash_segments".into();
+        info
+    }
+
+    #[tokio::test]
+    async fn streams_a_cancelled_attempt_kept_go_once_yt_dlp_makes_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cookies = BrowserCookies::new(Some(dir.path().join("private")));
+        let out = dir.path().join("out");
+        std::fs::create_dir(&out).unwrap();
+        for name in ["clip.f136.hf.mp4.part", "clip.f136.hf.mp4.part.hfstate", "clip.f140.hf.m4a"] {
+            std::fs::write(out.join(name), b"x").unwrap();
+        }
+        let fetch: &StreamFetcher<'_> = &|_, _, _| panic!("yt-dlp downloads DASH fragments");
+        let path = fake_download(dir.path(), &dash_info(&out), &cookies, fetch).await.unwrap();
+        assert_eq!(path, out.join("clip.mp4"));
+        assert_eq!(names_in(&out), ["clip.mp4"]);
     }
 }
