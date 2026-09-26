@@ -1,9 +1,11 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use crate::range::{ByteRange, RangeError};
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 
 /// Base and cap of the per-chunk exponential retry backoff.
 const BACKOFF_BASE: Duration = Duration::from_millis(500);
@@ -83,6 +85,12 @@ pub struct Chunk {
     pub current_offset: Arc<AtomicU64>,
     /// Inclusive end, lowered by work stealing while the chunk is in flight.
     pub end_offset: Arc<AtomicU64>,
+    /// Cancelled when another worker takes over what is left: the attempt's worker then stops at
+    /// once and settles nothing, since the chunk is no longer its own.
+    pub(crate) revoked: CancellationToken,
+    /// Since when the attempt's worker has been waiting for the server without a byte; `None`
+    /// while it is busy (writing, rate limited) rather than waiting.
+    waiting: Arc<Mutex<Option<Instant>>>,
     not_before: Option<Instant>,
     assigned_at: Option<Instant>,
     assigned_offset: u64,
@@ -97,10 +105,28 @@ impl Chunk {
             retries: 0,
             current_offset: Arc::new(AtomicU64::new(range.start)),
             end_offset: Arc::new(AtomicU64::new(range.end)),
+            revoked: CancellationToken::new(),
+            waiting: Arc::new(Mutex::new(None)),
             not_before: None,
             assigned_at: None,
             assigned_offset: range.start,
         }
+    }
+
+    /// The attempt's worker waits for the server from `since` on (a time in the future while
+    /// the rate limit holds it back).
+    pub(crate) fn wait_for_server(&self, since: Instant) {
+        *self.waiting.lock() = Some(since);
+    }
+
+    /// The attempt's worker is busy with what arrived, not waiting for the server.
+    pub(crate) fn busy(&self) {
+        *self.waiting.lock() = None;
+    }
+
+    /// How long the attempt's worker has been waiting for the server without a byte.
+    fn silence(&self, now: Instant) -> Duration {
+        self.waiting.lock().map_or(Duration::ZERO, |since| now.saturating_duration_since(since))
     }
 
     pub fn is_completed(&self) -> bool {
@@ -284,7 +310,63 @@ impl ChunkManager {
         chunk.not_before = None;
         chunk.assigned_at = Some(now);
         chunk.assigned_offset = chunk.current_offset.load(Ordering::SeqCst);
+        chunk.wait_for_server(now);
         chunk.clone()
+    }
+
+    /// Hands everything left of the in-flight chunk whose worker has waited longest for the server
+    /// without a byte to an idle thief, if that wait is at least `min_silence(chunk's mirror)`. The
+    /// silent attempt is revoked. What it wrote becomes a completed chunk; the rest keeps the
+    /// chunk's id and gets new offsets and a new token, so the revoked worker, which still holds
+    /// the old ones, can neither move nor settle what the thief now owns.
+    pub fn take_over_silent(
+        &mut self,
+        thief_worker_id: usize,
+        thief_mirror_id: usize,
+        min_silence: impl Fn(usize) -> Duration,
+    ) -> Option<Chunk> {
+        if self.fatal.is_some() {
+            return None;
+        }
+        let now = Instant::now();
+        let (id, _) = self
+            .chunks
+            .iter()
+            .filter_map(|c| match c.status {
+                ChunkStatus::Assigned { mirror_id, .. } if c.remaining_bytes() > 0 => {
+                    let silent = c.silence(now);
+                    (silent >= min_silence(mirror_id)).then_some((c.id, silent))
+                }
+                _ => None,
+            })
+            .max_by_key(|&(_, silent)| silent)?;
+
+        let chunk = &mut self.chunks[id];
+        chunk.revoked.cancel();
+        // Read after revoking: whatever the old worker records from now on is its own business.
+        let pos = chunk.current_offset.load(Ordering::SeqCst).max(chunk.range.start);
+        let end = chunk.end_offset.load(Ordering::SeqCst);
+        if pos > end {
+            // Its last byte got written meanwhile, and the revoked worker will not settle it.
+            chunk.status = ChunkStatus::Completed;
+            self.completed += 1;
+            return None;
+        }
+        if pos > chunk.range.start {
+            let written = ByteRange { start: chunk.range.start, end: pos - 1 };
+            chunk.range.start = pos;
+            let prefix_id = self.chunks.len();
+            let mut done = Chunk::new(prefix_id, written);
+            done.status = ChunkStatus::Completed;
+            self.chunks.push(done);
+            self.completed += 1;
+        }
+        let chunk = &mut self.chunks[id];
+        chunk.current_offset = Arc::new(AtomicU64::new(pos));
+        chunk.end_offset = Arc::new(AtomicU64::new(end));
+        chunk.revoked = CancellationToken::new();
+        chunk.waiting = Arc::new(Mutex::new(None));
+        Some(self.assign(id, thief_worker_id, thief_mirror_id, now))
     }
 
     /// Splits the in-flight chunk with the longest estimated time remaining (ties: most bytes left).
@@ -459,11 +541,14 @@ impl ChunkManager {
         self.chunks.get_mut(chunk_id).ok_or(ChunkError::NotFound(chunk_id))
     }
 
-    /// Moves a chunk's assignment `by` into the past, as if its worker had been at it that long.
+    /// Moves a chunk's assignment and its worker's wait `by` into the past, as if its worker had
+    /// been at it that long.
     #[cfg(test)]
     pub(crate) fn backdate(&mut self, chunk_id: usize, by: Duration) {
         let chunk = &mut self.chunks[chunk_id];
         chunk.assigned_at = chunk.assigned_at.and_then(|t| t.checked_sub(by));
+        let waiting = *chunk.waiting.lock();
+        *chunk.waiting.lock() = waiting.and_then(|t| t.checked_sub(by));
     }
 }
 
@@ -576,6 +661,95 @@ mod tests {
         manager.get_next_work(0, 0).unwrap();
         let (_, stolen) = manager.steal_work(1, 0, timed(64 * 1024, 0.5, MB as f64)).unwrap();
         assert_eq!(stolen.range.start, 2 * MB);
+    }
+
+    const SILENT: Duration = Duration::from_secs(2);
+
+    #[test]
+    fn test_silent_chunk_is_taken_over_keeping_what_it_wrote() {
+        let mut manager = ChunkManager::new(4 * MB, 4 * MB).unwrap();
+        let silent = manager.get_next_work(0, 0).unwrap();
+        silent.current_offset.store(MB, Ordering::SeqCst);
+        manager.backdate(0, Duration::from_secs(3));
+
+        let taken = manager.take_over_silent(1, 2, |_| SILENT).unwrap();
+        assert!(silent.revoked.is_cancelled() && !taken.revoked.is_cancelled());
+        assert_eq!((taken.id, taken.range), (0, ByteRange::new(MB, 4 * MB - 1).unwrap()));
+        assert_eq!(taken.status, ChunkStatus::Assigned { worker_id: 1, mirror_id: 2 });
+        assert_eq!(taken.current_offset.load(Ordering::SeqCst), MB);
+        assert_eq!(manager.completed_ranges(), vec![ByteRange::new(0, MB - 1).unwrap()]);
+
+        // The revoked worker's late progress no longer counts: the rest is the thief's.
+        silent.current_offset.store(2 * MB, Ordering::SeqCst);
+        assert_eq!(manager.total_downloaded(), MB);
+        assert!(manager.take_over_silent(3, 0, |_| SILENT).is_none(), "the thief's attempt has just begun");
+
+        taken.current_offset.store(4 * MB, Ordering::SeqCst);
+        manager.mark_completed(taken.id).unwrap();
+        assert!(manager.is_all_completed());
+        assert_eq!(manager.completed_ranges(), vec![ByteRange::new(0, 4 * MB - 1).unwrap()]);
+    }
+
+    #[test]
+    fn test_silent_chunk_that_wrote_nothing_is_handed_over_whole() {
+        // Stuck before its answer arrived, at the very start of the file.
+        let mut manager = ChunkManager::new(2 * MB, MB).unwrap();
+        let silent = manager.get_next_work(0, 0).unwrap();
+        let other = manager.get_next_work(1, 0).unwrap();
+        manager.backdate(0, Duration::from_secs(3));
+
+        let taken = manager.take_over_silent(2, 0, |_| SILENT).unwrap();
+        assert!(silent.revoked.is_cancelled() && !other.revoked.is_cancelled());
+        assert_eq!((taken.id, taken.range), (0, ByteRange::new(0, MB - 1).unwrap()));
+        assert_eq!(manager.chunks().len(), 2, "nothing was written, so nothing is split off");
+        assert!(manager.completed_ranges().is_empty());
+
+        for chunk in [&taken, &other] {
+            chunk.current_offset.store(chunk.range.end + 1, Ordering::SeqCst);
+            manager.mark_completed(chunk.id).unwrap();
+        }
+        assert!(manager.is_all_completed());
+    }
+
+    #[test]
+    fn test_only_a_long_silence_is_taken_over() {
+        let mut manager = ChunkManager::new(3 * MB, MB).unwrap();
+        let quiet = manager.get_next_work(0, 0).unwrap();
+        let quieter = manager.get_next_work(1, 1).unwrap();
+        let working = manager.get_next_work(2, 0).unwrap();
+        manager.backdate(0, Duration::from_secs(3));
+        manager.backdate(1, Duration::from_secs(5));
+        manager.backdate(2, Duration::from_secs(9));
+        // Worker 2 is writing what arrived, not waiting for its server.
+        working.busy();
+
+        assert!(manager.take_over_silent(3, 0, |_| Duration::from_secs(6)).is_none());
+        // A mirror slow to answer gets longer: mirror 1's chunk is left alone.
+        let limit = |mirror: usize| if mirror == 1 { Duration::from_secs(10) } else { SILENT };
+        assert_eq!(manager.take_over_silent(3, 0, limit).unwrap().id, quiet.id);
+        assert!(!quieter.revoked.is_cancelled() && !working.revoked.is_cancelled());
+        // Of several silent chunks, the one silent longest goes first.
+        let mut manager = ChunkManager::new(2 * MB, MB).unwrap();
+        manager.get_next_work(0, 0).unwrap();
+        manager.get_next_work(1, 0).unwrap();
+        manager.backdate(0, Duration::from_secs(3));
+        manager.backdate(1, Duration::from_secs(4));
+        assert_eq!(manager.take_over_silent(2, 0, |_| SILENT).unwrap().id, 1);
+    }
+
+    #[test]
+    fn test_a_silent_chunk_that_finished_meanwhile_is_completed_not_handed_over() {
+        let mut manager = ChunkManager::new(MB, MB).unwrap();
+        let silent = manager.get_next_work(0, 0).unwrap();
+        manager.backdate(0, Duration::from_secs(3));
+        // The worker's last batch lands just as its chunk is picked to be taken over.
+        let lands = |_| {
+            silent.current_offset.store(MB, Ordering::SeqCst);
+            SILENT
+        };
+        assert!(manager.take_over_silent(1, 0, lands).is_none(), "nothing is left to hand over");
+        assert!(silent.revoked.is_cancelled());
+        assert!(manager.is_all_completed(), "the revoked worker will not complete it");
     }
 
     #[test]

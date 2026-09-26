@@ -1544,6 +1544,28 @@ async fn test_connection_quiet_mid_body_is_replaced_long_before_the_stall_timeou
     assert_eq!(mock.served_ranges()[1].start, (PREFETCH + 32 * KB) as u64, "the retry continues where the first stopped");
 }
 
+#[tokio::test]
+async fn test_idle_worker_takes_over_a_silent_chunk() {
+    let _history = setup().await;
+    let data = payload(PREFETCH + 4096 * KB, 241);
+    let mut mock = Mock::new(data.clone());
+    // Less than a steal takes (32 KiB here), so part of the chunk stays with the silent connection.
+    mock.plan = |i| if i == 0 { Reply::StallAfter(16 * KB) } else { Reply::Normal };
+    let mock = Arc::new(mock);
+    let url = serve(Arc::clone(&mock), "silent.bin").await;
+    let temp = tempdir().unwrap();
+    let out = temp.path().join("silent.bin");
+
+    // The others finish at once and sit idle; one of them takes over from the silent connection
+    // after about 2 s, well before its own 5 s idle timeout would end it.
+    let engine = DownloadEngine::new(vec![url], options(&out, 4, 256 * KB));
+    let started = Instant::now();
+    run(&engine, None).await.expect("download should succeed");
+
+    assert!(started.elapsed() < Duration::from_millis(4500), "took {:?}", started.elapsed());
+    assert_file(&out, &data);
+}
+
 /// A mirror at a redirector (`/latest.bin`) that sends every request to `file`, the real server.
 async fn redirected_to(file: &Arc<Mock>) -> (Arc<Mock>, Url) {
     let target = serve(Arc::clone(file), "real.bin").await;
