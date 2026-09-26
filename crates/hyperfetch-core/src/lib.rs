@@ -13,6 +13,7 @@ pub mod queue;
 pub mod media;
 pub mod history;
 pub mod verify;
+pub mod hosts;
 
 pub use range::{ByteRange, RangeError};
 pub use chunk::{Chunk, ChunkManager, ChunkStatus, ChunkError};
@@ -33,4 +34,5 @@ pub use media::{
 };
 pub use history::{DownloadHistoryManager, HistoryEntry, HistoryStatus};
 pub use verify::{BuildVerificationResult, verify_build_file, repair_missing_ranges};
+pub use hosts::{HostKey, HostProfile};
 
