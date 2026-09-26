@@ -86,6 +86,22 @@ pub(crate) fn peak(url: &Url) -> usize {
     HOSTS.entries.lock().get(&HostKey::of(url)).map_or(0, |entry| entry.peak)
 }
 
+/// A local listener for a test server whose host (scheme, host and port) this process has seen
+/// nothing of: its port is below the ephemeral range other listeners get theirs from, and no
+/// other listener from here had it.
+#[cfg(test)]
+pub(crate) async fn unseen_listener() -> tokio::net::TcpListener {
+    use std::sync::atomic::{AtomicU16, Ordering};
+    static NEXT_PORT: AtomicU16 = AtomicU16::new(20_000);
+    loop {
+        let port = NEXT_PORT.fetch_add(1, Ordering::SeqCst);
+        assert!(port < 32_768, "out of ports below the ephemeral range");
+        if let Ok(listener) = tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+            return listener;
+        }
+    }
+}
+
 /// A slot for a request to `url`'s host under `limit`, if one is free now.
 pub fn try_acquire(url: &Url, limit: usize) -> Option<HostSlot> {
     HOSTS.try_acquire(&HostKey::of(url), limit, Instant::now())
@@ -97,12 +113,20 @@ pub struct HostSlot {
     hosts: &'static Hosts,
     key: HostKey,
     limit: usize,
+    idle_before: Option<Duration>,
 }
 
 impl HostSlot {
     /// The host this slot is for.
     pub fn host(&self) -> &HostKey {
         &self.key
+    }
+
+    /// How long no request to the host had ended when this slot was taken; `None` if none had
+    /// since the host was last forgotten. A client keeps a connection for reuse only so long
+    /// after its request ends, so after longer than that this request opens a new one.
+    pub fn idle_before(&self) -> Option<Duration> {
+        self.idle_before
     }
 
     /// The host refused this request with 429/503. With other requests to it open at the time, it
@@ -208,6 +232,8 @@ struct Entry {
     held: Limits,
     /// The limits of requests waiting for a slot.
     waiting: Limits,
+    /// When a request to the host last ended.
+    released: Option<Instant>,
     /// When the connection cap was last raised.
     cap_raised: Option<Instant>,
     /// The most requests ever open at once.
@@ -272,7 +298,8 @@ impl Hosts {
         {
             entry.peak = entry.peak.max(entry.open);
         }
-        Some(HostSlot { hosts: self, key: key.clone(), limit })
+        let idle_before = entry.released.map(|at| now.saturating_duration_since(at));
+        Some(HostSlot { hosts: self, key: key.clone(), limit, idle_before })
     }
 
     async fn acquire(&'static self, key: HostKey, limit: usize) -> HostSlot {
@@ -317,6 +344,7 @@ impl Hosts {
             if let Some(entry) = entries.get_mut(key) {
                 entry.open = entry.open.saturating_sub(1);
                 remove_limit(&mut entry.held, limit);
+                entry.released = Some(now);
             }
             forget_idle(&mut entries, now);
         }
@@ -528,6 +556,19 @@ mod tests {
         assert_eq!(more.host(), &host);
         assert!(started.elapsed() >= Duration::from_secs(1), "not while the strict one waited");
         assert!(hosts.entries.lock()[&host].waiting.is_empty());
+    }
+
+    #[test]
+    fn test_a_slot_tells_how_long_no_request_to_the_host_had_ended() {
+        let (hosts, host) = (leaked(), key("http://idle.example/"));
+        let first = hosts.try_acquire(&host, 0, Instant::now()).unwrap();
+        let open = hosts.try_acquire(&host, 0, Instant::now()).unwrap();
+        assert_eq!(open.idle_before(), None, "a request still open leaves no connection to reuse");
+        drop(first);
+        let later = hosts.try_acquire(&host, 0, Instant::now() + Duration::from_secs(90)).unwrap();
+        let idle = later.idle_before().expect("a request ended before");
+        assert!(idle >= Duration::from_secs(90) && idle < Duration::from_secs(91), "{idle:?}");
+        drop(open);
     }
 
     #[tokio::test]
