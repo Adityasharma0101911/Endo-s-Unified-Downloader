@@ -519,7 +519,6 @@ impl DownloadEngine {
                 let writer = blocking(move || -> Result<DiskWriter, StorageError> {
                     let writer = DiskWriter::open_or_create(&path, size)?;
                     writer.write_chunk_slice(0, &prefetched)?;
-                    writer.sync()?;
                     Ok(writer)
                 })
                 .await?
@@ -681,13 +680,8 @@ impl DownloadEngine {
         while workers.join_next().await.is_some() {}
 
         match outcome {
-            Ok(()) => {
-                let writer = job.writer.clone();
-                blocking(move || writer.sync())
-                    .await?
-                    .map_err(|e| format!("Failed to flush download to disk: {}", e))?;
-                Ok(job.writer)
-            }
+            // No flush here: `finalize` flushes (with fsync_on_complete) while it hashes.
+            Ok(()) => Ok(job.writer),
             Err(e) => {
                 if let Err(save_err) = job.persist().await {
                     tracing::warn!("Failed to save resume state: {}", save_err);
@@ -891,15 +885,24 @@ impl DownloadEngine {
     }
 
     /// The BLAKE3 (hex) of the finished file at `path`, once its expected checksum is confirmed.
-    /// The digest comes from `written` where it can, else from reading the file. A mismatch found
-    /// without reading the whole file is confirmed by reading it before it counts: only the file
-    /// itself can condemn it.
+    /// The digest comes from `written` where it can, else from reading the file; with
+    /// fsync_on_complete the file is flushed to disk at the same time, and both must succeed. A
+    /// mismatch found without reading the whole file is confirmed by reading it before it counts:
+    /// only the file itself can condemn it.
     async fn verify_written(&self, path: &Path, written: Written) -> Result<String, VerifyError> {
         let expected = self.options.expected_checksum.clone();
         let writer = match &written {
             Written::Writer(writer) => Some(writer.clone()),
             _ => None,
         };
+        // Through a handle of its own, as the hash may be reading through the writer's.
+        let flush = self.options.fsync_on_complete.then(|| {
+            let (writer, path) = (writer.clone(), path.to_path_buf());
+            move || match writer {
+                Some(writer) => writer.sync_separately().map_err(|e| e.to_string()),
+                None => OpenOptions::new().write(true).open(&path).and_then(|f| f.sync_data()).map_err(|e| e.to_string()),
+            }
+        });
         let read_back = matches!(written, Written::File);
         let hash = {
             let (path, expected) = (path.to_path_buf(), expected.clone());
@@ -909,7 +912,7 @@ impl DownloadEngine {
                 Written::Digest(digest) => verify_digest(&digest, expected.as_deref()),
             }
         };
-        match blocking(hash).await.map_err(VerifyError::Io)? {
+        match hash_and_flush(hash, flush).await {
             Err(VerifyError::Mismatch(e)) if !read_back => {
                 tracing::warn!("{}; reading {} back to be sure", e, path.display());
                 let path = path.to_path_buf();
@@ -997,6 +1000,24 @@ enum Written {
     Writer(DiskWriter),
     /// Taken while the file was written in order (see [`StreamHasher`]).
     Digest(FileDigest),
+}
+
+/// Runs `hash` and, if given, `flush` at the same time on blocking threads. `hash`'s result
+/// stands once both are done, unless the flush failed.
+async fn hash_and_flush(
+    hash: impl FnOnce() -> Result<String, VerifyError> + Send + 'static,
+    flush: Option<impl FnOnce() -> Result<(), String> + Send + 'static>,
+) -> Result<String, VerifyError> {
+    let flushed = async {
+        match flush {
+            Some(flush) => blocking(flush).await.and_then(|flushed| flushed),
+            None => Ok(()),
+        }
+    };
+    let (hashed, flushed) = tokio::join!(blocking(hash), flushed);
+    let hashed = hashed.map_err(VerifyError::Io)??;
+    flushed.map_err(|e| VerifyError::Io(format!("Failed to flush download to disk: {}", e)))?;
+    Ok(hashed)
 }
 
 /// Checks `digest`, a digest of the file at `path` (reading it if needed), against `expected`.
@@ -2945,6 +2966,44 @@ mod tests {
         let err = engine.finalize(target.clone(), claim, Written::Writer(writer), unix_now(), &None).await.unwrap_err();
         assert!(err.contains("Checksum verification failed"), "{err}");
         assert!(!part_path(&target).exists() && !target.exists());
+    }
+
+    #[tokio::test]
+    async fn test_completion_waits_for_the_disk_only_with_fsync_on_complete() {
+        let dir = tempdir().unwrap();
+        for fsync in [false, true] {
+            let target = dir.path().join(format!("fsync-{fsync}.bin"));
+            let writer = written_part(&target, b"abc");
+            let engine = engine_with(DownloadOptions { fsync_on_complete: fsync, ..Default::default() });
+            let claim = Claim::try_take(&target).unwrap().unwrap();
+            let done = engine.finalize(target.clone(), claim, Written::Writer(writer.clone()), unix_now(), &None).await;
+            assert_eq!(done.unwrap(), target);
+            assert_eq!(writer.sync_count(), usize::from(fsync), "fsync_on_complete: {fsync}");
+            assert_eq!(std::fs::read(&target).unwrap(), b"abc");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_flush_and_hash_run_at_the_same_time() {
+        // Each waits for the other to have started: run one after the other, both would time out.
+        let (flush_started, flush_rx) = std::sync::mpsc::channel();
+        let (hash_started, hash_rx) = std::sync::mpsc::channel();
+        let hash = move || {
+            let _ = hash_started.send(());
+            flush_rx
+                .recv_timeout(Duration::from_secs(10))
+                .map(|()| "digest".to_string())
+                .map_err(|_| VerifyError::Io("the flush did not run alongside".into()))
+        };
+        let flush = move || {
+            let _ = flush_started.send(());
+            hash_rx.recv_timeout(Duration::from_secs(10)).map_err(|_| "the hash did not run alongside".to_string())
+        };
+        assert_eq!(hash_and_flush(hash, Some(flush)).await.unwrap(), "digest");
+
+        // A failed flush fails the download, so the file is not renamed.
+        let err = hash_and_flush(|| Ok("digest".to_string()), Some(|| Err("disk gone".to_string()))).await.unwrap_err();
+        assert!(matches!(&err, VerifyError::Io(e) if e.contains("disk gone")), "{err}");
     }
 
     #[tokio::test]
