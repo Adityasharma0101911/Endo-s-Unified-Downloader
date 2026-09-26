@@ -55,6 +55,8 @@ pub struct DiskWriter {
 struct Inner {
     file: Arc<File>,
     hashes: Arc<Hashes>,
+    #[cfg(test)]
+    syncs: AtomicUsize,
 }
 
 impl Drop for Inner {
@@ -95,6 +97,8 @@ impl DiskWriter {
             inner: Arc::new(Inner {
                 file: Arc::new(file),
                 hashes: Arc::new(Hashes::new(total_size, block)),
+                #[cfg(test)]
+                syncs: AtomicUsize::new(0),
             }),
         })
     }
@@ -233,8 +237,26 @@ impl DiskWriter {
 
     /// Flushes written data to persistent storage.
     pub fn sync(&self) -> Result<(), StorageError> {
+        #[cfg(test)]
+        self.inner.syncs.fetch_add(1, Ordering::Relaxed);
         self.inner.file.sync_data()?;
         Ok(())
+    }
+
+    /// Flushes written data to persistent storage through a handle of its own, so that reads
+    /// through this writer (such as [`DiskWriter::digest`]) go on meanwhile: Windows serves one
+    /// handle's requests, the flush included, one at a time.
+    pub fn sync_separately(&self) -> Result<(), StorageError> {
+        #[cfg(test)]
+        self.inner.syncs.fetch_add(1, Ordering::Relaxed);
+        OpenOptions::new().write(true).open(&self.path)?.sync_data()?;
+        Ok(())
+    }
+
+    /// How often this writer (any clone) was synced.
+    #[cfg(test)]
+    pub(crate) fn sync_count(&self) -> usize {
+        self.inner.syncs.load(Ordering::Relaxed)
     }
 }
 
