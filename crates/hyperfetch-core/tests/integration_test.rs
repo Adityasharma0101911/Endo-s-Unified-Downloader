@@ -1310,6 +1310,34 @@ async fn test_small_file_takes_one_get_and_no_worker() {
 }
 
 #[tokio::test]
+async fn test_file_the_probe_brought_whole_is_written_plainly_without_state() {
+    isolate_history();
+    let _history = HISTORY.write().await;
+    let data = payload(300 * KB, 211);
+    let url = serve(Arc::new(Mock::new(data.clone())), "whole.bin").await;
+    let temp = tempdir().unwrap();
+    let out = temp.path().join("whole.bin");
+    // Such a file has nothing to resume, so no state is saved: one that cannot be changes nothing.
+    std::fs::create_dir(DownloadState::state_file_path(&part_of(&out))).unwrap();
+
+    let engine = DownloadEngine::new(vec![url], options(&out, 4, 64 * KB));
+    let path = run(&engine, None).await.expect("download should succeed");
+
+    assert_eq!(path, out);
+    assert_file(&out, &data);
+    assert!(!part_of(&out).exists());
+    let entry = history_entry(&out).expect("the download is recorded");
+    assert_eq!(entry.blake3_hash, Some(blake3::hash(&data).to_hex().to_string()));
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_SPARSE_FILE: u32 = 0x200;
+        let attributes = std::fs::metadata(&out).unwrap().file_attributes();
+        assert_eq!(attributes & FILE_ATTRIBUTE_SPARSE_FILE, 0, "a small file is written plainly, not as a sparse file");
+    }
+}
+
+#[tokio::test]
 async fn test_sha256_checksum_of_a_multi_connection_download() {
     use sha2::Digest;
     isolate_history();

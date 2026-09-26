@@ -25,7 +25,7 @@ use crate::hls::HlsError;
 use crate::mirror::MirrorRacer;
 use crate::range::{compute_gaps, ByteRange};
 use crate::state::DownloadState;
-use crate::storage::{verify_digest, DiskWriter, FileDigest, StorageError, VerifyError};
+use crate::storage::{verify_digest, DiskWriter, FileDigest, StorageError, StreamHasher, VerifyError};
 use crate::worker::{
     authorize, content_length, retry_after, Auth, FailureKind, HttpWorker, RateLimiter, WorkerEvent, WorkerShared,
 };
@@ -496,8 +496,11 @@ impl DownloadEngine {
             tracing::info!("Resuming {} with {} completed range(s)", part.display(), previous.completed_ranges.len());
             state.completed_ranges = previous.completed_ranges;
         }
-        // Record the sources and validators before the first byte arrives.
-        {
+        let prefetched = reference.prefetch.clone();
+        // The probe brought the whole file: it is written in one go, so there is nothing to resume.
+        let whole = reference.size == Some(prefetched.len() as u64);
+        // Otherwise record the sources and validators before the first byte arrives.
+        if !whole {
             let (state, path) = (state.clone(), state_path.clone());
             blocking(move || state.save_atomic(&path))
                 .await?
@@ -511,19 +514,26 @@ impl DownloadEngine {
             mirrors.len(),
             reference.accepts_ranges
         );
-        let prefetched = reference.prefetch.clone();
         let written = match reference.size {
-            // The probe brought the whole file.
-            Some(size) if size == prefetched.len() as u64 => {
-                let path = part.clone();
-                let writer = blocking(move || -> Result<DiskWriter, StorageError> {
-                    let writer = DiskWriter::open_or_create(&path, size)?;
-                    writer.write_chunk_slice(0, &prefetched)?;
-                    Ok(writer)
+            // A plain write (no sparse file, no preallocation, no flush unless fsync_on_complete
+            // asks for one in `finalize`), hashed from memory.
+            _ if whole => {
+                let (path, expected) = (part.clone(), self.options.expected_checksum.clone());
+                let digest = blocking(move || {
+                    let written = std::fs::write(&path, &prefetched);
+                    if written.is_err() {
+                        // Without a state file nothing could resume it.
+                        let _ = std::fs::remove_file(&path);
+                    }
+                    written.map(|()| {
+                        let mut hasher = StreamHasher::new(expected.as_deref());
+                        hasher.update(&prefetched);
+                        hasher.finish()
+                    })
                 })
                 .await?
                 .map_err(|e| format!("Failed to write {}: {}", part.display(), e))?;
-                Written::Writer(writer)
+                Written::Digest(digest)
             }
             Some(size) if reference.accepts_ranges => {
                 let per_connection = reference.per_setup.map_or(BYTES_PER_CONNECTION, |bytes| {
