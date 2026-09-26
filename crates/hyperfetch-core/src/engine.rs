@@ -231,11 +231,12 @@ impl DownloadEngine {
             tracing::info!("Detected HLS video stream: {}", playlist);
             let started_at = unix_now();
             let auth = self.auth.as_deref();
+            let fetch = crate::hls::FetchPolicy { stall_timeout: self.stall_timeout(), max_retries: self.options.max_retries };
             let parsed = self
                 .guarded(
                     HLS_PARSE_TIMEOUT,
                     "fetching the HLS playlist",
-                    crate::hls::parse_hls_playlist(&client, playlist, auth),
+                    crate::hls::parse_hls_playlist(&client, playlist, auth, fetch),
                 )
                 .await?;
             match parsed {
@@ -244,13 +245,14 @@ impl DownloadEngine {
                     let cancel_flag = Some(Arc::clone(&self.cancel_flag));
                     // The claim is held until this download returns, whichever way it ends.
                     let (target, _claim) =
-                        claim_hls_output(&client, auth, playlist, &segments, base, &cancel_flag).await?;
+                        claim_hls_output(&client, auth, playlist, &segments, base, fetch, &cancel_flag).await?;
+                    let options = crate::hls::HlsOptions { connections: self.options.num_connections, fetch };
                     let path = crate::hls::HlsEngine::download(
                         &client,
                         auth,
                         segments,
                         target,
-                        self.options.num_connections,
+                        &options,
                         snapshot_tx,
                         cancel_flag,
                     )
@@ -1053,6 +1055,7 @@ async fn claim_hls_output(
     playlist: &Url,
     segments: &[crate::hls::HlsSegment],
     base: PathBuf,
+    fetch: crate::hls::FetchPolicy,
     cancel_flag: &Option<Arc<AtomicBool>>,
 ) -> Result<(crate::hls::HlsTarget, Claim), String> {
     if let Some(parent) = base.parent().filter(|p| !p.as_os_str().is_empty()).map(Path::to_path_buf) {
@@ -1070,7 +1073,7 @@ async fn claim_hls_output(
         let Some(claim) = claim else {
             continue;
         };
-        let prepared = crate::hls::HlsEngine::prepare(client, auth, playlist, segments, &candidate, cancel_flag).await;
+        let prepared = crate::hls::HlsEngine::prepare(client, auth, playlist, segments, &candidate, fetch, cancel_flag).await;
         if let Some(target) = prepared.map_err(|e| e.to_string())? {
             return Ok((target, claim));
         }
@@ -2617,6 +2620,44 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"INTRO 720-1 720-2 ");
         let fetched = |seg: &str| hits.lock().iter().filter(|(p, _)| p.contains("q=720&") && p.ends_with(seg)).map(|(_, n)| n).sum::<usize>();
         assert_eq!((fetched("n=0"), fetched("n=1")), (2, 2), "checked once each after the first run, not refetched");
+    }
+
+    #[tokio::test]
+    async fn test_hls_takes_stall_timeout_and_retries_from_the_options() {
+        use crate::hls::tests::{ok, serve};
+        let busy = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let busy_srv = Arc::clone(&busy);
+        let (addr, hits) = serve(move |path: &str, _| match path {
+            "/stall.m3u8" => ok("#EXTM3U\n#EXTINF:4,\nstall.ts\n#EXT-X-ENDLIST\n"),
+            "/busy.m3u8" => ok("#EXTM3U\n#EXTINF:4,\nbusy.ts\n#EXT-X-ENDLIST\n"),
+            "/stall.ts" => (0, String::new(), Vec::new()),
+            // More failures in a row than HLS used to try.
+            "/busy.ts" if busy_srv.fetch_add(1, Ordering::SeqCst) < 6 => (503, String::new(), Vec::new()),
+            "/busy.ts" => ok("DATA"),
+            _ => (404, String::new(), Vec::new()),
+        })
+        .await;
+        let dir = tempdir().unwrap();
+        let engine = |path: &str, stall_timeout_secs: u64, max_retries: u32| {
+            let options = DownloadOptions {
+                output_path: Some(dir.path().to_path_buf()),
+                num_connections: 1,
+                stall_timeout_secs,
+                max_retries,
+                ..Default::default()
+            };
+            DownloadEngine::new(vec![Url::parse(&format!("http://{addr}{path}")).unwrap()], options)
+        };
+
+        // One attempt that gives up after a second, not five of 30 s each.
+        let started = Instant::now();
+        let err = tokio::time::timeout(Duration::from_secs(10), engine("/stall.m3u8", 1, 0).run(None)).await.unwrap().unwrap_err();
+        assert!(err.contains("after 1 attempt(s)"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+
+        let path = engine("/busy.m3u8", 30, 6).run(None).await.unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"DATA");
+        assert_eq!(hits.lock()["/busy.ts"], 7);
     }
 
     #[test]
