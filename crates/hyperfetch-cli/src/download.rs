@@ -223,6 +223,8 @@ pub struct Job {
     pub label: String,
     pub urls: Vec<Url>,
     pub options: DownloadOptions,
+    /// The line of the input file (-i) that listed it.
+    pub line: Option<usize>,
 }
 
 enum Outcome {
@@ -275,9 +277,9 @@ pub async fn run_jobs(jobs: Vec<Job>, concurrency: usize, ui: &Ui, shutdown: &Sh
     });
     let named = concurrency > 1 && jobs.len() > 1;
     let clients = Clients::for_jobs(&jobs).await;
-    let mut outcomes = futures_util::stream::iter(jobs.into_iter().enumerate())
-        .map(|(index, job)| {
-            let input = named.then(|| input_name(index, &job.urls));
+    let mut outcomes = futures_util::stream::iter(jobs)
+        .map(|job| {
+            let input = named.then(|| input_name(job.line, &job.urls)).flatten();
             run_job(job, input, &clients, ui, shutdown, overall.as_ref())
         })
         .buffer_unordered(concurrency.max(1));
@@ -302,18 +304,23 @@ pub async fn run_jobs(jobs: Vec<Job>, concurrency: usize, ui: &Ui, shutdown: &Sh
     failed
 }
 
-/// "#3 https://host/path/file": the job's place in the input and its first URL, without the
-/// query and fragment, which may carry access tokens.
-fn input_name(index: usize, urls: &[Url]) -> String {
-    let number = format!("#{}", index + 1);
-    match urls.first() {
-        Some(url) => {
-            let mut shown = url.clone();
-            shown.set_query(None);
-            shown.set_fragment(None);
-            format!("{} {}", number, truncate(shown.as_str(), 100))
-        }
-        None => number,
+/// "line 3 https://host/path/file": the input-file line that listed the job, if one did, and its
+/// first URL without the user name, password, query and fragment, which may carry credentials.
+/// None when there is neither.
+fn input_name(line: Option<usize>, urls: &[Url]) -> Option<String> {
+    let url = urls.first().map(|url| {
+        let mut shown = url.clone();
+        // These fail only for URLs that cannot carry credentials.
+        let _ = shown.set_username("");
+        let _ = shown.set_password(None);
+        shown.set_query(None);
+        shown.set_fragment(None);
+        truncate(shown.as_str(), 100)
+    });
+    match (line, url) {
+        (Some(line), Some(url)) => Some(format!("line {} {}", line, url)),
+        (Some(line), None) => Some(format!("line {}", line)),
+        (None, url) => url,
     }
 }
 
@@ -592,6 +599,7 @@ mod tests {
             label: name.to_string(),
             urls: vec![Url::parse(&format!("{}/{}.bin", server, name)).unwrap()],
             options: DownloadOptions { output_path: Some(dir.join("")), ..Default::default() },
+            line: None,
         };
         let mut jobs: Vec<Job> = ["a", "b", "c"].iter().map(|name| job(name)).collect();
         // A client that cannot be built fails only the downloads that need it.
@@ -646,11 +654,17 @@ mod tests {
     #[test]
     fn parallel_results_name_their_input() {
         let urls = [Url::parse("https://cdn.example/dl/a.iso?token=secret#part").unwrap()];
-        assert_eq!(input_name(2, &urls), "#3 https://cdn.example/dl/a.iso");
-        assert_eq!(input_name(0, &[]), "#1");
+        assert_eq!(input_name(Some(3), &urls).as_deref(), Some("line 3 https://cdn.example/dl/a.iso"));
+        assert_eq!(input_name(None, &urls).as_deref(), Some("https://cdn.example/dl/a.iso"));
+        let login = [Url::parse("https://alice:s3cret@files.example/a.iso").unwrap()];
+        assert_eq!(input_name(Some(1), &login).as_deref(), Some("line 1 https://files.example/a.iso"));
+        let user = [Url::parse("https://alice@files.example/a.iso").unwrap()];
+        assert_eq!(input_name(None, &user).as_deref(), Some("https://files.example/a.iso"));
+        assert_eq!(input_name(Some(7), &[]).as_deref(), Some("line 7"));
+        assert_eq!(input_name(None, &[]), None);
         let path = std::path::Path::new("out").join("a.iso");
-        let named = done_line(Some("#3 https://cdn.example/dl/a.iso"), &path);
-        assert_eq!(named, format!("[OK] #3 https://cdn.example/dl/a.iso -> {}", path.display()));
+        let named = done_line(Some("line 3 https://cdn.example/dl/a.iso"), &path);
+        assert_eq!(named, format!("[OK] line 3 https://cdn.example/dl/a.iso -> {}", path.display()));
         assert_eq!(done_line(None, &path), format!("[OK] {}", path.display()));
     }
 
