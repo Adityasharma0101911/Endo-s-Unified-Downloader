@@ -63,19 +63,21 @@ struct ArchiveAlternateLocations {
     workable: Option<Vec<ArchiveServerDir>>,
 }
 
+/// What the resolver reads of an item's metadata. The item's servers (`server`, `d1`, `d2`) are
+/// left out: `workable_servers` lists those of them that are up, the only ones a download can use.
 #[derive(Debug)]
 struct ArchiveMetadata {
-    server: Option<String>,
-    d1: Option<String>,
-    d2: Option<String>,
     dir: Option<String>,
     workable_servers: Option<Vec<String>>,
     alternate_locations: Option<ArchiveAlternateLocations>,
 }
 
 /// archive.org's item metadata: `/{id}` is the whole record (megabytes for an item with thousands
-/// of files), `/{id}/{field}` one field of it.
+/// of files: 43 MB and 18 s for one with 180,000), `/{id}/{field}` one field of it.
 const ARCHIVE_METADATA: &str = "https://archive.org/metadata";
+
+/// How long the files of one item resolve with the metadata fetched for the first of them.
+const ARCHIVE_METADATA_REUSE: Duration = Duration::from_secs(60);
 
 /// One field of an item's metadata: `{"result": ...}`, or `{"error": ...}` when the item or the
 /// field does not exist.
@@ -84,7 +86,35 @@ struct ArchiveField<T> {
     result: Option<T>,
 }
 
+type SharedMetadata = std::sync::Arc<tokio::sync::OnceCell<std::sync::Arc<ArchiveMetadata>>>;
+
 impl ArchiveMetadata {
+    /// The metadata of item `identifier` at `base`, fetched once for every file of the item that
+    /// resolves within [`ARCHIVE_METADATA_REUSE`] of the first: once a client has sent a dozen
+    /// metadata requests, archive.org answers about one a second, so a batch of files from one
+    /// item must not ask again for each file. A failed fetch is not kept.
+    async fn shared(client: &Client, base: &str, identifier: &str) -> Result<std::sync::Arc<Self>, ResolverError> {
+        static RECENT: parking_lot::Mutex<Vec<(String, std::time::Instant, SharedMetadata)>> =
+            parking_lot::const_mutex(Vec::new());
+        let item = format!("{}/{}", base, identifier);
+        let metadata = {
+            let mut recent = RECENT.lock();
+            recent.retain(|(_, first, _)| first.elapsed() < ARCHIVE_METADATA_REUSE);
+            match recent.iter().find(|(known, _, _)| *known == item) {
+                Some((_, _, metadata)) => metadata.clone(),
+                None => {
+                    let metadata = SharedMetadata::default();
+                    recent.push((item, std::time::Instant::now(), metadata.clone()));
+                    metadata
+                }
+            }
+        };
+        metadata
+            .get_or_try_init(|| async { Self::fetch(client, base, identifier).await.map(std::sync::Arc::new) })
+            .await
+            .cloned()
+    }
+
     /// Fetches the fields the resolver reads, all at once, from the metadata at `base`.
     async fn fetch(client: &Client, base: &str, identifier: &str) -> Result<Self, ResolverError> {
         async fn field<T: serde::de::DeserializeOwned>(
@@ -99,15 +129,12 @@ impl ArchiveMetadata {
                 .map_err(|e| ResolverError::Parse(format!("archive.org metadata {}: {}", name, e)))?;
             Ok(field.result)
         }
-        let (server, d1, d2, dir, workable_servers, alternate_locations) = tokio::try_join!(
-            field(client, base, identifier, "server"),
-            field(client, base, identifier, "d1"),
-            field(client, base, identifier, "d2"),
+        let (dir, workable_servers, alternate_locations) = tokio::try_join!(
             field(client, base, identifier, "dir"),
             field(client, base, identifier, "workable_servers"),
             field(client, base, identifier, "alternate_locations"),
         )?;
-        Ok(Self { server, d1, d2, dir, workable_servers, alternate_locations })
+        Ok(Self { dir, workable_servers, alternate_locations })
     }
 }
 
@@ -140,7 +167,7 @@ impl HostResolver for ArchiveOrgResolver {
         let (identifier, file) = archive_item_path(url)
             .ok_or_else(|| ResolverError::Parse(format!("Not an archive.org file URL: {}", url)))?;
 
-        let metadata = ArchiveMetadata::fetch(client, ARCHIVE_METADATA, &identifier).await?;
+        let metadata = ArchiveMetadata::shared(client, ARCHIVE_METADATA, &identifier).await?;
 
         let mut server_dirs: Vec<(String, String)> = Vec::new();
         let mut seen = HashSet::new();
@@ -151,8 +178,7 @@ impl HostResolver for ArchiveOrgResolver {
         };
 
         if let Some(ref d) = metadata.dir {
-            let named = [&metadata.server, &metadata.d1, &metadata.d2];
-            for s in named.into_iter().flatten().chain(metadata.workable_servers.iter().flatten()) {
+            for s in metadata.workable_servers.iter().flatten() {
                 add(s, d);
             }
         }
@@ -901,20 +927,18 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_archive_org_metadata_fetches_only_the_fields_it_reads() {
-        // archive.org's answers for the item "nasa" (d2 made missing).
+    /// Serves archive.org's metadata answers for the item "nasa" (`alternate_locations` made
+    /// missing) at `/metadata`, and a 503 for every request while `down` is set. Logs the paths
+    /// asked for.
+    async fn serve_archive_metadata(
+        down: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> (String, std::sync::Arc<parking_lot::Mutex<Vec<String>>>) {
         fn reply(path: &str) -> &'static str {
             match path {
-                "/metadata/nasa/server" => r#"{"result":"ia801607.us.archive.org"}"#,
-                "/metadata/nasa/d1" => r#"{"result":"ia601607.us.archive.org"}"#,
-                "/metadata/nasa/d2" => r#"{"error":"Couldn't get 'd2' for item nasa"}"#,
                 "/metadata/nasa/dir" => r#"{"result":"/6/items/nasa"}"#,
                 "/metadata/nasa/workable_servers" => r#"{"result":["ia801607.us.archive.org","ia601607.us.archive.org"]}"#,
-                "/metadata/nasa/alternate_locations" => {
-                    r#"{"result":{"servers":[{"server":"dn790001.ca.archive.org","dir":"/0/items/nasa"}],"workable":[]}}"#
-                }
-                _ => r#"{"files":[]}"#,
+                "/metadata/nasa/alternate_locations" => r#"{"error":"Couldn't get 'alternate_locations' for item nasa"}"#,
+                _ => r#"{"d1":"ia601607.us.archive.org","dir":"/6/items/nasa","files":[]}"#,
             }
         }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -923,15 +947,20 @@ mod tests {
         let log = requested.clone();
         tokio::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
-                let log = log.clone();
+                let (log, down) = (log.clone(), down.clone());
                 tokio::spawn(async move {
                     let mut buf = [0u8; 4096];
                     let n = sock.read(&mut buf).await.unwrap_or(0);
                     let path = String::from_utf8_lossy(&buf[..n]).split_whitespace().nth(1).unwrap_or("").to_string();
-                    let body = reply(&path);
+                    let (status, body) = if down.load(std::sync::atomic::Ordering::Relaxed) {
+                        ("503 Service Unavailable", "")
+                    } else {
+                        ("200 OK", reply(&path))
+                    };
                     log.lock().push(path);
                     let head = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        status,
                         body.len()
                     );
                     let _ = sock.write_all(head.as_bytes()).await;
@@ -939,21 +968,40 @@ mod tests {
                 });
             }
         });
+        (base, requested)
+    }
 
+    #[tokio::test]
+    async fn test_archive_org_metadata_fetches_only_the_fields_it_reads() {
+        let (base, requested) = serve_archive_metadata(Default::default()).await;
         let metadata = ArchiveMetadata::fetch(&local_client(), &base, "nasa").await.unwrap();
-        assert_eq!(metadata.server.as_deref(), Some("ia801607.us.archive.org"));
-        assert_eq!(metadata.d1.as_deref(), Some("ia601607.us.archive.org"));
-        assert_eq!(metadata.d2, None);
         assert_eq!(metadata.dir.as_deref(), Some("/6/items/nasa"));
-        assert_eq!(metadata.workable_servers.map(|s| s.len()), Some(2));
-        let alternate = metadata.alternate_locations.and_then(|a| a.servers).unwrap();
-        assert_eq!(alternate[0].server.as_deref(), Some("dn790001.ca.archive.org"));
+        assert_eq!(metadata.workable_servers.as_ref().map(Vec::len), Some(2));
+        assert!(metadata.alternate_locations.is_none(), "a missing field is absent");
 
-        // Never the whole record.
+        // Never the whole record, and no field workable_servers already covers.
         let mut paths = requested.lock().clone();
         paths.sort();
-        let fields = ["alternate_locations", "d1", "d2", "dir", "server", "workable_servers"];
+        let fields = ["alternate_locations", "dir", "workable_servers"];
         assert_eq!(paths, fields.map(|f| format!("/metadata/nasa/{}", f)));
+    }
+
+    #[tokio::test]
+    async fn test_archive_org_files_of_one_item_share_its_metadata() {
+        let down = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (base, requested) = serve_archive_metadata(down.clone()).await;
+        let client = local_client();
+        // A failed fetch is not kept.
+        assert!(ArchiveMetadata::shared(&client, &base, "nasa").await.is_err());
+        down.store(false, std::sync::atomic::Ordering::Relaxed);
+        requested.lock().clear();
+
+        // Files of a batch resolving at once, and one a moment later.
+        let (a, b) = tokio::join!(ArchiveMetadata::shared(&client, &base, "nasa"), ArchiveMetadata::shared(&client, &base, "nasa"));
+        let c = ArchiveMetadata::shared(&client, &base, "nasa").await.unwrap();
+        assert!(std::sync::Arc::ptr_eq(&a.unwrap(), &c) && std::sync::Arc::ptr_eq(&b.unwrap(), &c));
+        assert_eq!(c.dir.as_deref(), Some("/6/items/nasa"));
+        assert_eq!(requested.lock().len(), 3, "one fetch: {:?}", requested.lock());
     }
 
     #[tokio::test]
