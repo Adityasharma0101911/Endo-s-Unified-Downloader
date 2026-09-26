@@ -1174,7 +1174,7 @@ struct ProbeInfo {
 
 impl ProbeInfo {
     fn strong_etag(&self) -> Option<&str> {
-        self.etag.as_deref().filter(|e| !e.starts_with("W/"))
+        self.etag.as_deref().filter(|e| is_strong(e))
     }
 
     /// Validator for `If-Range`: weak ETags are not allowed there.
@@ -1390,17 +1390,24 @@ fn build_racer(mirrors: &[ProbeInfo]) -> MirrorRacer {
 }
 
 /// Whether a probe's ranged GET, answered from `final_url`, leaves HEAD nothing to add: a 206
-/// with the total size, a validator, and a file name (its own Content-Disposition or a name in
-/// the URL's path).
+/// with the total size, a validator chunk requests can send as If-Range (a strong ETag or
+/// Last-Modified: HEAD may have the date a weak ETag cannot stand in for), and a file name (its
+/// own Content-Disposition or a name in the URL's path).
 fn says_it_all(status: StatusCode, headers: &HeaderMap, final_url: &Url) -> bool {
     let has_total = headers
         .get(CONTENT_RANGE)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| matches!(ByteRange::parse_content_range(v), Ok((_, Some(_)))));
+    let strong_etag = headers.get(ETAG).and_then(|v| v.to_str().ok()).is_some_and(is_strong);
     status == StatusCode::PARTIAL_CONTENT
         && has_total
-        && (headers.contains_key(ETAG) || headers.contains_key(LAST_MODIFIED))
+        && (strong_etag || headers.contains_key(LAST_MODIFIED))
         && (disposition_name(headers).is_some() || filename_from_url(final_url).is_some())
+}
+
+/// Whether an ETag is strong: If-Range takes no weak one.
+fn is_strong(etag: &str) -> bool {
+    !etag.starts_with("W/")
 }
 
 /// Answers that mean "not now", not "no ranges" or "no such file".
@@ -2267,6 +2274,8 @@ mod tests {
         assert!(!says_it_all(StatusCode::PARTIAL_CONTENT, &tagged, &unnamed), "no name");
         let untagged = headers(&[("content-range", "bytes 0-0/1000")]);
         assert!(!says_it_all(StatusCode::PARTIAL_CONTENT, &untagged, &named), "no validator");
+        let weak = headers(&[("content-range", "bytes 0-0/1000"), ("etag", "W/\"v1\"")]);
+        assert!(!says_it_all(StatusCode::PARTIAL_CONTENT, &weak, &named), "no validator If-Range takes");
         let no_total = headers(&[("content-range", "bytes 0-0/*"), ("etag", "\"v1\"")]);
         assert!(!says_it_all(StatusCode::PARTIAL_CONTENT, &no_total, &named), "no size");
         assert!(!says_it_all(StatusCode::OK, &tagged, &named), "no ranges");
