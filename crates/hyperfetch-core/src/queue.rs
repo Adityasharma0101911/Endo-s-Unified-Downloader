@@ -1,9 +1,11 @@
 use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::engine::{DownloadOptions, EngineSnapshot};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QueueItemStatus {
     /// Waiting for the scheduler or for the user to start it.
     Queued,
@@ -15,6 +17,9 @@ pub enum QueueItemStatus {
     Paused,
     Completed,
     Failed(String),
+    /// Restored after a restart without its Authorization header, which is never saved; it
+    /// runs again only once the header is provided (see [`DownloadQueue::provide_auth`]).
+    AuthRequired,
 }
 
 impl QueueItemStatus {
@@ -24,10 +29,11 @@ impl QueueItemStatus {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueueItem {
     pub id: usize,
     /// Mirrors of one file.
+    #[serde(with = "url_list")]
     pub urls: Vec<Url>,
     /// Display name: the URL's last path segment until the engine reports the real target.
     pub filename: String,
@@ -50,10 +56,13 @@ impl QueueItem {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DownloadQueue {
     items: Vec<QueueItem>,
     next_id: usize,
+    /// Bumped by every change, so a front-end knows when to save the queue.
+    #[serde(skip)]
+    revision: u64,
 }
 
 impl Default for DownloadQueue {
@@ -67,12 +76,19 @@ impl DownloadQueue {
         Self {
             items: Vec::new(),
             next_id: 1,
+            revision: 0,
         }
+    }
+
+    /// Changes whenever the queue may have changed.
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     pub fn add_item(&mut self, urls: Vec<Url>, options: DownloadOptions) -> usize {
         let id = self.next_id;
         self.next_id += 1;
+        self.revision += 1;
         let filename = urls
             .first()
             .and_then(|u| u.path_segments())
@@ -105,6 +121,7 @@ impl DownloadQueue {
     }
 
     fn get_item_mut(&mut self, id: usize) -> Option<&mut QueueItem> {
+        self.revision += 1;
         self.items.iter_mut().find(|i| i.id == id)
     }
 
@@ -160,7 +177,9 @@ impl DownloadQueue {
         item.total_bytes = snapshot.total_bytes;
         item.downloaded_bytes = snapshot.downloaded_bytes;
         item.speed_bytes_per_sec = snapshot.speed_bytes_per_sec;
-        item.progress_ratio = snapshot.progress_ratio.clamp(0.0, 1.0);
+        // NaN (0/0 from an empty stream) would make the saved queue unreadable JSON.
+        item.progress_ratio =
+            if snapshot.progress_ratio.is_nan() { 0.0 } else { snapshot.progress_ratio.clamp(0.0, 1.0) };
         if let Some(target) = &snapshot.target_path {
             if let Some(name) = target.file_name() {
                 item.filename = name.to_string_lossy().into_owned();
@@ -203,20 +222,72 @@ impl DownloadQueue {
         }
     }
 
+    /// Gives an item its Authorization header; one waiting for it becomes `Paused`, so Resume
+    /// continues from its partial file. Returns false if it is missing or running.
+    pub fn provide_auth(&mut self, id: usize, header: String) -> bool {
+        match self.get_item_mut(id) {
+            Some(item) if !item.status.is_active() => {
+                item.options.auth_header = Some(header);
+                if item.status == QueueItemStatus::AuthRequired {
+                    item.status = QueueItemStatus::Paused;
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The state to resume from after a restart, when no engine runs: running items are
+    /// `Paused` (their resume state is on disk), and unfinished items that had an
+    /// Authorization header, which is never saved, wait for it as `AuthRequired`.
+    pub fn settle_for_restart(&mut self) {
+        self.revision += 1;
+        for item in &mut self.items {
+            item.speed_bytes_per_sec = 0.0;
+            if item.status.is_active() {
+                item.status = QueueItemStatus::Paused;
+            }
+            if item.options.auth_header.is_some() && item.status != QueueItemStatus::Completed {
+                item.status = QueueItemStatus::AuthRequired;
+            }
+        }
+    }
+
     /// Removes an item unless its engine is still running.
     pub fn remove_item(&mut self, id: usize) -> bool {
+        self.revision += 1;
         let before = self.items.len();
         self.items.retain(|item| item.id != id || item.status.is_active());
         self.items.len() != before
     }
 
     pub fn clear_completed(&mut self) {
+        self.revision += 1;
         self.items.retain(|i| i.status != QueueItemStatus::Completed);
     }
 
     /// Removes every item whose engine is not running.
     pub fn clear_inactive(&mut self) {
+        self.revision += 1;
         self.items.retain(|i| i.status.is_active());
+    }
+}
+
+/// URLs as strings (the `url` crate is built without serde).
+mod url_list {
+    use serde::de::Error;
+    use serde::{Deserialize, Deserializer, Serializer};
+    use url::Url;
+
+    pub fn serialize<S: Serializer>(urls: &[Url], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(urls.iter().map(Url::as_str))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<Url>, D::Error> {
+        Vec::<String>::deserialize(deserializer)?
+            .iter()
+            .map(|u| Url::parse(u).map_err(D::Error::custom))
+            .collect()
     }
 }
 
@@ -351,5 +422,60 @@ mod tests {
         let item = q.get_item(ids[0]).unwrap();
         assert_eq!((item.downloaded_bytes, item.total_bytes, item.progress_ratio), (0, 0, 0.0));
         assert_eq!(item.target_path.as_deref(), Some(std::path::Path::new("/dl/a")), "the target is kept");
+    }
+
+    #[test]
+    fn restart_pauses_running_items_and_holds_those_that_need_auth() {
+        let (mut q, ids) = queue_of(&["https://e.com/a", "https://e.com/b", "https://e.com/c", "https://e.com/d"]);
+        let authed = q.add_item(vec![url("https://e.com/private")], DownloadOptions { auth_header: Some("Bearer t".into()), ..Default::default() });
+        let authed_done = q.add_item(vec![url("https://e.com/p2")], DownloadOptions { auth_header: Some("Bearer t".into()), ..Default::default() });
+        q.mark_started(ids[0]);
+        q.apply_snapshot(ids[0], &snapshot("/dl/a"));
+        q.mark_started(ids[1]);
+        q.mark_pausing(ids[1]);
+        q.mark_started(ids[2]);
+        q.finish(ids[2], Err("HTTP 404".into()));
+        q.mark_started(authed);
+        q.mark_started(authed_done);
+        q.finish(authed_done, Ok((PathBuf::from("/dl/p2"), Some(1))));
+
+        let before = q.revision();
+        q.settle_for_restart();
+        assert_ne!(q.revision(), before);
+        let status = |id| q.get_item(id).unwrap().status.clone();
+        assert_eq!(status(ids[0]), QueueItemStatus::Paused);
+        assert_eq!(status(ids[1]), QueueItemStatus::Paused);
+        assert_eq!(status(ids[2]), QueueItemStatus::Failed("HTTP 404".into()));
+        assert_eq!(status(ids[3]), QueueItemStatus::Queued);
+        assert_eq!(status(authed), QueueItemStatus::AuthRequired);
+        assert_eq!(status(authed_done), QueueItemStatus::Completed);
+        assert_eq!(q.get_item(ids[0]).unwrap().speed_bytes_per_sec, 0.0);
+        assert_eq!(q.next_to_start(5), Some(ids[3]), "an item waiting for its header is never auto-started");
+
+        assert!(q.provide_auth(authed, "Bearer new".into()));
+        let item = q.get_item(authed).unwrap();
+        assert_eq!((item.status.clone(), item.options.auth_header.as_deref()), (QueueItemStatus::Paused, Some("Bearer new")));
+    }
+
+    #[test]
+    fn queue_round_trips_through_json_without_credentials() {
+        let (mut q, ids) = queue_of(&["https://e.com/a%20b?x=1"]);
+        let authed = q.add_item(vec![url("https://e.com/p")], DownloadOptions { auth_header: Some("Bearer secret".into()), ..Default::default() });
+        q.mark_started(ids[0]);
+        q.apply_snapshot(ids[0], &EngineSnapshot { progress_ratio: f64::NAN, ..snapshot("/dl/a b") });
+        q.mark_pausing(ids[0]);
+        q.finish(ids[0], Err("cancelled".into()));
+
+        let json = serde_json::to_string(&q).unwrap();
+        assert!(!json.contains("secret"));
+        let back: DownloadQueue = serde_json::from_str(&json).unwrap();
+        let item = back.get_item(ids[0]).unwrap();
+        assert_eq!(item.urls, vec![url("https://e.com/a%20b?x=1")]);
+        assert_eq!((item.status.clone(), item.downloaded_bytes, item.progress_ratio), (QueueItemStatus::Paused, 40, 0.0));
+        assert_eq!(item.target_path.as_deref(), Some(std::path::Path::new("/dl/a b")));
+        assert_eq!(back.get_item(authed).unwrap().options.auth_header, None);
+        let mut back = back;
+        assert!(back.add_item(vec![url("https://e.com/n")], DownloadOptions::default()) > authed, "ids keep counting");
+        assert!(serde_json::from_str::<DownloadQueue>(&json.replace("https://e.com/p", "not a url")).is_err());
     }
 }
