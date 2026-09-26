@@ -425,7 +425,15 @@ impl DownloadEngine {
                 } else if let Some(ref expected) = self.options.expected_checksum {
                     DiskWriter::verify_file_checksum(&output_path, expected).unwrap_or(false)
                 } else {
-                    true
+                    // Check if persistent history recorded this exact download as completed
+                    let history = crate::history::DownloadHistoryManager::load();
+                    let target_filename = output_path.file_name().unwrap_or_default().to_string_lossy();
+                    let in_history = history.entries().iter().any(|e| {
+                        (e.file_path == output_path || e.file_name == target_filename)
+                            && e.status == crate::history::HistoryStatus::Completed
+                            && e.downloaded_bytes == file_size
+                    });
+                    in_history && is_file_header_valid(&output_path)
                 }
             } else {
                 false
@@ -538,6 +546,19 @@ impl DownloadEngine {
         let mirror_racer = Arc::new(Mutex::new(MirrorRacer::new(resolved_urls.clone())));
         let disk_writer = DiskWriter::open_or_create(&output_path, file_size)
             .map_err(|e| e.to_string())?;
+
+        // Immediately persist initial state file if not already present,
+        // ensuring an interrupted download is never mistaken for complete.
+        if resumed_state.is_none() {
+            let mut initial_state = DownloadState::new(
+                output_path.file_name().unwrap_or_default().to_string_lossy().to_string(),
+                file_size,
+                effective_chunk_size,
+                self.urls.iter().map(|u| u.to_string()).collect(),
+            );
+            initial_state.completed_ranges = chunk_manager.lock().completed_ranges();
+            let _ = initial_state.save_atomic(&state_path);
+        }
 
         // Broadcast initial snapshot so UI immediately reflects resumed progress
         if let Some(ref tx) = snapshot_tx {
@@ -883,6 +904,33 @@ fn sanitize_filename(name: &str) -> String {
 
 fn hex_encode(data: &[u8]) -> String {
     data.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// Helper to verify that an existing file has valid header content and is not an unwritten preallocated stub.
+pub fn is_file_header_valid(path: &Path) -> bool {
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    use std::io::Read;
+    let mut buf = [0u8; 16];
+    let n = file.read(&mut buf).unwrap_or(0);
+    if n < 4 {
+        return false;
+    }
+    // If header bytes are all zero, it is an unwritten preallocation
+    if buf[..n].iter().all(|&b| b == 0) {
+        return false;
+    }
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        if ext.eq_ignore_ascii_case("7z") && n >= 6 {
+            return &buf[..6] == b"7z\xbc\xaf\x27\x1c";
+        }
+        if ext.eq_ignore_ascii_case("zip") && n >= 4 {
+            return &buf[..4] == b"PK\x03\x04" || &buf[..4] == b"PK\x05\x06" || &buf[..4] == b"PK\x07\x08";
+        }
+    }
+    true
 }
 
 /// Helper to determine if a local file on disk represents the same resource as the probed download.
