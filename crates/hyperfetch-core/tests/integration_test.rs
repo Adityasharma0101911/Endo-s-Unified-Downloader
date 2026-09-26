@@ -1939,19 +1939,44 @@ async fn test_a_busy_probe_goes_by_the_ranges_its_host_was_seen_to_take() {
 async fn test_a_mirror_slow_to_answer_does_not_hold_up_the_download() {
     let _history = setup().await;
     let data = payload(2 * PREFETCH, 281);
-    let fast = Arc::new(Mock::new(data.clone()));
-    let mut slow = Mock::new(data.clone());
-    slow.latency = Duration::from_secs(60);
-    let slow = Arc::new(slow);
-    let fast_url = serve(Arc::clone(&fast), "late.bin").await;
-    let slow_url = serve(Arc::clone(&slow), "late.bin").await;
-    let temp = tempdir().unwrap();
-    let out = temp.path().join("late.bin");
+    // Listed after the mirror that answers or before it, a mirror that does not answer is not
+    // waited for.
+    for slow_first in [false, true] {
+        let fast = Arc::new(Mock::new(data.clone()));
+        let mut slow = Mock::new(data.clone());
+        slow.latency = Duration::from_secs(60);
+        let slow = Arc::new(slow);
+        let fast_url = serve(Arc::clone(&fast), "late.bin").await;
+        let slow_url = serve(Arc::clone(&slow), "late.bin").await;
+        let urls = if slow_first { vec![slow_url, fast_url] } else { vec![fast_url, slow_url] };
+        let temp = tempdir().unwrap();
+        let out = temp.path().join("late.bin");
 
-    let started = Instant::now();
-    run(&DownloadEngine::new(vec![fast_url, slow_url], options(&out, 4, 64 * KB)), None).await.expect("the first mirror serves it");
+        let started = Instant::now();
+        run(&DownloadEngine::new(urls, options(&out, 4, 64 * KB)), None).await.expect("the mirror that answers serves it");
+        assert_file(&out, &data);
+        assert!(started.elapsed() < Duration::from_secs(10), "slow first: {slow_first}: took {:?}", started.elapsed());
+    }
+}
+
+#[tokio::test]
+async fn test_an_answer_waiting_for_the_other_probes_holds_no_host_slot() {
+    let _history = setup().await;
+    let data = payload(2 * PREFETCH, 287);
+    // Two mirrors on one host, which ignores ranges and was seen to serve one connection at a
+    // time: the first mirror's answer, kept for the one stream, must not keep the second mirror's
+    // probe from the host while the download waits for it.
+    let mut mock = Mock::new(data.clone());
+    mock.ranges = false;
+    let mock = Arc::new(mock);
+    let first = serve(Arc::clone(&mock), "a.bin").await;
+    let second = first.join("b.bin").unwrap();
+    hosts::record(&first, HostProfile { connection_cap: Some(1), ..Default::default() });
+    let temp = tempdir().unwrap();
+    let out = temp.path().join("a.bin");
+
+    run(&DownloadEngine::new(vec![first, second], options(&out, 4, 64 * KB)), None).await.expect("download should succeed");
     assert_file(&out, &data);
-    assert!(started.elapsed() < Duration::from_secs(10), "took {:?}", started.elapsed());
 }
 
 #[tokio::test]
