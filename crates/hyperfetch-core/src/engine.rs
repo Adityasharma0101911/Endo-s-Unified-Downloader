@@ -358,15 +358,85 @@ impl DownloadEngine {
             concurrent_fragments: self.options.num_connections.clamp(1, 32),
         };
 
-        let res = crate::media::download_media(
+        // yt-dlp finds the streams; this engine downloads them where it can.
+        let fetch: &crate::media::StreamFetcher<'_> =
+            &|stream, tx, stop| Box::pin(self.download_media_stream(stream, tx, stop));
+        let res = crate::media::download_media_with(
             &media_url,
             &media_opts,
             Some(prog_tx),
             Some(Arc::clone(&self.cancel_flag)),
+            Some(fetch),
         )
         .await;
         let _ = forwarder.await;
         self.finish_external(res?, started_at).await
+    }
+
+    /// Downloads one stream of a media download (see `crate::media`) with this download's
+    /// settings, but the stream's own client, file and request size, and its share of the speed
+    /// limit. The stream's key is one of its URLs, so its resume state and history outlive the
+    /// stream URL. Cancelling `stop` stops it as `cancel` stops a download.
+    pub(crate) async fn download_media_stream(
+        &self,
+        stream: crate::media::MediaStream,
+        snapshot_tx: broadcast::Sender<EngineSnapshot>,
+        stop: CancellationToken,
+    ) -> Result<PathBuf, String> {
+        let options = DownloadOptions {
+            output_path: Some(stream.path.clone()),
+            base_chunk_size: stream.chunk_size.unwrap_or(self.options.base_chunk_size),
+            max_speed: self.options.max_speed.map(|cap| ((cap as f64 * stream.share) as u64).max(1)),
+            // The checksum, the user's credentials and cookies are for the page, not this stream.
+            expected_checksum: None,
+            cookies_path: None,
+            auth_header: None,
+            media_preset: None,
+            browser_cookies: None,
+            fsync_on_complete: false,
+            ..self.options.clone()
+        };
+        let urls = vec![stream.url.clone(), stream.key.clone()];
+        let engine = DownloadEngine::with_client(urls, options, stream.client.clone());
+        let download = engine.fetch_media_stream(&stream, snapshot_tx);
+        tokio::pin!(download);
+        tokio::select! {
+            result = &mut download => result,
+            () = stop.cancelled() => {
+                engine.cancel();
+                download.await
+            }
+        }
+    }
+
+    async fn fetch_media_stream(
+        &self,
+        stream: &crate::media::MediaStream,
+        snapshot_tx: broadcast::Sender<EngineSnapshot>,
+    ) -> Result<PathBuf, String> {
+        let client = &stream.client;
+        if !stream.hls {
+            let (reference, mirrors) = self.probe_all(client, std::slice::from_ref(&stream.url)).await?;
+            return self.download(client.clone(), reference, mirrors, Some(snapshot_tx)).await;
+        }
+        let parsed = self
+            .guarded(HLS_PARSE_TIMEOUT, "fetching the HLS playlist", crate::hls::parse_hls_playlist(client, &stream.url, None))
+            .await?;
+        let segments = parsed.map_err(|e| e.to_string())?;
+        let cancel_flag = Some(Arc::clone(&self.cancel_flag));
+        let (target, _claim) =
+            claim_hls_output(client, None, &stream.url, &segments, stream.path.clone(), &cancel_flag).await?;
+        crate::hls::HlsEngine::download(
+            client,
+            None,
+            segments,
+            target,
+            self.options.num_connections,
+            Some(snapshot_tx),
+            cancel_flag,
+        )
+        .await
+        .map_err(|e| e.to_string())
     }
 
     /// Checks the expected checksum of a file another engine (yt-dlp, HLS) finished, in one
