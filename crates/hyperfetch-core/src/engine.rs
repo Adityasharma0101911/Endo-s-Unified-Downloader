@@ -244,9 +244,12 @@ impl DownloadEngine {
                 Ok(segments) => {
                     let base = self.hls_output_path(playlist, &segments);
                     let cancel_flag = Some(Arc::clone(&self.cancel_flag));
-                    // The claim is held until this download returns, whichever way it ends.
-                    let (target, _claim) =
+                    // The claim is held until this download returns, whichever way it ends, and by
+                    // its writer while that touches the .part, even after this future is dropped.
+                    let (target, claim) =
                         claim_hls_output(&client, auth, playlist, &segments, base, fetch, &cancel_flag).await?;
+                    let claim = Arc::new(claim);
+                    let target = target.hold(Arc::clone(&claim));
                     let options = crate::hls::HlsOptions {
                         connections: self.options.num_connections,
                         fetch,
@@ -2512,6 +2515,33 @@ mod tests {
             assert_eq!(std::fs::read(path).unwrap(), b"AAAABBBB");
             assert!(!lock_path(path).exists(), "the claim is released when the download ends");
         }
+    }
+
+    #[tokio::test]
+    async fn test_hls_claim_outlasts_a_dropped_run_until_its_writer_is_done() {
+        use crate::hls::tests::{ok, serve, wait_for, DiskGate, DiskOp};
+        let (addr, hits) = serve(|path: &str, _| match path {
+            "/stream.m3u8" => ok(format!("#EXTM3U\n{}#EXT-X-ENDLIST\n", "#EXTINF:4,\nseg.ts\n".repeat(10))),
+            _ => ok("DATA"),
+        })
+        .await;
+        let dir = tempdir().unwrap();
+        let options = DownloadOptions { output_path: Some(dir.path().to_path_buf()), num_connections: 1, ..Default::default() };
+        let engine = DownloadEngine::new(vec![Url::parse(&format!("http://{addr}/stream.m3u8")).unwrap()], options);
+        let writes = DiskGate::close(dir.path(), DiskOp::Write);
+        let run = tokio::spawn(async move { engine.run(None).await });
+        // With one connection, the third segment is requested once the first went to the writer,
+        // which is stuck on it.
+        wait_for("the third segment", || hits.lock().get("/seg.ts").is_some_and(|&n| n >= 3)).await;
+        run.abort();
+        assert!(run.await.unwrap_err().is_cancelled());
+
+        let target = dir.path().join("stream.ts");
+        let claimed = || claim_target(&target).unwrap().is_none();
+        assert!(claimed(), "the writer still writes the .part");
+        drop(writes);
+        wait_for("the writer to release the claim", || !claimed()).await;
+        assert!(dir.path().join("stream.ts.part.hlsstate").exists());
     }
 
     #[tokio::test]

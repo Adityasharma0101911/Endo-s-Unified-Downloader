@@ -43,6 +43,9 @@ const PEEK_BYTES: u64 = 1024;
 const WRITE_QUEUE: usize = 4;
 /// The resume state is saved at most this often while segments are written, and once they stop.
 const PERSIST_INTERVAL: Duration = Duration::from_secs(2);
+/// What an earlier run wrote is hashed this much at a time, so that a download stopped meanwhile
+/// need not wait for all of it.
+const PART_HASH_STEP: u64 = if cfg!(test) { 16 * 1024 } else { 64 * 1024 * 1024 };
 /// Largest segment or init section held in memory. Real segments are a few MiB.
 // ponytail: up to WINDOW_PER_CONNECTION x connections segments, one second request and
 // WRITE_QUEUE + 1 segments on their way to the disk are held at once, so peak memory is that many
@@ -1044,69 +1047,125 @@ where
     (unit, result)
 }
 
-/// The `.hlsstate` of a `.part`: the stream it holds, and how many of its segments (bytes).
+/// Where a download goes, and the stream the `.part` beside it holds, which its `.hlsstate` names
+/// along with how many of the stream's segments (bytes) the `.part` holds.
 struct ResumeState {
-    path: PathBuf,
+    target: PathBuf,
     fingerprints: Fingerprints,
-    segments: usize,
-    bytes: u64,
 }
 
 impl ResumeState {
-    /// Records what `part` holds. Its data reaches the disk first and the state file is replaced
-    /// in one step, so the state never claims more than the `.part` holds. Blocking.
-    fn save(&self, part: &std::fs::File) -> std::io::Result<()> {
+    fn part(&self) -> PathBuf {
+        with_suffix(&self.target, ".part")
+    }
+
+    fn path(&self) -> PathBuf {
+        with_suffix(&self.target, ".part.hlsstate")
+    }
+
+    /// Records that `part` holds `held` (segments, bytes). Its data reaches the disk first and the
+    /// state file is replaced in one step, so the state never claims more than the `.part` holds.
+    /// Blocking.
+    fn save(&self, part: &std::fs::File, (segments, bytes): (usize, u64)) -> std::io::Result<()> {
         use std::io::Write;
-        if self.bytes > 0 {
+        let path = self.path();
+        if bytes > 0 {
+            #[cfg(test)]
+            tests::DiskGate::pass(&path, tests::DiskOp::Flush);
             part.sync_data()?;
         }
-        let tmp = with_suffix(&self.path, ".tmp");
+        let tmp = with_suffix(&path, ".tmp");
         let mut file = std::fs::File::create(&tmp)?;
         let Fingerprints { exact, stream } = &self.fingerprints;
-        write!(file, "{} {} {} {}", exact, stream, self.segments, self.bytes)?;
+        write!(file, "{} {} {} {}", exact, stream, segments, bytes)?;
         file.sync_all()?;
         drop(file);
-        std::fs::rename(&tmp, &self.path)
+        std::fs::rename(&tmp, &path)
     }
 }
 
+/// Hashes the first `len` bytes of `part`, which an earlier run wrote, with `hasher`, a step at a
+/// time so that it can stop once `received` closes: returns whether it got through. Blocking.
+fn hash_part(
+    hasher: &mut StreamHasher,
+    part: &std::fs::File,
+    len: u64,
+    received: &mpsc::Receiver<(usize, Vec<u8>)>,
+) -> std::io::Result<bool> {
+    while hasher.position() < len {
+        if received.is_closed() {
+            return Ok(false);
+        }
+        hasher.update_from_file(part, (hasher.position() + PART_HASH_STEP).min(len))?;
+    }
+    Ok(true)
+}
+
 /// Appends the data it receives, with how many segments each piece holds, to `part`, which holds
-/// what `state` (as saved) says, saving the state at most every [`PERSIST_INTERVAL`] and once more
-/// if the sender goes away before all `total` segments are written (the download failed or was
-/// cancelled). With them all written, flushes the file to disk if `fsync`. Returns the digest of
-/// the file, taken with `hasher` as it was written (after reading what an earlier run wrote), so it
-/// never has to be read back. Blocking: runs on a thread of its own, so the fetches never wait for
-/// the disk unless its queue is full.
+/// `held` (segments, bytes) of the stream `state` names. The state is saved at most every
+/// [`PERSIST_INTERVAL`], by a thread of its own: writing goes on while the `.part` is flushed for
+/// it. With all `total` segments written, flushes the file to disk if `fsync`, gives it its final
+/// name and returns its digest, taken with `hasher` as it was written (after what an earlier run
+/// wrote), so it never has to be read back. If `received` closes before that (the download failed,
+/// was cancelled or dropped), stops hashing what an earlier run wrote, writes what it was given,
+/// saves the state and returns `None`. Blocking: runs on a thread of its own, so the fetches never
+/// wait for the disk unless its queue is full.
 fn write_segments(
     mut part: std::fs::File,
-    mut state: ResumeState,
+    state: &ResumeState,
+    mut held: (usize, u64),
     total: usize,
     fsync: bool,
     mut hasher: StreamHasher,
     mut received: mpsc::Receiver<(usize, Vec<u8>)>,
-) -> std::io::Result<FileDigest> {
+) -> std::io::Result<Option<FileDigest>> {
     use std::io::{Seek, Write};
-    hasher.update_from_file(&part, state.bytes)?;
-    part.seek(SeekFrom::Start(state.bytes))?;
-    let (mut saved, mut saved_at) = (state.segments, Instant::now());
-    while let Some((segments, data)) = received.blocking_recv() {
-        part.write_all(&data)?;
-        hasher.update(&data);
-        state.segments += segments;
-        state.bytes += data.len() as u64;
-        if saved_at.elapsed() >= PERSIST_INTERVAL {
-            state.save(&part)?;
-            (saved, saved_at) = (state.segments, Instant::now());
+    use std::sync::mpsc::TrySendError;
+    let hashed = hash_part(&mut hasher, &part, held.1, &received)?;
+    part.seek(SeekFrom::Start(held.1))?;
+    let flusher = part.try_clone()?;
+    let mut saved = held.0;
+    std::thread::scope(|scope| -> std::io::Result<()> {
+        // A save is handed over only while the saver waits for one, so one runs at a time.
+        let (to_saver, saves) = std::sync::mpsc::sync_channel(0);
+        let saver = scope.spawn(move || saves.into_iter().try_for_each(|held| state.save(&flusher, held)));
+        let mut saved_at = Instant::now();
+        while held.0 < total {
+            let Some((segments, data)) = received.blocking_recv() else { break };
+            #[cfg(test)]
+            tests::DiskGate::pass(&state.path(), tests::DiskOp::Write);
+            part.write_all(&data)?;
+            if hashed {
+                hasher.update(&data);
+            }
+            held = (held.0 + segments, held.1 + data.len() as u64);
+            if saved_at.elapsed() >= PERSIST_INTERVAL {
+                match to_saver.try_send(held) {
+                    Ok(()) => (saved, saved_at) = (held.0, Instant::now()),
+                    // Still saving: the next piece tries again.
+                    Err(TrySendError::Full(_)) => {}
+                    // The saver failed; its error ends the download.
+                    Err(TrySendError::Disconnected(_)) => break,
+                }
+            }
         }
-    }
-    if state.segments == total {
+        drop(to_saver);
+        saver.join().map_err(|_| std::io::Error::other("the HLS state saver panicked"))?
+    })?;
+    if hashed && held.0 == total && !received.is_closed() {
         if fsync {
             part.sync_data()?;
         }
-    } else if state.segments > saved {
-        state.save(&part)?;
+        drop(part);
+        std::fs::rename(state.part(), &state.target)?;
+        // Without its `.part` the state names nothing.
+        let _ = std::fs::remove_file(state.path());
+        return Ok(Some(hasher.finish()));
     }
-    Ok(hasher.finish())
+    if held.0 > saved {
+        state.save(&part, held)?;
+    }
+    Ok(None)
 }
 
 /// Where an HLS download goes and how much of its `.part` it keeps, from [`HlsEngine::prepare`].
@@ -1115,6 +1174,17 @@ pub struct HlsTarget {
     fingerprints: Fingerprints,
     resume_from: usize,
     resume_bytes: u64,
+    claim: Option<Box<dyn Send>>,
+}
+
+impl HlsTarget {
+    /// Keeps `claim`, the caller's claim on the target, until the download is done with its
+    /// `.part`: that can be after the download's future was dropped, as its writer still writes
+    /// what it was given and saves the state.
+    pub fn hold(mut self, claim: impl Send + 'static) -> Self {
+        self.claim = Some(Box::new(claim));
+        self
+    }
 }
 
 /// High-speed parallel HLS segment downloader and in-order stream stitcher.
@@ -1145,7 +1215,7 @@ impl HlsEngine {
         let part_len = match tokio::fs::metadata(&part_path).await {
             Ok(meta) => meta.len(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Some(HlsTarget { path, fingerprints, resume_from: 0, resume_bytes: 0 }))
+                return Ok(Some(HlsTarget { path, fingerprints, resume_from: 0, resume_bytes: 0, claim: None }))
             }
             Err(e) => return Err(e.into()),
         };
@@ -1165,15 +1235,16 @@ impl HlsEngine {
             tracing::info!("{} holds another stream; leaving it alone", part_path.display());
             return Ok(None);
         };
-        Ok(Some(HlsTarget { path, fingerprints, resume_from, resume_bytes }))
+        Ok(Some(HlsTarget { path, fingerprints, resume_from, resume_bytes, claim: None }))
     }
 
     /// Downloads `segments` with at most `options.connections` requests in flight (see
     /// [`InOrder`]) and writes them in order (see [`write_segments`]) to the `.part` of `target`
     /// (from [`HlsEngine::prepare`] for these segments), renamed to the target path once complete.
     /// Returns that path and the file's digest, taken while writing it. A failed or cancelled run
-    /// keeps the `.part` file, with its state saved, and resumes from it next time. `auth` is added
-    /// to every request it covers.
+    /// keeps the `.part` file, with its state saved, and resumes from it next time; so does a run
+    /// whose future is dropped, and its writer holds the target's claim (see [`HlsTarget::hold`])
+    /// until it has saved it. `auth` is added to every request it covers.
     pub async fn download(
         client: &Client,
         auth: Option<&Auth>,
@@ -1190,34 +1261,34 @@ impl HlsEngine {
         }
         let is_cancelled = || cancel_flag.as_ref().is_some_and(|c| c.load(Ordering::Relaxed));
 
-        let HlsTarget { path: target_file, fingerprints, resume_from, resume_bytes: mut written_bytes } = target;
+        let HlsTarget { path: target_file, fingerprints, resume_from, resume_bytes: mut written_bytes, claim } = target;
         let part_path = with_suffix(&target_file, ".part");
-        let state_path = with_suffix(&part_path, ".hlsstate");
-        let state = ResumeState { path: state_path.clone(), fingerprints, segments: resume_from, bytes: written_bytes };
-        let (part, state) = {
-            let (dir, part_path) = (target_file.parent().map(Path::to_path_buf), part_path.clone());
-            tokio::task::spawn_blocking(move || -> std::io::Result<_> {
-                if let Some(dir) = dir {
-                    std::fs::create_dir_all(dir)?;
-                }
-                let part =
-                    std::fs::OpenOptions::new().create(true).read(true).write(true).truncate(false).open(&part_path)?;
-                part.set_len(state.bytes)?;
-                // A new `.part` names its stream from the start: without a state it would pass for
-                // another download's and be left behind.
-                if state.segments == 0 {
-                    state.save(&part)?;
-                }
-                Ok((part, state))
-            })
-            .await
-            .map_err(std::io::Error::other)??
-        };
+        let state = ResumeState { target: target_file.clone(), fingerprints };
+        let held = (resume_from, written_bytes);
+        // Whatever touches the `.part` holds the claim, even if this future is dropped meanwhile.
+        let (part, state, claim) = tokio::task::spawn_blocking(move || -> std::io::Result<_> {
+            if let Some(dir) = state.target.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            let part =
+                std::fs::OpenOptions::new().create(true).read(true).write(true).truncate(false).open(state.part())?;
+            part.set_len(held.1)?;
+            // A new `.part` names its stream from the start: without a state it would pass for
+            // another download's and be left behind.
+            if held.0 == 0 {
+                state.save(&part, held)?;
+            }
+            Ok((part, state, claim))
+        })
+        .await
+        .map_err(std::io::Error::other)??;
         // Written on a thread of its own, fed by a short queue: the fetches go on while it writes.
         let (to_disk, queued) = mpsc::channel(WRITE_QUEUE);
         let (fsync, hasher) = (options.fsync_on_complete, StreamHasher::new(options.expected_checksum.as_deref()));
-        let writer =
-            tokio::task::spawn_blocking(move || write_segments(part, state, total_segments, fsync, hasher, queued));
+        let writer = tokio::task::spawn_blocking(move || {
+            let _claim = claim;
+            write_segments(part, &state, held, total_segments, fsync, hasher, queued)
+        });
 
         tracing::info!(
             "Starting HLS ingestion: {} segments ({} already done) across {} streams -> {}",
@@ -1280,20 +1351,21 @@ impl HlsEngine {
                 }
             }
         };
-        // Stops the fetches, then lets the writer finish what it was given (saving the state if
-        // the download stopped early) and close the file.
+        // Stops the fetches, then lets the writer finish. Its queue stays open until then only if
+        // every segment went to it: closed early, it tells the writer that the download stopped,
+        // so it writes what it was given, saves the state and closes the file.
         drop(window);
-        drop(to_disk);
+        let queue = stopped.is_none().then_some(to_disk);
         let wrote = writer.await.map_err(std::io::Error::other).and_then(|wrote| wrote);
+        drop(queue);
         if let Some(e) = stopped {
             if let Err(save) = wrote {
                 tracing::warn!("Failed to save the HLS resume state of {}: {}", part_path.display(), save);
             }
             return Err(e);
         }
-        let digest = wrote?;
-        tokio::fs::rename(&part_path, &target_file).await?;
-        let _ = tokio::fs::remove_file(&state_path).await;
+        // With every segment written the writer has named the file.
+        let digest = wrote?.ok_or_else(|| std::io::Error::other("the HLS writer stopped before the last segment"))?;
 
         if let Some(tx) = &snapshot_tx {
             let _ = tx.send(progress_snapshot(
@@ -1450,6 +1522,81 @@ pub(crate) mod tests {
 
     pub(crate) fn ok(body: impl Into<Vec<u8>>) -> Reply {
         (200, String::new(), body.into())
+    }
+
+    /// What a [`DiskGate`] holds back.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum DiskOp {
+        /// Writing a piece of the stream to the `.part`.
+        Write,
+        /// Flushing the `.part` to disk for a state save.
+        Flush,
+    }
+
+    type Gates = Vec<(PathBuf, DiskOp, Arc<Mutex<std::sync::mpsc::Receiver<()>>>)>;
+    static DISK_GATES: Mutex<Gates> = parking_lot::const_mutex(Vec::new());
+
+    /// Stands in for a stuck disk: every `op` on the `.part` of a download under `dir` waits until
+    /// the gate is dropped.
+    pub(crate) struct DiskGate {
+        dir: PathBuf,
+        op: DiskOp,
+        // Nothing is ever sent: waiting ends when it is dropped.
+        _open: std::sync::mpsc::Sender<()>,
+    }
+
+    impl DiskGate {
+        pub(crate) fn close(dir: &Path, op: DiskOp) -> Self {
+            let (open, waiting) = std::sync::mpsc::channel();
+            DISK_GATES.lock().push((dir.to_path_buf(), op, Arc::new(Mutex::new(waiting))));
+            Self { dir: dir.to_path_buf(), op, _open: open }
+        }
+
+        /// Runs before `op` on the files of the download whose state file is `state`.
+        pub(crate) fn pass(state: &Path, op: DiskOp) {
+            let gates = DISK_GATES.lock();
+            let gate = gates.iter().find(|(dir, gated, _)| *gated == op && state.starts_with(dir)).map(|(.., g)| Arc::clone(g));
+            drop(gates);
+            if let Some(gate) = gate {
+                let _ = gate.lock().recv();
+            }
+        }
+    }
+
+    impl Drop for DiskGate {
+        fn drop(&mut self) {
+            DISK_GATES.lock().retain(|(dir, op, _)| (dir, *op) != (&self.dir, self.op));
+        }
+    }
+
+    /// Waits up to ten seconds for `done`.
+    pub(crate) async fn wait_for(what: &str, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The segments and bytes the state of `out` says its `.part` holds.
+    fn saved(out: &Path) -> Option<(usize, u64)> {
+        let state = std::fs::read_to_string(with_suffix(out, ".part.hlsstate")).ok()?;
+        let fields: Vec<&str> = state.split_whitespace().collect();
+        Some((fields.get(2)?.parse().ok()?, fields.get(3)?.parse().ok()?))
+    }
+
+    fn part_len(out: &Path) -> Option<u64> {
+        std::fs::metadata(with_suffix(out, ".part")).map(|m| m.len()).ok()
+    }
+
+    /// A media playlist of `count` segments `s0.ts`, `s1.ts`, ...
+    fn numbered_playlist(count: usize) -> Reply {
+        ok(format!("#EXTM3U\n{}#EXT-X-ENDLIST\n", (0..count).map(|n| format!("#EXTINF:4,\ns{n}.ts\n")).collect::<String>()))
+    }
+
+    /// The body of `/s<n>.ts`: its number, four times.
+    fn numbered_segment(path: &str) -> Reply {
+        ok(path.trim_start_matches("/s").trim_end_matches(".ts").repeat(4))
     }
 
     /// A short stall timeout keeps tests that stall quick.
@@ -2244,10 +2391,7 @@ video.m3u8
             let (path, gates, held) = (path.to_string(), Arc::clone(&gates_srv), Arc::clone(&held));
             async move {
                 let gate = match path.as_str() {
-                    "/media.m3u8" => {
-                        let segments: String = (0..10).map(|n| format!("#EXTINF:4,\ns{n}.ts\n")).collect();
-                        return ok(format!("#EXTM3U\n{segments}#EXT-X-ENDLIST\n"));
-                    }
+                    "/media.m3u8" => return numbered_playlist(10),
                     "/s5.ts" => Some(0),
                     "/s7.ts" => Some(1),
                     _ => None,
@@ -2255,7 +2399,7 @@ video.m3u8
                 if let Some(gate) = gate.filter(|&g| held[g].swap(false, Ordering::SeqCst)) {
                     let _ = gates[gate].acquire().await;
                 }
-                ok(path.trim_start_matches("/s").trim_end_matches(".ts").repeat(4))
+                numbered_segment(&path)
             }
         })
         .await;
@@ -2263,20 +2407,9 @@ video.m3u8
         let url = Url::parse(&format!("http://{addr}/media.m3u8")).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("paced.ts");
-        let (part, state) = (with_suffix(&out, ".part"), with_suffix(&out, ".part.hlsstate"));
-        let saved = || -> Option<(usize, u64)> {
-            let state = std::fs::read_to_string(&state).ok()?;
-            let fields: Vec<&str> = state.split_whitespace().collect();
-            Some((fields.get(2)?.parse().ok()?, fields.get(3)?.parse().ok()?))
-        };
-        let part_len = || std::fs::metadata(&part).map(|m| m.len()).ok();
-        async fn wait_for(what: &str, done: impl Fn() -> bool) {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while !done() {
-                assert!(Instant::now() < deadline, "timed out waiting for {what}");
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        }
+        let state = with_suffix(&out, ".part.hlsstate");
+        let saved = || saved(&out);
+        let part_len = || part_len(&out);
 
         let segments = parse_hls_playlist(&client, &url, None, FETCH).await.unwrap();
         let target = HlsEngine::prepare(&client, None, &url, &segments, &out, FETCH, &None).await.unwrap().unwrap();
@@ -2293,10 +2426,14 @@ video.m3u8
         wait_for("segments 0-4", || part_len() == Some(20)).await;
         assert_eq!(saved(), Some((0, 0)));
         // The first segment written two seconds after that save saves it again, the next does not.
+        // That save waits for the .part to reach the disk, and the writer goes on meanwhile.
+        let flush = DiskGate::close(dir.path(), DiskOp::Flush);
         tokio::time::sleep(Duration::from_millis(2200)).await;
         gates[0].add_permits(1);
         wait_for("segment 6", || part_len() == Some(28)).await;
-        assert_eq!(saved(), Some((6, 24)));
+        assert_eq!(saved(), Some((0, 0)), "the save of segment 5 is still flushing");
+        drop(flush);
+        wait_for("the save of segment 5", || saved() == Some((6, 24))).await;
 
         // Cancelled while segment 7 is held back: the state records every segment written.
         cancel.store(true, Ordering::SeqCst);
@@ -2309,6 +2446,119 @@ video.m3u8
         assert_eq!(std::fs::read(&out).unwrap(), b"0000111122223333444455556666777788889999");
         let hits = hits.lock();
         assert!((0..10).all(|n| hits[&format!("/s{n}.ts")] == if n == 7 { 2 } else { 1 }), "{hits:?}");
+    }
+
+    #[tokio::test]
+    async fn test_fetches_go_on_while_the_disk_is_stuck() {
+        let (addr, hits) = serve(|path: &str, _| match path {
+            "/media.m3u8" => numbered_playlist(20),
+            p => numbered_segment(p),
+        })
+        .await;
+        let client = Client::new();
+        let url = Url::parse(&format!("http://{addr}/media.m3u8")).unwrap();
+        let segments = parse_hls_playlist(&client, &url, None, FETCH).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("stuck.ts");
+        let target = HlsEngine::prepare(&client, None, &url, &segments, &out, FETCH, &None).await.unwrap().unwrap();
+        let writes = DiskGate::close(dir.path(), DiskOp::Write);
+        let download = {
+            let client = client.clone();
+            tokio::spawn(async move { HlsEngine::download(&client, None, segments, target, &options(2), None, None).await })
+        };
+
+        // The writer is stuck on segment 0, four more wait in its queue, and the window of two
+        // connections fetches the four after those, but no more.
+        let requested = |n: usize| hits.lock().contains_key(&format!("/s{n}.ts"));
+        wait_for("segment 8 to be requested", || requested(8)).await;
+        assert_eq!(part_len(&out), Some(0), "nothing is written yet");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!requested(9), "what is held in memory stays bounded");
+
+        drop(writes);
+        let (path, digest) = download.await.unwrap().unwrap();
+        let expected: String = (0..20).map(|n| n.to_string().repeat(4)).collect();
+        assert_eq!(std::fs::read(&path).unwrap(), expected.as_bytes());
+        assert_digest(&digest, &path);
+    }
+
+    #[tokio::test]
+    async fn test_a_dropped_download_holds_its_claim_until_its_writer_saved_what_it_was_given() {
+        let (addr, hits) = serve(|path: &str, _| match path {
+            "/media.m3u8" => numbered_playlist(10),
+            p => numbered_segment(p),
+        })
+        .await;
+        let client = Client::new();
+        let url = Url::parse(&format!("http://{addr}/media.m3u8")).unwrap();
+        let segments = parse_hls_playlist(&client, &url, None, FETCH).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("dropped.ts");
+        struct Claim(Arc<AtomicBool>);
+        impl Drop for Claim {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let released = Arc::new(AtomicBool::new(false));
+        let target = HlsEngine::prepare(&client, None, &url, &segments, &out, FETCH, &None).await.unwrap().unwrap();
+        let target = target.hold(Claim(Arc::clone(&released)));
+        let writes = DiskGate::close(dir.path(), DiskOp::Write);
+        let download = {
+            let (client, segments) = (client.clone(), segments.clone());
+            tokio::spawn(async move { HlsEngine::download(&client, None, segments, target, &options(1), None, None).await })
+        };
+
+        // The writer is stuck on segment 0 with 1-4 in its queue; segments 5 and 6 are fetched.
+        wait_for("segment 6 to be requested", || hits.lock().contains_key("/s6.ts")).await;
+        download.abort();
+        assert!(download.await.unwrap_err().is_cancelled());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!released.load(Ordering::SeqCst), "the writer still has segments to write");
+
+        drop(writes);
+        wait_for("the writer to let go of the claim", || released.load(Ordering::SeqCst)).await;
+        assert_eq!(saved(&out), Some((5, 20)), "the state records every segment the writer was given");
+        assert_eq!(part_len(&out), Some(20));
+
+        download_to(&client, None, &url, segments, &out, 1).await.unwrap();
+        let hits = hits.lock();
+        assert!((0..5).all(|n| hits[&format!("/s{n}.ts")] == 1), "{hits:?}");
+    }
+
+    #[tokio::test]
+    async fn test_stopping_a_resumed_download_does_not_wait_for_its_part_to_be_hashed() {
+        let (addr, _) = serve(|_, _| (0, String::new(), Vec::new())).await;
+        let client = Client::new();
+        let url = Url::parse(&format!("http://{addr}/media.m3u8")).unwrap();
+        // Two segments; an earlier run wrote the first, a huge one.
+        let segments: Vec<HlsSegment> = (0..2)
+            .map(|index| HlsSegment {
+                index,
+                url: url.join(&format!("s{index}.ts")).unwrap(),
+                duration_secs: 4.0,
+                byte_range: None,
+                encryption: None,
+                init: None,
+            })
+            .collect();
+        const WRITTEN: u64 = 512 * 1024 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("resumed.ts");
+        std::fs::File::create(with_suffix(&out, ".part")).unwrap().set_len(WRITTEN).unwrap();
+        let state = with_suffix(&out, ".part.hlsstate");
+        std::fs::write(&state, "as the earlier run left it").unwrap();
+        let fingerprints = Fingerprints::of(&url, &segments);
+        let target = HlsTarget { path: out.clone(), fingerprints, resume_from: 1, resume_bytes: WRITTEN, claim: None };
+        // Hashing all of it with SHA-256 as well takes seconds.
+        let options = HlsOptions { expected_checksum: Some(format!("sha256:{}", "0".repeat(64))), ..options(1) };
+
+        let started = Instant::now();
+        let cancelled = Some(Arc::new(AtomicBool::new(true)));
+        let result = HlsEngine::download(&client, None, segments, target, &options, None, cancelled).await;
+        assert!(matches!(result, Err(HlsError::Cancelled)), "{result:?}");
+        assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+        assert_eq!(std::fs::read_to_string(&state).unwrap(), "as the earlier run left it", "nothing new to record");
     }
 
     #[tokio::test]
