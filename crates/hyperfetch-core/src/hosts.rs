@@ -6,9 +6,10 @@
 //! learned, each on its own: hosts change, and a fact nobody sees again is forgotten.
 //!
 //! A host takes a new request while fewer are open than the smallest nonzero limit among that
-//! request's and those of the requests already open (downloads with differing
-//! `max_connections_per_host` share one host at the strictest), and than the connection cap the
-//! host was seen to enforce. A limit of 0 sets none.
+//! request's and those of the requests already open or waiting for a slot (downloads with
+//! differing `max_connections_per_host` share one host at the strictest, from the moment the
+//! strict one asks), and than the connection cap the host was seen to enforce. A limit of 0 sets
+//! none.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::LazyLock;
@@ -19,6 +20,9 @@ use url::Url;
 
 /// How long a learned fact about a host is trusted.
 pub const PROFILE_TTL: Duration = Duration::from_secs(10 * 60);
+/// Least time between the refusal a connection cap was learned from (or its last rise) and the
+/// next rise: a host that means its cap refuses every request offered past it.
+const CAP_PROBE_INTERVAL: Duration = Duration::from_secs(60);
 /// Hosts remembered before those with nothing fresh to tell are dropped.
 const KEEP_HOSTS: usize = 256;
 
@@ -53,7 +57,8 @@ pub struct HostProfile {
     pub connection_rate: Option<f64>,
     /// How long a new connection took to its first answer.
     pub setup_time: Option<Duration>,
-    /// Connections it serves at once before refusing more with 429/503.
+    /// Connections it serves at once before refusing more with 429/503; at least 1 (a 0 recorded
+    /// is ignored: every host serves one request, or it could never be downloaded from).
     pub connection_cap: Option<usize>,
 }
 
@@ -101,7 +106,9 @@ impl HostSlot {
         self.hosts.throttled(&self.key, Instant::now())
     }
 
-    /// The host accepted this request. At the cap it was seen to enforce, it may take one more.
+    /// The host accepted this request. Serving as many as the cap it was seen to enforce, it is
+    /// offered one more, at most once per `CAP_PROBE_INTERVAL` after the cap was learned or last
+    /// raised: a host that means its cap refuses each request offered past it.
     pub fn accepted(&self) {
         self.hosts.accepted(&self.key, Instant::now())
     }
@@ -110,6 +117,19 @@ impl HostSlot {
 impl Drop for HostSlot {
     fn drop(&mut self) {
         self.hosts.release(&self.key, self.limit, Instant::now())
+    }
+}
+
+/// A request waiting for a slot, whose limit holds the host's other requests too while it waits.
+struct Waiting {
+    hosts: &'static Hosts,
+    key: HostKey,
+    limit: usize,
+}
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        self.hosts.stop_waiting(&self.key, self.limit, Instant::now())
     }
 }
 
@@ -151,7 +171,25 @@ impl Facts {
         learn(&mut self.capped_per_connection, seen.capped_per_connection, now);
         learn(&mut self.connection_rate, seen.connection_rate, now);
         learn(&mut self.setup_time, seen.setup_time, now);
-        learn(&mut self.connection_cap, seen.connection_cap, now);
+        learn(&mut self.connection_cap, seen.connection_cap.filter(|&cap| cap > 0), now);
+    }
+}
+
+/// Nonzero limits, and how many requests are under each.
+type Limits = BTreeMap<usize, usize>;
+
+fn add_limit(limits: &mut Limits, limit: usize) {
+    if limit > 0 {
+        *limits.entry(limit).or_default() += 1;
+    }
+}
+
+fn remove_limit(limits: &mut Limits, limit: usize) {
+    if let Some(count) = limits.get_mut(&limit) {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            limits.remove(&limit);
+        }
     }
 }
 
@@ -160,20 +198,29 @@ struct Entry {
     facts: Facts,
     /// Requests open to the host.
     open: usize,
-    /// The nonzero limits those requests were opened under, and how many hold each.
-    held: BTreeMap<usize, usize>,
+    /// The limits those requests were opened under.
+    held: Limits,
+    /// The limits of requests waiting for a slot.
+    waiting: Limits,
+    /// When the connection cap was last raised.
+    cap_raised: Option<Instant>,
 }
 
 impl Entry {
     /// Whether nothing would be lost by forgetting the host.
     fn is_idle(&self, now: Instant) -> bool {
-        self.open == 0 && self.facts.profile(now) == HostProfile::default()
+        self.open == 0 && self.waiting.is_empty() && self.facts.profile(now) == HostProfile::default()
+    }
+
+    /// The smallest limit among the requests open or waiting.
+    fn strictest(&self) -> Option<usize> {
+        [self.held.keys().next(), self.waiting.keys().next()].into_iter().flatten().min().copied()
     }
 
     /// Requests the host may have open once one under `limit` joins them.
     fn allowance(&self, limit: usize, now: Instant) -> usize {
         let own = (limit > 0).then_some(limit);
-        [own, self.held.keys().next().copied(), fresh(self.facts.connection_cap, now)]
+        [own, self.strictest(), fresh(self.facts.connection_cap, now)]
             .into_iter()
             .flatten()
             .min()
@@ -211,13 +258,17 @@ impl Hosts {
             return None;
         }
         entry.open += 1;
-        if limit > 0 {
-            *entry.held.entry(limit).or_default() += 1;
-        }
+        add_limit(&mut entry.held, limit);
         Some(HostSlot { hosts: self, key: key.clone(), limit })
     }
 
     async fn acquire(&'static self, key: HostKey, limit: usize) -> HostSlot {
+        // A lenient download re-taking slots as its requests end would otherwise keep a strict
+        // one waiting until it is nearly done: the strict limit counts from now on.
+        let _waiting = {
+            add_limit(&mut self.entries.lock().entry(key.clone()).or_default().waiting, limit);
+            Waiting { hosts: self, key: key.clone(), limit }
+        };
         loop {
             // Registered before looking, so a slot freed in between still wakes us.
             let freed = self.freed.notified();
@@ -230,17 +281,29 @@ impl Hosts {
         }
     }
 
+    fn stop_waiting(&self, key: &HostKey, limit: usize, now: Instant) {
+        let loosened = {
+            let mut entries = self.entries.lock();
+            let loosened = entries.get_mut(key).is_some_and(|entry| {
+                let before = entry.strictest();
+                remove_limit(&mut entry.waiting, limit);
+                entry.strictest() != before
+            });
+            forget_idle(&mut entries, now);
+            loosened
+        };
+        // A wait given up may leave the others a larger allowance.
+        if loosened {
+            self.freed.notify_waiters();
+        }
+    }
+
     fn release(&self, key: &HostKey, limit: usize, now: Instant) {
         {
             let mut entries = self.entries.lock();
             if let Some(entry) = entries.get_mut(key) {
                 entry.open = entry.open.saturating_sub(1);
-                if let Some(holders) = entry.held.get_mut(&limit) {
-                    *holders = holders.saturating_sub(1);
-                    if *holders == 0 {
-                        entry.held.remove(&limit);
-                    }
-                }
+                remove_limit(&mut entry.held, limit);
             }
             forget_idle(&mut entries, now);
         }
@@ -260,9 +323,14 @@ impl Hosts {
     fn accepted(&self, key: &HostKey, now: Instant) {
         let raised = self.entries.lock().get_mut(key).is_some_and(|entry| {
             match (entry.facts.connection_cap, fresh(entry.facts.connection_cap, now)) {
-                // The cap keeps the time it was learned at, so it still expires.
                 (Some((cap, learned)), Some(_)) if entry.open >= cap => {
+                    let since = entry.cap_raised.map_or(learned, |raised| raised.max(learned));
+                    if now.saturating_duration_since(since) < CAP_PROBE_INTERVAL {
+                        return false;
+                    }
+                    // The cap keeps the time it was learned at, so it still expires.
                     entry.facts.connection_cap = Some((cap + 1, learned));
+                    entry.cap_raised = Some(now);
                     true
                 }
                 _ => false,
@@ -389,13 +457,64 @@ mod tests {
         let now = Instant::now();
         let mut later: Vec<HostSlot> = (0..2).map(|_| hosts.try_acquire(&host, 32, now).unwrap()).collect();
         assert!(hosts.try_acquire(&host, 32, now).is_none());
-        // Served in full at the cap, the host is offered one more request.
-        later[0].accepted();
-        later.push(hosts.try_acquire(&host, 32, now).unwrap());
-        assert!(hosts.try_acquire(&host, 32, now).is_none());
-        assert_eq!(hosts.profile(&host, now).connection_cap, Some(3));
+        // Served in full at the cap, the host is offered one more request, but not every time:
+        // each offer a capped host refuses costs a request.
+        hosts.accepted(&host, now);
+        assert!(hosts.try_acquire(&host, 32, now).is_none(), "the cap was just learned");
+        let probe = now + CAP_PROBE_INTERVAL;
+        hosts.accepted(&host, probe);
+        later.push(hosts.try_acquire(&host, 32, probe).unwrap());
+        assert_eq!(hosts.profile(&host, probe).connection_cap, Some(3));
+        hosts.accepted(&host, probe);
+        assert!(hosts.try_acquire(&host, 32, probe).is_none(), "the cap was just raised");
+        // Refused again: back to what it served, and the next offer waits a full interval from then.
+        let refused = probe + Duration::from_secs(5);
+        hosts.throttled(&host, refused);
+        drop(later.pop());
+        hosts.accepted(&host, probe + CAP_PROBE_INTERVAL);
+        assert_eq!(hosts.profile(&host, refused).connection_cap, Some(2));
+        hosts.accepted(&host, refused + CAP_PROBE_INTERVAL);
+        assert_eq!(hosts.profile(&host, refused).connection_cap, Some(3));
         // Ten minutes after it was seen, the cap is forgotten.
-        assert!(hosts.try_acquire(&host, 32, now + PROFILE_TTL).is_some());
+        assert!(hosts.try_acquire(&host, 32, refused + PROFILE_TTL).is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_a_cap_of_zero_is_no_cap() {
+        let (hosts, host) = (leaked(), key("http://zero.example/"));
+        hosts.record(&host, HostProfile { connection_cap: Some(0), ..Default::default() }, Instant::now());
+        assert_eq!(hosts.profile(&host, Instant::now()).connection_cap, None);
+        let slot = tokio::time::timeout(Duration::from_secs(60), hosts.acquire(host.clone(), 4)).await;
+        assert!(slot.is_ok(), "a host always takes one request");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_a_strict_download_waiting_holds_a_lenient_one_to_its_limit() {
+        let (hosts, host) = (leaked(), key("http://shared.example/"));
+        let mut lenient: Vec<HostSlot> = (0..20).map(|_| hosts.try_acquire(&host, 32, Instant::now()).unwrap()).collect();
+        let strict = tokio::spawn(hosts.acquire(host.clone(), 4));
+        tokio::task::yield_now().await;
+        // Its requests ending one by one, the lenient download may not take their slots again
+        // while it has 4 or more open: the strict one waits for fewer than 4.
+        lenient.truncate(4);
+        assert!(hosts.try_acquire(&host, 32, Instant::now()).is_none());
+        lenient.pop();
+        let strict = tokio::time::timeout(Duration::from_secs(60), strict).await.expect("the strict download gets a slot");
+        assert!(hosts.try_acquire(&host, 32, Instant::now()).is_none(), "4 are open, the strict one's among them");
+        drop(strict);
+
+        // A wait given up lifts its limit, and wakes whoever it held back.
+        lenient.push(hosts.try_acquire(&host, 32, Instant::now()).unwrap());
+        let started = tokio::time::Instant::now();
+        let (gave_up, more) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(1), hosts.acquire(host.clone(), 4)),
+            tokio::time::timeout(Duration::from_secs(60), hosts.acquire(host.clone(), 32)),
+        );
+        assert!(gave_up.is_err());
+        let more = more.expect("the lenient download may open more once nothing stricter waits");
+        assert_eq!(more.host(), &host);
+        assert!(started.elapsed() >= Duration::from_secs(1), "not while the strict one waited");
+        assert!(hosts.entries.lock()[&host].waiting.is_empty());
     }
 
     #[tokio::test]
