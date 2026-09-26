@@ -25,7 +25,7 @@ use crate::hls::HlsError;
 use crate::hosts::{self, HostKey, HostProfile, HostSlot};
 use crate::mirror::MirrorRacer;
 use crate::range::{compute_gaps, ByteRange};
-use crate::resolver::GoogleDriveResolver;
+use crate::resolver::{GoogleDriveResolver, HtmlVideoResolver};
 use crate::state::DownloadState;
 use crate::storage::{DiskWriter, StorageError, VerifyError};
 use crate::worker::{
@@ -243,7 +243,19 @@ impl DownloadEngine {
         }
 
         let resolved = self.resolve_all(&client).await?;
+        self.fetch_resolved(client, resolved, snapshot_tx, true).await
+    }
 
+    /// Downloads what the resolved mirrors serve: an HLS stream if one is a playlist, else their
+    /// file. With `scrape`, a web page they answer with is looked into, once, for the video it
+    /// plays, which is then downloaded in the page's place (see `video_on_page`).
+    async fn fetch_resolved(
+        &self,
+        client: Client,
+        resolved: Vec<Url>,
+        snapshot_tx: Option<broadcast::Sender<EngineSnapshot>>,
+        scrape: bool,
+    ) -> Result<PathBuf, String> {
         if let Some(playlist) = resolved.iter().find(|u| u.as_str().contains(".m3u8")) {
             tracing::info!("Detected HLS video stream: {}", playlist);
             let started_at = unix_now();
@@ -287,8 +299,66 @@ impl DownloadEngine {
             }
         }
 
-        let probed = self.probe_all(&client, &resolved).await?;
+        let mut probed = self.probe_all(&client, &resolved).await?;
+        if scrape {
+            if let Some(video) = self.video_on_page(&client, &mut probed).await? {
+                let page = probed.reference.url.clone();
+                // Nothing of the page is kept: its answer and the probes still out are given up.
+                drop(probed);
+                let mut mirrors = Vec::new();
+                for url in resolved {
+                    let url = if url == page { video.clone() } else { url };
+                    if !mirrors.contains(&url) {
+                        mirrors.push(url);
+                    }
+                }
+                return Box::pin(self.fetch_resolved(client, mirrors, snapshot_tx, false)).await;
+            }
+        }
         self.download(client, probed, snapshot_tx).await
+    }
+
+    /// The video a web page the download's reference answered with plays (see
+    /// `HtmlVideoResolver::is_page`), looked for in the page as the probe brought it (all of it,
+    /// or all still coming), else as a new request without Range brings it. A page without a
+    /// video, or one that could not be read, is downloaded as it is; an answer still coming is
+    /// taken from `probed` once read.
+    async fn video_on_page(&self, client: &Client, probed: &mut Probed) -> Result<Option<Url>, String> {
+        let reference = &probed.reference;
+        if !HtmlVideoResolver::is_page(&reference.url, &reference.headers) {
+            return Ok(None);
+        }
+        let (url, final_url) = (reference.url.clone(), reference.final_url.clone());
+        let whole = reference.size == Some(reference.prefetch.len() as u64);
+        let prefetch = reference.prefetch.clone();
+        let live = probed.live.take();
+        let page = async {
+            let (response, _slot) = match live {
+                _ if whole => return Ok((String::from_utf8_lossy(&prefetch).into_owned(), final_url)),
+                Some(Live::Stream { response, slot }) => (response, Some(slot)),
+                // Only the start came, or none of it: the page again, all of it.
+                other => {
+                    drop(other);
+                    let request = authorize(client.get(url.clone()), self.auth.as_deref(), &url).header(ACCEPT_ENCODING, "identity");
+                    let response = request.send().await.map_err(|e| e.to_string())?;
+                    if !response.status().is_success() {
+                        return Err(format!("HTTP {}", response.status()));
+                    }
+                    (response, None)
+                }
+            };
+            let page_url = response.url().clone();
+            let html = HtmlVideoResolver::read_page(response).await.map_err(|e| e.to_string())?;
+            Ok((html, page_url))
+        };
+        match self.guarded(RESOLVE_TIMEOUT, &format!("reading the page {}", url), page).await {
+            Ok(Ok((html, page_url))) => Ok(HtmlVideoResolver::video_in(&html, &page_url)),
+            Err(e) if self.cancel_token.is_cancelled() => Err(e),
+            Ok(Err(e)) | Err(e) => {
+                tracing::warn!("Could not look into the page {}, downloading it as it is: {}", url, e);
+                Ok(None)
+            }
+        }
     }
 
     /// The first URL that should go to yt-dlp: a known media site, or with an explicit media
