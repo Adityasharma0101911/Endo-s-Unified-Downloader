@@ -600,10 +600,7 @@ impl DownloadEngine {
         let mut manager = ChunkManager::with_resumed_ranges(size, chunk_size, &have).map_err(|e| e.to_string())?;
         manager.set_max_retries(self.options.max_retries);
 
-        let mut racer = MirrorRacer::new(mirrors.iter().map(|m| m.url.clone()).collect());
-        for (mirror, probe) in racer.mirrors_mut().iter_mut().zip(mirrors) {
-            mirror.if_range = probe.if_range();
-        }
+        let racer = build_racer(mirrors);
 
         let writer = {
             let part = part.to_path_buf();
@@ -1160,6 +1157,9 @@ struct ProbeInfo {
     /// Bytes the probe's connection moved, at the rate it reached, in the time a new connection
     /// takes to answer. `None` when no rate was measured.
     per_setup: Option<u64>,
+    /// How long the ranged GET waited for its answer; `None` when HEAD or a plain GET had to
+    /// stand in for it.
+    answer_time: Option<Duration>,
 }
 
 impl ProbeInfo {
@@ -1189,6 +1189,7 @@ impl ProbeInfo {
             last_modified: header(LAST_MODIFIED),
             prefetch: Bytes::new(),
             per_setup: None,
+            answer_time: None,
         }
     }
 }
@@ -1243,7 +1244,8 @@ async fn probe_url(
         }
     };
     let range = format!("bytes=0-{}", if prefetch { PREFETCH - 1 } else { 0 });
-    // Also when it answered and, for a first try, how long that took: what a connection needs to start.
+    // Also when it answered, how long the last try waited, and whether that was the first try:
+    // then the wait is what a new connection needs to start.
     let ranged = async {
         let mut attempt = 0;
         loop {
@@ -1266,7 +1268,7 @@ async fn probe_url(
                 }
                 _ => {
                     let answered = tokio::time::Instant::now();
-                    break (sent, answered, (attempt == 1).then(|| answered - sent_at));
+                    break (sent, answered, answered - sent_at, attempt == 1);
                 }
             }
         }
@@ -1274,10 +1276,11 @@ async fn probe_url(
     // Once the GET has answered, a HEAD that is still out only gets a short grace: some servers
     // never answer HEAD, and the GET alone has everything needed.
     tokio::pin!(head, ranged);
-    let (head, (ranged, answered, setup)) = tokio::select! {
+    let (head, (ranged, answered, waited, first_try)) = tokio::select! {
         head = &mut head => (head, ranged.await),
         ranged = &mut ranged => (tokio::time::timeout(HEAD_GRACE, head).await.ok().flatten(), ranged),
     };
+    let setup = first_try.then_some(waited);
     let body = |response: Response, len: u64| ProbeBody { response, len, answered, setup };
     let head_len = head.as_ref().and_then(|r| content_length(r.headers()));
     // Still busy or unreachable after every try: that says nothing about range support.
@@ -1319,6 +1322,7 @@ async fn probe_url(
 
     let sources: Vec<&Response> = std::iter::once(&get).chain(head.as_ref()).collect();
     let mut info = ProbeInfo::describe(url, &sources);
+    info.answer_time = Some(waited);
     let content_range = get.headers().get(CONTENT_RANGE).and_then(|v| v.to_str().ok());
     let keep = match get.status() {
         StatusCode::PARTIAL_CONTENT => match content_range.map(ByteRange::parse_content_range) {
@@ -1352,6 +1356,19 @@ async fn probe_url(
     let own_validators = own(ETAG) == info.etag && own(LAST_MODIFIED) == info.last_modified;
     let body = keep.filter(|_| prefetch && own_validators).map(|len| body(get, len.min(PREFETCH)));
     Ok((info, body))
+}
+
+/// The racer over the mirrors serving the download. Each mirror starts from the answer time its
+/// probe measured instead of an assumed one, so the first requests already favour near mirrors.
+fn build_racer(mirrors: &[ProbeInfo]) -> MirrorRacer {
+    let mut racer = MirrorRacer::new(mirrors.iter().map(|m| m.url.clone()).collect());
+    for (mirror, probe) in racer.mirrors_mut().iter_mut().zip(mirrors) {
+        mirror.if_range = probe.if_range();
+        if let Some(answer) = probe.answer_time {
+            mirror.ttfb_ewma_ms = answer.as_secs_f64() * 1000.0;
+        }
+    }
+    racer
 }
 
 /// Answers that mean "not now", not "no ranges" or "no such file".
@@ -2087,6 +2104,7 @@ mod tests {
             last_modified: None,
             prefetch: Bytes::new(),
             per_setup: None,
+            answer_time: None,
         }
     }
 
@@ -2615,6 +2633,26 @@ mod tests {
         let stalled = meter.update_at(100 * 100_000, t0 + Duration::from_secs(12));
         assert!((0.0..400_000.0).contains(&stalled), "{stalled}");
         assert!(meter.update_at(0, t0 + Duration::from_secs(13)) >= 0.0);
+    }
+
+    #[test]
+    fn test_mirrors_start_from_their_probed_answer_times() {
+        let mirror = |host: &str, answer_ms: Option<u64>| {
+            let mut m = remote(1000);
+            m.url = Url::parse(&format!("http://{host}/file.bin")).unwrap();
+            m.answer_time = answer_ms.map(Duration::from_millis);
+            m
+        };
+        // The second mirror answered its probe ten times sooner: the first request goes there.
+        let racer = build_racer(&[mirror("far.example", Some(300)), mirror("near.example", Some(30))]);
+        assert_eq!(racer.select_best_mirror(), Some(1));
+        assert_eq!(racer.get_mirror(1).unwrap().ttfb_ewma_ms, 30.0);
+        assert_eq!(racer.get_mirror(0).unwrap().if_range.as_deref(), Some("\"v1\""));
+        // Equal answers, or none measured: the first listed mirror leads.
+        let even = build_racer(&[mirror("a.example", Some(30)), mirror("b.example", Some(30))]);
+        assert_eq!(even.select_best_mirror(), Some(0));
+        let unmeasured = build_racer(&[mirror("a.example", None), mirror("b.example", None)]);
+        assert_eq!(unmeasured.select_best_mirror(), Some(0));
     }
 
     #[test]

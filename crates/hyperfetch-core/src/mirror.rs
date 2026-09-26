@@ -144,14 +144,15 @@ impl MirrorRacer {
         &mut self.mirrors
     }
 
-    /// Selects the best mirror that can take another connection right now, if any.
+    /// Selects the best mirror that can take another connection right now, if any. Equal scores
+    /// go to the mirror listed first: the user's or the resolver's preferred source.
     pub fn select_best_mirror(&self) -> Option<usize> {
         let now = Instant::now();
         self.mirrors
             .iter()
             .map(|m| (m.id, m.score(now)))
             .filter(|&(_, score)| score >= 0.0)
-            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .max_by(|a, b| a.1.total_cmp(&b.1).then(b.0.cmp(&a.0)))
             .map(|(id, _)| id)
     }
 
@@ -219,6 +220,19 @@ mod tests {
         // With every mirror unavailable there is no fallback to mirror 0.
         racer.get_mirror_mut(1).unwrap().cool_down(Instant::now() + Duration::from_secs(60));
         assert_eq!(racer.select_best_mirror(), None);
+    }
+
+    #[test]
+    fn test_equal_scores_go_to_the_first_mirror() {
+        let mut racer = MirrorRacer::new(
+            ["a", "b", "c"].iter().map(|h| Url::parse(&format!("https://{h}.example.com/f")).unwrap()).collect(),
+        );
+        assert_eq!(racer.select_best_mirror(), Some(0));
+        racer.acquire_mirror(0);
+        assert_eq!(racer.select_best_mirror(), Some(1), "a busier mirror scores lower");
+        racer.acquire_mirror(1);
+        racer.acquire_mirror(2);
+        assert_eq!(racer.select_best_mirror(), Some(0));
     }
 
     #[test]
