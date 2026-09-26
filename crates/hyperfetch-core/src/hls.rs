@@ -44,6 +44,9 @@ const PERSIST_INTERVAL: Duration = Duration::from_secs(2);
 // WRITE_QUEUE + 1 segments on their way to the disk are held at once, so peak memory is that many
 // times this; spool segments to disk if streams with huge segments must work.
 const MAX_SEGMENT_BYTES: u64 = if cfg!(test) { 64 * 1024 } else { 256 * 1024 * 1024 };
+/// Most bytes one request fetches when it merges the byte ranges of several segments of one file:
+/// enough to spare most of the per-request round trips, small enough to keep every connection busy.
+const MAX_MERGED_BYTES: u64 = if MAX_SEGMENT_BYTES < 8 * 1024 * 1024 { MAX_SEGMENT_BYTES } else { 8 * 1024 * 1024 };
 /// Longest media playlist accepted (a day of 2-second segments is about 43,000).
 const MAX_SEGMENTS: usize = if cfg!(test) { 1000 } else { 1_000_000 };
 const SNAPSHOT_INTERVAL: Duration = Duration::from_millis(200);
@@ -744,6 +747,45 @@ fn writes_init(segments: &[HlsSegment], i: usize) -> bool {
     segments[i].init.is_some() && (i == 0 || segments[i - 1].init != segments[i].init)
 }
 
+/// One request of a download: a segment (with its init section if [`writes_init`]), or several
+/// consecutive segments whose byte ranges it fetches together.
+struct Request {
+    segment: HlsSegment,
+    with_init: bool,
+    segments: usize,
+}
+
+/// The requests that fetch `segments[from..]`: one per segment, except that consecutive byte
+/// ranges of one file, each starting where the one before ends, are fetched together, up to
+/// [`MAX_MERGED_BYTES`] at a time. Encrypted segments are never merged, as each is decrypted on its
+/// own with its own IV, and neither is a segment its init section must precede.
+fn plan_requests(segments: Vec<HlsSegment>, from: usize) -> Vec<Request> {
+    let with_init: Vec<bool> = (0..segments.len()).map(|i| writes_init(&segments, i)).collect();
+    let mut requests: Vec<Request> = Vec::new();
+    for (segment, with_init) in segments.into_iter().zip(with_init).skip(from) {
+        let merged = requests.last().filter(|_| !with_init).and_then(|last| merged_range(&last.segment, &segment));
+        match (merged, requests.last_mut()) {
+            (Some(range), Some(last)) => {
+                last.segment.byte_range = Some(range);
+                last.segments += 1;
+            }
+            _ => requests.push(Request { segment, with_init, segments: 1 }),
+        }
+    }
+    requests
+}
+
+/// The byte range of `request` extended by that of `next`, if one request may fetch both.
+fn merged_range(request: &HlsSegment, next: &HlsSegment) -> Option<ByteRange> {
+    let (range, more) = (request.byte_range?, next.byte_range?);
+    let adjoining = range.end.checked_add(1) == Some(more.start) && request.url == next.url;
+    let plain = request.encryption.is_none() && next.encryption.is_none();
+    if !adjoining || !plain || range.len() + more.len() > MAX_MERGED_BYTES {
+        return None;
+    }
+    ByteRange::new(range.start, more.end).ok()
+}
+
 /// Whether the `count` segments written to `part_path` (`bytes` long) are these: the first and the
 /// last of them, fetched again, must equal the bytes that start and end the `.part`.
 #[allow(clippy::too_many_arguments)]
@@ -856,13 +898,13 @@ where
         matches!(self.slots.front(), Some(Slot::Ready(_)))
     }
 
-    /// The next unit, if it has arrived.
-    fn pop(&mut self) -> Option<Vec<u8>> {
+    /// The next unit and its data, if it has arrived.
+    fn pop(&mut self) -> Option<(usize, Vec<u8>)> {
         let Some(Slot::Ready(data)) = self.slots.front_mut() else { return None };
         let data = std::mem::take(data);
         self.slots.pop_front();
         self.head += 1;
-        Some(data)
+        Some((self.head - 1, data))
     }
 
     /// Waits until a unit has been fetched, or the next one is due to be requested again. The
@@ -991,29 +1033,29 @@ impl ResumeState {
     }
 }
 
-/// Appends the segments it receives to `part`, which holds what `state` (as saved) says, saving
-/// the state at most every [`PERSIST_INTERVAL`] and once more if the sender goes away before all
-/// `total` segments are written (the download failed or was cancelled). With them all written,
-/// flushes the file to disk if `fsync`. Returns the digest of the file, taken with `hasher` as it
-/// was written (after reading what an earlier run wrote), so it never has to be read back.
-/// Blocking: runs on a thread of its own, so the fetches never wait for the disk unless its queue
-/// is full.
+/// Appends the data it receives, with how many segments each piece holds, to `part`, which holds
+/// what `state` (as saved) says, saving the state at most every [`PERSIST_INTERVAL`] and once more
+/// if the sender goes away before all `total` segments are written (the download failed or was
+/// cancelled). With them all written, flushes the file to disk if `fsync`. Returns the digest of
+/// the file, taken with `hasher` as it was written (after reading what an earlier run wrote), so it
+/// never has to be read back. Blocking: runs on a thread of its own, so the fetches never wait for
+/// the disk unless its queue is full.
 fn write_segments(
     mut part: std::fs::File,
     mut state: ResumeState,
     total: usize,
     fsync: bool,
     mut hasher: StreamHasher,
-    mut segments: mpsc::Receiver<Vec<u8>>,
+    mut received: mpsc::Receiver<(usize, Vec<u8>)>,
 ) -> std::io::Result<FileDigest> {
     use std::io::{Seek, Write};
     hasher.update_from_file(&part, state.bytes)?;
     part.seek(SeekFrom::Start(state.bytes))?;
     let (mut saved, mut saved_at) = (state.segments, Instant::now());
-    while let Some(data) = segments.blocking_recv() {
+    while let Some((segments, data)) = received.blocking_recv() {
         part.write_all(&data)?;
         hasher.update(&data);
-        state.segments += 1;
+        state.segments += segments;
         state.bytes += data.len() as u64;
         if saved_at.elapsed() >= PERSIST_INTERVAL {
             state.save(&part)?;
@@ -1148,14 +1190,12 @@ impl HlsEngine {
             target_file.display()
         );
 
-        // An init section is written before the first segment that uses it and again whenever it changes.
-        let with_init: Vec<bool> = (0..total_segments).map(|i| writes_init(&segments, i)).collect();
-        let units: Vec<(HlsSegment, bool)> = segments.into_iter().zip(with_init).skip(resume_from).collect();
+        let requests = plan_requests(segments, resume_from);
         let received = AtomicU64::new(written_bytes);
         // Dropping it aborts the fetches in flight.
-        let mut window = InOrder::new(units.len(), num_connections, WINDOW_PER_CONNECTION * num_connections, |unit| {
-            let (segment, with_init) = &units[unit];
-            fetch_segment(client, auth, segment.clone(), *with_init, &received, options.fetch)
+        let mut window = InOrder::new(requests.len(), num_connections, WINDOW_PER_CONNECTION * num_connections, |i| {
+            let request = &requests[i];
+            fetch_segment(client, auth, request.segment.clone(), request.with_init, &received, options.fetch)
         });
 
         // Segments handed to the writer.
@@ -1172,10 +1212,10 @@ impl HlsEngine {
             tokio::select! {
                 room = to_disk.reserve(), if window.head_ready() => {
                     let Ok(room) = room else { break None };
-                    if let Some(data) = window.pop() {
-                        written += 1;
+                    if let Some((i, data)) = window.pop() {
+                        written += requests[i].segments;
                         written_bytes += data.len() as u64;
-                        room.send(data);
+                        room.send((requests[i].segments, data));
                     }
                 }
                 progress = window.progress() => {
@@ -1964,9 +2004,9 @@ video.m3u8
     async fn drain(mut window: InOrder<'_, impl Fn(usize) -> FakeFetch, FakeFetch>, requests: &Requests) -> Result<Vec<u8>, HlsError> {
         let mut out = Vec::new();
         loop {
-            while let Some(data) = window.pop() {
+            while let Some((unit, data)) = window.pop() {
+                assert_eq!(unit, requests.handed_out.fetch_add(1, Ordering::SeqCst), "units come out in order");
                 out.extend(data);
-                requests.handed_out.fetch_add(1, Ordering::SeqCst);
             }
             if window.is_done() {
                 return Ok(out);
@@ -2182,6 +2222,102 @@ video.m3u8
         assert_eq!(crate::storage::verify_digest(&digest, Some(&checksum)).unwrap(), blake3);
         let wrong = format!("sha256:{}", "0".repeat(64));
         assert!(crate::storage::verify_digest(&digest, Some(&wrong)).is_err());
+    }
+
+    #[test]
+    fn test_plan_merges_adjoining_plain_ranges_of_one_file() {
+        let init = |name: &str| Arc::new(InitSection { url: Url::parse(&format!("http://h/{name}")).unwrap(), byte_range: None, encryption: None });
+        let (x, y) = (init("x.mp4"), init("y.mp4"));
+        let segment = |file: &str, range: Option<(u64, u64)>, encrypted: bool, init: Option<&Arc<InitSection>>| HlsSegment {
+            index: 0,
+            url: Url::parse(&format!("http://h/{file}")).unwrap(),
+            duration_secs: 4.0,
+            byte_range: range.map(|(start, len)| ByteRange::from_len(start, len).unwrap()),
+            encryption: encrypted.then_some(Aes128Key { key: [1; 16], iv: [2; 16] }),
+            init: init.cloned(),
+        };
+        const K: u64 = 1024;
+        let mut segments = vec![
+            segment("a.mp4", Some((0, 10)), false, None),
+            segment("a.mp4", Some((10, 10)), false, None),
+            segment("a.mp4", Some((20, 10)), false, None),
+            segment("a.mp4", Some((31, 9)), false, None),  // a gap
+            segment("b.mp4", Some((40, 10)), false, None), // another file
+            segment("b.mp4", Some((50, 10)), true, None),  // encrypted
+            segment("b.mp4", Some((60, 10)), true, None),
+            segment("c.ts", None, false, None),            // no byte ranges
+            segment("c.ts", None, false, None),
+            segment("d.mp4", Some((0, 10)), false, Some(&x)),
+            segment("d.mp4", Some((10, 10)), false, Some(&x)),
+            segment("d.mp4", Some((20, 10)), false, Some(&y)), // its init section comes first
+            segment("e.mp4", Some((0, 30 * K)), false, Some(&y)),
+            segment("e.mp4", Some((30 * K, 30 * K)), false, Some(&y)),
+            segment("e.mp4", Some((60 * K, 30 * K)), false, Some(&y)), // over MAX_MERGED_BYTES together
+        ];
+        for (index, segment) in segments.iter_mut().enumerate() {
+            segment.index = index;
+        }
+        // (first segment, segments, byte range, with init section) of each request.
+        let plan = |from: usize| {
+            plan_requests(segments.clone(), from)
+                .iter()
+                .map(|r| (r.segment.index, r.segments, r.segment.byte_range.map(|b| (b.start, b.end)), r.with_init))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            plan(0),
+            [
+                (0, 3, Some((0, 29)), false),
+                (3, 1, Some((31, 39)), false),
+                (4, 1, Some((40, 49)), false),
+                (5, 1, Some((50, 59)), false),
+                (6, 1, Some((60, 69)), false),
+                (7, 1, None, false),
+                (8, 1, None, false),
+                (9, 2, Some((0, 19)), true),
+                (11, 1, Some((20, 29)), true),
+                (12, 2, Some((0, 60 * K - 1)), false),
+                (14, 1, Some((60 * K, 90 * K - 1)), false),
+            ]
+        );
+        // Resumed after one segment: the rest of the first file's run is still one request.
+        assert_eq!(plan(1)[0], (1, 2, Some((10, 29)), false));
+    }
+
+    #[tokio::test]
+    async fn test_byte_ranges_of_one_file_are_fetched_together_and_resume_by_segment() {
+        const SEGMENT: usize = 10 * 1024;
+        let file: Vec<u8> = (0..20 * SEGMENT).map(|i| (i % 251) as u8).collect();
+        let playlist: String = (0..20).map(|n| format!("#EXTINF:4,\n#EXT-X-BYTERANGE:{SEGMENT}@{}\nall.mp4\n", n * SEGMENT)).collect();
+        let playlist = format!("#EXTM3U\n{playlist}#EXT-X-ENDLIST\n");
+        // Fails the request for the third group of segments until it is repaired.
+        let broken = Arc::new(AtomicBool::new(true));
+        let (file_srv, broken_srv) = (file.clone(), Arc::clone(&broken));
+        let (addr, hits) = serve(move |path: &str, range: Option<ByteRange>| match (path, range) {
+            ("/media.m3u8", _) => ok(playlist.clone()),
+            ("/all.mp4", Some(r)) if r.start == 12 * SEGMENT as u64 && broken_srv.load(Ordering::SeqCst) => {
+                (404, String::new(), Vec::new())
+            }
+            ("/all.mp4", Some(r)) => (206, String::new(), file_srv[r.start as usize..=r.end as usize].to_vec()),
+            _ => (404, String::new(), Vec::new()),
+        })
+        .await;
+        let client = Client::new();
+        let url = Url::parse(&format!("http://{addr}/media.m3u8")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("ranged.mp4");
+        let segments = parse_hls_playlist(&client, &url, None, FETCH).await.unwrap();
+
+        // Six segments (60 KiB) per request: the first two requests are written, the third fails.
+        let err = download_to(&client, None, &url, segments.clone(), &out, 1).await.unwrap_err();
+        assert!(matches!(err, HlsError::SegmentFailed { index: 12, .. }), "{err}");
+        let state = std::fs::read_to_string(with_suffix(&out, ".part.hlsstate")).unwrap();
+        assert!(state.ends_with(&format!(" 12 {}", 12 * SEGMENT)), "{state}");
+
+        broken.store(false, Ordering::SeqCst);
+        download_to(&client, None, &url, segments, &out, 2).await.unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), file);
+        assert_eq!(hits.lock()["/all.mp4"], 3 + 2, "segments 12-17 and 18-19 on resume, not 8 requests");
     }
 
     #[tokio::test]
