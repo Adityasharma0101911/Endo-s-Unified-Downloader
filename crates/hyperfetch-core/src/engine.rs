@@ -1165,8 +1165,10 @@ struct ProbeInfo {
     /// Bytes the probe's connection moved, at the rate it reached, in the time a new connection
     /// takes to answer. `None` when no rate was measured.
     per_setup: Option<u64>,
-    /// How long the ranged GET waited for its answer; `None` when HEAD or a plain GET had to
-    /// stand in for it.
+    /// What a new request to `final_url` waits for its answer: how long the ranged GET's first
+    /// try waited, when it went there directly. `None` after a retry (which may reuse the
+    /// connection) or a redirect (whose hops chunk requests skip), or when HEAD or a plain GET
+    /// had to stand in for it.
     answer_time: Option<Duration>,
 }
 
@@ -1253,8 +1255,7 @@ async fn probe_url(
         }
     };
     let range = format!("bytes=0-{}", if prefetch { PREFETCH - 1 } else { 0 });
-    // Also when it answered, how long the last try waited, and whether that was the first try:
-    // then the wait is what a new connection needs to start.
+    // Also when it answered and, for a first try, how long that took: what a connection needs to start.
     let ranged = async {
         let mut attempt = 0;
         loop {
@@ -1277,7 +1278,7 @@ async fn probe_url(
                 }
                 _ => {
                     let answered = tokio::time::Instant::now();
-                    break (sent, answered, answered - sent_at, attempt == 1);
+                    break (sent, answered, (attempt == 1).then(|| answered - sent_at));
                 }
             }
         }
@@ -1286,7 +1287,7 @@ async fn probe_url(
     // never answer HEAD, and the GET alone has everything needed. None at all once the GET has
     // everything HEAD could add.
     tokio::pin!(head, ranged);
-    let (head, (ranged, answered, waited, first_try)) = tokio::select! {
+    let (head, (ranged, answered, setup)) = tokio::select! {
         head = &mut head => (head, ranged.await),
         ranged = &mut ranged => {
             let complete = ranged.0.as_ref().is_ok_and(|r| says_it_all(r.status(), r.headers(), r.url()));
@@ -1294,7 +1295,6 @@ async fn probe_url(
             (head, ranged)
         }
     };
-    let setup = first_try.then_some(waited);
     let body = |response: Response, len: u64| ProbeBody { response, len, answered, setup };
     let head_len = head.as_ref().and_then(|r| content_length(r.headers()));
     // Still busy or unreachable after every try: that says nothing about range support.
@@ -1336,7 +1336,8 @@ async fn probe_url(
 
     let sources: Vec<&Response> = std::iter::once(&get).chain(head.as_ref()).collect();
     let mut info = ProbeInfo::describe(url, &sources);
-    info.answer_time = Some(waited);
+    // Chunk requests go straight to the final URL, skipping the hops the probe took to get there.
+    info.answer_time = setup.filter(|_| info.final_url == *url);
     let content_range = get.headers().get(CONTENT_RANGE).and_then(|v| v.to_str().ok());
     let keep = match get.status() {
         StatusCode::PARTIAL_CONTENT => match content_range.map(ByteRange::parse_content_range) {
@@ -1374,8 +1375,8 @@ async fn probe_url(
 
 /// The racer over the mirrors serving the download. Requests go straight to where each probe was
 /// redirected, saving a redirect per request, with the mirror's own URL to fall back to. Each
-/// mirror starts from the answer time its probe measured instead of an assumed one, so the first
-/// requests already favour near mirrors.
+/// mirror starts from the answer time its probe measured, where it measured one, instead of an
+/// assumed one, so the first requests already favour near mirrors.
 fn build_racer(mirrors: &[ProbeInfo]) -> MirrorRacer {
     let mut racer = MirrorRacer::new(mirrors.iter().map(|m| m.final_url.clone()).collect());
     for (mirror, probe) in racer.mirrors_mut().iter_mut().zip(mirrors) {
@@ -2751,6 +2752,88 @@ mod tests {
     #[test]
     fn test_the_default_host_budget_never_holds_one_download_back() {
         assert!(DownloadOptions::default().max_connections_per_host >= MAX_CONNECTIONS);
+    }
+
+    /// A local server of `data` at every path: HEAD, and GETs honouring `Range` whose bodies come
+    /// 64 KiB per `pace`. `/moved/<name>` redirects to `/<name>`, the first GET of `/busy/<name>`
+    /// is refused with 503, and the first GET of `/stall/<name>` past the file's start goes
+    /// silent after 64 KiB.
+    async fn file_server(data: Vec<u8>, pace: Duration) -> Url {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let data = Arc::new(data);
+        let seen = Arc::new(Mutex::new(std::collections::HashSet::new()));
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let (data, seen) = (Arc::clone(&data), Arc::clone(&seen));
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => head.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
+                    let mut words = head.split_whitespace();
+                    let (method, path) = (words.next().unwrap_or_default(), words.next().unwrap_or("/").to_string());
+                    let (start, end) = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("range: bytes=")?.trim().split_once('-'))
+                        .and_then(|(a, b)| Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?.min(data.len() - 1))))
+                        .unwrap_or((0, data.len() - 1));
+                    let stall = path.starts_with("/stall/");
+                    let first = method == "get" && (!stall || start > 0) && seen.lock().insert(path.clone());
+                    let answer = if let Some(name) = path.strip_prefix("/moved/") {
+                        format!("HTTP/1.1 302 Found\r\nLocation: /{name}\r\nContent-Length: 0\r\n")
+                    } else if first && path.starts_with("/busy/") {
+                        "HTTP/1.1 503 Busy\r\nRetry-After: 0\r\nContent-Length: 0\r\n".to_string()
+                    } else if method == "head" {
+                        format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nETag: \"v1\"\r\n", data.len())
+                    } else {
+                        let (total, len) = (data.len(), end + 1 - start);
+                        format!("HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{total}\r\nContent-Length: {len}\r\nETag: \"v1\"\r\n")
+                    };
+                    if socket.write_all(format!("{answer}Connection: close\r\n\r\n").as_bytes()).await.is_err() {
+                        return;
+                    }
+                    if !answer.starts_with("HTTP/1.1 206") {
+                        return;
+                    }
+                    let silent = stall && first;
+                    for piece in data[start..=end].chunks(64 * 1024).take(if silent { 1 } else { usize::MAX }) {
+                        tokio::time::sleep(pace).await;
+                        if socket.write_all(piece).await.is_err() {
+                            return;
+                        }
+                    }
+                    if silent {
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                    }
+                });
+            }
+        });
+        base
+    }
+
+    #[tokio::test]
+    async fn test_only_a_direct_first_try_seeds_a_mirrors_answer_time() {
+        let base = file_server(vec![7u8; 4096], Duration::ZERO).await;
+        let client = Client::new();
+        let probe = |path: &str| {
+            let (client, url) = (client.clone(), base.join(path).unwrap());
+            async move { probe_url(&client, None, &url, false).await.unwrap().0 }
+        };
+        assert!(probe("file.bin").await.answer_time.is_some());
+        // Chunk requests skip the redirect the probe went through, so its time says nothing.
+        let moved = probe("moved/file.bin").await;
+        assert_eq!((moved.final_url, moved.answer_time), (base.join("file.bin").unwrap(), None));
+        // A retry may have reused the connection of the try before.
+        let busy = probe("busy/file.bin").await;
+        assert!(busy.accepts_ranges);
+        assert_eq!(busy.answer_time, None);
     }
 
     #[test]
