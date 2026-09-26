@@ -70,6 +70,10 @@ const PERSIST_INTERVAL: Duration = Duration::from_secs(2);
 const SPEED_TAU_SECS: f64 = 2.0;
 const DEFAULT_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
 const DEFAULT_MIN_STEAL: u64 = 1024 * 1024;
+/// Fewest bytes a steal takes unless the user set `min_steal_threshold`. Whether a steal pays
+/// off is decided by time (see `ChunkManager::steal_work`); this only keeps rates measured over
+/// a few packets from splitting off slivers.
+const MIN_STEAL: u64 = 64 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct EngineSnapshot {
@@ -592,11 +596,6 @@ impl DownloadEngine {
         let max_workers = self.options.num_connections.clamp(1, 64) as u64;
         let num_workers = remaining.div_ceil(per_connection).clamp(1, max_workers) as usize;
         let chunk_size = effective_chunk_size(remaining, num_workers as u64, self.options.base_chunk_size);
-        let min_steal = if self.options.min_steal_threshold != DEFAULT_MIN_STEAL {
-            self.options.min_steal_threshold
-        } else {
-            (chunk_size / 4).max(DEFAULT_MIN_STEAL)
-        };
         let mut manager = ChunkManager::with_resumed_ranges(size, chunk_size, &have).map_err(|e| e.to_string())?;
         manager.set_max_retries(self.options.max_retries);
 
@@ -638,7 +637,7 @@ impl DownloadEngine {
             cancel: stop.clone(),
             limiter: self.limiter(),
             file_size: size,
-            min_steal,
+            min_steal: min_steal(&self.options),
             stall_timeout: self.stall_timeout(),
             body_idle: self.stall_timeout().min(BODY_IDLE),
         };
@@ -1810,6 +1809,15 @@ fn validators_compatible(state: &DownloadState, remote: &ProbeInfo) -> bool {
     }
 }
 
+/// Fewest bytes a steal takes: the user's `min_steal_threshold`, else `MIN_STEAL`.
+fn min_steal(options: &DownloadOptions) -> u64 {
+    if options.min_steal_threshold != DEFAULT_MIN_STEAL {
+        options.min_steal_threshold
+    } else {
+        MIN_STEAL
+    }
+}
+
 fn effective_chunk_size(file_size: u64, num_workers: u64, configured: u64) -> u64 {
     const MB: u64 = 1024 * 1024;
     if configured != DEFAULT_CHUNK_SIZE {
@@ -2713,6 +2721,14 @@ mod tests {
         assert_eq!(even.select_best_mirror(), Some(0));
         let unmeasured = build_racer(&[mirror("a.example", None), mirror("b.example", None)]);
         assert_eq!(unmeasured.select_best_mirror(), Some(0));
+    }
+
+    #[test]
+    fn test_steals_take_a_small_floor_unless_the_user_set_one() {
+        // Time decides a steal now; the floor no longer grows with the chunk size.
+        assert_eq!(min_steal(&DownloadOptions::default()), 64 * 1024);
+        let set = DownloadOptions { min_steal_threshold: 8 * 1024 * 1024, ..Default::default() };
+        assert_eq!(min_steal(&set), 8 * 1024 * 1024);
     }
 
     #[test]
