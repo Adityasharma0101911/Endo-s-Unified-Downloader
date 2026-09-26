@@ -1,14 +1,17 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
+use futures_util::stream::FuturesUnordered;
 use futures_util::StreamExt;
 use reqwest::{Client, StatusCode};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, oneshot};
 use url::Url;
 use thiserror::Error;
 use crate::engine::EngineSnapshot;
@@ -16,9 +19,14 @@ use crate::range::ByteRange;
 use crate::worker::{authorize, Auth};
 
 const MAX_CONNECTIONS: usize = 64;
+/// Segments fetched or held ahead of the next one to write, per connection: a slow segment leaves
+/// the other connections this much to do before they would sit idle.
+const WINDOW_PER_CONNECTION: usize = 2;
+/// A segment is requested a second time once it has taken twice as long as a typical one, but
+/// never sooner than this: a second request saves too little on a fast one to be worth it.
+const HEDGE_MIN_WAIT: Duration = Duration::from_secs(1);
 /// Master playlists may point at further master playlists; stop following them after this many hops.
 const MAX_MASTER_DEPTH: usize = 3;
-const MAX_ATTEMPTS: u32 = 5;
 const MAX_PLAYLIST_BYTES: u64 = if cfg!(test) { 64 * 1024 } else { 16 * 1024 * 1024 };
 const MAX_KEY_BYTES: u64 = 1024;
 /// Most AES keys fetched at once; more would risk a burst of 429s from the key server.
@@ -26,16 +34,35 @@ const KEY_CONCURRENCY: usize = 16;
 /// Most of an oversized body read anyway, to tell a huge playlist from an ordinary file.
 const PEEK_BYTES: u64 = 1024;
 /// Largest segment or init section held in memory. Real segments are a few MiB.
-// ponytail: up to num_connections segments are buffered at once, so peak memory is
-// num_connections x this; spool segments to disk if streams with huge segments must work.
+// ponytail: up to WINDOW_PER_CONNECTION x connections segments (plus one second request) are held
+// at once, so peak memory is that many times this; spool segments to disk if streams with huge
+// segments must work.
 const MAX_SEGMENT_BYTES: u64 = if cfg!(test) { 64 * 1024 } else { 256 * 1024 * 1024 };
 /// Longest media playlist accepted (a day of 2-second segments is about 43,000).
 const MAX_SEGMENTS: usize = if cfg!(test) { 1000 } else { 1_000_000 };
 const SNAPSHOT_INTERVAL: Duration = Duration::from_millis(200);
-/// Time allowed for response headers to arrive, and for any gap between body chunks.
-const STALL_TIMEOUT: Duration = if cfg!(test) { Duration::from_millis(500) } else { Duration::from_secs(30) };
-/// First retry delay; doubles on every further attempt (0.5s, 1s, 2s, 4s).
+/// First retry delay; doubles on every further attempt (0.5s, 1s, 2s, 4s, 8s, 8s, ...).
 const RETRY_BASE_DELAY: Duration = if cfg!(test) { Duration::from_millis(20) } else { Duration::from_millis(500) };
+/// Longest pause between two attempts: with the default 8 retries a playlist or key gives up
+/// within about 40 s, inside the time the engine allows for fetching the playlist.
+const RETRY_MAX_DELAY: Duration = Duration::from_secs(8);
+
+/// Patience of every HLS request (playlists, keys, segments), from the user's settings.
+#[derive(Clone, Copy, Debug)]
+pub struct FetchPolicy {
+    /// Longest wait for the response headers, and between two pieces of the body.
+    pub stall_timeout: Duration,
+    /// Failed attempts allowed per request before it gives up.
+    pub max_retries: u32,
+}
+
+/// How [`HlsEngine::download`] fetches a stream.
+#[derive(Clone, Debug)]
+pub struct HlsOptions {
+    /// Requests in flight at once (1 to 64).
+    pub connections: usize,
+    pub fetch: FetchPolicy,
+}
 
 #[derive(Error, Debug)]
 pub enum HlsError {
@@ -102,10 +129,11 @@ pub async fn parse_hls_playlist(
     client: &Client,
     playlist_url: &Url,
     auth: Option<&Auth>,
+    fetch: FetchPolicy,
 ) -> Result<Vec<HlsSegment>, HlsError> {
     let mut url = playlist_url.clone();
     for hop in 0..=MAX_MASTER_DEPTH {
-        let (body, final_url) = fetch_with_retry(client, auth, &url, None, MAX_PLAYLIST_BYTES, &AtomicU64::new(0))
+        let (body, final_url) = fetch_with_retry(client, auth, &url, None, MAX_PLAYLIST_BYTES, None, fetch)
             .await
             .map_err(|e| {
                 let reason = format!("could not fetch {}: {}", url, e.reason);
@@ -136,7 +164,7 @@ pub async fn parse_hls_playlist(
             tracing::info!("Selected HLS variant: {}", url);
             continue;
         }
-        return parse_media_playlist(client, auth, text, &final_url).await;
+        return parse_media_playlist(client, auth, text, &final_url, fetch).await;
     }
     Err(malformed(format!("master playlists nested more than {} levels deep", MAX_MASTER_DEPTH)))
 }
@@ -279,6 +307,7 @@ async fn parse_media_playlist(
     auth: Option<&Auth>,
     text: &str,
     base: &Url,
+    fetch: FetchPolicy,
 ) -> Result<Vec<HlsSegment>, HlsError> {
     let is_vod = text.lines().map(str::trim).any(|l| l == "#EXT-X-ENDLIST" || l == "#EXT-X-PLAYLIST-TYPE:VOD");
     if !is_vod {
@@ -296,7 +325,7 @@ async fn parse_media_playlist(
     // fetched fails the walk only where it is used, so errors come in playlist order.
     let mut key_cache: HashMap<Url, Result<[u8; 16], String>> = futures_util::stream::iter(key_urls(text, base))
         .map(|url| async move {
-            let key = fetch_key(client, auth, &url).await;
+            let key = fetch_key(client, auth, &url, fetch).await;
             (url, key)
         })
         .buffer_unordered(KEY_CONCURRENCY)
@@ -338,7 +367,7 @@ async fn parse_media_playlist(
                     let key_bytes = match key_cache.get(&key_url) {
                         Some(k) => k.clone(),
                         None => {
-                            let k = fetch_key(client, auth, &key_url).await;
+                            let k = fetch_key(client, auth, &key_url, fetch).await;
                             key_cache.insert(key_url, k.clone());
                             k
                         }
@@ -419,8 +448,8 @@ fn key_urls(text: &str, base: &Url) -> Vec<Url> {
 }
 
 /// Fetches a 16-byte AES key; the error is the reason it could not.
-async fn fetch_key(client: &Client, auth: Option<&Auth>, url: &Url) -> Result<[u8; 16], String> {
-    let (bytes, _) = fetch_with_retry(client, auth, url, None, MAX_KEY_BYTES, &AtomicU64::new(0))
+async fn fetch_key(client: &Client, auth: Option<&Auth>, url: &Url, fetch: FetchPolicy) -> Result<[u8; 16], String> {
+    let (bytes, _) = fetch_with_retry(client, auth, url, None, MAX_KEY_BYTES, None, fetch)
         .await
         .map_err(|e| format!("could not fetch AES key {}: {}", url, e.reason))?;
     <[u8; 16]>::try_from(bytes.as_slice())
@@ -459,21 +488,57 @@ impl FetchError {
     }
 }
 
-/// One GET with header and idle timeouts, reading at most `max_bytes` of body. Body bytes
-/// are added to `progress` as they arrive and taken back out if the attempt fails.
+/// Body bytes of one segment's requests, counted in a download's progress as they arrive. Dropped
+/// before [`Tally::keep`], as a fetch that failed or lost the race to a second request is, it takes
+/// them back out.
+struct Tally<'a> {
+    total: &'a AtomicU64,
+    own: AtomicU64,
+}
+
+impl<'a> Tally<'a> {
+    fn new(total: &'a AtomicU64) -> Self {
+        Self { total, own: AtomicU64::new(0) }
+    }
+
+    fn add(&self, bytes: u64) {
+        self.total.fetch_add(bytes, Ordering::Relaxed);
+        self.own.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn take_back(&self, bytes: u64) {
+        self.total.fetch_sub(bytes, Ordering::Relaxed);
+        self.own.fetch_sub(bytes, Ordering::Relaxed);
+    }
+
+    /// Leaves the bytes counted: they are the segment's.
+    fn keep(self) {
+        self.own.store(0, Ordering::Relaxed);
+    }
+}
+
+impl Drop for Tally<'_> {
+    fn drop(&mut self) {
+        self.total.fetch_sub(*self.own.get_mut(), Ordering::Relaxed);
+    }
+}
+
+/// One GET with header and idle timeouts of `stall`, reading at most `max_bytes` of body. Body
+/// bytes are added to `progress` as they arrive and taken back out if the attempt fails.
 async fn fetch_once(
     client: &Client,
     auth: Option<&Auth>,
     url: &Url,
     range: Option<ByteRange>,
     max_bytes: u64,
-    progress: &AtomicU64,
+    progress: Option<&Tally<'_>>,
+    stall: Duration,
 ) -> Result<(Vec<u8>, Url), FetchError> {
     let mut req = authorize(client.get(url.clone()), auth, url);
     if let Some(r) = range {
         req = req.header(reqwest::header::RANGE, r.to_http_header());
     }
-    let mut resp = tokio::time::timeout(STALL_TIMEOUT, req.send())
+    let mut resp = tokio::time::timeout(stall, req.send())
         .await
         .map_err(|_| FetchError::retryable("timed out waiting for a response"))?
         .map_err(FetchError::retryable)?;
@@ -503,7 +568,7 @@ async fn fetch_once(
     let final_url = resp.url().clone();
     let mut body = Vec::new();
     let result = loop {
-        match tokio::time::timeout(STALL_TIMEOUT, resp.chunk()).await {
+        match tokio::time::timeout(stall, resp.chunk()).await {
             Err(_) => break Err(FetchError::retryable("connection stalled")),
             Ok(Err(e)) => break Err(FetchError::retryable(e)),
             Ok(Ok(None)) if declared_too_large => break Err(FetchError::too_large(max_bytes, &body)),
@@ -513,7 +578,9 @@ async fn fetch_once(
                     let head: Vec<u8> = body.iter().chain(chunk.iter()).take(PEEK_BYTES as usize).copied().collect();
                     break Err(FetchError::too_large(max_bytes, &head));
                 }
-                progress.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                if let Some(progress) = progress {
+                    progress.add(chunk.len() as u64);
+                }
                 body.extend_from_slice(&chunk);
             }
         }
@@ -527,34 +594,38 @@ async fn fetch_once(
         _ => Ok(()),
     });
     if let Err(e) = result {
-        progress.fetch_sub(body.len() as u64, Ordering::Relaxed);
+        if let Some(progress) = progress {
+            progress.take_back(body.len() as u64);
+        }
         return Err(e);
     }
     Ok((body, final_url))
 }
 
-/// `fetch_once` with exponential backoff; client errors other than 408/429 are not retried.
+/// `fetch_once` with exponential backoff, as often as `fetch` allows; client errors other than
+/// 408/429 are not retried.
 async fn fetch_with_retry(
     client: &Client,
     auth: Option<&Auth>,
     url: &Url,
     range: Option<ByteRange>,
     max_bytes: u64,
-    progress: &AtomicU64,
+    progress: Option<&Tally<'_>>,
+    fetch: FetchPolicy,
 ) -> Result<(Vec<u8>, Url), FetchError> {
     let mut delay = RETRY_BASE_DELAY;
-    let mut attempt = 1;
+    let mut failures = 0;
     loop {
-        match fetch_once(client, auth, url, range, max_bytes, progress).await {
+        match fetch_once(client, auth, url, range, max_bytes, progress, fetch.stall_timeout).await {
             Ok(fetched) => return Ok(fetched),
-            Err(e) if e.kind == FetchErrorKind::Transient && attempt < MAX_ATTEMPTS => {
-                tracing::warn!("HLS fetch of {} failed (attempt {}): {}; retrying", url, attempt, e.reason);
+            Err(e) if e.kind == FetchErrorKind::Transient && failures < fetch.max_retries => {
+                failures += 1;
+                tracing::warn!("HLS fetch of {} failed (attempt {}): {}; retrying", url, failures, e.reason);
                 tokio::time::sleep(delay).await;
-                delay *= 2;
-                attempt += 1;
+                delay = (delay * 2).min(RETRY_MAX_DELAY);
             }
             Err(mut e) => {
-                e.reason = format!("{} (after {} attempt(s))", e.reason, attempt);
+                e.reason = format!("{} (after {} attempt(s))", e.reason, failures + 1);
                 return Err(e);
             }
         }
@@ -576,27 +647,33 @@ async fn decrypt(data: Vec<u8>, key: &Option<Aes128Key>) -> Result<Vec<u8>, Stri
     .map_err(|e| format!("decryption task failed: {}", e))?
 }
 
-/// Downloads and decrypts one segment, prefixed by its init section when that changes.
+/// Downloads and decrypts one segment, prefixed by its init section when that changes. Its body
+/// bytes count in `progress` as they arrive, and stay counted only if it succeeds.
 async fn fetch_segment(
     client: &Client,
     auth: Option<&Auth>,
     segment: HlsSegment,
     with_init: bool,
     progress: &AtomicU64,
+    fetch: FetchPolicy,
 ) -> Result<Vec<u8>, HlsError> {
     let failed = |reason: String| HlsError::SegmentFailed { index: segment.index, reason };
     let limit = |range: Option<ByteRange>| range.map_or(MAX_SEGMENT_BYTES, |r| r.len().min(MAX_SEGMENT_BYTES));
+    let tally = Tally::new(progress);
     let mut init_data = None;
     if let Some(init) = segment.init.as_ref().filter(|_| with_init) {
-        let (data, _) = fetch_with_retry(client, auth, &init.url, init.byte_range, limit(init.byte_range), progress)
-            .await
-            .map_err(|e| failed(format!("init section {}: {}", init.url, e.reason)))?;
+        let (data, _) =
+            fetch_with_retry(client, auth, &init.url, init.byte_range, limit(init.byte_range), Some(&tally), fetch)
+                .await
+                .map_err(|e| failed(format!("init section {}: {}", init.url, e.reason)))?;
         init_data = Some(decrypt(data, &init.encryption).await.map_err(|r| failed(format!("init section: {}", r)))?);
     }
-    let (data, _) = fetch_with_retry(client, auth, &segment.url, segment.byte_range, limit(segment.byte_range), progress)
-        .await
-        .map_err(|e| failed(format!("{}: {}", segment.url, e.reason)))?;
+    let (data, _) =
+        fetch_with_retry(client, auth, &segment.url, segment.byte_range, limit(segment.byte_range), Some(&tally), fetch)
+            .await
+            .map_err(|e| failed(format!("{}: {}", segment.url, e.reason)))?;
     let data = decrypt(data, &segment.encryption).await.map_err(failed)?;
+    tally.keep();
     Ok(match init_data {
         Some(mut out) => {
             out.extend_from_slice(&data);
@@ -658,6 +735,7 @@ fn writes_init(segments: &[HlsSegment], i: usize) -> bool {
 
 /// Whether the `count` segments written to `part_path` (`bytes` long) are these: the first and the
 /// last of them, fetched again, must equal the bytes that start and end the `.part`.
+#[allow(clippy::too_many_arguments)]
 async fn part_matches(
     client: &Client,
     auth: Option<&Auth>,
@@ -665,13 +743,14 @@ async fn part_matches(
     part_path: &Path,
     count: usize,
     bytes: u64,
+    fetch: FetchPolicy,
     cancel_flag: &Option<Arc<AtomicBool>>,
 ) -> Result<bool, HlsError> {
     for index in std::iter::once(0).chain((count > 1).then_some(count - 1)) {
         let uncounted = AtomicU64::new(0);
-        let fetch = fetch_segment(client, auth, segments[index].clone(), writes_init(segments, index), &uncounted);
+        let segment = fetch_segment(client, auth, segments[index].clone(), writes_init(segments, index), &uncounted, fetch);
         let data = tokio::select! {
-            data = fetch => data?,
+            data = segment => data?,
             _ = cancelled(cancel_flag) => return Err(HlsError::Cancelled),
         };
         let len = data.len() as u64;
@@ -704,6 +783,172 @@ async fn cancelled(cancel_flag: &Option<Arc<AtomicBool>>) {
     }
 }
 
+/// A unit of an [`InOrder`] download that was started and not yet handed out.
+enum Slot<Fut> {
+    /// Requested at `since`, by `requests` requests at once; `hedge` starts the second one.
+    Fetching { since: tokio::time::Instant, requests: usize, hedge: Option<oneshot::Sender<Fut>> },
+    Ready(Vec<u8>),
+}
+
+type Job<'a> = Pin<Box<dyn Future<Output = (usize, Result<Vec<u8>, HlsError>)> + Send + 'a>>;
+
+/// Fetches units `0..count` with `fetch`, at most `connections` requests at once, and hands them
+/// out in order. The units fetched or waiting to be handed out span at most `window` from the next
+/// one on, which bounds memory: a slow unit does not idle the other connections, which go on with
+/// the units after it until the window is full. Once a connection would sit idle while the next
+/// unit is still being fetched, and that fetch has taken twice as long as a typical one (at least
+/// [`HEDGE_MIN_WAIT`]), the unit is requested a second time, never a third: the first of the two
+/// to succeed is used and the other is dropped, which aborts it.
+struct InOrder<'a, F, Fut> {
+    fetch: F,
+    count: usize,
+    connections: usize,
+    window: usize,
+    /// The next unit to hand out; `slots` holds it and the units after it that were started.
+    head: usize,
+    slots: VecDeque<Slot<Fut>>,
+    jobs: FuturesUnordered<Job<'a>>,
+    /// Requests in flight: a unit requested twice counts twice.
+    requests: usize,
+    /// Time the units fetched by a single request took, and how many they were.
+    fetch_time: Duration,
+    fetched: u32,
+}
+
+impl<'a, F, Fut> InOrder<'a, F, Fut>
+where
+    F: Fn(usize) -> Fut,
+    Fut: Future<Output = Result<Vec<u8>, HlsError>> + Send + 'a,
+{
+    fn new(count: usize, connections: usize, window: usize, fetch: F) -> Self {
+        Self {
+            fetch,
+            count,
+            connections,
+            window,
+            head: 0,
+            slots: VecDeque::new(),
+            jobs: FuturesUnordered::new(),
+            requests: 0,
+            fetch_time: Duration::ZERO,
+            fetched: 0,
+        }
+    }
+
+    /// Whether every unit has been handed out.
+    fn is_done(&self) -> bool {
+        self.head == self.count
+    }
+
+    /// The next unit, if it has arrived.
+    fn pop(&mut self) -> Option<Vec<u8>> {
+        let Some(Slot::Ready(data)) = self.slots.front_mut() else { return None };
+        let data = std::mem::take(data);
+        self.slots.pop_front();
+        self.head += 1;
+        Some(data)
+    }
+
+    /// Waits until a unit has been fetched, or the next one is due to be requested again. The
+    /// error of a unit that could not be fetched ends the download.
+    async fn progress(&mut self) -> Result<(), HlsError> {
+        self.launch();
+        let hedge_at = self.hedge_at();
+        let lag = async move {
+            match hedge_at {
+                Some(at) => tokio::time::sleep_until(at).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            finished = self.jobs.next() => match finished {
+                Some((unit, result)) => self.finish(unit, result),
+                // Nothing in flight: every unit started waits to be handed out.
+                None => std::future::pending().await,
+            },
+            () = lag => {
+                self.hedge();
+                Ok(())
+            }
+        }
+    }
+
+    /// Starts the units after the last one started, as far as connections and the window allow.
+    fn launch(&mut self) {
+        while self.requests < self.connections && self.slots.len() < self.window && self.head + self.slots.len() < self.count {
+            let unit = self.head + self.slots.len();
+            let (hedge, second) = oneshot::channel();
+            self.jobs.push(Box::pin(race(unit, (self.fetch)(unit), second)));
+            self.slots.push_back(Slot::Fetching { since: tokio::time::Instant::now(), requests: 1, hedge: Some(hedge) });
+            self.requests += 1;
+        }
+    }
+
+    /// When the next unit is due to be requested again, if it may be: it is still being fetched
+    /// by one request, a connection is free for another (so nothing else can be started), and a
+    /// typical fetch time is known.
+    fn hedge_at(&self) -> Option<tokio::time::Instant> {
+        let Some(Slot::Fetching { since, hedge: Some(_), .. }) = self.slots.front() else { return None };
+        if self.requests >= self.connections || self.fetched == 0 {
+            return None;
+        }
+        Some(*since + (self.fetch_time / self.fetched * 2).max(HEDGE_MIN_WAIT))
+    }
+
+    /// Requests the next unit a second time.
+    fn hedge(&mut self) {
+        let Some(Slot::Fetching { requests, hedge, .. }) = self.slots.front_mut() else { return };
+        let Some(hedge) = hedge.take() else { return };
+        tracing::info!("HLS segment {} is slow; requesting it a second time", self.head);
+        // Refused only when the first request has just finished: its answer is used.
+        if hedge.send((self.fetch)(self.head)).is_ok() {
+            *requests += 1;
+            self.requests += 1;
+        }
+    }
+
+    fn finish(&mut self, unit: usize, result: Result<Vec<u8>, HlsError>) -> Result<(), HlsError> {
+        let Some(slot) = unit.checked_sub(self.head).and_then(|i| self.slots.get_mut(i)) else { return Ok(()) };
+        if let Slot::Fetching { since, requests, .. } = slot {
+            self.requests -= *requests;
+            if *requests == 1 {
+                self.fetch_time += since.elapsed();
+                self.fetched += 1;
+            }
+        }
+        *slot = Slot::Ready(result?);
+        Ok(())
+    }
+}
+
+/// Fetches `unit` with `first` until it succeeds or fails, or until a second request for it arrives
+/// on `hedge`: then the first of the two to succeed is used, and the other dropped. When both fail,
+/// the first request's error is returned.
+async fn race<Fut>(unit: usize, first: Fut, hedge: oneshot::Receiver<Fut>) -> (usize, Result<Vec<u8>, HlsError>)
+where
+    Fut: Future<Output = Result<Vec<u8>, HlsError>>,
+{
+    tokio::pin!(first);
+    let second = tokio::select! {
+        biased;
+        result = &mut first => return (unit, result),
+        Ok(second) = hedge => second,
+    };
+    tokio::pin!(second);
+    let result = tokio::select! {
+        biased;
+        result = &mut first => match result {
+            Ok(data) => Ok(data),
+            Err(e) => second.await.map_err(|_| e),
+        },
+        result = &mut second => match result {
+            Ok(data) => Ok(data),
+            Err(_) => first.await,
+        },
+    };
+    (unit, result)
+}
+
 /// Where an HLS download goes and how much of its `.part` it keeps, from [`HlsEngine::prepare`].
 pub struct HlsTarget {
     path: PathBuf,
@@ -727,6 +972,7 @@ impl HlsEngine {
         playlist: &Url,
         segments: &[HlsSegment],
         output_path: &Path,
+        fetch: FetchPolicy,
         cancel_flag: &Option<Arc<AtomicBool>>,
     ) -> Result<Option<HlsTarget>, HlsError> {
         let path = if output_path.extension().is_none() {
@@ -752,7 +998,7 @@ impl HlsEngine {
             if resumable { (count, bytes) } else { (0, 0) }
         } else if stream == fingerprints.stream
             && resumable
-            && part_matches(client, auth, segments, &part_path, count, bytes, cancel_flag).await?
+            && part_matches(client, auth, segments, &part_path, count, bytes, fetch, cancel_flag).await?
         {
             (count, bytes)
         } else {
@@ -762,20 +1008,21 @@ impl HlsEngine {
         Ok(Some(HlsTarget { path, fingerprints, resume_from, resume_bytes }))
     }
 
-    /// Downloads `segments` with at most `num_connections` requests in flight and writes them in
-    /// order to the `.part` of `target` (from [`HlsEngine::prepare`] for these segments), renamed
-    /// to the target path once complete. A failed or cancelled run keeps the `.part` file and
-    /// resumes from it next time. `auth` is added to every request it covers.
+    /// Downloads `segments` with at most `options.connections` requests in flight (see
+    /// [`InOrder`]) and writes them in order to the `.part` of `target` (from
+    /// [`HlsEngine::prepare`] for these segments), renamed to the target path once complete. A
+    /// failed or cancelled run keeps the `.part` file and resumes from it next time. `auth` is
+    /// added to every request it covers.
     pub async fn download(
         client: &Client,
         auth: Option<&Auth>,
         segments: Vec<HlsSegment>,
         target: HlsTarget,
-        num_connections: usize,
+        options: &HlsOptions,
         snapshot_tx: Option<broadcast::Sender<EngineSnapshot>>,
         cancel_flag: Option<Arc<AtomicBool>>,
     ) -> Result<PathBuf, HlsError> {
-        let num_connections = num_connections.clamp(1, MAX_CONNECTIONS);
+        let num_connections = options.connections.clamp(1, MAX_CONNECTIONS);
         let total_segments = segments.len();
         if total_segments == 0 {
             return Err(HlsError::NoSegments);
@@ -802,37 +1049,32 @@ impl HlsEngine {
 
         // An init section is written before the first segment that uses it and again whenever it changes.
         let with_init: Vec<bool> = (0..total_segments).map(|i| writes_init(&segments, i)).collect();
+        let units: Vec<(HlsSegment, bool)> = segments.into_iter().zip(with_init).skip(resume_from).collect();
         let received = AtomicU64::new(written_bytes);
-        // `buffered` keeps at most `num_connections` fetches in flight and yields them in order,
-        // so no more than that many segments are ever held in memory. Dropping it aborts them.
-        let mut pipeline = futures_util::stream::iter(
-            segments
-                .into_iter()
-                .zip(with_init)
-                .skip(resume_from)
-                .map(|(segment, with_init)| fetch_segment(client, auth, segment, with_init, &received)),
-        )
-        .buffered(num_connections);
+        // Dropping it aborts the fetches in flight.
+        let mut window = InOrder::new(units.len(), num_connections, WINDOW_PER_CONNECTION * num_connections, |unit| {
+            let (segment, with_init) = &units[unit];
+            fetch_segment(client, auth, segment.clone(), *with_init, &received, options.fetch)
+        });
 
         let mut written = resume_from;
         let start_time = Instant::now();
         let start_bytes = written_bytes;
         let mut ticker = tokio::time::interval(SNAPSHOT_INTERVAL);
         loop {
+            while let Some(data) = window.pop() {
+                out_file.write_all(&data).await?;
+                out_file.flush().await?;
+                written += 1;
+                written_bytes += data.len() as u64;
+                let state = format!("{} {} {} {}", fingerprints.exact, fingerprints.stream, written, written_bytes);
+                tokio::fs::write(&state_path, state).await?;
+            }
+            if window.is_done() {
+                break;
+            }
             tokio::select! {
-                next = pipeline.next() => match next {
-                    None => break,
-                    Some(data) => {
-                        let data = data?;
-                        out_file.write_all(&data).await?;
-                        out_file.flush().await?;
-                        written += 1;
-                        written_bytes += data.len() as u64;
-                        let state =
-                            format!("{} {} {} {}", fingerprints.exact, fingerprints.stream, written, written_bytes);
-                        tokio::fs::write(&state_path, state).await?;
-                    }
-                },
+                progress = window.progress() => progress?,
                 _ = ticker.tick() => {
                     if is_cancelled() {
                         return Err(HlsError::Cancelled);
@@ -852,7 +1094,7 @@ impl HlsEngine {
                 }
             }
         }
-        drop(pipeline);
+        drop(window);
 
         out_file.sync_all().await?;
         drop(out_file);
@@ -1014,6 +1256,13 @@ pub(crate) mod tests {
         (200, String::new(), body.into())
     }
 
+    /// A short stall timeout keeps tests that stall quick.
+    const FETCH: FetchPolicy = FetchPolicy { stall_timeout: Duration::from_millis(500), max_retries: 4 };
+
+    fn options(connections: usize) -> HlsOptions {
+        HlsOptions { connections, fetch: FETCH }
+    }
+
     /// Prepares `out` for `segments` of `playlist`, which must be free or hold this stream, and
     /// downloads them there.
     async fn download_to(
@@ -1024,8 +1273,8 @@ pub(crate) mod tests {
         out: &Path,
         num_connections: usize,
     ) -> Result<PathBuf, HlsError> {
-        let target = HlsEngine::prepare(client, auth, playlist, &segments, out, &None).await?.expect("usable name");
-        HlsEngine::download(client, auth, segments, target, num_connections, None, None).await
+        let target = HlsEngine::prepare(client, auth, playlist, &segments, out, FETCH, &None).await?.expect("usable name");
+        HlsEngine::download(client, auth, segments, target, &options(num_connections), None, None).await
     }
 
     fn encrypt(plain: &[u8], key: [u8; 16], iv: [u8; 16]) -> Vec<u8> {
@@ -1099,7 +1348,7 @@ video.m3u8
         let playlist = "#EXTM3U\n#EXT-X-VERSION:4\n#EXT-X-TARGETDURATION:10\n#EXTINF:10.0,\n#EXT-X-BYTERANGE:1000@0\nmedia.ts\n#EXTINF:10.0,\n#EXT-X-BYTERANGE:2000\nmedia.ts\n#EXT-X-ENDLIST\n";
         let (addr, _) = serve(move |_, _| ok(playlist)).await;
         let url = Url::parse(&format!("http://{}/playlist.m3u8", addr)).unwrap();
-        let segments = parse_hls_playlist(&Client::new(), &url, None).await.unwrap();
+        let segments = parse_hls_playlist(&Client::new(), &url, None, FETCH).await.unwrap();
         assert_eq!(segments.len(), 2);
         assert_eq!(segments[0].byte_range, Some(ByteRange::new(0, 999).unwrap()));
         assert_eq!(segments[1].byte_range, Some(ByteRange::new(1000, 2999).unwrap()));
@@ -1117,10 +1366,10 @@ video.m3u8
         .await;
         let client = Client::new();
         let live = Url::parse(&format!("http://{}/live.m3u8", addr)).unwrap();
-        assert!(matches!(parse_hls_playlist(&client, &live, None).await, Err(HlsError::Unsupported(_))));
+        assert!(matches!(parse_hls_playlist(&client, &live, None, FETCH).await, Err(HlsError::Unsupported(_))));
 
         let start = Url::parse(&format!("http://{}/start/master.m3u8", addr)).unwrap();
-        let segments = parse_hls_playlist(&client, &start, None).await.unwrap();
+        let segments = parse_hls_playlist(&client, &start, None, FETCH).await.unwrap();
         assert_eq!(segments[0].url.path(), "/cdn/abc/v/seg0.ts");
     }
 
@@ -1159,21 +1408,21 @@ video.m3u8
         .await;
         let client = Client::new();
         let url = Url::parse(&format!("http://{addr}/rotating.m3u8")).unwrap();
-        let segments = parse_hls_playlist(&client, &url, None).await.unwrap();
+        let segments = parse_hls_playlist(&client, &url, None, FETCH).await.unwrap();
         assert_eq!(most.load(Ordering::SeqCst), KEY_CONCURRENCY, "at most {KEY_CONCURRENCY} key requests at once, and that many");
         for (n, segment) in segments.iter().enumerate() {
             assert_eq!(segment.encryption.as_ref().unwrap().key, [n as u8; 16], "segment {n} has its own key");
         }
 
         let url = Url::parse(&format!("http://{addr}/drm-first.m3u8")).unwrap();
-        assert!(matches!(parse_hls_playlist(&client, &url, None).await, Err(HlsError::Unsupported(_))));
+        assert!(matches!(parse_hls_playlist(&client, &url, None, FETCH).await, Err(HlsError::Unsupported(_))));
     }
 
     #[tokio::test]
     async fn test_master_recursion_is_depth_limited() {
         let (addr, hits) = serve(|_, _| ok("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nself.m3u8\n")).await;
         let url = Url::parse(&format!("http://{}/self.m3u8", addr)).unwrap();
-        assert!(matches!(parse_hls_playlist(&Client::new(), &url, None).await, Err(HlsError::Unsupported(_))));
+        assert!(matches!(parse_hls_playlist(&Client::new(), &url, None, FETCH).await, Err(HlsError::Unsupported(_))));
         assert_eq!(hits.lock()["/self.m3u8"], MAX_MASTER_DEPTH + 1);
     }
 
@@ -1214,15 +1463,15 @@ video.m3u8
 
         let client = Client::new();
         let url = Url::parse(&format!("http://{}/master.m3u8", addr)).unwrap();
-        let segments = parse_hls_playlist(&client, &url, None).await.unwrap();
+        let segments = parse_hls_playlist(&client, &url, None, FETCH).await.unwrap();
         assert_eq!(container_extension(&segments), "mp4");
 
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("video.mp4");
         let (tx, mut rx) = broadcast::channel(256);
-        let target = HlsEngine::prepare(&client, None, &url, &segments, &out, &None).await.unwrap().unwrap();
+        let target = HlsEngine::prepare(&client, None, &url, &segments, &out, FETCH, &None).await.unwrap().unwrap();
         // num_connections == 0 must be treated as 1, not panic.
-        let path = HlsEngine::download(&client, None, segments, target, 0, Some(tx), None).await.unwrap();
+        let path = HlsEngine::download(&client, None, segments, target, &options(0), Some(tx), None).await.unwrap();
 
         let expected = [init, seg0, seg1, seg2].concat();
         assert_eq!(path, out);
@@ -1263,7 +1512,7 @@ video.m3u8
         let out = dir.path().join("clip.ts");
         std::fs::write(&out, "previous download").unwrap();
 
-        let segments = parse_hls_playlist(&client, &url, None).await.unwrap();
+        let segments = parse_hls_playlist(&client, &url, None, FETCH).await.unwrap();
         let err = download_to(&client, None, &url, segments, &out, 1).await.unwrap_err();
         assert!(matches!(err, HlsError::SegmentFailed { index: 1, .. }), "{err}");
         assert_eq!(std::fs::read(&out).unwrap(), b"previous download", "a failed run must not touch the final name");
@@ -1271,7 +1520,7 @@ video.m3u8
         assert_eq!(std::fs::read(with_suffix(&out, ".part")).unwrap(), b"AAAA");
 
         broken.store(false, Ordering::SeqCst);
-        let segments = parse_hls_playlist(&client, &url, None).await.unwrap();
+        let segments = parse_hls_playlist(&client, &url, None, FETCH).await.unwrap();
         download_to(&client, None, &url, segments, &out, 4).await.unwrap();
         assert_eq!(std::fs::read(&out).unwrap(), b"AAAABBBBCCCC");
         assert_eq!(hits.lock()["/a.ts"], 1, "segments already written are not fetched again");
@@ -1289,7 +1538,7 @@ video.m3u8
         let client = Client::new();
         let url = Url::parse(&format!("http://{}/media.m3u8", addr)).unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let segments = parse_hls_playlist(&client, &url, None).await.unwrap();
+        let segments = parse_hls_playlist(&client, &url, None, FETCH).await.unwrap();
         let err = download_to(&client, None, &url, segments.clone(), &dir.path().join("a.ts"), 2).await.unwrap_err();
         assert!(err.to_string().contains("ignored the byte range"), "{err}");
 
@@ -1315,7 +1564,7 @@ video.m3u8
         let dir = tempfile::tempdir().unwrap();
         for (playlist, segment) in [("/big.m3u8", "/big.ts"), ("/ranged.m3u8", "/over.ts")] {
             let url = Url::parse(&format!("http://{}{}", addr, playlist)).unwrap();
-            let segments = parse_hls_playlist(&client, &url, None).await.unwrap();
+            let segments = parse_hls_playlist(&client, &url, None, FETCH).await.unwrap();
             let out = dir.path().join(&segment[1..]);
             let err = download_to(&client, None, &url, segments, &out, 1).await.unwrap_err();
             assert!(matches!(err, HlsError::SegmentFailed { index: 0, .. }), "{err}");
@@ -1348,7 +1597,7 @@ video.m3u8
         let parse = |path: &str| {
             let url = Url::parse(&format!("http://{}{}", addr, path)).unwrap();
             let client = client.clone();
-            async move { parse_hls_playlist(&client, &url, None).await }
+            async move { parse_hls_playlist(&client, &url, None, FETCH).await }
         };
         assert!(matches!(parse("/missing.m3u8").await, Err(HlsError::Unavailable(_))));
         assert!(matches!(parse("/keyless.m3u8").await, Err(HlsError::Unavailable(_))));
@@ -1381,9 +1630,9 @@ video.m3u8
         let client = Client::new();
         let url = Url::parse(&format!("http://{}/private/master.m3u8", addr)).unwrap();
         let auth = Auth::new("Bearer secret", std::slice::from_ref(&url)).unwrap();
-        assert!(matches!(parse_hls_playlist(&client, &url, None).await, Err(HlsError::Unavailable(_))));
+        assert!(matches!(parse_hls_playlist(&client, &url, None, FETCH).await, Err(HlsError::Unavailable(_))));
 
-        let segments = parse_hls_playlist(&client, &url, Some(&auth)).await.unwrap();
+        let segments = parse_hls_playlist(&client, &url, Some(&auth), FETCH).await.unwrap();
         let dir = tempfile::tempdir().unwrap();
         let err = download_to(&client, None, &url, segments.clone(), &dir.path().join("public.mp4"), 1).await.unwrap_err();
         assert!(err.to_string().contains("401"), "{err}");
@@ -1418,8 +1667,8 @@ video.m3u8
             let client = client.clone();
             async move {
                 let url = playlist(path);
-                let segments = parse_hls_playlist(&client, &url, None).await.unwrap();
-                let target = HlsEngine::prepare(&client, None, &url, &segments, &out, &None).await.unwrap();
+                let segments = parse_hls_playlist(&client, &url, None, FETCH).await.unwrap();
+                let target = HlsEngine::prepare(&client, None, &url, &segments, &out, FETCH, &None).await.unwrap();
                 (target, segments)
             }
         };
@@ -1429,7 +1678,7 @@ video.m3u8
         for (i, (paused, other)) in pairs.into_iter().enumerate() {
             let out = dir.path().join(format!("{i}.ts"));
             let (target, segments) = prepare(paused, out.clone()).await;
-            let err = HlsEngine::download(&client, None, segments, target.unwrap(), 1, None, None).await.unwrap_err();
+            let err = HlsEngine::download(&client, None, segments, target.unwrap(), &options(1), None, None).await.unwrap_err();
             assert!(matches!(err, HlsError::SegmentFailed { index: 2, .. }), "{err}");
             let part = std::fs::read(with_suffix(&out, ".part")).unwrap();
             let state = std::fs::read(with_suffix(&out, ".part.hlsstate")).unwrap();
@@ -1449,7 +1698,7 @@ video.m3u8
         let out = dir.path().join("1.ts");
         let before = fetches("720");
         let (target, segments) = prepare("/video/index.m3u8?q=720", out.clone()).await;
-        HlsEngine::download(&client, None, segments, target.unwrap(), 1, None, None).await.unwrap();
+        HlsEngine::download(&client, None, segments, target.unwrap(), &options(1), None, None).await.unwrap();
         assert_eq!(std::fs::read(&out).unwrap(), b"INTRO /seg.ts?v=720&n=1 /seg.ts?v=720&n=2 ");
         assert_eq!(fetches("720"), before + 1, "only the missing segment is fetched");
     }
@@ -1478,11 +1727,11 @@ video.m3u8
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("index.ts");
 
-        let segments = parse_hls_playlist(&client, &url(1), None).await.unwrap();
+        let segments = parse_hls_playlist(&client, &url(1), None, FETCH).await.unwrap();
         assert!(download_to(&client, None, &url(1), segments, &out, 1).await.is_err());
 
         broken.store(false, Ordering::SeqCst);
-        let segments = parse_hls_playlist(&client, &url(2), None).await.unwrap();
+        let segments = parse_hls_playlist(&client, &url(2), None, FETCH).await.unwrap();
         // download_to panics unless the .part is accepted as this stream.
         download_to(&client, None, &url(2), segments, &out, 1).await.unwrap();
         assert_eq!(std::fs::read(&out).unwrap(), b"AAAABBBBCCCC");
@@ -1505,12 +1754,12 @@ video.m3u8
         .await;
         let client = Client::new();
         let url = Url::parse(&format!("http://{}/fmp4.m3u8", addr)).unwrap();
-        let segments = parse_hls_playlist(&client, &url, None).await.unwrap();
+        let segments = parse_hls_playlist(&client, &url, None, FETCH).await.unwrap();
         let (a, b) = (segments[0].init.as_ref().unwrap(), segments[1].init.as_ref().unwrap());
         assert!(Arc::ptr_eq(a, b), "segments must share one init section, not copies");
 
         let url = Url::parse(&format!("http://{}/many.m3u8", addr)).unwrap();
-        assert!(matches!(parse_hls_playlist(&client, &url, None).await, Err(HlsError::Unsupported(_))));
+        assert!(matches!(parse_hls_playlist(&client, &url, None, FETCH).await, Err(HlsError::Unsupported(_))));
     }
 
     #[tokio::test]
@@ -1522,7 +1771,7 @@ video.m3u8
         .await;
         let client = Client::new();
         let url = Url::parse(&format!("http://{}/media.m3u8", addr)).unwrap();
-        let segments = parse_hls_playlist(&client, &url, None).await.unwrap();
+        let segments = parse_hls_playlist(&client, &url, None, FETCH).await.unwrap();
         let dir = tempfile::tempdir().unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
         let setter = Arc::clone(&cancel);
@@ -1530,11 +1779,199 @@ video.m3u8
             tokio::time::sleep(Duration::from_millis(100)).await;
             setter.store(true, Ordering::SeqCst);
         });
-        let target = HlsEngine::prepare(&client, None, &url, &segments, &dir.path().join("x.ts"), &None).await.unwrap();
+        let target = HlsEngine::prepare(&client, None, &url, &segments, &dir.path().join("x.ts"), FETCH, &None).await.unwrap();
         let started = Instant::now();
-        let result = HlsEngine::download(&client, None, segments, target.unwrap(), 2, None, Some(cancel)).await;
+        let result = HlsEngine::download(&client, None, segments, target.unwrap(), &options(2), None, Some(cancel)).await;
         assert!(matches!(result, Err(HlsError::Cancelled)));
         // Well under the stall timeout: the cancel must not wait for the fetch to give up.
-        assert!(started.elapsed() < STALL_TIMEOUT);
+        assert!(started.elapsed() < FETCH.stall_timeout);
+    }
+
+    /// What a fake fetch saw: requests per unit, requests open at once (and the most ever), how
+    /// many units were handed out, and how far past those a unit was ever requested.
+    #[derive(Default)]
+    struct Requests {
+        per_unit: Mutex<HashMap<usize, usize>>,
+        open: AtomicUsize,
+        most_open: AtomicUsize,
+        handed_out: AtomicUsize,
+        most_ahead: AtomicUsize,
+    }
+
+    type FakeFetch = Pin<Box<dyn Future<Output = Result<Vec<u8>, HlsError>> + Send>>;
+
+    /// A fetch whose `n`-th request (from 0) of `unit` takes `plan(unit, n).0` milliseconds and
+    /// answers `[unit]`, or fails if `plan(unit, n).1` is false.
+    fn fake(requests: &Arc<Requests>, plan: fn(usize, usize) -> (u64, bool)) -> impl Fn(usize) -> FakeFetch {
+        struct Open(Arc<Requests>);
+        impl Drop for Open {
+            fn drop(&mut self) {
+                self.0.open.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let requests = Arc::clone(requests);
+        move |unit| {
+            let n = {
+                let mut per_unit = requests.per_unit.lock();
+                let count = per_unit.entry(unit).or_insert(0);
+                *count += 1;
+                *count - 1
+            };
+            let ahead = unit.saturating_sub(requests.handed_out.load(Ordering::SeqCst));
+            requests.most_ahead.fetch_max(ahead, Ordering::SeqCst);
+            let requests = Arc::clone(&requests);
+            let (millis, succeeds) = plan(unit, n);
+            Box::pin(async move {
+                requests.most_open.fetch_max(requests.open.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+                let _open = Open(Arc::clone(&requests));
+                tokio::time::sleep(Duration::from_millis(millis)).await;
+                match succeeds {
+                    true => Ok(vec![unit as u8]),
+                    false => Err(HlsError::SegmentFailed { index: unit, reason: format!("request {n} failed") }),
+                }
+            })
+        }
+    }
+
+    /// Runs `window` to the end as `download` does, returning what it handed out, in order.
+    async fn drain(mut window: InOrder<'_, impl Fn(usize) -> FakeFetch, FakeFetch>, requests: &Requests) -> Result<Vec<u8>, HlsError> {
+        let mut out = Vec::new();
+        loop {
+            while let Some(data) = window.pop() {
+                out.extend(data);
+                requests.handed_out.fetch_add(1, Ordering::SeqCst);
+            }
+            if window.is_done() {
+                return Ok(out);
+            }
+            window.progress().await?;
+        }
+    }
+
+    fn requests_of(requests: &Requests, unit: usize) -> usize {
+        requests.per_unit.lock().get(&unit).copied().unwrap_or(0)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_window_goes_past_a_stalled_unit_and_requests_it_once_more() {
+        let requests = Arc::new(Requests::default());
+        // The first request of unit 0 stalls; everything else takes a second.
+        let fetch = fake(&requests, |unit, n| (if (unit, n) == (0, 0) { 100_000 } else { 1_000 }, true));
+        let started = tokio::time::Instant::now();
+        let out = drain(InOrder::new(12, 3, 6, fetch), &requests).await.unwrap();
+
+        assert_eq!(out, (0..12).collect::<Vec<u8>>(), "handed out in order");
+        assert_eq!(requests_of(&requests, 0), 2, "the stalled unit is requested once more");
+        assert!((1..12).all(|unit| requests_of(&requests, unit) == 1), "{:?}", requests.per_unit.lock());
+        // Two seconds (twice the typical fetch) after it started, not a hundred.
+        assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+        assert_eq!(requests.most_open.load(Ordering::SeqCst), 3, "never more requests than connections");
+        assert_eq!(requests.most_ahead.load(Ordering::SeqCst), 5, "the others fill the window, and no more");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_steady_units_are_requested_once() {
+        let requests = Arc::new(Requests::default());
+        // Between 1 and 1.4 s each, the tail included: no unit lags.
+        let fetch = fake(&requests, |unit, _| (1_000 + (unit * 37 % 5) as u64 * 100, true));
+        let out = drain(InOrder::new(30, 4, 8, fetch), &requests).await.unwrap();
+        assert_eq!(out, (0..30).collect::<Vec<u8>>());
+        assert!((0..30).all(|unit| requests_of(&requests, unit) == 1), "{:?}", requests.per_unit.lock());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_either_request_may_answer_and_there_is_no_third() {
+        // Unit 0's first request fails after 5 s, while its second one (from 3 s on) is still
+        // running: that one's answer is used.
+        let requests = Arc::new(Requests::default());
+        let fetch = fake(&requests, |unit, n| match (unit, n) {
+            (0, 0) => (5_000, false),
+            (0, _) => (10_000, true),
+            _ => (1_000, true),
+        });
+        let started = tokio::time::Instant::now();
+        let out = drain(InOrder::new(4, 2, 4, fetch), &requests).await.unwrap();
+        assert_eq!(out, [0, 1, 2, 3]);
+        assert_eq!(requests_of(&requests, 0), 2);
+        let elapsed = started.elapsed();
+        assert!((13_000..13_100).contains(&elapsed.as_millis()), "second request from 3 s on, answered 10 s later: {elapsed:?}");
+
+        // Both requests fail: the first one's error ends the download, and no third is made.
+        let requests = Arc::new(Requests::default());
+        let fetch = fake(&requests, |unit, _| if unit == 0 { (5_000, false) } else { (1_000, true) });
+        let err = drain(InOrder::new(4, 2, 4, fetch), &requests).await.unwrap_err();
+        assert!(err.to_string().contains("request 0 failed"), "{err}");
+        assert_eq!(requests_of(&requests, 0), 2);
+    }
+
+    #[test]
+    fn test_tally_keeps_only_what_a_finished_fetch_received() {
+        let total = AtomicU64::new(100);
+        let lost = Tally::new(&total);
+        lost.add(40);
+        lost.take_back(10);
+        assert_eq!(total.load(Ordering::SeqCst), 130);
+        // A fetch dropped midway (it failed, or lost the race to a second request) counts for nothing.
+        drop(lost);
+        assert_eq!(total.load(Ordering::SeqCst), 100);
+        let kept = Tally::new(&total);
+        kept.add(25);
+        kept.keep();
+        assert_eq!(total.load(Ordering::SeqCst), 125);
+    }
+
+    #[tokio::test]
+    async fn test_stalled_segment_is_requested_again_before_the_stall_timeout() {
+        let first = Arc::new(AtomicBool::new(true));
+        let (addr, hits) = serve(move |path: &str, _| match path {
+            "/media.m3u8" => ok(format!("#EXTM3U\n{}#EXT-X-ENDLIST\n", (0..6).map(|n| format!("#EXTINF:4,\ns{n}.ts\n")).collect::<String>())),
+            // The first request of the first segment never gets an answer.
+            "/s0.ts" if first.swap(false, Ordering::SeqCst) => (0, String::new(), Vec::new()),
+            p => ok(p.trim_start_matches("/s").trim_end_matches(".ts").repeat(3)),
+        })
+        .await;
+        let client = Client::new();
+        let url = Url::parse(&format!("http://{addr}/media.m3u8")).unwrap();
+        let segments = parse_hls_playlist(&client, &url, None, FETCH).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("hedged.ts");
+        // Waiting out the stall would take 20 s, and fail: no retries.
+        let patient = HlsOptions { connections: 3, fetch: FetchPolicy { stall_timeout: Duration::from_secs(20), max_retries: 0 } };
+        let target = HlsEngine::prepare(&client, None, &url, &segments, &out, patient.fetch, &None).await.unwrap().unwrap();
+        let started = Instant::now();
+        HlsEngine::download(&client, None, segments, target, &patient, None, None).await.unwrap();
+        assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+        assert_eq!(std::fs::read(&out).unwrap(), b"000111222333444555");
+        let hits = hits.lock();
+        assert_eq!(hits["/s0.ts"], 2);
+        assert!((1..6).all(|n| hits[&format!("/s{n}.ts")] == 1), "{hits:?}");
+    }
+
+    #[tokio::test]
+    async fn test_retries_follow_the_policy() {
+        let failures = Arc::new(AtomicUsize::new(0));
+        let failures_srv = Arc::clone(&failures);
+        let (addr, _) = serve(move |path: &str, _| match path {
+            "/media.m3u8" => ok("#EXTM3U\n#EXTINF:4,\nbusy.ts\n#EXT-X-ENDLIST\n"),
+            // Busy twice for every client that starts over.
+            _ if failures_srv.fetch_add(1, Ordering::SeqCst) % 3 < 2 => (503, String::new(), Vec::new()),
+            _ => ok("DATA"),
+        })
+        .await;
+        let client = Client::new();
+        let url = Url::parse(&format!("http://{addr}/media.m3u8")).unwrap();
+        let segments = parse_hls_playlist(&client, &url, None, FETCH).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        for (max_retries, succeeds) in [(1, false), (2, true)] {
+            failures.store(0, Ordering::SeqCst);
+            let options = HlsOptions { connections: 1, fetch: FetchPolicy { max_retries, ..FETCH } };
+            let out = dir.path().join(format!("{max_retries}.ts"));
+            let target = HlsEngine::prepare(&client, None, &url, &segments, &out, FETCH, &None).await.unwrap().unwrap();
+            let result = HlsEngine::download(&client, None, segments.clone(), target, &options, None, None).await;
+            match result {
+                Ok(_) => assert!(succeeds, "{max_retries} retries must not be enough"),
+                Err(e) => assert!(!succeeds && e.to_string().contains("after 2 attempt(s)"), "{e}"),
+            }
+        }
     }
 }
