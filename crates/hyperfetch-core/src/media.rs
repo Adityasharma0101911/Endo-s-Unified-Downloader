@@ -187,7 +187,10 @@ const PATH_MARK: &str = "HFPATH ";
 
 /// Turns YouTube's formats into 10 MiB range fragments that `--concurrent-fragments` fetches in
 /// parallel; otherwise one connection pulls the 10 MiB pieces one after another. Fragments report
-/// progress against an estimated total, which the progress parser reads.
+/// progress against an estimated total, which the progress parser reads. A format whose size
+/// YouTube does not give (the muxed format 18, often) has no fragments and is dropped altogether,
+/// so only our presets get it: they pick adaptive formats, which have sizes, while a custom format
+/// selection may name exactly such a format.
 const YOUTUBE_DASHY: [&str; 2] = ["--extractor-args", "youtube:formats=dashy"];
 
 /// Number of trailing stderr lines kept to explain a failure without an `ERROR:` line.
@@ -1106,11 +1109,12 @@ fn build_ytdlp_args(
             // (the format's `http_chunk_size`), which a global chunk size would override.
             "--buffer-size",
             "16M",
-            YOUTUBE_DASHY[0],
-            YOUTUBE_DASHY[1],
         ],
     };
     args.extend(kind_args.iter().map(|a| a.to_string()));
+    if kind == RunKind::Download && !matches!(options.preset, MediaQualityPreset::Custom(_)) {
+        args.extend(YOUTUBE_DASHY.map(String::from));
+    }
 
     if supports(NO_PLUGIN_DIRS_MIN_VERSION) {
         args.push("--no-plugin-dirs".to_string());
@@ -2299,6 +2303,15 @@ mod tests {
         assert_eq!(args[at + 1], "youtube:formats=dashy");
         let at = args.iter().position(|a| a == "--concurrent-fragments").expect("parallel fragments");
         assert_eq!(args[at + 1], "8");
+        // dashy drops the formats YouTube gives no size for (format 18, often), which a custom
+        // selection may name; our presets pick adaptive formats.
+        for preset in [MediaQualityPreset::Hd720p, MediaQualityPreset::AudioMp3, MediaQualityPreset::AudioM4a] {
+            let options = MediaDownloadOptions { preset, ..options.clone() };
+            assert!(build_ytdlp_args(&url, &options, RunKind::Download, &[], None, None, None).contains(&YOUTUBE_DASHY[1].to_string()));
+        }
+        let custom = MediaDownloadOptions { preset: MediaQualityPreset::Custom("18".into()), ..options };
+        let args = build_ytdlp_args(&url, &custom, RunKind::Download, &[], None, None, Some("2026.08.19"));
+        assert!(!args.iter().any(|a| a == "--extractor-args"), "{args:?}");
     }
 
     #[test]
