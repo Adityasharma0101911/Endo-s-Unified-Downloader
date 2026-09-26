@@ -8,7 +8,9 @@ Serves deterministic generated files (nothing is written to disk):
 
 Keep-alive, HEAD, single Range requests (206 + Content-Range, 416 when unsatisfiable),
 If-Range, ETag and Last-Modified. Every response waits --latency-ms before its headers and
-every body is paced to --rate-mib MiB/s on its connection.
+every body is paced to --rate-mib MiB/s on its connection. Every new connection first waits
+--connect-ms, like the round trips of a TCP and TLS handshake over a real network; requests on a
+kept-alive connection do not.
 
 Fault modes:
   --head-without-accept-ranges  HEAD responses omit Accept-Ranges (ranged GETs still work)
@@ -87,6 +89,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, *args):
         pass
+
+    def setup(self):
+        super().setup()
+        time.sleep(self.server.cfg.connect_ms / 1000)
 
     def do_HEAD(self):
         self.respond(head=True)
@@ -181,6 +187,8 @@ def main():
     parser.add_argument("--port", type=int, default=0, help="0 picks a free port")
     parser.add_argument("--rate-mib", type=float, default=2.0, help="per-connection cap in MiB/s (0 = unlimited)")
     parser.add_argument("--latency-ms", type=float, default=40.0, help="delay before every response")
+    parser.add_argument("--connect-ms", type=float, default=0.0,
+                        help="delay before a new connection's first request is read (simulated handshake)")
     parser.add_argument("--head-without-accept-ranges", action="store_true")
     parser.add_argument("--stall", action="store_true")
     add_file_args(parser)
