@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use hyperfetch_core::engine::DownloadOptions;
 use hyperfetch_core::history::DownloadHistoryManager;
@@ -66,10 +66,33 @@ impl Default for Settings {
     }
 }
 
+/// A file of the GUI's own, stored next to the download history.
+pub fn app_file(name: &str) -> PathBuf {
+    DownloadHistoryManager::default_history_path().with_file_name(name)
+}
+
+/// Replaces `path` with `bytes` in one step: a crash leaves either the old file or the new one.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".{}.tmp", std::process::id()));
+    let tmp = PathBuf::from(tmp);
+    let written = std::fs::File::create(&tmp).and_then(|mut file| {
+        std::io::Write::write_all(&mut file, bytes)?;
+        file.sync_all()
+    });
+    if let Err(e) = written.and_then(|()| std::fs::rename(&tmp, path)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
 impl Settings {
-    /// Stored next to the download history.
     fn path() -> PathBuf {
-        DownloadHistoryManager::default_history_path().with_file_name("gui-settings.json")
+        app_file("gui-settings.json")
     }
 
     /// Saved settings, or the defaults when there are none or they cannot be read.
@@ -81,14 +104,8 @@ impl Settings {
     }
 
     pub fn save(&self) -> std::io::Result<()> {
-        let path = Self::path();
-        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-            std::fs::create_dir_all(dir)?;
-        }
         let json = serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?;
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, json)?;
-        std::fs::rename(&tmp, &path)
+        write_atomic(&Self::path(), &json)
     }
 
     /// Engine options for downloading `urls` with these settings plus the per-download

@@ -23,6 +23,9 @@ const GREEN: Color32 = Color32::from_rgb(16, 185, 129);
 const AMBER: Color32 = Color32::from_rgb(234, 179, 8);
 const RED: Color32 = Color32::from_rgb(239, 68, 68);
 
+const AUTH_REQUIRED: &str =
+    "Authorization header not saved: enter it again under Advanced Options > Auth, then Resume to continue from the partial file.";
+
 fn card() -> egui::Frame {
     egui::Frame::none()
         .fill(Color32::from_rgb(24, 26, 33))
@@ -69,6 +72,7 @@ fn status_badge(app: &App, item: &QueueItem) -> (&'static str, Color32) {
         QueueItemStatus::Paused => ("PAUSED", MUTED),
         QueueItemStatus::Completed => ("COMPLETED", GREEN),
         QueueItemStatus::Failed(_) => ("FAILED", RED),
+        QueueItemStatus::AuthRequired => ("NEEDS AUTH", AMBER),
     }
 }
 
@@ -328,6 +332,20 @@ fn download_actions(app: &mut App, ui: &mut egui::Ui, item: Option<&QueueItem>) 
                 app.new_download();
             }
         }
+        QueueItemStatus::AuthRequired => {
+            let ready = !app.auth_input.trim().is_empty();
+            let resume = ui
+                .add_enabled_ui(ready, |ui| ui.add_sized([110.0, 26.0], primary_button("Resume", GREEN)))
+                .inner
+                .on_hover_text("Continue from the saved state with the Authorization header entered under Advanced Options")
+                .on_disabled_hover_text("Enter the Authorization header under Advanced Options > Auth first");
+            if resume.clicked() {
+                app.resume_with_auth(id);
+            }
+            if ui.button("New Download").on_hover_text("Keep this download in the queue and start another").clicked() {
+                app.new_download();
+            }
+        }
         QueueItemStatus::Completed => {
             if ui.button("Download Another").clicked() {
                 app.new_download();
@@ -515,6 +533,7 @@ fn status_line(app: &App, item: Option<&QueueItem>) -> (String, Color32) {
             (format!("Completed: {}", path), GREEN)
         }
         QueueItemStatus::Failed(error) => (format!("Error: {}", error), RED),
+        QueueItemStatus::AuthRequired => (AUTH_REQUIRED.to_string(), AMBER),
     }
 }
 
@@ -825,6 +844,10 @@ fn queue_tab(app: &mut App, ui: &mut egui::Ui) {
                         button("Details", RowAction::Show);
                         button("Remove", RowAction::Remove);
                     }
+                    QueueItemStatus::AuthRequired => {
+                        button("Details", RowAction::Show);
+                        button("Remove", RowAction::Remove);
+                    }
                     QueueItemStatus::Completed => {
                         button("Open", RowAction::Open);
                         button("Folder", RowAction::Reveal);
@@ -832,8 +855,14 @@ fn queue_tab(app: &mut App, ui: &mut egui::Ui) {
                     }
                 }
             });
-            if let QueueItemStatus::Failed(error) = &item.status {
-                ui.label(RichText::new(truncate_chars(error, 160)).size(11.0).color(RED)).on_hover_text(error);
+            match &item.status {
+                QueueItemStatus::Failed(error) => {
+                    ui.label(RichText::new(truncate_chars(error, 160)).size(11.0).color(RED)).on_hover_text(error);
+                }
+                QueueItemStatus::AuthRequired => {
+                    ui.label(RichText::new("Authorization header not saved: open Details to enter it again and resume").size(11.0).color(AMBER));
+                }
+                _ => {}
             }
         }
     });

@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod queue_store;
 mod settings;
 mod ui;
 mod util;
@@ -143,6 +144,10 @@ struct App {
     clipboard_banner: Option<String>,
 
     queue: DownloadQueue,
+    /// Saves the queue in the background; `None` if its thread could not start.
+    queue_saver: Option<queue_store::Saver>,
+    /// Revision of the queue last handed to the saver.
+    queue_saved: u64,
     jobs: HashMap<usize, JobView>,
     /// The download shown on the Downloader tab.
     focused: Option<usize>,
@@ -171,6 +176,10 @@ impl App {
     fn new(cc: &eframe::CreationContext<'_>, rt: tokio::runtime::Handle) -> Self {
         apply_theme(&cc.egui_ctx);
         let settings = Settings::load();
+        let (queue, queue_problem) = queue_store::load(&queue_store::path());
+        let queue_saver = queue_store::Saver::spawn(queue_store::path())
+            .inspect_err(|e| tracing::warn!("Queue changes will only be saved on exit: {}", e))
+            .ok();
         let (events_tx, events_rx) = mpsc::channel();
         let clipboard_enabled = Arc::new(AtomicBool::new(settings.clipboard_watch));
         let clipboard_seen = Arc::new(Mutex::new(String::new()));
@@ -195,11 +204,13 @@ impl App {
             show_advanced: false,
             form_error: None,
             queue_error: None,
-            notice: None,
+            notice: queue_problem.map(Err),
             clipboard_enabled,
             clipboard_seen,
             clipboard_banner: None,
-            queue: DownloadQueue::new(),
+            queue_saved: queue.revision(),
+            queue,
+            queue_saver,
             jobs: HashMap::new(),
             focused: None,
             anim_job: None,
@@ -374,6 +385,14 @@ impl App {
             },
         );
         true
+    }
+
+    /// Resumes a restored download with the Authorization header from the form, which is never saved.
+    fn resume_with_auth(&mut self, id: usize) {
+        let auth = self.auth_input.trim().to_string();
+        if !auth.is_empty() && self.queue.provide_auth(id, auth) {
+            self.start_job(id, false);
+        }
     }
 
     /// Asks a running download to stop; it stays "Pausing" until the engine has saved its state.
@@ -702,6 +721,12 @@ impl eframe::App for App {
         if let Some(dialog) = self.pending_dialog.take() {
             self.open_dialog(dialog, frame);
         }
+        if self.queue.revision() != self.queue_saved {
+            self.queue_saved = self.queue.revision();
+            if let Some(saver) = &self.queue_saver {
+                saver.save(self.queue.clone());
+            }
+        }
         // Background work wakes the UI when it has news; otherwise only animations and the
         // once-a-second clocks (elapsed time, stall timer) need frames.
         if animating {
@@ -711,15 +736,17 @@ impl eframe::App for App {
         }
     }
 
-    /// Stops every download so it saves its resume state (and kills yt-dlp), waiting briefly.
+    /// Stops every download so it saves its resume state (and kills yt-dlp), waiting briefly,
+    /// then saves the queue.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.settings.clipboard_watch = self.clipboard_enabled.load(Ordering::Relaxed);
         if let Err(e) = self.settings.save() {
             tracing::warn!("Failed to save settings: {}", e);
         }
         let mut tasks = Vec::new();
-        for view in self.jobs.values_mut() {
+        for (&id, view) in &mut self.jobs {
             if let Some(running) = view.running.take() {
+                self.queue.mark_pausing(id);
                 running.cancel.notify_one();
                 tasks.push(running.task);
             }
@@ -736,6 +763,21 @@ impl eframe::App for App {
             };
             if self.rt.block_on(tokio::time::timeout(EXIT_GRACE, wait_all)).is_err() {
                 tracing::warn!("Some downloads did not stop within {}s", EXIT_GRACE.as_secs());
+            }
+        }
+        // Record how the stopped downloads ended; any still stopping are saved as paused.
+        while let Ok(event) = self.events_rx.try_recv() {
+            if let AppEvent::JobFinished { id, result } = event {
+                self.queue.finish(id, result);
+            }
+        }
+        let queue = self.queue.clone();
+        match self.queue_saver.take() {
+            Some(saver) => saver.finish(queue),
+            None => {
+                if let Err(e) = queue_store::save(&queue_store::path(), queue) {
+                    tracing::warn!("Failed to save the queue: {}", e);
+                }
             }
         }
     }
