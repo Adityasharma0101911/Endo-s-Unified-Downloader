@@ -298,7 +298,7 @@ mod tests {
     fn batch_and_disk_defaults() {
         let parse = |args: &[&str]| Args::try_parse_from(std::iter::once("cli").chain(args.iter().copied()));
         let args = parse(&["u"]).unwrap();
-        assert_eq!((args.jobs, args.fsync, args.max_connections_per_host), (4, false, 32));
+        assert_eq!((args.jobs, args.fsync, args.max_connections_per_host), (4, false, 64));
         let args = parse(&["-j", "1", "--fsync", "--max-connections-per-host", "0", "u"]).unwrap();
         assert_eq!((args.jobs, args.fsync, args.max_connections_per_host), (1, true, 0));
         assert!(parse(&["--max-connections-per-host", "-1", "u"]).is_err());

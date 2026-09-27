@@ -16,7 +16,7 @@
 - Splits a file into chunks and downloads them over several HTTP/1.1 connections at once (one TCP connection per worker, up to 64). Workers that finish early take over part of the slowest remaining range (work stealing).
 - Several mirror URLs of the same file are used together. Every mirror is probed first, and a mirror that reports a different size or a different strong ETag is dropped, so bytes from different files are never mixed.
 - An optional speed limit (`--max-speed`) is shared by all connections of a download.
-- Batches run 4 downloads at once by default (`-j`). All running downloads together open at most 32 connections to one host (`--max-connections-per-host`), and the downloads of a batch share their HTTP connections and TLS sessions, so later files skip the handshakes.
+- Batches run 4 downloads at once by default (`-j`). All running downloads together open at most 64 connections to one host (`--max-connections-per-host`), and the downloads of a batch share their HTTP connections and TLS sessions, so later files skip the handshakes.
 
 **Safe, resumable files**
 - A download is written to `<name>.part`. Its resume state is saved to `<name>.part.hfstate` before the first byte arrives and again every 2 seconds, each time after the data it records has been flushed to disk. When the download finishes, the file is renamed to its final name, so a file at its final name is always complete.
@@ -86,7 +86,7 @@ All `URLS` given on the command line are **mirrors of one file**. To download se
 | :--- | :--- | :--- |
 | `-i, --input-file FILE` | Batch file with one download per line (see below). `-` reads the list from stdin. | |
 | `-j, --max-concurrent-downloads N` | Number of batch downloads that run at the same time (1-32). Above 1, each result line names its input (see below). | `4` |
-| `--max-connections-per-host N` | Connections all running downloads may open to one host together. `0` means no limit. | `32` |
+| `--max-connections-per-host N` | Connections all running downloads may open to one host together. `0` means no limit. | `64` |
 | `--fsync` | Wait until each finished file is on the disk before reporting it done. | off |
 | `-d, --dir DIR` | Directory to save into. It is created if it is missing. | current directory |
 | `-o, --output FILE` | Output file name for a single download. It is relative to `-d` when both are given. | name from the server |
@@ -216,7 +216,7 @@ The service downloads every line of the queue, two at a time, and then exits. Fi
 - **Batch queue:** add one download per line (mirrors of one file go on one line, separated by spaces). Each item keeps the folder and options it was added with. Auto-run handles 1–8 downloads at once (4 by default; a number you saved before is kept), with per-item Start, Pause, Resume, Retry, Remove, Open and Folder. Downloads share their HTTP connections and TLS sessions.
 - **Verify & Repair:** checks a file against the BLAKE3 hash recorded when it was downloaded. Results are VERIFIED, INCOMPLETE (with a cancellable repair of just the missing ranges), CHECKSUM MISMATCH or UNVERIFIED.
 - **Clipboard watcher:** offers "Download Now" / "Add to Queue" for copied links. It ignores links the app copied itself and magnets without web seeds.
-- **Advanced options:** speed limit, retries per chunk, stall timeout, connections per host (32 by default, 0 = no limit), flushing finished files to disk (off by default, see above), proxy, cookies (file or browser), Authorization header, checksum and media quality.
+- **Advanced options:** speed limit, retries per chunk, stall timeout, connections per host (64 by default, 0 = no limit), flushing finished files to disk (off by default, see above), proxy, cookies (file or browser), Authorization header, checksum and media quality.
 - **Remembers settings:** folder, connections and advanced options are stored in `gui-settings.json` next to the history. The Authorization header and checksum are never saved.
 - **Safe to close:** closing the window pauses running downloads and saves their state (waiting at most 3 s). It also stops yt-dlp. The app uses no CPU while idle.
 
