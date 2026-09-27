@@ -2509,13 +2509,33 @@ fn lists_nothing(json: &[u8]) -> bool {
         .is_ok_and(|info| info["_type"] == "playlist" && info["entries"].as_array().is_none_or(Vec::is_empty))
 }
 
+/// How yt-dlp's sites say a page has no media, in their own words ("No video formats found!",
+/// "There is no video.", "This article does not have a video.", "No media found"), matched in
+/// lower case.
+const NO_MEDIA: &[&str] = &["no video", "no media", "not a video", "not have a video", "not have any video", "not contain a video"];
+
+/// What yt-dlp adds to an error its site did not expect: one that could not find on the page what
+/// it looks for there ("Unable to extract media id", a KeyError), as Spiegel's, ABC News' and NBC
+/// News' article pages without a video give. The errors a site expects, which say it failed (an
+/// HTTP error, a private, removed or geo-blocked video, a login, a rate limit, cookies), come
+/// without it.
+const UNEXPECTED: &str = "please report this issue";
+
 /// Whether `error`, from [`find_site_media`], is that of a site of yt-dlp's that took the link
 /// and failed at it (a private or removed video, a login it needs, an HTTP error, the cookies it
-/// was given): an `ERROR:` line of yt-dlp's other than the one for a link no site takes. Not
+/// was given): an `ERROR:` line of yt-dlp's other than the one for a link no site takes, or for a
+/// page without media (see [`NO_MEDIA`] and [`UNEXPECTED`]). A site broken on a page that has
+/// media says the same (El País on an article with a video, the Guardian on a podcast's page):
+/// the page is then kept, as it was before yt-dlp was asked, until yt-dlp is fixed. Not
 /// installing, starting or waiting for yt-dlp, which says nothing of the link.
 pub(crate) fn site_failed(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
     error == DRM_REFUSED
-        || (error.starts_with("ERROR:") && !error.contains(NO_SITE) && !error.contains("Unsupported URL"))
+        || (error.starts_with("ERROR:")
+            && !error.contains(NO_SITE)
+            && !error.contains("Unsupported URL")
+            && !lower.contains(UNEXPECTED)
+            && !NO_MEDIA.iter().any(|words| lower.contains(words)))
 }
 
 /// [`find_site_media`] with `tools`. Paths in `options` must be absolute.
@@ -4703,13 +4723,34 @@ mod tests {
 
     #[test]
     fn only_a_site_that_took_the_link_fails_it() {
+        // As yt-dlp 2026.08.19 answered news article pages, and as its sites word a login, a
+        // private, removed or geo-blocked video and a rate limit.
+        let report = "; please report this issue on  https://github.com/yt-dlp/yt-dlp/issues?q= , filling out the appropriate \
+                      issue template. Confirm you are on the latest version using  yt-dlp -U";
         for failed in [
             "ERROR: [Rumble] v000: Unable to download webpage: HTTP Error 404: Not Found",
+            "ERROR: [NYTimesArticle] ai-government-regulation: Unable to download webpage: HTTP Error 403: Forbidden (caused by <HTTPError 403: Forbidden>)",
             "ERROR: [Patreon] 123: You do not have access to this post",
+            "ERROR: [vimeo] 123: This video is only available for registered users. Use --cookies-from-browser or --cookies for the authentication.",
+            "ERROR: [youtube] abc: Private video. Sign in if you've been granted access to this video",
+            "ERROR: [youtube] abc: Video unavailable. This video has been removed by the uploader",
+            "ERROR: [BBC] p0abc: This video is not available from your location due to geo restriction",
+            "ERROR: [twitch:vod] 123: Unable to download JSON metadata: HTTP Error 429: Too Many Requests",
             "ERROR: could not find firefox cookies database in 'C:/profile'",
             DRM_REFUSED,
         ] {
             assert!(site_failed(failed), "{failed}");
+        }
+        for nothing_there in [
+            format!("ERROR: [Spiegel] 0861c578-806a-4762-b87d-6a88e987bafa: Unable to extract media id{report}"),
+            format!("ERROR: [abc.net.au] 107201770: Unable to extract video urls{report}"),
+            format!("ERROR: [ElPais] los-alonso-no-quieren-ser-llamados-buitres: Unable to extract URL prefix{report}"),
+            format!("ERROR: rcna600052: An extractor error has occurred. (caused by KeyError('video')){report}"),
+            format!("ERROR: [TheGuardianPodcast] protests-erupt: No video formats found!{report}"),
+            "ERROR: [CNN] story: This article does not have a video.".to_string(),
+            "ERROR: [twitter] 123: No video could be found in this tweet".to_string(),
+        ] {
+            assert!(!site_failed(&nothing_there), "{nothing_there}");
         }
         for none_took_it in [
             "ERROR: No suitable extractor found for URL https://example.com/a",
