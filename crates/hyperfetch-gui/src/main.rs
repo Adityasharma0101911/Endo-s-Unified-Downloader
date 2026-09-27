@@ -60,18 +60,31 @@ enum Origin {
     Form,
     /// This line (1-based) of the queue input: errors show there, with the line kept.
     QueueLine(usize),
-    /// A file dropped on the window.
+    /// A file dropped on the window, or a clipboard link added to the queue: the outcome shows as
+    /// a notice.
     Dropped,
 }
 
-/// The downloads a .metalink, .meta4 or .torrent lists, waiting for the user to agree to add
-/// that many.
+/// The downloads a .metalink, .meta4 or .torrent (or a folder, feed or playlist link) lists,
+/// waiting for the user to agree to add that many, or to pick the one video a video link that
+/// names its playlist too stands for.
 struct Listing {
     origin: Origin,
     input: String,
     checksum: String,
     auth: String,
     tasks: Vec<Task>,
+    /// The video the input names, offered in place of its whole playlist.
+    video: Option<Task>,
+}
+
+/// What the user answers a listing waiting for it.
+#[derive(Clone, Copy)]
+enum Answer {
+    Cancel,
+    /// Only the video the input names (see `Listing::video`).
+    Video,
+    All,
 }
 
 impl Listing {
@@ -390,15 +403,18 @@ impl App {
         }
     }
 
-    /// Answers the first large listing waiting: adds its downloads, or drops them.
-    fn answer_listing(&mut self, add: bool) {
+    /// Answers the first listing waiting: adds its downloads, or the one video, or drops them.
+    fn answer_listing(&mut self, answer: Answer) {
         if self.listings.is_empty() {
             return;
         }
-        let Listing { origin, input, checksum, auth, tasks } = self.listings.remove(0);
-        if add {
-            self.add_listing(origin, &input, &checksum, &auth, Ok(tasks));
-        }
+        let Listing { origin, input, checksum, auth, tasks, video } = self.listings.remove(0);
+        let chosen = match answer {
+            Answer::Cancel => return,
+            Answer::Video => video.into_iter().collect(),
+            Answer::All => tasks,
+        };
+        self.add_listing(origin, &input, &checksum, &auth, Ok(chosen));
     }
 
     /// Adds the downloads of a .metalink, .meta4 or .torrent file dropped on the window.
@@ -726,8 +742,19 @@ impl App {
             AppEvent::Read { origin, input, checksum, auth, result } => {
                 self.reading.remove(&input);
                 self.notice = None;
+                // A video link that names its playlist asks which of the two is meant.
+                let video = playlist_video(&input);
                 match result {
-                    Ok(tasks) if tasks.len() > CONFIRM_FILES => self.listings.push(Listing { origin, input, checksum, auth, tasks }),
+                    Ok(tasks) if video.is_some() || tasks.len() > CONFIRM_FILES => {
+                        self.listings.push(Listing { origin, input, checksum, auth, tasks, video })
+                    }
+                    // The link is a video all the same.
+                    Err(e) if video.is_some() => {
+                        self.add_listing(origin, &input, &checksum, &auth, Ok(video.into_iter().collect()));
+                        if self.notice.is_none() {
+                            self.notice = Some(Err(format!("Added the video alone: {}", e)));
+                        }
+                    }
                     result => self.add_listing(origin, &input, &checksum, &auth, result),
                 }
             }
@@ -1020,10 +1047,24 @@ fn keep_refused_line(queue_input: &mut String, queue_error: &mut Option<String>,
     });
 }
 
+/// The video `input` names when it is one video link that names its playlist too (see
+/// `media::video_in_playlist`): what the user may pick instead of the playlist.
+fn playlist_video(input: &str) -> Option<Task> {
+    let [token] = &ingest::split_tokens(input)[..] else { return None };
+    // As ingest takes it: a "leaving this site" link is its target.
+    ingest::link_task(&[token]).ok().filter(|task| matches!(&task.urls[..], [url] if hyperfetch_core::media::video_in_playlist(url)))
+}
+
+/// How the links in `input` are listed with `settings`: a video link that names its playlist
+/// lists the playlist, for the user to pick it or the video (see [`playlist_video`]).
+fn read_options(settings: &Settings, input: &str) -> ingest::ListOptions {
+    ingest::ListOptions { whole_playlist: playlist_video(input).is_some(), ..settings.list_options() }
+}
+
 /// Reads the downloads `input` (a local or remote .metalink, .meta4 or .torrent, or a link that
 /// lists many) lists, fetching through the proxy setting.
 fn read_listing(settings: &Settings, input: String) -> impl Future<Output = Result<Vec<Task>, String>> + Send + 'static {
-    let list = settings.list_options();
+    let list = read_options(settings, &input);
     async move {
         let tokens = ingest::input_tokens(&input).await;
         let http = ingest::descriptor_client(list.proxy.as_deref())?;
@@ -1549,9 +1590,29 @@ mod tests {
         assert_eq!(input, "https://ok.example/f\nhttps://a.example/x.torrent\ny.meta4");
         assert_eq!(errors.as_deref(), Some("Line 2: Cannot fetch\nLine 3: Cannot read"));
 
-        let listing = |tasks| Listing { origin: Origin::Dropped, input: String::new(), checksum: String::new(), auth: String::new(), tasks };
+        let listing = |tasks| Listing { origin: Origin::Dropped, input: String::new(), checksum: String::new(), auth: String::new(), tasks, video: None };
         assert_eq!(listing((1..=60).map(file).collect()).summary(), "60 files (60.00 KiB)");
         assert_eq!(listing(vec![file(1), Task { size: None, ..file(2) }]).summary(), "2 files");
+    }
+
+    /// A video link that names its playlist too is read as the playlist, for the user to pick it
+    /// or the one video, which is then downloaded as the link it is.
+    #[test]
+    fn a_video_in_a_playlist_offers_the_video_or_the_whole_playlist() {
+        let settings = Settings { only_new: false, latest: 5, ..Settings::default() };
+        let link = "https://www.youtube.com/watch?v=jNQXAC9IVRw&list=PLbpi6ZahtOH6Blw3RGYpWkSByi_T7Rygb";
+        for input in [link.to_string(), format!("https://www.youtube.com/redirect?q={}", url::form_urlencoded::byte_serialize(link.as_bytes()).collect::<String>())] {
+            let video = playlist_video(&input).unwrap_or_else(|| panic!("{input}"));
+            assert_eq!(video.urls, [Url::parse(link).unwrap()]);
+            let list = read_options(&settings, &input);
+            assert!(list.whole_playlist && !list.only_new);
+            assert_eq!(list.latest, Some(5));
+        }
+        let mirrored = format!("{link} https://mirror.example/v.mp4");
+        for other in ["https://www.youtube.com/watch?v=jNQXAC9IVRw", "https://www.youtube.com/playlist?list=PL1", "https://www.youtube.com/@NASA", &mirrored] {
+            assert!(playlist_video(other).is_none(), "{other}");
+            assert!(!read_options(&settings, other).whole_playlist, "{other}");
+        }
     }
 
     /// A remote document is fetched through the proxy setting: its host does not exist, so only
