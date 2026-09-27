@@ -26,14 +26,17 @@ const DRIVE_SHORTCUT: &str = "application/vnd.google-apps.shortcut";
 enum Folder {
     /// A Google Drive folder, and the resource key one shared by link before 2021 opens with.
     Drive { id: String, resource_key: Option<String> },
+    /// A MediaFire folder; `maybe` for a `/?key` link, which names a file or a folder.
+    MediaFire { key: String, maybe: bool },
 }
 
-/// Whether `s` is an id as Drive makes them.
+/// Whether `s` is an id or key as Drive and MediaFire make them.
 fn token(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
-/// The folder `url` names: drive.google.com/drive[/u/N]/folders/{id}.
+/// The folder `url` names: drive.google.com/drive[/u/N]/folders/{id}, mediafire.com/folder/{key}[/...]
+/// or mediafire.com/?{key}.
 fn folder_of(url: &Url) -> Option<Folder> {
     let segs: Vec<&str> = url.path_segments()?.collect();
     match url.host_str()?.trim_end_matches('.') {
@@ -46,6 +49,11 @@ fn folder_of(url: &Url) -> Option<Folder> {
             let resource_key = url.query_pairs().find(|(k, _)| k == "resourcekey").map(|(_, v)| v.into_owned());
             token(id).then(|| Folder::Drive { id: id.to_string(), resource_key })
         }
+        "mediafire.com" | "www.mediafire.com" => match segs[..] {
+            ["folder", key, ..] if token(key) => Some(Folder::MediaFire { key: key.to_string(), maybe: false }),
+            [""] => url.query().filter(|q| token(q)).map(|key| Folder::MediaFire { key: key.to_string(), maybe: true }),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -77,6 +85,7 @@ pub async fn list(http: &reqwest::Client, url: &Url, options: &ListOptions) -> O
             };
             drive_list(http, &source, id, resource_key).await
         }
+        Folder::MediaFire { key, maybe } => mediafire_list(http, url.scheme(), &key, maybe).await?,
     };
     Some(listed.and_then(|tasks| {
         if tasks.is_empty() {
@@ -430,6 +439,148 @@ fn unescape(text: &str) -> String {
     quick_xml::escape::unescape(text).map_or_else(|_| text.to_string(), |t| t.into_owned()).trim().to_string()
 }
 
+/// MediaFire's answer to an API call.
+#[derive(Debug, Deserialize)]
+struct MfAnswer {
+    response: MfResponse,
+}
+
+#[derive(Debug, Deserialize)]
+struct MfResponse {
+    /// "Success" or "Error".
+    result: String,
+    message: Option<String>,
+    folder_info: Option<MfFolder>,
+    folder_content: Option<MfContent>,
+}
+
+/// One chunk of a folder's files or subfolders (MediaFire gives 100 at a time).
+#[derive(Debug, Default, Deserialize)]
+struct MfContent {
+    #[serde(default)]
+    files: Vec<MfFile>,
+    #[serde(default)]
+    folders: Vec<MfFolder>,
+    /// "yes" when another chunk follows.
+    #[serde(default)]
+    more_chunks: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MfFile {
+    quickkey: String,
+    filename: String,
+    /// The file's SHA-256, in hex.
+    #[serde(default)]
+    hash: String,
+    /// A decimal string.
+    #[serde(default)]
+    size: String,
+    #[serde(default)]
+    password_protected: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MfFolder {
+    #[serde(default)]
+    folderkey: String,
+    name: String,
+}
+
+/// MediaFire's answer in `body`, or what its error says (an unknown folder is answered 404).
+fn mediafire_answer(status: u16, body: &[u8]) -> Result<MfResponse, String> {
+    let Ok(MfAnswer { response }) = serde_json::from_slice::<MfAnswer>(body) else {
+        return Err(format!("MediaFire answered HTTP {} instead of listing the folder", status));
+    };
+    if response.result != "Success" {
+        let message = response.message.unwrap_or_else(|| format!("HTTP {}", status));
+        return Err(format!("MediaFire cannot list the folder: {} (it may be private or deleted)", message));
+    }
+    Ok(response)
+}
+
+/// Calls `method` of MediaFire's folder API at `api`.
+async fn mediafire_get(http: &reqwest::Client, api: &str, method: &str, params: &[(&str, &str)]) -> Result<MfResponse, String> {
+    let params = params.iter().copied().chain([("response_format", "json")]);
+    let url = Url::parse_with_params(&format!("{}{}", api, method), params).map_err(|e| e.to_string())?;
+    let fail = |e: reqwest::Error| format!("Cannot reach MediaFire: {}", e);
+    let resp = http.get(url).send().await.map_err(fail)?;
+    let status = resp.status().as_u16();
+    mediafire_answer(status, &resp.bytes().await.map_err(fail)?)
+}
+
+/// Every file (`content_type` "files") or subfolder ("folders") of the MediaFire folder `key`,
+/// a chunk at a time.
+async fn mediafire_content(http: &reqwest::Client, api: &str, key: &str, content_type: &str) -> Result<MfContent, String> {
+    let mut all = MfContent::default();
+    for chunk in 1u32.. {
+        let chunk = chunk.to_string();
+        let params = [("folder_key", key), ("content_type", content_type), ("chunk", chunk.as_str())];
+        let content = mediafire_get(http, api, "get_content.php", &params).await?.folder_content.unwrap_or_default();
+        // A chunk with nothing in it ends the listing whatever it says.
+        let more = content.more_chunks == "yes" && !(content.files.is_empty() && content.folders.is_empty());
+        all.files.extend(content.files);
+        all.folders.extend(content.folders);
+        if !more {
+            break;
+        }
+    }
+    Ok(all)
+}
+
+/// Every file under the MediaFire folder `key`, each a task for its page (which
+/// `MediaFireResolver` downloads), with its SHA-256; files behind a password are left out. The
+/// API is asked at the scheme of the link typed. None for a `maybe` link that names no folder.
+async fn mediafire_list(http: &reqwest::Client, scheme: &str, key: &str, maybe: bool) -> Option<Result<Vec<Task>, String>> {
+    let api = format!("{}://www.mediafire.com/api/1.5/folder/", scheme);
+    let root = match mediafire_get(http, &api, "get_info.php", &[("folder_key", key)]).await {
+        Ok(info) => info.folder_info.map(|f| f.name).unwrap_or_default(),
+        // A file's link: the engine downloads it.
+        Err(_) if maybe => return None,
+        Err(e) => return Some(Err(e)),
+    };
+    Some(mediafire_files(http, scheme, &api, key, &root).await)
+}
+
+async fn mediafire_files(http: &reqwest::Client, scheme: &str, api: &str, key: &str, root: &str) -> Result<Vec<Task>, String> {
+    let mut queue = VecDeque::from([(key.to_string(), component(root, key)?)]);
+    let mut listed = HashSet::new();
+    let (mut tasks, mut locked) = (Vec::new(), 0);
+    while let Some((key, folder)) = queue.pop_front() {
+        if !listed.insert(key.clone()) {
+            continue;
+        }
+        for file in mediafire_content(http, api, &key, "files").await?.files {
+            let page = token(&file.quickkey).then(|| Url::parse(&format!("{}://www.mediafire.com/file/{}", scheme, file.quickkey)));
+            let Some(Ok(page)) = page else { continue };
+            if file.password_protected == "yes" {
+                locked += 1;
+                continue;
+            }
+            let checksum = Some(format!("sha256:{}", file.hash)).filter(|c| crate::storage::validate_checksum(c).is_ok());
+            tasks.push(Task {
+                urls: vec![page],
+                folder: Some(folder.clone()),
+                name: Some(component(&file.filename, &file.quickkey)?),
+                checksum,
+                size: file.size.parse().ok(),
+                from_document: true,
+                ..Task::default()
+            });
+        }
+        for sub in mediafire_content(http, api, &key, "folders").await?.folders {
+            if token(&sub.folderkey) {
+                let path = folder.join(component(&sub.name, &sub.folderkey)?);
+                queue.push_back((sub.folderkey, path));
+            }
+        }
+    }
+    if locked > 0 {
+        tracing::warn!("{} files of the MediaFire folder are protected by a password and were left out", locked);
+    }
+    Ok(tasks)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,6 +596,11 @@ mod tests {
         let drive = |id: &str, key: Option<&str>| Some(Folder::Drive { id: id.into(), resource_key: key.map(Into::into) });
         assert_eq!(folder("https://drive.google.com/drive/folders/1KpLl_1tcK0eeehzN980zbG-3M2nhbVks"), drive("1KpLl_1tcK0eeehzN980zbG-3M2nhbVks", None));
         assert_eq!(folder("https://drive.google.com/drive/u/1/folders/1aB-c?resourcekey=0-xY_z&usp=sharing"), drive("1aB-c", Some("0-xY_z")));
+        let mediafire = |key: &str, maybe| Some(Folder::MediaFire { key: key.into(), maybe });
+        assert_eq!(folder("https://www.mediafire.com/folder/rww7bhhi0yc1l/NewFolder"), mediafire("rww7bhhi0yc1l", false));
+        assert_eq!(folder("http://mediafire.com/folder/rww7bhhi0yc1l"), mediafire("rww7bhhi0yc1l", false));
+        // The old form names a folder or a file: the folder API tells which.
+        assert_eq!(folder("https://www.mediafire.com/?rww7bhhi0yc1l"), mediafire("rww7bhhi0yc1l", true));
         for other in [
             "https://drive.google.com/file/d/1Z2VYnXb01h/view",
             "https://drive.google.com/drive/my-drive",
@@ -452,11 +608,16 @@ mod tests {
             "https://drive.google.com/drive/folders/",
             "https://drive.google.com/drive/folders/a%27b",
             "https://docs.google.com/drive/folders/1aB",
+            "https://www.mediafire.com/file/ierdl9nle7ask6i/a.png/file",
+            "https://www.mediafire.com/?sharekey=abc",
+            "https://www.mediafire.com/",
+            "https://mediafire.example/folder/abc",
         ] {
             assert_eq!(folder(other), None, "{other}");
         }
         assert!(crate::ingest::needs_reading("https://drive.google.com/drive/folders/1KpLl_1tc"));
         assert!(crate::ingest::needs_reading("https://www.google.com/url?q=https%3A%2F%2Fdrive.google.com%2Fdrive%2Ffolders%2F1aB"));
+        assert!(crate::ingest::needs_reading("https://www.google.com/url?q=https%3A%2F%2Fwww.mediafire.com%2Ffolder%2Fabc"));
     }
 
     /// drive.google.com/embeddedfolderview?id=1KpLl_1tcK0eeehzN980zbG-3M2nhbVks as it answered,
@@ -654,5 +815,25 @@ mod tests {
         let closed = DriveSource::Api { base: "http://127.0.0.1:1/drive/v3/", key: "AIzaKey" };
         let unreachable = drive_list(&http, &closed, "root1".into(), None).await.unwrap_err();
         assert!(unreachable.starts_with("Cannot reach the Google Drive API") && !unreachable.contains("AIzaKey"), "{unreachable}");
+    }
+
+    /// folder/get_content.php as MediaFire answered it for a public folder, and for a key that
+    /// names no folder (HTTP 404).
+    #[test]
+    fn mediafire_answers_are_read() {
+        let files = br#"{"response":{"action":"folder\/get_content","asynchronous":"no","folder_content":{"chunk_size":"100","content_type":"files","chunk_number":"1","folderkey":"gtrp6u25m6nmb","files":[{"quickkey":"lrryifc0vut4jl6","hash":"59cfdccb8770ce0984e6f1da9de8508377d9a84516dfd89e03ee7d9413213d7d","filename":"Lorem ipsum.txt","description":"","size":"3771","privacy":"public","created":"2021-09-28 01:35:49","password_protected":"no","mimetype":"text\/plain","filetype":"document","view":"0","edit":"1","revision":"1029","flag":"16","permissions":{"value":"1","explicit":"0","read":"1","write":"0"},"downloads":"103","views":"0","links":{"normal_download":"https:\/\/www.mediafire.com\/file\/lrryifc0vut4jl6\/Lorem_ipsum.txt\/file"},"created_utc":"2021-09-28T06:35:49Z"}],"more_chunks":"no","revision":"2996"},"result":"Success","current_api_version":"1.5"}}"#;
+        let content = mediafire_answer(200, files).unwrap().folder_content.unwrap();
+        let [file] = &content.files[..] else { panic!("one file: {content:?}") };
+        assert_eq!((file.quickkey.as_str(), file.filename.as_str(), file.size.as_str()), ("lrryifc0vut4jl6", "Lorem ipsum.txt", "3771"));
+        assert_eq!((file.hash.len(), file.password_protected.as_str(), content.more_chunks.as_str()), (64, "no", "no"));
+        let folders = br#"{"response":{"action":"folder\/get_content","asynchronous":"no","folder_content":{"chunk_size":"100","content_type":"folders","chunk_number":"1","folderkey":"gtrp6u25m6nmb","folders":[{"folderkey":"34gxd4kmqz5nn","name":"InnerFolder","description":"","tags":"","privacy":"public","created":"2022-10-29 13:54:16","revision":"1502","flag":"0","permissions":{"value":"1","explicit":"0","read":"1","write":"0"},"file_count":"0","folder_count":"0","dropbox_enabled":"no","created_utc":"2022-10-29T18:54:16Z"}],"more_chunks":"no","revision":"2996"},"result":"Success","current_api_version":"1.5"}}"#;
+        let content = mediafire_answer(200, folders).unwrap().folder_content.unwrap();
+        assert_eq!(content.folders.iter().map(|f| (f.folderkey.as_str(), f.name.as_str())).collect::<Vec<_>>(), [("34gxd4kmqz5nn", "InnerFolder")]);
+        let unknown = br#"{"response":{"action":"folder\/get_content","message":"Unknown or invalid FolderKey","error":112,"result":"Error","current_api_version":"1.5"}}"#;
+        assert_eq!(
+            mediafire_answer(404, unknown).unwrap_err(),
+            "MediaFire cannot list the folder: Unknown or invalid FolderKey (it may be private or deleted)"
+        );
+        assert_eq!(mediafire_answer(503, b"<html>busy</html>").unwrap_err(), "MediaFire answered HTTP 503 instead of listing the folder");
     }
 }
