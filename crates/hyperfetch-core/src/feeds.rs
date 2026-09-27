@@ -30,6 +30,9 @@ const MEDIA_EXTENSIONS: &[&str] = &[
     "webm", "mkv", "avi", "wmv", "mpg", "mpeg", "3gp", "3g2", "ogv", "flv",
 ];
 
+/// Apple's iTunes Lookup API, which answers without a key.
+const LOOKUP_API: &str = "https://itunes.apple.com/lookup";
+
 /// Podcast hosts whose feed links have an `rss`, `feed` or `feeds` part: Anchor's
 /// `/podcast/rss`, Libsyn's `/rss`, Acast's `/rss/...`, Spreaker's `/episodes/feed`, Supercast's
 /// `/feeds/...` and Patreon's `/rss/...`.
@@ -74,12 +77,12 @@ fn feed_shape(url: &Url) -> Option<bool> {
 /// is); `Some(Ok)` is never empty.
 ///
 /// Episodes come newest first, each named "YYYY-MM-DD Title.ext" in a folder named after the
-/// feed; `options.latest` keeps the newest N, and `options.only_new` then leaves out those whose
-/// enclosure history records as downloaded. An Apple Podcasts show lists its public feed, and
-/// an episode link that one episode of it.
+/// feed; `options.latest` keeps the newest N, and `options.only_new` then leaves out those
+/// history records as downloaded. An Apple Podcasts show lists its public feed, and an episode
+/// link that one episode of it (see [`AppleLink::list`]).
 pub async fn list(http: &reqwest::Client, url: &Url, options: &ListOptions) -> Option<Result<Vec<Task>, String>> {
     if let Some(apple) = AppleLink::of(url) {
-        return apple.list(http, options).await;
+        return apple.list(http, LOOKUP_API, options).await;
     }
     match read_feed(http, url, feed_shape(url) == Some(true)).await {
         Ok(Some(feed)) if !feed.episodes.is_empty() => Some(show_tasks(feed, options).await),
@@ -631,57 +634,124 @@ impl AppleLink {
         Some(Self { show, episode, country })
     }
 
-    /// The show's feed, through the keyless iTunes Lookup API, or the episode the link opens on,
-    /// found in it by what the API says of it. None for an episode the API or the feed does not
-    /// know: the engine hands the link to yt-dlp.
-    async fn list(&self, http: &reqwest::Client, options: &ListOptions) -> Option<Result<Vec<Task>, String>> {
-        let entity = if self.episode.is_some() { "podcastEpisode" } else { "podcast" };
-        let mut query = vec![("id", self.show.to_string()), ("entity", entity.to_string())];
-        if self.episode.is_some() {
-            query.push(("limit", "200".to_string()));
+    /// The show's public feed, found through the keyless iTunes Lookup API at `api`, or the
+    /// episode the link opens on, found in that feed by what the API says of it. A show whose
+    /// feed Apple does not publish (for subscribers only, or hidden by its publisher) lists the
+    /// newest episodes the API gives a public file for, and an episode link to it that episode.
+    /// None for an episode the API or the feed does not know: the engine hands the link to
+    /// yt-dlp, which reads Apple's own page.
+    async fn list(&self, http: &reqwest::Client, api: &str, options: &ListOptions) -> Option<Result<Vec<Task>, String>> {
+        let lookup = match self.lookup(http, api, self.episode.is_some()).await {
+            Ok(lookup) => lookup,
+            Err(e) => return Some(Err(e)),
+        };
+        match (&lookup.feed, self.episode) {
+            (Some(feed_url), None) => {
+                let feed = match read_feed(http, feed_url, true).await {
+                    Ok(Some(feed)) => feed,
+                    Ok(None) => return Some(Err(format!("The show's feed ({}) is not a podcast feed", redact_url(feed_url.as_str())))),
+                    Err(e) => return Some(Err(e)),
+                };
+                if feed.episodes.is_empty() {
+                    return Some(Err(format!("{} lists no episodes", feed.title.as_deref().unwrap_or("The show's feed"))));
+                }
+                Some(show_tasks(feed, options).await)
+            }
+            (Some(feed_url), Some(track)) => {
+                let wanted = lookup.episodes.iter().find(|e| e.track == Some(track))?;
+                let feed = match read_feed(http, feed_url, true).await {
+                    Ok(Some(feed)) => feed,
+                    Ok(None) => return None,
+                    Err(e) => return Some(Err(e)),
+                };
+                let found = feed.episodes.into_iter().find(|e| wanted.matches(e))?;
+                Some(feed_tasks(Feed { title: feed.title, episodes: vec![found] }, None, &Done::default()))
+            }
+            (None, Some(track)) => {
+                let found = lookup.episodes.iter().find(|e| e.track == Some(track)).and_then(LookupEpisode::episode)?;
+                Some(feed_tasks(Feed { title: lookup.name, episodes: vec![found] }, None, &Done::default()))
+            }
+            (None, None) => {
+                // The show's answer holds no episodes: ask for them.
+                let lookup = match self.lookup(http, api, true).await {
+                    Ok(lookup) => lookup,
+                    Err(e) => return Some(Err(e)),
+                };
+                let episodes: Vec<Episode> = lookup.episodes.iter().filter_map(LookupEpisode::episode).collect();
+                if episodes.is_empty() {
+                    return Some(Err(format!(
+                        "{} is not available: Apple does not publish its feed (it may be for subscribers only, or its publisher hid it), \
+                         and lists no episode with a public file. A link to one of its episodes (with ?i=) may still download.",
+                        lookup.name.as_deref().unwrap_or("This show")
+                    )));
+                }
+                tracing::info!("Apple does not publish show {}'s feed: its newest {} episodes are listed", self.show, episodes.len());
+                Some(show_tasks(Feed { title: lookup.name, episodes }, options).await)
+            }
+        }
+    }
+
+    /// What the iTunes Lookup API at `api` says of the show, and of its newest episodes (200 at
+    /// most) when `episodes` are asked for.
+    async fn lookup(&self, http: &reqwest::Client, api: &str, episodes: bool) -> Result<Lookup, String> {
+        let mut query = vec![("id", self.show.to_string())];
+        if episodes {
+            query.extend([("entity", "podcastEpisode".to_string()), ("limit", "200".to_string())]);
+        } else {
+            query.push(("entity", "podcast".to_string()));
         }
         if let Some(country) = &self.country {
             query.push(("country", country.clone()));
         }
-        let lookup = match Url::parse_with_params("https://itunes.apple.com/lookup", &query) {
-            Ok(lookup) => lookup,
-            Err(e) => return Some(Err(e.to_string())),
-        };
-        let answer = match fetch(http, &lookup, false, true).await {
-            Ok(Some((answer, _))) => answer,
-            Ok(None) => return Some(Err(format!("Apple Podcasts refused to look up show {}; try again later", self.show))),
-            Err(e) => return Some(Err(e)),
-        };
-        let (feed_url, episode) = match read_lookup(&answer, self.show, self.episode) {
-            Ok(found) => found,
-            Err(e) => return Some(Err(e)),
-        };
-        let feed = match read_feed(http, &feed_url, true).await {
-            Ok(Some(feed)) => feed,
-            Ok(None) if self.episode.is_some() => return None,
-            Ok(None) => return Some(Err(format!("The show's feed ({}) is not a podcast feed", redact_url(feed_url.as_str())))),
-            Err(e) => return Some(Err(e)),
-        };
-        if self.episode.is_none() {
-            if feed.episodes.is_empty() {
-                return Some(Err(format!("{} lists no episodes", feed.title.as_deref().unwrap_or("The show's feed"))));
-            }
-            return Some(show_tasks(feed, options).await);
+        let url = Url::parse_with_params(api, &query).map_err(|e| e.to_string())?;
+        match fetch(http, &url, false, true).await? {
+            Some((answer, _)) => read_lookup(&answer, self.show),
+            None => Err(format!("Apple Podcasts refused to look up show {}; try again later", self.show)),
         }
-        let wanted = episode?;
-        let found = feed.episodes.into_iter().find(|e| wanted.matches(e))?;
-        Some(feed_tasks(Feed { title: feed.title, episodes: vec![found] }, None, &Done::default()))
     }
 }
 
-/// What the iTunes Lookup API says of an episode: the guid and file the feed gives it.
-#[derive(Debug, PartialEq)]
+/// What the iTunes Lookup API says of a show.
+#[derive(Debug)]
+struct Lookup {
+    name: Option<String>,
+    /// Its public feed; None when Apple does not publish one.
+    feed: Option<Url>,
+    /// Its newest episodes, when they were asked for.
+    episodes: Vec<LookupEpisode>,
+}
+
+/// What the iTunes Lookup API says of an episode: its id, and its guid and file as its feed
+/// gives them (a subscription episode has no public file).
+#[derive(Debug, Default, PartialEq)]
 struct LookupEpisode {
+    track: Option<u64>,
     guid: Option<String>,
     url: Option<Url>,
+    title: String,
+    date: Option<Date>,
+    extension: Option<&'static str>,
 }
 
 impl LookupEpisode {
+    fn of(result: &LookupResult) -> Self {
+        let url = result.episode_url.as_deref().and_then(|u| Url::parse(u).ok()).filter(|u| matches!(u.scheme(), "http" | "https"));
+        let extension = url.as_ref().and_then(|url| {
+            let named = result.episode_file_extension.as_deref().and_then(|ext| MEDIA_EXTENSIONS.iter().copied().find(|known| known.eq_ignore_ascii_case(ext)));
+            // "audio" or "video".
+            let kind = result.episode_content_type.as_deref().unwrap_or("audio");
+            named.or_else(|| media_extension(url, Some(&format!("{}/", kind))))
+        });
+        Self {
+            track: result.track_id,
+            guid: result.episode_guid.clone(),
+            url,
+            title: result.track_name.as_deref().map(|t| t.split_whitespace().collect::<Vec<_>>().join(" ")).unwrap_or_default(),
+            date: result.release_date.as_deref().and_then(parse_date),
+            extension,
+        }
+    }
+
     /// Whether `episode` of the feed is this one: the same guid, or the same file (its link's
     /// host and path; the query carries tracking that may differ).
     fn matches(&self, episode: &Episode) -> bool {
@@ -691,6 +761,12 @@ impl LookupEpisode {
             _ => false,
         };
         same_guid || same_file
+    }
+
+    /// The episode as a feed would list it, when it has a public audio or video file.
+    fn episode(&self) -> Option<Episode> {
+        let enclosure = Enclosure { url: self.url.clone()?, extension: self.extension?, length: None };
+        Some(Episode { title: self.title.clone(), date: self.date, guid: self.guid.clone(), enclosure: Some(enclosure) })
     }
 }
 
@@ -709,40 +785,29 @@ struct LookupResult {
     track_id: Option<u64>,
     collection_name: Option<String>,
     feed_url: Option<String>,
+    track_name: Option<String>,
+    release_date: Option<String>,
     episode_guid: Option<String>,
     episode_url: Option<String>,
+    episode_file_extension: Option<String>,
+    episode_content_type: Option<String>,
 }
 
-/// The feed of `show` from an iTunes Lookup `answer`, and for an `episode` link what it says of
-/// that episode (None when it is not among the recent episodes the API lists). A show without
-/// a public feed, or an episode without a file, is on Apple Podcasts only (a subscription): an
-/// error that says it is not available.
-fn read_lookup(answer: &[u8], show: u64, episode: Option<u64>) -> Result<(Url, Option<LookupEpisode>), String> {
+/// What an iTunes Lookup `answer` says of `show` and the episodes of it the answer lists. An
+/// error when it does not know the show.
+fn read_lookup(answer: &[u8], show: u64) -> Result<Lookup, String> {
     let answer: LookupAnswer = serde_json::from_slice(answer).map_err(|e| format!("Apple Podcasts answered the lookup of show {} with {}", show, e))?;
     let Some(record) = answer.results.iter().find(|r| r.kind.as_deref() == Some("podcast") && r.collection_id == Some(show)) else {
         return Err(format!("Apple Podcasts has no show with id {} (it may have been removed, or be listed in another country only)", show));
     };
-    let name = record.collection_name.as_deref().unwrap_or("This show");
-    let feed = record
-        .feed_url
-        .as_deref()
-        .and_then(|feed| Url::parse(feed).ok())
-        .filter(|u| matches!(u.scheme(), "http" | "https"))
-        .ok_or_else(|| {
-            format!("{} is not available: it is on Apple Podcasts only (a subscription show) and has no public feed to download from", name)
-        })?;
-    let Some(episode) = episode else { return Ok((feed, None)) };
-    let Some(found) = answer.results.iter().find(|r| r.wrapper_type.as_deref() == Some("podcastEpisode") && r.track_id == Some(episode)) else {
-        return Ok((feed, None));
-    };
-    let url = found.episode_url.as_deref().and_then(|u| Url::parse(u).ok());
-    if url.is_none() {
-        return Err(format!(
-            "This episode of {} is not available: it is on Apple Podcasts only (a subscription episode) and has no public file to download",
-            name
-        ));
-    }
-    Ok((feed, Some(LookupEpisode { guid: found.episode_guid.clone(), url })))
+    let feed = record.feed_url.as_deref().and_then(|feed| Url::parse(feed).ok()).filter(|u| matches!(u.scheme(), "http" | "https"));
+    let episodes = answer
+        .results
+        .iter()
+        .filter(|r| r.wrapper_type.as_deref() == Some("podcastEpisode") && r.collection_id == Some(show))
+        .map(LookupEpisode::of)
+        .collect();
+    Ok(Lookup { name: record.collection_name.clone().filter(|n| !n.trim().is_empty()), feed, episodes })
 }
 
 #[cfg(test)]
@@ -1166,39 +1231,138 @@ mod tests {
 
     #[test]
     fn apple_lookup_gives_the_feed_and_finds_the_episode_in_it() {
-        let (feed, episode) = read_lookup(LOOKUP.as_bytes(), 1_200_361_736, None).unwrap();
-        assert_eq!((feed.as_str(), episode), ("https://feeds.simplecast.com/Sl5CSM3S", None));
-        let (_, episode) = read_lookup(LOOKUP.as_bytes(), 1_200_361_736, Some(1_000_791_857_941)).unwrap();
-        let episode = episode.unwrap();
-        assert_eq!(episode.guid.as_deref(), Some("d9759ebd-1c66-4ffd-907d-f40e391e2a01"));
-        // Not among the episodes the API lists: left to yt-dlp.
-        assert_eq!(read_lookup(LOOKUP.as_bytes(), 1_200_361_736, Some(1)).unwrap().1, None);
+        let lookup = read_lookup(LOOKUP.as_bytes(), 1_200_361_736).unwrap();
+        assert_eq!(lookup.name.as_deref(), Some("The Daily"));
+        assert_eq!(lookup.feed.as_ref().map(Url::as_str), Some("https://feeds.simplecast.com/Sl5CSM3S"));
+        let [episode] = &lookup.episodes[..] else { panic!("{:?}", lookup.episodes) };
+        assert_eq!((episode.track, episode.guid.as_deref()), (Some(1_000_791_857_941), Some("d9759ebd-1c66-4ffd-907d-f40e391e2a01")));
+        assert_eq!((episode.title.as_str(), episode.extension), ("The Best TV Shows of the 21st Century", Some("mp3")));
 
         let feed = parse(DAILY, "https://feeds.simplecast.com/Sl5CSM3S").unwrap().unwrap();
         let found: Vec<_> = feed.episodes.iter().filter(|e| episode.matches(e)).map(|e| e.title.as_str()).collect();
         assert_eq!(found, ["The Best TV Shows of the 21st Century"]);
         // By its file alone, whatever tracking its link carries.
-        let by_file = LookupEpisode { guid: Some("other".into()), url: Some(url("https://feeds.simplecast.com/audio/bonus.m4a?src=apple")) };
+        let by_file = LookupEpisode { guid: Some("other".into()), url: Some(url("https://feeds.simplecast.com/audio/bonus.m4a?src=apple")), ..LookupEpisode::default() };
         let found: Vec<_> = feed.episodes.iter().filter(|e| by_file.matches(e)).map(|e| e.title.as_str()).collect();
         assert_eq!(found, ["Bonus: Q&A / \"Live\""]);
-        let nothing = LookupEpisode { guid: None, url: None };
-        assert!(!feed.episodes.iter().any(|e| nothing.matches(e)));
+        assert!(!feed.episodes.iter().any(|e| LookupEpisode::default().matches(e)));
     }
 
-    /// A show without a public feed, or an episode without a file, is Apple's only; a show the
-    /// API does not know, or an answer that is no lookup, is an error too.
+    /// The Lookup API's answer (`entity=podcastEpisode`) for an Apple Original, which Apple hosts
+    /// and publishes no feed of: the show alone, cut to its main fields.
+    const APPLE_ORIGINAL: &str = r#"{"resultCount":1,"results":[{"wrapperType":"track", "kind":"podcast", "artistId":1513466631, "collectionId":1461515071, "trackId":1461515071, "artistName":"Apple Music", "collectionName":"The Zane Lowe Interview Series", "trackName":"The Zane Lowe Interview Series", "collectionViewUrl":"https://podcasts.apple.com/us/podcast/the-zane-lowe-interview-series/id1461515071?uo=4", "collectionPrice":0.0, "releaseDate":"2026-09-17T17:00:00Z", "trackCount":334, "country":"USA", "primaryGenreName":"Music Interviews"}]}"#;
+
+    /// The Lookup API's record of a show whose publisher hid its feed (show 1724561745, its text
+    /// replaced), as `entity=podcast` answers it.
+    const HIDDEN_SHOW: &str = r#"{"wrapperType":"track", "kind":"podcast", "collectionId":1724561745, "trackId":1724561745, "collectionName":"Bedtime Stories", "trackName":"Bedtime Stories", "collectionViewUrl":"https://podcasts.apple.com/us/podcast/bedtime-stories/id1724561745?uo=4", "collectionPrice":0.0, "releaseDate":"2026-09-24T23:00:00Z", "trackCount":445, "country":"USA", "primaryGenreName":"Relationships"}"#;
+
+    /// Two of its episodes as `entity=podcastEpisode` answers them: with public files.
+    const HIDDEN_EPISODES: &str = r#"{"trackViewUrl":"https://podcasts.apple.com/us/podcast/until-next-time/id1724561745?i=1000699698115&uo=4", "episodeContentType":"audio", "episodeFileExtension":"mp3", "episodeUrl":"https://c10.patreonusercontent.com/4/patreon-media/p/post/124647799/33f9aa017c444682ae9f3c506841377c/eyJhIjoxLCJwIjoxfQ%3D%3D/1.mp3?token-time=1743206400&token-hash=8GMwbjL4O0YzT7i5__fZncrPbPhU3M_eJSAtOHvpW9U%3D", "episodeGuid":"124647799", "releaseDate":"2025-03-18T17:55:23Z", "trackId":1000699698115, "trackName":"Until Next Time...", "collectionId":1724561745, "collectionName":"Bedtime Stories", "kind":"podcast-episode", "wrapperType":"podcastEpisode"},
+{"trackViewUrl":"https://podcasts.apple.com/us/podcast/the-second-story/id1724561745?i=1000699698015&uo=4", "episodeContentType":"audio", "episodeFileExtension":"mp3", "episodeUrl":"https://c10.patreonusercontent.com/4/patreon-media/p/post/124506468/74ef19bb69d040efaf2307ab689d2c9c/eyJhIjoxLCJwIjoxfQ%3D%3D/1.mp3?token-time=1743206400&token-hash=cl-9oZgzO3PpGkjgAv8dSvtkEZdiP-r0mqKl9WQ49zk%3D", "episodeGuid":"124506468", "releaseDate":"2025-03-16T20:42:00Z", "trackId":1000699698015, "trackName":"The Second Story", "collectionId":1724561745, "collectionName":"Bedtime Stories", "kind":"podcast-episode", "wrapperType":"podcastEpisode"}"#;
+
+    fn answer(records: &[&str]) -> String {
+        format!(r#"{{"resultCount":{},"results":[{}]}}"#, records.len(), records.join(","))
+    }
+
+    /// A show without a public feed has none in its lookup; the episodes the API lists with a
+    /// public file are episodes as a feed would list them. A show the API does not know, or an
+    /// answer that is no lookup, is an error.
     #[test]
-    fn apple_only_shows_and_episodes_are_not_available() {
-        let private = LOOKUP.replace(r#""feedUrl":"https://feeds.simplecast.com/Sl5CSM3S", "trackViewUrl""#, r#""trackViewUrl""#);
-        let err = read_lookup(private.as_bytes(), 1_200_361_736, None).unwrap_err();
-        assert!(err.starts_with("The Daily is not available: it is on Apple Podcasts only"), "{err}");
-        let err = read_lookup(private.as_bytes(), 1_200_361_736, Some(1_000_791_857_941)).unwrap_err();
-        assert!(err.contains("not available"), "{err}");
-        let paid = LOOKUP.replace(r#""episodeUrl":"#, r#""paidEpisodeUrl":"#);
-        let err = read_lookup(paid.as_bytes(), 1_200_361_736, Some(1_000_791_857_941)).unwrap_err();
-        assert!(err.starts_with("This episode of The Daily is not available"), "{err}");
-        let err = read_lookup(br#"{"resultCount":0,"results":[]}"#, 42, None).unwrap_err();
+    fn apple_shows_without_a_public_feed_are_read_from_the_lookup() {
+        let original = read_lookup(APPLE_ORIGINAL.as_bytes(), 1_461_515_071).unwrap();
+        assert_eq!((original.name.as_deref(), &original.feed, original.episodes.len()), (Some("The Zane Lowe Interview Series"), &None, 0));
+
+        let hidden = read_lookup(answer(&[HIDDEN_SHOW, HIDDEN_EPISODES]).as_bytes(), 1_724_561_745).unwrap();
+        assert_eq!((hidden.name.as_deref(), &hidden.feed), (Some("Bedtime Stories"), &None));
+        let episodes: Vec<Episode> = hidden.episodes.iter().filter_map(LookupEpisode::episode).collect();
+        let tasks = feed_tasks(Feed { title: hidden.name, episodes }, None, &Done::default()).unwrap();
+        assert_eq!(names(&tasks), ["2025-03-18 Until Next Time.mp3", "2025-03-16 The Second Story.mp3"]);
+        assert!(tasks[0].urls[0].as_str().starts_with("https://c10.patreonusercontent.com/4/patreon-media/p/post/124647799/"));
+        assert!(tasks.iter().all(|t| t.folder.as_deref() == Some(Path::new("Bedtime Stories")) && t.from_document));
+
+        // An episode without a public file (or one that is no audio or video) is none to list.
+        let no_file = HIDDEN_EPISODES.replacen(r#""episodeUrl":"#, r#""otherUrl":"#, 1);
+        let lookup = read_lookup(answer(&[HIDDEN_SHOW, &no_file]).as_bytes(), 1_724_561_745).unwrap();
+        assert_eq!(lookup.episodes.iter().map(|e| e.episode().is_some()).collect::<Vec<_>>(), [false, true]);
+        let text = HIDDEN_EPISODES.replacen(r#""episodeContentType":"audio", "episodeFileExtension":"mp3", "episodeUrl":"https://c10.patreonusercontent.com/4/patreon-media/p/post/124647799/33f9aa017c444682ae9f3c506841377c/eyJhIjoxLCJwIjoxfQ%3D%3D/1.mp3"#, r#""episodeContentType":"text", "episodeUrl":"https://c10.patreonusercontent.com/notes"#, 1);
+        let lookup = read_lookup(answer(&[HIDDEN_SHOW, &text]).as_bytes(), 1_724_561_745).unwrap();
+        assert_eq!(lookup.episodes.iter().map(|e| e.episode().is_some()).collect::<Vec<_>>(), [false, true]);
+
+        let err = read_lookup(br#"{"resultCount":0,"results":[]}"#, 42).unwrap_err();
         assert!(err.starts_with("Apple Podcasts has no show with id 42"), "{err}");
-        assert!(read_lookup(b"<html>", 42, None).unwrap_err().starts_with("Apple Podcasts answered the lookup of show 42"));
+        assert!(read_lookup(b"<html>", 42).unwrap_err().starts_with("Apple Podcasts answered the lookup of show 42"));
+    }
+
+    /// Answers requests on a local port with the body of the first route whose text the request
+    /// target holds (404 when none does); `routes` is given the port's address.
+    async fn serve_routes(routes: impl FnOnce(&Url) -> Vec<(String, String)>) -> Url {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = url(&format!("http://{}/", listener.local_addr().unwrap()));
+        let routes = routes(&base);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut head = vec![0u8; 8192];
+                let n = socket.read(&mut head).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&head[..n]).into_owned();
+                let target = head.split_whitespace().nth(1).unwrap_or_default();
+                let reply = match routes.iter().find(|(route, _)| target.contains(route.as_str())) {
+                    Some((_, body)) => format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body),
+                    None => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+                };
+                let _ = socket.write_all(reply.as_bytes()).await;
+            }
+        });
+        base
+    }
+
+    /// Apple Podcasts links through a lookup API and feed served locally: a show lists its feed
+    /// and an episode link that episode of it; a show whose feed Apple does not publish lists
+    /// the episodes the API gives files for, and an episode link to it that one; a show with
+    /// neither is not available, and an episode the API does not list is left to yt-dlp.
+    #[tokio::test]
+    async fn apple_links_are_listed_through_the_lookup_api() {
+        let base = serve_routes(|base| {
+            let daily = LOOKUP.replace(r#""feedUrl":"https://feeds.simplecast.com/Sl5CSM3S""#, &format!(r#""feedUrl":"{}daily.rss""#, base));
+            vec![
+                ("id=1200361736&".to_string(), daily),
+                ("/daily.rss".to_string(), DAILY.to_string()),
+                ("id=1724561745&entity=podcast&".to_string(), answer(&[HIDDEN_SHOW])),
+                ("id=1724561745&entity=podcastEpisode&".to_string(), answer(&[HIDDEN_SHOW, HIDDEN_EPISODES])),
+                ("id=1461515071&".to_string(), APPLE_ORIGINAL.to_string()),
+            ]
+        })
+        .await;
+        let api = base.join("lookup").unwrap();
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        // History is not read: only-new is tested with feeds.
+        let options = ListOptions { only_new: false, ..ListOptions::default() };
+        let list = |link: &str| {
+            let apple = AppleLink::of(&url(link)).unwrap();
+            let (http, api, options) = (&http, api.as_str(), &options);
+            async move { apple.list(http, api, options).await }
+        };
+
+        let show = list("https://podcasts.apple.com/us/podcast/the-daily/id1200361736").await.unwrap().unwrap();
+        assert_eq!(show.len(), 5);
+        assert!(show.iter().all(|t| t.folder.as_deref() == Some(Path::new("The Daily"))));
+        let episode = list("https://podcasts.apple.com/us/podcast/the-daily/id1200361736?i=1000791857941").await.unwrap().unwrap();
+        assert_eq!(names(&episode), ["2026-09-27 The Best TV Shows of the 21st Century.mp3"]);
+        assert!(list("https://podcasts.apple.com/us/podcast/the-daily/id1200361736?i=1").await.is_none());
+
+        let hidden = list("https://podcasts.apple.com/us/podcast/bedtime-stories/id1724561745").await.unwrap().unwrap();
+        assert_eq!(names(&hidden), ["2025-03-18 Until Next Time.mp3", "2025-03-16 The Second Story.mp3"]);
+        let latest = ListOptions { latest: Some(1), ..options.clone() };
+        let apple = AppleLink::of(&url("https://podcasts.apple.com/us/podcast/bedtime-stories/id1724561745")).unwrap();
+        assert_eq!(apple.list(&http, api.as_str(), &latest).await.unwrap().unwrap().len(), 1);
+        let episode = list("https://podcasts.apple.com/us/podcast/the-second-story/id1724561745?i=1000699698015").await.unwrap().unwrap();
+        assert_eq!(names(&episode), ["2025-03-16 The Second Story.mp3"]);
+        assert!(list("https://podcasts.apple.com/us/podcast/older/id1724561745?i=1000600000000").await.is_none());
+
+        let err = list("https://podcasts.apple.com/us/podcast/the-zane-lowe-interview-series/id1461515071").await.unwrap().unwrap_err();
+        assert!(err.starts_with("The Zane Lowe Interview Series is not available: Apple does not publish its feed"), "{err}");
+        assert!(list("https://podcasts.apple.com/us/podcast/an-interview/id1461515071?i=1000700000000").await.is_none());
+        let err = list("https://podcasts.apple.com/us/podcast/gone/id42").await.unwrap().unwrap_err();
+        assert!(err.starts_with("Apple Podcasts refused to look up show 42"), "{err}");
     }
 }
