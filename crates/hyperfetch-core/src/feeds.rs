@@ -181,16 +181,16 @@ async fn fetch(http: &reqwest::Client, url: &Url, feed: bool, sure: bool) -> Res
 /// The name of the first element in `head`, the start of an XML document in UTF-8 or (with a
 /// BOM) UTF-16, in lower case; None while `head` ends before it does.
 fn first_element(head: &[u8]) -> Option<String> {
-    let utf16: Option<(&[u8], fn([u8; 2]) -> u16)> = match head {
-        [0xFF, 0xFE, rest @ ..] => Some((rest, u16::from_le_bytes)),
-        [0xFE, 0xFF, rest @ ..] => Some((rest, u16::from_be_bytes)),
-        _ => None,
-    };
-    if let Some((rest, unit)) = utf16 {
-        // The head may end inside a character: that end is read as a replacement character.
+    // The head may end inside a character: that end is read as a replacement character.
+    let utf16 = |rest: &[u8], unit: fn([u8; 2]) -> u16| {
         let units = rest.chunks_exact(2).map(|pair| unit([pair[0], pair[1]]));
         let text: String = char::decode_utf16(units).map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER)).collect();
-        return first_element(text.as_bytes());
+        first_element(text.as_bytes())
+    };
+    match head {
+        [0xFF, 0xFE, rest @ ..] => return utf16(rest, u16::from_le_bytes),
+        [0xFE, 0xFF, rest @ ..] => return utf16(rest, u16::from_be_bytes),
+        _ => {}
     }
     let mut reader = Reader::from_reader(head);
     let mut buf = Vec::new();
