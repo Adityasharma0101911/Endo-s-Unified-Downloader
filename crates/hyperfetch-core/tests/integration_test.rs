@@ -3001,6 +3001,38 @@ async fn test_a_short_link_with_a_secret_to_a_code_host_file_page_gets_the_file_
     assert_eq!(names_in(temp.path()), ["tool.bin"]);
 }
 
+/// GitHub after a repository renamed its branch master to main: the file page of the old branch
+/// redirects to the new one's, /raw/ of the old branch is not found.
+fn github_after_a_branch_rename(method: &str, target: &str) -> Vec<u8> {
+    match target {
+        "http://github.com/owner/repo/blob/master/dist/tool.bin" => {
+            response(method, "301 Moved Permanently", "Location: http://github.com/owner/repo/blob/main/dist/tool.bin\r\n", b"")
+        }
+        "http://github.com/owner/repo/blob/main/dist/tool.bin" => {
+            response(method, "200 OK", "Content-Type: text/html; charset=utf-8\r\n", b"<!doctype html><title>dist/tool.bin at main</title>")
+        }
+        "http://github.com/owner/repo/raw/main/dist/tool.bin" => {
+            response(method, "200 OK", "Content-Type: application/octet-stream\r\n", &payload(64 * KB, 373))
+        }
+        _ => response(method, "404 Not Found", "Content-Type: text/html; charset=utf-8\r\n", b"<!doctype html><title>Not Found</title>"),
+    }
+}
+
+#[tokio::test]
+async fn test_a_github_file_page_of_a_renamed_branch_downloads_the_file() {
+    let _history = setup().await;
+    let (proxy, seen) = serve_proxy(github_after_a_branch_rename).await;
+    let temp = tempdir().unwrap();
+    let old = Url::parse("http://github.com/owner/repo/blob/master/dist/tool.bin").unwrap();
+    let opts = DownloadOptions { proxy: Some(proxy), ..options(temp.path(), 4, 64 * KB) };
+
+    let path = run(&DownloadEngine::new(vec![old], opts), None).await.expect("the file should download");
+    assert_eq!(path, temp.path().join("tool.bin"));
+    assert_file(&path, &payload(64 * KB, 373));
+    let seen = seen.lock().unwrap().clone();
+    assert!(seen.iter().all(|(target, _)| !target.contains("/raw/master/")), "{seen:?}");
+}
+
 /// A file share's page, as Box shows one: the file is behind its buttons.
 fn a_share_page(method: &str, _target: &str) -> Vec<u8> {
     response(method, "200 OK", "Content-Type: text/html; charset=utf-8\r\n", b"<!doctype html><title>report.pdf | Powered by Box</title>")

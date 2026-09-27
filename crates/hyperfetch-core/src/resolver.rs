@@ -725,8 +725,22 @@ impl HostResolver for CodeHostResolver {
         code_host_raw_url(url).is_some()
     }
 
-    async fn resolve(&self, _client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
-        let raw = code_host_raw_url(url).ok_or_else(|| ResolverError::Parse(format!("Not a code host file URL: {}", url)))?;
+    /// GitHub's /raw/ does not follow a renamed branch (master to main) or repository as its file
+    /// page does, so a GitHub link is rewritten from where its page redirects; one whose page does
+    /// not answer in time, or not with success (a private repository), is rewritten as it is.
+    async fn resolve(&self, client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
+        let mut page = url.clone();
+        if url.host_str() == Some("github.com") {
+            match tokio::time::timeout(RESOLVE_TIMEOUT, client.head(url.clone()).send()).await {
+                Ok(Ok(resp)) if resp.status().is_success() && code_host_raw_url(resp.url()).is_some() => {
+                    page = resp.url().clone()
+                }
+                Ok(Ok(resp)) => tracing::debug!("{} answered HTTP {}; rewriting it as it is", url, resp.status()),
+                Ok(Err(e)) => tracing::debug!("{} did not answer ({}); rewriting it as it is", url, e),
+                Err(_) => tracing::debug!("{} did not answer in time; rewriting it as it is", url),
+            }
+        }
+        let raw = code_host_raw_url(&page).ok_or_else(|| ResolverError::Parse(format!("Not a code host file URL: {}", url)))?;
         Ok(vec![raw])
     }
 }
@@ -1536,17 +1550,40 @@ mod tests {
         }
     }
 
+    /// Only GitHub's file page is asked where it is (its branch may have been renamed); when it
+    /// does not say, the link is rewritten as it is. Other code hosts are sent nothing.
     #[tokio::test]
-    async fn test_code_host_resolver_sends_nothing() {
+    async fn test_code_host_resolver_asks_only_github_where_its_file_page_is() {
         let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client = Client::builder()
             .proxy(reqwest::Proxy::all(format!("http://{}", proxy.local_addr().unwrap())).unwrap())
             .build()
             .unwrap();
+        for (page, raw) in [
+            ("https://gitlab.com/g/p/-/blob/main/app.zip", "https://gitlab.com/g/p/-/raw/main/app.zip"),
+            ("https://huggingface.co/o/m/blob/main/model.gguf", "https://huggingface.co/o/m/resolve/main/model.gguf"),
+        ] {
+            let resolved = SmartResolver::resolve(&client, &Url::parse(page).unwrap()).await.unwrap();
+            assert_eq!(resolved, vec![Url::parse(raw).unwrap()]);
+            assert!(!contacted(&proxy).await, "{page} was asked before the download's probe");
+        }
+
+        // The proxy turns the request away: the link is rewritten as it is.
+        let turned_away = tokio::spawn(async move {
+            let (mut socket, _) = proxy.accept().await.unwrap();
+            let mut head = [0u8; 1024];
+            let n = tokio::io::AsyncReadExt::read(&mut socket, &mut head).await.unwrap();
+            let request = String::from_utf8_lossy(&head[..n]).into_owned();
+            tokio::io::AsyncWriteExt::write_all(&mut socket, b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            request
+        });
         let page = Url::parse("https://github.com/o/r/blob/main/app.zip").unwrap();
         let resolved = SmartResolver::resolve(&client, &page).await.unwrap();
         assert_eq!(resolved, vec![Url::parse("https://github.com/o/r/raw/main/app.zip").unwrap()]);
-        assert!(!contacted(&proxy).await, "the code host was asked before the download's probe");
+        let request = turned_away.await.unwrap();
+        assert!(request.starts_with("CONNECT github.com:443 "), "{request}");
     }
 
     #[test]
