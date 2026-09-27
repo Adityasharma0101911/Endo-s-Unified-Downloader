@@ -127,6 +127,10 @@ pub struct DownloadOptions {
     /// that, it sends no link to yt-dlp itself.
     pub page_media_preset: Option<crate::media::MediaQualityPreset>,
     pub browser_cookies: Option<crate::media::BrowserCookieSource>,
+    /// The yt-dlp to run for media, in place of the one found or installed. Never saved with the
+    /// options: a program to run is not read back from a file.
+    #[serde(skip)]
+    pub ytdlp_path: Option<PathBuf>,
     /// Global download speed cap in bytes/sec across all connections (None = unlimited).
     pub max_speed: Option<u64>,
     /// Failed attempts allowed per chunk before the download fails. Attempts that made progress don't count.
@@ -158,6 +162,7 @@ impl Default for DownloadOptions {
             media_preset: None,
             page_media_preset: None,
             browser_cookies: None,
+            ytdlp_path: None,
             max_speed: None,
             max_retries: 8,
             stall_timeout_secs: 30,
@@ -423,12 +428,14 @@ impl DownloadEngine {
 
     /// What one of yt-dlp's own sites finds at `url`, a web page that leads nowhere by itself (see
     /// `crate::media::find_site_media`). None when none of them takes it, or yt-dlp cannot be
-    /// found, installed or run: that never fails the download.
+    /// found, installed or run, or takes too long: that never fails the download. A site that
+    /// takes it but finds its video DRM-protected does: the page is not what the link stands for.
     async fn site_media(&self, url: &Url) -> Result<Option<crate::media::Extracted>, String> {
         let options = self.media_options();
         match crate::media::find_site_media(url, &options, Some(Arc::clone(&self.cancel_flag))).await {
             Ok(found) => Ok(Some(found)),
             Err(_) if self.cancel_token.is_cancelled() => Err(CANCELLED.to_string()),
+            Err(e) if e == crate::media::DRM_REFUSED => Err(e),
             Err(e) => {
                 tracing::info!("No site of yt-dlp's takes {}: {}", url, e);
                 Ok(None)
@@ -526,7 +533,7 @@ impl DownloadEngine {
             proxy: self.options.proxy.clone(),
             output_dir,
             output_filename,
-            custom_ytdlp_path: None,
+            custom_ytdlp_path: self.options.ytdlp_path.clone(),
             concurrent_fragments: self.options.num_connections.clamp(1, 32),
         }
     }
