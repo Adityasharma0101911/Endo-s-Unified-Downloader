@@ -164,8 +164,6 @@ fn job(args: &Args, connections: u64, dir: &Path, task: Task) -> Job {
     };
     let media = args.media_preset.is_some() || task.urls.iter().any(hyperfetch_core::media::is_supported_media_site);
     let options = DownloadOptions {
-        num_connections: if media { args.concurrent_fragments } else { connections } as usize,
-        base_chunk_size: args.chunk_size_mb * 1024 * 1024,
         output_path: Some(output),
         expected_checksum: args.checksum.clone().or(task.checksum),
         cookies_path: args.load_cookies.clone(),
@@ -173,12 +171,23 @@ fn job(args: &Args, connections: u64, dir: &Path, task: Task) -> Job {
         proxy: args.proxy.clone(),
         media_preset: args.media_preset.clone(),
         browser_cookies: args.cookies_from_browser.map(Into::into),
+        ..tuning(args, if media { args.concurrent_fragments } else { connections })
+    };
+    Job { label, urls: task.urls, options, line: None }
+}
+
+/// The engine settings every download of this run shares, with `connections` per download.
+fn tuning(args: &Args, connections: u64) -> DownloadOptions {
+    DownloadOptions {
+        num_connections: connections as usize,
+        base_chunk_size: args.chunk_size_mb * 1024 * 1024,
         max_speed: args.max_speed.filter(|&s| s > 0),
         max_retries: args.max_retries,
         stall_timeout_secs: args.stall_timeout,
+        fsync_on_complete: args.fsync,
+        max_connections_per_host: args.max_connections_per_host,
         ..Default::default()
-    };
-    Job { label, urls: task.urls, options }
+    }
 }
 
 async fn read_input(path: &Path) -> Result<String, String> {
@@ -196,34 +205,41 @@ async fn read_input(path: &Path) -> Result<String, String> {
     decode_text(&bytes).map_err(|e| format!("{}: {}", path.display(), e))
 }
 
-async fn batch(args: &Args, ui: &Ui, shutdown: &Shutdown, http: &reqwest::Client) -> i32 {
-    let mut inputs: Vec<Vec<String>> = Vec::new();
-    if let Some(path) = &args.input_file {
-        match read_input(path).await {
-            Ok(text) => {
-                for line in batch_lines(&text) {
-                    inputs.push(input_tokens(line).await);
-                }
-            }
-            Err(e) => return usage(&e),
-        }
-    }
-    if !args.urls.is_empty() {
-        inputs.push(args.urls.clone());
-    }
-
+/// The downloads `inputs` list, each with the input-file line it came from (None for the
+/// command-line URLs), and how many inputs could not be read into downloads (those are reported).
+async fn read_tasks(inputs: &[(Option<usize>, Vec<String>)], ui: &Ui, http: &reqwest::Client) -> (Vec<(Option<usize>, Task)>, usize) {
     let mut tasks = Vec::new();
     let mut failed = 0;
-    for input in &inputs {
+    for (line, input) in inputs {
         let tokens: Vec<&str> = input.iter().map(String::as_str).collect();
         match ingest(&tokens, http).await {
-            Ok(found) => tasks.extend(found),
+            Ok(found) => tasks.extend(found.into_iter().map(|task| (*line, task))),
             Err(e) => {
                 ui.error(&format!("[FAILED] {}: {}", truncate(&tokens.join(" "), 60), e));
                 failed += 1;
             }
         }
     }
+    (tasks, failed)
+}
+
+async fn batch(args: &Args, ui: &Ui, shutdown: &Shutdown, http: &reqwest::Client) -> i32 {
+    let mut inputs: Vec<(Option<usize>, Vec<String>)> = Vec::new();
+    if let Some(path) = &args.input_file {
+        match read_input(path).await {
+            Ok(text) => {
+                for (number, line) in batch_lines(&text) {
+                    inputs.push((Some(number), input_tokens(line).await));
+                }
+            }
+            Err(e) => return usage(&e),
+        }
+    }
+    if !args.urls.is_empty() {
+        inputs.push((None, args.urls.clone()));
+    }
+
+    let (tasks, mut failed) = read_tasks(&inputs, ui, http).await;
     if let Err(e) = check_single_file_options(args.output.as_deref(), args.checksum.is_some(), tasks.len()) {
         return usage(&e);
     }
@@ -242,7 +258,7 @@ async fn batch(args: &Args, ui: &Ui, shutdown: &Shutdown, http: &reqwest::Client
         return usage(&e);
     }
 
-    let jobs = tasks.into_iter().map(|t| job(args, args.connections, &dir, t)).collect();
+    let jobs = tasks.into_iter().map(|(line, t)| Job { line, ..job(args, args.connections, &dir, t) }).collect();
     failed += run_jobs(jobs, args.jobs as usize, ui, shutdown).await;
     exit_code(shutdown.requested(), failed)
 }
@@ -571,6 +587,7 @@ async fn verify_file(args: &Args, path: &Path, ui: &Ui, shutdown: &Shutdown) -> 
         total_size,
         &res.missing_ranges,
         &urls,
+        &tuning(args, args.connections),
         Some(cancel),
         move |done, total| {
             progress.set_length(total);
@@ -666,6 +683,46 @@ mod tests {
         let output = job(&args, 4, Path::new("gone"), task).options.output_path.unwrap();
         let last = *output.as_os_str().as_encoded_bytes().last().unwrap();
         assert!(std::path::is_separator(last as char), "{}", output.display());
+    }
+
+    #[test]
+    fn every_download_gets_the_disk_and_host_settings() {
+        let args = parse(&["--fsync", "--max-connections-per-host", "6", "-s", "3", "https://a.example/f"]);
+        let task = Task { urls: vec![Url::parse("https://a.example/f").unwrap()], ..Default::default() };
+        let options = job(&args, args.connections, Path::new("d"), task).options;
+        assert_eq!((options.fsync_on_complete, options.max_connections_per_host, options.num_connections), (true, 6, 3));
+        let defaults = tuning(&parse(&["u"]), 16);
+        assert_eq!((defaults.fsync_on_complete, defaults.max_connections_per_host), (false, 32));
+    }
+
+    /// Each download keeps the line of the input file that listed it, however many downloads
+    /// the lines before it turned into.
+    #[tokio::test]
+    async fn downloads_keep_their_input_line() {
+        let dir = test_dir("lines");
+        let metalink = dir.join("two.meta4");
+        std::fs::write(
+            &metalink,
+            r#"<?xml version="1.0"?><metalink xmlns="urn:ietf:params:xml:ns:metalink">
+            <file name="a.bin"><url>https://m.example/a.bin</url></file>
+            <file name="b.bin"><url>https://m.example/b.bin</url></file>
+            </metalink>"#,
+        )
+        .unwrap();
+        let text = format!("# queue\n{}\nnot-a-url\n\nhttps://h.example/c.bin\n", metalink.display());
+        let mut inputs = Vec::new();
+        for (number, line) in batch_lines(&text) {
+            inputs.push((Some(number), input_tokens(line).await));
+        }
+        inputs.push((None, vec!["https://h.example/d.bin".to_string()]));
+
+        let (tasks, failed) = read_tasks(&inputs, &Ui::new(true), &reqwest::Client::new()).await;
+        assert_eq!(failed, 1);
+        let lines: Vec<(Option<usize>, String)> = tasks.iter().map(|(line, task)| (*line, task.label())).collect();
+        assert_eq!(
+            lines,
+            [(Some(2), "a.bin".into()), (Some(2), "b.bin".into()), (Some(5), "c.bin".into()), (None, "d.bin".into())]
+        );
     }
 
     #[test]
@@ -805,6 +862,8 @@ mod tests {
         let data: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 251) as u8).collect();
         let server = serve(data.clone()).await;
         let dir = test_dir("repair");
+        // The repair runs through the engine, which records the finished file in history.
+        std::env::set_var("ENDO_HISTORY_PATH", dir.join("history.json"));
         let final_file = dir.join("data.bin");
         let part = dir.join("data.bin.part");
         let mut on_disk = data.clone();

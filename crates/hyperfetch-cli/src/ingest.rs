@@ -234,9 +234,14 @@ pub fn decode_text(bytes: &[u8]) -> Result<String, String> {
     }
 }
 
-/// The meaningful lines of a batch file: trimmed, without blanks and # comments.
-pub fn batch_lines(text: &str) -> impl Iterator<Item = &str> {
-    text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#'))
+/// The meaningful lines of a batch file with their 1-based line numbers: trimmed, without
+/// blanks and # comments.
+pub fn batch_lines(text: &str) -> impl Iterator<Item = (usize, &str)> {
+    text.lines()
+        .map(str::trim)
+        .enumerate()
+        .filter(|(_, l)| !l.is_empty() && !l.starts_with('#'))
+        .map(|(i, l)| (i + 1, l))
 }
 
 #[cfg(test)]
@@ -361,7 +366,7 @@ d6:lengthi4e4:pathl5:y.bineee4:name4:root12:piece lengthi16384e6:pieces20:aaaaaa
 
     #[test]
     fn batch_lines_skip_comments_and_blanks() {
-        let lines: Vec<&str> = batch_lines("# queue\r\n\r\n  https://a  https://b \r\n#x\nhttps://c").collect();
-        assert_eq!(lines, ["https://a  https://b", "https://c"]);
+        let lines: Vec<(usize, &str)> = batch_lines("# queue\r\n\r\n  https://a  https://b \r\n#x\nhttps://c").collect();
+        assert_eq!(lines, [(3, "https://a  https://b"), (5, "https://c")]);
     }
 }
