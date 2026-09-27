@@ -24,6 +24,8 @@ pub struct Task {
     pub name: Option<PathBuf>,
     /// Checksum published by a metalink.
     pub checksum: Option<String>,
+    /// Size published by a metalink or torrent.
+    pub size: Option<u64>,
     /// Listed by a .metalink, .meta4 or .torrent, so its hosts are ones the user never named:
     /// the Authorization header the user gave is not sent to them.
     pub from_document: bool,
@@ -271,7 +273,7 @@ fn metalink_tasks(bytes: &[u8]) -> Result<Vec<Task>, String> {
                 .iter()
                 .find_map(|algo| file.hashes.iter().find(|(t, _)| t == algo).map(|(t, h)| format!("{}:{}", t, h)));
             let name = Some(clean_path(file.name.split('/'))?);
-            Ok(Task { name, urls: file.urls, checksum, from_document: true })
+            Ok(Task { name, urls: file.urls, checksum, size: file.size, from_document: true })
         })
         .collect()
 }
@@ -296,7 +298,7 @@ fn torrent_tasks(bytes: &[u8], remote: Option<&Url>) -> Result<Vec<Task>, String
                 ));
             }
             let name = if single_file { relative } else { clean_path([info.name.as_str()])?.join(relative) };
-            Ok(Task { urls: file.urls.clone(), name: Some(name), from_document: true, ..Task::default() })
+            Ok(Task { urls: file.urls.clone(), name: Some(name), size: Some(file.length), from_document: true, ..Task::default() })
         })
         .collect()
 }
@@ -472,6 +474,7 @@ d6:lengthi4e4:pathl5:y.bineee4:name4:root12:piece lengthi16384e6:pieces20:aaaaaa
         let tasks = torrent_tasks(torrent, None).unwrap();
         assert_eq!(tasks.len(), 2);
         assert_eq!(tasks[0].name, Some(Path::new("root").join("a").join("x.bin")));
+        assert_eq!((tasks[0].size, tasks[1].size), (Some(3), Some(4)));
         assert_eq!(tasks[1].urls[0].as_str(), "https://s.example/d/root/y.bin");
     }
 

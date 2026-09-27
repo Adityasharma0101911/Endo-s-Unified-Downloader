@@ -82,6 +82,7 @@ pub fn render(app: &mut App, ui: &mut egui::Ui) {
     ui.add_space(8.0);
     header(app, ui);
     clipboard_banner(app, ui);
+    listing_prompt(app, ui);
     if let Some(notice) = app.notice.clone() {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
@@ -178,6 +179,32 @@ fn clipboard_banner(app: &mut App, ui: &mut egui::Ui) {
                     if ui.add(primary_button("Download Now", BLUE)).clicked() {
                         app.clipboard_banner = None;
                         app.download_now(&link, "", "");
+                    }
+                });
+            });
+        });
+}
+
+/// Asks before adding the many downloads a large .metalink, .meta4 or .torrent lists.
+fn listing_prompt(app: &mut App, ui: &mut egui::Ui) {
+    let Some(listing) = app.listings.first() else { return };
+    let input = listing.input.clone();
+    let text = format!("{} lists {}. Add them all?", truncate_chars(&input, 55), listing.summary());
+    ui.add_space(6.0);
+    egui::Frame::none()
+        .fill(Color32::from_rgb(22, 27, 38))
+        .stroke(Stroke::new(1.0, AMBER))
+        .inner_margin(8.0)
+        .rounding(4.0)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(text).color(TEXT)).on_hover_text(&input);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button(RichText::new("Cancel").size(11.0)).clicked() {
+                        app.answer_listing(false);
+                    }
+                    if ui.add(primary_button("Add All", BLUE)).clicked() {
+                        app.answer_listing(true);
                     }
                 });
             });
