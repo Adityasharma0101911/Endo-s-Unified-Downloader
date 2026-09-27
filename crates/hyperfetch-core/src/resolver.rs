@@ -28,6 +28,80 @@ const JSON_VIDEO_KEYS: &[&str] = &["viewMp4Url", "downloadUrl", "videoUrl", "vid
 
 const SOURCEFORGE_MIRRORS: &[&str] = &["autoselect", "netix", "phoenixnap", "netcologne", "jaist", "liquidtelecom"];
 
+/// "You are leaving this site" links: their hosts (a trailing `*` for any of the site's country
+/// domains, see `country_domain`), their path (trailing slash aside; `None` for any) and the query
+/// parameters that may hold the target, in the order they are tried.
+const REDIRECT_WRAPPERS: &[(&[&str], Option<&str>, &[&str])] = &[
+    (&["youtube.com", "www.youtube.com", "m.youtube.com"], Some("/redirect"), &["q"]),
+    // google.com, and google.co.uk, google.de, ... where Google Search runs outside the US.
+    (&["google.*", "www.google.*"], Some("/url"), &["q", "url"]),
+    (&["l.facebook.com", "lm.facebook.com", "l.messenger.com"], Some("/l.php"), &["u"]),
+    (&["l.instagram.com", "l.threads.net", "l.threads.com"], Some(""), &["u"]),
+    // `url` is the parameter older links carry.
+    (&["steamcommunity.com"], Some("/linkfilter"), &["u", "url"]),
+    (&["out.reddit.com"], None, &["url"]),
+    (&["linkedin.com", "www.linkedin.com"], Some("/redir/redirect"), &["url"]),
+    // LinkedIn's for links in messages.
+    (&["linkedin.com", "www.linkedin.com"], Some("/safety/go"), &["url"]),
+    (&["vk.com", "m.vk.com"], Some("/away.php"), &["to"]),
+    (&["duckduckgo.com"], Some("/l"), &["uddg"]),
+    (&["t.umblr.com"], Some("/redirect"), &["z"]),
+    // SoundCloud's.
+    (&["gate.sc"], Some(""), &["url"]),
+];
+
+/// How many wrappers around one link are taken off at most.
+const MAX_UNWRAPS: usize = 5;
+
+/// Last-segment extensions that name a file, never a web page (see `check_answer`).
+const FILE_EXTENSIONS: &[&str] = &[
+    // Archives
+    "zip", "7z", "rar", "tar", "gz", "tgz", "bz2", "xz", "zst", "lzma", "cab",
+    // Installers and packages
+    "exe", "msi", "msix", "msixbundle", "appx", "appxbundle", "dmg", "pkg", "deb", "rpm", "apk", "xapk", "ipa",
+    "appimage", "flatpak", "snap", "jar", "whl",
+    // Disk images
+    "iso", "img", "vhd", "vhdx", "vmdk", "qcow2", "ova",
+    // Audio and video
+    "mp3", "flac", "wav", "m4a", "aac", "ogg", "opus", "wma", "mp4", "m4v", "mkv", "webm", "mov", "avi", "wmv",
+    "flv", "mpg", "mpeg",
+    // Documents
+    "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "odp", "rtf", "epub", "mobi", "djvu",
+    "cbz", "cbr",
+    // Model weights
+    "safetensors", "gguf", "ckpt", "pt", "pth", "bin", "onnx", "h5",
+    "torrent",
+];
+
+/// File-share services not supported yet, by the domains (subdomains included) of their pages;
+/// those of their pages yt-dlp downloads aside (see `yt_dlp_share_page`).
+const UNSUPPORTED_SHARES: &[(&str, &[&str])] = &[
+    ("MEGA", &["mega.nz", "mega.io", "mega.co.nz"]),
+    ("OneDrive", &["1drv.ms", "onedrive.live.com"]),
+    ("SharePoint", &["sharepoint.com"]),
+    ("WeTransfer", &["wetransfer.com", "we.tl"]),
+    (
+        "Terabox",
+        &[
+            "terabox.com", "terabox.app", "terabox.fun", "teraboxapp.com", "teraboxlink.com", "teraboxshare.com",
+            "terafileshare.com", "terasharelink.com", "1024tera.com", "1024tera.co", "1024terabox.com", "4funbox.com",
+            "4funbox.co", "mirrobox.com", "nephobox.com", "freeterabox.com", "momerybox.com", "tibibox.com",
+        ],
+    ),
+    ("Gofile", &["gofile.io"]),
+    ("Pixeldrain", &["pixeldrain.com", "pixeldrain.net", "pixeldra.in"]),
+    ("iCloud", &["icloud.com"]),
+    (
+        "Yandex Disk",
+        &[
+            "yadi.sk", "disk.yandex.ru", "disk.yandex.com", "disk.yandex.com.tr", "disk.yandex.by", "disk.yandex.kz",
+            "disk.yandex.ua", "disk.360.yandex.ru", "disk.360.yandex.com",
+        ],
+    ),
+    ("pCloud", &["pcloud.link", "pcloud.com"]),
+    ("Box", &["box.com"]),
+];
+
 #[derive(Error, Debug)]
 pub enum ResolverError {
     #[error("Network error during resolution: {0}")]
@@ -220,7 +294,12 @@ pub struct GoogleDriveResolver;
 
 impl HostResolver for GoogleDriveResolver {
     fn can_handle(&self, url: &Url) -> bool {
-        matches!(url.host_str(), Some("drive.google.com" | "drive.usercontent.google.com"))
+        match url.host_str() {
+            Some("drive.google.com" | "drive.usercontent.google.com") => true,
+            // Older Drive links: docs.google.com/uc?id=... and /file/d/{id}/...
+            Some("docs.google.com") => url.path() == "/uc" || url.path().starts_with("/file/d/"),
+            _ => false,
+        }
     }
 
     /// The direct download URL, sending nothing: whether Drive serves the file there shows in the
@@ -235,14 +314,138 @@ impl HostResolver for GoogleDriveResolver {
 /// The target of a "you are leaving this site" link (youtube.com/redirect?q=, google.com/url?q=,
 /// l.facebook.com/l.php?u=, ...), read from the link itself without a request; None when `url` is
 /// not such a link. Wrappers of wrappers are unwrapped too; the result is always http(s).
-pub fn unwrap_redirect(_url: &Url) -> Option<Url> {
-    None
+pub fn unwrap_redirect(url: &Url) -> Option<Url> {
+    let mut target = unwrap_once(url)?;
+    for _ in 1..MAX_UNWRAPS {
+        match unwrap_once(&target) {
+            Some(inner) => target = inner,
+            None => break,
+        }
+    }
+    Some(target)
+}
+
+/// The http(s) target one wrapper in [`REDIRECT_WRAPPERS`] holds, if `url` is one.
+fn unwrap_once(url: &Url) -> Option<Url> {
+    let host = url.host_str()?.trim_end_matches('.');
+    let path = url.path().trim_end_matches('/');
+    let listed = |pattern: &&str| match pattern.strip_suffix('*') {
+        Some(stem) => host.strip_prefix(stem).is_some_and(country_domain),
+        None => host == *pattern,
+    };
+    let (_, _, params) = REDIRECT_WRAPPERS
+        .iter()
+        .find(|(hosts, wrapper_path, _)| hosts.iter().any(listed) && wrapper_path.is_none_or(|p| p == path))?;
+    params.iter().find_map(|name| {
+        let (_, value) = url.query_pairs().find(|(key, _)| key == name)?;
+        let target = Url::parse(value.trim()).ok()?;
+        matches!(target.scheme(), "http" | "https").then_some(target)
+    })
+}
+
+/// Whether `domain` ends a host as a site's country domains do: `com`, `de`, `co.uk`, `com.au`.
+fn country_domain(domain: &str) -> bool {
+    let tld = domain.strip_prefix("co.").or_else(|| domain.strip_prefix("com.")).unwrap_or(domain);
+    !tld.is_empty() && tld.bytes().all(|b| b.is_ascii_lowercase())
 }
 
 /// Fails if the answer to `url` (which ended at `final_url`), with these headers, is a web page
-/// instead of the file it stands for.
-pub fn check_answer(url: &Url, _final_url: &Url, headers: &HeaderMap) -> Result<(), ResolverError> {
-    GoogleDriveResolver::check_answer(url, headers)
+/// instead of the file it stands for: HTML not sent as an attachment (a hosted .html file is
+/// one) from Drive, from Google asking to sign in to a document, for a code-host folder, for a
+/// link that names a file, or from a file-share service not supported yet. Other pages are looked
+/// into for a video.
+pub fn check_answer(url: &Url, final_url: &Url, headers: &HeaderMap) -> Result<(), ResolverError> {
+    GoogleDriveResolver::check_answer(url, headers)?;
+    if !html_type(headers) || is_attachment(headers) {
+        return Ok(());
+    }
+    if GoogleDocsResolver.can_handle(url) || final_url.host_str() == Some("accounts.google.com") {
+        return Err(ResolverError::NotFound(
+            "Google asked to sign in: the document is private (share it as \"Anyone with the link\", or pass your browser's cookies with --load-cookies)"
+                .to_string(),
+        ));
+    }
+    if code_host_folder(url) || code_host_folder(final_url) {
+        return Err(ResolverError::NotFound(
+            "the link leads to a folder, not a file (link one of the files in it instead)".to_string(),
+        ));
+    }
+    // Before the services: a link of theirs that names a file is one to the file, gone stale.
+    if let Some(file) = named_file(url).or_else(|| named_file(final_url)) {
+        return Err(ResolverError::NotFound(format!(
+            "the server sent a web page instead of {} (the link may need a login, have expired, or lead to a download page)",
+            file
+        )));
+    }
+    if let Some(service) = unsupported_share_answer(url, final_url) {
+        return Err(ResolverError::NotFound(format!("{} links are not supported yet", service)));
+    }
+    Ok(())
+}
+
+/// The file-share service in [`UNSUPPORTED_SHARES`] whose page `url` is on, if any.
+fn unsupported_share(url: &Url) -> Option<&'static str> {
+    let host = url.host_str()?.trim_end_matches('.');
+    let on = |domain: &&str| host == *domain || host.strip_suffix(domain).is_some_and(|sub| sub.ends_with('.'));
+    UNSUPPORTED_SHARES.iter().find(|(_, domains)| domains.iter().any(on)).map(|(service, _)| *service)
+}
+
+/// The file-share service not supported yet that answered with a page: where the answer ended,
+/// unless yt-dlp downloads that page (see [`yt_dlp_share_page`]), else where it began, when the
+/// service sent it on elsewhere (to a sign-in page).
+fn unsupported_share_answer(url: &Url, final_url: &Url) -> Option<&'static str> {
+    match unsupported_share(final_url) {
+        Some(_) if yt_dlp_share_page(final_url) => None,
+        Some(service) => Some(service),
+        None => unsupported_share(url),
+    }
+}
+
+/// Whether `url` is a share page of a service in [`UNSUPPORTED_SHARES`] that yt-dlp's own
+/// extractor for it takes (as its URL patterns match them): Box shares, SharePoint videos, and
+/// Yandex Disk shares. Such a page goes on to the page handling, which hands it to yt-dlp.
+fn yt_dlp_share_page(url: &Url) -> bool {
+    let (host, path) = (url.host_str().unwrap_or_default(), url.path());
+    let has = |key: &str| url.query_pairs().any(|(k, _)| k == key);
+    match unsupported_share(url) {
+        // (app|ent).box.com/s/..., under a company's subdomain or not.
+        Some("Box") => {
+            let sub = host.strip_suffix(".box.com").unwrap_or_default();
+            matches!(sub.rsplit('.').next(), Some("app" | "ent")) && path.starts_with("/s/")
+        }
+        Some("SharePoint") => path.starts_with("/:v:/") || (path.ends_with("/stream.aspx") && has("id")),
+        Some("Yandex Disk") => {
+            path.starts_with("/d/") || path.starts_with("/i/") || (path.starts_with("/public") && has("hash"))
+        }
+        _ => false,
+    }
+}
+
+/// Whether `url` is a folder page on a code host, which lists files instead of being one:
+/// GitHub /{owner}/{repo}/tree/..., GitLab /{namespace...}/-/tree/..., Hugging Face
+/// [/datasets|/spaces]/{owner}/{repo}/tree/... (a file link to a folder ends there too).
+fn code_host_folder(url: &Url) -> bool {
+    let Some(segs) = url.path_segments().map(|s| s.collect::<Vec<_>>()) else { return false };
+    // "tree" then the ref.
+    let tree_at = |i: usize| segs.get(i) == Some(&"tree") && segs.get(i + 1).is_some_and(|r| !r.is_empty());
+    match url.host_str().unwrap_or_default().trim_end_matches('.') {
+        "github.com" => tree_at(2),
+        "gitlab.com" => (3..segs.len()).any(|i| segs[i - 1] == "-" && tree_at(i)),
+        "huggingface.co" | "hf.co" => {
+            let start = usize::from(matches!(segs.first(), Some(&("datasets" | "spaces"))));
+            tree_at(start + 2) || tree_at(start + 1)
+        }
+        _ => false,
+    }
+}
+
+/// The name of the file `url` names by one of the [`FILE_EXTENSIONS`], if it does.
+fn named_file(url: &Url) -> Option<String> {
+    let ext = last_segment_extension(url)?;
+    let last = url.path_segments()?.next_back()?;
+    FILE_EXTENSIONS
+        .contains(&ext.as_str())
+        .then(|| percent_encoding::percent_decode_str(last).decode_utf8_lossy().into_owned())
 }
 
 /// Whether `url`, which no host resolver takes, ended at `final_url` on another host that one
@@ -275,6 +478,83 @@ fn google_drive_direct_url(file_id: &str) -> Result<Url, ResolverError> {
         &[("id", file_id), ("export", "download"), ("confirm", "t")],
     )
     .map_err(|e| ResolverError::Parse(e.to_string()))
+}
+
+/// Google Docs Resolver (Turns a Docs, Sheets or Slides link into the document exported as a file)
+pub struct GoogleDocsResolver;
+
+/// The pages of a document the Docs, Sheets and Slides apps show (after `/d/{id}/`), which stand
+/// for the document itself.
+const GOOGLE_DOCS_VIEWS: &[&str] = &["edit", "view", "preview", "htmlview", "mobilebasic", "present", "embed", "copy", "comment"];
+
+/// The export of the document `url` links to, rewritten without a request, as Google's own
+/// File > Download does it: a document as .docx, a spreadsheet as .xlsx, or as .csv of the one
+/// sheet the link names (`gid`), a presentation as .pptx; the account it names (`authuser`) is
+/// kept. An export link is kept in the format it asks for. Other links on a document (gviz
+/// queries, /pub copies) already give what they are for, so they are left alone. Exports are
+/// made on the fly: one connection, no known size.
+fn google_docs_export(url: &Url) -> Option<Url> {
+    if url.host_str()? != "docs.google.com" {
+        return None;
+    }
+    let segs: Vec<&str> = url.path_segments()?.collect();
+    let (&kind, rest) = segs.split_first()?;
+    let format = match kind {
+        "document" => "docx",
+        "spreadsheets" => "xlsx",
+        "presentation" => "pptx",
+        _ => return None,
+    };
+    // /u/{n}/ picks one of the signed-in accounts (the cookies passed); it is kept.
+    let (account, rest) = match rest {
+        ["u", n, rest @ ..] if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => (format!("/u/{}", n), rest),
+        _ => (String::new(), rest),
+    };
+    // /d/e/{id} is a published copy: a web page, with no export.
+    let ["d", id, rest @ ..] = rest else { return None };
+    if id.is_empty() || *id == "e" {
+        return None;
+    }
+    let mut export = url.clone();
+    export.set_fragment(None);
+    match rest {
+        ["export", ..] => return Some(export),
+        [] | [""] => {}
+        [view] | [view, ""] if GOOGLE_DOCS_VIEWS.contains(view) => {}
+        _ => return None,
+    }
+    export.set_path(&format!("/{}{}/d/{}/export", kind, account, id));
+    let authuser = url.query_pairs().find(|(k, _)| k == "authuser").map(|(_, v)| v.into_owned());
+    {
+        let mut query = export.query_pairs_mut();
+        query.clear();
+        match sheet_gid(url).filter(|_| kind == "spreadsheets") {
+            Some(gid) => query.append_pair("format", "csv").append_pair("gid", &gid),
+            None => query.append_pair("format", format),
+        };
+        if let Some(user) = authuser {
+            query.append_pair("authuser", &user);
+        }
+    }
+    Some(export)
+}
+
+/// The sheet a spreadsheet link names: `gid` in its query or its fragment (`#gid=123`).
+fn sheet_gid(url: &Url) -> Option<String> {
+    let in_query = url.query_pairs().find(|(k, _)| k == "gid").map(|(_, v)| v.into_owned());
+    let in_fragment = || url.fragment()?.split('&').find_map(|p| p.strip_prefix("gid=")).map(str::to_string);
+    in_query.or_else(in_fragment).filter(|gid| !gid.is_empty() && gid.bytes().all(|b| b.is_ascii_digit()))
+}
+
+impl HostResolver for GoogleDocsResolver {
+    fn can_handle(&self, url: &Url) -> bool {
+        google_docs_export(url).is_some()
+    }
+
+    async fn resolve(&self, _client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
+        let export = google_docs_export(url).ok_or_else(|| ResolverError::Parse(format!("Not a Google Docs document URL: {}", url)))?;
+        Ok(vec![export])
+    }
 }
 
 /// MediaFire Resolver (Bypasses landing page to extract direct CDN link)
@@ -379,6 +659,66 @@ impl HostResolver for SourceForgeResolver {
     }
 }
 
+/// Code Host Resolver (Turns a "view file" page on GitHub, GitLab, Codeberg, Bitbucket or Hugging
+/// Face into the file's own download link)
+pub struct CodeHostResolver;
+
+/// The download link of the file whose "view file" page `url` is, rewritten without a request:
+/// the one path segment naming the view becomes the one naming the file's bytes. Folder pages
+/// ("tree", or a trailing slash) are left alone.
+fn code_host_raw_url(url: &Url) -> Option<Url> {
+    let mut segs: Vec<&str> = url.path_segments()?.collect();
+    // Where the segment naming the view is, what it becomes, and how many segments name the ref.
+    let (at, raw, refs) = match url.host_str()?.trim_end_matches('.') {
+        // /{owner}/{repo}/blob/{ref}/{path}; /raw/ also serves Git LFS files.
+        "github.com" if segs.get(2) == Some(&"blob") => (2, "raw", 1),
+        // /{namespace...}/-/blob/{ref}/{path}, or /{namespace...}/blob/{ref}/{path} as older
+        // links have it (GitLab reserves "blob" as a project name).
+        "gitlab.com" => match segs.windows(2).skip(2).position(|w| w == ["-", "blob"]) {
+            Some(i) => (i + 3, "raw", 1),
+            None => {
+                let at = segs.iter().skip(2).position(|s| *s == "blob")? + 2;
+                (!segs[..at].contains(&"-")).then_some((at, "-/raw", 1))?
+            }
+        },
+        // /{owner}/{repo}/src/{branch|tag|commit}/{ref}/{path}. /media/ serves what /raw/ does,
+        // but for a Git LFS file the file itself instead of its pointer.
+        "codeberg.org" if segs.get(2) == Some(&"src") && matches!(segs.get(3), Some(&("branch" | "tag" | "commit"))) => {
+            (2, "media", 2)
+        }
+        // /{owner}/{repo}/src/{ref}/{path}
+        "bitbucket.org" if segs.get(2) == Some(&"src") => (2, "raw", 1),
+        // [/datasets|/spaces]/{owner}/{repo}/blob/{ref}/{path}, or {repo} alone for older repos.
+        // /raw/ serves the file too, but a Git LFS file (model weights) as its pointer.
+        "huggingface.co" | "hf.co" => {
+            let start = usize::from(matches!(segs.first(), Some(&("datasets" | "spaces"))));
+            let view = |&i: &usize| matches!(segs.get(i), Some(&("blob" | "raw")));
+            ([start + 2, start + 1].into_iter().find(view)?, "resolve", 1)
+        }
+        _ => return None,
+    };
+    // The ref, then a path whose last segment names a file.
+    if segs.len() <= at + refs + 1 || segs.last().is_none_or(|s| s.is_empty()) {
+        return None;
+    }
+    segs[at] = raw;
+    let mut raw_url = url.clone();
+    raw_url.set_path(&format!("/{}", segs.join("/")));
+    raw_url.set_fragment(None);
+    Some(raw_url)
+}
+
+impl HostResolver for CodeHostResolver {
+    fn can_handle(&self, url: &Url) -> bool {
+        code_host_raw_url(url).is_some()
+    }
+
+    async fn resolve(&self, _client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
+        let raw = code_host_raw_url(url).ok_or_else(|| ResolverError::Parse(format!("Not a code host file URL: {}", url)))?;
+        Ok(vec![raw])
+    }
+}
+
 /// HTML5 Video Extractor (Finds the video a web page plays via <video>, <source>, OpenGraph or player JSON)
 pub struct HtmlVideoResolver;
 
@@ -433,9 +773,11 @@ impl SmartResolver {
     /// Whether a host resolver (not the generic page one) takes `url`.
     pub fn handles(url: &Url) -> bool {
         GoogleDriveResolver.can_handle(url)
+            || GoogleDocsResolver.can_handle(url)
             || MediaFireResolver.can_handle(url)
             || DropboxResolver.can_handle(url)
             || SourceForgeResolver.can_handle(url)
+            || CodeHostResolver.can_handle(url)
             || ArchiveOrgResolver.can_handle(url)
     }
 
@@ -446,6 +788,9 @@ impl SmartResolver {
         if GoogleDriveResolver.can_handle(url) {
             return with_timeout(GoogleDriveResolver.resolve(client, url)).await;
         }
+        if GoogleDocsResolver.can_handle(url) {
+            return GoogleDocsResolver.resolve(client, url).await;
+        }
         if MediaFireResolver.can_handle(url) {
             return with_timeout(MediaFireResolver.resolve(client, url)).await;
         }
@@ -454,6 +799,9 @@ impl SmartResolver {
         }
         if SourceForgeResolver.can_handle(url) {
             return SourceForgeResolver.resolve(client, url).await;
+        }
+        if CodeHostResolver.can_handle(url) {
+            return CodeHostResolver.resolve(client, url).await;
         }
 
         // These only add mirrors or find an embedded stream; the input URL remains a valid source.
@@ -931,6 +1279,501 @@ mod tests {
         assert!(GoogleDriveResolver::check_answer(&drive, &html_file).is_ok());
         // Only Drive's answers are judged so.
         assert!(GoogleDriveResolver::check_answer(&Url::parse("https://example.com/download").unwrap(), &page).is_ok());
+    }
+
+    fn unwrapped(link: &str) -> Option<String> {
+        unwrap_redirect(&Url::parse(link).unwrap()).map(String::from)
+    }
+
+    #[test]
+    fn test_leaving_this_site_links_give_their_target() {
+        let target = "https://www.mediafire.com/file/abc/mod.zip/file?dkey=1&r=2";
+        let enc = "https%3A%2F%2Fwww.mediafire.com%2Ffile%2Fabc%2Fmod.zip%2Ffile%3Fdkey%3D1%26r%3D2";
+        for link in [
+            format!("https://www.youtube.com/redirect?event=video_description&redir_token=QUFF&q={enc}&v=dQw4w9WgXcQ"),
+            format!("https://youtube.com/redirect?q={enc}"),
+            format!("https://m.youtube.com/redirect/?q={enc}"),
+            format!("https://www.google.com/url?q={enc}&sa=D&source=docs&ust=1&usg=AOv"),
+            format!("https://google.com/url?sa=t&url={enc}"),
+            format!("https://www.google.co.uk/url?q={enc}"),
+            format!("https://www.google.de/url?sa=t&url={enc}"),
+            format!("https://www.google.com.au/url?q={enc}"),
+            format!("https://google.co.in/url?q={enc}"),
+            format!("https://l.facebook.com/l.php?u={enc}&h=AT0"),
+            format!("https://lm.facebook.com/l.php?u={enc}"),
+            format!("https://l.messenger.com/l.php?u={enc}"),
+            format!("https://l.instagram.com/?u={enc}&e=AT1"),
+            format!("https://l.threads.net/?u={enc}"),
+            format!("https://steamcommunity.com/linkfilter/?u={enc}"),
+            format!("https://steamcommunity.com/linkfilter/?url={enc}"),
+            format!("https://out.reddit.com/t3_1abcd?url={enc}&token=AQAA&app_name=web2x"),
+            format!("https://www.linkedin.com/redir/redirect?url={enc}&urlhash=x"),
+            format!("https://www.linkedin.com/safety/go?url={enc}&trk=flagship-messaging-web&messageThreadUrn=urn"),
+            format!("https://vk.com/away.php?to={enc}&cc_key="),
+            format!("https://m.vk.com/away.php?to={enc}"),
+            format!("https://duckduckgo.com/l/?uddg={enc}&rut=abc"),
+            format!("https://t.umblr.com/redirect?z={enc}&t=MjQ"),
+            format!("https://gate.sc/?url={enc}&token=1a2b"),
+        ] {
+            assert_eq!(unwrapped(&link).as_deref(), Some(target), "{link}");
+        }
+    }
+
+    #[test]
+    fn test_wrapped_wrappers_are_unwrapped_up_to_a_limit() {
+        let file = "https://drive.google.com/file/d/abc/view";
+        let youtube = format!("https://www.youtube.com/redirect?q={}", utf8_percent_encode(file));
+        let google = format!("https://www.google.com/url?q={}", utf8_percent_encode(&youtube));
+        assert_eq!(unwrapped(&google).as_deref(), Some(file));
+
+        // Six wrappers deep, the last is left on.
+        let mut link = file.to_string();
+        for _ in 0..MAX_UNWRAPS + 1 {
+            link = format!("https://www.google.com/url?q={}", utf8_percent_encode(&link));
+        }
+        let left = unwrapped(&link).unwrap();
+        assert_eq!(unwrap_once(&Url::parse(&left).unwrap()).map(String::from).as_deref(), Some(file));
+        // An inner wrapper without a usable target stops the unwrapping, not the outer one's.
+        let broken = format!("https://www.google.com/url?q={}", utf8_percent_encode("https://vk.com/away.php?to=nowhere"));
+        assert_eq!(unwrapped(&broken).as_deref(), Some("https://vk.com/away.php?to=nowhere"));
+    }
+
+    #[test]
+    fn test_links_that_are_not_wrappers_or_hold_no_target_are_kept() {
+        for link in [
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ&q=https%3A%2F%2Fexample.com",
+            "https://www.google.com/search?q=https%3A%2F%2Fexample.com",
+            "https://www.google.co.uk/search?q=https%3A%2F%2Fexample.com",
+            // Only Google's own country domains.
+            "https://google.example.com/url?q=https%3A%2F%2Fexample.org",
+            "https://www.google.co.uk.example.com/url?q=https%3A%2F%2Fexample.org",
+            "https://notgoogle.com/url?q=https%3A%2F%2Fexample.org",
+            "https://www.linkedin.com/safety/help?url=https%3A%2F%2Fexample.org",
+            "https://example.com/redirect?q=https%3A%2F%2Fexample.org",
+            "https://www.youtube.com/redirect?event=video_description",
+            "https://www.youtube.com/redirect?q=example.com%2Ffile.zip",
+            "https://www.youtube.com/redirect?q=javascript%3Aalert(1)",
+            "https://www.google.com/url?q=file%3A%2F%2F%2Fetc%2Fpasswd",
+            "https://www.google.com/url?q=https%3A%2F%2F",
+            "https://l.instagram.com/p/abc?u=https%3A%2F%2Fexample.com",
+            "https://lnkd.in/abc123",
+        ] {
+            assert_eq!(unwrapped(link), None, "{link}");
+        }
+        // A target that is not a URL is skipped for the next parameter that holds one.
+        assert_eq!(
+            unwrapped("https://www.google.com/url?q=weather&url=https%3A%2F%2Fexample.com%2Fa.zip").as_deref(),
+            Some("https://example.com/a.zip")
+        );
+    }
+
+    #[test]
+    fn test_code_host_file_pages_become_their_download_links() {
+        // Each download link was checked to serve the file.
+        for (page, file) in [
+            (
+                "https://github.com/yt-dlp/yt-dlp/blob/master/README.md#L10-L20",
+                "https://github.com/yt-dlp/yt-dlp/raw/master/README.md",
+            ),
+            (
+                "https://github.com/o/r/blob/feature/x/src/My%20App.zip",
+                "https://github.com/o/r/raw/feature/x/src/My%20App.zip",
+            ),
+            (
+                "https://gitlab.com/gitlab-org/gitlab-runner/-/blob/main/README.md?ref_type=heads",
+                "https://gitlab.com/gitlab-org/gitlab-runner/-/raw/main/README.md?ref_type=heads",
+            ),
+            (
+                "https://gitlab.com/group/sub/group/project/-/blob/v1.0/dist/app.tar.gz",
+                "https://gitlab.com/group/sub/group/project/-/raw/v1.0/dist/app.tar.gz",
+            ),
+            // The older form, without "/-/", still shows the page.
+            (
+                "https://gitlab.com/gitlab-org/gitlab-runner/blob/main/README.md",
+                "https://gitlab.com/gitlab-org/gitlab-runner/-/raw/main/README.md",
+            ),
+            (
+                "https://gitlab.com/group/sub/project/blob/v1.0/dist/app.tar.gz",
+                "https://gitlab.com/group/sub/project/-/raw/v1.0/dist/app.tar.gz",
+            ),
+            (
+                "https://codeberg.org/forgejo/forgejo/src/branch/forgejo/README.md",
+                "https://codeberg.org/forgejo/forgejo/media/branch/forgejo/README.md",
+            ),
+            (
+                "https://codeberg.org/forgejo/forgejo/src/tag/v12.0.0/README.md",
+                "https://codeberg.org/forgejo/forgejo/media/tag/v12.0.0/README.md",
+            ),
+            (
+                "https://bitbucket.org/multicoreware/x265_git/src/master/COPYING?at=master",
+                "https://bitbucket.org/multicoreware/x265_git/raw/master/COPYING?at=master",
+            ),
+            (
+                "https://huggingface.co/openai-community/gpt2/blob/main/model.safetensors",
+                "https://huggingface.co/openai-community/gpt2/resolve/main/model.safetensors",
+            ),
+            ("https://huggingface.co/gpt2/blob/main/config.json", "https://huggingface.co/gpt2/resolve/main/config.json"),
+            // /raw/ gives a Git LFS file's pointer, not the file.
+            (
+                "https://huggingface.co/openai-community/gpt2/raw/main/model.safetensors",
+                "https://huggingface.co/openai-community/gpt2/resolve/main/model.safetensors",
+            ),
+            ("https://huggingface.co/gpt2/raw/main/config.json", "https://huggingface.co/gpt2/resolve/main/config.json"),
+            (
+                "https://hf.co/openai-community/gpt2/blob/main/config.json",
+                "https://hf.co/openai-community/gpt2/resolve/main/config.json",
+            ),
+            (
+                "https://huggingface.co/datasets/stanfordnlp/imdb/blob/main/README.md",
+                "https://huggingface.co/datasets/stanfordnlp/imdb/resolve/main/README.md",
+            ),
+            ("https://huggingface.co/datasets/squad/blob/main/README.md", "https://huggingface.co/datasets/squad/resolve/main/README.md"),
+            (
+                "https://huggingface.co/spaces/gradio/hello_world/blob/main/app.py",
+                "https://huggingface.co/spaces/gradio/hello_world/resolve/main/app.py",
+            ),
+        ] {
+            let page = Url::parse(page).unwrap();
+            assert!(SmartResolver::handles(&page), "{page}");
+            assert_eq!(code_host_raw_url(&page).map(String::from).as_deref(), Some(file), "{page}");
+        }
+    }
+
+    #[test]
+    fn test_code_host_folders_and_other_pages_are_left_alone() {
+        for page in [
+            "https://github.com/o/r/tree/main/docs",
+            "https://github.com/o/r/blob/main",
+            "https://github.com/o/r/blob/main/docs/",
+            "https://github.com/o/r/raw/main/app.zip",
+            "https://github.com/o/r/releases/download/v1.0/app.zip",
+            "https://github.com/o/blob",
+            "https://gitlab.com/group/project/-/tree/main/docs",
+            "https://gitlab.com/group/-/blob/main/app.zip",
+            "https://gitlab.com/group/project/-/blob/main",
+            "https://gitlab.com/group/project/blob/main",
+            "https://gitlab.com/group/project/-/tree/main/blob/app.zip",
+            "https://gitlab.com/blob/main/app.zip",
+            "https://codeberg.org/o/r/src/branch/main/",
+            "https://codeberg.org/o/r/src/branch/main",
+            "https://codeberg.org/o/r/src/main/app.zip",
+            "https://bitbucket.org/o/r/src/master/",
+            "https://bitbucket.org/o/r/src/master",
+            "https://huggingface.co/openai-community/gpt2/tree/main",
+            "https://huggingface.co/openai-community/gpt2",
+            "https://huggingface.co/datasets/stanfordnlp/imdb/blob/main",
+            "https://example.com/o/r/blob/main/app.zip",
+        ] {
+            let page = Url::parse(page).unwrap();
+            assert_eq!(code_host_raw_url(&page), None, "{page}");
+            assert!(!CodeHostResolver.can_handle(&page), "{page}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_code_host_resolver_sends_nothing() {
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = Client::builder()
+            .proxy(reqwest::Proxy::all(format!("http://{}", proxy.local_addr().unwrap())).unwrap())
+            .build()
+            .unwrap();
+        let page = Url::parse("https://github.com/o/r/blob/main/app.zip").unwrap();
+        let resolved = SmartResolver::resolve(&client, &page).await.unwrap();
+        assert_eq!(resolved, vec![Url::parse("https://github.com/o/r/raw/main/app.zip").unwrap()]);
+        assert!(!contacted(&proxy).await, "the code host was asked before the download's probe");
+    }
+
+    #[test]
+    fn test_google_docs_links_become_their_export() {
+        let (doc, sheet, deck) = (
+            "195j9eDD3ccgjQRttHhJPymLJUCOUjs-jmwTrekvdjFE",
+            "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms",
+            "1EAYk18WDjIG-zp_0vLm3CsfQh_i8eXc67Jo2O9C6Vuc",
+        );
+        let docs = |path: &str| format!("https://docs.google.com/{}", path);
+        // Each export link was checked to serve the document as an attachment.
+        for (link, export) in [
+            (format!("document/d/{doc}/edit?usp=sharing"), format!("document/d/{doc}/export?format=docx")),
+            (format!("document/u/0/d/{doc}/edit"), format!("document/u/0/d/{doc}/export?format=docx")),
+            (format!("document/d/{doc}"), format!("document/d/{doc}/export?format=docx")),
+            (format!("spreadsheets/d/{sheet}/edit?usp=sharing"), format!("spreadsheets/d/{sheet}/export?format=xlsx")),
+            (format!("spreadsheets/d/{sheet}/edit#gid=0"), format!("spreadsheets/d/{sheet}/export?format=csv&gid=0")),
+            (
+                format!("spreadsheets/u/1/d/{sheet}/edit?gid=1234#gid=1234"),
+                format!("spreadsheets/u/1/d/{sheet}/export?format=csv&gid=1234"),
+            ),
+            (format!("spreadsheets/d/{sheet}/htmlview#gid=abc"), format!("spreadsheets/d/{sheet}/export?format=xlsx")),
+            (format!("presentation/d/{deck}/edit#slide=id.p"), format!("presentation/d/{deck}/export?format=pptx")),
+            (format!("presentation/u/1/d/{deck}/view"), format!("presentation/u/1/d/{deck}/export?format=pptx")),
+            (format!("presentation/d/{deck}/present?slide=id.p"), format!("presentation/d/{deck}/export?format=pptx")),
+            (format!("presentation/d/{deck}/embed?start=false"), format!("presentation/d/{deck}/export?format=pptx")),
+            (format!("document/d/{doc}/mobilebasic"), format!("document/d/{doc}/export?format=docx")),
+            (format!("document/d/{doc}/preview"), format!("document/d/{doc}/export?format=docx")),
+            (format!("document/d/{doc}/copy"), format!("document/d/{doc}/export?format=docx")),
+            (format!("document/d/{doc}/edit/"), format!("document/d/{doc}/export?format=docx")),
+            (format!("document/d/{doc}/"), format!("document/d/{doc}/export?format=docx")),
+            // The signed-in account the link names is kept (the export drops it when there is none).
+            (format!("document/d/{doc}/edit?usp=sharing&authuser=1"), format!("document/d/{doc}/export?format=docx&authuser=1")),
+            (
+                format!("spreadsheets/d/{sheet}/edit?authuser=me%40example.com#gid=7"),
+                format!("spreadsheets/d/{sheet}/export?format=csv&gid=7&authuser=me%40example.com"),
+            ),
+            // An export in a format of the user's choosing is kept; a gid means nothing to a document.
+            (format!("document/d/{doc}/export?format=pdf#top"), format!("document/d/{doc}/export?format=pdf")),
+            (format!("presentation/d/{deck}/export/pdf"), format!("presentation/d/{deck}/export/pdf")),
+            (format!("document/d/{doc}/edit#gid=5"), format!("document/d/{doc}/export?format=docx")),
+        ] {
+            let link = Url::parse(&docs(&link)).unwrap();
+            assert!(SmartResolver::handles(&link), "{link}");
+            assert_eq!(google_docs_export(&link).map(String::from), Some(docs(&export)), "{link}");
+        }
+        for page in [
+            "https://docs.google.com/document/d/e/2PACX-1vR/pub",
+            "https://docs.google.com/spreadsheets/d/e/2PACX-1vR/pubhtml",
+            "https://docs.google.com/forms/d/e/1FAIpQLSf/viewform",
+            "https://docs.google.com/drawings/d/abc/edit",
+            "https://docs.google.com/document/u/0/",
+            "https://docs.google.com/spreadsheets/d/",
+            "https://example.com/document/d/abc/edit",
+            // Links that already give what they are for: a gviz query (a CSV attachment, or JSON or
+            // HTML for scripts), and older /pub copies published to the web.
+            "https://docs.google.com/spreadsheets/d/abc/gviz/tq?tqx=out:csv&sheet=Class%20Data",
+            "https://docs.google.com/spreadsheets/u/1/d/abc/gviz/tq?tqx=out:json&gid=0",
+            "https://docs.google.com/spreadsheets/d/abc/pub?output=csv",
+            "https://docs.google.com/spreadsheets/d/abc/pubhtml",
+            "https://docs.google.com/document/d/abc/pub",
+            "https://docs.google.com/presentation/d/abc/pub?start=false",
+            "https://docs.google.com/document/d/abc/template/preview",
+            "https://docs.google.com/document/d/abc/edit/extra",
+        ] {
+            let link = Url::parse(page).unwrap();
+            assert!(!GoogleDocsResolver.can_handle(&link), "{page}");
+            assert!(!SmartResolver::handles(&link), "{page}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_google_docs_links_that_give_a_file_are_downloaded_as_they_are() {
+        let link = Url::parse("https://docs.google.com/spreadsheets/d/abc/gviz/tq?tqx=out:csv&sheet=Sheet1").unwrap();
+        assert_eq!(SmartResolver::resolve(&Client::new(), &link).await.unwrap(), vec![link.clone()]);
+        // Their HTML answers (a gviz table for scripts, a copy published to the web) are what they
+        // are for, not an export's sign-in page.
+        let html = headers(&[(CONTENT_TYPE, "text/html; charset=utf-8")]);
+        for page in ["https://docs.google.com/spreadsheets/d/abc/gviz/tq?tqx=out:html", "https://docs.google.com/document/d/abc/pub"] {
+            assert_eq!(refusal(page, None, &html), None, "{page}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_older_drive_links_on_docs_google_com_go_to_drive() {
+        let direct = google_drive_direct_url("1BxyzABC_12345").unwrap();
+        for link in [
+            "https://docs.google.com/uc?export=download&id=1BxyzABC_12345",
+            "https://docs.google.com/file/d/1BxyzABC_12345/edit",
+        ] {
+            let resolved = SmartResolver::resolve(&Client::new(), &Url::parse(link).unwrap()).await.unwrap();
+            assert_eq!(resolved, vec![direct.clone()], "{link}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_google_docs_resolver_sends_nothing() {
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = Client::builder()
+            .proxy(reqwest::Proxy::all(format!("http://{}", proxy.local_addr().unwrap())).unwrap())
+            .build()
+            .unwrap();
+        let link = Url::parse("https://docs.google.com/document/d/abc/edit").unwrap();
+        let resolved = SmartResolver::resolve(&client, &link).await.unwrap();
+        assert_eq!(resolved, vec![Url::parse("https://docs.google.com/document/d/abc/export?format=docx").unwrap()]);
+        assert!(!contacted(&proxy).await, "Google Docs was asked before the download's probe");
+    }
+
+    fn utf8_percent_encode(s: &str) -> String {
+        percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string()
+    }
+
+    /// `check_answer` for `url`, which ended at `final_url` (or at itself), as an error message.
+    fn refusal(url: &str, final_url: Option<&str>, headers: &HeaderMap) -> Option<String> {
+        let url = Url::parse(url).unwrap();
+        let final_url = final_url.map_or(url.clone(), |f| Url::parse(f).unwrap());
+        check_answer(&url, &final_url, headers).err().map(|e| e.to_string())
+    }
+
+    #[test]
+    fn test_web_pages_in_place_of_drive_files_and_private_documents_are_refused() {
+        let page = headers(&[(CONTENT_TYPE, "text/html; charset=utf-8")]);
+        let drive = "https://drive.usercontent.google.com/download?id=abc&export=download&confirm=t";
+        let err = refusal(drive, None, &page).unwrap();
+        assert!(err.contains("Google Drive served a web page instead of the file"), "{err}");
+
+        // A Google document that asks to sign in: on docs.google.com, or sent on to Google's sign-in.
+        let export = "https://docs.google.com/document/d/abc/export?format=docx";
+        for (url, final_url) in [
+            (export, None),
+            (export, Some("https://accounts.google.com/v3/signin/identifier?continue=https%3A%2F%2Fdocs.google.com")),
+            ("https://example.com/report", Some("https://accounts.google.com/ServiceLogin?service=wise")),
+        ] {
+            let err = refusal(url, final_url, &page).unwrap_or_else(|| panic!("{url} -> {final_url:?}"));
+            assert!(err.contains("private") && err.contains("Anyone with the link") && err.contains("--load-cookies"), "{err}");
+        }
+        let docx = headers(&[
+            (CONTENT_TYPE, "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+            (CONTENT_DISPOSITION, "attachment; filename=\"Report.docx\""),
+        ]);
+        assert_eq!(refusal(export, Some("https://doc-0g-3o-docstext.googleusercontent.com/export/x"), &docx), None);
+    }
+
+    #[test]
+    fn test_web_pages_from_file_shares_not_supported_yet_are_refused() {
+        let page = headers(&[(CONTENT_TYPE, "text/html")]);
+        for (url, service) in [
+            ("https://mega.nz/file/abc#key", "MEGA"),
+            ("https://mega.nz/folder/abc#key", "MEGA"),
+            ("https://1drv.ms/u/s!abc", "OneDrive"),
+            ("https://onedrive.live.com/?cid=abc&id=def", "OneDrive"),
+            ("https://contoso.sharepoint.com/:u:/g/abc", "SharePoint"),
+            ("https://contoso-my.sharepoint.com/:x:/p/abc", "SharePoint"),
+            ("https://we.tl/t-abc", "WeTransfer"),
+            ("https://wetransfer.com/downloads/abc/def", "WeTransfer"),
+            ("https://www.terabox.com/s/1abc", "Terabox"),
+            ("https://1024terabox.com/s/1abc", "Terabox"),
+            ("https://www.nephobox.com/s/1abc", "Terabox"),
+            ("https://gofile.io/d/abc", "Gofile"),
+            ("https://pixeldrain.com/u/abc", "Pixeldrain"),
+            ("https://www.icloud.com/iclouddrive/abc#file", "iCloud"),
+            ("https://disk.yandex.ru/client/disk", "Yandex Disk"),
+            ("https://u.pcloud.link/publink/show?code=abc", "pCloud"),
+            ("https://acme.app.box.com/v/files", "Box"),
+            ("https://app.box.com/folder/123", "Box"),
+            ("https://contoso.sharepoint.com/sites/team/_layouts/15/stream.aspx", "SharePoint"),
+        ] {
+            assert_eq!(refusal(url, None, &page), Some(format!("Direct download link not found: {} links are not supported yet", service)));
+        }
+        // A shortened link that lands on one, and share links yt-dlp would take that sent the
+        // browser on to sign in instead: yt-dlp is handed the page answered, not the link.
+        for (url, final_url, service) in [
+            ("https://bit.ly/abc", "https://mega.nz/file/abc", "MEGA"),
+            ("https://yadi.sk/d/abc", "https://passport.yandex.ru/auth?retpath=x", "Yandex Disk"),
+            ("https://app.box.com/s/abc", "https://account.box.com/login?redirect_url=%2Fs%2Fabc", "Box"),
+            (
+                "https://contoso.sharepoint.com/:v:/g/personal/user_contoso_com/EabcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRS",
+                "https://login.microsoftonline.com/common/oauth2/authorize?client_id=x",
+                "SharePoint",
+            ),
+        ] {
+            let err = refusal(url, Some(final_url), &page).unwrap_or_else(|| panic!("{url}"));
+            assert!(err.contains(&format!("{service} links are not supported yet")), "{err}");
+        }
+        // The files these services serve are downloads like any other, and look-alike hosts are not theirs.
+        let file = headers(&[(CONTENT_TYPE, "application/octet-stream")]);
+        assert_eq!(refusal("https://pixeldrain.com/api/file/abc?download", None, &file), None);
+        for elsewhere in ["https://notbox.com/s/abc", "https://example.com/mega.nz", "https://megalodon.nz/file/abc"] {
+            assert_eq!(refusal(elsewhere, None, &page), None, "{elsewhere}");
+        }
+        // A link of theirs that names a file is one to the file, gone stale: said so, not that the
+        // service is not supported.
+        for (url, file) in [
+            ("https://p-lux3.pcloud.com/cBZabcdefghij/Backup%202024.zip", "Backup 2024.zip"),
+            ("https://app.box.com/shared/static/abcdefghijklmnop.zip", "abcdefghijklmnop.zip"),
+            ("https://contoso.sharepoint.com/sites/team/Shared%20Documents/report.docx", "report.docx"),
+        ] {
+            let err = refusal(url, None, &page).unwrap_or_else(|| panic!("{url}"));
+            assert!(err.contains(&format!("the server sent a web page instead of {file} (")), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_share_pages_yt_dlp_downloads_go_on_to_the_page_handling() {
+        // As yt-dlp's Box, SharePoint and Yandex Disk extractors match them.
+        let page = headers(&[(CONTENT_TYPE, "text/html; charset=utf-8")]);
+        for (url, final_url) in [
+            ("https://app.box.com/s/abc123", None),
+            ("https://acme.app.box.com/s/abc123/file/456", None),
+            ("https://acme.ent.box.com/s/abc123", None),
+            ("https://box.com/s/abc123", Some("https://app.box.com/s/abc123")),
+            ("https://bit.ly/abc", Some("https://app.box.com/s/abc123")),
+            ("https://contoso.sharepoint.com/:v:/g/personal/user_contoso_com/EabcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRS?e=x", None),
+            (
+                "https://contoso.sharepoint.com/:v:/g/personal/user_contoso_com/EabcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRS",
+                Some("https://contoso-my.sharepoint.com/personal/user_contoso_com/_layouts/15/stream.aspx?id=%2Fpersonal%2Fv.mp4"),
+            ),
+            ("https://yadi.sk/d/abc", Some("https://disk.yandex.ru/d/abc")),
+            ("https://yadi.sk/i/abc", None),
+            ("https://disk.yandex.com/d/abc", None),
+            ("https://disk.360.yandex.ru/d/abc", None),
+            ("https://disk.yandex.ru/public?hash=abc%3D", None),
+        ] {
+            assert_eq!(refusal(url, final_url, &page), None, "{url} -> {final_url:?}");
+            let landed = Url::parse(final_url.unwrap_or(url)).unwrap();
+            assert!(HtmlVideoResolver::is_page(&landed, &page), "{landed}");
+        }
+    }
+
+    #[test]
+    fn test_code_host_folders_are_refused() {
+        let page = headers(&[(CONTENT_TYPE, "text/html; charset=utf-8")]);
+        for (url, final_url) in [
+            // A file link to a folder, which GitHub sends on to the folder's page.
+            ("https://github.com/o/r/blob/main/docs", Some("https://github.com/o/r/tree/main/docs")),
+            ("https://github.com/o/r/tree/main", None),
+            ("https://gitlab.com/group/sub/project/-/tree/main/docs", None),
+            ("https://huggingface.co/openai-community/gpt2/tree/main/onnx", None),
+            ("https://huggingface.co/datasets/stanfordnlp/imdb/tree/main", None),
+            ("https://hf.co/gpt2/tree/main", None),
+        ] {
+            let err = refusal(url, final_url, &page).unwrap_or_else(|| panic!("{url}"));
+            assert!(err.contains("the link leads to a folder, not a file"), "{err}");
+        }
+        for page_url in [
+            "https://github.com/o/r",
+            "https://github.com/o/tree",
+            "https://github.com/o/r/tree/",
+            "https://gitlab.com/group/tree/main",
+            "https://huggingface.co/owner/tree",
+            "https://example.com/o/r/tree/main",
+        ] {
+            assert_eq!(refusal(page_url, None, &page), None, "{page_url}");
+        }
+        // A folder's listing sent as a file is one.
+        let json = headers(&[(CONTENT_TYPE, "application/json")]);
+        assert_eq!(refusal("https://huggingface.co/api/models/gpt2/tree/main", None, &json), None);
+    }
+
+    #[test]
+    fn test_web_pages_in_place_of_a_named_file_are_refused() {
+        let page = headers(&[(CONTENT_TYPE, "text/html; charset=utf-8")]);
+        for (url, final_url, file) in [
+            ("https://example.com/files/app.zip", None, "app.zip"),
+            ("https://example.com/dl/My%20Setup%201.2.exe", None, "My Setup 1.2.exe"),
+            ("https://example.com/src/project-1.0.tar.gz", None, "project-1.0.tar.gz"),
+            ("https://example.com/os/Distro.ISO", None, "Distro.ISO"),
+            ("https://example.com/files/app.zip", Some("https://example.com/login?next=%2Ffiles%2Fapp.zip"), "app.zip"),
+            ("https://example.com/get?id=3", Some("https://cdn.example.com/m/model.safetensors"), "model.safetensors"),
+            ("https://example.com/t/linux.torrent", None, "linux.torrent"),
+        ] {
+            let err = refusal(url, final_url, &page).unwrap_or_else(|| panic!("{url}"));
+            assert!(err.contains(&format!("the server sent a web page instead of {} (the link may need a login", file)), "{err}");
+        }
+        // The file itself, or a page sent as an attachment, is what was asked for.
+        let zip = headers(&[(CONTENT_TYPE, "application/zip")]);
+        assert_eq!(refusal("https://example.com/files/app.zip", None, &zip), None);
+        assert_eq!(refusal("https://example.com/files/app.zip", None, &HeaderMap::new()), None);
+        let attached = headers(&[(CONTENT_TYPE, "text/html"), (CONTENT_DISPOSITION, "attachment; filename=\"app.zip\"")]);
+        assert_eq!(refusal("https://example.com/files/app.zip", None, &attached), None);
+
+        // Pages go on to be looked into: an .html file, and names that only look like files.
+        for url in [
+            "https://example.com/docs/page.html",
+            "https://example.com/watch",
+            "https://example.com/",
+            "https://example.com/view.php?file=app.zip",
+            "https://example.com/releases/v1.2",
+            "https://example.com/people/john.doe",
+            "https://example.com/docs/readme.md",
+        ] {
+            assert_eq!(refusal(url, None, &page), None, "{url}");
+        }
     }
 
     #[test]
