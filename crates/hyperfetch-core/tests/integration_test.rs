@@ -3349,3 +3349,37 @@ async fn test_a_video_link_naming_its_playlist_is_one_download_unless_the_playli
     let tasks = ingest(&[link], &descriptor_client(None).unwrap(), &ListOptions::default()).await.expect("the video");
     assert_eq!(tasks, [Task { urls: vec![Url::parse(link).unwrap()], ..Task::default() }]);
 }
+
+/// A playlist entry saved into its list's folder is named by yt-dlp by its title and id, as the
+/// entry's task says: two entries of one title are two files, and the one found there already
+/// (downloaded before the archive knew it) is this video's, so it goes into the archive.
+#[tokio::test]
+async fn test_a_playlist_entry_is_named_by_its_title_and_id() {
+    let _history = setup().await;
+    let (tools, temp) = (tempdir().unwrap(), tempdir().unwrap());
+    let video = payload(PREFETCH + 64 * KB, 354);
+    let video_url = serve(Arc::new(Mock::new(video.clone())), "v/entry").await;
+    let (_, page_url) = plain_page("clips/entry").await;
+    let output = temp.path().join("Intro [entry-2].mp4");
+    std::fs::write(&output, &video).unwrap();
+    let info = serde_json::json!({
+        "_type": "video", "extractor_key": "FakeSite", "id": "entry-2", "title": "Intro",
+        "url": video_url.as_str(), "protocol": "http", "format_id": "0", "ext": "mp4",
+        "requested_downloads": [{ "filename": output }],
+    });
+    std::fs::write(tools.path().join("info.json"), serde_json::to_vec(&info).unwrap()).unwrap();
+    let template = "%(title)s [%(id)s].%(ext)s";
+    let opts = DownloadOptions {
+        ytdlp_path: Some(fake_ytdlp(tools.path(), &output)),
+        media_name: Some(template.to_string()),
+        ..options(temp.path(), 4, 64 * KB)
+    };
+    let path = run(&DownloadEngine::new(vec![page_url], opts), None).await.expect("the entry should download");
+    assert_eq!(path, output);
+    assert_file(&path, &video);
+    let named = temp.path().join(template).to_string_lossy().into_owned();
+    let runs = runs_of(tools.path());
+    assert!(!runs.is_empty() && runs.iter().all(|run| has_arg(run, "-o", &named)), "{runs:?}");
+    let lines = archived();
+    assert_eq!(lines.iter().filter(|line| *line == "fakesite entry-2").count(), 1, "{lines:?}");
+}

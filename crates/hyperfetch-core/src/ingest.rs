@@ -26,6 +26,10 @@ pub struct Task {
     /// the file name (a playlist entry, a feed episode named by the server). Cleaned like `name`
     /// (see `clean_path`).
     pub folder: Option<PathBuf>,
+    /// How yt-dlp names the file of a media download that `name` does not name: an output
+    /// template (a playlist entry's title and id, `%(title)s [%(id)s].%(ext)s`). None names it by
+    /// its title.
+    pub media_name: Option<String>,
     /// Checksum published by a metalink.
     pub checksum: Option<String>,
     /// Size published by a metalink or torrent.
@@ -212,7 +216,8 @@ pub async fn input_tokens(line: &str) -> Vec<String> {
 /// client error (a login, a private GitHub file's 404; a timeout or a rate limit is an error) or
 /// a web page yields the link itself, for the engine, which sends the user's cookies and
 /// Authorization and refuses a page in place of the file. The link itself is always the one
-/// typed, never where its resolver led. `Ok` is never empty.
+/// typed, never where its resolver led. `Ok` is empty only for a listing everything of which was
+/// downloaded before (see [`ListOptions::only_new`]): nothing to do, not a failure.
 pub async fn ingest(tokens: &[impl AsRef<str>], http: &reqwest::Client, options: &ListOptions) -> Result<Vec<Task>, String> {
     if let [token] = tokens {
         if let Some((source, kind)) = descriptor_source(token.as_ref()) {
