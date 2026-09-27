@@ -286,6 +286,10 @@ fn torrent_tasks(bytes: &[u8], remote: Option<&Url>) -> Result<Vec<Task>, String
     if let Some(url) = remote.filter(|_| info.files.iter().all(|f| f.urls.is_empty())) {
         return Ok(vec![Task { urls: vec![url.clone()], ..Task::default() }]);
     }
+    // A BitTorrent v2-only torrent lists its files in a `file tree`, which is not read.
+    if info.files.is_empty() {
+        return Err("the torrent lists no files this app can read (BitTorrent v2-only torrents are not supported)".to_string());
+    }
     let single_file = matches!(&info.files[..], [f] if f.path == [info.name.clone()]);
     info.files
         .iter()
@@ -503,6 +507,20 @@ d6:lengthi4e4:pathl5:y.bineee4:name4:root12:piece lengthi16384e6:pieces20:aaaaaa
         assert_eq!(tasks[0].name, Some(Path::new("root").join("a").join("x.bin")));
         assert_eq!((tasks[0].size, tasks[1].size), (Some(3), Some(4)));
         assert_eq!(tasks[1].urls[0].as_str(), "https://s.example/d/root/y.bin");
+    }
+
+    /// A torrent that lists no files this app reads is an error, not a download of nothing; a
+    /// remote one is saved itself, as one without web seeds is.
+    #[test]
+    fn a_torrent_without_files_to_read_is_an_error() {
+        let v2_only = b"d4:infod9:file treed5:a.bind0:d6:lengthi3e11:pieces root32:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaeee\
+12:meta versioni2e4:name4:pack12:piece lengthi16384eee";
+        let err = torrent_tasks(v2_only, None).unwrap_err();
+        assert!(err.contains("BitTorrent v2-only torrents are not supported"), "{err}");
+        let (_dir, path) = write_temp("pack.torrent", v2_only);
+        assert_eq!(run(path.to_str().unwrap()).unwrap_err(), err);
+        let url = Url::parse("https://releases.example/pack.torrent").unwrap();
+        assert_eq!(torrent_tasks(v2_only, Some(&url)).unwrap(), [Task { urls: vec![url], ..Task::default() }]);
     }
 
     /// A torrent without HTTP web seeds cannot be downloaded over HTTP; a remote one is then
