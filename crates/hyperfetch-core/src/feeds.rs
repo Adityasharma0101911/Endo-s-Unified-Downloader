@@ -25,7 +25,10 @@ const MAX_HEAD_BYTES: usize = 64 * 1024;
 const MAX_TITLE_BYTES: usize = 150;
 
 /// Extensions of audio and video files an enclosure may have.
-const MEDIA_EXTENSIONS: &[&str] = &["mp3", "m4a", "m4b", "aac", "ogg", "oga", "opus", "flac", "wav", "mp4", "m4v", "mov", "webm", "mkv"];
+const MEDIA_EXTENSIONS: &[&str] = &[
+    "mp3", "m4a", "m4b", "aac", "ogg", "oga", "opus", "flac", "wav", "wma", "aif", "aiff", "amr", "mp2", "mka", "weba", "mp4", "m4v", "mov",
+    "webm", "mkv", "avi", "wmv", "mpg", "mpeg", "3gp", "3g2", "ogv", "flv",
+];
 
 /// Whether `url` names a feed (or a podcast show page) this module lists, from its shape alone:
 /// an Apple Podcasts show or episode, a feed host (`feeds.`, `feed.`, `rss.`, as Simplecast,
@@ -193,7 +196,7 @@ struct Episode {
 #[derive(Debug)]
 struct Enclosure {
     url: Url,
-    extension: Option<&'static str>,
+    extension: &'static str,
     length: Option<u64>,
 }
 
@@ -309,13 +312,22 @@ fn enclosure(episode: &mut Option<Episode>, parent: &str, name: &str, element: &
     let Some(url) = href.and_then(|href| base.join(&href).ok()).filter(|u| matches!(u.scheme(), "http" | "https")) else { return };
     let url = resolver::unwrap_redirect(&url).unwrap_or(url);
     let mime = attr("type").map(|t| t.split(';').next().unwrap_or_default().trim().to_ascii_lowercase());
-    let from_link = link_extension(&url);
-    let media = mime.as_deref().is_some_and(|m| m.starts_with("audio/") || m.starts_with("video/")) || from_link.is_some();
-    if media {
-        let extension = from_link.or_else(|| mime.as_deref().and_then(mime_extension));
+    if let Some(extension) = media_extension(&url, mime.as_deref()) {
         let length = attr("length").and_then(|l| l.parse().ok()).filter(|&l| l > 0);
         episode.enclosure = Some(Enclosure { url, extension, length });
     }
+}
+
+/// The extension a file at `url` of type `mime` is saved with, when it is audio or video: the
+/// audio or video one its link ends in, else its type's, else "mp3" or "mp4" for any other audio
+/// or video type. Never another one, so a feed cannot have an episode saved as a program.
+fn media_extension(url: &Url, mime: Option<&str>) -> Option<&'static str> {
+    let fallback = match mime.and_then(|m| m.split_once('/')) {
+        Some(("audio", _)) => Some("mp3"),
+        Some(("video", _)) => Some("mp4"),
+        _ => None,
+    };
+    link_extension(url).or_else(|| mime.and_then(mime_extension)).or(fallback)
 }
 
 /// The audio or video extension the last part of `url`'s path ends in.
@@ -336,11 +348,22 @@ fn mime_extension(mime: &str) -> Option<&'static str> {
         "audio/opus" => "opus",
         "audio/flac" | "audio/x-flac" => "flac",
         "audio/wav" | "audio/x-wav" | "audio/wave" => "wav",
+        "audio/x-ms-wma" => "wma",
+        "audio/aiff" | "audio/x-aiff" => "aif",
+        "audio/amr" => "amr",
+        "audio/x-matroska" => "mka",
         "audio/webm" | "video/webm" => "webm",
         "video/mp4" => "mp4",
         "video/x-m4v" => "m4v",
         "video/quicktime" => "mov",
         "video/x-matroska" => "mkv",
+        "video/x-msvideo" | "video/avi" | "video/msvideo" => "avi",
+        "video/x-ms-wmv" => "wmv",
+        "video/mpeg" => "mpg",
+        "video/3gpp" | "audio/3gpp" => "3gp",
+        "video/3gpp2" | "audio/3gpp2" => "3g2",
+        "video/ogg" => "ogv",
+        "video/x-flv" => "flv",
         _ => return None,
     })
 }
@@ -500,28 +523,31 @@ fn feed_tasks(feed: Feed, latest: Option<usize>, done: &HashSet<String>) -> Resu
 }
 
 /// "YYYY-MM-DD Title.ext", cleaned for every OS, with " (2)" and up added to a name `taken`
-/// already has (compared ignoring case, as Windows does); an episode without a title is named
-/// after its file.
-fn episode_name(title: &str, date: Option<Date>, extension: Option<&str>, url: &Url, taken: &mut HashSet<String>) -> Result<PathBuf, String> {
-    let file = url.path_segments().and_then(|mut s| s.next_back()).map(|last| last.rsplit_once('.').map_or(last, |(stem, _)| stem));
-    let title = if title.is_empty() { file.filter(|f| !f.is_empty()).unwrap_or("Episode") } else { title };
-    let cut = (0..=MAX_TITLE_BYTES.min(title.len())).rev().find(|&i| title.is_char_boundary(i)).unwrap_or(0);
-    // "Coming Clean." is not saved as "Coming Clean..mp3".
-    let title = title[..cut].trim_end_matches(|c: char| c == '.' || c.is_whitespace());
+/// already has (compared ignoring case, as Windows does); an episode without a title (or with
+/// dots alone) is named after its file.
+fn episode_name(title: &str, date: Option<Date>, extension: &str, url: &Url, taken: &mut HashSet<String>) -> Result<PathBuf, String> {
+    let file = url.path_segments().and_then(|mut s| s.next_back()).map_or("", |last| last.rsplit_once('.').map_or(last, |(stem, _)| stem));
+    let title = [title, file].into_iter().map(shorten).find(|t| !t.is_empty()).unwrap_or("Episode");
     let stem = match date {
         Some(d) => format!("{:04}-{:02}-{:02} {}", d.year, d.month, d.day, title),
         None => title.to_string(),
     };
-    let extension = extension.map(|e| format!(".{}", e)).unwrap_or_default();
     let mut n = 1;
     loop {
         let suffix = if n == 1 { String::new() } else { format!(" ({})", n) };
-        let name = clean_path([format!("{}{}{}", stem, suffix, extension).as_str()])?;
+        let name = clean_path([format!("{}{}.{}", stem, suffix, extension).as_str()])?;
         if taken.insert(name.to_string_lossy().to_lowercase()) {
             return Ok(name);
         }
         n += 1;
     }
+}
+
+/// `title` cut to at most [`MAX_TITLE_BYTES`], without the dots and spaces it would then end in:
+/// "Coming Clean." is not saved as "Coming Clean..mp3".
+fn shorten(title: &str) -> &str {
+    let cut = (0..=MAX_TITLE_BYTES.min(title.len())).rev().find(|&i| title.is_char_boundary(i)).unwrap_or(0);
+    title[..cut].trim_end_matches(|c: char| c == '.' || c.is_whitespace())
 }
 
 /// An Apple Podcasts show link (podcasts.apple.com/{country}/podcast/{name}/id{show}), with the
@@ -961,15 +987,51 @@ mod tests {
         let long = "Ω".repeat(200);
         let mut taken = HashSet::new();
         let date = parse_date("2026-09-27");
-        let name = episode_name(&long, date, Some("mp3"), &url("https://a.example/x.mp3"), &mut taken).unwrap();
+        let name = episode_name(&long, date, "mp3", &url("https://a.example/x.mp3"), &mut taken).unwrap();
         let name = name.to_string_lossy().into_owned();
         assert!(name.starts_with("2026-09-27 ΩΩ") && name.ends_with("Ω.mp3") && name.len() <= 11 + MAX_TITLE_BYTES + 4, "{name}");
-        let again = episode_name(&long, date, Some("mp3"), &url("https://a.example/y.mp3"), &mut taken).unwrap();
+        let again = episode_name(&long, date, "mp3", &url("https://a.example/y.mp3"), &mut taken).unwrap();
         assert!(again.to_string_lossy().ends_with("Ω (2).mp3"));
         // Without a title, the file's name; differing only in case, told apart for Windows.
-        assert_eq!(episode_name("", None, None, &url("https://a.example/ep/Show-12.MP3"), &mut taken).unwrap(), Path::new("Show-12"));
-        assert_eq!(episode_name("show-12", None, None, &url("https://a.example/z"), &mut taken).unwrap(), Path::new("show-12 (2)"));
-        assert_eq!(episode_name("CON", None, Some("mp3"), &url("https://a.example/z"), &mut taken).unwrap(), Path::new("_CON.mp3"));
+        assert_eq!(episode_name("", None, "mp3", &url("https://a.example/ep/Show-12.MP3"), &mut taken).unwrap(), Path::new("Show-12.mp3"));
+        assert_eq!(episode_name("show-12", None, "mp3", &url("https://a.example/z"), &mut taken).unwrap(), Path::new("show-12 (2).mp3"));
+        assert_eq!(episode_name("CON", None, "mp3", &url("https://a.example/z"), &mut taken).unwrap(), Path::new("_CON.mp3"));
+        // A title of dots alone is none; the extension always comes last, never from the title.
+        assert_eq!(episode_name("...", None, "wma", &url("https://a.example/play?id=1"), &mut taken).unwrap(), Path::new("play.wma"));
+        assert_eq!(episode_name(". . .", date, "mp3", &url("https://a.example/"), &mut taken).unwrap(), Path::new("2026-09-27 Episode.mp3"));
+        assert_eq!(episode_name("Setup.exe", date, "mp3", &url("https://a.example/f"), &mut taken).unwrap(), Path::new("2026-09-27 Setup.exe.mp3"));
+    }
+
+    /// An enclosure is saved with the audio or video extension its link or type gives, or "mp3"
+    /// or "mp4" for another audio or video type, never without one or with another kind.
+    #[test]
+    fn enclosures_get_a_media_extension() {
+        let item = |url: &str, mime: &str| {
+            let rss = format!(r#"<rss><channel><title>S</title><item><title>Interview with Dr. Smith</title><enclosure url="{url}" type="{mime}"/></item></channel></rss>"#);
+            let feed = parse(&rss, "https://s.example/feed").unwrap().unwrap();
+            feed.episodes.first().and_then(|e| e.enclosure.as_ref()).map(|e| e.extension)
+        };
+        assert_eq!(item("https://s.example/ep.wma", "audio/x-ms-wma"), Some("wma"));
+        assert_eq!(item("https://s.example/ep.WMA", ""), Some("wma"));
+        assert_eq!(item("https://s.example/ep.avi", "video/x-msvideo"), Some("avi"));
+        assert_eq!(item("https://s.example/play?id=1", "video/mpeg"), Some("mpg"));
+        assert_eq!(item("https://s.example/ep.3gp", "video/3gpp"), Some("3gp"));
+        assert_eq!(item("https://s.example/play?id=1", "audio/x-foo"), Some("mp3"));
+        assert_eq!(item("https://s.example/stream.php", "video/x-foo"), Some("mp4"));
+        // A program's link with an audio type is still saved as audio.
+        assert_eq!(item("https://s.example/Setup.exe", "audio/x-foo"), Some("mp3"));
+        assert_eq!(item("https://s.example/Setup.exe", "application/octet-stream"), None);
+        assert_eq!(item("https://s.example/notes.pdf", "application/pdf"), None);
+        // One episode titled with dots alone does not stop the others being listed.
+        let feed = parse(
+            r#"<rss><channel><title>S</title>
+<item><title>Interview with Dr. Smith</title><pubDate>Sun, 27 Sep 2026 10:00:00 GMT</pubDate><enclosure url="https://s.example/ep" type="audio/x-foo"/></item>
+<item><title>...</title><enclosure url="https://s.example/play?id=1" type="audio/x-ms-wma"/></item>
+</channel></rss>"#,
+            "https://s.example/feed",
+        );
+        let tasks = feed_tasks(feed.unwrap().unwrap(), None, &HashSet::new()).unwrap();
+        assert_eq!(names(&tasks), ["2026-09-27 Interview with Dr. Smith.mp3", "play.wma"]);
     }
 
     /// The iTunes Lookup API's answer for The Daily with `entity=podcastEpisode`, cut to the show
