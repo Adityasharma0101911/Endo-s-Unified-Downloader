@@ -436,6 +436,18 @@ fn advanced_options(app: &mut App, ui: &mut egui::Ui) {
 
     ui.add_space(4.0);
     ui.horizontal(|ui| {
+        ui.label(RichText::new("Google API Key:").size(12.0));
+        let key = egui::TextEdit::singleline(&mut app.settings.google_api_key)
+            .password(true)
+            .hint_text(hint_text("Optional: lists whole Google Drive folders, with sizes and checksums, through the Drive API"));
+        ui.add_sized([ui.available_width() - 10.0, 24.0], key).on_hover_text(
+            "Sent only to Google's Drive API. Without a key a Drive folder is listed from its public page, \
+             which gives no sizes or checksums and may not show every file of a very large folder.",
+        );
+    });
+
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
         ui.label(RichText::new("Media Quality:").size(12.0));
         combo(ui, "media_preset_combo", &mut app.settings.media_preset, &MEDIA_PRESETS);
         ui.add_space(12.0);
