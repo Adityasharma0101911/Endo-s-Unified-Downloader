@@ -173,12 +173,21 @@ const CANCELLED: &str = "Download cancelled by user";
 /// under `/download/<version>/`.
 const RELEASES: &str = "https://github.com/yt-dlp/yt-dlp/releases";
 
-/// The files of the newest release of the ffmpeg builds the yt-dlp project makes for yt-dlp (GPL
-/// licensed), with their SHA-256 sums in `checksums.sha256`.
-const FFMPEG_RELEASE: &str = "https://github.com/yt-dlp/FFmpeg-Builds/releases/latest/download";
+/// The files of the newest build of the ffmpeg builds the yt-dlp project makes for yt-dlp (GPL
+/// licensed), with their SHA-256 sums in `checksums.sha256`. Named by its tag, `latest`: GitHub's
+/// newest release is a dated one, with differently named files, while `latest` is replaced.
+const FFMPEG_RELEASE: &str = "https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest";
 
 /// What installing ffmpeg downloads, as the user is told (the win64 build is 196 MB, linux64 153 MB).
 const FFMPEG_DOWNLOAD: &str = "about 200 MB";
+
+/// How installing ffmpeg fails while [`FFMPEG_RELEASE`] is missing a file: FFmpeg-Builds deletes
+/// the release and makes it again every day, which takes some minutes.
+const FFMPEG_RELEASE_GONE: &str =
+    "The ffmpeg release is missing a file, as it is for some minutes each day while it is replaced; the next video tries again";
+
+/// How long a download of yt-dlp or ffmpeg may receive nothing before it fails.
+const INSTALL_STALL_TIMEOUT: Duration = if cfg!(test) { Duration::from_secs(2) } else { Duration::from_secs(30) };
 
 /// Process creation flag that keeps a console program from opening a window.
 #[cfg(windows)]
@@ -488,7 +497,7 @@ fn discover_ffmpeg() -> Option<PathBuf> {
 }
 
 /// The single-file Windows build, as named in the GitHub release: what is installed where the
-/// release zip cannot be unpacked (see [`tar_works`]).
+/// release zip cannot be unpacked (see [`runs`]).
 #[cfg(windows)]
 fn single_file_asset() -> &'static str {
     if cfg!(target_arch = "aarch64") {
@@ -585,7 +594,7 @@ async fn install_release(client: &reqwest::Client, tag: &str) -> Result<PathBuf,
         }
     }
     #[cfg(windows)]
-    let asset = if tokio::task::spawn_blocking(|| tar_works(&windows_tar())).await.unwrap_or(false) {
+    let asset = if tokio::task::spawn_blocking(|| runs(&windows_tar())).await.unwrap_or(false) {
         ytdlp_release_asset()
     } else {
         tracing::warn!("{} does not run: installing the single-file yt-dlp, which starts more slowly", windows_tar().display());
@@ -701,7 +710,7 @@ fn install_onedir(bin_dir: &Path, tag: &str, asset: &str, bytes: &[u8]) -> Resul
         if !asset.ends_with(".zip") {
             return std::fs::write(unpacked.join("yt-dlp.exe"), bytes);
         }
-        let unzipped = std::fs::write(&archive, bytes).and_then(|()| unpack(&archive, &unpacked, &[]));
+        let unzipped = std::fs::write(&archive, bytes).and_then(|()| unpack(&windows_tar(), &archive, &unpacked, &[]));
         let _ = std::fs::remove_file(&archive);
         unzipped
     });
@@ -759,35 +768,49 @@ fn windows_tar() -> PathBuf {
     windows.join("System32").join("tar.exe")
 }
 
-/// Whether `tar` runs, so [`unzip`] can unpack a release: older and trimmed-down Windows installs
-/// have no tar.exe. Blocking.
-#[cfg(windows)]
-fn tar_works(tar: &Path) -> bool {
-    use std::os::windows::process::CommandExt;
-    std::process::Command::new(tar)
+/// The tar [`unpack`] runs: [`windows_tar`] on Windows, the system's elsewhere.
+fn system_tar() -> PathBuf {
+    #[cfg(windows)]
+    return windows_tar();
+    #[cfg(not(windows))]
+    {
+        PathBuf::from("tar")
+    }
+}
+
+/// `program`, started without a console window on Windows.
+fn quiet_command(program: &Path) -> std::process::Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let mut command = std::process::Command::new(program);
+        command.creation_flags(CREATE_NO_WINDOW);
+        command
+    }
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new(program)
+    }
+}
+
+/// Whether `program --version` runs, as tar must for [`unpack`] to unpack a release: older and
+/// trimmed-down Windows installs have no tar.exe. Blocking.
+fn runs(program: &Path) -> bool {
+    quiet_command(program)
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .creation_flags(CREATE_NO_WINDOW)
         .status()
         .is_ok_and(|status| status.success())
 }
 
-/// Extracts `archive` (a zip, or a tar compressed as tar can tell) into `into`: only `members` if
-/// any are named, else everything. It runs [`windows_tar`] on Windows and the system's tar
-/// elsewhere, which refuse entries that would land outside `into`. Blocking.
-fn unpack(archive: &Path, into: &Path, members: &[String]) -> std::io::Result<()> {
-    #[cfg(windows)]
-    let mut tar = {
-        use std::os::windows::process::CommandExt;
-        let mut tar = std::process::Command::new(windows_tar());
-        tar.creation_flags(CREATE_NO_WINDOW);
-        tar
-    };
-    #[cfg(not(windows))]
-    let mut tar = std::process::Command::new("tar");
-    let output = tar.arg("-xf").arg(archive).arg("-C").arg(into).args(members).stdin(Stdio::null()).output()?;
+/// Extracts `archive` (a zip, or a tar compressed as tar can tell) into `into` with `tar` (see
+/// [`system_tar`]), which refuses entries that would land outside `into`: only `members` if any
+/// are named, else everything. Blocking.
+fn unpack(tar: &Path, archive: &Path, into: &Path, members: &[String]) -> std::io::Result<()> {
+    let output =
+        quiet_command(tar).arg("-xf").arg(archive).arg("-C").arg(into).args(members).stdin(Stdio::null()).output()?;
     if output.status.success() {
         Ok(())
     } else {
@@ -841,9 +864,12 @@ fn is_running(exe: &Path) -> bool {
     exe.is_file() && std::fs::OpenOptions::new().write(true).open(exe).is_err()
 }
 
+/// Client for installing yt-dlp and ffmpeg: a connection that goes silent fails after
+/// [`INSTALL_STALL_TIMEOUT`], one that is slow but receiving goes on.
 fn http_client(proxy: Option<&str>) -> Result<reqwest::Client, String> {
     let mut builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(15))
+        .read_timeout(INSTALL_STALL_TIMEOUT)
         .user_agent(crate::resolver::APP_USER_AGENT);
     if let Some(proxy) = proxy {
         builder = builder.proxy(reqwest::Proxy::all(proxy).map_err(|e| format!("Invalid proxy {proxy}: {e}"))?);
@@ -929,11 +955,18 @@ fn managed_ffmpeg_dir(bin_dir: &Path) -> PathBuf {
     bin_dir.join("ffmpeg-build")
 }
 
-/// The managed ffmpeg in `bin_dir`, if one is installed: the one this app installs (see
-/// [`install_ffmpeg_archive`]), else one put right in the directory. Blocking.
+/// The managed ffmpeg in `bin_dir`, if one is installed: the build this app installs (see
+/// [`install_ffmpeg_archive`]) while it is whole, else one put right in the directory. Blocking.
 fn managed_ffmpeg(bin_dir: &Path) -> Option<PathBuf> {
-    let name = exe_name("ffmpeg");
-    [managed_ffmpeg_dir(bin_dir).join(&name), bin_dir.join(&name)].into_iter().find(|p| p.is_file())
+    let (build, name) = (managed_ffmpeg_dir(bin_dir), exe_name("ffmpeg"));
+    let built = Some(build.join(&name)).filter(|_| whole_build(&build));
+    built.or_else(|| Some(bin_dir.join(&name)).filter(|p| p.is_file()))
+}
+
+/// Whether `dir` has both ffmpeg and ffprobe, which yt-dlp runs to look into what it converts and
+/// embeds. Blocking.
+fn whole_build(dir: &Path) -> bool {
+    ["ffmpeg", "ffprobe"].into_iter().all(|program| dir.join(exe_name(program)).is_file())
 }
 
 /// When installing ffmpeg last failed, and why (see [`install_managed_ffmpeg`]).
@@ -947,36 +980,75 @@ pub fn installing_ffmpeg() -> bool {
     FFMPEG_INSTALLING.load(Ordering::Relaxed)
 }
 
-/// Installs ffmpeg into the managed directory, under the lock yt-dlp's installs take, unless a
-/// concurrent job did. A failure less than [`INSTALL_RETRY_AFTER`] ago stands for this attempt,
-/// so each media download does not download the build again. Returns ffmpeg's path.
+/// Keeps [`installing_ffmpeg`] true while it lives, however the install ends.
+struct Installing;
+
+impl Installing {
+    fn start() -> Self {
+        FFMPEG_INSTALLING.store(true, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for Installing {
+    fn drop(&mut self) {
+        FFMPEG_INSTALLING.store(false, Ordering::Relaxed);
+    }
+}
+
+/// Installs ffmpeg into the managed directory (see [`install_ffmpeg`]). Returns ffmpeg's path.
 async fn install_managed_ffmpeg(proxy: Option<&str>) -> Result<PathBuf, String> {
-    let _guard = INSTALL_LOCK.lock().await;
     let bin_dir = managed_bin_dir().ok_or("Cannot determine a per-user directory to install ffmpeg into")?;
-    let dir = bin_dir.clone();
+    let client = http_client(proxy)?;
+    install_ffmpeg(&bin_dir, &FFMPEG_INSTALL_FAILED, download_ffmpeg(&client, FFMPEG_RELEASE, &bin_dir, &system_tar())).await
+}
+
+/// Installs ffmpeg into `bin_dir` with `download` (see [`download_ffmpeg`]), under the lock
+/// yt-dlp's installs take, unless a concurrent job did. A failure less than
+/// [`INSTALL_RETRY_AFTER`] ago, which `failed` keeps, stands for this attempt, so each media
+/// download does not download the build again; one of a release being replaced (see
+/// [`FFMPEG_RELEASE_GONE`]) is not kept. Returns ffmpeg's path.
+async fn install_ffmpeg(
+    bin_dir: &Path,
+    failed: &parking_lot::Mutex<Option<(tokio::time::Instant, String)>>,
+    download: impl std::future::Future<Output = Result<PathBuf, String>>,
+) -> Result<PathBuf, String> {
+    let _guard = INSTALL_LOCK.lock().await;
+    let dir = bin_dir.to_path_buf();
     if let Ok(Some(installed)) = tokio::task::spawn_blocking(move || managed_ffmpeg(&dir)).await {
         return Ok(installed);
     }
-    unless_failed_lately("ffmpeg", &FFMPEG_INSTALL_FAILED, false, async {
-        tracing::warn!("ffmpeg not found: installing it into {} ({FFMPEG_DOWNLOAD} download)", managed_ffmpeg_dir(&bin_dir).display());
-        FFMPEG_INSTALLING.store(true, Ordering::Relaxed);
-        let installed = async { download_ffmpeg(&http_client(proxy)?, FFMPEG_RELEASE, &bin_dir).await }.await;
-        FFMPEG_INSTALLING.store(false, Ordering::Relaxed);
+    let installed = unless_failed_lately("ffmpeg", failed, false, async {
+        tracing::warn!("ffmpeg not found: installing it into {} ({FFMPEG_DOWNLOAD} download)", managed_ffmpeg_dir(bin_dir).display());
+        let _installing = Installing::start();
+        let installed = download.await;
         if let Ok(ffmpeg) = &installed {
             tracing::warn!("Installed ffmpeg at {}", ffmpeg.display());
         }
         installed
     })
-    .await
+    .await;
+    if installed.as_ref().is_err_and(|e| e.starts_with(FFMPEG_RELEASE_GONE)) {
+        *failed.lock() = None;
+    }
+    installed
 }
 
 /// Downloads this platform's ffmpeg build from `release` (see [`FFMPEG_RELEASE`]) into a temporary
-/// file in `bin_dir`, checks it against the release's SHA-256 sums and only then installs it (see
-/// [`install_ffmpeg_archive`]). The archive is deleted either way. Returns ffmpeg's path.
-async fn download_ffmpeg(client: &reqwest::Client, release: &str, bin_dir: &Path) -> Result<PathBuf, String> {
+/// file in `bin_dir`, checks it against the release's SHA-256 sums and only then installs it with
+/// `tar` (see [`install_ffmpeg_archive`]). The archive is deleted either way. Nothing is downloaded
+/// when `tar` could not unpack it (see [`cannot_unpack`]). Returns ffmpeg's path.
+async fn download_ffmpeg(client: &reqwest::Client, release: &str, bin_dir: &Path, tar: &Path) -> Result<PathBuf, String> {
     let asset = ffmpeg_release_asset().ok_or("No ffmpeg build is published for this platform; install ffmpeg yourself")?;
+    let unpacker = tar.to_path_buf();
+    let cannot = tokio::task::spawn_blocking(move || cannot_unpack(&unpacker, asset))
+        .await
+        .map_err(|e| format!("ffmpeg install task failed: {e}"))?;
+    if let Some(why) = cannot {
+        return Err(why);
+    }
     let sums_url = format!("{release}/checksums.sha256");
-    let sums = http_get(client, &sums_url, Duration::from_secs(30))
+    let sums = ffmpeg_release_file(client, &sums_url, Some(Duration::from_secs(30)))
         .await?
         .text()
         .await
@@ -991,8 +1063,8 @@ async fn download_ffmpeg(client: &reqwest::Client, release: &str, bin_dir: &Path
     let archive = bin_dir.join(format!(".ffmpeg-{}-{asset}", unique_suffix()));
     let installed = match fetch_to_file(client, &format!("{release}/{asset}"), &archive).await {
         Ok(actual) if actual == expected => {
-            let (bin_dir, archive) = (bin_dir.to_path_buf(), archive.clone());
-            tokio::task::spawn_blocking(move || install_ffmpeg_archive(&bin_dir, asset, &archive))
+            let (bin_dir, archive, tar) = (bin_dir.to_path_buf(), archive.clone(), tar.to_path_buf());
+            tokio::task::spawn_blocking(move || install_ffmpeg_archive(&bin_dir, asset, &archive, &tar))
                 .await
                 .map_err(|e| format!("ffmpeg install task failed: {e}"))
                 .and_then(|installed| installed)
@@ -1004,10 +1076,39 @@ async fn download_ffmpeg(client: &reqwest::Client, release: &str, bin_dir: &Path
     installed
 }
 
-/// Writes the body of `url` to `path` as it arrives and returns its SHA-256 in lower-case hex.
+/// Why `tar` cannot unpack the ffmpeg build `asset` (see [`unpack`]), if it cannot: it does not
+/// run, or the build is a `.tar.xz` and there is no xz, which GNU tar runs to decompress it.
+/// Blocking.
+fn cannot_unpack(tar: &Path, asset: &str) -> Option<String> {
+    if !runs(tar) {
+        return Some(format!("{} does not run, and the ffmpeg build is unpacked with it; install ffmpeg yourself", tar.display()));
+    }
+    let needs_xz = !cfg!(windows) && asset.ends_with(".xz");
+    (needs_xz && !runs(Path::new("xz")))
+        .then(|| "xz is not installed, and the ffmpeg build is unpacked with it; install xz (xz-utils) or ffmpeg".to_string())
+}
+
+/// GET of `url`, a file of [`FFMPEG_RELEASE`], within `timeout` if one is given; a stalled one
+/// fails in any case (see [`http_client`]). One the release does not have fails with
+/// [`FFMPEG_RELEASE_GONE`].
+async fn ffmpeg_release_file(client: &reqwest::Client, url: &str, timeout: Option<Duration>) -> Result<reqwest::Response, String> {
+    let mut request = client.get(url);
+    if let Some(timeout) = timeout {
+        request = request.timeout(timeout);
+    }
+    let resp = request.send().await.map_err(|e| format!("Failed to download {url}: {e}"))?;
+    match resp.status() {
+        status if status.is_success() => Ok(resp),
+        reqwest::StatusCode::NOT_FOUND => Err(format!("{FFMPEG_RELEASE_GONE} (no {url})")),
+        status => Err(format!("{url} returned status {status}")),
+    }
+}
+
+/// Writes the body of `url`, a file of [`FFMPEG_RELEASE`], to `path` as it arrives, however long a
+/// slow link takes, and returns its SHA-256 in lower-case hex.
 async fn fetch_to_file(client: &reqwest::Client, url: &str, path: &Path) -> Result<String, String> {
     use tokio::io::AsyncWriteExt;
-    let mut resp = http_get(client, url, Duration::from_secs(3600)).await?;
+    let mut resp = ffmpeg_release_file(client, url, None).await?;
     let write_error = |e: std::io::Error| format!("Failed to write {}: {e}", path.display());
     let mut file = tokio::fs::File::create(path).await.map_err(write_error)?;
     let mut hasher = Sha256::new();
@@ -1021,11 +1122,9 @@ async fn fetch_to_file(client: &reqwest::Client, url: &str, path: &Path) -> Resu
 
 /// Unpacks ffmpeg and ffprobe from `archive`, release asset `asset` (laid out as
 /// `<asset without extension>/bin/...`), into [`managed_ffmpeg_dir`]; ffplay and the documentation
-/// stay in the archive. They are unpacked into a temporary folder that becomes the install in one
-/// rename, so no half-written ffmpeg is ever found. What crashed installs left goes once it is an
-/// hour old. Returns ffmpeg's path. Blocking.
-fn install_ffmpeg_archive(bin_dir: &Path, asset: &str, archive: &Path) -> Result<PathBuf, String> {
-    remove_stale_ffmpeg_files(bin_dir);
+/// stay in the archive. They are unpacked with `tar` into a temporary folder that becomes the
+/// install in one rename, so no half-written ffmpeg is ever found. Returns ffmpeg's path. Blocking.
+fn install_ffmpeg_archive(bin_dir: &Path, asset: &str, archive: &Path, tar: &Path) -> Result<PathBuf, String> {
     let root = asset.strip_suffix(".zip").or_else(|| asset.strip_suffix(".tar.xz")).unwrap_or(asset);
     let programs = ["ffmpeg", "ffprobe"].map(exe_name);
     let target = managed_ffmpeg_dir(bin_dir);
@@ -1034,15 +1133,15 @@ fn install_ffmpeg_archive(bin_dir: &Path, asset: &str, archive: &Path) -> Result
     let fail = |e: std::io::Error| format!("Failed to install ffmpeg to {}: {e}", target.display());
     let members: Vec<String> = programs.iter().map(|p| format!("{root}/bin/{p}")).collect();
     let installed = std::fs::create_dir(&unpacked)
-        .and_then(|()| unpack(archive, &unpacked, &members))
+        .and_then(|()| unpack(tar, archive, &unpacked, &members))
         .map_err(fail)
         .and_then(|()| match programs.iter().find(|p| !bin.join(p).is_file()) {
             Some(missing) => Err(format!("The ffmpeg build {asset} has no {missing}")),
             None => Ok(()),
         })
         .and_then(|()| {
-            // One left without its ffmpeg (deleted by hand) would stand in the way for good.
-            if target.is_dir() && !target.join(&programs[0]).is_file() {
+            // One missing a program (deleted by hand or by antivirus) would stand in the way for good.
+            if target.is_dir() && !whole_build(&target) {
                 let _ = std::fs::remove_dir_all(&target);
             }
             #[cfg(windows)]
@@ -1050,14 +1149,15 @@ fn install_ffmpeg_archive(bin_dir: &Path, asset: &str, archive: &Path) -> Result
             #[cfg(not(windows))]
             let renamed = std::fs::rename(&bin, &target);
             // Another process installed it meanwhile.
-            renamed.or_else(|e| if target.join(&programs[0]).is_file() { Ok(()) } else { Err(fail(e)) })
+            renamed.or_else(|e| if whole_build(&target) { Ok(()) } else { Err(fail(e)) })
         });
     let _ = std::fs::remove_dir_all(&unpacked);
     installed.map(|()| target.join(&programs[0]))
 }
 
 /// Deletes the temporary files and folders of ffmpeg installs in `bin_dir` that nothing has
-/// written to for an hour (an install that is still downloading writes to its file). Blocking.
+/// written to for an hour: an install that is still downloading writes to its file, and one that
+/// stalls fails within [`INSTALL_STALL_TIMEOUT`]. Blocking.
 fn remove_stale_ffmpeg_files(bin_dir: &Path) {
     let Ok(entries) = std::fs::read_dir(bin_dir) else { return };
     for entry in entries.flatten() {
@@ -2674,33 +2774,26 @@ pub(crate) async fn download_media_with(
     extracted: Option<Extracted>,
 ) -> Result<PathBuf, String> {
     let (options, mut tools) = prepare(options, &cancel_flag, true).await?;
+    let proxy = options.proxy.clone();
+    let install = async move { install_managed_ffmpeg(proxy.as_deref()).await };
+    let ffmpeg = ffmpeg_for_download(tools.ffmpeg.take(), managed_bin_dir(), options.install_ffmpeg, &cancel_flag, install).await;
     // Why there is no ffmpeg, if there is none.
-    let mut missing = None;
-    if tools.ffmpeg.is_none() {
-        let installed = if options.install_ffmpeg {
-            // A task of its own, like installing yt-dlp: a cancelled download leaves it to finish.
-            let proxy = options.proxy.clone();
-            let install = tokio::spawn(async move { install_managed_ffmpeg(proxy.as_deref()).await });
-            tokio::select! {
-                installed = install => installed.map_err(|e| format!("Installing ffmpeg failed: {e}")).and_then(|i| i),
-                _ = wait_cancelled(cancel_flag.clone()) => return Err(CANCELLED.to_string()),
-            }
-        } else {
-            Err("installing it is turned off (the \"Install ffmpeg\" setting, or --no-install-ffmpeg)".to_string())
-        };
-        match installed {
-            Ok(ffmpeg) => tools.ffmpeg = Some(ffmpeg),
-            Err(why) => {
-                tracing::warn!(
-                    "ffmpeg not found ({why}): yt-dlp cannot merge separate video and audio streams, so it will fall \
-                     back to a lower-quality pre-merged format, and audio extraction presets will fail. Let the app \
-                     install it, install it yourself (e.g. `winget install Gyan.FFmpeg` or your package manager) or \
-                     place it next to the application."
-                );
-                missing = Some(why);
-            }
+    let missing = match ffmpeg {
+        Ok(ffmpeg) => {
+            tools.ffmpeg = Some(ffmpeg);
+            None
         }
-    }
+        Err(e) if e == CANCELLED => return Err(e),
+        Err(why) => {
+            tracing::warn!(
+                "ffmpeg not found ({why}): yt-dlp cannot merge separate video and audio streams, so it will fall \
+                 back to a lower-quality pre-merged format, and audio extraction presets will fail. Let the app \
+                 install it, install it yourself (e.g. `winget install Gyan.FFmpeg` or your package manager) or \
+                 place it next to the application."
+            );
+            Some(why)
+        }
+    };
     let result = download_with(url, &options, tools, progress_tx, cancel_flag, fetch, extracted).await;
     result.map_err(|e| without_ffmpeg(drm_refused(e), &options.preset, missing.as_deref()))
 }
@@ -2714,6 +2807,34 @@ fn without_ffmpeg(error: String, preset: &MediaQualityPreset, missing: Option<&s
             format!("{error} (audio presets need ffmpeg, which was not found: {why})")
         }
         _ => error,
+    }
+}
+
+/// The ffmpeg a media download works with: `found`, else, with `install_ffmpeg`, the one `install`
+/// installs, in a task of its own that a cancelled download leaves to finish, like installing
+/// yt-dlp. What interrupted installs left in `bin_dir` goes first (see
+/// [`remove_stale_ffmpeg_files`]), also once ffmpeg is installed. Fails with why there is none, or
+/// with [`CANCELLED`].
+async fn ffmpeg_for_download(
+    found: Option<PathBuf>,
+    bin_dir: Option<PathBuf>,
+    install_ffmpeg: bool,
+    cancel_flag: &Option<Arc<AtomicBool>>,
+    install: impl std::future::Future<Output = Result<PathBuf, String>> + Send + 'static,
+) -> Result<PathBuf, String> {
+    if let Some(dir) = bin_dir {
+        let _ = tokio::task::spawn_blocking(move || remove_stale_ffmpeg_files(&dir)).await;
+    }
+    if let Some(ffmpeg) = found {
+        return Ok(ffmpeg);
+    }
+    if !install_ffmpeg {
+        return Err("installing it is turned off (the \"Install ffmpeg\" setting, or --no-install-ffmpeg)".to_string());
+    }
+    let install = tokio::spawn(install);
+    tokio::select! {
+        installed = install => installed.map_err(|e| format!("Installing ffmpeg failed: {e}")).and_then(|i| i),
+        _ = wait_cancelled(cancel_flag.clone()) => Err(CANCELLED.to_string()),
     }
 }
 
@@ -3439,9 +3560,9 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn without_tar_the_single_file_build_is_installed_as_a_release() {
-        assert!(tar_works(&windows_tar()));
+        assert!(runs(&windows_tar()));
         let dir = tempfile::tempdir().unwrap();
-        assert!(!tar_works(&dir.path().join("tar.exe")), "no tar.exe, nothing to unpack the zip with");
+        assert!(!runs(&dir.path().join("tar.exe")), "no tar.exe, nothing to unpack the zip with");
         #[cfg(target_arch = "x86_64")]
         assert_eq!(single_file_asset(), "yt-dlp.exe");
         // The Windows builds a release lists (trimmed from 2026.09's SHA2-256SUMS).
@@ -3508,10 +3629,13 @@ mod tests {
         assert_eq!(newest_release(dir.path()), Some(dir.path().join("yt-dlp-2026.10.01").join("yt-dlp.exe")));
     }
 
-    /// The FFmpeg-Builds release lists a build for each platform it has one for (its
-    /// checksums.sha256 of 2026-09-25).
+    /// A check of names only: the build installed on this platform is one the FFmpeg-Builds
+    /// release lists, in a copy of its checksums.sha256 of 2026-09-25 (the live release is
+    /// checked by `installs_the_published_ffmpeg_build`). Its files come from the release tagged
+    /// `latest`, not GitHub's newest release, a dated one whose files are named otherwise.
     #[test]
-    fn the_ffmpeg_release_lists_this_platforms_build() {
+    fn the_ffmpeg_asset_name_is_one_the_recorded_release_lists() {
+        assert_eq!(FFMPEG_RELEASE, "https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest");
         let sums = "\
 b963851e8588ac4b069f92d6d618b3d0d668fa3180ad4f35412457025fdf2e38  ffmpeg-master-latest-win32-gpl-shared.zip
 12c1163fe19b278d166dfe8b2e9165963f9da804efaf42f6d7b9c2d42ae37e05  ffmpeg-master-latest-win32-gpl.zip
@@ -3533,15 +3657,16 @@ bbd8671c6c05eaa3ec29d690695aebadff0871faa3efe9051581afbf3c01e80e  ffmpeg-master-
         }
     }
 
-    /// Serves each of `files` (path, body) over HTTP; anything else is a 404. Returns the base URL.
-    async fn serve_files(files: Vec<(String, Vec<u8>)>) -> String {
+    /// Serves each of `files` (path, body) over HTTP; `stalled` promises a megabyte, sends a
+    /// kilobyte and goes silent; anything else is a 404. Returns the base URL.
+    async fn serve_files(files: Vec<(String, Vec<u8>)>, stalled: Option<String>) -> String {
         use tokio::io::AsyncWriteExt;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let files = Arc::new(files);
+        let (files, stalled) = (Arc::new(files), Arc::new(stalled));
         tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
-                let files = Arc::clone(&files);
+                let (files, stalled) = (Arc::clone(&files), Arc::clone(&stalled));
                 tokio::spawn(async move {
                     let mut request = Vec::new();
                     let mut buf = [0u8; 4096];
@@ -3553,6 +3678,11 @@ bbd8671c6c05eaa3ec29d690695aebadff0871faa3efe9051581afbf3c01e80e  ffmpeg-master-
                     }
                     let request = String::from_utf8_lossy(&request).into_owned();
                     let path = request.split(' ').nth(1).unwrap_or_default();
+                    if stalled.as_deref() == Some(path) {
+                        let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\n\r\n").await;
+                        let _ = socket.write_all(&[0; 1024]).await;
+                        return std::future::pending().await;
+                    }
                     let (status, body) = match files.iter().find(|(p, _)| p == path) {
                         Some((_, body)) => ("200 OK", &body[..]),
                         None => ("404 Not Found", &b""[..]),
@@ -3579,11 +3709,7 @@ bbd8671c6c05eaa3ec29d690695aebadff0871faa3efe9051581afbf3c01e80e  ffmpeg-master-
         std::fs::write(src.join(root).join("LICENSE.txt"), b"GPL").unwrap();
         std::fs::write(src.join(root).join("doc").join("ffmpeg.html"), b"docs").unwrap();
         let archive = dir.join(asset);
-        #[cfg(windows)]
-        let tar = windows_tar();
-        #[cfg(not(windows))]
-        let tar = PathBuf::from("tar");
-        let status = std::process::Command::new(tar).args(["-a", "-cf"]).arg(&archive).arg("-C").arg(&src).arg(root).status().unwrap();
+        let status = std::process::Command::new(system_tar()).args(["-a", "-cf"]).arg(&archive).arg("-C").arg(&src).arg(root).status().unwrap();
         assert!(status.success());
         std::fs::read(archive).unwrap()
     }
@@ -3608,23 +3734,97 @@ bbd8671c6c05eaa3ec29d690695aebadff0871faa3efe9051581afbf3c01e80e  ffmpeg-master-
         let sums = |hash: &str| format!("{}  ffmpeg-master-latest-win64-gpl-shared.zip\n{hash}  {asset}\n", "0".repeat(64)).into_bytes();
         let file = |name: &str, body: Vec<u8>| (format!("/release/{name}"), body);
         let client = reqwest::Client::new();
-        let bin = dir.path().join("bin");
+        let (bin, tar) = (dir.path().join("bin"), system_tar());
 
         // A build that does not match its sum is refused, and leaves nothing behind.
-        let release = serve_files(vec![file("checksums.sha256", sums(&"1".repeat(64))), file(asset, archive.clone())]).await;
-        let err = download_ffmpeg(&client, &release, &bin).await.unwrap_err();
+        let release = serve_files(vec![file("checksums.sha256", sums(&"1".repeat(64))), file(asset, archive.clone())], None).await;
+        let err = download_ffmpeg(&client, &release, &bin, &tar).await.unwrap_err();
         assert!(err.contains("checksum"), "{err}");
         assert!(names_of(&bin).is_empty(), "{:?}", names_of(&bin));
         assert_eq!(managed_ffmpeg(&bin), None);
 
-        // A release without the build's sum, or without the build, installs nothing either.
-        let release = serve_files(vec![file("checksums.sha256", b"abc  other.zip\n".to_vec()), file(asset, archive.clone())]).await;
-        assert!(download_ffmpeg(&client, &release, &bin).await.unwrap_err().contains("no entry"));
-        let release = serve_files(vec![file("checksums.sha256", sums(&good))]).await;
-        assert!(download_ffmpeg(&client, &release, &bin).await.unwrap_err().contains("404"));
+        // A release without the build's sum, or without the build (as while it is replaced),
+        // installs nothing either.
+        let release = serve_files(vec![file("checksums.sha256", b"abc  other.zip\n".to_vec()), file(asset, archive.clone())], None).await;
+        assert!(download_ffmpeg(&client, &release, &bin, &tar).await.unwrap_err().contains("no entry"));
+        let release = serve_files(vec![file("checksums.sha256", sums(&good))], None).await;
+        let err = download_ffmpeg(&client, &release, &bin, &tar).await.unwrap_err();
+        assert!(err.starts_with(FFMPEG_RELEASE_GONE), "{err}");
+        let release = serve_files(Vec::new(), None).await;
+        let err = download_ffmpeg(&client, &release, &bin, &tar).await.unwrap_err();
+        assert!(err.starts_with(FFMPEG_RELEASE_GONE), "{err}");
         assert!(names_of(&bin).is_empty(), "{:?}", names_of(&bin));
 
-        // What an install that crashed hours ago left goes; one still downloading stays.
+        let release = serve_files(vec![file("checksums.sha256", sums(&good)), file(asset, archive)], None).await;
+        let ffmpeg = download_ffmpeg(&client, &release, &bin, &tar).await.unwrap();
+        assert_eq!(ffmpeg, managed_ffmpeg_dir(&bin).join(exe_name("ffmpeg")));
+        assert_eq!(std::fs::read(&ffmpeg).unwrap(), b"ffmpeg build");
+        assert_eq!(names_of(&managed_ffmpeg_dir(&bin)), [exe_name("ffmpeg"), exe_name("ffprobe")]);
+        assert_eq!(names_of(&bin), ["ffmpeg-build"]);
+        assert_eq!(managed_ffmpeg(&bin), Some(ffmpeg.clone()));
+
+        // Installed by another process meanwhile: that install stands.
+        assert_eq!(download_ffmpeg(&client, &release, &bin, &tar).await.unwrap(), ffmpeg);
+        assert_eq!(names_of(&bin), ["ffmpeg-build"]);
+
+        // An install whose ffmpeg or ffprobe was deleted (by hand, by antivirus) is replaced.
+        for program in ["ffmpeg", "ffprobe"] {
+            std::fs::remove_file(managed_ffmpeg_dir(&bin).join(exe_name(program))).unwrap();
+            assert_eq!(managed_ffmpeg(&bin), None, "without {program}");
+            assert_eq!(download_ffmpeg(&client, &release, &bin, &tar).await.unwrap(), ffmpeg);
+            assert_eq!(names_of(&managed_ffmpeg_dir(&bin)), [exe_name("ffmpeg"), exe_name("ffprobe")]);
+        }
+    }
+
+    /// A download of the build that goes silent fails within [`INSTALL_STALL_TIMEOUT`], not an
+    /// hour later, and leaves nothing behind.
+    #[tokio::test]
+    async fn a_stalled_ffmpeg_download_fails_soon_and_leaves_nothing() {
+        let Some(asset) = ffmpeg_release_asset() else {
+            eprintln!("skipped: no ffmpeg build for this platform");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        let sums = (String::from("/release/checksums.sha256"), format!("{}  {asset}\n", "0".repeat(64)).into_bytes());
+        let release = serve_files(vec![sums], Some(format!("/release/{asset}"))).await;
+        let (client, tar) = (http_client(None).unwrap(), system_tar());
+        let download = download_ffmpeg(&client, &release, &bin, &tar);
+        let err = tokio::time::timeout(INSTALL_STALL_TIMEOUT * 5, download).await.expect("a stalled download fails").unwrap_err();
+        assert!(err.starts_with("Failed to download"), "{err}");
+        assert!(names_of(&bin).is_empty(), "{:?}", names_of(&bin));
+    }
+
+    /// Nothing is downloaded when the build could not be unpacked: without a tar that runs the
+    /// install fails at once and says why.
+    #[tokio::test]
+    async fn without_a_tar_that_runs_no_ffmpeg_build_is_downloaded() {
+        let Some(asset) = ffmpeg_release_asset() else {
+            eprintln!("skipped: no ffmpeg build for this platform");
+            return;
+        };
+        assert_eq!(cannot_unpack(&system_tar(), asset), None);
+        let dir = tempfile::tempdir().unwrap();
+        let (bin, no_tar) = (dir.path().join("bin"), dir.path().join(exe_name("tar")));
+        // Nothing listens there: had it asked, it would fail to connect.
+        let err = download_ffmpeg(&reqwest::Client::new(), "http://127.0.0.1:9/release", &bin, &no_tar).await.unwrap_err();
+        assert!(err.starts_with(&format!("{} does not run", no_tar.display())), "{err}");
+        assert!(!bin.exists());
+    }
+
+    /// Stands for an install that must not run.
+    async fn installs_nothing() -> Result<PathBuf, String> {
+        unreachable!("nothing is to be installed")
+    }
+
+    /// A media download uses the ffmpeg it found, else installs one if it may; a cancelled one
+    /// stops waiting and leaves the install to finish. What interrupted installs left goes on
+    /// every download, also once ffmpeg is installed, when it is an hour old.
+    #[tokio::test]
+    async fn a_media_download_uses_the_ffmpeg_it_found_else_installs_one_if_it_may() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
         let (crashed, fresh) = (bin.join(".ffmpeg-1-crashed.zip"), bin.join(".ffmpeg-2-downloading.zip"));
         for leftover in [&crashed, &fresh] {
             std::fs::write(leftover, b"partial").unwrap();
@@ -3632,23 +3832,77 @@ bbd8671c6c05eaa3ec29d690695aebadff0871faa3efe9051581afbf3c01e80e  ffmpeg-master-
         let hours_ago = SystemTime::now() - Duration::from_secs(2 * 3600);
         std::fs::File::options().write(true).open(&crashed).unwrap().set_modified(hours_ago).unwrap();
 
-        let release = serve_files(vec![file("checksums.sha256", sums(&good)), file(asset, archive)]).await;
-        let ffmpeg = download_ffmpeg(&client, &release, &bin).await.unwrap();
-        assert_eq!(ffmpeg, managed_ffmpeg_dir(&bin).join(exe_name("ffmpeg")));
-        assert_eq!(std::fs::read(&ffmpeg).unwrap(), b"ffmpeg build");
-        assert_eq!(names_of(&managed_ffmpeg_dir(&bin)), [exe_name("ffmpeg"), exe_name("ffprobe")]);
-        assert_eq!(names_of(&bin), [".ffmpeg-2-downloading.zip", "ffmpeg-build"]);
-        assert_eq!(managed_ffmpeg(&bin), Some(ffmpeg.clone()));
+        let found = dir.path().join(exe_name("ffmpeg"));
+        let used = ffmpeg_for_download(Some(found.clone()), Some(bin.clone()), true, &None, installs_nothing()).await;
+        assert_eq!(used, Ok(found));
+        assert_eq!(names_of(&bin), [".ffmpeg-2-downloading.zip"]);
 
-        // Installed by another process meanwhile: that install stands.
-        assert_eq!(download_ffmpeg(&client, &release, &bin).await.unwrap(), ffmpeg);
-        assert_eq!(names_of(&bin), [".ffmpeg-2-downloading.zip", "ffmpeg-build"]);
+        // Installing it is turned off: the download goes on without, and says how to turn it on.
+        let off = ffmpeg_for_download(None, None, false, &None, installs_nothing()).await.unwrap_err();
+        assert!(off.contains("--no-install-ffmpeg"), "{off}");
 
-        // An install whose ffmpeg was deleted by hand is replaced.
-        std::fs::remove_file(&ffmpeg).unwrap();
-        assert_eq!(managed_ffmpeg(&bin), None);
-        assert_eq!(download_ffmpeg(&client, &release, &bin).await.unwrap(), ffmpeg);
-        assert_eq!(names_of(&managed_ffmpeg_dir(&bin)), [exe_name("ffmpeg"), exe_name("ffprobe")]);
+        // The installed ffmpeg is the one the download works with; a failed install says why.
+        let installed = managed_ffmpeg_dir(&bin).join(exe_name("ffmpeg"));
+        let path = installed.clone();
+        assert_eq!(ffmpeg_for_download(None, None, true, &None, async move { Ok(path) }).await, Ok(installed));
+        let failed = ffmpeg_for_download(None, None, true, &None, async { Err("offline".to_string()) }).await;
+        assert_eq!(failed, Err("offline".to_string()));
+
+        // Cancelled while it installs: the download stops, the install goes on to the end.
+        let (go, wait) = tokio::sync::oneshot::channel::<()>();
+        let (finished, done) = tokio::sync::oneshot::channel();
+        let install = async move {
+            let _ = wait.await;
+            let _ = finished.send(());
+            Ok(PathBuf::from("ffmpeg"))
+        };
+        let cancelled = Some(Arc::new(AtomicBool::new(true)));
+        assert_eq!(ffmpeg_for_download(None, None, true, &cancelled, install).await, Err(CANCELLED.to_string()));
+        go.send(()).expect("the install still runs");
+        done.await.expect("the install finishes");
+    }
+
+    /// While ffmpeg downloads a front end shows it, however that ends. A failed install stands for
+    /// the next ones for a while, unless the release was being replaced; an installed build is
+    /// used as it is.
+    #[tokio::test]
+    async fn a_failed_ffmpeg_install_stands_for_a_while_unless_the_release_was_being_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let fail = |e: String| async move {
+            assert!(installing_ffmpeg(), "shown while it downloads");
+            Err(e)
+        };
+        let failed = parking_lot::Mutex::new(None);
+        // One dropped halfway, as when its runtime shuts down, is not shown any more.
+        let mut dropped = Box::pin(install_ffmpeg(dir.path(), &failed, std::future::pending()));
+        tokio::select! {
+            _ = &mut dropped => unreachable!("it never ends"),
+            () = async {
+                while !installing_ffmpeg() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            } => {}
+        }
+        drop(dropped);
+        assert!(!installing_ffmpeg());
+        assert!(failed.lock().is_none());
+
+        let gone = format!("{FFMPEG_RELEASE_GONE} (no checksums.sha256)");
+        assert_eq!(install_ffmpeg(dir.path(), &failed, fail(gone.clone())).await, Err(gone));
+        assert!(!installing_ffmpeg());
+        assert!(failed.lock().is_none(), "the next download tries again");
+
+        assert_eq!(install_ffmpeg(dir.path(), &failed, fail("offline".to_string())).await, Err("offline".to_string()));
+        assert!(!installing_ffmpeg());
+        let err = install_ffmpeg(dir.path(), &failed, installs_nothing()).await.unwrap_err();
+        assert!(err.starts_with("Installing ffmpeg failed") && err.ends_with("offline"), "{err}");
+
+        let build = managed_ffmpeg_dir(dir.path());
+        std::fs::create_dir(&build).unwrap();
+        for program in ["ffmpeg", "ffprobe"] {
+            std::fs::write(build.join(exe_name(program)), b"x").unwrap();
+        }
+        assert_eq!(install_ffmpeg(dir.path(), &failed, installs_nothing()).await, Ok(build.join(exe_name("ffmpeg"))));
     }
 
     /// The real release installs an ffmpeg and ffprobe that run.
@@ -3656,7 +3910,7 @@ bbd8671c6c05eaa3ec29d690695aebadff0871faa3efe9051581afbf3c01e80e  ffmpeg-master-
     #[ignore = "downloads about 200 MB from GitHub"]
     async fn installs_the_published_ffmpeg_build() {
         let dir = tempfile::tempdir().unwrap();
-        let ffmpeg = download_ffmpeg(&http_client(None).unwrap(), FFMPEG_RELEASE, dir.path()).await.unwrap();
+        let ffmpeg = download_ffmpeg(&http_client(None).unwrap(), FFMPEG_RELEASE, dir.path(), &system_tar()).await.unwrap();
         for program in [ffmpeg.clone(), ffmpeg.with_file_name(exe_name("ffprobe"))] {
             let out = std::process::Command::new(&program).arg("-version").output().unwrap();
             assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).contains("--enable-gpl"), "{}", program.display());
@@ -3664,18 +3918,20 @@ bbd8671c6c05eaa3ec29d690695aebadff0871faa3efe9051581afbf3c01e80e  ffmpeg-master-
         assert_eq!(names_of(dir.path()), ["ffmpeg-build"]);
     }
 
-    /// The build this app installs comes first; an ffmpeg put right in the managed directory
-    /// still counts.
+    /// The build this app installs comes first while it has both ffmpeg and ffprobe; an ffmpeg
+    /// put right in the managed directory still counts.
     #[test]
-    fn the_managed_ffmpeg_is_the_installed_build_else_one_put_in_the_directory() {
+    fn the_managed_ffmpeg_is_the_whole_installed_build_else_one_put_in_the_directory() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(managed_ffmpeg(dir.path()), None);
         let loose = dir.path().join(exe_name("ffmpeg"));
         std::fs::write(&loose, b"x").unwrap();
-        assert_eq!(managed_ffmpeg(dir.path()), Some(loose));
+        assert_eq!(managed_ffmpeg(dir.path()), Some(loose.clone()));
         std::fs::create_dir(managed_ffmpeg_dir(dir.path())).unwrap();
         let built = managed_ffmpeg_dir(dir.path()).join(exe_name("ffmpeg"));
         std::fs::write(&built, b"x").unwrap();
+        assert_eq!(managed_ffmpeg(dir.path()), Some(loose), "a build without its ffprobe");
+        std::fs::write(managed_ffmpeg_dir(dir.path()).join(exe_name("ffprobe")), b"x").unwrap();
         assert_eq!(managed_ffmpeg(dir.path()), Some(built));
     }
 
