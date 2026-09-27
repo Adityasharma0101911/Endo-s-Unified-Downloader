@@ -3384,7 +3384,18 @@ async fn test_a_link_that_only_looks_like_a_feed_is_downloaded_as_it_is() {
     }
     let mut busy = Mock::new(Vec::new());
     busy.plan = |_| Reply::Status(503, None);
-    let link = serve(Arc::new(busy), "busy/show.rss?token=s3cret").await;
+    let busy = Arc::new(busy);
+    let link = serve(Arc::clone(&busy), "busy/show.rss?token=s3cret").await;
     let err = ingest(&[link.as_str()], &http, &ListOptions::default()).await.expect_err("a busy host is an error");
     assert!(err.contains("503") && err.contains("token=REDACTED") && !err.contains("s3cret"), "{err}");
+
+    // A link other files share the shape of (an .xml file, a repository named "rss") on a busy or
+    // unreachable host is left to the engine, which retries it, as before feeds were read.
+    let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let unreachable = Url::parse(&format!("http://{}/someone/rss", closed.local_addr().unwrap())).unwrap();
+    drop(closed);
+    for link in [serve(Arc::clone(&busy), "exports/catalog.xml").await, unreachable] {
+        let tasks = ingest(&[link.as_str()], &http, &ListOptions::default()).await.unwrap_or_else(|e| panic!("{link}: {e}"));
+        assert_eq!(tasks, [Task { urls: vec![link.clone()], ..Task::default() }], "{link}");
+    }
 }

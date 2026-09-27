@@ -30,31 +30,43 @@ const MEDIA_EXTENSIONS: &[&str] = &[
     "webm", "mkv", "avi", "wmv", "mpg", "mpeg", "3gp", "3g2", "ogv", "flv",
 ];
 
+/// Podcast hosts whose feed links have an `rss`, `feed` or `feeds` part: Anchor's
+/// `/podcast/rss`, Libsyn's `/rss`, Acast's `/rss/...`, Spreaker's `/episodes/feed`, Supercast's
+/// `/feeds/...` and Patreon's `/rss/...`.
+const FEED_PATH_HOSTS: &[&str] = &["anchor.fm", "libsyn.com", "acast.com", "spreaker.com", "supercast.com", "patreon.com"];
+
 /// Whether `url` names a feed (or a podcast show page) this module lists, from its shape alone:
-/// an Apple Podcasts show or episode, a feed host (`feeds.`, `feed.`, `rss.`, as Simplecast,
-/// Megaphone, Acast, Transistor, Buzzsprout, Art19, Podbean, SoundCloud and Libsyn use, or
-/// `podcastfeeds.`), a path ending in `.rss`, `.xml`, `.atom` or `/podcast`, or with an `rss`,
-/// `feed` or `feeds` part (Anchor's `/podcast/rss`, Spreaker's `/episodes/feed`, Patreon's
-/// `/rss/...`, Supercast's `/feeds/...`), or a feed asked for in the query (Squarespace's
-/// `?format=rss`, WordPress's `?feed=podcast`).
+/// an Apple Podcasts show or episode, or a link [`feed_shape`] takes.
 pub fn lists(url: &Url) -> bool {
-    AppleLink::of(url).is_some() || looks_like_feed(url)
+    AppleLink::of(url).is_some() || feed_shape(url).is_some()
 }
 
-fn looks_like_feed(url: &Url) -> bool {
-    let Some(host) = url.host_str() else { return false };
-    let host = host.to_ascii_lowercase();
+/// Whether `url` is shaped like a feed: `Some(true)` for a shape only feeds have (a feed host,
+/// `feeds.`, `feed.`, `rss.` and `podcastfeeds.` as Simplecast, Megaphone, Acast, Transistor,
+/// Buzzsprout, Art19, Podbean, SoundCloud, Libsyn and NBC use, or one whose first label ends in
+/// `-feed`; a path ending in `.rss` or `.atom`; a feed asked for in the query, Squarespace's
+/// `?format=rss` and WordPress's `?feed=podcast`; a [`FEED_PATH_HOSTS`] feed path), `Some(false)`
+/// for one other files share (a path ending in `.xml` or `/podcast`, or with an `rss`, `feed` or
+/// `feeds` part), None for neither.
+fn feed_shape(url: &Url) -> Option<bool> {
+    let host = url.host_str()?.trim_end_matches('.').to_ascii_lowercase();
     let path = url.path().to_ascii_lowercase();
     let first_label = host.split('.').next().unwrap_or_default();
     let feed_query = |(key, value): (std::borrow::Cow<'_, str>, std::borrow::Cow<'_, str>)| {
         matches!(&*key, "format" | "feed") && ["rss", "atom", "podcast"].iter().any(|kind| value.to_ascii_lowercase().starts_with(kind))
     };
-    first_label.contains("feed")
-        || first_label == "rss"
-        || [".rss", ".xml", ".atom"].iter().any(|ext| path.ends_with(ext))
-        || path.trim_end_matches('/').ends_with("/podcast")
-        || path.split('/').any(|s| matches!(s, "rss" | "feed" | "feeds"))
+    let feed_part = path.split('/').any(|s| matches!(s, "rss" | "feed" | "feeds"));
+    let feed_path_host = FEED_PATH_HOSTS.iter().any(|h| host == *h || host.strip_suffix(h).is_some_and(|sub| sub.ends_with('.')));
+    if matches!(first_label, "feed" | "feeds" | "rss" | "podcastfeeds")
+        || first_label.ends_with("-feed")
+        || path.ends_with(".rss")
+        || path.ends_with(".atom")
         || url.query_pairs().any(feed_query)
+        || (feed_part && feed_path_host)
+    {
+        return Some(true);
+    }
+    (feed_part || path.ends_with(".xml") || path.trim_end_matches('/').ends_with("/podcast")).then_some(false)
 }
 
 /// One task per episode of the feed at `url`; called only when [`lists`] takes `url`. None when
@@ -69,7 +81,7 @@ pub async fn list(http: &reqwest::Client, url: &Url, options: &ListOptions) -> O
     if let Some(apple) = AppleLink::of(url) {
         return apple.list(http, options).await;
     }
-    match read_feed(http, url).await {
+    match read_feed(http, url, feed_shape(url) == Some(true)).await {
         Ok(Some(feed)) if !feed.episodes.is_empty() => Some(show_tasks(feed, options).await),
         Ok(Some(_)) => {
             tracing::info!("{} is a feed without audio or video: it is downloaded as it is", redact_url(url.as_str()));
@@ -80,9 +92,10 @@ pub async fn list(http: &reqwest::Client, url: &Url, options: &ListOptions) -> O
     }
 }
 
-/// The feed at `url`; None when it answers with a client error or is no RSS or Atom feed.
-async fn read_feed(http: &reqwest::Client, url: &Url) -> Result<Option<Feed>, String> {
-    let Some((bytes, base)) = fetch(http, url, true).await? else { return Ok(None) };
+/// The feed at `url`; None when it answers with a client error or is no RSS or Atom feed, and
+/// unless `sure` it is one, when its host cannot be reached or is busy (see [`fetch`]).
+async fn read_feed(http: &reqwest::Client, url: &Url, sure: bool) -> Result<Option<Feed>, String> {
+    let Some((bytes, base)) = fetch(http, url, true, sure).await? else { return Ok(None) };
     let text = decode_text(&bytes).unwrap_or_else(|_| String::from_utf8_lossy(&bytes).into_owned());
     parse_feed(&text, &base).transpose()
 }
@@ -90,24 +103,38 @@ async fn read_feed(http: &reqwest::Client, url: &Url) -> Result<Option<Feed>, St
 /// The body at `url` and where it came from (after redirects), at most [`MAX_FEED_BYTES`]; None
 /// when its host answers with a client error (a login, an expired private feed), which the
 /// engine is left to report. With `feed`, also None when its first element is no `<rss>` or
-/// `<feed>`, or it is too large to tell and not labelled a feed. A timeout, a rate
-/// limit and a server error are errors, to retry. The link is redacted in errors: a private
-/// feed's token is in it.
-async fn fetch(http: &reqwest::Client, url: &Url, feed: bool) -> Result<Option<(Vec<u8>, Url)>, String> {
+/// `<feed>`, or it is too large to tell and not labelled a feed. An unreachable host, a
+/// timeout, a rate limit and a server error are errors, to retry, when the link is `sure` to
+/// be what is wanted; else None, and the engine downloads the link, retrying as it does. The
+/// link is redacted in errors: a private feed's token is in it.
+async fn fetch(http: &reqwest::Client, url: &Url, feed: bool, sure: bool) -> Result<Option<(Vec<u8>, Url)>, String> {
     use reqwest::header::{ACCEPT, CONTENT_TYPE};
     use reqwest::StatusCode;
-    let fail = |e: reqwest::Error| format!("Cannot fetch {}: {}", redact_url(url.as_str()), e.without_url());
+    let fail = |e: reqwest::Error| {
+        let error = format!("Cannot fetch {}: {}", redact_url(url.as_str()), e.without_url());
+        if sure {
+            return Err(error);
+        }
+        tracing::info!("{}: the link is downloaded as it is", error);
+        Ok(None)
+    };
     let mut request = http.get(url.clone());
     if feed {
         request = request.header(ACCEPT, "application/rss+xml, application/atom+xml, application/xml;q=0.9, text/xml;q=0.9, */*;q=0.8");
     }
-    let resp = request.send().await.map_err(fail)?;
+    let resp = match request.send().await {
+        Ok(resp) => resp,
+        Err(e) => return fail(e),
+    };
     let status = resp.status();
     if status.is_client_error() && !matches!(status, StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS) {
         tracing::info!("{} answered HTTP {}", redact_url(url.as_str()), status);
         return Ok(None);
     }
-    let mut resp = resp.error_for_status().map_err(fail)?;
+    let mut resp = match resp.error_for_status() {
+        Ok(resp) => resp,
+        Err(e) => return fail(e),
+    };
     let base = resp.url().clone();
     let labelled = resp
         .headers()
@@ -126,7 +153,12 @@ async fn fetch(http: &reqwest::Client, url: &Url, feed: bool) -> Result<Option<(
         return too_large(known_feed);
     }
     let mut body = Vec::new();
-    while let Some(chunk) = resp.chunk().await.map_err(fail)? {
+    loop {
+        let chunk = match resp.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(e) => return fail(e),
+        };
         body.extend_from_slice(&chunk);
         if !known_feed {
             match first_element(&body) {
@@ -591,7 +623,7 @@ impl AppleLink {
             Ok(lookup) => lookup,
             Err(e) => return Some(Err(e.to_string())),
         };
-        let answer = match fetch(http, &lookup, false).await {
+        let answer = match fetch(http, &lookup, false, true).await {
             Ok(Some((answer, _))) => answer,
             Ok(None) => return Some(Err(format!("Apple Podcasts refused to look up show {}; try again later", self.show))),
             Err(e) => return Some(Err(e)),
@@ -600,7 +632,7 @@ impl AppleLink {
             Ok(found) => found,
             Err(e) => return Some(Err(e)),
         };
-        let feed = match read_feed(http, &feed_url).await {
+        let feed = match read_feed(http, &feed_url, true).await {
             Ok(Some(feed)) => feed,
             Ok(None) if self.episode.is_some() => return None,
             Ok(None) => return Some(Err(format!("The show's feed ({}) is not a podcast feed", redact_url(feed_url.as_str())))),
@@ -742,8 +774,40 @@ mod tests {
             "https://podcasts.apple.com/us/podcast/the-daily",
             "https://apple.com/us/podcast/x/id123",
             "https://example.org/list?format=json",
+            "https://feedback.example.com/files/app.zip",
+            "https://datafeed.example.com/products/dump.zip",
+            "https://feedly.com/i/latest",
         ] {
             assert!(!lists(&url(other)), "{other}");
+        }
+        // Only feeds have these shapes; files of other kinds share the others, so a busy or
+        // unreachable host is left to the engine (see `fetch`).
+        for feed in [
+            "https://feeds.simplecast.com/Sl5CSM3S",
+            "https://rss.art19.com/absolutely-not",
+            "https://feed.podbean.com/HDSR/feed.xml",
+            "https://podcastfeeds.nbcnews.com/l7jK75d0",
+            "https://leftrightandcenter-feed.kcrw.com",
+            "https://podcasts.files.bbci.co.uk/b006qykl.rss",
+            "https://example.org/blog/atom.atom",
+            "https://www.arnewsline.org/?format=rss",
+            "https://anchor.fm/s/101adcf44/podcast/rss",
+            "https://cybersecuritytoday.libsyn.com/rss",
+            "https://access.acast.com/rss/6215faef4b795a5d1ffd3b62",
+            "https://www.spreaker.com/show/4836142/episodes/feed",
+            "https://show.supercast.com/feeds/Tok3n",
+            "https://www.patreon.com/rss/somecreator?auth=abc123",
+        ] {
+            assert_eq!(feed_shape(&url(feed)), Some(true), "{feed}");
+        }
+        for maybe in [
+            "https://github.com/someone/rss",
+            "https://example.org/data/books.xml",
+            "https://example.org/show/podcast/",
+            "https://example.org/news/feed",
+            "https://notlibsyn.com/rss",
+        ] {
+            assert_eq!(feed_shape(&url(maybe)), Some(false), "{maybe}");
         }
         let episode = AppleLink::of(&url("https://podcasts.apple.com/GB/podcast/the-daily/id1200361736?i=1000791857941")).unwrap();
         assert_eq!(episode, AppleLink { show: 1_200_361_736, episode: Some(1_000_791_857_941), country: Some("gb".into()) });
