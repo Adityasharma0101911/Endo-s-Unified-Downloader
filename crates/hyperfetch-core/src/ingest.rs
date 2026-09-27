@@ -228,6 +228,7 @@ async fn fetch(http: &reqwest::Client, url: &Url) -> Result<Vec<u8>, String> {
     Ok(body)
 }
 
+/// One task per metalink file, named by its relative path ("dir/file.iso" is saved in dir/).
 fn metalink_tasks(bytes: &[u8]) -> Result<Vec<Task>, String> {
     let text = decode_text(bytes)?;
     metalink::parse_metalink(&text)?
@@ -393,6 +394,24 @@ mod tests {
         assert_eq!(tasks[0].name, Some(PathBuf::from("a.bin")));
         assert_eq!(tasks[0].checksum.as_deref(), Some("sha256:abcdef"));
         assert_eq!(tasks[1].checksum.as_deref(), Some("md5:0123"));
+    }
+
+    #[test]
+    fn metalink_files_keep_their_folders() {
+        let xml = r#"<metalink xmlns="urn:ietf:params:xml:ns:metalink">
+            <file name="dir/sub/file.iso"><url>https://m.example/file.iso</url></file>
+            <file name="./top: level?.txt"><url>https://m.example/top.txt</url></file>
+            <file name="con/aux.txt"><url>https://m.example/aux.txt</url></file>
+            </metalink>"#;
+        let names: Vec<_> = metalink_tasks(xml.as_bytes()).unwrap().into_iter().map(|t| t.name.unwrap()).collect();
+        assert_eq!(
+            names,
+            [Path::new("dir").join("sub").join("file.iso"), PathBuf::from("top_ level_.txt"), Path::new("_con").join("_aux.txt")]
+        );
+        for bad in ["../escape.iso", "dir/../../escape.iso", "/etc/passwd", "C:\\Windows\\x.dll", "dir/.../x"] {
+            let xml = format!(r#"<metalink><file name="{}"><url>https://m.example/x</url></file></metalink>"#, bad);
+            assert!(metalink_tasks(xml.as_bytes()).is_err(), "{bad:?} must be refused");
+        }
     }
 
     #[test]

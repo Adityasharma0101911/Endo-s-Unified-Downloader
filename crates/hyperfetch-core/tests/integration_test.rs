@@ -2295,3 +2295,54 @@ async fn test_a_download_starts_at_the_connection_cap_its_host_was_seen_to_enfor
     assert_file(&out, &data);
     assert_eq!(mock.served_ranges().len(), 2, "{:?}", mock.served_ranges());
 }
+
+// ---- Documents that list downloads (.metalink, .meta4, .torrent) ------------------------------
+
+/// A remote metalink becomes one task per file, and each file lands in its own folder, checked
+/// against the metalink's checksum.
+#[tokio::test]
+async fn test_a_remote_metalink_saves_each_file_under_its_folder() {
+    use hyperfetch_core::ingest::{descriptor_client, ingest};
+    use sha2::Digest;
+    let _history = setup().await;
+    let data = payload(300 * KB, 283);
+    let sha256: String = sha2::Sha256::digest(&data).iter().map(|b| format!("{:02x}", b)).collect();
+    let file = serve(Arc::new(Mock::new(data.clone())), "disc.iso").await;
+    let xml = format!(
+        r#"<metalink xmlns="urn:ietf:params:xml:ns:metalink"><file name="release/1.0/disc.iso">
+        <hash type="sha-256">{}</hash><url>{}</url></file></metalink>"#,
+        sha256, file
+    );
+    let document = serve(Arc::new(Mock::new(xml.into_bytes())), "release.meta4").await;
+
+    let tasks = ingest(&[document.as_str()], &descriptor_client(None).unwrap()).await.expect("the metalink is read");
+    let [task] = &tasks[..] else { panic!("one file: {:?}", tasks) };
+    assert_eq!(task.name.as_deref(), Some(Path::new("release").join("1.0").join("disc.iso").as_path()));
+    assert_eq!(task.checksum, Some(format!("sha256:{}", sha256)));
+
+    let temp = tempdir().unwrap();
+    let out = temp.path().join(task.name.as_ref().unwrap());
+    let opts = DownloadOptions { expected_checksum: task.checksum.clone(), ..options(&out, 4, 64 * KB) };
+    let path = run(&DownloadEngine::new(task.urls.clone(), opts), None).await.expect("download should succeed");
+    assert_eq!(path, temp.path().join("release").join("1.0").join("disc.iso"));
+    assert_file(&path, &data);
+}
+
+/// A remote multi-file torrent with a web seed becomes one task per file under the torrent's name.
+#[tokio::test]
+async fn test_a_remote_torrent_lists_every_file_of_its_web_seed() {
+    use hyperfetch_core::ingest::{descriptor_client, ingest};
+    let seed = serve(Arc::new(Mock::new(payload(KB, 3))), "seed/").await;
+    let torrent = format!(
+        "d8:url-list{}:{}4:infod5:filesld6:lengthi1024e4:pathl3:sub5:a.bineed6:lengthi1024e4:pathl5:b.bineee\
+         4:name4:pack12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaaee",
+        seed.as_str().len(),
+        seed
+    );
+    let document = serve(Arc::new(Mock::new(torrent.into_bytes())), "pack.torrent").await;
+
+    let tasks = ingest(&[document.as_str()], &descriptor_client(None).unwrap()).await.expect("the torrent is read");
+    let names: Vec<_> = tasks.iter().map(|t| t.name.clone().unwrap()).collect();
+    assert_eq!(names, [Path::new("pack").join("sub").join("a.bin"), Path::new("pack").join("b.bin")]);
+    assert_eq!(tasks[0].urls, [seed.join("pack/sub/a.bin").unwrap()]);
+}
