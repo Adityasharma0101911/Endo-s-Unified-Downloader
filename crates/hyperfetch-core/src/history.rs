@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions, TryLockError};
@@ -6,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
+use url::{form_urlencoded, Url};
 
 /// Only the newest entries are kept so loading and saving stay cheap.
 const MAX_ENTRIES: usize = 1000;
@@ -33,6 +35,148 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut name: OsString = path.as_os_str().to_owned();
     name.push(suffix);
     PathBuf::from(name)
+}
+
+/// Stands in for a secret taken out of a saved link.
+pub const REDACTED: &str = "REDACTED";
+
+/// Why a saved link cannot be requested again.
+pub const REDACTED_LINK: &str = "The link held a secret that was not saved; paste the link again";
+
+/// Query and fragment parameters whose values are secrets (lower case, matched ignoring case):
+/// the signatures and signing keys of presigned links (S3 and CloudFront, Google Cloud Storage,
+/// Azure SAS `sig`), tokens and keys that stand in for a login (OAuth, Moodle and Canvas
+/// `token`, API keys, SharePoint and OneDrive `tempauth`), and passwords.
+const SECRET_PARAMS: &[&str] = &[
+    "x-amz-signature",
+    "x-amz-credential",
+    "x-amz-security-token",
+    "awsaccesskeyid",
+    "x-goog-signature",
+    "x-goog-credential",
+    "googleaccessid",
+    "sig",
+    "signature",
+    "token",
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "tempauth",
+    "api_key",
+    "apikey",
+    "key",
+    "client_secret",
+    "password",
+    "secret",
+];
+
+/// Parameters that are secrets only on some hosts (and their subdomains), as the names are
+/// common elsewhere: Discord's attachment signature `hm`, and Outlook Safe Links' `data`, which
+/// holds the recipient's address, and `sdata`, its signature.
+const HOST_SECRET_PARAMS: &[(&str, &[&str])] = &[
+    ("discordapp.com", &["hm"]),
+    ("discordapp.net", &["hm"]),
+    ("safelinks.protection.outlook.com", &["data", "sdata"]),
+    ("safelinks.protection.office365.us", &["data", "sdata"]),
+];
+
+/// `url` without its secrets, for saving: the `user:password@` part is dropped and the values of
+/// secret parameters (see `SECRET_PARAMS`) in the query and fragment become [`REDACTED`], also in
+/// links carried inside a parameter (a redirect's target). Everything else is kept as written, so
+/// a link without secrets comes back unchanged, as does a string that is not a URL.
+pub fn redact_url(url: &str) -> String {
+    scrub(url).0.into_owned()
+}
+
+/// A secret was taken out of this saved link (see [`redact_url`]), so it cannot be requested.
+pub fn is_redacted(url: &str) -> bool {
+    scrub(url).1
+}
+
+/// `text` (an error message, say) with every link in it passed through [`redact_url`].
+pub fn redact_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("://") {
+        let scheme = rest[..at].chars().rev().take_while(|c| c.is_ascii_alphanumeric() || "+-.".contains(*c)).count();
+        let start = at - scheme;
+        let len = rest[at..].find(|c: char| c.is_whitespace() || "\"'<>()[]{}".contains(c)).unwrap_or(rest.len() - at);
+        // Punctuation that ends a sentence is not part of the link.
+        let link = rest[start..at + len].trim_end_matches(['.', ',', ':', ';']);
+        let end = (start + link.len()).max(at + 3);
+        out.push_str(&rest[..start]);
+        out.push_str(&redact_url(&rest[start..end]));
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `input` without its secrets (borrowed when it has none), and whether a secret parameter
+/// already holds [`REDACTED`].
+fn scrub(input: &str) -> (Cow<'_, str>, bool) {
+    let unchanged = (Cow::Borrowed(input), false);
+    if !input.contains(['@', '?', '#']) {
+        return unchanged;
+    }
+    let Ok(mut url) = Url::parse(input) else {
+        return unchanged;
+    };
+    let mut changed = false;
+    if !url.username().is_empty() || url.password().is_some() {
+        let _ = url.set_password(None);
+        let _ = url.set_username("");
+        changed = true;
+    }
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    let scoped: Vec<&str> = HOST_SECRET_PARAMS
+        .iter()
+        .filter(|(domain, _)| host.strip_suffix(domain).is_some_and(|sub| sub.is_empty() || sub.ends_with('.')))
+        .flat_map(|(_, names)| names.iter().copied())
+        .collect();
+    let mut marked = false;
+    if let Some(query) = url.query().and_then(|q| scrub_pairs(q, &scoped, &mut marked)) {
+        url.set_query(Some(&query));
+        changed = true;
+    }
+    if let Some(fragment) = url.fragment().and_then(|f| scrub_pairs(f, &scoped, &mut marked)) {
+        url.set_fragment(Some(&fragment));
+        changed = true;
+    }
+    (if changed { Cow::Owned(url.into()) } else { Cow::Borrowed(input) }, marked)
+}
+
+/// The `name=value` pairs of a query or fragment with secret values replaced and links inside
+/// values scrubbed, or None if nothing changed. Sets `marked` when a secret already holds
+/// [`REDACTED`].
+fn scrub_pairs(pairs: &str, scoped: &[&str], marked: &mut bool) -> Option<String> {
+    let mut changed = false;
+    let out: Vec<Cow<'_, str>> = pairs
+        .split('&')
+        .map(|pair| {
+            let Some((name, value)) = form_urlencoded::parse(pair.as_bytes()).next() else {
+                return Cow::Borrowed(pair);
+            };
+            let raw_name = pair.split_once('=').map_or(pair, |(n, _)| n);
+            let secret = SECRET_PARAMS.iter().chain(scoped).any(|s| name.eq_ignore_ascii_case(s));
+            if secret && value == REDACTED {
+                *marked = true;
+            } else if secret && !value.is_empty() {
+                changed = true;
+                return Cow::Owned(format!("{raw_name}={REDACTED}"));
+            } else if value.contains("://") {
+                let (inner, inner_marked) = scrub(&value);
+                *marked |= inner_marked;
+                if let Cow::Owned(inner) = inner {
+                    changed = true;
+                    let encoded: String = form_urlencoded::byte_serialize(inner.as_bytes()).collect();
+                    return Cow::Owned(format!("{raw_name}={encoded}"));
+                }
+            }
+            Cow::Borrowed(pair)
+        })
+        .collect();
+    changed.then(|| out.join("&"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,8 +210,9 @@ pub struct HistoryEntry {
 }
 
 impl HistoryEntry {
-    /// Creates an entry with a unique id. `started_at` defaults to now; callers that build the
-    /// entry after the download finished must set it to the time the download began.
+    /// Creates an entry with a unique id and `urls` without their secrets (see [`redact_url`]).
+    /// `started_at` defaults to now; callers that build the entry after the download finished
+    /// must set it to the time the download began.
     pub fn new(
         file_name: String,
         file_path: PathBuf,
@@ -85,12 +230,24 @@ impl HistoryEntry {
             file_path,
             file_size,
             downloaded_bytes: 0,
-            urls,
+            urls: urls.iter().map(|u| redact_url(u)).collect(),
             status: HistoryStatus::Completed,
             blake3_hash: None,
             sha256_hash: None,
             started_at: now,
             completed_at: None,
+        }
+    }
+
+    /// Takes the secrets out of the links and of a failure message.
+    fn redact(&mut self) {
+        for url in &mut self.urls {
+            if let Cow::Owned(redacted) = scrub(url).0 {
+                *url = redacted;
+            }
+        }
+        if let HistoryStatus::Failed(reason) = &mut self.status {
+            *reason = redact_text(reason);
         }
     }
 
@@ -126,8 +283,12 @@ fn read_entries(path: &Path, backup: bool) -> io::Result<Vec<HistoryEntry>> {
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e),
     };
-    match serde_json::from_slice(&bytes) {
-        Ok(entries) => Ok(entries),
+    match serde_json::from_slice::<Vec<HistoryEntry>>(&bytes) {
+        // Entries saved before links were redacted lose their secrets at the next save.
+        Ok(mut entries) => {
+            entries.iter_mut().for_each(HistoryEntry::redact);
+            Ok(entries)
+        }
         Err(parse_err) if backup => {
             let backup = with_suffix(path, &format!(".corrupt-{}", unique_suffix()));
             fs::rename(path, &backup)?;
@@ -210,7 +371,10 @@ impl Change {
         match self {
             Change::Upsert(entry) => {
                 entries.retain(|e| e.id != entry.id && e.file_path != entry.file_path);
-                entries.insert(0, entry.clone());
+                // Also a failure message set after `HistoryEntry::new`.
+                let mut entry = entry.clone();
+                entry.redact();
+                entries.insert(0, entry);
                 return true;
             }
             Change::Remove(id) => entries.retain(|e| e.id != *id),
@@ -579,5 +743,101 @@ mod tests {
         assert_eq!(entries.len(), MAX_ENTRIES);
         assert_eq!(entries[0].completed_at, Some(MAX_ENTRIES as u64 + 4));
         assert_eq!(entries.last().unwrap().completed_at, Some(5));
+    }
+
+    #[test]
+    fn redact_takes_out_credentials_and_secret_parameters_only() {
+        assert_eq!(redact_url("https://me:pw@files.example/a.zip"), "https://files.example/a.zip");
+        assert_eq!(redact_url("ftp://me@files.example/a.zip"), "ftp://files.example/a.zip");
+        let s3 = "https://b.s3.amazonaws.com/k.bin?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIA%2F2026&X-Amz-Date=20260927T000000Z&X-Amz-Security-Token=t&X-Amz-Signature=abc";
+        assert_eq!(
+            redact_url(s3),
+            "https://b.s3.amazonaws.com/k.bin?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=REDACTED&X-Amz-Date=20260927T000000Z&X-Amz-Security-Token=REDACTED&X-Amz-Signature=REDACTED"
+        );
+        assert_eq!(redact_url("https://a.blob.core.windows.net/c/f?sv=2022&SIG=x%2By"), "https://a.blob.core.windows.net/c/f?sv=2022&SIG=REDACTED");
+        assert_eq!(
+            redact_url("https://moodle.example/webservice/pluginfile.php/1/f.pdf?Token=abc&forcedownload=1"),
+            "https://moodle.example/webservice/pluginfile.php/1/f.pdf?Token=REDACTED&forcedownload=1"
+        );
+        assert_eq!(redact_url("https://app.example/cb#access_token=abc&state=1"), "https://app.example/cb#access_token=REDACTED&state=1");
+
+        // Links without secrets, and strings that are not links, come back exactly as given.
+        for same in ["https://e.com/a%20b?x=1&token", "HTTPS://E.com/a?q=1", "not a url?token=abc", "hyperfetch-media:/yt/id/137", ""] {
+            assert_eq!(redact_url(same), same);
+        }
+        let once = redact_url(s3);
+        assert_eq!(redact_url(&once), once, "redacting again changes nothing");
+    }
+
+    #[test]
+    fn redact_knows_host_specific_secrets_and_links_inside_links() {
+        let discord = "https://cdn.discordapp.com/attachments/1/2/f.png?ex=65&is=64&hm=abc&";
+        assert_eq!(redact_url(discord), "https://cdn.discordapp.com/attachments/1/2/f.png?ex=65&is=64&hm=REDACTED&");
+        assert_eq!(redact_url("https://other.example/f?hm=abc&data=1"), "https://other.example/f?hm=abc&data=1");
+
+        let safelink = "https://nam12.safelinks.protection.outlook.com/?url=https%3A%2F%2Fx.example%2Ff.zip%3Ftoken%3Dabc&data=05%7C02%7Cme%40corp.example%7C&sdata=xyz&reserved=0";
+        let redacted = redact_url(safelink);
+        assert!(!redacted.contains("corp.example") && !redacted.contains("xyz") && !redacted.contains("abc"), "{redacted}");
+        assert!(redacted.ends_with("&data=REDACTED&sdata=REDACTED&reserved=0"), "{redacted}");
+        let inner = url::form_urlencoded::parse(Url::parse(&redacted).unwrap().query().unwrap().as_bytes()).next().unwrap().1.into_owned();
+        assert_eq!(inner, "https://x.example/f.zip?token=REDACTED");
+        assert!(is_redacted(&redacted), "a secret inside the carried link counts too");
+    }
+
+    #[test]
+    fn only_a_saved_link_counts_as_redacted() {
+        let live = "https://h.example/f?token=abc";
+        assert!(!is_redacted(live));
+        assert!(is_redacted(&redact_url(live)));
+        assert!(!is_redacted("https://h.example/f?note=REDACTED"), "not a secret parameter");
+        assert!(!is_redacted("https://me:pw@h.example/f"), "a dropped login leaves nothing to find");
+    }
+
+    #[test]
+    fn redact_text_scrubs_every_link_in_a_message() {
+        assert_eq!(redact_text("https://h/f?token=abc: HTTP 403"), "https://h/f?token=REDACTED: HTTP 403");
+        assert_eq!(
+            redact_text("error sending request for url (https://u:p@h/x?sig=1&a=2), then ftp://me:pw@f/y."),
+            "error sending request for url (https://h/x?sig=REDACTED&a=2), then ftp://f/y."
+        );
+        for same in ["connection reset", "odd :// here", "://", "é://x?token=1"] {
+            assert_eq!(redact_text(same), same);
+        }
+    }
+
+    #[test]
+    fn history_keeps_no_secrets_and_still_finds_the_entry() {
+        let dir = tempdir().unwrap();
+        let history_path = dir.path().join("history.json");
+        let live = "https://me:pw@h.example/f.bin?X-Amz-Signature=abc&v=1";
+        let mut failed = HistoryEntry::new("f.bin".into(), dir.path().join("f.bin"), 1, vec![live.to_string()]);
+        assert_eq!(failed.urls, ["https://h.example/f.bin?X-Amz-Signature=REDACTED&v=1"]);
+        // The failure message is set after `new`, as a download does.
+        failed.status = HistoryStatus::Failed(format!("{live}: HTTP 403"));
+        DownloadHistoryManager::record(&history_path, failed).unwrap();
+
+        let on_disk = std::fs::read_to_string(&history_path).unwrap();
+        assert!(!on_disk.contains("abc") && !on_disk.contains("pw"), "{on_disk}");
+        let loaded = DownloadHistoryManager::load_from_path(&history_path);
+        assert_eq!(loaded.entries()[0].urls, [redact_url(live)], "the live link finds its entry by its redacted form");
+    }
+
+    #[test]
+    fn old_entries_lose_their_secrets_at_the_next_save() {
+        let dir = tempdir().unwrap();
+        let history_path = dir.path().join("history.json");
+        let mut old = entry("old.bin", dir.path());
+        old.urls = vec!["https://h.example/old.bin?token=abc".into()];
+        old.status = HistoryStatus::Failed("https://h.example/old.bin?token=abc: HTTP 500".into());
+        std::fs::write(&history_path, serde_json::to_vec(&[old]).unwrap()).unwrap();
+
+        let mut manager = DownloadHistoryManager::load_from_path(&history_path);
+        assert_eq!(manager.entries()[0].urls, ["https://h.example/old.bin?token=REDACTED"]);
+        assert_eq!(manager.entries()[0].status, HistoryStatus::Failed("https://h.example/old.bin?token=REDACTED: HTTP 500".into()));
+        assert!(std::fs::read_to_string(&history_path).unwrap().contains("abc"), "a plain load writes nothing");
+
+        manager.add_or_update(entry("new.bin", dir.path()));
+        assert!(!std::fs::read_to_string(&history_path).unwrap().contains("abc"));
+        assert_eq!(names_on_disk(&history_path), ["new.bin", "old.bin"]);
     }
 }
