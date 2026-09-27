@@ -917,6 +917,22 @@ impl SmartResolver {
     }
 }
 
+/// The app's own User-Agent, for requests that do not pass as a browser's.
+pub(crate) const APP_USER_AGENT: &str = concat!("EndosUnifiedDownloader/", env!("CARGO_PKG_VERSION"));
+
+/// Hosts that refuse the browser User-Agent of `SmartResolver::default_anti_qos_headers`, and
+/// get [`APP_USER_AGENT`] instead: Codeberg answers /raw/ and /media/ for an older Chrome with
+/// "403 Access denied, old Chrome version".
+const OWN_AGENT_HOSTS: &[&str] = &["codeberg.org"];
+
+/// `request`, for `url`, with the User-Agent `url`'s host takes.
+pub(crate) fn with_agent_for(request: reqwest::RequestBuilder, url: &Url) -> reqwest::RequestBuilder {
+    match url.host_str() {
+        Some(host) if OWN_AGENT_HOSTS.contains(&host.trim_end_matches('.')) => request.header(USER_AGENT, APP_USER_AGENT),
+        _ => request,
+    }
+}
+
 async fn with_timeout(
     fut: impl Future<Output = Result<Vec<Url>, ResolverError>>,
 ) -> Result<Vec<Url>, ResolverError> {
@@ -1537,6 +1553,25 @@ mod tests {
             let page = Url::parse(page).unwrap();
             assert_eq!(code_host_raw_url(&page), None, "{page}");
             assert!(!CodeHostResolver.can_handle(&page), "{page}");
+        }
+    }
+
+    /// Codeberg refuses the browser User-Agent the engine sends elsewhere ("403 Access denied,
+    /// old Chrome version" on /media/ and /raw/, checked with curl), and takes the app's own.
+    #[test]
+    fn test_codeberg_gets_the_apps_own_user_agent() {
+        let client = Client::builder().default_headers(SmartResolver::default_anti_qos_headers()).build().unwrap();
+        let agent = |link: &str| {
+            let url = Url::parse(link).unwrap();
+            let request = with_agent_for(client.get(url.clone()), &url).build().unwrap();
+            request.headers().get(USER_AGENT).map(|v| v.to_str().unwrap().to_string())
+        };
+        let app = Some(APP_USER_AGENT.to_string());
+        assert_eq!(agent("https://codeberg.org/forgejo/forgejo/media/branch/forgejo/README.md"), app);
+        assert_eq!(agent("https://codeberg.org./o/r/raw/branch/main/app.zip"), app);
+        // Elsewhere the client's own, a browser's, stays.
+        for other in ["https://github.com/o/r/raw/main/app.zip", "https://docs.codeberg.org/x", "https://example.com/codeberg.org"] {
+            assert_eq!(agent(other), None, "{other}");
         }
     }
 

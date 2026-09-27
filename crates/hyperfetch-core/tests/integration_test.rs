@@ -3101,3 +3101,53 @@ async fn test_a_page_whose_site_finds_an_empty_list_is_downloaded_as_it_is() {
     assert_file(&out, &page.data);
     assert_eq!(runs_of(tools.path()).len(), 1, "yt-dlp was asked once, to find");
 }
+
+/// The proxy a download sends every request through, standing in for the hosts they name:
+/// `answer` gives the response to a request by its method, its target (an absolute URL) and its
+/// User-Agent.
+async fn serve_proxy_by_agent(answer: fn(&str, &str, &str) -> Vec<u8>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let Some(head) = read_head(&mut socket).await else { return };
+                let mut request_line = head.lines().next().unwrap_or("").split(' ');
+                let (method, target) = (request_line.next().unwrap_or(""), request_line.next().unwrap_or(""));
+                let agent = head.lines().find_map(|l| l.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case("user-agent")));
+                let _ = socket.write_all(&answer(method, target, agent.map_or("", |(_, v)| v.trim()))).await;
+            });
+        }
+    });
+    proxy
+}
+
+/// Codeberg as it answers a browser User-Agent: the file page shows the file, its download link
+/// refuses an older Chrome and serves the file to anything else.
+fn codeberg(method: &str, target: &str, agent: &str) -> Vec<u8> {
+    match target {
+        "http://codeberg.org/o/r/src/branch/main/dist/tool.bin" => {
+            response(method, "200 OK", "Content-Type: text/html; charset=utf-8\r\n", b"<!doctype html><title>tool.bin</title>")
+        }
+        "http://codeberg.org/o/r/media/branch/main/dist/tool.bin" if agent.contains("Chrome/") => {
+            response(method, "403 Forbidden", "Content-Type: text/plain\r\n", b"Access denied, old Chrome version.")
+        }
+        "http://codeberg.org/o/r/media/branch/main/dist/tool.bin" => {
+            response(method, "200 OK", "Content-Type: application/octet-stream\r\n", &payload(64 * KB, 379))
+        }
+        _ => response(method, "404 Not Found", "Content-Type: text/html; charset=utf-8\r\n", b"<!doctype html><title>Not Found</title>"),
+    }
+}
+
+#[tokio::test]
+async fn test_a_codeberg_file_page_downloads_the_file() {
+    let _history = setup().await;
+    let proxy = serve_proxy_by_agent(codeberg).await;
+    let temp = tempdir().unwrap();
+    let page = Url::parse("http://codeberg.org/o/r/src/branch/main/dist/tool.bin").unwrap();
+    let opts = DownloadOptions { proxy: Some(proxy), ..options(temp.path(), 4, 64 * KB) };
+
+    let path = run(&DownloadEngine::new(vec![page], opts), None).await.expect("the file should download");
+    assert_eq!(path, temp.path().join("tool.bin"));
+    assert_file(&path, &payload(64 * KB, 379));
+}
