@@ -28,17 +28,21 @@ const JSON_VIDEO_KEYS: &[&str] = &["viewMp4Url", "downloadUrl", "videoUrl", "vid
 
 const SOURCEFORGE_MIRRORS: &[&str] = &["autoselect", "netix", "phoenixnap", "netcologne", "jaist", "liquidtelecom"];
 
-/// "You are leaving this site" links: their hosts, their path (trailing slash aside; `None` for
-/// any) and the query parameters that may hold the target, in the order they are tried.
+/// "You are leaving this site" links: their hosts (a trailing `*` for any of the site's country
+/// domains, see `country_domain`), their path (trailing slash aside; `None` for any) and the query
+/// parameters that may hold the target, in the order they are tried.
 const REDIRECT_WRAPPERS: &[(&[&str], Option<&str>, &[&str])] = &[
     (&["youtube.com", "www.youtube.com", "m.youtube.com"], Some("/redirect"), &["q"]),
-    (&["google.com", "www.google.com"], Some("/url"), &["q", "url"]),
+    // google.com, and google.co.uk, google.de, ... where Google Search runs outside the US.
+    (&["google.*", "www.google.*"], Some("/url"), &["q", "url"]),
     (&["l.facebook.com", "lm.facebook.com", "l.messenger.com"], Some("/l.php"), &["u"]),
     (&["l.instagram.com", "l.threads.net", "l.threads.com"], Some(""), &["u"]),
     // `url` is the parameter older links carry.
     (&["steamcommunity.com"], Some("/linkfilter"), &["u", "url"]),
     (&["out.reddit.com"], None, &["url"]),
     (&["linkedin.com", "www.linkedin.com"], Some("/redir/redirect"), &["url"]),
+    // LinkedIn's for links in messages.
+    (&["linkedin.com", "www.linkedin.com"], Some("/safety/go"), &["url"]),
     (&["vk.com", "m.vk.com"], Some("/away.php"), &["to"]),
     (&["duckduckgo.com"], Some("/l"), &["uddg"]),
     (&["t.umblr.com"], Some("/redirect"), &["z"]),
@@ -324,14 +328,24 @@ pub fn unwrap_redirect(url: &Url) -> Option<Url> {
 fn unwrap_once(url: &Url) -> Option<Url> {
     let host = url.host_str()?.trim_end_matches('.');
     let path = url.path().trim_end_matches('/');
+    let listed = |pattern: &&str| match pattern.strip_suffix('*') {
+        Some(stem) => host.strip_prefix(stem).is_some_and(country_domain),
+        None => host == *pattern,
+    };
     let (_, _, params) = REDIRECT_WRAPPERS
         .iter()
-        .find(|(hosts, wrapper_path, _)| hosts.contains(&host) && wrapper_path.is_none_or(|p| p == path))?;
+        .find(|(hosts, wrapper_path, _)| hosts.iter().any(listed) && wrapper_path.is_none_or(|p| p == path))?;
     params.iter().find_map(|name| {
         let (_, value) = url.query_pairs().find(|(key, _)| key == name)?;
         let target = Url::parse(value.trim()).ok()?;
         matches!(target.scheme(), "http" | "https").then_some(target)
     })
+}
+
+/// Whether `domain` ends a host as a site's country domains do: `com`, `de`, `co.uk`, `com.au`.
+fn country_domain(domain: &str) -> bool {
+    let tld = domain.strip_prefix("co.").or_else(|| domain.strip_prefix("com.")).unwrap_or(domain);
+    !tld.is_empty() && tld.bytes().all(|b| b.is_ascii_lowercase())
 }
 
 /// Fails if the answer to `url` (which ended at `final_url`), with these headers, is a web page
@@ -1215,6 +1229,10 @@ mod tests {
             format!("https://m.youtube.com/redirect/?q={enc}"),
             format!("https://www.google.com/url?q={enc}&sa=D&source=docs&ust=1&usg=AOv"),
             format!("https://google.com/url?sa=t&url={enc}"),
+            format!("https://www.google.co.uk/url?q={enc}"),
+            format!("https://www.google.de/url?sa=t&url={enc}"),
+            format!("https://www.google.com.au/url?q={enc}"),
+            format!("https://google.co.in/url?q={enc}"),
             format!("https://l.facebook.com/l.php?u={enc}&h=AT0"),
             format!("https://lm.facebook.com/l.php?u={enc}"),
             format!("https://l.messenger.com/l.php?u={enc}"),
@@ -1224,6 +1242,7 @@ mod tests {
             format!("https://steamcommunity.com/linkfilter/?url={enc}"),
             format!("https://out.reddit.com/t3_1abcd?url={enc}&token=AQAA&app_name=web2x"),
             format!("https://www.linkedin.com/redir/redirect?url={enc}&urlhash=x"),
+            format!("https://www.linkedin.com/safety/go?url={enc}&trk=flagship-messaging-web&messageThreadUrn=urn"),
             format!("https://vk.com/away.php?to={enc}&cc_key="),
             format!("https://m.vk.com/away.php?to={enc}"),
             format!("https://duckduckgo.com/l/?uddg={enc}&rut=abc"),
@@ -1258,6 +1277,12 @@ mod tests {
         for link in [
             "https://www.youtube.com/watch?v=dQw4w9WgXcQ&q=https%3A%2F%2Fexample.com",
             "https://www.google.com/search?q=https%3A%2F%2Fexample.com",
+            "https://www.google.co.uk/search?q=https%3A%2F%2Fexample.com",
+            // Only Google's own country domains.
+            "https://google.example.com/url?q=https%3A%2F%2Fexample.org",
+            "https://www.google.co.uk.example.com/url?q=https%3A%2F%2Fexample.org",
+            "https://notgoogle.com/url?q=https%3A%2F%2Fexample.org",
+            "https://www.linkedin.com/safety/help?url=https%3A%2F%2Fexample.org",
             "https://example.com/redirect?q=https%3A%2F%2Fexample.org",
             "https://www.youtube.com/redirect?event=video_description",
             "https://www.youtube.com/redirect?q=example.com%2Ffile.zip",
