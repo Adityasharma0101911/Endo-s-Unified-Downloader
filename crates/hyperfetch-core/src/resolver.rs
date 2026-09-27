@@ -241,7 +241,12 @@ pub struct GoogleDriveResolver;
 
 impl HostResolver for GoogleDriveResolver {
     fn can_handle(&self, url: &Url) -> bool {
-        matches!(url.host_str(), Some("drive.google.com" | "drive.usercontent.google.com"))
+        match url.host_str() {
+            Some("drive.google.com" | "drive.usercontent.google.com") => true,
+            // Older Drive links: docs.google.com/uc?id=... and /file/d/{id}/...
+            Some("docs.google.com") => url.path() == "/uc" || url.path().starts_with("/file/d/"),
+            _ => false,
+        }
     }
 
     /// The direct download URL, sending nothing: whether Drive serves the file there shows in the
@@ -317,6 +322,67 @@ fn google_drive_direct_url(file_id: &str) -> Result<Url, ResolverError> {
         &[("id", file_id), ("export", "download"), ("confirm", "t")],
     )
     .map_err(|e| ResolverError::Parse(e.to_string()))
+}
+
+/// Google Docs Resolver (Turns a Docs, Sheets or Slides link into the document exported as a file)
+pub struct GoogleDocsResolver;
+
+/// The export of the document `url` links to, rewritten without a request, as Google's own
+/// File > Download does it: a document as .docx, a spreadsheet as .xlsx, or as .csv of the one
+/// sheet the link names (`gid`), a presentation as .pptx. An export link is kept in the format
+/// it asks for. Exports are made on the fly: one connection, no known size.
+fn google_docs_export(url: &Url) -> Option<Url> {
+    if url.host_str()? != "docs.google.com" {
+        return None;
+    }
+    let segs: Vec<&str> = url.path_segments()?.collect();
+    let (&kind, rest) = segs.split_first()?;
+    let format = match kind {
+        "document" => "docx",
+        "spreadsheets" => "xlsx",
+        "presentation" => "pptx",
+        _ => return None,
+    };
+    // /u/{n}/ picks one of the signed-in accounts (the cookies passed); it is kept.
+    let (account, rest) = match rest {
+        ["u", n, rest @ ..] if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => (format!("/u/{}", n), rest),
+        _ => (String::new(), rest),
+    };
+    // /d/e/{id} is a published copy: a web page, with no export.
+    let ["d", id, rest @ ..] = rest else { return None };
+    if id.is_empty() || *id == "e" {
+        return None;
+    }
+    let mut export = url.clone();
+    export.set_fragment(None);
+    if rest.first() == Some(&"export") {
+        return Some(export);
+    }
+    export.set_path(&format!("/{}{}/d/{}/export", kind, account, id));
+    let query = match sheet_gid(url).filter(|_| kind == "spreadsheets") {
+        Some(gid) => format!("format=csv&gid={}", gid),
+        None => format!("format={}", format),
+    };
+    export.set_query(Some(&query));
+    Some(export)
+}
+
+/// The sheet a spreadsheet link names: `gid` in its query or its fragment (`#gid=123`).
+fn sheet_gid(url: &Url) -> Option<String> {
+    let in_query = url.query_pairs().find(|(k, _)| k == "gid").map(|(_, v)| v.into_owned());
+    let in_fragment = || url.fragment()?.split('&').find_map(|p| p.strip_prefix("gid=")).map(str::to_string);
+    in_query.or_else(in_fragment).filter(|gid| !gid.is_empty() && gid.bytes().all(|b| b.is_ascii_digit()))
+}
+
+impl HostResolver for GoogleDocsResolver {
+    fn can_handle(&self, url: &Url) -> bool {
+        google_docs_export(url).is_some()
+    }
+
+    async fn resolve(&self, _client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
+        let export = google_docs_export(url).ok_or_else(|| ResolverError::Parse(format!("Not a Google Docs document URL: {}", url)))?;
+        Ok(vec![export])
+    }
 }
 
 /// MediaFire Resolver (Bypasses landing page to extract direct CDN link)
@@ -526,6 +592,7 @@ impl SmartResolver {
     /// Whether a host resolver (not the generic page one) takes `url`.
     pub fn handles(url: &Url) -> bool {
         GoogleDriveResolver.can_handle(url)
+            || GoogleDocsResolver.can_handle(url)
             || MediaFireResolver.can_handle(url)
             || DropboxResolver.can_handle(url)
             || SourceForgeResolver.can_handle(url)
@@ -539,6 +606,9 @@ impl SmartResolver {
         // The landing pages of these hosts are never the file, so a failed extraction is an error.
         if GoogleDriveResolver.can_handle(url) {
             return with_timeout(GoogleDriveResolver.resolve(client, url)).await;
+        }
+        if GoogleDocsResolver.can_handle(url) {
+            return GoogleDocsResolver.resolve(client, url).await;
         }
         if MediaFireResolver.can_handle(url) {
             return with_timeout(MediaFireResolver.resolve(client, url)).await;
@@ -1201,6 +1271,75 @@ mod tests {
         let resolved = SmartResolver::resolve(&client, &page).await.unwrap();
         assert_eq!(resolved, vec![Url::parse("https://github.com/o/r/raw/main/app.zip").unwrap()]);
         assert!(!contacted(&proxy).await, "the code host was asked before the download's probe");
+    }
+
+    #[test]
+    fn test_google_docs_links_become_their_export() {
+        let (doc, sheet, deck) = (
+            "195j9eDD3ccgjQRttHhJPymLJUCOUjs-jmwTrekvdjFE",
+            "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms",
+            "1EAYk18WDjIG-zp_0vLm3CsfQh_i8eXc67Jo2O9C6Vuc",
+        );
+        let docs = |path: &str| format!("https://docs.google.com/{}", path);
+        // Each export link was checked to serve the document as an attachment.
+        for (link, export) in [
+            (format!("document/d/{doc}/edit?usp=sharing"), format!("document/d/{doc}/export?format=docx")),
+            (format!("document/u/0/d/{doc}/edit"), format!("document/u/0/d/{doc}/export?format=docx")),
+            (format!("document/d/{doc}"), format!("document/d/{doc}/export?format=docx")),
+            (format!("spreadsheets/d/{sheet}/edit?usp=sharing"), format!("spreadsheets/d/{sheet}/export?format=xlsx")),
+            (format!("spreadsheets/d/{sheet}/edit#gid=0"), format!("spreadsheets/d/{sheet}/export?format=csv&gid=0")),
+            (
+                format!("spreadsheets/u/1/d/{sheet}/edit?gid=1234#gid=1234"),
+                format!("spreadsheets/u/1/d/{sheet}/export?format=csv&gid=1234"),
+            ),
+            (format!("spreadsheets/d/{sheet}/htmlview#gid=abc"), format!("spreadsheets/d/{sheet}/export?format=xlsx")),
+            (format!("presentation/d/{deck}/edit#slide=id.p"), format!("presentation/d/{deck}/export?format=pptx")),
+            (format!("presentation/u/1/d/{deck}/view"), format!("presentation/u/1/d/{deck}/export?format=pptx")),
+            // An export in a format of the user's choosing is kept; a gid means nothing to a document.
+            (format!("document/d/{doc}/export?format=pdf#top"), format!("document/d/{doc}/export?format=pdf")),
+            (format!("presentation/d/{deck}/export/pdf"), format!("presentation/d/{deck}/export/pdf")),
+            (format!("document/d/{doc}/edit#gid=5"), format!("document/d/{doc}/export?format=docx")),
+        ] {
+            let link = Url::parse(&docs(&link)).unwrap();
+            assert!(SmartResolver::handles(&link), "{link}");
+            assert_eq!(google_docs_export(&link).map(String::from), Some(docs(&export)), "{link}");
+        }
+        for page in [
+            "https://docs.google.com/document/d/e/2PACX-1vR/pub",
+            "https://docs.google.com/spreadsheets/d/e/2PACX-1vR/pubhtml",
+            "https://docs.google.com/forms/d/e/1FAIpQLSf/viewform",
+            "https://docs.google.com/drawings/d/abc/edit",
+            "https://docs.google.com/document/u/0/",
+            "https://docs.google.com/spreadsheets/d/",
+            "https://example.com/document/d/abc/edit",
+        ] {
+            assert!(!GoogleDocsResolver.can_handle(&Url::parse(page).unwrap()), "{page}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_older_drive_links_on_docs_google_com_go_to_drive() {
+        let direct = google_drive_direct_url("1BxyzABC_12345").unwrap();
+        for link in [
+            "https://docs.google.com/uc?export=download&id=1BxyzABC_12345",
+            "https://docs.google.com/file/d/1BxyzABC_12345/edit",
+        ] {
+            let resolved = SmartResolver::resolve(&Client::new(), &Url::parse(link).unwrap()).await.unwrap();
+            assert_eq!(resolved, vec![direct.clone()], "{link}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_google_docs_resolver_sends_nothing() {
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = Client::builder()
+            .proxy(reqwest::Proxy::all(format!("http://{}", proxy.local_addr().unwrap())).unwrap())
+            .build()
+            .unwrap();
+        let link = Url::parse("https://docs.google.com/document/d/abc/edit").unwrap();
+        let resolved = SmartResolver::resolve(&client, &link).await.unwrap();
+        assert_eq!(resolved, vec![Url::parse("https://docs.google.com/document/d/abc/export?format=docx").unwrap()]);
+        assert!(!contacted(&proxy).await, "Google Docs was asked before the download's probe");
     }
 
     fn utf8_percent_encode(s: &str) -> String {
