@@ -11,7 +11,7 @@ use reqwest::{Client, StatusCode};
 use tokio::sync::broadcast;
 use url::Url;
 use crate::engine::{claim_target, discard_partial, DownloadEngine, DownloadOptions, EngineSnapshot, TargetClaim};
-use crate::history::{DownloadHistoryManager, HistoryEntry};
+use crate::history::{is_redacted, DownloadHistoryManager, HistoryEntry, REDACTED_LINK};
 use crate::range::{compute_gaps, merge_ranges, ByteRange};
 use crate::state::DownloadState;
 use crate::storage::DiskWriter;
@@ -498,6 +498,12 @@ where
     if urls.is_empty() {
         return Err("No mirror URLs provided for chunk repair".to_string());
     }
+    // A link history saved without its secret is never requested.
+    let usable: Vec<Url> = urls.iter().filter(|u| !is_redacted(u.as_str())).cloned().collect();
+    if usable.is_empty() {
+        return Err(REDACTED_LINK.to_string());
+    }
+    let urls = usable.as_slice();
     if let Some(r) = missing_ranges.iter().find(|r| r.end >= total_size) {
         return Err(format!("Missing range {} lies outside the {}-byte file", r, total_size));
     }
@@ -1532,6 +1538,23 @@ mod tests {
         let res = repair_missing_ranges(&fresh, 1000, &[gap], &[Url::parse("http://127.0.0.1:9/").unwrap()], &DownloadOptions::default(), None, |_, _| {}).await;
         assert!(res.as_ref().is_err_and(|e| e.contains("refusing to overwrite")), "{:?}", res);
         assert!(claim_target(&fresh).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn repair_never_requests_a_link_saved_without_its_secret() {
+        let dir = tempdir().unwrap();
+        let content = content();
+        let path = damaged_file(dir.path(), &content);
+        let data = std::fs::read(&path).unwrap();
+        let gap = ByteRange::new(100, 199).unwrap();
+        let redacted = Url::parse("http://127.0.0.1:9/file.bin?token=REDACTED").unwrap();
+        let res = repair_missing_ranges(&path, 1000, &[gap], std::slice::from_ref(&redacted), &DownloadOptions::default(), None, |_, _| {}).await;
+        assert_eq!(res, Err(REDACTED_LINK.to_string()));
+        assert_eq!(std::fs::read(&path).unwrap(), data);
+
+        let url = mock_server(content.clone(), |_, _, s, e, c| partial(s, e, c, usize::MAX)).await;
+        repair_missing_ranges(&path, 1000, &[gap], &[redacted, url], &DownloadOptions::default(), None, |_, _| {}).await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), content);
     }
 
     const MIB: usize = 1024 * 1024;
