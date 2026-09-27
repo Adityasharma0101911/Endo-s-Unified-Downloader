@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use hyperfetch_core::engine::DownloadOptions;
 use hyperfetch_core::history::DownloadHistoryManager;
+use hyperfetch_core::ingest::ListOptions;
 use hyperfetch_core::media::{is_supported_media_site, BrowserCookieSource, MediaQualityPreset};
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -47,6 +48,20 @@ pub struct Settings {
     pub clipboard_watch: bool,
     pub auto_run_queue: bool,
     pub max_concurrent: usize,
+    /// The user's Google API key, for listing whole Google Drive folders (empty = none).
+    pub google_api_key: String,
+    /// Leave out the items of a channel, playlist or feed downloaded before.
+    pub only_new: bool,
+    /// Only the newest this many items of a channel, playlist or feed (0 = all).
+    pub latest: usize,
+    /// Install a managed ffmpeg when a media download needs one and none is found.
+    pub install_ffmpeg: bool,
+    /// Subtitle languages for media downloads, e.g. "en,es" or "all" (empty = none).
+    pub subtitles: String,
+    /// Title, artist, date and URL tags, chapters and cover art inside media files.
+    pub embed_metadata: bool,
+    /// Record live streams from their start.
+    pub live_from_start: bool,
 }
 
 impl Default for Settings {
@@ -68,6 +83,13 @@ impl Default for Settings {
             clipboard_watch: true,
             auto_run_queue: true,
             max_concurrent: 4,
+            google_api_key: String::new(),
+            only_new: true,
+            latest: 0,
+            install_ffmpeg: engine.install_ffmpeg,
+            subtitles: String::new(),
+            embed_metadata: engine.embed_metadata,
+            live_from_start: engine.live_from_start,
         }
     }
 }
@@ -135,15 +157,6 @@ impl Settings {
         // A preset sends every non-file URL to yt-dlp, so it is only set for known media sites;
         // any other link that turns out to be media takes the quality all the same.
         let media_preset = urls.iter().any(is_supported_media_site).then(|| quality.clone());
-        let browser_cookies = match self.browser_cookies {
-            1 => Some(BrowserCookieSource::Chrome),
-            2 => Some(BrowserCookieSource::Edge),
-            3 => Some(BrowserCookieSource::Firefox),
-            4 => Some(BrowserCookieSource::Brave),
-            5 => Some(BrowserCookieSource::Opera),
-            6 => Some(BrowserCookieSource::Vivaldi),
-            _ => None,
-        };
         Ok(DownloadOptions {
             output_path: Some(PathBuf::from(save_dir)),
             expected_checksum: checksum,
@@ -152,9 +165,39 @@ impl Settings {
             proxy: non_empty(&self.proxy),
             media_preset,
             page_media_preset: Some(quality),
-            browser_cookies,
+            browser_cookies: self.browser_cookies(),
+            install_ffmpeg: self.install_ffmpeg,
+            subtitles: non_empty(&self.subtitles),
+            embed_metadata: self.embed_metadata,
+            live_from_start: self.live_from_start,
             ..self.tuning()
         })
+    }
+
+    /// How a link that lists many downloads (a folder, feed, playlist or channel) is read with
+    /// these settings: through the proxy, with the browser's cookies, else the cookies file.
+    pub fn list_options(&self) -> ListOptions {
+        let cookies_file = || non_empty(&self.cookies_path).map(|path| BrowserCookieSource::File(PathBuf::from(path)));
+        ListOptions {
+            google_api_key: non_empty(&self.google_api_key),
+            whole_playlist: false,
+            latest: Some(self.latest).filter(|&n| n > 0),
+            only_new: self.only_new,
+            cookies: self.browser_cookies().or_else(cookies_file).unwrap_or_default(),
+            proxy: non_empty(&self.proxy),
+        }
+    }
+
+    fn browser_cookies(&self) -> Option<BrowserCookieSource> {
+        match self.browser_cookies {
+            1 => Some(BrowserCookieSource::Chrome),
+            2 => Some(BrowserCookieSource::Edge),
+            3 => Some(BrowserCookieSource::Firefox),
+            4 => Some(BrowserCookieSource::Brave),
+            5 => Some(BrowserCookieSource::Opera),
+            6 => Some(BrowserCookieSource::Vivaldi),
+            _ => None,
+        }
     }
 
     /// The engine settings shared by every download and repair: connections, speed limit,
@@ -330,6 +373,43 @@ mod tests {
         let partial: Settings = serde_json::from_str(r#"{"connections": 4}"#).unwrap();
         assert_eq!(partial.connections, 4);
         assert_eq!(partial.max_retries, Settings::default().max_retries);
+    }
+
+    /// Listing and media settings saved by an older version take their defaults, and reach the
+    /// listers and the engine.
+    #[test]
+    fn listing_and_media_settings() {
+        let saved: Settings = serde_json::from_str(r#"{"proxy": "http://p:8080", "cookies_path": "c.txt"}"#).unwrap();
+        assert!(saved.only_new && saved.install_ffmpeg && saved.embed_metadata && !saved.live_from_start);
+        assert_eq!((saved.latest, saved.google_api_key.as_str(), saved.subtitles.as_str()), (0, "", ""));
+        let list = saved.list_options();
+        assert!(list.only_new && !list.whole_playlist);
+        assert_eq!((list.google_api_key, list.latest), (None, None));
+        assert_eq!((list.cookies, list.proxy.as_deref()), (BrowserCookieSource::File("c.txt".into()), Some("http://p:8080")));
+        let file = [Url::parse("https://example.com/a.iso").unwrap()];
+        let opts = saved.download_options(&file, "", "").unwrap();
+        assert!(opts.install_ffmpeg && opts.embed_metadata && !opts.live_from_start && !opts.wait_for_video);
+        assert_eq!(opts.subtitles, None);
+
+        let chosen = Settings {
+            google_api_key: " AIzaKey ".into(),
+            only_new: false,
+            latest: 5,
+            browser_cookies: 3,
+            install_ffmpeg: false,
+            subtitles: "en,es".into(),
+            embed_metadata: false,
+            live_from_start: true,
+            ..saved
+        };
+        let list = chosen.list_options();
+        assert_eq!((list.google_api_key.as_deref(), list.latest, list.only_new), (Some("AIzaKey"), Some(5), false));
+        assert_eq!(list.cookies, BrowserCookieSource::Firefox);
+        let opts = chosen.download_options(&file, "", "").unwrap();
+        assert!(!opts.install_ffmpeg && !opts.embed_metadata && opts.live_from_start);
+        assert_eq!(opts.subtitles.as_deref(), Some("en,es"));
+        let json = serde_json::to_string(&chosen).unwrap();
+        assert_eq!(serde_json::from_str::<Settings>(&json).unwrap(), chosen);
     }
 
     #[test]

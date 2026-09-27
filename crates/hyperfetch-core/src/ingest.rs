@@ -7,7 +7,7 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use url::Url;
 
-use crate::{metalink, resolver, torrent};
+use crate::{feeds, folders, media, metalink, resolver, torrent};
 
 /// Largest .metalink/.torrent document read from the network or the disk.
 const MAX_DESCRIPTOR_BYTES: usize = 16 * 1024 * 1024;
@@ -22,6 +22,10 @@ pub struct Task {
     /// File name (a relative path for metalinks and multi-file torrents) chosen by the input;
     /// None lets the server decide.
     pub name: Option<PathBuf>,
+    /// Subfolder of the save folder the file goes in, when the input decides the folder but not
+    /// the file name (a playlist entry, a feed episode named by the server). Cleaned like `name`
+    /// (see `clean_path`).
+    pub folder: Option<PathBuf>,
     /// Checksum published by a metalink.
     pub checksum: Option<String>,
     /// Size published by a metalink or torrent.
@@ -51,6 +55,38 @@ impl Task {
                     .unwrap_or_else(|| u.host_str().unwrap_or("download").to_string())
             })
             .unwrap_or_else(|| "download".to_string())
+    }
+}
+
+/// How a link that lists many downloads (a folder, feed, playlist or channel) is read.
+#[derive(Clone, Debug)]
+pub struct ListOptions {
+    /// The user's Google API key: lists a whole Google Drive folder through the Drive API.
+    /// Without it only what the public folder page shows is listed.
+    pub google_api_key: Option<String>,
+    /// A video link that also names a playlist (watch?v=X&list=Y) lists the playlist instead of
+    /// the one video.
+    pub whole_playlist: bool,
+    /// Only the newest N items of a channel, playlist or feed.
+    pub latest: Option<usize>,
+    /// Leave out items downloaded before (channel sync, feed updates).
+    pub only_new: bool,
+    /// Cookies for yt-dlp listings of private or members-only lists.
+    pub cookies: media::BrowserCookieSource,
+    /// Proxy for listings made outside the HTTP client [`ingest`] is given (yt-dlp's).
+    pub proxy: Option<String>,
+}
+
+impl Default for ListOptions {
+    fn default() -> Self {
+        Self {
+            google_api_key: None,
+            whole_playlist: false,
+            latest: None,
+            only_new: true,
+            cookies: media::BrowserCookieSource::None,
+            proxy: None,
+        }
     }
 }
 
@@ -109,6 +145,25 @@ pub fn names_document(text: &str) -> bool {
     descriptor_source(&unquote(text)).is_some() || split_tokens(text).iter().any(|t| descriptor_source(t).is_some())
 }
 
+/// Whether `url` may list many downloads (a folder, feed, playlist or channel), from its shape
+/// alone: [`ingest`] then asks the listers.
+pub fn might_list(url: &Url) -> bool {
+    folders::lists(url) || feeds::lists(url) || media::lists(url)
+}
+
+/// `token` as a link [`might_list`] takes, a "leaving this site" link replaced by its target.
+fn listing_url(token: &str) -> Option<Url> {
+    let url = http_url(token)?;
+    let url = resolver::unwrap_redirect(&url).unwrap_or(url);
+    might_list(&url).then_some(url)
+}
+
+/// Whether [`ingest`] reads `text` before it knows its downloads: it names a document (see
+/// [`names_document`]) or is one link that may list many. A UI thread leaves that to the runtime.
+pub fn needs_reading(text: &str) -> bool {
+    names_document(text) || matches!(&split_tokens(text)[..], [token] if listing_url(token).is_some())
+}
+
 /// `name` (from a torrent, metalink or magnet, so untrusted) made safe as one path component on
 /// every OS (see `engine::sanitize_component`). None when nothing is left, as for "." and "..".
 fn clean_component(name: &str) -> Option<String> {
@@ -116,7 +171,7 @@ fn clean_component(name: &str) -> Option<String> {
 }
 
 /// A relative path built from untrusted name components, each cleaned by [`clean_component`].
-fn clean_path<'a>(components: impl IntoIterator<Item = &'a str>) -> Result<PathBuf, String> {
+pub(crate) fn clean_path<'a>(components: impl IntoIterator<Item = &'a str>) -> Result<PathBuf, String> {
     components
         .into_iter()
         .map(|c| clean_component(c).ok_or_else(|| format!("unusable file name {:?}", c)))
@@ -147,7 +202,9 @@ pub async fn input_tokens(line: &str) -> Vec<String> {
 
 /// Parses one input (a batch line split on whitespace, or the command-line URLs) into tasks.
 ///
-/// The tokens are mirrors of one file (see [`link_task`]). A local or remote
+/// The tokens are mirrors of one file (see [`link_task`]), unless they are one link that
+/// [`might_list`]: the lister that takes it (folders, then feeds, then media) lists its
+/// downloads, as `options` say, or finds it lists nothing after all. A local or remote
 /// .metalink/.meta4/.torrent must stand alone and may yield several tasks, one per file. A
 /// remote .torrent none of whose files has an HTTP web seed yields the .torrent itself, for a
 /// torrent client. A remote document is fetched from where its host's resolver says the file is
@@ -156,7 +213,7 @@ pub async fn input_tokens(line: &str) -> Vec<String> {
 /// a web page yields the link itself, for the engine, which sends the user's cookies and
 /// Authorization and refuses a page in place of the file. The link itself is always the one
 /// typed, never where its resolver led. `Ok` is never empty.
-pub async fn ingest(tokens: &[impl AsRef<str>], http: &reqwest::Client) -> Result<Vec<Task>, String> {
+pub async fn ingest(tokens: &[impl AsRef<str>], http: &reqwest::Client, options: &ListOptions) -> Result<Vec<Task>, String> {
     if let [token] = tokens {
         if let Some((source, kind)) = descriptor_source(token.as_ref()) {
             return match source {
@@ -164,11 +221,35 @@ pub async fn ingest(tokens: &[impl AsRef<str>], http: &reqwest::Client) -> Resul
                 Source::Local(path) => document_tasks(kind, &read_local(&path).await?, None),
             };
         }
+        if let Some(url) = listing_url(token.as_ref()) {
+            if let Some(listed) = list(http, &url, options).await {
+                return listed;
+            }
+        }
     }
     if let Some(token) = tokens.iter().map(|t| t.as_ref()).find(|t| descriptor_source(t).is_some()) {
         return Err(format!("{}: a .metalink, .meta4 or .torrent input must be on its own", token));
     }
     link_task(tokens).map(|task| vec![task])
+}
+
+/// The downloads the folder, feed or playlist at `url` lists, from the first lister whose `lists`
+/// takes it and that finds a listing there; None when none does.
+async fn list(http: &reqwest::Client, url: &Url, options: &ListOptions) -> Option<Result<Vec<Task>, String>> {
+    if folders::lists(url) {
+        if let Some(listed) = folders::list(http, url, options).await {
+            return Some(listed);
+        }
+    }
+    if feeds::lists(url) {
+        if let Some(listed) = feeds::list(http, url, options).await {
+            return Some(listed);
+        }
+    }
+    if media::lists(url) {
+        return media::list(http, url, options).await;
+    }
+    None
 }
 
 /// The mirrors of one file named by links: http(s) URLs, each "leaving this site" link replaced
@@ -404,7 +485,7 @@ mod tests {
     fn run(line: &str) -> Result<Vec<Task>, String> {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let tokens: Vec<&str> = line.split_whitespace().collect();
-        rt.block_on(ingest(&tokens, &reqwest::Client::new()))
+        rt.block_on(ingest(&tokens, &reqwest::Client::new(), &ListOptions::default()))
     }
 
     fn link(text: &str) -> Result<Task, String> {
@@ -482,6 +563,16 @@ mod tests {
         assert!(names_document("https://a.example/x.torrent https://b.example/y"), "refused later, off the UI thread");
         assert!(!names_document("https://a.example/x.iso https://b.example/x.iso"));
         assert!(!names_document("https://a.example/get?file=x.torrent"));
+    }
+
+    /// A document is read before its downloads are known, a link to one file is not; a listing
+    /// leaves out what was downloaded before unless told otherwise.
+    #[test]
+    fn documents_need_reading_and_listings_skip_old_items() {
+        assert!(needs_reading("\"C:\\My Files\\list.metalink\""));
+        assert!(needs_reading("https://a.example/x.torrent https://b.example/y"));
+        assert!(!needs_reading("https://a.example/x.iso https://b.example/x.iso"));
+        assert!(ListOptions::default().only_new);
     }
 
     fn write_temp(name: &str, bytes: &[u8]) -> (tempfile::TempDir, PathBuf) {
@@ -646,7 +737,7 @@ d6:lengthi4e4:pathl5:y.bineee4:name4:root12:piece lengthi16384e6:pieces20:aaaaaa
         let line = format!("\"{}\"", missing.display());
         let tokens = rt.block_on(input_tokens(&line));
         assert_eq!(tokens, [missing.to_str().unwrap()]);
-        let error = rt.block_on(ingest(&tokens, &reqwest::Client::new())).unwrap_err();
+        let error = rt.block_on(ingest(&tokens, &reqwest::Client::new(), &ListOptions::default())).unwrap_err();
         assert!(error.starts_with(&format!("Cannot read {}: ", missing.display())), "{}", error);
         // A link line never becomes one token.
         let links = rt.block_on(input_tokens("https://a.example/y https://b.example/x.torrent"));

@@ -353,8 +353,9 @@ impl App {
         Ok(queue_task(&mut self.queue, task, options))
     }
 
-    /// Reads the downloads a .metalink, .meta4 or .torrent lists off the UI thread and adds them
-    /// as `origin` says. A document already being read is not read again.
+    /// Reads the downloads a .metalink, .meta4 or .torrent, or a folder, feed or playlist link
+    /// lists (see `ingest::needs_reading`) off the UI thread and adds them as `origin` says. A
+    /// document already being read is not read again.
     fn read_document(&mut self, input: String, origin: Origin, checksum: String, auth: String) {
         let shown = ingest::truncate_chars(&input, 60);
         if !self.reading.insert(input.clone()) {
@@ -403,7 +404,7 @@ impl App {
     /// Adds the downloads of a .metalink, .meta4 or .torrent file dropped on the window.
     fn add_dropped(&mut self, path: PathBuf) {
         let input = path.to_string_lossy().into_owned();
-        if ingest::names_document(&input) {
+        if ingest::needs_reading(&input) {
             self.read_document(input, Origin::Dropped, String::new(), String::new());
         } else {
             self.notice = Some(Err(format!("{} is not a .metalink, .meta4 or .torrent file", path.display())));
@@ -412,10 +413,11 @@ impl App {
 
     /// Adds a download, starts it immediately and shows it on the Downloader tab. A file that is
     /// already downloading is shown instead of being started twice. A .metalink, .meta4 or
-    /// .torrent is read first; the first download it lists starts, the others wait in the queue.
+    /// .torrent, or a folder, feed or playlist link, is read first; the first download it lists
+    /// starts, the others wait in the queue.
     fn download_now(&mut self, text: &str, checksum: &str, auth: &str) {
         self.tab = Tab::Downloader;
-        if ingest::names_document(text) {
+        if ingest::needs_reading(text) {
             self.form_error = None;
             self.read_document(text.trim().to_string(), Origin::Form, checksum.trim().to_string(), auth.to_string());
             return;
@@ -444,7 +446,8 @@ impl App {
     }
 
     /// Adds each non-empty line of the queue input as one download; a .metalink, .meta4 or
-    /// .torrent line adds every file it lists once it has been read.
+    /// .torrent line, or a folder, feed or playlist link, adds every file it lists once it has
+    /// been read.
     fn add_queue_input(&mut self) {
         let lines: Vec<String> =
             self.queue_input.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect();
@@ -463,7 +466,7 @@ impl App {
         let mut errors = Vec::new();
         let mut rejected = Vec::new();
         for (n, line) in lines.iter().enumerate() {
-            if ingest::names_document(line) {
+            if ingest::needs_reading(line) {
                 self.read_document(line.clone(), Origin::QueueLine(n + 1), checksum.clone(), auth.clone());
             } else if let Err(e) = self.add_download(line, &checksum, &auth) {
                 errors.push(format!("Line {}: {}", n + 1, e));
@@ -953,7 +956,7 @@ impl eframe::App for App {
 /// Engine options for `task` with `settings`, the per-download checksum (else the task's own;
 /// never for a document downloaded itself, as it is for the file the document lists) and
 /// Authorization header (never for the hosts a document lists). A task that names its file is
-/// saved as that (sub)path of the save folder.
+/// saved as that (sub)path of the save folder; one in a folder, in that folder of the save folder.
 fn task_options(settings: &Settings, task: &Task, checksum: &str, auth: &str) -> Result<DownloadOptions, String> {
     let checksum = if task.document_itself { "" } else { checksum };
     let checksum = match checksum.trim() {
@@ -962,8 +965,8 @@ fn task_options(settings: &Settings, task: &Task, checksum: &str, auth: &str) ->
     };
     let auth = if task.from_document { "" } else { auth };
     let mut options = settings.download_options(&task.urls, checksum, auth)?;
-    if let Some(name) = &task.name {
-        options.output_path = options.output_path.map(|folder| folder.join(name));
+    for part in [&task.folder, &task.name].into_iter().flatten() {
+        options.output_path = options.output_path.map(|path| path.join(part));
     }
     Ok(options)
 }
@@ -1017,14 +1020,14 @@ fn keep_refused_line(queue_input: &mut String, queue_error: &mut Option<String>,
     });
 }
 
-/// Reads the downloads `input` (a local or remote .metalink, .meta4 or .torrent) lists, fetching
-/// a remote one through the proxy setting.
+/// Reads the downloads `input` (a local or remote .metalink, .meta4 or .torrent, or a link that
+/// lists many) lists, fetching through the proxy setting.
 fn read_listing(settings: &Settings, input: String) -> impl Future<Output = Result<Vec<Task>, String>> + Send + 'static {
-    let proxy = Some(settings.proxy.trim().to_string()).filter(|p| !p.is_empty());
+    let list = settings.list_options();
     async move {
         let tokens = ingest::input_tokens(&input).await;
-        let http = ingest::descriptor_client(proxy.as_deref())?;
-        ingest::ingest(&tokens, &http).await
+        let http = ingest::descriptor_client(list.proxy.as_deref())?;
+        ingest::ingest(&tokens, &http, &list).await
     }
 }
 
@@ -1461,6 +1464,22 @@ mod tests {
         let listed = Task { urls: typed.urls.clone(), from_document: true, ..Task::default() };
         assert_eq!(task_options(&settings, &typed, "", "Bearer t").unwrap().auth_header.as_deref(), Some("Bearer t"));
         assert_eq!(task_options(&settings, &listed, "", "Bearer t").unwrap().auth_header, None);
+    }
+
+    /// A task in a folder is saved in that folder of the save folder, as its name if it has one;
+    /// one without a name is queued for the engine to name, in a folder made for it.
+    #[test]
+    fn a_task_in_a_folder_is_saved_in_it() {
+        let settings = Settings { save_dir: "dl".into(), ..Settings::default() };
+        let urls = vec![Url::parse("https://m.example/ep1").unwrap()];
+        let named = Task { urls: urls.clone(), folder: Some("Show".into()), name: Some("ep1.mp3".into()), ..Task::default() };
+        let path = task_options(&settings, &named, "", "").unwrap().output_path;
+        assert_eq!(path, Some(PathBuf::from("dl").join("Show").join("ep1.mp3")));
+        let unnamed = Task { urls, folder: Some("Show".into()), ..Task::default() };
+        let mut queue = DownloadQueue::new();
+        let [id] = queue_listed(&mut queue, &settings, vec![unnamed], "", "").unwrap()[..] else { panic!("one download") };
+        let item = queue.get_item(id).unwrap();
+        assert_eq!(util::folder_to_create(item), Some(PathBuf::from("dl").join("Show")));
     }
 
     /// Each file a document lists keeps its own path and checksum; the form's checksum only fits a

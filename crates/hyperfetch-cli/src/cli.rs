@@ -108,6 +108,43 @@ pub struct Args {
     #[arg(long = "concurrent-fragments", default_value_t = 8, value_parser = clap::value_parser!(u64).range(1..=32))]
     pub concurrent_fragments: u64,
 
+    /// Google API key for listing a whole Google Drive folder through the Drive API; without it
+    /// only what the public folder page shows is downloaded
+    #[arg(long = "google-api-key", value_name = "KEY", env = "ENDO_GOOGLE_API_KEY", hide_env_values = true)]
+    pub google_api_key: Option<String>,
+
+    /// For a video link that also names a playlist (watch?v=X&list=Y), download the whole playlist
+    #[arg(long = "yes-playlist")]
+    pub yes_playlist: bool,
+
+    /// Only the newest N items of a channel, playlist or feed
+    #[arg(long = "latest", value_name = "N", value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
+    pub latest: Option<usize>,
+
+    /// Download every item of a channel, playlist or feed, also those downloaded before
+    #[arg(long = "all-items")]
+    pub all_items: bool,
+
+    /// Never install ffmpeg: media that needs it falls back to what works without it
+    #[arg(long = "no-install-ffmpeg")]
+    pub no_install_ffmpeg: bool,
+
+    /// Subtitle languages to download with media, e.g. "en,es" or "all"
+    #[arg(long = "subs", value_name = "LANGS", value_parser = parse_subtitle_langs)]
+    pub subs: Option<String>,
+
+    /// Leave out the title, artist, date and URL tags, chapters and cover art media files get
+    #[arg(long = "no-embed-metadata")]
+    pub no_embed_metadata: bool,
+
+    /// Record a live stream from its start instead of from now
+    #[arg(long = "live-from-start")]
+    pub live_from_start: bool,
+
+    /// Wait for a scheduled stream or premiere to start instead of failing
+    #[arg(long = "wait-for-video")]
+    pub wait_for_video: bool,
+
     /// Show download history and exit
     #[arg(long = "history", conflicts_with_all = ["urls", "input_file", "verify"])]
     pub history: bool,
@@ -215,6 +252,15 @@ fn existing_file(s: &str) -> Result<PathBuf, String> {
     }
 }
 
+/// Subtitle languages as yt-dlp's --sub-langs takes them: a comma-separated list without spaces.
+fn parse_subtitle_langs(s: &str) -> Result<String, String> {
+    let s = s.trim();
+    if s.is_empty() || s.contains(char::is_whitespace) {
+        return Err(format!("'{}' is not a list of languages (e.g. en,es or all)", s));
+    }
+    Ok(s.to_string())
+}
+
 pub fn parse_media_preset(s: &str) -> Result<MediaQualityPreset, String> {
     let s = s.trim();
     Ok(match s.to_ascii_lowercase().as_str() {
@@ -293,6 +339,19 @@ mod tests {
         assert!(parse(&["--verify", "f", "--repair", "--cookies-from-browser", "firefox"]).is_err());
         let args = parse(&["-vv", "--max-speed", "2M", "--header", "Authorization: Bearer t", "u"]).unwrap();
         assert_eq!((args.verbose, args.max_speed, args.auth_header.as_deref()), (2, Some(2 << 20), Some("Bearer t")));
+    }
+
+    #[test]
+    fn listing_and_media_flags() {
+        let parse = |args: &[&str]| Args::try_parse_from(std::iter::once("cli").chain(args.iter().copied()));
+        let args = parse(&["u"]).unwrap();
+        assert!(!args.yes_playlist && !args.all_items && !args.no_install_ffmpeg && !args.no_embed_metadata);
+        assert_eq!((args.latest, args.subs), (None, None));
+        let args = parse(&["--latest", "5", "--subs", " en,es ", "--yes-playlist", "--google-api-key", "k", "u"]).unwrap();
+        assert_eq!((args.latest, args.subs.as_deref(), args.google_api_key.as_deref()), (Some(5), Some("en,es"), Some("k")));
+        assert!(parse(&["--latest", "0", "u"]).is_err());
+        assert!(parse(&["--subs", " ", "u"]).is_err());
+        assert!(parse(&["--subs", "en, es", "u"]).is_err());
     }
 
     #[test]

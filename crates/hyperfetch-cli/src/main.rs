@@ -11,7 +11,8 @@ use std::time::Duration;
 use clap::Parser;
 use hyperfetch_core::engine::DownloadOptions;
 use hyperfetch_core::history::{is_redacted, DownloadHistoryManager, HistoryEntry, HistoryStatus, REDACTED_LINK};
-use hyperfetch_core::ingest::{decode_text, descriptor_client, http_url, ingest, input_tokens, Task};
+use hyperfetch_core::ingest::{decode_text, descriptor_client, http_url, ingest, input_tokens, ListOptions, Task};
+use hyperfetch_core::media::BrowserCookieSource;
 use hyperfetch_core::resolver::SmartResolver;
 use hyperfetch_core::state::DownloadState;
 use hyperfetch_core::verify::{self, BuildVerificationResult};
@@ -140,14 +141,17 @@ async fn prepare_dir(dir: &Path) -> Result<PathBuf, String> {
     Ok(dir.to_path_buf())
 }
 
+/// Saves `task` under `dir`: as -o, else as its name in its folder, else into its folder under
+/// the name the server or yt-dlp gives.
 fn job(args: &Args, connections: u64, dir: &Path, task: Task) -> Job {
     let label = task.label();
+    let folder = task.folder.as_ref().map_or_else(|| dir.to_path_buf(), |folder| dir.join(folder));
     let output = match (&args.output, &task.name) {
         (Some(file), _) => dir.join(file),
-        (None, Some(name)) => dir.join(name),
+        (None, Some(name)) => folder.join(name),
         // The trailing separator keeps it a directory even if it disappears mid-batch; a
         // download then fails instead of being saved as a file with the directory's name.
-        (None, None) => dir.join(""),
+        (None, None) => folder.join(""),
     };
     let media = args.media_preset.is_some() || task.urls.iter().any(hyperfetch_core::media::is_supported_media_site);
     let options = DownloadOptions {
@@ -160,9 +164,31 @@ fn job(args: &Args, connections: u64, dir: &Path, task: Task) -> Job {
         proxy: args.proxy.clone(),
         media_preset: args.media_preset.clone(),
         browser_cookies: args.cookies_from_browser.map(Into::into),
+        install_ffmpeg: !args.no_install_ffmpeg,
+        subtitles: args.subs.clone(),
+        embed_metadata: !args.no_embed_metadata,
+        live_from_start: args.live_from_start,
+        wait_for_video: args.wait_for_video,
         ..tuning(args, if media { args.concurrent_fragments } else { connections })
     };
     Job { label, urls: task.urls, options, line: None }
+}
+
+/// How a link that lists many downloads (a folder, feed, playlist or channel) is read.
+fn list_options(args: &Args) -> ListOptions {
+    let cookies = match (args.cookies_from_browser, &args.load_cookies) {
+        (Some(browser), _) => browser.into(),
+        (None, Some(file)) => BrowserCookieSource::File(file.clone()),
+        (None, None) => BrowserCookieSource::None,
+    };
+    ListOptions {
+        google_api_key: args.google_api_key.clone(),
+        whole_playlist: args.yes_playlist,
+        latest: args.latest,
+        only_new: !args.all_items,
+        cookies,
+        proxy: args.proxy.clone(),
+    }
 }
 
 /// The engine settings every download of this run shares, with `connections` per download.
@@ -206,11 +232,16 @@ async fn read_input(path: &Path) -> Result<String, String> {
 
 /// The downloads `inputs` list, each with the input-file line it came from (None for the
 /// command-line URLs), and how many inputs could not be read into downloads (those are reported).
-async fn read_tasks(inputs: &[(Option<usize>, Vec<String>)], ui: &Ui, http: &reqwest::Client) -> (Vec<(Option<usize>, Task)>, usize) {
+async fn read_tasks(
+    inputs: &[(Option<usize>, Vec<String>)],
+    ui: &Ui,
+    http: &reqwest::Client,
+    list: &ListOptions,
+) -> (Vec<(Option<usize>, Task)>, usize) {
     let mut tasks = Vec::new();
     let mut failed = 0;
     for (line, tokens) in inputs {
-        match ingest(tokens, http).await {
+        match ingest(tokens, http, list).await {
             Ok(found) => tasks.extend(found.into_iter().map(|task| (*line, task))),
             Err(e) => {
                 ui.error(&format!("[FAILED] {}: {}", truncate(&tokens.join(" "), 60), e));
@@ -237,7 +268,7 @@ async fn batch(args: &Args, ui: &Ui, shutdown: &Shutdown, http: &reqwest::Client
         inputs.push((None, args.urls.clone()));
     }
 
-    let (tasks, mut failed) = read_tasks(&inputs, ui, http).await;
+    let (tasks, mut failed) = read_tasks(&inputs, ui, http, &list_options(args)).await;
     if let Err(e) = check_single_file_options(args.output.as_deref(), args.checksum.is_some(), tasks.len()) {
         return usage(&e);
     }
@@ -298,7 +329,7 @@ async fn interactive(args: &Args, ui: &Ui, shutdown: &Shutdown, http: &reqwest::
             break;
         }
         let tokens = input_tokens(&input).await;
-        let tasks = match ingest(&tokens, http).await {
+        let tasks = match ingest(&tokens, http, &list_options(args)).await {
             Ok(tasks) => tasks,
             Err(e) => {
                 stderr_line(&format!("[ERROR] {}", e));
@@ -686,6 +717,43 @@ mod tests {
         assert!(std::path::is_separator(last as char), "{}", output.display());
     }
 
+    /// A task in a folder is saved in that folder under the download dir: as its name, else as a
+    /// directory the server or yt-dlp names the file in.
+    #[test]
+    fn a_task_in_a_folder_is_saved_in_it() {
+        let args = parse(&["https://a.example/list"]);
+        let urls = vec![Url::parse("https://a.example/ep1").unwrap()];
+        let named = Task { urls: urls.clone(), folder: Some("Show".into()), name: Some("ep1.mp3".into()), ..Default::default() };
+        let output = job(&args, 4, Path::new("d"), named).options.output_path.unwrap();
+        assert_eq!(output, Path::new("d").join("Show").join("ep1.mp3"));
+        let unnamed = Task { urls, folder: Some("Show".into()), ..Default::default() };
+        let output = job(&args, 4, Path::new("d"), unnamed).options.output_path.unwrap();
+        assert_eq!(output, Path::new("d").join("Show").join(""));
+        assert!(std::path::is_separator(*output.as_os_str().as_encoded_bytes().last().unwrap() as char));
+    }
+
+    #[test]
+    fn listing_and_media_flags_reach_ingest_and_the_engine() {
+        let defaults = list_options(&parse(&["u"]));
+        assert!(defaults.only_new && !defaults.whole_playlist && defaults.latest.is_none());
+        assert_eq!(defaults.cookies, BrowserCookieSource::None);
+        let args = parse(&[
+            "--yes-playlist", "--latest", "3", "--all-items", "--cookies-from-browser", "firefox", "--proxy",
+            "socks5h://127.0.0.1:9050", "--no-install-ffmpeg", "--subs", "all", "--no-embed-metadata", "--live-from-start",
+            "--wait-for-video", "u",
+        ]);
+        let list = list_options(&args);
+        assert!(list.whole_playlist && !list.only_new);
+        assert_eq!((list.latest, list.cookies, list.proxy.as_deref()), (Some(3), BrowserCookieSource::Firefox, Some("socks5h://127.0.0.1:9050")));
+        let task = Task { urls: vec![Url::parse("https://a.example/f").unwrap()], ..Default::default() };
+        let options = job(&args, 4, Path::new("d"), task).options;
+        assert!(!options.install_ffmpeg && !options.embed_metadata && options.live_from_start && options.wait_for_video);
+        assert_eq!(options.subtitles.as_deref(), Some("all"));
+        let task = Task { urls: vec![Url::parse("https://a.example/f").unwrap()], ..Default::default() };
+        let options = job(&parse(&["u"]), 4, Path::new("d"), task).options;
+        assert!(options.install_ffmpeg && options.embed_metadata && !options.live_from_start && !options.wait_for_video);
+    }
+
     /// --header goes to the hosts the user named, never to the mirrors a .metalink or .torrent
     /// lists.
     #[test]
@@ -742,7 +810,7 @@ mod tests {
         }
         inputs.push((None, vec!["https://h.example/d.bin".to_string()]));
 
-        let (tasks, failed) = read_tasks(&inputs, &Ui::new(true), &reqwest::Client::new()).await;
+        let (tasks, failed) = read_tasks(&inputs, &Ui::new(true), &reqwest::Client::new(), &ListOptions::default()).await;
         assert_eq!(failed, 1);
         let lines: Vec<(Option<usize>, String)> = tasks.iter().map(|(line, task)| (*line, task.label())).collect();
         assert_eq!(

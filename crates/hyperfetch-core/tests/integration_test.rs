@@ -2841,7 +2841,7 @@ async fn test_a_short_link_to_a_media_site_is_downloaded_with_yt_dlp() {
 /// against the metalink's checksum.
 #[tokio::test]
 async fn test_a_remote_metalink_saves_each_file_under_its_folder() {
-    use hyperfetch_core::ingest::{descriptor_client, ingest};
+    use hyperfetch_core::ingest::{descriptor_client, ingest, ListOptions};
     use sha2::Digest;
     let _history = setup().await;
     let data = payload(300 * KB, 283);
@@ -2854,7 +2854,7 @@ async fn test_a_remote_metalink_saves_each_file_under_its_folder() {
     );
     let document = serve(Arc::new(Mock::new(xml.into_bytes())), "release.meta4").await;
 
-    let tasks = ingest(&[document.as_str()], &descriptor_client(None).unwrap()).await.expect("the metalink is read");
+    let tasks = ingest(&[document.as_str()], &descriptor_client(None).unwrap(), &ListOptions::default()).await.expect("the metalink is read");
     let [task] = &tasks[..] else { panic!("one file: {:?}", tasks) };
     assert_eq!(task.name.as_deref(), Some(Path::new("release").join("1.0").join("disc.iso").as_path()));
     assert_eq!(task.checksum, Some(format!("sha256:{}", sha256)));
@@ -2870,7 +2870,7 @@ async fn test_a_remote_metalink_saves_each_file_under_its_folder() {
 /// A remote multi-file torrent with a web seed becomes one task per file under the torrent's name.
 #[tokio::test]
 async fn test_a_remote_torrent_lists_every_file_of_its_web_seed() {
-    use hyperfetch_core::ingest::{descriptor_client, ingest};
+    use hyperfetch_core::ingest::{descriptor_client, ingest, ListOptions};
     let seed = serve(Arc::new(Mock::new(payload(KB, 3))), "seed/").await;
     let torrent = format!(
         "d8:url-list{}:{}4:infod5:filesld6:lengthi1024e4:pathl3:sub5:a.bineed6:lengthi1024e4:pathl5:b.bineee\
@@ -2880,7 +2880,7 @@ async fn test_a_remote_torrent_lists_every_file_of_its_web_seed() {
     );
     let document = serve(Arc::new(Mock::new(torrent.into_bytes())), "pack.torrent").await;
 
-    let tasks = ingest(&[document.as_str()], &descriptor_client(None).unwrap()).await.expect("the torrent is read");
+    let tasks = ingest(&[document.as_str()], &descriptor_client(None).unwrap(), &ListOptions::default()).await.expect("the torrent is read");
     let names: Vec<_> = tasks.iter().map(|t| t.name.clone().unwrap()).collect();
     assert_eq!(names, [Path::new("pack").join("sub").join("a.bin"), Path::new("pack").join("b.bin")]);
     assert_eq!(tasks[0].urls, [seed.join("pack/sub/a.bin").unwrap()]);
@@ -2890,12 +2890,12 @@ async fn test_a_remote_torrent_lists_every_file_of_its_web_seed() {
 /// client, instead of being refused.
 #[tokio::test]
 async fn test_a_remote_torrent_without_web_seeds_is_downloaded_itself() {
-    use hyperfetch_core::ingest::{descriptor_client, ingest};
+    use hyperfetch_core::ingest::{descriptor_client, ingest, ListOptions};
     let _history = setup().await;
     let torrent = b"d4:infod6:lengthi3e4:name5:x.iso12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaaee".to_vec();
     let document = serve(Arc::new(Mock::new(torrent.clone())), "x.iso.torrent").await;
 
-    let tasks = ingest(&[document.as_str()], &descriptor_client(None).unwrap()).await.expect("the torrent is read");
+    let tasks = ingest(&[document.as_str()], &descriptor_client(None).unwrap(), &ListOptions::default()).await.expect("the torrent is read");
     let [task] = &tasks[..] else { panic!("the torrent itself: {:?}", tasks) };
     assert_eq!((&task.urls, &task.name, task.from_document), (&vec![document.clone()], &None, false));
 
@@ -2910,13 +2910,13 @@ async fn test_a_remote_torrent_without_web_seeds_is_downloaded_itself() {
 /// can have answered.
 #[tokio::test]
 async fn test_a_remote_document_is_fetched_through_the_proxy() {
-    use hyperfetch_core::ingest::{descriptor_client, ingest};
+    use hyperfetch_core::ingest::{descriptor_client, ingest, ListOptions};
     let xml = r#"<metalink xmlns="urn:ietf:params:xml:ns:metalink"><file name="a.bin"><url>https://m.example/a.bin</url></file></metalink>"#;
     let proxy = Arc::new(Mock::new(xml.as_bytes().to_vec()));
     let address = serve(Arc::clone(&proxy), "").await;
 
     let http = descriptor_client(Some(address.as_str())).unwrap();
-    let tasks = ingest(&["http://documents.invalid/list.meta4"], &http).await.expect("the proxy answers");
+    let tasks = ingest(&["http://documents.invalid/list.meta4"], &http, &ListOptions::default()).await.expect("the proxy answers");
     assert_eq!(tasks.iter().map(|t| t.urls[0].as_str()).collect::<Vec<_>>(), ["https://m.example/a.bin"]);
     assert_eq!(proxy.stats.requests.load(Ordering::SeqCst), 1);
 }
@@ -3190,14 +3190,14 @@ fn hosted_documents(method: &str, target: &str) -> Vec<u8> {
 
 #[tokio::test]
 async fn test_a_document_on_a_file_page_or_share_is_read_and_one_behind_a_login_left_to_the_engine() {
-    use hyperfetch_core::ingest::{descriptor_client, ingest, Task};
+    use hyperfetch_core::ingest::{descriptor_client, ingest, ListOptions, Task};
     let _history = setup().await;
     let (proxy, _) = serve_proxy(hosted_documents).await;
     let http = descriptor_client(Some(&proxy)).unwrap();
     let pages = ["http://github.com/o/r/blob/main/fixtures/pack.torrent", "http://www.dropbox.com/s/k3y/pack.torrent?dl=0"];
     // Read, however its host labels it, when it is no web page.
     for page in pages.into_iter().chain(["http://mirrors.invalid/pack.torrent", "http://mirrors.invalid/list.meta4"]) {
-        let tasks = ingest(&[page], &http).await.expect(page);
+        let tasks = ingest(&[page], &http, &ListOptions::default()).await.expect(page);
         let listed: Vec<_> = tasks.iter().map(|t| (t.name.clone().unwrap(), t.urls[0].to_string())).collect();
         assert_eq!(listed, [(PathBuf::from("a.bin"), "https://s.example/d/a.bin".to_string())], "{page}");
     }
@@ -3213,12 +3213,12 @@ async fn test_a_document_on_a_file_page_or_share_is_read_and_one_behind_a_login_
         "http://pages.invalid/endless.torrent",
         "http://www.dropbox.com/s/k3y/bare.torrent?dl=0",
     ] {
-        let tasks = ingest(&[link], &http).await.expect(link);
+        let tasks = ingest(&[link], &http, &ListOptions::default()).await.expect(link);
         assert_eq!(tasks, [Task { urls: vec![Url::parse(link).unwrap()], document_itself: true, ..Task::default() }], "{link}");
     }
     // A busy host is an error to retry: the engine would save the document as the file.
     for (link, status) in [("http://slow.invalid/pack.torrent", "408 Request Timeout"), ("http://busy.invalid/list.meta4", "429 Too Many Requests")] {
-        let err = ingest(&[link], &http).await.expect_err(link);
+        let err = ingest(&[link], &http, &ListOptions::default()).await.expect_err(link);
         assert!(err.contains(status), "{err}");
     }
     // Which saves no page in the document's place.
