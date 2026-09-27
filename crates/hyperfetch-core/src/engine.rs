@@ -2228,10 +2228,12 @@ async fn read_prefix(
 /// asking for those bytes again.
 ///
 /// What its host was seen to do (see [`crate::hosts`]) spares measuring it again: on a host known
-/// to cap each connection the workers start at once, at the rate it was capped at; on one known
-/// not to, the start is read as if no rate could be measured. Otherwise what the measurement
-/// tells is recorded for the next download, and while it tells nothing yet, the answer's
-/// connection is watched on as the first chunk (see `Watched`).
+/// to cap each connection the workers start at once, at the rate it was capped at, unless the
+/// answer brings the whole file in less than two setup times at that rate (as `read_prefix` would
+/// judge it): that file is read, to be written as it is. On a host known not to cap, the start is
+/// read as if no rate could be measured. Otherwise what the measurement tells is recorded for the
+/// next download, and while it tells nothing yet, the answer's connection is watched on as the
+/// first chunk (see `Watched`).
 async fn take_start(
     info: &mut ProbeInfo,
     body: ProbeBody,
@@ -2252,8 +2254,12 @@ async fn take_start(
     // use) and there can be several.
     let splits = info.accepts_ranges && several_connections;
     if splits && known.capped_per_connection == Some(true) {
-        info.per_setup = bytes_per_setup(known.connection_rate, setup);
-        return Some(Live::Range { response, slot, end: len.saturating_sub(1), watch: None });
+        let per_setup = bytes_per_setup(known.connection_rate, setup);
+        let whole_soon = info.size == Some(len) && per_setup.is_some_and(|bytes| len <= bytes.saturating_mul(2));
+        if !whole_soon {
+            info.per_setup = per_setup;
+            return Some(Live::Range { response, slot, end: len.saturating_sub(1), watch: None });
+        }
     }
     // Only the start of a larger file keeps workers waiting.
     let deadline = (info.size != Some(len)).then(|| tokio::time::Instant::now() + PREFETCH_TIME);
@@ -3355,6 +3361,15 @@ mod tests {
         let body = probe_body(&info.final_url, capped_body(), PREFETCH, Duration::from_millis(10));
         take_start(&mut info, body, false, None, stall).await;
         assert!(!info.prefetch.is_empty());
+        // Nor for a file the answer brings whole in less than two setups (200 KB at the rate
+        // seen): it is read, to be written as it is without resume state or workers. One that
+        // takes longer still goes to the workers at once.
+        for (size, whole) in [(64 * 1024, true), (200_000, true), (PREFETCH, false)] {
+            let mut info = probed(capped, size);
+            let body = probe_body(&info.final_url, paced(vec![(0, size as usize)]), size, Duration::from_millis(10));
+            let live = take_start(&mut info, body, true, None, stall).await;
+            assert_eq!((live.is_none(), info.prefetch.len() as u64 == size), (whole, whole), "{size} bytes");
+        }
 
         // Seen uncapped: the start is read as if no rate could be measured, and nothing is
         // measured to record anew.
