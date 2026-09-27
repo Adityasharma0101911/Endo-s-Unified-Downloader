@@ -615,8 +615,15 @@ fn code_host_raw_url(url: &Url) -> Option<Url> {
     let (at, raw, refs) = match url.host_str()?.trim_end_matches('.') {
         // /{owner}/{repo}/blob/{ref}/{path}; /raw/ also serves Git LFS files.
         "github.com" if segs.get(2) == Some(&"blob") => (2, "raw", 1),
-        // /{namespace...}/-/blob/{ref}/{path}
-        "gitlab.com" => (segs.windows(2).skip(2).position(|w| w == ["-", "blob"])? + 3, "raw", 1),
+        // /{namespace...}/-/blob/{ref}/{path}, or /{namespace...}/blob/{ref}/{path} as older
+        // links have it (GitLab reserves "blob" as a project name).
+        "gitlab.com" => match segs.windows(2).skip(2).position(|w| w == ["-", "blob"]) {
+            Some(i) => (i + 3, "raw", 1),
+            None => {
+                let at = segs.iter().skip(2).position(|s| *s == "blob")? + 2;
+                (!segs[..at].contains(&"-")).then_some((at, "-/raw", 1))?
+            }
+        },
         // /{owner}/{repo}/src/{branch|tag|commit}/{ref}/{path}. /media/ serves what /raw/ does,
         // but for a Git LFS file the file itself instead of its pointer.
         "codeberg.org" if segs.get(2) == Some(&"src") && matches!(segs.get(3), Some(&("branch" | "tag" | "commit"))) => {
@@ -625,9 +632,11 @@ fn code_host_raw_url(url: &Url) -> Option<Url> {
         // /{owner}/{repo}/src/{ref}/{path}
         "bitbucket.org" if segs.get(2) == Some(&"src") => (2, "raw", 1),
         // [/datasets|/spaces]/{owner}/{repo}/blob/{ref}/{path}, or {repo} alone for older repos.
+        // /raw/ serves the file too, but a Git LFS file (model weights) as its pointer.
         "huggingface.co" | "hf.co" => {
             let start = usize::from(matches!(segs.first(), Some(&("datasets" | "spaces"))));
-            ([start + 2, start + 1].into_iter().find(|&i| segs.get(i) == Some(&"blob"))?, "resolve", 1)
+            let view = |&i: &usize| matches!(segs.get(i), Some(&("blob" | "raw")));
+            ([start + 2, start + 1].into_iter().find(view)?, "resolve", 1)
         }
         _ => return None,
     };
@@ -1321,6 +1330,15 @@ mod tests {
                 "https://gitlab.com/group/sub/group/project/-/blob/v1.0/dist/app.tar.gz",
                 "https://gitlab.com/group/sub/group/project/-/raw/v1.0/dist/app.tar.gz",
             ),
+            // The older form, without "/-/", still shows the page.
+            (
+                "https://gitlab.com/gitlab-org/gitlab-runner/blob/main/README.md",
+                "https://gitlab.com/gitlab-org/gitlab-runner/-/raw/main/README.md",
+            ),
+            (
+                "https://gitlab.com/group/sub/project/blob/v1.0/dist/app.tar.gz",
+                "https://gitlab.com/group/sub/project/-/raw/v1.0/dist/app.tar.gz",
+            ),
             (
                 "https://codeberg.org/forgejo/forgejo/src/branch/forgejo/README.md",
                 "https://codeberg.org/forgejo/forgejo/media/branch/forgejo/README.md",
@@ -1338,6 +1356,12 @@ mod tests {
                 "https://huggingface.co/openai-community/gpt2/resolve/main/model.safetensors",
             ),
             ("https://huggingface.co/gpt2/blob/main/config.json", "https://huggingface.co/gpt2/resolve/main/config.json"),
+            // /raw/ gives a Git LFS file's pointer, not the file.
+            (
+                "https://huggingface.co/openai-community/gpt2/raw/main/model.safetensors",
+                "https://huggingface.co/openai-community/gpt2/resolve/main/model.safetensors",
+            ),
+            ("https://huggingface.co/gpt2/raw/main/config.json", "https://huggingface.co/gpt2/resolve/main/config.json"),
             (
                 "https://hf.co/openai-community/gpt2/blob/main/config.json",
                 "https://hf.co/openai-community/gpt2/resolve/main/config.json",
@@ -1370,6 +1394,9 @@ mod tests {
             "https://gitlab.com/group/project/-/tree/main/docs",
             "https://gitlab.com/group/-/blob/main/app.zip",
             "https://gitlab.com/group/project/-/blob/main",
+            "https://gitlab.com/group/project/blob/main",
+            "https://gitlab.com/group/project/-/tree/main/blob/app.zip",
+            "https://gitlab.com/blob/main/app.zip",
             "https://codeberg.org/o/r/src/branch/main/",
             "https://codeberg.org/o/r/src/branch/main",
             "https://codeberg.org/o/r/src/main/app.zip",
