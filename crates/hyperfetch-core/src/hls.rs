@@ -17,7 +17,7 @@ use thiserror::Error;
 use crate::engine::EngineSnapshot;
 use crate::range::ByteRange;
 use crate::storage::{FileDigest, StreamHasher};
-use crate::worker::{authorize, Auth};
+use crate::worker::{authorize, Auth, RateLimiter};
 
 const MAX_CONNECTIONS: usize = 64;
 /// Segments fetched or held ahead of the next one to write, per connection: a slow segment leaves
@@ -93,6 +93,8 @@ pub struct HlsOptions {
     /// The checksum the file will be checked against: it says which digests to take while
     /// writing it.
     pub expected_checksum: Option<String>,
+    /// The download's speed limit, which the segments' bodies are held to together.
+    pub limiter: Option<Arc<RateLimiter>>,
 }
 
 #[derive(Error, Debug)]
@@ -527,17 +529,25 @@ impl FetchError {
     }
 }
 
-/// Body bytes of one segment's requests, counted in a download's progress as they arrive. Dropped
-/// before [`Tally::keep`], as a fetch that failed or lost the race to a second request is, it takes
-/// them back out.
+/// Body bytes of one segment's requests, counted in a download's progress as they arrive and held
+/// to its speed limit, if any. Dropped before [`Tally::keep`], as a fetch that failed or lost the
+/// race to a second request is, it takes them back out.
 struct Tally<'a> {
     total: &'a AtomicU64,
     own: AtomicU64,
+    limiter: Option<&'a RateLimiter>,
 }
 
 impl<'a> Tally<'a> {
-    fn new(total: &'a AtomicU64) -> Self {
-        Self { total, own: AtomicU64::new(0) }
+    fn new(total: &'a AtomicU64, limiter: Option<&'a RateLimiter>) -> Self {
+        Self { total, own: AtomicU64::new(0), limiter }
+    }
+
+    /// Waits until the speed limit lets `bytes` more in.
+    async fn pace(&self, bytes: u64) {
+        if let Some(limiter) = self.limiter {
+            limiter.acquire(bytes).await;
+        }
     }
 
     fn add(&self, bytes: u64) {
@@ -619,6 +629,8 @@ async fn fetch_once(
                 }
                 if let Some(progress) = progress {
                     progress.add(chunk.len() as u64);
+                    // No stall: the wait for the next piece starts once the limit lets it in.
+                    progress.pace(chunk.len() as u64).await;
                 }
                 body.extend_from_slice(&chunk);
             }
@@ -729,11 +741,12 @@ async fn fetch_request(
     auth: Option<&Auth>,
     request: &Request,
     progress: &AtomicU64,
+    limiter: Option<&RateLimiter>,
     fetch: FetchPolicy,
 ) -> Result<Vec<u8>, HlsError> {
     let first = &request.segment;
     if !request.merged.is_empty() {
-        let tally = Tally::new(progress);
+        let tally = Tally::new(progress, limiter);
         let once = FetchPolicy { max_retries: 0, ..fetch };
         match fetch_segment(client, auth, first, request.with_init, &tally, once).await {
             Ok(data) => {
@@ -743,7 +756,7 @@ async fn fetch_request(
             Err(e) => tracing::warn!("{}; fetching those {} segments one at a time", e, request.merged.len()),
         }
     }
-    let tally = Tally::new(progress);
+    let tally = Tally::new(progress, limiter);
     let data = if request.merged.is_empty() {
         fetch_segment(client, auth, first, request.with_init, &tally, fetch).await?
     } else {
@@ -884,7 +897,7 @@ async fn part_matches(
 ) -> Result<bool, HlsError> {
     for index in std::iter::once(0).chain((count > 1).then_some(count - 1)) {
         let uncounted = AtomicU64::new(0);
-        let tally = Tally::new(&uncounted);
+        let tally = Tally::new(&uncounted, None);
         let segment = fetch_segment(client, auth, &segments[index], writes_init(segments, index), &tally, fetch);
         let data = tokio::select! {
             data = segment => data?,
@@ -1379,7 +1392,7 @@ impl HlsEngine {
         // Dropping it aborts the fetches in flight.
         let window = WINDOW_PER_CONNECTION * num_connections;
         let mut window = InOrder::new(requests.len(), num_connections, window, options.fetch.stall_timeout, |i| {
-            fetch_request(client, auth, &requests[i], &received, options.fetch)
+            fetch_request(client, auth, &requests[i], &received, options.limiter.as_deref(), options.fetch)
         });
 
         // Segments handed to the writer.
@@ -1678,7 +1691,7 @@ pub(crate) mod tests {
     const FETCH: FetchPolicy = FetchPolicy { stall_timeout: Duration::from_millis(500), max_retries: 4 };
 
     fn options(connections: usize) -> HlsOptions {
-        HlsOptions { connections, fetch: FETCH, fsync_on_complete: false, expected_checksum: None }
+        HlsOptions { connections, fetch: FETCH, fsync_on_complete: false, expected_checksum: None, limiter: None }
     }
 
     /// Prepares `out` for `segments` of `playlist`, which must be free or hold this stream, and
@@ -2437,14 +2450,14 @@ video.m3u8
     #[test]
     fn test_tally_keeps_only_what_a_finished_fetch_received() {
         let total = AtomicU64::new(100);
-        let lost = Tally::new(&total);
+        let lost = Tally::new(&total, None);
         lost.add(40);
         lost.take_back(10);
         assert_eq!(total.load(Ordering::SeqCst), 130);
         // A fetch dropped midway (it failed, or lost the race to a second request) counts for nothing.
         drop(lost);
         assert_eq!(total.load(Ordering::SeqCst), 100);
-        let kept = Tally::new(&total);
+        let kept = Tally::new(&total, None);
         kept.add(25);
         kept.keep();
         assert_eq!(total.load(Ordering::SeqCst), 125);

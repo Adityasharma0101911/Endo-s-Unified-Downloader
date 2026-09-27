@@ -468,9 +468,9 @@ impl DownloadEngine {
     }
 
     /// Downloads one stream of a media download (see `crate::media`) with this download's
-    /// settings, but the stream's own client, file and request size. The streams draw on this
-    /// download's one speed limit together, whatever their sizes; HLS streams are not held to it,
-    /// as no HLS download is (and no yt-dlp download). The stream's key is one of its URLs, so its
+    /// settings, but the stream's own client, file and request size. The streams, HLS ones
+    /// included, draw on this download's one speed limit together, whatever their sizes (what
+    /// yt-dlp downloads itself is not held to it). The stream's key is one of its URLs, so its
     /// resume state and history outlive the stream URL. Cancelling `stop` stops it as `cancel`
     /// stops a download.
     pub(crate) async fn download_media_stream(
@@ -552,6 +552,7 @@ impl DownloadEngine {
             fetch,
             fsync_on_complete: self.options.fsync_on_complete,
             expected_checksum: self.options.expected_checksum.clone(),
+            limiter: self.limiter(),
         };
         crate::hls::HlsEngine::download(client, auth, segments, target, &options, snapshot_tx, cancel_flag)
             .await
@@ -3669,6 +3670,28 @@ mod tests {
         let path = engine("/busy.m3u8", 30, 6).run(None).await.unwrap();
         assert_eq!(std::fs::read(path).unwrap(), b"DATA");
         assert_eq!(hits.lock()["/busy.ts"], 7);
+    }
+
+    #[tokio::test]
+    async fn test_hls_is_held_to_the_speed_limit() {
+        use crate::hls::tests::{ok, serve};
+        const SEGMENT: usize = 48 * 1024;
+        let (addr, _) = serve(|path: &str, _| match path {
+            "/stream.m3u8" => ok(format!("#EXTM3U\n{}#EXT-X-ENDLIST\n", "#EXTINF:4,\nseg.ts\n".repeat(6))),
+            _ => ok(vec![5u8; SEGMENT]),
+        })
+        .await;
+        let dir = tempdir().unwrap();
+        let limit = 96 * 1024;
+        let options = DownloadOptions { output_path: Some(dir.path().to_path_buf()), max_speed: Some(limit), ..Default::default() };
+        let engine = DownloadEngine::new(vec![Url::parse(&format!("http://{addr}/stream.m3u8")).unwrap()], options);
+
+        let started = Instant::now();
+        let path = engine.run(None).await.unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), vec![5u8; 6 * SEGMENT]);
+        // Three seconds' worth at the limit, less the tenth of a second it lets through at once.
+        let least = Duration::from_secs_f64((6 * SEGMENT) as f64 / limit as f64 - 0.5);
+        assert!(started.elapsed() >= least, "{:?}", started.elapsed());
     }
 
     #[tokio::test]
