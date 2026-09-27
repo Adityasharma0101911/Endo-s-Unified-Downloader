@@ -3299,7 +3299,101 @@ async fn test_bare_sha512_and_sha1_checksums_of_a_single_stream() {
     }
 }
 
-// Folder links: Google Drive folders listed into one download per file.
+// Folder links: Google Drive and MediaFire folders listed into one download per file.
+
+/// The bytes of the MediaFire file with this quick key.
+fn mediafire_file(quickkey: &str) -> Vec<u8> {
+    match quickkey {
+        "corebin0000001" => payload(40 * KB, 7),
+        "readme00000002" => payload(3 * KB, 11),
+        _ => payload(20 * KB, 13),
+    }
+}
+
+/// MediaFire as its folder API (checked live) answers for a folder "Mod Pack" whose files come
+/// in two chunks, with a subfolder "Extras" holding a file and one behind a password; each file's
+/// page links its download, as MediaFire's do. Any other key names no folder.
+fn mediafire(method: &str, target: &str) -> Vec<u8> {
+    use sha2::Digest;
+    let url = Url::parse(target).unwrap();
+    let param = |name: &str| url.query_pairs().find(|(k, _)| k == name).map(|(_, v)| v.into_owned()).unwrap_or_default();
+    let json = |body: String| response(method, "200 OK", "Content-Type: application/json\r\n", body.as_bytes());
+    let file = |quickkey: &str, name: &str, locked: &str| {
+        let data = mediafire_file(quickkey);
+        let hash = to_hex(&sha2::Sha256::digest(&data));
+        format!(r#"{{"quickkey":"{quickkey}","filename":"{name}","hash":"{hash}","size":"{}","password_protected":"{locked}"}}"#, data.len())
+    };
+    let content = |kind: &str, items: String, more: &str| {
+        json(format!(r#"{{"response":{{"folder_content":{{"{kind}":[{items}],"more_chunks":"{more}"}},"result":"Success"}}}}"#))
+    };
+    let path = url.path().to_string();
+    match (url.host_str().unwrap_or_default(), path.as_str()) {
+        ("www.mediafire.com", "/api/1.5/folder/get_info.php") if param("folder_key") == "pack1" => {
+            json(r#"{"response":{"action":"folder\/get_info","folder_info":{"folderkey":"pack1","name":"Mod Pack"},"result":"Success"}}"#.into())
+        }
+        ("www.mediafire.com", "/api/1.5/folder/get_content.php") if param("response_format") == "json" => {
+            match (param("folder_key").as_str(), param("content_type").as_str(), param("chunk").as_str()) {
+                ("pack1", "files", "1") => content("files", file("corebin0000001", "core.bin", "no"), "yes"),
+                ("pack1", "files", "2") => content("files", file("readme00000002", "readme.txt", "no"), "no"),
+                ("pack1", "folders", "1") => content("folders", r#"{"folderkey":"extras1","name":"Extras"}"#.into(), "no"),
+                ("extras1", "files", "1") => {
+                    content("files", [file("skinbin0000003", "skin.bin", "no"), file("secret00000004", "secret.bin", "yes")].join(","), "no")
+                }
+                ("extras1", "folders", "1") => content("folders", String::new(), "no"),
+                _ => response(method, "404 Not Found", "Content-Type: application/json\r\n", br#"{"response":{"message":"Unknown or invalid FolderKey","error":112,"result":"Error"}}"#),
+            }
+        }
+        ("www.mediafire.com", file_page) if file_page.starts_with("/file/") => {
+            let quickkey = file_page.trim_start_matches("/file/");
+            let page = format!(r#"<html><body><a class="input popsok" aria-label="Download file" href="http://download7.mediafire.com/k3y/{quickkey}/file.bin">Download</a></body></html>"#);
+            response(method, "200 OK", "Content-Type: text/html; charset=UTF-8\r\n", page.as_bytes())
+        }
+        ("download7.mediafire.com", download) => {
+            let quickkey = download.split('/').nth(2).unwrap_or_default();
+            response(method, "200 OK", "Content-Type: application/octet-stream\r\n", &mediafire_file(quickkey))
+        }
+        _ => response(method, "404 Not Found", "Content-Type: application/json\r\n", br#"{"response":{"message":"Unknown or invalid FolderKey","error":112,"result":"Error"}}"#),
+    }
+}
+
+/// A MediaFire folder is listed chunk by chunk, subfolders kept under the folder's own name, and
+/// each file downloads through its page, checked against the SHA-256 MediaFire gives; a file
+/// behind a password is left out. An old `/?key` link that names a file is that file.
+#[tokio::test]
+async fn test_a_mediafire_folder_downloads_every_file_in_its_folders() {
+    use hyperfetch_core::ingest::{descriptor_client, ingest, ListOptions, Task};
+    let _history = setup().await;
+    let (proxy, _) = serve_proxy(mediafire).await;
+    let http = descriptor_client(Some(&proxy)).unwrap();
+
+    let tasks = ingest(&["http://www.mediafire.com/folder/pack1/Mod_Pack"], &http, &ListOptions::default()).await.expect("the folder is listed");
+    let pack = PathBuf::from("Mod Pack");
+    let listed: Vec<_> = tasks.iter().map(|t| (t.folder.clone().unwrap(), t.name.clone().unwrap(), t.urls[0].as_str())).collect();
+    assert_eq!(
+        listed,
+        [
+            (pack.clone(), PathBuf::from("core.bin"), "http://www.mediafire.com/file/corebin0000001"),
+            (pack.clone(), PathBuf::from("readme.txt"), "http://www.mediafire.com/file/readme00000002"),
+            (pack.join("Extras"), PathBuf::from("skin.bin"), "http://www.mediafire.com/file/skinbin0000003"),
+        ]
+    );
+    assert!(tasks.iter().all(|t| t.from_document && t.checksum.as_deref().is_some_and(|c| c.starts_with("sha256:"))));
+
+    let temp = tempdir().unwrap();
+    for task in &tasks {
+        let out = temp.path().join(task.folder.as_ref().unwrap()).join(task.name.as_ref().unwrap());
+        let opts = DownloadOptions { proxy: Some(proxy.clone()), expected_checksum: task.checksum.clone(), ..options(&out, 2, 16 * KB) };
+        let path = run(&DownloadEngine::new(task.urls.clone(), opts), None).await.expect("the file downloads");
+        assert_eq!(path, out);
+        assert_file(&path, &mediafire_file(task.urls[0].path().trim_start_matches("/file/")));
+    }
+
+    let file = Url::parse("http://www.mediafire.com/?fileonly0000001").unwrap();
+    let tasks = ingest(&[file.as_str()], &http, &ListOptions::default()).await.expect("the link is a file's");
+    assert_eq!(tasks, [Task { urls: vec![file], ..Task::default() }]);
+    let gone = ingest(&["http://www.mediafire.com/folder/gone1"], &http, &ListOptions::default()).await.unwrap_err();
+    assert!(gone.contains("Unknown or invalid FolderKey"), "{gone}");
+}
 
 /// Google Drive's embedded view of public folders (its shape checked live): "Photos" holds a
 /// file, a Slides document and a subfolder "2024" shared with a resource key; one folder is
