@@ -270,7 +270,7 @@ impl DownloadEngine {
         }
 
         if let Some(media_url) = self.media_target() {
-            return self.run_media(media_url, snapshot_tx).await;
+            return self.run_media(media_url, None, snapshot_tx).await;
         }
 
         let resolved = self.resolve_all(&client).await?;
@@ -281,8 +281,8 @@ impl DownloadEngine {
     /// file. An answer that lands on a host a resolver takes, or on a media site, is downloaded
     /// from there instead (see `follow`). With `route.scrape`, a web page they answer with is
     /// looked into (see `look_into_page`): the video it plays is downloaded in its place, the link
-    /// it sends the browser on to at once is followed. A page that leads nowhere is downloaded as
-    /// it is.
+    /// it sends the browser on to at once is followed. A page that leads nowhere is asked of
+    /// yt-dlp's own sites (see `site_media`), and is downloaded as it is when none takes it.
     async fn fetch_resolved(
         &self,
         client: Client,
@@ -353,6 +353,10 @@ impl DownloadEngine {
             }
             None => {}
         }
+        if let Some(found) = self.site_media(&final_url).await? {
+            drop(probed);
+            return self.naming(final_url.clone()).run_media(final_url, Some(found), snapshot_tx).await;
+        }
         self.download(client, probed, snapshot_tx).await
     }
 
@@ -383,7 +387,7 @@ impl DownloadEngine {
         tracing::info!("Downloading {} in place of the link that led there", target);
         let engine = self.naming(target.clone());
         if crate::media::is_supported_media_site(&target) {
-            return engine.run_media(target, snapshot_tx).await;
+            return engine.run_media(target, None, snapshot_tx).await;
         }
         let resolved = engine
             .guarded(RESOLVE_TIMEOUT, &format!("resolving {}", target), crate::resolver::SmartResolver::resolve(&client, &target))
@@ -403,6 +407,21 @@ impl DownloadEngine {
             engine.urls.push(url);
         }
         engine
+    }
+
+    /// What one of yt-dlp's own sites finds at `url`, a web page that leads nowhere by itself (see
+    /// `crate::media::find_site_media`). None when none of them takes it, or yt-dlp cannot be
+    /// found, installed or run: that never fails the download.
+    async fn site_media(&self, url: &Url) -> Result<Option<crate::media::Extracted>, String> {
+        let options = self.media_options();
+        match crate::media::find_site_media(url, &options, Some(Arc::clone(&self.cancel_flag))).await {
+            Ok(found) => Ok(Some(found)),
+            Err(_) if self.cancel_token.is_cancelled() => Err(CANCELLED.to_string()),
+            Err(e) => {
+                tracing::info!("No site of yt-dlp's takes {}: {}", url, e);
+                Ok(None)
+            }
+        }
     }
 
     /// Where a web page the download's reference answered with leads (see
@@ -470,9 +489,40 @@ impl DownloadEngine {
         })
     }
 
+    /// What a media download of this one goes by (see `run_media`).
+    fn media_options(&self) -> crate::media::MediaDownloadOptions {
+        let (output_dir, output_filename) = match &self.options.output_path {
+            Some(p) if is_dir_target(p) => (p.clone(), None),
+            Some(p) => (
+                p.parent().unwrap_or(Path::new(".")).to_path_buf(),
+                p.file_name().map(|n| n.to_string_lossy().to_string()),
+            ),
+            None => (PathBuf::from("."), None),
+        };
+        let cookies = if let Some(ref bc) = self.options.browser_cookies {
+            bc.clone()
+        } else if let Some(ref cp) = self.options.cookies_path {
+            crate::media::BrowserCookieSource::File(cp.clone())
+        } else {
+            crate::media::BrowserCookieSource::None
+        };
+        crate::media::MediaDownloadOptions {
+            preset: self.options.media_preset.clone().unwrap_or_default(),
+            cookies,
+            proxy: self.options.proxy.clone(),
+            output_dir,
+            output_filename,
+            custom_ytdlp_path: None,
+            concurrent_fragments: self.options.num_connections.clamp(1, 32),
+        }
+    }
+
+    /// Downloads `media_url` with yt-dlp, which goes by what it found there moments ago when
+    /// that is given (see `site_media`).
     async fn run_media(
         &self,
         media_url: Url,
+        extracted: Option<crate::media::Extracted>,
         snapshot_tx: Option<broadcast::Sender<EngineSnapshot>>,
     ) -> Result<PathBuf, String> {
         tracing::info!("Routing download to Media Engine: {}", media_url);
@@ -501,37 +551,13 @@ impl DownloadEngine {
             }
         });
 
-        let (output_dir, output_filename) = match &self.options.output_path {
-            Some(p) if is_dir_target(p) => (p.clone(), None),
-            Some(p) => (
-                p.parent().unwrap_or(Path::new(".")).to_path_buf(),
-                p.file_name().map(|n| n.to_string_lossy().to_string()),
-            ),
-            None => (PathBuf::from("."), None),
-        };
+        let media_opts = self.media_options();
         {
-            let dir = output_dir.clone();
+            let dir = media_opts.output_dir.clone();
             blocking(move || std::fs::create_dir_all(&dir))
                 .await?
-                .map_err(|e| format!("Failed to create {}: {}", output_dir.display(), e))?;
+                .map_err(|e| format!("Failed to create {}: {}", media_opts.output_dir.display(), e))?;
         }
-        let cookie_source = if let Some(ref bc) = self.options.browser_cookies {
-            bc.clone()
-        } else if let Some(ref cp) = self.options.cookies_path {
-            crate::media::BrowserCookieSource::File(cp.clone())
-        } else {
-            crate::media::BrowserCookieSource::None
-        };
-
-        let media_opts = crate::media::MediaDownloadOptions {
-            preset: self.options.media_preset.clone().unwrap_or_default(),
-            cookies: cookie_source,
-            proxy: self.options.proxy.clone(),
-            output_dir,
-            output_filename,
-            custom_ytdlp_path: None,
-            concurrent_fragments: self.options.num_connections.clamp(1, 32),
-        };
 
         // yt-dlp finds the streams; this engine downloads them where it can.
         let fetch: &crate::media::StreamFetcher<'_> =
@@ -542,6 +568,7 @@ impl DownloadEngine {
             Some(prog_tx),
             Some(Arc::clone(&self.cancel_flag)),
             Some(fetch),
+            extracted,
         )
         .await;
         let _ = forwarder.await;
