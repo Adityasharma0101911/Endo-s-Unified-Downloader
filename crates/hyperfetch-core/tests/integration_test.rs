@@ -2325,3 +2325,32 @@ async fn test_a_code_host_file_page_downloads_the_file() {
     assert!(mock.stats.gets.load(Ordering::SeqCst) > 0);
     assert_eq!(mock.stats.denied.load(Ordering::SeqCst), 0, "the page was asked for the file");
 }
+
+#[tokio::test]
+async fn test_a_google_docs_link_downloads_the_export_over_one_connection() {
+    let _history = setup().await;
+    // As Google sends an export: made on the fly, so no length and no ranges, named by
+    // Content-Disposition. The first answer breaks off, so the export is asked for again, from
+    // its start: the editor's page, asked for so, is not it.
+    let data = payload(PREFETCH + 300 * KB + 11, 313);
+    let mut mock = Mock::new(data.clone());
+    mock.chunked = true;
+    mock.content_type = Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+    mock.disposition = Some("attachment; filename=\"QuarterlyReport.docx\"; filename*=UTF-8''Quarterly%20Report.docx".to_string());
+    mock.probe_reply = Reply::CloseAfter(PREFETCH + 64 * KB);
+    mock.expired = Some(("/edit", Reply::ErrorPage));
+    let mock = Arc::new(mock);
+    let proxy = serve(Arc::clone(&mock), "").await;
+    let temp = tempdir().unwrap();
+    let link = Url::parse("http://docs.google.com/document/d/1LinksLaneDoc/edit?usp=sharing").unwrap();
+
+    let path = run(&DownloadEngine::new(vec![link], through(&proxy, temp.path())), None)
+        .await
+        .expect("the export should download");
+    assert_eq!(path, temp.path().join("Quarterly Report.docx"));
+    assert_file(&path, &data);
+    assert_no_leftovers(&path);
+    let s = &mock.stats;
+    assert!(mock.served_ranges().is_empty(), "the export was asked for in parts");
+    assert_eq!((s.gets.load(Ordering::SeqCst), s.denied.load(Ordering::SeqCst)), (1, 0), "asked for once more, as the export");
+}
