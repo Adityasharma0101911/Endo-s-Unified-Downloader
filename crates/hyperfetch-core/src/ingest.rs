@@ -1,14 +1,15 @@
 //! Turns what the user enters (links, mirrors, magnet links, .metalink/.meta4/.torrent files and
 //! URLs) into download tasks, the same way for every front end.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use tokio::io::AsyncReadExt;
 use url::Url;
 
 use crate::{metalink, resolver, torrent};
 
-/// Largest .metalink/.torrent document fetched from the network.
+/// Largest .metalink/.torrent document read from the network or the disk.
 const MAX_DESCRIPTOR_BYTES: usize = 16 * 1024 * 1024;
 
 pub const BLOB_MESSAGE: &str = "Browser-internal blob: URLs exist only in the browser's memory and cannot be downloaded by external tools. Copy the page URL from the address bar instead (e.g. https://www.youtube.com/watch?v=...).";
@@ -125,12 +126,14 @@ pub fn split_tokens(line: &str) -> Vec<String> {
     line.split_whitespace().map(unquote).filter(|t| !t.is_empty()).collect()
 }
 
-/// Splits one line of input into mirror tokens. A line naming a single existing local file (a
-/// .torrent path with spaces, possibly quoted by drag and drop) stays one token; quotes around
-/// tokens are removed.
+/// Splits one line of input into mirror tokens. A line naming a single existing local file, or
+/// a local .metalink/.meta4/.torrent whether or not it exists (a path with spaces, possibly
+/// quoted by drag and drop), stays one token, so reading it reports the real error; quotes
+/// around tokens are removed.
 pub async fn input_tokens(line: &str) -> Vec<String> {
     let whole = unquote(line);
-    if tokio::fs::metadata(&whole).await.is_ok_and(|m| m.is_file()) {
+    let local_document = matches!(descriptor_source(&whole), Some((Source::Local(_), _)));
+    if local_document || tokio::fs::metadata(&whole).await.is_ok_and(|m| m.is_file()) {
         return vec![whole];
     }
     split_tokens(line)
@@ -145,9 +148,7 @@ pub async fn ingest(tokens: &[impl AsRef<str>], http: &reqwest::Client) -> Resul
         if let Some((source, kind)) = descriptor_source(token.as_ref()) {
             let bytes = match source {
                 Source::Remote(url) => fetch(http, &url).await?,
-                Source::Local(path) => tokio::fs::read(&path)
-                    .await
-                    .map_err(|e| format!("Cannot read {}: {}", path.display(), e))?,
+                Source::Local(path) => read_local(&path).await?,
             };
             return match kind {
                 Descriptor::Metalink => metalink_tasks(&bytes),
@@ -214,21 +215,45 @@ pub fn descriptor_client(proxy: Option<&str>) -> Result<reqwest::Client, String>
     builder.build().map_err(|e| format!("cannot create HTTP client: {}", e))
 }
 
+fn too_large(what: impl std::fmt::Display) -> String {
+    format!("{} is larger than {} bytes", what, MAX_DESCRIPTOR_BYTES)
+}
+
 async fn fetch(http: &reqwest::Client, url: &Url) -> Result<Vec<u8>, String> {
     let fail = |e: reqwest::Error| format!("Cannot fetch {}: {}", url, e);
     let mut resp = http.get(url.clone()).send().await.and_then(|r| r.error_for_status()).map_err(fail)?;
-    let too_large = || format!("{} is larger than {} bytes", url, MAX_DESCRIPTOR_BYTES);
     if resp.content_length().is_some_and(|len| len > MAX_DESCRIPTOR_BYTES as u64) {
-        return Err(too_large());
+        return Err(too_large(url));
     }
     let mut body = Vec::new();
     while let Some(chunk) = resp.chunk().await.map_err(fail)? {
         body.extend_from_slice(&chunk);
         if body.len() > MAX_DESCRIPTOR_BYTES {
-            return Err(too_large());
+            return Err(too_large(url));
         }
     }
     Ok(body)
+}
+
+/// A local document, read only if it is a file no larger than a remote one may be: a renamed
+/// disc image is not loaded into memory, and a pipe or device is not waited on.
+async fn read_local(path: &Path) -> Result<Vec<u8>, String> {
+    let fail = |e: std::io::Error| format!("Cannot read {}: {}", path.display(), e);
+    let meta = tokio::fs::metadata(path).await.map_err(fail)?;
+    if !meta.is_file() {
+        return Err(format!("Cannot read {}: not a file", path.display()));
+    }
+    if meta.len() > MAX_DESCRIPTOR_BYTES as u64 {
+        return Err(too_large(path.display()));
+    }
+    let mut bytes = Vec::new();
+    let file = tokio::fs::File::open(path).await.map_err(fail)?;
+    // It may have grown since.
+    file.take(MAX_DESCRIPTOR_BYTES as u64 + 1).read_to_end(&mut bytes).await.map_err(fail)?;
+    if bytes.len() > MAX_DESCRIPTOR_BYTES {
+        return Err(too_large(path.display()));
+    }
+    Ok(bytes)
 }
 
 /// One task per metalink file, named by its relative path ("dir/file.iso" is saved in dir/).
@@ -298,7 +323,6 @@ pub fn truncate_chars(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
     fn run(line: &str) -> Result<Vec<Task>, String> {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -402,6 +426,17 @@ mod tests {
         assert!(!run("https://a.example/f.iso").unwrap()[0].from_document);
     }
 
+    /// A local document is read only if it is a file no larger than a remote one may be.
+    #[test]
+    fn local_documents_must_be_small_files() {
+        let (dir, huge) = write_temp("disc.iso.torrent", b"");
+        std::fs::File::options().write(true).open(&huge).unwrap().set_len(MAX_DESCRIPTOR_BYTES as u64 + 1).unwrap();
+        assert!(run(huge.to_str().unwrap()).unwrap_err().contains("is larger than"));
+        let folder = dir.path().join("folder.torrent");
+        std::fs::create_dir(&folder).unwrap();
+        assert!(run(folder.to_str().unwrap()).unwrap_err().ends_with("not a file"));
+    }
+
     #[test]
     fn metalink_files_keep_their_folders() {
         let xml = r#"<metalink xmlns="urn:ietf:params:xml:ns:metalink">
@@ -466,6 +501,17 @@ d6:lengthi4e4:pathl5:y.bineee4:name4:root12:piece lengthi16384e6:pieces20:aaaaaa
         assert_eq!(quoted, plain);
         assert_eq!(mirrors, ["https://a.example/f", "https://b.example/f"]);
         assert!(names_document(path.to_str().unwrap()));
+
+        // A missing one is read as the one path it is, which says what is wrong with it.
+        let missing = path.with_file_name("no such file.metalink");
+        let line = format!("\"{}\"", missing.display());
+        let tokens = rt.block_on(input_tokens(&line));
+        assert_eq!(tokens, [missing.to_str().unwrap()]);
+        let error = rt.block_on(ingest(&tokens, &reqwest::Client::new())).unwrap_err();
+        assert!(error.starts_with(&format!("Cannot read {}: ", missing.display())), "{}", error);
+        // A link line never becomes one token.
+        let links = rt.block_on(input_tokens("https://a.example/y https://b.example/x.torrent"));
+        assert_eq!(links, ["https://a.example/y", "https://b.example/x.torrent"]);
     }
 
     #[test]
