@@ -1168,11 +1168,29 @@ impl Drop for CookieRun<'_> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunKind {
     /// Finds what to download and prints it as JSON (`-J`), for the engine to download
-    /// (see [`fast_download`]), or else a Download run of [`Source::Info`]. Its formats are plain
-    /// files and playlists: no `formats=dashy`.
+    /// (see [`fast_download`]), or else a Download run of [`Source::Info`] (see [`loads_found`]).
+    /// Its formats are plain files and playlists: no `formats=dashy`.
     Extract,
     /// Downloads and post-processes, printing progress for [`OutputState`].
     Download,
+}
+
+/// Whether a Download run with `options` asks YouTube for its formats in fragments (see
+/// [`YOUTUBE_DASHY`]).
+fn fragments_youtube(options: &MediaDownloadOptions) -> bool {
+    !matches!(options.preset, MediaQualityPreset::Custom(_))
+}
+
+/// Whether a Download run can load what an extraction found (`info`, see [`Source::Info`]) rather
+/// than find it again from the URL. yt-dlp drops a playlist's entries from a file it loads; and a
+/// YouTube video's formats there are whole files (see [`RunKind::Extract`]), each of which the
+/// download would pull 10 MiB request after request where it could have fetched fragments in
+/// parallel.
+fn loads_found(info: &Value, options: &MediaDownloadOptions) -> bool {
+    let text = |key| info.get(key).and_then(Value::as_str);
+    let video = text("_type").is_none_or(|t| t == "video");
+    let youtube = text("extractor_key").or_else(|| text("extractor")).is_some_and(|e| e.eq_ignore_ascii_case("youtube"));
+    video && !(youtube && fragments_youtube(options))
 }
 
 /// What a yt-dlp run works on.
@@ -1232,7 +1250,7 @@ fn build_ytdlp_args(
         ],
     };
     args.extend(kind_args.iter().map(|a| a.to_string()));
-    if kind == RunKind::Download && !matches!(options.preset, MediaQualityPreset::Custom(_)) {
+    if kind == RunKind::Download && fragments_youtube(options) {
         args.extend(YOUTUBE_DASHY.map(String::from));
     }
 
@@ -2430,11 +2448,10 @@ async fn download_with(
                         Err(_) if is_cancelled(&cancel_flag) => return Err(CANCELLED.to_string()),
                         // yt-dlp would write the very file the other job is making.
                         Err(FastError::Busy(e)) => return Err(e),
-                        // Found moments ago: yt-dlp downloads it as it is. Not a playlist, whose
-                        // entries yt-dlp drops from a file it loads.
+                        // Found moments ago: yt-dlp downloads it as it is, where it can.
                         Err(FastError::Unsupported(why)) => {
                             tracing::info!("Leaving {url} to yt-dlp: {why}");
-                            if info.get("_type").and_then(Value::as_str).is_none_or(|t| t == "video") {
+                            if loads_found(&info, options) {
                                 found = tools.cookies.files.file(Some(json), "json").await.inspect_err(|e| tracing::debug!("{e}")).ok();
                             }
                         }
@@ -4091,7 +4108,8 @@ mod tests {
         assert_eq!(names_in(&out), ["clip.mp4"]);
     }
 
-    /// yt-dlp's `-J` for a video of one DASH format (fragments), which the engine leaves to yt-dlp.
+    /// yt-dlp's `-J` for a video of one DASH format (fragments) on a site other than YouTube, which
+    /// the engine leaves to yt-dlp.
     fn dash_info(out: &Path) -> Value {
         let mut info = merge_info(out, Value::Null, Value::Null);
         info["requested_formats"] = Value::Null;
@@ -4099,7 +4117,25 @@ mod tests {
             info[key] = value.clone();
         }
         info["protocol"] = "http_dash_segments".into();
+        (info["extractor"], info["extractor_key"]) = ("vimeo".into(), "Vimeo".into());
         info
+    }
+
+    #[test]
+    fn only_a_download_that_would_find_the_same_formats_loads_what_was_found() {
+        let options = MediaDownloadOptions::default();
+        let custom = MediaDownloadOptions { preset: MediaQualityPreset::Custom("18".to_string()), ..Default::default() };
+        let out = std::env::temp_dir();
+        assert!(loads_found(&dash_info(&out), &options));
+        // Found again from the URL, YouTube's formats come in fragments.
+        assert!(!loads_found(&youtube_info(&out), &options));
+        let mut named = youtube_info(&out);
+        named["extractor_key"] = Value::Null;
+        assert!(!loads_found(&named, &options));
+        // A format selection of its own gets whole files anyway.
+        assert!(loads_found(&youtube_info(&out), &custom));
+        let playlist = serde_json::json!({"_type": "playlist", "id": "PL1", "extractor_key": "Vimeo"});
+        assert!(!loads_found(&playlist, &options));
     }
 
     #[tokio::test]
@@ -4146,6 +4182,13 @@ mod tests {
         std::fs::remove_file(dir.path().join("runs.txt")).unwrap();
         let playlist = serde_json::json!({"_type": "playlist", "id": "PL1", "entries": [{"_type": "url", "url": "https://youtu.be/a"}]});
         fake_download(dir.path(), &playlist, &cookies, fetch).await.unwrap();
+        assert_eq!(runs_in(dir.path()), ["extract", "download url"]);
+
+        // Nor does it load a YouTube video: found again, its formats come in fragments.
+        std::fs::remove_file(dir.path().join("runs.txt")).unwrap();
+        let mut youtube = dash_info(&dir.path().join("out"));
+        (youtube["extractor"], youtube["extractor_key"]) = ("youtube".into(), "Youtube".into());
+        fake_download(dir.path(), &youtube, &cookies, fetch).await.unwrap();
         assert_eq!(runs_in(dir.path()), ["extract", "download url"]);
     }
 
