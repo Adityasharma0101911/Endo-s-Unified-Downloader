@@ -43,46 +43,79 @@ pub const REDACTED: &str = "REDACTED";
 /// Why a saved link cannot be requested again.
 pub const REDACTED_LINK: &str = "The link held a secret that was not saved; paste the link again";
 
-/// Query and fragment parameters whose values are secrets (lower case, matched ignoring case):
-/// the signatures and signing keys of presigned links (S3 and CloudFront, Google Cloud Storage,
-/// Azure SAS `sig`), tokens and keys that stand in for a login (OAuth, Moodle and Canvas
-/// `token`, API keys, SharePoint and OneDrive `tempauth`), and passwords.
+/// Query and fragment parameters whose values are secrets (lower case, matched ignoring case and
+/// underscores around the name, as in Akamai's `__token__`), besides those [`SECRET_SUFFIXES`]
+/// end: the credentials of presigned links (S3 and CloudFront, Google Cloud Storage, Azure SAS
+/// `sig`), logins passed in the link (SharePoint and OneDrive `tempauth`, Backblaze B2
+/// `Authorization`, JWTs), API keys, CDN tokens (Akamai `hdnts`, `hdnea`) and Google's link
+/// signature `usg`.
 const SECRET_PARAMS: &[&str] = &[
-    "x-amz-signature",
     "x-amz-credential",
-    "x-amz-security-token",
     "awsaccesskeyid",
-    "x-goog-signature",
     "x-goog-credential",
     "googleaccessid",
     "sig",
-    "signature",
-    "token",
-    "access_token",
-    "refresh_token",
-    "id_token",
     "tempauth",
-    "api_key",
     "apikey",
     "key",
-    "client_secret",
-    "password",
-    "secret",
+    "authorization",
+    "auth",
+    "jwt",
+    "hdnts",
+    "hdnea",
+    "usg",
 ];
 
+/// Endings of parameter names whose values are secrets: tokens (`token`, OAuth `access_token`,
+/// GitLab `private_token`, S3 `X-Amz-Security-Token`), keys (`api_key`, `access_key`), secrets,
+/// signatures (`X-Amz-Signature`) and passwords.
+const SECRET_SUFFIXES: &[&str] = &["token", "_key", "-key", "secret", "signature", "password"];
+
 /// Parameters that are secrets only on some hosts (and their subdomains), as the names are
-/// common elsewhere: Discord's attachment signature `hm`, and Outlook Safe Links' `data`, which
-/// holds the recipient's address, and `sdata`, its signature.
+/// common elsewhere: Discord's attachment signature `hm`, Outlook Safe Links' `data`, which
+/// holds the recipient's address, and `sdata`, its signature, and the token of a Slack file link.
 const HOST_SECRET_PARAMS: &[(&str, &[&str])] = &[
     ("discordapp.com", &["hm"]),
     ("discordapp.net", &["hm"]),
     ("safelinks.protection.outlook.com", &["data", "sdata"]),
     ("safelinks.protection.office365.us", &["data", "sdata"]),
+    ("slack.com", &["t"]),
 ];
 
-/// `url` without its secrets, for saving: the `user:password@` part is dropped and the values of
-/// secret parameters (see `SECRET_PARAMS`) in the query and fragment become [`REDACTED`], also in
-/// links carried inside a parameter (a redirect's target). Everything else is kept as written, so
+/// Whether a parameter named `name` holds a secret (see [`SECRET_PARAMS`]); `scoped` lists the
+/// names that do on the link's host.
+fn secret_param(name: &str, scoped: &[&str]) -> bool {
+    let name = name.to_ascii_lowercase();
+    let name = name.trim_matches('_');
+    SECRET_PARAMS.iter().chain(scoped).any(|s| name == *s) || SECRET_SUFFIXES.iter().any(|s| name.ends_with(s))
+}
+
+/// `path` of a Telegram Bot API link with the bot's token (`/bot<id>:<token>/...` or
+/// `/file/bot<id>:<token>/...`, which logs in as the bot) replaced by [`REDACTED`], or None if
+/// it holds none. Sets `marked` when a token already is [`REDACTED`].
+fn scrub_bot_token(path: &str, marked: &mut bool) -> Option<String> {
+    let mut changed = false;
+    let segments: Vec<Cow<'_, str>> = path
+        .split('/')
+        .map(|segment| match segment.strip_prefix("bot").and_then(|s| s.split_once(':')) {
+            Some((id, token)) if !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()) && !token.is_empty() => {
+                if token == REDACTED {
+                    *marked = true;
+                    Cow::Borrowed(segment)
+                } else {
+                    changed = true;
+                    Cow::Owned(format!("bot{id}:{REDACTED}"))
+                }
+            }
+            _ => Cow::Borrowed(segment),
+        })
+        .collect();
+    changed.then(|| segments.join("/"))
+}
+
+/// `url` without its secrets, for saving: the `user:password@` part is dropped, and the values of
+/// secret parameters (see `SECRET_PARAMS`) in the query and fragment, and a Telegram bot's token
+/// in the path, become [`REDACTED`], also in links carried inside a parameter (a redirect's target). Everything else is kept as written, so
 /// a link without secrets comes back unchanged, as does a string that is not a URL.
 pub fn redact_url(url: &str) -> String {
     scrub(url).0.into_owned()
@@ -116,7 +149,7 @@ pub fn redact_text(text: &str) -> String {
 /// already holds [`REDACTED`].
 fn scrub(input: &str) -> (Cow<'_, str>, bool) {
     let unchanged = (Cow::Borrowed(input), false);
-    if !input.contains(['@', '?', '#']) {
+    if !input.contains(['@', '?', '#']) && !input.contains("/bot") {
         return unchanged;
     }
     let Ok(mut url) = Url::parse(input) else {
@@ -135,6 +168,12 @@ fn scrub(input: &str) -> (Cow<'_, str>, bool) {
         .flat_map(|(_, names)| names.iter().copied())
         .collect();
     let mut marked = false;
+    if host == "api.telegram.org" {
+        if let Some(path) = scrub_bot_token(url.path(), &mut marked) {
+            url.set_path(&path);
+            changed = true;
+        }
+    }
     if let Some(query) = url.query().and_then(|q| scrub_pairs(q, &scoped, &mut marked)) {
         url.set_query(Some(&query));
         changed = true;
@@ -158,7 +197,7 @@ fn scrub_pairs(pairs: &str, scoped: &[&str], marked: &mut bool) -> Option<String
                 return Cow::Borrowed(pair);
             };
             let raw_name = pair.split_once('=').map_or(pair, |(n, _)| n);
-            let secret = SECRET_PARAMS.iter().chain(scoped).any(|s| name.eq_ignore_ascii_case(s));
+            let secret = secret_param(&name, scoped);
             if secret && value == REDACTED {
                 *marked = true;
             } else if secret && !value.is_empty() {
@@ -782,6 +821,34 @@ mod tests {
         let inner = url::form_urlencoded::parse(Url::parse(&redacted).unwrap().query().unwrap().as_bytes()).next().unwrap().1.into_owned();
         assert_eq!(inner, "https://x.example/f.zip?token=REDACTED");
         assert!(is_redacted(&redacted), "a secret inside the carried link counts too");
+    }
+
+    #[test]
+    fn redact_knows_secrets_by_how_their_names_end_and_bot_tokens() {
+        for (live, saved) in [
+            (
+                "https://gitlab.com/api/v4/projects/1/packages/generic/app/1.0/app.zip?private_token=glpat-XXXX",
+                "https://gitlab.com/api/v4/projects/1/packages/generic/app/1.0/app.zip?private_token=REDACTED",
+            ),
+            ("https://f002.backblazeb2.com/file/b/a.zip?Authorization=4_002abc", "https://f002.backblazeb2.com/file/b/a.zip?Authorization=REDACTED"),
+            ("https://h.example/a?auth_token=1&access_key=2&jwt=3&auth=4&v=5", "https://h.example/a?auth_token=REDACTED&access_key=REDACTED&jwt=REDACTED&auth=REDACTED&v=5"),
+            ("https://cdn.example/v.mp4?hdnts=exp%3D1~hmac%3Dab&__token__=st%3D1", "https://cdn.example/v.mp4?hdnts=REDACTED&__token__=REDACTED"),
+            ("https://h.example/a?X-API-Key=k&db_password=p&client_secret=s", "https://h.example/a?X-API-Key=REDACTED&db_password=REDACTED&client_secret=REDACTED"),
+            ("https://www.google.com/url?q=https%3A%2F%2Fx.example%2F&usg=AOvVaw1", "https://www.google.com/url?q=https%3A%2F%2Fx.example%2F&usg=REDACTED"),
+            ("https://files.slack.com/files-pri/T0-F0/download/f.zip?t=xoxe-123", "https://files.slack.com/files-pri/T0-F0/download/f.zip?t=REDACTED"),
+            ("https://api.telegram.org/file/bot123456:AAHdqTcv/documents/file_1.pdf", "https://api.telegram.org/file/bot123456:REDACTED/documents/file_1.pdf"),
+        ] {
+            assert_eq!(redact_url(live), saved, "{live}");
+            assert!(is_redacted(saved), "{saved}");
+        }
+        // Names that only look alike, and `t` or bot paths elsewhere, are kept.
+        for same in [
+            "https://h.example/a?keyword=x&monkey=1&t=2",
+            "https://example.com/file/bot123456:AAH/a.pdf",
+            "https://api.telegram.org/file/botfather/a.pdf",
+        ] {
+            assert_eq!(redact_url(same), same);
+        }
     }
 
     #[test]
