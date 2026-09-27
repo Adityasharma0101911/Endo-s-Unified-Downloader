@@ -49,6 +49,54 @@ const REDIRECT_WRAPPERS: &[(&[&str], Option<&str>, &[&str])] = &[
 /// How many wrappers around one link are taken off at most.
 const MAX_UNWRAPS: usize = 5;
 
+/// Last-segment extensions that name a file, never a web page (see `check_answer`).
+const FILE_EXTENSIONS: &[&str] = &[
+    // Archives
+    "zip", "7z", "rar", "tar", "gz", "tgz", "bz2", "xz", "zst", "lzma", "cab",
+    // Installers and packages
+    "exe", "msi", "msix", "msixbundle", "appx", "appxbundle", "dmg", "pkg", "deb", "rpm", "apk", "xapk", "ipa",
+    "appimage", "flatpak", "snap", "jar", "whl",
+    // Disk images
+    "iso", "img", "vhd", "vhdx", "vmdk", "qcow2", "ova",
+    // Audio and video
+    "mp3", "flac", "wav", "m4a", "aac", "ogg", "opus", "wma", "mp4", "m4v", "mkv", "webm", "mov", "avi", "wmv",
+    "flv", "mpg", "mpeg",
+    // Documents
+    "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "odp", "rtf", "epub", "mobi", "djvu",
+    "cbz", "cbr",
+    // Model weights
+    "safetensors", "gguf", "ckpt", "pt", "pth", "bin", "onnx", "h5",
+    "torrent",
+];
+
+/// File-share services not supported yet, by the domains (subdomains included) of their pages.
+const UNSUPPORTED_SHARES: &[(&str, &[&str])] = &[
+    ("MEGA", &["mega.nz", "mega.io", "mega.co.nz"]),
+    ("OneDrive", &["1drv.ms", "onedrive.live.com"]),
+    ("SharePoint", &["sharepoint.com"]),
+    ("WeTransfer", &["wetransfer.com", "we.tl"]),
+    (
+        "Terabox",
+        &[
+            "terabox.com", "terabox.app", "terabox.fun", "teraboxapp.com", "teraboxlink.com", "teraboxshare.com",
+            "terafileshare.com", "terasharelink.com", "1024tera.com", "1024tera.co", "1024terabox.com", "4funbox.com",
+            "4funbox.co", "mirrobox.com", "nephobox.com", "freeterabox.com", "momerybox.com", "tibibox.com",
+        ],
+    ),
+    ("Gofile", &["gofile.io"]),
+    ("Pixeldrain", &["pixeldrain.com", "pixeldrain.net", "pixeldra.in"]),
+    ("iCloud", &["icloud.com"]),
+    (
+        "Yandex Disk",
+        &[
+            "yadi.sk", "disk.yandex.ru", "disk.yandex.com", "disk.yandex.com.tr", "disk.yandex.by", "disk.yandex.kz",
+            "disk.yandex.ua", "disk.360.yandex.ru", "disk.360.yandex.com",
+        ],
+    ),
+    ("pCloud", &["pcloud.link", "pcloud.com"]),
+    ("Box", &["box.com"]),
+];
+
 #[derive(Error, Debug)]
 pub enum ResolverError {
     #[error("Network error during resolution: {0}")]
@@ -287,9 +335,46 @@ fn unwrap_once(url: &Url) -> Option<Url> {
 }
 
 /// Fails if the answer to `url` (which ended at `final_url`), with these headers, is a web page
-/// instead of the file it stands for.
-pub fn check_answer(url: &Url, _final_url: &Url, headers: &HeaderMap) -> Result<(), ResolverError> {
-    GoogleDriveResolver::check_answer(url, headers)
+/// instead of the file it stands for: HTML not sent as an attachment (a hosted .html file is
+/// one) from Drive, from Google asking to sign in to a document, from a file-share service not
+/// supported yet, or for a link that names a file. Other pages are looked into for a video.
+pub fn check_answer(url: &Url, final_url: &Url, headers: &HeaderMap) -> Result<(), ResolverError> {
+    GoogleDriveResolver::check_answer(url, headers)?;
+    if !html_type(headers) || is_attachment(headers) {
+        return Ok(());
+    }
+    if GoogleDocsResolver.can_handle(url) || final_url.host_str() == Some("accounts.google.com") {
+        return Err(ResolverError::NotFound(
+            "Google asked to sign in: the document is private (share it as \"Anyone with the link\", or pass your browser's cookies with --load-cookies)"
+                .to_string(),
+        ));
+    }
+    if let Some(service) = unsupported_share(url).or_else(|| unsupported_share(final_url)) {
+        return Err(ResolverError::NotFound(format!("{} links are not supported yet", service)));
+    }
+    if let Some(file) = named_file(url).or_else(|| named_file(final_url)) {
+        return Err(ResolverError::NotFound(format!(
+            "the server sent a web page instead of {} (the link may need a login, have expired, or lead to a download page)",
+            file
+        )));
+    }
+    Ok(())
+}
+
+/// The file-share service in [`UNSUPPORTED_SHARES`] whose page `url` is on, if any.
+fn unsupported_share(url: &Url) -> Option<&'static str> {
+    let host = url.host_str()?.trim_end_matches('.');
+    let on = |domain: &&str| host == *domain || host.strip_suffix(domain).is_some_and(|sub| sub.ends_with('.'));
+    UNSUPPORTED_SHARES.iter().find(|(_, domains)| domains.iter().any(on)).map(|(service, _)| *service)
+}
+
+/// The name of the file `url` names by one of the [`FILE_EXTENSIONS`], if it does.
+fn named_file(url: &Url) -> Option<String> {
+    let ext = last_segment_extension(url)?;
+    let last = url.path_segments()?.next_back()?;
+    FILE_EXTENSIONS
+        .contains(&ext.as_str())
+        .then(|| percent_encoding::percent_decode_str(last).decode_utf8_lossy().into_owned())
 }
 
 /// Whether `url`, which no host resolver takes, ended at `final_url` on another host that one
@@ -1344,6 +1429,110 @@ mod tests {
 
     fn utf8_percent_encode(s: &str) -> String {
         percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string()
+    }
+
+    /// `check_answer` for `url`, which ended at `final_url` (or at itself), as an error message.
+    fn refusal(url: &str, final_url: Option<&str>, headers: &HeaderMap) -> Option<String> {
+        let url = Url::parse(url).unwrap();
+        let final_url = final_url.map_or(url.clone(), |f| Url::parse(f).unwrap());
+        check_answer(&url, &final_url, headers).err().map(|e| e.to_string())
+    }
+
+    #[test]
+    fn test_web_pages_in_place_of_drive_files_and_private_documents_are_refused() {
+        let page = headers(&[(CONTENT_TYPE, "text/html; charset=utf-8")]);
+        let drive = "https://drive.usercontent.google.com/download?id=abc&export=download&confirm=t";
+        let err = refusal(drive, None, &page).unwrap();
+        assert!(err.contains("Google Drive served a web page instead of the file"), "{err}");
+
+        // A Google document that asks to sign in: on docs.google.com, or sent on to Google's sign-in.
+        let export = "https://docs.google.com/document/d/abc/export?format=docx";
+        for (url, final_url) in [
+            (export, None),
+            (export, Some("https://accounts.google.com/v3/signin/identifier?continue=https%3A%2F%2Fdocs.google.com")),
+            ("https://example.com/report", Some("https://accounts.google.com/ServiceLogin?service=wise")),
+        ] {
+            let err = refusal(url, final_url, &page).unwrap_or_else(|| panic!("{url} -> {final_url:?}"));
+            assert!(err.contains("private") && err.contains("Anyone with the link") && err.contains("--load-cookies"), "{err}");
+        }
+        let docx = headers(&[
+            (CONTENT_TYPE, "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+            (CONTENT_DISPOSITION, "attachment; filename=\"Report.docx\""),
+        ]);
+        assert_eq!(refusal(export, Some("https://doc-0g-3o-docstext.googleusercontent.com/export/x"), &docx), None);
+    }
+
+    #[test]
+    fn test_web_pages_from_file_shares_not_supported_yet_are_refused() {
+        let page = headers(&[(CONTENT_TYPE, "text/html")]);
+        for (url, service) in [
+            ("https://mega.nz/file/abc#key", "MEGA"),
+            ("https://mega.nz/folder/abc#key", "MEGA"),
+            ("https://1drv.ms/u/s!abc", "OneDrive"),
+            ("https://onedrive.live.com/?cid=abc&id=def", "OneDrive"),
+            ("https://contoso.sharepoint.com/:u:/g/abc", "SharePoint"),
+            ("https://contoso-my.sharepoint.com/:x:/p/abc", "SharePoint"),
+            ("https://we.tl/t-abc", "WeTransfer"),
+            ("https://wetransfer.com/downloads/abc/def", "WeTransfer"),
+            ("https://www.terabox.com/s/1abc", "Terabox"),
+            ("https://1024terabox.com/s/1abc", "Terabox"),
+            ("https://www.nephobox.com/s/1abc", "Terabox"),
+            ("https://gofile.io/d/abc", "Gofile"),
+            ("https://pixeldrain.com/u/abc", "Pixeldrain"),
+            ("https://www.icloud.com/iclouddrive/abc#file", "iCloud"),
+            ("https://yadi.sk/d/abc", "Yandex Disk"),
+            ("https://disk.yandex.ru/d/abc", "Yandex Disk"),
+            ("https://u.pcloud.link/publink/show?code=abc", "pCloud"),
+            ("https://app.box.com/s/abc", "Box"),
+            ("https://acme.app.box.com/v/files", "Box"),
+        ] {
+            assert_eq!(refusal(url, None, &page), Some(format!("Direct download link not found: {} links are not supported yet", service)));
+        }
+        // A shortened link that lands on one.
+        let err = refusal("https://bit.ly/abc", Some("https://mega.nz/file/abc"), &page).unwrap();
+        assert!(err.contains("MEGA links are not supported yet"), "{err}");
+        // The files these services serve are downloads like any other, and look-alike hosts are not theirs.
+        let file = headers(&[(CONTENT_TYPE, "application/octet-stream")]);
+        assert_eq!(refusal("https://pixeldrain.com/api/file/abc?download", None, &file), None);
+        for elsewhere in ["https://notbox.com/s/abc", "https://example.com/mega.nz", "https://megalodon.nz/file/abc"] {
+            assert_eq!(refusal(elsewhere, None, &page), None, "{elsewhere}");
+        }
+    }
+
+    #[test]
+    fn test_web_pages_in_place_of_a_named_file_are_refused() {
+        let page = headers(&[(CONTENT_TYPE, "text/html; charset=utf-8")]);
+        for (url, final_url, file) in [
+            ("https://example.com/files/app.zip", None, "app.zip"),
+            ("https://example.com/dl/My%20Setup%201.2.exe", None, "My Setup 1.2.exe"),
+            ("https://example.com/src/project-1.0.tar.gz", None, "project-1.0.tar.gz"),
+            ("https://example.com/os/Distro.ISO", None, "Distro.ISO"),
+            ("https://example.com/files/app.zip", Some("https://example.com/login?next=%2Ffiles%2Fapp.zip"), "app.zip"),
+            ("https://example.com/get?id=3", Some("https://cdn.example.com/m/model.safetensors"), "model.safetensors"),
+            ("https://example.com/t/linux.torrent", None, "linux.torrent"),
+        ] {
+            let err = refusal(url, final_url, &page).unwrap_or_else(|| panic!("{url}"));
+            assert!(err.contains(&format!("the server sent a web page instead of {} (the link may need a login", file)), "{err}");
+        }
+        // The file itself, or a page sent as an attachment, is what was asked for.
+        let zip = headers(&[(CONTENT_TYPE, "application/zip")]);
+        assert_eq!(refusal("https://example.com/files/app.zip", None, &zip), None);
+        assert_eq!(refusal("https://example.com/files/app.zip", None, &HeaderMap::new()), None);
+        let attached = headers(&[(CONTENT_TYPE, "text/html"), (CONTENT_DISPOSITION, "attachment; filename=\"app.zip\"")]);
+        assert_eq!(refusal("https://example.com/files/app.zip", None, &attached), None);
+
+        // Pages go on to be looked into: an .html file, and names that only look like files.
+        for url in [
+            "https://example.com/docs/page.html",
+            "https://example.com/watch",
+            "https://example.com/",
+            "https://example.com/view.php?file=app.zip",
+            "https://example.com/releases/v1.2",
+            "https://example.com/people/john.doe",
+            "https://example.com/docs/readme.md",
+        ] {
+            assert_eq!(refusal(url, None, &page), None, "{url}");
+        }
     }
 
     #[test]
