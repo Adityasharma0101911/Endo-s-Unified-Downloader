@@ -591,11 +591,7 @@ impl HostResolver for MediaFireResolver {
         }
         let page_url = resp.url().clone();
         let html = read_capped(resp, MAX_HTML_BYTES).await?;
-        extract_mediafire_direct(&html, &page_url).map(|u| vec![u]).ok_or_else(|| {
-            ResolverError::NotFound(
-                "MediaFire download link not found on the page (the file may be removed or the page layout changed)".to_string(),
-            )
-        })
+        extract_mediafire_direct(&html, &page_url).map(|u| vec![u]).ok_or_else(|| ResolverError::NotFound(mediafire_no_link(&html)))
     }
 }
 
@@ -1078,6 +1074,17 @@ fn extract_mediafire_direct(html: &str, page_url: &Url) -> Option<Url> {
             Url::parse(std::str::from_utf8(&decoded).ok()?).ok().filter(is_download_host)
         })
     })
+}
+
+/// Why a MediaFire file page `html` has no download link. A file MediaFire flags as malware shows
+/// "Malware Detected" (a `MalwareAdvisory` box, checked live) and gives its link only to a
+/// browser whose user accepts the risk, which is theirs to accept.
+fn mediafire_no_link(html: &str) -> String {
+    if html.contains("class=\"MalwareAdvisory\"") {
+        "MediaFire flagged this file as malware (\"Malware Detected\") and hands it out only after a warning: open the link in your browser to decide".to_string()
+    } else {
+        "MediaFire download link not found on the page (the file may be removed or the page layout changed)".to_string()
+    }
 }
 
 /// Picks the one video a page plays. Candidates are often different encodes of the same video,
@@ -2021,6 +2028,16 @@ mod tests {
         let page = serve_once("text/html", b"<html><a href=\"/help\">Help</a></html>".to_vec()).await;
         let result = MediaFireResolver.resolve(&local_client(), &page).await;
         assert!(matches!(result, Err(ResolverError::NotFound(_))));
+    }
+
+    /// MediaFire's page for a file it flags as malware (www.mediafire.com/file/dz08mstub83ik3l as
+    /// it answered, cut down): no download link, and the error says why.
+    #[tokio::test]
+    async fn test_a_mediafire_file_flagged_as_malware_says_so() {
+        let html = br#"<html><body><div class="download_link" id="download_link"></div><div class="MalwareAdvisory" role="alertdialog"><div class="MalwareAdvisory-warning MalwareAdvisory-warning--virustotal"><div class="MalwareAdvisory-warningText">Malware Detected</div></div><div class="MalwareAdvisory-fileText">TestBlockedFile.exe (1.1 MB)</div></div></body></html>"#;
+        let page = serve_once("text/html", html.to_vec()).await;
+        let err = MediaFireResolver.resolve(&local_client(), &page).await.unwrap_err();
+        assert!(err.to_string().contains("MediaFire flagged this file as malware"), "{err}");
     }
 
     #[test]
