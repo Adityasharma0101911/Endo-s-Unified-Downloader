@@ -278,9 +278,9 @@ fn ytdlp_work_dir() -> PathBuf {
     app_data_dir().map_or_else(std::env::temp_dir, |dir| dir.join("ytdlp-work"))
 }
 
-/// The managed yt-dlp, if one is installed: on Windows the unpacked build of the newest release
-/// installed (see [`install_onedir`]), else a single-file build (the only kind elsewhere, and what
-/// Windows installs used to be). Blocking.
+/// The managed yt-dlp, if one is installed: on Windows the build of the newest release installed
+/// in its own folder (see [`install_onedir`]), else a single-file build right in the directory (the
+/// only kind elsewhere, and what Windows installs used to be). Blocking.
 fn installed_managed_ytdlp() -> Option<PathBuf> {
     let dir = managed_bin_dir()?;
     #[cfg(windows)]
@@ -442,9 +442,23 @@ fn discover_ffmpeg() -> Option<PathBuf> {
     None
 }
 
+/// The single-file Windows build, as named in the GitHub release: what is installed where the
+/// release zip cannot be unpacked (see [`tar_works`]).
+#[cfg(windows)]
+fn single_file_asset() -> &'static str {
+    if cfg!(target_arch = "aarch64") {
+        "yt-dlp_arm64.exe"
+    } else if cfg!(target_arch = "x86") {
+        "yt-dlp_x86.exe"
+    } else {
+        "yt-dlp.exe"
+    }
+}
+
 /// The yt-dlp build installed on this platform, as named in the GitHub release. On Windows the
-/// unpacked ("onedir") build: the single-file one unpacks its Python runtime to %TEMP% on every
-/// launch, about 0.7 s more per run.
+/// unpacked ("onedir") build where it can be unpacked: the single-file one (see
+/// [`single_file_asset`]) unpacks its Python runtime to %TEMP% on every launch, about 0.7 s more
+/// per run.
 fn ytdlp_release_asset() -> &'static str {
     if cfg!(all(windows, target_arch = "aarch64")) {
         "yt-dlp_win_arm64.zip"
@@ -525,6 +539,14 @@ async fn install_release(client: &reqwest::Client, tag: &str) -> Result<PathBuf,
             return Ok(exe);
         }
     }
+    #[cfg(windows)]
+    let asset = if tokio::task::spawn_blocking(|| tar_works(&windows_tar())).await.unwrap_or(false) {
+        ytdlp_release_asset()
+    } else {
+        tracing::warn!("{} does not run: installing the single-file yt-dlp, which starts more slowly", windows_tar().display());
+        single_file_asset()
+    };
+    #[cfg(not(windows))]
     let asset = ytdlp_release_asset();
     let release = format!("{RELEASES}/download/{tag}");
 
@@ -546,15 +568,15 @@ async fn install_release(client: &reqwest::Client, tag: &str) -> Result<PathBuf,
         .map_err(|e| format!("Failed to read {asset_url}: {e}"))?;
 
     let tag = tag.to_string();
-    tokio::task::spawn_blocking(move || install_verified(&bin_dir, &tag, &bytes, &expected))
+    tokio::task::spawn_blocking(move || install_verified(&bin_dir, &tag, asset, &bytes, &expected))
         .await
         .map_err(|e| format!("yt-dlp install task failed: {e}"))?
 }
 
-/// Check `bytes` (the release asset) against `expected_sha256`, then install them into `bin_dir`:
-/// unpacked on Windows (see [`install_onedir`]), elsewhere as one file written next to its target
-/// and renamed into place. Returns the program to run. Blocking.
-fn install_verified(bin_dir: &Path, tag: &str, bytes: &[u8], expected_sha256: &str) -> Result<PathBuf, String> {
+/// Check `bytes` (release asset `asset`) against `expected_sha256`, then install them into
+/// `bin_dir`: on Windows into the release's own folder (see [`install_onedir`]), elsewhere as one
+/// file written next to its target and renamed into place. Returns the program to run. Blocking.
+fn install_verified(bin_dir: &Path, tag: &str, asset: &str, bytes: &[u8], expected_sha256: &str) -> Result<PathBuf, String> {
     let actual = format!("{:x}", Sha256::digest(bytes));
     if actual != expected_sha256 {
         return Err(format!(
@@ -563,10 +585,10 @@ fn install_verified(bin_dir: &Path, tag: &str, bytes: &[u8], expected_sha256: &s
     }
     std::fs::create_dir_all(bin_dir).map_err(|e| format!("Failed to create {}: {e}", bin_dir.display()))?;
     #[cfg(windows)]
-    return install_onedir(bin_dir, tag, bytes);
+    return install_onedir(bin_dir, tag, asset, bytes);
     #[cfg(not(windows))]
     {
-        let _ = tag;
+        let _ = (tag, asset);
         install_file(&bin_dir.join("yt-dlp"), bytes)
     }
 }
@@ -597,13 +619,13 @@ fn make_executable(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Folder the unpacked build of release `tag` is installed in.
+/// Folder release `tag` is installed in.
 #[cfg(windows)]
 fn release_dir(bin_dir: &Path, tag: &str) -> PathBuf {
     bin_dir.join(format!("yt-dlp-{tag}"))
 }
 
-/// `yt-dlp.exe` of the newest release unpacked in `bin_dir`.
+/// `yt-dlp.exe` of the newest release installed in `bin_dir`.
 #[cfg(windows)]
 fn newest_release(bin_dir: &Path) -> Option<PathBuf> {
     std::fs::read_dir(bin_dir)
@@ -618,21 +640,26 @@ fn newest_release(bin_dir: &Path) -> Option<PathBuf> {
         .map(|(_, exe)| exe)
 }
 
-/// Unpacks the release zip into its own `yt-dlp-<tag>` folder. The folder is unpacked under a
-/// temporary name and appears complete in one rename, which is what switches the managed yt-dlp
-/// to this release (see [`newest_release`]); a running yt-dlp keeps running from its own folder,
-/// which Windows would not let us replace anyway. Older releases are cleared away afterwards (see
-/// [`remove_old_releases`]). Blocking.
+/// Installs release asset `asset` (`bytes`) into the release's own `yt-dlp-<tag>` folder: the zip
+/// unpacked, or the single-file build (see [`single_file_asset`]) as `yt-dlp.exe`. The folder is
+/// made under a temporary name and appears complete in one rename, which is what switches the
+/// managed yt-dlp to this release (see [`newest_release`]); a running yt-dlp keeps running from
+/// its own folder, which Windows would not let us replace anyway. Older releases are cleared away
+/// afterwards (see [`remove_old_releases`]). Blocking.
 #[cfg(windows)]
-fn install_onedir(bin_dir: &Path, tag: &str, zip: &[u8]) -> Result<PathBuf, String> {
+fn install_onedir(bin_dir: &Path, tag: &str, asset: &str, bytes: &[u8]) -> Result<PathBuf, String> {
     let target = release_dir(bin_dir, tag);
     let temp = format!(".yt-dlp-{tag}-{}", unique_suffix());
     let (archive, unpacked) = (bin_dir.join(format!("{temp}.zip")), bin_dir.join(format!("{temp}.tmp")));
     let fail = |e: std::io::Error| format!("Failed to install yt-dlp to {}: {e}", target.display());
-    let extracted = std::fs::write(&archive, zip)
-        .and_then(|()| std::fs::create_dir(&unpacked))
-        .and_then(|()| unzip(&archive, &unpacked));
-    let _ = std::fs::remove_file(&archive);
+    let extracted = std::fs::create_dir(&unpacked).and_then(|()| {
+        if !asset.ends_with(".zip") {
+            return std::fs::write(unpacked.join("yt-dlp.exe"), bytes);
+        }
+        let unzipped = std::fs::write(&archive, bytes).and_then(|()| unzip(&archive, &unpacked));
+        let _ = std::fs::remove_file(&archive);
+        unzipped
+    });
     let complete = extracted.map_err(fail).and_then(|()| {
         if unpacked.join("yt-dlp.exe").is_file() {
             Ok(())
@@ -679,14 +706,35 @@ fn rename_patiently(from: &Path, to: &Path) -> std::io::Result<()> {
     std::fs::rename(from, to)
 }
 
-/// Extracts `archive` into `into` with the tar.exe that ships with Windows (10 1803 and later),
-/// named by full path so no other tar on PATH is used. It refuses entries that would land outside
+/// The tar.exe that ships with Windows (10 1803 and later), named by full path so no other tar on
+/// PATH is used.
+#[cfg(windows)]
+fn windows_tar() -> PathBuf {
+    let windows = std::env::var_os("SystemRoot").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
+    windows.join("System32").join("tar.exe")
+}
+
+/// Whether `tar` runs, so [`unzip`] can unpack a release: older and trimmed-down Windows installs
+/// have no tar.exe. Blocking.
+#[cfg(windows)]
+fn tar_works(tar: &Path) -> bool {
+    use std::os::windows::process::CommandExt;
+    std::process::Command::new(tar)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// Extracts `archive` into `into` with [`windows_tar`]. It refuses entries that would land outside
 /// `into`. Blocking.
 #[cfg(windows)]
 fn unzip(archive: &Path, into: &Path) -> std::io::Result<()> {
     use std::os::windows::process::CommandExt;
-    let windows = std::env::var_os("SystemRoot").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
-    let output = std::process::Command::new(windows.join("System32").join("tar.exe"))
+    let output = std::process::Command::new(windows_tar())
         .arg("-xf")
         .arg(archive)
         .arg("-C")
@@ -2838,10 +2886,10 @@ mod tests {
         let body = b"binary";
         let good = format!("{:x}", Sha256::digest(body));
 
-        assert!(install_verified(&bin, "2026.08.19", body, &"0".repeat(64)).is_err());
+        assert!(install_verified(&bin, "2026.08.19", ytdlp_release_asset(), body, &"0".repeat(64)).is_err());
         assert!(!target.exists());
 
-        assert_eq!(install_verified(&bin, "2026.08.19", body, &good).unwrap(), target);
+        assert_eq!(install_verified(&bin, "2026.08.19", ytdlp_release_asset(), body, &good).unwrap(), target);
         assert_eq!(std::fs::read(&target).unwrap(), body);
         // No temp file left behind.
         assert_eq!(std::fs::read_dir(&bin).unwrap().count(), 1);
@@ -2876,7 +2924,7 @@ mod tests {
         let zip = release_zip(dir.path(), b"new build");
         let good = format!("{:x}", Sha256::digest(&zip));
 
-        assert!(install_verified(&bin, "2026.08.19", &zip, &"0".repeat(64)).is_err());
+        assert!(install_verified(&bin, "2026.08.19", "yt-dlp_win.zip", &zip, &"0".repeat(64)).is_err());
         assert!(!release_dir(&bin, "2026.08.19").exists());
 
         // What earlier installs left: the previous release, an older one still running and one
@@ -2905,7 +2953,7 @@ mod tests {
         let hours_ago = SystemTime::now() - Duration::from_secs(2 * 3600);
         std::fs::File::options().write(true).open(&crashed).unwrap().set_modified(hours_ago).unwrap();
 
-        let exe = install_verified(&bin, "2026.08.19", &zip, &good).unwrap();
+        let exe = install_verified(&bin, "2026.08.19", "yt-dlp_win.zip", &zip, &good).unwrap();
         assert_eq!(exe, release_dir(&bin, "2026.08.19").join("yt-dlp.exe"));
         assert_eq!(std::fs::read(&exe).unwrap(), b"new build");
         assert!(release_dir(&bin, "2026.08.19").join("_internal").join("python.dll").is_file());
@@ -2923,8 +2971,38 @@ mod tests {
         child.wait().unwrap();
         // The same release again (as when another process installed it first) is kept as it is,
         // and the old release nothing runs from any more goes.
-        assert_eq!(install_verified(&bin, "2026.08.19", &zip, &good).unwrap(), exe);
+        assert_eq!(install_verified(&bin, "2026.08.19", "yt-dlp_win.zip", &zip, &good).unwrap(), exe);
         assert_eq!(left(), [".yt-dlp-2026.08.19-2.zip", "yt-dlp-2026.07.01", "yt-dlp-2026.08.19"]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn without_tar_the_single_file_build_is_installed_as_a_release() {
+        assert!(tar_works(&windows_tar()));
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!tar_works(&dir.path().join("tar.exe")), "no tar.exe, nothing to unpack the zip with");
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(single_file_asset(), "yt-dlp.exe");
+        // The Windows builds a release lists (trimmed from 2026.09's SHA2-256SUMS).
+        let sums = "30b4  yt-dlp_win.zip\n6667  yt-dlp.exe\na8f9  yt-dlp_x86.exe\n05b4  yt-dlp_arm64.exe\n";
+        assert!(expected_sha256(sums, single_file_asset()).is_some(), "the release lists it");
+
+        let bin = dir.path().join("bin");
+        let build = b"single-file build";
+        let good = format!("{:x}", Sha256::digest(build));
+        assert!(install_verified(&bin, "2026.08.19", single_file_asset(), build, &"0".repeat(64)).is_err());
+        assert!(!release_dir(&bin, "2026.08.19").exists());
+
+        // An older release unpacked while tar.exe still worked: the new one supersedes it.
+        std::fs::create_dir_all(release_dir(&bin, "2026.07.01")).unwrap();
+        std::fs::write(release_dir(&bin, "2026.07.01").join("yt-dlp.exe"), b"previous build").unwrap();
+        let exe = install_verified(&bin, "2026.08.19", single_file_asset(), build, &good).unwrap();
+        assert_eq!(exe, release_dir(&bin, "2026.08.19").join("yt-dlp.exe"));
+        assert_eq!(std::fs::read(&exe).unwrap(), build);
+        assert_eq!(newest_release(&bin), Some(exe));
+        let mut left: Vec<String> = std::fs::read_dir(&bin).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        left.sort();
+        assert_eq!(left, ["yt-dlp-2026.07.01", "yt-dlp-2026.08.19"], "no temporary files");
     }
 
     #[cfg(windows)]
