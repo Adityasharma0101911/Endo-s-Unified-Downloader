@@ -186,6 +186,9 @@ pub struct DownloadEngine {
     client: Result<Client, String>,
     /// Added per request, only for the hosts in `urls`; never a client default header.
     auth: Option<Arc<Auth>>,
+    /// The speed limit, one for every connection of the download (and every stream of a media
+    /// download, see `download_media_stream`).
+    limiter: Option<Arc<RateLimiter>>,
     cancel_flag: Arc<AtomicBool>,
     cancel_token: CancellationToken,
 }
@@ -210,6 +213,7 @@ impl DownloadEngine {
             _ => client,
         };
         Self {
+            limiter: options.max_speed.filter(|&s| s > 0).map(|s| Arc::new(RateLimiter::new(s))),
             options,
             urls,
             client,
@@ -265,43 +269,18 @@ impl DownloadEngine {
         if let Some(playlist) = resolved.iter().find(|u| u.as_str().contains(".m3u8")) {
             tracing::info!("Detected HLS video stream: {}", playlist);
             let started_at = unix_now();
-            let auth = self.auth.as_deref();
-            let fetch =
-                crate::hls::FetchPolicy { stall_timeout: self.stall_timeout(), max_retries: self.options.max_retries };
+            let fetch = self.fetch_policy();
             let parsed = self
                 .guarded(
                     HLS_PARSE_TIMEOUT.saturating_add(fetch.give_up_after()),
                     "fetching the HLS playlist",
-                    crate::hls::parse_hls_playlist(&client, playlist, auth, fetch),
+                    crate::hls::parse_hls_playlist(&client, playlist, self.auth.as_deref(), fetch),
                 )
                 .await?;
             match parsed {
                 Ok(segments) => {
                     let base = self.hls_output_path(playlist, &segments);
-                    let cancel_flag = Some(Arc::clone(&self.cancel_flag));
-                    // The claim is held until this download returns, whichever way it ends, and by
-                    // its writer while that touches the .part, even after this future is dropped.
-                    let (target, claim) =
-                        claim_hls_output(&client, auth, playlist, &segments, base, fetch, &cancel_flag).await?;
-                    let claim = Arc::new(claim);
-                    let target = target.hold(Arc::clone(&claim));
-                    let options = crate::hls::HlsOptions {
-                        connections: self.options.num_connections,
-                        fetch,
-                        fsync_on_complete: self.options.fsync_on_complete,
-                        expected_checksum: self.options.expected_checksum.clone(),
-                    };
-                    let (path, digest) = crate::hls::HlsEngine::download(
-                        &client,
-                        auth,
-                        segments,
-                        target,
-                        &options,
-                        snapshot_tx,
-                        cancel_flag,
-                    )
-                    .await
-                    .map_err(|e| e.to_string())?;
+                    let (path, digest) = self.fetch_hls(&client, playlist, segments, base, snapshot_tx).await?;
                     // Hashed as it was written and, with fsync_on_complete, flushed before it took
                     // its name: nothing is read back or flushed again.
                     return self.finish_external(path, started_at, Some(digest)).await;
@@ -472,15 +451,110 @@ impl DownloadEngine {
             concurrent_fragments: self.options.num_connections.clamp(1, 32),
         };
 
-        let res = crate::media::download_media(
+        // yt-dlp finds the streams; this engine downloads them where it can.
+        let fetch: &crate::media::StreamFetcher<'_> =
+            &|stream, tx, stop| Box::pin(self.download_media_stream(stream, tx, stop));
+        let res = crate::media::download_media_with(
             &media_url,
             &media_opts,
             Some(prog_tx),
             Some(Arc::clone(&self.cancel_flag)),
+            Some(fetch),
         )
         .await;
         let _ = forwarder.await;
         self.finish_external(res?, started_at, None).await
+    }
+
+    /// Downloads one stream of a media download (see `crate::media`) with this download's
+    /// settings, but the stream's own client, file and request size. The streams draw on this
+    /// download's one speed limit together, whatever their sizes; HLS streams are not held to it,
+    /// as no HLS download is (and no yt-dlp download). The stream's key is one of its URLs, so its
+    /// resume state and history outlive the stream URL. Cancelling `stop` stops it as `cancel`
+    /// stops a download.
+    pub(crate) async fn download_media_stream(
+        &self,
+        stream: crate::media::MediaStream,
+        snapshot_tx: broadcast::Sender<EngineSnapshot>,
+        stop: CancellationToken,
+    ) -> Result<PathBuf, String> {
+        let options = DownloadOptions {
+            output_path: Some(stream.path.clone()),
+            base_chunk_size: stream.chunk_size.unwrap_or(self.options.base_chunk_size),
+            // The checksum, the user's credentials and cookies are for the page, not this stream.
+            expected_checksum: None,
+            cookies_path: None,
+            auth_header: None,
+            media_preset: None,
+            browser_cookies: None,
+            fsync_on_complete: false,
+            ..self.options.clone()
+        };
+        let urls = vec![stream.url.clone(), stream.key.clone()];
+        let mut engine = DownloadEngine::with_client(urls, options, stream.client.clone());
+        engine.limiter = self.limiter.clone();
+        let download = engine.fetch_media_stream(&stream, snapshot_tx);
+        tokio::pin!(download);
+        tokio::select! {
+            result = &mut download => result,
+            () = stop.cancelled() => {
+                engine.cancel();
+                download.await
+            }
+        }
+    }
+
+    async fn fetch_media_stream(
+        &self,
+        stream: &crate::media::MediaStream,
+        snapshot_tx: broadcast::Sender<EngineSnapshot>,
+    ) -> Result<PathBuf, String> {
+        let client = &stream.client;
+        if !stream.hls {
+            let probed = self.probe_all(client, std::slice::from_ref(&stream.url)).await?;
+            return self.download(client.clone(), probed, Some(snapshot_tx)).await;
+        }
+        let fetch = self.fetch_policy();
+        let parsed = self
+            .guarded(
+                HLS_PARSE_TIMEOUT.saturating_add(fetch.give_up_after()),
+                "fetching the HLS playlist",
+                crate::hls::parse_hls_playlist(client, &stream.url, None, fetch),
+            )
+            .await?;
+        let segments = parsed.map_err(|e| e.to_string())?;
+        // The streams are joined into the output, which is what gets checked and recorded.
+        let (path, _digest) = self.fetch_hls(client, &stream.url, segments, stream.path.clone(), Some(snapshot_tx)).await?;
+        Ok(path)
+    }
+
+    /// Downloads the HLS stream `segments` of `playlist` make, to `base` or the first name after
+    /// it that is free or holds this stream's `.part`, and returns the file with the digest taken
+    /// while writing it. The claim on the name is held until this returns, whichever way it ends,
+    /// and by the stream's writer while that touches the `.part`, even after this future is
+    /// dropped.
+    async fn fetch_hls(
+        &self,
+        client: &Client,
+        playlist: &Url,
+        segments: Vec<crate::hls::HlsSegment>,
+        base: PathBuf,
+        snapshot_tx: Option<broadcast::Sender<EngineSnapshot>>,
+    ) -> Result<(PathBuf, FileDigest), String> {
+        let (auth, fetch) = (self.auth.as_deref(), self.fetch_policy());
+        let cancel_flag = Some(Arc::clone(&self.cancel_flag));
+        let (target, claim) = claim_hls_output(client, auth, playlist, &segments, base, fetch, &cancel_flag).await?;
+        let claim = Arc::new(claim);
+        let target = target.hold(Arc::clone(&claim));
+        let options = crate::hls::HlsOptions {
+            connections: self.options.num_connections,
+            fetch,
+            fsync_on_complete: self.options.fsync_on_complete,
+            expected_checksum: self.options.expected_checksum.clone(),
+        };
+        crate::hls::HlsEngine::download(client, auth, segments, target, &options, snapshot_tx, cancel_flag)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     /// Checks the expected checksum of a file another engine (yt-dlp, HLS) finished and records
@@ -1204,11 +1278,16 @@ impl DownloadEngine {
     }
 
     fn limiter(&self) -> Option<Arc<RateLimiter>> {
-        self.options.max_speed.filter(|&s| s > 0).map(|s| Arc::new(RateLimiter::new(s)))
+        self.limiter.clone()
     }
 
     fn stall_timeout(&self) -> Duration {
         Duration::from_secs(self.options.stall_timeout_secs.max(1))
+    }
+
+    /// How HLS requests wait and retry: as the user set it for every connection.
+    fn fetch_policy(&self) -> crate::hls::FetchPolicy {
+        crate::hls::FetchPolicy { stall_timeout: self.stall_timeout(), max_retries: self.options.max_retries }
     }
 }
 
