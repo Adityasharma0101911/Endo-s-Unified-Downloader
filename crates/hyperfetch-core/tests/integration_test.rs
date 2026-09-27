@@ -3406,3 +3406,26 @@ async fn test_a_link_that_only_looks_like_a_feed_is_downloaded_as_it_is() {
         assert_eq!(tasks, [Task { urls: vec![link.clone()], ..Task::default() }], "{link}");
     }
 }
+
+/// A private feed saved as UTF-16 is read, and its relative enclosure is on the feed's host
+/// without the feed's query, so the token stays with the feed.
+#[tokio::test]
+async fn test_a_relative_enclosure_is_on_the_feed_host_without_the_feeds_token() {
+    use hyperfetch_core::ingest::{descriptor_client, ingest, ListOptions};
+    let _history = setup().await;
+    let rss = r#"<?xml version="1.0" encoding="UTF-16"?>
+<rss version="2.0"><channel><title>Wide Show</title>
+<item><title>Relative</title><pubDate>Wed, 03 Jun 2026 08:00:00 GMT</pubDate><enclosure url="media/rel.mp3" type="audio/mpeg"/></item>
+</channel></rss>"#;
+    let body: Vec<u8> = [0xFF, 0xFE].into_iter().chain(rss.encode_utf16().flat_map(u16::to_le_bytes)).collect();
+    let feed = serve(Arc::new(Mock::new(body)), "private/show.rss?auth=s3cret").await;
+    let http = descriptor_client(None).unwrap();
+    let tasks = ingest(&[feed.as_str()], &http, &ListOptions::default()).await.expect("the feed is read");
+    let [task] = &tasks[..] else { panic!("{tasks:?}") };
+    let host = format!("{}:{}", feed.host_str().unwrap(), feed.port().unwrap());
+    assert_eq!(task.urls, [Url::parse(&format!("http://{host}/private/media/rel.mp3")).unwrap()]);
+    assert_eq!(task.urls[0].query(), None);
+    assert_eq!(task.name.as_deref(), Some(Path::new("2026-06-03 Relative.mp3")));
+    assert_eq!(task.folder.as_deref(), Some(Path::new("Wide Show")));
+    assert!(task.from_document);
+}
