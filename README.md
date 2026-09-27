@@ -13,27 +13,31 @@
 ## Features
 
 **Fast downloads**
-- Splits a file into chunks and downloads them over several HTTP/1.1 connections at once (one TCP connection per worker, up to 64). Workers that finish early take over part of the slowest remaining range (work stealing).
-- Several mirror URLs of the same file are used together. Every mirror is probed first, and a mirror that reports a different size or a different strong ETag is dropped, so bytes from different files are never mixed.
-- An optional speed limit (`--max-speed`) is shared by all connections of a download.
-- Batches run 4 downloads at once by default (`-j`). All running downloads together open at most 64 connections to one host (`--max-connections-per-host`), and the downloads of a batch share their HTTP connections and TLS sessions, so later files skip the handshakes.
+- Splits a file into chunks and downloads them over several HTTP/1.1 connections at once (one TCP connection per worker, up to 64). The probe's answer goes on as the first chunk, and the other connections start as soon as the size is known.
+- Work stealing is decided by time: a worker that finishes early takes over the part of the slowest chunk that it can finish sooner, split where both finish together, and takes over at once a chunk whose connection has gone silent for 2 s (or 4 answer times).
+- Several mirror URLs of the same file are used together. The download starts with the first mirror that answers with range support, and the others join as their probes come back. A mirror that reports a different size or a different strong ETag is dropped, so bytes from different files are never mixed.
+- Chunk requests go straight to where a mirror redirects (GitHub releases, SourceForge, Dropbox), and back to the mirror's own URL if that target expires.
+- An optional speed limit (`--max-speed`) is shared by all connections of a download, HLS segments and the streams of a media download included.
+- Batches run 4 downloads at once by default (`-j`). All running downloads together open at most 64 connections to one host (`--max-connections-per-host`), probes included, and the downloads of a batch share their HTTP connections and TLS sessions, so later files skip the handshakes.
+- What a host was seen to do is remembered for 10 minutes: whether it takes ranges, whether it caps each connection's speed (and at what rate), how long a new connection takes, and a connection cap learned from 429 answers. Later downloads from it start at the right width without measuring again.
 
 **Safe, resumable files**
 - A download is written to `<name>.part`. Its resume state is saved to `<name>.part.hfstate` before the first byte arrives and again every 2 seconds, each time after the data it records has been flushed to disk. When the download finishes, the file is renamed to its final name, so a file at its final name is always complete.
 - A finished file is not flushed to disk before it is reported done; the operating system writes it out on its own schedule, as with curl, wget and browsers. A power loss right after a download finishes can therefore leave a damaged file, which `--verify` detects. `--fsync` (GUI: **Flush finished files to disk**) waits for each finished file to reach the disk first.
 - Stopping (Ctrl+C, `systemctl stop`) saves the resume state. Running the same command again continues where it stopped, but only if the server still reports the same size, validators (ETag/Last-Modified) and range support. Otherwise the stale `.part` is discarded and the download starts over.
 - Existing files are never overwritten. A different file with the same name is saved as `name (1).ext`. A file that is already complete (the checksum matches, or history recorded it as completed at that exact path) is not downloaded again.
-- Checksums: `sha256:`, `md5:`, `blake3:` or bare hex. The BLAKE3 hash of every finished download is recorded in the history, so `--verify` can check the file later.
+- Checksums: `sha256:`, `md5:`, `blake3:` or bare hex. The BLAKE3 hash of every finished download is recorded in the history, so `--verify` can check the file later. The hashes are taken while the file is written (SHA-256 and MD5 follow the file's start as it grows, so with such a checksum chunks are at most 8 MiB unless `-c` sets their size), and finishing a download reads back only what was not hashed on the way. A mismatch is confirmed by reading the whole file before it is discarded.
+- A server that ignores `If-Range` and sends part of a changed file is caught by the ETag or Last-Modified date of its answer, and the download stops instead of mixing two versions.
 
 **Resilient transfers**
-- Stall detection: a connection that receives no data for `--stall-timeout` seconds (default 30) is dropped and retried.
+- Stall detection: a connection that receives no data for `--stall-timeout` seconds (default 30) is dropped and retried. A chunk's connection that goes quiet mid-body is replaced after 5 s (or the stall timeout, if shorter), keeping what it received.
 - Retries with exponential backoff and jitter. HTTP 429/503 responses respect `Retry-After` and reduce the number of connections. Mirrors that keep failing are disabled. An attempt that made progress does not count against `--max-retries`.
-- Servers without range support or without a known length are downloaded as a single stream.
+- Servers without range support or without a known length are downloaded as a single stream, which goes on with the probe's answer instead of asking again.
 
 **Many kinds of input**
-- **Link resolvers:** Google Drive (large-file confirmation), MediaFire, Dropbox share links, SourceForge (several mirrors), Archive.org (all replica servers), and web pages with an embedded video (`<video>`, `og:video`).
-- **HLS (`.m3u8`):** master and media playlists, AES-128 encrypted segments, `#EXT-X-MAP` init sections, output as `.ts` or `.mp4`, and resumable. Live streams and DRM are not supported.
-- **Media sites:** YouTube, Twitch, TikTok, Twitter/X, Vimeo, Reddit, Instagram, Facebook and Dailymotion are handed to [yt-dlp](https://github.com/yt-dlp/yt-dlp) automatically. If yt-dlp is not installed, a managed copy is downloaded and checked against its published SHA-256 sums. ffmpeg is needed to merge separate video and audio streams. Use `--media-preset` to choose the quality and `--cookies-from-browser` for sites that require a login.
+- **Link resolvers:** Google Drive (large-file confirmation), MediaFire, Dropbox share links, SourceForge (several mirrors), Archive.org (all replica servers), and web pages with an embedded video (`<video>`, `og:video`). Whether a Google Drive link, or a URL that may be a web page (no extension, or a page one), answers with a page is read from the probe's own answer, not from a request of its own, and an Archive.org item is asked only for the three metadata fields that name its servers, once for all its files.
+- **HLS (`.m3u8`):** master and media playlists, AES-128 encrypted segments, `#EXT-X-MAP` init sections, output as `.ts` or `.mp4`, and resumable. Segments come over several connections in a sliding window, so a slow segment does not hold up the others (it is requested a second time once it lags), and are written by a writer of their own, which saves the resume state every 2 s. AES keys are fetched in parallel, adjoining byte ranges of one file are fetched together, and `--stall-timeout` and `--max-retries` apply. Live streams and DRM are not supported.
+- **Media sites:** YouTube, Twitch, TikTok, Twitter/X, Vimeo, Reddit, Instagram, Facebook and Dailymotion are handed to [yt-dlp](https://github.com/yt-dlp/yt-dlp) automatically. yt-dlp finds the formats, and when they are plain files or HLS playlists the engine downloads the video and audio together over its own connections, then ffmpeg joins them without re-encoding; anything else, or a failure, falls back to yt-dlp's own download, which reuses that extraction. If yt-dlp is not installed, a managed copy is downloaded and checked against its published SHA-256 sums (on Windows the unpacked build, which starts faster). Its version is cached on disk, and browser cookies are read once and reused for 15 minutes. ffmpeg is needed to merge separate video and audio streams. Use `--media-preset` to choose the quality (`m4a` picks an AAC source, so the audio is copied, not re-encoded) and `--cookies-from-browser` for sites that require a login.
 - **Magnet links** with HTTP web seeds (`ws=`), and **`.torrent`** files with web seeds (`url-list`). Every file of a multi-file torrent becomes a separate download. BitTorrent peer-to-peer transfer is not supported.
 - **Metalink** (`.metalink`, `.meta4`): mirrors are ordered by priority, and the file name and SHA-256/MD5 checksum are taken from the metalink.
 
@@ -228,18 +232,18 @@ The service downloads every line of the queue, two at a time, and then exits. Fi
   CLI / GUI
       |
       v
-  DownloadEngine ---- media hosts ----> yt-dlp (process tree, cancellable)
+  DownloadEngine ---- media hosts ----> yt-dlp (finds the formats; process tree, cancellable)
       |  resolve (Drive, MediaFire, SourceForge, Archive.org, pages)
-      |  probe mirrors concurrently, keep identical ones
-      |---- .m3u8 ---------------------> HlsEngine (ordered segment pipeline, AES-128)
+      |  probe mirrors concurrently, keep identical ones; the first answer is the first chunk
+      |---- .m3u8 ---------------------> HlsEngine (sliding window, writer thread, AES-128)
       v
-  ChunkManager (dynamic chunks, work stealing, per-chunk retries)
+  ChunkManager (dynamic chunks, time-based work stealing, per-chunk retries)
       |                      \
       v                       v
   HTTP workers x N        MirrorRacer (per-mirror speed, throttling, failover)
-      |
+      |  hosts (per-host connection budget and profile, shared by every download)
       v
-  DiskWriter (positional writes into <name>.part, preallocation, fsync)
+  DiskWriter (positional writes into <name>.part, preallocation, hashed as written)
   DownloadState (<name>.part.hfstate, saved every 2 s and on stop)
 ```
 
