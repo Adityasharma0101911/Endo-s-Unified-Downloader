@@ -308,11 +308,12 @@ impl HostResolver for GoogleDriveResolver {
     }
 
     /// The direct download URL, sending nothing: whether Drive serves the file there shows in the
-    /// download's own probe (see `check_answer`).
+    /// download's own probe (see `check_answer`). The link's resource key goes along.
     async fn resolve(&self, _client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
         let file_id = extract_google_drive_id(url)
             .ok_or_else(|| ResolverError::Parse("Could not extract Google Drive file ID".to_string()))?;
-        Ok(vec![google_drive_direct_url(&file_id)?])
+        let resource_key = url.query_pairs().find(|(k, _)| k == "resourcekey").map(|(_, v)| v);
+        Ok(vec![google_drive_direct_url(&file_id, resource_key.as_deref())?])
     }
 }
 
@@ -488,11 +489,13 @@ impl GoogleDriveResolver {
 }
 
 /// The usercontent download endpoint serves every file size directly; `confirm=t` skips the
-/// virus-scan interstitial that large files otherwise get.
-fn google_drive_direct_url(file_id: &str) -> Result<Url, ResolverError> {
+/// virus-scan interstitial that large files otherwise get. A file shared by link before Drive's
+/// 2021 security update opens only with its `resource_key`.
+pub(crate) fn google_drive_direct_url(file_id: &str, resource_key: Option<&str>) -> Result<Url, ResolverError> {
+    let key = resource_key.map(|key| ("resourcekey", key));
     Url::parse_with_params(
         "https://drive.usercontent.google.com/download",
-        &[("id", file_id), ("export", "download"), ("confirm", "t")],
+        [("id", file_id), ("export", "download"), ("confirm", "t")].into_iter().chain(key),
     )
     .map_err(|e| ResolverError::Parse(e.to_string()))
 }
@@ -511,7 +514,7 @@ const GOOGLE_DOCS_VIEWS: &[&str] = &["edit", "view", "preview", "htmlview", "mob
 /// link is kept in the format it asks for (`format=csv&gid=` for one sheet). Other links on a document (gviz
 /// queries, /pub copies) already give what they are for, so they are left alone. Exports are
 /// made on the fly: one connection, no known size.
-fn google_docs_export(url: &Url) -> Option<Url> {
+pub(crate) fn google_docs_export(url: &Url) -> Option<Url> {
     if url.host_str()? != "docs.google.com" {
         return None;
     }
@@ -1328,10 +1331,16 @@ mod tests {
 
     #[test]
     fn test_google_drive_direct_url() {
-        let direct = google_drive_direct_url("1BxyzABC_12345").unwrap();
+        let direct = google_drive_direct_url("1BxyzABC_12345", None).unwrap();
         assert_eq!(
             direct.as_str(),
             "https://drive.usercontent.google.com/download?id=1BxyzABC_12345&export=download&confirm=t"
+        );
+        // Where Drive itself sends drive.google.com/uc?...&resourcekey= (checked live).
+        let keyed = google_drive_direct_url("1BxyzABC_12345", Some("0-a_B")).unwrap();
+        assert_eq!(
+            keyed.as_str(),
+            "https://drive.usercontent.google.com/download?id=1BxyzABC_12345&export=download&confirm=t&resourcekey=0-a_B"
         );
     }
 
@@ -1353,13 +1362,17 @@ mod tests {
             .unwrap();
         let shared = Url::parse("https://drive.google.com/file/d/1BxyzABC_12345/view?usp=sharing").unwrap();
         let resolved = SmartResolver::resolve(&client, &shared).await.unwrap();
-        assert_eq!(resolved, vec![google_drive_direct_url("1BxyzABC_12345").unwrap()]);
+        assert_eq!(resolved, vec![google_drive_direct_url("1BxyzABC_12345", None).unwrap()]);
+        // A link's resource key opens the file.
+        let keyed = Url::parse("https://drive.google.com/file/d/1BxyzABC_12345/view?resourcekey=0-k3y&usp=sharing").unwrap();
+        let resolved = SmartResolver::resolve(&client, &keyed).await.unwrap();
+        assert_eq!(resolved, vec![google_drive_direct_url("1BxyzABC_12345", Some("0-k3y")).unwrap()]);
         assert!(!contacted(&proxy).await, "Drive was asked before the download's probe");
     }
 
     #[test]
     fn test_google_drive_web_page_answers_are_rejected() {
-        let drive = google_drive_direct_url("1BxyzABC_12345").unwrap();
+        let drive = google_drive_direct_url("1BxyzABC_12345", None).unwrap();
         let page = headers(&[(CONTENT_TYPE, "text/html; charset=utf-8")]);
         let err = GoogleDriveResolver::check_answer(&drive, &page).unwrap_err();
         assert!(err.to_string().contains("Google Drive served a web page instead of the file"), "{err}");
@@ -1699,7 +1712,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_older_drive_links_on_docs_google_com_go_to_drive() {
-        let direct = google_drive_direct_url("1BxyzABC_12345").unwrap();
+        let direct = google_drive_direct_url("1BxyzABC_12345", None).unwrap();
         for link in [
             "https://docs.google.com/uc?export=download&id=1BxyzABC_12345",
             "https://docs.google.com/file/d/1BxyzABC_12345/edit",
