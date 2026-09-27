@@ -38,6 +38,10 @@ const MAX_HASH_BLOCKS: u64 = 1 << 16;
 /// the writers.
 const FOLLOW_STEP: u64 = 1024 * 1024;
 
+/// Files read back whole to be hashed (see `FileDigest::of`), for tests to tell which were not.
+#[cfg(test)]
+pub(crate) static READ_BACK: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
 /// Preallocated output file shared by all workers. Writes are positional (`pwrite` /
 /// `WriteFile` with an offset), so concurrent writers never share a cursor or a mapping.
 ///
@@ -824,6 +828,8 @@ impl FileDigest {
 
     /// Hashes the file at `path` without writing to it (see [`FileDigest::of_file`]). Blocking.
     fn of(path: &Path, sha256: bool, md5: bool) -> std::io::Result<Self> {
+        #[cfg(test)]
+        READ_BACK.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(path.to_path_buf());
         let file = File::open(path)?;
         let len = file.metadata()?.len();
         Self::of_file(&file, len, FILE_HASH_BLOCK, sha256, md5)
