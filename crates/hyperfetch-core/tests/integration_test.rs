@@ -3298,3 +3298,78 @@ async fn test_bare_sha512_and_sha1_checksums_of_a_single_stream() {
         assert_no_leftovers(&out);
     }
 }
+
+// Folder links: Google Drive folders listed into one download per file.
+
+/// Google Drive's embedded view of public folders (its shape checked live): "Photos" holds a
+/// file, a Slides document and a subfolder "2024" shared with a resource key; one folder is
+/// private, any other missing.
+fn drive_folders(method: &str, target: &str) -> Vec<u8> {
+    let page = |title: &str, entries: &[(&str, &str)]| {
+        let entries: String = entries
+            .iter()
+            .map(|(href, name)| {
+                format!(r#"<div class="flip-entry" id="entry-x" tabindex="0" role="link"><div class="flip-entry-info"><a href="{href}" target="_blank"><div class="flip-entry-title">{name}</div></a></div></div>"#)
+            })
+            .collect();
+        let html = format!(r#"<!DOCTYPE html><html><head><title>{title}</title></head><body><div class="flip-entries">{entries}</div></body></html>"#);
+        response(method, "200 OK", "Content-Type: text/html; charset=utf-8\r\n", html.as_bytes())
+    };
+    match target {
+        "http://drive.google.com/embeddedfolderview?id=1Photos" => page(
+            "Photos",
+            &[
+                ("https://drive.google.com/file/d/1Beach/view?usp=drive_web", "beach.jpg"),
+                ("https://docs.google.com/presentation/d/1Deck/edit?usp=drive_web", "Trip"),
+                ("https://drive.google.com/drive/folders/1Year?resourcekey=0-yk", "2024"),
+            ],
+        ),
+        "http://drive.google.com/embeddedfolderview?id=1Year&resourcekey=0-yk" => {
+            page("2024", &[("https://drive.google.com/file/d/1Snow/view?usp=drive_web&amp;resourcekey=0-sk", "snow &amp; ice.jpg")])
+        }
+        "http://drive.google.com/embeddedfolderview?id=1Private" => response(method, "401 Unauthorized", "Content-Type: text/html\r\n", b"<!DOCTYPE html>"),
+        _ => response(method, "404 Not Found", "Content-Type: text/html\r\n", b"<html><title>Error 404 (Not Found)!!1</title></html>"),
+    }
+}
+
+/// Without an API key a Drive folder is listed from its public page: each file goes through
+/// Drive's direct download, a document as its export, under the folder's name. A private or
+/// missing folder is an error. With a key, the folder is asked of the Drive API only, over TLS.
+#[tokio::test]
+async fn test_a_google_drive_folder_is_listed_from_its_page_or_the_api() {
+    use hyperfetch_core::ingest::{descriptor_client, ingest, ListOptions};
+    let (proxy, seen) = serve_proxy(drive_folders).await;
+    let http = descriptor_client(Some(&proxy)).unwrap();
+
+    let tasks = ingest(&["http://drive.google.com/drive/u/0/folders/1Photos?usp=sharing"], &http, &ListOptions::default())
+        .await
+        .expect("the folder is listed");
+    let photos = PathBuf::from("Photos");
+    let listed: Vec<_> = tasks.iter().map(|t| (t.folder.clone().unwrap(), t.name.clone().unwrap(), t.urls[0].as_str())).collect();
+    assert_eq!(
+        listed,
+        [
+            (photos.clone(), PathBuf::from("beach.jpg"), "https://drive.usercontent.google.com/download?id=1Beach&export=download&confirm=t"),
+            (photos.clone(), PathBuf::from("Trip.pptx"), "https://docs.google.com/presentation/d/1Deck/export?format=pptx"),
+            (
+                photos.join("2024"),
+                PathBuf::from("snow & ice.jpg"),
+                "https://drive.usercontent.google.com/download?id=1Snow&export=download&confirm=t&resourcekey=0-sk",
+            ),
+        ]
+    );
+    assert!(tasks.iter().all(|t| t.from_document && t.size.is_none() && t.checksum.is_none()));
+
+    let private = ingest(&["http://drive.google.com/drive/folders/1Private"], &http, &ListOptions::default()).await.unwrap_err();
+    assert!(private.contains("private"), "{private}");
+    let missing = ingest(&["http://drive.google.com/drive/folders/1Gone"], &http, &ListOptions::default()).await.unwrap_err();
+    assert!(missing.contains("not found"), "{missing}");
+    assert!(seen.lock().unwrap().iter().all(|(target, _)| target.starts_with("http://drive.google.com/embeddedfolderview?id=")));
+
+    seen.lock().unwrap().clear();
+    let keyed = ListOptions { google_api_key: Some("AIzaSecret".into()), ..ListOptions::default() };
+    let err = ingest(&["http://drive.google.com/drive/folders/1Photos"], &http, &keyed).await.unwrap_err();
+    assert!(err.starts_with("Cannot reach the Google Drive API") && !err.contains("AIzaSecret"), "{err}");
+    let asked: Vec<_> = seen.lock().unwrap().iter().map(|(target, _)| target.clone()).collect();
+    assert_eq!(asked, ["www.googleapis.com:443"], "the key is sent to the Drive API alone, inside TLS");
+}
