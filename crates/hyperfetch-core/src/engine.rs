@@ -1285,9 +1285,13 @@ impl DownloadEngine {
         Duration::from_secs(self.options.stall_timeout_secs.max(1))
     }
 
-    /// How HLS requests wait and retry: as the user set it for every connection.
+    /// How HLS requests wait, retry and share their hosts: as the user set it for every connection.
     fn fetch_policy(&self) -> crate::hls::FetchPolicy {
-        crate::hls::FetchPolicy { stall_timeout: self.stall_timeout(), max_retries: self.options.max_retries }
+        crate::hls::FetchPolicy {
+            stall_timeout: self.stall_timeout(),
+            max_retries: self.options.max_retries,
+            host_limit: self.options.max_connections_per_host,
+        }
     }
 }
 
@@ -3720,6 +3724,49 @@ mod tests {
         // Three seconds' worth at the limit, less the tenth of a second it lets through at once.
         let least = Duration::from_secs_f64((6 * SEGMENT) as f64 / limit as f64 - 0.5);
         assert!(started.elapsed() >= least, "{:?}", started.elapsed());
+    }
+
+    #[tokio::test]
+    async fn test_hls_downloads_sharing_a_host_stay_within_its_budget() {
+        use crate::hls::tests::{ok, serve_async};
+        use std::sync::atomic::AtomicUsize;
+        // Requests the server is answering now, and the most it ever answered at once.
+        let (answering, most) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let (answering_srv, most_srv) = (Arc::clone(&answering), Arc::clone(&most));
+        let (addr, _) = serve_async(move |path: &str, _| {
+            let (path, answering, most) = (path.to_string(), Arc::clone(&answering_srv), Arc::clone(&most_srv));
+            async move {
+                most.fetch_max(answering.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                answering.fetch_sub(1, Ordering::SeqCst);
+                match path.strip_suffix(".m3u8") {
+                    Some(name) => ok(format!("#EXTM3U\n{}#EXT-X-ENDLIST\n", format!("#EXTINF:4,\n{name}.ts\n").repeat(12))),
+                    None => ok("DATA"),
+                }
+            }
+        })
+        .await;
+        let dir = tempdir().unwrap();
+        let engine = |name: &str| {
+            let options = DownloadOptions {
+                output_path: Some(dir.path().join(format!("{name}.ts"))),
+                num_connections: 4,
+                max_connections_per_host: 2,
+                ..Default::default()
+            };
+            DownloadEngine::new(vec![Url::parse(&format!("http://{addr}/{name}.m3u8")).unwrap()], options)
+        };
+        let (a, b) = (engine("a"), engine("b"));
+
+        let (a_done, b_done) = tokio::time::timeout(Duration::from_secs(30), async { tokio::join!(a.run(None), b.run(None)) })
+            .await
+            .expect("both downloads finish");
+        for (done, name) in [(a_done, "a.ts"), (b_done, "b.ts")] {
+            assert_eq!(std::fs::read(done.unwrap()).unwrap(), b"DATA".repeat(12), "{name}");
+        }
+        // Playlists and segments of both, four connections each, within the host's two.
+        assert!(most.load(Ordering::SeqCst) <= 2, "{} answered at once", most.load(Ordering::SeqCst));
+        assert_eq!(crate::hosts::peak(&Url::parse(&format!("http://{addr}/")).unwrap()), 2);
     }
 
     #[tokio::test]
