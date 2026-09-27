@@ -146,8 +146,9 @@ struct Stats {
     /// Body bytes sent in answer to probes.
     probe_bytes: AtomicU64,
     active: AtomicUsize,
-    /// GETs being answered now, each until just before its last write (so never after the client
-    /// could have seen the whole answer), and the most ever answered at once.
+    /// Requests being answered now, probes and HEADs among them (all hold host slots), each until
+    /// just before its last write (so never after the client could have seen the whole answer),
+    /// and the most ever answered at once.
     serving: AtomicUsize,
     max_serving: AtomicUsize,
     /// GETs refused with 503 for exceeding `max_active`.
@@ -281,6 +282,9 @@ async fn handle(mut socket: TcpStream, mock: Arc<Mock>) {
     let accept = if mock.ranges && !mock.chunked { "Accept-Ranges: bytes\r\n" } else { "" };
     let length = |n: usize| if mock.chunked { "Transfer-Encoding: chunked\r\n".to_string() } else { format!("Content-Length: {}\r\n", n) };
     let content_type = mock.content_type.map(|t| format!("Content-Type: {}\r\n", t)).unwrap_or_default();
+    let serving = s.serving.fetch_add(1, Ordering::SeqCst) + 1;
+    s.max_serving.fetch_max(serving, Ordering::SeqCst);
+    let mut serving = Some(ActiveGuard(&s.serving));
 
     if method == "HEAD" {
         tokio::time::sleep(mock.head_delay).await;
@@ -299,21 +303,19 @@ async fn handle(mut socket: TcpStream, mock: Arc<Mock>) {
             let disposition = mock.head_disposition.map(|d| format!("Content-Disposition: {}\r\n", d)).unwrap_or_default();
             format!("HTTP/1.1 200 OK\r\n{}{}{}{}{}Connection: close\r\n\r\n", length(total), accept, etag, disposition, content_type)
         };
+        drop(serving);
         let _ = socket.write_all(resp.as_bytes()).await;
         return;
     }
 
-    let (reply, _guard, mut serving) = if probe {
+    let (reply, _guard) = if probe {
         s.probes.fetch_add(1, Ordering::SeqCst);
         let busy = mock.busy_probes.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok();
-        (if busy { Reply::Status(503, None) } else { mock.probe_reply }, None, None)
+        (if busy { Reply::Status(503, None) } else { mock.probe_reply }, None)
     } else {
         let index = s.gets.fetch_add(1, Ordering::SeqCst);
         let active = s.active.fetch_add(1, Ordering::SeqCst) + 1;
         let guard = ActiveGuard(&s.active);
-        let serving = s.serving.fetch_add(1, Ordering::SeqCst) + 1;
-        s.max_serving.fetch_max(serving, Ordering::SeqCst);
-        let serving = ActiveGuard(&s.serving);
         if header("if-range").is_some() {
             s.if_ranges.fetch_add(1, Ordering::SeqCst);
         }
@@ -331,7 +333,7 @@ async fn handle(mut socket: TcpStream, mock: Arc<Mock>) {
         } else {
             (mock.plan)(index)
         };
-        (reply, Some(guard), Some(serving))
+        (reply, Some(guard))
     };
     let reply = if mock.rejects_range && header("range").is_some() { Reply::Status(400, None) } else { reply };
     if let Reply::Status(code, retry_after) = reply {
@@ -1897,9 +1899,10 @@ async fn test_downloads_to_one_host_share_its_connection_budget() {
             stall_timeout_secs: 1,
             // No steals: a stolen-from request is dropped once its part is in, which the mock
             // only notices at its next write. (With steals and takeovers the engine's own tests
-            // count the slots held instead.)
+            // count the slots held instead.) For the same reason chunks are as long as the
+            // probe's range, so its answer, which goes on as the first chunk, is read to its end.
             min_steal_threshold: u64::MAX,
-            ..options(&out, 8, 128 * KB)
+            ..options(&out, 8, PREFETCH)
         };
         (DownloadEngine::new(vec![url], opts), out)
     };
@@ -1912,7 +1915,7 @@ async fn test_downloads_to_one_host_share_its_connection_budget() {
     assert_file(&a_out, &data);
     assert_file(&b_out, &data);
     let most = mock.stats.max_serving.load(Ordering::SeqCst);
-    assert_eq!(most, 4, "two downloads of 8 connections each share the host's 4");
+    assert_eq!(most, 4, "two downloads of 8 connections each, probes included, share the host's 4");
 }
 
 #[tokio::test]
