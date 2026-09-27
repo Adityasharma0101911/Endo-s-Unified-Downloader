@@ -284,7 +284,7 @@ impl DownloadEngine {
         }
 
         let resolved = self.resolve_all(&client).await?;
-        self.fetch_resolved(client, resolved, snapshot_tx, Route { follows: 0, scrape: true }).await
+        self.fetch_resolved(client, resolved, snapshot_tx, Route { follows: 0, tried: Vec::new(), scrape: true }).await
     }
 
     /// Downloads what the resolved mirrors serve: an HLS stream if one is a playlist, else their
@@ -299,7 +299,7 @@ impl DownloadEngine {
         client: Client,
         resolved: Vec<Url>,
         snapshot_tx: Option<broadcast::Sender<EngineSnapshot>>,
-        route: Route,
+        mut route: Route,
     ) -> Result<PathBuf, String> {
         if let Some(playlist) = resolved.iter().find(|u| u.as_str().contains(".m3u8")) {
             tracing::info!("Detected HLS video stream: {}", playlist);
@@ -334,7 +334,8 @@ impl DownloadEngine {
 
         let mut probed = self.probe_all(&client, &resolved).await?;
         let (url, final_url) = (probed.reference.url.clone(), probed.reference.final_url.clone());
-        if crate::resolver::lands_elsewhere(&url, &final_url) && self.goes_on(&final_url, route, &probed.reference)? {
+        route.tried.push(url.clone());
+        if crate::resolver::lands_elsewhere(&url, &final_url) && route.goes_on(&final_url, &probed.reference)? {
             // Nothing of the answer is kept: it and the probes still out are given up.
             drop(probed);
             return self.follow(client, final_url, snapshot_tx, route).await;
@@ -357,7 +358,7 @@ impl DownloadEngine {
                 return Box::pin(self.naming(video).fetch_resolved(client, mirrors, snapshot_tx, route)).await;
             }
             Some(Lead::Refresh(target)) => {
-                if self.goes_on(&target, route, &probed.reference)? {
+                if route.goes_on(&target, &probed.reference)? {
                     drop(probed);
                     return self.follow(client, target, snapshot_tx, route).await;
                 }
@@ -377,20 +378,6 @@ impl DownloadEngine {
         self.download(client, probed, snapshot_tx).await
     }
 
-    /// Whether the download goes on to `target`, where the answer `reference` describes leads: at
-    /// most `MAX_FOLLOWS` links past those it was given, and never to one it had. When it does
-    /// not, that answer is judged as `probe_all` leaves out for one that lands elsewhere, so a
-    /// page is never saved in place of a file.
-    fn goes_on(&self, target: &Url, route: Route, reference: &ProbeInfo) -> Result<bool, String> {
-        if route.follows < MAX_FOLLOWS && !self.urls.contains(target) {
-            return Ok(true);
-        }
-        tracing::warn!("Not following {} to {}: too many links followed, or one followed before", reference.url, target);
-        crate::resolver::check_answer(&reference.url, &reference.final_url, &reference.headers)
-            .map_err(|e| format!("{}: {}", reference.url, e))?;
-        Ok(false)
-    }
-
     /// Downloads `target`, where the download's link led (see `fetch_resolved`), in its place: a
     /// media site's link with yt-dlp, any other as its resolver takes it, looked into again if it
     /// answers with a page.
@@ -399,7 +386,7 @@ impl DownloadEngine {
         client: Client,
         target: Url,
         snapshot_tx: Option<broadcast::Sender<EngineSnapshot>>,
-        route: Route,
+        mut route: Route,
     ) -> Result<PathBuf, String> {
         tracing::info!("Downloading {} in place of the link that led there", target);
         let engine = self.naming(target.clone());
@@ -410,7 +397,9 @@ impl DownloadEngine {
             .guarded(RESOLVE_TIMEOUT, &format!("resolving {}", target), crate::resolver::SmartResolver::resolve(&client, &target))
             .await?
             .map_err(|e| format!("Failed to resolve {}: {}", target, e))?;
-        let route = Route { follows: route.follows + 1, scrape: true };
+        route.follows += 1;
+        route.tried.push(target);
+        route.scrape = true;
         Box::pin(engine.fetch_resolved(client, resolved, snapshot_tx, route)).await
     }
 
@@ -1852,12 +1841,33 @@ enum Lead {
 }
 
 /// How far a download went from the links it was given.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Route {
     /// Links followed so far (see `DownloadEngine::follow`).
     follows: usize,
+    /// The links whose answers the download had, and those it followed: a link it was given but
+    /// never had the answer of (a mirror whose probe lost to the first's) is not among them.
+    tried: Vec<Url>,
     /// Whether a web page answered is looked into: not once one led to its video.
     scrape: bool,
+}
+
+impl Route {
+    /// Whether the download goes on to `target`, where the answer `reference` describes leads: at
+    /// most `MAX_FOLLOWS` links past those it was given, and never to one it tried. When it does
+    /// not, that answer is judged as `probe_all` leaves out for one that lands elsewhere, and as
+    /// if the link had been where it landed, so a page is never saved in place of a file.
+    fn goes_on(&self, target: &Url, reference: &ProbeInfo) -> Result<bool, String> {
+        if self.follows < MAX_FOLLOWS && !self.tried.contains(target) {
+            return Ok(true);
+        }
+        tracing::warn!("Not following {} to {}: too many links followed, or one tried before", reference.url, target);
+        for link in [&reference.url, &reference.final_url] {
+            crate::resolver::check_answer(link, &reference.final_url, &reference.headers)
+                .map_err(|e| format!("{}: {}", reference.url, e))?;
+        }
+        Ok(false)
+    }
 }
 
 /// The host of `url` when a link shortener or a mail link scanner answers there (see
@@ -4801,23 +4811,29 @@ mod tests {
     #[test]
     fn test_a_download_follows_at_most_three_links_and_never_back() {
         let given = Url::parse("http://short.engine.invalid/x").unwrap();
-        let engine = DownloadEngine::new(vec![given.clone()], DownloadOptions::default());
         let answer = probed(given.as_str(), 100);
         let next = Url::parse("http://files.engine.invalid/a.bin").unwrap();
-        let after = |follows| Route { follows, scrape: true };
-        assert_eq!(engine.goes_on(&next, after(0), &answer), Ok(true));
-        assert_eq!(engine.goes_on(&next, after(MAX_FOLLOWS - 1), &answer), Ok(true));
-        assert_eq!(engine.goes_on(&next, after(MAX_FOLLOWS), &answer), Ok(false));
-        // Never to a link the download had: the one given, or one it followed.
-        assert_eq!(engine.goes_on(&given, after(0), &answer), Ok(false));
-        let followed = engine.naming(next.clone());
-        assert_eq!(followed.urls, [given, next.clone()]);
-        assert_eq!(followed.goes_on(&next, after(1), &answer), Ok(false));
-        // An answer the download does not follow on from is judged as the probe skipped it.
-        let mut drive = probed("http://drive.usercontent.google.com/download?id=abc&export=download&confirm=t", 100);
-        drive.headers.insert(reqwest::header::CONTENT_TYPE, HeaderValue::from_static("text/html"));
-        let err = engine.goes_on(&next, after(MAX_FOLLOWS), &drive).unwrap_err();
+        let after = |follows, tried: &[&Url]| Route { follows, tried: tried.iter().map(|u| (*u).clone()).collect(), scrape: true };
+        assert_eq!(after(0, &[&given]).goes_on(&next, &answer), Ok(true));
+        assert_eq!(after(MAX_FOLLOWS - 1, &[&given]).goes_on(&next, &answer), Ok(true));
+        assert_eq!(after(MAX_FOLLOWS, &[&given]).goes_on(&next, &answer), Ok(false));
+        // Never to a link the download tried: one whose answer it had, or one it followed. A
+        // link it was only given is not among them (see the integration tests).
+        assert_eq!(after(0, &[&given]).goes_on(&given, &answer), Ok(false));
+        assert_eq!(after(1, &[&given, &next]).goes_on(&next, &answer), Ok(false));
+        // An answer the download does not follow on from is judged as the probe skipped it...
+        let html = |mut info: ProbeInfo| {
+            info.headers.insert(reqwest::header::CONTENT_TYPE, HeaderValue::from_static("text/html"));
+            info
+        };
+        let drive = html(probed("http://drive.usercontent.google.com/download?id=abc&export=download&confirm=t", 100));
+        let err = after(MAX_FOLLOWS, &[]).goes_on(&next, &drive).unwrap_err();
         assert!(err.contains("Google Drive served a web page instead of the file"), "{err}");
+        // ... and as if the link had been where it landed.
+        let mut landed = html(probed(given.as_str(), 100));
+        landed.final_url = drive.url.clone();
+        let err = after(MAX_FOLLOWS, &[]).goes_on(&next, &landed).unwrap_err();
+        assert!(err.starts_with(&format!("{given}: ")) && err.contains("Google Drive served a web page"), "{err}");
     }
 
     #[test]
