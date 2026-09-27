@@ -115,7 +115,9 @@ pub fn parse_metalink(xml_content: &str) -> Result<Vec<MetalinkFile>, String> {
                             if !clean_hash.is_empty() {
                                 let htype = if current_hash_type.is_empty() {
                                     match clean_hash.len() {
+                                        128 => "sha512".to_string(),
                                         64 => "sha256".to_string(),
+                                        40 => "sha1".to_string(),
                                         32 => "md5".to_string(),
                                         _ => "unknown".to_string(),
                                     }

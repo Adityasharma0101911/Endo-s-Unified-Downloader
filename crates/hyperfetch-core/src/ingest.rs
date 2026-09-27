@@ -269,7 +269,7 @@ fn metalink_tasks(bytes: &[u8]) -> Result<Vec<Task>, String> {
             if file.urls.is_empty() {
                 return Err(format!("metalink file '{}' has no http(s) URLs", file.name));
             }
-            let checksum = ["sha256", "md5"]
+            let checksum = ["sha512", "sha256", "sha1", "md5"]
                 .iter()
                 .find_map(|algo| file.hashes.iter().find(|(t, _)| t == algo).map(|(t, h)| format!("{}:{}", t, h)));
             let name = Some(clean_path(file.name.split('/'))?);
@@ -441,6 +441,28 @@ mod tests {
         assert_eq!(tasks[1].checksum.as_deref(), Some("md5:0123"));
         assert!(tasks.iter().all(|t| t.from_document), "the user never named these hosts");
         assert!(!run("https://a.example/f.iso").unwrap()[0].from_document);
+    }
+
+    /// The strongest checksum a metalink publishes is checked; one that gives only SHA-1 or
+    /// SHA-512 (Metalink 3 files often give SHA-1 alone) is checked too.
+    #[test]
+    fn metalink_checksums_are_taken_strongest_first() {
+        let (sha512, sha1) = ("ab".repeat(64), "cd".repeat(20));
+        let xml = format!(
+            r#"<metalink version="3.0" xmlns="http://www.metalinker.org/"><files>
+            <file name="a.iso"><verification><hash type="sha1">{sha1}</hash><hash type="md5">{md5}</hash><hash type="sha512">{sha512}</hash></verification>
+            <resources><url type="http">https://m.example/a.iso</url></resources></file>
+            <file name="b.iso"><verification><hash type="sha1">{sha1}</hash><hash type="md5">{md5}</hash></verification>
+            <resources><url type="http">https://m.example/b.iso</url></resources></file>
+            <file name="c.iso"><verification><hash>{sha512}</hash></verification><resources><url>https://m.example/c.iso</url></resources></file>
+            </files></metalink>"#,
+            md5 = "ef".repeat(16),
+        );
+        let checksums: Vec<_> = metalink_tasks(xml.as_bytes()).unwrap().into_iter().map(|t| t.checksum.unwrap()).collect();
+        assert_eq!(checksums, [format!("sha512:{sha512}"), format!("sha1:{sha1}"), format!("sha512:{sha512}")]);
+        for checksum in &checksums {
+            assert!(crate::storage::validate_checksum(checksum).is_ok(), "{checksum}");
+        }
     }
 
     /// A local document is read only if it is a file no larger than a remote one may be.

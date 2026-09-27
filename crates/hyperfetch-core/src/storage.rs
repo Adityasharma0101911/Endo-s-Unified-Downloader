@@ -7,7 +7,9 @@ use std::thread::JoinHandle;
 use blake3::hazmat::{merge_subtrees_non_root, merge_subtrees_root, ChainingValue, HasherExt, Mode};
 use parking_lot::{Condvar, Mutex};
 use thiserror::Error;
-use sha2::{Digest as Sha2Digest, Sha256};
+use sha2::digest::DynDigest;
+use sha2::{Digest as Sha2Digest, Sha256, Sha512};
+use sha1::Sha1;
 use md5::Md5;
 use crate::range::ByteRange;
 
@@ -47,7 +49,7 @@ pub(crate) static READ_BACK: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::
 ///
 /// Once told to with [`DiskWriter::track_digest`], the writer also hashes what it writes: each
 /// aligned block with BLAKE3 as its bytes come in, so [`DiskWriter::digest`] reads back only the
-/// blocks it never saw written (and SHA-256/MD5, see `track_digest`).
+/// blocks it never saw written (and a checksum's other digest, see `track_digest`).
 #[derive(Clone)]
 pub struct DiskWriter {
     path: PathBuf,
@@ -132,12 +134,13 @@ impl DiskWriter {
 
     /// Starts hashing what is written from now on, for [`DiskWriter::digest`]; a writer that is
     /// never asked for a digest (a repair) does without. Counts `on_disk`, bytes an earlier run
-    /// wrote, as written, so blocks they complete are hashed too. When `expected_checksum` needs
-    /// SHA-256 or MD5, also starts hashing the file's written prefix with it in the background as
-    /// the prefix grows, with BLAKE3 for any block in it never hashed, so `digest` reads only the
-    /// rest. That hashing stops once the last clone of this writer is dropped.
+    /// wrote, as written, so blocks they complete are hashed too. When `expected_checksum` needs a
+    /// digest besides BLAKE3 (SHA-256, SHA-512, SHA-1 or MD5), also starts hashing the file's
+    /// written prefix with it in the background as the prefix grows, with BLAKE3 for any block in
+    /// it never hashed, so `digest` reads only the rest. That hashing stops once the last clone of
+    /// this writer is dropped.
     pub fn track_digest(&self, on_disk: &[ByteRange], expected_checksum: Option<&str>) {
-        let (sha256, md5) = needs(expected_checksum).unwrap_or_default();
+        let extra = needs(expected_checksum).unwrap_or_default();
         let hashes = &self.inner.hashes;
         let mut state = hashes.state.lock();
         state.tracking = true;
@@ -145,9 +148,9 @@ impl DiskWriter {
             add(&mut state.written, range.start..range.end.saturating_add(1).min(self.size));
         }
         hashes.changed.notify_all();
-        if (sha256 || md5) && state.follower.is_none() && !state.stopped {
+        if extra.is_some() && state.follower.is_none() && !state.stopped {
             let (hashes, file) = (Arc::clone(hashes), Arc::clone(&self.inner.file));
-            let prefix = PrefixHash::new(sha256, md5);
+            let prefix = PrefixHash::new(extra);
             // Without the thread, `digest` hashes the whole file at the end, as it would anyway.
             state.follower = std::thread::Builder::new()
                 .name("prefix-hash".into())
@@ -157,18 +160,18 @@ impl DiskWriter {
     }
 
     /// The file's digest, once writing is done: BLAKE3 merged from the blocks hashed as they were
-    /// written, plus SHA-256/MD5 when `expected_checksum` needs them. Reads each byte at most once,
-    /// through this writer's handle: SHA-256/MD5 goes on from where the prefix hasher stopped,
+    /// written, plus the digest `expected_checksum` needs besides. Reads each byte at most once,
+    /// through this writer's handle: that digest goes on from where the prefix hasher stopped,
     /// hashing the blocks never hashed that it passes on the way, and whatever blocks are left
     /// unhashed after that are read back on every core. Blocking.
     pub fn digest(&self, expected_checksum: Option<&str>) -> std::io::Result<FileDigest> {
-        let (sha256, md5) = needs(expected_checksum).unwrap_or_default();
+        let extra = needs(expected_checksum).unwrap_or_default();
         let (hashes, file) = (&*self.inner.hashes, &*self.inner.file);
         let mut prefix = hashes
             .stop_follower()
-            .filter(|p| p.has(sha256, md5))
-            .unwrap_or_else(|| PrefixHash::new(sha256, md5));
-        if sha256 || md5 {
+            .filter(|p| p.algo == extra)
+            .unwrap_or_else(|| PrefixHash::new(extra));
+        if extra.is_some() {
             // The prefix hasher stops on a block boundary, and these reads are whole blocks.
             let tail = prefix.len..self.size;
             let unhashed = hashes.unhashed(&hashes.state.lock(), tail.clone());
@@ -191,12 +194,11 @@ impl DiskWriter {
     /// The file's digest from reading all of it back through this writer's handle, ignoring
     /// what was hashed while writing. Blocking.
     pub fn full_digest(&self, expected_checksum: Option<&str>) -> std::io::Result<FileDigest> {
-        let (sha256, md5) = needs(expected_checksum).unwrap_or_default();
-        self.read_digest(sha256, md5)
+        self.read_digest(needs(expected_checksum).unwrap_or_default())
     }
 
-    fn read_digest(&self, sha256: bool, md5: bool) -> std::io::Result<FileDigest> {
-        FileDigest::of_file(&self.inner.file, self.size, FILE_HASH_BLOCK, sha256, md5)
+    fn read_digest(&self, extra: Option<Algo>) -> std::io::Result<FileDigest> {
+        FileDigest::of_file(&self.inner.file, self.size, FILE_HASH_BLOCK, extra)
     }
 
     /// Computes BLAKE3 hash for a specific range.
@@ -213,26 +215,27 @@ impl DiskWriter {
 
     /// Computes BLAKE3 root hash for the entire file.
     pub fn compute_file_hash(&self) -> Result<[u8; 32], StorageError> {
-        Ok(self.read_digest(false, false)?.blake3)
+        Ok(self.read_digest(None)?.blake3)
     }
 
     /// Computes SHA-256 hash for the entire file as a lowercase hex string.
     pub fn compute_sha256(&self) -> Result<String, StorageError> {
-        Ok(self.read_digest(true, false)?.sha256.unwrap_or_default())
+        Ok(self.read_digest(Some(Algo::Sha256))?.extra.map(|(_, hex)| hex).unwrap_or_default())
     }
 
     /// Computes MD5 hash for the entire file as a lowercase hex string.
     pub fn compute_md5(&self) -> Result<String, StorageError> {
-        Ok(self.read_digest(false, true)?.md5.unwrap_or_default())
+        Ok(self.read_digest(Some(Algo::Md5))?.extra.map(|(_, hex)| hex).unwrap_or_default())
     }
 
-    /// Verifies the file against an expected checksum ("sha256:...", "md5:...", "blake3:...", or raw hex).
+    /// Verifies the file against an expected checksum ("sha256:...", "md5:...", "blake3:...", or raw
+    /// hex; see [`validate_checksum`]).
     /// `Ok(false)` means the hash does not match; `Err` means the file could not be read or the
     /// algorithm prefix is unknown.
     pub fn verify_checksum(&self, expected: &str) -> Result<bool, String> {
         let checksum = Checksum::parse(expected)?;
         let digest = self
-            .read_digest(checksum.needs_sha256(), checksum.needs_md5())
+            .read_digest(checksum.algo.extra())
             .map_err(|e| format!("Failed to read {}: {}", self.path.display(), e))?;
         Ok(checksum.matches(&digest))
     }
@@ -240,7 +243,7 @@ impl DiskWriter {
     /// Verifies an existing file against an expected checksum. Opens the file read-only and never modifies it.
     pub fn verify_file_checksum(path: &Path, expected: &str) -> Result<bool, String> {
         let checksum = Checksum::parse(expected)?;
-        let digests = FileDigest::of(path, checksum.needs_sha256(), checksum.needs_md5())
+        let digests = FileDigest::of(path, checksum.algo.extra())
             .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
         Ok(checksum.matches(&digests))
     }
@@ -303,7 +306,8 @@ struct HashState {
     /// Written byte ranges: sorted, disjoint and not touching.
     written: Vec<Range<u64>>,
     blocks: Vec<Block>,
-    /// SHA-256/MD5 of the written prefix, taken in the background (see `DiskWriter::track_digest`).
+    /// A checksum's other digest of the written prefix, taken in the background (see
+    /// `DiskWriter::track_digest`).
     follower: Option<JoinHandle<PrefixHash>>,
     /// How far the prefix hasher has read, or is reading.
     followed: u64,
@@ -621,28 +625,28 @@ fn joined<T>(handle: std::thread::ScopedJoinHandle<'_, T>) -> T {
     handle.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))
 }
 
-/// SHA-256 and/or MD5 of the first `len` bytes of a file.
+/// The digest of the first `len` bytes of a file that a checksum needs besides BLAKE3, if any.
 struct PrefixHash {
-    sha256: Option<Sha256>,
-    md5: Option<Md5>,
+    algo: Option<Algo>,
+    hasher: Option<Box<dyn DynDigest + Send>>,
     len: u64,
 }
 
 impl PrefixHash {
-    fn new(sha256: bool, md5: bool) -> Self {
-        Self { sha256: sha256.then(Sha256::new), md5: md5.then(Md5::new), len: 0 }
-    }
-
-    /// Whether it computes every digest asked for.
-    fn has(&self, sha256: bool, md5: bool) -> bool {
-        (!sha256 || self.sha256.is_some()) && (!md5 || self.md5.is_some())
+    /// `algo` is one of [`Algo::extra`]'s.
+    fn new(algo: Option<Algo>) -> Self {
+        let hasher: Option<Box<dyn DynDigest + Send>> = match algo {
+            Some(Algo::Sha256) => Some(Box::new(Sha256::new())),
+            Some(Algo::Sha512) => Some(Box::new(Sha512::new())),
+            Some(Algo::Sha1) => Some(Box::new(Sha1::new())),
+            Some(Algo::Md5) => Some(Box::new(Md5::new())),
+            Some(Algo::Blake3 | Algo::Sha256OrBlake3) | None => None,
+        };
+        Self { algo: algo.filter(|_| hasher.is_some()), hasher, len: 0 }
     }
 
     fn update(&mut self, data: &[u8]) {
-        if let Some(h) = self.sha256.as_mut() {
-            h.update(data);
-        }
-        if let Some(h) = self.md5.as_mut() {
+        if let Some(h) = self.hasher.as_mut() {
             h.update(data);
         }
         self.len += data.len() as u64;
@@ -666,24 +670,24 @@ pub fn validate_checksum(expected: &str) -> Result<(), String> {
     Checksum::parse(expected).map(|_| ())
 }
 
-/// Whether `expected_checksum` needs SHA-256 and MD5 computed.
-fn needs(expected_checksum: Option<&str>) -> Result<(bool, bool), String> {
+/// The digest `expected_checksum` needs computed besides BLAKE3, if any (see [`Algo::extra`]).
+fn needs(expected_checksum: Option<&str>) -> Result<Option<Algo>, String> {
     let checksum = expected_checksum.map(Checksum::parse).transpose()?;
-    Ok(checksum.map_or((false, false), |c| (c.needs_sha256(), c.needs_md5())))
+    Ok(checksum.and_then(|c| c.algo.extra()))
 }
 
 /// Whether a writer told of `expected_checksum` hashes the file's written start as it grows (for
-/// SHA-256 or MD5, see [`DiskWriter::track_digest`]).
+/// a digest besides BLAKE3, see [`DiskWriter::track_digest`]).
 pub(crate) fn hashes_prefix(expected_checksum: Option<&str>) -> bool {
-    needs(expected_checksum).is_ok_and(|(sha256, md5)| sha256 || md5)
+    needs(expected_checksum).is_ok_and(|extra| extra.is_some())
 }
 
 /// Hashes a finished file: always BLAKE3 (returned as hex), plus whatever `expected_checksum`
 /// needs, all at once (see [`FileDigest::of`]). Opens the file read-only; call it from a blocking
 /// context.
 pub fn hash_and_verify_file(path: &Path, expected_checksum: Option<&str>) -> Result<String, VerifyError> {
-    let (sha256, md5) = needs(expected_checksum).map_err(VerifyError::Io)?;
-    let digest = FileDigest::of(path, sha256, md5)
+    let extra = needs(expected_checksum).map_err(VerifyError::Io)?;
+    let digest = FileDigest::of(path, extra)
         .map_err(|e| VerifyError::Io(format!("Failed to read {}: {}", path.display(), e)))?;
     verify_digest(&digest, expected_checksum)
 }
@@ -703,9 +707,11 @@ pub fn verify_digest(digest: &FileDigest, expected_checksum: Option<&str>) -> Re
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Algo {
     Sha256,
+    Sha512,
+    Sha1,
     Md5,
     Blake3,
     /// A bare 64-digit digest: SHA-256 and BLAKE3 digests look alike, so either may match.
@@ -716,6 +722,8 @@ impl Algo {
     fn name(self) -> &'static str {
         match self {
             Algo::Sha256 => "SHA-256",
+            Algo::Sha512 => "SHA-512",
+            Algo::Sha1 => "SHA-1",
             Algo::Md5 => "MD5",
             Algo::Blake3 => "BLAKE3",
             Algo::Sha256OrBlake3 => "SHA-256 or BLAKE3",
@@ -725,7 +733,19 @@ impl Algo {
     fn hex_len(self) -> usize {
         match self {
             Algo::Md5 => 32,
+            Algo::Sha1 => 40,
             Algo::Sha256 | Algo::Blake3 | Algo::Sha256OrBlake3 => 64,
+            Algo::Sha512 => 128,
+        }
+    }
+
+    /// The digest a checksum of this algorithm needs computed besides BLAKE3, which every file
+    /// gets: none for BLAKE3 itself.
+    fn extra(self) -> Option<Algo> {
+        match self {
+            Algo::Blake3 => None,
+            Algo::Sha256OrBlake3 => Some(Algo::Sha256),
+            algo => Some(algo),
         }
     }
 }
@@ -736,14 +756,17 @@ struct Checksum {
 }
 
 impl Checksum {
-    /// Accepts `sha256:`, `md5:` or `blake3:` followed by the digest, or a bare digest of 32 (MD5)
-    /// or 64 (SHA-256 or BLAKE3) hex digits. Rejects anything no supported algorithm can produce.
+    /// Accepts `sha256:`, `sha512:`, `sha1:`, `md5:` or `blake3:` (`sha-256:` and so on too)
+    /// followed by the digest, or a bare digest of 32 (MD5), 40 (SHA-1), 64 (SHA-256 or BLAKE3) or
+    /// 128 (SHA-512) hex digits. Rejects anything no supported algorithm can produce.
     fn parse(expected: &str) -> Result<Self, String> {
         let trimmed = expected.trim();
         let (algo, hex) = match trimmed.split_once(':') {
             Some((prefix, hash)) => {
                 let algo = match prefix.trim().to_ascii_lowercase().as_str() {
                     "sha256" | "sha-256" => Algo::Sha256,
+                    "sha512" | "sha-512" => Algo::Sha512,
+                    "sha1" | "sha-1" => Algo::Sha1,
                     "md5" => Algo::Md5,
                     "blake3" => Algo::Blake3,
                     other => return Err(format!("Unsupported checksum algorithm: {}", other)),
@@ -762,10 +785,12 @@ impl Checksum {
             Some(algo) => algo,
             None => match hex.len() {
                 32 => Algo::Md5,
+                40 => Algo::Sha1,
                 64 => Algo::Sha256OrBlake3,
+                128 => Algo::Sha512,
                 n => {
                     return Err(format!(
-                        "Unsupported checksum of {} hex digits: use MD5 (32) or SHA-256/BLAKE3 (64), optionally prefixed with md5:, sha256: or blake3:",
+                        "Unsupported checksum of {} hex digits: use MD5 (32), SHA-1 (40), SHA-256/BLAKE3 (64) or SHA-512 (128), optionally prefixed with md5:, sha1:, sha256:, sha512: or blake3:",
                         n
                     ))
                 }
@@ -777,54 +802,43 @@ impl Checksum {
         Ok(Self { algo, hex: hex.to_ascii_lowercase() })
     }
 
-    fn needs_sha256(&self) -> bool {
-        matches!(self.algo, Algo::Sha256 | Algo::Sha256OrBlake3)
-    }
-
-    fn needs_md5(&self) -> bool {
-        self.algo == Algo::Md5
-    }
-
     fn actual(&self, d: &FileDigest) -> String {
-        let sha256 = d.sha256.as_deref().unwrap_or_default();
         match self.algo {
-            Algo::Sha256 => sha256.to_string(),
-            Algo::Md5 => d.md5.clone().unwrap_or_default(),
             Algo::Blake3 => d.blake3_hex.clone(),
-            Algo::Sha256OrBlake3 => format!("SHA-256 {} / BLAKE3 {}", sha256, d.blake3_hex),
+            Algo::Sha256OrBlake3 => format!("SHA-256 {} / BLAKE3 {}", d.extra(Algo::Sha256).unwrap_or_default(), d.blake3_hex),
+            algo => d.extra(algo).unwrap_or_default().to_string(),
         }
     }
 
     fn matches(&self, d: &FileDigest) -> bool {
         let hex = Some(self.hex.as_str());
-        let blake3 = Some(d.blake3_hex.as_str());
         match self.algo {
-            Algo::Sha256 => d.sha256.as_deref() == hex,
-            Algo::Md5 => d.md5.as_deref() == hex,
-            Algo::Blake3 => blake3 == hex,
-            Algo::Sha256OrBlake3 => d.sha256.as_deref() == hex || blake3 == hex,
+            Algo::Blake3 => Some(d.blake3_hex.as_str()) == hex,
+            Algo::Sha256OrBlake3 => d.extra(Algo::Sha256) == hex || Some(d.blake3_hex.as_str()) == hex,
+            algo => d.extra(algo) == hex,
         }
     }
 }
 
-/// Digests of a whole file: BLAKE3 always, SHA-256 and MD5 when a checksum needed them. Check it
-/// with [`verify_digest`].
+/// Digests of a whole file: BLAKE3 always, and the one a checksum needed besides. Check it with
+/// [`verify_digest`].
 #[derive(Clone, Debug)]
 pub struct FileDigest {
     blake3: [u8; 32],
     blake3_hex: String,
-    sha256: Option<String>,
-    md5: Option<String>,
+    /// See [`Algo::extra`]; lowercase hex.
+    extra: Option<(Algo, String)>,
 }
 
 impl FileDigest {
     fn new(blake3: [u8; 32], rest: PrefixHash) -> Self {
-        Self {
-            blake3,
-            blake3_hex: hex::encode(&blake3),
-            sha256: rest.sha256.map(|h| hex::encode(&h.finalize())),
-            md5: rest.md5.map(|h| hex::encode(&h.finalize())),
-        }
+        let extra = rest.algo.zip(rest.hasher).map(|(algo, h)| (algo, hex::encode(&h.finalize())));
+        Self { blake3, blake3_hex: hex::encode(&blake3), extra }
+    }
+
+    /// The `algo` digest as lowercase hex, if it was taken.
+    fn extra(&self, algo: Algo) -> Option<&str> {
+        self.extra.as_ref().filter(|(taken, _)| *taken == algo).map(|(_, hex)| hex.as_str())
     }
 
     /// The BLAKE3 hash as lowercase hex, as history records it.
@@ -833,24 +847,25 @@ impl FileDigest {
     }
 
     /// Hashes the file at `path` without writing to it (see [`FileDigest::of_file`]). Blocking.
-    fn of(path: &Path, sha256: bool, md5: bool) -> std::io::Result<Self> {
+    fn of(path: &Path, extra: Option<Algo>) -> std::io::Result<Self> {
         #[cfg(test)]
         READ_BACK.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(path.to_path_buf());
         let file = File::open(path)?;
         let len = file.metadata()?.len();
-        Self::of_file(&file, len, FILE_HASH_BLOCK, sha256, md5)
+        Self::of_file(&file, len, FILE_HASH_BLOCK, extra)
     }
 
     /// Hashes the first `len` bytes of `file` in one sequential pass of `block`-sized reads, the
     /// next block read on another thread while this one is hashed: BLAKE3 on every core and the
-    /// requested SHA-256/MD5 on one more thread, so the pass takes about as long as the slowest of
-    /// reading, BLAKE3 and SHA-256/MD5. A read error, or a file shorter than `len`, is an `Err`.
-    fn of_file(file: &File, len: u64, block: usize, sha256: bool, md5: bool) -> std::io::Result<Self> {
+    /// `extra` digest (see [`Algo::extra`]) on one more thread, so the pass takes about as long as
+    /// the slowest of reading, BLAKE3 and that digest. A read error, or a file shorter than `len`,
+    /// is an `Err`.
+    fn of_file(file: &File, len: u64, block: usize, extra: Option<Algo>) -> std::io::Result<Self> {
         let mut blake = blake3::Hasher::new();
-        let mut rest = PrefixHash::new(sha256, md5);
+        let mut rest = PrefixHash::new(extra);
         read_ahead(file, 0..len, block, |data| {
             std::thread::scope(|s| {
-                if sha256 || md5 {
+                if extra.is_some() {
                     s.spawn(|| rest.update(data));
                 }
                 blake.update_rayon(data);
@@ -861,7 +876,7 @@ impl FileDigest {
 }
 
 /// Digest of a file written from start to end, taken as it is written so that nothing has to be
-/// read back: BLAKE3, plus SHA-256/MD5 when the expected checksum needs them. For in-order
+/// read back: BLAKE3, plus the digest the expected checksum needs besides. For in-order
 /// writers (a single stream, HLS), which hand [`StreamHasher::finish`] to the engine instead of
 /// the finished file being read back.
 pub struct StreamHasher {
@@ -871,10 +886,9 @@ pub struct StreamHasher {
 
 impl StreamHasher {
     /// A hasher for a download whose expected checksum is `expected_checksum`. One that does not
-    /// parse needs no SHA-256/MD5 (the download reports it when verifying).
+    /// parse needs no other digest (the download reports it when verifying).
     pub fn new(expected_checksum: Option<&str>) -> Self {
-        let (sha256, md5) = needs(expected_checksum).unwrap_or_default();
-        Self { blake3: blake3::Hasher::new(), rest: PrefixHash::new(sha256, md5) }
+        Self { blake3: blake3::Hasher::new(), rest: PrefixHash::new(needs(expected_checksum).unwrap_or_default()) }
     }
 
     /// Hashes the file's next bytes. CPU-bound, about 1 GB/s: large pieces belong on a blocking
@@ -1180,6 +1194,14 @@ mod tests {
         assert!(writer.verify_checksum("5d41402abc4b2a76b9719d911017c592").unwrap()); // auto-detect md5
         assert!(writer.verify_checksum("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824").unwrap()); // auto-detect sha256
         // A mismatch is Ok(false); an unknown algorithm or a malformed digest is an error.
+        // sha512("hello") and sha1("hello"), prefixed or bare.
+        let sha512 = "9b71d224bd62f3785d96d46ad3ea3d73319bfbc2890caadae2dff72519673ca72323c3d99ba5c11d7c7acc6e14b8c5da0c4663475c2e5c3adef46f73bcdec043";
+        let sha1 = "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d";
+        for good in [format!("sha512:{sha512}"), format!("SHA-512:{sha512}"), sha512.to_string(), format!("sha-1:{sha1}"), sha1.to_string()] {
+            assert!(writer.verify_checksum(&good).unwrap(), "{good}");
+        }
+        assert!(!writer.verify_checksum(&format!("sha512:{}", "0".repeat(128))).unwrap());
+        assert!(!writer.verify_checksum(&format!("sha1:{}", "0".repeat(40))).unwrap());
         assert!(!writer.verify_checksum("md5:00000000000000000000000000000000").unwrap());
         assert!(writer.verify_checksum("md5:wronghash").is_err());
         assert!(writer.verify_checksum("crc32:3610a686").is_err());
@@ -1222,8 +1244,14 @@ mod tests {
         // Many blocks, a partial last one, and buffers handed back and forth between the threads.
         std::fs::write(temp.path(), &data).unwrap();
         let file = File::open(temp.path()).unwrap();
-        let d = FileDigest::of_file(&file, data.len() as u64, 1024 * 1024 + 17, true, true).unwrap();
-        assert_eq!((d.blake3_hex, d.sha256, d.md5), (blake, Some(sha), Some(md5)));
+        let sha512 = hex::encode(&Sha512::digest(&data));
+        let sha1 = hex::encode(&Sha1::digest(&data));
+        assert_eq!(hash_and_verify_file(temp.path(), Some(&format!("sha512:{sha512}"))).unwrap(), blake);
+        assert_eq!(hash_and_verify_file(temp.path(), Some(&format!("sha1:{sha1}"))).unwrap(), blake);
+        for (algo, expected) in [(Algo::Sha256, &sha), (Algo::Md5, &md5), (Algo::Sha512, &sha512), (Algo::Sha1, &sha1)] {
+            let d = FileDigest::of_file(&file, data.len() as u64, 1024 * 1024 + 17, Some(algo)).unwrap();
+            assert_eq!((&d.blake3_hex, d.extra(algo)), (&blake, Some(expected.as_str())), "{algo:?}");
+        }
     }
 
     #[test]
@@ -1234,7 +1262,7 @@ mod tests {
         std::fs::write(temp.path(), vec![5u8; 3 * 4096 + 1]).unwrap();
         let file = File::open(temp.path()).unwrap();
         for block in [4096, FILE_HASH_BLOCK] {
-            let err = FileDigest::of_file(&file, 8 * 4096, block, true, false).expect_err("truncated file hashed");
+            let err = FileDigest::of_file(&file, 8 * 4096, block, Some(Algo::Sha256)).expect_err("truncated file hashed");
             assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
         }
     }
@@ -1242,10 +1270,11 @@ mod tests {
     #[test]
     fn test_checksums_that_can_never_match_are_rejected_up_front() {
         let sums_line = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824  hello.txt";
-        let sha512 = "ab".repeat(64);
+        let sha384 = "ab".repeat(48);
         for bad in [
-            "da39a3ee5e6b4b0d3255bfef95601890afd80709", // SHA-1
-            sha512.as_str(),
+            sha384.as_str(),
+            "sha1:5d41402abc4b2a76b9719d911017c592",
+            "sha512:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
             sums_line,
             "md5:wronghash",
             "md5:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
@@ -1255,8 +1284,11 @@ mod tests {
         ] {
             assert!(validate_checksum(bad).is_err(), "{bad:?} was accepted");
         }
+        let sha512 = format!("sha-512:{}", "ab".repeat(64));
         for good in [
             "5d41402abc4b2a76b9719d911017c592",
+            "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+            sha512.as_str(),
             "SHA256:2CF24DBA5FB0A30E26E83B2AC5B9E29E1B161E5C1FA7425E73043362938B9824",
             " blake3:ea8f163db38682925e4491c5e58d4bb3506ef8c14eb78a86e908c5624a67200f ",
         ] {

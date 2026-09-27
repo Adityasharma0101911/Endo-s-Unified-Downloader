@@ -78,7 +78,7 @@ pub struct Args {
     #[arg(long = "fsync")]
     pub fsync: bool,
 
-    /// Expected checksum (sha256:HEX, md5:HEX, blake3:HEX or bare hex); single download or --verify
+    /// Expected checksum (sha256:HEX, sha512:HEX, sha1:HEX, md5:HEX, blake3:HEX or bare hex); single download or --verify
     #[arg(long = "checksum", value_parser = parse_checksum)]
     pub checksum: Option<String>,
 
