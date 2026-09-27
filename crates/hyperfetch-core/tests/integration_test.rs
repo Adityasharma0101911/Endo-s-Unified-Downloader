@@ -129,6 +129,8 @@ struct Mock {
     delay_us: AtomicU64,
     /// If set, every GET checks that this file exists.
     must_exist_on_get: Mutex<Option<PathBuf>>,
+    /// If set, every GET checks that the engine holds a slot on this URL's host.
+    slot_on_get: Mutex<Option<Url>>,
     stats: Stats,
 }
 
@@ -158,6 +160,8 @@ struct Stats {
     /// Ranges served with 206, in request order.
     ranges: Mutex<Vec<ByteRange>>,
     missing_on_get: AtomicUsize,
+    /// GETs answered while the engine held no slot on `slot_on_get`'s host.
+    unslotted: AtomicUsize,
     /// GETs sent with If-Range.
     if_ranges: AtomicUsize,
     /// Requests of any kind (HEAD, probe, GET) that carried an Authorization header.
@@ -193,6 +197,7 @@ impl Mock {
             probe_pause: None,
             delay_us: AtomicU64::new(0),
             must_exist_on_get: Mutex::new(None),
+            slot_on_get: Mutex::new(None),
             stats: Stats::default(),
         }
     }
@@ -322,6 +327,12 @@ async fn handle(mut socket: TcpStream, mock: Arc<Mock>) {
         if let Some(path) = mock.must_exist_on_get.lock().unwrap().as_ref() {
             if !path.exists() {
                 s.missing_on_get.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        if let Some(url) = mock.slot_on_get.lock().unwrap().as_ref() {
+            // Under a limit of one a slot is free only while the engine holds none.
+            if hosts::try_acquire(url, 1).is_some() {
+                s.unslotted.fetch_add(1, Ordering::SeqCst);
             }
         }
         let reply = if mock.max_active.is_some_and(|max| active > max) {
@@ -2175,6 +2186,7 @@ async fn test_a_web_page_is_downloaded_as_the_video_it_plays() {
         page.chunked = chunked;
         let page = Arc::new(page);
         let page_url = serve(Arc::clone(&page), "watch").await;
+        *page.slot_on_get.lock().unwrap() = Some(page_url.clone());
         let temp = tempdir().unwrap();
         let out = temp.path().join("clip.mp4");
 
@@ -2183,6 +2195,7 @@ async fn test_a_web_page_is_downloaded_as_the_video_it_plays() {
         let s = &page.stats;
         let seen = (s.requests.load(Ordering::SeqCst), s.gets.load(Ordering::SeqCst));
         assert_eq!(seen, (requests, gets), "chunked: {chunked}, padding: {padding}");
+        assert_eq!(s.unslotted.load(Ordering::SeqCst), 0, "the page was asked for again without a host slot");
         assert!(page.served_ranges().is_empty(), "the page was asked for in parts");
         // History lists the video along with the page: a repair finds it there.
         let urls = history_entry(&out).expect("the download is recorded").urls;

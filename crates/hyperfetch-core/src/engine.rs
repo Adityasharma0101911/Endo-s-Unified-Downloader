@@ -345,15 +345,17 @@ impl DownloadEngine {
             let (response, _slot) = match live {
                 _ if whole => return Ok((String::from_utf8_lossy(&prefetch).into_owned(), final_url)),
                 Some(Live::Stream { response, slot }) => (response, Some(slot)),
-                // Only the start came, or none of it: the page again, all of it.
+                // Only the start came, or none of it: the page again, all of it, under a slot of
+                // its host once the probe's answer gave its own back.
                 other => {
                     drop(other);
+                    let slot = hosts::acquire(&final_url, self.options.max_connections_per_host).await;
                     let request = authorize(client.get(url.clone()), self.auth.as_deref(), &url).header(ACCEPT_ENCODING, "identity");
                     let response = request.send().await.map_err(|e| e.to_string())?;
                     if !response.status().is_success() {
                         return Err(format!("HTTP {}", response.status()));
                     }
-                    (response, None)
+                    (response, Some(slot))
                 }
             };
             let page_url = response.url().clone();
