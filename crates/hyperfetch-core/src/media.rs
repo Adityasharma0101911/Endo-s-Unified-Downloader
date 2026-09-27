@@ -1765,8 +1765,17 @@ async fn run_to_end(mut cmd: Command, cancel_flag: Option<Arc<AtomicBool>>) -> R
     }
     let stderr = String::from_utf8_lossy(&stderr);
     let lines: Vec<&str> = stderr.lines().filter(|l| !l.trim().is_empty()).collect();
-    let errors: Vec<&str> = lines.iter().copied().filter(|l| l.starts_with("ERROR:")).collect();
-    // As a yt-dlp download reports them (see `OutputState::failure_message`).
+    // As a yt-dlp download reports them (see `OutputState::failure_message`), with the lines an
+    // error goes on over (a geo-blocked video's "You might want to use a VPN ...", see
+    // `site_failed`) up to the next message.
+    let errors: Vec<&str> = lines
+        .iter()
+        .scan(false, |in_error, &line| {
+            *in_error = line.starts_with("ERROR:") || (*in_error && !line.starts_with("WARNING:") && !line.starts_with('['));
+            Some(in_error.then_some(line))
+        })
+        .flatten()
+        .collect();
     if !errors.is_empty() {
         return Err(errors.join("\n"));
     }
@@ -2521,21 +2530,27 @@ const NO_MEDIA: &[&str] = &["no video", "no media", "not a video", "not have a v
 /// without it.
 const UNEXPECTED: &str = "please report this issue";
 
+/// What yt-dlp adds, on a line of its own, to every error of a site that finds the video
+/// geo-blocked, whatever the site's words: NetEase Music's are "No media links found; possibly
+/// due to geo restriction".
+const GEO_BLOCKED: &str = "you might want to use a vpn";
+
 /// Whether `error`, from [`find_site_media`], is that of a site of yt-dlp's that took the link
-/// and failed at it (a private or removed video, a login it needs, an HTTP error, the cookies it
-/// was given): an `ERROR:` line of yt-dlp's other than the one for a link no site takes, or for a
-/// page without media (see [`NO_MEDIA`] and [`UNEXPECTED`]). A site broken on a page that has
-/// media says the same (El País on an article with a video, the Guardian on a podcast's page):
-/// the page is then kept, as it was before yt-dlp was asked, until yt-dlp is fixed. Not
-/// installing, starting or waiting for yt-dlp, which says nothing of the link.
+/// and failed at it (a private, removed or geo-blocked video, a login it needs, an HTTP error, the
+/// cookies it was given): an `ERROR:` of yt-dlp's other than the one for a link no site takes,
+/// or for a page without media (see [`NO_MEDIA`] and [`UNEXPECTED`]; [`GEO_BLOCKED`] is never
+/// that). A site broken on a page that has media says the same (El País on an article with a
+/// video, the Guardian on a podcast's page): the page is then kept, as it was before yt-dlp was
+/// asked, until yt-dlp is fixed. Not installing, starting or waiting for yt-dlp, which says
+/// nothing of the link.
 pub(crate) fn site_failed(error: &str) -> bool {
     let lower = error.to_ascii_lowercase();
+    let no_media = lower.contains(UNEXPECTED) || NO_MEDIA.iter().any(|words| lower.contains(words));
     error == DRM_REFUSED
         || (error.starts_with("ERROR:")
             && !error.contains(NO_SITE)
             && !error.contains("Unsupported URL")
-            && !lower.contains(UNEXPECTED)
-            && !NO_MEDIA.iter().any(|words| lower.contains(words)))
+            && (lower.contains(GEO_BLOCKED) || !no_media))
 }
 
 /// [`find_site_media`] with `tools`. Paths in `options` must be absolute.
@@ -4690,6 +4705,38 @@ mod tests {
         assert!(!site_failed(&err));
     }
 
+    /// As yt-dlp 2026.08.19 answers a NetEase Music song from outside China when it cannot get
+    /// past the block: the site's words say "no media", yt-dlp's lines after them say why.
+    #[tokio::test]
+    async fn a_geo_blocked_site_fails_the_link_whatever_its_words() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = [
+            "ERROR: [netease:song] 32102397: No media links found; possibly due to geo restriction",
+            "This video is available in China.",
+            "You might want to use a VPN or a proxy server (with --proxy) to workaround.",
+        ];
+        let warning = "WARNING: [netease:song] Video is geo restricted. Retrying extraction with fake IP 36.164.47.216 (CN) as X-Forwarded-For.";
+        #[cfg(windows)]
+        let (bin, script) = (
+            dir.path().join("yt-dlp.cmd"),
+            format!("@echo off\r\nif \"%~2\"==\"--version\" exit /b 1\r\n{}exit /b 1\r\n", [warning].iter().chain(&error).map(|l| format!(">&2 echo {l}\r\n")).collect::<String>()),
+        );
+        #[cfg(not(windows))]
+        let (bin, script) = (
+            dir.path().join("yt-dlp"),
+            format!("#!/bin/sh\n[ \"$2\" = --version ] && exit 1\n{}exit 1\n", [warning].iter().chain(&error).map(|l| format!("echo '{l}' >&2\n")).collect::<String>()),
+        );
+        std::fs::write(&bin, script).unwrap();
+        #[cfg(unix)]
+        make_executable(&bin).unwrap();
+        let options = MediaDownloadOptions { output_dir: dir.path().to_path_buf(), custom_ytdlp_path: Some(bin), ..Default::default() };
+        let url = Url::parse("https://music.163.com/song?id=32102397").unwrap();
+
+        let err = find_site_media(&url, &options, None).await.err().expect("the site failed");
+        assert_eq!(err, error.join("\n"));
+        assert!(site_failed(&err));
+    }
+
     /// Installing yt-dlp for a page check is waited for no longer than the check itself.
     #[tokio::test(start_paused = true)]
     async fn installing_yt_dlp_counts_toward_the_wait() {
@@ -4735,6 +4782,8 @@ mod tests {
             "ERROR: [youtube] abc: Private video. Sign in if you've been granted access to this video",
             "ERROR: [youtube] abc: Video unavailable. This video has been removed by the uploader",
             "ERROR: [BBC] p0abc: This video is not available from your location due to geo restriction",
+            "ERROR: [netease:song] 32102397: No media links found; possibly due to geo restriction\nThis video is available in China.\n\
+             You might want to use a VPN or a proxy server (with --proxy) to workaround.",
             "ERROR: [twitch:vod] 123: Unable to download JSON metadata: HTTP Error 429: Too Many Requests",
             "ERROR: could not find firefox cookies database in 'C:/profile'",
             DRM_REFUSED,
