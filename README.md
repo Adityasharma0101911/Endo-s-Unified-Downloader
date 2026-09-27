@@ -41,6 +41,18 @@
 - **Magnet links** with HTTP web seeds (`ws=`), and **`.torrent`** files with web seeds (`url-list`). Every file of a multi-file torrent becomes a separate download. BitTorrent peer-to-peer transfer is not supported: a `.torrent` URL without web seeds downloads the `.torrent` file itself, for a torrent client.
 - **Metalink** (`.metalink`, `.meta4`): mirrors are ordered by priority, and the file name and SHA-256/MD5 checksum are taken from the metalink. A name with folders (`dir/file.iso`) is saved in those folders; `..` and absolute names are refused. Versions before 1.1 dropped the folders and cleaned names a little differently, so a metalink or torrent download paused by one of them may start again from zero under its new path.
 
+**Links that just work**
+
+A pasted link gives the file or the media it stands for, judged by where it lands, not by the page it may answer with. The same rules apply in the command line and the GUI.
+- **Short and wrapped links:** a link from a shortener (bit.ly, TinyURL, git.io, ...) or a mail link scanner (Outlook Safe Links, Proofpoint, Mimecast) is downloaded from where it lands, through that host's resolver or yt-dlp. "You are leaving this site" links (`youtube.com/redirect`, `google.com/url` and Google's country sites, `l.facebook.com`, `l.instagram.com`, Steam's link filter, `out.reddit.com`, LinkedIn, VK, DuckDuckGo) are replaced by the target they hold, without a request, so the queue and history keep the target. A shortener or scanner that shows a page of its own (a preview, a warning) is an error that asks you to open the link in your browser; nothing on it is clicked.
+- **t.co:** X's links, and other pages that send the browser on at once (a 0-second refresh), are followed to their target. At most three links are followed past the one given, and never back to one already tried.
+- **Code-site file pages:** a "view file" link on GitHub (`/blob/`, a renamed branch included), GitLab (`/-/blob/`), Bitbucket (`/src/`) or Hugging Face (`/blob/`, and `/raw/`, which on its own gives only the pointer of a large file) downloads the file itself. A folder link is an error.
+- **Google Docs, Sheets and Slides:** an editor or share link downloads the document as `.docx`, `.xlsx` or `.pptx`, and a link to one sheet (`#gid=`) as that sheet's `.csv`. A private document is an error that says how to share it, or to pass your browser's cookies with `--load-cookies`.
+- **Any site yt-dlp supports:** a web page that plays no video of its own is offered to yt-dlp's site extractors (never its generic one), which fail at once for a site they do not know. When one takes the page, its media is downloaded instead of the page, in the GUI's media quality. So are Box, SharePoint video and Yandex Disk share pages; one that yt-dlp cannot download is an error. A DRM-protected video is an error, never a download.
+- **Documents in the GUI:** `.metalink`, `.meta4` and `.torrent` files and links add one download per file they list (see the GUI section).
+- **Pages are refused, not saved:** a link that names a file (`.zip`, `.exe`, `.iso`, `.pdf`, ...) and answers with a web page (a login, an expired link, a download page) is an error, as is a Google Drive page (private, deleted or over quota) and the share page of a service not supported yet (MEGA, OneDrive, SharePoint, WeTransfer, Terabox, Gofile, Pixeldrain, iCloud, pCloud). A file whose server labels it a web page still downloads when its first bytes show it is a file.
+- **Secrets stay out of history:** history and the GUI's saved queue keep links without the user name, password, signatures and tokens they carry (`X-Amz-Signature`, `sig`, `token`, `key`, Discord's `hm`, Safe Links' `data`, ...), including links inside other links and error messages. Giving the same link again still finds its finished file. A Redownload, Retry or repair that would need the secret asks for the link instead.
+
 ---
 
 ## Installation
@@ -187,7 +199,7 @@ Get-Content .\links.txt | .\Endos-Unified-Downloader-CLI.exe -i - -d D:\Download
 
 ### History
 
-`--history` lists downloads newest first: status (completed, failed, or stopped with its percentage), size, file name and host. Full URLs are not shown because they may contain tokens. The history is stored in:
+`--history` lists downloads newest first: status (completed, failed, or stopped with its percentage), size, file name and host. Full URLs are not shown because they may contain tokens, and the history file keeps links without their secrets (see [Links that just work](#features)). The history is stored in:
 - Windows: `%LOCALAPPDATA%\EndosUnifiedDownloader\history.json`
 - Linux: `$XDG_DATA_HOME/endos-downloader/history.json`, otherwise `~/.hyperfetch/history.json`
 
