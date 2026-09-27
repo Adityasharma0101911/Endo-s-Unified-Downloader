@@ -228,6 +228,9 @@ impl DownloadEngine {
     }
 
     fn with_client_result(urls: Vec<Url>, options: DownloadOptions, client: Result<Client, String>) -> Self {
+        // A "leaving this site" link stands for its target, as the front ends' ingest takes it:
+        // that is what is downloaded, recorded, and given the credentials.
+        let urls: Vec<Url> = urls.into_iter().map(|u| crate::resolver::unwrap_redirect(&u).unwrap_or(u)).collect();
         let auth = options.auth_header.as_deref().map(|value| Auth::new(value, &urls));
         let client = match &auth {
             Some(Err(e)) => Err(e.clone()),
@@ -288,12 +291,13 @@ impl DownloadEngine {
     }
 
     /// Downloads what the resolved mirrors serve: an HLS stream if one is a playlist, else their
-    /// file. An answer that lands on a host a resolver takes, or on a media site, is downloaded
-    /// from there instead (see `follow`). With `route.scrape`, a web page they answer with is an
-    /// error when a link shortener or mail scanner showed it instead of redirecting; any other is
-    /// looked into (see `look_into_page`): the video it plays is downloaded in its place, the link
-    /// it sends the browser on to at once is followed. A page that leads nowhere is asked of
-    /// yt-dlp's own sites (see `site_media`), and is downloaded as it is when none takes it.
+    /// file. An answer that lands on a host a resolver takes, on a media site, or on a "leaving
+    /// this site" link, is downloaded from there instead (see `follow`). With `route.scrape`, a
+    /// web page they answer with is an error when a link shortener or mail scanner showed it
+    /// instead of redirecting; any other is looked into (see `look_into_page`): the video it plays
+    /// is downloaded in its place, the link it sends the browser on to at once is followed. A page
+    /// that leads nowhere is asked of yt-dlp's own sites (see `site_media`), and is downloaded as
+    /// it is when none takes it.
     async fn fetch_resolved(
         &self,
         client: Client,
@@ -335,7 +339,10 @@ impl DownloadEngine {
         let mut probed = self.probe_all(&client, &resolved).await?;
         let (url, final_url) = (probed.reference.url.clone(), probed.reference.final_url.clone());
         route.tried.push(url.clone());
-        if crate::resolver::lands_elsewhere(&url, &final_url) && route.goes_on(&final_url, &probed.reference)? {
+        // Landing on a "leaving this site" link is landing on its target.
+        let lands =
+            crate::resolver::lands_elsewhere(&url, &final_url) || crate::resolver::unwrap_redirect(&final_url).is_some();
+        if lands && route.goes_on(&final_url, &probed.reference)? {
             // Nothing of the answer is kept: it and the probes still out are given up.
             drop(probed);
             return self.follow(client, final_url, snapshot_tx, route).await;
@@ -381,14 +388,17 @@ impl DownloadEngine {
 
     /// Downloads `target`, where the download's link led (see `fetch_resolved`), in its place: a
     /// media site's link with yt-dlp, any other as its resolver takes it, looked into again if it
-    /// answers with a page.
+    /// answers with a page. A "leaving this site" link is taken as its target, without a request.
     async fn follow(
         &self,
         client: Client,
-        target: Url,
+        mut target: Url,
         snapshot_tx: Option<broadcast::Sender<EngineSnapshot>>,
         mut route: Route,
     ) -> Result<PathBuf, String> {
+        if let Some(inner) = crate::resolver::unwrap_redirect(&target) {
+            route.tried.push(std::mem::replace(&mut target, inner));
+        }
         tracing::info!("Downloading {} in place of the link that led there", target);
         let engine = self.naming(target.clone());
         if crate::media::is_supported_media_site(&target) {
