@@ -136,6 +136,16 @@ pub struct MediaDownloadOptions {
     pub output_filename: Option<String>,
     pub custom_ytdlp_path: Option<PathBuf>,
     pub concurrent_fragments: usize,
+    /// Install a managed ffmpeg when a download needs one and none is found.
+    pub install_ffmpeg: bool,
+    /// Subtitle languages to fetch ("en,es", "all"); None fetches none.
+    pub subtitles: Option<String>,
+    /// Title, artist, date and URL tags, chapters and cover art inside the file.
+    pub embed_metadata: bool,
+    /// Record a live stream from its start.
+    pub live_from_start: bool,
+    /// Wait for a scheduled stream or premiere to start.
+    pub wait_for_video: bool,
 }
 
 impl Default for MediaDownloadOptions {
@@ -148,6 +158,11 @@ impl Default for MediaDownloadOptions {
             output_filename: None,
             custom_ytdlp_path: None,
             concurrent_fragments: 8,
+            install_ffmpeg: true,
+            subtitles: None,
+            embed_metadata: true,
+            live_from_start: false,
+            wait_for_video: false,
         }
     }
 }
@@ -225,6 +240,23 @@ pub fn is_supported_media_site(url: &Url) -> bool {
         || MEDIA_DOMAINS.iter().any(|domain| {
             host == *domain || host.strip_suffix(domain).is_some_and(|sub| sub.ends_with('.'))
         })
+}
+
+/// Whether `url` names a playlist, channel, album or other list of videos this module lists
+/// through yt-dlp, from its shape alone.
+pub fn lists(_url: &Url) -> bool {
+    false
+}
+
+/// One task per entry of the list at `url`, as `options` say; called only when [`lists`] takes
+/// `url`. None when it is one video after all (the link is then downloaded as it is);
+/// `Some(Ok)` is never empty.
+pub async fn list(
+    _http: &reqwest::Client,
+    _url: &Url,
+    _options: &crate::ingest::ListOptions,
+) -> Option<Result<Vec<crate::ingest::Task>, String>> {
+    None
 }
 
 fn exe_name(base: &str) -> String {

@@ -146,6 +146,16 @@ pub struct DownloadOptions {
     /// with a request open or waiting for one applies to all of them. The default is the most
     /// connections one download opens, so only several downloads to one host are held back.
     pub max_connections_per_host: usize,
+    /// Install a managed ffmpeg when a media download needs one and none is found.
+    pub install_ffmpeg: bool,
+    /// Subtitle languages a media download fetches ("en,es", "all"); None fetches none.
+    pub subtitles: Option<String>,
+    /// Title, artist, date and URL tags, chapters and cover art inside media files.
+    pub embed_metadata: bool,
+    /// Record a live stream from its start.
+    pub live_from_start: bool,
+    /// Wait for a scheduled stream or premiere to start.
+    pub wait_for_video: bool,
 }
 
 impl Default for DownloadOptions {
@@ -168,6 +178,11 @@ impl Default for DownloadOptions {
             stall_timeout_secs: 30,
             fsync_on_complete: false,
             max_connections_per_host: MAX_CONNECTIONS,
+            install_ffmpeg: true,
+            subtitles: None,
+            embed_metadata: true,
+            live_from_start: false,
+            wait_for_video: false,
         }
     }
 }
@@ -544,6 +559,11 @@ impl DownloadEngine {
             output_filename,
             custom_ytdlp_path: self.options.ytdlp_path.clone(),
             concurrent_fragments: self.options.num_connections.clamp(1, 32),
+            install_ffmpeg: self.options.install_ffmpeg,
+            subtitles: self.options.subtitles.clone(),
+            embed_metadata: self.options.embed_metadata,
+            live_from_start: self.options.live_from_start,
+            wait_for_video: self.options.wait_for_video,
         }
     }
 
