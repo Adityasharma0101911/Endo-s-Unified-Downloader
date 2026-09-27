@@ -3019,3 +3019,17 @@ async fn test_a_share_page_yt_dlp_cannot_download_is_an_error_not_a_download() {
     assert_eq!(names_in(temp.path()), Vec::<String>::new());
     assert_eq!(runs_of(tools.path()).len(), 1, "yt-dlp was asked");
 }
+
+#[tokio::test]
+async fn test_a_file_its_server_labels_a_web_page_is_downloaded() {
+    let _history = setup().await;
+    let data = payload(PREFETCH + 256 * KB, 367);
+    let mut mock = Mock::new(data.clone());
+    mock.content_type = Some("text/html");
+    let url = serve(Arc::new(mock), "tool.zip").await;
+    let temp = tempdir().unwrap();
+
+    let path = run(&DownloadEngine::new(vec![url], options(temp.path(), 4, 64 * KB)), None).await.expect("the file should download");
+    assert_eq!(path, temp.path().join("tool.zip"));
+    assert_file(&path, &data);
+}
