@@ -519,6 +519,16 @@ impl DownloadEngine {
             let probed = self.probe_all(client, std::slice::from_ref(&stream.url)).await?;
             return self.download(client.clone(), probed, Some(snapshot_tx)).await;
         }
+        // Finished by an earlier attempt whose other streams did not finish: kept for this one,
+        // as a stream downloaded over ranges is (see `plan_target`).
+        let (base, key) = (stream.path.clone(), stream.key.to_string());
+        let history = DownloadHistoryManager::default_history_path();
+        if let Some((path, size)) = blocking(move || finished_stream(&base, &key, &history)).await? {
+            tracing::info!("{} is already downloaded", path.display());
+            emit(&Some(snapshot_tx), || done_snapshot(size, &path));
+            return Ok(path);
+        }
+        let started_at = unix_now();
         let fetch = self.fetch_policy();
         let parsed = self
             .guarded(
@@ -528,9 +538,10 @@ impl DownloadEngine {
             )
             .await?;
         let segments = parsed.map_err(|e| e.to_string())?;
-        // The streams are joined into the output, which is what gets checked and recorded.
-        let (path, _digest) = self.fetch_hls(client, &stream.url, segments, stream.path.clone(), Some(snapshot_tx)).await?;
-        Ok(path)
+        let (path, digest) = self.fetch_hls(client, &stream.url, segments, stream.path.clone(), Some(snapshot_tx)).await?;
+        // Recorded under the stream's URL and key, as a stream downloaded over ranges is, for the
+        // next attempt to find it by its key.
+        self.finish_external(path, started_at, Some(digest)).await
     }
 
     /// Downloads the HLS stream `segments` of `playlist` make, to `base` or the first name after
@@ -2566,6 +2577,24 @@ fn already_downloaded<'h>(
             && e.urls.iter().any(|u| urls.contains(u))
             && modified.is_none_or(|lm| lm <= e.started_at)
     }) && header_matches_extension(&path)
+}
+
+/// The file, and its size, that the media stream `key` (see [`crate::media::MediaStream::key`])
+/// was finished into next to `base` by an earlier attempt: history, read from `history_path`,
+/// recorded it completing from that key in `base`'s folder, at the size the file has now.
+/// Blocking.
+fn finished_stream(base: &Path, key: &str, history_path: &Path) -> Option<(PathBuf, u64)> {
+    let dir = absolute(base).parent()?.to_path_buf();
+    let history = DownloadHistoryManager::load_from_path(history_path);
+    history
+        .entries()
+        .iter()
+        .filter(|e| e.status == HistoryStatus::Completed && e.urls.iter().any(|u| u == key))
+        .filter(|e| absolute(&e.file_path).parent() == Some(dir.as_path()))
+        .find_map(|e| {
+            let size = std::fs::metadata(&e.file_path).ok().filter(|m| m.is_file())?.len();
+            (size == e.file_size).then(|| (e.file_path.clone(), size))
+        })
 }
 
 /// Rejects archives whose magic bytes are wrong (e.g. overwritten or zero-filled since they
