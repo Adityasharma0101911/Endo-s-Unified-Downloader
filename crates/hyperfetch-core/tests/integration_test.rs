@@ -2398,3 +2398,19 @@ async fn test_private_documents_and_unsupported_shares_are_errors_not_downloads(
         assert!(names_in(temp.path()).is_empty(), "{link}: {:?}", names_in(temp.path()));
     }
 }
+
+#[tokio::test]
+async fn test_a_code_host_folder_is_an_error_not_a_download() {
+    let _history = setup().await;
+    let mut page = Mock::new(b"<!doctype html><title>docs at main</title>".to_vec());
+    page.content_type = Some("text/html; charset=utf-8");
+    let proxy = serve(Arc::new(page), "").await;
+    let temp = tempdir().unwrap();
+    let folder = Url::parse("http://github.com/links-lane/repo/tree/main/docs").unwrap();
+
+    let err = run(&DownloadEngine::new(vec![folder], through(&proxy, temp.path())), None)
+        .await
+        .expect_err("a folder's page is no file");
+    assert!(err.contains("the link leads to a folder, not a file"), "{err}");
+    assert!(names_in(temp.path()).is_empty(), "{:?}", names_in(temp.path()));
+}
