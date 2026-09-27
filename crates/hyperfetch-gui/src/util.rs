@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, MutexGuard};
 
-use hyperfetch_core::history::{DownloadHistoryManager, HistoryEntry};
+use hyperfetch_core::history::{is_redacted, redact_url, DownloadHistoryManager, HistoryEntry, REDACTED_LINK};
 use hyperfetch_core::state::DownloadState;
 use hyperfetch_core::torrent::{is_magnet_uri, parse_magnet_uri};
 use hyperfetch_core::verify::BuildVerificationResult;
@@ -143,6 +143,22 @@ pub fn verdict(result: &BuildVerificationResult) -> Verdict {
     } else {
         Verdict::Unverified
     }
+}
+
+/// What the history search box matches against saved links: a pasted link in the form history
+/// saves it, without secrets, lower case.
+pub fn history_search_key(input: &str) -> String {
+    redact_url(input.trim()).to_lowercase()
+}
+
+/// The links to download a history entry again, for the link box, or why they cannot be used:
+/// links saved without their secret are left out.
+pub fn redownload_input(urls: &[String]) -> Result<String, String> {
+    let usable: Vec<&str> = urls.iter().map(String::as_str).filter(|u| !is_redacted(u)).collect();
+    if usable.is_empty() && !urls.is_empty() {
+        return Err(REDACTED_LINK.to_string());
+    }
+    Ok(usable.join(" "))
 }
 
 /// URLs recorded in history for exactly `final_path` (never matched by file name alone).
@@ -368,5 +384,23 @@ mod tests {
         let entries = [other, mine];
         assert_eq!(history_urls_for(&entries, &dir.path().join("setup.exe")), Some(vec!["https://b/setup.exe".to_string()]));
         assert_eq!(history_urls_for(&entries, &dir.path().join("elsewhere").join("setup.exe")), None);
+    }
+
+    #[test]
+    fn a_pasted_link_with_a_secret_finds_its_history_entry() {
+        let live = "https://files.example/Report.pdf?X-Amz-Signature=abc";
+        let entry = HistoryEntry::new("Report.pdf".into(), PathBuf::from("/d/Report.pdf"), 1, vec![live.into()]);
+        let key = history_search_key(&format!("  {live} "));
+        assert!(entry.urls[0].to_lowercase().contains(&key), "{key}");
+        assert_eq!(history_search_key(" Report "), "report");
+    }
+
+    #[test]
+    fn redownload_leaves_out_links_saved_without_their_secret() {
+        let entry = HistoryEntry::new("a.bin".into(), PathBuf::from("/d/a.bin"), 1, vec!["https://h/a.bin?token=abc".into()]);
+        assert_eq!(redownload_input(&entry.urls), Err(REDACTED_LINK.to_string()));
+        let mirrors = vec!["https://h/a.bin?token=REDACTED".to_string(), "https://m/a.bin".to_string()];
+        assert_eq!(redownload_input(&mirrors).as_deref(), Ok("https://m/a.bin"));
+        assert_eq!(redownload_input(&["https://m/a.bin?x=1".to_string()]).as_deref(), Ok("https://m/a.bin?x=1"));
     }
 }

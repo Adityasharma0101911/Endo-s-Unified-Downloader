@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use hyperfetch_core::engine::DownloadOptions;
-use hyperfetch_core::history::{DownloadHistoryManager, HistoryEntry, HistoryStatus};
+use hyperfetch_core::history::{is_redacted, DownloadHistoryManager, HistoryEntry, HistoryStatus, REDACTED_LINK};
 use hyperfetch_core::resolver::SmartResolver;
 use hyperfetch_core::state::DownloadState;
 use hyperfetch_core::verify::{self, BuildVerificationResult};
@@ -446,7 +446,7 @@ fn final_path(path: &Path) -> PathBuf {
 }
 
 /// Repair sources: URLs from the command line, else the mirrors in this file's resume state,
-/// else the URLs history recorded for exactly this path.
+/// else the URLs history recorded for exactly this path, less links saved without their secret.
 fn repair_candidates(explicit: &[String], data_path: &Path) -> Result<Vec<Url>, String> {
     let candidates: Vec<String> = if !explicit.is_empty() {
         explicit.to_vec()
@@ -465,8 +465,12 @@ fn repair_candidates(explicit: &[String], data_path: &Path) -> Result<Vec<Url>, 
             }
         }
     };
+    let usable: Vec<&String> = candidates.iter().filter(|c| !is_redacted(c)).collect();
+    if usable.is_empty() && !candidates.is_empty() {
+        return Err(format!("{}: --verify FILE --repair URL", REDACTED_LINK));
+    }
     let mut urls = Vec::new();
-    for candidate in &candidates {
+    for candidate in usable {
         let url = http_url(candidate).ok_or_else(|| format!("'{}' is not an http(s) URL", candidate))?;
         if !urls.contains(&url) {
             urls.push(url);
@@ -735,6 +739,16 @@ mod tests {
             batch(&args, &Ui::new(true), &Shutdown::install(), &reqwest::Client::new()).await
         });
         assert_eq!(code, EXIT_OK);
+    }
+
+    #[test]
+    fn repair_never_uses_a_link_saved_without_its_secret() {
+        let file = Path::new("/nowhere/a.iso");
+        let redacted = "https://h.example/a.iso?token=REDACTED".to_string();
+        let err = repair_candidates(std::slice::from_ref(&redacted), file).unwrap_err();
+        assert!(err.starts_with(REDACTED_LINK), "{}", err);
+        let mirror = "https://m.example/a.iso".to_string();
+        assert_eq!(repair_candidates(&[redacted, mirror.clone()], file).unwrap(), [Url::parse(&mirror).unwrap()]);
     }
 
     #[test]
