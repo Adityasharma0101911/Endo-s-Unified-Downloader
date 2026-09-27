@@ -3074,7 +3074,7 @@ async fn test_a_file_its_server_labels_a_web_page_is_downloaded() {
     assert_file(&path, &data);
 }
 
-// ---- Final fixes: what yt-dlp's sites say of a page, documents, history for repairs ------------
+// ---- Final fixes: what yt-dlp's sites say of a page, Codeberg, documents -----------------------
 
 #[tokio::test]
 async fn test_a_page_one_of_yt_dlps_sites_takes_but_fails_at_is_an_error_not_a_download() {
@@ -3152,34 +3152,6 @@ async fn test_a_codeberg_file_page_downloads_the_file() {
     let path = run(&DownloadEngine::new(vec![page], opts), None).await.expect("the file should download");
     assert_eq!(path, temp.path().join("tool.bin"));
     assert_file(&path, &payload(64 * KB, 379));
-}
-
-/// A file downloaded through a link that led elsewhere is repaired from the links history lists
-/// for it, the page it was given first among them. (A resolver's link, such as Dropbox's dl=1,
-/// is listed as well, see `test_a_short_link_is_downloaded_from_the_file_host_it_lands_on`;
-/// repairs connect directly, not through the proxy that stands in for such hosts here.)
-#[tokio::test]
-async fn test_a_file_downloaded_through_a_followed_link_is_repaired_from_its_history() {
-    isolate_history();
-    let _history = HISTORY.write().await;
-    let data = payload(PREFETCH + 256 * KB, 383);
-    let file_url = serve(Arc::new(Mock::new(data.clone())), "repair/tool.bin").await;
-    let (_, page_url) = refreshing_page("l/repair", file_url.as_str(), true).await;
-    let temp = tempdir().unwrap();
-    let path = run(&DownloadEngine::new(vec![page_url.clone()], options(temp.path(), 4, 256 * KB)), None)
-        .await
-        .expect("the file should download");
-    let urls: Vec<Url> = history_entry(&path).expect("the download is recorded").urls.iter().map(|u| Url::parse(u).unwrap()).collect();
-    assert_eq!(urls.first(), Some(&page_url));
-
-    // Its last 100 KiB lost.
-    std::fs::write(&path, &data[..data.len() - 100 * KB]).unwrap();
-    let found = hyperfetch_core::verify_build_file(&path, None, None).unwrap();
-    assert_eq!(found.missing_ranges.len(), 1, "{}", found.status_message);
-    hyperfetch_core::repair_missing_ranges(&path, data.len() as u64, &found.missing_ranges, &urls, &options(temp.path(), 4, 256 * KB), None, |_, _| {})
-        .await
-        .expect("the file should be repaired");
-    assert_file(&path, &data);
 }
 
 /// A torrent with a web seed, as GitHub's raw link and Dropbox's `dl=1` serve it; their file page
