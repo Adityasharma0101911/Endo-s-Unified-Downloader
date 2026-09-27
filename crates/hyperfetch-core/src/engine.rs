@@ -1,8 +1,10 @@
 use std::fs::{File, OpenOptions, TryLockError};
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -22,16 +24,26 @@ use url::Url;
 use crate::chunk::{ChunkManager, ChunkSnapshot};
 use crate::history::{DownloadHistoryManager, HistoryEntry, HistoryStatus};
 use crate::hls::HlsError;
+use crate::hosts::{self, HostKey, HostProfile, HostSlot};
 use crate::mirror::MirrorRacer;
 use crate::range::{compute_gaps, ByteRange};
+use crate::resolver::{GoogleDriveResolver, HtmlVideoResolver};
 use crate::state::DownloadState;
 use crate::storage::{DiskWriter, StorageError, VerifyError};
 use crate::worker::{
-    authorize, content_length, retry_after, Auth, FailureKind, HttpWorker, RateLimiter, WorkerEvent, WorkerShared,
+    authorize, content_length, retry_after, Auth, Body, FailureKind, HttpWorker, RateLimiter, Seed, WorkerEvent,
+    WorkerShared,
 };
 
 const CANCELLED: &str = "Download cancelled by user";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long a client keeps a connection whose request ended, for the next request to its host.
+pub(crate) const POOL_IDLE: Duration = Duration::from_secs(90);
+/// Most connections a client keeps that way per host.
+pub(crate) const POOL_MAX_IDLE: usize = 64;
+/// Longest a range worker waits between body reads (the stall timeout, if shorter): its retry
+/// keeps what arrived and starts at once, so a connection gone quiet is best replaced soon.
+const BODY_IDLE: Duration = Duration::from_secs(5);
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Bound on one mirror's whole probe: HEAD, the ranged GET's tries and the pauses between them.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -67,6 +79,13 @@ const PERSIST_INTERVAL: Duration = Duration::from_secs(2);
 const SPEED_TAU_SECS: f64 = 2.0;
 const DEFAULT_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
 const DEFAULT_MIN_STEAL: u64 = 1024 * 1024;
+/// Most connections one download opens, whatever `num_connections` asks for; also the default
+/// per-host budget, so that alone never holds a download back.
+const MAX_CONNECTIONS: usize = 64;
+/// Fewest bytes a steal takes unless the user set `min_steal_threshold`. Whether a steal pays
+/// off is decided by time (see `ChunkManager::steal_work`); this only keeps rates measured over
+/// a few packets from splitting off slivers.
+const MIN_STEAL: u64 = 64 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct EngineSnapshot {
@@ -109,6 +128,9 @@ pub struct DownloadOptions {
     /// resume state consistent during the download happen either way.
     pub fsync_on_complete: bool,
     /// Connections all downloads in this process may hold to one host at once (0 = no limit).
+    /// When downloads sharing a host set different limits, the smallest nonzero one among those
+    /// with a request open or waiting for one applies to all of them. The default is the most
+    /// connections one download opens, so only several downloads to one host are held back.
     pub max_connections_per_host: usize,
 }
 
@@ -129,7 +151,7 @@ impl Default for DownloadOptions {
             max_retries: 8,
             stall_timeout_secs: 30,
             fsync_on_complete: false,
-            max_connections_per_host: 32,
+            max_connections_per_host: MAX_CONNECTIONS,
         }
     }
 }
@@ -226,7 +248,19 @@ impl DownloadEngine {
         }
 
         let resolved = self.resolve_all(&client).await?;
+        self.fetch_resolved(client, resolved, snapshot_tx, true).await
+    }
 
+    /// Downloads what the resolved mirrors serve: an HLS stream if one is a playlist, else their
+    /// file. With `scrape`, a web page they answer with is looked into, once, for the video it
+    /// plays, which is then downloaded in the page's place (see `video_on_page`).
+    async fn fetch_resolved(
+        &self,
+        client: Client,
+        resolved: Vec<Url>,
+        snapshot_tx: Option<broadcast::Sender<EngineSnapshot>>,
+        scrape: bool,
+    ) -> Result<PathBuf, String> {
         if let Some(playlist) = resolved.iter().find(|u| u.as_str().contains(".m3u8")) {
             tracing::info!("Detected HLS video stream: {}", playlist);
             let started_at = unix_now();
@@ -270,8 +304,74 @@ impl DownloadEngine {
             }
         }
 
-        let (reference, mirrors) = self.probe_all(&client, &resolved).await?;
-        self.download(client, reference, mirrors, snapshot_tx).await
+        let mut probed = self.probe_all(&client, &resolved).await?;
+        if scrape {
+            if let Some(video) = self.video_on_page(&client, &mut probed).await? {
+                let page = probed.reference.url.clone();
+                // Nothing of the page is kept: its answer and the probes still out are given up.
+                drop(probed);
+                let mut mirrors = Vec::new();
+                for url in resolved {
+                    let url = if url == page { video.clone() } else { url };
+                    if !mirrors.contains(&url) {
+                        mirrors.push(url);
+                    }
+                }
+                // The video is downloaded as if named along with the page: its history entry lists
+                // it, as its resume state does, so a repair finds it without the page. Credentials
+                // still go only to the hosts the user named, as they were scoped to when this
+                // engine was built.
+                let mut engine = self.clone();
+                if !engine.urls.contains(&video) {
+                    engine.urls.push(video);
+                }
+                return Box::pin(engine.fetch_resolved(client, mirrors, snapshot_tx, false)).await;
+            }
+        }
+        self.download(client, probed, snapshot_tx).await
+    }
+
+    /// The video a web page the download's reference answered with plays (see
+    /// `HtmlVideoResolver::is_page`), looked for in the page as the probe brought it (all of it,
+    /// or all still coming), else as a new request without Range brings it. A page without a
+    /// video, or one that could not be read, is downloaded as it is; an answer still coming is
+    /// taken from `probed` once read.
+    async fn video_on_page(&self, client: &Client, probed: &mut Probed) -> Result<Option<Url>, String> {
+        let reference = &probed.reference;
+        if !HtmlVideoResolver::is_page(&reference.url, &reference.headers) {
+            return Ok(None);
+        }
+        let (url, final_url) = (reference.url.clone(), reference.final_url.clone());
+        let whole = reference.size == Some(reference.prefetch.len() as u64);
+        let prefetch = reference.prefetch.clone();
+        let live = probed.live.take();
+        let page = async {
+            let (response, _slot) = match live {
+                _ if whole => return Ok((String::from_utf8_lossy(&prefetch).into_owned(), final_url)),
+                Some(Live::Stream { response, slot }) => (response, Some(slot)),
+                // Only the start came, or none of it: the page again, all of it.
+                other => {
+                    drop(other);
+                    let request = authorize(client.get(url.clone()), self.auth.as_deref(), &url).header(ACCEPT_ENCODING, "identity");
+                    let response = request.send().await.map_err(|e| e.to_string())?;
+                    if !response.status().is_success() {
+                        return Err(format!("HTTP {}", response.status()));
+                    }
+                    (response, None)
+                }
+            };
+            let page_url = response.url().clone();
+            let html = HtmlVideoResolver::read_page(response).await.map_err(|e| e.to_string())?;
+            Ok((html, page_url))
+        };
+        match self.guarded(RESOLVE_TIMEOUT, &format!("reading the page {}", url), page).await {
+            Ok(Ok((html, page_url))) => Ok(HtmlVideoResolver::video_in(&html, &page_url)),
+            Err(e) if self.cancel_token.is_cancelled() => Err(e),
+            Ok(Err(e)) | Err(e) => {
+                tracing::warn!("Could not look into the page {}, downloading it as it is: {}", url, e);
+                Ok(None)
+            }
+        }
     }
 
     /// The first URL that should go to yt-dlp: a known media site, or with an explicit media
@@ -419,53 +519,106 @@ impl DownloadEngine {
         Ok(resolved)
     }
 
-    /// Probes all mirrors concurrently; returns the reference probe and the mirrors that serve the same file.
-    async fn probe_all(&self, client: &Client, urls: &[Url]) -> Result<(ProbeInfo, Vec<ProbeInfo>), String> {
+    /// Probes all mirrors concurrently; returns the reference probe, the mirrors that serve the
+    /// same file and the reference's answer while it is still coming. The mirror that leads is the
+    /// first, in URL order, of those whose probes answered (failures aside), the first mirror's
+    /// counting from when its answer is in, while its start is read. When that mirror takes ranges
+    /// or brought the whole file it is the reference, and the download starts without waiting for
+    /// the probes still out, which come with it as `late`: a mirror that answers later, listed
+    /// before it or not, only joins if it serves the same file. Otherwise another mirror may have
+    /// to lead, so every probe is waited for, and no answer holds its host slot meanwhile: another
+    /// probe may need it. A Google Drive answer that is a web page fails its mirror's probe.
+    async fn probe_all(&self, client: &Client, urls: &[Url]) -> Result<Probed, String> {
         let (limiter, stall) = (self.limiter(), self.stall_timeout());
         let several_connections = self.options.num_connections > 1;
-        // Owned values keep the future `Send` (a borrowing closure here is not general enough).
-        let probes = futures_util::stream::iter(urls.iter().cloned().enumerate())
-            .map(|(i, url)| {
-                let (client, auth, limiter) = (client.clone(), self.auth.clone(), limiter.clone());
+        let limit = self.options.max_connections_per_host;
+        // Whether the first mirror's start is being read, and whether the download went ahead
+        // without its answer, which then has no start to read.
+        let (reading, started) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        // Owned, as the probes may still be out once this returns.
+        let (client, auth, owned) = (client.clone(), self.auth.clone(), urls.to_vec());
+        let flags = (Arc::clone(&reading), Arc::clone(&started));
+        let mut probes: ProbeStream = futures_util::stream::iter(owned.into_iter().enumerate())
+            .map(move |(i, url)| {
+                let (client, auth, limiter) = (client.clone(), auth.clone(), limiter.clone());
+                let (reading, started) = (Arc::clone(&flags.0), Arc::clone(&flags.1));
                 async move {
-                    // Only the first mirror fetches the file's start: the download uses one copy.
-                    let (mut info, body) =
-                        tokio::time::timeout(PROBE_TIMEOUT, probe_url(&client, auth.as_deref(), &url, i == 0))
-                            .await
-                            .unwrap_or_else(|_| Err(format!("{}: no answer within {}s", url, PROBE_TIMEOUT.as_secs())))?;
-                    if let Some(body) = body {
-                        // Only the start of a larger file keeps workers waiting.
-                        let deadline = (info.size != Some(body.len)).then(|| tokio::time::Instant::now() + PREFETCH_TIME);
-                        // Workers can take over early only where ranges work (without them only the
-                        // whole body is of use), there can be several, and no speed limit makes
-                        // every connection look capped.
-                        let pace = body
-                            .setup
-                            .filter(|_| info.accepts_ranges && several_connections && limiter.is_none())
-                            .map(|setup| Pace { answered: body.answered, setup });
-                        (info.prefetch, info.per_setup) =
-                            read_prefix(body.response, body.len, deadline, pace, stall, limiter.as_deref()).await;
-                    }
-                    Ok::<_, String>(info)
+                    let probe = async {
+                        // Only the first mirror fetches the file's start: the download uses one copy.
+                        let (mut info, body) = probe_url(&client, auth.as_deref(), &url, i == 0, limit).await?;
+                        GoogleDriveResolver::check_answer(&url, &info.headers).map_err(|e| format!("{}: {}", url, e))?;
+                        let live = match body {
+                            Some(body) if !started.load(Ordering::Relaxed) => {
+                                reading.store(true, Ordering::Relaxed);
+                                take_start(&mut info, body, several_connections, limiter.as_deref(), stall).await
+                            }
+                            _ => None,
+                        };
+                        Ok((info, live))
+                    };
+                    (i, probe.await)
                 }
             })
-            .buffered(PROBE_CONCURRENCY)
-            .collect::<Vec<_>>();
-        let probes = tokio::select! {
-            biased;
-            _ = self.cancel_token.cancelled() => return Err(CANCELLED.to_string()),
-            probes = probes => probes,
+            .buffer_unordered(PROBE_CONCURRENCY)
+            .boxed();
+        // Each mirror's probe, in URL order, once it is in.
+        let mut done: Vec<Option<Probe>> = urls.iter().map(|_| None).collect();
+        let starts = loop {
+            let next = tokio::select! {
+                biased;
+                _ = self.cancel_token.cancelled() => return Err(CANCELLED.to_string()),
+                next = probes.next() => next,
+            };
+            let Some((i, probe)) = next else { break false };
+            if let Some(slot) = done.get_mut(i) {
+                *slot = Some(probe);
+            }
+            let lead = done.iter().enumerate().find(|&(i, probe)| match probe {
+                Some(probe) => probe.is_ok(),
+                None => i == 0 && reading.load(Ordering::Relaxed),
+            });
+            if let Some((_, Some(Ok((info, _))))) = lead {
+                if info.accepts_ranges || info.size == Some(info.prefetch.len() as u64) {
+                    break true;
+                }
+            }
+            if done.iter().any(Option::is_none) {
+                for (_, live) in done.iter_mut().flatten().flatten() {
+                    *live = None;
+                }
+            }
         };
-        select_mirrors(probes)
+        let late = (starts && done.iter().any(Option::is_none)).then(|| {
+            started.store(true, Ordering::Relaxed);
+            probes
+        });
+        // Only the first mirror's answer can still be coming.
+        let mut live = None;
+        let probes = done
+            .into_iter()
+            .flatten()
+            .map(|probe| {
+                probe.map(|(info, answer)| {
+                    live = live.take().or(answer);
+                    info
+                })
+            })
+            .collect();
+        let (reference, mirrors) = select_mirrors(probes)?;
+        let live = live.filter(|_| urls.first() == Some(&reference.url));
+        Ok(Probed { reference, mirrors, live, late })
     }
 
     async fn download(
         &self,
         client: Client,
-        reference: ProbeInfo,
-        mirrors: Vec<ProbeInfo>,
+        probed: Probed,
         snapshot_tx: Option<broadcast::Sender<EngineSnapshot>>,
     ) -> Result<PathBuf, String> {
+        let Probed { reference, mirrors, live, late } = probed;
+        // Mirrors answering late only join a download over ranges: otherwise their probes, and
+        // the host slots they hold, are given up now.
+        let late = late.filter(|_| reference.accepts_ranges && reference.size != Some(reference.prefetch.len() as u64));
         let started_at = unix_now();
         let base = self.output_path_for(&reference.filename);
         let mut known_urls = self.url_strings();
@@ -540,67 +693,70 @@ impl DownloadEngine {
                 .map_err(|e| format!("Failed to write {}: {}", part.display(), e))?
             }
             Some(size) if reference.accepts_ranges => {
-                let per_connection = reference.per_setup.map_or(BYTES_PER_CONNECTION, |bytes| {
-                    bytes.clamp(MIN_BYTES_PER_CONNECTION, BYTES_PER_CONNECTION)
-                });
-                self.fetch_ranges(
-                    client,
-                    size,
-                    prefetched,
-                    per_connection,
-                    &mirrors,
-                    state,
-                    &part,
-                    &state_path,
-                    &final_path,
-                    &snapshot_tx,
-                )
-                .await?
+                let probes = Probed { reference, mirrors, live, late };
+                self.fetch_ranges(client, size, probes, state, &part, &state_path, &final_path, &snapshot_tx).await?
             }
-            _ => self.fetch_stream(&client, &reference, &part, &final_path, &snapshot_tx).await?,
+            _ => self.fetch_stream(&client, &reference, live, &part, &final_path, &snapshot_tx).await?,
         }
         self.finalize(part, final_path, state_path, claim, started_at, &snapshot_tx).await
     }
 
     /// Multi-connection download of a file whose size is known and whose server honours ranges.
-    /// `prefetch`, the file's first bytes from the probe, counts as downloaded; it is written
-    /// wherever the resumed state does not already hold those bytes. Every `per_connection`
-    /// missing bytes justify one connection, up to the limit.
+    /// The reference's prefetch, the file's first bytes from the probe, counts as downloaded; it
+    /// is written wherever the resumed state does not already hold those bytes. The probe's
+    /// answer, if still `live`, goes on as the first chunk from where the probe stopped reading,
+    /// when those bytes are still missing, its rate watched on until another connection answers
+    /// (see `Watched`). The bytes one connection carries in the time another takes to start (the
+    /// reference's `per_setup`) justify one connection each, up to the limit and what the
+    /// mirrors' hosts take at once. Mirrors whose probes come in `late` join as they do, if they
+    /// serve the reference's file.
     #[allow(clippy::too_many_arguments)]
     async fn fetch_ranges(
         &self,
         client: Client,
         size: u64,
-        prefetch: Bytes,
-        per_connection: u64,
-        mirrors: &[ProbeInfo],
+        probed: Probed,
         state: DownloadState,
         part: &Path,
         state_path: &Path,
         final_path: &Path,
         snapshot_tx: &Option<broadcast::Sender<EngineSnapshot>>,
     ) -> Result<(), String> {
+        let Probed { reference, mirrors, live, mut late } = probed;
+        let prefetch = reference.prefetch.clone();
         let unwritten = compute_gaps(prefetch.len() as u64, &state.completed_ranges);
         let mut have = state.completed_ranges.clone();
         have.extend(ByteRange::from_len(0, prefetch.len() as u64));
         // A connection must carry enough to repay its handshakes: a small file arrives sooner over
         // one connection than over many, unless the server caps each connection's speed.
+        let per_connection = reference
+            .per_setup
+            .map_or(BYTES_PER_CONNECTION, |bytes| bytes.clamp(MIN_BYTES_PER_CONNECTION, BYTES_PER_CONNECTION));
         let remaining: u64 = compute_gaps(size, &have).iter().map(ByteRange::len).sum();
-        let max_workers = self.options.num_connections.clamp(1, 64) as u64;
+        // Mirrors still to come may bring hosts with room of their own.
+        let room = if late.is_some() { usize::MAX } else { host_room(&mirrors, self.options.max_connections_per_host) };
+        let max_workers = self.options.num_connections.clamp(1, MAX_CONNECTIONS).min(room).max(1) as u64;
         let num_workers = remaining.div_ceil(per_connection).clamp(1, max_workers) as usize;
         let chunk_size = effective_chunk_size(remaining, num_workers as u64, self.options.base_chunk_size);
-        let min_steal = if self.options.min_steal_threshold != DEFAULT_MIN_STEAL {
-            self.options.min_steal_threshold
-        } else {
-            (chunk_size / 4).max(DEFAULT_MIN_STEAL)
-        };
         let mut manager = ChunkManager::with_resumed_ranges(size, chunk_size, &have).map_err(|e| e.to_string())?;
         manager.set_max_retries(self.options.max_retries);
+        // The probe's answer is worker 0's first attempt, its connection's rate watched on while no
+        // other connection of the download has an answer.
+        let alone = CancellationToken::new();
+        let seed = match live {
+            Some(Live::Range { response, slot, end, watch }) => mirrors.iter().position(|m| m.url == reference.url).and_then(|mirror_id| {
+                let chunk = manager.assign_at(0, mirror_id, prefetch.len() as u64, end)?;
+                let (body, url) = (response.bytes_stream().boxed(), reference.final_url.clone());
+                let body = match watch {
+                    Some(watch) => Watched { body, watch: Some(watch), alone: alone.clone(), url: url.clone() }.boxed(),
+                    None => body,
+                };
+                Some(Seed { chunk, mirror_id, url, body, slot })
+            }),
+            _ => None,
+        };
 
-        let mut racer = MirrorRacer::new(mirrors.iter().map(|m| m.url.clone()).collect());
-        for (mirror, probe) in racer.mirrors_mut().iter_mut().zip(mirrors) {
-            mirror.if_range = probe.if_range();
-        }
+        let racer = build_racer(&mirrors);
 
         let writer = {
             let part = part.to_path_buf();
@@ -614,7 +770,7 @@ impl DownloadEngine {
             .await?
             .map_err(|e| e.to_string())?
         };
-        let job = RangeJob {
+        let mut job = RangeJob {
             chunks: Arc::new(Mutex::new(manager)),
             mirrors: Arc::new(Mutex::new(racer)),
             writer,
@@ -638,12 +794,18 @@ impl DownloadEngine {
             cancel: stop.clone(),
             limiter: self.limiter(),
             file_size: size,
-            min_steal,
+            min_steal: min_steal(&self.options),
+            host_limit: self.options.max_connections_per_host,
             stall_timeout: self.stall_timeout(),
+            body_idle: self.stall_timeout().min(BODY_IDLE),
         };
         let mut workers = JoinSet::new();
-        for worker_id in 0..num_workers {
-            workers.spawn(HttpWorker::new(worker_id, shared.clone()).run());
+        let seeded = seed.is_some() as usize;
+        if let Some(seed) = seed {
+            workers.spawn(HttpWorker::new(0, shared.clone()).run(Some(seed)));
+        }
+        for worker_id in seeded..num_workers {
+            workers.spawn(HttpWorker::new(worker_id, shared.clone()).run(None));
         }
         drop(shared);
 
@@ -657,8 +819,15 @@ impl DownloadEngine {
             tokio::select! {
                 biased;
                 _ = self.cancel_token.cancelled() => break Err(CANCELLED.to_string()),
+                probe = next_late(&mut late) => match probe {
+                    Some((_, probe)) => job.admit(probe.map(|(info, _)| info), &reference),
+                    None => late = None,
+                },
                 event = events.recv() => match event {
                     Some(event) => {
+                        if matches!(event, WorkerEvent::Ttfb { .. }) {
+                            alone.cancel();
+                        }
                         if let Err(e) = job.handle(event) {
                             break Err(e);
                         }
@@ -682,7 +851,8 @@ impl DownloadEngine {
         // once all have exited no write is in flight. They are not aborted: an aborted worker
         // would leave its blocking write running on its own.
         stop.cancel();
-        drop(events);
+        // Probes still out are given up, and the host slots they hold with them.
+        drop((events, late));
         while workers.join_next().await.is_some() {}
 
         match outcome {
@@ -702,20 +872,27 @@ impl DownloadEngine {
     }
 
     /// Single-connection download for servers without range support or without a known length.
-    /// Such a download cannot resume, so every retry starts from byte 0.
+    /// Such a download cannot resume, so every retry starts from byte 0. The probe's answer, if
+    /// `live` brought the whole file, is the first try.
     async fn fetch_stream(
         &self,
         client: &Client,
         remote: &ProbeInfo,
+        live: Option<Live>,
         part: &Path,
         final_path: &Path,
         snapshot_tx: &Option<broadcast::Sender<EngineSnapshot>>,
     ) -> Result<(), String> {
         let limiter = self.limiter();
+        let mut answered = match live {
+            Some(Live::Stream { response, slot }) => Some((response, slot)),
+            _ => None,
+        };
         let mut failures = 0u32;
         let mut bad_responses = 0u32;
         loop {
-            let (kind, error) = match self.stream_once(client, remote, part, final_path, limiter.as_deref(), snapshot_tx).await {
+            let attempt = self.stream_once(client, remote, answered.take(), part, final_path, limiter.as_deref(), snapshot_tx);
+            let (kind, error) = match attempt.await {
                 Ok(()) => return Ok(()),
                 Err(failure) => failure,
             };
@@ -745,10 +922,14 @@ impl DownloadEngine {
         }
     }
 
+    /// One try at the whole file: `answered`, an answer already in with the host slot its request
+    /// holds, or else a new request under a slot of the host the probe was sent on to.
+    #[allow(clippy::too_many_arguments)]
     async fn stream_once(
         &self,
         client: &Client,
         remote: &ProbeInfo,
+        answered: Option<(Response, HostSlot)>,
         part: &Path,
         final_path: &Path,
         limiter: Option<&RateLimiter>,
@@ -756,17 +937,29 @@ impl DownloadEngine {
     ) -> Result<(), (FailureKind, String)> {
         let stall = self.stall_timeout();
         let transient = |msg: String| (FailureKind::Transient, msg);
-        let request = authorize(client.get(remote.url.clone()), self.auth.as_deref(), &remote.url)
-            .header(ACCEPT_ENCODING, "identity")
-            .send();
-        let response = tokio::select! {
-            biased;
-            _ = self.cancel_token.cancelled() => return Err(transient(CANCELLED.to_string())),
-            res = tokio::time::timeout(stall, request) => match res {
-                Err(_) => return Err(transient(format!("no response within {}s", stall.as_secs()))),
-                Ok(Err(e)) => return Err(transient(format!("request failed: {}", e))),
-                Ok(Ok(resp)) => resp,
-            },
+        let (response, _slot) = match answered {
+            Some(answered) => answered,
+            None => {
+                // Waiting for the host's other requests is no stall.
+                let slot = tokio::select! {
+                    biased;
+                    _ = self.cancel_token.cancelled() => return Err(transient(CANCELLED.to_string())),
+                    slot = hosts::acquire(&remote.final_url, self.options.max_connections_per_host) => slot,
+                };
+                let request = authorize(client.get(remote.url.clone()), self.auth.as_deref(), &remote.url)
+                    .header(ACCEPT_ENCODING, "identity")
+                    .send();
+                let response = tokio::select! {
+                    biased;
+                    _ = self.cancel_token.cancelled() => return Err(transient(CANCELLED.to_string())),
+                    res = tokio::time::timeout(stall, request) => match res {
+                        Err(_) => return Err(transient(format!("no response within {}s", stall.as_secs()))),
+                        Ok(Err(e)) => return Err(transient(format!("request failed: {}", e))),
+                        Ok(Ok(resp)) => resp,
+                    },
+                };
+                (response, slot)
+            }
         };
         let status = response.status();
         if !status.is_success() {
@@ -999,8 +1192,8 @@ pub fn build_client(options: &DownloadOptions) -> Result<Client, String> {
         .tcp_nodelay(true)
         .connect_timeout(CONNECT_TIMEOUT)
         .tcp_keepalive(Duration::from_secs(30))
-        .pool_max_idle_per_host(64)
-        .pool_idle_timeout(Some(Duration::from_secs(90)))
+        .pool_max_idle_per_host(POOL_MAX_IDLE)
+        .pool_idle_timeout(Some(POOL_IDLE))
         .default_headers(headers);
 
     if options.auth_header.is_some() {
@@ -1069,6 +1262,28 @@ impl RangeJob {
         match self.chunks.lock().has_fatal_failure() {
             Some((_, reason)) => Err(format!("Download failed: {}", reason)),
             None => Ok(()),
+        }
+    }
+
+    /// Adds the mirror a probe that came in after the download started found, if it serves the
+    /// file `reference` describes, and keeps its URL for a resume.
+    fn admit(&mut self, probe: Result<ProbeInfo, String>, reference: &ProbeInfo) {
+        let info = match probe {
+            Ok(info) => info,
+            Err(e) => {
+                tracing::warn!("Mirror probe failed: {}", e);
+                return;
+            }
+        };
+        if let Some(reason) = mismatch(&info, reference) {
+            tracing::warn!("Dropping mirror {}: {}", info.url, reason);
+            return;
+        }
+        tracing::info!("Mirror {} joins the download", info.url);
+        add_mirror(&mut self.mirrors.lock(), &info);
+        let url = info.url.to_string();
+        if !self.state.mirrors.contains(&url) {
+            self.state.mirrors.push(url);
         }
     }
 
@@ -1145,6 +1360,8 @@ impl SpeedMeter {
 #[derive(Debug, Clone)]
 struct ProbeInfo {
     url: Url,
+    /// Where the probe's answer came from, after redirects.
+    final_url: Url,
     /// `None` when the server does not tell (chunked responses).
     size: Option<u64>,
     accepts_ranges: bool,
@@ -1153,14 +1370,21 @@ struct ProbeInfo {
     last_modified: Option<String>,
     /// The file's first bytes, from the response whose validators these are.
     prefetch: Bytes,
-    /// Bytes the probe's connection moved, at the rate it reached, in the time a new connection
-    /// takes to answer. `None` when no rate was measured.
+    /// Bytes the probe's connection moves, capped at the rate it was measured or known to be, in
+    /// the time a new connection takes to answer. `None` when no cap is known.
     per_setup: Option<u64>,
+    /// What a new request to `final_url` waits for its answer: how long the ranged GET's first
+    /// try waited, when it went there directly. `None` after a retry (which may reuse the
+    /// connection) or a redirect (whose hops chunk requests skip), or when HEAD or a plain GET
+    /// had to stand in for it.
+    answer_time: Option<Duration>,
+    /// The headers of the answer that decided the rest: what it served shows there.
+    headers: HeaderMap,
 }
 
 impl ProbeInfo {
     fn strong_etag(&self) -> Option<&str> {
-        self.etag.as_deref().filter(|e| !e.starts_with("W/"))
+        self.etag.as_deref().filter(|e| is_strong(e))
     }
 
     /// Validator for `If-Range`: weak ETags are not allowed there.
@@ -1169,8 +1393,8 @@ impl ProbeInfo {
     }
 
     /// Name and validators of `url` from the first of `responses` that has each; without a
-    /// Content-Disposition name, the first response's final (post-redirect) URL names the file.
-    /// Size and range support are left for the caller.
+    /// Content-Disposition name, the first response's final (post-redirect) URL names the file,
+    /// and its headers are kept. Size and range support are left for the caller.
     fn describe(url: &Url, responses: &[&Response]) -> Self {
         let header = |name: HeaderName| {
             responses.iter().find_map(|r| r.headers().get(&name)?.to_str().ok().map(str::to_string))
@@ -1178,6 +1402,7 @@ impl ProbeInfo {
         let final_url = responses.first().map_or(url, |r| r.url());
         Self {
             url: url.clone(),
+            final_url: final_url.clone(),
             size: None,
             accepts_ranges: false,
             filename: extract_filename(responses.iter().map(|r| r.headers()), final_url),
@@ -1185,15 +1410,18 @@ impl ProbeInfo {
             last_modified: header(LAST_MODIFIED),
             prefetch: Bytes::new(),
             per_setup: None,
+            answer_time: None,
+            headers: responses.first().map(|r| r.headers().clone()).unwrap_or_default(),
         }
     }
 }
 
-/// A probe response whose body is the start of the file (or all of it).
+/// A probe response whose body is the file, or its start.
 struct ProbeBody {
     response: Response,
-    /// Body bytes to keep.
-    len: u64,
+    /// The host slot the response's request holds.
+    slot: HostSlot,
+    holds: Holds,
     /// When the answer arrived.
     answered: tokio::time::Instant,
     /// How long the request waited for it, when that was the first try: a retry may reuse the
@@ -1201,7 +1429,43 @@ struct ProbeBody {
     setup: Option<Duration>,
 }
 
-/// Lets `read_prefix` measure the rate from when the answer arrived.
+/// What a probe response's body holds for the download.
+enum Holds {
+    /// The file's first bytes, this many (all of it when that is its size).
+    Start(u64),
+    /// The whole file, too large to read in advance or of unknown size: what a single stream goes
+    /// on with.
+    Whole,
+}
+
+/// A probe's answer whose body is still coming, with the host slot its request holds.
+enum Live {
+    /// The rest of a ranged answer: the file's bytes from where the probe stopped reading up to
+    /// `end`, and the watch on its connection's rate while that told nothing yet.
+    Range { response: Response, slot: HostSlot, end: u64, watch: Option<RateWatch> },
+    /// A server ignoring the probe's range sent the whole file, none of it read yet.
+    Stream { response: Response, slot: HostSlot },
+}
+
+/// A probe's outcome: what it found, and the answer still coming when it is the first mirror's.
+type Probe = Result<(ProbeInfo, Option<Live>), String>;
+
+/// Probes as they come in, each with its mirror's place among the URLs probed.
+type ProbeStream = futures_util::stream::BoxStream<'static, (usize, Probe)>;
+
+/// What the probes found, for the download.
+struct Probed {
+    /// The mirror whose answers the download goes by.
+    reference: ProbeInfo,
+    /// The mirrors serving the reference's file, the reference among them.
+    mirrors: Vec<ProbeInfo>,
+    /// The reference's probe answer, still coming.
+    live: Option<Live>,
+    /// The probes still out when the download could start without them.
+    late: Option<ProbeStream>,
+}
+
+/// Where a `RateWatch` measures a connection's rate from: when its answer arrived.
 #[derive(Clone, Copy)]
 struct Pace {
     answered: tokio::time::Instant,
@@ -1217,15 +1481,40 @@ struct Pace {
 /// out the busy server; only without HEAD is it an error.
 ///
 /// With `prefetch` the GET asks for the first `PREFETCH` bytes instead of one, and its response
-/// comes back too, with how many body bytes to keep, when that body is the start of the file (or
-/// all of it, from a server ignoring ranges) and the validators found are the response's own.
+/// comes back too when its body is of use: the start of the file (or all of it, if that small)
+/// under the validators found, which must be the response's own, or else the whole file from a
+/// server ignoring ranges, for a single stream to take up.
+///
+/// HEAD and GET each hold a slot of their host's budget under `limit` (see [`crate::hosts`]).
+/// The GET waits for its slot before the probe's time runs, since a host busy with other
+/// downloads is no dead mirror, and keeps it for as long as its answer is read. HEAD goes out
+/// alongside only with a slot free at once: waiting for one while the GET holds another could be
+/// waiting for the GET's own. Without one, HEAD goes out after a GET that left no body to read,
+/// under the GET's slot, and is left out otherwise.
 async fn probe_url(
     client: &Client,
     auth: Option<&Auth>,
     url: &Url,
     prefetch: bool,
+    limit: usize,
 ) -> Result<(ProbeInfo, Option<ProbeBody>), String> {
-    let head = async {
+    let slot = hosts::acquire(url, limit).await;
+    tokio::time::timeout(PROBE_TIMEOUT, probe_with(client, auth, url, prefetch, limit, slot))
+        .await
+        .unwrap_or_else(|_| Err(format!("{}: no answer within {}s", url, PROBE_TIMEOUT.as_secs())))
+}
+
+/// `probe_url` once the GET holds `slot`.
+async fn probe_with(
+    client: &Client,
+    auth: Option<&Auth>,
+    url: &Url,
+    prefetch: bool,
+    limit: usize,
+    slot: HostSlot,
+) -> Result<(ProbeInfo, Option<ProbeBody>), String> {
+    let cold = slot.opens_connection();
+    let send_head = || async move {
         match authorize(client.head(url.clone()), auth, url).send().await {
             Ok(resp) if resp.status().is_success() => Some(resp),
             Ok(resp) => {
@@ -1238,7 +1527,15 @@ async fn probe_url(
             }
         }
     };
-    let range = format!("bytes=0-{}", if prefetch { PREFETCH - 1 } else { 0 });
+    let head_slot = hosts::try_acquire(url, limit);
+    let alongside = head_slot.is_some();
+    let head = async {
+        let _slot = head_slot?;
+        send_head().await
+    };
+    // The bytes the GET asks for.
+    let asked = if prefetch { PREFETCH } else { 1 };
+    let range = format!("bytes=0-{}", asked - 1);
     // Also when it answered and, for a first try, how long that took: what a connection needs to start.
     let ranged = async {
         let mut attempt = 0;
@@ -1268,30 +1565,47 @@ async fn probe_url(
         }
     };
     // Once the GET has answered, a HEAD that is still out only gets a short grace: some servers
-    // never answer HEAD, and the GET alone has everything needed.
+    // never answer HEAD, and the GET alone has everything needed. None at all once the GET has
+    // everything HEAD could add.
     tokio::pin!(head, ranged);
     let (head, (ranged, answered, setup)) = tokio::select! {
         head = &mut head => (head, ranged.await),
-        ranged = &mut ranged => (tokio::time::timeout(HEAD_GRACE, head).await.ok().flatten(), ranged),
+        ranged = &mut ranged => {
+            let complete = ranged.0.as_ref().is_ok_and(|r| says_it_all(r.status(), r.headers(), r.url()));
+            let head = if complete { None } else { tokio::time::timeout(HEAD_GRACE, head).await.ok().flatten() };
+            (head, ranged)
+        }
     };
-    let body = |response: Response, len: u64| ProbeBody { response, len, answered, setup };
-    let head_len = head.as_ref().and_then(|r| content_length(r.headers()));
     // Still busy or unreachable after every try: that says nothing about range support.
     let unanswered = ranged.as_ref().map_or(true, |resp| is_busy(resp.status()));
+    let usable = ranged.as_ref().is_ok_and(|resp| {
+        matches!(resp.status(), StatusCode::PARTIAL_CONTENT | StatusCode::OK | StatusCode::RANGE_NOT_SATISFIABLE)
+    });
+    // HEAD without a slot of its own goes out now if the GET left nothing to read under its slot:
+    // it is all the probe has to go by then.
+    let head = match head {
+        None if !alongside && !usable => send_head().await,
+        head => head,
+    };
+    // A body is read under the GET's slot, which a redirect moves to the host it came from.
+    let body = |response: Response, holds: Holds| {
+        let slot = slot_at(slot, response.url(), limit)?;
+        Some(ProbeBody { response, slot, holds, answered, setup })
+    };
+    let head_len = head.as_ref().and_then(|r| content_length(r.headers()));
 
     let get = match (ranged, &head) {
-        (Ok(resp), _) if matches!(
-            resp.status(),
-            StatusCode::PARTIAL_CONTENT | StatusCode::OK | StatusCode::RANGE_NOT_SATISFIABLE
-        ) => resp,
+        (Ok(resp), _) if usable => resp,
         // Go by HEAD. A refused range request means a single stream. An unanswered one is no
-        // reason to demote the download to one stream that cannot resume, so HEAD's Accept-Ranges
-        // decides, and the download retries the busy server as Retry-After and max_retries allow.
-        // A HEAD Content-Length of 0 is common for dynamic content: it is no size.
+        // reason to demote the download to one stream that cannot resume, so range support is as
+        // a ranged GET to the host found before, else as HEAD's Accept-Ranges says, and the
+        // download retries the busy server as Retry-After and max_retries allow. A HEAD
+        // Content-Length of 0 is common for dynamic content: it is no size.
         (_, Some(head)) => {
             let mut info = ProbeInfo::describe(url, &[head]);
             info.size = head_len.filter(|&n| n > 0);
-            info.accepts_ranges = unanswered && info.size.is_some() && accepts_bytes(head.headers());
+            let ranges = hosts::profile(head.url()).accepts_ranges.unwrap_or_else(|| accepts_bytes(head.headers()));
+            info.accepts_ranges = unanswered && info.size.is_some() && ranges;
             return Ok((info, None));
         }
         (Ok(resp), None) if unanswered => return Err(format!("{}: server busy (HTTP {})", url, resp.status())),
@@ -1308,20 +1622,22 @@ async fn probe_url(
             }
             let mut info = ProbeInfo::describe(url, &[&plain]);
             info.size = content_length(plain.headers());
-            let body = info.size.filter(|&n| prefetch && n <= PREFETCH).map(|n| body(plain, n));
+            let body = if prefetch { body(plain, whole_file(info.size)) } else { None };
             return Ok((info, body));
         }
     };
 
     let sources: Vec<&Response> = std::iter::once(&get).chain(head.as_ref()).collect();
     let mut info = ProbeInfo::describe(url, &sources);
+    // Chunk requests go straight to the final URL, skipping the hops the probe took to get there.
+    info.answer_time = setup.filter(|_| info.final_url == *url);
     let content_range = get.headers().get(CONTENT_RANGE).and_then(|v| v.to_str().ok());
-    let keep = match get.status() {
+    let holds = match get.status() {
         StatusCode::PARTIAL_CONTENT => match content_range.map(ByteRange::parse_content_range) {
             Some(Ok((range, Some(total)))) if range.start == 0 => {
                 info.accepts_ranges = true;
                 info.size = Some(total);
-                Some(range.len())
+                Some(Holds::Start(range.len().min(PREFETCH)))
             }
             // `bytes 0-0/*`: the length is unknown, so only a single stream can fetch the file.
             Some(Ok((range, None))) if range.start == 0 => None,
@@ -1329,8 +1645,7 @@ async fn probe_url(
         },
         StatusCode::OK => {
             info.size = content_length(get.headers());
-            // Without ranges only the whole file is of use.
-            info.size.filter(|&n| n <= PREFETCH)
+            Some(whole_file(info.size))
         }
         // Only an empty file cannot satisfy a range from byte 0.
         _ => {
@@ -1344,10 +1659,106 @@ async fn probe_url(
             None
         }
     };
+    // What the host answering the GET was seen to do: honour the range or not, and take this long
+    // to answer over a new connection. An unknown length or an empty file tells neither, and nor
+    // does the whole file for a range that reaches past its end: a server may send that as it is.
+    let ranges = match get.status() {
+        StatusCode::OK => info.size.is_none_or(|size| size > asked).then_some(false),
+        _ => info.accepts_ranges.then_some(true),
+    };
+    let setup_time = info.answer_time.filter(|_| cold);
+    hosts::record(get.url(), HostProfile { accepts_ranges: ranges, setup_time, ..Default::default() });
+
     let own = |name: HeaderName| get.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_string);
     let own_validators = own(ETAG) == info.etag && own(LAST_MODIFIED) == info.last_modified;
-    let body = keep.filter(|_| prefetch && own_validators).map(|len| body(get, len.min(PREFETCH)));
+    // A stream that cannot resume goes by no validator.
+    let body = holds
+        .filter(|holds| prefetch && (own_validators || matches!(holds, Holds::Whole)))
+        .and_then(|holds| body(get, holds));
     Ok((info, body))
+}
+
+/// What a 200's body, the whole file, holds: read in advance when that is small enough.
+fn whole_file(size: Option<u64>) -> Holds {
+    match size {
+        Some(size) if size <= PREFETCH => Holds::Start(size),
+        _ => Holds::Whole,
+    }
+}
+
+/// `slot` for a request whose answer came from `url`: a redirect to another host moves the
+/// request to that host's budget, if it has room; without room the answer is not read.
+fn slot_at(slot: HostSlot, url: &Url, limit: usize) -> Option<HostSlot> {
+    if *slot.host() == HostKey::of(url) {
+        Some(slot)
+    } else {
+        hosts::try_acquire(url, limit)
+    }
+}
+
+/// The racer over the mirrors serving the download. Requests go straight to where each probe was
+/// redirected, saving a redirect per request, with the mirror's own URL to fall back to. Each
+/// mirror starts from the answer time its probe measured, where it measured one, instead of an
+/// assumed one, so the first requests already favour near mirrors.
+fn build_racer(mirrors: &[ProbeInfo]) -> MirrorRacer {
+    let mut racer = MirrorRacer::new(Vec::new());
+    for probe in mirrors {
+        add_mirror(&mut racer, probe);
+    }
+    racer
+}
+
+/// Adds the mirror `probe` found to `racer` (see `build_racer`).
+fn add_mirror(racer: &mut MirrorRacer, probe: &ProbeInfo) {
+    let mirror = racer.add(probe.final_url.clone());
+    mirror.fallback = (probe.final_url != probe.url).then(|| probe.url.clone());
+    mirror.if_range = probe.if_range();
+    if let Some(answer) = probe.answer_time {
+        mirror.ttfb_ewma_ms = answer.as_secs_f64() * 1000.0;
+    }
+}
+
+/// The next probe of those still out, if any are; never while none are.
+async fn next_late(late: &mut Option<ProbeStream>) -> Option<(usize, Probe)> {
+    match late {
+        Some(probes) => probes.next().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Requests the mirrors' hosts take at once from a download under `limit` (0 for none): per host,
+/// the limit, or the connection cap it was seen to enforce if lower.
+fn host_room(mirrors: &[ProbeInfo], limit: usize) -> usize {
+    let mut seen = std::collections::HashSet::new();
+    mirrors
+        .iter()
+        .filter(|m| seen.insert(HostKey::of(&m.final_url)))
+        .map(|m| {
+            let cap = hosts::profile(&m.final_url).connection_cap;
+            cap.into_iter().chain((limit > 0).then_some(limit)).min().unwrap_or(usize::MAX)
+        })
+        .fold(0, usize::saturating_add)
+}
+
+/// Whether a probe's ranged GET, answered from `final_url`, leaves HEAD nothing to add: a 206
+/// with the total size, a validator chunk requests can send as If-Range (a strong ETag or
+/// Last-Modified: HEAD may have the date a weak ETag cannot stand in for), and a file name (its
+/// own Content-Disposition or a name in the URL's path).
+fn says_it_all(status: StatusCode, headers: &HeaderMap, final_url: &Url) -> bool {
+    let has_total = headers
+        .get(CONTENT_RANGE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| matches!(ByteRange::parse_content_range(v), Ok((_, Some(_)))));
+    let strong_etag = headers.get(ETAG).and_then(|v| v.to_str().ok()).is_some_and(is_strong);
+    status == StatusCode::PARTIAL_CONTENT
+        && has_total
+        && (strong_etag || headers.contains_key(LAST_MODIFIED))
+        && (disposition_name(headers).is_some() || filename_from_url(final_url).is_some())
+}
+
+/// Whether an ETag is strong: If-Range takes no weak one.
+fn is_strong(etag: &str) -> bool {
+    !etag.starts_with("W/")
 }
 
 /// Answers that mean "not now", not "no ranges" or "no such file".
@@ -1368,79 +1779,265 @@ fn accepts_bytes(headers: &HeaderMap) -> bool {
         .any(|unit| unit.trim().eq_ignore_ascii_case("bytes"))
 }
 
+/// Watches one connection's rate for a cap on it. Every half setup time (the time a new
+/// connection needs before its first byte), or at the first byte after, the rate over the bytes
+/// that came since the last look is measured; a look at nothing leaves the window open, as a pause
+/// is no rate. Two rates in a row without it climbing mean TCP slow start (which new connections
+/// would go through too) is over and the server caps the connection at that rate.
+struct RateWatch {
+    pace: Pace,
+    tick: Duration,
+    /// Bytes that came since the answer, and when the last of them came.
+    received: u64,
+    last_byte_at: tokio::time::Instant,
+    /// The window being measured: since when, from how many bytes, and when it is next looked at.
+    window_began: tokio::time::Instant,
+    window_began_len: u64,
+    next_tick: tokio::time::Instant,
+    /// The last rate measured, and whether it had stopped climbing.
+    last: Option<(f64, bool)>,
+    /// The rate, in bytes per second, the connection keeps to, once it kept to it twice in a row.
+    capped_at: Option<f64>,
+}
+
+impl RateWatch {
+    fn new(pace: Pace) -> Self {
+        let tick = (pace.setup / 2).max(MIN_RATE_TICK);
+        Self {
+            pace,
+            tick,
+            received: 0,
+            last_byte_at: pace.answered,
+            window_began: pace.answered,
+            window_began_len: 0,
+            next_tick: pace.answered + tick,
+            last: None,
+            capped_at: None,
+        }
+    }
+
+    /// `bytes` came at `now`, after the window a look then due measures.
+    fn arrived(&mut self, bytes: u64, now: tokio::time::Instant) {
+        self.look(now);
+        self.received += bytes;
+        self.last_byte_at = now;
+    }
+
+    /// Measures the rate over the window up to `now`, if a look is due.
+    fn look(&mut self, now: tokio::time::Instant) {
+        if now < self.next_tick {
+            return;
+        }
+        self.next_tick = now + self.tick;
+        let got = self.received - self.window_began_len;
+        if got == 0 {
+            return;
+        }
+        let rate = got as f64 / (now - self.window_began).as_secs_f64();
+        let flat = self.last.is_some_and(|(prev, _)| rate < prev * 1.5);
+        if flat && self.last.is_some_and(|(_, was_flat)| was_flat) {
+            self.capped_at = Some(rate);
+        } else if !flat {
+            self.capped_at = None;
+        }
+        self.last = Some((rate, flat));
+        (self.window_began, self.window_began_len) = (now, self.received);
+    }
+
+    /// What the connection told of its host so far: capped at `capped_at`; or not capped (`None`)
+    /// once it came, on average, so fast that in the time a new connection takes to start it
+    /// brings all one connection is ever asked to carry (`BYTES_PER_CONNECTION`), since whatever
+    /// cap it may have above that rate, no download would be split differently for it. Less tells
+    /// nothing: a cap may be just ahead.
+    fn verdict(&self) -> Option<Option<f64>> {
+        if self.capped_at.is_some() {
+            return Some(self.capped_at);
+        }
+        let secs = (self.last_byte_at - self.pace.answered).as_secs_f64();
+        let rate = (secs > 0.0).then(|| self.received as f64 / secs);
+        let fast = bytes_per_setup(rate, Some(self.pace.setup)).is_some_and(|bytes| bytes >= BYTES_PER_CONNECTION);
+        fast.then_some(None)
+    }
+
+    /// Records what the connection told of `url`'s host, if anything; whether it told anything.
+    fn record(&self, url: &Url) -> bool {
+        let Some(capped_at) = self.verdict() else { return false };
+        let seen = HostProfile { capped_per_connection: Some(capped_at.is_some()), connection_rate: capped_at, ..Default::default() };
+        hosts::record(url, seen);
+        true
+    }
+}
+
+/// The rest of the probe's answer as the first chunk's worker reads it, its connection's rate
+/// watched on (see `RateWatch`) for as long as the download has no other connection with an
+/// answer: what it tells of the host is recorded once it tells it, or once watching ends.
+struct Watched {
+    body: Body,
+    watch: Option<RateWatch>,
+    /// Cancelled once another connection of the download has its answer.
+    alone: CancellationToken,
+    url: Url,
+}
+
+impl Watched {
+    fn stop(&mut self) {
+        if let Some(watch) = self.watch.take() {
+            watch.record(&self.url);
+        }
+    }
+}
+
+impl futures_util::Stream for Watched {
+    type Item = reqwest::Result<Bytes>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        let item = std::task::ready!(this.body.poll_next_unpin(cx));
+        let over = match (&item, this.watch.as_mut()) {
+            (Some(Ok(bytes)), Some(watch)) if !this.alone.is_cancelled() => {
+                watch.arrived(bytes.len() as u64, tokio::time::Instant::now());
+                watch.capped_at.is_some()
+            }
+            _ => true,
+        };
+        if over {
+            this.stop();
+        }
+        Poll::Ready(item)
+    }
+}
+
+impl Drop for Watched {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// What `read_prefix` read.
+struct Prefix {
+    bytes: Bytes,
+    /// The connection's rate, as watched while reading.
+    watch: Option<RateWatch>,
+    /// Whether reading stopped by choice, for a capped connection or at the deadline, while the
+    /// body is still coming: the rest of it can go on as the download's first chunk.
+    live: bool,
+}
+
 /// Reads up to `len` bytes of a probe's body until `deadline`, giving up after `stall` without
 /// data. Whatever arrived is kept, even if the body ends early.
 ///
-/// With `pace`, the rate is measured every half setup time. Two ticks in a row without it
-/// climbing mean TCP slow start (which new connections would go through too) is over and the
-/// server caps the connection; the returned bytes-per-setup then says what one connection carries
-/// in the time another needs to start. Reading stops there if the rest would take over two setup
-/// times: workers fetch it in parallel sooner, even after losing the bytes still in flight.
+/// With `watch`, the connection's rate is watched for a cap (see `RateWatch`). Reading stops at
+/// one if the rest would take over two setup times: workers fetch it in parallel sooner, with this
+/// connection as one of them.
 async fn read_prefix(
-    response: Response,
+    response: &mut Response,
     len: u64,
     deadline: Option<tokio::time::Instant>,
-    pace: Option<Pace>,
+    mut watch: Option<RateWatch>,
     stall: Duration,
     limiter: Option<&RateLimiter>,
-) -> (Bytes, Option<u64>) {
-    let mut body = response.bytes_stream();
+) -> Prefix {
     let mut kept = Vec::with_capacity(len as usize);
     let mut last_byte_at = tokio::time::Instant::now();
-    let tick = pace.map_or(MIN_RATE_TICK, |p| (p.setup / 2).max(MIN_RATE_TICK));
-    // The window being measured, and when it is next looked at.
-    let (mut window_began, mut window_began_len) = (pace.map_or(last_byte_at, |p| p.answered), 0);
-    let mut next_tick = window_began + tick;
-    // The last rate measured, and whether it had stopped climbing.
-    let mut last: Option<(f64, bool)> = None;
-    let mut per_setup = None;
+    let mut live = false;
     while (kept.len() as u64) < len {
         let mut wake = last_byte_at + stall;
-        if pace.is_some() {
-            wake = wake.min(next_tick);
+        if let Some(watch) = &watch {
+            wake = wake.min(watch.next_tick);
         }
         if let Some(deadline) = deadline {
             wake = wake.min(deadline);
         }
-        match tokio::time::timeout_at(wake, body.next()).await {
-            Ok(Some(Ok(bytes))) => {
+        match tokio::time::timeout_at(wake, response.chunk()).await {
+            Ok(Ok(Some(bytes))) => {
                 if let Some(limiter) = limiter {
                     limiter.acquire(bytes.len() as u64).await;
                 }
                 let take = bytes.len().min(len as usize - kept.len());
                 kept.extend_from_slice(&bytes[..take]);
                 last_byte_at = tokio::time::Instant::now();
+                if let Some(watch) = &mut watch {
+                    watch.arrived(take as u64, last_byte_at);
+                }
             }
-            Ok(_) => break,
+            Ok(_) => break, // the body ended, or failed
             Err(_) => {
                 let now = tokio::time::Instant::now();
-                let (Some(p), false, false) =
-                    (pace, now >= last_byte_at + stall, deadline.is_some_and(|d| now >= d))
-                else {
-                    break; // stalled, or out of time
-                };
-                next_tick = now + tick;
-                let got = kept.len() - window_began_len;
-                if got == 0 {
-                    continue; // a pause, not a rate: the window stays open, and stalls are timed above
+                if now >= last_byte_at + stall {
+                    break; // stalled: nothing more is coming
                 }
-                let rate = got as f64 / (now - window_began).as_secs_f64();
-                let setup = p.setup.as_secs_f64();
-                let flat = last.is_some_and(|(prev, _)| rate < prev * 1.5);
-                if flat && last.is_some_and(|(_, was_flat)| was_flat) {
-                    per_setup = Some((rate * setup) as u64);
-                    if (len - kept.len() as u64) as f64 > 2.0 * rate * setup {
-                        break;
-                    }
-                } else if !flat {
-                    per_setup = None;
+                if deadline.is_some_and(|d| now >= d) {
+                    live = true; // out of time: the rest goes on alongside the workers
+                    break;
                 }
-                last = Some((rate, flat));
-                (window_began, window_began_len) = (now, kept.len());
+                if let Some(watch) = &mut watch {
+                    watch.look(now);
+                }
+            }
+        }
+        if let Some(watch) = &watch {
+            let rest = (len - kept.len() as u64) as f64;
+            if watch.capped_at.is_some_and(|rate| rest > 2.0 * rate * watch.pace.setup.as_secs_f64()) {
+                live = true;
+                break;
             }
         }
     }
-    (kept.into(), per_setup)
+    Prefix { bytes: kept.into(), watch, live }
+}
+
+/// Reads the file's start from the first mirror's probe answer, as much of it as the workers
+/// should wait for (see `read_prefix`), and returns the answer while the rest of it is still
+/// coming: the download goes on with it (as its first chunk, or as its one stream) instead of
+/// asking for those bytes again.
+///
+/// What its host was seen to do (see [`crate::hosts`]) spares measuring it again: on a host known
+/// to cap each connection the workers start at once, at the rate it was capped at; on one known
+/// not to, the start is read as if no rate could be measured. Otherwise what the measurement
+/// tells is recorded for the next download, and while it tells nothing yet, the answer's
+/// connection is watched on as the first chunk (see `Watched`).
+async fn take_start(
+    info: &mut ProbeInfo,
+    body: ProbeBody,
+    several_connections: bool,
+    limiter: Option<&RateLimiter>,
+    stall: Duration,
+) -> Option<Live> {
+    let ProbeBody { mut response, slot, holds, answered, setup } = body;
+    let len = match holds {
+        Holds::Start(len) => len,
+        Holds::Whole => return Some(Live::Stream { response, slot }),
+    };
+    let known = hosts::profile(&info.final_url);
+    // What a new connection needs before its first byte: as one needed before, since this answer
+    // may have come over a connection already open, which needs less.
+    let setup = known.setup_time.or(setup);
+    // Workers can take over early only where ranges work (without them only the whole body is of
+    // use) and there can be several.
+    let splits = info.accepts_ranges && several_connections;
+    if splits && known.capped_per_connection == Some(true) {
+        info.per_setup = bytes_per_setup(known.connection_rate, setup);
+        return Some(Live::Range { response, slot, end: len.saturating_sub(1), watch: None });
+    }
+    // Only the start of a larger file keeps workers waiting.
+    let deadline = (info.size != Some(len)).then(|| tokio::time::Instant::now() + PREFETCH_TIME);
+    // A speed limit would make every connection look capped.
+    let watch = setup
+        .filter(|_| splits && limiter.is_none() && known.capped_per_connection.is_none())
+        .map(|setup| RateWatch::new(Pace { answered, setup }));
+    let prefix = read_prefix(&mut response, len, deadline, watch, stall, limiter).await;
+    info.prefetch = prefix.bytes;
+    info.per_setup = bytes_per_setup(prefix.watch.as_ref().and_then(|watch| watch.capped_at), setup);
+    let mut watch = prefix.watch;
+    if watch.as_ref().is_some_and(|watch| watch.record(&info.final_url)) {
+        watch = None;
+    }
+    prefix.live.then(|| Live::Range { response, slot, end: len.saturating_sub(1), watch })
+}
+
+/// Bytes a connection at `rate` carries in the time `setup` another needs to start.
+fn bytes_per_setup(rate: Option<f64>, setup: Option<Duration>) -> Option<u64> {
+    Some((rate? * setup?.as_secs_f64()) as u64)
 }
 
 /// Picks the reference probe and keeps the mirrors that serve the same file. The first successful
@@ -1460,13 +2057,6 @@ fn select_mirrors(probes: Vec<Result<ProbeInfo, String>>) -> Result<(ProbeInfo, 
         }
     }
     let first = ok.first().cloned().ok_or_else(|| format!("Failed to probe file information: {}", errors.join("; ")))?;
-    // Why mirror `m` cannot serve the download `reference` describes, if it cannot.
-    let mismatch = |m: &ProbeInfo, reference: &ProbeInfo| match (m.strong_etag(), reference.strong_etag()) {
-        _ if m.size != reference.size => Some(format!("size {:?} differs from {:?}", m.size, reference.size)),
-        (Some(a), Some(b)) if a != b => Some(format!("ETag {} differs from {}", a, b)),
-        _ if reference.accepts_ranges && !m.accepts_ranges => Some("no range support".to_string()),
-        _ => None,
-    };
     let reference = if first.accepts_ranges || first.size == Some(first.prefetch.len() as u64) {
         &first
     } else {
@@ -1487,6 +2077,16 @@ fn select_mirrors(probes: Vec<Result<ProbeInfo, String>>) -> Result<(ProbeInfo, 
         })
         .collect();
     Ok((reference, mirrors))
+}
+
+/// Why mirror `m` cannot serve the download `reference` describes, if it cannot.
+fn mismatch(m: &ProbeInfo, reference: &ProbeInfo) -> Option<String> {
+    match (m.strong_etag(), reference.strong_etag()) {
+        _ if m.size != reference.size => Some(format!("size {:?} differs from {:?}", m.size, reference.size)),
+        (Some(a), Some(b)) if a != b => Some(format!("ETag {} differs from {}", a, b)),
+        _ if reference.accepts_ranges && !m.accepts_ranges => Some("no range support".to_string()),
+        _ => None,
+    }
 }
 
 /// Where the download goes and whether it can pick up a previous partial download.
@@ -1764,6 +2364,15 @@ fn validators_compatible(state: &DownloadState, remote: &ProbeInfo) -> bool {
     }
 }
 
+/// Fewest bytes a steal takes: the user's `min_steal_threshold`, else `MIN_STEAL`.
+fn min_steal(options: &DownloadOptions) -> u64 {
+    if options.min_steal_threshold != DEFAULT_MIN_STEAL {
+        options.min_steal_threshold
+    } else {
+        MIN_STEAL
+    }
+}
+
 fn effective_chunk_size(file_size: u64, num_workers: u64, configured: u64) -> u64 {
     const MB: u64 = 1024 * 1024;
     if configured != DEFAULT_CHUNK_SIZE {
@@ -1875,14 +2484,17 @@ fn stream_snapshot(size: Option<u64>, written: u64, speed: f64, path: &Path) -> 
 fn extract_filename<'a>(headers: impl IntoIterator<Item = &'a HeaderMap>, url: &Url) -> String {
     headers
         .into_iter()
-        .find_map(|h| {
-            let value = String::from_utf8_lossy(h.get(CONTENT_DISPOSITION)?.as_bytes()).into_owned();
-            content_disposition_filename(&value)
-                .map(|name| sanitize_filename(&name))
-                .filter(|name| !name.is_empty())
-        })
+        .find_map(disposition_name)
         .or_else(|| filename_from_url(url))
         .unwrap_or_else(|| "downloaded_file.bin".to_string())
+}
+
+/// The usable file name in a response's Content-Disposition, if it has one.
+fn disposition_name(headers: &HeaderMap) -> Option<String> {
+    let value = String::from_utf8_lossy(headers.get(CONTENT_DISPOSITION)?.as_bytes()).into_owned();
+    content_disposition_filename(&value)
+        .map(|name| sanitize_filename(&name))
+        .filter(|name| !name.is_empty())
 }
 
 fn filename_from_url(url: &Url) -> Option<String> {
@@ -2074,8 +2686,10 @@ mod tests {
     use tempfile::tempdir;
 
     fn remote(size: u64) -> ProbeInfo {
+        let url = Url::parse("http://example.com/file.bin").unwrap();
         ProbeInfo {
-            url: Url::parse("http://example.com/file.bin").unwrap(),
+            final_url: url.clone(),
+            url,
             size: Some(size),
             accepts_ranges: true,
             filename: "file.bin".to_string(),
@@ -2083,6 +2697,8 @@ mod tests {
             last_modified: None,
             prefetch: Bytes::new(),
             per_setup: None,
+            answer_time: None,
+            headers: HeaderMap::new(),
         }
     }
 
@@ -2176,6 +2792,37 @@ mod tests {
     }
 
     #[test]
+    fn test_a_complete_ranged_answer_leaves_head_nothing_to_add() {
+        let headers = |pairs: &[(&'static str, &'static str)]| {
+            let mut map = HeaderMap::new();
+            for (k, v) in pairs {
+                map.insert(*k, HeaderValue::from_static(v));
+            }
+            map
+        };
+        let (named, unnamed) = (Url::parse("http://h/files/tool.zip").unwrap(), Url::parse("http://h/").unwrap());
+        let tagged = headers(&[("content-range", "bytes 0-0/1000"), ("etag", "\"v1\"")]);
+        assert!(says_it_all(StatusCode::PARTIAL_CONTENT, &tagged, &named));
+        // Last-Modified is a validator too, and Content-Disposition a name.
+        let dated = headers(&[
+            ("content-range", "bytes 0-0/1000"),
+            ("last-modified", "Sun, 06 Nov 1994 08:49:37 GMT"),
+            ("content-disposition", "attachment; filename=\"a.bin\""),
+        ]);
+        assert!(says_it_all(StatusCode::PARTIAL_CONTENT, &dated, &unnamed));
+
+        // Anything missing leaves HEAD its grace.
+        assert!(!says_it_all(StatusCode::PARTIAL_CONTENT, &tagged, &unnamed), "no name");
+        let untagged = headers(&[("content-range", "bytes 0-0/1000")]);
+        assert!(!says_it_all(StatusCode::PARTIAL_CONTENT, &untagged, &named), "no validator");
+        let weak = headers(&[("content-range", "bytes 0-0/1000"), ("etag", "W/\"v1\"")]);
+        assert!(!says_it_all(StatusCode::PARTIAL_CONTENT, &weak, &named), "no validator If-Range takes");
+        let no_total = headers(&[("content-range", "bytes 0-0/*"), ("etag", "\"v1\"")]);
+        assert!(!says_it_all(StatusCode::PARTIAL_CONTENT, &no_total, &named), "no size");
+        assert!(!says_it_all(StatusCode::OK, &tagged, &named), "no ranges");
+    }
+
+    #[test]
     fn test_raw_utf8_content_disposition_is_used() {
         let url = Url::parse("http://example.com/dl.cgi").unwrap();
         let mut headers = HeaderMap::new();
@@ -2260,9 +2907,28 @@ mod tests {
     }
 
     /// Reads all of `body` as a probe whose answer took 40 ms, so its rate ticks every 20 ms.
-    async fn read_paced(body: Response, len: u64, paced_read: bool) -> (Bytes, Option<u64>) {
+    async fn read_paced(body: &mut Response, len: u64, paced_read: bool) -> Prefix {
         let pace = Pace { answered: tokio::time::Instant::now(), setup: Duration::from_millis(40) };
-        read_prefix(body, len, None, paced_read.then_some(pace), Duration::from_secs(1), None).await
+        read_prefix(body, len, None, paced_read.then(|| RateWatch::new(pace)), Duration::from_secs(1), None).await
+    }
+
+    /// What a read's connection told of its host.
+    fn verdict(prefix: &Prefix) -> Option<Option<f64>> {
+        prefix.watch.as_ref().and_then(RateWatch::verdict)
+    }
+
+    /// The rate a read found its connection capped at.
+    fn capped_at(prefix: &Prefix) -> Option<f64> {
+        prefix.watch.as_ref().and_then(|watch| watch.capped_at)
+    }
+
+    /// What is left of a body, read to its end.
+    async fn rest_of(mut body: Response) -> usize {
+        let mut rest = 0;
+        while let Some(bytes) = body.chunk().await.unwrap() {
+            rest += bytes.len();
+        }
+        rest
     }
 
     #[tokio::test(start_paused = true)]
@@ -2270,14 +2936,18 @@ mod tests {
         // 8 KiB per 3 ms from the first byte on (~2.7 MB/s), for 1 MiB: the rest would take far
         // longer than two 40 ms setups, so workers take over, each worth ~40 ms of transfer.
         let capped = || paced(std::iter::once((0, 8 * 1024)).chain(std::iter::repeat_n((3, 8 * 1024), 127)).collect());
-        let (bytes, per_setup) = read_paced(capped(), PREFETCH, true).await;
-        assert!(bytes.len() <= 256 * 1024, "{}", bytes.len());
-        let per_setup = per_setup.expect("a capped rate is measured");
+        let mut body = capped();
+        let prefix = read_paced(&mut body, PREFETCH, true).await;
+        assert!(prefix.bytes.len() <= 256 * 1024, "{}", prefix.bytes.len());
+        let per_setup = bytes_per_setup(capped_at(&prefix), Some(Duration::from_millis(40))).expect("a capped rate is measured");
         assert!((80 * 1024..=140 * 1024).contains(&per_setup), "{per_setup}");
+        // The probe's connection is one of them: the rest of its answer is still coming.
+        assert!(verdict(&prefix).is_some() && prefix.live);
+        assert_eq!(prefix.bytes.len() + rest_of(body).await, PREFETCH as usize, "nothing read was lost");
 
-        // Without ranges only the whole body is of use.
-        let (bytes, _) = read_paced(capped(), PREFETCH, false).await;
-        assert_eq!(bytes.len() as u64, PREFETCH);
+        // Without ranges only the whole body is of use, and no rate tells anything.
+        let prefix = read_paced(&mut capped(), PREFETCH, false).await;
+        assert_eq!((prefix.bytes.len() as u64, prefix.live, verdict(&prefix)), (PREFETCH, false, None));
     }
 
     #[tokio::test(start_paused = true)]
@@ -2286,18 +2956,181 @@ mod tests {
         // the first tick: one window looks flat (4+8 KiB, then 16), yet the rate is still
         // climbing and new connections would start as slowly, so the probe keeps the whole file.
         let steps = vec![(0, 4), (19, 8), (20, 16), (20, 32), (20, 64), (20, 128), (20, 4)];
-        let body = paced(steps.into_iter().map(|(ms, k)| (ms, k * 1024)).collect());
-        let (bytes, per_setup) = read_paced(body, 256 * 1024, true).await;
-        assert_eq!(bytes.len(), 256 * 1024);
-        assert_eq!(per_setup, None);
+        let mut body = paced(steps.into_iter().map(|(ms, k)| (ms, k * 1024)).collect());
+        let prefix = read_paced(&mut body, 256 * 1024, true).await;
+        assert_eq!(prefix.bytes.len(), 256 * 1024);
+        assert_eq!((capped_at(&prefix), prefix.live), (None, false));
+        // All of it came before the rate stopped climbing, but a cap may have been just ahead:
+        // ~2 MB/s brings far less than a connection is asked to carry in the 40 ms another needs.
+        assert_eq!(verdict(&prefix), None, "too little came too slowly to tell there is no cap");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_what_a_connection_tells_of_its_host() {
+        let setup = Duration::from_millis(40);
+        let url = Url::parse("http://told.engine.invalid/f").unwrap();
+        // Too short to measure: two pieces, 20 KiB at ~0.6 MB/s. Nothing is recorded, so the next
+        // file from the host, as capped, is measured and split, not kept on one connection.
+        let mut info = probed(url.as_str(), 20 * 1024);
+        let body = probe_body(&url, paced(vec![(0, 16 * 1024), (32, 4 * 1024)]), 20 * 1024, setup);
+        assert!(take_start(&mut info, body, true, None, Duration::from_secs(1)).await.is_none());
+        assert_eq!(info.prefetch.len(), 20 * 1024);
+        assert_eq!(hosts::profile(&url).capped_per_connection, None);
+        let mut info = probed(url.as_str(), PREFETCH);
+        let body = probe_body(&url, capped_body(), PREFETCH, setup);
+        assert!(matches!(take_start(&mut info, body, true, None, Duration::from_secs(1)).await, Some(Live::Range { .. })));
+        assert_eq!(hosts::profile(&url).capped_per_connection, Some(true));
+
+        // So fast that, in the time a new connection needs, it brings all a connection is asked
+        // to carry: whatever cap it has, splitting could not pay off.
+        let url = Url::parse("http://told-fast.engine.invalid/f").unwrap();
+        let mut info = probed(url.as_str(), PREFETCH);
+        let body = probe_body(&url, paced(vec![(0, 256 * 1024), (2, 256 * 1024), (2, 256 * 1024), (2, 256 * 1024)]), PREFETCH, setup);
+        assert!(take_start(&mut info, body, true, None, Duration::from_secs(1)).await.is_none());
+        let seen = hosts::profile(&url);
+        assert_eq!((seen.capped_per_connection, seen.connection_rate), (Some(false), None));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_a_connection_that_told_nothing_yet_is_watched_on_as_the_first_chunk() {
+        // New connections take 200 ms, so the rate is looked at every 100 ms: by the 250 ms the
+        // workers wait for the start of a larger file, the capped rate held only once.
+        let taken = |url: &Url| {
+            hosts::record(url, HostProfile { setup_time: Some(Duration::from_millis(200)), ..Default::default() });
+            let info = probed(url.as_str(), 4 * PREFETCH);
+            let body = probe_body(url, capped_body(), PREFETCH, Duration::from_millis(200));
+            async move {
+                let mut info = info;
+                match take_start(&mut info, body, true, None, Duration::from_secs(1)).await {
+                    Some(Live::Range { response, watch: Some(watch), .. }) => (response, watch),
+                    _ => panic!("the answer goes on, still watched"),
+                }
+            }
+        };
+        let url = Url::parse("http://watched.engine.invalid/f").unwrap();
+        let (response, watch) = taken(&url).await;
+        assert_eq!(hosts::profile(&url).capped_per_connection, None, "nothing told yet");
+        // Read on as the only connection with an answer, it tells: the next download knows.
+        let alone = CancellationToken::new();
+        let mut watched = Watched { body: response.bytes_stream().boxed(), watch: Some(watch), alone, url: url.clone() };
+        let mut rest = 0;
+        while let Some(bytes) = watched.next().await {
+            rest += bytes.unwrap().len();
+        }
+        assert!(rest > 0);
+        let seen = hosts::profile(&url);
+        assert_eq!(seen.capped_per_connection, Some(true));
+        assert!(seen.connection_rate.is_some_and(|rate| (2e6..3.5e6).contains(&rate)), "{seen:?}");
+
+        // Once another connection has its answer, what the rate does may be the others' doing.
+        let url = Url::parse("http://watched-shared.engine.invalid/f").unwrap();
+        let (response, watch) = taken(&url).await;
+        let alone = CancellationToken::new();
+        alone.cancel();
+        let watched = Watched { body: response.bytes_stream().boxed(), watch: Some(watch), alone, url: url.clone() };
+        let rest: Vec<Bytes> = watched.map(Result::unwrap).collect().await;
+        assert!(!rest.is_empty());
+        assert_eq!(hosts::profile(&url).capped_per_connection, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_prefix_read_out_of_time_leaves_the_rest_coming() {
+        // 8 KiB per 10 ms, and 95 ms to read it: the rest of the answer goes on with the workers.
+        let mut body = paced(std::iter::repeat_n((10, 8 * 1024), 32).collect());
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(95);
+        let prefix = read_prefix(&mut body, 256 * 1024, Some(deadline), None, Duration::from_secs(1), None).await;
+        assert!(prefix.live && prefix.watch.is_none());
+        assert_eq!(prefix.bytes.len(), 72 * 1024);
+        assert_eq!(rest_of(body).await, 184 * 1024);
+    }
+
+    /// ~2.7 MB/s from the first byte on, for 1 MiB.
+    fn capped_body() -> Response {
+        paced(std::iter::once((0, 8 * 1024)).chain(std::iter::repeat_n((3, 8 * 1024), 127)).collect())
+    }
+
+    /// A probe of `url` that found a file of `size` taking ranges.
+    fn probed(url: &str, size: u64) -> ProbeInfo {
+        let mut info = remote(size);
+        info.url = Url::parse(url).unwrap();
+        info.final_url = info.url.clone();
+        info
+    }
+
+    /// The first mirror's probe answer as `probe_url` hands it on: `len` bytes of `body` coming
+    /// from `url`, whose request waited `setup` for them.
+    fn probe_body(url: &Url, body: Response, len: u64, setup: Duration) -> ProbeBody {
+        let slot = hosts::try_acquire(url, 0).unwrap();
+        ProbeBody { response: body, slot, holds: Holds::Start(len), answered: tokio::time::Instant::now(), setup: Some(setup) }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_a_probe_over_an_open_connection_is_paced_by_what_a_new_one_needs() {
+        let mut info = probed("http://cold-setup.engine.invalid/f", PREFETCH);
+        // The answer came in 10 ms over a connection already open; a new one took 200 ms.
+        hosts::record(&info.final_url, HostProfile { setup_time: Some(Duration::from_millis(200)), ..Default::default() });
+        let body = probe_body(&info.final_url, capped_body(), PREFETCH, Duration::from_millis(10));
+        let live = take_start(&mut info, body, true, None, Duration::from_secs(1)).await;
+        // The rest took less than two new connections' setup: no worker takes over.
+        assert!(live.is_none());
+        assert_eq!(info.prefetch.len() as u64, PREFETCH);
+        let per_setup = info.per_setup.expect("a capped rate is measured");
+        assert!((400 * 1024..=700 * 1024).contains(&per_setup), "{per_setup}: 200 ms at the capped rate");
+        // And the next download from the host knows the cap.
+        let seen = hosts::profile(&info.final_url);
+        assert_eq!(seen.capped_per_connection, Some(true));
+        assert!(seen.connection_rate.is_some_and(|rate| (2e6..3.5e6).contains(&rate)), "{seen:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_a_host_seen_before_is_not_measured_again() {
+        let stall = Duration::from_secs(1);
+        // Seen capped: the workers start at once, at the rate seen, the answer going on unread.
+        let capped = "http://seen-capped.engine.invalid/f";
+        let seen = HostProfile {
+            capped_per_connection: Some(true),
+            connection_rate: Some(1e6),
+            setup_time: Some(Duration::from_millis(100)),
+            ..Default::default()
+        };
+        hosts::record(&Url::parse(capped).unwrap(), seen);
+        let mut info = probed(capped, 4 * PREFETCH);
+        let body = probe_body(&info.final_url, capped_body(), PREFETCH, Duration::from_millis(10));
+        let Some(Live::Range { response, end, .. }) = take_start(&mut info, body, true, None, stall).await else {
+            panic!("the answer goes on as the first chunk");
+        };
+        assert_eq!((info.prefetch.len(), end, info.per_setup), (0, PREFETCH - 1, Some(100_000)));
+        assert_eq!(rest_of(response).await, PREFETCH as usize);
+        // With a single connection there is nobody to hand over to: the start is read as ever.
+        let mut info = probed(capped, 4 * PREFETCH);
+        let body = probe_body(&info.final_url, capped_body(), PREFETCH, Duration::from_millis(10));
+        take_start(&mut info, body, false, None, stall).await;
+        assert!(!info.prefetch.is_empty());
+
+        // Seen uncapped: the start is read as if no rate could be measured, and nothing is
+        // measured to record anew.
+        let uncapped = "http://seen-uncapped.engine.invalid/f";
+        hosts::record(&Url::parse(uncapped).unwrap(), HostProfile { capped_per_connection: Some(false), ..Default::default() });
+        let mut info = probed(uncapped, PREFETCH);
+        let body = probe_body(&info.final_url, capped_body(), PREFETCH, Duration::from_millis(10));
+        assert!(take_start(&mut info, body, true, None, stall).await.is_none());
+        assert_eq!((info.prefetch.len() as u64, info.per_setup), (PREFETCH, None));
+        assert_eq!(hosts::profile(&info.final_url).capped_per_connection, Some(false));
     }
 
     #[tokio::test(start_paused = true)]
     async fn test_prefix_read_gives_up_on_a_stalled_body() {
         let silent = futures_util::stream::pending::<Result<Bytes, std::io::Error>>();
-        let body = Response::from(http::Response::new(reqwest::Body::wrap_stream(silent)));
-        let read = tokio::time::timeout(Duration::from_secs(5), read_paced(body, 256 * 1024, true)).await;
-        assert!(read.expect("the stall timeout ends the read").0.is_empty());
+        let mut body = Response::from(http::Response::new(reqwest::Body::wrap_stream(silent)));
+        let read = tokio::time::timeout(Duration::from_secs(5), read_paced(&mut body, 256 * 1024, true)).await;
+        let prefix = read.expect("the stall timeout ends the read");
+        assert!(prefix.bytes.is_empty() && !prefix.live, "nothing more is coming");
+        assert_eq!(verdict(&prefix), None, "a silent connection tells nothing of a cap");
+
+        // Nor does a body that ended early leave anything to go on with.
+        let mut short = paced(vec![(0, 8 * 1024)]);
+        let prefix = read_paced(&mut short, 256 * 1024, false).await;
+        assert_eq!((prefix.bytes.len(), prefix.live), (8 * 1024, false));
     }
 
     #[test]
@@ -2611,6 +3444,273 @@ mod tests {
         let stalled = meter.update_at(100 * 100_000, t0 + Duration::from_secs(12));
         assert!((0.0..400_000.0).contains(&stalled), "{stalled}");
         assert!(meter.update_at(0, t0 + Duration::from_secs(13)) >= 0.0);
+    }
+
+    #[test]
+    fn test_mirrors_start_from_their_probed_answer_times() {
+        let mirror = |host: &str, answer_ms: Option<u64>| {
+            let mut m = remote(1000);
+            m.url = Url::parse(&format!("http://{host}/file.bin")).unwrap();
+            m.final_url = m.url.clone();
+            m.answer_time = answer_ms.map(Duration::from_millis);
+            m
+        };
+        // The second mirror answered its probe ten times sooner: the first request goes there.
+        let racer = build_racer(&[mirror("far.example", Some(300)), mirror("near.example", Some(30))]);
+        assert_eq!(racer.select_best_mirror(), Some(1));
+        assert_eq!(racer.get_mirror(1).unwrap().ttfb_ewma_ms, 30.0);
+        assert_eq!(racer.get_mirror(0).unwrap().if_range.as_deref(), Some("\"v1\""));
+        // Equal answers, or none measured: the first listed mirror leads.
+        let even = build_racer(&[mirror("a.example", Some(30)), mirror("b.example", Some(30))]);
+        assert_eq!(even.select_best_mirror(), Some(0));
+        let unmeasured = build_racer(&[mirror("a.example", None), mirror("b.example", None)]);
+        assert_eq!(unmeasured.select_best_mirror(), Some(0));
+    }
+
+    #[test]
+    fn test_steals_take_a_small_floor_unless_the_user_set_one() {
+        // Time decides a steal now; the floor no longer grows with the chunk size.
+        assert_eq!(min_steal(&DownloadOptions::default()), 64 * 1024);
+        let set = DownloadOptions { min_steal_threshold: 8 * 1024 * 1024, ..Default::default() };
+        assert_eq!(min_steal(&set), 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_requests_go_where_the_probe_was_redirected() {
+        let mut redirected = remote(1000);
+        redirected.final_url = Url::parse("https://cdn.example/file.bin?sig=1").unwrap();
+        let racer = build_racer(&[redirected.clone(), remote(1000)]);
+        let (first, second) = (racer.get_mirror(0).unwrap(), racer.get_mirror(1).unwrap());
+        assert_eq!((&first.url, first.fallback.as_ref()), (&redirected.final_url, Some(&redirected.url)));
+        assert_eq!((&second.url, second.fallback.as_ref()), (&remote(1000).url, None), "nothing to fall back to");
+    }
+
+    #[test]
+    fn test_the_default_host_budget_never_holds_one_download_back() {
+        assert!(DownloadOptions::default().max_connections_per_host >= MAX_CONNECTIONS);
+    }
+
+    /// A local server of `data` at every path: HEAD, and GETs honouring `Range` whose bodies come
+    /// 64 KiB per `pace`. `/moved/<name>` redirects to `/<name>`, the first GET of `/busy/<name>`
+    /// and every GET of `/refused/<name>` are refused with 503, GETs of `/untagged/<name>` carry
+    /// no ETag, and the first GET of `/stall/<name>` past the file's start goes silent after
+    /// 64 KiB.
+    async fn file_server(data: Vec<u8>, pace: Duration) -> Url {
+        use tokio::io::AsyncReadExt;
+        let listener = crate::hosts::unseen_listener().await;
+        let base = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let data = Arc::new(data);
+        let seen = Arc::new(Mutex::new(std::collections::HashSet::new()));
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let (data, seen) = (Arc::clone(&data), Arc::clone(&seen));
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => head.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
+                    let mut words = head.split_whitespace();
+                    let (method, path) = (words.next().unwrap_or_default(), words.next().unwrap_or("/").to_string());
+                    let (start, end) = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("range: bytes=")?.trim().split_once('-'))
+                        .and_then(|(a, b)| Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?.min(data.len() - 1))))
+                        .unwrap_or((0, data.len() - 1));
+                    let stall = path.starts_with("/stall/");
+                    let first = method == "get" && (!stall || start > 0) && seen.lock().insert(path.clone());
+                    let answer = if let Some(name) = path.strip_prefix("/moved/") {
+                        format!("HTTP/1.1 302 Found\r\nLocation: /{name}\r\nContent-Length: 0\r\n")
+                    } else if (first && path.starts_with("/busy/")) || (method == "get" && path.starts_with("/refused/")) {
+                        "HTTP/1.1 503 Busy\r\nRetry-After: 0\r\nContent-Length: 0\r\n".to_string()
+                    } else if method == "head" {
+                        format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nETag: \"v1\"\r\n", data.len())
+                    } else {
+                        let (total, len) = (data.len(), end + 1 - start);
+                        let etag = if path.starts_with("/untagged/") { "" } else { "ETag: \"v1\"\r\n" };
+                        format!("HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{total}\r\nContent-Length: {len}\r\n{etag}")
+                    };
+                    if socket.write_all(format!("{answer}Connection: close\r\n\r\n").as_bytes()).await.is_err() {
+                        return;
+                    }
+                    if !answer.starts_with("HTTP/1.1 206") {
+                        return;
+                    }
+                    let silent = stall && first;
+                    for piece in data[start..=end].chunks(64 * 1024).take(if silent { 1 } else { usize::MAX }) {
+                        tokio::time::sleep(pace).await;
+                        if socket.write_all(piece).await.is_err() {
+                            return;
+                        }
+                    }
+                    if silent {
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                    }
+                });
+            }
+        });
+        base
+    }
+
+    #[tokio::test]
+    async fn test_only_a_direct_first_try_seeds_a_mirrors_answer_time() {
+        let base = file_server(vec![7u8; 4096], Duration::ZERO).await;
+        let client = Client::new();
+        let probe = |path: &str| {
+            let (client, url) = (client.clone(), base.join(path).unwrap());
+            async move { probe_url(&client, None, &url, false, 0).await.unwrap().0 }
+        };
+        assert!(probe("file.bin").await.answer_time.is_some());
+        // Chunk requests skip the redirect the probe went through, so its time says nothing.
+        let moved = probe("moved/file.bin").await;
+        assert_eq!((moved.final_url, moved.answer_time), (base.join("file.bin").unwrap(), None));
+        // A retry may have reused the connection of the try before.
+        let busy = probe("busy/file.bin").await;
+        assert!(busy.accepts_ranges);
+        assert_eq!(busy.answer_time, None);
+    }
+
+    #[tokio::test]
+    async fn test_head_without_a_slot_of_its_own_holds_up_no_probe() {
+        let base = file_server(vec![7u8; 4096], Duration::ZERO).await;
+        let client = Client::new();
+        // One request to the host at a time, which the ranged GET holds: HEAD has no slot. A GET
+        // naming the file without a validator would otherwise leave HEAD its grace.
+        let started = std::time::Instant::now();
+        let (info, _) = probe_url(&client, None, &base.join("untagged/f.bin").unwrap(), false, 1).await.unwrap();
+        assert!(started.elapsed() < HEAD_GRACE, "HEAD was waited for: {:?}", started.elapsed());
+        assert_eq!((info.size, info.accepts_ranges, info.etag), (Some(4096), true, None));
+        // A GET refused on every try leaves nothing to read: HEAD goes out after it, under its
+        // slot, and says what the file is.
+        let refused = base.join("refused/f.bin").unwrap();
+        let (info, body) = probe_url(&client, None, &refused, true, 1).await.expect("HEAD answers for the refused GET");
+        assert_eq!((info.size, info.accepts_ranges, info.etag.as_deref()), (Some(4096), true, Some("\"v1\"")));
+        assert!(body.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_probes_still_out_are_given_up_when_the_probe_brought_the_whole_file() {
+        use tokio::io::AsyncReadExt;
+        let file = file_server(vec![7u8; 4096], Duration::ZERO).await.join("f.bin").unwrap();
+        // A second mirror that takes requests but never answers them, and tells when they are
+        // given up.
+        let listener = crate::hosts::unseen_listener().await;
+        let silent = Url::parse(&format!("http://{}/f.bin", listener.local_addr().unwrap())).unwrap();
+        let (given_up_tx, mut given_up) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let given_up_tx = given_up_tx.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    while socket.read(&mut buf).await.is_ok_and(|n| n > 0) {}
+                    let _ = given_up_tx.send(Instant::now());
+                });
+            }
+        });
+        let dir = tempdir().unwrap();
+        let options = DownloadOptions { output_path: Some(dir.path().to_path_buf()), ..Default::default() };
+        let path = DownloadEngine::new(vec![file, silent], options).run(None).await.unwrap();
+        // Nothing runs between the end of the download and this: whatever the mirror noticed
+        // before, it noticed while the download wrote and checked the file.
+        let finished = Instant::now();
+        assert_eq!(std::fs::read(path).unwrap(), vec![7u8; 4096]);
+        let given_up = tokio::time::timeout(Duration::from_secs(10), given_up.recv()).await.unwrap().unwrap();
+        assert!(given_up < finished, "the second mirror's probe held its host slot until the download was over");
+    }
+
+    #[tokio::test]
+    async fn test_a_web_page_from_google_drive_fails_its_probe() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // Every answer comes through this proxy: a web page, as Drive sends for a private or
+        // deleted file.
+        let proxy = crate::hosts::unseen_listener().await;
+        let options = DownloadOptions { proxy: Some(format!("http://{}", proxy.local_addr().unwrap())), ..Default::default() };
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = proxy.accept().await {
+                tokio::spawn(async move {
+                    let mut head = [0u8; 4096];
+                    let _ = socket.read(&mut head).await;
+                    let page = "<html>You can't view or download this file at this time.</html>";
+                    let answer = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page}",
+                        page.len()
+                    );
+                    let _ = socket.write_all(answer.as_bytes()).await;
+                });
+            }
+        });
+        let drive = Url::parse("http://drive.usercontent.google.com/download?id=abc&export=download&confirm=t").unwrap();
+        let engine = DownloadEngine::new(vec![drive.clone()], options);
+        let client = engine.client.clone().unwrap();
+        let err = engine.probe_all(&client, &[drive]).await.err().expect("a web page is no file");
+        assert!(err.contains("Google Drive served a web page instead of the file"), "{err}");
+        // The same answer from anywhere else is what was asked for.
+        let elsewhere = Url::parse("http://files.engine.invalid/download?id=abc").unwrap();
+        assert!(engine.probe_all(&client, &[elsewhere]).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_a_probe_tells_what_its_host_does() {
+        let url = file_server(vec![7u8; 4096], Duration::ZERO).await.join("file.bin").unwrap();
+        let client = Client::new();
+        // Nothing went to the host before: the probe's connection is new, and its wait what a
+        // new one needs.
+        let (probe, _) = probe_url(&client, None, &url, false, 0).await.unwrap();
+        let seen = hosts::profile(&url);
+        assert_eq!(seen.accepts_ranges, Some(true));
+        assert!(seen.setup_time.is_some() && seen.setup_time == probe.answer_time, "{seen:?}");
+        // Right after, a connection may be open for reuse: the next probe's wait tells nothing.
+        let cold = Duration::from_secs(7);
+        hosts::record(&url, HostProfile { setup_time: Some(cold), ..Default::default() });
+        probe_url(&client, None, &url, false, 0).await.unwrap();
+        assert_eq!(hosts::profile(&url).setup_time, Some(cold));
+    }
+
+    #[test]
+    fn test_a_download_opens_no_more_connections_than_its_hosts_take() {
+        hosts::record(&Url::parse("http://capped.room.engine.invalid/").unwrap(), HostProfile { connection_cap: Some(3), ..Default::default() });
+        let mirrors = [
+            probed("http://capped.room.engine.invalid/a", 1000),
+            probed("http://open.room.engine.invalid/a", 1000),
+            probed("http://capped.room.engine.invalid/b", 1000),
+        ];
+        assert_eq!(host_room(&mirrors, 8), 3 + 8, "per host, not per mirror");
+        assert_eq!(host_room(&mirrors, 2), 2 + 2);
+        assert_eq!(host_room(&mirrors[..1], 0), 3);
+        assert_eq!(host_room(&mirrors, 0), usize::MAX, "no limit, and no cap seen on one host");
+    }
+
+    #[tokio::test]
+    async fn test_downloads_sharing_a_host_stay_within_its_budget_through_steals_and_takeovers() {
+        const MIB: usize = 1024 * 1024;
+        let data: Vec<u8> = (0..9 * MIB).map(|i| (i % 251) as u8).collect();
+        let base = file_server(data.clone(), Duration::from_millis(2)).await;
+        let dir = tempdir().unwrap();
+        let engine = |path: &str, out: &str| {
+            let options = DownloadOptions {
+                num_connections: 8,
+                base_chunk_size: 256 * 1024,
+                max_connections_per_host: 4,
+                output_path: Some(dir.path().join(out)),
+                ..Default::default()
+            };
+            DownloadEngine::new(vec![base.join(path).unwrap()], options)
+        };
+        // Steals are on (the default floor), and one connection goes silent to be taken over.
+        let (a, b) = (engine("stall/a.bin", "a.bin"), engine("b.bin", "b.bin"));
+
+        let (a_done, b_done) = tokio::time::timeout(Duration::from_secs(30), async { tokio::join!(a.run(None), b.run(None)) })
+            .await
+            .expect("both downloads finish");
+        for (done, out) in [(a_done, "a.bin"), (b_done, "b.bin")] {
+            assert_eq!(done.unwrap(), dir.path().join(out));
+            assert!(std::fs::read(dir.path().join(out)).unwrap() == data, "{out} differs");
+        }
+        assert_eq!(crate::hosts::peak(&base), 4, "both downloads' workers share the host's four slots");
     }
 
     #[test]

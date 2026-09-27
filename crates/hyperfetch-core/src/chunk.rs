@@ -1,13 +1,44 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use crate::range::{ByteRange, RangeError};
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 
 /// Base and cap of the per-chunk exponential retry backoff.
 const BACKOFF_BASE: Duration = Duration::from_millis(500);
 const BACKOFF_CAP: Duration = Duration::from_secs(30);
+/// A timed steal leaves a chunk alone unless its worker needs more than this many times a new
+/// request's startup to finish it: otherwise the new request barely gets going before it ends.
+const STEAL_MIN_STARTUPS: f64 = 2.0;
+
+/// How a thief may split a chunk.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StealRule<'a> {
+    /// Fewest bytes a steal hands the thief: a split that would give it less is not made.
+    pub min_bytes: u64,
+    /// What a new request to each mirror costs, by mirror id. Without it the rest of a chunk is
+    /// split in half.
+    pub timing: Option<&'a [StealTiming]>,
+}
+
+/// What a new request to a mirror costs.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StealTiming {
+    /// Time the request needs before its first byte.
+    pub startup: Duration,
+    /// Bytes per second its connection is expected to reach.
+    pub rate: f64,
+}
+
+/// A steal of at least this many bytes, split in half.
+impl From<u64> for StealRule<'_> {
+    fn from(min_bytes: u64) -> Self {
+        Self { min_bytes, timing: None }
+    }
+}
 
 #[derive(Error, Debug)]
 pub enum ChunkError {
@@ -55,6 +86,12 @@ pub struct Chunk {
     pub current_offset: Arc<AtomicU64>,
     /// Inclusive end, lowered by work stealing while the chunk is in flight.
     pub end_offset: Arc<AtomicU64>,
+    /// Cancelled when another worker takes over what is left: the attempt's worker then stops at
+    /// once and settles nothing, since the chunk is no longer its own.
+    pub(crate) revoked: CancellationToken,
+    /// Since when the attempt's worker has been waiting for the server without a byte; `None`
+    /// while it is busy (writing, rate limited) rather than waiting.
+    waiting: Arc<Mutex<Option<Instant>>>,
     not_before: Option<Instant>,
     assigned_at: Option<Instant>,
     assigned_offset: u64,
@@ -69,10 +106,28 @@ impl Chunk {
             retries: 0,
             current_offset: Arc::new(AtomicU64::new(range.start)),
             end_offset: Arc::new(AtomicU64::new(range.end)),
+            revoked: CancellationToken::new(),
+            waiting: Arc::new(Mutex::new(None)),
             not_before: None,
             assigned_at: None,
             assigned_offset: range.start,
         }
+    }
+
+    /// The attempt's worker waits for the server from `since` on (a time in the future while
+    /// the rate limit holds it back).
+    pub(crate) fn wait_for_server(&self, since: Instant) {
+        *self.waiting.lock() = Some(since);
+    }
+
+    /// The attempt's worker is busy with what arrived, not waiting for the server.
+    pub(crate) fn busy(&self) {
+        *self.waiting.lock() = None;
+    }
+
+    /// How long the attempt's worker has been waiting for the server without a byte.
+    fn silence(&self, now: Instant) -> Duration {
+        self.waiting.lock().map_or(Duration::ZERO, |since| now.saturating_duration_since(since))
     }
 
     pub fn is_completed(&self) -> bool {
@@ -107,16 +162,30 @@ impl Chunk {
         self.written_prefix().map_or(0, |r| r.len())
     }
 
-    /// Estimated seconds to finish at the rate observed since assignment (infinite if nothing arrived yet).
-    fn eta_secs(&self, remaining: u64, now: Instant) -> f64 {
+    /// Bytes per second written since assignment; `None` before anything arrived.
+    fn rate(&self, now: Instant) -> Option<f64> {
         let received = self.current_offset.load(Ordering::SeqCst).saturating_sub(self.assigned_offset);
         let elapsed = self.assigned_at.map_or(0.0, |t| now.duration_since(t).as_secs_f64());
-        if received == 0 || elapsed <= 0.0 {
-            f64::INFINITY
-        } else {
-            remaining as f64 / (received as f64 / elapsed)
-        }
+        (received > 0 && elapsed > 0.0).then(|| received as f64 / elapsed)
     }
+
+    /// How the chunk's worker is expected to go on: seconds until its next byte, and bytes per
+    /// second from then on. Once it has a rate since assignment, that rate at once; before, what
+    /// a request to its mirror costs (`expected`), less the part of the startup already behind it.
+    /// `None` without either.
+    fn pace(&self, now: Instant, expected: Option<&StealTiming>) -> Option<(f64, f64)> {
+        if let Some(rate) = self.rate(now) {
+            return Some((0.0, rate));
+        }
+        let expected = expected.filter(|t| t.rate > 0.0)?;
+        let waited = self.assigned_at.map_or(Duration::ZERO, |at| now.saturating_duration_since(at));
+        Some((expected.startup.saturating_sub(waited).as_secs_f64(), expected.rate))
+    }
+}
+
+/// Seconds until a worker going on at `pace` has written `remaining` bytes (infinite without a pace).
+fn eta_secs(remaining: u64, pace: Option<(f64, f64)>) -> f64 {
+    pace.map_or(f64::INFINITY, |(wait, rate)| wait + remaining as f64 / rate)
 }
 
 /// Manages chunk partitioning, assignment, retries and work stealing.
@@ -249,50 +318,144 @@ impl ChunkManager {
         None
     }
 
+    /// Hands `worker_id` the unassigned chunk that starts at `start`, cut to end at `end` if it
+    /// goes further (the rest becomes a chunk of its own): for bytes an answer already on its way
+    /// brings, such as the probe's, whose range ends at `end`. `None` without such a chunk, as
+    /// when those bytes are on disk.
+    pub fn assign_at(&mut self, worker_id: usize, mirror_id: usize, start: u64, end: u64) -> Option<Chunk> {
+        if self.fatal.is_some() || end < start {
+            return None;
+        }
+        let id = self.chunks.iter().position(|c| c.status == ChunkStatus::Unassigned && c.range.start == start)?;
+        let chunk_end = self.chunks[id].range.end;
+        if chunk_end > end {
+            let rest = Chunk::new(self.chunks.len(), ByteRange::new(end + 1, chunk_end).ok()?);
+            let chunk = &mut self.chunks[id];
+            chunk.range.end = end;
+            chunk.end_offset.store(end, Ordering::SeqCst);
+            self.chunks.push(rest);
+        }
+        Some(self.assign(id, worker_id, mirror_id, Instant::now()))
+    }
+
     fn assign(&mut self, id: usize, worker_id: usize, mirror_id: usize, now: Instant) -> Chunk {
         let chunk = &mut self.chunks[id];
         chunk.status = ChunkStatus::Assigned { worker_id, mirror_id };
         chunk.not_before = None;
         chunk.assigned_at = Some(now);
         chunk.assigned_offset = chunk.current_offset.load(Ordering::SeqCst);
+        chunk.wait_for_server(now);
         chunk.clone()
     }
 
-    /// Splits the in-flight chunk with the longest estimated time remaining (ties: most bytes left)
-    /// at the midpoint of what is left. The victim is always truncated and the thief always gets
-    /// `[split, old_end]`; if the victim's worker already wrote past the split, those bytes are
-    /// identical and simply get written twice.
-    /// Returns `(victim_chunk_id, new_stolen_chunk)`.
-    pub fn steal_work(
+    /// Hands everything left of the in-flight chunk whose worker has waited longest for the server
+    /// without a byte to an idle thief, if that wait is at least `min_silence(chunk's mirror)`. The
+    /// silent attempt is revoked. What it wrote becomes a completed chunk; the rest keeps the
+    /// chunk's id and gets new offsets and a new token, so the revoked worker, which still holds
+    /// the old ones, can neither move nor settle what the thief now owns.
+    pub fn take_over_silent(
         &mut self,
         thief_worker_id: usize,
         thief_mirror_id: usize,
-        min_steal_threshold: u64,
+        min_silence: impl Fn(usize) -> Duration,
+    ) -> Option<Chunk> {
+        if self.fatal.is_some() {
+            return None;
+        }
+        let now = Instant::now();
+        let (id, _) = self
+            .chunks
+            .iter()
+            .filter_map(|c| match c.status {
+                ChunkStatus::Assigned { mirror_id, .. } if c.remaining_bytes() > 0 => {
+                    let silent = c.silence(now);
+                    (silent >= min_silence(mirror_id)).then_some((c.id, silent))
+                }
+                _ => None,
+            })
+            .max_by_key(|&(_, silent)| silent)?;
+
+        let chunk = &mut self.chunks[id];
+        chunk.revoked.cancel();
+        // Read after revoking: whatever the old worker records from now on is its own business.
+        let pos = chunk.current_offset.load(Ordering::SeqCst).max(chunk.range.start);
+        let end = chunk.end_offset.load(Ordering::SeqCst);
+        if pos > end {
+            // Its last byte got written meanwhile, and the revoked worker will not settle it.
+            chunk.status = ChunkStatus::Completed;
+            self.completed += 1;
+            return None;
+        }
+        if pos > chunk.range.start {
+            let written = ByteRange { start: chunk.range.start, end: pos - 1 };
+            chunk.range.start = pos;
+            let prefix_id = self.chunks.len();
+            let mut done = Chunk::new(prefix_id, written);
+            done.status = ChunkStatus::Completed;
+            self.chunks.push(done);
+            self.completed += 1;
+        }
+        let chunk = &mut self.chunks[id];
+        chunk.current_offset = Arc::new(AtomicU64::new(pos));
+        chunk.end_offset = Arc::new(AtomicU64::new(end));
+        chunk.revoked = CancellationToken::new();
+        chunk.waiting = Arc::new(Mutex::new(None));
+        Some(self.assign(id, thief_worker_id, thief_mirror_id, now))
+    }
+
+    /// Splits the in-flight chunk expected to finish last (ties: most bytes left). Its worker is
+    /// expected to go on at the rate it has had since assignment, or before it has one, at its
+    /// mirror's rate once its mirror's startup is over. A timed steal splits where both sides
+    /// finish together, the thief starting after its mirror's startup at its mirror's rate, and
+    /// leaves the chunk alone if its worker finishes within `STEAL_MIN_STARTUPS` of those startups
+    /// anyway. Without timing the rest is split in half. A split that would hand the thief fewer
+    /// than `min_bytes` is not made, and the victim keeps at least one byte. The victim is always
+    /// truncated and the thief always gets `[split, old_end]`; if the victim's worker already
+    /// wrote past the split, those bytes are identical and simply get written twice.
+    /// Returns `(victim_chunk_id, new_stolen_chunk)`.
+    pub fn steal_work<'a>(
+        &mut self,
+        thief_worker_id: usize,
+        thief_mirror_id: usize,
+        rule: impl Into<StealRule<'a>>,
     ) -> Option<(usize, Chunk)> {
         if self.fatal.is_some() {
             return None;
         }
-        let threshold = min_steal_threshold.max(2);
+        let rule = rule.into();
+        let min_bytes = rule.min_bytes.max(1);
+        let expected = |mirror_id: usize| rule.timing.and_then(|t| t.get(mirror_id));
         let now = Instant::now();
-        let (victim_id, _, _) = self
+        let (victim_id, _, pace) = self
             .chunks
             .iter()
-            .filter(|c| c.is_in_flight())
-            .filter_map(|c| {
-                let remaining = c.remaining_bytes();
-                (remaining >= threshold).then(|| (c.id, remaining, c.eta_secs(remaining, now)))
+            .filter_map(|c| match c.status {
+                ChunkStatus::Assigned { mirror_id, .. } => {
+                    let remaining = c.remaining_bytes();
+                    (remaining > min_bytes).then(|| (c.id, remaining, c.pace(now, expected(mirror_id))))
+                }
+                _ => None,
             })
-            .max_by(|a, b| a.2.total_cmp(&b.2).then(a.1.cmp(&b.1)))?;
+            .max_by(|a, b| eta_secs(a.1, a.2).total_cmp(&eta_secs(b.1, b.2)).then(a.1.cmp(&b.1)))?;
 
         let victim = &mut self.chunks[victim_id];
         let cur_pos = victim.current_offset.load(Ordering::SeqCst).max(victim.range.start);
         let cur_end = victim.end_offset.load(Ordering::SeqCst);
         let remaining = cur_end.checked_sub(cur_pos)?.saturating_add(1);
-        if remaining < threshold {
-            return None;
-        }
+        let keep = match (expected(thief_mirror_id).filter(|t| t.rate > 0.0), pace) {
+            (Some(thief), Some((wait, victim_rate))) => {
+                let (startup, left) = (thief.startup.as_secs_f64(), remaining as f64);
+                if eta_secs(remaining, pace) <= STEAL_MIN_STARTUPS * startup {
+                    return None;
+                }
+                // wait + keep / victim_rate == startup + (remaining - keep) / thief.rate
+                (((startup - wait) * thief.rate + left) * victim_rate / (victim_rate + thief.rate)) as u64
+            }
+            _ => remaining / 2,
+        };
+        let stolen = remaining.checked_sub(keep.max(1)).filter(|&n| n >= min_bytes)?;
 
-        let split_offset = cur_pos + remaining / 2;
+        let split_offset = cur_end + 1 - stolen;
         victim.end_offset.store(split_offset - 1, Ordering::SeqCst);
         victim.range.end = split_offset - 1;
 
@@ -413,6 +576,16 @@ impl ChunkManager {
     fn get_chunk_mut(&mut self, chunk_id: usize) -> Result<&mut Chunk, ChunkError> {
         self.chunks.get_mut(chunk_id).ok_or(ChunkError::NotFound(chunk_id))
     }
+
+    /// Moves a chunk's assignment and its worker's wait `by` into the past, as if its worker had
+    /// been at it that long.
+    #[cfg(test)]
+    pub(crate) fn backdate(&mut self, chunk_id: usize, by: Duration) {
+        let chunk = &mut self.chunks[chunk_id];
+        chunk.assigned_at = chunk.assigned_at.and_then(|t| t.checked_sub(by));
+        let waiting = *chunk.waiting.lock();
+        *chunk.waiting.lock() = waiting.and_then(|t| t.checked_sub(by));
+    }
 }
 
 /// Exponential backoff with equal jitter: `[d/2, d]` for `d = base * 2^(attempt-1)`, capped.
@@ -477,6 +650,213 @@ mod tests {
         let mut manager = ChunkManager::new(4 * MB, 4 * MB).unwrap();
         manager.get_next_work(0, 0).unwrap();
         assert!(manager.steal_work(1, 0, MB).is_some());
+    }
+
+    /// A manager with one chunk of `size` whose worker wrote `written` bytes over the last `secs`.
+    fn one_victim(size: u64, written: u64, secs: u64) -> ChunkManager {
+        let mut manager = ChunkManager::new(size, size).unwrap();
+        manager.get_next_work(0, 0).unwrap().current_offset.store(written, Ordering::SeqCst);
+        manager.backdate(0, Duration::from_secs(secs));
+        manager
+    }
+
+    /// What a request to a mirror costs: `startup_secs` before its first byte, then `rate`.
+    fn cost(startup_secs: f64, rate: f64) -> StealTiming {
+        StealTiming { startup: Duration::from_secs_f64(startup_secs), rate }
+    }
+
+    fn timed(min_bytes: u64, mirrors: &[StealTiming]) -> StealRule<'_> {
+        StealRule { min_bytes, timing: Some(mirrors) }
+    }
+
+    #[test]
+    fn test_timed_steal_splits_where_both_sides_finish_together() {
+        // 90 MB left at 1 MB/s; the thief starts after 4 s, then moves 3 MB/s. Both finish after
+        // 25.5 s: the victim with 25.5 MB, the thief with 64.5 MB in 4 + 21.5 s.
+        let mut manager = one_victim(100 * MB, 10 * MB, 10);
+        let (victim, stolen) = manager.steal_work(1, 0, timed(64 * 1024, &[cost(4.0, 3.0 * MB as f64)])).unwrap();
+        let split = 10 * MB + (25.5 * MB as f64) as u64;
+        assert_eq!(victim, 0);
+        assert!(stolen.range.start.abs_diff(split) < MB, "split at {} instead of about {split}", stolen.range.start);
+        assert_eq!(stolen.range.end, 100 * MB - 1);
+        assert_eq!(manager.chunks()[0].end_offset.load(Ordering::SeqCst), stolen.range.start - 1);
+    }
+
+    #[test]
+    fn test_a_steal_whose_fair_share_is_under_the_floor_is_not_made() {
+        // A thief far slower than the victim would finish its share after the victim anyway:
+        // topping it up to the floor would only make the download end later.
+        let mut manager = one_victim(100 * MB, 10 * MB, 10);
+        assert!(manager.steal_work(1, 0, timed(MB, &[cost(0.1, 1000.0)])).is_none());
+        assert_eq!(manager.chunks()[0].end_offset.load(Ordering::SeqCst), 100 * MB - 1, "the victim keeps it all");
+
+        // 9 MB left at 1 MB/s, a thief as fast after 0.5 s: its fair share is 4.25 MB, so a
+        // user's 8 MB floor steals nothing rather than hand a new connection 8 MB.
+        let mut manager = one_victim(19 * MB, 10 * MB, 10);
+        let even = [cost(0.5, MB as f64)];
+        assert!(manager.steal_work(1, 0, timed(8 * MB, &even)).is_none());
+        let (_, stolen) = manager.steal_work(1, 0, timed(4 * MB, &even)).unwrap();
+        assert!(stolen.range.len().abs_diff(17 * MB / 4) < 64 * 1024, "{}", stolen.range.len());
+    }
+
+    #[test]
+    fn test_timed_steal_leaves_a_chunk_that_ends_within_two_startups() {
+        // 5 MB left at 1 MB/s: 5 s.
+        let mut manager = one_victim(15 * MB, 10 * MB, 10);
+        assert!(manager.steal_work(1, 0, timed(64 * 1024, &[cost(3.0, MB as f64)])).is_none(), "5 s is under two 3 s startups");
+        assert!(manager.steal_work(1, 0, timed(64 * 1024, &[cost(2.0, MB as f64)])).is_some(), "5 s is over two 2 s startups");
+    }
+
+    #[test]
+    fn test_a_chunk_without_a_rate_is_timed_by_what_a_request_to_its_mirror_costs() {
+        // Assigned to slow mirror 1 and still waiting for its answer: it is expected to start after
+        // 0.5 s at 0.5 MB/s. A thief on mirror 0 starts after 0.1 s at 2 MB/s. Both finish after
+        // 1.78 s: the victim with 0.64 MB, the thief with 3.36 MB.
+        let mut manager = ChunkManager::new(4 * MB, 4 * MB).unwrap();
+        manager.get_next_work(0, 1).unwrap();
+        let mirrors = [cost(0.1, 2.0 * MB as f64), cost(0.5, 0.5 * MB as f64)];
+        let (_, stolen) = manager.steal_work(1, 0, timed(64 * 1024, &mirrors)).unwrap();
+        let split = (0.64 * MB as f64) as u64;
+        assert!(stolen.range.start.abs_diff(split) < 64 * 1024, "split at {} instead of about {split}", stolen.range.start);
+    }
+
+    #[test]
+    fn test_thieves_in_a_row_split_the_straggler_not_each_others_fresh_chunks() {
+        // 18 MiB left at 2 MiB/s: 9 s. Seven idle workers arrive one after the other, each a new
+        // request that starts after 0.3 s and then moves 2 MiB/s, as the straggler does.
+        let mut manager = one_victim(20 * MB, 2 * MB, 1);
+        let mirror = [cost(0.3, 2.0 * MB as f64)];
+        let victims: Vec<usize> =
+            (1..=7).map(|thief| manager.steal_work(thief, 0, timed(64 * 1024, &mirror)).unwrap().0).collect();
+        // The second thief finds the straggler, not the first thief's chunk that has yet to start,
+        // still the one to finish last.
+        assert_eq!(victims[..2], [0, 0], "{victims:?}");
+
+        // All eight pieces finish together, as soon as eight connections can: after about 1.39 s.
+        let now = Instant::now();
+        let finish: Vec<f64> =
+            manager.chunks().iter().map(|c| eta_secs(c.remaining_bytes(), c.pace(now, Some(&mirror[0])))).collect();
+        assert_eq!(finish.len(), 8);
+        assert!(finish.iter().all(|&secs| (1.3..1.5).contains(&secs)), "{finish:?}");
+    }
+
+    const SILENT: Duration = Duration::from_secs(2);
+
+    #[test]
+    fn test_silent_chunk_is_taken_over_keeping_what_it_wrote() {
+        let mut manager = ChunkManager::new(4 * MB, 4 * MB).unwrap();
+        let silent = manager.get_next_work(0, 0).unwrap();
+        silent.current_offset.store(MB, Ordering::SeqCst);
+        manager.backdate(0, Duration::from_secs(3));
+
+        let taken = manager.take_over_silent(1, 2, |_| SILENT).unwrap();
+        assert!(silent.revoked.is_cancelled() && !taken.revoked.is_cancelled());
+        assert_eq!((taken.id, taken.range), (0, ByteRange::new(MB, 4 * MB - 1).unwrap()));
+        assert_eq!(taken.status, ChunkStatus::Assigned { worker_id: 1, mirror_id: 2 });
+        assert_eq!(taken.current_offset.load(Ordering::SeqCst), MB);
+        assert_eq!(manager.completed_ranges(), vec![ByteRange::new(0, MB - 1).unwrap()]);
+
+        // The revoked worker's late progress no longer counts: the rest is the thief's.
+        silent.current_offset.store(2 * MB, Ordering::SeqCst);
+        assert_eq!(manager.total_downloaded(), MB);
+        assert!(manager.take_over_silent(3, 0, |_| SILENT).is_none(), "the thief's attempt has just begun");
+
+        taken.current_offset.store(4 * MB, Ordering::SeqCst);
+        manager.mark_completed(taken.id).unwrap();
+        assert!(manager.is_all_completed());
+        assert_eq!(manager.completed_ranges(), vec![ByteRange::new(0, 4 * MB - 1).unwrap()]);
+    }
+
+    #[test]
+    fn test_silent_chunk_that_wrote_nothing_is_handed_over_whole() {
+        // Stuck before its answer arrived, at the very start of the file.
+        let mut manager = ChunkManager::new(2 * MB, MB).unwrap();
+        let silent = manager.get_next_work(0, 0).unwrap();
+        let other = manager.get_next_work(1, 0).unwrap();
+        manager.backdate(0, Duration::from_secs(3));
+
+        let taken = manager.take_over_silent(2, 0, |_| SILENT).unwrap();
+        assert!(silent.revoked.is_cancelled() && !other.revoked.is_cancelled());
+        assert_eq!((taken.id, taken.range), (0, ByteRange::new(0, MB - 1).unwrap()));
+        assert_eq!(manager.chunks().len(), 2, "nothing was written, so nothing is split off");
+        assert!(manager.completed_ranges().is_empty());
+
+        for chunk in [&taken, &other] {
+            chunk.current_offset.store(chunk.range.end + 1, Ordering::SeqCst);
+            manager.mark_completed(chunk.id).unwrap();
+        }
+        assert!(manager.is_all_completed());
+    }
+
+    #[test]
+    fn test_only_a_long_silence_is_taken_over() {
+        let mut manager = ChunkManager::new(3 * MB, MB).unwrap();
+        let quiet = manager.get_next_work(0, 0).unwrap();
+        let quieter = manager.get_next_work(1, 1).unwrap();
+        let working = manager.get_next_work(2, 0).unwrap();
+        manager.backdate(0, Duration::from_secs(3));
+        manager.backdate(1, Duration::from_secs(5));
+        manager.backdate(2, Duration::from_secs(9));
+        // Worker 2 is writing what arrived, not waiting for its server.
+        working.busy();
+
+        assert!(manager.take_over_silent(3, 0, |_| Duration::from_secs(6)).is_none());
+        // A mirror slow to answer gets longer: mirror 1's chunk is left alone.
+        let limit = |mirror: usize| if mirror == 1 { Duration::from_secs(10) } else { SILENT };
+        assert_eq!(manager.take_over_silent(3, 0, limit).unwrap().id, quiet.id);
+        assert!(!quieter.revoked.is_cancelled() && !working.revoked.is_cancelled());
+        // Of several silent chunks, the one silent longest goes first.
+        let mut manager = ChunkManager::new(2 * MB, MB).unwrap();
+        manager.get_next_work(0, 0).unwrap();
+        manager.get_next_work(1, 0).unwrap();
+        manager.backdate(0, Duration::from_secs(3));
+        manager.backdate(1, Duration::from_secs(4));
+        assert_eq!(manager.take_over_silent(2, 0, |_| SILENT).unwrap().id, 1);
+    }
+
+    #[test]
+    fn test_a_silent_chunk_that_finished_meanwhile_is_completed_not_handed_over() {
+        let mut manager = ChunkManager::new(MB, MB).unwrap();
+        let silent = manager.get_next_work(0, 0).unwrap();
+        manager.backdate(0, Duration::from_secs(3));
+        // The worker's last batch lands just as its chunk is picked to be taken over.
+        let lands = |_| {
+            silent.current_offset.store(MB, Ordering::SeqCst);
+            SILENT
+        };
+        assert!(manager.take_over_silent(1, 0, lands).is_none(), "nothing is left to hand over");
+        assert!(silent.revoked.is_cancelled());
+        assert!(manager.is_all_completed(), "the revoked worker will not complete it");
+    }
+
+    #[test]
+    fn test_an_answer_on_its_way_takes_the_chunk_it_brings() {
+        // The probe read [0, 100) of its answer for [0, 1 MB); a previous run left [3 MB, 4 MB).
+        let done = [ByteRange::new(0, 99).unwrap(), ByteRange::new(3 * MB, 4 * MB - 1).unwrap()];
+        let mut manager = ChunkManager::with_resumed_ranges(4 * MB, 2 * MB, &done).unwrap();
+        assert!(manager.assign_at(0, 0, 50, MB - 1).is_none(), "those bytes are on disk");
+        let live = manager.assign_at(0, 0, 100, MB - 1).unwrap();
+        assert_eq!((live.range, live.status.clone()), (ByteRange::new(100, MB - 1).unwrap(), ChunkStatus::Assigned { worker_id: 0, mirror_id: 0 }));
+        assert_eq!(live.end_offset.load(Ordering::SeqCst), MB - 1);
+        assert!(manager.assign_at(1, 0, 100, MB - 1).is_none(), "already taken");
+
+        // The rest of the chunk it was cut from goes to the other workers, and a thief can still
+        // split what the answer has left to bring.
+        let rest: Vec<Chunk> = std::iter::from_fn(|| manager.get_next_work(1, 0)).collect();
+        let mut ranges: Vec<ByteRange> = rest.iter().map(|c| c.range).collect();
+        ranges.sort_by_key(|r| r.start);
+        assert_eq!(ranges, [ByteRange::new(MB, 2 * MB + 99).unwrap(), ByteRange::new(2 * MB + 100, 3 * MB - 1).unwrap()]);
+        for chunk in &rest {
+            chunk.current_offset.store(chunk.range.end + 1, Ordering::SeqCst);
+            manager.mark_completed(chunk.id).unwrap();
+        }
+        let (victim, stolen) = manager.steal_work(2, 0, 64 * 1024).unwrap();
+        assert_eq!((victim, stolen.range.end), (live.id, MB - 1));
+        assert_eq!(live.end_offset.load(Ordering::SeqCst), stolen.range.start - 1);
+
+        // An answer that ends before the chunk would leaves the chunk whole when it does not.
+        let mut manager = ChunkManager::new(MB, 256 * 1024).unwrap();
+        assert_eq!(manager.assign_at(0, 0, 0, MB - 1).unwrap().range, ByteRange::new(0, 256 * 1024 - 1).unwrap());
     }
 
     #[test]

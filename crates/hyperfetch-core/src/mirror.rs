@@ -8,7 +8,11 @@ const MAX_BAD_RESPONSES: u32 = 2;
 #[derive(Debug, Clone)]
 pub struct Mirror {
     pub id: usize,
+    /// Where requests go: where the mirror's probe was redirected, if it was.
     pub url: Url,
+    /// The mirror's own URL while `url` is its redirect target. Requests fall back to it (and its
+    /// fresh redirects) once, when the target stops serving the file: signed targets expire.
+    pub fallback: Option<Url>,
     /// Validator this mirror issued (strong ETag, else Last-Modified), sent back as `If-Range`.
     pub if_range: Option<String>,
     pub speed_ewma: f64,    // bytes per second
@@ -28,6 +32,7 @@ impl Mirror {
         Self {
             id,
             url,
+            fallback: None,
             if_range: None,
             speed_ewma: 1_000_000.0, // Initial optimistic estimate: 1 MB/s
             ttfb_ewma_ms: 100.0,     // Initial optimistic TTFB: 100ms
@@ -72,6 +77,11 @@ impl Mirror {
         // EWMA alpha = 0.3
         const ALPHA: f64 = 0.3;
         self.speed_ewma = (ALPHA * instant_speed) + ((1.0 - ALPHA) * self.speed_ewma);
+    }
+
+    /// How long a request to this mirror waits for its answer, smoothed.
+    pub fn ttfb(&self) -> Duration {
+        Duration::try_from_secs_f64(self.ttfb_ewma_ms / 1000.0).unwrap_or_default()
     }
 
     pub fn record_ttfb(&mut self, ttfb: Duration) {
@@ -140,19 +150,31 @@ impl MirrorRacer {
         &self.mirrors
     }
 
+    /// Adds a mirror at `url` after the others, keeping their ids; returns it.
+    pub fn add(&mut self, url: Url) -> &mut Mirror {
+        let id = self.mirrors.len();
+        self.mirrors.push(Mirror::new(id, url));
+        &mut self.mirrors[id]
+    }
+
     pub fn mirrors_mut(&mut self) -> &mut [Mirror] {
         &mut self.mirrors
     }
 
-    /// Selects the best mirror that can take another connection right now, if any.
+    /// Selects the best mirror that can take another connection right now, if any. Equal scores
+    /// go to the mirror listed first: the user's or the resolver's preferred source.
     pub fn select_best_mirror(&self) -> Option<usize> {
+        self.ranked().first().copied()
+    }
+
+    /// Every mirror that can take another connection right now, best first; equal scores keep
+    /// the listed order.
+    pub fn ranked(&self) -> Vec<usize> {
         let now = Instant::now();
-        self.mirrors
-            .iter()
-            .map(|m| (m.id, m.score(now)))
-            .filter(|&(_, score)| score >= 0.0)
-            .max_by(|a, b| a.1.total_cmp(&b.1))
-            .map(|(id, _)| id)
+        let mut usable: Vec<(usize, f64)> =
+            self.mirrors.iter().map(|m| (m.id, m.score(now))).filter(|&(_, score)| score >= 0.0).collect();
+        usable.sort_by(|a, b| b.1.total_cmp(&a.1));
+        usable.into_iter().map(|(id, _)| id).collect()
     }
 
     pub fn get_mirror(&self, id: usize) -> Option<&Mirror> {
@@ -219,6 +241,34 @@ mod tests {
         // With every mirror unavailable there is no fallback to mirror 0.
         racer.get_mirror_mut(1).unwrap().cool_down(Instant::now() + Duration::from_secs(60));
         assert_eq!(racer.select_best_mirror(), None);
+    }
+
+    #[test]
+    fn test_equal_scores_go_to_the_first_mirror() {
+        let mut racer = MirrorRacer::new(
+            ["a", "b", "c"].iter().map(|h| Url::parse(&format!("https://{h}.example.com/f")).unwrap()).collect(),
+        );
+        assert_eq!(racer.select_best_mirror(), Some(0));
+        racer.acquire_mirror(0);
+        assert_eq!(racer.select_best_mirror(), Some(1), "a busier mirror scores lower");
+        assert_eq!(racer.ranked(), [1, 2, 0]);
+        racer.acquire_mirror(1);
+        racer.acquire_mirror(2);
+        assert_eq!(racer.select_best_mirror(), Some(0));
+        assert_eq!(racer.ranked(), [0, 1, 2]);
+        racer.get_mirror_mut(1).unwrap().is_active = false;
+        assert_eq!(racer.ranked(), [0, 2], "only mirrors that can take a connection");
+    }
+
+    #[test]
+    fn test_a_mirror_added_later_takes_the_next_id() {
+        let mut racer = racer();
+        racer.acquire_mirror(0);
+        let added = racer.add(Url::parse("https://late.example.com/file.iso").unwrap());
+        assert_eq!(added.id, 2);
+        added.ttfb_ewma_ms = 5.0;
+        assert_eq!(racer.select_best_mirror(), Some(2), "it is raced like the others");
+        assert_eq!(racer.get_mirror(0).unwrap().in_flight, 1, "the others keep their ids and state");
     }
 
     #[test]

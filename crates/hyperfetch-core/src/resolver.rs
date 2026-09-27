@@ -162,12 +162,26 @@ impl HostResolver for GoogleDriveResolver {
         matches!(url.host_str(), Some("drive.google.com" | "drive.usercontent.google.com"))
     }
 
-    async fn resolve(&self, client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
+    /// The direct download URL, sending nothing: whether Drive serves the file there shows in the
+    /// download's own probe (see `check_answer`).
+    async fn resolve(&self, _client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
         let file_id = extract_google_drive_id(url)
             .ok_or_else(|| ResolverError::Parse("Could not extract Google Drive file ID".to_string()))?;
-        let direct = google_drive_direct_url(&file_id)?;
-        ensure_file_response(client, &direct, "Google Drive").await?;
-        Ok(vec![direct])
+        Ok(vec![google_drive_direct_url(&file_id)?])
+    }
+}
+
+impl GoogleDriveResolver {
+    /// Fails if `url` is Drive's and its answer, with these headers, is a web page instead of the
+    /// file: HTML not sent as an attachment (a hosted .html file is one).
+    pub fn check_answer(url: &Url, headers: &HeaderMap) -> Result<(), ResolverError> {
+        if GoogleDriveResolver.can_handle(url) && html_type(headers) && !is_attachment(headers) {
+            return Err(ResolverError::NotFound(
+                "Google Drive served a web page instead of the file (it may be private, deleted, or over its download quota)"
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -296,20 +310,36 @@ impl HostResolver for HtmlVideoResolver {
             }
     }
 
-    async fn resolve(&self, client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
-        let resp = client.get(url.clone()).send().await?;
-        if !resp.status().is_success() || !is_html(&resp) {
-            return Ok(vec![url.clone()]);
-        }
-        let page_url = resp.url().clone();
-        let html = read_capped(resp, MAX_HTML_BYTES).await?;
-        match extract_html_video_source(&html, &page_url) {
-            Some(video) => {
-                tracing::info!("HtmlVideoResolver: {} plays {}", url, video);
-                Ok(vec![video])
-            }
-            None => Ok(vec![url.clone()]),
-        }
+    /// The URL itself, sending nothing: whether it is a web page, and which video it plays, shows
+    /// in its answer, which the download's own probe fetches (see `is_page`).
+    async fn resolve(&self, _client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
+        Ok(vec![url.clone()])
+    }
+}
+
+impl HtmlVideoResolver {
+    /// Whether the answer to `url`, with these headers, is a web page to look into for the video
+    /// it plays: HTML, for a URL this resolver would be handed (one that can be a page, and that
+    /// no resolver `SmartResolver` tries first takes).
+    pub fn is_page(url: &Url, headers: &HeaderMap) -> bool {
+        let taken = GoogleDriveResolver.can_handle(url)
+            || MediaFireResolver.can_handle(url)
+            || DropboxResolver.can_handle(url)
+            || SourceForgeResolver.can_handle(url)
+            || ArchiveOrgResolver.can_handle(url);
+        !taken && HtmlVideoResolver.can_handle(url) && html_type(headers)
+    }
+
+    /// Reads as much of a page's body as is looked into.
+    pub async fn read_page(resp: Response) -> Result<String, ResolverError> {
+        read_capped(resp, MAX_HTML_BYTES).await
+    }
+
+    /// The video file the page `html`, from `page_url`, plays, if one is found.
+    pub fn video_in(html: &str, page_url: &Url) -> Option<Url> {
+        let video = extract_html_video_source(html, page_url)?;
+        tracing::info!("HtmlVideoResolver: {} plays {}", page_url, video);
+        Some(video)
     }
 }
 
@@ -434,13 +464,15 @@ pub fn parse_netscape_cookies(content: &str, jar: &reqwest::cookie::Jar) {
 }
 
 fn is_html(resp: &Response) -> bool {
-    resp.headers()
-        .get(CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|ct| {
-            let ct = ct.to_ascii_lowercase();
-            ct.contains("text/html") || ct.contains("application/xhtml")
-        })
+    html_type(resp.headers())
+}
+
+/// Whether headers say the body is HTML.
+fn html_type(headers: &HeaderMap) -> bool {
+    headers.get(CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|ct| {
+        let ct = ct.to_ascii_lowercase();
+        ct.contains("text/html") || ct.contains("application/xhtml")
+    })
 }
 
 /// Reads at most `cap` bytes of the body; the rest is never downloaded.
@@ -453,27 +485,12 @@ async fn read_capped(mut resp: Response, cap: usize) -> Result<String, ResolverE
     Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
-fn is_attachment(resp: &Response) -> bool {
-    resp.headers()
+/// Whether headers say the body is sent as an attachment.
+fn is_attachment(headers: &HeaderMap) -> bool {
+    headers
         .get(CONTENT_DISPOSITION)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|cd| cd.trim_start().to_ascii_lowercase().starts_with("attachment"))
-}
-
-/// Fails unless `url` answers with a successful response that is the file: not HTML, or HTML
-/// sent as an attachment (a hosted .html file rather than a warning page). The body is never read.
-async fn ensure_file_response(client: &Client, url: &Url, host: &str) -> Result<(), ResolverError> {
-    let resp = client.get(url.clone()).send().await?;
-    if !resp.status().is_success() {
-        return Err(ResolverError::NotFound(format!("{} returned HTTP {}", host, resp.status())));
-    }
-    if is_html(&resp) && !is_attachment(&resp) {
-        return Err(ResolverError::NotFound(format!(
-            "{} served a web page instead of the file (it may be private, deleted, or over its download quota)",
-            host
-        )));
-    }
-    Ok(())
 }
 
 /// Lower-cased extension of the last path segment, if it has one.
@@ -717,20 +734,40 @@ mod tests {
         assert!(!HtmlVideoResolver.can_handle(&Url::parse("ftp://example.com/watch").unwrap()));
     }
 
-    #[tokio::test]
-    async fn test_smart_resolver_scrapes_html_page() {
-        let html = br#"<video controls><source src="/media/clip.mp4" type="video/mp4"></video>"#.to_vec();
-        let page = serve_once("text/html; charset=utf-8", html).await;
-        let resolved = SmartResolver::resolve(&local_client(), &page).await.unwrap();
-        assert_eq!(resolved, vec![page.join("/media/clip.mp4").unwrap()]);
+    /// Whether anything connects to `listener` within a moment.
+    async fn contacted(listener: &tokio::net::TcpListener) -> bool {
+        tokio::time::timeout(Duration::from_millis(200), listener.accept()).await.is_ok()
     }
 
     #[tokio::test]
-    async fn test_html_video_resolver_ignores_non_html() {
-        let body = br#"<video src="/media/clip.mp4"></video>"#.to_vec();
-        let page = serve_once("application/octet-stream", body).await;
-        let resolved = HtmlVideoResolver.resolve(&local_client(), &page).await.unwrap();
+    async fn test_smart_resolver_leaves_pages_to_the_probe() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let page = Url::parse(&format!("http://{}/watch/page", listener.local_addr().unwrap())).unwrap();
+        let resolved = SmartResolver::resolve(&local_client(), &page).await.unwrap();
         assert_eq!(resolved, vec![page]);
+        assert!(!contacted(&listener).await, "the page was fetched before the download's probe");
+    }
+
+    fn headers(pairs: &[(reqwest::header::HeaderName, &'static str)]) -> HeaderMap {
+        pairs.iter().map(|(name, value)| (name.clone(), HeaderValue::from_static(value))).collect()
+    }
+
+    #[test]
+    fn test_only_html_answers_to_urls_left_to_the_video_resolver_are_pages() {
+        let html = headers(&[(CONTENT_TYPE, "text/html; charset=utf-8")]);
+        let page = Url::parse("https://example.com/watch/video").unwrap();
+        assert!(HtmlVideoResolver::is_page(&page, &html));
+        assert!(HtmlVideoResolver::is_page(&Url::parse("https://example.com/view.php?id=4").unwrap(), &html));
+        assert!(!HtmlVideoResolver::is_page(&page, &headers(&[(CONTENT_TYPE, "application/octet-stream")])));
+        assert!(!HtmlVideoResolver::is_page(&page, &HeaderMap::new()));
+        for file_or_taken in [
+            "https://example.com/dl/video.mp4",
+            "https://drive.usercontent.google.com/download?id=abc&export=download&confirm=t",
+            "https://www.mediafire.com/file/abc/name",
+            "https://www.dropbox.com/s/abc/name?dl=1",
+        ] {
+            assert!(!HtmlVideoResolver::is_page(&Url::parse(file_or_taken).unwrap(), &html), "{file_or_taken}");
+        }
     }
 
     #[tokio::test]
@@ -776,17 +813,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ensure_file_response_rejects_html() {
-        let client = local_client();
-        let page = serve_once("text/html", b"<html>Quota exceeded</html>".to_vec()).await;
-        assert!(matches!(ensure_file_response(&client, &page, "Google Drive").await, Err(ResolverError::NotFound(_))));
+    async fn test_google_drive_resolver_sends_nothing() {
+        // Every request would go through this proxy.
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = Client::builder()
+            .proxy(reqwest::Proxy::all(format!("http://{}", proxy.local_addr().unwrap())).unwrap())
+            .build()
+            .unwrap();
+        let shared = Url::parse("https://drive.google.com/file/d/1BxyzABC_12345/view?usp=sharing").unwrap();
+        let resolved = SmartResolver::resolve(&client, &shared).await.unwrap();
+        assert_eq!(resolved, vec![google_drive_direct_url("1BxyzABC_12345").unwrap()]);
+        assert!(!contacted(&proxy).await, "Drive was asked before the download's probe");
+    }
 
-        let file = serve_once("application/octet-stream", vec![0u8; 64]).await;
-        assert!(ensure_file_response(&client, &file, "Google Drive").await.is_ok());
+    #[test]
+    fn test_google_drive_web_page_answers_are_rejected() {
+        let drive = google_drive_direct_url("1BxyzABC_12345").unwrap();
+        let page = headers(&[(CONTENT_TYPE, "text/html; charset=utf-8")]);
+        let err = GoogleDriveResolver::check_answer(&drive, &page).unwrap_err();
+        assert!(err.to_string().contains("Google Drive served a web page instead of the file"), "{err}");
 
+        assert!(GoogleDriveResolver::check_answer(&drive, &headers(&[(CONTENT_TYPE, "application/octet-stream")])).is_ok());
         // A hosted .html file is served as an attachment; the warning/quota page is not.
-        let html_file = serve_once("text/html\r\nContent-Disposition: attachment; filename=\"page.html\"", b"<html></html>".to_vec()).await;
-        assert!(ensure_file_response(&client, &html_file, "Google Drive").await.is_ok());
+        let html_file = headers(&[(CONTENT_TYPE, "text/html"), (CONTENT_DISPOSITION, "attachment; filename=\"page.html\"")]);
+        assert!(GoogleDriveResolver::check_answer(&drive, &html_file).is_ok());
+        // Only Drive's answers are judged so.
+        assert!(GoogleDriveResolver::check_answer(&Url::parse("https://example.com/download").unwrap(), &page).is_ok());
     }
 
     #[test]
