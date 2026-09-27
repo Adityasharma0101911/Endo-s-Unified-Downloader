@@ -950,10 +950,12 @@ impl eframe::App for App {
     }
 }
 
-/// Engine options for `task` with `settings`, the per-download checksum (else the task's own)
-/// and Authorization header (never for the hosts a document lists). A task that names its file
-/// is saved as that (sub)path of the save folder.
+/// Engine options for `task` with `settings`, the per-download checksum (else the task's own;
+/// never for a document downloaded itself, as it is for the file the document lists) and
+/// Authorization header (never for the hosts a document lists). A task that names its file is
+/// saved as that (sub)path of the save folder.
 fn task_options(settings: &Settings, task: &Task, checksum: &str, auth: &str) -> Result<DownloadOptions, String> {
+    let checksum = if task.document_itself { "" } else { checksum };
     let checksum = match checksum.trim() {
         "" => task.checksum.as_deref().unwrap_or_default(),
         typed => typed,
@@ -968,7 +970,8 @@ fn task_options(settings: &Settings, task: &Task, checksum: &str, auth: &str) ->
 
 /// Engine options for the downloads a .metalink, .meta4 or .torrent lists, each saved under the
 /// save folder joined with its (sub)path; an error if one of them is refused. The form's checksum
-/// applies to a document of one file; its Authorization header `auth` is for the hosts the user
+/// applies to the file a document of one file lists, not to a document ingest leaves to the
+/// engine to download itself; its Authorization header `auth` is for the hosts the user
 /// typed (the document's own, when ingest leaves the link to the engine), never for those a
 /// document lists.
 fn document_options(settings: &Settings, tasks: &[Task], checksum: &str, auth: &str) -> Result<Vec<DownloadOptions>, String> {
@@ -1510,10 +1513,12 @@ mod tests {
         assert!(ids.iter().all(|&id| queue.get_item(id).is_some_and(|item| item.names_file && item.target_path.is_none())));
         assert!(ids.iter().all(|&id| queue.get_item(id).is_some_and(|item| item.options.auth_header.is_none())), "a listed host got it");
         // A document its host would not hand over without a login is left to the engine as the
-        // link typed, which the header is for.
-        let link = Task { urls: vec![Url::parse("https://tracker.example/dl/1.torrent").unwrap()], ..Task::default() };
-        let [id] = queue_listed(&mut queue, &settings, vec![link], "", "Bearer t").unwrap()[..] else { panic!("one download") };
-        assert_eq!(queue.get_item(id).and_then(|item| item.options.auth_header.as_deref()), Some("Bearer t"));
+        // link typed, which the header is for; the form's checksum is for the file it lists.
+        let link = Task { urls: vec![Url::parse("https://tracker.example/dl/1.torrent").unwrap()], document_itself: true, ..Task::default() };
+        let typed = format!("sha256:{}", "cc".repeat(32));
+        let [id] = queue_listed(&mut queue, &settings, vec![link], &typed, "Bearer t").unwrap()[..] else { panic!("one download") };
+        let options = queue.get_item(id).map(|item| (item.options.auth_header.clone(), item.options.expected_checksum.clone()));
+        assert_eq!(options, Some((Some("Bearer t".to_string()), None)));
         queue.remove_item(id);
         let refused = Task { checksum: Some("crc32:1".to_string()), ..file(3) };
         assert!(queue_listed(&mut queue, &settings, vec![file(4), refused], "", "").is_err());

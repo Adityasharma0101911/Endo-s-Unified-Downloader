@@ -152,7 +152,8 @@ fn job(args: &Args, connections: u64, dir: &Path, task: Task) -> Job {
     let media = args.media_preset.is_some() || task.urls.iter().any(hyperfetch_core::media::is_supported_media_site);
     let options = DownloadOptions {
         output_path: Some(output),
-        expected_checksum: args.checksum.clone().or(task.checksum),
+        // --checksum is for the file a document lists, not for the document downloaded itself.
+        expected_checksum: args.checksum.clone().filter(|_| !task.document_itself).or(task.checksum),
         cookies_path: args.load_cookies.clone(),
         // --header is for the hosts the user named, not those a .metalink or .torrent lists.
         auth_header: args.auth_header.clone().filter(|_| !task.from_document),
@@ -695,6 +696,19 @@ mod tests {
         let listed = Task { urls, from_document: true, ..Default::default() };
         assert_eq!(job(&args, 4, Path::new("d"), typed).options.auth_header.as_deref(), Some("Bearer ghp_x"));
         assert_eq!(job(&args, 4, Path::new("d"), listed).options.auth_header, None);
+    }
+
+    /// --checksum is for the file a document lists: the document downloaded itself (a torrent
+    /// without web seeds) is not checked against it.
+    #[test]
+    fn the_checksum_skips_a_document_downloaded_itself() {
+        let checksum = format!("sha256:{}", "ab".repeat(32));
+        let args = parse(&["--checksum", &checksum, "https://a.example/x.torrent"]);
+        let urls = vec![Url::parse("https://a.example/x.torrent").unwrap()];
+        let file = Task { urls: urls.clone(), ..Default::default() };
+        let itself = Task { urls, document_itself: true, ..Default::default() };
+        assert_eq!(job(&args, 4, Path::new("d"), file).options.expected_checksum, Some(checksum));
+        assert_eq!(job(&args, 4, Path::new("d"), itself).options.expected_checksum, None);
     }
 
     #[test]

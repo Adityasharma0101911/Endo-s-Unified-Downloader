@@ -3182,15 +3182,23 @@ async fn test_a_file_downloaded_through_a_followed_link_is_repaired_from_its_his
 }
 
 /// A torrent with a web seed, as GitHub's raw link and Dropbox's `dl=1` serve it; their file page
-/// and share page are web pages, a private tracker asks for a login, and another host answers
-/// with a page.
+/// and share page are web pages, a private tracker asks for a login, GitHub's raw link into a
+/// private repository is not found, and another host answers with a page. That torrent and a
+/// metalink of the same file are also served labelled web pages, as PHP labels what it sends,
+/// and a torrent without web seeds is shared on Dropbox.
 fn hosted_documents(method: &str, target: &str) -> Vec<u8> {
     let torrent = b"d8:url-list20:https://s.example/d/4:infod6:lengthi3e4:name5:a.bin12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaaee";
+    let metalink = br#"<metalink xmlns="urn:ietf:params:xml:ns:metalink"><file name="a.bin"><url>https://s.example/d/a.bin</url></file></metalink>"#;
+    let no_seeds = b"d4:infod6:lengthi3e4:name5:a.bin12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaaee";
     match target {
         "http://github.com/o/r/raw/main/fixtures/pack.torrent" | "http://www.dropbox.com/s/k3y/pack.torrent?dl=1" => {
             response(method, "200 OK", "Content-Type: application/x-bittorrent\r\n", torrent)
         }
+        "http://www.dropbox.com/s/k3y/bare.torrent?dl=1" => response(method, "200 OK", "Content-Type: application/x-bittorrent\r\n", no_seeds),
+        "http://mirrors.invalid/pack.torrent" => response(method, "200 OK", "Content-Type: text/html; charset=UTF-8\r\n", torrent),
+        "http://mirrors.invalid/list.meta4" => response(method, "200 OK", "Content-Type: text/html; charset=UTF-8\r\n", metalink),
         "http://tracker.invalid/dl/1/pack.torrent" => response(method, "403 Forbidden", "Content-Type: text/html\r\n", b"<title>Log in</title>"),
+        "http://github.com/o/private/raw/main/pack.torrent" => response(method, "404 Not Found", "Content-Type: text/plain\r\n", b"404: Not Found"),
         _ => response(method, "200 OK", "Content-Type: text/html; charset=utf-8\r\n", b"<!doctype html><title>pack.torrent</title>"),
     }
 }
@@ -3201,15 +3209,25 @@ async fn test_a_document_on_a_file_page_or_share_is_read_and_one_behind_a_login_
     let _history = setup().await;
     let (proxy, _) = serve_proxy(hosted_documents).await;
     let http = descriptor_client(Some(&proxy)).unwrap();
-    for page in ["http://github.com/o/r/blob/main/fixtures/pack.torrent", "http://www.dropbox.com/s/k3y/pack.torrent?dl=0"] {
+    let pages = ["http://github.com/o/r/blob/main/fixtures/pack.torrent", "http://www.dropbox.com/s/k3y/pack.torrent?dl=0"];
+    // Read, however its host labels it, when it is no web page.
+    for page in pages.into_iter().chain(["http://mirrors.invalid/pack.torrent", "http://mirrors.invalid/list.meta4"]) {
         let tasks = ingest(&[page], &http).await.expect(page);
         let listed: Vec<_> = tasks.iter().map(|t| (t.name.clone().unwrap(), t.urls[0].to_string())).collect();
         assert_eq!(listed, [(PathBuf::from("a.bin"), "https://s.example/d/a.bin".to_string())], "{page}");
     }
-    // The link itself, for the engine to download with the user's cookies and Authorization.
-    for link in ["http://tracker.invalid/dl/1/pack.torrent", "http://files.invalid/pack.torrent", "http://files.invalid/list.meta4"] {
+    // The link itself, as typed (not where its resolver led, which the user's Authorization is not
+    // for), for the engine to download with the user's cookies and Authorization and to report
+    // what its host answers.
+    for link in [
+        "http://tracker.invalid/dl/1/pack.torrent",
+        "http://github.com/o/private/blob/main/pack.torrent",
+        "http://files.invalid/pack.torrent",
+        "http://files.invalid/list.meta4",
+        "http://www.dropbox.com/s/k3y/bare.torrent?dl=0",
+    ] {
         let tasks = ingest(&[link], &http).await.expect(link);
-        assert_eq!(tasks, [Task { urls: vec![Url::parse(link).unwrap()], ..Task::default() }], "{link}");
+        assert_eq!(tasks, [Task { urls: vec![Url::parse(link).unwrap()], document_itself: true, ..Task::default() }], "{link}");
     }
     // Which saves no page in the document's place.
     let temp = tempdir().unwrap();
