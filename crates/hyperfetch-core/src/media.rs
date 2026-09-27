@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use futures_util::future::BoxFuture;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::Sender;
@@ -1620,22 +1620,33 @@ async fn run_ytdlp(
 }
 
 /// Runs a [`tree_command`] to the end and returns its standard output, or the errors it printed
-/// when it fails. Cancelling kills its process tree.
+/// when it fails. Cancelling kills its process tree and waits for it to exit, so nothing it had
+/// open (ffmpeg's output) is held any more once this returns.
 async fn run_to_end(mut cmd: Command, cancel_flag: Option<Arc<AtomicBool>>) -> Result<Vec<u8>, String> {
     let program = Path::new(cmd.as_std().get_program()).display().to_string();
-    let child = cmd.spawn().map_err(|e| format!("Failed to spawn {program}: {e}"))?;
+    let mut child = cmd.spawn().map_err(|e| format!("Failed to spawn {program}: {e}"))?;
     let mut tree = ProcessTree::attach(&child);
-    let output = tokio::select! {
+    let (Some(mut out), Some(mut err)) = (child.stdout.take(), child.stderr.take()) else {
+        tree.kill_and_reap(&mut child).await;
+        return Err(format!("Failed to capture the output of {program}"));
+    };
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    let status = tokio::select! {
         biased;
-        output = child.wait_with_output() => output.map_err(|e| format!("Failed to wait on {program}: {e}"))?,
-        // Dropping the child and its tree kills them.
-        _ = wait_cancelled(cancel_flag) => return Err(CANCELLED.to_string()),
+        // Both pipes drain while it runs, so it never blocks on a full one.
+        ended = async { tokio::try_join!(child.wait(), out.read_to_end(&mut stdout), err.read_to_end(&mut stderr)) } => {
+            ended.map_err(|e| format!("Failed to wait on {program}: {e}"))?.0
+        }
+        _ = wait_cancelled(cancel_flag) => {
+            tree.kill_and_reap(&mut child).await;
+            return Err(CANCELLED.to_string());
+        }
     };
     tree.disarm();
-    if output.status.success() {
-        return Ok(output.stdout);
+    if status.success() {
+        return Ok(stdout);
     }
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = String::from_utf8_lossy(&stderr);
     let lines: Vec<&str> = stderr.lines().filter(|l| !l.trim().is_empty()).collect();
     let errors: Vec<&str> = lines.iter().copied().filter(|l| l.starts_with("ERROR:")).collect();
     // As a yt-dlp download reports them (see `OutputState::failure_message`).
@@ -1643,7 +1654,7 @@ async fn run_to_end(mut cmd: Command, cancel_flag: Option<Arc<AtomicBool>>) -> R
         return Err(errors.join("\n"));
     }
     let tail = &lines[lines.len().saturating_sub(STDERR_TAIL_LINES)..];
-    Err(format!("{program} exited with {}: {}", output.status, tail.join("\n")))
+    Err(format!("{program} exited with {status}: {}", tail.join("\n")))
 }
 
 /// One stream of a media download, which the engine fetches itself (see [`fast_download`]).
@@ -2110,11 +2121,24 @@ fn stream_of(output: &Path, name: &str) -> Option<String> {
         .then(|| file.to_string())
 }
 
+/// Where ffmpeg joins the streams of `output` before the result is moved there.
+fn merge_temp(output: &Path) -> PathBuf {
+    let ext = output.extension().map_or_else(String::new, |e| format!(".{}", e.to_string_lossy()));
+    let stem = output.file_stem().map_or_else(String::new, |s| s.to_string_lossy().into_owned());
+    output.with_file_name(format!("{stem}.hfmerge{ext}"))
+}
+
 /// Deletes every stream of `output` next to it (see [`stream_of`]), finished or partial, with the
-/// history entries the engine made for them, except what a download holds. The caller holds the
-/// claim on `output`, so no job is downloading these streams for it or joining them. Blocking.
+/// history entries the engine made for them, except what a download holds, and what a merge a
+/// crash cut short left (see [`merge_temp`]). The caller holds the claim on `output`, so no job is
+/// downloading these streams for it or joining them. Blocking.
 fn remove_streams_of(output: &Path) {
     let Some(dir) = output.parent() else { return };
+    let temp = merge_temp(output);
+    match std::fs::remove_file(&temp) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => tracing::warn!("Failed to delete {}: {e}", temp.display()),
+        _ => {}
+    }
     let stream_name = |path: &Path| stream_of(output, path.file_name()?.to_str()?);
     let mut streams: Vec<String> =
         std::fs::read_dir(dir).into_iter().flatten().flatten().filter_map(|entry| stream_name(&entry.path())).collect();
@@ -2271,9 +2295,7 @@ async fn joined(
         return rename(file.clone()).await;
     }
     let ffmpeg = ffmpeg.ok_or("ffmpeg is missing")?;
-    let ext = output.extension().map_or_else(String::new, |e| format!(".{}", e.to_string_lossy()));
-    let stem = output.file_stem().map_or_else(String::new, |s| s.to_string_lossy().into_owned());
-    let temp = output.with_file_name(format!("{stem}.hfmerge{ext}"));
+    let temp = merge_temp(output);
     let mut cmd = tree_command(ffmpeg);
     cmd.args(ffmpeg_args(&plan.streams, files, &temp));
     let made = match run_to_end(cmd, cancel_flag.clone()).await {
@@ -3148,8 +3170,8 @@ mod tests {
         (child, tree, first.trim().parse().unwrap())
     }
 
-    /// Wait up to 10 s for `pid` to exit.
-    fn process_exits(pid: u32) -> bool {
+    /// Whether `pid` exits (and is reaped) within `within`.
+    fn process_exits(pid: u32, within: Duration) -> bool {
         #[cfg(windows)]
         {
             use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
@@ -3159,20 +3181,23 @@ mod tests {
                 if handle.is_null() {
                     return true;
                 }
-                let exited = WaitForSingleObject(handle, 10_000) == WAIT_OBJECT_0;
+                let exited = WaitForSingleObject(handle, u32::try_from(within.as_millis()).unwrap_or(u32::MAX)) == WAIT_OBJECT_0;
                 CloseHandle(handle);
                 exited
             }
         }
         #[cfg(unix)]
         {
-            for _ in 0..100 {
+            let deadline = std::time::Instant::now() + within;
+            loop {
                 if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
                     return true;
                 }
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
                 std::thread::sleep(Duration::from_millis(100));
             }
-            false
         }
     }
 
@@ -3180,14 +3205,48 @@ mod tests {
     async fn cancel_kills_whole_process_tree() {
         let (mut child, mut tree, grandchild) = spawn_tree_with_grandchild().await;
         tree.kill_and_reap(&mut child).await;
-        assert!(process_exits(grandchild), "grandchild {grandchild} survived cancel");
+        assert!(process_exits(grandchild, Duration::from_secs(10)), "grandchild {grandchild} survived cancel");
     }
 
     #[tokio::test]
     async fn dropping_the_download_kills_whole_process_tree() {
         let (child, tree, grandchild) = spawn_tree_with_grandchild().await;
         drop((child, tree));
-        assert!(process_exits(grandchild), "grandchild {grandchild} survived drop");
+        assert!(process_exits(grandchild, Duration::from_secs(10)), "grandchild {grandchild} survived drop");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_run_has_ended_when_it_returns() {
+        // Standing in for ffmpeg writing a merge: whatever it holds open must be free to delete
+        // once the cancelled run returns.
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        #[cfg(windows)]
+        let cmd = {
+            let mut cmd = tree_command(Path::new("powershell"));
+            cmd.args(["-NoProfile", "-Command", &format!("$PID | Out-File -Encoding ascii '{}'; Start-Sleep 120", pid_file.display())]);
+            cmd
+        };
+        #[cfg(unix)]
+        let cmd = {
+            let mut cmd = tree_command(Path::new("sh"));
+            cmd.args(["-c", &format!("echo $$ > '{}'; exec sleep 120", pid_file.display())]);
+            cmd
+        };
+        let flag = Arc::new(AtomicBool::new(false));
+        let run = tokio::spawn(run_to_end(cmd, Some(Arc::clone(&flag))));
+        let started = async {
+            loop {
+                if let Some(pid) = std::fs::read_to_string(&pid_file).ok().and_then(|s| s.trim().parse::<u32>().ok()) {
+                    return pid;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        let pid = tokio::time::timeout(Duration::from_secs(30), started).await.expect("the command started");
+        flag.store(true, Ordering::Relaxed);
+        assert_eq!(run.await.unwrap(), Err(CANCELLED.to_string()));
+        assert!(process_exits(pid, Duration::ZERO), "{pid} was still running when the cancelled run returned");
     }
 
     /// End-to-end against the real site; needs yt-dlp, ffmpeg and network access.
@@ -3611,9 +3670,16 @@ mod tests {
         let output = dir.path().join("clip.mp4");
         std::fs::write(&output, b"done").unwrap();
         // What earlier attempts left: a partial stream of another format, a finished stream the
-        // engine recorded in history and one under a numbered name, an HLS stream's state, and
-        // the history entry of a stream already deleted.
-        for name in ["clip.f136.hf.mp4.part", "clip.f136.hf.mp4.part.hfstate", "clip.f140.hf.m4a", "clip.f137.hf (1).mp4", "clip.fhls-1.hf.mp4.part.hlsstate"] {
+        // engine recorded in history and one under a numbered name, an HLS stream's state, the
+        // merge a crash cut short, and the history entry of a stream already deleted.
+        for name in [
+            "clip.f136.hf.mp4.part",
+            "clip.f136.hf.mp4.part.hfstate",
+            "clip.f140.hf.m4a",
+            "clip.f137.hf (1).mp4",
+            "clip.fhls-1.hf.mp4.part.hlsstate",
+            "clip.hfmerge.mp4",
+        ] {
             std::fs::write(dir.path().join(name), b"x").unwrap();
         }
         let mut history = crate::history::DownloadHistoryManager::load();
