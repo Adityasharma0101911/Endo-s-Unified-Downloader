@@ -412,10 +412,16 @@ fn google_drive_direct_url(file_id: &str) -> Result<Url, ResolverError> {
 /// Google Docs Resolver (Turns a Docs, Sheets or Slides link into the document exported as a file)
 pub struct GoogleDocsResolver;
 
+/// The pages of a document the Docs, Sheets and Slides apps show (after `/d/{id}/`), which stand
+/// for the document itself.
+const GOOGLE_DOCS_VIEWS: &[&str] = &["edit", "view", "preview", "htmlview", "mobilebasic", "present", "embed", "copy", "comment"];
+
 /// The export of the document `url` links to, rewritten without a request, as Google's own
 /// File > Download does it: a document as .docx, a spreadsheet as .xlsx, or as .csv of the one
-/// sheet the link names (`gid`), a presentation as .pptx. An export link is kept in the format
-/// it asks for. Exports are made on the fly: one connection, no known size.
+/// sheet the link names (`gid`), a presentation as .pptx; the account it names (`authuser`) is
+/// kept. An export link is kept in the format it asks for. Other links on a document (gviz
+/// queries, /pub copies) already give what they are for, so they are left alone. Exports are
+/// made on the fly: one connection, no known size.
 fn google_docs_export(url: &Url) -> Option<Url> {
     if url.host_str()? != "docs.google.com" {
         return None;
@@ -440,15 +446,25 @@ fn google_docs_export(url: &Url) -> Option<Url> {
     }
     let mut export = url.clone();
     export.set_fragment(None);
-    if rest.first() == Some(&"export") {
-        return Some(export);
+    match rest {
+        ["export", ..] => return Some(export),
+        [] | [""] => {}
+        [view] | [view, ""] if GOOGLE_DOCS_VIEWS.contains(view) => {}
+        _ => return None,
     }
     export.set_path(&format!("/{}{}/d/{}/export", kind, account, id));
-    let query = match sheet_gid(url).filter(|_| kind == "spreadsheets") {
-        Some(gid) => format!("format=csv&gid={}", gid),
-        None => format!("format={}", format),
-    };
-    export.set_query(Some(&query));
+    let authuser = url.query_pairs().find(|(k, _)| k == "authuser").map(|(_, v)| v.into_owned());
+    {
+        let mut query = export.query_pairs_mut();
+        query.clear();
+        match sheet_gid(url).filter(|_| kind == "spreadsheets") {
+            Some(gid) => query.append_pair("format", "csv").append_pair("gid", &gid),
+            None => query.append_pair("format", format),
+        };
+        if let Some(user) = authuser {
+            query.append_pair("authuser", &user);
+        }
+    }
     Some(export)
 }
 
@@ -1380,6 +1396,19 @@ mod tests {
             (format!("spreadsheets/d/{sheet}/htmlview#gid=abc"), format!("spreadsheets/d/{sheet}/export?format=xlsx")),
             (format!("presentation/d/{deck}/edit#slide=id.p"), format!("presentation/d/{deck}/export?format=pptx")),
             (format!("presentation/u/1/d/{deck}/view"), format!("presentation/u/1/d/{deck}/export?format=pptx")),
+            (format!("presentation/d/{deck}/present?slide=id.p"), format!("presentation/d/{deck}/export?format=pptx")),
+            (format!("presentation/d/{deck}/embed?start=false"), format!("presentation/d/{deck}/export?format=pptx")),
+            (format!("document/d/{doc}/mobilebasic"), format!("document/d/{doc}/export?format=docx")),
+            (format!("document/d/{doc}/preview"), format!("document/d/{doc}/export?format=docx")),
+            (format!("document/d/{doc}/copy"), format!("document/d/{doc}/export?format=docx")),
+            (format!("document/d/{doc}/edit/"), format!("document/d/{doc}/export?format=docx")),
+            (format!("document/d/{doc}/"), format!("document/d/{doc}/export?format=docx")),
+            // The signed-in account the link names is kept (the export drops it when there is none).
+            (format!("document/d/{doc}/edit?usp=sharing&authuser=1"), format!("document/d/{doc}/export?format=docx&authuser=1")),
+            (
+                format!("spreadsheets/d/{sheet}/edit?authuser=me%40example.com#gid=7"),
+                format!("spreadsheets/d/{sheet}/export?format=csv&gid=7&authuser=me%40example.com"),
+            ),
             // An export in a format of the user's choosing is kept; a gid means nothing to a document.
             (format!("document/d/{doc}/export?format=pdf#top"), format!("document/d/{doc}/export?format=pdf")),
             (format!("presentation/d/{deck}/export/pdf"), format!("presentation/d/{deck}/export/pdf")),
@@ -1397,8 +1426,32 @@ mod tests {
             "https://docs.google.com/document/u/0/",
             "https://docs.google.com/spreadsheets/d/",
             "https://example.com/document/d/abc/edit",
+            // Links that already give what they are for: a gviz query (a CSV attachment, or JSON or
+            // HTML for scripts), and older /pub copies published to the web.
+            "https://docs.google.com/spreadsheets/d/abc/gviz/tq?tqx=out:csv&sheet=Class%20Data",
+            "https://docs.google.com/spreadsheets/u/1/d/abc/gviz/tq?tqx=out:json&gid=0",
+            "https://docs.google.com/spreadsheets/d/abc/pub?output=csv",
+            "https://docs.google.com/spreadsheets/d/abc/pubhtml",
+            "https://docs.google.com/document/d/abc/pub",
+            "https://docs.google.com/presentation/d/abc/pub?start=false",
+            "https://docs.google.com/document/d/abc/template/preview",
+            "https://docs.google.com/document/d/abc/edit/extra",
         ] {
-            assert!(!GoogleDocsResolver.can_handle(&Url::parse(page).unwrap()), "{page}");
+            let link = Url::parse(page).unwrap();
+            assert!(!GoogleDocsResolver.can_handle(&link), "{page}");
+            assert!(!SmartResolver::handles(&link), "{page}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_google_docs_links_that_give_a_file_are_downloaded_as_they_are() {
+        let link = Url::parse("https://docs.google.com/spreadsheets/d/abc/gviz/tq?tqx=out:csv&sheet=Sheet1").unwrap();
+        assert_eq!(SmartResolver::resolve(&Client::new(), &link).await.unwrap(), vec![link.clone()]);
+        // Their HTML answers (a gviz table for scripts, a copy published to the web) are what they
+        // are for, not an export's sign-in page.
+        let html = headers(&[(CONTENT_TYPE, "text/html; charset=utf-8")]);
+        for page in ["https://docs.google.com/spreadsheets/d/abc/gviz/tq?tqx=out:html", "https://docs.google.com/document/d/abc/pub"] {
+            assert_eq!(refusal(page, None, &html), None, "{page}");
         }
     }
 
