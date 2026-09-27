@@ -510,7 +510,8 @@ const GOOGLE_DOCS_VIEWS: &[&str] = &["edit", "view", "preview", "htmlview", "mob
 /// The export of the document `url` links to, rewritten without a request, as Google's own
 /// File > Download does it: a document as .docx, a spreadsheet as .xlsx with every sheet (the
 /// sheet a link names, `gid`, is only the one the editor opened on, and Sheets names one in every
-/// editor link), a presentation as .pptx; the account it names (`authuser`) is kept. An export
+/// editor link), a presentation as .pptx; the account it names (`authuser`) is kept, and so is the
+/// `resourcekey` a document shared by link before 2021 opens with (the export takes it). An export
 /// link is kept in the format it asks for (`format=csv&gid=` for one sheet). Other links on a document (gviz
 /// queries, /pub copies) already give what they are for, so they are left alone. Exports are
 /// made on the fly: one connection, no known size.
@@ -545,14 +546,9 @@ pub(crate) fn google_docs_export(url: &Url) -> Option<Url> {
         _ => return None,
     }
     export.set_path(&format!("/{}{}/d/{}/export", kind, account, id));
-    let authuser = url.query_pairs().find(|(k, _)| k == "authuser").map(|(_, v)| v.into_owned());
-    {
-        let mut query = export.query_pairs_mut();
-        query.clear().append_pair("format", format);
-        if let Some(user) = authuser {
-            query.append_pair("authuser", &user);
-        }
-    }
+    let kept: Vec<(String, String)> =
+        url.query_pairs().filter(|(k, _)| k == "authuser" || k == "resourcekey").map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
+    export.query_pairs_mut().clear().append_pair("format", format).extend_pairs(kept);
     Some(export)
 }
 
@@ -1680,6 +1676,9 @@ mod tests {
                 format!("spreadsheets/d/{sheet}/edit?authuser=me%40example.com#gid=7"),
                 format!("spreadsheets/d/{sheet}/export?format=xlsx&authuser=me%40example.com"),
             ),
+            // So is the resource key of a document shared by link before 2021 (Drive's exportLinks
+            // carry it too; the export answers the same with it, checked live).
+            (format!("presentation/d/{deck}/edit?usp=sharing&resourcekey=0-aB_c"), format!("presentation/d/{deck}/export?format=pptx&resourcekey=0-aB_c")),
             // An export in a format of the user's choosing is kept; a gid means nothing to a document.
             (format!("document/d/{doc}/export?format=pdf#top"), format!("document/d/{doc}/export?format=pdf")),
             (format!("spreadsheets/d/{sheet}/export?format=csv&gid=7"), format!("spreadsheets/d/{sheet}/export?format=csv&gid=7")),
