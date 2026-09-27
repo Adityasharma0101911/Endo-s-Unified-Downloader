@@ -2463,16 +2463,31 @@ pub(crate) async fn download_media_with(
 }
 
 /// What one of yt-dlp's own sites finds at `url` (see [`RunKind::Find`]), for a download with
-/// `options` to go by. Fails when none of them takes the link, when yt-dlp cannot be found or
-/// installed, or when the extraction fails.
+/// `options` to go by. Fails when none of them takes the link, when the one that does finds
+/// nothing there (an empty list, as a news site's section page gives), when yt-dlp cannot be
+/// found, installed or run, or takes longer than [`FIND_TIMEOUT`], installing it included, or
+/// when the extraction fails; [`site_failed`] tells the last apart.
 pub(crate) async fn find_site_media(
     url: &Url,
     options: &MediaDownloadOptions,
     cancel_flag: Option<Arc<AtomicBool>>,
 ) -> Result<Extracted, String> {
-    let (options, tools) = prepare(options, &cancel_flag, false).await?;
+    find_prepared(url, prepare(options, &cancel_flag, false), cancel_flag.clone()).await
+}
+
+/// [`find_site_media`] with the options and tools `prepared` gives, all within [`FIND_TIMEOUT`].
+async fn find_prepared(
+    url: &Url,
+    prepared: impl std::future::Future<Output = Result<(MediaDownloadOptions, Tools<'static>), String>>,
+    cancel_flag: Option<Arc<AtomicBool>>,
+) -> Result<Extracted, String> {
+    let find = async {
+        let (options, tools) = prepared.await?;
+        find_with(url, &options, &tools, cancel_flag).await
+    };
     // Dropped, the run's process tree is killed.
-    match tokio::time::timeout(FIND_TIMEOUT, find_with(url, &options, &tools, cancel_flag)).await {
+    match tokio::time::timeout(FIND_TIMEOUT, find).await {
+        Ok(Ok(Extracted(json))) if lists_nothing(&json) => Err(NOTHING_FOUND.to_string()),
         Ok(found) => found.map_err(drm_refused),
         Err(_) => Err(format!("yt-dlp took over {}s", FIND_TIMEOUT.as_secs())),
     }
@@ -2484,6 +2499,24 @@ const FIND_TIMEOUT: Duration = if cfg!(test) { Duration::from_secs(3) } else { D
 
 /// How yt-dlp says that none of the sites it may use takes a link.
 const NO_SITE: &str = "No suitable extractor";
+
+/// How [`find_site_media`] says that the site that takes a link found nothing there.
+const NOTHING_FOUND: &str = "yt-dlp found nothing to download there";
+
+/// Whether yt-dlp's `-J` output is a list with nothing in it.
+fn lists_nothing(json: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(json)
+        .is_ok_and(|info| info["_type"] == "playlist" && info["entries"].as_array().is_none_or(Vec::is_empty))
+}
+
+/// Whether `error`, from [`find_site_media`], is that of a site of yt-dlp's that took the link
+/// and failed at it (a private or removed video, a login it needs, an HTTP error, the cookies it
+/// was given): an `ERROR:` line of yt-dlp's other than the one for a link no site takes. Not
+/// installing, starting or waiting for yt-dlp, which says nothing of the link.
+pub(crate) fn site_failed(error: &str) -> bool {
+    error == DRM_REFUSED
+        || (error.starts_with("ERROR:") && !error.contains(NO_SITE) && !error.contains("Unsupported URL"))
+}
 
 /// [`find_site_media`] with `tools`. Paths in `options` must be absolute.
 async fn find_with(
@@ -2547,10 +2580,16 @@ async fn prepare(
     let ytdlp = match (&options.custom_ytdlp_path, found_ytdlp) {
         (Some(path), _) => absolute(path)?,
         (None, Some(path)) => path,
-        (None, None) => tokio::select! {
-            installed = install_managed_ytdlp(options.proxy.as_deref(), retry_install) => installed?,
-            _ = wait_cancelled(cancel_flag.clone()) => return Err(CANCELLED.to_string()),
-        },
+        (None, None) => {
+            // A task of its own: a run that stops waiting for it (a page check out of time, a
+            // cancelled download) leaves it to finish for the next one.
+            let proxy = options.proxy.clone();
+            let install = tokio::spawn(async move { install_managed_ytdlp(proxy.as_deref(), retry_install).await });
+            tokio::select! {
+                installed = install => installed.map_err(|e| format!("Installing yt-dlp failed: {e}"))??,
+                _ = wait_cancelled(cancel_flag.clone()) => return Err(CANCELLED.to_string()),
+            }
+        }
     };
     let managed = managed_bin_dir().is_some_and(|dir| ytdlp.starts_with(dir));
     let tools = Tools {
@@ -4628,5 +4667,60 @@ mod tests {
         let err = find_site_media(&url, &options, None).await.err().expect("nothing was found");
         assert_eq!(err, format!("yt-dlp took over {}s", FIND_TIMEOUT.as_secs()));
         assert!(started.elapsed() < FIND_TIMEOUT + Duration::from_secs(20), "{:?}", started.elapsed());
+        assert!(!site_failed(&err));
+    }
+
+    /// Installing yt-dlp for a page check is waited for no longer than the check itself.
+    #[tokio::test(start_paused = true)]
+    async fn installing_yt_dlp_counts_toward_the_wait() {
+        let url = Url::parse("https://slow.example/watch/1").unwrap();
+        let installing = async {
+            tokio::time::sleep(FIND_TIMEOUT * 10).await;
+            Err::<(MediaDownloadOptions, Tools<'static>), _>("installed at last".to_string())
+        };
+        let err = find_prepared(&url, installing, None).await.err();
+        assert_eq!(err, Some(format!("yt-dlp took over {}s", FIND_TIMEOUT.as_secs())));
+    }
+
+    #[tokio::test]
+    async fn a_site_that_finds_nothing_leaves_the_page_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        let ytdlp = fake_ytdlp(dir.path(), &out.join("clip.mp4"));
+        let options = MediaDownloadOptions { output_dir: out, custom_ytdlp_path: Some(ytdlp), ..Default::default() };
+        let url = Url::parse("https://www.bbc.co.uk/news/technology").unwrap();
+        // As yt-dlp's BBC site answers a section page: a list with nothing in it.
+        for empty in [r#"{"_type": "playlist", "id": "technology", "entries": []}"#, r#"{"_type": "playlist", "id": "technology"}"#] {
+            std::fs::write(dir.path().join("info.json"), empty).unwrap();
+            let err = find_site_media(&url, &options, None).await.err().expect("nothing was found");
+            assert_eq!(err, NOTHING_FOUND);
+            assert!(!site_failed(&err));
+        }
+        let listed = r#"{"_type": "playlist", "id": "technology", "entries": [{"_type": "url", "url": "https://www.bbc.co.uk/news/av/1"}]}"#;
+        std::fs::write(dir.path().join("info.json"), listed).unwrap();
+        assert!(find_site_media(&url, &options, None).await.is_ok());
+    }
+
+    #[test]
+    fn only_a_site_that_took_the_link_fails_it() {
+        for failed in [
+            "ERROR: [Rumble] v000: Unable to download webpage: HTTP Error 404: Not Found",
+            "ERROR: [Patreon] 123: You do not have access to this post",
+            "ERROR: could not find firefox cookies database in 'C:/profile'",
+            DRM_REFUSED,
+        ] {
+            assert!(site_failed(failed), "{failed}");
+        }
+        for none_took_it in [
+            "ERROR: No suitable extractor found for URL https://example.com/a",
+            "ERROR: Unsupported URL: https://example.com/a",
+            NOTHING_FOUND,
+            "Installing yt-dlp failed 3s ago: offline",
+            "Failed to spawn C:\\yt-dlp.exe: The system cannot find the file specified. (os error 2)",
+            "C:\\yt-dlp.exe exited with exit code: 1: Traceback (most recent call last):",
+            "yt-dlp took over 45s",
+        ] {
+            assert!(!site_failed(none_took_it), "{none_took_it}");
+        }
     }
 }

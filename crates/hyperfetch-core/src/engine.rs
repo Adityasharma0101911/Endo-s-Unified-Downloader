@@ -427,11 +427,12 @@ impl DownloadEngine {
     }
 
     /// What one of yt-dlp's own sites finds at `url`, a web page that leads nowhere by itself (see
-    /// `crate::media::find_site_media`). None when none of them takes it, or yt-dlp cannot be
-    /// found, installed or run, or takes too long: that never fails the download. A site that
-    /// takes it but finds its video DRM-protected does: the page is not what the link stands for.
-    /// Nor is a file-share page, which `check_answer` lets through only for yt-dlp: any failure
-    /// to find what it shares fails the download.
+    /// `crate::media::find_site_media`). None when none of them takes it, or the one that does
+    /// finds nothing there, or yt-dlp cannot be found, installed or run, or takes too long: that
+    /// never fails the download. A site that takes it but fails at it does (its video is
+    /// private, removed, DRM-protected, ...): the page is not what the link stands for, and
+    /// yt-dlp's error says why. Nor is a file-share page, which `check_answer` lets through only
+    /// for yt-dlp: any failure to find what it shares fails the download.
     async fn site_media(&self, url: &Url) -> Result<Option<crate::media::Extracted>, String> {
         let options = self.media_options();
         match crate::media::find_site_media(url, &options, Some(Arc::clone(&self.cancel_flag))).await {
@@ -442,6 +443,7 @@ impl DownloadEngine {
                 Some(service) => {
                     Err(format!("yt-dlp could not download this {} link, and its page is not the file: {}", service, e))
                 }
+                None if crate::media::site_failed(&e) => Err(e),
                 None => {
                     tracing::info!("No site of yt-dlp's takes {}: {}", url, e);
                     Ok(None)
