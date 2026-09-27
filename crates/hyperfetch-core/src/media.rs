@@ -2504,12 +2504,17 @@ async fn find_with(
     found.map(Extracted)
 }
 
+/// What a media download fails with when yt-dlp finds the video DRM-protected (see
+/// [`drm_refused`]).
+pub(crate) const DRM_REFUSED: &str = "DRM-protected: not supported";
+
 /// A failure as the user reads it: yt-dlp finding a video DRM-protected means it is not to be
-/// downloaded at all, which it says in words of its own.
+/// downloaded at all, which it says in words of its own ("This video is DRM protected", "This
+/// format is DRM protected; ...").
 fn drm_refused(error: String) -> String {
     let lower = error.to_ascii_lowercase();
-    if lower.contains("drm") && lower.contains("protected") {
-        "DRM-protected: not supported".to_string()
+    if lower.contains(" drm protected") || lower.contains(" drm-protected") {
+        DRM_REFUSED.to_string()
     } else {
         error
     }
@@ -4562,11 +4567,22 @@ mod tests {
 
     #[test]
     fn drm_failures_read_as_not_supported() {
-        for error in ["ERROR: [SomeSite] 123: This video is DRM protected", "ERROR: [x] 1: The video is DRM-protected"] {
-            assert_eq!(drm_refused(error.to_string()), "DRM-protected: not supported");
+        for error in [
+            "ERROR: [SomeSite] 123: This video is DRM protected",
+            "ERROR: [x] 1: The video is DRM-protected",
+            "ERROR: [hlsnative] This format is DRM protected; Try selecting another format",
+        ] {
+            assert_eq!(drm_refused(error.to_string()), DRM_REFUSED);
         }
-        let other = "ERROR: [youtube] abc: Video unavailable";
-        assert_eq!(drm_refused(other.to_string()), other);
+        // What only happens to hold the words keeps its own cause.
+        for other in [
+            "ERROR: [youtube] abc: Video unavailable",
+            "ERROR: [vimeo] 12drm3: This video is password protected. Use the --video-password option",
+            "ERROR: No suitable extractor found for URL https://x.example/drm/protected-clip",
+            "ERROR: No suitable extractor found for URL https://x.example/drm-protected-clip",
+        ] {
+            assert_eq!(drm_refused(other.to_string()), other);
+        }
     }
 
     #[tokio::test(start_paused = true)]
