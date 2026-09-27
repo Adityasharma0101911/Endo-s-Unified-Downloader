@@ -369,9 +369,10 @@ fn write_entries(path: &Path, entries: &[HistoryEntry]) -> io::Result<()> {
     result
 }
 
-/// Takes the cross-process history lock (an OS advisory lock on `<path>.lock`, released when the
-/// returned file is dropped or the process dies).
-fn lock_history(path: &Path) -> io::Result<File> {
+/// Takes the cross-process lock of the file `path` (an OS advisory lock on `<path>.lock`, released
+/// when the returned file is dropped or the process dies), as the history and the download
+/// archive are written under.
+pub(crate) fn lock_file(path: &Path) -> io::Result<File> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent)?;
     }
@@ -388,7 +389,7 @@ fn lock_history(path: &Path) -> io::Result<File> {
                 std::thread::sleep(Duration::from_millis(10));
             }
             Err(TryLockError::WouldBlock) => {
-                return Err(io::Error::new(ErrorKind::TimedOut, "timed out waiting for the history lock"));
+                return Err(io::Error::new(ErrorKind::TimedOut, format!("timed out waiting for the lock on {}", path.display())));
             }
             Err(TryLockError::Error(e)) => return Err(e),
         }
@@ -508,7 +509,7 @@ impl DownloadHistoryManager {
     /// updates made by other managers or processes since this one loaded are never lost or undone.
     pub fn save(&mut self) -> Result<(), std::io::Error> {
         let path = self.path();
-        let _lock = lock_history(&path)?;
+        let _lock = lock_file(&path)?;
         let mut entries = read_entries(&path, true)?;
         for change in &self.pending {
             change.apply(&mut entries);
