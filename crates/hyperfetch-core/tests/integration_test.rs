@@ -2366,3 +2366,18 @@ async fn test_a_remote_torrent_without_web_seeds_is_downloaded_itself() {
     assert_eq!(path, temp.path().join("x.iso.torrent"));
     assert_file(&path, &torrent);
 }
+
+/// A remote document is fetched through the proxy: its host does not exist, so only the proxy
+/// can have answered.
+#[tokio::test]
+async fn test_a_remote_document_is_fetched_through_the_proxy() {
+    use hyperfetch_core::ingest::{descriptor_client, ingest};
+    let xml = r#"<metalink xmlns="urn:ietf:params:xml:ns:metalink"><file name="a.bin"><url>https://m.example/a.bin</url></file></metalink>"#;
+    let proxy = Arc::new(Mock::new(xml.as_bytes().to_vec()));
+    let address = serve(Arc::clone(&proxy), "").await;
+
+    let http = descriptor_client(Some(address.as_str())).unwrap();
+    let tasks = ingest(&["http://documents.invalid/list.meta4"], &http).await.expect("the proxy answers");
+    assert_eq!(tasks.iter().map(|t| t.urls[0].as_str()).collect::<Vec<_>>(), ["https://m.example/a.bin"]);
+    assert_eq!(proxy.stats.requests.load(Ordering::SeqCst), 1);
+}
