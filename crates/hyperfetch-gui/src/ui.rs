@@ -202,7 +202,7 @@ fn downloader_tab(app: &mut App, ui: &mut egui::Ui) {
                 }
                 None => {
                     let edit = egui::TextEdit::singleline(&mut app.url_input)
-                        .hint_text(hint_text("File URL, media link (YouTube, Vimeo, Reddit, ...) or magnet link with web seeds"));
+                        .hint_text(hint_text("File URL, media link (YouTube, Vimeo, Reddit, ...), magnet link with web seeds, or .torrent/.metalink"));
                     let response = ui.add_sized([width, 26.0], edit);
                     if response.changed() {
                         app.form_error = None;
@@ -766,7 +766,7 @@ fn queue_tab(app: &mut App, ui: &mut egui::Ui) {
     card().show(ui, |ui| {
         ui.label(RichText::new("Add to Queue").strong().size(13.0));
         ui.label(
-            RichText::new("One download per line; separate mirrors of the same file with spaces. Uses the folder and options from the Downloader tab.")
+            RichText::new("One download per line; separate mirrors of the same file with spaces. A .torrent or .metalink (URL, file path, or file dropped on the window) adds every file it lists. Uses the folder and options from the Downloader tab.")
                 .size(11.0)
                 .color(MUTED),
         );

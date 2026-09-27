@@ -50,8 +50,22 @@ enum Dialog {
     VerifyFile,
 }
 
+/// Where a .metalink, .meta4 or .torrent came from, which decides what happens to its downloads.
+#[derive(Clone, Copy)]
+enum Origin {
+    /// The URL box: the first download starts now and is shown; errors show in the form.
+    Form,
+    /// This line (1-based) of the queue input: errors show there, with the line kept.
+    QueueLine(usize),
+    /// A file dropped on the window.
+    Dropped,
+}
+
 /// Results of background work, delivered to the UI thread (each send also requests a repaint).
 enum AppEvent {
+    /// The downloads a .metalink, .meta4 or .torrent lists, with the form's checksum when it was
+    /// added.
+    Read { origin: Origin, input: String, checksum: String, result: Result<Vec<Task>, String> },
     JobFinished { id: usize, result: Result<(PathBuf, Option<u64>), String> },
     /// The history as read by the `generation`-th history operation to run.
     History(Result<(u64, Vec<HistoryEntry>), String>),
@@ -309,10 +323,47 @@ impl App {
         Ok(queue_task(&mut self.queue, task, options))
     }
 
+    /// Queues the downloads a .metalink, .meta4 or .torrent lists; nothing if one is refused.
+    fn add_tasks(&mut self, tasks: Vec<Task>, checksum: &str) -> Result<Vec<usize>, String> {
+        let options = document_options(&self.settings, &tasks, checksum)?;
+        Ok(tasks.into_iter().zip(options).map(|(task, options)| queue_task(&mut self.queue, task, options)).collect())
+    }
+
+    /// Reads the downloads a .metalink, .meta4 or .torrent lists off the UI thread (fetching a
+    /// remote one through the proxy setting) and adds them as `origin` says.
+    fn read_document(&mut self, input: String, origin: Origin, checksum: String) {
+        self.notice = Some(Ok(format!("Reading {}...", ingest::truncate_chars(&input, 60))));
+        let proxy = Some(self.settings.proxy.trim().to_string()).filter(|p| !p.is_empty());
+        self.spawn_event(async move {
+            let tokens = ingest::input_tokens(&input).await;
+            let result = match ingest::descriptor_client(proxy.as_deref()) {
+                Ok(http) => ingest::ingest(&tokens, &http).await,
+                Err(e) => Err(e),
+            };
+            AppEvent::Read { origin, input, checksum, result }
+        });
+    }
+
+    /// Adds the downloads of a .metalink, .meta4 or .torrent file dropped on the window.
+    fn add_dropped(&mut self, path: PathBuf) {
+        let input = path.to_string_lossy().into_owned();
+        if ingest::names_document(&input) {
+            self.read_document(input, Origin::Dropped, String::new());
+        } else {
+            self.notice = Some(Err(format!("{} is not a .metalink, .meta4 or .torrent file", path.display())));
+        }
+    }
+
     /// Adds a download, starts it immediately and shows it on the Downloader tab. A file that is
-    /// already downloading is shown instead of being started twice.
+    /// already downloading is shown instead of being started twice. A .metalink, .meta4 or
+    /// .torrent is read first; the first download it lists starts, the others wait in the queue.
     fn download_now(&mut self, text: &str, checksum: &str, auth: &str) {
         self.tab = Tab::Downloader;
+        if ingest::names_document(text) {
+            self.form_error = None;
+            self.read_document(text.trim().to_string(), Origin::Form, checksum.trim().to_string());
+            return;
+        }
         match self.add_download(text, checksum, auth) {
             Ok(id) => self.start_added(id),
             Err(e) => self.form_error = Some(e),
@@ -336,7 +387,8 @@ impl App {
         self.start_job(id, false);
     }
 
-    /// Adds each non-empty line of the queue input as one download.
+    /// Adds each non-empty line of the queue input as one download; a .metalink, .meta4 or
+    /// .torrent line adds every file it lists once it has been read.
     fn add_queue_input(&mut self) {
         let lines: Vec<String> =
             self.queue_input.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect();
@@ -355,7 +407,9 @@ impl App {
         let mut errors = Vec::new();
         let mut rejected = Vec::new();
         for (n, line) in lines.iter().enumerate() {
-            if let Err(e) = self.add_download(line, &checksum, &auth) {
+            if ingest::names_document(line) {
+                self.read_document(line.clone(), Origin::QueueLine(n + 1), checksum.clone());
+            } else if let Err(e) = self.add_download(line, &checksum, &auth) {
                 errors.push(format!("Line {}: {}", n + 1, e));
                 rejected.push(line.as_str());
             }
@@ -610,6 +664,38 @@ impl App {
 
     fn handle_event(&mut self, event: AppEvent) {
         match event {
+            AppEvent::Read { origin, input, checksum, result } => {
+                self.notice = None;
+                let added = result.and_then(|tasks| self.add_tasks(tasks, &checksum));
+                match (origin, added) {
+                    (Origin::Form, Ok(ids)) => {
+                        if let Some(&first) = ids.first() {
+                            self.start_added(first);
+                        }
+                        if ids.len() > 1 && self.notice.is_none() {
+                            self.notice = Some(Ok(format!("Started the first of {} downloads; the others wait in the queue", ids.len())));
+                        }
+                    }
+                    (Origin::Form, Err(e)) => self.form_error = Some(e),
+                    (Origin::QueueLine(_), Ok(ids)) | (Origin::Dropped, Ok(ids)) => {
+                        let name = ingest::truncate_chars(&input, 60);
+                        self.notice = Some(Ok(format!("Added {} download(s) from {} to the queue", ids.len(), name)));
+                    }
+                    (Origin::QueueLine(line), Err(e)) => {
+                        // Keep the line so it can be corrected, as a line refused at once is.
+                        if !self.queue_input.is_empty() {
+                            self.queue_input.push('\n');
+                        }
+                        self.queue_input.push_str(&input);
+                        let error = format!("Line {}: {}", line, e);
+                        self.queue_error = Some(match self.queue_error.take() {
+                            Some(errors) => format!("{}\n{}", errors, error),
+                            None => error,
+                        });
+                    }
+                    (Origin::Dropped, Err(e)) => self.notice = Some(Err(e)),
+                }
+            }
             AppEvent::JobFinished { id, result } => {
                 if let Some(view) = self.jobs.get_mut(&id) {
                     if let (Some(_), Some(started)) = (view.running.take(), view.started) {
@@ -757,6 +843,10 @@ impl eframe::App for App {
         while let Ok(event) = self.events_rx.try_recv() {
             self.handle_event(event);
         }
+        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
+        for path in dropped {
+            self.add_dropped(path);
+        }
         self.drain_snapshots();
         self.run_scheduler();
         let animating = self.animate();
@@ -834,6 +924,17 @@ fn task_options(settings: &Settings, task: &Task, checksum: &str, auth: &str) ->
         options.output_path = options.output_path.map(|folder| folder.join(name));
     }
     Ok(options)
+}
+
+/// Engine options for the downloads a .metalink, .meta4 or .torrent lists, each saved under the
+/// save folder joined with its (sub)path; an error if one of them is refused. The form's checksum
+/// applies to a document of one file; its Authorization header is for the hosts the user typed,
+/// never for those a document lists.
+fn document_options(settings: &Settings, tasks: &[Task], checksum: &str) -> Result<Vec<DownloadOptions>, String> {
+    if tasks.len() > 1 && !checksum.trim().is_empty() {
+        return Err(format!("The checksum in Advanced Options is for a single file, but this lists {} files", tasks.len()));
+    }
+    tasks.iter().map(|task| task_options(settings, task, checksum, "")).collect()
 }
 
 /// Queues one download. One its input named is shown under that name at once, and the queue
@@ -1276,6 +1377,37 @@ mod tests {
 
         let plain = Task { urls: vec![url], ..Task::default() };
         assert_eq!(task_options(&settings, &plain, " ", "").unwrap().output_path, Some(PathBuf::from("dl")));
+    }
+
+    /// Each file a document lists keeps its own path and checksum; the form's checksum only fits a
+    /// document of one file, and one refused file refuses them all.
+    #[test]
+    fn a_document_adds_each_file_it_lists_or_none() {
+        let settings = Settings { save_dir: "dl".into(), ..Settings::default() };
+        let file = |name: &str, checksum: Option<String>| Task {
+            urls: vec![Url::parse(&format!("https://m.example/{}", name)).unwrap()],
+            name: Some(PathBuf::from("pack").join(name)),
+            checksum,
+        };
+        let (a, b) = (format!("sha256:{}", "aa".repeat(32)), format!("md5:{}", "bb".repeat(16)));
+        let tasks = [file("a.bin", Some(a.clone())), file("b.bin", Some(b.clone()))];
+        let options = document_options(&settings, &tasks, " ").unwrap();
+        let saved: Vec<_> = options.iter().map(|o| (o.output_path.clone(), o.expected_checksum.clone())).collect();
+        assert_eq!(
+            saved,
+            [
+                (Some(PathBuf::from("dl").join("pack").join("a.bin")), Some(a)),
+                (Some(PathBuf::from("dl").join("pack").join("b.bin")), Some(b)),
+            ]
+        );
+        assert!(options.iter().all(|o| o.auth_header.is_none()));
+
+        let typed = format!("sha256:{}", "cc".repeat(32));
+        assert!(document_options(&settings, &tasks, &typed).unwrap_err().contains("lists 2 files"));
+        let one = [file("a.bin", None)];
+        assert_eq!(document_options(&settings, &one, &typed).unwrap()[0].expected_checksum, Some(typed));
+        let refused = [file("a.bin", None), file("b.bin", Some("crc32:1234".to_string()))];
+        assert!(document_options(&settings, &refused, "").is_err());
     }
 
     /// A download its input named is shown under that name at once and saved as that file, in

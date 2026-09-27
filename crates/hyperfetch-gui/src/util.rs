@@ -16,10 +16,11 @@ pub fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Clipboard text worth offering as a download: one downloadable link.
+/// Clipboard text worth offering as a download: one downloadable link (not a .metalink or
+/// .torrent, which lists several).
 pub fn clipboard_link(text: &str) -> Option<String> {
     let text = text.trim();
-    if text.is_empty() || text.len() > 8192 || text.contains(char::is_whitespace) {
+    if text.is_empty() || text.len() > 8192 || text.contains(char::is_whitespace) || ingest::names_document(text) {
         return None;
     }
     ingest::link_task(&[text]).ok().map(|_| text.to_string())
@@ -221,6 +222,9 @@ mod tests {
         let seeded = format!("magnet:?xt=urn:btih:{}&dn=f.iso&ws=https%3A%2F%2Fmirror.example%2Ff.iso", hash);
         assert!(clipboard_link(&seeded).is_some());
         assert!(clipboard_link(&format!("magnet:?xt=urn:btih:{}", hash)).is_none());
+        // A document lists downloads rather than being one.
+        assert_eq!(clipboard_link("https://a.com/list.meta4"), None);
+        assert_eq!(clipboard_link("https://a.com/x.torrent"), None);
     }
 
     #[test]
