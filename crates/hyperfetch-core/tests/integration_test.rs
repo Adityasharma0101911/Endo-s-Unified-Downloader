@@ -2913,3 +2913,53 @@ async fn test_a_remote_document_is_fetched_through_the_proxy() {
     assert_eq!(tasks.iter().map(|t| t.urls[0].as_str()).collect::<Vec<_>>(), ["https://m.example/a.bin"]);
     assert_eq!(proxy.stats.requests.load(Ordering::SeqCst), 1);
 }
+
+// ---- The lanes together: leaving links, links that land on a code host, secrets in history ----
+
+/// A short link to a "leaving this site" link around a file, as a YouTube description (/v) or a
+/// Google result (/g) holds one; the wrappers answer with a page.
+fn short_link_to_a_wrapped_file(method: &str, target: &str) -> Vec<u8> {
+    let wrapper = match target {
+        "http://go.short.invalid/v" => "http://www.youtube.com/redirect?event=video_description&q=http%3A%2F%2Ffiles.short.invalid%2Fwrapped.bin",
+        "http://go.short.invalid/g" => "http://www.google.com/url?q=http%3A%2F%2Ffiles.short.invalid%2Fwrapped.bin&sa=D",
+        "http://files.short.invalid/wrapped.bin" => {
+            return response(method, "200 OK", "Content-Type: application/octet-stream\r\n", &payload(64 * KB, 349))
+        }
+        _ => return response(method, "200 OK", "Content-Type: text/html; charset=utf-8\r\n", b"<html><body>Redirect Notice</body></html>"),
+    };
+    response(method, "302 Found", &format!("Location: {wrapper}\r\n"), b"")
+}
+
+#[tokio::test]
+async fn test_a_leaving_link_is_downloaded_from_its_target_given_or_landed_on() {
+    isolate_history();
+    let _history = HISTORY.write().await;
+    // youtube.com is a media site: a wrapper there handed to yt-dlp would come back as this one's
+    // never.mp4.
+    let tools = tempdir().unwrap();
+    let ytdlp = no_site_ytdlp(tools.path());
+
+    // Given as it is, as a queue saved before the front ends unwrapped links holds it.
+    let data = payload(PREFETCH + 64 * KB, 353);
+    let file_url = serve(Arc::new(Mock::new(data.clone())), "given.bin").await;
+    let wrapper = Url::parse_with_params("https://www.youtube.com/redirect", &[("event", "video_description"), ("q", file_url.as_str())]).unwrap();
+    let temp = tempdir().unwrap();
+    let opts = DownloadOptions { ytdlp_path: Some(ytdlp.clone()), ..options(temp.path(), 4, 64 * KB) };
+    let path = run(&DownloadEngine::new(vec![wrapper], opts), None).await.expect("the target should download");
+    assert_eq!(path, temp.path().join("given.bin"));
+    assert_file(&path, &data);
+    assert_eq!(history_entry(&path).expect("the download is recorded").urls, [file_url.to_string()]);
+
+    // Landed on, behind a short link.
+    let (proxy, _) = serve_proxy(short_link_to_a_wrapped_file).await;
+    for short in ["http://go.short.invalid/v", "http://go.short.invalid/g"] {
+        let temp = tempdir().unwrap();
+        let opts = DownloadOptions { proxy: Some(proxy.clone()), ytdlp_path: Some(ytdlp.clone()), ..options(temp.path(), 4, 64 * KB) };
+        let path = run(&DownloadEngine::new(vec![Url::parse(short).unwrap()], opts), None).await.expect(short);
+        assert_eq!(path, temp.path().join("wrapped.bin"), "{short}");
+        assert_file(&path, &payload(64 * KB, 349));
+        let urls = history_entry(&path).expect("the download is recorded").urls;
+        assert_eq!(urls, [short, "http://files.short.invalid/wrapped.bin"], "{short}");
+    }
+    assert_eq!(runs_of(tools.path()), Vec::<Vec<String>>::new(), "yt-dlp was asked");
+}
