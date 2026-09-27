@@ -2963,3 +2963,40 @@ async fn test_a_leaving_link_is_downloaded_from_its_target_given_or_landed_on() 
     }
     assert_eq!(runs_of(tools.path()), Vec::<Vec<String>>::new(), "yt-dlp was asked");
 }
+
+/// A short link to a GitHub "view file" page, whose raw link serves the file.
+fn short_link_to_a_code_host_file_page(method: &str, target: &str) -> Vec<u8> {
+    if target.starts_with("http://go.short.invalid/") {
+        response(method, "302 Found", "Location: http://github.com/owner/repo/blob/main/dist/tool.bin\r\n", b"")
+    } else if target == "http://github.com/owner/repo/raw/main/dist/tool.bin" {
+        response(method, "200 OK", "Content-Type: application/octet-stream\r\n", &payload(64 * KB, 359))
+    } else {
+        response(method, "200 OK", "Content-Type: text/html; charset=utf-8\r\n", b"<!doctype html><title>dist/tool.bin at main</title>")
+    }
+}
+
+#[tokio::test]
+async fn test_a_short_link_with_a_secret_to_a_code_host_file_page_gets_the_file_and_history_no_secret() {
+    isolate_history();
+    let _history = HISTORY.write().await;
+    let (proxy, seen) = serve_proxy(short_link_to_a_code_host_file_page).await;
+    let temp = tempdir().unwrap();
+    let short = Url::parse("http://go.short.invalid/t?token=s3cr3t-t0ken").unwrap();
+    let opts = || DownloadOptions { proxy: Some(proxy.clone()), ..options(temp.path(), 4, 64 * KB) };
+
+    let path = run(&DownloadEngine::new(vec![short.clone()], opts()), None).await.expect("the file should download");
+    assert_eq!(path, temp.path().join("tool.bin"));
+    assert_file(&path, &payload(64 * KB, 359));
+    let raw = "http://github.com/owner/repo/raw/main/dist/tool.bin";
+    assert!(seen.lock().unwrap().iter().any(|(target, _)| target == raw), "the file page was rewritten to its raw link");
+    // History lists the link without its secret, and where it landed.
+    let entry = history_entry(&path).expect("the download is recorded");
+    assert_eq!(entry.urls, ["http://go.short.invalid/t?token=REDACTED", "http://github.com/owner/repo/blob/main/dist/tool.bin"]);
+    let saved = std::fs::read_to_string(DownloadHistoryManager::default_history_path()).unwrap();
+    assert!(!saved.contains("s3cr3t-t0ken"), "{saved}");
+
+    // The same link again finds that entry: the file is not downloaded a second time.
+    let again = run(&DownloadEngine::new(vec![short], opts()), None).await.expect("the file is already there");
+    assert_eq!(again, path);
+    assert_eq!(names_in(temp.path()), ["tool.bin"]);
+}
