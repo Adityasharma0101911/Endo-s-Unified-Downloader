@@ -430,8 +430,10 @@ async fn record_unfinished(snapshot: EngineSnapshot, urls: Vec<String>, status: 
     entry.downloaded_bytes = snapshot.downloaded_bytes;
     entry.status = status;
     entry.started_at = started_at;
-    let recorded = tokio::task::spawn_blocking(move || DownloadHistoryManager::load().add_or_update(entry)).await;
-    if let Err(e) = recorded {
+    // Read once, under the history lock.
+    let history = DownloadHistoryManager::default_history_path();
+    let recorded = tokio::task::spawn_blocking(move || DownloadHistoryManager::record(&history, entry, true)).await;
+    if let Err(e) = recorded.map_err(|e| e.to_string()).and_then(|saved| saved.map_err(|e| e.to_string())) {
         tracing::warn!("Could not record the download in history: {}", e);
     }
 }
