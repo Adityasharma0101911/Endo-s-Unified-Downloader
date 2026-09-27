@@ -409,8 +409,33 @@ impl HtmlVideoResolver {
 
     /// Where the page `html`, from `page_url`, sends the browser at once: the target of a
     /// `<meta http-equiv="refresh" content="0; url=...">` (t.co answers this way), if it has one.
-    pub fn meta_refresh(_html: &str, _page_url: &Url) -> Option<Url> {
-        None
+    pub fn meta_refresh(html: &str, page_url: &Url) -> Option<Url> {
+        let lower = html.to_ascii_lowercase();
+        start_tags(html, &lower, "meta").into_iter().find_map(|tag| {
+            attr_value(tag, "http-equiv").filter(|v| v.eq_ignore_ascii_case("refresh"))?;
+            // "<seconds>[.<fraction>][;|,] [url=]<target>", the target maybe quoted, as the HTML
+            // standard reads it. Only a refresh at once: a later one is a page to look at first.
+            let content = attr_value(tag, "content")?;
+            let rest = content.trim_start();
+            let seconds = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+            if seconds == 0 || rest[..seconds].bytes().any(|b| b != b'0') {
+                return None;
+            }
+            let rest = rest[seconds..].trim_start_matches(|c: char| c.is_ascii_digit() || c == '.').trim_start();
+            let rest = rest.strip_prefix([';', ',']).unwrap_or(rest).trim_start();
+            let named = rest.get(..3).filter(|s| s.eq_ignore_ascii_case("url")).and_then(|_| rest[3..].trim_start().strip_prefix('='));
+            let target = named.map_or(rest, str::trim_start);
+            let target = match target.chars().next() {
+                Some(quote @ ('\'' | '"')) => target[1..].split(quote).next().unwrap_or_default(),
+                _ => target,
+            };
+            let target = target.trim();
+            // Without a target the page only reloads itself.
+            if target.is_empty() {
+                return None;
+            }
+            page_url.join(target).ok().filter(|u| matches!(u.scheme(), "http" | "https"))
+        })
     }
 
     /// Reads as much of a page's body as is looked into.

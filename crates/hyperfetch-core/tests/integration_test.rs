@@ -2295,3 +2295,127 @@ async fn test_a_download_starts_at_the_connection_cap_its_host_was_seen_to_enfor
     assert_file(&out, &data);
     assert_eq!(mock.served_ranges().len(), 2, "{:?}", mock.served_ranges());
 }
+
+// ---- Links judged by where they lead: short links, pages that send the browser on, shorteners ----
+
+/// A whole HTTP response with `body`, which a HEAD request does not get.
+fn response(method: &str, status: &str, headers: &str, body: &[u8]) -> Vec<u8> {
+    let mut out = format!("HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n", body.len()).into_bytes();
+    if method != "HEAD" {
+        out.extend_from_slice(body);
+    }
+    out
+}
+
+/// The proxy a download sends every request through, standing in for the hosts they name:
+/// `answer` gives the response to a request by its method and target (an absolute URL). It
+/// lists the targets asked for, each with whether the request carried an Authorization header.
+async fn serve_proxy(answer: fn(&str, &str) -> Vec<u8>) -> (String, Arc<Mutex<Vec<(String, bool)>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy = format!("http://{}", listener.local_addr().unwrap());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&seen);
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let log = Arc::clone(&log);
+            tokio::spawn(async move {
+                let Some(head) = read_head(&mut socket).await else { return };
+                let mut request_line = head.lines().next().unwrap_or("").split(' ');
+                let (method, target) = (request_line.next().unwrap_or(""), request_line.next().unwrap_or(""));
+                let authorized = head.lines().any(|l| l.to_ascii_lowercase().starts_with("authorization:"));
+                log.lock().unwrap().push((target.to_string(), authorized));
+                let _ = socket.write_all(&answer(method, target)).await;
+            });
+        }
+    });
+    (proxy, seen)
+}
+
+/// A short link to a Dropbox file, whose link as shared answers with a preview page.
+fn short_link_to_dropbox(method: &str, target: &str) -> Vec<u8> {
+    if target.starts_with("http://go.short.invalid/") {
+        response(method, "302 Found", "Location: http://www.dropbox.com/s/k3y/report.bin?dl=0\r\n", b"")
+    } else if target == "http://www.dropbox.com/s/k3y/report.bin?dl=1" {
+        response(method, "200 OK", "Content-Type: application/octet-stream\r\n", &payload(64 * KB, 311))
+    } else {
+        response(method, "200 OK", "Content-Type: text/html; charset=utf-8\r\n", b"<html><body>Preview of report.bin</body></html>")
+    }
+}
+
+#[tokio::test]
+async fn test_a_short_link_is_downloaded_from_the_file_host_it_lands_on() {
+    isolate_history();
+    let _history = HISTORY.write().await;
+    let (proxy, seen) = serve_proxy(short_link_to_dropbox).await;
+    let temp = tempdir().unwrap();
+    let short = Url::parse("http://go.short.invalid/report").unwrap();
+    let opts = DownloadOptions { proxy: Some(proxy), auth_header: Some("Bearer secret".into()), ..options(temp.path(), 4, 64 * KB) };
+
+    let path = run(&DownloadEngine::new(vec![short.clone()], opts), None).await.expect("the file should download");
+    assert_eq!(path, temp.path().join("report.bin"));
+    assert_file(&path, &payload(64 * KB, 311));
+    // History lists where the link landed along with it: a repair finds the file there.
+    let landed = "http://www.dropbox.com/s/k3y/report.bin?dl=0";
+    assert_eq!(history_entry(&path).expect("the download is recorded").urls, [short.to_string(), landed.to_string()]);
+    // The file came as Dropbox's resolver asks for it, and the credentials went only to the host
+    // the user named.
+    let seen = seen.lock().unwrap().clone();
+    assert!(seen.iter().any(|(target, _)| target.ends_with("report.bin?dl=1")), "{seen:?}");
+    for (target, authorized) in &seen {
+        assert_eq!(*authorized, target.starts_with("http://go.short.invalid/"), "{target}");
+    }
+}
+
+/// A web page at `name` that sends the browser on to `to` at once, as t.co answers.
+async fn refreshing_page(name: &str, to: &str) -> (Arc<Mock>, Url) {
+    let html = format!(r#"<html><head><noscript><META http-equiv="refresh" content="0;URL='{to}'"></noscript></head></html>"#);
+    let mut page = Mock::new(html.into_bytes());
+    page.content_type = Some("text/html; charset=utf-8");
+    let page = Arc::new(page);
+    let url = serve(Arc::clone(&page), name).await;
+    (page, url)
+}
+
+#[tokio::test]
+async fn test_a_page_that_sends_the_browser_on_at_once_is_downloaded_as_its_target() {
+    isolate_history();
+    let _history = HISTORY.write().await;
+    let data = payload(PREFETCH + 256 * KB, 313);
+    let file_url = serve(Arc::new(Mock::new(data.clone())), "setup.exe").await;
+    let (_, page_url) = refreshing_page("l/abc", file_url.as_str()).await;
+    let temp = tempdir().unwrap();
+
+    let path = run(&DownloadEngine::new(vec![page_url.clone()], options(temp.path(), 4, 256 * KB)), None)
+        .await
+        .expect("the file should download");
+    assert_eq!(path, temp.path().join("setup.exe"));
+    assert_file(&path, &data);
+    assert_eq!(history_entry(&path).expect("the download is recorded").urls, [page_url.to_string(), file_url.to_string()]);
+}
+
+#[tokio::test]
+async fn test_links_are_followed_at_most_three_times_and_never_back() {
+    let _history = setup().await;
+    // Four pages, each sending the browser on to the next, the last to the file.
+    let file = Arc::new(Mock::new(payload(64 * KB, 317)));
+    let mut to = serve(Arc::clone(&file), "far.bin").await.to_string();
+    let mut pages = Vec::new();
+    for n in (1..=4).rev() {
+        let (page, url) = refreshing_page(&format!("hop{n}"), &to).await;
+        to = url.to_string();
+        pages.insert(0, page);
+    }
+    let temp = tempdir().unwrap();
+    let out = temp.path().join("hops.html");
+    let first = Url::parse(&to).unwrap();
+    run(&DownloadEngine::new(vec![first], options(&out, 4, 64 * KB)), None).await.expect("the last page should download");
+    assert_file(&out, &pages[3].data);
+    assert_eq!(file.stats.requests.load(Ordering::SeqCst), 0, "a fourth link was followed");
+
+    // A page sending the browser to itself is followed once, not again.
+    let (page, url) = refreshing_page("start", "/again").await;
+    let out = temp.path().join("again.html");
+    run(&DownloadEngine::new(vec![url], options(&out, 4, 64 * KB)), None).await.expect("the page should download");
+    assert_file(&out, &page.data);
+    assert_eq!(page.stats.probes.load(Ordering::SeqCst), 2, "the start page, then the one it sends the browser to");
+}
