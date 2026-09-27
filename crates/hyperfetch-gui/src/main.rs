@@ -94,7 +94,8 @@ enum AppEvent {
     History(Result<(u64, Vec<HistoryEntry>), String>),
     /// Leftovers of a stopped download were deleted (the count), or kept because of the error.
     Discarded { id: usize, name: String, result: Result<usize, String> },
-    Verified(Result<(BuildVerificationResult, Vec<Url>), String>),
+    /// A file verified, with the links to repair it from, or why none can be used.
+    Verified(Result<(BuildVerificationResult, Result<Vec<Url>, String>), String>),
     RepairFinished(Result<(), String>),
     Picked(Dialog, Option<PathBuf>),
     Pasted(Result<String, String>),
@@ -662,7 +663,7 @@ impl App {
                 let repair_urls = if util::verdict(&result) == Verdict::Incomplete {
                     util::repair_urls_for(&result.file_path)
                 } else {
-                    Vec::new()
+                    Ok(Vec::new())
                 };
                 Ok((result, repair_urls))
             })
@@ -765,7 +766,14 @@ impl App {
             AppEvent::Verified(result) => {
                 self.verifying = false;
                 match result {
-                    Ok((result, repair_urls)) => self.verification = Some(Verification { result, repair_urls }),
+                    Ok((result, repair_urls)) => {
+                        // Links saved without their secret cannot repair it: the user is told so.
+                        let repair_urls = repair_urls.unwrap_or_else(|e| {
+                            self.verify_message = Some(e);
+                            Vec::new()
+                        });
+                        self.verification = Some(Verification { result, repair_urls });
+                    }
                     Err(e) => self.verify_message = Some(format!("Could not verify: {}", e)),
                 }
             }

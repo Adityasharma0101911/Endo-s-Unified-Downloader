@@ -123,18 +123,27 @@ pub fn history_urls_for(entries: &[HistoryEntry], final_path: &Path) -> Option<V
 }
 
 /// Mirrors to repair `target` from: its own resume state, else the history entry for exactly
-/// its final path. Blocking.
-pub fn repair_urls_for(target: &Path) -> Vec<Url> {
+/// its final path (see [`repair_mirrors`]). Blocking.
+pub fn repair_urls_for(target: &Path) -> Result<Vec<Url>, String> {
     let from_state = DownloadState::load_from_path(&DownloadState::state_file_path(target))
         .ok()
         .flatten()
         .map(|state| state.mirrors);
-    from_state
-        .or_else(|| history_urls_for(DownloadHistoryManager::load().entries(), &final_path_of(target)))
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|u| Url::parse(u).ok())
-        .collect()
+    repair_mirrors(
+        &from_state
+            .or_else(|| history_urls_for(DownloadHistoryManager::load().entries(), &final_path_of(target)))
+            .unwrap_or_default(),
+    )
+}
+
+/// The links among `urls` a repair can request: links saved without their secret are left out,
+/// and when that leaves none, the error says to give the link again.
+pub fn repair_mirrors(urls: &[String]) -> Result<Vec<Url>, String> {
+    let usable: Vec<Url> = urls.iter().filter(|u| !is_redacted(u)).filter_map(|u| Url::parse(u).ok()).collect();
+    if usable.is_empty() && urls.iter().any(|u| is_redacted(u)) {
+        return Err(REDACTED_LINK.to_string());
+    }
+    Ok(usable)
 }
 
 /// Starts `command` without waiting for it and returns its process id. A thread waits for it to
@@ -343,6 +352,15 @@ mod tests {
         let key = history_search_key(&format!("  {live} "));
         assert!(entry.urls[0].to_lowercase().contains(&key), "{key}");
         assert_eq!(history_search_key(" Report "), "report");
+    }
+
+    #[test]
+    fn repair_leaves_out_links_saved_without_their_secret() {
+        let signed = HistoryEntry::new("a.bin".into(), PathBuf::from("/d/a.bin"), 1, vec!["https://h/a.bin?X-Amz-Signature=abc".into()]);
+        assert_eq!(repair_mirrors(&signed.urls), Err(REDACTED_LINK.to_string()));
+        let mirrors = vec!["https://h/a.bin?token=REDACTED".to_string(), "https://m/a.bin".to_string()];
+        assert_eq!(repair_mirrors(&mirrors), Ok(vec![Url::parse("https://m/a.bin").unwrap()]));
+        assert_eq!(repair_mirrors(&[]), Ok(Vec::new()), "nothing recorded is no redacted link");
     }
 
     #[test]
