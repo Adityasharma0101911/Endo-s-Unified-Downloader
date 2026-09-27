@@ -3298,3 +3298,93 @@ async fn test_bare_sha512_and_sha1_checksums_of_a_single_stream() {
         assert_no_leftovers(&out);
     }
 }
+
+
+// Podcast and RSS/Atom feeds: one download per episode, newest first, and only new ones later.
+
+/// A private feed (its token in its link) lists two episodes on other hosts; the newest one is
+/// downloaded as a front end saves it, and the feed then lists only the other one, unless every
+/// episode is asked for.
+#[tokio::test]
+async fn test_a_feed_lists_its_episodes_and_later_only_new_ones() {
+    use hyperfetch_core::ingest::{descriptor_client, ingest, ListOptions};
+    isolate_history();
+    let _history = HISTORY.write().await;
+    let (old, new) = (payload(40 * KB, 7), payload(50 * KB, 11));
+    let old_url = serve(Arc::new(Mock::new(old.clone())), "media/old.mp3").await;
+    let new_url = serve(Arc::new(Mock::new(new.clone())), "media/new").await;
+    let rss = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd">
+  <channel>
+    <title>Mock Show</title>
+    <item><title>Old one</title><pubDate>Mon, 01 Jun 2026 08:00:00 GMT</pubDate><enclosure url="{old_url}" type="audio/mpeg" length="{}"/></item>
+    <item><title>New one</title><pubDate>Tue, 02 Jun 2026 08:00:00 GMT</pubDate><enclosure url="{new_url}" type="audio/mpeg"/></item>
+  </channel>
+</rss>"#,
+        old.len()
+    );
+    let mut feed_host = Mock::new(rss.into_bytes());
+    feed_host.content_type = Some("application/rss+xml; charset=utf-8");
+    let feed = serve(Arc::new(feed_host), "private/show.rss?auth=s3cret").await;
+    let http = descriptor_client(None).unwrap();
+    let listed = |tasks: &[hyperfetch_core::ingest::Task]| -> Vec<(String, String)> {
+        tasks.iter().map(|t| (t.name.as_ref().unwrap().to_string_lossy().into_owned(), t.urls[0].to_string())).collect()
+    };
+
+    let tasks = ingest(&[feed.as_str()], &http, &ListOptions::default()).await.expect("the feed is read");
+    assert_eq!(
+        listed(&tasks),
+        [("2026-06-02 New one.mp3".to_string(), new_url.to_string()), ("2026-06-01 Old one.mp3".to_string(), old_url.to_string())]
+    );
+    assert_eq!(tasks.iter().map(|t| t.size).collect::<Vec<_>>(), [None, Some(old.len() as u64)]);
+    // The feed's token stays with the feed: the Authorization the user gave is not for the
+    // enclosures' hosts either.
+    assert!(tasks.iter().all(|t| t.from_document && !t.urls[0].as_str().contains("s3cret")));
+    assert!(tasks.iter().all(|t| t.folder.as_deref() == Some(Path::new("Mock Show"))));
+
+    let temp = tempdir().unwrap();
+    let newest = &tasks[0];
+    let out = temp.path().join(newest.folder.as_ref().unwrap()).join(newest.name.as_ref().unwrap());
+    let path = run(&DownloadEngine::new(newest.urls.clone(), options(&out, 2, 16 * KB)), None).await.expect("the episode downloads");
+    assert_eq!(path, out);
+    assert_file(&out, &new);
+
+    let tasks = ingest(&[feed.as_str()], &http, &ListOptions::default()).await.expect("the feed is read again");
+    assert_eq!(listed(&tasks), [("2026-06-01 Old one.mp3".to_string(), old_url.to_string())]);
+    let latest = ListOptions { latest: Some(1), ..ListOptions::default() };
+    let err = ingest(&[feed.as_str()], &http, &latest).await.expect_err("the newest was downloaded");
+    assert_eq!(err, "Nothing new in Mock Show: the newest 1 of its 2 episodes were downloaded before");
+    let all = ListOptions { only_new: false, ..ListOptions::default() };
+    assert_eq!(ingest(&[feed.as_str()], &http, &all).await.unwrap().len(), 2);
+}
+
+/// A link shaped like a feed that answers with a page, another XML document, a feed without
+/// audio or video, or a client error is downloaded as it is; a busy feed host is an error, to try
+/// again.
+#[tokio::test]
+async fn test_a_link_that_only_looks_like_a_feed_is_downloaded_as_it_is() {
+    use hyperfetch_core::ingest::{descriptor_client, ingest, ListOptions, Task};
+    let _history = setup().await;
+    let http = descriptor_client(None).unwrap();
+    let mut page = Mock::new(b"<!DOCTYPE html><html><body>Latest posts</body></html>".to_vec());
+    page.content_type = Some("text/html");
+    let blog = Mock::new(b"<rss version=\"2.0\"><channel><title>Blog</title><item><title>Post</title></item></channel></rss>".to_vec());
+    let mut gone = Mock::new(Vec::new());
+    gone.plan = |_| Reply::Status(404, None);
+    let links = [
+        serve(Arc::new(page), "news/feed").await,
+        serve(Arc::new(Mock::new(b"<?xml version=\"1.0\"?><catalog><book id=\"1\"/></catalog>".to_vec())), "data/books.xml").await,
+        serve(Arc::new(blog), "blog/rss").await,
+        serve(Arc::new(gone), "expired/show.rss?token=old").await,
+    ];
+    for link in links {
+        let tasks = ingest(&[link.as_str()], &http, &ListOptions::default()).await.unwrap_or_else(|e| panic!("{link}: {e}"));
+        assert_eq!(tasks, [Task { urls: vec![link.clone()], ..Task::default() }], "{link}");
+    }
+    let mut busy = Mock::new(Vec::new());
+    busy.plan = |_| Reply::Status(503, None);
+    let link = serve(Arc::new(busy), "busy/show.rss?token=s3cret").await;
+    let err = ingest(&[link.as_str()], &http, &ListOptions::default()).await.expect_err("a busy host is an error");
+    assert!(err.contains("503") && err.contains("token=REDACTED") && !err.contains("s3cret"), "{err}");
+}
