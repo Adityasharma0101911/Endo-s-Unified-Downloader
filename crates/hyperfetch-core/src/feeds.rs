@@ -329,9 +329,11 @@ struct Date {
 }
 
 impl Date {
-    /// `seconds` into the day, less the time zone's `offset` (both in seconds).
+    /// `seconds` into the day, less the time zone's `offset` (both in seconds). None for a year
+    /// outside 1 to 9999, which a name cannot show in four digits and a hostile feed could make
+    /// overflow.
     fn new(year: i64, month: u32, day: u32, seconds: i64, offset: i64) -> Option<Self> {
-        ((1..=12).contains(&month) && (1..=31).contains(&day))
+        ((1..=9999).contains(&year) && (1..=12).contains(&month) && (1..=31).contains(&day))
             .then(|| Self { year, month, day, unix: days_from_civil(year, month, day) * 86_400 + seconds - offset })
     }
 }
@@ -383,13 +385,14 @@ fn rfc3339(text: &str) -> Option<Date> {
     Date::new(year, month, day, seconds, zone_offset(&rest[zone_at..]))
 }
 
-/// Seconds into the day of "hh:mm" or "hh:mm:ss" (a fraction of a second is dropped).
+/// Seconds into the day of "hh:mm" or "hh:mm:ss" (a fraction of a second is dropped); None
+/// past 24:59:60.
 fn time_of_day(text: &str) -> Option<i64> {
     let mut fields = text.split(':');
-    let hours: i64 = fields.next()?.parse().ok()?;
-    let minutes: i64 = fields.next()?.parse().ok()?;
-    let seconds: i64 = fields.next().map_or(Some(0), |s| s.split('.').next()?.parse().ok())?;
-    Some(hours * 3600 + minutes * 60 + seconds)
+    let hours: u8 = fields.next()?.parse().ok().filter(|&h| h <= 24)?;
+    let minutes: u8 = fields.next()?.parse().ok().filter(|&m| m <= 59)?;
+    let seconds: u8 = fields.next().map_or(Some(0), |s| s.split('.').next()?.parse().ok()).filter(|&s| s <= 60)?;
+    Some(i64::from(hours) * 3600 + i64::from(minutes) * 60 + i64::from(seconds))
 }
 
 /// The offset from UTC in seconds of a zone written "+hhmm", "-hh:mm", "Z", "GMT" or as a North
@@ -870,6 +873,19 @@ mod tests {
         assert_eq!(day("2026-09-27"), Some((2026, 9, 27, noon - 12 * 3600)));
         for bad in ["", "yesterday", "Sun, 27 Foo 2026", "2026-13-01", "32 Sep 2026", "2026-09-27T25"] {
             assert_eq!(day(bad), None, "{bad}");
+        }
+        // A hostile year or time is no date, not an overflow.
+        for hostile in [
+            "Mon, 01 Jan 99999999999999999 00:00:00 GMT",
+            "Mon, 01 Jan 10000 00:00:00 GMT",
+            "Mon, 01 Jan -5 00:00:00 GMT",
+            "Sun, 27 Sep 2026 9999999999999999:00:00 GMT",
+            "Sun, 27 Sep 2026 12:99:00 GMT",
+            "Sun, 27 Sep 2026 -1:00:00 GMT",
+            "2026-09-27T9999999999999:00:00Z",
+            "0000-01-01",
+        ] {
+            assert_eq!(day(hostile), None, "{hostile}");
         }
     }
 
