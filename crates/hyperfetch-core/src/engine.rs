@@ -122,6 +122,10 @@ pub struct DownloadOptions {
     pub auth_header: Option<String>,
     pub proxy: Option<String>,
     pub media_preset: Option<crate::media::MediaQualityPreset>,
+    /// The quality of a link that turns out to be media only once it answers (a web page one of
+    /// yt-dlp's sites takes, a short link to a media site), when `media_preset` is not set: unlike
+    /// that, it sends no link to yt-dlp itself.
+    pub page_media_preset: Option<crate::media::MediaQualityPreset>,
     pub browser_cookies: Option<crate::media::BrowserCookieSource>,
     /// Global download speed cap in bytes/sec across all connections (None = unlimited).
     pub max_speed: Option<u64>,
@@ -152,6 +156,7 @@ impl Default for DownloadOptions {
             auth_header: None,
             proxy: None,
             media_preset: None,
+            page_media_preset: None,
             browser_cookies: None,
             max_speed: None,
             max_retries: 8,
@@ -496,7 +501,8 @@ impl DownloadEngine {
         })
     }
 
-    /// What a media download of this one goes by (see `run_media`).
+    /// What a media download of this one goes by (see `run_media`): its settings, and the quality
+    /// asked for, else the one for a link that turns out to be media, else the default.
     fn media_options(&self) -> crate::media::MediaDownloadOptions {
         let (output_dir, output_filename) = match &self.options.output_path {
             Some(p) if is_dir_target(p) => (p.clone(), None),
@@ -513,8 +519,9 @@ impl DownloadEngine {
         } else {
             crate::media::BrowserCookieSource::None
         };
+        let preset = self.options.media_preset.as_ref().or(self.options.page_media_preset.as_ref());
         crate::media::MediaDownloadOptions {
-            preset: self.options.media_preset.clone().unwrap_or_default(),
+            preset: preset.cloned().unwrap_or_default(),
             cookies,
             proxy: self.options.proxy.clone(),
             output_dir,
@@ -4865,5 +4872,22 @@ mod tests {
         ] {
             assert_eq!(host(url), None, "{url}");
         }
+    }
+
+    #[test]
+    fn test_media_quality_is_the_one_asked_for_else_the_one_for_pages() {
+        use crate::media::MediaQualityPreset::{AudioMp3, Hd720p};
+        let preset = |media_preset, page_media_preset| {
+            engine_with(DownloadOptions { media_preset, page_media_preset, ..Default::default() }).media_options().preset
+        };
+        assert_eq!(preset(None, None), crate::media::MediaQualityPreset::default());
+        assert_eq!(preset(None, Some(AudioMp3)), AudioMp3);
+        assert_eq!(preset(Some(Hd720p), Some(AudioMp3)), Hd720p);
+        // It changes nothing the client is built from, and is kept with the other options.
+        let with = DownloadOptions { page_media_preset: Some(AudioMp3), ..Default::default() };
+        assert_eq!(ClientKey::of(&with), ClientKey::of(&DownloadOptions::default()));
+        let back: DownloadOptions = serde_json::from_str(&serde_json::to_string(&with).unwrap()).unwrap();
+        assert_eq!(back.page_media_preset, Some(AudioMp3));
+        assert_eq!(serde_json::from_str::<DownloadOptions>("{}").unwrap().page_media_preset, None);
     }
 }
