@@ -4,7 +4,7 @@ use url::Url;
 
 #[derive(Debug, Clone)]
 pub struct MetalinkFile {
-    /// Plain file name, valid on every OS; directory parts of the metalink name are dropped.
+    /// Relative path, '/'-separated, each component valid on every OS ("." parts dropped).
     pub name: String,
     pub size: Option<u64>,
     /// HTTP(S) URLs, best priority first.
@@ -14,24 +14,24 @@ pub struct MetalinkFile {
     pub hashes: Vec<(String, String)>,
 }
 
-/// Returns the last path component of a metalink file name, made valid on every OS. Rejects
-/// names that are absolute (including `C:\...`) or climb out of the download directory
-/// (RFC 5854 section 4.1.2.1).
-fn safe_file_name(name: &str) -> Result<String, String> {
+/// Returns a metalink file name as a relative path ("dir/file.iso"), each component made valid
+/// on every OS. Rejects names that are absolute (including `C:\...`) or climb out of the
+/// download directory (RFC 5854 section 4.1.2.1).
+fn safe_path(name: &str) -> Result<String, String> {
     let unsafe_name = || format!("Unsafe file name in Metalink: {:?}", name);
     let drive = matches!(name.as_bytes(), [letter, b':', b'/' | b'\\', ..] if letter.is_ascii_alphabetic());
     if name.starts_with(['/', '\\']) || drive {
         return Err(unsafe_name());
     }
     let parts: Vec<&str> = name.split(['/', '\\']).filter(|p| !p.is_empty() && *p != ".").collect();
-    if parts.contains(&"..") {
+    if parts.is_empty() || parts.contains(&"..") {
         return Err(unsafe_name());
     }
-    parts
-        .last()
-        .map(|p| crate::engine::sanitize_component(p))
-        .filter(|p| !p.is_empty())
-        .ok_or_else(unsafe_name)
+    let parts: Vec<String> = parts.into_iter().map(crate::engine::sanitize_component).collect();
+    if parts.iter().any(String::is_empty) {
+        return Err(unsafe_name());
+    }
+    Ok(parts.join("/"))
 }
 
 /// Parses RFC 5854 (.meta4) and Metalink 3.0 (.metalink) XML documents.
@@ -71,7 +71,7 @@ pub fn parse_metalink(xml_content: &str) -> Result<Vec<MetalinkFile>, String> {
                         let file_name = attr(b"name").unwrap_or_default();
                         ranked_urls.clear();
                         current_file = Some(MetalinkFile {
-                            name: safe_file_name(&file_name)?,
+                            name: safe_path(&file_name)?,
                             size: None,
                             urls: Vec::new(),
                             hashes: Vec::new(),
@@ -222,7 +222,7 @@ mod tests {
             <url type="bittorrent" preference="100">http://fast/x.iso.torrent</url>
             </resources></file></files></metalink>"#;
         let files = parse_metalink(xml).unwrap();
-        assert_eq!(files[0].name, "x.iso");
+        assert_eq!(files[0].name, "sub/dir/x.iso", "folders are kept");
         assert_eq!(files[0].urls[0].host_str(), Some("fast"));
         assert_eq!(files[0].urls.len(), 2, "torrent links are not mirrors");
 
@@ -239,14 +239,16 @@ mod tests {
         for (name, expected) in [
             ("Ep 1: Pilot.mkv", "Ep 1_ Pilot.mkv"),
             ("A: Tale.mkv", "A_ Tale.mkv"),
-            ("show/S01: &quot;Pilot&quot;?.mkv", "S01_ _Pilot__.mkv"),
+            ("show/S01: &quot;Pilot&quot;?.mkv", "show/S01_ _Pilot__.mkv"),
+            ("./a\\b:c/./d.bin", "a/b_c/d.bin"),
+            ("aux/nul.txt", "_aux/_nul.txt"),
             ("x&#x85;y&#9;.bin", "x_y_.bin"),
             ("Tom &amp; Jerry.mkv", "Tom & Jerry.mkv"),
             ("con.txt", "_con.txt"),
             // Dotfiles keep their names; only the trailing dots and spaces Windows drops go.
             (".htaccess", ".htaccess"),
-            (".config/settings.json", "settings.json"),
-            ("site/.gitignore. ", ".gitignore"),
+            (".config/settings.json", ".config/settings.json"),
+            ("site/.gitignore. ", "site/.gitignore"),
         ] {
             let xml = format!(r#"<metalink><file name="{}"><url>http://m/x</url></file></metalink>"#, name);
             assert_eq!(parse_metalink(&xml).unwrap()[0].name, expected, "{name:?}");

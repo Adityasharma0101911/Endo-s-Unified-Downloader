@@ -6,10 +6,11 @@ use eframe::egui;
 use egui::{Color32, Pos2, Rect, RichText, Stroke, Vec2};
 use hyperfetch_core::chunk::ChunkSnapshot;
 use hyperfetch_core::history::HistoryStatus;
+use hyperfetch_core::ingest::{self, truncate_chars};
 use hyperfetch_core::queue::{QueueItem, QueueItemStatus};
 
 use crate::settings::{BROWSERS, MEDIA_PRESETS};
-use crate::util::{self, format_bytes, format_duration, lock, truncate_chars, Verdict};
+use crate::util::{self, format_bytes, format_duration, lock, Verdict};
 use crate::{App, Dialog, Tab, VerifyRequest, GRAPH_WINDOW};
 
 const TEXT: Color32 = Color32::from_rgb(228, 232, 240);
@@ -81,6 +82,7 @@ pub fn render(app: &mut App, ui: &mut egui::Ui) {
     ui.add_space(8.0);
     header(app, ui);
     clipboard_banner(app, ui);
+    listing_prompt(app, ui);
     if let Some(notice) = app.notice.clone() {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
@@ -183,6 +185,32 @@ fn clipboard_banner(app: &mut App, ui: &mut egui::Ui) {
         });
 }
 
+/// Asks before adding the many downloads a large .metalink, .meta4 or .torrent lists.
+fn listing_prompt(app: &mut App, ui: &mut egui::Ui) {
+    let Some(listing) = app.listings.first() else { return };
+    let input = listing.input.clone();
+    let text = format!("{} lists {}. Add them all?", truncate_chars(&input, 55), listing.summary());
+    ui.add_space(6.0);
+    egui::Frame::none()
+        .fill(Color32::from_rgb(22, 27, 38))
+        .stroke(Stroke::new(1.0, AMBER))
+        .inner_margin(8.0)
+        .rounding(4.0)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(text).color(TEXT)).on_hover_text(&input);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button(RichText::new("Cancel").size(11.0)).clicked() {
+                        app.answer_listing(false);
+                    }
+                    if ui.add(primary_button("Add All", BLUE)).clicked() {
+                        app.answer_listing(true);
+                    }
+                });
+            });
+        });
+}
+
 // ---- Downloader tab ----------------------------------------------------------------------
 
 fn downloader_tab(app: &mut App, ui: &mut egui::Ui) {
@@ -201,7 +229,7 @@ fn downloader_tab(app: &mut App, ui: &mut egui::Ui) {
                 }
                 None => {
                     let edit = egui::TextEdit::singleline(&mut app.url_input)
-                        .hint_text(hint_text("File URL, media link (YouTube, Vimeo, Reddit, ...) or magnet link with web seeds"));
+                        .hint_text(hint_text("File URL, media link (YouTube, Vimeo, Reddit, ...), magnet link with web seeds, or .torrent/.metalink"));
                     let response = ui.add_sized([width, 26.0], edit);
                     if response.changed() {
                         app.form_error = None;
@@ -216,8 +244,8 @@ fn downloader_tab(app: &mut App, ui: &mut egui::Ui) {
             }
         });
 
-        if focused.is_none() && util::is_blob_url(&app.url_input) {
-            error_alert(ui, util::BLOB_MESSAGE);
+        if focused.is_none() && ingest::is_blob_url(&app.url_input) {
+            error_alert(ui, ingest::BLOB_MESSAGE);
         }
         if let Some(error) = &app.form_error {
             error_alert(ui, error);
@@ -765,7 +793,7 @@ fn queue_tab(app: &mut App, ui: &mut egui::Ui) {
     card().show(ui, |ui| {
         ui.label(RichText::new("Add to Queue").strong().size(13.0));
         ui.label(
-            RichText::new("One download per line; separate mirrors of the same file with spaces. Uses the folder and options from the Downloader tab.")
+            RichText::new("One download per line; separate mirrors of the same file with spaces. A .torrent or .metalink (URL, file path, or file dropped on the window) adds every file it lists. Uses the folder and options from the Downloader tab.")
                 .size(11.0)
                 .color(MUTED),
         );

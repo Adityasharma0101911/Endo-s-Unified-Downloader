@@ -5,80 +5,32 @@ use std::process::Command;
 use std::sync::{Mutex, MutexGuard};
 
 use hyperfetch_core::history::{is_redacted, redact_url, DownloadHistoryManager, HistoryEntry, REDACTED_LINK};
+use hyperfetch_core::ingest;
+use hyperfetch_core::queue::QueueItem;
 use hyperfetch_core::state::DownloadState;
-use hyperfetch_core::torrent::{is_magnet_uri, parse_magnet_uri};
 use hyperfetch_core::verify::BuildVerificationResult;
 use url::Url;
-
-pub const BLOB_MESSAGE: &str = "Browser-internal blob: URLs exist only in the browser's memory and cannot be downloaded by external tools. Copy the page URL from the address bar instead (e.g. https://www.youtube.com/watch?v=...).";
 
 /// Locks a mutex, recovering the data if another thread panicked while holding it.
 pub fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// A `blob:` URL, or a YouTube URL ending in a blob UUID pasted without its prefix.
-pub fn is_blob_url(s: &str) -> bool {
-    let s = s.trim();
-    s.starts_with("blob:")
-        || (s.contains("youtube.com")
-            && s.rsplit('/').next().is_some_and(|last| last.len() == 36 && last.matches('-').count() == 4))
-}
-
-/// Parses the mirrors of one file: whitespace-separated http(s) URLs and magnet links with
-/// HTTP web seeds.
-pub fn parse_urls(input: &str) -> Result<Vec<Url>, String> {
-    let mut urls: Vec<Url> = Vec::new();
-    for token in input.split_whitespace() {
-        if is_blob_url(token) {
-            return Err(BLOB_MESSAGE.to_string());
-        }
-        let found = if is_magnet_uri(token) {
-            let magnet = parse_magnet_uri(token).map_err(|e| format!("Invalid magnet link: {}", e))?;
-            if magnet.web_seeds.is_empty() {
-                let name = magnet.display_name.map(|n| format!(" for \"{}\"", n)).unwrap_or_default();
-                return Err(format!(
-                    "The magnet link{} has no HTTP web seeds (ws=). Peer-to-peer BitTorrent transfers are not supported, so it cannot be downloaded.",
-                    name
-                ));
-            }
-            magnet.web_seeds
-        } else {
-            let url = Url::parse(token).map_err(|e| format!("Invalid URL '{}': {}", truncate_chars(token, 80), e))?;
-            if !matches!(url.scheme(), "http" | "https") {
-                return Err(format!("Unsupported URL scheme '{}': only http and https can be downloaded", url.scheme()));
-            }
-            vec![url]
-        };
-        for url in found {
-            if !urls.contains(&url) {
-                urls.push(url);
-            }
-        }
-    }
-    if urls.is_empty() {
-        return Err("Enter a download URL".to_string());
-    }
-    Ok(urls)
-}
-
-/// Clipboard text worth offering as a download: one downloadable link.
+/// Clipboard text worth offering as a download: one downloadable link (not a .metalink or
+/// .torrent, which lists several).
 pub fn clipboard_link(text: &str) -> Option<String> {
     let text = text.trim();
-    if text.is_empty() || text.len() > 8192 || text.contains(char::is_whitespace) {
+    if text.is_empty() || text.len() > 8192 || text.contains(char::is_whitespace) || ingest::names_document(text) {
         return None;
     }
-    parse_urls(text).ok().map(|_| text.to_string())
+    ingest::link_task(&[text]).ok().map(|_| text.to_string())
 }
 
-/// At most `max` characters, ending in "..." when shortened. Never splits a character.
-pub fn truncate_chars(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let mut out: String = s.chars().take(max.saturating_sub(3)).collect();
-    out.push_str("...");
-    out
+/// The folder to create before `item` starts, since the engine takes a missing folder for a file
+/// name: its output path, unless that is the file itself (a download a metalink, torrent or
+/// magnet named; the engine creates its folders).
+pub fn folder_to_create(item: &QueueItem) -> Option<PathBuf> {
+    item.options.output_path.clone().filter(|_| !item.names_file)
 }
 
 /// `path` without a trailing `.part`: the final name of an in-progress download.
@@ -272,28 +224,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_urls_accepts_mirrors_and_rejects_bad_input() {
-        let urls = parse_urls("  https://a.com/f.iso\thttp://b.com/f.iso https://a.com/f.iso ").unwrap();
-        assert_eq!(urls.len(), 2, "duplicates are dropped");
-        assert!(parse_urls("   ").is_err());
-        assert!(parse_urls("ftp://a.com/f").unwrap_err().contains("scheme"));
-        assert!(parse_urls("not a url").unwrap_err().contains("Invalid URL"));
-        assert_eq!(parse_urls("blob:https://www.youtube.com/x").unwrap_err(), BLOB_MESSAGE);
-        assert!(parse_urls("https://www.youtube.com/0b9f5e2c-1d3a-4c5e-9f7a-123456789abc").is_err());
-    }
-
-    #[test]
-    fn magnets_need_web_seeds() {
-        let hash = "c12fe1c06bba254a9dc9f519b335aa7c1367a88a";
-        let err = parse_urls(&format!("magnet:?xt=urn:btih:{}&dn=Ubuntu", hash)).unwrap_err();
-        assert!(err.contains("\"Ubuntu\"") && err.contains("web seeds"), "{}", err);
-        let seeded = format!("magnet:?xt=urn:btih:{}&dn=f.iso&ws=https%3A%2F%2Fmirror.example%2Ff.iso", hash);
-        assert_eq!(parse_urls(&seeded).unwrap(), vec![Url::parse("https://mirror.example/f.iso").unwrap()]);
-        assert!(clipboard_link(&seeded).is_some());
-        assert!(clipboard_link(&format!("magnet:?xt=urn:btih:{}", hash)).is_none());
-    }
-
-    #[test]
     fn clipboard_link_only_takes_single_links() {
         let long = format!("https://ja.wikipedia.org/wiki/{}", "東京都の区市町村".repeat(4));
         assert_eq!(clipboard_link(&format!("  {}\n", long)), Some(long));
@@ -301,16 +231,36 @@ mod tests {
         assert_eq!(clipboard_link("https://a.com/x https://b.com/x"), None);
         assert_eq!(clipboard_link("hello"), None);
         assert_eq!(clipboard_link("file:///etc/passwd"), None);
+        assert_eq!(clipboard_link("blob:https://www.youtube.com/x"), None);
+        let hash = "c12fe1c06bba254a9dc9f519b335aa7c1367a88a";
+        let seeded = format!("magnet:?xt=urn:btih:{}&dn=f.iso&ws=https%3A%2F%2Fmirror.example%2Ff.iso", hash);
+        assert!(clipboard_link(&seeded).is_some());
+        assert!(clipboard_link(&format!("magnet:?xt=urn:btih:{}", hash)).is_none());
+        // A document lists downloads rather than being one.
+        assert_eq!(clipboard_link("https://a.com/list.meta4"), None);
+        assert_eq!(clipboard_link("https://a.com/x.torrent"), None);
     }
 
     #[test]
-    fn truncate_chars_never_splits_characters() {
-        let url = format!("https://ja.wikipedia.org/wiki/{}", "東京都の区市町村".repeat(5));
-        let short = truncate_chars(&url, 55);
-        assert_eq!(short.chars().count(), 55);
-        assert!(short.ends_with("..."));
-        assert_eq!(truncate_chars("héllo", 5), "héllo");
-        assert_eq!(truncate_chars("héllo!", 5), "hé...");
+    fn only_a_folder_to_save_into_is_created_before_a_download() {
+        let dir = Path::new("dl");
+        let item = |output: PathBuf, named: bool, target: Option<PathBuf>| {
+            let mut queue = hyperfetch_core::DownloadQueue::new();
+            let options = hyperfetch_core::engine::DownloadOptions { output_path: Some(output), ..Default::default() };
+            let urls = vec![Url::parse("https://a.example/x.iso").unwrap()];
+            let id = if named { queue.add_named_item(urls, options) } else { queue.add_item(urls, options) };
+            let mut item = queue.get_item(id).unwrap().clone();
+            item.target_path = target;
+            item
+        };
+        // Saved under the server's name: the folder, whether or not the engine reported the file yet.
+        assert_eq!(folder_to_create(&item(dir.into(), false, None)), Some(dir.into()));
+        assert_eq!(folder_to_create(&item(dir.into(), false, Some(dir.join("x.iso")))), Some(dir.into()));
+        // Named by its input: the path is the file, whose folders the engine creates, before and
+        // after the engine reported where it went.
+        let file = dir.join("sub").join("x.iso");
+        assert_eq!(folder_to_create(&item(file.clone(), true, None)), None);
+        assert_eq!(folder_to_create(&item(file, true, Some(dir.join("sub").join("x (1).iso")))), None);
     }
 
     #[cfg(windows)]
