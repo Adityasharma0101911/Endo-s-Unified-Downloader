@@ -808,13 +808,39 @@ fn http_client(proxy: Option<&str>) -> Result<reqwest::Client, String> {
 /// Serializes installs and updates of the managed yt-dlp across concurrent media jobs.
 static INSTALL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-async fn install_managed_ytdlp(proxy: Option<&str>) -> Result<PathBuf, String> {
+/// When installing yt-dlp last failed, and why (see [`install_managed_ytdlp`]).
+static INSTALL_FAILED: parking_lot::Mutex<Option<(tokio::time::Instant, String)>> = parking_lot::const_mutex(None);
+
+/// How long after installing yt-dlp failed a run that may do without it does so rather than try
+/// again: each web page downloaded would otherwise wait for another attempt (see
+/// [`find_site_media`]).
+const INSTALL_RETRY_AFTER: Duration = Duration::from_secs(15 * 60);
+
+/// Installs the managed yt-dlp, unless a concurrent job did. Unless `retry`, a failure less than
+/// [`INSTALL_RETRY_AFTER`] ago stands for this attempt, also for the jobs that waited for it.
+async fn install_managed_ytdlp(proxy: Option<&str>, retry: bool) -> Result<PathBuf, String> {
     let _guard = INSTALL_LOCK.lock().await;
     // A concurrent job may have installed it while we waited for the lock.
     if let Ok(Some(installed)) = tokio::task::spawn_blocking(installed_managed_ytdlp).await {
         return Ok(installed);
     }
-    download_ytdlp_binary(&http_client(proxy)?).await
+    unless_failed_lately(&INSTALL_FAILED, retry, async { download_ytdlp_binary(&http_client(proxy)?).await }).await
+}
+
+/// `install`, whose failure `failed` keeps; unless `retry` is false and the last one it keeps is
+/// less than [`INSTALL_RETRY_AFTER`] old, which then stands for it.
+async fn unless_failed_lately(
+    failed: &parking_lot::Mutex<Option<(tokio::time::Instant, String)>>,
+    retry: bool,
+    install: impl std::future::Future<Output = Result<PathBuf, String>>,
+) -> Result<PathBuf, String> {
+    let lately = failed.lock().clone().filter(|(at, _)| !retry && at.elapsed() < INSTALL_RETRY_AFTER);
+    if let Some((at, e)) = lately {
+        return Err(format!("Installing yt-dlp failed {}s ago: {e}", at.elapsed().as_secs()));
+    }
+    let installed = install.await;
+    *failed.lock() = installed.as_ref().err().map(|e| (tokio::time::Instant::now(), e.clone()));
+    installed
 }
 
 /// Installs the latest release as the managed yt-dlp if `current` is older, and returns the
@@ -2425,7 +2451,7 @@ pub(crate) async fn download_media_with(
     fetch: Option<&StreamFetcher<'_>>,
     extracted: Option<Extracted>,
 ) -> Result<PathBuf, String> {
-    let (options, tools) = prepare(options, &cancel_flag).await?;
+    let (options, tools) = prepare(options, &cancel_flag, true).await?;
     if tools.ffmpeg.is_none() {
         tracing::warn!(
             "ffmpeg not found: yt-dlp cannot merge separate video and audio streams, so it will fall back \
@@ -2444,7 +2470,7 @@ pub(crate) async fn find_site_media(
     options: &MediaDownloadOptions,
     cancel_flag: Option<Arc<AtomicBool>>,
 ) -> Result<Extracted, String> {
-    let (options, tools) = prepare(options, &cancel_flag).await?;
+    let (options, tools) = prepare(options, &cancel_flag, false).await?;
     find_with(url, &options, &tools, cancel_flag).await.map_err(drm_refused)
 }
 
@@ -2482,10 +2508,12 @@ fn drm_refused(error: String) -> String {
 }
 
 /// `options` with every path absolute, as yt-dlp needs them (it runs in [`ytdlp_work_dir`]), and
-/// the programs a media download with them works with: yt-dlp is installed if none is found.
+/// the programs a media download with them works with: yt-dlp is installed if none is found,
+/// unless installing it failed lately and `retry_install` is false (see [`install_managed_ytdlp`]).
 async fn prepare(
     options: &MediaDownloadOptions,
     cancel_flag: &Option<Arc<AtomicBool>>,
+    retry_install: bool,
 ) -> Result<(MediaDownloadOptions, Tools<'static>), String> {
     // First-time discovery stats every PATH entry (possibly on slow network drives).
     let (found_ytdlp, ffmpeg, js_runtime) =
@@ -2507,7 +2535,7 @@ async fn prepare(
         (Some(path), _) => absolute(path)?,
         (None, Some(path)) => path,
         (None, None) => tokio::select! {
-            installed = install_managed_ytdlp(options.proxy.as_deref()) => installed?,
+            installed = install_managed_ytdlp(options.proxy.as_deref(), retry_install) => installed?,
             _ = wait_cancelled(cancel_flag.clone()) => return Err(CANCELLED.to_string()),
         },
     };
@@ -4531,5 +4559,31 @@ mod tests {
         }
         let other = "ERROR: [youtube] abc: Video unavailable";
         assert_eq!(drm_refused(other.to_string()), other);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_install_is_not_tried_again_for_a_while_unless_asked() {
+        let failed = parking_lot::Mutex::new(None);
+        let tries = std::cell::Cell::new(0);
+        let install = |works: bool| {
+            let tries = &tries;
+            async move {
+                tries.set(tries.get() + 1);
+                if works { Ok(PathBuf::from("yt-dlp")) } else { Err("offline".to_string()) }
+            }
+        };
+        assert_eq!(unless_failed_lately(&failed, false, install(false)).await, Err("offline".to_string()));
+        // The page checks right after it go without yt-dlp, the jobs that waited for it too.
+        tokio::time::advance(INSTALL_RETRY_AFTER / 2).await;
+        let err = unless_failed_lately(&failed, false, install(true)).await.unwrap_err();
+        assert!(err.starts_with("Installing yt-dlp failed") && err.ends_with("offline"), "{err}");
+        assert_eq!(tries.get(), 1);
+        // A media download tries at once.
+        assert_eq!(unless_failed_lately(&failed, true, install(false)).await, Err("offline".to_string()));
+        assert_eq!(tries.get(), 2);
+        // Later, so do page checks; a success forgets the failure.
+        tokio::time::advance(INSTALL_RETRY_AFTER).await;
+        assert_eq!(unless_failed_lately(&failed, false, install(true)).await, Ok(PathBuf::from("yt-dlp")));
+        assert!(failed.lock().is_none());
     }
 }
