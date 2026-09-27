@@ -55,22 +55,27 @@ const MAX_UNWRAPS: usize = 5;
 
 /// Last-segment extensions that name a file, never a web page (see `check_answer`).
 const FILE_EXTENSIONS: &[&str] = &[
-    // Archives
-    "zip", "7z", "rar", "tar", "gz", "tgz", "bz2", "xz", "zst", "lzma", "cab",
+    // Archives, and the parts of split ones
+    "zip", "7z", "rar", "tar", "gz", "tgz", "bz2", "tbz", "tbz2", "xz", "txz", "zst", "lzma", "lz4", "cab", "001",
     // Installers and packages
     "exe", "msi", "msix", "msixbundle", "appx", "appxbundle", "dmg", "pkg", "deb", "rpm", "apk", "xapk", "ipa",
-    "appimage", "flatpak", "snap", "jar", "whl",
+    "appimage", "flatpak", "snap", "jar", "whl", "nupkg", "vsix", "xpi", "crx",
     // Disk images
-    "iso", "img", "vhd", "vhdx", "vmdk", "qcow2", "ova",
+    "iso", "img", "vhd", "vhdx", "vmdk", "qcow2", "ova", "chd",
     // Audio and video
-    "mp3", "flac", "wav", "m4a", "aac", "ogg", "opus", "wma", "mp4", "m4v", "mkv", "webm", "mov", "avi", "wmv",
-    "flv", "mpg", "mpeg",
+    "mp3", "flac", "wav", "m4a", "m4b", "aac", "ogg", "opus", "wma", "mka", "mp4", "m4v", "mkv", "webm", "mov",
+    "avi", "wmv", "flv", "mpg", "mpeg", "ts", "m2ts", "ogv", "3gp",
+    // Images
+    "jpg", "jpeg", "png", "gif", "webp", "avif", "heic", "heif", "tif", "tiff", "bmp", "psd",
+    // Fonts
+    "ttf", "otf", "woff", "woff2",
     // Documents
     "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "odp", "rtf", "epub", "mobi", "djvu",
     "cbz", "cbr",
     // Model weights
     "safetensors", "gguf", "ckpt", "pt", "pth", "bin", "onnx", "h5",
-    "torrent",
+    // Documents that list downloads
+    "torrent", "metalink", "meta4",
 ];
 
 /// File-share services not supported yet, by the domains (subdomains included) of their pages;
@@ -1879,6 +1884,14 @@ mod tests {
             ("https://example.com/files/app.zip", Some("https://example.com/login?next=%2Ffiles%2Fapp.zip"), "app.zip"),
             ("https://example.com/get?id=3", Some("https://cdn.example.com/m/model.safetensors"), "model.safetensors"),
             ("https://example.com/t/linux.torrent", None, "linux.torrent"),
+            ("https://example.com/t/release.meta4", None, "release.meta4"),
+            // A hotlinked or expired image, a stream's segment, a font, an extension.
+            ("https://cdn.example/photos/sunset.jpg", None, "sunset.jpg"),
+            ("https://cdn.example/photos/IMG_0001.HEIC", None, "IMG_0001.HEIC"),
+            ("https://cdn.example/live/stream.ts", None, "stream.ts"),
+            ("https://cdn.example/fonts/Inter.woff2", None, "Inter.woff2"),
+            ("https://example.com/addons/tool.xpi", None, "tool.xpi"),
+            ("https://example.com/rom/game.7z.001", None, "game.7z.001"),
         ] {
             let err = refusal(url, final_url, &page).unwrap_or_else(|| panic!("{url}"));
             assert!(err.contains(&format!("the server sent a web page instead of {} (the link may need a login", file)), "{err}");
