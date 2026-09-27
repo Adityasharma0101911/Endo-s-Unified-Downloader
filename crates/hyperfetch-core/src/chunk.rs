@@ -89,14 +89,22 @@ pub struct Chunk {
     /// Cancelled when another worker takes over what is left: the attempt's worker then stops at
     /// once and settles nothing, since the chunk is no longer its own.
     pub(crate) revoked: CancellationToken,
-    /// Since when the attempt's worker has been waiting for the server without a byte; `None`
-    /// while it is busy (writing, rate limited) rather than waiting, and until the attempt has its
-    /// answer: a server slow to answer is no silent one, and the wait for an answer has the stall
-    /// timeout of its own.
-    waiting: Arc<Mutex<Option<Instant>>>,
+    /// What the current attempt's worker tells of it, shared with that worker.
+    attempt: Arc<Mutex<Attempt>>,
     not_before: Option<Instant>,
     assigned_at: Option<Instant>,
-    assigned_offset: u64,
+}
+
+/// How an attempt at a chunk goes, as its worker tells it.
+#[derive(Debug, Default)]
+struct Attempt {
+    /// When its answer came, and the chunk's offset then: its rate counts from there, as the wait
+    /// for the answer moved no bytes.
+    answered: Option<(Instant, u64)>,
+    /// Since when its worker has been waiting for the server without a byte; `None` while it is
+    /// busy (writing, rate limited) rather than waiting, and until the answer came: a server slow
+    /// to answer is no silent one, and the wait for an answer has the stall timeout of its own.
+    waiting: Option<Instant>,
 }
 
 impl Chunk {
@@ -109,27 +117,33 @@ impl Chunk {
             current_offset: Arc::new(AtomicU64::new(range.start)),
             end_offset: Arc::new(AtomicU64::new(range.end)),
             revoked: CancellationToken::new(),
-            waiting: Arc::new(Mutex::new(None)),
+            attempt: Arc::default(),
             not_before: None,
             assigned_at: None,
-            assigned_offset: range.start,
         }
     }
 
-    /// The attempt's worker waits for the server from `since` on (a time in the future while
-    /// the rate limit holds it back).
+    /// The attempt's answer came at `at`: from then on its worker waits for the server's bytes.
+    pub(crate) fn answered(&self, at: Instant) {
+        let from = self.current_offset.load(Ordering::SeqCst);
+        let mut attempt = self.attempt.lock();
+        attempt.answered = Some((at, from));
+        attempt.waiting = Some(at);
+    }
+
+    /// The attempt's worker waits for the server from `since` on.
     pub(crate) fn wait_for_server(&self, since: Instant) {
-        *self.waiting.lock() = Some(since);
+        self.attempt.lock().waiting = Some(since);
     }
 
     /// The attempt's worker is busy with what arrived, not waiting for the server.
     pub(crate) fn busy(&self) {
-        *self.waiting.lock() = None;
+        self.attempt.lock().waiting = None;
     }
 
     /// How long the attempt's worker has been waiting for the server without a byte.
     fn silence(&self, now: Instant) -> Duration {
-        self.waiting.lock().map_or(Duration::ZERO, |since| now.saturating_duration_since(since))
+        self.attempt.lock().waiting.map_or(Duration::ZERO, |since| now.saturating_duration_since(since))
     }
 
     pub fn is_completed(&self) -> bool {
@@ -164,15 +178,20 @@ impl Chunk {
         self.written_prefix().map_or(0, |r| r.len())
     }
 
-    /// Bytes per second written since assignment; `None` before anything arrived.
+    /// Bytes per second written since the attempt's answer came: the wait for the answer is no
+    /// transfer, and counted in, it would make an attempt that just answered after a long wait
+    /// look nearly stalled. `None` before the answer, and until a first batch of what it brings is
+    /// on disk, which a worker writes once it holds a few hundred KiB or a quarter of a second of
+    /// data: the least a rate is measured over.
     fn rate(&self, now: Instant) -> Option<f64> {
-        let received = self.current_offset.load(Ordering::SeqCst).saturating_sub(self.assigned_offset);
-        let elapsed = self.assigned_at.map_or(0.0, |t| now.duration_since(t).as_secs_f64());
+        let (at, from) = self.attempt.lock().answered?;
+        let received = self.current_offset.load(Ordering::SeqCst).saturating_sub(from);
+        let elapsed = now.saturating_duration_since(at).as_secs_f64();
         (received > 0 && elapsed > 0.0).then(|| received as f64 / elapsed)
     }
 
     /// How the chunk's worker is expected to go on: seconds until its next byte, and bytes per
-    /// second from then on. Once it has a rate since assignment, that rate at once; before, what
+    /// second from then on. Once it has a rate since its answer, that rate at once; before, what
     /// a request to its mirror costs (`expected`), less the part of the startup already behind it.
     /// `None` without either.
     fn pace(&self, now: Instant, expected: Option<&StealTiming>) -> Option<(f64, f64)> {
@@ -345,8 +364,8 @@ impl ChunkManager {
         chunk.status = ChunkStatus::Assigned { worker_id, mirror_id };
         chunk.not_before = None;
         chunk.assigned_at = Some(now);
-        chunk.assigned_offset = chunk.current_offset.load(Ordering::SeqCst);
-        chunk.busy();
+        // Whatever an earlier worker told of its attempt stays with it.
+        chunk.attempt = Arc::default();
         chunk.clone()
     }
 
@@ -403,7 +422,6 @@ impl ChunkManager {
         chunk.current_offset = Arc::new(AtomicU64::new(pos));
         chunk.end_offset = Arc::new(AtomicU64::new(end));
         chunk.revoked = CancellationToken::new();
-        chunk.waiting = Arc::new(Mutex::new(None));
         Some(self.assign(id, thief_worker_id, thief_mirror_id, now))
     }
 
@@ -581,14 +599,15 @@ impl ChunkManager {
         self.chunks.get_mut(chunk_id).ok_or(ChunkError::NotFound(chunk_id))
     }
 
-    /// Moves a chunk's assignment and its worker's wait `by` into the past, as if its worker had
-    /// been at it that long.
+    /// Moves a chunk's assignment, its answer and its worker's wait `by` into the past, as if its
+    /// worker had been at it that long.
     #[cfg(test)]
     pub(crate) fn backdate(&mut self, chunk_id: usize, by: Duration) {
         let chunk = &mut self.chunks[chunk_id];
         chunk.assigned_at = chunk.assigned_at.and_then(|t| t.checked_sub(by));
-        let waiting = *chunk.waiting.lock();
-        *chunk.waiting.lock() = waiting.and_then(|t| t.checked_sub(by));
+        let mut attempt = chunk.attempt.lock();
+        attempt.answered = attempt.answered.and_then(|(at, from)| Some((at.checked_sub(by)?, from)));
+        attempt.waiting = attempt.waiting.and_then(|t| t.checked_sub(by));
     }
 }
 
@@ -641,8 +660,8 @@ mod tests {
     #[test]
     fn test_steal_prefers_longest_eta() {
         let mut manager = ChunkManager::new(10 * MB, 6 * MB).unwrap();
-        let fast = manager.get_next_work(0, 0).unwrap(); // [0, 6MB)
-        let slow = manager.get_next_work(1, 0).unwrap(); // [6MB, 10MB)
+        let fast = answering(&mut manager, 0, 0); // [0, 6MB)
+        let slow = answering(&mut manager, 1, 0); // [6MB, 10MB)
         fast.current_offset.store(MB, Ordering::SeqCst);
         slow.current_offset.store(6 * MB + 1, Ordering::SeqCst);
         std::thread::sleep(Duration::from_millis(5));
@@ -656,10 +675,18 @@ mod tests {
         assert!(manager.steal_work(1, 0, MB).is_some());
     }
 
-    /// A manager with one chunk of `size` whose worker wrote `written` bytes over the last `secs`.
+    /// The next chunk for `worker_id` on mirror `mirror_id`, whose answer has just come.
+    fn answering(manager: &mut ChunkManager, worker_id: usize, mirror_id: usize) -> Chunk {
+        let chunk = manager.get_next_work(worker_id, mirror_id).unwrap();
+        chunk.answered(Instant::now());
+        chunk
+    }
+
+    /// A manager with one chunk of `size` whose worker wrote `written` bytes over the `secs` since
+    /// its answer came.
     fn one_victim(size: u64, written: u64, secs: u64) -> ChunkManager {
         let mut manager = ChunkManager::new(size, size).unwrap();
-        manager.get_next_work(0, 0).unwrap().current_offset.store(written, Ordering::SeqCst);
+        answering(&mut manager, 0, 0).current_offset.store(written, Ordering::SeqCst);
         manager.backdate(0, Duration::from_secs(secs));
         manager
     }
@@ -725,6 +752,29 @@ mod tests {
     }
 
     #[test]
+    fn test_a_chunk_is_timed_from_its_answer_not_its_request() {
+        // The answer took 2 s to come, then brought 0.5 MB in 0.1 s: the worker goes on at 5 MB/s,
+        // not the 0.24 MB/s the time since its request would make of it.
+        let mut manager = ChunkManager::new(100 * MB, 100 * MB).unwrap();
+        let chunk = manager.get_next_work(0, 0).unwrap();
+        manager.backdate(0, Duration::from_secs(2));
+        chunk.answered(Instant::now());
+        let mirror = [cost(2.0, 5.0 * MB as f64)];
+        let pace = |manager: &ChunkManager| manager.chunks()[0].pace(Instant::now(), Some(&mirror[0]));
+        assert_eq!(pace(&manager), Some((0.0, 5.0 * MB as f64)), "nothing on disk yet: the mirror's rate");
+        chunk.current_offset.store(MB / 2, Ordering::SeqCst);
+        manager.backdate(0, Duration::from_millis(100));
+        let (_, rate) = pace(&manager).unwrap();
+        assert!((rate / (5.0 * MB as f64) - 1.0).abs() < 0.1, "{rate}");
+
+        // A thief as fast after its own 2 s: both finish together once the victim keeps 5 MB more
+        // than half of the 99.5 MB left, rather than a sliver it would end long before the thief.
+        let (_, stolen) = manager.steal_work(1, 0, timed(64 * 1024, &mirror)).unwrap();
+        let fair = (99.5 - 10.0) / 2.0 * MB as f64;
+        assert!((stolen.range.len() as f64 - fair).abs() < 2.0 * MB as f64, "stole {} of 99.5 MB", stolen.range.len());
+    }
+
+    #[test]
     fn test_thieves_in_a_row_split_the_straggler_not_each_others_fresh_chunks() {
         // 18 MiB left at 2 MiB/s: 9 s. Seven idle workers arrive one after the other, each a new
         // request that starts after 0.3 s and then moves 2 MiB/s, as the straggler does.
@@ -746,18 +796,10 @@ mod tests {
 
     const SILENT: Duration = Duration::from_secs(2);
 
-    /// The next chunk for `worker_id` on mirror `mirror_id`, whose answer has come: its worker
-    /// waits for the server's bytes from now on, as a worker receiving it does.
-    fn answered(manager: &mut ChunkManager, worker_id: usize, mirror_id: usize) -> Chunk {
-        let chunk = manager.get_next_work(worker_id, mirror_id).unwrap();
-        chunk.wait_for_server(Instant::now());
-        chunk
-    }
-
     #[test]
     fn test_silent_chunk_is_taken_over_keeping_what_it_wrote() {
         let mut manager = ChunkManager::new(4 * MB, 4 * MB).unwrap();
-        let silent = answered(&mut manager, 0, 0);
+        let silent = answering(&mut manager, 0, 0);
         silent.current_offset.store(MB, Ordering::SeqCst);
         manager.backdate(0, Duration::from_secs(3));
 
@@ -785,8 +827,8 @@ mod tests {
     fn test_silent_chunk_that_wrote_nothing_is_handed_over_whole() {
         // Its answer came, and then not a byte, at the very start of the file.
         let mut manager = ChunkManager::new(2 * MB, MB).unwrap();
-        let silent = answered(&mut manager, 0, 0);
-        let other = answered(&mut manager, 1, 0);
+        let silent = answering(&mut manager, 0, 0);
+        let other = answering(&mut manager, 1, 0);
         manager.backdate(0, Duration::from_secs(3));
 
         let taken = manager.take_over_silent(2, 0, |_| SILENT).unwrap();
@@ -814,7 +856,7 @@ mod tests {
 
         // A retry waits for an answer of its own, however long the attempt before it waited for
         // bytes.
-        waiting.wait_for_server(Instant::now());
+        waiting.answered(Instant::now());
         manager.backdate(0, Duration::from_secs(3));
         manager.mark_failed(0, "stalled", Duration::ZERO, false).unwrap();
         let retry = manager.get_next_work(1, 0).unwrap();
@@ -827,9 +869,9 @@ mod tests {
     #[test]
     fn test_only_a_long_silence_is_taken_over() {
         let mut manager = ChunkManager::new(3 * MB, MB).unwrap();
-        let quiet = answered(&mut manager, 0, 0);
-        let quieter = answered(&mut manager, 1, 1);
-        let working = answered(&mut manager, 2, 0);
+        let quiet = answering(&mut manager, 0, 0);
+        let quieter = answering(&mut manager, 1, 1);
+        let working = answering(&mut manager, 2, 0);
         manager.backdate(0, Duration::from_secs(3));
         manager.backdate(1, Duration::from_secs(5));
         manager.backdate(2, Duration::from_secs(9));
@@ -843,8 +885,8 @@ mod tests {
         assert!(!quieter.revoked.is_cancelled() && !working.revoked.is_cancelled());
         // Of several silent chunks, the one silent longest goes first.
         let mut manager = ChunkManager::new(2 * MB, MB).unwrap();
-        answered(&mut manager, 0, 0);
-        answered(&mut manager, 1, 0);
+        answering(&mut manager, 0, 0);
+        answering(&mut manager, 1, 0);
         manager.backdate(0, Duration::from_secs(3));
         manager.backdate(1, Duration::from_secs(4));
         assert_eq!(manager.take_over_silent(2, 0, |_| SILENT).unwrap().id, 1);
@@ -853,7 +895,7 @@ mod tests {
     #[test]
     fn test_a_silent_chunk_that_finished_meanwhile_is_completed_not_handed_over() {
         let mut manager = ChunkManager::new(MB, MB).unwrap();
-        let silent = answered(&mut manager, 0, 0);
+        let silent = answering(&mut manager, 0, 0);
         manager.backdate(0, Duration::from_secs(3));
         // The worker's last batch lands just as its chunk is picked to be taken over.
         let lands = |_| {
