@@ -73,7 +73,8 @@ const FILE_EXTENSIONS: &[&str] = &[
     "torrent",
 ];
 
-/// File-share services not supported yet, by the domains (subdomains included) of their pages.
+/// File-share services not supported yet, by the domains (subdomains included) of their pages;
+/// those of their pages yt-dlp downloads aside (see `yt_dlp_share_page`).
 const UNSUPPORTED_SHARES: &[(&str, &[&str])] = &[
     ("MEGA", &["mega.nz", "mega.io", "mega.co.nz"]),
     ("OneDrive", &["1drv.ms", "onedrive.live.com"]),
@@ -350,8 +351,8 @@ fn country_domain(domain: &str) -> bool {
 
 /// Fails if the answer to `url` (which ended at `final_url`), with these headers, is a web page
 /// instead of the file it stands for: HTML not sent as an attachment (a hosted .html file is
-/// one) from Drive, from Google asking to sign in to a document, from a file-share service not
-/// supported yet, or for a link that names a file. Other pages are looked into for a video.
+/// one) from Drive, from Google asking to sign in to a document, for a link that names a file,
+/// or from a file-share service not supported yet. Other pages are looked into for a video.
 pub fn check_answer(url: &Url, final_url: &Url, headers: &HeaderMap) -> Result<(), ResolverError> {
     GoogleDriveResolver::check_answer(url, headers)?;
     if !html_type(headers) || is_attachment(headers) {
@@ -363,14 +364,15 @@ pub fn check_answer(url: &Url, final_url: &Url, headers: &HeaderMap) -> Result<(
                 .to_string(),
         ));
     }
-    if let Some(service) = unsupported_share(url).or_else(|| unsupported_share(final_url)) {
-        return Err(ResolverError::NotFound(format!("{} links are not supported yet", service)));
-    }
+    // Before the services: a link of theirs that names a file is one to the file, gone stale.
     if let Some(file) = named_file(url).or_else(|| named_file(final_url)) {
         return Err(ResolverError::NotFound(format!(
             "the server sent a web page instead of {} (the link may need a login, have expired, or lead to a download page)",
             file
         )));
+    }
+    if let Some(service) = unsupported_share_answer(url, final_url) {
+        return Err(ResolverError::NotFound(format!("{} links are not supported yet", service)));
     }
     Ok(())
 }
@@ -380,6 +382,37 @@ fn unsupported_share(url: &Url) -> Option<&'static str> {
     let host = url.host_str()?.trim_end_matches('.');
     let on = |domain: &&str| host == *domain || host.strip_suffix(domain).is_some_and(|sub| sub.ends_with('.'));
     UNSUPPORTED_SHARES.iter().find(|(_, domains)| domains.iter().any(on)).map(|(service, _)| *service)
+}
+
+/// The file-share service not supported yet that answered with a page: where the answer ended,
+/// unless yt-dlp downloads that page (see [`yt_dlp_share_page`]), else where it began, when the
+/// service sent it on elsewhere (to a sign-in page).
+fn unsupported_share_answer(url: &Url, final_url: &Url) -> Option<&'static str> {
+    match unsupported_share(final_url) {
+        Some(_) if yt_dlp_share_page(final_url) => None,
+        Some(service) => Some(service),
+        None => unsupported_share(url),
+    }
+}
+
+/// Whether `url` is a share page of a service in [`UNSUPPORTED_SHARES`] that yt-dlp's own
+/// extractor for it takes (as its URL patterns match them): Box shares, SharePoint videos, and
+/// Yandex Disk shares. Such a page goes on to the page handling, which hands it to yt-dlp.
+fn yt_dlp_share_page(url: &Url) -> bool {
+    let (host, path) = (url.host_str().unwrap_or_default(), url.path());
+    let has = |key: &str| url.query_pairs().any(|(k, _)| k == key);
+    match unsupported_share(url) {
+        // (app|ent).box.com/s/..., under a company's subdomain or not.
+        Some("Box") => {
+            let sub = host.strip_suffix(".box.com").unwrap_or_default();
+            matches!(sub.rsplit('.').next(), Some("app" | "ent")) && path.starts_with("/s/")
+        }
+        Some("SharePoint") => path.starts_with("/:v:/") || (path.ends_with("/stream.aspx") && has("id")),
+        Some("Yandex Disk") => {
+            path.starts_with("/d/") || path.starts_with("/i/") || (path.starts_with("/public") && has("hash"))
+        }
+        _ => false,
+    }
 }
 
 /// The name of the file `url` names by one of the [`FILE_EXTENSIONS`], if it does.
@@ -1585,22 +1618,71 @@ mod tests {
             ("https://gofile.io/d/abc", "Gofile"),
             ("https://pixeldrain.com/u/abc", "Pixeldrain"),
             ("https://www.icloud.com/iclouddrive/abc#file", "iCloud"),
-            ("https://yadi.sk/d/abc", "Yandex Disk"),
-            ("https://disk.yandex.ru/d/abc", "Yandex Disk"),
+            ("https://disk.yandex.ru/client/disk", "Yandex Disk"),
             ("https://u.pcloud.link/publink/show?code=abc", "pCloud"),
-            ("https://app.box.com/s/abc", "Box"),
             ("https://acme.app.box.com/v/files", "Box"),
+            ("https://app.box.com/folder/123", "Box"),
+            ("https://contoso.sharepoint.com/sites/team/_layouts/15/stream.aspx", "SharePoint"),
         ] {
             assert_eq!(refusal(url, None, &page), Some(format!("Direct download link not found: {} links are not supported yet", service)));
         }
-        // A shortened link that lands on one.
-        let err = refusal("https://bit.ly/abc", Some("https://mega.nz/file/abc"), &page).unwrap();
-        assert!(err.contains("MEGA links are not supported yet"), "{err}");
+        // A shortened link that lands on one, and share links yt-dlp would take that sent the
+        // browser on to sign in instead: yt-dlp is handed the page answered, not the link.
+        for (url, final_url, service) in [
+            ("https://bit.ly/abc", "https://mega.nz/file/abc", "MEGA"),
+            ("https://yadi.sk/d/abc", "https://passport.yandex.ru/auth?retpath=x", "Yandex Disk"),
+            ("https://app.box.com/s/abc", "https://account.box.com/login?redirect_url=%2Fs%2Fabc", "Box"),
+            (
+                "https://contoso.sharepoint.com/:v:/g/personal/user_contoso_com/EabcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRS",
+                "https://login.microsoftonline.com/common/oauth2/authorize?client_id=x",
+                "SharePoint",
+            ),
+        ] {
+            let err = refusal(url, Some(final_url), &page).unwrap_or_else(|| panic!("{url}"));
+            assert!(err.contains(&format!("{service} links are not supported yet")), "{err}");
+        }
         // The files these services serve are downloads like any other, and look-alike hosts are not theirs.
         let file = headers(&[(CONTENT_TYPE, "application/octet-stream")]);
         assert_eq!(refusal("https://pixeldrain.com/api/file/abc?download", None, &file), None);
         for elsewhere in ["https://notbox.com/s/abc", "https://example.com/mega.nz", "https://megalodon.nz/file/abc"] {
             assert_eq!(refusal(elsewhere, None, &page), None, "{elsewhere}");
+        }
+        // A link of theirs that names a file is one to the file, gone stale: said so, not that the
+        // service is not supported.
+        for (url, file) in [
+            ("https://p-lux3.pcloud.com/cBZabcdefghij/Backup%202024.zip", "Backup 2024.zip"),
+            ("https://app.box.com/shared/static/abcdefghijklmnop.zip", "abcdefghijklmnop.zip"),
+            ("https://contoso.sharepoint.com/sites/team/Shared%20Documents/report.docx", "report.docx"),
+        ] {
+            let err = refusal(url, None, &page).unwrap_or_else(|| panic!("{url}"));
+            assert!(err.contains(&format!("the server sent a web page instead of {file} (")), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_share_pages_yt_dlp_downloads_go_on_to_the_page_handling() {
+        // As yt-dlp's Box, SharePoint and Yandex Disk extractors match them.
+        let page = headers(&[(CONTENT_TYPE, "text/html; charset=utf-8")]);
+        for (url, final_url) in [
+            ("https://app.box.com/s/abc123", None),
+            ("https://acme.app.box.com/s/abc123/file/456", None),
+            ("https://acme.ent.box.com/s/abc123", None),
+            ("https://box.com/s/abc123", Some("https://app.box.com/s/abc123")),
+            ("https://bit.ly/abc", Some("https://app.box.com/s/abc123")),
+            ("https://contoso.sharepoint.com/:v:/g/personal/user_contoso_com/EabcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRS?e=x", None),
+            (
+                "https://contoso.sharepoint.com/:v:/g/personal/user_contoso_com/EabcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRS",
+                Some("https://contoso-my.sharepoint.com/personal/user_contoso_com/_layouts/15/stream.aspx?id=%2Fpersonal%2Fv.mp4"),
+            ),
+            ("https://yadi.sk/d/abc", Some("https://disk.yandex.ru/d/abc")),
+            ("https://yadi.sk/i/abc", None),
+            ("https://disk.yandex.com/d/abc", None),
+            ("https://disk.360.yandex.ru/d/abc", None),
+            ("https://disk.yandex.ru/public?hash=abc%3D", None),
+        ] {
+            assert_eq!(refusal(url, final_url, &page), None, "{url} -> {final_url:?}");
+            let landed = Url::parse(final_url.unwrap_or(url)).unwrap();
+            assert!(HtmlVideoResolver::is_page(&landed, &page), "{landed}");
         }
     }
 
