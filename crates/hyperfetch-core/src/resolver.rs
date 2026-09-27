@@ -409,6 +409,8 @@ impl HtmlVideoResolver {
 
     /// Where the page `html`, from `page_url`, sends the browser at once: the target of a
     /// `<meta http-equiv="refresh" content="0; url=...">` (t.co answers this way), if it has one.
+    /// One inside `<noscript>`, for browsers without JavaScript, counts only when it leads to
+    /// another site: on the same one it is a page asking for JavaScript (Google's answers so).
     pub fn meta_refresh(html: &str, page_url: &Url) -> Option<Url> {
         let lower = html.to_ascii_lowercase();
         start_tags(html, &lower, "meta").into_iter().find_map(|tag| {
@@ -434,7 +436,11 @@ impl HtmlVideoResolver {
             if target.is_empty() {
                 return None;
             }
-            page_url.join(target).ok().filter(|u| matches!(u.scheme(), "http" | "https"))
+            let target = page_url.join(target).ok().filter(|u| matches!(u.scheme(), "http" | "https"))?;
+            // `tag` is a slice of `html`, which `lower` matches byte for byte.
+            let before = &lower[..tag.as_ptr() as usize - html.as_ptr() as usize];
+            let in_noscript = before.rfind("<noscript") > before.rfind("</noscript");
+            (!in_noscript || target.origin() != page_url.origin()).then_some(target)
         })
     }
 

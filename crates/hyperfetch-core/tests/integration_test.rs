@@ -2470,10 +2470,12 @@ async fn test_a_short_link_is_downloaded_from_the_file_host_it_lands_on() {
     }
 }
 
-/// A web page at `name` that sends the browser on to `to` at once, as t.co answers.
-async fn refreshing_page(name: &str, to: &str) -> (Arc<Mock>, Url) {
-    let html = format!(r#"<html><head><noscript><META http-equiv="refresh" content="0;URL='{to}'"></noscript></head></html>"#);
-    let mut page = Mock::new(html.into_bytes());
+/// A web page at `name` that sends the browser on to `to` at once, with JavaScript or without
+/// (`<noscript>`, as t.co answers).
+async fn refreshing_page(name: &str, to: &str, noscript: bool) -> (Arc<Mock>, Url) {
+    let meta = format!(r#"<META http-equiv="refresh" content="0;URL='{to}'">"#);
+    let meta = if noscript { format!("<noscript>{meta}</noscript>") } else { meta };
+    let mut page = Mock::new(format!("<html><head>{meta}</head></html>").into_bytes());
     page.content_type = Some("text/html; charset=utf-8");
     let page = Arc::new(page);
     let url = serve(Arc::clone(&page), name).await;
@@ -2486,7 +2488,7 @@ async fn test_a_page_that_sends_the_browser_on_at_once_is_downloaded_as_its_targ
     let _history = HISTORY.write().await;
     let data = payload(PREFETCH + 256 * KB, 313);
     let file_url = serve(Arc::new(Mock::new(data.clone())), "setup.exe").await;
-    let (_, page_url) = refreshing_page("l/abc", file_url.as_str()).await;
+    let (_, page_url) = refreshing_page("l/abc", file_url.as_str(), true).await;
     let temp = tempdir().unwrap();
 
     let path = run(&DownloadEngine::new(vec![page_url.clone()], options(temp.path(), 4, 256 * KB)), None)
@@ -2518,7 +2520,7 @@ async fn test_a_download_given_its_history_as_mirrors_gets_the_file_again() {
 
     let data = payload(PREFETCH + 256 * KB, 331);
     let file_url = serve(Arc::new(Mock::new(data.clone())), "setup.exe").await;
-    let (_, page_url) = refreshing_page("l/again", file_url.as_str()).await;
+    let (_, page_url) = refreshing_page("l/again", file_url.as_str(), true).await;
     let (first, second) = (tempdir().unwrap(), tempdir().unwrap());
     let path = run(&DownloadEngine::new(vec![page_url], options(first.path(), 4, 256 * KB)), None).await.expect("the file should download");
     let path = run(&DownloadEngine::new(again(&path), options(second.path(), 4, 256 * KB)), None)
@@ -2538,7 +2540,7 @@ async fn test_links_are_followed_at_most_three_times_and_never_back() {
     let mut to = serve(Arc::clone(&file), "far.bin").await.to_string();
     let mut pages = Vec::new();
     for n in (1..=4).rev() {
-        let (page, url) = refreshing_page(&format!("hop{n}"), &to).await;
+        let (page, url) = refreshing_page(&format!("hop{n}"), &to, true).await;
         to = url.to_string();
         pages.insert(0, page);
     }
@@ -2550,11 +2552,25 @@ async fn test_links_are_followed_at_most_three_times_and_never_back() {
     assert_eq!(file.stats.requests.load(Ordering::SeqCst), 0, "a fourth link was followed");
 
     // A page sending the browser to itself is followed once, not again.
-    let (page, url) = refreshing_page("start", "/again").await;
+    let (page, url) = refreshing_page("start", "/again", false).await;
     let out = temp.path().join("again.html");
     run(&DownloadEngine::new(vec![url], opts(&out)), None).await.expect("the page should download");
     assert_file(&out, &page.data);
     assert_eq!(page.stats.probes.load(Ordering::SeqCst), 2, "the start page, then the one it sends the browser to");
+}
+
+#[tokio::test]
+async fn test_a_page_asking_for_javascript_is_downloaded_as_it_is() {
+    let _history = setup().await;
+    let temp = tempdir().unwrap();
+    // As Google answers without JavaScript: the page asks for it on its own site.
+    let (page, url) = refreshing_page("search", "/httpservice/retry/enablejs?sei=x", true).await;
+    let out = temp.path().join("search.html");
+    let opts = DownloadOptions { ytdlp_path: Some(no_site_ytdlp(temp.path())), ..options(&out, 4, 64 * KB) };
+
+    run(&DownloadEngine::new(vec![url], opts), None).await.expect("the page should download");
+    assert_file(&out, &page.data);
+    assert_eq!(page.stats.requests.load(Ordering::SeqCst), 2, "the page it asks for was asked for");
 }
 
 /// A link shortener's warning page, as it shows one instead of redirecting.
@@ -2562,17 +2578,32 @@ fn shortener_warning(method: &str, _target: &str) -> Vec<u8> {
     response(method, "200 OK", "Content-Type: text/html; charset=utf-8\r\n", b"<html><body>Warning! This link may be unsafe.</body></html>")
 }
 
+/// A link shortener's page that sends the browser on to the file at once.
+fn shortener_page_sending_on(method: &str, target: &str) -> Vec<u8> {
+    if target.starts_with("http://files.short.invalid/") {
+        response(method, "200 OK", "Content-Type: application/octet-stream\r\n", &payload(64 * KB, 337))
+    } else {
+        let page = br#"<html><head><meta http-equiv="refresh" content="0; url=http://files.short.invalid/x.bin"></head></html>"#;
+        response(method, "200 OK", "Content-Type: text/html; charset=utf-8\r\n", page)
+    }
+}
+
 #[tokio::test]
 async fn test_a_link_shortener_showing_a_page_is_an_error_not_a_download() {
     let _history = setup().await;
-    let (proxy, _) = serve_proxy(shortener_warning).await;
-    let temp = tempdir().unwrap();
     let link = Url::parse("http://bit.ly/3xYz").unwrap();
-    let opts = DownloadOptions { proxy: Some(proxy), ..options(temp.path(), 4, 64 * KB) };
+    // A page that leads nowhere, and one that leads on: neither is clicked through.
+    for answer in [shortener_warning as fn(&str, &str) -> Vec<u8>, shortener_page_sending_on] {
+        let (proxy, seen) = serve_proxy(answer).await;
+        let temp = tempdir().unwrap();
+        let opts = DownloadOptions { proxy: Some(proxy), ..options(temp.path(), 4, 64 * KB) };
 
-    let err = run(&DownloadEngine::new(vec![link], opts), None).await.expect_err("a warning is not what the link stands for");
-    assert_eq!(err, "bit.ly showed a page instead of redirecting (a preview or a warning): open the link in your browser");
-    assert_eq!(names_in(temp.path()), Vec::<String>::new());
+        let err = run(&DownloadEngine::new(vec![link.clone()], opts), None).await.expect_err("a warning is not what the link stands for");
+        assert_eq!(err, "bit.ly showed a page instead of redirecting (a preview or a warning): open the link in your browser");
+        assert_eq!(names_in(temp.path()), Vec::<String>::new());
+        let seen = seen.lock().unwrap().clone();
+        assert!(seen.iter().all(|(target, _)| target.starts_with("http://bit.ly/")), "{seen:?}");
+    }
 }
 
 #[tokio::test]
