@@ -2498,6 +2498,37 @@ async fn test_a_page_that_sends_the_browser_on_at_once_is_downloaded_as_its_targ
 }
 
 #[tokio::test]
+async fn test_a_download_given_its_history_as_mirrors_gets_the_file_again() {
+    isolate_history();
+    let _history = HISTORY.write().await;
+    // What the GUI's Redownload does: the URLs history lists for a download that followed its
+    // link, as mirrors of a new one. The link's answer comes first, and is a page.
+    let again = |path: &Path| -> Vec<Url> {
+        history_entry(path).expect("the download is recorded").urls.iter().map(|u| Url::parse(u).unwrap()).collect()
+    };
+
+    let (proxy, _) = serve_proxy(short_link_to_dropbox).await;
+    let (first, second) = (tempdir().unwrap(), tempdir().unwrap());
+    let short = Url::parse("http://go.short.invalid/report").unwrap();
+    let opts = |dir: &Path| DownloadOptions { proxy: Some(proxy.clone()), ..options(dir, 4, 64 * KB) };
+    let path = run(&DownloadEngine::new(vec![short], opts(first.path())), None).await.expect("the file should download");
+    let path = run(&DownloadEngine::new(again(&path), opts(second.path())), None).await.expect("the file should download again");
+    assert_eq!(path, second.path().join("report.bin"));
+    assert_file(&path, &payload(64 * KB, 311));
+
+    let data = payload(PREFETCH + 256 * KB, 331);
+    let file_url = serve(Arc::new(Mock::new(data.clone())), "setup.exe").await;
+    let (_, page_url) = refreshing_page("l/again", file_url.as_str()).await;
+    let (first, second) = (tempdir().unwrap(), tempdir().unwrap());
+    let path = run(&DownloadEngine::new(vec![page_url], options(first.path(), 4, 256 * KB)), None).await.expect("the file should download");
+    let path = run(&DownloadEngine::new(again(&path), options(second.path(), 4, 256 * KB)), None)
+        .await
+        .expect("the file should download again");
+    assert_eq!(path, second.path().join("setup.exe"));
+    assert_file(&path, &data);
+}
+
+#[tokio::test]
 async fn test_links_are_followed_at_most_three_times_and_never_back() {
     let _history = setup().await;
     let temp = tempdir().unwrap();
