@@ -107,10 +107,20 @@ fn normalize(entries: &mut Vec<HistoryEntry>) {
     entries.truncate(MAX_ENTRIES);
 }
 
+#[cfg(test)]
+thread_local! {
+    /// History file reads made on this thread.
+    pub(crate) static READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// History files flushed to disk on this thread.
+    static SYNCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Reads the history file. A file that cannot be parsed reads as an empty list; with `backup` it
 /// is also moved aside to `<path>.corrupt-<suffix>` (never overwritten). Only a caller holding the
 /// history lock may back up, or it could move away a valid file another process just wrote.
 fn read_entries(path: &Path, backup: bool) -> io::Result<Vec<HistoryEntry>> {
+    #[cfg(test)]
+    READS.with(|n| n.set(n.get() + 1));
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
@@ -136,14 +146,21 @@ fn read_entries(path: &Path, backup: bool) -> io::Result<Vec<HistoryEntry>> {
     }
 }
 
-/// Atomically replaces the history file via a uniquely named temp file.
-fn write_entries(path: &Path, entries: &[HistoryEntry]) -> io::Result<()> {
+/// Atomically replaces the history file via a uniquely named temp file, which reaches the disk
+/// first if `durable`. Without, a crash of the program still leaves the old file or the new one,
+/// but a power cut in the seconds after may leave one the OS had not written out yet, which then
+/// reads as corrupt.
+fn write_entries(path: &Path, entries: &[HistoryEntry], durable: bool) -> io::Result<()> {
     let json = serde_json::to_vec(entries).map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
     let tmp_path = with_suffix(path, &format!(".{}.tmp", unique_suffix()));
     let result = (|| {
         let mut file = File::create(&tmp_path)?;
         file.write_all(&json)?;
-        file.sync_all()?;
+        if durable {
+            #[cfg(test)]
+            SYNCS.with(|n| n.set(n.get() + 1));
+            file.sync_all()?;
+        }
         drop(file);
         fs::rename(&tmp_path, path)
     })();
@@ -284,6 +301,11 @@ impl DownloadHistoryManager {
     /// Under the history lock the file is reloaded and only those changes are replayed onto it, so
     /// updates made by other managers or processes since this one loaded are never lost or undone.
     pub fn save(&mut self) -> Result<(), std::io::Error> {
+        self.save_to_disk(true)
+    }
+
+    /// `save`, flushing the new file to disk before it replaces the old one only if `durable`.
+    fn save_to_disk(&mut self, durable: bool) -> io::Result<()> {
         let path = self.path();
         let _lock = lock_history(&path)?;
         let mut entries = read_entries(&path, true)?;
@@ -291,10 +313,20 @@ impl DownloadHistoryManager {
             change.apply(&mut entries);
         }
         normalize(&mut entries);
-        write_entries(&path, &entries)?;
+        write_entries(&path, &entries, durable)?;
         self.pending.clear();
         self.entries = entries;
         Ok(())
+    }
+
+    /// Adds `entry` to the history file at `path`, replacing any entry with the same id or the
+    /// same file path, without loading the history first: the file is read once, under the lock,
+    /// as [`DownloadHistoryManager::save`] does. Unless `durable`, nothing waits for the new file
+    /// to reach the disk (see `DownloadOptions::fsync_on_complete`): a crash of the program cannot
+    /// damage it, but a power cut in the seconds after can.
+    pub fn record(path: &Path, entry: HistoryEntry, durable: bool) -> io::Result<()> {
+        Self { entries: Vec::new(), custom_path: Some(path.to_path_buf()), pending: vec![Change::Upsert(entry)] }
+            .save_to_disk(durable)
     }
 
     /// Adds `entry`, replacing any entry with the same id or the same file path.
@@ -481,6 +513,44 @@ mod tests {
         assert!(gui.remove_entry(&x_id));
         cli.save().unwrap();
         assert_eq!(names_on_disk(&history_path), ["offline.bin"]);
+    }
+
+    #[test]
+    fn record_reads_the_history_once_and_keeps_other_entries() {
+        let dir = tempdir().unwrap();
+        let history_path = dir.path().join("history.json");
+        let mut other = DownloadHistoryManager::load_from_path(&history_path);
+        other.add_or_update(entry("old.bin", dir.path()));
+        let mut replaced = entry("same.bin", dir.path());
+        other.add_or_update(replaced.clone());
+
+        replaced.file_size = 99;
+        let reads = READS.with(std::cell::Cell::get);
+        DownloadHistoryManager::record(&history_path, replaced, true).unwrap();
+        assert_eq!(READS.with(std::cell::Cell::get) - reads, 1, "one read, under the lock");
+
+        assert_eq!(names_on_disk(&history_path), ["old.bin", "same.bin"]);
+        let on_disk = DownloadHistoryManager::load_from_path(&history_path);
+        assert_eq!(on_disk.entries().iter().find(|e| e.file_name == "same.bin").unwrap().file_size, 99);
+    }
+
+    #[test]
+    fn record_waits_for_the_disk_only_when_durable() {
+        let dir = tempdir().unwrap();
+        let history_path = dir.path().join("history.json");
+        let syncs = || SYNCS.with(std::cell::Cell::get);
+        let before = syncs();
+        DownloadHistoryManager::record(&history_path, entry("fast.bin", dir.path()), false).unwrap();
+        assert_eq!(syncs(), before, "a download finishing without fsync_on_complete does not wait for the disk");
+        DownloadHistoryManager::record(&history_path, entry("durable.bin", dir.path()), true).unwrap();
+        assert_eq!(syncs(), before + 1);
+        // Other changes, made by hand, still reach the disk before they replace the file.
+        DownloadHistoryManager::load_from_path(&history_path).clear();
+        assert_eq!(syncs(), before + 2);
+
+        DownloadHistoryManager::record(&history_path, entry("fast.bin", dir.path()), false).unwrap();
+        assert_eq!(names_on_disk(&history_path), ["fast.bin"]);
+        assert!(std::fs::read_dir(dir.path()).unwrap().all(|f| !f.unwrap().file_name().to_string_lossy().ends_with(".tmp")));
     }
 
     #[test]

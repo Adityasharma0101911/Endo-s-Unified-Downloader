@@ -1444,6 +1444,102 @@ async fn test_small_file_takes_one_get_and_no_worker() {
 }
 
 #[tokio::test]
+async fn test_file_the_probe_brought_whole_is_written_plainly_without_state() {
+    isolate_history();
+    let _history = HISTORY.write().await;
+    let data = payload(300 * KB, 211);
+    let url = serve(Arc::new(Mock::new(data.clone())), "whole.bin").await;
+    let temp = tempdir().unwrap();
+    let out = temp.path().join("whole.bin");
+    // Such a file has nothing to resume, so no state is saved: one that cannot be changes nothing.
+    std::fs::create_dir(DownloadState::state_file_path(&part_of(&out))).unwrap();
+
+    let engine = DownloadEngine::new(vec![url], options(&out, 4, 64 * KB));
+    let path = run(&engine, None).await.expect("download should succeed");
+
+    assert_eq!(path, out);
+    assert_file(&out, &data);
+    assert!(!part_of(&out).exists());
+    let entry = history_entry(&out).expect("the download is recorded");
+    assert_eq!(entry.blake3_hash, Some(blake3::hash(&data).to_hex().to_string()));
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_SPARSE_FILE: u32 = 0x200;
+        let attributes = std::fs::metadata(&out).unwrap().file_attributes();
+        assert_eq!(attributes & FILE_ATTRIBUTE_SPARSE_FILE, 0, "a small file is written plainly, not as a sparse file");
+    }
+}
+
+#[tokio::test]
+async fn test_sha256_checksum_of_a_multi_connection_download() {
+    use sha2::Digest;
+    isolate_history();
+    let _history = HISTORY.write().await;
+    let data = payload(4 * PREFETCH + 12345, 227);
+    let sha256: String = sha2::Sha256::digest(&data).iter().map(|b| format!("{:02x}", b)).collect();
+    let mock = Arc::new(Mock::new(data.clone()));
+    let url = serve(Arc::clone(&mock), "summed.bin").await;
+    let temp = tempdir().unwrap();
+    let out = temp.path().join("summed.bin");
+
+    let mut opts = options(&out, 4, 256 * KB);
+    opts.expected_checksum = Some(format!("sha256:{}", "0".repeat(64)));
+    let err = run(&DownloadEngine::new(vec![url.clone()], opts.clone()), None).await.expect_err("a wrong checksum fails");
+    assert!(err.contains("Checksum verification failed") && err.contains(&sha256), "{err}");
+    assert!(!out.exists());
+    assert_no_leftovers(&out);
+
+    opts.expected_checksum = Some(format!("sha256:{}", sha256));
+    let path = run(&DownloadEngine::new(vec![url], opts), None).await.expect("the right checksum passes");
+    assert_eq!(path, out);
+    assert_file(&out, &data);
+    assert!(mock.served_ranges().len() >= 4, "fetched over several connections");
+    let entry = history_entry(&out).expect("the download is recorded");
+    assert_eq!(entry.blake3_hash, Some(blake3::hash(&data).to_hex().to_string()));
+}
+
+#[tokio::test]
+async fn test_resumed_download_is_hashed_whole() {
+    use sha2::Digest;
+    isolate_history();
+    let _history = HISTORY.write().await;
+    let size = 3 * PREFETCH;
+    let data = payload(size, 229);
+    let md5: String = md5::Md5::digest(&data).iter().map(|b| format!("{:02x}", b)).collect();
+    let mut mock = Mock::new(data.clone());
+    mock.etag = Some("\"m1\"");
+    let mock = Arc::new(mock);
+    let url = serve(Arc::clone(&mock), "resumed.bin").await;
+    let temp = tempdir().unwrap();
+    let out = temp.path().join("resumed.bin");
+    let part = part_of(&out);
+
+    // An earlier run finished two unaligned stretches, one of them where the probe's MiB ends; the
+    // rest of the .part is junk.
+    let done = [(PREFETCH / 2, PREFETCH + 3 * KB + 5), (2 * PREFETCH + 7, 2 * PREFETCH + 300 * KB)];
+    let mut on_disk = vec![0xAAu8; size];
+    let mut state = DownloadState::new("resumed.bin".into(), size as u64, 256 * KB as u64, vec![url.to_string()]);
+    state.etag = Some("\"m1\"".into());
+    for (from, to) in done {
+        on_disk[from..to].copy_from_slice(&data[from..to]);
+        state.completed_ranges.push(ByteRange::new(from as u64, to as u64 - 1).unwrap());
+    }
+    std::fs::write(&part, &on_disk).unwrap();
+    state.save_atomic(&DownloadState::state_file_path(&part)).unwrap();
+
+    let mut opts = options(&out, 3, 256 * KB);
+    opts.expected_checksum = Some(format!("md5:{}", md5));
+    let path = run(&DownloadEngine::new(vec![url], opts), None).await.expect("resumed download should succeed");
+
+    assert_eq!(path, out);
+    assert_file(&out, &data);
+    assert_no_leftovers(&out);
+    let entry = history_entry(&out).expect("the download is recorded");
+    assert_eq!(entry.blake3_hash, Some(blake3::hash(&data).to_hex().to_string()));
+}
+
+#[tokio::test]
 async fn test_connections_follow_the_size_of_the_file_on_a_fast_server() {
     let _history = setup().await;
     let data = payload(3 * PREFETCH, 167);

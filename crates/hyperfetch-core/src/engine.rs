@@ -29,7 +29,7 @@ use crate::mirror::MirrorRacer;
 use crate::range::{compute_gaps, ByteRange};
 use crate::resolver::{GoogleDriveResolver, HtmlVideoResolver};
 use crate::state::DownloadState;
-use crate::storage::{DiskWriter, StorageError, VerifyError};
+use crate::storage::{verify_digest, DiskWriter, FileDigest, StorageError, StreamHasher, VerifyError};
 use crate::worker::{
     authorize, content_length, retry_after, Auth, Body, FailureKind, HttpWorker, RateLimiter, Seed, WorkerEvent,
     WorkerShared,
@@ -68,8 +68,9 @@ const MIN_RATE_TICK: Duration = Duration::from_millis(20);
 const BYTES_PER_CONNECTION: u64 = 1024 * 1024;
 /// Fewest missing bytes that justify one more connection, whatever the probe measured.
 const MIN_BYTES_PER_CONNECTION: u64 = 64 * 1024;
-/// Fetching the playlists and each AES key may retry every request with backoff.
-const HLS_PARSE_TIMEOUT: Duration = Duration::from_secs(120);
+/// Fetching the playlists and their AES keys may take this long, besides what one request takes
+/// that uses every retry the user allows (see [`crate::hls::FetchPolicy::give_up_after`]).
+const HLS_PARSE_TIMEOUT: Duration = if cfg!(test) { Duration::from_secs(1) } else { Duration::from_secs(120) };
 /// Longest file name we create, in bytes: leaves room for " (n)" and ".part.hfstate.tmp" under
 /// the 255-byte (Linux) and 255 UTF-16 unit (NTFS) limits.
 const MAX_NAME_BYTES: usize = 200;
@@ -265,32 +266,45 @@ impl DownloadEngine {
             tracing::info!("Detected HLS video stream: {}", playlist);
             let started_at = unix_now();
             let auth = self.auth.as_deref();
+            let fetch =
+                crate::hls::FetchPolicy { stall_timeout: self.stall_timeout(), max_retries: self.options.max_retries };
             let parsed = self
                 .guarded(
-                    HLS_PARSE_TIMEOUT,
+                    HLS_PARSE_TIMEOUT.saturating_add(fetch.give_up_after()),
                     "fetching the HLS playlist",
-                    crate::hls::parse_hls_playlist(&client, playlist, auth),
+                    crate::hls::parse_hls_playlist(&client, playlist, auth, fetch),
                 )
                 .await?;
             match parsed {
                 Ok(segments) => {
                     let base = self.hls_output_path(playlist, &segments);
                     let cancel_flag = Some(Arc::clone(&self.cancel_flag));
-                    // The claim is held until this download returns, whichever way it ends.
-                    let (target, _claim) =
-                        claim_hls_output(&client, auth, playlist, &segments, base, &cancel_flag).await?;
-                    let path = crate::hls::HlsEngine::download(
+                    // The claim is held until this download returns, whichever way it ends, and by
+                    // its writer while that touches the .part, even after this future is dropped.
+                    let (target, claim) =
+                        claim_hls_output(&client, auth, playlist, &segments, base, fetch, &cancel_flag).await?;
+                    let claim = Arc::new(claim);
+                    let target = target.hold(Arc::clone(&claim));
+                    let options = crate::hls::HlsOptions {
+                        connections: self.options.num_connections,
+                        fetch,
+                        fsync_on_complete: self.options.fsync_on_complete,
+                        expected_checksum: self.options.expected_checksum.clone(),
+                    };
+                    let (path, digest) = crate::hls::HlsEngine::download(
                         &client,
                         auth,
                         segments,
                         target,
-                        self.options.num_connections,
+                        &options,
                         snapshot_tx,
                         cancel_flag,
                     )
                     .await
                     .map_err(|e| e.to_string())?;
-                    return self.finish_external(path, started_at).await;
+                    // Hashed as it was written and, with fsync_on_complete, flushed before it took
+                    // its name: nothing is read back or flushed again.
+                    return self.finish_external(path, started_at, Some(digest)).await;
                 }
                 // Fetched, but not a playlist after all: try it as a plain file.
                 Err(HlsError::InvalidPlaylist(reason)) => {
@@ -466,35 +480,21 @@ impl DownloadEngine {
         )
         .await;
         let _ = forwarder.await;
-        self.finish_external(res?, started_at).await
+        self.finish_external(res?, started_at, None).await
     }
 
-    /// Checks the expected checksum of a file another engine (yt-dlp, HLS) finished, in one
-    /// read-only pass off the runtime, and records it in history. A mismatch is an error; the
-    /// file is left in place for the user to inspect.
-    async fn finish_external(&self, path: PathBuf, started_at: u64) -> Result<PathBuf, String> {
-        let hashed = {
-            let (path, expected) = (path.clone(), self.options.expected_checksum.clone());
-            blocking(move || crate::storage::hash_and_verify_file(&path, expected.as_deref())).await?
-        };
-        let blake3_hex = hashed.map_err(|e| e.to_string())?;
+    /// Checks the expected checksum of a file another engine (yt-dlp, HLS) finished and records
+    /// it in history. `digest`, from an engine that hashed the file as it wrote it (see
+    /// [`StreamHasher`]) and flushed it before it took its name as fsync_on_complete asks, spares
+    /// reading it back and flushing it again; without one it is read once, off the runtime. A
+    /// mismatch is an error; the file is left in place for the user to inspect.
+    async fn finish_external(&self, path: PathBuf, started_at: u64, digest: Option<FileDigest>) -> Result<PathBuf, String> {
+        let written = digest.map_or(Written::File, Written::Flushed);
+        let blake3_hex = self.verify_written(&path, written).await.map_err(|e| e.to_string())?;
         if self.options.expected_checksum.is_some() {
             tracing::info!("Checksum verification passed for {}", path.display());
         }
-
-        let urls = self.url_strings();
-        let recorded = path.clone();
-        let _ = blocking(move || {
-            let size = std::fs::metadata(&recorded).map(|m| m.len()).unwrap_or(0);
-            let mut entry = HistoryEntry::new(file_name_of(&recorded), absolute(&recorded), size, urls);
-            entry.downloaded_bytes = size;
-            entry.status = HistoryStatus::Completed;
-            entry.blake3_hash = Some(blake3_hex);
-            entry.started_at = started_at;
-            entry.completed_at = Some(unix_now());
-            DownloadHistoryManager::load().add_or_update(entry);
-        })
-        .await;
+        self.record_completed(path.clone(), None, blake3_hex, started_at).await;
         Ok(path)
     }
 
@@ -636,7 +636,7 @@ impl DownloadEngine {
                 if let Some(dir) = base.parent().filter(|d| !d.as_os_str().is_empty()) {
                     std::fs::create_dir_all(dir).map_err(|e| format!("Failed to create {}: {}", dir.display(), e))?;
                 }
-                let history = DownloadHistoryManager::load();
+                let history = DownloadHistoryManager::default_history_path();
                 plan_target(&base, &remote, &urls, &history, checksum.as_deref())
             })
             .await?
@@ -664,8 +664,11 @@ impl DownloadEngine {
             tracing::info!("Resuming {} with {} completed range(s)", part.display(), previous.completed_ranges.len());
             state.completed_ranges = previous.completed_ranges;
         }
-        // Record the sources and validators before the first byte arrives.
-        {
+        let prefetched = reference.prefetch.clone();
+        // The probe brought the whole file: it is written in one go, so there is nothing to resume.
+        let whole = reference.size == Some(prefetched.len() as u64);
+        // Otherwise record the sources and validators before the first byte arrives.
+        if !whole {
             let (state, path) = (state.clone(), state_path.clone());
             blocking(move || state.save_atomic(&path))
                 .await?
@@ -679,26 +682,39 @@ impl DownloadEngine {
             mirrors.len(),
             reference.accepts_ranges
         );
-        let prefetched = reference.prefetch.clone();
-        match reference.size {
-            // The probe brought the whole file.
-            Some(size) if size == prefetched.len() as u64 => {
-                let path = part.clone();
-                blocking(move || -> Result<(), StorageError> {
-                    let writer = DiskWriter::open_or_create(&path, size)?;
-                    writer.write_chunk_slice(0, &prefetched)?;
-                    writer.sync()
+        let written = match reference.size {
+            // A plain write (no sparse file, no preallocation, no flush unless fsync_on_complete
+            // asks for one in `finalize`), hashed from memory.
+            _ if whole => {
+                let (path, expected) = (part.clone(), self.options.expected_checksum.clone());
+                let digest = blocking(move || {
+                    let written = std::fs::write(&path, &prefetched);
+                    if written.is_err() {
+                        // Without a state file nothing could resume it.
+                        let _ = std::fs::remove_file(&path);
+                    }
+                    written.map(|()| {
+                        let mut hasher = StreamHasher::new(expected.as_deref());
+                        hasher.update(&prefetched);
+                        hasher.finish()
+                    })
                 })
                 .await?
-                .map_err(|e| format!("Failed to write {}: {}", part.display(), e))?
+                .map_err(|e| format!("Failed to write {}: {}", part.display(), e))?;
+                Written::Digest(digest)
             }
             Some(size) if reference.accepts_ranges => {
                 let probes = Probed { reference, mirrors, live, late };
-                self.fetch_ranges(client, size, probes, state, &part, &state_path, &final_path, &snapshot_tx).await?
+                let writer =
+                    self.fetch_ranges(client, size, probes, state, &part, &state_path, &final_path, &snapshot_tx).await?;
+                Written::Writer(writer)
             }
-            _ => self.fetch_stream(&client, &reference, live, &part, &final_path, &snapshot_tx).await?,
-        }
-        self.finalize(part, final_path, state_path, claim, started_at, &snapshot_tx).await
+            _ => {
+                self.fetch_stream(&client, &reference, live, &part, &final_path, &snapshot_tx).await?;
+                Written::File
+            }
+        };
+        self.finalize(final_path, claim, written, started_at, &snapshot_tx).await
     }
 
     /// Multi-connection download of a file whose size is known and whose server honours ranges.
@@ -709,7 +725,8 @@ impl DownloadEngine {
     /// (see `Watched`). The bytes one connection carries in the time another takes to start (the
     /// reference's `per_setup`) justify one connection each, up to the limit and what the
     /// mirrors' hosts take at once. Mirrors whose probes come in `late` join as they do, if they
-    /// serve the reference's file.
+    /// serve the reference's file. Returns the writer, with what it hashed on the way, for
+    /// `finalize`.
     #[allow(clippy::too_many_arguments)]
     async fn fetch_ranges(
         &self,
@@ -721,7 +738,7 @@ impl DownloadEngine {
         state_path: &Path,
         final_path: &Path,
         snapshot_tx: &Option<broadcast::Sender<EngineSnapshot>>,
-    ) -> Result<(), String> {
+    ) -> Result<DiskWriter, String> {
         let Probed { reference, mirrors, live, mut late } = probed;
         let prefetch = reference.prefetch.clone();
         let unwritten = compute_gaps(prefetch.len() as u64, &state.completed_ranges);
@@ -760,8 +777,10 @@ impl DownloadEngine {
 
         let writer = {
             let part = part.to_path_buf();
+            let (on_disk, checksum) = (state.completed_ranges.clone(), self.options.expected_checksum.clone());
             blocking(move || {
                 let writer = DiskWriter::open_or_create(&part, size)?;
+                writer.track_digest(&on_disk, checksum.as_deref());
                 for gap in unwritten {
                     writer.write_chunk_slice(gap.start, &prefetch[gap.start as usize..=gap.end as usize])?;
                 }
@@ -856,12 +875,8 @@ impl DownloadEngine {
         while workers.join_next().await.is_some() {}
 
         match outcome {
-            Ok(()) => {
-                let writer = job.writer.clone();
-                blocking(move || writer.sync())
-                    .await?
-                    .map_err(|e| format!("Failed to flush download to disk: {}", e))
-            }
+            // No flush here: `finalize` flushes (with fsync_on_complete) while it hashes.
+            Ok(()) => Ok(job.writer),
             Err(e) => {
                 if let Err(save_err) = job.persist().await {
                     tracing::warn!("Failed to save resume state: {}", save_err);
@@ -1040,23 +1055,19 @@ impl DownloadEngine {
         }
     }
 
-    /// Verifies the finished `.part`, moves it to its final name and records it in history. The
-    /// claim on the name is released only once the file is in place (or discarded).
+    /// Verifies the finished `.part` of `final_path`, moves it to its final name and records it in
+    /// history. The claim on the name is released only once the file is in place (or discarded).
     async fn finalize(
         &self,
-        part: PathBuf,
         final_path: PathBuf,
-        state_path: PathBuf,
         claim: Claim,
+        written: Written,
         started_at: u64,
         snapshot_tx: &Option<broadcast::Sender<EngineSnapshot>>,
     ) -> Result<PathBuf, String> {
-        let expected = self.options.expected_checksum.clone();
-        let hashed = {
-            let part = part.clone();
-            blocking(move || crate::storage::hash_and_verify_file(&part, expected.as_deref())).await?
-        };
-        let blake3_hex = match hashed {
+        let part = part_path(&final_path);
+        let state_path = DownloadState::state_file_path(&part);
+        let blake3_hex = match self.verify_written(&part, written).await {
             Ok(hash) => hash,
             Err(VerifyError::Mismatch(e)) => {
                 // Resuming would only reproduce the same bytes, so start from scratch next time.
@@ -1085,19 +1096,76 @@ impl DownloadEngine {
         })
         .await??;
         tracing::info!("Download completed: {} (BLAKE3 {})", target.display(), blake3_hex);
-
-        let mut entry = HistoryEntry::new(file_name_of(&target), absolute(&target), size, self.url_strings());
-        entry.downloaded_bytes = size;
-        entry.status = HistoryStatus::Completed;
-        entry.blake3_hash = Some(blake3_hex);
-        entry.started_at = started_at;
-        entry.completed_at = Some(unix_now());
-        // Re-read rather than reuse the planning snapshot: the history may have been edited
-        // (entries removed, other downloads finished) while this one ran.
-        let _ = blocking(move || DownloadHistoryManager::load().add_or_update(entry)).await;
+        self.record_completed(target.clone(), Some(size), blake3_hex, started_at).await;
 
         emit(snapshot_tx, || done_snapshot(size, &target));
         Ok(target)
+    }
+
+    /// The BLAKE3 (hex) of the finished file at `path`, once its expected checksum is confirmed.
+    /// The digest comes from `written` where it can, else from reading the file; with
+    /// fsync_on_complete the file is flushed to disk at the same time (unless its writer already
+    /// did, see [`Written::Flushed`]), and both must succeed. A
+    /// mismatch found without reading the whole file is confirmed by reading it before it counts:
+    /// only the file itself can condemn it.
+    async fn verify_written(&self, path: &Path, written: Written) -> Result<String, VerifyError> {
+        let expected = self.options.expected_checksum.clone();
+        let writer = match &written {
+            Written::Writer(writer) => Some(writer.clone()),
+            _ => None,
+        };
+        // Through a handle of its own, as the hash may be reading through the writer's.
+        let flush = (self.options.fsync_on_complete && !matches!(written, Written::Flushed(_))).then(|| {
+            let (writer, path) = (writer.clone(), path.to_path_buf());
+            move || match writer {
+                Some(writer) => writer.sync_separately().map_err(|e| e.to_string()),
+                None => OpenOptions::new().write(true).open(&path).and_then(|f| f.sync_data()).map_err(|e| e.to_string()),
+            }
+        });
+        let reread = (!matches!(written, Written::File)).then(|| {
+            let (path, expected) = (path.to_path_buf(), expected.clone());
+            move || {
+                tracing::warn!(
+                    "The digest of {} taken while writing it does not match; reading it back to be sure",
+                    path.display()
+                );
+                match writer {
+                    Some(writer) => checked(&path, writer.full_digest(expected.as_deref()), expected.as_deref()),
+                    None => crate::storage::hash_and_verify_file(&path, expected.as_deref()),
+                }
+            }
+        });
+        let hash = {
+            let path = path.to_path_buf();
+            move || match written {
+                Written::File => crate::storage::hash_and_verify_file(&path, expected.as_deref()),
+                Written::Writer(writer) => checked(&path, writer.digest(expected.as_deref()), expected.as_deref()),
+                Written::Digest(digest) | Written::Flushed(digest) => verify_digest(&digest, expected.as_deref()),
+            }
+        };
+        hash_and_flush(hash, flush, reread).await
+    }
+
+    /// Records `path` as completed in the download history, which is read only once, under its
+    /// lock: it may have been edited (entries removed, other downloads finished) while this
+    /// download ran. `size` is looked up if not given. Waits for the history file to reach the
+    /// disk only with fsync_on_complete, as for the file itself.
+    async fn record_completed(&self, path: PathBuf, size: Option<u64>, blake3_hex: String, started_at: u64) {
+        let (urls, durable) = (self.url_strings(), self.options.fsync_on_complete);
+        let _ = blocking(move || {
+            let size = size.unwrap_or_else(|| std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0));
+            let mut entry = HistoryEntry::new(file_name_of(&path), absolute(&path), size, urls);
+            entry.downloaded_bytes = size;
+            entry.status = HistoryStatus::Completed;
+            entry.blake3_hash = Some(blake3_hex);
+            entry.started_at = started_at;
+            entry.completed_at = Some(unix_now());
+            let history = DownloadHistoryManager::default_history_path();
+            if let Err(e) = DownloadHistoryManager::record(&history, entry, durable) {
+                tracing::warn!("Failed to update history file {:?}: {}", history, e);
+            }
+        })
+        .await;
     }
 
     /// Runs `fut` with a timeout, returning early if the download is cancelled.
@@ -1144,6 +1212,47 @@ impl DownloadEngine {
     }
 }
 
+/// What a finished download hands `finalize` for the file's digest.
+enum Written {
+    /// Nothing: the file is read back.
+    File,
+    /// The writer that wrote it, which hashed most of it on the way (see [`DiskWriter::digest`]).
+    Writer(DiskWriter),
+    /// Taken while the file was written in order (see [`StreamHasher`]).
+    Digest(FileDigest),
+    /// A [`Written::Digest`] of a file its writer has already flushed, as fsync_on_complete asks.
+    Flushed(FileDigest),
+}
+
+/// Runs `hash` and, if given, `flush` at the same time on blocking threads. A mismatch `hash`
+/// reports is checked by `reread`, if given, before it counts. The file passes only if its digest
+/// matches and the flush succeeded; one that does not match is a mismatch, flushed or not.
+async fn hash_and_flush(
+    hash: impl FnOnce() -> Result<String, VerifyError> + Send + 'static,
+    flush: Option<impl FnOnce() -> Result<(), String> + Send + 'static>,
+    reread: Option<impl FnOnce() -> Result<String, VerifyError> + Send + 'static>,
+) -> Result<String, VerifyError> {
+    let flushed = async {
+        match flush {
+            Some(flush) => blocking(flush).await.and_then(|flushed| flushed),
+            None => Ok(()),
+        }
+    };
+    let (hashed, flushed) = tokio::join!(blocking(hash), flushed);
+    let hashed = match (hashed.map_err(VerifyError::Io)?, reread) {
+        (Err(VerifyError::Mismatch(_)), Some(reread)) => blocking(reread).await.map_err(VerifyError::Io)?,
+        (hashed, _) => hashed,
+    }?;
+    flushed.map_err(|e| VerifyError::Io(format!("Failed to flush download to disk: {}", e)))?;
+    Ok(hashed)
+}
+
+/// Checks `digest`, a digest of the file at `path` (reading it if needed), against `expected`.
+fn checked(path: &Path, digest: std::io::Result<FileDigest>, expected: Option<&str>) -> Result<String, VerifyError> {
+    let digest = digest.map_err(|e| VerifyError::Io(format!("Failed to read {}: {}", path.display(), e)))?;
+    verify_digest(&digest, expected)
+}
+
 /// Chooses and claims the HLS output name. Walks `base`, `base (1)`, ... and takes the first name
 /// it can claim with no finished file whose `.part` is absent or proven to be this same stream (see
 /// [`crate::hls::HlsEngine::prepare`]), so a retry resumes it and never orphans it, while another
@@ -1155,6 +1264,7 @@ async fn claim_hls_output(
     playlist: &Url,
     segments: &[crate::hls::HlsSegment],
     base: PathBuf,
+    fetch: crate::hls::FetchPolicy,
     cancel_flag: &Option<Arc<AtomicBool>>,
 ) -> Result<(crate::hls::HlsTarget, Claim), String> {
     if let Some(parent) = base.parent().filter(|p| !p.as_os_str().is_empty()).map(Path::to_path_buf) {
@@ -1172,7 +1282,7 @@ async fn claim_hls_output(
         let Some(claim) = claim else {
             continue;
         };
-        let prepared = crate::hls::HlsEngine::prepare(client, auth, playlist, segments, &candidate, cancel_flag).await;
+        let prepared = crate::hls::HlsEngine::prepare(client, auth, playlist, segments, &candidate, fetch, cancel_flag).await;
         if let Some(target) = prepared.map_err(|e| e.to_string())? {
             return Ok((target, claim));
         }
@@ -2197,19 +2307,23 @@ pub fn claim_target(final_path: &Path) -> Result<Option<TargetClaim>, String> {
     Ok(Claim::try_take(final_path)?.map(|claim| TargetClaim { _claim: claim }))
 }
 
-/// Deletes the partial files of `final_path` (`.part`, `.part.hfstate`, `.part.hlsstate`) and
-/// returns how many existed. Never touches the final file. Fails while a download holds the
-/// target. Blocking.
+/// Deletes the partial files of `final_path` (`.part`, `.part.hfstate`, `.part.hlsstate`, and the
+/// `.tmp` files a crash can leave of the latter two) and returns how many existed. Never touches
+/// the final file. Fails while a download holds the target. Blocking.
 pub fn discard_partial(final_path: &Path) -> Result<usize, String> {
     let Some(_claim) = claim_target(final_path)? else {
         return Err(format!("{} is still being downloaded", final_path.display()));
     };
     let part = part_path(final_path);
-    let mut hls_state = part.clone().into_os_string();
-    hls_state.push(".hlsstate");
+    let beside_part = |suffix: &str| {
+        let mut path = part.clone().into_os_string();
+        path.push(suffix);
+        PathBuf::from(path)
+    };
     // The data goes first: if a state file then fails to delete, it no longer matches anything.
     let mut removed = 0;
-    for path in [part.clone(), DownloadState::state_file_path(&part), PathBuf::from(hls_state)] {
+    let states = [".hfstate", ".hlsstate", ".hfstate.tmp", ".hlsstate.tmp"].map(beside_part);
+    for path in std::iter::once(part.clone()).chain(states) {
         match std::fs::remove_file(&path) {
             Ok(()) => removed += 1,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -2223,14 +2337,17 @@ pub fn discard_partial(final_path: &Path) -> Result<usize, String> {
 /// is already this exact file, or that it can claim and that holds our resumable (or stale)
 /// `.part` or is free. Existing files, claimed names and other downloads' `.part` files are never
 /// touched. Our `.part` holding progress that no mirror can resume right now (`remote` takes ranges
-/// if any mirror serving the file does) fails the plan and is kept.
+/// if any mirror serving the file does) fails the plan and is kept. The history file at
+/// `history_path` is read only if an existing file has to be compared with it.
 fn plan_target(
     base: &Path,
     remote: &ProbeInfo,
     urls: &[String],
-    history: &DownloadHistoryManager,
+    history_path: &Path,
     checksum: Option<&str>,
 ) -> Result<Plan, String> {
+    let loaded = std::cell::OnceCell::new();
+    let history = || loaded.get_or_init(|| DownloadHistoryManager::load_from_path(history_path));
     let mut n = 0;
     loop {
         let candidate = numbered(base, n);
@@ -2284,12 +2401,12 @@ fn plan_target(
 
 /// An existing file counts as this download only if the checksum says so, or history recorded
 /// this exact path completing from one of these URLs with this size, and the server's
-/// Last-Modified is not newer than that download.
-fn already_downloaded(
+/// Last-Modified is not newer than that download. `history` is consulted only in that last case.
+fn already_downloaded<'h>(
     path: &Path,
     remote: &ProbeInfo,
     urls: &[String],
-    history: &DownloadHistoryManager,
+    history: impl FnOnce() -> &'h DownloadHistoryManager,
     checksum: Option<&str>,
 ) -> bool {
     if !path.is_file() {
@@ -2306,7 +2423,7 @@ fn already_downloaded(
     }
     let path = absolute(path);
     let modified = remote.last_modified.as_deref().and_then(parse_http_date);
-    history.entries().iter().any(|e| {
+    history().entries().iter().any(|e| {
         e.status == HistoryStatus::Completed
             && absolute(&e.file_path) == path
             && e.file_size == size
@@ -3155,6 +3272,19 @@ mod tests {
     }
 
     #[test]
+    fn test_discard_partial_removes_the_temporary_state_files() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("file.ts");
+        // What a crash while saving a state leaves behind, for either engine.
+        let tmps = ["file.ts.part.hlsstate.tmp", "file.ts.part.hfstate.tmp"].map(|name| dir.path().join(name));
+        for tmp in &tmps {
+            std::fs::write(tmp, b"x").unwrap();
+        }
+        assert_eq!(discard_partial(&target).unwrap(), 2);
+        assert!(tmps.iter().all(|tmp| !tmp.exists()));
+    }
+
+    #[test]
     fn test_directory_targets() {
         let dir = tempdir().unwrap();
         let sep = std::path::MAIN_SEPARATOR;
@@ -3241,6 +3371,33 @@ mod tests {
             assert_eq!(std::fs::read(path).unwrap(), b"AAAABBBB");
             assert!(!lock_path(path).exists(), "the claim is released when the download ends");
         }
+    }
+
+    #[tokio::test]
+    async fn test_hls_claim_outlasts_a_dropped_run_until_its_writer_is_done() {
+        use crate::hls::tests::{ok, serve, wait_for, DiskGate, DiskOp};
+        let (addr, hits) = serve(|path: &str, _| match path {
+            "/stream.m3u8" => ok(format!("#EXTM3U\n{}#EXT-X-ENDLIST\n", "#EXTINF:4,\nseg.ts\n".repeat(10))),
+            _ => ok("DATA"),
+        })
+        .await;
+        let dir = tempdir().unwrap();
+        let options = DownloadOptions { output_path: Some(dir.path().to_path_buf()), num_connections: 1, ..Default::default() };
+        let engine = DownloadEngine::new(vec![Url::parse(&format!("http://{addr}/stream.m3u8")).unwrap()], options);
+        let writes = DiskGate::close(dir.path(), DiskOp::Write);
+        let run = tokio::spawn(async move { engine.run(None).await });
+        // With one connection, the third segment is requested once the first went to the writer,
+        // which is stuck on it.
+        wait_for("the third segment", || hits.lock().get("/seg.ts").is_some_and(|&n| n >= 3)).await;
+        run.abort();
+        assert!(run.await.unwrap_err().is_cancelled());
+
+        let target = dir.path().join("stream.ts");
+        let claimed = || claim_target(&target).unwrap().is_none();
+        assert!(claimed(), "the writer still writes the .part");
+        drop(writes);
+        wait_for("the writer to release the claim", || !claimed()).await;
+        assert!(dir.path().join("stream.ts.part.hlsstate").exists());
     }
 
     #[tokio::test]
@@ -3358,6 +3515,90 @@ mod tests {
         assert_eq!((fetched("n=0"), fetched("n=1")), (2, 2), "checked once each after the first run, not refetched");
     }
 
+    #[tokio::test]
+    async fn test_hls_takes_stall_timeout_and_retries_from_the_options() {
+        use crate::hls::tests::{ok, serve};
+        let busy = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let busy_srv = Arc::clone(&busy);
+        let (addr, hits) = serve(move |path: &str, _| match path {
+            "/stall.m3u8" => ok("#EXTM3U\n#EXTINF:4,\nstall.ts\n#EXT-X-ENDLIST\n"),
+            "/busy.m3u8" => ok("#EXTM3U\n#EXTINF:4,\nbusy.ts\n#EXT-X-ENDLIST\n"),
+            "/stall.ts" => (0, String::new(), Vec::new()),
+            // More failures in a row than HLS used to try.
+            "/busy.ts" if busy_srv.fetch_add(1, Ordering::SeqCst) < 6 => (503, String::new(), Vec::new()),
+            "/busy.ts" => ok("DATA"),
+            _ => (404, String::new(), Vec::new()),
+        })
+        .await;
+        let dir = tempdir().unwrap();
+        let engine = |path: &str, stall_timeout_secs: u64, max_retries: u32| {
+            let options = DownloadOptions {
+                output_path: Some(dir.path().to_path_buf()),
+                num_connections: 1,
+                stall_timeout_secs,
+                max_retries,
+                ..Default::default()
+            };
+            DownloadEngine::new(vec![Url::parse(&format!("http://{addr}{path}")).unwrap()], options)
+        };
+
+        // One attempt that gives up after a second, not five of 30 s each.
+        let started = Instant::now();
+        let err = tokio::time::timeout(Duration::from_secs(10), engine("/stall.m3u8", 1, 0).run(None)).await.unwrap().unwrap_err();
+        assert!(err.contains("after 1 attempt(s)"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+
+        let path = engine("/busy.m3u8", 30, 6).run(None).await.unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"DATA");
+        assert_eq!(hits.lock()["/busy.ts"], 7);
+    }
+
+    #[tokio::test]
+    async fn test_a_file_whose_writer_flushed_it_is_not_flushed_again() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("flushed.ts");
+        std::fs::write(&path, b"DATA").unwrap();
+        let digest = || {
+            let mut hasher = StreamHasher::new(None);
+            hasher.update(b"DATA");
+            hasher.finish()
+        };
+        // Read-only: a flush, which opens the file for writing, fails.
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&path, permissions.clone()).unwrap();
+        let options = DownloadOptions { fsync_on_complete: true, ..Default::default() };
+        let engine = DownloadEngine::new(Vec::new(), options);
+
+        let flushed = engine.finish_external(path.clone(), unix_now(), Some(digest())).await;
+        assert_eq!(flushed.unwrap(), path, "a file its engine flushed is not flushed again");
+        let err = engine.finish_external(path.clone(), unix_now(), None).await.unwrap_err();
+        assert!(err.contains("flush"), "any other is: {err}");
+        assert!(engine.verify_written(&path, Written::Digest(digest())).await.is_err(), "so is one with a digest alone");
+
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&path, permissions).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_hls_playlist_may_take_every_retry_the_options_allow() {
+        use crate::hls::tests::serve;
+        let (addr, _) = serve(|_, _| (0, String::new(), Vec::new())).await;
+        let dir = tempdir().unwrap();
+        let options = DownloadOptions {
+            output_path: Some(dir.path().to_path_buf()),
+            stall_timeout_secs: 1,
+            max_retries: 1,
+            ..Default::default()
+        };
+        let engine = DownloadEngine::new(vec![Url::parse(&format!("http://{addr}/stalled.m3u8")).unwrap()], options);
+        // Two attempts of a second each outlast HLS_PARSE_TIMEOUT, which is a second in tests: the
+        // playlist fetch's own error ends the download, not the time limit.
+        let err = engine.run(None).await.unwrap_err();
+        assert!(err.contains("after 2 attempt(s)"), "{err}");
+    }
+
     #[test]
     fn test_claim_is_exclusive_and_removed_when_released() {
         let dir = tempdir().unwrap();
@@ -3390,7 +3631,7 @@ mod tests {
     fn test_plan_skips_a_name_claimed_by_another_download() {
         let dir = tempdir().unwrap();
         let base = dir.path().join("file.bin");
-        let history = DownloadHistoryManager::load_from_path(&dir.path().join("h.json"));
+        let history = dir.path().join("h.json");
         // Another download planned this name but has not created its .part yet.
         let other = Claim::try_take(&base).unwrap().unwrap();
         match plan_target(&base, &remote(1000), &urls(), &history, None).unwrap() {
@@ -3790,7 +4031,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let base = dir.path().join("file.bin");
         std::fs::write(&base, vec![7u8; 1000]).unwrap(); // same name AND same size
-        let history = DownloadHistoryManager::load_from_path(&dir.path().join("h.json"));
+        let history = dir.path().join("h.json");
         match plan_target(&base, &remote(1000), &urls(), &history, None).unwrap() {
             Plan::Fetch { final_path, resume: None, .. } => assert_eq!(final_path, dir.path().join("file (1).bin")),
             other => panic!("{other:?}"),
@@ -3804,14 +4045,15 @@ mod tests {
         let dir = tempdir().unwrap();
         let base = dir.path().join("file.bin");
         std::fs::write(&base, vec![7u8; 1000]).unwrap();
-        let mut history = DownloadHistoryManager::load_from_path(&dir.path().join("h.json"));
+        let history = dir.path().join("h.json");
+        let mut recorded = DownloadHistoryManager::load_from_path(&history);
 
         // Same name and URL, but recorded in another directory: not this file.
         let elsewhere = dir.path().join("other").join("file.bin");
-        history.add_or_update(completed_entry(&elsewhere, 1000, urls()));
+        recorded.add_or_update(completed_entry(&elsewhere, 1000, urls()));
         assert!(matches!(plan_target(&base, &remote(1000), &urls(), &history, None).unwrap(), Plan::Fetch { .. }));
 
-        history.add_or_update(completed_entry(&base, 1000, urls()));
+        recorded.add_or_update(completed_entry(&base, 1000, urls()));
         assert!(matches!(
             plan_target(&base, &remote(1000), &urls(), &history, None).unwrap(),
             Plan::AlreadyDone(p) if p == base
@@ -3828,7 +4070,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let base = dir.path().join("file.bin");
         std::fs::write(&base, b"hello").unwrap();
-        let history = DownloadHistoryManager::load_from_path(&dir.path().join("h.json"));
+        let history = dir.path().join("h.json");
         let good = Some("md5:5d41402abc4b2a76b9719d911017c592");
         let bad = Some("md5:00000000000000000000000000000000");
         assert!(matches!(plan_target(&base, &remote(5), &urls(), &history, good).unwrap(), Plan::AlreadyDone(_)));
@@ -3841,7 +4083,7 @@ mod tests {
         let base = dir.path().join("file.bin");
         let part = part_path(&base);
         let part_state = DownloadState::state_file_path(&part);
-        let history = DownloadHistoryManager::load_from_path(&dir.path().join("h.json"));
+        let history = dir.path().join("h.json");
 
         std::fs::write(&part, vec![1u8; 1000]).unwrap();
         state_for(1000, "\"v1\"", urls()).save_atomic(&part_state).unwrap();
@@ -3914,7 +4156,7 @@ mod tests {
         let base = dir.path().join("file.bin");
         std::fs::write(&base, vec![3u8; 1000]).unwrap();
         state_for(1000, "\"v1\"", urls()).save_atomic(&DownloadState::state_file_path(&base)).unwrap();
-        let history = DownloadHistoryManager::load_from_path(&dir.path().join("h.json"));
+        let history = dir.path().join("h.json");
 
         match plan_target(&base, &remote(1000), &urls(), &history, None).unwrap() {
             Plan::Fetch { final_path, resume: Some(_), .. } => assert_eq!(final_path, base),
@@ -3935,6 +4177,107 @@ mod tests {
         r.etag = None;
         r.last_modified = Some("Sun, 06 Nov 1994 08:49:37 GMT".into());
         assert!(validators_compatible(&state, &r), "nothing comparable");
+    }
+
+    #[test]
+    fn test_plan_reads_history_only_to_judge_an_existing_file() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().join("file.bin");
+        let history = dir.path().join("h.json");
+        DownloadHistoryManager::load_from_path(&history).add_or_update(completed_entry(&base, 1000, urls()));
+        let reads = || crate::history::READS.with(std::cell::Cell::get);
+        let before = reads();
+
+        assert!(matches!(plan_target(&base, &remote(1000), &urls(), &history, None).unwrap(), Plan::Fetch { .. }));
+        assert_eq!(reads(), before, "no file to judge, so no history to read");
+        std::fs::write(&base, vec![7u8; 1000]).unwrap();
+        assert!(matches!(plan_target(&base, &remote(1000), &urls(), &history, None).unwrap(), Plan::AlreadyDone(_)));
+        assert_eq!(reads(), before + 1);
+    }
+
+    fn engine_with(options: DownloadOptions) -> DownloadEngine {
+        DownloadEngine::new(vec![Url::parse("http://example.com/file.bin").unwrap()], options)
+    }
+
+    /// A `.part` of `final_path` holding `data`, written through a writer that hashed it.
+    fn written_part(final_path: &Path, data: &[u8]) -> DiskWriter {
+        let writer = DiskWriter::open_or_create(part_path(final_path), data.len() as u64).unwrap();
+        writer.track_digest(&[], None);
+        writer.write_chunk_slice(0, data).unwrap();
+        writer
+    }
+
+    #[tokio::test]
+    async fn test_a_mismatch_found_while_writing_is_confirmed_by_reading_the_file() {
+        let dir = tempdir().unwrap();
+        let (seen, on_disk) = (vec![1u8; 5000], vec![2u8; 5000]);
+        let checksum = Some(blake3::hash(&on_disk).to_hex().to_string());
+
+        // The bytes on disk are not the ones the writer hashed: the checksum decides by the file.
+        let target = dir.path().join("kept.bin");
+        let writer = written_part(&target, &seen);
+        std::io::Write::write_all(&mut File::options().write(true).open(part_path(&target)).unwrap(), &on_disk).unwrap();
+        let engine = engine_with(DownloadOptions { expected_checksum: checksum.clone(), ..Default::default() });
+        let claim = Claim::try_take(&target).unwrap().unwrap();
+        let done = engine.finalize(target.clone(), claim, Written::Writer(writer), unix_now(), &None).await;
+        assert_eq!(done.unwrap(), target);
+        assert_eq!(std::fs::read(&target).unwrap(), on_disk);
+
+        // A file that really differs is still discarded.
+        let target = dir.path().join("discarded.bin");
+        let writer = written_part(&target, &seen);
+        let claim = Claim::try_take(&target).unwrap().unwrap();
+        let err = engine.finalize(target.clone(), claim, Written::Writer(writer), unix_now(), &None).await.unwrap_err();
+        assert!(err.contains("Checksum verification failed"), "{err}");
+        assert!(!part_path(&target).exists() && !target.exists());
+    }
+
+    #[tokio::test]
+    async fn test_completion_waits_for_the_disk_only_with_fsync_on_complete() {
+        let dir = tempdir().unwrap();
+        for fsync in [false, true] {
+            let target = dir.path().join(format!("fsync-{fsync}.bin"));
+            let writer = written_part(&target, b"abc");
+            let engine = engine_with(DownloadOptions { fsync_on_complete: fsync, ..Default::default() });
+            let claim = Claim::try_take(&target).unwrap().unwrap();
+            let done = engine.finalize(target.clone(), claim, Written::Writer(writer.clone()), unix_now(), &None).await;
+            assert_eq!(done.unwrap(), target);
+            assert_eq!(writer.sync_count(), usize::from(fsync), "fsync_on_complete: {fsync}");
+            assert_eq!(std::fs::read(&target).unwrap(), b"abc");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_flush_and_hash_run_at_the_same_time() {
+        // Each waits for the other to have started: run one after the other, both would time out.
+        let (flush_started, flush_rx) = std::sync::mpsc::channel();
+        let (hash_started, hash_rx) = std::sync::mpsc::channel();
+        let hash = move || {
+            let _ = hash_started.send(());
+            flush_rx
+                .recv_timeout(Duration::from_secs(10))
+                .map(|()| "digest".to_string())
+                .map_err(|_| VerifyError::Io("the flush did not run alongside".into()))
+        };
+        let flush = move || {
+            let _ = flush_started.send(());
+            hash_rx.recv_timeout(Duration::from_secs(10)).map_err(|_| "the hash did not run alongside".to_string())
+        };
+        let no_reread = None::<fn() -> Result<String, VerifyError>>;
+        assert_eq!(hash_and_flush(hash, Some(flush), no_reread).await.unwrap(), "digest");
+
+        // A failed flush fails the download, so the file is not renamed.
+        let digest = || Ok("digest".to_string());
+        let (failed, mismatch) = (|| Err("disk gone".to_string()), || Err(VerifyError::Mismatch("differs".into())));
+        let err = hash_and_flush(digest, Some(failed), no_reread).await.unwrap_err();
+        assert!(matches!(&err, VerifyError::Io(e) if e.contains("disk gone")), "{err}");
+        // Also when a mismatch the digest reported is overturned by reading the file back.
+        let err = hash_and_flush(mismatch, Some(failed), Some(digest)).await.unwrap_err();
+        assert!(matches!(&err, VerifyError::Io(e) if e.contains("disk gone")), "{err}");
+        assert_eq!(hash_and_flush(mismatch, Some(|| Ok(())), Some(digest)).await.unwrap(), "digest");
+        // A mismatch the file confirms is one, flushed or not: the file is discarded.
+        let err = hash_and_flush(mismatch, Some(failed), Some(mismatch)).await.unwrap_err();
+        assert!(matches!(err, VerifyError::Mismatch(_)), "{err}");
     }
 
     #[tokio::test]
