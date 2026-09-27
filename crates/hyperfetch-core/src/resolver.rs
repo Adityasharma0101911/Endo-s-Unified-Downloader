@@ -351,8 +351,9 @@ fn country_domain(domain: &str) -> bool {
 
 /// Fails if the answer to `url` (which ended at `final_url`), with these headers, is a web page
 /// instead of the file it stands for: HTML not sent as an attachment (a hosted .html file is
-/// one) from Drive, from Google asking to sign in to a document, for a link that names a file,
-/// or from a file-share service not supported yet. Other pages are looked into for a video.
+/// one) from Drive, from Google asking to sign in to a document, for a code-host folder, for a
+/// link that names a file, or from a file-share service not supported yet. Other pages are looked
+/// into for a video.
 pub fn check_answer(url: &Url, final_url: &Url, headers: &HeaderMap) -> Result<(), ResolverError> {
     GoogleDriveResolver::check_answer(url, headers)?;
     if !html_type(headers) || is_attachment(headers) {
@@ -362,6 +363,11 @@ pub fn check_answer(url: &Url, final_url: &Url, headers: &HeaderMap) -> Result<(
         return Err(ResolverError::NotFound(
             "Google asked to sign in: the document is private (share it as \"Anyone with the link\", or pass your browser's cookies with --load-cookies)"
                 .to_string(),
+        ));
+    }
+    if code_host_folder(url) || code_host_folder(final_url) {
+        return Err(ResolverError::NotFound(
+            "the link leads to a folder, not a file (link one of the files in it instead)".to_string(),
         ));
     }
     // Before the services: a link of theirs that names a file is one to the file, gone stale.
@@ -410,6 +416,24 @@ fn yt_dlp_share_page(url: &Url) -> bool {
         Some("SharePoint") => path.starts_with("/:v:/") || (path.ends_with("/stream.aspx") && has("id")),
         Some("Yandex Disk") => {
             path.starts_with("/d/") || path.starts_with("/i/") || (path.starts_with("/public") && has("hash"))
+        }
+        _ => false,
+    }
+}
+
+/// Whether `url` is a folder page on a code host, which lists files instead of being one:
+/// GitHub /{owner}/{repo}/tree/..., GitLab /{namespace...}/-/tree/..., Hugging Face
+/// [/datasets|/spaces]/{owner}/{repo}/tree/... (a file link to a folder ends there too).
+fn code_host_folder(url: &Url) -> bool {
+    let Some(segs) = url.path_segments().map(|s| s.collect::<Vec<_>>()) else { return false };
+    // "tree" then the ref.
+    let tree_at = |i: usize| segs.get(i) == Some(&"tree") && segs.get(i + 1).is_some_and(|r| !r.is_empty());
+    match url.host_str().unwrap_or_default().trim_end_matches('.') {
+        "github.com" => tree_at(2),
+        "gitlab.com" => (3..segs.len()).any(|i| segs[i - 1] == "-" && tree_at(i)),
+        "huggingface.co" | "hf.co" => {
+            let start = usize::from(matches!(segs.first(), Some(&("datasets" | "spaces"))));
+            tree_at(start + 2) || tree_at(start + 1)
         }
         _ => false,
     }
@@ -1684,6 +1708,36 @@ mod tests {
             let landed = Url::parse(final_url.unwrap_or(url)).unwrap();
             assert!(HtmlVideoResolver::is_page(&landed, &page), "{landed}");
         }
+    }
+
+    #[test]
+    fn test_code_host_folders_are_refused() {
+        let page = headers(&[(CONTENT_TYPE, "text/html; charset=utf-8")]);
+        for (url, final_url) in [
+            // A file link to a folder, which GitHub sends on to the folder's page.
+            ("https://github.com/o/r/blob/main/docs", Some("https://github.com/o/r/tree/main/docs")),
+            ("https://github.com/o/r/tree/main", None),
+            ("https://gitlab.com/group/sub/project/-/tree/main/docs", None),
+            ("https://huggingface.co/openai-community/gpt2/tree/main/onnx", None),
+            ("https://huggingface.co/datasets/stanfordnlp/imdb/tree/main", None),
+            ("https://hf.co/gpt2/tree/main", None),
+        ] {
+            let err = refusal(url, final_url, &page).unwrap_or_else(|| panic!("{url}"));
+            assert!(err.contains("the link leads to a folder, not a file"), "{err}");
+        }
+        for page_url in [
+            "https://github.com/o/r",
+            "https://github.com/o/tree",
+            "https://github.com/o/r/tree/",
+            "https://gitlab.com/group/tree/main",
+            "https://huggingface.co/owner/tree",
+            "https://example.com/o/r/tree/main",
+        ] {
+            assert_eq!(refusal(page_url, None, &page), None, "{page_url}");
+        }
+        // A folder's listing sent as a file is one.
+        let json = headers(&[(CONTENT_TYPE, "application/json")]);
+        assert_eq!(refusal("https://huggingface.co/api/models/gpt2/tree/main", None, &json), None);
     }
 
     #[test]
