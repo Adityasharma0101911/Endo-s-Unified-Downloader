@@ -70,6 +70,8 @@ const MIN_BYTES_PER_CONNECTION: u64 = 64 * 1024;
 /// Fetching the playlists and their AES keys may take this long, besides what one request takes
 /// that uses every retry the user allows (see [`crate::hls::FetchPolicy::give_up_after`]).
 const HLS_PARSE_TIMEOUT: Duration = if cfg!(test) { Duration::from_secs(1) } else { Duration::from_secs(120) };
+/// Most links one download follows past those it was given (see `DownloadEngine::follow`).
+const MAX_FOLLOWS: usize = 3;
 /// Longest file name we create, in bytes: leaves room for " (n)" and ".part.hfstate.tmp" under
 /// the 255-byte (Linux) and 255 UTF-16 unit (NTFS) limits.
 const MAX_NAME_BYTES: usize = 200;
@@ -120,7 +122,15 @@ pub struct DownloadOptions {
     pub auth_header: Option<String>,
     pub proxy: Option<String>,
     pub media_preset: Option<crate::media::MediaQualityPreset>,
+    /// The quality of a link that turns out to be media only once it answers (a web page one of
+    /// yt-dlp's sites takes, a short link to a media site), when `media_preset` is not set: unlike
+    /// that, it sends no link to yt-dlp itself.
+    pub page_media_preset: Option<crate::media::MediaQualityPreset>,
     pub browser_cookies: Option<crate::media::BrowserCookieSource>,
+    /// The yt-dlp to run for media, in place of the one found or installed. Never saved with the
+    /// options: a program to run is not read back from a file.
+    #[serde(skip)]
+    pub ytdlp_path: Option<PathBuf>,
     /// Global download speed cap in bytes/sec across all connections (None = unlimited).
     pub max_speed: Option<u64>,
     /// Failed attempts allowed per chunk before the download fails. Attempts that made progress don't count.
@@ -150,7 +160,9 @@ impl Default for DownloadOptions {
             auth_header: None,
             proxy: None,
             media_preset: None,
+            page_media_preset: None,
             browser_cookies: None,
+            ytdlp_path: None,
             max_speed: None,
             max_retries: 8,
             stall_timeout_secs: 30,
@@ -268,22 +280,26 @@ impl DownloadEngine {
         }
 
         if let Some(media_url) = self.media_target() {
-            return self.run_media(media_url, snapshot_tx).await;
+            return self.run_media(media_url, None, snapshot_tx).await;
         }
 
         let resolved = self.resolve_all(&client).await?;
-        self.fetch_resolved(client, resolved, snapshot_tx, true).await
+        self.fetch_resolved(client, resolved, snapshot_tx, Route { follows: 0, tried: Vec::new(), scrape: true }).await
     }
 
     /// Downloads what the resolved mirrors serve: an HLS stream if one is a playlist, else their
-    /// file. With `scrape`, a web page they answer with is looked into, once, for the video it
-    /// plays, which is then downloaded in the page's place (see `video_on_page`).
+    /// file. An answer that lands on a host a resolver takes, or on a media site, is downloaded
+    /// from there instead (see `follow`). With `route.scrape`, a web page they answer with is an
+    /// error when a link shortener or mail scanner showed it instead of redirecting; any other is
+    /// looked into (see `look_into_page`): the video it plays is downloaded in its place, the link
+    /// it sends the browser on to at once is followed. A page that leads nowhere is asked of
+    /// yt-dlp's own sites (see `site_media`), and is downloaded as it is when none takes it.
     async fn fetch_resolved(
         &self,
         client: Client,
         resolved: Vec<Url>,
         snapshot_tx: Option<broadcast::Sender<EngineSnapshot>>,
-        scrape: bool,
+        mut route: Route,
     ) -> Result<PathBuf, String> {
         if let Some(playlist) = resolved.iter().find(|u| u.as_str().contains(".m3u8")) {
             tracing::info!("Detected HLS video stream: {}", playlist);
@@ -317,42 +333,113 @@ impl DownloadEngine {
         }
 
         let mut probed = self.probe_all(&client, &resolved).await?;
-        if scrape {
-            if let Some(video) = self.video_on_page(&client, &mut probed).await? {
-                let page = probed.reference.url.clone();
+        let (url, final_url) = (probed.reference.url.clone(), probed.reference.final_url.clone());
+        route.tried.push(url.clone());
+        if crate::resolver::lands_elsewhere(&url, &final_url) && route.goes_on(&final_url, &probed.reference)? {
+            // Nothing of the answer is kept: it and the probes still out are given up.
+            drop(probed);
+            return self.follow(client, final_url, snapshot_tx, route).await;
+        }
+        if !route.scrape || !HtmlVideoResolver::is_page(&url, &probed.reference.headers) {
+            return self.download(client, probed, snapshot_tx).await;
+        }
+        // Never clicked through, whatever the page holds.
+        if let Some(host) = shortener_host(&final_url) {
+            return Err(format!(
+                "{} showed a page instead of redirecting (a preview or a warning): open the link in your browser",
+                host
+            ));
+        }
+        match self.look_into_page(&client, &mut probed).await? {
+            Some(Lead::Video(video)) => {
                 // Nothing of the page is kept: its answer and the probes still out are given up.
                 drop(probed);
                 let mut mirrors = Vec::new();
-                for url in resolved {
-                    let url = if url == page { video.clone() } else { url };
-                    if !mirrors.contains(&url) {
-                        mirrors.push(url);
+                for mirror in resolved {
+                    let mirror = if mirror == url { video.clone() } else { mirror };
+                    if !mirrors.contains(&mirror) {
+                        mirrors.push(mirror);
                     }
                 }
-                // The video is downloaded as if named along with the page: its history entry lists
-                // it, as its resume state does, so a repair finds it without the page. Credentials
-                // still go only to the hosts the user named, as they were scoped to when this
-                // engine was built.
-                let mut engine = self.clone();
-                if !engine.urls.contains(&video) {
-                    engine.urls.push(video);
-                }
-                return Box::pin(engine.fetch_resolved(client, mirrors, snapshot_tx, false)).await;
+                let route = Route { scrape: false, ..route };
+                return Box::pin(self.naming(video).fetch_resolved(client, mirrors, snapshot_tx, route)).await;
             }
+            Some(Lead::Refresh(target)) => {
+                if route.goes_on(&target, &probed.reference)? {
+                    drop(probed);
+                    return self.follow(client, target, snapshot_tx, route).await;
+                }
+            }
+            None => {}
+        }
+        if let Some(found) = self.site_media(&final_url).await? {
+            drop(probed);
+            return self.naming(final_url.clone()).run_media(final_url, Some(found), snapshot_tx).await;
         }
         self.download(client, probed, snapshot_tx).await
     }
 
-    /// The video a web page the download's reference answered with plays (see
-    /// `HtmlVideoResolver::is_page`), looked for in the page as the probe brought it (all of it,
-    /// or all still coming), else as a new request without Range brings it. A page without a
-    /// video, or one that could not be read, is downloaded as it is; an answer still coming is
-    /// taken from `probed` once read.
-    async fn video_on_page(&self, client: &Client, probed: &mut Probed) -> Result<Option<Url>, String> {
-        let reference = &probed.reference;
-        if !HtmlVideoResolver::is_page(&reference.url, &reference.headers) {
-            return Ok(None);
+    /// Downloads `target`, where the download's link led (see `fetch_resolved`), in its place: a
+    /// media site's link with yt-dlp, any other as its resolver takes it, looked into again if it
+    /// answers with a page.
+    async fn follow(
+        &self,
+        client: Client,
+        target: Url,
+        snapshot_tx: Option<broadcast::Sender<EngineSnapshot>>,
+        mut route: Route,
+    ) -> Result<PathBuf, String> {
+        tracing::info!("Downloading {} in place of the link that led there", target);
+        let engine = self.naming(target.clone());
+        if crate::media::is_supported_media_site(&target) {
+            return engine.run_media(target, None, snapshot_tx).await;
         }
+        let resolved = engine
+            .guarded(RESOLVE_TIMEOUT, &format!("resolving {}", target), crate::resolver::SmartResolver::resolve(&client, &target))
+            .await?
+            .map_err(|e| format!("Failed to resolve {}: {}", target, e))?;
+        route.follows += 1;
+        route.tried.push(target);
+        route.scrape = true;
+        Box::pin(engine.fetch_resolved(client, resolved, snapshot_tx, route)).await
+    }
+
+    /// This download with `url`, found on the way, among its URLs: its history entry lists it,
+    /// as its resume state does, so a repair finds it without the link that led there.
+    /// Credentials still go only to the hosts the user named, as they were scoped to when this
+    /// engine was built.
+    fn naming(&self, url: Url) -> Self {
+        let mut engine = self.clone();
+        if !engine.urls.contains(&url) {
+            engine.urls.push(url);
+        }
+        engine
+    }
+
+    /// What one of yt-dlp's own sites finds at `url`, a web page that leads nowhere by itself (see
+    /// `crate::media::find_site_media`). None when none of them takes it, or yt-dlp cannot be
+    /// found, installed or run, or takes too long: that never fails the download. A site that
+    /// takes it but finds its video DRM-protected does: the page is not what the link stands for.
+    async fn site_media(&self, url: &Url) -> Result<Option<crate::media::Extracted>, String> {
+        let options = self.media_options();
+        match crate::media::find_site_media(url, &options, Some(Arc::clone(&self.cancel_flag))).await {
+            Ok(found) => Ok(Some(found)),
+            Err(_) if self.cancel_token.is_cancelled() => Err(CANCELLED.to_string()),
+            Err(e) if e == crate::media::DRM_REFUSED => Err(e),
+            Err(e) => {
+                tracing::info!("No site of yt-dlp's takes {}: {}", url, e);
+                Ok(None)
+            }
+        }
+    }
+
+    /// Where a web page the download's reference answered with leads (see
+    /// `HtmlVideoResolver::is_page`): to the video it plays, else to the link it sends the browser
+    /// on to at once. It is looked into as the probe brought it (all of it, or all still coming),
+    /// else as a new request without Range brings it. A page that could not be read leads
+    /// nowhere; an answer still coming is taken from `probed` once read.
+    async fn look_into_page(&self, client: &Client, probed: &mut Probed) -> Result<Option<Lead>, String> {
+        let reference = &probed.reference;
         let (url, final_url) = (reference.url.clone(), reference.final_url.clone());
         let whole = reference.size == Some(reference.prefetch.len() as u64);
         let prefetch = reference.prefetch.clone();
@@ -379,10 +466,12 @@ impl DownloadEngine {
             Ok((html, page_url))
         };
         match self.guarded(RESOLVE_TIMEOUT, &format!("reading the page {}", url), page).await {
-            Ok(Ok((html, page_url))) => Ok(HtmlVideoResolver::video_in(&html, &page_url)),
+            Ok(Ok((html, page_url))) => Ok(HtmlVideoResolver::video_in(&html, &page_url)
+                .map(Lead::Video)
+                .or_else(|| HtmlVideoResolver::meta_refresh(&html, &page_url).map(Lead::Refresh))),
             Err(e) if self.cancel_token.is_cancelled() => Err(e),
             Ok(Err(e)) | Err(e) => {
-                tracing::warn!("Could not look into the page {}, downloading it as it is: {}", url, e);
+                tracing::warn!("Could not look into the page {}: {}", url, e);
                 Ok(None)
             }
         }
@@ -409,9 +498,42 @@ impl DownloadEngine {
         })
     }
 
+    /// What a media download of this one goes by (see `run_media`): its settings, and the quality
+    /// asked for, else the one for a link that turns out to be media, else the default.
+    fn media_options(&self) -> crate::media::MediaDownloadOptions {
+        let (output_dir, output_filename) = match &self.options.output_path {
+            Some(p) if is_dir_target(p) => (p.clone(), None),
+            Some(p) => (
+                p.parent().unwrap_or(Path::new(".")).to_path_buf(),
+                p.file_name().map(|n| n.to_string_lossy().to_string()),
+            ),
+            None => (PathBuf::from("."), None),
+        };
+        let cookies = if let Some(ref bc) = self.options.browser_cookies {
+            bc.clone()
+        } else if let Some(ref cp) = self.options.cookies_path {
+            crate::media::BrowserCookieSource::File(cp.clone())
+        } else {
+            crate::media::BrowserCookieSource::None
+        };
+        let preset = self.options.media_preset.as_ref().or(self.options.page_media_preset.as_ref());
+        crate::media::MediaDownloadOptions {
+            preset: preset.cloned().unwrap_or_default(),
+            cookies,
+            proxy: self.options.proxy.clone(),
+            output_dir,
+            output_filename,
+            custom_ytdlp_path: self.options.ytdlp_path.clone(),
+            concurrent_fragments: self.options.num_connections.clamp(1, 32),
+        }
+    }
+
+    /// Downloads `media_url` with yt-dlp, which goes by what it found there moments ago when
+    /// that is given (see `site_media`).
     async fn run_media(
         &self,
         media_url: Url,
+        extracted: Option<crate::media::Extracted>,
         snapshot_tx: Option<broadcast::Sender<EngineSnapshot>>,
     ) -> Result<PathBuf, String> {
         tracing::info!("Routing download to Media Engine: {}", media_url);
@@ -440,37 +562,13 @@ impl DownloadEngine {
             }
         });
 
-        let (output_dir, output_filename) = match &self.options.output_path {
-            Some(p) if is_dir_target(p) => (p.clone(), None),
-            Some(p) => (
-                p.parent().unwrap_or(Path::new(".")).to_path_buf(),
-                p.file_name().map(|n| n.to_string_lossy().to_string()),
-            ),
-            None => (PathBuf::from("."), None),
-        };
+        let media_opts = self.media_options();
         {
-            let dir = output_dir.clone();
+            let dir = media_opts.output_dir.clone();
             blocking(move || std::fs::create_dir_all(&dir))
                 .await?
-                .map_err(|e| format!("Failed to create {}: {}", output_dir.display(), e))?;
+                .map_err(|e| format!("Failed to create {}: {}", media_opts.output_dir.display(), e))?;
         }
-        let cookie_source = if let Some(ref bc) = self.options.browser_cookies {
-            bc.clone()
-        } else if let Some(ref cp) = self.options.cookies_path {
-            crate::media::BrowserCookieSource::File(cp.clone())
-        } else {
-            crate::media::BrowserCookieSource::None
-        };
-
-        let media_opts = crate::media::MediaDownloadOptions {
-            preset: self.options.media_preset.clone().unwrap_or_default(),
-            cookies: cookie_source,
-            proxy: self.options.proxy.clone(),
-            output_dir,
-            output_filename,
-            custom_ytdlp_path: None,
-            concurrent_fragments: self.options.num_connections.clamp(1, 32),
-        };
 
         // yt-dlp finds the streams; this engine downloads them where it can.
         let fetch: &crate::media::StreamFetcher<'_> =
@@ -481,6 +579,7 @@ impl DownloadEngine {
             Some(prog_tx),
             Some(Arc::clone(&self.cancel_flag)),
             Some(fetch),
+            extracted,
         )
         .await;
         let _ = forwarder.await;
@@ -1732,6 +1831,55 @@ struct Probed {
     live: Option<Live>,
     /// The probes still out when the download could start without them.
     late: Option<ProbeStream>,
+}
+
+/// Where a web page leads a download (see `DownloadEngine::look_into_page`).
+enum Lead {
+    /// The video it plays.
+    Video(Url),
+    /// The link it sends the browser on to at once.
+    Refresh(Url),
+}
+
+/// How far a download went from the links it was given.
+#[derive(Clone, Debug)]
+struct Route {
+    /// Links followed so far (see `DownloadEngine::follow`).
+    follows: usize,
+    /// The links whose answers the download had, and those it followed: a link it was given but
+    /// never had the answer of (a mirror whose probe lost to the first's) is not among them.
+    tried: Vec<Url>,
+    /// Whether a web page answered is looked into: not once one led to its video.
+    scrape: bool,
+}
+
+impl Route {
+    /// Whether the download goes on to `target`, where the answer `reference` describes leads: at
+    /// most `MAX_FOLLOWS` links past those it was given, and never to one it tried. When it does
+    /// not, that answer is judged as `probe_all` leaves out for one that lands elsewhere, and as
+    /// if the link had been where it landed, so a page is never saved in place of a file.
+    fn goes_on(&self, target: &Url, reference: &ProbeInfo) -> Result<bool, String> {
+        if self.follows < MAX_FOLLOWS && !self.tried.contains(target) {
+            return Ok(true);
+        }
+        tracing::warn!("Not following {} to {}: too many links followed, or one tried before", reference.url, target);
+        for link in [&reference.url, &reference.final_url] {
+            crate::resolver::check_answer(link, &reference.final_url, &reference.headers)
+                .map_err(|e| format!("{}: {}", reference.url, e))?;
+        }
+        Ok(false)
+    }
+}
+
+/// The host of `url` when a link shortener or a mail link scanner answers there (see
+/// `HtmlVideoResolver::SHORTENER_HOSTS`): a page from it is a preview or a warning.
+fn shortener_host(url: &Url) -> Option<&str> {
+    let host = url.host_str()?;
+    let listed = |pattern: &&str| match pattern.split_once('*') {
+        Some((head, tail)) => host.len() > head.len() + tail.len() && host.starts_with(head) && host.ends_with(tail),
+        None => host == *pattern,
+    };
+    HtmlVideoResolver::SHORTENER_HOSTS.iter().any(listed).then_some(host)
 }
 
 /// Where a `RateWatch` measures a connection's rate from: when its answer arrived.
@@ -4659,5 +4807,120 @@ mod tests {
         let engine = DownloadEngine::new(vec![Url::parse("http://127.0.0.1:9/x.bin").unwrap()], options);
         let err = engine.run(None).await.unwrap_err();
         assert!(err.contains("proxy"), "{err}");
+    }
+
+    #[test]
+    fn test_a_download_follows_at_most_three_links_and_never_back() {
+        let given = Url::parse("http://short.engine.invalid/x").unwrap();
+        let answer = probed(given.as_str(), 100);
+        let next = Url::parse("http://files.engine.invalid/a.bin").unwrap();
+        let after = |follows, tried: &[&Url]| Route { follows, tried: tried.iter().map(|u| (*u).clone()).collect(), scrape: true };
+        assert_eq!(after(0, &[&given]).goes_on(&next, &answer), Ok(true));
+        assert_eq!(after(MAX_FOLLOWS - 1, &[&given]).goes_on(&next, &answer), Ok(true));
+        assert_eq!(after(MAX_FOLLOWS, &[&given]).goes_on(&next, &answer), Ok(false));
+        // Never to a link the download tried: one whose answer it had, or one it followed. A
+        // link it was only given is not among them (see the integration tests).
+        assert_eq!(after(0, &[&given]).goes_on(&given, &answer), Ok(false));
+        assert_eq!(after(1, &[&given, &next]).goes_on(&next, &answer), Ok(false));
+        // An answer the download does not follow on from is judged as the probe skipped it...
+        let html = |mut info: ProbeInfo| {
+            info.headers.insert(reqwest::header::CONTENT_TYPE, HeaderValue::from_static("text/html"));
+            info
+        };
+        let drive = html(probed("http://drive.usercontent.google.com/download?id=abc&export=download&confirm=t", 100));
+        let err = after(MAX_FOLLOWS, &[]).goes_on(&next, &drive).unwrap_err();
+        assert!(err.contains("Google Drive served a web page instead of the file"), "{err}");
+        // ... and as if the link had been where it landed.
+        let mut landed = html(probed(given.as_str(), 100));
+        landed.final_url = drive.url.clone();
+        let err = after(MAX_FOLLOWS, &[]).goes_on(&next, &landed).unwrap_err();
+        assert!(err.starts_with(&format!("{given}: ")) && err.contains("Google Drive served a web page"), "{err}");
+    }
+
+    #[test]
+    fn test_a_page_refreshing_at_once_names_its_target() {
+        let page = Url::parse("https://t.co/abc").unwrap();
+        let target = |meta: &str| HtmlVideoResolver::meta_refresh(&format!("<head>{meta}</head>"), &page);
+        let a = Url::parse("https://example.com/a").unwrap();
+        // t.co's own answer, and the case, spacing, separator and quoting variants browsers read alike.
+        for meta in [
+            r#"<noscript><META http-equiv="refresh" content="0;URL=https://example.com/a"></noscript>"#,
+            r#"<meta HTTP-EQUIV="Refresh" CONTENT="0; url=https://example.com/a">"#,
+            r#"<meta http-equiv="refresh" content="0;URL='https://example.com/a'">"#,
+            r#"<meta http-equiv='refresh' content='0, URL="https://example.com/a"'>"#,
+            r#"<meta http-equiv="refresh" content="  0 ;  url = https://example.com/a  ">"#,
+            r#"<meta http-equiv="refresh" content="0;https://example.com/a">"#,
+            r#"<meta http-equiv="refresh" content="0.5; url=https://example.com/a">"#,
+        ] {
+            assert_eq!(target(meta).as_ref(), Some(&a), "{meta}");
+        }
+        let relative = target(r#"<meta http-equiv="refresh" content="0; url=/dl/f.zip?x=1&amp;y=2">"#);
+        assert_eq!(relative.map(String::from).as_deref(), Some("https://t.co/dl/f.zip?x=1&y=2"));
+        // For browsers without JavaScript only, a page asks for it on its own site (as Google's
+        // answers do), or sends the browser on to another site (as t.co's do).
+        let enable_js = r#"<noscript><meta content="0;url=/httpservice/retry/enablejs?sei=x" http-equiv="refresh"></noscript>"#;
+        assert_eq!(target(enable_js), None);
+        let both = format!(r#"{enable_js}<noscript><meta http-equiv="refresh" content="0;url=https://example.com/a"></noscript>"#);
+        assert_eq!(target(&both).as_ref(), Some(&a));
+        let after_noscript = r#"<noscript><style>p{display:none}</style></noscript><meta http-equiv="refresh" content="0; url=/next">"#;
+        assert_eq!(target(after_noscript).map(String::from).as_deref(), Some("https://t.co/next"));
+        for meta in [
+            // A timed page is for reading first; one refreshing without a target only reloads.
+            r#"<meta http-equiv="refresh" content="5; url=https://example.com/a">"#,
+            r#"<meta http-equiv="refresh" content="0">"#,
+            r#"<meta http-equiv="refresh" content="0; url=javascript:alert(1)">"#,
+            r#"<meta http-equiv="refresh" content="0; url=ftp://example.com/a">"#,
+            r#"<meta http-equiv="content-type" content="0; url=https://example.com/a">"#,
+            r#"<meta name="refresh" content="0; url=https://example.com/a">"#,
+            r#"<NOSCRIPT><meta http-equiv="refresh" content="0; url=https://t.co/abc?js=0"></NOSCRIPT>"#,
+        ] {
+            assert_eq!(target(meta), None, "{meta}");
+        }
+    }
+
+    #[test]
+    fn test_link_shorteners_and_mail_scanners_are_known_by_host() {
+        let host = |url: &str| shortener_host(&Url::parse(url).unwrap()).map(str::to_string);
+        for url in [
+            "https://bit.ly/3xYz",
+            "https://tinyurl.com/abc",
+            "https://lnkd.in/eAbc",
+            "https://nam12.safelinks.protection.outlook.com/?url=https%3A%2F%2Fexample.com",
+            "https://urldefense.proofpoint.com/v2/url?u=x",
+            "https://protect-eu.mimecast.com/s/abc",
+            "https://url.uk.m.mimecastprotect.com/s/abc",
+        ] {
+            let expected = Url::parse(url).unwrap().host_str().map(str::to_string);
+            assert_eq!(host(url), expected, "{url}");
+        }
+        // t.co's page sends the browser on (see `meta_refresh`); lookalikes are no shorteners.
+        for url in [
+            "https://t.co/abc",
+            "https://example.com/bit.ly",
+            "https://notbit.ly/x",
+            "https://bit.ly.example.com/x",
+            "https://safelinks.protection.outlook.com/?url=x",
+            "https://protect-.mimecast.com/s/abc",
+            "https://mimecast.com/s/abc",
+        ] {
+            assert_eq!(host(url), None, "{url}");
+        }
+    }
+
+    #[test]
+    fn test_media_quality_is_the_one_asked_for_else_the_one_for_pages() {
+        use crate::media::MediaQualityPreset::{AudioMp3, Hd720p};
+        let preset = |media_preset, page_media_preset| {
+            engine_with(DownloadOptions { media_preset, page_media_preset, ..Default::default() }).media_options().preset
+        };
+        assert_eq!(preset(None, None), crate::media::MediaQualityPreset::default());
+        assert_eq!(preset(None, Some(AudioMp3)), AudioMp3);
+        assert_eq!(preset(Some(Hd720p), Some(AudioMp3)), Hd720p);
+        // It changes nothing the client is built from, and is kept with the other options.
+        let with = DownloadOptions { page_media_preset: Some(AudioMp3), ..Default::default() };
+        assert_eq!(ClientKey::of(&with), ClientKey::of(&DownloadOptions::default()));
+        let back: DownloadOptions = serde_json::from_str(&serde_json::to_string(&with).unwrap()).unwrap();
+        assert_eq!(back.page_media_preset, Some(AudioMp3));
+        assert_eq!(serde_json::from_str::<DownloadOptions>("{}").unwrap().page_media_preset, None);
     }
 }
