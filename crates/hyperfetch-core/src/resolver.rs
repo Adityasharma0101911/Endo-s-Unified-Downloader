@@ -999,7 +999,7 @@ fn is_html(resp: &Response) -> bool {
 }
 
 /// Whether headers say the body is HTML.
-fn html_type(headers: &HeaderMap) -> bool {
+pub(crate) fn html_type(headers: &HeaderMap) -> bool {
     headers.get(CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|ct| {
         let ct = ct.to_ascii_lowercase();
         ct.contains("text/html") || ct.contains("application/xhtml")

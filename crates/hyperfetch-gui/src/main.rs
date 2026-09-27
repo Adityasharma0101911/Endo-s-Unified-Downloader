@@ -70,6 +70,7 @@ struct Listing {
     origin: Origin,
     input: String,
     checksum: String,
+    auth: String,
     tasks: Vec<Task>,
 }
 
@@ -85,9 +86,9 @@ impl Listing {
 
 /// Results of background work, delivered to the UI thread (each send also requests a repaint).
 enum AppEvent {
-    /// The downloads a .metalink, .meta4 or .torrent lists, with the form's checksum when it was
-    /// added.
-    Read { origin: Origin, input: String, checksum: String, result: Result<Vec<Task>, String> },
+    /// The downloads a .metalink, .meta4 or .torrent lists, with the form's checksum and
+    /// Authorization header when it was added.
+    Read { origin: Origin, input: String, checksum: String, auth: String, result: Result<Vec<Task>, String> },
     JobFinished { id: usize, result: Result<(PathBuf, Option<u64>), String> },
     /// The history as read by the `generation`-th history operation to run.
     History(Result<(u64, Vec<HistoryEntry>), String>),
@@ -353,7 +354,7 @@ impl App {
 
     /// Reads the downloads a .metalink, .meta4 or .torrent lists off the UI thread and adds them
     /// as `origin` says. A document already being read is not read again.
-    fn read_document(&mut self, input: String, origin: Origin, checksum: String) {
+    fn read_document(&mut self, input: String, origin: Origin, checksum: String, auth: String) {
         let shown = ingest::truncate_chars(&input, 60);
         if !self.reading.insert(input.clone()) {
             self.notice = Some(Ok(format!("Still reading {}...", shown)));
@@ -361,13 +362,13 @@ impl App {
         }
         self.notice = Some(Ok(format!("Reading {}...", shown)));
         let read = read_listing(&self.settings, input.clone());
-        self.spawn_event(async move { AppEvent::Read { origin, input, checksum, result: read.await } });
+        self.spawn_event(async move { AppEvent::Read { origin, input, checksum, auth, result: read.await } });
     }
 
     /// Adds what a document listed (or shows why it was refused) as `origin` says: the form
     /// starts the first download, a queue line that failed is put back with its error.
-    fn add_listing(&mut self, origin: Origin, input: &str, checksum: &str, result: Result<Vec<Task>, String>) {
-        let added = result.and_then(|tasks| queue_listed(&mut self.queue, &self.settings, tasks, checksum));
+    fn add_listing(&mut self, origin: Origin, input: &str, checksum: &str, auth: &str, result: Result<Vec<Task>, String>) {
+        let added = result.and_then(|tasks| queue_listed(&mut self.queue, &self.settings, tasks, checksum, auth));
         match (origin, added) {
             (Origin::Form, Ok(ids)) => {
                 if let Some(&first) = ids.first() {
@@ -392,9 +393,9 @@ impl App {
         if self.listings.is_empty() {
             return;
         }
-        let Listing { origin, input, checksum, tasks } = self.listings.remove(0);
+        let Listing { origin, input, checksum, auth, tasks } = self.listings.remove(0);
         if add {
-            self.add_listing(origin, &input, &checksum, Ok(tasks));
+            self.add_listing(origin, &input, &checksum, &auth, Ok(tasks));
         }
     }
 
@@ -402,7 +403,7 @@ impl App {
     fn add_dropped(&mut self, path: PathBuf) {
         let input = path.to_string_lossy().into_owned();
         if ingest::names_document(&input) {
-            self.read_document(input, Origin::Dropped, String::new());
+            self.read_document(input, Origin::Dropped, String::new(), String::new());
         } else {
             self.notice = Some(Err(format!("{} is not a .metalink, .meta4 or .torrent file", path.display())));
         }
@@ -415,7 +416,7 @@ impl App {
         self.tab = Tab::Downloader;
         if ingest::names_document(text) {
             self.form_error = None;
-            self.read_document(text.trim().to_string(), Origin::Form, checksum.trim().to_string());
+            self.read_document(text.trim().to_string(), Origin::Form, checksum.trim().to_string(), auth.to_string());
             return;
         }
         match self.add_download(text, checksum, auth) {
@@ -462,7 +463,7 @@ impl App {
         let mut rejected = Vec::new();
         for (n, line) in lines.iter().enumerate() {
             if ingest::names_document(line) {
-                self.read_document(line.clone(), Origin::QueueLine(n + 1), checksum.clone());
+                self.read_document(line.clone(), Origin::QueueLine(n + 1), checksum.clone(), auth.clone());
             } else if let Err(e) = self.add_download(line, &checksum, &auth) {
                 errors.push(format!("Line {}: {}", n + 1, e));
                 rejected.push(line.as_str());
@@ -718,12 +719,12 @@ impl App {
 
     fn handle_event(&mut self, event: AppEvent) {
         match event {
-            AppEvent::Read { origin, input, checksum, result } => {
+            AppEvent::Read { origin, input, checksum, auth, result } => {
                 self.reading.remove(&input);
                 self.notice = None;
                 match result {
-                    Ok(tasks) if tasks.len() > CONFIRM_FILES => self.listings.push(Listing { origin, input, checksum, tasks }),
-                    result => self.add_listing(origin, &input, &checksum, result),
+                    Ok(tasks) if tasks.len() > CONFIRM_FILES => self.listings.push(Listing { origin, input, checksum, auth, tasks }),
+                    result => self.add_listing(origin, &input, &checksum, &auth, result),
                 }
             }
             AppEvent::JobFinished { id, result } => {
@@ -959,18 +960,25 @@ fn task_options(settings: &Settings, task: &Task, checksum: &str, auth: &str) ->
 
 /// Engine options for the downloads a .metalink, .meta4 or .torrent lists, each saved under the
 /// save folder joined with its (sub)path; an error if one of them is refused. The form's checksum
-/// applies to a document of one file; its Authorization header is for the hosts the user typed,
-/// never for those a document lists.
-fn document_options(settings: &Settings, tasks: &[Task], checksum: &str) -> Result<Vec<DownloadOptions>, String> {
+/// applies to a document of one file; its Authorization header `auth` is for the hosts the user
+/// typed (the document's own, when ingest leaves the link to the engine), never for those a
+/// document lists.
+fn document_options(settings: &Settings, tasks: &[Task], checksum: &str, auth: &str) -> Result<Vec<DownloadOptions>, String> {
     if tasks.len() > 1 && !checksum.trim().is_empty() {
         return Err(format!("The checksum in Advanced Options is for a single file, but this lists {} files", tasks.len()));
     }
-    tasks.iter().map(|task| task_options(settings, task, checksum, "")).collect()
+    tasks.iter().map(|task| task_options(settings, task, checksum, auth)).collect()
 }
 
 /// Queues the downloads a .metalink, .meta4 or .torrent lists; nothing if one is refused.
-fn queue_listed(queue: &mut DownloadQueue, settings: &Settings, tasks: Vec<Task>, checksum: &str) -> Result<Vec<usize>, String> {
-    let options = document_options(settings, &tasks, checksum)?;
+fn queue_listed(
+    queue: &mut DownloadQueue,
+    settings: &Settings,
+    tasks: Vec<Task>,
+    checksum: &str,
+    auth: &str,
+) -> Result<Vec<usize>, String> {
+    let options = document_options(settings, &tasks, checksum, auth)?;
     Ok(tasks.into_iter().zip(options).map(|(task, options)| queue_task(queue, task, options)).collect())
 }
 
@@ -1457,7 +1465,7 @@ mod tests {
         };
         let (a, b) = (format!("sha256:{}", "aa".repeat(32)), format!("md5:{}", "bb".repeat(16)));
         let tasks = [file("a.bin", Some(a.clone())), file("b.bin", Some(b.clone()))];
-        let options = document_options(&settings, &tasks, " ").unwrap();
+        let options = document_options(&settings, &tasks, " ", "").unwrap();
         let saved: Vec<_> = options.iter().map(|o| (o.output_path.clone(), o.expected_checksum.clone())).collect();
         assert_eq!(
             saved,
@@ -1469,11 +1477,11 @@ mod tests {
         assert!(options.iter().all(|o| o.auth_header.is_none()));
 
         let typed = format!("sha256:{}", "cc".repeat(32));
-        assert!(document_options(&settings, &tasks, &typed).unwrap_err().contains("lists 2 files"));
+        assert!(document_options(&settings, &tasks, &typed, "").unwrap_err().contains("lists 2 files"));
         let one = [file("a.bin", None)];
-        assert_eq!(document_options(&settings, &one, &typed).unwrap()[0].expected_checksum, Some(typed));
+        assert_eq!(document_options(&settings, &one, &typed, "").unwrap()[0].expected_checksum, Some(typed));
         let refused = [file("a.bin", None), file("b.bin", Some("crc32:1234".to_string()))];
-        assert!(document_options(&settings, &refused, "").is_err());
+        assert!(document_options(&settings, &refused, "", "").is_err());
     }
 
     /// A document's downloads are queued all together or not at all; a queue line whose document
@@ -1489,11 +1497,18 @@ mod tests {
             ..Task::default()
         };
         let mut queue = DownloadQueue::new();
-        let ids = queue_listed(&mut queue, &settings, vec![file(1), file(2)], "").unwrap();
+        let ids = queue_listed(&mut queue, &settings, vec![file(1), file(2)], "", "Bearer t").unwrap();
         assert_eq!(ids.len(), 2);
         assert!(ids.iter().all(|&id| queue.get_item(id).is_some_and(|item| item.names_file && item.target_path.is_none())));
+        assert!(ids.iter().all(|&id| queue.get_item(id).is_some_and(|item| item.options.auth_header.is_none())), "a listed host got it");
+        // A document its host would not hand over without a login is left to the engine as the
+        // link typed, which the header is for.
+        let link = Task { urls: vec![Url::parse("https://tracker.example/dl/1.torrent").unwrap()], ..Task::default() };
+        let [id] = queue_listed(&mut queue, &settings, vec![link], "", "Bearer t").unwrap()[..] else { panic!("one download") };
+        assert_eq!(queue.get_item(id).and_then(|item| item.options.auth_header.as_deref()), Some("Bearer t"));
+        queue.remove_item(id);
         let refused = Task { checksum: Some("crc32:1".to_string()), ..file(3) };
-        assert!(queue_listed(&mut queue, &settings, vec![file(4), refused], "").is_err());
+        assert!(queue_listed(&mut queue, &settings, vec![file(4), refused], "", "").is_err());
         assert_eq!(queue.items().len(), 2, "nothing of a refused document is queued");
 
         let (mut input, mut errors) = ("https://ok.example/f".to_string(), None);
@@ -1502,7 +1517,7 @@ mod tests {
         assert_eq!(input, "https://ok.example/f\nhttps://a.example/x.torrent\ny.meta4");
         assert_eq!(errors.as_deref(), Some("Line 2: Cannot fetch\nLine 3: Cannot read"));
 
-        let listing = |tasks| Listing { origin: Origin::Dropped, input: String::new(), checksum: String::new(), tasks };
+        let listing = |tasks| Listing { origin: Origin::Dropped, input: String::new(), checksum: String::new(), auth: String::new(), tasks };
         assert_eq!(listing((1..=60).map(file).collect()).summary(), "60 files (60.00 KiB)");
         assert_eq!(listing(vec![file(1), Task { size: None, ..file(2) }]).summary(), "2 files");
     }
