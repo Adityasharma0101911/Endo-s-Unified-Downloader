@@ -3802,6 +3802,53 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), [vec![1; 1000], vec![2; 500]].concat());
     }
 
+    #[tokio::test]
+    async fn a_finished_hls_stream_is_not_downloaded_again() {
+        let (addr, hits) = crate::hls::tests::serve(|path, _| match path.split('?').next().unwrap_or(path) {
+            "/v/index.m3u8" => (200, String::new(), b"#EXTM3U\n#EXTINF:2,\na.ts\n#EXTINF:2,\nb.ts\n#EXT-X-ENDLIST\n".to_vec()),
+            "/v/a.ts" => (200, String::new(), vec![1; 1000]),
+            "/v/b.ts" => (200, String::new(), vec![2; 500]),
+            _ => (404, String::new(), Vec::new()),
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clip.fhls-audio.hf.mp4");
+        let key = Url::parse("hyperfetch-media:/Vimeo/x/hls-audio").unwrap();
+        let engine = crate::engine::DownloadEngine::new(Vec::new(), crate::engine::DownloadOptions::default());
+        // Each attempt extracts the stream anew, under a URL of its own.
+        let fetch = |token: &str| {
+            let planned = planned_stream(Url::parse(&format!("http://{addr}/v/index.m3u8?t={token}")).unwrap(), key.clone(), true);
+            let stream = MediaStream {
+                url: planned.url.clone(),
+                key: planned.key.clone(),
+                hls: true,
+                client: stream_client(&planned, None).unwrap(),
+                path: path.clone(),
+                chunk_size: None,
+            };
+            let (tx, rx) = broadcast::channel(16);
+            (engine.download_media_stream(stream, tx, CancellationToken::new()), rx)
+        };
+        let (first, _rx) = fetch("1");
+        assert_eq!(first.await, Ok(path.clone()));
+        let requests = hits.lock().values().sum::<usize>();
+
+        // The video's other stream failed, or was stopped, and the user tries again: this stream
+        // is taken as it is, and its size reported, not fetched again into "clip... (1).mp4".
+        let (again, mut rx) = fetch("2");
+        assert_eq!(again.await, Ok(path.clone()));
+        assert_eq!(hits.lock().values().sum::<usize>(), requests, "{:?}", hits.lock());
+        assert_eq!(rx.try_recv().map(|s| (s.downloaded_bytes, s.total_bytes)).ok(), Some((1500, 1500)));
+        assert_eq!(names_in(dir.path()), ["clip.fhls-audio.hf.mp4"]);
+
+        // Once it is joined into the output, it goes with its history entry, and a later attempt
+        // fetches it anew.
+        remove_streams_of(&dir.path().join("clip.mp4"));
+        let (after, _rx) = fetch("3");
+        assert_eq!(after.await, Ok(path.clone()));
+        assert!(hits.lock().values().sum::<usize>() > requests);
+    }
+
     /// Makes `file` with ffmpeg from a lavfi source.
     fn lavfi(ffmpeg: &Path, source: &str, extra: &[&str], file: &Path) -> Vec<u8> {
         let made = std::process::Command::new(ffmpeg)
