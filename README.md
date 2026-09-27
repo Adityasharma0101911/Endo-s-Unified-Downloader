@@ -18,7 +18,7 @@
 - Several mirror URLs of the same file are used together. The download starts with the first mirror that answers with range support, and the others join as their probes come back. A mirror that reports a different size or a different strong ETag is dropped, so bytes from different files are never mixed.
 - Chunk requests go straight to where a mirror redirects (GitHub releases, SourceForge, Dropbox), and back to the mirror's own URL if that target expires.
 - An optional speed limit (`--max-speed`) is shared by all connections of a download, HLS segments and the streams of a media download included.
-- Batches run 4 downloads at once by default (`-j`). All running downloads together open at most 64 connections to one host (`--max-connections-per-host`), probes included, and the downloads of a batch share their HTTP connections and TLS sessions, so later files skip the handshakes.
+- Batches run 4 downloads at once by default (`-j`). All running downloads together open at most 64 connections to one host (`--max-connections-per-host`), probes and HLS playlist, key and segment requests included, and the downloads of a batch share their HTTP connections and TLS sessions, so later files skip the handshakes.
 - What a host was seen to do is remembered for 10 minutes: whether it takes ranges, whether it caps each connection's speed (and at what rate), how long a new connection takes, and a connection cap learned from 429 answers. Later downloads from it start at the right width without measuring again.
 
 **Safe, resumable files**

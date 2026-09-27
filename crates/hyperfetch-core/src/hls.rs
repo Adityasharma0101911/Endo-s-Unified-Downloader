@@ -64,13 +64,17 @@ const RETRY_BASE_DELAY: Duration = if cfg!(test) { Duration::from_millis(20) } e
 /// Longest pause between two attempts; the pauses of the default 8 retries add up to about 40 s.
 const RETRY_MAX_DELAY: Duration = Duration::from_secs(8);
 
-/// Patience of every HLS request (playlists, keys, segments), from the user's settings.
+/// Patience and manners of every HLS request (playlists, keys, segments), from the user's settings.
 #[derive(Clone, Copy, Debug)]
 pub struct FetchPolicy {
     /// Longest wait for the response headers, and between two pieces of the body.
     pub stall_timeout: Duration,
     /// Failed attempts allowed per request before it gives up.
     pub max_retries: u32,
+    /// Most connections all downloads may hold to one host at once, as a request holds a slot of
+    /// its host's budget from its send to its last byte (see [`crate::hosts`]); 0 for no limit of
+    /// its own. Waiting for a slot is no stall.
+    pub host_limit: usize,
 }
 
 impl FetchPolicy {
@@ -572,8 +576,9 @@ impl Drop for Tally<'_> {
     }
 }
 
-/// One GET with header and idle timeouts of `stall`, reading at most `max_bytes` of body. Body
-/// bytes are added to `progress` as they arrive and taken back out if the attempt fails.
+/// One GET with header and idle timeouts of `fetch`'s stall timeout, reading at most `max_bytes`
+/// of body, under a slot of its host's budget it holds until it returns. Body bytes are added to
+/// `progress` as they arrive and taken back out if the attempt fails.
 async fn fetch_once(
     client: &Client,
     auth: Option<&Auth>,
@@ -581,8 +586,10 @@ async fn fetch_once(
     range: Option<ByteRange>,
     max_bytes: u64,
     progress: Option<&Tally<'_>>,
-    stall: Duration,
+    fetch: FetchPolicy,
 ) -> Result<(Vec<u8>, Url), FetchError> {
+    let _slot = crate::hosts::acquire(url, fetch.host_limit).await;
+    let stall = fetch.stall_timeout;
     let mut req = authorize(client.get(url.clone()), auth, url);
     if let Some(r) = range {
         req = req.header(reqwest::header::RANGE, r.to_http_header());
@@ -667,7 +674,7 @@ async fn fetch_with_retry(
     let mut delay = RETRY_BASE_DELAY;
     let mut failures = 0;
     loop {
-        match fetch_once(client, auth, url, range, max_bytes, progress, fetch.stall_timeout).await {
+        match fetch_once(client, auth, url, range, max_bytes, progress, fetch).await {
             Ok(fetched) => return Ok(fetched),
             Err(e) if e.kind == FetchErrorKind::Transient && failures < fetch.max_retries => {
                 failures += 1;
@@ -1556,7 +1563,8 @@ pub(crate) mod tests {
         handler: impl Fn(&str, Option<ByteRange>) -> F + Send + Sync + 'static,
     ) -> (SocketAddr, Arc<Mutex<HashMap<String, usize>>>) {
         let handler = Arc::new(handler);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        // A host nothing was seen of: HLS requests take slots of their host's budget.
+        let listener = crate::hosts::unseen_listener().await;
         let addr = listener.local_addr().unwrap();
         let hits = Arc::new(Mutex::new(HashMap::new()));
         let hits_srv = Arc::clone(&hits);
@@ -1688,7 +1696,7 @@ pub(crate) mod tests {
     }
 
     /// A short stall timeout keeps tests that stall quick.
-    const FETCH: FetchPolicy = FetchPolicy { stall_timeout: Duration::from_millis(500), max_retries: 4 };
+    const FETCH: FetchPolicy = FetchPolicy { stall_timeout: Duration::from_millis(500), max_retries: 4, host_limit: 0 };
 
     fn options(connections: usize) -> HlsOptions {
         HlsOptions { connections, fetch: FETCH, fsync_on_complete: false, expected_checksum: None, limiter: None }
@@ -1873,7 +1881,7 @@ video.m3u8
         })
         .await;
         let url = Url::parse(&format!("http://{addr}/media.m3u8")).unwrap();
-        let patient = FetchPolicy { stall_timeout: Duration::from_secs(10), max_retries: 0 };
+        let patient = FetchPolicy { stall_timeout: Duration::from_secs(10), max_retries: 0, ..FETCH };
         let started = Instant::now();
         let err = parse_hls_playlist(&Client::new(), &url, None, patient).await.unwrap_err();
         assert!(matches!(&err, HlsError::Unavailable(reason) if reason.contains("k0.bin")), "{err}");
@@ -2479,7 +2487,7 @@ video.m3u8
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("hedged.ts");
         // Waiting out the stall would take 20 s, and fail: no retries.
-        let patient = HlsOptions { fetch: FetchPolicy { stall_timeout: Duration::from_secs(20), max_retries: 0 }, ..options(3) };
+        let patient = HlsOptions { fetch: FetchPolicy { stall_timeout: Duration::from_secs(20), max_retries: 0, ..FETCH }, ..options(3) };
         let target = HlsEngine::prepare(&client, None, &url, &segments, &out, patient.fetch, &None).await.unwrap().unwrap();
         let started = Instant::now();
         HlsEngine::download(&client, None, segments, target, &patient, None, None).await.unwrap();
@@ -2864,7 +2872,7 @@ video.m3u8
     async fn test_a_request_that_never_gets_an_answer_gives_up_in_time() {
         let (addr, _) = serve(|_, _| (0, String::new(), Vec::new())).await;
         let url = Url::parse(&format!("http://{addr}/stalled.m3u8")).unwrap();
-        let fetch = FetchPolicy { stall_timeout: Duration::from_millis(300), max_retries: 2 };
+        let fetch = FetchPolicy { stall_timeout: Duration::from_millis(300), max_retries: 2, ..FETCH };
         let started = Instant::now();
         assert!(parse_hls_playlist(&Client::new(), &url, None, fetch).await.is_err());
         let (took, bound) = (started.elapsed(), fetch.give_up_after());
@@ -2872,9 +2880,9 @@ video.m3u8
 
         // The default policy needs more than the two minutes the engine used to allow for the
         // playlist and its keys, and no policy overflows.
-        let default = FetchPolicy { stall_timeout: Duration::from_secs(30), max_retries: 8 };
+        let default = FetchPolicy { stall_timeout: Duration::from_secs(30), max_retries: 8, ..FETCH };
         assert_eq!(default.give_up_after(), Duration::from_secs(9 * 30 + 8 * 8));
-        let endless = FetchPolicy { stall_timeout: Duration::MAX, max_retries: u32::MAX };
+        let endless = FetchPolicy { stall_timeout: Duration::MAX, max_retries: u32::MAX, ..FETCH };
         assert_eq!(endless.give_up_after(), Duration::MAX);
     }
 
@@ -2896,7 +2904,7 @@ video.m3u8
         for (max_retries, succeeds) in [(1, false), (2, true)] {
             failures.store(0, Ordering::SeqCst);
             // Only the 503s count as failures, however slow the machine.
-            let fetch = FetchPolicy { max_retries, stall_timeout: Duration::from_secs(10) };
+            let fetch = FetchPolicy { max_retries, stall_timeout: Duration::from_secs(10), ..FETCH };
             let options = HlsOptions { fetch, ..options(1) };
             let out = dir.path().join(format!("{max_retries}.ts"));
             let target = HlsEngine::prepare(&client, None, &url, &segments, &out, FETCH, &None).await.unwrap().unwrap();
