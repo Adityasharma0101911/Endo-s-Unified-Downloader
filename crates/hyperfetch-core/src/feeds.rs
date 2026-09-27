@@ -127,7 +127,7 @@ async fn fetch(http: &reqwest::Client, url: &Url, feed: bool) -> Result<Option<(
         body.extend_from_slice(&chunk);
         if !known_feed {
             match first_element(&body) {
-                Some(name) if name == "rss" || name == "feed" => known_feed = true,
+                Some(name) if is_feed_root(&name) => known_feed = true,
                 Some(_) => return Ok(None),
                 None if body.len() >= MAX_HEAD_BYTES => return Ok(None),
                 None => {}
@@ -140,9 +140,20 @@ async fn fetch(http: &reqwest::Client, url: &Url, feed: bool) -> Result<Option<(
     Ok(known_feed.then_some((body, base)))
 }
 
-/// The name of the first element in `head`, the start of an XML document, in lower case; None
-/// while `head` ends before it does.
+/// The name of the first element in `head`, the start of an XML document in UTF-8 or (with a
+/// BOM) UTF-16, in lower case; None while `head` ends before it does.
 fn first_element(head: &[u8]) -> Option<String> {
+    let utf16: Option<(&[u8], fn([u8; 2]) -> u16)> = match head {
+        [0xFF, 0xFE, rest @ ..] => Some((rest, u16::from_le_bytes)),
+        [0xFE, 0xFF, rest @ ..] => Some((rest, u16::from_be_bytes)),
+        _ => None,
+    };
+    if let Some((rest, unit)) = utf16 {
+        // The head may end inside a character: that end is read as a replacement character.
+        let units = rest.chunks_exact(2).map(|pair| unit([pair[0], pair[1]]));
+        let text: String = char::decode_utf16(units).map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER)).collect();
+        return first_element(text.as_bytes());
+    }
     let mut reader = Reader::from_reader(head);
     let mut buf = Vec::new();
     loop {
@@ -156,6 +167,12 @@ fn first_element(head: &[u8]) -> Option<String> {
 
 fn name_of(name: QName<'_>) -> String {
     String::from_utf8_lossy(name.as_ref()).to_ascii_lowercase()
+}
+
+/// Whether an element named `name` is the root of an RSS or Atom feed (`<rss>`, `<feed>`, or
+/// `<atom:feed>` with any prefix).
+fn is_feed_root(name: &str) -> bool {
+    matches!(name.rsplit(':').next(), Some("rss" | "feed"))
 }
 
 /// A feed's title and its episodes with an audio or video enclosure, in the feed's order.
@@ -190,6 +207,12 @@ fn parse_feed(text: &str, base: &Url) -> Option<Result<Feed, String>> {
     let mut path: Vec<String> = Vec::new();
     let mut text = String::new();
     let mut episode: Option<Episode> = None;
+    // The root's prefix ("atom:" of `<atom:feed>`), taken off the names of the elements in it.
+    let mut prefix = String::new();
+    let local = |name: QName<'_>, prefix: &str| {
+        let name = name_of(name);
+        name.strip_prefix(prefix).map(str::to_string).unwrap_or(name)
+    };
     loop {
         let event = match reader.read_event() {
             Ok(event) => event,
@@ -202,15 +225,19 @@ fn parse_feed(text: &str, base: &Url) -> Option<Result<Feed, String>> {
         match event {
             Event::Start(e) if path.is_empty() => {
                 let root = name_of(e.name());
-                if root != "rss" && root != "feed" {
+                if !is_feed_root(&root) {
                     return None;
                 }
-                path.push(root);
+                let (root_prefix, root) = root.rsplit_once(':').unwrap_or(("", root.as_str()));
+                if !root_prefix.is_empty() {
+                    prefix = format!("{}:", root_prefix);
+                }
+                path.push(root.to_string());
             }
             // An empty `<rss/>` lists nothing either.
             Event::Empty(_) if path.is_empty() => return None,
             Event::Start(e) => {
-                let name = name_of(e.name());
+                let name = local(e.name(), &prefix);
                 let parent = path.join("/");
                 match (parent.as_str(), name.as_str()) {
                     ("rss/channel", "item") | ("feed", "entry") => episode = Some(Episode::default()),
@@ -219,7 +246,7 @@ fn parse_feed(text: &str, base: &Url) -> Option<Result<Feed, String>> {
                 path.push(name);
                 text.clear();
             }
-            Event::Empty(e) => enclosure(&mut episode, &path.join("/"), &name_of(e.name()), &e, base),
+            Event::Empty(e) => enclosure(&mut episode, &path.join("/"), &local(e.name(), &prefix), &e, base),
             Event::Text(t) => text.push_str(&t.unescape().map_or_else(|_| String::from_utf8_lossy(&t).into_owned(), |t| t.into_owned())),
             Event::CData(c) => text.push_str(&String::from_utf8_lossy(&c)),
             Event::End(_) => {
@@ -853,6 +880,46 @@ mod tests {
         assert_eq!(first_element(b"\xEF\xBB\xBF<?xml version=\"1.0\"?>\n<!-- <html> -->\n<rss version=\"2.0\">").as_deref(), Some("rss"));
         assert_eq!(first_element(b"<!doctype html><HTML lang=en>").as_deref(), Some("html"));
         assert_eq!(first_element(b"<?xml version=\"1.0\"?><fe"), None);
+    }
+
+    fn utf16(text: &str, big_endian: bool) -> Vec<u8> {
+        let bom = if big_endian { [0xFE, 0xFF] } else { [0xFF, 0xFE] };
+        let units = text.encode_utf16().flat_map(|u| if big_endian { u.to_be_bytes() } else { u.to_le_bytes() });
+        bom.into_iter().chain(units).collect()
+    }
+
+    /// A feed saved as UTF-16 with a BOM is known by its first element, whichever byte order it
+    /// has and wherever its head breaks off, and read; so is an Atom feed whose elements carry a
+    /// prefix.
+    #[test]
+    fn utf16_and_prefixed_atom_feeds_are_read() {
+        let rss = r#"<?xml version="1.0" encoding="UTF-16"?><rss version="2.0"><channel><title>Wide</title><item><title>Ünïcode</title><enclosure url="https://w.example/e.mp3" type="audio/mpeg"/></item></channel></rss>"#;
+        for big_endian in [false, true] {
+            let bytes = utf16(rss, big_endian);
+            assert_eq!(first_element(&bytes).as_deref(), Some("rss"));
+            assert_eq!(first_element(&bytes[..bytes.len() - 1]).as_deref(), Some("rss"));
+            let feed = parse(&decode_text(&bytes).unwrap(), "https://w.example/feed.xml").unwrap().unwrap();
+            assert_eq!((feed.title.as_deref(), feed.episodes[0].title.as_str()), (Some("Wide"), "Ünïcode"));
+        }
+        let html = utf16("<!DOCTYPE html><html><body>page</body></html>", false);
+        assert_eq!(first_element(&html).as_deref(), Some("html"));
+
+        let atom = r#"<?xml version="1.0"?>
+<atom:feed xmlns:atom="http://www.w3.org/2005/Atom">
+  <atom:title>Prefixed</atom:title>
+  <atom:entry>
+    <atom:title>Only</atom:title>
+    <atom:id>urn:only</atom:id>
+    <atom:updated>2026-02-01T00:00:00Z</atom:updated>
+    <atom:link rel="enclosure" href="https://p.example/only.mp3" type="audio/mpeg"/>
+  </atom:entry>
+</atom:feed>"#;
+        assert_eq!(first_element(atom.as_bytes()).as_deref(), Some("atom:feed"));
+        assert!(is_feed_root("atom:feed") && !is_feed_root("atom:entry") && !is_feed_root("feeds"));
+        let feed = parse(atom, "https://p.example/feed.atom").unwrap().unwrap();
+        assert_eq!(feed.title.as_deref(), Some("Prefixed"));
+        let tasks = feed_tasks(feed, None, &HashSet::new()).unwrap();
+        assert_eq!(names(&tasks), ["2026-02-01 Only.mp3"]);
     }
 
     #[test]
