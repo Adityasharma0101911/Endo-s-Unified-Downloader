@@ -6,10 +6,11 @@ use eframe::egui;
 use egui::{Color32, Pos2, Rect, RichText, Stroke, Vec2};
 use hyperfetch_core::chunk::ChunkSnapshot;
 use hyperfetch_core::history::HistoryStatus;
+use hyperfetch_core::ingest::{self, truncate_chars};
 use hyperfetch_core::queue::{QueueItem, QueueItemStatus};
 
 use crate::settings::{BROWSERS, MEDIA_PRESETS};
-use crate::util::{self, format_bytes, format_duration, lock, truncate_chars, Verdict};
+use crate::util::{self, format_bytes, format_duration, lock, Verdict};
 use crate::{App, Dialog, Tab, VerifyRequest, GRAPH_WINDOW};
 
 const TEXT: Color32 = Color32::from_rgb(228, 232, 240);
@@ -216,8 +217,8 @@ fn downloader_tab(app: &mut App, ui: &mut egui::Ui) {
             }
         });
 
-        if focused.is_none() && util::is_blob_url(&app.url_input) {
-            error_alert(ui, util::BLOB_MESSAGE);
+        if focused.is_none() && ingest::is_blob_url(&app.url_input) {
+            error_alert(ui, ingest::BLOB_MESSAGE);
         }
         if let Some(error) = &app.form_error {
             error_alert(ui, error);

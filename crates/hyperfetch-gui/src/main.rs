@@ -17,6 +17,7 @@ use egui::Color32;
 use hyperfetch_core::chunk::ChunkSnapshot;
 use hyperfetch_core::engine::{build_client, ClientKey, DownloadEngine, DownloadOptions, EngineSnapshot, SharedLimits};
 use hyperfetch_core::history::{DownloadHistoryManager, HistoryEntry};
+use hyperfetch_core::ingest::{self, Task};
 use hyperfetch_core::queue::{DownloadQueue, QueueItem};
 use hyperfetch_core::verify::{self, BuildVerificationResult};
 use tokio::sync::{broadcast, Notify};
@@ -301,24 +302,26 @@ impl App {
 
     // ---- downloads -----------------------------------------------------------------------
 
-    /// Adds the download described by `text` (mirrors of one file) with the current settings.
+    /// Adds the download described by `text` (links to one file) with the current settings.
     fn add_download(&mut self, text: &str, checksum: &str, auth: &str) -> Result<usize, String> {
-        let urls = util::parse_urls(text)?;
-        let options = self.settings.download_options(&urls, checksum, auth)?;
-        Ok(self.queue.add_item(urls, options))
+        let task = ingest::link_task(&ingest::split_tokens(text))?;
+        let options = task_options(&self.settings, &task, checksum, auth)?;
+        Ok(queue_task(&mut self.queue, task, options))
     }
 
     /// Adds a download, starts it immediately and shows it on the Downloader tab. A file that is
     /// already downloading is shown instead of being started twice.
     fn download_now(&mut self, text: &str, checksum: &str, auth: &str) {
         self.tab = Tab::Downloader;
-        let id = match self.add_download(text, checksum, auth) {
-            Ok(id) => id,
-            Err(e) => {
-                self.form_error = Some(e);
-                return;
-            }
-        };
+        match self.add_download(text, checksum, auth) {
+            Ok(id) => self.start_added(id),
+            Err(e) => self.form_error = Some(e),
+        }
+    }
+
+    /// Starts a download just added from the form and shows it, clearing the form. A file that is
+    /// already downloading is shown instead of being started twice.
+    fn start_added(&mut self, id: usize) {
         self.form_error = None;
         self.notice = None;
         if let Some(existing) = self.queue.active_conflict(id) {
@@ -380,7 +383,7 @@ impl App {
             return false;
         }
         let Some(item) = self.queue.get_item(id) else { return false };
-        let (urls, options) = (item.urls.clone(), item.options.clone());
+        let (urls, options, folder) = (item.urls.clone(), item.options.clone(), util::folder_to_create(item));
         let leftovers_of = if fresh { item.target_path.clone() } else { None };
         if !self.queue.mark_started(id) {
             return false;
@@ -396,7 +399,7 @@ impl App {
                 (Arc::clone(&cancel), Arc::clone(&snapshot), self.ctx.clone(), self.events_tx.clone());
             let engines = Arc::clone(&self.engines);
             self.rt.spawn(async move {
-                let result = run_job(&engines, urls, options, leftovers_of, cancel, snapshot, ctx.clone()).await;
+                let result = run_job(&engines, urls, options, folder, leftovers_of, cancel, snapshot, ctx.clone()).await;
                 if tx.send(AppEvent::JobFinished { id, result }).is_ok() {
                     ctx.request_repaint();
                 }
@@ -818,6 +821,42 @@ impl eframe::App for App {
     }
 }
 
+/// Engine options for `task` with `settings`, the per-download checksum (else the task's own)
+/// and Authorization header. A task that names its file is saved as that (sub)path of the save
+/// folder.
+fn task_options(settings: &Settings, task: &Task, checksum: &str, auth: &str) -> Result<DownloadOptions, String> {
+    let checksum = match checksum.trim() {
+        "" => task.checksum.as_deref().unwrap_or_default(),
+        typed => typed,
+    };
+    let mut options = settings.download_options(&task.urls, checksum, auth)?;
+    if let Some(name) = &task.name {
+        options.output_path = options.output_path.map(|folder| folder.join(name));
+    }
+    Ok(options)
+}
+
+/// Queues one download. One its input named is shown under that name at once, and the queue
+/// knows its target before the engine reports it (see [`util::folder_to_create`]).
+fn queue_task(queue: &mut DownloadQueue, task: Task, options: DownloadOptions) -> usize {
+    let target = task.name.and(options.output_path.clone());
+    let id = queue.add_item(task.urls, options);
+    if target.is_some() {
+        let named = EngineSnapshot {
+            total_bytes: 0,
+            downloaded_bytes: 0,
+            speed_bytes_per_sec: 0.0,
+            progress_ratio: 0.0,
+            active_workers: 0,
+            mirror_speeds: Vec::new(),
+            chunks: Vec::new(),
+            target_path: target,
+        };
+        queue.apply_snapshot(id, &named);
+    }
+    id
+}
+
 async fn unblock<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T, String> {
     tokio::task::spawn_blocking(f).await.map_err(|e| format!("Background task failed: {}", e))
 }
@@ -881,12 +920,16 @@ fn cached_client<C: Clone>(
     Ok(client)
 }
 
-/// One engine run. A cancel request calls `engine.cancel()` and keeps awaiting `run()`, so the
-/// engine flushes data, saves its resume state and stops yt-dlp before this returns.
+/// One engine run, saving into `folder` (created first if missing; see
+/// [`util::folder_to_create`]). A cancel request calls `engine.cancel()` and keeps awaiting
+/// `run()`, so the engine flushes data, saves its resume state and stops yt-dlp before this
+/// returns.
+#[allow(clippy::too_many_arguments)]
 async fn run_job(
     engines: &EngineMaker,
     urls: Vec<Url>,
     options: DownloadOptions,
+    folder: Option<PathBuf>,
     leftovers_of: Option<PathBuf>,
     cancel: Arc<Notify>,
     slot: Arc<Mutex<Option<EngineSnapshot>>>,
@@ -896,7 +939,7 @@ async fn run_job(
         discard_leftovers(final_path).await.map_err(|e| format!("Could not start over: {}", e))?;
     }
     // The engine treats a missing output directory as a file name.
-    if let Some(dir) = options.output_path.clone() {
+    if let Some(dir) = folder {
         tokio::fs::create_dir_all(&dir)
             .await
             .map_err(|e| format!("Cannot create the download folder {}: {}", dir.display(), e))?;
@@ -1108,7 +1151,8 @@ mod tests {
         let (url, options, cancel_job, job_slot) = (url.clone(), options.clone(), Arc::clone(&cancel), Arc::clone(&slot));
         let job = tokio::spawn(async move {
             let engines = shared_clients();
-            run_job(&engines, vec![url], options, leftovers_of, cancel_job, job_slot, egui::Context::default()).await
+            let folder = options.output_path.clone();
+            run_job(&engines, vec![url], options, folder, leftovers_of, cancel_job, job_slot, egui::Context::default()).await
         });
         if let Some(delay) = pause_after {
             tokio::time::sleep(delay).await;
@@ -1205,10 +1249,68 @@ mod tests {
         assert_eq!(refresh, (2, vec![]), "the refresh reads after the clear and is numbered after it");
     }
 
+    /// Points download history at a file of this test process, once for every test, so no test
+    /// touches the user's history or switches the file while another runs.
+    fn isolate_history() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let path = std::env::temp_dir().join(format!("hf-gui-test-history-{}.json", std::process::id()));
+            std::env::set_var("ENDO_HISTORY_PATH", path);
+        });
+    }
+
+    /// A download a document or magnet named is saved as that (sub)path of the save folder,
+    /// checked against the document's checksum unless the form gives one.
+    #[test]
+    fn named_downloads_are_saved_under_their_path_in_the_save_folder() {
+        let settings = Settings { save_dir: "dl".into(), ..Settings::default() };
+        let url = Url::parse("https://m.example/disc.iso").unwrap();
+        let listed = format!("sha256:{}", "ab".repeat(32));
+        let named =
+            Task { urls: vec![url.clone()], name: Some(PathBuf::from("release").join("disc.iso")), checksum: Some(listed.clone()) };
+        let options = task_options(&settings, &named, "", "").unwrap();
+        assert_eq!(options.output_path, Some(PathBuf::from("dl").join("release").join("disc.iso")));
+        assert_eq!(options.expected_checksum, Some(listed));
+        let typed = format!("md5:{}", "cd".repeat(16));
+        assert_eq!(task_options(&settings, &named, &typed, "").unwrap().expected_checksum, Some(typed));
+
+        let plain = Task { urls: vec![url], ..Task::default() };
+        assert_eq!(task_options(&settings, &plain, " ", "").unwrap().output_path, Some(PathBuf::from("dl")));
+    }
+
+    /// A download its input named is shown under that name at once and saved as that file, in
+    /// folders made for it, never into a folder of that name.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_named_download_is_saved_as_its_file() {
+        isolate_history();
+        let dir = tempfile::tempdir().unwrap();
+        let body: Arc<Vec<u8>> = Arc::new((0..64 * 1024u32).map(|i| (i % 251) as u8).collect());
+        let addr = serve(Arc::clone(&body)).await;
+        let downloads = dir.path().join("downloads");
+        let settings = Settings { save_dir: downloads.to_string_lossy().into_owned(), connections: 2, ..Settings::default() };
+        let task = Task {
+            urls: vec![Url::parse(&format!("http://{}/get?id=7", addr)).unwrap()],
+            name: Some(PathBuf::from("release").join("disc.iso")),
+            checksum: None,
+        };
+        let options = task_options(&settings, &task, "", "").unwrap();
+        let mut queue = DownloadQueue::new();
+        let id = queue_task(&mut queue, task, options);
+        let item = queue.get_item(id).unwrap().clone();
+        assert_eq!(item.filename, "disc.iso");
+
+        let (engines, cancel, slot) = (shared_clients(), Arc::new(Notify::new()), Arc::new(Mutex::new(None)));
+        let folder = util::folder_to_create(&item);
+        let job = run_job(&engines, item.urls, item.options, folder, None, cancel, slot, egui::Context::default());
+        let (path, size) = tokio::time::timeout(Duration::from_secs(60), job).await.unwrap().unwrap();
+        assert_eq!(path, downloads.join("release").join("disc.iso"));
+        assert_eq!(size, Some(body.len() as u64));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn pause_keeps_resume_state_and_start_over_restarts() {
+        isolate_history();
         let dir = tempfile::tempdir().unwrap();
-        std::env::set_var("ENDO_HISTORY_PATH", dir.path().join("history.json"));
         let body: Arc<Vec<u8>> = Arc::new((0..3 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect());
         let addr = serve(Arc::clone(&body)).await;
         // The folder does not exist yet: the job creates it instead of the engine treating it as a file name.
