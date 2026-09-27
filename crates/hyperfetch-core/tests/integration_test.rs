@@ -1844,6 +1844,33 @@ async fn test_chunk_requests_go_straight_to_the_redirect_target() {
 }
 
 #[tokio::test]
+async fn test_a_request_waiting_for_a_slow_answer_is_not_taken_over() {
+    let _history = setup().await;
+    let data = payload(PREFETCH + 1536 * KB, 271);
+    let mut file = Mock::new(data.clone());
+    // Longer than the silence after which an idle connection takes over a chunk. The mirror's
+    // probe went through a redirect, which chunk requests skip.
+    file.latency = Duration::from_millis(2500);
+    let file = Arc::new(file);
+    let (_redirector, url) = redirected_to(&file).await;
+    let temp = tempdir().unwrap();
+    let out = temp.path().join("slow.bin");
+
+    // Two connections for one chunk and no steals: one of them waits for the chunk's answer, the
+    // other has nothing to do but take it over, and would, each time, from whichever asked last.
+    let opts = DownloadOptions { min_steal_threshold: u64::MAX, ..options(&out, 4, 8 * PREFETCH) };
+    let engine = DownloadEngine::new(vec![url], opts);
+    run(&engine, None).await.expect("download should succeed");
+
+    assert_file(&out, &data);
+    let mut starts: Vec<u64> = file.served_ranges().iter().map(|r| r.start).collect();
+    let requests = starts.len();
+    starts.sort_unstable();
+    starts.dedup();
+    assert_eq!(starts.len(), requests, "a chunk was asked for again before its answer came: {:?}", file.served_ranges());
+}
+
+#[tokio::test]
 async fn test_expired_redirect_target_falls_back_to_the_mirrors_own_url() {
     let _history = setup().await;
     let data = payload(PREFETCH + 1024 * KB, 233);
