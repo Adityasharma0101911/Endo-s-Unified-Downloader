@@ -80,6 +80,8 @@ const PERSIST_INTERVAL: Duration = Duration::from_secs(2);
 /// Time constant of the smoothed speed shown to the user.
 const SPEED_TAU_SECS: f64 = 2.0;
 const DEFAULT_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+/// Largest default chunk while the file is hashed from its start as that is written.
+const IN_ORDER_CHUNK: u64 = 8 * 1024 * 1024;
 const DEFAULT_MIN_STEAL: u64 = 1024 * 1024;
 /// Most connections one download opens, whatever `num_connections` asks for; also the default
 /// per-host budget, so that alone never holds a download back.
@@ -827,7 +829,8 @@ impl DownloadEngine {
         let room = if late.is_some() { usize::MAX } else { host_room(&mirrors, self.options.max_connections_per_host) };
         let max_workers = self.options.num_connections.clamp(1, MAX_CONNECTIONS).min(room).max(1) as u64;
         let num_workers = remaining.div_ceil(per_connection).clamp(1, max_workers) as usize;
-        let chunk_size = effective_chunk_size(remaining, num_workers as u64, self.options.base_chunk_size);
+        let in_order = crate::storage::hashes_prefix(self.options.expected_checksum.as_deref());
+        let chunk_size = effective_chunk_size(remaining, num_workers as u64, self.options.base_chunk_size, in_order);
         let mut manager = ChunkManager::with_resumed_ranges(size, chunk_size, &have).map_err(|e| e.to_string())?;
         manager.set_max_retries(self.options.max_retries);
         // The probe's answer is worker 0's first attempt, its connection's rate watched on while no
@@ -2609,10 +2612,16 @@ fn min_steal(options: &DownloadOptions) -> u64 {
     }
 }
 
-fn effective_chunk_size(file_size: u64, num_workers: u64, configured: u64) -> u64 {
+/// The chunk size for `file_size` missing bytes over `num_workers` connections, unless the user
+/// `configured` one. `in_order`, when the file is hashed from its start as that is written (SHA-256
+/// or MD5, see [`DiskWriter::track_digest`]), keeps chunks small: taken in file order, they keep
+/// that start growing, so little is left to hash once the download is done.
+fn effective_chunk_size(file_size: u64, num_workers: u64, configured: u64, in_order: bool) -> u64 {
     const MB: u64 = 1024 * 1024;
     if configured != DEFAULT_CHUNK_SIZE {
         configured
+    } else if in_order {
+        effective_chunk_size(file_size, num_workers, configured, false).min(IN_ORDER_CHUNK)
     } else if file_size >= 1024 * MB {
         // Multi-GB files: long-lived 64-256MB streams per connection.
         (file_size / (num_workers * 2)).clamp(64 * MB, 256 * MB)
@@ -3847,6 +3856,28 @@ mod tests {
         assert_eq!(even.select_best_mirror(), Some(0));
         let unmeasured = build_racer(&[mirror("a.example", None), mirror("b.example", None)]);
         assert_eq!(unmeasured.select_best_mirror(), Some(0));
+    }
+
+    #[test]
+    fn test_chunks_stay_small_while_a_checksum_hashes_the_file_from_its_start() {
+        const MB: u64 = 1024 * 1024;
+        assert_eq!(effective_chunk_size(4096 * MB, 16, DEFAULT_CHUNK_SIZE, false), 128 * MB);
+        assert_eq!(effective_chunk_size(4096 * MB, 16, DEFAULT_CHUNK_SIZE, true), IN_ORDER_CHUNK);
+        // Chunks that small already stay, and so does a size the user chose.
+        assert_eq!(effective_chunk_size(20 * MB, 8, DEFAULT_CHUNK_SIZE, true), 4 * MB);
+        assert_eq!(effective_chunk_size(4096 * MB, 16, 32 * MB, true), 32 * MB);
+
+        let (hex64, hex32) = ("ab".repeat(32), "ab".repeat(16));
+        for (checksum, in_order) in [
+            (None, false),
+            (Some(format!("blake3:{hex64}")), false),
+            (Some(format!("sha256:{hex64}")), true),
+            (Some(format!("md5:{hex32}")), true),
+            // Either SHA-256 or BLAKE3: SHA-256 is taken too.
+            (Some(hex64.clone()), true),
+        ] {
+            assert_eq!(crate::storage::hashes_prefix(checksum.as_deref()), in_order, "{checksum:?}");
+        }
     }
 
     #[test]

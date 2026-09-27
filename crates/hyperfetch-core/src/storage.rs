@@ -672,6 +672,12 @@ fn needs(expected_checksum: Option<&str>) -> Result<(bool, bool), String> {
     Ok(checksum.map_or((false, false), |c| (c.needs_sha256(), c.needs_md5())))
 }
 
+/// Whether a writer told of `expected_checksum` hashes the file's written start as it grows (for
+/// SHA-256 or MD5, see [`DiskWriter::track_digest`]).
+pub(crate) fn hashes_prefix(expected_checksum: Option<&str>) -> bool {
+    needs(expected_checksum).is_ok_and(|(sha256, md5)| sha256 || md5)
+}
+
 /// Hashes a finished file: always BLAKE3 (returned as hex), plus whatever `expected_checksum`
 /// needs, all at once (see [`FileDigest::of`]). Opens the file read-only; call it from a blocking
 /// context.
