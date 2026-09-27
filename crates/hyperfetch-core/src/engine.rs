@@ -430,16 +430,23 @@ impl DownloadEngine {
     /// `crate::media::find_site_media`). None when none of them takes it, or yt-dlp cannot be
     /// found, installed or run, or takes too long: that never fails the download. A site that
     /// takes it but finds its video DRM-protected does: the page is not what the link stands for.
+    /// Nor is a file-share page, which `check_answer` lets through only for yt-dlp: any failure
+    /// to find what it shares fails the download.
     async fn site_media(&self, url: &Url) -> Result<Option<crate::media::Extracted>, String> {
         let options = self.media_options();
         match crate::media::find_site_media(url, &options, Some(Arc::clone(&self.cancel_flag))).await {
             Ok(found) => Ok(Some(found)),
             Err(_) if self.cancel_token.is_cancelled() => Err(CANCELLED.to_string()),
             Err(e) if e == crate::media::DRM_REFUSED => Err(e),
-            Err(e) => {
-                tracing::info!("No site of yt-dlp's takes {}: {}", url, e);
-                Ok(None)
-            }
+            Err(e) => match crate::resolver::unsupported_share(url) {
+                Some(service) => {
+                    Err(format!("yt-dlp could not download this {} link, and its page is not the file: {}", service, e))
+                }
+                None => {
+                    tracing::info!("No site of yt-dlp's takes {}: {}", url, e);
+                    Ok(None)
+                }
+            },
         }
     }
 
