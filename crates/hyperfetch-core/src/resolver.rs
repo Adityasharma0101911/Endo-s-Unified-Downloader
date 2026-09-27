@@ -384,7 +384,7 @@ pub fn check_answer(url: &Url, final_url: &Url, headers: &HeaderMap) -> Result<(
 }
 
 /// The file-share service in [`UNSUPPORTED_SHARES`] whose page `url` is on, if any.
-fn unsupported_share(url: &Url) -> Option<&'static str> {
+pub(crate) fn unsupported_share(url: &Url) -> Option<&'static str> {
     let host = url.host_str()?.trim_end_matches('.');
     let on = |domain: &&str| host == *domain || host.strip_suffix(domain).is_some_and(|sub| sub.ends_with('.'));
     UNSUPPORTED_SHARES.iter().find(|(_, domains)| domains.iter().any(on)).map(|(service, _)| *service)

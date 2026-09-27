@@ -3000,3 +3000,22 @@ async fn test_a_short_link_with_a_secret_to_a_code_host_file_page_gets_the_file_
     assert_eq!(again, path);
     assert_eq!(names_in(temp.path()), ["tool.bin"]);
 }
+
+/// A file share's page, as Box shows one: the file is behind its buttons.
+fn a_share_page(method: &str, _target: &str) -> Vec<u8> {
+    response(method, "200 OK", "Content-Type: text/html; charset=utf-8\r\n", b"<!doctype html><title>report.pdf | Powered by Box</title>")
+}
+
+#[tokio::test]
+async fn test_a_share_page_yt_dlp_cannot_download_is_an_error_not_a_download() {
+    let _history = setup().await;
+    let (proxy, _) = serve_proxy(a_share_page).await;
+    let (tools, temp) = (tempdir().unwrap(), tempdir().unwrap());
+    let opts = DownloadOptions { proxy: Some(proxy), ytdlp_path: Some(no_site_ytdlp(tools.path())), ..options(temp.path(), 4, 64 * KB) };
+    let link = Url::parse("http://app.box.com/s/k3yk3y").unwrap();
+
+    let err = run(&DownloadEngine::new(vec![link], opts), None).await.expect_err("the page is not the file");
+    assert!(err.starts_with("yt-dlp could not download this Box link, and its page is not the file: "), "{err}");
+    assert_eq!(names_in(temp.path()), Vec::<String>::new());
+    assert_eq!(runs_of(tools.path()).len(), 1, "yt-dlp was asked");
+}
