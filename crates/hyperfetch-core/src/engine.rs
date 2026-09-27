@@ -445,7 +445,7 @@ impl DownloadEngine {
                 }
                 None if crate::media::site_failed(&e) => Err(e),
                 None => {
-                    tracing::info!("No site of yt-dlp's takes {}: {}", url, e);
+                    tracing::info!("yt-dlp finds nothing to download at {}: {}", url, e);
                     Ok(None)
                 }
             },
