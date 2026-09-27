@@ -236,6 +236,10 @@ impl DownloadHistoryManager {
         if let Some(p) = std::env::var_os("ENDO_HISTORY_PATH") {
             return PathBuf::from(p);
         }
+        // Unit tests never touch the user's history, and never switch files mid-run.
+        if cfg!(test) {
+            return std::env::temp_dir().join(format!("hf-unit-history-{}.json", std::process::id()));
+        }
 
         #[cfg(windows)]
         if let Ok(app_data) = std::env::var("LOCALAPPDATA") {
