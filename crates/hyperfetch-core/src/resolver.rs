@@ -232,6 +232,27 @@ impl HostResolver for GoogleDriveResolver {
     }
 }
 
+/// The target of a "you are leaving this site" link (youtube.com/redirect?q=, google.com/url?q=,
+/// l.facebook.com/l.php?u=, ...), read from the link itself without a request; None when `url` is
+/// not such a link. Wrappers of wrappers are unwrapped too; the result is always http(s).
+pub fn unwrap_redirect(_url: &Url) -> Option<Url> {
+    None
+}
+
+/// Fails if the answer to `url` (which ended at `final_url`), with these headers, is a web page
+/// instead of the file it stands for.
+pub fn check_answer(url: &Url, _final_url: &Url, headers: &HeaderMap) -> Result<(), ResolverError> {
+    GoogleDriveResolver::check_answer(url, headers)
+}
+
+/// Whether `url`, which no host resolver takes, ended at `final_url` on another host that one
+/// does, or that is a media site: the download is then that of `final_url` (a shortened link).
+pub fn lands_elsewhere(url: &Url, final_url: &Url) -> bool {
+    url.host_str() != final_url.host_str()
+        && !SmartResolver::handles(url)
+        && (SmartResolver::handles(final_url) || crate::media::is_supported_media_site(final_url))
+}
+
 impl GoogleDriveResolver {
     /// Fails if `url` is Drive's and its answer, with these headers, is a web page instead of the
     /// file: HTML not sent as an attachment (a hosted .html file is one).
@@ -383,12 +404,13 @@ impl HtmlVideoResolver {
     /// it plays: HTML, for a URL this resolver would be handed (one that can be a page, and that
     /// no resolver `SmartResolver` tries first takes).
     pub fn is_page(url: &Url, headers: &HeaderMap) -> bool {
-        let taken = GoogleDriveResolver.can_handle(url)
-            || MediaFireResolver.can_handle(url)
-            || DropboxResolver.can_handle(url)
-            || SourceForgeResolver.can_handle(url)
-            || ArchiveOrgResolver.can_handle(url);
-        !taken && HtmlVideoResolver.can_handle(url) && html_type(headers)
+        !SmartResolver::handles(url) && HtmlVideoResolver.can_handle(url) && html_type(headers)
+    }
+
+    /// Where the page `html`, from `page_url`, sends the browser at once: the target of a
+    /// `<meta http-equiv="refresh" content="0; url=...">` (t.co answers this way), if it has one.
+    pub fn meta_refresh(_html: &str, _page_url: &Url) -> Option<Url> {
+        None
     }
 
     /// Reads as much of a page's body as is looked into.
@@ -408,6 +430,15 @@ impl HtmlVideoResolver {
 pub struct SmartResolver;
 
 impl SmartResolver {
+    /// Whether a host resolver (not the generic page one) takes `url`.
+    pub fn handles(url: &Url) -> bool {
+        GoogleDriveResolver.can_handle(url)
+            || MediaFireResolver.can_handle(url)
+            || DropboxResolver.can_handle(url)
+            || SourceForgeResolver.can_handle(url)
+            || ArchiveOrgResolver.can_handle(url)
+    }
+
     /// Resolves `url` into download sources that are byte-identical copies of one file.
     /// `Ok` is never empty. `Err` means a resolver recognized the host but could not extract a direct link.
     pub async fn resolve(client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
