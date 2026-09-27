@@ -375,14 +375,19 @@ mod tests {
     }
 
     /// The queue and history hold the target of a "leaving this site" link, not the link itself,
-    /// and a wrapped document is read as one.
+    /// and a wrapped document is read as one. The CLI goes through `ingest`, the GUI's form and
+    /// queue through `link_task`.
     #[test]
-    #[ignore = "needs resolver::unwrap_redirect, which the resolver lane fills in"]
     fn leaving_links_are_replaced_by_their_target() {
-        let wrapped = "https://www.google.com/url?q=https%3A%2F%2Fwww.mediafire.com%2Ffile%2Fabc%2Fmod.zip";
         let target = [Url::parse("https://www.mediafire.com/file/abc/mod.zip").unwrap()];
-        assert_eq!(link(wrapped).unwrap().urls, target);
-        assert_eq!(run(wrapped).unwrap()[0].urls, target);
+        for wrapped in [
+            "https://www.google.com/url?q=https%3A%2F%2Fwww.mediafire.com%2Ffile%2Fabc%2Fmod.zip",
+            // As YouTube writes the links in a video's description.
+            "https://www.youtube.com/redirect?event=video_description&redir_token=QUFF&q=https%3A%2F%2Fwww.mediafire.com%2Ffile%2Fabc%2Fmod.zip&v=dQw4w9WgXcQ",
+        ] {
+            assert_eq!(link(wrapped).unwrap().urls, target, "{wrapped}");
+            assert_eq!(run(wrapped).unwrap()[0].urls, target, "{wrapped}");
+        }
         assert!(names_document("https://www.google.com/url?q=https%3A%2F%2Fm.example%2Flist.meta4"));
     }
 
