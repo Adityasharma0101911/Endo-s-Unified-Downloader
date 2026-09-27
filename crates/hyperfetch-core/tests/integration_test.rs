@@ -22,14 +22,17 @@ const PREFETCH: usize = 1024 * KB;
 /// recorded take this exclusively, so a parallel test's history write cannot race theirs.
 static HISTORY: RwLock<()> = RwLock::const_new(());
 
-/// Points download history at a file under target/ so tests never touch the user's history.
-/// Each run starts it afresh and reuses it (and its lock file) instead of piling up temp files.
+/// Points download history, and the download archive media downloads add to, at files under
+/// target/ so tests never touch the user's. Each run starts them afresh and reuses them (and
+/// their lock files) instead of piling up temp files.
 fn isolate_history() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
-        let path = Path::new(env!("CARGO_TARGET_TMPDIR")).join("integration-history.json");
-        let _ = std::fs::remove_file(&path);
-        std::env::set_var("ENDO_HISTORY_PATH", path);
+        for (var, name) in [("ENDO_HISTORY_PATH", "integration-history.json"), ("ENDO_ARCHIVE_PATH", "integration-archive.txt")] {
+            let path = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
+            let _ = std::fs::remove_file(&path);
+            std::env::set_var(var, path);
+        }
     });
 }
 
@@ -3297,4 +3300,52 @@ async fn test_bare_sha512_and_sha1_checksums_of_a_single_stream() {
         assert_file(&out, &data);
         assert_no_leftovers(&out);
     }
+}
+
+// ---- Playlists and channels: one download per video, and the download archive ----------------
+
+/// The lines of the download archive the tests' media downloads add to (see `isolate_history`).
+fn archived() -> Vec<String> {
+    let file = std::env::var_os("ENDO_ARCHIVE_PATH").expect("the archive is isolated");
+    std::fs::read_to_string(file).unwrap_or_default().lines().map(str::to_string).collect()
+}
+
+/// A media download the engine makes is added to the download archive, once however often it is
+/// made, so that a later listing of a channel or playlist it is in leaves it out.
+#[tokio::test]
+async fn test_a_finished_media_download_is_added_to_the_download_archive() {
+    let _history = setup().await;
+    let (tools, temp) = (tempdir().unwrap(), tempdir().unwrap());
+    let video = payload(PREFETCH + 64 * KB, 353);
+    let video_url = serve(Arc::new(Mock::new(video.clone())), "v/archived").await;
+    let (_, page_url) = plain_page("clips/archived").await;
+    let output = temp.path().join("Archived clip.mp4");
+    let info = serde_json::json!({
+        "_type": "video", "extractor_key": "FakeSite", "id": "archived-clip", "title": "Archived clip",
+        "url": video_url.as_str(), "protocol": "http", "format_id": "0", "ext": "mp4",
+        "requested_downloads": [{ "filename": output }],
+    });
+    std::fs::write(tools.path().join("info.json"), serde_json::to_vec(&info).unwrap()).unwrap();
+    let opts = DownloadOptions { ytdlp_path: Some(fake_ytdlp(tools.path(), &output)), ..options(temp.path(), 4, 64 * KB) };
+
+    for _ in 0..2 {
+        let path = run(&DownloadEngine::new(vec![page_url.clone()], opts.clone()), None).await.expect("the video should download");
+        assert_eq!(path, output);
+        assert_file(&path, &video);
+        let lines = archived();
+        assert_eq!(lines.iter().filter(|line| *line == "fakesite archived-clip").count(), 1, "{lines:?}");
+    }
+}
+
+/// A video link that also names its playlist is the one video, unless the playlist is asked
+/// for: ingest reads it, and asks yt-dlp nothing.
+#[tokio::test]
+async fn test_a_video_link_naming_its_playlist_is_one_download_unless_the_playlist_is_asked_for() {
+    use hyperfetch_core::ingest::{descriptor_client, ingest, needs_reading, ListOptions, Task};
+    let link = "https://www.youtube.com/watch?v=jNQXAC9IVRw&list=PLbpi6ZahtOH6Blw3RGYpWkSByi_T7Rygb";
+    assert!(needs_reading(link) && needs_reading("https://www.youtube.com/@NASA/videos"));
+    assert!(!needs_reading("https://www.youtube.com/watch?v=jNQXAC9IVRw"));
+    // Not whole_playlist: no yt-dlp is run, so none needs to be installed.
+    let tasks = ingest(&[link], &descriptor_client(None).unwrap(), &ListOptions::default()).await.expect("the video");
+    assert_eq!(tasks, [Task { urls: vec![Url::parse(link).unwrap()], ..Task::default() }]);
 }
