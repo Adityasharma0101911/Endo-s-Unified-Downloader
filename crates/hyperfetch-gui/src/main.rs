@@ -912,13 +912,14 @@ impl eframe::App for App {
 }
 
 /// Engine options for `task` with `settings`, the per-download checksum (else the task's own)
-/// and Authorization header. A task that names its file is saved as that (sub)path of the save
-/// folder.
+/// and Authorization header (never for the hosts a document lists). A task that names its file
+/// is saved as that (sub)path of the save folder.
 fn task_options(settings: &Settings, task: &Task, checksum: &str, auth: &str) -> Result<DownloadOptions, String> {
     let checksum = match checksum.trim() {
         "" => task.checksum.as_deref().unwrap_or_default(),
         typed => typed,
     };
+    let auth = if task.from_document { "" } else { auth };
     let mut options = settings.download_options(&task.urls, checksum, auth)?;
     if let Some(name) = &task.name {
         options.output_path = options.output_path.map(|folder| folder.join(name));
@@ -1356,8 +1357,12 @@ mod tests {
         let settings = Settings { save_dir: "dl".into(), ..Settings::default() };
         let url = Url::parse("https://m.example/disc.iso").unwrap();
         let listed = format!("sha256:{}", "ab".repeat(32));
-        let named =
-            Task { urls: vec![url.clone()], name: Some(PathBuf::from("release").join("disc.iso")), checksum: Some(listed.clone()) };
+        let named = Task {
+            urls: vec![url.clone()],
+            name: Some(PathBuf::from("release").join("disc.iso")),
+            checksum: Some(listed.clone()),
+            ..Task::default()
+        };
         let options = task_options(&settings, &named, "", "").unwrap();
         assert_eq!(options.output_path, Some(PathBuf::from("dl").join("release").join("disc.iso")));
         assert_eq!(options.expected_checksum, Some(listed));
@@ -1366,6 +1371,16 @@ mod tests {
 
         let plain = Task { urls: vec![url], ..Task::default() };
         assert_eq!(task_options(&settings, &plain, " ", "").unwrap().output_path, Some(PathBuf::from("dl")));
+    }
+
+    /// The Authorization header goes to the hosts the user typed, never to those a document lists.
+    #[test]
+    fn the_authorization_header_skips_the_hosts_a_document_lists() {
+        let settings = Settings { save_dir: "dl".into(), ..Settings::default() };
+        let typed = Task { urls: vec![Url::parse("https://a.example/f.iso").unwrap()], ..Task::default() };
+        let listed = Task { urls: typed.urls.clone(), from_document: true, ..Task::default() };
+        assert_eq!(task_options(&settings, &typed, "", "Bearer t").unwrap().auth_header.as_deref(), Some("Bearer t"));
+        assert_eq!(task_options(&settings, &listed, "", "Bearer t").unwrap().auth_header, None);
     }
 
     /// Each file a document lists keeps its own path and checksum; the form's checksum only fits a
@@ -1377,6 +1392,7 @@ mod tests {
             urls: vec![Url::parse(&format!("https://m.example/{}", name)).unwrap()],
             name: Some(PathBuf::from("pack").join(name)),
             checksum,
+            ..Task::default()
         };
         let (a, b) = (format!("sha256:{}", "aa".repeat(32)), format!("md5:{}", "bb".repeat(16)));
         let tasks = [file("a.bin", Some(a.clone())), file("b.bin", Some(b.clone()))];
@@ -1412,7 +1428,7 @@ mod tests {
         let task = Task {
             urls: vec![Url::parse(&format!("http://{}/get?id=7", addr)).unwrap()],
             name: Some(PathBuf::from("release").join("disc.iso")),
-            checksum: None,
+            ..Task::default()
         };
         let options = task_options(&settings, &task, "", "").unwrap();
         let mut queue = DownloadQueue::new();

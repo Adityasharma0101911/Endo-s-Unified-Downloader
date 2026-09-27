@@ -23,6 +23,9 @@ pub struct Task {
     pub name: Option<PathBuf>,
     /// Checksum published by a metalink.
     pub checksum: Option<String>,
+    /// Listed by a .metalink, .meta4 or .torrent, so its hosts are ones the user never named:
+    /// the Authorization header the user gave is not sent to them.
+    pub from_document: bool,
 }
 
 impl Task {
@@ -240,7 +243,8 @@ fn metalink_tasks(bytes: &[u8]) -> Result<Vec<Task>, String> {
             let checksum = ["sha256", "md5"]
                 .iter()
                 .find_map(|algo| file.hashes.iter().find(|(t, _)| t == algo).map(|(t, h)| format!("{}:{}", t, h)));
-            Ok(Task { name: Some(clean_path(file.name.split('/'))?), urls: file.urls, checksum })
+            let name = Some(clean_path(file.name.split('/'))?);
+            Ok(Task { name, urls: file.urls, checksum, from_document: true })
         })
         .collect()
 }
@@ -259,7 +263,7 @@ fn torrent_tasks(bytes: &[u8]) -> Result<Vec<Task>, String> {
                 ));
             }
             let name = if single_file { relative } else { clean_path([info.name.as_str()])?.join(relative) };
-            Ok(Task { urls: file.urls.clone(), name: Some(name), checksum: None })
+            Ok(Task { urls: file.urls.clone(), name: Some(name), from_document: true, ..Task::default() })
         })
         .collect()
 }
@@ -394,6 +398,8 @@ mod tests {
         assert_eq!(tasks[0].name, Some(PathBuf::from("a.bin")));
         assert_eq!(tasks[0].checksum.as_deref(), Some("sha256:abcdef"));
         assert_eq!(tasks[1].checksum.as_deref(), Some("md5:0123"));
+        assert!(tasks.iter().all(|t| t.from_document), "the user never named these hosts");
+        assert!(!run("https://a.example/f.iso").unwrap()[0].from_document);
     }
 
     #[test]
