@@ -2583,9 +2583,10 @@ async fn test_a_short_link_is_downloaded_from_the_file_host_it_lands_on() {
     let path = run(&DownloadEngine::new(vec![short.clone()], opts), None).await.expect("the file should download");
     assert_eq!(path, temp.path().join("report.bin"));
     assert_file(&path, &payload(64 * KB, 311));
-    // History lists where the link landed along with it: a repair finds the file there.
-    let landed = "http://www.dropbox.com/s/k3y/report.bin?dl=0";
-    assert_eq!(history_entry(&path).expect("the download is recorded").urls, [short.to_string(), landed.to_string()]);
+    // History lists where the link landed along with it, and the link Dropbox's resolver made of
+    // that, which serves the file: a repair, which uses no resolver, finds the file there.
+    let (landed, file) = ("http://www.dropbox.com/s/k3y/report.bin?dl=0", "http://www.dropbox.com/s/k3y/report.bin?dl=1");
+    assert_eq!(history_entry(&path).expect("the download is recorded").urls, [short.as_str(), landed, file]);
     // The file came as Dropbox's resolver asks for it, and the credentials went only to the host
     // the user named.
     let seen = seen.lock().unwrap().clone();
@@ -2995,9 +2996,9 @@ async fn test_a_short_link_with_a_secret_to_a_code_host_file_page_gets_the_file_
     assert_file(&path, &payload(64 * KB, 359));
     let raw = "http://github.com/owner/repo/raw/main/dist/tool.bin";
     assert!(seen.lock().unwrap().iter().any(|(target, _)| target == raw), "the file page was rewritten to its raw link");
-    // History lists the link without its secret, and where it landed.
+    // History lists the link without its secret, where it landed, and the raw link made of that.
     let entry = history_entry(&path).expect("the download is recorded");
-    assert_eq!(entry.urls, ["http://go.short.invalid/t?token=REDACTED", "http://github.com/owner/repo/blob/main/dist/tool.bin"]);
+    assert_eq!(entry.urls, ["http://go.short.invalid/t?token=REDACTED", "http://github.com/owner/repo/blob/main/dist/tool.bin", raw]);
     let saved = std::fs::read_to_string(DownloadHistoryManager::default_history_path()).unwrap();
     assert!(!saved.contains("s3cr3t-t0ken"), "{saved}");
 
@@ -3150,4 +3151,32 @@ async fn test_a_codeberg_file_page_downloads_the_file() {
     let path = run(&DownloadEngine::new(vec![page], opts), None).await.expect("the file should download");
     assert_eq!(path, temp.path().join("tool.bin"));
     assert_file(&path, &payload(64 * KB, 379));
+}
+
+/// A file downloaded through a link that led elsewhere is repaired from the links history lists
+/// for it, the page it was given first among them. (A resolver's link, such as Dropbox's dl=1,
+/// is listed as well, see `test_a_short_link_is_downloaded_from_the_file_host_it_lands_on`;
+/// repairs connect directly, not through the proxy that stands in for such hosts here.)
+#[tokio::test]
+async fn test_a_file_downloaded_through_a_followed_link_is_repaired_from_its_history() {
+    isolate_history();
+    let _history = HISTORY.write().await;
+    let data = payload(PREFETCH + 256 * KB, 383);
+    let file_url = serve(Arc::new(Mock::new(data.clone())), "repair/tool.bin").await;
+    let (_, page_url) = refreshing_page("l/repair", file_url.as_str(), true).await;
+    let temp = tempdir().unwrap();
+    let path = run(&DownloadEngine::new(vec![page_url.clone()], options(temp.path(), 4, 256 * KB)), None)
+        .await
+        .expect("the file should download");
+    let urls: Vec<Url> = history_entry(&path).expect("the download is recorded").urls.iter().map(|u| Url::parse(u).unwrap()).collect();
+    assert_eq!(urls.first(), Some(&page_url));
+
+    // Its last 100 KiB lost.
+    std::fs::write(&path, &data[..data.len() - 100 * KB]).unwrap();
+    let found = hyperfetch_core::verify_build_file(&path, None, None).unwrap();
+    assert_eq!(found.missing_ranges.len(), 1, "{}", found.status_message);
+    hyperfetch_core::repair_missing_ranges(&path, data.len() as u64, &found.missing_ranges, &urls, &options(temp.path(), 4, 256 * KB), None, |_, _| {})
+        .await
+        .expect("the file should be repaired");
+    assert_file(&path, &data);
 }

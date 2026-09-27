@@ -854,13 +854,10 @@ impl DownloadEngine {
         let late = late.filter(|_| reference.accepts_ranges && reference.size != Some(reference.prefetch.len() as u64));
         let started_at = unix_now();
         let base = self.output_path_for(&reference.filename);
-        let mut known_urls = self.url_strings();
-        for mirror in &mirrors {
-            let url = mirror.url.to_string();
-            if !known_urls.contains(&url) {
-                known_urls.push(url);
-            }
-        }
+        // The mirrors, as resolvers made them of the links, among its URLs: a repair of the file
+        // asks them, not a page the link was (see `naming`).
+        let this = mirrors.iter().fold(self.clone(), |engine, mirror| engine.naming(mirror.url.clone()));
+        let known_urls = this.url_strings();
 
         let plan = {
             let (base, remote, urls) = (base.clone(), reference.clone(), known_urls.clone());
@@ -944,7 +941,7 @@ impl DownloadEngine {
             }
             _ => Written::Digest(self.fetch_stream(&client, &reference, live, &part, &final_path, &snapshot_tx).await?),
         };
-        self.finalize(final_path, claim, written, started_at, &snapshot_tx).await
+        this.finalize(final_path, claim, written, started_at, &snapshot_tx).await
     }
 
     /// Multi-connection download of a file whose size is known and whose server honours ranges.
