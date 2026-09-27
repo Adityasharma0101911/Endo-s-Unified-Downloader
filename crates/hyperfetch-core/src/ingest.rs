@@ -321,9 +321,14 @@ fn metalink_tasks(bytes: &[u8]) -> Result<Vec<Task>, String> {
             if file.urls.is_empty() {
                 return Err(format!("metalink file '{}' has no http(s) URLs", file.name));
             }
-            let checksum = ["sha512", "sha256", "sha1", "md5"]
-                .iter()
-                .find_map(|algo| file.hashes.iter().find(|(t, _)| t == algo).map(|(t, h)| format!("{}:{}", t, h)));
+            // A malformed hash (of the wrong length) is passed over for the next strongest.
+            let checksum = ["sha512", "sha256", "sha1", "md5"].iter().find_map(|algo| {
+                file.hashes
+                    .iter()
+                    .filter(|(t, _)| t == algo)
+                    .map(|(t, h)| format!("{}:{}", t, h))
+                    .find(|c| crate::storage::validate_checksum(c).is_ok())
+            });
             let name = Some(clean_path(file.name.split('/'))?);
             Ok(Task { name, urls: file.urls, checksum, size: file.size, from_document: true, ..Task::default() })
         })
@@ -482,10 +487,13 @@ mod tests {
 
     #[test]
     fn local_metalink_yields_named_tasks_with_checksums() {
-        let xml = r#"<?xml version="1.0"?><metalink xmlns="urn:ietf:params:xml:ns:metalink">
-            <file name="a.bin"><hash type="sha-256">ABCDEF</hash><url>https://m1.example/a.bin</url></file>
-            <file name="b.bin"><hash type="md5">0123</hash><url>https://m1.example/b.bin</url></file>
-            </metalink>"#;
+        let (sha256, md5) = ("AB".repeat(32), "01".repeat(16));
+        let xml = format!(
+            r#"<?xml version="1.0"?><metalink xmlns="urn:ietf:params:xml:ns:metalink">
+            <file name="a.bin"><hash type="sha-256">{sha256}</hash><url>https://m1.example/a.bin</url></file>
+            <file name="b.bin"><hash type="md5">{md5}</hash><url>https://m1.example/b.bin</url></file>
+            </metalink>"#
+        );
         let mut bytes = vec![0xEF, 0xBB, 0xBF];
         bytes.extend_from_slice(xml.as_bytes());
         let (_dir, path) = write_temp("list.meta4", &bytes);
@@ -493,17 +501,18 @@ mod tests {
         let tasks = run(path.to_str().unwrap()).unwrap();
         assert_eq!(tasks.len(), 2);
         assert_eq!(tasks[0].name, Some(PathBuf::from("a.bin")));
-        assert_eq!(tasks[0].checksum.as_deref(), Some("sha256:abcdef"));
-        assert_eq!(tasks[1].checksum.as_deref(), Some("md5:0123"));
+        assert_eq!(tasks[0].checksum, Some(format!("sha256:{}", sha256.to_lowercase())));
+        assert_eq!(tasks[1].checksum, Some(format!("md5:{md5}")));
         assert!(tasks.iter().all(|t| t.from_document), "the user never named these hosts");
         assert!(!run("https://a.example/f.iso").unwrap()[0].from_document);
     }
 
     /// The strongest checksum a metalink publishes is checked; one that gives only SHA-1 or
-    /// SHA-512 (Metalink 3 files often give SHA-1 alone) is checked too.
+    /// SHA-512 (Metalink 3 files often give SHA-1 alone) is checked too. A malformed one is passed
+    /// over for the next strongest.
     #[test]
     fn metalink_checksums_are_taken_strongest_first() {
-        let (sha512, sha1) = ("ab".repeat(64), "cd".repeat(20));
+        let (sha512, sha256, sha1) = ("ab".repeat(64), "12".repeat(32), "cd".repeat(20));
         let xml = format!(
             r#"<metalink version="3.0" xmlns="http://www.metalinker.org/"><files>
             <file name="a.iso"><verification><hash type="sha1">{sha1}</hash><hash type="md5">{md5}</hash><hash type="sha512">{sha512}</hash></verification>
@@ -511,11 +520,17 @@ mod tests {
             <file name="b.iso"><verification><hash type="sha1">{sha1}</hash><hash type="md5">{md5}</hash></verification>
             <resources><url type="http">https://m.example/b.iso</url></resources></file>
             <file name="c.iso"><verification><hash>{sha512}</hash></verification><resources><url>https://m.example/c.iso</url></resources></file>
+            <file name="d.iso"><verification><hash type="sha512">{short}</hash><hash type="sha256">{sha256}</hash></verification>
+            <resources><url>https://m.example/d.iso</url></resources></file>
             </files></metalink>"#,
             md5 = "ef".repeat(16),
+            short = "ab".repeat(63),
         );
         let checksums: Vec<_> = metalink_tasks(xml.as_bytes()).unwrap().into_iter().map(|t| t.checksum.unwrap()).collect();
-        assert_eq!(checksums, [format!("sha512:{sha512}"), format!("sha1:{sha1}"), format!("sha512:{sha512}")]);
+        assert_eq!(
+            checksums,
+            [format!("sha512:{sha512}"), format!("sha1:{sha1}"), format!("sha512:{sha512}"), format!("sha256:{sha256}")]
+        );
         for checksum in &checksums {
             assert!(crate::storage::validate_checksum(checksum).is_ok(), "{checksum}");
         }
