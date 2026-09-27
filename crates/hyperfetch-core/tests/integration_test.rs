@@ -3324,7 +3324,7 @@ async fn test_a_feed_lists_its_episodes_and_later_only_new_ones() {
 </rss>"#,
         old.len()
     );
-    let mut feed_host = Mock::new(rss.into_bytes());
+    let mut feed_host = Mock::new(rss.clone().into_bytes());
     feed_host.content_type = Some("application/rss+xml; charset=utf-8");
     let feed = serve(Arc::new(feed_host), "private/show.rss?auth=s3cret").await;
     let http = descriptor_client(None).unwrap();
@@ -3357,6 +3357,13 @@ async fn test_a_feed_lists_its_episodes_and_later_only_new_ones() {
     assert_eq!(err, "Nothing new in Mock Show: the newest 1 of its 2 episodes were downloaded before");
     let all = ListOptions { only_new: false, ..ListOptions::default() };
     assert_eq!(ingest(&[feed.as_str()], &http, &all).await.unwrap().len(), 2);
+
+    // The host adds tracking to the newest one's link: it is still the file downloaded before.
+    let moved = rss.replace(&format!("url=\"{new_url}\""), &format!("url=\"{new_url}?updated=2\""));
+    assert_ne!(moved, rss);
+    let feed = serve(Arc::new(Mock::new(moved.into_bytes())), "private/show.rss?auth=s3cret").await;
+    let tasks = ingest(&[feed.as_str()], &http, &ListOptions::default()).await.expect("the feed is read once more");
+    assert_eq!(listed(&tasks), [("2026-06-01 Old one.mp3".to_string(), old_url.to_string())]);
 }
 
 /// A link shaped like a feed that answers with a page, another XML document, a feed without

@@ -1,7 +1,7 @@
 //! Podcast and RSS/Atom feeds read into one download per episode.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::name::QName;
@@ -9,7 +9,7 @@ use quick_xml::reader::Reader;
 use serde::Deserialize;
 use url::Url;
 
-use crate::history::{redact_url, DownloadHistoryManager, HistoryStatus};
+use crate::history::{is_redacted, redact_url, DownloadHistoryManager, HistoryEntry, HistoryStatus};
 use crate::ingest::{clean_path, decode_text, ListOptions, Task};
 use crate::resolver;
 
@@ -500,58 +500,82 @@ fn zone_offset(zone: &str) -> i64 {
 /// The tasks of `feed`'s episodes as `options` say, reading the download history for
 /// `only_new` off the runtime's threads.
 async fn show_tasks(feed: Feed, options: &ListOptions) -> Result<Vec<Task>, String> {
-    let done = if options.only_new { completed_links().await } else { HashSet::new() };
+    let done = if options.only_new {
+        tokio::task::spawn_blocking(|| Done::of(DownloadHistoryManager::load().entries())).await.unwrap_or_default()
+    } else {
+        Done::default()
+    };
     feed_tasks(feed, options.latest, &done)
 }
 
-/// The links of the downloads history records as completed, as it saves them (redacted).
-async fn completed_links() -> HashSet<String> {
-    tokio::task::spawn_blocking(|| {
-        let history = DownloadHistoryManager::load();
-        history.entries().iter().filter(|e| e.status == HistoryStatus::Completed).flat_map(|e| e.urls.clone()).collect()
-    })
-    .await
-    .unwrap_or_default()
+/// What history records as downloaded, which tells the episodes downloaded before.
+#[derive(Default)]
+struct Done {
+    /// Links, as history saves them, but for those it took a secret out of: the secret may be
+    /// what told one episode's link from another's (`download?key=EP1`, `?key=EP2`).
+    links: HashSet<String>,
+    /// Files, as the names of their folder and their own in lower case (Windows compares names
+    /// so): an episode whose link changed (a new tracking prefix or query) is still in its
+    /// show's folder under its name.
+    files: HashSet<(String, String)>,
+}
+
+impl Done {
+    fn of(entries: &[HistoryEntry]) -> Self {
+        let mut done = Self::default();
+        for entry in entries.iter().filter(|e| e.status == HistoryStatus::Completed) {
+            done.links.extend(entry.urls.iter().filter(|u| !is_redacted(u)).cloned());
+            if let (Some(folder), Some(file)) = (entry.file_path.parent().and_then(Path::file_name), entry.file_path.file_name()) {
+                done.files.insert((folder.to_string_lossy().to_lowercase(), file.to_string_lossy().to_lowercase()));
+            }
+        }
+        done
+    }
+
+    /// Whether the episode `task` downloads was downloaded before: from one of its links, or
+    /// into the file it names.
+    fn has(&self, task: &Task) -> bool {
+        let lower = |path: &Path| path.to_string_lossy().to_lowercase();
+        task.urls.iter().any(|url| self.links.contains(&redact_url(url.as_str())))
+            || matches!((&task.folder, &task.name), (Some(folder), Some(name)) if self.files.contains(&(lower(folder), lower(name))))
+    }
 }
 
 /// One task per episode of `feed`, newest first (in the feed's order where dates are missing or
-/// equal), an enclosure listed twice once: the newest `latest` of them, less those whose
-/// enclosure link is in `done` (compared redacted, as history keeps it). An error when that
-/// leaves none.
-fn feed_tasks(feed: Feed, latest: Option<usize>, done: &HashSet<String>) -> Result<Vec<Task>, String> {
+/// equal), an enclosure listed twice once: the newest `latest` of them, less those `done` has.
+/// Names are given over the whole feed, so an episode keeps its name from one listing to the
+/// next. An error when that leaves none.
+fn feed_tasks(feed: Feed, latest: Option<usize>, done: &Done) -> Result<Vec<Task>, String> {
     let show = feed.title.as_deref().unwrap_or("the feed");
     let folder = feed.title.as_deref().and_then(|title| clean_path([title]).ok());
     let mut episodes = feed.episodes;
     episodes.sort_by_key(|e| std::cmp::Reverse(e.date.map(|d| d.unix)));
-    let mut seen = HashSet::new();
-    episodes.retain(|e| e.enclosure.as_ref().is_some_and(|enclosure| seen.insert(enclosure.url.clone())));
-    let listed = episodes.len();
-    if let Some(latest) = latest {
-        episodes.truncate(latest);
+    let (mut seen, mut names) = (HashSet::new(), HashSet::new());
+    let mut tasks = Vec::new();
+    for episode in episodes {
+        let Some(enclosure) = episode.enclosure.filter(|e| seen.insert(e.url.clone())) else { continue };
+        let name = episode_name(&episode.title, episode.date, enclosure.extension, &enclosure.url, &mut names)?;
+        tasks.push(Task {
+            urls: vec![enclosure.url],
+            name: Some(name),
+            folder: folder.clone(),
+            size: enclosure.length,
+            // Its host is not the feed's: the Authorization the user gave is not sent there.
+            from_document: true,
+            ..Task::default()
+        });
     }
-    let considered = episodes.len();
-    episodes.retain(|e| e.enclosure.as_ref().is_some_and(|enclosure| !done.contains(&redact_url(enclosure.url.as_str()))));
-    if episodes.is_empty() {
+    let listed = tasks.len();
+    if let Some(latest) = latest {
+        tasks.truncate(latest);
+    }
+    let considered = tasks.len();
+    tasks.retain(|task| !done.has(task));
+    if tasks.is_empty() {
         let which = if considered < listed { format!("the newest {} of its {}", considered, listed) } else { format!("all {} of its", listed) };
         return Err(format!("Nothing new in {}: {} episodes were downloaded before", show, which));
     }
-    let mut names = HashSet::new();
-    episodes
-        .into_iter()
-        .filter_map(|episode| {
-            let enclosure = episode.enclosure?;
-            let name = episode_name(&episode.title, episode.date, enclosure.extension, &enclosure.url, &mut names);
-            Some(name.map(|name| Task {
-                urls: vec![enclosure.url],
-                name: Some(name),
-                folder: folder.clone(),
-                size: enclosure.length,
-                // Its host is not the feed's: the Authorization the user gave is not sent there.
-                from_document: true,
-                ..Task::default()
-            }))
-        })
-        .collect()
+    Ok(tasks)
 }
 
 /// "YYYY-MM-DD Title.ext", cleaned for every OS, with " (2)" and up added to a name `taken`
@@ -646,7 +670,7 @@ impl AppleLink {
         }
         let wanted = episode?;
         let found = feed.episodes.into_iter().find(|e| wanted.matches(e))?;
-        Some(feed_tasks(Feed { title: feed.title, episodes: vec![found] }, None, &HashSet::new()))
+        Some(feed_tasks(Feed { title: feed.title, episodes: vec![found] }, None, &Done::default()))
     }
 }
 
@@ -883,7 +907,7 @@ mod tests {
     fn an_rss_feed_lists_its_audio_and_video_newest_first() {
         let feed = parse(DAILY, "https://feeds.simplecast.com/Sl5CSM3S?token=s3cret").unwrap().unwrap();
         assert_eq!(feed.title.as_deref(), Some("The Daily"));
-        let tasks = feed_tasks(feed, None, &HashSet::new()).unwrap();
+        let tasks = feed_tasks(feed, None, &Done::default()).unwrap();
         assert_eq!(
             names(&tasks),
             [
@@ -904,24 +928,56 @@ mod tests {
         assert!(tasks.iter().all(|t| t.folder.as_deref() == Some(Path::new("The Daily")) && t.from_document));
     }
 
-    /// The newest N, less what history has downloaded, compared as history keeps links: without
-    /// their secrets.
+    /// A completed download history records: `file` (a path under a download folder) from `link`.
+    fn downloaded(file: &str, link: &str) -> HistoryEntry {
+        let path = Path::new("downloads").join(file);
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        HistoryEntry::new(name, path, 1, vec![link.to_string()])
+    }
+
+    /// The newest N, less what history has downloaded: from the same link, as history keeps it,
+    /// or into the same file in the show's folder. Names do not change with what is left out.
     #[test]
     fn latest_and_only_new_pick_the_episodes() {
         let feed = || parse(DAILY, "https://feeds.simplecast.com/Sl5CSM3S").unwrap().unwrap();
-        assert_eq!(feed_tasks(feed(), Some(2), &HashSet::new()).unwrap().len(), 2);
-        let newest = feed_tasks(feed(), Some(1), &HashSet::new()).unwrap().remove(0).urls.remove(0);
-        let done = HashSet::from([redact_url(newest.as_str()), "https://cdn.example/play?id=7".to_string()]);
+        assert_eq!(feed_tasks(feed(), Some(2), &Done::default()).unwrap().len(), 2);
+        let newest = feed_tasks(feed(), Some(1), &Done::default()).unwrap().remove(0).urls.remove(0);
+        let mut failed = downloaded("elsewhere/x.mp3", "https://cdn.example/play?id=8");
+        failed.status = HistoryStatus::Failed("reset".into());
+        let done = Done::of(&[downloaded("elsewhere/a.mp3", newest.as_str()), downloaded("elsewhere/b.mp4", "https://cdn.example/play?id=7"), failed]);
         let left = feed_tasks(feed(), None, &done).unwrap();
-        assert_eq!(left.len(), 3);
+        assert_eq!(names(&left).len(), 3);
         assert!(names(&left)[0].starts_with("2026-09-26 "));
+        assert_eq!(names(&left)[2], "2026-09-21 Repeat (2).mp4");
         let err = feed_tasks(feed(), Some(1), &done).unwrap_err();
         assert_eq!(err, "Nothing new in The Daily: the newest 1 of its 5 episodes were downloaded before");
+    }
 
-        let signed = r#"<rss><channel><title>Members</title><item><title>E</title><enclosure type="audio/mpeg" url="https://c.example/e.mp3?token=abc"/></item></channel></rss>"#;
-        let done = HashSet::from([redact_url("https://c.example/e.mp3?token=xyz")]);
-        let err = feed_tasks(parse(signed, "https://f.example/rss").unwrap().unwrap(), None, &done).unwrap_err();
-        assert_eq!(err, "Nothing new in Members: all 1 of its episodes were downloaded before");
+    /// A link history took a secret out of matches no episode, as the secret may be what told
+    /// episodes apart; the file an episode was saved to still does, whatever its link is now.
+    #[test]
+    fn only_new_goes_by_file_where_links_cannot_tell() {
+        let private = r#"<rss><channel><title>Members</title>
+<item><title>One</title><enclosure type="audio/mpeg" url="https://h.example/download?key=EP1"/></item>
+<item><title>Two</title><enclosure type="audio/mpeg" url="https://h.example/download?key=EP2"/></item>
+</channel></rss>"#;
+        let feed = || parse(private, "https://f.example/rss").unwrap().unwrap();
+        let done = Done::of(&[downloaded("Members/One.mp3", "https://h.example/download?key=EP1")]);
+        assert!(done.links.is_empty());
+        assert_eq!(names(&feed_tasks(feed(), None, &done).unwrap()), ["Two.mp3"]);
+        // The same link with another key, saved elsewhere, is no match.
+        let done = Done::of(&[downloaded("Other/Three.mp3", "https://h.example/download?key=EP9")]);
+        assert_eq!(names(&feed_tasks(feed(), None, &done).unwrap()), ["One.mp3", "Two.mp3"]);
+
+        // A new tracking prefix: the episode is in its show's folder under its name (in any case).
+        let tracked = r#"<rss><channel><title>Show</title><item><title>Ep</title><pubDate>Thu, 01 Jan 2026 08:00:00 GMT</pubDate>
+<enclosure type="audio/mpeg" url="https://tracking.example/new-prefix/cdn.example/ep.mp3?updated=2"/></item></channel></rss>"#;
+        let feed = || parse(tracked, "https://f.example/show.rss").unwrap().unwrap();
+        let done = Done::of(&[downloaded("SHOW/2026-01-01 ep.MP3", "https://tracking.example/old-prefix/cdn.example/ep.mp3")]);
+        let err = feed_tasks(feed(), None, &done).unwrap_err();
+        assert_eq!(err, "Nothing new in Show: all 1 of its episodes were downloaded before");
+        let done = Done::of(&[downloaded("Another show/2026-01-01 Ep.mp3", "https://tracking.example/old-prefix/cdn.example/ep.mp3")]);
+        assert_eq!(feed_tasks(feed(), None, &done).unwrap().len(), 1);
     }
 
     #[test]
@@ -946,7 +1002,7 @@ mod tests {
 </feed>"#;
         let feed = parse(atom, "https://a.example/feeds/show.atom").unwrap().unwrap();
         assert_eq!(feed.episodes[0].guid.as_deref(), Some("urn:1"));
-        let tasks = feed_tasks(feed, None, &HashSet::new()).unwrap();
+        let tasks = feed_tasks(feed, None, &Done::default()).unwrap();
         // Published at 04:00 UTC on the 3rd, the first is older than the second.
         assert_eq!(names(&tasks), ["2026-01-03 Second.ogg", "2026-01-02 First.opus"]);
         assert_eq!(tasks[0].urls, [url("https://a.example/feeds/media/second")]);
@@ -1008,7 +1064,7 @@ mod tests {
         assert!(is_feed_root("atom:feed") && !is_feed_root("atom:entry") && !is_feed_root("feeds"));
         let feed = parse(atom, "https://p.example/feed.atom").unwrap().unwrap();
         assert_eq!(feed.title.as_deref(), Some("Prefixed"));
-        let tasks = feed_tasks(feed, None, &HashSet::new()).unwrap();
+        let tasks = feed_tasks(feed, None, &Done::default()).unwrap();
         assert_eq!(names(&tasks), ["2026-02-01 Only.mp3"]);
     }
 
@@ -1094,7 +1150,7 @@ mod tests {
 </channel></rss>"#,
             "https://s.example/feed",
         );
-        let tasks = feed_tasks(feed.unwrap().unwrap(), None, &HashSet::new()).unwrap();
+        let tasks = feed_tasks(feed.unwrap().unwrap(), None, &Done::default()).unwrap();
         assert_eq!(names(&tasks), ["2026-09-27 Interview with Dr. Smith.mp3", "play.wma"]);
     }
 
