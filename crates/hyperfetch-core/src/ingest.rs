@@ -142,17 +142,19 @@ pub async fn input_tokens(line: &str) -> Vec<String> {
 /// Parses one input (a batch line split on whitespace, or the command-line URLs) into tasks.
 ///
 /// The tokens are mirrors of one file (see [`link_task`]). A local or remote
-/// .metalink/.meta4/.torrent must stand alone and may yield several tasks, one per file.
+/// .metalink/.meta4/.torrent must stand alone and may yield several tasks, one per file. A
+/// remote .torrent none of whose files has an HTTP web seed yields the .torrent itself, for a
+/// torrent client.
 pub async fn ingest(tokens: &[impl AsRef<str>], http: &reqwest::Client) -> Result<Vec<Task>, String> {
     if let [token] = tokens {
         if let Some((source, kind)) = descriptor_source(token.as_ref()) {
-            let bytes = match source {
-                Source::Remote(url) => fetch(http, &url).await?,
-                Source::Local(path) => read_local(&path).await?,
+            let (bytes, remote) = match source {
+                Source::Remote(url) => (fetch(http, &url).await?, Some(url)),
+                Source::Local(path) => (read_local(&path).await?, None),
             };
             return match kind {
                 Descriptor::Metalink => metalink_tasks(&bytes),
-                Descriptor::Torrent => torrent_tasks(&bytes),
+                Descriptor::Torrent => torrent_tasks(&bytes, remote.as_ref()),
             };
         }
     }
@@ -274,8 +276,14 @@ fn metalink_tasks(bytes: &[u8]) -> Result<Vec<Task>, String> {
         .collect()
 }
 
-fn torrent_tasks(bytes: &[u8]) -> Result<Vec<Task>, String> {
+/// One task per torrent file with HTTP web seeds. When no file has any, the torrent at `remote`
+/// (where it was fetched from, if it was) is the one download: a torrent client takes it from
+/// there.
+fn torrent_tasks(bytes: &[u8], remote: Option<&Url>) -> Result<Vec<Task>, String> {
     let info = torrent::parse_torrent_bytes(bytes)?;
+    if let Some(url) = remote.filter(|_| info.files.iter().all(|f| f.urls.is_empty())) {
+        return Ok(vec![Task { urls: vec![url.clone()], ..Task::default() }]);
+    }
     let single_file = matches!(&info.files[..], [f] if f.path == [info.name.clone()]);
     info.files
         .iter()
@@ -459,13 +467,21 @@ mod tests {
     fn multi_file_torrent_becomes_one_task_per_file() {
         let torrent = b"d8:url-list20:https://s.example/d/4:infod5:filesld6:lengthi3e4:pathl1:a5:x.binee\
 d6:lengthi4e4:pathl5:y.bineee4:name4:root12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaaee";
-        let tasks = torrent_tasks(torrent).unwrap();
+        let tasks = torrent_tasks(torrent, None).unwrap();
         assert_eq!(tasks.len(), 2);
         assert_eq!(tasks[0].name, Some(Path::new("root").join("a").join("x.bin")));
         assert_eq!(tasks[1].urls[0].as_str(), "https://s.example/d/root/y.bin");
+    }
 
+    /// A torrent without HTTP web seeds cannot be downloaded over HTTP; a remote one is then
+    /// saved itself, for a torrent client, as the link stands for that file.
+    #[test]
+    fn a_remote_torrent_without_web_seeds_is_saved_itself() {
         let no_seeds = b"d4:infod6:lengthi3e4:name5:x.bin12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaaee";
-        assert!(torrent_tasks(no_seeds).unwrap_err().contains("no HTTP web seeds"));
+        assert!(torrent_tasks(no_seeds, None).unwrap_err().contains("no HTTP web seeds"));
+        let url = Url::parse("https://releases.example/x.bin.torrent").unwrap();
+        let tasks = torrent_tasks(no_seeds, Some(&url)).unwrap();
+        assert_eq!(tasks, [Task { urls: vec![url], ..Task::default() }]);
     }
 
     #[test]
@@ -476,7 +492,7 @@ d6:lengthi4e4:pathl5:y.bineee4:name4:root12:piece lengthi16384e6:pieces20:aaaaaa
             name.len(),
             name
         );
-        let tasks = torrent_tasks(torrent.as_bytes()).unwrap();
+        let tasks = torrent_tasks(torrent.as_bytes(), None).unwrap();
         assert_eq!(tasks[0].name, Some(PathBuf::from("_[31mRED_[0m_.bin")));
 
         let hash = "0123456789abcdef0123456789abcdef01234567";

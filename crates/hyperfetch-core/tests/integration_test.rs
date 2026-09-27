@@ -2346,3 +2346,23 @@ async fn test_a_remote_torrent_lists_every_file_of_its_web_seed() {
     assert_eq!(names, [Path::new("pack").join("sub").join("a.bin"), Path::new("pack").join("b.bin")]);
     assert_eq!(tasks[0].urls, [seed.join("pack/sub/a.bin").unwrap()]);
 }
+
+/// A remote torrent none of whose files has an HTTP web seed is downloaded itself, for a torrent
+/// client, instead of being refused.
+#[tokio::test]
+async fn test_a_remote_torrent_without_web_seeds_is_downloaded_itself() {
+    use hyperfetch_core::ingest::{descriptor_client, ingest};
+    let _history = setup().await;
+    let torrent = b"d4:infod6:lengthi3e4:name5:x.iso12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaaee".to_vec();
+    let document = serve(Arc::new(Mock::new(torrent.clone())), "x.iso.torrent").await;
+
+    let tasks = ingest(&[document.as_str()], &descriptor_client(None).unwrap()).await.expect("the torrent is read");
+    let [task] = &tasks[..] else { panic!("the torrent itself: {:?}", tasks) };
+    assert_eq!((&task.urls, &task.name, task.from_document), (&vec![document.clone()], &None, false));
+
+    let temp = tempdir().unwrap();
+    let engine = DownloadEngine::new(task.urls.clone(), options(temp.path(), 2, 64 * KB));
+    let path = run(&engine, None).await.expect("download should succeed");
+    assert_eq!(path, temp.path().join("x.iso.torrent"));
+    assert_file(&path, &torrent);
+}
