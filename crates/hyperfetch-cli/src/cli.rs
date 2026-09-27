@@ -59,7 +59,8 @@ pub struct Args {
     #[arg(short = 'v', long = "verbose", action = ArgAction::Count)]
     pub verbose: u8,
 
-    /// Speed limit per download in bytes/s, e.g. 500K, 2M, 1.5MiB (K/M/G are powers of 1024; 0 = unlimited)
+    /// Speed limit in bytes/s for all running downloads (-j) together, e.g. 500K, 2M, 1.5MiB (K/M/G
+    /// are powers of 1024; 0 = unlimited)
     #[arg(long = "max-speed", value_name = "RATE", value_parser = parse_speed)]
     pub max_speed: Option<u64>,
 

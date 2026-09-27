@@ -17,7 +17,7 @@
 - Work stealing is decided by time: a worker that finishes early takes over the part of the slowest chunk that it can finish sooner, split where both finish together, and takes over at once a chunk whose connection has gone silent for 2 s (or 4 answer times).
 - Several mirror URLs of the same file are used together. The download starts with the first mirror that answers with range support, and the others join as their probes come back. A mirror that reports a different size or a different strong ETag is dropped, so bytes from different files are never mixed.
 - Chunk requests go straight to where a mirror redirects (GitHub releases, SourceForge, Dropbox), and back to the mirror's own URL if that target expires.
-- An optional speed limit (`--max-speed`) is shared by all connections of a download, HLS segments and the streams of a media download included.
+- An optional speed limit (`--max-speed`) is shared by all connections of a download, HLS segments and the streams of a media download included, and by all downloads running at once (a batch, the GUI queue).
 - Batches run 4 downloads at once by default (`-j`). All running downloads together open at most 64 connections to one host (`--max-connections-per-host`), probes and HLS playlist, key and segment requests included, and the downloads of a batch share their HTTP connections and TLS sessions, so later files skip the handshakes.
 - What a host was seen to do is remembered for 10 minutes: whether it takes ranges, whether it caps each connection's speed (and at what rate), how long a new connection takes, and a connection cap learned from 429 answers. Later downloads from it start at the right width without measuring again.
 
@@ -96,7 +96,7 @@ All `URLS` given on the command line are **mirrors of one file**. To download se
 | `-o, --output FILE` | Output file name for a single download. It is relative to `-d` when both are given. | name from the server |
 | `-s, --split N` | Connections per download (1-64). | `16` |
 | `-c, --chunk-size MIB` | Base chunk size in MiB (1-1024). | `4` |
-| `--max-speed RATE` | Speed limit per download, e.g. `500K`, `2M`, `1.5MiB`. K/M/G are powers of 1024, and `0` means unlimited. | unlimited |
+| `--max-speed RATE` | Speed limit for all running downloads together (`-j`), e.g. `500K`, `2M`, `1.5MiB`. K/M/G are powers of 1024, and `0` means unlimited. | unlimited |
 | `--max-retries N` | Failed attempts allowed per chunk before the download gives up. | `8` |
 | `--stall-timeout SECS` | Seconds without data before a connection is retried (1-3600). | `30` |
 | `--checksum SUM` | Expected checksum: `sha256:HEX`, `md5:HEX`, `blake3:HEX` or bare hex. Only for a single download or `--verify`. | |
@@ -220,7 +220,7 @@ The service downloads every line of the queue, two at a time, and then exits. Fi
 - **Batch queue:** add one download per line (mirrors of one file go on one line, separated by spaces). Each item keeps the folder and options it was added with. Auto-run handles 1–8 downloads at once (4 by default; a number you saved before is kept), with per-item Start, Pause, Resume, Retry, Remove, Open and Folder. Downloads share their HTTP connections and TLS sessions.
 - **Verify & Repair:** checks a file against the BLAKE3 hash recorded when it was downloaded. Results are VERIFIED, INCOMPLETE (with a cancellable repair of just the missing ranges), CHECKSUM MISMATCH or UNVERIFIED.
 - **Clipboard watcher:** offers "Download Now" / "Add to Queue" for copied links. It ignores links the app copied itself and magnets without web seeds.
-- **Advanced options:** speed limit, retries per chunk, stall timeout, connections per host (64 by default, 0 = no limit), flushing finished files to disk (off by default, see above), proxy, cookies (file or browser), Authorization header, checksum and media quality.
+- **Advanced options:** speed limit (for all running downloads together), retries per chunk, stall timeout, connections per host (64 by default, 0 = no limit), flushing finished files to disk (off by default, see above), proxy, cookies (file or browser), Authorization header, checksum and media quality.
 - **Remembers settings:** folder, connections and advanced options are stored in `gui-settings.json` next to the history. The Authorization header and checksum are never saved.
 - **Safe to close:** closing the window pauses running downloads and saves their state (waiting at most 3 s). It also stops yt-dlp. The app uses no CPU while idle.
 

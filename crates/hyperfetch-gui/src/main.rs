@@ -15,7 +15,7 @@ use std::time::{Duration, Instant, SystemTime};
 use eframe::egui;
 use egui::Color32;
 use hyperfetch_core::chunk::ChunkSnapshot;
-use hyperfetch_core::engine::{build_client, ClientKey, DownloadEngine, DownloadOptions, EngineSnapshot};
+use hyperfetch_core::engine::{build_client, ClientKey, DownloadEngine, DownloadOptions, EngineSnapshot, SharedLimits};
 use hyperfetch_core::history::{DownloadHistoryManager, HistoryEntry};
 use hyperfetch_core::queue::{DownloadQueue, QueueItem};
 use hyperfetch_core::verify::{self, BuildVerificationResult};
@@ -850,12 +850,14 @@ async fn discard_leftovers(final_path: PathBuf) -> Result<usize, String> {
 }
 
 /// Engines that share one HTTP client per [`ClientKey`], so a download reuses the connections and
-/// TLS sessions of earlier ones (see [`cached_client`]).
+/// TLS sessions of earlier ones (see [`cached_client`]), and the speed limit: downloads running at
+/// once stay within it together.
 fn shared_clients() -> EngineMaker {
     let cache = Mutex::new(HashMap::new());
+    let limits = SharedLimits::default();
     Arc::new(move |urls, options| {
         let client = cached_client(&cache, &options, build_client)?;
-        Ok(DownloadEngine::with_client(urls, options, client))
+        Ok(DownloadEngine::with_client(urls, options, client).sharing_limit(&limits))
     })
 }
 
