@@ -1638,7 +1638,7 @@ dependencies = [
 
 [[package]]
 name = "hyperfetch-cli"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "clap",
  "futures-util",
@@ -1653,7 +1653,7 @@ dependencies = [
 
 [[package]]
 name = "hyperfetch-core"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "aes",
  "base64",
@@ -1686,7 +1686,7 @@ dependencies = [
 
 [[package]]
 name = "hyperfetch-gui"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "arboard",
  "eframe",
