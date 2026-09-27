@@ -904,7 +904,9 @@ impl SmartResolver {
         })
     }
 
-    /// Generates browser-grade anti-QoS headers to prevent CDNs from throttling traffic.
+    /// Generates browser-grade anti-QoS headers to prevent CDNs from throttling traffic. A
+    /// download the user asked for is no request made by another site (`Sec-Fetch-Site: none`):
+    /// Google's download hosts refuse `cross-site` with 403 (checked live).
     pub fn default_anti_qos_headers() -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -920,7 +922,7 @@ impl SmartResolver {
         headers.insert("Sec-Ch-Ua-Platform", HeaderValue::from_static("\"Windows\""));
         headers.insert("Sec-Fetch-Dest", HeaderValue::from_static("empty"));
         headers.insert("Sec-Fetch-Mode", HeaderValue::from_static("cors"));
-        headers.insert("Sec-Fetch-Site", HeaderValue::from_static("cross-site"));
+        headers.insert("Sec-Fetch-Site", HeaderValue::from_static("none"));
         headers
     }
 }
@@ -1572,6 +1574,14 @@ mod tests {
             assert_eq!(code_host_raw_url(&page), None, "{page}");
             assert!(!CodeHostResolver.can_handle(&page), "{page}");
         }
+    }
+
+    /// drive.usercontent.google.com answers a range request 403 with `Sec-Fetch-Site: cross-site`
+    /// and 206 with `none` (checked with curl), so a download says it is the user's own.
+    #[test]
+    fn test_downloads_are_not_sent_as_cross_site_requests() {
+        let headers = SmartResolver::default_anti_qos_headers();
+        assert_eq!(headers.get("Sec-Fetch-Site").map(|v| v.to_str().unwrap()), Some("none"));
     }
 
     /// Codeberg refuses the browser User-Agent the engine sends elsewhere ("403 Access denied,
