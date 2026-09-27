@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::chunk::{ChunkManager, ChunkSnapshot};
-use crate::history::{DownloadHistoryManager, HistoryEntry, HistoryStatus};
+use crate::history::{redact_url, DownloadHistoryManager, HistoryEntry, HistoryStatus};
 use crate::hls::HlsError;
 use crate::hosts::{self, HostKey, HostProfile, HostSlot};
 use crate::mirror::MirrorRacer;
@@ -2568,8 +2568,9 @@ fn plan_target(
 }
 
 /// An existing file counts as this download only if the checksum says so, or history recorded
-/// this exact path completing from one of these URLs with this size, and the server's
-/// Last-Modified is not newer than that download. `history` is consulted only in that last case.
+/// this exact path completing from one of these URLs (as history saves them, without secrets)
+/// with this size, and the server's Last-Modified is not newer than that download. `history` is
+/// consulted only in that last case.
 fn already_downloaded<'h>(
     path: &Path,
     remote: &ProbeInfo,
@@ -2591,6 +2592,7 @@ fn already_downloaded<'h>(
     }
     let path = absolute(path);
     let modified = remote.last_modified.as_deref().and_then(parse_http_date);
+    let urls: Vec<String> = urls.iter().map(|u| redact_url(u)).collect();
     history().entries().iter().any(|e| {
         e.status == HistoryStatus::Completed
             && absolute(&e.file_path) == path
@@ -4388,6 +4390,21 @@ mod tests {
         let mut newer = remote(1000);
         newer.last_modified = Some("Fri, 01 Jan 2100 00:00:00 GMT".into());
         assert!(matches!(plan_target(&base, &newer, &urls(), &history, None).unwrap(), Plan::Fetch { .. }));
+    }
+
+    #[test]
+    fn test_plan_finds_the_history_of_a_link_with_secrets() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().join("file.bin");
+        std::fs::write(&base, vec![7u8; 1000]).unwrap();
+        let history = dir.path().join("h.json");
+        let signed = vec!["http://example.com/file.bin?X-Amz-Signature=abc".to_string()];
+        DownloadHistoryManager::load_from_path(&history).add_or_update(completed_entry(&base, 1000, signed.clone()));
+        // History saved the link without its signature; the live link is compared the same way.
+        assert!(matches!(
+            plan_target(&base, &remote(1000), &signed, &history, None).unwrap(),
+            Plan::AlreadyDone(p) if p == base
+        ));
     }
 
     #[test]
