@@ -90,7 +90,9 @@ pub struct Chunk {
     /// once and settles nothing, since the chunk is no longer its own.
     pub(crate) revoked: CancellationToken,
     /// Since when the attempt's worker has been waiting for the server without a byte; `None`
-    /// while it is busy (writing, rate limited) rather than waiting.
+    /// while it is busy (writing, rate limited) rather than waiting, and until the attempt has its
+    /// answer: a server slow to answer is no silent one, and the wait for an answer has the stall
+    /// timeout of its own.
     waiting: Arc<Mutex<Option<Instant>>>,
     not_before: Option<Instant>,
     assigned_at: Option<Instant>,
@@ -344,15 +346,17 @@ impl ChunkManager {
         chunk.not_before = None;
         chunk.assigned_at = Some(now);
         chunk.assigned_offset = chunk.current_offset.load(Ordering::SeqCst);
-        chunk.wait_for_server(now);
+        chunk.busy();
         chunk.clone()
     }
 
     /// Hands everything left of the in-flight chunk whose worker has waited longest for the server
-    /// without a byte to an idle thief, if that wait is at least `min_silence(chunk's mirror)`. The
-    /// silent attempt is revoked. What it wrote becomes a completed chunk; the rest keeps the
-    /// chunk's id and gets new offsets and a new token, so the revoked worker, which still holds
-    /// the old ones, can neither move nor settle what the thief now owns.
+    /// without a byte, once its answer came, to an idle thief, if that wait is at least
+    /// `min_silence(chunk's mirror)`. A chunk still waiting for its answer is never taken: the
+    /// thief's request would wait as long, and be taken over in turn. The silent attempt is
+    /// revoked. What it wrote becomes a completed chunk; the rest keeps the chunk's id and gets new
+    /// offsets and a new token, so the revoked worker, which still holds the old ones, can neither
+    /// move nor settle what the thief now owns.
     pub fn take_over_silent(
         &mut self,
         thief_worker_id: usize,
@@ -742,10 +746,18 @@ mod tests {
 
     const SILENT: Duration = Duration::from_secs(2);
 
+    /// The next chunk for `worker_id` on mirror `mirror_id`, whose answer has come: its worker
+    /// waits for the server's bytes from now on, as a worker receiving it does.
+    fn answered(manager: &mut ChunkManager, worker_id: usize, mirror_id: usize) -> Chunk {
+        let chunk = manager.get_next_work(worker_id, mirror_id).unwrap();
+        chunk.wait_for_server(Instant::now());
+        chunk
+    }
+
     #[test]
     fn test_silent_chunk_is_taken_over_keeping_what_it_wrote() {
         let mut manager = ChunkManager::new(4 * MB, 4 * MB).unwrap();
-        let silent = manager.get_next_work(0, 0).unwrap();
+        let silent = answered(&mut manager, 0, 0);
         silent.current_offset.store(MB, Ordering::SeqCst);
         manager.backdate(0, Duration::from_secs(3));
 
@@ -760,6 +772,8 @@ mod tests {
         silent.current_offset.store(2 * MB, Ordering::SeqCst);
         assert_eq!(manager.total_downloaded(), MB);
         assert!(manager.take_over_silent(3, 0, |_| SILENT).is_none(), "the thief's attempt has just begun");
+        manager.backdate(0, Duration::from_secs(3));
+        assert!(manager.take_over_silent(3, 0, |_| SILENT).is_none(), "and waits for its answer");
 
         taken.current_offset.store(4 * MB, Ordering::SeqCst);
         manager.mark_completed(taken.id).unwrap();
@@ -769,10 +783,10 @@ mod tests {
 
     #[test]
     fn test_silent_chunk_that_wrote_nothing_is_handed_over_whole() {
-        // Stuck before its answer arrived, at the very start of the file.
+        // Its answer came, and then not a byte, at the very start of the file.
         let mut manager = ChunkManager::new(2 * MB, MB).unwrap();
-        let silent = manager.get_next_work(0, 0).unwrap();
-        let other = manager.get_next_work(1, 0).unwrap();
+        let silent = answered(&mut manager, 0, 0);
+        let other = answered(&mut manager, 1, 0);
         manager.backdate(0, Duration::from_secs(3));
 
         let taken = manager.take_over_silent(2, 0, |_| SILENT).unwrap();
@@ -789,11 +803,33 @@ mod tests {
     }
 
     #[test]
+    fn test_a_chunk_waiting_for_its_answer_is_not_taken_over() {
+        // A server that takes long to answer: a new request would wait as long, and be taken
+        // over in turn, again and again. The wait for an answer has the stall timeout instead.
+        let mut manager = ChunkManager::new(2 * MB, MB).unwrap();
+        let waiting = manager.get_next_work(0, 0).unwrap();
+        manager.backdate(0, Duration::from_secs(60));
+        assert!(manager.take_over_silent(1, 0, |_| SILENT).is_none());
+        assert!(!waiting.revoked.is_cancelled());
+
+        // A retry waits for an answer of its own, however long the attempt before it waited for
+        // bytes.
+        waiting.wait_for_server(Instant::now());
+        manager.backdate(0, Duration::from_secs(3));
+        manager.mark_failed(0, "stalled", Duration::ZERO, false).unwrap();
+        let retry = manager.get_next_work(1, 0).unwrap();
+        assert_eq!(retry.id, 0);
+        manager.backdate(0, Duration::from_secs(3));
+        assert!(manager.take_over_silent(2, 0, |_| SILENT).is_none());
+        assert!(!retry.revoked.is_cancelled());
+    }
+
+    #[test]
     fn test_only_a_long_silence_is_taken_over() {
         let mut manager = ChunkManager::new(3 * MB, MB).unwrap();
-        let quiet = manager.get_next_work(0, 0).unwrap();
-        let quieter = manager.get_next_work(1, 1).unwrap();
-        let working = manager.get_next_work(2, 0).unwrap();
+        let quiet = answered(&mut manager, 0, 0);
+        let quieter = answered(&mut manager, 1, 1);
+        let working = answered(&mut manager, 2, 0);
         manager.backdate(0, Duration::from_secs(3));
         manager.backdate(1, Duration::from_secs(5));
         manager.backdate(2, Duration::from_secs(9));
@@ -807,8 +843,8 @@ mod tests {
         assert!(!quieter.revoked.is_cancelled() && !working.revoked.is_cancelled());
         // Of several silent chunks, the one silent longest goes first.
         let mut manager = ChunkManager::new(2 * MB, MB).unwrap();
-        manager.get_next_work(0, 0).unwrap();
-        manager.get_next_work(1, 0).unwrap();
+        answered(&mut manager, 0, 0);
+        answered(&mut manager, 1, 0);
         manager.backdate(0, Duration::from_secs(3));
         manager.backdate(1, Duration::from_secs(4));
         assert_eq!(manager.take_over_silent(2, 0, |_| SILENT).unwrap().id, 1);
@@ -817,7 +853,7 @@ mod tests {
     #[test]
     fn test_a_silent_chunk_that_finished_meanwhile_is_completed_not_handed_over() {
         let mut manager = ChunkManager::new(MB, MB).unwrap();
-        let silent = manager.get_next_work(0, 0).unwrap();
+        let silent = answered(&mut manager, 0, 0);
         manager.backdate(0, Duration::from_secs(3));
         // The worker's last batch lands just as its chunk is picked to be taken over.
         let lands = |_| {

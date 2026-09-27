@@ -1014,6 +1014,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let url = Url::parse("http://127.0.0.1:9/f").unwrap();
         let (worker, old, _events) = test_worker(&url, &dir.path().join("f.part"), 1 << 20);
+        // Its answer came, then nothing more.
+        old.wait_for_server(Instant::now());
         let taken = {
             let mut chunks = worker.shared.chunks.lock();
             chunks.backdate(0, Duration::from_secs(3));

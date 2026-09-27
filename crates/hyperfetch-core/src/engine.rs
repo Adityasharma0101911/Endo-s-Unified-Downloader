@@ -1606,10 +1606,10 @@ struct ProbeInfo {
     /// Bytes the probe's connection moves, capped at the rate it was measured or known to be, in
     /// the time a new connection takes to answer. `None` when no cap is known.
     per_setup: Option<u64>,
-    /// What a new request to `final_url` waits for its answer: how long the ranged GET's first
-    /// try waited, when it went there directly. `None` after a retry (which may reuse the
-    /// connection) or a redirect (whose hops chunk requests skip), or when HEAD or a plain GET
-    /// had to stand in for it.
+    /// What a new request to `final_url` waits for its answer, at most: how long the ranged GET's
+    /// first try waited, the hops of a redirect included, which chunk requests skip. `None` after
+    /// a retry (which may reuse the connection, and so say too little), or when HEAD or a plain
+    /// GET had to stand in for it.
     answer_time: Option<Duration>,
     /// The headers of the answer that decided the rest: what it served shows there.
     headers: HeaderMap,
@@ -1862,8 +1862,10 @@ async fn probe_with(
 
     let sources: Vec<&Response> = std::iter::once(&get).chain(head.as_ref()).collect();
     let mut info = ProbeInfo::describe(url, &sources);
-    // Chunk requests go straight to the final URL, skipping the hops the probe took to get there.
-    info.answer_time = setup.filter(|_| info.final_url == *url);
+    // Chunk requests go straight to the final URL, skipping the hops the probe took to get there:
+    // after a redirect this overstates their wait, which errs on the safe side, as a mirror
+    // taken for quicker than it is gets its requests taken over and split before they can answer.
+    info.answer_time = setup;
     let content_range = get.headers().get(CONTENT_RANGE).and_then(|v| v.to_str().ok());
     let holds = match get.status() {
         StatusCode::PARTIAL_CONTENT => match content_range.map(ByteRange::parse_content_range) {
@@ -1893,13 +1895,14 @@ async fn probe_with(
         }
     };
     // What the host answering the GET was seen to do: honour the range or not, and take this long
-    // to answer over a new connection. An unknown length or an empty file tells neither, and nor
-    // does the whole file for a range that reaches past its end: a server may send that as it is.
+    // to answer over a new connection straight to it. An unknown length or an empty file tells
+    // neither range support nor its lack, and nor does the whole file for a range that reaches
+    // past its end: a server may send that as it is.
     let ranges = match get.status() {
         StatusCode::OK => info.size.is_none_or(|size| size > asked).then_some(false),
         _ => info.accepts_ranges.then_some(true),
     };
-    let setup_time = info.answer_time.filter(|_| cold);
+    let setup_time = info.answer_time.filter(|_| cold && info.final_url == *url);
     hosts::record(get.url(), HostProfile { accepts_ranges: ranges, setup_time, ..Default::default() });
 
     let own = |name: HeaderName| get.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_string);
@@ -3971,17 +3974,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_only_a_direct_first_try_seeds_a_mirrors_answer_time() {
+    async fn test_only_a_first_try_seeds_a_mirrors_answer_time() {
         let base = file_server(vec![7u8; 4096], Duration::ZERO).await;
         let client = Client::new();
         let probe = |path: &str| {
             let (client, url) = (client.clone(), base.join(path).unwrap());
             async move { probe_url(&client, None, &url, false, 0).await.unwrap().0 }
         };
-        assert!(probe("file.bin").await.answer_time.is_some());
-        // Chunk requests skip the redirect the probe went through, so its time says nothing.
+        // Chunk requests skip the redirect the probe went through: its wait overstates theirs, but
+        // unlike an assumed one never makes a slow target look quick. What a new connection to the
+        // target's host needs is only learned from a request straight to it.
         let moved = probe("moved/file.bin").await;
-        assert_eq!((moved.final_url, moved.answer_time), (base.join("file.bin").unwrap(), None));
+        assert_eq!(moved.final_url, base.join("file.bin").unwrap());
+        let waited = moved.answer_time.expect("the redirected first try's wait");
+        assert_eq!(hosts::profile(&base).setup_time, None);
+        let racer = build_racer(&[moved]);
+        assert_eq!(racer.get_mirror(0).unwrap().ttfb_ewma_ms, waited.as_secs_f64() * 1000.0);
+        assert!(probe("file.bin").await.answer_time.is_some());
         // A retry may have reused the connection of the try before.
         let busy = probe("busy/file.bin").await;
         assert!(busy.accepts_ranges);
