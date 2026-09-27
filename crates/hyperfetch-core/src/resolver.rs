@@ -500,9 +500,10 @@ pub struct GoogleDocsResolver;
 const GOOGLE_DOCS_VIEWS: &[&str] = &["edit", "view", "preview", "htmlview", "mobilebasic", "present", "embed", "copy", "comment"];
 
 /// The export of the document `url` links to, rewritten without a request, as Google's own
-/// File > Download does it: a document as .docx, a spreadsheet as .xlsx, or as .csv of the one
-/// sheet the link names (`gid`), a presentation as .pptx; the account it names (`authuser`) is
-/// kept. An export link is kept in the format it asks for. Other links on a document (gviz
+/// File > Download does it: a document as .docx, a spreadsheet as .xlsx with every sheet (the
+/// sheet a link names, `gid`, is only the one the editor opened on, and Sheets names one in every
+/// editor link), a presentation as .pptx; the account it names (`authuser`) is kept. An export
+/// link is kept in the format it asks for (`format=csv&gid=` for one sheet). Other links on a document (gviz
 /// queries, /pub copies) already give what they are for, so they are left alone. Exports are
 /// made on the fly: one connection, no known size.
 fn google_docs_export(url: &Url) -> Option<Url> {
@@ -539,23 +540,12 @@ fn google_docs_export(url: &Url) -> Option<Url> {
     let authuser = url.query_pairs().find(|(k, _)| k == "authuser").map(|(_, v)| v.into_owned());
     {
         let mut query = export.query_pairs_mut();
-        query.clear();
-        match sheet_gid(url).filter(|_| kind == "spreadsheets") {
-            Some(gid) => query.append_pair("format", "csv").append_pair("gid", &gid),
-            None => query.append_pair("format", format),
-        };
+        query.clear().append_pair("format", format);
         if let Some(user) = authuser {
             query.append_pair("authuser", &user);
         }
     }
     Some(export)
-}
-
-/// The sheet a spreadsheet link names: `gid` in its query or its fragment (`#gid=123`).
-fn sheet_gid(url: &Url) -> Option<String> {
-    let in_query = url.query_pairs().find(|(k, _)| k == "gid").map(|(_, v)| v.into_owned());
-    let in_fragment = || url.fragment()?.split('&').find_map(|p| p.strip_prefix("gid=")).map(str::to_string);
-    in_query.or_else(in_fragment).filter(|gid| !gid.is_empty() && gid.bytes().all(|b| b.is_ascii_digit()))
 }
 
 impl HostResolver for GoogleDocsResolver {
@@ -1600,11 +1590,10 @@ mod tests {
             (format!("document/u/0/d/{doc}/edit"), format!("document/u/0/d/{doc}/export?format=docx")),
             (format!("document/d/{doc}"), format!("document/d/{doc}/export?format=docx")),
             (format!("spreadsheets/d/{sheet}/edit?usp=sharing"), format!("spreadsheets/d/{sheet}/export?format=xlsx")),
-            (format!("spreadsheets/d/{sheet}/edit#gid=0"), format!("spreadsheets/d/{sheet}/export?format=csv&gid=0")),
-            (
-                format!("spreadsheets/u/1/d/{sheet}/edit?gid=1234#gid=1234"),
-                format!("spreadsheets/u/1/d/{sheet}/export?format=csv&gid=1234"),
-            ),
+            // The whole workbook, whichever sheet the editor was on: Sheets names it in the address
+            // bar's link, and every sheet but that one would be lost in a .csv.
+            (format!("spreadsheets/d/{sheet}/edit#gid=0"), format!("spreadsheets/d/{sheet}/export?format=xlsx")),
+            (format!("spreadsheets/u/1/d/{sheet}/edit?gid=1234#gid=1234"), format!("spreadsheets/u/1/d/{sheet}/export?format=xlsx")),
             (format!("spreadsheets/d/{sheet}/htmlview#gid=abc"), format!("spreadsheets/d/{sheet}/export?format=xlsx")),
             (format!("presentation/d/{deck}/edit#slide=id.p"), format!("presentation/d/{deck}/export?format=pptx")),
             (format!("presentation/u/1/d/{deck}/view"), format!("presentation/u/1/d/{deck}/export?format=pptx")),
@@ -1619,10 +1608,11 @@ mod tests {
             (format!("document/d/{doc}/edit?usp=sharing&authuser=1"), format!("document/d/{doc}/export?format=docx&authuser=1")),
             (
                 format!("spreadsheets/d/{sheet}/edit?authuser=me%40example.com#gid=7"),
-                format!("spreadsheets/d/{sheet}/export?format=csv&gid=7&authuser=me%40example.com"),
+                format!("spreadsheets/d/{sheet}/export?format=xlsx&authuser=me%40example.com"),
             ),
             // An export in a format of the user's choosing is kept; a gid means nothing to a document.
             (format!("document/d/{doc}/export?format=pdf#top"), format!("document/d/{doc}/export?format=pdf")),
+            (format!("spreadsheets/d/{sheet}/export?format=csv&gid=7"), format!("spreadsheets/d/{sheet}/export?format=csv&gid=7")),
             (format!("presentation/d/{deck}/export/pdf"), format!("presentation/d/{deck}/export/pdf")),
             (format!("document/d/{doc}/edit#gid=5"), format!("document/d/{doc}/export?format=docx")),
         ] {
