@@ -936,7 +936,7 @@ fn history_tab(app: &mut App, ui: &mut egui::Ui) {
 
     ui.add_space(8.0);
     card().show(ui, |ui| {
-        let search = app.history_search.trim().to_lowercase();
+        let search = util::history_search_key(&app.history_search);
         let entries: Vec<_> = app
             .history
             .iter()
@@ -978,9 +978,14 @@ fn history_tab(app: &mut App, ui: &mut egui::Ui) {
                             });
                         }
                         if ui.button(RichText::new("Redownload").size(11.0)).clicked() {
-                            app.new_download();
-                            app.url_input = entry.urls.join(" ");
-                            app.tab = Tab::Downloader;
+                            match util::redownload_input(&entry.urls) {
+                                Ok(input) => {
+                                    app.new_download();
+                                    app.url_input = input;
+                                    app.tab = Tab::Downloader;
+                                }
+                                Err(e) => app.notice = Some(Err(e)),
+                            }
                         }
                         let verify = egui::Button::new(RichText::new("Verify & Repair").size(11.0).color(CYAN));
                         if ui.add_enabled(idle, verify).clicked() {
