@@ -29,6 +29,10 @@ pub struct Task {
     /// Listed by a .metalink, .meta4 or .torrent, so its hosts are ones the user never named:
     /// the Authorization header the user gave is not sent to them.
     pub from_document: bool,
+    /// The .metalink, .meta4 or .torrent link itself, left to the engine to download as a file
+    /// (its host would not hand it over, or the torrent has no HTTP web seeds): a checksum given
+    /// for the file it lists is not its own.
+    pub document_itself: bool,
 }
 
 impl Task {
@@ -147,25 +151,17 @@ pub async fn input_tokens(line: &str) -> Vec<String> {
 /// .metalink/.meta4/.torrent must stand alone and may yield several tasks, one per file. A
 /// remote .torrent none of whose files has an HTTP web seed yields the .torrent itself, for a
 /// torrent client. A remote document is fetched from where its host's resolver says the file is
-/// (a GitHub /blob/ page's /raw/ link, a Dropbox share's `dl=1`); one whose host asks for a login
-/// or answers with a web page yields the link itself, for the engine, which sends the user's
-/// cookies and Authorization and refuses a page in place of the file. `Ok` is never empty.
+/// (a GitHub /blob/ page's /raw/ link, a Dropbox share's `dl=1`); one whose host answers with a
+/// client error (a login, a private GitHub file's 404) or a web page yields the link itself, for
+/// the engine, which sends the user's cookies and Authorization and refuses a page in place of the
+/// file. The link itself is always the one typed, never where its resolver led. `Ok` is never
+/// empty.
 pub async fn ingest(tokens: &[impl AsRef<str>], http: &reqwest::Client) -> Result<Vec<Task>, String> {
     if let [token] = tokens {
         if let Some((source, kind)) = descriptor_source(token.as_ref()) {
-            let (bytes, remote) = match source {
-                Source::Remote(url) => {
-                    let url = resolver::SmartResolver::resolve_mirrors(http, &url).await.into_iter().next().unwrap_or(url);
-                    match fetch(http, &url).await? {
-                        Some(bytes) => (bytes, Some(url)),
-                        None => return link_task(tokens).map(|task| vec![task]),
-                    }
-                }
-                Source::Local(path) => (read_local(&path).await?, None),
-            };
-            return match kind {
-                Descriptor::Metalink => metalink_tasks(&bytes),
-                Descriptor::Torrent => torrent_tasks(&bytes, remote.as_ref()),
+            return match source {
+                Source::Remote(typed) => remote_tasks(http, typed, kind).await,
+                Source::Local(path) => document_tasks(kind, &read_local(&path).await?, None),
             };
         }
     }
@@ -232,17 +228,56 @@ fn too_large(what: impl std::fmt::Display) -> String {
     format!("{} is larger than {} bytes", what, MAX_DESCRIPTOR_BYTES)
 }
 
-/// The document at `url`; None when its host asks for a login (401, 403) or answers with a web
-/// page, which the engine is left to download.
-async fn fetch(http: &reqwest::Client, url: &Url) -> Result<Option<Vec<u8>>, String> {
+/// The tasks of the document at `typed`, fetched from where its host's resolver says the file is.
+/// The link itself when its host answers with a client error, or with a web page that is no
+/// such document: a host may label any file a page (PHP sends text/html unless told otherwise).
+async fn remote_tasks(http: &reqwest::Client, typed: Url, kind: Descriptor) -> Result<Vec<Task>, String> {
+    let url = resolver::SmartResolver::resolve_mirrors(http, &typed).await.into_iter().next().unwrap_or_else(|| typed.clone());
+    match fetch(http, &url).await? {
+        Some((bytes, labelled_page)) if !labelled_page || (!starts_like_html(&bytes) && parses(kind, &bytes)) => {
+            document_tasks(kind, &bytes, Some(&typed))
+        }
+        _ => {
+            tracing::info!("{} answered with an error or a web page: the download engine takes {}", url, typed);
+            Ok(vec![Task { urls: vec![typed], document_itself: true, ..Task::default() }])
+        }
+    }
+}
+
+/// The tasks the document `bytes` lists (see [`torrent_tasks`] for `remote`).
+fn document_tasks(kind: Descriptor, bytes: &[u8], remote: Option<&Url>) -> Result<Vec<Task>, String> {
+    match kind {
+        Descriptor::Metalink => metalink_tasks(bytes),
+        Descriptor::Torrent => torrent_tasks(bytes, remote),
+    }
+}
+
+/// Whether `bytes` read as a document of this kind.
+fn parses(kind: Descriptor, bytes: &[u8]) -> bool {
+    match kind {
+        Descriptor::Metalink => decode_text(bytes).and_then(|text| metalink::parse_metalink(&text)).is_ok(),
+        Descriptor::Torrent => torrent::parse_torrent_bytes(bytes).is_ok(),
+    }
+}
+
+/// Whether `body` opens as a web page: `<!doctype` or `<html`, after a BOM and whitespace.
+fn starts_like_html(body: &[u8]) -> bool {
+    let start = body.strip_prefix("\u{feff}".as_bytes()).unwrap_or(body).trim_ascii_start();
+    [&b"<!doctype"[..], b"<html"].iter().any(|tag| start.get(..tag.len()).is_some_and(|s| s.eq_ignore_ascii_case(tag)))
+}
+
+/// The document at `url` and whether its host labels it a web page; None when its host answers
+/// with a client error (401 or 403 for a login, 404 for a private GitHub repository's /raw/
+/// link), which the engine is left to download and report.
+async fn fetch(http: &reqwest::Client, url: &Url) -> Result<Option<(Vec<u8>, bool)>, String> {
     let fail = |e: reqwest::Error| format!("Cannot fetch {}: {}", url, e);
     let resp = http.get(url.clone()).send().await.map_err(fail)?;
-    let login = matches!(resp.status(), reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN);
-    if login || (resp.status().is_success() && resolver::html_type(resp.headers())) {
-        tracing::info!("{} answered HTTP {} with a login or a page: the download engine takes it", url, resp.status());
+    if resp.status().is_client_error() {
+        tracing::info!("{} answered HTTP {}", url, resp.status());
         return Ok(None);
     }
     let mut resp = resp.error_for_status().map_err(fail)?;
+    let labelled_page = resolver::html_type(resp.headers());
     if resp.content_length().is_some_and(|len| len > MAX_DESCRIPTOR_BYTES as u64) {
         return Err(too_large(url));
     }
@@ -253,7 +288,7 @@ async fn fetch(http: &reqwest::Client, url: &Url) -> Result<Option<Vec<u8>>, Str
             return Err(too_large(url));
         }
     }
-    Ok(Some(body))
+    Ok(Some((body, labelled_page)))
 }
 
 /// A local document, read only if it is a file no larger than a remote one may be: a renamed
@@ -290,18 +325,18 @@ fn metalink_tasks(bytes: &[u8]) -> Result<Vec<Task>, String> {
                 .iter()
                 .find_map(|algo| file.hashes.iter().find(|(t, _)| t == algo).map(|(t, h)| format!("{}:{}", t, h)));
             let name = Some(clean_path(file.name.split('/'))?);
-            Ok(Task { name, urls: file.urls, checksum, size: file.size, from_document: true })
+            Ok(Task { name, urls: file.urls, checksum, size: file.size, from_document: true, ..Task::default() })
         })
         .collect()
 }
 
 /// One task per torrent file with HTTP web seeds. When no file has any, the torrent at `remote`
-/// (where it was fetched from, if it was) is the one download: a torrent client takes it from
+/// (the link typed for it, if it was fetched) is the one download: a torrent client takes it from
 /// there.
 fn torrent_tasks(bytes: &[u8], remote: Option<&Url>) -> Result<Vec<Task>, String> {
     let info = torrent::parse_torrent_bytes(bytes)?;
     if let Some(url) = remote.filter(|_| info.files.iter().all(|f| f.urls.is_empty())) {
-        return Ok(vec![Task { urls: vec![url.clone()], ..Task::default() }]);
+        return Ok(vec![Task { urls: vec![url.clone()], document_itself: true, ..Task::default() }]);
     }
     // A BitTorrent v2-only torrent lists its files in a `file tree`, which is not read.
     if info.files.is_empty() {
@@ -537,7 +572,7 @@ d6:lengthi4e4:pathl5:y.bineee4:name4:root12:piece lengthi16384e6:pieces20:aaaaaa
         let (_dir, path) = write_temp("pack.torrent", v2_only);
         assert_eq!(run(path.to_str().unwrap()).unwrap_err(), err);
         let url = Url::parse("https://releases.example/pack.torrent").unwrap();
-        assert_eq!(torrent_tasks(v2_only, Some(&url)).unwrap(), [Task { urls: vec![url], ..Task::default() }]);
+        assert_eq!(torrent_tasks(v2_only, Some(&url)).unwrap(), [Task { urls: vec![url], document_itself: true, ..Task::default() }]);
     }
 
     /// A torrent without HTTP web seeds cannot be downloaded over HTTP; a remote one is then
@@ -548,7 +583,7 @@ d6:lengthi4e4:pathl5:y.bineee4:name4:root12:piece lengthi16384e6:pieces20:aaaaaa
         assert!(torrent_tasks(no_seeds, None).unwrap_err().contains("no HTTP web seeds"));
         let url = Url::parse("https://releases.example/x.bin.torrent").unwrap();
         let tasks = torrent_tasks(no_seeds, Some(&url)).unwrap();
-        assert_eq!(tasks, [Task { urls: vec![url], ..Task::default() }]);
+        assert_eq!(tasks, [Task { urls: vec![url], document_itself: true, ..Task::default() }]);
     }
 
     #[test]
