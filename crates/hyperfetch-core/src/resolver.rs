@@ -438,6 +438,29 @@ impl HtmlVideoResolver {
         })
     }
 
+    /// Hosts of link shorteners and mail link scanners: they answer a link with a redirect, so a
+    /// page from one is a preview or a warning, never what the link stands for. `*` stands for
+    /// any part of a host name. t.co is not among them: its page sends the browser on at once
+    /// (see `meta_refresh`).
+    pub const SHORTENER_HOSTS: &[&str] = &[
+        "bit.ly",
+        "bitly.com",
+        "tinyurl.com",
+        "is.gd",
+        "ow.ly",
+        "buff.ly",
+        "cutt.ly",
+        "rb.gy",
+        "goo.gl",
+        "shorturl.at",
+        "lnkd.in",
+        "*.safelinks.protection.outlook.com",
+        "urldefense.com",
+        "urldefense.proofpoint.com",
+        "protect-*.mimecast.com",
+        "*.mimecastprotect.com",
+    ];
+
     /// Reads as much of a page's body as is looked into.
     pub async fn read_page(resp: Response) -> Result<String, ResolverError> {
         read_capped(resp, MAX_HTML_BYTES).await
