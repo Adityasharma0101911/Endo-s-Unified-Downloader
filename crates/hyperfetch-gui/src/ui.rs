@@ -417,7 +417,7 @@ fn advanced_options(app: &mut App, ui: &mut egui::Ui) {
 
     ui.add_space(4.0);
     ui.horizontal(|ui| {
-        ui.label(RichText::new("Speed Limit:").size(12.0));
+        ui.label(RichText::new("Speed Limit:").size(12.0)).on_hover_text("For all downloads running at once together");
         ui.add(egui::DragValue::new(&mut app.settings.max_speed).range(0.0..=1_000_000.0).speed(1.0).max_decimals(1));
         let in_mb = &mut app.settings.max_speed_in_mb;
         egui::ComboBox::from_id_salt("speed_unit_combo")

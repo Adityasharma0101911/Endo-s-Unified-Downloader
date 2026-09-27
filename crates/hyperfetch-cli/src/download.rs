@@ -5,7 +5,7 @@ use std::io::{IsTerminal, Write};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt;
-use hyperfetch_core::engine::{build_client, ClientKey, DownloadEngine, DownloadOptions, EngineSnapshot};
+use hyperfetch_core::engine::{build_client, ClientKey, DownloadEngine, DownloadOptions, EngineSnapshot, SharedLimits};
 use hyperfetch_core::history::{DownloadHistoryManager, HistoryEntry, HistoryStatus};
 use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use tokio::sync::{broadcast, mpsc, watch};
@@ -234,8 +234,9 @@ enum Outcome {
 }
 
 /// One HTTP client per [`ClientKey`] among a batch's downloads, so later downloads reuse the
-/// connections and TLS sessions earlier ones opened.
-struct Clients(HashMap<ClientKey, Result<reqwest::Client, String>>);
+/// connections and TLS sessions earlier ones opened, and the speed limit they share (-j downloads
+/// at once stay within --max-speed together).
+struct Clients(HashMap<ClientKey, Result<reqwest::Client, String>>, SharedLimits);
 
 impl Clients {
     /// Builds, off the runtime, the client of every key among `jobs`.
@@ -249,17 +250,18 @@ impl Clients {
             wanted.into_iter().map(|(key, options)| (key, build_client(&options))).collect()
         })
         .await;
-        match built {
-            Ok(clients) => Self(clients),
-            Err(e) => Self(keys.into_iter().map(|key| (key, Err(format!("cannot create HTTP client: {}", e)))).collect()),
-        }
+        let clients = match built {
+            Ok(clients) => clients,
+            Err(e) => keys.into_iter().map(|key| (key, Err(format!("cannot create HTTP client: {}", e)))).collect(),
+        };
+        Self(clients, SharedLimits::default())
     }
 
-    /// An engine for these URLs and options on the shared client of their key, or why that
-    /// client could not be built (a bad proxy, an unreadable cookies file).
+    /// An engine for these URLs and options on the shared client of their key and the shared
+    /// speed limit, or why that client could not be built (a bad proxy, an unreadable cookies file).
     fn engine(&self, urls: Vec<Url>, options: DownloadOptions) -> Result<DownloadEngine, String> {
         match self.0.get(&ClientKey::of(&options)) {
-            Some(Ok(client)) => Ok(DownloadEngine::with_client(urls, options, client.clone())),
+            Some(Ok(client)) => Ok(DownloadEngine::with_client(urls, options, client.clone()).sharing_limit(&self.1)),
             Some(Err(e)) => Err(e.clone()),
             None => Err("no HTTP client was built for this download".to_string()),
         }
@@ -616,6 +618,33 @@ mod tests {
         }
         let accepted = accepted.load(Ordering::SeqCst);
         assert!(accepted < 6, "{} connections for 3 downloads: the later ones did not reuse any", accepted);
+    }
+
+    /// Downloads running at once stay within --max-speed together, not each on its own.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_batch_shares_the_speed_limit() {
+        let dir = std::env::temp_dir().join(format!("hf-cli-limit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("ENDO_HISTORY_PATH", dir.join("history.json"));
+        let body: Vec<u8> = (0..96 * 1024u32).map(|i| (i % 251) as u8).collect();
+        let (server, _) = keep_alive_server(body.clone()).await;
+        let limit = 64 * 1024;
+        let jobs = ["a", "b"].map(|name| Job {
+            label: name.to_string(),
+            urls: vec![Url::parse(&format!("{}/{}.bin", server, name)).unwrap()],
+            options: DownloadOptions { output_path: Some(dir.join("")), max_speed: Some(limit), ..Default::default() },
+            line: None,
+        });
+        let started = Instant::now();
+        assert_eq!(run_jobs(Vec::from(jobs), 2, &Ui::new(true), &Shutdown::install()).await, 0);
+        // Three seconds' worth of both at the limit, where each at a limit of its own takes half;
+        // less the tenth of a second the limit lets through at once.
+        let least = Duration::from_secs_f64(2.0 * body.len() as f64 / limit as f64 - 0.5);
+        assert!(started.elapsed() >= least, "{:?} for both at {} B/s", started.elapsed(), limit);
+        for name in ["a", "b"] {
+            assert_eq!(std::fs::read(dir.join(format!("{}.bin", name))).unwrap(), body);
+        }
     }
 
     #[test]

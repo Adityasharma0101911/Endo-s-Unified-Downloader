@@ -180,6 +180,12 @@ impl ClientKey {
     }
 }
 
+/// The speed limits of downloads that run at once (a batch, a queue): one per `max_speed`, which
+/// every download with that limit shares, so together they stay within it (see
+/// [`DownloadEngine::sharing_limit`]).
+#[derive(Debug, Default)]
+pub struct SharedLimits(Mutex<std::collections::HashMap<u64, Arc<RateLimiter>>>);
+
 #[derive(Clone)]
 pub struct DownloadEngine {
     options: DownloadOptions,
@@ -190,7 +196,7 @@ pub struct DownloadEngine {
     /// Added per request, only for the hosts in `urls`; never a client default header.
     auth: Option<Arc<Auth>>,
     /// The speed limit, one for every connection of the download (and every stream of a media
-    /// download, see `download_media_stream`).
+    /// download, see `download_media_stream`), and for other downloads too (see `sharing_limit`).
     limiter: Option<Arc<RateLimiter>>,
     cancel_flag: Arc<AtomicBool>,
     cancel_token: CancellationToken,
@@ -224,6 +230,16 @@ impl DownloadEngine {
             cancel_flag: Arc::new(AtomicBool::new(false)),
             cancel_token: CancellationToken::new(),
         }
+    }
+
+    /// Holds the download to the limit `limits` keeps for its `max_speed`, together with the other
+    /// downloads there, instead of to a limit of its own. A download without a limit ignores it.
+    pub fn sharing_limit(mut self, limits: &SharedLimits) -> Self {
+        if let Some(speed) = self.options.max_speed.filter(|&s| s > 0) {
+            let shared = Arc::clone(limits.0.lock().entry(speed).or_insert_with(|| Arc::new(RateLimiter::new(speed))));
+            self.limiter = Some(shared);
+        }
+        self
     }
 
     /// Requests cancellation; may be called from any clone of the engine, before or during `run()`.
@@ -3753,6 +3769,37 @@ mod tests {
         // Three seconds' worth at the limit, less the tenth of a second it lets through at once.
         let least = Duration::from_secs_f64((6 * SEGMENT) as f64 / limit as f64 - 0.5);
         assert!(started.elapsed() >= least, "{:?}", started.elapsed());
+    }
+
+    #[tokio::test]
+    async fn test_downloads_sharing_a_limit_stay_within_it_together() {
+        use crate::hls::tests::{ok, serve};
+        const SEGMENT: usize = 24 * 1024;
+        let (addr, _) = serve(|path: &str, _| match path.strip_suffix(".m3u8") {
+            Some(name) => ok(format!("#EXTM3U\n{}#EXT-X-ENDLIST\n", format!("#EXTINF:4,\n{name}.ts\n").repeat(6))),
+            None => ok(vec![5u8; SEGMENT]),
+        })
+        .await;
+        let dir = tempdir().unwrap();
+        let limit = 96 * 1024;
+        let limits = SharedLimits::default();
+        let engine = |name: &str, max_speed| {
+            let options = DownloadOptions { output_path: Some(dir.path().to_path_buf()), max_speed, ..Default::default() };
+            DownloadEngine::new(vec![Url::parse(&format!("http://{addr}/{name}.m3u8")).unwrap()], options).sharing_limit(&limits)
+        };
+
+        let (a, b) = (engine("a", Some(limit)), engine("b", Some(limit)));
+        let started = Instant::now();
+        let (a, b) = tokio::join!(a.run(None), b.run(None));
+        assert_eq!((a.unwrap().file_name().unwrap(), b.unwrap().file_name().unwrap()), ("a.ts".as_ref(), "b.ts".as_ref()));
+        // Three seconds' worth of both at the limit, where each at a limit of its own takes half.
+        let least = Duration::from_secs_f64((2 * 6 * SEGMENT) as f64 / limit as f64 - 0.5);
+        assert!(started.elapsed() >= least, "{:?}", started.elapsed());
+
+        // A download without a limit is not held to theirs.
+        let started = Instant::now();
+        engine("c", None).run(None).await.unwrap();
+        assert!(started.elapsed() < least / 2, "{:?}", started.elapsed());
     }
 
     #[tokio::test]

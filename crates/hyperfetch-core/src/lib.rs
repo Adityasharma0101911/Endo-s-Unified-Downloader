@@ -21,7 +21,8 @@ pub use mirror::{Mirror, MirrorRacer};
 pub use storage::{DiskWriter, StorageError};
 pub use state::{DownloadState, StateError};
 pub use engine::{
-    build_client, claim_target, discard_partial, ClientKey, DownloadEngine, DownloadOptions, EngineSnapshot, TargetClaim,
+    build_client, claim_target, discard_partial, ClientKey, DownloadEngine, DownloadOptions, EngineSnapshot, SharedLimits,
+    TargetClaim,
 };
 pub use resolver::SmartResolver;
 pub use hls::{HlsEngine, HlsSegment, HlsError, parse_hls_playlist};
