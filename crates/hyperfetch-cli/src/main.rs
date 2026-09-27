@@ -154,7 +154,8 @@ fn job(args: &Args, connections: u64, dir: &Path, task: Task) -> Job {
         output_path: Some(output),
         expected_checksum: args.checksum.clone().or(task.checksum),
         cookies_path: args.load_cookies.clone(),
-        auth_header: args.auth_header.clone(),
+        // --header is for the hosts the user named, not those a .metalink or .torrent lists.
+        auth_header: args.auth_header.clone().filter(|_| !task.from_document),
         proxy: args.proxy.clone(),
         media_preset: args.media_preset.clone(),
         browser_cookies: args.cookies_from_browser.map(Into::into),
@@ -678,6 +679,18 @@ mod tests {
         let output = job(&args, 4, Path::new("gone"), task).options.output_path.unwrap();
         let last = *output.as_os_str().as_encoded_bytes().last().unwrap();
         assert!(std::path::is_separator(last as char), "{}", output.display());
+    }
+
+    /// --header goes to the hosts the user named, never to the mirrors a .metalink or .torrent
+    /// lists.
+    #[test]
+    fn the_authorization_header_skips_the_hosts_a_document_lists() {
+        let args = parse(&["--header", "Authorization: Bearer ghp_x", "https://a.example/list.meta4"]);
+        let urls = vec![Url::parse("https://mirror.example/f.iso").unwrap()];
+        let typed = Task { urls: urls.clone(), ..Default::default() };
+        let listed = Task { urls, from_document: true, ..Default::default() };
+        assert_eq!(job(&args, 4, Path::new("d"), typed).options.auth_header.as_deref(), Some("Bearer ghp_x"));
+        assert_eq!(job(&args, 4, Path::new("d"), listed).options.auth_header, None);
     }
 
     #[test]
