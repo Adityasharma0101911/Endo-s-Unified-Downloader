@@ -5,7 +5,7 @@ mod settings;
 mod ui;
 mod util;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -73,7 +73,8 @@ struct Listing {
     input: String,
     checksum: String,
     auth: String,
-    tasks: Vec<Task>,
+    /// None while the playlist of a video link is still being read (see `App::read_document`).
+    tasks: Option<Vec<Task>>,
     /// The video the input names, offered in place of its whole playlist.
     video: Option<Task>,
 }
@@ -90,9 +91,10 @@ enum Answer {
 impl Listing {
     /// "120 files (4.20 GiB)", the size shown when the document gives every file's.
     fn summary(&self) -> String {
-        match self.tasks.iter().try_fold(0u64, |total, t| total.checked_add(t.size?)) {
-            Some(total) => format!("{} files ({})", self.tasks.len(), util::format_bytes(total)),
-            None => format!("{} files", self.tasks.len()),
+        let tasks = self.tasks.as_deref().unwrap_or_default();
+        match tasks.iter().try_fold(0u64, |total, t| total.checked_add(t.size?)) {
+            Some(total) => format!("{} files ({})", tasks.len(), util::format_bytes(total)),
+            None => format!("{} files", tasks.len()),
         }
     }
 }
@@ -196,9 +198,11 @@ struct App {
     form_error: Option<String>,
     queue_error: Option<String>,
     notice: Option<Result<String, String>>,
-    /// Documents being read now; asking again for one of them does nothing.
-    reading: HashSet<String>,
-    /// Large listings waiting for the user's answer, first come first.
+    /// Documents being read now, and the task reading each; asking again for one of them does
+    /// nothing.
+    reading: HashMap<String, JoinHandle<()>>,
+    /// Large listings, and video links that name their playlist, waiting for the user's answer,
+    /// first come first.
     listings: Vec<Listing>,
 
     clipboard_enabled: Arc<AtomicBool>,
@@ -245,19 +249,31 @@ impl App {
         let queue_saver = queue_store::Saver::spawn(queue_store::path())
             .inspect_err(|e| tracing::warn!("Queue changes will only be saved on exit: {}", e))
             .ok();
-        let (events_tx, events_rx) = mpsc::channel();
-        let clipboard_enabled = Arc::new(AtomicBool::new(settings.clipboard_watch));
-        let clipboard_seen = Arc::new(Mutex::new(String::new()));
+        let mut app = Self::with(cc.egui_ctx.clone(), rt, settings, queue, queue_saver);
+        app.notice = queue_problem.map(Err);
         spawn_clipboard_watcher(
-            Arc::clone(&clipboard_enabled),
-            Arc::clone(&clipboard_seen),
-            events_tx.clone(),
+            Arc::clone(&app.clipboard_enabled),
+            Arc::clone(&app.clipboard_seen),
+            app.events_tx.clone(),
             cc.egui_ctx.clone(),
         );
+        app.refresh_history();
+        app
+    }
 
-        let mut app = Self {
+    /// The app with `settings` and `queue`, before it watches the clipboard or reads the history.
+    fn with(
+        ctx: egui::Context,
+        rt: tokio::runtime::Handle,
+        settings: Settings,
+        queue: DownloadQueue,
+        queue_saver: Option<queue_store::Saver>,
+    ) -> Self {
+        let (events_tx, events_rx) = mpsc::channel();
+        let clipboard_enabled = Arc::new(AtomicBool::new(settings.clipboard_watch));
+        Self {
             rt,
-            ctx: cc.egui_ctx.clone(),
+            ctx,
             events_tx,
             events_rx,
             settings,
@@ -269,11 +285,11 @@ impl App {
             show_advanced: false,
             form_error: None,
             queue_error: None,
-            notice: queue_problem.map(Err),
-            reading: HashSet::new(),
+            notice: None,
+            reading: HashMap::new(),
             listings: Vec::new(),
             clipboard_enabled,
-            clipboard_seen,
+            clipboard_seen: Arc::new(Mutex::new(String::new())),
             clipboard_banner: None,
             queue_saved: queue.revision(),
             queue,
@@ -297,9 +313,7 @@ impl App {
             repair: None,
             dialog_open: false,
             pending_dialog: None,
-        };
-        app.refresh_history();
-        app
+        }
     }
 
     /// Runs `fut` on the runtime and delivers its event to the UI thread.
@@ -370,20 +384,93 @@ impl App {
     /// lists (see `ingest::needs_reading`) off the UI thread and adds them as `origin` says. A
     /// document already being read is not read again.
     fn read_document(&mut self, input: String, origin: Origin, checksum: String, auth: String) {
+        let read = read_listing(&self.settings, input.clone());
+        self.start_reading(input, origin, checksum, auth, read);
+    }
+
+    /// [`App::read_document`] with `read`, which reads `input`. A video link that names its
+    /// playlist asks at once whether the video or the whole playlist is meant, while the playlist
+    /// is read (see [`playlist_video`]).
+    fn start_reading(
+        &mut self,
+        input: String,
+        origin: Origin,
+        checksum: String,
+        auth: String,
+        read: impl Future<Output = Result<Vec<Task>, String>> + Send + 'static,
+    ) {
         let shown = ingest::truncate_chars(&input, 60);
-        if !self.reading.insert(input.clone()) {
+        if self.reading.contains_key(&input) {
             self.notice = Some(Ok(format!("Still reading {}...", shown)));
             return;
         }
         self.notice = Some(Ok(format!("Reading {}...", shown)));
-        let read = read_listing(&self.settings, input.clone());
-        self.spawn_event(async move { AppEvent::Read { origin, input, checksum, auth, result: read.await } });
+        let prompt = playlist_video(&input).map(|video| Listing {
+            origin,
+            input: input.clone(),
+            checksum: checksum.clone(),
+            auth: auth.clone(),
+            tasks: None,
+            video: Some(video),
+        });
+        let key = input.clone();
+        let reading = self.spawn_event(async move { AppEvent::Read { origin, input, checksum, auth, result: read.await } });
+        self.reading.insert(key, reading);
+        self.listings.extend(prompt);
+    }
+
+    /// Takes what reading `input` gave: fills in the playlist its prompt waits for (see
+    /// [`App::start_reading`]), or adds the downloads as `origin` says. A reading answered or
+    /// cancelled meanwhile was stopped, and what it read is not wanted.
+    fn read_done(&mut self, origin: Origin, input: String, checksum: String, auth: String, result: Result<Vec<Task>, String>) {
+        if self.reading.remove(&input).is_none() {
+            return;
+        }
+        self.notice = None;
+        let shown = ingest::truncate_chars(&input, 60);
+        if let Some(at) = self.listings.iter().position(|l| l.input == input && l.tasks.is_none()) {
+            // yt-dlp found the video alone: nothing to choose.
+            let alone = |tasks: &[Task], video: &Option<Task>| matches!((tasks, video), ([one], Some(video)) if one.urls == video.urls);
+            match result {
+                Ok(tasks) if !alone(&tasks, &self.listings[at].video) => self.listings[at].tasks = Some(tasks),
+                result => {
+                    let Listing { origin, checksum, auth, video, .. } = self.listings.remove(at);
+                    match result {
+                        Ok(tasks) => {
+                            self.add_listing(origin, &input, &checksum, &auth, Ok(tasks));
+                        }
+                        // The link is a video all the same.
+                        Err(e) => {
+                            if self.add_listing(origin, &input, &checksum, &auth, Ok(video.into_iter().collect())) {
+                                self.notice = Some(Err(format!("Added the video of {} alone: {}", shown, e)));
+                            }
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        match result {
+            // Everything it lists was downloaded before: nothing to do, not a failure.
+            Ok(tasks) if tasks.is_empty() => {
+                let why = "all it lists was downloaded before (untick Only new items to get it all again)";
+                self.notice = Some(Ok(format!("Nothing new in {}: {}", shown, why)));
+            }
+            Ok(tasks) if tasks.len() > CONFIRM_FILES => {
+                self.listings.push(Listing { origin, input, checksum, auth, tasks: Some(tasks), video: None })
+            }
+            result => {
+                self.add_listing(origin, &input, &checksum, &auth, result);
+            }
+        }
     }
 
     /// Adds what a document listed (or shows why it was refused) as `origin` says: the form
-    /// starts the first download, a queue line that failed is put back with its error.
-    fn add_listing(&mut self, origin: Origin, input: &str, checksum: &str, auth: &str, result: Result<Vec<Task>, String>) {
+    /// starts the first download, a queue line that failed is put back with its error. True when
+    /// it was added.
+    fn add_listing(&mut self, origin: Origin, input: &str, checksum: &str, auth: &str, result: Result<Vec<Task>, String>) -> bool {
         let added = result.and_then(|tasks| queue_listed(&mut self.queue, &self.settings, tasks, checksum, auth));
+        let ok = added.is_ok();
         match (origin, added) {
             (Origin::Form, Ok(ids)) => {
                 if let Some(&first) = ids.first() {
@@ -401,18 +488,27 @@ impl App {
             (Origin::QueueLine(line), Err(e)) => keep_refused_line(&mut self.queue_input, &mut self.queue_error, line, input, &e),
             (Origin::Dropped, Err(e)) => self.notice = Some(Err(e)),
         }
+        ok
     }
 
     /// Answers the first listing waiting: adds its downloads, or the one video, or drops them.
+    /// The whole playlist of a video link can be picked once it has been read; picking the video
+    /// or nothing before then stops reading it.
     fn answer_listing(&mut self, answer: Answer) {
-        if self.listings.is_empty() {
-            return;
+        match self.listings.first() {
+            Some(listing) if listing.tasks.is_some() || !matches!(answer, Answer::All) => {}
+            _ => return,
         }
         let Listing { origin, input, checksum, auth, tasks, video } = self.listings.remove(0);
+        if tasks.is_none() {
+            if let Some(reading) = self.reading.remove(&input) {
+                reading.abort();
+            }
+        }
         let chosen = match answer {
             Answer::Cancel => return,
             Answer::Video => video.into_iter().collect(),
-            Answer::All => tasks,
+            Answer::All => tasks.unwrap_or_default(),
         };
         self.add_listing(origin, &input, &checksum, &auth, Ok(chosen));
     }
@@ -739,25 +835,7 @@ impl App {
 
     fn handle_event(&mut self, event: AppEvent) {
         match event {
-            AppEvent::Read { origin, input, checksum, auth, result } => {
-                self.reading.remove(&input);
-                self.notice = None;
-                // A video link that names its playlist asks which of the two is meant.
-                let video = playlist_video(&input);
-                match result {
-                    Ok(tasks) if video.is_some() || tasks.len() > CONFIRM_FILES => {
-                        self.listings.push(Listing { origin, input, checksum, auth, tasks, video })
-                    }
-                    // The link is a video all the same.
-                    Err(e) if video.is_some() => {
-                        self.add_listing(origin, &input, &checksum, &auth, Ok(video.into_iter().collect()));
-                        if self.notice.is_none() {
-                            self.notice = Some(Err(format!("Added the video alone: {}", e)));
-                        }
-                    }
-                    result => self.add_listing(origin, &input, &checksum, &auth, result),
-                }
-            }
+            AppEvent::Read { origin, input, checksum, auth, result } => self.read_done(origin, input, checksum, auth, result),
             AppEvent::JobFinished { id, result } => {
                 if let Some(view) = self.jobs.get_mut(&id) {
                     if let (Some(_), Some(started)) = (view.running.take(), view.started) {
@@ -995,6 +1073,7 @@ fn task_options(settings: &Settings, task: &Task, checksum: &str, auth: &str) ->
     for part in [&task.folder, &task.name].into_iter().flatten() {
         options.output_path = options.output_path.map(|path| path.join(part));
     }
+    options.media_name = task.media_name.clone();
     Ok(options)
 }
 
@@ -1516,11 +1595,14 @@ mod tests {
         let named = Task { urls: urls.clone(), folder: Some("Show".into()), name: Some("ep1.mp3".into()), ..Task::default() };
         let path = task_options(&settings, &named, "", "").unwrap().output_path;
         assert_eq!(path, Some(PathBuf::from("dl").join("Show").join("ep1.mp3")));
-        let unnamed = Task { urls, folder: Some("Show".into()), ..Task::default() };
+        // A playlist entry, which yt-dlp names by its title and id.
+        let template = "%(title)s [%(id)s].%(ext)s".to_string();
+        let unnamed = Task { urls, folder: Some("Show".into()), media_name: Some(template.clone()), ..Task::default() };
         let mut queue = DownloadQueue::new();
         let [id] = queue_listed(&mut queue, &settings, vec![unnamed], "", "").unwrap()[..] else { panic!("one download") };
         let item = queue.get_item(id).unwrap();
         assert_eq!(util::folder_to_create(item), Some(PathBuf::from("dl").join("Show")));
+        assert_eq!(item.options.media_name, Some(template));
     }
 
     /// Each file a document lists keeps its own path and checksum; the form's checksum only fits a
@@ -1590,7 +1672,7 @@ mod tests {
         assert_eq!(input, "https://ok.example/f\nhttps://a.example/x.torrent\ny.meta4");
         assert_eq!(errors.as_deref(), Some("Line 2: Cannot fetch\nLine 3: Cannot read"));
 
-        let listing = |tasks| Listing { origin: Origin::Dropped, input: String::new(), checksum: String::new(), auth: String::new(), tasks, video: None };
+        let listing = |tasks| Listing { origin: Origin::Dropped, input: String::new(), checksum: String::new(), auth: String::new(), tasks: Some(tasks), video: None };
         assert_eq!(listing((1..=60).map(file).collect()).summary(), "60 files (60.00 KiB)");
         assert_eq!(listing(vec![file(1), Task { size: None, ..file(2) }]).summary(), "2 files");
     }
@@ -1613,6 +1695,92 @@ mod tests {
             assert!(playlist_video(other).is_none(), "{other}");
             assert!(!read_options(&settings, other).whole_playlist, "{other}");
         }
+    }
+
+    /// The app, saving into `dir`, on `rt`: a runtime that never runs what it is given here, so
+    /// nothing is read or downloaded.
+    fn test_app(rt: &tokio::runtime::Runtime, dir: &std::path::Path) -> App {
+        let settings = Settings { save_dir: dir.to_string_lossy().into_owned(), ..Settings::default() };
+        App::with(egui::Context::default(), rt.handle().clone(), settings, DownloadQueue::new(), None)
+    }
+
+    /// The first link of each download queued.
+    fn queued(app: &App) -> Vec<String> {
+        app.queue.items().iter().map(|item| item.urls[0].to_string()).collect()
+    }
+
+    /// A video link that names its playlist asks at once: the video can be picked while the
+    /// playlist is read, which stops the reading (what it gives later is dropped), the whole
+    /// playlist once it has been read. yt-dlp finding the video alone adds it without asking, and
+    /// a playlist that cannot be read adds the video, saying why, whatever the link came from.
+    #[test]
+    fn a_video_in_a_playlist_is_asked_about_at_once_and_added_as_answered() {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(&rt, dir.path());
+        let link = "https://www.youtube.com/watch?v=jNQXAC9IVRw&list=PLbpi6ZahtOH6Blw3RGYpWkSByi_T7Rygb";
+        let entry = |id: &str| Task {
+            urls: vec![Url::parse(&format!("https://www.youtube.com/watch?v={id}")).unwrap()],
+            folder: Some("Top".into()),
+            ..Task::default()
+        };
+        let ask = |app: &mut App| app.start_reading(link.to_string(), Origin::QueueLine(1), String::new(), String::new(), std::future::pending());
+        let read = |app: &mut App, result: Result<Vec<Task>, String>| {
+            let (input, checksum, auth) = (link.to_string(), String::new(), String::new());
+            app.handle_event(AppEvent::Read { origin: Origin::QueueLine(1), input, checksum, auth, result })
+        };
+
+        ask(&mut app);
+        assert_eq!((app.listings.len(), app.listings[0].tasks.is_none()), (1, true));
+        app.answer_listing(Answer::All);
+        assert_eq!(app.listings.len(), 1, "the playlist is not read yet");
+        read(&mut app, Ok(vec![entry("a"), entry("b")]));
+        assert_eq!(app.listings[0].tasks.as_ref().map(Vec::len), Some(2));
+        app.answer_listing(Answer::All);
+        assert_eq!(queued(&app), ["https://www.youtube.com/watch?v=a", "https://www.youtube.com/watch?v=b"]);
+        assert!(app.listings.is_empty() && app.reading.is_empty());
+
+        ask(&mut app);
+        app.answer_listing(Answer::Video);
+        assert_eq!(queued(&app)[2], link);
+        assert!(app.reading.is_empty(), "still reading the playlist");
+        read(&mut app, Ok(vec![entry("c")]));
+        assert_eq!((queued(&app).len(), app.listings.len()), (3, 0));
+
+        ask(&mut app);
+        read(&mut app, Ok(vec![Task { urls: vec![Url::parse(link).unwrap()], ..Task::default() }]));
+        assert_eq!((queued(&app).len(), app.listings.len()), (4, 0));
+
+        ask(&mut app);
+        read(&mut app, Err("ERROR: [youtube:tab] PL1: The playlist does not exist.".to_string()));
+        assert_eq!((queued(&app).len(), app.listings.len()), (5, 0));
+        let notice = app.notice.clone().and_then(Result::err).unwrap_or_default();
+        assert!(notice.starts_with("Added the video of https://www.youtube.com/watch") && notice.ends_with("does not exist."), "{notice}");
+
+        // Nothing new in the playlist: the video alone can be picked.
+        ask(&mut app);
+        read(&mut app, Ok(Vec::new()));
+        assert_eq!(app.listings[0].tasks.as_deref(), Some(&[][..]));
+        app.answer_listing(Answer::Cancel);
+        assert_eq!((queued(&app).len(), app.listings.len()), (5, 0));
+    }
+
+    /// A playlist or channel with nothing new is nothing to do: said so, and its queue line is
+    /// not kept as an error.
+    #[test]
+    fn a_listing_with_nothing_new_is_a_notice() {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(&rt, dir.path());
+        let channel = "https://www.youtube.com/@NASA";
+        app.start_reading(channel.to_string(), Origin::QueueLine(2), String::new(), String::new(), std::future::pending());
+        assert!(app.listings.is_empty());
+        let (input, checksum, auth) = (channel.to_string(), String::new(), String::new());
+        app.handle_event(AppEvent::Read { origin: Origin::QueueLine(2), input, checksum, auth, result: Ok(Vec::new()) });
+        assert!(app.queue.items().is_empty());
+        assert_eq!((app.queue_input.as_str(), app.queue_error.as_deref()), ("", None));
+        let notice = app.notice.clone().and_then(Result::ok).unwrap_or_default();
+        assert!(notice.starts_with("Nothing new in https://www.youtube.com/@NASA:") && notice.contains("Only new items"), "{notice}");
     }
 
     /// A remote document is fetched through the proxy setting: its host does not exist, so only

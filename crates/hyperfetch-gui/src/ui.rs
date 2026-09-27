@@ -190,14 +190,21 @@ fn clipboard_banner(app: &mut App, ui: &mut egui::Ui) {
 }
 
 /// Asks before adding the many downloads a large .metalink, .meta4, .torrent or playlist lists,
-/// and whether a video link that names its playlist too means the video or the whole playlist.
+/// and whether a video link that names its playlist too means the video or the whole playlist:
+/// at once, the video can be picked while the playlist is read.
 fn listing_prompt(app: &mut App, ui: &mut egui::Ui) {
     let Some(listing) = app.listings.first() else { return };
     let input = listing.input.clone();
     let video = listing.video.is_some();
+    let playlist_ready = listing.tasks.as_ref().is_some_and(|tasks| !tasks.is_empty());
     let (text, all) = if video {
         let text = format!("{} is a video in a playlist. Download:", truncate_chars(&input, 55));
-        (text, format!("Whole Playlist ({})", listing.tasks.len()))
+        let all = match listing.tasks.as_deref() {
+            None => "Whole Playlist (reading...)".to_string(),
+            Some([]) => "Whole Playlist (nothing new)".to_string(),
+            Some(tasks) => format!("Whole Playlist ({})", tasks.len()),
+        };
+        (text, all)
     } else {
         (format!("{} lists {}. Add them all?", truncate_chars(&input, 55), listing.summary()), "Add All".to_string())
     };
@@ -220,7 +227,7 @@ fn listing_prompt(app: &mut App, ui: &mut egui::Ui) {
                         }
                         return;
                     }
-                    if ui.button(RichText::new(&all).size(11.0)).clicked() {
+                    if ui.add_enabled(playlist_ready, egui::Button::new(RichText::new(&all).size(11.0))).clicked() {
                         app.answer_listing(Answer::All);
                     }
                     if ui.add(primary_button("This Video", BLUE)).clicked() {
