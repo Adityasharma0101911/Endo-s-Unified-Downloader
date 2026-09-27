@@ -3220,3 +3220,71 @@ async fn test_a_document_on_a_file_page_or_share_is_read_and_one_behind_a_login_
     assert!(err.contains("the server sent a web page instead of list.meta4"), "{err}");
     assert_eq!(names_in(temp.path()), Vec::<String>::new());
 }
+
+
+// SHA-512 and SHA-1 checksums: hashed as the file is written, like SHA-256 and MD5.
+
+fn to_hex(digest: &[u8]) -> String {
+    digest.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+#[tokio::test]
+async fn test_sha512_and_sha1_checksums_of_a_multi_connection_download() {
+    use sha2::Digest;
+    isolate_history();
+    let _history = HISTORY.write().await;
+    let data = payload(4 * PREFETCH + 54321, 281);
+    let sums = [
+        ("sha512", to_hex(&sha2::Sha512::digest(&data))),
+        ("sha1", to_hex(&sha1::Sha1::digest(&data))),
+    ];
+    for (algo, sum) in sums {
+        let mock = Arc::new(Mock::new(data.clone()));
+        let url = serve(Arc::clone(&mock), "summed.bin").await;
+        let temp = tempdir().unwrap();
+        let out = temp.path().join("summed.bin");
+
+        let mut opts = options(&out, 4, 256 * KB);
+        opts.expected_checksum = Some(format!("{algo}:{}", "0".repeat(sum.len())));
+        let err = run(&DownloadEngine::new(vec![url.clone()], opts.clone()), None).await.expect_err("a wrong checksum fails");
+        assert!(err.contains("Checksum verification failed") && err.contains(&sum), "{algo}: {err}");
+        assert!(!out.exists());
+        assert_no_leftovers(&out);
+
+        opts.expected_checksum = Some(format!("{algo}:{sum}"));
+        let path = run(&DownloadEngine::new(vec![url], opts), None).await.expect("the right checksum passes");
+        assert_eq!(path, out);
+        assert_file(&out, &data);
+        assert!(mock.served_ranges().len() >= 4, "{algo}: fetched over several connections");
+        let entry = history_entry(&out).expect("the download is recorded");
+        assert_eq!(entry.blake3_hash, Some(blake3::hash(&data).to_hex().to_string()));
+    }
+}
+
+#[tokio::test]
+async fn test_bare_sha512_and_sha1_checksums_of_a_single_stream() {
+    use sha2::Digest;
+    let _history = setup().await;
+    let data = payload(PREFETCH + 333 * KB, 283);
+    // Bare digests: 128 hex digits are SHA-512, 40 are SHA-1.
+    for sum in [to_hex(&sha2::Sha512::digest(&data)), to_hex(&sha1::Sha1::digest(&data))] {
+        let mut mock = Mock::new(data.clone());
+        mock.ranges = false;
+        let url = serve(Arc::new(mock), "streamed.bin").await;
+        let temp = tempdir().unwrap();
+        let out = temp.path().join("streamed.bin");
+
+        let mut opts = options(&out, 4, 64 * KB);
+        opts.expected_checksum = Some("f".repeat(sum.len()));
+        let err = run(&DownloadEngine::new(vec![url.clone()], opts.clone()), None).await.expect_err("a wrong checksum fails");
+        assert!(err.contains("Checksum verification failed") && err.contains(&sum), "{err}");
+        assert!(!out.exists());
+        assert_no_leftovers(&out);
+
+        opts.expected_checksum = Some(sum.to_uppercase());
+        let path = run(&DownloadEngine::new(vec![url], opts), None).await.expect("the right checksum passes");
+        assert_eq!(path, out);
+        assert_file(&out, &data);
+        assert_no_leftovers(&out);
+    }
+}
