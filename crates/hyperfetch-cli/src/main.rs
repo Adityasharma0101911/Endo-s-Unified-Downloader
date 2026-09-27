@@ -692,7 +692,7 @@ mod tests {
         let options = job(&args, args.connections, Path::new("d"), task).options;
         assert_eq!((options.fsync_on_complete, options.max_connections_per_host, options.num_connections), (true, 6, 3));
         let defaults = tuning(&parse(&["u"]), 16);
-        assert_eq!((defaults.fsync_on_complete, defaults.max_connections_per_host), (false, 32));
+        assert_eq!((defaults.fsync_on_complete, defaults.max_connections_per_host), (false, 64));
     }
 
     /// Each download keeps the line of the input file that listed it, however many downloads

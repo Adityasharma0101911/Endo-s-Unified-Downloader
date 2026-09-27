@@ -329,10 +329,10 @@ mod tests {
     #[test]
     fn new_defaults_leave_saved_choices_alone() {
         let defaults = Settings::default();
-        assert_eq!((defaults.max_concurrent, defaults.fsync_on_complete, defaults.max_connections_per_host), (4, false, 32));
+        assert_eq!((defaults.max_concurrent, defaults.fsync_on_complete, defaults.max_connections_per_host), (4, false, 64));
         // Saved by an older version: the user's own limit stays, the new settings take their defaults.
         let saved: Settings = serde_json::from_str(r#"{"max_concurrent": 2}"#).unwrap();
-        assert_eq!((saved.max_concurrent, saved.fsync_on_complete, saved.max_connections_per_host), (2, false, 32));
+        assert_eq!((saved.max_concurrent, saved.fsync_on_complete, saved.max_connections_per_host), (2, false, 64));
         let chosen = Settings { fsync_on_complete: true, max_connections_per_host: 8, ..defaults };
         let json = serde_json::to_string(&chosen).unwrap();
         assert_eq!(serde_json::from_str::<Settings>(&json).unwrap(), chosen);
