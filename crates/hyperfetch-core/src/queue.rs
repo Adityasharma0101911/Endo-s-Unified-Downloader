@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::engine::{DownloadOptions, EngineSnapshot};
+use crate::history::{is_redacted, redact_text, redact_url, REDACTED_LINK};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QueueItemStatus {
@@ -168,10 +169,18 @@ impl DownloadQueue {
         self.items.iter().find(|i| i.status.is_active() && i.targets(path)).map(|i| i.id)
     }
 
-    /// Marks the item as running and clears its speed. Returns false if it is missing or already active.
+    /// Marks the item as running and clears its speed. Returns false if it is missing or already
+    /// active, or if every link it has was saved without its secret (see
+    /// [`DownloadQueue::settle_for_restart`]): it then fails, saying so.
     pub fn mark_started(&mut self, id: usize) -> bool {
         match self.get_item_mut(id) {
             Some(item) if !item.status.is_active() => {
+                let before = item.urls.len();
+                item.urls.retain(|u| !is_redacted(u.as_str()));
+                if item.urls.is_empty() && before > 0 {
+                    item.status = QueueItemStatus::Failed(REDACTED_LINK.to_string());
+                    return false;
+                }
                 item.status = QueueItemStatus::Downloading;
                 item.speed_bytes_per_sec = 0.0;
                 true
@@ -259,7 +268,9 @@ impl DownloadQueue {
 
     /// The state to resume from after a restart, when no engine runs: running items are
     /// `Paused` (their resume state is on disk), and unfinished items that had an
-    /// Authorization header, which is never saved, wait for it as `AuthRequired`.
+    /// Authorization header, which is never saved, wait for it as `AuthRequired`. Finished
+    /// items (completed or failed) keep their links and error without secrets (see
+    /// [`crate::history::redact_url`]); unfinished ones keep them whole to resume.
     pub fn settle_for_restart(&mut self) {
         self.revision += 1;
         for item in &mut self.items {
@@ -269,6 +280,16 @@ impl DownloadQueue {
             }
             if item.options.auth_header.is_some() && item.status != QueueItemStatus::Completed {
                 item.status = QueueItemStatus::AuthRequired;
+            }
+            match &mut item.status {
+                QueueItemStatus::Completed => {}
+                QueueItemStatus::Failed(error) => *error = redact_text(error),
+                _ => continue,
+            }
+            for url in &mut item.urls {
+                if let Ok(redacted) = Url::parse(&redact_url(url.as_str())) {
+                    *url = redacted;
+                }
             }
         }
     }
@@ -536,5 +557,49 @@ mod tests {
         let mut back = back;
         assert!(back.add_item(vec![url("https://e.com/n")], DownloadOptions::default()) > authed, "ids keep counting");
         assert!(serde_json::from_str::<DownloadQueue>(&json.replace("https://e.com/p", "not a url")).is_err());
+    }
+
+    #[test]
+    fn finished_items_are_saved_without_secrets_and_ask_for_the_link_again() {
+        let (mut q, ids) = queue_of(&[
+            "https://me:pw@e.com/done.bin?token=t1",
+            "https://e.com/failed.bin?sig=s2",
+            "https://e.com/paused.bin?sig=s3",
+            "https://e.com/queued.bin?sig=s4",
+        ]);
+        let mirrored = q.add_item(vec![url("https://e.com/m.bin?sig=s5"), url("https://f.com/m.bin")], DownloadOptions::default());
+        for id in [ids[0], ids[1], ids[2], mirrored] {
+            q.mark_started(id);
+        }
+        q.finish(ids[0], Ok((PathBuf::from("/dl/done.bin"), Some(1))));
+        q.finish(ids[1], Err("https://e.com/failed.bin?sig=s2: HTTP 403".into()));
+        q.finish(mirrored, Err("HTTP 500".into()));
+
+        let json = serde_json::to_string(&{
+            let mut saved = q.clone();
+            saved.settle_for_restart();
+            saved
+        })
+        .unwrap();
+        for secret in ["pw", "t1", "s2", "s5"] {
+            assert!(!json.contains(secret), "{secret} in {json}");
+        }
+        let mut back: DownloadQueue = serde_json::from_str(&json).unwrap();
+        let item = |q: &DownloadQueue, id| q.get_item(id).unwrap().clone();
+        assert_eq!(item(&back, ids[0]).urls, vec![url("https://e.com/done.bin?token=REDACTED")]);
+        assert_eq!(item(&back, ids[1]).status, QueueItemStatus::Failed("https://e.com/failed.bin?sig=REDACTED: HTTP 403".into()));
+        // Unfinished items keep their links whole, to resume.
+        assert_eq!(item(&back, ids[2]).urls, vec![url("https://e.com/paused.bin?sig=s3")]);
+        assert_eq!(item(&back, ids[3]).urls, vec![url("https://e.com/queued.bin?sig=s4")]);
+
+        // A retry never requests a redacted link: it fails, saying so, or keeps the other mirrors.
+        assert!(!back.mark_started(ids[1]));
+        assert_eq!(item(&back, ids[1]).status, QueueItemStatus::Failed(REDACTED_LINK.to_string()));
+        assert!(back.mark_started(mirrored));
+        assert_eq!(item(&back, mirrored).urls, vec![url("https://f.com/m.bin")]);
+        assert!(back.mark_started(ids[2]));
+        // The live queue is untouched until it is saved.
+        assert_eq!(item(&q, ids[1]).urls, vec![url("https://e.com/failed.bin?sig=s2")]);
+        assert!(q.mark_started(ids[1]));
     }
 }
