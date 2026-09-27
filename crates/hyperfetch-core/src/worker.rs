@@ -660,7 +660,18 @@ fn check_response(
         StatusCode::PARTIAL_CONTENT => {
             let header = headers.get(CONTENT_RANGE).and_then(|v| v.to_str().ok());
             match header.map(ByteRange::parse_content_range) {
-                Some(Ok((range, Some(total)))) if range.start == start && total == file_size => Ok(()),
+                // A server honouring If-Range answers for another version with a 200. One that
+                // ignores it may send part of that version as a 206, which only its validator
+                // tells apart.
+                Some(Ok((range, Some(total)))) if range.start == start && total == file_size => {
+                    match if_range.filter(|v| names_another_version(headers, v)) {
+                        Some(_) => Err((
+                            FailureKind::Fatal,
+                            "remote file changed: server ignored If-Range and sent part of a different version".to_string(),
+                        )),
+                        None => Ok(()),
+                    }
+                }
                 _ => Err((
                     FailureKind::BadMirror,
                     format!(
@@ -728,6 +739,13 @@ fn at_redirect_target(status: StatusCode, (kind, error): Failure) -> Failure {
 pub(crate) fn carries_validator(headers: &HeaderMap, validator: &str) -> bool {
     let name = if validator.starts_with('"') { ETAG } else { LAST_MODIFIED };
     headers.get(name).and_then(|v| v.to_str().ok()).is_some_and(|v| v.trim() == validator)
+}
+
+/// Whether a response names a version other than the `If-Range` validator we sent: it carries
+/// that validator's header (ETag, or Last-Modified for a date) with another value.
+fn names_another_version(headers: &HeaderMap, validator: &str) -> bool {
+    let name = if validator.starts_with('"') { ETAG } else { LAST_MODIFIED };
+    headers.get(name).and_then(|v| v.to_str().ok()).is_some_and(|v| v.trim() != validator)
 }
 
 /// `Retry-After` in delta-seconds form, capped.
@@ -826,6 +844,23 @@ mod tests {
         assert_eq!(check(200, &dated, 500, 999, 1000, Some(date)), Some(FailureKind::BadMirror));
         let newer = [("content-length", "1000"), ("last-modified", "Mon, 07 Nov 1994 08:49:37 GMT")];
         assert_eq!(check(200, &newer, 500, 999, 1000, Some(date)), Some(FailureKind::Fatal));
+    }
+
+    #[test]
+    fn test_206_naming_another_version_than_if_range_is_a_changed_file() {
+        let range = ("content-range", "bytes 500-999/1000");
+        assert_eq!(check(206, &[range, ("etag", "\"v1\"")], 500, 999, 1000, V1), None);
+        // A server that ignores If-Range, serving part of a new build.
+        assert_eq!(check(206, &[range, ("etag", "\"v2\"")], 500, 999, 1000, V1), Some(FailureKind::Fatal));
+        // Nothing to go by: no validator in the answer, or none sent.
+        assert_eq!(check(206, &[range], 500, 999, 1000, V1), None);
+        assert_eq!(check(206, &[range, ("etag", "\"v2\"")], 500, 999, 1000, None), None);
+
+        let date = "Sun, 06 Nov 1994 08:49:37 GMT";
+        let dated = ("last-modified", "Sun, 06 Nov 1994 08:49:37 GMT");
+        let newer = ("last-modified", "Mon, 07 Nov 1994 08:49:37 GMT");
+        assert_eq!(check(206, &[range, dated, ("etag", "\"any\"")], 500, 999, 1000, Some(date)), None);
+        assert_eq!(check(206, &[range, newer], 500, 999, 1000, Some(date)), Some(FailureKind::Fatal));
     }
 
     #[test]
