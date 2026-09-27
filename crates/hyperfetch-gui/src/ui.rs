@@ -7,6 +7,7 @@ use egui::{Color32, Pos2, Rect, RichText, Stroke, Vec2};
 use hyperfetch_core::chunk::ChunkSnapshot;
 use hyperfetch_core::history::HistoryStatus;
 use hyperfetch_core::ingest::{self, truncate_chars};
+use hyperfetch_core::media;
 use hyperfetch_core::queue::{QueueItem, QueueItemStatus};
 
 use crate::settings::{BROWSERS, MEDIA_PRESETS};
@@ -95,6 +96,12 @@ pub fn render(app: &mut App, ui: &mut egui::Ui) {
                 app.notice = None;
             }
         });
+    }
+    if media::installing_ffmpeg() {
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new("Installing ffmpeg (about 200 MB download); the video starts once it is ready.").size(12.0).color(AMBER),
+        );
     }
     ui.add_space(8.0);
 
@@ -442,6 +449,11 @@ fn advanced_options(app: &mut App, ui: &mut egui::Ui) {
         ui.label(RichText::new("Browser Cookies:").size(12.0));
         combo(ui, "browser_cookies_combo", &mut app.settings.browser_cookies, &BROWSERS);
     });
+    ui.checkbox(&mut app.settings.install_ffmpeg, "Install ffmpeg when a video needs it (about 200 MB)").on_hover_text(
+        "ffmpeg joins separate video and audio (the best quality) and makes MP3/M4A files. Without it videos \
+         download in a lower quality and audio presets fail. The GPL build yt-dlp's makers publish is checked \
+         and installed for your user only.",
+    );
 
     ui.add_space(4.0);
     ui.horizontal(|ui| {
