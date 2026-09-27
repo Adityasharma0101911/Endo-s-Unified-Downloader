@@ -2471,8 +2471,16 @@ pub(crate) async fn find_site_media(
     cancel_flag: Option<Arc<AtomicBool>>,
 ) -> Result<Extracted, String> {
     let (options, tools) = prepare(options, &cancel_flag, false).await?;
-    find_with(url, &options, &tools, cancel_flag).await.map_err(drm_refused)
+    // Dropped, the run's process tree is killed.
+    match tokio::time::timeout(FIND_TIMEOUT, find_with(url, &options, &tools, cancel_flag)).await {
+        Ok(found) => found.map_err(drm_refused),
+        Err(_) => Err(format!("yt-dlp took over {}s", FIND_TIMEOUT.as_secs())),
+    }
 }
+
+/// How long [`find_site_media`] waits for yt-dlp: a site on a slow or stalling host is left
+/// alone rather than hold up the download of the page for as long as yt-dlp's retries last.
+const FIND_TIMEOUT: Duration = if cfg!(test) { Duration::from_secs(3) } else { Duration::from_secs(45) };
 
 /// How yt-dlp says that none of the sites it may use takes a link.
 const NO_SITE: &str = "No suitable extractor";
@@ -4585,5 +4593,24 @@ mod tests {
         tokio::time::advance(INSTALL_RETRY_AFTER).await;
         assert_eq!(unless_failed_lately(&failed, false, install(true)).await, Ok(PathBuf::from("yt-dlp")));
         assert!(failed.lock().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_site_that_takes_too_long_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        let (bin, script) = (dir.path().join("yt-dlp.cmd"), "@echo off\r\nif \"%~2\"==\"--version\" exit /b 1\r\nping -n 60 127.0.0.1 >nul\r\n");
+        #[cfg(not(windows))]
+        let (bin, script) = (dir.path().join("yt-dlp"), "#!/bin/sh\n[ \"$2\" = --version ] && exit 1\nsleep 60\n");
+        std::fs::write(&bin, script).unwrap();
+        #[cfg(unix)]
+        make_executable(&bin).unwrap();
+        let options = MediaDownloadOptions { output_dir: dir.path().to_path_buf(), custom_ytdlp_path: Some(bin), ..Default::default() };
+        let url = Url::parse("https://slow.example/watch/1").unwrap();
+
+        let started = std::time::Instant::now();
+        let err = find_site_media(&url, &options, None).await.err().expect("nothing was found");
+        assert_eq!(err, format!("yt-dlp took over {}s", FIND_TIMEOUT.as_secs()));
+        assert!(started.elapsed() < FIND_TIMEOUT + Duration::from_secs(20), "{:?}", started.elapsed());
     }
 }
