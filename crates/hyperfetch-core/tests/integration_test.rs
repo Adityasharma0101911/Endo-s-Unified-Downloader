@@ -1146,6 +1146,9 @@ async fn test_a_single_stream_goes_on_with_the_probes_answer() {
         done.expect("download should succeed");
 
         assert_file(&out, &data);
+        // Taken while writing: a broken answer's bytes are not in it.
+        let recorded = history_entry(&out).and_then(|entry| entry.blake3_hash);
+        assert_eq!(recorded.as_deref(), Some(blake3::hash(&data).to_hex().as_str()), "probe: {probe_reply:?}");
         assert!(seen > 0, "the stream was never seen under way");
         assert_eq!(mock.stats.gets.load(Ordering::SeqCst), gets, "chunked: {chunked}, probe: {probe_reply:?}");
     }

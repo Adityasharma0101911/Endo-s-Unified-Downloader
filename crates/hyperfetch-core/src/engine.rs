@@ -14,7 +14,6 @@ use reqwest::header::{
     RANGE,
 };
 use reqwest::{Client, Response, StatusCode};
-use tokio::io::AsyncWriteExt;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
@@ -75,6 +74,8 @@ const HLS_PARSE_TIMEOUT: Duration = if cfg!(test) { Duration::from_secs(1) } els
 /// the 255-byte (Linux) and 255 UTF-16 unit (NTFS) limits.
 const MAX_NAME_BYTES: usize = 200;
 const SNAPSHOT_INTERVAL: Duration = Duration::from_millis(150);
+/// Bytes a single stream gathers before writing and hashing them on a blocking thread.
+const STREAM_BATCH: usize = 1024 * 1024;
 const PERSIST_INTERVAL: Duration = Duration::from_secs(2);
 /// Time constant of the smoothed speed shown to the user.
 const SPEED_TAU_SECS: f64 = 2.0;
@@ -783,10 +784,7 @@ impl DownloadEngine {
                     self.fetch_ranges(client, size, probes, state, &part, &state_path, &final_path, &snapshot_tx).await?;
                 Written::Writer(writer)
             }
-            _ => {
-                self.fetch_stream(&client, &reference, live, &part, &final_path, &snapshot_tx).await?;
-                Written::File
-            }
+            _ => Written::Digest(self.fetch_stream(&client, &reference, live, &part, &final_path, &snapshot_tx).await?),
         };
         self.finalize(final_path, claim, written, started_at, &snapshot_tx).await
     }
@@ -962,7 +960,8 @@ impl DownloadEngine {
 
     /// Single-connection download for servers without range support or without a known length.
     /// Such a download cannot resume, so every retry starts from byte 0. The probe's answer, if
-    /// `live` brought the whole file, is the first try.
+    /// `live` brought the whole file, is the first try. Returns the digest of the file, taken as
+    /// it was written, for `finalize`.
     async fn fetch_stream(
         &self,
         client: &Client,
@@ -971,7 +970,7 @@ impl DownloadEngine {
         part: &Path,
         final_path: &Path,
         snapshot_tx: &Option<broadcast::Sender<EngineSnapshot>>,
-    ) -> Result<(), String> {
+    ) -> Result<FileDigest, String> {
         let limiter = self.limiter();
         let mut answered = match live {
             Some(Live::Stream { response, slot }) => Some((response, slot)),
@@ -982,7 +981,7 @@ impl DownloadEngine {
         loop {
             let attempt = self.stream_once(client, remote, answered.take(), part, final_path, limiter.as_deref(), snapshot_tx);
             let (kind, error) = match attempt.await {
-                Ok(()) => return Ok(()),
+                Ok(digest) => return Ok(digest),
                 Err(failure) => failure,
             };
             if self.cancel_token.is_cancelled() {
@@ -1012,7 +1011,9 @@ impl DownloadEngine {
     }
 
     /// One try at the whole file: `answered`, an answer already in with the host slot its request
-    /// holds, or else a new request under a slot of the host the probe was sent on to.
+    /// holds, or else a new request under a slot of the host the probe was sent on to. The file is
+    /// hashed as it is written (see [`InOrderFile`]), from its first byte, as every try starts
+    /// there; nothing is flushed here, as `finalize` does that with fsync_on_complete.
     #[allow(clippy::too_many_arguments)]
     async fn stream_once(
         &self,
@@ -1023,7 +1024,7 @@ impl DownloadEngine {
         final_path: &Path,
         limiter: Option<&RateLimiter>,
         snapshot_tx: &Option<broadcast::Sender<EngineSnapshot>>,
-    ) -> Result<(), (FailureKind, String)> {
+    ) -> Result<FileDigest, (FailureKind, String)> {
         let stall = self.stall_timeout();
         let transient = |msg: String| (FailureKind::Transient, msg);
         let (response, _slot) = match answered {
@@ -1069,10 +1070,10 @@ impl DownloadEngine {
             }
         }
 
-        let file = tokio::fs::File::create(part)
+        let mut out = InOrderFile::create(part, self.options.expected_checksum.clone())
             .await
             .map_err(|e| (FailureKind::Fatal, format!("Failed to create {}: {}", part.display(), e)))?;
-        let mut out = tokio::io::BufWriter::with_capacity(1 << 20, file);
+        let disk_error = |e: std::io::Error| (FailureKind::Fatal, format!("Disk write error: {}", e));
         let mut stream = response.bytes_stream();
         let mut written: u64 = 0;
         let mut meter = SpeedMeter::new(0);
@@ -1105,27 +1106,21 @@ impl DownloadEngine {
                         }
                     }
                     idle.as_mut().reset(tokio::time::Instant::now() + stall);
-                    out.write_all(&bytes)
-                        .await
-                        .map_err(|e| (FailureKind::Fatal, format!("Disk write error: {}", e)))?;
                     written += bytes.len() as u64;
                     if remote.size.is_some_and(|size| written > size) {
                         return Err((FailureKind::Fatal, "remote file changed: server sent more data than expected".to_string()));
                     }
+                    out = out.push(&bytes).await.map_err(disk_error)?;
                 }
             }
         }
 
-        out.flush().await.map_err(|e| (FailureKind::Fatal, format!("Disk write error: {}", e)))?;
-        out.get_ref()
-            .sync_all()
-            .await
-            .map_err(|e| (FailureKind::Fatal, format!("Failed to flush download to disk: {}", e)))?;
+        let digest = out.finish().await.map_err(disk_error)?;
         match remote.size {
             Some(expected) if written != expected => {
                 Err(transient(format!("connection closed after {} of {} bytes", written, expected)))
             }
-            _ => Ok(()),
+            _ => Ok(digest),
         }
     }
 
@@ -1301,6 +1296,50 @@ enum Written {
     Digest(FileDigest),
     /// A [`Written::Digest`] of a file its writer has already flushed, as fsync_on_complete asks.
     Flushed(FileDigest),
+}
+
+/// A file written from its first byte to its last, as a single stream writes it. Pieces gather
+/// into batches of `STREAM_BATCH` bytes, each written and then hashed on a blocking thread, so
+/// the file's digest is ready once its last byte is written (see [`StreamHasher`]).
+struct InOrderFile {
+    file: File,
+    hasher: StreamHasher,
+    batch: Vec<u8>,
+}
+
+impl InOrderFile {
+    /// Creates `path` (emptying it if it exists); `expected_checksum` says which digests to take.
+    async fn create(path: &Path, expected_checksum: Option<String>) -> std::io::Result<Self> {
+        let path = path.to_path_buf();
+        let file = blocking(move || File::create(&path)).await.map_err(std::io::Error::other)??;
+        let hasher = StreamHasher::new(expected_checksum.as_deref());
+        Ok(Self { file, hasher, batch: Vec::with_capacity(STREAM_BATCH) })
+    }
+
+    /// Appends `bytes`, writing the batch out once it is full.
+    async fn push(mut self, bytes: &[u8]) -> std::io::Result<Self> {
+        self.batch.extend_from_slice(bytes);
+        if self.batch.len() < STREAM_BATCH {
+            return Ok(self);
+        }
+        self.write_batch().await
+    }
+
+    async fn write_batch(mut self) -> std::io::Result<Self> {
+        blocking(move || {
+            std::io::Write::write_all(&mut self.file, &self.batch)?;
+            self.hasher.update(&self.batch);
+            self.batch.clear();
+            Ok(self)
+        })
+        .await
+        .map_err(std::io::Error::other)?
+    }
+
+    /// Writes what is left and returns the digest of everything written.
+    async fn finish(self) -> std::io::Result<FileDigest> {
+        Ok(self.write_batch().await?.hasher.finish())
+    }
 }
 
 /// Runs `hash` and, if given, `flush` at the same time on blocking threads. A mismatch `hash`
@@ -3816,7 +3855,7 @@ mod tests {
     /// no ETag, and the first GET of `/stall/<name>` past the file's start goes silent after
     /// 64 KiB.
     async fn file_server(data: Vec<u8>, pace: Duration) -> Url {
-        use tokio::io::AsyncReadExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = crate::hosts::unseen_listener().await;
         let base = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
         let data = Arc::new(data);
@@ -4324,6 +4363,54 @@ mod tests {
             assert_eq!(writer.sync_count(), usize::from(fsync), "fsync_on_complete: {fsync}");
             assert_eq!(std::fs::read(&target).unwrap(), b"abc");
         }
+    }
+
+    #[tokio::test]
+    async fn test_a_single_stream_is_hashed_from_its_first_byte_as_it_is_written() {
+        use sha2::Digest;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let data: Vec<u8> = (0..3 * PREFETCH as usize + 12_345).map(|i| (i * 31 % 251) as u8).collect();
+        // A server ignoring ranges whose first answer breaks off halfway: the stream starts over.
+        let listener = crate::hosts::unseen_listener().await;
+        let url = Url::parse(&format!("http://{}/whole.bin", listener.local_addr().unwrap())).unwrap();
+        let gets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (served, answers) = (Arc::new(data.clone()), Arc::clone(&gets));
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let (data, gets) = (Arc::clone(&served), Arc::clone(&answers));
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => head.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let answer = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", data.len());
+                    if socket.write_all(answer.as_bytes()).await.is_err() || head.starts_with(b"HEAD") {
+                        return;
+                    }
+                    let body = match gets.fetch_add(1, Ordering::SeqCst) {
+                        0 => &data[..data.len() / 2],
+                        _ => &data[..],
+                    };
+                    let _ = socket.write_all(body).await;
+                });
+            }
+        });
+        let dir = tempdir().unwrap();
+        let sha256: String = sha2::Sha256::digest(&data).iter().map(|b| format!("{b:02x}")).collect();
+        let checksum = format!("sha256:{sha256}");
+        let options =
+            DownloadOptions { output_path: Some(dir.path().to_path_buf()), expected_checksum: Some(checksum), ..Default::default() };
+        let path = DownloadEngine::new(vec![url], options).run(None).await.expect("the second try brings the file");
+
+        assert_eq!(std::fs::read(&path).unwrap(), data);
+        assert_eq!(gets.load(Ordering::SeqCst), 2, "the broken answer, then the whole file");
+        // The broken try's bytes are not in the digest, or the checksum would call for a re-read.
+        let read_back = crate::storage::READ_BACK.lock().unwrap().clone();
+        assert!(!read_back.iter().any(|p| p.starts_with(dir.path())), "read back: {read_back:?}");
     }
 
     #[tokio::test]
