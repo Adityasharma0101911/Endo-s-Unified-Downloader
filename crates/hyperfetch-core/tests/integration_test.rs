@@ -3156,9 +3156,11 @@ async fn test_a_codeberg_file_page_downloads_the_file() {
 
 /// A torrent with a web seed, as GitHub's raw link and Dropbox's `dl=1` serve it; their file page
 /// and share page are web pages, a private tracker asks for a login, GitHub's raw link into a
-/// private repository is not found, and another host answers with a page. That torrent and a
-/// metalink of the same file are also served labelled web pages, as PHP labels what it sends,
-/// and a torrent without web seeds is shared on Dropbox.
+/// private repository is not found, and another host answers with a page (one of them larger than
+/// a document may be, by its Content-Length or as it streams). That torrent and a metalink of the
+/// same file are also served labelled web pages, as PHP labels what it sends, and a torrent
+/// without web seeds is shared on Dropbox. Two hosts are busy: one times out (408), one limits
+/// its rate (429).
 fn hosted_documents(method: &str, target: &str) -> Vec<u8> {
     let torrent = b"d8:url-list20:https://s.example/d/4:infod6:lengthi3e4:name5:a.bin12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaaee";
     let metalink = br#"<metalink xmlns="urn:ietf:params:xml:ns:metalink"><file name="a.bin"><url>https://s.example/d/a.bin</url></file></metalink>"#;
@@ -3172,7 +3174,17 @@ fn hosted_documents(method: &str, target: &str) -> Vec<u8> {
         "http://mirrors.invalid/list.meta4" => response(method, "200 OK", "Content-Type: text/html; charset=UTF-8\r\n", metalink),
         "http://tracker.invalid/dl/1/pack.torrent" => response(method, "403 Forbidden", "Content-Type: text/html\r\n", b"<title>Log in</title>"),
         "http://github.com/o/private/raw/main/pack.torrent" => response(method, "404 Not Found", "Content-Type: text/plain\r\n", b"404: Not Found"),
-        _ => response(method, "200 OK", "Content-Type: text/html; charset=utf-8\r\n", b"<!doctype html><title>pack.torrent</title>"),
+        "http://slow.invalid/pack.torrent" => response(method, "408 Request Timeout", "Content-Type: text/plain\r\n", b"timed out"),
+        "http://busy.invalid/list.meta4" => response(method, "429 Too Many Requests", "Retry-After: 1\r\n", b"slow down"),
+        "http://pages.invalid/huge.meta4" => {
+            format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", 16 * 1024 * KB + 1).into_bytes()
+        }
+        "http://pages.invalid/endless.torrent" => {
+            let mut out = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n<!doctype html>".to_vec();
+            out.resize(out.len() + 16 * 1024 * KB, b' ');
+            out
+        }
+        _ =>response(method, "200 OK", "Content-Type: text/html; charset=utf-8\r\n", b"<!doctype html><title>pack.torrent</title>"),
     }
 }
 
@@ -3197,10 +3209,17 @@ async fn test_a_document_on_a_file_page_or_share_is_read_and_one_behind_a_login_
         "http://github.com/o/private/blob/main/pack.torrent",
         "http://files.invalid/pack.torrent",
         "http://files.invalid/list.meta4",
+        "http://pages.invalid/huge.meta4",
+        "http://pages.invalid/endless.torrent",
         "http://www.dropbox.com/s/k3y/bare.torrent?dl=0",
     ] {
         let tasks = ingest(&[link], &http).await.expect(link);
         assert_eq!(tasks, [Task { urls: vec![Url::parse(link).unwrap()], document_itself: true, ..Task::default() }], "{link}");
+    }
+    // A busy host is an error to retry: the engine would save the document as the file.
+    for (link, status) in [("http://slow.invalid/pack.torrent", "408 Request Timeout"), ("http://busy.invalid/list.meta4", "429 Too Many Requests")] {
+        let err = ingest(&[link], &http).await.expect_err(link);
+        assert!(err.contains(status), "{err}");
     }
     // Which saves no page in the document's place.
     let temp = tempdir().unwrap();
