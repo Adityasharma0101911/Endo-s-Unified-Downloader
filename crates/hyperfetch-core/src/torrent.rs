@@ -245,6 +245,15 @@ pub fn parse_torrent_bytes(data: &[u8]) -> Result<TorrentInfo, String> {
                     .collect::<Result<Vec<_>, _>>()?,
                 _ => return Err("Invalid torrent: file entry without path".to_string()),
             };
+            // A padding file (BEP 47, as hybrid torrents have them) only lines the next file up
+            // with a piece: no web seed serves one. Older creators mark them by name alone.
+            let padding = match dict_get(fd, b"attr") {
+                Some(BValue::Bytes(attr)) => attr.contains(&b'p'),
+                _ => raw_path.first().is_some_and(|c| c == ".pad" || c.starts_with("_____padding_file_")),
+            };
+            if padding {
+                continue;
+            }
             let path = raw_path
                 .iter()
                 .map(|c| local_name(c))
@@ -423,6 +432,27 @@ mod tests {
         assert_eq!(info.files[0].path, vec!["sub", "x.bin"]);
         assert_eq!(info.files[0].urls[0].as_str(), "https://mirror/pub/dir/sub/x.bin");
         assert_eq!(info.files[1].urls[0].as_str(), "https://mirror/pub/dir/y.bin");
+    }
+
+    #[test]
+    fn test_padding_files_are_left_out() {
+        let bitcomet = "_____padding_file_0_if you see this file, please update to BitComet 0.85 or above____";
+        let torrent = format!(
+            "d8:url-list18:https://mirror/pub4:infod5:filesl\
+             d6:lengthi3e4:pathl5:a.binee\
+             d4:attr1:p6:lengthi16381e4:pathl4:.pad5:16381ee\
+             d4:attr1:x6:lengthi4e4:pathl5:b.binee\
+             d6:lengthi5e4:pathl{}:{}ee\
+             d4:attr1:h6:lengthi6e4:pathl4:.pad5:c.binee\
+             e4:name4:packee",
+            bitcomet.len(),
+            bitcomet
+        );
+        let info = parse_torrent_bytes(torrent.as_bytes()).unwrap();
+        let paths: Vec<_> = info.files.iter().map(|f| f.path.join("/")).collect();
+        // An executable (`x`) is a file; so is a hidden one (`h`) named like a padding file.
+        assert_eq!(paths, ["a.bin", "b.bin", ".pad/c.bin"]);
+        assert_eq!(info.total_length, 3 + 4 + 6);
     }
 
     #[test]
