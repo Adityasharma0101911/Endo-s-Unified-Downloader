@@ -26,7 +26,7 @@ use crate::hls::HlsError;
 use crate::hosts::{self, HostKey, HostProfile, HostSlot};
 use crate::mirror::MirrorRacer;
 use crate::range::{compute_gaps, ByteRange};
-use crate::resolver::{GoogleDriveResolver, HtmlVideoResolver};
+use crate::resolver::HtmlVideoResolver;
 use crate::state::DownloadState;
 use crate::storage::{verify_digest, DiskWriter, FileDigest, StorageError, StreamHasher, VerifyError};
 use crate::worker::{
@@ -653,7 +653,12 @@ impl DownloadEngine {
                     let probe = async {
                         // Only the first mirror fetches the file's start: the download uses one copy.
                         let (mut info, body) = probe_url(&client, auth.as_deref(), &url, i == 0, limit).await?;
-                        GoogleDriveResolver::check_answer(&url, &info.headers).map_err(|e| format!("{}: {}", url, e))?;
+                        // A shortened link that lands on a host a resolver takes is judged there (see
+                        // `fetch_resolved`), not as the page it may answer with here.
+                        if !crate::resolver::lands_elsewhere(&url, &info.final_url) {
+                            crate::resolver::check_answer(&url, &info.final_url, &info.headers)
+                                .map_err(|e| format!("{}: {}", url, e))?;
+                        }
                         let live = match body {
                             Some(body) if !started.load(Ordering::Relaxed) => {
                                 reading.store(true, Ordering::Relaxed);
