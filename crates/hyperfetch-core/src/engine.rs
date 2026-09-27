@@ -289,11 +289,11 @@ impl DownloadEngine {
 
     /// Downloads what the resolved mirrors serve: an HLS stream if one is a playlist, else their
     /// file. An answer that lands on a host a resolver takes, or on a media site, is downloaded
-    /// from there instead (see `follow`). With `route.scrape`, a web page they answer with is
+    /// from there instead (see `follow`). With `route.scrape`, a web page they answer with is an
+    /// error when a link shortener or mail scanner showed it instead of redirecting; any other is
     /// looked into (see `look_into_page`): the video it plays is downloaded in its place, the link
     /// it sends the browser on to at once is followed. A page that leads nowhere is asked of
-    /// yt-dlp's own sites (see `site_media`), and is downloaded as it is when none takes it,
-    /// unless a link shortener or mail scanner showed it instead of redirecting.
+    /// yt-dlp's own sites (see `site_media`), and is downloaded as it is when none takes it.
     async fn fetch_resolved(
         &self,
         client: Client,
@@ -343,6 +343,13 @@ impl DownloadEngine {
         if !route.scrape || !HtmlVideoResolver::is_page(&url, &probed.reference.headers) {
             return self.download(client, probed, snapshot_tx).await;
         }
+        // Never clicked through, whatever the page holds.
+        if let Some(host) = shortener_host(&final_url) {
+            return Err(format!(
+                "{} showed a page instead of redirecting (a preview or a warning): open the link in your browser",
+                host
+            ));
+        }
         match self.look_into_page(&client, &mut probed).await? {
             Some(Lead::Video(video)) => {
                 // Nothing of the page is kept: its answer and the probes still out are given up.
@@ -368,12 +375,6 @@ impl DownloadEngine {
         if let Some(found) = self.site_media(&final_url).await? {
             drop(probed);
             return self.naming(final_url.clone()).run_media(final_url, Some(found), snapshot_tx).await;
-        }
-        if let Some(host) = shortener_host(&final_url) {
-            return Err(format!(
-                "{} showed a page instead of redirecting (a preview or a warning): open the link in your browser",
-                host
-            ));
         }
         self.download(client, probed, snapshot_tx).await
     }
@@ -4839,11 +4840,11 @@ mod tests {
     #[test]
     fn test_a_page_refreshing_at_once_names_its_target() {
         let page = Url::parse("https://t.co/abc").unwrap();
-        let target = |meta: &str| HtmlVideoResolver::meta_refresh(&format!("<head><noscript>{meta}</noscript></head>"), &page);
+        let target = |meta: &str| HtmlVideoResolver::meta_refresh(&format!("<head>{meta}</head>"), &page);
         let a = Url::parse("https://example.com/a").unwrap();
         // t.co's own answer, and the case, spacing, separator and quoting variants browsers read alike.
         for meta in [
-            r#"<META http-equiv="refresh" content="0;URL=https://example.com/a">"#,
+            r#"<noscript><META http-equiv="refresh" content="0;URL=https://example.com/a"></noscript>"#,
             r#"<meta HTTP-EQUIV="Refresh" CONTENT="0; url=https://example.com/a">"#,
             r#"<meta http-equiv="refresh" content="0;URL='https://example.com/a'">"#,
             r#"<meta http-equiv='refresh' content='0, URL="https://example.com/a"'>"#,
@@ -4855,6 +4856,14 @@ mod tests {
         }
         let relative = target(r#"<meta http-equiv="refresh" content="0; url=/dl/f.zip?x=1&amp;y=2">"#);
         assert_eq!(relative.map(String::from).as_deref(), Some("https://t.co/dl/f.zip?x=1&y=2"));
+        // For browsers without JavaScript only, a page asks for it on its own site (as Google's
+        // answers do), or sends the browser on to another site (as t.co's do).
+        let enable_js = r#"<noscript><meta content="0;url=/httpservice/retry/enablejs?sei=x" http-equiv="refresh"></noscript>"#;
+        assert_eq!(target(enable_js), None);
+        let both = format!(r#"{enable_js}<noscript><meta http-equiv="refresh" content="0;url=https://example.com/a"></noscript>"#);
+        assert_eq!(target(&both).as_ref(), Some(&a));
+        let after_noscript = r#"<noscript><style>p{display:none}</style></noscript><meta http-equiv="refresh" content="0; url=/next">"#;
+        assert_eq!(target(after_noscript).map(String::from).as_deref(), Some("https://t.co/next"));
         for meta in [
             // A timed page is for reading first; one refreshing without a target only reloads.
             r#"<meta http-equiv="refresh" content="5; url=https://example.com/a">"#,
@@ -4863,6 +4872,7 @@ mod tests {
             r#"<meta http-equiv="refresh" content="0; url=ftp://example.com/a">"#,
             r#"<meta http-equiv="content-type" content="0; url=https://example.com/a">"#,
             r#"<meta name="refresh" content="0; url=https://example.com/a">"#,
+            r#"<NOSCRIPT><meta http-equiv="refresh" content="0; url=https://t.co/abc?js=0"></NOSCRIPT>"#,
         ] {
             assert_eq!(target(meta), None, "{meta}");
         }
