@@ -937,25 +937,14 @@ fn document_options(settings: &Settings, tasks: &[Task], checksum: &str) -> Resu
     tasks.iter().map(|task| task_options(settings, task, checksum, "")).collect()
 }
 
-/// Queues one download. One its input named is shown under that name at once, and the queue
-/// knows its target before the engine reports it (see [`util::folder_to_create`]).
+/// Queues one download; one its input named is shown under that name at once. Its target is
+/// left for the engine to report, so Start Over and Delete Leftovers never reach a file another
+/// download holds under that name.
 fn queue_task(queue: &mut DownloadQueue, task: Task, options: DownloadOptions) -> usize {
-    let target = task.name.and(options.output_path.clone());
-    let id = queue.add_item(task.urls, options);
-    if target.is_some() {
-        let named = EngineSnapshot {
-            total_bytes: 0,
-            downloaded_bytes: 0,
-            speed_bytes_per_sec: 0.0,
-            progress_ratio: 0.0,
-            active_workers: 0,
-            mirror_speeds: Vec::new(),
-            chunks: Vec::new(),
-            target_path: target,
-        };
-        queue.apply_snapshot(id, &named);
+    match task.name {
+        Some(_) => queue.add_named_item(task.urls, options),
+        None => queue.add_item(task.urls, options),
     }
-    id
 }
 
 async fn unblock<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T, String> {
@@ -1430,6 +1419,9 @@ mod tests {
         let id = queue_task(&mut queue, task, options);
         let item = queue.get_item(id).unwrap().clone();
         assert_eq!(item.filename, "disc.iso");
+        // Only the engine says which file is its own: Start Over and Delete Leftovers of a named
+        // download that never started must not reach another download's partial file.
+        assert_eq!(item.target_path, None);
 
         let (engines, cancel, slot) = (shared_clients(), Arc::new(Notify::new()), Arc::new(Mutex::new(None)));
         let folder = util::folder_to_create(&item);

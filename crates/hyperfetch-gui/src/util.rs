@@ -27,12 +27,10 @@ pub fn clipboard_link(text: &str) -> Option<String> {
 }
 
 /// The folder to create before `item` starts, since the engine takes a missing folder for a file
-/// name: its output path, unless that names the file itself (a download a metalink, torrent or
-/// magnet named, whose target is that path or a numbered sibling of it).
+/// name: its output path, unless that is the file itself (a download a metalink, torrent or
+/// magnet named; the engine creates its folders).
 pub fn folder_to_create(item: &QueueItem) -> Option<PathBuf> {
-    let output = item.options.output_path.as_ref()?;
-    let names_file = item.target_path.as_deref().is_some_and(|target| target.parent() == output.parent());
-    (!names_file).then(|| output.clone())
+    item.options.output_path.clone().filter(|_| !item.names_file)
 }
 
 /// `path` without a trailing `.part`: the final name of an in-progress download.
@@ -230,21 +228,23 @@ mod tests {
     #[test]
     fn only_a_folder_to_save_into_is_created_before_a_download() {
         let dir = Path::new("dl");
-        let item = |output: PathBuf, target: Option<PathBuf>| {
+        let item = |output: PathBuf, named: bool, target: Option<PathBuf>| {
             let mut queue = hyperfetch_core::DownloadQueue::new();
             let options = hyperfetch_core::engine::DownloadOptions { output_path: Some(output), ..Default::default() };
-            let id = queue.add_item(vec![Url::parse("https://a.example/x.iso").unwrap()], options);
+            let urls = vec![Url::parse("https://a.example/x.iso").unwrap()];
+            let id = if named { queue.add_named_item(urls, options) } else { queue.add_item(urls, options) };
             let mut item = queue.get_item(id).unwrap().clone();
             item.target_path = target;
             item
         };
         // Saved under the server's name: the folder, whether or not the engine reported the file yet.
-        assert_eq!(folder_to_create(&item(dir.into(), None)), Some(dir.into()));
-        assert_eq!(folder_to_create(&item(dir.into(), Some(dir.join("x.iso")))), Some(dir.into()));
-        // Named by its input: the path is the file, whose folders the engine creates.
+        assert_eq!(folder_to_create(&item(dir.into(), false, None)), Some(dir.into()));
+        assert_eq!(folder_to_create(&item(dir.into(), false, Some(dir.join("x.iso")))), Some(dir.into()));
+        // Named by its input: the path is the file, whose folders the engine creates, before and
+        // after the engine reported where it went.
         let file = dir.join("sub").join("x.iso");
-        assert_eq!(folder_to_create(&item(file.clone(), Some(file.clone()))), None);
-        assert_eq!(folder_to_create(&item(file, Some(dir.join("sub").join("x (1).iso")))), None);
+        assert_eq!(folder_to_create(&item(file.clone(), true, None)), None);
+        assert_eq!(folder_to_create(&item(file, true, Some(dir.join("sub").join("x (1).iso")))), None);
     }
 
     #[cfg(windows)]
