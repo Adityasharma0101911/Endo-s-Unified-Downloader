@@ -895,21 +895,9 @@ async fn repair_in_place(
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
-    use std::sync::Once;
     use tempfile::{tempdir, NamedTempFile};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::Notify;
-
-    /// A repair through the engine records the finished file in the history file; point that at a
-    /// file of this test process, never the user's.
-    fn isolate_history() {
-        static ONCE: Once = Once::new();
-        ONCE.call_once(|| {
-            let path = std::env::temp_dir().join(format!("hf-verify-history-{}.json", std::process::id()));
-            let _ = std::fs::remove_file(&path);
-            std::env::set_var("ENDO_HISTORY_PATH", path);
-        });
-    }
 
     fn empty_history() -> DownloadHistoryManager {
         let dir = tempdir().unwrap();
@@ -1052,7 +1040,6 @@ mod tests {
         content: Vec<u8>,
         respond: fn(usize, &str, u64, u64, &[u8]) -> Vec<u8>,
     ) -> Url {
-        isolate_history();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1105,7 +1092,6 @@ mod tests {
     /// Serves `content` as ETag "v1" to many connections at once, HEAD refused. An If-Range that
     /// does not match gets the whole file, as from any server honoring it.
     async fn engine_server(content: Vec<u8>, mode: Mode) -> (Url, Arc<Served>) {
-        isolate_history();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let served = Arc::new(Served::default());
