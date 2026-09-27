@@ -253,24 +253,29 @@ The engine is the `hyperfetch-core` library crate. `hyperfetch-cli` and `hyperfe
 
 ## Benchmarks
 
-v1.0 against this version on a local server (`bench/`, median of 3 runs, every file checked by
-SHA-256, Windows 11, 32 threads):
+v1.0 against this version on a local server (`bench/`, the two binaries taking turns, median of
+3 runs, every file checked by SHA-256, Windows 11, 32 threads). Batches use `-j 4`, the default,
+unless marked `-j 1`; v1.0 always downloads one file at a time.
 
-| Scenario (2 MiB/s per connection, 40 ms per request) | v1.0 | now |
+| Server caps each connection at 2 MiB/s, 40 ms per request | v1.0 | now |
 |---|---:|---:|
-| 256 MiB file, `-s 16` | 8.50 s | 8.48 s |
-| 256 MiB file, HEAD without `Accept-Ranges` | 128.56 s (one connection) | 8.41 s |
-| 256 MiB file, one connection stalls forever | hangs | 35.65 s |
-| 50 small files (20 MiB), `-i` | 5.98 s | 9.93 s (`-j 1`), 2.71 s (`-j 4`) |
+| 256 MiB file, `-s 16` | 9.00 s | 8.74 s |
+| 256 MiB file, HEAD without `Accept-Ranges` | 128.66 s (one connection) | 8.52 s |
+| 256 MiB file, one connection stalls forever | hangs | 8.73 s |
+| 50 small files (20 MiB), `-i` | 6.18 s | 1.72 s (`-j 1`: 7.02 s) |
+| Same, every new connection takes 80 ms to set up | 14.32 s | 3.10 s (`-j 1`: 10.84 s) |
+| Same as the plain batch, with 1000 downloads in the history | 6.48 s | 1.94 s (`-j 1`: 7.38 s) |
 
-| Scenario (no per-connection cap, 40 ms per request) | v1.0 | now |
+| No per-connection cap, 40 ms per request | v1.0 | now |
 |---|---:|---:|
-| 50 small files (20 MiB), `-i` | 4.65 s | 2.76 s (`-j 1`), 0.77 s (`-j 4`) |
+| 256 MiB file, `-s 16` | 0.62 s | 0.32 s |
+| 50 small files (20 MiB), `-i` | 4.80 s | 0.66 s (`-j 1`: 2.31 s) |
+| Same, every new connection takes 80 ms to set up | 13.32 s | 0.88 s (`-j 1`: 2.52 s) |
 
-Small files come over the single connection that probed them unless that connection turns out to
-be capped, so a batch of tiny files from a server that caps every connection is slower one at a
-time than v1.0's fixed 16-way split; `-j 4`, now the default, is faster. Hashing a finished 2 GiB file (BLAKE3,
-warm cache) takes 0.34 s instead of 0.64 s. Reproduce with `bench/README.md`.
+One at a time (`-j 1`), tiny files from a server that caps every connection are still slightly
+slower than v1.0's fixed 16-way split: each file starts on the connection that probed it. BLAKE3
+is computed while the file downloads, so large files finish without reading the whole file back.
+Reproduce with `bench/README.md`.
 
 ---
 

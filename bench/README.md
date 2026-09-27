@@ -55,7 +55,43 @@ All runs also pass `-q -d <tempdir>`. Pick scenarios with `--only large,stall`; 
 server with `--rate-mib`, `--latency-ms`, `--connect-ms` (the `handshake` scenario's setup
 time), `--large-mib`, `--small-count`, `--small-kib`, `--medium-count`, `--medium-mib`.
 
-## Results (2026-09-26, Windows 11, 32 threads)
+## Results (2026-09-26, Windows 11, 32 threads, commit `bb0bc43`)
+
+Default server (2 MiB/s per connection, 40 ms per request; 80 ms connection setup in the
+slow-setup scenario):
+
+| Scenario | Binary | Median wall | Min | Max | MB/s | Passed | Outcomes |
+|---|---|---:|---:|---:|---:|---:|---|
+| Large file, -s 16 | v1.0 | 9.00 s | 8.97 s | 9.43 s | 29.8 | 3/3 | ok |
+| Large file, -s 16 | new | 8.74 s | 8.64 s | 8.84 s | 30.7 | 3/3 | ok |
+| Small-file batch via -i | v1.0 (sequential) | 6.18 s | 6.04 s | 6.44 s | 3.4 | 3/3 | ok |
+| Small-file batch via -i | new -j 1 | 7.02 s | 6.83 s | 7.05 s | 3.0 | 3/3 | ok |
+| Small-file batch via -i | new -j 4 | 1.72 s | 1.67 s | 1.89 s | 12.2 | 3/3 | ok |
+| Small-file batch via -i, slow connection setup | v1.0 (sequential) | 14.32 s | 14.12 s | 14.41 s | 1.5 | 3/3 | ok |
+| Small-file batch via -i, slow connection setup | new -j 1 | 10.84 s | 10.60 s | 11.31 s | 1.9 | 3/3 | ok |
+| Small-file batch via -i, slow connection setup | new -j 4 | 3.10 s | 2.94 s | 3.31 s | 6.8 | 3/3 | ok |
+| Small-file batch via -i, 1000-entry history | v1.0 (sequential) | 6.48 s | 6.39 s | 6.57 s | 3.2 | 3/3 | ok |
+| Small-file batch via -i, 1000-entry history | new -j 1 | 7.38 s | 6.49 s | 7.41 s | 2.8 | 3/3 | ok |
+| Small-file batch via -i, 1000-entry history | new -j 4 | 1.94 s | 1.91 s | 2.08 s | 10.8 | 3/3 | ok |
+| Large file, HEAD without Accept-Ranges | v1.0 | 128.66 s | 128.62 s | 130.16 s | 2.1 | 3/3 | ok |
+| Large file, HEAD without Accept-Ranges | new | 8.52 s | 8.45 s | 8.53 s | 31.5 | 3/3 | ok |
+| Large file, one connection stalls forever | v1.0 | - | - | - | - | 0/3 | hung |
+| Large file, one connection stalls forever | new | 8.73 s | 8.70 s | 8.82 s | 30.8 | 3/3 | ok |
+
+`--rate-mib 0 --only large,small,handshake` (no per-connection cap):
+
+| Scenario | Binary | Median wall | Min | Max | MB/s | Passed | Outcomes |
+|---|---|---:|---:|---:|---:|---:|---|
+| Large file, -s 16 | v1.0 | 0.62 s | 0.53 s | 0.68 s | 430.5 | 3/3 | ok |
+| Large file, -s 16 | new | 0.32 s | 0.32 s | 0.38 s | 827.5 | 3/3 | ok |
+| Small-file batch via -i | v1.0 (sequential) | 4.80 s | 4.78 s | 4.88 s | 4.4 | 3/3 | ok |
+| Small-file batch via -i | new -j 1 | 2.31 s | 2.29 s | 2.31 s | 9.1 | 3/3 | ok |
+| Small-file batch via -i | new -j 4 | 0.66 s | 0.65 s | 0.67 s | 31.8 | 3/3 | ok |
+| Small-file batch via -i, slow connection setup | v1.0 (sequential) | 13.32 s | 13.15 s | 13.46 s | 1.6 | 3/3 | ok |
+| Small-file batch via -i, slow connection setup | new -j 1 | 2.52 s | 2.48 s | 2.70 s | 8.3 | 3/3 | ok |
+| Small-file batch via -i, slow connection setup | new -j 4 | 0.88 s | 0.78 s | 0.90 s | 23.9 | 3/3 | ok |
+
+## Earlier results (2026-09-26, commit `da1613a`)
 
 Taken before the runs alternated and before the `handshake` and `history` scenarios and the
 Min/Max columns existed, with the new build at commit `da1613a`.
