@@ -185,6 +185,7 @@ impl Settings {
             only_new: self.only_new,
             cookies: self.browser_cookies().or_else(cookies_file).unwrap_or_default(),
             proxy: non_empty(&self.proxy),
+            notes: None,
         }
     }
 

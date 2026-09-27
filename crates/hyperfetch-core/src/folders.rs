@@ -21,11 +21,16 @@ const DRIVE_FIELDS: &str = "nextPageToken,files(id,name,mimeType,size,md5Checksu
 
 const DRIVE_SHORTCUT: &str = "application/vnd.google-apps.shortcut";
 
+/// Most items one listing reads: a folder that lists more is taken for one whose listing does
+/// not end (a server repeating itself).
+const MAX_ITEMS: usize = 100_000;
+
 /// A folder a link names, from its shape.
 #[derive(Debug, PartialEq)]
 enum Folder {
-    /// A Google Drive folder, and the resource key one shared by link before 2021 opens with.
-    Drive { id: String, resource_key: Option<String> },
+    /// A Google Drive folder, and the resource key one shared by link before 2021 opens with;
+    /// `maybe` for an `open?id=` link, which names a file or a folder.
+    Drive { id: String, resource_key: Option<String>, maybe: bool },
     /// A MediaFire folder; `maybe` for a `/?key` link, which names a file or a folder.
     MediaFire { key: String, maybe: bool },
 }
@@ -35,19 +40,25 @@ fn token(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
-/// The folder `url` names: drive.google.com/drive[/u/N]/folders/{id}, mediafire.com/folder/{key}[/...]
-/// or mediafire.com/?{key}.
+/// The folder `url` names: drive.google.com/drive[/u/N][/mobile]/folders/{id} (the mobile app
+/// shares the latter), /folderview?id= and /open?id= (which Drive sends on to /drive/folders/,
+/// checked live), mediafire.com/folder/{key}[/...] or mediafire.com/?{key}.
 fn folder_of(url: &Url) -> Option<Folder> {
     let segs: Vec<&str> = url.path_segments()?.collect();
+    let param = |name: &str| url.query_pairs().find(|(k, _)| k == name).map(|(_, v)| v.into_owned());
     match url.host_str()?.trim_end_matches('.') {
         "drive.google.com" => {
-            let id = match segs[..] {
-                ["drive", "folders", id, ..] => id,
-                ["drive", "u", n, "folders", id, ..] if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => id,
+            let account = |n: &str| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit());
+            let (id, maybe) = match segs[..] {
+                ["drive", "folders", id, ..] | ["drive", "mobile", "folders", id, ..] => (id.to_string(), false),
+                ["drive", "u", n, "folders", id, ..] | ["drive", "u", n, "mobile", "folders", id, ..] if account(n) => {
+                    (id.to_string(), false)
+                }
+                ["folderview"] => (param("id")?, false),
+                ["open"] => (param("id")?, true),
                 _ => return None,
             };
-            let resource_key = url.query_pairs().find(|(k, _)| k == "resourcekey").map(|(_, v)| v.into_owned());
-            token(id).then(|| Folder::Drive { id: id.to_string(), resource_key })
+            token(&id).then(|| Folder::Drive { id, resource_key: param("resourcekey"), maybe })
         }
         "mediafire.com" | "www.mediafire.com" => match segs[..] {
             ["folder", key, ..] if token(key) => Some(Folder::MediaFire { key: key.to_string(), maybe: false }),
@@ -68,24 +79,31 @@ pub fn lists(url: &Url) -> bool {
 /// downloaded as it is); `Some(Ok)` is never empty.
 ///
 /// A Google Drive folder is listed through the Drive API with the user's Google API key, else
-/// from its public page. Requests are made one at a time.
+/// from its public page. Requests are made one at a time. Only the folder linked must be read: a
+/// subfolder that cannot be is left out. What was left out, and why, goes to `options`' notes.
 pub async fn list(http: &reqwest::Client, url: &Url, options: &ListOptions) -> Option<Result<Vec<Task>, String>> {
     let listed = match folder_of(url)? {
-        Folder::Drive { id, resource_key } => {
-            let source = match options.google_api_key.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+        Folder::Drive { id, resource_key, maybe } => {
+            if maybe && !drive_opens_folder(http, url, &id).await {
+                return None;
+            }
+            let key = options.google_api_key.as_deref().map(str::trim).filter(|k| !k.is_empty());
+            let source = match key {
                 Some(key) => DriveSource::Api { base: DRIVE_API, key },
-                None => {
-                    tracing::warn!(
-                        "Listing the Google Drive folder from its public page, which gives no sizes or checksums and may not \
-                         show every file of a very large folder: add a Google API key (--google-api-key, or the Google API \
-                         key setting) to list it whole through the Drive API"
-                    );
-                    DriveSource::Page { link: url }
-                }
+                None => DriveSource::Page { link: url },
             };
-            drive_list(http, &source, id, resource_key).await
+            let listed = drive_list(http, &source, id, resource_key, options).await;
+            if key.is_none() && listed.is_ok() {
+                options.note(
+                    "The Google Drive folder was listed from its public page, which gives no sizes or checksums and may not \
+                     show every file of a very large folder: add a Google API key (--google-api-key, or Google API Key under \
+                     Advanced Options) to list it whole through the Drive API"
+                        .to_string(),
+                );
+            }
+            listed
         }
-        Folder::MediaFire { key, maybe } => mediafire_list(http, url.scheme(), &key, maybe).await?,
+        Folder::MediaFire { key, maybe } => mediafire_list(http, url.scheme(), &key, maybe, options).await?,
     };
     Some(listed.and_then(|tasks| {
         if tasks.is_empty() {
@@ -99,6 +117,39 @@ pub async fn list(http: &reqwest::Client, url: &Url, options: &ListOptions) -> O
 /// `name` made one path component, else `id` (a name like ".." leaves nothing).
 fn component(name: &str, id: &str) -> Result<PathBuf, String> {
     clean_path([name]).or_else(|_| clean_path([id]))
+}
+
+/// An error once a listing has read more than [`MAX_ITEMS`] items.
+fn too_many(items: usize) -> Result<(), String> {
+    if items > MAX_ITEMS {
+        return Err(format!("the folder lists more than {} items, or its listing does not end: add a subfolder's link instead", MAX_ITEMS));
+    }
+    Ok(())
+}
+
+/// Tells the user of the subfolders of a `site` folder (path, why) that could not be read.
+fn note_unread(options: &ListOptions, site: &str, unread: &[(PathBuf, String)]) {
+    let Some((_, why)) = unread.first() else { return };
+    let mut paths: Vec<String> = unread.iter().take(3).map(|(path, _)| path.display().to_string()).collect();
+    if unread.len() > 3 {
+        paths.push("...".to_string());
+    }
+    options.note(format!(
+        "{} subfolder(s) of the {} folder could not be read, and the files in them were left out ({}): {}",
+        unread.len(),
+        site,
+        paths.join(", "),
+        why
+    ));
+}
+
+/// Whether Drive sends the `open?id=` link `url` on to the folder `id`; else it is a file's (or
+/// one Drive does not show), which the engine downloads.
+async fn drive_opens_folder(http: &reqwest::Client, url: &Url, id: &str) -> bool {
+    match http.head(url.clone()).send().await {
+        Ok(landed) => matches!(folder_of(landed.url()), Some(Folder::Drive { id: folder, maybe: false, .. }) if folder == id),
+        Err(_) => false,
+    }
 }
 
 /// Where a Drive folder is read.
@@ -129,6 +180,8 @@ struct DriveChild {
     resource_key: Option<String>,
     size: Option<u64>,
     md5: Option<String>,
+    /// Reached through a shortcut (`id` is the target's).
+    shortcut: bool,
 }
 
 /// A child of a folder as a listing takes it.
@@ -177,20 +230,21 @@ struct DriveName {
 impl From<DriveItem> for DriveChild {
     /// A shortcut stands for its target, under the shortcut's name.
     fn from(item: DriveItem) -> Self {
-        let (id, mime_type, resource_key, size, md5) = match item.shortcut_details {
+        let (id, mime_type, resource_key, size, md5, shortcut) = match item.shortcut_details {
             Some(target) if item.mime_type == DRIVE_SHORTCUT => {
-                (target.target_id, target.target_mime_type, target.target_resource_key, None, None)
+                (target.target_id, target.target_mime_type, target.target_resource_key, None, None, true)
             }
-            _ => (item.id, item.mime_type, item.resource_key, item.size.and_then(|s| s.parse().ok()), item.md5_checksum),
+            _ => (item.id, item.mime_type, item.resource_key, item.size.and_then(|s| s.parse().ok()), item.md5_checksum, false),
         };
-        let kind = drive_kind(&id, &mime_type);
-        DriveChild { id, name: item.name, kind, resource_key, size, md5 }
+        let kind = drive_kind(&id, &mime_type, resource_key.as_deref());
+        DriveChild { id, name: item.name, kind, resource_key, size, md5, shortcut }
     }
 }
 
 /// What a Drive item of this MIME type is: Docs, Sheets and Slides export as Google's own
-/// File > Download does (see `google_docs_export`); forms, drawings, sites and the like are none.
-fn drive_kind(id: &str, mime_type: &str) -> Kind {
+/// File > Download does (see `google_docs_export`, which keeps the resource key); forms,
+/// drawings, sites and the like are none.
+fn drive_kind(id: &str, mime_type: &str, resource_key: Option<&str>) -> Kind {
     let editor = match mime_type.strip_prefix("application/vnd.google-apps.") {
         None => return Kind::File,
         Some("folder") => return Kind::Folder,
@@ -199,29 +253,30 @@ fn drive_kind(id: &str, mime_type: &str) -> Kind {
         Some("presentation") => "presentation",
         Some(_) => return Kind::Other,
     };
-    let document = Url::parse(&format!("https://docs.google.com/{}/d/{}/edit", editor, id)).ok();
+    let key = resource_key.map(|key| ("resourcekey", key));
+    let document = Url::parse_with_params(&format!("https://docs.google.com/{}/d/{}/edit", editor, id), key).ok();
     document.and_then(|d| google_docs_export(&d)).map_or(Kind::Other, Kind::Export)
 }
 
 /// The child of a Drive folder the embedded view links as `href`: a folder, a file, or a
 /// document of Docs, Sheets or Slides (by its editor link); anything else is left out.
 fn page_child(href: &str, name: String) -> DriveChild {
-    let other = |name| DriveChild { id: String::new(), name, kind: Kind::Other, resource_key: None, size: None, md5: None };
-    let Ok(url) = Url::parse(href) else { return other(name) };
+    let child = |id, name, kind, resource_key| DriveChild { id, name, kind, resource_key, size: None, md5: None, shortcut: false };
+    let Ok(url) = Url::parse(href) else { return child(String::new(), name, Kind::Other, None) };
     let resource_key = url.query_pairs().find(|(k, _)| k == "resourcekey").map(|(_, v)| v.into_owned());
-    if let Some(Folder::Drive { id, resource_key }) = folder_of(&url) {
-        return DriveChild { id, name, kind: Kind::Folder, resource_key, size: None, md5: None };
+    if let Some(Folder::Drive { id, resource_key, maybe: false }) = folder_of(&url) {
+        return child(id, name, Kind::Folder, resource_key);
     }
     let segs: Vec<&str> = url.path_segments().map(Iterator::collect).unwrap_or_default();
     let (id, kind) = match (url.host_str().unwrap_or_default(), &segs[..]) {
         ("drive.google.com", ["file", "d", id, ..]) => (*id, Kind::File),
         ("docs.google.com", [_, "d", id, ..]) => (*id, google_docs_export(&url).map_or(Kind::Other, Kind::Export)),
-        _ => return other(name),
+        _ => return child(String::new(), name, Kind::Other, None),
     };
     if !token(id) {
-        return other(name);
+        return child(String::new(), name, Kind::Other, None);
     }
-    DriveChild { id: id.to_string(), name, kind, resource_key, size: None, md5: None }
+    child(id.to_string(), name, kind, resource_key)
 }
 
 impl DriveChild {
@@ -270,36 +325,57 @@ fn with_extension(name: &str, extension: &str) -> String {
 }
 
 /// Every file under the Drive folder `id`, one task each, in a folder named after it. A folder
-/// reached twice (a shortcut up the tree) is listed once.
+/// reached twice (a shortcut up the tree) is listed once, and so is a file: where it is, not
+/// where a shortcut to it is, when it is in the tree.
 async fn drive_list(
     http: &reqwest::Client,
     source: &DriveSource<'_>,
     id: String,
     resource_key: Option<String>,
+    options: &ListOptions,
 ) -> Result<Vec<Task>, String> {
     let mut queue = VecDeque::from([(id, resource_key, None)]);
-    let mut listed = HashSet::new();
-    let (mut tasks, mut left_out) = (Vec::new(), 0);
+    let (mut listed, mut files) = (HashSet::new(), HashSet::new());
+    let (mut tasks, mut shortcuts, mut unread, mut left_out, mut read) = (Vec::new(), Vec::new(), Vec::new(), 0, 0);
     while let Some((id, resource_key, path)) = queue.pop_front() {
         if !listed.insert(id.clone()) {
             continue;
         }
-        let (name, children) = source.read(http, &id, resource_key.as_deref(), path.is_none()).await?;
+        let (name, children) = match source.read(http, &id, resource_key.as_deref(), path.is_none()).await {
+            Ok(read) => read,
+            Err(e) => match path {
+                Some(path) => {
+                    unread.push((path, e));
+                    continue;
+                }
+                None => return Err(e),
+            },
+        };
         let folder = match path {
             Some(path) => path,
             None => component(name.as_deref().unwrap_or_default(), &id)?,
         };
+        read += children.len();
+        too_many(read)?;
         for child in children {
+            let (file, shortcut) = (child.id.clone(), child.shortcut);
             match child.into_child(&folder)? {
                 Child::Folder { id, resource_key, path } => queue.push_back((id, resource_key, Some(path))),
-                Child::File(task) => tasks.push(task),
+                Child::File(task) if shortcut => shortcuts.push((file, task)),
+                Child::File(task) => {
+                    if files.insert(file) {
+                        tasks.push(task);
+                    }
+                }
                 Child::Other => left_out += 1,
             }
         }
     }
+    tasks.extend(shortcuts.into_iter().filter_map(|(file, task)| files.insert(file).then_some(task)));
     if left_out > 0 {
-        tracing::warn!("{} items of the Google Drive folder (forms, drawings, sites, ...) are no files and were left out", left_out);
+        options.note(format!("{} items of the Google Drive folder (forms, drawings, sites, ...) are no files and were left out", left_out));
     }
+    note_unread(options, "Google Drive", &unread);
     Ok(tasks)
 }
 
@@ -327,13 +403,17 @@ impl DriveSource<'_> {
                 };
                 let query = format!("'{}' in parents and trashed=false", id);
                 let mut children = Vec::new();
-                let mut page_token = None;
+                let (mut page_token, mut tokens) = (None, HashSet::new());
                 loop {
                     let mut params = vec![("q", query.as_str()), ("fields", DRIVE_FIELDS), ("pageSize", "1000"), ("includeItemsFromAllDrives", "true")];
                     params.extend(page_token.as_deref().map(|token| ("pageToken", token)));
                     let page: DrivePage = drive_api_get(http, url("files", &params)?, keys.as_deref()).await?;
                     children.extend(page.files.into_iter().map(DriveChild::from));
+                    too_many(children.len())?;
                     match page.next_page_token {
+                        Some(token) if !tokens.insert(token.clone()) => {
+                            return Err("the Google Drive API gave the same page twice: the folder's listing does not end".to_string());
+                        }
                         Some(token) if !token.is_empty() => page_token = Some(token),
                         _ => break,
                     }
@@ -464,6 +544,9 @@ struct MfContent {
     /// "yes" when another chunk follows.
     #[serde(default)]
     more_chunks: String,
+    /// The chunk this is, from 1.
+    #[serde(default)]
+    chunk_number: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -517,10 +600,18 @@ async fn mediafire_content(http: &reqwest::Client, api: &str, key: &str, content
         let chunk = chunk.to_string();
         let params = [("folder_key", key), ("content_type", content_type), ("chunk", chunk.as_str())];
         let content = mediafire_get(http, api, "get_content.php", &params).await?.folder_content.unwrap_or_default();
+        // One that ignored `chunk` would answer chunk 1 for ever.
+        if !content.chunk_number.is_empty() && content.chunk_number != chunk {
+            return Err(format!(
+                "MediaFire answered chunk {} when asked for chunk {}: the folder's listing does not end",
+                content.chunk_number, chunk
+            ));
+        }
         // A chunk with nothing in it ends the listing whatever it says.
         let more = content.more_chunks == "yes" && !(content.files.is_empty() && content.folders.is_empty());
         all.files.extend(content.files);
         all.folders.extend(content.folders);
+        too_many(all.files.len() + all.folders.len())?;
         if !more {
             break;
         }
@@ -531,7 +622,13 @@ async fn mediafire_content(http: &reqwest::Client, api: &str, key: &str, content
 /// Every file under the MediaFire folder `key`, each a task for its page (which
 /// `MediaFireResolver` downloads), with its SHA-256; files behind a password are left out. The
 /// API is asked at the scheme of the link typed. None for a `maybe` link that names no folder.
-async fn mediafire_list(http: &reqwest::Client, scheme: &str, key: &str, maybe: bool) -> Option<Result<Vec<Task>, String>> {
+async fn mediafire_list(
+    http: &reqwest::Client,
+    scheme: &str,
+    key: &str,
+    maybe: bool,
+    options: &ListOptions,
+) -> Option<Result<Vec<Task>, String>> {
     let api = format!("{}://www.mediafire.com/api/1.5/folder/", scheme);
     let root = match mediafire_get(http, &api, "get_info.php", &[("folder_key", key)]).await {
         Ok(info) => info.folder_info.map(|f| f.name).unwrap_or_default(),
@@ -539,18 +636,40 @@ async fn mediafire_list(http: &reqwest::Client, scheme: &str, key: &str, maybe: 
         Err(_) if maybe => return None,
         Err(e) => return Some(Err(e)),
     };
-    Some(mediafire_files(http, scheme, &api, key, &root).await)
+    Some(mediafire_files(http, scheme, &api, key, &root, options).await)
 }
 
-async fn mediafire_files(http: &reqwest::Client, scheme: &str, api: &str, key: &str, root: &str) -> Result<Vec<Task>, String> {
-    let mut queue = VecDeque::from([(key.to_string(), component(root, key)?)]);
+async fn mediafire_files(
+    http: &reqwest::Client,
+    scheme: &str,
+    api: &str,
+    key: &str,
+    root: &str,
+    options: &ListOptions,
+) -> Result<Vec<Task>, String> {
+    // Each folder's key, path, and whether it is a subfolder (which may be left out unread).
+    let mut queue = VecDeque::from([(key.to_string(), component(root, key)?, false)]);
     let mut listed = HashSet::new();
-    let (mut tasks, mut locked) = (Vec::new(), 0);
-    while let Some((key, folder)) = queue.pop_front() {
+    let (mut tasks, mut locked, mut unread, mut read) = (Vec::new(), 0, Vec::new(), 0);
+    while let Some((key, folder, sub)) = queue.pop_front() {
         if !listed.insert(key.clone()) {
             continue;
         }
-        for file in mediafire_content(http, api, &key, "files").await?.files {
+        let content = async {
+            let files = mediafire_content(http, api, &key, "files").await?.files;
+            Ok::<_, String>((files, mediafire_content(http, api, &key, "folders").await?.folders))
+        };
+        let (files, folders) = match content.await {
+            Ok(content) => content,
+            Err(e) if sub => {
+                unread.push((folder, e));
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        read += files.len() + folders.len();
+        too_many(read)?;
+        for file in files {
             let page = token(&file.quickkey).then(|| Url::parse(&format!("{}://www.mediafire.com/file/{}", scheme, file.quickkey)));
             let Some(Ok(page)) = page else { continue };
             if file.password_protected == "yes" {
@@ -568,16 +687,17 @@ async fn mediafire_files(http: &reqwest::Client, scheme: &str, api: &str, key: &
                 ..Task::default()
             });
         }
-        for sub in mediafire_content(http, api, &key, "folders").await?.folders {
+        for sub in folders {
             if token(&sub.folderkey) {
                 let path = folder.join(component(&sub.name, &sub.folderkey)?);
-                queue.push_back((sub.folderkey, path));
+                queue.push_back((sub.folderkey, path, true));
             }
         }
     }
     if locked > 0 {
-        tracing::warn!("{} files of the MediaFire folder are protected by a password and were left out", locked);
+        options.note(format!("{} files of the MediaFire folder are protected by a password and were left out", locked));
     }
+    note_unread(options, "MediaFire", &unread);
     Ok(tasks)
 }
 
@@ -593,9 +713,16 @@ mod tests {
 
     #[test]
     fn folder_links_are_told_by_their_shape() {
-        let drive = |id: &str, key: Option<&str>| Some(Folder::Drive { id: id.into(), resource_key: key.map(Into::into) });
+        let drive = |id: &str, key: Option<&str>| Some(Folder::Drive { id: id.into(), resource_key: key.map(Into::into), maybe: false });
         assert_eq!(folder("https://drive.google.com/drive/folders/1KpLl_1tcK0eeehzN980zbG-3M2nhbVks"), drive("1KpLl_1tcK0eeehzN980zbG-3M2nhbVks", None));
         assert_eq!(folder("https://drive.google.com/drive/u/1/folders/1aB-c?resourcekey=0-xY_z&usp=sharing"), drive("1aB-c", Some("0-xY_z")));
+        // The mobile app's link, and older ones Drive sends on to /drive/folders/ (checked live).
+        assert_eq!(folder("https://drive.google.com/drive/mobile/folders/1KpLl_1tc?usp=sharing"), drive("1KpLl_1tc", None));
+        assert_eq!(folder("https://drive.google.com/drive/u/0/mobile/folders/1aB?resourcekey=0-k"), drive("1aB", Some("0-k")));
+        assert_eq!(folder("https://drive.google.com/folderview?id=1KpLl_1tc&usp=sharing"), drive("1KpLl_1tc", None));
+        // open?id= names a file or a folder: where Drive sends it tells which.
+        let opened = Some(Folder::Drive { id: "1KpLl_1tc".into(), resource_key: None, maybe: true });
+        assert_eq!(folder("https://drive.google.com/open?id=1KpLl_1tc"), opened);
         let mediafire = |key: &str, maybe| Some(Folder::MediaFire { key: key.into(), maybe });
         assert_eq!(folder("https://www.mediafire.com/folder/rww7bhhi0yc1l/NewFolder"), mediafire("rww7bhhi0yc1l", false));
         assert_eq!(folder("http://mediafire.com/folder/rww7bhhi0yc1l"), mediafire("rww7bhhi0yc1l", false));
@@ -607,6 +734,10 @@ mod tests {
             "https://drive.google.com/drive/u/x/folders/1aB",
             "https://drive.google.com/drive/folders/",
             "https://drive.google.com/drive/folders/a%27b",
+            "https://drive.google.com/drive/u/0/mobile/x/1aB",
+            "https://drive.google.com/folderview",
+            "https://drive.google.com/open?id=a%27b",
+            "https://drive.google.com/uc?id=1aB&export=download",
             "https://docs.google.com/drive/folders/1aB",
             "https://www.mediafire.com/file/ierdl9nle7ask6i/a.png/file",
             "https://www.mediafire.com/?sharekey=abc",
@@ -651,6 +782,9 @@ mod tests {
         );
         let keyed = page_child("https://drive.google.com/file/d/1Z2/view?usp=drive_web&resourcekey=0-k", "a".into());
         assert_eq!(keyed.resource_key.as_deref(), Some("0-k"));
+        let keyed = page_child("https://docs.google.com/document/d/1Dc/edit?usp=drive_web&resourcekey=0-d", "b".into());
+        let export = Url::parse("https://docs.google.com/document/d/1Dc/export?format=docx&resourcekey=0-d").unwrap();
+        assert_eq!(keyed.kind, Kind::Export(export));
         for other in ["https://docs.google.com/forms/d/1Fm/edit", "https://sites.google.com/view/x", "not a link"] {
             assert_eq!(page_child(other, "x".into()).kind, Kind::Other, "{other}");
         }
@@ -667,6 +801,7 @@ mod tests {
             r#"[
             {"id": "f1", "name": "a.bin", "mimeType": "application/octet-stream", "size": "5", "md5Checksum": "5d41402abc4b2a76b9719d911017c592", "resourceKey": "0-r"},
             {"id": "d1", "name": "Notes", "mimeType": "application/vnd.google-apps.document", "size": "1024"},
+            {"id": "d2", "name": "Minutes", "mimeType": "application/vnd.google-apps.document", "resourceKey": "0-dk"},
             {"id": "x1", "name": "Budget.XLSX", "mimeType": "application/vnd.google-apps.spreadsheet"},
             {"id": "fm1", "name": "Survey", "mimeType": "application/vnd.google-apps.form"},
             {"id": "s1", "name": "Link to b", "mimeType": "application/vnd.google-apps.shortcut", "shortcutDetails": {"targetId": "f9", "targetMimeType": "image/png", "targetResourceKey": "0-t"}},
@@ -695,6 +830,8 @@ mod tests {
             [
                 (direct("f1", Some("0-r")), PathBuf::from("a.bin"), Some(5), Some("md5:5d41402abc4b2a76b9719d911017c592".to_string())),
                 (docs("https://docs.google.com/document/d/d1/export?format=docx"), PathBuf::from("Notes.docx"), None, None),
+                // A document shared by link before 2021 exports with its resource key.
+                (docs("https://docs.google.com/document/d/d2/export?format=docx&resourcekey=0-dk"), PathBuf::from("Minutes.docx"), None, None),
                 (docs("https://docs.google.com/spreadsheets/d/x1/export?format=xlsx"), PathBuf::from("Budget.XLSX"), None, None),
                 (direct("f9", Some("0-t")), PathBuf::from("Link to b"), None, None),
             ]
@@ -754,7 +891,8 @@ mod tests {
     }
 
     /// A folder "Pack: 1" whose files come on two pages, with a subfolder that needs its resource
-    /// key and holds a shortcut back up to "Pack: 1".
+    /// key and holds a shortcut back up to "Pack: 1", a subfolder the key cannot see, and shortcuts
+    /// to a file in the tree and to one outside it. The listing of "loop1" never ends.
     fn drive_api(target: &str) -> (u16, String) {
         let url = Url::parse(&format!("http://api.test{}", target)).unwrap();
         let param = |name: &str| url.query_pairs().find(|(k, _)| k == name).map(|(_, v)| v.into_owned());
@@ -770,26 +908,37 @@ mod tests {
                     {"id": "sub1", "name": "Sub", "mimeType": "application/vnd.google-apps.folder", "resourceKey": "0-rk"}]}"#
             }
             ("/drive/v3/files", Some("'root1' in parents and trashed=false"), Some("p2")) if listing => {
-                r#"{"files": [{"id": "d1", "name": "Notes", "mimeType": "application/vnd.google-apps.document"}]}"#
+                r#"{"files": [
+                    {"id": "d1", "name": "Notes", "mimeType": "application/vnd.google-apps.document"},
+                    {"id": "lock1", "name": "Locked", "mimeType": "application/vnd.google-apps.folder"},
+                    {"id": "s9", "name": "Link to b", "mimeType": "application/vnd.google-apps.shortcut", "shortcutDetails": {"targetId": "f2", "targetMimeType": "text/plain"}},
+                    {"id": "s8", "name": "Link to c", "mimeType": "application/vnd.google-apps.shortcut", "shortcutDetails": {"targetId": "f9", "targetMimeType": "image/png"}}]}"#
             }
             ("/drive/v3/files", Some("'sub1' in parents and trashed=false"), None) if listing => {
                 r#"{"files": [
                     {"id": "s1", "name": "Back up", "mimeType": "application/vnd.google-apps.shortcut", "shortcutDetails": {"targetId": "root1", "targetMimeType": "application/vnd.google-apps.folder"}},
                     {"id": "f2", "name": "b.txt", "mimeType": "text/plain", "size": "7"}]}"#
             }
+            ("/drive/v3/files/loop1", None, None) => r#"{"name": "Loop"}"#,
+            ("/drive/v3/files", Some("'loop1' in parents and trashed=false"), _) if listing => {
+                r#"{"nextPageToken": "again", "files": [{"id": "f7", "name": "c.bin", "mimeType": "application/octet-stream"}]}"#
+            }
             _ => return (404, r#"{"error": {"code": 404, "message": "File not found: x."}}"#.into()),
         };
         (200, body.into())
     }
 
-    /// A whole tree is listed through the API, page by page, each folder once, with the key on
-    /// every request and a folder's resource key on the requests for it.
+    /// A whole tree is listed through the API, page by page, each folder and file once, with the
+    /// key on every request and a folder's resource key on the requests for it. A subfolder that
+    /// cannot be read is left out and told of; the folder linked must be read.
     #[tokio::test]
     async fn the_drive_api_lists_a_folder_tree() {
         let (base, seen) = serve(drive_api).await;
         let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let (notes, noted) = std::sync::mpsc::channel();
+        let options = ListOptions { notes: Some(notes), ..ListOptions::default() };
         let source = DriveSource::Api { base: &base, key: "AIzaKey" };
-        let tasks = drive_list(&http, &source, "root1".into(), None).await.unwrap();
+        let tasks = drive_list(&http, &source, "root1".into(), None, &options).await.unwrap();
         let top = PathBuf::from("Pack_ 1");
         let listed: Vec<_> = tasks.iter().map(|t| (t.folder.clone().unwrap(), t.name.clone().unwrap(), t.urls[0].to_string())).collect();
         assert_eq!(
@@ -797,24 +946,39 @@ mod tests {
             [
                 (top.clone(), PathBuf::from("a.bin"), google_drive_direct_url("f1", None).unwrap().to_string()),
                 (top.clone(), PathBuf::from("Notes.docx"), "https://docs.google.com/document/d/d1/export?format=docx".to_string()),
+                // b.txt where it is, not again as "Link to b"; a file outside the tree by its shortcut.
                 (top.join("Sub"), PathBuf::from("b.txt"), google_drive_direct_url("f2", None).unwrap().to_string()),
+                (top.clone(), PathBuf::from("Link to c"), google_drive_direct_url("f9", None).unwrap().to_string()),
             ]
         );
         assert_eq!((tasks[0].size, tasks[0].checksum.as_deref()), (Some(5), Some("md5:5d41402abc4b2a76b9719d911017c592")));
         let seen = seen.lock().unwrap().clone();
-        assert_eq!(seen.len(), 4, "the name, two pages and the subfolder, and Pack: 1 once: {seen:?}");
+        assert_eq!(seen.len(), 5, "the name, two pages, the two subfolders, and Pack: 1 once: {seen:?}");
         assert_eq!(seen[3].1.as_deref(), Some("sub1/0-rk"));
-        assert!(seen[..3].iter().all(|(_, keys)| keys.is_none()), "{seen:?}");
+        assert!(seen.iter().enumerate().all(|(i, (_, keys))| i == 3 || keys.is_none()), "{seen:?}");
+        let noted: Vec<String> = noted.try_iter().collect();
+        let [note] = &noted[..] else { panic!("one note: {noted:?}") };
+        let locked = top.join("Locked").display().to_string();
+        assert!(note.starts_with(&format!("1 subfolder(s) of the Google Drive folder could not be read, and the files in them were left out ({locked}): Google Drive folder not found")), "{note}");
 
-        let missing = drive_list(&http, &source, "gone".into(), None).await.unwrap_err();
+        let missing = drive_list(&http, &source, "gone".into(), None, &options).await.unwrap_err();
         assert!(missing.starts_with("Google Drive folder not found"), "{missing}");
         let wrong_key = DriveSource::Api { base: &base, key: "AIzaOld" };
-        let refused = drive_list(&http, &wrong_key, "root1".into(), None).await.unwrap_err();
+        let refused = drive_list(&http, &wrong_key, "root1".into(), None, &options).await.unwrap_err();
         assert_eq!(refused, "Google Drive API: API key not valid. (HTTP 400)");
         // A request that fails shows no URL, which holds the key.
         let closed = DriveSource::Api { base: "http://127.0.0.1:1/drive/v3/", key: "AIzaKey" };
-        let unreachable = drive_list(&http, &closed, "root1".into(), None).await.unwrap_err();
+        let unreachable = drive_list(&http, &closed, "root1".into(), None, &options).await.unwrap_err();
         assert!(unreachable.starts_with("Cannot reach the Google Drive API") && !unreachable.contains("AIzaKey"), "{unreachable}");
+        // An API that gives the same page again would be asked for ever.
+        let endless = drive_list(&http, &source, "loop1".into(), None, &options).await.unwrap_err();
+        assert!(endless.contains("the folder's listing does not end"), "{endless}");
+    }
+
+    #[test]
+    fn a_listing_has_an_end() {
+        assert_eq!(too_many(MAX_ITEMS), Ok(()));
+        assert!(too_many(MAX_ITEMS + 1).unwrap_err().contains("its listing does not end"));
     }
 
     /// folder/get_content.php as MediaFire answered it for a public folder, and for a key that
@@ -826,6 +990,7 @@ mod tests {
         let [file] = &content.files[..] else { panic!("one file: {content:?}") };
         assert_eq!((file.quickkey.as_str(), file.filename.as_str(), file.size.as_str()), ("lrryifc0vut4jl6", "Lorem ipsum.txt", "3771"));
         assert_eq!((file.hash.len(), file.password_protected.as_str(), content.more_chunks.as_str()), (64, "no", "no"));
+        assert_eq!(content.chunk_number, "1");
         let folders = br#"{"response":{"action":"folder\/get_content","asynchronous":"no","folder_content":{"chunk_size":"100","content_type":"folders","chunk_number":"1","folderkey":"gtrp6u25m6nmb","folders":[{"folderkey":"34gxd4kmqz5nn","name":"InnerFolder","description":"","tags":"","privacy":"public","created":"2022-10-29 13:54:16","revision":"1502","flag":"0","permissions":{"value":"1","explicit":"0","read":"1","write":"0"},"file_count":"0","folder_count":"0","dropbox_enabled":"no","created_utc":"2022-10-29T18:54:16Z"}],"more_chunks":"no","revision":"2996"},"result":"Success","current_api_version":"1.5"}}"#;
         let content = mediafire_answer(200, folders).unwrap().folder_content.unwrap();
         assert_eq!(content.folders.iter().map(|f| (f.folderkey.as_str(), f.name.as_str())).collect::<Vec<_>>(), [("34gxd4kmqz5nn", "InnerFolder")]);
