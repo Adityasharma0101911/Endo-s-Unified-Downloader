@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::chunk::{ChunkManager, ChunkSnapshot};
-use crate::history::{redact_url, DownloadHistoryManager, HistoryEntry, HistoryStatus};
+use crate::history::{is_redacted, redact_url, DownloadHistoryManager, HistoryEntry, HistoryStatus};
 use crate::hls::HlsError;
 use crate::hosts::{self, HostKey, HostProfile, HostSlot};
 use crate::mirror::MirrorRacer;
@@ -2736,8 +2736,10 @@ fn plan_target(
 
 /// An existing file counts as this download only if the checksum says so, or history recorded
 /// this exact path completing from one of these URLs (as history saves them, without secrets)
-/// with this size, and the server's Last-Modified is not newer than that download. `history` is
-/// consulted only in that last case.
+/// with this size, and the server's Last-Modified is not newer than that download. A URL history
+/// saved without a secret matches none: what was taken out may have named the file
+/// (`object_key=`, `share_token=`), so another file at that path is never taken for this one.
+/// `history` is consulted only in that last case.
 fn already_downloaded<'h>(
     path: &Path,
     remote: &ProbeInfo,
@@ -2764,7 +2766,7 @@ fn already_downloaded<'h>(
         e.status == HistoryStatus::Completed
             && absolute(&e.file_path) == path
             && e.file_size == size
-            && e.urls.iter().any(|u| urls.contains(u))
+            && e.urls.iter().any(|u| urls.contains(u) && !is_redacted(u))
             && modified.is_none_or(|lm| lm <= e.started_at)
     }) && header_matches_extension(&path)
 }
@@ -4559,17 +4561,29 @@ mod tests {
         assert!(matches!(plan_target(&base, &newer, &urls(), &history, None).unwrap(), Plan::Fetch { .. }));
     }
 
+    /// History saved a link without its secret, which may have named the file (`object_key=`
+    /// reads as a key): the link it became no longer tells one file from another, so an existing
+    /// file is never taken for this download by it. Another link of the download still finds it.
     #[test]
-    fn test_plan_finds_the_history_of_a_link_with_secrets() {
+    fn test_plan_never_finds_a_file_by_a_link_saved_without_its_secret() {
         let dir = tempdir().unwrap();
         let base = dir.path().join("file.bin");
         std::fs::write(&base, vec![7u8; 1000]).unwrap();
         let history = dir.path().join("h.json");
-        let signed = vec!["http://example.com/file.bin?X-Amz-Signature=abc".to_string()];
-        DownloadHistoryManager::load_from_path(&history).add_or_update(completed_entry(&base, 1000, signed.clone()));
-        // History saved the link without its signature; the live link is compared the same way.
+        let link = |name: &str| format!("http://example.com/get?object_key={name}");
+        DownloadHistoryManager::load_from_path(&history).add_or_update(completed_entry(&base, 1000, vec![link("a.bin")]));
+        let mut older = remote(1000);
+        older.last_modified = Some("Thu, 01 Jan 1970 00:00:00 GMT".into());
+        match plan_target(&base, &older, &[link("b.bin")], &history, None).unwrap() {
+            Plan::Fetch { final_path, .. } => assert_eq!(final_path, dir.path().join("file (1).bin")),
+            other => panic!("b.bin was taken for a.bin: {other:?}"),
+        }
+        assert!(matches!(plan_target(&base, &older, &[link("a.bin")], &history, None).unwrap(), Plan::Fetch { .. }));
+
+        let landed = "http://files.example/a.bin".to_string();
+        DownloadHistoryManager::load_from_path(&history).add_or_update(completed_entry(&base, 1000, vec![link("a.bin"), landed.clone()]));
         assert!(matches!(
-            plan_target(&base, &remote(1000), &signed, &history, None).unwrap(),
+            plan_target(&base, &older, &[link("a.bin"), landed], &history, None).unwrap(),
             Plan::AlreadyDone(p) if p == base
         ));
     }

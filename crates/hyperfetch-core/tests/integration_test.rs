@@ -3002,7 +3002,8 @@ async fn test_a_short_link_with_a_secret_to_a_code_host_file_page_gets_the_file_
     let saved = std::fs::read_to_string(DownloadHistoryManager::default_history_path()).unwrap();
     assert!(!saved.contains("s3cr3t-t0ken"), "{saved}");
 
-    // The same link again finds that entry: the file is not downloaded a second time.
+    // The same link again finds that entry by where it landed (never by the link saved without
+    // its secret, which may have named another file): the file is not downloaded a second time.
     let again = run(&DownloadEngine::new(vec![short], opts()), None).await.expect("the file is already there");
     assert_eq!(again, path);
     assert_eq!(names_in(temp.path()), ["tool.bin"]);
