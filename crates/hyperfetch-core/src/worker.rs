@@ -1,7 +1,9 @@
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use futures_util::StreamExt;
+use bytes::Bytes;
+use futures_util::stream::BoxStream;
+use futures_util::{Stream, StreamExt};
 use parking_lot::Mutex;
 use reqwest::header::{
     HeaderMap, HeaderValue, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE, ETAG, IF_RANGE, LAST_MODIFIED,
@@ -12,8 +14,9 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-use crate::chunk::{Chunk, ChunkManager};
-use crate::mirror::MirrorRacer;
+use crate::chunk::{Chunk, ChunkManager, StealRule, StealTiming};
+use crate::hosts::{self, HostKey, HostProfile, HostSlot};
+use crate::mirror::{Mirror, MirrorRacer};
 use crate::range::ByteRange;
 use crate::storage::DiskWriter;
 
@@ -29,6 +32,10 @@ const THROTTLE_COOLDOWN: Duration = Duration::from_secs(1);
 const WRITE_BATCH: usize = 512 * 1024;
 /// Longest a received byte waits in memory, so progress and resume state keep up on slow links.
 const WRITE_INTERVAL: Duration = Duration::from_millis(250);
+/// Wait for a byte after which an idle worker takes over what is left of a chunk.
+const TAKEOVER_SILENCE: Duration = Duration::from_secs(2);
+/// ...or this many of the mirror's answer times, if longer.
+const TAKEOVER_TTFBS: u32 = 4;
 
 /// Why an attempt failed, which decides how the engine retries it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,8 +44,12 @@ pub enum FailureKind {
     Transient,
     /// 429/503, with the server's Retry-After if it sent one.
     Throttled(Option<Duration>),
-    /// This mirror cannot serve the file (401/403/404/410, wrong Content-Range, ignored Range).
+    /// This mirror cannot serve the file (wrong Content-Range, ignored Range).
     BadMirror,
+    /// The URL refused the request (401/403/404/410), or a redirect target answered with anything
+    /// but the file, throttling or a server error: an expired redirect target, or a mirror that
+    /// cannot serve the file.
+    Denied,
     /// Retrying cannot help (disk write error, remote file changed): fail the download.
     Fatal,
 }
@@ -163,9 +174,32 @@ pub struct WorkerShared {
     pub cancel: CancellationToken,
     pub limiter: Option<Arc<RateLimiter>>,
     pub file_size: u64,
+    /// Fewest bytes a steal takes.
     pub min_steal: u64,
-    /// Max wait for response headers and between body reads.
+    /// Most connections this download opens to one host, together with every other download
+    /// there (see [`crate::hosts`]); 0 for no limit of its own.
+    pub host_limit: usize,
+    /// Max wait for response headers.
     pub stall_timeout: Duration,
+    /// Max wait between body reads once the answer has started. Shorter than `stall_timeout`:
+    /// a retry keeps what arrived and starts at once, so a quiet connection is best replaced.
+    pub body_idle: Duration,
+}
+
+/// The body of an answer, as it comes.
+pub type Body = BoxStream<'static, reqwest::Result<Bytes>>;
+
+/// An answer already bringing a chunk's bytes, from the chunk's start: the probe's, which its
+/// worker streams as its first attempt instead of asking for those bytes again.
+pub struct Seed {
+    /// The chunk, assigned to the worker.
+    pub chunk: Chunk,
+    pub mirror_id: usize,
+    /// Where the answer came from.
+    pub url: Url,
+    pub body: Body,
+    /// The host slot the answer's request holds.
+    pub slot: HostSlot,
 }
 
 pub struct HttpWorker {
@@ -178,74 +212,168 @@ impl HttpWorker {
         Self { worker_id, shared }
     }
 
-    /// Takes chunks (or steals halves of slow ones) until cancelled or the engine goes away.
-    pub async fn run(self) {
+    /// Takes chunks (or takes over or steals from slow ones) until cancelled or the engine goes away.
+    /// Each request holds a slot of its host's connection budget, taken before any chunk: waiting
+    /// for one is neither a stall nor a failure, and leaves nothing for others to steal. A `seed`,
+    /// whose chunk must be assigned to this worker, comes first, like any other attempt but for
+    /// the request.
+    pub async fn run(self, seed: Option<Seed>) {
+        if let Some(Seed { chunk, mirror_id, url, body, slot }) = seed {
+            self.shared.mirrors.lock().acquire_mirror(mirror_id);
+            let start = chunk.current_offset.load(Ordering::SeqCst);
+            let outcome = self.receive(&chunk, mirror_id, body, start).await;
+            if !self.conclude(&chunk, mirror_id, &url, outcome, slot).await {
+                return;
+            }
+        }
         let s = &self.shared;
         loop {
             if s.cancel.is_cancelled() {
                 return;
             }
-            let Some((chunk, mirror_id, url, if_range)) = self.next_job() else {
+            let slot = tokio::select! {
+                biased;
+                _ = s.cancel.cancelled() => return,
+                slot = self.take_slot() => slot,
+            };
+            let job = slot.and_then(|(mirror_id, slot)| Some((self.next_job(mirror_id, &slot)?, mirror_id, slot)));
+            let Some(((chunk, url, if_range, redirected), mirror_id, slot)) = job else {
                 tokio::select! {
                     _ = s.cancel.cancelled() => return,
                     _ = tokio::time::sleep(IDLE_POLL) => continue,
                 }
             };
 
-            let outcome = self.download_chunk(&chunk, mirror_id, url, if_range).await;
-            // Settle the chunk before looking for more work, so nobody (including this worker)
-            // mistakes it for a live chunk to steal from.
-            let event = {
-                let mut racer = s.mirrors.lock();
-                racer.release_mirror(mirror_id);
-                if s.cancel.is_cancelled() {
-                    return;
-                }
-                let mut chunks = s.chunks.lock();
-                match outcome {
-                    Ok(()) => {
-                        if let Err(e) = chunks.mark_completed(chunk.id) {
-                            chunks.abort(chunk.id, &e.to_string());
-                        }
-                        WorkerEvent::ChunkCompleted { worker_id: self.worker_id, chunk_id: chunk.id }
-                    }
-                    Err((kind, error)) => {
-                        record_failure(&mut racer, &mut chunks, chunk.id, mirror_id, kind, &error);
-                        WorkerEvent::ChunkFailed { worker_id: self.worker_id, chunk_id: chunk.id, mirror_id, kind, error }
-                    }
-                }
-            };
-            // Wakes the engine so it notices completion or a fatal error.
-            if s.events.send(event).await.is_err() {
+            let outcome = self.download_chunk(&chunk, mirror_id, &url, if_range, redirected, &slot).await;
+            if !self.conclude(&chunk, mirror_id, &url, outcome, slot).await {
                 return;
             }
         }
     }
 
-    /// Picks the best available mirror, then a chunk for it. Lock order: mirrors, then chunks.
-    fn next_job(&self) -> Option<(Chunk, usize, Url, Option<String>)> {
+    /// Settles an attempt at `chunk` (a request to `url` under `slot`) and reports it; `false`
+    /// once the worker is to stop.
+    async fn conclude(&self, chunk: &Chunk, mirror_id: usize, url: &Url, outcome: Result<(), Failure>, slot: HostSlot) -> bool {
+        let s = &self.shared;
+        if s.cancel.is_cancelled() {
+            s.mirrors.lock().release_mirror(mirror_id);
+            return false;
+        }
+        // Settled before looking for more work, so nobody (including this worker) mistakes the
+        // chunk for a live one to steal from. The event wakes the engine so it notices completion
+        // or a fatal error.
+        let event = self.settle(chunk, mirror_id, url, outcome, &slot);
+        drop(slot);
+        match event {
+            Some(event) => s.events.send(event).await.is_ok(),
+            None => true,
+        }
+    }
+
+    /// A slot on the host of a mirror that can take another connection: the best such mirror
+    /// whose host has one free, else the best one's, once it has. `None` while no mirror can.
+    async fn take_slot(&self) -> Option<(usize, HostSlot)> {
+        let s = &self.shared;
+        let ranked: Vec<(usize, Url)> = {
+            let racer = s.mirrors.lock();
+            racer.ranked().into_iter().filter_map(|id| Some((id, racer.get_mirror(id)?.url.clone()))).collect()
+        };
+        for (mirror_id, url) in &ranked {
+            if let Some(slot) = hosts::try_acquire(url, s.host_limit) {
+                return Some((*mirror_id, slot));
+            }
+        }
+        let (mirror_id, url) = ranked.into_iter().next()?;
+        Some((mirror_id, hosts::acquire(&url, s.host_limit).await))
+    }
+
+    /// A chunk for the mirror `slot` was taken for, if it can still take a connection there:
+    /// fresh work, else what is left of a chunk gone silent, else part of a slow chunk, timed by
+    /// what a new request to each mirror costs. Also where to send the request, with its If-Range
+    /// validator and whether that URL is the mirror's redirect target. Lock order: mirrors, then
+    /// chunks.
+    fn next_job(&self, mirror_id: usize, slot: &HostSlot) -> Option<(Chunk, Url, Option<String>, bool)> {
         let s = &self.shared;
         let mut racer = s.mirrors.lock();
-        let mirror_id = racer.select_best_mirror()?;
-        let (url, if_range) = racer.get_mirror(mirror_id).map(|m| (m.url.clone(), m.if_range.clone()))?;
+        // Meanwhile the mirror may have filled up, cooled down or gone back to its own URL.
+        let mirror = racer
+            .get_mirror(mirror_id)
+            .filter(|m| m.score(Instant::now()) >= 0.0 && HostKey::of(&m.url) == *slot.host())?;
+        let (url, if_range, redirected) = (mirror.url.clone(), mirror.if_range.clone(), mirror.fallback.is_some());
         let chunk = {
             let mut mgr = s.chunks.lock();
             mgr.get_next_work(self.worker_id, mirror_id)
-                .or_else(|| mgr.steal_work(self.worker_id, mirror_id, s.min_steal).map(|(_, c)| c))?
+                .or_else(|| {
+                    let taken = mgr.take_over_silent(self.worker_id, mirror_id, |m| takeover_after(racer.get_mirror(m)));
+                    if let Some(chunk) = &taken {
+                        tracing::info!("Chunk {} went silent; worker {} takes over the rest", chunk.id, self.worker_id);
+                    }
+                    taken
+                })
+                .or_else(|| {
+                    let costs: Vec<StealTiming> =
+                        racer.mirrors().iter().map(|m| StealTiming { startup: m.ttfb(), rate: m.speed_ewma }).collect();
+                    let steal = StealRule { min_bytes: s.min_steal, timing: Some(&costs) };
+                    mgr.steal_work(self.worker_id, mirror_id, steal).map(|(_, c)| c)
+                })?
         };
         racer.acquire_mirror(mirror_id);
-        Some((chunk, mirror_id, url, if_range))
+        Some((chunk, url, if_range, redirected))
     }
 
-    /// Streams the chunk's remaining range into the file. Bytes are written in batches on the
-    /// blocking pool, never on the async runtime. Only this worker advances
-    /// `chunk.current_offset`, and only once a batch is on disk.
+    /// Applies an attempt's outcome to mirror, host and chunk bookkeeping and returns the event to
+    /// send. A chunk another worker took over is no longer this worker's to complete or retry:
+    /// only a disk error still counts, and the silence against the mirror.
+    fn settle(
+        &self,
+        chunk: &Chunk,
+        mirror_id: usize,
+        url: &Url,
+        outcome: Result<(), Failure>,
+        slot: &HostSlot,
+    ) -> Option<WorkerEvent> {
+        let s = &self.shared;
+        let mut racer = s.mirrors.lock();
+        racer.release_mirror(mirror_id);
+        let mut chunks = s.chunks.lock();
+        let (worker_id, chunk_id) = (self.worker_id, chunk.id);
+        let revoked = chunk.revoked.is_cancelled();
+        match outcome {
+            Ok(()) if revoked => None,
+            Ok(()) => {
+                if let Err(e) = chunks.mark_completed(chunk_id) {
+                    chunks.abort(chunk_id, &e.to_string());
+                }
+                Some(WorkerEvent::ChunkCompleted { worker_id, chunk_id })
+            }
+            Err((kind, error)) => {
+                if !revoked {
+                    if matches!(kind, FailureKind::Throttled(_)) {
+                        slot.throttled();
+                    }
+                    record_failure(&mut racer, &mut chunks, chunk_id, mirror_id, url, kind, &error);
+                } else if kind == FailureKind::Fatal {
+                    chunks.abort(chunk_id, &error);
+                } else if let Some(mirror) = racer.get_mirror_mut(mirror_id) {
+                    mirror.record_failure();
+                }
+                Some(WorkerEvent::ChunkFailed { worker_id, chunk_id, mirror_id, kind, error })
+            }
+        }
+    }
+
+    /// Streams the chunk's remaining range from `url` (the mirror's redirect target if
+    /// `redirected`) into the file. Bytes are written in batches on the blocking pool, never on
+    /// the async runtime. Only this worker advances `chunk.current_offset`, and only once a batch
+    /// is on disk.
     async fn download_chunk(
         &self,
         chunk: &Chunk,
         mirror_id: usize,
-        url: Url,
+        url: &Url,
         if_range: Option<String>,
+        redirected: bool,
+        slot: &HostSlot,
     ) -> Result<(), Failure> {
         let s = &self.shared;
         let start = chunk.current_offset.load(Ordering::SeqCst);
@@ -254,7 +382,7 @@ impl HttpWorker {
             return Ok(()); // stolen away entirely before we started
         }
 
-        let mut request = authorize(s.client.get(url.clone()), s.auth.as_deref(), &url)
+        let mut request = authorize(s.client.get(url.clone()), s.auth.as_deref(), url)
             .header(RANGE, format!("bytes={}-{}", start, end))
             .header(ACCEPT_ENCODING, "identity");
         if let Some(validator) = &if_range {
@@ -265,57 +393,88 @@ impl HttpWorker {
         let response = tokio::select! {
             biased;
             _ = s.cancel.cancelled() => return Err(cancelled()),
+            _ = chunk.revoked.cancelled() => return Err(taken_over()),
             res = tokio::time::timeout(s.stall_timeout, request.send()) => match res {
                 Err(_) => return Err((FailureKind::Transient, format!("no response within {}s", s.stall_timeout.as_secs()))),
                 Ok(Err(e)) => return Err((FailureKind::Transient, format!("request failed: {}", e))),
                 Ok(Ok(resp)) => resp,
             },
         };
-        check_response(response.status(), response.headers(), start, end, s.file_size, if_range.as_deref())?;
-        let _ = s.events.try_send(WorkerEvent::Ttfb {
-            worker_id: self.worker_id,
-            mirror_id,
-            ttfb: sent_at.elapsed(),
-        });
+        check_response(response.status(), response.headers(), start, end, s.file_size, if_range.as_deref())
+            .map_err(|failure| if redirected { at_redirect_target(response.status(), failure) } else { failure })?;
+        slot.accepted();
+        let ttfb = sent_at.elapsed();
+        // The host answering honours ranges (a 200 from the file's start says nothing) and, on a
+        // new connection straight to it, takes this long to answer: the next download from it
+        // starts from that.
+        let accepts_ranges = (response.status() == StatusCode::PARTIAL_CONTENT).then_some(true);
+        let setup_time = (response.url() == url && slot.opens_connection()).then_some(ttfb);
+        hosts::record(response.url(), HostProfile { accepts_ranges, setup_time, ..Default::default() });
+        let _ = s.events.try_send(WorkerEvent::Ttfb { worker_id: self.worker_id, mirror_id, ttfb });
+        self.receive(chunk, mirror_id, response.bytes_stream(), start).await
+    }
 
-        let mut stream = response.bytes_stream();
+    /// Streams `body`, the chunk's bytes from `start`, into the file. The attempt ends once
+    /// `body_idle` passes without a byte: what arrived is kept for the retry. It ends at once when
+    /// another worker takes the chunk over; what arrived is then left to that worker.
+    async fn receive(
+        &self,
+        chunk: &Chunk,
+        mirror_id: usize,
+        body: impl Stream<Item = reqwest::Result<Bytes>>,
+        start: u64,
+    ) -> Result<(), Failure> {
+        let s = &self.shared;
+        let mut stream = std::pin::pin!(body);
         let mut batch = Batch { pos: start, buf: Vec::with_capacity(WRITE_BATCH) };
         // Due `WRITE_INTERVAL` after the oldest byte in `batch` arrived.
         let flush_due = tokio::time::sleep(WRITE_INTERVAL);
         tokio::pin!(flush_due);
+        // Due `body_idle` after the last byte arrived (or waiting on the rate limit ended).
+        let idle = tokio::time::sleep(s.body_idle);
+        tokio::pin!(idle);
         let mut pending: u64 = 0;
         let mut last_report = Instant::now();
         let result = loop {
+            // Only time spent waiting on the server counts as the chunk's silence, not writing or
+            // rate limiting what arrived.
+            chunk.wait_for_server(Instant::now());
             let item = tokio::select! {
                 biased;
                 _ = s.cancel.cancelled() => break Err(cancelled()),
+                _ = chunk.revoked.cancelled() => break Err(taken_over()),
                 // Also while the server pauses: received bytes must not wait for the next ones.
                 _ = &mut flush_due, if !batch.buf.is_empty() => {
                     if let Err(e) = self.flush(chunk, &mut batch).await {
                         break Err(e);
                     }
+                    // A thief may have left this chunk nothing beyond what just went to disk.
+                    if batch.pos > chunk.end_offset.load(Ordering::SeqCst) {
+                        break Ok(());
+                    }
                     continue;
                 }
-                item = tokio::time::timeout(s.stall_timeout, stream.next()) => item,
+                item = stream.next() => item,
+                _ = &mut idle => break Err((
+                    FailureKind::Transient,
+                    format!("stalled: no data for {:?} at offset {}", s.body_idle, batch.end()),
+                )),
             };
             let bytes = match item {
-                Err(_) => break Err((
-                    FailureKind::Transient,
-                    format!("stalled: no data for {}s at offset {}", s.stall_timeout.as_secs(), batch.end()),
-                )),
-                Ok(None) => break Ok(()),
-                Ok(Some(Err(e))) => {
-                    break Err((FailureKind::Transient, format!("read error at offset {}: {}", batch.end(), e)))
-                }
-                Ok(Some(Ok(bytes))) => bytes,
+                None => break Ok(()),
+                Some(Err(e)) => break Err((FailureKind::Transient, format!("read error at offset {}: {}", batch.end(), e))),
+                Some(Ok(bytes)) => bytes,
             };
+            chunk.busy();
             if let Some(limiter) = &s.limiter {
                 tokio::select! {
                     biased;
                     _ = s.cancel.cancelled() => break Err(cancelled()),
+                    _ = chunk.revoked.cancelled() => break Err(taken_over()),
                     _ = limiter.acquire(bytes.len() as u64) => {}
                 }
             }
+            idle.as_mut().reset(tokio::time::Instant::now() + s.body_idle);
 
             if batch.buf.len() + bytes.len() > WRITE_BATCH {
                 if let Err(e) = self.flush(chunk, &mut batch).await {
@@ -359,8 +518,14 @@ impl HttpWorker {
     }
 
     /// Writes the batch at its offset on the blocking pool, then advances the chunk's offset.
-    /// Bytes past the chunk's current end belong to whoever stole that tail and are dropped.
+    /// Bytes past the chunk's current end belong to whoever stole that tail and are dropped, as
+    /// is everything once the chunk has been taken over.
     async fn flush(&self, chunk: &Chunk, batch: &mut Batch) -> Result<(), Failure> {
+        chunk.busy();
+        if chunk.revoked.is_cancelled() {
+            batch.buf.clear();
+            return Ok(());
+        }
         let end = chunk.end_offset.load(Ordering::SeqCst);
         let keep = (end + 1).saturating_sub(batch.pos).min(batch.buf.len() as u64) as usize;
         batch.buf.truncate(keep);
@@ -399,16 +564,18 @@ impl HttpWorker {
     }
 }
 
-/// Applies a failed attempt to mirror and chunk bookkeeping. This is the retry policy:
-/// transient errors cost the chunk a retry (unless it made progress) and back off;
-/// bad mirrors are dropped after repeated bad answers; throttling while other connections are
-/// being served lowers the connection cap instead of costing retries.
+/// Applies a failed attempt (a request to `url`) to mirror and chunk bookkeeping. This is the retry
+/// policy: transient errors cost the chunk a retry (unless it made progress) and back off;
+/// bad mirrors are dropped after repeated bad answers, though a redirect target that refuses
+/// first sends the mirror back to its own URL; throttling while other connections are being
+/// served lowers the connection cap instead of costing retries.
 /// `mirror.in_flight` must already exclude the failed connection.
 fn record_failure(
     racer: &mut MirrorRacer,
     chunks: &mut ChunkManager,
     chunk_id: usize,
     mirror_id: usize,
+    url: &Url,
     kind: FailureKind,
     error: &str,
 ) {
@@ -425,7 +592,16 @@ fn record_failure(
             mirror.record_failure();
             (Duration::ZERO, true)
         }
-        FailureKind::BadMirror => {
+        // Another connection already sent the mirror back to its own URL.
+        FailureKind::Denied if *url != mirror.url => (Duration::ZERO, false),
+        FailureKind::Denied if mirror.fallback.is_some() => {
+            if let Some(own) = mirror.fallback.take() {
+                tracing::info!("{} refused ({}); going back to {}", mirror.url, error, own);
+                mirror.url = own;
+            }
+            (Duration::ZERO, false)
+        }
+        FailureKind::BadMirror | FailureKind::Denied => {
             if mirror.record_bad_response() {
                 tracing::warn!("Disabling mirror {}: {}", mirror.url, error);
             }
@@ -457,6 +633,17 @@ fn record_failure(
 
 fn cancelled() -> Failure {
     (FailureKind::Transient, "cancelled".to_string())
+}
+
+fn taken_over() -> Failure {
+    (FailureKind::Transient, "no data for too long; another connection took over".to_string())
+}
+
+/// How long a chunk's worker may wait for a byte from its mirror before an idle worker takes over
+/// what is left: `TAKEOVER_SILENCE`, or `TAKEOVER_TTFBS` of the mirror's answer times if longer,
+/// since a server slow to answer is not a dead one.
+fn takeover_after(mirror: Option<&Mirror>) -> Duration {
+    mirror.map_or(TAKEOVER_SILENCE, |m| TAKEOVER_SILENCE.max(m.ttfb().saturating_mul(TAKEOVER_TTFBS)))
 }
 
 /// Classifies the response to `Range: bytes=start-end` (with `If-Range: if_range` when set) for
@@ -513,12 +700,26 @@ fn check_response(
             format!("remote file changed: 416 Range Not Satisfiable for bytes {}-{}", start, end),
         )),
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND | StatusCode::GONE => {
-            Err((FailureKind::BadMirror, format!("HTTP {}", status)))
+            Err((FailureKind::Denied, format!("HTTP {}", status)))
         }
         StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE => {
             Err((FailureKind::Throttled(retry_after(headers)), format!("HTTP {}", status)))
         }
         _ => Err((FailureKind::Transient, format!("HTTP {}", status))),
+    }
+}
+
+/// Reclassifies `failure`, `check_response`'s verdict on a `status` answer from a mirror's
+/// redirect target. A signed target that expired may answer with any client error (Google Cloud
+/// Storage sends 400) or an error page that is not the file (a 200, maybe after a redirect of its
+/// own), so all of these are Denied there: the mirror goes back to its own URL, whose fresh
+/// redirect decides, before anything counts against the mirror or ends the download. Throttling
+/// and server errors say nothing about the target's signature and keep their kind.
+fn at_redirect_target(status: StatusCode, (kind, error): Failure) -> Failure {
+    match kind {
+        FailureKind::Throttled(_) => (kind, error),
+        _ if status.is_server_error() => (kind, error),
+        _ => (FailureKind::Denied, error),
     }
 }
 
@@ -575,7 +776,7 @@ mod tests {
 
         assert_eq!(check(416, &[], 0, 9, 10, V1), Some(FailureKind::Fatal));
         for status in [401, 403, 404, 410] {
-            assert_eq!(check(status, &[], 0, 9, 10, None), Some(FailureKind::BadMirror));
+            assert_eq!(check(status, &[], 0, 9, 10, None), Some(FailureKind::Denied));
         }
         assert_eq!(
             check(503, &[("retry-after", "3")], 0, 9, 10, None),
@@ -583,6 +784,30 @@ mod tests {
         );
         assert_eq!(check(429, &[], 0, 9, 10, None), Some(FailureKind::Throttled(None)));
         assert_eq!(check(502, &[], 0, 9, 10, None), Some(FailureKind::Transient));
+    }
+
+    #[test]
+    fn test_a_redirect_target_answering_anything_but_the_file_sends_the_mirror_home() {
+        // The answer to bytes 500-999 of a 1000-byte file, asked of a redirect target with If-Range.
+        let at_target = |status: u16, headers: &[(&'static str, &'static str)]| {
+            let mut map = HeaderMap::new();
+            for (k, v) in headers {
+                map.insert(*k, HeaderValue::from_static(v));
+            }
+            let status = StatusCode::from_u16(status).unwrap();
+            check_response(status, &map, 500, 999, 1000, V1).err().map(|failure| at_redirect_target(status, failure).0)
+        };
+        assert_eq!(at_target(206, &[("content-range", "bytes 500-999/1000")]), None);
+        // An expired signature: a client error of any kind, an error page, a wrong range.
+        for status in [400, 401, 403, 404, 410, 416] {
+            assert_eq!(at_target(status, &[]), Some(FailureKind::Denied), "HTTP {status}");
+        }
+        assert_eq!(at_target(200, &[("content-length", "41"), ("content-type", "text/html")]), Some(FailureKind::Denied));
+        assert_eq!(at_target(206, &[("content-range", "bytes 500-999/77")]), Some(FailureKind::Denied));
+        // Neither throttling nor a server error says the signature expired.
+        assert_eq!(at_target(429, &[]), Some(FailureKind::Throttled(None)));
+        assert_eq!(at_target(503, &[]), Some(FailureKind::Throttled(None)));
+        assert_eq!(at_target(502, &[]), Some(FailureKind::Transient));
     }
 
     #[test]
@@ -634,9 +859,261 @@ mod tests {
             limiter: None,
             file_size: size,
             min_steal: size,
+            host_limit: 0,
             stall_timeout: Duration::from_secs(10),
+            body_idle: Duration::from_secs(5),
         };
         (HttpWorker::new(0, shared), chunk, rx)
+    }
+
+    /// A connection slot on `url`'s host, from no budget.
+    fn slot(url: &Url) -> HostSlot {
+        hosts::try_acquire(url, 0).unwrap()
+    }
+
+    /// A body that sends each `(ms, len)` step `ms` after the one before, then goes silent.
+    fn silent_after(steps: Vec<(u64, usize)>) -> Body {
+        let steps = futures_util::stream::iter(steps).then(|(ms, len)| async move {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+            Ok(Bytes::from(vec![9u8; len]))
+        });
+        steps.chain(futures_util::stream::pending()).boxed()
+    }
+
+    #[tokio::test]
+    async fn test_a_seeded_worker_streams_the_answer_it_was_given() {
+        const SIZE: usize = 256 * 1024;
+        let data: Vec<u8> = (0..SIZE).map(|i| (i % 253) as u8).collect();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.part");
+        // Nothing answers there: the bytes can only come from the answer the worker was given.
+        let url = Url::parse("http://seeded.worker.invalid/f").unwrap();
+        let (worker, chunk, mut events) = test_worker(&url, &path, SIZE as u64);
+        let shared = worker.shared.clone();
+        let response = reqwest::Response::from(http::Response::new(reqwest::Body::from(data.clone())));
+        let slot = hosts::try_acquire(&url, 1).unwrap();
+        assert!(hosts::try_acquire(&url, 1).is_none(), "the answer's request holds the host's only slot");
+        let seed = Seed { chunk, mirror_id: 0, url: url.clone(), body: response.bytes_stream().boxed(), slot };
+        let task = tokio::spawn(HttpWorker::new(0, shared.clone()).run(Some(seed)));
+
+        let completed = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match events.recv().await {
+                    Some(WorkerEvent::ChunkCompleted { chunk_id, .. }) => break chunk_id,
+                    Some(_) => continue,
+                    None => panic!("the worker stopped"),
+                }
+            }
+        });
+        assert_eq!(completed.await.expect("the chunk completes"), 0);
+        assert!(shared.chunks.lock().is_all_completed());
+        assert_eq!(std::fs::read(&path).unwrap(), data);
+        assert!(hosts::try_acquire(&url, 1).is_some(), "the slot went back once the attempt was settled");
+        assert_eq!(shared.mirrors.lock().in_flight(), 0);
+        shared.cancel.cancel();
+        task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_a_body_gone_quiet_ends_the_attempt_after_the_idle_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = Url::parse("http://127.0.0.1:9/f").unwrap();
+        for (stall, idle) in [(30, 5), (3, 3)] {
+            let (mut worker, chunk, _events) = test_worker(&url, &dir.path().join(format!("{stall}.part")), 1 << 20);
+            worker.shared.stall_timeout = Duration::from_secs(stall);
+            worker.shared.body_idle = Duration::from_secs(stall).min(Duration::from_secs(5));
+            let started = tokio::time::Instant::now();
+            // A pause just under the idle timeout is fine; one as long ends the attempt.
+            let body = silent_after(vec![(0, 64 * 1024), (idle * 1000 - 100, 64 * 1024)]);
+            let err = worker.receive(&chunk, 0, body, 0).await.unwrap_err();
+
+            assert_eq!(err.0, FailureKind::Transient, "{}", err.1);
+            assert!(err.1.contains(&format!("no data for {idle}s")), "{}", err.1);
+            let waited = started.elapsed();
+            let expected = Duration::from_millis(idle * 2000 - 100);
+            assert!(waited >= expected && waited < expected + Duration::from_millis(50), "{waited:?}");
+            assert_eq!(chunk.current_offset.load(Ordering::SeqCst), 128 * 1024, "what arrived is kept");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_an_attempt_whose_tail_was_stolen_ends_once_its_part_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = Url::parse("http://127.0.0.1:9/f").unwrap();
+        let (worker, chunk, _events) = test_worker(&url, &dir.path().join("f.part"), 1 << 20);
+        let (end, offset) = (Arc::clone(&chunk.end_offset), Arc::clone(&chunk.current_offset));
+        let started = tokio::time::Instant::now();
+        let task = tokio::spawn(async move { worker.receive(&chunk, 0, silent_after(vec![(0, 64 * 1024)]), 0).await });
+
+        // 64 KiB arrived, then the server went quiet and a thief took everything after it.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        end.store(64 * 1024 - 1, Ordering::SeqCst);
+        task.await.unwrap().unwrap();
+        assert!(started.elapsed() <= WRITE_INTERVAL, "done once written, not after the idle timeout: {:?}", started.elapsed());
+        assert_eq!(offset.load(Ordering::SeqCst), 64 * 1024);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_a_taken_over_attempt_stops_at_once_and_writes_nothing_more() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.part");
+        let url = Url::parse("http://127.0.0.1:9/f").unwrap();
+        let (worker, chunk, _events) = test_worker(&url, &path, 1 << 20);
+        let (revoked, offset) = (chunk.revoked.clone(), Arc::clone(&chunk.current_offset));
+        let started = tokio::time::Instant::now();
+        let task = tokio::spawn(async move { worker.receive(&chunk, 0, silent_after(vec![(0, 64 * 1024)]), 0).await });
+
+        // 64 KiB arrived and waits to be written when another worker takes the chunk over.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        revoked.cancel();
+        let err = task.await.unwrap().unwrap_err();
+        assert!(err.1.contains("took over"), "{}", err.1);
+        assert!(started.elapsed() < WRITE_INTERVAL, "{:?}", started.elapsed());
+        assert_eq!(offset.load(Ordering::SeqCst), 0, "the new owner fetches those bytes");
+        assert!(std::fs::read(&path).unwrap().iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_a_taken_over_chunk_is_left_to_its_new_owner() {
+        use crate::chunk::ChunkStatus;
+        let dir = tempfile::tempdir().unwrap();
+        let url = Url::parse("http://127.0.0.1:9/f").unwrap();
+        let (worker, old, _events) = test_worker(&url, &dir.path().join("f.part"), 1 << 20);
+        let taken = {
+            let mut chunks = worker.shared.chunks.lock();
+            chunks.backdate(0, Duration::from_secs(3));
+            chunks.take_over_silent(1, 0, |_| Duration::from_secs(2)).unwrap()
+        };
+        let thiefs = || worker.shared.chunks.lock().chunks()[0].status == ChunkStatus::Assigned { worker_id: 1, mirror_id: 0 };
+        let held = slot(&url);
+
+        // However the silent worker's attempt ends, the chunk stays the thief's.
+        assert!(worker.settle(&old, 0, &url, Ok(()), &held).is_none());
+        assert!(thiefs());
+        assert!(matches!(worker.settle(&old, 0, &url, Err(taken_over()), &held), Some(WorkerEvent::ChunkFailed { .. })));
+        assert!(thiefs(), "nor is it queued for a retry");
+        assert_eq!(worker.shared.mirrors.lock().get_mirror(0).unwrap().failures, 1, "the silence counts against the mirror");
+
+        let thief = HttpWorker::new(1, worker.shared.clone());
+        taken.current_offset.store(1 << 20, Ordering::SeqCst);
+        assert!(matches!(thief.settle(&taken, 0, &url, Ok(()), &held), Some(WorkerEvent::ChunkCompleted { .. })));
+        assert!(worker.shared.chunks.lock().is_all_completed());
+        // A disk error in the silent attempt still ends the download.
+        worker.settle(&old, 0, &url, Err((FailureKind::Fatal, "Disk write error: no space".into())), &held);
+        assert!(worker.shared.chunks.lock().has_fatal_failure().is_some());
+    }
+
+    #[test]
+    fn test_a_refusal_holds_every_download_to_the_connections_the_host_served() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = Url::parse("http://refusing.worker.example/f").unwrap();
+        let (worker, chunk, _events) = test_worker(&url, &dir.path().join("f.part"), 1 << 20);
+        let mut open: Vec<HostSlot> = (0..4).map(|_| slot(&url)).collect();
+        let refused = FailureKind::Throttled(None);
+        worker.settle(&chunk, 0, &url, Err((refused, "HTTP 503".into())), &open[3]);
+        open.pop();
+
+        assert_eq!(hosts::profile(&url).connection_cap, Some(3));
+        assert!(hosts::try_acquire(&url, 0).is_none(), "three are open");
+        open.pop();
+        assert!(hosts::try_acquire(&url, 0).is_some());
+    }
+
+    #[test]
+    fn test_a_slot_is_only_good_for_its_own_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = Url::parse("http://127.0.0.1:9/f").unwrap();
+        let (worker, ..) = test_worker(&url, &dir.path().join("f.part"), 1 << 20);
+        *worker.shared.chunks.lock() = ChunkManager::new(1 << 20, 1 << 19).unwrap();
+        // Say the mirror went back to its own URL on another host after the slot was taken.
+        let elsewhere = Url::parse("http://127.0.0.1:10/f").unwrap();
+        assert!(worker.next_job(0, &slot(&elsewhere)).is_none());
+        assert!(worker.next_job(0, &slot(&url)).is_some());
+    }
+
+    #[test]
+    fn test_steals_are_timed_by_what_a_request_to_the_thiefs_mirror_costs() {
+        const MB: u64 = 1024 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let url = Url::parse("http://127.0.0.1:9/f").unwrap();
+        let (mut worker, chunk, _events) = test_worker(&url, &dir.path().join("f.part"), 100 * MB);
+        worker.shared.min_steal = 64 * 1024;
+        // Worker 0 wrote 10 MB in 10 s: 90 MB left at 1 MB/s.
+        chunk.current_offset.store(10 * MB, Ordering::SeqCst);
+        worker.shared.chunks.lock().backdate(0, Duration::from_secs(10));
+        {
+            let mut racer = worker.shared.mirrors.lock();
+            let mirror = racer.get_mirror_mut(0).unwrap();
+            (mirror.ttfb_ewma_ms, mirror.speed_ewma) = (4000.0, 3.0 * MB as f64);
+        }
+        let thief = HttpWorker::new(1, worker.shared.clone());
+        let (stolen, ..) = thief.next_job(0, &slot(&url)).unwrap();
+        // The mirror's 4 s answers and 3 MB/s connections: both sides finish after 25.5 s.
+        let split = 10 * MB + (25.5 * MB as f64) as u64;
+        assert!(stolen.range.start.abs_diff(split) < MB, "split at {} instead of about {split}", stolen.range.start);
+    }
+
+    #[tokio::test]
+    async fn test_a_slow_answer_gets_the_full_stall_timeout() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        const SIZE: usize = 64 * 1024;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!("http://{}/f", listener.local_addr().unwrap())).unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut head = [0u8; 4096];
+            let _ = socket.read(&mut head).await.unwrap();
+            // Headers come well after the body idle timeout, within the stall timeout.
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            let header = format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-{}/{}\r\nContent-Length: {}\r\n\r\n",
+                SIZE - 1, SIZE, SIZE
+            );
+            socket.write_all(header.as_bytes()).await.unwrap();
+            socket.write_all(&[5u8; SIZE]).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut worker, chunk, _events) = test_worker(&url, &dir.path().join("f.part"), SIZE as u64);
+        worker.shared.stall_timeout = Duration::from_secs(10);
+        worker.shared.body_idle = Duration::from_millis(100);
+        worker.download_chunk(&chunk, 0, &url, None, false, &slot(&url)).await.unwrap();
+        assert_eq!(chunk.current_offset.load(Ordering::SeqCst), SIZE as u64);
+    }
+
+    #[tokio::test]
+    async fn test_an_answered_range_tells_what_its_host_does() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        const SIZE: usize = 16 * 1024;
+        let listener = hosts::unseen_listener().await;
+        let url = Url::parse(&format!("http://{}/f", listener.local_addr().unwrap())).unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut head = [0u8; 4096];
+                let _ = socket.read(&mut head).await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let header = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-{}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    SIZE - 1, SIZE, SIZE
+                );
+                let _ = socket.write_all(header.as_bytes()).await;
+                let _ = socket.write_all(&[5u8; SIZE]).await;
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+
+        // Nothing went to the host before: the connection is new, and its wait what one needs.
+        let (worker, chunk, _events) = test_worker(&url, &dir.path().join("a.part"), SIZE as u64);
+        worker.download_chunk(&chunk, 0, &url, None, false, &slot(&url)).await.unwrap();
+        let seen = hosts::profile(&url);
+        assert_eq!(seen.accepts_ranges, Some(true));
+        assert!(seen.setup_time.is_some_and(|t| t >= Duration::from_millis(50)), "{seen:?}");
+        // Right after a request to the host ended, the next may reuse its connection.
+        let cold = Duration::from_secs(7);
+        hosts::record(&url, HostProfile { setup_time: Some(cold), ..Default::default() });
+        let (worker, chunk, _events) = test_worker(&url, &dir.path().join("b.part"), SIZE as u64);
+        worker.download_chunk(&chunk, 0, &url, None, false, &slot(&url)).await.unwrap();
+        assert_eq!(hosts::profile(&url).setup_time, Some(cold));
     }
 
     #[tokio::test]
@@ -668,7 +1145,7 @@ mod tests {
         let path = dir.path().join("f.part");
         let (worker, chunk, _events) = test_worker(&url, &path, SIZE as u64);
         let offset = Arc::clone(&chunk.current_offset);
-        let task = tokio::spawn(async move { worker.download_chunk(&chunk, 0, url, None).await });
+        let task = tokio::spawn(async move { worker.download_chunk(&chunk, 0, &url, None, false, &slot(&url)).await });
 
         sent_rx.await.unwrap();
         // 64 KiB arrived, far less than a batch, and the server went quiet: within about
@@ -713,7 +1190,7 @@ mod tests {
         let path = dir.path().join("f.part");
         let (worker, chunk, _events) = test_worker(&url, &path, SIZE as u64);
         let offset = Arc::clone(&chunk.current_offset);
-        let err = worker.download_chunk(&chunk, 0, url, None).await.unwrap_err();
+        let err = worker.download_chunk(&chunk, 0, &url, None, false, &slot(&url)).await.unwrap_err();
 
         assert_eq!(err.0, FailureKind::Transient, "{}", err.1);
         assert_eq!(offset.load(Ordering::SeqCst), 100_000);
@@ -727,6 +1204,12 @@ mod tests {
         (MirrorRacer::new(urls), chunks)
     }
 
+    /// A failed request to the mirror's current URL.
+    fn fail(racer: &mut MirrorRacer, chunks: &mut ChunkManager, chunk: usize, mirror: usize, kind: FailureKind, error: &str) {
+        let url = racer.get_mirror(mirror).unwrap().url.clone();
+        record_failure(racer, chunks, chunk, mirror, &url, kind, error);
+    }
+
     #[test]
     fn test_throttling_with_other_connections_costs_no_retries() {
         let (mut racer, mut chunks) = setup(1);
@@ -735,7 +1218,7 @@ mod tests {
         }
         for _ in 0..5 {
             let chunk = chunks.get_next_work(0, 0).map(|c| c.id).unwrap_or(0);
-            record_failure(&mut racer, &mut chunks, chunk, 0, FailureKind::Throttled(None), "HTTP 503");
+            fail(&mut racer, &mut chunks, chunk, 0, FailureKind::Throttled(None), "HTTP 503");
             assert!(chunks.chunks().iter().all(|c| c.retries == 0));
         }
         assert!(chunks.has_fatal_failure().is_none());
@@ -748,7 +1231,7 @@ mod tests {
         let (mut racer, mut chunks) = setup(1);
         chunks.get_next_work(0, 0).unwrap();
         let busy = FailureKind::Throttled(Some(Duration::from_secs(2)));
-        record_failure(&mut racer, &mut chunks, 0, 0, busy, "HTTP 503");
+        fail(&mut racer, &mut chunks, 0, 0, busy, "HTTP 503");
         assert_eq!(chunks.chunks()[0].retries, 1);
         assert_eq!(racer.select_best_mirror(), None, "mirror pauses for Retry-After");
         assert!(chunks.get_next_work(0, 0).is_none_or(|c| c.id != 0), "chunk waits for Retry-After");
@@ -760,7 +1243,7 @@ mod tests {
         for mirror in 0..2 {
             for _ in 0..2 {
                 let chunk = chunks.get_next_work(0, mirror).unwrap().id;
-                record_failure(&mut racer, &mut chunks, chunk, mirror, FailureKind::BadMirror, "HTTP 404");
+                fail(&mut racer, &mut chunks, chunk, mirror, FailureKind::BadMirror, "HTTP 404");
             }
         }
         assert!(racer.all_inactive());
@@ -770,10 +1253,38 @@ mod tests {
     }
 
     #[test]
+    fn test_refused_redirect_target_sends_the_mirror_back_to_its_own_url_once() {
+        let target = Url::parse("https://cdn.example/f.bin?sig=expired").unwrap();
+        let own = Url::parse("https://example.com/releases/f.bin").unwrap();
+        let mut racer = MirrorRacer::new(vec![target.clone()]);
+        racer.get_mirror_mut(0).unwrap().fallback = Some(own.clone());
+        let (_, mut chunks) = setup(1);
+
+        // Every connection finds the signed target expired at once: none of that counts.
+        for _ in 0..3 {
+            let chunk = chunks.get_next_work(0, 0).unwrap().id;
+            record_failure(&mut racer, &mut chunks, chunk, 0, &target, FailureKind::Denied, "HTTP 403");
+        }
+        let mirror = racer.get_mirror(0).unwrap();
+        assert_eq!((&mirror.url, &mirror.fallback), (&own, &None));
+        assert_eq!((mirror.bad_responses, mirror.failures, mirror.is_active), (0, 0, true));
+        assert!(chunks.has_fatal_failure().is_none());
+        assert!(chunks.chunks().iter().all(|c| c.retries == 0));
+
+        // The mirror's own URL refusing is a bad mirror, as always.
+        for _ in 0..2 {
+            let chunk = chunks.get_next_work(0, 0).unwrap().id;
+            record_failure(&mut racer, &mut chunks, chunk, 0, &own, FailureKind::Denied, "HTTP 404");
+        }
+        assert!(racer.all_inactive());
+        assert!(chunks.has_fatal_failure().unwrap().1.contains("every mirror failed"));
+    }
+
+    #[test]
     fn test_fatal_failure_aborts() {
         let (mut racer, mut chunks) = setup(1);
         chunks.get_next_work(0, 0).unwrap();
-        record_failure(&mut racer, &mut chunks, 0, 0, FailureKind::Fatal, "Disk write error: no space");
+        fail(&mut racer, &mut chunks, 0, 0, FailureKind::Fatal, "Disk write error: no space");
         assert_eq!(chunks.has_fatal_failure().unwrap().1, "Disk write error: no space");
     }
 
