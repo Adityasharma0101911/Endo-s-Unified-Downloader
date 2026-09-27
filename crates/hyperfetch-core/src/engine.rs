@@ -769,12 +769,6 @@ impl DownloadEngine {
                     let probe = async {
                         // Only the first mirror fetches the file's start: the download uses one copy.
                         let (mut info, body) = probe_url(&client, auth.as_deref(), &url, i == 0, limit).await?;
-                        // A shortened link that lands on a host a resolver takes is judged there (see
-                        // `fetch_resolved`), not as the page it may answer with here.
-                        if !crate::resolver::lands_elsewhere(&url, &info.final_url) {
-                            crate::resolver::check_answer(&url, &info.final_url, &info.headers)
-                                .map_err(|e| format!("{}: {}", url, e))?;
-                        }
                         let live = match body {
                             Some(body) if !started.load(Ordering::Relaxed) => {
                                 reading.store(true, Ordering::Relaxed);
@@ -782,6 +776,15 @@ impl DownloadEngine {
                             }
                             _ => None,
                         };
+                        // A shortened link that lands on a host a resolver takes is judged there (see
+                        // `fetch_resolved`), not as the page it may answer with here. An answer whose
+                        // start, when read, shows a file is none, whatever it is labelled.
+                        if !crate::resolver::lands_elsewhere(&url, &info.final_url)
+                            && !crate::resolver::start_is_no_page(&info.prefetch)
+                        {
+                            crate::resolver::check_answer(&url, &info.final_url, &info.headers)
+                                .map_err(|e| format!("{}: {}", url, e))?;
+                        }
                         Ok((info, live))
                     };
                     (i, probe.await)

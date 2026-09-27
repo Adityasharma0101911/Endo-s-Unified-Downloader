@@ -439,6 +439,18 @@ fn code_host_folder(url: &Url) -> bool {
     }
 }
 
+/// Whether `start`, the first bytes of an answer, show it is no web page whatever its headers
+/// say, as a server that labels every file HTML still sends the file: binary data (a NUL byte,
+/// or bytes that are no UTF-8 text) that does not open with markup. No bytes show nothing.
+pub fn start_is_no_page(start: &[u8]) -> bool {
+    let head = &start[..start.len().min(512)];
+    let head = head.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(head);
+    let Some(&first) = head.iter().find(|b| !b.is_ascii_whitespace()) else { return false };
+    // A character the 512 bytes cut in two is still text.
+    let binary = head.contains(&0) || std::str::from_utf8(head).is_err_and(|e| e.error_len().is_some());
+    first != b'<' && binary
+}
+
 /// The name of the file `url` names by one of the [`FILE_EXTENSIONS`], if it does.
 fn named_file(url: &Url) -> Option<String> {
     let ext = last_segment_extension(url)?;
@@ -1827,6 +1839,33 @@ mod tests {
             "https://example.com/docs/readme.md",
         ] {
             assert_eq!(refusal(url, None, &page), None, "{url}");
+        }
+    }
+
+    /// A server may label every file HTML: the file's own first bytes show it is none.
+    #[test]
+    fn test_only_binary_data_shows_an_answer_labelled_html_is_no_page() {
+        for file in [
+            &b"PK\x03\x04\x14\x00\x00\x00\x08\x00"[..],
+            b"MZ\x90\x00\x03\x00\x00\x00",
+            b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n",
+            b"\x1F\x8B\x08\x00\x00\x00\x00\x00",
+            b"GGUF\x03\x00\x00\x00",
+            b"\xEF\xBB\xBF\x00\x01",
+        ] {
+            assert!(start_is_no_page(file), "{file:?}");
+        }
+        for page in [
+            &b""[..],
+            b"   \r\n",
+            b"<!DOCTYPE html><html><body>Sign in</body></html>",
+            b"\xEF\xBB\xBF\n  <html lang=\"fr\"><title>T\xE9l\xE9charger</title>",
+            b"File not found.",
+            "Datei nicht gefunden: überprüfen Sie den Link".as_bytes(),
+            // A character cut in two by the 512 bytes looked at.
+            &[b"x".repeat(511), "é".as_bytes().to_vec()].concat(),
+        ] {
+            assert!(!start_is_no_page(page), "{:?}", String::from_utf8_lossy(page));
         }
     }
 
