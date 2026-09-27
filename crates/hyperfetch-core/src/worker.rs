@@ -153,8 +153,10 @@ impl Auth {
     }
 }
 
-/// Adds the user's `Authorization` header to a request for `url` when `auth` covers that URL.
+/// Adds the user's `Authorization` header to a request for `url` when `auth` covers that URL,
+/// and the User-Agent `url`'s host takes (see [`crate::resolver::with_agent_for`]).
 pub(crate) fn authorize(request: RequestBuilder, auth: Option<&Auth>, url: &Url) -> RequestBuilder {
+    let request = crate::resolver::with_agent_for(request, url);
     match auth.filter(|a| a.allows(url)) {
         Some(a) => request.header(AUTHORIZATION, a.value.clone()),
         None => request,

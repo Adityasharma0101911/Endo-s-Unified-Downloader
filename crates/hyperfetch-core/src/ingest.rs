@@ -212,7 +212,7 @@ pub fn descriptor_client(proxy: Option<&str>) -> Result<reqwest::Client, String>
     let mut builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(15))
         .timeout(Duration::from_secs(60))
-        .user_agent(concat!("Endos-Unified-Downloader/", env!("CARGO_PKG_VERSION")));
+        .user_agent(resolver::APP_USER_AGENT);
     if let Some(proxy) = proxy {
         builder = builder.proxy(reqwest::Proxy::all(proxy).map_err(|e| format!("invalid proxy: {}", e))?);
     }
