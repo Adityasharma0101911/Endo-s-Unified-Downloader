@@ -2295,3 +2295,33 @@ async fn test_a_download_starts_at_the_connection_cap_its_host_was_seen_to_enfor
     assert_file(&out, &data);
     assert_eq!(mock.served_ranges().len(), 2, "{:?}", mock.served_ranges());
 }
+
+// Links that stand for a file elsewhere: code-host file pages, Google Docs, and web pages served
+// in place of a file.
+
+/// Options that send every request through `proxy`, a mock that answers for whatever host is
+/// asked: links to real hosts, as the resolvers rewrite them, reach it over plain HTTP.
+fn through(proxy: &Url, out: &Path) -> DownloadOptions {
+    DownloadOptions { proxy: Some(format!("http://{}", proxy.authority())), ..options(out, 4, 64 * KB) }
+}
+
+#[tokio::test]
+async fn test_a_code_host_file_page_downloads_the_file() {
+    let _history = setup().await;
+    let data = payload(PREFETCH + 256 * KB, 311);
+    // Past the probe's first MiB, the "view file" page is no source of the file.
+    let mut mock = Mock::new(data.clone());
+    mock.expired = Some(("/blob/", Reply::Status(404, None)));
+    let mock = Arc::new(mock);
+    let proxy = serve(Arc::clone(&mock), "").await;
+    let temp = tempdir().unwrap();
+    let page = Url::parse("http://github.com/links-lane/repo/blob/main/dist/app.zip").unwrap();
+
+    let path = run(&DownloadEngine::new(vec![page], through(&proxy, temp.path())), None)
+        .await
+        .expect("the file should download");
+    assert_eq!(path, temp.path().join("app.zip"));
+    assert_file(&path, &data);
+    assert!(mock.stats.gets.load(Ordering::SeqCst) > 0);
+    assert_eq!(mock.stats.denied.load(Ordering::SeqCst), 0, "the page was asked for the file");
+}

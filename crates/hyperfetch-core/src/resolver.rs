@@ -421,6 +421,57 @@ impl HostResolver for SourceForgeResolver {
     }
 }
 
+/// Code Host Resolver (Turns a "view file" page on GitHub, GitLab, Codeberg, Bitbucket or Hugging
+/// Face into the file's own download link)
+pub struct CodeHostResolver;
+
+/// The download link of the file whose "view file" page `url` is, rewritten without a request:
+/// the one path segment naming the view becomes the one naming the file's bytes. Folder pages
+/// ("tree", or a trailing slash) are left alone.
+fn code_host_raw_url(url: &Url) -> Option<Url> {
+    let mut segs: Vec<&str> = url.path_segments()?.collect();
+    // Where the segment naming the view is, what it becomes, and how many segments name the ref.
+    let (at, raw, refs) = match url.host_str()?.trim_end_matches('.') {
+        // /{owner}/{repo}/blob/{ref}/{path}; /raw/ also serves Git LFS files.
+        "github.com" if segs.get(2) == Some(&"blob") => (2, "raw", 1),
+        // /{namespace...}/-/blob/{ref}/{path}
+        "gitlab.com" => (segs.windows(2).skip(2).position(|w| w == ["-", "blob"])? + 3, "raw", 1),
+        // /{owner}/{repo}/src/{branch|tag|commit}/{ref}/{path}. /media/ serves what /raw/ does,
+        // but for a Git LFS file the file itself instead of its pointer.
+        "codeberg.org" if segs.get(2) == Some(&"src") && matches!(segs.get(3), Some(&("branch" | "tag" | "commit"))) => {
+            (2, "media", 2)
+        }
+        // /{owner}/{repo}/src/{ref}/{path}
+        "bitbucket.org" if segs.get(2) == Some(&"src") => (2, "raw", 1),
+        // [/datasets|/spaces]/{owner}/{repo}/blob/{ref}/{path}, or {repo} alone for older repos.
+        "huggingface.co" | "hf.co" => {
+            let start = usize::from(matches!(segs.first(), Some(&("datasets" | "spaces"))));
+            ([start + 2, start + 1].into_iter().find(|&i| segs.get(i) == Some(&"blob"))?, "resolve", 1)
+        }
+        _ => return None,
+    };
+    // The ref, then a path whose last segment names a file.
+    if segs.len() <= at + refs + 1 || segs.last().is_none_or(|s| s.is_empty()) {
+        return None;
+    }
+    segs[at] = raw;
+    let mut raw_url = url.clone();
+    raw_url.set_path(&format!("/{}", segs.join("/")));
+    raw_url.set_fragment(None);
+    Some(raw_url)
+}
+
+impl HostResolver for CodeHostResolver {
+    fn can_handle(&self, url: &Url) -> bool {
+        code_host_raw_url(url).is_some()
+    }
+
+    async fn resolve(&self, _client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
+        let raw = code_host_raw_url(url).ok_or_else(|| ResolverError::Parse(format!("Not a code host file URL: {}", url)))?;
+        Ok(vec![raw])
+    }
+}
+
 /// HTML5 Video Extractor (Finds the video a web page plays via <video>, <source>, OpenGraph or player JSON)
 pub struct HtmlVideoResolver;
 
@@ -478,6 +529,7 @@ impl SmartResolver {
             || MediaFireResolver.can_handle(url)
             || DropboxResolver.can_handle(url)
             || SourceForgeResolver.can_handle(url)
+            || CodeHostResolver.can_handle(url)
             || ArchiveOrgResolver.can_handle(url)
     }
 
@@ -496,6 +548,9 @@ impl SmartResolver {
         }
         if SourceForgeResolver.can_handle(url) {
             return SourceForgeResolver.resolve(client, url).await;
+        }
+        if CodeHostResolver.can_handle(url) {
+            return CodeHostResolver.resolve(client, url).await;
         }
 
         // These only add mirrors or find an embedded stream; the input URL remains a valid source.
@@ -1048,6 +1103,104 @@ mod tests {
             unwrapped("https://www.google.com/url?q=weather&url=https%3A%2F%2Fexample.com%2Fa.zip").as_deref(),
             Some("https://example.com/a.zip")
         );
+    }
+
+    #[test]
+    fn test_code_host_file_pages_become_their_download_links() {
+        // Each download link was checked to serve the file.
+        for (page, file) in [
+            (
+                "https://github.com/yt-dlp/yt-dlp/blob/master/README.md#L10-L20",
+                "https://github.com/yt-dlp/yt-dlp/raw/master/README.md",
+            ),
+            (
+                "https://github.com/o/r/blob/feature/x/src/My%20App.zip",
+                "https://github.com/o/r/raw/feature/x/src/My%20App.zip",
+            ),
+            (
+                "https://gitlab.com/gitlab-org/gitlab-runner/-/blob/main/README.md?ref_type=heads",
+                "https://gitlab.com/gitlab-org/gitlab-runner/-/raw/main/README.md?ref_type=heads",
+            ),
+            (
+                "https://gitlab.com/group/sub/group/project/-/blob/v1.0/dist/app.tar.gz",
+                "https://gitlab.com/group/sub/group/project/-/raw/v1.0/dist/app.tar.gz",
+            ),
+            (
+                "https://codeberg.org/forgejo/forgejo/src/branch/forgejo/README.md",
+                "https://codeberg.org/forgejo/forgejo/media/branch/forgejo/README.md",
+            ),
+            (
+                "https://codeberg.org/forgejo/forgejo/src/tag/v12.0.0/README.md",
+                "https://codeberg.org/forgejo/forgejo/media/tag/v12.0.0/README.md",
+            ),
+            (
+                "https://bitbucket.org/multicoreware/x265_git/src/master/COPYING?at=master",
+                "https://bitbucket.org/multicoreware/x265_git/raw/master/COPYING?at=master",
+            ),
+            (
+                "https://huggingface.co/openai-community/gpt2/blob/main/model.safetensors",
+                "https://huggingface.co/openai-community/gpt2/resolve/main/model.safetensors",
+            ),
+            ("https://huggingface.co/gpt2/blob/main/config.json", "https://huggingface.co/gpt2/resolve/main/config.json"),
+            (
+                "https://hf.co/openai-community/gpt2/blob/main/config.json",
+                "https://hf.co/openai-community/gpt2/resolve/main/config.json",
+            ),
+            (
+                "https://huggingface.co/datasets/stanfordnlp/imdb/blob/main/README.md",
+                "https://huggingface.co/datasets/stanfordnlp/imdb/resolve/main/README.md",
+            ),
+            ("https://huggingface.co/datasets/squad/blob/main/README.md", "https://huggingface.co/datasets/squad/resolve/main/README.md"),
+            (
+                "https://huggingface.co/spaces/gradio/hello_world/blob/main/app.py",
+                "https://huggingface.co/spaces/gradio/hello_world/resolve/main/app.py",
+            ),
+        ] {
+            let page = Url::parse(page).unwrap();
+            assert!(SmartResolver::handles(&page), "{page}");
+            assert_eq!(code_host_raw_url(&page).map(String::from).as_deref(), Some(file), "{page}");
+        }
+    }
+
+    #[test]
+    fn test_code_host_folders_and_other_pages_are_left_alone() {
+        for page in [
+            "https://github.com/o/r/tree/main/docs",
+            "https://github.com/o/r/blob/main",
+            "https://github.com/o/r/blob/main/docs/",
+            "https://github.com/o/r/raw/main/app.zip",
+            "https://github.com/o/r/releases/download/v1.0/app.zip",
+            "https://github.com/o/blob",
+            "https://gitlab.com/group/project/-/tree/main/docs",
+            "https://gitlab.com/group/-/blob/main/app.zip",
+            "https://gitlab.com/group/project/-/blob/main",
+            "https://codeberg.org/o/r/src/branch/main/",
+            "https://codeberg.org/o/r/src/branch/main",
+            "https://codeberg.org/o/r/src/main/app.zip",
+            "https://bitbucket.org/o/r/src/master/",
+            "https://bitbucket.org/o/r/src/master",
+            "https://huggingface.co/openai-community/gpt2/tree/main",
+            "https://huggingface.co/openai-community/gpt2",
+            "https://huggingface.co/datasets/stanfordnlp/imdb/blob/main",
+            "https://example.com/o/r/blob/main/app.zip",
+        ] {
+            let page = Url::parse(page).unwrap();
+            assert_eq!(code_host_raw_url(&page), None, "{page}");
+            assert!(!CodeHostResolver.can_handle(&page), "{page}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_code_host_resolver_sends_nothing() {
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = Client::builder()
+            .proxy(reqwest::Proxy::all(format!("http://{}", proxy.local_addr().unwrap())).unwrap())
+            .build()
+            .unwrap();
+        let page = Url::parse("https://github.com/o/r/blob/main/app.zip").unwrap();
+        let resolved = SmartResolver::resolve(&client, &page).await.unwrap();
+        assert_eq!(resolved, vec![Url::parse("https://github.com/o/r/raw/main/app.zip").unwrap()]);
+        assert!(!contacted(&proxy).await, "the code host was asked before the download's probe");
     }
 
     fn utf8_percent_encode(s: &str) -> String {
