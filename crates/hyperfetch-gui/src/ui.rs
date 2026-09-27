@@ -417,7 +417,7 @@ fn combo(ui: &mut egui::Ui, id: &str, value: &mut usize, names: &[&str]) {
 }
 
 fn advanced_options(app: &mut App, ui: &mut egui::Ui) {
-    text_row(ui, "Checksum:", &mut app.checksum_input, "Optional, this download only: sha256:..., md5:..., blake3:..., or hex");
+    text_row(ui, "Checksum:", &mut app.checksum_input, "Optional, this download only: sha256:..., sha512:..., sha1:..., md5:..., blake3:..., or hex");
 
     ui.add_space(4.0);
     ui.horizontal(|ui| {
