@@ -28,6 +28,27 @@ const JSON_VIDEO_KEYS: &[&str] = &["viewMp4Url", "downloadUrl", "videoUrl", "vid
 
 const SOURCEFORGE_MIRRORS: &[&str] = &["autoselect", "netix", "phoenixnap", "netcologne", "jaist", "liquidtelecom"];
 
+/// "You are leaving this site" links: their hosts, their path (trailing slash aside; `None` for
+/// any) and the query parameters that may hold the target, in the order they are tried.
+const REDIRECT_WRAPPERS: &[(&[&str], Option<&str>, &[&str])] = &[
+    (&["youtube.com", "www.youtube.com", "m.youtube.com"], Some("/redirect"), &["q"]),
+    (&["google.com", "www.google.com"], Some("/url"), &["q", "url"]),
+    (&["l.facebook.com", "lm.facebook.com", "l.messenger.com"], Some("/l.php"), &["u"]),
+    (&["l.instagram.com", "l.threads.net", "l.threads.com"], Some(""), &["u"]),
+    // `url` is the parameter older links carry.
+    (&["steamcommunity.com"], Some("/linkfilter"), &["u", "url"]),
+    (&["out.reddit.com"], None, &["url"]),
+    (&["linkedin.com", "www.linkedin.com"], Some("/redir/redirect"), &["url"]),
+    (&["vk.com", "m.vk.com"], Some("/away.php"), &["to"]),
+    (&["duckduckgo.com"], Some("/l"), &["uddg"]),
+    (&["t.umblr.com"], Some("/redirect"), &["z"]),
+    // SoundCloud's.
+    (&["gate.sc"], Some(""), &["url"]),
+];
+
+/// How many wrappers around one link are taken off at most.
+const MAX_UNWRAPS: usize = 5;
+
 #[derive(Error, Debug)]
 pub enum ResolverError {
     #[error("Network error during resolution: {0}")]
@@ -235,8 +256,29 @@ impl HostResolver for GoogleDriveResolver {
 /// The target of a "you are leaving this site" link (youtube.com/redirect?q=, google.com/url?q=,
 /// l.facebook.com/l.php?u=, ...), read from the link itself without a request; None when `url` is
 /// not such a link. Wrappers of wrappers are unwrapped too; the result is always http(s).
-pub fn unwrap_redirect(_url: &Url) -> Option<Url> {
-    None
+pub fn unwrap_redirect(url: &Url) -> Option<Url> {
+    let mut target = unwrap_once(url)?;
+    for _ in 1..MAX_UNWRAPS {
+        match unwrap_once(&target) {
+            Some(inner) => target = inner,
+            None => break,
+        }
+    }
+    Some(target)
+}
+
+/// The http(s) target one wrapper in [`REDIRECT_WRAPPERS`] holds, if `url` is one.
+fn unwrap_once(url: &Url) -> Option<Url> {
+    let host = url.host_str()?.trim_end_matches('.');
+    let path = url.path().trim_end_matches('/');
+    let (_, _, params) = REDIRECT_WRAPPERS
+        .iter()
+        .find(|(hosts, wrapper_path, _)| hosts.contains(&host) && wrapper_path.is_none_or(|p| p == path))?;
+    params.iter().find_map(|name| {
+        let (_, value) = url.query_pairs().find(|(key, _)| key == name)?;
+        let target = Url::parse(value.trim()).ok()?;
+        matches!(target.scheme(), "http" | "https").then_some(target)
+    })
 }
 
 /// Fails if the answer to `url` (which ended at `final_url`), with these headers, is a web page
@@ -931,6 +973,85 @@ mod tests {
         assert!(GoogleDriveResolver::check_answer(&drive, &html_file).is_ok());
         // Only Drive's answers are judged so.
         assert!(GoogleDriveResolver::check_answer(&Url::parse("https://example.com/download").unwrap(), &page).is_ok());
+    }
+
+    fn unwrapped(link: &str) -> Option<String> {
+        unwrap_redirect(&Url::parse(link).unwrap()).map(String::from)
+    }
+
+    #[test]
+    fn test_leaving_this_site_links_give_their_target() {
+        let target = "https://www.mediafire.com/file/abc/mod.zip/file?dkey=1&r=2";
+        let enc = "https%3A%2F%2Fwww.mediafire.com%2Ffile%2Fabc%2Fmod.zip%2Ffile%3Fdkey%3D1%26r%3D2";
+        for link in [
+            format!("https://www.youtube.com/redirect?event=video_description&redir_token=QUFF&q={enc}&v=dQw4w9WgXcQ"),
+            format!("https://youtube.com/redirect?q={enc}"),
+            format!("https://m.youtube.com/redirect/?q={enc}"),
+            format!("https://www.google.com/url?q={enc}&sa=D&source=docs&ust=1&usg=AOv"),
+            format!("https://google.com/url?sa=t&url={enc}"),
+            format!("https://l.facebook.com/l.php?u={enc}&h=AT0"),
+            format!("https://lm.facebook.com/l.php?u={enc}"),
+            format!("https://l.messenger.com/l.php?u={enc}"),
+            format!("https://l.instagram.com/?u={enc}&e=AT1"),
+            format!("https://l.threads.net/?u={enc}"),
+            format!("https://steamcommunity.com/linkfilter/?u={enc}"),
+            format!("https://steamcommunity.com/linkfilter/?url={enc}"),
+            format!("https://out.reddit.com/t3_1abcd?url={enc}&token=AQAA&app_name=web2x"),
+            format!("https://www.linkedin.com/redir/redirect?url={enc}&urlhash=x"),
+            format!("https://vk.com/away.php?to={enc}&cc_key="),
+            format!("https://m.vk.com/away.php?to={enc}"),
+            format!("https://duckduckgo.com/l/?uddg={enc}&rut=abc"),
+            format!("https://t.umblr.com/redirect?z={enc}&t=MjQ"),
+            format!("https://gate.sc/?url={enc}&token=1a2b"),
+        ] {
+            assert_eq!(unwrapped(&link).as_deref(), Some(target), "{link}");
+        }
+    }
+
+    #[test]
+    fn test_wrapped_wrappers_are_unwrapped_up_to_a_limit() {
+        let file = "https://drive.google.com/file/d/abc/view";
+        let youtube = format!("https://www.youtube.com/redirect?q={}", utf8_percent_encode(file));
+        let google = format!("https://www.google.com/url?q={}", utf8_percent_encode(&youtube));
+        assert_eq!(unwrapped(&google).as_deref(), Some(file));
+
+        // Six wrappers deep, the last is left on.
+        let mut link = file.to_string();
+        for _ in 0..MAX_UNWRAPS + 1 {
+            link = format!("https://www.google.com/url?q={}", utf8_percent_encode(&link));
+        }
+        let left = unwrapped(&link).unwrap();
+        assert_eq!(unwrap_once(&Url::parse(&left).unwrap()).map(String::from).as_deref(), Some(file));
+        // An inner wrapper without a usable target stops the unwrapping, not the outer one's.
+        let broken = format!("https://www.google.com/url?q={}", utf8_percent_encode("https://vk.com/away.php?to=nowhere"));
+        assert_eq!(unwrapped(&broken).as_deref(), Some("https://vk.com/away.php?to=nowhere"));
+    }
+
+    #[test]
+    fn test_links_that_are_not_wrappers_or_hold_no_target_are_kept() {
+        for link in [
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ&q=https%3A%2F%2Fexample.com",
+            "https://www.google.com/search?q=https%3A%2F%2Fexample.com",
+            "https://example.com/redirect?q=https%3A%2F%2Fexample.org",
+            "https://www.youtube.com/redirect?event=video_description",
+            "https://www.youtube.com/redirect?q=example.com%2Ffile.zip",
+            "https://www.youtube.com/redirect?q=javascript%3Aalert(1)",
+            "https://www.google.com/url?q=file%3A%2F%2F%2Fetc%2Fpasswd",
+            "https://www.google.com/url?q=https%3A%2F%2F",
+            "https://l.instagram.com/p/abc?u=https%3A%2F%2Fexample.com",
+            "https://lnkd.in/abc123",
+        ] {
+            assert_eq!(unwrapped(link), None, "{link}");
+        }
+        // A target that is not a URL is skipped for the next parameter that holds one.
+        assert_eq!(
+            unwrapped("https://www.google.com/url?q=weather&url=https%3A%2F%2Fexample.com%2Fa.zip").as_deref(),
+            Some("https://example.com/a.zip")
+        );
+    }
+
+    fn utf8_percent_encode(s: &str) -> String {
+        percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string()
     }
 
     #[test]
