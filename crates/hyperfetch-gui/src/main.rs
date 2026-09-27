@@ -5,7 +5,7 @@ mod settings;
 mod ui;
 mod util;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -35,6 +35,9 @@ const GRAPH_WINDOW: Duration = Duration::from_secs(60);
 const STALL_HINT: Duration = Duration::from_secs(5);
 /// How often the clipboard is checked for links.
 const CLIPBOARD_POLL: Duration = Duration::from_millis(500);
+/// A .metalink, .meta4 or .torrent listing more files than this is added only once the user
+/// agrees.
+const CONFIRM_FILES: usize = 50;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -59,6 +62,25 @@ enum Origin {
     QueueLine(usize),
     /// A file dropped on the window.
     Dropped,
+}
+
+/// The downloads a .metalink, .meta4 or .torrent lists, waiting for the user to agree to add
+/// that many.
+struct Listing {
+    origin: Origin,
+    input: String,
+    checksum: String,
+    tasks: Vec<Task>,
+}
+
+impl Listing {
+    /// "120 files (4.20 GiB)", the size shown when the document gives every file's.
+    fn summary(&self) -> String {
+        match self.tasks.iter().try_fold(0u64, |total, t| total.checked_add(t.size?)) {
+            Some(total) => format!("{} files ({})", self.tasks.len(), util::format_bytes(total)),
+            None => format!("{} files", self.tasks.len()),
+        }
+    }
 }
 
 /// Results of background work, delivered to the UI thread (each send also requests a repaint).
@@ -159,6 +181,10 @@ struct App {
     form_error: Option<String>,
     queue_error: Option<String>,
     notice: Option<Result<String, String>>,
+    /// Documents being read now; asking again for one of them does nothing.
+    reading: HashSet<String>,
+    /// Large listings waiting for the user's answer, first come first.
+    listings: Vec<Listing>,
 
     clipboard_enabled: Arc<AtomicBool>,
     /// Last clipboard text the watcher saw or the app copied itself; never offered again.
@@ -229,6 +255,8 @@ impl App {
             form_error: None,
             queue_error: None,
             notice: queue_problem.map(Err),
+            reading: HashSet::new(),
+            listings: Vec::new(),
             clipboard_enabled,
             clipboard_seen,
             clipboard_banner: None,
@@ -323,25 +351,51 @@ impl App {
         Ok(queue_task(&mut self.queue, task, options))
     }
 
-    /// Queues the downloads a .metalink, .meta4 or .torrent lists; nothing if one is refused.
-    fn add_tasks(&mut self, tasks: Vec<Task>, checksum: &str) -> Result<Vec<usize>, String> {
-        let options = document_options(&self.settings, &tasks, checksum)?;
-        Ok(tasks.into_iter().zip(options).map(|(task, options)| queue_task(&mut self.queue, task, options)).collect())
+    /// Reads the downloads a .metalink, .meta4 or .torrent lists off the UI thread and adds them
+    /// as `origin` says. A document already being read is not read again.
+    fn read_document(&mut self, input: String, origin: Origin, checksum: String) {
+        let shown = ingest::truncate_chars(&input, 60);
+        if !self.reading.insert(input.clone()) {
+            self.notice = Some(Ok(format!("Still reading {}...", shown)));
+            return;
+        }
+        self.notice = Some(Ok(format!("Reading {}...", shown)));
+        let read = read_listing(&self.settings, input.clone());
+        self.spawn_event(async move { AppEvent::Read { origin, input, checksum, result: read.await } });
     }
 
-    /// Reads the downloads a .metalink, .meta4 or .torrent lists off the UI thread (fetching a
-    /// remote one through the proxy setting) and adds them as `origin` says.
-    fn read_document(&mut self, input: String, origin: Origin, checksum: String) {
-        self.notice = Some(Ok(format!("Reading {}...", ingest::truncate_chars(&input, 60))));
-        let proxy = Some(self.settings.proxy.trim().to_string()).filter(|p| !p.is_empty());
-        self.spawn_event(async move {
-            let tokens = ingest::input_tokens(&input).await;
-            let result = match ingest::descriptor_client(proxy.as_deref()) {
-                Ok(http) => ingest::ingest(&tokens, &http).await,
-                Err(e) => Err(e),
-            };
-            AppEvent::Read { origin, input, checksum, result }
-        });
+    /// Adds what a document listed (or shows why it was refused) as `origin` says: the form
+    /// starts the first download, a queue line that failed is put back with its error.
+    fn add_listing(&mut self, origin: Origin, input: &str, checksum: &str, result: Result<Vec<Task>, String>) {
+        let added = result.and_then(|tasks| queue_listed(&mut self.queue, &self.settings, tasks, checksum));
+        match (origin, added) {
+            (Origin::Form, Ok(ids)) => {
+                if let Some(&first) = ids.first() {
+                    self.start_added(first);
+                }
+                if ids.len() > 1 && self.notice.is_none() {
+                    self.notice = Some(Ok(format!("Started the first of {} downloads; the others wait in the queue", ids.len())));
+                }
+            }
+            (Origin::Form, Err(e)) => self.form_error = Some(e),
+            (Origin::QueueLine(_) | Origin::Dropped, Ok(ids)) => {
+                let name = ingest::truncate_chars(input, 60);
+                self.notice = Some(Ok(format!("Added {} download(s) from {} to the queue", ids.len(), name)));
+            }
+            (Origin::QueueLine(line), Err(e)) => keep_refused_line(&mut self.queue_input, &mut self.queue_error, line, input, &e),
+            (Origin::Dropped, Err(e)) => self.notice = Some(Err(e)),
+        }
+    }
+
+    /// Answers the first large listing waiting: adds its downloads, or drops them.
+    fn answer_listing(&mut self, add: bool) {
+        if self.listings.is_empty() {
+            return;
+        }
+        let Listing { origin, input, checksum, tasks } = self.listings.remove(0);
+        if add {
+            self.add_listing(origin, &input, &checksum, Ok(tasks));
+        }
     }
 
     /// Adds the downloads of a .metalink, .meta4 or .torrent file dropped on the window.
@@ -665,35 +719,11 @@ impl App {
     fn handle_event(&mut self, event: AppEvent) {
         match event {
             AppEvent::Read { origin, input, checksum, result } => {
+                self.reading.remove(&input);
                 self.notice = None;
-                let added = result.and_then(|tasks| self.add_tasks(tasks, &checksum));
-                match (origin, added) {
-                    (Origin::Form, Ok(ids)) => {
-                        if let Some(&first) = ids.first() {
-                            self.start_added(first);
-                        }
-                        if ids.len() > 1 && self.notice.is_none() {
-                            self.notice = Some(Ok(format!("Started the first of {} downloads; the others wait in the queue", ids.len())));
-                        }
-                    }
-                    (Origin::Form, Err(e)) => self.form_error = Some(e),
-                    (Origin::QueueLine(_), Ok(ids)) | (Origin::Dropped, Ok(ids)) => {
-                        let name = ingest::truncate_chars(&input, 60);
-                        self.notice = Some(Ok(format!("Added {} download(s) from {} to the queue", ids.len(), name)));
-                    }
-                    (Origin::QueueLine(line), Err(e)) => {
-                        // Keep the line so it can be corrected, as a line refused at once is.
-                        if !self.queue_input.is_empty() {
-                            self.queue_input.push('\n');
-                        }
-                        self.queue_input.push_str(&input);
-                        let error = format!("Line {}: {}", line, e);
-                        self.queue_error = Some(match self.queue_error.take() {
-                            Some(errors) => format!("{}\n{}", errors, error),
-                            None => error,
-                        });
-                    }
-                    (Origin::Dropped, Err(e)) => self.notice = Some(Err(e)),
+                match result {
+                    Ok(tasks) if tasks.len() > CONFIRM_FILES => self.listings.push(Listing { origin, input, checksum, tasks }),
+                    result => self.add_listing(origin, &input, &checksum, result),
                 }
             }
             AppEvent::JobFinished { id, result } => {
@@ -938,6 +968,12 @@ fn document_options(settings: &Settings, tasks: &[Task], checksum: &str) -> Resu
     tasks.iter().map(|task| task_options(settings, task, checksum, "")).collect()
 }
 
+/// Queues the downloads a .metalink, .meta4 or .torrent lists; nothing if one is refused.
+fn queue_listed(queue: &mut DownloadQueue, settings: &Settings, tasks: Vec<Task>, checksum: &str) -> Result<Vec<usize>, String> {
+    let options = document_options(settings, &tasks, checksum)?;
+    Ok(tasks.into_iter().zip(options).map(|(task, options)| queue_task(queue, task, options)).collect())
+}
+
 /// Queues one download; one its input named is shown under that name at once. Its target is
 /// left for the engine to report, so Start Over and Delete Leftovers never reach a file another
 /// download holds under that name.
@@ -945,6 +981,31 @@ fn queue_task(queue: &mut DownloadQueue, task: Task, options: DownloadOptions) -
     match task.name {
         Some(_) => queue.add_named_item(task.urls, options),
         None => queue.add_item(task.urls, options),
+    }
+}
+
+/// Puts queue line `line` back into the queue input with its error, as a line refused at once is,
+/// so it can be corrected.
+fn keep_refused_line(queue_input: &mut String, queue_error: &mut Option<String>, line: usize, input: &str, error: &str) {
+    if !queue_input.is_empty() {
+        queue_input.push('\n');
+    }
+    queue_input.push_str(input);
+    let error = format!("Line {}: {}", line, error);
+    *queue_error = Some(match queue_error.take() {
+        Some(errors) => format!("{}\n{}", errors, error),
+        None => error,
+    });
+}
+
+/// Reads the downloads `input` (a local or remote .metalink, .meta4 or .torrent) lists, fetching
+/// a remote one through the proxy setting.
+fn read_listing(settings: &Settings, input: String) -> impl Future<Output = Result<Vec<Task>, String>> + Send + 'static {
+    let proxy = Some(settings.proxy.trim().to_string()).filter(|p| !p.is_empty());
+    async move {
+        let tokens = ingest::input_tokens(&input).await;
+        let http = ingest::descriptor_client(proxy.as_deref())?;
+        ingest::ingest(&tokens, &http).await
     }
 }
 
@@ -1413,6 +1474,48 @@ mod tests {
         assert_eq!(document_options(&settings, &one, &typed).unwrap()[0].expected_checksum, Some(typed));
         let refused = [file("a.bin", None), file("b.bin", Some("crc32:1234".to_string()))];
         assert!(document_options(&settings, &refused, "").is_err());
+    }
+
+    /// A document's downloads are queued all together or not at all; a queue line whose document
+    /// could not be read is put back with its error; a large listing says how much it adds.
+    #[test]
+    fn a_read_document_is_queued_whole_or_its_line_is_kept() {
+        let settings = Settings { save_dir: "dl".into(), ..Settings::default() };
+        let file = |n: u32| Task {
+            urls: vec![Url::parse(&format!("https://m.example/{}.bin", n)).unwrap()],
+            name: Some(PathBuf::from(format!("{}.bin", n))),
+            size: Some(1024),
+            from_document: true,
+            ..Task::default()
+        };
+        let mut queue = DownloadQueue::new();
+        let ids = queue_listed(&mut queue, &settings, vec![file(1), file(2)], "").unwrap();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.iter().all(|&id| queue.get_item(id).is_some_and(|item| item.names_file && item.target_path.is_none())));
+        let refused = Task { checksum: Some("crc32:1".to_string()), ..file(3) };
+        assert!(queue_listed(&mut queue, &settings, vec![file(4), refused], "").is_err());
+        assert_eq!(queue.items().len(), 2, "nothing of a refused document is queued");
+
+        let (mut input, mut errors) = ("https://ok.example/f".to_string(), None);
+        keep_refused_line(&mut input, &mut errors, 2, "https://a.example/x.torrent", "Cannot fetch");
+        keep_refused_line(&mut input, &mut errors, 3, "y.meta4", "Cannot read");
+        assert_eq!(input, "https://ok.example/f\nhttps://a.example/x.torrent\ny.meta4");
+        assert_eq!(errors.as_deref(), Some("Line 2: Cannot fetch\nLine 3: Cannot read"));
+
+        let listing = |tasks| Listing { origin: Origin::Dropped, input: String::new(), checksum: String::new(), tasks };
+        assert_eq!(listing((1..=60).map(file).collect()).summary(), "60 files (60.00 KiB)");
+        assert_eq!(listing(vec![file(1), Task { size: None, ..file(2) }]).summary(), "2 files");
+    }
+
+    /// A remote document is fetched through the proxy setting: its host does not exist, so only
+    /// the proxy can answer.
+    #[tokio::test]
+    async fn documents_are_read_through_the_proxy_setting() {
+        let xml = br#"<metalink xmlns="urn:ietf:params:xml:ns:metalink"><file name="a.bin"><url>https://m.example/a.bin</url></file></metalink>"#;
+        let proxy = serve(Arc::new(xml.to_vec())).await;
+        let settings = Settings { proxy: format!("http://{}", proxy), ..Settings::default() };
+        let tasks = read_listing(&settings, "http://documents.invalid/list.meta4".to_string()).await.unwrap();
+        assert_eq!(tasks.iter().map(|t| t.name.clone()).collect::<Vec<_>>(), [Some(PathBuf::from("a.bin"))]);
     }
 
     /// A download its input named is shown under that name at once and saved as that file, in
