@@ -441,8 +441,9 @@ fn advanced_options(app: &mut App, ui: &mut egui::Ui) {
             .password(true)
             .hint_text(hint_text("Optional: lists whole Google Drive folders, with sizes and checksums, through the Drive API"));
         ui.add_sized([ui.available_width() - 10.0, 24.0], key).on_hover_text(
-            "Sent only to Google's Drive API. Without a key a Drive folder is listed from its public page, \
-             which gives no sizes or checksums and may not show every file of a very large folder.",
+            "Sent only to Google's Drive API, and saved with the other settings (in plain text), like the \
+             proxy. Without a key a Drive folder is listed from its public page, which gives no sizes or \
+             checksums and may not show every file of a very large folder.",
         );
     });
 
