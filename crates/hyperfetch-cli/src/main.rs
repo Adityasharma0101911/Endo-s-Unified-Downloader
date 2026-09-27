@@ -169,6 +169,7 @@ fn job(args: &Args, connections: u64, dir: &Path, task: Task) -> Job {
         embed_metadata: !args.no_embed_metadata,
         live_from_start: args.live_from_start,
         wait_for_video: args.wait_for_video,
+        media_name: task.media_name,
         ..tuning(args, if media { args.concurrent_fragments } else { connections })
     };
     Job { label, urls: task.urls, options, line: None }
@@ -232,6 +233,8 @@ async fn read_input(path: &Path) -> Result<String, String> {
 
 /// The downloads `inputs` list, each with the input-file line it came from (None for the
 /// command-line URLs), and how many inputs could not be read into downloads (those are reported).
+/// A playlist or channel with nothing new is said so, but has not failed: it is the idle state
+/// of a sync.
 async fn read_tasks(
     inputs: &[(Option<usize>, Vec<String>)],
     ui: &Ui,
@@ -242,6 +245,12 @@ async fn read_tasks(
     let mut failed = 0;
     for (line, tokens) in inputs {
         match ingest(tokens, http, list).await {
+            Ok(found) if found.is_empty() => {
+                if !ui.quiet() {
+                    let input = truncate(&tokens.join(" "), 60);
+                    ui.error(&format!("Nothing new in {}: all it lists was downloaded before (--all-items gets it all again)", input));
+                }
+            }
             Ok(found) => tasks.extend(found.into_iter().map(|task| (*line, task))),
             Err(e) => {
                 ui.error(&format!("[FAILED] {}: {}", truncate(&tokens.join(" "), 60), e));
@@ -726,10 +735,14 @@ mod tests {
         let named = Task { urls: urls.clone(), folder: Some("Show".into()), name: Some("ep1.mp3".into()), ..Default::default() };
         let output = job(&args, 4, Path::new("d"), named).options.output_path.unwrap();
         assert_eq!(output, Path::new("d").join("Show").join("ep1.mp3"));
-        let unnamed = Task { urls, folder: Some("Show".into()), ..Default::default() };
-        let output = job(&args, 4, Path::new("d"), unnamed).options.output_path.unwrap();
+        // A playlist entry, which yt-dlp names by its title and id.
+        let template = "%(title)s [%(id)s].%(ext)s".to_string();
+        let unnamed = Task { urls, folder: Some("Show".into()), media_name: Some(template.clone()), ..Default::default() };
+        let options = job(&args, 4, Path::new("d"), unnamed).options;
+        let output = options.output_path.unwrap();
         assert_eq!(output, Path::new("d").join("Show").join(""));
         assert!(std::path::is_separator(*output.as_os_str().as_encoded_bytes().last().unwrap() as char));
+        assert_eq!(options.media_name, Some(template));
     }
 
     #[test]
