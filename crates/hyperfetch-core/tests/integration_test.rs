@@ -2419,3 +2419,21 @@ async fn test_links_are_followed_at_most_three_times_and_never_back() {
     assert_file(&out, &page.data);
     assert_eq!(page.stats.probes.load(Ordering::SeqCst), 2, "the start page, then the one it sends the browser to");
 }
+
+/// A link shortener's warning page, as it shows one instead of redirecting.
+fn shortener_warning(method: &str, _target: &str) -> Vec<u8> {
+    response(method, "200 OK", "Content-Type: text/html; charset=utf-8\r\n", b"<html><body>Warning! This link may be unsafe.</body></html>")
+}
+
+#[tokio::test]
+async fn test_a_link_shortener_showing_a_page_is_an_error_not_a_download() {
+    let _history = setup().await;
+    let (proxy, _) = serve_proxy(shortener_warning).await;
+    let temp = tempdir().unwrap();
+    let link = Url::parse("http://bit.ly/3xYz").unwrap();
+    let opts = DownloadOptions { proxy: Some(proxy), ..options(temp.path(), 4, 64 * KB) };
+
+    let err = run(&DownloadEngine::new(vec![link], opts), None).await.expect_err("a warning is not what the link stands for");
+    assert_eq!(err, "bit.ly showed a page instead of redirecting (a preview or a warning): open the link in your browser");
+    assert_eq!(names_in(temp.path()), Vec::<String>::new());
+}

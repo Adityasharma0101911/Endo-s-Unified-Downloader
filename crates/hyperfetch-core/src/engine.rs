@@ -282,7 +282,8 @@ impl DownloadEngine {
     /// from there instead (see `follow`). With `route.scrape`, a web page they answer with is
     /// looked into (see `look_into_page`): the video it plays is downloaded in its place, the link
     /// it sends the browser on to at once is followed. A page that leads nowhere is asked of
-    /// yt-dlp's own sites (see `site_media`), and is downloaded as it is when none takes it.
+    /// yt-dlp's own sites (see `site_media`), and is downloaded as it is when none takes it,
+    /// unless a link shortener or mail scanner showed it instead of redirecting.
     async fn fetch_resolved(
         &self,
         client: Client,
@@ -356,6 +357,12 @@ impl DownloadEngine {
         if let Some(found) = self.site_media(&final_url).await? {
             drop(probed);
             return self.naming(final_url.clone()).run_media(final_url, Some(found), snapshot_tx).await;
+        }
+        if let Some(host) = shortener_host(&final_url) {
+            return Err(format!(
+                "{} showed a page instead of redirecting (a preview or a warning): open the link in your browser",
+                host
+            ));
         }
         self.download(client, probed, snapshot_tx).await
     }
@@ -1837,6 +1844,17 @@ struct Route {
     follows: usize,
     /// Whether a web page answered is looked into: not once one led to its video.
     scrape: bool,
+}
+
+/// The host of `url` when a link shortener or a mail link scanner answers there (see
+/// `HtmlVideoResolver::SHORTENER_HOSTS`): a page from it is a preview or a warning.
+fn shortener_host(url: &Url) -> Option<&str> {
+    let host = url.host_str()?;
+    let listed = |pattern: &&str| match pattern.split_once('*') {
+        Some((head, tail)) => host.len() > head.len() + tail.len() && host.starts_with(head) && host.ends_with(tail),
+        None => host == *pattern,
+    };
+    HtmlVideoResolver::SHORTENER_HOSTS.iter().any(listed).then_some(host)
 }
 
 /// Where a `RateWatch` measures a connection's rate from: when its answer arrived.
@@ -4817,6 +4835,35 @@ mod tests {
             r#"<meta name="refresh" content="0; url=https://example.com/a">"#,
         ] {
             assert_eq!(target(meta), None, "{meta}");
+        }
+    }
+
+    #[test]
+    fn test_link_shorteners_and_mail_scanners_are_known_by_host() {
+        let host = |url: &str| shortener_host(&Url::parse(url).unwrap()).map(str::to_string);
+        for url in [
+            "https://bit.ly/3xYz",
+            "https://tinyurl.com/abc",
+            "https://lnkd.in/eAbc",
+            "https://nam12.safelinks.protection.outlook.com/?url=https%3A%2F%2Fexample.com",
+            "https://urldefense.proofpoint.com/v2/url?u=x",
+            "https://protect-eu.mimecast.com/s/abc",
+            "https://url.uk.m.mimecastprotect.com/s/abc",
+        ] {
+            let expected = Url::parse(url).unwrap().host_str().map(str::to_string);
+            assert_eq!(host(url), expected, "{url}");
+        }
+        // t.co's page sends the browser on (see `meta_refresh`); lookalikes are no shorteners.
+        for url in [
+            "https://t.co/abc",
+            "https://example.com/bit.ly",
+            "https://notbit.ly/x",
+            "https://bit.ly.example.com/x",
+            "https://safelinks.protection.outlook.com/?url=x",
+            "https://protect-.mimecast.com/s/abc",
+            "https://mimecast.com/s/abc",
+        ] {
+            assert_eq!(host(url), None, "{url}");
         }
     }
 }
