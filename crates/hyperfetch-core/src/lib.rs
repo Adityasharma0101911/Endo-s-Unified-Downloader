@@ -14,6 +14,7 @@ pub mod media;
 pub mod history;
 pub mod verify;
 pub mod hosts;
+pub mod ingest;
 
 pub use range::{ByteRange, RangeError};
 pub use chunk::{Chunk, ChunkManager, ChunkStatus, ChunkError};

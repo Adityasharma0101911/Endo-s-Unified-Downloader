@@ -47,6 +47,11 @@ pub struct QueueItem {
     pub progress_ratio: f64,
     /// Final path reported by the engine, once known.
     pub target_path: Option<PathBuf>,
+    /// `options.output_path` is the file itself, named by the input (a .metalink, .torrent or
+    /// magnet), rather than the folder that receives it under the server's name. The engine may
+    /// still save it under a numbered name, which `target_path` then reports.
+    #[serde(default)]
+    pub names_file: bool,
 }
 
 impl QueueItem {
@@ -123,7 +128,21 @@ impl DownloadQueue {
             speed_bytes_per_sec: 0.0,
             progress_ratio: 0.0,
             target_path: None,
+            names_file: false,
         });
+        id
+    }
+
+    /// Adds a download saved as `options.output_path` itself (see [`QueueItem::names_file`]),
+    /// shown under that name until the engine reports its target.
+    pub fn add_named_item(&mut self, urls: Vec<Url>, options: DownloadOptions) -> usize {
+        let id = self.add_item(urls, options);
+        if let Some(item) = self.items.last_mut() {
+            item.names_file = true;
+            if let Some(name) = item.options.output_path.as_deref().and_then(Path::file_name) {
+                item.filename = name.to_string_lossy().into_owned();
+            }
+        }
         id
     }
 
@@ -372,6 +391,29 @@ mod tests {
         assert_eq!(item.options.proxy.as_deref(), Some("http://p:1"));
         assert_eq!(item.status, QueueItemStatus::Queued);
         assert_eq!(q.get_item(b).unwrap().filename, "download");
+    }
+
+    /// A download its input named shows that name at once, but its target stays unknown until
+    /// the engine reports one: until then no other download's file counts as its own, to clean
+    /// up or to conflict with.
+    #[test]
+    fn a_named_item_is_shown_by_name_but_targets_nothing_yet() {
+        let mut q = DownloadQueue::new();
+        let named = |dir: &str| DownloadOptions { output_path: Some(PathBuf::from(dir).join("video.mkv")), ..Default::default() };
+        let running = q.add_named_item(vec![url("https://a.example/1")], named("/dl"));
+        let added = q.add_named_item(vec![url("https://b.example/2")], named("/dl"));
+        q.mark_started(running);
+        let item = q.get_item(added).unwrap();
+        assert_eq!((item.filename.as_str(), item.names_file, item.target_path.as_ref()), ("video.mkv", true, None));
+        assert_eq!(q.active_conflict(added), None, "the same name is not the same file");
+        let plain = q.add_item(vec![url("https://e.com/x")], named("/dl"));
+        assert!(!q.get_item(plain).unwrap().names_file);
+
+        // Queues saved before the flag existed load as folders to save into.
+        let json = serde_json::to_string(&q).unwrap().replace(",\"names_file\":true", "").replace(",\"names_file\":false", "");
+        assert!(!json.contains("names_file"));
+        let back: DownloadQueue = serde_json::from_str(&json).unwrap();
+        assert!(back.items().iter().all(|item| !item.names_file));
     }
 
     #[test]

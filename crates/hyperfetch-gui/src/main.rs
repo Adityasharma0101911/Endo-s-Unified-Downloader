@@ -5,7 +5,7 @@ mod settings;
 mod ui;
 mod util;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,6 +17,7 @@ use egui::Color32;
 use hyperfetch_core::chunk::ChunkSnapshot;
 use hyperfetch_core::engine::{build_client, ClientKey, DownloadEngine, DownloadOptions, EngineSnapshot, SharedLimits};
 use hyperfetch_core::history::{DownloadHistoryManager, HistoryEntry};
+use hyperfetch_core::ingest::{self, Task};
 use hyperfetch_core::queue::{DownloadQueue, QueueItem};
 use hyperfetch_core::verify::{self, BuildVerificationResult};
 use tokio::sync::{broadcast, Notify};
@@ -34,6 +35,9 @@ const GRAPH_WINDOW: Duration = Duration::from_secs(60);
 const STALL_HINT: Duration = Duration::from_secs(5);
 /// How often the clipboard is checked for links.
 const CLIPBOARD_POLL: Duration = Duration::from_millis(500);
+/// A .metalink, .meta4 or .torrent listing more files than this is added only once the user
+/// agrees.
+const CONFIRM_FILES: usize = 50;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -49,8 +53,41 @@ enum Dialog {
     VerifyFile,
 }
 
+/// Where a .metalink, .meta4 or .torrent came from, which decides what happens to its downloads.
+#[derive(Clone, Copy)]
+enum Origin {
+    /// The URL box: the first download starts now and is shown; errors show in the form.
+    Form,
+    /// This line (1-based) of the queue input: errors show there, with the line kept.
+    QueueLine(usize),
+    /// A file dropped on the window.
+    Dropped,
+}
+
+/// The downloads a .metalink, .meta4 or .torrent lists, waiting for the user to agree to add
+/// that many.
+struct Listing {
+    origin: Origin,
+    input: String,
+    checksum: String,
+    tasks: Vec<Task>,
+}
+
+impl Listing {
+    /// "120 files (4.20 GiB)", the size shown when the document gives every file's.
+    fn summary(&self) -> String {
+        match self.tasks.iter().try_fold(0u64, |total, t| total.checked_add(t.size?)) {
+            Some(total) => format!("{} files ({})", self.tasks.len(), util::format_bytes(total)),
+            None => format!("{} files", self.tasks.len()),
+        }
+    }
+}
+
 /// Results of background work, delivered to the UI thread (each send also requests a repaint).
 enum AppEvent {
+    /// The downloads a .metalink, .meta4 or .torrent lists, with the form's checksum when it was
+    /// added.
+    Read { origin: Origin, input: String, checksum: String, result: Result<Vec<Task>, String> },
     JobFinished { id: usize, result: Result<(PathBuf, Option<u64>), String> },
     /// The history as read by the `generation`-th history operation to run.
     History(Result<(u64, Vec<HistoryEntry>), String>),
@@ -144,6 +181,10 @@ struct App {
     form_error: Option<String>,
     queue_error: Option<String>,
     notice: Option<Result<String, String>>,
+    /// Documents being read now; asking again for one of them does nothing.
+    reading: HashSet<String>,
+    /// Large listings waiting for the user's answer, first come first.
+    listings: Vec<Listing>,
 
     clipboard_enabled: Arc<AtomicBool>,
     /// Last clipboard text the watcher saw or the app copied itself; never offered again.
@@ -214,6 +255,8 @@ impl App {
             form_error: None,
             queue_error: None,
             notice: queue_problem.map(Err),
+            reading: HashSet::new(),
+            listings: Vec::new(),
             clipboard_enabled,
             clipboard_seen,
             clipboard_banner: None,
@@ -301,24 +344,89 @@ impl App {
 
     // ---- downloads -----------------------------------------------------------------------
 
-    /// Adds the download described by `text` (mirrors of one file) with the current settings.
+    /// Adds the download described by `text` (links to one file) with the current settings.
     fn add_download(&mut self, text: &str, checksum: &str, auth: &str) -> Result<usize, String> {
-        let urls = util::parse_urls(text)?;
-        let options = self.settings.download_options(&urls, checksum, auth)?;
-        Ok(self.queue.add_item(urls, options))
+        let task = ingest::link_task(&ingest::split_tokens(text))?;
+        let options = task_options(&self.settings, &task, checksum, auth)?;
+        Ok(queue_task(&mut self.queue, task, options))
+    }
+
+    /// Reads the downloads a .metalink, .meta4 or .torrent lists off the UI thread and adds them
+    /// as `origin` says. A document already being read is not read again.
+    fn read_document(&mut self, input: String, origin: Origin, checksum: String) {
+        let shown = ingest::truncate_chars(&input, 60);
+        if !self.reading.insert(input.clone()) {
+            self.notice = Some(Ok(format!("Still reading {}...", shown)));
+            return;
+        }
+        self.notice = Some(Ok(format!("Reading {}...", shown)));
+        let read = read_listing(&self.settings, input.clone());
+        self.spawn_event(async move { AppEvent::Read { origin, input, checksum, result: read.await } });
+    }
+
+    /// Adds what a document listed (or shows why it was refused) as `origin` says: the form
+    /// starts the first download, a queue line that failed is put back with its error.
+    fn add_listing(&mut self, origin: Origin, input: &str, checksum: &str, result: Result<Vec<Task>, String>) {
+        let added = result.and_then(|tasks| queue_listed(&mut self.queue, &self.settings, tasks, checksum));
+        match (origin, added) {
+            (Origin::Form, Ok(ids)) => {
+                if let Some(&first) = ids.first() {
+                    self.start_added(first);
+                }
+                if ids.len() > 1 && self.notice.is_none() {
+                    self.notice = Some(Ok(format!("Started the first of {} downloads; the others wait in the queue", ids.len())));
+                }
+            }
+            (Origin::Form, Err(e)) => self.form_error = Some(e),
+            (Origin::QueueLine(_) | Origin::Dropped, Ok(ids)) => {
+                let name = ingest::truncate_chars(input, 60);
+                self.notice = Some(Ok(format!("Added {} download(s) from {} to the queue", ids.len(), name)));
+            }
+            (Origin::QueueLine(line), Err(e)) => keep_refused_line(&mut self.queue_input, &mut self.queue_error, line, input, &e),
+            (Origin::Dropped, Err(e)) => self.notice = Some(Err(e)),
+        }
+    }
+
+    /// Answers the first large listing waiting: adds its downloads, or drops them.
+    fn answer_listing(&mut self, add: bool) {
+        if self.listings.is_empty() {
+            return;
+        }
+        let Listing { origin, input, checksum, tasks } = self.listings.remove(0);
+        if add {
+            self.add_listing(origin, &input, &checksum, Ok(tasks));
+        }
+    }
+
+    /// Adds the downloads of a .metalink, .meta4 or .torrent file dropped on the window.
+    fn add_dropped(&mut self, path: PathBuf) {
+        let input = path.to_string_lossy().into_owned();
+        if ingest::names_document(&input) {
+            self.read_document(input, Origin::Dropped, String::new());
+        } else {
+            self.notice = Some(Err(format!("{} is not a .metalink, .meta4 or .torrent file", path.display())));
+        }
     }
 
     /// Adds a download, starts it immediately and shows it on the Downloader tab. A file that is
-    /// already downloading is shown instead of being started twice.
+    /// already downloading is shown instead of being started twice. A .metalink, .meta4 or
+    /// .torrent is read first; the first download it lists starts, the others wait in the queue.
     fn download_now(&mut self, text: &str, checksum: &str, auth: &str) {
         self.tab = Tab::Downloader;
-        let id = match self.add_download(text, checksum, auth) {
-            Ok(id) => id,
-            Err(e) => {
-                self.form_error = Some(e);
-                return;
-            }
-        };
+        if ingest::names_document(text) {
+            self.form_error = None;
+            self.read_document(text.trim().to_string(), Origin::Form, checksum.trim().to_string());
+            return;
+        }
+        match self.add_download(text, checksum, auth) {
+            Ok(id) => self.start_added(id),
+            Err(e) => self.form_error = Some(e),
+        }
+    }
+
+    /// Starts a download just added from the form and shows it, clearing the form. A file that is
+    /// already downloading is shown instead of being started twice.
+    fn start_added(&mut self, id: usize) {
         self.form_error = None;
         self.notice = None;
         if let Some(existing) = self.queue.active_conflict(id) {
@@ -333,7 +441,8 @@ impl App {
         self.start_job(id, false);
     }
 
-    /// Adds each non-empty line of the queue input as one download.
+    /// Adds each non-empty line of the queue input as one download; a .metalink, .meta4 or
+    /// .torrent line adds every file it lists once it has been read.
     fn add_queue_input(&mut self) {
         let lines: Vec<String> =
             self.queue_input.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect();
@@ -352,7 +461,9 @@ impl App {
         let mut errors = Vec::new();
         let mut rejected = Vec::new();
         for (n, line) in lines.iter().enumerate() {
-            if let Err(e) = self.add_download(line, &checksum, &auth) {
+            if ingest::names_document(line) {
+                self.read_document(line.clone(), Origin::QueueLine(n + 1), checksum.clone());
+            } else if let Err(e) = self.add_download(line, &checksum, &auth) {
                 errors.push(format!("Line {}: {}", n + 1, e));
                 rejected.push(line.as_str());
             }
@@ -380,7 +491,7 @@ impl App {
             return false;
         }
         let Some(item) = self.queue.get_item(id) else { return false };
-        let (urls, options) = (item.urls.clone(), item.options.clone());
+        let (urls, options, folder) = (item.urls.clone(), item.options.clone(), util::folder_to_create(item));
         let leftovers_of = if fresh { item.target_path.clone() } else { None };
         if !self.queue.mark_started(id) {
             return false;
@@ -396,7 +507,7 @@ impl App {
                 (Arc::clone(&cancel), Arc::clone(&snapshot), self.ctx.clone(), self.events_tx.clone());
             let engines = Arc::clone(&self.engines);
             self.rt.spawn(async move {
-                let result = run_job(&engines, urls, options, leftovers_of, cancel, snapshot, ctx.clone()).await;
+                let result = run_job(&engines, urls, options, folder, leftovers_of, cancel, snapshot, ctx.clone()).await;
                 if tx.send(AppEvent::JobFinished { id, result }).is_ok() {
                     ctx.request_repaint();
                 }
@@ -607,6 +718,14 @@ impl App {
 
     fn handle_event(&mut self, event: AppEvent) {
         match event {
+            AppEvent::Read { origin, input, checksum, result } => {
+                self.reading.remove(&input);
+                self.notice = None;
+                match result {
+                    Ok(tasks) if tasks.len() > CONFIRM_FILES => self.listings.push(Listing { origin, input, checksum, tasks }),
+                    result => self.add_listing(origin, &input, &checksum, result),
+                }
+            }
             AppEvent::JobFinished { id, result } => {
                 if let Some(view) = self.jobs.get_mut(&id) {
                     if let (Some(_), Some(started)) = (view.running.take(), view.started) {
@@ -754,6 +873,10 @@ impl eframe::App for App {
         while let Ok(event) = self.events_rx.try_recv() {
             self.handle_event(event);
         }
+        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
+        for path in dropped {
+            self.add_dropped(path);
+        }
         self.drain_snapshots();
         self.run_scheduler();
         let animating = self.animate();
@@ -815,6 +938,74 @@ impl eframe::App for App {
                 }
             }
         }
+    }
+}
+
+/// Engine options for `task` with `settings`, the per-download checksum (else the task's own)
+/// and Authorization header (never for the hosts a document lists). A task that names its file
+/// is saved as that (sub)path of the save folder.
+fn task_options(settings: &Settings, task: &Task, checksum: &str, auth: &str) -> Result<DownloadOptions, String> {
+    let checksum = match checksum.trim() {
+        "" => task.checksum.as_deref().unwrap_or_default(),
+        typed => typed,
+    };
+    let auth = if task.from_document { "" } else { auth };
+    let mut options = settings.download_options(&task.urls, checksum, auth)?;
+    if let Some(name) = &task.name {
+        options.output_path = options.output_path.map(|folder| folder.join(name));
+    }
+    Ok(options)
+}
+
+/// Engine options for the downloads a .metalink, .meta4 or .torrent lists, each saved under the
+/// save folder joined with its (sub)path; an error if one of them is refused. The form's checksum
+/// applies to a document of one file; its Authorization header is for the hosts the user typed,
+/// never for those a document lists.
+fn document_options(settings: &Settings, tasks: &[Task], checksum: &str) -> Result<Vec<DownloadOptions>, String> {
+    if tasks.len() > 1 && !checksum.trim().is_empty() {
+        return Err(format!("The checksum in Advanced Options is for a single file, but this lists {} files", tasks.len()));
+    }
+    tasks.iter().map(|task| task_options(settings, task, checksum, "")).collect()
+}
+
+/// Queues the downloads a .metalink, .meta4 or .torrent lists; nothing if one is refused.
+fn queue_listed(queue: &mut DownloadQueue, settings: &Settings, tasks: Vec<Task>, checksum: &str) -> Result<Vec<usize>, String> {
+    let options = document_options(settings, &tasks, checksum)?;
+    Ok(tasks.into_iter().zip(options).map(|(task, options)| queue_task(queue, task, options)).collect())
+}
+
+/// Queues one download; one its input named is shown under that name at once. Its target is
+/// left for the engine to report, so Start Over and Delete Leftovers never reach a file another
+/// download holds under that name.
+fn queue_task(queue: &mut DownloadQueue, task: Task, options: DownloadOptions) -> usize {
+    match task.name {
+        Some(_) => queue.add_named_item(task.urls, options),
+        None => queue.add_item(task.urls, options),
+    }
+}
+
+/// Puts queue line `line` back into the queue input with its error, as a line refused at once is,
+/// so it can be corrected.
+fn keep_refused_line(queue_input: &mut String, queue_error: &mut Option<String>, line: usize, input: &str, error: &str) {
+    if !queue_input.is_empty() {
+        queue_input.push('\n');
+    }
+    queue_input.push_str(input);
+    let error = format!("Line {}: {}", line, error);
+    *queue_error = Some(match queue_error.take() {
+        Some(errors) => format!("{}\n{}", errors, error),
+        None => error,
+    });
+}
+
+/// Reads the downloads `input` (a local or remote .metalink, .meta4 or .torrent) lists, fetching
+/// a remote one through the proxy setting.
+fn read_listing(settings: &Settings, input: String) -> impl Future<Output = Result<Vec<Task>, String>> + Send + 'static {
+    let proxy = Some(settings.proxy.trim().to_string()).filter(|p| !p.is_empty());
+    async move {
+        let tokens = ingest::input_tokens(&input).await;
+        let http = ingest::descriptor_client(proxy.as_deref())?;
+        ingest::ingest(&tokens, &http).await
     }
 }
 
@@ -881,12 +1072,16 @@ fn cached_client<C: Clone>(
     Ok(client)
 }
 
-/// One engine run. A cancel request calls `engine.cancel()` and keeps awaiting `run()`, so the
-/// engine flushes data, saves its resume state and stops yt-dlp before this returns.
+/// One engine run, saving into `folder` (created first if missing; see
+/// [`util::folder_to_create`]). A cancel request calls `engine.cancel()` and keeps awaiting
+/// `run()`, so the engine flushes data, saves its resume state and stops yt-dlp before this
+/// returns.
+#[allow(clippy::too_many_arguments)]
 async fn run_job(
     engines: &EngineMaker,
     urls: Vec<Url>,
     options: DownloadOptions,
+    folder: Option<PathBuf>,
     leftovers_of: Option<PathBuf>,
     cancel: Arc<Notify>,
     slot: Arc<Mutex<Option<EngineSnapshot>>>,
@@ -896,7 +1091,7 @@ async fn run_job(
         discard_leftovers(final_path).await.map_err(|e| format!("Could not start over: {}", e))?;
     }
     // The engine treats a missing output directory as a file name.
-    if let Some(dir) = options.output_path.clone() {
+    if let Some(dir) = folder {
         tokio::fs::create_dir_all(&dir)
             .await
             .map_err(|e| format!("Cannot create the download folder {}: {}", dir.display(), e))?;
@@ -1108,7 +1303,8 @@ mod tests {
         let (url, options, cancel_job, job_slot) = (url.clone(), options.clone(), Arc::clone(&cancel), Arc::clone(&slot));
         let job = tokio::spawn(async move {
             let engines = shared_clients();
-            run_job(&engines, vec![url], options, leftovers_of, cancel_job, job_slot, egui::Context::default()).await
+            let folder = options.output_path.clone();
+            run_job(&engines, vec![url], options, folder, leftovers_of, cancel_job, job_slot, egui::Context::default()).await
         });
         if let Some(delay) = pause_after {
             tokio::time::sleep(delay).await;
@@ -1205,10 +1401,159 @@ mod tests {
         assert_eq!(refresh, (2, vec![]), "the refresh reads after the clear and is numbered after it");
     }
 
+    /// Points download history at a file of this test process, once for every test, so no test
+    /// touches the user's history or switches the file while another runs.
+    fn isolate_history() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let path = std::env::temp_dir().join(format!("hf-gui-test-history-{}.json", std::process::id()));
+            std::env::set_var("ENDO_HISTORY_PATH", path);
+        });
+    }
+
+    /// A download a document or magnet named is saved as that (sub)path of the save folder,
+    /// checked against the document's checksum unless the form gives one.
+    #[test]
+    fn named_downloads_are_saved_under_their_path_in_the_save_folder() {
+        let settings = Settings { save_dir: "dl".into(), ..Settings::default() };
+        let url = Url::parse("https://m.example/disc.iso").unwrap();
+        let listed = format!("sha256:{}", "ab".repeat(32));
+        let named = Task {
+            urls: vec![url.clone()],
+            name: Some(PathBuf::from("release").join("disc.iso")),
+            checksum: Some(listed.clone()),
+            ..Task::default()
+        };
+        let options = task_options(&settings, &named, "", "").unwrap();
+        assert_eq!(options.output_path, Some(PathBuf::from("dl").join("release").join("disc.iso")));
+        assert_eq!(options.expected_checksum, Some(listed));
+        let typed = format!("md5:{}", "cd".repeat(16));
+        assert_eq!(task_options(&settings, &named, &typed, "").unwrap().expected_checksum, Some(typed));
+
+        let plain = Task { urls: vec![url], ..Task::default() };
+        assert_eq!(task_options(&settings, &plain, " ", "").unwrap().output_path, Some(PathBuf::from("dl")));
+    }
+
+    /// The Authorization header goes to the hosts the user typed, never to those a document lists.
+    #[test]
+    fn the_authorization_header_skips_the_hosts_a_document_lists() {
+        let settings = Settings { save_dir: "dl".into(), ..Settings::default() };
+        let typed = Task { urls: vec![Url::parse("https://a.example/f.iso").unwrap()], ..Task::default() };
+        let listed = Task { urls: typed.urls.clone(), from_document: true, ..Task::default() };
+        assert_eq!(task_options(&settings, &typed, "", "Bearer t").unwrap().auth_header.as_deref(), Some("Bearer t"));
+        assert_eq!(task_options(&settings, &listed, "", "Bearer t").unwrap().auth_header, None);
+    }
+
+    /// Each file a document lists keeps its own path and checksum; the form's checksum only fits a
+    /// document of one file, and one refused file refuses them all.
+    #[test]
+    fn a_document_adds_each_file_it_lists_or_none() {
+        let settings = Settings { save_dir: "dl".into(), ..Settings::default() };
+        let file = |name: &str, checksum: Option<String>| Task {
+            urls: vec![Url::parse(&format!("https://m.example/{}", name)).unwrap()],
+            name: Some(PathBuf::from("pack").join(name)),
+            checksum,
+            ..Task::default()
+        };
+        let (a, b) = (format!("sha256:{}", "aa".repeat(32)), format!("md5:{}", "bb".repeat(16)));
+        let tasks = [file("a.bin", Some(a.clone())), file("b.bin", Some(b.clone()))];
+        let options = document_options(&settings, &tasks, " ").unwrap();
+        let saved: Vec<_> = options.iter().map(|o| (o.output_path.clone(), o.expected_checksum.clone())).collect();
+        assert_eq!(
+            saved,
+            [
+                (Some(PathBuf::from("dl").join("pack").join("a.bin")), Some(a)),
+                (Some(PathBuf::from("dl").join("pack").join("b.bin")), Some(b)),
+            ]
+        );
+        assert!(options.iter().all(|o| o.auth_header.is_none()));
+
+        let typed = format!("sha256:{}", "cc".repeat(32));
+        assert!(document_options(&settings, &tasks, &typed).unwrap_err().contains("lists 2 files"));
+        let one = [file("a.bin", None)];
+        assert_eq!(document_options(&settings, &one, &typed).unwrap()[0].expected_checksum, Some(typed));
+        let refused = [file("a.bin", None), file("b.bin", Some("crc32:1234".to_string()))];
+        assert!(document_options(&settings, &refused, "").is_err());
+    }
+
+    /// A document's downloads are queued all together or not at all; a queue line whose document
+    /// could not be read is put back with its error; a large listing says how much it adds.
+    #[test]
+    fn a_read_document_is_queued_whole_or_its_line_is_kept() {
+        let settings = Settings { save_dir: "dl".into(), ..Settings::default() };
+        let file = |n: u32| Task {
+            urls: vec![Url::parse(&format!("https://m.example/{}.bin", n)).unwrap()],
+            name: Some(PathBuf::from(format!("{}.bin", n))),
+            size: Some(1024),
+            from_document: true,
+            ..Task::default()
+        };
+        let mut queue = DownloadQueue::new();
+        let ids = queue_listed(&mut queue, &settings, vec![file(1), file(2)], "").unwrap();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.iter().all(|&id| queue.get_item(id).is_some_and(|item| item.names_file && item.target_path.is_none())));
+        let refused = Task { checksum: Some("crc32:1".to_string()), ..file(3) };
+        assert!(queue_listed(&mut queue, &settings, vec![file(4), refused], "").is_err());
+        assert_eq!(queue.items().len(), 2, "nothing of a refused document is queued");
+
+        let (mut input, mut errors) = ("https://ok.example/f".to_string(), None);
+        keep_refused_line(&mut input, &mut errors, 2, "https://a.example/x.torrent", "Cannot fetch");
+        keep_refused_line(&mut input, &mut errors, 3, "y.meta4", "Cannot read");
+        assert_eq!(input, "https://ok.example/f\nhttps://a.example/x.torrent\ny.meta4");
+        assert_eq!(errors.as_deref(), Some("Line 2: Cannot fetch\nLine 3: Cannot read"));
+
+        let listing = |tasks| Listing { origin: Origin::Dropped, input: String::new(), checksum: String::new(), tasks };
+        assert_eq!(listing((1..=60).map(file).collect()).summary(), "60 files (60.00 KiB)");
+        assert_eq!(listing(vec![file(1), Task { size: None, ..file(2) }]).summary(), "2 files");
+    }
+
+    /// A remote document is fetched through the proxy setting: its host does not exist, so only
+    /// the proxy can answer.
+    #[tokio::test]
+    async fn documents_are_read_through_the_proxy_setting() {
+        let xml = br#"<metalink xmlns="urn:ietf:params:xml:ns:metalink"><file name="a.bin"><url>https://m.example/a.bin</url></file></metalink>"#;
+        let proxy = serve(Arc::new(xml.to_vec())).await;
+        let settings = Settings { proxy: format!("http://{}", proxy), ..Settings::default() };
+        let tasks = read_listing(&settings, "http://documents.invalid/list.meta4".to_string()).await.unwrap();
+        assert_eq!(tasks.iter().map(|t| t.name.clone()).collect::<Vec<_>>(), [Some(PathBuf::from("a.bin"))]);
+    }
+
+    /// A download its input named is shown under that name at once and saved as that file, in
+    /// folders made for it, never into a folder of that name.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_named_download_is_saved_as_its_file() {
+        isolate_history();
+        let dir = tempfile::tempdir().unwrap();
+        let body: Arc<Vec<u8>> = Arc::new((0..64 * 1024u32).map(|i| (i % 251) as u8).collect());
+        let addr = serve(Arc::clone(&body)).await;
+        let downloads = dir.path().join("downloads");
+        let settings = Settings { save_dir: downloads.to_string_lossy().into_owned(), connections: 2, ..Settings::default() };
+        let task = Task {
+            urls: vec![Url::parse(&format!("http://{}/get?id=7", addr)).unwrap()],
+            name: Some(PathBuf::from("release").join("disc.iso")),
+            ..Task::default()
+        };
+        let options = task_options(&settings, &task, "", "").unwrap();
+        let mut queue = DownloadQueue::new();
+        let id = queue_task(&mut queue, task, options);
+        let item = queue.get_item(id).unwrap().clone();
+        assert_eq!(item.filename, "disc.iso");
+        // Only the engine says which file is its own: Start Over and Delete Leftovers of a named
+        // download that never started must not reach another download's partial file.
+        assert_eq!(item.target_path, None);
+
+        let (engines, cancel, slot) = (shared_clients(), Arc::new(Notify::new()), Arc::new(Mutex::new(None)));
+        let folder = util::folder_to_create(&item);
+        let job = run_job(&engines, item.urls, item.options, folder, None, cancel, slot, egui::Context::default());
+        let (path, size) = tokio::time::timeout(Duration::from_secs(60), job).await.unwrap().unwrap();
+        assert_eq!(path, downloads.join("release").join("disc.iso"));
+        assert_eq!(size, Some(body.len() as u64));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn pause_keeps_resume_state_and_start_over_restarts() {
+        isolate_history();
         let dir = tempfile::tempdir().unwrap();
-        std::env::set_var("ENDO_HISTORY_PATH", dir.path().join("history.json"));
         let body: Arc<Vec<u8>> = Arc::new((0..3 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect());
         let addr = serve(Arc::clone(&body)).await;
         // The folder does not exist yet: the job creates it instead of the engine treating it as a file name.

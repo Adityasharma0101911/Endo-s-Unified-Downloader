@@ -1,6 +1,5 @@
 mod cli;
 mod download;
-mod ingest;
 
 use std::future::Future;
 use std::io::{IsTerminal, Write};
@@ -12,6 +11,7 @@ use std::time::Duration;
 use clap::Parser;
 use hyperfetch_core::engine::DownloadOptions;
 use hyperfetch_core::history::{is_redacted, DownloadHistoryManager, HistoryEntry, HistoryStatus, REDACTED_LINK};
+use hyperfetch_core::ingest::{decode_text, descriptor_client, http_url, ingest, input_tokens, Task};
 use hyperfetch_core::resolver::SmartResolver;
 use hyperfetch_core::state::DownloadState;
 use hyperfetch_core::verify::{self, BuildVerificationResult};
@@ -23,7 +23,6 @@ use download::{
     printable, run_jobs, stderr_line, stdout_line, stop_requested, truncate, Job, Shutdown, Ui, EXIT_FAILED, EXIT_OK,
     EXIT_USAGE,
 };
-use ingest::{batch_lines, decode_text, http_url, ingest, input_tokens, Task};
 
 fn main() {
     let args = Args::parse();
@@ -57,7 +56,7 @@ async fn app(args: Args) -> i32 {
     if let Some(path) = &args.verify {
         return verify_file(&args, path, &ui, &shutdown).await;
     }
-    let http = match descriptor_client(&args) {
+    let http = match descriptor_client(args.proxy.as_deref()) {
         Ok(client) => client,
         Err(e) => return usage(&e),
     };
@@ -109,18 +108,6 @@ fn init_tracing(verbose: u8, ui: &Ui) {
         .init();
 }
 
-/// Client for fetching remote .metalink/.torrent documents.
-fn descriptor_client(args: &Args) -> Result<reqwest::Client, String> {
-    let mut builder = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(15))
-        .timeout(Duration::from_secs(60))
-        .user_agent(concat!("Endos-Unified-Downloader/", env!("CARGO_PKG_VERSION")));
-    if let Some(proxy) = &args.proxy {
-        builder = builder.proxy(reqwest::Proxy::all(proxy.as_str()).map_err(|e| format!("invalid proxy: {}", e))?);
-    }
-    builder.build().map_err(|e| format!("cannot create HTTP client: {}", e))
-}
-
 /// Rejects options that name a single file when there are several downloads.
 fn check_single_file_options(output: Option<&Path>, has_checksum: bool, tasks: usize) -> Result<(), String> {
     if output.is_some() && tasks > 1 {
@@ -167,7 +154,8 @@ fn job(args: &Args, connections: u64, dir: &Path, task: Task) -> Job {
         output_path: Some(output),
         expected_checksum: args.checksum.clone().or(task.checksum),
         cookies_path: args.load_cookies.clone(),
-        auth_header: args.auth_header.clone(),
+        // --header is for the hosts the user named, not those a .metalink or .torrent lists.
+        auth_header: args.auth_header.clone().filter(|_| !task.from_document),
         proxy: args.proxy.clone(),
         media_preset: args.media_preset.clone(),
         browser_cookies: args.cookies_from_browser.map(Into::into),
@@ -190,6 +178,16 @@ fn tuning(args: &Args, connections: u64) -> DownloadOptions {
     }
 }
 
+/// The meaningful lines of a batch file with their 1-based line numbers: trimmed, without
+/// blanks and # comments.
+fn batch_lines(text: &str) -> impl Iterator<Item = (usize, &str)> {
+    text.lines()
+        .map(str::trim)
+        .enumerate()
+        .filter(|(_, l)| !l.is_empty() && !l.starts_with('#'))
+        .map(|(i, l)| (i + 1, l))
+}
+
 async fn read_input(path: &Path) -> Result<String, String> {
     let bytes = if path == Path::new("-") {
         tokio::task::spawn_blocking(|| {
@@ -210,9 +208,8 @@ async fn read_input(path: &Path) -> Result<String, String> {
 async fn read_tasks(inputs: &[(Option<usize>, Vec<String>)], ui: &Ui, http: &reqwest::Client) -> (Vec<(Option<usize>, Task)>, usize) {
     let mut tasks = Vec::new();
     let mut failed = 0;
-    for (line, input) in inputs {
-        let tokens: Vec<&str> = input.iter().map(String::as_str).collect();
-        match ingest(&tokens, http).await {
+    for (line, tokens) in inputs {
+        match ingest(tokens, http).await {
             Ok(found) => tasks.extend(found.into_iter().map(|task| (*line, task))),
             Err(e) => {
                 ui.error(&format!("[FAILED] {}: {}", truncate(&tokens.join(" "), 60), e));
@@ -300,7 +297,6 @@ async fn interactive(args: &Args, ui: &Ui, shutdown: &Shutdown, http: &reqwest::
             break;
         }
         let tokens = input_tokens(&input).await;
-        let tokens: Vec<&str> = tokens.iter().map(String::as_str).collect();
         let tasks = match ingest(&tokens, http).await {
             Ok(tasks) => tasks,
             Err(e) => {
@@ -689,6 +685,18 @@ mod tests {
         assert!(std::path::is_separator(last as char), "{}", output.display());
     }
 
+    /// --header goes to the hosts the user named, never to the mirrors a .metalink or .torrent
+    /// lists.
+    #[test]
+    fn the_authorization_header_skips_the_hosts_a_document_lists() {
+        let args = parse(&["--header", "Authorization: Bearer ghp_x", "https://a.example/list.meta4"]);
+        let urls = vec![Url::parse("https://mirror.example/f.iso").unwrap()];
+        let typed = Task { urls: urls.clone(), ..Default::default() };
+        let listed = Task { urls, from_document: true, ..Default::default() };
+        assert_eq!(job(&args, 4, Path::new("d"), typed).options.auth_header.as_deref(), Some("Bearer ghp_x"));
+        assert_eq!(job(&args, 4, Path::new("d"), listed).options.auth_header, None);
+    }
+
     #[test]
     fn every_download_gets_the_disk_and_host_settings() {
         let args = parse(&["--fsync", "--max-connections-per-host", "6", "-s", "3", "https://a.example/f"]);
@@ -749,6 +757,12 @@ mod tests {
         assert!(err.starts_with(REDACTED_LINK), "{}", err);
         let mirror = "https://m.example/a.iso".to_string();
         assert_eq!(repair_candidates(&[redacted, mirror.clone()], file).unwrap(), [Url::parse(&mirror).unwrap()]);
+    }
+
+    #[test]
+    fn batch_lines_skip_comments_and_blanks() {
+        let lines: Vec<(usize, &str)> = batch_lines("# queue\r\n\r\n  https://a  https://b \r\n#x\nhttps://c").collect();
+        assert_eq!(lines, [(3, "https://a  https://b"), (5, "https://c")]);
     }
 
     #[test]
