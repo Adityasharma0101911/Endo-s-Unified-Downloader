@@ -2295,3 +2295,122 @@ async fn test_a_download_starts_at_the_connection_cap_its_host_was_seen_to_enfor
     assert_file(&out, &data);
     assert_eq!(mock.served_ranges().len(), 2, "{:?}", mock.served_ranges());
 }
+
+// Links that stand for a file elsewhere: code-host file pages, Google Docs, and web pages served
+// in place of a file.
+
+/// Options that send every request through `proxy`, a mock that answers for whatever host is
+/// asked: links to real hosts, as the resolvers rewrite them, reach it over plain HTTP.
+fn through(proxy: &Url, out: &Path) -> DownloadOptions {
+    DownloadOptions { proxy: Some(format!("http://{}", proxy.authority())), ..options(out, 4, 64 * KB) }
+}
+
+#[tokio::test]
+async fn test_a_code_host_file_page_downloads_the_file() {
+    let _history = setup().await;
+    let data = payload(PREFETCH + 256 * KB, 311);
+    // Past the probe's first MiB, the "view file" page is no source of the file.
+    let mut mock = Mock::new(data.clone());
+    mock.expired = Some(("/blob/", Reply::Status(404, None)));
+    let mock = Arc::new(mock);
+    let proxy = serve(Arc::clone(&mock), "").await;
+    let temp = tempdir().unwrap();
+    let page = Url::parse("http://github.com/links-lane/repo/blob/main/dist/app.zip").unwrap();
+
+    let path = run(&DownloadEngine::new(vec![page], through(&proxy, temp.path())), None)
+        .await
+        .expect("the file should download");
+    assert_eq!(path, temp.path().join("app.zip"));
+    assert_file(&path, &data);
+    assert!(mock.stats.gets.load(Ordering::SeqCst) > 0);
+    assert_eq!(mock.stats.denied.load(Ordering::SeqCst), 0, "the page was asked for the file");
+}
+
+#[tokio::test]
+async fn test_a_google_docs_link_downloads_the_export_over_one_connection() {
+    let _history = setup().await;
+    // As Google sends an export: made on the fly, so no length and no ranges, named by
+    // Content-Disposition. The first answer breaks off, so the export is asked for again, from
+    // its start: the editor's page, asked for so, is not it.
+    let data = payload(PREFETCH + 300 * KB + 11, 313);
+    let mut mock = Mock::new(data.clone());
+    mock.chunked = true;
+    mock.content_type = Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+    mock.disposition = Some("attachment; filename=\"QuarterlyReport.docx\"; filename*=UTF-8''Quarterly%20Report.docx".to_string());
+    mock.probe_reply = Reply::CloseAfter(PREFETCH + 64 * KB);
+    mock.expired = Some(("/edit", Reply::ErrorPage));
+    let mock = Arc::new(mock);
+    let proxy = serve(Arc::clone(&mock), "").await;
+    let temp = tempdir().unwrap();
+    let link = Url::parse("http://docs.google.com/document/d/1LinksLaneDoc/edit?usp=sharing").unwrap();
+
+    let path = run(&DownloadEngine::new(vec![link], through(&proxy, temp.path())), None)
+        .await
+        .expect("the export should download");
+    assert_eq!(path, temp.path().join("Quarterly Report.docx"));
+    assert_file(&path, &data);
+    assert_no_leftovers(&path);
+    let s = &mock.stats;
+    assert!(mock.served_ranges().is_empty(), "the export was asked for in parts");
+    assert_eq!((s.gets.load(Ordering::SeqCst), s.denied.load(Ordering::SeqCst)), (1, 0), "asked for once more, as the export");
+}
+
+#[tokio::test]
+async fn test_a_web_page_served_for_a_named_file_is_an_error_not_a_download() {
+    let _history = setup().await;
+    let html = b"<html><body>Please sign in to download setup.exe</body></html>".to_vec();
+    let mut page = Mock::new(html.clone());
+    page.content_type = Some("text/html; charset=utf-8");
+    let page = Arc::new(page);
+    let temp = tempdir().unwrap();
+
+    let url = serve(Arc::clone(&page), "setup.exe").await;
+    let err = run(&DownloadEngine::new(vec![url], options(temp.path(), 4, 64 * KB)), None)
+        .await
+        .expect_err("a web page is no setup.exe");
+    assert!(err.contains("the server sent a web page instead of setup.exe"), "{err}");
+    assert!(names_in(temp.path()).is_empty(), "{:?}", names_in(temp.path()));
+
+    // A hosted .html file is what was asked for.
+    let url = serve(Arc::clone(&page), "guide.html").await;
+    let path = run(&DownloadEngine::new(vec![url], options(temp.path(), 4, 64 * KB)), None)
+        .await
+        .expect("the .html file should download");
+    assert_eq!(path, temp.path().join("guide.html"));
+    assert_file(&path, &html);
+}
+
+#[tokio::test]
+async fn test_private_documents_and_unsupported_shares_are_errors_not_downloads() {
+    let _history = setup().await;
+    let mut page = Mock::new(b"<!doctype html><title>Sign in</title>".to_vec());
+    page.content_type = Some("text/html; charset=utf-8");
+    let proxy = serve(Arc::new(page), "").await;
+    for (link, expected) in [
+        ("http://docs.google.com/spreadsheets/d/1LinksLanePrivate/edit#gid=0", "Google asked to sign in: the document is private"),
+        ("http://mega.nz/file/links-lane#key", "MEGA links are not supported yet"),
+    ] {
+        let temp = tempdir().unwrap();
+        let err = run(&DownloadEngine::new(vec![Url::parse(link).unwrap()], through(&proxy, temp.path())), None)
+            .await
+            .expect_err(link);
+        assert!(err.contains(expected), "{link}: {err}");
+        assert!(names_in(temp.path()).is_empty(), "{link}: {:?}", names_in(temp.path()));
+    }
+}
+
+#[tokio::test]
+async fn test_a_code_host_folder_is_an_error_not_a_download() {
+    let _history = setup().await;
+    let mut page = Mock::new(b"<!doctype html><title>docs at main</title>".to_vec());
+    page.content_type = Some("text/html; charset=utf-8");
+    let proxy = serve(Arc::new(page), "").await;
+    let temp = tempdir().unwrap();
+    let folder = Url::parse("http://github.com/links-lane/repo/tree/main/docs").unwrap();
+
+    let err = run(&DownloadEngine::new(vec![folder], through(&proxy, temp.path())), None)
+        .await
+        .expect_err("a folder's page is no file");
+    assert!(err.contains("the link leads to a folder, not a file"), "{err}");
+    assert!(names_in(temp.path()).is_empty(), "{:?}", names_in(temp.path()));
+}
