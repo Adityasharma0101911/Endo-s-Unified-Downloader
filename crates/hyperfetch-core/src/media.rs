@@ -808,13 +808,39 @@ fn http_client(proxy: Option<&str>) -> Result<reqwest::Client, String> {
 /// Serializes installs and updates of the managed yt-dlp across concurrent media jobs.
 static INSTALL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-async fn install_managed_ytdlp(proxy: Option<&str>) -> Result<PathBuf, String> {
+/// When installing yt-dlp last failed, and why (see [`install_managed_ytdlp`]).
+static INSTALL_FAILED: parking_lot::Mutex<Option<(tokio::time::Instant, String)>> = parking_lot::const_mutex(None);
+
+/// How long after installing yt-dlp failed a run that may do without it does so rather than try
+/// again: each web page downloaded would otherwise wait for another attempt (see
+/// [`find_site_media`]).
+const INSTALL_RETRY_AFTER: Duration = Duration::from_secs(15 * 60);
+
+/// Installs the managed yt-dlp, unless a concurrent job did. Unless `retry`, a failure less than
+/// [`INSTALL_RETRY_AFTER`] ago stands for this attempt, also for the jobs that waited for it.
+async fn install_managed_ytdlp(proxy: Option<&str>, retry: bool) -> Result<PathBuf, String> {
     let _guard = INSTALL_LOCK.lock().await;
     // A concurrent job may have installed it while we waited for the lock.
     if let Ok(Some(installed)) = tokio::task::spawn_blocking(installed_managed_ytdlp).await {
         return Ok(installed);
     }
-    download_ytdlp_binary(&http_client(proxy)?).await
+    unless_failed_lately(&INSTALL_FAILED, retry, async { download_ytdlp_binary(&http_client(proxy)?).await }).await
+}
+
+/// `install`, whose failure `failed` keeps; unless `retry` is false and the last one it keeps is
+/// less than [`INSTALL_RETRY_AFTER`] old, which then stands for it.
+async fn unless_failed_lately(
+    failed: &parking_lot::Mutex<Option<(tokio::time::Instant, String)>>,
+    retry: bool,
+    install: impl std::future::Future<Output = Result<PathBuf, String>>,
+) -> Result<PathBuf, String> {
+    let lately = failed.lock().clone().filter(|(at, _)| !retry && at.elapsed() < INSTALL_RETRY_AFTER);
+    if let Some((at, e)) = lately {
+        return Err(format!("Installing yt-dlp failed {}s ago: {e}", at.elapsed().as_secs()));
+    }
+    let installed = install.await;
+    *failed.lock() = installed.as_ref().err().map(|e| (tokio::time::Instant::now(), e.clone()));
+    installed
 }
 
 /// Installs the latest release as the managed yt-dlp if `current` is older, and returns the
@@ -1095,9 +1121,29 @@ impl BrowserCookies {
         Self { files: PrivateDir::new(dir), jars: parking_lot::Mutex::new(HashMap::new()) }
     }
 
-    /// The cookie arguments of one yt-dlp run with `source`.
+    /// The cookie arguments of one yt-dlp run with `source`. A cookies file goes to yt-dlp as a
+    /// copy of the run's own: yt-dlp writes its jar back into the file it reads when it exits,
+    /// which would rewrite the user's on every run (dropping lines yt-dlp cannot read), several
+    /// runs at once among them. One that cannot be read is left out, as yt-dlp leaves it out.
     async fn for_run(&self, source: &BrowserCookieSource) -> CookieRun<'_> {
         let mut run = CookieRun { cookies: self, args: source.to_args(), file: None, jar: None };
+        if let BrowserCookieSource::File(path) = source {
+            let copy = match tokio::fs::read(path).await {
+                Ok(contents) => self.files.file(Some(contents), "txt").await,
+                Err(e) => Err(e.to_string()),
+            };
+            match copy {
+                Ok(file) => {
+                    run.args = vec!["--cookies".to_string(), file.path.to_string_lossy().into_owned()];
+                    run.file = Some(file);
+                }
+                Err(e) => {
+                    tracing::warn!("yt-dlp runs without the cookies of {}: {e}", path.display());
+                    run.args.clear();
+                }
+            }
+            return run;
+        }
         let Some(browser) = source.browser() else {
             return run;
         };
@@ -1219,6 +1265,10 @@ enum RunKind {
     /// (see [`fast_download`]), or else a Download run of [`Source::Info`] (see [`loads_found`]).
     /// Its formats are plain files and playlists: no `formats=dashy`.
     Extract,
+    /// An Extract run that only yt-dlp's own sites may take (`--ies default,-generic`): a link to
+    /// none of them fails at once, offline, instead of yt-dlp looking through the page for
+    /// anything playable (see [`find_site_media`]).
+    Find,
     /// Downloads and post-processes, printing progress for [`OutputState`].
     Download,
 }
@@ -1277,6 +1327,7 @@ fn build_ytdlp_args(
         // A playlist comes back as a list of links, not every video extracted: it goes to a
         // Download run anyway.
         RunKind::Extract => &["-J", "--flat-playlist"],
+        RunKind::Find => &["-J", "--flat-playlist", "--ies", "default,-generic"],
         RunKind::Download => &[
             "--newline",
             "--progress",
@@ -2382,25 +2433,107 @@ pub async fn download_media(
     progress_tx: Option<Sender<ProgressUpdate>>,
     cancel_flag: Option<Arc<AtomicBool>>,
 ) -> Result<PathBuf, String> {
-    download_media_with(url, options, progress_tx, cancel_flag, None).await
+    download_media_with(url, options, progress_tx, cancel_flag, None, None).await
 }
 
+/// What one of yt-dlp's own sites found at a link (see [`find_site_media`]): its `-J` output,
+/// which the download of it goes by instead of finding it again.
+pub(crate) struct Extracted(Vec<u8>);
+
 /// [`download_media`]; with `fetch`, yt-dlp first only finds the formats and `fetch` downloads
-/// them (see [`fast_download`]). What that cannot do goes to yt-dlp as before.
+/// them (see [`fast_download`]). What that cannot do goes to yt-dlp as before. `extracted`, what
+/// yt-dlp found at `url` moments ago with these options, stands in for finding it again.
 pub(crate) async fn download_media_with(
     url: &Url,
     options: &MediaDownloadOptions,
     progress_tx: Option<Sender<ProgressUpdate>>,
     cancel_flag: Option<Arc<AtomicBool>>,
     fetch: Option<&StreamFetcher<'_>>,
+    extracted: Option<Extracted>,
 ) -> Result<PathBuf, String> {
+    let (options, tools) = prepare(options, &cancel_flag, true).await?;
+    if tools.ffmpeg.is_none() {
+        tracing::warn!(
+            "ffmpeg not found: yt-dlp cannot merge separate video and audio streams, so it will fall back \
+             to a lower-quality pre-merged format, and audio extraction presets will fail. Install ffmpeg \
+             (e.g. `winget install Gyan.FFmpeg` or your package manager) or place it next to the application."
+        );
+    }
+    download_with(url, &options, tools, progress_tx, cancel_flag, fetch, extracted).await.map_err(drm_refused)
+}
+
+/// What one of yt-dlp's own sites finds at `url` (see [`RunKind::Find`]), for a download with
+/// `options` to go by. Fails when none of them takes the link, when yt-dlp cannot be found or
+/// installed, or when the extraction fails.
+pub(crate) async fn find_site_media(
+    url: &Url,
+    options: &MediaDownloadOptions,
+    cancel_flag: Option<Arc<AtomicBool>>,
+) -> Result<Extracted, String> {
+    let (options, tools) = prepare(options, &cancel_flag, false).await?;
+    // Dropped, the run's process tree is killed.
+    match tokio::time::timeout(FIND_TIMEOUT, find_with(url, &options, &tools, cancel_flag)).await {
+        Ok(found) => found.map_err(drm_refused),
+        Err(_) => Err(format!("yt-dlp took over {}s", FIND_TIMEOUT.as_secs())),
+    }
+}
+
+/// How long [`find_site_media`] waits for yt-dlp: a site on a slow or stalling host is left
+/// alone rather than hold up the download of the page for as long as yt-dlp's retries last.
+const FIND_TIMEOUT: Duration = if cfg!(test) { Duration::from_secs(3) } else { Duration::from_secs(45) };
+
+/// How yt-dlp says that none of the sites it may use takes a link.
+const NO_SITE: &str = "No suitable extractor";
+
+/// [`find_site_media`] with `tools`. Paths in `options` must be absolute.
+async fn find_with(
+    url: &Url,
+    options: &MediaDownloadOptions,
+    tools: &Tools<'_>,
+    cancel_flag: Option<Arc<AtomicBool>>,
+) -> Result<Extracted, String> {
+    let ffmpeg_dir = tools.ffmpeg.as_deref().and_then(Path::parent);
+    let version = ytdlp_version(&tools.ytdlp, &tools.work_dir, tools.version_cache.as_deref()).await;
+    let cookies = tools.cookies.for_run(&options.cookies).await;
+    let args = build_ytdlp_args(Source::Url(url), options, RunKind::Find, &cookies.args, ffmpeg_dir, tools.js_runtime.as_deref(), version.as_deref());
+    let found = run_to_end(ytdlp_command(&tools.ytdlp, &args, options.proxy.as_deref(), &tools.work_dir), cancel_flag.clone()).await;
+    if !is_cancelled(&cancel_flag) {
+        // A link no site takes says nothing of the cookies: none was sent.
+        cookies.finish(found.as_ref().err().is_none_or(|e| e.contains(NO_SITE))).await;
+    }
+    found.map(Extracted)
+}
+
+/// What a media download fails with when yt-dlp finds the video DRM-protected (see
+/// [`drm_refused`]).
+pub(crate) const DRM_REFUSED: &str = "DRM-protected: not supported";
+
+/// A failure as the user reads it: yt-dlp finding a video DRM-protected means it is not to be
+/// downloaded at all, which it says in words of its own ("This video is DRM protected", "This
+/// format is DRM protected; ...").
+fn drm_refused(error: String) -> String {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains(" drm protected") || lower.contains(" drm-protected") {
+        DRM_REFUSED.to_string()
+    } else {
+        error
+    }
+}
+
+/// `options` with every path absolute, as yt-dlp needs them (it runs in [`ytdlp_work_dir`]), and
+/// the programs a media download with them works with: yt-dlp is installed if none is found,
+/// unless installing it failed lately and `retry_install` is false (see [`install_managed_ytdlp`]).
+async fn prepare(
+    options: &MediaDownloadOptions,
+    cancel_flag: &Option<Arc<AtomicBool>>,
+    retry_install: bool,
+) -> Result<(MediaDownloadOptions, Tools<'static>), String> {
     // First-time discovery stats every PATH entry (possibly on slow network drives).
     let (found_ytdlp, ffmpeg, js_runtime) =
         tokio::task::spawn_blocking(|| (find_ytdlp_path(), find_ffmpeg_path(), find_js_runtime()))
             .await
             .map_err(|e| format!("Tool discovery failed: {e}"))?;
 
-    // yt-dlp runs in its own working directory, so every path it gets must be absolute.
     let mut options = options.clone();
     options.output_dir = absolute(&options.output_dir)?;
     if let BrowserCookieSource::File(path) = &mut options.cookies {
@@ -2415,18 +2548,10 @@ pub(crate) async fn download_media_with(
         (Some(path), _) => absolute(path)?,
         (None, Some(path)) => path,
         (None, None) => tokio::select! {
-            installed = install_managed_ytdlp(options.proxy.as_deref()) => installed?,
+            installed = install_managed_ytdlp(options.proxy.as_deref(), retry_install) => installed?,
             _ = wait_cancelled(cancel_flag.clone()) => return Err(CANCELLED.to_string()),
         },
     };
-
-    if ffmpeg.is_none() {
-        tracing::warn!(
-            "ffmpeg not found: yt-dlp cannot merge separate video and audio streams, so it will fall back \
-             to a lower-quality pre-merged format, and audio extraction presets will fail. Install ffmpeg \
-             (e.g. `winget install Gyan.FFmpeg` or your package manager) or place it next to the application."
-        );
-    }
     let managed = managed_bin_dir().is_some_and(|dir| ytdlp.starts_with(dir));
     let tools = Tools {
         ytdlp,
@@ -2437,7 +2562,7 @@ pub(crate) async fn download_media_with(
         version_cache: version_cache_file(),
         cookies: &BROWSER_COOKIES,
     };
-    download_with(url, &options, tools, progress_tx, cancel_flag, fetch).await
+    Ok((options, tools))
 }
 
 /// The programs and places a media download works with.
@@ -2462,6 +2587,7 @@ async fn download_with(
     progress_tx: Option<Sender<ProgressUpdate>>,
     cancel_flag: Option<Arc<AtomicBool>>,
     fetch: Option<&StreamFetcher<'_>>,
+    mut extracted: Option<Extracted>,
 ) -> Result<PathBuf, String> {
     // Clears what crashed runs left in the private folder, whatever this download uses.
     tools.cookies.files.get().await;
@@ -2478,34 +2604,49 @@ async fn download_with(
         let result = 'attempt: {
             // What yt-dlp found, for it to download when the engine does not.
             let mut found = None;
-            if let Some(fetch) = fast {
-                let cookies = tools.cookies.for_run(&options.cookies).await;
-                let extracted = run_to_end(command(Source::Url(url), RunKind::Extract, &cookies), cancel_flag.clone()).await;
-                if !is_cancelled(&cancel_flag) {
-                    cookies.finish(extracted.is_ok()).await;
+            // What yt-dlp found moments ago, else, for the engine to download, what it finds now.
+            let json = match extracted.take() {
+                Some(Extracted(json)) => Some(json),
+                None if fast.is_some() => {
+                    let cookies = tools.cookies.for_run(&options.cookies).await;
+                    let run = run_to_end(command(Source::Url(url), RunKind::Extract, &cookies), cancel_flag.clone()).await;
+                    if !is_cancelled(&cancel_flag) {
+                        cookies.finish(run.is_ok()).await;
+                    }
+                    // The download would only extract the video again and fail the same way.
+                    match run {
+                        Ok(json) => Some(json),
+                        Err(e) => break 'attempt Err(e),
+                    }
                 }
-                // The download would only extract the video again and fail the same way.
-                let json = match extracted {
-                    Ok(json) => json,
-                    Err(e) => break 'attempt Err(e),
-                };
+                None => None,
+            };
+            if let Some(json) = json {
                 match serde_json::from_slice::<Value>(&json) {
                     Err(e) => tracing::info!("Leaving {url} to yt-dlp: yt-dlp -J: {e}"),
-                    Ok(info) => match fast_download(&info, options, tools.ffmpeg.as_deref(), progress_tx.as_ref(), &cancel_flag, fetch).await {
-                        Ok(path) => return Ok(path),
-                        Err(_) if is_cancelled(&cancel_flag) => return Err(CANCELLED.to_string()),
-                        // yt-dlp would write the very file the other job is making.
-                        Err(FastError::Busy(e)) => return Err(e),
-                        // Found moments ago: yt-dlp downloads it as it is, where it can.
-                        Err(FastError::Unsupported(why)) => {
-                            tracing::info!("Leaving {url} to yt-dlp: {why}");
-                            if loads_found(&info, options) {
-                                found = tools.cookies.files.file(Some(json), "json").await.inspect_err(|e| tracing::debug!("{e}")).ok();
+                    Ok(info) => {
+                        let made = match fast {
+                            Some(fetch) => {
+                                fast_download(&info, options, tools.ffmpeg.as_deref(), progress_tx.as_ref(), &cancel_flag, fetch).await
                             }
+                            None => Err(FastError::Unsupported("yt-dlp converts the audio itself".to_string())),
+                        };
+                        match made {
+                            Ok(path) => return Ok(path),
+                            Err(_) if is_cancelled(&cancel_flag) => return Err(CANCELLED.to_string()),
+                            // yt-dlp would write the very file the other job is making.
+                            Err(FastError::Busy(e)) => return Err(e),
+                            // Found moments ago: yt-dlp downloads it as it is, where it can.
+                            Err(FastError::Unsupported(why)) => {
+                                tracing::info!("Leaving {url} to yt-dlp: {why}");
+                                if loads_found(&info, options) {
+                                    found = tools.cookies.files.file(Some(json), "json").await.inspect_err(|e| tracing::debug!("{e}")).ok();
+                                }
+                            }
+                            // Maybe long after the extraction: the formats' URLs may have expired.
+                            Err(FastError::Failed(e)) => tracing::info!("Leaving {url} to yt-dlp: {e}"),
                         }
-                        // Maybe long after the extraction: the formats' URLs may have expired.
-                        Err(FastError::Failed(e)) => tracing::info!("Leaving {url} to yt-dlp: {e}"),
-                    },
+                    }
                 }
             }
             let source = found.as_ref().map_or(Source::Url(url), |file| Source::Info(&file.path));
@@ -3182,13 +3323,39 @@ mod tests {
         drop(later);
         assert!(!copy.exists());
 
-        // Each browser has its own jar; a cookie file is passed on as it is.
+        // Each browser has its own jar.
         let firefox = cookies.for_run(&BrowserCookieSource::Firefox).await;
         assert_eq!(firefox.args[..2], ["--cookies-from-browser", "firefox"]);
         drop(firefox);
-        let file = PathBuf::from("/home/me/cookies.txt");
-        assert_eq!(cookies.for_run(&BrowserCookieSource::File(file.clone())).await.args, BrowserCookieSource::File(file).to_args());
         assert_eq!(cookies.for_run(&BrowserCookieSource::None).await.args, Vec::<String>::new());
+        // Nothing is left on disk, claim locks included.
+        assert_eq!(names_in(&folder), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn a_cookies_file_goes_to_yt_dlp_as_a_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("cookies");
+        let cookies = BrowserCookies::new(Some(folder.clone()));
+        let mine = dir.path().join("mine.txt");
+        let kept = "# Netscape HTTP Cookie File\n# my note, which yt-dlp would drop\n";
+        std::fs::write(&mine, kept).unwrap();
+
+        // Each run gets a copy of its own, which yt-dlp may write as it exits.
+        let run = cookies.for_run(&BrowserCookieSource::File(mine.clone())).await;
+        let other = cookies.for_run(&BrowserCookieSource::File(mine.clone())).await;
+        assert_eq!(run.args[0], "--cookies");
+        let copy = PathBuf::from(&run.args[1]);
+        assert!(copy.starts_with(&folder) && copy.as_os_str() != other.args[1].as_str(), "{copy:?}");
+        assert_eq!(std::fs::read_to_string(&copy).unwrap(), kept);
+        std::fs::write(&copy, "# This file is generated by yt-dlp.  Do not edit.\n").unwrap();
+        run.finish(true).await;
+        drop(other);
+        assert_eq!(std::fs::read_to_string(&mine).unwrap(), kept);
+        // A file that cannot be read is left out.
+        let gone = cookies.for_run(&BrowserCookieSource::File(dir.path().join("gone.txt"))).await;
+        assert_eq!(gone.args, Vec::<String>::new());
+        drop(gone);
         // Nothing is left on disk, claim locks included.
         assert_eq!(names_in(&folder), Vec::<String>::new());
     }
@@ -3384,7 +3551,7 @@ mod tests {
         let options = MediaDownloadOptions { output_dir: dir.path().to_path_buf(), ..Default::default() };
         let url = Url::parse("https://www.youtube.com/watch?v=jNQXAC9IVRw").unwrap();
         let started = std::time::Instant::now();
-        let path = download_media_with(&url, &options, None, None, Some(fetch)).await.unwrap();
+        let path = download_media_with(&url, &options, None, None, Some(fetch), None).await.unwrap();
         eprintln!("{} in {:?}", path.display(), started.elapsed());
         assert_eq!(fetched.load(Ordering::Relaxed), 2, "video and audio");
         assert_eq!(path.extension().and_then(|e| e.to_str()), Some("mp4"));
@@ -4152,7 +4319,7 @@ mod tests {
         };
         let options = MediaDownloadOptions { output_dir: out, ..Default::default() };
         let url = Url::parse("https://www.youtube.com/watch?v=jNQXAC9IVRw").unwrap();
-        download_with(&url, &options, tools, None, None, Some(fetch)).await
+        download_with(&url, &options, tools, None, None, Some(fetch), None).await
     }
 
     #[tokio::test]
@@ -4340,5 +4507,126 @@ mod tests {
         again.finish(true).await;
         late.finish(false).await;
         assert_eq!(cookies.for_run(&BrowserCookieSource::Chrome).await.args[0], "--cookies");
+    }
+
+    #[test]
+    fn a_find_asks_only_yt_dlps_own_sites() {
+        let options = MediaDownloadOptions { output_dir: std::env::temp_dir(), ..Default::default() };
+        let url = Url::parse("https://rumble.com/v4abc-clip.html").unwrap();
+        let args = |kind| build_ytdlp_args(Source::Url(&url), &options, kind, &[], None, None, Some("2026.08.19"));
+        let find = args(RunKind::Find);
+        let ies = find.iter().position(|a| a == "--ies").expect("a find names the extractors it may use");
+        assert_eq!(find[ies + 1], "default,-generic");
+        // It is an extraction as any other, which a download can go by.
+        let extract = args(RunKind::Extract);
+        assert_eq!([&find[..ies], &find[ies + 2..]].concat(), extract);
+        for kind in [RunKind::Extract, RunKind::Find, RunKind::Download] {
+            let args = args(kind);
+            assert!(kind == RunKind::Find || !args.contains(&"--ies".to_string()), "{kind:?}: {args:?}");
+            assert!(!args.contains(&"--allow-unplayable-formats".to_string()), "{kind:?}: {args:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn what_a_find_found_is_downloaded_without_looking_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let cookies = BrowserCookies::new(Some(dir.path().join("private")));
+        let out = dir.path().join("out");
+        std::fs::write(dir.path().join("info.json"), serde_json::to_vec(&dash_info(&out)).unwrap()).unwrap();
+        let tools = || Tools {
+            ytdlp: fake_ytdlp(dir.path(), &out.join("clip.mp4")),
+            managed: false,
+            ffmpeg: Some(dir.path().join("no-ffmpeg-here")),
+            js_runtime: None,
+            work_dir: dir.path().to_path_buf(),
+            version_cache: None,
+            cookies: &cookies,
+        };
+        let fetch: &StreamFetcher<'_> = &|_, _, _| panic!("yt-dlp downloads DASH fragments");
+        let url = Url::parse("https://vimeo.com/123").unwrap();
+        // Video, which the engine may fetch, and audio, which yt-dlp converts itself: without what
+        // was found, the latter would go to yt-dlp's download straight from the link.
+        for preset in [MediaQualityPreset::BestVideoAudio, MediaQualityPreset::AudioMp3] {
+            let _ = std::fs::remove_file(dir.path().join("runs.txt"));
+            let options = MediaDownloadOptions { preset, output_dir: out.clone(), ..Default::default() };
+            let found = find_with(&url, &options, &tools(), None).await.unwrap();
+            let path = download_with(&url, &options, tools(), None, None, Some(fetch), Some(found)).await.unwrap();
+            assert_eq!(path, out.join("clip.mp4"));
+            assert_eq!(runs_in(dir.path()), ["extract", "download info"], "{:?}", options.preset);
+            assert_eq!(std::fs::read(dir.path().join("loaded.json")).unwrap(), std::fs::read(dir.path().join("info.json")).unwrap());
+        }
+
+        // A find that fails is the error yt-dlp printed, and nothing is downloaded.
+        std::fs::remove_file(dir.path().join("runs.txt")).unwrap();
+        std::fs::write(dir.path().join("extract-error"), b"").unwrap();
+        let options = MediaDownloadOptions { output_dir: out.clone(), ..Default::default() };
+        let failed = find_with(&url, &options, &tools(), None).await.err();
+        assert_eq!(failed.as_deref(), Some("ERROR: [youtube] abc: Video unavailable"));
+        assert_eq!(runs_in(dir.path()), ["extract"]);
+    }
+
+    #[test]
+    fn drm_failures_read_as_not_supported() {
+        for error in [
+            "ERROR: [SomeSite] 123: This video is DRM protected",
+            "ERROR: [x] 1: The video is DRM-protected",
+            "ERROR: [hlsnative] This format is DRM protected; Try selecting another format",
+        ] {
+            assert_eq!(drm_refused(error.to_string()), DRM_REFUSED);
+        }
+        // What only happens to hold the words keeps its own cause.
+        for other in [
+            "ERROR: [youtube] abc: Video unavailable",
+            "ERROR: [vimeo] 12drm3: This video is password protected. Use the --video-password option",
+            "ERROR: No suitable extractor found for URL https://x.example/drm/protected-clip",
+            "ERROR: No suitable extractor found for URL https://x.example/drm-protected-clip",
+        ] {
+            assert_eq!(drm_refused(other.to_string()), other);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_install_is_not_tried_again_for_a_while_unless_asked() {
+        let failed = parking_lot::Mutex::new(None);
+        let tries = std::cell::Cell::new(0);
+        let install = |works: bool| {
+            let tries = &tries;
+            async move {
+                tries.set(tries.get() + 1);
+                if works { Ok(PathBuf::from("yt-dlp")) } else { Err("offline".to_string()) }
+            }
+        };
+        assert_eq!(unless_failed_lately(&failed, false, install(false)).await, Err("offline".to_string()));
+        // The page checks right after it go without yt-dlp, the jobs that waited for it too.
+        tokio::time::advance(INSTALL_RETRY_AFTER / 2).await;
+        let err = unless_failed_lately(&failed, false, install(true)).await.unwrap_err();
+        assert!(err.starts_with("Installing yt-dlp failed") && err.ends_with("offline"), "{err}");
+        assert_eq!(tries.get(), 1);
+        // A media download tries at once.
+        assert_eq!(unless_failed_lately(&failed, true, install(false)).await, Err("offline".to_string()));
+        assert_eq!(tries.get(), 2);
+        // Later, so do page checks; a success forgets the failure.
+        tokio::time::advance(INSTALL_RETRY_AFTER).await;
+        assert_eq!(unless_failed_lately(&failed, false, install(true)).await, Ok(PathBuf::from("yt-dlp")));
+        assert!(failed.lock().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_site_that_takes_too_long_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        let (bin, script) = (dir.path().join("yt-dlp.cmd"), "@echo off\r\nif \"%~2\"==\"--version\" exit /b 1\r\nping -n 60 127.0.0.1 >nul\r\n");
+        #[cfg(not(windows))]
+        let (bin, script) = (dir.path().join("yt-dlp"), "#!/bin/sh\n[ \"$2\" = --version ] && exit 1\nsleep 60\n");
+        std::fs::write(&bin, script).unwrap();
+        #[cfg(unix)]
+        make_executable(&bin).unwrap();
+        let options = MediaDownloadOptions { output_dir: dir.path().to_path_buf(), custom_ytdlp_path: Some(bin), ..Default::default() };
+        let url = Url::parse("https://slow.example/watch/1").unwrap();
+
+        let started = std::time::Instant::now();
+        let err = find_site_media(&url, &options, None).await.err().expect("nothing was found");
+        assert_eq!(err, format!("yt-dlp took over {}s", FIND_TIMEOUT.as_secs()));
+        assert!(started.elapsed() < FIND_TIMEOUT + Duration::from_secs(20), "{:?}", started.elapsed());
     }
 }

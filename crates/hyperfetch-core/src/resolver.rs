@@ -749,9 +749,63 @@ impl HtmlVideoResolver {
 
     /// Where the page `html`, from `page_url`, sends the browser at once: the target of a
     /// `<meta http-equiv="refresh" content="0; url=...">` (t.co answers this way), if it has one.
-    pub fn meta_refresh(_html: &str, _page_url: &Url) -> Option<Url> {
-        None
+    /// One inside `<noscript>`, for browsers without JavaScript, counts only when it leads to
+    /// another site: on the same one it is a page asking for JavaScript (Google's answers so).
+    pub fn meta_refresh(html: &str, page_url: &Url) -> Option<Url> {
+        let lower = html.to_ascii_lowercase();
+        start_tags(html, &lower, "meta").into_iter().find_map(|tag| {
+            attr_value(tag, "http-equiv").filter(|v| v.eq_ignore_ascii_case("refresh"))?;
+            // "<seconds>[.<fraction>][;|,] [url=]<target>", the target maybe quoted, as the HTML
+            // standard reads it. Only a refresh at once: a later one is a page to look at first.
+            let content = attr_value(tag, "content")?;
+            let rest = content.trim_start();
+            let seconds = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+            if seconds == 0 || rest[..seconds].bytes().any(|b| b != b'0') {
+                return None;
+            }
+            let rest = rest[seconds..].trim_start_matches(|c: char| c.is_ascii_digit() || c == '.').trim_start();
+            let rest = rest.strip_prefix([';', ',']).unwrap_or(rest).trim_start();
+            let named = rest.get(..3).filter(|s| s.eq_ignore_ascii_case("url")).and_then(|_| rest[3..].trim_start().strip_prefix('='));
+            let target = named.map_or(rest, str::trim_start);
+            let target = match target.chars().next() {
+                Some(quote @ ('\'' | '"')) => target[1..].split(quote).next().unwrap_or_default(),
+                _ => target,
+            };
+            let target = target.trim();
+            // Without a target the page only reloads itself.
+            if target.is_empty() {
+                return None;
+            }
+            let target = page_url.join(target).ok().filter(|u| matches!(u.scheme(), "http" | "https"))?;
+            // `tag` is a slice of `html`, which `lower` matches byte for byte.
+            let before = &lower[..tag.as_ptr() as usize - html.as_ptr() as usize];
+            let in_noscript = before.rfind("<noscript") > before.rfind("</noscript");
+            (!in_noscript || target.origin() != page_url.origin()).then_some(target)
+        })
     }
+
+    /// Hosts of link shorteners and mail link scanners: they answer a link with a redirect, so a
+    /// page from one is a preview or a warning, never what the link stands for. `*` stands for
+    /// any part of a host name. t.co is not among them: its page sends the browser on at once
+    /// (see `meta_refresh`).
+    pub const SHORTENER_HOSTS: &[&str] = &[
+        "bit.ly",
+        "bitly.com",
+        "tinyurl.com",
+        "is.gd",
+        "ow.ly",
+        "buff.ly",
+        "cutt.ly",
+        "rb.gy",
+        "goo.gl",
+        "shorturl.at",
+        "lnkd.in",
+        "*.safelinks.protection.outlook.com",
+        "urldefense.com",
+        "urldefense.proofpoint.com",
+        "protect-*.mimecast.com",
+        "*.mimecastprotect.com",
+    ];
 
     /// Reads as much of a page's body as is looked into.
     pub async fn read_page(resp: Response) -> Result<String, ResolverError> {

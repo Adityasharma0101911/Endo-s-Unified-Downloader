@@ -125,14 +125,16 @@ impl Settings {
         if save_dir.is_empty() {
             return Err("Choose a folder to save downloads to".to_string());
         }
-        // A preset sends every non-file URL to yt-dlp, so it is only set for known media sites.
-        let media_preset = urls.iter().any(is_supported_media_site).then_some(match self.media_preset {
+        let quality = match self.media_preset {
             1 => MediaQualityPreset::Fhd1080p,
             2 => MediaQualityPreset::Hd720p,
             3 => MediaQualityPreset::AudioMp3,
             4 => MediaQualityPreset::AudioM4a,
             _ => MediaQualityPreset::BestVideoAudio,
-        });
+        };
+        // A preset sends every non-file URL to yt-dlp, so it is only set for known media sites;
+        // any other link that turns out to be media takes the quality all the same.
+        let media_preset = urls.iter().any(is_supported_media_site).then(|| quality.clone());
         let browser_cookies = match self.browser_cookies {
             1 => Some(BrowserCookieSource::Chrome),
             2 => Some(BrowserCookieSource::Edge),
@@ -149,6 +151,7 @@ impl Settings {
             auth_header: non_empty(auth),
             proxy: non_empty(&self.proxy),
             media_preset,
+            page_media_preset: Some(quality),
             browser_cookies,
             ..self.tuning()
         })
@@ -305,10 +308,13 @@ mod tests {
         assert_eq!(opts.browser_cookies, Some(BrowserCookieSource::Edge));
         assert_eq!((opts.fsync_on_complete, opts.max_connections_per_host), (true, 0));
         assert_eq!(opts.media_preset, None, "a preset would send a plain file URL to yt-dlp");
+        // A link that turns out to be media still gets the chosen quality.
+        assert_eq!(opts.page_media_preset, Some(MediaQualityPreset::AudioMp3));
 
         let video = [Url::parse("https://www.youtube.com/watch?v=x").unwrap()];
         let opts = settings.download_options(&video, "", "").unwrap();
         assert_eq!(opts.media_preset, Some(MediaQualityPreset::AudioMp3));
+        assert_eq!(opts.page_media_preset, Some(MediaQualityPreset::AudioMp3));
         assert_eq!((opts.expected_checksum, opts.auth_header), (None, None));
 
         assert!(settings.download_options(&file, "crc32:1234", "").is_err());
