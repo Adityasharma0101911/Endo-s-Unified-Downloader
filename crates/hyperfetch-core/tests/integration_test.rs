@@ -1871,6 +1871,34 @@ async fn test_a_request_waiting_for_a_slow_answer_is_not_taken_over() {
 }
 
 #[tokio::test]
+async fn test_a_chunk_that_just_answered_is_not_split_again_and_again() {
+    let _history = setup().await;
+    let data = payload(PREFETCH + 16 * PREFETCH, 277);
+    let mut mock = Mock::new(data.clone());
+    // Every answer takes two seconds, then comes at a few MB/s per connection.
+    mock.latency = Duration::from_secs(2);
+    mock.delay_us.store(4000, Ordering::SeqCst);
+    let mock = Arc::new(mock);
+    let url = serve(Arc::clone(&mock), "slow-start.bin").await;
+    let temp = tempdir().unwrap();
+    let out = temp.path().join("slow-start.bin");
+
+    // More chunks than connections, so connections run out of work at different times, and the
+    // default floor for steals.
+    let opts = DownloadOptions { min_steal_threshold: DownloadOptions::default().min_steal_threshold, ..options(&out, 4, 3 * PREFETCH) };
+    let engine = DownloadEngine::new(vec![url], opts);
+    run(&engine, None).await.expect("download should succeed");
+
+    assert_file(&out, &data);
+    // A thief's request, once its first bytes land after the long wait, looks no slower than it
+    // is: nobody splits it again, which would cost another wait for an answer each time.
+    let ranges = mock.served_ranges();
+    let inside = |r: &ByteRange, of: &ByteRange| r.start > of.start && r.start <= of.end;
+    let stolen: Vec<&ByteRange> = ranges.iter().filter(|r| ranges.iter().any(|v| inside(r, v))).collect();
+    assert!(stolen.iter().all(|s| !ranges.iter().any(|r| inside(r, s))), "a stolen part was split again: {ranges:?}");
+}
+
+#[tokio::test]
 async fn test_expired_redirect_target_falls_back_to_the_mirrors_own_url() {
     let _history = setup().await;
     let data = payload(PREFETCH + 1024 * KB, 233);

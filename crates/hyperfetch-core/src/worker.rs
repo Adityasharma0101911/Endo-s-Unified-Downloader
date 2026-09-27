@@ -425,6 +425,8 @@ impl HttpWorker {
         start: u64,
     ) -> Result<(), Failure> {
         let s = &self.shared;
+        // The wait before is the answer's: the chunk's rate, and its silence, count from here.
+        chunk.answered(Instant::now());
         let mut stream = std::pin::pin!(body);
         let mut batch = Batch { pos: start, buf: Vec::with_capacity(WRITE_BATCH) };
         // Due `WRITE_INTERVAL` after the oldest byte in `batch` arrived.
@@ -1075,7 +1077,8 @@ mod tests {
         let url = Url::parse("http://127.0.0.1:9/f").unwrap();
         let (mut worker, chunk, _events) = test_worker(&url, &dir.path().join("f.part"), 100 * MB);
         worker.shared.min_steal = 64 * 1024;
-        // Worker 0 wrote 10 MB in 10 s: 90 MB left at 1 MB/s.
+        // Worker 0 wrote 10 MB in the 10 s since its answer: 90 MB left at 1 MB/s.
+        chunk.answered(Instant::now());
         chunk.current_offset.store(10 * MB, Ordering::SeqCst);
         worker.shared.chunks.lock().backdate(0, Duration::from_secs(10));
         {
