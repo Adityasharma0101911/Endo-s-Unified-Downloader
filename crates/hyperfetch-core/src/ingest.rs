@@ -146,12 +146,21 @@ pub async fn input_tokens(line: &str) -> Vec<String> {
 /// The tokens are mirrors of one file (see [`link_task`]). A local or remote
 /// .metalink/.meta4/.torrent must stand alone and may yield several tasks, one per file. A
 /// remote .torrent none of whose files has an HTTP web seed yields the .torrent itself, for a
-/// torrent client.
+/// torrent client. A remote document is fetched from where its host's resolver says the file is
+/// (a GitHub /blob/ page's /raw/ link, a Dropbox share's `dl=1`); one whose host asks for a login
+/// or answers with a web page yields the link itself, for the engine, which sends the user's
+/// cookies and Authorization and refuses a page in place of the file. `Ok` is never empty.
 pub async fn ingest(tokens: &[impl AsRef<str>], http: &reqwest::Client) -> Result<Vec<Task>, String> {
     if let [token] = tokens {
         if let Some((source, kind)) = descriptor_source(token.as_ref()) {
             let (bytes, remote) = match source {
-                Source::Remote(url) => (fetch(http, &url).await?, Some(url)),
+                Source::Remote(url) => {
+                    let url = resolver::SmartResolver::resolve_mirrors(http, &url).await.into_iter().next().unwrap_or(url);
+                    match fetch(http, &url).await? {
+                        Some(bytes) => (bytes, Some(url)),
+                        None => return link_task(tokens).map(|task| vec![task]),
+                    }
+                }
                 Source::Local(path) => (read_local(&path).await?, None),
             };
             return match kind {
@@ -223,9 +232,17 @@ fn too_large(what: impl std::fmt::Display) -> String {
     format!("{} is larger than {} bytes", what, MAX_DESCRIPTOR_BYTES)
 }
 
-async fn fetch(http: &reqwest::Client, url: &Url) -> Result<Vec<u8>, String> {
+/// The document at `url`; None when its host asks for a login (401, 403) or answers with a web
+/// page, which the engine is left to download.
+async fn fetch(http: &reqwest::Client, url: &Url) -> Result<Option<Vec<u8>>, String> {
     let fail = |e: reqwest::Error| format!("Cannot fetch {}: {}", url, e);
-    let mut resp = http.get(url.clone()).send().await.and_then(|r| r.error_for_status()).map_err(fail)?;
+    let resp = http.get(url.clone()).send().await.map_err(fail)?;
+    let login = matches!(resp.status(), reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN);
+    if login || (resp.status().is_success() && resolver::html_type(resp.headers())) {
+        tracing::info!("{} answered HTTP {} with a login or a page: the download engine takes it", url, resp.status());
+        return Ok(None);
+    }
+    let mut resp = resp.error_for_status().map_err(fail)?;
     if resp.content_length().is_some_and(|len| len > MAX_DESCRIPTOR_BYTES as u64) {
         return Err(too_large(url));
     }
@@ -236,7 +253,7 @@ async fn fetch(http: &reqwest::Client, url: &Url) -> Result<Vec<u8>, String> {
             return Err(too_large(url));
         }
     }
-    Ok(body)
+    Ok(Some(body))
 }
 
 /// A local document, read only if it is a file no larger than a remote one may be: a renamed

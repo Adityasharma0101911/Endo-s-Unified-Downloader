@@ -3180,3 +3180,43 @@ async fn test_a_file_downloaded_through_a_followed_link_is_repaired_from_its_his
         .expect("the file should be repaired");
     assert_file(&path, &data);
 }
+
+/// A torrent with a web seed, as GitHub's raw link and Dropbox's `dl=1` serve it; their file page
+/// and share page are web pages, a private tracker asks for a login, and another host answers
+/// with a page.
+fn hosted_documents(method: &str, target: &str) -> Vec<u8> {
+    let torrent = b"d8:url-list20:https://s.example/d/4:infod6:lengthi3e4:name5:a.bin12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaaee";
+    match target {
+        "http://github.com/o/r/raw/main/fixtures/pack.torrent" | "http://www.dropbox.com/s/k3y/pack.torrent?dl=1" => {
+            response(method, "200 OK", "Content-Type: application/x-bittorrent\r\n", torrent)
+        }
+        "http://tracker.invalid/dl/1/pack.torrent" => response(method, "403 Forbidden", "Content-Type: text/html\r\n", b"<title>Log in</title>"),
+        _ => response(method, "200 OK", "Content-Type: text/html; charset=utf-8\r\n", b"<!doctype html><title>pack.torrent</title>"),
+    }
+}
+
+#[tokio::test]
+async fn test_a_document_on_a_file_page_or_share_is_read_and_one_behind_a_login_left_to_the_engine() {
+    use hyperfetch_core::ingest::{descriptor_client, ingest, Task};
+    let _history = setup().await;
+    let (proxy, _) = serve_proxy(hosted_documents).await;
+    let http = descriptor_client(Some(&proxy)).unwrap();
+    for page in ["http://github.com/o/r/blob/main/fixtures/pack.torrent", "http://www.dropbox.com/s/k3y/pack.torrent?dl=0"] {
+        let tasks = ingest(&[page], &http).await.expect(page);
+        let listed: Vec<_> = tasks.iter().map(|t| (t.name.clone().unwrap(), t.urls[0].to_string())).collect();
+        assert_eq!(listed, [(PathBuf::from("a.bin"), "https://s.example/d/a.bin".to_string())], "{page}");
+    }
+    // The link itself, for the engine to download with the user's cookies and Authorization.
+    for link in ["http://tracker.invalid/dl/1/pack.torrent", "http://files.invalid/pack.torrent", "http://files.invalid/list.meta4"] {
+        let tasks = ingest(&[link], &http).await.expect(link);
+        assert_eq!(tasks, [Task { urls: vec![Url::parse(link).unwrap()], ..Task::default() }], "{link}");
+    }
+    // Which saves no page in the document's place.
+    let temp = tempdir().unwrap();
+    let opts = DownloadOptions { proxy: Some(proxy), ..options(temp.path(), 4, 64 * KB) };
+    let err = run(&DownloadEngine::new(vec![Url::parse("http://files.invalid/list.meta4").unwrap()], opts), None)
+        .await
+        .expect_err("a web page is no metalink");
+    assert!(err.contains("the server sent a web page instead of list.meta4"), "{err}");
+    assert_eq!(names_in(temp.path()), Vec::<String>::new());
+}
