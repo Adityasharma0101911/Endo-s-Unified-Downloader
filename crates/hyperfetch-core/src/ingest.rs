@@ -152,10 +152,10 @@ pub async fn input_tokens(line: &str) -> Vec<String> {
 /// remote .torrent none of whose files has an HTTP web seed yields the .torrent itself, for a
 /// torrent client. A remote document is fetched from where its host's resolver says the file is
 /// (a GitHub /blob/ page's /raw/ link, a Dropbox share's `dl=1`); one whose host answers with a
-/// client error (a login, a private GitHub file's 404) or a web page yields the link itself, for
-/// the engine, which sends the user's cookies and Authorization and refuses a page in place of the
-/// file. The link itself is always the one typed, never where its resolver led. `Ok` is never
-/// empty.
+/// client error (a login, a private GitHub file's 404; a timeout or a rate limit is an error) or
+/// a web page yields the link itself, for the engine, which sends the user's cookies and
+/// Authorization and refuses a page in place of the file. The link itself is always the one
+/// typed, never where its resolver led. `Ok` is never empty.
 pub async fn ingest(tokens: &[impl AsRef<str>], http: &reqwest::Client) -> Result<Vec<Task>, String> {
     if let [token] = tokens {
         if let Some((source, kind)) = descriptor_source(token.as_ref()) {
@@ -229,8 +229,9 @@ fn too_large(what: impl std::fmt::Display) -> String {
 }
 
 /// The tasks of the document at `typed`, fetched from where its host's resolver says the file is.
-/// The link itself when its host answers with a client error, or with a web page that is no
-/// such document: a host may label any file a page (PHP sends text/html unless told otherwise).
+/// The link itself when its host answers with a client error (see [`fetch`]), or with a web page
+/// that is no such document: a host may label any file a page (PHP sends text/html unless told
+/// otherwise).
 async fn remote_tasks(http: &reqwest::Client, typed: Url, kind: Descriptor) -> Result<Vec<Task>, String> {
     let url = resolver::SmartResolver::resolve_mirrors(http, &typed).await.into_iter().next().unwrap_or_else(|| typed.clone());
     match fetch(http, &url).await? {
@@ -268,24 +269,29 @@ fn starts_like_html(body: &[u8]) -> bool {
 
 /// The document at `url` and whether its host labels it a web page; None when its host answers
 /// with a client error (401 or 403 for a login, 404 for a private GitHub repository's /raw/
-/// link), which the engine is left to download and report.
+/// link) or with a page larger than a document may be, which the engine is left to download and
+/// report. A timeout (408) or a rate limit (429) says nothing of the file: it is an error, to
+/// retry, as a server error is.
 async fn fetch(http: &reqwest::Client, url: &Url) -> Result<Option<(Vec<u8>, bool)>, String> {
+    use reqwest::StatusCode;
     let fail = |e: reqwest::Error| format!("Cannot fetch {}: {}", url, e);
     let resp = http.get(url.clone()).send().await.map_err(fail)?;
-    if resp.status().is_client_error() {
-        tracing::info!("{} answered HTTP {}", url, resp.status());
+    let status = resp.status();
+    if status.is_client_error() && !matches!(status, StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS) {
+        tracing::info!("{} answered HTTP {}", url, status);
         return Ok(None);
     }
     let mut resp = resp.error_for_status().map_err(fail)?;
     let labelled_page = resolver::html_type(resp.headers());
+    let oversized = || if labelled_page { Ok(None) } else { Err(too_large(url)) };
     if resp.content_length().is_some_and(|len| len > MAX_DESCRIPTOR_BYTES as u64) {
-        return Err(too_large(url));
+        return oversized();
     }
     let mut body = Vec::new();
     while let Some(chunk) = resp.chunk().await.map_err(fail)? {
         body.extend_from_slice(&chunk);
         if body.len() > MAX_DESCRIPTOR_BYTES {
-            return Err(too_large(url));
+            return oversized();
         }
     }
     Ok(Some((body, labelled_page)))
