@@ -2373,9 +2373,12 @@ async fn test_a_web_page_served_for_a_named_file_is_an_error_not_a_download() {
     assert!(err.contains("the server sent a web page instead of setup.exe"), "{err}");
     assert!(names_in(temp.path()).is_empty(), "{:?}", names_in(temp.path()));
 
-    // A hosted .html file is what was asked for.
+    // A hosted .html file is what was asked for; asked whether one of its sites takes the page,
+    // yt-dlp says none does.
     let url = serve(Arc::clone(&page), "guide.html").await;
-    let path = run(&DownloadEngine::new(vec![url], options(temp.path(), 4, 64 * KB)), None)
+    let tools = tempdir().unwrap();
+    let opts = DownloadOptions { ytdlp_path: Some(no_site_ytdlp(tools.path())), ..options(temp.path(), 4, 64 * KB) };
+    let path = run(&DownloadEngine::new(vec![url], opts), None)
         .await
         .expect("the .html file should download");
     assert_eq!(path, temp.path().join("guide.html"));
@@ -2455,8 +2458,9 @@ async fn serve_proxy(answer: fn(&str, &str) -> Vec<u8>) -> (String, Arc<Mutex<Ve
 }
 
 /// A stand-in for yt-dlp that works in `dir`. Asked to find what a link holds (`-J`), it prints
-/// `dir/info.json`, or fails as yt-dlp does for a DRM-protected video while `dir/drm` exists,
-/// else as it does for a link none of its sites takes; asked to download, it writes `output` and
+/// `dir/info.json`, or fails as yt-dlp does for a DRM-protected video while `dir/drm` exists, as
+/// a site that takes the link fails at it (a video gone private) while `dir/fails` exists, else
+/// as it does for a link none of its sites takes; asked to download, it writes `output` and
 /// reports it. It writes the cookies file it is given, as yt-dlp does as it exits, and lists
 /// the arguments of each run (see `runs_of`).
 fn fake_ytdlp(dir: &Path, output: &Path) -> PathBuf {
@@ -2480,6 +2484,7 @@ fn fake_ytdlp(dir: &Path, output: &Path) -> PathBuf {
              if not defined find goto download\r\n\
              if exist \"{dir_s}\\info.json\" (type \"{dir_s}\\info.json\"& exit /b 0)\r\n\
              if exist \"{dir_s}\\drm\" (>&2 echo ERROR: [FakeSite] clip1: This video is DRM protected& exit /b 1)\r\n\
+             if exist \"{dir_s}\\fails\" (>&2 echo ERROR: [FakeSite] clip1: Unable to download webpage: HTTP Error 403: Forbidden& exit /b 1)\r\n\
              >&2 echo ERROR: No suitable extractor found for URL\r\n\
              exit /b 1\r\n\
              :download\r\n\
@@ -2506,6 +2511,7 @@ fn fake_ytdlp(dir: &Path, output: &Path) -> PathBuf {
              if [ -n \"$find\" ]; then\n\
              [ -e '{dir_s}/info.json' ] && {{ cat '{dir_s}/info.json'; exit 0; }}\n\
              [ -e '{dir_s}/drm' ] && {{ echo 'ERROR: [FakeSite] clip1: This video is DRM protected' >&2; exit 1; }}\n\
+             [ -e '{dir_s}/fails' ] && {{ echo 'ERROR: [FakeSite] clip1: Unable to download webpage: HTTP Error 403: Forbidden' >&2; exit 1; }}\n\
              echo 'ERROR: No suitable extractor found for URL' >&2; exit 1\n\
              fi\n\
              mkdir -p '{out_dir}'\n\
@@ -3064,4 +3070,34 @@ async fn test_a_file_its_server_labels_a_web_page_is_downloaded() {
     let path = run(&DownloadEngine::new(vec![url], options(temp.path(), 4, 64 * KB)), None).await.expect("the file should download");
     assert_eq!(path, temp.path().join("tool.zip"));
     assert_file(&path, &data);
+}
+
+// ---- Final fixes: what yt-dlp's sites say of a page, documents, history for repairs ------------
+
+#[tokio::test]
+async fn test_a_page_one_of_yt_dlps_sites_takes_but_fails_at_is_an_error_not_a_download() {
+    let _history = setup().await;
+    let (tools, temp) = (tempdir().unwrap(), tempdir().unwrap());
+    std::fs::write(tools.path().join("fails"), b"").unwrap();
+    let (_, url) = plain_page("videos/gone-private").await;
+    let opts = DownloadOptions { ytdlp_path: Some(no_site_ytdlp(tools.path())), ..options(temp.path(), 4, 64 * KB) };
+
+    let err = run(&DownloadEngine::new(vec![url], opts), None).await.expect_err("the page is not the video");
+    assert_eq!(err, "ERROR: [FakeSite] clip1: Unable to download webpage: HTTP Error 403: Forbidden");
+    assert_eq!(names_in(temp.path()), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn test_a_page_whose_site_finds_an_empty_list_is_downloaded_as_it_is() {
+    let _history = setup().await;
+    let (tools, temp) = (tempdir().unwrap(), tempdir().unwrap());
+    // As yt-dlp's BBC site answers a news section's page.
+    std::fs::write(tools.path().join("info.json"), br#"{"_type": "playlist", "id": "technology", "entries": []}"#).unwrap();
+    let (page, url) = plain_page("news/technology").await;
+    let out = temp.path().join("technology.html");
+    let opts = DownloadOptions { ytdlp_path: Some(no_site_ytdlp(tools.path())), ..options(&out, 4, 64 * KB) };
+
+    run(&DownloadEngine::new(vec![url], opts), None).await.expect("the page should download");
+    assert_file(&out, &page.data);
+    assert_eq!(runs_of(tools.path()).len(), 1, "yt-dlp was asked once, to find");
 }
