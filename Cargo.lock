@@ -1644,6 +1644,7 @@ dependencies = [
  "futures-util",
  "hyperfetch-core",
  "indicatif",
+ "libc",
  "reqwest",
  "tokio",
  "tracing",
