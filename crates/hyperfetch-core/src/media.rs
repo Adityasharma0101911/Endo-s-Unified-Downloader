@@ -1627,13 +1627,15 @@ impl OutputState {
             return None;
         }
         // ffmpeg's progress: its rate, then what it has written. Counted as the video's file, which
-        // yt-dlp's last progress line for it names.
+        // yt-dlp's last progress line for it names. Only a recording's: ffmpeg downloading the
+        // formats of another video one by one writes each to a file of its own, whose last
+        // progress line counts it already.
         if let Some(rate) = line.strip_prefix("bitrate=") {
             let kbits = rate.trim().strip_suffix("kbits/s").and_then(parse_template_number);
             self.ffmpeg_rate = kbits.map_or(0.0, |kbits| kbits * 1000.0 / 8.0);
             return None;
         }
-        if let Some(size) = line.strip_prefix("total_size=") {
+        if let Some(size) = line.strip_prefix("total_size=").filter(|_| self.live) {
             let written = parse_template_number(size.trim())? as u64;
             let speed = Some(self.ffmpeg_rate);
             let progress = TemplateProgress { finished: false, downloaded: written, total: None, speed, eta: None, stream: &self.file };
@@ -5561,6 +5563,24 @@ mod tests {
         let update = state.handle_line(&line, false).expect("progress");
         assert_eq!(update.eta_seconds, Some(18));
         assert!(update.total > 0 && state.recording.is_empty());
+    }
+
+    /// ffmpeg downloading a video's formats one by one (an HLS stream yt-dlp cannot decrypt
+    /// itself): each is counted once, by yt-dlp's line for its file.
+    #[test]
+    fn ffmpegs_progress_of_a_video_that_is_not_live_is_not_counted_twice() {
+        let out = std::env::temp_dir();
+        let mut state = OutputState::default();
+        state.handle_line(&format!("HFLIVE False {}", out.join("clip.mp4").display()), false);
+        state.handle_line("HFTOTAL 3000", false);
+        for (format, size) in [("f1", 2000), ("f2", 1000)] {
+            assert!(state.handle_line("bitrate= 800.0kbits/s", false).is_none());
+            assert!(state.handle_line(&format!("total_size={size}"), false).is_none());
+            let line = format!("HFP finished {size} {size} NA NA NA {}", out.join(format!("clip.{format}.mp4")).display());
+            state.handle_line(&line, false).expect("progress");
+        }
+        let update = state.handle_line("HFPOST x", false).expect("progress");
+        assert_eq!((update.downloaded, update.total), (3000, 3000));
     }
 
     /// `yt-dlp -J` (trimmed) for a YouTube video with chapters, as yt-dlp 2026.08.19 answered.
