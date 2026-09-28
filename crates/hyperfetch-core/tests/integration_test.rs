@@ -3476,3 +3476,37 @@ async fn test_a_drm_protected_live_hls_stream_is_an_error_not_a_recording() {
         assert_eq!(names_in(temp.path()), Vec::<String>::new());
     }
 }
+
+/// A language the site has subtitles of its own in only for regions of it (YouTube's `en-US`)
+/// gets those, not the automatic captions of the bare code, which yt-dlp would pick.
+#[tokio::test]
+async fn test_a_language_gets_the_sites_own_subtitles_of_its_regions() {
+    isolate_history();
+    let _history = HISTORY.write().await;
+    let (tools, temp) = (tempdir().unwrap(), tempdir().unwrap());
+    let output = temp.path().join("Apple Event.mp4");
+    // yt-dlp 2026.08.19's -J of youtube.com/watch?v=5AwdkGKmZ0I, trimmed to its subtitles' languages.
+    let langs = |langs: &[&str]| {
+        serde_json::Value::Object(langs.iter().map(|lang| (lang.to_string(), serde_json::json!([{ "ext": "srt" }]))).collect())
+    };
+    let info = serde_json::json!({
+        "_type": "video", "extractor_key": "Youtube", "id": "5AwdkGKmZ0I", "title": "Apple Event",
+        "subtitles": langs(&["en-US", "es-419", "ja", "ko", "ru", "zh-CN"]),
+        "automatic_captions": langs(&["en", "en-US", "en-orig", "es", "ja"]),
+        "requested_downloads": [{ "filename": output }],
+    });
+    std::fs::write(tools.path().join("info.json"), serde_json::to_vec(&info).unwrap()).unwrap();
+    let opts = DownloadOptions {
+        ytdlp_path: Some(fake_ytdlp(tools.path(), &output)),
+        subtitles: Some("en,es".into()),
+        install_ffmpeg: false,
+        ..options(temp.path(), 4, 64 * KB)
+    };
+    let url = Url::parse("https://www.youtube.com/watch?v=5AwdkGKmZ0I").unwrap();
+
+    assert_eq!(run(&DownloadEngine::new(vec![url], opts), None).await, Ok(output));
+    let runs = runs_of(tools.path());
+    let [extract, download] = &runs[..] else { panic!("found, then downloaded: {runs:?}") };
+    assert!(has_arg(extract, "--sub-langs", "en,es"), "{extract:?}");
+    assert!(has_arg(download, "--sub-langs", "en-US,es-419"), "{download:?}");
+}

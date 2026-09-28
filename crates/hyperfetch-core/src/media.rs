@@ -1474,6 +1474,26 @@ fn sub_langs(options: &MediaDownloadOptions) -> Option<(String, bool)> {
     (!langs.is_empty()).then(|| (langs.join(","), all))
 }
 
+/// The subtitle languages `asked` for (`--subs`) as what an extraction found (`info`) has them:
+/// a language the site has no subtitles of its own in, but has its regions' (`en-US`, `en-GB` for
+/// `en`), stands for those. yt-dlp takes a language code as it is (`^en$`), which would pass them
+/// over for the automatic captions of `en`.
+fn regional_langs(asked: &str, info: &Value) -> String {
+    let own: Vec<&str> = info.get("subtitles").and_then(Value::as_object).map_or_else(Vec::new, |subs| subs.keys().map(String::as_str).collect());
+    let mut langs = Vec::new();
+    for lang in asked.split(',').map(str::trim).filter(|lang| !lang.is_empty()) {
+        let regions = own.iter().filter(|own| own.strip_prefix(lang).is_some_and(|region| region.starts_with('-')));
+        let before = langs.len();
+        if plain_language(lang) && !own.contains(&lang) {
+            langs.extend(regions.copied());
+        }
+        if langs.len() == before {
+            langs.push(lang);
+        }
+    }
+    langs.join(",")
+}
+
 /// yt-dlp arguments that pick the subtitles `options` ask for. A language named gets the site's
 /// subtitles, else its automatic captions (a language only those have, `en-orig`, is one to
 /// name); `all` gets every language the site has subtitles in, not the automatic captions, often a
@@ -3433,19 +3453,21 @@ async fn download_with(
     let mut updated = false;
     loop {
         let version = ytdlp_version(&tools.ytdlp, &tools.work_dir, tools.version_cache.as_deref()).await;
-        let command = |source, kind, cookies: &CookieRun| {
+        let command = |source, kind, cookies: &CookieRun, options: &MediaDownloadOptions| {
             let args = build_ytdlp_args(source, options, kind, &cookies.args, ffmpeg_dir.as_deref(), tools.js_runtime.as_deref(), version.as_deref());
             ytdlp_command(&tools.ytdlp, &args, options.proxy.as_deref(), &tools.work_dir)
         };
         let result = 'attempt: {
             // What yt-dlp found, for it to download when the engine does not.
             let mut found = None;
+            // `options` with the subtitle languages as what yt-dlp found has them.
+            let mut regional = None;
             // What yt-dlp found moments ago, else, for the engine to download, what it finds now.
             let json = match extracted.take() {
                 Some(Extracted(json)) => Some(json),
                 None if fast.is_some() => {
                     let cookies = tools.cookies.for_run(&options.cookies).await;
-                    let run = run_to_end(command(Source::Url(url), RunKind::Extract, &cookies), cancel_flag.clone()).await;
+                    let run = run_to_end(command(Source::Url(url), RunKind::Extract, &cookies, options), cancel_flag.clone()).await;
                     if !is_cancelled(&cancel_flag) {
                         cookies.finish(run.is_ok()).await;
                     }
@@ -3461,6 +3483,11 @@ async fn download_with(
                 match serde_json::from_slice::<Value>(&json) {
                     Err(e) => tracing::info!("Leaving {url} to yt-dlp: yt-dlp -J: {e}"),
                     Ok(info) => {
+                        let asked = options.subtitles.as_deref();
+                        let run_options = regional.insert(MediaDownloadOptions {
+                            subtitles: asked.map(|asked| regional_langs(asked, &info)),
+                            ..options.clone()
+                        });
                         let made = match fast {
                             Some(fetch) => {
                                 fast_download(&info, options, tools.ffmpeg.as_deref(), progress_tx.as_ref(), &cancel_flag, fetch).await
@@ -3474,7 +3501,7 @@ async fn download_with(
                                     let wrote = match tools.cookies.files.file(Some(json), "json").await {
                                         Ok(file) => {
                                             let cookies = tools.cookies.for_run(&options.cookies).await;
-                                            let command = command(Source::Info(&file.path), RunKind::Subtitles, &cookies);
+                                            let command = command(Source::Info(&file.path), RunKind::Subtitles, &cookies, run_options);
                                             let run = run_to_end(command, cancel_flag.clone()).await;
                                             if !is_cancelled(&cancel_flag) {
                                                 cookies.finish(run.is_ok()).await;
@@ -3510,8 +3537,8 @@ async fn download_with(
             }
             let source = found.as_ref().map_or(Source::Url(url), |file| Source::Info(&file.path));
             let cookies = tools.cookies.for_run(&options.cookies).await;
-            let result =
-                run_ytdlp(command(source, RunKind::Download, &cookies), progress_tx.as_ref(), cancel_flag.clone(), tools.ffmpeg.as_deref()).await;
+            let command = command(source, RunKind::Download, &cookies, regional.as_ref().unwrap_or(options));
+            let result = run_ytdlp(command, progress_tx.as_ref(), cancel_flag.clone(), tools.ffmpeg.as_deref()).await;
             if !is_cancelled(&cancel_flag) {
                 cookies.finish(result.is_ok()).await;
             }
@@ -5692,6 +5719,35 @@ mod tests {
         let only = args_of(&named, RunKind::Subtitles, true);
         assert!(only.contains(&"--skip-download".to_string()) && !only.contains(&"--embed-metadata".to_string()), "{only:?}");
         assert!(!only.contains(&PROGRESS_TEMPLATE.to_string()), "{only:?}");
+    }
+
+    /// The subtitles `yt-dlp -J` (2026.08.19) found of youtube.com/watch?v=5AwdkGKmZ0I, Apple's
+    /// event of November 10, 2020, trimmed to their languages: its own English is `en-US`, while
+    /// its automatic captions have `en` too.
+    fn regional_subtitles_info() -> Value {
+        let langs = |langs: &[&str]| {
+            Value::Object(langs.iter().map(|lang| (lang.to_string(), serde_json::json!([{"ext": "srt"}, {"ext": "vtt"}]))).collect())
+        };
+        serde_json::json!({
+            "id": "5AwdkGKmZ0I",
+            "subtitles": langs(&["en-US", "es-419", "ja", "ko", "ru", "zh-CN"]),
+            "automatic_captions": langs(&["en", "en-US", "en-orig", "es", "ja"]),
+        })
+    }
+
+    #[test]
+    fn a_language_stands_for_the_sites_own_subtitles_of_its_regions() {
+        let info = regional_subtitles_info();
+        assert_eq!(regional_langs("en", &info), "en-US");
+        assert_eq!(regional_langs(" en, es,ja,fr,ALL,en.*,-live_chat", &info), "en-US,es-419,ja,fr,ALL,en.*,-live_chat");
+        // Its own subtitles in the language itself come first; a site without any changes nothing.
+        let mut both = info.clone();
+        both["subtitles"]["en"] = serde_json::json!([{"ext": "vtt"}]);
+        both["subtitles"]["en-GB"] = serde_json::json!([{"ext": "vtt"}]);
+        assert_eq!(regional_langs("en", &both), "en");
+        both["subtitles"].as_object_mut().unwrap().remove("en");
+        assert_eq!(regional_langs("en", &both), "en-GB,en-US");
+        assert_eq!(regional_langs("en,es", &serde_json::json!({"id": "x"})), "en,es");
     }
 
     /// A language no subtitles came in, and subtitles that came empty, are reported; `all`, a
