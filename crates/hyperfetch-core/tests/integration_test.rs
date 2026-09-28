@@ -3678,8 +3678,8 @@ async fn test_a_feed_lists_its_episodes_and_later_only_new_ones() {
     let tasks = ingest(&[feed.as_str()], &http, &ListOptions::default()).await.expect("the feed is read again");
     assert_eq!(listed(&tasks), [("2026-06-01 Old one.mp3".to_string(), old_url.to_string())]);
     let latest = ListOptions { latest: Some(1), ..ListOptions::default() };
-    let err = ingest(&[feed.as_str()], &http, &latest).await.expect_err("the newest was downloaded");
-    assert_eq!(err, "Nothing new in Mock Show: the newest 1 of its 2 episodes were downloaded before");
+    // Nothing new is nothing to do, as a playlist's is: no error.
+    assert!(ingest(&[feed.as_str()], &http, &latest).await.expect("the newest was downloaded").is_empty());
     let all = ListOptions { only_new: false, ..ListOptions::default() };
     assert_eq!(ingest(&[feed.as_str()], &http, &all).await.unwrap().len(), 2);
 
