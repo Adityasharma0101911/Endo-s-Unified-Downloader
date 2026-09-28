@@ -74,7 +74,7 @@ fn feed_shape(url: &Url) -> Option<bool> {
 
 /// One task per episode of the feed at `url`; called only when [`lists`] takes `url`. None when
 /// it is no feed after all, or a feed without audio or video (the link is then downloaded as it
-/// is); `Some(Ok)` is never empty.
+/// is); `Some(Ok)` is empty only when every episode it would list was downloaded before.
 ///
 /// Episodes come newest first, each named "YYYY-MM-DD Title.ext" in a folder named after the
 /// feed; `options.latest` keeps the newest N, and `options.only_new` then leaves out those
@@ -547,7 +547,7 @@ impl Done {
 /// One task per episode of `feed`, newest first (in the feed's order where dates are missing or
 /// equal), an enclosure listed twice once: the newest `latest` of them, less those `done` has.
 /// Names are given over the whole feed, so an episode keeps its name from one listing to the
-/// next. An error when that leaves none.
+/// next. None left is nothing new to do, not an error (see `ingest::ingest`).
 fn feed_tasks(feed: Feed, latest: Option<usize>, done: &Done) -> Result<Vec<Task>, String> {
     let show = feed.title.as_deref().unwrap_or("the feed");
     let folder = feed.title.as_deref().and_then(|title| clean_path([title]).ok());
@@ -576,7 +576,7 @@ fn feed_tasks(feed: Feed, latest: Option<usize>, done: &Done) -> Result<Vec<Task
     tasks.retain(|task| !done.has(task));
     if tasks.is_empty() {
         let which = if considered < listed { format!("the newest {} of its {}", considered, listed) } else { format!("all {} of its", listed) };
-        return Err(format!("Nothing new in {}: {} episodes were downloaded before", show, which));
+        tracing::info!("Nothing new in {}: {} episodes were downloaded before", show, which);
     }
     Ok(tasks)
 }
@@ -1014,8 +1014,8 @@ mod tests {
         assert_eq!(names(&left).len(), 3);
         assert!(names(&left)[0].starts_with("2026-09-26 "));
         assert_eq!(names(&left)[2], "2026-09-21 Repeat (2).mp4");
-        let err = feed_tasks(feed(), Some(1), &done).unwrap_err();
-        assert_eq!(err, "Nothing new in The Daily: the newest 1 of its 5 episodes were downloaded before");
+        // Nothing new is nothing to do, as a playlist's is.
+        assert!(feed_tasks(feed(), Some(1), &done).unwrap().is_empty());
     }
 
     /// A link history took a secret out of matches no episode, as the secret may be what told
@@ -1039,8 +1039,7 @@ mod tests {
 <enclosure type="audio/mpeg" url="https://tracking.example/new-prefix/cdn.example/ep.mp3?updated=2"/></item></channel></rss>"#;
         let feed = || parse(tracked, "https://f.example/show.rss").unwrap().unwrap();
         let done = Done::of(&[downloaded("SHOW/2026-01-01 ep.MP3", "https://tracking.example/old-prefix/cdn.example/ep.mp3")]);
-        let err = feed_tasks(feed(), None, &done).unwrap_err();
-        assert_eq!(err, "Nothing new in Show: all 1 of its episodes were downloaded before");
+        assert!(feed_tasks(feed(), None, &done).unwrap().is_empty());
         let done = Done::of(&[downloaded("Another show/2026-01-01 Ep.mp3", "https://tracking.example/old-prefix/cdn.example/ep.mp3")]);
         assert_eq!(feed_tasks(feed(), None, &done).unwrap().len(), 1);
     }
