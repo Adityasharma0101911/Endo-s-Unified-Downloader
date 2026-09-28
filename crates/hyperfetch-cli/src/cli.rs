@@ -13,12 +13,14 @@ use hyperfetch_core::media::{BrowserCookieSource, MediaQualityPreset};
     about = "High-speed multi-connection download accelerator",
     after_help = "Exit status: 0 all downloads finished, 1 a download failed, 2 usage error or \
                   verification failed, 130 interrupted (Ctrl+C), 143 terminated (SIGTERM).\n\
-                  Press Ctrl+C once to stop and save resume state; press it again to quit immediately."
+                  Press Ctrl+C once to stop and save resume state (a live recording is finished and \
+                  kept); press it again to quit immediately."
 )]
 pub struct Args {
-    /// Mirrors of ONE file (all must serve identical bytes), a magnet link with web seeds, or a
-    /// local/remote .metalink, .meta4 or .torrent. Without URLs and without -i an interactive
-    /// prompt starts.
+    /// Mirrors of ONE file (all must serve identical bytes), a magnet link with web seeds, a
+    /// local/remote .metalink, .meta4 or .torrent, or a link that lists many downloads (a Google
+    /// Drive or MediaFire folder, a playlist or channel, a podcast feed). Without URLs and without
+    /// -i an interactive prompt starts.
     #[arg(num_args = 0..)]
     pub urls: Vec<String>,
 
@@ -108,42 +110,44 @@ pub struct Args {
     #[arg(long = "concurrent-fragments", default_value_t = 8, value_parser = clap::value_parser!(u64).range(1..=32))]
     pub concurrent_fragments: u64,
 
-    /// Google API key for listing a whole Google Drive folder through the Drive API; without it
-    /// only what the public folder page shows is downloaded
-    #[arg(long = "google-api-key", value_name = "KEY", env = "ENDO_GOOGLE_API_KEY", hide_env_values = true)]
-    pub google_api_key: Option<String>,
-
-    /// For a video link that also names a playlist (watch?v=X&list=Y), download the whole playlist
-    #[arg(long = "yes-playlist")]
-    pub yes_playlist: bool,
-
-    /// Only the newest N items of a channel, playlist or feed
-    #[arg(long = "latest", value_name = "N", value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
-    pub latest: Option<usize>,
-
-    /// Download every item of a channel, playlist or feed, also those downloaded before
-    #[arg(long = "all-items")]
-    pub all_items: bool,
-
-    /// Never install ffmpeg: media that needs it falls back to what works without it
-    #[arg(long = "no-install-ffmpeg")]
-    pub no_install_ffmpeg: bool,
-
-    /// Subtitle languages to download with media, e.g. "en,es" or "all"
+    /// Subtitle languages to save next to media files, e.g. "en" or "en,es" or "all" (as .srt
+    /// when ffmpeg is at hand)
     #[arg(long = "subs", value_name = "LANGS", value_parser = parse_subtitle_langs)]
     pub subs: Option<String>,
 
-    /// Leave out the title, artist, date and URL tags, chapters and cover art media files get
+    /// Do not write the title, artist, date and URL tags, chapters and cover art into media files
     #[arg(long = "no-embed-metadata")]
     pub no_embed_metadata: bool,
 
-    /// Record a live stream from its start instead of from now
+    /// Record a live stream from its start (where the site keeps it) instead of from now
     #[arg(long = "live-from-start")]
     pub live_from_start: bool,
 
     /// Wait for a scheduled stream or premiere to start instead of failing
     #[arg(long = "wait-for-video")]
     pub wait_for_video: bool,
+
+    /// Never install ffmpeg (the checked build yt-dlp's makers publish, about 200 MB) when media
+    /// needs it and none is found: such media falls back to what works without it
+    #[arg(long = "no-install-ffmpeg")]
+    pub no_install_ffmpeg: bool,
+
+    /// Only the newest N items of a channel, playlist or podcast feed
+    #[arg(long = "latest", value_name = "N", value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
+    pub latest: Option<usize>,
+
+    /// Also the items of a channel, playlist or feed downloaded before (by default only new ones)
+    #[arg(long = "all-items")]
+    pub all_items: bool,
+
+    /// For a video link that also names a playlist (watch?v=X&list=Y), download the whole playlist
+    #[arg(long = "yes-playlist")]
+    pub yes_playlist: bool,
+
+    /// Google API key to list a whole Google Drive folder through the Drive API, with sizes and
+    /// checksums; without it the public folder page is read, which may not show every file
+    #[arg(long = "google-api-key", value_name = "KEY", env = "ENDO_GOOGLE_API_KEY", hide_env_values = true)]
+    pub google_api_key: Option<String>,
 
     /// Show download history and exit
     #[arg(long = "history", conflicts_with_all = ["urls", "input_file", "verify"])]
