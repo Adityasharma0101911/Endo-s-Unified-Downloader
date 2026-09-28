@@ -156,6 +156,9 @@ pub struct DownloadOptions {
     pub live_from_start: bool,
     /// Wait for a scheduled stream or premiere to start.
     pub wait_for_video: bool,
+    /// How yt-dlp names a media download's file when `output_path` is a folder: an output
+    /// template (see `ingest::Task::media_name`). None names it by its title.
+    pub media_name: Option<String>,
 }
 
 impl Default for DownloadOptions {
@@ -183,6 +186,7 @@ impl Default for DownloadOptions {
             embed_metadata: true,
             live_from_start: false,
             wait_for_video: false,
+            media_name: None,
         }
     }
 }
@@ -536,12 +540,12 @@ impl DownloadEngine {
     /// asked for, else the one for a link that turns out to be media, else the default.
     fn media_options(&self) -> crate::media::MediaDownloadOptions {
         let (output_dir, output_filename) = match &self.options.output_path {
-            Some(p) if is_dir_target(p) => (p.clone(), None),
+            Some(p) if is_dir_target(p) => (p.clone(), self.options.media_name.clone()),
             Some(p) => (
                 p.parent().unwrap_or(Path::new(".")).to_path_buf(),
                 p.file_name().map(|n| n.to_string_lossy().to_string()),
             ),
-            None => (PathBuf::from("."), None),
+            None => (PathBuf::from("."), self.options.media_name.clone()),
         };
         let cookies = if let Some(ref bc) = self.options.browser_cookies {
             bc.clone()
@@ -4992,5 +4996,22 @@ mod tests {
         let back: DownloadOptions = serde_json::from_str(&serde_json::to_string(&with).unwrap()).unwrap();
         assert_eq!(back.page_media_preset, Some(AudioMp3));
         assert_eq!(serde_json::from_str::<DownloadOptions>("{}").unwrap().page_media_preset, None);
+    }
+
+    /// A playlist entry saved into a folder is named by yt-dlp as the entry says (its title and
+    /// id); a file name given is the name, and the naming is kept with the other options.
+    #[test]
+    fn test_a_media_download_into_a_folder_is_named_as_its_input_says() {
+        let dir = tempfile::tempdir().unwrap();
+        let template = "%(title)s [%(id)s].%(ext)s".to_string();
+        let named = |output_path: PathBuf, media_name: Option<String>| {
+            engine_with(DownloadOptions { output_path: Some(output_path), media_name, ..Default::default() }).media_options().output_filename
+        };
+        assert_eq!(named(dir.path().to_path_buf(), Some(template.clone())), Some(template.clone()));
+        assert_eq!(named(dir.path().to_path_buf(), None), None);
+        assert_eq!(named(dir.path().join("mine.mp4"), Some(template.clone())), Some("mine.mp4".to_string()));
+        let with = DownloadOptions { media_name: Some(template.clone()), ..Default::default() };
+        let back: DownloadOptions = serde_json::from_str(&serde_json::to_string(&with).unwrap()).unwrap();
+        assert_eq!(back.media_name, Some(template));
     }
 }

@@ -11,7 +11,7 @@ use hyperfetch_core::queue::{QueueItem, QueueItemStatus};
 
 use crate::settings::{BROWSERS, MEDIA_PRESETS};
 use crate::util::{self, format_bytes, format_duration, lock, Verdict};
-use crate::{App, Dialog, Tab, VerifyRequest, GRAPH_WINDOW};
+use crate::{Answer, App, Dialog, Origin, Tab, VerifyRequest, GRAPH_WINDOW};
 
 const TEXT: Color32 = Color32::from_rgb(228, 232, 240);
 const MUTED: Color32 = Color32::from_rgb(148, 163, 184);
@@ -174,7 +174,11 @@ fn clipboard_banner(app: &mut App, ui: &mut egui::Ui) {
                     if ui.button(RichText::new("Add to Queue").size(11.0)).clicked() {
                         app.clipboard_banner = None;
                         // Link from the clipboard: the per-download checksum and Authorization header don't apply.
-                        app.notice = Some(app.add_download(&link, "", "").map(|id| format!("Added #{} to the queue", id)));
+                        if ingest::needs_reading(&link) {
+                            app.read_document(link.clone(), Origin::Dropped, String::new(), String::new());
+                        } else {
+                            app.notice = Some(app.add_download(&link, "", "").map(|id| format!("Added #{} to the queue", id)));
+                        }
                     }
                     if ui.add(primary_button("Download Now", BLUE)).clicked() {
                         app.clipboard_banner = None;
@@ -185,11 +189,25 @@ fn clipboard_banner(app: &mut App, ui: &mut egui::Ui) {
         });
 }
 
-/// Asks before adding the many downloads a large .metalink, .meta4 or .torrent lists.
+/// Asks before adding the many downloads a large .metalink, .meta4, .torrent or playlist lists,
+/// and whether a video link that names its playlist too means the video or the whole playlist:
+/// at once, the video can be picked while the playlist is read.
 fn listing_prompt(app: &mut App, ui: &mut egui::Ui) {
     let Some(listing) = app.listings.first() else { return };
     let input = listing.input.clone();
-    let text = format!("{} lists {}. Add them all?", truncate_chars(&input, 55), listing.summary());
+    let video = listing.video.is_some();
+    let playlist_ready = listing.tasks.as_ref().is_some_and(|tasks| !tasks.is_empty());
+    let (text, all) = if video {
+        let text = format!("{} is a video in a playlist. Download:", truncate_chars(&input, 55));
+        let all = match listing.tasks.as_deref() {
+            None => "Whole Playlist (reading...)".to_string(),
+            Some([]) => "Whole Playlist (nothing new)".to_string(),
+            Some(tasks) => format!("Whole Playlist ({})", tasks.len()),
+        };
+        (text, all)
+    } else {
+        (format!("{} lists {}. Add them all?", truncate_chars(&input, 55), listing.summary()), "Add All".to_string())
+    };
     ui.add_space(6.0);
     egui::Frame::none()
         .fill(Color32::from_rgb(22, 27, 38))
@@ -201,10 +219,19 @@ fn listing_prompt(app: &mut App, ui: &mut egui::Ui) {
                 ui.label(RichText::new(text).color(TEXT)).on_hover_text(&input);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button(RichText::new("Cancel").size(11.0)).clicked() {
-                        app.answer_listing(false);
+                        app.answer_listing(Answer::Cancel);
                     }
-                    if ui.add(primary_button("Add All", BLUE)).clicked() {
-                        app.answer_listing(true);
+                    if !video {
+                        if ui.add(primary_button(&all, BLUE)).clicked() {
+                            app.answer_listing(Answer::All);
+                        }
+                        return;
+                    }
+                    if ui.add_enabled(playlist_ready, egui::Button::new(RichText::new(&all).size(11.0))).clicked() {
+                        app.answer_listing(Answer::All);
+                    }
+                    if ui.add(primary_button("This Video", BLUE)).clicked() {
+                        app.answer_listing(Answer::Video);
                     }
                 });
             });
@@ -229,7 +256,7 @@ fn downloader_tab(app: &mut App, ui: &mut egui::Ui) {
                 }
                 None => {
                     let edit = egui::TextEdit::singleline(&mut app.url_input)
-                        .hint_text(hint_text("File URL, media link (YouTube, Vimeo, Reddit, ...), magnet link with web seeds, or .torrent/.metalink"));
+                        .hint_text(hint_text("File URL, media link (YouTube, Vimeo, Reddit, ...), playlist or channel, magnet link with web seeds, or .torrent/.metalink"));
                     let response = ui.add_sized([width, 26.0], edit);
                     if response.changed() {
                         app.form_error = None;
@@ -277,7 +304,7 @@ fn downloader_tab(app: &mut App, ui: &mut egui::Ui) {
         ui.separator();
         ui.add_space(4.0);
         let marker = if app.show_advanced { "[-]" } else { "[+]" };
-        let advanced = format!("{} Advanced Options (Checksum, Cookies, Proxy, Speed Limit, Retries)", marker);
+        let advanced = format!("{} Advanced Options (Checksum, Cookies, Proxy, Playlists, Speed Limit, Retries)", marker);
         if ui.button(RichText::new(advanced).size(12.0).color(MUTED)).clicked() {
             app.show_advanced = !app.show_advanced;
         }
@@ -454,6 +481,18 @@ fn advanced_options(app: &mut App, ui: &mut egui::Ui) {
         ui.add_space(12.0);
         ui.label(RichText::new("Browser Cookies:").size(12.0));
         combo(ui, "browser_cookies_combo", &mut app.settings.browser_cookies, &BROWSERS);
+    });
+
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Playlists & Channels:").size(12.0));
+        ui.checkbox(&mut app.settings.only_new, "Only new items")
+            .on_hover_text("Leave out the videos and tracks of a playlist or channel that were downloaded before");
+        ui.add_space(12.0);
+        ui.label(RichText::new("Newest").size(12.0));
+        ui.add(egui::DragValue::new(&mut app.settings.latest).range(0..=100_000))
+            .on_hover_text("Only this many of the newest items: a channel's first, a playlist's last");
+        ui.label(RichText::new("items (0 = all)").size(11.0).color(MUTED));
     });
 
     ui.add_space(4.0);
@@ -806,7 +845,7 @@ fn queue_tab(app: &mut App, ui: &mut egui::Ui) {
     card().show(ui, |ui| {
         ui.label(RichText::new("Add to Queue").strong().size(13.0));
         ui.label(
-            RichText::new("One download per line; separate mirrors of the same file with spaces. A .torrent or .metalink (URL, file path, or file dropped on the window) adds every file it lists. Uses the folder and options from the Downloader tab.")
+            RichText::new("One download per line; separate mirrors of the same file with spaces. A .torrent or .metalink (URL, file path, or file dropped on the window) adds every file it lists, a playlist or channel every video. Uses the folder and options from the Downloader tab.")
                 .size(11.0)
                 .color(MUTED),
         );
