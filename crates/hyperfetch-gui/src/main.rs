@@ -5,7 +5,7 @@ mod settings;
 mod ui;
 mod util;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -835,14 +835,16 @@ impl App {
     }
 
     /// Starts queued downloads while fewer than the configured number are running; none while the
-    /// window waits to close.
+    /// window waits to close. One that cannot start yet (a video waiting for the answer about
+    /// ffmpeg, a file under repair) holds up none after it.
     fn run_scheduler(&mut self) {
         if !self.settings.auto_run_queue || self.closing {
             return;
         }
-        while let Some(id) = self.queue.next_to_start(self.settings.max_concurrent.max(1)) {
+        let mut held = HashSet::new();
+        while let Some(id) = self.queue.next_to_start(self.settings.max_concurrent.max(1), |id| held.contains(&id)) {
             if !self.start_job(id, false) {
-                break;
+                held.insert(id);
             }
         }
     }
@@ -1978,6 +1980,23 @@ mod tests {
         app.handle_event(AppEvent::FfmpegFound(true));
         let second = video(&mut app);
         assert!(app.start_job(second, false) && !app.asks_about_ffmpeg());
+    }
+
+    /// A video that waits for the answer about ffmpeg holds up none of the downloads queued
+    /// after it: the queue starts them, as many as may run.
+    #[test]
+    fn a_video_waiting_for_the_ffmpeg_answer_holds_up_no_other_download() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(&rt, dir.path());
+        app.engines = Arc::new(|_: Vec<Url>, _: DownloadOptions| Err("not downloaded here".to_string()));
+        app.settings.max_concurrent = 2;
+        let video = app.add_download("https://www.youtube.com/watch?v=jNQXAC9IVRw", "", "").unwrap();
+        let files: Vec<usize> = (1..=3).map(|n| app.add_download(&format!("https://a.example/{n}.iso"), "", "").unwrap()).collect();
+        app.run_scheduler();
+        assert_eq!(app.ffmpeg_waiting, [(video, false)]);
+        let running: Vec<usize> = app.queue.items().iter().filter(|item| item.status.is_active()).map(|item| item.id).collect();
+        assert_eq!(running, files[..2]);
     }
 
     /// A playlist or channel with nothing new is nothing to do: said so, and its queue line is

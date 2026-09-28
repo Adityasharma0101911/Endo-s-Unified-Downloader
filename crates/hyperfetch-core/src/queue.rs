@@ -164,14 +164,15 @@ impl DownloadQueue {
         self.items.iter().filter(|i| i.status.is_active()).count()
     }
 
-    /// The first queued item to start while fewer than `max_concurrent` items are active.
-    pub fn next_to_start(&self, max_concurrent: usize) -> Option<usize> {
+    /// The first queued item to start while fewer than `max_concurrent` items are active, but
+    /// for those `skip` holds back (ones that cannot start yet, which the others go past).
+    pub fn next_to_start(&self, max_concurrent: usize, skip: impl Fn(usize) -> bool) -> Option<usize> {
         if self.active_count() >= max_concurrent {
             return None;
         }
         self.items
             .iter()
-            .find(|i| i.status == QueueItemStatus::Queued && self.active_conflict(i.id).is_none())
+            .find(|i| i.status == QueueItemStatus::Queued && !skip(i.id) && self.active_conflict(i.id).is_none())
             .map(|i| i.id)
     }
 
@@ -426,18 +427,20 @@ mod tests {
     #[test]
     fn scheduler_respects_concurrency_and_order() {
         let (mut q, ids) = queue_of(&["https://e.com/a", "https://e.com/b", "https://e.com/c"]);
-        assert_eq!(q.next_to_start(2), Some(ids[0]));
+        assert_eq!(q.next_to_start(2, |_| false), Some(ids[0]));
         assert!(q.mark_started(ids[0]));
         assert!(!q.mark_started(ids[0]), "an active item cannot be started twice");
-        assert_eq!(q.next_to_start(2), Some(ids[1]));
+        assert_eq!(q.next_to_start(2, |_| false), Some(ids[1]));
         q.mark_started(ids[1]);
         assert_eq!(q.active_count(), 2);
-        assert_eq!(q.next_to_start(2), None);
+        assert_eq!(q.next_to_start(2, |_| false), None);
         assert!(q.mark_pausing(ids[0]));
-        assert_eq!(q.next_to_start(2), None, "a pausing item still occupies a slot");
+        assert_eq!(q.next_to_start(2, |_| false), None, "a pausing item still occupies a slot");
         q.finish(ids[0], Err(CANCELLED.into()));
         assert_eq!(q.get_item(ids[0]).unwrap().status, QueueItemStatus::Paused);
-        assert_eq!(q.next_to_start(2), Some(ids[2]), "paused items are not restarted automatically");
+        assert_eq!(q.next_to_start(2, |_| false), Some(ids[2]), "paused items are not restarted automatically");
+        let (q, ids) = queue_of(&["https://e.com/a", "https://e.com/b"]);
+        assert_eq!(q.next_to_start(2, |id| id == ids[0]), Some(ids[1]), "one held back holds none after it");
     }
 
     #[test]
@@ -446,7 +449,7 @@ mod tests {
         q.mark_started(ids[0]);
         assert_eq!(q.active_conflict(ids[1]), Some(ids[0]));
         assert_eq!(q.active_conflict(ids[2]), None);
-        assert_eq!(q.next_to_start(5), Some(ids[2]), "a conflicting item waits");
+        assert_eq!(q.next_to_start(5, |_| false), Some(ids[2]), "a conflicting item waits");
 
         q.apply_snapshot(ids[0], &snapshot("/dl/x.bin"));
         q.apply_snapshot(ids[2], &snapshot("/dl/x.bin"));
@@ -618,7 +621,7 @@ mod tests {
         assert_eq!(status(authed), QueueItemStatus::AuthRequired);
         assert_eq!(status(authed_done), QueueItemStatus::Completed);
         assert_eq!(q.get_item(ids[0]).unwrap().speed_bytes_per_sec, 0.0);
-        assert_eq!(q.next_to_start(5), Some(ids[3]), "an item waiting for its header is never auto-started");
+        assert_eq!(q.next_to_start(5, |_| false), Some(ids[3]), "an item waiting for its header is never auto-started");
 
         assert!(q.provide_auth(authed, "Bearer new".into()));
         let item = q.get_item(authed).unwrap();
