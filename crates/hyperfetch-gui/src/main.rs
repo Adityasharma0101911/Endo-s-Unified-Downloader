@@ -1284,6 +1284,8 @@ fn apply_theme(ctx: &egui::Context) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Started again to stop a live recording (a debug build has a console), this only does that.
+    hyperfetch_core::media::serve_ctrl_c();
     let _ = tracing_subscriber::fmt().try_init();
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     let handle = runtime.handle().clone();

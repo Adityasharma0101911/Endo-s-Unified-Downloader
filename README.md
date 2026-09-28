@@ -220,11 +220,12 @@ A live stream is recorded by yt-dlp. This covers a site's live video and an HLS 
 - By default the recording starts now. With `--live-from-start` (GUI: "Record live streams from the start") it starts from the beginning, where the site keeps it (YouTube does).
 - `--wait-for-video` waits for a scheduled stream or premiere to begin, checking every 1 to 10 minutes.
 - Progress shows the size recorded and how long the recording has run, not a percentage.
-- Stop ends the recording and keeps it (Ctrl+C in the CLI, Pause in the GUI). yt-dlp is asked to stop the way Ctrl+C at a terminal asks it: SIGINT on Linux, a Ctrl+C sent to its console on Windows. It finishes the file, which is reported done with its size and saved in history as completed.
+- Stop ends the recording and keeps it (Ctrl+C in the CLI, Pause in the GUI). yt-dlp is asked to stop the way Ctrl+C at a terminal asks it: SIGINT on Linux, a Ctrl+C sent to its console on Windows (the CLI, which has a console of its own, starts itself again without one to send it). It finishes the file, which is reported done with its size and saved in history as completed. A recording that has ended by itself and is being finished is left to finish.
 - Closing the GUI window stops the recordings the same way, and the window stays open until their files are finished. Close it a second time to quit at once, which cuts them off.
-- Sometimes yt-dlp is stopped outright instead: when it does not stop recording within 30 seconds, and when it cannot be asked (the Windows CLI, which has a console of its own). What it recorded is kept either way:
+- Sometimes yt-dlp is stopped outright instead: when it does not stop recording within 30 seconds, or cannot be asked. What it recorded is kept either way:
   - An MPEG-TS recording is named `.ts`, then remuxed to `.mp4` when ffmpeg is present.
   - Video and audio recorded apart are joined with ffmpeg.
+  - A recording that cannot be renamed is kept as its `.part` file and reported done under that name.
 - DRM-protected live TV (a FairPlay, Widevine or other non-`identity` key format) is refused, not recorded.
 
 ---
