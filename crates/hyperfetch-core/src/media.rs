@@ -128,8 +128,12 @@ impl BrowserCookieSource {
 
 /// `text` in a yt-dlp output template, where it stands for itself: a `%` would start a field
 /// (`50%(off)s`) or, on Windows, name an environment variable (`%USERNAME%`), so it is doubled.
+/// yt-dlp also expands `$HOME` and `${HOME}` in a template before it reads its fields (its
+/// `_outtmpl_expandpath`), and has no escape for `$`: a `$` becomes a field that is always
+/// missing, with `$` for default, and an empty one after it, so that the `%`s stay in pairs and
+/// Windows reads no `%NAME%` from the text after.
 pub fn template_literal(text: &str) -> String {
-    text.replace('%', "%%")
+    text.replace('%', "%%").replace('$', "%(hf_dollar|$)s%(hf_none|)s")
 }
 
 /// Options for configuring a media download
@@ -4919,6 +4923,12 @@ mod tests {
         let expected = |dir: &str, name: &str| Path::new(dir).join(name).to_string_lossy().into_owned();
         assert_eq!(output("50%(off)s %USERNAME%", None), expected("50%%(off)s %%USERNAME%%", "%(title)s.%(ext)s"));
         assert_eq!(output("100%", Some("%(title)s [%(id)s].%(ext)s")), expected("100%%", "%(title)s [%(id)s].%(ext)s"));
+        // A `$` is a field that is always missing, with `$` for default: yt-dlp expands `$HOME`
+        // before it reads fields. The empty field after it keeps the `%`s in pairs, which
+        // Windows would otherwise read `%USERNAME%` from.
+        let dollar = "%(hf_dollar|$)s%(hf_none|)s";
+        assert_eq!(output("$HOME clips %USERNAME%", None), expected(&format!("{dollar}HOME clips %%USERNAME%%"), "%(title)s.%(ext)s"));
+        assert_eq!(template_literal("${HOME}"), format!("{dollar}{{HOME}}"));
     }
 
     #[test]
