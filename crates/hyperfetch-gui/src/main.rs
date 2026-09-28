@@ -642,13 +642,13 @@ impl App {
     /// Starts (or resumes) the engine for a queue item. `fresh` first deletes the item's partial
     /// files so the download starts from zero. Returns false if nothing was started. A media
     /// download waits while the user has not said whether ffmpeg may be installed and none is
-    /// found (see [`App::answer_ffmpeg`]); it installs ffmpeg as the user said last, whatever the
+    /// found (see [`App::answer_ffmpeg`]), and then starts as it was asked to last (a Resume
+    /// after a Start Over resumes); it installs ffmpeg as the user said last, whatever the
     /// setting was when it was queued.
     fn start_job(&mut self, id: usize, fresh: bool) -> bool {
         if self.waits_for_ffmpeg_answer(id) {
-            if !self.ffmpeg_waiting.iter().any(|&(waiting, _)| waiting == id) {
-                self.ffmpeg_waiting.push((id, fresh));
-            }
+            self.ffmpeg_waiting.retain(|&(waiting, _)| waiting != id);
+            self.ffmpeg_waiting.push((id, fresh));
             return false;
         }
         if let Some(other) = self.queue.active_conflict(id) {
@@ -1960,7 +1960,9 @@ mod tests {
         app.handle_event(AppEvent::FfmpegFound(false));
         assert!(app.asks_about_ffmpeg());
         assert!(!app.start_job(first, false), "still waiting");
-        assert_eq!(app.ffmpeg_waiting, [(first, true)], "started as it was asked to first");
+        assert_eq!(app.ffmpeg_waiting, [(first, false)], "started as it was asked to last");
+        assert!(!app.start_job(first, true));
+        assert_eq!(app.ffmpeg_waiting, [(first, true)], "started as it was asked to last");
 
         app.answer_ffmpeg(true);
         assert_eq!(app.settings.install_ffmpeg, Some(true));
