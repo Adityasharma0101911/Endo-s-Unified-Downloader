@@ -105,6 +105,15 @@ pub struct EngineSnapshot {
     pub target_path: Option<PathBuf>,
 }
 
+impl EngineSnapshot {
+    /// A live recording's progress: what yt-dlp has recorded, with no size to reach. yt-dlp's
+    /// progress is the only kind without a `target_path` (see `run_media`), and it has a size
+    /// for every other download.
+    pub fn is_recording(&self) -> bool {
+        self.target_path.is_none() && self.total_bytes == 0 && self.downloaded_bytes > 0
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct DownloadOptions {
@@ -574,7 +583,8 @@ impl DownloadEngine {
     }
 
     /// Downloads `media_url` with yt-dlp, which goes by what it found there moments ago when
-    /// that is given (see `site_media`).
+    /// that is given (see `site_media`). Its snapshots name no `target_path`, and their total is
+    /// 0 while it records a live stream (see `EngineSnapshot::is_recording`).
     async fn run_media(
         &self,
         media_url: Url,
