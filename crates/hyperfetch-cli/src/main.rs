@@ -64,7 +64,7 @@ async fn app(args: Args) -> i32 {
         Err(e) => return usage(&e),
     };
     if args.urls.is_empty() && args.input_file.is_none() {
-        interactive(&args, &ui, &shutdown, &http, prompt).await
+        interactive(&args, &ui, &shutdown, &http, at_terminal().then_some(find_ffmpeg_path as Finder), prompt).await
     } else {
         batch(&args, &ui, &shutdown, &http).await
     }
@@ -326,9 +326,8 @@ async fn batch(args: &Args, ui: &Ui, shutdown: &Shutdown, http: &reqwest::Client
 
     let mut jobs: Vec<Job> = tasks.into_iter().map(|(line, t)| Job { line, ..job(args, args.connections, &dir, t) }).collect();
     // Asked only where someone answers: at a terminal that is not reading the input file.
-    let terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-    let can_ask = terminal && !ui.quiet() && args.input_file.as_deref() != Some(Path::new("-"));
-    let install = may_install_ffmpeg(args, &jobs, &mut None, can_ask.then_some(prompt)).await;
+    let can_ask = !ui.quiet() && args.input_file.as_deref() != Some(Path::new("-")) && at_terminal();
+    let install = may_install_ffmpeg(args, &jobs, &mut None, can_ask.then_some(find_ffmpeg_path as Finder), prompt).await;
     for job in &mut jobs {
         job.options.install_ffmpeg = install;
     }
@@ -336,16 +335,24 @@ async fn batch(args: &Args, ui: &Ui, shutdown: &Shutdown, http: &reqwest::Client
     exit_code(shutdown.requested(), failed)
 }
 
-/// What [`may_install_ffmpeg`] asks.
+/// Looks for an ffmpeg (see `find_ffmpeg_path`). Blocking.
+type Finder = fn() -> Option<PathBuf>;
+
+/// Whether someone can answer this run's questions: stdin and stdout are a terminal.
+fn at_terminal() -> bool {
+    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+}
+
+/// What [`ask_to_install_ffmpeg`] asks.
 const FFMPEG_QUESTION: &str = "\nffmpeg is not installed. It joins a video's separate video and audio (the best quality) and \
 makes MP3/M4A files; without it videos download in a lower quality and audio presets fail.\nInstall it for your user \
 (the checked build yt-dlp's makers publish, about 200 MB)? [y/N]: ";
 
-/// Whether the media downloads of this run may install ffmpeg (about 200 MB) when none is found:
-/// as --install-ffmpeg or --no-install-ffmpeg says, else as the user answered before this run
-/// (`answered`), else as the user answers `ask` now, asked only when one of `jobs` is a media
-/// download and no ffmpeg is found. Without `ask` (no one to answer) it is no.
-async fn may_install_ffmpeg<F, Fut>(args: &Args, jobs: &[Job], answered: &mut Option<bool>, ask: Option<F>) -> bool
+/// Whether the media downloads among `jobs` may install ffmpeg (about 200 MB) when none is found:
+/// as --install-ffmpeg or --no-install-ffmpeg says, else as the user answered before in this run
+/// (`answered`), else as the user answers `ask` now (see [`ask_to_install_ffmpeg`]), when one of
+/// `jobs` needs it. No one answers without `find` (see [`at_terminal`]): that is no.
+async fn may_install_ffmpeg<F, Fut>(args: &Args, jobs: &[Job], answered: &mut Option<bool>, find: Option<Finder>, ask: F) -> bool
 where
     F: FnOnce(String) -> Fut,
     Fut: Future<Output = Option<String>>,
@@ -357,14 +364,23 @@ where
         return answer;
     }
     let media = jobs.iter().any(|job| job.options.media_preset.is_some() || job.urls.iter().any(is_supported_media_site));
-    let Some(ask) = ask.filter(|_| media) else { return false };
-    if tokio::task::spawn_blocking(find_ffmpeg_path).await.is_ok_and(|found| found.is_some()) {
-        return false;
+    let Some(find) = find.filter(|_| media) else { return false };
+    *answered = ask_to_install_ffmpeg(find, ask).await;
+    answered.unwrap_or(false)
+}
+
+/// The user's answer to `ask` whether ffmpeg may be installed, asked only when `find` (run off the
+/// runtime) finds none; None when it finds one.
+async fn ask_to_install_ffmpeg<F, Fut>(find: Finder, ask: F) -> Option<bool>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: Future<Output = Option<String>>,
+{
+    if tokio::task::spawn_blocking(find).await.is_ok_and(|found| found.is_some()) {
+        return None;
     }
     let answer = ask(FFMPEG_QUESTION.to_string()).await;
-    let yes = answer.is_some_and(|answer| answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes"));
-    *answered = Some(yes);
-    yes
+    Some(answer.is_some_and(|answer| answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes")))
 }
 
 /// Prints `message` and reads one trimmed line; None at end of input.
@@ -390,9 +406,10 @@ fn default_download_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// Prompt loop used when no URL is given, asking with `ask` (see [`prompt`]). Command-line
-/// options apply to every download.
-async fn interactive<F, Fut>(args: &Args, ui: &Ui, shutdown: &Shutdown, http: &reqwest::Client, mut ask: F) -> i32
+/// Prompt loop used when no URL is given, asking with `ask` (see [`prompt`]), which may read a
+/// pipe; whether ffmpeg may be installed is asked only with `find` (see [`may_install_ffmpeg`]),
+/// where someone answers. Command-line options apply to every download.
+async fn interactive<F, Fut>(args: &Args, ui: &Ui, shutdown: &Shutdown, http: &reqwest::Client, find: Option<Finder>, mut ask: F) -> i32
 where
     F: FnMut(String) -> Fut,
     Fut: Future<Output = Option<String>>,
@@ -460,7 +477,7 @@ where
         };
 
         let mut jobs: Vec<Job> = tasks.into_iter().map(|t| job(args, connections, &dir, t)).collect();
-        let install = may_install_ffmpeg(args, &jobs, &mut ffmpeg_answer, Some(&mut ask)).await;
+        let install = may_install_ffmpeg(args, &jobs, &mut ffmpeg_answer, find, &mut ask).await;
         for job in &mut jobs {
             job.options.install_ffmpeg = install;
         }
@@ -861,31 +878,36 @@ mod tests {
     }
 
     /// ffmpeg (about 200 MB) is installed as a flag says, else only once the user agrees: asked
-    /// once, for a media download, when none is found; without anyone to ask, never.
+    /// once, for a media download, when none is found; without anyone to ask, never. The machine's
+    /// own ffmpeg does not count: where it is looked for is the test's.
     #[tokio::test]
     async fn installing_ffmpeg_is_asked_about_unless_a_flag_says() {
         type Ask = fn(String) -> std::future::Ready<Option<String>>;
         let never: Ask = |question| panic!("asked: {question}");
+        let missing: Finder = || None;
+        let found: Finder = || Some(PathBuf::from("ffmpeg"));
         let args = parse(&["u"]);
         let jobs = |link: &str| [job(&args, 4, Path::new("d"), Task { urls: vec![Url::parse(link).unwrap()], ..Default::default() })];
         let (video, file) = (jobs("https://www.youtube.com/watch?v=jNQXAC9IVRw"), jobs("https://a.example/f.iso"));
         for (flag, allowed) in [("--install-ffmpeg", true), ("--no-install-ffmpeg", false)] {
-            assert_eq!(may_install_ffmpeg(&parse(&[flag, "u"]), &video, &mut None, Some(never)).await, allowed, "{flag}");
+            assert_eq!(may_install_ffmpeg(&parse(&[flag, "u"]), &video, &mut None, Some(missing), never).await, allowed, "{flag}");
         }
-        assert!(!may_install_ffmpeg(&args, &video, &mut None, None::<Ask>).await, "no one to ask");
-        assert!(!may_install_ffmpeg(&args, &file, &mut None, Some(never)).await, "no media");
-        assert!(!may_install_ffmpeg(&args, &video, &mut Some(false), Some(never)).await, "answered before");
+        assert!(!may_install_ffmpeg(&args, &video, &mut None, None, never).await, "no one to ask");
+        assert!(!may_install_ffmpeg(&args, &file, &mut None, Some(missing), never).await, "no media");
+        assert!(!may_install_ffmpeg(&args, &video, &mut Some(false), Some(missing), never).await, "answered before");
+        assert!(!may_install_ffmpeg(&args, &video, &mut None, Some(found), never).await, "ffmpeg is found");
 
-        let missing = tokio::task::spawn_blocking(find_ffmpeg_path).await.unwrap().is_none();
         let (mut asked, mut answered) = (0, None);
         let mut yes = |question: String| {
             assert!(question.contains("about 200 MB") && question.ends_with("[y/N]: "), "{question}");
             asked += 1;
             std::future::ready(Some("Y".to_string()))
         };
-        assert_eq!(may_install_ffmpeg(&args, &video, &mut answered, Some(&mut yes)).await, missing);
-        assert_eq!(may_install_ffmpeg(&args, &video, &mut answered, Some(&mut yes)).await, missing);
-        assert_eq!((asked, answered), (usize::from(missing), missing.then_some(true)), "asked once, if ffmpeg is missing");
+        assert!(may_install_ffmpeg(&args, &video, &mut answered, Some(missing), &mut yes).await);
+        assert!(may_install_ffmpeg(&args, &video, &mut answered, Some(missing), &mut yes).await);
+        assert_eq!((asked, answered), (1, Some(true)), "asked once");
+        let no = |_| std::future::ready(Some("n".to_string()));
+        assert!(!may_install_ffmpeg(&args, &video, &mut None, Some(missing), no).await);
     }
 
     /// --header goes to the hosts the user named, never to the mirrors a .metalink or .torrent
@@ -1044,10 +1066,36 @@ mod tests {
             asked.push(question);
             std::future::ready(answers.next())
         };
-        let code = interactive(&args, &Ui::new(true), &Shutdown::install(), &reqwest::Client::new(), ask).await;
+        let code = interactive(&args, &Ui::new(true), &Shutdown::install(), &reqwest::Client::new(), None, ask).await;
         assert_eq!(code, EXIT_OK);
         assert_eq!(asked.len(), 2, "{asked:?}");
         assert!(asked.iter().all(|question| question.contains("URL(s)")), "{asked:?}");
+    }
+
+    /// Interactive mode reads its answers from a pipe too, but asks whether ffmpeg may be
+    /// installed only where someone answers: a "y" meant for another question is no consent to a
+    /// 200 MB install, and the answers after it keep their questions.
+    #[tokio::test]
+    async fn interactive_mode_asks_about_ffmpeg_only_where_someone_answers() {
+        let dir = test_dir("interactive-ffmpeg");
+        let mut args = parse(&["--media-preset", "best", "-d", dir.to_str().unwrap()]);
+        // The download fails as it starts, with no cookies file to read.
+        args.load_cookies = Some(dir.join("missing-cookies.txt"));
+        let piped = ["https://a.example/clip.mp4", "", "", "n"];
+        let typed = ["https://a.example/clip.mp4", "", "", "y", "n"];
+        for (find, answers, questions) in [(None, &piped[..], 4), (Some((|| None) as Finder), &typed[..], 5)] {
+            let mut answers = answers.iter().map(|answer| answer.to_string());
+            let mut asked = Vec::new();
+            let ask = |question: String| {
+                asked.push(question);
+                std::future::ready(answers.next())
+            };
+            let code = interactive(&args, &Ui::new(true), &Shutdown::install(), &reqwest::Client::new(), find, ask).await;
+            assert_eq!(code, EXIT_FAILED);
+            assert_eq!(asked.len(), questions, "{asked:?}");
+            assert_eq!(asked.iter().any(|question| question.contains("about 200 MB")), find.is_some(), "{asked:?}");
+            assert!(asked.last().is_some_and(|question| question.contains("another")), "{asked:?}");
+        }
     }
 
     #[test]
