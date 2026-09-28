@@ -4,7 +4,9 @@
 //! its link is one the listing made, so the Authorization header the user gave is not sent there.
 
 use std::collections::{HashSet, VecDeque};
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -12,6 +14,66 @@ use url::Url;
 
 use crate::ingest::{clean_path, ListOptions, Task};
 use crate::resolver::{google_docs_export, google_drive_direct_url};
+use crate::worker::retry_after;
+
+/// How many times in all a listing's request is made while its host is busy or failing (see
+/// [`Why::Busy`]), as Google asks of Drive API clients: with a wait that doubles from
+/// [`FIRST_WAIT`], or as long as the host says (`Retry-After`), never over [`MAX_WAIT`].
+const ATTEMPTS: u32 = 4;
+const FIRST_WAIT: Duration = if cfg!(test) { Duration::from_millis(10) } else { Duration::from_secs(1) };
+const MAX_WAIT: Duration = Duration::from_secs(30);
+
+/// Why a request of a listing failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Why {
+    /// The folder is private, deleted, or not there: a subfolder so is left out.
+    Denied,
+    /// The host was busy (a rate limit), failed, or could not be reached: the request is made
+    /// again, and a subfolder still unread then is missing from a listing that failed in part.
+    Busy,
+    /// Anything else (an answer that cannot be read, a quota used up): the listing failed, in
+    /// part for a subfolder, and trying again at once would not help.
+    Broken,
+}
+
+/// A request of a listing that failed: why, what the user is told, and how long its host asked
+/// to be left alone.
+#[derive(Debug)]
+struct Failed {
+    why: Why,
+    message: String,
+    retry_after: Option<Duration>,
+}
+
+impl Failed {
+    fn new(why: Why, message: impl Into<String>) -> Self {
+        Self { why, message: message.into(), retry_after: None }
+    }
+}
+
+/// Why an HTTP answer with the error `status` failed: a rate limit or a server error is the host
+/// being busy, a missing or forbidden folder is denied.
+fn why_status(status: u16) -> Why {
+    match status {
+        429 | 500..=599 => Why::Busy,
+        401 | 403 | 404 | 410 => Why::Denied,
+        _ => Why::Broken,
+    }
+}
+
+/// What `request` gives, made again while its host is busy or failing, [`ATTEMPTS`] times in all.
+async fn retried<T, Fut: Future<Output = Result<T, Failed>>>(mut request: impl FnMut() -> Fut) -> Result<T, Failed> {
+    let (mut attempt, mut wait) = (1, FIRST_WAIT);
+    loop {
+        match request().await {
+            Err(failed) if failed.why == Why::Busy && attempt < ATTEMPTS => {
+                tokio::time::sleep(failed.retry_after.unwrap_or(wait).min(MAX_WAIT)).await;
+                (attempt, wait) = (attempt + 1, wait.saturating_mul(2));
+            }
+            result => return result,
+        }
+    }
+}
 
 /// The Drive API: the only host the user's Google API key is sent to.
 const DRIVE_API: &str = "https://www.googleapis.com/drive/v3/";
@@ -79,8 +141,10 @@ pub fn lists(url: &Url) -> bool {
 /// downloaded as it is); `Some(Ok)` is never empty.
 ///
 /// A Google Drive folder is listed through the Drive API with the user's Google API key, else
-/// from its public page. Requests are made one at a time. Only the folder linked must be read: a
-/// subfolder that cannot be is left out. What was left out, and why, goes to `options`' notes.
+/// from its public page. Requests are made one at a time, again while the host is busy or
+/// failing (see [`retried`]). Only the folder linked must be read: a subfolder that is private
+/// or gone is left out, and one whose host kept failing makes the listing fail in part. What was
+/// left out, and why, goes to `options`' notes.
 pub async fn list(http: &reqwest::Client, url: &Url, options: &ListOptions) -> Option<Result<Vec<Task>, String>> {
     let listed = match folder_of(url)? {
         Folder::Drive { id, resource_key, maybe } => {
@@ -127,20 +191,27 @@ fn too_many(items: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// Tells the user of the subfolders of a `site` folder (path, why) that could not be read.
-fn note_unread(options: &ListOptions, site: &str, unread: &[(PathBuf, String)]) {
-    let Some((_, why)) = unread.first() else { return };
-    let mut paths: Vec<String> = unread.iter().take(3).map(|(path, _)| path.display().to_string()).collect();
-    if unread.len() > 3 {
-        paths.push("...".to_string());
+/// Tells the user of the subfolders of a `site` folder (path, why) that could not be read: left
+/// out when the site denied them (private, deleted), else missing from a listing that failed in
+/// part (see `ListNote::failed`).
+fn note_unread(options: &ListOptions, site: &str, unread: Vec<(PathBuf, Failed)>) {
+    let (denied, failed): (Vec<_>, Vec<_>) = unread.into_iter().partition(|(_, failed)| failed.why == Why::Denied);
+    let told = |unread: &[(PathBuf, Failed)]| {
+        let mut paths: Vec<String> = unread.iter().take(3).map(|(path, _)| path.display().to_string()).collect();
+        if unread.len() > 3 {
+            paths.push("...".to_string());
+        }
+        unread.first().map(|(_, why)| (unread.len(), paths.join(", "), why.message.clone()))
+    };
+    if let Some((count, paths, why)) = told(&denied) {
+        options.note(format!("{count} subfolder(s) of the {site} folder could not be read, and the files in them were left out ({paths}): {why}"));
     }
-    options.note(format!(
-        "{} subfolder(s) of the {} folder could not be read, and the files in them were left out ({}): {}",
-        unread.len(),
-        site,
-        paths.join(", "),
-        why
-    ));
+    if let Some((count, paths, why)) = told(&failed) {
+        options.fail(format!(
+            "{count} subfolder(s) of the {site} folder could not be read now, and the files in them are missing ({paths}): {why}. \
+             Add the folder again later for them."
+        ));
+    }
 }
 
 /// Whether Drive sends the `open?id=` link `url` on to the folder `id`; else it is a file's (or
@@ -348,7 +419,7 @@ async fn drive_list(
                     unread.push((path, e));
                     continue;
                 }
-                None => return Err(e),
+                None => return Err(e.message),
             },
         };
         let folder = match path {
@@ -375,7 +446,7 @@ async fn drive_list(
     if left_out > 0 {
         options.note(format!("{} items of the Google Drive folder (forms, drawings, sites, ...) are no files and were left out", left_out));
     }
-    note_unread(options, "Google Drive", &unread);
+    note_unread(options, "Google Drive", unread);
     Ok(tasks)
 }
 
@@ -387,13 +458,13 @@ impl DriveSource<'_> {
         id: &str,
         resource_key: Option<&str>,
         named: bool,
-    ) -> Result<(Option<String>, Vec<DriveChild>), String> {
+    ) -> Result<(Option<String>, Vec<DriveChild>), Failed> {
         match self {
             DriveSource::Api { base, key } => {
                 let keys = resource_key.map(|rk| format!("{}/{}", id, rk));
                 let url = |path: &str, params: &[(&str, &str)]| {
                     let params = params.iter().copied().chain([("supportsAllDrives", "true"), ("key", *key)]);
-                    Url::parse_with_params(&format!("{}{}", base, path), params).map_err(|e| e.to_string())
+                    Url::parse_with_params(&format!("{}{}", base, path), params).map_err(|e| Failed::new(Why::Broken, e.to_string()))
                 };
                 let name = if named {
                     let folder = url(&format!("files/{}", id), &[("fields", "name")])?;
@@ -409,10 +480,10 @@ impl DriveSource<'_> {
                     params.extend(page_token.as_deref().map(|token| ("pageToken", token)));
                     let page: DrivePage = drive_api_get(http, url("files", &params)?, keys.as_deref()).await?;
                     children.extend(page.files.into_iter().map(DriveChild::from));
-                    too_many(children.len())?;
+                    too_many(children.len()).map_err(|e| Failed::new(Why::Broken, e))?;
                     match page.next_page_token {
                         Some(token) if !tokens.insert(token.clone()) => {
-                            return Err("the Google Drive API gave the same page twice: the folder's listing does not end".to_string());
+                            return Err(Failed::new(Why::Broken, "the Google Drive API gave the same page twice: the folder's listing does not end"));
                         }
                         Some(token) if !token.is_empty() => page_token = Some(token),
                         _ => break,
@@ -423,7 +494,10 @@ impl DriveSource<'_> {
             DriveSource::Page { link } => {
                 let html = drive_page(http, link, id, resource_key).await?;
                 let (name, entries) = parse_embedded_view(&html).ok_or_else(|| {
-                    "the Google Drive folder page could not be read (its layout may have changed); add a Google API key to list the folder through the Drive API".to_string()
+                    Failed::new(
+                        Why::Broken,
+                        "the Google Drive folder page could not be read (its layout may have changed); add a Google API key to list the folder through the Drive API",
+                    )
                 })?;
                 Ok((Some(name), entries.into_iter().map(|(href, name)| page_child(&href, name)).collect()))
             }
@@ -431,25 +505,31 @@ impl DriveSource<'_> {
     }
 }
 
-/// The Drive API's answer at `url`, which carries the user's key: no error shows the URL.
-async fn drive_api_get<T: DeserializeOwned>(http: &reqwest::Client, url: Url, resource_keys: Option<&str>) -> Result<T, String> {
-    let mut request = http.get(url);
-    if let Some(keys) = resource_keys {
-        request = request.header("X-Goog-Drive-Resource-Keys", keys);
-    }
-    let fail = |e: reqwest::Error| format!("Cannot reach the Google Drive API: {}", e.without_url());
-    let resp = request.send().await.map_err(fail)?;
-    let status = resp.status().as_u16();
-    let body = resp.bytes().await.map_err(fail)?;
-    if !(200..300).contains(&status) {
-        return Err(drive_api_error(status, &body));
-    }
-    serde_json::from_slice(&body).map_err(|e| format!("Unexpected answer from the Google Drive API: {}", e))
+/// The Drive API's answer at `url`, which carries the user's key: no error shows the URL. Asked
+/// again while the API is busy or failing (see [`retried`]).
+async fn drive_api_get<T: DeserializeOwned>(http: &reqwest::Client, url: Url, resource_keys: Option<&str>) -> Result<T, Failed> {
+    retried(|| async {
+        let mut request = http.get(url.clone());
+        if let Some(keys) = resource_keys {
+            request = request.header("X-Goog-Drive-Resource-Keys", keys);
+        }
+        let fail = |e: reqwest::Error| Failed::new(Why::Busy, format!("Cannot reach the Google Drive API: {}", e.without_url()));
+        let resp = request.send().await.map_err(fail)?;
+        let (status, wait) = (resp.status().as_u16(), retry_after(resp.headers()));
+        let body = resp.bytes().await.map_err(fail)?;
+        if !(200..300).contains(&status) {
+            return Err(Failed { retry_after: wait, ..drive_api_error(status, &body) });
+        }
+        serde_json::from_slice(&body).map_err(|e| Failed::new(Why::Broken, format!("Unexpected answer from the Google Drive API: {}", e)))
+    })
+    .await
 }
 
-/// What the Drive API's error answer (`{"error": {"message": ...}}`) says, a folder the key
-/// cannot see in plain words.
-fn drive_api_error(status: u16, body: &[u8]) -> String {
+/// What the Drive API's error answer (`{"error": {"message": ..., "errors": [{"reason": ...}]}}`)
+/// says, a folder the key cannot see in plain words. A 403 is a rate limit, which passes, when
+/// its reason says so, as Google's guide to Drive API errors has it; a quota used up for the day
+/// is reported, never waited out.
+fn drive_api_error(status: u16, body: &[u8]) -> Failed {
     #[derive(Deserialize)]
     struct Answer {
         error: Detail,
@@ -457,33 +537,59 @@ fn drive_api_error(status: u16, body: &[u8]) -> String {
     #[derive(Deserialize)]
     struct Detail {
         message: String,
+        #[serde(default)]
+        errors: Vec<Reason>,
+    }
+    #[derive(Deserialize)]
+    struct Reason {
+        #[serde(default)]
+        reason: String,
     }
     if status == 404 {
-        return "Google Drive folder not found: it is private, deleted, or the link is wrong (a Google API key lists only folders shared as \"Anyone with the link\")".to_string();
+        return Failed::new(
+            Why::Denied,
+            "Google Drive folder not found: it is private, deleted, or the link is wrong (a Google API key lists only folders shared as \"Anyone with the link\")",
+        );
     }
-    match serde_json::from_slice::<Answer>(body) {
-        Ok(answer) => format!("Google Drive API: {} (HTTP {})", answer.error.message, status),
-        Err(_) => format!("Google Drive API answered HTTP {}", status),
-    }
+    let Ok(answer) = serde_json::from_slice::<Answer>(body) else {
+        return Failed::new(why_status(status), format!("Google Drive API answered HTTP {}", status));
+    };
+    let reasons: Vec<&str> = answer.error.errors.iter().map(|r| r.reason.as_str()).collect();
+    // A rate limit passes; a daily limit or a quota does not, and is no folder denied either.
+    let used_up = |r: &&str| {
+        let r = r.to_ascii_lowercase();
+        r.contains("limitexceeded") || r.contains("quota")
+    };
+    let why = match status {
+        403 if reasons.iter().any(|r| matches!(*r, "rateLimitExceeded" | "userRateLimitExceeded")) => Why::Busy,
+        403 if reasons.iter().any(used_up) => Why::Broken,
+        status => why_status(status),
+    };
+    Failed::new(why, format!("Google Drive API: {} (HTTP {})", answer.error.message, status))
 }
 
 /// The embedded view of the Drive folder `id` (drive.google.com/embeddedfolderview?id=), which
 /// lists a whole folder (1000 of 1000 files, checked live) where its /drive/folders/ page embeds
-/// only the first 50.
-async fn drive_page(http: &reqwest::Client, link: &Url, id: &str, resource_key: Option<&str>) -> Result<String, String> {
+/// only the first 50. Asked again while Drive is busy or failing (see [`retried`]).
+async fn drive_page(http: &reqwest::Client, link: &Url, id: &str, resource_key: Option<&str>) -> Result<String, Failed> {
     let mut url = link.clone();
     url.set_path("/embeddedfolderview");
     url.set_fragment(None);
     url.query_pairs_mut().clear().append_pair("id", id).extend_pairs(resource_key.map(|rk| ("resourcekey", rk)));
-    let fail = |e: reqwest::Error| format!("Cannot read the Google Drive folder: {}", e);
-    let resp = http.get(url).send().await.map_err(fail)?;
-    match resp.status().as_u16() {
-        401 | 403 => return Err(DRIVE_PRIVATE.to_string()),
-        _ if resp.url().host_str() == Some("accounts.google.com") => return Err(DRIVE_PRIVATE.to_string()),
-        404 => return Err("Google Drive folder not found: it was deleted, or the link is wrong".to_string()),
-        _ => {}
-    }
-    resp.error_for_status().map_err(fail)?.text().await.map_err(fail)
+    retried(|| async {
+        let fail = |e: reqwest::Error| Failed::new(Why::Busy, format!("Cannot read the Google Drive folder: {}", e));
+        let resp = http.get(url.clone()).send().await.map_err(fail)?;
+        let (status, wait) = (resp.status().as_u16(), retry_after(resp.headers()));
+        match status {
+            401 | 403 => return Err(Failed::new(Why::Denied, DRIVE_PRIVATE)),
+            _ if resp.url().host_str() == Some("accounts.google.com") => return Err(Failed::new(Why::Denied, DRIVE_PRIVATE)),
+            404 => return Err(Failed::new(Why::Denied, "Google Drive folder not found: it was deleted, or the link is wrong")),
+            _ => {}
+        }
+        let resp = resp.error_for_status().map_err(|e| Failed { why: why_status(status), retry_after: wait, ..fail(e) })?;
+        resp.text().await.map_err(fail)
+    })
+    .await
 }
 
 const DRIVE_PRIVATE: &str =
@@ -570,31 +676,40 @@ struct MfFolder {
     name: String,
 }
 
-/// MediaFire's answer in `body`, or what its error says (an unknown folder is answered 404).
-fn mediafire_answer(status: u16, body: &[u8]) -> Result<MfResponse, String> {
+/// MediaFire's answer in `body`, or what its error says (an unknown folder is answered 404): a
+/// rate limit or a server error is MediaFire being busy, an error it answers otherwise a folder
+/// it denies (private or deleted).
+fn mediafire_answer(status: u16, body: &[u8]) -> Result<MfResponse, Failed> {
+    let busy = matches!(why_status(status), Why::Busy);
     let Ok(MfAnswer { response }) = serde_json::from_slice::<MfAnswer>(body) else {
-        return Err(format!("MediaFire answered HTTP {} instead of listing the folder", status));
+        let why = if busy { Why::Busy } else { Why::Broken };
+        return Err(Failed::new(why, format!("MediaFire answered HTTP {} instead of listing the folder", status)));
     };
     if response.result != "Success" {
         let message = response.message.unwrap_or_else(|| format!("HTTP {}", status));
-        return Err(format!("MediaFire cannot list the folder: {} (it may be private or deleted)", message));
+        let why = if busy { Why::Busy } else { Why::Denied };
+        return Err(Failed::new(why, format!("MediaFire cannot list the folder: {} (it may be private or deleted)", message)));
     }
     Ok(response)
 }
 
-/// Calls `method` of MediaFire's folder API at `api`.
-async fn mediafire_get(http: &reqwest::Client, api: &str, method: &str, params: &[(&str, &str)]) -> Result<MfResponse, String> {
+/// Calls `method` of MediaFire's folder API at `api`, again while it is busy or failing (see
+/// [`retried`]).
+async fn mediafire_get(http: &reqwest::Client, api: &str, method: &str, params: &[(&str, &str)]) -> Result<MfResponse, Failed> {
     let params = params.iter().copied().chain([("response_format", "json")]);
-    let url = Url::parse_with_params(&format!("{}{}", api, method), params).map_err(|e| e.to_string())?;
-    let fail = |e: reqwest::Error| format!("Cannot reach MediaFire: {}", e);
-    let resp = http.get(url).send().await.map_err(fail)?;
-    let status = resp.status().as_u16();
-    mediafire_answer(status, &resp.bytes().await.map_err(fail)?)
+    let url = Url::parse_with_params(&format!("{}{}", api, method), params).map_err(|e| Failed::new(Why::Broken, e.to_string()))?;
+    retried(|| async {
+        let fail = |e: reqwest::Error| Failed::new(Why::Busy, format!("Cannot reach MediaFire: {}", e));
+        let resp = http.get(url.clone()).send().await.map_err(fail)?;
+        let (status, wait) = (resp.status().as_u16(), retry_after(resp.headers()));
+        mediafire_answer(status, &resp.bytes().await.map_err(fail)?).map_err(|failed| Failed { retry_after: wait, ..failed })
+    })
+    .await
 }
 
 /// Every file (`content_type` "files") or subfolder ("folders") of the MediaFire folder `key`,
 /// a chunk at a time.
-async fn mediafire_content(http: &reqwest::Client, api: &str, key: &str, content_type: &str) -> Result<MfContent, String> {
+async fn mediafire_content(http: &reqwest::Client, api: &str, key: &str, content_type: &str) -> Result<MfContent, Failed> {
     let mut all = MfContent::default();
     for chunk in 1u32.. {
         let chunk = chunk.to_string();
@@ -602,16 +717,16 @@ async fn mediafire_content(http: &reqwest::Client, api: &str, key: &str, content
         let content = mediafire_get(http, api, "get_content.php", &params).await?.folder_content.unwrap_or_default();
         // One that ignored `chunk` would answer chunk 1 for ever.
         if !content.chunk_number.is_empty() && content.chunk_number != chunk {
-            return Err(format!(
-                "MediaFire answered chunk {} when asked for chunk {}: the folder's listing does not end",
-                content.chunk_number, chunk
+            return Err(Failed::new(
+                Why::Broken,
+                format!("MediaFire answered chunk {} when asked for chunk {}: the folder's listing does not end", content.chunk_number, chunk),
             ));
         }
         // A chunk with nothing in it ends the listing whatever it says.
         let more = content.more_chunks == "yes" && !(content.files.is_empty() && content.folders.is_empty());
         all.files.extend(content.files);
         all.folders.extend(content.folders);
-        too_many(all.files.len() + all.folders.len())?;
+        too_many(all.files.len() + all.folders.len()).map_err(|e| Failed::new(Why::Broken, e))?;
         if !more {
             break;
         }
@@ -634,7 +749,7 @@ async fn mediafire_list(
         Ok(info) => info.folder_info.map(|f| f.name).unwrap_or_default(),
         // A file's link: the engine downloads it.
         Err(_) if maybe => return None,
-        Err(e) => return Some(Err(e)),
+        Err(e) => return Some(Err(e.message)),
     };
     Some(mediafire_files(http, scheme, &api, key, &root, options).await)
 }
@@ -657,7 +772,7 @@ async fn mediafire_files(
         }
         let content = async {
             let files = mediafire_content(http, api, &key, "files").await?.files;
-            Ok::<_, String>((files, mediafire_content(http, api, &key, "folders").await?.folders))
+            Ok::<_, Failed>((files, mediafire_content(http, api, &key, "folders").await?.folders))
         };
         let (files, folders) = match content.await {
             Ok(content) => content,
@@ -665,7 +780,7 @@ async fn mediafire_files(
                 unread.push((folder, e));
                 continue;
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.message),
         };
         read += files.len() + folders.len();
         too_many(read)?;
@@ -697,7 +812,7 @@ async fn mediafire_files(
     if locked > 0 {
         options.note(format!("{} files of the MediaFire folder are protected by a password and were left out", locked));
     }
-    note_unread(options, "MediaFire", &unread);
+    note_unread(options, "MediaFire", unread);
     Ok(tasks)
 }
 
@@ -842,17 +957,64 @@ mod tests {
         assert_eq!(with_extension("Deck", "pptx"), "Deck.pptx");
     }
 
-    /// Drive API errors as the API answered them (a bad key, no key); a folder it cannot see is
-    /// answered 404.
+    /// Drive API errors as the API answered them (a bad key, no key, a rate limit and a daily
+    /// limit as Google documents them); a folder it cannot see is answered 404.
     #[test]
     fn drive_api_errors_say_what_is_wrong() {
+        let error = |status, body: &[u8]| {
+            let failed = drive_api_error(status, body);
+            (failed.why, failed.message)
+        };
         let bad_key = br#"{"error": {"code": 400, "message": "API key not valid. Please pass a valid API key.", "errors": [{"message": "API key not valid. Please pass a valid API key.", "domain": "global", "reason": "badRequest"}], "status": "INVALID_ARGUMENT"}}"#;
-        assert_eq!(drive_api_error(400, bad_key), "Google Drive API: API key not valid. Please pass a valid API key. (HTTP 400)");
+        assert_eq!(error(400, bad_key), (Why::Broken, "Google Drive API: API key not valid. Please pass a valid API key. (HTTP 400)".into()));
         let no_key = br#"{"error": {"code": 403, "message": "Method doesn't allow unregistered callers (callers without established identity). Please use API Key or other form of API consumer identity to call this API.", "status": "PERMISSION_DENIED"}}"#;
-        assert!(drive_api_error(403, no_key).starts_with("Google Drive API: Method doesn't allow unregistered callers"));
+        let (why, message) = error(403, no_key);
+        assert!(why == Why::Denied && message.starts_with("Google Drive API: Method doesn't allow unregistered callers"), "{message}");
         let missing = br#"{"error": {"code": 404, "message": "File not found: 1aB.", "errors": [{"reason": "notFound"}]}}"#;
-        assert!(drive_api_error(404, missing).starts_with("Google Drive folder not found: it is private, deleted"));
-        assert_eq!(drive_api_error(502, b"<html>Bad Gateway</html>"), "Google Drive API answered HTTP 502");
+        let (why, message) = error(404, missing);
+        assert!(why == Why::Denied && message.starts_with("Google Drive folder not found: it is private, deleted"), "{message}");
+        assert_eq!(error(502, b"<html>Bad Gateway</html>"), (Why::Busy, "Google Drive API answered HTTP 502".into()));
+        let rate = br#"{"error": {"errors": [{"domain": "usageLimits", "reason": "userRateLimitExceeded", "message": "User Rate Limit Exceeded"}], "code": 403, "message": "User Rate Limit Exceeded"}}"#;
+        assert_eq!(error(403, rate), (Why::Busy, "Google Drive API: User Rate Limit Exceeded (HTTP 403)".into()));
+        let daily = br#"{"error": {"errors": [{"domain": "usageLimits", "reason": "dailyLimitExceeded", "message": "Daily Limit Exceeded"}], "code": 403, "message": "Daily Limit Exceeded"}}"#;
+        assert_eq!(error(403, daily).0, Why::Broken, "a daily limit is not waited out");
+        let quota = br#"{"error": {"errors": [{"reason": "downloadQuotaExceeded"}], "code": 403, "message": "The download quota for this file has been exceeded."}}"#;
+        assert_eq!(error(403, quota).0, Why::Broken, "a quota is reported, not waited out");
+        assert_eq!(error(429, b"").0, Why::Busy);
+    }
+
+    /// What `retried` gives when each request is answered by the next of `answers` (why it failed,
+    /// and the seconds its host asked to wait; the last again once they run out): the result, how
+    /// many requests it made, and how long it waited.
+    async fn retry(answers: &[(Option<Why>, Option<u64>)]) -> (Result<usize, Why>, usize, Duration) {
+        let started = tokio::time::Instant::now();
+        let mut asked = 0;
+        let result = retried(|| {
+            asked += 1;
+            let (why, secs) = answers[(asked - 1).min(answers.len() - 1)];
+            let n = asked;
+            async move {
+                match why {
+                    Some(why) => Err(Failed { retry_after: secs.map(Duration::from_secs), ..Failed::new(why, "failed") }),
+                    None => Ok(n),
+                }
+            }
+        })
+        .await;
+        (result.map_err(|failed| failed.why), asked, started.elapsed())
+    }
+
+    /// A busy host is asked again, a few times in all, with a wait that doubles or as long as it
+    /// asks (never over MAX_WAIT); a folder denied or an answer that cannot be read is asked once.
+    #[tokio::test(start_paused = true)]
+    async fn a_busy_host_is_asked_again_a_few_times() {
+        let busy = (Some(Why::Busy), None);
+        assert_eq!(retry(&[busy, busy, (None, None)]).await, (Ok(3), 3, FIRST_WAIT * 3));
+        assert_eq!(retry(&[busy]).await, (Err(Why::Busy), ATTEMPTS as usize, FIRST_WAIT * 7));
+        let asked = [(Some(Why::Busy), Some(3)), (Some(Why::Busy), Some(3600)), (None, None)];
+        assert_eq!(retry(&asked).await, (Ok(3), 3, Duration::from_secs(3) + MAX_WAIT));
+        assert_eq!(retry(&[(Some(Why::Denied), None)]).await, (Err(Why::Denied), 1, Duration::ZERO));
+        assert_eq!(retry(&[busy, (Some(Why::Broken), None)]).await, (Err(Why::Broken), 2, FIRST_WAIT));
     }
 
     /// The target of each request, with the resource keys it sent.
@@ -956,10 +1118,12 @@ mod tests {
         assert_eq!(seen.len(), 5, "the name, two pages, the two subfolders, and Pack: 1 once: {seen:?}");
         assert_eq!(seen[3].1.as_deref(), Some("sub1/0-rk"));
         assert!(seen.iter().enumerate().all(|(i, (_, keys))| i == 3 || keys.is_none()), "{seen:?}");
-        let noted: Vec<String> = noted.try_iter().collect();
+        let noted: Vec<crate::ingest::ListNote> = noted.try_iter().collect();
         let [note] = &noted[..] else { panic!("one note: {noted:?}") };
         let locked = top.join("Locked").display().to_string();
-        assert!(note.starts_with(&format!("1 subfolder(s) of the Google Drive folder could not be read, and the files in them were left out ({locked}): Google Drive folder not found")), "{note}");
+        let text = &note.text;
+        assert!(text.starts_with(&format!("1 subfolder(s) of the Google Drive folder could not be read, and the files in them were left out ({locked}): Google Drive folder not found")), "{text}");
+        assert!(!note.failed, "a folder the key cannot see is left out, as its owner chose");
 
         let missing = drive_list(&http, &source, "gone".into(), None, &options).await.unwrap_err();
         assert!(missing.starts_with("Google Drive folder not found"), "{missing}");
@@ -995,10 +1159,15 @@ mod tests {
         let content = mediafire_answer(200, folders).unwrap().folder_content.unwrap();
         assert_eq!(content.folders.iter().map(|f| (f.folderkey.as_str(), f.name.as_str())).collect::<Vec<_>>(), [("34gxd4kmqz5nn", "InnerFolder")]);
         let unknown = br#"{"response":{"action":"folder\/get_content","message":"Unknown or invalid FolderKey","error":112,"result":"Error","current_api_version":"1.5"}}"#;
+        let error = |status, body: &[u8]| {
+            let failed = mediafire_answer(status, body).unwrap_err();
+            (failed.why, failed.message)
+        };
         assert_eq!(
-            mediafire_answer(404, unknown).unwrap_err(),
-            "MediaFire cannot list the folder: Unknown or invalid FolderKey (it may be private or deleted)"
+            error(404, unknown),
+            (Why::Denied, "MediaFire cannot list the folder: Unknown or invalid FolderKey (it may be private or deleted)".into())
         );
-        assert_eq!(mediafire_answer(503, b"<html>busy</html>").unwrap_err(), "MediaFire answered HTTP 503 instead of listing the folder");
+        assert_eq!(error(503, b"<html>busy</html>"), (Why::Busy, "MediaFire answered HTTP 503 instead of listing the folder".into()));
+        assert_eq!(error(200, b"<html>maintenance</html>").0, Why::Broken);
     }
 }

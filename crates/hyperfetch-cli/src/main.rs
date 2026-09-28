@@ -192,9 +192,25 @@ fn list_options(args: &Args) -> ListOptions {
         only_new: !args.all_items,
         cookies,
         proxy: args.proxy.clone(),
-        // Logged: warnings reach stderr.
+        // Each input's own (see `listed`).
         notes: None,
     }
+}
+
+/// What `tokens` list, and what of it could not be read (see `ListNote::failed`); the other
+/// notes of the listing are logged: warnings reach stderr.
+async fn listed(tokens: &[String], http: &reqwest::Client, list: &ListOptions) -> (Result<Vec<Task>, String>, Vec<String>) {
+    let (notes, noted) = std::sync::mpsc::channel();
+    let result = ingest(tokens, http, &ListOptions { notes: Some(notes), ..list.clone() }).await;
+    let mut missing = Vec::new();
+    for note in noted.try_iter() {
+        if note.failed {
+            missing.push(note.text);
+        } else {
+            tracing::warn!("{}", note.text);
+        }
+    }
+    (result, missing)
 }
 
 /// The engine settings every download of this run shares, with `connections` per download.
@@ -237,9 +253,9 @@ async fn read_input(path: &Path) -> Result<String, String> {
 }
 
 /// The downloads `inputs` list, each with the input-file line it came from (None for the
-/// command-line URLs), and how many inputs could not be read into downloads (those are reported).
-/// A playlist or channel with nothing new is said so, but has not failed: it is the idle state
-/// of a sync.
+/// command-line URLs), and how many inputs could not be read into downloads, or only in part
+/// (those are reported; what was read of the latter is downloaded). A playlist or channel with
+/// nothing new is said so, but has not failed: it is the idle state of a sync.
 async fn read_tasks(
     inputs: &[(Option<usize>, Vec<String>)],
     ui: &Ui,
@@ -249,18 +265,20 @@ async fn read_tasks(
     let mut tasks = Vec::new();
     let mut failed = 0;
     for (line, tokens) in inputs {
-        match ingest(tokens, http, list).await {
-            Ok(found) if found.is_empty() => {
+        let (result, mut missing) = listed(tokens, http, list).await;
+        match result {
+            Ok(found) if found.is_empty() && missing.is_empty() => {
                 if !ui.quiet() {
                     ui.error(&nothing_new(&tokens.join(" ")));
                 }
             }
             Ok(found) => tasks.extend(found.into_iter().map(|task| (*line, task))),
-            Err(e) => {
-                ui.error(&format!("[FAILED] {}: {}", truncate(&tokens.join(" "), 60), e));
-                failed += 1;
-            }
+            Err(e) => missing.push(e),
         }
+        for e in &missing {
+            ui.error(&format!("[FAILED] {}: {}", truncate(&tokens.join(" "), 60), e));
+        }
+        failed += usize::from(!missing.is_empty());
     }
     (tasks, failed)
 }
@@ -390,10 +408,18 @@ where
             break;
         }
         let tokens = input_tokens(&input).await;
-        let tasks = match ingest(&tokens, http, &list_options(args)).await {
+        let (result, missing) = listed(&tokens, http, &list_options(args)).await;
+        // A folder read in part: what was read is downloaded, and the run has failed.
+        for e in &missing {
+            stderr_line(&format!("[ERROR] {}", e));
+        }
+        failed += usize::from(!missing.is_empty());
+        let tasks = match result {
             // A playlist, channel, feed or folder with nothing new: nothing to save anywhere.
             Ok(tasks) if tasks.is_empty() => {
-                stdout_line(&nothing_new(&input));
+                if missing.is_empty() {
+                    stdout_line(&nothing_new(&input));
+                }
                 continue;
             }
             Ok(tasks) => tasks,
@@ -936,12 +962,15 @@ mod tests {
         assert_eq!(code, EXIT_OK);
     }
 
-    /// Answers every request with the RSS feed `body`.
-    async fn serve_feed(body: &'static str) -> String {
+    /// A local server (or proxy) at the address returned, answering the head of each request
+    /// with the whole response `answer` makes of it.
+    async fn serve_answers(answer: impl Fn(&str) -> String + Send + Sync + 'static) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let answer = Arc::new(answer);
         tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
+                let answer = Arc::clone(&answer);
                 tokio::spawn(async move {
                     let (mut head, mut buf) = (Vec::new(), [0u8; 1024]);
                     while !head.windows(4).any(|w| w == b"\r\n\r\n") {
@@ -950,15 +979,49 @@ mod tests {
                             Ok(n) => head.extend_from_slice(&buf[..n]),
                         }
                     }
-                    let head = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/rss+xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        body.len()
-                    );
-                    let _ = socket.write_all(format!("{head}{body}").as_bytes()).await;
+                    let _ = socket.write_all(answer(&String::from_utf8_lossy(&head)).as_bytes()).await;
                 });
             }
         });
         format!("http://{}", addr)
+    }
+
+    /// A response with `status` and a `kind` of `body`.
+    fn response(status: &str, kind: &str, body: &str) -> String {
+        format!("HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+    }
+
+    /// Answers every request with the RSS feed `body`.
+    async fn serve_feed(body: &'static str) -> String {
+        serve_answers(move |_| response("200 OK", "application/rss+xml", body)).await
+    }
+
+    /// A folder with a subfolder its host kept failing on is downloaded as far as it was read,
+    /// and the input has failed (the run's exit code says so).
+    #[tokio::test]
+    async fn a_folder_read_in_part_has_failed() {
+        // MediaFire's folder API, which answers the folder's name, files and subfolders alike
+        // here, and is busy for the subfolder each time it is asked (Retry-After: 0 for the test).
+        let json = r#"{"response":{"result":"Success","folder_info":{"name":"Pack"},"folder_content":{
+            "files":[{"quickkey":"openfile000001","filename":"a.bin","password_protected":"no"}],
+            "folders":[{"folderkey":"subfolder0001","name":"Sub"}],"more_chunks":"no"}}}"#;
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = Arc::clone(&asked);
+        let proxy = serve_answers(move |head| {
+            if head.contains("folder_key=subfolder0001") {
+                count.fetch_add(1, Ordering::SeqCst);
+                response("503 Service Unavailable\r\nRetry-After: 0", "text/html", "busy")
+            } else {
+                response("200 OK", "application/json", json)
+            }
+        })
+        .await;
+        let http = reqwest::Client::builder().proxy(reqwest::Proxy::all(&proxy).unwrap()).build().unwrap();
+        let inputs = [(None, vec!["http://www.mediafire.com/folder/pack00000001".to_string()])];
+        let (tasks, failed) = read_tasks(&inputs, &Ui::new(true), &http, &ListOptions::default()).await;
+        assert_eq!(tasks.iter().map(|(_, task)| task.label()).collect::<Vec<_>>(), ["a.bin"]);
+        assert_eq!(failed, 1, "the files of the subfolder are missing");
+        assert!(asked.load(Ordering::SeqCst) > 1, "a busy host is asked again");
     }
 
     /// A link that lists nothing new is said so, and the next link is asked for, not where to

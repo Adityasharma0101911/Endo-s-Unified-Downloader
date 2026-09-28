@@ -1266,7 +1266,8 @@ fn read_listing(settings: &Settings, input: String) -> impl Future<Output = (Res
             ingest::ingest(&tokens, &http, &list).await
         };
         let result = read.await;
-        (result, noted.try_iter().collect())
+        // What was left out and what could not be read alike: the notice shows them as errors.
+        (result, noted.try_iter().map(|note| note.text).collect())
     }
 }
 
