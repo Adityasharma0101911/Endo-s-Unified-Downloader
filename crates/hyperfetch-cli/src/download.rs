@@ -155,17 +155,9 @@ impl Ui {
         *self.held.lock().unwrap_or_else(PoisonError::into_inner) = Some(Vec::new());
         let _ = self.multi.clear();
         self.multi.set_draw_target(ProgressDrawTarget::hidden());
-        let answer = question.await;
-        // Written with the lock held, so that nothing printed now goes ahead of it.
-        let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
-        for (stderr, bytes) in held.take().unwrap_or_default() {
-            let _ = write_to(stderr, &bytes);
-        }
-        drop(held);
-        if !self.quiet {
-            self.multi.set_draw_target(ProgressDrawTarget::stderr());
-        }
-        answer
+        // Also when the question is dropped unanswered: the run can end first.
+        let _answered = Answered(self);
+        question.await
     }
 
     /// A writer for log output that keeps the progress bars intact.
@@ -189,6 +181,25 @@ impl Ui {
         };
         bar.enable_steady_tick(Duration::from_millis(120));
         bar
+    }
+}
+
+/// Once a question is answered (see [`Ui::hiding_bars`]), writes what was held back and shows the
+/// progress bars again.
+struct Answered<'a>(&'a Ui);
+
+impl Drop for Answered<'_> {
+    fn drop(&mut self) {
+        let ui = self.0;
+        // Written with the lock held, so that nothing printed now goes ahead of it.
+        let mut held = ui.held.lock().unwrap_or_else(PoisonError::into_inner);
+        for (stderr, bytes) in held.take().unwrap_or_default() {
+            let _ = write_to(stderr, &bytes);
+        }
+        drop(held);
+        if !ui.quiet {
+            ui.multi.set_draw_target(ProgressDrawTarget::stderr());
+        }
     }
 }
 
@@ -805,7 +816,8 @@ mod tests {
 
     /// What the downloads print while a question waits for its answer (a finished file, a log
     /// line) is held back, so that it neither lands in the question's line nor scrolls it away,
-    /// and written in its order once the question is answered.
+    /// and written in its order once the question is answered, or dropped unanswered as the run
+    /// ends.
     #[tokio::test]
     async fn output_waits_for_the_answer_to_a_question() {
         let ui = Ui::new(true);
@@ -821,6 +833,12 @@ mod tests {
         let line = |stderr: bool, text: &str| (stderr, text.as_bytes().to_vec());
         assert_eq!(during, Some(vec![line(false, "[OK] a.iso\n"), line(true, "WARN a log line\n"), line(true, "[FAILED] b.iso: gone\n")]));
         assert_eq!(held(), None, "written once answered");
+        let unanswered = ui.hiding_bars(async {
+            ui.print("[OK] c.iso");
+            std::future::pending::<()>().await
+        });
+        assert!(tokio::time::timeout(Duration::from_millis(10), unanswered).await.is_err());
+        assert_eq!(held(), None, "written once the question is dropped");
     }
 
     #[test]
