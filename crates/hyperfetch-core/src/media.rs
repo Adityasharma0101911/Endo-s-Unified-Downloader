@@ -2902,8 +2902,10 @@ impl Tags {
 /// (`info`), from the fields it takes them from (its `FFmpegMetadataPP`): the title (a track's
 /// own, else the video's), upload date, description, page URL, artist (the uploader, unless the
 /// site names an artist) and what a site knows of albums, shows and genres, under the names ffmpeg
-/// maps to each container's own tags. yt-dlp has filled in each chapter's times already.
-fn tags_of(info: &Value) -> Tags {
+/// maps to each container's own tags. yt-dlp has filled in each chapter's times already, but for
+/// the end of the last one when it knew no duration: that one ends where the file does (`plays`,
+/// see [`playing_time`]), as yt-dlp ends it when it embeds the chapters.
+fn tags_of(info: &Value, plays: Option<f64>) -> Tags {
     // yt-dlp's first field that is set, even when empty; lists are joined.
     let field = |keys: &[&str]| -> Option<String> {
         let value = keys.iter().find_map(|key| info.get(*key).filter(|v| !v.is_null()))?;
@@ -2950,9 +2952,10 @@ fn tags_of(info: &Value) -> Tags {
     };
     let listed = info.get("chapters").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
     let mut chapters = String::from(";FFMETADATA1\n");
-    for chapter in listed {
+    for (i, chapter) in listed.iter().enumerate() {
         let time = |key| chapter.get(key).and_then(Value::as_f64);
-        let (Some(start), Some(end)) = (time("start_time"), time("end_time")) else { continue };
+        let end = if i + 1 == listed.len() && last_chapter_open(info) { plays } else { time("end_time") };
+        let (Some(start), Some(end)) = (time("start_time"), end) else { continue };
         // ffmpeg refuses the whole file for a chapter that ends before it starts.
         if start < 0.0 || end < start {
             continue;
@@ -2963,6 +2966,32 @@ fn tags_of(info: &Value) -> Tags {
         }
     }
     Tags { metadata, chapters: chapters.contains("[CHAPTER]").then_some(chapters) }
+}
+
+/// Whether the last of the chapters yt-dlp found (`info`) has no end: it knew no duration to end
+/// it with.
+fn last_chapter_open(info: &Value) -> bool {
+    let last = info.get("chapters").and_then(Value::as_array).and_then(|chapters| chapters.last());
+    last.is_some_and(|chapter| chapter.get("end_time").and_then(Value::as_f64).is_none_or(|end| end == 0.0))
+}
+
+/// How long the longest of `files` plays, as ffmpeg reads it ("Duration: 00:11:22.33"): where a
+/// video yt-dlp knew no duration of ends.
+async fn playing_time(ffmpeg: &Path, files: &[PathBuf]) -> Option<f64> {
+    let mut longest: Option<f64> = None;
+    for file in files {
+        let mut cmd = tree_command(ffmpeg);
+        cmd.args([OsString::from("-hide_banner"), OsString::from("-nostdin"), OsString::from("-i"), file_arg(file)]);
+        // Given no output, ffmpeg describes its input, then fails.
+        let Ok(described) = cmd.output().await else { continue };
+        let described = String::from_utf8_lossy(&described.stderr);
+        let clock = described.split_once("Duration: ").and_then(|(_, rest)| rest.split(',').next());
+        let secs = clock.and_then(|clock| clock.trim().split(':').try_fold(0.0, |secs, part| Some(secs * 60.0 + part.parse::<f64>().ok()?)));
+        if let Some(secs) = secs.filter(|secs| secs.is_finite() && *secs > 0.0) {
+            longest = Some(longest.map_or(secs, |longest| longest.max(secs)));
+        }
+    }
+    longest
 }
 
 /// Where ffmpeg reads the chapters it writes into `output` from, next to it.
@@ -3131,7 +3160,11 @@ async fn fast_download(
         });
     }
     let files = fetch_streams(streams, sizes, fetch, progress_tx, cancel_flag).await.map_err(FastError::Failed)?;
-    let tags = if options.embed_metadata { tags_of(info) } else { Tags::default() };
+    let tags = match ffmpeg.filter(|_| options.embed_metadata) {
+        Some(ffmpeg) if last_chapter_open(info) => tags_of(info, playing_time(ffmpeg, &files).await),
+        Some(_) => tags_of(info, None),
+        None => Tags::default(),
+    };
     let made = joined(&plan, &files, ffmpeg, &tags, cancel_flag).await;
     // Cancelled while ffmpeg ran: the next attempt has every stream at hand.
     if made.is_err() && is_cancelled(cancel_flag) {
@@ -5957,7 +5990,7 @@ mod tests {
 
     #[test]
     fn a_videos_tags_are_the_ones_yt_dlp_embeds() {
-        let tags = tags_of(&chaptered_info());
+        let tags = tags_of(&chaptered_info(), None);
         let description = chaptered_info()["description"].as_str().unwrap().to_string();
         let url = "https://www.youtube.com/watch?v=wSSmNUl9Snw".to_string();
         assert_eq!(
@@ -5990,7 +6023,7 @@ mod tests {
                 {"start_time": 20, "end_time": 30.5},
             ],
         });
-        let tags = tags_of(&track);
+        let tags = tags_of(&track, None);
         let expected = [
             ("title", "Song"),
             ("track", "7"),
@@ -6008,7 +6041,7 @@ mod tests {
                  [CHAPTER]\nTIMEBASE=1/1000\nSTART=20000\nEND=30500\n"
             )
         );
-        assert!(tags_of(&serde_json::json!({"id": "x"})).is_empty());
+        assert!(tags_of(&serde_json::json!({"id": "x"}), None).is_empty());
     }
 
     /// What ffmpeg reads of `file`: its streams, tags and chapters.
@@ -6033,7 +6066,7 @@ mod tests {
         let mut info = chaptered_info();
         info["duration"] = 2.into();
         info["chapters"] = serde_json::json!([{"start_time": 0, "end_time": 1, "title": "One = one"}, {"start_time": 1, "end_time": 2, "title": "Two"}]);
-        let tags = tags_of(&info);
+        let tags = tags_of(&info, None);
 
         // Joined from its streams.
         let mut plan = plan_fast(&mp4_merge_info(&out), true).unwrap();
@@ -6058,6 +6091,34 @@ mod tests {
         let path = joined(&plan, &files[..1], Some(&dir.path().join("no-ffmpeg-here")), &tags, &None).await.unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
         assert_eq!(names_in(&out), ["clip.mp4"]);
+    }
+
+    /// yt-dlp leaves the last chapter without an end when it knows no duration; it then ends where
+    /// the file does, as yt-dlp's `--embed-chapters` ends it, and is left out only when that is
+    /// not known either.
+    #[tokio::test]
+    async fn a_last_chapter_without_an_end_ends_with_the_file() {
+        let info = serde_json::json!({
+            "id": "x", "duration": null,
+            "chapters": [{"start_time": 0, "end_time": 1, "title": "One"}, {"start_time": 1, "end_time": null, "title": "Two"}],
+        });
+        assert!(last_chapter_open(&info) && !last_chapter_open(&chaptered_info()));
+        let one = "[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=1000\ntitle=One\n";
+        let two = "[CHAPTER]\nTIMEBASE=1/1000\nSTART=1000\nEND=2500\ntitle=Two\n";
+        assert_eq!(tags_of(&info, Some(2.5)).chapters, Some(format!(";FFMETADATA1\n{one}{two}")));
+        assert_eq!(tags_of(&info, None).chapters, Some(format!(";FFMETADATA1\n{one}")));
+
+        let Some(ffmpeg) = find_ffmpeg_path() else {
+            eprintln!("skipped: ffmpeg not found");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (video, audio) = (dir.path().join("v.mp4"), dir.path().join("a.m4a"));
+        lavfi(&ffmpeg, "testsrc=duration=2:size=64x48:rate=5", &[], &video);
+        lavfi(&ffmpeg, "sine=duration=3", &[], &audio);
+        let plays = playing_time(&ffmpeg, &[video, audio]).await.expect("a duration");
+        assert!((2.9..3.2).contains(&plays), "{plays}");
+        assert_eq!(playing_time(&ffmpeg, &[dir.path().join("missing.mp4")]).await, None);
     }
 
     /// yt-dlp's `-J` for a video of one plain file the engine downloads itself, with nothing to join.
