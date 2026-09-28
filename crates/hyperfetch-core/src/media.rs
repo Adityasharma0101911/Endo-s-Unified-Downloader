@@ -274,10 +274,13 @@ pub fn is_supported_media_site(url: &Url) -> bool {
     let host = url.host_str().unwrap_or("").trim_end_matches('.').to_ascii_lowercase();
     // Bare redd.it is Reddit's post shortener. Only its v. subdomain serves video:
     // i.redd.it / preview.redd.it are plain image files the regular engine handles.
+    // feeds.soundcloud.com serves podcast feeds and their episodes' plain MP3 files
+    // (/stream/<id>-<name>.mp3), which yt-dlp has no extractor for.
     host == "redd.it"
-        || MEDIA_DOMAINS.iter().any(|domain| {
-            host == *domain || host.strip_suffix(domain).is_some_and(|sub| sub.ends_with('.'))
-        })
+        || (host != "feeds.soundcloud.com"
+            && MEDIA_DOMAINS.iter().any(|domain| {
+                host == *domain || host.strip_suffix(domain).is_some_and(|sub| sub.ends_with('.'))
+            }))
 }
 
 /// How the entries of a list are ordered, which tells its newest ones.
@@ -5339,6 +5342,8 @@ bbd8671c6c05eaa3ec29d690695aebadff0871faa3efe9051581afbf3c01e80e  ffmpeg-master-
             "https://v.redd.it/abc123",
             "https://dai.ly/x8abc",
             "https://m.youtube.com./watch?v=1",
+            "https://soundcloud.com/forss/flickermood",
+            "https://m.soundcloud.com/forss",
         ];
         for u in yes {
             assert!(is_supported_media_site(&Url::parse(u).unwrap()), "{u}");
@@ -5349,6 +5354,8 @@ bbd8671c6c05eaa3ec29d690695aebadff0871faa3efe9051581afbf3c01e80e  ffmpeg-master-
             "https://i.redd.it/picture.jpg",
             "https://box.com/file",
             "https://ly/",
+            "https://feeds.soundcloud.com/stream/305850704-user-605289591-episode-1.mp3",
+            "https://feeds.soundcloud.com/users/soundcloud:users:123/sounds.rss",
         ];
         for u in no {
             assert!(!is_supported_media_site(&Url::parse(u).unwrap()), "{u}");
