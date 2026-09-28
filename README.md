@@ -210,7 +210,7 @@ Set `ENDO_HISTORY_PATH` to use a different file.
 `--subs LANGS` (GUI: Advanced Options > Subtitles) saves a video's subtitles next to it, as `name.LANG.srt`. Give languages as `en,es`, or `all`.
 - The site's SRT is taken where it has one, else its WebVTT, else its best format, converted to SRT when ffmpeg is present. Without ffmpeg they stay as the site has them (`.srt`, `.vtt` or the site's own format), and so does one that fails to convert, with a warning in the log. A failed conversion never fails the video.
 - A site's own subtitles come first. Its automatic captions are used for a language it has no subtitles of its own in. `all` gets every language the site has its own subtitles in, without the automatic translations and YouTube's live chat.
-- A language the video has no subtitles in is skipped, not an error. A subtitle that YouTube sends empty without a proof-of-origin (PO) token is skipped with a warning in the log and not retried. No PO-token plugins are used.
+- A language the video has no subtitles in is skipped, not an error, with a warning in the log; so are subtitles that came empty. YouTube subtitles that need a proof-of-origin (PO) token are left out, with yt-dlp's warning in the log, and not retried. No PO-token plugins are used.
 - When the engine downloads the streams itself, yt-dlp then writes only the subtitles, from the same extraction.
 
 Tags are embedded by default, when ffmpeg is present. The file gets the title, artist, date, description, link, genre, album and show or episode details, and the video's chapters. Audio presets (`mp3`, `m4a`) also get the thumbnail as cover art. Without ffmpeg the download goes on without tags. `--no-embed-metadata` (GUI: clear "Embed tags and chapters") leaves tags out.
