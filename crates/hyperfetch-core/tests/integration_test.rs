@@ -4016,3 +4016,88 @@ async fn test_a_feed_episode_history_let_go_is_still_not_new() {
     let all = ListOptions { only_new: false, ..ListOptions::default() };
     assert_eq!(ingest(&[feed.as_str()], &http, &all).await.unwrap().len(), 1);
 }
+
+/// A MediaFire folder "Synced" of two files, and a Google Drive folder page "Synced Drive" of a
+/// file and a document; everything else as [`mediafire`] answers it (the files' pages and
+/// downloads).
+fn synced_folders(method: &str, target: &str) -> Vec<u8> {
+    use sha2::Digest;
+    let url = Url::parse(target).unwrap();
+    let param = |name: &str| url.query_pairs().find(|(k, _)| k == name).map(|(_, v)| v.into_owned()).unwrap_or_default();
+    let json = |body: String| response(method, "200 OK", "Content-Type: application/json\r\n", body.as_bytes());
+    let file = |quickkey: &str, name: &str| {
+        let hash = to_hex(&sha2::Sha256::digest(mediafire_file(quickkey)));
+        format!(r#"{{"quickkey":"{quickkey}","filename":"{name}","hash":"{hash}","password_protected":"no"}}"#)
+    };
+    let entry = |href: &str, name: &str| {
+        format!(r#"<div class="flip-entry" id="entry-x" tabindex="0" role="link"><div class="flip-entry-info"><a href="{href}" target="_blank"><div class="flip-entry-title">{name}</div></a></div></div>"#)
+    };
+    match (url.host_str().unwrap_or_default(), url.path(), param("folder_key").as_str(), param("content_type").as_str()) {
+        ("www.mediafire.com", "/api/1.5/folder/get_info.php", "synced1", _) => {
+            json(r#"{"response":{"folder_info":{"folderkey":"synced1","name":"Synced"},"result":"Success"}}"#.into())
+        }
+        ("www.mediafire.com", "/api/1.5/folder/get_content.php", "synced1", "files") => json(format!(
+            r#"{{"response":{{"folder_content":{{"files":[{},{}],"more_chunks":"no"}},"result":"Success"}}}}"#,
+            file("syncedfile0001", "one.bin"),
+            file("syncedfile0002", "two.bin")
+        )),
+        ("www.mediafire.com", "/api/1.5/folder/get_content.php", "synced1", "folders") => {
+            json(r#"{"response":{"folder_content":{"folders":[],"more_chunks":"no"},"result":"Success"}}"#.into())
+        }
+        ("drive.google.com", "/embeddedfolderview", _, _) if param("id") == "1Synced" => {
+            let entries = entry("https://drive.google.com/file/d/1SyncedFile/view?usp=drive_web", "photo.jpg")
+                + &entry("https://docs.google.com/document/d/1SyncedDoc/edit?usp=drive_web", "Plan");
+            let html = format!(r#"<!DOCTYPE html><html><head><title>Synced Drive</title></head><body><div class="flip-entries">{entries}</div></body></html>"#);
+            response(method, "200 OK", "Content-Type: text/html; charset=utf-8\r\n", html.as_bytes())
+        }
+        _ => mediafire(method, target),
+    }
+}
+
+/// A Drive or MediaFire folder added again lists only the files not downloaded before: the
+/// engine adds each file's line (its id, and its version where the listing tells one) to the
+/// download archive once it is downloaded, whatever history keeps. A folder whose files were
+/// all downloaded is nothing new, not an error.
+#[tokio::test]
+async fn test_a_folder_added_again_lists_only_the_files_not_downloaded() {
+    use hyperfetch_core::ingest::{descriptor_client, ingest, ListOptions, Task};
+    use sha2::Digest;
+    let _history = setup().await;
+    let (proxy, _) = serve_proxy(synced_folders).await;
+    let http = descriptor_client(Some(&proxy)).unwrap();
+    let all = ListOptions { only_new: false, ..ListOptions::default() };
+    let names = |tasks: &[Task]| tasks.iter().map(Task::label).collect::<Vec<_>>();
+    let temp = tempdir().unwrap();
+    // Downloads `task` from `from` (through `proxy`) as a front end does, with its lines for the archive.
+    let download = |task: &Task, from: Vec<Url>, proxy: Option<String>| {
+        let out = temp.path().join(task.folder.as_ref().unwrap()).join(task.name.as_ref().unwrap());
+        let opts = DownloadOptions { proxy, archive_lines: task.archive.clone(), ..options(&out, 2, 16 * KB) };
+        async move { run(&DownloadEngine::new(from, opts), None).await.expect("the file downloads") }
+    };
+
+    let folder = "http://www.mediafire.com/folder/synced1";
+    let tasks = ingest(&[folder], &http, &ListOptions::default()).await.expect("the folder is listed");
+    assert_eq!(names(&tasks), ["one.bin", "two.bin"]);
+    let hash = to_hex(&sha2::Sha256::digest(mediafire_file("syncedfile0001")));
+    assert_eq!(tasks[0].archive, [format!("mediafire syncedfile0001 {hash}")]);
+    download(&tasks[0], tasks[0].urls.clone(), Some(proxy.clone())).await;
+    assert!(archived().contains(&tasks[0].archive[0]), "{:?}", archived());
+    let again = ingest(&[folder], &http, &ListOptions::default()).await.expect("the folder is listed again");
+    assert_eq!(names(&again), ["two.bin"]);
+    download(&again[0], again[0].urls.clone(), Some(proxy.clone())).await;
+    let nothing = ingest(&[folder], &http, &ListOptions::default()).await.expect("nothing new is no error");
+    assert!(nothing.is_empty(), "{nothing:?}");
+    assert_eq!(names(&ingest(&[folder], &http, &all).await.unwrap()), ["one.bin", "two.bin"]);
+
+    // Drive's folder page tells no version: a file is its id. (Its https hosts are out of the
+    // proxy's reach, so the file comes from a local server; the line is the file's all the same.)
+    let drive = "http://drive.google.com/drive/folders/1Synced";
+    let tasks = ingest(&[drive], &http, &ListOptions::default()).await.expect("the Drive folder is listed");
+    assert_eq!(names(&tasks), ["photo.jpg", "Plan.docx"]);
+    assert_eq!(tasks.iter().map(|t| t.archive.clone()).collect::<Vec<_>>(), [["gdrive 1SyncedFile"], ["gdrive 1SyncedDoc"]]);
+    let local = serve(Arc::new(Mock::new(payload(8 * KB, 5))), "synced/photo.jpg").await;
+    download(&tasks[0], vec![local], None).await;
+    let again = ingest(&[drive], &http, &ListOptions::default()).await.expect("the Drive folder is listed again");
+    assert_eq!(names(&again), ["Plan.docx"]);
+    assert_eq!(ingest(&[drive], &http, &all).await.unwrap().len(), 2);
+}

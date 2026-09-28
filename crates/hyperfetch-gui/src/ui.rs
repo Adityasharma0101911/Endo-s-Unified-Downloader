@@ -561,7 +561,7 @@ fn advanced_options(app: &mut App, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         ui.label(RichText::new("Playlists & Feeds:").size(12.0));
         ui.checkbox(&mut app.settings.only_new, "Only new items").on_hover_text(
-            "Leave out the videos, tracks and episodes of a playlist, channel or podcast feed that were downloaded before",
+            "Leave out the videos, tracks, episodes and files of a playlist, channel, podcast feed or Drive or MediaFire folder that were downloaded before",
         );
         ui.add_space(12.0);
         ui.label(RichText::new("Newest").size(12.0));
