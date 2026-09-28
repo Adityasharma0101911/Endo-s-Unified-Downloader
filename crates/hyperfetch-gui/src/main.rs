@@ -86,9 +86,10 @@ impl Listing {
 
 /// Results of background work, delivered to the UI thread (each send also requests a repaint).
 enum AppEvent {
-    /// The downloads a .metalink, .meta4 or .torrent lists, with the form's checksum and
-    /// Authorization header when it was added.
-    Read { origin: Origin, input: String, checksum: String, auth: String, result: Result<Vec<Task>, String> },
+    /// The downloads a .metalink, .meta4 or .torrent, or a folder, feed or playlist lists, with
+    /// the form's checksum and Authorization header when it was added, and the notes the listing
+    /// left (what it left out).
+    Read { origin: Origin, input: String, checksum: String, auth: String, result: Result<Vec<Task>, String>, notes: Vec<String> },
     JobFinished { id: usize, result: Result<(PathBuf, Option<u64>), String> },
     /// The history as read by the `generation`-th history operation to run.
     History(Result<(u64, Vec<HistoryEntry>), String>),
@@ -364,7 +365,10 @@ impl App {
         }
         self.notice = Some(Ok(format!("Reading {}...", shown)));
         let read = read_listing(&self.settings, input.clone());
-        self.spawn_event(async move { AppEvent::Read { origin, input, checksum, auth, result: read.await } });
+        self.spawn_event(async move {
+            let (result, notes) = read.await;
+            AppEvent::Read { origin, input, checksum, auth, result, notes }
+        });
     }
 
     /// Adds what a document listed (or shows why it was refused) as `origin` says: the form
@@ -723,12 +727,16 @@ impl App {
 
     fn handle_event(&mut self, event: AppEvent) {
         match event {
-            AppEvent::Read { origin, input, checksum, auth, result } => {
+            AppEvent::Read { origin, input, checksum, auth, result, notes } => {
                 self.reading.remove(&input);
                 self.notice = None;
+                let listed = result.is_ok();
                 match result {
                     Ok(tasks) if tasks.len() > CONFIRM_FILES => self.listings.push(Listing { origin, input, checksum, auth, tasks }),
                     result => self.add_listing(origin, &input, &checksum, &auth, result),
+                }
+                if listed {
+                    self.notice = with_notes(self.notice.take(), &notes);
                 }
             }
             AppEvent::JobFinished { id, result } => {
@@ -1020,14 +1028,28 @@ fn keep_refused_line(queue_input: &mut String, queue_error: &mut Option<String>,
     });
 }
 
+/// `notice` followed by the notes a listing left (what it left out), shown as a warning.
+fn with_notes(notice: Option<Result<String, String>>, notes: &[String]) -> Option<Result<String, String>> {
+    if notes.is_empty() {
+        return notice;
+    }
+    let shown = notice.map(|n| n.unwrap_or_else(|e| e));
+    Some(Err(shown.into_iter().chain(notes.iter().cloned()).collect::<Vec<_>>().join("\n")))
+}
+
 /// Reads the downloads `input` (a local or remote .metalink, .meta4 or .torrent, or a link that
-/// lists many) lists, fetching through the proxy setting.
-fn read_listing(settings: &Settings, input: String) -> impl Future<Output = Result<Vec<Task>, String>> + Send + 'static {
-    let list = settings.list_options();
+/// lists many) lists, fetching through the proxy setting, and the notes the listing left.
+fn read_listing(settings: &Settings, input: String) -> impl Future<Output = (Result<Vec<Task>, String>, Vec<String>)> + Send + 'static {
+    let (notes, noted) = mpsc::channel();
+    let list = ingest::ListOptions { notes: Some(notes), ..settings.list_options() };
     async move {
-        let tokens = ingest::input_tokens(&input).await;
-        let http = ingest::descriptor_client(list.proxy.as_deref())?;
-        ingest::ingest(&tokens, &http, &list).await
+        let read = async {
+            let tokens = ingest::input_tokens(&input).await;
+            let http = ingest::descriptor_client(list.proxy.as_deref())?;
+            ingest::ingest(&tokens, &http, &list).await
+        };
+        let result = read.await;
+        (result, noted.try_iter().collect())
     }
 }
 
@@ -1561,8 +1583,30 @@ mod tests {
         let xml = br#"<metalink xmlns="urn:ietf:params:xml:ns:metalink"><file name="a.bin"><url>https://m.example/a.bin</url></file></metalink>"#;
         let proxy = serve(Arc::new(xml.to_vec())).await;
         let settings = Settings { proxy: format!("http://{}", proxy), ..Settings::default() };
-        let tasks = read_listing(&settings, "http://documents.invalid/list.meta4".to_string()).await.unwrap();
-        assert_eq!(tasks.iter().map(|t| t.name.clone()).collect::<Vec<_>>(), [Some(PathBuf::from("a.bin"))]);
+        let (tasks, notes) = read_listing(&settings, "http://documents.invalid/list.meta4".to_string()).await;
+        assert_eq!(tasks.unwrap().iter().map(|t| t.name.clone()).collect::<Vec<_>>(), [Some(PathBuf::from("a.bin"))]);
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    /// What a folder listing left out reaches the notice, as a warning after what was added.
+    #[tokio::test]
+    async fn a_listing_tells_what_it_left_out() {
+        // MediaFire's folder API, which answers the folder's name, files and (no) subfolders
+        // alike here: one of the two files is behind a password.
+        let json = br#"{"response":{"result":"Success","folder_info":{"name":"Pack"},"folder_content":{"files":[
+            {"quickkey":"lockedfile0001","filename":"a.bin","password_protected":"yes"},
+            {"quickkey":"openfile000002","filename":"b.bin","password_protected":"no"}],"more_chunks":"no"}}}"#;
+        let proxy = serve(Arc::new(json.to_vec())).await;
+        let settings = Settings { proxy: format!("http://{}", proxy), ..Settings::default() };
+        let (tasks, notes) = read_listing(&settings, "http://www.mediafire.com/folder/pack00000001".to_string()).await;
+        assert_eq!(tasks.unwrap().len(), 1);
+        assert_eq!(notes, ["1 files of the MediaFire folder are protected by a password and were left out"]);
+
+        let added = Some(Ok("Added 1 download(s) from x to the queue".to_string()));
+        let shown = with_notes(added, &notes);
+        assert_eq!(shown, Some(Err(format!("Added 1 download(s) from x to the queue\n{}", notes[0]))));
+        assert_eq!(with_notes(None, &notes), Some(Err(notes[0].clone())));
+        assert_eq!(with_notes(None, &[]), None);
     }
 
     /// A download its input named is shown under that name at once and saved as that file, in

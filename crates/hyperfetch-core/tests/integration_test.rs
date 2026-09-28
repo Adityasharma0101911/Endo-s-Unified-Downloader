@@ -3298,3 +3298,244 @@ async fn test_bare_sha512_and_sha1_checksums_of_a_single_stream() {
         assert_no_leftovers(&out);
     }
 }
+
+// Folder links: Google Drive and MediaFire folders listed into one download per file.
+
+/// The bytes of the MediaFire file with this quick key.
+fn mediafire_file(quickkey: &str) -> Vec<u8> {
+    match quickkey {
+        "corebin0000001" => payload(40 * KB, 7),
+        "readme00000002" => payload(3 * KB, 11),
+        _ => payload(20 * KB, 13),
+    }
+}
+
+/// MediaFire as its folder API (checked live) answers for a folder "Mod Pack" whose files come
+/// in two chunks, with a subfolder "Extras" holding a file and one behind a password, and a
+/// subfolder "Broken" it cannot list; each file's page links its download, as MediaFire's do. The
+/// folder "Loop" is answered by an API that ignores `chunk`. Any other key names no folder.
+fn mediafire(method: &str, target: &str) -> Vec<u8> {
+    use sha2::Digest;
+    let url = Url::parse(target).unwrap();
+    let param = |name: &str| url.query_pairs().find(|(k, _)| k == name).map(|(_, v)| v.into_owned()).unwrap_or_default();
+    let json = |body: String| response(method, "200 OK", "Content-Type: application/json\r\n", body.as_bytes());
+    let file = |quickkey: &str, name: &str, locked: &str| {
+        let data = mediafire_file(quickkey);
+        let hash = to_hex(&sha2::Sha256::digest(&data));
+        format!(r#"{{"quickkey":"{quickkey}","filename":"{name}","hash":"{hash}","size":"{}","password_protected":"{locked}"}}"#, data.len())
+    };
+    let content = |kind: &str, items: String, more: &str| {
+        json(format!(r#"{{"response":{{"folder_content":{{"{kind}":[{items}],"more_chunks":"{more}"}},"result":"Success"}}}}"#))
+    };
+    let path = url.path().to_string();
+    match (url.host_str().unwrap_or_default(), path.as_str()) {
+        ("www.mediafire.com", "/api/1.5/folder/get_info.php") if param("folder_key") == "pack1" => {
+            json(r#"{"response":{"action":"folder\/get_info","folder_info":{"folderkey":"pack1","name":"Mod Pack"},"result":"Success"}}"#.into())
+        }
+        ("www.mediafire.com", "/api/1.5/folder/get_info.php") if param("folder_key") == "loop1" => {
+            json(r#"{"response":{"action":"folder\/get_info","folder_info":{"folderkey":"loop1","name":"Loop"},"result":"Success"}}"#.into())
+        }
+        ("www.mediafire.com", "/api/1.5/folder/get_content.php") if param("response_format") == "json" => {
+            match (param("folder_key").as_str(), param("content_type").as_str(), param("chunk").as_str()) {
+                ("pack1", "files", "1") => content("files", file("corebin0000001", "core.bin", "no"), "yes"),
+                ("pack1", "files", "2") => content("files", file("readme00000002", "readme.txt", "no"), "no"),
+                ("pack1", "folders", "1") => {
+                    content("folders", r#"{"folderkey":"extras1","name":"Extras"},{"folderkey":"broken1","name":"Broken"}"#.into(), "no")
+                }
+                ("loop1", "files", _) => json(format!(
+                    r#"{{"response":{{"folder_content":{{"chunk_number":"1","files":[{}],"more_chunks":"yes"}},"result":"Success"}}}}"#,
+                    file("loopbin0000005", "loop.bin", "no")
+                )),
+                ("extras1", "files", "1") => {
+                    content("files", [file("skinbin0000003", "skin.bin", "no"), file("secret00000004", "secret.bin", "yes")].join(","), "no")
+                }
+                ("extras1", "folders", "1") => content("folders", String::new(), "no"),
+                _ => response(method, "404 Not Found", "Content-Type: application/json\r\n", br#"{"response":{"message":"Unknown or invalid FolderKey","error":112,"result":"Error"}}"#),
+            }
+        }
+        ("www.mediafire.com", file_page) if file_page.starts_with("/file/") => {
+            let quickkey = file_page.trim_start_matches("/file/");
+            let page = format!(r#"<html><body><a class="input popsok" aria-label="Download file" href="http://download7.mediafire.com/k3y/{quickkey}/file.bin">Download</a></body></html>"#);
+            response(method, "200 OK", "Content-Type: text/html; charset=UTF-8\r\n", page.as_bytes())
+        }
+        ("download7.mediafire.com", download) => {
+            let quickkey = download.split('/').nth(2).unwrap_or_default();
+            response(method, "200 OK", "Content-Type: application/octet-stream\r\n", &mediafire_file(quickkey))
+        }
+        _ => response(method, "404 Not Found", "Content-Type: application/json\r\n", br#"{"response":{"message":"Unknown or invalid FolderKey","error":112,"result":"Error"}}"#),
+    }
+}
+
+/// A MediaFire folder is listed chunk by chunk, subfolders kept under the folder's own name, and
+/// each file downloads through its page, checked against the SHA-256 MediaFire gives; a file
+/// behind a password is left out. An old `/?key` link that names a file is that file.
+#[tokio::test]
+async fn test_a_mediafire_folder_downloads_every_file_in_its_folders() {
+    use hyperfetch_core::ingest::{descriptor_client, ingest, ListOptions, Task};
+    let _history = setup().await;
+    let (proxy, _) = serve_proxy(mediafire).await;
+    let http = descriptor_client(Some(&proxy)).unwrap();
+
+    let tasks = ingest(&["http://www.mediafire.com/folder/pack1/Mod_Pack"], &http, &ListOptions::default()).await.expect("the folder is listed");
+    let pack = PathBuf::from("Mod Pack");
+    let listed: Vec<_> = tasks.iter().map(|t| (t.folder.clone().unwrap(), t.name.clone().unwrap(), t.urls[0].as_str())).collect();
+    assert_eq!(
+        listed,
+        [
+            (pack.clone(), PathBuf::from("core.bin"), "http://www.mediafire.com/file/corebin0000001"),
+            (pack.clone(), PathBuf::from("readme.txt"), "http://www.mediafire.com/file/readme00000002"),
+            (pack.join("Extras"), PathBuf::from("skin.bin"), "http://www.mediafire.com/file/skinbin0000003"),
+        ]
+    );
+    assert!(tasks.iter().all(|t| t.from_document && t.checksum.as_deref().is_some_and(|c| c.starts_with("sha256:"))));
+
+    let temp = tempdir().unwrap();
+    for task in &tasks {
+        let out = temp.path().join(task.folder.as_ref().unwrap()).join(task.name.as_ref().unwrap());
+        let opts = DownloadOptions { proxy: Some(proxy.clone()), expected_checksum: task.checksum.clone(), ..options(&out, 2, 16 * KB) };
+        let path = run(&DownloadEngine::new(task.urls.clone(), opts), None).await.expect("the file downloads");
+        assert_eq!(path, out);
+        assert_file(&path, &mediafire_file(task.urls[0].path().trim_start_matches("/file/")));
+    }
+
+    let file = Url::parse("http://www.mediafire.com/?fileonly0000001").unwrap();
+    let tasks = ingest(&[file.as_str()], &http, &ListOptions::default()).await.expect("the link is a file's");
+    assert_eq!(tasks, [Task { urls: vec![file], ..Task::default() }]);
+    let gone = ingest(&["http://www.mediafire.com/folder/gone1"], &http, &ListOptions::default()).await.unwrap_err();
+    assert!(gone.contains("Unknown or invalid FolderKey"), "{gone}");
+}
+
+/// Google Drive's embedded view of public folders (its shape checked live): "Photos" holds a
+/// file, a Slides document, a subfolder "2024" shared with a resource key and a subfolder
+/// "Broken" Drive is too busy to show; one folder is private, any other missing. Old open?id=
+/// links are sent on to the folder's or the file's page, as Drive does.
+fn drive_folders(method: &str, target: &str) -> Vec<u8> {
+    let page = |title: &str, entries: &[(&str, &str)]| {
+        let entries: String = entries
+            .iter()
+            .map(|(href, name)| {
+                format!(r#"<div class="flip-entry" id="entry-x" tabindex="0" role="link"><div class="flip-entry-info"><a href="{href}" target="_blank"><div class="flip-entry-title">{name}</div></a></div></div>"#)
+            })
+            .collect();
+        let html = format!(r#"<!DOCTYPE html><html><head><title>{title}</title></head><body><div class="flip-entries">{entries}</div></body></html>"#);
+        response(method, "200 OK", "Content-Type: text/html; charset=utf-8\r\n", html.as_bytes())
+    };
+    match target {
+        "http://drive.google.com/embeddedfolderview?id=1Photos" => page(
+            "Photos",
+            &[
+                ("https://drive.google.com/file/d/1Beach/view?usp=drive_web", "beach.jpg"),
+                ("https://docs.google.com/presentation/d/1Deck/edit?usp=drive_web", "Trip"),
+                ("https://drive.google.com/drive/folders/1Year?resourcekey=0-yk", "2024"),
+                ("https://drive.google.com/drive/folders/1Broken", "Broken"),
+            ],
+        ),
+        "http://drive.google.com/embeddedfolderview?id=1Year&resourcekey=0-yk" => {
+            page("2024", &[("https://drive.google.com/file/d/1Snow/view?usp=drive_web&amp;resourcekey=0-sk", "snow &amp; ice.jpg")])
+        }
+        "http://drive.google.com/embeddedfolderview?id=1Broken" => response(method, "503 Service Unavailable", "Content-Type: text/html\r\n", b"busy"),
+        "http://drive.google.com/embeddedfolderview?id=1Private" => response(method, "401 Unauthorized", "Content-Type: text/html\r\n", b"<!DOCTYPE html>"),
+        "http://drive.google.com/open?id=1Photos" => {
+            response(method, "307 Temporary Redirect", "Location: http://drive.google.com/drive/folders/1Photos?usp=drive_open\r\n", b"")
+        }
+        "http://drive.google.com/open?id=1Beach" => {
+            response(method, "307 Temporary Redirect", "Location: http://drive.google.com/file/d/1Beach/view?usp=drive_open\r\n", b"")
+        }
+        "http://drive.google.com/drive/folders/1Photos?usp=drive_open" | "http://drive.google.com/file/d/1Beach/view?usp=drive_open" => {
+            response(method, "200 OK", "Content-Type: text/html; charset=utf-8\r\n", b"<!DOCTYPE html>")
+        }
+        _ => response(method, "404 Not Found", "Content-Type: text/html\r\n", b"<html><title>Error 404 (Not Found)!!1</title></html>"),
+    }
+}
+
+/// Without an API key a Drive folder is listed from its public page: each file goes through
+/// Drive's direct download, a document as its export, under the folder's name. A private or
+/// missing folder is an error. With a key, the folder is asked of the Drive API only, over TLS.
+#[tokio::test]
+async fn test_a_google_drive_folder_is_listed_from_its_page_or_the_api() {
+    use hyperfetch_core::ingest::{descriptor_client, ingest, ListOptions};
+    let (proxy, seen) = serve_proxy(drive_folders).await;
+    let http = descriptor_client(Some(&proxy)).unwrap();
+
+    let tasks = ingest(&["http://drive.google.com/drive/u/0/folders/1Photos?usp=sharing"], &http, &ListOptions::default())
+        .await
+        .expect("the folder is listed");
+    let photos = PathBuf::from("Photos");
+    let listed: Vec<_> = tasks.iter().map(|t| (t.folder.clone().unwrap(), t.name.clone().unwrap(), t.urls[0].as_str())).collect();
+    assert_eq!(
+        listed,
+        [
+            (photos.clone(), PathBuf::from("beach.jpg"), "https://drive.usercontent.google.com/download?id=1Beach&export=download&confirm=t"),
+            (photos.clone(), PathBuf::from("Trip.pptx"), "https://docs.google.com/presentation/d/1Deck/export?format=pptx"),
+            (
+                photos.join("2024"),
+                PathBuf::from("snow & ice.jpg"),
+                "https://drive.usercontent.google.com/download?id=1Snow&export=download&confirm=t&resourcekey=0-sk",
+            ),
+        ]
+    );
+    assert!(tasks.iter().all(|t| t.from_document && t.size.is_none() && t.checksum.is_none()));
+
+    let private = ingest(&["http://drive.google.com/drive/folders/1Private"], &http, &ListOptions::default()).await.unwrap_err();
+    assert!(private.contains("private"), "{private}");
+    let missing = ingest(&["http://drive.google.com/drive/folders/1Gone"], &http, &ListOptions::default()).await.unwrap_err();
+    assert!(missing.contains("not found"), "{missing}");
+    assert!(seen.lock().unwrap().iter().all(|(target, _)| target.starts_with("http://drive.google.com/embeddedfolderview?id=")));
+
+    seen.lock().unwrap().clear();
+    let keyed = ListOptions { google_api_key: Some("AIzaSecret".into()), ..ListOptions::default() };
+    let err = ingest(&["http://drive.google.com/drive/folders/1Photos"], &http, &keyed).await.unwrap_err();
+    assert!(err.starts_with("Cannot reach the Google Drive API") && !err.contains("AIzaSecret"), "{err}");
+    let asked: Vec<_> = seen.lock().unwrap().iter().map(|(target, _)| target.clone()).collect();
+    assert_eq!(asked, ["www.googleapis.com:443"], "the key is sent to the Drive API alone, inside TLS");
+}
+
+/// A subfolder Drive does not show is left out, not the whole folder, and the front end is told
+/// which, with the note that a folder listed without a key has no sizes or checksums. An old
+/// open?id= link is listed when Drive sends it on to a folder, and is the link itself otherwise.
+#[tokio::test]
+async fn test_a_google_drive_folder_tells_what_it_left_out() {
+    use hyperfetch_core::ingest::{descriptor_client, ingest, ListOptions, Task};
+    let (proxy, _) = serve_proxy(drive_folders).await;
+    let http = descriptor_client(Some(&proxy)).unwrap();
+    let (notes, noted) = std::sync::mpsc::channel();
+    let options = ListOptions { notes: Some(notes), ..ListOptions::default() };
+
+    let tasks = ingest(&["http://drive.google.com/open?id=1Photos"], &http, &options).await.expect("the folder is listed");
+    let names: Vec<_> = tasks.iter().map(|t| t.name.clone().unwrap()).collect();
+    assert_eq!(names, [PathBuf::from("beach.jpg"), PathBuf::from("Trip.pptx"), PathBuf::from("snow & ice.jpg")]);
+    let told: Vec<String> = noted.try_iter().collect();
+    let [unread, keyless] = &told[..] else { panic!("two notes: {told:?}") };
+    let broken = Path::new("Photos").join("Broken").display().to_string();
+    let left_out = format!("1 subfolder(s) of the Google Drive folder could not be read, and the files in them were left out ({broken}): ");
+    assert!(unread.starts_with(&left_out) && unread.contains("503"), "{unread}");
+    assert!(keyless.contains("add a Google API key"), "{keyless}");
+
+    let file = "http://drive.google.com/open?id=1Beach";
+    let tasks = ingest(&[file], &http, &options).await.expect("the link is a file's");
+    assert_eq!(tasks, [Task { urls: vec![Url::parse(file).unwrap()], ..Task::default() }]);
+    assert_eq!(noted.try_iter().count(), 0);
+}
+
+/// A MediaFire subfolder the API cannot list is left out and told of, with the files behind a
+/// password; an API that ignores `chunk` is an error, not a listing without end.
+#[tokio::test]
+async fn test_a_mediafire_folder_tells_what_it_left_out() {
+    use hyperfetch_core::ingest::{descriptor_client, ingest, ListOptions};
+    let (proxy, _) = serve_proxy(mediafire).await;
+    let http = descriptor_client(Some(&proxy)).unwrap();
+    let (notes, noted) = std::sync::mpsc::channel();
+    let options = ListOptions { notes: Some(notes), ..ListOptions::default() };
+
+    let tasks = ingest(&["http://www.mediafire.com/folder/pack1"], &http, &options).await.expect("the folder is listed");
+    assert_eq!(tasks.len(), 3);
+    let told: Vec<String> = noted.try_iter().collect();
+    let [locked, unread] = &told[..] else { panic!("two notes: {told:?}") };
+    assert_eq!(locked, "1 files of the MediaFire folder are protected by a password and were left out");
+    let broken = Path::new("Mod Pack").join("Broken").display().to_string();
+    let left_out = format!("1 subfolder(s) of the MediaFire folder could not be read, and the files in them were left out ({broken}): ");
+    assert!(unread.starts_with(&left_out) && unread.contains("Unknown or invalid FolderKey"), "{unread}");
+
+    let endless = ingest(&["http://www.mediafire.com/folder/loop1"], &http, &options).await.unwrap_err();
+    assert_eq!(endless, "MediaFire answered chunk 1 when asked for chunk 2: the folder's listing does not end");
+}

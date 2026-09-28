@@ -308,11 +308,12 @@ impl HostResolver for GoogleDriveResolver {
     }
 
     /// The direct download URL, sending nothing: whether Drive serves the file there shows in the
-    /// download's own probe (see `check_answer`).
+    /// download's own probe (see `check_answer`). The link's resource key goes along.
     async fn resolve(&self, _client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
         let file_id = extract_google_drive_id(url)
             .ok_or_else(|| ResolverError::Parse("Could not extract Google Drive file ID".to_string()))?;
-        Ok(vec![google_drive_direct_url(&file_id)?])
+        let resource_key = url.query_pairs().find(|(k, _)| k == "resourcekey").map(|(_, v)| v);
+        Ok(vec![google_drive_direct_url(&file_id, resource_key.as_deref())?])
     }
 }
 
@@ -488,11 +489,13 @@ impl GoogleDriveResolver {
 }
 
 /// The usercontent download endpoint serves every file size directly; `confirm=t` skips the
-/// virus-scan interstitial that large files otherwise get.
-fn google_drive_direct_url(file_id: &str) -> Result<Url, ResolverError> {
+/// virus-scan interstitial that large files otherwise get. A file shared by link before Drive's
+/// 2021 security update opens only with its `resource_key`.
+pub(crate) fn google_drive_direct_url(file_id: &str, resource_key: Option<&str>) -> Result<Url, ResolverError> {
+    let key = resource_key.map(|key| ("resourcekey", key));
     Url::parse_with_params(
         "https://drive.usercontent.google.com/download",
-        &[("id", file_id), ("export", "download"), ("confirm", "t")],
+        [("id", file_id), ("export", "download"), ("confirm", "t")].into_iter().chain(key),
     )
     .map_err(|e| ResolverError::Parse(e.to_string()))
 }
@@ -507,11 +510,12 @@ const GOOGLE_DOCS_VIEWS: &[&str] = &["edit", "view", "preview", "htmlview", "mob
 /// The export of the document `url` links to, rewritten without a request, as Google's own
 /// File > Download does it: a document as .docx, a spreadsheet as .xlsx with every sheet (the
 /// sheet a link names, `gid`, is only the one the editor opened on, and Sheets names one in every
-/// editor link), a presentation as .pptx; the account it names (`authuser`) is kept. An export
+/// editor link), a presentation as .pptx; the account it names (`authuser`) is kept, and so is the
+/// `resourcekey` a document shared by link before 2021 opens with (the export takes it). An export
 /// link is kept in the format it asks for (`format=csv&gid=` for one sheet). Other links on a document (gviz
 /// queries, /pub copies) already give what they are for, so they are left alone. Exports are
 /// made on the fly: one connection, no known size.
-fn google_docs_export(url: &Url) -> Option<Url> {
+pub(crate) fn google_docs_export(url: &Url) -> Option<Url> {
     if url.host_str()? != "docs.google.com" {
         return None;
     }
@@ -542,14 +546,9 @@ fn google_docs_export(url: &Url) -> Option<Url> {
         _ => return None,
     }
     export.set_path(&format!("/{}{}/d/{}/export", kind, account, id));
-    let authuser = url.query_pairs().find(|(k, _)| k == "authuser").map(|(_, v)| v.into_owned());
-    {
-        let mut query = export.query_pairs_mut();
-        query.clear().append_pair("format", format);
-        if let Some(user) = authuser {
-            query.append_pair("authuser", &user);
-        }
-    }
+    let kept: Vec<(String, String)> =
+        url.query_pairs().filter(|(k, _)| k == "authuser" || k == "resourcekey").map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
+    export.query_pairs_mut().clear().append_pair("format", format).extend_pairs(kept);
     Some(export)
 }
 
@@ -588,11 +587,7 @@ impl HostResolver for MediaFireResolver {
         }
         let page_url = resp.url().clone();
         let html = read_capped(resp, MAX_HTML_BYTES).await?;
-        extract_mediafire_direct(&html, &page_url).map(|u| vec![u]).ok_or_else(|| {
-            ResolverError::NotFound(
-                "MediaFire download link not found on the page (the file may be removed or the page layout changed)".to_string(),
-            )
-        })
+        extract_mediafire_direct(&html, &page_url).map(|u| vec![u]).ok_or_else(|| ResolverError::NotFound(mediafire_no_link(&html)))
     }
 }
 
@@ -901,7 +896,9 @@ impl SmartResolver {
         })
     }
 
-    /// Generates browser-grade anti-QoS headers to prevent CDNs from throttling traffic.
+    /// Generates browser-grade anti-QoS headers to prevent CDNs from throttling traffic. A
+    /// download the user asked for is no request made by another site (`Sec-Fetch-Site: none`):
+    /// Google's download hosts refuse `cross-site` with 403 (checked live).
     pub fn default_anti_qos_headers() -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -917,7 +914,7 @@ impl SmartResolver {
         headers.insert("Sec-Ch-Ua-Platform", HeaderValue::from_static("\"Windows\""));
         headers.insert("Sec-Fetch-Dest", HeaderValue::from_static("empty"));
         headers.insert("Sec-Fetch-Mode", HeaderValue::from_static("cors"));
-        headers.insert("Sec-Fetch-Site", HeaderValue::from_static("cross-site"));
+        headers.insert("Sec-Fetch-Site", HeaderValue::from_static("none"));
         headers
     }
 }
@@ -1073,6 +1070,17 @@ fn extract_mediafire_direct(html: &str, page_url: &Url) -> Option<Url> {
             Url::parse(std::str::from_utf8(&decoded).ok()?).ok().filter(is_download_host)
         })
     })
+}
+
+/// Why a MediaFire file page `html` has no download link. A file MediaFire flags as malware shows
+/// "Malware Detected" (a `MalwareAdvisory` box, checked live) and gives its link only to a
+/// browser whose user accepts the risk, which is theirs to accept.
+fn mediafire_no_link(html: &str) -> String {
+    if html.contains("class=\"MalwareAdvisory\"") {
+        "MediaFire flagged this file as malware (\"Malware Detected\") and hands it out only after a warning: open the link in your browser to decide".to_string()
+    } else {
+        "MediaFire download link not found on the page (the file may be removed or the page layout changed)".to_string()
+    }
 }
 
 /// Picks the one video a page plays. Candidates are often different encodes of the same video,
@@ -1328,10 +1336,16 @@ mod tests {
 
     #[test]
     fn test_google_drive_direct_url() {
-        let direct = google_drive_direct_url("1BxyzABC_12345").unwrap();
+        let direct = google_drive_direct_url("1BxyzABC_12345", None).unwrap();
         assert_eq!(
             direct.as_str(),
             "https://drive.usercontent.google.com/download?id=1BxyzABC_12345&export=download&confirm=t"
+        );
+        // Where Drive itself sends drive.google.com/uc?...&resourcekey= (checked live).
+        let keyed = google_drive_direct_url("1BxyzABC_12345", Some("0-a_B")).unwrap();
+        assert_eq!(
+            keyed.as_str(),
+            "https://drive.usercontent.google.com/download?id=1BxyzABC_12345&export=download&confirm=t&resourcekey=0-a_B"
         );
     }
 
@@ -1353,13 +1367,17 @@ mod tests {
             .unwrap();
         let shared = Url::parse("https://drive.google.com/file/d/1BxyzABC_12345/view?usp=sharing").unwrap();
         let resolved = SmartResolver::resolve(&client, &shared).await.unwrap();
-        assert_eq!(resolved, vec![google_drive_direct_url("1BxyzABC_12345").unwrap()]);
+        assert_eq!(resolved, vec![google_drive_direct_url("1BxyzABC_12345", None).unwrap()]);
+        // A link's resource key opens the file.
+        let keyed = Url::parse("https://drive.google.com/file/d/1BxyzABC_12345/view?resourcekey=0-k3y&usp=sharing").unwrap();
+        let resolved = SmartResolver::resolve(&client, &keyed).await.unwrap();
+        assert_eq!(resolved, vec![google_drive_direct_url("1BxyzABC_12345", Some("0-k3y")).unwrap()]);
         assert!(!contacted(&proxy).await, "Drive was asked before the download's probe");
     }
 
     #[test]
     fn test_google_drive_web_page_answers_are_rejected() {
-        let drive = google_drive_direct_url("1BxyzABC_12345").unwrap();
+        let drive = google_drive_direct_url("1BxyzABC_12345", None).unwrap();
         let page = headers(&[(CONTENT_TYPE, "text/html; charset=utf-8")]);
         let err = GoogleDriveResolver::check_answer(&drive, &page).unwrap_err();
         assert!(err.to_string().contains("Google Drive served a web page instead of the file"), "{err}");
@@ -1561,6 +1579,14 @@ mod tests {
         }
     }
 
+    /// drive.usercontent.google.com answers a range request 403 with `Sec-Fetch-Site: cross-site`
+    /// and 206 with `none` (checked with curl), so a download says it is the user's own.
+    #[test]
+    fn test_downloads_are_not_sent_as_cross_site_requests() {
+        let headers = SmartResolver::default_anti_qos_headers();
+        assert_eq!(headers.get("Sec-Fetch-Site").map(|v| v.to_str().unwrap()), Some("none"));
+    }
+
     /// Codeberg refuses the browser User-Agent the engine sends elsewhere ("403 Access denied,
     /// old Chrome version" on /media/ and /raw/, checked with curl), and takes the app's own.
     #[test]
@@ -1650,6 +1676,9 @@ mod tests {
                 format!("spreadsheets/d/{sheet}/edit?authuser=me%40example.com#gid=7"),
                 format!("spreadsheets/d/{sheet}/export?format=xlsx&authuser=me%40example.com"),
             ),
+            // So is the resource key of a document shared by link before 2021 (Drive's exportLinks
+            // carry it too; the export answers the same with it, checked live).
+            (format!("presentation/d/{deck}/edit?usp=sharing&resourcekey=0-aB_c"), format!("presentation/d/{deck}/export?format=pptx&resourcekey=0-aB_c")),
             // An export in a format of the user's choosing is kept; a gid means nothing to a document.
             (format!("document/d/{doc}/export?format=pdf#top"), format!("document/d/{doc}/export?format=pdf")),
             (format!("spreadsheets/d/{sheet}/export?format=csv&gid=7"), format!("spreadsheets/d/{sheet}/export?format=csv&gid=7")),
@@ -1699,7 +1728,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_older_drive_links_on_docs_google_com_go_to_drive() {
-        let direct = google_drive_direct_url("1BxyzABC_12345").unwrap();
+        let direct = google_drive_direct_url("1BxyzABC_12345", None).unwrap();
         for link in [
             "https://docs.google.com/uc?export=download&id=1BxyzABC_12345",
             "https://docs.google.com/file/d/1BxyzABC_12345/edit",
@@ -1998,6 +2027,16 @@ mod tests {
         let page = serve_once("text/html", b"<html><a href=\"/help\">Help</a></html>".to_vec()).await;
         let result = MediaFireResolver.resolve(&local_client(), &page).await;
         assert!(matches!(result, Err(ResolverError::NotFound(_))));
+    }
+
+    /// MediaFire's page for a file it flags as malware (www.mediafire.com/file/dz08mstub83ik3l as
+    /// it answered, cut down): no download link, and the error says why.
+    #[tokio::test]
+    async fn test_a_mediafire_file_flagged_as_malware_says_so() {
+        let html = br#"<html><body><div class="download_link" id="download_link"></div><div class="MalwareAdvisory" role="alertdialog"><div class="MalwareAdvisory-warning MalwareAdvisory-warning--virustotal"><div class="MalwareAdvisory-warningText">Malware Detected</div></div><div class="MalwareAdvisory-fileText">TestBlockedFile.exe (1.1 MB)</div></div></body></html>"#;
+        let page = serve_once("text/html", html.to_vec()).await;
+        let err = MediaFireResolver.resolve(&local_client(), &page).await.unwrap_err();
+        assert!(err.to_string().contains("MediaFire flagged this file as malware"), "{err}");
     }
 
     #[test]
