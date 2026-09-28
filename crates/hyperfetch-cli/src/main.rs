@@ -188,6 +188,8 @@ fn list_options(args: &Args) -> ListOptions {
         only_new: !args.all_items,
         cookies,
         proxy: args.proxy.clone(),
+        // Logged: warnings reach stderr.
+        notes: None,
     }
 }
 

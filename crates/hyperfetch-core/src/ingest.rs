@@ -75,6 +75,9 @@ pub struct ListOptions {
     pub cookies: media::BrowserCookieSource,
     /// Proxy for listings made outside the HTTP client [`ingest`] is given (yt-dlp's).
     pub proxy: Option<String>,
+    /// Where a listing sends what the user should know besides its downloads (items left out, a
+    /// folder listed in part), for a front end to show; None logs it as a warning.
+    pub notes: Option<std::sync::mpsc::Sender<String>>,
 }
 
 impl Default for ListOptions {
@@ -86,6 +89,20 @@ impl Default for ListOptions {
             only_new: true,
             cookies: media::BrowserCookieSource::None,
             proxy: None,
+            notes: None,
+        }
+    }
+}
+
+impl ListOptions {
+    /// Tells the user `note` about a listing, through `notes` or else as a warning.
+    pub(crate) fn note(&self, note: String) {
+        let unsent = match &self.notes {
+            Some(notes) => notes.send(note).err().map(|e| e.0),
+            None => Some(note),
+        };
+        if let Some(note) = unsent {
+            tracing::warn!("{}", note);
         }
     }
 }
