@@ -485,41 +485,11 @@ fn advanced_options(app: &mut App, ui: &mut egui::Ui) {
 
     ui.add_space(4.0);
     ui.horizontal(|ui| {
-        ui.label(RichText::new("Google API Key:").size(12.0));
-        let key = egui::TextEdit::singleline(&mut app.settings.google_api_key)
-            .password(true)
-            .hint_text(hint_text("Optional: lists whole Google Drive folders, with sizes and checksums, through the Drive API"));
-        ui.add_sized([ui.available_width() - 10.0, 24.0], key).on_hover_text(
-            "Sent only to Google's Drive API, and saved with the other settings (in plain text), like the \
-             proxy. Without a key a Drive folder is listed from its public page, which gives no sizes or \
-             checksums and may not show every file of a very large folder.",
-        );
-    });
-
-    ui.add_space(4.0);
-    ui.horizontal(|ui| {
         ui.label(RichText::new("Media Quality:").size(12.0));
         combo(ui, "media_preset_combo", &mut app.settings.media_preset, &MEDIA_PRESETS);
         ui.add_space(12.0);
         ui.label(RichText::new("Browser Cookies:").size(12.0));
         combo(ui, "browser_cookies_combo", &mut app.settings.browser_cookies, &BROWSERS);
-    });
-    ui.checkbox(&mut app.settings.install_ffmpeg, "Install ffmpeg when a video needs it (about 200 MB)").on_hover_text(
-        "ffmpeg joins separate video and audio (the best quality) and makes MP3/M4A files. Without it videos \
-         download in a lower quality and audio presets fail. The GPL build yt-dlp's makers publish is checked \
-         and installed for your user only; it takes about 330 MB on disk.",
-    );
-
-    ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("Playlists & Channels:").size(12.0));
-        ui.checkbox(&mut app.settings.only_new, "Only new items")
-            .on_hover_text("Leave out the videos and tracks of a playlist or channel that were downloaded before");
-        ui.add_space(12.0);
-        ui.label(RichText::new("Newest").size(12.0));
-        ui.add(egui::DragValue::new(&mut app.settings.latest).range(0..=100_000))
-            .on_hover_text("Only this many of the newest items: a channel's first, a playlist's last");
-        ui.label(RichText::new("items (0 = all)").size(11.0).color(MUTED));
     });
 
     ui.add_space(4.0);
@@ -533,10 +503,43 @@ fn advanced_options(app: &mut App, ui: &mut egui::Ui) {
         ui.add_space(12.0);
         ui.checkbox(&mut app.settings.embed_metadata, "Embed tags and chapters")
             .on_hover_text("Write the title, artist, date, description, link and chapters into the file (needs ffmpeg)");
-        ui.add_space(12.0);
+    });
+    ui.horizontal(|ui| {
         ui.checkbox(&mut app.settings.live_from_start, "Record live streams from the start").on_hover_text(
             "Where the site keeps it, record a live stream from its start instead of from now. \
              Stop finishes the recording and keeps it.",
+        );
+        ui.add_space(12.0);
+        ui.checkbox(&mut app.settings.install_ffmpeg, "Install ffmpeg when a video needs it (about 200 MB)").on_hover_text(
+            "ffmpeg joins separate video and audio (the best quality) and makes MP3/M4A files. Without it videos \
+             download in a lower quality and audio presets fail. The GPL build yt-dlp's makers publish is checked \
+             and installed for your user only; it takes about 330 MB on disk.",
+        );
+    });
+
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Playlists & Feeds:").size(12.0));
+        ui.checkbox(&mut app.settings.only_new, "Only new items").on_hover_text(
+            "Leave out the videos, tracks and episodes of a playlist, channel or podcast feed that were downloaded before",
+        );
+        ui.add_space(12.0);
+        ui.label(RichText::new("Newest").size(12.0));
+        ui.add(egui::DragValue::new(&mut app.settings.latest).range(0..=100_000))
+            .on_hover_text("Only this many of the newest items: a channel's first, a playlist's last, a feed's latest episodes");
+        ui.label(RichText::new("items (0 = all)").size(11.0).color(MUTED));
+    });
+
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Google API Key:").size(12.0));
+        let key = egui::TextEdit::singleline(&mut app.settings.google_api_key)
+            .password(true)
+            .hint_text(hint_text("Optional: lists whole Google Drive folders, with sizes and checksums, through the Drive API"));
+        ui.add_sized([ui.available_width() - 10.0, 24.0], key).on_hover_text(
+            "Sent only to Google's Drive API, and saved with the other settings (in plain text), like the \
+             proxy. Without a key a Drive folder is listed from its public page, which gives no sizes or \
+             checksums and may not show every file of a very large folder.",
         );
     });
 
