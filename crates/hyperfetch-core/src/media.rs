@@ -732,11 +732,11 @@ fn install_onedir(bin_dir: &Path, tag: &str, asset: &str, bytes: &[u8]) -> Resul
     Ok(target.join("yt-dlp.exe"))
 }
 
-/// Renames folder `from` to `to`, trying again for a moment while Windows refuses. Antivirus
-/// scanners open new programs right after they are written, and a folder with an open file in it
-/// cannot be renamed. Gives up at once once `to` exists (another process installed the same
-/// release). Blocking.
-#[cfg(windows)]
+/// Renames `from` to `to`, trying again for a moment while Windows refuses because a file is
+/// open: antivirus scanners open new programs right after they are written (a folder with an open
+/// file in it cannot be renamed either), and a program just ended (a killed ffmpeg) holds its
+/// files until Windows has closed them. Gives up at once once `to` exists (another process
+/// installed the same release). Blocking.
 fn rename_patiently(from: &Path, to: &Path) -> std::io::Result<()> {
     const ERROR_SHARING_VIOLATION: i32 = 32;
     let mut pause = Duration::from_millis(100);
@@ -744,7 +744,9 @@ fn rename_patiently(from: &Path, to: &Path) -> std::io::Result<()> {
     for _ in 0..4 {
         match std::fs::rename(from, to) {
             Err(e)
-                if (e.kind() == std::io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(ERROR_SHARING_VIOLATION))
+                if cfg!(windows)
+                    && (e.kind() == std::io::ErrorKind::PermissionDenied
+                        || e.raw_os_error() == Some(ERROR_SHARING_VIOLATION))
                     && !to.exists() =>
             {
                 std::thread::sleep(pause);
@@ -2049,9 +2051,9 @@ async fn stopped(state: &OutputState, ffmpeg: Option<&Path>) -> Result<PathBuf, 
     }
     match parts.as_slice() {
         // Moved to its name by yt-dlp before it was killed, or not started.
-        [] if is_file(output).await => keep_recording(output, ffmpeg).await,
+        [] if is_file(output).await => Ok(keep_recording(output, ffmpeg).await),
         [] => Err(CANCELLED.to_string()),
-        [part] => keep_recording(part, ffmpeg).await,
+        [part] => Ok(keep_recording(part, ffmpeg).await),
         _ => join_recording(&parts, output, ffmpeg).await,
     }
 }
@@ -2059,15 +2061,29 @@ async fn stopped(state: &OutputState, ffmpeg: Option<&Path>) -> Result<PathBuf, 
 /// Makes a stopped live recording's `file` (its `.part`, or the file yt-dlp moved it to) a playable
 /// file of its own, never in place of another: MPEG-TS, as ffmpeg records HLS, is named `.ts`,
 /// then remuxed to `.mp4` when ffmpeg is at hand (the `.ts` stays if that fails); a file ffmpeg
-/// finished otherwise just loses its `.part`. Returns the file.
-async fn keep_recording(file: &Path, ffmpeg: Option<&Path>) -> Result<PathBuf, String> {
+/// finished otherwise just loses its `.part`. Returns the file: `file` itself when it cannot be
+/// moved, which is then the recording, never something to resume and overwrite.
+async fn keep_recording(file: &Path, ffmpeg: Option<&Path>) -> PathBuf {
+    let kept = |e: String| {
+        tracing::warn!("Kept the recording as {}: {e}", file.display());
+        file.to_path_buf()
+    };
     let named = if file.extension().is_some_and(|ext| ext == "part") { file.with_extension("") } else { file.to_path_buf() };
     if !is_mpeg_ts(file).await {
-        return move_to_free(file, &named).await;
+        return move_to_free(file, &named).await.unwrap_or_else(kept);
     }
-    let ts = move_to_free(file, &named.with_extension("ts")).await?;
-    let Some(ffmpeg) = ffmpeg else { return Ok(ts) };
-    let mp4 = free_name(&named.with_extension("mp4")).await?;
+    let ts = match move_to_free(file, &named.with_extension("ts")).await {
+        Ok(ts) => ts,
+        Err(e) => return kept(e),
+    };
+    let Some(ffmpeg) = ffmpeg else { return ts };
+    let mp4 = match free_name(&named.with_extension("mp4")).await {
+        Ok(mp4) => mp4,
+        Err(e) => {
+            tracing::warn!("Kept the recording as {}: {e}", ts.display());
+            return ts;
+        }
+    };
     let temp = merge_temp(&mp4);
     let mut args: Vec<OsString> = FFMPEG_QUIET.map(OsString::from).to_vec();
     args.extend([OsString::from("-i"), file_arg(&ts)]);
@@ -2084,12 +2100,12 @@ async fn keep_recording(file: &Path, ffmpeg: Option<&Path>) -> Result<PathBuf, S
             if let Err(e) = tokio::fs::remove_file(&ts).await {
                 tracing::warn!("Failed to delete {}: {e}", ts.display());
             }
-            Ok(mp4)
+            mp4
         }
         Err(e) => {
             tracing::warn!("Kept the recording as {}: remuxing it to MP4 failed: {e}", ts.display());
             let _ = tokio::fs::remove_file(&temp).await;
-            Ok(ts)
+            ts
         }
     }
 }
@@ -2146,14 +2162,20 @@ async fn free_name(path: &Path) -> Result<PathBuf, String> {
 }
 
 /// Moves `file` to `to`, or the first free name after it, and returns where it went; `file`
-/// stays where it is when that is `to`. `to`'s `.part` is taken while it is `file`.
+/// stays where it is when that is `to`. `to`'s `.part` is taken while it is `file`. A process
+/// just killed (see [`ProcessTree::kill_and_reap`]) may hold `file` a moment longer, which is
+/// waited out (see [`rename_patiently`]).
 async fn move_to_free(file: &Path, to: &Path) -> Result<PathBuf, String> {
     if file == to {
         return Ok(to.to_path_buf());
     }
     let own_part = crate::engine::part_path(to) == file && !tokio::fs::try_exists(to).await.unwrap_or(true);
     let to = if own_part { to.to_path_buf() } else { free_name(to).await? };
-    tokio::fs::rename(file, &to).await.map_err(|e| format!("Failed to move {} to {}: {e}", file.display(), to.display()))?;
+    let (from, target) = (file.to_path_buf(), to.clone());
+    tokio::task::spawn_blocking(move || rename_patiently(&from, &target))
+        .await
+        .map_err(|e| format!("Background task failed: {e}"))?
+        .map_err(|e| format!("Failed to move {} to {}: {e}", file.display(), to.display()))?;
     Ok(to)
 }
 
@@ -5814,6 +5836,36 @@ mod tests {
         let mut left = names_in(dir.path());
         left.retain(|n| *n != bin_name);
         assert_eq!(left, [name]);
+    }
+
+    /// A recording that the ffmpeg killed with yt-dlp still holds is moved once Windows lets go of
+    /// it, and kept where it is if it never does: that file is the recording, not a download to
+    /// resume, which would overwrite it.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_recording_a_killed_ffmpeg_still_holds_is_kept() {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ_WRITE: u32 = 0x1 | 0x2;
+        let dir = tempfile::tempdir().unwrap();
+        let part = dir.path().join("clip.mp4.part");
+        ts_recording(None, &part);
+        // As ffmpeg holds its output: others may read and write it, not move it.
+        let hold = |time| {
+            let file = std::fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_READ_WRITE).open(&part).unwrap();
+            std::thread::spawn(move || {
+                std::thread::sleep(time);
+                drop(file);
+            })
+        };
+        let held = hold(Duration::from_millis(300));
+        assert_eq!(keep_recording(&part, None).await, dir.path().join("clip.ts"));
+        held.join().unwrap();
+
+        std::fs::rename(dir.path().join("clip.ts"), &part).unwrap();
+        let held = hold(Duration::from_secs(3));
+        assert_eq!(keep_recording(&part, None).await, part);
+        held.join().unwrap();
+        assert_eq!(names_in(dir.path()), ["clip.mp4.part"]);
     }
 
     /// A stop while yt-dlp finishes a live stream that ended of itself waits for the file: no
