@@ -102,10 +102,12 @@ pub struct Ui {
     quiet: bool,
     /// stderr is not a terminal: print a progress line now and then instead of bars.
     plain: bool,
-    /// Output held back while a question waits for its answer (see [`Ui::hiding_bars`]), each
-    /// piece with whether it goes to stderr.
-    held: Arc<Mutex<Option<Vec<(bool, Vec<u8>)>>>>,
+    held: Arc<Mutex<Held>>,
 }
+
+/// Output held back while a question waits for its answer (see [`Ui::hiding_bars`]), each piece
+/// with whether it goes to stderr.
+type Held = Option<Vec<(bool, Vec<u8>)>>;
 
 impl Ui {
     pub fn new(quiet: bool) -> Self {
