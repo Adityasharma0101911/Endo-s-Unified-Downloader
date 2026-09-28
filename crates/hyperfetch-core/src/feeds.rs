@@ -98,15 +98,40 @@ pub async fn list(http: &reqwest::Client, url: &Url, options: &ListOptions) -> O
 /// The feed at `url`; None when it answers with a client error or is no RSS or Atom feed, and
 /// unless `sure` it is one, when its host cannot be reached or is busy (see [`fetch`]).
 async fn read_feed(http: &reqwest::Client, url: &Url, sure: bool) -> Result<Option<Feed>, String> {
-    let Some((bytes, base)) = fetch(http, url, true, sure).await? else { return Ok(None) };
-    parse_feed(&decode_feed(&bytes), &base).transpose()
+    let Some(Fetched { body, base, charset }) = fetch(http, url, true, sure).await? else { return Ok(None) };
+    parse_feed(&decode_feed(&body, charset.as_deref()), &base).transpose()
 }
 
-/// A feed's text: UTF-8, or UTF-16 with a BOM (see [`decode_text`]); else windows-1252, which is
-/// what the ISO-8859-1 many older feeds declare stands for on the web (it only adds letters and
-/// signs at 0x80-0x9F). A feed in another single-byte encoding gets wrong letters, not an error.
-fn decode_feed(bytes: &[u8]) -> String {
-    decode_text(bytes).unwrap_or_else(|_| bytes.iter().map(|&byte| windows_1252(byte)).collect())
+/// Labels of windows-1252, as the web reads them: ISO-8859-1 and US-ASCII stand for it too (it
+/// only adds letters and signs at 0x80-0x9F).
+const WINDOWS_1252_LABELS: &[&str] = &[
+    "windows-1252", "cp1252", "x-cp1252", "iso-8859-1", "iso8859-1", "iso88591", "iso_8859-1", "iso_8859-1:1987", "iso-ir-100", "latin1",
+    "latin-1", "l1", "csisolatin1", "cp819", "ibm819", "us-ascii", "ascii", "ansi_x3.4-1968",
+];
+
+/// A feed's text: UTF-8, or UTF-16 with a BOM (see [`decode_text`]). One that is neither is
+/// windows-1252 when its XML declaration or `charset` (its Content-Type's) says it is (see
+/// [`WINDOWS_1252_LABELS`]), else UTF-8 with a stray byte: that byte becomes U+FFFD and every
+/// other letter stays. A feed in another single-byte encoding gets wrong letters, not an error.
+fn decode_feed(bytes: &[u8], charset: Option<&str>) -> String {
+    if let Ok(text) = decode_text(bytes) {
+        return text;
+    }
+    let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+    let latin = |label: &str| WINDOWS_1252_LABELS.contains(&label.trim().trim_matches(['"', '\'']).to_ascii_lowercase().as_str());
+    if charset.is_some_and(latin) || declared_encoding(bytes).is_some_and(|label| latin(&label)) {
+        bytes.iter().map(|&byte| windows_1252(byte)).collect()
+    } else {
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+}
+
+/// The encoding the XML declaration `bytes` start with names, if any.
+fn declared_encoding(bytes: &[u8]) -> Option<String> {
+    match Reader::from_reader(bytes).read_event_into(&mut Vec::new()) {
+        Ok(Event::Decl(decl)) => Some(String::from_utf8_lossy(&decl.encoding()?.ok()?).into_owned()),
+        _ => None,
+    }
 }
 
 /// The character a windows-1252 byte stands for. The five bytes it leaves unassigned are the C1
@@ -129,7 +154,7 @@ fn windows_1252(byte: u8) -> char {
 /// timeout, a rate limit and a server error are errors, to retry, when the link is `sure` to
 /// be what is wanted; else None, and the engine downloads the link, retrying as it does. The
 /// link is redacted in errors: a private feed's token is in it.
-async fn fetch(http: &reqwest::Client, url: &Url, feed: bool, sure: bool) -> Result<Option<(Vec<u8>, Url)>, String> {
+async fn fetch(http: &reqwest::Client, url: &Url, feed: bool, sure: bool) -> Result<Option<Fetched>, String> {
     use reqwest::header::{ACCEPT, CONTENT_TYPE};
     use reqwest::StatusCode;
     let fail = |e: reqwest::Error| {
@@ -158,11 +183,12 @@ async fn fetch(http: &reqwest::Client, url: &Url, feed: bool, sure: bool) -> Res
         Err(e) => return fail(e),
     };
     let base = resp.url().clone();
-    let labelled = resp
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|t| t.contains("rss") || t.contains("atom"));
+    let content_type = resp.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or_default();
+    let labelled = content_type.contains("rss") || content_type.contains("atom");
+    let charset = content_type.split(';').skip(1).find_map(|param| {
+        let (key, value) = param.split_once('=')?;
+        key.trim().eq_ignore_ascii_case("charset").then(|| value.trim().to_string())
+    });
     let mut known_feed = !feed;
     let too_large = |known_feed: bool| {
         if labelled || known_feed {
@@ -194,7 +220,14 @@ async fn fetch(http: &reqwest::Client, url: &Url, feed: bool, sure: bool) -> Res
             return too_large(known_feed);
         }
     }
-    Ok(known_feed.then_some((body, base)))
+    Ok(known_feed.then_some(Fetched { body, base, charset }))
+}
+
+/// What [`fetch`] read: the body, where it came from and the charset its Content-Type names.
+struct Fetched {
+    body: Vec<u8>,
+    base: Url,
+    charset: Option<String>,
 }
 
 /// The name of the first element in `head`, the start of an XML document in UTF-8 or (with a
@@ -749,7 +782,7 @@ impl AppleLink {
         }
         let url = Url::parse_with_params(api, &query).map_err(|e| e.to_string())?;
         match fetch(http, &url, false, true).await? {
-            Some((answer, _)) => read_lookup(&answer, self.show),
+            Some(answer) => read_lookup(&answer.body, self.show),
             None => Err(format!("Apple Podcasts refused to look up show {}; try again later", self.show)),
         }
     }
@@ -1204,10 +1237,27 @@ mod tests {
         let mut rss = br#"<?xml version="1.0" encoding="ISO-8859-1"?><rss version="2.0"><channel><title>Caf"#.to_vec();
         rss.extend_from_slice(b"\xE9</title><item><title>\x93Folge 1\x94 \x96 Gr\xFC\xDFe \x80</title>");
         rss.extend_from_slice(br#"<enclosure url="https://l.example/1.mp3" type="audio/mpeg"/></item></channel></rss>"#);
-        let feed = parse(&decode_feed(&rss), "https://l.example/feed.xml").unwrap().unwrap();
+        let feed = parse(&decode_feed(&rss, None), "https://l.example/feed.xml").unwrap().unwrap();
         assert_eq!((feed.title.as_deref(), feed.episodes[0].title.as_str()), (Some("Café"), "“Folge 1” – Grüße €"));
-        assert_eq!(decode_feed("Ünïcode".as_bytes()), "Ünïcode");
-        assert_eq!(decode_feed(b"\x81\x8D\x8F\x90\x9D\xFF"), "\u{81}\u{8D}\u{8F}\u{90}\u{9D}ÿ");
+        assert_eq!(decode_feed("Ünïcode".as_bytes(), Some("iso-8859-1")), "Ünïcode");
+        // Without a declaration, the Content-Type's charset tells.
+        assert_eq!(decode_feed(b"\x81\x8D\x8F\x90\x9D\xFF", Some("\"Windows-1252\"")), "\u{81}\u{8D}\u{8F}\u{90}\u{9D}ÿ");
+        assert_eq!(decode_feed(b"<?xml version='1.0' encoding='us-ascii'?><rss>\xE9", None), "<?xml version='1.0' encoding='us-ascii'?><rss>é");
+    }
+
+    /// A UTF-8 feed with a stray windows-1252 byte loses that byte alone: its other accented
+    /// letters, which name its folder and files, stay, and so does a BOM's absence.
+    #[test]
+    fn a_stray_byte_in_a_utf8_feed_garbles_nothing_else() {
+        let mut rss = "\u{FEFF}<?xml version=\"1.0\" encoding=\"UTF-8\"?><rss><channel><title>Café Grüße</title><item><title>Épisode ".as_bytes().to_vec();
+        rss.extend_from_slice(b"\x92s</title><enclosure url=\"https://u.example/1.mp3\" type=\"audio/mpeg\"/></item></channel></rss>");
+        for charset in [None, Some("utf-8")] {
+            let text = decode_feed(&rss, charset);
+            assert!(text.starts_with("<?xml"), "{text}");
+            let feed = parse(&text, "https://u.example/feed.xml").unwrap().unwrap();
+            assert_eq!((feed.title.as_deref(), feed.episodes[0].title.as_str()), (Some("Café Grüße"), "Épisode \u{FFFD}s"));
+        }
+        assert_eq!(decode_feed(b"<rss>Caf\xC3\xA9 \xFF", None), "<rss>Café \u{FFFD}");
     }
 
     #[test]
@@ -1441,5 +1491,22 @@ mod tests {
         assert!(list("https://podcasts.apple.com/us/podcast/an-interview/id1461515071?i=1000700000000").await.is_none());
         let err = list("https://podcasts.apple.com/us/podcast/gone/id42").await.unwrap().unwrap_err();
         assert!(err.starts_with("Apple Podcasts refused to look up show 42"), "{err}");
+    }
+
+    /// A feed without a declaration is read in the charset its Content-Type names.
+    #[tokio::test]
+    async fn the_content_type_names_a_feeds_charset() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let feed = url(&format!("http://{}/show.rss", listener.local_addr().unwrap()));
+        tokio::spawn(async move {
+            let rss = b"<rss><channel><title>Caf\xE9</title><item><enclosure url=\"/1.mp3\"/></item></channel></rss>";
+            let head = format!("HTTP/1.1 200 OK\r\nContent-Type: application/rss+xml; Charset=ISO-8859-1\r\nContent-Length: {}\r\n\r\n", rss.len());
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = socket.read(&mut [0u8; 8192]).await;
+            socket.write_all(&[head.as_bytes(), rss].concat()).await.unwrap();
+        });
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        assert_eq!(read_feed(&http, &feed, true).await.unwrap().unwrap().title.as_deref(), Some("Café"));
     }
 }
