@@ -3298,3 +3298,29 @@ async fn test_bare_sha512_and_sha1_checksums_of_a_single_stream() {
         assert_no_leftovers(&out);
     }
 }
+
+// ---- Subtitles and tags -----------------------------------------------------------------------
+
+/// The subtitles and tags the settings ask for reach yt-dlp's download.
+#[tokio::test]
+async fn test_subtitle_and_tag_settings_reach_yt_dlp() {
+    isolate_history();
+    let _history = HISTORY.write().await;
+    let (tools, temp) = (tempdir().unwrap(), tempdir().unwrap());
+    let output = temp.path().join("A song.mp3");
+    let opts = DownloadOptions {
+        media_preset: Some(MediaQualityPreset::AudioMp3),
+        ytdlp_path: Some(fake_ytdlp(tools.path(), &output)),
+        subtitles: Some("en,de".into()),
+        embed_metadata: false,
+        install_ffmpeg: false,
+        ..options(temp.path(), 4, 64 * KB)
+    };
+    let url = Url::parse("https://www.youtube.com/watch?v=abc").unwrap();
+
+    assert_eq!(run(&DownloadEngine::new(vec![url], opts), None).await, Ok(output));
+    let runs = runs_of(tools.path());
+    let [download] = &runs[..] else { panic!("one download: {runs:?}") };
+    assert!(has_arg(download, "--sub-langs", "en,de") && download.contains(&"--write-subs".to_string()), "{download:?}");
+    assert!(!download.iter().any(|arg| arg.starts_with("--embed")), "{download:?}");
+}

@@ -198,6 +198,9 @@ const POSTPROCESS_MARK: &str = "HFPOST";
 /// Final path of each video once every post-processor has run and the file has been moved.
 const PATH_TEMPLATE: &str = "after_move:HFPATH %(filepath)s";
 const PATH_MARK: &str = "HFPATH ";
+/// Keeps ffmpeg from moving the index of a file it writes tags into to the front (see
+/// [`NO_FASTSTART`]).
+const NO_FASTSTART_METADATA: [&str; 2] = ["--postprocessor-args", "Metadata+ffmpeg_o:-movflags -faststart"];
 
 /// Turns YouTube's formats into 10 MiB range fragments that `--concurrent-fragments` fetches in
 /// parallel; otherwise one connection pulls the 10 MiB pieces one after another. Fragments report
@@ -1303,6 +1306,9 @@ enum RunKind {
     Find,
     /// Downloads and post-processes, printing progress for [`OutputState`].
     Download,
+    /// Writes only the subtitles of what an extraction found ([`Source::Info`]), for a video the
+    /// engine downloaded (see [`subtitle_args`]).
+    Subtitles,
 }
 
 /// Whether a Download run with `options` asks YouTube for its formats in fragments (see
@@ -1379,10 +1385,17 @@ fn build_ytdlp_args(
             "--buffer-size",
             "16M",
         ],
+        RunKind::Subtitles => &["--skip-download"],
     };
     args.extend(kind_args.iter().map(|a| a.to_string()));
     if kind == RunKind::Download && fragments_youtube(options) {
         args.extend(YOUTUBE_DASHY.map(String::from));
+    }
+    if matches!(kind, RunKind::Download | RunKind::Subtitles) {
+        args.extend(subtitle_args(options));
+    }
+    if kind == RunKind::Download {
+        args.extend(embed_args(options, ffmpeg_dir.is_some()));
     }
 
     if supports(NO_PLUGIN_DIRS_MIN_VERSION) {
@@ -1409,6 +1422,57 @@ fn build_ytdlp_args(
         Source::Info(file) => args.extend(["--load-info-json".to_string(), file.to_string_lossy().into_owned()]),
     }
     args
+}
+
+/// The subtitle languages `options` ask for, as `--sub-langs` takes them, and whether they are
+/// `all` of them; None when they ask for none.
+fn sub_langs(options: &MediaDownloadOptions) -> Option<(String, bool)> {
+    let mut langs: Vec<&str> = options.subtitles.as_deref()?.split(',').map(str::trim).filter(|l| !l.is_empty()).collect();
+    for lang in &mut langs {
+        if lang.eq_ignore_ascii_case("all") {
+            *lang = "all";
+        }
+    }
+    let all = langs.contains(&"all");
+    if all {
+        // YouTube lists a stream's chat among its subtitles.
+        langs.push("-live_chat");
+    }
+    (!langs.is_empty()).then(|| (langs.join(","), all))
+}
+
+/// yt-dlp arguments that write the subtitles `options` ask for next to the video, as the site
+/// has them: `.srt`, else `.vtt`, else its best format. Not converted (`--convert-subs`): a
+/// conversion that fails is an error of the whole run, even with `--ignore-errors`. A language named
+/// gets the site's subtitles, else its automatic captions (a language only those have, `en-orig`,
+/// is one to name); `all` gets every language the site has subtitles in, not the automatic
+/// captions, often a hundred machine translations. A language the site lacks is left out, and one
+/// that fails to download is a warning (`--ignore-errors`), not the failure of the video.
+fn subtitle_args(options: &MediaDownloadOptions) -> Vec<String> {
+    let Some((langs, all)) = sub_langs(options) else { return Vec::new() };
+    let mut args = vec!["--write-subs".to_string()];
+    if !all {
+        args.push("--write-auto-subs".to_string());
+    }
+    args.extend(["--sub-langs".to_string(), langs]);
+    args.extend(["--sub-format", "srt/vtt/best", "--ignore-errors"].map(String::from));
+    args
+}
+
+/// yt-dlp arguments that write the title, artist, date, description and URL tags and the chapters
+/// into the file, and cover art into an audio file, as `options` ask. ffmpeg writes them: none
+/// without it.
+fn embed_args(options: &MediaDownloadOptions, have_ffmpeg: bool) -> Vec<String> {
+    if !options.embed_metadata || !have_ffmpeg {
+        return Vec::new();
+    }
+    let mut args = vec!["--embed-metadata", "--embed-chapters"];
+    if options.preset.extracts_audio() {
+        args.push("--embed-thumbnail");
+    } else {
+        args.extend(NO_FASTSTART_METADATA);
+    }
+    args.into_iter().map(String::from).collect()
 }
 
 /// One line printed by our `--progress-template`.
@@ -1792,10 +1856,14 @@ async fn run_to_end(mut cmd: Command, cancel_flag: Option<Arc<AtomicBool>>) -> R
         }
     };
     tree.disarm();
+    let stderr = String::from_utf8_lossy(&stderr);
     if status.success() {
+        // yt-dlp's (subtitles it skips, as a download's are, see `OutputState::handle_line`).
+        for warning in stderr.lines().filter(|l| l.starts_with("WARNING:")) {
+            tracing::warn!("{program}: {warning}");
+        }
         return Ok(stdout);
     }
-    let stderr = String::from_utf8_lossy(&stderr);
     let lines: Vec<&str> = stderr.lines().filter(|l| !l.trim().is_empty()).collect();
     // As a yt-dlp download reports them (see `OutputState::failure_message`), with the lines an
     // error goes on over (a geo-blocked video's "You might want to use a VPN ...", see
@@ -2228,36 +2296,154 @@ async fn fetch_streams(
     Ok(files)
 }
 
+/// How every ffmpeg run here starts: quiet but for errors, never waiting for input, overwriting
+/// its (temporary) output.
+const FFMPEG_QUIET: [&str; 5] = ["-y", "-nostdin", "-hide_banner", "-loglevel", "error"];
+/// Copies all of the first input, as yt-dlp's fixups do: without data streams, and past ones
+/// ffmpeg does not know.
+const COPY_ALL: [&str; 6] = ["-map", "0", "-dn", "-ignore_unknown", "-c", "copy"];
+
+/// `path` as a `file:` URL, as yt-dlp passes paths to ffmpeg, so no name is taken for a protocol
+/// or an option.
+fn file_arg(path: &Path) -> OsString {
+    let mut url = OsString::from("file:");
+    url.push(path);
+    url
+}
+
 /// ffmpeg arguments that turn `inputs` (the streams' files, in order) into `output` without
-/// re-encoding: several streams as yt-dlp's merger joins them, one as its MPEG-TS / DASH m4a
-/// fixups remux it. Neither asks for the second `faststart` pass (see [`NO_FASTSTART`]). Paths go
-/// in as `file:` URLs, as yt-dlp passes them, so no name is taken for a protocol or an option.
-fn ffmpeg_args(streams: &[PlannedStream], inputs: &[PathBuf], output: &Path) -> Vec<OsString> {
-    let file = |path: &Path| {
-        let mut url = OsString::from("file:");
-        url.push(path);
-        url
-    };
-    let mut args: Vec<OsString> = ["-y", "-nostdin", "-hide_banner", "-loglevel", "error"].map(OsString::from).to_vec();
+/// re-encoding, as `finish` says: several streams as yt-dlp's merger joins them, one as its MPEG-TS
+/// / DASH m4a fixups remux it, or copied as it is. `tags` go in too, the chapters read from the
+/// ffmetadata file `chapters` (see [`Tags`]). None asks for the second `faststart` pass (see
+/// [`NO_FASTSTART`]).
+fn ffmpeg_args(
+    streams: &[PlannedStream],
+    finish: Finish,
+    inputs: &[PathBuf],
+    tags: &Tags,
+    chapters: Option<&Path>,
+    output: &Path,
+) -> Vec<OsString> {
+    let mut args: Vec<OsString> = FFMPEG_QUIET.map(OsString::from).to_vec();
     for input in inputs {
-        args.extend([OsString::from("-i"), file(input)]);
+        args.extend([OsString::from("-i"), file_arg(input)]);
     }
-    if let [_] = streams {
-        args.extend(["-map", "0", "-dn", "-ignore_unknown", "-c", "copy", "-f", "mp4"].map(OsString::from));
-    } else {
-        args.extend(["-c", "copy"].map(OsString::from));
-        // yt-dlp's order. A stream yt-dlp cannot tell has audio or video is mapped if it has.
-        for (i, stream) in streams.iter().enumerate() {
-            for (kind, has) in [("a", stream.audio), ("v", stream.video)] {
-                if has != Some(false) {
-                    let optional = if has.is_none() { "?" } else { "" };
-                    args.extend([OsString::from("-map"), OsString::from(format!("{i}:{kind}:0{optional}"))]);
+    if let Some(chapters) = chapters {
+        args.extend(["-f", "ffmetadata", "-i"].map(OsString::from));
+        args.push(file_arg(chapters));
+    }
+    match finish {
+        Finish::Merge => {
+            args.extend(["-c", "copy"].map(OsString::from));
+            // yt-dlp's order. A stream yt-dlp cannot tell has audio or video is mapped if it has.
+            for (i, stream) in streams.iter().enumerate() {
+                for (kind, has) in [("a", stream.audio), ("v", stream.video)] {
+                    if has != Some(false) {
+                        let optional = if has.is_none() { "?" } else { "" };
+                        args.extend([OsString::from("-map"), OsString::from(format!("{i}:{kind}:0{optional}"))]);
+                    }
                 }
             }
         }
+        Finish::Remux => args.extend(COPY_ALL.into_iter().chain(["-f", "mp4"]).map(OsString::from)),
+        Finish::Rename => args.extend(COPY_ALL.map(OsString::from)),
     }
-    args.push(file(output));
+    if chapters.is_some() {
+        args.extend([OsString::from("-map_chapters"), OsString::from(inputs.len().to_string())]);
+    }
+    for (name, value) in &tags.metadata {
+        args.extend([OsString::from("-metadata"), OsString::from(format!("{name}={value}"))]);
+    }
+    args.push(file_arg(output));
     args
+}
+
+/// The tags and chapters yt-dlp's `--embed-metadata` writes into a file (see [`tags_of`]).
+#[derive(Debug, Default, PartialEq)]
+struct Tags {
+    /// `-metadata` names and values, in yt-dlp's order.
+    metadata: Vec<(&'static str, String)>,
+    /// The chapters, as an ffmetadata file; None without any.
+    chapters: Option<String>,
+}
+
+impl Tags {
+    fn is_empty(&self) -> bool {
+        self.metadata.is_empty() && self.chapters.is_none()
+    }
+}
+
+/// The tags and chapters yt-dlp's `--embed-metadata --embed-chapters` would write for what it found
+/// (`info`), from the fields it takes them from (its `FFmpegMetadataPP`): the title (a track's
+/// own, else the video's), upload date, description, page URL, artist (the uploader, unless the
+/// site names an artist) and what a site knows of albums, shows and genres, under the names ffmpeg
+/// maps to each container's own tags. yt-dlp has filled in each chapter's times already.
+fn tags_of(info: &Value) -> Tags {
+    // yt-dlp's first field that is set, even when empty; lists are joined.
+    let field = |keys: &[&str]| -> Option<String> {
+        let value = keys.iter().find_map(|key| info.get(*key).filter(|v| !v.is_null()))?;
+        let text = match value {
+            Value::String(s) => s.clone(),
+            Value::Array(items) => {
+                items.iter().map(|item| item.as_str().map_or_else(|| item.to_string(), str::to_string)).collect::<Vec<_>>().join(", ")
+            }
+            other => other.to_string(),
+        };
+        // ffmpeg cannot take a NUL on its command line.
+        Some(text.replace('\0', "")).filter(|text| !text.is_empty())
+    };
+    let mut metadata = Vec::new();
+    let mut add = |names: &[&'static str], keys: &[&str]| {
+        if let Some(value) = field(keys) {
+            metadata.extend(names.iter().map(|name| (*name, value.clone())));
+        }
+    };
+    add(&["title"], &["track", "title"]);
+    add(&["date"], &["upload_date"]);
+    add(&["description", "synopsis"], &["description"]);
+    add(&["purl", "comment"], &["webpage_url"]);
+    add(&["track"], &["track_number"]);
+    add(&["artist"], &["artist", "artists", "creator", "creators", "uploader", "uploader_id"]);
+    add(&["composer"], &["composer", "composers"]);
+    add(&["genre"], &["genre", "genres", "categories", "tags"]);
+    add(&["album"], &["album", "series"]);
+    add(&["album_artist"], &["album_artist", "album_artists"]);
+    add(&["disc"], &["disc_number"]);
+    add(&["show"], &["series"]);
+    add(&["season_number"], &["season_number"]);
+    add(&["episode_id"], &["episode", "episode_id"]);
+    add(&["episode_sort"], &["episode_number"]);
+
+    let escape = |text: &str| {
+        text.chars().fold(String::new(), |mut out, c| {
+            if matches!(c, '=' | ';' | '#' | '\\' | '\n') {
+                out.push('\\');
+            }
+            out.push(c);
+            out
+        })
+    };
+    let listed = info.get("chapters").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
+    let mut chapters = String::from(";FFMETADATA1\n");
+    for chapter in listed {
+        let time = |key| chapter.get(key).and_then(Value::as_f64);
+        let (Some(start), Some(end)) = (time("start_time"), time("end_time")) else { continue };
+        // ffmpeg refuses the whole file for a chapter that ends before it starts.
+        if start < 0.0 || end < start {
+            continue;
+        }
+        chapters.push_str(&format!("[CHAPTER]\nTIMEBASE=1/1000\nSTART={}\nEND={}\n", (start * 1000.0) as u64, (end * 1000.0) as u64));
+        if let Some(title) = chapter.get("title").and_then(Value::as_str).filter(|t| !t.is_empty()) {
+            chapters.push_str(&format!("title={}\n", escape(title)));
+        }
+    }
+    Tags { metadata, chapters: chapters.contains("[CHAPTER]").then_some(chapters) }
+}
+
+/// Where ffmpeg reads the chapters it writes into `output` from, next to it.
+fn chapters_file(output: &Path) -> PathBuf {
+    let stem = output.file_stem().map_or_else(String::new, |s| s.to_string_lossy().into_owned());
+    output.with_file_name(format!("{stem}.hfchapters.txt"))
 }
 
 /// The stream of `output` that the file `name` next to it belongs to: a stream of any format
@@ -2288,14 +2474,15 @@ fn merge_temp(output: &Path) -> PathBuf {
 
 /// Deletes every stream of `output` next to it (see [`stream_of`]), finished or partial, with the
 /// history entries the engine made for them, except what a download holds, and what a merge a
-/// crash cut short left (see [`merge_temp`]). The caller holds the claim on `output`, so no job is
-/// downloading these streams for it or joining them. Blocking.
+/// crash cut short left (see [`merge_temp`] and [`chapters_file`]). The caller holds the claim on
+/// `output`, so no job is downloading these streams for it or joining them. Blocking.
 fn remove_streams_of(output: &Path) {
     let Some(dir) = output.parent() else { return };
-    let temp = merge_temp(output);
-    match std::fs::remove_file(&temp) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => tracing::warn!("Failed to delete {}: {e}", temp.display()),
-        _ => {}
+    for temp in [merge_temp(output), chapters_file(output)] {
+        match std::fs::remove_file(&temp) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => tracing::warn!("Failed to delete {}: {e}", temp.display()),
+            _ => {}
+        }
     }
     let stream_name = |path: &Path| stream_of(output, path.file_name()?.to_str()?);
     let mut streams: Vec<String> =
@@ -2356,9 +2543,10 @@ enum FastError {
 
 /// Downloads what yt-dlp found (`info`, its `-J` output) with the engine instead of yt-dlp: every
 /// stream at once, each over as many connections as the engine opens, then joined or remuxed
-/// with ffmpeg as yt-dlp would. Until the output is made, the streams stay for the next attempt
-/// to resume (see [`MediaStream::key`]); once it exists, or ffmpeg cannot join them, every stream
-/// of it goes (see [`remove_streams_of`]).
+/// with ffmpeg as yt-dlp would, with the tags and chapters its `--embed-metadata` writes when
+/// `options` ask for them (see [`tags_of`]). Until the output is made, the streams stay for the
+/// next attempt to resume (see [`MediaStream::key`]); once it exists, or ffmpeg cannot join them,
+/// every stream of it goes (see [`remove_streams_of`]).
 async fn fast_download(
     info: &Value,
     options: &MediaDownloadOptions,
@@ -2418,7 +2606,8 @@ async fn fast_download(
         });
     }
     let files = fetch_streams(streams, sizes, fetch, progress_tx, cancel_flag).await.map_err(FastError::Failed)?;
-    let made = joined(&plan, &files, ffmpeg, cancel_flag).await;
+    let tags = if options.embed_metadata { tags_of(info) } else { Tags::default() };
+    let made = joined(&plan, &files, ffmpeg, &tags, cancel_flag).await;
     // Cancelled while ffmpeg ran: the next attempt has every stream at hand.
     if made.is_err() && is_cancelled(cancel_flag) {
         return Err(FastError::Failed(CANCELLED.to_string()));
@@ -2431,35 +2620,71 @@ async fn fast_download(
     made.map_err(FastError::Failed)
 }
 
-/// Makes the plan's output from the streams' `files`: the one file itself, or what ffmpeg writes
-/// to a temporary name next to it.
+/// Makes the plan's output from the streams' `files`, with `tags`: the one file itself, or what
+/// ffmpeg writes to a temporary name next to it. A file that is the output as it is goes through
+/// ffmpeg only for its tags, when ffmpeg is at hand, and is kept without them if that fails.
 async fn joined(
     plan: &FastPlan,
     files: &[PathBuf],
     ffmpeg: Option<&Path>,
+    tags: &Tags,
+    cancel_flag: &Option<Arc<AtomicBool>>,
+) -> Result<PathBuf, String> {
+    if plan.finish != Finish::Rename {
+        return ffmpeg_output(plan, files, ffmpeg.ok_or("ffmpeg is missing")?, tags, cancel_flag).await;
+    }
+    let [file] = files else {
+        return Err(format!("{} streams for one file", files.len()));
+    };
+    if let Some(ffmpeg) = ffmpeg.filter(|_| !tags.is_empty()) {
+        match ffmpeg_output(plan, files, ffmpeg, tags, cancel_flag).await {
+            Err(e) if !is_cancelled(cancel_flag) => tracing::warn!("Keeping {} without its tags: {e}", plan.output.display()),
+            made => return made,
+        }
+    }
+    let output = &plan.output;
+    tokio::fs::rename(file, output)
+        .await
+        .map(|()| output.clone())
+        .map_err(|e| format!("Failed to move {} to {}: {e}", file.display(), output.display()))
+}
+
+/// What ffmpeg makes of `files` and `tags` as the plan says (see [`ffmpeg_args`]), written to a
+/// temporary name, then moved to the plan's output.
+async fn ffmpeg_output(
+    plan: &FastPlan,
+    files: &[PathBuf],
+    ffmpeg: &Path,
+    tags: &Tags,
     cancel_flag: &Option<Arc<AtomicBool>>,
 ) -> Result<PathBuf, String> {
     let output = &plan.output;
-    let rename = |from: PathBuf| async move {
-        tokio::fs::rename(&from, output)
+    let temp = merge_temp(output);
+    let chapters = match &tags.chapters {
+        Some(text) => {
+            let file = chapters_file(output);
+            match tokio::fs::write(&file, text).await {
+                Ok(()) => Some(file),
+                Err(e) => {
+                    tracing::warn!("Leaving out the chapters of {}: {}: {e}", output.display(), file.display());
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+    let mut cmd = tree_command(ffmpeg);
+    cmd.args(ffmpeg_args(&plan.streams, plan.finish, files, tags, chapters.as_deref(), &temp));
+    let made = match run_to_end(cmd, cancel_flag.clone()).await {
+        Ok(_) => tokio::fs::rename(&temp, output)
             .await
             .map(|()| output.clone())
-            .map_err(|e| format!("Failed to move {} to {}: {e}", from.display(), output.display()))
-    };
-    if plan.finish == Finish::Rename {
-        let [file] = files else {
-            return Err(format!("{} streams for one file", files.len()));
-        };
-        return rename(file.clone()).await;
-    }
-    let ffmpeg = ffmpeg.ok_or("ffmpeg is missing")?;
-    let temp = merge_temp(output);
-    let mut cmd = tree_command(ffmpeg);
-    cmd.args(ffmpeg_args(&plan.streams, files, &temp));
-    let made = match run_to_end(cmd, cancel_flag.clone()).await {
-        Ok(_) => rename(temp.clone()).await,
+            .map_err(|e| format!("Failed to move {} to {}: {e}", temp.display(), output.display())),
         Err(e) => Err(e),
     };
+    if let Some(chapters) = chapters {
+        let _ = tokio::fs::remove_file(chapters).await;
+    }
     if made.is_err() {
         let _ = tokio::fs::remove_file(&temp).await;
     }
@@ -2738,7 +2963,28 @@ async fn download_with(
                             None => Err(FastError::Unsupported("yt-dlp converts the audio itself".to_string())),
                         };
                         match made {
-                            Ok(path) => return Ok(path),
+                            Ok(path) => {
+                                // yt-dlp writes the subtitles next to it, of what it found.
+                                if sub_langs(options).is_some() {
+                                    let wrote = match tools.cookies.files.file(Some(json), "json").await {
+                                        Ok(file) => {
+                                            let cookies = tools.cookies.for_run(&options.cookies).await;
+                                            let command = command(Source::Info(&file.path), RunKind::Subtitles, &cookies);
+                                            let run = run_to_end(command, cancel_flag.clone()).await;
+                                            if !is_cancelled(&cancel_flag) {
+                                                cookies.finish(run.is_ok()).await;
+                                            }
+                                            run.map(drop)
+                                        }
+                                        Err(e) => Err(e),
+                                    };
+                                    // The video is whole whatever becomes of them.
+                                    if let Err(e) = wrote {
+                                        tracing::warn!("No subtitles for {}: {e}", path.display());
+                                    }
+                                }
+                                return Ok(path);
+                            }
                             Err(_) if is_cancelled(&cancel_flag) => return Err(CANCELLED.to_string()),
                             // yt-dlp would write the very file the other job is making.
                             Err(FastError::Busy(e)) => return Err(e),
@@ -3816,21 +4062,37 @@ mod tests {
         let mut plan = plan_fast(&youtube_info(&out), true).unwrap();
         let inputs = [out.join("v.mp4"), out.join("a.webm")];
         let file = |p: &Path| format!("file:{}", p.display());
-        let args = |plan: &FastPlan| {
-            let args = ffmpeg_args(&plan.streams, &inputs[..plan.streams.len()], &out.join("t.mp4"));
+        let tagged = |plan: &FastPlan, tags: &Tags, chapters: Option<&Path>| {
+            let args = ffmpeg_args(&plan.streams, plan.finish, &inputs[..plan.streams.len()], tags, chapters, &out.join("t.mp4"));
             args.iter().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>().join(" ")
         };
+        let args = |plan: &FastPlan| tagged(plan, &Tags::default(), None);
         let (video, audio, temp) = (file(&inputs[0]), file(&inputs[1]), file(&out.join("t.mp4")));
         assert_eq!(
             args(&plan),
             format!("-y -nostdin -hide_banner -loglevel error -i {video} -i {audio} -c copy -map 0:v:0 -map 1:a:0 {temp}")
         );
+        // The tags after the streams, the chapters from an input of their own.
+        let chapters = out.join("t.hfchapters.txt");
+        let tags = Tags { metadata: vec![("title", "A = b".to_string()), ("artist", "Me".to_string())], chapters: Some(String::new()) };
+        assert_eq!(
+            tagged(&plan, &tags, Some(&chapters)),
+            format!(
+                "-y -nostdin -hide_banner -loglevel error -i {video} -i {audio} -f ffmetadata -i {} -c copy -map 0:v:0 -map 1:a:0 \
+                 -map_chapters 2 -metadata title=A = b -metadata artist=Me {temp}",
+                file(&chapters)
+            )
+        );
         // Streams yt-dlp cannot tell have audio (or video) are mapped only if they have.
         plan.streams[0].audio = None;
         assert!(args(&plan).contains("-map 0:a:0? -map 0:v:0 -map 1:a:0"), "{}", args(&plan));
         plan.streams.truncate(1);
+        plan.finish = Finish::Remux;
         assert!(args(&plan).ends_with(&format!("-i {video} -map 0 -dn -ignore_unknown -c copy -f mp4 {temp}")));
         assert!(!args(&plan).contains("movflags"));
+        // A file that is the output as it is, copied for its tags into the same format.
+        plan.finish = Finish::Rename;
+        assert!(tagged(&plan, &tags, None).ends_with(&format!("-i {video} -map 0 -dn -ignore_unknown -c copy -metadata title=A = b -metadata artist=Me {temp}")));
     }
 
     fn snapshot(downloaded: u64, total: u64, speed: f64) -> EngineSnapshot {
@@ -4342,9 +4604,12 @@ mod tests {
     /// A stand-in for yt-dlp that works in `dir`. `-J` prints `dir/info.json`, or fails as an
     /// extractor does while `dir/extract-error` exists; a download writes `output` and reports it.
     /// Each run adds a line to `dir/runs.txt`: `extract`, or `download url` / `download info`, the
-    /// latter for `--load-info-json`, whose file it copies to `dir/loaded.json`.
+    /// latter for `--load-info-json`, whose file it copies to `dir/loaded.json`. A run for the
+    /// subtitles only (`--skip-download`) writes `output`'s English ones and adds `subtitles info`.
     fn fake_ytdlp(dir: &Path, output: &Path) -> PathBuf {
         let (dir_s, out_s, out_dir) = (dir.display(), output.display(), output.parent().unwrap().display());
+        let subs = output.with_extension("en.srt");
+        let subs_s = subs.display();
         #[cfg(windows)]
         let (bin, script) = (
             dir.join("yt-dlp.cmd"),
@@ -4352,6 +4617,8 @@ mod tests {
                 "@echo off\r\n\
                  if \"%~2\"==\"--version\" (echo 2026.08.19& exit /b 0)\r\n\
                  if \"%~4\"==\"-J\" goto extract\r\n\
+                 set kind=download\r\n\
+                 if \"%~4\"==\"--skip-download\" set kind=subtitles\r\n\
                  set source=url\r\n\
                  :scan\r\n\
                  if \"%~1\"==\"\" goto download\r\n\
@@ -4359,10 +4626,15 @@ mod tests {
                  shift\r\n\
                  goto scan\r\n\
                  :download\r\n\
+                 if \"%kind%\"==\"subtitles\" goto subtitles\r\n\
                  >>\"{dir_s}\\runs.txt\" echo download %source%\r\n\
                  if not exist \"{out_dir}\" mkdir \"{out_dir}\"\r\n\
                  >\"{out_s}\" echo video\r\n\
                  echo HFPATH {out_s}\r\n\
+                 exit /b 0\r\n\
+                 :subtitles\r\n\
+                 >>\"{dir_s}\\runs.txt\" echo subtitles %source%\r\n\
+                 >\"{subs_s}\" echo 1\r\n\
                  exit /b 0\r\n\
                  :extract\r\n\
                  >>\"{dir_s}\\runs.txt\" echo extract\r\n\
@@ -4382,11 +4654,17 @@ mod tests {
                  [ -e '{dir_s}/extract-error' ] && {{ echo 'ERROR: [youtube] abc: Video unavailable' >&2; exit 1; }}\n\
                  cat '{dir_s}/info.json'; exit 0\n\
                  fi\n\
+                 kind=download\n\
+                 [ \"$4\" = --skip-download ] && kind=subtitles\n\
                  source=url\n\
                  while [ $# -gt 0 ]; do\n\
                  [ \"$1\" = --load-info-json ] && {{ source=info; cp \"$2\" '{dir_s}/loaded.json'; }}\n\
                  shift\n\
                  done\n\
+                 if [ $kind = subtitles ]; then\n\
+                 echo \"subtitles $source\" >> '{dir_s}/runs.txt'\n\
+                 echo 1 > '{subs_s}'; exit 0\n\
+                 fi\n\
                  echo \"download $source\" >> '{dir_s}/runs.txt'\n\
                  mkdir -p '{out_dir}'\n\
                  echo video > '{out_s}'\n\
@@ -4412,6 +4690,17 @@ mod tests {
         cookies: &BrowserCookies,
         fetch: &StreamFetcher<'_>,
     ) -> Result<PathBuf, String> {
+        fake_download_with(dir, info, cookies, fetch, MediaDownloadOptions::default()).await
+    }
+
+    /// [`fake_download`] with `options`, but for the folder.
+    async fn fake_download_with(
+        dir: &Path,
+        info: &Value,
+        cookies: &BrowserCookies,
+        fetch: &StreamFetcher<'_>,
+        options: MediaDownloadOptions,
+    ) -> Result<PathBuf, String> {
         let out = dir.join("out");
         std::fs::write(dir.join("info.json"), serde_json::to_vec(info).unwrap()).unwrap();
         let tools = Tools {
@@ -4423,7 +4712,7 @@ mod tests {
             version_cache: None,
             cookies,
         };
-        let options = MediaDownloadOptions { output_dir: out, ..Default::default() };
+        let options = MediaDownloadOptions { output_dir: out, ..options };
         let url = Url::parse("https://www.youtube.com/watch?v=jNQXAC9IVRw").unwrap();
         download_with(&url, &options, tools, None, None, Some(fetch), None).await
     }
@@ -4844,5 +5133,229 @@ mod tests {
         ] {
             assert!(!site_failed(none_took_it), "{none_took_it}");
         }
+    }
+
+    // ---- Subtitles and tags ----
+
+    /// The arguments of a `kind` run with `options`, ffmpeg at hand or not.
+    fn args_of(options: &MediaDownloadOptions, kind: RunKind, ffmpeg: bool) -> Vec<String> {
+        let url = Url::parse("https://www.youtube.com/watch?v=abc").unwrap();
+        let ffmpeg_dir = std::env::temp_dir();
+        build_ytdlp_args(Source::Url(&url), options, kind, &[], ffmpeg.then_some(ffmpeg_dir.as_path()), None, Some("2026.08.19"))
+    }
+
+    /// Whether `args` hold `wanted` in a row.
+    fn holds(args: &[String], wanted: &[&str]) -> bool {
+        args.windows(wanted.len()).any(|w| w.iter().zip(wanted).all(|(a, b)| a == b))
+    }
+
+    #[test]
+    fn subtitles_are_asked_of_the_runs_that_write_files() {
+        let named = MediaDownloadOptions { subtitles: Some(" en, es ,".to_string()), ..Default::default() };
+        let wanted = ["--write-subs", "--write-auto-subs", "--sub-langs", "en,es", "--sub-format", "srt/vtt/best", "--ignore-errors"];
+        for (kind, ffmpeg) in [(RunKind::Download, true), (RunKind::Download, false), (RunKind::Subtitles, true)] {
+            let args = args_of(&named, kind, ffmpeg);
+            // As the site has them: a conversion that fails would fail the video.
+            assert!(holds(&args, &wanted) && !args.contains(&"--convert-subs".to_string()), "{args:?}");
+        }
+        // Every language the site has subtitles in, none of its machine translations nor a chat.
+        let all = MediaDownloadOptions { subtitles: Some("ALL".to_string()), ..Default::default() };
+        let args = args_of(&all, RunKind::Download, true);
+        assert!(holds(&args, &["--write-subs", "--sub-langs", "all,-live_chat"]), "{args:?}");
+        assert!(!args.contains(&"--write-auto-subs".to_string()), "{args:?}");
+        // Finding what to download writes nothing; asked for none, no run writes any.
+        for kind in [RunKind::Extract, RunKind::Find] {
+            assert!(!args_of(&named, kind, true).contains(&"--write-subs".to_string()));
+        }
+        for none in [None, Some(""), Some(" , ")] {
+            let options = MediaDownloadOptions { subtitles: none.map(str::to_string), ..Default::default() };
+            assert!(!args_of(&options, RunKind::Download, true).contains(&"--write-subs".to_string()), "{none:?}");
+        }
+        // A subtitles run downloads nothing else and reports no progress.
+        let only = args_of(&named, RunKind::Subtitles, true);
+        assert!(only.contains(&"--skip-download".to_string()) && !only.contains(&"--embed-metadata".to_string()), "{only:?}");
+        assert!(!only.contains(&PROGRESS_TEMPLATE.to_string()), "{only:?}");
+    }
+
+    #[test]
+    fn tags_are_embedded_by_ffmpeg_as_asked() {
+        let video = args_of(&MediaDownloadOptions::default(), RunKind::Download, true);
+        assert!(holds(&video, &["--embed-metadata", "--embed-chapters", NO_FASTSTART_METADATA[0], NO_FASTSTART_METADATA[1]]), "{video:?}");
+        assert!(!video.contains(&"--embed-thumbnail".to_string()), "{video:?}");
+        let audio = MediaDownloadOptions { preset: MediaQualityPreset::AudioMp3, ..Default::default() };
+        assert!(holds(&args_of(&audio, RunKind::Download, true), &["--embed-metadata", "--embed-chapters", "--embed-thumbnail"]));
+        // ffmpeg writes them: none without it, none when not asked for, none but in a download.
+        let off = MediaDownloadOptions { embed_metadata: false, ..Default::default() };
+        for args in [
+            args_of(&MediaDownloadOptions::default(), RunKind::Download, false),
+            args_of(&off, RunKind::Download, true),
+            args_of(&MediaDownloadOptions::default(), RunKind::Extract, true),
+        ] {
+            assert!(!args.iter().any(|a| a.starts_with("--embed")), "{args:?}");
+        }
+    }
+
+    /// `yt-dlp -J` (trimmed) for a YouTube video with chapters, as yt-dlp 2026.08.19 answered.
+    fn chaptered_info() -> Value {
+        serde_json::json!({
+            "id": "wSSmNUl9Snw", "title": "The Computer Hack That Saved Apollo 14",
+            "uploader": "Scott Manley", "uploader_id": "@scottmanley", "creators": null,
+            "upload_date": "20170831", "webpage_url": "https://www.youtube.com/watch?v=wSSmNUl9Snw",
+            "duration": 682, "extractor_key": "Youtube", "_type": "video",
+            "description": "Apollo 14 almost never made it to the lunar surface thanks to a hardware failure which caused a short circuit in the abort switch.",
+            "categories": ["Science & Technology"], "tags": ["apollo 14", "computer hack", "troubleshooting"],
+            "chapters": [
+                {"start_time": 0, "title": "The Apollo 14 crisis", "end_time": 36},
+                {"start_time": 36, "title": "Mission control reacts", "end_time": 105},
+                {"start_time": 105, "title": "Understanding the computer", "end_time": 229},
+                {"start_time": 229, "title": "The first software hack", "end_time": 305},
+                {"start_time": 305, "title": "Risks of the initial plan", "end_time": 362},
+                {"start_time": 362, "title": "A new procedural approach", "end_time": 451},
+                {"start_time": 451, "title": "Executing the new commands", "end_time": 525},
+                {"start_time": 525, "title": "Restoring computer control", "end_time": 637},
+                {"start_time": 637, "title": "Conclusion and legacy", "end_time": 682},
+            ],
+        })
+    }
+
+    #[test]
+    fn a_videos_tags_are_the_ones_yt_dlp_embeds() {
+        let tags = tags_of(&chaptered_info());
+        let description = chaptered_info()["description"].as_str().unwrap().to_string();
+        let url = "https://www.youtube.com/watch?v=wSSmNUl9Snw".to_string();
+        assert_eq!(
+            tags.metadata,
+            [
+                ("title", "The Computer Hack That Saved Apollo 14".to_string()),
+                ("date", "20170831".to_string()),
+                ("description", description.clone()),
+                ("synopsis", description),
+                ("purl", url.clone()),
+                ("comment", url),
+                ("artist", "Scott Manley".to_string()),
+                ("genre", "Science & Technology".to_string()),
+            ]
+        );
+        let chapters = tags.chapters.expect("chapters");
+        assert!(chapters.starts_with(";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=36000\ntitle=The Apollo 14 crisis\n"), "{chapters}");
+        assert!(chapters.ends_with("START=637000\nEND=682000\ntitle=Conclusion and legacy\n"), "{chapters}");
+        assert_eq!(chapters.matches("[CHAPTER]").count(), 9);
+
+        // A track's own title, number and artists, a show's episode; ffmetadata's special
+        // characters escaped; chapters ffmpeg would refuse left out, an untitled one kept.
+        let track = serde_json::json!({
+            "title": "Video", "track": "Song\u{0}", "track_number": 7, "artists": ["A", "B"], "uploader": "Channel",
+            "genres": ["Rock", "Pop"], "series": "Show", "episode_number": 3, "description": "",
+            "chapters": [
+                {"start_time": 0, "end_time": 10, "title": "One = two; #3 \\ back\nslash"},
+                {"start_time": 12, "end_time": 11, "title": "Backwards"},
+                {"start_time": 20},
+                {"start_time": 20, "end_time": 30.5},
+            ],
+        });
+        let tags = tags_of(&track);
+        let expected = [
+            ("title", "Song"),
+            ("track", "7"),
+            ("artist", "A, B"),
+            ("genre", "Rock, Pop"),
+            ("album", "Show"),
+            ("show", "Show"),
+            ("episode_sort", "3"),
+        ];
+        assert_eq!(tags.metadata, expected.map(|(name, value)| (name, value.to_string())));
+        assert_eq!(
+            tags.chapters.as_deref(),
+            Some(
+                ";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=10000\ntitle=One \\= two\\; \\#3 \\\\ back\\\nslash\n\
+                 [CHAPTER]\nTIMEBASE=1/1000\nSTART=20000\nEND=30500\n"
+            )
+        );
+        assert!(tags_of(&serde_json::json!({"id": "x"})).is_empty());
+    }
+
+    /// What ffmpeg reads of `file`: its streams, tags and chapters.
+    fn probe(ffmpeg: &Path, file: &Path) -> String {
+        let out = std::process::Command::new(ffmpeg).args(["-hide_banner", "-i"]).arg(file).output().unwrap();
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    }
+
+    #[tokio::test]
+    async fn the_engines_file_gets_the_tags_and_chapters() {
+        let Some(ffmpeg) = find_ffmpeg_path() else {
+            eprintln!("skipped: ffmpeg not found");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (src, out) = (dir.path().join("src"), dir.path().join("out"));
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        let video = src.join("v.mp4");
+        lavfi(&ffmpeg, "testsrc=duration=2:size=64x48:rate=5", &[], &video);
+        lavfi(&ffmpeg, "sine=duration=2", &[], &src.join("a.m4a"));
+        let mut info = chaptered_info();
+        info["duration"] = 2.into();
+        info["chapters"] = serde_json::json!([{"start_time": 0, "end_time": 1, "title": "One = one"}, {"start_time": 1, "end_time": 2, "title": "Two"}]);
+        let tags = tags_of(&info);
+
+        // Joined from its streams.
+        let mut plan = plan_fast(&mp4_merge_info(&out), true).unwrap();
+        let files = [video.clone(), src.join("a.m4a")];
+        let path = joined(&plan, &files, Some(&ffmpeg), &tags, &None).await.unwrap();
+        let read = probe(&ffmpeg, &path);
+        assert!(read.contains("The Computer Hack That Saved Apollo 14") && read.contains("Scott Manley"), "{read}");
+        assert!(read.contains("Chapter #0:1: start 1.000000, end 2.000000") && read.contains("One = one"), "{read}");
+        assert_eq!(media_streams(&path), (true, true));
+        assert_eq!(names_in(&out), ["clip.mp4"], "the chapters file stays behind");
+
+        // A file that is the output as it is: copied with them into its place.
+        std::fs::remove_file(&path).unwrap();
+        plan.streams.truncate(1);
+        plan.finish = Finish::Rename;
+        let path = joined(&plan, &files[..1], Some(&ffmpeg), &tags, &None).await.unwrap();
+        assert!(probe(&ffmpeg, &path).contains("Scott Manley"));
+        assert_eq!(names_in(&out), ["clip.mp4"]);
+        // ffmpeg failing, it is kept as it is.
+        std::fs::remove_file(&path).unwrap();
+        let bytes = std::fs::read(&video).unwrap();
+        let path = joined(&plan, &files[..1], Some(&dir.path().join("no-ffmpeg-here")), &tags, &None).await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(names_in(&out), ["clip.mp4"]);
+    }
+
+    /// yt-dlp's `-J` for a video of one plain file the engine downloads itself, with nothing to join.
+    fn one_file_info(out: &Path) -> Value {
+        let mut info = merge_info(out, Value::Null, Value::Null);
+        info["requested_formats"] = Value::Null;
+        for (key, value) in format_info("18", "mp4", "avc1.42001E", "mp4a.40.2", 5).as_object().unwrap() {
+            info[key] = value.clone();
+        }
+        info
+    }
+
+    #[tokio::test]
+    async fn yt_dlp_writes_the_subtitles_of_the_video_the_engine_downloaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let cookies = BrowserCookies::new(Some(dir.path().join("private")));
+        let fetch: &StreamFetcher<'_> = &|stream, _tx, _stop| {
+            Box::pin(async move {
+                std::fs::write(&stream.path, b"video").unwrap();
+                Ok(stream.path)
+            })
+        };
+        let out = dir.path().join("out");
+        let options = MediaDownloadOptions { subtitles: Some("en".to_string()), ..Default::default() };
+        let path = fake_download_with(dir.path(), &one_file_info(&out), &cookies, fetch, options).await.unwrap();
+        assert_eq!(path, out.join("clip.mp4"));
+        // From what was found: nothing is extracted again.
+        assert_eq!(runs_in(dir.path()), ["extract", "subtitles info"]);
+        assert_eq!(names_in(&out), ["clip.en.srt", "clip.mp4"]);
+        assert_eq!(std::fs::read(&path).unwrap(), b"video");
+
+        // Asked for none, yt-dlp is not run for them.
+        let again = tempfile::tempdir().unwrap();
+        let out = again.path().join("out");
+        fake_download(again.path(), &one_file_info(&out), &cookies, fetch).await.unwrap();
+        assert_eq!(runs_in(again.path()), ["extract"]);
     }
 }
