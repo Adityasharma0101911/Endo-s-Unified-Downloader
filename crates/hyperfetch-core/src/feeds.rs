@@ -127,9 +127,10 @@ fn decode_feed(bytes: &[u8], charset: Option<&str>) -> String {
     }
 }
 
-/// The encoding the XML declaration `bytes` start with names, if any.
+/// The encoding the XML declaration `bytes` start with names, if any, past whitespace some feeds
+/// put before it.
 fn declared_encoding(bytes: &[u8]) -> Option<String> {
-    match Reader::from_reader(bytes).read_event_into(&mut Vec::new()) {
+    match Reader::from_reader(bytes.trim_ascii_start()).read_event_into(&mut Vec::new()) {
         Ok(Event::Decl(decl)) => Some(String::from_utf8_lossy(&decl.encoding()?.ok()?).into_owned()),
         _ => None,
     }
@@ -1295,6 +1296,10 @@ mod tests {
         // Without a declaration, the Content-Type's charset tells.
         assert_eq!(decode_feed(b"\x81\x8D\x8F\x90\x9D\xFF", Some("\"Windows-1252\"")), "\u{81}\u{8D}\u{8F}\u{90}\u{9D}ÿ");
         assert_eq!(decode_feed(b"<?xml version='1.0' encoding='us-ascii'?><rss>\xE9", None), "<?xml version='1.0' encoding='us-ascii'?><rss>é");
+        // Whitespace some feeds put before the declaration does not hide it.
+        let padded = [b"\r\n \t".as_slice(), &rss].concat();
+        let feed = parse(&decode_feed(&padded, None), "https://l.example/feed.xml").unwrap().unwrap();
+        assert_eq!(feed.title.as_deref(), Some("Café"));
     }
 
     /// A UTF-8 feed with a stray windows-1252 byte loses that byte alone: its other accented
