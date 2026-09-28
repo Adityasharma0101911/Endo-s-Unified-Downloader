@@ -268,7 +268,7 @@ sudo systemctl enable endos-downloader       # also at every boot
 journalctl -u endos-downloader -f            # progress and results
 ```
 
-The service downloads every line of the queue, two at a time, and then exits. Files that are already complete are skipped on the next run, and interrupted files resume. `systemctl stop` sends SIGTERM, which saves the resume state. The service restarts only after a crash. It does not restart after a failed download, so a dead link cannot cause a restart loop. The unit runs as an unprivileged user with a read-only system, no home-directory access and a restricted set of address families. A folder, playlist, channel or feed line is listed on every run, and only what is new is downloaded, so the queue can hold subscriptions. Its history, the download archive and the managed yt-dlp and ffmpeg are stored in `/var/lib/endos-downloader`.
+The service downloads every line of the queue, two at a time, and then exits. Files that are already complete are skipped on the next run, and interrupted files resume. `systemctl stop` sends SIGTERM, which saves the resume state, and finishes the file of a live recording (the unit waits up to 15 minutes for that before it kills the service). The service restarts only after a crash. It does not restart after a failed download, so a dead link cannot cause a restart loop. The unit runs as an unprivileged user with a read-only system, no home-directory access and a restricted set of address families. A folder, playlist, channel or feed line is listed on every run, and only what is new is downloaded, so the queue can hold subscriptions. Its history, the download archive and the managed yt-dlp and ffmpeg are stored in `/var/lib/endos-downloader`.
 
 ---
 

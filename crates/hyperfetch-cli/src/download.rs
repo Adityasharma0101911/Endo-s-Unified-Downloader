@@ -550,6 +550,19 @@ mod tests {
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    /// The service gives a stopping live recording time to finish its file, which has no
+    /// [`STOP_TIMEOUT`] (see [`is_recording`]): systemd kills everything once TimeoutStopSec is up.
+    #[test]
+    fn the_service_lets_a_stopped_recording_finish() {
+        let unit = include_str!("../../../endos-downloader.service");
+        let timeout = unit.lines().find_map(|line| line.strip_prefix("TimeoutStopSec=")).unwrap();
+        let seconds = match timeout.strip_suffix("min") {
+            Some(minutes) => minutes.parse::<u64>().unwrap() * 60,
+            None => timeout.trim_end_matches('s').parse().unwrap(),
+        };
+        assert!(seconds >= 10 * 60, "{timeout}");
+    }
+
     /// Serves `body` at every path over keep-alive HTTP/1.1 (HEAD, and GET with or without a
     /// Range) and counts the connections it accepts.
     async fn keep_alive_server(body: Vec<u8>) -> (String, Arc<AtomicUsize>) {
