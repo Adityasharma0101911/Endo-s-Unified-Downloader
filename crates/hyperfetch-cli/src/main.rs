@@ -26,6 +26,8 @@ use download::{
 };
 
 fn main() {
+    // Started again to stop a live recording, this only does that.
+    hyperfetch_core::media::serve_ctrl_c();
     let args = Args::parse();
     let code = run_detached(app(args)).unwrap_or_else(|e| {
         stderr_line(&format!("error: cannot start the async runtime: {}", e));

@@ -120,6 +120,10 @@ pub enum HlsError {
     /// plain download of the playlist URL would not help either.
     #[error("Unsupported HLS stream: {0}")]
     Unsupported(String),
+    /// A live playlist (no `#EXT-X-ENDLIST`) without DRM: it lists only the latest segments, so
+    /// it is recorded (by the media engine), not downloaded.
+    #[error("Live HLS stream: only a recording can download it")]
+    Live,
     #[error("HLS segment {index} could not be downloaded: {reason}")]
     SegmentFailed { index: usize, reason: String },
     #[error("Download cancelled by user")]
@@ -333,6 +337,26 @@ fn select_variant(master: &str, base: &Url) -> Result<Url, HlsError> {
     base.join(chosen).map_err(|e| malformed(format!("invalid variant URL '{}': {}", chosen, e)))
 }
 
+/// Whether a `#EXT-X-KEY` (its attributes) starts AES-128 encryption with a key anyone can fetch,
+/// or ends encryption (`METHOD=NONE`). DRM (a key format other than `identity`, whatever the
+/// method: FairPlay and Widevine use SAMPLE-AES) and other methods are refused.
+fn clear_key(attrs: &HashMap<&str, &str>) -> Result<bool, HlsError> {
+    let method = attrs.get("METHOD").copied();
+    if method == Some("NONE") {
+        return Ok(false);
+    }
+    if attrs.get("KEYFORMAT").is_some_and(|f| *f != "identity") {
+        return Err(HlsError::Unsupported("DRM-protected stream (non-identity KEYFORMAT)".to_string()));
+    }
+    match method {
+        Some("AES-128") => Ok(true),
+        other => Err(HlsError::Unsupported(format!(
+            "encryption method {} is not supported (only AES-128)",
+            other.unwrap_or("<missing>")
+        ))),
+    }
+}
+
 /// Key currently in force while walking a media playlist.
 struct ActiveKey {
     key: [u8; 16],
@@ -348,11 +372,9 @@ async fn parse_media_playlist(
 ) -> Result<Vec<HlsSegment>, HlsError> {
     let is_vod = text.lines().map(str::trim).any(|l| l == "#EXT-X-ENDLIST" || l == "#EXT-X-PLAYLIST-TYPE:VOD");
     if !is_vod {
-        return Err(HlsError::Unsupported(
-            "live playlist (no #EXT-X-ENDLIST): only the segments currently listed exist, so the \
-             recording would be silently truncated; use the media engine to record live streams"
-                .to_string(),
-        ));
+        // Only the segments listed now exist: recorded, unless DRM keeps them from being played.
+        let keys = text.lines().filter_map(|l| l.trim().strip_prefix("#EXT-X-KEY:"));
+        return Err(keys.map(|list| clear_key(&parse_attributes(list))).find_map(Result::err).unwrap_or(HlsError::Live));
     }
 
     let join = |uri: &str| base.join(uri).map_err(|e| malformed(format!("invalid URL '{}': {}", uri, e)));
@@ -393,12 +415,9 @@ async fn parse_media_playlist(
             byte_range = Some(range);
         } else if let Some(list) = trimmed.strip_prefix("#EXT-X-KEY:") {
             let attrs = parse_attributes(list);
-            match attrs.get("METHOD").copied() {
-                Some("NONE") => key = None,
-                Some("AES-128") => {
-                    if attrs.get("KEYFORMAT").is_some_and(|f| *f != "identity") {
-                        return Err(HlsError::Unsupported("DRM-protected stream (non-identity KEYFORMAT)".to_string()));
-                    }
+            match clear_key(&attrs)? {
+                false => key = None,
+                true => {
                     let uri = attrs.get("URI").ok_or_else(|| malformed("#EXT-X-KEY without URI"))?;
                     let key_url = join(uri)?;
                     let key_bytes = loop {
@@ -423,12 +442,6 @@ async fn parse_media_playlist(
                         None => None,
                     };
                     key = Some(ActiveKey { key: key_bytes, iv });
-                }
-                other => {
-                    return Err(HlsError::Unsupported(format!(
-                        "encryption method {} is not supported (only AES-128)",
-                        other.unwrap_or("<missing>")
-                    )))
                 }
             }
         } else if let Some(list) = trimmed.strip_prefix("#EXT-X-MAP:") {
@@ -482,8 +495,7 @@ fn key_urls(text: &str, base: &Url) -> Vec<Url> {
         .filter_map(|line| line.trim().strip_prefix("#EXT-X-KEY:"))
         .filter_map(|list| {
             let attrs = parse_attributes(list);
-            let identity = attrs.get("KEYFORMAT").is_none_or(|f| *f == "identity");
-            if attrs.get("METHOD") != Some(&"AES-128") || !identity {
+            if !matches!(clear_key(&attrs), Ok(true)) {
                 return None;
             }
             base.join(attrs.get("URI")?).ok()
@@ -1802,9 +1814,12 @@ video.m3u8
     }
 
     #[tokio::test]
-    async fn test_live_playlist_rejected_and_bom_redirect_handled() {
+    async fn test_live_playlist_is_left_to_a_recording_unless_drm_and_bom_redirect_handled() {
         let (addr, _) = serve(|path: &str, _| match path {
             "/live.m3u8" => ok("#EXTM3U\n#EXTINF:4,\nlive0.ts\n"),
+            "/live-aes.m3u8" => ok("#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"k.bin\"\n#EXTINF:4,\nlive0.ts\n"),
+            "/live-drm.m3u8" => ok("#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"k.bin\",KEYFORMAT=\"urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed\"\n#EXTINF:4,\nlive0.ts\n"),
+            "/live-sample-aes.m3u8" => ok("#EXTM3U\n#EXT-X-KEY:METHOD=SAMPLE-AES,URI=\"skd://k\"\n#EXTINF:4,\nlive0.ts\n"),
             "/start/master.m3u8" => (302, "Location: /cdn/abc/master.m3u8\r\n".to_string(), Vec::new()),
             "/cdn/abc/master.m3u8" => ok("\u{feff}  \n#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nv/media.m3u8\n"),
             "/cdn/abc/v/media.m3u8" => ok("#EXTM3U\n#EXTINF:4,\nseg0.ts\n#EXT-X-ENDLIST\n"),
@@ -1812,8 +1827,18 @@ video.m3u8
         })
         .await;
         let client = Client::new();
-        let live = Url::parse(&format!("http://{}/live.m3u8", addr)).unwrap();
-        assert!(matches!(parse_hls_playlist(&client, &live, None, FETCH).await, Err(HlsError::Unsupported(_))));
+        let parse = |name: &str| {
+            let url = Url::parse(&format!("http://{}/{}", addr, name)).unwrap();
+            let client = client.clone();
+            async move { parse_hls_playlist(&client, &url, None, FETCH).await }
+        };
+        // Only the latest segments are listed: a recording's job, even with a key anyone can get.
+        assert!(matches!(parse("live.m3u8").await, Err(HlsError::Live)));
+        assert!(matches!(parse("live-aes.m3u8").await, Err(HlsError::Live)));
+        // DRM stays refused, live or not.
+        for drm in ["live-drm.m3u8", "live-sample-aes.m3u8"] {
+            assert!(matches!(parse(drm).await, Err(HlsError::Unsupported(_))), "{drm}");
+        }
 
         let start = Url::parse(&format!("http://{}/start/master.m3u8", addr)).unwrap();
         let segments = parse_hls_playlist(&client, &start, None, FETCH).await.unwrap();
