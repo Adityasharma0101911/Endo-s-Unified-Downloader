@@ -81,7 +81,16 @@ pub struct ListOptions {
     pub proxy: Option<String>,
     /// Where a listing sends what the user should know besides its downloads (items left out, a
     /// folder listed in part), for a front end to show; None logs it as a warning.
-    pub notes: Option<std::sync::mpsc::Sender<String>>,
+    pub notes: Option<std::sync::mpsc::Sender<ListNote>>,
+}
+
+/// What a listing tells the user besides its downloads (see [`ListOptions::notes`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListNote {
+    pub text: String,
+    /// Part of what the link lists could not be read (its host kept failing): the downloads
+    /// listed are not all there are, and the listing counts as failed, though they are added.
+    pub failed: bool,
 }
 
 impl Default for ListOptions {
@@ -99,14 +108,23 @@ impl Default for ListOptions {
 }
 
 impl ListOptions {
-    /// Tells the user `note` about a listing, through `notes` or else as a warning.
-    pub(crate) fn note(&self, note: String) {
+    /// Tells the user `text` about a listing, through `notes` or else as a warning.
+    pub(crate) fn note(&self, text: String) {
+        self.tell(ListNote { text, failed: false });
+    }
+
+    /// Tells the user that the listing failed in part, as `text` says (see [`ListNote::failed`]).
+    pub(crate) fn fail(&self, text: String) {
+        self.tell(ListNote { text, failed: true });
+    }
+
+    fn tell(&self, note: ListNote) {
         let unsent = match &self.notes {
             Some(notes) => notes.send(note).err().map(|e| e.0),
             None => Some(note),
         };
         if let Some(note) = unsent {
-            tracing::warn!("{}", note);
+            tracing::warn!("{}", note.text);
         }
     }
 }

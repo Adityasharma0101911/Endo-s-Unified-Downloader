@@ -3411,9 +3411,10 @@ async fn test_a_mediafire_folder_downloads_every_file_in_its_folders() {
 }
 
 /// Google Drive's embedded view of public folders (its shape checked live): "Photos" holds a
-/// file, a Slides document, a subfolder "2024" shared with a resource key and a subfolder
-/// "Broken" Drive is too busy to show; one folder is private, any other missing. Old open?id=
-/// links are sent on to the folder's or the file's page, as Drive does.
+/// file, a Slides document, a subfolder "2024" shared with a resource key, a subfolder "Broken"
+/// Drive is too busy to show (asking again at once, as Retry-After says) and a private one; one
+/// folder is private, any other missing. Old open?id= links are sent on to the folder's or the
+/// file's page, as Drive does.
 fn drive_folders(method: &str, target: &str) -> Vec<u8> {
     let page = |title: &str, entries: &[(&str, &str)]| {
         let entries: String = entries
@@ -3433,12 +3434,15 @@ fn drive_folders(method: &str, target: &str) -> Vec<u8> {
                 ("https://docs.google.com/presentation/d/1Deck/edit?usp=drive_web", "Trip"),
                 ("https://drive.google.com/drive/folders/1Year?resourcekey=0-yk", "2024"),
                 ("https://drive.google.com/drive/folders/1Broken", "Broken"),
+                ("https://drive.google.com/drive/folders/1Private", "Private"),
             ],
         ),
         "http://drive.google.com/embeddedfolderview?id=1Year&resourcekey=0-yk" => {
             page("2024", &[("https://drive.google.com/file/d/1Snow/view?usp=drive_web&amp;resourcekey=0-sk", "snow &amp; ice.jpg")])
         }
-        "http://drive.google.com/embeddedfolderview?id=1Broken" => response(method, "503 Service Unavailable", "Content-Type: text/html\r\n", b"busy"),
+        "http://drive.google.com/embeddedfolderview?id=1Broken" => {
+            response(method, "503 Service Unavailable", "Content-Type: text/html\r\nRetry-After: 0\r\n", b"busy")
+        }
         "http://drive.google.com/embeddedfolderview?id=1Private" => response(method, "401 Unauthorized", "Content-Type: text/html\r\n", b"<!DOCTYPE html>"),
         "http://drive.google.com/open?id=1Photos" => {
             response(method, "307 Temporary Redirect", "Location: http://drive.google.com/drive/folders/1Photos?usp=drive_open\r\n", b"")
@@ -3492,16 +3496,19 @@ async fn test_a_google_drive_folder_is_listed_from_its_page_or_the_api() {
     let err = ingest(&["http://drive.google.com/drive/folders/1Photos"], &http, &keyed).await.unwrap_err();
     assert!(err.starts_with("Cannot reach the Google Drive API") && !err.contains("AIzaSecret"), "{err}");
     let asked: Vec<_> = seen.lock().unwrap().iter().map(|(target, _)| target.clone()).collect();
-    assert_eq!(asked, ["www.googleapis.com:443"], "the key is sent to the Drive API alone, inside TLS");
+    // Asked again while it cannot be reached: 4 times in all.
+    assert_eq!(asked, ["www.googleapis.com:443"; 4], "the key is sent to the Drive API alone, inside TLS");
 }
 
-/// A subfolder Drive does not show is left out, not the whole folder, and the front end is told
-/// which, with the note that a folder listed without a key has no sizes or checksums. An old
-/// open?id= link is listed when Drive sends it on to a folder, and is the link itself otherwise.
+/// A subfolder Drive does not show is left out, not the whole folder, and one Drive stays busy
+/// for is asked for again, then missing: the front end is told which, the latter as a listing
+/// that failed in part, with the note that a folder listed without a key has no sizes or
+/// checksums. An old open?id= link is listed when Drive sends it on to a folder, and is the link
+/// itself otherwise.
 #[tokio::test]
 async fn test_a_google_drive_folder_tells_what_it_left_out() {
-    use hyperfetch_core::ingest::{descriptor_client, ingest, ListOptions, Task};
-    let (proxy, _) = serve_proxy(drive_folders).await;
+    use hyperfetch_core::ingest::{descriptor_client, ingest, ListNote, ListOptions, Task};
+    let (proxy, seen) = serve_proxy(drive_folders).await;
     let http = descriptor_client(Some(&proxy)).unwrap();
     let (notes, noted) = std::sync::mpsc::channel();
     let options = ListOptions { notes: Some(notes), ..ListOptions::default() };
@@ -3509,12 +3516,17 @@ async fn test_a_google_drive_folder_tells_what_it_left_out() {
     let tasks = ingest(&["http://drive.google.com/open?id=1Photos"], &http, &options).await.expect("the folder is listed");
     let names: Vec<_> = tasks.iter().map(|t| t.name.clone().unwrap()).collect();
     assert_eq!(names, [PathBuf::from("beach.jpg"), PathBuf::from("Trip.pptx"), PathBuf::from("snow & ice.jpg")]);
-    let told: Vec<String> = noted.try_iter().collect();
-    let [unread, keyless] = &told[..] else { panic!("two notes: {told:?}") };
+    let told: Vec<ListNote> = noted.try_iter().collect();
+    let [private, unread, keyless] = &told[..] else { panic!("three notes: {told:?}") };
+    let locked = Path::new("Photos").join("Private").display().to_string();
+    let left_out = format!("1 subfolder(s) of the Google Drive folder could not be read, and the files in them were left out ({locked}): ");
+    assert!(!private.failed && private.text.starts_with(&left_out) && private.text.contains("private"), "{private:?}");
     let broken = Path::new("Photos").join("Broken").display().to_string();
-    let left_out = format!("1 subfolder(s) of the Google Drive folder could not be read, and the files in them were left out ({broken}): ");
-    assert!(unread.starts_with(&left_out) && unread.contains("503"), "{unread}");
-    assert!(keyless.contains("add a Google API key"), "{keyless}");
+    let missing = format!("1 subfolder(s) of the Google Drive folder could not be read now, and the files in them are missing ({broken}): ");
+    assert!(unread.failed && unread.text.starts_with(&missing) && unread.text.contains("503"), "{unread:?}");
+    assert!(!keyless.failed && keyless.text.contains("add a Google API key"), "{keyless:?}");
+    let busy = seen.lock().unwrap().iter().filter(|(target, _)| target.ends_with("?id=1Broken")).count();
+    assert_eq!(busy, 4, "a busy host is asked again, 4 times in all");
 
     let file = "http://drive.google.com/open?id=1Beach";
     let tasks = ingest(&[file], &http, &options).await.expect("the link is a file's");
@@ -3534,12 +3546,13 @@ async fn test_a_mediafire_folder_tells_what_it_left_out() {
 
     let tasks = ingest(&["http://www.mediafire.com/folder/pack1"], &http, &options).await.expect("the folder is listed");
     assert_eq!(tasks.len(), 3);
-    let told: Vec<String> = noted.try_iter().collect();
+    let told: Vec<_> = noted.try_iter().collect();
     let [locked, unread] = &told[..] else { panic!("two notes: {told:?}") };
-    assert_eq!(locked, "1 files of the MediaFire folder are protected by a password and were left out");
+    assert_eq!(locked.text, "1 files of the MediaFire folder are protected by a password and were left out");
     let broken = Path::new("Mod Pack").join("Broken").display().to_string();
     let left_out = format!("1 subfolder(s) of the MediaFire folder could not be read, and the files in them were left out ({broken}): ");
-    assert!(unread.starts_with(&left_out) && unread.contains("Unknown or invalid FolderKey"), "{unread}");
+    assert!(unread.text.starts_with(&left_out) && unread.text.contains("Unknown or invalid FolderKey"), "{unread:?}");
+    assert!(!locked.failed && !unread.failed, "a folder MediaFire does not show is left out, as its owner chose");
 
     let endless = ingest(&["http://www.mediafire.com/folder/loop1"], &http, &options).await.unwrap_err();
     assert_eq!(endless, "MediaFire answered chunk 1 when asked for chunk 2: the folder's listing does not end");
