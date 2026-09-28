@@ -933,6 +933,75 @@ enum RowAction {
     Reveal,
 }
 
+/// Most height the list of queued downloads takes before it scrolls.
+const QUEUE_HEIGHT: f32 = 480.0;
+
+/// One line of the queue list for `item`, with the button clicked, if any, in `action`. Where a
+/// failed download's progress and speed would be, its error is (in full on hover), as is why one
+/// restored without its Authorization header waits.
+fn queue_row(app: &App, ui: &mut egui::Ui, item: &QueueItem, action: &mut Option<(usize, RowAction)>) {
+    ui.add_sized([40.0, 18.0], egui::Label::new(format!("#{}", item.id)));
+    ui.add_sized([220.0, 18.0], egui::Label::new(&item.filename).truncate()).on_hover_text(&item.filename);
+    let (status, color) = status_badge(app, item);
+    ui.add_sized([95.0, 18.0], egui::Label::new(RichText::new(status).monospace().size(11.0).color(color)));
+    // The progress and speed columns together.
+    let wide = 150.0 + ui.spacing().item_spacing.x + 90.0;
+    match &item.status {
+        QueueItemStatus::Failed(error) => {
+            let text = RichText::new(truncate_chars(error, 160)).size(11.0).color(RED);
+            ui.add_sized([wide, 18.0], egui::Label::new(text).truncate()).on_hover_text(error);
+        }
+        QueueItemStatus::AuthRequired => {
+            let text = RichText::new("Authorization header not saved: open Details to enter it again and resume").size(11.0).color(AMBER);
+            ui.add_sized([wide, 18.0], egui::Label::new(text).truncate());
+        }
+        _ => {
+            let elapsed = app.jobs.get(&item.id).map(|view| view.elapsed().as_secs());
+            let progress = util::progress_text(item.total_bytes, item.downloaded_bytes, item.progress_ratio, 0, elapsed);
+            ui.add_sized([150.0, 16.0], egui::ProgressBar::new(item.progress_ratio as f32).text(progress));
+            let speed = if item.status == QueueItemStatus::Downloading {
+                format!("{}/s", format_bytes(item.speed_bytes_per_sec as u64))
+            } else {
+                String::new()
+            };
+            ui.add_sized([90.0, 18.0], egui::Label::new(RichText::new(speed).color(CYAN)));
+        }
+    }
+
+    let mut button = |label: &str, what: RowAction| {
+        if ui.small_button(label).clicked() {
+            *action = Some((item.id, what));
+        }
+    };
+    match &item.status {
+        QueueItemStatus::Queued => {
+            button("Start", RowAction::Start);
+            button("Details", RowAction::Show);
+            button("Remove", RowAction::Remove);
+        }
+        QueueItemStatus::Downloading => {
+            button("Pause", RowAction::Pause);
+            button("Details", RowAction::Show);
+        }
+        QueueItemStatus::Pausing => button("Details", RowAction::Show),
+        QueueItemStatus::Paused | QueueItemStatus::Failed(_) => {
+            let label = if item.status == QueueItemStatus::Paused { "Resume" } else { "Retry" };
+            button(label, RowAction::Start);
+            button("Details", RowAction::Show);
+            button("Remove", RowAction::Remove);
+        }
+        QueueItemStatus::AuthRequired => {
+            button("Details", RowAction::Show);
+            button("Remove", RowAction::Remove);
+        }
+        QueueItemStatus::Completed => {
+            button("Open", RowAction::Open);
+            button("Folder", RowAction::Reveal);
+            button("Remove", RowAction::Remove);
+        }
+    }
+}
+
 fn queue_tab(app: &mut App, ui: &mut egui::Ui) {
     card().show(ui, |ui| {
         ui.label(RichText::new("Add to Queue").strong().size(13.0));
@@ -975,9 +1044,10 @@ fn queue_tab(app: &mut App, ui: &mut egui::Ui) {
     ui.label(RichText::new("BATCH DOWNLOAD QUEUE").strong().size(13.0));
     ui.add_space(4.0);
 
-    let items = app.queue.items().to_vec();
     let mut action = None;
+    let shown: &App = app;
     card().inner_margin(8.0).show(ui, |ui| {
+        let items = shown.queue.items();
         if items.is_empty() {
             ui.vertical_centered(|ui| {
                 ui.add_space(30.0);
@@ -992,65 +1062,17 @@ fn queue_tab(app: &mut App, ui: &mut egui::Ui) {
             }
         });
         ui.separator();
-        for item in &items {
-            ui.horizontal(|ui| {
-                ui.add_sized([40.0, 18.0], egui::Label::new(format!("#{}", item.id)));
-                ui.add_sized([220.0, 18.0], egui::Label::new(&item.filename).truncate()).on_hover_text(&item.filename);
-                let (status, color) = status_badge(app, item);
-                ui.add_sized([95.0, 18.0], egui::Label::new(RichText::new(status).monospace().size(11.0).color(color)));
-                let elapsed = app.jobs.get(&item.id).map(|view| view.elapsed().as_secs());
-                let progress = util::progress_text(item.total_bytes, item.downloaded_bytes, item.progress_ratio, 0, elapsed);
-                ui.add_sized([150.0, 16.0], egui::ProgressBar::new(item.progress_ratio as f32).text(progress));
-                let speed = if item.status == QueueItemStatus::Downloading {
-                    format!("{}/s", format_bytes(item.speed_bytes_per_sec as u64))
-                } else {
-                    String::new()
-                };
-                ui.add_sized([90.0, 18.0], egui::Label::new(RichText::new(speed).color(CYAN)));
-
-                let mut button = |label: &str, what: RowAction| {
-                    if ui.small_button(label).clicked() {
-                        action = Some((item.id, what));
-                    }
-                };
-                match &item.status {
-                    QueueItemStatus::Queued => {
-                        button("Start", RowAction::Start);
-                        button("Details", RowAction::Show);
-                        button("Remove", RowAction::Remove);
-                    }
-                    QueueItemStatus::Downloading => {
-                        button("Pause", RowAction::Pause);
-                        button("Details", RowAction::Show);
-                    }
-                    QueueItemStatus::Pausing => button("Details", RowAction::Show),
-                    QueueItemStatus::Paused | QueueItemStatus::Failed(_) => {
-                        let label = if item.status == QueueItemStatus::Paused { "Resume" } else { "Retry" };
-                        button(label, RowAction::Start);
-                        button("Details", RowAction::Show);
-                        button("Remove", RowAction::Remove);
-                    }
-                    QueueItemStatus::AuthRequired => {
-                        button("Details", RowAction::Show);
-                        button("Remove", RowAction::Remove);
-                    }
-                    QueueItemStatus::Completed => {
-                        button("Open", RowAction::Open);
-                        button("Folder", RowAction::Reveal);
-                        button("Remove", RowAction::Remove);
-                    }
-                }
-            });
-            match &item.status {
-                QueueItemStatus::Failed(error) => {
-                    ui.label(RichText::new(truncate_chars(error, 160)).size(11.0).color(RED)).on_hover_text(error);
-                }
-                QueueItemStatus::AuthRequired => {
-                    ui.label(RichText::new("Authorization header not saved: open Details to enter it again and resume").size(11.0).color(AMBER));
-                }
-                _ => {}
+        // Only visible rows are laid out, each one line: a channel can queue thousands of videos.
+        let row_height = 20.0 + ui.spacing().item_spacing.y;
+        let scroll = egui::ScrollArea::vertical().id_salt("queue_rows").max_height(QUEUE_HEIGHT).auto_shrink([false, true]);
+        scroll.show_rows(ui, row_height, items.len(), |ui, rows| {
+            for item in &items[rows] {
+                ui.horizontal(|ui| {
+                    ui.set_min_height(20.0);
+                    queue_row(shown, ui, item, &mut action);
+                });
             }
-        }
+        });
     });
 
     let Some((id, action)) = action else { return };
