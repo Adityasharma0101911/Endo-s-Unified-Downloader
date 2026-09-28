@@ -173,6 +173,7 @@ fn job(args: &Args, connections: u64, dir: &Path, task: Task) -> Job {
         live_from_start: args.live_from_start,
         wait_for_video: args.wait_for_video,
         media_name: task.media_name,
+        archive_lines: task.archive,
         ..tuning(args, if media { args.concurrent_fragments } else { connections })
     };
     Job { label, urls: task.urls, options, line: None }
@@ -819,9 +820,11 @@ mod tests {
     fn a_task_in_a_folder_is_saved_in_it() {
         let args = parse(&["https://a.example/list"]);
         let urls = vec![Url::parse("https://a.example/ep1").unwrap()];
-        let named = Task { urls: urls.clone(), folder: Some("Show".into()), name: Some("ep1.mp3".into()), ..Default::default() };
-        let output = job(&args, 4, Path::new("d"), named).options.output_path.unwrap();
-        assert_eq!(output, Path::new("d").join("Show").join("ep1.mp3"));
+        let archive = vec!["feed-file show/ep1.mp3".to_string()];
+        let named = Task { urls: urls.clone(), folder: Some("Show".into()), name: Some("ep1.mp3".into()), archive: archive.clone(), ..Default::default() };
+        let options = job(&args, 4, Path::new("d"), named).options;
+        assert_eq!(options.output_path.unwrap(), Path::new("d").join("Show").join("ep1.mp3"));
+        assert_eq!(options.archive_lines, archive, "the engine adds them to the download archive once it is downloaded");
         // A playlist entry, which yt-dlp names by its title and id.
         let template = "%(title)s [%(id)s].%(ext)s".to_string();
         let unnamed = Task { urls, folder: Some("Show".into()), media_name: Some(template.clone()), ..Default::default() };

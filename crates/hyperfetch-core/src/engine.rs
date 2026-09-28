@@ -170,6 +170,8 @@ pub struct DownloadOptions {
     /// How yt-dlp names a media download's file when `output_path` is a folder: an output
     /// template (see `ingest::Task::media_name`). None names it by its title.
     pub media_name: Option<String>,
+    /// Lines the download archive gets once the download finishes (see `ingest::Task::archive`).
+    pub archive_lines: Vec<String>,
 }
 
 impl Default for DownloadOptions {
@@ -198,6 +200,7 @@ impl Default for DownloadOptions {
             live_from_start: false,
             wait_for_video: false,
             media_name: None,
+            archive_lines: Vec::new(),
         }
     }
 }
@@ -300,11 +303,23 @@ impl DownloadEngine {
         self.cancel_token.cancel();
     }
 
-    /// Downloads the engine's URLs and returns the path of the finished file.
+    /// Downloads the engine's URLs and returns the path of the finished file, adding the
+    /// options' `archive_lines` to the download archive once it is (not for a recording stopped
+    /// early: it is not the whole of it).
     pub async fn run(
         &self,
         snapshot_tx: Option<broadcast::Sender<EngineSnapshot>>,
     ) -> Result<PathBuf, String> {
+        let result = self.fetch_all(snapshot_tx).await;
+        let lines = &self.options.archive_lines;
+        if result.is_ok() && !lines.is_empty() && !self.cancel_token.is_cancelled() {
+            crate::media::archive_downloaded(crate::media::archive_file().as_deref(), lines.clone()).await;
+        }
+        result
+    }
+
+    /// [`DownloadEngine::run`] but for the download archive.
+    async fn fetch_all(&self, snapshot_tx: Option<broadcast::Sender<EngineSnapshot>>) -> Result<PathBuf, String> {
         let client = self.client.clone()?;
         if let Some(expected) = &self.options.expected_checksum {
             crate::storage::validate_checksum(expected)?;

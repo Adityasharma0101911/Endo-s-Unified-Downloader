@@ -3977,3 +3977,42 @@ async fn test_a_language_gets_the_sites_own_subtitles_of_its_regions() {
     assert!(has_arg(extract, "--sub-langs", "en,es"), "{extract:?}");
     assert!(has_arg(download, "--sub-langs", "en-US,es-419"), "{download:?}");
 }
+
+// ---- Final fix pass: the download archive keeps what history lets go ---------------------------
+
+/// A feed episode the engine downloads is added to the download archive, so that once history,
+/// which keeps only its newest entries, has let it go, the feed still lists it as downloaded.
+#[tokio::test]
+async fn test_a_feed_episode_history_let_go_is_still_not_new() {
+    use hyperfetch_core::ingest::{descriptor_client, ingest, ListOptions};
+    isolate_history();
+    let _history = HISTORY.write().await;
+    let data = payload(30 * KB, 13);
+    let episode = serve(Arc::new(Mock::new(data.clone())), "archived/episode.mp3").await;
+    let rss = format!(
+        r#"<rss version="2.0"><channel><title>Archived Show</title>
+<item><title>Only one</title><pubDate>Mon, 01 Jun 2026 08:00:00 GMT</pubDate><enclosure url="{episode}" type="audio/mpeg"/></item>
+</channel></rss>"#
+    );
+    let feed = serve(Arc::new(Mock::new(rss.into_bytes())), "archived/show.rss").await;
+    let http = descriptor_client(None).unwrap();
+
+    let tasks = ingest(&[feed.as_str()], &http, &ListOptions::default()).await.expect("the feed is read");
+    let [task] = &tasks[..] else { panic!("one episode: {tasks:?}") };
+    let lines = [format!("feed {episode}"), "feed-file archived show/2026-06-01 only one.mp3".to_string()];
+    assert_eq!(task.archive, lines);
+    let temp = tempdir().unwrap();
+    let out = temp.path().join("Archived Show").join(task.name.as_ref().unwrap());
+    let opts = DownloadOptions { archive_lines: task.archive.clone(), ..options(&out, 2, 16 * KB) };
+    run(&DownloadEngine::new(task.urls.clone(), opts), None).await.expect("the episode downloads");
+    assert_file(&out, &data);
+    assert!(lines.iter().all(|line| archived().contains(line)), "{:?}", archived());
+
+    // History lets the download go (it keeps its newest entries only).
+    let _ = std::fs::remove_file(std::env::var_os("ENDO_HISTORY_PATH").unwrap());
+    assert!(history_entry(&out).is_none());
+    let again = ingest(&[feed.as_str()], &http, &ListOptions::default()).await.expect("the feed is read again");
+    assert!(again.is_empty(), "downloaded before: {again:?}");
+    let all = ListOptions { only_new: false, ..ListOptions::default() };
+    assert_eq!(ingest(&[feed.as_str()], &http, &all).await.unwrap().len(), 1);
+}

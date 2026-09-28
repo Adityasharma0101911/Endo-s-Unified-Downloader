@@ -736,7 +736,7 @@ fn archive_id(info: &Value) -> Option<String> {
 /// The download archive: a line (see [`archive_id`]) for every media download that finished,
 /// which a listing with `only_new` leaves out. It is in the app data folder, or where
 /// `ENDO_ARCHIVE_PATH` says. yt-dlp is never given it: it would skip a video asked for again.
-fn archive_file() -> Option<PathBuf> {
+pub(crate) fn archive_file() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("ENDO_ARCHIVE_PATH") {
         return Some(PathBuf::from(path));
     }
@@ -748,7 +748,7 @@ fn archive_file() -> Option<PathBuf> {
 }
 
 /// The lines of the download archive `file`; none before it exists. Blocking.
-fn read_archive(file: &Path) -> Result<HashSet<String>, String> {
+pub(crate) fn read_archive(file: &Path) -> Result<HashSet<String>, String> {
     match std::fs::read(file) {
         Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(HashSet::new()),
@@ -796,7 +796,7 @@ fn record_archive(file: &Path, ids: &[String]) -> std::io::Result<()> {
 
 /// Adds `ids`, of a media download that finished, to the download archive `file`, if there is
 /// one (see [`record_archive`]). A failure is only logged: the download itself succeeded.
-async fn archive_downloaded(file: Option<&Path>, ids: Vec<String>) {
+pub(crate) async fn archive_downloaded(file: Option<&Path>, ids: Vec<String>) {
     let Some(file) = file.map(Path::to_path_buf).filter(|_| !ids.is_empty()) else { return };
     let recorded = tokio::task::spawn_blocking(move || record_archive(&file, &ids)).await;
     if let Err(e) = recorded.map_err(|e| e.to_string()).and_then(|r| r.map_err(|e| e.to_string())) {

@@ -519,18 +519,39 @@ fn zone_offset(zone: &str) -> i64 {
     hours * 3600
 }
 
-/// The tasks of `feed`'s episodes as `options` say, reading the download history for
-/// `only_new` off the runtime's threads.
+/// The tasks of `feed`'s episodes as `options` say, reading the download history and archive
+/// for `only_new` off the runtime's threads.
 async fn show_tasks(feed: Feed, options: &ListOptions) -> Result<Vec<Task>, String> {
     let done = if options.only_new {
-        tokio::task::spawn_blocking(|| Done::of(DownloadHistoryManager::load().entries())).await.unwrap_or_default()
+        let read = tokio::task::spawn_blocking(|| {
+            let archive = crate::media::archive_file().map(|file| crate::media::read_archive(&file)).transpose()?;
+            Ok::<_, String>(Done { archive: archive.unwrap_or_default(), ..Done::of(DownloadHistoryManager::load().entries()) })
+        });
+        read.await.map_err(|e| format!("Background task failed: {e}"))??
     } else {
         Done::default()
     };
     feed_tasks(feed, options.latest, &done)
 }
 
-/// What history records as downloaded, which tells the episodes downloaded before.
+/// The download archive's lines of the episode `task` downloads (see `media::archive_file`), as
+/// [`Done`] tells it: its link, but for one that holds a secret, which the archive is no place
+/// for, and its file.
+fn episode_archive(task: &Task) -> Vec<String> {
+    let links = task.urls.iter().map(Url::as_str).filter(|url| redact_url(url) == *url).map(|url| format!("feed {url}"));
+    let file = match (&task.folder, &task.name) {
+        (Some(folder), Some(name)) => Some(format!("feed-file {}/{}", lower(folder), lower(name))),
+        _ => None,
+    };
+    links.chain(file).collect()
+}
+
+fn lower(path: &Path) -> String {
+    path.to_string_lossy().to_lowercase()
+}
+
+/// What history and the download archive record as downloaded, which tells the episodes
+/// downloaded before. History keeps only its newest entries; the archive keeps every line.
 #[derive(Default)]
 struct Done {
     /// Links, as history saves them, but for those it took a secret out of: the secret may be
@@ -540,6 +561,8 @@ struct Done {
     /// so): an episode whose link changed (a new tracking prefix or query) is still in its
     /// show's folder under its name.
     files: HashSet<(String, String)>,
+    /// The download archive's lines (see [`episode_archive`]).
+    archive: HashSet<String>,
 }
 
 impl Done {
@@ -557,9 +580,9 @@ impl Done {
     /// Whether the episode `task` downloads was downloaded before: from one of its links, or
     /// into the file it names.
     fn has(&self, task: &Task) -> bool {
-        let lower = |path: &Path| path.to_string_lossy().to_lowercase();
         task.urls.iter().any(|url| self.links.contains(&redact_url(url.as_str())))
             || matches!((&task.folder, &task.name), (Some(folder), Some(name)) if self.files.contains(&(lower(folder), lower(name))))
+            || task.archive.iter().any(|line| self.archive.contains(line))
     }
 }
 
@@ -577,7 +600,7 @@ fn feed_tasks(feed: Feed, latest: Option<usize>, done: &Done) -> Result<Vec<Task
     for episode in episodes {
         let Some(enclosure) = episode.enclosure.filter(|e| seen.insert(e.url.clone())) else { continue };
         let name = episode_name(&episode.title, episode.date, enclosure.extension, &enclosure.url, &mut names)?;
-        tasks.push(Task {
+        let mut task = Task {
             urls: vec![enclosure.url],
             name: Some(name),
             folder: folder.clone(),
@@ -585,7 +608,9 @@ fn feed_tasks(feed: Feed, latest: Option<usize>, done: &Done) -> Result<Vec<Task
             // Its host is not the feed's: the Authorization the user gave is not sent there.
             from_document: true,
             ..Task::default()
-        });
+        };
+        task.archive = episode_archive(&task);
+        tasks.push(task);
     }
     let listed = tasks.len();
     if let Some(latest) = latest {
@@ -1061,6 +1086,27 @@ mod tests {
         assert!(feed_tasks(feed(), None, &done).unwrap().is_empty());
         let done = Done::of(&[downloaded("Another show/2026-01-01 Ep.mp3", "https://tracking.example/old-prefix/cdn.example/ep.mp3")]);
         assert_eq!(feed_tasks(feed(), None, &done).unwrap().len(), 1);
+    }
+
+    /// Each episode carries its lines for the download archive, which keeps them after history
+    /// has let the download go: its link (but one with a secret) and its file, in lower case.
+    #[test]
+    fn the_download_archive_tells_episodes_history_forgot() {
+        let show = r#"<rss><channel><title>Show</title>
+<item><title>One</title><enclosure type="audio/mpeg" url="https://cdn.example/1.mp3"/></item>
+<item><title>Two</title><enclosure type="audio/mpeg" url="https://h.example/download?key=EP2"/></item>
+</channel></rss>"#;
+        let feed = || parse(show, "https://f.example/rss").unwrap().unwrap();
+        let tasks = feed_tasks(feed(), None, &Done::default()).unwrap();
+        let lines: Vec<_> = tasks.iter().map(|task| task.archive.clone()).collect();
+        assert_eq!(
+            lines,
+            [vec!["feed https://cdn.example/1.mp3".to_string(), "feed-file show/one.mp3".to_string()], vec!["feed-file show/two.mp3".to_string()]]
+        );
+        let done = |line: &str| Done { archive: HashSet::from([line.to_string()]), ..Done::default() };
+        assert_eq!(names(&feed_tasks(feed(), None, &done("feed https://cdn.example/1.mp3")).unwrap()), ["Two.mp3"]);
+        assert_eq!(names(&feed_tasks(feed(), None, &done("feed-file show/two.mp3")).unwrap()), ["One.mp3"]);
+        assert_eq!(feed_tasks(feed(), None, &done("feed https://cdn.example/2.mp3")).unwrap().len(), 2);
     }
 
     #[test]

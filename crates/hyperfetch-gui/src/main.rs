@@ -1179,6 +1179,7 @@ fn task_options(settings: &Settings, task: &Task, checksum: &str, auth: &str) ->
         options.output_path = options.output_path.map(|path| path.join(part));
     }
     options.media_name = task.media_name.clone();
+    options.archive_lines = task.archive.clone();
     Ok(options)
 }
 
@@ -1759,9 +1760,11 @@ mod tests {
     fn a_task_in_a_folder_is_saved_in_it() {
         let settings = Settings { save_dir: "dl".into(), ..Settings::default() };
         let urls = vec![Url::parse("https://m.example/ep1").unwrap()];
-        let named = Task { urls: urls.clone(), folder: Some("Show".into()), name: Some("ep1.mp3".into()), ..Task::default() };
-        let path = task_options(&settings, &named, "", "").unwrap().output_path;
-        assert_eq!(path, Some(PathBuf::from("dl").join("Show").join("ep1.mp3")));
+        let archive = vec!["feed-file show/ep1.mp3".to_string()];
+        let named = Task { urls: urls.clone(), folder: Some("Show".into()), name: Some("ep1.mp3".into()), archive: archive.clone(), ..Task::default() };
+        let options = task_options(&settings, &named, "", "").unwrap();
+        assert_eq!(options.output_path, Some(PathBuf::from("dl").join("Show").join("ep1.mp3")));
+        assert_eq!(options.archive_lines, archive, "the engine adds them to the download archive once it is downloaded");
         // A playlist entry, which yt-dlp names by its title and id.
         let template = "%(title)s [%(id)s].%(ext)s".to_string();
         let unnamed = Task { urls, folder: Some("Show".into()), media_name: Some(template.clone()), ..Task::default() };
