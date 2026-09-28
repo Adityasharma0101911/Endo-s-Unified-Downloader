@@ -3,6 +3,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::io::{IsTerminal, Write};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::future::{BoxFuture, OptionFuture, Shared};
@@ -101,6 +102,9 @@ pub struct Ui {
     quiet: bool,
     /// stderr is not a terminal: print a progress line now and then instead of bars.
     plain: bool,
+    /// Output held back while a question waits for its answer (see [`Ui::hiding_bars`]), each
+    /// piece with whether it goes to stderr.
+    held: Arc<Mutex<Option<Vec<(bool, Vec<u8>)>>>>,
 }
 
 impl Ui {
@@ -110,7 +114,7 @@ impl Ui {
         } else {
             MultiProgress::new()
         };
-        Self { multi, quiet, plain: !quiet && !std::io::stderr().is_terminal() }
+        Self { multi, quiet, plain: !quiet && !std::io::stderr().is_terminal(), held: Arc::default() }
     }
 
     /// -q was given: no progress or status output.
@@ -120,20 +124,42 @@ impl Ui {
 
     /// Prints to stdout without tearing the progress bars.
     pub fn print(&self, line: &str) {
-        self.multi.suspend(|| stdout_line(line));
+        let _ = self.write(false, format!("{}\n", printable(line)).as_bytes());
     }
 
     /// Prints to stderr without tearing the progress bars.
     pub fn error(&self, line: &str) {
-        self.multi.suspend(|| stderr_line(line));
+        let _ = self.write(true, format!("{}\n", printable(line)).as_bytes());
+    }
+
+    /// Writes `bytes` to stderr, else stdout, without tearing the progress bars; while a question
+    /// waits for its answer, once it is answered.
+    fn write(&self, stderr: bool, bytes: &[u8]) -> std::io::Result<()> {
+        let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        match held.as_mut() {
+            Some(held) => {
+                held.push((stderr, bytes.to_vec()));
+                Ok(())
+            }
+            None => self.multi.suspend(|| write_to(stderr, bytes)),
+        }
     }
 
     /// Awaits `question`, a prompt at the terminal, with the progress bars off it, so that they
-    /// draw over neither the question nor the answer typed.
+    /// draw over neither the question nor the answer typed, and what the downloads print
+    /// meanwhile (a finished file, a log line) held back until it is answered, so that it does
+    /// not land in the question's line or scroll it away.
     pub async fn hiding_bars<T>(&self, question: impl Future<Output = T>) -> T {
+        *self.held.lock().unwrap_or_else(PoisonError::into_inner) = Some(Vec::new());
         let _ = self.multi.clear();
         self.multi.set_draw_target(ProgressDrawTarget::hidden());
         let answer = question.await;
+        // Written with the lock held, so that nothing printed now goes ahead of it.
+        let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        for (stderr, bytes) in held.take().unwrap_or_default() {
+            let _ = write_to(stderr, &bytes);
+        }
+        drop(held);
         if !self.quiet {
             self.multi.set_draw_target(ProgressDrawTarget::stderr());
         }
@@ -142,7 +168,7 @@ impl Ui {
 
     /// A writer for log output that keeps the progress bars intact.
     pub fn log_writer(&self) -> LogWriter {
-        LogWriter(self.multi.clone())
+        LogWriter(self.clone())
     }
 
     /// A byte progress bar of `len` bytes (unknown when None), placed above `below` when given.
@@ -165,16 +191,25 @@ impl Ui {
 }
 
 #[derive(Clone)]
-pub struct LogWriter(MultiProgress);
+pub struct LogWriter(Ui);
 
 impl Write for LogWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.suspend(|| std::io::stderr().write_all(buf))?;
+        self.0.write(true, buf)?;
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
         std::io::stderr().flush()
+    }
+}
+
+/// Writes `bytes` to stderr, else stdout.
+fn write_to(stderr: bool, bytes: &[u8]) -> std::io::Result<()> {
+    if stderr {
+        std::io::stderr().write_all(bytes)
+    } else {
+        std::io::stdout().write_all(bytes)
     }
 }
 
@@ -764,6 +799,26 @@ mod tests {
         std::fs::remove_file(dir.join("file.bin")).unwrap();
         let answered: FfmpegAnswer = async { false }.boxed().shared();
         assert_eq!(run_jobs(jobs(), 1, &Ui::new(true), &Shutdown::install(), Some(answered)).await, 1, "the video started, and failed");
+    }
+
+    /// What the downloads print while a question waits for its answer (a finished file, a log
+    /// line) is held back, so that it neither lands in the question's line nor scrolls it away,
+    /// and written in its order once the question is answered.
+    #[tokio::test]
+    async fn output_waits_for_the_answer_to_a_question() {
+        let ui = Ui::new(true);
+        let held = || ui.held.lock().unwrap().clone();
+        let during = ui
+            .hiding_bars(async {
+                ui.print("[OK] a.iso");
+                ui.log_writer().write_all(b"WARN a log line\n").unwrap();
+                ui.error("[FAILED] b.iso: gone");
+                held()
+            })
+            .await;
+        let line = |stderr: bool, text: &str| (stderr, text.as_bytes().to_vec());
+        assert_eq!(during, Some(vec![line(false, "[OK] a.iso\n"), line(true, "WARN a log line\n"), line(true, "[FAILED] b.iso: gone\n")]));
+        assert_eq!(held(), None, "written once answered");
     }
 
     #[test]
