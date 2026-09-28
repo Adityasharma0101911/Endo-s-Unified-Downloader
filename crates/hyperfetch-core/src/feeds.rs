@@ -272,7 +272,8 @@ struct Feed {
     title: Option<String>,
     episodes: Vec<Episode>,
     /// What tells this feed from another of the same title: its link without its secrets (see
-    /// [`redact_url`]), or the Apple show it was looked up for.
+    /// [`redact_url`]), or the Apple show it was looked up for. The archive holds only a digest
+    /// of it (see [`episode_archive`]).
     source: String,
 }
 
@@ -574,10 +575,13 @@ async fn show_tasks(feed: Feed, options: &ListOptions) -> Result<Vec<Task>, Stri
 /// The download archive's lines of the episode `task` of the feed `source` (see [`Feed`])
 /// downloads (see `media::archive_file`), as [`Done`] tells it: its link, but for one that holds
 /// a secret, which the archive is no place for, and its file in that feed, so another show of
-/// the same title and an episode of its of the same day and title is not taken for it.
+/// the same title and an episode of its of the same day and title is not taken for it. The feed
+/// is named by a digest of `source`, not by its link: a private feed's token may be in the path
+/// (Supercast's `/feeds/<token>`), which [`redact_url`] leaves.
 fn episode_archive(source: &str, task: &Task) -> Vec<String> {
     let links = task.urls.iter().map(Url::as_str).filter(|url| redact_url(url) == *url).map(|url| format!("feed {url}"));
-    let file = file_of(task).map(|file| format!("feed-file {source} {file}"));
+    let feed = blake3::hash(source.as_bytes()).to_hex();
+    let file = file_of(task).map(|file| format!("feed-file {} {file}", &feed[..32]));
     links.chain(file).collect()
 }
 
@@ -1140,8 +1144,9 @@ mod tests {
     }
 
     /// Each episode carries its lines for the download archive, which keeps them after history
-    /// has let the download go: its link (but one with a secret) and its file in its feed, in
-    /// lower case. A line an older archive has for the file alone still counts.
+    /// has let the download go: its link (but one with a secret) and its file in its feed (a
+    /// digest of the feed's link), in lower case. A line an older archive has for the file alone
+    /// still counts.
     #[test]
     fn the_download_archive_tells_episodes_history_forgot() {
         let show = r#"<rss><channel><title>Show</title>
@@ -1151,23 +1156,20 @@ mod tests {
         let feed = || parse(show, "https://f.example/rss").unwrap().unwrap();
         let tasks = feed_tasks(feed(), None, &Done::default()).unwrap();
         let lines: Vec<_> = tasks.iter().map(|task| task.archive.clone()).collect();
-        assert_eq!(
-            lines,
-            [
-                vec!["feed https://cdn.example/1.mp3".to_string(), "feed-file https://f.example/rss show/one.mp3".to_string()],
-                vec!["feed-file https://f.example/rss show/two.mp3".to_string()]
-            ]
-        );
+        // "https://f.example/rss", by its BLAKE3 hash's first 16 bytes.
+        let file = |name: &str| format!("feed-file 5b934f15a443a3e1a95f894dd3436ef4 show/{name}");
+        assert_eq!(lines, [vec!["feed https://cdn.example/1.mp3".to_string(), file("one.mp3")], vec![file("two.mp3")]]);
         let done = |line: &str| Done { archive: HashSet::from([line.to_string()]), ..Done::default() };
         assert_eq!(names(&feed_tasks(feed(), None, &done("feed https://cdn.example/1.mp3")).unwrap()), ["Two.mp3"]);
-        assert_eq!(names(&feed_tasks(feed(), None, &done("feed-file https://f.example/rss show/two.mp3")).unwrap()), ["One.mp3"]);
+        assert_eq!(names(&feed_tasks(feed(), None, &done(&file("two.mp3"))).unwrap()), ["One.mp3"]);
         assert_eq!(names(&feed_tasks(feed(), None, &done("feed-file show/two.mp3")).unwrap()), ["One.mp3"]);
         assert_eq!(feed_tasks(feed(), None, &done("feed https://cdn.example/2.mp3")).unwrap().len(), 2);
     }
 
     /// Two feeds of one title, each with an episode of the same day and title on a link of its
     /// own: the one downloaded from the first feed does not stand for the second's. A private
-    /// feed's token is not written to the archive.
+    /// feed's token, in its query or its path, is not written to the archive, and a new token in
+    /// the query is the same feed.
     #[test]
     fn a_feed_of_the_same_title_has_episodes_of_its_own() {
         let show = |n: u8| {
@@ -1176,14 +1178,20 @@ mod tests {
 <enclosure type="audio/mpeg" url="https://h.example/download?key=EP{n}"/></item></channel></rss>"#
             )
         };
-        let first = parse(&show(1), "https://a.example/news.rss?token=s3cret").unwrap().unwrap();
-        let archived = feed_tasks(first, None, &Done::default()).unwrap().remove(0).archive;
-        assert_eq!(archived, ["feed-file https://a.example/news.rss?token=REDACTED news/2026-06-01 today.mp3"]);
-        let done = Done { archive: archived.into_iter().collect(), ..Done::default() };
+        let archive = |n: u8, feed: &str| feed_tasks(parse(&show(n), feed).unwrap().unwrap(), None, &Done::default()).unwrap().remove(0).archive;
+        let archived = archive(1, "https://a.example/news.rss?token=s3cret");
+        assert_eq!(archived.len(), 1);
+        assert!(archived[0].starts_with("feed-file ") && archived[0].ends_with(" news/2026-06-01 today.mp3"), "{archived:?}");
+        let done = Done { archive: archived.iter().cloned().collect(), ..Done::default() };
         let second = parse(&show(2), "https://b.example/news.rss").unwrap().unwrap();
         assert_eq!(names(&feed_tasks(second, None, &done).unwrap()), ["2026-06-01 Today.mp3"]);
         let first = parse(&show(1), "https://a.example/news.rss?token=0ther").unwrap().unwrap();
         assert!(feed_tasks(first, None, &done).unwrap().is_empty());
+        for (feed, token) in [("https://a.example/news.rss?token=s3cret", "s3cret"), ("https://show.supercast.com/feeds/Tok3n", "Tok3n")] {
+            let line = &archive(1, feed)[0];
+            assert!(!line.contains(token) && !line.contains(".example") && !line.contains("supercast"), "{line}");
+        }
+        assert_ne!(archive(1, "https://show.supercast.com/feeds/Tok3n"), archived);
     }
 
     #[test]
