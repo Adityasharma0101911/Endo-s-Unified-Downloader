@@ -78,8 +78,8 @@ fn feed_shape(url: &Url) -> Option<bool> {
 ///
 /// Episodes come newest first, each named "YYYY-MM-DD Title.ext" in a folder named after the
 /// feed; `options.latest` keeps the newest N, and `options.only_new` then leaves out those
-/// history records as downloaded. An Apple Podcasts show lists its public feed, and an episode
-/// link that one episode of it (see [`AppleLink::list`]).
+/// history or the download archive records as downloaded (see [`Done`]). An Apple Podcasts show
+/// lists its public feed, and an episode link that one episode of it (see [`AppleLink::list`]).
 pub async fn list(http: &reqwest::Client, url: &Url, options: &ListOptions) -> Option<Result<Vec<Task>, String>> {
     if let Some(apple) = AppleLink::of(url) {
         return apple.list(http, LOOKUP_API, options).await;
