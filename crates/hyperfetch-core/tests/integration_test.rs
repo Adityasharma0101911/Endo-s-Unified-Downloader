@@ -473,6 +473,8 @@ fn options(out: &Path, connections: usize, chunk: usize) -> DownloadOptions {
         base_chunk_size: chunk as u64,
         min_steal_threshold: 32 * KB as u64,
         output_path: Some(out.to_path_buf()),
+        // A machine without ffmpeg would install it from the network for a media test.
+        install_ffmpeg: false,
         ..Default::default()
     }
 }
@@ -3769,7 +3771,6 @@ async fn test_subtitle_and_tag_settings_reach_yt_dlp() {
         ytdlp_path: Some(fake_ytdlp(tools.path(), &output)),
         subtitles: Some("en,de".into()),
         embed_metadata: false,
-        install_ffmpeg: false,
         ..options(temp.path(), 4, 64 * KB)
     };
     let url = Url::parse("https://www.youtube.com/watch?v=abc").unwrap();
@@ -3793,7 +3794,6 @@ async fn test_live_settings_reach_yt_dlp() {
         ytdlp_path: Some(fake_ytdlp(tools.path(), &output)),
         live_from_start: true,
         wait_for_video: true,
-        install_ffmpeg: false,
         ..options(temp.path(), 4, 64 * KB)
     };
     let url = Url::parse("https://www.youtube.com/watch?v=abc").unwrap();
@@ -3857,7 +3857,6 @@ async fn test_stopping_a_live_recording_keeps_what_it_recorded() {
     std::fs::write(tools.path().join("info.json"), serde_json::to_vec(&info).unwrap()).unwrap();
     let opts = DownloadOptions {
         ytdlp_path: Some(recording_ytdlp(tools.path(), &output)),
-        install_ffmpeg: false,
         ..options(temp.path(), 4, 64 * KB)
     };
     let engine = DownloadEngine::new(vec![Url::parse("https://www.youtube.com/watch?v=live1").unwrap()], opts);
@@ -3900,7 +3899,6 @@ async fn test_a_live_hls_stream_is_recorded_with_yt_dlp() {
     std::fs::write(tools.path().join("info.json"), serde_json::to_vec(&info).unwrap()).unwrap();
     let opts = DownloadOptions {
         ytdlp_path: Some(fake_ytdlp(tools.path(), &output)),
-        install_ffmpeg: false,
         ..options(temp.path(), 4, 64 * KB)
     };
 
@@ -3955,7 +3953,6 @@ async fn test_a_language_gets_the_sites_own_subtitles_of_its_regions() {
     let opts = DownloadOptions {
         ytdlp_path: Some(fake_ytdlp(tools.path(), &output)),
         subtitles: Some("en,es".into()),
-        install_ffmpeg: false,
         ..options(temp.path(), 4, 64 * KB)
     };
     let url = Url::parse("https://www.youtube.com/watch?v=5AwdkGKmZ0I").unwrap();
