@@ -80,7 +80,7 @@ impl QueueItem {
 pub struct DownloadQueue {
     items: Vec<QueueItem>,
     next_id: usize,
-    /// Bumped by every change, so a front-end knows when to save the queue.
+    /// Bumped by every change but progress, so a front-end knows when to save the queue.
     #[serde(skip)]
     revision: u64,
 }
@@ -100,7 +100,8 @@ impl DownloadQueue {
         }
     }
 
-    /// Changes whenever the queue may have changed.
+    /// Changes whenever the queue may have changed, but for a running item's progress alone (see
+    /// [`DownloadQueue::apply_snapshot`]).
     pub fn revision(&self) -> u64 {
         self.revision
     }
@@ -219,8 +220,11 @@ impl DownloadQueue {
         }
     }
 
+    /// Takes a running item's progress. Only a new target is a change of the queue (see
+    /// [`DownloadQueue::revision`]): progress comes several times a second, a resume reads its
+    /// own from the resume state, and the queue saved on exit has it.
     pub fn apply_snapshot(&mut self, id: usize, snapshot: &EngineSnapshot) {
-        let Some(item) = self.get_item_mut(id) else { return };
+        let Some(item) = self.items.iter_mut().find(|i| i.id == id) else { return };
         item.total_bytes = snapshot.total_bytes;
         item.downloaded_bytes = snapshot.downloaded_bytes;
         // Nothing is transferred any more once every byte has arrived.
@@ -228,11 +232,12 @@ impl DownloadQueue {
         // NaN (0/0 from an empty stream) would make the saved queue unreadable JSON.
         item.progress_ratio =
             if snapshot.progress_ratio.is_nan() { 0.0 } else { snapshot.progress_ratio.clamp(0.0, 1.0) };
-        if let Some(target) = &snapshot.target_path {
+        if let Some(target) = snapshot.target_path.as_ref().filter(|&target| item.target_path.as_ref() != Some(target)) {
             if let Some(name) = target.file_name() {
                 item.filename = name.to_string_lossy().into_owned();
             }
             item.target_path = Some(target.clone());
+            self.revision += 1;
         }
     }
 
@@ -563,6 +568,28 @@ mod tests {
         let item = q.get_item(ids[0]).unwrap();
         assert_eq!((item.downloaded_bytes, item.total_bytes, item.progress_ratio), (0, 0, 0.0));
         assert_eq!(item.target_path.as_deref(), Some(std::path::Path::new("/dl/a")), "the target is kept");
+    }
+
+    /// Progress alone does not change the queue's revision, so a front end does not save the
+    /// whole queue several times a second; the engine naming the target does.
+    #[test]
+    fn only_a_new_target_of_a_running_item_is_a_change_to_save() {
+        let (mut q, ids) = queue_of(&["https://e.com/a"]);
+        q.mark_started(ids[0]);
+        let started = q.revision();
+        q.apply_snapshot(ids[0], &EngineSnapshot { target_path: None, ..snapshot("/dl/a") });
+        assert_eq!(q.revision(), started, "progress alone");
+        assert_eq!(q.get_item(ids[0]).unwrap().downloaded_bytes, 40);
+        q.apply_snapshot(ids[0], &snapshot("/dl/a"));
+        let named = q.revision();
+        assert_ne!(named, started);
+        q.apply_snapshot(ids[0], &EngineSnapshot { downloaded_bytes: 90, ..snapshot("/dl/a") });
+        assert_eq!(q.revision(), named, "the same target");
+        q.apply_snapshot(ids[0], &snapshot("/dl/a (1)"));
+        assert_ne!(q.revision(), named);
+        assert_eq!(q.get_item(ids[0]).unwrap().filename, "a (1)");
+        q.finish(ids[0], Ok((PathBuf::from("/dl/a (1)"), Some(100))));
+        assert_ne!(q.revision(), named, "finishing is saved");
     }
 
     #[test]
