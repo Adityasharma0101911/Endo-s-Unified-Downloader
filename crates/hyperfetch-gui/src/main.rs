@@ -18,6 +18,7 @@ use hyperfetch_core::chunk::ChunkSnapshot;
 use hyperfetch_core::engine::{build_client, ClientKey, DownloadEngine, DownloadOptions, EngineSnapshot, SharedLimits};
 use hyperfetch_core::history::{DownloadHistoryManager, HistoryEntry};
 use hyperfetch_core::ingest::{self, Task};
+use hyperfetch_core::media;
 use hyperfetch_core::queue::{DownloadQueue, QueueItem};
 use hyperfetch_core::verify::{self, BuildVerificationResult};
 use tokio::sync::{broadcast, Notify};
@@ -117,6 +118,9 @@ enum AppEvent {
     Picked(Dialog, Option<PathBuf>),
     Pasted(Result<String, String>),
     ClipboardLink(String),
+    /// Whether an ffmpeg was found, looked for at launch while the user has not said whether one
+    /// may be installed.
+    FfmpegFound(bool),
 }
 
 /// Handles to a running engine task.
@@ -228,6 +232,11 @@ struct App {
     jobs: HashMap<usize, JobView>,
     /// The download shown on the Downloader tab.
     focused: Option<usize>,
+    /// Whether an ffmpeg was found (see [`AppEvent::FfmpegFound`]); None until that is known.
+    ffmpeg_found: Option<bool>,
+    /// Media downloads started (the id, and whether from zero) while the user has not said whether
+    /// ffmpeg may be installed and none is found: they start once the user answers.
+    ffmpeg_waiting: Vec<(usize, bool)>,
 
     anim_job: Option<usize>,
     anim_progress: f64,
@@ -270,6 +279,10 @@ impl App {
             cc.egui_ctx.clone(),
         );
         app.refresh_history();
+        if app.settings.install_ffmpeg.is_none() {
+            let found = unblock(hyperfetch_core::media::find_ffmpeg_path);
+            app.spawn_event(async { AppEvent::FfmpegFound(found.await.is_ok_and(|found| found.is_some())) });
+        }
         app
     }
 
@@ -309,6 +322,8 @@ impl App {
             queue_saver,
             jobs: HashMap::new(),
             focused: None,
+            ffmpeg_found: None,
+            ffmpeg_waiting: Vec::new(),
             anim_job: None,
             anim_progress: 0.0,
             anim_speed: 0.0,
@@ -625,8 +640,17 @@ impl App {
     }
 
     /// Starts (or resumes) the engine for a queue item. `fresh` first deletes the item's partial
-    /// files so the download starts from zero. Returns false if nothing was started.
+    /// files so the download starts from zero. Returns false if nothing was started. A media
+    /// download waits while the user has not said whether ffmpeg may be installed and none is
+    /// found (see [`App::answer_ffmpeg`]); it installs ffmpeg as the user said last, whatever the
+    /// setting was when it was queued.
     fn start_job(&mut self, id: usize, fresh: bool) -> bool {
+        if self.waits_for_ffmpeg_answer(id) {
+            if !self.ffmpeg_waiting.iter().any(|&(waiting, _)| waiting == id) {
+                self.ffmpeg_waiting.push((id, fresh));
+            }
+            return false;
+        }
         if let Some(other) = self.queue.active_conflict(id) {
             self.notice = Some(Err(format!(
                 "Download #{} is already fetching the same file; pause it before starting #{}",
@@ -639,7 +663,8 @@ impl App {
             return false;
         }
         let Some(item) = self.queue.get_item(id) else { return false };
-        let (urls, options, folder) = (item.urls.clone(), item.options.clone(), util::folder_to_create(item));
+        let (urls, mut options, folder) = (item.urls.clone(), item.options.clone(), util::folder_to_create(item));
+        options.install_ffmpeg = self.settings.install_ffmpeg == Some(true);
         let leftovers_of = if fresh { item.target_path.clone() } else { None };
         if !self.queue.mark_started(id) {
             return false;
@@ -670,6 +695,35 @@ impl App {
             },
         );
         true
+    }
+
+    /// Whether download `id` goes to yt-dlp and must wait for the user to say whether ffmpeg may
+    /// be installed: they have not, and no ffmpeg was found (or that is not known yet).
+    fn waits_for_ffmpeg_answer(&self, id: usize) -> bool {
+        let media = |item: &QueueItem| item.options.media_preset.is_some() || item.urls.iter().any(media::is_supported_media_site);
+        self.settings.install_ffmpeg.is_none() && self.ffmpeg_found != Some(true) && self.queue.get_item(id).is_some_and(media)
+    }
+
+    /// Whether the user is to be asked whether ffmpeg may be installed: a download waits for it.
+    fn asks_about_ffmpeg(&self) -> bool {
+        self.settings.install_ffmpeg.is_none()
+            && self.ffmpeg_found == Some(false)
+            && self.ffmpeg_waiting.iter().any(|&(id, _)| self.queue.get_item(id).is_some())
+    }
+
+    /// Takes the user's answer whether ffmpeg may be installed, kept as the setting, and starts
+    /// the downloads that waited for it.
+    fn answer_ffmpeg(&mut self, install: bool) {
+        self.settings.install_ffmpeg = Some(install);
+        self.start_waiting();
+    }
+
+    /// Starts the downloads that waited for the user's answer about ffmpeg (see
+    /// [`App::start_job`]), as they were asked to start.
+    fn start_waiting(&mut self) {
+        for (id, fresh) in std::mem::take(&mut self.ffmpeg_waiting) {
+            self.start_job(id, fresh);
+        }
     }
 
     /// Resumes a restored download with the Authorization header from the form, which is never saved.
@@ -951,7 +1005,15 @@ impl App {
                 if self.clipboard_enabled.load(Ordering::Relaxed) && self.url_input.trim() != link {
                     self.clipboard_banner = Some(link);
                 }
-            }        }
+            }
+            AppEvent::FfmpegFound(found) => {
+                self.ffmpeg_found = Some(found);
+                // Nothing to ask: what waited to know it starts.
+                if found {
+                    self.start_waiting();
+                }
+            }
+        }
     }
 
     fn open_dialog(&mut self, dialog: Dialog, frame: &eframe::Frame) {
@@ -1867,6 +1929,51 @@ mod tests {
         assert_eq!(app.listings[0].tasks.as_deref(), Some(&[][..]));
         app.answer_listing(Answer::Cancel);
         assert_eq!((queued(&app).len(), app.listings.len()), (5, 0));
+    }
+
+    /// A video waits, queued, while the user has not said whether ffmpeg may be installed and
+    /// none is found, and then starts, installing it as the user answered; a file never waits,
+    /// nor does a video once an ffmpeg is found.
+    #[test]
+    fn a_video_waits_for_the_answer_whether_ffmpeg_may_be_installed() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(&rt, dir.path());
+        let built = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&built);
+        app.engines = Arc::new(move |urls: Vec<Url>, options: DownloadOptions| {
+            lock(&seen).push((urls[0].host_str().unwrap_or_default().to_string(), options.install_ffmpeg));
+            Err("not downloaded here".to_string())
+        });
+        let video = |app: &mut App| app.add_download("https://www.youtube.com/watch?v=jNQXAC9IVRw", "", "").unwrap();
+        let first = video(&mut app);
+        let file = app.add_download("https://a.example/f.iso", "", "").unwrap();
+        // Whether ffmpeg is found is not known yet: nothing to ask, but the video waits.
+        assert!(!app.start_job(first, true) && !app.asks_about_ffmpeg());
+        assert!(app.start_job(file, false), "a file does not need ffmpeg");
+        app.handle_event(AppEvent::FfmpegFound(false));
+        assert!(app.asks_about_ffmpeg());
+        assert!(!app.start_job(first, false), "still waiting");
+        assert_eq!(app.ffmpeg_waiting, [(first, true)], "started as it was asked to first");
+
+        app.answer_ffmpeg(true);
+        assert_eq!(app.settings.install_ffmpeg, Some(true));
+        assert!(!app.asks_about_ffmpeg() && app.ffmpeg_waiting.is_empty());
+        assert!(app.jobs.get(&first).is_some_and(|view| view.running.is_some()), "started once answered");
+        rt.block_on(async {
+            while lock(&built).len() < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        let mut built = lock(&built).clone();
+        built.sort();
+        assert_eq!(built, [("a.example".to_string(), false), ("www.youtube.com".to_string(), true)], "the file started before the answer");
+
+        // Found: nothing waits, and nothing is installed without an answer.
+        let mut app = test_app(&rt, dir.path());
+        app.handle_event(AppEvent::FfmpegFound(true));
+        let second = video(&mut app);
+        assert!(app.start_job(second, false) && !app.asks_about_ffmpeg());
     }
 
     /// A playlist or channel with nothing new is nothing to do: said so, and its queue line is

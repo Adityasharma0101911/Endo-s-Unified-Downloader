@@ -156,7 +156,8 @@ pub struct DownloadOptions {
     /// with a request open or waiting for one applies to all of them. The default is the most
     /// connections one download opens, so only several downloads to one host are held back.
     pub max_connections_per_host: usize,
-    /// Install a managed ffmpeg when a media download needs one and none is found.
+    /// Install a managed ffmpeg (about 200 MB) when a media download needs one and none is found.
+    /// Off unless the user agreed to it.
     pub install_ffmpeg: bool,
     /// Subtitle languages a media download fetches ("en,es", "all"); None fetches none.
     pub subtitles: Option<String>,
@@ -191,7 +192,7 @@ impl Default for DownloadOptions {
             stall_timeout_secs: 30,
             fsync_on_complete: false,
             max_connections_per_host: MAX_CONNECTIONS,
-            install_ffmpeg: true,
+            install_ffmpeg: false,
             subtitles: None,
             embed_metadata: true,
             live_from_start: false,

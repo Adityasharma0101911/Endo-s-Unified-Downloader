@@ -127,8 +127,12 @@ pub struct Args {
     #[arg(long = "wait-for-video")]
     pub wait_for_video: bool,
 
-    /// Never install ffmpeg (the checked build yt-dlp's makers publish, about 200 MB) when media
-    /// needs it and none is found: such media falls back to what works without it
+    /// Install ffmpeg (the checked build yt-dlp's makers publish, about 200 MB) when media needs
+    /// it and none is found. Without this or --no-install-ffmpeg, a terminal asks first
+    #[arg(long = "install-ffmpeg", conflicts_with = "no_install_ffmpeg")]
+    pub install_ffmpeg: bool,
+
+    /// Never install ffmpeg, nor ask: media that needs it falls back to what works without it
     #[arg(long = "no-install-ffmpeg")]
     pub no_install_ffmpeg: bool,
 
@@ -349,8 +353,10 @@ mod tests {
     fn listing_and_media_flags() {
         let parse = |args: &[&str]| Args::try_parse_from(std::iter::once("cli").chain(args.iter().copied()));
         let args = parse(&["u"]).unwrap();
-        assert!(!args.yes_playlist && !args.all_items && !args.no_install_ffmpeg && !args.no_embed_metadata);
+        assert!(!args.yes_playlist && !args.all_items && !args.install_ffmpeg && !args.no_install_ffmpeg && !args.no_embed_metadata);
         assert_eq!((args.latest, args.subs), (None, None));
+        assert!(parse(&["--install-ffmpeg", "u"]).unwrap().install_ffmpeg);
+        assert!(parse(&["--install-ffmpeg", "--no-install-ffmpeg", "u"]).is_err());
         let args = parse(&["--latest", "5", "--subs", " en,es ", "--yes-playlist", "--google-api-key", "k", "u"]).unwrap();
         assert_eq!((args.latest, args.subs.as_deref(), args.google_api_key.as_deref()), (Some(5), Some("en,es"), Some("k")));
         assert!(parse(&["--latest", "0", "u"]).is_err());

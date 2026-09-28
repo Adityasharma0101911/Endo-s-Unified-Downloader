@@ -79,6 +79,39 @@ fn status_badge(app: &App, item: &QueueItem) -> (&'static str, Color32) {
     }
 }
 
+/// What ffmpeg is for, and what installing it takes.
+const FFMPEG_ABOUT: &str = "ffmpeg joins separate video and audio (the best quality) and makes MP3/M4A files. Without it \
+     videos download in a lower quality and audio presets fail. The GPL build yt-dlp's makers publish is checked and \
+     installed for your user only; it takes about 330 MB on disk.";
+
+/// Asks whether ffmpeg may be installed, while a media download waits for the answer (see
+/// `App::start_job`).
+fn ffmpeg_prompt(app: &mut App, ui: &mut egui::Ui) {
+    if !app.asks_about_ffmpeg() {
+        return;
+    }
+    ui.add_space(6.0);
+    egui::Frame::none()
+        .fill(Color32::from_rgb(22, 27, 38))
+        .stroke(Stroke::new(1.0, AMBER))
+        .inner_margin(8.0)
+        .rounding(4.0)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let text = "ffmpeg is not installed. Install it for the best video quality and MP3/M4A files (about 200 MB)?";
+                ui.label(RichText::new(text).color(TEXT)).on_hover_text(FFMPEG_ABOUT);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button(RichText::new("Continue Without").size(11.0)).clicked() {
+                        app.answer_ffmpeg(false);
+                    }
+                    if ui.add(primary_button("Install ffmpeg", BLUE)).clicked() {
+                        app.answer_ffmpeg(true);
+                    }
+                });
+            });
+        });
+}
+
 /// While ffmpeg is `installing`, a notice, and a frame a second so that it goes when the install
 /// ends, also when no download runs any more (a cancelled video leaves the install to finish).
 fn ffmpeg_notice(ui: &mut egui::Ui, installing: bool) {
@@ -103,6 +136,7 @@ pub fn render(app: &mut App, ui: &mut egui::Ui) {
     }
     clipboard_banner(app, ui);
     listing_prompt(app, ui);
+    ffmpeg_prompt(app, ui);
     if let Some(notice) = app.notice.clone() {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
@@ -516,11 +550,11 @@ fn advanced_options(app: &mut App, ui: &mut egui::Ui) {
         );
     });
     ui.horizontal(|ui| {
-        ui.checkbox(&mut app.settings.install_ffmpeg, "Install ffmpeg when a video needs it (about 200 MB)").on_hover_text(
-            "ffmpeg joins separate video and audio (the best quality) and makes MP3/M4A files. Without it videos \
-             download in a lower quality and audio presets fail. The GPL build yt-dlp's makers publish is checked \
-             and installed for your user only; it takes about 330 MB on disk.",
-        );
+        let mut install = app.settings.install_ffmpeg == Some(true);
+        let checkbox = ui.checkbox(&mut install, "Install ffmpeg when a video needs it (about 200 MB)").on_hover_text(FFMPEG_ABOUT);
+        if checkbox.changed() {
+            app.answer_ffmpeg(install);
+        }
     });
 
     ui.add_space(4.0);

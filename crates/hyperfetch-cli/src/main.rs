@@ -12,7 +12,7 @@ use clap::Parser;
 use hyperfetch_core::engine::DownloadOptions;
 use hyperfetch_core::history::{is_redacted, DownloadHistoryManager, HistoryEntry, HistoryStatus, REDACTED_LINK};
 use hyperfetch_core::ingest::{decode_text, descriptor_client, http_url, ingest, input_tokens, ListOptions, Task};
-use hyperfetch_core::media::BrowserCookieSource;
+use hyperfetch_core::media::{find_ffmpeg_path, is_supported_media_site, BrowserCookieSource};
 use hyperfetch_core::resolver::SmartResolver;
 use hyperfetch_core::state::DownloadState;
 use hyperfetch_core::verify::{self, BuildVerificationResult};
@@ -155,7 +155,7 @@ fn job(args: &Args, connections: u64, dir: &Path, task: Task) -> Job {
         // download then fails instead of being saved as a file with the directory's name.
         (None, None) => folder.join(""),
     };
-    let media = args.media_preset.is_some() || task.urls.iter().any(hyperfetch_core::media::is_supported_media_site);
+    let media = args.media_preset.is_some() || task.urls.iter().any(is_supported_media_site);
     let options = DownloadOptions {
         output_path: Some(output),
         // --checksum is for the file a document lists, not for the document downloaded itself.
@@ -166,7 +166,8 @@ fn job(args: &Args, connections: u64, dir: &Path, task: Task) -> Job {
         proxy: args.proxy.clone(),
         media_preset: args.media_preset.clone(),
         browser_cookies: args.cookies_from_browser.map(Into::into),
-        install_ffmpeg: !args.no_install_ffmpeg,
+        // Else as the user answers (see `may_install_ffmpeg`).
+        install_ffmpeg: args.install_ffmpeg,
         subtitles: args.subs.clone(),
         embed_metadata: !args.no_embed_metadata,
         live_from_start: args.live_from_start,
@@ -304,9 +305,47 @@ async fn batch(args: &Args, ui: &Ui, shutdown: &Shutdown, http: &reqwest::Client
         return usage(&e);
     }
 
-    let jobs = tasks.into_iter().map(|(line, t)| Job { line, ..job(args, args.connections, &dir, t) }).collect();
+    let mut jobs: Vec<Job> = tasks.into_iter().map(|(line, t)| Job { line, ..job(args, args.connections, &dir, t) }).collect();
+    // Asked only where someone answers: at a terminal that is not reading the input file.
+    let terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let can_ask = terminal && !ui.quiet() && args.input_file.as_deref() != Some(Path::new("-"));
+    let install = may_install_ffmpeg(args, &jobs, &mut None, can_ask.then_some(prompt)).await;
+    for job in &mut jobs {
+        job.options.install_ffmpeg = install;
+    }
     failed += run_jobs(jobs, args.jobs as usize, ui, shutdown).await;
     exit_code(shutdown.requested(), failed)
+}
+
+/// What [`may_install_ffmpeg`] asks.
+const FFMPEG_QUESTION: &str = "\nffmpeg is not installed. It joins a video's separate video and audio (the best quality) and \
+makes MP3/M4A files; without it videos download in a lower quality and audio presets fail.\nInstall it for your user \
+(the checked build yt-dlp's makers publish, about 200 MB)? [y/N]: ";
+
+/// Whether the media downloads of this run may install ffmpeg (about 200 MB) when none is found:
+/// as --install-ffmpeg or --no-install-ffmpeg says, else as the user answered before this run
+/// (`answered`), else as the user answers `ask` now, asked only when one of `jobs` is a media
+/// download and no ffmpeg is found. Without `ask` (no one to answer) it is no.
+async fn may_install_ffmpeg<F, Fut>(args: &Args, jobs: &[Job], answered: &mut Option<bool>, ask: Option<F>) -> bool
+where
+    F: FnOnce(String) -> Fut,
+    Fut: Future<Output = Option<String>>,
+{
+    if args.install_ffmpeg || args.no_install_ffmpeg {
+        return args.install_ffmpeg;
+    }
+    if let Some(answer) = *answered {
+        return answer;
+    }
+    let media = jobs.iter().any(|job| job.options.media_preset.is_some() || job.urls.iter().any(is_supported_media_site));
+    let Some(ask) = ask.filter(|_| media) else { return false };
+    if tokio::task::spawn_blocking(find_ffmpeg_path).await.is_ok_and(|found| found.is_some()) {
+        return false;
+    }
+    let answer = ask(FFMPEG_QUESTION.to_string()).await;
+    let yes = answer.is_some_and(|answer| answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes"));
+    *answered = Some(yes);
+    yes
 }
 
 /// Prints `message` and reads one trimmed line; None at end of input.
@@ -341,7 +380,7 @@ where
 {
     stdout_line(&format!("Endo's Unified Downloader {}", env!("CARGO_PKG_VERSION")));
     let default_dir = args.dir.clone().unwrap_or_else(default_download_dir);
-    let mut failed = 0;
+    let (mut failed, mut ffmpeg_answer) = (0, None);
     loop {
         let Some(input) = ask("\nURL(s) of one file (space-separated mirrors), magnet, metalink or torrent;\nEnter to exit:\n> ".to_string()).await
         else {
@@ -393,7 +432,11 @@ where
             }
         };
 
-        let jobs = tasks.into_iter().map(|t| job(args, connections, &dir, t)).collect();
+        let mut jobs: Vec<Job> = tasks.into_iter().map(|t| job(args, connections, &dir, t)).collect();
+        let install = may_install_ffmpeg(args, &jobs, &mut ffmpeg_answer, Some(&mut ask)).await;
+        for job in &mut jobs {
+            job.options.install_ffmpeg = install;
+        }
         failed += run_jobs(jobs, args.jobs as usize, ui, shutdown).await;
         if let Some(code) = shutdown.requested() {
             return code;
@@ -782,7 +825,38 @@ mod tests {
         assert_eq!(options.subtitles.as_deref(), Some("all"));
         let task = Task { urls: vec![Url::parse("https://a.example/f").unwrap()], ..Default::default() };
         let options = job(&parse(&["u"]), 4, Path::new("d"), task).options;
-        assert!(options.install_ffmpeg && options.embed_metadata && !options.live_from_start && !options.wait_for_video);
+        // ffmpeg is installed only once the user agrees (see `may_install_ffmpeg`).
+        assert!(!options.install_ffmpeg && options.embed_metadata && !options.live_from_start && !options.wait_for_video);
+        let task = Task { urls: vec![Url::parse("https://a.example/f").unwrap()], ..Default::default() };
+        assert!(job(&parse(&["--install-ffmpeg", "u"]), 4, Path::new("d"), task).options.install_ffmpeg);
+    }
+
+    /// ffmpeg (about 200 MB) is installed as a flag says, else only once the user agrees: asked
+    /// once, for a media download, when none is found; without anyone to ask, never.
+    #[tokio::test]
+    async fn installing_ffmpeg_is_asked_about_unless_a_flag_says() {
+        type Ask = fn(String) -> std::future::Ready<Option<String>>;
+        let never: Ask = |question| panic!("asked: {question}");
+        let args = parse(&["u"]);
+        let jobs = |link: &str| [job(&args, 4, Path::new("d"), Task { urls: vec![Url::parse(link).unwrap()], ..Default::default() })];
+        let (video, file) = (jobs("https://www.youtube.com/watch?v=jNQXAC9IVRw"), jobs("https://a.example/f.iso"));
+        for (flag, allowed) in [("--install-ffmpeg", true), ("--no-install-ffmpeg", false)] {
+            assert_eq!(may_install_ffmpeg(&parse(&[flag, "u"]), &video, &mut None, Some(never)).await, allowed, "{flag}");
+        }
+        assert!(!may_install_ffmpeg(&args, &video, &mut None, None::<Ask>).await, "no one to ask");
+        assert!(!may_install_ffmpeg(&args, &file, &mut None, Some(never)).await, "no media");
+        assert!(!may_install_ffmpeg(&args, &video, &mut Some(false), Some(never)).await, "answered before");
+
+        let missing = tokio::task::spawn_blocking(find_ffmpeg_path).await.unwrap().is_none();
+        let (mut asked, mut answered) = (0, None);
+        let mut yes = |question: String| {
+            assert!(question.contains("about 200 MB") && question.ends_with("[y/N]: "), "{question}");
+            asked += 1;
+            std::future::ready(Some("Y".to_string()))
+        };
+        assert_eq!(may_install_ffmpeg(&args, &video, &mut answered, Some(&mut yes)).await, missing);
+        assert_eq!(may_install_ffmpeg(&args, &video, &mut answered, Some(&mut yes)).await, missing);
+        assert_eq!((asked, answered), (usize::from(missing), missing.then_some(true)), "asked once, if ffmpeg is missing");
     }
 
     /// --header goes to the hosts the user named, never to the mirrors a .metalink or .torrent
