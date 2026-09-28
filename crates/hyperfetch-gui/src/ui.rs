@@ -510,6 +510,12 @@ fn advanced_options(app: &mut App, ui: &mut egui::Ui) {
              Stop finishes the recording and keeps it.",
         );
         ui.add_space(12.0);
+        ui.checkbox(&mut app.settings.wait_for_video, "Wait for scheduled streams").on_hover_text(
+            "A stream or premiere that has not begun yet is waited for, checking every 1 to 10 minutes, \
+             instead of failing. Stop ends the wait.",
+        );
+    });
+    ui.horizontal(|ui| {
         ui.checkbox(&mut app.settings.install_ffmpeg, "Install ffmpeg when a video needs it (about 200 MB)").on_hover_text(
             "ffmpeg joins separate video and audio (the best quality) and makes MP3/M4A files. Without it videos \
              download in a lower quality and audio presets fail. The GPL build yt-dlp's makers publish is checked \

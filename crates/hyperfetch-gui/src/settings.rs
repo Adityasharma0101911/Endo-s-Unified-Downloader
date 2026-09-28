@@ -62,6 +62,8 @@ pub struct Settings {
     pub embed_metadata: bool,
     /// Record live streams from their start.
     pub live_from_start: bool,
+    /// Wait for a scheduled stream or premiere to begin instead of failing.
+    pub wait_for_video: bool,
 }
 
 impl Default for Settings {
@@ -90,6 +92,7 @@ impl Default for Settings {
             subtitles: String::new(),
             embed_metadata: engine.embed_metadata,
             live_from_start: engine.live_from_start,
+            wait_for_video: engine.wait_for_video,
         }
     }
 }
@@ -170,6 +173,7 @@ impl Settings {
             subtitles: non_empty(&self.subtitles),
             embed_metadata: self.embed_metadata,
             live_from_start: self.live_from_start,
+            wait_for_video: self.wait_for_video,
             ..self.tuning()
         })
     }
@@ -401,13 +405,14 @@ mod tests {
             subtitles: "en,es".into(),
             embed_metadata: false,
             live_from_start: true,
+            wait_for_video: true,
             ..saved
         };
         let list = chosen.list_options();
         assert_eq!((list.google_api_key.as_deref(), list.latest, list.only_new), (Some("AIzaKey"), Some(5), false));
         assert_eq!(list.cookies, BrowserCookieSource::Firefox);
         let opts = chosen.download_options(&file, "", "").unwrap();
-        assert!(!opts.install_ffmpeg && !opts.embed_metadata && opts.live_from_start);
+        assert!(!opts.install_ffmpeg && !opts.embed_metadata && opts.live_from_start && opts.wait_for_video);
         assert_eq!(opts.subtitles.as_deref(), Some("en,es"));
         let json = serde_json::to_string(&chosen).unwrap();
         assert_eq!(serde_json::from_str::<Settings>(&json).unwrap(), chosen);
