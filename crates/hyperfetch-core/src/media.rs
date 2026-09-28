@@ -1624,6 +1624,10 @@ impl OutputState {
             self.live = live == "True";
             self.file = file.to_string();
             self.recording = if self.live && !file.is_empty() { vec![PathBuf::from(file)] } else { Vec::new() };
+            // A recording's file is the one yt-dlp finishes for it, not an earlier video's.
+            if self.live {
+                self.final_path = None;
+            }
             return None;
         }
         // ffmpeg's progress: its rate, then what it has written. Counted as the video's file, which
@@ -1933,8 +1937,8 @@ fn ytdlp_command(bin: &Path, args: &[String], proxy: Option<&str>, work_dir: &Pa
 }
 
 /// Run yt-dlp once and return the file it produced. Cancelling kills it, but for a live recording,
-/// which it is asked to end as a Ctrl+C ends it, and then gives the file recorded so far (see
-/// [`stopped`]).
+/// which it is asked to end as a Ctrl+C ends it (one that has ended is left to finish its file),
+/// and then gives the file recorded so far (see [`stopped`]).
 async fn run_ytdlp(
     mut cmd: Command,
     progress_tx: Option<&Sender<ProgressUpdate>>,
@@ -1963,18 +1967,20 @@ async fn run_ytdlp(
     let status = loop {
         let update = tokio::select! {
             () = &mut cancelled, if !interrupted => {
-                if state.live && tree.interrupt(&child).await {
+                // A recording that has ended already is left to finish its file: a Ctrl+C would
+                // cut that short.
+                if state.live && (state.finishing || tree.interrupt(&child).await) {
                     interrupted = true;
-                    deadline = Some(tokio::time::Instant::now() + LIVE_STOP_GRACE);
+                    deadline = (!state.finishing).then(|| tokio::time::Instant::now() + LIVE_STOP_GRACE);
                     continue;
                 }
                 tree.kill_and_reap(&mut child).await;
-                return stopped(&state, false, ffmpeg).await;
+                return stopped(&state, ffmpeg).await;
             }
             () = sleep_until(deadline) => {
                 tracing::warn!("yt-dlp did not stop the live recording within {}s; killing it", LIVE_STOP_GRACE.as_secs());
                 tree.kill_and_reap(&mut child).await;
-                return stopped(&state, false, ffmpeg).await;
+                return stopped(&state, ffmpeg).await;
             }
             read = stdout.read_until(b'\n', &mut out_buf), if out_open => {
                 take_line(read, &mut out_buf, &mut out_open).and_then(|line| state.handle_line(&line, false))
@@ -1997,7 +2003,7 @@ async fn run_ytdlp(
     tree.disarm();
 
     if interrupted {
-        return stopped(&state, status.success(), ffmpeg).await;
+        return stopped(&state, ffmpeg).await;
     }
     if !status.success() {
         return Err(state.failure_message(status));
@@ -2021,14 +2027,15 @@ async fn is_file(path: &Path) -> bool {
 }
 
 /// What a yt-dlp run that was stopped leaves: nothing (the download is cancelled), unless it was
-/// recording a live stream. Then it is the file yt-dlp finished, when it `ended` of its own accord
-/// once asked to stop (see [`ProcessTree::interrupt`]); else what it recorded, made playable (see
-/// [`keep_recording`] and [`join_recording`]). Nothing recorded yet is cancelled all the same.
-async fn stopped(state: &OutputState, ended: bool, ffmpeg: Option<&Path>) -> Result<PathBuf, String> {
+/// recording a live stream. Then it is the file yt-dlp finished once asked to stop (see
+/// [`ProcessTree::interrupt`]), even when a step after that failed; else what it recorded, made
+/// playable (see [`keep_recording`] and [`join_recording`]). Nothing recorded yet is cancelled all
+/// the same.
+async fn stopped(state: &OutputState, ffmpeg: Option<&Path>) -> Result<PathBuf, String> {
     let Some(output) = state.recording.first().filter(|_| state.live) else {
         return Err(CANCELLED.to_string());
     };
-    if let Some(path) = state.final_path.as_ref().filter(|_| ended) {
+    if let Some(path) = &state.final_path {
         if is_file(path).await {
             return Ok(path.clone());
         }
@@ -5809,6 +5816,44 @@ mod tests {
         assert_eq!(left, [name]);
     }
 
+    /// A stop while yt-dlp finishes a live stream that ended of itself waits for the file: no
+    /// Ctrl+C cuts its remux short, nor is it killed.
+    #[tokio::test]
+    async fn a_recording_that_has_ended_is_left_to_finish_its_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("clip.mp4");
+        let out_s = output.display();
+        #[cfg(windows)]
+        let (bin, script) = (
+            dir.path().join("yt-dlp.cmd"),
+            format!(
+                "@echo off\r\necho HFLIVE True {out_s}\r\necho total_size=1000\r\necho HFPOST x\r\n\
+                 ping -n 3 127.0.0.1 >nul\r\necho finished> \"{out_s}\"\r\necho HFPATH {out_s}\r\n"
+            ),
+        );
+        #[cfg(not(windows))]
+        let (bin, script) = (
+            dir.path().join("yt-dlp"),
+            format!("#!/bin/sh\necho 'HFLIVE True {out_s}'\necho total_size=1000\necho HFPOST x\nsleep 2\necho finished > '{out_s}'\necho 'HFPATH {out_s}'\n"),
+        );
+        std::fs::write(&bin, script).unwrap();
+        #[cfg(unix)]
+        make_executable(&bin).unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stop = async {
+            // Its size, then the bar pinned while it finishes.
+            for _ in 0..2 {
+                rx.recv().await.expect("progress");
+            }
+            cancel.store(true, Ordering::Relaxed);
+        };
+        let (result, ()) = tokio::join!(run_ytdlp(tree_command(&bin), Some(&tx), Some(Arc::clone(&cancel)), None), stop);
+        assert_eq!(result, Ok(output.clone()));
+        assert!(std::fs::read_to_string(&output).unwrap().starts_with("finished"));
+    }
+
     #[tokio::test]
     async fn a_stopped_recording_is_its_streams_joined_or_its_file_named() {
         let dir = tempfile::tempdir().unwrap();
@@ -5822,19 +5867,29 @@ mod tests {
         };
         // Nothing to keep: the download is cancelled.
         let not_live = live(&[format!("HFLIVE False {}", out.join("clip.mp4").display())]);
-        assert_eq!(stopped(&not_live, false, None).await, Err(CANCELLED.to_string()));
+        assert_eq!(stopped(&not_live, None).await, Err(CANCELLED.to_string()));
         let started = live(&[format!("HFLIVE True {}", out.join("clip.mp4").display())]);
-        assert_eq!(stopped(&started, false, None).await, Err(CANCELLED.to_string()));
-        // yt-dlp finished it once asked to stop.
-        std::fs::write(out.join("clip.mp4"), b"done").unwrap();
-        let mut ended = live(&[format!("HFLIVE True {}", out.join("clip.mp4").display())]);
-        ended.final_path = Some(out.join("clip.mp4"));
-        assert_eq!(stopped(&ended, true, None).await, Ok(out.join("clip.mp4")));
-        std::fs::remove_file(out.join("clip.mp4")).unwrap();
+        assert_eq!(stopped(&started, None).await, Err(CANCELLED.to_string()));
+        // yt-dlp finished it once asked to stop, under the name of its last step (an audio
+        // preset's), whether a step after that failed or not.
+        std::fs::write(out.join("clip.mp3"), b"done").unwrap();
+        let ended = live(&[
+            format!("HFLIVE True {}", out.join("clip.m4a").display()),
+            "HFPOST x".to_string(),
+            format!("HFPATH {}", out.join("clip.mp3").display()),
+        ]);
+        assert_eq!(stopped(&ended, None).await, Ok(out.join("clip.mp3")));
+        // What an earlier video of the run became is not the recording.
+        let after = live(&[
+            format!("HFPATH {}", out.join("clip.mp3").display()),
+            format!("HFLIVE True {}", out.join("clip.mp4").display()),
+        ]);
+        assert_eq!(stopped(&after, None).await, Err(CANCELLED.to_string()));
+        std::fs::remove_file(out.join("clip.mp3")).unwrap();
         // A file of another format just loses its `.part`, under its own name.
         std::fs::write(out.join("talk.webm.part"), b"webm").unwrap();
         let webm = live(&[format!("HFLIVE True {}", out.join("talk.webm").display())]);
-        assert_eq!(stopped(&webm, false, None).await, Ok(out.join("talk.webm")));
+        assert_eq!(stopped(&webm, None).await, Ok(out.join("talk.webm")));
         assert_eq!(names_in(out), ["talk.webm"]);
         std::fs::remove_file(out.join("talk.webm")).unwrap();
 
@@ -5851,7 +5906,7 @@ mod tests {
             format!("HFP downloading 100 NA NA 10.0 NA {}", video.display()),
             format!("HFP downloading 100 NA NA 10.0 NA {}", audio.display()),
         ]);
-        let path = stopped(&from_start, false, Some(&ffmpeg)).await.unwrap();
+        let path = stopped(&from_start, Some(&ffmpeg)).await.unwrap();
         assert_eq!(path, out.join("clip.mp4"));
         assert_eq!(media_streams(&path), (true, true));
         assert_eq!(names_in(out), ["clip.mp4"]);
