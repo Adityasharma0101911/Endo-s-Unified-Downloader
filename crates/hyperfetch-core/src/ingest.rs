@@ -41,6 +41,10 @@ pub struct Task {
     /// (its host would not hand it over, or the torrent has no HTTP web seeds): a checksum given
     /// for the file it lists is not its own.
     pub document_itself: bool,
+    /// Lines the download archive gets once the file is downloaded (see
+    /// `engine::DownloadOptions::archive_lines`), which leave it out of a later listing with
+    /// `only_new`: a feed episode's, or a cloud folder file's.
+    pub archive: Vec<String>,
 }
 
 impl Task {
