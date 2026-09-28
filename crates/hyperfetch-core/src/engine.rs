@@ -278,7 +278,8 @@ impl DownloadEngine {
     /// data, saves the resume state and returns `Err("Download cancelled by user")`, normally within
     /// about two seconds (longer only while the disk is still flushing written data). Dropping the
     /// `run()` future instead skips that final state save, so up to two seconds of progress would
-    /// be downloaded again on resume.
+    /// be downloaded again on resume. A live recording is not cancelled but finished: `run()` then
+    /// returns the file recorded so far (see `crate::media`).
     pub fn cancel(&self) {
         self.cancel_flag.store(true, Ordering::Relaxed);
         self.cancel_token.cancel();
@@ -305,9 +306,10 @@ impl DownloadEngine {
         self.fetch_resolved(client, resolved, snapshot_tx, Route { follows: 0, tried: Vec::new(), scrape: true }).await
     }
 
-    /// Downloads what the resolved mirrors serve: an HLS stream if one is a playlist, else their
-    /// file. An answer that lands on a host a resolver takes, on a media site, or on a "leaving
-    /// this site" link, is downloaded from there instead (see `follow`). With `route.scrape`, a
+    /// Downloads what the resolved mirrors serve: an HLS stream if one is a playlist (recorded
+    /// with yt-dlp if it is live), else their file. An answer that lands on a host a resolver
+    /// takes, on a media site, or on a "leaving this site" link, is downloaded from there instead
+    /// (see `follow`). With `route.scrape`, a
     /// web page they answer with is an error when a link shortener or mail scanner showed it
     /// instead of redirecting; any other is looked into (see `look_into_page`): the video it plays
     /// is downloaded in its place, the link it sends the browser on to at once is followed. A page
@@ -342,6 +344,10 @@ impl DownloadEngine {
                 // Fetched, but not a playlist after all: try it as a plain file.
                 Err(HlsError::InvalidPlaylist(reason)) => {
                     tracing::warn!("Not an HLS playlist ({}); falling back to a direct download", reason)
+                }
+                // Only a recording gets a live stream: yt-dlp's.
+                Err(HlsError::Live) => {
+                    return self.naming(playlist.clone()).run_media(playlist.clone(), None, snapshot_tx).await
                 }
                 // A real stream; downloading the playlist text instead would only fake a success.
                 Err(e) if matches!(e, HlsError::Unsupported(_)) => {
@@ -2903,14 +2909,14 @@ fn numbered(base: &Path, n: usize) -> PathBuf {
 }
 
 /// First of `base`, `base (1)`, ... where neither the file, its `.part` nor a claim exists.
-fn free_path(base: &Path) -> PathBuf {
+pub(crate) fn free_path(base: &Path) -> PathBuf {
     (0..)
         .map(|n| numbered(base, n))
         .find(|c| !c.exists() && !part_path(c).exists() && !lock_path(c).exists())
         .unwrap_or_else(|| base.to_path_buf())
 }
 
-fn part_path(final_path: &Path) -> PathBuf {
+pub(crate) fn part_path(final_path: &Path) -> PathBuf {
     let mut name = final_path.file_name().unwrap_or_default().to_os_string();
     name.push(".part");
     final_path.with_file_name(name)

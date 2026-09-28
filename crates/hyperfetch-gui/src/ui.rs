@@ -454,6 +454,11 @@ fn advanced_options(app: &mut App, ui: &mut egui::Ui) {
         ui.add_space(12.0);
         ui.checkbox(&mut app.settings.embed_metadata, "Embed tags and chapters")
             .on_hover_text("Write the title, artist, date, description, link and chapters into the file (needs ffmpeg)");
+        ui.add_space(12.0);
+        ui.checkbox(&mut app.settings.live_from_start, "Record live streams from the start").on_hover_text(
+            "Where the site keeps it, record a live stream from its start instead of from now. \
+             Stop finishes the recording and keeps it.",
+        );
     });
 
     ui.add_space(4.0);
@@ -508,22 +513,22 @@ fn metric(ui: &mut egui::Ui, label: &str, value: String, color: Option<Color32>)
 fn progress_card(app: &App, ui: &mut egui::Ui, item: Option<&QueueItem>) {
     let view = item.and_then(|item| app.jobs.get(&item.id));
     let downloading = item.is_some_and(|item| item.status == QueueItemStatus::Downloading);
+    let (downloaded, total) = item.map_or((0, 0), |item| (item.downloaded_bytes, item.total_bytes));
+    let elapsed = view.map_or(0, |view| view.elapsed().as_secs());
     card().show(ui, |ui| {
         ui.add(
             egui::ProgressBar::new(app.anim_progress as f32)
                 .animate(downloading)
-                .text(format!("{:.1}%", (app.anim_progress * 100.0).clamp(0.0, 100.0))),
+                .text(util::progress_text(total, downloaded, app.anim_progress, 1, view.map(|_| elapsed))),
         );
         ui.add_space(8.0);
 
-        let (downloaded, total) = item.map_or((0, 0), |item| (item.downloaded_bytes, item.total_bytes));
         let eta = match item {
             Some(item) if item.status == QueueItemStatus::Completed => "Done".to_string(),
             Some(item) if downloading => util::eta_secs(item.total_bytes, item.downloaded_bytes, item.speed_bytes_per_sec)
                 .map_or_else(|| "--:--".to_string(), format_duration),
             _ => "--:--".to_string(),
         };
-        let elapsed = view.map_or(0, |view| view.elapsed().as_secs());
         ui.columns(4, |cols| {
             let transferred = if total > 0 {
                 format!("{} / {}", format_bytes(downloaded), format_bytes(total))
@@ -867,11 +872,8 @@ fn queue_tab(app: &mut App, ui: &mut egui::Ui) {
                 ui.add_sized([220.0, 18.0], egui::Label::new(&item.filename).truncate()).on_hover_text(&item.filename);
                 let (status, color) = status_badge(app, item);
                 ui.add_sized([95.0, 18.0], egui::Label::new(RichText::new(status).monospace().size(11.0).color(color)));
-                let progress = if item.total_bytes > 0 {
-                    format!("{:.0}%", item.progress_ratio * 100.0)
-                } else {
-                    format_bytes(item.downloaded_bytes)
-                };
+                let elapsed = app.jobs.get(&item.id).map(|view| view.elapsed().as_secs());
+                let progress = util::progress_text(item.total_bytes, item.downloaded_bytes, item.progress_ratio, 0, elapsed);
                 ui.add_sized([150.0, 16.0], egui::ProgressBar::new(item.progress_ratio as f32).text(progress));
                 let speed = if item.status == QueueItemStatus::Downloading {
                     format!("{}/s", format_bytes(item.speed_bytes_per_sec as u64))
