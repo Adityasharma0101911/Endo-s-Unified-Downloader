@@ -34,11 +34,13 @@ Restart=on-abnormal
 RestartSec=30
 SuccessExitStatus=130 143
 
-# SIGTERM makes the CLI stop every download and save its resume state (bounded to 10 s);
-# yt-dlp children are stopped by the CLI itself.
+# SIGTERM makes the CLI stop every download and save its resume state within 10 s, and finish
+# the file of a live recording, which takes as long as the file is big (minutes for hours of
+# video); only after TimeoutStopSec is everything killed. yt-dlp children are stopped by the CLI
+# itself.
 KillSignal=SIGTERM
 KillMode=mixed
-TimeoutStopSec=30
+TimeoutStopSec=15min
 
 # Hardening
 NoNewPrivileges=yes
