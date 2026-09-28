@@ -4303,30 +4303,31 @@ pub(crate) async fn find_site_media(
     options: &MediaDownloadOptions,
     cancel_flag: Option<Arc<AtomicBool>>,
 ) -> Result<Extracted, String> {
-    find_prepared(url, prepare(options, &cancel_flag, false), cancel_flag.clone()).await
+    find_prepared(url, prepare(options, &cancel_flag, false), cancel_flag.clone(), FIND_TIMEOUT).await
 }
 
-/// [`find_site_media`] with the options and tools `prepared` gives, all within [`FIND_TIMEOUT`].
+/// [`find_site_media`] with the options and tools `prepared` gives, all within `limit`.
 async fn find_prepared(
     url: &Url,
     prepared: impl std::future::Future<Output = Result<(MediaDownloadOptions, Tools<'static>), String>>,
     cancel_flag: Option<Arc<AtomicBool>>,
+    limit: Duration,
 ) -> Result<Extracted, String> {
     let find = async {
         let (options, tools) = prepared.await?;
         find_with(url, &options, &tools, cancel_flag).await
     };
     // Dropped, the run's process tree is killed.
-    match tokio::time::timeout(FIND_TIMEOUT, find).await {
+    match tokio::time::timeout(limit, find).await {
         Ok(Ok(Extracted(json))) if lists_nothing(&json) => Err(NOTHING_FOUND.to_string()),
         Ok(found) => found.map_err(drm_refused),
-        Err(_) => Err(format!("yt-dlp took over {}s", FIND_TIMEOUT.as_secs())),
+        Err(_) => Err(format!("yt-dlp took over {}s", limit.as_secs())),
     }
 }
 
 /// How long [`find_site_media`] waits for yt-dlp: a site on a slow or stalling host is left
 /// alone rather than hold up the download of the page for as long as yt-dlp's retries last.
-const FIND_TIMEOUT: Duration = if cfg!(test) { Duration::from_secs(3) } else { Duration::from_secs(45) };
+const FIND_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// How yt-dlp says that none of the sites it may use takes a link.
 const NO_SITE: &str = "No suitable extractor";
@@ -7002,10 +7003,12 @@ bbd8671c6c05eaa3ec29d690695aebadff0871faa3efe9051581afbf3c01e80e  ffmpeg-master-
         let options = MediaDownloadOptions { output_dir: dir.path().to_path_buf(), custom_ytdlp_path: Some(bin), ..Default::default() };
         let url = Url::parse("https://slow.example/watch/1").unwrap();
 
+        // A short wait of its own, so the test does not take FIND_TIMEOUT.
+        let limit = Duration::from_secs(3);
         let started = std::time::Instant::now();
-        let err = find_site_media(&url, &options, None).await.err().expect("nothing was found");
-        assert_eq!(err, format!("yt-dlp took over {}s", FIND_TIMEOUT.as_secs()));
-        assert!(started.elapsed() < FIND_TIMEOUT + Duration::from_secs(20), "{:?}", started.elapsed());
+        let err = find_prepared(&url, prepare(&options, &None, false), None, limit).await.err().expect("nothing was found");
+        assert_eq!(err, format!("yt-dlp took over {}s", limit.as_secs()));
+        assert!(started.elapsed() < limit + Duration::from_secs(20), "{:?}", started.elapsed());
         assert!(!site_failed(&err));
     }
 
@@ -7049,7 +7052,7 @@ bbd8671c6c05eaa3ec29d690695aebadff0871faa3efe9051581afbf3c01e80e  ffmpeg-master-
             tokio::time::sleep(FIND_TIMEOUT * 10).await;
             Err::<(MediaDownloadOptions, Tools<'static>), _>("installed at last".to_string())
         };
-        let err = find_prepared(&url, installing, None).await.err();
+        let err = find_prepared(&url, installing, None, FIND_TIMEOUT).await.err();
         assert_eq!(err, Some(format!("yt-dlp took over {}s", FIND_TIMEOUT.as_secs())));
     }
 
