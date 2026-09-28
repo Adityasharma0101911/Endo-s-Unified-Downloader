@@ -3415,6 +3415,7 @@ async fn test_stopping_a_live_recording_keeps_what_it_recorded() {
     let (path, snapshot) = tokio::join!(run(&engine, Some(tx)), stop);
     let path = path.expect("the recording is kept");
     assert_eq!((snapshot.downloaded_bytes, snapshot.total_bytes), (1000, 0));
+    assert!(snapshot.is_recording());
     assert_eq!(path, output);
     assert_file(&path, b"recorded so far");
     let entry = history_entry(&path).expect("the recording is recorded");

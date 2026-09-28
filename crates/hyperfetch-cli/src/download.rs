@@ -429,11 +429,11 @@ async fn run_job(
     }
 }
 
-/// A download with no size to reach that has something already, as a live recording has: stopping
+/// A live recording that has something already (see [`EngineSnapshot::is_recording`]): stopping
 /// finishes its file, which takes as long as the file is big, so it gets no [`STOP_TIMEOUT`] (a
-/// second Ctrl+C still quits at once).
+/// second Ctrl+C still quits at once). Any other download without a size stops as all others do.
 fn is_recording(last: Option<&EngineSnapshot>) -> bool {
-    last.is_some_and(|s| s.total_bytes == 0 && s.downloaded_bytes > 0)
+    last.is_some_and(EngineSnapshot::is_recording)
 }
 
 async fn sleep_until(deadline: Option<tokio::time::Instant>) {
@@ -700,7 +700,9 @@ mod tests {
             target_path: None,
         };
         assert!(is_recording(Some(&snapshot(0, 4096))));
-        for not_one in [Some(snapshot(8192, 4096)), Some(snapshot(0, 0)), None] {
+        // A server that sends no size: the engine's own download of a file.
+        let unsized_file = EngineSnapshot { target_path: Some("file.bin".into()), ..snapshot(0, 4096) };
+        for not_one in [Some(snapshot(8192, 4096)), Some(snapshot(0, 0)), Some(unsized_file), None] {
             assert!(!is_recording(not_one.as_ref()), "{not_one:?}");
         }
     }
