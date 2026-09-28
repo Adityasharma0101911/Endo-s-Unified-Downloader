@@ -686,7 +686,9 @@ async fn list_entries_of<F: std::future::Future<Output = ListRun>>(
 
 /// One task per entry of the list `title`, saved in a folder named after it (see `Task::folder`)
 /// under its title and id (see [`LIST_ENTRY_NAME`]), leaving out those whose line `archive` (the
-/// download archive's lines) holds: none when it holds them all.
+/// download archive's lines) holds: none when it holds them all. An entry's link is one the list
+/// chose (a label's albums on each artist's own site), so the Authorization the user gave is not
+/// sent there.
 fn list_tasks((title, entries): (String, Vec<ListEntry>), archive: Option<&HashSet<String>>) -> Vec<crate::ingest::Task> {
     let listed = entries.len();
     let folder = crate::ingest::clean_path([title.as_str()]).ok();
@@ -697,6 +699,7 @@ fn list_tasks((title, entries): (String, Vec<ListEntry>), archive: Option<&HashS
             urls: vec![entry.url],
             folder: folder.clone(),
             media_name: Some(LIST_ENTRY_NAME.to_string()),
+            from_document: true,
             ..Default::default()
         })
         .collect();
@@ -7274,6 +7277,17 @@ bbd8671c6c05eaa3ec29d690695aebadff0871faa3efe9051581afbf3c01e80e  ffmpeg-master-
         let mut downloaded = entries();
         downloaded.truncate(2);
         assert_eq!(list_tasks((title(), downloaded), Some(&archive)), []);
+    }
+
+    /// A label's page lists albums on each artist's own site, hosts the user never named: the
+    /// Authorization header the user gave for the label's page is not sent to them.
+    #[test]
+    fn list_entries_are_links_the_list_chose() {
+        let entries = ["https://artist-one.bandcamp.com/album/first", "https://artist-two.bandcamp.com/track/second"]
+            .map(|link| ListEntry { url: Url::parse(link).unwrap(), archive_id: None });
+        let tasks = list_tasks(("Label".to_string(), entries.into()), None);
+        assert_eq!(tasks.len(), 2);
+        assert!(tasks.iter().all(|task| task.from_document), "{tasks:?}");
     }
 
     #[test]
