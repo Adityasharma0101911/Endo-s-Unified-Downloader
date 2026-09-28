@@ -1,12 +1,13 @@
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use egui::{Color32, Pos2, Rect, RichText, Stroke, Vec2};
 use hyperfetch_core::chunk::ChunkSnapshot;
 use hyperfetch_core::history::HistoryStatus;
 use hyperfetch_core::ingest::{self, truncate_chars};
+use hyperfetch_core::media;
 use hyperfetch_core::queue::{QueueItem, QueueItemStatus};
 
 use crate::settings::{BROWSERS, MEDIA_PRESETS};
@@ -78,6 +79,17 @@ fn status_badge(app: &App, item: &QueueItem) -> (&'static str, Color32) {
     }
 }
 
+/// While ffmpeg is `installing`, a notice, and a frame a second so that it goes when the install
+/// ends, also when no download runs any more (a cancelled video leaves the install to finish).
+fn ffmpeg_notice(ui: &mut egui::Ui, installing: bool) {
+    if installing {
+        ui.add_space(6.0);
+        let text = "Installing ffmpeg (about 200 MB download); videos that need it wait until it is ready.";
+        ui.label(RichText::new(text).size(12.0).color(AMBER));
+        ui.ctx().request_repaint_after(Duration::from_secs(1));
+    }
+}
+
 pub fn render(app: &mut App, ui: &mut egui::Ui) {
     ui.add_space(8.0);
     header(app, ui);
@@ -96,6 +108,7 @@ pub fn render(app: &mut App, ui: &mut egui::Ui) {
             }
         });
     }
+    ffmpeg_notice(ui, media::installing_ffmpeg());
     ui.add_space(8.0);
 
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match app.tab {
@@ -482,6 +495,11 @@ fn advanced_options(app: &mut App, ui: &mut egui::Ui) {
         ui.label(RichText::new("Browser Cookies:").size(12.0));
         combo(ui, "browser_cookies_combo", &mut app.settings.browser_cookies, &BROWSERS);
     });
+    ui.checkbox(&mut app.settings.install_ffmpeg, "Install ffmpeg when a video needs it (about 200 MB)").on_hover_text(
+        "ffmpeg joins separate video and audio (the best quality) and makes MP3/M4A files. Without it videos \
+         download in a lower quality and audio presets fail. The GPL build yt-dlp's makers publish is checked \
+         and installed for your user only; it takes about 330 MB on disk.",
+    );
 
     ui.add_space(4.0);
     ui.horizontal(|ui| {
@@ -1185,5 +1203,32 @@ fn verification_card(app: &mut App, ui: &mut egui::Ui) {
     if let Some(message) = &app.verify_message {
         ui.add_space(4.0);
         ui.label(RichText::new(message).size(11.0).color(MUTED));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The delay before the next frame after one with the ffmpeg notice, `installing` or not. The
+    /// first frame asks for a second one at once, to lay itself out.
+    fn next_frame_after(installing: bool) -> Duration {
+        let ctx = egui::Context::default();
+        let frame = || {
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| ffmpeg_notice(ui, installing));
+            });
+            output.viewport_output[&egui::ViewportId::ROOT].repaint_delay
+        };
+        frame();
+        frame()
+    }
+
+    /// While ffmpeg installs, frames keep coming though no download runs, so the notice goes when
+    /// the install ends.
+    #[test]
+    fn the_ffmpeg_notice_keeps_frames_coming_while_it_shows() {
+        assert!(next_frame_after(true) <= Duration::from_secs(1));
+        assert_eq!(next_frame_after(false), Duration::MAX);
     }
 }
