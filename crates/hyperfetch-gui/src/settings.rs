@@ -25,8 +25,12 @@ pub const BROWSERS: [&str; 7] = [
     "Vivaldi",
 ];
 
+/// The environment variable the command line takes the Google API key from too.
+pub const GOOGLE_API_KEY_VAR: &str = "ENDO_GOOGLE_API_KEY";
+
 /// Options the user sets once and that are kept across launches. The checksum and the
-/// Authorization header belong to a single download and are never saved.
+/// Authorization header belong to a single download and are never saved, nor is the Google API
+/// key, a credential.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -48,7 +52,10 @@ pub struct Settings {
     pub clipboard_watch: bool,
     pub auto_run_queue: bool,
     pub max_concurrent: usize,
-    /// The user's Google API key, for listing whole Google Drive folders (empty = none).
+    /// The user's Google API key, for listing whole Google Drive folders (empty = none). Never
+    /// saved: [`Settings::load`] takes it from [`GOOGLE_API_KEY_VAR`], and one an older version
+    /// saved is read and left out of the file the next time the settings are saved.
+    #[serde(skip_serializing)]
     pub google_api_key: String,
     /// Leave out the items of a channel, playlist or feed downloaded before.
     pub only_new: bool,
@@ -126,12 +133,15 @@ impl Settings {
         app_file("gui-settings.json")
     }
 
-    /// Saved settings, or the defaults when there are none or they cannot be read.
+    /// Saved settings, or the defaults when there are none or they cannot be read, with the
+    /// Google API key from [`GOOGLE_API_KEY_VAR`] when that is set.
     pub fn load() -> Self {
-        std::fs::read(Self::path())
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default()
+        let mut settings: Self =
+            std::fs::read(Self::path()).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default();
+        if let Some(key) = std::env::var(GOOGLE_API_KEY_VAR).ok().as_deref().and_then(non_empty) {
+            settings.google_api_key = key;
+        }
+        settings
     }
 
     pub fn save(&self) -> std::io::Result<()> {
@@ -415,7 +425,19 @@ mod tests {
         assert!(!opts.install_ffmpeg && !opts.embed_metadata && opts.live_from_start && opts.wait_for_video);
         assert_eq!(opts.subtitles.as_deref(), Some("en,es"));
         let json = serde_json::to_string(&chosen).unwrap();
-        assert_eq!(serde_json::from_str::<Settings>(&json).unwrap(), chosen);
+        assert_eq!(serde_json::from_str::<Settings>(&json).unwrap(), Settings { google_api_key: String::new(), ..chosen });
+    }
+
+    /// The Google API key is a credential: it is never written to the settings file, and one an
+    /// older version wrote there is read, so the next save leaves it out.
+    #[test]
+    fn the_google_api_key_is_not_saved() {
+        let settings = Settings { google_api_key: "AIzaSecret".into(), ..Settings::default() };
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(!json.contains("AIzaSecret") && !json.contains("google_api_key"), "{json}");
+        let older: Settings = serde_json::from_str(r#"{"google_api_key": "AIzaOld"}"#).unwrap();
+        assert_eq!(older.google_api_key, "AIzaOld");
+        assert!(!serde_json::to_string(&older).unwrap().contains("AIzaOld"));
     }
 
     #[test]
