@@ -140,7 +140,7 @@ pub struct Args {
     #[arg(long = "latest", value_name = "N", value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     pub latest: Option<usize>,
 
-    /// Also the items of a channel, playlist or feed downloaded before (by default only new ones)
+    /// Also the items of a channel, playlist, feed or cloud folder downloaded before (by default only new ones)
     #[arg(long = "all-items")]
     pub all_items: bool,
 

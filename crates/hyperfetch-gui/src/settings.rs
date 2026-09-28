@@ -57,7 +57,7 @@ pub struct Settings {
     /// saved is read and left out of the file the next time the settings are saved.
     #[serde(skip_serializing)]
     pub google_api_key: String,
-    /// Leave out the items of a channel, playlist or feed downloaded before.
+    /// Leave out the items of a channel, playlist, feed or cloud folder downloaded before.
     pub only_new: bool,
     /// Only the newest this many items of a channel, playlist or feed (0 = all).
     pub latest: usize,

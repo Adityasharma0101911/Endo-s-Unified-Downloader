@@ -79,7 +79,7 @@ async fn retried<T, Fut: Future<Output = Result<T, Failed>>>(mut request: impl F
 const DRIVE_API: &str = "https://www.googleapis.com/drive/v3/";
 
 /// What the Drive API tells of each child of a folder (see [`DriveItem`]).
-const DRIVE_FIELDS: &str = "nextPageToken,files(id,name,mimeType,size,md5Checksum,resourceKey,shortcutDetails)";
+const DRIVE_FIELDS: &str = "nextPageToken,files(id,name,mimeType,size,md5Checksum,modifiedTime,resourceKey,shortcutDetails)";
 
 const DRIVE_SHORTCUT: &str = "application/vnd.google-apps.shortcut";
 
@@ -138,7 +138,8 @@ pub fn lists(url: &Url) -> bool {
 
 /// One task per file in the folder at `url`, subfolders kept in `Task::folder` or `Task::name`;
 /// called only when [`lists`] takes `url`. None when it is no folder after all (the link is then
-/// downloaded as it is); `Some(Ok)` is never empty.
+/// downloaded as it is); `Some(Ok)` is empty only when every file it lists was downloaded
+/// before and `options.only_new` left them out (see `Task::archive`).
 ///
 /// A Google Drive folder is listed through the Drive API with the user's Google API key, else
 /// from its public page. Requests are made one at a time, again while the host is busy or
@@ -169,13 +170,21 @@ pub async fn list(http: &reqwest::Client, url: &Url, options: &ListOptions) -> O
         }
         Folder::MediaFire { key, maybe } => mediafire_list(http, url.scheme(), &key, maybe, options).await?,
     };
-    Some(listed.and_then(|tasks| {
-        if tasks.is_empty() {
-            Err("the folder holds no files that can be downloaded".to_string())
-        } else {
-            Ok(tasks)
-        }
-    }))
+    Some(match listed {
+        Ok(tasks) if tasks.is_empty() => Err("the folder holds no files that can be downloaded".to_string()),
+        Ok(tasks) if options.only_new => not_downloaded(tasks).await,
+        listed => listed,
+    })
+}
+
+/// `tasks` less those whose line the download archive holds (see `Task::archive`), read off the
+/// runtime's threads: none left is nothing new to do, not an error.
+async fn not_downloaded(mut tasks: Vec<Task>) -> Result<Vec<Task>, String> {
+    let Some(file) = crate::media::archive_file() else { return Ok(tasks) };
+    let read = tokio::task::spawn_blocking(move || crate::media::read_archive(&file));
+    let archive = read.await.map_err(|e| format!("Background task failed: {e}"))??;
+    tasks.retain(|task| !task.archive.iter().any(|line| archive.contains(line)));
+    Ok(tasks)
 }
 
 /// `name` made one path component, else `id` (a name like ".." leaves nothing).
@@ -251,6 +260,8 @@ struct DriveChild {
     resource_key: Option<String>,
     size: Option<u64>,
     md5: Option<String>,
+    /// When it last changed, as the API tells it (RFC 3339).
+    modified: Option<String>,
     /// Reached through a shortcut (`id` is the target's).
     shortcut: bool,
 }
@@ -273,6 +284,7 @@ struct DriveItem {
     /// A decimal string, as the API gives 64-bit numbers.
     size: Option<String>,
     md5_checksum: Option<String>,
+    modified_time: Option<String>,
     resource_key: Option<String>,
     shortcut_details: Option<DriveShortcut>,
 }
@@ -299,16 +311,17 @@ struct DriveName {
 }
 
 impl From<DriveItem> for DriveChild {
-    /// A shortcut stands for its target, under the shortcut's name.
+    /// A shortcut stands for its target, under the shortcut's name (the size, checksum and time
+    /// of change it has are its own, not the target's).
     fn from(item: DriveItem) -> Self {
-        let (id, mime_type, resource_key, size, md5, shortcut) = match item.shortcut_details {
-            Some(target) if item.mime_type == DRIVE_SHORTCUT => {
-                (target.target_id, target.target_mime_type, target.target_resource_key, None, None, true)
-            }
-            _ => (item.id, item.mime_type, item.resource_key, item.size.and_then(|s| s.parse().ok()), item.md5_checksum, false),
+        let (id, mime_type, resource_key, shortcut) = match item.shortcut_details {
+            Some(target) if item.mime_type == DRIVE_SHORTCUT => (target.target_id, target.target_mime_type, target.target_resource_key, true),
+            _ => (item.id, item.mime_type, item.resource_key, false),
         };
         let kind = drive_kind(&id, &mime_type, resource_key.as_deref());
-        DriveChild { id, name: item.name, kind, resource_key, size, md5, shortcut }
+        let (size, md5, modified) =
+            if shortcut { (None, None, None) } else { (item.size.and_then(|s| s.parse().ok()), item.md5_checksum, item.modified_time) };
+        DriveChild { id, name: item.name, kind, resource_key, size, md5, modified, shortcut }
     }
 }
 
@@ -332,7 +345,7 @@ fn drive_kind(id: &str, mime_type: &str, resource_key: Option<&str>) -> Kind {
 /// The child of a Drive folder the embedded view links as `href`: a folder, a file, or a
 /// document of Docs, Sheets or Slides (by its editor link); anything else is left out.
 fn page_child(href: &str, name: String) -> DriveChild {
-    let child = |id, name, kind, resource_key| DriveChild { id, name, kind, resource_key, size: None, md5: None, shortcut: false };
+    let child = |id, name, kind, resource_key| DriveChild { id, name, kind, resource_key, size: None, md5: None, modified: None, shortcut: false };
     let Ok(url) = Url::parse(href) else { return child(String::new(), name, Kind::Other, None) };
     let resource_key = url.query_pairs().find(|(k, _)| k == "resourcekey").map(|(_, v)| v.into_owned());
     if let Some(Folder::Drive { id, resource_key, maybe: false }) = folder_of(&url) {
@@ -351,6 +364,16 @@ fn page_child(href: &str, name: String) -> DriveChild {
 }
 
 impl DriveChild {
+    /// Its line in the download archive (see `Task::archive`): its id and, where the listing
+    /// tells one, its version (the MD5 of its content, else when it last changed), so that a
+    /// file changed since it was downloaded is new again. The folder's page tells none.
+    fn archive_line(&self) -> String {
+        match self.md5.as_ref().or(self.modified.as_ref()) {
+            Some(version) => format!("gdrive {} {}", self.id, version),
+            None => format!("gdrive {}", self.id),
+        }
+    }
+
     /// What this child of the folder at `folder` (a path under the save folder) becomes.
     fn into_child(self, folder: &Path) -> Result<Child, String> {
         let task = |urls, name: &str, size, checksum| -> Result<Child, String> {
@@ -361,6 +384,7 @@ impl DriveChild {
                 size,
                 checksum,
                 from_document: true,
+                archive: vec![self.archive_line()],
                 ..Task::default()
             }))
         };
@@ -799,6 +823,8 @@ async fn mediafire_files(
                 checksum,
                 size: file.size.parse().ok(),
                 from_document: true,
+                // Its key and content (see `DriveChild::archive_line`).
+                archive: vec![format!("mediafire {} {}", file.quickkey, file.hash).trim_end().to_string()],
                 ..Task::default()
             });
         }
@@ -914,12 +940,12 @@ mod tests {
     fn drive_items_become_downloads_documents_their_export() {
         let items: Vec<DriveItem> = serde_json::from_str(
             r#"[
-            {"id": "f1", "name": "a.bin", "mimeType": "application/octet-stream", "size": "5", "md5Checksum": "5d41402abc4b2a76b9719d911017c592", "resourceKey": "0-r"},
-            {"id": "d1", "name": "Notes", "mimeType": "application/vnd.google-apps.document", "size": "1024"},
+            {"id": "f1", "name": "a.bin", "mimeType": "application/octet-stream", "size": "5", "md5Checksum": "5d41402abc4b2a76b9719d911017c592", "modifiedTime": "2026-03-01T10:00:00.000Z", "resourceKey": "0-r"},
+            {"id": "d1", "name": "Notes", "mimeType": "application/vnd.google-apps.document", "size": "1024", "modifiedTime": "2026-03-02T11:30:00.000Z"},
             {"id": "d2", "name": "Minutes", "mimeType": "application/vnd.google-apps.document", "resourceKey": "0-dk"},
             {"id": "x1", "name": "Budget.XLSX", "mimeType": "application/vnd.google-apps.spreadsheet"},
             {"id": "fm1", "name": "Survey", "mimeType": "application/vnd.google-apps.form"},
-            {"id": "s1", "name": "Link to b", "mimeType": "application/vnd.google-apps.shortcut", "shortcutDetails": {"targetId": "f9", "targetMimeType": "image/png", "targetResourceKey": "0-t"}},
+            {"id": "s1", "name": "Link to b", "mimeType": "application/vnd.google-apps.shortcut", "modifiedTime": "2026-01-01T00:00:00.000Z", "shortcutDetails": {"targetId": "f9", "targetMimeType": "image/png", "targetResourceKey": "0-t"}},
             {"id": "s2", "name": "Link to sub", "mimeType": "application/vnd.google-apps.shortcut", "shortcutDetails": {"targetId": "sub9", "targetMimeType": "application/vnd.google-apps.folder"}},
             {"id": "s3", "name": "Broken link", "mimeType": "application/vnd.google-apps.shortcut"}
             ]"#,
@@ -955,6 +981,10 @@ mod tests {
         assert_eq!(folders, [("sub9".to_string(), None, root.join("Link to sub"))]);
         assert_eq!(others, 2, "a form and a shortcut without a target have nothing to download");
         assert_eq!(with_extension("Deck", "pptx"), "Deck.pptx");
+        // Each file's line in the download archive: its id and the version the API tells (the
+        // MD5 of its content, else when it last changed; a shortcut's own time is not its target's).
+        let archive: Vec<_> = tasks.iter().map(|t| t.archive.join("|")).collect();
+        assert_eq!(archive, ["gdrive f1 5d41402abc4b2a76b9719d911017c592", "gdrive d1 2026-03-02T11:30:00.000Z", "gdrive d2", "gdrive x1", "gdrive f9"]);
     }
 
     /// Drive API errors as the API answered them (a bad key, no key, a rate limit and a daily

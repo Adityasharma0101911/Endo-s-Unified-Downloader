@@ -77,7 +77,7 @@ pub struct ListOptions {
     pub whole_playlist: bool,
     /// Only the newest N items of a channel, playlist or feed.
     pub latest: Option<usize>,
-    /// Leave out items downloaded before (channel sync, feed updates).
+    /// Leave out items downloaded before (channel sync, feed updates, a cloud folder added again).
     pub only_new: bool,
     /// Cookies for yt-dlp listings of private or members-only lists.
     pub cookies: media::BrowserCookieSource,
