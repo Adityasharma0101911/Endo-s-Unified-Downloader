@@ -3999,7 +3999,7 @@ async fn test_a_feed_episode_history_let_go_is_still_not_new() {
 
     let tasks = ingest(&[feed.as_str()], &http, &ListOptions::default()).await.expect("the feed is read");
     let [task] = &tasks[..] else { panic!("one episode: {tasks:?}") };
-    let lines = [format!("feed {episode}"), "feed-file archived show/2026-06-01 only one.mp3".to_string()];
+    let lines = [format!("feed {episode}"), format!("feed-file {feed} archived show/2026-06-01 only one.mp3")];
     assert_eq!(task.archive, lines);
     let temp = tempdir().unwrap();
     let out = temp.path().join("Archived Show").join(task.name.as_ref().unwrap());

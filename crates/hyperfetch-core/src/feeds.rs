@@ -99,7 +99,8 @@ pub async fn list(http: &reqwest::Client, url: &Url, options: &ListOptions) -> O
 /// unless `sure` it is one, when its host cannot be reached or is busy (see [`fetch`]).
 async fn read_feed(http: &reqwest::Client, url: &Url, sure: bool) -> Result<Option<Feed>, String> {
     let Some(Fetched { body, base, charset }) = fetch(http, url, true, sure).await? else { return Ok(None) };
-    parse_feed(&decode_feed(&body, charset.as_deref()), &base).transpose()
+    let feed = parse_feed(&decode_feed(&body, charset.as_deref()), &base).transpose()?;
+    Ok(feed.map(|feed| Feed { source: redact_url(url.as_str()), ..feed }))
 }
 
 /// Labels of windows-1252, as the web reads them: ISO-8859-1 and US-ASCII stand for it too (it
@@ -270,6 +271,9 @@ fn is_feed_root(name: &str) -> bool {
 struct Feed {
     title: Option<String>,
     episodes: Vec<Episode>,
+    /// What tells this feed from another of the same title: its link without its secrets (see
+    /// [`redact_url`]), or the Apple show it was looked up for.
+    source: String,
 }
 
 #[derive(Debug, Default)]
@@ -567,16 +571,22 @@ async fn show_tasks(feed: Feed, options: &ListOptions) -> Result<Vec<Task>, Stri
     feed_tasks(feed, options.latest, &done)
 }
 
-/// The download archive's lines of the episode `task` downloads (see `media::archive_file`), as
-/// [`Done`] tells it: its link, but for one that holds a secret, which the archive is no place
-/// for, and its file.
-fn episode_archive(task: &Task) -> Vec<String> {
+/// The download archive's lines of the episode `task` of the feed `source` (see [`Feed`])
+/// downloads (see `media::archive_file`), as [`Done`] tells it: its link, but for one that holds
+/// a secret, which the archive is no place for, and its file in that feed, so another show of
+/// the same title and an episode of its of the same day and title is not taken for it.
+fn episode_archive(source: &str, task: &Task) -> Vec<String> {
     let links = task.urls.iter().map(Url::as_str).filter(|url| redact_url(url) == *url).map(|url| format!("feed {url}"));
-    let file = match (&task.folder, &task.name) {
-        (Some(folder), Some(name)) => Some(format!("feed-file {}/{}", lower(folder), lower(name))),
-        _ => None,
-    };
+    let file = file_of(task).map(|file| format!("feed-file {source} {file}"));
     links.chain(file).collect()
+}
+
+/// "folder/name" of the file `task` saves to, in lower case; None for a feed without a title.
+fn file_of(task: &Task) -> Option<String> {
+    match (&task.folder, &task.name) {
+        (Some(folder), Some(name)) => Some(format!("{}/{}", lower(folder), lower(name))),
+        _ => None,
+    }
 }
 
 fn lower(path: &Path) -> String {
@@ -616,6 +626,8 @@ impl Done {
         task.urls.iter().any(|url| self.links.contains(&redact_url(url.as_str())))
             || matches!((&task.folder, &task.name), (Some(folder), Some(name)) if self.files.contains(&(lower(folder), lower(name))))
             || task.archive.iter().any(|line| self.archive.contains(line))
+            // The line of a file an archive noted before it named the feed.
+            || file_of(task).is_some_and(|file| self.archive.contains(&format!("feed-file {file}")))
     }
 }
 
@@ -642,7 +654,7 @@ fn feed_tasks(feed: Feed, latest: Option<usize>, done: &Done) -> Result<Vec<Task
             from_document: true,
             ..Task::default()
         };
-        task.archive = episode_archive(&task);
+        task.archive = episode_archive(&feed.source, &task);
         tasks.push(task);
     }
     let listed = tasks.len();
@@ -742,11 +754,11 @@ impl AppleLink {
                     Err(e) => return Some(Err(e)),
                 };
                 let found = feed.episodes.into_iter().find(|e| wanted.matches(e))?;
-                Some(feed_tasks(Feed { title: feed.title, episodes: vec![found] }, None, &Done::default()))
+                Some(feed_tasks(Feed { episodes: vec![found], ..feed }, None, &Done::default()))
             }
             (None, Some(track)) => {
                 let found = lookup.episodes.iter().find(|e| e.track == Some(track)).and_then(LookupEpisode::episode)?;
-                Some(feed_tasks(Feed { title: lookup.name, episodes: vec![found] }, None, &Done::default()))
+                Some(feed_tasks(Feed { title: lookup.name, episodes: vec![found], source: self.source() }, None, &Done::default()))
             }
             (None, None) => {
                 // The show's answer holds no episodes: ask for them.
@@ -763,9 +775,14 @@ impl AppleLink {
                     )));
                 }
                 tracing::info!("Apple does not publish show {}'s feed: its newest {} episodes are listed", self.show, episodes.len());
-                Some(show_tasks(Feed { title: lookup.name, episodes }, options).await)
+                Some(show_tasks(Feed { title: lookup.name, episodes, source: self.source() }, options).await)
             }
         }
+    }
+
+    /// The [`Feed::source`] of a show whose feed Apple does not publish.
+    fn source(&self) -> String {
+        format!("https://podcasts.apple.com/podcast/id{}", self.show)
     }
 
     /// What the iTunes Lookup API at `api` says of the show, and of its newest episodes (200 at
@@ -1037,8 +1054,9 @@ mod tests {
   </channel>
 </rss>"#;
 
+    /// The feed `text` at `base`, as [`read_feed`] reads it.
     fn parse(text: &str, base: &str) -> Option<Result<Feed, String>> {
-        parse_feed(text, &url(base))
+        Some(parse_feed(text, &url(base))?.map(|feed| Feed { source: redact_url(base), ..feed }))
     }
 
     fn names(tasks: &[Task]) -> Vec<String> {
@@ -1122,7 +1140,8 @@ mod tests {
     }
 
     /// Each episode carries its lines for the download archive, which keeps them after history
-    /// has let the download go: its link (but one with a secret) and its file, in lower case.
+    /// has let the download go: its link (but one with a secret) and its file in its feed, in
+    /// lower case. A line an older archive has for the file alone still counts.
     #[test]
     fn the_download_archive_tells_episodes_history_forgot() {
         let show = r#"<rss><channel><title>Show</title>
@@ -1134,12 +1153,37 @@ mod tests {
         let lines: Vec<_> = tasks.iter().map(|task| task.archive.clone()).collect();
         assert_eq!(
             lines,
-            [vec!["feed https://cdn.example/1.mp3".to_string(), "feed-file show/one.mp3".to_string()], vec!["feed-file show/two.mp3".to_string()]]
+            [
+                vec!["feed https://cdn.example/1.mp3".to_string(), "feed-file https://f.example/rss show/one.mp3".to_string()],
+                vec!["feed-file https://f.example/rss show/two.mp3".to_string()]
+            ]
         );
         let done = |line: &str| Done { archive: HashSet::from([line.to_string()]), ..Done::default() };
         assert_eq!(names(&feed_tasks(feed(), None, &done("feed https://cdn.example/1.mp3")).unwrap()), ["Two.mp3"]);
+        assert_eq!(names(&feed_tasks(feed(), None, &done("feed-file https://f.example/rss show/two.mp3")).unwrap()), ["One.mp3"]);
         assert_eq!(names(&feed_tasks(feed(), None, &done("feed-file show/two.mp3")).unwrap()), ["One.mp3"]);
         assert_eq!(feed_tasks(feed(), None, &done("feed https://cdn.example/2.mp3")).unwrap().len(), 2);
+    }
+
+    /// Two feeds of one title, each with an episode of the same day and title on a link of its
+    /// own: the one downloaded from the first feed does not stand for the second's. A private
+    /// feed's token is not written to the archive.
+    #[test]
+    fn a_feed_of_the_same_title_has_episodes_of_its_own() {
+        let show = |n: u8| {
+            format!(
+                r#"<rss><channel><title>News</title><item><title>Today</title><pubDate>Mon, 01 Jun 2026 08:00:00 GMT</pubDate>
+<enclosure type="audio/mpeg" url="https://h.example/download?key=EP{n}"/></item></channel></rss>"#
+            )
+        };
+        let first = parse(&show(1), "https://a.example/news.rss?token=s3cret").unwrap().unwrap();
+        let archived = feed_tasks(first, None, &Done::default()).unwrap().remove(0).archive;
+        assert_eq!(archived, ["feed-file https://a.example/news.rss?token=REDACTED news/2026-06-01 today.mp3"]);
+        let done = Done { archive: archived.into_iter().collect(), ..Done::default() };
+        let second = parse(&show(2), "https://b.example/news.rss").unwrap().unwrap();
+        assert_eq!(names(&feed_tasks(second, None, &done).unwrap()), ["2026-06-01 Today.mp3"]);
+        let first = parse(&show(1), "https://a.example/news.rss?token=0ther").unwrap().unwrap();
+        assert!(feed_tasks(first, None, &done).unwrap().is_empty());
     }
 
     #[test]
@@ -1402,7 +1446,7 @@ mod tests {
         let hidden = read_lookup(answer(&[HIDDEN_SHOW, HIDDEN_EPISODES]).as_bytes(), 1_724_561_745).unwrap();
         assert_eq!((hidden.name.as_deref(), &hidden.feed), (Some("Bedtime Stories"), &None));
         let episodes: Vec<Episode> = hidden.episodes.iter().filter_map(LookupEpisode::episode).collect();
-        let tasks = feed_tasks(Feed { title: hidden.name, episodes }, None, &Done::default()).unwrap();
+        let tasks = feed_tasks(Feed { title: hidden.name, episodes, ..Feed::default() }, None, &Done::default()).unwrap();
         assert_eq!(names(&tasks), ["2025-03-18 Until Next Time.mp3", "2025-03-16 The Second Story.mp3"]);
         assert!(tasks[0].urls[0].as_str().starts_with("https://c10.patreonusercontent.com/4/patreon-media/p/post/124647799/"));
         assert!(tasks.iter().all(|t| t.folder.as_deref() == Some(Path::new("Bedtime Stories")) && t.from_document));
