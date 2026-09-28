@@ -46,6 +46,18 @@ pub fn eta_secs(total: u64, downloaded: u64, speed: f64) -> Option<u64> {
     (speed >= 1024.0 && total > downloaded).then(|| ((total - downloaded) as f64 / speed).ceil() as u64)
 }
 
+/// A progress bar's text: the share done, to `decimals` places; with no size to reach (a live
+/// recording, a server that sends none) what has come in, and for how long when that is known.
+pub fn progress_text(total: u64, downloaded: u64, ratio: f64, decimals: usize, elapsed_secs: Option<u64>) -> String {
+    if total > 0 || downloaded == 0 {
+        return format!("{:.*}%", decimals, (ratio * 100.0).clamp(0.0, 100.0));
+    }
+    match elapsed_secs {
+        Some(secs) => format!("{} in {}", format_bytes(downloaded), format_duration(secs)),
+        None => format_bytes(downloaded),
+    }
+}
+
 pub fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
@@ -311,6 +323,17 @@ mod tests {
         assert_eq!(eta_secs(10_000, 0, 1000.0), None);
         assert_eq!(eta_secs(0, 500, 4096.0), None);
         assert_eq!(eta_secs(100, 100, 4096.0), None);
+    }
+
+    #[test]
+    fn a_download_with_no_size_shows_what_came_in_and_for_how_long() {
+        // A live recording: its size and how long it has run, never a share of nothing.
+        assert_eq!(progress_text(0, 3 * 1024 * 1024, 0.0, 1, Some(75)), "3.00 MiB in 01:15");
+        assert_eq!(progress_text(0, 2048, 0.0, 0, None), "2.00 KiB");
+        // A size to reach, or nothing yet: the share done.
+        assert_eq!(progress_text(1000, 250, 0.25, 1, Some(9)), "25.0%");
+        assert_eq!(progress_text(1000, 1000, 1.0, 0, None), "100%");
+        assert_eq!(progress_text(0, 0, 0.0, 0, Some(3)), "0%");
     }
 
     fn result(is_complete: bool, missing: bool, checksum_match: Option<bool>) -> BuildVerificationResult {

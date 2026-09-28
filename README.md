@@ -36,7 +36,7 @@
 
 **Many kinds of input**
 - **Link resolvers:** Google Drive (large-file confirmation), MediaFire, Dropbox share links, SourceForge (several mirrors), Archive.org (all replica servers), and web pages with an embedded video (`<video>`, `og:video`). Whether a Google Drive link, or a URL that may be a web page (no extension, or a page one), answers with a page is read from the probe's own answer, not from a request of its own, and an Archive.org item is asked only for the three metadata fields that name its servers, once for all its files.
-- **HLS (`.m3u8`):** master and media playlists, AES-128 encrypted segments, `#EXT-X-MAP` init sections, output as `.ts` or `.mp4`, and resumable. Segments come over several connections in a sliding window, so a slow segment does not hold up the others (it is requested a second time once it lags), and are written by a writer of their own, which saves the resume state every 2 s. AES keys are fetched in parallel, adjoining byte ranges of one file are fetched together, and `--stall-timeout` and `--max-retries` apply. Live streams and DRM are not supported.
+- **HLS (`.m3u8`):** master and media playlists, AES-128 encrypted segments, `#EXT-X-MAP` init sections, output as `.ts` or `.mp4`, and resumable. Segments come over several connections in a sliding window, so a slow segment does not hold up the others (it is requested a second time once it lags), and are written by a writer of their own, which saves the resume state every 2 s. AES keys are fetched in parallel, adjoining byte ranges of one file are fetched together, and `--stall-timeout` and `--max-retries` apply. A live playlist is recorded by yt-dlp instead (see [Live streams](#live-streams)); DRM is not supported.
 - **Media sites:** YouTube, Twitch, TikTok, Twitter/X, Vimeo, Reddit, Instagram, Facebook and Dailymotion are handed to [yt-dlp](https://github.com/yt-dlp/yt-dlp) automatically. yt-dlp finds the formats, and when they are plain files or HLS playlists the engine downloads the video and audio together over its own connections, then ffmpeg joins them without re-encoding; anything else, or a failure, falls back to yt-dlp's own download, which reuses that extraction. If yt-dlp is not installed, a managed copy is downloaded and checked against its published SHA-256 sums (on Windows the unpacked build, which starts faster). Its version is cached on disk, and browser cookies are read once and reused for 15 minutes. ffmpeg is needed to merge separate video and audio streams. Use `--media-preset` to choose the quality (`m4a` picks an AAC source, so the audio is copied, not re-encoded) and `--cookies-from-browser` for sites that require a login.
 - **Magnet links** with HTTP web seeds (`ws=`), and **`.torrent`** files with web seeds (`url-list`). Every file of a multi-file torrent becomes a separate download. BitTorrent peer-to-peer transfer is not supported: a `.torrent` URL without web seeds downloads the `.torrent` file itself, for a torrent client. Padding files (BEP 47) are skipped, and a BitTorrent v2-only torrent is an error. A `.torrent`, `.metalink` or `.meta4` link is read whatever type its server labels it (PHP labels everything a web page), and one to a GitHub or Hugging Face file page or a Dropbox share from the file itself; one whose host refuses it (a login, or GitHub's "not found" for a private repository) or answers with a web page is downloaded as the file it is, from the link you gave, with your cookies and Authorization header, and a web page in its place is an error. A host that is busy (a timeout, a rate limit) or fails is an error, to try again. A checksum you give is for the file a document lists, so a document downloaded itself is not checked against it.
 - **Metalink** (`.metalink`, `.meta4`): mirrors are ordered by priority, and the file name and checksum (the strongest well-formed one of SHA-512, SHA-256, SHA-1 and MD5 it gives) are taken from the metalink. A name with folders (`dir/file.iso`) is saved in those folders; `..` and absolute names are refused. Versions up to 1.1.0 dropped the folders and cleaned names a little differently, so a metalink or torrent download paused by one of them may start again from zero under its new path.
@@ -139,7 +139,7 @@ https://example.com/release.meta4
 
 **Progress.** Each running download shows a bar with the engine's measured speed, the number of open connections and the ETA. If no data arrives for 5 seconds, the bar shows `STALLED`. Batches also show a total bar. When stderr is not a terminal (journald, cron, pipes), a plain progress line is printed every 10 seconds instead of the bars.
 
-**Stopping.** Press Ctrl+C once, or send SIGTERM, to stop all downloads, save their resume state (within at most 10 seconds) and skip the rest of the batch. Press Ctrl+C a second time to quit immediately.
+**Stopping.** Press Ctrl+C once, or send SIGTERM, to stop all downloads, save their resume state (within at most 10 seconds) and skip the rest of the batch. A live recording is finished and kept instead, however long that takes (see [Live streams](#live-streams)). Press Ctrl+C a second time to quit immediately.
 
 **Exit status.**
 
@@ -213,6 +213,18 @@ Set `ENDO_HISTORY_PATH` to use a different file.
 - When the engine downloads the streams itself, yt-dlp then writes only the subtitles, from the same extraction.
 
 Tags are embedded by default, when ffmpeg is present. The file gets the title, artist, date, description, link, genre, album and show or episode details, and the video's chapters. Audio presets (`mp3`, `m4a`) also get the thumbnail as cover art. Without ffmpeg the download goes on without tags. `--no-embed-metadata` (GUI: clear "Embed tags and chapters") leaves tags out.
+
+### Live streams
+
+A live stream is recorded by yt-dlp. This covers a site's live video and an HLS playlist that has no end yet.
+- By default the recording starts now. With `--live-from-start` (GUI: "Record live streams from the start") it starts from the beginning, where the site keeps it (YouTube does).
+- `--wait-for-video` waits for a scheduled stream or premiere to begin, checking every 1 to 10 minutes.
+- Progress shows the size recorded and how long the recording has run, not a percentage.
+- Stop ends the recording and keeps it (Ctrl+C in the CLI, Pause in the GUI). yt-dlp is asked to stop the way Ctrl+C at a terminal asks it: SIGINT on Linux, a Ctrl+C sent to its console on Windows. It finishes the file, which is reported done with its size and saved in history as completed.
+- Sometimes yt-dlp is stopped outright instead: when it does not stop recording within 30 seconds, and when it cannot be asked (the Windows CLI, which has a console of its own). What it recorded is kept either way:
+  - An MPEG-TS recording is named `.ts`, then remuxed to `.mp4` when ffmpeg is present.
+  - Video and audio recorded apart are joined with ffmpeg.
+- DRM-protected live TV (a FairPlay, Widevine or other non-`identity` key format) is refused, not recorded.
 
 ---
 
