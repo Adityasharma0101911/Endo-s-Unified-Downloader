@@ -21,8 +21,8 @@ use url::Url;
 
 use cli::Args;
 use download::{
-    printable, run_jobs, stderr_line, stdout_line, stop_requested, truncate, Job, Shutdown, Ui, EXIT_FAILED, EXIT_OK,
-    EXIT_USAGE,
+    printable, run_jobs, stderr_line, stdout_line, stop_requested, truncate, FfmpegAnswer, Job, Shutdown, Ui, EXIT_FAILED,
+    EXIT_OK, EXIT_USAGE,
 };
 
 fn main() {
@@ -324,23 +324,47 @@ async fn batch(args: &Args, ui: &Ui, shutdown: &Shutdown, http: &reqwest::Client
         return usage(&e);
     }
 
-    let mut jobs: Vec<Job> = tasks.into_iter().map(|(line, t)| Job { line, ..job(args, args.connections, &dir, t) }).collect();
+    let jobs: Vec<Job> = tasks.into_iter().map(|(line, t)| Job { line, ..job(args, args.connections, &dir, t) }).collect();
     // Asked only where someone answers: at a terminal that is not reading the input file.
     let can_ask = !ui.quiet() && args.input_file.as_deref() != Some(Path::new("-")) && at_terminal();
-    let install = may_install_ffmpeg(args, &jobs, &mut None, can_ask.then_some(find_ffmpeg_path as Finder), prompt).await;
-    for job in &mut jobs {
-        job.options.install_ffmpeg = install;
-    }
-    failed += run_jobs(jobs, args.jobs as usize, ui, shutdown).await;
+    let ffmpeg = ffmpeg_question(args, &jobs, can_ask.then_some(find_ffmpeg_path as Finder), ui);
+    failed += run_jobs(jobs, args.jobs as usize, ui, shutdown, ffmpeg).await;
     exit_code(shutdown.requested(), failed)
 }
 
 /// Looks for an ffmpeg (see `find_ffmpeg_path`). Blocking.
 type Finder = fn() -> Option<PathBuf>;
 
-/// Whether someone can answer this run's questions: stdin and stdout are a terminal.
+/// Whether someone can answer this run's questions: stdin and stdout are a terminal, and on Unix
+/// the process is its foreground job, which reads it without being stopped (SIGTTIN); a console
+/// is enough on Windows.
 fn at_terminal() -> bool {
-    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+    std::io::stdin().is_terminal() && std::io::stdout().is_terminal() && in_foreground()
+}
+
+#[cfg(unix)]
+fn in_foreground() -> bool {
+    // SAFETY: plain calls on the standard input's descriptor, without pointers.
+    unsafe { libc::tcgetpgrp(libc::STDIN_FILENO) == libc::getpgrp() }
+}
+
+#[cfg(not(unix))]
+fn in_foreground() -> bool {
+    true
+}
+
+/// The answer whether the media downloads among `jobs` may install ffmpeg, which those that need
+/// it wait for while the others run (see `run_jobs`): asked at once, with the progress bars off
+/// the terminal, when `find` finds no ffmpeg. None when a flag says (the downloads go by it),
+/// none of `jobs` needs ffmpeg, or no one answers (`find` is None, see [`at_terminal`]): that is
+/// no, and the engine's warning says to pass --install-ffmpeg.
+fn ffmpeg_question(args: &Args, jobs: &[Job], find: Option<Finder>, ui: &Ui) -> Option<FfmpegAnswer> {
+    use futures_util::FutureExt;
+    let asked = !args.install_ffmpeg && !args.no_install_ffmpeg && jobs.iter().any(Job::needs_ffmpeg);
+    let find = find.filter(|_| asked)?;
+    let ui = ui.clone();
+    let ask = move |question| async move { ui.hiding_bars(prompt(question)).await };
+    Some(async move { ask_to_install_ffmpeg(find, ask).await.unwrap_or(false) }.boxed().shared())
 }
 
 /// What [`ask_to_install_ffmpeg`] asks.
@@ -363,8 +387,7 @@ where
     if let Some(answer) = *answered {
         return answer;
     }
-    let media = jobs.iter().any(|job| job.options.media_preset.is_some() || job.urls.iter().any(is_supported_media_site));
-    let Some(find) = find.filter(|_| media) else { return false };
+    let Some(find) = find.filter(|_| jobs.iter().any(Job::needs_ffmpeg)) else { return false };
     *answered = ask_to_install_ffmpeg(find, ask).await;
     answered.unwrap_or(false)
 }
@@ -481,7 +504,7 @@ where
         for job in &mut jobs {
             job.options.install_ffmpeg = install;
         }
-        failed += run_jobs(jobs, args.jobs as usize, ui, shutdown).await;
+        failed += run_jobs(jobs, args.jobs as usize, ui, shutdown, None).await;
         if let Some(code) = shutdown.requested() {
             return code;
         }
@@ -908,6 +931,21 @@ mod tests {
         assert_eq!((asked, answered), (1, Some(true)), "asked once");
         let no = |_| std::future::ready(Some("n".to_string()));
         assert!(!may_install_ffmpeg(&args, &video, &mut None, Some(missing), no).await);
+    }
+
+    /// Only the downloads that need ffmpeg wait for the answer whether it may be installed, which
+    /// is asked only where someone answers, and not when a flag says.
+    #[test]
+    fn a_batch_asks_about_ffmpeg_for_its_media_downloads_only() {
+        let missing: Finder = || None;
+        let args = parse(&["u"]);
+        let jobs = |link: &str| vec![job(&args, 4, Path::new("d"), Task { urls: vec![Url::parse(link).unwrap()], ..Default::default() })];
+        let (video, file) = (jobs("https://www.youtube.com/watch?v=jNQXAC9IVRw"), jobs("https://a.example/f.iso"));
+        let ui = Ui::new(true);
+        assert!(ffmpeg_question(&args, &video, Some(missing), &ui).is_some());
+        assert!(ffmpeg_question(&args, &file, Some(missing), &ui).is_none(), "no media");
+        assert!(ffmpeg_question(&args, &video, None, &ui).is_none(), "no one to ask");
+        assert!(ffmpeg_question(&parse(&["--no-install-ffmpeg", "u"]), &video, Some(missing), &ui).is_none());
     }
 
     /// --header goes to the hosts the user named, never to the mirrors a .metalink or .torrent

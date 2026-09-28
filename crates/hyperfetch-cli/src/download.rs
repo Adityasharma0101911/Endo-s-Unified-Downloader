@@ -1,12 +1,16 @@
 //! Runs downloads with progress output and graceful Ctrl+C / SIGTERM handling.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::io::{IsTerminal, Write};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use futures_util::future::{BoxFuture, OptionFuture, Shared};
+use futures_util::stream::FuturesUnordered;
 use futures_util::StreamExt;
 use hyperfetch_core::engine::{build_client, ClientKey, DownloadEngine, DownloadOptions, EngineSnapshot, SharedLimits};
 use hyperfetch_core::history::{DownloadHistoryManager, HistoryEntry, HistoryStatus};
+use hyperfetch_core::media::is_supported_media_site;
 use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use tokio::sync::{broadcast, mpsc, watch};
 use url::Url;
@@ -124,6 +128,18 @@ impl Ui {
         self.multi.suspend(|| stderr_line(line));
     }
 
+    /// Awaits `question`, a prompt at the terminal, with the progress bars off it, so that they
+    /// draw over neither the question nor the answer typed.
+    pub async fn hiding_bars<T>(&self, question: impl Future<Output = T>) -> T {
+        let _ = self.multi.clear();
+        self.multi.set_draw_target(ProgressDrawTarget::hidden());
+        let answer = question.await;
+        if !self.quiet {
+            self.multi.set_draw_target(ProgressDrawTarget::stderr());
+        }
+        answer
+    }
+
     /// A writer for log output that keeps the progress bars intact.
     pub fn log_writer(&self) -> LogWriter {
         LogWriter(self.multi.clone())
@@ -238,6 +254,16 @@ pub struct Job {
     pub line: Option<usize>,
 }
 
+impl Job {
+    /// Whether it goes to yt-dlp, which may need ffmpeg (see `DownloadOptions::install_ffmpeg`).
+    pub fn needs_ffmpeg(&self) -> bool {
+        self.options.media_preset.is_some() || self.urls.iter().any(is_supported_media_site)
+    }
+}
+
+/// The user's answer whether ffmpeg may be installed, asked once for every download waiting for it.
+pub type FfmpegAnswer = Shared<BoxFuture<'static, bool>>;
+
 enum Outcome {
     Done,
     Failed,
@@ -279,10 +305,13 @@ impl Clients {
     }
 }
 
-/// Runs `jobs` with at most `concurrency` at a time and returns how many failed. After a
-/// shutdown request no new job starts and running ones stop with their state saved. Running
-/// several at once, results arrive in completion order, so each result line names its input.
-pub async fn run_jobs(jobs: Vec<Job>, concurrency: usize, ui: &Ui, shutdown: &Shutdown) -> usize {
+/// Runs `jobs` in order with at most `concurrency` at a time and returns how many failed. While
+/// `ffmpeg`, the answer whether ffmpeg may be installed, is not known, the downloads that need it
+/// (see [`Job::needs_ffmpeg`]) wait for it and the others go ahead of them; every download that
+/// starts once it is known goes by it. After a shutdown request no new job starts and running
+/// ones stop with their state saved. Running several at once, results arrive in completion
+/// order, so each result line names its input.
+pub async fn run_jobs(jobs: Vec<Job>, concurrency: usize, ui: &Ui, shutdown: &Shutdown, ffmpeg: Option<FfmpegAnswer>) -> usize {
     let overall = (jobs.len() > 1 && !ui.quiet).then(|| {
         let bar = ui.multi.add(ProgressBar::new(jobs.len() as u64).with_style(style(OVERALL)).with_prefix("Total"));
         bar.tick();
@@ -290,27 +319,42 @@ pub async fn run_jobs(jobs: Vec<Job>, concurrency: usize, ui: &Ui, shutdown: &Sh
     });
     let named = concurrency > 1 && jobs.len() > 1;
     let clients = Clients::for_jobs(&jobs).await;
-    let mut outcomes = futures_util::stream::iter(jobs)
-        .map(|job| {
-            let input = named.then(|| input_name(job.line, &job.urls)).flatten();
-            run_job(job, input, &clients, ui, shutdown, overall.as_ref())
-        })
-        .buffer_unordered(concurrency.max(1));
+    let mut stop = shutdown.subscribe();
+    let (mut waiting, mut running) = (VecDeque::from(jobs), FuturesUnordered::new());
     let mut failed = 0;
-    while let Some(outcome) = outcomes.next().await {
-        match outcome {
-            Outcome::Done => {}
-            Outcome::Failed => failed += 1,
-            Outcome::Interrupted => continue,
-        }
-        if let Some(bar) = &overall {
-            bar.inc(1);
-            if failed > 0 {
-                bar.set_message(format!("({} failed)", failed));
+    loop {
+        while running.len() < concurrency.max(1) {
+            // None when nothing is asked; Some(None) while it is not answered.
+            let answer = ffmpeg.as_ref().map(|answer| answer.peek().copied());
+            let next = waiting.iter().position(|job| answer != Some(None) || !job.needs_ffmpeg());
+            let Some(mut job) = next.and_then(|at| waiting.remove(at)) else { break };
+            if let Some(Some(install)) = answer {
+                job.options.install_ffmpeg = install;
             }
+            let input = named.then(|| input_name(job.line, &job.urls)).flatten();
+            running.push(run_job(job, input, &clients, ui, shutdown, overall.as_ref()));
+        }
+        let unanswered = ffmpeg.clone().filter(|answer| answer.peek().is_none() && !waiting.is_empty());
+        tokio::select! {
+            Some(outcome) = running.next() => {
+                match outcome {
+                    Outcome::Done => {}
+                    Outcome::Failed => failed += 1,
+                    Outcome::Interrupted => continue,
+                }
+                if let Some(bar) = &overall {
+                    bar.inc(1);
+                    if failed > 0 {
+                        bar.set_message(format!("({} failed)", failed));
+                    }
+                }
+            }
+            Some(_) = OptionFuture::from(unanswered) => {}
+            () = stop_requested(&mut stop), if !waiting.is_empty() => waiting.clear(),
+            else => break,
         }
     }
-    drop(outcomes);
+    drop(running);
     if let Some(bar) = overall {
         bar.abandon();
     }
@@ -637,7 +681,7 @@ mod tests {
         let mut no_cookies = job("d");
         no_cookies.options.cookies_path = Some(dir.join("missing-cookies.txt"));
         jobs.insert(1, no_cookies);
-        let failed = run_jobs(jobs, 1, &Ui::new(true), &Shutdown::install()).await;
+        let failed = run_jobs(jobs, 1, &Ui::new(true), &Shutdown::install(), None).await;
         assert_eq!(failed, 1);
         assert!(!dir.join("d.bin").exists());
         for name in ["a", "b", "c"] {
@@ -664,7 +708,7 @@ mod tests {
             line: None,
         });
         let started = Instant::now();
-        assert_eq!(run_jobs(Vec::from(jobs), 2, &Ui::new(true), &Shutdown::install()).await, 0);
+        assert_eq!(run_jobs(Vec::from(jobs), 2, &Ui::new(true), &Shutdown::install(), None).await, 0);
         // Three seconds' worth of both at the limit, where each at a limit of its own takes half;
         // less the tenth of a second the limit lets through at once.
         let least = Duration::from_secs_f64(2.0 * body.len() as f64 / limit as f64 - 0.5);
@@ -672,6 +716,54 @@ mod tests {
         for name in ["a", "b"] {
             assert_eq!(std::fs::read(dir.join(format!("{}.bin", name))).unwrap(), body);
         }
+    }
+
+    /// A download that needs ffmpeg waits for the answer whether it may be installed, and one
+    /// that does not goes ahead of it; once answered, it starts too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_the_downloads_that_need_ffmpeg_wait_for_the_answer() {
+        use futures_util::FutureExt;
+        let dir = std::env::temp_dir().join(format!("hf-cli-ffmpeg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let body: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
+        let (server, _) = keep_alive_server(body.clone()).await;
+        let jobs = || {
+            // It fails as it starts, with no cookies file to read.
+            let video = Job {
+                label: "video".to_string(),
+                urls: vec![Url::parse("https://www.youtube.com/watch?v=jNQXAC9IVRw").unwrap()],
+                options: DownloadOptions { cookies_path: Some(dir.join("missing-cookies.txt")), ..Default::default() },
+                line: None,
+            };
+            let file = Job {
+                label: "file".to_string(),
+                urls: vec![Url::parse(&format!("{server}/file.bin")).unwrap()],
+                options: DownloadOptions { output_path: Some(dir.join("")), ..Default::default() },
+                line: None,
+            };
+            assert!(video.needs_ffmpeg() && !file.needs_ffmpeg());
+            vec![video, file]
+        };
+        let unanswered: FfmpegAnswer = std::future::pending().boxed().shared();
+        let (ui, shutdown) = (Ui::new(true), Shutdown::install());
+        let run = run_jobs(jobs(), 1, &ui, &shutdown, Some(unanswered));
+        let downloaded = async {
+            while !dir.join("file.bin").exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        let raced = async {
+            tokio::select! {
+                _ = run => panic!("the run ended while the video waits for the answer"),
+                () = downloaded => {}
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(30), raced).await.expect("the file downloads while the video waits");
+        assert_eq!(std::fs::read(dir.join("file.bin")).unwrap(), body);
+        std::fs::remove_file(dir.join("file.bin")).unwrap();
+        let answered: FfmpegAnswer = async { false }.boxed().shared();
+        assert_eq!(run_jobs(jobs(), 1, &Ui::new(true), &Shutdown::install(), Some(answered)).await, 1, "the video started, and failed");
     }
 
     #[test]
