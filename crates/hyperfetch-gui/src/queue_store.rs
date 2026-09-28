@@ -123,7 +123,7 @@ mod tests {
         assert_eq!(status(done), QueueItemStatus::Completed);
         assert_eq!(status(private), QueueItemStatus::AuthRequired);
         assert_eq!(restored.get_item(done).unwrap().total_bytes, 7);
-        assert_eq!(restored.next_to_start(8), Some(queued));
+        assert_eq!(restored.next_to_start(8, |_| false), Some(queued));
         assert_eq!(std::fs::read_dir(path.parent().unwrap()).unwrap().count(), 1, "no temp file is left behind");
     }
 
