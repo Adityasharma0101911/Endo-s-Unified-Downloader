@@ -2113,12 +2113,13 @@ fn fragments_youtube(options: &MediaDownloadOptions) -> bool {
 /// than find it again from the URL. yt-dlp drops a playlist's entries from a file it loads; and a
 /// YouTube video's formats there are whole files (see [`RunKind::Extract`]), each of which the
 /// download would pull 10 MiB request after request where it could have fetched fragments in
-/// parallel.
+/// parallel. Nor a live stream's: yt-dlp adds the date to its title each time it takes the stream
+/// in, so a recording of one it loaded would be named with the date twice.
 fn loads_found(info: &Value, options: &MediaDownloadOptions) -> bool {
     let text = |key| info.get(key).and_then(Value::as_str);
     let video = text("_type").is_none_or(|t| t == "video");
     let youtube = text("extractor_key").or_else(|| text("extractor")).is_some_and(|e| e.eq_ignore_ascii_case("youtube"));
-    video && !(youtube && fragments_youtube(options))
+    video && !is_set(info.get("is_live")) && !(youtube && fragments_youtube(options))
 }
 
 /// What a yt-dlp run works on.
@@ -6564,6 +6565,10 @@ bbd8671c6c05eaa3ec29d690695aebadff0871faa3efe9051581afbf3c01e80e  ffmpeg-master-
         assert!(loads_found(&youtube_info(&out), &custom));
         let playlist = serde_json::json!({"_type": "playlist", "id": "PL1", "extractor_key": "Vimeo"});
         assert!(!loads_found(&playlist, &options));
+        // Found again, a live stream's title gets the date once.
+        let mut live = dash_info(&out);
+        live["is_live"] = true.into();
+        assert!(!loads_found(&live, &options));
     }
 
     #[tokio::test]

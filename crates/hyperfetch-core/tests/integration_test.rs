@@ -3904,11 +3904,12 @@ async fn test_a_live_hls_stream_is_recorded_with_yt_dlp() {
 
     let path = run(&DownloadEngine::new(vec![url.clone()], opts), None).await.expect("the stream should be recorded");
     assert_eq!(path, output);
-    // Found, then recorded from what was found.
+    // Found, then recorded from the link again: yt-dlp dates a live stream's title each time it
+    // takes it in, so what was found would name the recording with the date twice.
     let runs = runs_of(tools.path());
     assert_eq!(runs.len(), 2, "{runs:?}");
     assert!(runs[0].contains(&"-J".to_string()) && runs[0].last() == Some(&url.to_string()), "{runs:?}");
-    assert!(runs[1].contains(&"--load-info-json".to_string()), "{runs:?}");
+    assert!(!runs[1].contains(&"--load-info-json".to_string()) && runs[1].last() == Some(&url.to_string()), "{runs:?}");
 }
 
 /// Live TV behind FairPlay or Widevine is refused, not handed to a recording.
