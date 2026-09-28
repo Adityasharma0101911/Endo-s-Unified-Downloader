@@ -27,7 +27,8 @@ use url::Url;
 use settings::Settings;
 use util::{lock, Verdict};
 
-/// How long closing the window waits for downloads to save their resume state.
+/// How long closing the window waits for downloads to save their resume state. Live recordings
+/// are finished before it closes (see [`stop_recordings`]).
 const EXIT_GRACE: Duration = Duration::from_secs(3);
 /// Span of the throughput graph.
 const GRAPH_WINDOW: Duration = Duration::from_secs(60);
@@ -141,9 +142,16 @@ struct JobView {
     elapsed: Duration,
     last_progress: Option<Instant>,
     got_snapshot: bool,
+    /// Its last snapshot was a live recording's (see `EngineSnapshot::is_recording`).
+    recording: bool,
 }
 
 impl JobView {
+    /// Recording a live stream now, which stopping finishes.
+    fn records(&self) -> bool {
+        self.running.is_some() && self.recording
+    }
+
     fn elapsed(&self) -> Duration {
         match (&self.running, self.started) {
             (Some(_), Some(started)) => started.elapsed(),
@@ -240,6 +248,9 @@ struct App {
 
     dialog_open: bool,
     pending_dialog: Option<Dialog>,
+    /// The window was asked to close and stays open until the live recordings have finished
+    /// their files (see [`stop_recordings`]).
+    closing: bool,
 }
 
 impl App {
@@ -314,6 +325,7 @@ impl App {
             repair: None,
             dialog_open: false,
             pending_dialog: None,
+            closing: false,
         }
     }
 
@@ -342,6 +354,11 @@ impl App {
             return None;
         }
         self.jobs.get(&id).and_then(JobView::stalled_for)
+    }
+
+    /// The download records a live stream (see [`JobView::records`]).
+    fn is_recording(&self, id: usize) -> bool {
+        self.jobs.get(&id).is_some_and(JobView::records)
     }
 
     /// The download's file is being repaired, so it must not be started or cleaned up.
@@ -749,6 +766,7 @@ impl App {
                 view.last_progress = Some(now);
             }
             view.got_snapshot = true;
+            view.recording = snapshot.is_recording();
             view.active_workers = snapshot.active_workers;
             view.speed_history.push_back((now, snapshot.speed_bytes_per_sec));
             while view.speed_history.front().is_some_and(|(t, _)| now.duration_since(*t) > GRAPH_WINDOW) {
@@ -762,9 +780,10 @@ impl App {
         }
     }
 
-    /// Starts queued downloads while fewer than the configured number are running.
+    /// Starts queued downloads while fewer than the configured number are running; none while the
+    /// window waits to close.
     fn run_scheduler(&mut self) {
-        if !self.settings.auto_run_queue {
+        if !self.settings.auto_run_queue || self.closing {
             return;
         }
         while let Some(id) = self.queue.next_to_start(self.settings.max_concurrent.max(1)) {
@@ -1009,6 +1028,15 @@ impl eframe::App for App {
             self.add_dropped(path);
         }
         self.drain_snapshots();
+        // Asked to close, the window first stays open for the live recordings to finish; asked
+        // again, it closes at once.
+        if ctx.input(|i| i.viewport().close_requested()) && !self.closing && stop_recordings(&mut self.queue, &self.jobs) {
+            self.closing = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
+        if self.closing && !self.jobs.values().any(JobView::records) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
         self.run_scheduler();
         let animating = self.animate();
 
@@ -1033,7 +1061,8 @@ impl eframe::App for App {
     }
 
     /// Stops every download so it saves its resume state (and kills yt-dlp), waiting briefly,
-    /// then saves the queue.
+    /// then saves the queue. Live recordings have finished by now, unless the user closed the
+    /// window a second time while they did (see [`stop_recordings`]).
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.settings.clipboard_watch = self.clipboard_enabled.load(Ordering::Relaxed);
         if let Err(e) = self.settings.save() {
@@ -1195,6 +1224,22 @@ fn wait_for_tasks(rt: &tokio::runtime::Handle, tasks: Vec<JoinHandle<()>>, grace
         };
         tokio::time::timeout(grace, wait_all).await.is_ok()
     })
+}
+
+/// Stops the live recordings among `jobs` (see [`JobView::records`]) for the window to close, and
+/// returns whether there are any. Stopping finishes a recording's file, which takes as long as
+/// the file is big (yt-dlp remuxes it), so the window waits for them rather than cut them off
+/// after [`EXIT_GRACE`].
+fn stop_recordings(queue: &mut DownloadQueue, jobs: &HashMap<usize, JobView>) -> bool {
+    let mut any = false;
+    for (&id, view) in jobs {
+        let Some(running) = view.running.as_ref().filter(|_| view.recording) else { continue };
+        any = true;
+        if queue.mark_pausing(id) {
+            running.cancel.notify_one();
+        }
+    }
+    any
 }
 
 /// Runs a history operation after every earlier one has finished and numbers it in that order,
@@ -1387,6 +1432,8 @@ fn apply_theme(ctx: &egui::Context) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Started again to stop a live recording (a debug build has a console), this only does that.
+    hyperfetch_core::media::serve_ctrl_c();
     let _ = tracing_subscriber::fmt().try_init();
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     let handle = runtime.handle().clone();
@@ -1523,6 +1570,35 @@ mod tests {
         let failing = DownloadOptions { proxy: Some("http://127.0.0.1:10".into()), ..plain };
         assert!(cached_client(&cache, &failing, |_: &DownloadOptions| Err::<u32, _>("bad proxy".to_string())).is_err());
         assert_eq!(cached_client(&cache, &failing, build), Ok(5), "a failed build is not kept");
+    }
+
+    /// Closing the window stops the live recordings, which then finish their files while it
+    /// waits, and only them; with none running it closes at once.
+    #[tokio::test]
+    async fn closing_the_window_stops_the_live_recordings_first() {
+        use hyperfetch_core::queue::QueueItemStatus;
+        let mut queue = DownloadQueue::new();
+        let url = || vec![Url::parse("https://example.com/live/index.m3u8").unwrap()];
+        let (live, file) = (queue.add_item(url(), DownloadOptions::default()), queue.add_item(url(), DownloadOptions::default()));
+        assert!(queue.mark_started(live) && queue.mark_started(file));
+        let running = |recording| JobView {
+            running: Some(Running { cancel: Arc::new(Notify::new()), task: tokio::spawn(std::future::pending()), snapshot: Arc::default() }),
+            recording,
+            ..JobView::default()
+        };
+        let mut jobs = HashMap::from([(file, running(false))]);
+        assert!(!stop_recordings(&mut queue, &jobs), "nothing records");
+
+        jobs.insert(live, running(true));
+        assert!(stop_recordings(&mut queue, &jobs));
+        assert_eq!(queue.get_item(live).map(|item| &item.status), Some(&QueueItemStatus::Pausing));
+        assert_eq!(queue.get_item(file).map(|item| &item.status), Some(&QueueItemStatus::Downloading));
+        let asked = jobs[&live].running.as_ref().map(|running| Arc::clone(&running.cancel)).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), asked.notified()).await.expect("the recording is asked to stop");
+        // Still finishing: the window waits; done, it closes.
+        assert!(stop_recordings(&mut queue, &jobs));
+        jobs.get_mut(&live).unwrap().running = None;
+        assert!(!stop_recordings(&mut queue, &jobs));
     }
 
     /// Closing the window runs on the UI thread, which is not part of the runtime.

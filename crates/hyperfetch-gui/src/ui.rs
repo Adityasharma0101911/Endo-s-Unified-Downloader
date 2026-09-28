@@ -93,6 +93,14 @@ fn ffmpeg_notice(ui: &mut egui::Ui, installing: bool) {
 pub fn render(app: &mut App, ui: &mut egui::Ui) {
     ui.add_space(8.0);
     header(app, ui);
+    if app.closing {
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new("Finishing the live recordings; the window closes once they are saved. Close it again to quit now and cut them off.")
+                .size(12.0)
+                .color(AMBER),
+        );
+    }
     clipboard_banner(app, ui);
     listing_prompt(app, ui);
     if let Some(notice) = app.notice.clone() {
@@ -382,7 +390,8 @@ fn download_actions(app: &mut App, ui: &mut egui::Ui, item: Option<&QueueItem>) 
             }
         }
         QueueItemStatus::Pausing => {
-            ui.label(RichText::new("Pausing... saving resume state").color(MUTED));
+            let text = if app.is_recording(id) { "Stopping... finishing the recording" } else { "Pausing... saving resume state" };
+            ui.label(RichText::new(text).color(MUTED));
             ui.add(egui::Spinner::new());
         }
         QueueItemStatus::Paused | QueueItemStatus::Failed(_) => {
@@ -515,6 +524,24 @@ fn advanced_options(app: &mut App, ui: &mut egui::Ui) {
 
     ui.add_space(4.0);
     ui.horizontal(|ui| {
+        ui.label(RichText::new("Subtitles:").size(12.0));
+        ui.add_sized([110.0, 24.0], egui::TextEdit::singleline(&mut app.settings.subtitles).hint_text(hint_text("en,es or all")))
+            .on_hover_text(
+                "Languages to save a video's subtitles in, as .srt or .vtt files next to it; a site's own subtitles \
+                 first, else its automatic captions. A language it has none in is skipped.",
+            );
+        ui.add_space(12.0);
+        ui.checkbox(&mut app.settings.embed_metadata, "Embed tags and chapters")
+            .on_hover_text("Write the title, artist, date, description, link and chapters into the file (needs ffmpeg)");
+        ui.add_space(12.0);
+        ui.checkbox(&mut app.settings.live_from_start, "Record live streams from the start").on_hover_text(
+            "Where the site keeps it, record a live stream from its start instead of from now. \
+             Stop finishes the recording and keeps it.",
+        );
+    });
+
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
         ui.label(RichText::new("Speed Limit:").size(12.0)).on_hover_text("For all downloads running at once together");
         ui.add(egui::DragValue::new(&mut app.settings.max_speed).range(0.0..=1_000_000.0).speed(1.0).max_decimals(1));
         let in_mb = &mut app.settings.max_speed_in_mb;
@@ -565,22 +592,22 @@ fn metric(ui: &mut egui::Ui, label: &str, value: String, color: Option<Color32>)
 fn progress_card(app: &App, ui: &mut egui::Ui, item: Option<&QueueItem>) {
     let view = item.and_then(|item| app.jobs.get(&item.id));
     let downloading = item.is_some_and(|item| item.status == QueueItemStatus::Downloading);
+    let (downloaded, total) = item.map_or((0, 0), |item| (item.downloaded_bytes, item.total_bytes));
+    let elapsed = view.map_or(0, |view| view.elapsed().as_secs());
     card().show(ui, |ui| {
         ui.add(
             egui::ProgressBar::new(app.anim_progress as f32)
                 .animate(downloading)
-                .text(format!("{:.1}%", (app.anim_progress * 100.0).clamp(0.0, 100.0))),
+                .text(util::progress_text(total, downloaded, app.anim_progress, 1, view.map(|_| elapsed))),
         );
         ui.add_space(8.0);
 
-        let (downloaded, total) = item.map_or((0, 0), |item| (item.downloaded_bytes, item.total_bytes));
         let eta = match item {
             Some(item) if item.status == QueueItemStatus::Completed => "Done".to_string(),
             Some(item) if downloading => util::eta_secs(item.total_bytes, item.downloaded_bytes, item.speed_bytes_per_sec)
                 .map_or_else(|| "--:--".to_string(), format_duration),
             _ => "--:--".to_string(),
         };
-        let elapsed = view.map_or(0, |view| view.elapsed().as_secs());
         ui.columns(4, |cols| {
             let transferred = if total > 0 {
                 format!("{} / {}", format_bytes(downloaded), format_bytes(total))
@@ -638,6 +665,9 @@ fn status_line(app: &App, item: Option<&QueueItem>) -> (String, Color32) {
             (format!("Finishing {}: verifying the file and moving it into place...", item.filename), MUTED)
         }
         QueueItemStatus::Downloading => (format!("Downloading {}", item.filename), MUTED),
+        QueueItemStatus::Pausing if app.is_recording(item.id) => {
+            ("Stopping: yt-dlp is finishing the recording...".to_string(), MUTED)
+        }
         QueueItemStatus::Pausing => ("Pausing: saving resume state...".to_string(), MUTED),
         QueueItemStatus::Paused => (
             "Paused. Resume continues where it stopped; Start Over deletes the partial file first.".to_string(),
@@ -924,11 +954,8 @@ fn queue_tab(app: &mut App, ui: &mut egui::Ui) {
                 ui.add_sized([220.0, 18.0], egui::Label::new(&item.filename).truncate()).on_hover_text(&item.filename);
                 let (status, color) = status_badge(app, item);
                 ui.add_sized([95.0, 18.0], egui::Label::new(RichText::new(status).monospace().size(11.0).color(color)));
-                let progress = if item.total_bytes > 0 {
-                    format!("{:.0}%", item.progress_ratio * 100.0)
-                } else {
-                    format_bytes(item.downloaded_bytes)
-                };
+                let elapsed = app.jobs.get(&item.id).map(|view| view.elapsed().as_secs());
+                let progress = util::progress_text(item.total_bytes, item.downloaded_bytes, item.progress_ratio, 0, elapsed);
                 ui.add_sized([150.0, 16.0], egui::ProgressBar::new(item.progress_ratio as f32).text(progress));
                 let speed = if item.status == QueueItemStatus::Downloading {
                     format!("{}/s", format_bytes(item.speed_bytes_per_sec as u64))

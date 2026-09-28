@@ -3754,3 +3754,215 @@ async fn test_a_relative_enclosure_is_on_the_feed_host_without_the_feeds_token()
     assert_eq!(task.folder.as_deref(), Some(Path::new("Wide Show")));
     assert!(task.from_document);
 }
+
+// ---- Subtitles, tags and live streams ---------------------------------------------------------
+
+/// The subtitles and tags the settings ask for reach yt-dlp's download.
+#[tokio::test]
+async fn test_subtitle_and_tag_settings_reach_yt_dlp() {
+    isolate_history();
+    let _history = HISTORY.write().await;
+    let (tools, temp) = (tempdir().unwrap(), tempdir().unwrap());
+    let output = temp.path().join("A song.mp3");
+    let opts = DownloadOptions {
+        media_preset: Some(MediaQualityPreset::AudioMp3),
+        ytdlp_path: Some(fake_ytdlp(tools.path(), &output)),
+        subtitles: Some("en,de".into()),
+        embed_metadata: false,
+        install_ffmpeg: false,
+        ..options(temp.path(), 4, 64 * KB)
+    };
+    let url = Url::parse("https://www.youtube.com/watch?v=abc").unwrap();
+
+    assert_eq!(run(&DownloadEngine::new(vec![url], opts), None).await, Ok(output));
+    let runs = runs_of(tools.path());
+    let [download] = &runs[..] else { panic!("one download: {runs:?}") };
+    assert!(has_arg(download, "--sub-langs", "en,de") && download.contains(&"--write-subs".to_string()), "{download:?}");
+    assert!(!download.iter().any(|arg| arg.starts_with("--embed")), "{download:?}");
+}
+
+/// The live stream settings reach yt-dlp's download.
+#[tokio::test]
+async fn test_live_settings_reach_yt_dlp() {
+    isolate_history();
+    let _history = HISTORY.write().await;
+    let (tools, temp) = (tempdir().unwrap(), tempdir().unwrap());
+    let output = temp.path().join("A song.mp3");
+    let opts = DownloadOptions {
+        media_preset: Some(MediaQualityPreset::AudioMp3),
+        ytdlp_path: Some(fake_ytdlp(tools.path(), &output)),
+        live_from_start: true,
+        wait_for_video: true,
+        install_ffmpeg: false,
+        ..options(temp.path(), 4, 64 * KB)
+    };
+    let url = Url::parse("https://www.youtube.com/watch?v=abc").unwrap();
+
+    assert_eq!(run(&DownloadEngine::new(vec![url], opts), None).await, Ok(output));
+    let runs = runs_of(tools.path());
+    let [download] = &runs[..] else { panic!("one download: {runs:?}") };
+    assert!(has_arg(download, "--wait-for-video", "60-600") && download.contains(&"--live-from-start".to_string()), "{download:?}");
+}
+
+/// A stand-in for yt-dlp in `dir` that finds a live stream (`dir/info.json`) and records it into
+/// `output` until it is stopped.
+fn recording_ytdlp(dir: &Path, output: &Path) -> PathBuf {
+    let (dir_s, out_s) = (dir.display(), output.display());
+    #[cfg(windows)]
+    let (bin, script) = (
+        dir.join("yt-dlp.cmd"),
+        format!(
+            "@echo off\r\n\
+             if \"%~2\"==\"--version\" exit /b 1\r\n\
+             if \"%~4\"==\"-J\" (type \"{dir_s}\\info.json\"& exit /b 0)\r\n\
+             echo HFLIVE True {out_s}\r\n\
+             echo total_size=1000\r\n\
+             ping -n 30 127.0.0.1 >nul\r\n"
+        ),
+    );
+    #[cfg(not(windows))]
+    let (bin, script) = (
+        dir.join("yt-dlp"),
+        format!(
+            "#!/bin/sh\n\
+             [ \"$2\" = --version ] && exit 1\n\
+             [ \"$4\" = -J ] && {{ cat '{dir_s}/info.json'; exit 0; }}\n\
+             echo 'HFLIVE True {out_s}'\n\
+             echo 'total_size=1000'\n\
+             sleep 30\n"
+        ),
+    );
+    std::fs::write(&bin, script).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    bin
+}
+
+/// Stopping a live recording finishes it: the download is done, with what was recorded, and its
+/// progress was its size, with no total to reach.
+#[tokio::test]
+async fn test_stopping_a_live_recording_keeps_what_it_recorded() {
+    isolate_history();
+    let _history = HISTORY.write().await;
+    let (tools, temp) = (tempdir().unwrap(), tempdir().unwrap());
+    let output = temp.path().join("Live.mp4");
+    std::fs::write(part_of(&output), b"recorded so far").unwrap();
+    let info = serde_json::json!({
+        "_type": "video", "extractor_key": "Youtube", "id": "live1", "title": "Live",
+        "is_live": true, "live_status": "is_live", "requested_downloads": [{ "filename": output }],
+    });
+    std::fs::write(tools.path().join("info.json"), serde_json::to_vec(&info).unwrap()).unwrap();
+    let opts = DownloadOptions {
+        ytdlp_path: Some(recording_ytdlp(tools.path(), &output)),
+        install_ffmpeg: false,
+        ..options(temp.path(), 4, 64 * KB)
+    };
+    let engine = DownloadEngine::new(vec![Url::parse("https://www.youtube.com/watch?v=live1").unwrap()], opts);
+    let (tx, mut rx) = broadcast::channel(16);
+    let stop = async {
+        let snapshot = rx.recv().await.expect("progress");
+        engine.cancel();
+        snapshot
+    };
+
+    let (path, snapshot) = tokio::join!(run(&engine, Some(tx)), stop);
+    let path = path.expect("the recording is kept");
+    assert_eq!((snapshot.downloaded_bytes, snapshot.total_bytes), (1000, 0));
+    assert!(snapshot.is_recording());
+    assert_eq!(path, output);
+    assert_file(&path, b"recorded so far");
+    let entry = history_entry(&path).expect("the recording is recorded");
+    assert_eq!((entry.status, entry.file_size), (HistoryStatus::Completed, 15));
+}
+
+/// A live HLS playlist: its segments so far, no `#EXT-X-ENDLIST`, and the key line given.
+fn live_playlist(key: &str) -> Vec<u8> {
+    format!("#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-MEDIA-SEQUENCE:1041\n{key}#EXTINF:4,\nseg1041.ts\n#EXTINF:4,\nseg1042.ts\n")
+        .into_bytes()
+}
+
+#[tokio::test]
+async fn test_a_live_hls_stream_is_recorded_with_yt_dlp() {
+    isolate_history();
+    let _history = HISTORY.write().await;
+    let (tools, temp) = (tempdir().unwrap(), tempdir().unwrap());
+    let url = serve(Arc::new(Mock::new(live_playlist(""))), "live/index.m3u8").await;
+    // What yt-dlp's generic site finds there: a live stream, which only it records.
+    let output = temp.path().join("index.mp4");
+    let info = serde_json::json!({
+        "_type": "video", "extractor_key": "Generic", "id": "index", "title": "index",
+        "is_live": true, "live_status": "is_live", "url": url.as_str(), "protocol": "m3u8_native",
+        "format_id": "0", "ext": "mp4", "requested_downloads": [{ "filename": output }],
+    });
+    std::fs::write(tools.path().join("info.json"), serde_json::to_vec(&info).unwrap()).unwrap();
+    let opts = DownloadOptions {
+        ytdlp_path: Some(fake_ytdlp(tools.path(), &output)),
+        install_ffmpeg: false,
+        ..options(temp.path(), 4, 64 * KB)
+    };
+
+    let path = run(&DownloadEngine::new(vec![url.clone()], opts), None).await.expect("the stream should be recorded");
+    assert_eq!(path, output);
+    // Found, then recorded from what was found.
+    let runs = runs_of(tools.path());
+    assert_eq!(runs.len(), 2, "{runs:?}");
+    assert!(runs[0].contains(&"-J".to_string()) && runs[0].last() == Some(&url.to_string()), "{runs:?}");
+    assert!(runs[1].contains(&"--load-info-json".to_string()), "{runs:?}");
+}
+
+/// Live TV behind FairPlay or Widevine is refused, not handed to a recording.
+#[tokio::test]
+async fn test_a_drm_protected_live_hls_stream_is_an_error_not_a_recording() {
+    let _history = setup().await;
+    let keys = [
+        "#EXT-X-KEY:METHOD=SAMPLE-AES,URI=\"skd://key\",KEYFORMAT=\"com.apple.streamingkeydelivery\",KEYFORMATVERSIONS=\"1\"\n",
+        "#EXT-X-KEY:METHOD=SAMPLE-AES-CTR,URI=\"data:text/plain;base64,AAAA\",KEYFORMAT=\"urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed\"\n",
+    ];
+    for key in keys {
+        let (tools, temp) = (tempdir().unwrap(), tempdir().unwrap());
+        let url = serve(Arc::new(Mock::new(live_playlist(key))), "tv/index.m3u8").await;
+        let opts = DownloadOptions { ytdlp_path: Some(no_site_ytdlp(tools.path())), ..options(temp.path(), 4, 64 * KB) };
+
+        let err = run(&DownloadEngine::new(vec![url], opts), None).await.expect_err("DRM stays refused");
+        assert!(err.contains("DRM"), "{err}");
+        assert!(runs_of(tools.path()).is_empty(), "yt-dlp was asked to record it");
+        assert_eq!(names_in(temp.path()), Vec::<String>::new());
+    }
+}
+
+/// A language the site has subtitles of its own in only for regions of it (YouTube's `en-US`)
+/// gets those, not the automatic captions of the bare code, which yt-dlp would pick.
+#[tokio::test]
+async fn test_a_language_gets_the_sites_own_subtitles_of_its_regions() {
+    isolate_history();
+    let _history = HISTORY.write().await;
+    let (tools, temp) = (tempdir().unwrap(), tempdir().unwrap());
+    let output = temp.path().join("Apple Event.mp4");
+    // yt-dlp 2026.08.19's -J of youtube.com/watch?v=5AwdkGKmZ0I, trimmed to its subtitles' languages.
+    let langs = |langs: &[&str]| {
+        serde_json::Value::Object(langs.iter().map(|lang| (lang.to_string(), serde_json::json!([{ "ext": "srt" }]))).collect())
+    };
+    let info = serde_json::json!({
+        "_type": "video", "extractor_key": "Youtube", "id": "5AwdkGKmZ0I", "title": "Apple Event",
+        "subtitles": langs(&["en-US", "es-419", "ja", "ko", "ru", "zh-CN"]),
+        "automatic_captions": langs(&["en", "en-US", "en-orig", "es", "ja"]),
+        "requested_downloads": [{ "filename": output }],
+    });
+    std::fs::write(tools.path().join("info.json"), serde_json::to_vec(&info).unwrap()).unwrap();
+    let opts = DownloadOptions {
+        ytdlp_path: Some(fake_ytdlp(tools.path(), &output)),
+        subtitles: Some("en,es".into()),
+        install_ffmpeg: false,
+        ..options(temp.path(), 4, 64 * KB)
+    };
+    let url = Url::parse("https://www.youtube.com/watch?v=5AwdkGKmZ0I").unwrap();
+
+    assert_eq!(run(&DownloadEngine::new(vec![url], opts), None).await, Ok(output));
+    let runs = runs_of(tools.path());
+    let [extract, download] = &runs[..] else { panic!("found, then downloaded: {runs:?}") };
+    assert!(has_arg(extract, "--sub-langs", "en,es"), "{extract:?}");
+    assert!(has_arg(download, "--sub-langs", "en-US,es-419"), "{download:?}");
+}

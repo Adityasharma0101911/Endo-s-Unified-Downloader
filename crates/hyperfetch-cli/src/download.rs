@@ -163,7 +163,8 @@ impl Write for LogWriter {
 }
 
 const SIZED: &str = "{spinner:.green} {prefix:28.bold} [{bar:30.cyan/blue}] {bytes:>10}/{total_bytes:<10} {msg}";
-const UNSIZED: &str = "{spinner:.green} {prefix:28.bold} {bytes:>10} {msg}";
+/// With no size to reach (a live recording, a server that sends none): what came in, and for how long.
+const UNSIZED: &str = "{spinner:.green} {prefix:28.bold} {bytes:>10} in {elapsed_precise} {msg}";
 const OVERALL: &str = "  {prefix:28.bold} [{bar:30.green/white}] {pos}/{len} files {msg}";
 
 fn style(template: &str) -> ProgressStyle {
@@ -216,6 +217,16 @@ fn status_text(speed: f64, connections: usize, remaining: Option<u64>, stalled: 
         text.push_str(&format!(", ETA {}", compact_duration((remaining as f64 / speed).ceil() as u64)));
     }
     text
+}
+
+/// How far a download is, for a plain progress line: the share of its `total`, or with no size to
+/// reach (0: a live recording, a server that sends none) what came in and in how long.
+fn done_text(downloaded: u64, total: u64, elapsed: Duration) -> String {
+    if total > 0 {
+        format!("{:.1}% of {}", downloaded as f64 * 100.0 / total as f64, HumanBytes(total))
+    } else {
+        format!("{} in {}", HumanBytes(downloaded), compact_duration(elapsed.as_secs()))
+    }
 }
 
 /// One download to run.
@@ -363,7 +374,7 @@ async fn run_job(
     tokio::pin!(run);
     let mut last: Option<EngineSnapshot> = None;
     let mut snapshots_open = true;
-    let mut deadline: Option<tokio::time::Instant> = None;
+    let (mut stopping, mut deadline) = (false, None);
     let result = loop {
         tokio::select! {
             res = &mut run => break res,
@@ -375,11 +386,14 @@ async fn run_job(
                 Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Err(broadcast::error::RecvError::Closed) => snapshots_open = false,
             },
-            // Keep awaiting run() after cancel: it stops the workers and saves the resume state.
-            _ = stop_requested(&mut stop), if deadline.is_none() => {
+            // Keep awaiting run() after cancel: it stops the workers and saves the resume state,
+            // or finishes a recording.
+            _ = stop_requested(&mut stop), if !stopping => {
+                stopping = true;
                 engine.cancel();
-                view.bar.set_message("stopping, saving resume state...");
-                deadline = Some(tokio::time::Instant::now() + STOP_TIMEOUT);
+                let recording = is_recording(last.as_ref());
+                view.bar.set_message(if recording { "stopping, finishing the recording..." } else { "stopping, saving resume state..." });
+                deadline = (!recording).then(|| tokio::time::Instant::now() + STOP_TIMEOUT);
             }
             _ = sleep_until(deadline) => {
                 break Err(format!(
@@ -413,6 +427,13 @@ async fn run_job(
             if interrupted { Outcome::Interrupted } else { Outcome::Failed }
         }
     }
+}
+
+/// A live recording that has something already (see [`EngineSnapshot::is_recording`]): stopping
+/// finishes its file, which takes as long as the file is big, so it gets no [`STOP_TIMEOUT`] (a
+/// second Ctrl+C still quits at once). Any other download without a size stops as all others do.
+fn is_recording(last: Option<&EngineSnapshot>) -> bool {
+    last.is_some_and(EngineSnapshot::is_recording)
 }
 
 async fn sleep_until(deadline: Option<tokio::time::Instant>) {
@@ -494,14 +515,7 @@ impl TaskView {
         let status = status_text(s.speed_bytes_per_sec, s.active_workers, remaining, stalled);
 
         if self.last_plain.is_some_and(|t| now.duration_since(t) >= PLAIN_INTERVAL) {
-            let done = match remaining {
-                Some(_) => format!(
-                    "{:.1}% of {}",
-                    s.downloaded_bytes as f64 * 100.0 / s.total_bytes as f64,
-                    HumanBytes(s.total_bytes)
-                ),
-                None => HumanBytes(s.downloaded_bytes).to_string(),
-            };
+            let done = done_text(s.downloaded_bytes, s.total_bytes, self.bar.elapsed());
             self.ui.error(&format!("[{}] {}, {}", self.label, done, status));
             self.last_plain = Some(now);
         }
@@ -664,6 +678,33 @@ mod tests {
             status_text(9.0, 2, Some(1), Some(Duration::from_secs(75))),
             "STALLED: no data for 1m15s, 2 conn"
         );
+    }
+
+    #[test]
+    fn a_download_with_no_size_shows_what_came_in_and_for_how_long() {
+        // A live recording: no share of a size, but its size and how long it has run.
+        assert_eq!(done_text(3 * 1024 * 1024, 0, Duration::from_secs(75)), "3.00 MiB in 1m15s");
+        assert_eq!(done_text(250, 1000, Duration::from_secs(75)), "25.0% of 1000 B");
+    }
+
+    #[test]
+    fn only_a_recording_may_take_its_time_to_stop() {
+        let snapshot = |total_bytes, downloaded_bytes| EngineSnapshot {
+            total_bytes,
+            downloaded_bytes,
+            speed_bytes_per_sec: 0.0,
+            progress_ratio: 0.0,
+            active_workers: 1,
+            mirror_speeds: vec![],
+            chunks: vec![],
+            target_path: None,
+        };
+        assert!(is_recording(Some(&snapshot(0, 4096))));
+        // A server that sends no size: the engine's own download of a file.
+        let unsized_file = EngineSnapshot { target_path: Some("file.bin".into()), ..snapshot(0, 4096) };
+        for not_one in [Some(snapshot(8192, 4096)), Some(snapshot(0, 0)), Some(unsized_file), None] {
+            assert!(!is_recording(not_one.as_ref()), "{not_one:?}");
+        }
     }
 
     #[test]
