@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
@@ -198,6 +198,10 @@ const POSTPROCESS_MARK: &str = "HFPOST";
 /// Final path of each video once every post-processor has run and the file has been moved.
 const PATH_TEMPLATE: &str = "after_move:HFPATH %(filepath)s";
 const PATH_MARK: &str = "HFPATH ";
+/// What each video made is, for the download archive (see [`archive_id`]), and whether this run
+/// made its file (`False` when it was there already).
+const ARCHIVE_TEMPLATE: &str = "after_move:HFARCHIVE %(__real_download)s %(extractor_key)s %(id)s";
+const ARCHIVE_MARK: &str = "HFARCHIVE ";
 
 /// Turns YouTube's formats into 10 MiB range fragments that `--concurrent-fragments` fetches in
 /// parallel; otherwise one connection pulls the 10 MiB pieces one after another. Fragments report
@@ -242,21 +246,508 @@ pub fn is_supported_media_site(url: &Url) -> bool {
         })
 }
 
-/// Whether `url` names a playlist, channel, album or other list of videos this module lists
-/// through yt-dlp, from its shape alone.
-pub fn lists(_url: &Url) -> bool {
-    false
+/// How the entries of a list are ordered, which tells its newest ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListKind {
+    /// A channel's or a user's uploads (or a tab of them): newest first.
+    Uploads,
+    /// A playlist, album, set, showcase or collection, in its own order: the newest were added
+    /// last.
+    Playlist,
+    /// Ordered by views, not by date (a Twitch channel's clips, a channel's popular uploads): it
+    /// has no newest items, so it is listed whole.
+    Ranked,
 }
 
+impl ListKind {
+    /// yt-dlp's `--playlist-items` for the newest `n` items of a list of this kind.
+    fn newest(self, n: usize) -> Option<String> {
+        match self {
+            Self::Uploads => Some(format!(":{n}")),
+            Self::Playlist => Some(format!("-{n}:")),
+            Self::Ranked => None,
+        }
+    }
+}
+
+/// The host of `url` without `www.` or `m.`, and its path's segments.
+fn url_shape(url: &Url) -> (String, Vec<&str>) {
+    let host = url.host_str().unwrap_or_default().trim_end_matches('.').to_ascii_lowercase();
+    let host = host.strip_prefix("www.").or_else(|| host.strip_prefix("m.")).map_or_else(|| host.clone(), str::to_string);
+    (host, url.path_segments().map_or_else(Vec::new, |s| s.filter(|s| !s.is_empty()).collect()))
+}
+
+/// Whether `url` has the query parameter `name`, not empty.
+fn has_param(url: &Url, name: &str) -> bool {
+    url.query_pairs().any(|(key, value)| key == name && !value.is_empty())
+}
+
+/// The value of the query parameter `name` of `url`, if any.
+fn param(url: &Url, name: &str) -> Option<String> {
+    url.query_pairs().find(|(key, _)| key == name).map(|(_, value)| value.into_owned())
+}
+
+/// First path segments of soundcloud.com that are its own pages, not users.
+const SOUNDCLOUD_PAGES: &[&str] = &[
+    "discover", "stream", "feed", "charts", "search", "upload", "you", "settings", "messages", "notifications", "people",
+    "pages", "pro", "jobs", "imprint", "terms-of-use", "community-guidelines", "stories", "topic", "download", "go",
+    "getstarted", "company", "mobile", "signin", "logout", "popular", "tags", "stations", "playlists",
+];
+
+/// What kind of list `url` names (see [`lists`]).
+fn list_kind(url: &Url) -> Option<ListKind> {
+    use ListKind::{Playlist, Ranked, Uploads};
+    let (host, path) = url_shape(url);
+    // A channel's page is the videos, shorts and live streams tabs; its playlists would each be
+    // listed on their own.
+    let tab = |rest: &[&str]| matches!(rest, [] | ["videos" | "shorts" | "streams"]);
+    let by_views = param(url, "filter").as_deref() == Some("clips") || param(url, "sort").as_deref() == Some("views");
+    match (host.as_str(), &path[..]) {
+        ("youtube.com" | "music.youtube.com", ["playlist" | "watch"]) | ("youtu.be", [_]) if has_param(url, "list") => {
+            // A channel's uploads (UU..., its videos UULF..., its shorts UUSH...) are newest
+            // first, its popular videos (UULP...) and shorts (UUPS...) most viewed first.
+            let list = param(url, "list").unwrap_or_default();
+            Some(match list {
+                _ if list.starts_with("UULP") || list.starts_with("UUPS") => Ranked,
+                _ if list.starts_with("UU") => Uploads,
+                _ => Playlist,
+            })
+        }
+        ("youtube.com", [handle, rest @ ..]) if handle.starts_with('@') && tab(rest) => Some(Uploads),
+        ("youtube.com", ["channel" | "c" | "user", _, rest @ ..]) if tab(rest) => Some(Uploads),
+        // A set's link may end in its secret token.
+        ("soundcloud.com", [_, "sets", _] | [_, "sets", _, _]) => Some(Playlist),
+        ("soundcloud.com", [user] | [user, "tracks" | "albums" | "sets" | "reposts" | "likes" | "spotlight"])
+            if !SOUNDCLOUD_PAGES.contains(user) =>
+        {
+            Some(Uploads)
+        }
+        ("vimeo.com", ["showcase" | "album", _]) => Some(Playlist),
+        ("vimeo.com", ["channels" | "groups", _] | [_, "videos"]) => Some(Uploads),
+        ("twitch.tv", ["collections", _]) => Some(Playlist),
+        // Clips are the most viewed of a week (`range=` another span), and videos may be sorted
+        // by views too.
+        ("twitch.tv", [_, "clips"]) => Some(Ranked),
+        ("twitch.tv", [_, "videos"]) => Some(if by_views { Ranked } else { Uploads }),
+        (host, ["album", _]) if bandcamp_artist(host) => Some(Playlist),
+        (host, [] | ["music"]) if bandcamp_artist(host) => Some(Uploads),
+        _ => None,
+    }
+}
+
+/// The link yt-dlp lists for `url`: a SoundCloud user's page is their own tracks, where yt-dlp
+/// would read their stream, with the tracks and sets of others they reposted.
+fn list_url(url: &Url) -> Url {
+    let (host, path) = url_shape(url);
+    let mut listed = url.clone();
+    if let ("soundcloud.com", [user]) = (host.as_str(), &path[..]) {
+        listed.set_path(&format!("/{user}/tracks"));
+    }
+    listed
+}
+
+/// Whether `host` is an artist's Bandcamp site (`<artist>.bandcamp.com`).
+fn bandcamp_artist(host: &str) -> bool {
+    host.strip_suffix(".bandcamp.com").is_some_and(|artist| !artist.contains('.'))
+}
+
+/// Whether `url` names a playlist, channel, album or other list of videos this module lists
+/// through yt-dlp, from its shape alone: a YouTube playlist, channel (`/@name`, `/channel/`,
+/// `/c/`, `/user/`, or its videos, shorts or live tab) or video link that names its playlist
+/// too (see [`video_in_playlist`]); a SoundCloud user or set; a Bandcamp album or artist; a Vimeo
+/// showcase, album, channel, group or user's videos; a Twitch channel's videos, clips or a
+/// collection. Not a page of such a site's own (`soundcloud.com/discover`).
+pub fn lists(url: &Url) -> bool {
+    list_kind(url).is_some()
+}
+
+/// Whether `url` is a video link that also names the playlist it is in (YouTube's
+/// `watch?v=X&list=Y`, `youtu.be/X?list=Y`): [`list`] lists the playlist only when told to
+/// (`ListOptions::whole_playlist`), the link is otherwise the one video.
+pub fn video_in_playlist(url: &Url) -> bool {
+    let (host, path) = url_shape(url);
+    let video = match (host.as_str(), &path[..]) {
+        ("youtube.com" | "music.youtube.com", ["watch"]) => has_param(url, "v"),
+        (host, [_]) => host == "youtu.be",
+        _ => false,
+    };
+    video && has_param(url, "list")
+}
+
+/// How long each yt-dlp run of a listing, and installing yt-dlp, may take: a channel of
+/// thousands of videos takes a minute or two.
+const LIST_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// Most lists one yt-dlp run reads of those a list holds (an artist's albums): one run each
+/// would spend a second starting yt-dlp for every album.
+const NESTED_BATCH: usize = 50;
+
+/// Listings run one at a time, in this process, whichever front end asks: many yt-dlp runs
+/// paging one site at once bring its rate limits and bot checks on.
+static LISTING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
+/// How yt-dlp is told to download a list entry's file: by its title and id, as yt-dlp's own
+/// default does, since the titles of a list's entries (an album's "Intro", a streamer's daily
+/// VODs) may repeat in its one folder.
+const LIST_ENTRY_NAME: &str = "%(title)s [%(id)s].%(ext)s";
+
 /// One task per entry of the list at `url`, as `options` say; called only when [`lists`] takes
-/// `url`. None when it is one video after all (the link is then downloaded as it is);
-/// `Some(Ok)` is never empty.
+/// `url`. None when it is one video after all (the link is then downloaded as it is).
+/// `Some(Ok)` is empty only when everything listed was downloaded before (see
+/// `ListOptions::only_new`): nothing to do, not a failure; a list with nothing in it is an error.
+///
+/// yt-dlp lists it (see [`list_entries_of`]), installed as media downloads install it, with the
+/// cookies and proxy of `options`, after any other listing of this process. Each task is an
+/// entry's link, saved in a folder named after the list and named by its title and id (see
+/// [`LIST_ENTRY_NAME`]). With `only_new`, what the download archive holds (see [`archive_file`])
+/// is left out.
 pub async fn list(
     _http: &reqwest::Client,
-    _url: &Url,
-    _options: &crate::ingest::ListOptions,
+    url: &Url,
+    options: &crate::ingest::ListOptions,
 ) -> Option<Result<Vec<crate::ingest::Task>, String>> {
-    None
+    let kind = list_kind(url)?;
+    if video_in_playlist(url) && !options.whole_playlist {
+        return None;
+    }
+    let media = MediaDownloadOptions { cookies: options.cookies.clone(), proxy: options.proxy.clone(), ..Default::default() };
+    list_prepared(&list_url(url), kind, options, prepare(&media, &None, true)).await
+}
+
+/// "yt-dlp took over 10 minutes to list `what`", with how to list less.
+fn too_long(what: &str) -> String {
+    format!(
+        "yt-dlp took over {} minutes to list {what}; Newest N items (--latest N) lists only the newest",
+        LIST_TIMEOUT.as_secs() / 60
+    )
+}
+
+/// [`list`] with the options and tools `prepared` gives, within [`LIST_TIMEOUT`], each yt-dlp
+/// run within it too. A managed yt-dlp that fails to list is updated, and asked again, as a
+/// download does.
+async fn list_prepared<'a>(
+    url: &Url,
+    kind: ListKind,
+    options: &crate::ingest::ListOptions,
+    prepared: impl std::future::Future<Output = Result<(MediaDownloadOptions, Tools<'a>), String>>,
+) -> Option<Result<Vec<crate::ingest::Task>, String>> {
+    let (media, mut tools) = match tokio::time::timeout(LIST_TIMEOUT, prepared).await {
+        Ok(Ok(prepared)) => prepared,
+        Ok(Err(e)) => return Some(Err(e)),
+        Err(_) => return Some(Err(too_long(url.as_str()))),
+    };
+    let Ok(_turn) = LISTING.acquire().await else {
+        return Some(Err("Listing is shut down".to_string()));
+    };
+    let mut updated = false;
+    let listed = loop {
+        let extract = |urls: Vec<Url>, newest| {
+            let (media, tools) = (&media, &tools);
+            async move {
+                let what = match &urls[..] {
+                    [one] => one.to_string(),
+                    many => format!("{} lists", many.len()),
+                };
+                // Dropped, the run's process tree is killed.
+                let run = tokio::time::timeout(LIST_TIMEOUT, run_extraction(&urls, media, tools, RunKind::List(newest), None));
+                let (json, ran) = run.await.map_err(|_| too_long(&what))??;
+                Ok(listed_each(&urls, &json, ran.err()))
+            }
+        };
+        match list_entries_of(url, kind, options.latest, extract).await {
+            Some(Err(e)) if tools.managed && !updated => {
+                let version = ytdlp_version(&tools.ytdlp, &tools.work_dir, tools.version_cache.as_deref()).await;
+                match update_managed_ytdlp(media.proxy.as_deref(), version.as_deref()).await {
+                    Ok(Some(installed)) => (tools.ytdlp, updated) = (installed, true),
+                    Ok(None) => break Err(e),
+                    Err(update) => {
+                        tracing::warn!("Could not update yt-dlp: {update}");
+                        break Err(e);
+                    }
+                }
+            }
+            Some(listed) => break listed,
+            None => return None,
+        }
+    };
+    let listed = match listed {
+        Ok(listed) => listed,
+        Err(e) => return Some(Err(e)),
+    };
+    let Some(file) = tools.archive.clone().filter(|_| options.only_new) else {
+        return Some(Ok(list_tasks(listed, None)));
+    };
+    let archive = tokio::task::spawn_blocking(move || read_archive(&file)).await.map_err(|e| format!("Background task failed: {e}"));
+    Some(archive.and_then(|archive| archive).map(|archive| list_tasks(listed, Some(&archive))))
+}
+
+/// What a List run of yt-dlp printed for each of its links (see [`listed_each`]), or why it
+/// printed nothing (it took too long, or could not be run).
+type ListRun = Result<Vec<Result<Value, String>>, String>;
+
+/// What a List run of yt-dlp printed for each of `urls` (`-J` prints a line for each, in order,
+/// `null` for one it failed at), or why it printed nothing of it: `failure`, the run's errors.
+fn listed_each(urls: &[Url], json: &[u8], failure: Option<String>) -> Vec<Result<Value, String>> {
+    let mut lines = json.split(|&b| b == b'\n').filter(|line| !line.trim_ascii().is_empty());
+    urls.iter()
+        .map(|url| match lines.next().map(serde_json::from_slice::<Value>) {
+            Some(Ok(Value::Null)) | None => Err(failure.clone().unwrap_or_else(|| format!("yt-dlp listed nothing for {url}"))),
+            Some(Ok(info)) => Ok(info),
+            Some(Err(e)) => Err(format!("yt-dlp listed {url} unreadably: {e}")),
+        })
+        .collect()
+}
+
+/// An entry of a list yt-dlp printed.
+#[derive(Debug, PartialEq)]
+enum Listed {
+    /// One download.
+    Entry(ListEntry),
+    /// A list of its own (see [`lists`]), such as an album on an artist's page.
+    Nested(Url),
+}
+
+/// One download a list holds.
+#[derive(Debug, PartialEq)]
+struct ListEntry {
+    url: Url,
+    /// Its line in the download archive (see [`archive_id`]), when yt-dlp names its site and id.
+    archive_id: Option<String>,
+}
+
+impl ListEntry {
+    /// What tells it from the other entries of a list.
+    fn key(&self) -> String {
+        self.archive_id.clone().unwrap_or_else(|| self.url.to_string())
+    }
+}
+
+/// The entries of the list yt-dlp printed (`-J --flat-playlist`), in order: those of the lists in
+/// it (a channel's tabs) in their place; without streams that are live or still to come, which
+/// a later listing finds once they are videos, and without entries it gives no link for.
+fn list_entries(info: &Value) -> Vec<Listed> {
+    let mut listed = Vec::new();
+    for entry in info["entries"].as_array().into_iter().flatten() {
+        if entry["_type"] == "playlist" {
+            listed.extend(list_entries(entry));
+            continue;
+        }
+        if matches!(entry["live_status"].as_str(), Some("is_live" | "is_upcoming" | "post_live")) {
+            continue;
+        }
+        // An entry found whole has its media's link in `url`, one listed only the page's.
+        let Some(url) = ["webpage_url", "url"].iter().find_map(|key| entry[*key].as_str()).and_then(crate::ingest::http_url) else {
+            continue;
+        };
+        listed.push(if lists(&url) && !video_in_playlist(&url) {
+            Listed::Nested(url)
+        } else {
+            Listed::Entry(ListEntry { archive_id: archive_id(entry), url })
+        });
+    }
+    listed
+}
+
+/// The title of the list at `url` and its entries (see [`list_entries`]), each once; the lists
+/// among them (a SoundCloud user's sets, a Bandcamp artist's albums) listed in their place, one
+/// level deep, [`NESTED_BATCH`] to a yt-dlp run, or kept as they are when that fails; with
+/// `latest`, only the newest that many (see [`ListKind`]). `extract` gives what yt-dlp prints for
+/// each of the lists it is given (see [`listed_each`]), only their newest items when given them,
+/// or fails as a whole. None when `url` is one video, or no site of yt-dlp's takes it.
+async fn list_entries_of<F: std::future::Future<Output = ListRun>>(
+    url: &Url,
+    kind: ListKind,
+    latest: Option<usize>,
+    extract: impl Fn(Vec<Url>, Option<(ListKind, usize)>) -> F,
+) -> Option<Result<(String, Vec<ListEntry>), String>> {
+    let latest = latest.filter(|_| kind != ListKind::Ranked);
+    let first = extract(vec![url.clone()], latest.map(|n| (kind, n))).await;
+    let info = match first.and_then(|each| each.into_iter().next().unwrap_or_else(|| Err(format!("yt-dlp listed nothing for {url}")))) {
+        Ok(info) => info,
+        Err(e) if e.contains(NO_SITE) || e.contains("Unsupported URL") => return None,
+        Err(e) => return Some(Err(e)),
+    };
+    if info["_type"] != "playlist" {
+        return None;
+    }
+    let title = ["title", "id"].iter().find_map(|key| info[*key].as_str()).unwrap_or(url.as_str()).to_string();
+    let listed = list_entries(&info);
+    // The lists among the entries, each once, in the order they are read.
+    let mut nested: Vec<Url> = Vec::new();
+    for listed in &listed {
+        if let Listed::Nested(list) = listed {
+            if !nested.contains(list) {
+                nested.push(list.clone());
+            }
+        }
+    }
+    let (mut read, mut found) = (0, HashMap::new());
+    let mut entries = Vec::new();
+    let mut seen = HashSet::new();
+    let mut add = |entry: ListEntry, entries: &mut Vec<ListEntry>| {
+        if seen.insert(entry.key()) {
+            entries.push(entry);
+        }
+    };
+    for listed in listed {
+        // A channel's newest come first: its other lists need not be read.
+        if kind == ListKind::Uploads && latest.is_some_and(|n| entries.len() >= n) {
+            break;
+        }
+        let nested_url = match listed {
+            Listed::Entry(entry) => {
+                add(entry, &mut entries);
+                continue;
+            }
+            Listed::Nested(nested_url) => nested_url,
+        };
+        if read < nested.len() && !found.contains_key(&nested_url) {
+            // Each list holds an item at least: no more of them than the newest still wanted.
+            let wanted = match (kind, latest) {
+                (ListKind::Uploads, Some(n)) => n.saturating_sub(entries.len()),
+                _ => NESTED_BATCH,
+            };
+            let batch = nested[read..].iter().take(wanted.clamp(1, NESTED_BATCH)).cloned().collect::<Vec<_>>();
+            read += batch.len();
+            let mut each = match extract(batch.clone(), None).await {
+                Ok(each) => each.into_iter(),
+                Err(e) => vec![Err(e); batch.len()].into_iter(),
+            };
+            for list in batch {
+                let inner = each.next().unwrap_or_else(|| Err(format!("yt-dlp listed nothing for {list}")));
+                found.insert(list, inner);
+            }
+        }
+        // A list listed twice was added the first time.
+        let Some(inner) = found.remove(&nested_url) else { continue };
+        match inner {
+            Ok(inner) if inner["_type"] == "playlist" => {
+                for listed in list_entries(&inner) {
+                    add(
+                        match listed {
+                            Listed::Entry(entry) => entry,
+                            Listed::Nested(url) => ListEntry { url, archive_id: None },
+                        },
+                        &mut entries,
+                    );
+                }
+            }
+            Ok(one) => add(ListEntry { archive_id: archive_id(&one), url: nested_url }, &mut entries),
+            Err(e) => {
+                tracing::warn!("Could not list {nested_url}, which is downloaded as it is: {e}");
+                add(ListEntry { url: nested_url, archive_id: None }, &mut entries);
+            }
+        }
+    }
+    match (kind, latest) {
+        (ListKind::Uploads, Some(n)) => entries.truncate(n),
+        (ListKind::Playlist, Some(n)) => drop(entries.drain(..entries.len().saturating_sub(n))),
+        (ListKind::Ranked, _) | (_, None) => {}
+    }
+    if entries.is_empty() {
+        return Some(Err(format!("Nothing to download in {title}")));
+    }
+    Some(Ok((title, entries)))
+}
+
+/// One task per entry of the list `title`, saved in a folder named after it (see `Task::folder`)
+/// under its title and id (see [`LIST_ENTRY_NAME`]), leaving out those whose line `archive` (the
+/// download archive's lines) holds: none when it holds them all.
+fn list_tasks((title, entries): (String, Vec<ListEntry>), archive: Option<&HashSet<String>>) -> Vec<crate::ingest::Task> {
+    let listed = entries.len();
+    let folder = crate::ingest::clean_path([title.as_str()]).ok();
+    let tasks: Vec<crate::ingest::Task> = entries
+        .into_iter()
+        .filter(|entry| !entry.archive_id.as_ref().is_some_and(|id| archive.is_some_and(|archive| archive.contains(id))))
+        .map(|entry| crate::ingest::Task {
+            urls: vec![entry.url],
+            folder: folder.clone(),
+            media_name: Some(LIST_ENTRY_NAME.to_string()),
+            ..Default::default()
+        })
+        .collect();
+    if tasks.is_empty() {
+        tracing::info!("Nothing new in {title}: its {listed} item(s) were downloaded before");
+    }
+    tasks
+}
+
+/// The line of the download archive for what yt-dlp found (`extractor_key`) or lists (`ie_key`)
+/// under `id`, as yt-dlp's `--download-archive` writes it: `<extractor in lower case> <id>`.
+fn archive_id(info: &Value) -> Option<String> {
+    let extractor = info["extractor_key"].as_str().or_else(|| info["ie_key"].as_str())?;
+    Some(format!("{} {}", extractor.to_lowercase(), info["id"].as_str()?))
+}
+
+/// The download archive: a line (see [`archive_id`]) for every media download that finished,
+/// which a listing with `only_new` leaves out. It is in the app data folder, or where
+/// `ENDO_ARCHIVE_PATH` says. yt-dlp is never given it: it would skip a video asked for again.
+fn archive_file() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("ENDO_ARCHIVE_PATH") {
+        return Some(PathBuf::from(path));
+    }
+    // Unit tests never touch the user's archive.
+    if cfg!(test) {
+        return Some(std::env::temp_dir().join(format!("hf-unit-archive-{}.txt", std::process::id())));
+    }
+    Some(app_data_dir()?.join("download-archive.txt"))
+}
+
+/// The lines of the download archive `file`; none before it exists. Blocking.
+fn read_archive(file: &Path) -> Result<HashSet<String>, String> {
+    match std::fs::read(file) {
+        Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(HashSet::new()),
+        Err(e) => Err(format!("Cannot read the download archive {}: {e}", file.display())),
+    }
+}
+
+/// The line `line` (see [`archive_id`]) of a download whose file is `path`, for the download
+/// archive; `new` says the download made the file. A file that was there already is taken for
+/// this video only when its name holds the video's id, as a list entry's does (see
+/// [`LIST_ENTRY_NAME`]): one named by its title alone may be another video's of the same title,
+/// and the line would leave this one out of every later listing.
+fn archive_line(line: String, path: &Path, new: bool) -> Option<String> {
+    let id = line.split_once(' ').map_or("", |(_, id)| id);
+    let named = path.file_stem().is_some_and(|stem| stem.to_string_lossy().contains(&format!("[{id}]")));
+    (new || named).then_some(line)
+}
+
+/// Adds the lines `ids` to the download archive `file`, each once, under the lock of
+/// `<file>.lock`, which every process adding to it takes (see `history::lock_file`). A line a
+/// crash cut short stays a line of its own, which matches nothing. Blocking.
+fn record_archive(file: &Path, ids: &[String]) -> std::io::Result<()> {
+    use std::io::Write;
+    let _lock = crate::history::lock_file(file)?;
+    let known = match std::fs::read(file) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e),
+    };
+    let known = String::from_utf8_lossy(&known);
+    let mut lines: HashSet<&str> = known.lines().map(str::trim).collect();
+    let mut added = String::new();
+    for id in ids.iter().filter(|id| lines.insert(id.as_str())) {
+        added.push_str(id);
+        added.push('\n');
+    }
+    if added.is_empty() {
+        return Ok(());
+    }
+    if !known.is_empty() && !known.ends_with('\n') {
+        added.insert(0, '\n');
+    }
+    std::fs::OpenOptions::new().create(true).append(true).open(file)?.write_all(added.as_bytes())
+}
+
+/// Adds `ids`, of a media download that finished, to the download archive `file`, if there is
+/// one (see [`record_archive`]). A failure is only logged: the download itself succeeded.
+async fn archive_downloaded(file: Option<&Path>, ids: Vec<String>) {
+    let Some(file) = file.map(Path::to_path_buf).filter(|_| !ids.is_empty()) else { return };
+    let recorded = tokio::task::spawn_blocking(move || record_archive(&file, &ids)).await;
+    if let Err(e) = recorded.map_err(|e| e.to_string()).and_then(|r| r.map_err(|e| e.to_string())) {
+        tracing::warn!("Could not add to the download archive: {e}");
+    }
 }
 
 fn exe_name(base: &str) -> String {
@@ -1303,6 +1794,9 @@ enum RunKind {
     Find,
     /// Downloads and post-processes, printing progress for [`OutputState`].
     Download,
+    /// Lists a playlist (`-J --flat-playlist`), a video link's too (`--yes-playlist`), with only
+    /// its newest items when given them (see [`list`]).
+    List(Option<(ListKind, usize)>),
 }
 
 /// Whether a Download run with `options` asks YouTube for its formats in fragments (see
@@ -1327,6 +1821,8 @@ fn loads_found(info: &Value, options: &MediaDownloadOptions) -> bool {
 #[derive(Debug, Clone, Copy)]
 enum Source<'a> {
     Url(&'a Url),
+    /// Several links, each extracted in turn (a List run's).
+    Urls(&'a [Url]),
     /// What an extraction found (its `-J` output), downloaded as it is (`--load-info-json`).
     Info(&'a Path),
 }
@@ -1349,16 +1845,17 @@ fn build_ytdlp_args(
         // can run arbitrary commands via --exec and would break our output parsing.
         "--ignore-config",
         "--no-colors",
-        // Only affects URLs that name both a video and a playlist (watch?v=..&list=..).
-        // A URL that is only a playlist is still downloaded as one.
-        "--no-playlist",
+        // Only affects URLs that name both a video and a playlist (watch?v=..&list=..): the one
+        // video, unless the playlist is listed. A URL that is only a playlist is still
+        // downloaded as one.
+        if matches!(kind, RunKind::List(_)) { "--yes-playlist" } else { "--no-playlist" },
     ]
     .map(String::from)
     .to_vec();
     let kind_args: &[&str] = match kind {
         // A playlist comes back as a list of links, not every video extracted: it goes to a
-        // Download run anyway.
-        RunKind::Extract => &["-J", "--flat-playlist"],
+        // Download run anyway, or is listed.
+        RunKind::Extract | RunKind::List(_) => &["-J", "--flat-playlist"],
         RunKind::Find => &["-J", "--flat-playlist", "--ies", "default,-generic"],
         RunKind::Download => &[
             "--newline",
@@ -1373,6 +1870,8 @@ fn build_ytdlp_args(
             POSTPROCESS_TEMPLATE,
             "--print",
             PATH_TEMPLATE,
+            "--print",
+            ARCHIVE_TEMPLATE,
             // No --http-chunk-size: a file then streams in one response instead of one request per
             // chunk, each a round trip of idle connection. YouTube asks for 10 MiB requests itself
             // (the format's `http_chunk_size`), which a global chunk size would override.
@@ -1381,6 +1880,13 @@ fn build_ytdlp_args(
         ],
     };
     args.extend(kind_args.iter().map(|a| a.to_string()));
+    // yt-dlp reads no further into a channel than its newest; a playlist it reads whole.
+    if let Some(newest) = match kind {
+        RunKind::List(Some((list, n))) => list.newest(n),
+        _ => None,
+    } {
+        args.extend(["--playlist-items".to_string(), newest]);
+    }
     if kind == RunKind::Download && fragments_youtube(options) {
         args.extend(YOUTUBE_DASHY.map(String::from));
     }
@@ -1404,6 +1910,7 @@ fn build_ytdlp_args(
     args.extend(["-o".to_string(), options.output_dir.join(file_template).to_string_lossy().to_string()]);
     match source {
         Source::Url(url) => args.push(url.to_string()),
+        Source::Urls(urls) => args.extend(urls.iter().map(Url::to_string)),
         // yt-dlp neither extracts the video again nor picks up the formats' URLs anew, unless
         // their download fails: it then extracts from the video's page.
         Source::Info(file) => args.extend(["--load-info-json".to_string(), file.to_string_lossy().into_owned()]),
@@ -1491,6 +1998,9 @@ impl ProgressTracker {
 struct OutputState {
     tracker: ProgressTracker,
     final_path: Option<PathBuf>,
+    /// The download archive's line of each video (see [`archive_id`]), and whether the run made
+    /// its file (see [`archive_line`]).
+    archive: Vec<(String, bool)>,
     errors: Vec<String>,
     stderr_tail: VecDeque<String>,
 }
@@ -1513,6 +2023,15 @@ impl OutputState {
         if let Some(path) = line.strip_prefix(PATH_MARK) {
             // With --no-playlist this is the only file, otherwise the playlist's last one.
             self.final_path = Some(PathBuf::from(path));
+            return None;
+        }
+        if let Some(made) = line.strip_prefix(ARCHIVE_MARK) {
+            // Missing fields print as "NA"; a yt-dlp that no longer says whether it made the file
+            // is taken to have made it.
+            let (new, video) = made.split_once(' ')?;
+            if let Some((extractor, id)) = video.split_once(' ').filter(|(extractor, id)| ![*extractor, *id].contains(&"NA")) {
+                self.archive.push((format!("{} {id}", extractor.to_lowercase()), new != "False"));
+            }
             return None;
         }
         if !from_stderr || line.trim().is_empty() {
@@ -1709,12 +2228,13 @@ fn ytdlp_command(bin: &Path, args: &[String], proxy: Option<&str>, work_dir: &Pa
     cmd
 }
 
-/// Run yt-dlp once and return the file it produced.
+/// Run yt-dlp once and return the file it produced, with the download archive's line of each
+/// video in it and whether the run made its file (see [`OutputState::archive`]).
 async fn run_ytdlp(
     mut cmd: Command,
     progress_tx: Option<&Sender<ProgressUpdate>>,
     cancel_flag: Option<Arc<AtomicBool>>,
-) -> Result<PathBuf, String> {
+) -> Result<(PathBuf, Vec<(String, bool)>), String> {
     let mut child = cmd.spawn().map_err(|e| {
         format!("Failed to spawn yt-dlp ({}): {e}", Path::new(cmd.as_std().get_program()).display())
     })?;
@@ -1763,7 +2283,7 @@ async fn run_ytdlp(
     }
     let path = state.final_path.ok_or("yt-dlp finished without reporting an output file")?;
     match tokio::fs::metadata(&path).await {
-        Ok(meta) if meta.is_file() => Ok(path),
+        Ok(meta) if meta.is_file() => Ok((path, state.archive)),
         _ => Err(format!("yt-dlp reported {} but no such file exists", path.display())),
     }
 }
@@ -1771,7 +2291,14 @@ async fn run_ytdlp(
 /// Runs a [`tree_command`] to the end and returns its standard output, or the errors it printed
 /// when it fails. Cancelling kills its process tree and waits for it to exit, so nothing it had
 /// open (ffmpeg's output) is held any more once this returns.
-async fn run_to_end(mut cmd: Command, cancel_flag: Option<Arc<AtomicBool>>) -> Result<Vec<u8>, String> {
+async fn run_to_end(cmd: Command, cancel_flag: Option<Arc<AtomicBool>>) -> Result<Vec<u8>, String> {
+    let (stdout, ran) = run_captured(cmd, cancel_flag).await?;
+    ran.map(|()| stdout)
+}
+
+/// [`run_to_end`], with the standard output of a run that failed too: the second part is its
+/// errors then. Fails itself only when the program cannot be run, or is cancelled.
+async fn run_captured(mut cmd: Command, cancel_flag: Option<Arc<AtomicBool>>) -> Result<(Vec<u8>, Result<(), String>), String> {
     let program = Path::new(cmd.as_std().get_program()).display().to_string();
     let mut child = cmd.spawn().map_err(|e| format!("Failed to spawn {program}: {e}"))?;
     let mut tree = ProcessTree::attach(&child);
@@ -1793,7 +2320,7 @@ async fn run_to_end(mut cmd: Command, cancel_flag: Option<Arc<AtomicBool>>) -> R
     };
     tree.disarm();
     if status.success() {
-        return Ok(stdout);
+        return Ok((stdout, Ok(())));
     }
     let stderr = String::from_utf8_lossy(&stderr);
     let lines: Vec<&str> = stderr.lines().filter(|l| !l.trim().is_empty()).collect();
@@ -1809,10 +2336,10 @@ async fn run_to_end(mut cmd: Command, cancel_flag: Option<Arc<AtomicBool>>) -> R
         .flatten()
         .collect();
     if !errors.is_empty() {
-        return Err(errors.join("\n"));
+        return Ok((stdout, Err(errors.join("\n"))));
     }
     let tail = &lines[lines.len().saturating_sub(STDERR_TAIL_LINES)..];
-    Err(format!("{program} exited with {status}: {}", tail.join("\n")))
+    Ok((stdout, Err(format!("{program} exited with {status}: {}", tail.join("\n")))))
 }
 
 /// One stream of a media download, which the engine fetches itself (see [`fast_download`]).
@@ -2592,16 +3119,34 @@ async fn find_with(
     tools: &Tools<'_>,
     cancel_flag: Option<Arc<AtomicBool>>,
 ) -> Result<Extracted, String> {
+    let (json, ran) = run_extraction(std::slice::from_ref(url), options, tools, RunKind::Find, cancel_flag).await?;
+    ran.map(|()| Extracted(json))
+}
+
+/// What a yt-dlp run of `kind` (a Find or a List) finds at `urls`: its `-J` output, a line for
+/// each, and its errors when it failed at any (see [`run_captured`]). Paths in `options` must be
+/// absolute.
+async fn run_extraction(
+    urls: &[Url],
+    options: &MediaDownloadOptions,
+    tools: &Tools<'_>,
+    kind: RunKind,
+    cancel_flag: Option<Arc<AtomicBool>>,
+) -> Result<(Vec<u8>, Result<(), String>), String> {
     let ffmpeg_dir = tools.ffmpeg.as_deref().and_then(Path::parent);
     let version = ytdlp_version(&tools.ytdlp, &tools.work_dir, tools.version_cache.as_deref()).await;
     let cookies = tools.cookies.for_run(&options.cookies).await;
-    let args = build_ytdlp_args(Source::Url(url), options, RunKind::Find, &cookies.args, ffmpeg_dir, tools.js_runtime.as_deref(), version.as_deref());
-    let found = run_to_end(ytdlp_command(&tools.ytdlp, &args, options.proxy.as_deref(), &tools.work_dir), cancel_flag.clone()).await;
+    let args = build_ytdlp_args(Source::Urls(urls), options, kind, &cookies.args, ffmpeg_dir, tools.js_runtime.as_deref(), version.as_deref());
+    let found = run_captured(ytdlp_command(&tools.ytdlp, &args, options.proxy.as_deref(), &tools.work_dir), cancel_flag.clone()).await;
     if !is_cancelled(&cancel_flag) {
         // A link no site takes says nothing of the cookies: none was sent.
-        cookies.finish(found.as_ref().err().is_none_or(|e| e.contains(NO_SITE))).await;
+        let failed = match &found {
+            Ok((_, ran)) => ran.as_ref().err(),
+            Err(e) => Some(e),
+        };
+        cookies.finish(failed.is_none_or(|e| e.contains(NO_SITE))).await;
     }
-    found.map(Extracted)
+    found
 }
 
 /// What a media download fails with when yt-dlp finds the video DRM-protected (see
@@ -2666,6 +3211,7 @@ async fn prepare(
         js_runtime,
         work_dir,
         version_cache: version_cache_file(),
+        archive: archive_file(),
         cookies: &BROWSER_COOKIES,
     };
     Ok((options, tools))
@@ -2682,6 +3228,8 @@ struct Tools<'a> {
     work_dir: PathBuf,
     /// See [`ytdlp_version`].
     version_cache: Option<PathBuf>,
+    /// See [`archive_file`].
+    archive: Option<PathBuf>,
     cookies: &'a BrowserCookies,
 }
 
@@ -2731,6 +3279,12 @@ async fn download_with(
                 match serde_json::from_slice::<Value>(&json) {
                     Err(e) => tracing::info!("Leaving {url} to yt-dlp: yt-dlp -J: {e}"),
                     Ok(info) => {
+                        // Whether the engine makes the file, or finds it there (see `fast_download`).
+                        let planned = info["requested_downloads"][0]["filename"].as_str().map(PathBuf::from);
+                        let there = match planned {
+                            Some(file) => tokio::fs::metadata(file).await.is_ok_and(|m| m.is_file()),
+                            None => false,
+                        };
                         let made = match fast {
                             Some(fetch) => {
                                 fast_download(&info, options, tools.ffmpeg.as_deref(), progress_tx.as_ref(), &cancel_flag, fetch).await
@@ -2738,7 +3292,11 @@ async fn download_with(
                             None => Err(FastError::Unsupported("yt-dlp converts the audio itself".to_string())),
                         };
                         match made {
-                            Ok(path) => return Ok(path),
+                            Ok(path) => {
+                                let line = archive_id(&info).and_then(|line| archive_line(line, &path, !there));
+                                archive_downloaded(tools.archive.as_deref(), line.into_iter().collect()).await;
+                                return Ok(path);
+                            }
                             Err(_) if is_cancelled(&cancel_flag) => return Err(CANCELLED.to_string()),
                             // yt-dlp would write the very file the other job is making.
                             Err(FastError::Busy(e)) => return Err(e),
@@ -2764,10 +3322,12 @@ async fn download_with(
             result
         };
         let err = match result {
-            Ok(path) => {
+            Ok((path, made)) => {
                 if fast.is_some() {
                     remove_streams_after(&path).await;
                 }
+                let lines = made.into_iter().filter_map(|(line, new)| archive_line(line, &path, new)).collect();
+                archive_downloaded(tools.archive.as_deref(), lines).await;
                 return Ok(path);
             }
             Err(err) => err,
@@ -4340,7 +4900,8 @@ mod tests {
     }
 
     /// A stand-in for yt-dlp that works in `dir`. `-J` prints `dir/info.json`, or fails as an
-    /// extractor does while `dir/extract-error` exists; a download writes `output` and reports it.
+    /// extractor does while `dir/extract-error` exists; a download writes `output` and reports it,
+    /// as Vimeo's video 76979871.
     /// Each run adds a line to `dir/runs.txt`: `extract`, or `download url` / `download info`, the
     /// latter for `--load-info-json`, whose file it copies to `dir/loaded.json`.
     fn fake_ytdlp(dir: &Path, output: &Path) -> PathBuf {
@@ -4363,6 +4924,7 @@ mod tests {
                  if not exist \"{out_dir}\" mkdir \"{out_dir}\"\r\n\
                  >\"{out_s}\" echo video\r\n\
                  echo HFPATH {out_s}\r\n\
+                 echo HFARCHIVE True Vimeo 76979871\r\n\
                  exit /b 0\r\n\
                  :extract\r\n\
                  >>\"{dir_s}\\runs.txt\" echo extract\r\n\
@@ -4390,7 +4952,8 @@ mod tests {
                  echo \"download $source\" >> '{dir_s}/runs.txt'\n\
                  mkdir -p '{out_dir}'\n\
                  echo video > '{out_s}'\n\
-                 echo 'HFPATH {out_s}'\n"
+                 echo 'HFPATH {out_s}'\n\
+                 echo 'HFARCHIVE True Vimeo 76979871'\n"
             ),
         );
         std::fs::write(&bin, script).unwrap();
@@ -4421,6 +4984,7 @@ mod tests {
             js_runtime: None,
             work_dir: dir.to_path_buf(),
             version_cache: None,
+            archive: None,
             cookies,
         };
         let options = MediaDownloadOptions { output_dir: out, ..Default::default() };
@@ -4646,6 +5210,7 @@ mod tests {
             js_runtime: None,
             work_dir: dir.path().to_path_buf(),
             version_cache: None,
+            archive: None,
             cookies: &cookies,
         };
         let fetch: &StreamFetcher<'_> = &|_, _, _| panic!("yt-dlp downloads DASH fragments");
@@ -4843,6 +5408,641 @@ mod tests {
             "yt-dlp took over 45s",
         ] {
             assert!(!site_failed(none_took_it), "{none_took_it}");
+        }
+    }
+
+    // ---- Playlists and channels ---------------------------------------------------------------
+
+    #[test]
+    fn lists_are_told_by_their_links() {
+        use ListKind::{Playlist, Ranked, Uploads};
+        let lists_of = [
+            ("https://www.youtube.com/playlist?list=PLbpi6ZahtOH6Blw3RGYpWkSByi_T7Rygb", Playlist),
+            // A channel's "Play all": its uploads, videos or shorts newest first, its popular
+            // ones most viewed first.
+            ("https://www.youtube.com/playlist?list=UULA_DiR1FfKNvjuUpBHmylQ", Uploads),
+            ("https://www.youtube.com/playlist?list=UULFLA_DiR1FfKNvjuUpBHmylQ", Uploads),
+            ("https://www.youtube.com/watch?v=IwZVXmQdX1E&list=UUSHLA_DiR1FfKNvjuUpBHmylQ", Uploads),
+            ("https://www.youtube.com/playlist?list=UULPLA_DiR1FfKNvjuUpBHmylQ", Ranked),
+            ("https://www.youtube.com/playlist?list=UUPSLA_DiR1FfKNvjuUpBHmylQ", Ranked),
+            ("https://music.youtube.com/playlist?list=OLAK5uy_kX", Playlist),
+            ("https://www.youtube.com/watch?v=jNQXAC9IVRw&list=PLbpi6ZahtOH6Blw3RGYpWkSByi_T7Rygb", Playlist),
+            ("https://youtu.be/jNQXAC9IVRw?list=PLbpi6ZahtOH6Blw3RGYpWkSByi_T7Rygb", Playlist),
+            ("https://www.youtube.com/@NASA", Uploads),
+            ("https://m.youtube.com/@NASA/videos", Uploads),
+            ("https://www.youtube.com/@NASA/shorts", Uploads),
+            ("https://www.youtube.com/@NASA/streams/", Uploads),
+            ("https://www.youtube.com/channel/UCLA_DiR1FfKNvjuUpBHmylQ", Uploads),
+            ("https://www.youtube.com/c/NASA/videos", Uploads),
+            ("https://www.youtube.com/user/NASAtelevision", Uploads),
+            ("https://soundcloud.com/forss", Uploads),
+            ("https://soundcloud.com/forss/tracks", Uploads),
+            ("https://soundcloud.com/forss/sets/soulhack", Playlist),
+            ("https://soundcloud.com/forss/sets/demos/s-AbCdE", Playlist),
+            ("https://c418.bandcamp.com/", Uploads),
+            ("https://c418.bandcamp.com/music", Uploads),
+            ("https://c418.bandcamp.com/album/minecraft-volume-alpha", Playlist),
+            ("https://vimeo.com/showcase/7926539", Playlist),
+            ("https://vimeo.com/album/2632481", Playlist),
+            ("https://vimeo.com/channels/staffpicks", Uploads),
+            ("https://vimeo.com/groups/motion", Uploads),
+            ("https://vimeo.com/nkistudio/videos", Uploads),
+            ("https://www.twitch.tv/nasa/videos?filter=archives", Uploads),
+            ("https://www.twitch.tv/nasa/videos?filter=all&sort=views", Ranked),
+            ("https://www.twitch.tv/nasa/videos?filter=clips&range=all", Ranked),
+            ("https://www.twitch.tv/nasa/clips", Ranked),
+            ("https://www.twitch.tv/collections/wlDCoH0zEBZZbQ", Playlist),
+            ("https://soundcloud.com/discover/sets/charts-top:all-music", Playlist),
+        ];
+        for (link, kind) in lists_of {
+            assert_eq!(list_kind(&Url::parse(link).unwrap()), Some(kind), "{link}");
+        }
+        for one in [
+            "https://www.youtube.com/watch?v=jNQXAC9IVRw",
+            "https://youtu.be/jNQXAC9IVRw",
+            "https://www.youtube.com/shorts/myZ9kn9MIWQ",
+            "https://www.youtube.com/@NASA/live",
+            "https://www.youtube.com/channel/UCLA_DiR1FfKNvjuUpBHmylQ/live",
+            // Each of a channel's playlists is a list of its own.
+            "https://www.youtube.com/@NASA/playlists",
+            "https://www.youtube.com/playlist",
+            "https://soundcloud.com/forss/city-ports",
+            // SoundCloud's own pages.
+            "https://soundcloud.com/discover",
+            "https://soundcloud.com/charts",
+            "https://soundcloud.com/stream",
+            "https://soundcloud.com/search?q=forss",
+            "https://soundcloud.com/you/likes",
+            "https://c418.bandcamp.com/track/key",
+            "https://bandcamp.com/",
+            "https://vimeo.com/76979871",
+            "https://vimeo.com/channels/staffpicks/76979871",
+            "https://www.twitch.tv/videos/12345678",
+            "https://www.twitch.tv/nasa/clip/AwkwardHelplessSalamander",
+            "https://example.com/playlist?list=1",
+        ] {
+            assert!(!lists(&Url::parse(one).unwrap()), "{one}");
+        }
+        let in_playlist = |link| video_in_playlist(&Url::parse(link).unwrap());
+        assert!(in_playlist("https://www.youtube.com/watch?v=jNQXAC9IVRw&list=PL1"));
+        assert!(in_playlist("https://youtu.be/jNQXAC9IVRw?list=PL1"));
+        assert!(!in_playlist("https://www.youtube.com/playlist?list=PL1"));
+        assert!(!in_playlist("https://www.youtube.com/watch?list=PL1"));
+        assert!(!in_playlist("https://www.youtube.com/watch?v=jNQXAC9IVRw&list="));
+
+        // A SoundCloud user's own tracks, not their stream of reposts.
+        let listed = |link| list_url(&Url::parse(link).unwrap()).to_string();
+        assert_eq!(listed("https://soundcloud.com/forss"), "https://soundcloud.com/forss/tracks");
+        assert_eq!(listed("https://m.soundcloud.com/forss/?ref=x"), "https://m.soundcloud.com/forss/tracks?ref=x");
+        for kept in ["https://soundcloud.com/forss/reposts", "https://soundcloud.com/forss/sets/soulhack", "https://c418.bandcamp.com/"] {
+            assert_eq!(listed(kept), kept);
+        }
+    }
+
+    #[test]
+    fn a_list_ranked_by_views_has_no_newest() {
+        assert_eq!(ListKind::Uploads.newest(5).as_deref(), Some(":5"));
+        assert_eq!(ListKind::Playlist.newest(5).as_deref(), Some("-5:"));
+        assert_eq!(ListKind::Ranked.newest(5), None);
+    }
+
+    #[tokio::test]
+    async fn a_video_link_naming_its_playlist_is_the_video_unless_the_playlist_is_asked_for() {
+        let url = Url::parse("https://www.youtube.com/watch?v=jNQXAC9IVRw&list=PLbpi6ZahtOH6Blw3RGYpWkSByi_T7Rygb").unwrap();
+        // Told apart before yt-dlp is asked anything.
+        assert_eq!(list(&reqwest::Client::new(), &url, &crate::ingest::ListOptions::default()).await, None);
+    }
+
+    // What yt-dlp 2026.08.19 printed (`-J --flat-playlist`) for these lists, shortened to their
+    // first entries and the fields a listing reads.
+
+    /// NASA's channel page (`/@NASA`): its tabs come as lists of their own, the live one with
+    /// streams that are live or still to come.
+    const NASA_CHANNEL: &str = r#"{"_type": "playlist", "id": "@NASA", "title": "NASA", "extractor_key": "YoutubeTab", "webpage_url": "https://www.youtube.com/@NASA", "entries": [{"_type": "playlist", "id": "UCLA_DiR1FfKNvjuUpBHmylQ", "title": "NASA - Videos", "extractor_key": "YoutubeTab", "webpage_url": "https://www.youtube.com/@NASA/videos", "entries": [{"_type": "url", "ie_key": "Youtube", "id": "IwZVXmQdX1E", "title": "NASA Moon Base: The First Six Months", "url": "https://www.youtube.com/watch?v=IwZVXmQdX1E"}, {"_type": "url", "ie_key": "Youtube", "id": "90Kgw_SvK4w", "title": "What It Takes", "url": "https://www.youtube.com/watch?v=90Kgw_SvK4w"}, {"_type": "url", "ie_key": "Youtube", "id": "jHKf1eHp3eQ", "title": "Artemis III: Our Next Step Back to the Moon", "url": "https://www.youtube.com/watch?v=jHKf1eHp3eQ"}, {"_type": "url", "ie_key": "Youtube", "id": "MVt2139voxk", "title": "For Earth, With Love: Artemis II", "url": "https://www.youtube.com/watch?v=MVt2139voxk"}]}, {"_type": "playlist", "id": "UCLA_DiR1FfKNvjuUpBHmylQ", "title": "NASA - Live", "extractor_key": "YoutubeTab", "webpage_url": "https://www.youtube.com/@NASA/streams", "entries": [{"_type": "url", "ie_key": "Youtube", "id": "j9epFget1W8", "title": "Space Station Operations Update (Sept. 28, 2026)", "url": "https://www.youtube.com/watch?v=j9epFget1W8", "live_status": "is_upcoming"}, {"_type": "url", "ie_key": "Youtube", "id": "M3HKLzjvKPc", "title": "Live Video from the International Space Station (Official NASA Stream)", "url": "https://www.youtube.com/watch?v=M3HKLzjvKPc", "live_status": "is_live"}, {"_type": "url", "ie_key": "Youtube", "id": "awQzjn72bI0", "title": "Live High-Definition Views from the International Space Station (Official NASA Stream)", "url": "https://www.youtube.com/watch?v=awQzjn72bI0", "live_status": "is_live"}, {"_type": "url", "ie_key": "Youtube", "id": "v03RjDNwG1o", "title": "Progress 96 Cargo Ship Docking", "url": "https://www.youtube.com/watch?v=v03RjDNwG1o", "live_status": "was_live"}]}, {"_type": "playlist", "id": "UCLA_DiR1FfKNvjuUpBHmylQ", "title": "NASA - Shorts", "extractor_key": "YoutubeTab", "webpage_url": "https://www.youtube.com/@NASA/shorts", "entries": [{"_type": "url", "ie_key": "Youtube", "id": "myZ9kn9MIWQ", "title": "2026 Solar Eclipse @ 50,000 Feet", "url": "https://www.youtube.com/shorts/myZ9kn9MIWQ"}, {"_type": "url", "ie_key": "Youtube", "id": "QP5Fs3AYuWE", "title": "2026 Total Solar Eclipse Over Spain", "url": "https://www.youtube.com/shorts/QP5Fs3AYuWE"}]}]}"#;
+
+    /// A YouTube playlist, as the video link `watch?v=jNQXAC9IVRw&list=...` lists it.
+    const YOUTUBE_PLAYLIST: &str = r#"{"_type": "playlist", "id": "PLbpi6ZahtOH6Blw3RGYpWkSByi_T7Rygb", "title": "Top Trending Videos of the Week", "extractor_key": "YoutubeTab", "webpage_url": "https://www.youtube.com/playlist?list=PLbpi6ZahtOH6Blw3RGYpWkSByi_T7Rygb", "entries": [{"_type": "url", "ie_key": "Youtube", "id": "Vh4O04Bpovw", "title": "I Explored A $200,000,000 Forgotten Space Colony", "url": "https://www.youtube.com/watch?v=Vh4O04Bpovw"}, {"_type": "url", "ie_key": "Youtube", "id": "5TIp7oVKHq8", "title": "I spent a day with REALITY TV STARS", "url": "https://www.youtube.com/watch?v=5TIp7oVKHq8"}, {"_type": "url", "ie_key": "Youtube", "id": "7u43Zlj9KK8", "title": "I Surprised Him With His Least Favorite TikToker", "url": "https://www.youtube.com/watch?v=7u43Zlj9KK8"}]}"#;
+
+    /// A Bandcamp artist's page: its albums, as links.
+    const BANDCAMP_ARTIST: &str = r#"{"_type": "playlist", "id": "c418", "title": "Discography of c418", "extractor_key": "BandcampUser", "webpage_url": "https://c418.bandcamp.com/", "entries": [{"_type": "url", "url": "https://c418.bandcamp.com/album/wanderstop-fm"}, {"_type": "url", "url": "https://c418.bandcamp.com/album/wanderstop"}]}"#;
+
+    /// The first album on it.
+    const BANDCAMP_ALBUM: &str = r#"{"_type": "playlist", "id": "wanderstop-fm", "title": "Wanderstop FM", "extractor_key": "BandcampAlbum", "webpage_url": "https://c418.bandcamp.com/album/wanderstop-fm", "entries": [{"_type": "url", "ie_key": "Bandcamp", "id": "1351701690", "title": "Channel Whisker", "url": "https://c418.bandcamp.com/track/channel-whisker"}, {"_type": "url", "ie_key": "Bandcamp", "id": "1673215387", "title": "Litter Jitter", "url": "https://c418.bandcamp.com/track/litter-jitter"}, {"_type": "url", "ie_key": "Bandcamp", "id": "4287597695", "title": "Backyard Jumble", "url": "https://c418.bandcamp.com/track/backyard-jumble"}]}"#;
+
+    /// A SoundCloud user's page: tracks, and a set as a link.
+    const SOUNDCLOUD_USER: &str = r#"{"_type": "playlist", "id": "183", "title": "Forss (All)", "extractor_key": "SoundcloudUser", "webpage_url": "https://soundcloud.com/forss", "entries": [{"_type": "url", "ie_key": "Soundcloud", "id": "49438146", "title": "Lux Aeterna", "url": "https://soundcloud.com/forss/lux-aeterna"}, {"_type": "url", "ie_key": "Soundcloud", "id": "49437906", "title": "Veniam", "url": "https://soundcloud.com/forss/veniam"}, {"_type": "url", "id": "2050462", "title": "Ecclesia Inspiration", "url": "https://soundcloud.com/forss/sets/ecclesia-inspiration"}]}"#;
+
+    /// That set.
+    const SOUNDCLOUD_SET: &str = r#"{"_type": "playlist", "id": "2050462", "title": "Ecclesia Inspiration", "extractor_key": "SoundcloudSet", "webpage_url": "https://soundcloud.com/forss/sets/ecclesia-inspiration", "entries": [{"_type": "url_transparent", "ie_key": "Soundcloud", "id": "28301249", "url": "https://soundcloud.com/truro-cathedral/1-durufl-introit-and-kyrie"}, {"_type": "url_transparent", "ie_key": "Soundcloud", "id": "28301273", "url": "https://soundcloud.com/truro-cathedral/21-durufl-in-paradisum"}]}"#;
+
+    /// The links of a List run, and the newest items it asked for.
+    type Run = (Vec<String>, Option<(ListKind, usize)>);
+    type Asked = std::sync::Mutex<Vec<Run>>;
+
+    /// yt-dlp as `answers` (a link and what yt-dlp printed for it) record it; a link without an
+    /// answer fails as a site does. Notes the links of each run in `asked`, with the newest items
+    /// asked for.
+    fn recorded<'a, L: AsRef<str>, J: AsRef<str>>(
+        answers: &'a [(L, J)],
+        asked: &'a Asked,
+    ) -> impl Fn(Vec<Url>, Option<(ListKind, usize)>) -> std::future::Ready<ListRun> + 'a {
+        move |urls, newest| {
+            asked.lock().unwrap().push((urls.iter().map(Url::to_string).collect(), newest));
+            let each = urls.iter().map(|url| match answers.iter().find(|(link, _)| link.as_ref() == url.as_str()) {
+                Some((_, json)) => Ok(serde_json::from_str(json.as_ref()).unwrap()),
+                None => Err(format!("ERROR: [fake] {url}: Unable to download webpage: HTTP Error 404: Not Found")),
+            });
+            std::future::ready(Ok(each.collect()))
+        }
+    }
+
+    /// The runs `asked` noted.
+    fn runs(asked: &Asked) -> Vec<Run> {
+        asked.lock().unwrap().clone()
+    }
+
+    fn ids(entries: &[ListEntry]) -> Vec<&str> {
+        entries.iter().map(|e| e.archive_id.as_deref().unwrap_or(e.url.as_str())).collect()
+    }
+
+    #[tokio::test]
+    async fn a_channel_lists_the_videos_of_its_tabs_in_order_without_live_streams() {
+        let url = Url::parse("https://www.youtube.com/@NASA").unwrap();
+        let (answers, asked) = ([(url.as_str(), NASA_CHANNEL)], Asked::default());
+        let (title, entries) = list_entries_of(&url, ListKind::Uploads, None, recorded(&answers, &asked)).await.unwrap().unwrap();
+        assert_eq!(title, "NASA");
+        let videos = ["youtube IwZVXmQdX1E", "youtube 90Kgw_SvK4w", "youtube jHKf1eHp3eQ", "youtube MVt2139voxk"];
+        let expected = [&videos[..], &["youtube v03RjDNwG1o", "youtube myZ9kn9MIWQ", "youtube QP5Fs3AYuWE"]].concat();
+        assert_eq!(ids(&entries), expected);
+        assert_eq!(entries[5].url.as_str(), "https://www.youtube.com/shorts/myZ9kn9MIWQ");
+        assert_eq!(runs(&asked), [(vec![url.to_string()], None)], "the tabs come with the channel");
+
+        // The newest three: no more of each tab is asked for, and the videos come first.
+        asked.lock().unwrap().clear();
+        let (_, entries) = list_entries_of(&url, ListKind::Uploads, Some(3), recorded(&answers, &asked)).await.unwrap().unwrap();
+        assert_eq!(ids(&entries), videos[..3]);
+        assert_eq!(runs(&asked), [(vec![url.to_string()], Some((ListKind::Uploads, 3)))]);
+    }
+
+    #[tokio::test]
+    async fn the_newest_of_a_playlist_are_its_last() {
+        let url = Url::parse("https://www.youtube.com/watch?v=jNQXAC9IVRw&list=PLbpi6ZahtOH6Blw3RGYpWkSByi_T7Rygb").unwrap();
+        let (answers, asked) = ([(url.as_str(), YOUTUBE_PLAYLIST)], Asked::default());
+        let (title, entries) = list_entries_of(&url, ListKind::Playlist, Some(2), recorded(&answers, &asked)).await.unwrap().unwrap();
+        assert_eq!(title, "Top Trending Videos of the Week");
+        assert_eq!(ids(&entries), ["youtube 5TIp7oVKHq8", "youtube 7u43Zlj9KK8"]);
+        assert_eq!(runs(&asked), [(vec![url.to_string()], Some((ListKind::Playlist, 2)))]);
+
+        // Most viewed first: every item, however few are asked for.
+        asked.lock().unwrap().clear();
+        let (_, entries) = list_entries_of(&url, ListKind::Ranked, Some(2), recorded(&answers, &asked)).await.unwrap().unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(runs(&asked), [(vec![url.to_string()], None)]);
+    }
+
+    #[tokio::test]
+    async fn the_lists_on_a_page_are_listed_in_their_place() {
+        let artist = Url::parse("https://c418.bandcamp.com/").unwrap();
+        let album = "https://c418.bandcamp.com/album/wanderstop-fm";
+        let (answers, asked) = ([(artist.as_str(), BANDCAMP_ARTIST), (album, BANDCAMP_ALBUM)], Asked::default());
+        let (title, entries) = list_entries_of(&artist, ListKind::Uploads, None, recorded(&answers, &asked)).await.unwrap().unwrap();
+        assert_eq!(title, "Discography of c418");
+        // An album that cannot be listed is downloaded as it is, where its failure shows.
+        let second = "https://c418.bandcamp.com/album/wanderstop";
+        assert_eq!(ids(&entries), ["bandcamp 1351701690", "bandcamp 1673215387", "bandcamp 4287597695", second]);
+        // The albums in one run.
+        assert_eq!(runs(&asked), [(vec![artist.to_string()], None), (vec![album.to_string(), second.to_string()], None)]);
+
+        // Enough of the newest from the first album: the second is not asked about.
+        asked.lock().unwrap().clear();
+        let (_, entries) = list_entries_of(&artist, ListKind::Uploads, Some(1), recorded(&answers, &asked)).await.unwrap().unwrap();
+        assert_eq!(ids(&entries), ["bandcamp 1351701690"]);
+        assert_eq!(runs(&asked), [(vec![artist.to_string()], Some((ListKind::Uploads, 1))), (vec![album.to_string()], None)]);
+
+        let user = Url::parse("https://soundcloud.com/forss").unwrap();
+        let set = "https://soundcloud.com/forss/sets/ecclesia-inspiration";
+        let answers = [(user.as_str(), SOUNDCLOUD_USER), (set, SOUNDCLOUD_SET)];
+        let (_, entries) = list_entries_of(&user, ListKind::Uploads, None, recorded(&answers, &Asked::default())).await.unwrap().unwrap();
+        assert_eq!(ids(&entries), ["soundcloud 49438146", "soundcloud 49437906", "soundcloud 28301249", "soundcloud 28301273"]);
+    }
+
+    /// A label's page of hundreds of albums: they are read many to a run, each run within its own
+    /// time, not one run for each, one after the other.
+    #[tokio::test]
+    async fn the_lists_on_a_page_are_read_many_to_a_run() {
+        let label = Url::parse("https://nuclearwarnowproductions.bandcamp.com/music").unwrap();
+        let albums: Vec<String> = (0..120).map(|n| format!("https://nuclearwarnowproductions.bandcamp.com/album/a{n}")).collect();
+        let page = serde_json::json!({
+            "_type": "playlist", "id": "label", "title": "Discography of label",
+            "entries": albums.iter().map(|album| serde_json::json!({"_type": "url", "url": album})).collect::<Vec<_>>(),
+        });
+        let mut answers = vec![(label.to_string(), page.to_string())];
+        for (n, album) in albums.iter().enumerate() {
+            let track = serde_json::json!({"_type": "url", "ie_key": "Bandcamp", "id": n.to_string(), "url": format!("{album}/t")});
+            answers.push((album.clone(), serde_json::json!({"_type": "playlist", "id": n.to_string(), "entries": [track]}).to_string()));
+        }
+        let asked = Asked::default();
+        let (_, entries) = list_entries_of(&label, ListKind::Uploads, None, recorded(&answers, &asked)).await.unwrap().unwrap();
+        let expected: Vec<String> = (0..120).map(|n| format!("bandcamp {n}")).collect();
+        assert_eq!(ids(&entries), expected);
+        let batches: Vec<usize> = runs(&asked).iter().map(|(links, _)| links.len()).collect();
+        assert_eq!(batches, [1, NESTED_BATCH, NESTED_BATCH, 120 - 2 * NESTED_BATCH]);
+
+        // A run that fails as a whole (took too long) keeps its albums, to download as they are.
+        let failing = |urls: Vec<Url>, newest| {
+            let listed = recorded(&answers, &asked)(urls.clone(), newest);
+            std::future::ready(if urls.len() > 1 && urls[0].as_str().ends_with("/a50") { Err(too_long("50 lists")) } else { listed.into_inner() })
+        };
+        let (_, entries) = list_entries_of(&label, ListKind::Uploads, None, failing).await.unwrap().unwrap();
+        assert_eq!(entries.len(), 120);
+        assert_eq!(ids(&entries[49..52]), ["bandcamp 49", albums[50].as_str(), albums[51].as_str()]);
+        assert_eq!(ids(&entries[100..101]), ["bandcamp 100"]);
+    }
+
+    /// What yt-dlp 2026.08.19 printed for three albums in one run (`-J --flat-playlist`), the
+    /// second of which does not exist, shortened to the fields a listing reads; it exited with 1.
+    const BANDCAMP_ALBUMS: &str = concat!(
+        r#"{"_type": "playlist", "id": "wanderstop-fm", "title": "Wanderstop FM", "extractor_key": "BandcampAlbum", "webpage_url": "https://c418.bandcamp.com/album/wanderstop-fm", "original_url": "https://c418.bandcamp.com/album/wanderstop-fm", "entries": [{"_type": "url", "ie_key": "Bandcamp", "id": "1351701690", "title": "Channel Whisker", "url": "https://c418.bandcamp.com/track/channel-whisker"}]}"#,
+        "\n",
+        "null\n",
+        r#"{"_type": "playlist", "id": "wanderstop", "title": "Wanderstop", "extractor_key": "BandcampAlbum", "webpage_url": "https://c418.bandcamp.com/album/wanderstop", "original_url": "https://c418.bandcamp.com/album/wanderstop", "entries": [{"_type": "url", "ie_key": "Bandcamp", "id": "2326690597", "title": "Introduction", "url": "https://c418.bandcamp.com/track/introduction"}]}"#,
+        "\n",
+    );
+
+    #[test]
+    fn a_run_of_many_lists_gives_what_it_printed_for_each() {
+        let urls: Vec<Url> = ["wanderstop-fm", "no-such-album-xyz", "wanderstop"]
+            .iter()
+            .map(|album| Url::parse(&format!("https://c418.bandcamp.com/album/{album}")).unwrap())
+            .collect();
+        let failure = "ERROR: [Bandcamp:album] no-such-album-xyz: Unable to download webpage: HTTP Error 404: Not Found";
+        let each = listed_each(&urls, BANDCAMP_ALBUMS.as_bytes(), Some(failure.to_string()));
+        assert_eq!(each.len(), 3);
+        assert_eq!(each[0].as_ref().map(|info| info["title"].clone()), Ok("Wanderstop FM".into()));
+        assert_eq!(each[1], Err(failure.to_string()));
+        assert_eq!(each[2].as_ref().map(|info| info["id"].clone()), Ok("wanderstop".into()));
+        // A run cut short gives nothing for the rest.
+        let each = listed_each(&urls, BANDCAMP_ALBUMS.lines().next().unwrap().as_bytes(), None);
+        assert!(each[0].is_ok());
+        assert_eq!(each[2], Err(format!("yt-dlp listed nothing for {}", urls[2])));
+    }
+
+    #[tokio::test]
+    async fn an_entry_listed_twice_is_downloaded_once() {
+        let url = Url::parse("https://www.youtube.com/playlist?list=PL1").unwrap();
+        let video = |id: &str| format!(r#"{{"_type": "url", "ie_key": "Youtube", "id": "{id}", "url": "https://www.youtube.com/watch?v={id}"}}"#);
+        let twice = format!(r#"{{"_type": "playlist", "id": "PL1", "entries": [{}, {}, {}]}}"#, video("a"), video("b"), video("a"));
+        let answers = [(url.as_str(), twice.as_str())];
+        let (title, entries) = list_entries_of(&url, ListKind::Playlist, None, recorded(&answers, &Asked::default())).await.unwrap().unwrap();
+        assert_eq!((title.as_str(), ids(&entries)), ("PL1", vec!["youtube a", "youtube b"]));
+    }
+
+    #[tokio::test]
+    async fn what_is_no_list_is_left_to_the_download_and_an_empty_list_is_an_error() {
+        let url = Url::parse("https://www.youtube.com/playlist?list=PL1").unwrap();
+        let listed = |answer: Result<&'static str, &'static str>| {
+            let url = url.clone();
+            async move {
+                let each = || vec![answer.map(|json| serde_json::from_str(json).unwrap()).map_err(str::to_string)];
+                let extract = |_, _| std::future::ready(Ok(each()));
+                list_entries_of(&url, ListKind::Playlist, None, extract).await
+            }
+        };
+        // One video after all, or a link no site of yt-dlp's takes: downloaded as it is.
+        assert_eq!(listed(Ok(r#"{"_type": "video", "id": "jNQXAC9IVRw", "extractor_key": "Youtube"}"#)).await, None);
+        assert_eq!(listed(Err("ERROR: No suitable extractor found for URL https://www.youtube.com/playlist?list=PL1")).await, None);
+        assert_eq!(listed(Err("ERROR: Unsupported URL: https://www.youtube.com/playlist?list=PL1")).await, None);
+        // The site's failure is the listing's.
+        let gone = "ERROR: [youtube:tab] PL1: The playlist does not exist.";
+        assert_eq!(listed(Err(gone)).await, Some(Err(gone.to_string())));
+        // As is a run that fails as a whole.
+        let slow = |_, _| std::future::ready(Err(too_long(url.as_str())));
+        let listing = list_entries_of(&url, ListKind::Playlist, None, slow).await;
+        assert_eq!(listing, Some(Err(too_long(url.as_str()))));
+        assert!(too_long(url.as_str()).contains("--latest"));
+        // As Bandcamp lists an artist that does not exist, and a tab of streams yet to come.
+        for empty in [
+            r#"{"_type": "playlist", "id": "PL1", "title": "Discography of ftlst", "entries": []}"#,
+            r#"{"_type": "playlist", "id": "PL1", "title": "Discography of ftlst", "entries": [{"_type": "url", "ie_key": "Youtube", "id": "j9epFget1W8", "url": "https://www.youtube.com/watch?v=j9epFget1W8", "live_status": "is_upcoming"}]}"#,
+        ] {
+            assert_eq!(listed(Ok(empty)).await, Some(Err("Nothing to download in Discography of ftlst".to_string())));
+        }
+    }
+
+    /// Each entry is named by its title and id, so two of one title (an album's "Intro", a
+    /// streamer's daily VODs) are two files in the list's folder; nothing new is nothing to do.
+    #[test]
+    fn only_new_items_are_listed_each_into_a_folder_named_after_the_list() {
+        let entry = |link: &str, id: Option<&str>| ListEntry { url: Url::parse(link).unwrap(), archive_id: id.map(str::to_string) };
+        let entries = || {
+            vec![
+                entry("https://www.youtube.com/watch?v=a", Some("youtube a")),
+                entry("https://www.youtube.com/watch?v=b", Some("youtube b")),
+                entry("https://c418.bandcamp.com/album/wanderstop", None),
+            ]
+        };
+        let title = || "Top 10: Trending/Week".to_string();
+        let archive: HashSet<String> = ["youtube b".to_string(), "youtube zz".to_string()].into();
+        let tasks = list_tasks((title(), entries()), Some(&archive));
+        let links: Vec<&str> = tasks.iter().map(|t| t.urls[0].as_str()).collect();
+        assert_eq!(links, ["https://www.youtube.com/watch?v=a", "https://c418.bandcamp.com/album/wanderstop"]);
+        for task in &tasks {
+            // yt-dlp names each file, by its title and id.
+            assert_eq!((task.folder.as_deref(), task.name.as_deref()), (Some(Path::new("Top 10_ Trending_Week")), None));
+            assert_eq!(task.media_name.as_deref(), Some("%(title)s [%(id)s].%(ext)s"));
+        }
+        assert_eq!(list_tasks((title(), entries()), None).len(), 3);
+        let archive: HashSet<String> = ["youtube a".to_string(), "youtube b".to_string()].into();
+        let mut downloaded = entries();
+        downloaded.truncate(2);
+        assert_eq!(list_tasks((title(), downloaded), Some(&archive)), []);
+    }
+
+    #[test]
+    fn the_archive_holds_each_line_once_and_a_cut_line_stays_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("app").join("download-archive.txt");
+        assert_eq!(read_archive(&file), Ok(HashSet::new()));
+        let lines = |ids: &[&str]| ids.iter().map(|id| id.to_string()).collect::<Vec<_>>();
+        record_archive(&file, &lines(&["youtube a", "youtube b", "youtube a"])).unwrap();
+        record_archive(&file, &lines(&["youtube b", "bandcamp 1"])).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "youtube a\nyoutube b\nbandcamp 1\n");
+        // As a crash leaves a line it was writing.
+        std::io::Write::write_all(&mut std::fs::OpenOptions::new().append(true).open(&file).unwrap(), b"soundcloud 29").unwrap();
+        record_archive(&file, &lines(&["soundcloud 290"])).unwrap();
+        assert!(std::fs::read_to_string(&file).unwrap().ends_with("bandcamp 1\nsoundcloud 29\nsoundcloud 290\n"));
+        assert!(read_archive(&file).unwrap().contains("soundcloud 290"));
+
+        // Another process adding to it holds the lock: this waits for it.
+        let lock = std::fs::File::create(dir.path().join("app").join("download-archive.txt.lock")).unwrap();
+        lock.lock().unwrap();
+        let adding = std::thread::spawn({
+            let file = file.clone();
+            move || record_archive(&file, &["vimeo 76979871".to_string()])
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!std::fs::read_to_string(&file).unwrap().contains("vimeo"), "added under another's lock");
+        lock.unlock().unwrap();
+        adding.join().unwrap().unwrap();
+        assert!(read_archive(&file).unwrap().contains("vimeo 76979871"));
+    }
+
+    #[test]
+    fn a_download_reports_what_it_made_and_a_listing_asks_for_the_playlist() {
+        let mut state = OutputState::default();
+        for line in ["HFARCHIVE True Youtube jNQXAC9IVRw", "HFARCHIVE False Youtube 90Kgw_SvK4w", "HFARCHIVE NA Vimeo 76979871", "HFARCHIVE NA NA NA", "HFARCHIVE True Generic NA"] {
+            assert!(state.handle_line(line, false).is_none());
+        }
+        let made = [("youtube jNQXAC9IVRw", true), ("youtube 90Kgw_SvK4w", false), ("vimeo 76979871", true)];
+        assert_eq!(state.archive, made.map(|(line, new)| (line.to_string(), new)));
+
+        let url = Url::parse("https://www.youtube.com/watch?v=jNQXAC9IVRw&list=PL1").unwrap();
+        let options = MediaDownloadOptions { output_dir: std::env::temp_dir(), ..Default::default() };
+        let args = |kind| build_ytdlp_args(Source::Url(&url), &options, kind, &[], None, None, Some("2026.08.19"));
+        assert!(args(RunKind::Download).contains(&ARCHIVE_TEMPLATE.to_string()));
+        let listing = args(RunKind::List(None));
+        for flag in ["--yes-playlist", "-J", "--flat-playlist"] {
+            assert!(listing.contains(&flag.to_string()), "{flag} missing from {listing:?}");
+        }
+        for flag in ["--no-playlist", "--playlist-items", "--print", "--download-archive"] {
+            assert!(!listing.contains(&flag.to_string()), "{flag} in {listing:?}");
+        }
+        assert_eq!(listing.last(), Some(&url.to_string()));
+        let newest = |kind| {
+            let args = args(RunKind::List(Some((kind, 5))));
+            args.windows(2).find(|pair| pair[0] == "--playlist-items").map(|pair| pair[1].clone())
+        };
+        assert_eq!(newest(ListKind::Uploads).as_deref(), Some(":5"));
+        assert_eq!(newest(ListKind::Playlist).as_deref(), Some("-5:"));
+        assert_eq!(newest(ListKind::Ranked), None);
+        // Many lists in one run, in order.
+        let albums = [url.clone(), Url::parse("https://c418.bandcamp.com/album/wanderstop").unwrap()];
+        let run = build_ytdlp_args(Source::Urls(&albums), &options, RunKind::List(None), &[], None, None, Some("2026.08.19"));
+        assert_eq!(run[run.len() - 2..], albums.map(|u| u.to_string()));
+        for kind in [RunKind::Extract, RunKind::Find, RunKind::Download] {
+            assert!(args(kind).contains(&"--no-playlist".to_string()), "{kind:?}");
+            assert!(!args(kind).contains(&"--download-archive".to_string()), "{kind:?}");
+        }
+    }
+
+    /// A stand-in for yt-dlp that prints `dir/list.json` and notes the arguments of each run in
+    /// `dir/runs.txt` (see [`runs_of`]).
+    fn fake_lister(dir: &Path) -> PathBuf {
+        let dir_s = dir.display();
+        #[cfg(windows)]
+        let (bin, script) = (
+            dir.join("yt-dlp.cmd"),
+            format!(
+                "@echo off\r\n\
+                 if \"%~2\"==\"--version\" (echo 2026.08.19& exit /b 0)\r\n\
+                 >>\"{dir_s}\\runs.txt\" echo run\r\n\
+                 :scan\r\n\
+                 if \"%~1\"==\"\" goto listed\r\n\
+                 >>\"{dir_s}\\runs.txt\" echo \"%~1\"\r\n\
+                 shift\r\n\
+                 goto scan\r\n\
+                 :listed\r\n\
+                 type \"{dir_s}\\list.json\"\r\n"
+            ),
+        );
+        #[cfg(not(windows))]
+        let (bin, script) = (
+            dir.join("yt-dlp"),
+            format!(
+                "#!/bin/sh\n\
+                 [ \"$2\" = --version ] && {{ echo 2026.08.19; exit 0; }}\n\
+                 echo run >> '{dir_s}/runs.txt'\n\
+                 for a in \"$@\"; do printf '%s\\n' \"$a\" >> '{dir_s}/runs.txt'; done\n\
+                 cat '{dir_s}/list.json'\n"
+            ),
+        );
+        std::fs::write(&bin, script).unwrap();
+        #[cfg(unix)]
+        make_executable(&bin).unwrap();
+        bin
+    }
+
+    /// The arguments of each run `fake_lister` in `dir` saw.
+    fn runs_of(dir: &Path) -> Vec<Vec<String>> {
+        let log = std::fs::read_to_string(dir.join("runs.txt")).unwrap_or_default();
+        let mut runs: Vec<Vec<String>> = Vec::new();
+        for line in log.lines().map(|l| l.trim().trim_matches('"')) {
+            match runs.last_mut() {
+                Some(run) if line != "run" => run.push(line.to_string()),
+                _ => runs.push(Vec::new()),
+            }
+        }
+        runs
+    }
+
+    #[tokio::test]
+    async fn a_playlist_is_listed_by_yt_dlp_without_what_was_downloaded_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let cookies = BrowserCookies::new(Some(dir.path().join("private")));
+        std::fs::write(dir.path().join("list.json"), YOUTUBE_PLAYLIST).unwrap();
+        let archive = dir.path().join("download-archive.txt");
+        std::fs::write(&archive, "youtube 5TIp7oVKHq8\n").unwrap();
+        let prepared = || async {
+            let tools = Tools {
+                ytdlp: fake_lister(dir.path()),
+                managed: false,
+                ffmpeg: None,
+                js_runtime: None,
+                work_dir: dir.path().to_path_buf(),
+                version_cache: None,
+                archive: Some(archive.clone()),
+                cookies: &cookies,
+            };
+            Ok((MediaDownloadOptions { output_dir: dir.path().to_path_buf(), ..Default::default() }, tools))
+        };
+        let url = Url::parse("https://www.youtube.com/watch?v=jNQXAC9IVRw&list=PLbpi6ZahtOH6Blw3RGYpWkSByi_T7Rygb").unwrap();
+        let options = crate::ingest::ListOptions { whole_playlist: true, latest: Some(3), ..Default::default() };
+        let tasks = list_prepared(&url, ListKind::Playlist, &options, prepared()).await.unwrap().unwrap();
+        let links: Vec<&str> = tasks.iter().map(|t| t.urls[0].as_str()).collect();
+        assert_eq!(links, ["https://www.youtube.com/watch?v=Vh4O04Bpovw", "https://www.youtube.com/watch?v=7u43Zlj9KK8"]);
+        assert!(tasks.iter().all(|t| t.folder.as_deref() == Some(Path::new("Top Trending Videos of the Week"))));
+        let runs = runs_of(dir.path());
+        let [run] = &runs[..] else { panic!("one run: {runs:?}") };
+        assert!(run.windows(2).any(|pair| pair == ["--playlist-items", "-3:"]), "{run:?}");
+        assert!(run.contains(&"--yes-playlist".to_string()) && run.contains(&"--flat-playlist".to_string()), "{run:?}");
+        assert_eq!(run.last(), Some(&url.to_string()));
+
+        // Every item, those downloaded before too.
+        let options = crate::ingest::ListOptions { only_new: false, ..options };
+        assert_eq!(list_prepared(&url, ListKind::Playlist, &options, prepared()).await.unwrap().unwrap().len(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_listing_that_takes_too_long_is_an_error() {
+        let url = Url::parse("https://www.youtube.com/@NASA").unwrap();
+        let installing = std::future::pending::<Result<(MediaDownloadOptions, Tools<'static>), String>>();
+        let listed = list_prepared(&url, ListKind::Uploads, &crate::ingest::ListOptions::default(), installing).await;
+        let message = format!("yt-dlp took over 10 minutes to list {url}; Newest N items (--latest N) lists only the newest");
+        assert_eq!(listed, Some(Err(message)));
+    }
+
+    /// Listings wait for each other: several yt-dlp runs paging one site at once bring its rate
+    /// limits on. A playlist's entries are what a sync of it has not downloaded.
+    #[tokio::test]
+    async fn listings_run_one_at_a_time_and_a_sync_with_nothing_new_is_nothing_to_do() {
+        let dir = tempfile::tempdir().unwrap();
+        let cookies = BrowserCookies::new(Some(dir.path().join("private")));
+        std::fs::write(dir.path().join("list.json"), YOUTUBE_PLAYLIST).unwrap();
+        let archive = dir.path().join("download-archive.txt");
+        std::fs::write(&archive, "youtube Vh4O04Bpovw\nyoutube 5TIp7oVKHq8\nyoutube 7u43Zlj9KK8\n").unwrap();
+        let tools = Tools {
+            ytdlp: fake_lister(dir.path()),
+            managed: false,
+            ffmpeg: None,
+            js_runtime: None,
+            work_dir: dir.path().to_path_buf(),
+            version_cache: None,
+            archive: Some(archive.clone()),
+            cookies: &cookies,
+        };
+        let prepared = std::future::ready(Ok((MediaDownloadOptions { output_dir: dir.path().to_path_buf(), ..Default::default() }, tools)));
+        let url = Url::parse("https://www.youtube.com/playlist?list=PLbpi6ZahtOH6Blw3RGYpWkSByi_T7Rygb").unwrap();
+        let options = crate::ingest::ListOptions::default();
+
+        let other = LISTING.acquire().await.unwrap();
+        let listing = list_prepared(&url, ListKind::Playlist, &options, prepared);
+        tokio::pin!(listing);
+        let waited = tokio::time::timeout(Duration::from_millis(300), &mut listing).await;
+        assert!(waited.is_err(), "listed while another listing ran");
+        assert!(runs_of(dir.path()).is_empty(), "yt-dlp ran while another listing did");
+        drop(other);
+        assert_eq!(listing.await, Some(Ok(Vec::new())));
+        assert_eq!(runs_of(dir.path()).len(), 1);
+    }
+
+    /// A media download with `fake_ytdlp` of what `info` describes, into `dir/out`, whose download
+    /// archive is `dir/download-archive.txt`.
+    async fn download_archived(dir: &Path, info: &Value, fetch: &StreamFetcher<'_>) -> (Result<PathBuf, String>, String) {
+        let cookies = BrowserCookies::new(Some(dir.join("private")));
+        let out = dir.join("out");
+        std::fs::write(dir.join("info.json"), serde_json::to_vec(info).unwrap()).unwrap();
+        let archive = dir.join("download-archive.txt");
+        let tools = Tools {
+            ytdlp: fake_ytdlp(dir, &out.join("clip.mp4")),
+            managed: false,
+            ffmpeg: Some(dir.join("no-ffmpeg-here")),
+            js_runtime: None,
+            work_dir: dir.to_path_buf(),
+            version_cache: None,
+            archive: Some(archive.clone()),
+            cookies: &cookies,
+        };
+        let options = MediaDownloadOptions { output_dir: out, ..Default::default() };
+        let url = Url::parse("https://vimeo.com/76979871").unwrap();
+        let made = download_with(&url, &options, tools, None, None, Some(fetch), None).await;
+        (made, std::fs::read_to_string(&archive).unwrap_or_default())
+    }
+
+    #[test]
+    fn a_file_there_already_is_archived_only_when_its_name_says_it_is_the_video() {
+        let line = || "youtube a1".to_string();
+        assert_eq!(archive_line(line(), Path::new("/d/Intro.mp4"), true), Some(line()));
+        // Maybe another video of that title.
+        assert_eq!(archive_line(line(), Path::new("/d/Intro.mp4"), false), None);
+        assert_eq!(archive_line(line(), Path::new("/d/Intro [a1].mp4"), false), Some(line()));
+        assert_eq!(archive_line(line(), Path::new("/d/Intro [a12].mp4"), false), None);
+    }
+
+    #[tokio::test]
+    async fn a_finished_download_is_added_to_the_archive() {
+        // The engine fetches the one stream of a video.
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        let mut info = format_info("0", "mp4", "avc1", "mp4a.40.2", 5);
+        for (key, value) in [("_type", "video"), ("extractor_key", "FakeSite"), ("id", "clip1"), ("container", "mp4")] {
+            info[key] = value.into();
+        }
+        info["requested_downloads"] = serde_json::json!([{"filename": out.join("clip.mp4")}]);
+        let fetch: &StreamFetcher<'_> = &|stream, _tx, _stop| {
+            Box::pin(async move {
+                std::fs::write(&stream.path, b"video").unwrap();
+                Ok(stream.path)
+            })
+        };
+        let (made, archive) = download_archived(dir.path(), &info, fetch).await;
+        assert_eq!(made, Ok(out.join("clip.mp4")));
+        assert_eq!(runs_in(dir.path()), ["extract"], "yt-dlp downloaded nothing");
+        assert_eq!(archive, "fakesite clip1\n");
+
+        // yt-dlp downloads what the engine does not: what it printed it made.
+        let dir = tempfile::tempdir().unwrap();
+        let fetch: &StreamFetcher<'_> = &|_, _, _| panic!("yt-dlp downloads DASH fragments");
+        let (made, archive) = download_archived(dir.path(), &dash_info(&dir.path().join("out")), fetch).await;
+        assert!(made.is_ok(), "{made:?}");
+        assert_eq!(runs_in(dir.path()), ["extract", "download info"]);
+        assert_eq!(archive, "vimeo 76979871\n");
+
+        // A download that fails is not in it.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("extract-error"), b"").unwrap();
+        let (made, archive) = download_archived(dir.path(), &Value::Null, fetch).await;
+        assert!(made.is_err());
+        assert_eq!(archive, "");
+    }
+
+    /// A video whose file is there already (another video's of the same title, maybe) is added
+    /// only when the file's name holds its id, as a list entry's does.
+    #[tokio::test]
+    async fn a_file_that_was_there_is_added_to_the_archive_only_under_its_id() {
+        let fetch: &StreamFetcher<'_> = &|_, _, _| panic!("the file is there");
+        for (name, archived) in [("clip.mp4", ""), ("clip [clip1].mp4", "fakesite clip1\n")] {
+            let dir = tempfile::tempdir().unwrap();
+            let out = dir.path().join("out");
+            std::fs::create_dir(&out).unwrap();
+            std::fs::write(out.join(name), b"video").unwrap();
+            let mut info = format_info("0", "mp4", "avc1", "mp4a.40.2", 5);
+            for (key, value) in [("_type", "video"), ("extractor_key", "FakeSite"), ("id", "clip1"), ("container", "mp4")] {
+                info[key] = value.into();
+            }
+            info["requested_downloads"] = serde_json::json!([{"filename": out.join(name)}]);
+            let (made, archive) = download_archived(dir.path(), &info, fetch).await;
+            assert_eq!(made, Ok(out.join(name)));
+            assert_eq!(archive, archived, "{name}");
         }
     }
 }
