@@ -530,7 +530,7 @@ mod tests {
         }
         q.finish(ids[0], Err(CANCELLED.into()));
         assert_eq!(q.get_item(ids[0]).unwrap().status, QueueItemStatus::Paused);
-        let kept = "Could not join the recorded streams (ffmpeg is missing); they are kept as /dl/a.f1.mp4.part and /dl/a.f2.m4a.part";
+        let kept = "Could not join the recorded streams (ffmpeg is missing); what it recorded is kept as /dl/a.f1.mp4.part and /dl/a.f2.m4a.part";
         q.finish(ids[1], Err(kept.into()));
         assert_eq!(q.get_item(ids[1]).unwrap().status, QueueItemStatus::Failed(kept.into()));
     }

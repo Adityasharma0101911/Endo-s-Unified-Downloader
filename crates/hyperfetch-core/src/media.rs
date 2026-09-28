@@ -3045,10 +3045,12 @@ async fn run_ytdlp_watching(
     if failed && !state.only_steps_failed() {
         let failure = state.failure_message(status);
         // A live recording that broke off keeps what it recorded, not only as a `.part` that a
-        // retry would record over.
-        return Err(match stopped(&state, ffmpeg).await.ok().filter(|_| state.live) {
-            Some(kept) => format!("The live recording broke off; {RECORDING_KEPT} {}:\n{failure}", kept.display()),
-            None => failure,
+        // retry would record over: the error says where (see `download_with`), also when its
+        // streams could not be joined.
+        return Err(match stopped(&state, ffmpeg).await {
+            Ok(kept) => format!("The live recording broke off; {RECORDING_KEPT} {}:\n{failure}", kept.display()),
+            Err(e) if e == CANCELLED => failure,
+            Err(kept) => format!("The live recording broke off. {kept}:\n{failure}"),
         });
     }
     let path = state.final_path.take().ok_or("yt-dlp finished without reporting an output file")?;
@@ -3228,14 +3230,15 @@ async fn keep_recording(file: &Path, ffmpeg: Option<&Path>) -> PathBuf {
 }
 
 /// Joins the streams a stopped live recording downloaded apart (its video and audio from their
-/// start) into `output`, or a free name after it, as yt-dlp would have. They stay if that fails.
+/// start) into `output`, or a free name after it, as yt-dlp would have. They stay if that fails,
+/// which the error says with [`RECORDING_KEPT`].
 async fn join_recording(parts: &[PathBuf], output: &Path, ffmpeg: Option<&Path>) -> Result<PathBuf, String> {
     let kept = |why: String| {
         let names: Vec<String> = parts.iter().map(|part| part.display().to_string()).collect();
-        format!("Could not join the recorded streams ({why}); they are kept as {}", names.join(" and "))
+        format!("Could not join the recorded streams ({why}); {RECORDING_KEPT} {}", names.join(" and "))
     };
     let ffmpeg = ffmpeg.ok_or_else(|| kept("ffmpeg is missing".to_string()))?;
-    let target = free_name(output).await?;
+    let target = free_name(output).await.map_err(kept)?;
     let temp = merge_temp(&target);
     let mut args: Vec<OsString> = FFMPEG_QUIET.map(OsString::from).to_vec();
     for part in parts {
@@ -8304,6 +8307,23 @@ bbd8671c6c05eaa3ec29d690695aebadff0871faa3efe9051581afbf3c01e80e  ffmpeg-master-
         let kept = dir.path().join("clip.ts");
         assert!(error.contains(&format!("kept as {}", kept.display())) && error.ends_with("Connection reset by peer"), "{error}");
         assert!(kept.is_file() && !with_part(&output).exists());
+    }
+
+    /// A recording of streams downloaded apart that breaks off, and cannot be joined, fails
+    /// saying its streams are kept: trying again would record over them.
+    #[tokio::test]
+    async fn a_broken_off_recording_whose_streams_cannot_be_joined_says_they_are_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("clip.mp4");
+        let (video, audio) = (dir.path().join("clip.f299.mp4"), dir.path().join("clip.f140.m4a"));
+        for stream in [&video, &audio] {
+            std::fs::write(with_part(stream), b"stream").unwrap();
+        }
+        let bin = live_ytdlp(dir.path(), &output, &[&video, &audio], true);
+        let error = run_ytdlp(tree_command(&bin), None, None, None).await.unwrap_err();
+        assert!(error.contains(RECORDING_KEPT) && error.contains("ffmpeg is missing"), "{error}");
+        assert!(error.ends_with("Connection reset by peer"), "{error}");
+        assert!(with_part(&video).is_file() && with_part(&audio).is_file());
     }
 
     /// A live recording is ended once too little is left on its disk, keeping what it recorded,

@@ -251,7 +251,7 @@ A live stream is recorded by yt-dlp. This covers a site's live video and an HLS 
 - Closing the GUI window stops the recordings the same way, and the window stays open until their files are finished. Close it a second time to quit at once, which cuts them off.
 - Sometimes yt-dlp is stopped outright instead: when it does not stop recording within 30 seconds, or cannot be asked. What it recorded is kept either way:
   - An MPEG-TS recording is named `.ts`, then remuxed to `.mp4` when ffmpeg is present and its disk has room for the copy that writes; without that room the `.ts` is kept, which plays as it is, and the log says so.
-  - Video and audio recorded apart are joined with ffmpeg.
+  - Video and audio recorded apart are joined with ffmpeg. When that fails (no ffmpeg, a full disk) they stay as their `.part` files, which the error names, and the stream is not recorded again over them.
   - A recording that cannot be renamed is kept as its `.part` file and reported done under that name.
 - A recording that breaks off (the connection drops, the stream fails) keeps what it recorded the same way, and the download fails naming that file. So does one ended because the space left on its disk came down to the size of what it recorded plus 512 MiB, which is checked every 10 seconds while it records: finishing the file (yt-dlp's fixup and tags, the remux to MP4, joining streams recorded apart) writes a copy of it, and a full disk would cut it off mid-write.
 - DRM-protected live TV (a FairPlay, Widevine or other non-`identity` key format) is refused, not recorded.
