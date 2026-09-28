@@ -34,7 +34,8 @@ use crate::worker::{
     WorkerShared,
 };
 
-const CANCELLED: &str = "Download cancelled by user";
+/// What a download stopped by [`DownloadEngine::cancel`] fails with.
+pub const CANCELLED: &str = "Download cancelled by user";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long a client keeps a connection whose request ended, for the next request to its host.
 pub(crate) const POOL_IDLE: Duration = Duration::from_secs(90);

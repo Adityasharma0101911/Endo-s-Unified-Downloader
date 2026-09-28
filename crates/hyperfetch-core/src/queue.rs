@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::engine::{DownloadOptions, EngineSnapshot};
+use crate::engine::{DownloadOptions, EngineSnapshot, CANCELLED};
 use crate::history::{is_redacted, redact_text, redact_url, REDACTED_LINK};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -236,8 +236,10 @@ impl DownloadQueue {
         }
     }
 
-    /// Settles a finished engine run. A run that ends while pausing is `Paused` unless it
-    /// completed anyway; `size` is the finished file's size when known.
+    /// Settles a finished engine run. A run that ends while pausing is `Paused` when the pause
+    /// stopped it ([`CANCELLED`]); one that completed anyway is `Completed`, and one that failed
+    /// otherwise `Failed` (a live recording whose streams could not be joined says where they
+    /// are kept). `size` is the finished file's size when known.
     pub fn finish(&mut self, id: usize, result: Result<(PathBuf, Option<u64>), String>) {
         let Some(item) = self.get_item_mut(id) else { return };
         let was_pausing = item.status == QueueItemStatus::Pausing;
@@ -255,7 +257,7 @@ impl DownloadQueue {
                 item.progress_ratio = 1.0;
                 item.status = QueueItemStatus::Completed;
             }
-            Err(_) if was_pausing => item.status = QueueItemStatus::Paused,
+            Err(e) if was_pausing && e == CANCELLED => item.status = QueueItemStatus::Paused,
             Err(e) => item.status = QueueItemStatus::Failed(e),
         }
     }
@@ -428,7 +430,7 @@ mod tests {
         assert_eq!(q.next_to_start(2), None);
         assert!(q.mark_pausing(ids[0]));
         assert_eq!(q.next_to_start(2), None, "a pausing item still occupies a slot");
-        q.finish(ids[0], Err("Download cancelled by user".into()));
+        q.finish(ids[0], Err(CANCELLED.into()));
         assert_eq!(q.get_item(ids[0]).unwrap().status, QueueItemStatus::Paused);
         assert_eq!(q.next_to_start(2), Some(ids[2]), "paused items are not restarted automatically");
     }
@@ -462,7 +464,7 @@ mod tests {
         assert!(!q.get_item(ids[1]).unwrap().targets(&target));
         assert_eq!(q.active_on_target(&spelled_out), None, "only active items count");
         q.mark_pausing(ids[0]);
-        q.finish(ids[0], Err("cancelled".into()));
+        q.finish(ids[0], Err(CANCELLED.into()));
         assert_eq!(q.active_on_target(&target), None, "a paused item is not active");
     }
 
@@ -511,6 +513,23 @@ mod tests {
         assert_eq!(q.get_item(ids[2]).unwrap().status, QueueItemStatus::Completed);
     }
 
+    /// A pause that stops the download pauses it; one that ends it with another error (a live
+    /// recording whose streams could not be joined, which says where they are kept) is that
+    /// failure, shown with its message.
+    #[test]
+    fn only_the_stop_a_pause_asks_for_pauses_a_download() {
+        let (mut q, ids) = queue_of(&["https://e.com/a", "https://e.com/b"]);
+        for id in &ids {
+            q.mark_started(*id);
+            q.mark_pausing(*id);
+        }
+        q.finish(ids[0], Err(CANCELLED.into()));
+        assert_eq!(q.get_item(ids[0]).unwrap().status, QueueItemStatus::Paused);
+        let kept = "Could not join the recorded streams (ffmpeg is missing); they are kept as /dl/a.f1.mp4.part and /dl/a.f2.m4a.part";
+        q.finish(ids[1], Err(kept.into()));
+        assert_eq!(q.get_item(ids[1]).unwrap().status, QueueItemStatus::Failed(kept.into()));
+    }
+
     #[test]
     fn active_items_survive_remove_and_clear() {
         let (mut q, ids) = queue_of(&["https://e.com/a", "https://e.com/b", "https://e.com/c"]);
@@ -528,7 +547,7 @@ mod tests {
         assert_eq!(q.items()[0].id, ids[0]);
 
         q.mark_pausing(ids[0]);
-        q.finish(ids[0], Err("cancelled".into()));
+        q.finish(ids[0], Err(CANCELLED.into()));
         assert!(q.remove_item(ids[0]));
         assert!(q.items().is_empty());
     }
@@ -539,7 +558,7 @@ mod tests {
         q.mark_started(ids[0]);
         q.apply_snapshot(ids[0], &snapshot("/dl/a"));
         q.mark_pausing(ids[0]);
-        q.finish(ids[0], Err("cancelled".into()));
+        q.finish(ids[0], Err(CANCELLED.into()));
         q.reset_progress(ids[0]);
         let item = q.get_item(ids[0]).unwrap();
         assert_eq!((item.downloaded_bytes, item.total_bytes, item.progress_ratio), (0, 0, 0.0));
@@ -586,7 +605,7 @@ mod tests {
         q.mark_started(ids[0]);
         q.apply_snapshot(ids[0], &EngineSnapshot { progress_ratio: f64::NAN, ..snapshot("/dl/a b") });
         q.mark_pausing(ids[0]);
-        q.finish(ids[0], Err("cancelled".into()));
+        q.finish(ids[0], Err(CANCELLED.into()));
 
         let json = serde_json::to_string(&q).unwrap();
         assert!(!json.contains("secret"));
