@@ -1421,8 +1421,11 @@ fn build_ytdlp_args(
     if options.wait_for_video && matches!(kind, RunKind::Extract | RunKind::Download) {
         args.extend(["--wait-for-video".to_string(), WAIT_FOR_VIDEO.to_string()]);
     }
-    if matches!(kind, RunKind::Download | RunKind::Subtitles) {
-        args.extend(subtitle_args(options, ffmpeg_dir.is_some()));
+    match kind {
+        RunKind::Download | RunKind::Subtitles => args.extend(subtitle_args(options, ffmpeg_dir.is_some())),
+        // Asked for them, yt-dlp says which it cannot get as it finds the video (YouTube's that
+        // need a PO token); `-J` writes none.
+        RunKind::Extract | RunKind::Find => args.extend(subtitle_choice(options)),
     }
     if kind == RunKind::Download {
         args.extend(embed_args(options, ffmpeg_dir.is_some()));
@@ -1471,27 +1474,90 @@ fn sub_langs(options: &MediaDownloadOptions) -> Option<(String, bool)> {
     (!langs.is_empty()).then(|| (langs.join(","), all))
 }
 
-/// yt-dlp arguments that write the subtitles `options` ask for next to the video: the site's
-/// `.srt`, else its `.vtt`, else its best format, converted to `.srt` when ffmpeg is at hand
-/// (yt-dlp converts TTML itself, ffmpeg the rest). A language named gets the site's subtitles, else
-/// its automatic captions (a language only those have, `en-orig`, is one to name); `all` gets every
-/// language the site has subtitles in, not the automatic captions, often a hundred machine
-/// translations. A language the site lacks is left out; one that fails to download, or to convert
-/// (its file then stays as the site had it), is a warning, not the failure of the video
-/// (`--ignore-errors`, see [`OutputState::only_steps_failed`]).
-fn subtitle_args(options: &MediaDownloadOptions, have_ffmpeg: bool) -> Vec<String> {
+/// yt-dlp arguments that pick the subtitles `options` ask for. A language named gets the site's
+/// subtitles, else its automatic captions (a language only those have, `en-orig`, is one to
+/// name); `all` gets every language the site has subtitles in, not the automatic captions, often a
+/// hundred machine translations. A language the site lacks is left out.
+fn subtitle_choice(options: &MediaDownloadOptions) -> Vec<String> {
     let Some((langs, all)) = sub_langs(options) else { return Vec::new() };
     let mut args = vec!["--write-subs".to_string()];
     if !all {
         args.push("--write-auto-subs".to_string());
     }
     args.extend(["--sub-langs".to_string(), langs]);
+    args
+}
+
+/// yt-dlp arguments that write the subtitles `options` ask for (see [`subtitle_choice`]) next to
+/// the video: the site's `.srt`, else its `.vtt`, else its best format, converted to `.srt` when
+/// ffmpeg is at hand (yt-dlp converts TTML itself, ffmpeg the rest). One that fails to download, or
+/// to convert (its file then stays as the site had it), is a warning, not the failure of the video
+/// (`--ignore-errors`, see [`OutputState::only_steps_failed`]); what is missing is reported (see
+/// [`subtitle_problems`]).
+fn subtitle_args(options: &MediaDownloadOptions, have_ffmpeg: bool) -> Vec<String> {
+    let mut args = subtitle_choice(options);
+    if args.is_empty() {
+        return args;
+    }
     args.extend(["--sub-format", "srt/vtt/best"].map(String::from));
     if have_ffmpeg {
         args.extend(["--convert-subs", "srt"].map(String::from));
     }
     args.push("--ignore-errors".to_string());
     args
+}
+
+/// Whether `lang`, as `--sub-langs` takes it, is a language code (`en`, `pt-BR`), not `all`, a
+/// language left out (`-live_chat`) or a pattern (`en.*`).
+fn plain_language(lang: &str) -> bool {
+    !lang.is_empty()
+        && !lang.eq_ignore_ascii_case("all")
+        && !lang.starts_with('-')
+        && lang.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Subtitle formats yt-dlp writes: the sites' own, and what it converts them to.
+const SUBTITLE_EXTS: &[&str] = &["srt", "vtt", "ass", "ssa", "lrc", "ttml", "dfxp", "xml", "srv1", "srv2", "srv3", "json3", "sbv"];
+
+/// What went wrong with the subtitles `asked` for (`--subs`) of `video`, as the files next to it
+/// (`<name>.<language>.<format>`) tell: a language named that no subtitles are in (the site has
+/// none, or YouTube's need a PO token, which yt-dlp warns of as it finds the video), and subtitles
+/// that came empty. Neither fails the video, and neither is tried again. Blocking.
+fn subtitle_problems(video: &Path, asked: &str) -> Vec<String> {
+    let (Some(dir), Some(stem)) = (video.parent(), video.file_stem().and_then(|s| s.to_str())) else { return Vec::new() };
+    let mut problems = Vec::new();
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let name = entry.file_name();
+        let Some((lang, ext)) = name.to_str().and_then(|n| n.strip_prefix(stem)?.strip_prefix('.')?.split_once('.')) else {
+            continue;
+        };
+        if !SUBTITLE_EXTS.contains(&ext) {
+            continue;
+        }
+        if entry.metadata().is_ok_and(|m| m.len() == 0) {
+            problems.push(format!("The {lang} subtitles of {} came empty", video.display()));
+        }
+        found.push(lang.to_string());
+    }
+    for lang in asked.split(',').map(str::trim).filter(|lang| plain_language(lang)) {
+        // A region's own (`en-US`) stands for its language.
+        if !found.iter().any(|f| f.strip_prefix(lang).is_some_and(|rest| rest.is_empty() || rest.starts_with('-'))) {
+            problems.push(format!("No {lang} subtitles for {}", video.display()));
+        }
+    }
+    problems
+}
+
+/// Logs the [`subtitle_problems`] of `video`, when `options` ask for subtitles.
+async fn report_subtitles(video: &Path, options: &MediaDownloadOptions) {
+    let Some(asked) = options.subtitles.clone().filter(|_| sub_langs(options).is_some()) else { return };
+    let video = video.to_path_buf();
+    if let Ok(problems) = tokio::task::spawn_blocking(move || subtitle_problems(&video, &asked)).await {
+        for problem in problems {
+            tracing::warn!("{problem}");
+        }
+    }
 }
 
 /// yt-dlp arguments that write the title, artist, date, description and URL tags and the chapters
@@ -3422,6 +3488,7 @@ async fn download_with(
                                     if let Err(e) = wrote {
                                         tracing::warn!("Subtitles of {}: {e}", path.display());
                                     }
+                                    report_subtitles(&path, options).await;
                                 }
                                 return Ok(path);
                             }
@@ -3455,6 +3522,7 @@ async fn download_with(
                 if fast.is_some() {
                     remove_streams_after(&path).await;
                 }
+                report_subtitles(&path, options).await;
                 return Ok(path);
             }
             Err(err) => err,
@@ -5607,9 +5675,14 @@ mod tests {
         let args = args_of(&all, RunKind::Download, true);
         assert!(holds(&args, &["--write-subs", "--sub-langs", "all,-live_chat"]), "{args:?}");
         assert!(!args.contains(&"--write-auto-subs".to_string()), "{args:?}");
-        // Finding what to download writes nothing; asked for none, no run writes any.
+        // Finding what to download picks them, so that yt-dlp says which it cannot get (YouTube's
+        // that need a PO token), and writes nothing; asked for none, no run picks any.
         for kind in [RunKind::Extract, RunKind::Find] {
-            assert!(!args_of(&named, kind, true).contains(&"--write-subs".to_string()));
+            let args = args_of(&named, kind, true);
+            assert!(holds(&args, &wanted[..4]) && holds(&args, &["-J"]), "{args:?}");
+            for writes in ["--sub-format", "--convert-subs", "--ignore-errors", "--skip-download"] {
+                assert!(!args.contains(&writes.to_string()), "{args:?}");
+            }
         }
         for none in [None, Some(""), Some(" , ")] {
             let options = MediaDownloadOptions { subtitles: none.map(str::to_string), ..Default::default() };
@@ -5619,6 +5692,34 @@ mod tests {
         let only = args_of(&named, RunKind::Subtitles, true);
         assert!(only.contains(&"--skip-download".to_string()) && !only.contains(&"--embed-metadata".to_string()), "{only:?}");
         assert!(!only.contains(&PROGRESS_TEMPLATE.to_string()), "{only:?}");
+    }
+
+    /// A language no subtitles came in, and subtitles that came empty, are reported; `all`, a
+    /// language left out and a pattern name none to look for.
+    #[test]
+    fn subtitles_missing_or_empty_are_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let video = dir.path().join("clip.mp4");
+        for (name, body) in [
+            ("clip.mp4", "video"),
+            ("clip.en-US.srt", "1"),
+            ("clip.es.vtt", ""),
+            ("clip.fr.srt.part", "1"),
+            ("clip.f140.m4a", ""),
+            ("other.de.srt", "1"),
+        ] {
+            std::fs::write(dir.path().join(name), body).unwrap();
+        }
+        let problems = subtitle_problems(&video, "en, es,fr,de,ALL,-live_chat,pt.*");
+        assert_eq!(
+            problems,
+            [
+                format!("The es subtitles of {} came empty", video.display()),
+                format!("No fr subtitles for {}", video.display()),
+                format!("No de subtitles for {}", video.display()),
+            ]
+        );
+        assert_eq!(subtitle_problems(&video, "all"), [format!("The es subtitles of {} came empty", video.display())]);
     }
 
     /// With --ignore-errors yt-dlp exits 1 for a step that failed once a video began; the video it
