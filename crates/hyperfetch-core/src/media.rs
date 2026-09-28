@@ -144,7 +144,8 @@ pub struct MediaDownloadOptions {
     pub output_filename: Option<String>,
     pub custom_ytdlp_path: Option<PathBuf>,
     pub concurrent_fragments: usize,
-    /// Install a managed ffmpeg when a download needs one and none is found.
+    /// Install a managed ffmpeg (about 200 MB) when a download needs one and none is found. Off
+    /// unless the user agreed to it.
     pub install_ffmpeg: bool,
     /// Subtitle languages to fetch ("en,es", "all"); None fetches none.
     pub subtitles: Option<String>,
@@ -166,7 +167,7 @@ impl Default for MediaDownloadOptions {
             output_filename: None,
             custom_ytdlp_path: None,
             concurrent_fragments: 8,
-            install_ffmpeg: true,
+            install_ffmpeg: false,
             subtitles: None,
             embed_metadata: true,
             live_from_start: false,
@@ -4117,8 +4118,8 @@ pub(crate) async fn download_media_with(
             tracing::warn!(
                 "ffmpeg not found ({why}): yt-dlp cannot merge separate video and audio streams, so it will fall \
                  back to a lower-quality pre-merged format, and audio extraction presets will fail. Let the app \
-                 install it, install it yourself (e.g. `winget install Gyan.FFmpeg` or your package manager) or \
-                 place it next to the application."
+                 install it (the GUI's \"Install ffmpeg\" setting, or --install-ffmpeg), install it yourself (e.g. \
+                 `winget install Gyan.FFmpeg` or your package manager) or place it next to the application."
             );
             Some(why)
         }
@@ -4158,7 +4159,7 @@ async fn ffmpeg_for_download(
         return Ok(ffmpeg);
     }
     if !install_ffmpeg {
-        return Err("installing it is turned off (the \"Install ffmpeg\" setting, or --no-install-ffmpeg)".to_string());
+        return Err("installing it was not agreed to (the \"Install ffmpeg\" setting, or --install-ffmpeg)".to_string());
     }
     let install = tokio::spawn(install);
     tokio::select! {
@@ -5245,9 +5246,11 @@ bbd8671c6c05eaa3ec29d690695aebadff0871faa3efe9051581afbf3c01e80e  ffmpeg-master-
         assert_eq!(used, Ok(found));
         assert_eq!(names_of(&bin), [".ffmpeg-2-downloading.zip"]);
 
-        // Installing it is turned off: the download goes on without, and says how to turn it on.
+        // Installing it was not agreed to, which is the default: the download goes on without, and
+        // says how to agree.
+        assert!(!MediaDownloadOptions::default().install_ffmpeg && !crate::engine::DownloadOptions::default().install_ffmpeg);
         let off = ffmpeg_for_download(None, None, false, &None, installs_nothing()).await.unwrap_err();
-        assert!(off.contains("--no-install-ffmpeg"), "{off}");
+        assert!(off.contains("--install-ffmpeg"), "{off}");
 
         // The installed ffmpeg is the one the download works with; a failed install says why.
         let installed = managed_ffmpeg_dir(&bin).join(exe_name("ffmpeg"));

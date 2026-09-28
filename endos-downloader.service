@@ -23,6 +23,8 @@ Type=exec
 User=endos-downloader
 Group=endos-downloader
 UMask=0002
+# Add --install-ffmpeg to let it install ffmpeg (about 200 MB) when a video needs it and none is
+# found: videos then download in their best quality and MP3/M4A files can be made.
 ExecStart=/usr/local/bin/endos-downloader-cli -i /var/downloads/queue.txt -d /var/downloads -j 2
 # History and the managed yt-dlp are kept in the state directory.
 StateDirectory=endos-downloader

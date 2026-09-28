@@ -61,8 +61,11 @@ pub struct Settings {
     pub only_new: bool,
     /// Only the newest this many items of a channel, playlist or feed (0 = all).
     pub latest: usize,
-    /// Install a managed ffmpeg when a media download needs one and none is found.
-    pub install_ffmpeg: bool,
+    /// Install a managed ffmpeg (about 200 MB) when a media download needs one and none is found:
+    /// None until the user answers (see `App::start_job`). Saved under a key of its own, as the
+    /// `install_ffmpeg: true` older versions saved was their default, never an answer.
+    #[serde(rename = "install_ffmpeg_answer")]
+    pub install_ffmpeg: Option<bool>,
     /// Subtitle languages for media downloads, e.g. "en,es" or "all" (empty = none).
     pub subtitles: String,
     /// Title, artist, date and URL tags, chapters and cover art inside media files.
@@ -95,7 +98,7 @@ impl Default for Settings {
             google_api_key: String::new(),
             only_new: true,
             latest: 0,
-            install_ffmpeg: engine.install_ffmpeg,
+            install_ffmpeg: None,
             subtitles: String::new(),
             embed_metadata: engine.embed_metadata,
             live_from_start: engine.live_from_start,
@@ -179,7 +182,7 @@ impl Settings {
             media_preset,
             page_media_preset: Some(quality),
             browser_cookies: self.browser_cookies(),
-            install_ffmpeg: self.install_ffmpeg,
+            install_ffmpeg: self.install_ffmpeg == Some(true),
             subtitles: non_empty(&self.subtitles),
             embed_metadata: self.embed_metadata,
             live_from_start: self.live_from_start,
@@ -394,8 +397,9 @@ mod tests {
     /// listers and the engine.
     #[test]
     fn listing_and_media_settings() {
-        let saved: Settings = serde_json::from_str(r#"{"proxy": "http://p:8080", "cookies_path": "c.txt"}"#).unwrap();
-        assert!(saved.only_new && saved.install_ffmpeg && saved.embed_metadata && !saved.live_from_start);
+        // The install_ffmpeg older versions saved was their default, not the user's answer.
+        let saved: Settings = serde_json::from_str(r#"{"proxy": "http://p:8080", "cookies_path": "c.txt", "install_ffmpeg": true}"#).unwrap();
+        assert!(saved.only_new && saved.install_ffmpeg.is_none() && saved.embed_metadata && !saved.live_from_start);
         assert_eq!((saved.latest, saved.google_api_key.as_str(), saved.subtitles.as_str()), (0, "", ""));
         let list = saved.list_options();
         assert!(list.only_new && !list.whole_playlist);
@@ -403,15 +407,17 @@ mod tests {
         assert_eq!((list.cookies, list.proxy.as_deref()), (BrowserCookieSource::File("c.txt".into()), Some("http://p:8080")));
         let file = [Url::parse("https://example.com/a.iso").unwrap()];
         let opts = saved.download_options(&file, "", "").unwrap();
-        assert!(opts.install_ffmpeg && opts.embed_metadata && !opts.live_from_start && !opts.wait_for_video);
+        assert!(!opts.install_ffmpeg && opts.embed_metadata && !opts.live_from_start && !opts.wait_for_video);
         assert_eq!(opts.subtitles, None);
+        let agreed = Settings { install_ffmpeg: Some(true), ..saved.clone() };
+        assert!(agreed.download_options(&file, "", "").unwrap().install_ffmpeg);
 
         let chosen = Settings {
             google_api_key: " AIzaKey ".into(),
             only_new: false,
             latest: 5,
             browser_cookies: 3,
-            install_ffmpeg: false,
+            install_ffmpeg: Some(false),
             subtitles: "en,es".into(),
             embed_metadata: false,
             live_from_start: true,
