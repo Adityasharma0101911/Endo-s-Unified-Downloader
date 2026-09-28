@@ -1801,7 +1801,8 @@ impl ProcessTree {
 
     /// Asks the tree to stop as a Ctrl+C at a terminal does, which ends a yt-dlp live recording
     /// with its file finished (see [`run_ytdlp`]): a SIGINT to the process group on Unix, a Ctrl+C
-    /// to yt-dlp's console on Windows (see [`ctrl_c_console_of`]). Returns whether it was sent.
+    /// to yt-dlp's console on Windows (see [`ctrl_c_console_of`] and [`ctrl_c_by_helper`]).
+    /// Returns whether it was sent.
     async fn interrupt(&self, child: &Child) -> bool {
         #[cfg(unix)]
         {
@@ -1812,7 +1813,7 @@ impl ProcessTree {
         #[cfg(windows)]
         {
             let Some(pid) = child.id() else { return false };
-            tokio::task::spawn_blocking(move || ctrl_c_console_of(pid)).await.unwrap_or(false)
+            tokio::task::spawn_blocking(move || ctrl_c_console_of(pid) || ctrl_c_by_helper(pid)).await.unwrap_or(false)
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -1851,10 +1852,10 @@ impl Drop for ProcessTree {
 
 /// Sends a Ctrl+C to the console process `pid` runs in, which reaches every process there (yt-dlp
 /// and its ffmpeg: each yt-dlp gets a hidden console of its own, see [`hide_console`]). Only a
-/// process without a console of its own can attach to it (the GUI; the CLI's downloads are killed
-/// instead), and attaching holds for the whole process, so one at a time. The Ctrl+C this process
-/// gets while attached is swallowed, and its standard handles, which attaching points at that
-/// console, are put back. Blocking.
+/// process without a console of its own can attach to it (the GUI; the CLI has a helper do it,
+/// see [`serve_ctrl_c`]), and attaching holds for the whole process, so one at a time. The Ctrl+C
+/// this process gets while attached is swallowed, and its standard handles, which attaching points
+/// at that console, are put back. Blocking.
 #[cfg(windows)]
 fn ctrl_c_console_of(pid: u32) -> bool {
     use windows_sys::Win32::Foundation::BOOL;
@@ -1887,6 +1888,73 @@ fn ctrl_c_console_of(pid: u32) -> bool {
             SetStdHandle(which, handle);
         }
         sent
+    }
+}
+
+/// Names the process to whose console a program started as the Ctrl+C helper sends a Ctrl+C (see
+/// [`serve_ctrl_c`]).
+#[cfg(windows)]
+const CTRL_C_PID: &str = "HYPERFETCH_CTRL_C_PID";
+
+/// This program, which [`serve_ctrl_c`] made a Ctrl+C helper.
+#[cfg(windows)]
+static CTRL_C_HELPER: OnceLock<PathBuf> = OnceLock::new();
+
+/// For the `main` of a program that downloads, called first. The Ctrl+C that finishes a live
+/// recording can only be sent to yt-dlp's console by a process without a console of its own (see
+/// [`ctrl_c_console_of`]), which a command-line program is not: it starts itself again without
+/// one to send it. Started so, this sends it and exits; otherwise it lets the program do that.
+/// Nothing on other systems, where a signal does it.
+pub fn serve_ctrl_c() {
+    #[cfg(windows)]
+    {
+        send_ctrl_c_if_asked();
+        if let Ok(exe) = std::env::current_exe() {
+            let _ = CTRL_C_HELPER.set(exe);
+        }
+    }
+}
+
+/// Started as the Ctrl+C helper (see [`serve_ctrl_c`]): sends the Ctrl+C and exits, with 0 when
+/// it was sent.
+#[cfg(windows)]
+fn send_ctrl_c_if_asked() {
+    if let Some(pid) = std::env::var(CTRL_C_PID).ok().and_then(|pid| pid.parse().ok()) {
+        std::process::exit(if ctrl_c_console_of(pid) { 0 } else { 1 });
+    }
+}
+
+/// How this program starts itself as the Ctrl+C helper, when [`serve_ctrl_c`] let it.
+#[cfg(all(windows, not(test)))]
+fn ctrl_c_helper() -> Option<std::process::Command> {
+    CTRL_C_HELPER.get().map(std::process::Command::new)
+}
+
+#[cfg(all(windows, test))]
+fn ctrl_c_helper() -> Option<std::process::Command> {
+    tests::ctrl_c_helper()
+}
+
+/// [`ctrl_c_console_of`] `pid`, done by this program started again without a console (see
+/// [`serve_ctrl_c`]). Waits for it, 10 s at most. Blocking.
+#[cfg(windows)]
+fn ctrl_c_by_helper(pid: u32) -> bool {
+    use std::os::windows::process::CommandExt;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    let Some(mut helper) = ctrl_c_helper() else { return false };
+    helper.env(CTRL_C_PID, pid.to_string()).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let Ok(mut helper) = helper.creation_flags(DETACHED_PROCESS).spawn() else { return false };
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match helper.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            _ => {
+                let _ = helper.kill();
+                let _ = helper.wait();
+                return false;
+            }
+        }
     }
 }
 
@@ -5978,10 +6046,9 @@ mod tests {
         bin
     }
 
-    /// Runs the yt-dlp `bin` and stops it once it reports progress; returns what the run gave and
+    /// Runs yt-dlp as `cmd` and stops it once it reports progress; returns what the run gave and
     /// how long it took.
-    #[cfg(unix)]
-    async fn stop_recording(bin: &Path) -> (Result<PathBuf, String>, Duration) {
+    async fn stop_recording(cmd: Command) -> (Result<PathBuf, String>, Duration) {
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         let cancel = Arc::new(AtomicBool::new(false));
         let stop = async {
@@ -5989,7 +6056,7 @@ mod tests {
             cancel.store(true, Ordering::Relaxed);
         };
         let started = std::time::Instant::now();
-        let (result, ()) = tokio::join!(run_ytdlp(tree_command(bin), Some(&tx), Some(Arc::clone(&cancel)), None), stop);
+        let (result, ()) = tokio::join!(run_ytdlp(cmd, Some(&tx), Some(Arc::clone(&cancel)), None), stop);
         (result, started.elapsed())
     }
 
@@ -6003,16 +6070,144 @@ mod tests {
         let (out_s, part_s) = (output.display(), with_part(&output).display().to_string());
         std::fs::write(with_part(&output), b"recording").unwrap();
         let finish = format!("echo HFPOST x; sleep 5; echo finished > \"{out_s}\"; rm -f \"{part_s}\"; echo \"HFPATH {out_s}\"; exit 0");
-        let (result, took) = stop_recording(&recording_ytdlp(dir.path(), &output, &finish)).await;
+        let (result, took) = stop_recording(tree_command(&recording_ytdlp(dir.path(), &output, &finish))).await;
         assert_eq!(result, Ok(output.clone()));
         assert_eq!(std::fs::read(&output).unwrap(), b"finished\n");
         assert!(took >= Duration::from_secs(5), "killed while finishing, after {took:?}");
 
         std::fs::remove_file(&output).unwrap();
         std::fs::write(with_part(&output), b"recording").unwrap();
-        let (result, took) = stop_recording(&recording_ytdlp(dir.path(), &output, "")).await;
+        let (result, took) = stop_recording(tree_command(&recording_ytdlp(dir.path(), &output, ""))).await;
         assert_eq!(result, Ok(output.clone()));
         assert_eq!(std::fs::read(&output).unwrap(), b"recording");
         assert!(took >= LIVE_STOP_GRACE && took < LIVE_STOP_GRACE * 3, "{took:?}");
+    }
+
+    /// Where the yt-dlp this test binary stands in for records (see [`records_as_yt_dlp_does`]).
+    #[cfg(windows)]
+    const FAKE_RECORDING: &str = "HYPERFETCH_TEST_RECORDING";
+    /// Makes that yt-dlp go on recording when asked to stop.
+    #[cfg(windows)]
+    const FAKE_GOES_ON: &str = "HYPERFETCH_TEST_GOES_ON";
+    /// Keeps a process from having the Ctrl+C helper send its Ctrl+C (see [`ctrl_c_helper`]).
+    #[cfg(windows)]
+    const NO_CTRL_C_HELPER: &str = "HYPERFETCH_TEST_NO_CTRL_C_HELPER";
+    /// Runs [`a_stopped_recording_is_finished_by_yt_dlp_on_windows`] as the GUI does.
+    #[cfg(windows)]
+    const AS_THE_GUI: &str = "HYPERFETCH_TEST_AS_THE_GUI";
+
+    /// This test binary, running only the test `name`.
+    #[cfg(windows)]
+    fn this_test(name: &str) -> std::process::Command {
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args(["--exact", name, "--nocapture"]);
+        cmd
+    }
+
+    /// The Ctrl+C helper of this test binary (see `super::ctrl_c_helper`): the test below.
+    #[cfg(windows)]
+    pub(super) fn ctrl_c_helper() -> Option<std::process::Command> {
+        std::env::var_os(NO_CTRL_C_HELPER).is_none().then(|| this_test("media::tests::sends_a_ctrl_c_as_the_helper"))
+    }
+
+    /// Started as the Ctrl+C helper, sends it (see [`serve_ctrl_c`]); else does nothing.
+    #[cfg(windows)]
+    #[test]
+    fn sends_a_ctrl_c_as_the_helper() {
+        send_ctrl_c_if_asked();
+    }
+
+    /// Started as yt-dlp (see [`FAKE_RECORDING`]), records a live stream until a Ctrl+C, then
+    /// finishes the file as yt-dlp does, which takes it 5 s; else does nothing. It takes the Ctrl+C
+    /// as Python does: only when this process does not ignore it.
+    #[cfg(windows)]
+    #[test]
+    fn records_as_yt_dlp_does() {
+        use std::io::Write;
+        use windows_sys::Win32::Foundation::BOOL;
+        use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+        static STOPPED: AtomicBool = AtomicBool::new(false);
+        unsafe extern "system" fn on_ctrl_c(_event: u32) -> BOOL {
+            STOPPED.store(true, Ordering::SeqCst);
+            1
+        }
+        let Some(output) = std::env::var_os(FAKE_RECORDING).map(PathBuf::from) else { return };
+        // SAFETY: the handler is a function that lives as long as the process.
+        unsafe { SetConsoleCtrlHandler(Some(on_ctrl_c), 1) };
+        let mut out = std::io::stdout();
+        writeln!(out, "HFLIVE True {}\ntotal_size=1000", output.display()).unwrap();
+        out.flush().unwrap();
+        while !STOPPED.load(Ordering::SeqCst) || std::env::var_os(FAKE_GOES_ON).is_some() {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        writeln!(out, "HFPOST x").unwrap();
+        out.flush().unwrap();
+        std::thread::sleep(Duration::from_secs(5));
+        std::fs::write(&output, b"finished").unwrap();
+        let _ = std::fs::remove_file(with_part(&output));
+        writeln!(out, "HFPATH {}", output.display()).unwrap();
+        out.flush().unwrap();
+        std::process::exit(0);
+    }
+
+    /// yt-dlp recording into `output` (see [`records_as_yt_dlp_does`]).
+    #[cfg(windows)]
+    fn recording_ytdlp(output: &Path, goes_on: bool) -> Command {
+        let mut cmd = tree_command(&std::env::current_exe().unwrap());
+        cmd.args(["--exact", "media::tests::records_as_yt_dlp_does", "--nocapture"]).env(FAKE_RECORDING, output);
+        if goes_on {
+            cmd.env(FAKE_GOES_ON, "1");
+        }
+        cmd
+    }
+
+    /// Asked to stop, yt-dlp finishes the recording itself; one that goes on recording is killed
+    /// once [`LIVE_STOP_GRACE`] is over, and its file kept.
+    #[cfg(windows)]
+    async fn stop_and_finish_recording(dir: &Path, goes_on: bool) {
+        let output = dir.join(if goes_on { "going on.mp4" } else { "clip.mp4" });
+        std::fs::write(with_part(&output), b"recording").unwrap();
+        let (result, took) = stop_recording(recording_ytdlp(&output, goes_on)).await;
+        assert_eq!(result, Ok(output.clone()));
+        if goes_on {
+            assert_eq!(std::fs::read(&output).unwrap(), b"recording");
+            assert!(took >= LIVE_STOP_GRACE && took < LIVE_STOP_GRACE * 4, "{took:?}");
+        } else {
+            assert_eq!(std::fs::read(&output).unwrap(), b"finished");
+            assert!(took >= Duration::from_secs(5) && took < LIVE_STOP_GRACE * 4, "{took:?}");
+        }
+    }
+
+    /// As the CLI stops a recording: from a process with a console of its own, which has the
+    /// helper send the Ctrl+C; and as the GUI does, from one without, which sends it itself (its
+    /// own copy of it swallowed, its standard handles put back), and whose yt-dlp takes it even
+    /// though the GUI was started with Ctrl+C ignored.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_stopped_recording_is_finished_by_yt_dlp_on_windows() {
+        use windows_sys::Win32::System::Console::{GetConsoleCP, GetStdHandle, SetConsoleCtrlHandler, STD_OUTPUT_HANDLE};
+        let dir = tempfile::tempdir().unwrap();
+        if std::env::var_os(AS_THE_GUI).is_some() {
+            // SAFETY: plain Win32 calls.
+            assert_eq!(unsafe { GetConsoleCP() }, 0, "the GUI has no console");
+            let stdout = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+            stop_and_finish_recording(dir.path(), false).await;
+            assert_eq!(unsafe { GetStdHandle(STD_OUTPUT_HANDLE) }, stdout);
+            return;
+        }
+        // yt-dlp takes a Ctrl+C this test process may have been started ignoring, as the CLI's
+        // yt-dlp does in a terminal.
+        // SAFETY: plain Win32 call.
+        unsafe { SetConsoleCtrlHandler(None, 0) };
+        stop_and_finish_recording(dir.path(), false).await;
+        stop_and_finish_recording(dir.path(), true).await;
+
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        let mut gui = tokio::process::Command::from(this_test("media::tests::a_stopped_recording_is_finished_by_yt_dlp_on_windows"));
+        gui.env(AS_THE_GUI, "1").env(NO_CTRL_C_HELPER, "1").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        // Without a console, and with Ctrl+C ignored.
+        let status = gui.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP).status().await.unwrap();
+        assert!(status.success(), "{status}");
     }
 }
