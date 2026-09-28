@@ -445,6 +445,19 @@ fn advanced_options(app: &mut App, ui: &mut egui::Ui) {
 
     ui.add_space(4.0);
     ui.horizontal(|ui| {
+        ui.label(RichText::new("Subtitles:").size(12.0));
+        ui.add_sized([110.0, 24.0], egui::TextEdit::singleline(&mut app.settings.subtitles).hint_text(hint_text("en,es or all")))
+            .on_hover_text(
+                "Languages to save a video's subtitles in, as .srt or .vtt files next to it; a site's own subtitles \
+                 first, else its automatic captions. A language it has none in is skipped.",
+            );
+        ui.add_space(12.0);
+        ui.checkbox(&mut app.settings.embed_metadata, "Embed tags and chapters")
+            .on_hover_text("Write the title, artist, date, description, link and chapters into the file (needs ffmpeg)");
+    });
+
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
         ui.label(RichText::new("Speed Limit:").size(12.0)).on_hover_text("For all downloads running at once together");
         ui.add(egui::DragValue::new(&mut app.settings.max_speed).range(0.0..=1_000_000.0).speed(1.0).max_decimals(1));
         let in_mb = &mut app.settings.max_speed_in_mb;
