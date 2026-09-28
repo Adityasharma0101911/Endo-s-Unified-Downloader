@@ -1674,16 +1674,17 @@ fn install_ffmpeg_archive(bin_dir: &Path, asset: &str, archive: &Path, tar: &Pat
 
 /// Deletes the temporary files and folders of ffmpeg installs in `bin_dir` that nothing has
 /// written to for an hour: an install that is still downloading writes to its file, and one that
-/// stalls fails within [`INSTALL_STALL_TIMEOUT`]. Blocking.
+/// stalls fails within [`INSTALL_STALL_TIMEOUT`]. The time is the file's own, not the folder
+/// listing's: on Windows that one is updated only when the file is closed. Blocking.
 fn remove_stale_ffmpeg_files(bin_dir: &Path) {
     let Ok(entries) = std::fs::read_dir(bin_dir) else { return };
     for entry in entries.flatten() {
-        let stale = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .is_ok_and(|t| t.elapsed().is_ok_and(|age| age > Duration::from_secs(3600)));
-        if stale && entry.file_name().to_string_lossy().starts_with(".ffmpeg-") {
-            let path = entry.path();
+        let path = entry.path();
+        let stale = entry.file_name().to_string_lossy().starts_with(".ffmpeg-")
+            && std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .is_ok_and(|t| t.elapsed().is_ok_and(|age| age > Duration::from_secs(3600)));
+        if stale {
             let _ = std::fs::remove_dir_all(&path).or_else(|_| std::fs::remove_file(&path));
         }
     }
@@ -5315,6 +5316,23 @@ bbd8671c6c05eaa3ec29d690695aebadff0871faa3efe9051581afbf3c01e80e  ffmpeg-master-
         assert_eq!(managed_ffmpeg(dir.path()), Some(loose), "a build without its ffprobe");
         std::fs::write(managed_ffmpeg_dir(dir.path()).join(exe_name("ffprobe")), b"x").unwrap();
         assert_eq!(managed_ffmpeg(dir.path()), Some(built));
+    }
+
+    /// An install's file nothing wrote to for an hour is removed, and one still being written to
+    /// is kept, although the folder's listing on Windows keeps the time it had until it is closed.
+    #[test]
+    fn only_ffmpeg_install_files_nothing_writes_to_are_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = SystemTime::now() - Duration::from_secs(7200);
+        let [stale, busy, other] = [".ffmpeg-1.zip", ".ffmpeg-2.zip", "yt-dlp.exe"].map(|name| dir.path().join(name));
+        for path in [&stale, &busy, &other] {
+            std::fs::File::create(path).unwrap().set_modified(old).unwrap();
+        }
+        let mut writing = std::fs::OpenOptions::new().append(true).open(&busy).unwrap();
+        std::io::Write::write_all(&mut writing, b"more").unwrap();
+        remove_stale_ffmpeg_files(dir.path());
+        assert!(!stale.exists());
+        assert!(busy.exists() && other.exists());
     }
 
     /// Without ffmpeg an audio preset's failure says why ffmpeg is missing; a video preset's (it
