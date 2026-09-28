@@ -3,7 +3,7 @@
 //! Every file is a task under the folder's own name (subfolders kept), marked `from_document`:
 //! its link is one the listing made, so the Authorization header the user gave is not sent there.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -79,7 +79,7 @@ async fn retried<T, Fut: Future<Output = Result<T, Failed>>>(mut request: impl F
 const DRIVE_API: &str = "https://www.googleapis.com/drive/v3/";
 
 /// What the Drive API tells of each child of a folder (see [`DriveItem`]).
-const DRIVE_FIELDS: &str = "nextPageToken,files(id,name,mimeType,size,md5Checksum,modifiedTime,resourceKey,shortcutDetails)";
+const DRIVE_FIELDS: &str = "nextPageToken,files(id,name,mimeType,size,md5Checksum,resourceKey,shortcutDetails)";
 
 const DRIVE_SHORTCUT: &str = "application/vnd.google-apps.shortcut";
 
@@ -177,14 +177,42 @@ pub async fn list(http: &reqwest::Client, url: &Url, options: &ListOptions) -> O
     })
 }
 
-/// `tasks` less those whose line the download archive holds (see `Task::archive`), read off the
-/// runtime's threads: none left is nothing new to do, not an error.
+/// `tasks` less those the download archive, read off the runtime's threads, has (see
+/// [`Archived`]): none left is nothing new to do, not an error.
 async fn not_downloaded(mut tasks: Vec<Task>) -> Result<Vec<Task>, String> {
     let Some(file) = crate::media::archive_file() else { return Ok(tasks) };
     let read = tokio::task::spawn_blocking(move || crate::media::read_archive(&file));
     let archive = read.await.map_err(|e| format!("Background task failed: {e}"))??;
-    tasks.retain(|task| !task.archive.iter().any(|line| archive.contains(line)));
+    let archived = Archived::of(&archive);
+    tasks.retain(|task| !task.archive.iter().any(|line| archived.has(line)));
     Ok(tasks)
+}
+
+/// The download archive's lines, and the MD5s its Drive lines name by file id (None for a line
+/// that names none; see [`DriveChild::archive_line`]).
+struct Archived<'a> {
+    lines: &'a HashSet<String>,
+    drive: HashMap<&'a str, Vec<Option<&'a str>>>,
+}
+
+impl<'a> Archived<'a> {
+    fn of(lines: &'a HashSet<String>) -> Self {
+        let mut drive: HashMap<_, Vec<_>> = HashMap::new();
+        for rest in lines.iter().filter_map(|line| line.strip_prefix("gdrive ")) {
+            let (id, md5) = rest.split_once(' ').map_or((rest, None), |(id, md5)| (id, Some(md5)));
+            drive.entry(id).or_default().push(md5);
+        }
+        Self { lines, drive }
+    }
+
+    /// Whether the archive has `line`. A Drive file is had by any line of its id, whichever
+    /// listing (with an API key or without) noted it, unless `line` names the MD5 of its content
+    /// and every line of its id another one: that is new content.
+    fn has(&self, line: &str) -> bool {
+        let Some(rest) = line.strip_prefix("gdrive ") else { return self.lines.contains(line) };
+        let (id, md5) = rest.split_once(' ').map_or((rest, None), |(id, md5)| (id, Some(md5)));
+        self.drive.get(id).is_some_and(|noted| md5.is_none() || noted.iter().any(|n| n.is_none() || *n == md5))
+    }
 }
 
 /// `name` made one path component, else `id` (a name like ".." leaves nothing).
@@ -260,8 +288,6 @@ struct DriveChild {
     resource_key: Option<String>,
     size: Option<u64>,
     md5: Option<String>,
-    /// When it last changed, as the API tells it (RFC 3339).
-    modified: Option<String>,
     /// Reached through a shortcut (`id` is the target's).
     shortcut: bool,
 }
@@ -284,7 +310,6 @@ struct DriveItem {
     /// A decimal string, as the API gives 64-bit numbers.
     size: Option<String>,
     md5_checksum: Option<String>,
-    modified_time: Option<String>,
     resource_key: Option<String>,
     shortcut_details: Option<DriveShortcut>,
 }
@@ -311,17 +336,16 @@ struct DriveName {
 }
 
 impl From<DriveItem> for DriveChild {
-    /// A shortcut stands for its target, under the shortcut's name (the size, checksum and time
-    /// of change it has are its own, not the target's).
+    /// A shortcut stands for its target, under the shortcut's name (the size and checksum it
+    /// has are its own, not the target's).
     fn from(item: DriveItem) -> Self {
         let (id, mime_type, resource_key, shortcut) = match item.shortcut_details {
             Some(target) if item.mime_type == DRIVE_SHORTCUT => (target.target_id, target.target_mime_type, target.target_resource_key, true),
             _ => (item.id, item.mime_type, item.resource_key, false),
         };
         let kind = drive_kind(&id, &mime_type, resource_key.as_deref());
-        let (size, md5, modified) =
-            if shortcut { (None, None, None) } else { (item.size.and_then(|s| s.parse().ok()), item.md5_checksum, item.modified_time) };
-        DriveChild { id, name: item.name, kind, resource_key, size, md5, modified, shortcut }
+        let (size, md5) = if shortcut { (None, None) } else { (item.size.and_then(|s| s.parse().ok()), item.md5_checksum) };
+        DriveChild { id, name: item.name, kind, resource_key, size, md5, shortcut }
     }
 }
 
@@ -345,7 +369,7 @@ fn drive_kind(id: &str, mime_type: &str, resource_key: Option<&str>) -> Kind {
 /// The child of a Drive folder the embedded view links as `href`: a folder, a file, or a
 /// document of Docs, Sheets or Slides (by its editor link); anything else is left out.
 fn page_child(href: &str, name: String) -> DriveChild {
-    let child = |id, name, kind, resource_key| DriveChild { id, name, kind, resource_key, size: None, md5: None, modified: None, shortcut: false };
+    let child = |id, name, kind, resource_key| DriveChild { id, name, kind, resource_key, size: None, md5: None, shortcut: false };
     let Ok(url) = Url::parse(href) else { return child(String::new(), name, Kind::Other, None) };
     let resource_key = url.query_pairs().find(|(k, _)| k == "resourcekey").map(|(_, v)| v.into_owned());
     if let Some(Folder::Drive { id, resource_key, maybe: false }) = folder_of(&url) {
@@ -365,11 +389,13 @@ fn page_child(href: &str, name: String) -> DriveChild {
 
 impl DriveChild {
     /// Its line in the download archive (see `Task::archive`): its id and, where the listing
-    /// tells one, its version (the MD5 of its content, else when it last changed), so that a
-    /// file changed since it was downloaded is new again. The folder's page tells none.
+    /// tells it, the MD5 of its content, so that a file changed since it was downloaded is new
+    /// again (see [`Archived::has`]). The folder's page tells none, and a Docs, Sheets or Slides
+    /// document has none: it is known by its id alone, as an export saved next to one downloaded
+    /// before on each edit would pile up copies.
     fn archive_line(&self) -> String {
-        match self.md5.as_ref().or(self.modified.as_ref()) {
-            Some(version) => format!("gdrive {} {}", self.id, version),
+        match &self.md5 {
+            Some(md5) => format!("gdrive {} {}", self.id, md5),
             None => format!("gdrive {}", self.id),
         }
     }
@@ -981,10 +1007,26 @@ mod tests {
         assert_eq!(folders, [("sub9".to_string(), None, root.join("Link to sub"))]);
         assert_eq!(others, 2, "a form and a shortcut without a target have nothing to download");
         assert_eq!(with_extension("Deck", "pptx"), "Deck.pptx");
-        // Each file's line in the download archive: its id and the version the API tells (the
-        // MD5 of its content, else when it last changed; a shortcut's own time is not its target's).
+        // Each file's line in the download archive: its id and the MD5 of its content the API
+        // tells; a document's is its id alone, however often it is edited.
         let archive: Vec<_> = tasks.iter().map(|t| t.archive.join("|")).collect();
-        assert_eq!(archive, ["gdrive f1 5d41402abc4b2a76b9719d911017c592", "gdrive d1 2026-03-02T11:30:00.000Z", "gdrive d2", "gdrive x1", "gdrive f9"]);
+        assert_eq!(archive, ["gdrive f1 5d41402abc4b2a76b9719d911017c592", "gdrive d1", "gdrive d2", "gdrive x1", "gdrive f9"]);
+    }
+
+    /// A Drive file noted in the archive by one listing is had by the next, with an API key or
+    /// without, and a document whatever its version then was; a file whose MD5 the listing
+    /// tells is new only when every line of its id names another MD5.
+    #[test]
+    fn a_drive_file_is_known_by_its_id_whatever_listing_noted_it() {
+        let lines: HashSet<String> =
+            ["gdrive keyless", "gdrive keyed aaa", "gdrive doc 2026-03-02T11:30:00.000Z", "gdrive changed old", "mediafire q1 h1"].map(String::from).into();
+        let archived = Archived::of(&lines);
+        for had in ["gdrive keyless", "gdrive keyless aaa", "gdrive keyed", "gdrive keyed aaa", "gdrive doc", "mediafire q1 h1"] {
+            assert!(archived.has(had), "{had}");
+        }
+        for new in ["gdrive changed new", "gdrive other", "gdrive other aaa", "mediafire q1 h2"] {
+            assert!(!archived.has(new), "{new}");
+        }
     }
 
     /// Drive API errors as the API answered them (a bad key, no key, a rate limit and a daily
