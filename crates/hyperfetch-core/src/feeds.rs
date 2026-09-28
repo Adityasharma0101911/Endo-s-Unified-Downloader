@@ -99,8 +99,27 @@ pub async fn list(http: &reqwest::Client, url: &Url, options: &ListOptions) -> O
 /// unless `sure` it is one, when its host cannot be reached or is busy (see [`fetch`]).
 async fn read_feed(http: &reqwest::Client, url: &Url, sure: bool) -> Result<Option<Feed>, String> {
     let Some((bytes, base)) = fetch(http, url, true, sure).await? else { return Ok(None) };
-    let text = decode_text(&bytes).unwrap_or_else(|_| String::from_utf8_lossy(&bytes).into_owned());
-    parse_feed(&text, &base).transpose()
+    parse_feed(&decode_feed(&bytes), &base).transpose()
+}
+
+/// A feed's text: UTF-8, or UTF-16 with a BOM (see [`decode_text`]); else windows-1252, which is
+/// what the ISO-8859-1 many older feeds declare stands for on the web (it only adds letters and
+/// signs at 0x80-0x9F). A feed in another single-byte encoding gets wrong letters, not an error.
+fn decode_feed(bytes: &[u8]) -> String {
+    decode_text(bytes).unwrap_or_else(|_| bytes.iter().map(|&byte| windows_1252(byte)).collect())
+}
+
+/// The character a windows-1252 byte stands for. The five bytes it leaves unassigned are the C1
+/// controls of the same number, as browsers read them.
+fn windows_1252(byte: u8) -> char {
+    const HIGH: [char; 32] = [
+        '€', '\u{81}', '‚', 'ƒ', '„', '…', '†', '‡', 'ˆ', '‰', 'Š', '‹', 'Œ', '\u{8D}', 'Ž', '\u{8F}',
+        '\u{90}', '‘', '’', '“', '”', '•', '–', '—', '˜', '™', 'š', '›', 'œ', '\u{9D}', 'ž', 'Ÿ',
+    ];
+    match byte {
+        0x80..=0x9F => HIGH[usize::from(byte - 0x80)],
+        _ => char::from(byte),
+    }
 }
 
 /// The body at `url` and where it came from (after redirects), at most [`MAX_FEED_BYTES`]; None
@@ -1130,6 +1149,19 @@ mod tests {
         assert_eq!(feed.title.as_deref(), Some("Prefixed"));
         let tasks = feed_tasks(feed, None, &Done::default()).unwrap();
         assert_eq!(names(&tasks), ["2026-02-01 Only.mp3"]);
+    }
+
+    /// A feed saved as ISO-8859-1 or windows-1252 keeps its accented letters and typographic
+    /// signs, which name its episodes' files.
+    #[test]
+    fn latin1_feeds_are_read_as_windows_1252() {
+        let mut rss = br#"<?xml version="1.0" encoding="ISO-8859-1"?><rss version="2.0"><channel><title>Caf"#.to_vec();
+        rss.extend_from_slice(b"\xE9</title><item><title>\x93Folge 1\x94 \x96 Gr\xFC\xDFe \x80</title>");
+        rss.extend_from_slice(br#"<enclosure url="https://l.example/1.mp3" type="audio/mpeg"/></item></channel></rss>"#);
+        let feed = parse(&decode_feed(&rss), "https://l.example/feed.xml").unwrap().unwrap();
+        assert_eq!((feed.title.as_deref(), feed.episodes[0].title.as_str()), (Some("Café"), "“Folge 1” – Grüße €"));
+        assert_eq!(decode_feed("Ünïcode".as_bytes()), "Ünïcode");
+        assert_eq!(decode_feed(b"\x81\x8D\x8F\x90\x9D\xFF"), "\u{81}\u{8D}\u{8F}\u{90}\u{9D}ÿ");
     }
 
     #[test]
