@@ -81,6 +81,14 @@ fn status_badge(app: &App, item: &QueueItem) -> (&'static str, Color32) {
 pub fn render(app: &mut App, ui: &mut egui::Ui) {
     ui.add_space(8.0);
     header(app, ui);
+    if app.closing {
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new("Finishing the live recordings; the window closes once they are saved. Close it again to quit now and cut them off.")
+                .size(12.0)
+                .color(AMBER),
+        );
+    }
     clipboard_banner(app, ui);
     listing_prompt(app, ui);
     if let Some(notice) = app.notice.clone() {
@@ -342,7 +350,8 @@ fn download_actions(app: &mut App, ui: &mut egui::Ui, item: Option<&QueueItem>) 
             }
         }
         QueueItemStatus::Pausing => {
-            ui.label(RichText::new("Pausing... saving resume state").color(MUTED));
+            let text = if app.is_recording(id) { "Stopping... finishing the recording" } else { "Pausing... saving resume state" };
+            ui.label(RichText::new(text).color(MUTED));
             ui.add(egui::Spinner::new());
         }
         QueueItemStatus::Paused | QueueItemStatus::Failed(_) => {
@@ -586,6 +595,9 @@ fn status_line(app: &App, item: Option<&QueueItem>) -> (String, Color32) {
             (format!("Finishing {}: verifying the file and moving it into place...", item.filename), MUTED)
         }
         QueueItemStatus::Downloading => (format!("Downloading {}", item.filename), MUTED),
+        QueueItemStatus::Pausing if app.is_recording(item.id) => {
+            ("Stopping: yt-dlp is finishing the recording...".to_string(), MUTED)
+        }
         QueueItemStatus::Pausing => ("Pausing: saving resume state...".to_string(), MUTED),
         QueueItemStatus::Paused => (
             "Paused. Resume continues where it stopped; Start Over deletes the partial file first.".to_string(),
