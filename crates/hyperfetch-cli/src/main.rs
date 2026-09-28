@@ -64,7 +64,7 @@ async fn app(args: Args) -> i32 {
         Err(e) => return usage(&e),
     };
     if args.urls.is_empty() && args.input_file.is_none() {
-        interactive(&args, &ui, &shutdown, &http).await
+        interactive(&args, &ui, &shutdown, &http, prompt).await
     } else {
         batch(&args, &ui, &shutdown, &http).await
     }
@@ -251,8 +251,7 @@ async fn read_tasks(
         match ingest(tokens, http, list).await {
             Ok(found) if found.is_empty() => {
                 if !ui.quiet() {
-                    let input = truncate(&tokens.join(" "), 60);
-                    ui.error(&format!("Nothing new in {}: all it lists was downloaded before (--all-items gets it all again)", input));
+                    ui.error(&nothing_new(&tokens.join(" ")));
                 }
             }
             Ok(found) => tasks.extend(found.into_iter().map(|task| (*line, task))),
@@ -263,6 +262,11 @@ async fn read_tasks(
         }
     }
     (tasks, failed)
+}
+
+/// What is said of an input whose listing has nothing new (see [`read_tasks`]).
+fn nothing_new(input: &str) -> String {
+    format!("Nothing new in {}: all it lists was downloaded before (--all-items gets it all again)", truncate(input, 60))
 }
 
 async fn batch(args: &Args, ui: &Ui, shutdown: &Shutdown, http: &reqwest::Client) -> i32 {
@@ -328,13 +332,18 @@ fn default_download_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// Prompt loop used when no URL is given. Command-line options apply to every download.
-async fn interactive(args: &Args, ui: &Ui, shutdown: &Shutdown, http: &reqwest::Client) -> i32 {
+/// Prompt loop used when no URL is given, asking with `ask` (see [`prompt`]). Command-line
+/// options apply to every download.
+async fn interactive<F, Fut>(args: &Args, ui: &Ui, shutdown: &Shutdown, http: &reqwest::Client, mut ask: F) -> i32
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = Option<String>>,
+{
     stdout_line(&format!("Endo's Unified Downloader {}", env!("CARGO_PKG_VERSION")));
     let default_dir = args.dir.clone().unwrap_or_else(default_download_dir);
     let mut failed = 0;
     loop {
-        let Some(input) = prompt("\nURL(s) of one file (space-separated mirrors), magnet, metalink or torrent;\nEnter to exit:\n> ".to_string()).await
+        let Some(input) = ask("\nURL(s) of one file (space-separated mirrors), magnet, metalink or torrent;\nEnter to exit:\n> ".to_string()).await
         else {
             break;
         };
@@ -343,6 +352,11 @@ async fn interactive(args: &Args, ui: &Ui, shutdown: &Shutdown, http: &reqwest::
         }
         let tokens = input_tokens(&input).await;
         let tasks = match ingest(&tokens, http, &list_options(args)).await {
+            // A playlist, channel, feed or folder with nothing new: nothing to save anywhere.
+            Ok(tasks) if tasks.is_empty() => {
+                stdout_line(&nothing_new(&input));
+                continue;
+            }
             Ok(tasks) => tasks,
             Err(e) => {
                 stderr_line(&format!("[ERROR] {}", e));
@@ -354,7 +368,7 @@ async fn interactive(args: &Args, ui: &Ui, shutdown: &Shutdown, http: &reqwest::
             continue;
         }
 
-        let answer = prompt(format!("Connections per download [{}]: ", args.connections)).await.unwrap_or_default();
+        let answer = ask(format!("Connections per download [{}]: ", args.connections)).await.unwrap_or_default();
         let connections = match answer.parse::<u64>() {
             Ok(n @ 1..=64) => n,
             _ if answer.is_empty() => args.connections,
@@ -363,7 +377,7 @@ async fn interactive(args: &Args, ui: &Ui, shutdown: &Shutdown, http: &reqwest::
                 args.connections
             }
         };
-        let answer = prompt(format!("Save directory [{}]: ", default_dir.display())).await.unwrap_or_default();
+        let answer = ask(format!("Save directory [{}]: ", default_dir.display())).await.unwrap_or_default();
         let prepared = prepare_dir(if answer.is_empty() { &default_dir } else { Path::new(&answer) }).await;
         let dir = match prepared {
             Ok(dir) => match check_output_file(&dir, args.output.as_deref()).await {
@@ -384,7 +398,7 @@ async fn interactive(args: &Args, ui: &Ui, shutdown: &Shutdown, http: &reqwest::
         if let Some(code) = shutdown.requested() {
             return code;
         }
-        let again = prompt("\nDownload another file? [y/N]: ".to_string()).await.unwrap_or_default();
+        let again = ask("\nDownload another file? [y/N]: ".to_string()).await.unwrap_or_default();
         if !again.eq_ignore_ascii_case("y") {
             break;
         }
@@ -846,6 +860,54 @@ mod tests {
             batch(&args, &Ui::new(true), &Shutdown::install(), &reqwest::Client::new()).await
         });
         assert_eq!(code, EXIT_OK);
+    }
+
+    /// Answers every request with the RSS feed `body`.
+    async fn serve_feed(body: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let (mut head, mut buf) = (Vec::new(), [0u8; 1024]);
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => head.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/rss+xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = socket.write_all(format!("{head}{body}").as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{}", addr)
+    }
+
+    /// A link that lists nothing new is said so, and the next link is asked for, not where to
+    /// save nothing.
+    #[tokio::test]
+    async fn interactive_mode_asks_for_the_next_link_when_a_listing_has_nothing_new() {
+        let feed = r#"<?xml version="1.0"?><rss version="2.0"><channel><title>Show</title>
+            <item><title>One</title><enclosure url="https://cdn.example/1.mp3" type="audio/mpeg"/></item></channel></rss>"#;
+        let server = serve_feed(feed).await;
+        let dir = test_dir("interactive");
+        let mut args = parse(&["--all-items", "-d", dir.to_str().unwrap()]);
+        // The newest none of its episodes: nothing new, without the history being read.
+        args.latest = Some(0);
+        let mut answers = [format!("{server}/show.rss"), String::new()].into_iter();
+        let mut asked = Vec::new();
+        let ask = |question: String| {
+            asked.push(question);
+            std::future::ready(answers.next())
+        };
+        let code = interactive(&args, &Ui::new(true), &Shutdown::install(), &reqwest::Client::new(), ask).await;
+        assert_eq!(code, EXIT_OK);
+        assert_eq!(asked.len(), 2, "{asked:?}");
+        assert!(asked.iter().all(|question| question.contains("URL(s)")), "{asked:?}");
     }
 
     #[test]
