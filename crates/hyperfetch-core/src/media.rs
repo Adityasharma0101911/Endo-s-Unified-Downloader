@@ -1422,7 +1422,7 @@ fn build_ytdlp_args(
         args.extend(["--wait-for-video".to_string(), WAIT_FOR_VIDEO.to_string()]);
     }
     if matches!(kind, RunKind::Download | RunKind::Subtitles) {
-        args.extend(subtitle_args(options));
+        args.extend(subtitle_args(options, ffmpeg_dir.is_some()));
     }
     if kind == RunKind::Download {
         args.extend(embed_args(options, ffmpeg_dir.is_some()));
@@ -1471,21 +1471,26 @@ fn sub_langs(options: &MediaDownloadOptions) -> Option<(String, bool)> {
     (!langs.is_empty()).then(|| (langs.join(","), all))
 }
 
-/// yt-dlp arguments that write the subtitles `options` ask for next to the video, as the site
-/// has them: `.srt`, else `.vtt`, else its best format. Not converted (`--convert-subs`): a
-/// conversion that fails is an error of the whole run, even with `--ignore-errors`. A language named
-/// gets the site's subtitles, else its automatic captions (a language only those have, `en-orig`,
-/// is one to name); `all` gets every language the site has subtitles in, not the automatic
-/// captions, often a hundred machine translations. A language the site lacks is left out, and one
-/// that fails to download is a warning (`--ignore-errors`), not the failure of the video.
-fn subtitle_args(options: &MediaDownloadOptions) -> Vec<String> {
+/// yt-dlp arguments that write the subtitles `options` ask for next to the video: the site's
+/// `.srt`, else its `.vtt`, else its best format, converted to `.srt` when ffmpeg is at hand
+/// (yt-dlp converts TTML itself, ffmpeg the rest). A language named gets the site's subtitles, else
+/// its automatic captions (a language only those have, `en-orig`, is one to name); `all` gets every
+/// language the site has subtitles in, not the automatic captions, often a hundred machine
+/// translations. A language the site lacks is left out; one that fails to download, or to convert
+/// (its file then stays as the site had it), is a warning, not the failure of the video
+/// (`--ignore-errors`, see [`OutputState::only_steps_failed`]).
+fn subtitle_args(options: &MediaDownloadOptions, have_ffmpeg: bool) -> Vec<String> {
     let Some((langs, all)) = sub_langs(options) else { return Vec::new() };
     let mut args = vec!["--write-subs".to_string()];
     if !all {
         args.push("--write-auto-subs".to_string());
     }
     args.extend(["--sub-langs".to_string(), langs]);
-    args.extend(["--sub-format", "srt/vtt/best", "--ignore-errors"].map(String::from));
+    args.extend(["--sub-format", "srt/vtt/best"].map(String::from));
+    if have_ffmpeg {
+        args.extend(["--convert-subs", "srt"].map(String::from));
+    }
+    args.push("--ignore-errors".to_string());
     args
 }
 
@@ -1597,6 +1602,10 @@ struct OutputState {
     ffmpeg_rate: f64,
     /// The downloads are done and yt-dlp is making the file of them (see [`POSTPROCESS_TEMPLATE`]).
     finishing: bool,
+    /// An `ERROR:` that no video yt-dlp finished (see [`PATH_TEMPLATE`]) has followed yet.
+    error_pending: bool,
+    /// A video failed: an error was pending when the next one began.
+    video_failed: bool,
 }
 
 impl OutputState {
@@ -1622,6 +1631,7 @@ impl OutputState {
             return Some(self.shown(update));
         }
         if let Some(video) = line.strip_prefix(LIVE_MARK) {
+            self.video_failed |= self.error_pending;
             let (live, file) = video.split_once(' ').unwrap_or((video, ""));
             self.live = live == "True";
             self.file = file.to_string();
@@ -1651,6 +1661,7 @@ impl OutputState {
         if let Some(path) = line.strip_prefix(PATH_MARK) {
             // With --no-playlist this is the only file, otherwise the playlist's last one.
             self.final_path = Some(PathBuf::from(path));
+            self.error_pending = false;
             return None;
         }
         if !from_stderr || line.trim().is_empty() {
@@ -1658,6 +1669,7 @@ impl OutputState {
         }
         if line.starts_with("ERROR:") {
             self.errors.push(line.to_string());
+            self.error_pending = true;
         } else if line.starts_with("WARNING:") {
             tracing::warn!("yt-dlp: {line}");
         }
@@ -1676,6 +1688,14 @@ impl OutputState {
         } else {
             update
         }
+    }
+
+    /// Whether each error yt-dlp reported was of a step of a video it went on to finish: with
+    /// `--ignore-errors` (see [`subtitle_args`]) it goes past a step that fails once a video has
+    /// begun (a subtitle it cannot convert, the cover art, the tags) and exits 1, the video whole.
+    /// Not when a video failed, nor when an error came after the last video it finished.
+    fn only_steps_failed(&self) -> bool {
+        !self.errors.is_empty() && !self.error_pending && !self.video_failed
     }
 
     fn failure_message(&self, status: ExitStatus) -> String {
@@ -2075,14 +2095,18 @@ async fn run_ytdlp(
     if interrupted {
         return stopped(&state, ffmpeg).await;
     }
-    if !status.success() {
+    let failed = !status.success();
+    if failed && !state.only_steps_failed() {
         return Err(state.failure_message(status));
     }
-    let path = state.final_path.ok_or("yt-dlp finished without reporting an output file")?;
-    match tokio::fs::metadata(&path).await {
-        Ok(meta) if meta.is_file() => Ok(path),
-        _ => Err(format!("yt-dlp reported {} but no such file exists", path.display())),
+    let path = state.final_path.take().ok_or("yt-dlp finished without reporting an output file")?;
+    if !is_file(&path).await {
+        return Err(if failed { state.failure_message(status) } else { format!("yt-dlp reported {} but no such file exists", path.display()) });
     }
+    if failed {
+        tracing::warn!("yt-dlp made {}, but: {}", path.display(), state.errors.join("\n"));
+    }
+    Ok(path)
 }
 
 async fn sleep_until(deadline: Option<tokio::time::Instant>) {
@@ -3393,9 +3417,10 @@ async fn download_with(
                                         }
                                         Err(e) => Err(e),
                                     };
-                                    // The video is whole whatever becomes of them.
+                                    // The video is whole whatever becomes of them (one yt-dlp could
+                                    // not convert stays as the site had it).
                                     if let Err(e) = wrote {
-                                        tracing::warn!("No subtitles for {}: {e}", path.display());
+                                        tracing::warn!("Subtitles of {}: {e}", path.display());
                                     }
                                 }
                                 return Ok(path);
@@ -5568,11 +5593,14 @@ mod tests {
     #[test]
     fn subtitles_are_asked_of_the_runs_that_write_files() {
         let named = MediaDownloadOptions { subtitles: Some(" en, es ,".to_string()), ..Default::default() };
-        let wanted = ["--write-subs", "--write-auto-subs", "--sub-langs", "en,es", "--sub-format", "srt/vtt/best", "--ignore-errors"];
-        for (kind, ffmpeg) in [(RunKind::Download, true), (RunKind::Download, false), (RunKind::Subtitles, true)] {
-            let args = args_of(&named, kind, ffmpeg);
-            // As the site has them: a conversion that fails would fail the video.
-            assert!(holds(&args, &wanted) && !args.contains(&"--convert-subs".to_string()), "{args:?}");
+        let wanted = ["--write-subs", "--write-auto-subs", "--sub-langs", "en,es", "--sub-format", "srt/vtt/best"];
+        for kind in [RunKind::Download, RunKind::Subtitles] {
+            // Converted to SRT by ffmpeg; without it, as the site has them.
+            let args = args_of(&named, kind, true);
+            assert!(holds(&args, &wanted) && holds(&args, &["--convert-subs", "srt", "--ignore-errors"]), "{args:?}");
+            let args = args_of(&named, kind, false);
+            assert!(holds(&args, &[&wanted[..], &["--ignore-errors"]].concat()), "{args:?}");
+            assert!(!args.contains(&"--convert-subs".to_string()), "{args:?}");
         }
         // Every language the site has subtitles in, none of its machine translations nor a chat.
         let all = MediaDownloadOptions { subtitles: Some("ALL".to_string()), ..Default::default() };
@@ -5591,6 +5619,73 @@ mod tests {
         let only = args_of(&named, RunKind::Subtitles, true);
         assert!(only.contains(&"--skip-download".to_string()) && !only.contains(&"--embed-metadata".to_string()), "{only:?}");
         assert!(!only.contains(&PROGRESS_TEMPLATE.to_string()), "{only:?}");
+    }
+
+    /// With --ignore-errors yt-dlp exits 1 for a step that failed once a video began; the video it
+    /// went on to finish is whole. A video that failed, or an error after the last finished one,
+    /// fails the run.
+    #[test]
+    fn a_failed_step_of_a_finished_video_is_not_its_failure() {
+        let out = std::env::temp_dir();
+        let state = |lines: &[String]| {
+            let mut state = OutputState::default();
+            for line in lines {
+                state.handle_line(line, line.starts_with("ERROR:"));
+            }
+            state
+        };
+        let video = |name: &str| format!("HFLIVE False {}", out.join(name).display());
+        let made = |name: &str| format!("HFPATH {}", out.join(name).display());
+        let error = "ERROR: Conversion failed!".to_string();
+        // A subtitle it could not convert (before the download), the cover art (after it).
+        for at in [1, 2] {
+            let mut lines = vec![video("a.mp4"), "HFPOST a".to_string(), made("a.mp4")];
+            lines.insert(at, error.clone());
+            assert!(state(&lines).only_steps_failed(), "{lines:?}");
+        }
+        for lines in [
+            // Nothing failed.
+            vec![video("a.mp4"), made("a.mp4")],
+            // The video, an earlier one of a playlist, or its extraction failed.
+            vec![video("a.mp4"), error.clone()],
+            vec![video("a.mp4"), error.clone(), video("b.mp4"), made("b.mp4")],
+            vec![error.clone(), video("b.mp4"), made("b.mp4")],
+            // After the last video.
+            vec![video("a.mp4"), made("a.mp4"), error.clone()],
+        ] {
+            assert!(!state(&lines).only_steps_failed(), "{lines:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_video_yt_dlp_made_is_whole_whatever_step_failed_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("clip.mp4");
+        let out_s = output.display();
+        #[cfg(windows)]
+        let (bin, script) = (
+            dir.path().join("yt-dlp.cmd"),
+            format!(
+                "@echo off\r\necho HFLIVE False {out_s}\r\n>&2 echo ERROR: Conversion failed!\r\necho HFPOST x\r\n\
+                 if \"%1\"==\"make\" echo video> \"{out_s}\"\r\necho HFPATH {out_s}\r\nexit /b 1\r\n"
+            ),
+        );
+        #[cfg(not(windows))]
+        let (bin, script) = (
+            dir.path().join("yt-dlp"),
+            format!(
+                "#!/bin/sh\necho 'HFLIVE False {out_s}'\necho 'ERROR: Conversion failed!' >&2\necho HFPOST x\n\
+                 [ \"$1\" = make ] && echo video > '{out_s}'\necho 'HFPATH {out_s}'\nexit 1\n"
+            ),
+        );
+        std::fs::write(&bin, script).unwrap();
+        #[cfg(unix)]
+        make_executable(&bin).unwrap();
+        // The file it reported is missing: the step's error is the failure.
+        assert_eq!(run_ytdlp(tree_command(&bin), None, None, None).await, Err("ERROR: Conversion failed!".to_string()));
+        let mut make = tree_command(&bin);
+        make.arg("make");
+        assert_eq!(run_ytdlp(make, None, None, None).await, Ok(output));
     }
 
     #[test]
