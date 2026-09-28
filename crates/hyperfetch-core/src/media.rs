@@ -126,6 +126,12 @@ impl BrowserCookieSource {
     }
 }
 
+/// `text` in a yt-dlp output template, where it stands for itself: a `%` would start a field
+/// (`50%(off)s`) or, on Windows, name an environment variable (`%USERNAME%`), so it is doubled.
+pub fn template_literal(text: &str) -> String {
+    text.replace('%', "%%")
+}
+
 /// Options for configuring a media download
 #[derive(Debug, Clone)]
 pub struct MediaDownloadOptions {
@@ -133,6 +139,8 @@ pub struct MediaDownloadOptions {
     pub cookies: BrowserCookieSource,
     pub proxy: Option<String>,
     pub output_dir: PathBuf,
+    /// yt-dlp output template of the file's name; a name given as it is has its `%` doubled (see
+    /// [`template_literal`]). None names the file by its title.
     pub output_filename: Option<String>,
     pub custom_ytdlp_path: Option<PathBuf>,
     pub concurrent_fragments: usize,
@@ -2243,7 +2251,8 @@ fn build_ytdlp_args(
     }
 
     let file_template = options.output_filename.as_deref().unwrap_or("%(title)s.%(ext)s");
-    args.extend(["-o".to_string(), options.output_dir.join(file_template).to_string_lossy().to_string()]);
+    let dir = PathBuf::from(template_literal(&options.output_dir.to_string_lossy()));
+    args.extend(["-o".to_string(), dir.join(file_template).to_string_lossy().to_string()]);
     match source {
         Source::Url(url) => args.push(url.to_string()),
         Source::Urls(urls) => args.extend(urls.iter().map(Url::to_string)),
@@ -4770,6 +4779,22 @@ mod tests {
         let options = MediaDownloadOptions { output_dir: PathBuf::from("out"), ..Default::default() };
         let args = build_ytdlp_args(Source::Url(&url), &options, RunKind::Download, &[], None, None, Some("2026.08.19"));
         assert!(!args.iter().any(|a| a == "--http-chunk-size"), "{args:?}");
+    }
+
+    /// The folder is no template: a `%` in its name stands for itself, and the file's name is
+    /// the template given.
+    #[test]
+    fn a_percent_sign_in_the_folder_stands_for_itself() {
+        let url = Url::parse("https://vimeo.com/123").unwrap();
+        let output = |output_dir: &str, output_filename: Option<&str>| {
+            let options =
+                MediaDownloadOptions { output_dir: PathBuf::from(output_dir), output_filename: output_filename.map(String::from), ..Default::default() };
+            let args = build_ytdlp_args(Source::Url(&url), &options, RunKind::Download, &[], None, None, Some("2026.08.19"));
+            args[args.iter().position(|a| a == "-o").unwrap() + 1].clone()
+        };
+        let expected = |dir: &str, name: &str| Path::new(dir).join(name).to_string_lossy().into_owned();
+        assert_eq!(output("50%(off)s %USERNAME%", None), expected("50%%(off)s %%USERNAME%%", "%(title)s.%(ext)s"));
+        assert_eq!(output("100%", Some("%(title)s [%(id)s].%(ext)s")), expected("100%%", "%(title)s [%(id)s].%(ext)s"));
     }
 
     #[test]

@@ -559,7 +559,7 @@ impl DownloadEngine {
             Some(p) if is_dir_target(p) => (p.clone(), self.options.media_name.clone()),
             Some(p) => (
                 p.parent().unwrap_or(Path::new(".")).to_path_buf(),
-                p.file_name().map(|n| n.to_string_lossy().to_string()),
+                p.file_name().map(|n| crate::media::template_literal(&n.to_string_lossy())),
             ),
             None => (PathBuf::from("."), self.options.media_name.clone()),
         };
@@ -5027,6 +5027,8 @@ mod tests {
         assert_eq!(named(dir.path().to_path_buf(), Some(template.clone())), Some(template.clone()));
         assert_eq!(named(dir.path().to_path_buf(), None), None);
         assert_eq!(named(dir.path().join("mine.mp4"), Some(template.clone())), Some("mine.mp4".to_string()));
+        // It is not a template: its `%` stands for itself.
+        assert_eq!(named(dir.path().join("50%(off)s %USERNAME%.mp4"), None), Some("50%%(off)s %%USERNAME%%.mp4".to_string()));
         let with = DownloadOptions { media_name: Some(template.clone()), ..Default::default() };
         let back: DownloadOptions = serde_json::from_str(&serde_json::to_string(&with).unwrap()).unwrap();
         assert_eq!(back.media_name, Some(template));
