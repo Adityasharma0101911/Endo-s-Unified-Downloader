@@ -242,6 +242,11 @@ const WAIT_FOR_VIDEO: &str = "60-600";
 /// recording before it is killed and its file kept as it is. Once it has, yt-dlp finishes the
 /// file (remuxes, joins, tags it), however long that takes.
 const LIVE_STOP_GRACE: Duration = if cfg!(test) { Duration::from_secs(3) } else { Duration::from_secs(30) };
+/// A live recording is ended as a stop ends it once less than this is left on its disk: a full
+/// disk would cut it off mid-write, and finishing the file needs room (see [`run_ytdlp`]).
+const MIN_FREE_SPACE: u64 = 512 * 1024 * 1024;
+/// How often the space left on a live recording's disk is looked at.
+const DISK_CHECK_EVERY: Duration = if cfg!(test) { Duration::from_millis(100) } else { Duration::from_secs(10) };
 /// Keeps ffmpeg from moving the index of a file it writes tags into to the front (see
 /// [`NO_FASTSTART`]).
 const NO_FASTSTART_METADATA: [&str; 2] = ["--postprocessor-args", "Metadata+ffmpeg_o:-movflags -faststart"];
@@ -2935,12 +2940,25 @@ fn ytdlp_command(bin: &Path, args: &[String], proxy: Option<&str>, work_dir: &Pa
 /// video in it and whether the run made its file (see [`OutputState::archive`]). Cancelling kills
 /// it, but for a live recording, which it is asked to end as a Ctrl+C ends it (one that has ended
 /// is left to finish its file), and then gives the file recorded so far (see [`stopped`]): only
-/// part of the stream, which the archive does not record.
+/// part of the stream, which the archive does not record. A live recording is also ended so when
+/// less than [`MIN_FREE_SPACE`] is left on its disk, and one that breaks off keeps what it
+/// recorded; both fail, naming the file kept.
 async fn run_ytdlp(
+    cmd: Command,
+    progress_tx: Option<&Sender<ProgressUpdate>>,
+    cancel_flag: Option<Arc<AtomicBool>>,
+    ffmpeg: Option<&Path>,
+) -> Result<(PathBuf, Vec<(String, bool)>), String> {
+    run_ytdlp_watching(cmd, progress_tx, cancel_flag, ffmpeg, MIN_FREE_SPACE).await
+}
+
+/// [`run_ytdlp`], ending a live recording once less than `min_free` bytes are left on its disk.
+async fn run_ytdlp_watching(
     mut cmd: Command,
     progress_tx: Option<&Sender<ProgressUpdate>>,
     cancel_flag: Option<Arc<AtomicBool>>,
     ffmpeg: Option<&Path>,
+    min_free: u64,
 ) -> Result<(PathBuf, Vec<(String, bool)>), String> {
     #[cfg(windows)]
     let_children_take_ctrl_c();
@@ -2955,6 +2973,10 @@ async fn run_ytdlp(
     tokio::pin!(cancelled);
     // A live recording asked to stop, and until when it may take to stop recording.
     let (mut interrupted, mut deadline) = (false, None);
+    // The space left on a live recording's disk when it was ended for that.
+    let mut disk_full = None;
+    let mut disk_check = tokio::time::interval(DISK_CHECK_EVERY);
+    disk_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let mut state = OutputState::default();
     let (mut out_buf, mut err_buf) = (Vec::new(), Vec::new());
@@ -2977,7 +2999,25 @@ async fn run_ytdlp(
             () = sleep_until(deadline) => {
                 tracing::warn!("yt-dlp did not stop the live recording within {}s; killing it", LIVE_STOP_GRACE.as_secs());
                 tree.kill_and_reap(&mut child).await;
-                return stopped(&state, ffmpeg).await.map(|path| (path, Vec::new()));
+                return ended(stopped(&state, ffmpeg).await, disk_full).map(|path| (path, Vec::new()));
+            }
+            _ = disk_check.tick(), if state.live && !state.finishing && !interrupted => {
+                let dir = state.recording.first().and_then(|file| file.parent()).map(Path::to_path_buf);
+                let free = match dir {
+                    Some(dir) => tokio::task::spawn_blocking(move || free_space(&dir)).await.ok().flatten(),
+                    None => None,
+                };
+                if let Some(free) = free.filter(|&free| free < min_free) {
+                    tracing::warn!("Only {free} bytes are left on the disk of the live recording: ending it");
+                    disk_full = Some(free);
+                    if !tree.interrupt(&child).await {
+                        tree.kill_and_reap(&mut child).await;
+                        return ended(stopped(&state, ffmpeg).await, disk_full).map(|path| (path, Vec::new()));
+                    }
+                    interrupted = true;
+                    deadline = Some(tokio::time::Instant::now() + LIVE_STOP_GRACE);
+                }
+                None
             }
             read = stdout.read_until(b'\n', &mut out_buf), if out_open => {
                 take_line(read, &mut out_buf, &mut out_open).and_then(|line| state.handle_line(&line, false))
@@ -3000,11 +3040,17 @@ async fn run_ytdlp(
     tree.disarm();
 
     if interrupted {
-        return stopped(&state, ffmpeg).await.map(|path| (path, Vec::new()));
+        return ended(stopped(&state, ffmpeg).await, disk_full).map(|path| (path, Vec::new()));
     }
     let failed = !status.success();
     if failed && !state.only_steps_failed() {
-        return Err(state.failure_message(status));
+        let failure = state.failure_message(status);
+        // A live recording that broke off keeps what it recorded, not only as a `.part` that a
+        // retry would record over.
+        return Err(match stopped(&state, ffmpeg).await.ok().filter(|_| state.live) {
+            Some(kept) => format!("The live recording broke off; {RECORDING_KEPT} {}:\n{failure}", kept.display()),
+            None => failure,
+        });
     }
     let path = state.final_path.take().ok_or("yt-dlp finished without reporting an output file")?;
     if !is_file(&path).await {
@@ -3014,6 +3060,57 @@ async fn run_ytdlp(
         tracing::warn!("yt-dlp made {}, but: {}", path.display(), state.errors.join("\n"));
     }
     Ok((path, state.archive))
+}
+
+/// How the error of a live recording that ended early goes on, naming the file it was kept as.
+const RECORDING_KEPT: &str = "what it recorded is kept as";
+
+/// What a stopped run gives (see [`stopped`]): a live recording ended because only `disk_full`
+/// bytes were left on its disk fails, naming the file that keeps what it recorded.
+fn ended(kept: Result<PathBuf, String>, disk_full: Option<u64>) -> Result<PathBuf, String> {
+    match (kept, disk_full) {
+        (Ok(path), Some(free)) => Err(format!(
+            "The live recording was ended with only {:.1} MiB left on the disk; {RECORDING_KEPT} {}",
+            free as f64 / (1024.0 * 1024.0),
+            path.display()
+        )),
+        (kept, _) => kept,
+    }
+}
+
+/// Bytes this user may still write on the disk that holds `dir`; None when that cannot be told.
+/// Blocking.
+fn free_space(dir: &Path) -> Option<u64> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let wide: Vec<u16> = dir.as_os_str().encode_wide().chain([0]).collect();
+        let mut free = 0u64;
+        // SAFETY: a NUL-terminated path and a valid out-pointer; the totals are not asked for.
+        let ok = unsafe {
+            windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(wide.as_ptr(), &mut free, std::ptr::null_mut(), std::ptr::null_mut())
+        };
+        (ok != 0).then_some(free)
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+        // SAFETY: statvfs is plain data, which all zeros is a valid value of.
+        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        // SAFETY: a NUL-terminated path and a valid out-pointer.
+        if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
+            return None;
+        }
+        // The fields' types differ between platforms.
+        #[allow(clippy::unnecessary_cast)]
+        Some((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = dir;
+        None
+    }
 }
 
 async fn sleep_until(deadline: Option<tokio::time::Instant>) {
@@ -4500,7 +4597,9 @@ async fn download_with(
             }
             Err(err) => err,
         };
-        if updated || !tools.managed || is_cancelled(&cancel_flag) {
+        // A live recording that ended early was found and recorded: a newer yt-dlp would only
+        // record over what it kept.
+        if updated || !tools.managed || is_cancelled(&cancel_flag) || err.contains(RECORDING_KEPT) {
             return Err(err);
         }
 
@@ -8145,6 +8244,61 @@ bbd8671c6c05eaa3ec29d690695aebadff0871faa3efe9051581afbf3c01e80e  ffmpeg-master-
         let mut left = names_in(dir.path());
         left.retain(|n| *n != bin_name);
         assert_eq!(left, [name]);
+    }
+
+    /// A stand-in for yt-dlp that records a live stream into `output`, reporting as yt-dlp and its
+    /// ffmpeg do, then does `then`: breaks off with an error, or records on for 30 s.
+    fn live_ytdlp(dir: &Path, output: &Path, breaks_off: bool) -> PathBuf {
+        let out_s = output.display();
+        #[cfg(windows)]
+        let (bin, then) = (
+            dir.join("yt-dlp.cmd"),
+            if breaks_off { "1>&2 echo ERROR: [youtube] live1: Connection reset by peer\r\nexit /b 1" } else { "ping -n 30 127.0.0.1 >nul" },
+        );
+        #[cfg(windows)]
+        let script = format!("@echo off\r\necho HFLIVE True {out_s}\r\necho bitrate= 800.0kbits/s\r\necho total_size=1000\r\n{then}\r\n");
+        #[cfg(not(windows))]
+        let (bin, then) =
+            (dir.join("yt-dlp"), if breaks_off { "echo 'ERROR: [youtube] live1: Connection reset by peer' >&2\nexit 1" } else { "sleep 30" });
+        #[cfg(not(windows))]
+        let script = format!("#!/bin/sh\necho 'HFLIVE True {out_s}'\necho 'bitrate= 800.0kbits/s'\necho 'total_size=1000'\n{then}\n");
+        std::fs::write(&bin, script).unwrap();
+        #[cfg(unix)]
+        make_executable(&bin).unwrap();
+        bin
+    }
+
+    /// A live recording that breaks off keeps what it recorded, made playable, and fails saying
+    /// where that is: not left as a `.part` that trying again would record over.
+    #[tokio::test]
+    async fn a_live_recording_that_breaks_off_keeps_what_it_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("clip.mp4");
+        ts_recording(None, &with_part(&output));
+        let bin = live_ytdlp(dir.path(), &output, true);
+        let error = run_ytdlp(tree_command(&bin), None, None, None).await.unwrap_err();
+        let kept = dir.path().join("clip.ts");
+        assert!(error.contains(&format!("kept as {}", kept.display())) && error.ends_with("Connection reset by peer"), "{error}");
+        assert!(kept.is_file() && !with_part(&output).exists());
+    }
+
+    /// A live recording is ended once too little is left on its disk, keeping what it recorded,
+    /// and fails saying so.
+    #[tokio::test]
+    async fn a_live_recording_is_ended_when_its_disk_fills_up() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(free_space(dir.path()).is_some_and(|free| free > 0));
+        let output = dir.path().join("clip.mp4");
+        ts_recording(None, &with_part(&output));
+        let bin = live_ytdlp(dir.path(), &output, false);
+        let started = std::time::Instant::now();
+        let error = run_ytdlp_watching(tree_command(&bin), None, None, None, u64::MAX).await.unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(25), "{:?}", started.elapsed());
+        let kept = dir.path().join("clip.ts");
+        assert!(error.starts_with("The live recording was ended with only"), "{error}");
+        assert!(error.ends_with(&format!("kept as {}", kept.display())) && kept.is_file(), "{error}");
+        // With room left it records on until it ends.
+        assert_eq!(ended(Ok(kept.clone()), None), Ok(kept));
     }
 
     /// A recording that the ffmpeg killed with yt-dlp still holds is moved once Windows lets go of

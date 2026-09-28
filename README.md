@@ -253,6 +253,7 @@ A live stream is recorded by yt-dlp. This covers a site's live video and an HLS 
   - An MPEG-TS recording is named `.ts`, then remuxed to `.mp4` when ffmpeg is present.
   - Video and audio recorded apart are joined with ffmpeg.
   - A recording that cannot be renamed is kept as its `.part` file and reported done under that name.
+- A recording that breaks off (the connection drops, the stream fails) keeps what it recorded the same way, and the download fails naming that file. So does one ended because less than 512 MiB was left on its disk, which is checked every 10 seconds while it records: a full disk would cut the file off mid-write, and finishing it needs room.
 - DRM-protected live TV (a FairPlay, Widevine or other non-`identity` key format) is refused, not recorded.
 
 ---
