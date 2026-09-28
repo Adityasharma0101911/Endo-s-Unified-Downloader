@@ -116,7 +116,7 @@ All `URLS` given on the command line are **mirrors of one file**, except a link 
 | `--max-retries N` | Failed attempts allowed per chunk before the download gives up. | `8` |
 | `--stall-timeout SECS` | Seconds without data before a connection is retried (1-3600). | `30` |
 | `--checksum SUM` | Expected checksum: `sha256:HEX`, `sha512:HEX`, `sha1:HEX`, `md5:HEX`, `blake3:HEX` or bare hex. Only for a single download or `--verify`. | |
-| `--header HEADER` | Authorization header, as `"Authorization: Bearer TOKEN"` or `"Bearer TOKEN"`. Other header names are rejected. It is never sent to the mirrors a `.metalink` or `.torrent` lists. | |
+| `--header HEADER` | Authorization header, as `"Authorization: Bearer TOKEN"` or `"Bearer TOKEN"`. Other header names are rejected. It is never sent to the mirrors a `.metalink` or `.torrent` lists, nor to the files, episodes and videos a folder, feed, playlist or channel lists. | |
 | `--load-cookies FILE` | Netscape `cookies.txt` file. | |
 | `--proxy URL` | `http://`, `https://`, `socks5://` or `socks5h://` proxy. | |
 | `--media-preset PRESET` | `best`, `1080p`, `720p`, `mp3`, `m4a`, or any yt-dlp format selector. With a preset, page URLs that are not direct files are also sent to yt-dlp. | `best` |
