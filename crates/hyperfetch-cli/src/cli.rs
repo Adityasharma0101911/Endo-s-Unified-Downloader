@@ -92,6 +92,10 @@ pub struct Args {
     #[arg(long = "header", value_name = "HEADER", value_parser = parse_auth_header, conflicts_with = "repair")]
     pub auth_header: Option<String>,
 
+    /// HTTP Referer header, e.g. "https://dood.to/" or the embedding web page URL
+    #[arg(long = "referer", value_name = "URL", conflicts_with = "repair")]
+    pub referer: Option<String>,
+
     /// Proxy URL (http://, https://, socks5:// or socks5h://)
     #[arg(long = "proxy", value_name = "URL", value_parser = parse_proxy, conflicts_with = "repair")]
     pub proxy: Option<String>,

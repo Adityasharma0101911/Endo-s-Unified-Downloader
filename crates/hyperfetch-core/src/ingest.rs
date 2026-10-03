@@ -45,6 +45,8 @@ pub struct Task {
     /// `engine::DownloadOptions::archive_lines`), which leave it out of a later listing with
     /// `only_new`: a feed episode's, or a cloud folder file's.
     pub archive: Vec<String>,
+    /// Optional HTTP Referer header for links requiring anti-hotlinking bypass.
+    pub referer: Option<String>,
 }
 
 impl Task {

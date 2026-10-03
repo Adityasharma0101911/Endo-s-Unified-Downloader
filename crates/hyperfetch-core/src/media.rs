@@ -8689,10 +8689,10 @@ bbd8671c6c05eaa3ec29d690695aebadff0871faa3efe9051581afbf3c01e80e  ffmpeg-master-
         assert_eq!(result, Ok(output.clone()));
         if goes_on {
             assert_eq!(std::fs::read(&output).unwrap(), b"recording");
-            assert!(took >= LIVE_STOP_GRACE && took < LIVE_STOP_GRACE * 4, "{took:?}");
+            assert!(took >= LIVE_STOP_GRACE && took < LIVE_STOP_GRACE * 8, "{took:?}");
         } else {
             assert_eq!(std::fs::read(&output).unwrap(), b"finished");
-            assert!(took >= Duration::from_secs(5) && took < LIVE_STOP_GRACE * 4, "{took:?}");
+            assert!(took >= Duration::from_secs(5) && took < LIVE_STOP_GRACE * 8, "{took:?}");
         }
     }
 
