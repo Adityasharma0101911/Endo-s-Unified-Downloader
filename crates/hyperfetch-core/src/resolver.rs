@@ -1307,6 +1307,52 @@ pub(crate) fn with_agent_for(request: reqwest::RequestBuilder, url: &Url) -> req
     }
 }
 
+/// Returns the appropriate Referer header value for `url`, if required by the target host or CDN.
+pub fn referer_for_url(url: &Url) -> Option<String> {
+    let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+
+    // 1. DoodStream / CloudataCDN streaming tokens require dood.to or self referer
+    if host.contains("cloudatacdn") || host.contains("dood") || host.contains("ds2play") || host.contains("doodstream") {
+        return Some("https://dood.to/".to_string());
+    }
+
+    // 2. Anna's Archive
+    if host.contains("annas-archive") {
+        return Some("https://annas-archive.gl/".to_string());
+    }
+
+    // 3. Other known video hosting / CDN streaming domains that enforce anti-hotlinking
+    if host.contains("streamtape") || host.contains("mixdrop") || host.contains("voe.sx") || host.contains("streamwish") || host.contains("filelions") {
+        let scheme = url.scheme();
+        return Some(format!("{}://{}/", scheme, host));
+    }
+
+    // 4. If path indicates a video or stream, default to the origin
+    let path = url.path().to_ascii_lowercase();
+    if path.contains("/video/") || path.contains("/videos/") || path.contains("/stream/") {
+        let scheme = url.scheme();
+        return Some(format!("{}://{}/", scheme, host));
+    }
+
+    None
+}
+
+/// Attaches the appropriate Referer header to `request` for `url` unless already provided by `explicit_referer`.
+pub(crate) fn with_referer_for(
+    request: reqwest::RequestBuilder,
+    url: &Url,
+    explicit_referer: Option<&str>,
+) -> reqwest::RequestBuilder {
+    if let Some(r) = explicit_referer.filter(|s| !s.trim().is_empty()) {
+        return request.header(reqwest::header::REFERER, r.trim());
+    }
+    if let Some(r) = referer_for_url(url) {
+        request.header(reqwest::header::REFERER, r)
+    } else {
+        request
+    }
+}
+
 async fn with_timeout(
     fut: impl Future<Output = Result<Vec<Url>, ResolverError>>,
 ) -> Result<Vec<Url>, ResolverError> {

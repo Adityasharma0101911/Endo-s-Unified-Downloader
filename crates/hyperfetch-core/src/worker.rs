@@ -130,11 +130,12 @@ impl RateLimiter {
     }
 }
 
-/// The user's `Authorization` header, scoped to the hosts the user named: resolved, scraped and
+/// The user's `Authorization` or `Referer` headers, scoped to the hosts the user named: resolved, scraped and
 /// third-party URLs never receive it, and neither does plain HTTP to a host given as HTTPS.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Auth {
-    value: HeaderValue,
+    value: Option<HeaderValue>,
+    referer: Option<String>,
     user_urls: Vec<Url>,
 }
 
@@ -142,7 +143,16 @@ impl Auth {
     pub(crate) fn new(value: &str, user_urls: &[Url]) -> Result<Self, String> {
         let mut value = HeaderValue::from_str(value).map_err(|_| "Invalid Authorization header value".to_string())?;
         value.set_sensitive(true);
-        Ok(Self { value, user_urls: user_urls.to_vec() })
+        Ok(Self { value: Some(value), referer: None, user_urls: user_urls.to_vec() })
+    }
+
+    pub(crate) fn with_referer(mut self, referer: Option<String>) -> Self {
+        self.referer = referer;
+        self
+    }
+
+    pub(crate) fn only_referer(referer: &str, user_urls: &[Url]) -> Self {
+        Self { value: None, referer: Some(referer.to_string()), user_urls: user_urls.to_vec() }
     }
 
     fn allows(&self, url: &Url) -> bool {
@@ -154,11 +164,14 @@ impl Auth {
 }
 
 /// Adds the user's `Authorization` header to a request for `url` when `auth` covers that URL,
-/// and the User-Agent `url`'s host takes (see [`crate::resolver::with_agent_for`]).
+/// the User-Agent `url`'s host takes (see [`crate::resolver::with_agent_for`]), and the
+/// appropriate `Referer` header (see [`crate::resolver::with_referer_for`]).
 pub(crate) fn authorize(request: RequestBuilder, auth: Option<&Auth>, url: &Url) -> RequestBuilder {
     let request = crate::resolver::with_agent_for(request, url);
-    match auth.filter(|a| a.allows(url)) {
-        Some(a) => request.header(AUTHORIZATION, a.value.clone()),
+    let explicit_referer = auth.and_then(|a| a.referer.as_deref());
+    let request = crate::resolver::with_referer_for(request, url, explicit_referer);
+    match auth.filter(|a| a.allows(url)).and_then(|a| a.value.as_ref()) {
+        Some(v) => request.header(AUTHORIZATION, v.clone()),
         None => request,
     }
 }
@@ -398,7 +411,13 @@ impl HttpWorker {
             _ = chunk.revoked.cancelled() => return Err(taken_over()),
             res = tokio::time::timeout(s.stall_timeout, request.send()) => match res {
                 Err(_) => return Err((FailureKind::Transient, format!("no response within {}s", s.stall_timeout.as_secs()))),
-                Ok(Err(e)) => return Err((FailureKind::Transient, format!("request failed: {}", e))),
+                Ok(Err(e)) => {
+                    let err_str = e.to_string();
+                    if err_str.contains("rate limited") || err_str.contains("too many") {
+                        return Err((FailureKind::Throttled(Some(std::time::Duration::from_secs(5))), format!("request throttled: {}", e)));
+                    }
+                    return Err((FailureKind::Transient, format!("request failed: {}", e)));
+                }
                 Ok(Ok(resp)) => resp,
             },
         };

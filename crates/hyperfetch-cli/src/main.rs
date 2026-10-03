@@ -163,6 +163,7 @@ fn job(args: &Args, connections: u64, dir: &Path, task: Task) -> Job {
         cookies_path: args.load_cookies.clone(),
         // --header is for the hosts the user named, not those a .metalink or .torrent lists.
         auth_header: args.auth_header.clone().filter(|_| !task.from_document),
+        referer: args.referer.clone().filter(|_| !task.from_document).or(task.referer),
         proxy: args.proxy.clone(),
         media_preset: args.media_preset.clone(),
         browser_cookies: args.cookies_from_browser.map(Into::into),

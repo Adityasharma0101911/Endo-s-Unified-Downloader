@@ -46,6 +46,16 @@ impl HostKey {
             port: url.port_or_known_default(),
         }
     }
+
+    /// Default connection cap for hosts known to aggressively throttle or sinkhole concurrent connections.
+    pub fn default_connection_cap(&self) -> Option<usize> {
+        let host = self.host.to_ascii_lowercase();
+        if host.contains("cloudatacdn") || host.contains("dood") || host.contains("ds2play") || host.contains("doodstream") {
+            Some(4)
+        } else {
+            None
+        }
+    }
 }
 
 /// What a host was seen to do. Each fact is `None` when it is unknown or older than `PROFILE_TTL`.
@@ -261,9 +271,10 @@ impl Entry {
     }
 
     /// Requests the host may have open once one under `limit` joins them.
-    fn allowance(&self, limit: usize, now: Instant) -> usize {
+    fn allowance(&self, key: &HostKey, limit: usize, now: Instant) -> usize {
         let own = (limit > 0).then_some(limit);
-        [own, self.strictest(), fresh(self.facts.connection_cap, now)]
+        let cap = fresh(self.facts.connection_cap, now).or_else(|| key.default_connection_cap());
+        [own, self.strictest(), cap]
             .into_iter()
             .flatten()
             .min()
@@ -280,7 +291,11 @@ struct Hosts {
 
 impl Hosts {
     fn profile(&self, key: &HostKey, now: Instant) -> HostProfile {
-        self.entries.lock().get(key).map_or_else(HostProfile::default, |entry| entry.facts.profile(now))
+        let mut prof = self.entries.lock().get(key).map_or_else(HostProfile::default, |entry| entry.facts.profile(now));
+        if prof.connection_cap.is_none() {
+            prof.connection_cap = key.default_connection_cap();
+        }
+        prof
     }
 
     fn record(&self, key: &HostKey, seen: HostProfile, now: Instant) {
@@ -297,7 +312,7 @@ impl Hosts {
     fn try_acquire(&'static self, key: &HostKey, limit: usize, now: Instant) -> Option<HostSlot> {
         let mut entries = self.entries.lock();
         let entry = entries.entry(key.clone()).or_default();
-        if entry.open >= entry.allowance(limit, now) {
+        if entry.open >= entry.allowance(key, limit, now) {
             return None;
         }
         entry.open += 1;

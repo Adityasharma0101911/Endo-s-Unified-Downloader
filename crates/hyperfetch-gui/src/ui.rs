@@ -516,6 +516,7 @@ fn advanced_options(app: &mut App, ui: &mut egui::Ui) {
 
     text_row(ui, "Proxy:", &mut app.settings.proxy, "Optional: http://127.0.0.1:8080 or socks5://127.0.0.1:1080");
     text_row(ui, "Auth:", &mut app.auth_input, "Optional Authorization header, e.g. Bearer <token> (not saved, not sent to clipboard links)");
+    text_row(ui, "Referer:", &mut app.settings.referer, "Optional HTTP Referer header, e.g. https://dood.to/ or embedding site");
 
     ui.add_space(4.0);
     ui.horizontal(|ui| {

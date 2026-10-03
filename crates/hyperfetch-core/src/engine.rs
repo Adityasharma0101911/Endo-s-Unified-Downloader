@@ -130,6 +130,7 @@ pub struct DownloadOptions {
     /// Never serialized, so saved options (e.g. a persisted queue) don't leak the credential.
     #[serde(skip)]
     pub auth_header: Option<String>,
+    pub referer: Option<String>,
     pub proxy: Option<String>,
     pub media_preset: Option<crate::media::MediaQualityPreset>,
     /// The quality of a link that turns out to be media only once it answers (a web page one of
@@ -184,6 +185,7 @@ impl Default for DownloadOptions {
             expected_checksum: None,
             cookies_path: None,
             auth_header: None,
+            referer: None,
             proxy: None,
             media_preset: None,
             page_media_preset: None,
@@ -213,6 +215,7 @@ pub struct ClientKey {
     credentials: bool,
     proxy: Option<String>,
     cookies_path: Option<PathBuf>,
+    referer: Option<String>,
 }
 
 impl ClientKey {
@@ -221,6 +224,7 @@ impl ClientKey {
             credentials: options.auth_header.is_some(),
             proxy: options.proxy.clone(),
             cookies_path: options.cookies_path.clone(),
+            referer: options.referer.clone(),
         }
     }
 }
@@ -264,17 +268,28 @@ impl DownloadEngine {
         // A "leaving this site" link stands for its target, as the front ends' ingest takes it:
         // that is what is downloaded, recorded, and given the credentials.
         let urls: Vec<Url> = urls.into_iter().map(|u| crate::resolver::unwrap_redirect(&u).unwrap_or(u)).collect();
-        let auth = options.auth_header.as_deref().map(|value| Auth::new(value, &urls));
-        let client = match &auth {
-            Some(Err(e)) => Err(e.clone()),
-            _ => client,
+        let auth = match (options.auth_header.as_deref(), options.referer.as_deref()) {
+            (Some(value), referer) => match Auth::new(value, &urls) {
+                Ok(a) => Some(Arc::new(a.with_referer(referer.map(str::to_string)))),
+                Err(e) => return Self {
+                    limiter: None,
+                    options,
+                    urls,
+                    client: Err(e),
+                    auth: None,
+                    cancel_flag: Arc::new(AtomicBool::new(false)),
+                    cancel_token: CancellationToken::new(),
+                },
+            },
+            (None, Some(referer)) => Some(Arc::new(Auth::only_referer(referer, &urls))),
+            (None, None) => None,
         };
         Self {
             limiter: options.max_speed.filter(|&s| s > 0).map(|s| Arc::new(RateLimiter::new(s))),
             options,
             urls,
             client,
-            auth: auth.and_then(Result::ok).map(Arc::new),
+            auth,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             cancel_token: CancellationToken::new(),
         }
@@ -1627,7 +1642,12 @@ async fn claim_hls_output(
 /// request, only for the hosts the user named (see [`Auth`]).
 /// The HTTP client for downloads with these options; see `ClientKey` for what it depends on.
 pub fn build_client(options: &DownloadOptions) -> Result<Client, String> {
-    let headers = crate::resolver::SmartResolver::default_anti_qos_headers();
+    let mut headers = crate::resolver::SmartResolver::default_anti_qos_headers();
+    if let Some(referer) = &options.referer {
+        if let Ok(val) = reqwest::header::HeaderValue::from_str(referer) {
+            headers.insert(reqwest::header::REFERER, val);
+        }
+    }
 
     let mut builder = Client::builder()
         // One TCP connection per worker: over HTTP/2 every "connection" would be a stream
@@ -1640,21 +1660,26 @@ pub fn build_client(options: &DownloadOptions) -> Result<Client, String> {
         .pool_idle_timeout(Some(POOL_IDLE))
         .default_headers(headers);
 
-    if options.auth_header.is_some() {
-        // reqwest drops Authorization on a redirect to another host, but keeps it on a
-        // same-host redirect from https to http, which would send it in cleartext.
-        builder = builder.redirect(reqwest::redirect::Policy::custom(|attempt| {
-            let downgrade = attempt.url().scheme() == "http"
-                && attempt.previous().last().is_some_and(|prev| prev.scheme() == "https");
-            if downgrade {
-                attempt.error("refusing an HTTPS to HTTP redirect while sending credentials")
-            } else if attempt.previous().len() >= 10 {
-                attempt.error("too many redirects")
-            } else {
-                attempt.follow()
-            }
-        }));
-    }
+    let auth_header = options.auth_header.is_some();
+    builder = builder.redirect(reqwest::redirect::Policy::custom(move |attempt| {
+        let target_url = attempt.url();
+        let target_host = target_url.host_str().unwrap_or("").to_ascii_lowercase();
+
+        // Detect anti-hotlink sinkholes and rate-limiting redirects (e.g. odw7bf.dood.video -> 127.0.0.1)
+        if target_host.contains("dood.video") {
+            return attempt.error("rate limited: server redirected to anti-hotlink or throttle sinkhole");
+        }
+
+        let downgrade = target_url.scheme() == "http"
+            && attempt.previous().last().is_some_and(|prev| prev.scheme() == "https");
+        if downgrade && auth_header {
+            attempt.error("refusing an HTTPS to HTTP redirect while sending credentials")
+        } else if attempt.previous().len() >= 10 {
+            attempt.error("too many redirects")
+        } else {
+            attempt.follow()
+        }
+    }));
 
     if let Some(proxy_url) = &options.proxy {
         let proxy = reqwest::Proxy::all(proxy_url).map_err(|e| format!("Invalid proxy URL {}: {}", proxy_url, e))?;

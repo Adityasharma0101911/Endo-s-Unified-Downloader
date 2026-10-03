@@ -1061,6 +1061,12 @@ impl App {
                     }
                 }
 
+                if let Some(referer) = &payload.referer {
+                    if !referer.trim().is_empty() {
+                        self.settings.referer = referer.trim().to_string();
+                    }
+                }
+
                 let active = self.focused_item().is_some_and(|item| item.status.is_active());
                 if !active && self.url_input.trim().is_empty() {
                     self.download_now(&url, "", "");
@@ -1247,6 +1253,11 @@ fn task_options(settings: &Settings, task: &Task, checksum: &str, auth: &str) ->
     };
     let auth = if task.from_document { "" } else { auth };
     let mut options = settings.download_options(&task.urls, checksum, auth)?;
+    if task.from_document {
+        options.referer = None;
+    } else if options.referer.is_none() {
+        options.referer = task.referer.clone();
+    }
     for part in [&task.folder, &task.name].into_iter().flatten() {
         options.output_path = options.output_path.map(|path| path.join(part));
     }

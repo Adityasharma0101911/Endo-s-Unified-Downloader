@@ -74,6 +74,8 @@ pub struct Settings {
     pub live_from_start: bool,
     /// Wait for a scheduled stream or premiere to begin instead of failing.
     pub wait_for_video: bool,
+    /// Optional HTTP Referer header for downloads requiring anti-hotlinking bypass.
+    pub referer: String,
 }
 
 impl Default for Settings {
@@ -103,6 +105,7 @@ impl Default for Settings {
             embed_metadata: engine.embed_metadata,
             live_from_start: engine.live_from_start,
             wait_for_video: engine.wait_for_video,
+            referer: String::new(),
         }
     }
 }
@@ -178,6 +181,7 @@ impl Settings {
             expected_checksum: checksum,
             cookies_path: non_empty(&self.cookies_path).map(PathBuf::from),
             auth_header: non_empty(auth),
+            referer: non_empty(&self.referer),
             proxy: non_empty(&self.proxy),
             media_preset,
             page_media_preset: Some(quality),

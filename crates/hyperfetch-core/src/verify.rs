@@ -13,7 +13,7 @@ use url::Url;
 use crate::engine::{claim_target, discard_partial, DownloadEngine, DownloadOptions, EngineSnapshot, TargetClaim};
 use crate::history::{is_redacted, DownloadHistoryManager, HistoryEntry, REDACTED_LINK};
 use crate::range::{compute_gaps, merge_ranges, ByteRange};
-use crate::resolver::with_agent_for;
+use crate::resolver::{with_agent_for, with_referer_for};
 use crate::state::DownloadState;
 use crate::storage::DiskWriter;
 use crate::worker::carries_validator;
@@ -256,7 +256,7 @@ async fn fetch_range(
     let RepairTarget { state, writer, .. } = repair;
     let total_size = writer.size();
     let validator = seen.as_ref().and_then(Version::if_range).map(str::to_string);
-    let mut request = with_agent_for(client.get(url.clone()), url).header(RANGE, format!("bytes={}-{}", *offset, end));
+    let mut request = with_referer_for(with_agent_for(client.get(url.clone()), url), url, None).header(RANGE, format!("bytes={}-{}", *offset, end));
     if let Some(validator) = &validator {
         request = request.header(IF_RANGE, validator.as_str());
     }
@@ -620,7 +620,7 @@ impl VersionCheck<'_> {
     /// The version `url` serves, once its answer shows it is byte `at` of the file in the
     /// recorded version.
     async fn serves(&self, url: &Url) -> Result<Version, FetchError> {
-        let request = with_agent_for(self.client.get(url.clone()), url).header(RANGE, format!("bytes={}-{}", self.at, self.at));
+        let request = with_referer_for(with_agent_for(self.client.get(url.clone()), url), url, None).header(RANGE, format!("bytes={}-{}", self.at, self.at));
         let resp = until_cancelled(request.send(), self.cancel)
             .await?
             .map_err(|e| FetchError::Retry(format!("request to {} failed: {}", url, e)))?;
@@ -652,7 +652,7 @@ impl VersionCheck<'_> {
     /// have. A server honoring If-Range sends the whole file instead; that body is not read.
     async fn ignores_if_range(&self, url: &Url, validator: &str) -> Result<bool, FetchError> {
         let other = if validator.starts_with('"') { "\"endo-if-range-check\"" } else { "Thu, 01 Jan 1970 00:00:00 GMT" };
-        let request = with_agent_for(self.client.get(url.clone()), url)
+        let request = with_referer_for(with_agent_for(self.client.get(url.clone()), url), url, None)
             .header(RANGE, format!("bytes={}-{}", self.at, self.at))
             .header(IF_RANGE, other);
         let resp = until_cancelled(request.send(), self.cancel)
