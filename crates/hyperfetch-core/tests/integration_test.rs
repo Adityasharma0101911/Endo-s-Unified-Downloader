@@ -4103,3 +4103,53 @@ async fn test_a_folder_added_again_lists_only_the_files_not_downloaded() {
     assert_eq!(names(&again), ["Plan.docx"]);
     assert_eq!(ingest(&[drive], &http, &all).await.unwrap().len(), 2);
 }
+
+#[tokio::test]
+async fn test_anna_archive_resolution_and_fallback_racing() {
+    let _claim = setup().await;
+    let html = r#"
+        <html>
+            <body>
+                <h1>Book Title</h1>
+                <p>IPFS CID: ipfs://QmXoypizjW3WknFiJnKLwHCnL72vedxjQkDDP1mXWo6uco</p>
+                <div class="downloads">
+                    <a href="https://download.library.lol/main/8f07ef504d743288f62539da685d2543/book.pdf">LibGen .rs</a>
+                    <a href="https://libgen.li/file.php?id=9999">Libgen .li</a>
+                </div>
+            </body>
+        </html>
+    "#;
+    let base = Url::parse("https://annas-archive.gl/md5/8f07ef504d743288f62539da685d2543").unwrap();
+    let cid = hyperfetch_core::resolver::AnnaArchiveResolver::extract_ipfs_cid(html);
+    assert_eq!(cid, Some("QmXoypizjW3WknFiJnKLwHCnL72vedxjQkDDP1mXWo6uco".to_string()));
+
+    let gateways = hyperfetch_core::resolver::AnnaArchiveResolver::construct_gateway_urls(&cid.unwrap());
+    assert_eq!(gateways.len(), 4);
+    assert!(gateways.iter().any(|u| u.as_str().contains("cloudflare-ipfs.com")));
+
+    let mirrors = hyperfetch_core::resolver::AnnaArchiveResolver::extract_external_mirrors(html, &base);
+    assert_eq!(mirrors.len(), 2);
+    assert!(mirrors.iter().any(|u| u.as_str().contains("library.lol")));
+    assert!(mirrors.iter().any(|u| u.as_str().contains("libgen.li")));
+}
+
+#[tokio::test]
+async fn test_streaming_video_cdn_and_html_tag_resolution() {
+    let _claim = setup().await;
+    let base = Url::parse("https://videohost.example.com/watch/video123").unwrap();
+    let html = r#"
+        <html>
+            <body>
+                <div class="player">
+                    <video src="https://re585ll.cloudatacdn.com/u5kj7kaoqdplsdgge633wyagihc573jshphbgbbnt3ddxvhknmy32eat5kga/hxuat4j6gm~tPjDFEERXb?token=test&expiry=123" controls></video>
+                </div>
+            </body>
+        </html>
+    "#;
+    let candidate = hyperfetch_core::resolver::extract_html_video_source(html, &base);
+    assert!(candidate.is_some());
+    let url = candidate.unwrap();
+    assert!(url.as_str().contains("cloudatacdn.com"));
+    assert!(url.as_str().contains("hxuat4j6gm~tPjDFEERXb"));
+}
+

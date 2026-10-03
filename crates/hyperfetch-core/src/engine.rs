@@ -10,7 +10,7 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use parking_lot::Mutex;
 use reqwest::header::{
-    HeaderMap, HeaderName, ACCEPT_ENCODING, ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_RANGE, ETAG, LAST_MODIFIED,
+    HeaderMap, HeaderName, ACCEPT_ENCODING, ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_RANGE, CONTENT_TYPE, ETAG, LAST_MODIFIED,
     RANGE,
 };
 use reqwest::{Client, Response, StatusCode};
@@ -3017,13 +3017,66 @@ fn stream_snapshot(size: Option<u64>, written: u64, speed: f64, path: &Path) -> 
 }
 
 /// File name from the first Content-Disposition among `headers` that names one, else the last
-/// segment of the (final, post-redirect) URL. Raw UTF-8 in the header is accepted, as browsers do.
-fn extract_filename<'a>(headers: impl IntoIterator<Item = &'a HeaderMap>, url: &Url) -> String {
-    headers
+/// segment of the (final, post-redirect) URL. If the filename lacks a file extension or is a generic
+/// fallback, deduce the appropriate extension from Content-Type (e.g. video/mp4 -> .mp4).
+fn extract_filename<'a>(headers: impl IntoIterator<Item = &'a HeaderMap> + Clone, url: &Url) -> String {
+    let raw_name = headers
+        .clone()
         .into_iter()
         .find_map(disposition_name)
         .or_else(|| filename_from_url(url))
-        .unwrap_or_else(|| "downloaded_file.bin".to_string())
+        .unwrap_or_else(|| "downloaded_file.bin".to_string());
+
+    if !has_known_extension(&raw_name) {
+        if let Some(ext) = headers.into_iter().find_map(content_type_extension) {
+            if raw_name == "downloaded_file.bin" {
+                return format!("downloaded_file.{}", ext);
+            } else if !raw_name.ends_with(&format!(".{}", ext)) {
+                return format!("{}.{}", raw_name, ext);
+            }
+        }
+    }
+    raw_name
+}
+
+fn content_type_extension(headers: &HeaderMap) -> Option<&'static str> {
+    let content_type = headers.get(CONTENT_TYPE)?.to_str().ok()?;
+    let mime = content_type.split(';').next()?.trim().to_ascii_lowercase();
+    match mime.as_str() {
+        "video/mp4" => Some("mp4"),
+        "video/webm" => Some("webm"),
+        "video/x-matroska" => Some("mkv"),
+        "video/quicktime" => Some("mov"),
+        "video/x-msvideo" | "video/avi" => Some("avi"),
+        "video/x-flv" => Some("flv"),
+        "video/mp2t" => Some("ts"),
+        "audio/mpeg" | "audio/mp3" => Some("mp3"),
+        "audio/mp4" | "audio/m4a" => Some("m4a"),
+        "audio/flac" | "audio/x-flac" => Some("flac"),
+        "audio/wav" | "audio/x-wav" => Some("wav"),
+        "audio/ogg" | "audio/vorbis" | "audio/opus" => Some("ogg"),
+        "image/jpeg" => Some("jpg"),
+        "image/png" => Some("png"),
+        "image/gif" => Some("gif"),
+        "image/webp" => Some("webp"),
+        "application/pdf" => Some("pdf"),
+        "application/zip" => Some("zip"),
+        "application/x-7z-compressed" => Some("7z"),
+        "application/x-rar-compressed" | "application/vnd.rar" => Some("rar"),
+        "application/x-tar" => Some("tar"),
+        "application/gzip" | "application/x-gzip" => Some("gz"),
+        "application/epub+zip" => Some("epub"),
+        _ => None,
+    }
+}
+
+fn has_known_extension(name: &str) -> bool {
+    if let Some((_, ext)) = name.rsplit_once('.') {
+        if !ext.is_empty() && ext.len() <= 5 && ext.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return ext.to_ascii_lowercase() != "bin";
+        }
+    }
+    false
 }
 
 /// The usable file name in a response's Content-Disposition, if it has one.

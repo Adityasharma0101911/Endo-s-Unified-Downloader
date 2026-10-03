@@ -121,6 +121,16 @@ enum AppEvent {
     /// Whether an ffmpeg was found, looked for at launch while the user has not said whether one
     /// may be installed.
     FfmpegFound(bool),
+    /// Download request pushed from local IPC / webhook endpoint (e.g. browser bookmarklet or extension).
+    RemoteAdd(RemoteAddPayload),
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct RemoteAddPayload {
+    pub url: String,
+    pub cookies: Option<String>,
+    pub user_agent: Option<String>,
+    pub referer: Option<String>,
 }
 
 /// Handles to a running engine task.
@@ -270,7 +280,7 @@ impl App {
         let queue_saver = queue_store::Saver::spawn(queue_store::path())
             .inspect_err(|e| tracing::warn!("Queue changes will only be saved on exit: {}", e))
             .ok();
-        let mut app = Self::with(cc.egui_ctx.clone(), rt, settings, queue, queue_saver);
+        let mut app = Self::with(cc.egui_ctx.clone(), rt.clone(), settings, queue, queue_saver);
         app.notice = queue_problem.map(Err);
         spawn_clipboard_watcher(
             Arc::clone(&app.clipboard_enabled),
@@ -278,6 +288,7 @@ impl App {
             app.events_tx.clone(),
             cc.egui_ctx.clone(),
         );
+        spawn_ipc_listener(app.events_tx.clone(), cc.egui_ctx.clone(), &rt);
         app.refresh_history();
         if app.settings.install_ffmpeg.is_none() {
             let found = unblock(hyperfetch_core::media::find_ffmpeg_path);
@@ -1015,6 +1026,58 @@ impl App {
                     self.start_waiting();
                 }
             }
+            AppEvent::RemoteAdd(payload) => {
+                let url = payload.url.trim().to_string();
+                if url.is_empty() {
+                    return;
+                }
+
+                if let Some(cookies) = &payload.cookies {
+                    if !cookies.trim().is_empty() {
+                        std::env::set_var("ANNAS_ARCHIVE_COOKIE", cookies.trim());
+                        std::env::set_var("HYPERFETCH_COOKIES", cookies.trim());
+
+                        if let Ok(u) = Url::parse(&url) {
+                            if let Some(host) = u.host_str() {
+                                let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default();
+                                let dir = PathBuf::from(&home).join(".hyperfetch");
+                                let _ = std::fs::create_dir_all(&dir);
+                                let cookie_file = dir.join("cookies.txt");
+                                let mut lines = Vec::new();
+                                for part in cookies.split(';') {
+                                    let part = part.trim();
+                                    if let Some((k, v)) = part.split_once('=') {
+                                        lines.push(format!("{}\tTRUE\t/\tTRUE\t2147483647\t{}\t{}", host, k.trim(), v.trim()));
+                                    }
+                                }
+                                if !lines.is_empty() {
+                                    let _ = std::fs::write(&cookie_file, lines.join("\n"));
+                                    if self.settings.cookies_path.is_empty() {
+                                        self.settings.cookies_path = cookie_file.to_string_lossy().into_owned();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let active = self.focused_item().is_some_and(|item| item.status.is_active());
+                if !active && self.url_input.trim().is_empty() {
+                    self.download_now(&url, "", "");
+                    self.notice = Some(Ok(format!("Started remote download: {}", ingest::truncate_chars(&url, 60))));
+                } else if ingest::needs_reading(&url) {
+                    self.read_document(url.clone(), Origin::Dropped, String::new(), String::new());
+                } else {
+                    match self.add_download(&url, "", "") {
+                        Ok(id) => {
+                            self.notice = Some(Ok(format!("Added remote download #{} to queue: {}", id, ingest::truncate_chars(&url, 60))));
+                        }
+                        Err(e) => {
+                            self.notice = Some(Err(format!("Could not add remote download: {}", e)));
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1051,6 +1114,13 @@ impl App {
     fn copy_text(&mut self, text: String) {
         *lock(&self.clipboard_seen) = text.clone();
         self.ctx.copy_text(text);
+    }
+
+    /// Copies the browser integration bookmarklet to the clipboard.
+    pub fn copy_bookmarklet(&mut self) {
+        let script = r#"javascript:(function(){const v=document.querySelector('video')?.src||window.location.href;fetch('http://127.0.0.1:49152/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:v,cookies:document.cookie,user_agent:navigator.userAgent,referer:window.location.href})}).then(r=>r.json()).then(d=>alert('Sent to Endo\'s Unified Downloader: '+d.status)).catch(e=>alert('Downloader is not running on 127.0.0.1:49152'));})();"#;
+        self.copy_text(script.to_string());
+        self.notice = Some(Ok("Copied browser bookmarklet to clipboard. Create a browser bookmark and paste this as the URL.".to_string()));
     }
 
     /// Eases the displayed progress and speed of the shown download; true while still moving.
@@ -1482,6 +1552,146 @@ fn spawn_clipboard_watcher(
     if let Err(e) = spawned {
         tracing::warn!("Clipboard watcher unavailable: {}", e);
     }
+}
+
+/// Spawns a background local HTTP listener on 127.0.0.1:49152 (or next available port)
+/// to receive download tasks from browser extensions or the one-click bookmarklet.
+fn spawn_ipc_listener(
+    tx: mpsc::Sender<AppEvent>,
+    ctx: egui::Context,
+    rt: &tokio::runtime::Handle,
+) {
+    rt.spawn(async move {
+        let ports = [49152, 49153, 49154, 49155];
+        let mut listener = None;
+        for port in ports {
+            match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+                Ok(l) => {
+                    tracing::info!("Local IPC listener bound on 127.0.0.1:{}", port);
+                    listener = Some(l);
+                    break;
+                }
+                Err(e) => {
+                    tracing::debug!("Could not bind IPC port {}: {}", port, e);
+                }
+            }
+        }
+
+        let Some(listener) = listener else {
+            tracing::warn!("Failed to bind local IPC listener on ports 49152-49155");
+            return;
+        };
+
+        loop {
+            let (mut socket, _) = match listener.accept().await {
+                Ok(conn) => conn,
+                Err(_) => break,
+            };
+
+            let tx = tx.clone();
+            let ctx = ctx.clone();
+
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+                let mut buf = vec![0u8; 65536];
+                let mut read_bytes = 0;
+
+                let mut header_end = None;
+                while read_bytes < buf.len() {
+                    match socket.read(&mut buf[read_bytes..]).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            read_bytes += n;
+                            if let Some(pos) = buf[..read_bytes].windows(4).position(|w| w == b"\r\n\r\n") {
+                                header_end = Some(pos);
+                                break;
+                            }
+                        }
+                        Err(_) => return,
+                    }
+                }
+
+                let Some(hdr_pos) = header_end else {
+                    return;
+                };
+
+                let header_str = String::from_utf8_lossy(&buf[..hdr_pos]);
+                let mut lines = header_str.lines();
+                let request_line = match lines.next() {
+                    Some(l) => l,
+                    None => return,
+                };
+
+                let parts: Vec<&str> = request_line.split_whitespace().collect();
+                if parts.len() < 2 {
+                    return;
+                }
+                let method = parts[0];
+                let path = parts[1];
+
+                if method.eq_ignore_ascii_case("OPTIONS") {
+                    let response = "HTTP/1.1 204 No Content\r\n\
+Access-Control-Allow-Origin: *\r\n\
+Access-Control-Allow-Methods: POST, OPTIONS\r\n\
+Access-Control-Allow-Headers: Content-Type\r\n\
+Connection: close\r\n\r\n";
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    return;
+                }
+
+                if method.eq_ignore_ascii_case("POST") && path == "/add" {
+                    let mut content_length: usize = 0;
+                    for line in lines {
+                        if let Some((k, v)) = line.split_once(':') {
+                            if k.trim().eq_ignore_ascii_case("Content-Length") {
+                                content_length = v.trim().parse().unwrap_or(0);
+                            }
+                        }
+                    }
+
+                    let body_start = hdr_pos + 4;
+                    let mut body = buf[body_start..read_bytes].to_vec();
+
+                    while body.len() < content_length && body.len() < 1024 * 1024 {
+                        let mut chunk = vec![0u8; (content_length - body.len()).min(16384)];
+                        match socket.read(&mut chunk).await {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                body.extend_from_slice(&chunk[..n]);
+                            }
+                            Err(_) => break,
+                        }
+                    }
+
+                    if let Ok(payload) = serde_json::from_slice::<RemoteAddPayload>(&body) {
+                        let _ = tx.send(AppEvent::RemoteAdd(payload));
+                        ctx.request_repaint();
+
+                        let response = "HTTP/1.1 200 OK\r\n\
+Access-Control-Allow-Origin: *\r\n\
+Content-Type: application/json\r\n\
+Content-Length: 19\r\n\
+Connection: close\r\n\r\n\
+{\"status\":\"queued\"}";
+                        let _ = socket.write_all(response.as_bytes()).await;
+                        return;
+                    } else {
+                        let response = "HTTP/1.1 400 Bad Request\r\n\
+Access-Control-Allow-Origin: *\r\n\
+Content-Type: application/json\r\n\
+Connection: close\r\n\r\n\
+{\"error\":\"Invalid JSON\"}";
+                        let _ = socket.write_all(response.as_bytes()).await;
+                        return;
+                    }
+                }
+
+                let response = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n";
+                let _ = socket.write_all(response.as_bytes()).await;
+            });
+        }
+    });
 }
 
 fn apply_theme(ctx: &egui::Context) {

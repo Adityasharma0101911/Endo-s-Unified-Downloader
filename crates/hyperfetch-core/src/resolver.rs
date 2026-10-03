@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::future::Future;
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use base64::Engine as _;
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_DISPOSITION, CONTENT_TYPE, USER_AGENT};
@@ -291,6 +292,366 @@ impl HostResolver for ArchiveOrgResolver {
         }
 
         Ok(mirror_urls)
+    }
+}
+
+/// Anna's Archive Resolver (IPFS CIDs, LibGen/Z-Lib mirror racing, and slow download queues)
+pub struct AnnaArchiveResolver;
+
+impl AnnaArchiveResolver {
+    /// Checks whether the given URL is an Anna's Archive domain.
+    pub fn can_handle(url: &Url) -> bool {
+        let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+        let h = host.trim_end_matches('.');
+        h == "annas-archive.org"
+            || h.ends_with(".annas-archive.org")
+            || h == "annas-archive.gl"
+            || h.ends_with(".annas-archive.gl")
+            || h == "annas-archive.li"
+            || h.ends_with(".annas-archive.li")
+            || h == "annas-archive.se"
+            || h.ends_with(".annas-archive.se")
+            || h == "annas-archive.pm"
+            || h.ends_with(".annas-archive.pm")
+            || h == "annas-archive.gs"
+            || h.ends_with(".annas-archive.gs")
+            || h == "annas-archive.to"
+            || h.ends_with(".annas-archive.to")
+    }
+
+    /// Whether this is a book overview/metadata page (/md5/<MD5>).
+    pub fn is_book_page(url: &Url) -> bool {
+        url.path().contains("/md5/")
+    }
+
+    /// Whether this is a slow download page (/slow_download/...).
+    pub fn is_slow_download(url: &Url) -> bool {
+        url.path().contains("/slow_download/")
+    }
+
+    /// Extracts IPFS CID from HTML content (v0 Qm... or v1 bafy...).
+    pub fn extract_ipfs_cid(html: &str) -> Option<String> {
+        // 1. Look for ipfs://<CID>
+        if let Some(idx) = html.find("ipfs://") {
+            let sub = &html[idx + 7..];
+            let cid: String = sub.chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
+            if is_valid_ipfs_cid(&cid) {
+                return Some(cid);
+            }
+        }
+
+        // 2. Look for /ipfs/<CID>
+        let mut from = 0;
+        while let Some(idx) = html[from..].find("/ipfs/") {
+            let start = from + idx + 6;
+            let sub = &html[start..];
+            let cid: String = sub.chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
+            if is_valid_ipfs_cid(&cid) {
+                return Some(cid);
+            }
+            from = start;
+        }
+
+        // 3. Scan tokens in quotes or tags for valid CIDs
+        for word in html.split(|c: char| c == '"' || c == '\'' || c == '<' || c == '>' || c.is_ascii_whitespace()) {
+            let cleaned = word.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+            if is_valid_ipfs_cid(cleaned) {
+                return Some(cleaned.to_string());
+            }
+        }
+
+        None
+    }
+
+    /// Constructs high-speed public IPFS CDN gateway URLs for racing from a CID.
+    pub fn construct_gateway_urls(cid: &str) -> Vec<Url> {
+        let gateways = [
+            format!("https://cloudflare-ipfs.com/ipfs/{}", cid),
+            format!("https://ipfs.io/ipfs/{}", cid),
+            format!("https://gateway.pinata.cloud/ipfs/{}", cid),
+            format!("https://dweb.link/ipfs/{}", cid),
+        ];
+        gateways.into_iter().filter_map(|s| Url::parse(&s).ok()).collect()
+    }
+
+    /// Extracts external mirrors (LibGen, Z-Lib, Archive.org) from book HTML.
+    pub fn extract_external_mirrors(html: &str, base_url: &Url) -> Vec<Url> {
+        let mut mirrors = Vec::new();
+        let lower = html.to_ascii_lowercase();
+        for tag in start_tags(html, &lower, "a") {
+            if let Some(href) = attr_value(tag, "href") {
+                if let Ok(u) = base_url.join(&href) {
+                    let host = u.host_str().unwrap_or("").to_ascii_lowercase();
+                    if host.contains("library.lol")
+                        || host.contains("libgen.li")
+                        || host.contains("libgen.is")
+                        || host.contains("libgen.rs")
+                        || host.contains("libgen.rocks")
+                        || (host.contains("archive.org") && u.path().contains("/download/"))
+                        || host.contains("z-lib.is")
+                        || host.contains("z-lib.gs")
+                    {
+                        if !mirrors.contains(&u) {
+                            mirrors.push(u);
+                        }
+                    }
+                }
+            }
+        }
+        mirrors
+    }
+
+    /// Extracts download button href from a slow_download HTML page.
+    pub fn extract_download_button(html: &str, base_url: &Url) -> Option<Url> {
+        let lower = html.to_ascii_lowercase();
+        for tag in start_tags(html, &lower, "a") {
+            let id = attr_value(tag, "id").unwrap_or_default();
+            let class = attr_value(tag, "class").unwrap_or_default();
+            let href = attr_value(tag, "href");
+
+            let is_button = id.eq_ignore_ascii_case("download-button")
+                || class.contains("js_download_button")
+                || class.contains("download-button");
+
+            if let Some(h) = href {
+                let h_trim = h.trim();
+                if !h_trim.is_empty() && h_trim != "#" && !h_trim.starts_with("javascript:") {
+                    if is_button || h_trim.contains("/dyn/save/") {
+                        if let Ok(u) = base_url.join(h_trim) {
+                            return Some(u);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Parses countdown seconds from slow download HTML (e.g. data-countdown="30" or "wait 45 seconds").
+    pub fn parse_countdown_seconds(html: &str) -> Option<u64> {
+        let lower = html.to_ascii_lowercase();
+        // 1. data-countdown attribute
+        for tag in start_tags(html, &lower, "span").into_iter().chain(start_tags(html, &lower, "div")) {
+            if let Some(val) = attr_value(tag, "data-countdown") {
+                if let Ok(s) = val.trim().parse::<u64>() {
+                    return Some(s);
+                }
+            }
+        }
+
+        // 2. Look for id="countdown" element contents
+        if let Some(idx) = lower.find("id=\"countdown\"") {
+            let sub = &lower[idx..];
+            if let Some(close) = sub.find('>') {
+                let text = &sub[close + 1..];
+                let num_str: String = text.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if let Ok(s) = num_str.parse::<u64>() {
+                    return Some(s);
+                }
+            }
+        }
+
+        // 3. Scan patterns like "wait 45 seconds" or "countdown = 30"
+        for word_pattern in ["wait ", "in ", "countdown = ", "countdown=", "timer = ", "timer="] {
+            let mut from = 0;
+            while let Some(idx) = lower[from..].find(word_pattern) {
+                let start = from + idx + word_pattern.len();
+                let sub = &lower[start..];
+                let num_str: String = sub.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if !num_str.is_empty() {
+                    let after = sub[num_str.len()..].trim_start();
+                    if after.starts_with("second") || after.starts_with('s') || word_pattern.contains('=') {
+                        if let Ok(s) = num_str.parse::<u64>() {
+                            return Some(s);
+                        }
+                    }
+                }
+                from = start;
+            }
+        }
+
+        None
+    }
+}
+
+/// Validates whether a token matches IPFS v0 (Qm... 46 chars) or v1 (bafy/bafk... 52-120 chars) specifications.
+pub fn is_valid_ipfs_cid(cid: &str) -> bool {
+    let len = cid.len();
+    if cid.starts_with("Qm") && len == 46 {
+        return cid.chars().all(|c| c.is_ascii_alphanumeric());
+    }
+    if (cid.starts_with("bafy") || cid.starts_with("bafk")) && (52..=120).contains(&len) {
+        return cid.chars().all(|c| c.is_ascii_alphanumeric());
+    }
+    false
+}
+
+/// Helper to retrieve session cookies and browser User-Agent for a target domain.
+pub fn extract_browser_cookies_for_domain(domain: &str) -> (Option<String>, Option<String>) {
+    let ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36".to_string();
+
+    // 1. Check environment variables
+    if let Ok(cookie) = std::env::var("ANNAS_ARCHIVE_COOKIE").or_else(|_| std::env::var("HYPERFETCH_COOKIES")) {
+        if !cookie.trim().is_empty() {
+            return (Some(cookie.trim().to_string()), Some(ua));
+        }
+    }
+
+    // 2. Check local cookie files (e.g. cookies.txt or .hyperfetch/cookies.txt)
+    let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default();
+    let paths = [
+        PathBuf::from("cookies.txt"),
+        PathBuf::from(&home).join(".hyperfetch").join("cookies.txt"),
+        PathBuf::from(&home).join(".local").join("share").join("endos-downloader").join("cookies.txt"),
+    ];
+    for path in &paths {
+        if path.is_file() {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                let mut matched_cookies = Vec::new();
+                for line in content.lines() {
+                    let line = line.trim();
+                    if line.is_empty() || line.starts_with('#') {
+                        continue;
+                    }
+                    let parts: Vec<&str> = line.split('\t').collect();
+                    if parts.len() >= 7 {
+                        let cookie_domain = parts[0].trim_start_matches('.');
+                        let target_domain = domain.trim_start_matches('.');
+                        if parts[0].contains(domain) || domain.contains(cookie_domain) || target_domain.contains(cookie_domain) {
+                            matched_cookies.push(format!("{}={}", parts[5], parts[6]));
+                        }
+                    }
+                }
+                if !matched_cookies.is_empty() {
+                    return (Some(matched_cookies.join("; ")), Some(ua));
+                }
+            }
+        }
+    }
+
+    (None, Some(ua))
+}
+
+async fn resolve_slow_download(
+    client: &Client,
+    url: &Url,
+    cookie_header: Option<&str>,
+    user_agent: Option<&str>,
+) -> Result<Vec<Url>, ResolverError> {
+    let mut request = client.get(url.clone());
+    if let Some(c) = cookie_header {
+        if let Ok(hv) = HeaderValue::from_str(c) {
+            request = request.header(reqwest::header::COOKIE, hv);
+        }
+    }
+    if let Some(ua) = user_agent {
+        if let Ok(hv) = HeaderValue::from_str(ua) {
+            request = request.header(reqwest::header::USER_AGENT, hv);
+        }
+    }
+    request = request.header(reqwest::header::REFERER, "https://annas-archive.gl/");
+
+    let resp = request.send().await?;
+    if !resp.status().is_success() {
+        return Err(ResolverError::NotFound(format!("Anna's Archive returned HTTP {}", resp.status())));
+    }
+
+    let html = read_capped(resp, MAX_HTML_BYTES).await?;
+
+    if let Some(dl) = AnnaArchiveResolver::extract_download_button(&html, url) {
+        return Ok(vec![dl]);
+    }
+
+    if let Some(seconds) = AnnaArchiveResolver::parse_countdown_seconds(&html) {
+        let wait_secs = seconds.min(180);
+        tracing::info!("Anna's Archive: waiting for queue slot ({} seconds)...", wait_secs);
+        tokio::time::sleep(Duration::from_secs(wait_secs.saturating_add(1))).await;
+
+        let mut retry = client.get(url.clone());
+        if let Some(c) = cookie_header {
+            if let Ok(hv) = HeaderValue::from_str(c) {
+                retry = retry.header(reqwest::header::COOKIE, hv);
+            }
+        }
+        if let Some(ua) = user_agent {
+            if let Ok(hv) = HeaderValue::from_str(ua) {
+                retry = retry.header(reqwest::header::USER_AGENT, hv);
+            }
+        }
+        retry = retry.header(reqwest::header::REFERER, "https://annas-archive.gl/");
+        let resp2 = retry.send().await?;
+        if resp2.status().is_success() {
+            let new_html = read_capped(resp2, MAX_HTML_BYTES).await?;
+            if let Some(dl) = AnnaArchiveResolver::extract_download_button(&new_html, url) {
+                return Ok(vec![dl]);
+            }
+        }
+    }
+
+    Ok(vec![url.clone()])
+}
+
+impl HostResolver for AnnaArchiveResolver {
+    fn can_handle(&self, url: &Url) -> bool {
+        Self::can_handle(url)
+    }
+
+    async fn resolve(&self, client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
+        let (cookie_header, user_agent) = extract_browser_cookies_for_domain(url.host_str().unwrap_or(""));
+
+        // If it's directly a slow download URL
+        if Self::is_slow_download(url) {
+            return resolve_slow_download(client, url, cookie_header.as_deref(), user_agent.as_deref()).await;
+        }
+
+        // Flow A: Book Page (/md5/<MD5>)
+        let mut request = client.get(url.clone());
+        if let Some(ref c) = cookie_header {
+            if let Ok(hv) = HeaderValue::from_str(c) {
+                request = request.header(reqwest::header::COOKIE, hv);
+            }
+        }
+        if let Some(ref ua) = user_agent {
+            if let Ok(hv) = HeaderValue::from_str(ua) {
+                request = request.header(reqwest::header::USER_AGENT, hv);
+            }
+        }
+        request = request.header(reqwest::header::REFERER, "https://annas-archive.gl/");
+
+        let resp = request.send().await?;
+        if !resp.status().is_success() {
+            return Err(ResolverError::NotFound(format!("Anna's Archive returned HTTP {}", resp.status())));
+        }
+
+        let html = read_capped(resp, MAX_HTML_BYTES).await?;
+
+        let mut candidates = Vec::new();
+        if let Some(cid) = Self::extract_ipfs_cid(&html) {
+            tracing::info!("Anna's Archive: extracted IPFS CID {}", cid);
+            candidates.extend(Self::construct_gateway_urls(&cid));
+        }
+        let mirrors = Self::extract_external_mirrors(&html, url);
+        if !mirrors.is_empty() {
+            tracing::info!("Anna's Archive: extracted {} external mirrors", mirrors.len());
+            candidates.extend(mirrors);
+        }
+        if !candidates.is_empty() {
+            return Ok(candidates);
+        }
+
+        // Check if there are slow download links on the page
+        let lower = html.to_ascii_lowercase();
+        for tag in start_tags(&html, &lower, "a") {
+            if let Some(href) = attr_value(tag, "href") {
+                if href.contains("/slow_download/") {
+                    if let Ok(slow_url) = url.join(&href) {
+                        return resolve_slow_download(client, &slow_url, cookie_header.as_deref(), user_agent.as_deref()).await;
+                    }
+                }
+            }
+        }
+
+        Ok(vec![url.clone()])
     }
 }
 
@@ -849,6 +1210,7 @@ impl SmartResolver {
             || SourceForgeResolver.can_handle(url)
             || CodeHostResolver.can_handle(url)
             || ArchiveOrgResolver.can_handle(url)
+            || AnnaArchiveResolver.can_handle(url)
     }
 
     /// Resolves `url` into download sources that are byte-identical copies of one file.
@@ -872,6 +1234,16 @@ impl SmartResolver {
         }
         if CodeHostResolver.can_handle(url) {
             return CodeHostResolver.resolve(client, url).await;
+        }
+        if AnnaArchiveResolver.can_handle(url) {
+            let timeout = if AnnaArchiveResolver::is_slow_download(url) {
+                Duration::from_secs(200)
+            } else {
+                RESOLVE_TIMEOUT
+            };
+            return tokio::time::timeout(timeout, AnnaArchiveResolver.resolve(client, url))
+                .await
+                .unwrap_or(Err(ResolverError::Timeout(timeout.as_secs())));
         }
 
         // These only add mirrors or find an embedded stream; the input URL remains a valid source.
@@ -1029,8 +1401,15 @@ fn last_segment_extension(url: &Url) -> Option<String> {
 }
 
 fn is_media_url(url: &Url) -> bool {
-    matches!(url.scheme(), "http" | "https")
-        && last_segment_extension(url).is_some_and(|ext| MEDIA_EXTENSIONS.contains(&ext.as_str()))
+    if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
+    if let Some(ext) = last_segment_extension(url) {
+        return MEDIA_EXTENSIONS.contains(&ext.as_str());
+    }
+    let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+    let path = url.path().to_ascii_lowercase();
+    host.contains("cloudatacdn") || path.contains("/video/") || path.contains("/videos/") || path.contains("/stream/")
 }
 
 fn extract_google_drive_id(url: &Url) -> Option<String> {
@@ -1086,14 +1465,28 @@ fn mediafire_no_link(html: &str) -> String {
 /// Picks the one video a page plays. Candidates are often different encodes of the same video,
 /// which are not byte-identical, so only the first media URL found is returned:
 /// the page's own <video>/<source> tags, then OpenGraph/Twitter metadata, then player JSON.
-fn extract_html_video_source(html: &str, base_url: &Url) -> Option<Url> {
+pub fn extract_html_video_source(html: &str, base_url: &Url) -> Option<Url> {
     let lower = html.to_ascii_lowercase();
     let media = |raw: String| base_url.join(&raw).ok().filter(is_media_url);
 
     for name in ["video", "source"] {
         for tag in start_tags(html, &lower, name) {
-            if let Some(url) = attr_value(tag, "src").and_then(media) {
-                return Some(url);
+            let is_video_type = attr_value(tag, "type").is_some_and(|t| {
+                let t = t.to_ascii_lowercase();
+                t.starts_with("video/") || t.starts_with("audio/") || t.contains("mpegurl") || t.contains("m3u8")
+            });
+            if let Some(src) = attr_value(tag, "src") {
+                if let Ok(url) = base_url.join(&src) {
+                    if !matches!(url.scheme(), "http" | "https") {
+                        continue;
+                    }
+                    if is_media_url(&url) {
+                        return Some(url);
+                    }
+                    if is_video_type && last_segment_extension(&url).map_or(true, |ext| MEDIA_EXTENSIONS.contains(&ext.as_str())) {
+                        return Some(url);
+                    }
+                }
             }
         }
     }
@@ -2179,5 +2572,125 @@ host.example.com\tFALSE\t/\tFALSE\t0\thostonly\t1
         // Host-only cookies are not widened to subdomains.
         assert!(header("http://host.example.com/").contains("hostonly=1"));
         assert!(!header("http://sub.host.example.com/").contains("hostonly"));
+    }
+
+    #[test]
+    fn test_anna_archive_can_handle() {
+        let valid = [
+            "https://annas-archive.org/md5/8f07ef504d743288f62539da685d2543",
+            "https://annas-archive.gl/slow_download/8f07ef504d743288f62539da685d2543/0/0",
+            "https://annas-archive.li/slow_download/8f07ef504d743288f62539da685d2543/0/8",
+            "https://annas-archive.se/md5/test",
+            "https://annas-archive.pm/slow_download/test",
+            "https://annas-archive.gs/md5/test",
+            "https://annas-archive.to/md5/test",
+        ];
+        for u in valid {
+            let parsed = Url::parse(u).unwrap();
+            assert!(AnnaArchiveResolver.can_handle(&parsed), "{}", u);
+            assert!(SmartResolver::handles(&parsed), "{}", u);
+        }
+
+        let invalid = [
+            "https://example.com/md5/test",
+            "https://archive.org/details/test",
+            "https://google.com/",
+        ];
+        for u in invalid {
+            let parsed = Url::parse(u).unwrap();
+            assert!(!AnnaArchiveResolver.can_handle(&parsed), "{}", u);
+        }
+    }
+
+    #[test]
+    fn test_anna_archive_extract_ipfs_cid() {
+        let html_v0 = r#"<div>Download via IPFS: <a href="ipfs://QmXoypizjW3WknFiJnKLwHCnL72vedxjQkDDP1mXWo6uco">Gateway</a></div>"#;
+        assert_eq!(
+            AnnaArchiveResolver::extract_ipfs_cid(html_v0),
+            Some("QmXoypizjW3WknFiJnKLwHCnL72vedxjQkDDP1mXWo6uco".to_string())
+        );
+
+        let html_v1 = r#"<div>Path: <a href="/ipfs/bafykic733b5c3j26425a4d654274c5d63f25d62547d6e5c4b3a2a1z9y8x7w6">CID</a></div>"#;
+        assert_eq!(
+            AnnaArchiveResolver::extract_ipfs_cid(html_v1),
+            Some("bafykic733b5c3j26425a4d654274c5d63f25d62547d6e5c4b3a2a1z9y8x7w6".to_string())
+        );
+
+        let html_embedded = r#"<span class="font-mono">QmZtmD2qt8fJpq3CLDHcgDZDe65KMjVJvGeeMaSeAoGh4L</span>"#;
+        assert_eq!(
+            AnnaArchiveResolver::extract_ipfs_cid(html_embedded),
+            Some("QmZtmD2qt8fJpq3CLDHcgDZDe65KMjVJvGeeMaSeAoGh4L".to_string())
+        );
+    }
+
+    #[test]
+    fn test_anna_archive_construct_gateway_urls() {
+        let cid = "QmXoypizjW3WknFiJnKLwHCnL72vedxjQkDDP1mXWo6uco";
+        let urls = AnnaArchiveResolver::construct_gateway_urls(cid);
+        assert_eq!(urls.len(), 4);
+        assert!(urls[0].as_str().contains("cloudflare-ipfs.com"));
+        assert!(urls[1].as_str().contains("ipfs.io"));
+        assert!(urls[2].as_str().contains("pinata.cloud"));
+        assert!(urls[3].as_str().contains("dweb.link"));
+    }
+
+    #[test]
+    fn test_anna_archive_extract_external_mirrors() {
+        let html = r#"
+            <div class="mb-4">
+                <a href="https://download.library.lol/main/8f07ef504d743288f62539da685d2543/book.pdf">Libgen.rs GET</a>
+                <a href="https://libgen.li/file.php?id=12345">Libgen.li</a>
+                <a href="https://archive.org/download/item123/book.epub">Internet Archive</a>
+                <a href="https://randomsite.org/other">Irrelevant link</a>
+            </div>
+        "#;
+        let base = Url::parse("https://annas-archive.gl/md5/8f07ef504d743288f62539da685d2543").unwrap();
+        let mirrors = AnnaArchiveResolver::extract_external_mirrors(html, &base);
+        assert_eq!(mirrors.len(), 3);
+        assert!(mirrors.iter().any(|u| u.as_str().contains("library.lol")));
+        assert!(mirrors.iter().any(|u| u.as_str().contains("libgen.li")));
+        assert!(mirrors.iter().any(|u| u.as_str().contains("archive.org/download/")));
+    }
+
+    #[test]
+    fn test_anna_archive_extract_direct_button() {
+        let base = Url::parse("https://annas-archive.gl/slow_download/8f07ef504d743288f62539da685d2543/0/0").unwrap();
+        let html_ready = r#"<a id="download-button" class="btn btn-primary" href="/dyn/save/8f07ef504d743288f62539da685d2543?token=abc123">Download now</a>"#;
+        let direct = AnnaArchiveResolver::extract_download_button(html_ready, &base);
+        assert_eq!(
+            direct,
+            Some(Url::parse("https://annas-archive.gl/dyn/save/8f07ef504d743288f62539da685d2543?token=abc123").unwrap())
+        );
+
+        let html_waiting = r##"<a id="download-button" class="btn btn-disabled" href="#">Waiting for slot...</a>"##;
+        assert_eq!(AnnaArchiveResolver::extract_download_button(html_waiting, &base), None);
+    }
+
+    #[test]
+    fn test_anna_archive_parse_countdown() {
+        let html1 = r#"<span id="countdown" data-countdown="42">42 seconds remaining</span>"#;
+        assert_eq!(AnnaArchiveResolver::parse_countdown_seconds(html1), Some(42));
+
+        let html2 = r#"<div class="wait-banner">Please wait 60 seconds before your download begins</div>"#;
+        assert_eq!(AnnaArchiveResolver::parse_countdown_seconds(html2), Some(60));
+
+        let html3 = r#"<script>var countdown = 15;</script>"#;
+        assert_eq!(AnnaArchiveResolver::parse_countdown_seconds(html3), Some(15));
+    }
+
+    #[test]
+    fn test_extract_html_video_source_direct_video_tag() {
+        let base = Url::parse("https://embed.example.com/play/123").unwrap();
+        // Video tag with direct CDN stream that does not end in .mp4
+        let html = r#"
+            <div class="player">
+                <video src="https://re585ll.cloudatacdn.com/u5kj7kaoqdplsdgge633wyagihc573jshphbgbbnt3ddxvhknmy32eat5kga/hxuat4j6gm~tPjDFEERXb?token=dlmphynhhgsyaj4uentvkcyh&expiry=1790998907103" controls></video>
+            </div>
+        "#;
+        let found = extract_html_video_source(html, &base);
+        assert_eq!(
+            found,
+            Some(Url::parse("https://re585ll.cloudatacdn.com/u5kj7kaoqdplsdgge633wyagihc573jshphbgbbnt3ddxvhknmy32eat5kga/hxuat4j6gm~tPjDFEERXb?token=dlmphynhhgsyaj4uentvkcyh&expiry=1790998907103").unwrap())
+        );
     }
 }
