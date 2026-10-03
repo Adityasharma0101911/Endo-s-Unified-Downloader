@@ -619,6 +619,13 @@ fn advanced_options(app: &mut App, ui: &mut egui::Ui) {
              power loss right after a download finishes can damage the file (Verify detects that).",
         );
     });
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Browser Integration:").size(12.0));
+        if ui.button("Copy Browser Bookmarklet").on_hover_text("Copy 1-click JavaScript bookmarklet to send current page or video directly to Endo's Unified Downloader via local port 49152").clicked() {
+            app.copy_bookmarklet();
+        }
+    });
     ui.label(RichText::new("Settings apply to downloads started or queued afterwards.").size(11.0).color(DIM));
 }
 
