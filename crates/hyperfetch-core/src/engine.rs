@@ -131,6 +131,17 @@ pub struct DownloadOptions {
     #[serde(skip)]
     pub auth_header: Option<String>,
     pub referer: Option<String>,
+    /// Request headers from the browser (Origin, User-Agent, sec-ch-ua, …) sent with every
+    /// request of this download, replacing the defaults of the same name. A pair that is no valid
+    /// HTTP header is skipped.
+    pub headers: Vec<(String, String)>,
+    /// The link is an HLS playlist (the browser saw it read as one), whatever its URL looks
+    /// like: it is read as a playlist first, and downloaded as a file only if it is none.
+    pub hls: bool,
+    /// An HLS stream saved as MPEG-TS is remuxed into an MP4 (no re-encoding) once downloaded.
+    /// Without ffmpeg, or when the remux fails or is cancelled, the `.ts` is kept and is the
+    /// download's file: its extension tells the two apart.
+    pub hls_to_mp4: bool,
     pub proxy: Option<String>,
     pub media_preset: Option<crate::media::MediaQualityPreset>,
     /// The quality of a link that turns out to be media only once it answers (a web page one of
@@ -173,6 +184,12 @@ pub struct DownloadOptions {
     pub media_name: Option<String>,
     /// Lines the download archive gets once the download finishes (see `ingest::Task::archive`).
     pub archive_lines: Vec<String>,
+    /// Proxy pool for multi-egress rotation across workers.
+    pub proxy_pool: Vec<String>,
+    /// Debrid unrestrictor API key (Real-Debrid, AllDebrid).
+    pub debrid_api_key: Option<String>,
+    /// Debrid provider override ("real-debrid" or "alldebrid").
+    pub debrid_provider: Option<String>,
 }
 
 impl Default for DownloadOptions {
@@ -186,6 +203,9 @@ impl Default for DownloadOptions {
             cookies_path: None,
             auth_header: None,
             referer: None,
+            headers: Vec::new(),
+            hls: false,
+            hls_to_mp4: false,
             proxy: None,
             media_preset: None,
             page_media_preset: None,
@@ -203,6 +223,9 @@ impl Default for DownloadOptions {
             wait_for_video: false,
             media_name: None,
             archive_lines: Vec::new(),
+            proxy_pool: Vec::new(),
+            debrid_api_key: None,
+            debrid_provider: None,
         }
     }
 }
@@ -214,8 +237,10 @@ pub struct ClientKey {
     /// Credentials change the redirect policy (no HTTPS to HTTP downgrade).
     credentials: bool,
     proxy: Option<String>,
+    proxy_pool: Vec<String>,
     cookies_path: Option<PathBuf>,
     referer: Option<String>,
+    headers: Vec<(String, String)>,
 }
 
 impl ClientKey {
@@ -223,8 +248,10 @@ impl ClientKey {
         Self {
             credentials: options.auth_header.is_some(),
             proxy: options.proxy.clone(),
+            proxy_pool: options.proxy_pool.clone(),
             cookies_path: options.cookies_path.clone(),
             referer: options.referer.clone(),
+            headers: options.headers.clone(),
         }
     }
 }
@@ -242,6 +269,7 @@ pub struct DownloadEngine {
     /// A client that failed to build (bad proxy, header or cookies file) is reported by `run()`
     /// instead of silently downloading without the user's settings.
     client: Result<Client, String>,
+    client_pool: Result<Vec<Client>, String>,
     /// Added per request, only for the hosts in `urls`; never a client default header.
     auth: Option<Arc<Auth>>,
     /// The speed limit, one for every connection of the download (and every stream of a media
@@ -261,13 +289,21 @@ impl DownloadEngine {
     /// of the same `ClientKey`: a batch or queue shares one client so later downloads reuse its
     /// connections. Credentials are still added per request, only for the hosts in `urls`.
     pub fn with_client(urls: Vec<Url>, options: DownloadOptions, client: Client) -> Self {
-        Self::with_client_result(urls, options, Ok(client))
+        let pool = vec![client.clone()];
+        let mut engine = Self::with_client_result(urls, options, Ok(client));
+        engine.client_pool = Ok(pool);
+        engine
     }
 
     fn with_client_result(urls: Vec<Url>, options: DownloadOptions, client: Result<Client, String>) -> Self {
         // A "leaving this site" link stands for its target, as the front ends' ingest takes it:
         // that is what is downloaded, recorded, and given the credentials.
         let urls: Vec<Url> = urls.into_iter().map(|u| crate::resolver::unwrap_redirect(&u).unwrap_or(u)).collect();
+        let client_pool = if options.proxy_pool.is_empty() {
+            client.as_ref().map(|c| vec![c.clone()]).map_err(|e| e.clone())
+        } else {
+            build_client_pool(&options)
+        };
         let auth = match (options.auth_header.as_deref(), options.referer.as_deref()) {
             (Some(value), referer) => match Auth::new(value, &urls) {
                 Ok(a) => Some(Arc::new(a.with_referer(referer.map(str::to_string)))),
@@ -276,6 +312,7 @@ impl DownloadEngine {
                     options,
                     urls,
                     client: Err(e),
+                    client_pool: Ok(Vec::new()),
                     auth: None,
                     cancel_flag: Arc::new(AtomicBool::new(false)),
                     cancel_token: CancellationToken::new(),
@@ -289,6 +326,7 @@ impl DownloadEngine {
             options,
             urls,
             client,
+            client_pool,
             auth,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             cancel_token: CancellationToken::new(),
@@ -312,7 +350,8 @@ impl DownloadEngine {
     /// about two seconds (longer only while the disk is still flushing written data). Dropping the
     /// `run()` future instead skips that final state save, so up to two seconds of progress would
     /// be downloaded again on resume. A live recording is not cancelled but finished: `run()` then
-    /// returns the file recorded so far (see `crate::media`).
+    /// returns the file recorded so far (see `crate::media`). Nor is an HLS stream already
+    /// downloaded and being remuxed to MP4: its `.ts` is kept and returned.
     pub fn cancel(&self) {
         self.cancel_flag.store(true, Ordering::Relaxed);
         self.cancel_token.cancel();
@@ -351,8 +390,8 @@ impl DownloadEngine {
         self.fetch_resolved(client, resolved, snapshot_tx, Route { follows: 0, tried: Vec::new(), scrape: true }).await
     }
 
-    /// Downloads what the resolved mirrors serve: an HLS stream if one is a playlist (recorded
-    /// with yt-dlp if it is live), else their file. An answer that lands on a host a resolver
+    /// Downloads what the resolved mirrors serve: an HLS stream if one is a playlist, by its URL
+    /// or by its answer (recorded with yt-dlp if it is live), else their file. An answer that lands on a host a resolver
     /// takes, on a media site, or on a "leaving this site" link, is downloaded from there instead
     /// (see `follow`). With `route.scrape`, a
     /// web page they answer with is an error when a link shortener or mail scanner showed it
@@ -367,42 +406,23 @@ impl DownloadEngine {
         snapshot_tx: Option<broadcast::Sender<EngineSnapshot>>,
         mut route: Route,
     ) -> Result<PathBuf, String> {
-        if let Some(playlist) = resolved.iter().find(|u| u.as_str().contains(".m3u8")) {
-            tracing::info!("Detected HLS video stream: {}", playlist);
-            let started_at = unix_now();
-            let fetch = self.fetch_policy();
-            let parsed = self
-                .guarded(
-                    HLS_PARSE_TIMEOUT.saturating_add(fetch.give_up_after()),
-                    "fetching the HLS playlist",
-                    crate::hls::parse_hls_playlist(&client, playlist, self.auth.as_deref(), fetch),
-                )
-                .await?;
-            match parsed {
-                Ok(segments) => {
-                    let base = self.hls_output_path(playlist, &segments);
-                    let (path, digest) = self.fetch_hls(&client, playlist, segments, base, snapshot_tx).await?;
-                    // Hashed as it was written and, with fsync_on_complete, flushed before it took
-                    // its name: nothing is read back or flushed again.
-                    return self.finish_external(path, started_at, Some(digest)).await;
-                }
-                // Fetched, but not a playlist after all: try it as a plain file.
-                Err(HlsError::InvalidPlaylist(reason)) => {
-                    tracing::warn!("Not an HLS playlist ({}); falling back to a direct download", reason)
-                }
-                // Only a recording gets a live stream: yt-dlp's.
-                Err(HlsError::Live) => {
-                    return self.naming(playlist.clone()).run_media(playlist.clone(), None, snapshot_tx).await
-                }
-                // A real stream; downloading the playlist text instead would only fake a success.
-                Err(e) if matches!(e, HlsError::Unsupported(_)) => {
-                    return Err(format!("{} (try a media preset to use the media engine)", e))
-                }
-                Err(e) => return Err(e.to_string()),
+        if let Some(playlist) = resolved.iter().find(|u| self.options.hls || u.as_str().contains(".m3u8")) {
+            if let Some(path) = self.fetch_playlist(&client, playlist, snapshot_tx.clone()).await? {
+                return Ok(path);
             }
         }
 
         let mut probed = self.probe_all(&client, &resolved).await?;
+        if answers_playlist(&probed.reference) {
+            let playlist = probed.reference.url.clone();
+            // Nothing of the answer is kept: the playlist is read again, and the file probed again
+            // if it is none after all.
+            drop(probed);
+            if let Some(path) = self.fetch_playlist(&client, &playlist, snapshot_tx.clone()).await? {
+                return Ok(path);
+            }
+            probed = self.probe_all(&client, &resolved).await?;
+        }
         let (url, final_url) = (probed.reference.url.clone(), probed.reference.final_url.clone());
         route.tried.push(url.clone());
         // Landing on a "leaving this site" link is landing on its target.
@@ -452,6 +472,48 @@ impl DownloadEngine {
         self.download(client, probed, snapshot_tx).await
     }
 
+    /// Downloads the HLS stream `playlist` lists, or records it with yt-dlp if it is live (see
+    /// `fetch_resolved`); None when it is no playlist after all, to be downloaded as a plain file.
+    async fn fetch_playlist(
+        &self,
+        client: &Client,
+        playlist: &Url,
+        snapshot_tx: Option<broadcast::Sender<EngineSnapshot>>,
+    ) -> Result<Option<PathBuf>, String> {
+        tracing::info!("Detected HLS video stream: {}", playlist);
+        let started_at = unix_now();
+        let fetch = self.fetch_policy();
+        let parsed = self
+            .guarded(
+                HLS_PARSE_TIMEOUT.saturating_add(fetch.give_up_after()),
+                "fetching the HLS playlist",
+                crate::hls::parse_hls_playlist(client, playlist, self.auth.as_deref(), fetch),
+            )
+            .await?;
+        match parsed {
+            Ok(segments) => {
+                let base = self.hls_output_path(playlist, &segments);
+                let (path, digest) = self.fetch_hls(client, playlist, segments, base, snapshot_tx).await?;
+                // Hashed as it was written and, with fsync_on_complete, flushed before it took
+                // its name: nothing is read back or flushed again.
+                self.finish_media(path, started_at, Some(digest)).await.map(Some)
+            }
+            // Fetched, but not a playlist after all: try it as a plain file.
+            Err(HlsError::InvalidPlaylist(reason)) => {
+                tracing::warn!("Not an HLS playlist ({}); falling back to a direct download", reason);
+                Ok(None)
+            }
+            // Only a recording gets a live stream, and only a merge of its video and audio
+            // playlists a stream that keeps them apart: yt-dlp's.
+            Err(HlsError::Live | HlsError::SeparateAudio) => {
+                self.naming(playlist.clone()).run_media(playlist.clone(), None, snapshot_tx).await.map(Some)
+            }
+            // A real stream; downloading the playlist text instead would only fake a success.
+            Err(e) if matches!(e, HlsError::Unsupported(_)) => Err(format!("{} (try a media preset to use the media engine)", e)),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
     /// Downloads `target`, where the download's link led (see `fetch_resolved`), in its place: a
     /// media site's link with yt-dlp, any other as its resolver takes it, looked into again if it
     /// answers with a page. A "leaving this site" link is taken as its target, without a request.
@@ -471,7 +533,16 @@ impl DownloadEngine {
             return engine.run_media(target, None, snapshot_tx).await;
         }
         let resolved = engine
-            .guarded(RESOLVE_TIMEOUT, &format!("resolving {}", target), crate::resolver::SmartResolver::resolve(&client, &target))
+            .guarded(
+                RESOLVE_TIMEOUT,
+                &format!("resolving {}", target),
+                crate::resolver::SmartResolver::resolve_with_options(
+                    &client,
+                    &target,
+                    self.options.debrid_api_key.as_deref(),
+                    self.options.debrid_provider.as_deref(),
+                ),
+            )
             .await?
             .map_err(|e| format!("Failed to resolve {}: {}", target, e))?;
         route.follows += 1;
@@ -606,6 +677,8 @@ impl DownloadEngine {
             preset: preset.cloned().unwrap_or_default(),
             cookies,
             proxy: self.options.proxy.clone(),
+            referer: self.options.referer.clone(),
+            headers: self.options.headers.clone(),
             output_dir,
             output_filename,
             custom_ytdlp_path: self.options.ytdlp_path.clone(),
@@ -674,7 +747,7 @@ impl DownloadEngine {
         )
         .await;
         let _ = forwarder.await;
-        self.finish_external(res?, started_at, None).await
+        self.finish_media(res?, started_at, None).await
     }
 
     /// Downloads one stream of a media download (see `crate::media`) with this download's
@@ -791,8 +864,80 @@ impl DownloadEngine {
         if self.options.expected_checksum.is_some() {
             tracing::info!("Checksum verification passed for {}", path.display());
         }
-        self.record_completed(path.clone(), None, blake3_hex, started_at).await;
+        self.record_completed(path.clone(), None, blake3_hex, started_at, None).await;
         Ok(path)
+    }
+
+    /// [`Self::finish_external`] for the file an HLS download or yt-dlp finished, which is first
+    /// remuxed into an MP4 when it is MPEG-TS and `hls_to_mp4` asks for that (see
+    /// [`Self::remux_to_mp4`]; the `.ts` stays the file when it cannot be). The expected checksum
+    /// is the stream's, checked on the `.ts` before it goes, and history records the MP4 in place
+    /// of any entry for the `.ts`, as an attempt stopped earlier leaves. A stopped recording is
+    /// kept as yt-dlp's run left it (see `media::keep_recording`).
+    async fn finish_media(&self, path: PathBuf, started_at: u64, digest: Option<FileDigest>) -> Result<PathBuf, String> {
+        let ts = path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("ts"));
+        if !self.options.hls_to_mp4 || !ts || self.cancel_token.is_cancelled() {
+            return self.finish_external(path, started_at, digest).await;
+        }
+        if self.options.expected_checksum.is_some() {
+            let written = digest.clone().map_or(Written::File, Written::Flushed);
+            self.verify_written(&path, written).await.map_err(|e| e.to_string())?;
+            tracing::info!("Checksum verification passed for {}", path.display());
+        }
+        let Some(mp4) = self.remux_to_mp4(&path).await else {
+            return self.finish_external(path, started_at, digest).await;
+        };
+        // Read back for its digest; flushed already, as fsync_on_complete asks.
+        let mut engine = self.clone();
+        engine.options.expected_checksum = None;
+        engine.options.fsync_on_complete = false;
+        let blake3_hex = engine.verify_written(&mp4, Written::File).await.map_err(|e| e.to_string())?;
+        self.record_completed(mp4.clone(), None, blake3_hex, started_at, Some(path)).await;
+        Ok(mp4)
+    }
+
+    /// Remuxes `ts`, the MPEG-TS an HLS download finished, into an MP4 of the same name (see
+    /// `DownloadOptions::hls_to_mp4` and [`claim_mp4_output`]), written as that name's `.part`
+    /// while it holds its claim, and deletes `ts` once the MP4 has its name: with
+    /// fsync_on_complete, only once the MP4 is on the disk, as `ts` is its only other copy. None,
+    /// with `ts` kept and a warning saying why, when there is no ffmpeg (installed only as
+    /// `install_ffmpeg` allows) or ffmpeg fails or the download is cancelled meanwhile.
+    async fn remux_to_mp4(&self, ts: &Path) -> Option<PathBuf> {
+        let kept = |why: String| {
+            tracing::warn!("Kept {} as MPEG-TS, not remuxed to MP4: {}", ts.display(), why);
+            None
+        };
+        let flag = Some(Arc::clone(&self.cancel_flag));
+        let ffmpeg = match crate::media::remux_ffmpeg(self.options.install_ffmpeg, self.options.proxy.clone(), &flag).await {
+            Ok(ffmpeg) => ffmpeg,
+            Err(why) => return kept(format!("no ffmpeg ({})", why)),
+        };
+        let source = ts.to_path_buf();
+        let (mp4, _claim) = match blocking(move || claim_mp4_output(&source)).await.and_then(|claimed| claimed) {
+            Ok(claimed) => claimed,
+            Err(e) => return kept(e),
+        };
+        let part = part_path(&mp4);
+        let mut remuxed = crate::media::remux_hls(&ffmpeg, ts, &part, flag).await;
+        if remuxed.is_ok() && self.options.fsync_on_complete {
+            let part = part.clone();
+            remuxed = blocking(move || OpenOptions::new().write(true).open(&part).and_then(|f| f.sync_data()).map_err(|e| e.to_string()))
+                .await
+                .and_then(|synced| synced);
+        }
+        let remuxed = match remuxed {
+            Ok(()) => tokio::fs::rename(&part, &mp4).await.map_err(|e| e.to_string()),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = remuxed {
+            let _ = tokio::fs::remove_file(&part).await;
+            return kept(e);
+        }
+        if let Err(e) = tokio::fs::remove_file(ts).await {
+            tracing::warn!("Failed to delete {} after remuxing it to {}: {}", ts.display(), mp4.display(), e);
+        }
+        tracing::info!("Remuxed {} to {}", ts.display(), mp4.display());
+        Some(mp4)
     }
 
     /// Resolves every URL into direct mirrors. A resolver error fails the download instead of
@@ -804,7 +949,16 @@ impl DownloadEngine {
         let mut resolved: Vec<Url> = Vec::new();
         for url in &self.urls {
             let mirrors = self
-                .guarded(RESOLVE_TIMEOUT, &format!("resolving {}", url), crate::resolver::SmartResolver::resolve(client, url))
+                .guarded(
+                    RESOLVE_TIMEOUT,
+                    &format!("resolving {}", url),
+                    crate::resolver::SmartResolver::resolve_with_options(
+                        client,
+                        url,
+                        self.options.debrid_api_key.as_deref(),
+                        self.options.debrid_provider.as_deref(),
+                    ),
+                )
                 .await?
                 .map_err(|e| format!("Failed to resolve {}: {}", url, e))?;
             for mirror in mirrors {
@@ -1054,7 +1208,8 @@ impl DownloadEngine {
         let max_workers = self.options.num_connections.clamp(1, MAX_CONNECTIONS).min(room).max(1) as u64;
         let num_workers = remaining.div_ceil(per_connection).clamp(1, max_workers) as usize;
         let in_order = crate::storage::hashes_prefix(self.options.expected_checksum.as_deref());
-        let chunk_size = effective_chunk_size(remaining, num_workers as u64, self.options.base_chunk_size, in_order);
+        let throttled_host = mirrors.iter().any(|m| HostKey::of(&m.url).is_bitrate_throttled());
+        let chunk_size = effective_chunk_size(remaining, num_workers as u64, self.options.base_chunk_size, in_order, throttled_host);
         let mut manager = ChunkManager::with_resumed_ranges(size, chunk_size, &have).map_err(|e| e.to_string())?;
         manager.set_max_retries(self.options.max_retries);
         // The probe's answer is worker 0's first attempt, its connection's rate watched on while no
@@ -1103,8 +1258,13 @@ impl DownloadEngine {
         let (events_tx, mut events) = mpsc::channel(1024);
         // Workers stop when the user cancels or when this download is over.
         let stop = self.cancel_token.child_token();
+        let pool_clients = match self.client_pool.as_ref() {
+            Ok(p) if !p.is_empty() => p.clone(),
+            _ => vec![client.clone()],
+        };
         let shared = WorkerShared {
             client,
+            clients: Arc::new(pool_clients),
             auth: self.auth.clone(),
             writer: job.writer.clone(),
             chunks: Arc::clone(&job.chunks),
@@ -1393,7 +1553,7 @@ impl DownloadEngine {
         })
         .await??;
         tracing::info!("Download completed: {} (BLAKE3 {})", target.display(), blake3_hex);
-        self.record_completed(target.clone(), Some(size), blake3_hex, started_at).await;
+        self.record_completed(target.clone(), Some(size), blake3_hex, started_at, None).await;
 
         emit(snapshot_tx, || done_snapshot(size, &target));
         Ok(target)
@@ -1445,8 +1605,9 @@ impl DownloadEngine {
 
     /// Records `path` as completed in the download history, which is read only once, under its
     /// lock: it may have been edited (entries removed, other downloads finished) while this
-    /// download ran. `size` is looked up if not given.
-    async fn record_completed(&self, path: PathBuf, size: Option<u64>, blake3_hex: String, started_at: u64) {
+    /// download ran. `size` is looked up if not given. `replaced`, the file `path` was made from
+    /// and took the place of, loses its entries in the same write.
+    async fn record_completed(&self, path: PathBuf, size: Option<u64>, blake3_hex: String, started_at: u64, replaced: Option<PathBuf>) {
         let urls = self.url_strings();
         let _ = blocking(move || {
             let size = size.unwrap_or_else(|| std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0));
@@ -1457,7 +1618,11 @@ impl DownloadEngine {
             entry.started_at = started_at;
             entry.completed_at = Some(unix_now());
             let history = DownloadHistoryManager::default_history_path();
-            if let Err(e) = DownloadHistoryManager::record(&history, entry) {
+            let recorded = match replaced {
+                Some(replaced) => DownloadHistoryManager::record_replacing(&history, entry, &absolute(&replaced)),
+                None => DownloadHistoryManager::record(&history, entry),
+            };
+            if let Err(e) = recorded {
                 tracing::warn!("Failed to update history file {:?}: {}", history, e);
             }
         })
@@ -1489,7 +1654,11 @@ impl DownloadEngine {
         let mut name = PathBuf::from(filename_from_url(playlist).unwrap_or_else(|| "stream".to_string()));
         name.set_extension(ext);
         let mut out = self.output_path_for(&name.to_string_lossy());
-        if out.extension().is_none() {
+        // A name given without an extension, or with the other container's (a browser's
+        // "Talk.mp4" for MPEG-TS segments, which only `hls_to_mp4` remuxes afterwards), takes
+        // the segments' one.
+        let given = out.extension().map(|e| e.to_ascii_lowercase());
+        if given.is_none_or(|given| (given == "mp4" || given == "ts") && given != ext) {
             out.set_extension(ext);
         }
         out
@@ -1638,15 +1807,40 @@ async fn claim_hls_output(
     }
 }
 
+/// Chooses and claims the MP4 that the MPEG-TS `ts` is remuxed into: `ts` named `.mp4`, else the
+/// first of `name (1).mp4`, ... that no other download holds and where neither a file nor a
+/// `.part` (a remux a crash cut short, another download's) is. Nothing there is touched. Blocking.
+fn claim_mp4_output(ts: &Path) -> Result<(PathBuf, Claim), String> {
+    let base = ts.with_extension("mp4");
+    let mut n = 0;
+    loop {
+        let candidate = numbered(&base, n);
+        n += 1;
+        let free = |path: &Path| !path.exists() && !part_path(path).exists();
+        if let Some(claim) = Claim::try_take(&candidate)?.filter(|_| free(&candidate)) {
+            return Ok((candidate, claim));
+        }
+    }
+}
+
 /// The user's Authorization header is deliberately not a default header here: it is added per
 /// request, only for the hosts the user named (see [`Auth`]).
 /// The HTTP client for downloads with these options; see `ClientKey` for what it depends on.
 pub fn build_client(options: &DownloadOptions) -> Result<Client, String> {
+    build_client_with_proxy(options, options.proxy.as_deref())
+}
+
+/// Builds an HTTP client with the specified proxy URL override (if any).
+pub fn build_client_with_proxy(options: &DownloadOptions, proxy_url: Option<&str>) -> Result<Client, String> {
     let mut headers = crate::resolver::SmartResolver::default_anti_qos_headers();
     if let Some(referer) = &options.referer {
         if let Ok(val) = reqwest::header::HeaderValue::from_str(referer) {
             headers.insert(reqwest::header::REFERER, val);
         }
+    }
+    // The browser's own, in place of the defaults that only pass for a browser's.
+    for (name, value) in options.headers.iter().filter_map(|(name, value)| request_header(name, value)) {
+        headers.insert(name, value);
     }
 
     let mut builder = Client::builder()
@@ -1681,7 +1875,7 @@ pub fn build_client(options: &DownloadOptions) -> Result<Client, String> {
         }
     }));
 
-    if let Some(proxy_url) = &options.proxy {
+    if let Some(proxy_url) = proxy_url {
         let proxy = reqwest::Proxy::all(proxy_url).map_err(|e| format!("Invalid proxy URL {}: {}", proxy_url, e))?;
         builder = builder.proxy(proxy);
     }
@@ -1695,6 +1889,26 @@ pub fn build_client(options: &DownloadOptions) -> Result<Client, String> {
     }
 
     builder.build().map_err(|e| format!("Failed to build HTTP client: {}", e))
+}
+
+/// `name: value` as a request header, if both are valid in one (see `DownloadOptions::headers`).
+pub fn request_header(name: &str, value: &str) -> Option<(HeaderName, reqwest::header::HeaderValue)> {
+    Some((HeaderName::from_bytes(name.as_bytes()).ok()?, reqwest::header::HeaderValue::from_str(value).ok()?))
+}
+
+/// Builds a pool of HTTP clients for multi-proxy / multi-egress rotation across workers.
+pub fn build_client_pool(options: &DownloadOptions) -> Result<Vec<Client>, String> {
+    if options.proxy_pool.is_empty() {
+        let client = build_client(options)?;
+        Ok(vec![client])
+    } else {
+        let mut pool = Vec::with_capacity(options.proxy_pool.len());
+        for p in &options.proxy_pool {
+            let client = build_client_with_proxy(options, Some(p.trim()))?;
+            pool.push(client);
+        }
+        Ok(pool)
+    }
 }
 
 /// Shared state of one multi-connection download.
@@ -1981,6 +2195,14 @@ fn shortener_host(url: &Url) -> Option<&str> {
         None => host == *pattern,
     };
     HtmlVideoResolver::SHORTENER_HOSTS.iter().any(listed).then_some(host)
+}
+
+/// Whether `answer` is an HLS playlist its URL does not name (an API path, a `.m3u`, a variant a
+/// page chose), as its first bytes say: `#EXTM3U`, then HLS tags, which a plain M3U list of songs
+/// or radio stations lacks. A `.m3u8` URL was taken for one already.
+fn answers_playlist(answer: &ProbeInfo) -> bool {
+    let hls_tags = answer.prefetch.windows(7).any(|w| w == b"#EXT-X-");
+    !answer.url.as_str().contains(".m3u8") && crate::hls::is_playlist_start(&answer.prefetch) && hls_tags
 }
 
 /// Where a `RateWatch` measures a connection's rate from: when its answer arrived.
@@ -2933,12 +3155,16 @@ fn min_steal(options: &DownloadOptions) -> u64 {
 /// `configured` one. `in_order`, when the file is hashed from its start as that is written (SHA-256
 /// or MD5, see [`DiskWriter::track_digest`]), keeps chunks small: taken in file order, they keep
 /// that start growing, so little is left to hash once the download is done.
-fn effective_chunk_size(file_size: u64, num_workers: u64, configured: u64, in_order: bool) -> u64 {
+fn effective_chunk_size(file_size: u64, num_workers: u64, configured: u64, in_order: bool, throttled_host: bool) -> u64 {
     const MB: u64 = 1024 * 1024;
     if configured != DEFAULT_CHUNK_SIZE {
         configured
+    } else if throttled_host {
+        // Video CDNs throttle sustained streams to 400-600 KB/s after an initial burst window.
+        // Smaller 8MB chunks cycle connections, keeping downloads continuously inside the 4+ MB/s burst window.
+        8 * MB
     } else if in_order {
-        effective_chunk_size(file_size, num_workers, configured, false).min(IN_ORDER_CHUNK)
+        effective_chunk_size(file_size, num_workers, configured, false, false).min(IN_ORDER_CHUNK)
     } else if file_size >= 1024 * MB {
         // Multi-GB files: long-lived 64-256MB streams per connection.
         (file_size / (num_workers * 2)).clamp(64 * MB, 256 * MB)
@@ -3214,10 +3440,10 @@ fn percent_decode(input: &str) -> Vec<u8> {
     out
 }
 
-/// Makes a server-provided name safe as a single path component on every OS, at most
+/// Makes a name a server or a browser gave safe as a single path component on every OS, at most
 /// `MAX_NAME_BYTES` long. Leading dots go too, so a download is never hidden. Empty when nothing
 /// usable is left.
-fn sanitize_filename(name: &str) -> String {
+pub fn sanitize_filename(name: &str) -> String {
     finish_name(replace_invalid_chars(name).trim().trim_matches('.').trim())
 }
 
@@ -3506,9 +3732,50 @@ mod tests {
             DownloadOptions { auth_header: Some("Bearer x".into()), ..DownloadOptions::default() },
             DownloadOptions { proxy: Some("http://p:8080".into()), ..DownloadOptions::default() },
             DownloadOptions { cookies_path: Some("c.txt".into()), ..DownloadOptions::default() },
+            DownloadOptions { headers: vec![("Origin".into(), "https://page.example".into())], ..DownloadOptions::default() },
         ] {
             assert_ne!(ClientKey::of(&base), ClientKey::of(&other));
         }
+    }
+
+    /// The browser's headers are the client's: each replaces the default of its name, the other
+    /// defaults stay, and a pair that is no valid header is left out.
+    #[tokio::test]
+    async fn test_browser_headers_replace_the_client_defaults() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!("http://{}/v.mp4", listener.local_addr().unwrap())).unwrap();
+        let (head_tx, head_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut head = [0u8; 4096];
+            let n = socket.read(&mut head).await.unwrap();
+            let _ = head_tx.send(String::from_utf8_lossy(&head[..n]).to_ascii_lowercase());
+            let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await;
+        });
+
+        let headers = [("User-Agent", "Browser/1.0"), ("Origin", "https://page.example"), ("Bad Name", "x"), ("X-Bad-Value", "a\r\nb")];
+        let options = DownloadOptions {
+            headers: headers.iter().map(|(name, value)| (name.to_string(), value.to_string())).collect(),
+            ..Default::default()
+        };
+        build_client(&options).unwrap().get(url).send().await.unwrap();
+        let head = head_rx.await.unwrap();
+        let lines: Vec<&str> = head.lines().collect();
+        let agents: Vec<&&str> = lines.iter().filter(|l| l.starts_with("user-agent:")).collect();
+        assert_eq!(agents, [&"user-agent: browser/1.0"], "{head}");
+        assert!(lines.contains(&"origin: https://page.example"), "{head}");
+        assert!(lines.contains(&"accept-language: en-us,en;q=0.9"), "{head}");
+        assert!(!head.contains("bad"), "{head}");
+    }
+
+    /// The page's referer and the browser's headers go with a media download to yt-dlp.
+    #[test]
+    fn test_a_media_download_takes_the_browsers_request() {
+        let headers = vec![("Origin".to_string(), "https://page.example".to_string())];
+        let options = DownloadOptions { referer: Some("https://page.example/watch".into()), headers: headers.clone(), ..Default::default() };
+        let media = engine_with(options).media_options();
+        assert_eq!((media.referer.as_deref(), media.headers), (Some("https://page.example/watch"), headers));
     }
 
     /// A body that sends each `(ms, bytes)` step `ms` after the one before.
@@ -3816,6 +4083,189 @@ mod tests {
             let out = engine.hls_output_path(&Url::parse(playlist).unwrap(), &[]);
             assert_eq!(out, dir.path().join(expected), "{playlist}");
         }
+        // A name given (as the browser extension gives "<title>.mp4") is kept, but for the container.
+        for (given, expected) in [("Talk.mp4", "Talk.ts"), ("Talk.TS", "Talk.TS"), ("Talk.mkv", "Talk.mkv"), ("Talk", "Talk.ts")] {
+            let options = DownloadOptions { output_path: Some(dir.path().join(given)), ..Default::default() };
+            let out = DownloadEngine::new(Vec::new(), options).hls_output_path(&Url::parse("http://h/a.m3u8").unwrap(), &[]);
+            assert_eq!(out, dir.path().join(expected), "{given}");
+        }
+    }
+
+    /// A playlist served where its URL does not say so (an API path, as a page's player finds it)
+    /// is still a stream: its segments are downloaded, not the playlist text. A plain M3U list of
+    /// radio stations is no HLS stream, and is downloaded as it is.
+    #[tokio::test]
+    async fn test_a_playlist_is_known_by_its_answer() {
+        use crate::hls::tests::{ok, serve};
+        const RADIO: &[u8] = b"#EXTM3U\n#EXTINF:-1,Radio\nhttp://127.0.0.1:9/live\n";
+        let (addr, _) = serve(|path: &str, _| match path {
+            "/api/play" => (200, "Content-Type: text/plain\r\n".to_string(), b"#EXTM3U\n#EXTINF:4,\nseg.ts\n#EXT-X-ENDLIST\n".to_vec()),
+            "/api/seg.ts" => ok("SEGMENT"),
+            "/radio.m3u" => (200, "Content-Type: audio/x-mpegurl\r\n".to_string(), RADIO.to_vec()),
+            _ => (404, String::new(), Vec::new()),
+        })
+        .await;
+        let dir = tempdir().unwrap();
+        let engine = |path: &str| {
+            let options = DownloadOptions { output_path: Some(dir.path().to_path_buf()), ..Default::default() };
+            DownloadEngine::new(vec![Url::parse(&format!("http://{addr}{path}")).unwrap()], options)
+        };
+        let path = engine("/api/play").run(None).await.unwrap();
+        assert_eq!(path, dir.path().join("play.ts"));
+        assert_eq!(std::fs::read(path).unwrap(), b"SEGMENT");
+        let path = engine("/radio.m3u").run(None).await.unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), RADIO);
+    }
+
+    /// A link the browser saw read as a playlist (`hls`) is read as one even when its answer is
+    /// chunked, which leaves the probe no start to know it by (see `answers_playlist`).
+    #[tokio::test]
+    async fn test_a_link_known_as_hls_is_read_as_a_playlist() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut req = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => req.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let path = String::from_utf8_lossy(&req).split_whitespace().nth(1).unwrap_or("/").to_string();
+                    let body: &[u8] =
+                        if path.starts_with("/api/play") { b"#EXTM3U\n#EXTINF:4,\nseg.ts\n#EXT-X-ENDLIST\n" } else { b"SEGMENT" };
+                    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+                    let _ = socket.write_all(format!("{head}{:x}\r\n", body.len()).as_bytes()).await;
+                    let _ = socket.write_all(body).await;
+                    let _ = socket.write_all(b"\r\n0\r\n\r\n").await;
+                });
+            }
+        });
+        let dir = tempdir().unwrap();
+        let options = DownloadOptions { output_path: Some(dir.path().to_path_buf()), hls: true, ..Default::default() };
+        let url = Url::parse(&format!("http://{addr}/api/play?id=1")).unwrap();
+        let path = DownloadEngine::new(vec![url], options).run(None).await.unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"SEGMENT");
+    }
+
+    /// The MP4 an HLS download's `.ts` is remuxed into takes the `.ts`'s name, else the first
+    /// numbered one that no file, `.part` or other download has; nothing there is touched.
+    #[test]
+    fn test_hls_mp4_output_is_numbered_past_files_parts_and_claims() {
+        let dir = tempdir().unwrap();
+        let ts = dir.path().join("Talk.ts");
+        let (first, claim) = claim_mp4_output(&ts).unwrap();
+        assert_eq!(first, dir.path().join("Talk.mp4"));
+        let (held, _held) = claim_mp4_output(&ts).unwrap();
+        assert_eq!(held, dir.path().join("Talk (1).mp4"), "a name another remux holds is skipped");
+        drop(claim);
+        std::fs::write(dir.path().join("Talk.mp4"), b"another file").unwrap();
+        std::fs::write(dir.path().join("Talk (2).mp4.part"), b"cut short").unwrap();
+        assert_eq!(claim_mp4_output(&ts).unwrap().0, dir.path().join("Talk (3).mp4"));
+        assert_eq!(std::fs::read(dir.path().join("Talk.mp4")).unwrap(), b"another file");
+        assert_eq!(std::fs::read(dir.path().join("Talk (2).mp4.part")).unwrap(), b"cut short");
+        assert_eq!(claim_mp4_output(&dir.path().join("a.b (1).ts")).unwrap().0, dir.path().join("a.b (1).mp4"));
+    }
+
+    /// With `hls_to_mp4` an HLS stream of MPEG-TS ends as an MP4 next to it, never over another
+    /// file, and the `.ts` is gone; history records the MP4 in place of the `.ts` an attempt
+    /// stopped earlier recorded. A remux cancelled keeps the `.ts`, leaving nothing else behind.
+    /// Needs ffmpeg.
+    #[tokio::test]
+    async fn test_an_hls_stream_is_remuxed_to_mp4() {
+        use crate::hls::tests::{ok, serve};
+        let Some(ffmpeg) = crate::media::find_ffmpeg_path() else {
+            eprintln!("skipped: ffmpeg not found");
+            return;
+        };
+        let source = tempdir().unwrap();
+        let segment = source.path().join("seg.ts");
+        let made = std::process::Command::new(&ffmpeg)
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc=duration=1:size=64x48:rate=5"])
+            .args(["-f", "lavfi", "-i", "sine=duration=1", "-c:a", "aac", "-f", "mpegts"])
+            .arg(&segment)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
+        let segment = std::fs::read(&segment).unwrap();
+        let (addr, _) = serve(move |path: &str, _| match path {
+            "/v/play.m3u8" => ok("#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\nseg.ts\n#EXT-X-ENDLIST\n"),
+            "/v/seg.ts" => ok(segment.clone()),
+            _ => (404, String::new(), Vec::new()),
+        })
+        .await;
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("play.mp4"), b"another file").unwrap();
+        // As the CLI records a download stopped midway.
+        let history_path = DownloadHistoryManager::default_history_path();
+        let mut stopped = HistoryEntry::new("play.ts".into(), absolute(&dir.path().join("play.ts")), 0, vec![]);
+        stopped.status = HistoryStatus::Cancelled;
+        DownloadHistoryManager::record(&history_path, stopped).unwrap();
+        let options = DownloadOptions {
+            output_path: Some(dir.path().to_path_buf()),
+            hls_to_mp4: true,
+            fsync_on_complete: true,
+            ..Default::default()
+        };
+        let url = Url::parse(&format!("http://{addr}/v/play.m3u8")).unwrap();
+        let path = DownloadEngine::new(vec![url.clone()], options).run(None).await.unwrap();
+        assert_eq!(path, dir.path().join("play (1).mp4"));
+        assert_eq!(&std::fs::read(&path).unwrap()[4..8], b"ftyp");
+        let probe = std::process::Command::new(&ffmpeg).args(["-hide_banner", "-i"]).arg(&path).output().unwrap();
+        let info = String::from_utf8_lossy(&probe.stderr);
+        assert!(info.contains("Video:") && info.contains("Audio:"), "{info}");
+        let mut names: Vec<String> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        assert_eq!(names, ["play (1).mp4", "play.mp4"], "the .ts is gone, the other file untouched");
+        assert_eq!(std::fs::read(dir.path().join("play.mp4")).unwrap(), b"another file");
+        let history = DownloadHistoryManager::load_from_path(&history_path);
+        assert!(history.entries().iter().any(|e| absolute(&e.file_path) == absolute(&path) && e.status == HistoryStatus::Completed));
+        assert!(!history.entries().iter().any(|e| e.file_path == absolute(&dir.path().join("play.ts"))), "the stopped attempt's entry is gone");
+
+        let ts = dir.path().join("play.ts");
+        std::fs::copy(source.path().join("seg.ts"), &ts).unwrap();
+        let engine = DownloadEngine::new(vec![url], DownloadOptions { hls_to_mp4: true, ..Default::default() });
+        engine.cancel();
+        assert_eq!(engine.remux_to_mp4(&ts).await, None);
+        assert!(ts.is_file() && !dir.path().join("play (2).mp4").exists() && !dir.path().join("play (2).mp4.part").exists());
+    }
+
+    /// A `.ts` yt-dlp saved is remuxed only with `hls_to_mp4`, as the engine's own HLS download
+    /// is: into a numbered MP4 beside another file of its name, which is untouched, and history
+    /// then has the MP4 in place of the `.ts`. Needs ffmpeg.
+    #[tokio::test]
+    async fn test_a_ts_ytdlp_saved_is_remuxed_to_mp4() {
+        let Some(ffmpeg) = crate::media::find_ffmpeg_path() else {
+            eprintln!("skipped: ffmpeg not found");
+            return;
+        };
+        let dir = tempdir().unwrap();
+        let ts = dir.path().join("clip.ts");
+        let made = std::process::Command::new(&ffmpeg)
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc=duration=1:size=64x48:rate=5"])
+            .args(["-f", "lavfi", "-i", "sine=duration=1", "-c:a", "aac", "-f", "mpegts"])
+            .arg(&ts)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
+        std::fs::write(dir.path().join("clip.mp4"), b"another file").unwrap();
+        let url = Url::parse("https://cdn.example.com/clip.ts").unwrap();
+        let kept = DownloadEngine::new(vec![url.clone()], DownloadOptions::default());
+        assert_eq!(kept.finish_media(ts.clone(), unix_now(), None).await.unwrap(), ts, "kept as it is without hls_to_mp4");
+
+        let options = DownloadOptions { hls_to_mp4: true, fsync_on_complete: true, ..Default::default() };
+        let mp4 = DownloadEngine::new(vec![url], options).finish_media(ts.clone(), unix_now(), None).await.unwrap();
+        assert_eq!(mp4, dir.path().join("clip (1).mp4"));
+        assert_eq!(&std::fs::read(&mp4).unwrap()[4..8], b"ftyp");
+        assert!(!ts.exists());
+        assert_eq!(std::fs::read(dir.path().join("clip.mp4")).unwrap(), b"another file");
+        let history = DownloadHistoryManager::load_from_path(&DownloadHistoryManager::default_history_path());
+        assert!(history.entries().iter().any(|e| e.file_path == absolute(&mp4) && e.status == HistoryStatus::Completed));
+        assert!(!history.entries().iter().any(|e| e.file_path == absolute(&ts)), "the .ts is no longer listed");
     }
 
     #[tokio::test]
@@ -4314,11 +4764,13 @@ mod tests {
     #[test]
     fn test_chunks_stay_small_while_a_checksum_hashes_the_file_from_its_start() {
         const MB: u64 = 1024 * 1024;
-        assert_eq!(effective_chunk_size(4096 * MB, 16, DEFAULT_CHUNK_SIZE, false), 128 * MB);
-        assert_eq!(effective_chunk_size(4096 * MB, 16, DEFAULT_CHUNK_SIZE, true), IN_ORDER_CHUNK);
+        assert_eq!(effective_chunk_size(4096 * MB, 16, DEFAULT_CHUNK_SIZE, false, false), 128 * MB);
+        assert_eq!(effective_chunk_size(4096 * MB, 16, DEFAULT_CHUNK_SIZE, true, false), IN_ORDER_CHUNK);
         // Chunks that small already stay, and so does a size the user chose.
-        assert_eq!(effective_chunk_size(20 * MB, 8, DEFAULT_CHUNK_SIZE, true), 4 * MB);
-        assert_eq!(effective_chunk_size(4096 * MB, 16, 32 * MB, true), 32 * MB);
+        assert_eq!(effective_chunk_size(20 * MB, 8, DEFAULT_CHUNK_SIZE, true, false), 4 * MB);
+        assert_eq!(effective_chunk_size(4096 * MB, 16, 32 * MB, true, false), 32 * MB);
+        // Throttled video CDNs cap chunks to 8MB to cycle the burst window
+        assert_eq!(effective_chunk_size(4096 * MB, 16, DEFAULT_CHUNK_SIZE, false, true), 8 * MB);
 
         let (hex64, hex32) = ("ab".repeat(32), "ab".repeat(16));
         for (checksum, in_order) in [

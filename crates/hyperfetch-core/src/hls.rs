@@ -124,6 +124,11 @@ pub enum HlsError {
     /// it is recorded (by the media engine), not downloaded.
     #[error("Live HLS stream: only a recording can download it")]
     Live,
+    /// A master playlist whose audio is delivered only as a separate `#EXT-X-MEDIA` rendition:
+    /// a variant alone would come out silent, so the media engine (yt-dlp + ffmpeg) downloads
+    /// the video and audio playlists and merges them.
+    #[error("HLS stream with its audio in a separate rendition: only the media engine can merge it")]
+    SeparateAudio,
     #[error("HLS segment {index} could not be downloaded: {reason}")]
     SegmentFailed { index: usize, reason: String },
     #[error("Download cancelled by user")]
@@ -211,7 +216,7 @@ pub async fn parse_hls_playlist(
 }
 
 /// Whether `body` starts like an HLS playlist: `#EXTM3U` after an optional BOM and whitespace.
-fn is_playlist_start(body: &[u8]) -> bool {
+pub(crate) fn is_playlist_start(body: &[u8]) -> bool {
     body.strip_prefix("\u{feff}".as_bytes()).unwrap_or(body).trim_ascii_start().starts_with(b"#EXTM3U")
 }
 
@@ -264,7 +269,7 @@ const AUDIO_CODEC_PREFIXES: [&str; 8] = ["mp4a", "ac-3", "ec-3", "ac-4", "opus",
 
 /// Picks the best variant of a master playlist. Variants whose audio is muxed in are
 /// preferred; a variant whose audio lives only in a separate `#EXT-X-MEDIA` rendition
-/// would come out silent, so that case is an error.
+/// would come out silent, so that case is [`HlsError::SeparateAudio`], for the media engine.
 fn select_variant(master: &str, base: &Url) -> Result<Url, HlsError> {
     struct Variant<'a> {
         bandwidth: u64,
@@ -319,14 +324,7 @@ fn select_variant(master: &str, base: &Url) -> Result<Url, HlsError> {
 
     let chosen = match variants.iter().filter(|v| muxed_audio(v)).max_by_key(rank) {
         Some(v) => v.uri,
-        None if variants.iter().any(separate_audio) => {
-            return Err(HlsError::Unsupported(
-                "the audio track is delivered as a separate EXT-X-MEDIA rendition, so the video \
-                 variant alone would be silent; download this stream with the media engine \
-                 (yt-dlp + ffmpeg) instead"
-                    .to_string(),
-            ))
-        }
+        None if variants.iter().any(separate_audio) => return Err(HlsError::SeparateAudio),
         // No variant advertises audio at all: the stream is video-only by design.
         None => variants
             .iter()
@@ -717,6 +715,23 @@ async fn decrypt(data: Vec<u8>, key: &Option<Aes128Key>) -> Result<Vec<u8>, Stri
     .map_err(|e| format!("decryption task failed: {}", e))?
 }
 
+/// Cuts what some hosts put before an MPEG-TS segment's packets so it passes for an image (a 1×1
+/// PNG on an image CDN): players skip it, and so does the download, else the joined file starts
+/// with that image and players take it for one. The segment starts at the first byte of its first
+/// 64 KiB that begins five packets in a row (0x47 every 188 bytes); one that already does, or
+/// shows no such run, is kept whole. A run, not one 0x47, since a GIF starts with that byte too.
+fn strip_disguise(mut data: Vec<u8>) -> Vec<u8> {
+    const PACKET: usize = 188;
+    let packets_at = |i: usize| (0..5).all(|k| data.get(i + k * PACKET) == Some(&0x47));
+    if packets_at(0) {
+        return data;
+    }
+    if let Some(start) = (1..data.len().min(64 * 1024)).find(|&i| packets_at(i)) {
+        data.drain(..start);
+    }
+    data
+}
+
 /// Downloads and decrypts one segment, prefixed by its init section when that changes. Its body
 /// bytes count in `tally` as they arrive.
 async fn fetch_segment(
@@ -742,6 +757,8 @@ async fn fetch_segment(
             .await
             .map_err(|e| failed(format!("{}: {}", segment.url, e.reason)))?;
     let data = decrypt(data, &segment.encryption).await.map_err(failed)?;
+    // Only MPEG-TS is disguised so; fMP4 segments (with an init section) are left as they are.
+    let data = if segment.init.is_none() { strip_disguise(data) } else { data };
     Ok(match init_data {
         Some(mut out) => {
             out.extend_from_slice(&data);
@@ -1745,6 +1762,20 @@ pub(crate) mod tests {
             .to_vec()
     }
 
+    /// A segment disguised as an image (a 1×1 PNG, a GIF, both seen on image CDNs) loses the
+    /// image; a plain segment, or data that shows no packets, is kept whole.
+    #[test]
+    fn test_a_segment_disguised_as_an_image_is_cut_to_its_packets() {
+        let ts: Vec<u8> = (0..6).flat_map(|n| { let mut p = vec![n; 188]; p[0] = 0x47; p }).collect();
+        let png = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR\0\0\0\x01\0\0\0\x01\x08\x06\0\0\0\x1f\x15\xc4\x89\0\0\0\0IEND\xaeB`\x82";
+        let disguised = |prefix: &[u8]| [prefix, &ts].concat();
+        assert_eq!(strip_disguise(disguised(png)), ts);
+        assert_eq!(strip_disguise(disguised(b"GIF89a\x01\0\x01\0")), ts);
+        assert_eq!(strip_disguise(ts.clone()), ts);
+        let not_ts = b"\x89PNG and nothing after".to_vec();
+        assert_eq!(strip_disguise(not_ts.clone()), not_ts);
+    }
+
     #[test]
     fn test_parse_best_variant() {
         let master = r#"#EXTM3U
@@ -1782,7 +1813,7 @@ video-only.m3u8
 #EXT-X-STREAM-INF:BANDWIDTH=8000000,CODECS="avc1.640028,mp4a.40.2",AUDIO="aud"
 video.m3u8
 "#;
-        assert!(matches!(select_variant(demuxed, &base), Err(HlsError::Unsupported(_))));
+        assert!(matches!(select_variant(demuxed, &base), Err(HlsError::SeparateAudio)));
 
         // An audio group whose rendition has no URI means the audio is muxed into the variant.
         let muxed_group = r#"#EXTM3U

@@ -30,20 +30,26 @@ const KEEP_HOSTS: usize = 256;
 
 static HOSTS: LazyLock<Hosts> = LazyLock::new(Hosts::default);
 
-/// A host as this module tells hosts apart: scheme, host and port.
+/// A host as this module tells hosts apart: scheme, host, port, and optional proxy route.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct HostKey {
     scheme: String,
     host: String,
     port: Option<u16>,
+    route_id: usize,
 }
 
 impl HostKey {
     pub fn of(url: &Url) -> Self {
+        Self::routed(url, 0)
+    }
+
+    pub fn routed(url: &Url, route_id: usize) -> Self {
         Self {
             scheme: url.scheme().to_string(),
             host: url.host_str().unwrap_or_default().to_string(),
             port: url.port_or_known_default(),
+            route_id,
         }
     }
 
@@ -51,10 +57,16 @@ impl HostKey {
     pub fn default_connection_cap(&self) -> Option<usize> {
         let host = self.host.to_ascii_lowercase();
         if host.contains("cloudatacdn") || host.contains("dood") || host.contains("ds2play") || host.contains("doodstream") {
-            Some(4)
+            Some(3)
         } else {
             None
         }
+    }
+
+    /// Whether the host is known to enforce streaming bitrate shaping after an initial burst window.
+    pub fn is_bitrate_throttled(&self) -> bool {
+        let host = self.host.to_ascii_lowercase();
+        host.contains("cloudatacdn") || host.contains("dood") || host.contains("ds2play") || host.contains("doodstream") || host.contains("streamtape")
     }
 }
 
@@ -89,7 +101,22 @@ pub fn record(url: &Url, seen: HostProfile) {
 /// returns its slot. Waiting is no failure: nothing else is held meanwhile, and dropping the
 /// future gives up the wait. Never wait for a slot while holding another.
 pub async fn acquire(url: &Url, limit: usize) -> HostSlot {
-    HOSTS.acquire(HostKey::of(url), limit).await
+    acquire_routed(url, limit, 0).await
+}
+
+/// Waits until a request to `url`'s host on specific route `route_id` may be opened under `limit`.
+pub async fn acquire_routed(url: &Url, limit: usize, route_id: usize) -> HostSlot {
+    HOSTS.acquire(HostKey::routed(url, route_id), limit).await
+}
+
+/// A slot for a request to `url`'s host under `limit`, if one is free now.
+pub fn try_acquire(url: &Url, limit: usize) -> Option<HostSlot> {
+    try_acquire_routed(url, limit, 0)
+}
+
+/// A slot for a request to `url`'s host on specific route `route_id` under `limit`, if one is free now.
+pub fn try_acquire_routed(url: &Url, limit: usize, route_id: usize) -> Option<HostSlot> {
+    HOSTS.try_acquire(&HostKey::routed(url, route_id), limit, Instant::now())
 }
 
 /// The most requests `url`'s host has had open at once.
@@ -114,10 +141,6 @@ pub(crate) async fn unseen_listener() -> tokio::net::TcpListener {
     }
 }
 
-/// A slot for a request to `url`'s host under `limit`, if one is free now.
-pub fn try_acquire(url: &Url, limit: usize) -> Option<HostSlot> {
-    HOSTS.try_acquire(&HostKey::of(url), limit, Instant::now())
-}
 
 /// One request open to a host, counted against the host's budget until dropped.
 #[must_use = "the slot is given back when dropped"]

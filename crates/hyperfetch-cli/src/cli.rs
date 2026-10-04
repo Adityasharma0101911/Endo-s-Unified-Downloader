@@ -100,6 +100,22 @@ pub struct Args {
     #[arg(long = "proxy", value_name = "URL", value_parser = parse_proxy, conflicts_with = "repair")]
     pub proxy: Option<String>,
 
+    /// Comma-separated list of proxy URLs for multi-egress rotation (e.g. "socks5://127.0.0.1:9050,socks5://127.0.0.1:9051")
+    #[arg(long = "proxy-pool", value_name = "PROXIES", conflicts_with = "repair")]
+    pub proxy_pool: Option<String>,
+
+    /// Path to file containing proxy URLs (one per line, # for comments) for multi-egress rotation
+    #[arg(long = "proxies-file", value_name = "FILE", value_parser = existing_file, conflicts_with = "repair")]
+    pub proxies_file: Option<PathBuf>,
+
+    /// Real-Debrid or AllDebrid API key for automatic high-speed CDN unrestricting of filehosts
+    #[arg(long = "debrid-key", value_name = "KEY", env = "ENDO_DEBRID_KEY")]
+    pub debrid_key: Option<String>,
+
+    /// Debrid provider override ("real-debrid" or "alldebrid")
+    #[arg(long = "debrid-provider", value_name = "PROVIDER")]
+    pub debrid_provider: Option<String>,
+
     /// Media quality: best, 1080p, 720p, mp3, m4a, or any other yt-dlp format selector
     /// (e.g. "bestvideo[height<=480]+bestaudio"). Also sends non-file page URLs to yt-dlp.
     #[arg(long = "media-preset", value_name = "PRESET", value_parser = parse_media_preset)]
@@ -130,6 +146,11 @@ pub struct Args {
     /// Wait for a scheduled stream or premiere to start instead of failing
     #[arg(long = "wait-for-video")]
     pub wait_for_video: bool,
+
+    /// Remux an HLS (m3u8) stream saved as MPEG-TS into an MP4 once downloaded, without
+    /// re-encoding (needs ffmpeg; without it the .ts is kept)
+    #[arg(long = "hls-mp4")]
+    pub hls_mp4: bool,
 
     /// Install ffmpeg (the checked build yt-dlp's makers publish, about 200 MB) when media needs
     /// it and none is found. Without this or --no-install-ffmpeg, a terminal asks first

@@ -3945,6 +3945,39 @@ async fn test_a_drm_protected_live_hls_stream_is_an_error_not_a_recording() {
     }
 }
 
+/// A stream whose audio is a playlist of its own goes to yt-dlp, which merges the two, with the
+/// page's referer and the browser's headers.
+#[tokio::test]
+async fn test_an_hls_stream_with_separate_audio_goes_to_yt_dlp_with_the_browsers_request() {
+    isolate_history();
+    let _history = HISTORY.write().await;
+    let (tools, temp) = (tempdir().unwrap(), tempdir().unwrap());
+    let master = "#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"en\",URI=\"audio/en.m3u8\"\n\
+                  #EXT-X-STREAM-INF:BANDWIDTH=8000000,CODECS=\"avc1.640028,mp4a.40.2\",AUDIO=\"aud\"\nvideo.m3u8\n";
+    let url = serve(Arc::new(Mock::new(master.as_bytes().to_vec())), "show/master.m3u8").await;
+    // What yt-dlp's generic site finds there, left to yt-dlp to download.
+    let output = temp.path().join("master.mp4");
+    let info = serde_json::json!({
+        "_type": "video", "extractor_key": "Generic", "id": "master", "title": "master",
+        "requested_downloads": [{ "filename": output }],
+    });
+    std::fs::write(tools.path().join("info.json"), serde_json::to_vec(&info).unwrap()).unwrap();
+    let opts = DownloadOptions {
+        ytdlp_path: Some(fake_ytdlp(tools.path(), &output)),
+        referer: Some("https://page.example/watch".into()),
+        headers: vec![("Origin".into(), "https://page.example".into())],
+        ..options(temp.path(), 4, 64 * KB)
+    };
+
+    assert_eq!(run(&DownloadEngine::new(vec![url.clone()], opts), None).await, Ok(output));
+    let runs = runs_of(tools.path());
+    assert!(runs.first().is_some_and(|found| found.contains(&"-J".to_string()) && found.last() == Some(&url.to_string())), "{runs:?}");
+    for args in &runs {
+        assert!(has_arg(args, "--referer", "https://page.example/watch"), "{args:?}");
+        assert!(has_arg(args, "--add-header", "Origin:https://page.example"), "{args:?}");
+    }
+}
+
 /// A language the site has subtitles of its own in only for regions of it (YouTube's `en-US`)
 /// gets those, not the automatic captions of the bare code, which yt-dlp would pick.
 #[tokio::test]

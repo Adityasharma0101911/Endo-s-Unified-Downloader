@@ -180,6 +180,7 @@ pub(crate) fn authorize(request: RequestBuilder, auth: Option<&Auth>, url: &Url)
 #[derive(Clone)]
 pub struct WorkerShared {
     pub client: Client,
+    pub clients: Arc<Vec<Client>>,
     pub auth: Option<Arc<Auth>>,
     pub writer: DiskWriter,
     pub chunks: Arc<Mutex<ChunkManager>>,
@@ -199,6 +200,24 @@ pub struct WorkerShared {
     /// Max wait between body reads once the answer has started. Shorter than `stall_timeout`:
     /// a retry keeps what arrived and starts at once, so a quiet connection is best replaced.
     pub body_idle: Duration,
+}
+
+impl WorkerShared {
+    pub fn client_for_worker(&self, worker_id: usize) -> &Client {
+        if self.clients.is_empty() {
+            &self.client
+        } else {
+            &self.clients[worker_id % self.clients.len()]
+        }
+    }
+
+    pub fn route_for_worker(&self, worker_id: usize) -> usize {
+        if self.clients.len() > 1 {
+            worker_id % self.clients.len()
+        } else {
+            0
+        }
+    }
 }
 
 /// The body of an answer, as it comes.
@@ -289,17 +308,18 @@ impl HttpWorker {
     /// whose host has one free, else the best one's, once it has. `None` while no mirror can.
     async fn take_slot(&self) -> Option<(usize, HostSlot)> {
         let s = &self.shared;
+        let route_id = s.route_for_worker(self.worker_id);
         let ranked: Vec<(usize, Url)> = {
             let racer = s.mirrors.lock();
             racer.ranked().into_iter().filter_map(|id| Some((id, racer.get_mirror(id)?.url.clone()))).collect()
         };
         for (mirror_id, url) in &ranked {
-            if let Some(slot) = hosts::try_acquire(url, s.host_limit) {
+            if let Some(slot) = hosts::try_acquire_routed(url, s.host_limit, route_id) {
                 return Some((*mirror_id, slot));
             }
         }
         let (mirror_id, url) = ranked.into_iter().next()?;
-        Some((mirror_id, hosts::acquire(&url, s.host_limit).await))
+        Some((mirror_id, hosts::acquire_routed(&url, s.host_limit, route_id).await))
     }
 
     /// A chunk for the mirror `slot` was taken for, if it can still take a connection there:
@@ -309,11 +329,12 @@ impl HttpWorker {
     /// chunks.
     fn next_job(&self, mirror_id: usize, slot: &HostSlot) -> Option<(Chunk, Url, Option<String>, bool)> {
         let s = &self.shared;
+        let route_id = s.route_for_worker(self.worker_id);
         let mut racer = s.mirrors.lock();
         // Meanwhile the mirror may have filled up, cooled down or gone back to its own URL.
         let mirror = racer
             .get_mirror(mirror_id)
-            .filter(|m| m.score(Instant::now()) >= 0.0 && HostKey::of(&m.url) == *slot.host())?;
+            .filter(|m| m.score(Instant::now()) >= 0.0 && HostKey::routed(&m.url, route_id) == *slot.host())?;
         let (url, if_range, redirected) = (mirror.url.clone(), mirror.if_range.clone(), mirror.fallback.is_some());
         let chunk = {
             let mut mgr = s.chunks.lock();
@@ -397,9 +418,13 @@ impl HttpWorker {
             return Ok(()); // stolen away entirely before we started
         }
 
-        let mut request = authorize(s.client.get(url.clone()), s.auth.as_deref(), url)
+        let client = s.client_for_worker(self.worker_id);
+        let mut request = authorize(client.get(url.clone()), s.auth.as_deref(), url)
             .header(RANGE, format!("bytes={}-{}", start, end))
             .header(ACCEPT_ENCODING, "identity");
+        if crate::hosts::HostKey::of(url).is_bitrate_throttled() {
+            request = request.header(reqwest::header::CONNECTION, "close");
+        }
         if let Some(validator) = &if_range {
             request = request.header(IF_RANGE, validator.as_str());
         }
@@ -908,6 +933,7 @@ mod tests {
         let (events, rx) = mpsc::channel(64);
         let shared = WorkerShared {
             client: Client::new(),
+            clients: Arc::new(Vec::new()),
             auth: None,
             writer: DiskWriter::open_or_create(path, size).unwrap(),
             chunks: Arc::new(Mutex::new(chunks)),
