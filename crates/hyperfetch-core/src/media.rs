@@ -3960,7 +3960,7 @@ async fn playing_time(ffmpeg: &Path, files: &[PathBuf]) -> Option<f64> {
         let Ok(described) = cmd.output().await else { continue };
         let described = String::from_utf8_lossy(&described.stderr);
         let clock = described.split_once("Duration: ").and_then(|(_, rest)| rest.split(',').next());
-        let secs = clock.and_then(|clock| clock.trim().split(':').try_fold(0.0, |secs, part| Some(secs * 60.0 + part.parse::<f64>().ok()?)));
+        let secs = clock.and_then(clock_seconds);
         if let Some(secs) = secs.filter(|secs| secs.is_finite() && *secs > 0.0) {
             longest = Some(longest.map_or(secs, |longest| longest.max(secs)));
         }
@@ -4327,24 +4327,210 @@ pub(crate) async fn remux_ffmpeg(
     ffmpeg_for_download(found, managed_bin_dir(), install_ffmpeg, cancel_flag, install).await
 }
 
-/// ffmpeg arguments that remux `ts`, the MPEG-TS of an HLS download, into the MP4 `out`: its
-/// video and audio copied, not re-encoded (timed ID3 and other data streams an MP4 cannot hold
-/// are left out), with the index in front for players that stream it. `out` is a temporary
-/// name, so the container is named.
-fn hls_mp4_args(ts: &Path, out: &Path) -> Vec<OsString> {
+/// What goes into the remux of an HLS download's MPEG-TS besides its packets (see [`remux_hls`]).
+#[derive(Debug, Default)]
+pub(crate) struct RemuxExtras {
+    /// Byte offsets where a discontinuity starts a new part, whose timestamps need not follow on
+    /// from the part before (see `HlsEngine::download`).
+    pub breaks: Vec<u64>,
+    /// WebVTT files, with their languages (BCP 47), muxed as subtitle tracks.
+    pub subtitles: Vec<(PathBuf, String)>,
+}
+
+/// ffmpeg arguments that remux `input`, the MPEG-TS of an HLS download (with `concat`, the list of
+/// its parts, see [`remux_hls`]), into the MP4 `out`: its video and audio copied, not re-encoded
+/// (timed ID3 and other data streams an MP4 cannot hold are left out), each of `subtitles` as a
+/// `mov_text` track with its language, HEVC tagged `hvc1` as Apple's players need, with the index
+/// in front for players that stream it. `out` is a temporary name, so the container is named.
+/// The concat demuxer goes on past a part it cannot open, and puts a part whose streams are laid
+/// out unlike the first part's into the wrong tracks (it matches them by index), exiting 0 all
+/// the same: with `concat` any error fails the remux (`-xerror`).
+fn hls_mp4_args(input: &Path, concat: bool, subtitles: &[(PathBuf, String)], hevc: bool, out: &Path) -> Vec<OsString> {
     let mut args: Vec<OsString> = FFMPEG_QUIET.map(OsString::from).to_vec();
-    args.extend([OsString::from("-i"), file_arg(ts)]);
-    args.extend(["-map", "0:v?", "-map", "0:a?", "-c", "copy", "-movflags", "+faststart", "-f", "mp4"].map(OsString::from));
+    if concat {
+        args.extend(["-xerror", "-f", "concat", "-safe", "0", "-protocol_whitelist", "file,subfile"].map(OsString::from));
+    }
+    args.extend([OsString::from("-i"), file_arg(input)]);
+    for (vtt, _) in subtitles {
+        args.extend([OsString::from("-i"), file_arg(vtt)]);
+    }
+    args.extend(["-map", "0:v?", "-map", "0:a?"].map(OsString::from));
+    for n in 1..=subtitles.len() {
+        args.extend(["-map".into(), format!("{n}:s").into()]);
+    }
+    args.extend(["-c", "copy"].map(OsString::from));
+    if !subtitles.is_empty() {
+        args.extend(["-c:s", "mov_text"].map(OsString::from));
+    }
+    for (n, (_, language)) in subtitles.iter().enumerate() {
+        args.extend([format!("-metadata:s:s:{n}").into(), format!("language={}", mp4_language(language)).into()]);
+    }
+    if hevc {
+        args.extend(["-tag:v", "hvc1"].map(OsString::from));
+    }
+    args.extend(["-movflags", "+faststart", "-f", "mp4"].map(OsString::from));
     args.push(file_arg(out));
     args
 }
 
-/// Remuxes `ts` into `out` with `ffmpeg` (see [`hls_mp4_args`]). Cancelling kills ffmpeg, which
-/// lets go of `out` before this returns.
-pub(crate) async fn remux_hls(ffmpeg: &Path, ts: &Path, out: &Path, cancel_flag: Option<Arc<AtomicBool>>) -> Result<(), String> {
+/// Remuxes `ts` into `out` with `ffmpeg` and `extras` (see [`hls_mp4_args`]): in one piece, or,
+/// with breaks, as the parts between them (see [`remux_parts`]), so that each part's timestamps
+/// run on from the part before, where a plain remux would leave a jump; when that fails, in one
+/// piece after all. Cancelling kills ffmpeg, which lets go of `out` before this returns.
+pub(crate) async fn remux_hls(
+    ffmpeg: &Path,
+    ts: &Path,
+    out: &Path,
+    extras: &RemuxExtras,
+    hevc: bool,
+    cancel_flag: Option<Arc<AtomicBool>>,
+) -> Result<(), String> {
+    if !extras.breaks.is_empty() {
+        match remux_parts(ffmpeg, ts, out, extras, hevc, cancel_flag.clone()).await {
+            Err(e) if !cancel_flag.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) => {
+                tracing::warn!("Joining the parts of {} failed ({}); remuxing it in one piece", ts.display(), e);
+            }
+            joined => return joined,
+        }
+    }
     let mut cmd = tree_command(ffmpeg);
-    cmd.args(hls_mp4_args(ts, out));
+    cmd.args(hls_mp4_args(ts, false, &extras.subtitles, hevc, out));
     run_to_end(cmd, cancel_flag).await.map(drop)
+}
+
+/// Remuxes the parts of `ts` between `extras.breaks` into `out`, joined by the concat demuxer, each
+/// read in place through the `subfile` protocol. The subtitles, timed on the stream's own clock
+/// (see `hls::save_subtitles`), are moved first to where their parts play once joined (see
+/// [`joined_time`]). The list and the moved subtitles are temporary files next to `out`.
+async fn remux_parts(
+    ffmpeg: &Path,
+    ts: &Path,
+    out: &Path,
+    extras: &RemuxExtras,
+    hevc: bool,
+    cancel_flag: Option<Arc<AtomicBool>>,
+) -> Result<(), String> {
+    let len = tokio::fs::metadata(ts).await.map_err(|e| format!("Failed to read {}: {}", ts.display(), e))?.len();
+    let bounds = part_bounds(len, &extras.breaks);
+    let next_to_out = |suffix: String| {
+        let mut path = out.as_os_str().to_owned();
+        path.push(suffix);
+        PathBuf::from(path)
+    };
+    let list = next_to_out(".concat.txt".into());
+    let mut made = vec![list.clone()];
+    let result = async {
+        tokio::fs::write(&list, concat_list(ts, &bounds)).await.map_err(|e| format!("Failed to write {}: {}", list.display(), e))?;
+        let mut subtitles = Vec::new();
+        if !extras.subtitles.is_empty() {
+            let parts = part_times(ffmpeg, ts, &bounds).await.ok_or("ffmpeg did not tell where the parts start")?;
+            for (n, (vtt, language)) in extras.subtitles.iter().enumerate() {
+                let text = tokio::fs::read_to_string(vtt).await.map_err(|e| format!("Failed to read {}: {}", vtt.display(), e))?;
+                let moved = next_to_out(format!(".{n}.vtt"));
+                made.push(moved.clone());
+                let text = crate::hls::retime_vtt(&text, |at| joined_time(&parts, at));
+                tokio::fs::write(&moved, text).await.map_err(|e| format!("Failed to write {}: {}", moved.display(), e))?;
+                subtitles.push((moved, language.clone()));
+            }
+        }
+        let mut cmd = tree_command(ffmpeg);
+        cmd.args(hls_mp4_args(&list, true, &subtitles, hevc, out));
+        run_to_end(cmd, cancel_flag).await.map(drop)
+    }
+    .await;
+    for file in made {
+        let _ = tokio::fs::remove_file(file).await;
+    }
+    result
+}
+
+/// Where the parts of a file of `len` bytes start and end, by `breaks` (byte offsets, ascending):
+/// 0, each break inside it once (two at one offset come from an empty segment), then `len`.
+fn part_bounds(len: u64, breaks: &[u64]) -> Vec<u64> {
+    let inner = breaks.iter().copied().filter(|&at| at > 0 && at < len);
+    let mut bounds: Vec<u64> = std::iter::once(0).chain(inner).chain([len]).collect();
+    bounds.dedup();
+    bounds
+}
+
+/// A part of `ts`, from byte `start` up to byte `end`, as the `subfile` protocol reads it.
+fn subfile(ts: &Path, start: u64, end: u64) -> String {
+    let path = std::path::absolute(ts).unwrap_or_else(|_| ts.to_path_buf());
+    format!("subfile,,start,{},end,{},,:{}", start, end, path.to_string_lossy())
+}
+
+/// The concat demuxer's list of the parts of `ts` between `bounds` (see [`part_bounds`]).
+fn concat_list(ts: &Path, bounds: &[u64]) -> String {
+    // Quoted: a quote in the path closes the quotes, is escaped, and opens them again.
+    bounds.windows(2).map(|part| format!("file '{}'\n", subfile(ts, part[0], part[1]).replace('\'', r"'\''"))).collect()
+}
+
+/// Where each part of `ts` between `bounds` starts on the stream's clock and how long it plays,
+/// in seconds, as ffmpeg reads it ("Duration: 00:00:02.02, start: 1.576778"): the concat demuxer
+/// starts the next part where that duration ends. None when ffmpeg does not tell both of a part.
+async fn part_times(ffmpeg: &Path, ts: &Path, bounds: &[u64]) -> Option<Vec<(f64, f64)>> {
+    let mut parts = Vec::new();
+    for part in bounds.windows(2) {
+        let mut cmd = tree_command(ffmpeg);
+        cmd.args(["-hide_banner", "-nostdin", "-i", subfile(ts, part[0], part[1]).as_str()]);
+        // Given no output, ffmpeg describes its input, then fails.
+        let described = cmd.output().await.ok()?;
+        let described = String::from_utf8_lossy(&described.stderr);
+        let (clock, rest) = described.split_once("Duration: ")?.1.split_once(',')?;
+        let start = rest.trim_start().strip_prefix("start: ")?.split(',').next()?.trim().parse().ok()?;
+        parts.push((start, clock_seconds(clock)?));
+    }
+    Some(parts)
+}
+
+/// Seconds of a clock time as ffmpeg prints one ("00:11:22.33").
+fn clock_seconds(clock: &str) -> Option<f64> {
+    clock.trim().split(':').try_fold(0.0, |secs, part| Some(secs * 60.0 + part.parse::<f64>().ok()?))
+}
+
+/// Where a moment `at` seconds after the start of the first of `parts` (each part's start on the
+/// stream's clock and how long it plays, see [`part_times`]) plays once the parts are joined one
+/// after another: in the first part that holds it, else at the end of the part that starts
+/// closest before it (it fell into something left out, an ad), else where it is.
+fn joined_time(parts: &[(f64, f64)], at: f64) -> f64 {
+    let Some(&(first, _)) = parts.first() else { return at };
+    let clock = first + at;
+    let (mut joined_start, mut before): (f64, Option<(f64, f64)>) = (0.0, None);
+    for &(start, duration) in parts {
+        if start <= clock {
+            if clock <= start + duration {
+                return joined_start + clock - start;
+            }
+            if before.is_none_or(|(closest, _)| start > closest) {
+                before = Some((start, joined_start + duration));
+            }
+        }
+        joined_start += duration;
+    }
+    before.map_or(at, |(_, end)| end)
+}
+
+/// ISO 639-1 codes and the ISO 639-2 ones an MP4 track's language is written in.
+// ponytail: common languages only; another two-letter code is written "und", add it here.
+const LANGUAGES: [(&str, &str); 53] = [
+    ("ar", "ara"), ("bg", "bul"), ("bn", "ben"), ("ca", "cat"), ("cs", "ces"), ("cy", "cym"), ("da", "dan"),
+    ("de", "deu"), ("el", "ell"), ("en", "eng"), ("es", "spa"), ("et", "est"), ("eu", "eus"), ("fa", "fas"),
+    ("fi", "fin"), ("fr", "fra"), ("ga", "gle"), ("gl", "glg"), ("gu", "guj"), ("he", "heb"), ("hi", "hin"),
+    ("hr", "hrv"), ("hu", "hun"), ("id", "ind"), ("is", "isl"), ("it", "ita"), ("ja", "jpn"), ("kn", "kan"),
+    ("ko", "kor"), ("lt", "lit"), ("lv", "lav"), ("ml", "mal"), ("mr", "mar"), ("ms", "msa"), ("nb", "nob"),
+    ("nl", "nld"), ("no", "nor"), ("pa", "pan"), ("pl", "pol"), ("pt", "por"), ("ro", "ron"), ("ru", "rus"),
+    ("sk", "slk"), ("sl", "slv"), ("sr", "srp"), ("sv", "swe"), ("ta", "tam"), ("te", "tel"), ("th", "tha"),
+    ("tr", "tur"), ("uk", "ukr"), ("vi", "vie"), ("zh", "zho"),
+];
+
+/// The ISO 639-2 code an MP4 track's language is written in for `tag`, a BCP 47 tag as HLS gives
+/// it ("en", "pt-BR", "spa"): ffmpeg writes no language for a two-letter code.
+fn mp4_language(tag: &str) -> String {
+    let primary = tag.split(['-', '_']).next().unwrap_or_default().to_ascii_lowercase();
+    match primary.len() {
+        3 if primary.bytes().all(|b| b.is_ascii_lowercase()) => primary,
+        _ => LANGUAGES.iter().find(|(two, _)| *two == primary).map_or("und", |(_, three)| three).to_string(),
+    }
 }
 
 /// What one of yt-dlp's own sites finds at `url` (see [`RunKind::Find`]), for a download with
@@ -4840,13 +5026,52 @@ mod tests {
     /// arguments, as `file:` paths, never reading a name as an option or protocol.
     #[test]
     fn hls_mp4_args_copy_video_and_audio_into_an_mp4() {
-        let args = hls_mp4_args(Path::new("dl/Talk.ts"), Path::new("dl/Talk.mp4.part"));
-        let args: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        let strings = |args: Vec<OsString>| args.iter().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<String>>();
+        let args = strings(hls_mp4_args(Path::new("dl/Talk.ts"), false, &[], false, Path::new("dl/Talk.mp4.part")));
         let expected = [
             "-y", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", "file:dl/Talk.ts", "-map", "0:v?", "-map", "0:a?",
             "-c", "copy", "-movflags", "+faststart", "-f", "mp4", "file:dl/Talk.mp4.part",
         ];
         assert_eq!(args, expected);
+
+        // Its parts, an HEVC video tagged for Apple's players, and subtitles with their languages.
+        let subtitles = [(PathBuf::from("dl/Talk.en.vtt"), "en-US".to_string()), (PathBuf::from("dl/Talk.x.vtt"), "x-klingon".to_string())];
+        let args = strings(hls_mp4_args(Path::new("dl/Talk.mp4.part.concat.txt"), true, &subtitles, true, Path::new("dl/Talk.mp4.part")));
+        let expected = [
+            "-y", "-nostdin", "-hide_banner", "-loglevel", "error", "-xerror", "-f", "concat", "-safe", "0", "-protocol_whitelist", "file,subfile",
+            "-i", "file:dl/Talk.mp4.part.concat.txt", "-i", "file:dl/Talk.en.vtt", "-i", "file:dl/Talk.x.vtt",
+            "-map", "0:v?", "-map", "0:a?", "-map", "1:s", "-map", "2:s", "-c", "copy", "-c:s", "mov_text",
+            "-metadata:s:s:0", "language=eng", "-metadata:s:s:1", "language=und", "-tag:v", "hvc1",
+            "-movflags", "+faststart", "-f", "mp4", "file:dl/Talk.mp4.part",
+        ];
+        assert_eq!(args, expected);
+        assert_eq!((mp4_language("spa"), mp4_language("zh-Hant"), mp4_language("")), ("spa".into(), "zho".into(), "und".into()));
+    }
+
+    /// The parts of a stream with discontinuities are read in place, between its breaks; a break
+    /// twice at one offset (an empty segment) or at either end makes no empty part.
+    #[test]
+    fn a_concat_list_reads_the_parts_between_the_breaks() {
+        let ts = std::env::temp_dir().join("it's.ts");
+        let path = std::path::absolute(&ts).unwrap().to_string_lossy().replace('\'', r"'\''");
+        let list = concat_list(&ts, &part_bounds(300, &[0, 100, 100, 250, 300]));
+        let expected = format!(
+            "file 'subfile,,start,0,end,100,,:{path}'\nfile 'subfile,,start,100,end,250,,:{path}'\nfile 'subfile,,start,250,end,300,,:{path}'\n"
+        );
+        assert_eq!(list, expected);
+        assert!(list.contains(r"it'\''s.ts"), "{list}");
+    }
+
+    /// A moment on the stream's clock plays, once its parts are joined, as far into its part as
+    /// it was; one in something left out between two parts, at the end of the part before it.
+    #[test]
+    fn joined_parts_move_their_moments_with_them() {
+        // 2 s from 10 s, then (an ad of 30 s left out) 3 s from 42 s, then 1 s from 0 (a new clock).
+        let parts = [(10.0, 2.0), (42.0, 3.0), (0.0, 1.0)];
+        let joined = |at: f64| (joined_time(&parts, at) * 1000.0).round() / 1000.0;
+        assert_eq!([joined(0.5), joined(32.5), joined(20.0), joined(-9.5), joined(-11.0)], [0.5, 2.5, 2.0, 5.5, -11.0]);
+        assert_eq!(joined_time(&[], 4.0), 4.0);
+        assert_eq!(clock_seconds("01:02:03.25"), Some(3723.25));
     }
 
     #[test]

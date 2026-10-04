@@ -26,10 +26,15 @@ const APP: &str = "endos-unified-downloader";
 const EXTENSION_ORIGINS: [&str; 3] = ["chrome-extension://", "moz-extension://", "safari-web-extension://"];
 /// Largest request line and headers.
 const MAX_HEAD: usize = 64 * 1024;
-/// Largest body of `POST /add`, of a recording chunk, and of any other request.
-const MAX_ADD_BODY: usize = 1 << 20;
+/// Largest body of `POST /add` (room for a [`MAX_PLAYLIST`] playlist escaped in JSON and a full
+/// cookie jar), of a recording chunk, and of any other request.
+const MAX_ADD_BODY: usize = 4 << 20;
 const MAX_CHUNK_BODY: usize = 64 << 20;
 const MAX_BODY: usize = 64 * 1024;
+/// Largest playlist a page built itself that `/add` takes.
+const MAX_PLAYLIST: usize = 1 << 20;
+/// Most cookies of a `cookie_jar` written for a download.
+const MAX_JAR_COOKIES: usize = 500;
 /// How long a connection may take to send its request, so a stalled client never holds a task.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// Request headers of the browser's that a download does not send: the engine sets them per
@@ -59,7 +64,7 @@ const DROPPED_HEADERS: &[&str] = &[
 ];
 
 /// A download sent to `POST /add`: the link, with what the browser sent to fetch it.
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct RemoteAddPayload {
     pub url: String,
     /// The Cookie header the browser sent to `url`.
@@ -76,6 +81,35 @@ pub struct RemoteAddPayload {
     /// Remux the HLS stream into an MP4 (see `DownloadOptions::hls_to_mp4`), over the Settings
     /// value, for this download alone.
     pub mp4: Option<bool>,
+    /// The browser's cookies for every host the download fetches from, saved in place of
+    /// `cookies` when one is usable (see [`jar_file_text`]).
+    #[serde(default)]
+    pub cookie_jar: Vec<JarCookie>,
+    /// The link is a DASH manifest (see `DownloadOptions::dash`).
+    #[serde(default)]
+    pub dash: bool,
+    /// The tallest video wanted, in pixels (see `DownloadOptions::height`).
+    pub height: Option<u32>,
+    /// An HLS playlist the page built itself, `url` being only the base of its links (see
+    /// `DownloadOptions::playlist_text`); [`parse_add`] takes one of at most [`MAX_PLAYLIST`]
+    /// bytes that starts with `#EXTM3U`.
+    pub playlist: Option<String>,
+}
+
+/// A cookie of the browser's, as the extension reads it (chrome.cookies).
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct JarCookie {
+    pub domain: String,
+    pub path: String,
+    pub name: String,
+    pub value: String,
+    pub secure: bool,
+    pub http_only: bool,
+    /// Sent to `domain` alone, not to its subdomains.
+    pub host_only: bool,
+    /// When it expires, in Unix seconds; 0 for a session cookie.
+    pub expires: u64,
 }
 
 impl RemoteAddPayload {
@@ -114,6 +148,43 @@ impl RemoteAddPayload {
     pub fn file_name(&self) -> Option<String> {
         self.filename.as_deref().map(engine::sanitize_filename).filter(|name| !name.is_empty())
     }
+
+    /// The playlist the page built, without a byte order mark or blank space around it.
+    pub fn playlist_text(&self) -> Option<&str> {
+        self.playlist.as_deref().map(|text| text.trim_start_matches('\u{feff}').trim())
+    }
+
+    /// The Netscape cookies file to download `url` with: the browser's `cookie_jar` (see
+    /// [`jar_file_text`]), else the Cookie header it sent to `url` (see [`cookies_file_text`]).
+    /// None when neither holds a usable cookie.
+    pub fn cookies_file(&self, url: &Url) -> Option<String> {
+        jar_file_text(&self.cookie_jar).or_else(|| cookies_file_text(url, self.cookies.as_deref()?))
+    }
+}
+
+/// A Netscape cookies file holding the cookies of `jar` (the first [`MAX_JAR_COOKIES`] usable
+/// ones): each for its domain and its subdomains, or for its host alone when it is host-only,
+/// HttpOnly ones marked so. One without a domain or name, or with a field a tab or line break
+/// would end, is left out; a path that is no path is written as `/`. None when none is left.
+pub fn jar_file_text(jar: &[JarCookie]) -> Option<String> {
+    let flag = |on: bool| if on { "TRUE" } else { "FALSE" };
+    let lines: Vec<String> = jar
+        .iter()
+        .filter_map(|cookie| {
+            let host = cookie.domain.trim_start_matches('.');
+            let path = if cookie.path.starts_with('/') { cookie.path.as_str() } else { "/" };
+            let fields = [host, path, cookie.name.as_str(), cookie.value.as_str()];
+            if host.is_empty() || cookie.name.is_empty() || fields.iter().any(|field| field.contains(char::is_control)) {
+                return None;
+            }
+            let (domain, subdomains) = if cookie.host_only { (host.to_string(), false) } else { (format!(".{}", host), true) };
+            let http_only = if cookie.http_only { "#HttpOnly_" } else { "" };
+            let (subdomains, secure, expires) = (flag(subdomains), flag(cookie.secure), cookie.expires);
+            Some(format!("{http_only}{domain}\t{subdomains}\t{path}\t{secure}\t{expires}\t{}\t{}", cookie.name, cookie.value))
+        })
+        .take(MAX_JAR_COOKIES)
+        .collect();
+    (!lines.is_empty()).then(|| format!("# Netscape HTTP Cookie File\n{}\n", lines.join("\n")))
 }
 
 /// A Netscape cookies file holding the cookies of `cookie_header` (what the browser sent to
@@ -135,11 +206,10 @@ pub fn cookies_file_text(url: &Url, cookie_header: &str) -> Option<String> {
     (!lines.is_empty()).then(|| format!("# Netscape HTTP Cookie File\n{}\n", lines.join("\n")))
 }
 
-/// Saves the cookies the browser sent to `url` as `<home>/.hyperfetch/cookies/<host>.txt`, in
-/// place of the last ones of that host, for its download to read. None when there is no usable
-/// cookie or the file could not be written (logged).
-pub fn save_cookies(url: &Url, cookie_header: &str) -> Option<PathBuf> {
-    let text = cookies_file_text(url, cookie_header)?;
+/// Saves the cookies file `text` (see [`RemoteAddPayload::cookies_file`]) of the download of
+/// `url` as `<home>/.hyperfetch/cookies/<host>.txt`, in place of the last one of that host, for
+/// the download to read. None when it could not be written (logged).
+pub fn save_cookies(url: &Url, text: &str) -> Option<PathBuf> {
     let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).ok()?;
     let dir = PathBuf::from(home).join(".hyperfetch").join("cookies");
     let path = dir.join(format!("{}.txt", engine::sanitize_filename(url.host_str()?)));
@@ -161,7 +231,12 @@ pub fn spawn(events: mpsc::Sender<AppEvent>, ctx: egui::Context, rt: &tokio::run
                 Ok(listener) => {
                     tracing::info!("Local IPC listener bound on 127.0.0.1:{}", port);
                     let recordings = Recordings::new(std::env::temp_dir().join("endos-recordings"));
-                    return listen(listener, Arc::new(Server { port, events, ctx, recordings })).await;
+                    let server = Arc::new(Server { port, events, ctx, recordings });
+                    // What an earlier run left recording is joined before this one records.
+                    for finished in server.recordings.recover().await {
+                        server.send(AppEvent::Recorded(finished));
+                    }
+                    return listen(listener, server).await;
                 }
                 Err(e) => tracing::debug!("Could not bind IPC port {}: {}", port, e),
             }
@@ -231,10 +306,11 @@ impl Server {
                 Err(e) => Response::error("400 Bad Request", allow_origin.clone(), &e),
             },
             ("POST", "/record/start") => {
-                #[derive(serde::Deserialize)]
+                #[derive(Default, serde::Deserialize)]
+                #[serde(default)]
                 struct Start {
-                    #[serde(default)]
                     title: String,
+                    page_url: String,
                 }
                 match serde_json::from_slice::<Start>(&body) {
                     Ok(start) => {
@@ -242,7 +318,7 @@ impl Server {
                         for finished in self.recordings.close_stale().await {
                             self.send(AppEvent::Recorded(finished));
                         }
-                        match self.recordings.start(&start.title).await {
+                        match self.recordings.start(&start.title, &start.page_url).await {
                             Ok(id) => reply("200 OK", json!({"id": id})),
                             Err(refusal) => refused(refusal),
                         }
@@ -254,10 +330,13 @@ impl Server {
                 Some((id, "chunk")) => {
                     let param = |key: &str| url::form_urlencoded::parse(query.as_bytes()).find(|(k, _)| k == key).map(|(_, v)| v.into_owned());
                     let track = param("track").and_then(|t| t.parse::<u8>().ok()).filter(|&t| t <= recording::MAX_TRACK);
-                    let (Some(track), Some(_)) = (track, content_length) else {
-                        return Response::error("400 Bad Request", allow_origin.clone(), "a chunk needs a track of 0 to 15 and a Content-Length");
+                    // Part 0 unless it says another, of 0 to 255.
+                    let part = param("part").map_or(Some(0), |p| p.parse::<u8>().ok());
+                    let (Some(track), Some(part), Some(_)) = (track, part, content_length) else {
+                        let why = "a chunk needs a track of 0 to 15, a part of 0 to 255 and a Content-Length";
+                        return Response::error("400 Bad Request", allow_origin.clone(), why);
                     };
-                    match self.recordings.append(id, track, &param("mime").unwrap_or_default(), &body).await {
+                    match self.recordings.append(id, track, part, &param("mime").unwrap_or_default(), &body).await {
                         Ok(bytes) => reply("200 OK", json!({"ok": true, "bytes": bytes})),
                         Err(refusal) => refused(refusal),
                     }
@@ -288,9 +367,13 @@ fn record_route(path: &str) -> Option<(&str, &str)> {
     path.strip_prefix("/record/")?.split_once('/').filter(|(id, _)| recording::valid_id(id))
 }
 
-/// The download `body` asks for: JSON with an http(s) `url`; else why it is refused.
+/// The download `body` asks for: JSON with an http(s) `url`, and a `playlist`, if any, that is
+/// one; else why it is refused.
 fn parse_add(body: &[u8]) -> Result<RemoteAddPayload, String> {
     let payload: RemoteAddPayload = serde_json::from_slice(body).map_err(|e| format!("invalid JSON: {}", e))?;
+    if payload.playlist_text().is_some_and(|text| text.len() > MAX_PLAYLIST || !text.starts_with("#EXTM3U")) {
+        return Err("playlist must be an HLS playlist (#EXTM3U) of at most 1 MiB".to_string());
+    }
     match Url::parse(payload.url.trim()) {
         Ok(url) if matches!(url.scheme(), "http" | "https") => Ok(payload),
         _ => Err("url must be an http or https link".to_string()),
@@ -579,17 +662,7 @@ mod tests {
 
     #[test]
     fn file_names_are_made_safe_for_the_save_folder() {
-        let name = |filename: &str| RemoteAddPayload {
-            url: String::new(),
-            cookies: None,
-            user_agent: None,
-            referer: None,
-            headers: None,
-            filename: Some(filename.to_string()),
-            hls: false,
-            mp4: None,
-        }
-        .file_name();
+        let name = |filename: &str| RemoteAddPayload { filename: Some(filename.to_string()), ..Default::default() }.file_name();
         assert_eq!(name("My Video.mp4").as_deref(), Some("My Video.mp4"));
         assert_eq!(name("../../etc/passwd").as_deref(), Some("_.._etc_passwd"));
         assert_eq!(name("a\\b:c*?.mp4").as_deref(), Some("a_b_c__.mp4"));
@@ -613,6 +686,55 @@ mod tests {
         assert_eq!(cookies_file_text(&http, "junk; ;"), None);
     }
 
+    /// The browser's cookie jar is written whole, each cookie for its domain and subdomains or
+    /// its host alone, in place of the Cookie header, which is kept for when it has none usable.
+    #[test]
+    fn a_cookie_jar_is_saved_in_place_of_the_cookie_header() {
+        let payload: RemoteAddPayload = serde_json::from_value(json!({
+            "url": "https://cdn.example/v/a.m3u8",
+            "cookies": "h=1",
+            "cookie_jar": [
+                {"domain": ".example.com", "path": "/", "name": "sid", "value": "a b", "secure": true, "http_only": true, "host_only": false, "expires": 0},
+                {"domain": "cdn.example", "path": "/v", "name": "tok", "value": "x=y", "secure": false, "http_only": false, "host_only": true, "expires": 4102444800u64},
+                {"domain": "keys.example", "path": "", "name": "k", "value": "1"},
+                {"domain": "", "name": "nodomain", "value": "1"},
+                {"domain": "a.example", "name": "", "value": "1"},
+                {"domain": "a.example", "name": "tab", "value": "a\tb"},
+                {"domain": "a.example\nevil", "name": "line", "value": "1"},
+                {"domain": "a.example", "path": "/x\r", "name": "cr", "value": "1"},
+            ],
+        }))
+        .unwrap();
+        let url = Url::parse(&payload.url).unwrap();
+        assert_eq!(
+            payload.cookies_file(&url).as_deref(),
+            Some(
+                "# Netscape HTTP Cookie File\n\
+                 #HttpOnly_.example.com\tTRUE\t/\tTRUE\t0\tsid\ta b\n\
+                 cdn.example\tFALSE\t/v\tFALSE\t4102444800\ttok\tx=y\n\
+                 .keys.example\tTRUE\t/\tFALSE\t0\tk\t1\n"
+            )
+        );
+        let unusable = RemoteAddPayload { cookie_jar: payload.cookie_jar[3..].to_vec(), ..payload.clone() };
+        assert_eq!(unusable.cookies_file(&url), cookies_file_text(&url, "h=1"), "the Cookie header when the jar has nothing usable");
+        let many: Vec<JarCookie> =
+            (0..MAX_JAR_COOKIES + 5).map(|n| JarCookie { domain: "a.example".into(), name: format!("c{n}"), ..Default::default() }).collect();
+        assert_eq!(jar_file_text(&many).unwrap().lines().count(), 1 + MAX_JAR_COOKIES);
+        assert_eq!(RemoteAddPayload::default().cookies_file(&url), None);
+    }
+
+    #[test]
+    fn a_playlist_the_page_built_must_be_one() {
+        let add = |playlist: serde_json::Value| parse_add(json!({"url": "https://page.example/watch", "playlist": playlist}).to_string().as_bytes());
+        let payload = add(json!("\u{feff} #EXTM3U\n#EXTINF:4,\nseg0.ts\n ")).unwrap();
+        assert_eq!(payload.playlist_text(), Some("#EXTM3U\n#EXTINF:4,\nseg0.ts"));
+        for refused in [json!("<html>"), json!(""), json!(format!("#EXTM3U\n{}", "#".repeat(MAX_PLAYLIST)))] {
+            assert_eq!(add(refused).unwrap_err(), "playlist must be an HLS playlist (#EXTM3U) of at most 1 MiB");
+        }
+        let payload = parse_add(br#"{"url":"https://cdn.example/a.mpd","dash":true,"height":720}"#).unwrap();
+        assert!(payload.dash && payload.height == Some(720) && payload.playlist.is_none() && payload.cookie_jar.is_empty());
+    }
+
     /// A recording is started, fed and finished by the extension alone, with its id and track
     /// checked on every route.
     #[tokio::test]
@@ -624,6 +746,8 @@ mod tests {
         let (status, reply) = parts(&response);
         assert_eq!(status, "HTTP/1.1 200 OK");
         let id = reply["id"].as_str().unwrap().to_string();
+        let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(root.path().join(&id).join("meta.json")).unwrap()).unwrap();
+        assert_eq!((meta["title"].as_str(), meta["page_url"].as_str()), (Some("Talk"), Some("https://page.example/")));
         assert!(response.contains("Access-Control-Allow-Origin: chrome-extension://abc\r\n"), "{response}");
 
         let chunk = |id: &str, query: &str, origin: Option<&'static str>, body: Option<Vec<u8>>| {
@@ -633,8 +757,13 @@ mod tests {
         };
         let response = chunk(&id, "?track=0&mime=video%2Fwebm%3B%20codecs%3Dvp9", ext, Some(vec![1; 40 * 1024])).await;
         assert_eq!(parts(&response), ("HTTP/1.1 200 OK", json!({"ok": true, "bytes": 40 * 1024})));
-        let response = chunk(&id, "?track=0&mime=video%2Fmp4", ext, Some(vec![2; 40 * 1024])).await;
+        let response = chunk(&id, "?track=0&part=0&mime=video%2Fmp4", ext, Some(vec![2; 40 * 1024])).await;
         assert_eq!(parts(&response).1, json!({"ok": true, "bytes": 80 * 1024}));
+        let response = chunk(&id, "?track=0&part=255&mime=video%2Fmp4", ext, Some(vec![3; 10])).await;
+        assert_eq!(parts(&response).1, json!({"ok": true, "bytes": 80 * 1024 + 10}), "the track's parts together");
+        for bad in ["?track=0&part=256", "?track=0&part=x", "?track=0&part=-1", "?track=0&part="] {
+            assert_eq!(parts(&chunk(&id, bad, ext, Some(vec![0])).await).0, "HTTP/1.1 400 Bad Request", "{bad}");
+        }
         assert_eq!(parts(&chunk(&id, "?track=16&mime=video%2Fwebm", ext, Some(vec![0])).await).0, "HTTP/1.1 400 Bad Request");
         assert_eq!(parts(&chunk(&id, "?mime=video%2Fwebm", ext, Some(vec![0])).await).0, "HTTP/1.1 400 Bad Request");
         assert_eq!(parts(&chunk(&id, "?track=0&mime=video%2Fwebm", ext, None).await).0, "HTTP/1.1 400 Bad Request", "no Content-Length");
@@ -646,9 +775,10 @@ mod tests {
         let response = exchange(&server, &request("POST", &format!("/record/{}/finish", id), ext, Some(b""))).await;
         assert_eq!(parts(&response), ("HTTP/1.1 200 OK", json!({"status": "merging"})));
         let Ok(AppEvent::Recorded(finished)) = received.try_recv() else { panic!("the recording reaches the app") };
-        assert_eq!((finished.title.as_str(), finished.tracks.len()), ("Talk", 1));
-        assert_eq!(std::fs::read(&finished.tracks[0]).unwrap().len(), 80 * 1024);
-        assert_eq!(finished.tracks[0].extension().unwrap(), "webm");
+        let dir = root.path().join(&id);
+        assert_eq!(finished.title, "Talk");
+        assert_eq!(finished.tracks, [(0, vec![dir.join("track0.part0.webm"), dir.join("track0.part255.mp4")])]);
+        assert_eq!(std::fs::read(&finished.tracks[0].1[0]).unwrap().len(), 80 * 1024);
         let response = exchange(&server, &request("POST", &format!("/record/{}/abort", id), ext, None)).await;
         assert_eq!(parts(&response).0, "HTTP/1.1 404 Not Found", "finished already");
 

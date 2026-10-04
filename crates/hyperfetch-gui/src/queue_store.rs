@@ -3,7 +3,7 @@ use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use hyperfetch_core::queue::DownloadQueue;
+use hyperfetch_core::queue::{DownloadQueue, QueueItemStatus};
 
 use crate::settings::{app_file, write_atomic};
 
@@ -42,8 +42,20 @@ pub fn load(path: &Path) -> (DownloadQueue, Option<String>) {
     }
 }
 
-/// Writes `queue` as it will look after a restart (see `DownloadQueue::settle_for_restart`).
+/// Writes `queue` as it will look after a restart (see `DownloadQueue::settle_for_restart`). A
+/// download of a playlist a page built is never saved with it (see
+/// `DownloadOptions::playlist_text`), so one not done is saved as failed: its link alone is a
+/// page, which it must not download in place of the video.
 pub fn save(path: &Path, mut queue: DownloadQueue) -> std::io::Result<()> {
+    let unsaved: Vec<usize> = queue
+        .items()
+        .iter()
+        .filter(|item| item.options.playlist_text.is_some() && item.status != QueueItemStatus::Completed)
+        .map(|item| item.id)
+        .collect();
+    for id in unsaved {
+        queue.finish(id, Err("The playlist the page built is not kept once the app closes: send it from the browser again".to_string()));
+    }
     queue.settle_for_restart();
     let json = serde_json::to_vec_pretty(&queue).map_err(std::io::Error::other)?;
     write_atomic(path, &json)
@@ -125,6 +137,29 @@ mod tests {
         assert_eq!(restored.get_item(done).unwrap().total_bytes, 7);
         assert_eq!(restored.next_to_start(8, |_| false), Some(queued));
         assert_eq!(std::fs::read_dir(path.parent().unwrap()).unwrap().count(), 1, "no temp file is left behind");
+    }
+
+    /// A download of a playlist a page built comes back failed unless it finished: its link alone
+    /// is the page.
+    #[test]
+    fn a_playlist_the_page_built_is_not_resumed_without_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gui-queue.json");
+        let mut queue = DownloadQueue::new();
+        let built = DownloadOptions { playlist_text: Some("#EXTM3U\n#EXT-X-ENDLIST".into()), ..Default::default() };
+        let page = Url::parse("https://page.example/watch").unwrap();
+        let (running, done) = (queue.add_item(vec![page.clone()], built.clone()), queue.add_item(vec![page], built));
+        let plain = add(&mut queue, "https://e.com/a.iso", None);
+        queue.mark_started(running);
+        queue.mark_started(done);
+        queue.finish(done, Ok((PathBuf::from("/dl/v.ts"), Some(7))));
+        save(&path, queue.clone()).unwrap();
+        assert_eq!(queue.get_item(running).unwrap().status, QueueItemStatus::Downloading, "the live queue is untouched");
+
+        let (restored, _) = load(&path);
+        let status = |id| restored.get_item(id).unwrap().status.clone();
+        assert!(matches!(status(running), QueueItemStatus::Failed(e) if e.contains("send it from the browser again")));
+        assert_eq!((status(done), status(plain)), (QueueItemStatus::Completed, QueueItemStatus::Queued));
     }
 
     #[test]

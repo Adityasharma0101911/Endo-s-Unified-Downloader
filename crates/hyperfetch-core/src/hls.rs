@@ -63,6 +63,16 @@ const SNAPSHOT_INTERVAL: Duration = Duration::from_millis(200);
 const RETRY_BASE_DELAY: Duration = if cfg!(test) { Duration::from_millis(20) } else { Duration::from_millis(500) };
 /// Longest pause between two attempts; the pauses of the default 8 retries add up to about 40 s.
 const RETRY_MAX_DELAY: Duration = Duration::from_secs(8);
+/// Most times one download fetches its playlist again for segment links that expired (see
+/// [`Refresh`]).
+const MAX_REFRESHES: u32 = 3;
+/// Most subtitle renditions of a master playlist that are downloaded.
+const MAX_SUBTITLES: usize = 32;
+/// Subtitle segments fetched at once.
+const SUBTITLE_CONCURRENCY: usize = 8;
+/// MPEG-TS stream types of video: MPEG-1/2, MPEG-4 Part 2, H.264, MVC, HEVC, VVC, Dirac, VC-1.
+const TS_VIDEO_TYPES: [u8; 8] = [0x01, 0x02, 0x10, 0x1b, 0x20, 0x24, 0x33, 0xea];
+const TS_HEVC: u8 = 0x24;
 
 /// Patience and manners of every HLS request (playlists, keys, segments), from the user's settings.
 #[derive(Clone, Copy, Debug)]
@@ -99,6 +109,9 @@ pub struct HlsOptions {
     pub expected_checksum: Option<String>,
     /// The download's speed limit, which the segments' bodies are held to together.
     pub limiter: Option<Arc<RateLimiter>>,
+    /// The playlist the segments came from, fetched again when their links expire (see
+    /// [`Refresh`]); None never renews them.
+    pub refresh_from: Option<Url>,
 }
 
 #[derive(Error, Debug)]
@@ -152,7 +165,10 @@ pub struct InitSection {
 
 #[derive(Debug, Clone)]
 pub struct HlsSegment {
+    /// Its position among the segments downloaded.
     pub index: usize,
+    /// Its media sequence number, which a playlist fetched again gives it too (see [`Refresh`]).
+    pub sequence: u64,
     pub url: Url,
     pub duration_secs: f64,
     pub byte_range: Option<ByteRange>,
@@ -160,6 +176,26 @@ pub struct HlsSegment {
     /// Init section that must precede this segment in the output, shared by every
     /// segment it applies to.
     pub init: Option<Arc<InitSection>>,
+    /// Its timestamps need not follow on from the segment before (`#EXT-X-DISCONTINUITY`, or
+    /// segments left out before it).
+    pub discontinuity: bool,
+}
+
+/// A WebVTT subtitle rendition of a master playlist (`#EXT-X-MEDIA:TYPE=SUBTITLES`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Subtitle {
+    /// Its media playlist, which lists its `.vtt` segments.
+    pub url: Url,
+    /// Its `LANGUAGE` (a BCP 47 tag such as "en" or "pt-BR"), else "und".
+    pub language: String,
+}
+
+/// What [`parse_hls`] finds: the segments to download and the subtitles of the master playlist
+/// they came from.
+#[derive(Debug)]
+pub struct HlsStream {
+    pub segments: Vec<HlsSegment>,
+    pub subtitles: Vec<Subtitle>,
 }
 
 /// File extension matching the container the segments form: fMP4 streams need an
@@ -177,21 +213,37 @@ pub async fn parse_hls_playlist(
     auth: Option<&Auth>,
     fetch: FetchPolicy,
 ) -> Result<Vec<HlsSegment>, HlsError> {
+    parse_hls(client, playlist_url, None, auth, fetch).await.map(|stream| stream.segments)
+}
+
+/// [`parse_hls_playlist`], with the subtitle renditions of the master playlist. `text`, when
+/// given, is the playlist at `playlist_url` (one a web page built itself): it is read in place of
+/// fetching that URL, which then only resolves its relative URIs.
+pub async fn parse_hls(
+    client: &Client,
+    playlist_url: &Url,
+    text: Option<&str>,
+    auth: Option<&Auth>,
+    fetch: FetchPolicy,
+) -> Result<HlsStream, HlsError> {
     let mut url = playlist_url.clone();
+    let mut subtitles = Vec::new();
     for hop in 0..=MAX_MASTER_DEPTH {
-        let (body, final_url) = fetch_with_retry(client, auth, &url, None, MAX_PLAYLIST_BYTES, None, fetch)
-            .await
-            .map_err(|e| {
-                let reason = format!("could not fetch {}: {}", url, e.reason);
-                match e.kind {
-                    // A large file whose URL merely mentions .m3u8: download it as a plain file.
-                    FetchErrorKind::TooLarge { playlist: false } if hop == 0 => HlsError::InvalidPlaylist(reason),
-                    // A real playlist, or a variant: saving playlist text as the download would be
-                    // a fake success.
-                    FetchErrorKind::TooLarge { .. } => HlsError::Unsupported(reason),
-                    _ => HlsError::Unavailable(reason),
-                }
-            })?;
+        let fetched = match text.filter(|_| hop == 0) {
+            Some(text) => Ok((text.as_bytes().to_vec(), url.clone())),
+            None => fetch_with_retry(client, auth, &url, None, MAX_PLAYLIST_BYTES, None, fetch).await,
+        };
+        let (body, final_url) = fetched.map_err(|e| {
+            let reason = format!("could not fetch {}: {}", url, e.reason);
+            match e.kind {
+                // A large file whose URL merely mentions .m3u8: download it as a plain file.
+                FetchErrorKind::TooLarge { playlist: false } if hop == 0 => HlsError::InvalidPlaylist(reason),
+                // A real playlist, or a variant: saving playlist text as the download would be
+                // a fake success.
+                FetchErrorKind::TooLarge { .. } => HlsError::Unsupported(reason),
+                _ => HlsError::Unavailable(reason),
+            }
+        })?;
         let text = String::from_utf8_lossy(&body);
         let text = text.trim_start_matches('\u{feff}').trim_start();
         if !text.starts_with("#EXTM3U") {
@@ -207,12 +259,33 @@ pub async fn parse_hls_playlist(
         if text.lines().any(|l| l.trim_start().starts_with("#EXT-X-STREAM-INF:")) {
             // Relative URIs resolve against where the playlist actually came from (post-redirect).
             url = select_variant(text, &final_url)?;
+            subtitles = subtitle_renditions(text, &final_url);
             tracing::info!("Selected HLS variant: {}", url);
             continue;
         }
-        return parse_media_playlist(client, auth, text, &final_url, fetch).await;
+        let segments = parse_media_playlist(client, auth, text, &final_url, fetch).await?;
+        return Ok(HlsStream { segments, subtitles });
     }
     Err(malformed(format!("master playlists nested more than {} levels deep", MAX_MASTER_DEPTH)))
+}
+
+/// The subtitle renditions a master playlist lists, each language and name once, at most
+/// [`MAX_SUBTITLES`] of them.
+fn subtitle_renditions(master: &str, base: &Url) -> Vec<Subtitle> {
+    let mut seen = HashSet::new();
+    master
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("#EXT-X-MEDIA:"))
+        .map(parse_attributes)
+        .filter(|attrs| attrs.get("TYPE") == Some(&"SUBTITLES"))
+        .filter_map(|attrs| {
+            let url = base.join(attrs.get("URI")?).ok()?;
+            let language = attrs.get("LANGUAGE").filter(|l| !l.is_empty()).unwrap_or(&"und").to_string();
+            let name = attrs.get("NAME").copied().unwrap_or_default();
+            seen.insert((language.clone(), name)).then_some(Subtitle { url, language })
+        })
+        .take(MAX_SUBTITLES)
+        .collect()
 }
 
 /// Whether `body` starts like an HLS playlist: `#EXTM3U` after an optional BOM and whitespace.
@@ -263,6 +336,61 @@ fn parse_byte_range(spec: &str, next_start: u64) -> Result<ByteRange, HlsError> 
 fn parse_iv(hex: &str) -> Option<[u8; 16]> {
     let digits = hex.strip_prefix("0x").or_else(|| hex.strip_prefix("0X"))?;
     u128::from_str_radix(digits, 16).ok().filter(|_| digits.len() == 32).map(u128::to_be_bytes)
+}
+
+/// When the ads a media playlist's `#EXT-X-DATERANGE` tags mark play (seconds since 1970, from
+/// and up to): those whose CLASS names an ad (`twitch-stitched-ad`; "ad" or "ads" as a word of
+/// it), from START-DATE for DURATION, else PLANNED-DURATION, else up to END-DATE.
+fn ad_windows(text: &str) -> Vec<(f64, f64)> {
+    let names_an_ad = |class: &str| class.split(|c: char| !c.is_ascii_alphanumeric()).any(|w| w.eq_ignore_ascii_case("ad") || w.eq_ignore_ascii_case("ads"));
+    text.lines()
+        .filter_map(|line| line.trim().strip_prefix("#EXT-X-DATERANGE:"))
+        .map(parse_attributes)
+        .filter(|attrs| attrs.get("CLASS").is_some_and(|class| names_an_ad(class)))
+        .filter_map(|attrs| {
+            let start = epoch_seconds(attrs.get("START-DATE")?)?;
+            let length = attrs.get("DURATION").or(attrs.get("PLANNED-DURATION")).and_then(|d| d.parse::<f64>().ok());
+            let end = length.map(|l| start + l).or_else(|| epoch_seconds(attrs.get("END-DATE")?))?;
+            Some((start, end))
+        })
+        .collect()
+}
+
+/// Seconds left of an ad break, by what its `#EXT-X-CUE-OUT` (`:30`, `:DURATION=30`) or
+/// `#EXT-X-CUE-OUT-CONT` (`:ElapsedTime=6,Duration=30`, `:6/30`) tag says after its name: the
+/// break's duration less what has played of it; endless (up to `#EXT-X-CUE-IN`) when it gives
+/// no duration.
+fn break_left(spec: &str) -> f64 {
+    let spec = spec.strip_prefix(':').unwrap_or_default().trim();
+    let number = |s: &str| s.trim().parse::<f64>().ok();
+    let attrs = parse_attributes(spec);
+    let attr = |name: &str| attrs.iter().find(|(key, _)| key.eq_ignore_ascii_case(name)).and_then(|(_, value)| number(value));
+    let (played, duration) = match spec.split_once('/') {
+        Some((played, duration)) if !spec.contains('=') => (number(played), number(duration)),
+        _ => (attr("ElapsedTime"), number(spec).or_else(|| attr("DURATION"))),
+    };
+    duration.filter(|d| d.is_finite() && *d > 0.0).map_or(f64::INFINITY, |d| d - played.unwrap_or(0.0))
+}
+
+/// Seconds since 1970 of an ISO 8601 date and time as playlists give them
+/// (`2024-05-01T12:00:00.250Z`, `...+02:00`).
+fn epoch_seconds(date: &str) -> Option<f64> {
+    let (day, time) = date.trim().split_once(['T', 't'])?;
+    let mut ymd = day.splitn(3, '-').map(|n| n.parse::<i64>().ok());
+    let (year, month, day) = (ymd.next()??, ymd.next()??, ymd.next()??);
+    let (clock, zone) = time.split_at(time.find(['Z', 'z', '+', '-']).unwrap_or(time.len()));
+    let offset = match zone.split_at_checked(1) {
+        Some((sign @ ("+" | "-"), hm)) => {
+            let hm: String = hm.chars().filter(char::is_ascii_digit).collect();
+            let minutes = hm.get(..2)?.parse::<f64>().ok()? * 60.0 + hm.get(2..).filter(|m| !m.is_empty()).map_or(Some(0.0), |m| m.parse().ok())?;
+            if sign == "-" { -minutes * 60.0 } else { minutes * 60.0 }
+        }
+        _ => 0.0,
+    };
+    let mut hms = clock.splitn(3, ':').map(|n| n.parse::<f64>().ok());
+    let (h, m, s) = (hms.next()??, hms.next()??, hms.next()??);
+    let days = crate::engine::days_from_civil(year, month, day) as f64;
+    Some(days * 86_400.0 + h * 3600.0 + m * 60.0 + s - offset)
 }
 
 const AUDIO_CODEC_PREFIXES: [&str; 8] = ["mp4a", "ac-3", "ec-3", "ac-4", "opus", "flac", "alac", "dts"];
@@ -391,11 +519,19 @@ async fn parse_media_playlist(
 
     let mut segments = Vec::new();
     let mut media_sequence: u64 = 0;
+    // Segments listed so far, ads included.
+    let mut listed: u64 = 0;
     let mut duration = 2.0;
     let mut byte_range = None;
     let mut next_range_start = 0;
     let mut key: Option<ActiveKey> = None;
     let mut init = None;
+    let mut discontinuity = false;
+    // Inside an ad break, from `#EXT-X-CUE-OUT`: the seconds of it left (see [`break_left`]).
+    let mut ad_left: Option<f64> = None;
+    let ads = ad_windows(text);
+    // When the next segment starts (seconds since 1970), from `#EXT-X-PROGRAM-DATE-TIME`.
+    let mut clock: Option<f64> = None;
 
     for line in text.lines() {
         let trimmed = line.trim();
@@ -405,6 +541,18 @@ async fn parse_media_playlist(
 
         if let Some(info) = trimmed.strip_prefix("#EXTINF:") {
             duration = info.split(',').next().and_then(|d| d.trim().parse().ok()).unwrap_or(2.0);
+        } else if trimmed == "#EXT-X-DISCONTINUITY" {
+            discontinuity = true;
+        } else if let Some(cue) = trimmed.strip_prefix("#EXT-X-CUE-OUT") {
+            // `-CONT` goes on with the break; it starts one only for a playlist that starts inside it.
+            match cue.strip_prefix("-CONT") {
+                Some(cont) => ad_left = ad_left.or(Some(break_left(cont))),
+                None => ad_left = Some(break_left(cue)),
+            }
+        } else if trimmed.starts_with("#EXT-X-CUE-IN") {
+            ad_left = None;
+        } else if let Some(date) = trimmed.strip_prefix("#EXT-X-PROGRAM-DATE-TIME:") {
+            clock = epoch_seconds(date);
         } else if let Some(seq) = trimmed.strip_prefix("#EXT-X-MEDIA-SEQUENCE:") {
             media_sequence = seq.trim().parse().map_err(|_| malformed(format!("invalid media sequence '{}'", seq)))?;
         } else if let Some(spec) = trimmed.strip_prefix("#EXT-X-BYTERANGE:") {
@@ -461,12 +609,31 @@ async fn parse_media_playlist(
                 return Err(HlsError::Unsupported(format!("playlist has more than {} segments", MAX_SEGMENTS)));
             }
             // Parsing a huge playlist takes a while; let other tasks (and timeouts) run.
-            if index % 1024 == 1023 {
+            if listed % 1024 == 1023 {
                 tokio::task::yield_now().await;
             }
-            let sequence = media_sequence.saturating_add(index as u64);
+            let sequence = media_sequence.saturating_add(listed);
+            listed += 1;
+            let starts = clock;
+            clock = clock.map(|c| c + duration);
+            // An ad, by its break or its date range (half of it inside one counts). A break ends
+            // at `#EXT-X-CUE-IN`, or once its segments fill the duration it gave.
+            let middle = starts.map(|s| s + duration / 2.0);
+            if ad_left.is_some_and(|left| left < duration / 2.0) {
+                ad_left = None;
+            }
+            if let Some(left) = &mut ad_left {
+                *left -= duration;
+            }
+            if ad_left.is_some() || middle.is_some_and(|m| ads.iter().any(|&(from, to)| from <= m && m < to)) {
+                // What follows does not follow on from what came before it.
+                discontinuity = true;
+                byte_range = None;
+                continue;
+            }
             segments.push(HlsSegment {
                 index,
+                sequence,
                 url: join(trimmed)?,
                 duration_secs: duration,
                 byte_range: byte_range.take(),
@@ -475,6 +642,7 @@ async fn parse_media_playlist(
                     iv: k.iv.unwrap_or((sequence as u128).to_be_bytes()),
                 }),
                 init: init.clone(),
+                discontinuity: std::mem::take(&mut discontinuity),
             });
         }
     }
@@ -516,6 +684,9 @@ enum FetchErrorKind {
     /// Worth retrying: network trouble, 5xx, 408, 429, a short body.
     Transient,
     Fatal,
+    /// 401, 403, 404 or 410: as a CDN answers a signed link past its time, which a playlist
+    /// fetched again may renew (see [`Refresh`]).
+    Expired,
     /// The body is larger than the caller's limit; `playlist` if it starts like an HLS playlist.
     TooLarge { playlist: bool },
 }
@@ -614,8 +785,13 @@ async fn fetch_once(
         let transient = status.is_server_error()
             || status == StatusCode::REQUEST_TIMEOUT
             || status == StatusCode::TOO_MANY_REQUESTS;
+        let expired = matches!(status.as_u16(), 401 | 403 | 404 | 410);
         let reason = format!("HTTP {}", status);
-        return Err(if transient { FetchError::retryable(reason) } else { FetchError::fatal(reason) });
+        return Err(match (transient, expired) {
+            (true, _) => FetchError::retryable(reason),
+            (_, true) => FetchError { kind: FetchErrorKind::Expired, reason },
+            _ => FetchError::fatal(reason),
+        });
     }
     if let Some(r) = range {
         if status != StatusCode::PARTIAL_CONTENT {
@@ -715,25 +891,68 @@ async fn decrypt(data: Vec<u8>, key: &Option<Aes128Key>) -> Result<Vec<u8>, Stri
     .map_err(|e| format!("decryption task failed: {}", e))?
 }
 
-/// Cuts what some hosts put before an MPEG-TS segment's packets so it passes for an image (a 1×1
-/// PNG on an image CDN): players skip it, and so does the download, else the joined file starts
-/// with that image and players take it for one. The segment starts at the first byte of its first
-/// 64 KiB that begins five packets in a row (0x47 every 188 bytes); one that already does, or
-/// shows no such run, is kept whole. A run, not one 0x47, since a GIF starts with that byte too.
+/// Cuts what some hosts put around an MPEG-TS segment's packets: before them, so that it passes
+/// for an image (a 1×1 PNG on an image CDN), and junk after them. Players skip both, and so does
+/// the download, else the joined file starts with that image and players take it for one. The
+/// segment starts at its first byte that begins five packets in a row (0x47 every 188 bytes) and
+/// ends with the last whole packet after it that starts with 0x47; one that shows no such run is
+/// kept whole. A run, not one 0x47, since a GIF starts with that byte too.
 fn strip_disguise(mut data: Vec<u8>) -> Vec<u8> {
     const PACKET: usize = 188;
     let packets_at = |i: usize| (0..5).all(|k| data.get(i + k * PACKET) == Some(&0x47));
-    if packets_at(0) {
-        return data;
-    }
-    if let Some(start) = (1..data.len().min(64 * 1024)).find(|&i| packets_at(i)) {
-        data.drain(..start);
-    }
+    let Some(start) = (0..data.len()).find(|&i| packets_at(i)) else { return data };
+    let last = (0..(data.len() - start) / PACKET).rev().find(|k| data[start + k * PACKET] == 0x47).unwrap_or(0);
+    data.truncate(start + (last + 1) * PACKET);
+    data.drain(..start);
     data
 }
 
+/// Fetches the playlist of a download again when the links of its segments expire mid-download
+/// (401, 403, 404 or 410, as a CDN answers a signed link past its time), at most
+/// [`MAX_REFRESHES`] times per download, for fresh links (and keys) of those segments: found by
+/// media sequence number, else by position in a playlist as long as before. Segments whose links
+/// expire together share one fetch.
+struct Refresh<'a> {
+    client: &'a Client,
+    auth: Option<&'a Auth>,
+    playlist: &'a Url,
+    fetch: FetchPolicy,
+    /// Segments the download started with.
+    count: usize,
+    /// Fetches made so far, and the segments the latest one listed.
+    fresh: tokio::sync::Mutex<(u32, Vec<HlsSegment>)>,
+}
+
+impl Refresh<'_> {
+    /// `stale`, whose links expired, with those of the playlist fetched again: by another request
+    /// since `stale`'s were taken, else now. None once every refresh is spent, or if the playlist
+    /// no longer lists it.
+    async fn renew(&self, stale: &HlsSegment) -> Option<HlsSegment> {
+        let find = |segments: &[HlsSegment]| {
+            let by_sequence = segments.binary_search_by_key(&stale.sequence, |s| s.sequence).ok();
+            let at = by_sequence.or((segments.len() == self.count).then_some(stale.index))?;
+            // A merged request keeps its byte range: only the links change.
+            Some(HlsSegment { index: stale.index, byte_range: stale.byte_range, ..segments[at].clone() })
+        };
+        let mut fresh = self.fresh.lock().await;
+        if let Some(renewed) = find(&fresh.1).filter(|s| s.url != stale.url) {
+            return Some(renewed);
+        }
+        if fresh.0 == MAX_REFRESHES {
+            return None;
+        }
+        fresh.0 += 1;
+        tracing::warn!("HLS segment {} is gone at {}; fetching the playlist again for fresh links ({}/{})", stale.index, stale.url, fresh.0, MAX_REFRESHES);
+        match parse_hls(self.client, self.playlist, None, self.auth, self.fetch).await {
+            Ok(stream) => fresh.1 = stream.segments,
+            Err(e) => tracing::warn!("Fetching the playlist {} again failed: {}", self.playlist, e),
+        }
+        find(&fresh.1)
+    }
+}
+
 /// Downloads and decrypts one segment, prefixed by its init section when that changes. Its body
-/// bytes count in `tally` as they arrive.
+/// bytes count in `tally` as they arrive. Links that expired are renewed by `refresh`, if given.
 async fn fetch_segment(
     client: &Client,
     auth: Option<&Auth>,
@@ -741,22 +960,47 @@ async fn fetch_segment(
     with_init: bool,
     tally: &Tally<'_>,
     fetch: FetchPolicy,
+    refresh: Option<&Refresh<'_>>,
 ) -> Result<Vec<u8>, HlsError> {
-    let failed = |reason: String| HlsError::SegmentFailed { index: segment.index, reason };
+    let mut renewed = None;
+    loop {
+        let current = renewed.as_ref().unwrap_or(segment);
+        let result = fetch_segment_once(client, auth, current, with_init, tally, fetch).await;
+        let fresh = match (&result, refresh) {
+            (Err(e), Some(refresh)) if e.kind == FetchErrorKind::Expired => refresh.renew(current).await,
+            _ => None,
+        };
+        match fresh {
+            Some(fresh) => renewed = Some(fresh),
+            None => return result.map_err(|e| HlsError::SegmentFailed { index: segment.index, reason: e.reason }),
+        }
+    }
+}
+
+/// [`fetch_segment`] with the links `segment` has.
+async fn fetch_segment_once(
+    client: &Client,
+    auth: Option<&Auth>,
+    segment: &HlsSegment,
+    with_init: bool,
+    tally: &Tally<'_>,
+    fetch: FetchPolicy,
+) -> Result<Vec<u8>, FetchError> {
     let limit = |range: Option<ByteRange>| range.map_or(MAX_SEGMENT_BYTES, |r| r.len().min(MAX_SEGMENT_BYTES));
     let mut init_data = None;
     if let Some(init) = segment.init.as_ref().filter(|_| with_init) {
         let (data, _) =
             fetch_with_retry(client, auth, &init.url, init.byte_range, limit(init.byte_range), Some(tally), fetch)
                 .await
-                .map_err(|e| failed(format!("init section {}: {}", init.url, e.reason)))?;
-        init_data = Some(decrypt(data, &init.encryption).await.map_err(|r| failed(format!("init section: {}", r)))?);
+                .map_err(|e| FetchError { reason: format!("init section {}: {}", init.url, e.reason), ..e })?;
+        let data = decrypt(data, &init.encryption).await.map_err(|r| FetchError::fatal(format!("init section: {}", r)))?;
+        init_data = Some(data);
     }
     let (data, _) =
         fetch_with_retry(client, auth, &segment.url, segment.byte_range, limit(segment.byte_range), Some(tally), fetch)
             .await
-            .map_err(|e| failed(format!("{}: {}", segment.url, e.reason)))?;
-    let data = decrypt(data, &segment.encryption).await.map_err(failed)?;
+            .map_err(|e| FetchError { reason: format!("{}: {}", segment.url, e.reason), ..e })?;
+    let data = decrypt(data, &segment.encryption).await.map_err(FetchError::fatal)?;
     // Only MPEG-TS is disguised so; fMP4 segments (with an init section) are left as they are.
     let data = if segment.init.is_none() { strip_disguise(data) } else { data };
     Ok(match init_data {
@@ -779,12 +1023,13 @@ async fn fetch_request(
     progress: &AtomicU64,
     limiter: Option<&RateLimiter>,
     fetch: FetchPolicy,
+    refresh: Option<&Refresh<'_>>,
 ) -> Result<Vec<u8>, HlsError> {
     let first = &request.segment;
     if !request.merged.is_empty() {
         let tally = Tally::new(progress, limiter);
         let once = FetchPolicy { max_retries: 0, ..fetch };
-        match fetch_segment(client, auth, first, request.with_init, &tally, once).await {
+        match fetch_segment(client, auth, first, request.with_init, &tally, once, refresh).await {
             Ok(data) => {
                 tally.keep();
                 return Ok(data);
@@ -794,12 +1039,17 @@ async fn fetch_request(
     }
     let tally = Tally::new(progress, limiter);
     let data = if request.merged.is_empty() {
-        fetch_segment(client, auth, first, request.with_init, &tally, fetch).await?
+        fetch_segment(client, auth, first, request.with_init, &tally, fetch, refresh).await?
     } else {
         let mut data = Vec::new();
         for (i, range) in request.merged.iter().enumerate() {
-            let segment = HlsSegment { index: first.index + i, byte_range: Some(*range), ..first.clone() };
-            data.extend(fetch_segment(client, auth, &segment, request.with_init && i == 0, &tally, fetch).await?);
+            let segment = HlsSegment {
+                index: first.index + i,
+                sequence: first.sequence + i as u64,
+                byte_range: Some(*range),
+                ..first.clone()
+            };
+            data.extend(fetch_segment(client, auth, &segment, request.with_init && i == 0, &tally, fetch, refresh).await?);
         }
         data
     };
@@ -910,7 +1160,8 @@ fn plan_requests(segments: Vec<HlsSegment>, from: usize, limit: u64) -> Vec<Requ
 /// may fetch both.
 fn merged_range(request: &HlsSegment, next: &HlsSegment, limit: u64) -> Option<ByteRange> {
     let (range, more) = (request.byte_range?, next.byte_range?);
-    let adjoining = range.end.checked_add(1) == Some(more.start) && request.url == next.url;
+    // A discontinuity starts a new part of the file (see `HlsEngine::download`).
+    let adjoining = range.end.checked_add(1) == Some(more.start) && request.url == next.url && !next.discontinuity;
     let plain = request.encryption.is_none() && next.encryption.is_none();
     if !adjoining || !plain || range.len() + more.len() > limit {
         return None;
@@ -934,7 +1185,7 @@ async fn part_matches(
     for index in std::iter::once(0).chain((count > 1).then_some(count - 1)) {
         let uncounted = AtomicU64::new(0);
         let tally = Tally::new(&uncounted, None);
-        let segment = fetch_segment(client, auth, &segments[index], writes_init(segments, index), &tally, fetch);
+        let segment = fetch_segment(client, auth, &segments[index], writes_init(segments, index), &tally, fetch, None);
         let data = tokio::select! {
             data = segment => data?,
             _ = cancelled(cancel_flag) => return Err(HlsError::Cancelled),
@@ -1366,10 +1617,12 @@ impl HlsEngine {
     /// Downloads `segments` with at most `options.connections` requests in flight (see
     /// [`InOrder`]) and writes them in order (see [`write_segments`]) to the `.part` of `target`
     /// (from [`HlsEngine::prepare`] for these segments), renamed to the target path once complete.
-    /// Returns that path and the file's digest, taken while writing it. A failed or cancelled run
-    /// keeps the `.part` file, with its state saved, and resumes from it next time; so does a run
-    /// whose future is dropped, and its writer holds the target's claim (see [`HlsTarget::hold`])
-    /// until it has saved it. `auth` is added to every request it covers.
+    /// Returns that path, the file's digest, taken while writing it, and the byte offsets where
+    /// its discontinuities start (none when one lies in what an earlier run wrote, which left no
+    /// record of where). A failed or cancelled run keeps the `.part` file, with its state saved,
+    /// and resumes from it next time; so does a run whose future is dropped, and its writer holds
+    /// the target's claim (see [`HlsTarget::hold`]) until it has saved it. `auth` is added to
+    /// every request it covers.
     pub async fn download(
         client: &Client,
         auth: Option<&Auth>,
@@ -1378,13 +1631,23 @@ impl HlsEngine {
         options: &HlsOptions,
         snapshot_tx: Option<broadcast::Sender<EngineSnapshot>>,
         cancel_flag: Option<Arc<AtomicBool>>,
-    ) -> Result<(PathBuf, FileDigest), HlsError> {
+    ) -> Result<(PathBuf, FileDigest, Vec<u64>), HlsError> {
         let num_connections = options.connections.clamp(1, MAX_CONNECTIONS);
         let total_segments = segments.len();
         if total_segments == 0 {
             return Err(HlsError::NoSegments);
         }
         let is_cancelled = || cancel_flag.as_ref().is_some_and(|c| c.load(Ordering::Relaxed));
+        let refresh = options.refresh_from.as_ref().map(|playlist| Refresh {
+            client,
+            auth,
+            playlist,
+            fetch: options.fetch,
+            count: total_segments,
+            fresh: tokio::sync::Mutex::new((0, Vec::new())),
+        });
+        let breaks_known = !segments.iter().take(target.resume_from).skip(1).any(|s| s.discontinuity);
+        let mut breaks = Vec::new();
 
         let HlsTarget { path: target_file, fingerprints, resume_from, resume_bytes: mut written_bytes, claim } = target;
         let part_path = with_suffix(&target_file, ".part");
@@ -1428,7 +1691,7 @@ impl HlsEngine {
         // Dropping it aborts the fetches in flight.
         let window = WINDOW_PER_CONNECTION * num_connections;
         let mut window = InOrder::new(requests.len(), num_connections, window, options.fetch.stall_timeout, |i| {
-            fetch_request(client, auth, &requests[i], &received, options.limiter.as_deref(), options.fetch)
+            fetch_request(client, auth, &requests[i], &received, options.limiter.as_deref(), options.fetch, refresh.as_ref())
         });
 
         // Segments handed to the writer.
@@ -1447,6 +1710,10 @@ impl HlsEngine {
                     let Ok(room) = room else { break None };
                     match window.pop() {
                         Some(Ok((i, data))) => {
+                            let first = &requests[i].segment;
+                            if first.discontinuity && first.index > 0 {
+                                breaks.push(written_bytes);
+                            }
                             written += requests[i].segments();
                             written_bytes += data.len() as u64;
                             room.send((requests[i].segments(), data));
@@ -1503,7 +1770,7 @@ impl HlsEngine {
             ));
         }
         tracing::info!("HLS download and stitching completed: {}", target_file.display());
-        Ok((target_file, digest))
+        Ok((target_file, digest, if breaks_known { breaks } else { Vec::new() }))
     }
 }
 
@@ -1562,6 +1829,215 @@ fn progress_snapshot(
         chunks,
         target_path: Some(target.to_path_buf()),
     }
+}
+
+/// What the first packets of an MPEG-TS tell of it (see [`scan_ts`]).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct TsHead {
+    /// The stream types its program map lists; empty if none was among the packets.
+    pub stream_types: Vec<u8>,
+    /// The earliest presentation time among its PES packets, in 90 kHz ticks.
+    pub first_pts: Option<u64>,
+}
+
+impl TsHead {
+    /// Whether its program has streams and none of them is video.
+    pub fn audio_only(&self) -> bool {
+        !self.stream_types.is_empty() && !self.stream_types.iter().any(|t| TS_VIDEO_TYPES.contains(t))
+    }
+
+    pub fn hevc(&self) -> bool {
+        self.stream_types.contains(&TS_HEVC)
+    }
+}
+
+/// Reads the program map and the earliest presentation time from `data`, the start of an MPEG-TS
+/// (188-byte packets from its first byte, as [`strip_disguise`] leaves segments).
+pub(crate) fn scan_ts(data: &[u8]) -> TsHead {
+    let mut head = TsHead::default();
+    for packet in data.chunks_exact(188).take_while(|p| p[0] == 0x47) {
+        // Only a packet that starts a section or a PES packet, and has a payload, tells anything.
+        if packet[1] & 0x40 == 0 || packet[3] & 0x10 == 0 {
+            continue;
+        }
+        let payload_at = if packet[3] & 0x20 != 0 { 5 + usize::from(packet[4]) } else { 4 };
+        let Some(payload) = packet.get(payload_at..) else { continue };
+        if let Some(pes) = payload.strip_prefix(&[0, 0, 1]) {
+            // Stream id, length, two flag bytes (the second says whether a PTS follows), header
+            // length, then the PTS: 33 bits among marker bits.
+            let has_pts = pes.get(4).is_some_and(|flags| flags & 0x80 != 0);
+            let pts = pes.get(6..11).filter(|_| has_pts).map(|p| {
+                u64::from(p[0] >> 1 & 0x07) << 30
+                    | u64::from(p[1]) << 22
+                    | u64::from(p[2] >> 1) << 15
+                    | u64::from(p[3]) << 7
+                    | u64::from(p[4] >> 1)
+            });
+            head.first_pts = pts.into_iter().chain(head.first_pts).min();
+        } else if head.stream_types.is_empty() {
+            // A section, after its pointer field: a program map (table 2) lists the streams.
+            let Some(section) = payload.first().and_then(|&pointer| payload.get(1 + usize::from(pointer)..)) else { continue };
+            let length = |at: usize| section.get(at..at + 2).map(|b| usize::from(b[0] & 0x0f) << 8 | usize::from(b[1]));
+            let (Some(&2), Some(section_length), Some(program_info)) = (section.first(), length(1), length(10)) else { continue };
+            // Its streams follow the program info, up to the CRC that ends the section.
+            let end = (3 + section_length).saturating_sub(4).min(section.len());
+            let mut at = 12 + program_info;
+            while at + 5 <= end {
+                head.stream_types.push(section[at]);
+                at += 5 + length(at + 3).unwrap_or(0);
+            }
+        }
+    }
+    head
+}
+
+/// [`scan_ts`] of the first MiB of the file at `path`; nothing is known of one that cannot be read.
+pub(crate) async fn read_ts_head(path: &Path) -> TsHead {
+    let mut head = Vec::new();
+    if let Ok(file) = tokio::fs::File::open(path).await {
+        let _ = file.take(1 << 20).read_to_end(&mut head).await;
+    }
+    scan_ts(&head)
+}
+
+/// Saves `subtitles` (playlists of WebVTT segments, or WebVTT files) beside `media`, the file their
+/// stream was saved as, each as `<stem>.<language>.vtt` (numbered if taken): its cues joined
+/// under one header and timed as `media` plays (see [`join_vtt`]). One that cannot be fetched or
+/// saved, or has no cues, is left out with a warning: subtitles never fail a download. Returns the
+/// files saved, with their languages.
+pub async fn save_subtitles(
+    client: &Client,
+    auth: Option<&Auth>,
+    subtitles: &[Subtitle],
+    media: &Path,
+    fetch: FetchPolicy,
+) -> Vec<(PathBuf, String)> {
+    if subtitles.is_empty() {
+        return Vec::new();
+    }
+    let start = read_ts_head(media).await.first_pts.map(|pts| pts as f64 / 90_000.0);
+    let mut saved = Vec::new();
+    for subtitle in subtitles {
+        let vtt = match fetch_vtt(client, auth, &subtitle.url, fetch).await {
+            Ok(segments) => join_vtt(&segments, start),
+            Err(e) => {
+                tracing::warn!("Subtitles '{}' ({}) could not be downloaded: {}", subtitle.language, subtitle.url, e);
+                continue;
+            }
+        };
+        if !vtt.contains("-->") {
+            tracing::warn!("Subtitles '{}' ({}) have no cues", subtitle.language, subtitle.url);
+            continue;
+        }
+        let language: String = subtitle.language.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').take(35).collect();
+        let mut name = media.file_stem().unwrap_or_default().to_os_string();
+        name.push(format!(".{}.vtt", if language.is_empty() { "und" } else { &language }));
+        let path = crate::engine::free_path(&media.with_file_name(name));
+        match tokio::fs::write(&path, vtt).await {
+            Ok(()) => saved.push((path, subtitle.language.clone())),
+            Err(e) => tracing::warn!("Failed to save subtitles {}: {}", path.display(), e),
+        }
+    }
+    saved
+}
+
+/// The WebVTT segments the playlist at `url` lists, in order, or the WebVTT file it is.
+async fn fetch_vtt(client: &Client, auth: Option<&Auth>, url: &Url, fetch: FetchPolicy) -> Result<Vec<String>, String> {
+    use futures_util::TryStreamExt;
+    let (body, final_url) =
+        fetch_with_retry(client, auth, url, None, MAX_PLAYLIST_BYTES, None, fetch).await.map_err(|e| e.reason)?;
+    if !is_playlist_start(&body) {
+        return Ok(vec![String::from_utf8_lossy(&body).into_owned()]);
+    }
+    let text = String::from_utf8_lossy(&body);
+    let urls = text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).take(MAX_SEGMENTS);
+    let urls: Vec<Url> = urls.map(|uri| final_url.join(uri).map_err(|e| format!("invalid URL '{}': {}", uri, e))).collect::<Result<_, _>>()?;
+    futures_util::stream::iter(urls)
+        .map(|url| async move {
+            let (body, _) = fetch_with_retry(client, auth, &url, None, MAX_PLAYLIST_BYTES, None, fetch)
+                .await
+                .map_err(|e| format!("{}: {}", url, e.reason))?;
+            Ok::<_, String>(String::from_utf8_lossy(&body).into_owned())
+        })
+        .buffered(SUBTITLE_CONCURRENCY)
+        .try_collect()
+        .await
+}
+
+/// WebVTT `segments` joined into one file: one header, then the cues of each, moved onto the
+/// media's clock by the segment's `X-TIMESTAMP-MAP` (a cue at LOCAL plays at MPEGTS), less
+/// `start`, where the media's clock starts (seconds); when that is unknown, less the first
+/// segment's mapping, which leaves its cues as they are. Other blocks (notes, styles) are left
+/// out, and so is a cue repeated from a segment before.
+fn join_vtt(segments: &[String], start: Option<f64>) -> String {
+    let mut out = String::from("WEBVTT\n");
+    let mut seen = HashSet::new();
+    let mut start = start;
+    for segment in segments {
+        let segment = segment.replace("\r\n", "\n");
+        let mut blocks = segment.split("\n\n");
+        let header = blocks.next().unwrap_or_default();
+        let mapped = header.lines().find_map(|l| l.trim().strip_prefix("X-TIMESTAMP-MAP=")).and_then(timestamp_map);
+        let base = *start.get_or_insert(mapped.unwrap_or(0.0));
+        let shift = mapped.map_or(0.0, |at| at - base);
+        for block in blocks.map(str::trim).filter(|b| !b.is_empty()) {
+            // An optional identifier, the timing line, then the text.
+            let mut lines = block.lines();
+            let Some(timing) = lines.by_ref().find(|l| l.contains("-->")).and_then(|t| retime(t, |at| at + shift)) else { continue };
+            let cue = std::iter::once(timing.as_str()).chain(lines).collect::<Vec<_>>().join("\n");
+            if seen.insert(cue.clone()) {
+                out.push('\n');
+                out.push_str(&cue);
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
+/// Where cue time 0 plays on the media's clock, in seconds, by an `X-TIMESTAMP-MAP`
+/// (`MPEGTS:900000,LOCAL:00:00:00.000`).
+fn timestamp_map(map: &str) -> Option<f64> {
+    let (mut mpegts, mut local) = (None, None);
+    for part in map.split(',') {
+        match part.trim().split_once(':')? {
+            ("MPEGTS", ticks) => mpegts = ticks.trim().parse::<u64>().ok(),
+            ("LOCAL", time) => local = vtt_time(time),
+            _ => {}
+        }
+    }
+    Some(mpegts? as f64 / 90_000.0 - local?)
+}
+
+/// Seconds of a WebVTT timestamp (`01:02:03.456` or `02:03.456`).
+fn vtt_time(time: &str) -> Option<f64> {
+    let (clock, millis) = time.trim().split_once('.')?;
+    let seconds = clock.split(':').try_fold(0.0, |total, n| Some(total * 60.0 + n.parse::<f64>().ok()?))?;
+    Some(seconds + millis.parse::<f64>().ok()? / 1000.0)
+}
+
+/// `vtt`, a WebVTT file as [`join_vtt`] writes one, with each cue's times moved by `to` (seconds).
+pub(crate) fn retime_vtt(vtt: &str, to: impl Fn(f64) -> f64) -> String {
+    let lines = vtt.lines().map(|line| if line.contains("-->") { retime(line, &to).unwrap_or_else(|| line.to_string()) } else { line.to_string() });
+    lines.map(|line| line + "\n").collect()
+}
+
+/// A cue's timing line (`00:00:01.000 --> 00:00:02.000 align:start`) with its times moved by `to`
+/// (seconds).
+fn retime(line: &str, to: impl Fn(f64) -> f64) -> Option<String> {
+    let format = |time: &str| {
+        let millis = (to(vtt_time(time)?).max(0.0) * 1000.0).round() as u64;
+        Some(format!("{:02}:{:02}:{:02}.{:03}", millis / 3_600_000, millis / 60_000 % 60, millis / 1000 % 60, millis % 1000))
+    };
+    let (from, rest) = line.split_once("-->")?;
+    let rest = rest.trim_start();
+    let (to, settings) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    let mut timing = format!("{} --> {}", format(from)?, format(to)?);
+    if !settings.trim().is_empty() {
+        timing.push(' ');
+        timing.push_str(settings.trim());
+    }
+    Some(timing)
 }
 
 #[cfg(test)]
@@ -1728,7 +2204,7 @@ pub(crate) mod tests {
     const FETCH: FetchPolicy = FetchPolicy { stall_timeout: Duration::from_millis(500), max_retries: 4, host_limit: 0 };
 
     fn options(connections: usize) -> HlsOptions {
-        HlsOptions { connections, fetch: FETCH, fsync_on_complete: false, expected_checksum: None, limiter: None }
+        HlsOptions { connections, fetch: FETCH, fsync_on_complete: false, expected_checksum: None, limiter: None, refresh_from: None }
     }
 
     /// Prepares `out` for `segments` of `playlist`, which must be free or hold this stream, and
@@ -1742,7 +2218,7 @@ pub(crate) mod tests {
         num_connections: usize,
     ) -> Result<PathBuf, HlsError> {
         let target = HlsEngine::prepare(client, auth, playlist, &segments, out, FETCH, &None).await?.expect("usable name");
-        let (path, digest) = HlsEngine::download(client, auth, segments, target, &options(num_connections), None, None).await?;
+        let (path, digest, _) = HlsEngine::download(client, auth, segments, target, &options(num_connections), None, None).await?;
         assert_digest(&digest, &path);
         Ok(path)
     }
@@ -1774,6 +2250,158 @@ pub(crate) mod tests {
         assert_eq!(strip_disguise(ts.clone()), ts);
         let not_ts = b"\x89PNG and nothing after".to_vec();
         assert_eq!(strip_disguise(not_ts.clone()), not_ts);
+        // However far in the packets start, and whatever follows the last whole one.
+        let far = vec![0xff; 70 * 1024];
+        assert_eq!(strip_disguise([&far[..], &ts, b"trailing junk"].concat()), ts);
+        assert_eq!(strip_disguise([&ts[..], &[0x47, 1, 2]].concat()), ts, "a packet cut short");
+        assert_eq!(strip_disguise([&ts[..], &[0; 400]].concat()), ts, "whole packets of junk");
+    }
+
+    /// Ads are left out, by their breaks (`#EXT-X-CUE-OUT` to `#EXT-X-CUE-IN`) or their date
+    /// ranges; the segment after them, like one after `#EXT-X-DISCONTINUITY`, starts a new part,
+    /// and every segment keeps its media sequence number.
+    #[tokio::test]
+    async fn test_ads_are_left_out_and_discontinuities_marked() {
+        let playlist = "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:10\n#EXT-X-PROGRAM-DATE-TIME:2024-05-01T23:59:56.000Z\n\
+            #EXT-X-DATERANGE:ID=\"ad\",CLASS=\"twitch-stitched-ad\",START-DATE=\"2024-05-02T02:00:00.000+02:00\",DURATION=4.0\n\
+            #EXT-X-DATERANGE:ID=\"ch\",CLASS=\"com.example.broadcast-chapter\",START-DATE=\"2024-05-01T23:59:56Z\",DURATION=100\n\
+            #EXTINF:4,\nc0.ts\n#EXTINF:2,\nad0.ts\n#EXTINF:2,\nad1.ts\n#EXTINF:4,\nc1.ts\n\
+            #EXT-X-DISCONTINUITY\n#EXTINF:4,\nc2.ts\n\
+            #EXT-X-CUE-OUT:8\n#EXTINF:4,\nbreak0.ts\n#EXT-X-CUE-OUT-CONT:4/8\n#EXTINF:4,\nbreak1.ts\n#EXT-X-CUE-IN\n\
+            #EXTINF:4,\nc3.ts\n#EXT-X-ENDLIST\n";
+        let (addr, _) = serve(move |_, _| ok(playlist)).await;
+        let url = Url::parse(&format!("http://{addr}/media.m3u8")).unwrap();
+        let segments = parse_hls_playlist(&Client::new(), &url, None, FETCH).await.unwrap();
+        let kept: Vec<(&str, usize, u64, bool)> =
+            segments.iter().map(|s| (s.url.path(), s.index, s.sequence, s.discontinuity)).collect();
+        assert_eq!(kept, [("/c0.ts", 0, 10, false), ("/c1.ts", 1, 13, true), ("/c2.ts", 2, 14, true), ("/c3.ts", 3, 17, true)]);
+
+        // A break that gives its duration ends once its segments fill it (to within half a
+        // segment), with no `#EXT-X-CUE-IN`; one that gives none goes on to the end.
+        let playlist = "#EXTM3U\n#EXTINF:4,\nc0.ts\n#EXT-X-CUE-OUT:DURATION=8.0\n#EXT-X-DISCONTINUITY\n#EXTINF:4,\nad0.ts\n\
+            #EXT-X-CUE-OUT-CONT:ElapsedTime=4,Duration=8,SCTE35=/DA0\n#EXTINF:3.9,\nad1.ts\n#EXT-X-DISCONTINUITY\n\
+            #EXTINF:4,\nc1.ts\n#EXTINF:4,\nc2.ts\n#EXT-X-CUE-OUT\n#EXTINF:4,\nad2.ts\n#EXTINF:4,\nad3.ts\n#EXT-X-ENDLIST\n";
+        let (addr, _) = serve(move |_, _| ok(playlist)).await;
+        let url = Url::parse(&format!("http://{addr}/media.m3u8")).unwrap();
+        let segments = parse_hls_playlist(&Client::new(), &url, None, FETCH).await.unwrap();
+        let kept: Vec<(&str, bool)> = segments.iter().map(|s| (s.url.path(), s.discontinuity)).collect();
+        assert_eq!(kept, [("/c0.ts", false), ("/c1.ts", true), ("/c2.ts", false)]);
+        assert_eq!([break_left(":30"), break_left(":DURATION=30,ID=\"x\""), break_left(":6/30")], [30.0, 30.0, 24.0]);
+        assert_eq!([break_left(":ElapsedTime=6,Duration=30,SCTE35=/DA0"), break_left(""), break_left(":0")], [24.0, f64::INFINITY, f64::INFINITY]);
+
+        assert_eq!(epoch_seconds("1970-01-02T00:00:01.5Z"), Some(86_401.5));
+        assert_eq!(epoch_seconds("1970-01-02T01:00:00+0100"), Some(86_400.0));
+        assert_eq!(epoch_seconds("not a date"), None);
+    }
+
+    /// A segment whose link expired (403) is fetched again with its link, and key, from the
+    /// playlist fetched anew; one that stays gone fails the download once three such fetches
+    /// could not bring it back, and without a playlist to fetch it fails at once.
+    #[tokio::test]
+    async fn test_expired_segment_links_are_renewed_from_the_playlist() {
+        let key = [3u8; 16];
+        let plain = |n: u64| format!("segment {n}").repeat(20).into_bytes();
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&fetches);
+        let (addr, hits) = serve(move |path: &str, _| {
+            // Every playlist fetch hands out links with a token of its own: 0, 1, 2, ...
+            let (name, token) = path.split_once("?t=").unwrap_or((path, ""));
+            match name {
+                "/media.m3u8" | "/gone.m3u8" => {
+                    let last = if name == "/gone.m3u8" { "gone" } else { "s9" };
+                    let t = counter.fetch_add(1, Ordering::SeqCst);
+                    ok(format!("#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:7\n#EXT-X-KEY:METHOD=AES-128,URI=\"k.bin?t={t}\"\n\
+                        #EXTINF:4,\ns7.ts?t={t}\n#EXTINF:4,\ns8.ts?t={t}\n#EXTINF:4,\n{last}.ts?t={t}\n#EXT-X-ENDLIST\n"))
+                }
+                "/k.bin" => ok(key.to_vec()),
+                // The first playlist's link of segment 8 has expired.
+                "/s8.ts" if token == "0" => (403, String::new(), Vec::new()),
+                "/s7.ts" | "/s8.ts" | "/s9.ts" => {
+                    // Encrypted with the media sequence number as IV, as the playlist says.
+                    let n: u64 = name[2..3].parse().unwrap();
+                    ok(encrypt(&plain(n), key, u128::from(n).to_be_bytes()))
+                }
+                _ => (404, String::new(), Vec::new()),
+            }
+        })
+        .await;
+        let client = Client::new();
+        let dir = tempfile::tempdir().unwrap();
+        let download = |name: &'static str, refresh: bool| {
+            let (client, dir) = (client.clone(), dir.path().to_path_buf());
+            async move {
+                let url = Url::parse(&format!("http://{addr}/{name}.m3u8")).unwrap();
+                let segments = parse_hls_playlist(&client, &url, None, FETCH).await?;
+                let out = dir.join(format!("{name}-{refresh}.ts"));
+                let target = HlsEngine::prepare(&client, None, &url, &segments, &out, FETCH, &None).await?.unwrap();
+                let options = HlsOptions { refresh_from: refresh.then_some(url), ..options(1) };
+                HlsEngine::download(&client, None, segments, target, &options, None, None).await.map(|(path, ..)| path)
+            }
+        };
+
+        let path = download("media", true).await.unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), [plain(7), plain(8), plain(9)].concat());
+        assert_eq!(fetches.load(Ordering::SeqCst), 2, "the playlist is fetched once more");
+        let seen = |path: &str| hits.lock().get(path).copied();
+        assert_eq!([seen("/s8.ts?t=0"), seen("/s8.ts?t=1"), seen("/k.bin?t=1")], [Some(1); 3]);
+
+        let err = download("gone", true).await.unwrap_err();
+        assert!(matches!(err, HlsError::SegmentFailed { index: 2, .. }), "{err}");
+        assert_eq!(hits.lock()["/gone.m3u8"], 1 + MAX_REFRESHES as usize);
+        let err = download("gone", false).await.unwrap_err();
+        assert!(matches!(err, HlsError::SegmentFailed { index: 2, .. }), "{err}");
+        assert_eq!(hits.lock()["/gone.m3u8"], 2 + MAX_REFRESHES as usize, "never fetched again");
+    }
+
+    /// The program map of an MPEG-TS tells video from audio and HEVC from other video, and its
+    /// PES headers where its clock starts.
+    #[test]
+    fn test_the_first_packets_tell_the_streams_and_the_start() {
+        let packet = |start: bool, payload: &[u8]| {
+            let mut packet = vec![0x47, if start { 0x41 } else { 0x01 }, 0x00, 0x10];
+            packet.extend_from_slice(payload);
+            packet.resize(188, 0xff);
+            packet
+        };
+        // A program map of `streams` (type, PID 0x100 + n, no descriptors), after its pointer field.
+        let pmt = |streams: &[u8]| {
+            let mut section = vec![0x00, 0x02, 0xb0, (9 + 5 * streams.len() + 4) as u8, 0x00, 0x01, 0xc1, 0x00, 0x00, 0xe1, 0x00, 0xf0, 0x00];
+            for (n, &kind) in streams.iter().enumerate() {
+                section.extend([kind, 0xe1, n as u8, 0xf0, 0x00]);
+            }
+            section.extend([0; 4]);
+            packet(true, &section)
+        };
+        let pes = |pts: u64| {
+            let marked = [0x21 | (pts >> 29 & 0x0e) as u8, (pts >> 22) as u8, 0x01 | (pts >> 14 & 0xfe) as u8, (pts >> 7) as u8, 0x01 | (pts << 1 & 0xfe) as u8];
+            packet(true, &[[0, 0, 1, 0xe0, 0, 0, 0x80, 0x80, 5].as_slice(), &marked].concat())
+        };
+        let ts = [pmt(&[0x24, 0x0f]), pes(900_000), packet(false, &[0; 10]), pes(899_000 + (1 << 32))].concat();
+        let head = scan_ts(&[ts.as_slice(), &pes(899_000)].concat());
+        assert_eq!(head, TsHead { stream_types: vec![0x24, 0x0f], first_pts: Some(899_000) });
+        assert!(head.hevc() && !head.audio_only());
+        let audio = scan_ts(&pmt(&[0x0f]));
+        assert!(audio.audio_only() && !audio.hevc());
+        assert_eq!(scan_ts(b"not a transport stream"), TsHead::default());
+        assert!(!TsHead::default().audio_only(), "a stream nothing is known of may well be video");
+    }
+
+    /// Subtitle segments join into one WebVTT file timed by their `X-TIMESTAMP-MAP`s against
+    /// where the media's clock starts, a cue repeated across segments only once.
+    #[test]
+    fn test_subtitle_segments_join_on_the_medias_clock() {
+        let segments = [
+            "WEBVTT\r\nX-TIMESTAMP-MAP=MPEGTS:990000,LOCAL:00:00:00.000\r\n\r\n1\r\n00:00:00.500 --> 00:00:00.900\r\nhello\r\n".to_string(),
+            "WEBVTT\nX-TIMESTAMP-MAP=LOCAL:00:00:10.000,MPEGTS:990000\n\nNOTE a note\n\n00:00:10.500 --> 00:00:10.900\nhello\n\n\
+             2\n00:00:11.000 --> 00:00:11.500 align:start line:0\nworld\nagain\n"
+                .to_string(),
+        ];
+        // The media starts at 10 s: the first map plays cue time 0 at 11 s.
+        let expected = "WEBVTT\n\n00:00:01.500 --> 00:00:01.900\nhello\n\n00:00:02.000 --> 00:00:02.500 align:start line:0\nworld\nagain\n";
+        assert_eq!(join_vtt(&segments, Some(10.0)), expected);
+        // Not knowing where it starts, the first segment's cues stay as they are.
+        assert!(join_vtt(&segments, None).starts_with("WEBVTT\n\n00:00:00.500 --> 00:00:00.900\nhello\n\n00:00:01.000 -->"));
+        assert_eq!(join_vtt(&["WEBVTT\n\n01:02.000 --> 01:03.000\nno map\n".to_string()], Some(5.0)), "WEBVTT\n\n00:01:02.000 --> 00:01:03.000\nno map\n");
     }
 
     #[test]
@@ -1997,7 +2625,7 @@ video.m3u8
         let (tx, mut rx) = broadcast::channel(256);
         let target = HlsEngine::prepare(&client, None, &url, &segments, &out, FETCH, &None).await.unwrap().unwrap();
         // num_connections == 0 must be treated as 1, not panic.
-        let (path, digest) = HlsEngine::download(&client, None, segments, target, &options(0), Some(tx), None).await.unwrap();
+        let (path, digest, _) = HlsEngine::download(&client, None, segments, target, &options(0), Some(tx), None).await.unwrap();
 
         let expected = [init, seg0, seg1, seg2].concat();
         assert_eq!(path, out);
@@ -2649,7 +3277,7 @@ video.m3u8
         assert!(!requested(9), "what is held in memory stays bounded");
 
         drop(writes);
-        let (path, digest) = download.await.unwrap().unwrap();
+        let (path, digest, _) = download.await.unwrap().unwrap();
         let expected: String = (0..20).map(|n| n.to_string().repeat(4)).collect();
         assert_eq!(std::fs::read(&path).unwrap(), expected.as_bytes());
         assert_digest(&digest, &path);
@@ -2713,6 +3341,8 @@ video.m3u8
                 byte_range: None,
                 encryption: None,
                 init: None,
+                sequence: index as u64,
+                discontinuity: false,
             })
             .collect();
         const WRITTEN: u64 = 512 * 1024 * 1024;
@@ -2759,7 +3389,7 @@ video.m3u8
         let options = HlsOptions { expected_checksum: Some(checksum.clone()), ..options(2) };
         let target = HlsEngine::prepare(&client, None, &url, &segments, &out, FETCH, &None).await.unwrap().unwrap();
         assert_eq!(target.resume_from, 2);
-        let (path, digest) = HlsEngine::download(&client, None, segments, target, &options, None, None).await.unwrap();
+        let (path, digest, _) = HlsEngine::download(&client, None, segments, target, &options, None, None).await.unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), expected.as_bytes());
         let blake3 = blake3::hash(expected.as_bytes()).to_hex().to_string();
         assert_eq!(crate::storage::verify_digest(&digest, Some(&checksum)).unwrap(), blake3);
@@ -2778,6 +3408,8 @@ video.m3u8
                 byte_range: Some(ByteRange::from_len(index as u64 * SEGMENT, SEGMENT).unwrap()),
                 encryption: None,
                 init: None,
+                sequence: index as u64,
+                discontinuity: false,
             })
             .collect();
         let largest = |connections| plan_requests(segments.clone(), 0, merge_limit(connections)).iter().map(Request::segments).max();
@@ -2802,6 +3434,8 @@ video.m3u8
             byte_range: range.map(|(start, len)| ByteRange::from_len(start, len).unwrap()),
             encryption: encrypted.then_some(Aes128Key { key: [1; 16], iv: [2; 16] }),
             init: init.cloned(),
+            sequence: 0,
+            discontinuity: false,
         };
         const K: u64 = 1024;
         let mut segments = vec![

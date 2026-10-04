@@ -6,9 +6,12 @@ const $ = (id) => document.getElementById(id);
 
 let tab = null;
 let httpTab = false;
+let mediaSite = false;
 let state = { items: [], app: null, recordings: [], settings: null };
 /** Item id → its list row. Rows are kept across refreshes so typed names and chosen qualities survive. */
 const rows = new Map();
+/** Recording key → its row, kept across refreshes so a focused Stop button is not replaced every second. */
+const recRows = new Map();
 let blockedKey = null;
 let ticker = null;
 
@@ -81,10 +84,19 @@ function refresh() {
 function render() {
   const app = state.app || {};
   const pill = $("app-status");
-  pill.textContent = app.ok ? `Connected · ${app.port}` : app.error ? "Extension error" : "Downloader not running";
-  pill.title = app.ok ? `Version ${app.version || "?"}` : app.error || "";
+  pill.textContent = app.ok
+    ? `Connected · ${app.port}`
+    : app.outdated
+      ? "Update needed"
+      : app.error
+        ? "Extension error"
+        : "Downloader not running";
+  pill.title = app.ok ? `Version ${app.version || "?"}` : app.outdated ? `Older app on port ${app.port}` : app.error || "";
   pill.className = `pill ${app.ok ? "ok" : "bad"}`;
-  $("app-hint").hidden = !!app.ok;
+  $("app-hint").hidden = !!app.ok || !!app.outdated;
+  $("app-outdated").hidden = !!app.ok || !app.outdated;
+  // Without host access (Firefox grants it separately) the background sees no requests at all.
+  $("host-access").hidden = state.hostAccess !== false;
   if (state.settings) renderSettings(state.settings);
   if (!httpTab) return;
   renderItems(state.items || []);
@@ -115,6 +127,8 @@ function renderItems(items) {
   });
   $("media-count").textContent = shown.length ? String(shown.length) : "";
   $("empty").hidden = shown.length > 0;
+  // What loaded before the extension was installed or updated was never seen; a reload replays it.
+  $("reload-hint").hidden = shown.length > 0 || mediaSite;
   $("clear").hidden = shown.length === 0;
 }
 
@@ -139,6 +153,14 @@ function makeRow() {
   });
   row.mp4Wrap = el("label", { className: "check", title: "Convert the stream to MP4 once downloaded", hidden: true }, row.mp4, "MP4");
   row.download = el("button", { type: "button", className: "btn primary", textContent: "Download" });
+  // Fallback for servers that refuse the app (TLS fingerprint, bot checks): the page itself fetches the media.
+  row.via = el("button", {
+    type: "button",
+    className: "btn",
+    textContent: "Via browser",
+    title: "Download inside the page, for sites that block the downloader; progress shows under Record",
+  });
+  row.viaTitle = row.via.title;
   row.copy = el("button", { type: "button", className: "btn", textContent: "Copy URL" });
   row.block = el("button", { type: "button", className: "btn ghost", textContent: "Block host" });
   row.msg = el("p", { className: "msg" });
@@ -151,9 +173,10 @@ function makeRow() {
     row.url,
     row.quality,
     row.note,
-    el("div", { className: "actions" }, row.download, row.copy, row.block, row.mp4Wrap, row.msg),
+    el("div", { className: "actions" }, row.download, row.via, row.copy, row.block, row.mp4Wrap, row.msg),
   );
   row.download.addEventListener("click", () => download(row));
+  row.via.addEventListener("click", () => viaBrowser(row));
   row.copy.addEventListener("click", () => copy(row));
   row.block.addEventListener("click", () => block(row));
   return row;
@@ -171,7 +194,9 @@ function updateRow(row, item) {
 
   const master = hls?.kind === "master" && Array.isArray(hls.variants) ? hls : null;
   const best = master?.variants[0];
-  const chips = [[item.kind === "hls" ? "HLS" : String(item.format || "file").toUpperCase(), item.kind === "hls" ? "hls" : ""]];
+  const stream = item.kind === "hls" || item.kind === "dash";
+  const chips = [[stream ? item.kind.toUpperCase() : String(item.format || "file").toUpperCase(), stream ? "hls" : ""]];
+  if (item.inline) chips.push(["Inline", ""]);
   if (item.size > 0) chips.push([formatBytes(item.size), ""]);
   if (hls?.duration > 0 && !hls.live) chips.push([formatDuration(hls.duration), ""]);
   if (best && (best.resolution || best.height)) chips.push([best.resolution ? best.resolution.replace("x", "×") : `${best.height}p`, ""]);
@@ -184,11 +209,19 @@ function updateRow(row, item) {
     row.chips.replaceChildren(...chips.map(([text, cls]) => el("span", { className: `chip ${cls}`, textContent: text })));
   }
 
-  row.url.textContent = item.url;
+  // An inline playlist was built by the page (blob:/data:); its URL is only the frame it came from.
+  row.url.textContent = item.inline ? `Playlist built by the page · ${item.url}` : item.url;
   row.url.title = item.url;
 
-  // Masters with separate audio go to the downloader whole: it picks the best video and merges the audio.
-  const variants = master && !master.separateAudio ? master.variants : [];
+  // Masters with separate audio go to the downloader whole (it merges the audio), so a choice there is a height:
+  // only variants with one are offered, one per height. Inline masters can only be sent whole.
+  const heights = new Set();
+  const variants = !master || item.inline
+    ? []
+    : master.separateAudio
+      ? master.variants.filter((v) => v.height > 0 && !heights.has(v.height) && heights.add(v.height))
+      : master.variants;
+  row.variants = variants;
   const qualityKey = variants.map((v) => v.url).join("\n");
   if (qualityKey !== row.qualityKey) {
     const chosen = row.quality.value;
@@ -204,14 +237,21 @@ function updateRow(row, item) {
   const note = hls?.drm
     ? "DRM-protected (SAMPLE-AES or a key system): it can't be downloaded."
     : master?.separateAudio
-      ? "Best quality, audio merged by the downloader."
-      : hls?.live
-        ? "Live stream: the downloader records it as it plays."
-        : "";
+      ? "Separate audio: the downloader merges it with the chosen quality."
+      : item.kind === "dash"
+        ? "DASH stream: the downloader fetches it and merges the audio."
+        : hls?.live
+          ? "Live stream: the downloader records it as it plays."
+          : "";
   row.note.textContent = note;
   row.note.hidden = !note;
   row.download.disabled = !!hls?.drm;
   row.download.title = hls?.drm ? note : "";
+  // The page downloads only what it can fetch once and whole: not inline, DASH, live or DRM streams, nor a file its
+  // server lets only the <video> read (no CORS).
+  row.via.hidden = !!item.inline || !(item.kind === "hls" || item.kind === "file") || item.pageCanFetch === false;
+  row.via.disabled = !!(hls?.drm || hls?.live);
+  row.via.title = hls?.live ? "Live streams can't be downloaded through the browser." : hls?.drm ? note : row.viaTitle;
   row.mp4Wrap.hidden = item.kind !== "hls";
   if (!row.mp4Set) row.mp4.checked = state.settings?.convertToMp4 !== false;
 
@@ -222,6 +262,12 @@ function updateRow(row, item) {
 /** The selected variant URL, or the item's own URL. */
 function chosenUrl(row) {
   return (!row.quality.hidden && row.quality.value) || row.item.url;
+}
+
+/** The chosen variant's height for a separate-audio master (sent with the master URL); null for "Best". */
+function chosenHeight(row) {
+  if (!row.item.hls?.separateAudio || row.quality.hidden) return null;
+  return row.variants.find((v) => v.url === row.quality.value)?.height || null;
 }
 
 /** The typed file name, cleaned and with an extension; the suggested name when left empty. */
@@ -235,13 +281,29 @@ function chosenName(row) {
 async function download(row) {
   row.download.disabled = true;
   say(row.msg, "Sending…");
-  const reply = await ask({ cmd: "SEND", tabId: tab.id, id: row.item.id, url: chosenUrl(row), filename: chosenName(row), mp4: row.mp4.checked });
+  const height = chosenHeight(row);
+  const msg = { cmd: "SEND", tabId: tab.id, id: row.item.id, filename: chosenName(row), mp4: row.mp4.checked };
+  // A height goes with the master URL; otherwise the chosen variant (or the item itself) is sent.
+  if (height) Object.assign(msg, { url: row.item.url, height });
+  else msg.url = chosenUrl(row);
+  const reply = await ask(msg);
   row.download.disabled = !!row.item.hls?.drm;
   report(row.msg, reply, "Sent to the downloader.");
 }
 
+async function viaBrowser(row) {
+  row.via.disabled = true;
+  say(row.msg, "Starting…");
+  const reply = await ask({ cmd: "BROWSER_DL", tabId: tab.id, id: row.item.id, url: chosenUrl(row), filename: chosenName(row) });
+  row.via.disabled = !!(row.item.hls?.drm || row.item.hls?.live);
+  report(row.msg, reply, "Downloading in the page; progress shows under Record. Keep the tab open.");
+  if (reply.ok) refresh();
+}
+
 async function copy(row) {
   try {
+    // An inline item's playlist text stays in the background (GET_STATE leaves it out), so its
+    // frame URL is what is copied.
     await navigator.clipboard.writeText(chosenUrl(row));
     say(row.msg, "URL copied.", "ok");
   } catch (e) {
@@ -321,35 +383,99 @@ function videoRow(v, n) {
     button.disabled = true;
     const reply = await ask({ cmd: "MSR_START", tabId: tab.id, frameId: v.frameId, index: v.index });
     button.disabled = false;
-    report($("rec-msg"), reply, `Recording video ${n + 1}. Let it play to the end or press Stop.`);
+    const muted = reply.silent
+      ? " Without sound: the browser won't unmute it before the page is clicked. Unmute it on the page to record its sound from then on."
+      : v.muted
+        ? " It was muted: it plays at near-zero volume so its sound is recorded, and is muted again after."
+        : "";
+    report($("rec-msg"), reply, `Recording video ${n + 1}. Let it play to the end or press Stop.${muted}`);
     if (reply.ok) refresh();
   });
   return el("li", {}, el("span", { className: "label", title: label, textContent: label }), button);
 }
 
-/** The recordings of the tab, or that "Capture from start" is armed and waits for the video to play. */
+/**
+ * The recordings and browser downloads of the tab, or that "Capture from start" is armed and waits for the video to
+ * play. Browser downloads have their own progress and Stop; the shared Stop button ends the recordings.
+ */
 function renderRecordings(recs, armed) {
+  recs = recs.filter((r) => r && typeof r.key === "string");
   $("recs").hidden = recs.length === 0 && !armed;
   $("armed").hidden = !armed || recs.length > 0;
-  $("rec-list").replaceChildren(
-    ...recs.map((r) => {
-      const title = `${r.mode === "msr" ? "Playback" : "Buffers"} · ${r.title || "Untitled"}`;
-      const tracks = Array.isArray(r.tracks) ? r.tracks.length : Number(r.tracks) || 0;
-      return el(
-        "li",
-        {},
-        el("span", { className: "label", title, textContent: title }),
-        el("span", { textContent: `${formatBytes(Number(r.bytes) || 0)} · ${tracks} ${tracks === 1 ? "track" : "tracks"}` }),
-      );
-    }),
-  );
+  const list = $("rec-list");
+  const keep = new Set(recs.map((r) => r.key));
+  for (const [key, row] of recRows) {
+    if (!keep.has(key)) {
+      row.li.remove();
+      recRows.delete(key);
+    }
+  }
+  recs.forEach((r, i) => {
+    let row = recRows.get(r.key);
+    if (!row) {
+      row = makeRecRow(r.key);
+      recRows.set(r.key, row);
+    }
+    updateRecRow(row, r);
+    if (list.children[i] !== row.li) list.insertBefore(row.li, list.children[i] || null);
+  });
+  $("stop").hidden = !armed && !recs.some((r) => r.mode !== "browser");
   $("speed-wrap").hidden = !recs.some((r) => r.mode === "mse");
-  // Byte counts only move while something records, so poll only then.
-  if (recs.length && !ticker) ticker = setInterval(refresh, 1000);
-  else if (!recs.length && ticker) {
+  // Byte counts only move while something records (a failed browser download stays only to show why), so poll only then.
+  const moving = recs.some((r) => !r.error);
+  if (moving && !ticker) ticker = setInterval(refresh, 1000);
+  else if (!moving && ticker) {
     clearInterval(ticker);
     ticker = null;
   }
+}
+
+function makeRecRow(key) {
+  const row = {};
+  row.label = el("span", { className: "label" });
+  row.progress = el("progress", { max: 1, value: 0, hidden: true });
+  row.info = el("span");
+  row.stop = el("button", { type: "button", className: "btn small danger", textContent: "Stop", hidden: true });
+  row.stop.addEventListener("click", async () => {
+    row.stop.disabled = true;
+    // A failed download's button dismisses it.
+    const failed = row.failed;
+    const reply = await ask({ cmd: "BROWSER_DL_CANCEL", tabId: tab.id, key });
+    row.stop.disabled = false;
+    report($("rec-msg"), reply, failed ? "" : "Browser download stopped.");
+    refresh();
+  });
+  row.li = el("li", {}, row.label, row.progress, row.info, row.stop);
+  return row;
+}
+
+/** Browser downloads show how far they got (done of total, as the page reports it); recordings their bytes. */
+function updateRecRow(row, r) {
+  const browser = r.mode === "browser";
+  const kind = browser ? "Browser download" : r.mode === "msr" ? "Playback" : "Buffers";
+  const title = `${kind} · ${r.title || "Untitled"}`;
+  row.label.textContent = title;
+  row.label.title = title;
+  const bytes = formatBytes(Number(r.bytes) || 0);
+  const tracks = Array.isArray(r.tracks) ? r.tracks.length : Number(r.tracks) || 0;
+  const done = Math.max(0, Number(r.done) || 0);
+  const total = Math.max(0, Number(r.total) || 0);
+  const percent = browser && total > 0 ? Math.min(100, Math.floor((done / total) * 100)) : null;
+  // A browser download that failed was thrown away; it stays to say why until dismissed.
+  row.failed = browser && typeof r.error === "string" && r.error !== "";
+  row.info.textContent = row.failed
+    ? `Failed: ${r.error}`
+    : percent !== null
+      ? `${percent}% · ${bytes}`
+      : `${bytes} · ${tracks} ${tracks === 1 ? "track" : "tracks"}`;
+  row.info.className = row.failed ? "msg err" : "";
+  row.progress.hidden = percent === null || row.failed;
+  row.progress.max = total || 1;
+  row.progress.value = Math.min(done, total);
+  row.progress.setAttribute("aria-label", `${title}: ${percent ?? 0}%`);
+  row.stop.hidden = !browser;
+  row.stop.textContent = row.failed ? "Dismiss" : "Stop";
+  row.stop.setAttribute("aria-label", `${row.failed ? "Dismiss" : "Stop"} ${title}`);
 }
 
 // ---- Settings ----
@@ -412,7 +538,7 @@ async function init() {
   $("tab-ui").hidden = !httpTab;
 
   if (httpTab) {
-    const mediaSite = isMediaSiteHost(hostOf(tab.url));
+    mediaSite = isMediaSiteHost(hostOf(tab.url));
     $("send-page").classList.toggle("primary", mediaSite);
     $("page-note").hidden = !mediaSite;
     if (mediaSite) $("empty").textContent = "Streams aren't collected on this site: use Download this page.";
@@ -432,6 +558,16 @@ async function init() {
     if (reply.ok) say($("media-msg"), "");
     else report($("media-msg"), reply, "");
     refresh();
+  });
+  $("reload").addEventListener("click", () => chrome.tabs.reload(tab.id).catch(() => {}));
+  $("grant").addEventListener("click", async () => {
+    // Called straight from the click: browsers only show the prompt during a user gesture.
+    const granted = await chrome.permissions.request({ origins: ["<all_urls>"] }).catch((e) => {
+      say($("grant-msg"), `Couldn't ask for access: ${e?.message || e}`, "err");
+      return null;
+    });
+    if (granted === false) say($("grant-msg"), "Access was not granted.", "err");
+    if (granted) refresh();
   });
   $("rescan").addEventListener("click", () => {
     say($("rec-msg"), "");

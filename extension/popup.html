@@ -13,6 +13,12 @@
     <span id="app-status" class="pill" role="status">Checking…</span>
   </header>
   <p id="app-hint" class="hint warn" hidden>Start the Endo's Unified Downloader desktop app. Downloads are sent to it; until it runs they fail with an error.</p>
+  <p id="app-outdated" class="hint warn" hidden>An older Endo's Unified Downloader is running — restart it after updating.</p>
+  <div id="host-access" class="grant" hidden>
+    <p class="hint warn">The extension can't see this browser's requests, so it finds no media.</p>
+    <button id="grant" type="button" class="btn small">Allow access to all sites</button>
+    <p id="grant-msg" class="msg" role="status" aria-live="polite"></p>
+  </div>
 
   <p id="unsupported" class="hint" hidden>Nothing can be detected on this tab. Browser pages (chrome://, the extension store, file://, new tab) don't let extensions see their requests. Open a normal http(s) page.</p>
 
@@ -29,6 +35,7 @@
         <button id="clear" type="button" class="btn small ghost">Clear list</button>
       </div>
       <p id="empty" class="hint" hidden>No media found yet. Play the video, then reopen this popup. For streams that can't be fetched (blob or MSE players), use Record below.</p>
+      <p id="reload-hint" class="note" hidden>Reload the page to detect what already loaded. <button id="reload" type="button" class="btn small ghost">Reload page</button></p>
       <p id="media-msg" class="msg" role="status" aria-live="polite"></p>
       <ul id="items" class="items"></ul>
     </section>
@@ -38,7 +45,7 @@
         <h2 id="rec-title">Record</h2>
         <button id="rescan" type="button" class="btn small ghost">Rescan videos</button>
       </div>
-      <p class="note">Capture from start saves the stream's buffers as the player loads them; speed it up to finish sooner. Record playback captures an unmuted video in real time.</p>
+      <p class="note">Capture from start saves the stream's buffers as the player loads them; speed it up to finish sooner. Record playback captures a video in real time; a muted one plays at near-zero volume while recording, then its volume is restored. Downloads made via the browser show here too.</p>
       <button id="arm" type="button" class="btn">Capture from start (reloads page)</button>
       <p id="rec-msg" class="msg" role="status" aria-live="polite"></p>
       <p id="no-videos" class="note" hidden>No video elements on this page yet. Start the player, then Rescan.</p>

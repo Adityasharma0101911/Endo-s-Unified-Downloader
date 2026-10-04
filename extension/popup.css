@@ -26,7 +26,7 @@ body { padding: 10px 12px 12px; }
 
 [hidden] { display: none !important; }
 
-h1 { font-size: 14px; font-weight: 600; margin: 0; flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+h1 { font-size: 17px; font-weight: 600; margin: 0; flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 h2 { font-size: 12px; font-weight: 600; margin: 0; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
 h3 { font-size: 12px; font-weight: 600; margin: 12px 0 4px; color: var(--muted); }
 
@@ -118,6 +118,9 @@ input[type="checkbox"] { margin: 0; padding: 0; justify-self: start; accent-colo
   border-radius: 6px;
 }
 .rows .label { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rows progress { flex: none; width: 70px; accent-color: var(--accent); }
+.grant .btn { margin-top: 6px; }
+#reload-hint .btn { margin-left: 4px; }
 #videos { margin-top: 8px; }
 .recs { margin-top: 8px; }
 .rec-controls { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-top: 6px; }
