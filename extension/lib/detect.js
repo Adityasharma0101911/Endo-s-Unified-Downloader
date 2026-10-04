@@ -420,3 +420,14 @@ export function formatDuration(seconds) {
   const secs = String(total % 60).padStart(2, "0");
   return hours ? `${hours}:${String(minutes).padStart(2, "0")}:${secs}` : `${minutes}:${secs}`;
 }
+
+/** Whether version `a` ("1.4.0") is newer than `b`, part by part as numbers; anything that is not dot-separated numbers is false. */
+export function newerVersion(a, b) {
+  const parse = (v) => (/^\d+(\.\d+)*$/.test(String(v ?? "").trim()) ? String(v).trim().split(".").map(Number) : null);
+  const [x, y] = [parse(a), parse(b)];
+  if (!x || !y) return false;
+  for (let i = 0; i < Math.max(x.length, y.length); i++) {
+    if ((x[i] ?? 0) !== (y[i] ?? 0)) return (x[i] ?? 0) > (y[i] ?? 0);
+  }
+  return false;
+}

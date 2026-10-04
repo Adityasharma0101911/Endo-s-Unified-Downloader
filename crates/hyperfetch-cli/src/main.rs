@@ -15,6 +15,7 @@ use hyperfetch_core::ingest::{decode_text, descriptor_client, http_url, ingest, 
 use hyperfetch_core::media::{find_ffmpeg_path, is_supported_media_site, BrowserCookieSource};
 use hyperfetch_core::resolver::SmartResolver;
 use hyperfetch_core::state::DownloadState;
+use hyperfetch_core::updater;
 use hyperfetch_core::verify::{self, BuildVerificationResult};
 use indicatif::HumanBytes;
 use url::Url;
@@ -28,6 +29,8 @@ use download::{
 fn main() {
     // Started again to stop a live recording, this only does that.
     hyperfetch_core::media::serve_ctrl_c();
+    // What an earlier update left behind (the old programs) can be deleted once they have exited.
+    updater::cleanup_old();
     let args = Args::parse();
     let code = run_detached(app(args)).unwrap_or_else(|e| {
         stderr_line(&format!("error: cannot start the async runtime: {}", e));
@@ -55,6 +58,9 @@ async fn app(args: Args) -> i32 {
 
     if args.history {
         return show_history().await;
+    }
+    if args.update {
+        return update(args.proxy.as_deref()).await;
     }
     if let Some(path) = &args.verify {
         return verify_file(&args, path, &ui, &shutdown).await;
@@ -563,6 +569,41 @@ fn stopped_at(entry: &HistoryEntry) -> String {
     match entry.downloaded_bytes.saturating_mul(100).checked_div(entry.file_size) {
         Some(percent) => format!("Stopped {}%", percent.min(100)),
         None => "Stopped".to_string(),
+    }
+}
+
+/// `--update`: installs the newest release when there is one.
+async fn update(proxy: Option<&str>) -> i32 {
+    stdout_line("Checking for updates…");
+    let update = match updater::check(proxy).await {
+        Ok(Some(update)) => update,
+        Ok(None) => {
+            stdout_line(&format!("Endo's Unified Downloader {} is the latest version.", env!("CARGO_PKG_VERSION")));
+            return EXIT_OK;
+        }
+        Err(e) => {
+            stderr_line(&format!("error: {}", e));
+            return EXIT_FAILED;
+        }
+    };
+    stdout_line(&format!("Updating to {}…", update.version));
+    match updater::install(proxy, &update, updater::Program::Cli).await {
+        Ok(installed) => {
+            let names: Vec<_> =
+                installed.replaced.iter().filter_map(|p| p.file_name()).map(|n| n.to_string_lossy()).collect();
+            let extension = if installed.extension { " and the browser extension" } else { "" };
+            stdout_line(&format!(
+                "Updated to {}: replaced {}{}. Restart the app to use it.",
+                update.version,
+                names.join(", "),
+                extension
+            ));
+            EXIT_OK
+        }
+        Err(e) => {
+            stderr_line(&format!("error: {}", e));
+            EXIT_FAILED
+        }
     }
 }
 

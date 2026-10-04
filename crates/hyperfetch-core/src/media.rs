@@ -1082,7 +1082,7 @@ fn expected_sha256<'a>(sums: &'a str, asset: &str) -> Option<&'a str> {
     })
 }
 
-async fn http_get(client: &reqwest::Client, url: &str, timeout: Duration) -> Result<reqwest::Response, String> {
+pub(crate) async fn http_get(client: &reqwest::Client, url: &str, timeout: Duration) -> Result<reqwest::Response, String> {
     let resp = client
         .get(url)
         .timeout(timeout)
@@ -1283,7 +1283,7 @@ fn install_onedir(bin_dir: &Path, tag: &str, asset: &str, bytes: &[u8]) -> Resul
 /// file in it cannot be renamed either), and a program just ended (a killed ffmpeg) holds its
 /// files until Windows has closed them. Gives up at once once `to` exists (another process
 /// installed the same release). Blocking.
-fn rename_patiently(from: &Path, to: &Path) -> std::io::Result<()> {
+pub(crate) fn rename_patiently(from: &Path, to: &Path) -> std::io::Result<()> {
     const ERROR_SHARING_VIOLATION: i32 = 32;
     let mut pause = Duration::from_millis(100);
     // 100 + 200 + 400 + 800 ms of waiting at most.
@@ -1313,7 +1313,7 @@ fn windows_tar() -> PathBuf {
 }
 
 /// The tar [`unpack`] runs: [`windows_tar`] on Windows, the system's elsewhere.
-fn system_tar() -> PathBuf {
+pub(crate) fn system_tar() -> PathBuf {
     #[cfg(windows)]
     return windows_tar();
     #[cfg(not(windows))]
@@ -1323,7 +1323,7 @@ fn system_tar() -> PathBuf {
 }
 
 /// `program`, started without a console window on Windows.
-fn quiet_command(program: &Path) -> std::process::Command {
+pub(crate) fn quiet_command(program: &Path) -> std::process::Command {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -1352,7 +1352,7 @@ fn runs(program: &Path) -> bool {
 /// Extracts `archive` (a zip, or a tar compressed as tar can tell) into `into` with `tar` (see
 /// [`system_tar`]), which refuses entries that would land outside `into`: only `members` if any
 /// are named, else everything. Blocking.
-fn unpack(tar: &Path, archive: &Path, into: &Path, members: &[String]) -> std::io::Result<()> {
+pub(crate) fn unpack(tar: &Path, archive: &Path, into: &Path, members: &[String]) -> std::io::Result<()> {
     let output =
         quiet_command(tar).arg("-xf").arg(archive).arg("-C").arg(into).args(members).stdin(Stdio::null()).output()?;
     if output.status.success() {
@@ -1410,7 +1410,7 @@ fn is_running(exe: &Path) -> bool {
 
 /// Client for installing yt-dlp and ffmpeg: a connection that goes silent fails after
 /// [`INSTALL_STALL_TIMEOUT`], one that is slow but receiving goes on.
-fn http_client(proxy: Option<&str>) -> Result<reqwest::Client, String> {
+pub(crate) fn http_client(proxy: Option<&str>) -> Result<reqwest::Client, String> {
     let mut builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(15))
         .read_timeout(INSTALL_STALL_TIMEOUT)
@@ -1718,7 +1718,7 @@ fn remove_stale_ffmpeg_files(bin_dir: &Path) {
 }
 
 /// A name no other call in any process uses: time, process id and a counter.
-fn unique_suffix() -> String {
+pub(crate) fn unique_suffix() -> String {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
     format!("{nanos:x}-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed))
@@ -1837,7 +1837,7 @@ async fn ytdlp_version(bin: &Path, work_dir: &Path, cache_file: Option<&Path>) -
 
 /// The numbers of a yt-dlp version ("2025.11.12", nightly "2025.11.12.232810"), which compare in
 /// release order; `None` unless it has at least year, month and day.
-fn version_parts(version: &str) -> Option<Vec<u32>> {
+pub(crate) fn version_parts(version: &str) -> Option<Vec<u32>> {
     let parts = version.trim().split('.').map(|p| p.parse().ok()).collect::<Option<Vec<u32>>>()?;
     (parts.len() >= 3).then_some(parts)
 }
@@ -4892,7 +4892,7 @@ async fn download_with(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn line(status: &str, downloaded: &str, total: &str, estimate: &str, stream: &str) -> String {
@@ -5521,7 +5521,7 @@ bbd8671c6c05eaa3ec29d690695aebadff0871faa3efe9051581afbf3c01e80e  ffmpeg-master-
 
     /// Serves each of `files` (path, body) over HTTP; `stalled` promises a megabyte, sends a
     /// kilobyte and goes silent; anything else is a 404. Returns the base URL.
-    async fn serve_files(files: Vec<(String, Vec<u8>)>, stalled: Option<String>) -> String {
+    pub(crate) async fn serve_files(files: Vec<(String, Vec<u8>)>, stalled: Option<String>) -> String {
         use tokio::io::AsyncWriteExt;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -5576,7 +5576,7 @@ bbd8671c6c05eaa3ec29d690695aebadff0871faa3efe9051581afbf3c01e80e  ffmpeg-master-
         std::fs::read(archive).unwrap()
     }
 
-    fn names_of(dir: &Path) -> Vec<String> {
+    pub(crate) fn names_of(dir: &Path) -> Vec<String> {
         let mut names: Vec<String> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
         names.sort();
         names
