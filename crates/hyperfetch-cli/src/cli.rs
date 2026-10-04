@@ -191,6 +191,11 @@ pub struct Args {
     /// directly, so it cannot be combined with --proxy, --header or cookies
     #[arg(long = "repair", requires = "verify")]
     pub repair: bool,
+
+    /// Install the newest signed release from GitHub over this program (Windows; with --proxy if
+    /// given), and the GUI and browser extension next to it, then exit
+    #[arg(long = "update", conflicts_with_all = ["urls", "input_file", "verify", "repair", "history"])]
+    pub update: bool,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug)]
@@ -366,6 +371,11 @@ mod tests {
         assert!(parse(&["--proxy", "ftp://x", "u"]).is_err());
         assert!(parse(&["--checksum", "crc32:abcd", "u"]).is_err());
         assert!(parse(&["--history", "u"]).is_err());
+        assert!(parse(&["--update"]).unwrap().update);
+        assert!(parse(&["--update", "--proxy", "socks5h://127.0.0.1:9050"]).is_ok());
+        for other in [&["u"][..], &["-i", "list.txt"], &["--verify", "f"], &["--verify", "f", "--repair"], &["--history"]] {
+            assert!(parse(&[&["--update"][..], other].concat()).is_err(), "{other:?}");
+        }
         // The repair cannot honor these, so it must not silently connect without them.
         assert!(parse(&["--verify", "f", "--repair", "--proxy", "socks5h://127.0.0.1:9050"]).is_err());
         assert!(parse(&["--verify", "f", "--repair", "--header", "Bearer t"]).is_err());

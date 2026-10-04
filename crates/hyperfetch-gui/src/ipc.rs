@@ -9,7 +9,7 @@ use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 use eframe::egui;
-use hyperfetch_core::engine;
+use hyperfetch_core::{engine, updater};
 use serde_json::json;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -231,7 +231,7 @@ pub fn spawn(events: mpsc::Sender<AppEvent>, ctx: egui::Context, rt: &tokio::run
                 Ok(listener) => {
                     tracing::info!("Local IPC listener bound on 127.0.0.1:{}", port);
                     let recordings = Recordings::new(std::env::temp_dir().join("endos-recordings"));
-                    let server = Arc::new(Server { port, events, ctx, recordings });
+                    let server = Arc::new(Server { port, events, ctx, recordings, app_dir: updater::app_dir() });
                     // What an earlier run left recording is joined before this one records.
                     for finished in server.recordings.recover().await {
                         server.send(AppEvent::Recorded(finished));
@@ -262,12 +262,14 @@ async fn listen(listener: TcpListener, server: Arc<Server>) {
     }
 }
 
-/// What the API answers from: its port, the recordings open, and the way to the UI thread.
+/// What the API answers from: its port, the recordings open, the way to the UI thread, and the
+/// app's folder, whose `extension` folder an update replaces.
 struct Server {
     port: u16,
     events: mpsc::Sender<AppEvent>,
     ctx: egui::Context,
     recordings: Recordings,
+    app_dir: Option<PathBuf>,
 }
 
 impl Server {
@@ -297,7 +299,15 @@ impl Server {
             Refusal::Disk(why) => Response::error("500 Internal Server Error", allow_origin.clone(), &why),
         };
         match (method.as_str(), path.as_str()) {
-            ("GET", "/ping") => reply("200 OK", json!({"app": APP, "version": env!("CARGO_PKG_VERSION"), "port": self.port})),
+            ("GET", "/ping") => {
+                let mut ping = json!({"app": APP, "version": env!("CARGO_PKG_VERSION"), "port": self.port});
+                // The version of the extension next to the app (read anew, as an update may have
+                // replaced it), so an older one loaded from there reloads itself.
+                if let Some(version) = self.app_dir.as_deref().and_then(updater::extension_version) {
+                    ping["extension"] = version.into();
+                }
+                reply("200 OK", ping)
+            }
             ("POST", "/add") => match parse_add(&body) {
                 Ok(payload) => {
                     self.send(AppEvent::RemoteAdd(payload));
@@ -507,7 +517,8 @@ mod tests {
 
     fn server(root: &Path) -> (Server, mpsc::Receiver<AppEvent>) {
         let (events, received) = mpsc::channel();
-        let server = Server { port: 49152, events, ctx: egui::Context::default(), recordings: Recordings::new(root.to_path_buf()) };
+        let recordings = Recordings::new(root.to_path_buf());
+        let server = Server { port: 49152, events, ctx: egui::Context::default(), recordings, app_dir: Some(root.to_path_buf()) };
         (server, received)
     }
 
@@ -594,6 +605,13 @@ mod tests {
         let response = exchange(&server, &request("GET", "/ping", Some("chrome-extension://abc"), None)).await;
         assert!(response.contains("Content-Type: application/json\r\n") && response.contains("Connection: close\r\n"), "{response}");
         let expected = json!({"app": "endos-unified-downloader", "version": env!("CARGO_PKG_VERSION"), "port": 49152});
+        assert_eq!(parts(&response), ("HTTP/1.1 200 OK", expected));
+
+        // With the extension next to the app, its version too, for the extension to reload when older.
+        std::fs::create_dir(root.path().join("extension")).unwrap();
+        std::fs::write(root.path().join("extension").join("manifest.json"), r#"{"version": "1.4.0"}"#).unwrap();
+        let response = exchange(&server, &request("GET", "/ping", Some("chrome-extension://abc"), None)).await;
+        let expected = json!({"app": "endos-unified-downloader", "version": env!("CARGO_PKG_VERSION"), "port": 49152, "extension": "1.4.0"});
         assert_eq!(parts(&response), ("HTTP/1.1 200 OK", expected));
 
         let response = exchange(&server, &request("GET", "/ping", Some("https://page.example"), None)).await;

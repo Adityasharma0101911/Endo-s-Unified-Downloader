@@ -1671,6 +1671,7 @@ dependencies = [
  "percent-encoding",
  "quick-xml 0.37.5",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "sha1",

@@ -290,6 +290,18 @@ The service downloads every line of the queue, two at a time, and then exits. Fi
 
 ---
 
+## Updates
+
+- **Checked at startup:** the GUI asks this repository's GitHub releases for the newest version (through the proxy in Advanced options, if set) and, when it is newer, shows "Version X.Y.Z is available" with Update and restart and What's new. Turn it off with "Check for updates at startup" in Advanced options; "Check now" next to it checks at once. Nothing is sent but that request.
+- **Command line:** `Endos-Unified-Downloader-CLI --update` checks and installs (through `--proxy` if given). The CLI never checks on its own.
+- **Signed releases only:** a release is installed only when its `SHA256SUMS` carries a valid signature from the maintainer's key, whose public half is built into the app, and every file matches its SHA-256 there. The list also names its version, so an older release cannot be offered as a new one. Whoever takes over the GitHub account or the download servers cannot make the app install anything else; a release that fails a check changes nothing.
+- **What is replaced:** the GUI and the CLI in the app's folder (whichever of them are there) and the `extension/` folder next to them. The GUI saves its queue, finishes live recordings and restarts as the new version. The previous programs are kept as `.old.exe` until the next start deletes them, and a swap that fails puts them back.
+- **Windows only:** elsewhere What's new opens the release page; on Linux pull and run `./install.sh` again.
+- **Browser extension:** when it was loaded from the `extension/` folder next to the app, it reloads itself once the app reports a newer version there.
+- **From 1.3.0:** 1.3.0 and earlier have no updater, so download the first release that has one from the [releases page](https://github.com/Adityasharma0101911/Endo-s-Unified-Downloader/releases) by hand; it updates itself from then on.
+
+---
+
 ## Browser extension
 
 `extension/` is a Manifest V3 extension for Chrome and Edge (121 or later) and Firefox (128 or later) that sends the videos of a page to the running GUI. It needs no build step.

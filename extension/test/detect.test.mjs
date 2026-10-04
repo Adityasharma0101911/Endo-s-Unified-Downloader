@@ -8,6 +8,7 @@ import {
   isAdHost,
   isMediaSiteHost,
   mediaUrlFormat,
+  newerVersion,
   parseM3u8,
   passesSizeFilter,
   rangedVideoCandidate,
@@ -300,4 +301,17 @@ test("parseM3u8 lists the hosts of segments, keys and init sections, and a maste
   );
   assert.deepEqual(master.subtitles, [{ url: "https://cdn.example/v/subs/en.m3u8", name: "English", language: "en" }]);
   assert.deepEqual(master.audio, []);
+});
+
+test("newerVersion compares numeric dot parts and is false for anything else", () => {
+  assert.equal(newerVersion("1.4.0", "1.3.0"), true);
+  assert.equal(newerVersion("1.10.0", "1.9.9"), true);
+  assert.equal(newerVersion("2.0", "1.9.9"), true);
+  assert.equal(newerVersion("1.3.0", "1.3.0"), false);
+  assert.equal(newerVersion("1.3", "1.3.0"), false);
+  assert.equal(newerVersion("1.2.9", "1.3.0"), false);
+  for (const bad of ["", "v1.4.0", "1.4.0-beta", "1..4", "1.4.", null, undefined]) {
+    assert.equal(newerVersion(bad, "1.0.0"), false, String(bad));
+    assert.equal(newerVersion("9.9.9", bad), false, String(bad));
+  }
 });

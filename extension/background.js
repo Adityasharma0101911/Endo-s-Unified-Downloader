@@ -10,6 +10,7 @@ import {
   isAdHost,
   isMediaSiteHost,
   mediaUrlFormat,
+  newerVersion,
   parseM3u8,
   passesSizeFilter,
   rangedVideoCandidate,
@@ -442,10 +443,27 @@ async function ping(port) {
     const response = await fetch(`http://127.0.0.1:${port}/ping`, { signal: AbortSignal.timeout(800) });
     if (response.status === 404) return (await isOldApp(port)) ? { ok: false, outdated: true, port, version: null } : null;
     const body = await response.json();
-    return response.ok && body?.app === APP_NAME ? { ok: true, port, version: String(body.version ?? "") } : null;
+    if (!response.ok || body?.app !== APP_NAME) return null;
+    reloadIfNewer(body.extension).catch(() => {});
+    return { ok: true, port, version: String(body.version ?? "") };
   } catch {
     return null;
   }
+}
+
+/**
+ * The app's updater replaces the extension folder next to it and says which version is there; Chrome only runs it
+ * after a reload. Reloads once per offered version, so an extension loaded from another folder never loops.
+ */
+async function reloadIfNewer(offered) {
+  if (!newerVersion(offered, chrome.runtime.getManifest().version)) return;
+  const { reloadedFor } = await chrome.storage.local.get("reloadedFor");
+  if (reloadedFor === offered) return;
+  // A reload cuts off a request to the app and the recordings and browser downloads it relays: a later ping, once
+  // none is under way, reloads.
+  if (Object.values(await loadRecs()).some((rec) => rec.appId) || appCalls) return;
+  await chrome.storage.local.set({ reloadedFor: offered });
+  chrome.runtime.reload();
 }
 
 /** Whether the app from before /ping listens on `port`: it answers every preflight with exactly these methods. */
@@ -473,11 +491,24 @@ async function findApp() {
   return found;
 }
 
+/** Requests to the app under way (see callApp); the extension does not reload under one (see reloadIfNewer). */
+let appCalls = 0;
+
 /**
  * POSTs to the app and returns its JSON reply, throwing a readable error on failure. `verify` pings first (used
  * before sending cookies); otherwise the cached port is trusted, which keeps recording chunks to one request each.
  */
-async function callApp(path, { json, body, timeout = 10000, verify = false } = {}) {
+async function callApp(path, options) {
+  appCalls++;
+  try {
+    return await requestApp(path, options);
+  } finally {
+    appCalls--;
+  }
+}
+
+/** callApp's request. */
+async function requestApp(path, { json, body, timeout = 10000, verify = false } = {}) {
   let port = verify ? null : (await chrome.storage.session.get("appPort")).appPort;
   if (!APP_PORTS.includes(port)) {
     const app = await findApp();

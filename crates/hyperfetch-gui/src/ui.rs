@@ -134,6 +134,7 @@ pub fn render(app: &mut App, ui: &mut egui::Ui) {
                 .color(AMBER),
         );
     }
+    update_banner(app, ui);
     clipboard_banner(app, ui);
     listing_prompt(app, ui);
     ffmpeg_prompt(app, ui);
@@ -201,6 +202,36 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
             }
         });
     });
+}
+
+/// Offers the newer version a check found, until dismissed for this run. Installing in place
+/// works on Windows only; elsewhere What's new leads to the download.
+fn update_banner(app: &mut App, ui: &mut egui::Ui) {
+    let Some(update) = app.update.clone() else { return };
+    ui.add_space(6.0);
+    egui::Frame::none()
+        .fill(Color32::from_rgb(22, 27, 38))
+        .stroke(Stroke::new(1.0, GREEN))
+        .inner_margin(8.0)
+        .rounding(4.0)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let text =
+                    if app.updating { "Downloading the update…".to_string() } else { format!("Version {} is available.", update.version) };
+                ui.label(RichText::new(text).strong().color(GREEN));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add_enabled(!app.updating, egui::Button::new("x").small()).on_hover_text("Dismiss").clicked() {
+                        app.update = None;
+                    }
+                    if ui.button(RichText::new("What's new").size(11.0)).clicked() {
+                        ui.ctx().open_url(egui::OpenUrl::new_tab(&update.page));
+                    }
+                    if cfg!(windows) && ui.add_enabled(!app.updating, primary_button("Update and restart", BLUE)).clicked() {
+                        app.install_update();
+                    }
+                });
+            });
+        });
 }
 
 fn clipboard_banner(app: &mut App, ui: &mut egui::Ui) {
@@ -628,6 +659,15 @@ fn advanced_options(app: &mut App, ui: &mut egui::Ui) {
             "Wait until each finished file is on the disk before showing it as done. Slower; without it a \
              power loss right after a download finishes can damage the file (Verify detects that).",
         );
+    });
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut app.settings.check_updates, "Check for updates at startup").on_hover_text(
+            "Asks GitHub whether a newer release is out and offers it; nothing is installed unless you \
+             choose to, and only releases signed by the maintainer are.",
+        );
+        if ui.button(RichText::new("Check now").size(11.0)).clicked() {
+            app.check_for_update(true);
+        }
     });
     ui.label(RichText::new("Settings apply to downloads started or queued afterwards.").size(11.0).color(DIM));
 }

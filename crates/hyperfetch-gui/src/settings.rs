@@ -85,6 +85,9 @@ pub struct Settings {
     pub debrid_api_key: String,
     /// Debrid provider override ("real-debrid" or "alldebrid").
     pub debrid_provider: String,
+    /// Look for a newer release at launch (see `hyperfetch_core::updater::check`). On by default,
+    /// also for settings an older version saved.
+    pub check_updates: bool,
 }
 
 impl Default for Settings {
@@ -119,6 +122,7 @@ impl Default for Settings {
             proxy_pool: String::new(),
             debrid_api_key: String::new(),
             debrid_provider: String::new(),
+            check_updates: true,
         }
     }
 }
@@ -481,10 +485,12 @@ mod tests {
     fn new_defaults_leave_saved_choices_alone() {
         let defaults = Settings::default();
         assert_eq!((defaults.max_concurrent, defaults.fsync_on_complete, defaults.max_connections_per_host), (4, false, 64));
+        assert!(defaults.check_updates);
         // Saved by an older version: the user's own limit stays, the new settings take their defaults.
         let saved: Settings = serde_json::from_str(r#"{"max_concurrent": 2}"#).unwrap();
         assert_eq!((saved.max_concurrent, saved.fsync_on_complete, saved.max_connections_per_host), (2, false, 64));
-        let chosen = Settings { fsync_on_complete: true, max_connections_per_host: 8, ..defaults };
+        assert!(saved.check_updates, "updates are checked unless turned off");
+        let chosen = Settings { fsync_on_complete: true, max_connections_per_host: 8, check_updates: false, ..defaults };
         let json = serde_json::to_string(&chosen).unwrap();
         assert_eq!(serde_json::from_str::<Settings>(&json).unwrap(), chosen);
     }

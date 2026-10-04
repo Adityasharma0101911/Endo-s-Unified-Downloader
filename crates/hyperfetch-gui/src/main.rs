@@ -22,6 +22,7 @@ use hyperfetch_core::history::{DownloadHistoryManager, HistoryEntry};
 use hyperfetch_core::ingest::{self, Task};
 use hyperfetch_core::media;
 use hyperfetch_core::queue::{DownloadQueue, QueueItem};
+use hyperfetch_core::updater::{self, Installed, Update};
 use hyperfetch_core::verify::{self, BuildVerificationResult};
 use tokio::sync::{broadcast, Notify};
 use tokio::task::JoinHandle;
@@ -129,6 +130,11 @@ enum AppEvent {
     Recorded(recording::Finished),
     /// The notice saying where a recording was saved, or why it could not be joined.
     Merged(Result<String, String>),
+    /// What looking for a newer release found; `manual` when the user asked (Check now), which
+    /// says so also when there is none.
+    UpdateChecked { result: Result<Option<Update>, String>, manual: bool },
+    /// The update the user chose was installed (the app then restarts), or why not.
+    UpdateInstalled(Result<Installed, String>),
 }
 
 /// Handles to a running engine task.
@@ -268,10 +274,19 @@ struct App {
     /// The window was asked to close and stays open until the live recordings have finished
     /// their files (see [`stop_recordings`]).
     closing: bool,
+    /// A newer release offered in a banner, until the user dismisses it.
+    update: Option<Update>,
+    /// The offered update is being downloaded and installed.
+    updating: bool,
+    /// The task installing it, which closing the window waits for (see `on_exit`).
+    install_task: Option<JoinHandle<()>>,
+    /// The program to start once the window has closed: the new build an update installed. Read
+    /// by `main` after the window closes.
+    restart: Arc<Mutex<Option<PathBuf>>>,
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>, rt: tokio::runtime::Handle) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, rt: tokio::runtime::Handle, restart: Arc<Mutex<Option<PathBuf>>>) -> Self {
         apply_theme(&cc.egui_ctx);
         let settings = Settings::load();
         let (queue, queue_problem) = queue_store::load(&queue_store::path());
@@ -280,6 +295,12 @@ impl App {
             .ok();
         let mut app = Self::with(cc.egui_ctx.clone(), rt.clone(), settings, queue, queue_saver);
         app.notice = queue_problem.map(Err);
+        app.restart = restart;
+        // What an earlier update left next to the exe; it no longer runs.
+        rt.spawn_blocking(updater::cleanup_old);
+        if app.settings.check_updates {
+            app.check_for_update(false);
+        }
         spawn_clipboard_watcher(
             Arc::clone(&app.clipboard_enabled),
             Arc::clone(&app.clipboard_seen),
@@ -350,6 +371,10 @@ impl App {
             dialog_open: false,
             pending_dialog: None,
             closing: false,
+            update: None,
+            updating: false,
+            install_task: None,
+            restart: Arc::default(),
         }
     }
 
@@ -1044,6 +1069,30 @@ impl App {
                 });
             }
             AppEvent::Merged(notice) => self.notice = Some(notice),
+            AppEvent::UpdateChecked { result, manual } => match result {
+                Ok(Some(update)) => self.update = Some(update),
+                Ok(None) if manual => {
+                    self.notice = Some(Ok(format!("You have the latest version ({}).", env!("CARGO_PKG_VERSION"))))
+                }
+                Err(e) if manual => self.notice = Some(Err(format!("Could not check for updates: {}", e))),
+                Err(e) => tracing::warn!("Could not check for updates: {}", e),
+                Ok(None) => {}
+            },
+            AppEvent::UpdateInstalled(result) => {
+                self.updating = false;
+                self.install_task = None;
+                match result {
+                    // Closed the way the user closes it: the queue is saved and live recordings
+                    // finish first; `main` then starts the new build.
+                    Ok(installed) => {
+                        let version = self.update.take().map(|update| update.version).unwrap_or_default();
+                        self.notice = Some(Ok(format!("Updated to {}; restarting...", version)));
+                        *lock(&self.restart) = Some(installed.own);
+                        self.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    Err(e) => self.notice = Some(Err(format!("Could not update: {}", e))),
+                }
+            }
         }
     }
 
@@ -1150,6 +1199,25 @@ impl App {
         self.ctx.copy_text(text);
     }
 
+    // ---- updates -------------------------------------------------------------------------
+
+    /// Looks for a newer release through the proxy setting; `manual` reports the outcome even
+    /// when there is none (see [`AppEvent::UpdateChecked`]).
+    fn check_for_update(&self, manual: bool) {
+        let proxy = self.settings.list_options().proxy;
+        self.spawn_event(async move { AppEvent::UpdateChecked { result: updater::check(proxy.as_deref()).await, manual } });
+    }
+
+    /// Downloads, verifies and installs the update offered, once; the app restarts when it is in.
+    fn install_update(&mut self) {
+        let Some(update) = self.update.clone().filter(|_| !self.updating) else { return };
+        self.updating = true;
+        let proxy = self.settings.list_options().proxy;
+        self.install_task = Some(self.spawn_event(async move {
+            AppEvent::UpdateInstalled(updater::install(proxy.as_deref(), &update, updater::Program::Gui).await)
+        }));
+    }
+
 
     /// Eases the displayed progress and speed of the shown download; true while still moving.
     fn animate(&mut self) -> bool {
@@ -1242,6 +1310,11 @@ impl eframe::App for App {
             repair.cancel.store(true, Ordering::Relaxed);
             tasks.push(repair.task);
         }
+        // An update swapping the exes must not be cut off halfway; one still downloading is
+        // dropped, which leaves nothing changed.
+        // ponytail: an install whose swap starts at the end of the grace can still be cut off;
+        // wait for the swap itself if that ever shows.
+        tasks.extend(self.install_task.take());
         if !wait_for_tasks(&self.rt, tasks, EXIT_GRACE) {
             tracing::warn!("Some downloads did not stop within {}s", EXIT_GRACE.as_secs());
         }
@@ -1622,14 +1695,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_title("Endo's Unified Downloader"),
         ..Default::default()
     };
+    let restart = Arc::new(Mutex::new(None));
+    let restart_for_app = Arc::clone(&restart);
     let result = eframe::run_native(
         "Endo's Unified Downloader",
         options,
-        Box::new(move |cc| Ok(Box::new(App::new(cc, handle)))),
+        Box::new(move |cc| Ok(Box::new(App::new(cc, handle, restart_for_app)))),
     );
     // Downloads were stopped in `on_exit`; leftover blocking work (e.g. hashing for a verify)
     // must not keep the process alive.
     runtime.shutdown_background();
+    // An update was installed: the new build takes over.
+    if let Some(exe) = lock(&restart).take() {
+        if let Err(e) = std::process::Command::new(&exe).spawn() {
+            tracing::warn!("Could not start the updated app {}: {}", exe.display(), e);
+        }
+    }
     Ok(result?)
 }
 
@@ -2309,5 +2390,38 @@ mod tests {
         assert!(discard_leftovers(held.clone()).await.unwrap() >= 2);
         assert!(!held_part.exists() && !held_state.exists());
         assert!(std::fs::read(&final_path).unwrap() == *body, "other files are untouched");
+    }
+
+    /// A check at launch is quiet unless it finds a newer release, which is offered; one the user
+    /// asked for also says when there is none, or why it failed. A failed install keeps the offer;
+    /// a finished one closes the window (the existing way) for `main` to start the new build.
+    #[test]
+    fn updates_are_offered_and_installed_once() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(&rt, dir.path());
+        let checked = |result, manual| AppEvent::UpdateChecked { result, manual };
+        app.handle_event(checked(Ok(None), false));
+        app.handle_event(checked(Err("offline".to_string()), false));
+        assert!(app.update.is_none() && app.notice.is_none(), "a check at launch only logs");
+        app.handle_event(checked(Ok(None), true));
+        assert_eq!(app.notice, Some(Ok(format!("You have the latest version ({}).", env!("CARGO_PKG_VERSION")))));
+        app.handle_event(checked(Err("offline".to_string()), true));
+        assert!(matches!(&app.notice, Some(Err(e)) if e.contains("offline")));
+
+        let update = Update { version: "9.0.0".into(), tag: "v9.0.0".into(), page: format!("{}/tag/v9.0.0", updater::RELEASES) };
+        app.handle_event(checked(Ok(Some(update.clone())), false));
+        assert_eq!(app.update.as_ref(), Some(&update));
+        app.install_update();
+        assert!(app.updating);
+        app.handle_event(AppEvent::UpdateInstalled(Err("the signature does not match".to_string())));
+        assert!(!app.updating && app.update.as_ref() == Some(&update), "the offer stays to try again");
+        assert!(matches!(&app.notice, Some(Err(e)) if e.contains("signature")));
+        assert!(lock(&app.restart).is_none());
+
+        let own = dir.path().join(updater::GUI_EXE);
+        app.handle_event(AppEvent::UpdateInstalled(Ok(Installed { own: own.clone(), ..Installed::default() })));
+        assert_eq!(lock(&app.restart).as_ref(), Some(&own), "started once the window has closed");
+        assert!(app.update.is_none() && !app.updating);
     }
 }
