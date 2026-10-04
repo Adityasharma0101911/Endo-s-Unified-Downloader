@@ -4,12 +4,19 @@
   "short_name": "Endo DL",
   "version": "1.0.0",
   "description": "Finds videos and HLS (m3u8) streams on any page and sends them to Endo's Unified Downloader; records blob/MSE video the downloader cannot fetch.",
-  "minimum_chrome_version": "111",
-  "permissions": ["webRequest", "storage", "scripting", "contextMenus"],
+  "minimum_chrome_version": "121",
+  "permissions": ["webRequest", "storage", "scripting", "contextMenus", "cookies"],
   "host_permissions": ["<all_urls>"],
   "background": {
     "service_worker": "background.js",
+    "scripts": ["background.js"],
     "type": "module"
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "endo-downloader@local",
+      "strict_min_version": "128.0"
+    }
   },
   "action": {
     "default_popup": "popup.html",

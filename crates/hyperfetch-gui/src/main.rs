@@ -709,7 +709,9 @@ impl App {
     /// Whether download `id` goes to yt-dlp and must wait for the user to say whether ffmpeg may
     /// be installed: they have not, and no ffmpeg was found (or that is not known yet).
     fn waits_for_ffmpeg_answer(&self, id: usize) -> bool {
-        let media = |item: &QueueItem| item.options.media_preset.is_some() || item.urls.iter().any(media::is_supported_media_site);
+        let media = |item: &QueueItem| {
+            item.options.media_preset.is_some() || item.options.dash || item.urls.iter().any(media::is_supported_media_site)
+        };
         self.settings.install_ffmpeg.is_none() && self.ffmpeg_found != Some(true) && self.queue.get_item(id).is_some_and(media)
     }
 
@@ -1027,9 +1029,18 @@ impl App {
             AppEvent::RemoteAdd(payload) => self.add_remote(payload),
             AppEvent::Recorded(finished) => {
                 let save_dir = PathBuf::from(self.settings.save_dir.trim());
+                let recovered = finished.recovered;
+                // One an earlier run left says so, or the notice would come out of nowhere.
+                let said = move |notice: String| {
+                    if recovered {
+                        format!("Recovered a recording the app was taking when it last closed: {}", notice)
+                    } else {
+                        notice
+                    }
+                };
                 self.spawn_event(async move {
                     let merged = unblock(move || recording::merge(&finished, &save_dir, media::find_ffmpeg_path().as_deref())).await;
-                    AppEvent::Merged(merged.and_then(|notice| notice))
+                    AppEvent::Merged(merged.and_then(|notice| notice).map(said).map_err(said))
                 });
             }
             AppEvent::Merged(notice) => self.notice = Some(notice),
@@ -1041,7 +1052,8 @@ impl App {
     /// now when the download shown is not running and the URL box is empty, else it waits in the
     /// queue. A link to read first (see `ingest::needs_reading`) is read as one typed in is,
     /// without the browser's request; not one sent with a file name, which is the media the
-    /// extension saw the page fetch, whatever its path looks like (`/feed/index.m3u8`).
+    /// extension saw the page fetch, whatever its path looks like (`/feed/index.m3u8`), nor one
+    /// sent with the playlist the page built, of which it is only the base.
     fn add_remote(&mut self, payload: ipc::RemoteAddPayload) {
         let url = payload.url.trim().to_string();
         if url.is_empty() {
@@ -1055,7 +1067,7 @@ impl App {
         }
         let shown = ingest::truncate_chars(&url, 60);
         let start_now = !self.focused_item().is_some_and(|item| item.status.is_active()) && self.url_input.trim().is_empty();
-        if ingest::needs_reading(&url) && payload.file_name().is_none() {
+        if ingest::needs_reading(&url) && payload.file_name().is_none() && payload.playlist.is_none() {
             if start_now {
                 self.download_now(&url, "", "");
                 self.notice = Some(Ok(format!("Started remote download: {}", shown)));
@@ -1078,8 +1090,10 @@ impl App {
 
     /// Queues the download of `url` as the browser asked for it: under its file name, with its
     /// referer (over the Settings one), User-Agent and other headers, its Authorization header for
-    /// the hosts of `url` alone, its cookies (see `ipc::save_cookies`) and its choice of MP4 for
-    /// an HLS stream (over the Settings one). The Settings are not changed.
+    /// the hosts of `url` alone, its cookies (see `ipc::RemoteAddPayload::cookies_file`), its
+    /// choice of MP4 for an HLS stream (over the Settings one), whether it is DASH, the tallest
+    /// video it wants (over the media quality) and the playlist the page built. The Settings are
+    /// not changed.
     fn add_browser_download(&mut self, url: &str, payload: &ipc::RemoteAddPayload) -> Result<usize, String> {
         let mut task = ingest::link_task(&[url])?;
         task.name = payload.file_name().map(PathBuf::from).or(task.name);
@@ -1089,8 +1103,11 @@ impl App {
         options.headers = headers;
         options.hls = payload.hls;
         options.hls_to_mp4 = payload.mp4.unwrap_or(options.hls_to_mp4);
-        let cookies = payload.cookies.as_deref().filter(|cookies| !cookies.trim().is_empty());
-        if let Some(path) = cookies.zip(Url::parse(url).ok()).and_then(|(cookies, url)| ipc::save_cookies(&url, cookies)) {
+        options.dash = payload.dash;
+        options.height = payload.height.filter(|&height| height > 0);
+        options.playlist_text = payload.playlist_text().map(str::to_string);
+        let saved = Url::parse(url).ok().and_then(|url| ipc::save_cookies(&url, &payload.cookies_file(&url)?));
+        if let Some(path) = saved {
             options.cookies_path = Some(path);
             // The cookies the browser sent win over the Settings' browser, for yt-dlp too.
             options.browser_cookies = None;
@@ -2157,6 +2174,20 @@ mod tests {
         assert_eq!(started.options.referer.as_deref(), Some("https://settings.example/"), "the Settings referer when the browser sends none");
         assert!(started.options.headers.is_empty() && started.options.auth_header.is_none());
         assert!(started.options.hls_to_mp4, "the Settings' choice of MP4 when the browser sends none");
+        assert!(!started.options.dash && started.options.height.is_none() && started.options.playlist_text.is_none());
+
+        // A DASH manifest with a height to keep to, and a playlist the page built, based on the
+        // frame's page, which is not read as a document even when it looks like one.
+        app.handle_event(remote(serde_json::json!({"url": "https://cdn.example/v/manifest.mpd", "dash": true, "height": 720, "filename": "D.mp4"})));
+        let dash = &app.queue.items()[2];
+        assert!(dash.options.dash && dash.options.height == Some(720) && dash.options.playlist_text.is_none());
+        let playlist = "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\nseg0.ts\n#EXT-X-ENDLIST";
+        app.handle_event(remote(serde_json::json!({"url": "https://page.example/list.meta4", "playlist": format!("{playlist}\n"), "hls": true, "height": 0})));
+        let built = &app.queue.items()[3];
+        assert_eq!(built.options.playlist_text.as_deref(), Some(playlist));
+        assert!(built.options.hls && built.options.height.is_none(), "no height of 0");
+        assert!(app.reading.is_empty(), "not read as a document");
+        assert_eq!(app.queue.items().len(), 4);
     }
 
     /// A remote document is fetched through the proxy setting: its host does not exist, so only

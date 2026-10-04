@@ -3978,6 +3978,74 @@ async fn test_an_hls_stream_with_separate_audio_goes_to_yt_dlp_with_the_browsers
     }
 }
 
+/// A DASH manifest goes to yt-dlp, with the browser's request: a `.mpd` link, one the browser saw
+/// read as DASH (`dash`), and one that answers as DASH. The height the browser's user chose is
+/// the format yt-dlp gets, here for a stream with its audio apart.
+#[tokio::test]
+async fn test_dash_manifests_and_a_chosen_height_go_to_yt_dlp() {
+    isolate_history();
+    let _history = HISTORY.write().await;
+    const MPD: &[u8] = b"<?xml version=\"1.0\"?><MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\"></MPD>";
+    let master = "#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"en\",URI=\"audio/en.m3u8\"\n\
+                  #EXT-X-STREAM-INF:BANDWIDTH=8000000,RESOLUTION=1280x720,AUDIO=\"aud\"\nvideo.m3u8\n";
+    let mut answers_dash = Mock::new(MPD.to_vec());
+    answers_dash.content_type = Some("application/dash+xml");
+    let links = [
+        (serve(Arc::new(Mock::new(MPD.to_vec())), "show/manifest.mpd").await, false, None),
+        (serve(Arc::new(Mock::new(MPD.to_vec())), "api/play?id=7").await, true, None),
+        (serve(Arc::new(answers_dash), "api/stream").await, false, None),
+        (serve(Arc::new(Mock::new(master.as_bytes().to_vec())), "show/master.m3u8").await, false, Some(720)),
+    ];
+    for (url, dash, height) in links {
+        let (tools, temp) = (tempdir().unwrap(), tempdir().unwrap());
+        let output = temp.path().join("show.mp4");
+        let info = serde_json::json!({
+            "_type": "video", "extractor_key": "Generic", "id": "show", "title": "show",
+            "requested_downloads": [{ "filename": output }],
+        });
+        std::fs::write(tools.path().join("info.json"), serde_json::to_vec(&info).unwrap()).unwrap();
+        let opts = DownloadOptions {
+            ytdlp_path: Some(fake_ytdlp(tools.path(), &output)),
+            headers: vec![("Origin".into(), "https://page.example".into())],
+            dash,
+            height,
+            ..options(temp.path(), 4, 64 * KB)
+        };
+
+        assert_eq!(run(&DownloadEngine::new(vec![url.clone()], opts), None).await, Ok(output), "{url}");
+        let runs = runs_of(tools.path());
+        let found = runs.first().is_some_and(|find| find.contains(&"-J".to_string()) && find.last() == Some(&url.to_string()));
+        assert!(found && runs.len() == 2, "{url}: {runs:?}");
+        for args in &runs {
+            assert!(has_arg(args, "--add-header", "Origin:https://page.example"), "{args:?}");
+            if height.is_some() {
+                assert!(has_arg(args, "-f", "bv*[height<=720]+ba/b[height<=720]"), "{args:?}");
+            }
+        }
+    }
+}
+
+/// A playlist the page built itself is downloaded as it is, its URIs resolved against the page,
+/// which is never fetched itself.
+#[tokio::test]
+async fn test_a_playlist_the_page_built_is_downloaded_without_fetching_the_page() {
+    let _history = setup().await;
+    // Every path of the mock serves this, so each segment is it.
+    let segment = payload(3000, 7);
+    let mock = Arc::new(Mock::new(segment.clone()));
+    let page = serve(Arc::clone(&mock), "watch/page.html").await;
+    let temp = tempdir().unwrap();
+    let opts = DownloadOptions {
+        playlist_text: Some("#EXTM3U\n#EXTINF:4,\nseg0.ts\n#EXTINF:4,\nseg1.ts\n#EXT-X-ENDLIST\n".into()),
+        ..options(&temp.path().join("Clip.mp4"), 2, 64 * KB)
+    };
+
+    let path = run(&DownloadEngine::new(vec![page], opts), None).await.expect("the page's playlist should download");
+    assert_eq!(path, temp.path().join("Clip.ts"));
+    assert_file(&path, &[segment.clone(), segment].concat());
+    assert_eq!(mock.stats.requests.load(Ordering::SeqCst), 2, "the two segments, and nothing else");
+}
+
 /// A language the site has subtitles of its own in only for regions of it (YouTube's `en-US`)
 /// gets those, not the automatic captions of the bare code, which yt-dlp would pick.
 #[tokio::test]
