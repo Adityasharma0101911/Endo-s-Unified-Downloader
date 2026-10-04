@@ -401,6 +401,8 @@ pub(crate) fn lock_file(path: &Path) -> io::Result<File> {
 enum Change {
     Upsert(HistoryEntry),
     Remove(String),
+    /// Removes the entries of this file.
+    RemoveFile(PathBuf),
     Clear,
 }
 
@@ -418,6 +420,7 @@ impl Change {
                 return true;
             }
             Change::Remove(id) => entries.retain(|e| e.id != *id),
+            Change::RemoveFile(path) => entries.retain(|e| e.file_path != *path),
             Change::Clear => entries.clear(),
         }
         entries.len() != before
@@ -526,6 +529,14 @@ impl DownloadHistoryManager {
     /// as [`DownloadHistoryManager::save`] does.
     pub fn record(path: &Path, entry: HistoryEntry) -> io::Result<()> {
         Self { entries: Vec::new(), custom_path: Some(path.to_path_buf()), pending: vec![Change::Upsert(entry)] }.save()
+    }
+
+    /// [`DownloadHistoryManager::record`] for a file made from `replaced`, which it took the place
+    /// of (an HLS download's `.ts`, remuxed into an MP4): the entries of `replaced`, such as one a
+    /// stopped attempt left, go in the same write, as they name a file that is no longer there.
+    pub fn record_replacing(path: &Path, entry: HistoryEntry, replaced: &Path) -> io::Result<()> {
+        let pending = vec![Change::RemoveFile(replaced.to_path_buf()), Change::Upsert(entry)];
+        Self { entries: Vec::new(), custom_path: Some(path.to_path_buf()), pending }.save()
     }
 
     /// Adds `entry`, replacing any entry with the same id or the same file path.

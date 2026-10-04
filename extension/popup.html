@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Endo's Unified Downloader</title>
+  <link rel="stylesheet" href="popup.css">
+  <script type="module" src="popup.js"></script>
+</head>
+<body>
+  <header class="top">
+    <img src="icons/icon-32.png" width="24" height="24" alt="">
+    <h1>Endo's Unified Downloader</h1>
+    <span id="app-status" class="pill" role="status">Checking…</span>
+  </header>
+  <p id="app-hint" class="hint warn" hidden>Start the Endo's Unified Downloader desktop app. Downloads are sent to it; until it runs they fail with an error.</p>
+
+  <p id="unsupported" class="hint" hidden>Nothing can be detected on this tab. Browser pages (chrome://, the extension store, file://, new tab) don't let extensions see their requests. Open a normal http(s) page.</p>
+
+  <main id="tab-ui" hidden>
+    <section class="card">
+      <button id="send-page" type="button" class="btn">Download this page</button>
+      <p id="page-note" class="note" hidden>This site is handled by yt-dlp in the downloader: send the page, not its streams.</p>
+      <p id="page-msg" class="msg" role="status" aria-live="polite"></p>
+    </section>
+
+    <section aria-labelledby="media-title">
+      <div class="section-head">
+        <h2 id="media-title">Media <span id="media-count" class="count"></span></h2>
+        <button id="clear" type="button" class="btn small ghost">Clear list</button>
+      </div>
+      <p id="empty" class="hint" hidden>No media found yet. Play the video, then reopen this popup. For streams that can't be fetched (blob or MSE players), use Record below.</p>
+      <p id="media-msg" class="msg" role="status" aria-live="polite"></p>
+      <ul id="items" class="items"></ul>
+    </section>
+
+    <section aria-labelledby="rec-title">
+      <div class="section-head">
+        <h2 id="rec-title">Record</h2>
+        <button id="rescan" type="button" class="btn small ghost">Rescan videos</button>
+      </div>
+      <p class="note">Capture from start saves the stream's buffers as the player loads them; speed it up to finish sooner. Record playback captures an unmuted video in real time.</p>
+      <button id="arm" type="button" class="btn">Capture from start (reloads page)</button>
+      <p id="rec-msg" class="msg" role="status" aria-live="polite"></p>
+      <p id="no-videos" class="note" hidden>No video elements on this page yet. Start the player, then Rescan.</p>
+      <ul id="videos" class="rows"></ul>
+      <div id="recs" class="recs" hidden>
+        <p id="armed" class="note" hidden>Capture armed: play the video. Captured bytes show here.</p>
+        <ul id="rec-list" class="rows"></ul>
+        <div class="rec-controls">
+          <label id="speed-wrap" hidden>Speed
+            <select id="speed">
+              <option value="1">1×</option>
+              <option value="2">2×</option>
+              <option value="4">4×</option>
+              <option value="8">8×</option>
+              <option value="16">16×</option>
+            </select>
+          </label>
+          <button id="stop" type="button" class="btn danger">Stop recording</button>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <details id="settings">
+    <summary>Settings</summary>
+    <div class="settings-grid">
+      <label for="min-size">Min file size (KB, 0 = none)</label>
+      <input id="min-size" type="number" min="0" step="1" inputmode="numeric">
+      <label for="max-size">Max file size (KB, 0 = none)</label>
+      <input id="max-size" type="number" min="0" step="1" inputmode="numeric">
+      <label for="convert-mp4">Convert HLS to MP4</label>
+      <input id="convert-mp4" type="checkbox">
+    </div>
+    <h3>Blocked hosts</h3>
+    <p id="no-blocked" class="note">None.</p>
+    <ul id="blocked" class="rows"></ul>
+    <p id="settings-msg" class="msg" role="status" aria-live="polite"></p>
+  </details>
+</body>
+</html>

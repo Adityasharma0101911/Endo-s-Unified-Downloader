@@ -515,6 +515,9 @@ fn advanced_options(app: &mut App, ui: &mut egui::Ui) {
     });
 
     text_row(ui, "Proxy:", &mut app.settings.proxy, "Optional: http://127.0.0.1:8080 or socks5://127.0.0.1:1080");
+    text_row(ui, "Proxy Pool:", &mut app.settings.proxy_pool, "Optional: comma-separated proxy list for multi-egress rotation (e.g. http://p1:8080,http://p2:8080)");
+    text_row(ui, "Debrid Key:", &mut app.settings.debrid_api_key, "Optional: Real-Debrid or AllDebrid API key for automatic high-speed CDN unrestrict");
+    text_row(ui, "Debrid Provider:", &mut app.settings.debrid_provider, "Optional: 'real-debrid' or 'alldebrid' (auto-detected if blank)");
     text_row(ui, "Auth:", &mut app.auth_input, "Optional Authorization header, e.g. Bearer <token> (not saved, not sent to clipboard links)");
     text_row(ui, "Referer:", &mut app.settings.referer, "Optional HTTP Referer header, e.g. https://dood.to/ or embedding site");
 
@@ -551,6 +554,12 @@ fn advanced_options(app: &mut App, ui: &mut egui::Ui) {
         );
     });
     ui.horizontal(|ui| {
+        ui.checkbox(&mut app.settings.hls_to_mp4, "Convert HLS streams to MP4").on_hover_text(
+            "An HLS (m3u8) stream saved as MPEG-TS is remuxed into an MP4 once downloaded, without \
+             re-encoding. Needs ffmpeg; without it the .ts is kept. The browser extension can turn \
+             this off for a download.",
+        );
+        ui.add_space(12.0);
         let mut install = app.settings.install_ffmpeg == Some(true);
         let checkbox = ui.checkbox(&mut install, "Install ffmpeg when a video needs it (about 200 MB)").on_hover_text(FFMPEG_ABOUT);
         if checkbox.changed() {
@@ -619,13 +628,6 @@ fn advanced_options(app: &mut App, ui: &mut egui::Ui) {
             "Wait until each finished file is on the disk before showing it as done. Slower; without it a \
              power loss right after a download finishes can damage the file (Verify detects that).",
         );
-    });
-    ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("Browser Integration:").size(12.0));
-        if ui.button("Copy Browser Bookmarklet").on_hover_text("Copy 1-click JavaScript bookmarklet to send current page or video directly to Endo's Unified Downloader via local port 49152").clicked() {
-            app.copy_bookmarklet();
-        }
     });
     ui.label(RichText::new("Settings apply to downloads started or queued afterwards.").size(11.0).color(DIM));
 }

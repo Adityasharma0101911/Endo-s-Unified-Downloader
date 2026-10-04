@@ -142,6 +142,12 @@ pub struct MediaDownloadOptions {
     pub preset: MediaQualityPreset,
     pub cookies: BrowserCookieSource,
     pub proxy: Option<String>,
+    /// The page the media was found on, which yt-dlp sends as the Referer (`--referer`).
+    pub referer: Option<String>,
+    /// Request headers from the browser (see `DownloadOptions::headers`): yt-dlp sends them
+    /// (`--add-header`), and so does the engine with the streams it downloads itself, beneath
+    /// each format's own.
+    pub headers: Vec<(String, String)>,
     pub output_dir: PathBuf,
     /// yt-dlp output template of the file's name; a name given as it is has its `%` doubled (see
     /// [`template_literal`]). None names the file by its title.
@@ -167,6 +173,8 @@ impl Default for MediaDownloadOptions {
             preset: MediaQualityPreset::default(),
             cookies: BrowserCookieSource::default(),
             proxy: None,
+            referer: None,
+            headers: Vec::new(),
             output_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             output_filename: None,
             custom_ytdlp_path: None,
@@ -2257,6 +2265,14 @@ fn build_ytdlp_args(
     }
     args.extend(options.preset.to_args());
     args.extend_from_slice(cookie_args);
+    // The request as the browser made it: yt-dlp sends these with its requests, and lists them
+    // among each format's headers for the engine's (see `stream_client`).
+    if let Some(referer) = options.referer.as_deref().filter(|r| crate::engine::request_header("Referer", r).is_some()) {
+        args.extend(["--referer".to_string(), referer.to_string()]);
+    }
+    for (name, value) in options.headers.iter().filter(|(name, value)| crate::engine::request_header(name, value).is_some()) {
+        args.extend(["--add-header".to_string(), format!("{name}:{value}")]);
+    }
     if kind == RunKind::Download && options.concurrent_fragments > 1 {
         args.extend(["--concurrent-fragments".to_string(), options.concurrent_fragments.min(32).to_string()]);
     }
@@ -3608,9 +3624,14 @@ fn unquote_cookie_value(value: &str) -> String {
 
 /// The client for a stream: its format's headers, and its cookies in a jar, which sends them only
 /// where they belong (never to a host a redirect leads to). Otherwise set up like
-/// [`crate::engine::build_client`]'s, with the user's proxy.
-fn stream_client(stream: &PlannedStream, proxy: Option<&str>) -> Result<reqwest::Client, String> {
+/// [`crate::engine::build_client`]'s, with the user's proxy. The browser's headers (see
+/// [`MediaDownloadOptions::headers`]) go beneath the format's, which yt-dlp made from them and
+/// what the site asks for.
+fn stream_client(stream: &PlannedStream, browser: &[(String, String)], proxy: Option<&str>) -> Result<reqwest::Client, String> {
     let mut headers = reqwest::header::HeaderMap::new();
+    for (name, value) in browser.iter().filter_map(|(name, value)| crate::engine::request_header(name, value)) {
+        headers.insert(name, value);
+    }
     for (name, value) in &stream.headers {
         let name = reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(|e| format!("header {name}: {e}"))?;
         let value = reqwest::header::HeaderValue::from_str(value).map_err(|e| format!("header {name}: {e}"))?;
@@ -4107,7 +4128,7 @@ async fn fast_download(
             url: planned.url.clone(),
             key: planned.key.clone(),
             hls: planned.hls,
-            client: stream_client(planned, options.proxy.as_deref()).map_err(FastError::Unsupported)?,
+            client: stream_client(planned, &options.headers, options.proxy.as_deref()).map_err(FastError::Unsupported)?,
             path: stream_path(&output, &planned.format_id, &planned.ext),
             chunk_size: planned.chunk_size,
         });
@@ -4291,6 +4312,39 @@ async fn ffmpeg_for_download(
         installed = install => installed.map_err(|e| format!("Installing ffmpeg failed: {e}")).and_then(|i| i),
         _ = wait_cancelled(cancel_flag.clone()) => Err(CANCELLED.to_string()),
     }
+}
+
+/// The ffmpeg that remuxes an HLS download into an MP4 (see `DownloadOptions::hls_to_mp4`): the
+/// one a media download would find, else, with `install_ffmpeg`, the managed one, installed
+/// through `proxy` as for a media download (see [`ffmpeg_for_download`]).
+pub(crate) async fn remux_ffmpeg(
+    install_ffmpeg: bool,
+    proxy: Option<String>,
+    cancel_flag: &Option<Arc<AtomicBool>>,
+) -> Result<PathBuf, String> {
+    let found = tokio::task::spawn_blocking(find_ffmpeg_path).await.ok().flatten();
+    let install = async move { install_managed_ffmpeg(proxy.as_deref()).await };
+    ffmpeg_for_download(found, managed_bin_dir(), install_ffmpeg, cancel_flag, install).await
+}
+
+/// ffmpeg arguments that remux `ts`, the MPEG-TS of an HLS download, into the MP4 `out`: its
+/// video and audio copied, not re-encoded (timed ID3 and other data streams an MP4 cannot hold
+/// are left out), with the index in front for players that stream it. `out` is a temporary
+/// name, so the container is named.
+fn hls_mp4_args(ts: &Path, out: &Path) -> Vec<OsString> {
+    let mut args: Vec<OsString> = FFMPEG_QUIET.map(OsString::from).to_vec();
+    args.extend([OsString::from("-i"), file_arg(ts)]);
+    args.extend(["-map", "0:v?", "-map", "0:a?", "-c", "copy", "-movflags", "+faststart", "-f", "mp4"].map(OsString::from));
+    args.push(file_arg(out));
+    args
+}
+
+/// Remuxes `ts` into `out` with `ffmpeg` (see [`hls_mp4_args`]). Cancelling kills ffmpeg, which
+/// lets go of `out` before this returns.
+pub(crate) async fn remux_hls(ffmpeg: &Path, ts: &Path, out: &Path, cancel_flag: Option<Arc<AtomicBool>>) -> Result<(), String> {
+    let mut cmd = tree_command(ffmpeg);
+    cmd.args(hls_mp4_args(ts, out));
+    run_to_end(cmd, cancel_flag).await.map(drop)
 }
 
 /// What one of yt-dlp's own sites finds at `url` (see [`RunKind::Find`]), for a download with
@@ -4753,6 +4807,46 @@ mod tests {
         let custom = MediaDownloadOptions { preset: MediaQualityPreset::Custom("18".into()), ..options };
         let args = build_ytdlp_args(Source::Url(&url), &custom, RunKind::Download, &[], None, None, Some("2026.08.19"));
         assert!(!args.iter().any(|a| a == "--extractor-args"), "{args:?}");
+    }
+
+    /// Every run that requests the link sends the page's referer and the browser's headers; a
+    /// pair that is no valid header is left out.
+    #[test]
+    fn args_send_the_browsers_referer_and_headers() {
+        let url = Url::parse("https://cdn.example.com/show/master.m3u8").unwrap();
+        let options = MediaDownloadOptions {
+            output_dir: PathBuf::from("out"),
+            referer: Some("https://page.example/watch".into()),
+            headers: vec![
+                ("Origin".into(), "https://page.example".into()),
+                ("User-Agent".into(), "Browser/1.0 (Windows NT 10.0)".into()),
+                ("Bad Name".into(), "x".into()),
+            ],
+            ..Default::default()
+        };
+        for kind in [RunKind::Extract, RunKind::Find, RunKind::Download] {
+            let args = build_ytdlp_args(Source::Url(&url), &options, kind, &[], None, None, Some("2026.08.19"));
+            let after = |flag: &str| args.windows(2).filter(|pair| pair[0] == flag).map(|pair| pair[1].clone()).collect::<Vec<_>>();
+            assert_eq!(after("--referer"), ["https://page.example/watch"], "{args:?}");
+            assert_eq!(after("--add-header"), ["Origin:https://page.example", "User-Agent:Browser/1.0 (Windows NT 10.0)"], "{args:?}");
+            assert_eq!(args.last(), Some(&url.to_string()));
+        }
+        let plain = MediaDownloadOptions { output_dir: PathBuf::from("out"), ..Default::default() };
+        let args = build_ytdlp_args(Source::Url(&url), &plain, RunKind::Download, &[], None, None, None);
+        assert!(!args.iter().any(|a| a == "--referer" || a == "--add-header"), "{args:?}");
+    }
+
+    /// The remux of an HLS download's `.ts` copies its video and audio into an MP4 named by the
+    /// arguments, as `file:` paths, never reading a name as an option or protocol.
+    #[test]
+    fn hls_mp4_args_copy_video_and_audio_into_an_mp4() {
+        let args = hls_mp4_args(Path::new("dl/Talk.ts"), Path::new("dl/Talk.mp4.part"));
+        let args: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        let expected = [
+            "-y", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", "file:dl/Talk.ts", "-map", "0:v?", "-map", "0:a?",
+            "-c", "copy", "-movflags", "+faststart", "-f", "mp4", "file:dl/Talk.mp4.part",
+        ];
+        assert_eq!(args, expected);
     }
 
     #[test]
@@ -6430,7 +6524,7 @@ bbd8671c6c05eaa3ec29d690695aebadff0871faa3efe9051581afbf3c01e80e  ffmpeg-master-
             url: planned.url.clone(),
             key: planned.key.clone(),
             hls: false,
-            client: stream_client(&planned, None).unwrap(),
+            client: stream_client(&planned, &[], None).unwrap(),
             path: path.clone(),
             chunk_size: None,
         };
@@ -6462,7 +6556,7 @@ bbd8671c6c05eaa3ec29d690695aebadff0871faa3efe9051581afbf3c01e80e  ffmpeg-master-
             url: planned.url.clone(),
             key: planned.key.clone(),
             hls: true,
-            client: stream_client(&planned, None).unwrap(),
+            client: stream_client(&planned, &[], None).unwrap(),
             path: path.clone(),
             chunk_size: None,
         };
@@ -6471,6 +6565,30 @@ bbd8671c6c05eaa3ec29d690695aebadff0871faa3efe9051581afbf3c01e80e  ffmpeg-master-
         let done = engine.download_media_stream(stream, tx, CancellationToken::new()).await.unwrap();
         assert_eq!(done, path);
         assert_eq!(std::fs::read(&path).unwrap(), [vec![1; 1000], vec![2; 500]].concat());
+    }
+
+    /// The engine requests a stream with the browser's headers, beneath the format's own.
+    #[tokio::test]
+    async fn a_stream_is_requested_with_the_browsers_headers_beneath_its_formats() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!("http://{}/v.mp4", listener.local_addr().unwrap())).unwrap();
+        let (head_tx, head_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut head = [0u8; 4096];
+            let n = socket.read(&mut head).await.unwrap();
+            let _ = head_tx.send(String::from_utf8_lossy(&head[..n]).to_ascii_lowercase());
+            let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await;
+        });
+
+        let planned = planned_stream(url.clone(), Url::parse("hyperfetch-media:/Generic/master/0").unwrap(), false);
+        let browser = [("X-Format".to_string(), "browser".to_string()), ("Origin".to_string(), "https://page.example".to_string())];
+        stream_client(&planned, &browser, None).unwrap().get(url).send().await.unwrap();
+        let head = head_rx.await.unwrap();
+        let lines: Vec<&str> = head.lines().collect();
+        assert!(lines.contains(&"x-format: yes") && !head.contains("browser"), "{head}");
+        assert!(lines.contains(&"origin: https://page.example"), "{head}");
     }
 
     #[tokio::test]
@@ -6493,7 +6611,7 @@ bbd8671c6c05eaa3ec29d690695aebadff0871faa3efe9051581afbf3c01e80e  ffmpeg-master-
                 url: planned.url.clone(),
                 key: planned.key.clone(),
                 hls: true,
-                client: stream_client(&planned, None).unwrap(),
+                client: stream_client(&planned, &[], None).unwrap(),
                 path: path.clone(),
                 chunk_size: None,
             };

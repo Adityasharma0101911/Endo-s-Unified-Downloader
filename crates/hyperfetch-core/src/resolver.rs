@@ -1197,6 +1197,207 @@ impl HtmlVideoResolver {
     }
 }
 
+/// DoodStream Embed and Video Resolver (dood.to, doodstream.com, ds2play.com, etc.)
+pub struct DoodStreamResolver;
+
+impl HostResolver for DoodStreamResolver {
+    fn can_handle(&self, url: &Url) -> bool {
+        let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+        (host.contains("dood") || host.contains("ds2play") || host.contains("doodstream"))
+            && (url.path().starts_with("/e/") || url.path().starts_with("/d/") || url.path().starts_with("/f/"))
+    }
+
+    async fn resolve(&self, client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
+        let resp = client
+            .get(url.clone())
+            .header(reqwest::header::USER_AGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            .header(reqwest::header::REFERER, "https://dood.to/")
+            .send()
+            .await?;
+        let html = resp.text().await.map_err(|e| ResolverError::Parse(e.to_string()))?;
+
+        // Locate /pass_md5/ token in page JavaScript
+        let needle = "/pass_md5/";
+        let Some(idx) = html.find(needle) else {
+            return Err(ResolverError::NotFound("DoodStream pass_md5 token not found on page".to_string()));
+        };
+        let after = &html[idx + needle.len()..];
+        let token_end = after.find(|c: char| c == '\'' || c == '"' || c == '/' || c.is_whitespace()).unwrap_or(after.len());
+        let token = &after[..token_end];
+        if token.is_empty() {
+            return Err(ResolverError::NotFound("DoodStream token is empty".to_string()));
+        }
+
+        let host = url.host_str().unwrap_or("dood.to");
+        let scheme = url.scheme();
+        let pass_url_str = format!("{}://{}/pass_md5/{}", scheme, host, token);
+        let pass_url = Url::parse(&pass_url_str).map_err(|e| ResolverError::Parse(e.to_string()))?;
+
+        let pass_resp = client
+            .get(pass_url)
+            .header(reqwest::header::USER_AGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            .header(reqwest::header::REFERER, url.as_str())
+            .send()
+            .await?;
+        let raw_base = pass_resp.text().await.map_err(|e| ResolverError::Parse(e.to_string()))?;
+        let base_trimmed = raw_base.trim();
+        if base_trimmed.is_empty() || !base_trimmed.starts_with("http") {
+            return Err(ResolverError::NotFound("DoodStream pass_md5 returned invalid base URL".to_string()));
+        }
+
+        // Generate pseudo-random 10 alphanumeric characters
+        let now_millis = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+        let chars = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+        let mut rnd_str = String::with_capacity(10);
+        let mut seed = now_millis as u64;
+        for _ in 0..10 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            rnd_str.push(chars[(seed as usize) % chars.len()] as char);
+        }
+
+        let token_param = token.rsplit('-').next().unwrap_or(token);
+        let direct_url_str = format!("{}{}?token={}&expiry={}", base_trimmed, rnd_str, token_param, now_millis);
+        let direct_url = Url::parse(&direct_url_str).map_err(|e| ResolverError::Parse(e.to_string()))?;
+        Ok(vec![direct_url])
+    }
+}
+
+/// Streamtape Embed and Video Resolver (streamtape.com, streamtape.to, streamta.pe, etc.)
+pub struct StreamtapeResolver;
+
+impl HostResolver for StreamtapeResolver {
+    fn can_handle(&self, url: &Url) -> bool {
+        let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+        host.contains("streamtape") && (url.path().starts_with("/v/") || url.path().starts_with("/e/"))
+    }
+
+    async fn resolve(&self, client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
+        let resp = client
+            .get(url.clone())
+            .header(reqwest::header::USER_AGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            .header(reqwest::header::REFERER, "https://streamtape.com/")
+            .send()
+            .await?;
+        let html = resp.text().await.map_err(|e| ResolverError::Parse(e.to_string()))?;
+
+        // Locate robotlink or get_video
+        let needle = "get_video?";
+        let Some(idx) = html.find(needle) else {
+            return Err(ResolverError::NotFound("Streamtape get_video link not found in page HTML".to_string()));
+        };
+        let prefix = &html[..idx];
+        let link_start = prefix.rfind("//").unwrap_or(idx);
+        let after = &html[idx..];
+        let link_end = after.find(|c: char| c == '\'' || c == '"' || c.is_whitespace() || c == '<' || c == '>').unwrap_or(after.len());
+        let raw_link = &html[link_start..idx + link_end];
+        let full_link = if raw_link.starts_with("//") {
+            format!("https:{}", raw_link)
+        } else {
+            raw_link.to_string()
+        };
+
+        let direct_url = Url::parse(&full_link).map_err(|e| ResolverError::Parse(e.to_string()))?;
+        Ok(vec![direct_url])
+    }
+}
+
+/// High-speed link unrestrictor using Real-Debrid or AllDebrid
+pub struct DebridResolver;
+
+impl DebridResolver {
+    pub fn is_debrid_host(url: &Url) -> bool {
+        let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+        let debrid_domains = [
+            "rapidgator.net", "rg.to", "1fichier.com", "nitroflare.com", "turbobit.net",
+            "mega.nz", "mega.io", "mediafire.com", "filefactory.com", "uploaded.net",
+            "ddownload.com", "katfile.com", "send.cm", "keep2share.cc", "k2s.cc",
+            "doodstream.com", "dood.to", "dood.so", "dood.pm", "dood.watch", "ds2play.com",
+            "streamtape.com", "mixdrop.co", "upstore.net", "filestore.to",
+        ];
+        debrid_domains.iter().any(|d| host == *d || host.ends_with(&format!(".{}", d)))
+    }
+
+    pub async fn unrestrict(
+        client: &Client,
+        url: &Url,
+        api_key: &str,
+        provider: Option<&str>,
+    ) -> Result<Url, ResolverError> {
+        let is_alldebrid = provider.is_some_and(|p| p.eq_ignore_ascii_case("alldebrid"));
+        if is_alldebrid {
+            Self::unrestrict_alldebrid(client, url, api_key).await
+        } else {
+            match Self::unrestrict_realdebrid(client, url, api_key).await {
+                Ok(u) => Ok(u),
+                Err(e) if provider.is_none() => {
+                    Self::unrestrict_alldebrid(client, url, api_key).await.map_err(|_| e)
+                }
+                Err(e) => Err(e),
+            }
+        }
+    }
+
+    async fn unrestrict_realdebrid(client: &Client, url: &Url, api_key: &str) -> Result<Url, ResolverError> {
+        let resp = client
+            .post("https://api.real-debrid.com/rest/10.0/unrestrict/link")
+            .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", api_key.trim()))
+            .form(&[("link", url.as_str())])
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(ResolverError::NotFound(format!("Real-Debrid returned HTTP {}", resp.status())));
+        }
+
+        #[derive(Deserialize)]
+        struct RdResponse {
+            download: Option<String>,
+        }
+
+        let text = resp.text().await.map_err(|e| ResolverError::Parse(e.to_string()))?;
+        let rd: RdResponse = serde_json::from_str(&text).map_err(|e| ResolverError::Parse(e.to_string()))?;
+        if let Some(dl) = rd.download {
+            Url::parse(&dl).map_err(|e| ResolverError::Parse(e.to_string()))
+        } else {
+            Err(ResolverError::NotFound("Real-Debrid response missing download URL".to_string()))
+        }
+    }
+
+    async fn unrestrict_alldebrid(client: &Client, url: &Url, api_key: &str) -> Result<Url, ResolverError> {
+        let encoded_url = percent_encoding::utf8_percent_encode(url.as_str(), percent_encoding::NON_ALPHANUMERIC);
+        let endpoint = format!(
+            "https://api.alldebrid.com/v4/link/unlock?agent=hyperfetch&apikey={}&link={}",
+            api_key.trim(),
+            encoded_url
+        );
+        let resp = client.get(&endpoint).send().await?;
+        if !resp.status().is_success() {
+            return Err(ResolverError::NotFound(format!("AllDebrid returned HTTP {}", resp.status())));
+        }
+
+        #[derive(Deserialize)]
+        struct AdData {
+            link: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct AdResponse {
+            status: String,
+            data: Option<AdData>,
+        }
+
+        let text = resp.text().await.map_err(|e| ResolverError::Parse(e.to_string()))?;
+        let ad: AdResponse = serde_json::from_str(&text).map_err(|e| ResolverError::Parse(e.to_string()))?;
+        if ad.status == "success" {
+            if let Some(data) = ad.data {
+                if let Some(link) = data.link {
+                    return Url::parse(&link).map_err(|e| ResolverError::Parse(e.to_string()));
+                }
+            }
+        }
+        Err(ResolverError::NotFound("AllDebrid could not unlock link".to_string()))
+    }
+}
+
 /// Master Smart Resolver registry that chains all host resolvers
 pub struct SmartResolver;
 
@@ -1211,11 +1412,48 @@ impl SmartResolver {
             || CodeHostResolver.can_handle(url)
             || ArchiveOrgResolver.can_handle(url)
             || AnnaArchiveResolver.can_handle(url)
+            || DoodStreamResolver.can_handle(url)
+            || StreamtapeResolver.can_handle(url)
     }
 
     /// Resolves `url` into download sources that are byte-identical copies of one file.
     /// `Ok` is never empty. `Err` means a resolver recognized the host but could not extract a direct link.
     pub async fn resolve(client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
+        Self::resolve_with_options(client, url, None, None).await
+    }
+
+    /// Resolves `url` with optional Debrid link unrestrictor support.
+    pub async fn resolve_with_options(
+        client: &Client,
+        url: &Url,
+        debrid_key: Option<&str>,
+        debrid_provider: Option<&str>,
+    ) -> Result<Vec<Url>, ResolverError> {
+        // 0. Check Debrid unrestrictor if API key is provided or in environment
+        let key = debrid_key
+            .map(str::to_string)
+            .or_else(|| std::env::var("ENDO_DEBRID_KEY").ok())
+            .or_else(|| std::env::var("REAL_DEBRID_KEY").ok())
+            .or_else(|| std::env::var("ALLDEBRID_KEY").ok());
+        if let Some(key) = key.filter(|k| !k.trim().is_empty()) {
+            if DebridResolver::is_debrid_host(url) {
+                if let Ok(unrestricted) = DebridResolver::unrestrict(client, url, &key, debrid_provider).await {
+                    tracing::info!("Debrid unlocked {} -> {}", url, unrestricted);
+                    return Ok(vec![unrestricted]);
+                }
+            }
+        }
+
+        // 1. DoodStream embed / watch resolver
+        if DoodStreamResolver.can_handle(url) {
+            return with_timeout(DoodStreamResolver.resolve(client, url)).await;
+        }
+
+        // 2. Streamtape embed / watch resolver
+        if StreamtapeResolver.can_handle(url) {
+            return with_timeout(StreamtapeResolver.resolve(client, url)).await;
+        }
+
         // The landing pages of these hosts are never the file, so a failed extraction is an error.
         if GoogleDriveResolver.can_handle(url) {
             return with_timeout(GoogleDriveResolver.resolve(client, url)).await;
@@ -2738,5 +2976,30 @@ host.example.com\tFALSE\t/\tFALSE\t0\thostonly\t1
             found,
             Some(Url::parse("https://re585ll.cloudatacdn.com/u5kj7kaoqdplsdgge633wyagihc573jshphbgbbnt3ddxvhknmy32eat5kga/hxuat4j6gm~tPjDFEERXb?token=dlmphynhhgsyaj4uentvkcyh&expiry=1790998907103").unwrap())
         );
+    }
+
+    #[test]
+    fn test_doodstream_can_handle() {
+        assert!(DoodStreamResolver.can_handle(&Url::parse("https://dood.to/e/abc123xyz").unwrap()));
+        assert!(DoodStreamResolver.can_handle(&Url::parse("https://doodstream.com/d/abc123xyz").unwrap()));
+        assert!(DoodStreamResolver.can_handle(&Url::parse("https://ds2play.com/e/abc123xyz").unwrap()));
+        assert!(!DoodStreamResolver.can_handle(&Url::parse("https://example.com/e/abc123xyz").unwrap()));
+        assert!(!DoodStreamResolver.can_handle(&Url::parse("https://dood.to/").unwrap()));
+    }
+
+    #[test]
+    fn test_streamtape_can_handle() {
+        assert!(StreamtapeResolver.can_handle(&Url::parse("https://streamtape.com/v/abc123xyz").unwrap()));
+        assert!(StreamtapeResolver.can_handle(&Url::parse("https://streamtape.to/e/abc123xyz").unwrap()));
+        assert!(!StreamtapeResolver.can_handle(&Url::parse("https://example.com/v/abc123xyz").unwrap()));
+    }
+
+    #[test]
+    fn test_debrid_is_debrid_host() {
+        assert!(DebridResolver::is_debrid_host(&Url::parse("https://rapidgator.net/file/12345/video.mp4.html").unwrap()));
+        assert!(DebridResolver::is_debrid_host(&Url::parse("https://1fichier.com/?abcdef123").unwrap()));
+        assert!(DebridResolver::is_debrid_host(&Url::parse("https://doodstream.com/d/123").unwrap()));
+        assert!(DebridResolver::is_debrid_host(&Url::parse("https://streamtape.com/v/123").unwrap()));
+        assert!(!DebridResolver::is_debrid_host(&Url::parse("https://wikipedia.org/").unwrap()));
     }
 }

@@ -74,8 +74,17 @@ pub struct Settings {
     pub live_from_start: bool,
     /// Wait for a scheduled stream or premiere to begin instead of failing.
     pub wait_for_video: bool,
+    /// Remux HLS streams saved as MPEG-TS into MP4 (see `DownloadOptions::hls_to_mp4`). On by
+    /// default, also for settings an older version saved.
+    pub hls_to_mp4: bool,
     /// Optional HTTP Referer header for downloads requiring anti-hotlinking bypass.
     pub referer: String,
+    /// Comma-separated list of proxy URLs for multi-egress rotation across workers.
+    pub proxy_pool: String,
+    /// Debrid API key for automatic high-speed CDN unrestricting.
+    pub debrid_api_key: String,
+    /// Debrid provider override ("real-debrid" or "alldebrid").
+    pub debrid_provider: String,
 }
 
 impl Default for Settings {
@@ -105,7 +114,11 @@ impl Default for Settings {
             embed_metadata: engine.embed_metadata,
             live_from_start: engine.live_from_start,
             wait_for_video: engine.wait_for_video,
+            hls_to_mp4: true,
             referer: String::new(),
+            proxy_pool: String::new(),
+            debrid_api_key: String::new(),
+            debrid_provider: String::new(),
         }
     }
 }
@@ -191,6 +204,7 @@ impl Settings {
             embed_metadata: self.embed_metadata,
             live_from_start: self.live_from_start,
             wait_for_video: self.wait_for_video,
+            hls_to_mp4: self.hls_to_mp4,
             ..self.tuning()
         })
     }
@@ -225,6 +239,13 @@ impl Settings {
     /// The engine settings shared by every download and repair: connections, speed limit,
     /// retries, timeouts, disk flushing and the per-host connection budget.
     pub fn tuning(&self) -> DownloadOptions {
+        let proxy_pool = self.proxy_pool
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let debrid_api_key = (!self.debrid_api_key.trim().is_empty()).then(|| self.debrid_api_key.trim().to_string());
+        let debrid_provider = (!self.debrid_provider.trim().is_empty()).then(|| self.debrid_provider.trim().to_string());
         DownloadOptions {
             num_connections: self.connections.clamp(1, 64),
             max_speed: speed_limit_bytes(self.max_speed, self.max_speed_in_mb),
@@ -232,6 +253,9 @@ impl Settings {
             stall_timeout_secs: self.stall_timeout_secs.max(1),
             fsync_on_complete: self.fsync_on_complete,
             max_connections_per_host: self.max_connections_per_host,
+            proxy_pool,
+            debrid_api_key,
+            debrid_provider,
             ..Default::default()
         }
     }
@@ -412,6 +436,7 @@ mod tests {
         let file = [Url::parse("https://example.com/a.iso").unwrap()];
         let opts = saved.download_options(&file, "", "").unwrap();
         assert!(!opts.install_ffmpeg && opts.embed_metadata && !opts.live_from_start && !opts.wait_for_video);
+        assert!(saved.hls_to_mp4 && opts.hls_to_mp4, "HLS is remuxed to MP4 unless turned off");
         assert_eq!(opts.subtitles, None);
         let agreed = Settings { install_ffmpeg: Some(true), ..saved.clone() };
         assert!(agreed.download_options(&file, "", "").unwrap().install_ffmpeg);
@@ -426,6 +451,7 @@ mod tests {
             embed_metadata: false,
             live_from_start: true,
             wait_for_video: true,
+            hls_to_mp4: false,
             ..saved
         };
         let list = chosen.list_options();
@@ -433,6 +459,7 @@ mod tests {
         assert_eq!(list.cookies, BrowserCookieSource::Firefox);
         let opts = chosen.download_options(&file, "", "").unwrap();
         assert!(!opts.install_ffmpeg && !opts.embed_metadata && opts.live_from_start && opts.wait_for_video);
+        assert!(!opts.hls_to_mp4);
         assert_eq!(opts.subtitles.as_deref(), Some("en,es"));
         let json = serde_json::to_string(&chosen).unwrap();
         assert_eq!(serde_json::from_str::<Settings>(&json).unwrap(), Settings { google_api_key: String::new(), ..chosen });

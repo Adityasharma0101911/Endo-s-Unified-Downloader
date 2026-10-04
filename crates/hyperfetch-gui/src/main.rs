@@ -1,6 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod ipc;
 mod queue_store;
+mod recording;
 mod settings;
 mod ui;
 mod util;
@@ -121,16 +123,12 @@ enum AppEvent {
     /// Whether an ffmpeg was found, looked for at launch while the user has not said whether one
     /// may be installed.
     FfmpegFound(bool),
-    /// Download request pushed from local IPC / webhook endpoint (e.g. browser bookmarklet or extension).
-    RemoteAdd(RemoteAddPayload),
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct RemoteAddPayload {
-    pub url: String,
-    pub cookies: Option<String>,
-    pub user_agent: Option<String>,
-    pub referer: Option<String>,
+    /// A download the browser extension sent to `POST /add`.
+    RemoteAdd(ipc::RemoteAddPayload),
+    /// A recording the browser extension finished, to be joined into the save folder.
+    Recorded(recording::Finished),
+    /// The notice saying where a recording was saved, or why it could not be joined.
+    Merged(Result<String, String>),
 }
 
 /// Handles to a running engine task.
@@ -288,7 +286,7 @@ impl App {
             app.events_tx.clone(),
             cc.egui_ctx.clone(),
         );
-        spawn_ipc_listener(app.events_tx.clone(), cc.egui_ctx.clone(), &rt);
+        ipc::spawn(app.events_tx.clone(), cc.egui_ctx.clone(), &rt);
         app.refresh_history();
         if app.settings.install_ffmpeg.is_none() {
             let found = unblock(hyperfetch_core::media::find_ffmpeg_path);
@@ -1026,65 +1024,78 @@ impl App {
                     self.start_waiting();
                 }
             }
-            AppEvent::RemoteAdd(payload) => {
-                let url = payload.url.trim().to_string();
-                if url.is_empty() {
-                    return;
-                }
-
-                if let Some(cookies) = &payload.cookies {
-                    if !cookies.trim().is_empty() {
-                        std::env::set_var("ANNAS_ARCHIVE_COOKIE", cookies.trim());
-                        std::env::set_var("HYPERFETCH_COOKIES", cookies.trim());
-
-                        if let Ok(u) = Url::parse(&url) {
-                            if let Some(host) = u.host_str() {
-                                let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default();
-                                let dir = PathBuf::from(&home).join(".hyperfetch");
-                                let _ = std::fs::create_dir_all(&dir);
-                                let cookie_file = dir.join("cookies.txt");
-                                let mut lines = Vec::new();
-                                for part in cookies.split(';') {
-                                    let part = part.trim();
-                                    if let Some((k, v)) = part.split_once('=') {
-                                        lines.push(format!("{}\tTRUE\t/\tTRUE\t2147483647\t{}\t{}", host, k.trim(), v.trim()));
-                                    }
-                                }
-                                if !lines.is_empty() {
-                                    let _ = std::fs::write(&cookie_file, lines.join("\n"));
-                                    if self.settings.cookies_path.is_empty() {
-                                        self.settings.cookies_path = cookie_file.to_string_lossy().into_owned();
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if let Some(referer) = &payload.referer {
-                    if !referer.trim().is_empty() {
-                        self.settings.referer = referer.trim().to_string();
-                    }
-                }
-
-                let active = self.focused_item().is_some_and(|item| item.status.is_active());
-                if !active && self.url_input.trim().is_empty() {
-                    self.download_now(&url, "", "");
-                    self.notice = Some(Ok(format!("Started remote download: {}", ingest::truncate_chars(&url, 60))));
-                } else if ingest::needs_reading(&url) {
-                    self.read_document(url.clone(), Origin::Dropped, String::new(), String::new());
-                } else {
-                    match self.add_download(&url, "", "") {
-                        Ok(id) => {
-                            self.notice = Some(Ok(format!("Added remote download #{} to queue: {}", id, ingest::truncate_chars(&url, 60))));
-                        }
-                        Err(e) => {
-                            self.notice = Some(Err(format!("Could not add remote download: {}", e)));
-                        }
-                    }
-                }
+            AppEvent::RemoteAdd(payload) => self.add_remote(payload),
+            AppEvent::Recorded(finished) => {
+                let save_dir = PathBuf::from(self.settings.save_dir.trim());
+                self.spawn_event(async move {
+                    let merged = unblock(move || recording::merge(&finished, &save_dir, media::find_ffmpeg_path().as_deref())).await;
+                    AppEvent::Merged(merged.and_then(|notice| notice))
+                });
             }
+            AppEvent::Merged(notice) => self.notice = Some(notice),
         }
+    }
+
+    /// Adds a download the browser extension sent, with what the browser sent
+    /// to fetch it applied to this download alone (see [`App::add_browser_download`]). It starts
+    /// now when the download shown is not running and the URL box is empty, else it waits in the
+    /// queue. A link to read first (see `ingest::needs_reading`) is read as one typed in is,
+    /// without the browser's request; not one sent with a file name, which is the media the
+    /// extension saw the page fetch, whatever its path looks like (`/feed/index.m3u8`).
+    fn add_remote(&mut self, payload: ipc::RemoteAddPayload) {
+        let url = payload.url.trim().to_string();
+        if url.is_empty() {
+            return;
+        }
+        // The Anna's Archive resolver sends these to Anna's Archive: only its own cookies go there.
+        let annas = Url::parse(&url).is_ok_and(|u| hyperfetch_core::resolver::AnnaArchiveResolver::can_handle(&u));
+        if let Some(cookies) = payload.cookies.as_deref().filter(|c| annas && !c.trim().is_empty()) {
+            std::env::set_var("ANNAS_ARCHIVE_COOKIE", cookies.trim());
+            std::env::set_var("HYPERFETCH_COOKIES", cookies.trim());
+        }
+        let shown = ingest::truncate_chars(&url, 60);
+        let start_now = !self.focused_item().is_some_and(|item| item.status.is_active()) && self.url_input.trim().is_empty();
+        if ingest::needs_reading(&url) && payload.file_name().is_none() {
+            if start_now {
+                self.download_now(&url, "", "");
+                self.notice = Some(Ok(format!("Started remote download: {}", shown)));
+            } else {
+                self.read_document(url, Origin::Dropped, String::new(), String::new());
+            }
+            return;
+        }
+        match self.add_browser_download(&url, &payload) {
+            Ok(id) if start_now => {
+                self.tab = Tab::Downloader;
+                self.start_added(id);
+                // Unless it says the file is downloading already.
+                self.notice.get_or_insert_with(|| Ok(format!("Started remote download: {}", shown)));
+            }
+            Ok(id) => self.notice = Some(Ok(format!("Added remote download #{} to queue: {}", id, shown))),
+            Err(e) => self.notice = Some(Err(format!("Could not add remote download: {}", e))),
+        }
+    }
+
+    /// Queues the download of `url` as the browser asked for it: under its file name, with its
+    /// referer (over the Settings one), User-Agent and other headers, its Authorization header for
+    /// the hosts of `url` alone, its cookies (see `ipc::save_cookies`) and its choice of MP4 for
+    /// an HLS stream (over the Settings one). The Settings are not changed.
+    fn add_browser_download(&mut self, url: &str, payload: &ipc::RemoteAddPayload) -> Result<usize, String> {
+        let mut task = ingest::link_task(&[url])?;
+        task.name = payload.file_name().map(PathBuf::from).or(task.name);
+        let (headers, auth) = payload.request_headers();
+        let mut options = task_options(&self.settings, &task, "", auth.as_deref().unwrap_or_default())?;
+        options.referer = payload.referer().or(options.referer);
+        options.headers = headers;
+        options.hls = payload.hls;
+        options.hls_to_mp4 = payload.mp4.unwrap_or(options.hls_to_mp4);
+        let cookies = payload.cookies.as_deref().filter(|cookies| !cookies.trim().is_empty());
+        if let Some(path) = cookies.zip(Url::parse(url).ok()).and_then(|(cookies, url)| ipc::save_cookies(&url, cookies)) {
+            options.cookies_path = Some(path);
+            // The cookies the browser sent win over the Settings' browser, for yt-dlp too.
+            options.browser_cookies = None;
+        }
+        Ok(queue_task(&mut self.queue, task, options))
     }
 
     fn open_dialog(&mut self, dialog: Dialog, frame: &eframe::Frame) {
@@ -1122,12 +1133,6 @@ impl App {
         self.ctx.copy_text(text);
     }
 
-    /// Copies the browser integration bookmarklet to the clipboard.
-    pub fn copy_bookmarklet(&mut self) {
-        let script = r#"javascript:(function(){const v=document.querySelector('video')?.src||window.location.href;fetch('http://127.0.0.1:49152/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:v,cookies:document.cookie,user_agent:navigator.userAgent,referer:window.location.href})}).then(r=>r.json()).then(d=>alert('Sent to Endo\'s Unified Downloader: '+d.status)).catch(e=>alert('Downloader is not running on 127.0.0.1:49152'));})();"#;
-        self.copy_text(script.to_string());
-        self.notice = Some(Ok("Copied browser bookmarklet to clipboard. Create a browser bookmark and paste this as the URL.".to_string()));
-    }
 
     /// Eases the displayed progress and speed of the shown download; true while still moving.
     fn animate(&mut self) -> bool {
@@ -1414,6 +1419,11 @@ fn shared_clients() -> EngineMaker {
     })
 }
 
+/// Clients [`cached_client`] keeps. A browser download brings its page's own headers and cookies,
+/// and so a key of its own: past this many the cache starts over rather than keep them all.
+// ponytail: emptied when full; evict the least recently used if rebuilding clients ever shows.
+const MAX_CLIENTS: usize = 16;
+
 /// The client `cache` holds for the key of `options`, built with `build` if there is none yet or
 /// the cookies file changed since, so cookies exported anew reach the next download. A client that
 /// fails to build is not kept: each download needing it reports the error.
@@ -1430,6 +1440,9 @@ fn cached_client<C: Clone>(
         return Ok(client.clone());
     }
     let client = build(options)?;
+    if cache.len() >= MAX_CLIENTS {
+        cache.clear();
+    }
     cache.insert(key, (client.clone(), cookies_changed_at));
     Ok(client)
 }
@@ -1563,146 +1576,6 @@ fn spawn_clipboard_watcher(
     if let Err(e) = spawned {
         tracing::warn!("Clipboard watcher unavailable: {}", e);
     }
-}
-
-/// Spawns a background local HTTP listener on 127.0.0.1:49152 (or next available port)
-/// to receive download tasks from browser extensions or the one-click bookmarklet.
-fn spawn_ipc_listener(
-    tx: mpsc::Sender<AppEvent>,
-    ctx: egui::Context,
-    rt: &tokio::runtime::Handle,
-) {
-    rt.spawn(async move {
-        let ports = [49152, 49153, 49154, 49155];
-        let mut listener = None;
-        for port in ports {
-            match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
-                Ok(l) => {
-                    tracing::info!("Local IPC listener bound on 127.0.0.1:{}", port);
-                    listener = Some(l);
-                    break;
-                }
-                Err(e) => {
-                    tracing::debug!("Could not bind IPC port {}: {}", port, e);
-                }
-            }
-        }
-
-        let Some(listener) = listener else {
-            tracing::warn!("Failed to bind local IPC listener on ports 49152-49155");
-            return;
-        };
-
-        loop {
-            let (mut socket, _) = match listener.accept().await {
-                Ok(conn) => conn,
-                Err(_) => break,
-            };
-
-            let tx = tx.clone();
-            let ctx = ctx.clone();
-
-            tokio::spawn(async move {
-                use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-                let mut buf = vec![0u8; 65536];
-                let mut read_bytes = 0;
-
-                let mut header_end = None;
-                while read_bytes < buf.len() {
-                    match socket.read(&mut buf[read_bytes..]).await {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            read_bytes += n;
-                            if let Some(pos) = buf[..read_bytes].windows(4).position(|w| w == b"\r\n\r\n") {
-                                header_end = Some(pos);
-                                break;
-                            }
-                        }
-                        Err(_) => return,
-                    }
-                }
-
-                let Some(hdr_pos) = header_end else {
-                    return;
-                };
-
-                let header_str = String::from_utf8_lossy(&buf[..hdr_pos]);
-                let mut lines = header_str.lines();
-                let request_line = match lines.next() {
-                    Some(l) => l,
-                    None => return,
-                };
-
-                let parts: Vec<&str> = request_line.split_whitespace().collect();
-                if parts.len() < 2 {
-                    return;
-                }
-                let method = parts[0];
-                let path = parts[1];
-
-                if method.eq_ignore_ascii_case("OPTIONS") {
-                    let response = "HTTP/1.1 204 No Content\r\n\
-Access-Control-Allow-Origin: *\r\n\
-Access-Control-Allow-Methods: POST, OPTIONS\r\n\
-Access-Control-Allow-Headers: Content-Type\r\n\
-Connection: close\r\n\r\n";
-                    let _ = socket.write_all(response.as_bytes()).await;
-                    return;
-                }
-
-                if method.eq_ignore_ascii_case("POST") && path == "/add" {
-                    let mut content_length: usize = 0;
-                    for line in lines {
-                        if let Some((k, v)) = line.split_once(':') {
-                            if k.trim().eq_ignore_ascii_case("Content-Length") {
-                                content_length = v.trim().parse().unwrap_or(0);
-                            }
-                        }
-                    }
-
-                    let body_start = hdr_pos + 4;
-                    let mut body = buf[body_start..read_bytes].to_vec();
-
-                    while body.len() < content_length && body.len() < 1024 * 1024 {
-                        let mut chunk = vec![0u8; (content_length - body.len()).min(16384)];
-                        match socket.read(&mut chunk).await {
-                            Ok(0) => break,
-                            Ok(n) => {
-                                body.extend_from_slice(&chunk[..n]);
-                            }
-                            Err(_) => break,
-                        }
-                    }
-
-                    if let Ok(payload) = serde_json::from_slice::<RemoteAddPayload>(&body) {
-                        let _ = tx.send(AppEvent::RemoteAdd(payload));
-                        ctx.request_repaint();
-
-                        let response = "HTTP/1.1 200 OK\r\n\
-Access-Control-Allow-Origin: *\r\n\
-Content-Type: application/json\r\n\
-Content-Length: 19\r\n\
-Connection: close\r\n\r\n\
-{\"status\":\"queued\"}";
-                        let _ = socket.write_all(response.as_bytes()).await;
-                        return;
-                    } else {
-                        let response = "HTTP/1.1 400 Bad Request\r\n\
-Access-Control-Allow-Origin: *\r\n\
-Content-Type: application/json\r\n\
-Connection: close\r\n\r\n\
-{\"error\":\"Invalid JSON\"}";
-                        let _ = socket.write_all(response.as_bytes()).await;
-                        return;
-                    }
-                }
-
-                let response = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n";
-                let _ = socket.write_all(response.as_bytes()).await;
-            });
-        }
-    });
 }
 
 fn apply_theme(ctx: &egui::Context) {
@@ -1853,10 +1726,15 @@ mod tests {
         std::fs::File::options().write(true).open(&cookies).unwrap().set_modified(later).unwrap();
         assert_eq!(cached_client(&cache, &with_cookies, build), Ok(4), "a changed cookies file is read again");
         assert_eq!(builds.get(), 4);
+        for n in 0..2 * MAX_CLIENTS {
+            let browser = DownloadOptions { referer: Some(format!("https://page{n}.example/")), ..plain.clone() };
+            cached_client(&cache, &browser, build).unwrap();
+        }
+        assert!(lock(&cache).len() <= MAX_CLIENTS, "one-off keys do not pile up");
 
         let failing = DownloadOptions { proxy: Some("http://127.0.0.1:10".into()), ..plain };
         assert!(cached_client(&cache, &failing, |_: &DownloadOptions| Err::<u32, _>("bad proxy".to_string())).is_err());
-        assert_eq!(cached_client(&cache, &failing, build), Ok(5), "a failed build is not kept");
+        assert_eq!(cached_client(&cache, &failing, build), Ok(5 + 2 * MAX_CLIENTS as u32), "a failed build is not kept");
     }
 
     /// Closing the window stops the live recordings, which then finish their files while it
@@ -2238,6 +2116,47 @@ mod tests {
         assert_eq!((app.queue_input.as_str(), app.queue_error.as_deref()), ("", None));
         let notice = app.notice.clone().and_then(Result::ok).unwrap_or_default();
         assert!(notice.starts_with("Nothing new in https://www.youtube.com/@NASA:") && notice.contains("Only new items"), "{notice}");
+    }
+
+    /// A download the browser sends takes its name, referer, headers, Authorization header and
+    /// choice of MP4 for itself alone: the Settings stay as they were. It waits in the queue while
+    /// the URL box is in use, and starts when it is empty and nothing shown runs.
+    #[test]
+    fn a_download_from_the_browser_takes_its_request_alone() {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(&rt, dir.path());
+        app.settings.referer = "https://settings.example/".into();
+        let settings = (app.settings.referer.clone(), app.settings.cookies_path.clone());
+        let remote = |json: serde_json::Value| AppEvent::RemoteAdd(serde_json::from_value(json).unwrap());
+        app.url_input = "https://typed.example/a.iso".into();
+        app.handle_event(remote(serde_json::json!({
+            "url": "https://cdn.example/v/master.m3u8",
+            "user_agent": "Mozilla/5.0 Test",
+            "referer": "https://page.example/watch",
+            "headers": {"Origin": "https://page.example", "Authorization": "Bearer t", "Cookie": "a=1"},
+            "filename": "My: Talk.mp4",
+            "hls": true,
+            "mp4": false,
+        })));
+        let item = &app.queue.items()[0];
+        assert!(!item.status.is_active(), "queued while the URL box is in use");
+        assert!(item.options.hls && !item.options.hls_to_mp4 && app.settings.hls_to_mp4, "MP4 is off for this download alone");
+        assert_eq!(item.filename, "My_ Talk.mp4");
+        assert_eq!(item.options.output_path, Some(dir.path().join("My_ Talk.mp4")));
+        assert_eq!(item.options.referer.as_deref(), Some("https://page.example/watch"));
+        let header = |name: &str, value: &str| (name.to_string(), value.to_string());
+        assert_eq!(item.options.headers, [header("User-Agent", "Mozilla/5.0 Test"), header("Origin", "https://page.example")]);
+        assert_eq!(item.options.auth_header.as_deref(), Some("Bearer t"));
+        assert_eq!((app.settings.referer.clone(), app.settings.cookies_path.clone()), settings);
+
+        app.url_input.clear();
+        app.handle_event(remote(serde_json::json!({"url": "https://cdn.example/b.mp4"})));
+        let started = &app.queue.items()[1];
+        assert!(started.status.is_active() && app.focused == Some(started.id));
+        assert_eq!(started.options.referer.as_deref(), Some("https://settings.example/"), "the Settings referer when the browser sends none");
+        assert!(started.options.headers.is_empty() && started.options.auth_header.is_none());
+        assert!(started.options.hls_to_mp4, "the Settings' choice of MP4 when the browser sends none");
     }
 
     /// A remote document is fetched through the proxy setting: its host does not exist, so only

@@ -173,6 +173,7 @@ fn job(args: &Args, connections: u64, dir: &Path, task: Task) -> Job {
         embed_metadata: !args.no_embed_metadata,
         live_from_start: args.live_from_start,
         wait_for_video: args.wait_for_video,
+        hls_to_mp4: args.hls_mp4,
         media_name: task.media_name,
         archive_lines: task.archive,
         ..tuning(args, if media { args.concurrent_fragments } else { connections })
@@ -217,6 +218,25 @@ async fn listed(tokens: &[String], http: &reqwest::Client, list: &ListOptions) -
 
 /// The engine settings every download of this run shares, with `connections` per download.
 fn tuning(args: &Args, connections: u64) -> DownloadOptions {
+    let mut proxy_pool = Vec::new();
+    if let Some(pool_str) = &args.proxy_pool {
+        for p in pool_str.split(',') {
+            let p = p.trim();
+            if !p.is_empty() {
+                proxy_pool.push(p.to_string());
+            }
+        }
+    }
+    if let Some(file_path) = &args.proxies_file {
+        if let Ok(content) = std::fs::read_to_string(file_path) {
+            for line in content.lines() {
+                let line = line.trim();
+                if !line.is_empty() && !line.starts_with('#') {
+                    proxy_pool.push(line.to_string());
+                }
+            }
+        }
+    }
     DownloadOptions {
         num_connections: connections as usize,
         base_chunk_size: args.chunk_size_mb * 1024 * 1024,
@@ -225,6 +245,9 @@ fn tuning(args: &Args, connections: u64) -> DownloadOptions {
         stall_timeout_secs: args.stall_timeout,
         fsync_on_complete: args.fsync,
         max_connections_per_host: args.max_connections_per_host,
+        proxy_pool,
+        debrid_api_key: args.debrid_key.clone(),
+        debrid_provider: args.debrid_provider.clone(),
         ..Default::default()
     }
 }
@@ -884,7 +907,7 @@ mod tests {
         let args = parse(&[
             "--yes-playlist", "--latest", "3", "--all-items", "--cookies-from-browser", "firefox", "--proxy",
             "socks5h://127.0.0.1:9050", "--no-install-ffmpeg", "--subs", "all", "--no-embed-metadata", "--live-from-start",
-            "--wait-for-video", "u",
+            "--wait-for-video", "--hls-mp4", "u",
         ]);
         let list = list_options(&args);
         assert!(list.whole_playlist && !list.only_new);
@@ -892,11 +915,13 @@ mod tests {
         let task = Task { urls: vec![Url::parse("https://a.example/f").unwrap()], ..Default::default() };
         let options = job(&args, 4, Path::new("d"), task).options;
         assert!(!options.install_ffmpeg && !options.embed_metadata && options.live_from_start && options.wait_for_video);
+        assert!(options.hls_to_mp4);
         assert_eq!(options.subtitles.as_deref(), Some("all"));
         let task = Task { urls: vec![Url::parse("https://a.example/f").unwrap()], ..Default::default() };
         let options = job(&parse(&["u"]), 4, Path::new("d"), task).options;
         // ffmpeg is installed only once the user agrees (see `may_install_ffmpeg`).
         assert!(!options.install_ffmpeg && options.embed_metadata && !options.live_from_start && !options.wait_for_video);
+        assert!(!options.hls_to_mp4, "an HLS stream stays MPEG-TS unless asked");
         let task = Task { urls: vec![Url::parse("https://a.example/f").unwrap()], ..Default::default() };
         assert!(job(&parse(&["--install-ffmpeg", "u"]), 4, Path::new("d"), task).options.install_ffmpeg);
     }
