@@ -200,6 +200,15 @@ pub struct DownloadOptions {
     pub live_from_start: bool,
     /// Wait for a scheduled stream or premiere to start.
     pub wait_for_video: bool,
+    /// The parts of a media download to keep, as (start, end) in seconds (yt-dlp's
+    /// `--download-sections`); empty keeps it whole.
+    pub sections: Vec<(f64, f64)>,
+    /// What happens to a YouTube video's SponsorBlock segments: "remove" cuts them out, "mark"
+    /// makes them chapters; None leaves them alone.
+    pub sponsorblock: Option<String>,
+    /// The container yt-dlp merges video and audio into ("mp4", "mkv" or "webm"); None keeps
+    /// the quality's own.
+    pub merge_format: Option<String>,
     /// How yt-dlp names a media download's file when `output_path` is a folder: an output
     /// template (see `ingest::Task::media_name`). None names it by its title.
     pub media_name: Option<String>,
@@ -267,6 +276,9 @@ impl Default for DownloadOptions {
             embed_metadata: true,
             live_from_start: false,
             wait_for_video: false,
+            sections: Vec::new(),
+            sponsorblock: None,
+            merge_format: None,
             media_name: None,
             archive_lines: Vec::new(),
             proxy_pool: Vec::new(),
@@ -932,6 +944,9 @@ impl DownloadEngine {
             embed_metadata: self.options.embed_metadata,
             live_from_start: self.options.live_from_start,
             wait_for_video: self.options.wait_for_video,
+            sections: self.options.sections.clone(),
+            sponsorblock: self.options.sponsorblock.clone(),
+            merge_format: self.options.merge_format.clone(),
         }
     }
 
@@ -2422,7 +2437,7 @@ impl ProbeInfo {
             size: None,
             accepts_ranges: false,
             filename: extract_filename(responses.iter().map(|r| r.headers()), final_url),
-            etag: header(ETAG),
+            etag: header(ETAG).filter(|_| !etag_per_range(final_url)),
             last_modified: header(LAST_MODIFIED),
             prefetch: Bytes::new(),
             per_setup: None,
@@ -2768,7 +2783,8 @@ async fn probe_with(
     hosts::record(get.url(), HostProfile { accepts_ranges: ranges, setup_time, ..Default::default() });
 
     let own = |name: HeaderName| get.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_string);
-    let own_validators = own(ETAG) == info.etag && own(LAST_MODIFIED) == info.last_modified;
+    let own_validators =
+        own(ETAG).filter(|_| !etag_per_range(get.url())) == info.etag && own(LAST_MODIFIED) == info.last_modified;
     // A stream that cannot resume goes by no validator.
     let body = holds
         .filter(|holds| prefetch && (own_validators || matches!(holds, Holds::Whole)))
@@ -2847,11 +2863,18 @@ fn says_it_all(status: StatusCode, headers: &HeaderMap, final_url: &Url) -> bool
         .get(CONTENT_RANGE)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| matches!(ByteRange::parse_content_range(v), Ok((_, Some(_)))));
-    let strong_etag = headers.get(ETAG).and_then(|v| v.to_str().ok()).is_some_and(is_strong);
+    let strong_etag =
+        headers.get(ETAG).and_then(|v| v.to_str().ok()).is_some_and(is_strong) && !etag_per_range(final_url);
     status == StatusCode::PARTIAL_CONTENT
         && has_total
         && (strong_etag || headers.contains_key(LAST_MODIFIED))
         && (disposition_name(headers).is_some() || filename_from_url(final_url).is_some())
+}
+
+/// Whether `url`'s server tags each range it sends by its own bytes, not the file's (pCloud):
+/// its ETag cannot stand in for the file in If-Range.
+fn etag_per_range(url: &Url) -> bool {
+    url.host_str().is_some_and(|h| h == "pcloud.com" || h.ends_with(".pcloud.com"))
 }
 
 /// Whether an ETag is strong: If-Range takes no weak one.
@@ -4025,6 +4048,8 @@ mod tests {
         let no_total = headers(&[("content-range", "bytes 0-0/*"), ("etag", "\"v1\"")]);
         assert!(!says_it_all(StatusCode::PARTIAL_CONTENT, &no_total, &named), "no size");
         assert!(!says_it_all(StatusCode::OK, &tagged, &named), "no ranges");
+        let pcloud = Url::parse("https://p-def8.pcloud.com/x/tool.zip").unwrap();
+        assert!(!says_it_all(StatusCode::PARTIAL_CONTENT, &tagged, &pcloud), "pCloud's ETag tags the range, not the file");
     }
 
     #[test]
@@ -6204,6 +6229,16 @@ mod tests {
         let back: DownloadOptions = serde_json::from_str(&serde_json::to_string(&with).unwrap()).unwrap();
         assert_eq!(back.page_media_preset, Some(AudioMp3));
         assert_eq!(serde_json::from_str::<DownloadOptions>("{}").unwrap().page_media_preset, None);
+    }
+
+    /// The clips, SponsorBlock choice and container of a download reach yt-dlp.
+    #[test]
+    fn test_media_edits_reach_yt_dlp() {
+        let (sponsorblock, merge_format) = (Some("mark".to_string()), Some("mkv".to_string()));
+        let options = DownloadOptions { sections: vec![(90.0, 150.5)], sponsorblock, merge_format, ..Default::default() };
+        let media = engine_with(options).media_options();
+        assert_eq!(media.sections, [(90.0, 150.5)]);
+        assert_eq!((media.sponsorblock.as_deref(), media.merge_format.as_deref()), (Some("mark"), Some("mkv")));
     }
 
     /// A playlist entry saved into a folder is named by yt-dlp as the entry says (its title and

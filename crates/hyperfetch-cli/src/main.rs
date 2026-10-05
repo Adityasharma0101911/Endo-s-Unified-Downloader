@@ -201,6 +201,9 @@ fn job(args: &Args, connections: u64, dir: &Path, task: Task) -> Job {
         embed_metadata: !args.no_embed_metadata,
         live_from_start: args.live_from_start,
         wait_for_video: args.wait_for_video,
+        sections: args.sections.clone(),
+        sponsorblock: args.sponsorblock.clone(),
+        merge_format: args.merge_format.clone(),
         hls_to_mp4: args.hls_mp4,
         media_name: task.media_name,
         archive_lines: task.archive,
@@ -998,7 +1001,7 @@ mod tests {
         let args = parse(&[
             "--yes-playlist", "--latest", "3", "--all-items", "--cookies-from-browser", "firefox", "--proxy",
             "socks5h://127.0.0.1:9050", "--no-install-ffmpeg", "--subs", "all", "--no-embed-metadata", "--live-from-start",
-            "--wait-for-video", "--hls-mp4", "u",
+            "--wait-for-video", "--hls-mp4", "--sections", "1:30-2:30", "--sponsorblock", "remove", "--merge-format", "mkv", "u",
         ]);
         let list = list_options(&args);
         assert!(list.whole_playlist && !list.only_new);
@@ -1008,11 +1011,14 @@ mod tests {
         assert!(!options.install_ffmpeg && !options.embed_metadata && options.live_from_start && options.wait_for_video);
         assert!(options.hls_to_mp4);
         assert_eq!(options.subtitles.as_deref(), Some("all"));
+        assert_eq!(options.sections, [(90.0, 150.0)]);
+        assert_eq!((options.sponsorblock.as_deref(), options.merge_format.as_deref()), (Some("remove"), Some("mkv")));
         let task = Task { urls: vec![Url::parse("https://a.example/f").unwrap()], ..Default::default() };
         let options = job(&parse(&["u"]), 4, Path::new("d"), task).options;
         // ffmpeg is installed only once the user agrees (see `may_install_ffmpeg`).
         assert!(!options.install_ffmpeg && options.embed_metadata && !options.live_from_start && !options.wait_for_video);
         assert!(!options.hls_to_mp4, "an HLS stream stays MPEG-TS unless asked");
+        assert!(options.sections.is_empty() && options.sponsorblock.is_none() && options.merge_format.is_none());
         let task = Task { urls: vec![Url::parse("https://a.example/f").unwrap()], ..Default::default() };
         assert!(job(&parse(&["--install-ffmpeg", "u"]), 4, Path::new("d"), task).options.install_ffmpeg);
     }

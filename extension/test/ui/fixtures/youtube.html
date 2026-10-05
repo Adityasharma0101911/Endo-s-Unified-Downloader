@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Fixture YouTube page</title>
+<!--
+  Mimics where content/youtube.js puts its button on YouTube: a watch page's actions (?v=<id>) or the Shorts action
+  column (?shorts), with YouTube's colour variables for light and html[dark]. navigateTo(id) re-renders the page and
+  fires yt-navigate-finish as YouTube's in-page navigation does; nextShort() makes the second Short the active one.
+-->
+<style>
+  html {
+    --yt-spec-base-background: #fff;
+    --yt-spec-text-primary: #0f0f0f;
+    --yt-spec-badge-chip-background: rgba(0, 0, 0, 0.05);
+    --yt-spec-button-chip-background-hover: rgba(0, 0, 0, 0.1);
+    --yt-spec-menu-background: #fff;
+    --yt-spec-10-percent-layer: rgba(0, 0, 0, 0.1);
+    --yt-spec-inverted-background: #0f0f0f;
+    --yt-spec-text-primary-inverse: #fff;
+  }
+  html[dark] {
+    --yt-spec-base-background: #0f0f0f;
+    --yt-spec-text-primary: #f1f1f1;
+    --yt-spec-badge-chip-background: rgba(255, 255, 255, 0.1);
+    --yt-spec-button-chip-background-hover: rgba(255, 255, 255, 0.2);
+    --yt-spec-menu-background: #282828;
+    --yt-spec-10-percent-layer: rgba(255, 255, 255, 0.2);
+    --yt-spec-inverted-background: #f1f1f1;
+    --yt-spec-text-primary-inverse: #0f0f0f;
+  }
+  body { margin: 24px; background: var(--yt-spec-base-background); color: var(--yt-spec-text-primary); font-family: Roboto, Arial, sans-serif; }
+  h1 { margin: 12px 0; font-size: 20px; }
+  .player { width: 560px; aspect-ratio: 16 / 9; border-radius: 12px; background: #000; }
+  #top-level-buttons-computed { display: flex; align-items: center; gap: 8px; }
+  .pill { height: 36px; padding: 0 16px; border: 0; border-radius: 18px; background: var(--yt-spec-badge-chip-background); color: inherit; font: 500 14px Roboto, Arial, sans-serif; }
+  ytd-reel-video-renderer { display: flex; align-items: flex-end; gap: 16px; }
+  ytd-reel-video-renderer:not([is-active]) { display: none; }
+  .short { width: 270px; aspect-ratio: 9 / 16; border-radius: 12px; background: #000; color: #fff; padding: 12px; box-sizing: border-box; }
+  #actions { display: flex; flex-direction: column; align-items: center; gap: 16px; }
+  .round { width: 48px; height: 48px; border: 0; border-radius: 50%; background: var(--yt-spec-badge-chip-background); color: inherit; font: 12px Roboto, Arial, sans-serif; }
+</style>
+<body>
+<div id="app"></div>
+<script>
+  const app = document.getElementById("app");
+  const shorts = new URLSearchParams(location.search).has("shorts");
+  const round = (text) => `<button class="round">${text}</button>`;
+  const reel = (n, active) => `<ytd-reel-video-renderer id="reel-${n}"${active ? " is-active" : ""}>
+    <div class="short">Fixture Short ${n}</div>
+    <div id="actions">
+      <like-button-view-model>${round("Like")}</like-button-view-model>
+      <dislike-button-view-model>${round("No")}</dislike-button-view-model>
+      <button-view-model>${round("Talk")}</button-view-model>
+      <button-view-model>${round("Share")}</button-view-model>
+      <pivot-button-view-model>${round("Song")}</pivot-button-view-model>
+    </div>
+  </ytd-reel-video-renderer>`;
+
+  /** Builds the page anew, as YouTube re-renders it on navigating. */
+  function render() {
+    const v = new URLSearchParams(location.search).get("v") || "";
+    app.innerHTML = shorts
+      ? `<ytd-shorts>${reel(1, true)}${reel(2, false)}</ytd-shorts>`
+      : `<ytd-watch-flexy><div class="player"></div><ytd-watch-metadata><h1>Fixture video ${v}</h1>
+          <div id="actions"><ytd-menu-renderer><div id="top-level-buttons-computed">
+            <segmented-like-dislike-button-view-model><button class="pill">Like 12K</button></segmented-like-dislike-button-view-model>
+            <yt-button-view-model><button class="pill" aria-label="Share">Share</button></yt-button-view-model>
+          </div></ytd-menu-renderer></div>
+        </ytd-watch-metadata></ytd-watch-flexy>`;
+  }
+  window.navigateTo = (v) => {
+    history.pushState(null, "", `?v=${encodeURIComponent(v)}`);
+    render();
+    document.dispatchEvent(new CustomEvent("yt-navigate-finish", { bubbles: true }));
+  };
+  window.nextShort = () => {
+    document.getElementById("reel-1").removeAttribute("is-active");
+    document.getElementById("reel-2").setAttribute("is-active", "");
+  };
+  render();
+</script>
+</body>
+</html>

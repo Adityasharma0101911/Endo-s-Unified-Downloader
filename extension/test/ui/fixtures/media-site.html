@@ -2,4 +2,17 @@
 <meta charset="utf-8">
 <title>Fixture clip on a media site</title>
 <h1>Fixture clip on a media site</h1>
-<p>Served under a media-site host name (see run.mjs --host-resolver-rules): the popup offers Download this page.</p>
+<p>Served under a media-site host name (see run.mjs --host-resolver-rules): the popup offers its media card, or Download this page on the home page.</p>
+<p>The video (a canvas stream, nothing to fetch) plays for the card's "Use the current time".</p>
+<video id="v" width="320" height="180" muted autoplay playsinline></video>
+<script>
+  const canvas = Object.assign(document.createElement("canvas"), { width: 320, height: 180 });
+  const g = canvas.getContext("2d");
+  setInterval(() => {
+    g.fillStyle = "#1f2937";
+    g.fillRect(0, 0, 320, 180);
+  }, 200);
+  const v = document.getElementById("v");
+  v.srcObject = canvas.captureStream(5);
+  v.play().catch(() => {});
+</script>

@@ -2444,14 +2444,18 @@ async fn test_a_code_host_folder_is_an_error_not_a_download() {
     let mut page = Mock::new(b"<!doctype html><title>docs at main</title>".to_vec());
     page.content_type = Some("text/html; charset=utf-8");
     let proxy = serve(Arc::new(page), "").await;
-    let temp = tempdir().unwrap();
-    let folder = Url::parse("http://github.com/links-lane/repo/tree/main/docs").unwrap();
-
-    let err = run(&DownloadEngine::new(vec![folder], through(&proxy, temp.path())), None)
-        .await
-        .expect_err("a folder's page is no file");
-    assert!(err.contains("the link leads to a folder, not a file"), "{err}");
-    assert!(names_in(temp.path()).is_empty(), "{:?}", names_in(temp.path()));
+    // A GitHub folder is listed into its files (repos.rs); as one download it says so.
+    for (link, expected) in [
+        ("http://gitlab.com/links-lane/repo/-/tree/main/docs", "the link leads to a folder, not a file"),
+        ("http://github.com/links-lane/repo/tree/main/docs", "this link lists several files"),
+    ] {
+        let temp = tempdir().unwrap();
+        let err = run(&DownloadEngine::new(vec![Url::parse(link).unwrap()], through(&proxy, temp.path())), None)
+            .await
+            .expect_err("a folder's page is no file");
+        assert!(err.contains(expected), "{link}: {err}");
+        assert!(names_in(temp.path()).is_empty(), "{link}: {:?}", names_in(temp.path()));
+    }
 }
 
 // ---- Links judged by where they lead: short links, pages that send the browser on, shorteners ----
@@ -3844,6 +3848,32 @@ async fn test_live_settings_reach_yt_dlp() {
     let runs = runs_of(tools.path());
     let [download] = &runs[..] else { panic!("one download: {runs:?}") };
     assert!(has_arg(download, "--wait-for-video", "60-600") && download.contains(&"--live-from-start".to_string()), "{download:?}");
+}
+
+/// A clip, SponsorBlock and the container chosen reach yt-dlp's own download, which makes the
+/// file without an extraction first: the engine downloads no stream of it.
+#[tokio::test]
+async fn test_clips_sponsorblock_and_container_reach_yt_dlp() {
+    isolate_history();
+    let _history = HISTORY.write().await;
+    let (tools, temp) = (tempdir().unwrap(), tempdir().unwrap());
+    let output = temp.path().join("A talk.mkv");
+    let opts = DownloadOptions {
+        ytdlp_path: Some(fake_ytdlp(tools.path(), &output)),
+        sections: vec![(90.0, 150.5)],
+        sponsorblock: Some("remove".into()),
+        merge_format: Some("mkv".into()),
+        ..options(temp.path(), 4, 64 * KB)
+    };
+    let url = Url::parse("https://www.youtube.com/watch?v=abc").unwrap();
+
+    assert_eq!(run(&DownloadEngine::new(vec![url], opts), None).await, Ok(output));
+    let runs = runs_of(tools.path());
+    let [download] = &runs[..] else { panic!("one download: {runs:?}") };
+    assert!(has_arg(download, "--download-sections", "*90-150.5"), "{download:?}");
+    assert!(has_arg(download, "--sponsorblock-remove", "sponsor,selfpromo,interaction"), "{download:?}");
+    let container = download.windows(2).filter(|pair| pair[0] == "--merge-output-format").last().map(|pair| pair[1].as_str());
+    assert_eq!(container, Some("mkv"), "{download:?}");
 }
 
 /// A stand-in for yt-dlp in `dir` that finds a live stream (`dir/info.json`) and records it into

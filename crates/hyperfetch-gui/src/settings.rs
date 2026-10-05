@@ -17,6 +17,12 @@ pub const MEDIA_PRESETS: [&str; 5] = [
     "Audio Only (M4A)",
 ];
 
+/// What `Settings::sponsorblock` does with a YouTube video's SponsorBlock segments.
+pub const SPONSORBLOCK_MODES: [&str; 3] = ["Off", "Remove them", "Mark as chapters"];
+
+/// The containers `Settings::merge_format` merges video and audio into.
+pub const MERGE_FORMATS: [&str; 3] = ["MP4", "MKV", "WebM"];
+
 pub const BROWSERS: [&str; 7] = [
     "None",
     "Google Chrome",
@@ -76,6 +82,11 @@ pub struct Settings {
     pub live_from_start: bool,
     /// Wait for a scheduled stream or premiere to begin instead of failing.
     pub wait_for_video: bool,
+    /// A YouTube video's SponsorBlock segments: 0 left alone, 1 removed, 2 marked as chapters
+    /// (see [`SPONSORBLOCK_MODES`]).
+    pub sponsorblock: usize,
+    /// The container video and audio are merged into: 0 MP4, 1 MKV, 2 WebM (see [`MERGE_FORMATS`]).
+    pub merge_format: usize,
     /// Remux HLS streams saved as MPEG-TS into MP4 (see `DownloadOptions::hls_to_mp4`). On by
     /// default, also for settings an older version saved.
     pub hls_to_mp4: bool,
@@ -157,6 +168,8 @@ impl Default for Settings {
             embed_metadata: engine.embed_metadata,
             live_from_start: engine.live_from_start,
             wait_for_video: engine.wait_for_video,
+            sponsorblock: 0,
+            merge_format: 0,
             hls_to_mp4: true,
             referer: String::new(),
             proxy_pool: String::new(),
@@ -266,6 +279,17 @@ impl Settings {
             embed_metadata: self.embed_metadata,
             live_from_start: self.live_from_start,
             wait_for_video: self.wait_for_video,
+            sponsorblock: match self.sponsorblock {
+                1 => Some("remove".to_string()),
+                2 => Some("mark".to_string()),
+                _ => None,
+            },
+            // MP4 is what video and audio are merged into without a choice, so it sets none.
+            merge_format: match self.merge_format {
+                1 => Some("mkv".to_string()),
+                2 => Some("webm".to_string()),
+                _ => None,
+            },
             hls_to_mp4: self.hls_to_mp4,
             post: PostOptions {
                 extract: self.auto_extract,
@@ -564,6 +588,8 @@ mod tests {
         assert!(!opts.install_ffmpeg && opts.embed_metadata && !opts.live_from_start && !opts.wait_for_video);
         assert!(saved.hls_to_mp4 && opts.hls_to_mp4, "HLS is remuxed to MP4 unless turned off");
         assert_eq!(opts.subtitles, None);
+        assert_eq!((saved.sponsorblock, saved.merge_format), (0, 0));
+        assert_eq!((opts.sponsorblock, opts.merge_format), (None, None), "no SponsorBlock, and MP4 as without a choice");
         let agreed = Settings { install_ffmpeg: Some(true), ..saved.clone() };
         assert!(agreed.download_options(&file, "", "").unwrap().install_ffmpeg);
 
@@ -578,6 +604,8 @@ mod tests {
             live_from_start: true,
             wait_for_video: true,
             hls_to_mp4: false,
+            sponsorblock: 2,
+            merge_format: 1,
             ..saved
         };
         let list = chosen.list_options();
@@ -587,6 +615,9 @@ mod tests {
         assert!(!opts.install_ffmpeg && !opts.embed_metadata && opts.live_from_start && opts.wait_for_video);
         assert!(!opts.hls_to_mp4);
         assert_eq!(opts.subtitles.as_deref(), Some("en,es"));
+        assert_eq!((opts.sponsorblock.as_deref(), opts.merge_format.as_deref()), (Some("mark"), Some("mkv")));
+        let other = Settings { sponsorblock: 1, merge_format: 2, ..chosen.clone() }.download_options(&file, "", "").unwrap();
+        assert_eq!((other.sponsorblock.as_deref(), other.merge_format.as_deref()), (Some("remove"), Some("webm")));
         let json = serde_json::to_string(&chosen).unwrap();
         assert_eq!(serde_json::from_str::<Settings>(&json).unwrap(), Settings { google_api_key: String::new(), ..chosen });
     }

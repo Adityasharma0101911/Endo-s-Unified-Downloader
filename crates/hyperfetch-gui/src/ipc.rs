@@ -1,21 +1,23 @@
 //! The local HTTP API the browser extension talks to, on 127.0.0.1 only: `GET /ping` finds the
-//! app, `POST /add` adds a download with what the browser sent to fetch it, and the `/record/…`
-//! routes take the video the extension records from a page (see `recording`). Every route
-//! answers only the extension and local programs, which send no web `Origin`; web pages get 403.
+//! app, `POST /add` adds a download with what the browser sent to fetch it, `POST /info` tells
+//! what a media link holds (see `media::info`), and the `/record/…` routes take the video the
+//! extension records from a page (see `recording`). Every route answers only the extension and
+//! local programs, which send no web `Origin`; web pages get 403.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use eframe::egui;
-use hyperfetch_core::{engine, updater};
+use hyperfetch_core::{engine, media, updater};
 use serde_json::json;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use url::Url;
 
 use crate::recording::{self, Recordings, Refusal};
+use crate::util::lock;
 use crate::AppEvent;
 
 /// Ports tried in turn; the extension looks for the app on each.
@@ -30,6 +32,8 @@ const MAX_HEAD: usize = 64 * 1024;
 /// cookie jar), of a recording chunk, and of any other request.
 const MAX_ADD_BODY: usize = 4 << 20;
 const MAX_CHUNK_BODY: usize = 64 << 20;
+/// Largest body of `POST /info`: a link and a site's cookie jar.
+const MAX_INFO_BODY: usize = 256 << 10;
 const MAX_BODY: usize = 64 * 1024;
 /// Largest playlist a page built itself that `/add` takes.
 const MAX_PLAYLIST: usize = 1 << 20;
@@ -106,6 +110,64 @@ pub struct RemoteAddPayload {
     /// `DownloadOptions::playlist_text`); [`parse_add`] takes one of at most [`MAX_PLAYLIST`]
     /// bytes that starts with `#EXTM3U`.
     pub playlist: Option<String>,
+    /// What the extension's media card chose for a media-site link (see [`MediaChoice`]).
+    pub media: Option<MediaChoice>,
+}
+
+/// Qualities, containers and SponsorBlock modes a [`MediaChoice`] may name.
+const QUALITIES: [&str; 9] = ["best", "2160", "1440", "1080", "720", "480", "360", "audio-m4a", "audio-mp3"];
+const CONTAINERS: [&str; 3] = ["mp4", "mkv", "webm"];
+const SPONSORBLOCK: [&str; 3] = ["remove", "mark", "off"];
+/// Most clips of a [`MediaChoice`], and the latest second one may end at (24 hours).
+const MAX_SECTIONS: usize = 10;
+const MAX_SECTION_END: f64 = 86_400.0;
+
+/// What the extension's media card chose for a media-site download (`POST /add`'s `media`):
+/// every field optional, any other one refused (see [`MediaChoice::check`]).
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MediaChoice {
+    /// One of [`QUALITIES`]: the best, the tallest video wanted, or audio alone.
+    pub quality: Option<String>,
+    /// One of [`CONTAINERS`], to merge video and audio into.
+    pub container: Option<String>,
+    /// Subtitle languages, "en,es" or "all"; "" for none. None leaves them to the Settings.
+    pub subtitles: Option<String>,
+    /// The parts to keep, as [start, end] seconds: at most [`MAX_SECTIONS`], within 24 hours.
+    pub sections: Vec<(f64, f64)>,
+    /// One of [`SPONSORBLOCK`]; None leaves it to the Settings.
+    pub sponsorblock: Option<String>,
+    /// Download the list the link names, not the one video.
+    pub playlist: bool,
+    /// Record a live stream from its start.
+    pub live_from_start: bool,
+}
+
+impl MediaChoice {
+    /// Why the choice is refused, if it is: a value outside its list, subtitle languages that
+    /// are no comma-separated list of codes, or clips that are too many or out of 0 ≤ start <
+    /// end ≤ 24 h.
+    fn check(&self) -> Result<(), String> {
+        let listed = |value: &Option<String>, list: &[&str]| value.as_deref().is_none_or(|value| list.contains(&value));
+        if !listed(&self.quality, &QUALITIES) {
+            return Err(format!("media.quality must be one of {}", QUALITIES.join(", ")));
+        }
+        if !listed(&self.container, &CONTAINERS) {
+            return Err(format!("media.container must be one of {}", CONTAINERS.join(", ")));
+        }
+        if !listed(&self.sponsorblock, &SPONSORBLOCK) {
+            return Err(format!("media.sponsorblock must be one of {}", SPONSORBLOCK.join(", ")));
+        }
+        let language = |b: u8| b.is_ascii_alphanumeric() || b",-_".contains(&b);
+        if self.subtitles.as_deref().is_some_and(|s| s.len() > 200 || !s.bytes().all(language)) {
+            return Err("media.subtitles must be languages like en,es or all".to_string());
+        }
+        let clip = |&(start, end): &(f64, f64)| 0.0 <= start && start < end && end <= MAX_SECTION_END;
+        if self.sections.len() > MAX_SECTIONS || !self.sections.iter().all(clip) {
+            return Err(format!("media.sections takes at most {} [start, end] pairs with 0 ≤ start < end ≤ 86400", MAX_SECTIONS));
+        }
+        Ok(())
+    }
 }
 
 /// A cookie of the browser's, as the extension reads it (chrome.cookies).
@@ -350,6 +412,17 @@ impl Server {
                 }
                 Err(e) => Response::error("400 Bad Request", allow_origin.clone(), &e),
             },
+            // The same body as `/add`: `url`, and the site's `cookie_jar`.
+            ("POST", "/info") => match parse_info(&body) {
+                Ok((url, payload)) => {
+                    let proxy = lock(&PROXY).clone();
+                    match media_info(&url, payload.cookies_file(&url), proxy).await {
+                        Ok(info) => reply("200 OK", json!(info)),
+                        Err(e) => Response::error("422 Unprocessable Entity", allow_origin.clone(), &e),
+                    }
+                }
+                Err(e) => Response::error("400 Bad Request", allow_origin.clone(), &e),
+            },
             ("POST", "/record/start") => {
                 #[derive(Default, serde::Deserialize)]
                 #[serde(default)]
@@ -407,6 +480,36 @@ impl Server {
     }
 }
 
+/// The proxy setting, which `/info` asks yt-dlp through (see [`set_proxy`]).
+static PROXY: Mutex<Option<String>> = Mutex::new(None);
+
+/// Keeps what `/info` asks yt-dlp through the proxy setting `proxy`, as it is now.
+pub fn set_proxy(proxy: &str) {
+    let proxy = Some(proxy.trim()).filter(|p| !p.is_empty());
+    let mut shared = lock(&PROXY);
+    if shared.as_deref() != proxy {
+        *shared = proxy.map(str::to_string);
+    }
+}
+
+/// What `media::info` tells of `url`, asked through `proxy` with `cookies`, the browser's cookies
+/// file (see [`RemoteAddPayload::cookies_file`]), saved as a download's is.
+#[cfg(not(test))]
+async fn media_info(url: &Url, cookies: Option<String>, proxy: Option<String>) -> Result<media::MediaInfo, String> {
+    let cookies = cookies.and_then(|text| save_cookies(url, &text));
+    media::info(url, cookies.as_deref(), proxy.as_deref()).await
+}
+
+/// A stand-in for `media::info` that runs no yt-dlp and saves no cookies: it tells what it was
+/// asked with, and fails for a link to `fail.example`.
+#[cfg(test)]
+async fn media_info(url: &Url, cookies: Option<String>, proxy: Option<String>) -> Result<media::MediaInfo, String> {
+    if url.host_str() == Some("fail.example") {
+        return Err("Sign in to confirm your age.".to_string());
+    }
+    Ok(media::MediaInfo { title: url.to_string(), uploader: cookies, thumbnail: proxy, ..Default::default() })
+}
+
 /// `/record/<id>/<action>` as its id and action, when the id is one a recording can have.
 fn record_route(path: &str) -> Option<(&str, &str)> {
     path.strip_prefix("/record/")?.split_once('/').filter(|(id, _)| recording::valid_id(id))
@@ -419,6 +522,7 @@ fn parse_add(body: &[u8]) -> Result<RemoteAddPayload, String> {
     if payload.playlist_text().is_some_and(|text| text.len() > MAX_PLAYLIST || !text.starts_with("#EXTM3U")) {
         return Err("playlist must be an HLS playlist (#EXTM3U) of at most 1 MiB".to_string());
     }
+    payload.media.as_ref().map_or(Ok(()), MediaChoice::check)?;
     let refused = if payload.urls.is_empty() {
         (!http_link(&payload.url)).then(|| "url must be an http or https link".to_string())
     } else if !payload.url.trim().is_empty() {
@@ -429,6 +533,16 @@ fn parse_add(body: &[u8]) -> Result<RemoteAddPayload, String> {
         (!payload.urls.iter().all(|url| http_link(url))).then(|| "every link of urls must be http or https".to_string())
     };
     refused.map_or(Ok(payload), Err)
+}
+
+/// The media link `body` asks `POST /info` about: JSON with an http(s) `url` (and the site's
+/// `cookie_jar`, see [`RemoteAddPayload::cookies_file`]). Else why it is refused.
+fn parse_info(body: &[u8]) -> Result<(Url, RemoteAddPayload), String> {
+    let payload: RemoteAddPayload = serde_json::from_slice(body).map_err(|e| format!("invalid JSON: {}", e))?;
+    match Url::parse(payload.url.trim()) {
+        Ok(url) if matches!(url.scheme(), "http" | "https") => Ok((url, payload)),
+        _ => Err("url must be an http or https link".to_string()),
+    }
 }
 
 struct Request {
@@ -506,6 +620,7 @@ fn admit(method: &str, path: &str, origin: Option<&str>) -> Result<(Option<Strin
     }
     let max_body = match path {
         "/add" => MAX_ADD_BODY,
+        "/info" => MAX_INFO_BODY,
         _ if record_route(path).is_some_and(|(_, action)| action == "chunk") => MAX_CHUNK_BODY,
         _ => MAX_BODY,
     };
@@ -598,6 +713,7 @@ mod tests {
     fn web_pages_reach_nothing() {
         assert_eq!(admit("POST", "/add", None), Ok((None, MAX_ADD_BODY)));
         assert_eq!(admit("GET", "/ping", None), Ok((None, MAX_BODY)));
+        assert_eq!(admit("POST", "/info", None), Ok((None, MAX_INFO_BODY)));
         let extension = "chrome-extension://abcdefghijklmnop";
         assert_eq!(admit("GET", "/ping", Some(extension)), Ok((Some(extension.to_string()), MAX_BODY)));
         assert!(admit("POST", "/record/start", Some("moz-extension://1234")).is_ok());
@@ -605,6 +721,7 @@ mod tests {
         let forbidden = Err(Response::error("403 Forbidden", None, "forbidden origin"));
         for (method, path, origin) in [
             ("POST", "/add", "https://page.example"),
+            ("POST", "/info", "https://page.example"),
             ("GET", "/ping", "https://page.example"),
             ("POST", "/record/start", "null"),
             ("POST", "/record/a1/chunk", "http://127.0.0.1:8000"),
@@ -685,6 +802,98 @@ mod tests {
         assert_eq!(payload.url, "https://cdn.example/v/master.m3u8");
         assert_eq!((payload.referer(), payload.file_name()), (Some("https://page.example/watch".to_string()), Some("Talk.mp4".to_string())));
         assert_eq!(payload.request_headers().0, [("Origin".to_string(), "https://page.example".to_string())]);
+
+        // What the media card chose reaches the app with the link; a choice out of its lists does not.
+        let body = br#"{"url":"https://www.youtube.com/watch?v=x","media":{"quality":"720","playlist":true}}"#;
+        assert_eq!(parts(&exchange(&server, &request("POST", "/add", page, Some(body))).await).0, "HTTP/1.1 200 OK");
+        let Ok(AppEvent::RemoteAdd(payload)) = received.try_recv() else { panic!("the media download reaches the app") };
+        assert_eq!(payload.media, Some(MediaChoice { quality: Some("720".into()), playlist: true, ..Default::default() }));
+        let body = br#"{"url":"https://www.youtube.com/watch?v=x","media":{"quality":"8k"}}"#;
+        assert_eq!(parts(&exchange(&server, &request("POST", "/add", page, Some(body))).await).0, "HTTP/1.1 400 Bad Request");
+        assert!(received.try_recv().is_err());
+    }
+
+    /// `/info` takes an http(s) link from the extension alone, in a body of at most 256 KiB, and
+    /// answers what `media::info` says, asked with the site's cookie jar and through the proxy
+    /// setting; its error as `{"error": …}`.
+    #[tokio::test]
+    async fn info_answers_the_extension_about_a_link() {
+        let root = tempfile::tempdir().unwrap();
+        let (server, received) = server(root.path());
+        let ext = Some("chrome-extension://abc");
+        let body = br#"{"url":"https://www.youtube.com/watch?v=x","cookie_jar":[{"domain":".youtube.com","name":"a","value":"1"}]}"#;
+        set_proxy(" http://127.0.0.1:8080 ");
+        let response = exchange(&server, &request("POST", "/info", ext, Some(body))).await;
+        let (status, info) = parts(&response);
+        assert_eq!(status, "HTTP/1.1 200 OK");
+        assert!(response.contains("Access-Control-Allow-Origin: chrome-extension://abc\r\n"), "{response}");
+        // What the stand-in was asked with (see `media_info`).
+        assert_eq!(info["title"], "https://www.youtube.com/watch?v=x");
+        assert_eq!(info["uploader"], "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tFALSE\t0\ta\t1\n", "the jar's cookies file");
+        assert_eq!((&info["thumbnail"], &info["live"]), (&json!("http://127.0.0.1:8080"), &json!("none")));
+        let response = exchange(&server, &request("POST", "/info", ext, Some(br#"{"url":"https://fail.example/v"}"#))).await;
+        assert_eq!(parts(&response), ("HTTP/1.1 422 Unprocessable Entity", json!({"error": "Sign in to confirm your age."})));
+        assert!(response.contains("Access-Control-Allow-Origin: chrome-extension://abc\r\n"), "{response}");
+        for bad in [&b"{not json"[..], br#"{"url":"ftp://h.example/v"}"#, br#"{}"#] {
+            let response = exchange(&server, &request("POST", "/info", ext, Some(bad))).await;
+            assert_eq!(parts(&response).0, "HTTP/1.1 400 Bad Request", "{}", String::from_utf8_lossy(bad));
+        }
+        let response = exchange(&server, &request("POST", "/info", Some("https://page.example"), Some(body))).await;
+        assert_eq!(parts(&response).0, "HTTP/1.1 403 Forbidden");
+        let too_big = format!("POST /info HTTP/1.1\r\nContent-Length: {}\r\n\r\n", MAX_INFO_BODY + 1);
+        assert_eq!(parts(&exchange(&server, too_big.as_bytes()).await).0, "HTTP/1.1 413 Payload Too Large");
+        assert!(received.try_recv().is_err(), "nothing is added");
+    }
+
+    /// `/add`'s `media`: every field optional, each value from its list, at most 10 clips within
+    /// 24 hours, and no other field.
+    #[test]
+    fn a_media_choice_is_checked() {
+        let add = |media: serde_json::Value| parse_add(json!({"url": "https://www.youtube.com/watch?v=x", "media": media}).to_string().as_bytes());
+        let full = json!({
+            "quality": "1080", "container": "mkv", "subtitles": "en,es", "sections": [[90, 150.5], [0, 86400]],
+            "sponsorblock": "remove", "playlist": true, "live_from_start": true,
+        });
+        let expected = MediaChoice {
+            quality: Some("1080".into()),
+            container: Some("mkv".into()),
+            subtitles: Some("en,es".into()),
+            sections: vec![(90.0, 150.5), (0.0, 86_400.0)],
+            sponsorblock: Some("remove".into()),
+            playlist: true,
+            live_from_start: true,
+        };
+        assert_eq!(add(full).unwrap().media, Some(expected));
+        assert_eq!(add(json!({})).unwrap().media, Some(MediaChoice::default()));
+        assert_eq!(parse_add(br#"{"url":"https://a.example/v"}"#).unwrap().media, None);
+        for quality in QUALITIES {
+            assert!(add(json!({"quality": quality, "subtitles": "all"})).is_ok(), "{quality}");
+        }
+        // The card's None and Off, over the Settings.
+        assert!(add(json!({"subtitles": "", "sponsorblock": "off"})).is_ok());
+        let ten: Vec<(u32, u32)> = (0..10).map(|n| (n * 10, n * 10 + 5)).collect();
+        assert!(add(json!({"sections": ten})).is_ok());
+
+        for (refused, why) in [
+            (json!({"quality": "4k"}), "media.quality"),
+            (json!({"quality": "720p"}), "media.quality"),
+            (json!({"container": "avi"}), "media.container"),
+            (json!({"sponsorblock": "skip"}), "media.sponsorblock"),
+            (json!({"subtitles": "en es"}), "media.subtitles"),
+            (json!({"subtitles": "en;--exec"}), "media.subtitles"),
+            (json!({"sections": [[150, 90]]}), "media.sections"),
+            (json!({"sections": [[90, 90]]}), "media.sections"),
+            (json!({"sections": [[-1, 10]]}), "media.sections"),
+            (json!({"sections": [[0, 86401]]}), "media.sections"),
+            (json!({"sections": (0..11).map(|n| (n, n + 1)).collect::<Vec<_>>()}), "media.sections"),
+            (json!({"sections": [[1, 2, 3]]}), "invalid JSON"),
+            (json!({"sections": [90, 150]}), "invalid JSON"),
+            (json!({"quality": 1080}), "invalid JSON"),
+            (json!({"format": "bv*"}), "unknown field"),
+        ] {
+            let error = add(refused.clone()).unwrap_err();
+            assert!(error.contains(why), "{refused}: {error}");
+        }
     }
 
     #[test]

@@ -10,7 +10,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { normalizeLinks } from "../../lib/links.js";
 import { startFixtures } from "./fixtures/serve.mjs";
-import { startMockApp } from "./mock-app.mjs";
+import { INFO, INFO_ERROR, startMockApp } from "./mock-app.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const CDP_PORT = 9447;
@@ -250,6 +250,119 @@ async function captureAfter(page, fixture, name) {
   }
 }
 
+// ---- the media card ----
+
+/** Waits for the media card's choices (or its error), then reads what it shows. */
+async function mediaCard(page) {
+  await until(() => evaluate(page.sessionId, `!document.getElementById("mc-form").hidden || !document.getElementById("mc-error").hidden`), 8000);
+  return evaluate(page.sessionId, `(() => {
+    const $ = (id) => document.getElementById(id);
+    return {
+      title: $("mc-title").textContent,
+      channel: $("mc-channel").textContent,
+      length: __vis($("mc-length")) ? $("mc-length").textContent : "",
+      chip: __vis($("mc-live")) ? $("mc-live").textContent : "",
+      thumb: __vis($("mc-thumb")) && $("mc-thumb").complete && $("mc-thumb").naturalWidth > 0,
+      qualities: [...document.querySelectorAll("#mc-quality .seg")].map((l) => l.textContent),
+      audio: __vis($("mc-audio-row")),
+      quality: document.querySelector("#mc-form input[name=quality]:checked")?.value,
+      container: document.querySelector("#mc-form input[name=container]:checked")?.value,
+      subs: [...$("mc-subs").options].map((o) => o.value + (/\\(auto\\)$/.test(o.textContent) ? "*" : "")),
+      sub: $("mc-subs").value,
+      rows: ["format", "subs", "clip", "sponsor", "scope", "live"].filter((row) => __vis($("mc-" + row + "-row"))),
+      scope: $("mc-scope-all").textContent,
+      error: __vis($("mc-error")) ? $("mc-error-text").textContent : "",
+      pageCard: __vis($("page-card")),
+    };
+  })()`);
+}
+
+/** Ticks the card's radio `name` = `value` (as a click on it does). */
+const pick = (page, name, value) => evaluate(page.sessionId, `document.querySelector('#mc-form input[name=${name}][value="${value}"]').click()`);
+
+/** Clicks the card's Download and returns the /add body that reached the app, and what the card said. */
+async function downloadMedia(page, app) {
+  await until(() => evaluate(page.sessionId, `__vis(document.getElementById("mc-download"))`), 3000);
+  const before = app.requests.length;
+  const clicked = await click(page, "/^\\s*download\\s*$/i");
+  const body = (await until(async () => app.since(before, /^\/add$/).at(-1), 8000))?.body;
+  return { clicked, body, said: await evaluate(page.sessionId, `document.getElementById("mc-msg").textContent`) };
+}
+
+// ---- the YouTube button (content/youtube.js), on fixture pages that mimic YouTube's markup ----
+
+/** Puts content/youtube.js into a fixture tab as the manifest does on YouTube (the fixtures are http://127.0.0.1). */
+const injectYoutube = (ctx) => evaluate(ctx.sw, `chrome.scripting.executeScript({ target: { tabId: ${ctx.tabId} }, files: ["content/youtube.js"] }).then(() => true)`);
+
+/**
+ * Reads the button in the tab from the extension's isolated world, where chrome.dom opens its closed shadow root:
+ * where it sits, its theme and colour, whether its menu and note are open, and the centre of its control `label`.
+ */
+const ytProbe = (ctx, label = "Download") =>
+  evaluate(ctx.sw, `chrome.scripting.executeScript({ target: { tabId: ${ctx.tabId} }, args: [${JSON.stringify(label)}], func: (label) => {
+    const host = document.querySelector("endo-download");
+    const root = host && chrome.dom.openOrClosedShadowRoot(host);
+    if (!root) return { present: false, count: document.querySelectorAll("endo-download").length };
+    const target = [...root.querySelectorAll("button")].find((b) => b.textContent.trim() === label);
+    const r = target?.getBoundingClientRect();
+    const note = root.querySelector(".toast");
+    return {
+      present: true,
+      count: document.querySelectorAll("endo-download").length,
+      parent: host.parentElement?.id || host.parentElement?.tagName.toLowerCase(),
+      reel: host.closest("ytd-reel-video-renderer")?.id || null,
+      after: host.previousElementSibling?.textContent.trim() || null,
+      before: host.nextElementSibling?.tagName.toLowerCase() || null,
+      round: host.classList.contains("endo-round"),
+      dark: host.classList.contains("endo-dark"),
+      color: target ? getComputedStyle(target).color : null,
+      menu: root.querySelector(".menu").matches(":popover-open"),
+      note: note.matches(":popover-open") ? note.textContent : "",
+      at: r && r.width ? { x: r.x + r.width / 2, y: r.y + r.height / 2 } : null,
+    };
+  } }).then(([r]) => r.result)`);
+
+/** A real (trusted) click at a point of the headless page: nothing on the screen moves. */
+async function clickAt(ctx, label) {
+  const { at } = await ytProbe(ctx, label);
+  if (!at) return "missing";
+  for (const type of ["mousePressed", "mouseReleased"]) await send("Input.dispatchMouseEvent", { type, x: at.x, y: at.y, button: "left", clickCount: 1 }, ctx.sessionId);
+  return "clicked";
+}
+
+/** Opens the button's menu and clicks `label` in it; returns the /add body that reached the app, if any. */
+async function ytChoose(ctx, app, label) {
+  const before = app.requests.length;
+  const opened = await clickAt(ctx, "Download");
+  const menu = await until(async () => (await ytProbe(ctx)).menu, 3000);
+  const chose = await clickAt(ctx, label);
+  return { opened, menu, chose, body: (await until(async () => app.since(before, /^\/add$/).at(-1), 4000))?.body };
+}
+
+/** Captures the fixture page in YouTube's light and dark theme, once the button has followed it. */
+async function captureYoutube(ctx, name) {
+  const colors = {};
+  for (const scheme of THEMES) {
+    await evaluate(ctx.sessionId, `document.documentElement.toggleAttribute("dark", ${scheme === "dark"})`);
+    colors[scheme] = (await until(async () => { const p = await ytProbe(ctx); return p.dark === (scheme === "dark") && p; }, 3000))?.color;
+    await capture(ctx, `${name}-${scheme}`, { fixture: ctx.name, view: name, theme: scheme });
+  }
+  await evaluate(ctx.sessionId, `document.documentElement.removeAttribute("dark")`);
+  return colors;
+}
+
+/** Sets "Show a Download button on YouTube" straight in storage, as the popup's switch does. */
+const youtubeSetting = (ctx, on) =>
+  evaluate(ctx.sw, `chrome.storage.local.get("settings").then(({ settings }) => chrome.storage.local.set({ settings: { ...settings, youtubeButton: ${on} } })).then(() => true)`);
+
+/** Opens a fixture page in its own window at 900×600, with the page helpers, YouTube's button put in. */
+async function youtubePage(ctx) {
+  await send("Emulation.setDeviceMetricsOverride", { width: 900, height: 600, deviceScaleFactor: 1, mobile: false }, ctx.sessionId);
+  await evaluate(ctx.sessionId, PAGE_HELPERS);
+  await injectYoutube(ctx);
+  return until(async () => { const p = await ytProbe(ctx); return p.present && p.at && p; }, 5000);
+}
+
 // ---- the fixtures: what each page is, what the background must detect, and what the popup must send ----
 
 /** Clicks the first item's Download and returns the /add body that reached the app. */
@@ -380,14 +493,218 @@ const FIXTURES = [
     },
   },
   {
-    name: "media-site",
-    url: `http://${MEDIA_HOST}/video/x8fixture`,
+    name: "media-home",
+    url: `http://${MEDIA_HOST}/`,
     async act(page, app, ctx) {
+      check("media-home: a media site's home page has no media card", await evaluate(page.sessionId, `!__vis(document.getElementById("media-card"))`));
       const before = app.requests.length;
       const clicked = await click(page, "/download this page/i");
       const body = (await until(async () => app.since(before, /^\/add$/).at(-1), 5000))?.body;
-      check("media-site: Download this page sends the page URL", body?.url === ctx.url, { clicked, url: body?.url });
-      await captureAfter(page, "media-site", "after-send");
+      check("media-home: Download this page sends the page URL", body?.url === ctx.url, { clicked, url: body?.url });
+      await captureAfter(page, "media-home", "after-send");
+    },
+  },
+  {
+    name: "media-site",
+    url: `http://${MEDIA_HOST}/video/x8fixture`,
+    async act(page, app, ctx) {
+      const asked = app.requests.filter((r) => r.path === "/info" && r.body?.url === ctx.url);
+      check("media-site: the card asks /info about the page, with no cookies by default", asked.length > 0 && asked.every((r) => !r.body.cookie_jar), { asked: asked.length });
+      const card = await mediaCard(page);
+      const v = INFO.video;
+      check("media-site: the card shows the thumbnail, title, channel and length; no page card", card.thumb && card.title === v.title && card.channel === v.uploader && card.length === "3:33" && !card.pageCard, card);
+      check("media-site: qualities are Best and the heights, 4K marked HDR, 1080p and 720p 60 fps; audio M4A/MP3", card.qualities.join() === "Best,4KHDR,1440p,1080p60,720p60,480p,360p" && card.audio, card.qualities);
+      check("media-site: subtitles list each language once, automatic ones marked", card.subs.join() === ",all,en,es,de*", card.subs);
+      check("media-site: a fresh card picks Best and MP4, with format, subtitles, clip and SponsorBlock", card.quality === "best" && card.container === "mp4" && card.rows.join() === "format,subs,clip,sponsor", card);
+      // Use the current time: the fixture page's video plays.
+      await evaluate(page.sessionId, `document.getElementById("mc-start-now").click()`);
+      const now = await until(() => evaluate(page.sessionId, `document.getElementById("mc-start").value`), 3000);
+      check("media-site: Use the current time reads the page's video", /^\d+:\d\d$/.test(now || ""), { start: now });
+      // Audio hides the container and subtitles.
+      await pick(page, "quality", "audio-mp3");
+      const audioRows = (await mediaCard(page)).rows.join();
+      check("media-site: audio hides the format and subtitles", audioRows === "clip,sponsor", audioRows);
+      await pick(page, "quality", "1080");
+      await pick(page, "container", "mkv");
+      await pick(page, "sponsorblock", "remove");
+      await evaluate(page.sessionId, `(() => {
+        const subs = document.getElementById("mc-subs");
+        subs.value = "en";
+        subs.dispatchEvent(new Event("change", { bubbles: true }));
+        document.getElementById("mc-start").value = "2:00";
+        document.getElementById("mc-end").value = "1:00";
+      })()`);
+      // A clip that ends before it starts is refused in the card.
+      const refused = await downloadMedia(page, app);
+      const why = await until(() => evaluate(page.sessionId, `document.querySelector("#mc-msg.err")?.textContent`), 2000);
+      check("media-site: a clip that ends before it starts says so and sends nothing", !refused.body && /start before it ends/.test(why || ""), { why });
+      await evaluate(page.sessionId, `document.getElementById("mc-start").value = "0:30"; document.getElementById("mc-end").value = "1:00";`);
+      await captureAfter(page, "media-site", "chosen");
+      const { clicked, body } = await downloadMedia(page, app);
+      const want = { quality: "1080", container: "mkv", subtitles: "en", sections: [[30, 60]], sponsorblock: "remove" };
+      check("media-site: Download sends the page with the choice as media, and no cookies", body?.url === ctx.url && body?.referer === ctx.url && JSON.stringify(body?.media) === JSON.stringify(want) && !body?.cookie_jar, { clicked, body });
+      await captureAfter(page, "media-site", "sent");
+
+      // The next card opens with that quality, format and subtitles.
+      let again = await openPopup(ctx.tabId);
+      labels.set(again.sessionId, "popup on media-site, again");
+      const kept = await mediaCard(again);
+      check("media-site: the next card opens with the last quality, format and subtitles", kept.quality === "1080" && kept.container === "mkv" && kept.sub === "en", kept);
+
+      // "Use my browser sign-in on media sites": the site's cookies (and no other site's) go with /info and /add.
+      await evaluate(ctx.sessionId, `document.cookie = "endo_fixture=1; path=/"`);
+      await send("Network.setCookie", { name: "elsewhere", value: "1", url: "http://127.0.0.1:8765/" }, ctx.sessionId);
+      await view(again, "Settings");
+      const off = await evaluate(again.sessionId, `document.getElementById("media-cookies").checked`);
+      await evaluate(again.sessionId, `document.getElementById("media-cookies").click()`);
+      await sleep(800);
+      await captureAfter(again, "media-site", "sign-in-on");
+      await send("Target.closeTarget", { targetId: again.targetId });
+      const before = app.requests.length;
+      again = await openPopup(ctx.tabId);
+      labels.set(again.sessionId, "popup on media-site, signed in");
+      await mediaCard(again);
+      const jar = app.since(before, /^\/info$/).at(-1)?.body?.cookie_jar || [];
+      const names = jar.map((c) => `${c.name}@${c.domain}`);
+      const ok = (list) => list.some((c) => c.name === "endo_fixture" && c.domain === "www.twitch.tv") && list.every((c) => /(^|\.)twitch\.tv$/.test(c.domain));
+      check("media-site: sign-in is off by default; on, /info carries the site's cookies and no other site's", off === false && ok(jar), { off, cookies: names });
+      // It reopens on Settings, the last tab shown.
+      await view(again, "Media");
+      const signed = await downloadMedia(again, app);
+      check("media-site: with sign-in on, /add carries them too", ok(signed.body?.cookie_jar || []), {
+        clicked: signed.clicked,
+        said: signed.said,
+        cookies: (signed.body?.cookie_jar || []).map((c) => `${c.name}@${c.domain}`),
+      });
+      await view(again, "Settings");
+      await evaluate(again.sessionId, `document.getElementById("media-cookies").click()`);
+      await sleep(800);
+      await send("Target.closeTarget", { targetId: again.targetId });
+    },
+  },
+  {
+    name: "media-loading",
+    url: `http://${MEDIA_HOST}/slow/x8fixture`,
+    // /info answers only once released: the captures show the card loading.
+    before: (app) => (app.holdInfo = true),
+    async act(page, app) {
+      const loading = await evaluate(page.sessionId, `document.getElementById("media-card").getAttribute("aria-busy") === "true" && __vis(document.querySelector("#media-card .bones")) && /looking/i.test(document.getElementById("mc-msg").textContent)`);
+      app.holdInfo = false;
+      app.releaseInfo();
+      const card = await mediaCard(page);
+      check("media-loading: a skeleton shows until /info answers, then the card", loading && card.title === INFO.video.title, { loading, title: card.title });
+      await captureAfter(page, "media-loading", "loaded");
+    },
+  },
+  {
+    name: "media-live",
+    url: `http://${MEDIA_HOST}/live/x8fixture`,
+    async act(page, app, ctx) {
+      const card = await mediaCard(page);
+      check("media-live: LIVE, From now/From start; no clip, subtitles or SponsorBlock", card.chip === "LIVE" && card.rows.join() === "format,live", card);
+      await pick(page, "live", "start");
+      await captureAfter(page, "media-live", "from-start");
+      const { body } = await downloadMedia(page, app);
+      check("media-live: From start sends live_from_start and no clip", body?.url === ctx.url && body?.media?.live_from_start === true && !body?.media?.sections, body?.media);
+    },
+  },
+  {
+    name: "media-playlist",
+    url: `http://${MEDIA_HOST}/playlist/x8fixture`,
+    async act(page, app, ctx) {
+      const card = await mediaCard(page);
+      check("media-playlist: offers This video / Whole playlist (42), this video first", card.scope === "Whole playlist (42)" && card.rows.includes("scope") && card.rows.includes("clip"), card);
+      await pick(page, "scope", "playlist");
+      const rows = (await mediaCard(page)).rows;
+      check("media-playlist: the whole list takes no clip", !rows.includes("clip"), rows);
+      await captureAfter(page, "media-playlist", "whole");
+      const { body } = await downloadMedia(page, app);
+      check("media-playlist: Whole playlist sends playlist: true", body?.url === ctx.url && body?.media?.playlist === true, body?.media);
+    },
+  },
+  {
+    name: "media-error",
+    url: `http://${MEDIA_HOST}/error/x8fixture`,
+    async act(page, app, ctx) {
+      const card = await mediaCard(page);
+      check("media-error: the card says why /info failed", card.error === INFO_ERROR && card.qualities.length === 0, card);
+      const before = app.requests.length;
+      const clicked = await click(page, "/download anyway/i");
+      const body = (await until(async () => app.since(before, /^\/add$/).at(-1), 5000))?.body;
+      check("media-error: Download anyway sends the page in the best quality", body?.url === ctx.url && JSON.stringify(body?.media) === JSON.stringify({ quality: "best" }), { clicked, body });
+      await captureAfter(page, "media-error", "sent");
+    },
+  },
+  {
+    name: "youtube",
+    url: `${FX}/youtube.html?v=fixture1`,
+    popup: false,
+    async act(_page, app, ctx) {
+      let at = await youtubePage(ctx);
+      check("youtube: the button sits right after Share on a watch page", at?.parent === "top-level-buttons-computed" && at.after === "Share" && !at.round && at.count === 1, at);
+      await injectYoutube(ctx);
+      await sleep(700);
+      check("youtube: put in twice, it is still one button", (await ytProbe(ctx)).count === 1);
+      const colors = await captureYoutube(ctx, "youtube-watch");
+      check("youtube: it follows YouTube's light and dark theme", colors.light === "rgb(15, 15, 15)" && colors.dark === "rgb(241, 241, 241)", colors);
+      // The menu, on the user's (trusted) click; captured open in both themes.
+      await clickAt(ctx, "Download");
+      const menu = await until(async () => (await ytProbe(ctx)).menu, 3000);
+      await captureYoutube(ctx, "youtube-menu");
+      await clickAt(ctx, "Download");
+      check("youtube: a click opens its menu", menu);
+      const chosen = await ytChoose(ctx, app, "720p");
+      check("youtube: 720p sends the page in 720p", chosen.body?.url === ctx.url && chosen.body?.referer === ctx.url && JSON.stringify(chosen.body?.media) === JSON.stringify({ quality: "720" }), chosen);
+      const note = await until(async () => (await ytProbe(ctx)).note, 3000);
+      check("youtube: it says the video was sent", /^sent/i.test(note || ""), { note });
+      await captureYoutube(ctx, "youtube-sent");
+      // A click the page makes up (not the user's) sends nothing.
+      const before = app.requests.length;
+      await evaluate(ctx.sw, `chrome.scripting.executeScript({ target: { tabId: ${ctx.tabId} }, func: () => {
+        const root = chrome.dom.openOrClosedShadowRoot(document.querySelector("endo-download"));
+        [...root.querySelectorAll("button")].find((b) => b.textContent.trim() === "Best quality").click();
+      } }).then(() => true)`);
+      await sleep(1000);
+      check("youtube: a scripted click sends nothing", app.since(before, /^\/add$/).length === 0);
+      // YouTube's in-page navigation re-renders the actions: the button comes back, for the new video.
+      await evaluate(ctx.sessionId, `navigateTo("fixture2")`);
+      at = await until(async () => { const p = await ytProbe(ctx); return p.present && p.after === "Share" && p.at && p; }, 5000);
+      const next = at && (await ytChoose(ctx, app, "Best quality"));
+      check("youtube: after in-page navigation it is back beside Share, for the new video", next?.body?.url === `${FX}/youtube.html?v=fixture2` && next.body.media?.quality === "best", { at, body: next?.body });
+      // The Settings switch hides it and shows it again.
+      await youtubeSetting(ctx, false);
+      const gone = await until(async () => !(await ytProbe(ctx)).present, 3000);
+      await youtubeSetting(ctx, true);
+      const back = await until(async () => (await ytProbe(ctx)).present, 3000);
+      check("youtube: \"Show a Download button on YouTube\" off hides it, on shows it", gone && back, { gone, back });
+      // More options… opens the popup where the browser allows it, else says where it is.
+      const known = new Set((await send("Target.getTargets")).targetInfos.map((t) => t.targetId));
+      await until(async () => (await ytProbe(ctx)).at, 3000);
+      await ytChoose(ctx, app, "More options…");
+      const outcome = await until(async () => {
+        const popup = (await send("Target.getTargets")).targetInfos.find((t) => !known.has(t.targetId) && /popup\.html/.test(t.url));
+        if (popup) return (await send("Target.closeTarget", { targetId: popup.targetId }), "the popup opened");
+        const said = (await ytProbe(ctx)).note;
+        return /toolbar/i.test(said) ? `hint: ${said}` : null;
+      }, 5000);
+      check("youtube: More options… opens the popup, or says where to find it", !!outcome, { outcome });
+      const errors = report.pageErrors.filter((e) => (e.page || "").includes("/youtube.html"));
+      check("youtube: no exceptions or console errors on the page", errors.length === 0, errors.slice(0, 5));
+    },
+  },
+  {
+    name: "youtube-shorts",
+    url: `${FX}/youtube.html?shorts`,
+    popup: false,
+    async act(_page, app, ctx) {
+      const at = await youtubePage(ctx);
+      check("youtube-shorts: a round button in the playing Short's column, above its sound", at?.parent === "actions" && at.reel === "reel-1" && at.before === "pivot-button-view-model" && at.round, at);
+      await captureYoutube(ctx, "youtube-shorts");
+      await evaluate(ctx.sessionId, "nextShort()");
+      const moved = await until(async () => { const p = await ytProbe(ctx); return p.reel === "reel-2" && p.at && p; }, 3000);
+      check("youtube-shorts: it moves to the next Short", !!moved, moved);
+      const { body } = await ytChoose(ctx, app, "Audio (MP3)");
+      check("youtube-shorts: Audio (MP3) sends the page as MP3", body?.url === ctx.url && body?.media?.quality === "audio-mp3", body);
     },
   },
   {
@@ -515,12 +832,13 @@ async function main() {
     const opened = {};
     for (const fx of FIXTURES.filter((f) => !ONLY.length || ONLY.includes(f.name))) {
       try {
-        const ctx = { ...fx, ...(await open(fx.url)) };
+        // A page the harness clicks in gets its own window: the one shown, so it takes input.
+        const ctx = { ...fx, sw, ...(await open(fx.url, { newWindow: fx.popup === false })) };
         const loaded = await evaluate(ctx.sessionId, "location.href");
         if (loaded !== fx.url) throw new Error(`${fx.url} loaded as ${loaded}`);
         const tabId = await until(() => tabIdOf(fx.url), 3000);
         if (tabId === null) throw new Error(`no tab id for ${fx.url}`);
-        opened[fx.name] = tabId;
+        opened[fx.name] = ctx.tabId = tabId;
         if (fx.items) {
           const n = await until(
             () => evaluate(sw, `chrome.storage.session.get("tab:${tabId}").then((s) => Object.values(s["tab:${tabId}"]?.items || {}).filter((i) => !i.hidden).length)`),
@@ -528,6 +846,11 @@ async function main() {
           );
           check(`${fx.name}: the background detects ${fx.items} item(s)`, n === fx.items, `found ${n}`);
         }
+        if (fx.popup === false) {
+          await fx.act(null, app, ctx);
+          continue;
+        }
+        await fx.before?.(app);
         const page = await openPopup(tabId);
         labels.set(page.sessionId, `popup on ${fx.name}`);
         await captureViews(page, fx.name);

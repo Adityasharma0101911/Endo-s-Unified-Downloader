@@ -234,6 +234,9 @@ struct App {
     /// Large listings, and video links that name their playlist, waiting for the user's answer,
     /// first come first.
     listings: Vec<Listing>,
+    /// Lists the extension's media card sent to download whole, being read: by link, what the
+    /// card chose for each of their downloads, and the browser's cookies saved for them.
+    media_lists: HashMap<String, (ipc::MediaChoice, Option<PathBuf>)>,
 
     clipboard_enabled: Arc<AtomicBool>,
     /// Last clipboard text the watcher saw or the app copied itself; never offered again.
@@ -342,6 +345,7 @@ impl App {
             notice: None,
             reading: HashMap::new(),
             listings: Vec::new(),
+            media_lists: HashMap::new(),
             clipboard_enabled,
             clipboard_seen: Arc::new(Mutex::new(String::new())),
             clipboard_banner: None,
@@ -452,7 +456,7 @@ impl App {
 
     /// [`App::read_document`] with `read`, which reads `input`. A video link that names its
     /// playlist asks at once whether the video or the whole playlist is meant, while the playlist
-    /// is read (see [`playlist_video`]).
+    /// is read (see [`playlist_video`]); not one whose playlist the media card chose.
     fn start_reading(
         &mut self,
         input: String,
@@ -467,7 +471,7 @@ impl App {
             return;
         }
         self.notice = Some(Ok(format!("Reading {}...", shown)));
-        let prompt = playlist_video(&input).map(|video| Listing {
+        let prompt = playlist_video(&input).filter(|_| !self.media_lists.contains_key(&input)).map(|video| Listing {
             origin,
             input: input.clone(),
             checksum: checksum.clone(),
@@ -528,6 +532,7 @@ impl App {
         match result {
             // Everything it lists was downloaded before: nothing to do, not a failure.
             Ok(tasks) if tasks.is_empty() => {
+                self.media_lists.remove(&input);
                 let why = "all it lists was downloaded before (untick Only new items to get it all again)";
                 self.notice = Some(Ok(format!("Nothing new in {}: {}", shown, why)));
             }
@@ -544,7 +549,8 @@ impl App {
     /// starts the first download, a queue line that failed is put back with its error. True when
     /// it was added.
     fn add_listing(&mut self, origin: Origin, input: &str, checksum: &str, auth: &str, result: Result<Vec<Task>, String>) -> bool {
-        let added = result.and_then(|tasks| queue_listed(&mut self.queue, &self.settings, tasks, checksum, auth));
+        let media = self.media_lists.remove(input);
+        let added = result.and_then(|tasks| queue_listed(&mut self.queue, &self.settings, tasks, checksum, auth, media.as_ref()));
         let ok = added.is_ok();
         match (origin, added) {
             (Origin::Form, Ok(ids)) => {
@@ -581,7 +587,10 @@ impl App {
             }
         }
         let chosen = match answer {
-            Answer::Cancel => return,
+            Answer::Cancel => {
+                self.media_lists.remove(&input);
+                return;
+            }
             Answer::Video => video.into_iter().collect(),
             Answer::All => tasks.unwrap_or_default(),
         };
@@ -1106,7 +1115,9 @@ impl App {
     /// queue. A link to read first (see `ingest::needs_reading`) is read as one typed in is,
     /// without the browser's request; not one sent with a file name, which is the media the
     /// extension saw the page fetch, whatever its path looks like (`/feed/index.m3u8`), nor one
-    /// sent with the playlist the page built, of which it is only the base.
+    /// sent with the playlist the page built, of which it is only the base. A link the media card
+    /// sent that is only a list is read whatever it chose; a video link that names its playlist
+    /// too is the one video, unless the card chose the list.
     fn add_remote(&mut self, payload: ipc::RemoteAddPayload) {
         if !payload.urls.is_empty() {
             return self.add_remote_batch(&payload);
@@ -1121,9 +1132,21 @@ impl App {
             std::env::set_var("ANNAS_ARCHIVE_COOKIE", cookies.trim());
             std::env::set_var("HYPERFETCH_COOKIES", cookies.trim());
         }
-        let shown = ingest::truncate_chars(&url, 60);
         let start_now = !self.focused_item().is_some_and(|item| item.status.is_active()) && self.url_input.trim().is_empty();
-        if ingest::needs_reading(&url) && payload.file_name().is_none() && payload.playlist.is_none() {
+        let link = Url::parse(&url).ok();
+        // The whole list is read as the link it is: YouTube refuses `playlist?list=` for its mixes.
+        let reads = match &payload.media {
+            Some(choice) => ingest::needs_reading(&url) && (choice.playlist || !link.as_ref().is_some_and(media::video_in_playlist)),
+            None => ingest::needs_reading(&url) && payload.file_name().is_none() && payload.playlist.is_none(),
+        };
+        // Each download of a media list the card sent is made as it chose, with the browser's
+        // cookies; a feed or folder as the Settings say.
+        if let (Some(choice), Some(at)) = (&payload.media, link.as_ref().filter(|at| reads && media::lists(at))) {
+            let cookies = payload.cookies_file(at).and_then(|text| ipc::save_cookies(at, &text));
+            self.media_lists.insert(url.clone(), (choice.clone(), cookies));
+        }
+        let shown = ingest::truncate_chars(&url, 60);
+        if reads {
             if start_now {
                 self.download_now(&url, "", "");
                 self.notice = Some(Ok(format!("Started remote download: {}", shown)));
@@ -1189,6 +1212,9 @@ impl App {
             options.cookies_path = Some(path);
             // The cookies the browser sent win over the Settings' browser, for yt-dlp too.
             options.browser_cookies = None;
+        }
+        if let Some(choice) = &payload.media {
+            choose_media(&mut options, choice);
         }
         Ok(queue_task(&mut self.queue, task, options))
     }
@@ -1270,6 +1296,7 @@ impl eframe::App for App {
         self.run_scheduler();
 
         ui::render(self, ctx);
+        ipc::set_proxy(&self.settings.proxy);
 
         if let Some(dialog) = self.pending_dialog.take() {
             self.open_dialog(dialog, frame);
@@ -1382,16 +1409,64 @@ fn document_options(settings: &Settings, tasks: &[Task], checksum: &str, auth: &
     tasks.iter().map(|task| task_options(settings, task, checksum, auth)).collect()
 }
 
-/// Queues the downloads a .metalink, .meta4 or .torrent lists; nothing if one is refused.
+/// Queues the downloads a .metalink, .meta4 or .torrent lists; nothing if one is refused. Those
+/// of a list the extension's media card sent (see `App::media_lists`) each as it chose, with the
+/// browser's cookies.
 fn queue_listed(
     queue: &mut DownloadQueue,
     settings: &Settings,
     tasks: Vec<Task>,
     checksum: &str,
     auth: &str,
+    media: Option<&(ipc::MediaChoice, Option<PathBuf>)>,
 ) -> Result<Vec<usize>, String> {
     let options = document_options(settings, &tasks, checksum, auth)?;
-    Ok(tasks.into_iter().zip(options).map(|(task, options)| queue_task(queue, task, options)).collect())
+    let queued = tasks.into_iter().zip(options).map(|(task, mut options)| {
+        if let Some((choice, cookies)) = media {
+            choose_media(&mut options, choice);
+            if let Some(path) = cookies {
+                options.cookies_path = Some(path.clone());
+                options.browser_cookies = None;
+            }
+        }
+        queue_task(queue, task, options)
+    });
+    Ok(queued.collect())
+}
+
+/// `options` as the extension's media card chose, over the Settings: the quality (a preset, or
+/// the tallest video), the container, subtitles, clips, SponsorBlock, and recording a live
+/// stream from its start (which "From now" cannot turn off when the Settings turn it on).
+fn choose_media(options: &mut DownloadOptions, choice: &ipc::MediaChoice) {
+    use media::MediaQualityPreset::{AudioM4a, AudioMp3, BestVideoAudio, Fhd1080p, Hd720p};
+    let preset = match choice.quality.as_deref() {
+        None => None,
+        Some("best") => Some(BestVideoAudio),
+        Some("1080") => Some(Fhd1080p),
+        Some("720") => Some(Hd720p),
+        Some("audio-m4a") => Some(AudioM4a),
+        Some("audio-mp3") => Some(AudioMp3),
+        // 2160, 1440, 480, 360 (see `ipc::MediaChoice::check`).
+        Some(height) => {
+            options.height = height.parse().ok();
+            None
+        }
+    };
+    if preset.is_some() {
+        (options.media_preset, options.height) = (preset, None);
+    }
+    options.merge_format = choice.container.clone().or(options.merge_format.take());
+    // The card's None ("") and Off are over the Settings too.
+    if let Some(subtitles) = &choice.subtitles {
+        options.subtitles = Some(subtitles.clone()).filter(|s| !s.is_empty());
+    }
+    if let Some(mode) = &choice.sponsorblock {
+        options.sponsorblock = Some(mode.clone()).filter(|m| m != "off");
+    }
+    if !choice.sections.is_empty() {
+        options.sections = choice.sections.clone();
+    }
+    options.live_from_start |= choice.live_from_start;
 }
 
 /// Queues one download; one its input named is shown under that name at once. Its target is
@@ -1966,7 +2041,7 @@ mod tests {
         let template = "%(title)s [%(id)s].%(ext)s".to_string();
         let unnamed = Task { urls, folder: Some("Show".into()), media_name: Some(template.clone()), ..Task::default() };
         let mut queue = DownloadQueue::new();
-        let [id] = queue_listed(&mut queue, &settings, vec![unnamed], "", "").unwrap()[..] else { panic!("one download") };
+        let [id] = queue_listed(&mut queue, &settings, vec![unnamed], "", "", None).unwrap()[..] else { panic!("one download") };
         let item = queue.get_item(id).unwrap();
         assert_eq!(util::folder_to_create(item), Some(PathBuf::from("dl").join("Show")));
         assert_eq!(item.options.media_name, Some(template));
@@ -2017,7 +2092,7 @@ mod tests {
             ..Task::default()
         };
         let mut queue = DownloadQueue::new();
-        let ids = queue_listed(&mut queue, &settings, vec![file(1), file(2)], "", "Bearer t").unwrap();
+        let ids = queue_listed(&mut queue, &settings, vec![file(1), file(2)], "", "Bearer t", None).unwrap();
         assert_eq!(ids.len(), 2);
         assert!(ids.iter().all(|&id| queue.get_item(id).is_some_and(|item| item.names_file && item.target_path.is_none())));
         assert!(ids.iter().all(|&id| queue.get_item(id).is_some_and(|item| item.options.auth_header.is_none())), "a listed host got it");
@@ -2025,12 +2100,12 @@ mod tests {
         // link typed, which the header is for; the form's checksum is for the file it lists.
         let link = Task { urls: vec![Url::parse("https://tracker.example/dl/1.torrent").unwrap()], document_itself: true, ..Task::default() };
         let typed = format!("sha256:{}", "cc".repeat(32));
-        let [id] = queue_listed(&mut queue, &settings, vec![link], &typed, "Bearer t").unwrap()[..] else { panic!("one download") };
+        let [id] = queue_listed(&mut queue, &settings, vec![link], &typed, "Bearer t", None).unwrap()[..] else { panic!("one download") };
         let options = queue.get_item(id).map(|item| (item.options.auth_header.clone(), item.options.expected_checksum.clone()));
         assert_eq!(options, Some((Some("Bearer t".to_string()), None)));
         queue.remove_item(id);
         let refused = Task { checksum: Some("crc32:1".to_string()), ..file(3) };
-        assert!(queue_listed(&mut queue, &settings, vec![file(4), refused], "", "").is_err());
+        assert!(queue_listed(&mut queue, &settings, vec![file(4), refused], "", "", None).is_err());
         assert_eq!(queue.items().len(), 2, "nothing of a refused document is queued");
 
         let (mut input, mut errors) = ("https://ok.example/f".to_string(), None);
@@ -2267,6 +2342,64 @@ mod tests {
         assert!(built.options.hls && built.options.height.is_none(), "no height of 0");
         assert!(app.reading.is_empty(), "not read as a document");
         assert_eq!(app.queue.items().len(), 4);
+    }
+
+    /// What the extension's media card chose goes to that download alone, over the Settings: the
+    /// one video of a link that names its playlist too, or the whole playlist, read as that link
+    /// without asking, each of its downloads as the card chose. A link that is only a list is read
+    /// whatever the card chose; a reading that adds nothing forgets the choice.
+    #[test]
+    fn a_media_choice_from_the_browser_goes_to_its_downloads() {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(&rt, dir.path());
+        app.url_input = "https://typed.example/a.iso".into();
+        app.settings.subtitles = "de".into();
+        app.settings.sponsorblock = 1;
+        let remote = |json: serde_json::Value| AppEvent::RemoteAdd(serde_json::from_value(json).unwrap());
+        let video = "https://www.youtube.com/watch?v=jNQXAC9IVRw&list=PLbpi6ZahtOH6Blw3RGYpWkSByi_T7Rygb";
+        let media = serde_json::json!({"quality": "1440", "container": "mkv", "sections": [[90, 150]], "sponsorblock": "mark"});
+        app.handle_event(remote(serde_json::json!({"url": video, "height": 720, "media": media})));
+        let item = &app.queue.items()[0];
+        assert_eq!(item.urls[0].as_str(), video);
+        assert!(app.reading.is_empty() && app.listings.is_empty(), "the one video, without asking");
+        assert_eq!((item.options.height, item.options.sections.as_slice()), (Some(1440), &[(90.0, 150.0)][..]));
+        assert_eq!((item.options.merge_format.as_deref(), item.options.sponsorblock.as_deref()), (Some("mkv"), Some("mark")));
+        assert_eq!(item.options.subtitles.as_deref(), Some("de"), "the Settings' subtitles when the card sent none");
+        assert!(!app.settings.live_from_start && !item.options.live_from_start);
+
+        // The card's None and Off.
+        app.handle_event(remote(serde_json::json!({"url": video, "media": {"subtitles": "", "sponsorblock": "off"}})));
+        let item = &app.queue.items()[1];
+        assert_eq!((item.options.subtitles.as_deref(), item.options.sponsorblock.as_deref()), (None, None));
+        let id = item.id;
+        app.queue.remove_item(id);
+
+        // A mix: YouTube lists it at the video link alone.
+        let media = serde_json::json!({"quality": "audio-mp3", "subtitles": "en", "live_from_start": true, "playlist": true});
+        let video = "https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=RDdQw4w9WgXcQ";
+        app.handle_event(remote(serde_json::json!({"url": video, "height": 720, "media": media})));
+        let list = video;
+        assert!(app.reading.contains_key(list) && app.listings.is_empty(), "the playlist is read, without asking");
+        let entry = |id: &str| Task { urls: vec![Url::parse(&format!("https://www.youtube.com/watch?v={id}")).unwrap()], from_document: true, ..Default::default() };
+        let (checksum, auth, notes) = (String::new(), String::new(), Vec::new());
+        let result = Ok(vec![entry("Vh4O04Bpovw"), entry("5TIp7oVKHq8")]);
+        app.handle_event(AppEvent::Read { origin: Origin::Dropped, input: list.to_string(), checksum, auth, result, notes });
+        let listed = &app.queue.items()[1..];
+        assert_eq!(listed.len(), 2);
+        for item in listed {
+            assert_eq!((&item.options.media_preset, item.options.height), (&Some(media::MediaQualityPreset::AudioMp3), None));
+            assert!(item.options.subtitles.as_deref() == Some("en") && item.options.live_from_start, "{:?}", item.options);
+        }
+        assert!(app.media_lists.is_empty());
+
+        // A channel is read with the card's choice, which a reading that adds nothing forgets.
+        let channel = "https://www.youtube.com/@NASA";
+        app.handle_event(remote(serde_json::json!({"url": channel, "media": {"quality": "best"}})));
+        assert!(app.reading.contains_key(channel) && app.media_lists.contains_key(channel));
+        let (checksum, auth, notes) = (String::new(), String::new(), Vec::new());
+        app.handle_event(AppEvent::Read { origin: Origin::Dropped, input: channel.to_string(), checksum, auth, result: Ok(Vec::new()), notes });
+        assert!(app.media_lists.is_empty() && app.queue.items().len() == 3);
     }
 
     /// The link grabber's batch is queued whole, each link with the page's referer and User-Agent

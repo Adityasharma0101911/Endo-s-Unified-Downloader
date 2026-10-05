@@ -99,8 +99,9 @@ const UNSUPPORTED_SHARES: &[(&str, &[&str])] = &[
     ),
     ("Gofile", &["gofile.io"]),
     ("Pixeldrain", &["pixeldrain.com", "pixeldrain.net", "pixeldra.in"]),
+    // And these, whose share links are `crate::cloud`'s: what is left here is their other pages,
+    // and a Yandex Disk video or a Box share it hands back as given, which yt-dlp downloads.
     ("WeTransfer", &["wetransfer.com", "we.tl"]),
-    ("iCloud", &["icloud.com"]),
     (
         "Yandex Disk",
         &[
@@ -110,6 +111,8 @@ const UNSUPPORTED_SHARES: &[(&str, &[&str])] = &[
     ),
     ("pCloud", &["pcloud.link", "pcloud.com"]),
     ("Box", &["box.com"]),
+    // Not supported at all yet.
+    ("iCloud", &["icloud.com"]),
 ];
 
 #[derive(Error, Debug)]
@@ -1123,9 +1126,10 @@ impl HostResolver for HtmlVideoResolver {
 impl HtmlVideoResolver {
     /// Whether the answer to `url`, with these headers, is a web page to look into for the video
     /// it plays: HTML, for a URL this resolver would be handed (one that can be a page, and that
-    /// no resolver `SmartResolver` tries first takes).
+    /// no resolver `SmartResolver` tries first takes, but for a share page yt-dlp downloads, which
+    /// `crate::cloud` hands back when it cannot serve it itself).
     pub fn is_page(url: &Url, headers: &HeaderMap) -> bool {
-        !SmartResolver::handles(url) && HtmlVideoResolver.can_handle(url) && html_type(headers)
+        (!SmartResolver::handles(url) || yt_dlp_share_page(url)) && HtmlVideoResolver.can_handle(url) && html_type(headers)
     }
 
     /// Where the page `html`, from `page_url`, sends the browser at once: the target of a
@@ -1323,6 +1327,8 @@ impl SmartResolver {
             || StreamtapeResolver.can_handle(url)
             || crate::mega::handles(url)
             || crate::shares::handles(url)
+            || crate::cloud::handles(url)
+            || crate::repos::handles(url)
     }
 
     /// Resolves `url` into download sources that are byte-identical copies of one file.
@@ -1360,12 +1366,19 @@ impl SmartResolver {
             }
         }
 
-        // File-sharing hosts with resolvers of their own (see `crate::mega`, `crate::shares`).
+        // File-sharing hosts, cloud storage and code or model repositories with resolvers of their
+        // own (see `crate::mega`, `crate::shares`, `crate::cloud`, `crate::repos`).
         if crate::mega::handles(url) {
             return with_timeout(crate::mega::resolve(client, url)).await;
         }
         if crate::shares::handles(url) {
             return with_timeout(crate::shares::resolve(client, url, proxy)).await;
+        }
+        if crate::cloud::handles(url) {
+            return with_timeout(crate::cloud::resolve(client, url, proxy)).await;
+        }
+        if crate::repos::handles(url) {
+            return with_timeout(crate::repos::resolve(client, url, proxy)).await;
         }
 
         // 1. DoodStream embed / watch resolver

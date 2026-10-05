@@ -7,7 +7,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
-const TYPES = { ".html": "text/html; charset=utf-8", ".m3u8": "application/vnd.apple.mpegurl", ".mpd": "application/dash+xml" };
+const TYPES = { ".html": "text/html; charset=utf-8", ".m3u8": "application/vnd.apple.mpegurl", ".mpd": "application/dash+xml", ".svg": "image/svg+xml" };
 export const FIXTURE_PORT = 8765;
 
 export function startFixtures(port = FIXTURE_PORT) {

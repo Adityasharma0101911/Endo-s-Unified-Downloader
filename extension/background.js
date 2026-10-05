@@ -17,7 +17,8 @@ import {
   sanitizeFilename,
   splitRequestHeaders,
 } from "./lib/detect.js";
-import { MAX_BATCH, cookieHeader } from "./lib/links.js";
+import { MAX_BATCH, cookieHeader, siteOf } from "./lib/links.js";
+import { QUALITIES, isMediaPage, mediaPayload, rememberedChoice } from "./lib/media.js";
 
 const APP_NAME = "endos-unified-downloader";
 const APP_PORTS = [49152, 49153, 49154, 49155];
@@ -36,7 +37,8 @@ const MAX_COOKIES = 500;
 const MAX_CHUNK_BASE64 = Math.ceil((64 * 1024 * 1024) / 3) * 4;
 const HEADER_CACHE_SIZE = 300;
 const REQUEST_FILTER = { urls: ["<all_urls>"], types: ["media", "xmlhttprequest", "object", "other"] };
-const DEFAULT_SETTINGS = { minSizeKB: 500, maxSizeKB: 0, blockedHosts: [], convertToMp4: true };
+// mediaCookies: "Use my browser sign-in on media sites", off until the user turns it on (see mediaCookieJar).
+const DEFAULT_SETTINGS = { minSizeKB: 500, maxSizeKB: 0, blockedHosts: [], convertToMp4: true, mediaCookies: false, youtubeButton: true };
 const BADGE_COLOR = "#ef4444";
 const MENU_TITLE = "Download with Endo's Unified Downloader";
 const PLAYBACK_RATES = [1, 2, 4, 8, 16];
@@ -136,6 +138,8 @@ function normalizeSettings(raw) {
     maxSizeKB: kb(settings.maxSizeKB, DEFAULT_SETTINGS.maxSizeKB),
     blockedHosts: [...new Set(hosts)].slice(0, 500),
     convertToMp4: typeof settings.convertToMp4 === "boolean" ? settings.convertToMp4 : DEFAULT_SETTINGS.convertToMp4,
+    mediaCookies: settings.mediaCookies === true,
+    youtubeButton: settings.youtubeButton !== false,
   };
 }
 
@@ -538,9 +542,11 @@ async function requestApp(path, { json, body, timeout = 10000, verify = false } 
 
 /**
  * Queues a download in the app via POST /add; empty fields are left out. `playlist` is the text of a playlist the
- * page built itself (then `url` is the base for its relative links); `height` caps the quality the app picks.
+ * page built itself (then `url` is the base for its relative links); `height` caps the quality the app picks; `media`
+ * is the media card's choice for a media-site link (see lib/media.js mediaPayload). A media-site link with no cookies
+ * of its own goes with the user's sign-in there when they allowed it, from tab `tabId`'s cookie store (see mediaCookieJar).
  */
-async function sendToApp({ url, cookies, cookieJar, userAgent, referer, headers, filename, hls, dash, mp4, height, playlist }) {
+async function sendToApp({ url, tabId, cookies, cookieJar, userAgent, referer, headers, filename, hls, dash, mp4, height, playlist, media }) {
   if (!isHttpUrl(url)) return { ok: false, error: "Only http(s) links can be downloaded." };
   const body = { url };
   // The app only takes a link for a playlist by its URL; one served from /api/… must be named one.
@@ -550,7 +556,9 @@ async function sendToApp({ url, cookies, cookieJar, userAgent, referer, headers,
   if ((hls || dash) && typeof mp4 === "boolean") body.mp4 = mp4;
   if (Number.isInteger(height) && height > 0) body.height = height;
   if (typeof playlist === "string" && playlist) body.playlist = playlist;
+  if (media && typeof media === "object") body.media = media;
   if (cookies) body.cookies = cookies;
+  if (!cookies && !cookieJar?.length) cookieJar = await mediaCookieJar(url, tabId);
   if (cookieJar?.length) body.cookie_jar = cookieJar;
   if (userAgent) body.user_agent = userAgent;
   if (isHttpUrl(referer)) body.referer = referer;
@@ -583,10 +591,25 @@ async function cookieJarFor(item, target) {
     [...hosts]
       .map((host) => sent.get(host))
       .filter(Boolean)
-      .map(({ url, names }) => chrome.cookies.getAll({ url }).then((cookies) => cookies.filter((cookie) => names.has(cookie.name)), () => [])),
+      .map(({ url, names }) => tabCookies(item.tabId, { url }).then((cookies) => cookies.filter((cookie) => names.has(cookie.name)))),
   );
+  return jarOf(found.flat());
+}
+
+/**
+ * chrome.cookies.getAll(`details`) in the cookie store of tab `tabId`: an incognito or private window and a Firefox
+ * container each have their own, and the sign-in of another must never go along. None when the tab is unknown.
+ */
+async function tabCookies(tabId, details) {
+  const stores = await chrome.cookies.getAllCookieStores().catch(() => []);
+  const store = stores.find((candidate) => candidate.tabIds.includes(tabId));
+  return store ? chrome.cookies.getAll({ ...details, storeId: store.id }).catch(() => []) : [];
+}
+
+/** chrome.cookies cookies in the app's `cookie_jar` shape, one per name+domain+path, at most MAX_COOKIES. */
+function jarOf(cookies) {
   const jar = new Map();
-  for (const cookie of found.flat()) {
+  for (const cookie of cookies) {
     // The app's cookies file is tab-separated: a field holding a tab or newline cannot be written.
     if (/[\t\r\n]/.test(cookie.name + cookie.value + cookie.domain + cookie.path)) continue;
     jar.set(`${cookie.name}\t${cookie.domain}\t${cookie.path}`, {
@@ -604,11 +627,23 @@ async function cookieJarFor(item, target) {
 }
 
 /**
+ * The user's sign-in on a media site, for yt-dlp (age-restricted and members-only videos): with "Use my browser
+ * sign-in on media sites" on, the cookies of the link's registrable domain and its subdomains (.youtube.com for a
+ * YouTube link) and of no other site, from tab `tabId`'s cookie store; none for a link elsewhere or with the setting off.
+ */
+async function mediaCookieJar(url, tabId) {
+  const host = hostOf(url);
+  if (!chrome.cookies || !isMediaSiteHost(host) || !(await getSettings()).mediaCookies) return [];
+  const domain = host === "youtu.be" ? "youtube.com" : siteOf(host);
+  return jarOf(await tabCookies(tabId, { domain }));
+}
+
+/**
  * The Cookie header the browser has for each origin of `urls`, read at the first link of that origin (so its path
  * counts), in the app's `cookies_by_origin` shape; origins without cookies are left out. By origin, not host: an https
- * link's Secure cookies must never reach an http link of the same host.
+ * link's Secure cookies must never reach an http link of the same host. From tab `tabId`'s cookie store.
  */
-async function cookiesByOrigin(urls) {
+async function cookiesByOrigin(urls, tabId) {
   if (!chrome.cookies) return {};
   const first = new Map();
   for (const url of urls) {
@@ -616,7 +651,7 @@ async function cookiesByOrigin(urls) {
     if (!first.has(origin)) first.set(origin, url);
   }
   const headers = await Promise.all(
-    [...first].map(([origin, url]) => chrome.cookies.getAll({ url }).then((cookies) => [origin, cookieHeader(cookies)], () => [origin, ""])),
+    [...first].map(([origin, url]) => tabCookies(tabId, { url }).then((cookies) => [origin, cookieHeader(cookies)])),
   );
   return Object.fromEntries(headers.filter(([, header]) => header));
 }
@@ -634,6 +669,9 @@ async function injectIntoOpenTabs() {
     const target = { tabId: tab.id, allFrames: true };
     chrome.scripting.executeScript({ target, files: ["content/hook.js"], world: "MAIN", injectImmediately: true }).catch(() => {});
     chrome.scripting.executeScript({ target, files: ["content/bridge.js"], injectImmediately: true }).catch(() => {});
+    if (/^https:\/\/(www|m)\.youtube\.com\//.test(tab.url || "")) {
+      chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["content/youtube.js"] }).catch(() => {});
+    }
   }
 }
 
@@ -649,6 +687,15 @@ chrome.runtime.onInstalled.addListener((details) => {
     chrome.contextMenus.create({ id: "endo-page", title: MENU_TITLE, contexts: ["page"] });
   });
 });
+
+/**
+ * The quality, container and subtitles the media card last sent (the defaults it opens with) as /add's `media`, for
+ * a media page sent from the context menu; undefined before the card sent any, so the app's own settings apply.
+ */
+async function lastMediaChoice() {
+  const { mediaLast } = await chrome.storage.local.get("mediaLast").catch(() => ({}));
+  return mediaLast ? mediaPayload(rememberedChoice(mediaLast)).media : undefined;
+}
 
 /** Shows "✓" or "!" on the tab's badge for 2 s, then the item count again. */
 async function flashBadge(tabId, ok) {
@@ -667,7 +714,8 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   // A media element's request headers (cookies, Origin) are usually still in the cache by URL.
   const seen = headersByUrl.get(url);
   const request = seen ? splitRequestHeaders(seen.headers) : {};
-  const result = await sendToApp({ ...request, url, referer: info.pageUrl || tab?.url });
+  const media = isMediaPage(url) ? await lastMediaChoice() : undefined;
+  const result = await sendToApp({ ...request, url, tabId: tab?.id, referer: info.pageUrl || tab?.url, media });
   flashBadge(tab?.id, result.ok);
 });
 
@@ -857,6 +905,7 @@ const POPUP_COMMANDS = {
     }
     return sendToApp({
       url: target,
+      tabId,
       // The cookies were sent to the item's host; a variant on another host must not receive them.
       cookies: hostOf(target) === hostOf(item.url) ? cookies : "",
       cookieJar: await cookieJarFor(item, target),
@@ -957,8 +1006,28 @@ const POPUP_COMMANDS = {
     return { ok: true };
   },
 
-  SEND_URL({ url, filename, referer }) {
-    return sendToApp({ url, filename, referer });
+  SEND_URL({ tabId, url, filename, referer }) {
+    return sendToApp({ url, tabId, filename, referer });
+  },
+
+  /** What a media page holds (the app's POST /info, with the user's sign-in there when allowed): {ok, info}. */
+  async MEDIA_INFO({ tabId, url }) {
+    if (!isHttpUrl(url)) return { ok: false, error: "Only http(s) pages can be looked into." };
+    const jar = await mediaCookieJar(url, tabId);
+    const json = jar.length ? { url, cookie_jar: jar } : { url };
+    try {
+      // The app gives yt-dlp 45 s.
+      return { ok: true, info: await callApp("/info", { json, timeout: 50000, verify: true }) };
+    } catch (error) {
+      // An app from before /info answers 404.
+      const old = error.message === "not found";
+      return { ok: false, error: old ? "This Endo's Unified Downloader can't look into media links yet: update it." : error.message };
+    }
+  },
+
+  /** A media page with the media card's choice (see lib/media.js mediaPayload). */
+  SEND_MEDIA({ tabId, url, media }) {
+    return sendToApp({ url, tabId, referer: url, media });
   },
 
   /**
@@ -969,7 +1038,7 @@ const POPUP_COMMANDS = {
     if (!validTabId(tabId) || !Array.isArray(urls) || urls.length === 0 || !urls.every(isHttpUrl)) return { ok: false, error: "bad request" };
     if (urls.length > MAX_BATCH) return { ok: false, error: `Send at most ${MAX_BATCH} links at once.` };
     const tab = await chrome.tabs.get(tabId).catch(() => null);
-    const body = { urls, user_agent: navigator.userAgent, cookies_by_origin: await cookiesByOrigin(urls) };
+    const body = { urls, user_agent: navigator.userAgent, cookies_by_origin: await cookiesByOrigin(urls, tabId) };
     if (isHttpUrl(tab?.url)) body.referer = tab.url;
     try {
       await callApp("/add", { json: body, verify: true });
@@ -1204,6 +1273,22 @@ const PAGE_COMMANDS = {
   },
 
   REC_CHUNK: onRecChunk,
+
+  /** youtube.js's menu: the page the frame shows (its URL, on the frame's own host) in one of the menu's qualities. */
+  SEND_MEDIA({ url, quality }, sender) {
+    if (!isHttpUrl(url) || hostOf(url) !== hostOf(sender.url) || !QUALITIES.includes(quality)) return { ok: false, error: "bad request" };
+    return sendToApp({ url, tabId: sender.tab.id, referer: url, media: { quality } });
+  },
+
+  /** youtube.js's "More options…": the popup, where the browser lets an extension open it (Chrome 127+). */
+  async OPEN_POPUP() {
+    try {
+      await chrome.action.openPopup();
+      return { ok: true };
+    } catch {
+      return { ok: false };
+    }
+  },
 
   REC_END({ ms }, sender) {
     if (!isRecordingIndex(ms)) return { ok: false };

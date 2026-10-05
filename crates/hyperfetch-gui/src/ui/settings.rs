@@ -290,6 +290,13 @@ fn media_settings(app: &mut App, ui: &mut Ui) {
         combo(ui, "media_preset_combo", &mut app.settings.media_preset, &MEDIA_PRESETS);
     });
     let s = &mut app.settings;
+    setting(ui, "Video format", "The container a video's picture and sound are merged into.", s.merge_format, |ui| {
+        combo(ui, "merge_format_combo", &mut s.merge_format, &crate::settings::MERGE_FORMATS);
+    });
+    let about = "Sponsor, self-promotion and subscribe reminder segments of YouTube videos, as SponsorBlock's users mark them.";
+    setting(ui, "SponsorBlock", about, s.sponsorblock, |ui| {
+        combo(ui, "sponsorblock_combo", &mut s.sponsorblock, &crate::settings::SPONSORBLOCK_MODES);
+    });
     let about = "Languages to save a video's subtitles in, as .srt or .vtt files next to it: the site's own, else its automatic captions.";
     text_setting(ui, "Subtitles", about, &mut s.subtitles, "en,es or all", false);
     let about = "Title, artist, date, description, link and chapters inside the file (needs ffmpeg).";

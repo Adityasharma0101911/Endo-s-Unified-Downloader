@@ -7,7 +7,7 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use url::Url;
 
-use crate::{feeds, folders, media, mega, metalink, resolver, shares, torrent};
+use crate::{cloud, feeds, folders, media, mega, metalink, repos, resolver, shares, torrent};
 
 /// Largest .metalink/.torrent document read from the network or the disk.
 const MAX_DESCRIPTOR_BYTES: usize = 16 * 1024 * 1024;
@@ -215,7 +215,13 @@ pub fn names_document(text: &str) -> bool {
 /// Whether `url` may list many downloads (a folder, feed, playlist or channel), from its shape
 /// alone: [`ingest`] then asks the listers.
 pub fn might_list(url: &Url) -> bool {
-    mega::lists(url) || shares::lists(url) || folders::lists(url) || feeds::lists(url) || media::lists(url)
+    mega::lists(url)
+        || shares::lists(url)
+        || cloud::lists(url)
+        || repos::lists(url)
+        || folders::lists(url)
+        || feeds::lists(url)
+        || media::lists(url)
 }
 
 /// `token` as a link [`might_list`] takes, a "leaving this site" link replaced by its target.
@@ -349,6 +355,12 @@ async fn list(http: &reqwest::Client, url: &Url, options: &ListOptions) -> Optio
     }
     if shares::lists(url) {
         return Some(shares::list(http, url).await);
+    }
+    if cloud::lists(url) {
+        return Some(cloud::list(http, url).await);
+    }
+    if repos::lists(url) {
+        return Some(repos::list(http, url).await);
     }
     if folders::lists(url) {
         if let Some(listed) = folders::list(http, url, options).await {

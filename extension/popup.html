@@ -36,6 +36,7 @@
     <symbol id="i-external" viewBox="0 0 256 256"><path d="M224,104a8,8,0,0,1-16,0V59.32l-66.33,66.34a8,8,0,0,1-11.32-11.32L196.68,48H152a8,8,0,0,1,0-16h64a8,8,0,0,1,8,8Zm-40,24a8,8,0,0,0-8,8v72H48V80h72a8,8,0,0,0,0-16H48A16,16,0,0,0,32,80V208a16,16,0,0,0,16,16H176a16,16,0,0,0,16-16V136A8,8,0,0,0,184,128Z"/></symbol>
     <symbol id="i-video" viewBox="0 0 256 256"><path d="M251.77,73a8,8,0,0,0-8.21.39L208,97.05V72a16,16,0,0,0-16-16H32A16,16,0,0,0,16,72V184a16,16,0,0,0,16,16H192a16,16,0,0,0,16-16V159l35.56,23.71A8,8,0,0,0,248,184a8,8,0,0,0,8-8V80A8,8,0,0,0,251.77,73ZM192,184H32V72H192V184Zm48-22.95-32-21.33V116.28L240,95Z"/></symbol>
     <symbol id="i-browser" viewBox="0 0 256 256"><path d="M216,40H40A16,16,0,0,0,24,56V200a16,16,0,0,0,16,16H216a16,16,0,0,0,16-16V56A16,16,0,0,0,216,40Zm0,16V88H40V56Zm0,144H40V104H216v96Z"/></symbol>
+    <symbol id="i-clock" viewBox="0 0 256 256"><path d="M128,24A104,104,0,1,0,232,128,104.11,104.11,0,0,0,128,24Zm0,192a88,88,0,1,1,88-88A88.1,88.1,0,0,1,128,216Zm64-88a8,8,0,0,1-8,8H128a8,8,0,0,1-8-8V72a8,8,0,0,1,16,0v48h48A8,8,0,0,1,192,128Z"/></symbol>
     <symbol id="i-check" viewBox="0 0 256 256"><path d="M229.66,77.66l-128,128a8,8,0,0,1-11.32,0l-56-56a8,8,0,0,1,11.32-11.32L96,188.69,218.34,66.34a8,8,0,0,1,11.32,11.32Z"/></symbol>
   </svg>
 
@@ -83,6 +84,85 @@
 
   <main class="views">
     <section id="media-view" class="panel" role="tabpanel" aria-labelledby="tab-media">
+      <!-- A media site's video, list or channel page: what /info says of it, and the choices /add takes. -->
+      <div id="media-card" class="card media-card loading" aria-busy="true" hidden>
+        <div class="media-top">
+          <div class="thumb">
+            <svg class="icon" aria-hidden="true"><use href="#i-video"/></svg>
+            <img id="mc-thumb" alt="" referrerpolicy="no-referrer" hidden>
+            <span id="mc-length" class="thumb-length" hidden></span>
+          </div>
+          <div class="media-text">
+            <span id="mc-live" class="chip" hidden></span>
+            <strong id="mc-title"></strong>
+            <span id="mc-channel" class="note"></span>
+          </div>
+        </div>
+        <div class="bones" aria-hidden="true"><i></i><i></i><i></i></div>
+
+        <div id="mc-error" class="media-error" hidden>
+          <p><svg class="icon" aria-hidden="true"><use href="#i-warning-circle"/></svg><span id="mc-error-text"></span></p>
+          <button id="mc-anyway" type="button" class="btn primary wide"><svg class="icon" aria-hidden="true"><use href="#i-download"/></svg><span>Download anyway (best quality)</span></button>
+        </div>
+
+        <form id="mc-form" class="media-form" hidden>
+          <div class="field stack" role="radiogroup" aria-labelledby="mc-quality-label">
+            <span id="mc-quality-label" class="field-label">Quality</span>
+            <div id="mc-quality" class="seg-group"></div>
+            <div id="mc-audio-row" class="field">
+              <span class="field-label">Audio only</span>
+              <div id="mc-audio" class="seg-group">
+                <label class="seg"><input type="radio" name="quality" value="audio-m4a"><span>M4A</span></label>
+                <label class="seg"><input type="radio" name="quality" value="audio-mp3"><span>MP3</span></label>
+              </div>
+            </div>
+          </div>
+          <div id="mc-format-row" class="field" role="radiogroup" aria-labelledby="mc-format-label">
+            <span id="mc-format-label" class="field-label">Format</span>
+            <div class="seg-group">
+              <label class="seg"><input type="radio" name="container" value="mp4"><span>MP4</span></label>
+              <label class="seg"><input type="radio" name="container" value="mkv"><span>MKV</span></label>
+              <label class="seg"><input type="radio" name="container" value="webm"><span>WebM</span></label>
+            </div>
+          </div>
+          <label id="mc-subs-row" class="field"><span class="field-label">Subtitles</span><select id="mc-subs"></select></label>
+          <div id="mc-clip-row" class="field" role="group" aria-labelledby="mc-clip-label">
+            <span id="mc-clip-label" class="field-label">Clip</span>
+            <div class="clip">
+              <input id="mc-start" type="text" inputmode="numeric" placeholder="0:00" spellcheck="false" aria-label="Clip start, as m:ss">
+              <button id="mc-start-now" type="button" class="btn icon-btn" title="Use the current time" aria-label="Use the current time as the start"><svg class="icon" aria-hidden="true"><use href="#i-clock"/></svg></button>
+              <span class="note">to</span>
+              <input id="mc-end" type="text" inputmode="numeric" placeholder="end" spellcheck="false" aria-label="Clip end, as m:ss">
+              <button id="mc-end-now" type="button" class="btn icon-btn" title="Use the current time" aria-label="Use the current time as the end"><svg class="icon" aria-hidden="true"><use href="#i-clock"/></svg></button>
+            </div>
+          </div>
+          <div id="mc-sponsor-row" class="field" role="radiogroup" aria-labelledby="mc-sponsor-label">
+            <span id="mc-sponsor-label" class="field-label">SponsorBlock</span>
+            <div class="seg-group">
+              <label class="seg"><input type="radio" name="sponsorblock" value="off" checked><span>Off</span></label>
+              <label class="seg" title="Cut out sponsors, self-promotion and reminders to subscribe"><input type="radio" name="sponsorblock" value="remove"><span>Remove</span></label>
+              <label class="seg" title="Keep them, marked as chapters"><input type="radio" name="sponsorblock" value="mark"><span>Mark</span></label>
+            </div>
+          </div>
+          <div id="mc-scope-row" class="field" role="radiogroup" aria-labelledby="mc-scope-label">
+            <span id="mc-scope-label" class="field-label">Playlist</span>
+            <div class="seg-group">
+              <label class="seg"><input type="radio" name="scope" value="video" checked><span>This video</span></label>
+              <label class="seg"><input type="radio" name="scope" value="playlist"><span id="mc-scope-all">Whole playlist</span></label>
+            </div>
+          </div>
+          <div id="mc-live-row" class="field" role="radiogroup" aria-labelledby="mc-live-label">
+            <span id="mc-live-label" class="field-label">Live</span>
+            <div class="seg-group">
+              <label class="seg"><input type="radio" name="live" value="now" checked><span>From now</span></label>
+              <label class="seg"><input type="radio" name="live" value="start"><span>From start</span></label>
+            </div>
+          </div>
+          <button id="mc-download" type="submit" class="btn primary wide"><svg class="icon" aria-hidden="true"><use href="#i-download"/></svg><span>Download</span></button>
+        </form>
+        <p id="mc-msg" class="msg" role="status" aria-live="polite"></p>
+      </div>
+
       <div id="page-card" class="card page-card">
         <div class="page-row">
           <span class="page-icon" aria-hidden="true"><svg class="icon"><use href="#i-browser"/></svg></span>
@@ -193,6 +273,18 @@
         <div class="setting">
           <label for="convert-mp4">Convert HLS to MP4<small>The app turns saved streams into MP4 files</small></label>
           <input id="convert-mp4" type="checkbox" class="switch" role="switch">
+        </div>
+      </div>
+
+      <div class="card">
+        <h2 class="card-title"><svg class="icon" aria-hidden="true"><use href="#i-video"/></svg>Media sites</h2>
+        <div class="setting">
+          <label for="media-cookies">Use my browser sign-in on media sites<small>Lets the app download age-restricted or members-only videos you can already watch. Your cookies go only to the app on this PC. yt-dlp warns that using your account can get it rate-limited or flagged by the site.</small></label>
+          <input id="media-cookies" type="checkbox" class="switch" role="switch">
+        </div>
+        <div class="setting">
+          <label for="youtube-button">Show a Download button on YouTube<small>Beside Share under a video, and among a Short's buttons</small></label>
+          <input id="youtube-button" type="checkbox" class="switch" role="switch">
         </div>
       </div>
 
