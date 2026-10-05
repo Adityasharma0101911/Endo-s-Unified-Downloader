@@ -12,7 +12,7 @@ use clap::Parser;
 use hyperfetch_core::engine::DownloadOptions;
 use hyperfetch_core::history::{is_redacted, DownloadHistoryManager, HistoryEntry, HistoryStatus, REDACTED_LINK};
 use hyperfetch_core::ingest::{decode_text, descriptor_client, http_url, ingest, input_tokens, ListOptions, Task};
-use hyperfetch_core::media::{find_ffmpeg_path, is_supported_media_site, BrowserCookieSource};
+use hyperfetch_core::media::{self, find_ffmpeg_path, is_supported_media_site, BrowserCookieSource};
 use hyperfetch_core::p2p;
 use hyperfetch_core::paste::{self, PastedLink};
 use hyperfetch_core::postprocess::PostOptions;
@@ -32,8 +32,10 @@ use download::{
 fn main() {
     // Started again to stop a live recording, this only does that.
     hyperfetch_core::media::serve_ctrl_c();
+    media::prepare_macos();
     // What an earlier update left behind (the old programs) can be deleted once they have exited.
     updater::cleanup_old();
+    updater::refresh_extension();
     let args = Args::parse();
     // On a thread of its own: a MEGA or swarm download nests futures deep enough to overflow
     // the main thread's 1 MiB stack on Windows in a debug build.
@@ -508,9 +510,15 @@ fn ffmpeg_question(args: &Args, jobs: &[Job], find: Option<Finder>, ui: &Ui) -> 
 }
 
 /// What [`ask_to_install_ffmpeg`] asks.
-const FFMPEG_QUESTION: &str = "\nffmpeg is not installed. It joins a video's separate video and audio (the best quality) and \
-makes MP3/M4A files; without it videos download in a lower quality and audio presets fail.\nInstall it for your user \
-(the checked build yt-dlp's makers publish, about 200 MB)? [y/N]: ";
+fn ffmpeg_question_text() -> String {
+    format!(
+        "\nffmpeg is not installed. It joins a video's separate video and audio (the best quality) and makes MP3/M4A \
+         files; without it videos download in a lower quality and audio presets fail.\nInstall it for your user ({}, {})? \
+         [y/N]: ",
+        media::FFMPEG_BUILD,
+        media::FFMPEG_DOWNLOAD
+    )
+}
 
 /// Whether the media downloads among `jobs` may install ffmpeg (about 200 MB) when none is found:
 /// as --install-ffmpeg or --no-install-ffmpeg says, else as the user answered before in this run
@@ -542,7 +550,7 @@ where
     if tokio::task::spawn_blocking(find).await.is_ok_and(|found| found.is_some()) {
         return None;
     }
-    let answer = ask(FFMPEG_QUESTION.to_string()).await;
+    let answer = ask(ffmpeg_question_text()).await;
     Some(answer.is_some_and(|answer| answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes")))
 }
 
@@ -1105,7 +1113,7 @@ mod tests {
 
         let (mut asked, mut answered) = (0, None);
         let mut yes = |question: String| {
-            assert!(question.contains("about 200 MB") && question.ends_with("[y/N]: "), "{question}");
+            assert!(question.contains(media::FFMPEG_DOWNLOAD) && question.ends_with("[y/N]: "), "{question}");
             asked += 1;
             std::future::ready(Some("Y".to_string()))
         };
@@ -1360,7 +1368,7 @@ mod tests {
             let code = interactive(&args, &Ui::new(true), &Shutdown::install(), &reqwest::Client::new(), find, ask).await;
             assert_eq!(code, EXIT_FAILED);
             assert_eq!(asked.len(), questions, "{asked:?}");
-            assert_eq!(asked.iter().any(|question| question.contains("about 200 MB")), find.is_some(), "{asked:?}");
+            assert_eq!(asked.iter().any(|question| question.contains(media::FFMPEG_DOWNLOAD)), find.is_some(), "{asked:?}");
             assert!(asked.last().is_some_and(|question| question.contains("another")), "{asked:?}");
         }
     }

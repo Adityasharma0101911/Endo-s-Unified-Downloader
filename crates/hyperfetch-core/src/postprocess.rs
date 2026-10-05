@@ -154,9 +154,17 @@ pub(crate) fn size_of(path: &Path) -> u64 {
 
 /// Marks `path` (a file, or every file of a folder) as downloaded from the internet: Windows'
 /// Zone.Identifier stream, which SmartScreen and Office read, with `source` minus its secrets
-/// and its fragment (a MEGA folder's key). Best effort: FAT drives have no streams. Does
-/// nothing elsewhere.
+/// and its fragment (a MEGA folder's key); macOS' quarantine (see [`quarantine_value`]), which
+/// Gatekeeper reads. Best effort: FAT drives have no streams. Does nothing elsewhere.
 pub(crate) fn mark_from_internet(path: &Path, source: &Url) {
+    #[cfg(target_os = "macos")]
+    {
+        let now =std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let value = quarantine_value(now);
+        each_file(path, &mut |file| {
+            let _ = set_xattr(file, "com.apple.quarantine", value.as_bytes());
+        });
+    }
     if !cfg!(windows) {
         return;
     }
@@ -171,6 +179,29 @@ pub(crate) fn mark_from_internet(path: &Path, source: &Url) {
         stream.push(":Zone.Identifier");
         let _ = std::fs::write(stream, &zone);
     });
+}
+
+/// The `com.apple.quarantine` value of a file this app downloaded at `now` (Unix seconds), as
+/// browsers write it: flags 0081 (downloaded, not yet opened), the time in hex, the app's name and
+/// no event id.
+#[cfg(any(target_os = "macos", test))]
+fn quarantine_value(now: u64) -> String {
+    format!("0081;{now:x};Endo's Unified Downloader;")
+}
+
+/// Sets the extended attribute `name` of `file` to `value`, not following a link. Blocking.
+#[cfg(target_os = "macos")]
+fn set_xattr(file: &Path, name: &str, value: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(file.as_os_str().as_bytes()).map_err(std::io::Error::other)?;
+    let name = std::ffi::CString::new(name).map_err(std::io::Error::other)?;
+    // SAFETY: both strings are NUL-terminated and outlive the call; `value` is read for its length.
+    let set = unsafe { libc::setxattr(path.as_ptr(), name.as_ptr(), value.as_ptr().cast(), value.len(), 0, libc::XATTR_NOFOLLOW) };
+    if set == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 /// `name` without its archive extension (see [`ARCHIVES`]), or None if it is no archive.
@@ -228,7 +259,7 @@ fn extract(file: &Path, password: Option<&str>) -> Result<Option<PathBuf>, Strin
             }
             None => format!("{name} is password-protected, so it was left packed"),
             Some(_) if seven.is_none() && seven_or_rar => {
-                format!("{name} is password-protected and was left packed: opening it needs 7-Zip (7-zip.org)")
+                format!("{name} is password-protected and was left packed: opening it needs 7-Zip ({SEVEN_ZIP_FROM})")
             }
             Some(_) => format!("{name} was left packed: the password did not open it"),
         }
@@ -315,10 +346,15 @@ fn run_typing(command: &mut std::process::Command, line: Option<&str>) -> std::i
     child.wait_with_output()
 }
 
-/// 7-Zip's console program: on PATH, else where its installer puts it on Windows.
+/// Where to get 7-Zip, as the user is told.
+const SEVEN_ZIP_FROM: &str = if cfg!(target_os = "macos") { "brew install sevenzip" } else { "7-zip.org" };
+
+/// 7-Zip's console program: on PATH (Homebrew's sevenzip is `7zz`, p7zip's `7z`), else where its
+/// installer puts it on Windows.
 fn seven_zip() -> Option<PathBuf> {
     let exe = format!("7z{}", std::env::consts::EXE_SUFFIX);
-    crate::media::find_in_path(&exe).or_else(|| {
+    let on_path = || crate::media::find_in_path("7zz").or_else(|| crate::media::find_in_path(&exe));
+    on_path().or_else(|| {
         ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"]
             .into_iter()
             .filter_map(std::env::var_os)
@@ -328,7 +364,7 @@ fn seven_zip() -> Option<PathBuf> {
 }
 
 /// Whether the folder `dir` holds a symbolic link or junction, anywhere down.
-fn has_links(dir: &Path) -> bool {
+pub(crate) fn has_links(dir: &Path) -> bool {
     std::fs::read_dir(dir).into_iter().flatten().flatten().any(|entry| match entry.file_type() {
         Ok(kind) if kind.is_symlink() => true,
         Ok(kind) if kind.is_dir() => has_links(&entry.path()),
@@ -530,6 +566,35 @@ mod tests {
         mark_from_internet(&file, &url("https://mega.nz/folder/abc#FOLDERKEY/file/xyz"));
         let zone = std::fs::read_to_string(format!("{}:Zone.Identifier", file.display())).unwrap();
         assert!(zone.ends_with("HostUrl=https://mega.nz/folder/abc\r\n"), "{zone}");
+    }
+
+    #[test]
+    fn the_quarantine_is_a_browser_downloads() {
+        assert_eq!(quarantine_value(0x6a00_0001), "0081;6a000001;Endo's Unified Downloader;");
+    }
+
+    /// On macOS each file downloaded, also those of a folder, is quarantined as a browser's are.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn downloads_are_quarantined_on_macos() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (file, folder) = (dir.path().join("a.bin"), dir.path().join("f"));
+        std::fs::write(&file, b"x").unwrap();
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("inner.txt"), b"y").unwrap();
+        let done = after_download(&file, &PostOptions::default(), &url("https://example.com/a.bin"), None, None).await;
+        assert_eq!(done, PostOutcome { path: file.clone(), notes: vec![] });
+        mark_from_internet(&folder, &url("https://example.com/f.zip"));
+        for marked in [file, folder.join("inner.txt")] {
+            let (path, name) = (std::ffi::CString::new(marked.as_os_str().as_bytes()).unwrap(), c"com.apple.quarantine");
+            let mut value = [0u8; 256];
+            // SAFETY: NUL-terminated strings and a buffer of the length given.
+            let n = unsafe { libc::getxattr(path.as_ptr(), name.as_ptr(), value.as_mut_ptr().cast(), value.len(), 0, 0) };
+            assert!(n > 0, "{} is not quarantined", marked.display());
+            let value = String::from_utf8_lossy(&value[..n as usize]).into_owned();
+            assert!(value.starts_with("0081;") && value.ends_with(";Endo's Unified Downloader;"), "{value}");
+        }
     }
 
     #[test]

@@ -1,0 +1,21 @@
+<!-- The macOS app icon: assets/logo.svg on Apple's icon grid (an 824 px plate in a 1024 px canvas, with a soft shadow). bundle.sh builds AppIcon.icns from AppIcon.png, which is this file rendered. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="plate" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#26262b" />
+      <stop offset="1" stop-color="#09090b" />
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="12" stdDeviation="14" flood-color="#000" flood-opacity="0.3" />
+    </filter>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#plate)" filter="url(#shadow)" />
+  <rect x="101" y="101" width="822" height="822" rx="184" fill="none" stroke="#fff" stroke-opacity="0.1" stroke-width="2" />
+  <g fill="#fafafa" transform="translate(100 100) scale(3.21875)">
+    <rect x="74" y="52" width="22" height="72" rx="4" opacity="0.65" />
+    <rect x="117" y="38" width="22" height="86" rx="4" />
+    <rect x="160" y="52" width="22" height="72" rx="4" opacity="0.65" />
+    <path d="M 52 136 L 128 206 L 204 136 L 168 136 L 128 172 L 88 136 Z" />
+    <rect x="88" y="218" width="80" height="6" rx="3" opacity="0.4" />
+  </g>
+</svg>

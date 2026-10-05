@@ -90,7 +90,7 @@ pub(super) fn sidebar(app: &mut App, ctx: &egui::Context) {
         for (n, (tab, glyph, label, count)) in pages.into_iter().enumerate() {
             let response = nav_item(ui, glyph, label, count, app.tab == tab);
             rects[n] = response.rect;
-            if response.on_hover_text(format!("Ctrl+{}", n + 1)).clicked() {
+            if response.on_hover_text(keys(&format!("Ctrl+{}", n + 1)).into_owned()).clicked() {
                 go(app, tab);
             }
         }

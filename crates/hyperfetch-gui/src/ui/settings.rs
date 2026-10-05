@@ -89,6 +89,17 @@ pub(super) fn settings_page(app: &mut App, ui: &mut Ui) {
                     only; there is nothing to set up here. What it sends cannot change these settings: post-processing, \
                     the command run after downloads, networks and seeding stay as set here.";
         ui.add(egui::Label::new(RichText::new(text).color(p.muted)).wrap());
+        if let Some(dir) = hyperfetch_core::updater::extension_dir() {
+            let about = "Chrome, Edge and Brave load the extension from this folder: Extensions, Developer mode, Load unpacked.";
+            setting(ui, "Extension folder", about, (), |ui| {
+                if ui.add_enabled(dir.is_dir(), button("Open")).clicked() {
+                    if let Err(e) = util::open_path(&dir) {
+                        app.notice = Some(Err(format!("Could not open {}: {}", dir.display(), e)));
+                    }
+                }
+                ui.add(egui::Label::new(RichText::new(dir.display().to_string()).small().color(p.muted)).truncate());
+            });
+        }
     });
     section(ui, 7, icon::ARROW_CIRCLE_UP, "Updates", |ui| {
         setting(ui, "Version", "", (), |ui| {
@@ -127,7 +138,11 @@ fn general_settings(app: &mut App, ui: &mut Ui) {
             ui.selectable_value(&mut app.settings.theme, value, name);
         }
     });
-    let about = "Instant page changes and no moving icons. System follows the Animation effects setting of Windows.";
+    let about = if cfg!(target_os = "macos") {
+        "Instant page changes and no moving icons. System follows Reduce motion in the Accessibility settings of macOS."
+    } else {
+        "Instant page changes and no moving icons. System follows the Animation effects setting of Windows."
+    };
     setting(ui, "Reduce motion", about, app.settings.reduce_motion, |ui| {
         for (value, name) in [(Some(false), "Off"), (Some(true), "On"), (None, "System")] {
             ui.selectable_value(&mut app.settings.reduce_motion, value, name);
@@ -307,8 +322,13 @@ fn media_settings(app: &mut App, ui: &mut Ui) {
     switch(ui, "Wait for scheduled streams", about, &mut s.wait_for_video);
     let about = "An HLS (m3u8) stream is remuxed into an MP4 without re-encoding; needs ffmpeg, without it the .ts is kept.";
     switch(ui, "Convert HLS streams to MP4", about, &mut s.hls_to_mp4);
-    let about = "Imgur, Pixiv, DeviantArt, ArtStation, Flickr, Tumblr, Pinterest, boorus, Bluesky and Reddit galleries; \
-                 gallery-dl is installed when first needed.";
+    let about = if cfg!(target_os = "macos") {
+        "Imgur, Pixiv, DeviantArt, ArtStation, Flickr, Tumblr, Pinterest, boorus, Bluesky and Reddit galleries; \
+         needs gallery-dl (brew install gallery-dl)."
+    } else {
+        "Imgur, Pixiv, DeviantArt, ArtStation, Flickr, Tumblr, Pinterest, boorus, Bluesky and Reddit galleries; \
+         gallery-dl is installed when first needed."
+    };
     switch(ui, "Image galleries with gallery-dl", about, &mut s.gallery_dl);
     let about = "Leave out the videos, tracks, episodes and files of a playlist, channel, feed or folder downloaded before.";
     switch(ui, "Only new playlist items", about, &mut s.only_new);
@@ -322,8 +342,12 @@ fn media_settings(app: &mut App, ui: &mut Ui) {
 }
 
 fn post_settings(s: &mut Settings, ui: &mut Ui) {
-    ui.add_enabled_ui(cfg!(windows), |ui| {
-        let about = "Windows then asks before running a downloaded program, as it does for browser downloads.";
+    ui.add_enabled_ui(cfg!(any(windows, target_os = "macos")), |ui| {
+        let about = if cfg!(target_os = "macos") {
+            "macOS then asks before opening a downloaded program, as it does for browser downloads."
+        } else {
+            "Windows then asks before running a downloaded program, as it does for browser downloads."
+        };
         switch(ui, "Mark as downloaded from the internet", about, &mut s.mark_of_the_web);
     });
     switch(ui, "Unpack archives", "Zip, 7z, rar and tar files unpack into a folder next to them.", &mut s.auto_extract);
@@ -339,7 +363,8 @@ fn post_settings(s: &mut Settings, ui: &mut Ui) {
         text_setting(ui, "VirusTotal API key", about, &mut s.virustotal_api_key, "Your VirusTotal key", true);
     });
     let about = "A program and its arguments, run without a shell after each download. {path}, {dir}, {name} and {url} are filled in.";
-    text_setting(ui, "Run after each download", about, &mut s.run_after, "e.g. C:\\Tools\\scan.exe \"{path}\"", false);
+    let hint = if cfg!(windows) { "e.g. C:\\Tools\\scan.exe \"{path}\"" } else { "e.g. /usr/local/bin/scan \"{path}\"" };
+    text_setting(ui, "Run after each download", about, &mut s.run_after, hint, false);
 }
 
 #[cfg(test)]

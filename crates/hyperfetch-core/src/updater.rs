@@ -22,6 +22,11 @@ pub const RELEASES: &str = "https://github.com/Adityasharma0101911/Endo-s-Unifie
 pub const GUI_EXE: &str = "Endos-Unified-Downloader.exe";
 /// The command-line tool, as named in a release and next to the GUI.
 pub const CLI_EXE: &str = "Endos-Unified-Downloader-CLI.exe";
+/// The app's bundle on macOS, as a release's `.app.tar.gz` holds it (see [`bundle_asset`]); its
+/// `Contents/MacOS` holds the two programs, named as above without `.exe`.
+const BUNDLE: &str = "Endo's Unified Downloader.app";
+/// What an update on macOS cannot do without: a bundle the user can write over.
+const MOVE_THE_APP: &str = "Move the app to Applications, open it once, then update";
 /// The maintainer's Ed25519 public key (raw, base64) a release's `SHA256SUMS.sig` must verify with.
 /// The private half never leaves the maintainer's machine (see scripts/sign-release.mjs).
 const PUBLIC_KEY: &str = "T0QVGQ63fXhyznv19veDUihSZBpBRxjGVOmPVoh85ms=";
@@ -52,11 +57,13 @@ pub enum Program {
 /// What [`install`] replaced.
 #[derive(Debug, Clone, Default)]
 pub struct Installed {
-    /// Every exe replaced, own first.
+    /// Every exe replaced, own first; on macOS the bundle.
     pub replaced: Vec<PathBuf>,
-    /// Where the new build of the running program now is (its path before the update): what to restart.
+    /// Where the new build of the running program now is (its path before the update): what to
+    /// restart (see [`restart`]).
     pub own: PathBuf,
-    /// The extension folder next to the exes was replaced.
+    /// The extension folder next to the exes was replaced (on macOS [`refresh_extension`] copies
+    /// the new bundle's at the next start).
     pub extension: bool,
 }
 
@@ -96,18 +103,23 @@ fn newer_release(releases: &str, latest: &str, current: &str) -> Result<Option<U
     Ok(newer(version, current).then(|| Update { version: version.to_string(), tag: tag.to_string(), page: format!("{releases}/tag/{tag}") }))
 }
 
-/// Downloads, verifies and swaps in `update` (Windows only; elsewhere Err naming update.page): the
-/// running program `own`, the other program when it is next to it, and the browser extension's
-/// folder there. Nothing is replaced unless every file is verified and written next to its target,
-/// and a failure while the programs are swapped puts the old ones back. The old programs stay as
-/// `<name>.old.exe` until [`cleanup_old`], as a running one cannot be deleted.
+/// Downloads, verifies and swaps in `update` (Windows and macOS; elsewhere Err naming
+/// update.page). On Windows: the running program `own`, the other program when it is next to it,
+/// and the browser extension's folder there. Nothing is replaced unless every file is verified and
+/// written next to its target, and a failure while the programs are swapped puts the old ones
+/// back. The old programs stay as `<name>.old.exe` until [`cleanup_old`], as a running one cannot
+/// be deleted. On macOS the whole bundle the program runs from (see [`install_bundle_from`]).
 pub async fn install(proxy: Option<&str>, update: &Update, own: Program) -> Result<Installed, String> {
-    if !cfg!(windows) {
-        return Err(format!("Updating in place works on Windows only; download the new version from {}", update.page));
+    if !cfg!(any(windows, target_os = "macos")) {
+        return Err(format!("Updating in place works on Windows and macOS only; download the new version from {}", update.page));
     }
-    let exe = std::env::current_exe().map_err(|e| format!("Cannot find the running program: {e}"))?;
+    let exe = running_exe().map_err(|e| format!("Cannot find the running program: {e}"))?;
     let key = debug_override("ENDO_UPDATE_KEY").unwrap_or_else(|| PUBLIC_KEY.to_string());
-    install_from(&http_client(proxy)?, &releases(), &key, env!("CARGO_PKG_VERSION"), update, own, &exe).await
+    let (client, current) = (http_client(proxy)?, env!("CARGO_PKG_VERSION"));
+    if cfg!(target_os = "macos") {
+        return install_bundle_from(&client, &releases(), &key, current, update, &exe, cfg!(target_arch = "aarch64")).await;
+    }
+    install_from(&client, &releases(), &key, current, update, own, &exe).await
 }
 
 /// [`install`] of `update` from `releases`, signed with `key`, over `exe`, the running program
@@ -145,6 +157,19 @@ async fn install_from(
         .is_file()
         .then(|| format!("Endos-Unified-Downloader-Extension-{}.zip", update.tag));
 
+    let assets: Vec<&str> = targets.iter().map(|(_, asset)| *asset).chain(extension.as_deref()).collect();
+    let mut files = fetch_verified(client, releases, key, update, &assets).await?;
+
+    let zip = if extension.is_some() { files.pop() } else { None };
+    let (dir, exes): (_, Vec<PathBuf>) = (dir.to_path_buf(), targets.into_iter().map(|(path, _)| path).collect());
+    tokio::task::spawn_blocking(move || put_in_place(&dir, exes, files, zip))
+        .await
+        .map_err(|e| format!("Update task failed: {e}"))?
+}
+
+/// The files `assets` of `update` from `releases`, each checked against the release's
+/// `SHA256SUMS`, which must carry `key`'s signature and be for `update`'s version.
+async fn fetch_verified(client: &reqwest::Client, releases: &str, key: &str, update: &Update, assets: &[&str]) -> Result<Vec<Vec<u8>>, String> {
     let release = format!("{releases}/download/{}", update.tag);
     let listing = fetch(client, &format!("{release}/SHA256SUMS"), SUMS_CAP, Duration::from_secs(30)).await?;
     let signature = fetch(client, &format!("{release}/SHA256SUMS.sig"), SUMS_CAP, Duration::from_secs(30)).await?;
@@ -152,7 +177,7 @@ async fn install_from(
     verify_signature(key, &listing, &signature)?;
     let sums = parse_sums(&listing, &update.version)?;
     let mut files = Vec::new();
-    for asset in targets.iter().map(|(_, asset)| *asset).chain(extension.as_deref()) {
+    for asset in assets {
         let expected = sums.get(asset).ok_or_else(|| format!("The update's SHA256SUMS has no entry for {asset}"))?;
         let body = fetch(client, &format!("{release}/{asset}"), ASSET_CAP, Duration::from_secs(600)).await?;
         let actual = format!("{:x}", Sha256::digest(&body));
@@ -161,12 +186,148 @@ async fn install_from(
         }
         files.push(body);
     }
+    Ok(files)
+}
 
-    let zip = if extension.is_some() { files.pop() } else { None };
-    let (dir, exes): (_, Vec<PathBuf>) = (dir.to_path_buf(), targets.into_iter().map(|(path, _)| path).collect());
-    tokio::task::spawn_blocking(move || put_in_place(&dir, exes, files, zip))
-        .await
-        .map_err(|e| format!("Update task failed: {e}"))?
+/// The macOS release file of the app's bundle for a Mac with an Apple Silicon processor (`arm`)
+/// or an Intel one.
+fn bundle_asset(arm: bool) -> &'static str {
+    if arm {
+        "Endos-Unified-Downloader-macos-arm64.app.tar.gz"
+    } else {
+        "Endos-Unified-Downloader-macos-x64.app.tar.gz"
+    }
+}
+
+/// The `.app` bundle the program `exe` is in, when it is a bundle's `Contents/MacOS/<program>`.
+pub fn bundle_of(exe: &Path) -> Option<&Path> {
+    let macos = exe.parent()?;
+    let contents = macos.parent()?;
+    let bundle = contents.parent()?;
+    let inside = macos.file_name()? == "MacOS" && contents.file_name()? == "Contents" && bundle.extension()? == "app";
+    inside.then_some(bundle)
+}
+
+/// Whether macOS runs `path` from a read-only copy of where it was downloaded (App Translocation,
+/// for an app never moved out of Downloads or a disk image), which cannot be updated.
+fn translocated(path: &Path) -> bool {
+    path.to_string_lossy().contains("/AppTranslocation/")
+}
+
+/// `CFBundleShortVersionString` of an Info.plist in XML, when it parses as a version.
+fn plist_version(plist: &str) -> Option<String> {
+    let (_, after) = plist.split_once("<key>CFBundleShortVersionString</key>")?;
+    let version = after.trim_start().strip_prefix("<string>")?.split_once("</string>")?.0.trim();
+    version_parts(version).map(|_| version.to_string())
+}
+
+/// The version of the bundle `bundle` (see [`plist_version`]). Blocking.
+fn bundle_version(bundle: &Path) -> Option<String> {
+    plist_version(&std::fs::read_to_string(bundle.join("Contents").join("Info.plist")).ok()?)
+}
+
+/// [`install`] on macOS of `update` from `releases`, signed with `key`, over the bundle the
+/// program `exe` of version `current` runs from: the release's bundle for this Mac (`arm`: Apple
+/// Silicon, see [`bundle_asset`]) is checked like the Windows programs, unpacked in a folder beside
+/// the bundle (the same volume) and swapped in whole (see [`put_bundle_in_place`]). The GUI and
+/// the CLI, both in the bundle, are updated together.
+async fn install_bundle_from(
+    client: &reqwest::Client,
+    releases: &str,
+    key: &str,
+    current: &str,
+    update: &Update,
+    exe: &Path,
+    arm: bool,
+) -> Result<Installed, String> {
+    if !newer(&update.version, current) {
+        return Err(format!("Version {} is not newer than this one ({current})", update.version));
+    }
+    let bundle = bundle_of(exe).ok_or_else(|| format!("This copy of the app is not in its .app bundle; download the new version from {}", update.page))?;
+    if translocated(bundle) {
+        return Err(format!("macOS runs this copy of the app from a read-only place. {MOVE_THE_APP}"));
+    }
+    // The other program may have installed a release since this one started.
+    if let Some(installed) = bundle_version(bundle).filter(|installed| !newer(&update.version, installed)) {
+        return Err(format!("Version {installed} is already installed; restart the app to use it"));
+    }
+    // Before anything is downloaded: also whether the bundle's folder can be written.
+    let parent = bundle.parent().ok_or("The app's bundle has no folder")?;
+    let staging = parent.join(format!(".endo-update-{}.tmp", unique_suffix()));
+    std::fs::create_dir(&staging).map_err(|e| format!("Cannot write next to {}: {e}. {MOVE_THE_APP}", bundle.display()))?;
+    let fetched = fetch_verified(client, releases, key, update, &[bundle_asset(arm)]).await;
+    let installed = match fetched {
+        Ok(mut files) => {
+            let own = exe.file_name().unwrap_or_default().to_os_string();
+            let (bundle, staging, version) = (bundle.to_path_buf(), staging.clone(), update.version.clone());
+            tokio::task::spawn_blocking(move || put_bundle_in_place(&bundle, &staging, &files.remove(0), &version, &own))
+                .await
+                .map_err(|e| format!("Update task failed: {e}"))
+                .and_then(|done| done)
+        }
+        Err(e) => Err(e),
+    };
+    // The old bundle, moved aside next to it, still runs: it goes at the next start (see cleanup_old).
+    let _ = std::fs::remove_dir_all(&staging);
+    installed.map(|()| Installed { replaced: vec![bundle.to_path_buf()], own: exe.to_path_buf(), extension: false })
+}
+
+/// Unpacks `archive`, a release's `.app.tar.gz` (see [`bundle_asset`]), in `staging`, a new folder
+/// beside `bundle`, and swaps the [`BUNDLE`] it holds in for `bundle` (see [`swap_bundle`]) once it
+/// is whole: no entry of it would land outside `staging` (see [`escapes`]) nor is a link, it has
+/// the program `own` and its Info.plist is of `version`. Blocking.
+fn put_bundle_in_place(bundle: &Path, staging: &Path, archive: &[u8], version: &str, own: &std::ffi::OsStr) -> Result<(), String> {
+    let (tar, file, unpacked) = (system_tar(), staging.join("app.tar.gz"), staging.join("app"));
+    std::fs::write(&file, archive).map_err(|e| format!("Failed to write {}: {e}", file.display()))?;
+    entries_stay_inside(&tar, &file, "app")?;
+    std::fs::create_dir(&unpacked)
+        .and_then(|()| unpack(&tar, &file, &unpacked, &[]))
+        .map_err(|e| format!("Failed to unpack the update: {e}"))?;
+    if crate::postprocess::has_links(&unpacked) {
+        return Err("The update's app holds links, which could lead outside it".to_string());
+    }
+    let new = unpacked.join(BUNDLE);
+    if !new.join("Contents").join("MacOS").join(own).is_file() {
+        return Err(format!("The update's app has no {}", own.to_string_lossy()));
+    }
+    match bundle_version(&new) {
+        Some(found) if found == version => swap_bundle(bundle, &new),
+        found => Err(format!("The update's app is version {}, not {version}", found.as_deref().unwrap_or("unknown"))),
+    }
+}
+
+/// Where `bundle` is moved to make way for its new build: `.<name>.old-<unique>` next to it,
+/// hidden, until [`cleanup_old`].
+fn old_bundle(bundle: &Path) -> PathBuf {
+    let name = bundle.file_name().unwrap_or_default().to_string_lossy();
+    bundle.with_file_name(format!(".{name}.old-{}", unique_suffix()))
+}
+
+/// Moves `bundle` aside (see [`old_bundle`]) and `new` into its place, putting it back when that
+/// fails. A running program goes on from the bundle moved aside. Blocking.
+fn swap_bundle(bundle: &Path, new: &Path) -> Result<(), String> {
+    let old = old_bundle(bundle);
+    std::fs::rename(bundle, &old).map_err(|e| format!("Failed to move {} aside: {e}. {MOVE_THE_APP}", bundle.display()))?;
+    std::fs::rename(new, bundle).or_else(|e| {
+        if let Err(e) = std::fs::rename(&old, bundle) {
+            tracing::error!("Could not put {} back from {}: {e}", bundle.display(), old.display());
+        }
+        Err(format!("Failed to replace {}: {e}", bundle.display()))
+    })
+}
+
+/// Starts the updated program `exe` (see [`Installed::own`]) once this one closes: on macOS its
+/// bundle, as a new instance of the app (`open -n`), else `exe` itself.
+pub fn restart(exe: &Path) -> std::io::Result<()> {
+    let mut command = match bundle_of(exe) {
+        Some(bundle) if cfg!(target_os = "macos") => {
+            let mut open = std::process::Command::new("/usr/bin/open");
+            open.arg("-n").arg(bundle);
+            open
+        }
+        _ => std::process::Command::new(exe),
+    };
+    command.spawn().map(drop)
 }
 
 /// Body of `url`, refused once it grows past `cap` bytes.
@@ -302,17 +463,7 @@ fn unpack_extension(zip: &[u8], into: &Path) -> Result<(), String> {
     let unpacked = std::fs::create_dir(&staging)
         .and_then(|()| std::fs::write(&archive, zip))
         .map_err(|e| format!("Failed to write {}: {e}", archive.display()))
-        .and_then(|()| {
-            let listed = quiet_command(&tar).arg("-tf").arg(&archive).stdin(Stdio::null()).output();
-            match listed {
-                Ok(out) if out.status.success() => match String::from_utf8_lossy(&out.stdout).lines().find(|entry| escapes(entry)) {
-                    Some(entry) => Err(format!("The update's browser extension has a file outside its folder: {entry}")),
-                    None => Ok(()),
-                },
-                Ok(out) => Err(format!("Failed to list the browser extension: {}", String::from_utf8_lossy(&out.stderr).trim())),
-                Err(e) => Err(format!("Failed to run {}: {e}", tar.display())),
-            }
-        })
+        .and_then(|()| entries_stay_inside(&tar, &archive, "browser extension"))
         .and_then(|()| {
             std::fs::create_dir(into)
                 .and_then(|()| unpack(&tar, &archive, into, &[]))
@@ -321,6 +472,19 @@ fn unpack_extension(zip: &[u8], into: &Path) -> Result<(), String> {
     let _ = std::fs::remove_dir_all(&staging);
     unpacked?;
     manifest_version(into).map(drop).ok_or_else(|| "The update's browser extension has no manifest.json with a version".to_string())
+}
+
+/// Fails unless every entry of `archive`, as `tar` lists them, stays inside the folder it is
+/// unpacked into (see [`escapes`]); `what` names the archive. Blocking.
+fn entries_stay_inside(tar: &Path, archive: &Path, what: &str) -> Result<(), String> {
+    match quiet_command(tar).arg("-tf").arg(archive).stdin(Stdio::null()).output() {
+        Ok(out) if out.status.success() => match String::from_utf8_lossy(&out.stdout).lines().find(|entry| escapes(entry)) {
+            Some(entry) => Err(format!("The update's {what} has a file outside its folder: {entry}")),
+            None => Ok(()),
+        },
+        Ok(out) => Err(format!("Failed to list the {what}: {}", String::from_utf8_lossy(&out.stderr).trim())),
+        Err(e) => Err(format!("Failed to run {}: {e}", tar.display())),
+    }
 }
 
 /// Whether zip entry `name` would land outside the folder it is unpacked into: absolute, on a
@@ -351,10 +515,34 @@ fn replace_extension(dir: &Path, unpacked: &Path) -> bool {
 
 /// Best effort, blocking: deletes what an earlier update left next to the running exe: the
 /// programs it replaced, once they no longer run, and what it did not get to delete. What one cut
-/// off midway had moved aside is put back first.
+/// off midway had moved aside is put back first. On macOS, next to the running bundle (see
+/// [`cleanup_beside`]).
 pub fn cleanup_old() {
-    if let Some(dir) = app_dir() {
-        cleanup_in(&dir);
+    let Ok(exe) = running_exe() else { return };
+    match bundle_of(&exe) {
+        Some(bundle) if cfg!(target_os = "macos") => cleanup_beside(bundle),
+        _ => {
+            if let Some(dir) = exe.parent() {
+                cleanup_in(dir);
+            }
+        }
+    }
+}
+
+/// [`cleanup_old`] of the bundle `bundle`, while it is there: deletes the bundles updates moved
+/// aside next to it (see [`old_bundle`]) and the folders they unpacked in (`.endo-update-*.tmp`).
+fn cleanup_beside(bundle: &Path) {
+    let (Some(parent), Some(name)) = (bundle.parent(), bundle.file_name()) else { return };
+    if !bundle.is_dir() {
+        return;
+    }
+    let moved = format!(".{}.old-", name.to_string_lossy());
+    for entry in std::fs::read_dir(parent).into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let left = name.starts_with(&moved) || (name.starts_with(".endo-update-") && name.ends_with(".tmp"));
+        if left && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
     }
 }
 
@@ -417,11 +605,78 @@ pub fn extension_version(dir: &Path) -> Option<String> {
     manifest_version(&dir.join("extension"))
 }
 
+/// The browser extension's folder, the one a browser loads it from ("Load unpacked"): next to the
+/// programs, except on macOS, where it is in the app's data folder, as a bundle must stay as it
+/// was signed; [`refresh_extension`] copies the bundle's there.
+pub fn extension_dir() -> Option<PathBuf> {
+    if cfg!(target_os = "macos") {
+        crate::media::app_data_dir().map(|dir| dir.join("extension"))
+    } else {
+        app_dir().map(|dir| dir.join("extension"))
+    }
+}
+
+/// On macOS, puts the browser extension of the running bundle (`Contents/Resources/extension`)
+/// into [`extension_dir`] when that has none or an older one (see [`copy_extension`]). Nothing
+/// elsewhere, or outside a bundle. Best effort, blocking.
+pub fn refresh_extension() {
+    let (Ok(exe), Some(to)) = (running_exe(), extension_dir()) else { return };
+    let Some(bundle) = bundle_of(&exe).filter(|_| cfg!(target_os = "macos")) else { return };
+    if let Err(e) = copy_extension(&bundle.join("Contents").join("Resources").join("extension"), &to) {
+        tracing::warn!("Could not put the browser extension into {}: {e}", to.display());
+    }
+}
+
+/// Copies the extension folder `from` to `to`, a folder named `extension`, when `to` has no
+/// version or an older one than `from`: into a folder beside it first, which then takes its place
+/// (see [`replace_extension`]). What an earlier copy left there goes first (see [`cleanup_in`]).
+/// Returns whether it copied. Blocking.
+fn copy_extension(from: &Path, to: &Path) -> std::io::Result<bool> {
+    let dir = to.parent().ok_or_else(|| std::io::Error::other("the extension folder has no parent"))?;
+    cleanup_in(dir);
+    let Some(version) = manifest_version(from) else { return Ok(false) };
+    if manifest_version(to).is_some_and(|have| !newer(&version, &have)) {
+        return Ok(false);
+    }
+    std::fs::create_dir_all(dir)?;
+    let staged = dir.join(format!(".extension-{}.tmp", unique_suffix()));
+    if let Err(e) = copy_dir(from, &staged) {
+        let _ = std::fs::remove_dir_all(&staged);
+        return Err(e);
+    }
+    if !to.exists() {
+        return std::fs::rename(&staged, to).map(|()| true);
+    }
+    Ok(replace_extension(dir, &staged))
+}
+
+/// Copies the folder `from` into the new folder `to`, all the way down; links are left out. Blocking.
+fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::create_dir(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let (kind, target) = (entry.file_type()?, to.join(entry.file_name()));
+        if kind.is_dir() {
+            copy_dir(&entry.path(), &target)?;
+        } else if kind.is_file() {
+            std::fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
+}
+
 /// `version` of `folder/manifest.json` when it parses as a version. Blocking.
-fn manifest_version(folder: &Path) -> Option<String> {
+pub fn manifest_version(folder: &Path) -> Option<String> {
     let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(folder.join("manifest.json")).ok()?).ok()?;
     let version = manifest["version"].as_str()?;
     version_parts(version).map(|_| version.to_string())
+}
+
+/// The running program; on macOS where links lead, so that a link to the CLI (in /usr/local/bin,
+/// say) finds the bundle it is in.
+fn running_exe() -> std::io::Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    Ok(if cfg!(target_os = "macos") { std::fs::canonicalize(&exe).unwrap_or(exe) } else { exe })
 }
 
 /// The running exe's folder.
@@ -432,7 +687,7 @@ pub fn app_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::media::tests::names_of;
+    use crate::media::tests::{names_of, serve_files};
     use ring::signature::{Ed25519KeyPair, KeyPair};
 
     /// A new key pair, with its public half as [`PUBLIC_KEY`] holds one.
@@ -446,6 +701,233 @@ mod tests {
     /// `SHA256SUMS.sig` of `sums`, as scripts/sign-release.mjs writes it.
     fn sign(pair: &Ed25519KeyPair, sums: &[u8]) -> Vec<u8> {
         format!("{}\n", base64::engine::general_purpose::STANDARD.encode(pair.sign(sums))).into_bytes()
+    }
+
+    /// Serves `files` as release v1.4.0 does, with the `SHA256SUMS` of `summed`, signed by
+    /// `signer`. Resolves to the base URL of the releases.
+    fn serve_release(files: &[(&str, &[u8])], summed: &[(&str, &[u8])], signer: &Ed25519KeyPair) -> impl std::future::Future<Output = String> {
+        let mut sums = String::from("# version 1.4.0\n");
+        let mut summed = summed.to_vec();
+        summed.sort();
+        for (name, body) in summed {
+            sums += &format!("{:x}  {name}\n", Sha256::digest(body));
+        }
+        let at = |name: &str| format!("/release/download/v1.4.0/{name}");
+        let mut served: Vec<(String, Vec<u8>)> = files.iter().map(|(name, body)| (at(name), body.to_vec())).collect();
+        served.push((at("SHA256SUMS.sig"), sign(signer, sums.as_bytes())));
+        served.push((at("SHA256SUMS"), sums.into_bytes()));
+        serve_files(served, None)
+    }
+
+    /// A bundle at `bundle` of `version`, whose two programs hold `build`.
+    fn make_bundle(bundle: &Path, version: &str, build: &str) {
+        let programs = bundle.join("Contents").join("MacOS");
+        std::fs::create_dir_all(&programs).unwrap();
+        for exe in [GUI_EXE, CLI_EXE] {
+            std::fs::write(programs.join(exe.trim_end_matches(".exe")), build).unwrap();
+        }
+        let plist = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\">\n<dict>\n\t<key>CFBundleVersion</key>\n\t<string>{version}</string>\n\t<key>CFBundleShortVersionString</key>\n\t<string>{version}</string>\n</dict>\n</plist>\n"
+        );
+        std::fs::write(bundle.join("Contents").join("Info.plist"), plist).unwrap();
+    }
+
+    /// A release's `.app.tar.gz` named `name` in `dir`, of a new [`BUNDLE`] of `version`, with the
+    /// entries `extra` too (relative to the folder the bundle is in).
+    fn bundle_archive(dir: &Path, name: &str, version: &str, extra: &[&str]) -> Vec<u8> {
+        let src = dir.join(format!("{name}-src"));
+        make_bundle(&src.join(BUNDLE), version, "new");
+        let archive = dir.join(name);
+        let status = std::process::Command::new(system_tar()).arg("-czf").arg(&archive).arg("-C").arg(&src).arg(BUNDLE).args(extra).status().unwrap();
+        assert!(status.success());
+        std::fs::read(archive).unwrap()
+    }
+
+    #[test]
+    fn the_bundle_and_its_release_file_are_found() {
+        let app = Path::new("/Applications/Endo's Unified Downloader.app");
+        assert_eq!(bundle_of(&app.join("Contents").join("MacOS").join("Endos-Unified-Downloader")), Some(app));
+        let renamed = Path::new("/Users/u/Apps/Renamed.app");
+        assert_eq!(bundle_of(&renamed.join("Contents/MacOS/Endos-Unified-Downloader-CLI")), Some(renamed));
+        for loose in [
+            "/usr/local/bin/Endos-Unified-Downloader-CLI",
+            "/x/Endo.app/Contents/Resources/x",
+            "/x/Endo/Contents/MacOS/x",
+            "/x/Endo.app/MacOS/x",
+            "/Contents/MacOS/x",
+            "x",
+            "",
+        ] {
+            assert_eq!(bundle_of(Path::new(loose)), None, "{loose}");
+        }
+        assert_eq!(bundle_asset(true), "Endos-Unified-Downloader-macos-arm64.app.tar.gz");
+        assert_eq!(bundle_asset(false), "Endos-Unified-Downloader-macos-x64.app.tar.gz");
+        assert!(translocated(Path::new("/private/var/folders/ab/T/AppTranslocation/1F2E-77/d/Endo's Unified Downloader.app")));
+        assert!(!translocated(app));
+    }
+
+    #[test]
+    fn the_version_is_read_from_the_info_plist() {
+        let dir = tempfile::tempdir().unwrap();
+        make_bundle(dir.path(), "1.4.0", "x");
+        assert_eq!(bundle_version(dir.path()).as_deref(), Some("1.4.0"));
+        let key = "<key>CFBundleShortVersionString</key>";
+        assert_eq!(plist_version(&format!("{key}<string> 2.0.1 </string>")).as_deref(), Some("2.0.1"));
+        for bad in [String::new(), format!("{key}<integer>1</integer>"), format!("{key}\n<string>1.4</string>"), format!("{key}<string>1.4.0")] {
+            assert_eq!(plist_version(&bad), None, "{bad}");
+        }
+    }
+
+    /// A swap that cannot move the new bundle in puts the old one back.
+    #[test]
+    fn a_failed_bundle_swap_puts_the_old_one_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join(BUNDLE);
+        make_bundle(&bundle, "1.3.0", "old");
+        let err = swap_bundle(&bundle, &dir.path().join("missing.app")).unwrap_err();
+        assert!(err.contains("Failed to replace"), "{err}");
+        assert_eq!(names_of(dir.path()), [BUNDLE]);
+        assert_eq!(bundle_version(&bundle).as_deref(), Some("1.3.0"));
+    }
+
+    /// Only what updates left beside the bundle goes, and only while the bundle is there.
+    #[test]
+    fn cleanup_deletes_the_bundles_updates_moved_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let apps = dir.path();
+        let bundle = apps.join(BUNDLE);
+        let leftovers = [format!(".{BUNDLE}.old-1"), ".endo-update-2.tmp".to_string()];
+        for folder in leftovers.iter().map(String::as_str).chain([".endo-update-keep", "Other.app", ".Other.app.old-3"]) {
+            std::fs::create_dir(apps.join(folder)).unwrap();
+        }
+        cleanup_beside(&bundle);
+        assert_eq!(names_of(apps).len(), 5, "nothing goes while the bundle is missing");
+        std::fs::create_dir(&bundle).unwrap();
+        cleanup_beside(&bundle);
+        assert_eq!(names_of(apps), [".Other.app.old-3", ".endo-update-keep", BUNDLE, "Other.app"]);
+    }
+
+    /// The bundle's extension is copied to the data folder when that has none or an older one.
+    #[test]
+    fn the_bundles_extension_is_copied_when_newer() {
+        let dir = tempfile::tempdir().unwrap();
+        let (from, data) = (dir.path().join("Resources").join("extension"), dir.path().join("data"));
+        let to = data.join("extension");
+        std::fs::create_dir_all(from.join("lib")).unwrap();
+        std::fs::write(from.join("manifest.json"), r#"{"version":"1.4.0"}"#).unwrap();
+        std::fs::write(from.join("lib").join("detect.js"), "new").unwrap();
+        assert!(copy_extension(&from, &to).unwrap(), "none yet");
+        assert_eq!(names_of(&to), ["lib", "manifest.json"]);
+        assert_eq!(std::fs::read_to_string(to.join("lib").join("detect.js")).unwrap(), "new");
+        assert!(!copy_extension(&from, &to).unwrap(), "the same version stays");
+
+        std::fs::write(to.join("manifest.json"), r#"{"version":"1.3.0"}"#).unwrap();
+        std::fs::write(to.join("gone.js"), "old").unwrap();
+        assert!(copy_extension(&from, &to).unwrap(), "an older one is replaced");
+        assert_eq!(names_of(&to), ["lib", "manifest.json"]);
+        assert_eq!(names_of(&data), ["extension"]);
+        std::fs::write(to.join("manifest.json"), r#"{"version":"1.5.0"}"#).unwrap();
+        assert!(!copy_extension(&from, &to).unwrap(), "a newer one stays");
+        assert!(!copy_extension(&dir.path().join("none"), &to).unwrap(), "a bundle without one changes nothing");
+        assert_eq!(manifest_version(&to).as_deref(), Some("1.5.0"));
+    }
+
+    /// The macOS update against a release served from here: each way a release can be wrong
+    /// changes nothing beside the bundle, a right one swaps the whole bundle in, the old one kept
+    /// beside it until cleanup.
+    #[tokio::test]
+    async fn install_swaps_in_only_a_signed_matching_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let apps = dir.path().join("Applications");
+        let bundle = apps.join(BUNDLE);
+        make_bundle(&bundle, "1.3.0", "old");
+        let exe = bundle.join("Contents").join("MacOS").join(CLI_EXE.trim_end_matches(".exe"));
+        std::fs::write(dir.path().join("escape.txt"), "x").unwrap();
+        let asset = bundle_asset(false);
+        let good = bundle_archive(dir.path(), "good.tar.gz", "1.4.0", &[]);
+        let stale = bundle_archive(dir.path(), "stale.tar.gz", "1.3.5", &[]);
+        let evil = bundle_archive(dir.path(), "evil.tar.gz", "1.4.0", &["../escape.txt"]);
+        let ((pair, key), (other_pair, _)) = (test_key(), test_key());
+        let client = reqwest::Client::new();
+        let update = Update { version: "1.4.0".into(), tag: "v1.4.0".into(), page: "https://example.com/tag/v1.4.0".into() };
+        let install = |releases: String, current: &'static str, exe: PathBuf| {
+            let (client, key, update) = (&client, &key, &update);
+            async move { install_bundle_from(client, &releases, key, current, update, &exe, false).await }
+        };
+        let unchanged = || {
+            assert_eq!(std::fs::read_to_string(&exe).unwrap(), "old");
+            assert_eq!(bundle_version(&bundle).as_deref(), Some("1.3.0"));
+            assert_eq!(names_of(&apps), [BUNDLE]);
+        };
+        let files: Vec<(&str, &[u8])> = vec![(asset, &good[..])];
+
+        let err = install(serve_release(&files, &files, &other_pair).await, "1.3.0", exe.clone()).await.unwrap_err();
+        assert!(err.contains("signature does not match"), "{err}");
+        unchanged();
+        let err = install(serve_release(&[(asset, &stale[..])], &files, &pair).await, "1.3.0", exe.clone()).await.unwrap_err();
+        assert!(err.contains("checksum"), "{err}");
+        unchanged();
+        let err = install(serve_release(&files, &[], &pair).await, "1.3.0", exe.clone()).await.unwrap_err();
+        assert!(err.contains(&format!("no entry for {asset}")), "{err}");
+        unchanged();
+        for (archive, why) in [(&stale, "version 1.3.5, not 1.4.0"), (&evil, "outside its folder: ../escape.txt")] {
+            let served: Vec<(&str, &[u8])> = vec![(asset, &archive[..])];
+            let err = install(serve_release(&served, &served, &pair).await, "1.3.0", exe.clone()).await.unwrap_err();
+            assert!(err.contains(why), "{err}");
+            unchanged();
+        }
+        let err = install(serve_release(&files, &files, &pair).await, "1.4.0", exe.clone()).await.unwrap_err();
+        assert!(err.contains("not newer"), "{err}");
+        // The GUI installed a newer release while this CLI, still 1.3.0, ran.
+        make_bundle(&bundle, "1.5.0", "old");
+        let err = install(serve_release(&files, &files, &pair).await, "1.3.0", exe.clone()).await.unwrap_err();
+        assert!(err.contains("1.5.0 is already installed"), "{err}");
+        make_bundle(&bundle, "1.3.0", "old");
+        // A build run from outside a bundle.
+        let loose = dir.path().join("Endos-Unified-Downloader-CLI");
+        let err = install(serve_release(&files, &files, &pair).await, "1.3.0", loose).await.unwrap_err();
+        assert!(err.contains("not in its .app bundle") && err.contains(&update.page), "{err}");
+        unchanged();
+
+        let installed = install(serve_release(&files, &files, &pair).await, "1.3.0", exe.clone()).await.unwrap();
+        assert_eq!((installed.replaced, &installed.own, installed.extension), (vec![bundle.clone()], &exe, false));
+        assert_eq!(std::fs::read_to_string(&exe).unwrap(), "new");
+        assert_eq!(bundle_version(&bundle).as_deref(), Some("1.4.0"));
+        let names = names_of(&apps);
+        assert!(names.len() == 2 && names[0].starts_with(&format!(".{BUNDLE}.old-")) && names[1] == BUNDLE, "{names:?}");
+        let old = apps.join(&names[0]).join("Contents").join("MacOS").join(exe.file_name().unwrap());
+        assert_eq!(std::fs::read_to_string(old).unwrap(), "old");
+        cleanup_beside(&bundle);
+        assert_eq!(names_of(&apps), [BUNDLE]);
+    }
+
+    /// On macOS the app's data, and the browser extension's folder with it, are in Application Support.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_keeps_the_extension_with_the_data_in_application_support() {
+        let data = crate::media::app_data_dir().unwrap();
+        assert!(data.ends_with("Library/Application Support/EndosUnifiedDownloader"), "{}", data.display());
+        assert_eq!(extension_dir(), Some(data.join("extension")));
+    }
+
+    /// A bundle that holds a link is refused, as one could lead outside it.
+    #[cfg(unix)]
+    #[test]
+    fn a_bundle_with_a_link_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        make_bundle(&src.join(BUNDLE), "1.4.0", "new");
+        std::os::unix::fs::symlink("/etc", src.join(BUNDLE).join("Contents").join("Resources")).unwrap();
+        let archive = dir.path().join("linked.tar.gz");
+        let status = std::process::Command::new(system_tar()).arg("-czf").arg(&archive).arg("-C").arg(&src).arg(BUNDLE).status().unwrap();
+        assert!(status.success());
+        let (apps, own) = (dir.path().join("apps"), std::ffi::OsStr::new("Endos-Unified-Downloader"));
+        let (bundle, staging) = (apps.join(BUNDLE), apps.join(".endo-update-1.tmp"));
+        make_bundle(&bundle, "1.3.0", "old");
+        std::fs::create_dir(&staging).unwrap();
+        let err = put_bundle_in_place(&bundle, &staging, &std::fs::read(&archive).unwrap(), "1.4.0", own).unwrap_err();
+        assert!(err.contains("holds links"), "{err}");
+        assert_eq!(bundle_version(&bundle).as_deref(), Some("1.3.0"));
     }
 
     #[test]
@@ -587,7 +1069,6 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn install_swaps_in_only_a_signed_matching_release() {
-        use crate::media::tests::serve_files;
         use std::os::windows::fs::OpenOptionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -618,20 +1099,7 @@ mod tests {
         let ((pair, key), (other_pair, _)) = (test_key(), test_key());
         let ext_asset = "Endos-Unified-Downloader-Extension-v1.4.0.zip";
         let files: Vec<(&str, &[u8])> = vec![(GUI_EXE, &b"new gui"[..]), (CLI_EXE, &b"new cli"[..]), (ext_asset, &good_zip[..])];
-        // Serves `files` with sums of `summed`, signed by `signer`.
-        let serve = |files: &[(&str, &[u8])], summed: &[(&str, &[u8])], signer: &Ed25519KeyPair| {
-            let mut sums = String::from("# version 1.4.0\n");
-            let mut summed = summed.to_vec();
-            summed.sort();
-            for (name, body) in summed {
-                sums += &format!("{:x}  {name}\n", Sha256::digest(body));
-            }
-            let at = |name: &str| format!("/release/download/v1.4.0/{name}");
-            let mut served: Vec<(String, Vec<u8>)> = files.iter().map(|(name, body)| (at(name), body.to_vec())).collect();
-            served.push((at("SHA256SUMS.sig"), sign(signer, sums.as_bytes())));
-            served.push((at("SHA256SUMS"), sums.into_bytes()));
-            serve_files(served, None)
-        };
+        let serve = serve_release;
         let client = reqwest::Client::new();
         let update = Update { version: "1.4.0".into(), tag: "v1.4.0".into(), page: String::new() };
         let install = |releases: String, current: &'static str| {

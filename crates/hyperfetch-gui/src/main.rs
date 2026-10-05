@@ -306,7 +306,10 @@ impl App {
         app.notice = queue_problem.map(Err);
         app.restart = restart;
         // What an earlier update left next to the exe; it no longer runs.
-        rt.spawn_blocking(updater::cleanup_old);
+        rt.spawn_blocking(|| {
+            updater::cleanup_old();
+            updater::refresh_extension();
+        });
         if app.settings.check_updates {
             app.check_for_update(false);
         }
@@ -1880,6 +1883,7 @@ fn spawn_clipboard_watcher(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Started again to stop a live recording (a debug build has a console), this only does that.
     hyperfetch_core::media::serve_ctrl_c();
+    hyperfetch_core::media::prepare_macos();
     let _ = tracing_subscriber::fmt().try_init();
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     let handle = runtime.handle().clone();
@@ -1903,7 +1907,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     runtime.shutdown_background();
     // An update was installed: the new build takes over.
     if let Some(exe) = lock(&restart).take() {
-        if let Err(e) = std::process::Command::new(&exe).spawn() {
+        if let Err(e) = updater::restart(&exe) {
             tracing::warn!("Could not start the updated app {}: {}", exe.display(), e);
         }
     }

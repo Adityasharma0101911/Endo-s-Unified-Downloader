@@ -195,7 +195,8 @@ fn emit(tx: &Option<broadcast::Sender<EngineSnapshot>>, make: impl FnOnce() -> E
     }
 }
 
-/// gallery-dl's release file for this system; None where it has none (macOS, ARM Linux).
+/// gallery-dl's release file for this system; None where it has none (macOS, ARM Linux), where it
+/// is found on PATH (see `media::prepare_macos`) or not at all.
 fn asset() -> Option<&'static str> {
     if cfg!(all(windows, target_arch = "x86")) {
         Some("gallery-dl_x86.exe")
@@ -235,7 +236,8 @@ async fn gallery_dl(proxy: Option<&str>) -> Result<PathBuf, String> {
 /// to its place and renamed into it, so no half-written gallery-dl is ever run. A file the sums
 /// leave out is refused.
 async fn install(client: &reqwest::Client, api: &str, bin_dir: &Path) -> Result<PathBuf, String> {
-    let asset = asset().ok_or("There is no gallery-dl build for this system: install gallery-dl (pip install gallery-dl) and try again")?;
+    let how = if cfg!(target_os = "macos") { "brew install gallery-dl, or pip install gallery-dl" } else { "pip install gallery-dl" };
+    let asset = asset().ok_or_else(|| format!("There is no gallery-dl build for this system: install gallery-dl ({how}) and try again"))?;
     let body = http_get(client, api, Duration::from_secs(30)).await?.bytes().await.map_err(|e| format!("Failed to read {api}: {e}"))?;
     let release: serde_json::Value = serde_json::from_slice(&body).map_err(|e| format!("Unreadable gallery-dl release: {e}"))?;
     // Absolute in Codeberg's; a relative one is on the server of `api`.
