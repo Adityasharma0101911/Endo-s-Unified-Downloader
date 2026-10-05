@@ -453,6 +453,12 @@ impl DownloadHistoryManager {
             return PathBuf::from(app_data).join("EndosUnifiedDownloader").join("history.json");
         }
 
+        // Application Support, with everything else of the app's (see media::app_data_dir).
+        #[cfg(target_os = "macos")]
+        if let Some(dir) = crate::media::app_data_dir() {
+            return dir.join("history.json");
+        }
+
         #[cfg(not(windows))]
         {
             if let Ok(xdg_data) = std::env::var("XDG_DATA_HOME") {

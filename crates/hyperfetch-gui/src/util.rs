@@ -225,7 +225,7 @@ pub fn open_path(path: &Path) -> std::io::Result<()> {
     };
     #[cfg(target_os = "macos")]
     let command = {
-        let mut command = Command::new("open");
+        let mut command = Command::new("/usr/bin/open");
         command.arg(&path);
         command
     };
@@ -250,7 +250,7 @@ pub fn reveal_in_folder(path: &Path) -> std::io::Result<()> {
     };
     #[cfg(target_os = "macos")]
     let command = {
-        let mut command = Command::new("open");
+        let mut command = Command::new("/usr/bin/open");
         command.arg("-R").arg(&path);
         command
     };

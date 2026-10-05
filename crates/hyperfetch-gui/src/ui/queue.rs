@@ -715,7 +715,7 @@ pub(super) fn queue_page(app: &mut App, ui: &mut Ui) {
             ui.vertical_centered(|ui| {
                 ui.add_space(30.0);
                 ui.label(RichText::new(icon::QUEUE).size(28.0).color(p.dim));
-                ui.label(RichText::new("The queue is empty. Add links above, or press Ctrl+V with one copied.").color(p.muted));
+                ui.label(RichText::new(keys("The queue is empty. Add links above, or press Ctrl+V with one copied.")).color(p.muted));
                 ui.add_space(30.0);
             });
             return;

@@ -412,7 +412,18 @@ fn system_reduces_motion() -> bool {
     ok != 0 && on == 0
 }
 
-#[cfg(not(windows))]
+/// Whether Reduce motion is on in the Accessibility settings of macOS, read once (asking takes a
+/// program run); off when it cannot be read.
+#[cfg(target_os = "macos")]
+fn system_reduces_motion() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let read = std::process::Command::new("/usr/bin/defaults").args(["read", "com.apple.universalaccess", "reduceMotion"]).output();
+        read.is_ok_and(|out| out.status.success() && out.stdout.trim_ascii() == b"1")
+    })
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn system_reduces_motion() -> bool {
     false
 }

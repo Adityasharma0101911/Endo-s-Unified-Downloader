@@ -229,13 +229,30 @@ const RELEASES: &str = "https://github.com/yt-dlp/yt-dlp/releases";
 /// newest release is a dated one, with differently named files, while `latest` is replaced.
 const FFMPEG_RELEASE: &str = "https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest";
 
-/// What installing ffmpeg downloads, as the user is told (the win64 build is 196 MB, linux64 153 MB).
-const FFMPEG_DOWNLOAD: &str = "about 200 MB";
+/// Martin Riedl's static macOS builds of ffmpeg (GPL), whose makers publish none for macOS: the
+/// newest release for this Mac's processor. `<this>/ffmpeg.zip` redirects to that build's folder,
+/// which also has `ffprobe.zip` and a `<zip>.sha256` of each (see [`download_ffmpeg_programs`]).
+const MACOS_FFMPEG_RELEASE: &str = if cfg!(target_arch = "aarch64") {
+    "https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/release"
+} else {
+    "https://ffmpeg.martin-riedl.de/redirect/latest/macos/amd64/release"
+};
 
-/// How installing ffmpeg fails while [`FFMPEG_RELEASE`] is missing a file: FFmpeg-Builds deletes
-/// the release and makes it again every day, which takes some minutes.
-const FFMPEG_RELEASE_GONE: &str =
-    "The ffmpeg release is missing a file, as it is for some minutes each day while it is replaced; the next video tries again";
+/// What installing ffmpeg downloads, as the user is told (the win64 build is 196 MB, linux64 153
+/// MB; Martin Riedl's ffmpeg and ffprobe for macOS together 57 MB on Apple Silicon, 68 MB on Intel).
+pub const FFMPEG_DOWNLOAD: &str = if cfg!(target_os = "macos") { "about 70 MB" } else { "about 200 MB" };
+
+/// Whose ffmpeg build is installed, as the user is told.
+pub const FFMPEG_BUILD: &str =
+    if cfg!(target_os = "macos") { "Martin Riedl's checked static build" } else { "the checked build yt-dlp's makers publish" };
+
+/// How installing ffmpeg fails while its release is missing a file: FFmpeg-Builds deletes the
+/// release and makes it again every day, which takes some minutes.
+const FFMPEG_RELEASE_GONE: &str = if cfg!(target_os = "macos") {
+    "The ffmpeg download site is missing a file, as it can be for a moment while a new build is published; the next video tries again"
+} else {
+    "The ffmpeg release is missing a file, as it is for some minutes each day while it is replaced; the next video tries again"
+};
 
 /// How long a download of yt-dlp or ffmpeg may receive nothing before it fails.
 const INSTALL_STALL_TIMEOUT: Duration = if cfg!(test) { Duration::from_secs(2) } else { Duration::from_secs(30) };
@@ -890,11 +907,62 @@ pub(crate) fn find_in_path(name: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-/// Per-user application data directory.
-fn app_data_dir() -> Option<PathBuf> {
+/// Folders a program launched from Finder or the Dock lacks on its PATH, which is only
+/// /usr/bin:/bin:/usr/sbin:/sbin there: Homebrew's (Apple Silicon, Intel) and pip's user folder,
+/// where yt-dlp, ffmpeg, gallery-dl, 7-Zip and Node.js usually are.
+#[cfg(any(target_os = "macos", test))]
+fn missing_path_dirs(home: Option<&Path>) -> Vec<PathBuf> {
+    let mut dirs = vec![PathBuf::from("/opt/homebrew/bin"), PathBuf::from("/usr/local/bin")];
+    dirs.extend(home.map(|home| home.join(".local").join("bin")));
+    dirs
+}
+
+/// `path` (a PATH value) with each of `dirs` it lacks appended, never put in front of what it
+/// has; an empty entry, which stands for the current directory, is dropped.
+#[cfg(any(target_os = "macos", test))]
+fn appended_path(path: &std::ffi::OsStr, dirs: &[PathBuf]) -> Option<OsString> {
+    let mut all: Vec<PathBuf> = std::env::split_paths(path).filter(|dir| !dir.as_os_str().is_empty()).collect();
+    for dir in dirs {
+        if !all.contains(dir) {
+            all.push(dir.clone());
+        }
+    }
+    std::env::join_paths(all).ok()
+}
+
+/// On macOS, gives a program started from Finder or the Dock what one started from a terminal
+/// has: the folders of [`missing_path_dirs`] that exist, appended to PATH, so that the tools
+/// installed there are found; and room for more open files than the 256 it may have, which a few
+/// downloads' connections use up. Nothing elsewhere. Call it first in `main`, before any thread
+/// starts.
+pub fn prepare_macos() {
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let dirs: Vec<PathBuf> = missing_path_dirs(home.as_deref()).into_iter().filter(|dir| dir.is_dir()).collect();
+        if let Some(path) = appended_path(&std::env::var_os("PATH").unwrap_or_default(), &dirs) {
+            std::env::set_var("PATH", path);
+        }
+        let mut files = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        // SAFETY: each call reads or writes the one struct it is given.
+        unsafe {
+            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut files) == 0 && files.rlim_cur < 10240 {
+                // OPEN_MAX: macOS refuses more.
+                files.rlim_cur = files.rlim_max.min(10240);
+                libc::setrlimit(libc::RLIMIT_NOFILE, &files);
+            }
+        }
+    }
+}
+
+/// Per-user application data directory: under %LOCALAPPDATA% on Windows, Application Support on
+/// macOS, the XDG data folder elsewhere.
+pub(crate) fn app_data_dir() -> Option<PathBuf> {
     #[cfg(windows)]
     let data_dir = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    let data_dir = std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Library").join("Application Support"));
+    #[cfg(not(any(windows, target_os = "macos")))]
     let data_dir = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local").join("share")));
@@ -1364,13 +1432,13 @@ fn windows_tar() -> PathBuf {
     windows.join("System32").join("tar.exe")
 }
 
-/// The tar [`unpack`] runs: [`windows_tar`] on Windows, the system's elsewhere.
+/// The tar [`unpack`] runs: [`windows_tar`] on Windows, macOS' own bsdtar, the one on PATH elsewhere.
 pub(crate) fn system_tar() -> PathBuf {
     #[cfg(windows)]
     return windows_tar();
     #[cfg(not(windows))]
     {
-        PathBuf::from("tar")
+        PathBuf::from(if cfg!(target_os = "macos") { "/usr/bin/tar" } else { "tar" })
     }
 }
 
@@ -1596,7 +1664,8 @@ impl Drop for Installing {
 async fn install_managed_ffmpeg(proxy: Option<&str>) -> Result<PathBuf, String> {
     let bin_dir = managed_bin_dir().ok_or("Cannot determine a per-user directory to install ffmpeg into")?;
     let client = http_client(proxy)?;
-    install_ffmpeg(&bin_dir, &FFMPEG_INSTALL_FAILED, download_ffmpeg(&client, FFMPEG_RELEASE, &bin_dir, &system_tar())).await
+    let release = if cfg!(target_os = "macos") { MACOS_FFMPEG_RELEASE } else { FFMPEG_RELEASE };
+    install_ffmpeg(&bin_dir, &FFMPEG_INSTALL_FAILED, download_ffmpeg(&client, release, &bin_dir, &system_tar())).await
 }
 
 /// Installs ffmpeg into `bin_dir` with `download` (see [`download_ffmpeg`]), under the lock
@@ -1635,14 +1704,14 @@ async fn install_ffmpeg(
 /// `tar` (see [`install_ffmpeg_archive`]). The archive is deleted either way. Nothing is downloaded
 /// when `tar` could not unpack it (see [`cannot_unpack`]). Returns ffmpeg's path.
 async fn download_ffmpeg(client: &reqwest::Client, release: &str, bin_dir: &Path, tar: &Path) -> Result<PathBuf, String> {
-    let asset = ffmpeg_release_asset().ok_or("No ffmpeg build is published for this platform; install ffmpeg yourself")?;
-    let unpacker = tar.to_path_buf();
-    let cannot = tokio::task::spawn_blocking(move || cannot_unpack(&unpacker, asset))
-        .await
-        .map_err(|e| format!("ffmpeg install task failed: {e}"))?;
-    if let Some(why) = cannot {
-        return Err(why);
-    }
+    let Some(asset) = ffmpeg_release_asset() else {
+        return match cfg!(target_os = "macos") {
+            // Boxed: every media download's future holds this one, and would grow by its size.
+            true => Box::pin(download_ffmpeg_programs(client, release, bin_dir, tar)).await,
+            false => Err("No ffmpeg build is published for this platform; install ffmpeg yourself".to_string()),
+        };
+    };
+    unpackable(tar, asset).await?;
     let sums_url = format!("{release}/checksums.sha256");
     let sums = ffmpeg_release_file(client, &sums_url, Some(Duration::from_secs(30)))
         .await?
@@ -1670,6 +1739,69 @@ async fn download_ffmpeg(client: &reqwest::Client, release: &str, bin_dir: &Path
     };
     let _ = tokio::fs::remove_file(&archive).await;
     installed
+}
+
+/// [`download_ffmpeg`] from a release with ffmpeg and ffprobe each in a zip of its own, with a
+/// `<zip>.sha256` next to each, as Martin Riedl's are (see [`MACOS_FFMPEG_RELEASE`]):
+/// `<release>/ffmpeg.zip` leads to the newest build's folder on the same site, from which both
+/// zips and their sums come. Each zip is checked against its sum before anything is unpacked, and
+/// both are deleted either way. Returns ffmpeg's path.
+async fn download_ffmpeg_programs(client: &reqwest::Client, release: &str, bin_dir: &Path, tar: &Path) -> Result<PathBuf, String> {
+    unpackable(tar, "ffmpeg.zip").await?;
+    // Only where it leads is read; the zip is downloaded from there, with its sum.
+    let link = format!("{release}/ffmpeg.zip");
+    let landed = ffmpeg_release_file(client, &link, Some(Duration::from_secs(30))).await?.url().clone();
+    let same_site = Url::parse(release).is_ok_and(|release| release.origin() == landed.origin());
+    let folder = (landed.as_str().rsplit_once('/').map(|(folder, _)| folder.to_string()))
+        .filter(|_| same_site)
+        .ok_or_else(|| format!("{link} leads to {landed}, off its site"))?;
+    tokio::fs::create_dir_all(bin_dir)
+        .await
+        .map_err(|e| format!("Failed to create {}: {e}", bin_dir.display()))?;
+    let mut archives = Vec::new();
+    let fetched = async {
+        for zip in ["ffmpeg.zip", "ffprobe.zip"] {
+            let (url, sums_url) = (format!("{folder}/{zip}"), format!("{folder}/{zip}.sha256"));
+            let sums = ffmpeg_release_file(client, &sums_url, Some(Duration::from_secs(30)))
+                .await?
+                .text()
+                .await
+                .map_err(|e| format!("Failed to read {sums_url}: {e}"))?;
+            let expected = expected_sha256(&sums, zip).ok_or_else(|| format!("{sums_url} has no entry for {zip}"))?.to_ascii_lowercase();
+            let archive = bin_dir.join(format!(".ffmpeg-{}-{zip}", unique_suffix()));
+            archives.push(archive.clone());
+            let actual = fetch_to_file(client, &url, &archive).await?;
+            if actual != expected {
+                return Err(format!("Downloaded {zip} failed checksum verification (expected {expected}, got {actual})"));
+            }
+        }
+        Ok(())
+    }
+    .await;
+    let installed = match fetched {
+        Ok(()) => {
+            let (bin_dir, tar, zips) = (bin_dir.to_path_buf(), tar.to_path_buf(), archives.clone());
+            let unpack_all = move |into: &Path| zips.iter().try_for_each(|zip| unpack(&tar, zip, into, &[]));
+            tokio::task::spawn_blocking(move || install_ffmpeg_build(&bin_dir, "ffmpeg.zip and ffprobe.zip", Path::new(""), unpack_all))
+                .await
+                .map_err(|e| format!("ffmpeg install task failed: {e}"))
+                .and_then(|installed| installed)
+        }
+        Err(e) => Err(e),
+    };
+    for archive in &archives {
+        let _ = tokio::fs::remove_file(archive).await;
+    }
+    installed
+}
+
+/// Fails with why `tar` cannot unpack the ffmpeg build `asset` (see [`cannot_unpack`]), if it cannot.
+async fn unpackable(tar: &Path, asset: &'static str) -> Result<(), String> {
+    let tar = tar.to_path_buf();
+    let cannot = tokio::task::spawn_blocking(move || cannot_unpack(&tar, asset))
+        .await
+        .map_err(|e| format!("ffmpeg install task failed: {e}"))?;
+    cannot.map_or(Ok(()), Err)
 }
 
 /// Why `tar` cannot unpack the ffmpeg build `asset` (see [`unpack`]), if it cannot: it does not
@@ -1717,25 +1849,39 @@ async fn fetch_to_file(client: &reqwest::Client, url: &str, path: &Path) -> Resu
 }
 
 /// Unpacks ffmpeg and ffprobe from `archive`, release asset `asset` (laid out as
-/// `<asset without extension>/bin/...`), into [`managed_ffmpeg_dir`]; ffplay and the documentation
-/// stay in the archive. They are unpacked with `tar` into a temporary folder that becomes the
-/// install in one rename, so no half-written ffmpeg is ever found. Returns ffmpeg's path. Blocking.
+/// `<asset without extension>/bin/...`), into [`managed_ffmpeg_dir`] (see [`install_ffmpeg_build`]);
+/// ffplay and the documentation stay in the archive. Blocking.
 fn install_ffmpeg_archive(bin_dir: &Path, asset: &str, archive: &Path, tar: &Path) -> Result<PathBuf, String> {
     let root = asset.strip_suffix(".zip").or_else(|| asset.strip_suffix(".tar.xz")).unwrap_or(asset);
+    let members = ["ffmpeg", "ffprobe"].map(|p| format!("{root}/bin/{}", exe_name(p)));
+    install_ffmpeg_build(bin_dir, asset, &Path::new(root).join("bin"), |into| unpack(tar, archive, into, &members))
+}
+
+/// Installs the ffmpeg build `build` that `unpack` puts into the temporary folder it is given,
+/// with ffmpeg and ffprobe in its folder `inside` (empty: the folder itself): that folder becomes
+/// [`managed_ffmpeg_dir`] in one rename, so no half-written ffmpeg is ever found. Returns
+/// ffmpeg's path. Blocking.
+fn install_ffmpeg_build(
+    bin_dir: &Path,
+    build: &str,
+    inside: &Path,
+    unpack: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<PathBuf, String> {
     let programs = ["ffmpeg", "ffprobe"].map(exe_name);
     let target = managed_ffmpeg_dir(bin_dir);
     let unpacked = bin_dir.join(format!(".ffmpeg-{}.tmp", unique_suffix()));
-    let bin = unpacked.join(root).join("bin");
+    let bin = if inside.as_os_str().is_empty() { unpacked.clone() } else { unpacked.join(inside) };
     let fail = |e: std::io::Error| format!("Failed to install ffmpeg to {}: {e}", target.display());
-    let members: Vec<String> = programs.iter().map(|p| format!("{root}/bin/{p}")).collect();
     let installed = std::fs::create_dir(&unpacked)
-        .and_then(|()| unpack(tar, archive, &unpacked, &members))
+        .and_then(|()| unpack(&unpacked))
         .map_err(fail)
         .and_then(|()| match programs.iter().find(|p| !bin.join(p).is_file()) {
-            Some(missing) => Err(format!("The ffmpeg build {asset} has no {missing}")),
+            Some(missing) => Err(format!("The ffmpeg build {build} has no {missing}")),
             None => Ok(()),
         })
         .and_then(|()| {
+            #[cfg(unix)]
+            programs.iter().try_for_each(|p| make_executable(&bin.join(p))).map_err(fail)?;
             // One missing a program (deleted by hand or by antivirus) would stand in the way for good.
             if target.is_dir() && !whole_build(&target) {
                 let _ = std::fs::remove_dir_all(&target);
@@ -5927,8 +6073,14 @@ pub(crate) mod tests {
 
         assert_eq!(install_verified(&bin, "2026.08.19", ytdlp_release_asset(), body, &good).unwrap(), target);
         assert_eq!(std::fs::read(&target).unwrap(), body);
+        #[cfg(unix)]
+        assert_eq!(std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&target).unwrap().permissions()) & 0o777, 0o755);
         // No temp file left behind.
         assert_eq!(std::fs::read_dir(&bin).unwrap().count(), 1);
+        // The macOS build, one file for both processors.
+        if cfg!(target_os = "macos") {
+            assert_eq!(ytdlp_release_asset(), "yt-dlp_macos");
+        }
     }
 
     /// A zip laid out like yt-dlp_win.zip: yt-dlp.exe next to its `_internal` folder.
@@ -6361,12 +6513,89 @@ bbd8671c6c05eaa3ec29d690695aebadff0871faa3efe9051581afbf3c01e80e  ffmpeg-master-
         assert_eq!(install_ffmpeg(dir.path(), &failed, installs_nothing()).await, Ok(build.join(exe_name("ffmpeg"))));
     }
 
+    /// Martin Riedl's way, which macOS installs (see [`download_ffmpeg_programs`]): ffmpeg and
+    /// ffprobe each in a zip of its own with its sum next to it, in the folder `<release>/ffmpeg.zip`
+    /// leads to (here the release's own). Nothing is downloaded without a tar that runs; a zip that
+    /// does not match its sum, or has none, installs nothing; else both are installed, runnable, with
+    /// nothing temporary left. Not on Linux, whose GNU tar unpacks no zip.
+    #[tokio::test]
+    async fn ffmpeg_and_ffprobe_are_installed_from_their_checked_zips() {
+        if cfg!(target_os = "linux") {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let zip = |program: &str| {
+            let (src, name, archive) = (dir.path().join(program), exe_name(program), dir.path().join(format!("{program}.zip")));
+            std::fs::create_dir(&src).unwrap();
+            std::fs::write(src.join(&name), format!("{program} build")).unwrap();
+            let status = std::process::Command::new(system_tar()).args(["-a", "-cf"]).arg(&archive).arg("-C").arg(&src).arg(&name).status().unwrap();
+            assert!(status.success());
+            std::fs::read(archive).unwrap()
+        };
+        let (ffmpeg, ffprobe) = (zip("ffmpeg"), zip("ffprobe"));
+        let summed = |body: &[u8], name: &str| format!("{:x}  {name}\n", Sha256::digest(body)).into_bytes();
+        let release = |ffprobe_sums: Option<Vec<u8>>| {
+            let mut files = vec![
+                ("/release/ffmpeg.zip".to_string(), ffmpeg.clone()),
+                ("/release/ffmpeg.zip.sha256".to_string(), summed(&ffmpeg, "ffmpeg.zip")),
+                ("/release/ffprobe.zip".to_string(), ffprobe.clone()),
+            ];
+            files.extend(ffprobe_sums.map(|sums| ("/release/ffprobe.zip.sha256".to_string(), sums)));
+            serve_files(files, None)
+        };
+        let (client, bin, tar) = (reqwest::Client::new(), dir.path().join("bin"), system_tar());
+
+        let no_tar = dir.path().join(exe_name("tar"));
+        let err = download_ffmpeg_programs(&client, "http://127.0.0.1:9/release", &bin, &no_tar).await.unwrap_err();
+        assert!(err.starts_with(&format!("{} does not run", no_tar.display())), "{err}");
+        assert!(!bin.exists());
+
+        let err = download_ffmpeg_programs(&client, &release(Some(summed(b"other", "ffprobe.zip"))).await, &bin, &tar).await.unwrap_err();
+        assert!(err.contains("ffprobe.zip failed checksum verification"), "{err}");
+        let err = download_ffmpeg_programs(&client, &release(Some(summed(&ffprobe, "other.zip"))).await, &bin, &tar).await.unwrap_err();
+        assert!(err.contains("has no entry for ffprobe.zip"), "{err}");
+        let err = download_ffmpeg_programs(&client, &release(None).await, &bin, &tar).await.unwrap_err();
+        assert!(err.starts_with(FFMPEG_RELEASE_GONE), "{err}");
+        assert!(names_of(&bin).is_empty(), "{:?}", names_of(&bin));
+
+        let installed = download_ffmpeg_programs(&client, &release(Some(summed(&ffprobe, "ffprobe.zip"))).await, &bin, &tar).await.unwrap();
+        assert_eq!(installed, managed_ffmpeg_dir(&bin).join(exe_name("ffmpeg")));
+        assert_eq!(std::fs::read(&installed).unwrap(), b"ffmpeg build");
+        assert_eq!(names_of(&managed_ffmpeg_dir(&bin)), [exe_name("ffmpeg"), exe_name("ffprobe")]);
+        assert_eq!(names_of(&bin), ["ffmpeg-build"]);
+        #[cfg(unix)]
+        for program in ["ffmpeg", "ffprobe"] {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(managed_ffmpeg_dir(&bin).join(program)).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o755, "{program}");
+        }
+    }
+
+    /// A program started from Finder gets Homebrew's and pip's folders after what PATH has, each
+    /// once, and no empty entry (the current directory).
+    #[test]
+    fn path_gets_the_missing_folders_appended() {
+        let home = Path::new("/Users/u");
+        let dirs = missing_path_dirs(Some(home));
+        assert_eq!(dirs, [PathBuf::from("/opt/homebrew/bin"), PathBuf::from("/usr/local/bin"), home.join(".local").join("bin")]);
+        assert_eq!(missing_path_dirs(None).len(), 2);
+        let joined = |dirs: &[PathBuf]| std::env::join_paths(dirs).unwrap();
+        let (usr, local) = (PathBuf::from("/usr/bin"), dirs[1].clone());
+        let path = joined(&[usr.clone(), local.clone()]);
+        assert_eq!(appended_path(&path, &dirs), Some(joined(&[usr.clone(), local, dirs[0].clone(), dirs[2].clone()])));
+        assert_eq!(appended_path(&path, &[]), Some(path));
+        assert_eq!(appended_path(std::ffi::OsStr::new(""), &dirs[..1]), Some(joined(&dirs[..1])));
+        let with_empty = std::ffi::OsString::from(format!("{}{}", usr.display(), if cfg!(windows) { ";" } else { ":" }));
+        assert_eq!(appended_path(&with_empty, &dirs[..1]), Some(joined(&[usr, dirs[0].clone()])));
+    }
+
     /// The real release installs an ffmpeg and ffprobe that run.
     #[tokio::test]
-    #[ignore = "downloads about 200 MB from GitHub"]
+    #[ignore = "downloads about 200 MB from GitHub (70 MB on macOS)"]
     async fn installs_the_published_ffmpeg_build() {
         let dir = tempfile::tempdir().unwrap();
-        let ffmpeg = download_ffmpeg(&http_client(None).unwrap(), FFMPEG_RELEASE, dir.path(), &system_tar()).await.unwrap();
+        let release = if cfg!(target_os = "macos") { MACOS_FFMPEG_RELEASE } else { FFMPEG_RELEASE };
+        let ffmpeg = download_ffmpeg(&http_client(None).unwrap(), release, dir.path(), &system_tar()).await.unwrap();
         for program in [ffmpeg.clone(), ffmpeg.with_file_name(exe_name("ffprobe"))] {
             let out = std::process::Command::new(&program).arg("-version").output().unwrap();
             assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).contains("--enable-gpl"), "{}", program.display());

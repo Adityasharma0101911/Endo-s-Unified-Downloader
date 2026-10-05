@@ -418,9 +418,24 @@ fn status_badge(app: &App, item: &QueueItem, p: &Palette) -> (&'static str, Colo
 }
 
 /// What ffmpeg is for, and what installing it takes.
-const FFMPEG_ABOUT: &str = "ffmpeg joins separate video and audio (the best quality) and makes MP3/M4A files. Without it \
+const FFMPEG_ABOUT: &str = if cfg!(target_os = "macos") {
+    "ffmpeg joins separate video and audio (the best quality) and makes MP3/M4A files. Without it videos download in a \
+     lower quality and audio presets fail. Martin Riedl's static GPL build is checked and installed for your user only; \
+     it takes about 150 MB on disk."
+} else {
+    "ffmpeg joins separate video and audio (the best quality) and makes MP3/M4A files. Without it \
      videos download in a lower quality and audio presets fail. The GPL build yt-dlp's makers publish is checked and \
-     installed for your user only; it takes about 330 MB on disk.";
+     installed for your user only; it takes about 330 MB on disk."
+};
+
+/// `text` with its shortcuts named as on this system's keyboards: Ctrl+V, or ⌘V on macOS.
+fn keys(text: &str) -> std::borrow::Cow<'_, str> {
+    if cfg!(target_os = "macos") {
+        text.replace("Ctrl+", "⌘").into()
+    } else {
+        text.into()
+    }
+}
 
 // ---- Frame ---------------------------------------------------------------------------------
 
@@ -467,8 +482,9 @@ pub fn render(app: &mut App, ctx: &egui::Context) {
     });
 }
 
-/// Ctrl+1 to Ctrl+4 switch pages; outside a text box, Ctrl+V adds the copied link(s) to the
-/// queue and Delete removes the download selected in the queue.
+/// Ctrl+1 to Ctrl+4 (⌘ on macOS) switch pages; outside a text box, Ctrl+V adds the copied link(s)
+/// to the queue and Delete (or a Mac's delete key, Backspace) removes the download selected in the
+/// queue.
 fn shortcuts(app: &mut App, ctx: &egui::Context) {
     let typing = ctx.wants_keyboard_input();
     let (page, pasted, delete) = ctx.input_mut(|i| {
@@ -479,7 +495,10 @@ fn shortcuts(app: &mut App, ctx: &egui::Context) {
             egui::Event::Paste(text) if !typing => Some(text.clone()),
             _ => None,
         });
-        (page, pasted, !typing && i.consume_key(egui::Modifiers::NONE, egui::Key::Delete))
+        let delete = !typing
+            && (i.consume_key(egui::Modifiers::NONE, egui::Key::Delete)
+                || (cfg!(target_os = "macos") && i.consume_key(egui::Modifiers::NONE, egui::Key::Backspace)));
+        (page, pasted, delete)
     });
     if let Some(tab) = page {
         go(app, tab);
@@ -526,7 +545,7 @@ fn page_title(app: &App, ui: &mut Ui) {
         Tab::Settings => ("Settings".to_string(), "Saved when the app closes; downloads started or queued afterwards use them."),
     };
     ui.label(RichText::new(title).heading().color(p.strong));
-    ui.label(RichText::new(about).color(p.muted));
+    ui.label(RichText::new(keys(about)).color(p.muted));
 }
 
 fn combo(ui: &mut Ui, id: &str, value: &mut usize, names: &[&str]) {

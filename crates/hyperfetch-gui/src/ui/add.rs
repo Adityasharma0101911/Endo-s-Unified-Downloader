@@ -86,7 +86,7 @@ pub(super) fn notice_banner(app: &mut App, ui: &mut Ui) {
 pub(super) fn ffmpeg_prompt(app: &mut App, ui: &mut Ui) {
     fading(ui, "ffmpeg prompt", app.asks_about_ffmpeg().then_some(()), |ui, ()| {
         let p = palette(ui);
-        let text = "ffmpeg is not installed. Install it for the best video quality and MP3/M4A files (about 200 MB)?";
+        let text = format!("ffmpeg is not installed. Install it for the best video quality and MP3/M4A files ({})?", media::FFMPEG_DOWNLOAD);
         banner(ui, p.amber, icon::FILM_STRIP, RichText::new(text).color(p.text), |ui| {
             if ui.add(primary_button("Install ffmpeg", p.accent)).clicked() {
                 app.answer_ffmpeg(true);
@@ -104,14 +104,14 @@ pub(super) fn ffmpeg_prompt(app: &mut App, ui: &mut Ui) {
 pub(super) fn ffmpeg_notice(ui: &mut Ui, installing: bool) {
     fading(ui, "ffmpeg install", installing.then_some(()), |ui, ()| {
         let p = palette(ui);
-        let text = "Installing ffmpeg (about 200 MB download); videos that need it wait until it is ready.";
+        let text = format!("Installing ffmpeg ({} download); videos that need it wait until it is ready.", media::FFMPEG_DOWNLOAD);
         banner(ui, p.amber, icon::FILM_STRIP, RichText::new(text).color(p.text), |_| {});
         ui.ctx().request_repaint_after(Duration::from_secs(1));
     });
 }
 
 /// Offers the newer version a check found, until dismissed for this run. Installing in place
-/// works on Windows only; elsewhere What's new leads to the download.
+/// works on Windows and macOS; elsewhere What's new leads to the download.
 pub(super) fn update_banner(app: &mut App, ui: &mut Ui) {
     fading(ui, "update", app.update.clone(), |ui, update| {
         let p = palette(ui);
@@ -125,7 +125,8 @@ pub(super) fn update_banner(app: &mut App, ui: &mut Ui) {
             if ui.add(button("What's new")).clicked() {
                 ui.ctx().open_url(egui::OpenUrl::new_tab(&update.page));
             }
-            if cfg!(windows) && ui.add_enabled(!app.updating, primary_button("Update and restart", p.accent)).clicked() {
+            let installs = cfg!(any(windows, target_os = "macos"));
+            if installs && ui.add_enabled(!app.updating, primary_button("Update and restart", p.accent)).clicked() {
                 app.install_update();
             }
         });
@@ -369,7 +370,7 @@ pub(super) fn add_page(app: &mut App, ui: &mut Ui) {
                     anim::fade_in(ui, egui::Id::new(("tip", n)), anim::stagger(n + 1), anim::RISE, |ui| {
                         ui.horizontal(|ui| {
                             ui.label(RichText::new(icon::INFO).color(p.accent));
-                            ui.label(RichText::new(tip).color(p.muted));
+                            ui.label(RichText::new(keys(tip)).color(p.muted));
                         });
                     });
                 }

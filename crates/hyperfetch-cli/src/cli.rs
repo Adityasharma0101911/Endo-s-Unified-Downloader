@@ -175,7 +175,7 @@ pub struct Args {
     #[arg(long = "exec", value_name = "CMD")]
     pub exec: Option<String>,
 
-    /// Do not mark downloaded files as from the internet (Windows' Zone.Identifier)
+    /// Do not mark downloaded files as from the internet (Windows' Zone.Identifier, macOS' quarantine)
     #[arg(long = "no-mark-of-the-web")]
     pub no_mark_of_the_web: bool,
 
@@ -233,7 +233,8 @@ pub struct Args {
     #[arg(long = "hls-mp4")]
     pub hls_mp4: bool,
 
-    /// Install ffmpeg (the checked build yt-dlp's makers publish, about 200 MB) when media needs
+    #[cfg_attr(not(target_os = "macos"), doc = "Install ffmpeg (the checked build yt-dlp's makers publish, about 200 MB) when media needs")]
+    #[cfg_attr(target_os = "macos", doc = "Install ffmpeg (Martin Riedl's checked static build, about 70 MB) when media needs")]
     /// it and none is found. Without this or --no-install-ffmpeg, a terminal asks first
     #[arg(long = "install-ffmpeg", conflicts_with = "no_install_ffmpeg")]
     pub install_ffmpeg: bool,

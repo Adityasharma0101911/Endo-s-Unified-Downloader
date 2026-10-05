@@ -328,7 +328,7 @@ pub fn spawn(events: mpsc::Sender<AppEvent>, ctx: egui::Context, rt: &tokio::run
                 Ok(listener) => {
                     tracing::info!("Local IPC listener bound on 127.0.0.1:{}", port);
                     let recordings = Recordings::new(std::env::temp_dir().join("endos-recordings"));
-                    let server = Arc::new(Server { port, events, ctx, recordings, app_dir: updater::app_dir() });
+                    let server = Arc::new(Server { port, events, ctx, recordings, extension: updater::extension_dir() });
                     // What an earlier run left recording is joined before this one records.
                     for finished in server.recordings.recover().await {
                         server.send(AppEvent::Recorded(finished));
@@ -360,13 +360,13 @@ async fn listen(listener: TcpListener, server: Arc<Server>) {
 }
 
 /// What the API answers from: its port, the recordings open, the way to the UI thread, and the
-/// app's folder, whose `extension` folder an update replaces.
+/// browser extension's folder (see `updater::extension_dir`), which an update replaces.
 struct Server {
     port: u16,
     events: mpsc::Sender<AppEvent>,
     ctx: egui::Context,
     recordings: Recordings,
-    app_dir: Option<PathBuf>,
+    extension: Option<PathBuf>,
 }
 
 impl Server {
@@ -398,9 +398,9 @@ impl Server {
         match (method.as_str(), path.as_str()) {
             ("GET", "/ping") => {
                 let mut ping = json!({"app": APP, "version": env!("CARGO_PKG_VERSION"), "port": self.port});
-                // The version of the extension next to the app (read anew, as an update may have
+                // The version of the extension in its folder (read anew, as an update may have
                 // replaced it), so an older one loaded from there reloads itself.
-                if let Some(version) = self.app_dir.as_deref().and_then(updater::extension_version) {
+                if let Some(version) = self.extension.as_deref().and_then(updater::manifest_version) {
                     ping["extension"] = version.into();
                 }
                 reply("200 OK", ping)
@@ -674,7 +674,7 @@ mod tests {
     fn server(root: &Path) -> (Server, mpsc::Receiver<AppEvent>) {
         let (events, received) = mpsc::channel();
         let recordings = Recordings::new(root.to_path_buf());
-        let server = Server { port: 49152, events, ctx: egui::Context::default(), recordings, app_dir: Some(root.to_path_buf()) };
+        let server = Server { port: 49152, events, ctx: egui::Context::default(), recordings, extension: Some(root.join("extension")) };
         (server, received)
     }
 

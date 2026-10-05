@@ -1,0 +1,45 @@
+Endo's Unified Downloader for macOS
+===================================
+
+Install
+-------
+Drag "Endo's Unified Downloader" onto the Applications folder in this window, then open it from
+Applications (not from this disk image, or it cannot update itself).
+
+First launch
+------------
+The app is not from the App Store and is not notarized by Apple, so the first time you open it
+macOS says it cannot check it for malicious software. To open it once and for all:
+
+1. Double-click the app in Applications and choose Done (or OK) when macOS refuses.
+2. Open System Settings > Privacy & Security, scroll down to Security and click "Open Anyway"
+   next to the message about Endo's Unified Downloader.
+3. Confirm with Open Anyway and your password. From then on it opens normally.
+
+Or, in Terminal:
+
+    xattr -dr com.apple.quarantine "/Applications/Endo's Unified Downloader.app"
+
+This is needed only once: the app checks the signature of its updates itself (Settings > Updates).
+
+Command line
+------------
+The command-line tool is inside the app:
+
+    "/Applications/Endo's Unified Downloader.app/Contents/MacOS/Endos-Unified-Downloader-CLI" --help
+
+To type just endos-downloader instead:
+
+    sudo mkdir -p /usr/local/bin
+    sudo ln -sf "/Applications/Endo's Unified Downloader.app/Contents/MacOS/Endos-Unified-Downloader-CLI" /usr/local/bin/endos-downloader
+
+Browser extension
+-----------------
+The app keeps the extension in ~/Library/Application Support/EndosUnifiedDownloader/extension, and
+Settings > Browser extension shows that folder with an Open button. In Chrome or Edge open
+chrome://extensions, turn on Developer mode, choose Load unpacked and select that folder.
+
+Your files
+----------
+Settings, history and the queue are in ~/Library/Application Support/EndosUnifiedDownloader.
+Videos need ffmpeg: the app offers to install its own, or it uses Homebrew's (brew install ffmpeg).
