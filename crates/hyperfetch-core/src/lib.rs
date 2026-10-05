@@ -23,6 +23,8 @@ pub mod debrid;
 pub mod netif;
 pub mod mega;
 pub mod shares;
+pub mod cloud;
+pub mod repos;
 pub mod gallery;
 pub mod postprocess;
 

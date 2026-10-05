@@ -2,6 +2,7 @@
 // Everything shown comes from web pages, so it is only ever put into the DOM as text.
 import { formatDuration, isMediaSiteHost, sanitizeFilename, suggestFilename } from "./lib/detect.js";
 import { LINK_KINDS, MAX_BATCH, largestSrcset, linkFilter, normalizeLinks, textMatcher } from "./lib/links.js";
+import { isMediaPage, mediaPayload, pickQuality, rememberedChoice, subtitleChoices, videoChoices } from "./lib/media.js";
 import { itemChips, itemMeta, itemNote, linkName, recordingView, variantLabel } from "./lib/view.js";
 
 const $ = (id) => document.getElementById(id);
@@ -12,6 +13,8 @@ const VIA_HINT = "For sites that block the app";
 let tab = null;
 let httpTab = false;
 let mediaSite = false;
+/** The tab shows a media site's video, list or channel: the media card stands in for the page card. */
+let mediaPage = false;
 let state = { items: [], app: null, recordings: [], settings: null };
 /** Item id → its card. Cards are kept across refreshes so typed names and chosen qualities survive. */
 const rows = new Map();
@@ -199,7 +202,7 @@ function renderItems(items) {
   });
   setCount("media-count", shown.length);
   $("media-head").hidden = shown.length === 0;
-  $("empty").hidden = shown.length > 0;
+  $("empty").hidden = shown.length > 0 || mediaPage;
 }
 
 /** A menu entry: icon, label and a smaller line under it. */
@@ -414,6 +417,152 @@ async function block(row) {
   const reply = await ask({ cmd: "BLOCK_HOST", host: row.host });
   report(row.msg, reply, `Blocked ${row.host}.`);
   if (reply.ok) refresh();
+}
+
+// ---- Media card ----
+
+/** What /info said of the tab's page, and the choice the card opened with (the last one sent). */
+let info = null;
+let last = rememberedChoice(null);
+
+/** Asks the app what the page holds (a skeleton meanwhile), then shows it, or why it can't and a plain download. */
+async function loadMediaCard() {
+  const card = $("media-card");
+  card.hidden = false;
+  say($("mc-msg"), "Looking into this page…");
+  const [reply, stored] = await Promise.all([ask({ cmd: "MEDIA_INFO", tabId: tab.id, url: tab.url }), chrome.storage.local.get("mediaLast").catch(() => ({}))]);
+  last = rememberedChoice(stored.mediaLast);
+  card.classList.remove("loading");
+  card.removeAttribute("aria-busy");
+  say($("mc-msg"), "");
+  if (reply.ok && reply.info && typeof reply.info === "object") return renderMediaCard((info = reply.info));
+  $("mc-title").textContent = tab.title || hostOf(tab.url);
+  $("mc-channel").textContent = hostOf(tab.url);
+  $("mc-error-text").textContent = reply.error || "The downloader couldn't look into this page.";
+  $("mc-error").hidden = false;
+}
+
+/** A segment of a segmented control: a radio named `name`, its label and its small marks (60, HDR). */
+function segment(name, value, text, marks = []) {
+  const input = el("input", { type: "radio", name, value });
+  return el("label", { className: "seg" }, input, el("span", { textContent: text }), ...marks.map((mark) => el("small", { textContent: mark })));
+}
+
+/** Ticks the radio of `name` whose value is `value`. */
+function tick(name, value) {
+  const radio = [...$("mc-form").elements[name]].find((input) => input.value === value);
+  if (radio) radio.checked = true;
+}
+
+/** The language a subtitle code names ("English"), else the code itself. */
+function languageName(code) {
+  try {
+    return new Intl.DisplayNames(undefined, { type: "language" }).of(code) || code;
+  } catch {
+    return code;
+  }
+}
+
+function renderMediaCard(info) {
+  const chip = { live: ["LIVE", "red"], upcoming: ["UPCOMING", "amber"] }[info.live];
+  $("mc-live").hidden = !chip;
+  if (chip) Object.assign($("mc-live"), { textContent: chip[0], className: `chip tone-${chip[1]}` });
+  $("mc-title").textContent = info.title || tab.title || "";
+  $("mc-title").title = info.title || "";
+  $("mc-channel").textContent = info.uploader || hostOf(tab.url);
+  if (/^https?:\/\//i.test(info.thumbnail || "")) Object.assign($("mc-thumb"), { src: info.thumbnail, hidden: false });
+  const length = Number(info.duration) > 0 ? formatDuration(info.duration) : "";
+  Object.assign($("mc-length"), { textContent: length, hidden: !length });
+
+  const video = videoChoices(info);
+  $("mc-quality").replaceChildren(...video.map((choice) => segment("quality", choice.value, choice.label, choice.marks)));
+  $("mc-audio-row").hidden = !info.audio;
+  tick("quality", pickQuality(last.quality, [...video.map((choice) => choice.value), ...(info.audio ? ["audio-m4a", "audio-mp3"] : [])]));
+  tick("container", last.container);
+
+  const subs = subtitleChoices(info);
+  $("mc-subs").replaceChildren(
+    el("option", { value: "", textContent: "None" }),
+    ...(subs.length > 1 ? [el("option", { value: "all", textContent: "All languages" })] : []),
+    ...subs.map(({ code, auto }) => el("option", { value: code, textContent: `${languageName(code)}${auto ? " (auto)" : ""}` })),
+  );
+  $("mc-subs").value = [...$("mc-subs").options].some((option) => option.value === last.subtitles) ? last.subtitles : "";
+  $("mc-end").placeholder = length || "end";
+
+  $("mc-sponsor-row").hidden = !info.sponsorblock;
+  $("mc-scope-row").hidden = !info.playlist;
+  $("mc-scope-all").textContent = `Whole playlist${Number(info.playlist?.count) > 0 ? ` (${info.playlist.count})` : ""}`;
+  // A list or channel page (no one video's length) downloads the list.
+  if (info.playlist && !(Number(info.duration) > 0)) tick("scope", "playlist");
+  $("mc-live-row").hidden = info.live !== "live";
+  $("mc-form").hidden = false;
+  updateMediaForm();
+}
+
+/** Shows what the choice so far allows: container and subtitles for video, a clip for one video that is not live. */
+function updateMediaForm() {
+  const form = $("mc-form").elements;
+  const audio = form.quality.value.startsWith("audio-");
+  $("mc-format-row").hidden = audio;
+  $("mc-subs-row").hidden = audio || $("mc-subs").options.length < 2;
+  $("mc-clip-row").hidden = info.live === "live" || info.live === "upcoming" || (!!info.playlist && form.scope.value === "playlist");
+}
+
+/**
+ * Runs in the tab's top frame (isolated world); must not reference anything outside itself. The time the playing
+ * video is at, else the largest one's; null with no video.
+ */
+function pageVideoTime() {
+  const videos = [...document.querySelectorAll("video")].filter((v) => Number.isFinite(v.currentTime));
+  const area = (v) => v.clientWidth * v.clientHeight;
+  const video = videos.find((v) => !v.paused) || videos.sort((a, b) => area(b) - area(a))[0];
+  return video ? video.currentTime : null;
+}
+
+async function useCurrentTime(input) {
+  let time = null;
+  try {
+    [{ result: time } = {}] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: pageVideoTime });
+  } catch {
+    // Not readable: said below.
+  }
+  if (!Number.isFinite(time)) return say($("mc-msg"), "No video on the page to take the time from.", "err");
+  input.value = formatDuration(Math.floor(time));
+  say($("mc-msg"), "");
+}
+
+/** Sends the page with `media` (see lib/media.js mediaPayload); `button` waits meanwhile. */
+async function sendMedia(media, button) {
+  button.disabled = true;
+  say($("mc-msg"), "Sending…");
+  const reply = await ask({ cmd: "SEND_MEDIA", tabId: tab.id, url: tab.url, media });
+  button.disabled = false;
+  report($("mc-msg"), reply, "Sent to the downloader.");
+}
+
+function downloadMedia(event) {
+  event.preventDefault();
+  const form = $("mc-form").elements;
+  const choice = {
+    quality: form.quality.value,
+    container: form.container.value,
+    subtitles: $("mc-subs").value,
+    start: $("mc-start").value,
+    end: $("mc-end").value,
+    sponsorblock: form.sponsorblock.value,
+    playlist: form.scope.value === "playlist",
+    fromStart: form.live.value === "start",
+  };
+  const { media, error } = mediaPayload(choice, info);
+  if (error) return say($("mc-msg"), error, "err");
+  // The next card opens with this quality, and the container and subtitles when they were on show.
+  last = {
+    quality: choice.quality,
+    container: $("mc-format-row").hidden ? last.container : choice.container,
+    subtitles: $("mc-subs-row").hidden ? last.subtitles : choice.subtitles,
+  };
+  chrome.storage.local.set({ mediaLast: last }).catch(() => {});
+  sendMedia(media, $("mc-download"));
 }
 
 // ---- Recording ----
@@ -672,6 +821,8 @@ function renderSettings(s) {
     if (document.activeElement !== input) input.value = String(s[key] ?? 0);
   }
   $("convert-mp4").checked = s.convertToMp4 !== false;
+  $("media-cookies").checked = s.mediaCookies === true;
+  $("youtube-button").checked = s.youtubeButton !== false;
   const hosts = Array.isArray(s.blockedHosts) ? s.blockedHosts : [];
   const key = hosts.join("\n");
   if (key === blockedKey) return;
@@ -746,6 +897,9 @@ async function init() {
       $("empty-title").textContent = "Streams aren't collected on this site";
       $("empty-text").textContent = "Use Download this page above: the downloader takes the page itself.";
     }
+    mediaPage = isMediaPage(tab.url);
+    $("page-card").hidden = mediaPage;
+    if (mediaPage) loadMediaCard();
     scanVideos();
   }
 
@@ -764,7 +918,7 @@ async function init() {
     const button = $("send-page");
     button.disabled = true;
     say($("page-msg"), "Sending…");
-    const reply = await ask({ cmd: "SEND_URL", url: tab.url, referer: tab.url });
+    const reply = await ask({ cmd: "SEND_URL", tabId: tab.id, url: tab.url, referer: tab.url });
     button.disabled = false;
     report($("page-msg"), reply, "Page sent to the downloader.");
   });
@@ -833,6 +987,13 @@ async function init() {
   $("convert-mp4").addEventListener("change", (event) =>
     saveSettings({ convertToMp4: event.target.checked }, "Saved.").then(() => refresh()),
   );
+  $("media-cookies").addEventListener("change", (event) => saveSettings({ mediaCookies: event.target.checked }, "Saved."));
+  $("youtube-button").addEventListener("change", (event) => saveSettings({ youtubeButton: event.target.checked }, "Saved."));
+  $("mc-form").addEventListener("change", updateMediaForm);
+  $("mc-form").addEventListener("submit", downloadMedia);
+  $("mc-start-now").addEventListener("click", () => useCurrentTime($("mc-start")));
+  $("mc-end-now").addEventListener("click", () => useCurrentTime($("mc-end")));
+  $("mc-anyway").addEventListener("click", () => sendMedia({ quality: "best" }, $("mc-anyway")));
 
   showView(httpTab ? (VIEWS.includes(saved) ? saved : "media") : "settings");
   chrome.runtime.onMessage.addListener((msg) => {

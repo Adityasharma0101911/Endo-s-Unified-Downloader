@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
@@ -58,10 +58,13 @@ impl MediaQualityPreset {
         let mp4 = |format: &str| {
             ["-f", format, "--merge-output-format", "mp4", NO_FASTSTART[0], NO_FASTSTART[1]].map(String::from).to_vec()
         };
+        // Up to `n`p as sites name it: by the height of a landscape video, the width of a portrait
+        // one (a 1080x1920 Short is 1080p, yt-dlp's height 1920).
+        let up_to = |n: u32| mp4(&format!("bv*[height<={n}][aspect_ratio>=?1]+ba/bv*[width<={n}]+ba/b[height<={n}]/best"));
         match self {
             Self::BestVideoAudio => mp4("bv*+ba/b"),
-            Self::Fhd1080p => mp4("bv*[height<=1080]+ba/b[height<=1080]/best"),
-            Self::Hd720p => mp4("bv*[height<=720]+ba/b[height<=720]/best"),
+            Self::Fhd1080p => up_to(1080),
+            Self::Hd720p => up_to(720),
             Self::AudioMp3 => vec![
                 "-x".to_string(),
                 "--audio-format".to_string(),
@@ -165,6 +168,23 @@ pub struct MediaDownloadOptions {
     pub live_from_start: bool,
     /// Wait for a scheduled stream or premiere to start.
     pub wait_for_video: bool,
+    /// The parts to keep, as (start, end) in seconds (`--download-sections`); empty keeps it whole.
+    pub sections: Vec<(f64, f64)>,
+    /// What becomes of a YouTube video's SponsorBlock segments: "remove" cuts them out, "mark"
+    /// makes them chapters; None leaves them.
+    pub sponsorblock: Option<String>,
+    /// The container video and audio are merged into ("mp4", "mkv", "webm"); None keeps the
+    /// preset's own.
+    pub merge_format: Option<String>,
+}
+
+impl MediaDownloadOptions {
+    /// Whether only yt-dlp's own download can make the file: it cuts clips out of it, cuts or
+    /// marks its SponsorBlock segments, or merges it into another container than MP4, none of
+    /// which the engine's download of its streams does (see [`fast_download`]).
+    fn edits(&self) -> bool {
+        !self.sections.is_empty() || self.sponsorblock.is_some() || self.merge_format.as_deref().is_some_and(|f| f != "mp4")
+    }
 }
 
 impl Default for MediaDownloadOptions {
@@ -184,6 +204,9 @@ impl Default for MediaDownloadOptions {
             embed_metadata: true,
             live_from_start: false,
             wait_for_video: false,
+            sections: Vec::new(),
+            sponsorblock: None,
+            merge_format: None,
         }
     }
 }
@@ -2252,6 +2275,7 @@ fn build_ytdlp_args(
     }
     if kind == RunKind::Download {
         args.extend(embed_args(options, ffmpeg_dir.is_some()));
+        args.extend(edit_args(options));
     }
 
     if supports(NO_PLUGIN_DIRS_MIN_VERSION) {
@@ -2264,6 +2288,13 @@ fn build_ytdlp_args(
         args.extend(["--ffmpeg-location".to_string(), dir.to_string_lossy().to_string()]);
     }
     args.extend(options.preset.to_args());
+    // After the preset's: the last one counts. Every run, so that what an extraction plans is the
+    // file the download makes. WebM takes VP9, AV1 and Opus alone; other codecs go into an MKV
+    // rather than fail the merge.
+    if let Some(format) = &options.merge_format {
+        let formats = if format == "webm" { "webm/mkv".to_string() } else { format.clone() };
+        args.extend(["--merge-output-format".to_string(), formats]);
+    }
     args.extend_from_slice(cookie_args);
     // The request as the browser made it: yt-dlp sends these with its requests, and lists them
     // among each format's headers for the engine's (see `stream_client`).
@@ -2277,7 +2308,12 @@ fn build_ytdlp_args(
         args.extend(["--concurrent-fragments".to_string(), options.concurrent_fragments.min(32).to_string()]);
     }
 
-    let file_template = options.output_filename.as_deref().unwrap_or("%(title)s.%(ext)s");
+    let mut file_template = options.output_filename.clone().unwrap_or_else(|| "%(title)s.%(ext)s".to_string());
+    // A clip is named by its span before the extension: yt-dlp would take one clip's file for
+    // another's, or for the whole video's, as already downloaded.
+    if !options.sections.is_empty() {
+        file_template.insert_str(file_template.rfind('.').unwrap_or(file_template.len()), " [%(section_start)s-%(section_end)s]");
+    }
     let dir = PathBuf::from(template_literal(&options.output_dir.to_string_lossy()));
     args.extend(["-o".to_string(), dir.join(file_template).to_string_lossy().to_string()]);
     match source {
@@ -2427,6 +2463,23 @@ fn embed_args(options: &MediaDownloadOptions, have_ffmpeg: bool) -> Vec<String> 
         args.extend(NO_FASTSTART_METADATA);
     }
     args.into_iter().map(String::from).collect()
+}
+
+/// yt-dlp arguments that keep only the clips `options` ask for and cut out or mark the video's
+/// SponsorBlock segments (yt-dlp asks SponsorBlock about YouTube's alone). A clip is cut at the
+/// keyframes around it, without re-encoding (no `--force-keyframes-at-cuts`): it may start a
+/// few seconds early.
+fn edit_args(options: &MediaDownloadOptions) -> Vec<String> {
+    let mut args = Vec::new();
+    for (start, end) in &options.sections {
+        args.extend(["--download-sections".to_string(), format!("*{start}-{end}")]);
+    }
+    match options.sponsorblock.as_deref() {
+        Some("remove") => args.extend(["--sponsorblock-remove", "sponsor,selfpromo,interaction"].map(String::from)),
+        Some("mark") => args.extend(["--sponsorblock-mark", "all"].map(String::from)),
+        _ => {}
+    }
+    args
 }
 
 /// One line printed by our `--progress-template`.
@@ -4759,8 +4812,9 @@ async fn download_with(
     // Clears what crashed runs left in the private folder, whatever this download uses.
     tools.cookies.files.get().await;
     let ffmpeg_dir = tools.ffmpeg.as_deref().and_then(Path::parent).map(Path::to_path_buf);
-    // Audio presets convert with ffmpeg as yt-dlp's post-processor does; those stay with yt-dlp.
-    let fast = fetch.filter(|_| !options.preset.extracts_audio());
+    // Audio presets convert with ffmpeg as yt-dlp's post-processor does, and clips, SponsorBlock
+    // and other containers are yt-dlp's too (see `MediaDownloadOptions::edits`).
+    let fast = fetch.filter(|_| !options.preset.extracts_audio() && !options.edits());
     let mut updated = false;
     loop {
         let version = ytdlp_version(&tools.ytdlp, &tools.work_dir, tools.version_cache.as_deref()).await;
@@ -4809,7 +4863,7 @@ async fn download_with(
                             Some(fetch) => {
                                 fast_download(&info, options, tools.ffmpeg.as_deref(), progress_tx.as_ref(), &cancel_flag, fetch).await
                             }
-                            None => Err(FastError::Unsupported("yt-dlp converts the audio itself".to_string())),
+                            None => Err(FastError::Unsupported("yt-dlp converts, cuts or merges it itself".to_string())),
                         };
                         match made {
                             Ok(path) => {
@@ -4900,9 +4954,469 @@ async fn download_with(
     }
 }
 
+/// What a media link holds, before it is downloaded (see [`info`]), as `POST /info` answers it.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct MediaInfo {
+    pub title: String,
+    pub uploader: Option<String>,
+    /// In seconds; None when the site does not say (a live stream).
+    pub duration: Option<f64>,
+    pub thumbnail: Option<String>,
+    pub live: LiveStatus,
+    /// The heights of its video formats, tallest first; empty for audio alone.
+    pub heights: Vec<u32>,
+    /// Those of `heights` with an HDR format.
+    pub hdr: Vec<u32>,
+    /// Those of `heights` with a 60 fps format.
+    pub fps60: Vec<u32>,
+    /// Whether it has audio.
+    pub audio: bool,
+    /// Languages of the subtitles the site has, and of those it makes itself.
+    pub subtitles: Vec<String>,
+    pub auto_subtitles: Vec<String>,
+    pub chapters: usize,
+    /// The list the link names (a playlist, or a video's playlist too), if it names one.
+    pub playlist: Option<MediaPlaylist>,
+    /// Whether SponsorBlock knows its segments: a YouTube video.
+    pub sponsorblock: bool,
+}
+
+/// The list a media link names: its title and how many entries it has.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct MediaPlaylist {
+    pub title: String,
+    pub count: usize,
+}
+
+/// Whether a media link is a live stream: not one, live now, not begun, or one that has ended.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveStatus {
+    #[default]
+    None,
+    Live,
+    Upcoming,
+    WasLive,
+}
+
+/// How long [`info`] keeps what it found at a link.
+const INFO_KEPT: Duration = Duration::from_secs(10 * 60);
+
+/// [`info`] asks yt-dlp about two links at once at most; the others wait their turn.
+static INFO_TURNS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
+/// What [`info`] found lately, by link and cookies (see [`info_key`]), and when.
+static INFO_FOUND: LazyLock<parking_lot::Mutex<HashMap<String, (tokio::time::Instant, MediaInfo)>>> = LazyLock::new(Default::default);
+
+/// What yt-dlp tells of the media at `url`, read with the cookies file and proxy given, without
+/// downloading it: what one of its own sites finds there (see [`find_site_media`]), and the list
+/// the link names, counted as a listing reads it. Within [`FIND_TIMEOUT`]; kept for
+/// [`INFO_KEPT`], unless the list a video link names could not be read. Err is the sentence to
+/// show the user (see [`said`]).
+pub async fn info(url: &Url, cookies_path: Option<&Path>, proxy: Option<&str>) -> Result<MediaInfo, String> {
+    let key = info_key(url, cookies_path);
+    let kept = || INFO_FOUND.lock().get(&key).filter(|(at, _)| at.elapsed() < INFO_KEPT).map(|(_, info)| info.clone());
+    if let Some(info) = kept() {
+        return Ok(info);
+    }
+    let _turn = INFO_TURNS.acquire().await.map_err(|e| e.to_string())?;
+    // Found meanwhile by the run this one waited for.
+    if let Some(info) = kept() {
+        return Ok(info);
+    }
+    let options = MediaDownloadOptions {
+        cookies: cookies_path.map_or(BrowserCookieSource::None, |path| BrowserCookieSource::File(path.to_path_buf())),
+        proxy: proxy.map(str::to_string),
+        ..Default::default()
+    };
+    let deadline = tokio::time::Instant::now() + FIND_TIMEOUT;
+    let asked = async {
+        let (options, tools) = prepare(&options, &None, false).await?;
+        info_with(url, &options, &tools, deadline).await
+    };
+    // Dropped, a run's process tree is killed.
+    let info = match tokio::time::timeout_at(deadline, asked).await {
+        Ok(found) => found.map_err(|e| said(&drm_refused(e)))?,
+        Err(_) => return Err(format!("yt-dlp took over {}s", FIND_TIMEOUT.as_secs())),
+    };
+    let mut found = INFO_FOUND.lock();
+    found.retain(|_, (at, _)| at.elapsed() < INFO_KEPT);
+    // Asked again, its list may be read then.
+    if !(video_in_playlist(url) && info.playlist.is_none()) {
+        found.insert(key, (tokio::time::Instant::now(), info.clone()));
+    }
+    Ok(info)
+}
+
+/// What [`info`] keeps its answer about `url` by: the link and the SHA-256 of the cookies file
+/// it is read with, so that what a sign-in found goes only to a caller with that same sign-in.
+fn info_key(url: &Url, cookies_path: Option<&Path>) -> String {
+    let cookies = cookies_path.map(|path| std::fs::read(path).unwrap_or_default());
+    format!("{url} {}", cookies.map_or_else(String::new, |text| format!("{:x}", Sha256::digest(text))))
+}
+
+/// [`info`] with `tools`: the video `url` names, and the list it names, read until `deadline`.
+/// A video link that names its list too stands alone when the list cannot be read in time.
+async fn info_with(url: &Url, options: &MediaDownloadOptions, tools: &Tools<'_>, deadline: tokio::time::Instant) -> Result<MediaInfo, String> {
+    let video = || async {
+        let Extracted(json) = find_with(url, options, tools, None).await?;
+        serde_json::from_slice(&json).map(|found| media_info(&found)).map_err(|e| format!("yt-dlp printed what it found unreadably: {e}"))
+    };
+    let Some(kind) = list_kind(url) else { return video().await };
+    let one = video_in_playlist(url);
+    let mut info = if one { video().await? } else { MediaInfo::default() };
+    let extract = |urls: Vec<Url>, newest| async move {
+        let (json, ran) = run_extraction(&urls, options, tools, RunKind::List(newest), None).await?;
+        Ok::<_, String>(listed_each(&urls, &json, ran.err()))
+    };
+    match tokio::time::timeout_at(deadline, list_entries_of(&list_url(url), kind, None, extract)).await {
+        Ok(Some(Ok((title, entries)))) => {
+            if !one {
+                info.title = title.clone();
+            }
+            info.playlist = Some(MediaPlaylist { title, count: entries.len() });
+        }
+        Ok(Some(Err(e))) if one => tracing::info!("{url} is told of without its playlist: {e}"),
+        _ if one => {}
+        Ok(Some(Err(e))) => return Err(e),
+        // One video after all.
+        Ok(None) => return video().await,
+        Err(_) => return Err(format!("yt-dlp took over {}s", FIND_TIMEOUT.as_secs())),
+    }
+    Ok(info)
+}
+
+/// What yt-dlp found at a link (its `-J` output) as [`info`] tells it: a video, or a list with as
+/// many entries as yt-dlp printed (a list of lists counts those).
+fn media_info(found: &Value) -> MediaInfo {
+    let text = |key: &str| found[key].as_str().filter(|text| !text.is_empty()).map(str::to_string);
+    let title = text("title").or_else(|| text("id")).unwrap_or_default();
+    let live = match found["live_status"].as_str() {
+        Some("is_live") => LiveStatus::Live,
+        Some("is_upcoming") => LiveStatus::Upcoming,
+        Some("was_live" | "post_live") => LiveStatus::WasLive,
+        _ if found["is_live"] == true => LiveStatus::Live,
+        _ => LiveStatus::None,
+    };
+    let youtube = text("extractor_key").is_some_and(|e| e.eq_ignore_ascii_case("youtube"));
+    let mut info = MediaInfo {
+        uploader: text("uploader").or_else(|| text("channel")),
+        duration: found["duration"].as_f64(),
+        // The extension shows it as an image: a web link alone.
+        thumbnail: text("thumbnail").filter(|t| t.starts_with("https://") || t.starts_with("http://")),
+        live,
+        chapters: found["chapters"].as_array().map_or(0, Vec::len),
+        sponsorblock: youtube && matches!(live, LiveStatus::None | LiveStatus::WasLive),
+        ..Default::default()
+    };
+    if found["_type"] == "playlist" {
+        let entries = found["entries"].as_array().map_or(0, Vec::len);
+        let count = found["playlist_count"].as_u64().map_or(entries, |n| n as usize);
+        info.playlist = Some(MediaPlaylist { title: title.clone(), count });
+        info.title = title;
+        return info;
+    }
+    info.title = title;
+    // YouTube lists a stream's chat among its subtitles.
+    let langs = |key: &str| found[key].as_object().map_or_else(Vec::new, |subs| subs.keys().filter(|l| *l != "live_chat").cloned().collect());
+    (info.subtitles, info.auto_subtitles) = (langs("subtitles"), langs("automatic_captions"));
+    let formats: Vec<&Value> = found["formats"].as_array().map_or_else(|| vec![found], |formats| formats.iter().collect());
+    let (mut heights, mut hdr, mut fps60) = (BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
+    for format in formats.into_iter().filter(|f| !is_set(f.get("has_drm"))) {
+        // A codec yt-dlp does not know may be there.
+        let has = |codec: &str| format[codec].as_str() != Some("none");
+        info.audio |= has("acodec");
+        let Some(height) = format["height"].as_u64().and_then(|h| u32::try_from(h).ok()).filter(|_| has("vcodec")) else { continue };
+        heights.insert(height);
+        if format["dynamic_range"].as_str().is_some_and(|range| range != "SDR") {
+            hdr.insert(height);
+        }
+        if format["fps"].as_f64().is_some_and(|fps| fps >= 50.0) {
+            fps60.insert(height);
+        }
+    }
+    let tallest_first = |set: BTreeSet<u32>| set.into_iter().rev().collect();
+    (info.heights, info.hdr, info.fps60) = (tallest_first(heights), tallest_first(hdr), tallest_first(fps60));
+    info
+}
+
+/// A yt-dlp failure as the user reads it: its first error, without `ERROR:`, the site and video
+/// it names (`[youtube] abc123:`) or yt-dlp's advice for its command line ("Use --cookies ...").
+/// Any other failure as it is.
+fn said(error: &str) -> String {
+    let line = error.lines().next().unwrap_or_default();
+    let Some(line) = line.strip_prefix("ERROR: ") else { return error.to_string() };
+    let line = match line.strip_prefix('[').and_then(|rest| rest.split_once("] ")) {
+        Some((_, rest)) => rest.split_once(": ").filter(|(id, _)| !id.contains(' ')).map_or(rest, |(_, said)| said),
+        None => line,
+    };
+    line.split(" Use --").next().unwrap_or(line).trim().to_string()
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// `POST /info` answers MediaInfo as the extension reads it.
+    #[test]
+    fn media_info_serializes_as_the_extension_reads_it() {
+        let info = MediaInfo {
+            title: "Talk".into(),
+            uploader: Some("Channel".into()),
+            duration: Some(213.0),
+            thumbnail: Some("https://i.example/t.jpg".into()),
+            live: LiveStatus::WasLive,
+            heights: vec![2160, 1080, 720],
+            hdr: vec![2160],
+            fps60: vec![1080],
+            audio: true,
+            subtitles: vec!["en".into(), "es".into()],
+            auto_subtitles: vec!["en".into()],
+            chapters: 12,
+            playlist: Some(MediaPlaylist { title: "List".into(), count: 42 }),
+            sponsorblock: true,
+        };
+        let expected = serde_json::json!({
+            "title": "Talk", "uploader": "Channel", "duration": 213.0, "thumbnail": "https://i.example/t.jpg",
+            "live": "was_live", "heights": [2160, 1080, 720], "hdr": [2160], "fps60": [1080], "audio": true,
+            "subtitles": ["en", "es"], "auto_subtitles": ["en"], "chapters": 12,
+            "playlist": {"title": "List", "count": 42}, "sponsorblock": true,
+        });
+        assert_eq!(serde_json::to_value(&info).unwrap(), expected);
+        let none = serde_json::to_value(MediaInfo::default()).unwrap();
+        assert_eq!((&none["live"], &none["playlist"], &none["duration"]), (&serde_json::json!("none"), &Value::Null, &Value::Null));
+        let live: Vec<Value> = [LiveStatus::Live, LiveStatus::Upcoming].iter().map(|s| serde_json::to_value(s).unwrap()).collect();
+        assert_eq!(live, [serde_json::json!("live"), serde_json::json!("upcoming")]);
+    }
+
+    /// A video as yt-dlp prints it (`-J`, trimmed, of "Me at the zoo"), with a 1080p HDR format at
+    /// 60 fps besides, a storyboard and a format with DRM, none of which is a quality to pick.
+    fn zoo_video() -> Value {
+        serde_json::json!({
+            "_type": "video", "id": "jNQXAC9IVRw", "title": "Me at the zoo", "uploader": "jawed", "channel": "jawed",
+            "duration": 19, "extractor_key": "Youtube", "live_status": "not_live", "is_live": false,
+            "thumbnail": "https://i.ytimg.com/vi/jNQXAC9IVRw/hqdefault.jpg",
+            "chapters": [
+                {"start_time": 0, "title": "Intro", "end_time": 5},
+                {"start_time": 5, "title": "The cool thing", "end_time": 17},
+                {"start_time": 17, "title": "End", "end_time": 19},
+            ],
+            "subtitles": {"de": [{"ext": "vtt"}], "en": [{"ext": "vtt"}]},
+            "automatic_captions": {"en": [{"ext": "vtt"}], "en-orig": [{"ext": "vtt"}]},
+            "formats": [
+                {"format_id": "233", "ext": "mp4", "vcodec": "none", "protocol": "m3u8_native"},
+                {"format_id": "140", "ext": "m4a", "vcodec": "none", "acodec": "mp4a.40.2", "protocol": "https"},
+                {"format_id": "160", "ext": "mp4", "vcodec": "avc1.4d400b", "acodec": "none", "height": 144, "fps": 15, "dynamic_range": "SDR"},
+                {"format_id": "242", "ext": "webm", "vcodec": "vp9", "acodec": "none", "height": 240, "fps": 15, "dynamic_range": "SDR"},
+                {"format_id": "134", "ext": "mp4", "vcodec": "avc1.4d400c", "acodec": "none", "height": 240, "fps": 15, "dynamic_range": "SDR"},
+                {"format_id": "337", "ext": "webm", "vcodec": "vp09.02.40.10", "acodec": "none", "height": 1080, "fps": 60, "dynamic_range": "HDR10"},
+                {"format_id": "sb0", "ext": "mhtml", "vcodec": "none", "acodec": "none", "height": 90, "format_note": "storyboard"},
+                {"format_id": "drm", "ext": "mp4", "vcodec": "avc1", "acodec": "none", "height": 2160, "has_drm": true},
+            ],
+        })
+    }
+
+    /// What `/info` tells of a video, a live stream, a list and a site without video, from what
+    /// yt-dlp printed.
+    #[test]
+    fn info_is_read_from_what_yt_dlp_found() {
+        let expected = MediaInfo {
+            title: "Me at the zoo".into(),
+            uploader: Some("jawed".into()),
+            duration: Some(19.0),
+            thumbnail: Some("https://i.ytimg.com/vi/jNQXAC9IVRw/hqdefault.jpg".into()),
+            live: LiveStatus::None,
+            heights: vec![1080, 240, 144],
+            hdr: vec![1080],
+            fps60: vec![1080],
+            audio: true,
+            subtitles: vec!["de".into(), "en".into()],
+            auto_subtitles: vec!["en".into(), "en-orig".into()],
+            chapters: 3,
+            playlist: None,
+            sponsorblock: true,
+        };
+        assert_eq!(media_info(&zoo_video()), expected);
+
+        let live = media_info(&serde_json::json!({
+            "_type": "video", "id": "M3HKLzjvKPc", "title": "Live Video from the International Space Station", "channel": "NASA",
+            "extractor_key": "Youtube", "live_status": "is_live", "is_live": true, "thumbnail": "javascript:alert(1)",
+            "subtitles": {"live_chat": [{"ext": "json"}]},
+            "formats": [
+                {"format_id": "96", "vcodec": "avc1.640028", "acodec": "mp4a.40.2", "height": 1080, "fps": 30, "protocol": "m3u8_native"},
+                {"format_id": "300", "vcodec": "avc1.4d401f", "acodec": "mp4a.40.2", "height": 720, "fps": 60, "protocol": "m3u8_native"},
+            ],
+        }));
+        assert_eq!((live.live, live.duration, live.uploader.as_deref(), live.thumbnail.as_deref()), (LiveStatus::Live, None, Some("NASA"), None));
+        assert_eq!((live.heights, live.fps60, live.subtitles.len(), live.sponsorblock), (vec![1080, 720], vec![720], 0, false), "no SponsorBlock live");
+        let status = |status: &str| media_info(&serde_json::json!({"live_status": status})).live;
+        assert_eq!([status("is_upcoming"), status("was_live"), status("post_live")], [LiveStatus::Upcoming, LiveStatus::WasLive, LiveStatus::WasLive]);
+
+        let list = media_info(&serde_json::from_str(YOUTUBE_PLAYLIST).unwrap());
+        let title = "Top Trending Videos of the Week".to_string();
+        assert_eq!(list.playlist, Some(MediaPlaylist { title: title.clone(), count: 3 }));
+        assert_eq!((list.title, list.heights.len(), list.audio, list.sponsorblock), (title, 0, false, false));
+
+        // A site's one format, and a song: audio alone.
+        let one = media_info(&serde_json::json!({"title": "Clip", "ext": "mp4", "height": 720, "vcodec": "h264", "acodec": "aac"}));
+        assert_eq!((one.heights, one.audio), (vec![720], true));
+        let song = media_info(&serde_json::json!({"extractor_key": "Soundcloud", "id": "49438146", "formats": [{"vcodec": "none", "acodec": "opus"}]}));
+        assert_eq!((song.title.as_str(), song.heights.len(), song.audio, song.sponsorblock), ("49438146", 0, true, false));
+    }
+
+    /// yt-dlp's errors as the user reads them: the first alone, without the site, the video id or
+    /// advice for yt-dlp's command line.
+    #[test]
+    fn info_errors_are_sentences() {
+        let age = "ERROR: [youtube] HtVdAasjOgU: Sign in to confirm your age. This video may be inappropriate for some users. \
+                   Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  \
+                   for how to manually pass cookies.";
+        assert_eq!(said(age), "Sign in to confirm your age. This video may be inappropriate for some users.");
+        let geo = "ERROR: [youtube] abc: The uploader has not made this video available in your country\n\
+                   You might want to use a VPN or a proxy server (with --proxy) to workaround.";
+        assert_eq!(said(geo), "The uploader has not made this video available in your country");
+        let not_found = "ERROR: [generic] Unable to download webpage: HTTP Error 404: Not Found";
+        assert_eq!(said(not_found), "Unable to download webpage: HTTP Error 404: Not Found");
+        assert_eq!(said("ERROR: Unsupported URL: https://example.com/"), "Unsupported URL: https://example.com/");
+        for other in ["yt-dlp took over 45s", DRM_REFUSED, "Failed to spawn yt-dlp: not found"] {
+            assert_eq!(said(other), other);
+        }
+    }
+
+    /// `info` reads a channel as a listing does, its lists counted, with the cookies given; a
+    /// video as yt-dlp's own sites find it.
+    #[tokio::test]
+    async fn info_counts_a_list_and_finds_a_video() {
+        let dir = tempfile::tempdir().unwrap();
+        let cookies = BrowserCookies::new(Some(dir.path().join("private")));
+        std::fs::write(dir.path().join("cookies.txt"), "# Netscape HTTP Cookie File\n").unwrap();
+        let tools = Tools {
+            ytdlp: fake_lister(dir.path()),
+            managed: false,
+            ffmpeg: None,
+            js_runtime: None,
+            work_dir: dir.path().to_path_buf(),
+            version_cache: None,
+            archive: None,
+            cookies: &cookies,
+        };
+        let cookies_file = BrowserCookieSource::File(dir.path().join("cookies.txt"));
+        let options = MediaDownloadOptions { cookies: cookies_file, output_dir: dir.path().to_path_buf(), ..Default::default() };
+        let deadline = tokio::time::Instant::now() + FIND_TIMEOUT;
+
+        std::fs::write(dir.path().join("list.json"), NASA_CHANNEL).unwrap();
+        let channel = Url::parse("https://www.youtube.com/@NASA").unwrap();
+        let found = info_with(&channel, &options, &tools, deadline).await.unwrap();
+        // Its videos, the stream that was live and its shorts; not those live now or to come.
+        assert_eq!(found.playlist, Some(MediaPlaylist { title: "NASA".into(), count: 7 }));
+        assert_eq!((found.title.as_str(), found.heights.len()), ("NASA", 0));
+        let runs = runs_of(dir.path());
+        let [run] = &runs[..] else { panic!("one run: {runs:?}") };
+        assert!(run.contains(&"--yes-playlist".to_string()) && run.contains(&"--cookies".to_string()), "{run:?}");
+
+        std::fs::write(dir.path().join("list.json"), zoo_video().to_string()).unwrap();
+        std::fs::remove_file(dir.path().join("runs.txt")).unwrap();
+        let video = Url::parse("https://www.youtube.com/watch?v=jNQXAC9IVRw").unwrap();
+        assert_eq!(info_with(&video, &options, &tools, deadline).await, Ok(media_info(&zoo_video())));
+        let runs = runs_of(dir.path());
+        let [run] = &runs[..] else { panic!("one run: {runs:?}") };
+        assert!(run.windows(2).any(|pair| pair == ["--ies", "default,-generic"]) && run.contains(&"--no-playlist".to_string()), "{run:?}");
+    }
+
+    /// `info` keeps an answer by its link and cookies: one found with a sign-in is not told to a
+    /// caller with none, or with other cookies.
+    #[test]
+    fn info_keeps_answers_by_link_and_cookies() {
+        let dir = tempfile::tempdir().unwrap();
+        let (url, other) = (Url::parse("https://www.youtube.com/playlist?list=WL").unwrap(), Url::parse("https://youtu.be/x").unwrap());
+        let file = dir.path().join("cookies.txt");
+        std::fs::write(&file, "# Netscape HTTP Cookie File
+.youtube.com	TRUE	/	TRUE	0	SID	mine
+").unwrap();
+        let signed_in = info_key(&url, Some(&file));
+        assert_eq!(info_key(&url, Some(&file)), signed_in);
+        assert_ne!(info_key(&url, None), signed_in);
+        assert_ne!(info_key(&other, Some(&file)), signed_in);
+        std::fs::write(&file, "# Netscape HTTP Cookie File
+.youtube.com	TRUE	/	TRUE	0	SID	junk
+").unwrap();
+        assert_ne!(info_key(&url, Some(&file)), signed_in);
+        assert!(!signed_in.contains("mine"), "{signed_in}");
+    }
+
+    /// `info` asks yt-dlp about a short public video, then keeps what it found. Needs the
+    /// internet, and installs yt-dlp when none is found.
+    #[tokio::test]
+    #[ignore]
+    async fn info_tells_of_a_public_video() {
+        let url = Url::parse("https://www.youtube.com/watch?v=jNQXAC9IVRw").unwrap();
+        let found = info(&url, None, None).await.unwrap();
+        assert_eq!(found.title, "Me at the zoo");
+        assert!(found.audio && !found.heights.is_empty() && found.sponsorblock && found.live == LiveStatus::None, "{found:?}");
+        assert_eq!((found.playlist.as_ref(), found.duration), (None, Some(19.0)));
+        let asked = std::time::Instant::now();
+        assert_eq!(info(&url, None, None).await, Ok(found));
+        assert!(asked.elapsed() < Duration::from_secs(1), "kept, not asked again");
+    }
+
+    /// Clips, SponsorBlock and the container go to yt-dlp's download; the container to every run,
+    /// after the preset's, so that an extraction plans the file the download makes.
+    #[test]
+    fn args_cut_clips_handle_sponsor_segments_and_pick_the_container() {
+        let url = Url::parse("https://www.youtube.com/watch?v=abc").unwrap();
+        let options = MediaDownloadOptions {
+            sections: vec![(90.0, 150.5), (0.0, 10.0)],
+            sponsorblock: Some("remove".into()),
+            merge_format: Some("webm".into()),
+            output_dir: PathBuf::from("out"),
+            ..Default::default()
+        };
+        let args = |options: &MediaDownloadOptions, kind| build_ytdlp_args(Source::Url(&url), options, kind, &[], None, None, None);
+        let after = |args: &[String], flag: &str| args.windows(2).filter(|w| w[0] == flag).map(|w| w[1].clone()).collect::<Vec<_>>();
+        let download = args(&options, RunKind::Download);
+        assert_eq!(after(&download, "--download-sections"), ["*90-150.5", "*0-10"]);
+        assert_eq!(after(&download, "--sponsorblock-remove"), ["sponsor,selfpromo,interaction"]);
+        assert!(!download.contains(&"--force-keyframes-at-cuts".to_string()), "no re-encoding");
+        assert_eq!(after(&download, "--merge-output-format").last().map(String::as_str), Some("webm/mkv"));
+        let named = |options: &MediaDownloadOptions| after(&args(options, RunKind::Download), "-o");
+        let clip = Path::new("out").join("%(title)s [%(section_start)s-%(section_end)s].%(ext)s");
+        assert_eq!(named(&options), [clip.to_string_lossy()]);
+        let given = MediaDownloadOptions { output_filename: Some("talk.mp4".into()), ..options.clone() };
+        assert_eq!(named(&given), [Path::new("out").join("talk [%(section_start)s-%(section_end)s].mp4").to_string_lossy()]);
+        let extract = args(&options, RunKind::Extract);
+        assert!(after(&extract, "--download-sections").is_empty() && after(&extract, "--sponsorblock-remove").is_empty());
+        assert_eq!(after(&extract, "--merge-output-format").last().map(String::as_str), Some("webm/mkv"));
+
+        let marked = MediaDownloadOptions { sections: Vec::new(), sponsorblock: Some("mark".into()), merge_format: Some("mkv".into()), ..options };
+        let download = args(&marked, RunKind::Download);
+        assert_eq!(after(&download, "--sponsorblock-mark"), ["all"]);
+        assert_eq!(after(&download, "--merge-output-format").last().map(String::as_str), Some("mkv"));
+        assert!(after(&download, "--download-sections").is_empty());
+        let plain = args(&MediaDownloadOptions::default(), RunKind::Download);
+        assert!(!plain.iter().any(|a| a.starts_with("--sponsorblock") || a == "--download-sections"), "{plain:?}");
+        assert_eq!(after(&plain, "--merge-output-format"), ["mp4"], "the preset's alone");
+        assert!(after(&plain, "-o")[0].ends_with("%(title)s.%(ext)s"), "{plain:?}");
+    }
+
+    /// Clips, SponsorBlock segments and containers other than MP4 are yt-dlp's own download to
+    /// make: the engine's download of the streams does none of them.
+    #[tokio::test]
+    async fn edited_downloads_are_yt_dlps_own() {
+        let edits = |sections: Vec<(f64, f64)>, sponsorblock: Option<&str>, merge_format: Option<&str>| {
+            let (sponsorblock, merge_format) = (sponsorblock.map(String::from), merge_format.map(String::from));
+            MediaDownloadOptions { sections, sponsorblock, merge_format, ..Default::default() }.edits()
+        };
+        assert!(!edits(Vec::new(), None, None) && !edits(Vec::new(), None, Some("mp4")));
+        assert!(edits(vec![(1.0, 2.0)], None, None) && edits(Vec::new(), Some("mark"), None) && edits(Vec::new(), None, Some("mkv")));
+
+        let dir = tempfile::tempdir().unwrap();
+        let cookies = BrowserCookies::new(Some(dir.path().join("private")));
+        let fetch: &StreamFetcher<'_> = &|_, _, _| panic!("the engine downloads no stream");
+        let options = MediaDownloadOptions { sections: vec![(90.0, 150.0)], ..Default::default() };
+        let made = fake_download_with(dir.path(), &mp4_merge_info(&dir.path().join("out")), &cookies, fetch, options).await;
+        assert_eq!(made, Ok(dir.path().join("out").join("clip.mp4")));
+        assert_eq!(runs_in(dir.path()), ["download url"]);
+    }
 
     fn line(status: &str, downloaded: &str, total: &str, estimate: &str, stream: &str) -> String {
         format!("{PROGRESS_MARK}{status} {downloaded} {total} {estimate} 1048576.5 3 {stream}")

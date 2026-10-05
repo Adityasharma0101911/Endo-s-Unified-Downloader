@@ -411,6 +411,30 @@ mod tests {
         assert_eq!(q.get_item(b).unwrap().filename, "download");
     }
 
+    /// A queue saved before clips, SponsorBlock and the merge format existed loads with none of
+    /// them; one saved with them keeps them.
+    #[test]
+    fn a_queue_saved_before_the_media_options_loads() {
+        let mut q = DownloadQueue::new();
+        let media = DownloadOptions {
+            sections: vec![(90.0, 150.5)],
+            sponsorblock: Some("remove".into()),
+            merge_format: Some("mkv".into()),
+            ..Default::default()
+        };
+        q.add_item(vec![url("https://e.com/v")], media);
+        let json = serde_json::to_string(&q).unwrap();
+        let back: DownloadQueue = serde_json::from_str(&json).unwrap();
+        let options = &back.items()[0].options;
+        assert_eq!((&options.sections[..], options.sponsorblock.as_deref(), options.merge_format.as_deref()), (&[(90.0, 150.5)][..], Some("remove"), Some("mkv")));
+
+        let old = json.replace(r#""sections":[[90.0,150.5]],"sponsorblock":"remove","merge_format":"mkv","#, "");
+        assert!(!old.contains("sections") && !old.contains("merge_format"), "{old}");
+        let back: DownloadQueue = serde_json::from_str(&old).unwrap();
+        let options = &back.items()[0].options;
+        assert!(options.sections.is_empty() && options.sponsorblock.is_none() && options.merge_format.is_none());
+    }
+
     /// A download its input named shows that name at once, but its target stays unknown until
     /// the engine reports one: until then no other download's file counts as its own, to clean
     /// up or to conflict with.

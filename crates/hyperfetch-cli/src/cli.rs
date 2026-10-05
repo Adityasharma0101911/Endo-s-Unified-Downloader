@@ -207,6 +207,20 @@ pub struct Args {
     #[arg(long = "wait-for-video")]
     pub wait_for_video: bool,
 
+    /// Download only this part of a media file, e.g. 90-150, 1:30-2:30 or 1:02:03-1:05:00;
+    /// repeat it for several parts
+    #[arg(long = "sections", value_name = "START-END", value_parser = parse_section)]
+    pub sections: Vec<(f64, f64)>,
+
+    /// Remove a YouTube video's sponsor, self-promotion and subscribe reminder segments, or mark
+    /// SponsorBlock's segments as chapters
+    #[arg(long = "sponsorblock", value_name = "MODE", value_parser = ["remove", "mark"])]
+    pub sponsorblock: Option<String>,
+
+    /// The container a media file's video and audio are merged into
+    #[arg(long = "merge-format", value_name = "FORMAT", value_parser = ["mp4", "mkv", "webm"])]
+    pub merge_format: Option<String>,
+
     /// Remux an HLS (m3u8) stream saved as MPEG-TS into an MP4 once downloaded, without
     /// re-encoding (needs ffmpeg; without it the .ts is kept)
     #[arg(long = "hls-mp4")]
@@ -377,6 +391,37 @@ fn parse_subtitle_langs(s: &str) -> Result<String, String> {
     Ok(s.to_string())
 }
 
+/// A part of a media file as START-END, each a time in seconds, M:SS or H:MM:SS (seconds may
+/// have decimals), START before END: (start, end) in seconds.
+fn parse_section(s: &str) -> Result<(f64, f64), String> {
+    let invalid = || format!("'{}' is not a part of a video (e.g. 90-150, 1:30-2:30 or 1:02:03-1:05:00)", s);
+    let seconds = |time: &str| -> Option<f64> {
+        let fields: Vec<&str> = time.trim().split(':').collect();
+        if fields.len() > 3 {
+            return None;
+        }
+        let mut total = 0.0;
+        for (i, field) in fields.iter().enumerate() {
+            // Digits only: no sign, exponent, "inf" or "NaN".
+            if !field.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+                return None;
+            }
+            let value: f64 = field.parse().ok()?;
+            // Minutes and seconds after the first field stay under 60.
+            if i > 0 && value >= 60.0 {
+                return None;
+            }
+            total = total * 60.0 + value;
+        }
+        Some(total)
+    };
+    let (start, end) = s.split_once('-').ok_or_else(invalid)?;
+    match (seconds(start), seconds(end)) {
+        (Some(start), Some(end)) if start < end => Ok((start, end)),
+        _ => Err(invalid()),
+    }
+}
+
 pub fn parse_media_preset(s: &str) -> Result<MediaQualityPreset, String> {
     let s = s.trim();
     Ok(match s.to_ascii_lowercase().as_str() {
@@ -475,6 +520,28 @@ mod tests {
         assert!(parse(&["--latest", "0", "u"]).is_err());
         assert!(parse(&["--subs", " ", "u"]).is_err());
         assert!(parse(&["--subs", "en, es", "u"]).is_err());
+    }
+
+    #[test]
+    fn sections_sponsorblock_and_merge_format() {
+        assert_eq!(parse_section("90-150"), Ok((90.0, 150.0)));
+        assert_eq!(parse_section("1:30-2:30"), Ok((90.0, 150.0)));
+        assert_eq!(parse_section("1:02:03-1:05:00"), Ok((3723.0, 3900.0)));
+        assert_eq!(parse_section(" 0:05.5 - 75 "), Ok((5.5, 75.0)));
+        assert_eq!(parse_section("0-100:00"), Ok((0.0, 6000.0)), "the first field may be any size");
+        for bad in ["150-90", "90-90", "90", "-5-10", "a-b", "1:60-2:00", "1:2:3:4-5", "1e3-2e3", "inf-NaN", "+1-2", "90-", "1::2-3", ""] {
+            assert!(parse_section(bad).is_err(), "{bad}");
+        }
+
+        let parse = |args: &[&str]| Args::try_parse_from(std::iter::once("cli").chain(args.iter().copied()));
+        let args = parse(&["u"]).unwrap();
+        assert!(args.sections.is_empty() && args.sponsorblock.is_none() && args.merge_format.is_none());
+        let args = parse(&["--sections", "90-150", "--sections", "1:02:03-1:05:00", "--sponsorblock", "mark", "--merge-format", "webm", "u"]).unwrap();
+        assert_eq!(args.sections, [(90.0, 150.0), (3723.0, 3900.0)]);
+        assert_eq!((args.sponsorblock.as_deref(), args.merge_format.as_deref()), (Some("mark"), Some("webm")));
+        assert!(parse(&["--sponsorblock", "skip", "u"]).is_err());
+        assert!(parse(&["--merge-format", "avi", "u"]).is_err());
+        assert!(parse(&["--sections", "2:00-1:00", "u"]).is_err());
     }
 
     #[test]

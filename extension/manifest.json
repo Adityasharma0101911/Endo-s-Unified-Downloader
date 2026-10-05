@@ -52,6 +52,12 @@
       "all_frames": true,
       "match_about_blank": true,
       "world": "ISOLATED"
+    },
+    {
+      "matches": ["https://www.youtube.com/*", "https://m.youtube.com/*"],
+      "js": ["content/youtube.js"],
+      "run_at": "document_idle",
+      "world": "ISOLATED"
     }
   ]
 }

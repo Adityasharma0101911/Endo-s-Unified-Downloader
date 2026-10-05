@@ -15,6 +15,8 @@ export const MEDIA_SITE_HOSTS = [
   "instagram.com",
   "facebook.com",
   "dailymotion.com",
+  "soundcloud.com",
+  "bilibili.com",
 ];
 
 /** True when `hostname` is one of MEDIA_SITE_HOSTS or a subdomain of one. */
