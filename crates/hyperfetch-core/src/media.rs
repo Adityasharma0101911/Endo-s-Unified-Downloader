@@ -908,8 +908,9 @@ pub(crate) fn find_in_path(name: &str) -> Option<PathBuf> {
 }
 
 /// Folders a program launched from Finder or the Dock lacks on its PATH, which is only
-/// /usr/bin:/bin:/usr/sbin:/sbin there: Homebrew's (Apple Silicon, Intel) and pip's user folder,
-/// where yt-dlp, ffmpeg, gallery-dl, 7-Zip and Node.js usually are.
+/// /usr/bin:/bin:/usr/sbin:/sbin there: Homebrew's (Apple Silicon, Intel) and pipx's (macOS' pip
+/// puts a user's programs in ~/Library/Python/3.X/bin instead), where yt-dlp, ffmpeg, gallery-dl,
+/// 7-Zip and Node.js usually are.
 #[cfg(any(target_os = "macos", test))]
 fn missing_path_dirs(home: Option<&Path>) -> Vec<PathBuf> {
     let mut dirs = vec![PathBuf::from("/opt/homebrew/bin"), PathBuf::from("/usr/local/bin")];
@@ -1706,6 +1707,10 @@ async fn install_ffmpeg(
 async fn download_ffmpeg(client: &reqwest::Client, release: &str, bin_dir: &Path, tar: &Path) -> Result<PathBuf, String> {
     let Some(asset) = ffmpeg_release_asset() else {
         return match cfg!(target_os = "macos") {
+            // Martin Riedl's builds need macOS 12, whose kernel is Darwin 21: an older Mac cannot run them.
+            true if darwin_major().is_some_and(|major| major < 21) => {
+                Err("The ffmpeg build this app installs needs macOS 12 or later; install ffmpeg yourself (brew install ffmpeg)".to_string())
+            }
             // Boxed: every media download's future holds this one, and would grow by its size.
             true => Box::pin(download_ffmpeg_programs(client, release, bin_dir, tar)).await,
             false => Err("No ffmpeg build is published for this platform; install ffmpeg yourself".to_string()),
@@ -1793,6 +1798,20 @@ async fn download_ffmpeg_programs(client: &reqwest::Client, release: &str, bin_d
         let _ = tokio::fs::remove_file(archive).await;
     }
     installed
+}
+
+/// The major version of macOS' kernel, Darwin (macOS 12 is 21); None elsewhere.
+fn darwin_major() -> Option<u32> {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: uname fills the struct it is given; its release is then NUL-terminated.
+        let mut name: libc::utsname = unsafe { std::mem::zeroed() };
+        if unsafe { libc::uname(&mut name) } == 0 {
+            let release = unsafe { std::ffi::CStr::from_ptr(name.release.as_ptr()) };
+            return release.to_str().ok()?.split('.').next()?.parse().ok();
+        }
+    }
+    None
 }
 
 /// Fails with why `tar` cannot unpack the ffmpeg build `asset` (see [`cannot_unpack`]), if it cannot.
@@ -6571,7 +6590,7 @@ bbd8671c6c05eaa3ec29d690695aebadff0871faa3efe9051581afbf3c01e80e  ffmpeg-master-
         }
     }
 
-    /// A program started from Finder gets Homebrew's and pip's folders after what PATH has, each
+    /// A program started from Finder gets Homebrew's and pipx's folders after what PATH has, each
     /// once, and no empty entry (the current directory).
     #[test]
     fn path_gets_the_missing_folders_appended() {
@@ -6587,6 +6606,13 @@ bbd8671c6c05eaa3ec29d690695aebadff0871faa3efe9051581afbf3c01e80e  ffmpeg-master-
         assert_eq!(appended_path(std::ffi::OsStr::new(""), &dirs[..1]), Some(joined(&dirs[..1])));
         let with_empty = std::ffi::OsString::from(format!("{}{}", usr.display(), if cfg!(windows) { ";" } else { ":" }));
         assert_eq!(appended_path(&with_empty, &dirs[..1]), Some(joined(&[usr, dirs[0].clone()])));
+    }
+
+    /// The kernel's version is read, which says whether Martin Riedl's ffmpeg runs (macOS 12+).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_darwin_version_is_read() {
+        assert!(darwin_major().is_some_and(|major| major >= 20), "{:?}", darwin_major());
     }
 
     /// The real release installs an ffmpeg and ffprobe that run.

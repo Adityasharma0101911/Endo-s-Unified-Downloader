@@ -42,4 +42,5 @@ chrome://extensions, turn on Developer mode, choose Load unpacked and select tha
 Your files
 ----------
 Settings, history and the queue are in ~/Library/Application Support/EndosUnifiedDownloader.
-Videos need ffmpeg: the app offers to install its own, or it uses Homebrew's (brew install ffmpeg).
+Videos need ffmpeg: the app offers to install its own (on macOS 12 or later), or it uses Homebrew's
+(brew install ffmpeg).

@@ -453,10 +453,12 @@ impl DownloadHistoryManager {
             return PathBuf::from(app_data).join("EndosUnifiedDownloader").join("history.json");
         }
 
-        // Application Support, with everything else of the app's (see media::app_data_dir).
+        // Application Support, with everything else of the app's (see media::app_data_dir), unless
+        // only ~/.hyperfetch has a history: builds from before macOS was supported kept it there.
         #[cfg(target_os = "macos")]
-        if let Some(dir) = crate::media::app_data_dir() {
-            return dir.join("history.json");
+        if let Some(path) = crate::media::app_data_dir().map(|dir| dir.join("history.json")) {
+            let old = std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".hyperfetch").join("history.json"));
+            return old.filter(|old| !path.exists() && old.exists()).unwrap_or(path);
         }
 
         #[cfg(not(windows))]

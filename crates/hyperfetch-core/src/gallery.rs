@@ -236,7 +236,7 @@ async fn gallery_dl(proxy: Option<&str>) -> Result<PathBuf, String> {
 /// to its place and renamed into it, so no half-written gallery-dl is ever run. A file the sums
 /// leave out is refused.
 async fn install(client: &reqwest::Client, api: &str, bin_dir: &Path) -> Result<PathBuf, String> {
-    let how = if cfg!(target_os = "macos") { "brew install gallery-dl, or pip install gallery-dl" } else { "pip install gallery-dl" };
+    let how = if cfg!(target_os = "macos") { "brew install gallery-dl, or pipx install gallery-dl" } else { "pip install gallery-dl" };
     let asset = asset().ok_or_else(|| format!("There is no gallery-dl build for this system: install gallery-dl ({how}) and try again"))?;
     let body = http_get(client, api, Duration::from_secs(30)).await?.bytes().await.map_err(|e| format!("Failed to read {api}: {e}"))?;
     let release: serde_json::Value = serde_json::from_slice(&body).map_err(|e| format!("Unreadable gallery-dl release: {e}"))?;
