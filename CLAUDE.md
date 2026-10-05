@@ -5,6 +5,12 @@
 - Never touch, stage or commit `reference(dont commit)/`.
 - Before committing, make sure it builds and the tests pass: `cargo build --workspace`, `cargo test --workspace -- --test-threads=4`, `node --test "extension/test/*.test.mjs"`.
 
+## Testing the GUI
+
+- UI checks run headless inside `cargo test -p hyperfetch-gui`, through `crates/hyperfetch-gui/src/ui/harness.rs`: it drives the real `ui::render` with synthetic input (clicks on visible text, keys, typing, paste, files dragged over) and a hand-stepped clock, asserts the repaints each frame asks for, and paints frames to PNG with a CPU rasterizer. No window opens.
+- To look at the animations: `cargo test -p hyperfetch-gui capture_gallery -- --ignored` writes frame strips of each one, dark and light, and every page at 100/125/150 %, to the folder in `ENDO_CAPTURE_DIR` (default `target/ui-captures`).
+- Never move the mouse, send keys, focus windows or capture the screen to test the app: the user works on this PC. If a real run is needed (an idle CPU check), start the release build with `Start-Process -WindowStyle Minimized`, `ENDO_HISTORY_PATH` (its settings and queue live next to it) and `TEMP`/`TMP` pointing into a scratch folder, and close it with `CloseMainWindow()`.
+
 ## Releasing
 
 The app updates itself from this repo's GitHub releases and installs only what `SHA256SUMS.sig` signs with the key at `%USERPROFILE%\.endo-release\update-key.pem` (its public half is `PUBLIC_KEY` in `crates/hyperfetch-core/src/updater.rs`).
