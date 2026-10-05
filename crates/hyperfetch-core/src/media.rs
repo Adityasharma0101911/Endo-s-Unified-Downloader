@@ -176,6 +176,11 @@ pub struct MediaDownloadOptions {
     /// The container video and audio are merged into ("mp4", "mkv", "webm"); None keeps the
     /// preset's own.
     pub merge_format: Option<String>,
+    /// A video's password (`--video-password`), and a site's name for its sign-in (see
+    /// [`netrc_machine`]) with the user name and password, from a paste: yt-dlp gets them in
+    /// files of the run, never on its command line (see [`CookieRun::sign_in`]).
+    pub video_password: Option<String>,
+    pub login: Option<(&'static str, String, String)>,
 }
 
 impl MediaDownloadOptions {
@@ -207,6 +212,8 @@ impl Default for MediaDownloadOptions {
             sections: Vec::new(),
             sponsorblock: None,
             merge_format: None,
+            video_password: None,
+            login: None,
         }
     }
 }
@@ -331,6 +338,28 @@ pub fn is_supported_media_site(url: &Url) -> bool {
             && MEDIA_DOMAINS.iter().any(|domain| {
                 host == *domain || host.strip_suffix(domain).is_some_and(|sub| sub.ends_with('.'))
             }))
+}
+
+/// yt-dlp's name for the sign-in of the media site `url` is on (its extractors' netrc machine),
+/// for those that take one: a login given under it reaches that site's extractors alone, not
+/// those of a site its page leads to.
+pub fn netrc_machine(url: &Url) -> Option<&'static str> {
+    const MACHINES: &[(&str, &str)] = &[
+        ("youtube.com", "youtube"),
+        ("youtu.be", "youtube"),
+        ("twitch.tv", "twitch"),
+        ("twitter.com", "twitter"),
+        ("x.com", "twitter"),
+        ("vimeo.com", "vimeo"),
+        ("soundcloud.com", "soundcloud"),
+        ("reddit.com", "reddit"),
+        ("instagram.com", "instagram"),
+        ("facebook.com", "facebook"),
+        ("dailymotion.com", "dailymotion"),
+    ];
+    let host = url.host_str()?.trim_end_matches('.').to_ascii_lowercase();
+    let on = |domain: &str| host == domain || host.strip_suffix(domain).is_some_and(|sub| sub.ends_with('.'));
+    MACHINES.iter().find(|(domain, _)| on(domain)).map(|(_, machine)| *machine).filter(|_| is_supported_media_site(url))
 }
 
 /// How the entries of a list are ordered, which tells its newest ones.
@@ -2007,7 +2036,7 @@ impl BrowserCookies {
     /// which would rewrite the user's on every run (dropping lines yt-dlp cannot read), several
     /// runs at once among them. One that cannot be read is left out, as yt-dlp leaves it out.
     async fn for_run(&self, source: &BrowserCookieSource) -> CookieRun<'_> {
-        let mut run = CookieRun { cookies: self, args: source.to_args(), file: None, jar: None };
+        let mut run = CookieRun { cookies: self, args: source.to_args(), file: None, jar: None, secrets: Vec::new() };
         if let BrowserCookieSource::File(path) = source {
             let copy = match tokio::fs::read(path).await {
                 Ok(contents) => self.files.file(Some(contents), "txt").await,
@@ -2085,9 +2114,49 @@ struct CookieRun<'a> {
     args: Vec<String>,
     file: Option<PrivateFile>,
     jar: Option<JarUse>,
+    /// The files [`CookieRun::sign_in`] gives yt-dlp, for as long as the run lasts.
+    secrets: Vec<PrivateFile>,
+}
+
+/// `value` as a word of a .netrc file: as it is, or in `"` with `"` and `\` escaped when it holds
+/// a space, either of them or nothing (only Python 3.11's yt-dlp reads such quotes; older ones
+/// take the plain word alone).
+fn netrc_word(value: &str) -> String {
+    match value.is_empty() || value.contains(|c: char| c.is_whitespace() || c == '"' || c == '\\') {
+        true => format!("\"{}\"", value.replace('\\', r"\\").replace('"', "\\\"")),
+        false => value.to_string(),
+    }
 }
 
 impl CookieRun<'_> {
+    /// This run with `options`' video password and login, in files of its own in the
+    /// [`PrivateDir`], deleted with the run: never on yt-dlp's command line, which other
+    /// programs can read. The password goes in a config file (`--config-locations`), as shell
+    /// words in UTF-8; the login in a .netrc under the site's name, which yt-dlp gives that
+    /// site's extractors alone (`--username` would go to any site a page leads it to). Without
+    /// that folder the run goes without them.
+    async fn sign_in(mut self, options: &MediaDownloadOptions) -> Self {
+        let quote = |value: &str| format!("'{}'", value.replace('\'', r#"'"'"'"#));
+        let config = options.video_password.as_ref().map(|p| (format!("# coding: utf-8\n--video-password {}\n", quote(p)), "conf"));
+        let netrc = options.login.as_ref().map(|(machine, user, password)| {
+            (format!("machine {machine} login {} password {}\n", netrc_word(user), netrc_word(password)), "netrc")
+        });
+        for (contents, ext) in config.into_iter().chain(netrc) {
+            match self.cookies.files.file(Some(contents.into_bytes()), ext).await {
+                Ok(file) => {
+                    let path = file.path.to_string_lossy().into_owned();
+                    self.secrets.push(file);
+                    match ext {
+                        "conf" => self.args.extend(["--config-locations".to_string(), path]),
+                        _ => self.args.extend(["--netrc".to_string(), "--netrc-location".to_string(), path]),
+                    }
+                }
+                Err(e) => tracing::warn!("yt-dlp runs without the password from the paste: {e}"),
+            }
+        }
+        self
+    }
+
     /// Keeps the jar yt-dlp saved: the one it read from the browser, or the jar it got with what
     /// the site renewed. A run that fails with a jar it got drops it instead, so the next run reads
     /// the browser again: the site may reject cookies the browser has renewed since. Only for a
@@ -4701,7 +4770,7 @@ async fn run_extraction(
 ) -> Result<(Vec<u8>, Result<(), String>), String> {
     let ffmpeg_dir = tools.ffmpeg.as_deref().and_then(Path::parent);
     let version = ytdlp_version(&tools.ytdlp, &tools.work_dir, tools.version_cache.as_deref()).await;
-    let cookies = tools.cookies.for_run(&options.cookies).await;
+    let cookies = tools.cookies.for_run(&options.cookies).await.sign_in(options).await;
     let args = build_ytdlp_args(Source::Urls(urls), options, kind, &cookies.args, ffmpeg_dir, tools.js_runtime.as_deref(), version.as_deref());
     let found = run_captured(ytdlp_command(&tools.ytdlp, &args, options.proxy.as_deref(), &tools.work_dir), cancel_flag.clone()).await;
     if !is_cancelled(&cancel_flag) {
@@ -4831,7 +4900,7 @@ async fn download_with(
             let json = match extracted.take() {
                 Some(Extracted(json)) => Some(json),
                 None if fast.is_some() => {
-                    let cookies = tools.cookies.for_run(&options.cookies).await;
+                    let cookies = tools.cookies.for_run(&options.cookies).await.sign_in(options).await;
                     let run = run_to_end(command(Source::Url(url), RunKind::Extract, &cookies, options), cancel_flag.clone()).await;
                     if !is_cancelled(&cancel_flag) {
                         cookies.finish(run.is_ok()).await;
@@ -4871,7 +4940,7 @@ async fn download_with(
                                 if sub_langs(options).is_some() {
                                     let wrote = match tools.cookies.files.file(Some(json), "json").await {
                                         Ok(file) => {
-                                            let cookies = tools.cookies.for_run(&options.cookies).await;
+                                            let cookies = tools.cookies.for_run(&options.cookies).await.sign_in(options).await;
                                             let command = command(Source::Info(&file.path), RunKind::Subtitles, &cookies, run_options);
                                             let run = run_to_end(command, cancel_flag.clone()).await;
                                             if !is_cancelled(&cancel_flag) {
@@ -4909,7 +4978,7 @@ async fn download_with(
                 }
             }
             let source = found.as_ref().map_or(Source::Url(url), |file| Source::Info(&file.path));
-            let cookies = tools.cookies.for_run(&options.cookies).await;
+            let cookies = tools.cookies.for_run(&options.cookies).await.sign_in(options).await;
             let command = command(source, RunKind::Download, &cookies, regional.as_ref().unwrap_or(options));
             let result = run_ytdlp(command, progress_tx.as_ref(), cancel_flag.clone(), tools.ffmpeg.as_deref()).await;
             if !is_cancelled(&cancel_flag) {
@@ -6527,6 +6596,34 @@ bbd8671c6c05eaa3ec29d690695aebadff0871faa3efe9051581afbf3c01e80e  ffmpeg-master-
         drop(gone);
         // Nothing is left on disk, claim locks included.
         assert_eq!(names_in(&folder), Vec::<String>::new());
+    }
+
+    /// A video password and a login reach yt-dlp in a config file of the run, quoted as its shell
+    /// words take them, never among its arguments; the file goes with the run.
+    #[tokio::test]
+    async fn passwords_go_to_yt_dlp_in_a_file_of_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("cookies");
+        let cookies = BrowserCookies::new(Some(folder.clone()));
+        let options = MediaDownloadOptions {
+            video_password: Some("it's s3cret".into()),
+            login: Some(("vimeo", "me@x.org".into(), "p\"w d#\\".into())),
+            ..Default::default()
+        };
+        let run = cookies.for_run(&BrowserCookieSource::None).await.sign_in(&options).await;
+        let [config_flag, config, netrc, netrc_flag, netrc_file] = &run.args[..] else { panic!("{:?}", run.args) };
+        assert_eq!([config_flag, netrc, netrc_flag], ["--config-locations", "--netrc", "--netrc-location"]);
+        assert_eq!(std::fs::read_to_string(config).unwrap(), "# coding: utf-8\n--video-password 'it'\"'\"'s s3cret'\n");
+        // The login only under the site's name: no `--username`, which every site would get.
+        assert_eq!(std::fs::read_to_string(netrc_file).unwrap(), "machine vimeo login me@x.org password \"p\\\"w d#\\\\\"\n");
+        let url = Url::parse("https://vimeo.com/1").unwrap();
+        let args = build_ytdlp_args(Source::Url(&url), &options, RunKind::Download, &run.args, None, None, None);
+        assert!(args.contains(&"--config-locations".to_string()) && !args.iter().any(|a| a.contains("s3cret") || a.contains("p\"w")), "{args:?}");
+        assert!(!args.iter().any(|a| a == "--username" || a == "--password"), "{args:?}");
+        drop(run);
+        assert_eq!(names_in(&folder), Vec::<String>::new());
+        // Nothing to give, no file.
+        assert!(cookies.for_run(&BrowserCookieSource::None).await.sign_in(&MediaDownloadOptions::default()).await.args.is_empty());
     }
 
     #[tokio::test]

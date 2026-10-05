@@ -14,6 +14,7 @@ use hyperfetch_core::history::{is_redacted, DownloadHistoryManager, HistoryEntry
 use hyperfetch_core::ingest::{decode_text, descriptor_client, http_url, ingest, input_tokens, ListOptions, Task};
 use hyperfetch_core::media::{find_ffmpeg_path, is_supported_media_site, BrowserCookieSource};
 use hyperfetch_core::p2p;
+use hyperfetch_core::paste::{self, PastedLink};
 use hyperfetch_core::postprocess::PostOptions;
 use hyperfetch_core::resolver::SmartResolver;
 use hyperfetch_core::state::DownloadState;
@@ -191,6 +192,7 @@ fn job(args: &Args, connections: u64, dir: &Path, task: Task) -> Job {
         cookies_path: args.load_cookies.clone(),
         // --header is for the hosts the user named, not those a .metalink or .torrent lists.
         auth_header: args.auth_header.clone().filter(|_| !task.from_document),
+        password: args.password.clone(),
         referer: args.referer.clone().filter(|_| !task.from_document).or(task.referer),
         proxy: args.proxy.clone(),
         media_preset: args.media_preset.clone(),
@@ -241,6 +243,8 @@ fn list_options(args: &Args) -> ListOptions {
         debrid_key: args.debrid_key.clone(),
         debrid_provider: args.debrid_provider.clone(),
         debrid_magnets: true,
+        password: args.password.clone(),
+        auth: None,
     }
 }
 
@@ -332,27 +336,66 @@ async fn read_input(path: &Path) -> Result<String, String> {
     decode_text(&bytes).map_err(|e| format!("{}: {}", path.display(), e))
 }
 
+/// One input of a batch: the input-file line it is on (None for the command-line URLs and a
+/// paste), its tokens, and the link of a paste it is (see [`pasted_inputs`]), whose secrets its
+/// download gets.
+type Input = (Option<usize>, Vec<String>, Option<PastedLink>);
+
+/// The inputs of `text` when it is a paste with a password, key or sign-in, or copied requests
+/// (see `paste::parse`): each link one input. Unless quiet, a note per link names what of the
+/// paste it uses, never a value. None when `text` is neither; `Err` when the copied requests
+/// send data.
+fn pasted_inputs(text: &str, ui: &Ui) -> Option<Result<Vec<Input>, String>> {
+    let links = match paste::parse(text)? {
+        Ok(links) => links,
+        Err(e) => return Some(Err(e)),
+    };
+    for note in links.iter().filter_map(|link| link.secrets.note(&link.url)).filter(|_| !ui.quiet()) {
+        stderr_line(&note);
+    }
+    Some(Ok(links.into_iter().map(|link| (None, vec![link.url.to_string()], Some(link))).collect()))
+}
+
+/// The inputs of a batch file's (or stdin's) `text`: a paste with secrets (see
+/// [`pasted_inputs`]) and the lines it leaves that are inputs of their own (a magnet, a local
+/// .torrent), else one per meaningful line (see [`batch_lines`]).
+async fn text_inputs(text: &str, ui: &Ui) -> Result<Vec<Input>, String> {
+    let (mut inputs, lines) = match pasted_inputs(text, ui) {
+        Some(pasted) => (pasted?, paste::other_inputs(text)),
+        None => (Vec::new(), batch_lines(text).collect()),
+    };
+    for (number, line) in lines {
+        inputs.push((Some(number), input_tokens(line).await, None));
+    }
+    Ok(inputs)
+}
+
 /// The downloads `inputs` list, each with the input-file line it came from (None for the
-/// command-line URLs), and how many inputs could not be read into downloads, or only in part
+/// command-line URLs) and the pasted link it is, and how many inputs could not be read into
+/// downloads, or only in part
 /// (those are reported; what was read of the latter is downloaded). A playlist or channel with
 /// nothing new is said so, but has not failed: it is the idle state of a sync.
 async fn read_tasks(
-    inputs: &[(Option<usize>, Vec<String>)],
+    inputs: &[Input],
     ui: &Ui,
     http: &reqwest::Client,
     list: &ListOptions,
-) -> (Vec<(Option<usize>, Task)>, usize) {
+) -> (Vec<(Option<usize>, Task, Option<PastedLink>)>, usize) {
     let mut tasks = Vec::new();
     let mut failed = 0;
-    for (line, tokens) in inputs {
-        let (result, mut missing) = listed(tokens, http, list).await;
+    for (line, tokens, pasted) in inputs {
+        // A share is opened with the password pasted with it, unless --password says another, and
+        // a feed or remote .torrent read with the sign-in pasted with it.
+        let password = list.password.clone().or_else(|| pasted.as_ref()?.secrets.password.clone());
+        let auth = pasted.as_ref().and_then(|link| Some((link.url.clone(), link.secrets.auth_header.clone()?)));
+        let (result, mut missing) = listed(tokens, http, &ListOptions { password, auth, ..list.clone() }).await;
         match result {
             Ok(found) if found.is_empty() && missing.is_empty() => {
                 if !ui.quiet() {
                     ui.error(&nothing_new(&tokens.join(" ")));
                 }
             }
-            Ok(found) => tasks.extend(found.into_iter().map(|task| (*line, task))),
+            Ok(found) => tasks.extend(found.into_iter().map(|task| (*line, task, pasted.clone()))),
             Err(e) => missing.push(e),
         }
         for e in &missing {
@@ -369,23 +412,29 @@ fn nothing_new(input: &str) -> String {
 }
 
 async fn batch(args: &Args, ui: &Ui, shutdown: &Shutdown, http: &reqwest::Client) -> i32 {
-    let mut inputs: Vec<(Option<usize>, Vec<String>)> = Vec::new();
-    if let Some(path) = &args.input_file {
-        match read_input(path).await {
-            Ok(text) => {
-                for (number, line) in batch_lines(&text) {
-                    inputs.push((Some(number), input_tokens(line).await));
-                }
-            }
+    let mut inputs: Vec<Input> = Vec::new();
+    // "-" as the URLs is a paste (or a batch) on stdin.
+    let stdin = args.urls == ["-"];
+    for path in args.input_file.as_deref().into_iter().chain(stdin.then_some(Path::new("-"))) {
+        let read = match read_input(path).await {
+            Ok(text) => text_inputs(&text, ui).await,
+            Err(e) => Err(e),
+        };
+        match read {
+            Ok(read) => inputs.extend(read),
             Err(e) => return usage(&e),
         }
     }
-    if !args.urls.is_empty() {
-        inputs.push((None, args.urls.clone()));
+    if !args.urls.is_empty() && !stdin {
+        match pasted_inputs(&args.urls.join(" "), ui) {
+            Some(Ok(pasted)) => inputs.extend(pasted),
+            Some(Err(e)) => return usage(&e),
+            None => inputs.push((None, args.urls.clone(), None)),
+        }
     }
 
     let (tasks, mut failed) = read_tasks(&inputs, ui, http, &list_options(args)).await;
-    let swarm = tasks.iter().any(|(_, task)| task.p2p);
+    let swarm = tasks.iter().any(|(_, task, _)| task.p2p);
     if let Err(e) = check_single_file_options(args.output.as_deref(), args.checksum.is_some(), tasks.len(), swarm) {
         return usage(&e);
     }
@@ -404,12 +453,23 @@ async fn batch(args: &Args, ui: &Ui, shutdown: &Shutdown, http: &reqwest::Client
         return usage(&e);
     }
 
-    let jobs: Vec<Job> = tasks.into_iter().map(|(line, t)| Job { line, ..job(args, args.connections, &dir, t) }).collect();
+    let jobs: Vec<Job> = tasks.into_iter().map(|(line, task, pasted)| pasted_job(args, &dir, line, task, pasted)).collect();
     // Asked only where someone answers: at a terminal that is not reading the input file.
-    let can_ask = !ui.quiet() && args.input_file.as_deref() != Some(Path::new("-")) && at_terminal();
+    let can_ask = !ui.quiet() && args.input_file.as_deref() != Some(Path::new("-")) && !stdin && at_terminal();
     let ffmpeg = ffmpeg_question(args, &jobs, can_ask.then_some(find_ffmpeg_path as Finder), ui);
     failed += run_jobs(jobs, args.jobs as usize, ui, shutdown, ffmpeg).await;
     exit_code(shutdown.requested(), failed)
+}
+
+/// The download of `task` from input-file line `line` with the secrets of the `pasted` link it
+/// came from: only when it is that link's own, not one a document the link names lists.
+fn pasted_job(args: &Args, dir: &Path, line: Option<usize>, task: Task, pasted: Option<PastedLink>) -> Job {
+    let typed = !task.from_document;
+    let mut download = Job { line, ..job(args, args.connections, dir, task) };
+    if let Some(link) = pasted.filter(|_| typed) {
+        paste::apply(&link, &mut download.options);
+    }
+    download
 }
 
 /// Looks for an ffmpeg (see `find_ffmpeg_path`). Blocking.
@@ -1123,17 +1183,63 @@ mod tests {
         let text = format!("# queue\n{}\nnot-a-url\n\nhttps://h.example/c.bin\n", metalink.display());
         let mut inputs = Vec::new();
         for (number, line) in batch_lines(&text) {
-            inputs.push((Some(number), input_tokens(line).await));
+            inputs.push((Some(number), input_tokens(line).await, None));
         }
-        inputs.push((None, vec!["https://h.example/d.bin".to_string()]));
+        inputs.push((None, vec!["https://h.example/d.bin".to_string()], None));
 
         let (tasks, failed) = read_tasks(&inputs, &Ui::new(true), &reqwest::Client::new(), &ListOptions::default()).await;
         assert_eq!(failed, 1);
-        let lines: Vec<(Option<usize>, String)> = tasks.iter().map(|(line, task)| (*line, task.label())).collect();
+        let lines: Vec<(Option<usize>, String)> = tasks.iter().map(|(line, task, _)| (*line, task.label())).collect();
         assert_eq!(
             lines,
             [(Some(2), "a.bin".into()), (Some(2), "b.bin".into()), (Some(5), "c.bin".into()), (None, "d.bin".into())]
         );
+    }
+
+    /// A paste on the command line (a copied curl command, a user:pass@ link and its password)
+    /// or on stdin gives each link a download of its own with its secrets: --header and
+    /// --password win over pasted ones, the downloads a document lists get none, and a copied
+    /// POST is a usage error. Plain links are taken as before.
+    #[tokio::test]
+    async fn pasted_secrets_reach_their_own_downloads() {
+        let quiet = Ui::new(true);
+        let task = |url: &str| Task { urls: vec![Url::parse(url).unwrap()], ..Task::default() };
+        let pasted = |args: &Args| pasted_inputs(&args.urls.join(" "), &quiet).unwrap().unwrap();
+
+        let args = parse(&["curl 'https://c.example/c.bin' -H 'Cookie: sid=1' -H 'X-Api-Key: k' --compressed"]);
+        let inputs = pasted(&args);
+        assert_eq!((inputs.len(), inputs[0].1.as_slice()), (1, &["https://c.example/c.bin".to_string()][..]));
+        let headers = pasted_job(&args, Path::new("d"), None, task("https://c.example/c.bin"), inputs[0].2.clone()).options.secret_headers;
+        assert!(headers.contains(&("Cookie".into(), "sid=1".into())) && headers.contains(&("X-Api-Key".into(), "k".into())), "{headers:?}");
+
+        let args = parse(&["https://bob:pw@h.example/f.zip", "Password:", "pasted-pw"]);
+        let inputs = pasted(&args);
+        assert_eq!(inputs[0].1, ["https://h.example/f.zip"], "the link without its user:pass@");
+        let link = inputs[0].2.clone().unwrap();
+        let options = pasted_job(&args, Path::new("d"), None, task("https://h.example/f.zip"), Some(link.clone())).options;
+        assert_eq!((options.auth_header.as_deref(), options.password.as_deref()), (Some("Basic Ym9iOnB3"), Some("pasted-pw")));
+        let flags = parse(&["--header", "Bearer typed", "--password", "flag-pw", "u"]);
+        let options = pasted_job(&flags, Path::new("d"), None, task("https://h.example/f.zip"), Some(link.clone())).options;
+        assert_eq!((options.auth_header.as_deref(), options.password.as_deref()), (Some("Bearer typed"), Some("flag-pw")));
+        let listed = Task { from_document: true, ..task("https://cdn.example/x.zip") };
+        let options = pasted_job(&args, Path::new("d"), None, listed, Some(link)).options;
+        assert_eq!((options.auth_header, options.secret_headers.len()), (None, 0));
+
+        // Stdin and -i: a paste, else a batch as before.
+        let inputs = text_inputs("https://a.example/1.zip\nhttps://a.example/2.zip\nPassword: s\n", &quiet).await.unwrap();
+        assert!(inputs.iter().all(|(_, _, link)| link.as_ref().unwrap().secrets.password.as_deref() == Some("s")) && inputs.len() == 2);
+        let mirrors = vec!["https://a.example/1.zip".to_string(), "https://b.example/1.zip".to_string()];
+        assert_eq!(text_inputs("# list\nhttps://a.example/1.zip https://b.example/1.zip\n", &quiet).await.unwrap(), [(Some(2), mirrors.clone(), None)]);
+        assert!(pasted_inputs(&mirrors.join(" "), &quiet).is_none());
+        // A magnet the paste leaves out is an input of its own.
+        let magnet = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=a";
+        let inputs = text_inputs(&format!("{magnet}\nhttps://a.example/1.zip\nPassword: s\n"), &quiet).await.unwrap();
+        let read: Vec<(Option<usize>, &str)> = inputs.iter().map(|(line, tokens, _)| (*line, tokens[0].as_str())).collect();
+        assert_eq!(read, [(None, "https://a.example/1.zip"), (Some(1), magnet)]);
+
+        assert_eq!(pasted_inputs("curl -X POST https://h.example/f", &quiet), Some(Err(paste::SENDS_DATA.to_string())));
+        let code = batch(&parse(&["-q", "curl -d a=1 https://h.example/f"]), &quiet, &Shutdown::install(), &reqwest::Client::new()).await;
+        assert_eq!(code, EXIT_USAGE);
     }
 
     #[test]
@@ -1203,9 +1309,9 @@ mod tests {
         })
         .await;
         let http = reqwest::Client::builder().proxy(reqwest::Proxy::all(&proxy).unwrap()).build().unwrap();
-        let inputs = [(None, vec!["http://www.mediafire.com/folder/pack00000001".to_string()])];
+        let inputs = [(None, vec!["http://www.mediafire.com/folder/pack00000001".to_string()], None)];
         let (tasks, failed) = read_tasks(&inputs, &Ui::new(true), &http, &ListOptions::default()).await;
-        assert_eq!(tasks.iter().map(|(_, task)| task.label()).collect::<Vec<_>>(), ["a.bin"]);
+        assert_eq!(tasks.iter().map(|(_, task, _)| task.label()).collect::<Vec<_>>(), ["a.bin"]);
         assert_eq!(failed, 1, "the files of the subfolder are missing");
         assert!(asked.load(Ordering::SeqCst) > 1, "a busy host is asked again");
     }

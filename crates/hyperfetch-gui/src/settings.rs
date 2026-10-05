@@ -343,6 +343,8 @@ impl Settings {
             debrid_key: non_empty(&self.debrid_api_key),
             debrid_provider: non_empty(&self.debrid_provider),
             debrid_magnets: self.debrid_magnets,
+            password: None,
+            auth: None,
         }
     }
 

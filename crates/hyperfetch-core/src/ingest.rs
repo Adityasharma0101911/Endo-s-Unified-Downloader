@@ -106,6 +106,31 @@ pub struct ListOptions {
     pub debrid_provider: Option<String>,
     /// Magnet links go through debrid when there is a `debrid_key`.
     pub debrid_magnets: bool,
+    /// The password of the share being listed (a Gofile folder's), from a paste.
+    pub password: Option<String>,
+    /// The link being read and the Authorization header a paste gave it (its `user:pass@`):
+    /// sent when a feed or a remote .torrent or .metalink is fetched from that link's host alone
+    /// (see [`ListOptions::get`]).
+    pub auth: Option<(Url, String)>,
+}
+
+impl ListOptions {
+    /// A GET of `url` with [`ListOptions::auth`]'s header when `url` is on its link's host, and
+    /// not over plain HTTP when the link is HTTPS (as `worker::Auth` scopes the user's).
+    pub(crate) fn get(&self, http: &reqwest::Client, url: &Url) -> reqwest::RequestBuilder {
+        let request = http.get(url.clone());
+        let Some((link, header)) = &self.auth else { return request };
+        let value = reqwest::header::HeaderValue::from_str(header).ok().map(|mut value| {
+            value.set_sensitive(true);
+            value
+        });
+        match value {
+            Some(value) if link.host_str() == url.host_str() && (link.scheme() != "https" || url.scheme() == "https") => {
+                request.header(reqwest::header::AUTHORIZATION, value)
+            }
+            _ => request,
+        }
+    }
 }
 
 /// What a listing tells the user besides its downloads (see [`ListOptions::notes`]).
@@ -131,6 +156,8 @@ impl Default for ListOptions {
             debrid_key: None,
             debrid_provider: None,
             debrid_magnets: true,
+            password: None,
+            auth: None,
         }
     }
 }
@@ -297,7 +324,7 @@ pub async fn ingest(tokens: &[impl AsRef<str>], http: &reqwest::Client, options:
         }
         if let Some((source, kind)) = descriptor_source(token.as_ref()) {
             return match source {
-                Source::Remote(typed) => remote_tasks(http, typed, kind, options.p2p).await,
+                Source::Remote(typed) => remote_tasks(http, typed, kind, options).await,
                 Source::Local(path) => {
                     let swarm = std::path::absolute(&path).ok().and_then(|p| Url::from_file_path(p).ok()).filter(|_| options.p2p);
                     document_tasks(kind, &read_local(&path).await?, None, swarm.as_ref())
@@ -354,13 +381,14 @@ async fn list(http: &reqwest::Client, url: &Url, options: &ListOptions) -> Optio
         return Some(mega::list(http, url).await);
     }
     if shares::lists(url) {
-        return Some(shares::list(http, url).await);
+        return Some(shares::list(http, url, options.password.as_deref()).await);
     }
     if cloud::lists(url) {
         return Some(cloud::list(http, url).await);
     }
     if repos::lists(url) {
-        return Some(repos::list(http, url).await);
+        let auth = options.auth.as_ref().filter(|(link, _)| link == url).map(|(_, header)| header.as_str());
+        return Some(repos::list(http, url, auth).await);
     }
     if folders::lists(url) {
         if let Some(listed) = folders::list(http, url, options).await {
@@ -439,12 +467,12 @@ fn too_large(what: impl std::fmt::Display) -> String {
 /// The link itself when its host answers with a client error (see [`fetch`]), or with a web page
 /// that is no such document: a host may label any file a page (PHP sends text/html unless told
 /// otherwise). A torrent without web seeds goes to the swarm when `p2p` is on.
-async fn remote_tasks(http: &reqwest::Client, typed: Url, kind: Descriptor, p2p: bool) -> Result<Vec<Task>, String> {
+async fn remote_tasks(http: &reqwest::Client, typed: Url, kind: Descriptor, options: &ListOptions) -> Result<Vec<Task>, String> {
     let url = resolver::SmartResolver::resolve_mirrors(http, &typed).await.into_iter().next().unwrap_or_else(|| typed.clone());
-    match fetch(http, &url).await? {
+    match fetch(options.get(http, &url), &url).await? {
         Some((bytes, labelled_page)) if !labelled_page || (!starts_like_html(&bytes) && parses(kind, &bytes)) => {
             // The swarm reads the .torrent from where it was found: nothing resolves it there.
-            document_tasks(kind, &bytes, Some(&typed), p2p.then_some(&url))
+            document_tasks(kind, &bytes, Some(&typed), options.p2p.then_some(&url))
         }
         _ => {
             tracing::info!("{} answered with an error or a web page: the download engine takes {}", url, typed);
@@ -475,15 +503,15 @@ fn starts_like_html(body: &[u8]) -> bool {
     [&b"<!doctype"[..], b"<html"].iter().any(|tag| start.get(..tag.len()).is_some_and(|s| s.eq_ignore_ascii_case(tag)))
 }
 
-/// The document at `url` and whether its host labels it a web page; None when its host answers
-/// with a client error (401 or 403 for a login, 404 for a private GitHub repository's /raw/
-/// link) or with a page larger than a document may be, which the engine is left to download and
-/// report. A timeout (408) or a rate limit (429) says nothing of the file: it is an error, to
-/// retry, as a server error is.
-async fn fetch(http: &reqwest::Client, url: &Url) -> Result<Option<(Vec<u8>, bool)>, String> {
+/// The document `request` gets from `url` and whether its host labels it a web page; None when
+/// its host answers with a client error (401 or 403 for a login, 404 for a private GitHub
+/// repository's /raw/ link) or with a page larger than a document may be, which the engine is
+/// left to download and report. A timeout (408) or a rate limit (429) says nothing of the file:
+/// it is an error, to retry, as a server error is.
+async fn fetch(request: reqwest::RequestBuilder, url: &Url) -> Result<Option<(Vec<u8>, bool)>, String> {
     use reqwest::StatusCode;
     let fail = |e: reqwest::Error| format!("Cannot fetch {}: {}", url, e);
-    let resp = http.get(url.clone()).send().await.map_err(fail)?;
+    let resp = request.send().await.map_err(fail)?;
     let status = resp.status();
     if status.is_client_error() && !matches!(status, StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS) {
         tracing::info!("{} answered HTTP {}", url, status);
@@ -879,6 +907,25 @@ d6:lengthi4e4:pathl5:y.bineee4:name4:root12:piece lengthi16384e6:pieces20:aaaaaa
         assert!(told.len() == 2 && told[0].ends_with("from the swarm instead") && told[1].ends_with("from its web seeds instead"), "{told:?}");
         let error = read(magnet, false).unwrap_err();
         assert!(!error.is_empty() && !told.iter().chain([&error]).any(|t| t.contains("sekret123")), "{error}");
+    }
+
+    /// A pasted sign-in goes with the reading of its link's host alone, never over plain HTTP
+    /// after HTTPS.
+    #[test]
+    fn a_pasted_sign_in_goes_to_the_read_links_host_alone() {
+        let http = reqwest::Client::new();
+        let link = Url::parse("https://feeds.example/private.rss").unwrap();
+        let options = ListOptions { auth: Some((link, "Basic Ym9iOnB3".into())), ..ListOptions::default() };
+        let sent = |url: &str| {
+            let request = options.get(&http, &Url::parse(url).unwrap()).build().unwrap();
+            request.headers().get(reqwest::header::AUTHORIZATION).map(|v| v.to_str().unwrap().to_string())
+        };
+        assert_eq!(sent("https://feeds.example/private.rss?page=2").as_deref(), Some("Basic Ym9iOnB3"));
+        for elsewhere in ["http://feeds.example/private.rss", "https://cdn.example/1.mp3", "https://evil.feeds.example/x"] {
+            assert_eq!(sent(elsewhere), None, "{elsewhere}");
+        }
+        let plain = ListOptions::default().get(&http, &Url::parse("https://feeds.example/").unwrap()).build().unwrap();
+        assert!(plain.headers().get(reqwest::header::AUTHORIZATION).is_none());
     }
 
     #[test]

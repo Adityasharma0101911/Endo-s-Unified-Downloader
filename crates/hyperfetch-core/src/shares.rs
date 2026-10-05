@@ -132,11 +132,12 @@ pub fn lists(url: &Url) -> bool {
     matches!(share_of(url), Some(Share::PixeldrainList(_) | Share::GofileFolder(_) | Share::Microsoft { folder: true }))
 }
 
-/// One task per file the share at `url` holds, in a folder named after it.
-pub async fn list(http: &reqwest::Client, url: &Url) -> Result<Vec<Task>, String> {
+/// One task per file the share at `url` holds, in a folder named after it; a Gofile folder
+/// opened with `password` if it has one.
+pub async fn list(http: &reqwest::Client, url: &Url, password: Option<&str>) -> Result<Vec<Task>, String> {
     let tasks = match share_of(url) {
         Some(Share::PixeldrainList(id)) => pixeldrain_list(http, &url.origin().ascii_serialization(), &id).await?,
-        Some(Share::GofileFolder(id)) => gofile_list(http, GOFILE_API, &id).await?,
+        Some(Share::GofileFolder(id)) => gofile_list(http, GOFILE_API, &id, password).await?,
         Some(Share::Microsoft { folder: true }) => return Err(MICROSOFT_FOLDER.to_string()),
         _ => return Err(format!("{} is not a folder or list link", url)),
     };
@@ -199,11 +200,12 @@ fn component(name: &str, id: &str) -> Result<PathBuf, String> {
     clean_path([name]).or_else(|_| clean_path([id]))
 }
 
-/// The JSON `request` answers with, read as `T`; `service` names the host in errors.
+/// The JSON `request` answers with, read as `T`; `service` names the host in errors, which leave
+/// out the URL (it may hold a password's hash).
 async fn get_json<T: DeserializeOwned>(request: RequestBuilder, service: &str) -> Result<T, String> {
-    let answer = request.send().await.map_err(|e| format!("Cannot reach {}: {}", service, e))?;
+    let answer = request.send().await.map_err(|e| format!("Cannot reach {}: {}", service, e.without_url()))?;
     let status = answer.status();
-    let body = answer.bytes().await.map_err(|e| format!("Cannot reach {}: {}", service, e))?;
+    let body = answer.bytes().await.map_err(|e| format!("Cannot reach {}: {}", service, e.without_url()))?;
     serde_json::from_slice(&body).map_err(|_| format!("{} answered HTTP {} with something the app cannot read", service, status))
 }
 
@@ -329,17 +331,25 @@ struct GofileItem {
     children: HashMap<String, GofileItem>,
 }
 
-/// Gofile's folder `id`, its children with it.
-async fn gofile_contents(http: &reqwest::Client, api: &str, token: &str, id: &str) -> Result<GofileItem, String> {
+/// Gofile's folder `id`, its children with it, opened with `password` if given.
+async fn gofile_contents(http: &reqwest::Client, api: &str, token: &str, id: &str, password: Option<&str>) -> Result<GofileItem, String> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let mut url = format!("{}/contents/{}?page=1&pageSize=1000&sortField=name&sortDirection=1", api, id);
+    // Gofile's site sends the password's SHA-256, in hex (`get_json` errors never show the URL).
+    if let Some(password) = password {
+        url += &format!("&password={:x}", Sha256::digest(password));
+    }
     let request = http
-        .get(format!("{}/contents/{}?page=1&pageSize=1000&sortField=name&sortDirection=1", api, id))
+        .get(url)
         .header(AUTHORIZATION, format!("Bearer {}", token))
         .header("X-Website-Token", website_token(token, now))
         .header("X-BL", GOFILE_LANGUAGE)
         .header(USER_AGENT, GOFILE_AGENT);
     let answer: GofileAnswer = get_json(request, "Gofile").await?;
-    let locked = "the Gofile folder is protected by a password, which the app cannot enter yet";
+    let locked = match password {
+        None => "the Gofile folder is protected by a password: add its link again with the password on the next line (Password: ...)",
+        Some(_) => "the Gofile folder's password is wrong",
+    };
     match answer.status.as_str() {
         "ok" if answer.data.password_status.as_deref().is_some_and(|s| s != "passwordOk") => Err(locked.to_string()),
         "ok" => Ok(answer.data),
@@ -353,7 +363,7 @@ async fn gofile_contents(http: &reqwest::Client, api: &str, token: &str, id: &st
 
 /// Every file under Gofile's folder `id` (subfolders kept), each a task for its download link.
 /// ponytail: one page of 1000 children per folder; page on when someone shares more.
-async fn gofile_list(http: &reqwest::Client, api: &str, id: &str) -> Result<Vec<Task>, String> {
+async fn gofile_list(http: &reqwest::Client, api: &str, id: &str, password: Option<&str>) -> Result<Vec<Task>, String> {
     let token = gofile_token(http, api).await?;
     let mut queue = VecDeque::from([(id.to_string(), None::<PathBuf>)]);
     let (mut tasks, mut listed) = (Vec::new(), HashSet::new());
@@ -364,7 +374,7 @@ async fn gofile_list(http: &reqwest::Client, api: &str, id: &str) -> Result<Vec<
         if listed.len() > MAX_FOLDERS {
             return Err(format!("the Gofile folder holds more than {} folders: add a subfolder's link instead", MAX_FOLDERS));
         }
-        let item = gofile_contents(http, api, &token, &id).await?;
+        let item = gofile_contents(http, api, &token, &id, password).await?;
         let folder = match folder {
             Some(folder) => folder,
             None => component(&item.name, &id)?,
@@ -658,7 +668,14 @@ mod tests {
                     "c5":{"type":"file","id":"c5","name":"c.bin","link":"https://store2.gofile.io/download/web/c5/c.bin"},
                     "c6":{"type":"folder","id":"root","name":"Loop back"}}}}"#
             }
-            "/contents/locked" => r#"{"status":"ok","data":{"type":"folder","id":"locked","passwordStatus":"passwordRequired"}}"#,
+            "/contents/locked" => match target(head).split_once("&password=") {
+                Some((_, hash)) if hash == format!("{:x}", Sha256::digest("s3cret")) => {
+                    r#"{"status":"ok","data":{"type":"folder","id":"locked","name":"Locked","passwordStatus":"passwordOk","children":{
+                        "c7":{"type":"file","id":"c7","name":"l.bin","link":"https://store3.gofile.io/download/web/c7/l.bin"}}}}"#
+                }
+                Some(_) => r#"{"status":"ok","data":{"type":"folder","id":"locked","passwordStatus":"passwordWrong"}}"#,
+                None => r#"{"status":"ok","data":{"type":"folder","id":"locked","passwordStatus":"passwordRequired"}}"#,
+            },
             "/contents/busy" => r#"{"status":"error-rateLimit","data":{}}"#,
             _ => r#"{"status":"error-notFound","data":{}}"#,
         };
@@ -672,7 +689,7 @@ mod tests {
     async fn gofile_folders_are_listed_with_a_guest_account() {
         let (api, seen) = serve(gofile).await;
         let http = http();
-        let tasks = gofile_list(&http, &api, "root").await.unwrap();
+        let tasks = gofile_list(&http, &api, "root", None).await.unwrap();
         let listed: Vec<_> = tasks.iter().map(|t| (t.folder.clone().unwrap(), t.name.clone().unwrap(), t.urls[0].to_string())).collect();
         assert_eq!(
             listed,
@@ -692,9 +709,24 @@ mod tests {
         let download = with_cookie(http.get(url.clone()), &url).build().unwrap();
         assert_eq!(download.headers().get(COOKIE).unwrap(), "accountToken=guestTok1");
         for (id, said) in [("locked", "password"), ("busy", "try again"), ("gone", "does not exist")] {
-            let err = gofile_list(&http, &api, id).await.unwrap_err();
+            let err = gofile_list(&http, &api, id, None).await.unwrap_err();
             assert!(err.contains(said), "{id}: {err}");
         }
+    }
+
+    /// A folder with a password opens with its SHA-256, as Gofile's site sends it; a wrong one
+    /// is said so. The password itself never goes out.
+    #[tokio::test]
+    async fn gofile_folders_open_with_their_password() {
+        let (api, seen) = serve(gofile).await;
+        let http = http();
+        let tasks = gofile_list(&http, &api, "locked", Some("s3cret")).await.unwrap();
+        let listed: Vec<_> = tasks.iter().map(|t| (t.name.clone().unwrap(), t.urls[0].to_string())).collect();
+        assert_eq!(listed, [("l.bin".into(), "https://store3.gofile.io/download/web/c7/l.bin".to_string())]);
+        assert_eq!(gofile_list(&http, &api, "locked", Some("n0pe")).await.unwrap_err(), "the Gofile folder's password is wrong");
+        let none = gofile_list(&http, &api, "locked", None).await.unwrap_err();
+        assert!(none.contains("Password:"), "{none}");
+        assert!(!seen.lock().unwrap().iter().any(|head| head.contains("s3cret") || head.contains("n0pe")));
     }
 
     fn microsoft(head: &str) -> (u16, String, String) {
@@ -772,7 +804,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn live_gofile_token() {
-        let err = gofile_list(&http(), GOFILE_API, "zzzzzz").await.unwrap_err();
+        let err = gofile_list(&http(), GOFILE_API, "zzzzzz", None).await.unwrap_err();
         assert!(err.contains("does not exist") || err.contains("try again"), "{err}");
     }
 }

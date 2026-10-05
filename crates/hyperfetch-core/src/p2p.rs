@@ -567,7 +567,8 @@ mod tests {
         let seen = tokio::spawn(async move {
             let mut seen = Vec::new();
             while let Ok(snapshot) = rx.recv().await {
-                if snapshot.downloaded_bytes > 0 {
+                // The peer count can trail the first bytes by a snapshot: wait for both.
+                if snapshot.downloaded_bytes > 0 && snapshot.torrent.as_ref().is_some_and(|t| t.peers >= 1) {
                     stop.cancel();
                 }
                 seen.push(snapshot);

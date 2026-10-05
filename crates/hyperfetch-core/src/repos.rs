@@ -3,7 +3,8 @@
 //!
 //! The files download from the service's own host the user typed (github.com, huggingface.co,
 //! civitai.com), so the Authorization header the user gave goes with them there and nowhere
-//! else. The listings are read without it: a private or gated repository cannot be listed.
+//! else. A listing is read with the Authorization a paste gave its link (a `ghp_`/`hf_` token, say), sent
+//! to that service's API alone, so a private or gated repository can be listed; without one it cannot.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -120,15 +121,15 @@ pub fn lists(url: &Url) -> bool {
 }
 
 /// One task per file at `url`, in a folder named after it; a repository's zip.
-pub async fn list(http: &reqwest::Client, url: &Url) -> Result<Vec<Task>, String> {
+pub async fn list(http: &reqwest::Client, url: &Url, auth: Option<&str>) -> Result<Vec<Task>, String> {
     let tasks = match repo_of(url) {
         Some(Repo::GitHubRoot { owner, repo }) => {
             vec![Task { urls: vec![zip_of(&owner, &repo)?], name: Some(component(&format!("{repo}.zip"), "repository.zip")?), ..Task::default() }]
         }
-        Some(Repo::GitHubTree { owner, repo, rest }) => github_tree(http, GITHUB_API, &owner, &repo, &rest).await?,
-        Some(Repo::GitHubRelease { owner, repo, tag }) => github_release(http, GITHUB_API, &owner, &repo, tag.as_deref()).await?,
-        Some(Repo::HuggingFace { kind, repo, rev, path }) => hugging_face(http, HUGGING_FACE, kind, &repo, &rev, &path).await?,
-        Some(Repo::Civitai { model, version }) => civitai(http, CIVITAI, model, version).await?,
+        Some(Repo::GitHubTree { owner, repo, rest }) => github_tree(http, auth, GITHUB_API, &owner, &repo, &rest).await?,
+        Some(Repo::GitHubRelease { owner, repo, tag }) => github_release(http, auth, GITHUB_API, &owner, &repo, tag.as_deref()).await?,
+        Some(Repo::HuggingFace { kind, repo, rev, path }) => hugging_face(http, auth, HUGGING_FACE, kind, &repo, &rev, &path).await?,
+        Some(Repo::Civitai { model, version }) => civitai(http, auth, CIVITAI, model, version).await?,
         None => return Err(format!("{} is not a repository, folder, release or model link", url)),
     };
     if tasks.is_empty() {
@@ -188,7 +189,15 @@ fn checksum(algo: &str, hex: &str) -> Option<String> {
 }
 
 /// What `request` to `service` answers when it succeeds; None when there is no such thing (404).
-async fn fetch(request: RequestBuilder, service: &str) -> Result<Option<Response>, String> {
+async fn fetch(request: RequestBuilder, auth: Option<&str>, service: &str) -> Result<Option<Response>, String> {
+    let auth = auth.and_then(|v| reqwest::header::HeaderValue::from_str(v).ok()).map(|mut v| {
+        v.set_sensitive(true);
+        v
+    });
+    let request = match auth {
+        Some(v) => request.header(reqwest::header::AUTHORIZATION, v),
+        None => request,
+    };
     let answer = request.send().await.map_err(|e| format!("Cannot reach {}: {}", service, e))?;
     let status = answer.status();
     let number = |name: &str| answer.headers().get(name).and_then(|v| v.to_str().ok()).and_then(|v| v.trim().parse::<u64>().ok());
@@ -240,13 +249,13 @@ struct GitEntry {
 /// Every file under the folder `rest` (its ref, then its path) names in GitHub's `owner`/`repo`,
 /// subfolders kept, each a task for its /raw/ link (which serves Git LFS files too). The ref is
 /// the shortest start of `rest` GitHub knows.
-async fn github_tree(http: &reqwest::Client, api: &str, owner: &str, repo: &str, rest: &[String]) -> Result<Vec<Task>, String> {
+async fn github_tree(http: &reqwest::Client, auth: Option<&str>, api: &str, owner: &str, repo: &str, rest: &[String]) -> Result<Vec<Task>, String> {
     for parts in 1..=rest.len().min(MAX_REF_PARTS) {
         let (git_ref, path) = (rest[..parts].join("/"), &rest[parts..]);
         let tree_ish = if path.is_empty() { git_ref.clone() } else { format!("{}:{}", git_ref, path.join("/")) };
         let mut url = url_at(api, ["repos", owner, repo, "git", "trees", &tree_ish])?;
         url.set_query(Some("recursive=1"));
-        let Some(answer) = fetch(http.get(url), "GitHub").await? else { continue };
+        let Some(answer) = fetch(http.get(url), auth, "GitHub").await? else { continue };
         let tree: GitTree = json(answer, "GitHub").await?;
         if tree.truncated {
             return Err("the folder holds more files than GitHub lists at once: add the links of its subfolders instead".to_string());
@@ -282,12 +291,12 @@ struct Asset {
 }
 
 /// Every file of the release `tag` (None the latest) of GitHub's `owner`/`repo`.
-async fn github_release(http: &reqwest::Client, api: &str, owner: &str, repo: &str, tag: Option<&str>) -> Result<Vec<Task>, String> {
+async fn github_release(http: &reqwest::Client, auth: Option<&str>, api: &str, owner: &str, repo: &str, tag: Option<&str>) -> Result<Vec<Task>, String> {
     let url = match tag {
         Some(tag) => url_at(api, ["repos", owner, repo, "releases", "tags", tag])?,
         None => url_at(api, ["repos", owner, repo, "releases", "latest"])?,
     };
-    let Some(answer) = fetch(http.get(url), "GitHub").await? else {
+    let Some(answer) = fetch(http.get(url), auth, "GitHub").await? else {
         return Err(format!("{}/{} has no such release on GitHub (or the repository is private)", owner, repo));
     };
     let release: Release = json(answer, "GitHub").await?;
@@ -342,7 +351,7 @@ fn next_page(answer: &Response, base: &str) -> Option<Url> {
 
 /// Every file under `path` at revision `rev` of the Hugging Face repository `repo` of `kind`,
 /// subfolders kept, each a task for its /resolve/ link with its size and (Git LFS files) SHA-256.
-async fn hugging_face(http: &reqwest::Client, base: &str, kind: &str, repo: &str, rev: &str, path: &[String]) -> Result<Vec<Task>, String> {
+async fn hugging_face(http: &reqwest::Client, auth: Option<&str>, base: &str, kind: &str, repo: &str, rev: &str, path: &[String]) -> Result<Vec<Task>, String> {
     let path: Vec<&str> = path.iter().map(String::as_str).collect();
     let mut page = url_at(base, ["api", kind].into_iter().chain(repo.split('/')).chain(["tree", rev]).chain(path.iter().copied()))?;
     page.set_query(Some("recursive=true"));
@@ -353,7 +362,7 @@ async fn hugging_face(http: &reqwest::Client, base: &str, kind: &str, repo: &str
     let folder = component(path.last().copied().unwrap_or(name), name)?;
     let mut tasks = Vec::new();
     for _ in 0..MAX_PAGES {
-        let Some(answer) = fetch(http.get(page.clone()), "Hugging Face").await? else {
+        let Some(answer) = fetch(http.get(page.clone()), auth, "Hugging Face").await? else {
             return Err(format!("Hugging Face has no such folder at {} in {} (or the repository is private or gated)", rev, repo));
         };
         let next = next_page(&answer, base);
@@ -404,9 +413,9 @@ struct ModelFile {
 }
 
 /// Every file of the version `version` (None the newest) of Civitai's model `model`.
-async fn civitai(http: &reqwest::Client, api: &str, model: u64, version: Option<u64>) -> Result<Vec<Task>, String> {
+async fn civitai(http: &reqwest::Client, auth: Option<&str>, api: &str, model: u64, version: Option<u64>) -> Result<Vec<Task>, String> {
     let url = url_at(api, ["api", "v1", "models", &model.to_string()])?;
-    let Some(answer) = fetch(http.get(url), "Civitai").await? else {
+    let Some(answer) = fetch(http.get(url), auth, "Civitai").await? else {
         return Err(format!("Civitai has no model {}", model));
     };
     let found: Model = json(answer, "Civitai").await?;
@@ -506,7 +515,7 @@ mod tests {
     async fn a_repository_is_its_default_branchs_zip() {
         let root = Url::parse("https://github.com/o/My%20Repo").unwrap();
         let zip = "https://github.com/o/My%20Repo/archive/HEAD.zip";
-        let tasks = list(&http(), &root).await.unwrap();
+        let tasks = list(&http(), &root, None).await.unwrap();
         assert_eq!(tasks, [Task { urls: vec![Url::parse(zip).unwrap()], name: Some("My Repo.zip".into()), ..Task::default() }]);
         assert_eq!(resolve(&http(), &root, None).await.unwrap()[0].as_str(), zip);
         let tree = Url::parse("https://github.com/o/r/tree/main").unwrap();
@@ -553,7 +562,7 @@ mod tests {
     async fn github_folders_are_listed_with_their_ref() {
         let (addr, hits) = serve(github).await;
         let api = format!("http://{addr}");
-        let tasks = github_tree(&http(), &api, "o", "r", &strings(&["feature", "x", "docs"])).await.unwrap();
+        let tasks = github_tree(&http(), None, &api, "o", "r", &strings(&["feature", "x", "docs"])).await.unwrap();
         let listed: Vec<_> = tasks.iter().map(|t| (t.urls[0].to_string(), t.name.clone().unwrap(), t.size)).collect();
         assert_eq!(
             listed,
@@ -565,11 +574,11 @@ mod tests {
         assert!(tasks.iter().all(|t| t.folder == Some("docs".into()) && !t.from_document));
         // "feature" was tried first.
         assert_eq!(hits.lock().get("/repos/o/r/git/trees/feature:x%2Fdocs?recursive=1"), Some(&1));
-        let err = github_tree(&http(), &api, "o", "big", &strings(&["main"])).await.unwrap_err();
+        let err = github_tree(&http(), None, &api, "o", "big", &strings(&["main"])).await.unwrap_err();
         assert!(err.contains("subfolders"), "{err}");
-        let err = github_tree(&http(), &api, "o", "busy", &strings(&["main"])).await.unwrap_err();
+        let err = github_tree(&http(), None, &api, "o", "busy", &strings(&["main"])).await.unwrap_err();
         assert!(err.contains("60 requests an hour") && err.contains("in 10 minutes"), "{err}");
-        let err = github_tree(&http(), &api, "o", "r", &strings(&["nope", "docs"])).await.unwrap_err();
+        let err = github_tree(&http(), None, &api, "o", "r", &strings(&["nope", "docs"])).await.unwrap_err();
         assert!(err.contains("no such folder in o/r"), "{err}");
     }
 
@@ -579,13 +588,13 @@ mod tests {
     async fn github_releases_list_their_assets() {
         let (addr, _) = serve(github).await;
         let api = format!("http://{addr}");
-        let tasks = github_release(&http(), &api, "o", "r", None).await.unwrap();
+        let tasks = github_release(&http(), None, &api, "o", "r", None).await.unwrap();
         let sha = "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824".to_string();
         let listed: Vec<_> = tasks.iter().map(|t| (t.name.clone().unwrap(), t.checksum.clone(), t.from_document)).collect();
         assert_eq!(listed, [(PathBuf::from("app.zip"), Some(sha), false), (PathBuf::from("mirror.zip"), None, true)]);
         assert!(tasks.iter().all(|t| t.folder == Some("r v2.0".into())));
-        assert!(github_release(&http(), &api, "o", "r", Some("empty")).await.unwrap_err().contains("source code"));
-        assert!(github_release(&http(), &api, "o", "r", Some("gone")).await.unwrap_err().contains("no such release"));
+        assert!(github_release(&http(), None, &api, "o", "r", Some("empty")).await.unwrap_err().contains("source code"));
+        assert!(github_release(&http(), None, &api, "o", "r", Some("gone")).await.unwrap_err().contains("no such release"));
     }
 
     fn hugging(path: &str, _: Option<crate::range::ByteRange>) -> Reply {
@@ -618,7 +627,7 @@ mod tests {
     async fn hugging_face_folders_are_listed_page_by_page() {
         let (addr, hits) = serve(hugging).await;
         let base = format!("http://{addr}");
-        let tasks = hugging_face(&http(), &base, "datasets", "o/d", "main", &strings(&["sub"])).await.unwrap();
+        let tasks = hugging_face(&http(), None, &base, "datasets", "o/d", "main", &strings(&["sub"])).await.unwrap();
         let listed: Vec<_> = tasks.iter().map(|t| (t.urls[0].to_string(), t.name.clone().unwrap(), t.checksum.clone())).collect();
         let sha = "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824".to_string();
         assert_eq!(
@@ -632,7 +641,7 @@ mod tests {
         assert_eq!(hits.lock().len(), 2, "the page on another host was not asked for");
         let say = |repo: &'static str| {
             let base = base.clone();
-            async move { hugging_face(&http(), &base, "models", repo, "main", &[]).await.unwrap_err() }
+            async move { hugging_face(&http(), None, &base, "models", repo, "main", &[]).await.unwrap_err() }
         };
         assert!(say("o/gated").await.contains("private or gated"));
         assert!(say("o/busy").await.contains("limiting requests"));
@@ -659,22 +668,42 @@ mod tests {
     async fn civitai_models_list_a_versions_files() {
         let (addr, _) = serve(civitai_api).await;
         let api = format!("http://{addr}");
-        let newest = civitai(&http(), &api, 7, None).await.unwrap();
+        let newest = civitai(&http(), None, &api, 7, None).await.unwrap();
         let sha = "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824".to_string();
         assert_eq!(newest.len(), 1);
         assert_eq!(newest[0].urls[0].as_str(), "https://civitai.com/api/download/models/2?fileId=20");
         assert_eq!((newest[0].checksum.clone(), newest[0].from_document), (Some(sha), false));
         assert_eq!(newest[0].folder, Some("Model_ X v2".into()));
-        let v1 = civitai(&http(), &api, 7, Some(1)).await.unwrap();
+        let v1 = civitai(&http(), None, &api, 7, Some(1)).await.unwrap();
         let listed: Vec<_> = v1.iter().map(|t| (t.name.clone().unwrap(), t.from_document)).collect();
         assert_eq!(listed, [(PathBuf::from("x-v1.safetensors"), false), (PathBuf::from("11"), true)]);
-        assert!(civitai(&http(), &api, 7, Some(9)).await.unwrap_err().contains("no such version"));
-        assert!(civitai(&http(), &api, 8, None).await.unwrap_err().contains("no model 8"));
+        assert!(civitai(&http(), None, &api, 7, Some(9)).await.unwrap_err().contains("no such version"));
+        assert!(civitai(&http(), None, &api, 8, None).await.unwrap_err().contains("no model 8"));
+    }
+
+    /// A token pasted with the link goes to the service's API with the listing.
+    #[tokio::test]
+    async fn a_pasted_token_goes_with_the_listing() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 8192];
+            let n = socket.read(&mut request).await.unwrap();
+            let body = br#"{"name":"M","modelVersions":[{"id":2,"name":"v2","files":[{"id":20,"name":"m.bin","downloadUrl":"https://civitai.com/api/download/models/2?fileId=20"}]}]}"#;
+            let head = format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
+            socket.write_all(head.as_bytes()).await.unwrap();
+            socket.write_all(body).await.unwrap();
+            String::from_utf8_lossy(&request[..n]).to_ascii_lowercase()
+        });
+        assert_eq!(civitai(&http(), Some("Bearer t0ken"), &api, 7, None).await.unwrap().len(), 1);
+        assert!(server.await.unwrap().contains("authorization: bearer t0ken"));
     }
 
     /// What `link` lists, through the client the front ends list with (GitHub wants its user agent).
     async fn live(link: &str) -> Result<Vec<Task>, String> {
-        list(&crate::ingest::descriptor_client(None).unwrap(), &Url::parse(link).unwrap()).await
+        list(&crate::ingest::descriptor_client(None).unwrap(), &Url::parse(link).unwrap(), None).await
     }
 
     /// Live: a small public GitHub folder lists its files.
