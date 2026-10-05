@@ -17,7 +17,7 @@ use thiserror::Error;
 use crate::engine::EngineSnapshot;
 use crate::range::ByteRange;
 use crate::storage::{FileDigest, StreamHasher};
-use crate::worker::{authorize, Auth, RateLimiter};
+use crate::worker::{authorize, send, Auth, RateLimiter};
 
 const MAX_CONNECTIONS: usize = 64;
 /// Segments fetched or held ahead of the next one to write, per connection: a slow segment leaves
@@ -771,11 +771,14 @@ async fn fetch_once(
 ) -> Result<(Vec<u8>, Url), FetchError> {
     let _slot = crate::hosts::acquire(url, fetch.host_limit).await;
     let stall = fetch.stall_timeout;
-    let mut req = authorize(client.get(url.clone()), auth, url);
-    if let Some(r) = range {
-        req = req.header(reqwest::header::RANGE, r.to_http_header());
-    }
-    let mut resp = tokio::time::timeout(stall, req.send())
+    let req = |url: &Url| {
+        let req = authorize(client.get(url.clone()), auth, url);
+        match range {
+            Some(r) => req.header(reqwest::header::RANGE, r.to_http_header()),
+            None => req,
+        }
+    };
+    let mut resp = tokio::time::timeout(stall, send(req, url))
         .await
         .map_err(|_| FetchError::retryable("timed out waiting for a response"))?
         .map_err(FetchError::retryable)?;

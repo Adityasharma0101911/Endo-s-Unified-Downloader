@@ -2,14 +2,31 @@ use super::*;
 
 use super::queue::download_details;
 
-/// Adds `link` to the queue as a link from the clipboard, which the form's checksum and
-/// Authorization header don't apply to. A link to read first (a .torrent, playlist, folder) is
-/// read.
-pub(super) fn add_link(app: &mut App, link: &str) {
-    if ingest::needs_reading(link) {
-        app.read_document(link.to_string(), Origin::Dropped, String::new(), String::new());
-    } else {
-        app.notice = Some(app.add_download(link, "", "").map(|id| format!("Added #{} to the queue", id)));
+/// Adds the links of `text` from the clipboard to the queue, which the form's checksum and
+/// Authorization header don't apply to: a paste with secrets or a copied request as
+/// `App::add_pasted` does, else each line as one download. A link to read first (a .torrent,
+/// playlist, folder) is read.
+pub(super) fn add_link(app: &mut App, text: &str) {
+    match app.add_pasted(text, "", "", Origin::Dropped) {
+        Some(Ok((ids, _))) if ids.is_empty() => return,
+        Some(added) => {
+            app.notice = Some(added.map(|(ids, notes)| {
+                let added = match &ids[..] {
+                    [id] => format!("Added #{} to the queue", id),
+                    _ => format!("Added {} downloads to the queue", ids.len()),
+                };
+                std::iter::once(added).chain(notes).collect::<Vec<_>>().join("\n")
+            }));
+            return;
+        }
+        None => {}
+    }
+    for link in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if ingest::needs_reading(link) {
+            app.read_document(link.to_string(), Origin::Dropped, String::new(), String::new());
+        } else {
+            app.notice = Some(app.add_download(link, "", "").map(|id| format!("Added #{} to the queue", id)));
+        }
     }
 }
 
@@ -116,9 +133,9 @@ pub(super) fn update_banner(app: &mut App, ui: &mut Ui) {
 }
 
 pub(super) fn clipboard_banner(app: &mut App, ui: &mut Ui) {
-    fading(ui, "clipboard", app.clipboard_banner.clone(), |ui, link| {
+    fading(ui, "clipboard", app.clipboard_banner.clone(), |ui, (shown, link)| {
         let p = palette(ui);
-        let text = RichText::new(format!("Copied link: {}", truncate_chars(&link, 55))).color(p.text);
+        let text = RichText::new(format!("Copied link: {}", truncate_chars(&shown, 55))).color(p.text);
         banner(ui, p.accent, icon::CLIPBOARD_TEXT, text, |ui| {
             if icon_button(ui, icon::X, "Dismiss", true).clicked() {
                 app.clipboard_banner = None;
@@ -138,7 +155,7 @@ pub(super) fn clipboard_banner(app: &mut App, ui: &mut Ui) {
                 app.download_now(&link, "", "");
             }
         })
-        .on_hover_text(&link);
+        .on_hover_text(&shown);
     });
 }
 
@@ -211,7 +228,7 @@ pub(super) fn drop_zone(ctx: &egui::Context) {
     painter.rect(zone, 14.0, p.accent.gamma_multiply(0.06 * shown), edge);
     let center = zone.center() - Vec2::new(0.0, 22.0 + 6.0 * pulse);
     anim::paint_icon(&painter, center, icon::FILE_ARROW_DOWN, 52.0, p.accent.gamma_multiply(shown), 0.0);
-    let text = "Drop .torrent, .metalink or .meta4 files to add every file they list";
+    let text = "Drop .torrent, .metalink, .meta4 or .txt files to add every file they list";
     painter.text(zone.center() + Vec2::new(0.0, 22.0), Align2::CENTER_TOP, text, FontId::proportional(15.0), p.text.gamma_multiply(shown));
 }
 
@@ -516,6 +533,38 @@ mod tests {
         h.app.queue.remove_item(first);
         h.frames(1);
         assert_eq!(just_added(&h.app, &h.app.ctx), 1.0);
+    }
+
+    /// A link pasted into the form with its password starts with it: one download, a note naming
+    /// what it uses, the form cleared, the password shown nowhere. Ctrl+V outside the form queues
+    /// a copied link with its password the same way.
+    #[test]
+    fn a_pasted_password_is_used_and_never_shown() {
+        const SECRET: &str = "xq9-hunter2";
+        let mut h = Harness::new();
+        h.app.engines = std::sync::Arc::new(|_, _| Err("not downloaded here".to_string()));
+        assert!(h.settle());
+        let input = h.app.ctx.read_response(egui::Id::new("url_input")).unwrap().rect;
+        h.click_at(input.center());
+        h.paste(&format!("https://h.example/f.zip\nPassword: {SECRET}"));
+        assert!(h.app.url_input.contains(SECRET), "typed into the form");
+        h.click("Download");
+        h.frames(2);
+        let items = h.app.queue.items();
+        assert_eq!((items.len(), items[0].options.password.as_deref()), (1, Some(SECRET)));
+        assert_eq!(h.app.url_input, "", "the form clears");
+        h.settle();
+        assert!(h.texts().iter().any(|(text, _)| text.contains("Using the password from your paste for h.example")), "{:?}", h.app.notice);
+        assert!(h.texts().iter().all(|(text, _)| !text.contains(SECRET)));
+
+        h.click("New download");
+        h.key(egui::Key::Escape, egui::Modifiers::NONE);
+        h.paste(&format!("https://g.example/g.zip pw: {SECRET}"));
+        let last = h.app.queue.items().last().unwrap();
+        assert_eq!((last.urls[0].as_str(), last.options.password.as_deref()), ("https://g.example/g.zip", Some(SECRET)));
+        h.settle();
+        assert!(h.texts().iter().any(|(text, _)| text.contains("Using the password from your paste for g.example")), "{:?}", h.app.notice);
+        assert!(h.texts().iter().all(|(text, _)| !text.contains(SECRET)));
     }
 
     /// A notice opens its room over a few frames, pushing the card under it down smoothly; once
