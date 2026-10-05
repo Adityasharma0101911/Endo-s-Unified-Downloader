@@ -125,6 +125,9 @@ pub struct Settings {
     pub virustotal_check: bool,
     /// 0 follows the system, 1 dark, 2 light.
     pub theme: usize,
+    /// Instant transitions and nothing moving by itself; None follows the system (see
+    /// [`Settings::reduces_motion`]).
+    pub reduce_motion: Option<bool>,
 }
 
 impl Default for Settings {
@@ -177,6 +180,7 @@ impl Default for Settings {
             virustotal_api_key: String::new(),
             virustotal_check: false,
             theme: 0,
+            reduce_motion: None,
         }
     }
 }
@@ -330,6 +334,11 @@ impl Settings {
         }
     }
 
+    /// Whether to reduce motion: as set, else as the system's animation setting says.
+    pub fn reduces_motion(&self) -> bool {
+        self.reduce_motion.unwrap_or_else(system_reduces_motion)
+    }
+
     /// The engine settings shared by every download and repair: connections, speed limit,
     /// retries, timeouts, disk flushing and the per-host connection budget.
     pub fn tuning(&self) -> DownloadOptions {
@@ -364,6 +373,22 @@ impl Settings {
 
 fn non_empty(s: &str) -> Option<String> {
     Some(s.trim()).filter(|s| !s.is_empty()).map(str::to_string)
+}
+
+/// Whether Windows' "Animation effects" (Show animations in Windows) is off; asked each time,
+/// so that switching it applies at once. Elsewhere animations stay on.
+#[cfg(windows)]
+fn system_reduces_motion() -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SystemParametersInfoW, SPI_GETCLIENTAREAANIMATION};
+    let mut on = 1;
+    // SAFETY: this action writes one BOOL to the pointer given, which points at one.
+    let ok = unsafe { SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &mut on as *mut i32 as *mut std::ffi::c_void, 0) };
+    ok != 0 && on == 0
+}
+
+#[cfg(not(windows))]
+fn system_reduces_motion() -> bool {
+    false
 }
 
 /// Bytes per second for a limit given in KB/s or MB/s; `None` (unlimited) for zero or less.
@@ -576,6 +601,19 @@ mod tests {
         let older: Settings = serde_json::from_str(r#"{"google_api_key": "AIzaOld"}"#).unwrap();
         assert_eq!(older.google_api_key, "AIzaOld");
         assert!(!serde_json::to_string(&older).unwrap().contains("AIzaOld"));
+    }
+
+    /// Reduce motion follows the system until set, also in settings an older version saved.
+    #[test]
+    fn reduce_motion_follows_the_system_until_set() {
+        let saved: Settings = serde_json::from_str(r#"{"theme": 1}"#).unwrap();
+        assert_eq!(saved.reduce_motion, None);
+        assert_eq!(saved.reduces_motion(), system_reduces_motion());
+        for on in [false, true] {
+            let chosen = Settings { reduce_motion: Some(on), ..Settings::default() };
+            assert_eq!(chosen.reduces_motion(), on);
+            assert_eq!(serde_json::from_str::<Settings>(&serde_json::to_string(&chosen).unwrap()).unwrap(), chosen);
+        }
     }
 
     #[test]

@@ -2302,6 +2302,7 @@ dependencies = [
  "eframe",
  "egui-phosphor",
  "hyperfetch-core",
+ "image",
  "rfd",
  "serde",
  "serde_json",

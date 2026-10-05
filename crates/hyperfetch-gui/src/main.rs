@@ -257,12 +257,6 @@ struct App {
     /// ffmpeg may be installed and none is found: they start once the user answers.
     ffmpeg_waiting: Vec<(usize, bool)>,
 
-    anim_job: Option<usize>,
-    anim_progress: f64,
-    anim_speed: f64,
-    last_frame: Instant,
-    pulse_phase: f32,
-
     history: Vec<HistoryEntry>,
     /// Serializes history operations and counts them in the order they run.
     history_sequence: Arc<Mutex<u64>>,
@@ -360,11 +354,6 @@ impl App {
             selected: None,
             ffmpeg_found: None,
             ffmpeg_waiting: Vec::new(),
-            anim_job: None,
-            anim_progress: 0.0,
-            anim_speed: 0.0,
-            last_frame: Instant::now(),
-            pulse_phase: 0.0,
             history: Vec::new(),
             history_sequence: Arc::new(Mutex::new(0)),
             history_applied: 0,
@@ -1257,35 +1246,6 @@ impl App {
             AppEvent::UpdateInstalled(updater::install(proxy.as_deref(), &update, updater::Program::Gui).await)
         }));
     }
-
-
-    /// Eases the displayed progress and speed of the shown download; true while still moving.
-    fn animate(&mut self) -> bool {
-        let now = Instant::now();
-        let dt = now.duration_since(self.last_frame).as_secs_f64().clamp(0.001, 0.1);
-        self.last_frame = now;
-        self.pulse_phase = (self.pulse_phase + dt as f32 * 3.5) % std::f32::consts::TAU;
-
-        let (progress, speed) = self
-            .focused_item()
-            .map_or((0.0, 0.0), |item| (item.progress_ratio, item.speed_bytes_per_sec));
-        if self.anim_job != self.focused {
-            self.anim_job = self.focused;
-            self.anim_progress = progress;
-            self.anim_speed = speed;
-        }
-        self.anim_speed += (speed - self.anim_speed) * (dt * 8.0).min(1.0);
-        self.anim_progress += (progress - self.anim_progress) * (dt * 10.0).min(1.0);
-        let speed_settled = (speed - self.anim_speed).abs() < 1.0;
-        let progress_settled = (progress - self.anim_progress).abs() < 1e-4;
-        if speed_settled {
-            self.anim_speed = speed;
-        }
-        if progress_settled {
-            self.anim_progress = progress;
-        }
-        !(speed_settled && progress_settled)
-    }
 }
 
 impl eframe::App for App {
@@ -1308,7 +1268,6 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         self.run_scheduler();
-        let animating = self.animate();
 
         ui::render(self, ctx);
 
@@ -1321,11 +1280,9 @@ impl eframe::App for App {
                 saver.save(self.queue.clone());
             }
         }
-        // Background work wakes the UI when it has news; otherwise only animations and the
-        // once-a-second clocks (elapsed time, stall timer) need frames.
-        if animating {
-            ctx.request_repaint();
-        } else if self.queue.active_count() > 0 || self.verifying || self.repair.is_some() {
+        // Background work wakes the UI when it has news, and animations ask for their own frames;
+        // otherwise only the once-a-second clocks (elapsed time, stall timer) need frames.
+        if self.queue.active_count() > 0 || self.verifying || self.repair.is_some() {
             ctx.request_repaint_after(Duration::from_secs(1));
         }
     }
@@ -1953,7 +1910,7 @@ mod tests {
 
     /// Points download history at a file of this test process, once for every test, so no test
     /// touches the user's history or switches the file while another runs.
-    fn isolate_history() {
+    pub(crate) fn isolate_history() {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
             let path = std::env::temp_dir().join(format!("hf-gui-test-history-{}.json", std::process::id()));
