@@ -7701,7 +7701,8 @@ bbd8671c6c05eaa3ec29d690695aebadff0871faa3efe9051581afbf3c01e80e  ffmpeg-master-
         // is taken as it is, and its size reported, not fetched again into "clip... (1).mp4".
         let (again, mut rx) = fetch("2");
         assert_eq!(again.await, Ok(path.clone()));
-        assert_eq!(hits.lock().values().sum::<usize>(), requests, "{:?}", hits.lock());
+        let now = hits.lock().clone();
+        assert_eq!(now.values().sum::<usize>(), requests, "{now:?}");
         assert_eq!(rx.try_recv().map(|s| (s.downloaded_bytes, s.total_bytes)).ok(), Some((1500, 1500)));
         assert_eq!(names_in(dir.path()), ["clip.fhls-audio.hf.mp4"]);
 
