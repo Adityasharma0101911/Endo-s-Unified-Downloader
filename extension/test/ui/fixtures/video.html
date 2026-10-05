@@ -1,0 +1,22 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Fixture player</title>
+<h1>Fixture player</h1>
+<p>A &lt;video&gt; fed by a canvas stream (blob-like, nothing to fetch), for Record playback.</p>
+<video id="v" width="320" height="180" muted autoplay playsinline></video>
+<script>
+  const canvas = Object.assign(document.createElement("canvas"), { width: 320, height: 180 });
+  const g = canvas.getContext("2d");
+  let n = 0;
+  // A timer, not requestAnimationFrame: it keeps drawing in a background tab.
+  setInterval(() => {
+    g.fillStyle = `hsl(${(n += 7) % 360} 60% 40%)`;
+    g.fillRect(0, 0, 320, 180);
+    g.fillStyle = "#fff";
+    g.font = "28px sans-serif";
+    g.fillText(`frame ${n / 7}`, 90, 100);
+  }, 66);
+  const v = document.getElementById("v");
+  v.srcObject = canvas.captureStream(15);
+  v.play().catch(() => {});
+</script>
