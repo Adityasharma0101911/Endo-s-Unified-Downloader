@@ -1,0 +1,10 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Fixture stream</title>
+<h1>Fixture stream</h1>
+<p>Fetches the playlist, manifest or file named by <code>?src=</code> with an <code>X-Token</code> header, as a player would.</p>
+<script>
+  const q = new URLSearchParams(location.search);
+  document.title = q.get("title") || "Fixture stream";
+  fetch(q.get("src"), { headers: { "X-Token": "abc" } }).then((r) => r.arrayBuffer());
+</script>

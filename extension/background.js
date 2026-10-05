@@ -831,6 +831,8 @@ const POPUP_COMMANDS = {
         done: rec.done ?? null,
         total: rec.total ?? null,
         error: rec.failed ? rec.error : null,
+        // When it began, for the elapsed time and average speed the popup shows.
+        started: rec.started ?? null,
       }));
     const items = Object.values(state.items).sort((a, b) => b.time - a.time);
     return { items, app, recordings, settings, armed: Boolean(state.armed), hostAccess };
