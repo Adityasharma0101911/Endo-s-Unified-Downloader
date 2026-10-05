@@ -484,8 +484,8 @@ fn shortcuts(app: &mut App, ctx: &egui::Context) {
     if let Some(tab) = page {
         go(app, tab);
     }
-    for line in pasted.as_deref().unwrap_or_default().lines().map(str::trim).filter(|l| !l.is_empty()) {
-        add_link(app, line);
+    if let Some(text) = pasted {
+        add_link(app, &text);
     }
     if let Some(id) = app.selected.filter(|_| delete && app.tab == Tab::Queue) {
         if app.queue.get_item(id).is_some_and(|item| item.status.is_active()) {

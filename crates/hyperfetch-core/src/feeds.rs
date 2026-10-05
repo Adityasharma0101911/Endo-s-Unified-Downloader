@@ -84,7 +84,7 @@ pub async fn list(http: &reqwest::Client, url: &Url, options: &ListOptions) -> O
     if let Some(apple) = AppleLink::of(url) {
         return apple.list(http, LOOKUP_API, options).await;
     }
-    match read_feed(http, url, feed_shape(url) == Some(true)).await {
+    match read_feed(options.get(http, url), url, feed_shape(url) == Some(true)).await {
         Ok(Some(feed)) if !feed.episodes.is_empty() => Some(show_tasks(feed, options).await),
         Ok(Some(_)) => {
             tracing::info!("{} is a feed without audio or video: it is downloaded as it is", redact_url(url.as_str()));
@@ -95,10 +95,11 @@ pub async fn list(http: &reqwest::Client, url: &Url, options: &ListOptions) -> O
     }
 }
 
-/// The feed at `url`; None when it answers with a client error or is no RSS or Atom feed, and
-/// unless `sure` it is one, when its host cannot be reached or is busy (see [`fetch`]).
-async fn read_feed(http: &reqwest::Client, url: &Url, sure: bool) -> Result<Option<Feed>, String> {
-    let Some(Fetched { body, base, charset }) = fetch(http, url, true, sure).await? else { return Ok(None) };
+/// The feed `request` gets from `url`; None when it answers with a client error or is no RSS or
+/// Atom feed, and unless `sure` it is one, when its host cannot be reached or is busy (see
+/// [`fetch`]).
+async fn read_feed(request: reqwest::RequestBuilder, url: &Url, sure: bool) -> Result<Option<Feed>, String> {
+    let Some(Fetched { body, base, charset }) = fetch(request, url, true, sure).await? else { return Ok(None) };
     let feed = parse_feed(&decode_feed(&body, charset.as_deref()), &base).transpose()?;
     Ok(feed.map(|feed| Feed { source: redact_url(url.as_str()), ..feed }))
 }
@@ -149,14 +150,14 @@ fn windows_1252(byte: u8) -> char {
     }
 }
 
-/// The body at `url` and where it came from (after redirects), at most [`MAX_FEED_BYTES`]; None
-/// when its host answers with a client error (a login, an expired private feed), which the
-/// engine is left to report. With `feed`, also None when its first element is no `<rss>` or
+/// The body `request` gets from `url` and where it came from (after redirects), at most
+/// [`MAX_FEED_BYTES`]; None when its host answers with a client error (a login, an expired
+/// private feed), which the engine is left to report. With `feed`, also None when its first element is no `<rss>` or
 /// `<feed>`, or it is too large to tell and not labelled a feed. An unreachable host, a
 /// timeout, a rate limit and a server error are errors, to retry, when the link is `sure` to
 /// be what is wanted; else None, and the engine downloads the link, retrying as it does. The
 /// link is redacted in errors: a private feed's token is in it.
-async fn fetch(http: &reqwest::Client, url: &Url, feed: bool, sure: bool) -> Result<Option<Fetched>, String> {
+async fn fetch(mut request: reqwest::RequestBuilder, url: &Url, feed: bool, sure: bool) -> Result<Option<Fetched>, String> {
     use reqwest::header::{ACCEPT, CONTENT_TYPE};
     use reqwest::StatusCode;
     let fail = |e: reqwest::Error| {
@@ -167,7 +168,6 @@ async fn fetch(http: &reqwest::Client, url: &Url, feed: bool, sure: bool) -> Res
         tracing::info!("{}: the link is downloaded as it is", error);
         Ok(None)
     };
-    let mut request = http.get(url.clone());
     if feed {
         request = request.header(ACCEPT, "application/rss+xml, application/atom+xml, application/xml;q=0.9, text/xml;q=0.9, */*;q=0.8");
     }
@@ -741,7 +741,7 @@ impl AppleLink {
         };
         match (&lookup.feed, self.episode) {
             (Some(feed_url), None) => {
-                let feed = match read_feed(http, feed_url, true).await {
+                let feed = match read_feed(http.get(feed_url.clone()), feed_url, true).await {
                     Ok(Some(feed)) => feed,
                     Ok(None) => return Some(Err(format!("The show's feed ({}) is not a podcast feed", redact_url(feed_url.as_str())))),
                     Err(e) => return Some(Err(e)),
@@ -753,7 +753,7 @@ impl AppleLink {
             }
             (Some(feed_url), Some(track)) => {
                 let wanted = lookup.episodes.iter().find(|e| e.track == Some(track))?;
-                let feed = match read_feed(http, feed_url, true).await {
+                let feed = match read_feed(http.get(feed_url.clone()), feed_url, true).await {
                     Ok(Some(feed)) => feed,
                     Ok(None) => return None,
                     Err(e) => return Some(Err(e)),
@@ -803,7 +803,7 @@ impl AppleLink {
             query.push(("country", country.clone()));
         }
         let url = Url::parse_with_params(api, &query).map_err(|e| e.to_string())?;
-        match fetch(http, &url, false, true).await? {
+        match fetch(http.get(url.clone()), &url, false, true).await? {
             Some(answer) => read_lookup(&answer.body, self.show),
             None => Err(format!("Apple Podcasts refused to look up show {}; try again later", self.show)),
         }
@@ -1564,6 +1564,6 @@ mod tests {
             socket.write_all(&[head.as_bytes(), rss].concat()).await.unwrap();
         });
         let http = reqwest::Client::builder().no_proxy().build().unwrap();
-        assert_eq!(read_feed(&http, &feed, true).await.unwrap().unwrap().title.as_deref(), Some("Café"));
+        assert_eq!(read_feed(http.get(feed.clone()), &feed, true).await.unwrap().unwrap().title.as_deref(), Some("Café"));
     }
 }

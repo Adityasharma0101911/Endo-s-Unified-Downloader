@@ -1,6 +1,7 @@
 //! What happens to a download once it is on disk: Mark-of-the-Web, archive extraction, sorting
 //! into category folders, a VirusTotal lookup and the user's command, in that order.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -64,12 +65,14 @@ const CATEGORIES: &[(&str, &[&str])] = &[
 ];
 
 /// Post-processes the download at `path` (a file or a folder) of `source` as `post` says; the
-/// VirusTotal lookup goes through `proxy`, as the download did.
-pub async fn after_download(path: &Path, post: &PostOptions, source: &Url, proxy: Option<&str>) -> PostOutcome {
+/// VirusTotal lookup goes through `proxy`, as the download did. An archive is opened with
+/// `password` (`DownloadOptions::password`) if given.
+pub async fn after_download(path: &Path, post: &PostOptions, source: &Url, proxy: Option<&str>, password: Option<&str>) -> PostOutcome {
     let key = post.virustotal_key.clone().filter(|key| !key.trim().is_empty());
     let on_disk = {
         let (path, post, source, hash) = (path.to_path_buf(), post.clone(), source.clone(), key.is_some());
-        tokio::task::spawn_blocking(move || on_disk(path, &post, &source, hash)).await
+        let password = password.filter(|p| !p.is_empty()).map(str::to_string);
+        tokio::task::spawn_blocking(move || on_disk(path, &post, &source, hash, password.as_deref())).await
     };
     let Ok((path, mut notes, sha256)) = on_disk else {
         return PostOutcome { path: path.to_path_buf(), notes: vec!["Post-processing stopped unexpectedly".into()] };
@@ -86,7 +89,7 @@ pub async fn after_download(path: &Path, post: &PostOptions, source: &Url, proxy
 /// The blocking steps of [`after_download`]: marks, unpacks and sorts the download, and hashes
 /// it first when `hash` (so an archive unpacked and deleted still gets looked up). Returns where
 /// the download is now, the notes and the SHA-256.
-fn on_disk(mut path: PathBuf, post: &PostOptions, source: &Url, hash: bool) -> (PathBuf, Vec<String>, Option<String>) {
+fn on_disk(mut path: PathBuf, post: &PostOptions, source: &Url, hash: bool, password: Option<&str>) -> (PathBuf, Vec<String>, Option<String>) {
     let mut notes = Vec::new();
     let sha256 = (hash && path.is_file())
         .then(|| sha256_of(&path).map_err(|e| notes.push(format!("VirusTotal: could not read the file: {e}"))).ok())
@@ -95,7 +98,7 @@ fn on_disk(mut path: PathBuf, post: &PostOptions, source: &Url, hash: bool) -> (
         mark_from_internet(&path, source);
     }
     if post.extract && path.is_file() {
-        match extract(&path) {
+        match extract(&path, password) {
             Ok(Some(folder)) => {
                 if post.mark_of_the_web {
                     mark_from_internet(&folder, source);
@@ -187,24 +190,30 @@ fn split_part(name: &str) -> bool {
 }
 
 /// Unpacks the archive `file` with the system tar into a new folder next to it, named after it
-/// (numbered if taken). Every entry is checked first: one that would land outside the folder
-/// refuses the whole archive, as does a link among what it unpacked (a later download into a
-/// folder of that name would write through it). Ok(None) if `file` is no archive; Err is the
-/// note saying why it stayed packed (split, password-protected, unsafe or unreadable).
-fn extract(file: &Path) -> Result<Option<PathBuf>, String> {
+/// (numbered if taken), opened with `password` if given: an encrypted .7z or .rar, which tar
+/// cannot open, with 7-Zip when it is installed. Every entry is checked first: one that would
+/// land outside the folder refuses the whole archive, as does a link among what it unpacked (a
+/// later download into a folder of that name would write through it). Ok(None) if `file` is no
+/// archive; Err is the note saying why it stayed packed (split, password-protected or the
+/// password wrong, unsafe or unreadable), which never holds the password.
+fn extract(file: &Path, password: Option<&str>) -> Result<Option<PathBuf>, String> {
     let name = file_name(file);
     let lower = name.to_ascii_lowercase();
     if split_part(&lower) {
         return Err(format!("{name} is one part of a split archive, so it was left packed"));
     }
     let Some(stem) = archive_stem(&name) else { return Ok(None) };
+    let seven_or_rar = lower.ends_with(".7z") || lower.ends_with(".rar");
+    // Only these are ever encrypted (GNU tar would refuse `--passphrase` for a .tar.gz).
+    let password = password.filter(|_| seven_or_rar || lower.ends_with(".zip"));
+    let seven = password.filter(|_| seven_or_rar).and_then(|_| seven_zip());
     // Linux's GNU tar reads tar archives alone; bsdtar (Windows' and macOS' tar) the rest too.
-    let tar = match cfg!(target_os = "linux") {
+    let tar = || match cfg!(target_os = "linux") {
         true => crate::media::find_in_path("bsdtar"),
         false => Some(crate::media::system_tar()),
     };
-    let tar = match tar {
-        Some(tar) => tar,
+    let tool = match seven.clone().or_else(tar) {
+        Some(tool) => tool,
         None if [".zip", ".7z", ".rar"].iter().any(|ext| lower.ends_with(ext)) => {
             return Err(format!("{name} was left packed: unpacking it needs bsdtar (libarchive-tools)"));
         }
@@ -212,22 +221,50 @@ fn extract(file: &Path) -> Result<Option<PathBuf>, String> {
     };
     let failed = |error: &str| {
         let lower = error.to_ascii_lowercase();
-        if ["passphrase", "password", "encrypt"].iter().any(|w| lower.contains(w)) {
-            format!("{name} is password-protected, so it was left packed")
-        } else {
-            format!("Could not unpack {name}: {}", error.trim())
+        match password {
+            _ if !["passphrase", "password", "encrypt"].iter().any(|w| lower.contains(w)) => {
+                // Should a tool ever echo the password.
+                format!("Could not unpack {name}: {}", password.map_or(error.to_string(), |p| error.replace(p, "••••")).trim())
+            }
+            None => format!("{name} is password-protected, so it was left packed"),
+            Some(_) if seven.is_none() && seven_or_rar => {
+                format!("{name} is password-protected and was left packed: opening it needs 7-Zip (7-zip.org)")
+            }
+            Some(_) => format!("{name} was left packed: the password did not open it"),
         }
     };
-    let listing = crate::media::quiet_command(&tar)
-        .arg("-tf")
-        .arg(file)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| failed(&e.to_string()))?;
+    // Never through a shell. On Windows 7-Zip reads it on its input when it asks, off its command
+    // line, which other programs can read. ponytail: tar takes it only among its arguments, and so
+    // does 7-Zip elsewhere (it would ask the terminal); a password holding `"` does not reach 7-Zip
+    // whole there (it reads its command line its own way) and "did not open it".
+    let typed = password.filter(|_| seven.is_some() && cfg!(windows));
+    let pass: Vec<String> = match (password, &seven) {
+        (Some(p), Some(_)) if typed.is_none() => vec![format!("-p{p}")],
+        (Some(p), None) => vec!["--passphrase".into(), p.into()],
+        _ => Vec::new(),
+    };
+    let mut listing = crate::media::quiet_command(&tool);
+    match seven {
+        Some(_) => listing.args(["l", "-slt", "-sccUTF-8"]).args(&pass).arg("--").arg(file),
+        None => listing.arg("-tf").arg(file).args(&pass),
+    };
+    let listing = run_typing(&mut listing, typed).map_err(|e| failed(&e.to_string()))?;
     if !listing.status.success() {
         return Err(failed(&String::from_utf8_lossy(&listing.stderr)));
     }
-    if let Some(entry) = String::from_utf8_lossy(&listing.stdout).lines().find(|e| crate::updater::escapes(e)) {
+    let listed = String::from_utf8_lossy(&listing.stdout);
+    let entries: Vec<String> = match seven {
+        // Its entries follow the archive's own lines, under a line of dashes; `\` on Windows.
+        Some(_) => listed
+            .split_once("\n----------")
+            .map_or("", |(_, entries)| entries)
+            .lines()
+            .filter_map(|line| line.trim_end_matches('\r').strip_prefix("Path = "))
+            .map(|path| path.replace('\\', "/"))
+            .collect(),
+        None => listed.lines().map(str::to_string).collect(),
+    };
+    if let Some(entry) = entries.iter().find(|e| crate::updater::escapes(e)) {
         return Err(format!("{name} was left packed: its entry \"{entry}\" would land outside its folder"));
     }
     let mut n = 0;
@@ -239,7 +276,21 @@ fn extract(file: &Path) -> Result<Option<PathBuf>, String> {
             Err(e) => return Err(failed(&e.to_string())),
         }
     };
-    let unpacked = crate::media::unpack(&tar, file, &folder, &[]).map_err(|e| failed(&e.to_string()));
+    let unpacked = match seven {
+        Some(_) => {
+            let mut into = OsString::from("-o");
+            into.push(&folder);
+            let mut unpacking = crate::media::quiet_command(&tool);
+            unpacking.args(["x", "-y", "-sccUTF-8"]).arg(into).args(&pass).arg("--").arg(file);
+            run_typing(&mut unpacking, typed).and_then(|out| match out.status.success() {
+                true => Ok(()),
+                false => Err(std::io::Error::other(String::from_utf8_lossy(&out.stderr).into_owned())),
+            })
+        }
+        // bsdtar takes the passphrase among the members too.
+        None => crate::media::unpack(&tool, file, &folder, &pass),
+    };
+    let unpacked = unpacked.map_err(|e| failed(&e.to_string()));
     let unpacked = unpacked.and_then(|()| match has_links(&folder) {
         true => Err(format!("{name} was left packed: it holds links, which could lead outside its folder")),
         false => Ok(Some(folder.clone())),
@@ -249,6 +300,31 @@ fn extract(file: &Path) -> Result<Option<PathBuf>, String> {
         let _ = std::fs::remove_dir_all(&folder);
     }
     unpacked
+}
+
+/// Runs `command` to its end with `line` typed on its input (it reads it only if it asks), else
+/// with no input. Blocking.
+fn run_typing(command: &mut std::process::Command, line: Option<&str>) -> std::io::Result<std::process::Output> {
+    use std::io::Write;
+    let input = if line.is_some() { Stdio::piped() } else { Stdio::null() };
+    let mut child = command.stdin(input).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    if let (Some(mut stdin), Some(line)) = (child.stdin.take(), line) {
+        // It may have finished without asking.
+        let _ = writeln!(stdin, "{line}");
+    }
+    child.wait_with_output()
+}
+
+/// 7-Zip's console program: on PATH, else where its installer puts it on Windows.
+fn seven_zip() -> Option<PathBuf> {
+    let exe = format!("7z{}", std::env::consts::EXE_SUFFIX);
+    crate::media::find_in_path(&exe).or_else(|| {
+        ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"]
+            .into_iter()
+            .filter_map(std::env::var_os)
+            .map(|dir| PathBuf::from(dir).join("7-Zip").join(&exe))
+            .find(|exe| exe.is_file())
+    })
 }
 
 /// Whether the folder `dir` holds a symbolic link or junction, anywhere down.
@@ -445,7 +521,7 @@ mod tests {
         let file = dir.path().join("a.bin");
         std::fs::write(&file, b"x").unwrap();
         let source = url("https://user:pw@example.com/a.bin?token=hush");
-        let done = after_download(&file, &PostOptions::default(), &source, None).await;
+        let done = after_download(&file, &PostOptions::default(), &source, None, None).await;
         assert_eq!(done, PostOutcome { path: file.clone(), notes: vec![] });
         let zone = std::fs::read_to_string(format!("{}:Zone.Identifier", file.display())).unwrap();
         assert!(zone.starts_with("[ZoneTransfer]\r\nZoneId=3\r\nHostUrl=https://example.com/a.bin?token="), "{zone}");
@@ -480,7 +556,7 @@ mod tests {
         let archive = inner.join("evil.tar");
         std::fs::write(&archive, tar_with("../evil.txt", b"gotcha")).unwrap();
         let post = only(PostOptions { extract: true, delete_archive: true, ..Default::default() });
-        let done = after_download(&archive, &post, &url("https://example.com/evil.tar"), None).await;
+        let done = after_download(&archive, &post, &url("https://example.com/evil.tar"), None, None).await;
         assert_eq!(done.path, archive);
         assert!(done.notes[0].contains("would land outside its folder"), "{:?}", done.notes);
         assert!(archive.is_file() && !inner.join("evil").exists() && !dir.path().join("evil.txt").exists());
@@ -506,13 +582,59 @@ mod tests {
             .unwrap();
         assert!(made.success());
         let post = PostOptions { extract: true, delete_archive: true, ..Default::default() };
-        let done = after_download(&archive, &post, &url("https://example.com/pack"), None).await;
+        // A password the archive does not need changes nothing.
+        let done = after_download(&archive, &post, &url("https://example.com/pack"), None, Some("unused")).await;
         let folder = dir.path().join("pack (1)");
         assert_eq!(done, PostOutcome { path: folder.clone(), notes: vec![] });
         assert_eq!(std::fs::read(folder.join("inner.txt")).unwrap(), b"hello");
         assert!(!archive.exists());
         if cfg!(windows) {
             assert!(std::fs::metadata(format!("{}:Zone.Identifier", folder.join("inner.txt").display())).is_ok());
+        }
+    }
+
+    /// An encrypted archive opens with its password only: a wrong one, or none, leaves it packed
+    /// and says which, never with the password. A zip goes to tar; a .7z with its names encrypted
+    /// too to 7-Zip (each made here when its tool is installed).
+    #[tokio::test]
+    async fn encrypted_archives_open_with_their_password() {
+        use crate::media::quiet_command;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("inner.txt"), b"hello").unwrap();
+        let mut made = Vec::new();
+        // bsdtar (Windows' and macOS' tar) writes a zip encrypted the traditional way.
+        let tar = if cfg!(target_os = "linux") { crate::media::find_in_path("bsdtar") } else { Some(crate::media::system_tar()) };
+        if let Some(tar) = tar {
+            let zip = dir.path().join("locked.zip");
+            let options = ["--options", "zip:encryption=traditional", "--passphrase", "s3cret", "-C"];
+            assert!(quiet_command(&tar).args(["-a", "-cf"]).arg(&zip).args(options).arg(&src).arg("inner.txt").status().unwrap().success());
+            made.push(zip);
+        }
+        match seven_zip() {
+            Some(seven) => {
+                let archive = dir.path().join("locked.7z");
+                let mut made_7z = quiet_command(&seven);
+                made_7z.args(["a", "-ps3cret", "-mhe=on", "--"]).arg(&archive).arg(src.join("inner.txt")).stdout(Stdio::null());
+                assert!(made_7z.status().unwrap().success());
+                made.push(archive);
+            }
+            None => eprintln!("7-Zip is not installed: its part of the test is skipped"),
+        }
+        let source = url("https://example.com/locked");
+        for archive in made {
+            let name = file_name(&archive);
+            let post = PostOptions { extract: true, mark_of_the_web: false, ..Default::default() };
+            let wrong = after_download(&archive, &post, &source, None, Some("n0pe")).await;
+            assert_eq!(wrong, PostOutcome { path: archive.clone(), notes: vec![format!("{name} was left packed: the password did not open it")] });
+            let none = after_download(&archive, &post, &source, None, None).await;
+            assert_eq!(none, PostOutcome { path: archive.clone(), notes: vec![format!("{name} is password-protected, so it was left packed")] });
+            assert!(!dir.path().join("locked").exists(), "{name}: a failed unpacking leaves no folder");
+            let right = after_download(&archive, &post, &source, None, Some("s3cret")).await;
+            assert!(right.notes.is_empty(), "{name}: {:?}", right.notes);
+            assert_eq!(std::fs::read(right.path.join("inner.txt")).unwrap(), b"hello", "{name}");
+            std::fs::remove_dir_all(&right.path).unwrap();
         }
     }
 
@@ -538,20 +660,20 @@ mod tests {
         std::fs::write(&clip, b"new").unwrap();
         let post = only(PostOptions { sort: true, ..Default::default() });
         let source = url("https://example.com/clip.mp4");
-        let done = after_download(&clip, &post, &source, None).await;
+        let done = after_download(&clip, &post, &source, None, None).await;
         assert_eq!(done.path, dir.path().join("Video").join("clip (1).mp4"));
         assert_eq!(std::fs::read(&done.path).unwrap(), b"new");
         assert_eq!(std::fs::read(dir.path().join("Video").join("clip.mp4")).unwrap(), b"old");
 
         let book = dir.path().join("Book.PDF");
         std::fs::write(&book, b"pdf").unwrap();
-        assert_eq!(after_download(&book, &post, &source, None).await.path, dir.path().join("Documents").join("Book.PDF"));
+        assert_eq!(after_download(&book, &post, &source, None, None).await.path, dir.path().join("Documents").join("Book.PDF"));
         let odd = dir.path().join("thing.xyz");
         std::fs::write(&odd, b"?").unwrap();
-        assert_eq!(after_download(&odd, &post, &source, None).await.path, odd);
+        assert_eq!(after_download(&odd, &post, &source, None, None).await.path, odd);
         let folder = dir.path().join("Torrent");
         std::fs::create_dir(&folder).unwrap();
-        assert_eq!(after_download(&folder, &post, &source, None).await.path, folder);
+        assert_eq!(after_download(&folder, &post, &source, None, None).await.path, folder);
     }
 
     #[test]

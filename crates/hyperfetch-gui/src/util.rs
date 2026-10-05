@@ -27,6 +27,28 @@ pub fn clipboard_link(text: &str) -> Option<String> {
     (magnet || ingest::link_task(&[text]).is_ok()).then(|| text.to_string())
 }
 
+/// Clipboard text worth offering as a download, with what the banner shows of it: a paste with
+/// a password, key or sign-in, or a copied request (see `paste::parse`), shown as its first link
+/// without them (nor a MEGA key); else one link or magnet (see [`clipboard_link`]).
+pub fn clipboard_offer(text: &str) -> Option<(String, String)> {
+    let text = text.trim();
+    // A copied request with its cookies is long, a page of text longer.
+    if text.len() > 64 * 1024 {
+        return None;
+    }
+    let Some(pasted) = hyperfetch_core::paste::parse(text) else {
+        return clipboard_link(text).map(|link| (link.clone(), link));
+    };
+    let links = pasted.ok()?;
+    let mut shown = links.first()?.url.clone();
+    shown.set_fragment(None);
+    let more = match links.len() {
+        1 => String::new(),
+        n => format!(" and {} more", n - 1),
+    };
+    Some((format!("{}{}", shown, more), text.to_string()))
+}
+
 /// The folder to create before `item` starts, since the engine takes a missing folder for a file
 /// name: its output path, unless that is the file itself (a download a metalink, torrent or
 /// magnet named; the engine creates its folders).
@@ -263,6 +285,20 @@ mod tests {
         // A document lists downloads rather than being one.
         assert_eq!(clipboard_link("https://a.com/list.meta4"), None);
         assert_eq!(clipboard_link("https://a.com/x.torrent"), None);
+    }
+
+    /// A paste with secrets is offered by its first link, the secrets only in the text added.
+    #[test]
+    fn clipboard_offers_a_paste_without_showing_its_secrets() {
+        let text = "https://h.example/f.zip\nhttps://h.example/g.zip\nPassword: hunter2";
+        let (shown, kept) = clipboard_offer(text).unwrap();
+        assert_eq!((shown.as_str(), kept.as_str()), ("https://h.example/f.zip and 1 more", text));
+        let (shown, _) = clipboard_offer("https://bob:hunter2@h.example/f.zip").unwrap();
+        assert_eq!(shown, "https://h.example/f.zip");
+        let link = "https://h.example/f.zip";
+        assert_eq!(clipboard_offer(link), Some((link.to_string(), link.to_string())));
+        assert_eq!(clipboard_offer("curl -d a=1 https://h.example/f.zip"), None, "a POST is no download");
+        assert_eq!(clipboard_offer("hello"), None);
     }
 
     #[test]
