@@ -521,8 +521,11 @@ async fn test_connections_spread_over_local_addresses_and_drop_a_dead_one() {
     let data = payload(PREFETCH + 4096 * KB, 41);
     let temp = tempdir().unwrap();
     let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+    // macOS has only 127.0.0.1 on its loopback unless 127.0.0.2 is added (CI does): then it is a
+    // dead route too.
+    let second = std::net::TcpListener::bind("127.0.0.2:0").is_ok().then(|| ip("127.0.0.2"));
 
-    for (routes, expected) in [(["127.0.0.1", "127.0.0.2"], vec![ip("127.0.0.1"), ip("127.0.0.2")]), (["127.0.0.1", "192.0.2.1"], vec![ip("127.0.0.1")])] {
+    for (routes, expected) in [(["127.0.0.1", "127.0.0.2"], [Some(ip("127.0.0.1")), second].into_iter().flatten().collect()), (["127.0.0.1", "192.0.2.1"], vec![ip("127.0.0.1")])] {
         let mock = Arc::new(Mock::new(data.clone()));
         let url = serve(Arc::clone(&mock), "routes.bin").await;
         let out = temp.path().join(format!("routes-{}.bin", routes[1]));

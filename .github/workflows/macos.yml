@@ -36,7 +36,9 @@ jobs:
         with:
           node-version: 22
       - run: cargo build --workspace
-      - run: cargo test --workspace -- --test-threads=4
+      # macOS's loopback has only 127.0.0.1; the engine's test of spreading over local addresses needs a second.
+      - run: sudo ifconfig lo0 alias 127.0.0.2 up
+      - run: cargo test --workspace --no-fail-fast -- --test-threads=4
       - run: node --test "extension/test/*.test.mjs"
 
   package:

@@ -902,7 +902,8 @@ mod tests {
         DownloadHistoryManager::record(&history_path, failed).unwrap();
 
         let on_disk = std::fs::read_to_string(&history_path).unwrap();
-        assert!(!on_disk.contains("abc") && !on_disk.contains("pw"), "{on_disk}");
+        // Not just "pw": the temp folder's random name can hold that (`.tmpw...`).
+        assert!(!on_disk.contains("Signature=abc") && !on_disk.contains("me:pw"), "{on_disk}");
         let loaded = DownloadHistoryManager::load_from_path(&history_path);
         assert_eq!(loaded.entries()[0].urls, [redact_url(live)], "the live link finds its entry by its redacted form");
     }
