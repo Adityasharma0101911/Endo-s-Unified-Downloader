@@ -2737,6 +2737,13 @@ mod tests {
         let client = local_client();
         // A failed fetch is not kept.
         assert!(ArchiveMetadata::shared(&client, &base, "nasa").await.is_err());
+        // Its other two requests, given up at the first 503, may still be reaching the server.
+        for _ in 0..100 {
+            if requested.lock().len() >= 3 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
         down.store(false, std::sync::atomic::Ordering::Relaxed);
         requested.lock().clear();
 
@@ -2745,7 +2752,9 @@ mod tests {
         let c = ArchiveMetadata::shared(&client, &base, "nasa").await.unwrap();
         assert!(std::sync::Arc::ptr_eq(&a.unwrap(), &c) && std::sync::Arc::ptr_eq(&b.unwrap(), &c));
         assert_eq!(c.dir.as_deref(), Some("/6/items/nasa"));
-        assert_eq!(requested.lock().len(), 3, "one fetch: {:?}", requested.lock());
+        // Copied out: a guard held through assert_eq! would deadlock its message's second lock.
+        let requested = requested.lock().clone();
+        assert_eq!(requested.len(), 3, "one fetch: {requested:?}");
     }
 
     #[tokio::test]
