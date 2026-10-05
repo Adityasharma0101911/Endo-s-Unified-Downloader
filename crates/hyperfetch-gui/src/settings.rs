@@ -1,9 +1,11 @@
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use hyperfetch_core::engine::DownloadOptions;
 use hyperfetch_core::history::DownloadHistoryManager;
 use hyperfetch_core::ingest::ListOptions;
 use hyperfetch_core::media::{is_supported_media_site, BrowserCookieSource, MediaQualityPreset};
+use hyperfetch_core::postprocess::PostOptions;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -81,13 +83,48 @@ pub struct Settings {
     pub referer: String,
     /// Comma-separated list of proxy URLs for multi-egress rotation across workers.
     pub proxy_pool: String,
-    /// Debrid API key for automatic high-speed CDN unrestricting.
+    /// Debrid API key for automatic high-speed CDN unrestricting. Saved here, never with the queue
+    /// or in the history (see [`Settings::fill_keys`]).
     pub debrid_api_key: String,
-    /// Debrid provider override ("real-debrid" or "alldebrid").
+    /// Debrid provider: "realdebrid", "alldebrid", "torbox" or "premiumize".
     pub debrid_provider: String,
     /// Look for a newer release at launch (see `hyperfetch_core::updater::check`). On by default,
     /// also for settings an older version saved.
     pub check_updates: bool,
+    /// Spread connections over several networks (see [`Settings::bind_addresses`]).
+    pub multi_network: bool,
+    /// The local IP addresses chosen for that; none means every usable network.
+    pub bind_addresses: Vec<String>,
+    /// Download magnet links and .torrent files without web seeds from the BitTorrent swarm.
+    pub p2p: bool,
+    /// Seed a finished torrent until it has uploaded this many times its size (0 = don't seed).
+    pub seed_ratio: f64,
+    /// ... or for this many minutes, whichever comes first (0 = no time limit).
+    pub seed_minutes: u32,
+    /// BitTorrent listen port (0 = librqbit's default range).
+    pub bt_port: u16,
+    /// Ask the router (UPnP) to forward the BitTorrent port.
+    pub bt_upnp: bool,
+    /// Magnet links go through debrid when a debrid key is set.
+    pub debrid_magnets: bool,
+    /// Image galleries go to gallery-dl.
+    pub gallery_dl: bool,
+    /// Unpack archives after download.
+    pub auto_extract: bool,
+    /// Delete an archive once it is unpacked.
+    pub delete_archives: bool,
+    /// Move single files into category folders of the save folder.
+    pub sort_downloads: bool,
+    /// Command run after each download (empty = none).
+    pub run_after: String,
+    /// Mark downloaded files as from the internet (Windows).
+    pub mark_of_the_web: bool,
+    /// VirusTotal API key. Saved here, never with the queue or in the history.
+    pub virustotal_api_key: String,
+    /// Look each downloaded file's SHA-256 up on VirusTotal (the hash only, never the file).
+    pub virustotal_check: bool,
+    /// 0 follows the system, 1 dark, 2 light.
+    pub theme: usize,
 }
 
 impl Default for Settings {
@@ -123,6 +160,23 @@ impl Default for Settings {
             debrid_api_key: String::new(),
             debrid_provider: String::new(),
             check_updates: true,
+            multi_network: false,
+            bind_addresses: Vec::new(),
+            p2p: true,
+            seed_ratio: 1.0,
+            seed_minutes: 60,
+            bt_port: 0,
+            bt_upnp: false,
+            debrid_magnets: engine.debrid_magnets,
+            gallery_dl: engine.gallery_dl,
+            auto_extract: false,
+            delete_archives: false,
+            sort_downloads: false,
+            run_after: String::new(),
+            mark_of_the_web: engine.post.mark_of_the_web,
+            virustotal_api_key: String::new(),
+            virustotal_check: false,
+            theme: 0,
         }
     }
 }
@@ -209,8 +263,40 @@ impl Settings {
             live_from_start: self.live_from_start,
             wait_for_video: self.wait_for_video,
             hls_to_mp4: self.hls_to_mp4,
+            post: PostOptions {
+                extract: self.auto_extract,
+                delete_archive: self.delete_archives,
+                sort: self.sort_downloads,
+                run_after: non_empty(&self.run_after),
+                mark_of_the_web: self.mark_of_the_web,
+                // Never saved with the queue: see `fill_keys`.
+                virustotal_key: None,
+            },
             ..self.tuning()
         })
+    }
+
+    /// Puts the keys a queued download is never saved with (debrid, VirusTotal) into its
+    /// `options`, from these settings, as it starts; and the local addresses it connects from,
+    /// as the networks of when it was queued may be gone.
+    pub fn fill_keys(&self, options: &mut DownloadOptions) {
+        options.bind_addresses = self.bind_addresses();
+        options.debrid_api_key = non_empty(&self.debrid_api_key);
+        options.debrid_provider = non_empty(&self.debrid_provider);
+        options.post.virustotal_key = non_empty(&self.virustotal_api_key).filter(|_| self.virustotal_check);
+    }
+
+    /// The local addresses downloads connect from when `multi_network` is on: the chosen ones,
+    /// else every usable network's. None (the system's choice) when it is off.
+    pub fn bind_addresses(&self) -> Vec<IpAddr> {
+        if !self.multi_network {
+            return Vec::new();
+        }
+        let chosen: Vec<IpAddr> = self.bind_addresses.iter().filter_map(|a| a.trim().parse().ok()).collect();
+        if chosen.is_empty() {
+            return hyperfetch_core::netif::usable().into_iter().map(|i| i.address).collect();
+        }
+        chosen
     }
 
     /// How a link that lists many downloads (a folder, feed, playlist or channel) is read with
@@ -225,6 +311,10 @@ impl Settings {
             cookies: self.browser_cookies().or_else(cookies_file).unwrap_or_default(),
             proxy: non_empty(&self.proxy),
             notes: None,
+            p2p: self.p2p,
+            debrid_key: non_empty(&self.debrid_api_key),
+            debrid_provider: non_empty(&self.debrid_provider),
+            debrid_magnets: self.debrid_magnets,
         }
     }
 
@@ -260,6 +350,13 @@ impl Settings {
             proxy_pool,
             debrid_api_key,
             debrid_provider,
+            bind_addresses: self.bind_addresses(),
+            seed_ratio: self.seed_ratio.max(0.0),
+            seed_minutes: self.seed_minutes,
+            bt_port: Some(self.bt_port).filter(|&port| port > 0),
+            bt_upnp: self.bt_upnp,
+            debrid_magnets: self.debrid_magnets,
+            gallery_dl: self.gallery_dl,
             ..Default::default()
         }
     }

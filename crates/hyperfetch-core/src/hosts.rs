@@ -58,6 +58,9 @@ impl HostKey {
         let host = self.host.to_ascii_lowercase();
         if host.contains("cloudatacdn") || host.contains("dood") || host.contains("ds2play") || host.contains("doodstream") {
             Some(3)
+        } else if host.contains("pixeldra") {
+            // Answers 403 to a fifth or sixth connection from one address.
+            Some(4)
         } else {
             None
         }

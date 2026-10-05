@@ -1828,6 +1828,7 @@ fn progress_snapshot(
         mirror_speeds: Vec::new(),
         chunks,
         target_path: Some(target.to_path_buf()),
+        ..Default::default()
     }
 }
 

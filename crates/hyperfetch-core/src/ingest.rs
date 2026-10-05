@@ -7,7 +7,7 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use url::Url;
 
-use crate::{feeds, folders, media, metalink, resolver, torrent};
+use crate::{feeds, folders, media, mega, metalink, resolver, shares, torrent};
 
 /// Largest .metalink/.torrent document read from the network or the disk.
 const MAX_DESCRIPTOR_BYTES: usize = 16 * 1024 * 1024;
@@ -47,9 +47,19 @@ pub struct Task {
     pub archive: Vec<String>,
     /// Optional HTTP Referer header for links requiring anti-hotlinking bypass.
     pub referer: Option<String>,
+    /// A BitTorrent swarm download: `urls` holds the magnet link, the .torrent link or the
+    /// `file:` URL of a local .torrent (see `engine::DownloadOptions::bittorrent`).
+    pub p2p: bool,
 }
 
 impl Task {
+    /// Whether the download stays where it lands, never sorted into a category folder: it is in
+    /// a folder of its own (a listing's, a playlist's, a torrent's), or a swarm download, which
+    /// seeds from there.
+    pub fn keeps_its_place(&self) -> bool {
+        self.p2p || self.folder.is_some() || self.name.as_ref().is_some_and(|name| name.components().count() > 1)
+    }
+
     /// Short name for progress output.
     pub fn label(&self) -> String {
         if let Some(name) = &self.name {
@@ -88,6 +98,14 @@ pub struct ListOptions {
     /// Where a listing sends what the user should know besides its downloads (items left out, a
     /// folder listed in part), for a front end to show; None logs it as a warning.
     pub notes: Option<std::sync::mpsc::Sender<ListNote>>,
+    /// Magnet links and .torrent files without HTTP web seeds are downloaded from the swarm.
+    pub p2p: bool,
+    /// The debrid API key magnet links go through (with `debrid_magnets`).
+    pub debrid_key: Option<String>,
+    /// The debrid provider of `debrid_key` (see `engine::DownloadOptions::debrid_provider`).
+    pub debrid_provider: Option<String>,
+    /// Magnet links go through debrid when there is a `debrid_key`.
+    pub debrid_magnets: bool,
 }
 
 /// What a listing tells the user besides its downloads (see [`ListOptions::notes`]).
@@ -109,6 +127,10 @@ impl Default for ListOptions {
             cookies: media::BrowserCookieSource::None,
             proxy: None,
             notes: None,
+            p2p: false,
+            debrid_key: None,
+            debrid_provider: None,
+            debrid_magnets: true,
         }
     }
 }
@@ -193,7 +215,7 @@ pub fn names_document(text: &str) -> bool {
 /// Whether `url` may list many downloads (a folder, feed, playlist or channel), from its shape
 /// alone: [`ingest`] then asks the listers.
 pub fn might_list(url: &Url) -> bool {
-    folders::lists(url) || feeds::lists(url) || media::lists(url)
+    mega::lists(url) || shares::lists(url) || folders::lists(url) || feeds::lists(url) || media::lists(url)
 }
 
 /// `token` as a link [`might_list`] takes, a "leaving this site" link replaced by its target.
@@ -204,9 +226,11 @@ fn listing_url(token: &str) -> Option<Url> {
 }
 
 /// Whether [`ingest`] reads `text` before it knows its downloads: it names a document (see
-/// [`names_document`]) or is one link that may list many. A UI thread leaves that to the runtime.
+/// [`names_document`]), is one link that may list many, or is a magnet link (debrid or the swarm
+/// may take it). A UI thread leaves that to the runtime.
 pub fn needs_reading(text: &str) -> bool {
-    names_document(text) || matches!(&split_tokens(text)[..], [token] if listing_url(token).is_some())
+    names_document(text)
+        || matches!(&split_tokens(text)[..], [token] if listing_url(token).is_some() || torrent::is_magnet_uri(token))
 }
 
 /// `name` (from a torrent, metalink or magnet, so untrusted) made safe as one path component on
@@ -257,14 +281,21 @@ pub async fn input_tokens(line: &str) -> Vec<String> {
 /// client error (a login, a private GitHub file's 404; a timeout or a rate limit is an error) or
 /// a web page yields the link itself, for the engine, which sends the user's cookies and
 /// Authorization and refuses a page in place of the file. The link itself is always the one
-/// typed, never where its resolver led. `Ok` is empty only for a listing everything of which was
+/// typed, never where its resolver led (a swarm download's .torrent aside: nothing resolves it
+/// again). `Ok` is empty only for a listing everything of which was
 /// downloaded before (see [`ListOptions::only_new`]): nothing to do, not a failure.
 pub async fn ingest(tokens: &[impl AsRef<str>], http: &reqwest::Client, options: &ListOptions) -> Result<Vec<Task>, String> {
     if let [token] = tokens {
+        if let Some(tasks) = magnet_tasks(http, token.as_ref(), options).await? {
+            return Ok(tasks);
+        }
         if let Some((source, kind)) = descriptor_source(token.as_ref()) {
             return match source {
-                Source::Remote(typed) => remote_tasks(http, typed, kind).await,
-                Source::Local(path) => document_tasks(kind, &read_local(&path).await?, None),
+                Source::Remote(typed) => remote_tasks(http, typed, kind, options.p2p).await,
+                Source::Local(path) => {
+                    let swarm = std::path::absolute(&path).ok().and_then(|p| Url::from_file_path(p).ok()).filter(|_| options.p2p);
+                    document_tasks(kind, &read_local(&path).await?, None, swarm.as_ref())
+                }
             };
         }
         if let Some(url) = listing_url(token.as_ref()) {
@@ -279,9 +310,46 @@ pub async fn ingest(tokens: &[impl AsRef<str>], http: &reqwest::Client, options:
     link_task(tokens).map(|task| vec![task])
 }
 
+/// The downloads of the magnet link `token` when debrid or the swarm takes it: debrid when the
+/// user has a key for magnets and it takes the magnet, else the swarm when the magnet has no HTTP
+/// web seeds and `p2p` is on. None leaves it to [`link_task`] (its web seeds, or the error).
+async fn magnet_tasks(http: &reqwest::Client, token: &str, options: &ListOptions) -> Result<Option<Vec<Task>>, String> {
+    if !torrent::is_magnet_uri(token) {
+        return Ok(None);
+    }
+    let mut debrid_failed = None;
+    if let Some(key) = options.debrid_key.as_deref().filter(|k| options.debrid_magnets && !k.trim().is_empty()) {
+        let provider = options.debrid_provider.as_deref().unwrap_or_default();
+        match crate::debrid::magnet_tasks(http, token, key, provider).await {
+            Ok(tasks) if !tasks.is_empty() => return Ok(Some(tasks)),
+            Ok(_) => {}
+            Err(e) => debrid_failed = Some(e),
+        }
+    }
+    let parsed = torrent::parse_magnet_uri(token).ok().zip(Url::parse(token).ok());
+    let web_seeds = parsed.as_ref().is_some_and(|(magnet, _)| !magnet.web_seeds.is_empty());
+    let swarm = parsed.filter(|_| options.p2p && !web_seeds);
+    // A debrid failure is the error only when neither web seeds nor the swarm can take it.
+    if let Some(e) = debrid_failed {
+        if swarm.is_none() && !web_seeds {
+            return Err(e);
+        }
+        options.note(format!("{e}; downloading it from {} instead", if web_seeds { "its web seeds" } else { "the swarm" }));
+    }
+    let Some((magnet, url)) = swarm else { return Ok(None) };
+    let name = magnet.display_name.as_deref().and_then(clean_component).map(PathBuf::from);
+    Ok(Some(vec![Task { urls: vec![url], name, p2p: true, ..Task::default() }]))
+}
+
 /// The downloads the folder, feed or playlist at `url` lists, from the first lister whose `lists`
 /// takes it and that finds a listing there; None when none does.
 async fn list(http: &reqwest::Client, url: &Url, options: &ListOptions) -> Option<Result<Vec<Task>, String>> {
+    if mega::lists(url) {
+        return Some(mega::list(http, url).await);
+    }
+    if shares::lists(url) {
+        return Some(shares::list(http, url).await);
+    }
     if folders::lists(url) {
         if let Some(listed) = folders::list(http, url, options).await {
             return Some(listed);
@@ -358,12 +426,13 @@ fn too_large(what: impl std::fmt::Display) -> String {
 /// The tasks of the document at `typed`, fetched from where its host's resolver says the file is.
 /// The link itself when its host answers with a client error (see [`fetch`]), or with a web page
 /// that is no such document: a host may label any file a page (PHP sends text/html unless told
-/// otherwise).
-async fn remote_tasks(http: &reqwest::Client, typed: Url, kind: Descriptor) -> Result<Vec<Task>, String> {
+/// otherwise). A torrent without web seeds goes to the swarm when `p2p` is on.
+async fn remote_tasks(http: &reqwest::Client, typed: Url, kind: Descriptor, p2p: bool) -> Result<Vec<Task>, String> {
     let url = resolver::SmartResolver::resolve_mirrors(http, &typed).await.into_iter().next().unwrap_or_else(|| typed.clone());
     match fetch(http, &url).await? {
         Some((bytes, labelled_page)) if !labelled_page || (!starts_like_html(&bytes) && parses(kind, &bytes)) => {
-            document_tasks(kind, &bytes, Some(&typed))
+            // The swarm reads the .torrent from where it was found: nothing resolves it there.
+            document_tasks(kind, &bytes, Some(&typed), p2p.then_some(&url))
         }
         _ => {
             tracing::info!("{} answered with an error or a web page: the download engine takes {}", url, typed);
@@ -372,11 +441,11 @@ async fn remote_tasks(http: &reqwest::Client, typed: Url, kind: Descriptor) -> R
     }
 }
 
-/// The tasks the document `bytes` lists (see [`torrent_tasks`] for `remote`).
-fn document_tasks(kind: Descriptor, bytes: &[u8], remote: Option<&Url>) -> Result<Vec<Task>, String> {
+/// The tasks the document `bytes` lists (see [`torrent_tasks`] for `remote` and `swarm`).
+fn document_tasks(kind: Descriptor, bytes: &[u8], remote: Option<&Url>, swarm: Option<&Url>) -> Result<Vec<Task>, String> {
     match kind {
         Descriptor::Metalink => metalink_tasks(bytes),
-        Descriptor::Torrent => torrent_tasks(bytes, remote),
+        Descriptor::Torrent => torrent_tasks(bytes, remote, swarm),
     }
 }
 
@@ -468,12 +537,18 @@ fn metalink_tasks(bytes: &[u8]) -> Result<Vec<Task>, String> {
         .collect()
 }
 
-/// One task per torrent file with HTTP web seeds. When no file has any, the torrent at `remote`
-/// (the link typed for it, if it was fetched) is the one download: a torrent client takes it from
-/// there.
-fn torrent_tasks(bytes: &[u8], remote: Option<&Url>) -> Result<Vec<Task>, String> {
+/// One task per torrent file with HTTP web seeds. When no file has any, the torrent at `swarm`
+/// (its link, or the `file:` URL of a local one, when the swarm is allowed) is one swarm download;
+/// else the torrent at `remote` (the link typed for it, if it was fetched) is the one download: a
+/// torrent client takes it from there.
+fn torrent_tasks(bytes: &[u8], remote: Option<&Url>, swarm: Option<&Url>) -> Result<Vec<Task>, String> {
     let info = torrent::parse_torrent_bytes(bytes)?;
-    if let Some(url) = remote.filter(|_| info.files.iter().all(|f| f.urls.is_empty())) {
+    let seedless = info.files.iter().all(|f| f.urls.is_empty());
+    if let Some(url) = swarm.filter(|_| seedless) {
+        let name = clean_component(&info.name).map(PathBuf::from);
+        return Ok(vec![Task { urls: vec![url.clone()], name, p2p: true, ..Task::default() }]);
+    }
+    if let Some(url) = remote.filter(|_| seedless) {
         return Ok(vec![Task { urls: vec![url.clone()], document_itself: true, ..Task::default() }]);
     }
     // A BitTorrent v2-only torrent lists its files in a `file tree`, which is not read.
@@ -712,7 +787,7 @@ mod tests {
     fn multi_file_torrent_becomes_one_task_per_file() {
         let torrent = b"d8:url-list20:https://s.example/d/4:infod5:filesld6:lengthi3e4:pathl1:a5:x.binee\
 d6:lengthi4e4:pathl5:y.bineee4:name4:root12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaaee";
-        let tasks = torrent_tasks(torrent, None).unwrap();
+        let tasks = torrent_tasks(torrent, None, None).unwrap();
         assert_eq!(tasks.len(), 2);
         assert_eq!(tasks[0].name, Some(Path::new("root").join("a").join("x.bin")));
         assert_eq!((tasks[0].size, tasks[1].size), (Some(3), Some(4)));
@@ -725,12 +800,12 @@ d6:lengthi4e4:pathl5:y.bineee4:name4:root12:piece lengthi16384e6:pieces20:aaaaaa
     fn a_torrent_without_files_to_read_is_an_error() {
         let v2_only = b"d4:infod9:file treed5:a.bind0:d6:lengthi3e11:pieces root32:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaeee\
 12:meta versioni2e4:name4:pack12:piece lengthi16384eee";
-        let err = torrent_tasks(v2_only, None).unwrap_err();
+        let err = torrent_tasks(v2_only, None, None).unwrap_err();
         assert!(err.contains("BitTorrent v2-only torrents are not supported"), "{err}");
         let (_dir, path) = write_temp("pack.torrent", v2_only);
         assert_eq!(run(path.to_str().unwrap()).unwrap_err(), err);
         let url = Url::parse("https://releases.example/pack.torrent").unwrap();
-        assert_eq!(torrent_tasks(v2_only, Some(&url)).unwrap(), [Task { urls: vec![url], document_itself: true, ..Task::default() }]);
+        assert_eq!(torrent_tasks(v2_only, Some(&url), None).unwrap(), [Task { urls: vec![url], document_itself: true, ..Task::default() }]);
     }
 
     /// A torrent without HTTP web seeds cannot be downloaded over HTTP; a remote one is then
@@ -738,10 +813,60 @@ d6:lengthi4e4:pathl5:y.bineee4:name4:root12:piece lengthi16384e6:pieces20:aaaaaa
     #[test]
     fn a_remote_torrent_without_web_seeds_is_saved_itself() {
         let no_seeds = b"d4:infod6:lengthi3e4:name5:x.bin12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaaee";
-        assert!(torrent_tasks(no_seeds, None).unwrap_err().contains("no HTTP web seeds"));
+        assert!(torrent_tasks(no_seeds, None, None).unwrap_err().contains("no HTTP web seeds"));
         let url = Url::parse("https://releases.example/x.bin.torrent").unwrap();
-        let tasks = torrent_tasks(no_seeds, Some(&url)).unwrap();
+        let tasks = torrent_tasks(no_seeds, Some(&url), None).unwrap();
         assert_eq!(tasks, [Task { urls: vec![url], document_itself: true, ..Task::default() }]);
+    }
+
+    /// With the swarm allowed, a magnet link or a .torrent (remote or local) without web seeds is
+    /// one swarm download; a magnet with web seeds is still downloaded over HTTP.
+    #[test]
+    fn seedless_torrents_go_to_the_swarm_when_allowed() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let p2p = ListOptions { p2p: true, ..ListOptions::default() };
+        let read = |token: &str| rt.block_on(ingest(&[token], &reqwest::Client::new(), &p2p));
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        let magnet = format!("magnet:?xt=urn:btih:{}&dn=Ubuntu", hash);
+        assert!(needs_reading(&magnet));
+        let swarm = Task { urls: vec![Url::parse(&magnet).unwrap()], name: Some("Ubuntu".into()), p2p: true, ..Task::default() };
+        assert_eq!(read(&magnet).unwrap(), [swarm]);
+        let seeded = read(&format!("{}&ws=https%3A%2F%2Fs.example%2F", magnet)).unwrap();
+        assert!(!seeded[0].p2p && seeded[0].urls[0].scheme() == "https");
+
+        let no_seeds = b"d4:infod6:lengthi3e4:name5:x.bin12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaaee";
+        let url = Url::parse("https://releases.example/x.bin.torrent").unwrap();
+        let swarm = Task { urls: vec![url.clone()], name: Some("x.bin".into()), p2p: true, ..Task::default() };
+        assert_eq!(torrent_tasks(no_seeds, Some(&url), Some(&url)).unwrap(), [swarm]);
+        let (_dir, path) = write_temp("x.bin.torrent", no_seeds);
+        let local = read(path.to_str().unwrap()).unwrap();
+        assert!(local[0].p2p && local[0].urls[0].scheme() == "file", "{:?}", local);
+    }
+
+    /// A debrid failure on a magnet leaves it to its web seeds or the swarm, with a note; it is
+    /// the error only when neither takes the magnet.
+    #[test]
+    fn a_debrid_failure_falls_through_to_what_else_takes_the_magnet() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        // A proxy that hangs up at once: every debrid request fails.
+        let proxy = rt.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            tokio::spawn(async move { while let Ok((socket, _)) = listener.accept().await { drop(socket) } });
+            format!("http://{address}")
+        });
+        let http = reqwest::Client::builder().proxy(reqwest::Proxy::all(&proxy).unwrap()).build().unwrap();
+        let (notes, noted) = std::sync::mpsc::channel();
+        let options = |p2p| ListOptions { p2p, debrid_key: Some("sekret123".into()), notes: Some(notes.clone()), ..ListOptions::default() };
+        let read = |token: &str, p2p| rt.block_on(ingest(&[token], &http, &options(p2p)));
+        let magnet = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=a";
+        assert!(read(magnet, true).unwrap()[0].p2p);
+        let seeded = read(&format!("{magnet}&ws=https%3A%2F%2Fs.example%2F"), false).unwrap();
+        assert_eq!(seeded[0].urls[0].scheme(), "https");
+        let told: Vec<String> = noted.try_iter().map(|note| note.text).collect();
+        assert!(told.len() == 2 && told[0].ends_with("from the swarm instead") && told[1].ends_with("from its web seeds instead"), "{told:?}");
+        let error = read(magnet, false).unwrap_err();
+        assert!(!error.is_empty() && !told.iter().chain([&error]).any(|t| t.contains("sekret123")), "{error}");
     }
 
     #[test]
@@ -752,7 +877,7 @@ d6:lengthi4e4:pathl5:y.bineee4:name4:root12:piece lengthi16384e6:pieces20:aaaaaa
             name.len(),
             name
         );
-        let tasks = torrent_tasks(torrent.as_bytes(), None).unwrap();
+        let tasks = torrent_tasks(torrent.as_bytes(), None, None).unwrap();
         assert_eq!(tasks[0].name, Some(PathBuf::from("_[31mRED_[0m_.bin")));
 
         let hash = "0123456789abcdef0123456789abcdef01234567";

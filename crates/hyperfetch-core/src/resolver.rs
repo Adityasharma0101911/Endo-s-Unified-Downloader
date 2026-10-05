@@ -82,10 +82,13 @@ const FILE_EXTENSIONS: &[&str] = &[
 /// File-share services not supported yet, by the domains (subdomains included) of their pages;
 /// those of their pages yt-dlp downloads aside (see `yt_dlp_share_page`).
 const UNSUPPORTED_SHARES: &[(&str, &[&str])] = &[
+    // Its links are `crate::mega`'s; what is left of it here is a link it cannot read (no key),
+    // whose page must not be saved as the file.
     ("MEGA", &["mega.nz", "mega.io", "mega.co.nz"]),
+    // The same for these, whose share links are `crate::shares`' before any page is fetched;
+    // what is left here is their other pages (and SharePoint's videos, which yt-dlp downloads).
     ("OneDrive", &["1drv.ms", "onedrive.live.com"]),
     ("SharePoint", &["sharepoint.com"]),
-    ("WeTransfer", &["wetransfer.com", "we.tl"]),
     (
         "Terabox",
         &[
@@ -96,6 +99,7 @@ const UNSUPPORTED_SHARES: &[(&str, &[&str])] = &[
     ),
     ("Gofile", &["gofile.io"]),
     ("Pixeldrain", &["pixeldrain.com", "pixeldrain.net", "pixeldra.in"]),
+    ("WeTransfer", &["wetransfer.com", "we.tl"]),
     ("iCloud", &["icloud.com"]),
     (
         "Yandex Disk",
@@ -1301,103 +1305,6 @@ impl HostResolver for StreamtapeResolver {
     }
 }
 
-/// High-speed link unrestrictor using Real-Debrid or AllDebrid
-pub struct DebridResolver;
-
-impl DebridResolver {
-    pub fn is_debrid_host(url: &Url) -> bool {
-        let host = url.host_str().unwrap_or("").to_ascii_lowercase();
-        let debrid_domains = [
-            "rapidgator.net", "rg.to", "1fichier.com", "nitroflare.com", "turbobit.net",
-            "mega.nz", "mega.io", "mediafire.com", "filefactory.com", "uploaded.net",
-            "ddownload.com", "katfile.com", "send.cm", "keep2share.cc", "k2s.cc",
-            "doodstream.com", "dood.to", "dood.so", "dood.pm", "dood.watch", "ds2play.com",
-            "streamtape.com", "mixdrop.co", "upstore.net", "filestore.to",
-        ];
-        debrid_domains.iter().any(|d| host == *d || host.ends_with(&format!(".{}", d)))
-    }
-
-    pub async fn unrestrict(
-        client: &Client,
-        url: &Url,
-        api_key: &str,
-        provider: Option<&str>,
-    ) -> Result<Url, ResolverError> {
-        let is_alldebrid = provider.is_some_and(|p| p.eq_ignore_ascii_case("alldebrid"));
-        if is_alldebrid {
-            Self::unrestrict_alldebrid(client, url, api_key).await
-        } else {
-            match Self::unrestrict_realdebrid(client, url, api_key).await {
-                Ok(u) => Ok(u),
-                Err(e) if provider.is_none() => {
-                    Self::unrestrict_alldebrid(client, url, api_key).await.map_err(|_| e)
-                }
-                Err(e) => Err(e),
-            }
-        }
-    }
-
-    async fn unrestrict_realdebrid(client: &Client, url: &Url, api_key: &str) -> Result<Url, ResolverError> {
-        let resp = client
-            .post("https://api.real-debrid.com/rest/10.0/unrestrict/link")
-            .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", api_key.trim()))
-            .form(&[("link", url.as_str())])
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            return Err(ResolverError::NotFound(format!("Real-Debrid returned HTTP {}", resp.status())));
-        }
-
-        #[derive(Deserialize)]
-        struct RdResponse {
-            download: Option<String>,
-        }
-
-        let text = resp.text().await.map_err(|e| ResolverError::Parse(e.to_string()))?;
-        let rd: RdResponse = serde_json::from_str(&text).map_err(|e| ResolverError::Parse(e.to_string()))?;
-        if let Some(dl) = rd.download {
-            Url::parse(&dl).map_err(|e| ResolverError::Parse(e.to_string()))
-        } else {
-            Err(ResolverError::NotFound("Real-Debrid response missing download URL".to_string()))
-        }
-    }
-
-    async fn unrestrict_alldebrid(client: &Client, url: &Url, api_key: &str) -> Result<Url, ResolverError> {
-        let encoded_url = percent_encoding::utf8_percent_encode(url.as_str(), percent_encoding::NON_ALPHANUMERIC);
-        let endpoint = format!(
-            "https://api.alldebrid.com/v4/link/unlock?agent=hyperfetch&apikey={}&link={}",
-            api_key.trim(),
-            encoded_url
-        );
-        let resp = client.get(&endpoint).send().await?;
-        if !resp.status().is_success() {
-            return Err(ResolverError::NotFound(format!("AllDebrid returned HTTP {}", resp.status())));
-        }
-
-        #[derive(Deserialize)]
-        struct AdData {
-            link: Option<String>,
-        }
-        #[derive(Deserialize)]
-        struct AdResponse {
-            status: String,
-            data: Option<AdData>,
-        }
-
-        let text = resp.text().await.map_err(|e| ResolverError::Parse(e.to_string()))?;
-        let ad: AdResponse = serde_json::from_str(&text).map_err(|e| ResolverError::Parse(e.to_string()))?;
-        if ad.status == "success" {
-            if let Some(data) = ad.data {
-                if let Some(link) = data.link {
-                    return Url::parse(&link).map_err(|e| ResolverError::Parse(e.to_string()));
-                }
-            }
-        }
-        Err(ResolverError::NotFound("AllDebrid could not unlock link".to_string()))
-    }
-}
-
 /// Master Smart Resolver registry that chains all host resolvers
 pub struct SmartResolver;
 
@@ -1414,20 +1321,24 @@ impl SmartResolver {
             || AnnaArchiveResolver.can_handle(url)
             || DoodStreamResolver.can_handle(url)
             || StreamtapeResolver.can_handle(url)
+            || crate::mega::handles(url)
+            || crate::shares::handles(url)
     }
 
     /// Resolves `url` into download sources that are byte-identical copies of one file.
     /// `Ok` is never empty. `Err` means a resolver recognized the host but could not extract a direct link.
     pub async fn resolve(client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
-        Self::resolve_with_options(client, url, None, None).await
+        Self::resolve_with_options(client, url, None, None, None).await
     }
 
-    /// Resolves `url` with optional Debrid link unrestrictor support.
+    /// Resolves `url` with optional Debrid link unrestrictor support. A resolver that needs a
+    /// client of its own (see `crate::shares`) goes through `proxy`, as `client` does.
     pub async fn resolve_with_options(
         client: &Client,
         url: &Url,
         debrid_key: Option<&str>,
         debrid_provider: Option<&str>,
+        proxy: Option<&str>,
     ) -> Result<Vec<Url>, ResolverError> {
         // 0. Check Debrid unrestrictor if API key is provided or in environment
         let key = debrid_key
@@ -1436,12 +1347,25 @@ impl SmartResolver {
             .or_else(|| std::env::var("REAL_DEBRID_KEY").ok())
             .or_else(|| std::env::var("ALLDEBRID_KEY").ok());
         if let Some(key) = key.filter(|k| !k.trim().is_empty()) {
-            if DebridResolver::is_debrid_host(url) {
-                if let Ok(unrestricted) = DebridResolver::unrestrict(client, url, &key, debrid_provider).await {
-                    tracing::info!("Debrid unlocked {} -> {}", url, unrestricted);
-                    return Ok(vec![unrestricted]);
+            if crate::debrid::supports(client, url, &key, debrid_provider).await {
+                match crate::debrid::unrestrict(client, url, &key, debrid_provider).await {
+                    Ok(unrestricted) => {
+                        tracing::info!("Debrid unlocked {}", url);
+                        return Ok(vec![unrestricted]);
+                    }
+                    // A hoster nothing else here takes: the provider's answer is the error.
+                    Err(e) if crate::debrid::is_debrid_host(url) && !Self::handles(url) => return Err(e),
+                    Err(e) => tracing::warn!("{}; trying {} without debrid", e, url),
                 }
             }
+        }
+
+        // File-sharing hosts with resolvers of their own (see `crate::mega`, `crate::shares`).
+        if crate::mega::handles(url) {
+            return with_timeout(crate::mega::resolve(client, url)).await;
+        }
+        if crate::shares::handles(url) {
+            return with_timeout(crate::shares::resolve(client, url, proxy)).await;
         }
 
         // 1. DoodStream embed / watch resolver
@@ -1539,6 +1463,8 @@ const OWN_AGENT_HOSTS: &[&str] = &["codeberg.org"];
 
 /// `request`, for `url`, with the User-Agent `url`'s host takes.
 pub(crate) fn with_agent_for(request: reqwest::RequestBuilder, url: &Url) -> reqwest::RequestBuilder {
+    // The cookie a file share's download wants (see `crate::shares::with_cookie`).
+    let request = crate::shares::with_cookie(request, url);
     match url.host_str() {
         Some(host) if OWN_AGENT_HOSTS.contains(&host.trim_end_matches('.')) => request.header(USER_AGENT, APP_USER_AGENT),
         _ => request,
@@ -2469,17 +2395,12 @@ mod tests {
         for (url, service) in [
             ("https://mega.nz/file/abc#key", "MEGA"),
             ("https://mega.nz/folder/abc#key", "MEGA"),
-            ("https://1drv.ms/u/s!abc", "OneDrive"),
-            ("https://onedrive.live.com/?cid=abc&id=def", "OneDrive"),
-            ("https://contoso.sharepoint.com/:u:/g/abc", "SharePoint"),
-            ("https://contoso-my.sharepoint.com/:x:/p/abc", "SharePoint"),
+            // Pages of services `crate::shares` reads other links of.
+            ("https://pixeldrain.com/d/abc", "Pixeldrain"),
+            ("https://www.terabox.com/web/share/link?surl=abc", "Terabox"),
+            ("https://contoso.sharepoint.com/sites/team/SitePages/Home.aspx", "SharePoint"),
             ("https://we.tl/t-abc", "WeTransfer"),
             ("https://wetransfer.com/downloads/abc/def", "WeTransfer"),
-            ("https://www.terabox.com/s/1abc", "Terabox"),
-            ("https://1024terabox.com/s/1abc", "Terabox"),
-            ("https://www.nephobox.com/s/1abc", "Terabox"),
-            ("https://gofile.io/d/abc", "Gofile"),
-            ("https://pixeldrain.com/u/abc", "Pixeldrain"),
             ("https://www.icloud.com/iclouddrive/abc#file", "iCloud"),
             ("https://disk.yandex.ru/client/disk", "Yandex Disk"),
             ("https://u.pcloud.link/publink/show?code=abc", "pCloud"),
@@ -2992,14 +2913,5 @@ host.example.com\tFALSE\t/\tFALSE\t0\thostonly\t1
         assert!(StreamtapeResolver.can_handle(&Url::parse("https://streamtape.com/v/abc123xyz").unwrap()));
         assert!(StreamtapeResolver.can_handle(&Url::parse("https://streamtape.to/e/abc123xyz").unwrap()));
         assert!(!StreamtapeResolver.can_handle(&Url::parse("https://example.com/v/abc123xyz").unwrap()));
-    }
-
-    #[test]
-    fn test_debrid_is_debrid_host() {
-        assert!(DebridResolver::is_debrid_host(&Url::parse("https://rapidgator.net/file/12345/video.mp4.html").unwrap()));
-        assert!(DebridResolver::is_debrid_host(&Url::parse("https://1fichier.com/?abcdef123").unwrap()));
-        assert!(DebridResolver::is_debrid_host(&Url::parse("https://doodstream.com/d/123").unwrap()));
-        assert!(DebridResolver::is_debrid_host(&Url::parse("https://streamtape.com/v/123").unwrap()));
-        assert!(!DebridResolver::is_debrid_host(&Url::parse("https://wikipedia.org/").unwrap()));
     }
 }

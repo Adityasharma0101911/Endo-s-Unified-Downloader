@@ -169,6 +169,8 @@ struct Stats {
     if_ranges: AtomicUsize,
     /// Requests of any kind (HEAD, probe, GET) that carried an Authorization header.
     authorized: AtomicUsize,
+    /// The address each GET came from, in request order.
+    peers: Mutex<Vec<std::net::IpAddr>>,
 }
 
 impl Mock {
@@ -322,6 +324,7 @@ async fn handle(mut socket: TcpStream, mock: Arc<Mock>) {
         (if busy { Reply::Status(503, None) } else { mock.probe_reply }, None)
     } else {
         let index = s.gets.fetch_add(1, Ordering::SeqCst);
+        s.peers.lock().unwrap().extend(socket.peer_addr().map(|a| a.ip()));
         let active = s.active.fetch_add(1, Ordering::SeqCst) + 1;
         let guard = ActiveGuard(&s.active);
         if header("if-range").is_some() {
@@ -507,6 +510,32 @@ async fn test_multi_threaded_download_and_verification() {
     assert_file(&out, &data);
     assert_no_leftovers(&out);
     assert!(mock.served_ranges().len() >= 4, "expected one request per chunk");
+}
+
+/// Connections spread over every local address given, each its own route; one that cannot
+/// connect (an address this machine does not have, like an unplugged network's) is dropped and
+/// its share goes to the others.
+#[tokio::test]
+async fn test_connections_spread_over_local_addresses_and_drop_a_dead_one() {
+    let _history = setup().await;
+    let data = payload(PREFETCH + 4096 * KB, 41);
+    let temp = tempdir().unwrap();
+    let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+
+    for (routes, expected) in [(["127.0.0.1", "127.0.0.2"], vec![ip("127.0.0.1"), ip("127.0.0.2")]), (["127.0.0.1", "192.0.2.1"], vec![ip("127.0.0.1")])] {
+        let mock = Arc::new(Mock::new(data.clone()));
+        let url = serve(Arc::clone(&mock), "routes.bin").await;
+        let out = temp.path().join(format!("routes-{}.bin", routes[1]));
+        let options = DownloadOptions { bind_addresses: routes.iter().map(|r| ip(r)).collect(), ..options(&out, 4, 256 * KB) };
+
+        run(&DownloadEngine::new(vec![url], options), None).await.expect("download should succeed");
+
+        assert_file(&out, &data);
+        let mut peers = mock.stats.peers.lock().unwrap().clone();
+        peers.sort();
+        peers.dedup();
+        assert_eq!(peers, expected, "routes {:?}", routes);
+    }
 }
 
 #[tokio::test]

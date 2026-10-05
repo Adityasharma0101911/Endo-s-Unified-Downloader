@@ -17,6 +17,7 @@ import {
   sanitizeFilename,
   splitRequestHeaders,
 } from "./lib/detect.js";
+import { MAX_BATCH, cookieHeader } from "./lib/links.js";
 
 const APP_NAME = "endos-unified-downloader";
 const APP_PORTS = [49152, 49153, 49154, 49155];
@@ -602,6 +603,24 @@ async function cookieJarFor(item, target) {
   return [...jar.values()].slice(0, MAX_COOKIES);
 }
 
+/**
+ * The Cookie header the browser has for each origin of `urls`, read at the first link of that origin (so its path
+ * counts), in the app's `cookies_by_origin` shape; origins without cookies are left out. By origin, not host: an https
+ * link's Secure cookies must never reach an http link of the same host.
+ */
+async function cookiesByOrigin(urls) {
+  if (!chrome.cookies) return {};
+  const first = new Map();
+  for (const url of urls) {
+    const origin = new URL(url).origin;
+    if (!first.has(origin)) first.set(origin, url);
+  }
+  const headers = await Promise.all(
+    [...first].map(([origin, url]) => chrome.cookies.getAll({ url }).then((cookies) => [origin, cookieHeader(cookies)], () => [origin, ""])),
+  );
+  return Object.fromEntries(headers.filter(([, header]) => header));
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // Install / update
 
@@ -938,6 +957,24 @@ const POPUP_COMMANDS = {
 
   SEND_URL({ url, filename, referer }) {
     return sendToApp({ url, filename, referer });
+  },
+
+  /**
+   * The link grabber's batch: the chosen links of the tab, with its URL as the referer, the browser's User-Agent and
+   * each origin's cookies, which the app gives only to that origin's links.
+   */
+  async SEND_LINKS({ tabId, urls }) {
+    if (!validTabId(tabId) || !Array.isArray(urls) || urls.length === 0 || !urls.every(isHttpUrl)) return { ok: false, error: "bad request" };
+    if (urls.length > MAX_BATCH) return { ok: false, error: `Send at most ${MAX_BATCH} links at once.` };
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    const body = { urls, user_agent: navigator.userAgent, cookies_by_origin: await cookiesByOrigin(urls) };
+    if (isHttpUrl(tab?.url)) body.referer = tab.url;
+    try {
+      await callApp("/add", { json: body, verify: true });
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, error: error.message };
+    }
   },
 
   async BLOCK_HOST({ host }) {

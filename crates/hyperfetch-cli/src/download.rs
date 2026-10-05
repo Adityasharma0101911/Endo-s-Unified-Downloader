@@ -501,6 +501,13 @@ async fn run_job(
         Ok(path) => {
             if !ui.quiet {
                 ui.print(&done_line(input.as_deref(), &path));
+                // Post-processing notes come in the last snapshot, which may still be queued.
+                while let Ok(snapshot) = rx.try_recv() {
+                    last = Some(snapshot);
+                }
+                for note in last.iter().flat_map(|snapshot| &snapshot.notes) {
+                    ui.print(&format!("  {}", printable(note)));
+                }
             }
             Outcome::Done
         }
@@ -878,6 +885,7 @@ mod tests {
             mirror_speeds: vec![],
             chunks: vec![],
             target_path: None,
+            ..Default::default()
         };
         assert!(is_recording(Some(&snapshot(0, 4096))));
         // A server that sends no size: the engine's own download of a file.

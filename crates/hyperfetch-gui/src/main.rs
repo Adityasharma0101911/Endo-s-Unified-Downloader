@@ -15,7 +15,6 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use eframe::egui;
-use egui::Color32;
 use hyperfetch_core::chunk::ChunkSnapshot;
 use hyperfetch_core::engine::{build_client, ClientKey, DownloadEngine, DownloadOptions, EngineSnapshot, SharedLimits};
 use hyperfetch_core::history::{DownloadHistoryManager, HistoryEntry};
@@ -46,9 +45,11 @@ const CONFIRM_FILES: usize = 50;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
+    /// The link form, and the download shown (see `App::focused`).
     Downloader,
     Queue,
     History,
+    Settings,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -162,6 +163,8 @@ struct JobView {
     got_snapshot: bool,
     /// Its last snapshot was a live recording's (see `EngineSnapshot::is_recording`).
     recording: bool,
+    /// Peers and upload of a BitTorrent download, from its last snapshot.
+    torrent: Option<hyperfetch_core::p2p::TorrentProgress>,
 }
 
 impl JobView {
@@ -246,6 +249,8 @@ struct App {
     jobs: HashMap<usize, JobView>,
     /// The download shown on the Downloader tab.
     focused: Option<usize>,
+    /// The download selected in the queue list, which Delete removes.
+    selected: Option<usize>,
     /// Whether an ffmpeg was found (see [`AppEvent::FfmpegFound`]); None until that is known.
     ffmpeg_found: Option<bool>,
     /// Media downloads started (the id, and whether from zero) while the user has not said whether
@@ -287,7 +292,7 @@ struct App {
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, rt: tokio::runtime::Handle, restart: Arc<Mutex<Option<PathBuf>>>) -> Self {
-        apply_theme(&cc.egui_ctx);
+        ui::setup(&cc.egui_ctx);
         let settings = Settings::load();
         let (queue, queue_problem) = queue_store::load(&queue_store::path());
         let queue_saver = queue_store::Saver::spawn(queue_store::path())
@@ -352,6 +357,7 @@ impl App {
             queue_saver,
             jobs: HashMap::new(),
             focused: None,
+            selected: None,
             ffmpeg_found: None,
             ffmpeg_waiting: Vec::new(),
             anim_job: None,
@@ -699,6 +705,7 @@ impl App {
         let Some(item) = self.queue.get_item(id) else { return false };
         let (urls, mut options, folder) = (item.urls.clone(), item.options.clone(), util::folder_to_create(item));
         options.install_ffmpeg = self.settings.install_ffmpeg == Some(true);
+        self.settings.fill_keys(&mut options);
         let leftovers_of = if fresh { item.target_path.clone() } else { None };
         if !self.queue.mark_started(id) {
             return false;
@@ -863,6 +870,7 @@ impl App {
                 view.speed_history.pop_front();
             }
             self.queue.apply_snapshot(id, &snapshot);
+            view.torrent.clone_from(&snapshot.torrent);
             view.mirror_speeds = snapshot.mirror_speeds;
             if !snapshot.chunks.is_empty() {
                 view.chunks = snapshot.chunks;
@@ -963,9 +971,16 @@ impl App {
             AppEvent::Read { origin, input, checksum, auth, result, notes } => self.read_done(origin, input, checksum, auth, result, notes),
             AppEvent::JobFinished { id, result } => {
                 if let Some(view) = self.jobs.get_mut(&id) {
-                    if let (Some(_), Some(started)) = (view.running.take(), view.started) {
+                    let running = view.running.take();
+                    // The last snapshot (with the post-processing notes) may not have been drawn yet.
+                    if let Some(snapshot) = running.as_ref().and_then(|r| lock(&r.snapshot).take()) {
+                        self.queue.apply_snapshot(id, &snapshot);
+                    }
+                    if let (Some(_), Some(started)) = (running, view.started) {
                         view.elapsed = started.elapsed();
                     }
+                    // No snapshot tells of its seeding any more.
+                    view.torrent = None;
                     // The last snapshot predates the final bytes.
                     if result.is_ok() {
                         for chunk in &mut view.chunks {
@@ -1104,6 +1119,9 @@ impl App {
     /// extension saw the page fetch, whatever its path looks like (`/feed/index.m3u8`), nor one
     /// sent with the playlist the page built, of which it is only the base.
     fn add_remote(&mut self, payload: ipc::RemoteAddPayload) {
+        if !payload.urls.is_empty() {
+            return self.add_remote_batch(&payload);
+        }
         let url = payload.url.trim().to_string();
         if url.is_empty() {
             return;
@@ -1135,6 +1153,28 @@ impl App {
             Ok(id) => self.notice = Some(Ok(format!("Added remote download #{} to queue: {}", id, shown))),
             Err(e) => self.notice = Some(Err(format!("Could not add remote download: {}", e))),
         }
+    }
+
+    /// Queues every link of a batch the extension's link grabber sent (see
+    /// `ipc::RemoteAddPayload::batch`); the queue runs them. A link to read first is read as a
+    /// dropped file is.
+    fn add_remote_batch(&mut self, payload: &ipc::RemoteAddPayload) {
+        let (mut added, mut errors) = (0, Vec::new());
+        for link in payload.batch() {
+            if ingest::needs_reading(&link.url) {
+                self.read_document(link.url.clone(), Origin::Dropped, String::new(), String::new());
+            } else if let Err(e) = self.add_browser_download(&link.url, &link) {
+                errors.push(format!("{}: {}", ingest::truncate_chars(&link.url, 60), e));
+            } else {
+                added += 1;
+            }
+        }
+        let shown = format!("Added {} download(s) from the browser to the queue", added);
+        self.notice = Some(match errors.len() {
+            0 => Ok(shown),
+            // A few reasons are enough; a thousand would bury the notice.
+            n => Err(format!("{}; {} refused:\n{}", shown, n, errors[..n.min(3)].join("\n"))),
+        });
     }
 
     /// Queues the download of `url` as the browser asked for it: under its file name, with its
@@ -1270,7 +1310,7 @@ impl eframe::App for App {
         self.run_scheduler();
         let animating = self.animate();
 
-        egui::CentralPanel::default().show(ctx, |ui| ui::render(self, ui));
+        ui::render(self, ctx);
 
         if let Some(dialog) = self.pending_dialog.take() {
             self.open_dialog(dialog, frame);
@@ -1318,6 +1358,11 @@ impl eframe::App for App {
         if !wait_for_tasks(&self.rt, tasks, EXIT_GRACE) {
             tracing::warn!("Some downloads did not stop within {}s", EXIT_GRACE.as_secs());
         }
+        // Torrents still seeding stop with the app; their files stay.
+        let stopped = self.rt.block_on(async { tokio::time::timeout(EXIT_GRACE, hyperfetch_core::p2p::shutdown()).await });
+        if stopped.is_err() {
+            tracing::warn!("The BitTorrent session did not stop within {}s", EXIT_GRACE.as_secs());
+        }
         // Record how the stopped downloads ended; any still stopping are saved as paused.
         while let Ok(event) = self.events_rx.try_recv() {
             if let AppEvent::JobFinished { id, result } = event {
@@ -1356,8 +1401,14 @@ fn task_options(settings: &Settings, task: &Task, checksum: &str, auth: &str) ->
     for part in [&task.folder, &task.name].into_iter().flatten() {
         options.output_path = options.output_path.map(|path| path.join(part));
     }
+    // An unnamed torrent is saved in the folder itself (see `DownloadEngine::save_dir`).
+    if task.p2p && task.name.is_none() {
+        options.output_path = options.output_path.map(|path| path.join(""));
+    }
     options.media_name = task.media_name.clone();
     options.archive_lines = task.archive.clone();
+    options.bittorrent = task.p2p;
+    options.post.sort &= !task.keeps_its_place();
     Ok(options)
 }
 
@@ -1568,7 +1619,7 @@ async fn run_job(
     };
 
     let (tx, mut rx) = broadcast::channel::<EngineSnapshot>(16);
-    let forward = tokio::spawn(async move {
+    let mut forward = tokio::spawn(async move {
         loop {
             match rx.recv().await {
                 Ok(snapshot) => {
@@ -1594,10 +1645,13 @@ async fn run_job(
             run.await
         }
     };
+    // The last snapshot carries the post-processing notes: let it through first.
+    let _ = tokio::time::timeout(Duration::from_millis(500), &mut forward).await;
     forward.abort();
 
     let path = result?;
-    let size = tokio::fs::metadata(&path).await.ok().map(|m| m.len());
+    // A folder's (a torrent's, a gallery's) is the snapshots' total, which this keeps.
+    let size = tokio::fs::metadata(&path).await.ok().filter(|m| m.is_file()).map(|m| m.len());
     Ok((path, size))
 }
 
@@ -1666,19 +1720,6 @@ fn spawn_clipboard_watcher(
     if let Err(e) = spawned {
         tracing::warn!("Clipboard watcher unavailable: {}", e);
     }
-}
-
-fn apply_theme(ctx: &egui::Context) {
-    let mut style = (*ctx.style()).clone();
-    style.visuals.dark_mode = true;
-    style.visuals.override_text_color = Some(Color32::from_rgb(228, 232, 240));
-    style.visuals.window_fill = Color32::from_rgb(18, 20, 24);
-    style.visuals.panel_fill = Color32::from_rgb(18, 20, 24);
-    style.visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(26, 28, 35);
-    style.visuals.widgets.inactive.bg_fill = Color32::from_rgb(32, 35, 45);
-    style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(45, 50, 65);
-    style.visuals.widgets.active.bg_fill = Color32::from_rgb(30, 64, 175);
-    ctx.set_style(style);
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -2269,6 +2310,33 @@ mod tests {
         assert!(built.options.hls && built.options.height.is_none(), "no height of 0");
         assert!(app.reading.is_empty(), "not read as a document");
         assert_eq!(app.queue.items().len(), 4);
+    }
+
+    /// The link grabber's batch is queued whole, each link with the page's referer and User-Agent
+    /// alone; a list among them is read; nothing the URL box holds is touched.
+    #[test]
+    fn a_batch_from_the_browser_is_queued() {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(&rt, dir.path());
+        app.url_input = "https://typed.example/a.iso".into();
+        app.handle_event(AppEvent::RemoteAdd(
+            serde_json::from_value(serde_json::json!({
+                "urls": ["https://a.example/x.zip", "https://b.example/y.pdf", "https://c.example/list.meta4"],
+                "referer": "https://page.example/",
+                "user_agent": "Mozilla/5.0 Test",
+            }))
+            .unwrap(),
+        ));
+        assert_eq!(queued(&app), ["https://a.example/x.zip", "https://b.example/y.pdf"]);
+        for item in app.queue.items() {
+            assert!(!item.status.is_active());
+            assert_eq!(item.options.referer.as_deref(), Some("https://page.example/"));
+            assert_eq!(item.options.headers, [("User-Agent".to_string(), "Mozilla/5.0 Test".to_string())]);
+        }
+        assert!(app.reading.contains_key("https://c.example/list.meta4"), "the list is read");
+        assert_eq!(app.url_input, "https://typed.example/a.iso");
+        assert_eq!(app.notice, Some(Ok("Added 2 download(s) from the browser to the queue".to_string())));
     }
 
     /// A remote document is fetched through the proxy setting: its host does not exist, so only

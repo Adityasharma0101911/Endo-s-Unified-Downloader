@@ -325,7 +325,7 @@ fn unpack_extension(zip: &[u8], into: &Path) -> Result<(), String> {
 
 /// Whether zip entry `name` would land outside the folder it is unpacked into: absolute, on a
 /// drive, through `..`, or with a backslash, which Windows takes for a folder separator.
-fn escapes(name: &str) -> bool {
+pub(crate) fn escapes(name: &str) -> bool {
     name.starts_with('/') || name.contains(['\\', ':']) || name.split('/').any(|part| part == "..")
 }
 

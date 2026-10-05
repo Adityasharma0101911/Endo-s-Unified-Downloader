@@ -13,6 +13,8 @@ use hyperfetch_core::engine::DownloadOptions;
 use hyperfetch_core::history::{is_redacted, DownloadHistoryManager, HistoryEntry, HistoryStatus, REDACTED_LINK};
 use hyperfetch_core::ingest::{decode_text, descriptor_client, http_url, ingest, input_tokens, ListOptions, Task};
 use hyperfetch_core::media::{find_ffmpeg_path, is_supported_media_site, BrowserCookieSource};
+use hyperfetch_core::p2p;
+use hyperfetch_core::postprocess::PostOptions;
 use hyperfetch_core::resolver::SmartResolver;
 use hyperfetch_core::state::DownloadState;
 use hyperfetch_core::updater;
@@ -32,10 +34,16 @@ fn main() {
     // What an earlier update left behind (the old programs) can be deleted once they have exited.
     updater::cleanup_old();
     let args = Args::parse();
-    let code = run_detached(app(args)).unwrap_or_else(|e| {
-        stderr_line(&format!("error: cannot start the async runtime: {}", e));
-        EXIT_FAILED
-    });
+    // On a thread of its own: a MEGA or swarm download nests futures deep enough to overflow
+    // the main thread's 1 MiB stack on Windows in a debug build.
+    let code = std::thread::Builder::new()
+        .stack_size(8 << 20)
+        .spawn(move || run_detached(app(args)))
+        .and_then(|runner| runner.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)))
+        .unwrap_or_else(|e| {
+            stderr_line(&format!("error: cannot start the async runtime: {}", e));
+            EXIT_FAILED
+        });
     let _ = std::io::stdout().flush();
     // Exit without waiting for a blocking stdin read that may still be pending.
     std::process::exit(code);
@@ -69,11 +77,21 @@ async fn app(args: Args) -> i32 {
         Ok(client) => client,
         Err(e) => return usage(&e),
     };
-    if args.urls.is_empty() && args.input_file.is_none() {
+    let code = if args.urls.is_empty() && args.input_file.is_none() {
         interactive(&args, &ui, &shutdown, &http, at_terminal().then_some(find_ffmpeg_path as Finder), prompt).await
     } else {
         batch(&args, &ui, &shutdown, &http).await
+    };
+    // Finished torrents seed as --seed-ratio/--seed-time say, unless Ctrl+C stops them.
+    if args.seed_ratio.is_some() || args.seed_time.is_some() {
+        let mut stop = shutdown.subscribe();
+        tokio::select! {
+            () = p2p::wait_seeding() => {}
+            () = stop_requested(&mut stop) => {}
+        }
     }
+    p2p::shutdown().await;
+    code
 }
 
 fn usage(message: &str) -> i32 {
@@ -118,9 +136,13 @@ fn init_tracing(verbose: u8, ui: &Ui) {
 }
 
 /// Rejects options that name a single file when there are several downloads.
-fn check_single_file_options(output: Option<&Path>, has_checksum: bool, tasks: usize) -> Result<(), String> {
+fn check_single_file_options(output: Option<&Path>, has_checksum: bool, tasks: usize, swarm: bool) -> Result<(), String> {
     if output.is_some() && tasks > 1 {
         return Err(format!("-o names one file, but the input has {} downloads; use -d DIR instead", tasks));
+    }
+    // A torrent's files keep their names: it seeds and resumes from them.
+    if output.is_some() && swarm {
+        return Err("-o cannot rename a torrent's files; use -d DIR instead".to_string());
     }
     if has_checksum && tasks > 1 {
         return Err(format!("--checksum applies to one file, but the input has {} downloads", tasks));
@@ -152,7 +174,7 @@ async fn prepare_dir(dir: &Path) -> Result<PathBuf, String> {
 /// Saves `task` under `dir`: as -o, else as its name in its folder, else into its folder under
 /// the name the server or yt-dlp gives.
 fn job(args: &Args, connections: u64, dir: &Path, task: Task) -> Job {
-    let label = task.label();
+    let (label, keeps_its_place) = (task.label(), task.keeps_its_place());
     let folder = task.folder.as_ref().map_or_else(|| dir.to_path_buf(), |folder| dir.join(folder));
     let output = match (&args.output, &task.name) {
         (Some(file), _) => dir.join(file),
@@ -182,6 +204,15 @@ fn job(args: &Args, connections: u64, dir: &Path, task: Task) -> Job {
         hls_to_mp4: args.hls_mp4,
         media_name: task.media_name,
         archive_lines: task.archive,
+        bittorrent: task.p2p,
+        post: PostOptions {
+            extract: args.extract,
+            delete_archive: args.delete_archive,
+            sort: args.sort && !keeps_its_place,
+            run_after: args.exec.clone(),
+            mark_of_the_web: !args.no_mark_of_the_web,
+            virustotal_key: args.virustotal_key.clone(),
+        },
         ..tuning(args, if media { args.concurrent_fragments } else { connections })
     };
     Job { label, urls: task.urls, options, line: None }
@@ -203,6 +234,10 @@ fn list_options(args: &Args) -> ListOptions {
         proxy: args.proxy.clone(),
         // Each input's own (see `listed`).
         notes: None,
+        p2p: !args.no_p2p,
+        debrid_key: args.debrid_key.clone(),
+        debrid_provider: args.debrid_provider.clone(),
+        debrid_magnets: true,
     }
 }
 
@@ -254,6 +289,17 @@ fn tuning(args: &Args, connections: u64) -> DownloadOptions {
         proxy_pool,
         debrid_api_key: args.debrid_key.clone(),
         debrid_provider: args.debrid_provider.clone(),
+        bind_addresses: if args.all_networks {
+            hyperfetch_core::netif::usable().into_iter().map(|i| i.address).collect()
+        } else {
+            args.bind_address.clone()
+        },
+        // --seed-time alone seeds that long, whatever the ratio.
+        seed_ratio: args.seed_ratio.unwrap_or(if args.seed_time.is_some() { f64::MAX } else { 0.0 }),
+        seed_minutes: args.seed_time.unwrap_or(0),
+        bt_port: args.bt_port,
+        bt_upnp: args.upnp,
+        gallery_dl: !args.no_gallery_dl,
         ..Default::default()
     }
 }
@@ -336,7 +382,8 @@ async fn batch(args: &Args, ui: &Ui, shutdown: &Shutdown, http: &reqwest::Client
     }
 
     let (tasks, mut failed) = read_tasks(&inputs, ui, http, &list_options(args)).await;
-    if let Err(e) = check_single_file_options(args.output.as_deref(), args.checksum.is_some(), tasks.len()) {
+    let swarm = tasks.iter().any(|(_, task)| task.p2p);
+    if let Err(e) = check_single_file_options(args.output.as_deref(), args.checksum.is_some(), tasks.len(), swarm) {
         return usage(&e);
     }
     if tasks.is_empty() {
@@ -499,7 +546,8 @@ where
                 continue;
             }
         };
-        if let Err(e) = check_single_file_options(args.output.as_deref(), args.checksum.is_some(), tasks.len()) {
+        let swarm = tasks.iter().any(|task| task.p2p);
+        if let Err(e) = check_single_file_options(args.output.as_deref(), args.checksum.is_some(), tasks.len(), swarm) {
             stderr_line(&format!("[ERROR] {}", e));
             continue;
         }
@@ -891,10 +939,12 @@ mod tests {
     #[test]
     fn single_file_options_need_a_single_task() {
         let file = Path::new("does-not-exist-hf-cli/out.bin");
-        assert!(check_single_file_options(Some(file), true, 1).is_ok());
-        assert!(check_single_file_options(Some(file), false, 2).unwrap_err().contains("-d DIR"));
-        assert!(check_single_file_options(None, true, 2).unwrap_err().contains("--checksum"));
-        assert!(check_single_file_options(None, false, 5).is_ok());
+        assert!(check_single_file_options(Some(file), true, 1, false).is_ok());
+        assert!(check_single_file_options(Some(file), false, 2, false).unwrap_err().contains("-d DIR"));
+        assert!(check_single_file_options(None, true, 2, false).unwrap_err().contains("--checksum"));
+        assert!(check_single_file_options(None, false, 5, false).is_ok());
+        assert!(check_single_file_options(Some(file), false, 1, true).unwrap_err().contains("torrent"));
+        assert!(check_single_file_options(None, false, 1, true).is_ok());
     }
 
     #[tokio::test]
