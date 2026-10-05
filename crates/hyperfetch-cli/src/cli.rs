@@ -274,8 +274,9 @@ pub struct Args {
     #[arg(long = "repair", requires = "verify")]
     pub repair: bool,
 
-    /// Install the newest signed release from GitHub over this program (Windows; with --proxy if
-    /// given), and the GUI and browser extension next to it, then exit
+    /// Install the newest signed release from GitHub over this program (Windows and macOS; with
+    /// --proxy if given): on Windows the GUI and browser extension next to it too, on macOS the
+    /// whole app bundle; then exit
     #[arg(long = "update", conflicts_with_all = ["urls", "input_file", "verify", "repair", "history"])]
     pub update: bool,
 }

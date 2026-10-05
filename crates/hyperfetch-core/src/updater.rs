@@ -254,7 +254,15 @@ async fn install_bundle_from(
     // Before anything is downloaded: also whether the bundle's folder can be written.
     let parent = bundle.parent().ok_or("The app's bundle has no folder")?;
     let staging = parent.join(format!(".endo-update-{}.tmp", unique_suffix()));
-    std::fs::create_dir(&staging).map_err(|e| format!("Cannot write next to {}: {e}. {MOVE_THE_APP}", bundle.display()))?;
+    std::fs::create_dir(&staging).map_err(|e| match e.kind() {
+        // A standard account's /Applications, say, where moving the app would not help.
+        std::io::ErrorKind::PermissionDenied => format!(
+            "Your account cannot write to {}: update from an administrator account, or download the new version from {}",
+            parent.display(),
+            update.page
+        ),
+        _ => format!("Cannot write next to {}: {e}. {MOVE_THE_APP}", bundle.display()),
+    })?;
     let fetched = fetch_verified(client, releases, key, update, &[bundle_asset(arm)]).await;
     let installed = match fetched {
         Ok(mut files) => {
@@ -303,10 +311,18 @@ fn old_bundle(bundle: &Path) -> PathBuf {
     bundle.with_file_name(format!(".{name}.old-{}", unique_suffix()))
 }
 
-/// Moves `bundle` aside (see [`old_bundle`]) and `new` into its place, putting it back when that
-/// fails. A running program goes on from the bundle moved aside. Blocking.
+/// Puts `new` in place of `bundle` and moves the old one aside (see [`old_bundle`]), where a
+/// running program goes on from it: on macOS in one step, so that `bundle` never lacks a whole
+/// app; else, or on a volume that cannot (only APFS and HFS+ can), in two, putting the old one
+/// back when the second fails. Blocking.
 fn swap_bundle(bundle: &Path, new: &Path) -> Result<(), String> {
     let old = old_bundle(bundle);
+    #[cfg(target_os = "macos")]
+    if exchange(new, bundle).is_ok() {
+        // The old bundle is where the new one was.
+        let _ = std::fs::rename(new, &old);
+        return Ok(());
+    }
     std::fs::rename(bundle, &old).map_err(|e| format!("Failed to move {} aside: {e}. {MOVE_THE_APP}", bundle.display()))?;
     std::fs::rename(new, bundle).or_else(|e| {
         if let Err(e) = std::fs::rename(&old, bundle) {
@@ -314,6 +330,19 @@ fn swap_bundle(bundle: &Path, new: &Path) -> Result<(), String> {
         }
         Err(format!("Failed to replace {}: {e}", bundle.display()))
     })
+}
+
+/// Swaps the folders `a` and `b` in one step. Blocking.
+#[cfg(target_os = "macos")]
+fn exchange(a: &Path, b: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = |p: &Path| std::ffi::CString::new(p.as_os_str().as_bytes()).map_err(std::io::Error::other);
+    let (a, b) = (c_path(a)?, c_path(b)?);
+    // SAFETY: both strings are NUL-terminated and outlive the call.
+    match unsafe { libc::renamex_np(a.as_ptr(), b.as_ptr(), libc::RENAME_SWAP) } {
+        0 => Ok(()),
+        _ => Err(std::io::Error::last_os_error()),
+    }
 }
 
 /// Starts the updated program `exe` (see [`Installed::own`]) once this one closes: on macOS its
@@ -530,16 +559,22 @@ pub fn cleanup_old() {
 }
 
 /// [`cleanup_old`] of the bundle `bundle`, while it is there: deletes the bundles updates moved
-/// aside next to it (see [`old_bundle`]) and the folders they unpacked in (`.endo-update-*.tmp`).
+/// aside next to it (see [`old_bundle`]) and the folders they unpacked in (`.endo-update-*.tmp`)
+/// once those are an hour old: another instance's update may be using a newer one.
 fn cleanup_beside(bundle: &Path) {
     let (Some(parent), Some(name)) = (bundle.parent(), bundle.file_name()) else { return };
     if !bundle.is_dir() {
         return;
     }
     let moved = format!(".{}.old-", name.to_string_lossy());
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
     for entry in std::fs::read_dir(parent).into_iter().flatten().flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        let left = name.starts_with(&moved) || (name.starts_with(".endo-update-") && name.ends_with(".tmp"));
+        // Its name starts with when it was made (see unique_suffix); an update takes minutes.
+        let made = name.strip_prefix(".endo-update-").and_then(|rest| rest.strip_suffix(".tmp"));
+        let made = made.and_then(|rest| u128::from_str_radix(rest.split('-').next()?, 16).ok());
+        let stale = made.is_some_and(|made| now.saturating_sub(made) > Duration::from_secs(3600).as_nanos());
+        let left = name.starts_with(&moved) || stale;
         if left && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
             let _ = std::fs::remove_dir_all(entry.path());
         }
@@ -738,7 +773,8 @@ mod tests {
         let src = dir.join(format!("{name}-src"));
         make_bundle(&src.join(BUNDLE), version, "new");
         let archive = dir.join(name);
-        let status = std::process::Command::new(system_tar()).arg("-czf").arg(&archive).arg("-C").arg(&src).arg(BUNDLE).args(extra).status().unwrap();
+        // -P: GNU tar would drop the `../` of an entry in `extra`.
+        let status = std::process::Command::new(system_tar()).arg("-P").arg("-czf").arg(&archive).arg("-C").arg(&src).arg(BUNDLE).args(extra).status().unwrap();
         assert!(status.success());
         std::fs::read(archive).unwrap()
     }
@@ -790,21 +826,38 @@ mod tests {
         assert_eq!(bundle_version(&bundle).as_deref(), Some("1.3.0"));
     }
 
+    /// macOS swaps two folders in different folders in one step, as an update swaps the bundle.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn two_folders_swap_in_one_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("staging").join("b"));
+        for (folder, text) in [(&a, "a"), (&b, "b")] {
+            std::fs::create_dir_all(folder).unwrap();
+            std::fs::write(folder.join("x"), text).unwrap();
+        }
+        exchange(&a, &b).unwrap();
+        assert_eq!(std::fs::read_to_string(a.join("x")).unwrap(), "b");
+        assert_eq!(std::fs::read_to_string(b.join("x")).unwrap(), "a");
+    }
+
     /// Only what updates left beside the bundle goes, and only while the bundle is there.
     #[test]
     fn cleanup_deletes_the_bundles_updates_moved_aside() {
         let dir = tempfile::tempdir().unwrap();
         let apps = dir.path();
         let bundle = apps.join(BUNDLE);
-        let leftovers = [format!(".{BUNDLE}.old-1"), ".endo-update-2.tmp".to_string()];
-        for folder in leftovers.iter().map(String::as_str).chain([".endo-update-keep", "Other.app", ".Other.app.old-3"]) {
+        // One an update is unpacking in right now stays.
+        let busy = format!(".endo-update-{}.tmp", unique_suffix());
+        let leftovers = [format!(".{BUNDLE}.old-1"), ".endo-update-2-1-0.tmp".to_string()];
+        for folder in leftovers.iter().chain([&busy]).map(String::as_str).chain([".endo-update-keep", "Other.app", ".Other.app.old-3"]) {
             std::fs::create_dir(apps.join(folder)).unwrap();
         }
         cleanup_beside(&bundle);
-        assert_eq!(names_of(apps).len(), 5, "nothing goes while the bundle is missing");
+        assert_eq!(names_of(apps).len(), 6, "nothing goes while the bundle is missing");
         std::fs::create_dir(&bundle).unwrap();
         cleanup_beside(&bundle);
-        assert_eq!(names_of(apps), [".Other.app.old-3", ".endo-update-keep", BUNDLE, "Other.app"]);
+        assert_eq!(names_of(apps), [".Other.app.old-3", busy.as_str(), ".endo-update-keep", BUNDLE, "Other.app"]);
     }
 
     /// The bundle's extension is copied to the data folder when that has none or an older one.

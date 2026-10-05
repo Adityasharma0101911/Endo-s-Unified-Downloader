@@ -131,18 +131,29 @@ fn file_name(path: &Path) -> String {
     path.file_name().unwrap_or_default().to_string_lossy().into_owned()
 }
 
-/// Calls `f` with `path` if it is a file, else with every file in the folder `path`, all the way
-/// down. Links are not followed.
-fn each_file(path: &Path, f: &mut impl FnMut(&Path)) {
-    match std::fs::symlink_metadata(path) {
-        Ok(m) if m.is_file() => f(path),
-        Ok(m) if m.is_dir() => {
-            for entry in std::fs::read_dir(path).into_iter().flatten().flatten() {
-                each_file(&entry.path(), f);
-            }
-        }
-        _ => {}
+/// Calls `f` with `path` and its metadata, and when it is a folder with every file and folder in
+/// it, all the way down. Links are left out, and not followed.
+fn each_entry(path: &Path, f: &mut impl FnMut(&Path, &std::fs::Metadata)) {
+    let Ok(m) = std::fs::symlink_metadata(path) else { return };
+    if m.is_symlink() {
+        return;
     }
+    f(path, &m);
+    if m.is_dir() {
+        for entry in std::fs::read_dir(path).into_iter().flatten().flatten() {
+            each_entry(&entry.path(), f);
+        }
+    }
+}
+
+/// Calls `f` with `path` if it is a file, else with every file in the folder `path`, all the way
+/// down (see [`each_entry`]).
+fn each_file(path: &Path, f: &mut impl FnMut(&Path)) {
+    each_entry(path, &mut |entry, m| {
+        if m.is_file() {
+            f(entry)
+        }
+    });
 }
 
 /// The size of `path`: a file's, or that of every file in a folder, all the way down. Blocking.
@@ -155,14 +166,15 @@ pub(crate) fn size_of(path: &Path) -> u64 {
 /// Marks `path` (a file, or every file of a folder) as downloaded from the internet: Windows'
 /// Zone.Identifier stream, which SmartScreen and Office read, with `source` minus its secrets
 /// and its fragment (a MEGA folder's key); macOS' quarantine (see [`quarantine_value`]), which
-/// Gatekeeper reads. Best effort: FAT drives have no streams. Does nothing elsewhere.
+/// Gatekeeper reads, on the folders too: it reads an app's from its bundle folder. Best effort:
+/// FAT drives have no streams. Does nothing elsewhere.
 pub(crate) fn mark_from_internet(path: &Path, source: &Url) {
     #[cfg(target_os = "macos")]
     {
-        let now =std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
         let value = quarantine_value(now);
-        each_file(path, &mut |file| {
-            let _ = set_xattr(file, "com.apple.quarantine", value.as_bytes());
+        each_entry(path, &mut |entry, _| {
+            let _ = set_xattr(entry, "com.apple.quarantine", value.as_bytes());
         });
     }
     if !cfg!(windows) {
@@ -581,12 +593,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (file, folder) = (dir.path().join("a.bin"), dir.path().join("f"));
         std::fs::write(&file, b"x").unwrap();
-        std::fs::create_dir(&folder).unwrap();
+        let app = folder.join("X.app");
+        std::fs::create_dir_all(app.join("Contents")).unwrap();
         std::fs::write(folder.join("inner.txt"), b"y").unwrap();
         let done = after_download(&file, &PostOptions::default(), &url("https://example.com/a.bin"), None, None).await;
         assert_eq!(done, PostOutcome { path: file.clone(), notes: vec![] });
         mark_from_internet(&folder, &url("https://example.com/f.zip"));
-        for marked in [file, folder.join("inner.txt")] {
+        // Gatekeeper reads an app's quarantine from its bundle folder.
+        for marked in [file, folder.join("inner.txt"), folder.clone(), app.clone(), app.join("Contents")] {
             let (path, name) = (std::ffi::CString::new(marked.as_os_str().as_bytes()).unwrap(), c"com.apple.quarantine");
             let mut value = [0u8; 256];
             // SAFETY: NUL-terminated strings and a buffer of the length given.

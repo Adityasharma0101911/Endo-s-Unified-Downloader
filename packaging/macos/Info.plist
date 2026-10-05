@@ -22,11 +22,15 @@
 	<string>@VERSION@</string>
 	<key>CFBundleVersion</key>
 	<string>@VERSION@</string>
+	<key>LSAppNapIsDisabled</key>
+	<true/>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.utilities</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>11.0</string>
 	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSSupportsAutomaticGraphicsSwitching</key>
 	<true/>
 	<key>NSHumanReadableCopyright</key>
 	<string>Endo's Unified Downloader contributors. MIT or Apache-2.0.</string>
