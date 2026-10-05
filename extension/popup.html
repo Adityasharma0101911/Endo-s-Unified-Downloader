@@ -2,63 +2,150 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
+  <meta name="color-scheme" content="dark light">
   <title>Endo's Unified Downloader</title>
   <link rel="stylesheet" href="popup.css">
   <script type="module" src="popup.js"></script>
 </head>
 <body>
+  <!-- Icons: Phosphor Icons (regular), MIT licence: icons/PHOSPHOR-LICENSE.txt -->
+  <svg class="sprite" aria-hidden="true">
+    <symbol id="i-download" viewBox="0 0 256 256"><path d="M224,144v64a8,8,0,0,1-8,8H40a8,8,0,0,1-8-8V144a8,8,0,0,1,16,0v56H208V144a8,8,0,0,1,16,0Zm-101.66,5.66a8,8,0,0,0,11.32,0l40-40a8,8,0,0,0-11.32-11.32L136,124.69V32a8,8,0,0,0-16,0v92.69L93.66,98.34a8,8,0,0,0-11.32,11.32Z"/></symbol>
+    <symbol id="i-film" viewBox="0 0 256 256"><path d="M216,40H40A16,16,0,0,0,24,56V200a16,16,0,0,0,16,16H216a16,16,0,0,0,16-16V56A16,16,0,0,0,216,40ZM40,88h80v80H40Zm96-16V56h32V72Zm-16,0H88V56h32Zm0,112v16H88V184Zm16,0h32v16H136Zm0-16V88h80v80Zm80-96H184V56h32ZM72,56V72H40V56ZM40,184H72v16H40Zm176,16H184V184h32v16Z"/></symbol>
+    <symbol id="i-link" viewBox="0 0 256 256"><path d="M240,88.23a54.43,54.43,0,0,1-16,37L189.25,160a54.27,54.27,0,0,1-38.63,16h-.05A54.63,54.63,0,0,1,96,119.84a8,8,0,0,1,16,.45A38.62,38.62,0,0,0,150.58,160h0a38.39,38.39,0,0,0,27.31-11.31l34.75-34.75a38.63,38.63,0,0,0-54.63-54.63l-11,11A8,8,0,0,1,135.7,59l11-11A54.65,54.65,0,0,1,224,48,54.86,54.86,0,0,1,240,88.23ZM109,185.66l-11,11A38.41,38.41,0,0,1,70.6,208h0a38.63,38.63,0,0,1-27.29-65.94L78,107.31A38.63,38.63,0,0,1,144,135.71a8,8,0,0,0,16,.45A54.86,54.86,0,0,0,144,96a54.65,54.65,0,0,0-77.27,0L32,130.75A54.62,54.62,0,0,0,70.56,224h0a54.28,54.28,0,0,0,38.64-16l11-11A8,8,0,0,0,109,185.66Z"/></symbol>
+    <symbol id="i-record" viewBox="0 0 256 256"><path d="M128,24A104,104,0,1,0,232,128,104.11,104.11,0,0,0,128,24Zm0,192a88,88,0,1,1,88-88A88.1,88.1,0,0,1,128,216Zm0-160a72,72,0,1,0,72,72A72.08,72.08,0,0,0,128,56Zm0,128a56,56,0,1,1,56-56A56.06,56.06,0,0,1,128,184Z"/></symbol>
+    <symbol id="i-gear" viewBox="0 0 256 256"><path d="M128,80a48,48,0,1,0,48,48A48.05,48.05,0,0,0,128,80Zm0,80a32,32,0,1,1,32-32A32,32,0,0,1,128,160Zm109.94-52.79a8,8,0,0,0-3.89-5.4l-29.83-17-.12-33.62a8,8,0,0,0-2.83-6.08,111.91,111.91,0,0,0-36.72-20.67,8,8,0,0,0-6.46.59L128,41.85,97.88,25a8,8,0,0,0-6.47-.6A112.1,112.1,0,0,0,54.73,45.15a8,8,0,0,0-2.83,6.07l-.15,33.65-29.83,17a8,8,0,0,0-3.89,5.4,106.47,106.47,0,0,0,0,41.56,8,8,0,0,0,3.89,5.4l29.83,17,.12,33.62a8,8,0,0,0,2.83,6.08,111.91,111.91,0,0,0,36.72,20.67,8,8,0,0,0,6.46-.59L128,214.15,158.12,231a7.91,7.91,0,0,0,3.9,1,8.09,8.09,0,0,0,2.57-.42,112.1,112.1,0,0,0,36.68-20.73,8,8,0,0,0,2.83-6.07l.15-33.65,29.83-17a8,8,0,0,0,3.89-5.4A106.47,106.47,0,0,0,237.94,107.21Zm-15,34.91-28.57,16.25a8,8,0,0,0-3,3c-.58,1-1.19,2.06-1.81,3.06a7.94,7.94,0,0,0-1.22,4.21l-.15,32.25a95.89,95.89,0,0,1-25.37,14.3L134,199.13a8,8,0,0,0-3.91-1h-.19c-1.21,0-2.43,0-3.64,0a8.08,8.08,0,0,0-4.1,1l-28.84,16.1A96,96,0,0,1,67.88,201l-.11-32.2a8,8,0,0,0-1.22-4.22c-.62-1-1.23-2-1.8-3.06a8.09,8.09,0,0,0-3-3.06l-28.6-16.29a90.49,90.49,0,0,1,0-28.26L61.67,97.63a8,8,0,0,0,3-3c.58-1,1.19-2.06,1.81-3.06a7.94,7.94,0,0,0,1.22-4.21l.15-32.25a95.89,95.89,0,0,1,25.37-14.3L122,56.87a8,8,0,0,0,4.1,1c1.21,0,2.43,0,3.64,0a8.08,8.08,0,0,0,4.1-1l28.84-16.1A96,96,0,0,1,188.12,55l.11,32.2a8,8,0,0,0,1.22,4.22c.62,1,1.23,2,1.8,3.06a8.09,8.09,0,0,0,3,3.06l28.6,16.29A90.49,90.49,0,0,1,222.9,142.12Z"/></symbol>
+    <symbol id="i-dots" viewBox="0 0 256 256"><path d="M140,128a12,12,0,1,1-12-12A12,12,0,0,1,140,128Zm56-12a12,12,0,1,0,12,12A12,12,0,0,0,196,116ZM60,116a12,12,0,1,0,12,12A12,12,0,0,0,60,116Z"/></symbol>
+    <symbol id="i-globe" viewBox="0 0 256 256"><path d="M128,24h0A104,104,0,1,0,232,128,104.12,104.12,0,0,0,128,24Zm88,104a87.61,87.61,0,0,1-3.33,24H174.16a157.44,157.44,0,0,0,0-48h38.51A87.61,87.61,0,0,1,216,128ZM102,168H154a115.11,115.11,0,0,1-26,45A115.27,115.27,0,0,1,102,168Zm-3.9-16a140.84,140.84,0,0,1,0-48h59.88a140.84,140.84,0,0,1,0,48ZM40,128a87.61,87.61,0,0,1,3.33-24H81.84a157.44,157.44,0,0,0,0,48H43.33A87.61,87.61,0,0,1,40,128ZM154,88H102a115.11,115.11,0,0,1,26-45A115.27,115.27,0,0,1,154,88Zm52.33,0H170.71a135.28,135.28,0,0,0-22.3-45.6A88.29,88.29,0,0,1,206.37,88ZM107.59,42.4A135.28,135.28,0,0,0,85.29,88H49.63A88.29,88.29,0,0,1,107.59,42.4ZM49.63,168H85.29a135.28,135.28,0,0,0,22.3,45.6A88.29,88.29,0,0,1,49.63,168Zm98.78,45.6a135.28,135.28,0,0,0,22.3-45.6h35.66A88.29,88.29,0,0,1,148.41,213.6Z"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 256 256"><path d="M216,32H88a8,8,0,0,0-8,8V80H40a8,8,0,0,0-8,8V216a8,8,0,0,0,8,8H168a8,8,0,0,0,8-8V176h40a8,8,0,0,0,8-8V40A8,8,0,0,0,216,32ZM160,208H48V96H160Zm48-48H176V88a8,8,0,0,0-8-8H96V48H208Z"/></symbol>
+    <symbol id="i-prohibit" viewBox="0 0 256 256"><path d="M128,24A104,104,0,1,0,232,128,104.11,104.11,0,0,0,128,24Zm88,104a87.56,87.56,0,0,1-20.41,56.28L71.72,60.4A88,88,0,0,1,216,128ZM40,128A87.56,87.56,0,0,1,60.41,71.72L184.28,195.6A88,88,0,0,1,40,128Z"/></symbol>
+    <symbol id="i-broom" viewBox="0 0 256 256"><path d="M235.5,216.81c-22.56-11-35.5-34.58-35.5-64.8V134.73a15.94,15.94,0,0,0-10.09-14.87L165,110a8,8,0,0,1-4.48-10.34l21.32-53a28,28,0,0,0-16.1-37,28.14,28.14,0,0,0-35.82,16,.61.61,0,0,0,0,.12L108.9,79a8,8,0,0,1-10.37,4.49L73.11,73.14A15.89,15.89,0,0,0,55.74,76.8C34.68,98.45,24,123.75,24,152a111.45,111.45,0,0,0,31.18,77.53A8,8,0,0,0,61,232H232a8,8,0,0,0,3.5-15.19ZM67.14,88l25.41,10.3a24,24,0,0,0,31.23-13.45l21-53c2.56-6.11,9.47-9.27,15.43-7a12,12,0,0,1,6.88,15.92L145.69,93.76a24,24,0,0,0,13.43,31.14L184,134.73V152c0,.33,0,.66,0,1L55.77,101.71A108.84,108.84,0,0,1,67.14,88Zm48,128a87.53,87.53,0,0,1-24.34-42,8,8,0,0,0-15.49,4,105.16,105.16,0,0,0,18.36,38H64.44A95.54,95.54,0,0,1,40,152a85.9,85.9,0,0,1,7.73-36.29l137.8,55.12c3,18,10.56,33.48,21.89,45.16Z"/></symbol>
+    <symbol id="i-reload" viewBox="0 0 256 256"><path d="M240,56v48a8,8,0,0,1-8,8H184a8,8,0,0,1,0-16H211.4L184.81,71.64l-.25-.24a80,80,0,1,0-1.67,114.78,8,8,0,0,1,11,11.63A95.44,95.44,0,0,1,128,224h-1.32A96,96,0,1,1,195.75,60L224,85.8V56a8,8,0,1,1,16,0Z"/></symbol>
+    <symbol id="i-stop" viewBox="0 0 256 256"><path d="M200,40H56A16,16,0,0,0,40,56V200a16,16,0,0,0,16,16H200a16,16,0,0,0,16-16V56A16,16,0,0,0,200,40Zm0,160H56V56H200V200Z"/></symbol>
+    <symbol id="i-x" viewBox="0 0 256 256"><path d="M205.66,194.34a8,8,0,0,1-11.32,11.32L128,139.31,61.66,205.66a8,8,0,0,1-11.32-11.32L116.69,128,50.34,61.66A8,8,0,0,1,61.66,50.34L128,116.69l66.34-66.35a8,8,0,0,1,11.32,11.32L139.31,128Z"/></symbol>
+    <symbol id="i-warning-circle" viewBox="0 0 256 256"><path d="M128,24A104,104,0,1,0,232,128,104.11,104.11,0,0,0,128,24Zm0,192a88,88,0,1,1,88-88A88.1,88.1,0,0,1,128,216Zm-8-80V80a8,8,0,0,1,16,0v56a8,8,0,0,1-16,0Zm20,36a12,12,0,1,1-12-12A12,12,0,0,1,140,172Z"/></symbol>
+    <symbol id="i-warning" viewBox="0 0 256 256"><path d="M236.8,188.09,149.35,36.22h0a24.76,24.76,0,0,0-42.7,0L19.2,188.09a23.51,23.51,0,0,0,0,23.72A24.35,24.35,0,0,0,40.55,224h174.9a24.35,24.35,0,0,0,21.33-12.19A23.51,23.51,0,0,0,236.8,188.09ZM222.93,203.8a8.5,8.5,0,0,1-7.48,4.2H40.55a8.5,8.5,0,0,1-7.48-4.2,7.59,7.59,0,0,1,0-7.72L120.52,44.21a8.75,8.75,0,0,1,15,0l87.45,151.87A7.59,7.59,0,0,1,222.93,203.8ZM120,144V104a8,8,0,0,1,16,0v40a8,8,0,0,1-16,0Zm20,36a12,12,0,1,1-12-12A12,12,0,0,1,140,180Z"/></symbol>
+    <symbol id="i-info" viewBox="0 0 256 256"><path d="M128,24A104,104,0,1,0,232,128,104.11,104.11,0,0,0,128,24Zm0,192a88,88,0,1,1,88-88A88.1,88.1,0,0,1,128,216Zm16-40a8,8,0,0,1-8,8,16,16,0,0,1-16-16V128a8,8,0,0,1,0-16,16,16,0,0,1,16,16v40A8,8,0,0,1,144,176ZM112,84a12,12,0,1,1,12,12A12,12,0,0,1,112,84Z"/></symbol>
+    <symbol id="i-plugs" viewBox="0 0 256 256"><path d="M149.66,138.34a8,8,0,0,0-11.32,0L120,156.69,99.31,136l18.35-18.34a8,8,0,0,0-11.32-11.32L88,124.69,69.66,106.34a8,8,0,0,0-11.32,11.32L64.69,124,41.37,147.31a32,32,0,0,0,0,45.26l5.38,5.37-28.41,28.4a8,8,0,0,0,11.32,11.32l28.4-28.41,5.37,5.38a32,32,0,0,0,45.26,0L132,191.31l6.34,6.35a8,8,0,0,0,11.32-11.32L131.31,168l18.35-18.34A8,8,0,0,0,149.66,138.34Zm-52.29,65a16,16,0,0,1-22.62,0L52.69,181.25a16,16,0,0,1,0-22.62L76,135.31,120.69,180Zm140.29-185a8,8,0,0,0-11.32,0l-28.4,28.41-5.37-5.38a32.05,32.05,0,0,0-45.26,0L124,64.69l-6.34-6.35a8,8,0,0,0-11.32,11.32l80,80a8,8,0,0,0,11.32-11.32L191.31,132l23.32-23.31a32,32,0,0,0,0-45.26l-5.38-5.37,28.41-28.4A8,8,0,0,0,237.66,18.34Zm-34.35,79L180,120.69,135.31,76l23.32-23.31a16,16,0,0,1,22.62,0l22.06,22A16,16,0,0,1,203.31,97.37Z"/></symbol>
+    <symbol id="i-shield" viewBox="0 0 256 256"><path d="M208,40H48A16,16,0,0,0,32,56v56c0,52.72,25.52,84.67,46.93,102.19,23.06,18.86,46,25.26,47,25.53a8,8,0,0,0,4.2,0c1-.27,23.91-6.67,47-25.53C198.48,196.67,224,164.72,224,112V56A16,16,0,0,0,208,40Zm0,72c0,37.07-13.66,67.16-40.6,89.42A129.3,129.3,0,0,1,128,223.62a128.25,128.25,0,0,1-38.92-21.81C61.82,179.51,48,149.3,48,112l0-56,160,0ZM82.34,141.66a8,8,0,0,1,11.32-11.32L112,148.69l50.34-50.35a8,8,0,0,1,11.32,11.32l-56,56a8,8,0,0,1-11.32,0Z"/></symbol>
+    <symbol id="i-search" viewBox="0 0 256 256"><path d="M229.66,218.34l-50.07-50.06a88.11,88.11,0,1,0-11.31,11.31l50.06,50.07a8,8,0,0,0,11.32-11.32ZM40,112a72,72,0,1,1,72,72A72.08,72.08,0,0,1,40,112Z"/></symbol>
+    <symbol id="i-send" viewBox="0 0 256 256"><path d="M227.32,28.68a16,16,0,0,0-15.66-4.08l-.15,0L19.57,82.84a16,16,0,0,0-2.49,29.8L102,154l41.3,84.87A15.86,15.86,0,0,0,157.74,248q.69,0,1.38-.06a15.88,15.88,0,0,0,14-11.51l58.2-191.94c0-.05,0-.1,0-.15A16,16,0,0,0,227.32,28.68ZM157.83,231.85l-.05.14,0-.07-40.06-82.3,48-48a8,8,0,0,0-11.31-11.31l-48,48L24.08,98.25l-.07,0,.14,0L216,40Z"/></symbol>
+    <symbol id="i-play" viewBox="0 0 256 256"><path d="M232.4,114.49,88.32,26.35a16,16,0,0,0-16.2-.3A15.86,15.86,0,0,0,64,39.87V216.13A15.94,15.94,0,0,0,80,232a16.07,16.07,0,0,0,8.36-2.35L232.4,141.51a15.81,15.81,0,0,0,0-27ZM80,215.94V40l143.83,88Z"/></symbol>
+    <symbol id="i-update" viewBox="0 0 256 256"><path d="M128,24A104,104,0,1,0,232,128,104.11,104.11,0,0,0,128,24Zm0,192a88,88,0,1,1,88-88A88.1,88.1,0,0,1,128,216Zm37.66-101.66a8,8,0,0,1-11.32,11.32L136,107.31V168a8,8,0,0,1-16,0V107.31l-18.34,18.35a8,8,0,0,1-11.32-11.32l32-32a8,8,0,0,1,11.32,0Z"/></symbol>
+    <symbol id="i-sliders" viewBox="0 0 256 256"><path d="M64,105V40a8,8,0,0,0-16,0v65a32,32,0,0,0,0,62v49a8,8,0,0,0,16,0V167a32,32,0,0,0,0-62Zm-8,47a16,16,0,1,1,16-16A16,16,0,0,1,56,152Zm80-95V40a8,8,0,0,0-16,0V57a32,32,0,0,0,0,62v97a8,8,0,0,0,16,0V119a32,32,0,0,0,0-62Zm-8,47a16,16,0,1,1,16-16A16,16,0,0,1,128,104Zm104,64a32.06,32.06,0,0,0-24-31V40a8,8,0,0,0-16,0v97a32,32,0,0,0,0,62v17a8,8,0,0,0,16,0V199A32.06,32.06,0,0,0,232,168Zm-32,16a16,16,0,1,1,16-16A16,16,0,0,1,200,184Z"/></symbol>
+    <symbol id="i-external" viewBox="0 0 256 256"><path d="M224,104a8,8,0,0,1-16,0V59.32l-66.33,66.34a8,8,0,0,1-11.32-11.32L196.68,48H152a8,8,0,0,1,0-16h64a8,8,0,0,1,8,8Zm-40,24a8,8,0,0,0-8,8v72H48V80h72a8,8,0,0,0,0-16H48A16,16,0,0,0,32,80V208a16,16,0,0,0,16,16H176a16,16,0,0,0,16-16V136A8,8,0,0,0,184,128Z"/></symbol>
+    <symbol id="i-video" viewBox="0 0 256 256"><path d="M251.77,73a8,8,0,0,0-8.21.39L208,97.05V72a16,16,0,0,0-16-16H32A16,16,0,0,0,16,72V184a16,16,0,0,0,16,16H192a16,16,0,0,0,16-16V159l35.56,23.71A8,8,0,0,0,248,184a8,8,0,0,0,8-8V80A8,8,0,0,0,251.77,73ZM192,184H32V72H192V184Zm48-22.95-32-21.33V116.28L240,95Z"/></symbol>
+    <symbol id="i-browser" viewBox="0 0 256 256"><path d="M216,40H40A16,16,0,0,0,24,56V200a16,16,0,0,0,16,16H216a16,16,0,0,0,16-16V56A16,16,0,0,0,216,40Zm0,16V88H40V56Zm0,144H40V104H216v96Z"/></symbol>
+    <symbol id="i-check" viewBox="0 0 256 256"><path d="M229.66,77.66l-128,128a8,8,0,0,1-11.32,0l-56-56a8,8,0,0,1,11.32-11.32L96,188.69,218.34,66.34a8,8,0,0,1,11.32,11.32Z"/></symbol>
+  </svg>
+
   <header class="top">
-    <img src="icons/icon-32.png" width="24" height="24" alt="">
-    <h1>Endo's Unified Downloader</h1>
+    <span class="logo" aria-hidden="true"><svg class="icon"><use href="#i-download"/></svg></span>
+    <p class="brand"><strong>Endo's</strong> <span>Unified Downloader</span></p>
     <span id="app-status" class="pill" role="status">Checking…</span>
   </header>
-  <p id="app-hint" class="hint warn" hidden>Start the Endo's Unified Downloader desktop app. Downloads are sent to it; until it runs they fail with an error.</p>
-  <p id="app-outdated" class="hint warn" hidden>An older Endo's Unified Downloader is running — restart it after updating.</p>
-  <div id="host-access" class="grant" hidden>
-    <p class="hint warn">The extension can't see this browser's requests, so it finds no media.</p>
-    <button id="grant" type="button" class="btn small">Allow access to all sites</button>
-    <p id="grant-msg" class="msg" role="status" aria-live="polite"></p>
+
+  <nav id="tabs" class="tabs" role="tablist" aria-label="Views">
+    <button type="button" class="tab" role="tab" id="tab-media" aria-controls="media-view" aria-selected="true">
+      <svg class="icon" aria-hidden="true"><use href="#i-film"/></svg><span>Media</span><span id="media-count" class="count"></span>
+    </button>
+    <button type="button" class="tab" role="tab" id="tab-links" aria-controls="links-view" aria-selected="false" tabindex="-1">
+      <svg class="icon" aria-hidden="true"><use href="#i-link"/></svg><span>Links</span><span id="links-count" class="count" title="Selected links"></span>
+    </button>
+    <button type="button" class="tab" role="tab" id="tab-record" aria-controls="record-view" aria-selected="false" tabindex="-1">
+      <svg class="icon" aria-hidden="true"><use href="#i-record"/></svg><span>Record</span><span id="rec-count" class="count"></span>
+    </button>
+    <button type="button" class="tab" role="tab" id="tab-settings" aria-controls="settings-view" aria-selected="false" tabindex="-1">
+      <svg class="icon" aria-hidden="true"><use href="#i-gear"/></svg><span>Settings</span>
+    </button>
+  </nav>
+
+  <div id="app-hint" class="banner tone-amber" hidden>
+    <svg class="icon" aria-hidden="true"><use href="#i-plugs"/></svg>
+    <p><strong>The desktop app isn't running.</strong> Open Endo's Unified Downloader on this computer; until it runs, downloads fail with an error.</p>
+  </div>
+  <div id="app-outdated" class="banner tone-amber" hidden>
+    <svg class="icon" aria-hidden="true"><use href="#i-update"/></svg>
+    <p><strong>An older Endo's Unified Downloader is running.</strong> Update it, then restart it.</p>
+  </div>
+  <div id="host-access" class="banner tone-amber" hidden>
+    <svg class="icon" aria-hidden="true"><use href="#i-shield"/></svg>
+    <div>
+      <p><strong>Site access needed.</strong> The extension can't see this browser's requests, so it finds no media.</p>
+      <button id="grant" type="button" class="btn small primary">Allow access to all sites</button>
+      <p id="grant-msg" class="msg" role="status" aria-live="polite"></p>
+    </div>
+  </div>
+  <div id="unsupported" class="banner" hidden>
+    <svg class="icon" aria-hidden="true"><use href="#i-info"/></svg>
+    <p><strong>Nothing can be detected on this tab.</strong> Browser pages (chrome://, the extension store, file://, new tab) don't let extensions see their requests. Open a normal http(s) page.</p>
   </div>
 
-  <p id="unsupported" class="hint" hidden>Nothing can be detected on this tab. Browser pages (chrome://, the extension store, file://, new tab) don't let extensions see their requests. Open a normal http(s) page.</p>
-
-  <main id="tab-ui" hidden>
-    <nav class="views" aria-label="Views">
-      <button type="button" class="btn view" data-view="media-view" aria-pressed="true">Media</button>
-      <button type="button" class="btn view" data-view="links-view" aria-pressed="false">Links</button>
-    </nav>
-
-    <div id="media-view">
-    <section class="card">
-      <button id="send-page" type="button" class="btn">Download this page</button>
-      <p id="page-note" class="note" hidden>This site is handled by yt-dlp in the downloader: send the page, not its streams.</p>
-      <p id="page-msg" class="msg" role="status" aria-live="polite"></p>
-    </section>
-
-    <section aria-labelledby="media-title">
-      <div class="section-head">
-        <h2 id="media-title">Media <span id="media-count" class="count"></span></h2>
-        <button id="clear" type="button" class="btn small ghost">Clear list</button>
+  <main class="views">
+    <section id="media-view" class="panel" role="tabpanel" aria-labelledby="tab-media">
+      <div id="page-card" class="card page-card">
+        <div class="page-row">
+          <span class="page-icon" aria-hidden="true"><svg class="icon"><use href="#i-browser"/></svg></span>
+          <p class="page-text"><strong id="page-title"></strong><span id="page-host"></span></p>
+          <button id="send-page" type="button" class="btn"><svg class="icon" aria-hidden="true"><use href="#i-download"/></svg><span>Download this page</span></button>
+        </div>
+        <p id="page-note" class="note" hidden>This site is handled by yt-dlp in the downloader: send the page, not its streams.</p>
+        <p id="page-msg" class="msg" role="status" aria-live="polite"></p>
       </div>
-      <p id="empty" class="hint" hidden>No media found yet. Play the video, then reopen this popup. For streams that can't be fetched (blob or MSE players), use Record below.</p>
-      <p id="reload-hint" class="note" hidden>Reload the page to detect what already loaded. <button id="reload" type="button" class="btn small ghost">Reload page</button></p>
+
+      <div id="media-head" class="section-head" hidden>
+        <h2 id="media-title">Detected media</h2>
+        <button id="clear" type="button" class="btn small ghost"><svg class="icon" aria-hidden="true"><use href="#i-broom"/></svg><span>Clear list</span></button>
+      </div>
       <p id="media-msg" class="msg" role="status" aria-live="polite"></p>
-      <ul id="items" class="items"></ul>
+      <ul id="items" class="items" aria-labelledby="media-title"></ul>
+
+      <div id="empty" class="empty" hidden>
+        <span class="empty-icon" aria-hidden="true"><svg class="icon"><use href="#i-film"/></svg></span>
+        <p id="empty-title" class="empty-title">No media found yet</p>
+        <p id="empty-text">Play the video, then reopen this popup. Players that can't be fetched (blob or MSE) can be recorded instead.</p>
+        <div class="empty-actions">
+          <button id="go-record" type="button" class="btn small"><svg class="icon" aria-hidden="true"><use href="#i-record"/></svg><span>Record instead</span></button>
+          <button id="reload" type="button" class="btn small" title="Finds what the page loaded before the extension was installed or updated"><svg class="icon" aria-hidden="true"><use href="#i-reload"/></svg><span>Reload page</span></button>
+        </div>
+        <p id="reload-hint" class="note" hidden>Loaded before the extension? Reload the page to detect it.</p>
+      </div>
     </section>
 
-    <section aria-labelledby="rec-title">
-      <div class="section-head">
-        <h2 id="rec-title">Record</h2>
-        <button id="rescan" type="button" class="btn small ghost">Rescan videos</button>
+    <section id="links-view" class="panel" role="tabpanel" aria-labelledby="tab-links" hidden>
+      <div class="links-top">
+        <div class="toolbar">
+          <label class="search">
+            <svg class="icon" aria-hidden="true"><use href="#i-search"/></svg>
+            <input id="links-query" type="search" placeholder="Filter: text or /regex/" aria-label="Filter links by text or /regex/" spellcheck="false">
+          </label>
+          <label class="check" title="Only links to this site"><input id="same-site" type="checkbox" class="switch" role="switch"> Same site</label>
+          <button id="links-rescan" type="button" class="btn icon-btn" title="Rescan page" aria-label="Rescan page"><svg class="icon" aria-hidden="true"><use href="#i-reload"/></svg></button>
+        </div>
+        <div id="kinds" class="chips filters" role="group" aria-label="File types"></div>
+        <div class="list-head">
+          <span id="selected-count" class="note"></span>
+          <button id="select-all" type="button" class="btn small ghost">Select all</button>
+          <button id="select-none" type="button" class="btn small ghost">None</button>
+        </div>
       </div>
-      <p class="note">Capture from start saves the stream's buffers as the player loads them; speed it up to finish sooner. Record playback captures a video in real time; a muted one plays at near-zero volume while recording, then its volume is restored. Downloads made via the browser show here too.</p>
-      <button id="arm" type="button" class="btn">Capture from start (reloads page)</button>
+      <p id="links-msg" class="msg" role="status" aria-live="polite"></p>
+      <div id="no-links" class="empty" hidden>
+        <span class="empty-icon" aria-hidden="true"><svg class="icon"><use href="#i-link"/></svg></span>
+        <p id="no-links-text" class="empty-title">No links match.</p>
+      </div>
+      <ul id="links" class="links" aria-label="Links on this page"></ul>
+      <div class="sticky-foot">
+        <button id="send-links" type="button" class="btn primary wide" disabled><svg class="icon" aria-hidden="true"><use href="#i-send"/></svg><span id="send-links-label">Send 0 to app</span></button>
+      </div>
+    </section>
+
+    <section id="record-view" class="panel" role="tabpanel" aria-labelledby="tab-record" hidden>
       <p id="rec-msg" class="msg" role="status" aria-live="polite"></p>
-      <p id="no-videos" class="note" hidden>No video elements on this page yet. Start the player, then Rescan.</p>
-      <ul id="videos" class="rows"></ul>
-      <div id="recs" class="recs" hidden>
+      <div id="recs" class="card recs" hidden>
+        <h2 class="card-title"><span id="live-dot" class="live-dot" aria-hidden="true"></span><span id="recs-title">In progress</span></h2>
         <p id="armed" class="note" hidden>Capture armed: play the video. Captured bytes show here.</p>
-        <ul id="rec-list" class="rows"></ul>
+        <ul id="rec-list" class="rows" aria-label="Recordings and browser downloads"></ul>
         <div class="rec-controls">
           <label id="speed-wrap" hidden>Speed
             <select id="speed">
@@ -69,48 +156,64 @@
               <option value="16">16×</option>
             </select>
           </label>
-          <button id="stop" type="button" class="btn danger">Stop recording</button>
+          <button id="stop" type="button" class="btn danger"><svg class="icon" aria-hidden="true"><use href="#i-stop"/></svg><span>Stop recording</span></button>
         </div>
       </div>
-    </section>
-    </div>
 
-    <section id="links-view" aria-labelledby="links-title" hidden>
-      <div class="section-head">
-        <h2 id="links-title">Links <span id="links-count" class="count"></span></h2>
-        <button id="links-rescan" type="button" class="btn small ghost">Rescan page</button>
+      <div class="card">
+        <h2 class="card-title"><svg class="icon" aria-hidden="true"><use href="#i-record"/></svg>Capture from start</h2>
+        <p class="note">Saves the stream's buffers as the player loads them; speed it up to finish sooner. The page reloads first.</p>
+        <button id="arm" type="button" class="btn"><svg class="icon" aria-hidden="true"><use href="#i-record"/></svg><span>Capture from start</span></button>
       </div>
-      <div id="kinds" class="chips" role="group" aria-label="File types"></div>
-      <div class="link-filters">
-        <input id="links-query" type="search" placeholder="Filter: text or /regex/" aria-label="Filter links by text or /regex/" spellcheck="false">
-        <label class="check"><input id="same-site" type="checkbox"> Same site</label>
+
+      <div class="card">
+        <div class="section-head">
+          <h2 class="card-title"><svg class="icon" aria-hidden="true"><use href="#i-video"/></svg>Record playback</h2>
+          <button id="rescan" type="button" class="btn small ghost"><svg class="icon" aria-hidden="true"><use href="#i-reload"/></svg><span>Rescan videos</span></button>
+        </div>
+        <p class="note">Captures a video in real time; a muted one plays at near-zero volume while recording, then its volume is restored.</p>
+        <p id="no-videos" class="note" hidden>No video elements on this page yet. Start the player, then Rescan.</p>
+        <ul id="videos" class="rows" aria-label="Videos on this page"></ul>
       </div>
-      <div class="actions">
-        <button id="select-all" type="button" class="btn small ghost">Select all</button>
-        <button id="select-none" type="button" class="btn small ghost">None</button>
-        <span id="selected-count" class="note"></span>
-        <button id="send-links" type="button" class="btn small primary" disabled>Send 0 to app</button>
+      <p class="note">Downloads made via the browser show here too, with their progress.</p>
+    </section>
+
+    <section id="settings-view" class="panel" role="tabpanel" aria-labelledby="tab-settings" hidden>
+      <p id="settings-msg" class="msg" role="status" aria-live="polite"></p>
+      <div class="card">
+        <h2 class="card-title"><svg class="icon" aria-hidden="true"><use href="#i-sliders"/></svg>Detection</h2>
+        <div class="setting">
+          <label for="min-size">Min file size<small>KB; smaller files aren't listed (0 = none)</small></label>
+          <input id="min-size" type="number" min="0" step="1" inputmode="numeric">
+        </div>
+        <div class="setting">
+          <label for="max-size">Max file size<small>KB; larger files aren't listed (0 = none)</small></label>
+          <input id="max-size" type="number" min="0" step="1" inputmode="numeric">
+        </div>
+        <div class="setting">
+          <label for="convert-mp4">Convert HLS to MP4<small>The app turns saved streams into MP4 files</small></label>
+          <input id="convert-mp4" type="checkbox" class="switch" role="switch">
+        </div>
       </div>
-      <p id="links-msg" class="msg" role="status" aria-live="polite"></p>
-      <p id="no-links" class="hint" hidden>No links match.</p>
-      <ul id="links" class="rows links"></ul>
+
+      <div class="card">
+        <h2 class="card-title"><svg class="icon" aria-hidden="true"><use href="#i-prohibit"/></svg>Blocked hosts</h2>
+        <p id="no-blocked" class="note">None. Block a host from a media card's menu to stop detecting its media.</p>
+        <ul id="blocked" class="rows" aria-label="Blocked hosts"></ul>
+      </div>
+
+      <div class="card">
+        <h2 class="card-title"><svg class="icon" aria-hidden="true"><use href="#i-info"/></svg>About</h2>
+        <dl class="about">
+          <dt>Extension</dt><dd id="about-ext"></dd>
+          <dt>Desktop app</dt><dd id="about-app">Checking…</dd>
+        </dl>
+        <p class="about-links">
+          <a href="https://github.com/Adityasharma0101911/Endo-s-Unified-Downloader" target="_blank" rel="noopener">Project page<svg class="icon" aria-hidden="true"><use href="#i-external"/></svg></a>
+          <a href="https://github.com/Adityasharma0101911/Endo-s-Unified-Downloader/releases" target="_blank" rel="noopener">Releases<svg class="icon" aria-hidden="true"><use href="#i-external"/></svg></a>
+        </p>
+      </div>
     </section>
   </main>
-
-  <details id="settings">
-    <summary>Settings</summary>
-    <div class="settings-grid">
-      <label for="min-size">Min file size (KB, 0 = none)</label>
-      <input id="min-size" type="number" min="0" step="1" inputmode="numeric">
-      <label for="max-size">Max file size (KB, 0 = none)</label>
-      <input id="max-size" type="number" min="0" step="1" inputmode="numeric">
-      <label for="convert-mp4">Convert HLS to MP4</label>
-      <input id="convert-mp4" type="checkbox">
-    </div>
-    <h3>Blocked hosts</h3>
-    <p id="no-blocked" class="note">None.</p>
-    <ul id="blocked" class="rows"></ul>
-    <p id="settings-msg" class="msg" role="status" aria-live="polite"></p>
-  </details>
 </body>
 </html>
