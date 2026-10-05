@@ -20,7 +20,10 @@ pub struct Args {
     /// Mirrors of ONE file (all must serve identical bytes), a magnet link, a local/remote
     /// .metalink, .meta4 or .torrent, or a link that lists many downloads (a Google Drive,
     /// MediaFire or MEGA folder, a Pixeldrain list or Gofile folder, a playlist or channel, a
-    /// podcast feed). Without URLs and without -i an interactive prompt starts.
+    /// podcast feed). A paste works too: links with "Password: x", "Key: x" or a token, a
+    /// user:pass@ link, or a copied curl/wget/fetch/PowerShell command (each link then is its
+    /// own download, with its secrets, which are never shown or saved); "-" reads it from stdin.
+    /// Without URLs and without -i an interactive prompt starts.
     #[arg(num_args = 0..)]
     pub urls: Vec<String>,
 
@@ -91,6 +94,10 @@ pub struct Args {
     /// Authorization header, e.g. "Authorization: Bearer TOKEN" or just "Bearer TOKEN"
     #[arg(long = "header", value_name = "HEADER", value_parser = parse_auth_header, conflicts_with = "repair")]
     pub auth_header: Option<String>,
+
+    /// Password of a share, a video or an archive (over one given in a paste)
+    #[arg(long = "password", value_name = "PASS", conflicts_with = "repair")]
+    pub password: Option<String>,
 
     /// HTTP Referer header, e.g. "https://dood.to/" or the embedding web page URL
     #[arg(long = "referer", value_name = "URL", conflicts_with = "repair")]
@@ -460,6 +467,8 @@ mod tests {
         assert!(parse(&["--verify", "f", "--repair", "--cookies-from-browser", "firefox"]).is_err());
         let args = parse(&["-vv", "--max-speed", "2M", "--header", "Authorization: Bearer t", "u"]).unwrap();
         assert_eq!((args.verbose, args.max_speed, args.auth_header.as_deref()), (2, Some(2 << 20), Some("Bearer t")));
+        assert_eq!(parse(&["--password", "p w", "u"]).unwrap().password.as_deref(), Some("p w"));
+        assert!(parse(&["--verify", "f", "--repair", "--password", "p"]).is_err());
     }
 
     #[test]

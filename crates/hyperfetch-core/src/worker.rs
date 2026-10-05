@@ -7,9 +7,9 @@ use futures_util::{Stream, StreamExt};
 use parking_lot::Mutex;
 use reqwest::header::{
     HeaderMap, HeaderValue, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE, ETAG, IF_RANGE, LAST_MODIFIED,
-    RANGE, RETRY_AFTER,
+    LOCATION, RANGE, RETRY_AFTER,
 };
-use reqwest::{Client, RequestBuilder, StatusCode};
+use reqwest::{Client, RequestBuilder, Response, StatusCode};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use url::Url;
@@ -136,6 +136,8 @@ impl RateLimiter {
 pub struct Auth {
     value: Option<HeaderValue>,
     referer: Option<String>,
+    /// A paste's headers (see `DownloadOptions::secret_headers`), scoped as `value` is.
+    headers: HeaderMap,
     user_urls: Vec<Url>,
 }
 
@@ -143,7 +145,7 @@ impl Auth {
     pub(crate) fn new(value: &str, user_urls: &[Url]) -> Result<Self, String> {
         let mut value = HeaderValue::from_str(value).map_err(|_| "Invalid Authorization header value".to_string())?;
         value.set_sensitive(true);
-        Ok(Self { value: Some(value), referer: None, user_urls: user_urls.to_vec() })
+        Ok(Self { value: Some(value), referer: None, headers: HeaderMap::new(), user_urls: user_urls.to_vec() })
     }
 
     pub(crate) fn with_referer(mut self, referer: Option<String>) -> Self {
@@ -151,11 +153,20 @@ impl Auth {
         self
     }
 
-    pub(crate) fn only_referer(referer: &str, user_urls: &[Url]) -> Self {
-        Self { value: None, referer: Some(referer.to_string()), user_urls: user_urls.to_vec() }
+    pub(crate) fn only_referer(referer: Option<&str>, user_urls: &[Url]) -> Self {
+        Self { value: None, referer: referer.map(str::to_string), headers: HeaderMap::new(), user_urls: user_urls.to_vec() }
     }
 
-    fn allows(&self, url: &Url) -> bool {
+    /// With `headers` too; a pair that is no valid header is left out.
+    pub(crate) fn with_headers(mut self, headers: &[(String, String)]) -> Self {
+        for (name, mut value) in headers.iter().filter_map(|(name, value)| crate::engine::request_header(name, value)) {
+            value.set_sensitive(true);
+            self.headers.insert(name, value);
+        }
+        self
+    }
+
+    pub(crate) fn allows(&self, url: &Url) -> bool {
         url.host_str().is_some()
             && self.user_urls.iter().any(|u| {
                 u.host_str() == url.host_str() && (u.scheme() != "https" || url.scheme() == "https")
@@ -163,17 +174,38 @@ impl Auth {
     }
 }
 
-/// Adds the user's `Authorization` header to a request for `url` when `auth` covers that URL,
-/// the User-Agent `url`'s host takes (see [`crate::resolver::with_agent_for`]), and the
-/// appropriate `Referer` header (see [`crate::resolver::with_referer_for`]).
+/// Adds the user's `Authorization` header and a paste's headers (replacing those of the same
+/// name) to a request for `url` when `auth` covers that URL, the User-Agent `url`'s host takes
+/// (see [`crate::resolver::with_agent_for`]), and the appropriate `Referer` header (see
+/// [`crate::resolver::with_referer_for`]).
 pub(crate) fn authorize(request: RequestBuilder, auth: Option<&Auth>, url: &Url) -> RequestBuilder {
     let request = crate::resolver::with_agent_for(request, url);
     let explicit_referer = auth.and_then(|a| a.referer.as_deref());
     let request = crate::resolver::with_referer_for(request, url, explicit_referer);
-    match auth.filter(|a| a.allows(url)).and_then(|a| a.value.as_ref()) {
+    let Some(auth) = auth.filter(|a| a.allows(url)) else { return request };
+    let request = request.headers(auth.headers.clone());
+    match &auth.value {
         Some(v) => request.header(AUTHORIZATION, v.clone()),
         None => request,
     }
+}
+
+/// Sends the request `build` makes for `url`. A client carrying a paste's headers stops at a
+/// redirect to another host (see `engine::build_route_client`), as the client would send them
+/// along; it is followed here instead, in a request `build` makes for the new link, which
+/// [`authorize`] gives them only if it covers that link. Other clients follow redirects
+/// themselves, so their answers come back as they are.
+pub(crate) async fn send(build: impl Fn(&Url) -> RequestBuilder, url: &Url) -> reqwest::Result<Response> {
+    let mut response = build(url).send().await?;
+    for _ in 0..10 {
+        let moved = matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308);
+        let location = response.headers().get(LOCATION).and_then(|l| l.to_str().ok());
+        match location.filter(|_| moved).and_then(|l| response.url().join(l).ok()) {
+            Some(next) => response = build(&next).send().await?,
+            None => break,
+        }
+    }
+    Ok(response)
 }
 
 /// State shared by all workers of one download.
@@ -441,22 +473,25 @@ impl HttpWorker {
 
         let route = s.route_for_worker(self.worker_id);
         let client = s.clients.get(route).unwrap_or(&s.client);
-        let mut request = authorize(client.get(url.clone()), s.auth.as_deref(), url)
-            .header(RANGE, format!("bytes={}-{}", start, end))
-            .header(ACCEPT_ENCODING, "identity");
-        if crate::hosts::HostKey::of(url).is_bitrate_throttled() {
-            request = request.header(reqwest::header::CONNECTION, "close");
-        }
-        if let Some(validator) = &if_range {
-            request = request.header(IF_RANGE, validator.as_str());
-        }
+        let request = |url: &Url| {
+            let mut request = authorize(client.get(url.clone()), s.auth.as_deref(), url)
+                .header(RANGE, format!("bytes={}-{}", start, end))
+                .header(ACCEPT_ENCODING, "identity");
+            if crate::hosts::HostKey::of(url).is_bitrate_throttled() {
+                request = request.header(reqwest::header::CONNECTION, "close");
+            }
+            if let Some(validator) = &if_range {
+                request = request.header(IF_RANGE, validator.as_str());
+            }
+            request
+        };
 
         let sent_at = Instant::now();
         let response = tokio::select! {
             biased;
             _ = s.cancel.cancelled() => return Err(cancelled()),
             _ = chunk.revoked.cancelled() => return Err(taken_over()),
-            res = tokio::time::timeout(s.stall_timeout, request.send()) => match res {
+            res = tokio::time::timeout(s.stall_timeout, send(request, url)) => match res {
                 Err(_) => return Err((FailureKind::Transient, format!("no response within {}s", s.stall_timeout.as_secs()))),
                 Ok(Err(e)) => {
                     // A name that did not resolve says nothing of the route.

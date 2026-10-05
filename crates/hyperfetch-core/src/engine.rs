@@ -30,7 +30,7 @@ use crate::resolver::HtmlVideoResolver;
 use crate::state::DownloadState;
 use crate::storage::{verify_digest, DiskWriter, FileDigest, StorageError, StreamHasher, VerifyError};
 use crate::worker::{
-    authorize, content_length, retry_after, Auth, Body, FailureKind, HttpWorker, RateLimiter, Seed, WorkerEvent,
+    authorize, content_length, retry_after, send, Auth, Body, FailureKind, HttpWorker, RateLimiter, Seed, WorkerEvent,
     WorkerShared,
 };
 
@@ -139,6 +139,14 @@ pub struct DownloadOptions {
     /// request of this download, replacing the defaults of the same name. A pair that is no valid
     /// HTTP header is skipped.
     pub headers: Vec<(String, String)>,
+    /// Request headers from a paste (a cookie, an API token, a copied command's headers; see
+    /// `crate::paste`): sent like `auth_header`, only to the hosts of the download's own links,
+    /// never along a redirect to another host, and never saved.
+    #[serde(skip)]
+    pub secret_headers: Vec<(String, String)>,
+    /// The password of a share, a video or an archive, from a paste or the user. Never saved.
+    #[serde(skip)]
+    pub password: Option<String>,
     /// The link is an HLS playlist (the browser saw it read as one), whatever its URL looks
     /// like: it is read as a playlist first, and downloaded as a file only if it is none.
     pub hls: bool,
@@ -246,6 +254,8 @@ impl Default for DownloadOptions {
             auth_header: None,
             referer: None,
             headers: Vec::new(),
+            secret_headers: Vec::new(),
+            password: None,
             hls: false,
             hls_to_mp4: false,
             dash: false,
@@ -291,6 +301,8 @@ impl Default for DownloadOptions {
 pub struct ClientKey {
     /// Credentials change the redirect policy (no HTTPS to HTTP downgrade).
     credentials: bool,
+    /// So do a paste's headers (see `build_route_client`).
+    secret_headers: bool,
     proxy: Option<String>,
     proxy_pool: Vec<String>,
     cookies_path: Option<PathBuf>,
@@ -304,6 +316,7 @@ impl ClientKey {
     pub fn of(options: &DownloadOptions) -> Self {
         Self {
             credentials: options.auth_header.is_some(),
+            secret_headers: !options.secret_headers.is_empty(),
             proxy: options.proxy.clone(),
             proxy_pool: options.proxy_pool.clone(),
             cookies_path: options.cookies_path.clone(),
@@ -368,7 +381,7 @@ impl DownloadEngine {
         };
         let auth = match (options.auth_header.as_deref(), options.referer.as_deref()) {
             (Some(value), referer) => match Auth::new(value, &urls) {
-                Ok(a) => Some(Arc::new(a.with_referer(referer.map(str::to_string)))),
+                Ok(a) => Some(Arc::new(a.with_referer(referer.map(str::to_string)).with_headers(&options.secret_headers))),
                 Err(e) => return Self {
                     limiter: None,
                     options,
@@ -382,8 +395,9 @@ impl DownloadEngine {
                     already_done: Arc::default(),
                 },
             },
-            (None, Some(referer)) => Some(Arc::new(Auth::only_referer(referer, &urls))),
-            (None, None) => None,
+            // A password alone adds no header, but is scoped as they are (see `media_options_for`).
+            (None, None) if options.secret_headers.is_empty() && options.password.is_none() => None,
+            (None, referer) => Some(Arc::new(Auth::only_referer(referer, &urls).with_headers(&options.secret_headers))),
         };
         Self {
             limiter: options.max_speed.filter(|&s| s > 0).map(|s| Arc::new(RateLimiter::new(s))),
@@ -448,7 +462,8 @@ impl DownloadEngine {
         }
         let reused = result.as_ref().is_ok_and(|path| self.already_done.lock().unwrap().as_ref() == Some(path));
         if let (Ok(path), Some(source), false) = (&result, self.urls.first(), reused) {
-            let done = crate::postprocess::after_download(path, &self.options.post, source, self.options.proxy.as_deref()).await;
+            let (post, proxy, password) = (&self.options.post, self.options.proxy.as_deref(), self.options.password.as_deref());
+            let done = crate::postprocess::after_download(path, post, source, proxy, password).await;
             if !done.notes.is_empty() {
                 let size = crate::postprocess::size_of(&done.path);
                 emit(&snapshot_tx, || EngineSnapshot { notes: done.notes, ..done_snapshot(size, &done.path) });
@@ -813,7 +828,7 @@ impl DownloadEngine {
     /// yt-dlp's error says why. Nor is a file-share page, which `check_answer` lets through only
     /// for yt-dlp: any failure to find what it shares fails the download.
     async fn site_media(&self, url: &Url) -> Result<Option<crate::media::Extracted>, String> {
-        let options = self.media_options();
+        let options = self.media_options_for(url);
         match crate::media::find_site_media(url, &options, Some(Arc::clone(&self.cancel_flag))).await {
             Ok(found) => Ok(Some(found)),
             Err(_) if self.cancel_token.is_cancelled() => Err(CANCELLED.to_string()),
@@ -851,8 +866,8 @@ impl DownloadEngine {
                 other => {
                     drop(other);
                     let slot = hosts::acquire(&final_url, self.options.max_connections_per_host).await;
-                    let request = authorize(client.get(url.clone()), self.auth.as_deref(), &url).header(ACCEPT_ENCODING, "identity");
-                    let response = request.send().await.map_err(|e| e.to_string())?;
+                    let request = |url: &Url| authorize(client.get(url.clone()), self.auth.as_deref(), url).header(ACCEPT_ENCODING, "identity");
+                    let response = send(request, &url).await.map_err(|e| e.to_string())?;
                     if !response.status().is_success() {
                         return Err(format!("HTTP {}", response.status()));
                     }
@@ -932,7 +947,22 @@ impl DownloadEngine {
             embed_metadata: self.options.embed_metadata,
             live_from_start: self.options.live_from_start,
             wait_for_video: self.options.wait_for_video,
+            video_password: None,
+            login: None,
         }
+    }
+
+    /// [`Self::media_options`] for yt-dlp at `url`, with what a paste gave when `url` is on a host
+    /// of the user's own links (as `auth` scopes them): the password, and on a media site yt-dlp
+    /// signs in to the user name and password of a Basic sign-in, under that site's name.
+    fn media_options_for(&self, url: &Url) -> crate::media::MediaDownloadOptions {
+        let mut options = self.media_options();
+        if self.auth.as_ref().is_some_and(|auth| auth.allows(url)) {
+            options.video_password = self.options.password.clone();
+            let login = self.options.auth_header.as_deref().and_then(basic_login);
+            options.login = crate::media::netrc_machine(url).zip(login).map(|(machine, (user, password))| (machine, user, password));
+        }
+        options
     }
 
     /// Downloads `media_url` with yt-dlp, which goes by what it found there moments ago when
@@ -971,7 +1001,7 @@ impl DownloadEngine {
             }
         });
 
-        let media_opts = self.media_options();
+        let media_opts = self.media_options_for(&media_url);
         {
             let dir = media_opts.output_dir.clone();
             blocking(move || std::fs::create_dir_all(&dir))
@@ -1014,6 +1044,7 @@ impl DownloadEngine {
             expected_checksum: None,
             cookies_path: None,
             auth_header: None,
+            secret_headers: Vec::new(),
             media_preset: None,
             browser_cookies: None,
             fsync_on_complete: false,
@@ -1707,9 +1738,10 @@ impl DownloadEngine {
                     _ = self.cancel_token.cancelled() => return Err(transient(CANCELLED.to_string())),
                     slot = hosts::acquire(&remote.final_url, self.options.max_connections_per_host) => slot,
                 };
-                let request = authorize(client.get(remote.url.clone()), self.auth.as_deref(), &remote.url)
-                    .header(ACCEPT_ENCODING, "identity")
-                    .send();
+                let request = send(
+                    |url: &Url| authorize(client.get(url.clone()), self.auth.as_deref(), url).header(ACCEPT_ENCODING, "identity"),
+                    &remote.url,
+                );
                 let response = tokio::select! {
                     biased;
                     _ = self.cancel_token.cancelled() => return Err(transient(CANCELLED.to_string())),
@@ -2180,6 +2212,7 @@ fn build_route_client(options: &DownloadOptions, proxy_url: Option<&str>, local:
         .default_headers(headers);
 
     let auth_header = options.auth_header.is_some();
+    let secret_headers = !options.secret_headers.is_empty();
     builder = builder.redirect(reqwest::redirect::Policy::custom(move |attempt| {
         let target_url = attempt.url();
         let target_host = target_url.host_str().unwrap_or("").to_ascii_lowercase();
@@ -2191,8 +2224,18 @@ fn build_route_client(options: &DownloadOptions, proxy_url: Option<&str>, local:
 
         let downgrade = target_url.scheme() == "http"
             && attempt.previous().last().is_some_and(|prev| prev.scheme() == "https");
+        // What reqwest takes for another host, to which it drops Authorization and Cookie but
+        // would send the rest of a paste's headers: `worker::send` follows that redirect itself.
+        // ponytail: every cross-host redirect on such a client stops, also a resolver's request
+        // that carries none of them (it then sees the 3xx); give the policy the user's hosts if
+        // a pasted link that lands on a page to resolve ever needs it.
+        let elsewhere = attempt.previous().last().is_some_and(|prev| {
+            prev.host_str() != target_url.host_str() || prev.port_or_known_default() != target_url.port_or_known_default()
+        });
         if downgrade && auth_header {
             attempt.error("refusing an HTTPS to HTTP redirect while sending credentials")
+        } else if elsewhere && secret_headers {
+            attempt.stop()
         } else if attempt.previous().len() >= 10 {
             attempt.error("too many redirects")
         } else {
@@ -2219,6 +2262,16 @@ fn build_route_client(options: &DownloadOptions, proxy_url: Option<&str>, local:
 /// `name: value` as a request header, if both are valid in one (see `DownloadOptions::headers`).
 pub fn request_header(name: &str, value: &str) -> Option<(HeaderName, reqwest::header::HeaderValue)> {
     Some((HeaderName::from_bytes(name.as_bytes()).ok()?, reqwest::header::HeaderValue::from_str(value).ok()?))
+}
+
+/// The user name and password of a Basic `Authorization` value (`Basic base64(user:password)`).
+fn basic_login(header: &str) -> Option<(String, String)> {
+    use base64::Engine as _;
+    let (scheme, encoded) = header.trim().split_once(' ')?;
+    let pair = base64::engine::general_purpose::STANDARD.decode(encoded.trim()).ok().filter(|_| scheme.eq_ignore_ascii_case("basic"))?;
+    let pair = String::from_utf8(pair).ok()?;
+    let (user, password) = pair.split_once(':')?;
+    Some((user.to_string(), password.to_string()))
 }
 
 /// Most routes (proxy × local address) one download spreads its connections over.
@@ -2610,7 +2663,7 @@ async fn probe_with(
 ) -> Result<(ProbeInfo, Option<ProbeBody>), String> {
     let cold = slot.opens_connection();
     let send_head = || async move {
-        match authorize(client.head(url.clone()), auth, url).send().await {
+        match send(|url: &Url| authorize(client.head(url.clone()), auth, url), url).await {
             Ok(resp) if resp.status().is_success() => Some(resp),
             Ok(resp) => {
                 tracing::debug!("HEAD {} returned {}", url, resp.status());
@@ -2637,11 +2690,9 @@ async fn probe_with(
         loop {
             attempt += 1;
             let sent_at = tokio::time::Instant::now();
-            let sent = authorize(client.get(url.clone()), auth, url)
-                .header(RANGE, range.as_str())
-                .header(ACCEPT_ENCODING, "identity")
-                .send()
-                .await;
+            let request =
+                |url: &Url| authorize(client.get(url.clone()), auth, url).header(RANGE, range.as_str()).header(ACCEPT_ENCODING, "identity");
+            let sent = send(request, url).await;
             let retry_in = match &sent {
                 Ok(resp) if is_busy(resp.status()) => Some(retry_after(resp.headers()).unwrap_or_default()),
                 Ok(_) => None,
@@ -2707,9 +2758,7 @@ async fn probe_with(
         (Err(e), None) => return Err(format!("{}: {}", url, e)),
         // Some servers reject HEAD and any Range header: a plain GET is the last resort.
         (Ok(_), None) => {
-            let plain = authorize(client.get(url.clone()), auth, url)
-                .header(ACCEPT_ENCODING, "identity")
-                .send()
+            let plain = send(|url: &Url| authorize(client.get(url.clone()), auth, url).header(ACCEPT_ENCODING, "identity"), url)
                 .await
                 .map_err(|e| format!("{}: {}", url, e))?;
             if !plain.status().is_success() {
@@ -3915,6 +3964,8 @@ mod tests {
     fn serialized_options_round_trip_without_the_credential() {
         let opts = DownloadOptions {
             auth_header: Some("Bearer secret".into()),
+            secret_headers: vec![("X-Api-Key".into(), "secret".into())],
+            password: Some("secret".into()),
             max_speed: Some(1024),
             media_preset: Some(crate::media::MediaQualityPreset::Custom("bv*".into())),
             ..Default::default()
@@ -3923,6 +3974,7 @@ mod tests {
         assert!(!json.contains("secret"));
         let back: DownloadOptions = serde_json::from_str(&json).unwrap();
         assert_eq!((back.auth_header, back.max_speed), (None, Some(1024)));
+        assert_eq!((back.secret_headers, back.password), (Vec::new(), None));
         assert_eq!(back.media_preset, opts.media_preset);
         // Fields missing from older saved data take their defaults.
         let old: DownloadOptions = serde_json::from_str(r#"{"num_connections":4}"#).unwrap();
@@ -4094,11 +4146,84 @@ mod tests {
         assert_eq!(ClientKey::of(&base), ClientKey::of(&same));
         for other in [
             DownloadOptions { auth_header: Some("Bearer x".into()), ..DownloadOptions::default() },
+            DownloadOptions { secret_headers: vec![("X-Api-Key".into(), "x".into())], ..DownloadOptions::default() },
             DownloadOptions { proxy: Some("http://p:8080".into()), ..DownloadOptions::default() },
             DownloadOptions { cookies_path: Some("c.txt".into()), ..DownloadOptions::default() },
             DownloadOptions { headers: vec![("Origin".into(), "https://page.example".into())], ..DownloadOptions::default() },
         ] {
             assert_ne!(ClientKey::of(&base), ClientKey::of(&other));
+        }
+    }
+
+    /// A paste's headers, cookie and Authorization go to the link's host, along a redirect there
+    /// too, but never along a redirect to another host, which still serves the download.
+    #[tokio::test]
+    async fn test_pasted_secrets_stay_with_the_links_host() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // A server keeping each request's head, lowercased, and answering `reply(path)`.
+        async fn server(reply: impl Fn(&str) -> String + Send + Sync + 'static) -> (u16, Arc<Mutex<Vec<String>>>) {
+            let listener = crate::hosts::unseen_listener().await;
+            let (port, heads) = (listener.local_addr().unwrap().port(), Arc::new(Mutex::new(Vec::new())));
+            let (reply, seen) = (Arc::new(reply), Arc::clone(&heads));
+            tokio::spawn(async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    let (reply, seen) = (Arc::clone(&reply), Arc::clone(&seen));
+                    tokio::spawn(async move {
+                        let mut head = Vec::new();
+                        let mut buf = [0u8; 4096];
+                        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                            match socket.read(&mut buf).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => head.extend_from_slice(&buf[..n]),
+                            }
+                        }
+                        let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
+                        let path = head.split_whitespace().nth(1).unwrap_or("/").to_string();
+                        let mut answer = reply(&path);
+                        if head.starts_with("head ") {
+                            answer.truncate(answer.find("\r\n\r\n").unwrap() + 4);
+                        }
+                        seen.lock().push(head);
+                        let _ = socket.write_all(answer.as_bytes()).await;
+                    });
+                }
+            });
+            (port, heads)
+        }
+        const FILE: &str = "HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\nPAYLOAD";
+        let moved = |to: String| format!("HTTP/1.1 302 Found\r\nLocation: {to}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let (other_port, other) = server(|_| FILE.to_string()).await;
+        let (port, own) = server(move |path| match path {
+            "/hop.bin" => moved("/direct.bin".into()),
+            // Another host: the other server, under another name.
+            "/moved.bin" => moved(format!("http://localhost:{other_port}/file.bin")),
+            _ => FILE.to_string(),
+        })
+        .await;
+
+        let dir = tempdir().unwrap();
+        for path in ["/direct.bin", "/hop.bin", "/moved.bin"] {
+            // From the paste to the request: a copied curl command, as the GUI and CLI take it.
+            let copied = format!(
+                "curl 'http://127.0.0.1:{port}{path}' -H 'Authorization: Bearer a-secret' -H 'X-Api-Key: k-secret' -b 'sid=c-secret'"
+            );
+            let [link] = &crate::paste::parse(&copied).unwrap().unwrap()[..] else { panic!("one link") };
+            let mut options = DownloadOptions { output_path: Some(dir.path().join(path.trim_start_matches('/'))), ..Default::default() };
+            crate::paste::apply(link, &mut options);
+            let saved = DownloadEngine::new(vec![link.url.clone()], options).run(None).await.unwrap();
+            assert_eq!(std::fs::read(saved).unwrap(), b"PAYLOAD", "{path}");
+        }
+        let own = own.lock().clone();
+        assert!(own.len() >= 3, "{own:?}");
+        for head in &own {
+            for header in ["authorization: bearer a-secret", "x-api-key: k-secret", "cookie: sid=c-secret"] {
+                assert!(head.lines().any(|l| l == header), "{header} missing from {head}");
+            }
+        }
+        let other = other.lock().clone();
+        assert!(!other.is_empty(), "the redirect was not followed");
+        for head in &other {
+            assert!(!head.contains("secret") && !head.contains("authorization") && !head.contains("x-api-key"), "{head}");
         }
     }
 
@@ -4140,6 +4265,27 @@ mod tests {
         let options = DownloadOptions { referer: Some("https://page.example/watch".into()), headers: headers.clone(), ..Default::default() };
         let media = engine_with(options).media_options();
         assert_eq!((media.referer.as_deref(), media.headers), (Some("https://page.example/watch"), headers));
+    }
+
+    /// A paste's password and Basic sign-in go to yt-dlp only at the user's own link, and the
+    /// sign-in only on a media site.
+    #[test]
+    fn test_paste_secrets_reach_yt_dlp_only_at_the_users_link() {
+        let (vimeo, page) = (Url::parse("https://vimeo.com/1").unwrap(), Url::parse("https://page.example/v").unwrap());
+        // "me:s3cret"
+        let options = DownloadOptions { password: Some("pw".into()), auth_header: Some("Basic bWU6czNjcmV0".into()), ..Default::default() };
+        let engine = DownloadEngine::new(vec![vimeo.clone()], options.clone());
+        let media = engine.media_options_for(&vimeo);
+        assert_eq!((media.video_password.as_deref(), media.login), (Some("pw"), Some(("vimeo", "me".into(), "s3cret".into()))));
+        let elsewhere = engine.media_options_for(&Url::parse("https://player.vimeo.com/video/1").unwrap());
+        assert_eq!((elsewhere.video_password, elsewhere.login), (None, None));
+        assert_eq!((engine.media_options().video_password, engine.media_options().login), (None, None));
+        let media = DownloadEngine::new(vec![page.clone()], options).media_options_for(&page);
+        assert_eq!((media.video_password.as_deref(), media.login), (Some("pw"), None));
+        // A password alone is scoped as well.
+        let alone = DownloadEngine::new(vec![page.clone()], DownloadOptions { password: Some("pw".into()), ..Default::default() });
+        assert_eq!(alone.media_options_for(&page).video_password.as_deref(), Some("pw"));
+        assert_eq!(alone.media_options_for(&vimeo).video_password, None);
     }
 
     /// A body that sends each `(ms, bytes)` step `ms` after the one before.

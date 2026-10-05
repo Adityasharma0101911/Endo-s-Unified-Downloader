@@ -20,6 +20,7 @@ use hyperfetch_core::engine::{build_client, ClientKey, DownloadEngine, DownloadO
 use hyperfetch_core::history::{DownloadHistoryManager, HistoryEntry};
 use hyperfetch_core::ingest::{self, Task};
 use hyperfetch_core::media;
+use hyperfetch_core::paste;
 use hyperfetch_core::queue::{DownloadQueue, QueueItem};
 use hyperfetch_core::updater::{self, Installed, Update};
 use hyperfetch_core::verify::{self, BuildVerificationResult};
@@ -42,6 +43,8 @@ const CLIPBOARD_POLL: Duration = Duration::from_millis(500);
 /// A .metalink, .meta4 or .torrent listing more files than this is added only once the user
 /// agrees.
 const CONFIRM_FILES: usize = 50;
+/// Why the form's checksum is refused for several downloads.
+const SINGLE_CHECKSUM: &str = "The checksum in Advanced Options is for a single file: add that download on its own";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -121,7 +124,10 @@ enum AppEvent {
     RepairFinished(Result<(), String>),
     Picked(Dialog, Option<PathBuf>),
     Pasted(Result<String, String>),
-    ClipboardLink(String),
+    /// Clipboard text to offer as a download: what the banner shows of it, and the text.
+    ClipboardLink(String, String),
+    /// The text of a .txt dropped on the window, or why it could not be read.
+    DroppedText(Result<String, String>),
     /// Whether an ffmpeg was found, looked for at launch while the user has not said whether one
     /// may be installed.
     FfmpegFound(bool),
@@ -238,7 +244,8 @@ struct App {
     clipboard_enabled: Arc<AtomicBool>,
     /// Last clipboard text the watcher saw or the app copied itself; never offered again.
     clipboard_seen: Arc<Mutex<String>>,
-    clipboard_banner: Option<String>,
+    /// What the clipboard offers: what the banner shows of it (never a secret), and the text.
+    clipboard_banner: Option<(String, String)>,
 
     queue: DownloadQueue,
     engines: EngineMaker,
@@ -442,11 +449,55 @@ impl App {
         Ok(queue_task(&mut self.queue, task, options))
     }
 
+    /// Queues each link of `text` when it is a paste with a password, key or sign-in, or a copied
+    /// request (see `paste::parse`), with what the paste gave that link; the form's Authorization
+    /// header `auth` wins over a pasted one. A link to read first is read as `origin` says, with
+    /// its pasted password (a Gofile folder's) and Authorization header alone. None when `text` is neither: it is any other input.
+    /// Else the ids queued and a note per download naming what of the paste it uses (never a
+    /// value), or why nothing was added.
+    fn add_pasted(&mut self, text: &str, checksum: &str, auth: &str, origin: Origin) -> Option<Result<(Vec<usize>, Vec<String>), String>> {
+        let links = match paste::parse(text)? {
+            Ok(links) => links,
+            Err(e) => return Some(Err(e)),
+        };
+        if links.len() > 1 && !checksum.trim().is_empty() {
+            return Some(Err(SINGLE_CHECKSUM.to_string()));
+        }
+        let (reads, files): (Vec<_>, Vec<_>) = links.into_iter().partition(|link| ingest::needs_reading(link.url.as_str()));
+        // All checked before any is queued.
+        let queued = files.iter().map(|link| {
+            let task = ingest::link_task(&[link.url.as_str()])?;
+            let mut options = task_options(&self.settings, &task, checksum, auth)?;
+            paste::apply(link, &mut options);
+            Ok((task, options))
+        });
+        let queued = match queued.collect::<Result<Vec<_>, String>>() {
+            Ok(queued) => queued,
+            Err(e) => return Some(Err(e)),
+        };
+        for link in reads {
+            let input = link.url.to_string();
+            let read = read_listing(&self.settings, input.clone(), Some(&link));
+            // A queue line is the one the link is on, put back should reading it fail.
+            let origin = match origin {
+                Origin::QueueLine(_) => {
+                    let at = format!("{}{}", link.url.host_str().unwrap_or_default(), link.url.path());
+                    Origin::QueueLine(text.lines().position(|line| line.contains(&at)).map_or(1, |n| n + 1))
+                }
+                origin => origin,
+            };
+            let auth = if auth.trim().is_empty() { link.secrets.auth_header.unwrap_or_default() } else { auth.to_string() };
+            self.start_reading(input, origin, checksum.trim().to_string(), auth, read);
+        }
+        let notes = files.iter().filter_map(|link| link.secrets.note(&link.url)).collect();
+        Some(Ok((queued.into_iter().map(|(task, options)| queue_task(&mut self.queue, task, options)).collect(), notes)))
+    }
+
     /// Reads the downloads a .metalink, .meta4 or .torrent, or a folder, feed or playlist link
     /// lists (see `ingest::needs_reading`) off the UI thread and adds them as `origin` says. A
     /// document already being read is not read again.
     fn read_document(&mut self, input: String, origin: Origin, checksum: String, auth: String) {
-        let read = read_listing(&self.settings, input.clone());
+        let read = read_listing(&self.settings, input.clone(), None);
         self.start_reading(input, origin, checksum, auth, read);
     }
 
@@ -588,13 +639,42 @@ impl App {
         self.add_listing(origin, &input, &checksum, &auth, Ok(chosen));
     }
 
-    /// Adds the downloads of a .metalink, .meta4 or .torrent file dropped on the window.
+    /// Adds the downloads of a .metalink, .meta4 or .torrent file dropped on the window, or of a
+    /// .txt list of links (read off the UI thread, see [`App::add_dropped_text`]).
     fn add_dropped(&mut self, path: PathBuf) {
         let input = path.to_string_lossy().into_owned();
         if ingest::needs_reading(&input) {
             self.read_document(input, Origin::Dropped, String::new(), String::new());
+        } else if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("txt")) {
+            self.spawn_event(async move {
+                let read = tokio::fs::read(&path).await.map_err(|e| e.to_string()).and_then(|bytes| ingest::decode_text(&bytes));
+                AppEvent::DroppedText(read.map_err(|e| format!("Could not read {}: {}", path.display(), e)))
+            });
         } else {
-            self.notice = Some(Err(format!("{} is not a .metalink, .meta4 or .torrent file", path.display())));
+            self.notice = Some(Err(format!("{} is not a .metalink, .meta4, .torrent or .txt file", path.display())));
+        }
+    }
+
+    /// Queues the links of a dropped .txt as the queue input's (see [`App::add_lines`]), without
+    /// the form's checksum and Authorization header; what is refused waits in the queue input,
+    /// after what was typed there, for correcting.
+    fn add_dropped_text(&mut self, text: Result<String, String>) {
+        self.notice = None;
+        let (kept, error, _) = match text {
+            Ok(text) => self.add_lines(&text, "", ""),
+            Err(e) => return self.notice = Some(Err(e)),
+        };
+        if !kept.is_empty() {
+            if !self.queue_input.is_empty() {
+                self.queue_input.push('\n');
+            }
+            self.queue_input.push_str(&kept);
+        }
+        if let Some(error) = error {
+            self.queue_error = Some(error);
+            self.notice = Some(Err("Some of the dropped list could not be added: see the Queue page".to_string()));
+        } else {
+            self.notice.get_or_insert_with(|| Ok("Added the dropped list to the queue".to_string()));
         }
     }
 
@@ -604,6 +684,24 @@ impl App {
     /// starts, the others wait in the queue.
     fn download_now(&mut self, text: &str, checksum: &str, auth: &str) {
         self.tab = Tab::Downloader;
+        // The first link of a paste with secrets starts, the others wait; the form clears as
+        // it starts (it held the secrets).
+        match self.add_pasted(text, checksum, auth, Origin::Form) {
+            Some(Ok((ids, mut notes))) => {
+                self.form_error = None;
+                let Some(&first) = ids.first() else { return };
+                self.start_added(first);
+                if ids.len() > 1 {
+                    notes.push(format!("Started the first of {} downloads; the others wait in the queue", ids.len()));
+                }
+                if self.notice.is_none() && !notes.is_empty() {
+                    self.notice = Some(Ok(notes.join("\n")));
+                }
+                return;
+            }
+            Some(Err(e)) => return self.form_error = Some(e),
+            None => {}
+        }
         if ingest::needs_reading(text) {
             self.form_error = None;
             self.read_document(text.trim().to_string(), Origin::Form, checksum.trim().to_string(), auth.to_string());
@@ -636,36 +734,56 @@ impl App {
     /// .torrent line, or a folder, feed or playlist link, adds every file it lists once it has
     /// been read.
     fn add_queue_input(&mut self) {
-        let lines: Vec<String> =
-            self.queue_input.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect();
+        let text = std::mem::take(&mut self.queue_input);
+        let (checksum, auth) = (self.checksum_input.trim().to_string(), self.auth_input.clone());
+        let (kept, error, added) = self.add_lines(&text, &checksum, &auth);
+        (self.queue_input, self.queue_error) = (kept, error);
+        if added {
+            self.checksum_input.clear();
+        }
+    }
+
+    /// Queues the downloads of `text` (the queue input, a dropped .txt): a paste with secrets or
+    /// copied requests as [`App::add_pasted`] does, else each non-empty line as one download. The
+    /// text to keep for correcting (all of a paste refused, the lines refused), why, and whether
+    /// anything was added.
+    fn add_lines(&mut self, text: &str, checksum: &str, auth: &str) -> (String, Option<String>, bool) {
+        // A link to read is put back on its line should reading it fail.
+        match self.add_pasted(text, checksum, auth, Origin::QueueLine(1)) {
+            Some(Ok((ids, notes))) => {
+                // What the paste leaves that is an input of its own (a magnet, a local .torrent).
+                for (n, line) in paste::other_inputs(text) {
+                    self.read_document(line.to_string(), Origin::QueueLine(n), checksum.to_string(), auth.to_string());
+                }
+                // With links to read alone, "Reading…" stays.
+                if !ids.is_empty() {
+                    let added = format!("Added {} download(s) to the queue", ids.len());
+                    self.notice = Some(Ok(std::iter::once(added).chain(notes).collect::<Vec<_>>().join("\n")));
+                }
+                return (String::new(), None, true);
+            }
+            Some(Err(e)) => return (text.to_string(), Some(e), false),
+            None => {}
+        }
+        let lines: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
         if lines.is_empty() {
-            self.queue_error = Some("Enter one download per line".to_string());
-            return;
+            return (String::new(), Some("Enter one download per line".to_string()), false);
         }
-        let checksum = self.checksum_input.trim().to_string();
         if lines.len() > 1 && !checksum.is_empty() {
-            self.queue_error = Some(
-                "The checksum in Advanced Options is for a single file: add that download on its own".to_string(),
-            );
-            return;
+            return (text.to_string(), Some(SINGLE_CHECKSUM.to_string()), false);
         }
-        let auth = self.auth_input.clone();
         let mut errors = Vec::new();
         let mut rejected = Vec::new();
-        for (n, line) in lines.iter().enumerate() {
+        for (n, &line) in lines.iter().enumerate() {
             if ingest::needs_reading(line) {
-                self.read_document(line.clone(), Origin::QueueLine(n + 1), checksum.clone(), auth.clone());
-            } else if let Err(e) = self.add_download(line, &checksum, &auth) {
+                self.read_document(line.to_string(), Origin::QueueLine(n + 1), checksum.to_string(), auth.to_string());
+            } else if let Err(e) = self.add_download(line, checksum, auth) {
                 errors.push(format!("Line {}: {}", n + 1, e));
-                rejected.push(line.as_str());
+                rejected.push(line);
             }
         }
         // Keep the lines that failed so they can be corrected.
-        self.queue_input = rejected.join("\n");
-        self.queue_error = (!errors.is_empty()).then(|| errors.join("\n"));
-        if errors.len() < lines.len() {
-            self.checksum_input.clear();
-        }
+        (rejected.join("\n"), (!errors.is_empty()).then(|| errors.join("\n")), errors.len() < lines.len())
     }
 
     /// Starts (or resumes) the engine for a queue item. `fresh` first deletes the item's partial
@@ -758,9 +876,10 @@ impl App {
         }
     }
 
-    /// Resumes a restored download with the Authorization header from the form, which is never saved.
+    /// Resumes a restored download with the Authorization header from the form, which is never
+    /// saved; `user:pass`, or the link with its `user:pass@`, stands for its Basic credentials.
     fn resume_with_auth(&mut self, id: usize) {
-        let auth = self.auth_input.trim().to_string();
+        let auth = paste::authorization(&self.auth_input);
         if !auth.is_empty() && self.queue.provide_auth(id, auth) {
             self.start_job(id, false);
         }
@@ -1043,11 +1162,12 @@ impl App {
                 Ok(text) => self.url_input = text.trim().to_string(),
                 Err(e) => self.form_error = Some(format!("Could not read the clipboard: {}", e)),
             },
-            AppEvent::ClipboardLink(link) => {
-                if self.clipboard_enabled.load(Ordering::Relaxed) && self.url_input.trim() != link {
-                    self.clipboard_banner = Some(link);
+            AppEvent::ClipboardLink(shown, text) => {
+                if self.clipboard_enabled.load(Ordering::Relaxed) && self.url_input.trim() != text {
+                    self.clipboard_banner = Some((shown, text));
                 }
             }
+            AppEvent::DroppedText(text) => self.add_dropped_text(text),
             AppEvent::FfmpegFound(found) => {
                 self.ffmpeg_found = Some(found);
                 // Nothing to ask: what waited to know it starts.
@@ -1442,10 +1562,13 @@ fn read_options(settings: &Settings, input: &str) -> ingest::ListOptions {
 }
 
 /// Reads the downloads `input` (a local or remote .metalink, .meta4 or .torrent, or a link that
-/// lists many) lists, fetching through the proxy setting, and the notes the listing left.
-fn read_listing(settings: &Settings, input: String) -> impl Future<Output = (Result<Vec<Task>, String>, Vec<String>)> + Send + 'static {
+/// lists many) lists, fetching through the proxy setting, and the notes the listing left; the
+/// `pasted` link `input` is is read with its password (a share's) and sign-in (a feed's).
+fn read_listing(settings: &Settings, input: String, pasted: Option<&paste::PastedLink>) -> impl Future<Output = (Result<Vec<Task>, String>, Vec<String>)> + Send + 'static {
     let (notes, noted) = mpsc::channel();
-    let list = ingest::ListOptions { notes: Some(notes), ..read_options(settings, &input) };
+    let password = pasted.and_then(|link| link.secrets.password.clone());
+    let auth = pasted.and_then(|link| Some((link.url.clone(), link.secrets.auth_header.clone()?)));
+    let list = ingest::ListOptions { notes: Some(notes), password, auth, ..read_options(settings, &input) };
     async move {
         let read = async {
             let tokens = ingest::input_tokens(&input).await;
@@ -1666,8 +1789,8 @@ fn spawn_clipboard_watcher(
                 }
                 text.clone_into(&mut seen);
             }
-            if let Some(link) = util::clipboard_link(text) {
-                if tx.send(AppEvent::ClipboardLink(link)).is_err() {
+            if let Some((shown, text)) = util::clipboard_offer(text) {
+                if tx.send(AppEvent::ClipboardLink(shown, text)).is_err() {
                     break;
                 }
                 ctx.request_repaint();
@@ -2076,6 +2199,118 @@ mod tests {
         app.queue.items().iter().map(|item| item.urls[0].to_string()).collect()
     }
 
+    /// A paste with secrets queues each link with what the paste gave it, the form's
+    /// Authorization header winning, from the form, the queue input and a dropped .txt alike; the notes name what is used, and no secret reaches a note, a notice, a link or
+    /// the queue file. A copied POST adds nothing.
+    #[test]
+    fn pasted_secrets_reach_their_downloads_and_nothing_else() {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(&rt, dir.path());
+        let secrets = ["hunter2", "Ym9iOmh1bnRlcjI=", "s3cret-pw", "cookie-secret", "key-secret"];
+
+        let text = "https://bob:hunter2@h.example/a.zip\nhttps://h.example/b.zip\nPassword: s3cret-pw";
+        let (ids, notes) = app.add_pasted(text, "", "", Origin::Form).unwrap().unwrap();
+        let options = |app: &App, id: usize| app.queue.get_item(id).unwrap().options.clone();
+        assert_eq!(queued(&app), ["https://h.example/a.zip", "https://h.example/b.zip"]);
+        assert_eq!(options(&app, ids[0]).auth_header.as_deref(), Some("Basic Ym9iOmh1bnRlcjI="));
+        assert_eq!(options(&app, ids[1]).password.as_deref(), Some("s3cret-pw"));
+        assert!(notes.iter().all(|note| note.starts_with("Using the ") && note.ends_with("from your paste for h.example")), "{notes:?}");
+
+        let typed = app.add_pasted("https://bob:hunter2@h.example/c.zip", "", "Bearer typed", Origin::Form).unwrap().unwrap();
+        assert_eq!(options(&app, typed.0[0]).auth_header.as_deref(), Some("Bearer typed"), "the form wins");
+
+        app.queue_input = "curl 'https://c.example/c.bin' -H 'Cookie: sid=cookie-secret' -H 'X-Api-Key: key-secret'".to_string();
+        app.add_queue_input();
+        assert_eq!((app.queue_input.as_str(), &app.queue_error), ("", &None), "the queue input clears");
+        let headers = options(&app, app.queue.items().last().unwrap().id).secret_headers;
+        assert!(headers.contains(&("Cookie".into(), "sid=cookie-secret".into())) && headers.contains(&("X-Api-Key".into(), "key-secret".into())), "{headers:?}");
+
+        app.handle_event(AppEvent::DroppedText(Ok("https://d.example/d.7z\nPassword: s3cret-pw\n".to_string())));
+        assert_eq!(options(&app, app.queue.items().last().unwrap().id).password.as_deref(), Some("s3cret-pw"));
+
+        let count = app.queue.items().len();
+        assert_eq!(app.add_pasted("curl -d a=1 https://h.example/f.zip", "", "", Origin::Form), Some(Err(paste::SENDS_DATA.to_string())));
+        assert_eq!(app.queue.items().len(), count);
+        assert_eq!(app.add_pasted("https://h.example/plain.zip", "", "", Origin::Form), None, "no secret: any other input");
+
+        let notice = format!("{:?}", app.notice);
+        let saved = serde_json::to_string(&app.queue).unwrap();
+        for secret in secrets {
+            assert!(!saved.contains(secret) && !notice.contains(secret) && !queued(&app).concat().contains(secret), "{secret}");
+            assert!(!notes.concat().contains(secret));
+        }
+    }
+
+    /// A paste in the queue input: a link to read is read with its pasted sign-in (sent to its
+    /// host alone) and goes back on its line should reading it fail; a line the paste leaves that
+    /// is an input of its own (a magnet) is read too, and nothing claims "Added 0 download(s)".
+    #[test]
+    fn pasted_links_to_read_use_their_sign_in_and_go_back_when_they_fail() {
+        const META4: &str = r#"<metalink xmlns="urn:ietf:params:xml:ns:metalink"><file name="a.bin"><url>https://m.example/a.bin</url></file></metalink>"#;
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        // A proxy serving the list only to its sign-in ("bob:hunter2"), failing the other link.
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let heads = Arc::clone(&seen);
+        let proxy = rt.block_on(async move {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    let heads = Arc::clone(&heads);
+                    tokio::spawn(async move {
+                        let (mut head, mut buf) = (Vec::new(), [0u8; 1024]);
+                        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                            match socket.read(&mut buf).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => head.extend_from_slice(&buf[..n]),
+                            }
+                        }
+                        let head = String::from_utf8_lossy(&head).into_owned();
+                        let signed = head.lines().any(|l| l.eq_ignore_ascii_case("authorization: Basic Ym9iOmh1bnRlcjI="));
+                        let reply = match (head.split_whitespace().nth(1), signed) {
+                            (Some("http://docs.example/list.meta4"), true) => format!("200 OK\r\nContent-Length: {}\r\n\r\n{META4}", META4.len()),
+                            (Some("http://docs.example/list.meta4"), false) => "401 Unauthorized\r\nContent-Length: 0\r\n\r\n".to_string(),
+                            _ => "500 Internal Server Error\r\nContent-Length: 0\r\n\r\n".to_string(),
+                        };
+                        heads.lock().unwrap().push(head);
+                        let _ = socket.write_all(format!("HTTP/1.1 {reply}").as_bytes()).await;
+                    });
+                }
+            });
+            addr
+        });
+        let mut app = test_app(&rt, dir.path());
+        app.settings.proxy = format!("http://{proxy}");
+        let magnet = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=ubuntu.iso";
+        app.queue_input = format!("{magnet}\nhttp://bob:hunter2@docs.example/list.meta4\nhttp://docs.example/broken.meta4\nPassword: s3cret");
+        app.add_queue_input();
+        assert_eq!(app.queue_input, "");
+        assert!(matches!(&app.notice, Some(Ok(n)) if n.starts_with("Reading")), "{:?}", app.notice);
+        for read in [magnet, "http://docs.example/list.meta4", "http://docs.example/broken.meta4"] {
+            assert!(app.reading.contains_key(read), "{read} is not read");
+        }
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !app.reading.is_empty() && std::time::Instant::now() < deadline {
+            rt.block_on(async { tokio::time::sleep(Duration::from_millis(20)).await });
+            while let Ok(event) = app.events_rx.try_recv() {
+                app.handle_event(event);
+            }
+        }
+        assert!(queued(&app).contains(&"https://m.example/a.bin".to_string()), "{:?}", queued(&app));
+        assert!(app.queue_input.lines().any(|l| l == "http://docs.example/broken.meta4"), "{}", app.queue_input);
+        assert!(app.queue_error.as_deref().is_some_and(|e| e.contains("Line 3: ")), "{:?}", app.queue_error);
+        let heads = seen.lock().unwrap().clone();
+        assert!(heads.iter().any(|h| h.contains("broken.meta4")), "{heads:?}");
+        for head in heads.iter().filter(|h| !h.contains("/list.meta4")) {
+            assert!(!head.to_ascii_lowercase().contains("authorization"), "{head}");
+        }
+        let shown = format!("{} {:?} {:?}", app.queue_input, app.queue_error, app.notice);
+        assert!(!shown.contains("hunter2") && !shown.contains("s3cret"), "{shown}");
+    }
+
     /// A video link that names its playlist asks at once: the video can be picked while the
     /// playlist is read, which stops the reading (what it gives later is dropped), the whole
     /// playlist once it has been read. yt-dlp finding the video alone adds it without asking, and
@@ -2303,7 +2538,7 @@ mod tests {
         let xml = br#"<metalink xmlns="urn:ietf:params:xml:ns:metalink"><file name="a.bin"><url>https://m.example/a.bin</url></file></metalink>"#;
         let proxy = serve(Arc::new(xml.to_vec())).await;
         let settings = Settings { proxy: format!("http://{}", proxy), ..Settings::default() };
-        let (tasks, notes) = read_listing(&settings, "http://documents.invalid/list.meta4".to_string()).await;
+        let (tasks, notes) = read_listing(&settings, "http://documents.invalid/list.meta4".to_string(), None).await;
         assert_eq!(tasks.unwrap().iter().map(|t| t.name.clone()).collect::<Vec<_>>(), [Some(PathBuf::from("a.bin"))]);
         assert!(notes.is_empty(), "{notes:?}");
     }
@@ -2318,7 +2553,7 @@ mod tests {
             {"quickkey":"openfile000002","filename":"b.bin","password_protected":"no"}],"more_chunks":"no"}}}"#;
         let proxy = serve(Arc::new(json.to_vec())).await;
         let settings = Settings { proxy: format!("http://{}", proxy), ..Settings::default() };
-        let (tasks, notes) = read_listing(&settings, "http://www.mediafire.com/folder/pack00000001".to_string()).await;
+        let (tasks, notes) = read_listing(&settings, "http://www.mediafire.com/folder/pack00000001".to_string(), None).await;
         assert_eq!(tasks.unwrap().len(), 1);
         assert_eq!(notes, ["1 files of the MediaFire folder are protected by a password and were left out"]);
 

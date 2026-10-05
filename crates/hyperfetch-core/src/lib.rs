@@ -25,6 +25,7 @@ pub mod mega;
 pub mod shares;
 pub mod gallery;
 pub mod postprocess;
+pub mod paste;
 
 pub use range::{ByteRange, RangeError};
 pub use chunk::{Chunk, ChunkManager, ChunkStatus, ChunkError};
