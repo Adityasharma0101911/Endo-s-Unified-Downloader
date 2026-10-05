@@ -470,7 +470,10 @@ function renderMediaCard(info) {
   $("mc-title").textContent = info.title || tab.title || "";
   $("mc-title").title = info.title || "";
   $("mc-channel").textContent = info.uploader || hostOf(tab.url);
-  if (/^https?:\/\//i.test(info.thumbnail || "")) Object.assign($("mc-thumb"), { src: info.thumbnail, hidden: false });
+  // A thumbnail that fails to load leaves the card's gradient, not a broken-image box.
+  if (/^https?:\/\//i.test(info.thumbnail || "")) {
+    Object.assign($("mc-thumb"), { src: info.thumbnail, hidden: false, onerror: () => ($("mc-thumb").hidden = true) });
+  }
   const length = Number(info.duration) > 0 ? formatDuration(info.duration) : "";
   Object.assign($("mc-length"), { textContent: length, hidden: !length });
 
