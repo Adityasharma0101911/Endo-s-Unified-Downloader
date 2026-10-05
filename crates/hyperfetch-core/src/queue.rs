@@ -52,6 +52,9 @@ pub struct QueueItem {
     /// still save it under a numbered name, which `target_path` then reports.
     #[serde(default)]
     pub names_file: bool,
+    /// What post-processing told the user once the download finished (see `EngineSnapshot::notes`).
+    #[serde(default)]
+    pub notes: Vec<String>,
 }
 
 impl QueueItem {
@@ -130,6 +133,7 @@ impl DownloadQueue {
             progress_ratio: 0.0,
             target_path: None,
             names_file: false,
+            notes: Vec::new(),
         });
         id
     }
@@ -240,6 +244,10 @@ impl DownloadQueue {
             item.target_path = Some(target.clone());
             self.revision += 1;
         }
+        if !snapshot.notes.is_empty() {
+            item.notes = snapshot.notes.clone();
+            self.revision += 1;
+        }
     }
 
     /// Settles a finished engine run. A run that ends while pausing is `Paused` when the pause
@@ -275,6 +283,7 @@ impl DownloadQueue {
             item.downloaded_bytes = 0;
             item.speed_bytes_per_sec = 0.0;
             item.progress_ratio = 0.0;
+            item.notes.clear();
         }
     }
 
@@ -383,6 +392,7 @@ mod tests {
             mirror_speeds: Vec::new(),
             chunks: Vec::new(),
             target_path: Some(PathBuf::from(target)),
+            ..Default::default()
         }
     }
 

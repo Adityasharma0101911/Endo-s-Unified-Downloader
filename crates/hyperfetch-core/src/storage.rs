@@ -55,6 +55,8 @@ pub struct DiskWriter {
     path: PathBuf,
     size: u64,
     inner: Arc<Inner>,
+    /// A MEGA file's key, which what is written is decrypted with first (see `decrypting`).
+    decrypt: Option<Arc<crate::mega::Cipher>>,
 }
 
 /// Shared by a writer's clones. Once the last one is gone nothing writes any more, so the prefix
@@ -107,7 +109,14 @@ impl DiskWriter {
                 #[cfg(test)]
                 syncs: AtomicUsize::new(0),
             }),
+            decrypt: None,
         })
+    }
+
+    /// This writer decrypting what it is given with `cipher` (a MEGA file's, see `crate::mega`)
+    /// at its offset before writing and hashing it, so the file and its digests hold plaintext.
+    pub fn decrypting(self, cipher: Option<Arc<crate::mega::Cipher>>) -> Self {
+        Self { decrypt: cipher, ..self }
     }
 
     pub fn size(&self) -> u64 {
@@ -127,6 +136,15 @@ impl DiskWriter {
         if offset.checked_add(data.len() as u64).is_none_or(|end| end > self.size) {
             return Err(StorageError::OutOfBounds(offset, data.len(), self.size));
         }
+        let mut plain;
+        let data = match &self.decrypt {
+            Some(cipher) => {
+                plain = data.to_vec();
+                cipher.apply(offset, &mut plain);
+                &plain
+            }
+            None => data,
+        };
         write_all_at(&self.inner.file, data, offset)?;
         self.inner.hashes.wrote(&self.inner.file, offset, data);
         Ok(())

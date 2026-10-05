@@ -817,7 +817,7 @@ pub(crate) async fn archive_downloaded(file: Option<&Path>, ids: Vec<String>) {
     }
 }
 
-fn exe_name(base: &str) -> String {
+pub(crate) fn exe_name(base: &str) -> String {
     if cfg!(windows) {
         format!("{base}.exe")
     } else {
@@ -825,13 +825,13 @@ fn exe_name(base: &str) -> String {
     }
 }
 
-fn next_to_current_exe(name: &str) -> Option<PathBuf> {
+pub(crate) fn next_to_current_exe(name: &str) -> Option<PathBuf> {
     let candidate = std::env::current_exe().ok()?.parent()?.join(name);
     candidate.is_file().then_some(candidate)
 }
 
 /// Searches the absolute PATH entries; a relative entry would depend on the current directory.
-fn find_in_path(name: &str) -> Option<PathBuf> {
+pub(crate) fn find_in_path(name: &str) -> Option<PathBuf> {
     std::env::split_paths(&std::env::var_os("PATH")?)
         .filter(|dir| dir.is_absolute())
         .map(|dir| dir.join(name))
@@ -851,7 +851,7 @@ fn app_data_dir() -> Option<PathBuf> {
 
 /// Per-user directory the managed yt-dlp is installed into (always writable, unlike the
 /// application directory under Program Files or /usr/local/bin).
-fn managed_bin_dir() -> Option<PathBuf> {
+pub(crate) fn managed_bin_dir() -> Option<PathBuf> {
     Some(app_data_dir()?.join("bin"))
 }
 
@@ -1075,7 +1075,7 @@ fn ytdlp_release_asset() -> &'static str {
 }
 
 /// Look up `asset` in a `sha256sum`-style listing ("<hex>  <name>" per line).
-fn expected_sha256<'a>(sums: &'a str, asset: &str) -> Option<&'a str> {
+pub(crate) fn expected_sha256<'a>(sums: &'a str, asset: &str) -> Option<&'a str> {
     sums.lines().find_map(|line| {
         let (hash, name) = line.split_once(char::is_whitespace)?;
         (name.trim().trim_start_matches('*') == asset).then_some(hash)
@@ -1205,13 +1205,13 @@ fn install_file(target: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
 }
 
 #[cfg(unix)]
-fn make_executable(path: &Path) -> std::io::Result<()> {
+pub(crate) fn make_executable(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
 }
 
 #[cfg(all(not(unix), not(windows)))]
-fn make_executable(_path: &Path) -> std::io::Result<()> {
+pub(crate) fn make_executable(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -2681,7 +2681,7 @@ fn is_cancelled(flag: &Option<Arc<AtomicBool>>) -> bool {
 
 /// yt-dlp's whole process tree: yt-dlp itself, the interpreter a pip/PyInstaller launcher
 /// starts as its child, and the ffmpeg processes yt-dlp spawns. Dropping it kills the tree.
-struct ProcessTree {
+pub(crate) struct ProcessTree {
     /// Job object created with KILL_ON_JOB_CLOSE: when its last handle closes (on drop, or when
     /// this process dies for any reason) Windows terminates every process in it.
     #[cfg(windows)]
@@ -2701,7 +2701,7 @@ unsafe impl Sync for ProcessTree {}
 
 impl ProcessTree {
     #[cfg(windows)]
-    fn attach(child: &Child) -> Self {
+    pub(crate) fn attach(child: &Child) -> Self {
         use windows_sys::Win32::Foundation::HANDLE;
         use windows_sys::Win32::System::JobObjects::{
             AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
@@ -2733,7 +2733,7 @@ impl ProcessTree {
     }
 
     #[cfg(unix)]
-    fn attach(child: &Child) -> Self {
+    pub(crate) fn attach(child: &Child) -> Self {
         Self { pgid: child.id().and_then(|id| libc::pid_t::try_from(id).ok()) }
     }
 
@@ -2774,14 +2774,14 @@ impl ProcessTree {
     }
 
     /// The leader has exited and been reaped.
-    fn disarm(&mut self) {
+    pub(crate) fn disarm(&mut self) {
         #[cfg(unix)]
         {
             self.pgid = None;
         }
     }
 
-    async fn kill_and_reap(&mut self, child: &mut Child) {
+    pub(crate) async fn kill_and_reap(&mut self, child: &mut Child) {
         self.kill();
         let _ = child.start_kill();
         let _ = child.wait().await;
@@ -2937,7 +2937,7 @@ fn tree_command(program: &Path) -> Command {
 /// The yt-dlp invocation, run in `work_dir`. A proxy goes into the child's environment, which
 /// yt-dlp and the ffmpeg it starts both honor: on the command line its credentials would be
 /// visible to every local user.
-fn ytdlp_command(bin: &Path, args: &[String], proxy: Option<&str>, work_dir: &Path) -> Command {
+pub(crate) fn ytdlp_command(bin: &Path, args: &[String], proxy: Option<&str>, work_dir: &Path) -> Command {
     let mut cmd = tree_command(bin);
     // Otherwise Python encodes piped output in the locale code page (cp1252 on Windows).
     cmd.args(args).current_dir(work_dir).env("PYTHONIOENCODING", "utf-8");
@@ -4614,6 +4614,15 @@ pub(crate) fn site_failed(error: &str) -> bool {
             && !error.contains(NO_SITE)
             && !error.contains("Unsupported URL")
             && (lower.contains(GEO_BLOCKED) || !no_media))
+}
+
+/// Whether `error`, of a yt-dlp download, says there is no video at the link: no site of yt-dlp's
+/// takes it, or the one that does finds no media there (an X post of pictures only, "No video
+/// could be found in this tweet"; a Reddit gallery, which only the generic site is left for).
+pub(crate) fn found_no_video(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    [NO_SITE, "Unsupported URL", NOTHING_FOUND].iter().any(|words| error.contains(words))
+        || NO_MEDIA.iter().any(|words| lower.contains(words))
 }
 
 /// [`find_site_media`] with `tools`. Paths in `options` must be absolute.
@@ -6399,6 +6408,7 @@ bbd8671c6c05eaa3ec29d690695aebadff0871faa3efe9051581afbf3c01e80e  ffmpeg-master-
             mirror_speeds: vec![],
             chunks: vec![],
             target_path: None,
+            ..Default::default()
         }
     }
 

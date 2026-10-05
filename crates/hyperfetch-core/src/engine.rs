@@ -94,7 +94,7 @@ const MAX_CONNECTIONS: usize = 64;
 /// a few packets from splitting off slivers.
 const MIN_STEAL: u64 = 64 * 1024;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct EngineSnapshot {
     pub total_bytes: u64,
     pub downloaded_bytes: u64,
@@ -104,6 +104,10 @@ pub struct EngineSnapshot {
     pub mirror_speeds: Vec<(usize, String, f64)>, // (id, host, bytes_per_sec)
     pub chunks: Vec<ChunkSnapshot>,
     pub target_path: Option<PathBuf>,
+    /// Peers and upload of a BitTorrent download.
+    pub torrent: Option<crate::p2p::TorrentProgress>,
+    /// What post-processing tells the user (see `crate::postprocess`), in the last snapshot.
+    pub notes: Vec<String>,
 }
 
 impl EngineSnapshot {
@@ -203,10 +207,31 @@ pub struct DownloadOptions {
     pub archive_lines: Vec<String>,
     /// Proxy pool for multi-egress rotation across workers.
     pub proxy_pool: Vec<String>,
-    /// Debrid unrestrictor API key (Real-Debrid, AllDebrid).
+    /// Debrid API key. Never saved with the options: a front end fills it in from its settings
+    /// each time the download starts.
+    #[serde(skip)]
     pub debrid_api_key: Option<String>,
-    /// Debrid provider override ("real-debrid" or "alldebrid").
+    /// Debrid provider: "realdebrid", "alldebrid", "torbox" or "premiumize".
     pub debrid_provider: Option<String>,
+    /// Local addresses the connections go out from, spread over them (several networks at once);
+    /// empty lets the system choose.
+    pub bind_addresses: Vec<std::net::IpAddr>,
+    /// The download is a BitTorrent swarm download (see `ingest::Task::p2p`).
+    pub bittorrent: bool,
+    /// A finished torrent seeds until it has uploaded this many times its size (0 = no seeding).
+    pub seed_ratio: f64,
+    /// ... or for this many minutes, whichever comes first (0 = no time limit).
+    pub seed_minutes: u32,
+    /// The BitTorrent listen port; None uses librqbit's default range.
+    pub bt_port: Option<u16>,
+    /// Ask the router (UPnP) to forward the BitTorrent port.
+    pub bt_upnp: bool,
+    /// Magnet links go through debrid when there is a debrid key.
+    pub debrid_magnets: bool,
+    /// Image galleries go to gallery-dl.
+    pub gallery_dl: bool,
+    /// What happens to the file once downloaded.
+    pub post: crate::postprocess::PostOptions,
 }
 
 impl Default for DownloadOptions {
@@ -247,6 +272,15 @@ impl Default for DownloadOptions {
             proxy_pool: Vec::new(),
             debrid_api_key: None,
             debrid_provider: None,
+            bind_addresses: Vec::new(),
+            bittorrent: false,
+            seed_ratio: 0.0,
+            seed_minutes: 0,
+            bt_port: None,
+            bt_upnp: false,
+            debrid_magnets: true,
+            gallery_dl: true,
+            post: Default::default(),
         }
     }
 }
@@ -263,6 +297,7 @@ pub struct ClientKey {
     referer: Option<String>,
     headers: Vec<(String, String)>,
     http2: bool,
+    bind_addresses: Vec<std::net::IpAddr>,
 }
 
 impl ClientKey {
@@ -275,6 +310,7 @@ impl ClientKey {
             referer: options.referer.clone(),
             headers: options.headers.clone(),
             http2: options.http2,
+            bind_addresses: options.bind_addresses.clone(),
         }
     }
 }
@@ -300,6 +336,11 @@ pub struct DownloadEngine {
     limiter: Option<Arc<RateLimiter>>,
     cancel_flag: Arc<AtomicBool>,
     cancel_token: CancellationToken,
+    /// What a MEGA download decrypts what it writes with (see `fetch_mega`).
+    decrypt: Option<Arc<crate::mega::Cipher>>,
+    /// A file found downloaded already (see `plan_target`): `run` leaves it as it is instead of
+    /// post-processing it again.
+    already_done: Arc<std::sync::Mutex<Option<PathBuf>>>,
 }
 
 impl DownloadEngine {
@@ -310,19 +351,17 @@ impl DownloadEngine {
 
     /// Like `new`, but downloads through `client`, which must come from `build_client` with options
     /// of the same `ClientKey`: a batch or queue shares one client so later downloads reuse its
-    /// connections. Credentials are still added per request, only for the hosts in `urls`.
+    /// connections. Credentials are still added per request, only for the hosts in `urls`. Proxy
+    /// pool and network routes still get clients of their own (see `build_client_pool`).
     pub fn with_client(urls: Vec<Url>, options: DownloadOptions, client: Client) -> Self {
-        let pool = vec![client.clone()];
-        let mut engine = Self::with_client_result(urls, options, Ok(client));
-        engine.client_pool = Ok(pool);
-        engine
+        Self::with_client_result(urls, options, Ok(client))
     }
 
     fn with_client_result(urls: Vec<Url>, options: DownloadOptions, client: Result<Client, String>) -> Self {
         // A "leaving this site" link stands for its target, as the front ends' ingest takes it:
         // that is what is downloaded, recorded, and given the credentials.
         let urls: Vec<Url> = urls.into_iter().map(|u| crate::resolver::unwrap_redirect(&u).unwrap_or(u)).collect();
-        let client_pool = if options.proxy_pool.is_empty() {
+        let client_pool = if options.proxy_pool.is_empty() && options.bind_addresses.is_empty() {
             client.as_ref().map(|c| vec![c.clone()]).map_err(|e| e.clone())
         } else {
             build_client_pool(&options)
@@ -339,6 +378,8 @@ impl DownloadEngine {
                     auth: None,
                     cancel_flag: Arc::new(AtomicBool::new(false)),
                     cancel_token: CancellationToken::new(),
+                    decrypt: None,
+                    already_done: Arc::default(),
                 },
             },
             (None, Some(referer)) => Some(Arc::new(Auth::only_referer(referer, &urls))),
@@ -353,6 +394,8 @@ impl DownloadEngine {
             auth,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             cancel_token: CancellationToken::new(),
+            decrypt: None,
+            already_done: Arc::default(),
         }
     }
 
@@ -383,7 +426,9 @@ impl DownloadEngine {
     /// Downloads the engine's URLs and returns the path of the finished file, adding the
     /// options' `archive_lines` to the download archive once it is (not for a recording stopped
     /// early: it is not the whole of it). A download that fails on a server refusing HTTP/1.1
-    /// (see [`Self::refuses_http1`]) is run once more over HTTP/2.
+    /// (see [`Self::refuses_http1`]) is run once more over HTTP/2. A finished download is then
+    /// post-processed (see `crate::postprocess`): the path returned is where that left it, and its
+    /// notes come in a last snapshot.
     pub async fn run(
         &self,
         snapshot_tx: Option<broadcast::Sender<EngineSnapshot>>,
@@ -393,12 +438,22 @@ impl DownloadEngine {
             if self.refuses_http1(error).await {
                 tracing::warn!("The server refuses HTTP/1.1 ({}); downloading again over HTTP/2", error);
                 let engine = self.over_http2();
-                result = engine.boxed(|engine| engine.fetch_all(snapshot_tx)).await;
+                let tx = snapshot_tx.clone();
+                result = engine.boxed(|engine| engine.fetch_all(tx)).await;
             }
         }
         let lines = &self.options.archive_lines;
         if result.is_ok() && !lines.is_empty() && !self.cancel_token.is_cancelled() {
             crate::media::archive_downloaded(crate::media::archive_file().as_deref(), lines.clone()).await;
+        }
+        let reused = result.as_ref().is_ok_and(|path| self.already_done.lock().unwrap().as_ref() == Some(path));
+        if let (Ok(path), Some(source), false) = (&result, self.urls.first(), reused) {
+            let done = crate::postprocess::after_download(path, &self.options.post, source, self.options.proxy.as_deref()).await;
+            if !done.notes.is_empty() {
+                let size = crate::postprocess::size_of(&done.path);
+                emit(&snapshot_tx, || EngineSnapshot { notes: done.notes, ..done_snapshot(size, &done.path) });
+            }
+            result = Ok(done.path);
         }
         result
     }
@@ -413,6 +468,12 @@ impl DownloadEngine {
             return Err(CANCELLED.to_string());
         }
 
+        // A magnet link or .torrent for the swarm (see `ingest::Task::p2p`).
+        if self.options.bittorrent {
+            let source = self.urls.first().ok_or("No URLs to download")?;
+            return self.unless_rerun(crate::p2p::run(source, &self.options, &self.save_dir(), snapshot_tx, self.cancel_token.clone()).await);
+        }
+
         // A playlist the page built itself: the link is only the base of its URIs.
         if self.options.playlist_text.is_some() {
             let base = self.urls.first().ok_or("No URLs to download")?.clone();
@@ -420,12 +481,47 @@ impl DownloadEngine {
             return fetched.ok_or_else(|| "Not an HLS playlist".to_string());
         }
 
+        // Before yt-dlp: a Reddit gallery is on a media site, but has no video. Without a
+        // gallery-dl to run here, the link goes on as it did before gallery-dl.
+        if let Some(gallery) = self.urls.iter().find(|u| self.options.gallery_dl && crate::gallery::handles(u)) {
+            let tx = snapshot_tx.clone();
+            if let Some(done) = crate::gallery::run(gallery, &self.options, &self.save_dir(), tx, self.cancel_token.clone()).await {
+                return self.unless_rerun(done);
+            }
+        }
+
         if let Some(media_url) = self.media_target() {
-            return self.run_media(media_url, None, snapshot_tx).await;
+            let result = self.run_media(media_url.clone(), None, snapshot_tx.clone()).await;
+            // An X or Reddit post of pictures: yt-dlp finds no video there, gallery-dl the pictures.
+            match &result {
+                Err(e)
+                    if self.options.gallery_dl
+                        && crate::gallery::takes_posts(&media_url)
+                        && crate::media::found_no_video(e)
+                        && !self.cancel_token.is_cancelled() =>
+                {
+                    tracing::info!("yt-dlp finds no video at {}; trying gallery-dl: {}", media_url, e)
+                }
+                _ => return result,
+            }
+            return match crate::gallery::run(&media_url, &self.options, &self.save_dir(), snapshot_tx, self.cancel_token.clone()).await {
+                Some(done) => self.unless_rerun(done),
+                None => result,
+            };
         }
 
         let resolved = self.resolve_all(&client).await?;
         self.fetch_resolved(client, resolved, snapshot_tx, Route { follows: 0, tried: Vec::new(), scrape: true }).await
+    }
+
+    /// The path of a torrent or gallery `done` with, and whether anything of it arrived now:
+    /// when nothing did (an earlier run fetched it all), it is not post-processed again.
+    fn unless_rerun(&self, done: Result<(PathBuf, bool), String>) -> Result<PathBuf, String> {
+        let (path, fresh) = done?;
+        if !fresh {
+            *self.already_done.lock().unwrap() = Some(path.clone());
+        }
+        Ok(path)
     }
 
     /// Whether this download failed with `error` because a server refuses HTTP/1.1, which the
@@ -460,6 +556,7 @@ impl DownloadEngine {
         engine.limiter = self.limiter.clone();
         engine.cancel_flag = Arc::clone(&self.cancel_flag);
         engine.cancel_token = self.cancel_token.clone();
+        engine.already_done = Arc::clone(&self.already_done);
         engine
     }
 
@@ -479,6 +576,10 @@ impl DownloadEngine {
         snapshot_tx: Option<broadcast::Sender<EngineSnapshot>>,
         mut route: Route,
     ) -> Result<PathBuf, String> {
+        // MEGA's links resolve to themselves (see `crate::mega::resolve`).
+        if let Some(link) = resolved.iter().find(|u| crate::mega::handles(u)) {
+            return Box::pin(self.fetch_mega(client, link.clone(), snapshot_tx)).await;
+        }
         let mpd = |u: &Url| u.path().to_ascii_lowercase().ends_with(".mpd");
         if let Some(manifest) = resolved.iter().find(|u| self.options.dash || mpd(u)) {
             return self.run_dash(manifest.clone(), snapshot_tx).await;
@@ -553,6 +654,33 @@ impl DownloadEngine {
             return self.naming(final_url.clone()).run_media(final_url, Some(found), snapshot_tx).await;
         }
         self.download(client, probed, snapshot_tx).await
+    }
+
+    /// Downloads the MEGA file of `link` (see `crate::mega`) from where MEGA's API serves it for
+    /// now, named as its attributes say, decrypted as it is written, and checked against the MAC
+    /// its key carries (see `verify_written`). Only the link is recorded, never that address: it
+    /// serves ciphertext, and not for long.
+    async fn fetch_mega(
+        &self,
+        client: Client,
+        link: Url,
+        snapshot_tx: Option<broadcast::Sender<EngineSnapshot>>,
+    ) -> Result<PathBuf, String> {
+        let source = self.guarded(RESOLVE_TIMEOUT, "asking MEGA for the file", crate::mega::file(&client, &link)).await??;
+        let engine = Self { decrypt: Some(Arc::new(source.cipher)), ..self.naming(link) };
+        let fetched = async {
+            let mut probed = engine.probe_all(&client, std::slice::from_ref(&source.url)).await?;
+            // The ciphertext's validators tell a resume nothing the MAC does not check.
+            for probe in std::iter::once(&mut probed.reference).chain(&mut probed.mirrors) {
+                (probe.etag, probe.last_modified) = (None, None);
+            }
+            let name = sanitize_filename(&source.name);
+            if !name.is_empty() {
+                probed.reference.filename = name;
+            }
+            engine.download(client, probed, snapshot_tx).await
+        };
+        fetched.await.map_err(|e| if e.contains("HTTP 509") { crate::mega::QUOTA.to_string() } else { e })
     }
 
     /// Downloads the DASH manifest `manifest` with yt-dlp, which picks and merges its video and
@@ -654,6 +782,7 @@ impl DownloadEngine {
                     &target,
                     self.options.debrid_api_key.as_deref(),
                     self.options.debrid_provider.as_deref(),
+                    self.options.proxy.as_deref(),
                 ),
             )
             .await?
@@ -836,6 +965,7 @@ impl DownloadEngine {
                         mirror_speeds: vec![],
                         chunks: vec![],
                         target_path: None,
+                        ..Default::default()
                     });
                 }
             }
@@ -1096,6 +1226,7 @@ impl DownloadEngine {
                         url,
                         self.options.debrid_api_key.as_deref(),
                         self.options.debrid_provider.as_deref(),
+                        self.options.proxy.as_deref(),
                     ),
                 )
                 .await?
@@ -1220,8 +1351,12 @@ impl DownloadEngine {
         let started_at = unix_now();
         let base = self.output_path_for(&reference.filename);
         // The mirrors, as resolvers made them of the links, among its URLs: a repair of the file
-        // asks them, not a page the link was (see `naming`).
-        let this = mirrors.iter().fold(self.clone(), |engine, mirror| engine.naming(mirror.url.clone()));
+        // asks them, not a page the link was (see `naming`). A MEGA file keeps to its link (see
+        // `fetch_mega`).
+        let this = match self.decrypt {
+            Some(_) => self.clone(),
+            None => mirrors.iter().fold(self.clone(), |engine, mirror| engine.naming(mirror.url.clone())),
+        };
         let known_urls = this.url_strings();
 
         let plan = {
@@ -1239,6 +1374,7 @@ impl DownloadEngine {
         let (final_path, resume, claim) = match plan? {
             Plan::AlreadyDone(path) => {
                 tracing::info!("{} is already downloaded", path.display());
+                *self.already_done.lock().unwrap() = Some(path.clone());
                 emit(&snapshot_tx, || done_snapshot(reference.size.unwrap_or(0), &path));
                 return Ok(path);
             }
@@ -1259,7 +1395,12 @@ impl DownloadEngine {
             tracing::info!("Resuming {} with {} completed range(s)", part.display(), previous.completed_ranges.len());
             state.completed_ranges = previous.completed_ranges;
         }
-        let prefetched = reference.prefetch.clone();
+        let mut prefetched = reference.prefetch.clone();
+        if let Some(cipher) = &self.decrypt {
+            let mut start = prefetched.to_vec();
+            cipher.apply(0, &mut start);
+            prefetched = start.into();
+        }
         // The probe brought the whole file: it is written in one go, so there is nothing to resume.
         let whole = reference.size == Some(prefetched.len() as u64);
         // Otherwise record the sources and validators before the first byte arrives.
@@ -1372,8 +1513,9 @@ impl DownloadEngine {
         let writer = {
             let part = part.to_path_buf();
             let (on_disk, checksum) = (state.completed_ranges.clone(), self.options.expected_checksum.clone());
+            let decrypt = self.decrypt.clone();
             blocking(move || {
-                let writer = DiskWriter::open_or_create(&part, size)?;
+                let writer = DiskWriter::open_or_create(&part, size)?.decrypting(decrypt);
                 writer.track_digest(&on_disk, checksum.as_deref());
                 for gap in unwritten {
                     writer.write_chunk_slice(gap.start, &prefetch[gap.start as usize..=gap.end as usize])?;
@@ -1404,6 +1546,8 @@ impl DownloadEngine {
         let shared = WorkerShared {
             client,
             clients: Arc::new(pool_clients),
+            dropped_routes: Default::default(),
+            reached: Default::default(),
             auth: self.auth.clone(),
             writer: job.writer.clone(),
             chunks: Arc::clone(&job.chunks),
@@ -1597,7 +1741,7 @@ impl DownloadEngine {
             }
         }
 
-        let mut out = InOrderFile::create(part, self.options.expected_checksum.clone())
+        let mut out = InOrderFile::create(part, self.options.expected_checksum.clone(), self.decrypt.clone())
             .await
             .map_err(|e| (FailureKind::Fatal, format!("Failed to create {}: {}", part.display(), e)))?;
         let disk_error = |e: std::io::Error| (FailureKind::Fatal, format!("Disk write error: {}", e));
@@ -1739,7 +1883,20 @@ impl DownloadEngine {
                 Written::Digest(digest) | Written::Flushed(digest) => verify_digest(&digest, expected.as_deref()),
             }
         };
-        hash_and_flush(hash, flush, reread).await
+        let hashed = hash_and_flush(hash, flush, reread).await?;
+        // A MEGA file is held to the MAC its key carries, as MEGA's own clients hold it.
+        if let Some(cipher) = self.decrypt.clone() {
+            let path = path.to_path_buf();
+            let checked = blocking(move || {
+                cipher.mac_matches(&path).map_err(|e| format!("Failed to read {}: {}", path.display(), e))
+            });
+            if !checked.await.and_then(|matched| matched).map_err(VerifyError::Io)? {
+                return Err(VerifyError::Mismatch(
+                    "The file MEGA sent does not match its MAC: it arrived damaged; download it again".to_string(),
+                ));
+            }
+        }
+        Ok(hashed)
     }
 
     /// Records `path` as completed in the download history, which is read only once, under its
@@ -1776,6 +1933,18 @@ impl DownloadEngine {
             res = tokio::time::timeout(limit, fut) => {
                 res.map_err(|_| format!("Timed out after {}s {}", limit.as_secs(), what))
             }
+        }
+    }
+
+    /// The folder the download is saved in: `output_path` when it names one, else its parent (a
+    /// torrent or gallery names its own file or folder in there). A torrent's `output_path` names
+    /// it unless it ends with a separator: a folder by then is the one an earlier run made.
+    fn save_dir(&self) -> PathBuf {
+        match &self.options.output_path {
+            Some(p) if self.options.bittorrent && !ends_with_separator(p) => p.parent().unwrap_or(Path::new(".")).to_path_buf(),
+            Some(p) if is_dir_target(p) => p.clone(),
+            Some(p) => p.parent().unwrap_or(Path::new(".")).to_path_buf(),
+            None => PathBuf::from("."),
         }
     }
 
@@ -1844,15 +2013,21 @@ struct InOrderFile {
     file: File,
     hasher: StreamHasher,
     batch: Vec<u8>,
+    /// A MEGA file's key, which each batch is decrypted with before it is written.
+    decrypt: Option<Arc<crate::mega::Cipher>>,
 }
 
 impl InOrderFile {
     /// Creates `path` (emptying it if it exists); `expected_checksum` says which digests to take.
-    async fn create(path: &Path, expected_checksum: Option<String>) -> std::io::Result<Self> {
+    async fn create(
+        path: &Path,
+        expected_checksum: Option<String>,
+        decrypt: Option<Arc<crate::mega::Cipher>>,
+    ) -> std::io::Result<Self> {
         let path = path.to_path_buf();
         let file = blocking(move || File::create(&path)).await.map_err(std::io::Error::other)??;
         let hasher = StreamHasher::new(expected_checksum.as_deref());
-        Ok(Self { file, hasher, batch: Vec::with_capacity(STREAM_BATCH) })
+        Ok(Self { file, hasher, batch: Vec::with_capacity(STREAM_BATCH), decrypt })
     }
 
     /// Appends `bytes`, writing the batch out once it is full.
@@ -1866,6 +2041,9 @@ impl InOrderFile {
 
     async fn write_batch(mut self) -> std::io::Result<Self> {
         blocking(move || {
+            if let Some(cipher) = &self.decrypt {
+                cipher.apply(self.hasher.position(), &mut self.batch);
+            }
             std::io::Write::write_all(&mut self.file, &self.batch)?;
             self.hasher.update(&self.batch);
             self.batch.clear();
@@ -1972,6 +2150,11 @@ pub fn build_client(options: &DownloadOptions) -> Result<Client, String> {
 
 /// Builds an HTTP client with the specified proxy URL override (if any).
 pub fn build_client_with_proxy(options: &DownloadOptions, proxy_url: Option<&str>) -> Result<Client, String> {
+    build_route_client(options, proxy_url, None)
+}
+
+/// A client whose connections go through `proxy_url` (if any) and leave from `local` (if any).
+fn build_route_client(options: &DownloadOptions, proxy_url: Option<&str>, local: Option<std::net::IpAddr>) -> Result<Client, String> {
     let mut headers = crate::resolver::SmartResolver::default_anti_qos_headers();
     if let Some(referer) = &options.referer {
         if let Ok(val) = reqwest::header::HeaderValue::from_str(referer) {
@@ -1991,6 +2174,7 @@ pub fn build_client_with_proxy(options: &DownloadOptions, proxy_url: Option<&str
         .tcp_nodelay(true)
         .connect_timeout(CONNECT_TIMEOUT)
         .tcp_keepalive(Duration::from_secs(30))
+        .local_address(local)
         .pool_max_idle_per_host(POOL_MAX_IDLE)
         .pool_idle_timeout(Some(POOL_IDLE))
         .default_headers(headers);
@@ -2037,19 +2221,26 @@ pub fn request_header(name: &str, value: &str) -> Option<(HeaderName, reqwest::h
     Some((HeaderName::from_bytes(name.as_bytes()).ok()?, reqwest::header::HeaderValue::from_str(value).ok()?))
 }
 
-/// Builds a pool of HTTP clients for multi-proxy / multi-egress rotation across workers.
+/// Most routes (proxy × local address) one download spreads its connections over.
+const MAX_ROUTES: usize = 16;
+
+/// One client per route the workers take turns on: every proxy of the pool (else the one
+/// `proxy`) through every local address of `bind_addresses` (else the OS's choice).
 pub fn build_client_pool(options: &DownloadOptions) -> Result<Vec<Client>, String> {
-    if options.proxy_pool.is_empty() {
-        let client = build_client(options)?;
-        Ok(vec![client])
-    } else {
-        let mut pool = Vec::with_capacity(options.proxy_pool.len());
-        for p in &options.proxy_pool {
-            let client = build_client_with_proxy(options, Some(p.trim()))?;
-            pool.push(client);
-        }
-        Ok(pool)
-    }
+    let proxies: Vec<Option<&str>> = match options.proxy_pool.is_empty() {
+        true => vec![options.proxy.as_deref()],
+        false => options.proxy_pool.iter().map(|p| Some(p.trim())).collect(),
+    };
+    let locals: Vec<Option<std::net::IpAddr>> = match options.bind_addresses.is_empty() {
+        true => vec![None],
+        false => options.bind_addresses.iter().copied().map(Some).collect(),
+    };
+    proxies
+        .iter()
+        .flat_map(|&proxy| locals.iter().map(move |&local| (proxy, local)))
+        .take(MAX_ROUTES)
+        .map(|(proxy, local)| build_route_client(options, proxy, local))
+        .collect()
 }
 
 /// Shared state of one multi-connection download.
@@ -2134,6 +2325,7 @@ impl RangeJob {
             mirror_speeds,
             chunks,
             target_path: Some(target.to_path_buf()),
+            ..Default::default()
         }
     }
 
@@ -3341,7 +3533,7 @@ fn effective_chunk_size(file_size: u64, num_workers: u64, configured: u64, in_or
 }
 
 /// `base` for `n == 0`, else `stem (n).ext`.
-fn numbered(base: &Path, n: usize) -> PathBuf {
+pub(crate) fn numbered(base: &Path, n: usize) -> PathBuf {
     if n == 0 {
         return base.to_path_buf();
     }
@@ -3377,7 +3569,11 @@ fn lock_path(final_path: &Path) -> PathBuf {
 /// Whether an output path names a directory to save into: it ends with a path separator or is
 /// an existing directory.
 fn is_dir_target(path: &Path) -> bool {
-    path.as_os_str().as_encoded_bytes().last().is_some_and(|&b| std::path::is_separator(b as char)) || path.is_dir()
+    ends_with_separator(path) || path.is_dir()
+}
+
+fn ends_with_separator(path: &Path) -> bool {
+    path.as_os_str().as_encoded_bytes().last().is_some_and(|&b| std::path::is_separator(b as char))
 }
 
 fn file_name_of(path: &Path) -> String {
@@ -3414,6 +3610,7 @@ fn done_snapshot(size: u64, path: &Path) -> EngineSnapshot {
         mirror_speeds: Vec::new(),
         chunks: Vec::new(),
         target_path: Some(path.to_path_buf()),
+        ..Default::default()
     }
 }
 
@@ -3427,6 +3624,7 @@ fn stream_snapshot(size: Option<u64>, written: u64, speed: f64, path: &Path) -> 
         mirror_speeds: Vec::new(),
         chunks: Vec::new(),
         target_path: Some(path.to_path_buf()),
+        ..Default::default()
     }
 }
 

@@ -1,6 +1,7 @@
 // Popup: shows what the background found on the active tab and hands it to the desktop app.
 // Everything shown comes from web pages, so it is only ever put into the DOM as text.
 import { formatBytes, formatDuration, isMediaSiteHost, sanitizeFilename, suggestFilename } from "./lib/detect.js";
+import { LINK_KINDS, MAX_BATCH, largestSrcset, linkFilter, normalizeLinks, textMatcher } from "./lib/links.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -478,6 +479,110 @@ function updateRecRow(row, r) {
   row.stop.setAttribute("aria-label", `${row.failed ? "Dismiss" : "Stop"} ${title}`);
 }
 
+// ---- Links ----
+
+/** The page's links (see normalizeLinks), the ones ticked, and the chips chosen; null until the page is read. */
+let links = null;
+const picked = new Set();
+const kinds = new Set();
+
+/**
+ * Runs in the tab's top frame (isolated world); must not reference anything outside itself. The links and media of
+ * the page and its same-origin frames, as the URLs the browser resolved, and srcsets with the base they resolve against.
+ */
+function collectPageLinks() {
+  const urls = [];
+  const srcsets = [];
+  const rels = new Set(["alternate", "enclosure", "preload", "prefetch", "image_src"]);
+  const visit = (doc) => {
+    if (!doc) return;
+    for (const node of doc.querySelectorAll("a[href], area[href]")) if (typeof node.href === "string") urls.push(node.href);
+    for (const node of doc.querySelectorAll("img[src], video[src], audio[src], source[src]")) urls.push(node.src);
+    for (const node of doc.querySelectorAll("img[srcset], source[srcset]")) srcsets.push([node.getAttribute("srcset"), doc.baseURI]);
+    for (const node of doc.querySelectorAll("link[href][rel]")) {
+      if (node.rel.toLowerCase().split(/\s+/).some((rel) => rels.has(rel))) urls.push(node.href);
+    }
+    // A cross-origin frame's document is null.
+    for (const frame of doc.querySelectorAll("iframe, frame")) {
+      try {
+        visit(frame.contentDocument);
+      } catch {
+        // Not readable: skipped.
+      }
+    }
+  };
+  visit(document);
+  return { urls, srcsets };
+}
+
+async function scanLinks() {
+  say($("links-msg"), "Reading the page…");
+  let found;
+  try {
+    [found] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: collectPageLinks });
+  } catch (e) {
+    links = [];
+    renderLinks();
+    return say($("links-msg"), `Can't read this page's links: ${e?.message || e}`, "err");
+  }
+  const { urls = [], srcsets = [] } = found?.result || {};
+  links = normalizeLinks([...urls, ...srcsets.map(([srcset, base]) => largestSrcset(srcset, base))]);
+  picked.clear();
+  say($("links-msg"), "");
+  renderLinks();
+}
+
+/** The links the filters let through. */
+function shownLinks() {
+  const filter = linkFilter({ kinds: [...kinds], query: $("links-query").value, sameSite: $("same-site").checked, pageHost: hostOf(tab.url) });
+  return (links || []).filter(filter);
+}
+
+function renderLinks() {
+  const shown = shownLinks();
+  const chosen = shown.filter((link) => picked.has(link.url)).length;
+  $("links-count").textContent = links?.length ? String(links.length) : "";
+  $("links").replaceChildren(
+    ...shown.map((link) => {
+      const box = el("input", { type: "checkbox", checked: picked.has(link.url) });
+      box.addEventListener("change", () => {
+        if (box.checked) picked.add(link.url);
+        else picked.delete(link.url);
+        renderCount();
+      });
+      const label = el("label", { title: link.url }, box, el("span", { className: "label", textContent: link.url }));
+      return el("li", {}, label, ...(link.kind ? [el("span", { className: "chip", textContent: link.kind })] : []));
+    }),
+  );
+  $("no-links").hidden = links === null || shown.length > 0;
+  $("no-links").textContent = textMatcher($("links-query").value) === null ? "That /regex/ is not valid." : "No links match.";
+  renderCount(shown, chosen);
+}
+
+/** The count and the Send button, for the ticked links the filters show (those are what is sent). */
+function renderCount(shown = shownLinks(), chosen = shown.filter((link) => picked.has(link.url)).length) {
+  $("selected-count").textContent = `${chosen} of ${shown.length} selected`;
+  $("send-links").textContent = `Send ${chosen} to app`;
+  $("send-links").disabled = chosen === 0;
+}
+
+async function sendLinks() {
+  const urls = shownLinks().filter((link) => picked.has(link.url)).map((link) => link.url);
+  if (urls.length > MAX_BATCH) return say($("links-msg"), `Send at most ${MAX_BATCH} links at once.`, "err");
+  $("send-links").disabled = true;
+  say($("links-msg"), "Sending…");
+  const reply = await ask({ cmd: "SEND_LINKS", tabId: tab.id, urls });
+  report($("links-msg"), reply, `Sent ${urls.length} ${urls.length === 1 ? "link" : "links"} to the downloader.`);
+  renderCount();
+}
+
+function showView(id) {
+  for (const button of document.querySelectorAll(".views .view")) button.setAttribute("aria-pressed", String(button.dataset.view === id));
+  $("media-view").hidden = id !== "media-view";
+  $("links-view").hidden = id !== "links-view";
+  if (id === "links-view" && links === null) scanLinks();
+}
+
 // ---- Settings ----
 
 function renderSettings(s) {
@@ -587,6 +692,33 @@ async function init() {
     const reply = await ask({ cmd: "REC_SPEED", tabId: tab.id, rate });
     report($("rec-msg"), reply, `Playback speed ${rate}×.`);
   });
+  for (const button of document.querySelectorAll(".views .view")) button.addEventListener("click", () => showView(button.dataset.view));
+  $("kinds").replaceChildren(
+    ...Object.keys(LINK_KINDS).map((kind) => {
+      const chip = el("button", { type: "button", className: "chip", textContent: kind });
+      chip.setAttribute("aria-pressed", "false");
+      chip.addEventListener("click", () => {
+        if (kinds.has(kind)) kinds.delete(kind);
+        else kinds.add(kind);
+        chip.setAttribute("aria-pressed", String(kinds.has(kind)));
+        renderLinks();
+      });
+      return chip;
+    }),
+  );
+  $("links-query").addEventListener("input", renderLinks);
+  $("same-site").addEventListener("change", renderLinks);
+  $("links-rescan").addEventListener("click", scanLinks);
+  $("send-links").addEventListener("click", sendLinks);
+  for (const [id, tick] of [["select-all", true], ["select-none", false]]) {
+    $(id).addEventListener("click", () => {
+      for (const link of shownLinks()) {
+        if (tick) picked.add(link.url);
+        else picked.delete(link.url);
+      }
+      renderLinks();
+    });
+  }
   sizeInput("min-size", "minSizeKB");
   sizeInput("max-size", "maxSizeKB");
   $("convert-mp4").addEventListener("change", (event) =>

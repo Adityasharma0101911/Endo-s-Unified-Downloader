@@ -16,14 +16,15 @@ pub fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Clipboard text worth offering as a download: one downloadable link (not a .metalink or
-/// .torrent, which lists several).
+/// Clipboard text worth offering as a download: one downloadable link or magnet (not a
+/// .metalink or .torrent, which lists several).
 pub fn clipboard_link(text: &str) -> Option<String> {
     let text = text.trim();
     if text.is_empty() || text.len() > 8192 || text.contains(char::is_whitespace) || ingest::names_document(text) {
         return None;
     }
-    ingest::link_task(&[text]).ok().map(|_| text.to_string())
+    let magnet = hyperfetch_core::torrent::parse_magnet_uri(text).is_ok();
+    (magnet || ingest::link_task(&[text]).is_ok()).then(|| text.to_string())
 }
 
 /// The folder to create before `item` starts, since the engine takes a missing folder for a file
@@ -256,7 +257,9 @@ mod tests {
         let hash = "c12fe1c06bba254a9dc9f519b335aa7c1367a88a";
         let seeded = format!("magnet:?xt=urn:btih:{}&dn=f.iso&ws=https%3A%2F%2Fmirror.example%2Ff.iso", hash);
         assert!(clipboard_link(&seeded).is_some());
-        assert!(clipboard_link(&format!("magnet:?xt=urn:btih:{}", hash)).is_none());
+        // The swarm takes one without web seeds (see `ingest`).
+        assert!(clipboard_link(&format!("magnet:?xt=urn:btih:{}", hash)).is_some());
+        assert!(clipboard_link("magnet:?dn=no-hash").is_none());
         // A document lists downloads rather than being one.
         assert_eq!(clipboard_link("https://a.com/list.meta4"), None);
         assert_eq!(clipboard_link("https://a.com/x.torrent"), None);

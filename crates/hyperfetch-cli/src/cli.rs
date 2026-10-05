@@ -17,10 +17,10 @@ use hyperfetch_core::media::{BrowserCookieSource, MediaQualityPreset};
                   kept); press it again to quit immediately."
 )]
 pub struct Args {
-    /// Mirrors of ONE file (all must serve identical bytes), a magnet link with web seeds, a
-    /// local/remote .metalink, .meta4 or .torrent, or a link that lists many downloads (a Google
-    /// Drive or MediaFire folder, a playlist or channel, a podcast feed). Without URLs and without
-    /// -i an interactive prompt starts.
+    /// Mirrors of ONE file (all must serve identical bytes), a magnet link, a local/remote
+    /// .metalink, .meta4 or .torrent, or a link that lists many downloads (a Google Drive,
+    /// MediaFire or MEGA folder, a Pixeldrain list or Gofile folder, a playlist or channel, a
+    /// podcast feed). Without URLs and without -i an interactive prompt starts.
     #[arg(num_args = 0..)]
     pub urls: Vec<String>,
 
@@ -108,13 +108,73 @@ pub struct Args {
     #[arg(long = "proxies-file", value_name = "FILE", value_parser = existing_file, conflicts_with = "repair")]
     pub proxies_file: Option<PathBuf>,
 
-    /// Real-Debrid or AllDebrid API key for automatic high-speed CDN unrestricting of filehosts
-    #[arg(long = "debrid-key", value_name = "KEY", env = "ENDO_DEBRID_KEY")]
+    /// Debrid API key: filehost links are unrestricted into direct high-speed ones, and magnet
+    /// links are downloaded through the debrid service
+    #[arg(long = "debrid-key", value_name = "KEY", env = "ENDO_DEBRID_KEY", hide_env_values = true)]
     pub debrid_key: Option<String>,
 
-    /// Debrid provider override ("real-debrid" or "alldebrid")
-    #[arg(long = "debrid-provider", value_name = "PROVIDER")]
+    /// Debrid service of --debrid-key
+    #[arg(long = "debrid-provider", value_name = "PROVIDER", value_parser = debrid_providers(), ignore_case = true)]
     pub debrid_provider: Option<String>,
+
+    /// Local IP address to connect from; repeat it to spread connections over several networks
+    #[arg(long = "bind-address", value_name = "IP")]
+    pub bind_address: Vec<std::net::IpAddr>,
+
+    /// Spread connections over every network with internet access (wired, Wi-Fi, phone)
+    #[arg(long = "all-networks", conflicts_with = "bind_address")]
+    pub all_networks: bool,
+
+    /// Never download magnet links and .torrent files from the BitTorrent swarm
+    #[arg(long = "no-p2p")]
+    pub no_p2p: bool,
+
+    /// Seed a finished torrent until it has uploaded R times its size; the program waits for that
+    /// before exiting [default: 0, no seeding]
+    #[arg(long = "seed-ratio", value_name = "R", value_parser = parse_ratio)]
+    pub seed_ratio: Option<f64>,
+
+    /// Seed a finished torrent for at most this many minutes (alone: seed that long whatever the ratio)
+    #[arg(long = "seed-time", value_name = "MINUTES", value_parser = clap::value_parser!(u32).range(1..))]
+    pub seed_time: Option<u32>,
+
+    /// BitTorrent listen port [default: librqbit's range]
+    #[arg(long = "bt-port", value_name = "PORT", value_parser = clap::value_parser!(u16).range(1..))]
+    pub bt_port: Option<u16>,
+
+    /// Ask the router (UPnP) to forward the BitTorrent port
+    #[arg(long = "upnp")]
+    pub upnp: bool,
+
+    /// Do not send image galleries (imgur, pixiv, DeviantArt, ...) to gallery-dl
+    #[arg(long = "no-gallery-dl")]
+    pub no_gallery_dl: bool,
+
+    /// Unpack downloaded archives (zip, 7z, rar, tar) into a folder next to them
+    #[arg(long = "extract")]
+    pub extract: bool,
+
+    /// With --extract: delete an archive once it is unpacked
+    #[arg(long = "delete-archive", requires = "extract")]
+    pub delete_archive: bool,
+
+    /// Move each downloaded file into a category folder (Video, Music, Pictures, Documents,
+    /// Archives, Programs) of the save directory
+    #[arg(long = "sort")]
+    pub sort: bool,
+
+    /// Command run after each download, without a shell; {path}, {dir}, {name} and {url} in its
+    /// arguments are replaced (also in env ENDO_PATH, ENDO_DIR, ENDO_NAME, ENDO_URL)
+    #[arg(long = "exec", value_name = "CMD")]
+    pub exec: Option<String>,
+
+    /// Do not mark downloaded files as from the internet (Windows' Zone.Identifier)
+    #[arg(long = "no-mark-of-the-web")]
+    pub no_mark_of_the_web: bool,
+
+    /// VirusTotal API key: each downloaded file's SHA-256 is looked up (the file is never uploaded)
+    #[arg(long = "virustotal-key", value_name = "KEY", env = "VIRUSTOTAL_API_KEY", hide_env_values = true)]
+    pub virustotal_key: Option<String>,
 
     /// Media quality: best, 1080p, 720p, mp3, m4a, or any other yt-dlp format selector
     /// (e.g. "bestvideo[height<=480]+bestaudio"). Also sends non-file page URLs to yt-dlp.
@@ -276,6 +336,24 @@ fn parse_proxy(s: &str) -> Result<String, String> {
     }
 }
 
+/// The debrid services --debrid-provider names, in any case ("Real-Debrid" as older versions
+/// took it).
+fn debrid_providers() -> impl clap::builder::TypedValueParser<Value = String> {
+    use clap::builder::{PossibleValue, PossibleValuesParser, TypedValueParser};
+    PossibleValuesParser::new([
+        PossibleValue::new("realdebrid").alias("real-debrid"),
+        PossibleValue::new("alldebrid"),
+        PossibleValue::new("torbox"),
+        PossibleValue::new("premiumize"),
+    ])
+    .map(|name| name.to_ascii_lowercase().replace('-', ""))
+}
+
+/// A seeding ratio: a number, 0 or more.
+fn parse_ratio(s: &str) -> Result<f64, String> {
+    s.trim().parse::<f64>().ok().filter(|r| r.is_finite() && *r >= 0.0).ok_or_else(|| format!("'{}' is not a ratio (e.g. 1 or 2.5)", s))
+}
+
 fn parse_checksum(s: &str) -> Result<String, String> {
     hyperfetch_core::storage::validate_checksum(s)?;
     Ok(s.to_string())
@@ -397,6 +475,22 @@ mod tests {
         assert!(parse(&["--latest", "0", "u"]).is_err());
         assert!(parse(&["--subs", " ", "u"]).is_err());
         assert!(parse(&["--subs", "en, es", "u"]).is_err());
+    }
+
+    #[test]
+    fn network_torrent_and_post_flags() {
+        let parse = |args: &[&str]| Args::try_parse_from(std::iter::once("cli").chain(args.iter().copied()));
+        let args = parse(&["--debrid-provider", "real-debrid", "--seed-ratio", "1.5", "--bind-address", "10.0.0.2", "--bind-address", "::1", "u"]).unwrap();
+        assert_eq!((args.debrid_provider.as_deref(), args.seed_ratio, args.bind_address.len()), (Some("realdebrid"), Some(1.5), 2));
+        for (name, provider) in [("Real-Debrid", "realdebrid"), ("AllDebrid", "alldebrid"), ("TORBOX", "torbox")] {
+            assert_eq!(parse(&["--debrid-provider", name, "u"]).unwrap().debrid_provider.as_deref(), Some(provider));
+        }
+        assert!(parse(&["--debrid-provider", "megadebrid", "u"]).is_err());
+        assert!(parse(&["--seed-ratio", "-1", "u"]).is_err());
+        assert!(parse(&["--seed-time", "0", "u"]).is_err());
+        assert!(parse(&["--delete-archive", "u"]).is_err(), "only with --extract");
+        assert!(parse(&["--all-networks", "--bind-address", "10.0.0.2", "u"]).is_err());
+        assert!(parse(&["--bind-address", "not-an-ip", "u"]).is_err());
     }
 
     #[test]

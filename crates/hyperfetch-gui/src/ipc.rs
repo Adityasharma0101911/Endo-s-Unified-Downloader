@@ -35,6 +35,8 @@ const MAX_BODY: usize = 64 * 1024;
 const MAX_PLAYLIST: usize = 1 << 20;
 /// Most cookies of a `cookie_jar` written for a download.
 const MAX_JAR_COOKIES: usize = 500;
+/// Most links of one batch `/add` (the extension's link grabber).
+const MAX_BATCH: usize = 1000;
 /// How long a connection may take to send its request, so a stalled client never holds a task.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// Request headers of the browser's that a download does not send: the engine sets them per
@@ -63,10 +65,20 @@ const DROPPED_HEADERS: &[&str] = &[
     "proxy-connection",
 ];
 
-/// A download sent to `POST /add`: the link, with what the browser sent to fetch it.
+/// A download sent to `POST /add`: the link, with what the browser sent to fetch it. Or a batch
+/// from the extension's link grabber: `urls` in place of `url`, with the page's referer and
+/// User-Agent and `cookies_by_origin` (see [`RemoteAddPayload::batch`]).
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct RemoteAddPayload {
+    #[serde(default)]
     pub url: String,
+    /// The links of a batch, at most [`MAX_BATCH`], each http(s) (see [`parse_add`]).
+    #[serde(default)]
+    pub urls: Vec<String>,
+    /// The Cookie header the browser has for each origin (`https://host[:port]`) of `urls`: by
+    /// origin, not host, as an https link's Secure cookies must never go to an http one.
+    #[serde(default)]
+    pub cookies_by_origin: BTreeMap<String, String>,
     /// The Cookie header the browser sent to `url`.
     pub cookies: Option<String>,
     pub user_agent: Option<String>,
@@ -160,6 +172,29 @@ impl RemoteAddPayload {
     pub fn cookies_file(&self, url: &Url) -> Option<String> {
         jar_file_text(&self.cookie_jar).or_else(|| cookies_file_text(url, self.cookies.as_deref()?))
     }
+
+    /// The downloads of a batch, one per link of `urls`: each with the page's referer and
+    /// User-Agent and the cookies of its own origin alone, nothing else the batch sent.
+    pub fn batch(&self) -> Vec<RemoteAddPayload> {
+        self.urls
+            .iter()
+            .map(|url| {
+                let origin = Url::parse(url.trim()).ok().map(|url| url.origin().ascii_serialization());
+                RemoteAddPayload {
+                    url: url.trim().to_string(),
+                    cookies: origin.and_then(|origin| self.cookies_by_origin.get(&origin).cloned()),
+                    user_agent: self.user_agent.clone(),
+                    referer: self.referer.clone(),
+                    ..Default::default()
+                }
+            })
+            .collect()
+    }
+}
+
+/// Whether `text` is an http or https link.
+fn http_link(text: &str) -> bool {
+    Url::parse(text.trim()).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
 }
 
 /// A Netscape cookies file holding the cookies of `jar` (the first [`MAX_JAR_COOKIES`] usable
@@ -378,16 +413,22 @@ fn record_route(path: &str) -> Option<(&str, &str)> {
 }
 
 /// The download `body` asks for: JSON with an http(s) `url`, and a `playlist`, if any, that is
-/// one; else why it is refused.
+/// one; or a batch of `urls` alone, at most [`MAX_BATCH`], each http(s). Else why it is refused.
 fn parse_add(body: &[u8]) -> Result<RemoteAddPayload, String> {
     let payload: RemoteAddPayload = serde_json::from_slice(body).map_err(|e| format!("invalid JSON: {}", e))?;
     if payload.playlist_text().is_some_and(|text| text.len() > MAX_PLAYLIST || !text.starts_with("#EXTM3U")) {
         return Err("playlist must be an HLS playlist (#EXTM3U) of at most 1 MiB".to_string());
     }
-    match Url::parse(payload.url.trim()) {
-        Ok(url) if matches!(url.scheme(), "http" | "https") => Ok(payload),
-        _ => Err("url must be an http or https link".to_string()),
-    }
+    let refused = if payload.urls.is_empty() {
+        (!http_link(&payload.url)).then(|| "url must be an http or https link".to_string())
+    } else if !payload.url.trim().is_empty() {
+        Some("send url or urls, not both".to_string())
+    } else if payload.urls.len() > MAX_BATCH {
+        Some(format!("urls takes at most {} links", MAX_BATCH))
+    } else {
+        (!payload.urls.iter().all(|url| http_link(url))).then(|| "every link of urls must be http or https".to_string())
+    };
+    refused.map_or(Ok(payload), Err)
 }
 
 struct Request {
@@ -751,6 +792,43 @@ mod tests {
         }
         let payload = parse_add(br#"{"url":"https://cdn.example/a.mpd","dash":true,"height":720}"#).unwrap();
         assert!(payload.dash && payload.height == Some(720) && payload.playlist.is_none() && payload.cookie_jar.is_empty());
+    }
+
+    /// The link grabber's batch: at most MAX_BATCH http(s) links, never with `url`; each link
+    /// keeps the page's referer and User-Agent and gets only its own origin's cookies: an http
+    /// link never those of its host's https links.
+    #[test]
+    fn a_batch_gives_each_link_its_own_origins_cookies() {
+        let add = |body: serde_json::Value| parse_add(body.to_string().as_bytes());
+        let payload = add(json!({
+            "urls": [" https://a.example/x.zip ", "http://b.example:8080/y.pdf", "https://c.example/z.mp4", "http://a.example/w.zip"],
+            "referer": "https://page.example/",
+            "user_agent": "Mozilla/5.0 Test",
+            "cookies_by_origin": {"https://a.example": "s=1", "http://b.example:8080": "t=2", "https://page.example": "never=sent"},
+            "headers": {"Authorization": "Bearer t"},
+            "filename": "ignored.bin",
+            "hls": true,
+        }))
+        .unwrap();
+        let batch = payload.batch();
+        let urls: Vec<&str> = batch.iter().map(|link| link.url.as_str()).collect();
+        assert_eq!(urls, ["https://a.example/x.zip", "http://b.example:8080/y.pdf", "https://c.example/z.mp4", "http://a.example/w.zip"]);
+        let cookies: Vec<Option<&str>> = batch.iter().map(|link| link.cookies.as_deref()).collect();
+        assert_eq!(cookies, [Some("s=1"), Some("t=2"), None, None]);
+        for link in &batch {
+            assert_eq!((link.referer(), link.user_agent.as_deref()), (Some("https://page.example/".to_string()), Some("Mozilla/5.0 Test")));
+            assert!(link.headers.is_none() && link.file_name().is_none() && !link.hls && link.urls.is_empty());
+        }
+
+        let many: Vec<String> = (0..=MAX_BATCH).map(|n| format!("https://a.example/{n}")).collect();
+        assert_eq!(add(json!({"urls": many})).unwrap_err(), "urls takes at most 1000 links");
+        assert_eq!(add(json!({"urls": &many[..MAX_BATCH]})).unwrap().batch().len(), MAX_BATCH);
+        for bad in [json!(["https://a.example/1", "ftp://a.example/2"]), json!(["javascript:alert(1)"]), json!([""])] {
+            assert_eq!(add(json!({"urls": bad})).unwrap_err(), "every link of urls must be http or https");
+        }
+        assert_eq!(add(json!({"url": "https://a.example/1", "urls": ["https://a.example/2"]})).unwrap_err(), "send url or urls, not both");
+        assert_eq!(add(json!({"urls": []})).unwrap_err(), "url must be an http or https link");
+        assert!(add(json!({"urls": "https://a.example/1"})).is_err(), "urls is a list");
     }
 
     /// A recording is started, fed and finished by the extension alone, with its id and track

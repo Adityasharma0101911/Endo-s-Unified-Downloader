@@ -180,7 +180,12 @@ pub(crate) fn authorize(request: RequestBuilder, auth: Option<&Auth>, url: &Url)
 #[derive(Clone)]
 pub struct WorkerShared {
     pub client: Client,
+    /// One per route (proxy and/or local address) the workers take turns on; empty for `client`.
     pub clients: Arc<Vec<Client>>,
+    /// Routes of `clients` that could not connect, dropped for the rest of the download.
+    pub dropped_routes: Arc<Mutex<Vec<usize>>>,
+    /// The routes and the origins (`scheme://host:port`) each has reached in this download.
+    pub reached: Arc<Mutex<Vec<(usize, String)>>>,
     pub auth: Option<Arc<Auth>>,
     pub writer: DiskWriter,
     pub chunks: Arc<Mutex<ChunkManager>>,
@@ -203,19 +208,35 @@ pub struct WorkerShared {
 }
 
 impl WorkerShared {
-    pub fn client_for_worker(&self, worker_id: usize) -> &Client {
-        if self.clients.is_empty() {
-            &self.client
-        } else {
-            &self.clients[worker_id % self.clients.len()]
+    /// The worker's own route (workers take turns on them), or once that is dropped the next one
+    /// still in use: an index into `clients`, whose request goes out on `client` when that is empty.
+    pub fn route_for_worker(&self, worker_id: usize) -> usize {
+        let routes = self.clients.len().max(1);
+        let dropped = self.dropped_routes.lock();
+        (0..routes).map(|i| (worker_id + i) % routes).find(|r| !dropped.contains(r)).unwrap_or(0)
+    }
+
+    /// Notes that `route` reached the server of `url` (it answered).
+    fn reached(&self, route: usize, url: &Url) {
+        let origin = url.origin().ascii_serialization();
+        let mut reached = self.reached.lock();
+        if !reached.iter().any(|(r, o)| *r == route && *o == origin) {
+            reached.push((route, origin));
         }
     }
 
-    pub fn route_for_worker(&self, worker_id: usize) -> usize {
-        if self.clients.len() > 1 {
-            worker_id % self.clients.len()
-        } else {
-            0
+    /// Stops using `route`, whose connection to the server of `url` could not be made (an
+    /// unplugged network, a dead proxy), for the rest of the download; never the last route
+    /// left. Only when another route has reached that server: else the server is what fails.
+    fn drop_route(&self, route: usize, url: &Url) {
+        let origin = url.origin().ascii_serialization();
+        if !self.reached.lock().iter().any(|(r, o)| *r != route && *o == origin) {
+            return;
+        }
+        let mut dropped = self.dropped_routes.lock();
+        if self.clients.len() > dropped.len() + 1 && !dropped.contains(&route) {
+            dropped.push(route);
+            tracing::warn!("Route {} cannot connect; dropping it, {} left", route, self.clients.len() - dropped.len());
         }
     }
 }
@@ -418,7 +439,8 @@ impl HttpWorker {
             return Ok(()); // stolen away entirely before we started
         }
 
-        let client = s.client_for_worker(self.worker_id);
+        let route = s.route_for_worker(self.worker_id);
+        let client = s.clients.get(route).unwrap_or(&s.client);
         let mut request = authorize(client.get(url.clone()), s.auth.as_deref(), url)
             .header(RANGE, format!("bytes={}-{}", start, end))
             .header(ACCEPT_ENCODING, "identity");
@@ -437,13 +459,20 @@ impl HttpWorker {
             res = tokio::time::timeout(s.stall_timeout, request.send()) => match res {
                 Err(_) => return Err((FailureKind::Transient, format!("no response within {}s", s.stall_timeout.as_secs()))),
                 Ok(Err(e)) => {
+                    // A name that did not resolve says nothing of the route.
+                    if e.is_connect() && !format!("{e:?}").contains("dns error") {
+                        s.drop_route(route, url);
+                    }
                     let err_str = e.to_string();
                     if err_str.contains("rate limited") || err_str.contains("too many") {
                         return Err((FailureKind::Throttled(Some(std::time::Duration::from_secs(5))), format!("request throttled: {}", e)));
                     }
                     return Err((FailureKind::Transient, format!("request failed: {}", e)));
                 }
-                Ok(Ok(resp)) => resp,
+                Ok(Ok(resp)) => {
+                    s.reached(route, url);
+                    resp
+                }
             },
         };
         check_response(response.status(), response.headers(), start, end, s.file_size, if_range.as_deref())
@@ -934,6 +963,8 @@ mod tests {
         let shared = WorkerShared {
             client: Client::new(),
             clients: Arc::new(Vec::new()),
+            dropped_routes: Default::default(),
+            reached: Default::default(),
             auth: None,
             writer: DiskWriter::open_or_create(path, size).unwrap(),
             chunks: Arc::new(Mutex::new(chunks)),
@@ -1405,5 +1436,22 @@ mod tests {
         let elapsed = started.elapsed();
         assert!(elapsed >= Duration::from_millis(850), "{elapsed:?}");
         assert!(elapsed < Duration::from_millis(2000), "{elapsed:?}");
+    }
+
+    /// A route is dropped for a failed connection only once another route reached that server:
+    /// a server that refuses everyone says nothing of the route.
+    #[test]
+    fn a_route_is_dropped_only_when_another_reaches_that_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let (url, other) = (Url::parse("http://a.example/f").unwrap(), Url::parse("http://b.example/f").unwrap());
+        let (worker, _, _) = test_worker(&url, &dir.path().join("f"), 10);
+        let s = WorkerShared { clients: Arc::new(vec![Client::new(), Client::new()]), ..worker.shared.clone() };
+        s.drop_route(0, &url);
+        s.reached(1, &other);
+        s.drop_route(0, &url);
+        assert!(s.dropped_routes.lock().is_empty());
+        s.reached(1, &url);
+        s.drop_route(0, &url);
+        assert_eq!(*s.dropped_routes.lock(), [0]);
     }
 }

@@ -18,6 +18,13 @@ pub mod ingest;
 pub mod folders;
 pub mod feeds;
 pub mod updater;
+pub mod p2p;
+pub mod debrid;
+pub mod netif;
+pub mod mega;
+pub mod shares;
+pub mod gallery;
+pub mod postprocess;
 
 pub use range::{ByteRange, RangeError};
 pub use chunk::{Chunk, ChunkManager, ChunkStatus, ChunkError};

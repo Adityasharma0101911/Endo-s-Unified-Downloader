@@ -23,6 +23,12 @@
   <p id="unsupported" class="hint" hidden>Nothing can be detected on this tab. Browser pages (chrome://, the extension store, file://, new tab) don't let extensions see their requests. Open a normal http(s) page.</p>
 
   <main id="tab-ui" hidden>
+    <nav class="views" aria-label="Views">
+      <button type="button" class="btn view" data-view="media-view" aria-pressed="true">Media</button>
+      <button type="button" class="btn view" data-view="links-view" aria-pressed="false">Links</button>
+    </nav>
+
+    <div id="media-view">
     <section class="card">
       <button id="send-page" type="button" class="btn">Download this page</button>
       <p id="page-note" class="note" hidden>This site is handled by yt-dlp in the downloader: send the page, not its streams.</p>
@@ -66,6 +72,28 @@
           <button id="stop" type="button" class="btn danger">Stop recording</button>
         </div>
       </div>
+    </section>
+    </div>
+
+    <section id="links-view" aria-labelledby="links-title" hidden>
+      <div class="section-head">
+        <h2 id="links-title">Links <span id="links-count" class="count"></span></h2>
+        <button id="links-rescan" type="button" class="btn small ghost">Rescan page</button>
+      </div>
+      <div id="kinds" class="chips" role="group" aria-label="File types"></div>
+      <div class="link-filters">
+        <input id="links-query" type="search" placeholder="Filter: text or /regex/" aria-label="Filter links by text or /regex/" spellcheck="false">
+        <label class="check"><input id="same-site" type="checkbox"> Same site</label>
+      </div>
+      <div class="actions">
+        <button id="select-all" type="button" class="btn small ghost">Select all</button>
+        <button id="select-none" type="button" class="btn small ghost">None</button>
+        <span id="selected-count" class="note"></span>
+        <button id="send-links" type="button" class="btn small primary" disabled>Send 0 to app</button>
+      </div>
+      <p id="links-msg" class="msg" role="status" aria-live="polite"></p>
+      <p id="no-links" class="hint" hidden>No links match.</p>
+      <ul id="links" class="rows links"></ul>
     </section>
   </main>
 
