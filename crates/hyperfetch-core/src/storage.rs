@@ -215,6 +215,23 @@ impl DiskWriter {
         self.read_digest(needs(expected_checksum).unwrap_or_default())
     }
 
+    /// The BLAKE3 chaining values of the file's `piece`-byte pieces, merged from its blocks' hashes,
+    /// so after [`DiskWriter::digest`] nothing is read again. `piece` is a power of two, no smaller
+    /// than a block and smaller than the file: each piece is then a subtree of the file's hash.
+    /// Blocking.
+    pub(crate) fn piece_hashes(&self, piece: u64) -> std::io::Result<Vec<ChainingValue>> {
+        let hashes = &self.inner.hashes;
+        let per = usize::try_from(piece / hashes.block).unwrap_or(usize::MAX).max(1);
+        let blocks = hashes.block_hashes(&self.inner.file)?;
+        Ok(blocks
+            .chunks(per)
+            .map(|piece| {
+                let level = halve_to_two(piece.to_vec());
+                level.get(1).map_or(level[0], |right| merge_subtrees_non_root(&level[0], right, Mode::Hash))
+            })
+            .collect())
+    }
+
     fn read_digest(&self, extra: Option<Algo>) -> std::io::Result<FileDigest> {
         FileDigest::of_file(&self.inner.file, self.size, FILE_HASH_BLOCK, extra)
     }
@@ -502,11 +519,19 @@ impl Hashes {
         }
     }
 
-    /// The file's BLAKE3 hash: the blocks' hashes merged, once the blocks never hashed have been
-    /// read back from `file` and hashed, spread over every core.
+    /// The file's BLAKE3 hash: the blocks' hashes merged (see [`Hashes::block_hashes`]).
     fn root(&self, file: &File) -> std::io::Result<[u8; 32]> {
-        let mut hashes: Vec<Option<ChainingValue>> = self.state.lock().blocks.iter().map(|b| b.hash).collect();
-        let missing: Vec<usize> = (0..hashes.len()).filter(|&i| hashes[i].is_none()).collect();
+        Ok(merge(self.block_hashes(file)?))
+    }
+
+    /// Every block's hash, once the blocks never hashed have been read back from `file` and
+    /// hashed, spread over every core; kept, unless the block was written again meanwhile.
+    fn block_hashes(&self, file: &File) -> std::io::Result<Vec<ChainingValue>> {
+        let (mut hashes, missing): (Vec<Option<ChainingValue>>, Vec<(usize, u32)>) = {
+            let state = self.state.lock();
+            let missing = state.blocks.iter().enumerate().filter(|(_, b)| b.hash.is_none()).map(|(i, b)| (i, b.version));
+            (state.blocks.iter().map(|b| b.hash).collect(), missing.collect())
+        };
         let next = AtomicUsize::new(0);
         let threads = std::thread::available_parallelism().map_or(1, usize::from).min(missing.len());
         let found = std::thread::scope(|s| {
@@ -514,13 +539,13 @@ impl Hashes {
                 .map(|_| {
                     s.spawn(|| {
                         let (mut found, mut buf) = (Vec::new(), Vec::new());
-                        while let Some(&i) = missing.get(next.fetch_add(1, Ordering::Relaxed)) {
+                        while let Some(&(i, version)) = missing.get(next.fetch_add(1, Ordering::Relaxed)) {
                             let span = self.span(i);
                             buf.resize((span.end - span.start) as usize, 0);
                             read_exact_at(file, &mut buf, span.start)?;
                             #[cfg(test)]
                             self.read.fetch_add(buf.len(), Ordering::Relaxed);
-                            found.push((i, self.hash_block(i, &buf)));
+                            found.push((i, version, self.hash_block(i, &buf)));
                         }
                         Ok::<_, std::io::Error>(found)
                     })
@@ -528,10 +553,14 @@ impl Hashes {
                 .collect();
             workers.into_iter().map(joined).collect::<std::io::Result<Vec<_>>>()
         })?;
-        for (i, hash) in found.into_iter().flatten() {
+        let mut state = self.state.lock();
+        for (i, version, hash) in found.into_iter().flatten() {
             hashes[i] = Some(hash);
+            if state.blocks[i].version == version {
+                state.blocks[i].hash = Some(hash);
+            }
         }
-        Ok(merge(hashes.into_iter().flatten().collect()))
+        Ok(hashes.into_iter().flatten().collect())
     }
 
     /// Tells the prefix hasher to stop.
@@ -621,21 +650,27 @@ fn covers(set: &[Range<u64>], range: &Range<u64>) -> bool {
 /// Merges the hashes of a file's blocks, in order, into the file's hash. Blocks of one
 /// power-of-two size form the same tree as the file's chunks (BLAKE3 paper, section 2.1):
 /// neighbours pair up level by level, and an odd one out moves up a level as it is.
-fn merge(mut level: Vec<ChainingValue>) -> [u8; 32] {
+fn merge(level: Vec<ChainingValue>) -> [u8; 32] {
     match level.len() {
         0 => *blake3::hash(&[]).as_bytes(),
         // The only block's hash is already the file's (see `Hashes::hash_block`).
         1 => level[0],
         _ => {
-            while level.len() > 2 {
-                level = level
-                    .chunks(2)
-                    .map(|pair| pair.get(1).map_or(pair[0], |right| merge_subtrees_non_root(&pair[0], right, Mode::Hash)))
-                    .collect();
-            }
+            let level = halve_to_two(level);
             *merge_subtrees_root(&level[0], &level[1], Mode::Hash).as_bytes()
         }
     }
+}
+
+/// Merges neighbouring hashes level by level until two or fewer are left (see [`merge`]).
+fn halve_to_two(mut level: Vec<ChainingValue>) -> Vec<ChainingValue> {
+    while level.len() > 2 {
+        level = level
+            .chunks(2)
+            .map(|pair| pair.get(1).map_or(pair[0], |right| merge_subtrees_non_root(&pair[0], right, Mode::Hash)))
+            .collect();
+    }
+    level
 }
 
 /// A scoped thread's result; its panic, should it have panicked, carries on in this thread.

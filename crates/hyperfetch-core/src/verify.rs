@@ -127,6 +127,11 @@ fn verify_with_history(
         .filter(|_| sizes_ok)
         .map(|(c, _)| DiskWriter::verify_file_checksum(&target, c));
     let checksum_match = checksum_result.as_ref().map(|r| matches!(r, Ok(true)));
+    // The piece hashes history kept show which bytes of a file that fails its checksum are wrong.
+    let damaged = match entry {
+        Some(entry) if checksum_match == Some(false) && entry.file_size == actual_size => damaged_pieces(&target, history, entry),
+        _ => Vec::new(),
+    };
 
     let is_complete = sizes_ok
         && match checksum_match {
@@ -146,6 +151,12 @@ fn verify_with_history(
     } else if let (Some(result), Some((_, source))) = (&checksum_result, &checksum) {
         match result {
             Ok(true) => format!("Build complete: {} bytes, verified against {}", actual_size, source),
+            Ok(false) if !damaged.is_empty() => format!(
+                "Checksum mismatch against {}: {} damaged piece(s) totaling {} bytes; a repair downloads only those",
+                source,
+                damaged.len(),
+                damaged.iter().map(ByteRange::len).sum::<u64>()
+            ),
             Ok(false) => format!("Checksum mismatch against {}: the file is corrupt and must be re-downloaded", source),
             Err(e) => format!("Checksum verification against {} failed: {}", source, e),
         }
@@ -165,11 +176,27 @@ fn verify_with_history(
         expected_size: exp_size,
         actual_size,
         has_state_file,
-        missing_ranges,
+        // Damaged pieces are found only in a file of the right size with no gaps.
+        missing_ranges: if damaged.is_empty() { missing_ranges } else { damaged },
         is_complete,
         checksum_match,
         status_message,
     })
+}
+
+/// The pieces of the file at `file` whose BLAKE3 hashes differ from those `history` kept for
+/// `entry` when it was downloaded (see `HistoryEntry::blake3_hash`), as byte ranges; none when it
+/// kept none or the file cannot be read.
+fn damaged_pieces(file: &Path, history: &DownloadHistoryManager, entry: &HistoryEntry) -> Vec<ByteRange> {
+    let Some((piece, kept)) = history.pieces_of(entry) else { return Vec::new() };
+    let Ok(read) = crate::digest::read_pass(file, None, None, Some(piece)) else { return Vec::new() };
+    let size = entry.file_size;
+    let bad = read.blake3.iter().zip(&kept).enumerate().filter(|(_, (now, then))| now != then);
+    bad.filter_map(|(i, _)| {
+        let start = i as u64 * piece;
+        ByteRange::from_len(start, piece.min(size - start)).ok()
+    })
+    .collect()
 }
 
 enum FetchError {
@@ -1809,5 +1836,33 @@ mod tests {
         assert_eq!(recorded, Some(original));
         let res = verify_build_file(&path, None, None).unwrap();
         assert_eq!(res.checksum_match, Some(false), "{}", res.status_message);
+    }
+
+    /// A finished file that fails its hash has the pieces that fail theirs, as history kept them
+    /// when it was downloaded, fetched again, and nothing else.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_the_damaged_pieces_of_a_finished_file_are_fetched_again() {
+        let dir = tempdir().unwrap();
+        let content: Vec<u8> = (0..9 * MIB).map(|i| (i % 251) as u8 ^ (i >> 13) as u8).collect();
+        let (url, _) = engine_server(content.clone(), Mode::Paced(Duration::ZERO)).await;
+        let options = DownloadOptions { output_path: Some(dir.path().join("")), remote_checksum: false, ..DownloadOptions::default() };
+        let path = DownloadEngine::new(vec![url.clone()], options.clone()).run(None).await.unwrap();
+        let mut data = std::fs::read(&path).unwrap();
+        data[5 * MIB] ^= 0xff;
+        std::fs::write(&path, &data).unwrap();
+
+        // Pieces of 4 MiB: the second one is bad.
+        let res = verify_build_file(&path, None, None).unwrap();
+        assert!(!res.is_complete && res.status_message.contains("1 damaged piece(s)"), "{}", res.status_message);
+        assert_eq!(res.missing_ranges, vec![ByteRange::from_len(4 * MIB as u64, 4 * MIB as u64).unwrap()]);
+        let fetched = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let total = Arc::clone(&fetched);
+        let size = content.len() as u64;
+        repair_missing_ranges(&path, size, &res.missing_ranges, &[url], &options, None, move |_, of| total.store(of, Ordering::SeqCst))
+            .await
+            .unwrap();
+        assert_eq!(fetched.load(Ordering::SeqCst), 4 * MIB as u64);
+        assert!(std::fs::read(&path).unwrap() == content, "repaired file differs");
+        assert!(verify_build_file(&path, None, None).unwrap().is_complete);
     }
 }

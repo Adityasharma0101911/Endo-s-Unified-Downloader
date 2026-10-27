@@ -11,6 +11,13 @@ use url::{form_urlencoded, Url};
 
 /// Only the newest entries are kept so loading and saving stay cheap.
 const MAX_ENTRIES: usize = 1000;
+/// Most BLAKE3 piece hashes kept for one file (see [`piece_size`]).
+const MAX_PIECES: u64 = 1024;
+/// Smallest piece hashed on its own.
+const MIN_PIECE: u64 = 4 * 1024 * 1024;
+/// How old a piece file no entry names must be before it goes: a download writes its pieces just
+/// before it records its entry.
+const PIECES_GRACE: Duration = Duration::from_secs(3600);
 /// How long a writer waits for another process (CLI, GUI, parallel download) to finish its save.
 const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -527,9 +534,16 @@ impl DownloadHistoryManager {
         }
         normalize(&mut entries);
         write_entries(&path, &entries)?;
+        prune_pieces(&path, &entries);
         self.pending.clear();
         self.entries = entries;
         Ok(())
+    }
+
+    /// The BLAKE3 piece hashes kept for `entry`'s file (see [`save_pieces`]): the piece size and
+    /// each piece's hash, if they were kept and fit its size.
+    pub fn pieces_of(&self, entry: &HistoryEntry) -> Option<(u64, Vec<[u8; 32]>)> {
+        load_pieces(&self.path(), entry.blake3_hash.as_deref()?, entry.file_size)
     }
 
     /// Adds `entry` to the history file at `path`, replacing any entry with the same id or the
@@ -563,6 +577,58 @@ impl DownloadHistoryManager {
 
     pub fn clear(&mut self) {
         self.modify(Change::Clear);
+    }
+}
+
+/// Bytes per BLAKE3 piece history keeps for a `size`-byte file: a power of two of at least
+/// `MIN_PIECE`, for at most `MAX_PIECES` pieces, so each piece is a subtree of the file's BLAKE3
+/// tree. None for a file of one piece: its whole hash says as much.
+pub(crate) fn piece_size(size: u64) -> Option<u64> {
+    let piece = size.div_ceil(MAX_PIECES).next_power_of_two().max(MIN_PIECE);
+    (size > piece).then_some(piece)
+}
+
+/// Where the piece hashes of the file whose BLAKE3 is `blake3_hex` are kept: a folder beside the
+/// history file, one small file per hash (inline they would make the history file large). None
+/// for a hash that is not 64 hex digits, which could name another path.
+fn pieces_path(history: &Path, blake3_hex: &str) -> Option<PathBuf> {
+    let hex = blake3_hex.len() == 64 && blake3_hex.bytes().all(|b| b.is_ascii_hexdigit());
+    hex.then(|| with_suffix(history, ".pieces").join(blake3_hex.to_ascii_lowercase()))
+}
+
+/// Keeps the BLAKE3 piece hashes (see [`piece_size`]) of the finished file whose hash is
+/// `blake3_hex` beside the history file at `history`, for `--verify` and repair to find which
+/// pieces went bad. The file holds the piece size, then each piece's hash.
+pub(crate) fn save_pieces(history: &Path, blake3_hex: &str, piece: u64, hashes: &[[u8; 32]]) -> io::Result<()> {
+    let path = pieces_path(history, blake3_hex).ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "not a BLAKE3 hash"))?;
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let bytes: Vec<u8> = piece.to_le_bytes().into_iter().chain(hashes.iter().flatten().copied()).collect();
+    fs::write(path, bytes)
+}
+
+/// The piece size and hashes [`save_pieces`] kept for a `size`-byte file, unless they are missing
+/// or do not fit that size (a write cut short, say).
+fn load_pieces(history: &Path, blake3_hex: &str, size: u64) -> Option<(u64, Vec<[u8; 32]>)> {
+    let bytes = fs::read(pieces_path(history, blake3_hex)?).ok()?;
+    let (piece, hashes) = bytes.split_first_chunk::<8>()?;
+    let piece = u64::from_le_bytes(*piece);
+    let fits = piece > 0 && hashes.len() as u64 == size.div_ceil(piece).saturating_mul(32);
+    fits.then(|| hashes.chunks_exact(32).map(|h| h.try_into().unwrap_or_default()).collect())
+        .map(|hashes| (piece, hashes))
+}
+
+/// Removes the piece files of `history` that no entry of `entries` names, once they are older than
+/// `PIECES_GRACE`.
+fn prune_pieces(history: &Path, entries: &[HistoryEntry]) {
+    let Ok(files) = fs::read_dir(with_suffix(history, ".pieces")) else { return };
+    let named: HashSet<&str> = entries.iter().filter_map(|e| e.blake3_hash.as_deref()).collect();
+    for file in files.flatten() {
+        let old = file.metadata().and_then(|m| m.modified()).is_ok_and(|t| t.elapsed().is_ok_and(|age| age > PIECES_GRACE));
+        if old && !file.file_name().to_str().is_some_and(|name| named.contains(name)) {
+            let _ = fs::remove_file(file.path());
+        }
     }
 }
 
@@ -922,10 +988,53 @@ mod tests {
         let mut manager = DownloadHistoryManager::load_from_path(&history_path);
         assert_eq!(manager.entries()[0].urls, ["https://h.example/old.bin?token=REDACTED"]);
         assert_eq!(manager.entries()[0].status, HistoryStatus::Failed("https://h.example/old.bin?token=REDACTED: HTTP 500".into()));
-        assert!(std::fs::read_to_string(&history_path).unwrap().contains("abc"), "a plain load writes nothing");
+        // The secret with its name: "abc" alone turns up in the ids, hex of the time they were made.
+        assert!(std::fs::read_to_string(&history_path).unwrap().contains("token=abc"), "a plain load writes nothing");
 
         manager.add_or_update(entry("new.bin", dir.path()));
-        assert!(!std::fs::read_to_string(&history_path).unwrap().contains("abc"));
+        assert!(!std::fs::read_to_string(&history_path).unwrap().contains("token=abc"));
         assert_eq!(names_on_disk(&history_path), ["new.bin", "old.bin"]);
+    }
+
+    #[test]
+    fn piece_sizes_keep_to_1024_pieces_of_at_least_4_mib() {
+        const MIB: u64 = 1024 * 1024;
+        assert_eq!(piece_size(4 * MIB), None, "one piece: the whole hash covers it");
+        assert_eq!(piece_size(4 * MIB + 1), Some(4 * MIB));
+        assert_eq!(piece_size(4096 * MIB), Some(4 * MIB));
+        assert_eq!(piece_size(4096 * MIB + 1), Some(8 * MIB));
+        for size in [5 * MIB, 4097 * MIB, 3 << 40, u64::MAX / 2] {
+            let piece = piece_size(size).unwrap();
+            assert!(piece.is_power_of_two() && size.div_ceil(piece) <= MAX_PIECES, "{size}");
+        }
+    }
+
+    #[test]
+    fn pieces_are_kept_beside_the_history_and_pruned_with_their_entries() {
+        let dir = tempdir().unwrap();
+        let history_path = dir.path().join("history.json");
+        let (kept, gone, fresh) = ("a".repeat(64), "b".repeat(64), "c".repeat(64));
+        let hashes = [[1u8; 32], [2u8; 32], [3u8; 32]];
+        for hex in [&kept, &gone, &fresh] {
+            save_pieces(&history_path, hex, 4, &hashes).unwrap();
+        }
+        let mut manager = DownloadHistoryManager::load_from_path(&history_path);
+        let mut file = entry("a.bin", dir.path());
+        (file.blake3_hash, file.file_size) = (Some(kept.clone()), 10);
+        assert_eq!(manager.pieces_of(&file), Some((4, hashes.to_vec())));
+        file.file_size = 13;
+        assert_eq!(manager.pieces_of(&file), None, "they do not fit a file of another size");
+        file.file_size = 10;
+        assert!(save_pieces(&history_path, "../../evil", 4, &hashes).is_err());
+
+        let day_old = SystemTime::now() - Duration::from_secs(86_400);
+        for hex in [&kept, &gone] {
+            let path = pieces_path(&history_path, hex).unwrap();
+            File::options().write(true).open(path).unwrap().set_modified(day_old).unwrap();
+        }
+        manager.add_or_update(file.clone());
+        assert_eq!(manager.pieces_of(&file), Some((4, hashes.to_vec())));
+        assert!(!pieces_path(&history_path, &gone).unwrap().exists(), "no entry names it");
+        assert!(pieces_path(&history_path, &fresh).unwrap().exists(), "its entry may still be on its way");
     }
 }

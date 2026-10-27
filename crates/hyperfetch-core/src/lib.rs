@@ -29,6 +29,9 @@ pub mod gallery;
 pub mod postprocess;
 pub mod paste;
 pub mod ftp;
+pub mod digest;
+pub mod zipdir;
+pub mod sniff;
 
 pub use range::{ByteRange, RangeError};
 pub use chunk::{Chunk, ChunkManager, ChunkStatus, ChunkError};

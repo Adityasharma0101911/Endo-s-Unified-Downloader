@@ -478,6 +478,9 @@ fn options(out: &Path, connections: usize, chunk: usize) -> DownloadOptions {
         output_path: Some(out.to_path_buf()),
         // A machine without ffmpeg would install it from the network for a media test.
         install_ffmpeg: false,
+        // The mocks serve the file at every path and count what they serve: the site's checksum
+        // files (`digest`'s tests) would be more of it.
+        remote_checksum: false,
         ..Default::default()
     }
 }
