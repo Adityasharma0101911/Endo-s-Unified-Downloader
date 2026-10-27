@@ -4,6 +4,15 @@ What changed in each release, newest first. Each release's page on [GitHub](http
 
 ## Unreleased
 
+- **Installers and packages:** a Windows setup.exe (also for winget), Linux x64 and arm64 `.tar.gz`, `.deb` and `.rpm`, and a static Linux CLI; the Windows programs are code-signed when the project's signing is set up. `install.sh` installs the release for the machine's architecture.
+- **Browser downloads to the app** (off by default): files of chosen types and size go to the app instead of the browser, except from blocked sites, private windows or an Alt-click; the popup can start the app. **Firefox:** a signed add-on that updates itself from the releases.
+- **FTP** downloads with several connections and resume; `--max-filesize`; keep the server's file date (`--remote-time`); download only when the server has a newer copy (`-N`).
+- **Checksums the site publishes** (in its headers or a `.sha256`/`SHA256SUMS` file beside the download) are checked by themselves. A finished file that fails its check later is repaired by fetching only its damaged pieces; a metalink's piece hashes re-fetch only the bad pieces. A file with no proper extension gets one from its contents, and sorting goes by it.
+- **Request options:** custom headers, user agent, cookies, IPv4 or IPv6 only, connect timeout, no proxy, and (CLI only) skipping certificate checks; live recordings for a set time (`--record-seconds`); a connection count that adapts (off by default).
+- **CLI:** `--json` results, `--spider`, `-S`, `--preview` (a ZIP's contents), `--dry-run`, `--stdout`, `-u`, `--cookie`, `--no-clobber`, `--logfile`, `--completions`.
+- **App:** a tray icon and close to tray, start hidden and at login, a start/stop schedule, quit, sleep or shut down when the queue is done (30 s to cancel), one app at a time, taskbar progress on Windows, a log file and portable mode; sorting categories you can edit, each with its own folder; "See what's inside" for ZIP links; settings for site checksums, file dates, IP version, connect timeout and user agent.
+- A fast mirror with the wrong file no longer decides the download when the first link is slow to answer.
+
 ## 1.7.0 (2026-10-05)
 
 - **macOS:** the app, the CLI, the browser extension and self-updates run natively on Apple Silicon and Intel Macs (macOS 11 or later), each build tested on a real Mac of both kinds. A DMG per chip; the app is ad-hoc signed, not notarized. Data in `~/Library/Application Support/EndosUnifiedDownloader`; downloads are marked as coming from the internet for Gatekeeper; Reduce Motion and ⌘ shortcuts are followed; an update replaces the whole app in one step and rolls back on failure.
