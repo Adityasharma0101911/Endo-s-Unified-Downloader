@@ -12,7 +12,7 @@ use hyperfetch_core::torrent::parse_torrent_bytes;
 use hyperfetch_core::zipdir::ZipEntry;
 use indicatif::HumanBytes;
 use reqwest::header::{
-    HeaderMap, HeaderName, AUTHORIZATION, CONTENT_RANGE, CONTENT_TYPE, COOKIE, ETAG, LAST_MODIFIED, LOCATION,
+    HeaderMap, HeaderName, AUTHORIZATION, CONTENT_LOCATION, CONTENT_RANGE, CONTENT_TYPE, COOKIE, ETAG, LAST_MODIFIED, LOCATION,
     PROXY_AUTHORIZATION, SET_COOKIE,
 };
 use reqwest::{Client, Response, StatusCode};
@@ -85,10 +85,8 @@ fn request_headers(options: &DownloadOptions, url: &Url, own: &Url) -> HeaderMap
             headers.insert(name, value);
         }
     }
-    if url.host_str() == own.host_str() && (own.scheme() != "https" || url.scheme() == "https") {
-        let auth = options.auth_header.iter().map(|value| pair("Authorization", value));
-        let cookie = options.cookie_string.iter().map(|value| pair("Cookie", value));
-        for (name, value) in auth.chain(options.secret_headers.iter().cloned()).chain(options.extra_headers.iter().cloned()).chain(cookie) {
+    if sends_own(url, own) {
+        for (name, value) in own_headers(options) {
             if let Some((name, mut value)) = request_header(&name, &value) {
                 value.set_sensitive(true);
                 headers.insert(name, value);
@@ -98,16 +96,44 @@ fn request_headers(options: &DownloadOptions, url: &Url, own: &Url) -> HeaderMap
     headers
 }
 
+/// Whether the user's own headers, cookies and sign-in go to `url` when `own` is the link given:
+/// on its host, and not over plain HTTP when that was HTTPS.
+fn sends_own(url: &Url, own: &Url) -> bool {
+    url.host_str() == own.host_str() && (own.scheme() != "https" || url.scheme() == "https")
+}
+
+/// The user's own headers of `options`: the sign-in, a paste's headers, --header and --cookie.
+fn own_headers(options: &DownloadOptions) -> Vec<(String, String)> {
+    let auth = options.auth_header.iter().map(|value| ("Authorization".to_string(), value.clone()));
+    let cookie = options.cookie_string.iter().map(|value| ("Cookie".to_string(), value.clone()));
+    auth.chain(options.secret_headers.iter().cloned()).chain(options.extra_headers.iter().cloned()).chain(cookie).collect()
+}
+
+/// `options` whose client sends the user's own headers with each request when they go to `url`
+/// (see [`sends_own`]), for requests that set none of their own (--preview's). A redirect to
+/// another host still gets none of them: the client stops there, or drops the sign-in as it
+/// follows (see `engine::build_client`).
+pub fn sending_own(options: &DownloadOptions, url: &Url, own: &Url) -> DownloadOptions {
+    let mut options = options.clone();
+    if sends_own(url, own) {
+        let own = own_headers(&options);
+        options.headers.extend(own);
+    }
+    options
+}
+
 /// The -S lines of `headers`, each after `mark`: sign-ins, cookies and the user's own headers
-/// masked.
+/// masked, the links a redirect names (a signed one) without their secrets.
 fn header_lines(mark: char, headers: &HeaderMap) -> Vec<String> {
     const SECRET: [HeaderName; 4] = [AUTHORIZATION, PROXY_AUTHORIZATION, COOKIE, SET_COOKIE];
     headers
         .iter()
         .map(|(name, value)| {
+            let text = String::from_utf8_lossy(value.as_bytes());
             let value = match value.is_sensitive() || SECRET.contains(name) {
                 true => "***".into(),
-                false => String::from_utf8_lossy(value.as_bytes()),
+                false if [LOCATION, CONTENT_LOCATION].contains(name) => redact_url(&text),
+                false => text.into_owned(),
             };
             format!("{} {}: {}", mark, name, value)
         })
@@ -342,4 +368,21 @@ pub fn zip_lines(entries: &[ZipEntry]) -> Vec<String> {
     let (size, packed) = entries.iter().fold((0u64, 0u64), |(size, packed), e| (size.saturating_add(e.size), packed.saturating_add(e.compressed)));
     lines.push(format!("{} entries, {} ({} compressed)", entries.len(), HumanBytes(size), HumanBytes(packed)));
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// -S shows where a redirect leads without the signature or sign-in in the link.
+    #[test]
+    fn a_redirects_link_is_shown_without_its_secrets() {
+        let mut headers = HeaderMap::new();
+        headers.insert(LOCATION, "https://u:p@cdn.test/f.zip?X-Amz-Signature=abc&part=1".parse().unwrap());
+        headers.insert(CONTENT_LOCATION, "https://cdn.test/f.zip?token=def".parse().unwrap());
+        headers.insert(ETAG, "\"v1\"".parse().unwrap());
+        let lines = header_lines('<', &headers).join("\n");
+        assert!(!lines.contains("abc") && !lines.contains("def") && !lines.contains("u:p@"), "{lines}");
+        assert!(lines.contains("< location: https://cdn.test/f.zip?") && lines.contains("part=1") && lines.contains("< etag: \"v1\""), "{lines}");
+    }
 }

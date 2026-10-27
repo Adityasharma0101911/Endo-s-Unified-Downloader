@@ -135,13 +135,14 @@ fn usage(message: &str) -> i32 {
 }
 
 /// Turns `-u USER[:PASS]` into an Authorization header (an Authorization --header wins over it),
-/// with the password asked of `ask` when it is missing (see [`cli::basic_auth`]).
+/// with the password asked of `ask` when it is missing (see [`cli::basic_auth`]); not asked when
+/// nothing would send it (--history, --update, --verify).
 fn sign_in(args: &mut Args, ask: Option<fn(&str) -> Option<String>>) -> Result<(), String> {
     let Some(user) = args.user.take() else { return Ok(()) };
-    let basic = cli::basic_auth(&user, ask)?;
-    if args.auth_header().is_none() {
-        args.headers.push(("Authorization".to_string(), basic));
+    if args.auth_header().is_some() || args.history || args.update || args.verify.is_some() {
+        return Ok(());
     }
+    args.headers.push(("Authorization".to_string(), cli::basic_auth(&user, ask)?));
     Ok(())
 }
 
@@ -261,7 +262,9 @@ async fn preview(args: &Args, ui: &Ui) -> i32 {
         let url = Url::parse(link).map_err(|e| format!("not a link: {}", e))?;
         let options = job(args, 1, Path::new("."), Task { urls: vec![url.clone()], ..Default::default() }).options;
         let client = build_client(&options)?;
-        hyperfetch_core::zipdir::list_zip(&client, &probe::resolve(&client, &url, &options).await?).await
+        // Where the link leads, found as a download finds it: the user's headers to its host only.
+        let at = probe::probe(&client, &url, &options, None).await?.url().clone();
+        hyperfetch_core::zipdir::list_zip(&build_client(&probe::sending_own(&options, &at, &url))?, &at).await
     }
     .await;
     match listed {
@@ -424,7 +427,8 @@ fn list_options(args: &Args) -> ListOptions {
         p2p: !args.no_p2p,
         debrid_key: args.debrid_key.clone(),
         debrid_provider: args.debrid_provider.clone(),
-        debrid_magnets: true,
+        // Adding a magnet to the debrid account is a change there, not a look.
+        debrid_magnets: !(args.dry_run || args.spider),
         password: args.password.clone(),
         auth: None,
     }
@@ -1424,6 +1428,15 @@ mod tests {
         sign_in(&mut args, None).unwrap();
         assert_eq!(args.auth_header().as_deref(), Some("Bearer t"));
         assert!(sign_in(&mut parse(&["-u", "bob", "u"]), None).unwrap_err().contains("bob:PASS"));
+        // Nothing to ask for when the header wins or nothing is downloaded.
+        for line in [&["-u", "bob", "--header", "Bearer t", "u"][..], &["-u", "bob", "--history"], &["-u", "bob", "--update"], &["-u", "bob", "--verify", "f"]] {
+            let mut args = parse(line);
+            sign_in(&mut args, None).unwrap();
+            assert!(args.auth_header().is_none_or(|auth| auth == "Bearer t"), "{line:?}");
+        }
+        // --dry-run and --spider add no magnet to a debrid account.
+        assert!(list_options(&parse(&["u"])).debrid_magnets);
+        assert!(!list_options(&parse(&["--dry-run", "u"])).debrid_magnets && !list_options(&parse(&["--spider", "u"])).debrid_magnets);
         let mut asked = parse(&["-u", "bob", "u"]);
         sign_in(&mut asked, Some(|_| Some("pw".to_string()))).unwrap();
         assert_eq!(asked.auth_header().as_deref(), Some("Basic Ym9iOnB3"));
@@ -1584,6 +1597,29 @@ mod tests {
         let server = serve_answers(|_| response("200 OK", "application/zip", "PK")).await;
         assert_eq!(preview(&parse(&[&format!("{server}/a.zip")]), &Ui::new(true)).await, EXIT_FAILED);
         assert_eq!(to_stdout(&parse(&["--stdout", "https://a.example/1", "https://b.example/1"]), &Ui::new(true), &Shutdown::install()).await, EXIT_USAGE);
+    }
+
+    /// --preview sends the user's headers to the link's host, and follows its redirect to another
+    /// host without them.
+    #[tokio::test]
+    async fn a_zip_preview_sends_the_users_headers_to_the_links_host_only() {
+        // An empty ZIP: just its end record.
+        let end = format!("PK\x05\x06{}", "\0".repeat(18));
+        let zip = format!("HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-21/22\r\nContent-Length: 22\r\nConnection: close\r\n\r\n{end}");
+        let cdn = serve_answers(move |head| match head.to_ascii_lowercase().contains("x-key") {
+            true => response("403 Forbidden", "text/plain", "leaked"),
+            false => zip.clone(),
+        })
+        .await;
+        let elsewhere = cdn.replace("127.0.0.1", "localhost");
+        let site = serve_answers(move |head| match head.to_ascii_lowercase().contains("x-key: k1") {
+            true => format!("HTTP/1.1 302 Found\r\nLocation: {elsewhere}/a.zip\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
+            false => response("403 Forbidden", "text/plain", "no key"),
+        })
+        .await;
+        let link = format!("{site}/a.zip");
+        assert_eq!(preview(&parse(&["--preview", "--header", "X-Key: k1", &link]), &Ui::new(true)).await, EXIT_OK);
+        assert_eq!(preview(&parse(&["--preview", &link]), &Ui::new(true)).await, EXIT_FAILED);
     }
 
     #[test]
