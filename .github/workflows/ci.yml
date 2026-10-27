@@ -1,0 +1,47 @@
+# Builds and runs every test suite on Windows and Linux for each push and pull request (macOS has
+# its own workflow, macos.yml). No secrets.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      # The GUI's window libraries (the tray uses no GTK); the rest of Linux's are loaded at run time.
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq pkg-config libxkbcommon-dev libwayland-dev libgl1-mesa-dev
+      - run: cargo build --workspace
+      - run: cargo test --workspace --no-fail-fast -- --test-threads=4
+      - run: node --test "extension/test/*.test.mjs"
+      # install.sh checks releases with the same key as the app's updater.
+      - if: runner.os == 'Linux'
+        name: install.sh trusts the updater's key
+        run: |
+          key="$(sed -n 's/^const PUBLIC_KEY: &str = "\(.*\)";/\1/p' crates/hyperfetch-core/src/updater.rs)"
+          [ -n "$key" ] && grep -qx "PUBLIC_KEY=$key" install.sh
+      - if: runner.os == 'Linux'
+        run: shellcheck install.sh build-linux.sh packaging/linux/package.sh packaging/macos/bundle.sh

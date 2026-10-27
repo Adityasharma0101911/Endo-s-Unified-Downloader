@@ -1,0 +1,222 @@
+# On a v* tag, a release/* branch or a manual run: builds and checks a release's Windows and Linux
+# files and uploads them as the artifacts windows-x64 (the programs, both zips and the installer,
+# code-signed when the signing secrets are set), winget (the filled-in manifests), linux-x64 and
+# linux-arm64 (tar.gz, .deb, .rpm) and linux-x64-static (the static CLI); see CLAUDE.md, Releasing.
+# The updater's signature (SHA256SUMS.sig) is made on the maintainer's PC, never here.
+name: Packages
+
+on:
+  push:
+    branches: ["release/**"]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: packages-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      # Code signing with Azure Trusted Signing runs only when all six secrets are set.
+      SIGN: ${{ secrets.AZURE_TENANT_ID != '' && secrets.AZURE_CLIENT_ID != '' && secrets.AZURE_CLIENT_SECRET != '' && secrets.SIGNING_ENDPOINT != '' && secrets.SIGNING_ACCOUNT != '' && secrets.SIGNING_PROFILE != '' }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      - name: Version
+        shell: bash
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          if [[ "$GITHUB_REF" == refs/tags/v* && "${GITHUB_REF_NAME#v}" != "$version" ]]; then
+            echo "::error::The tag $GITHUB_REF_NAME does not match the version $version in Cargo.toml"
+            exit 1
+          fi
+          cli="$(target/release/Endos-Unified-Downloader-CLI.exe --version)"
+          [ "$cli" = "Endos-Unified-Downloader-CLI $version" ] || { echo "::error::The CLI says '$cli', not $version"; exit 1; }
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+      # The programs are signed before anything packs them, so every release file holds the signed ones.
+      - name: Sign the programs
+        if: env.SIGN == 'true'
+        uses: azure/artifact-signing-action@v2.0.0
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.SIGNING_ENDPOINT }}
+          signing-account-name: ${{ secrets.SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.SIGNING_PROFILE }}
+          files: |
+            ${{ github.workspace }}\target\release\Endos-Unified-Downloader.exe
+            ${{ github.workspace }}\target\release\Endos-Unified-Downloader-CLI.exe
+      - name: Installer
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup --no-progress -y; if ($LASTEXITCODE) { exit 1 } }
+          & $iscc "/DAppVersion=$env:VERSION" packaging\windows\installer.iss
+          if ($LASTEXITCODE) { exit 1 }
+      - name: Sign the installer
+        if: env.SIGN == 'true'
+        uses: azure/artifact-signing-action@v2.0.0
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.SIGNING_ENDPOINT }}
+          signing-account-name: ${{ secrets.SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.SIGNING_PROFILE }}
+          files: ${{ github.workspace }}\dist\Endos-Unified-Downloader-v${{ env.VERSION }}-windows-x64-setup.exe
+      # Installs it silently into a scratch folder, then uninstalls it: the programs, the extension
+      # and the uninstaller's removal of the app's Run value and endo-dl key.
+      - name: Check the installer
+        run: |
+          $ErrorActionPreference = "Stop"
+          $dir = Join-Path $env:RUNNER_TEMP "eud"
+          $setup = "dist\Endos-Unified-Downloader-v$env:VERSION-windows-x64-setup.exe"
+          Start-Process $setup -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=`"$dir`"" -Wait
+          $cli = & "$dir\Endos-Unified-Downloader-CLI.exe" --version
+          if ($cli -ne "Endos-Unified-Downloader-CLI $env:VERSION") { throw "The installed CLI says '$cli'" }
+          foreach ($file in "Endos-Unified-Downloader.exe", "extension\manifest.json") { if (-not (Test-Path "$dir\$file")) { throw "$file was not installed" } }
+          if (Test-Path "$dir\extension\test") { throw "The extension's tests were installed" }
+          $run = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+          New-ItemProperty $run -Name EndosUnifiedDownloader -Value "`"$dir\Endos-Unified-Downloader.exe`" --minimized" -Force | Out-Null
+          New-Item "HKCU:\Software\Classes\endo-dl\shell\open\command" -Force | Out-Null
+          Start-Process "$dir\unins000.exe" -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART" -Wait
+          # The uninstaller hands its work to a copy of itself and returns at once.
+          for ($i = 0; $i -lt 60 -and (Test-Path "$dir\Endos-Unified-Downloader.exe"); $i++) { Start-Sleep 1 }
+          if (Test-Path "$dir\Endos-Unified-Downloader.exe") { throw "The uninstaller left the GUI" }
+          for ($i = 0; $i -lt 30 -and (Test-Path "HKCU:\Software\Classes\endo-dl"); $i++) { Start-Sleep 1 }
+          if (Get-ItemProperty $run -Name EndosUnifiedDownloader -ErrorAction SilentlyContinue) { throw "The uninstaller left the Run value" }
+          if (Test-Path "HKCU:\Software\Classes\endo-dl") { throw "The uninstaller left the endo-dl key" }
+      # The release's other Windows files, from the same (signed) programs: the two the updater
+      # installs, the zip, and the extension's zip with manifest.json at its root.
+      - name: Release files
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tar = "$env:SystemRoot\System32\tar.exe"
+          Copy-Item target\release\Endos-Unified-Downloader.exe, target\release\Endos-Unified-Downloader-CLI.exe dist\
+          & $tar -a -cf "dist\Endos-Unified-Downloader-v$env:VERSION-windows-x64.zip" --exclude extension/test --exclude extension/package.json -C target\release Endos-Unified-Downloader.exe Endos-Unified-Downloader-CLI.exe -C ..\.. README.md extension
+          if ($LASTEXITCODE) { exit 1 }
+          & $tar -a -cf "dist\Endos-Unified-Downloader-Extension-v$env:VERSION.zip" -C extension --exclude test --exclude package.json .
+          if ($LASTEXITCODE) { exit 1 }
+          $zip = & $tar -tf "dist\Endos-Unified-Downloader-v$env:VERSION-windows-x64.zip"
+          foreach ($file in "Endos-Unified-Downloader.exe", "Endos-Unified-Downloader-CLI.exe", "README.md", "extension/manifest.json") { if ($zip -notcontains $file) { throw "The zip has no $file" } }
+          if ($zip -match "^extension/(test/|package\.json)") { throw "The zip holds the extension's tests" }
+          $ext = & $tar -tf "dist\Endos-Unified-Downloader-Extension-v$env:VERSION.zip"
+          if (-not ($ext -match "^(\./)?manifest\.json$")) { throw "The extension's zip has no manifest.json at its root" }
+          if ($ext -match "^(\./)?(test/|package\.json)") { throw "The extension's zip holds its tests" }
+          if ($env:SIGN -eq "true") {
+            foreach ($file in Get-ChildItem dist\*.exe) {
+              $status = (Get-AuthenticodeSignature $file.FullName).Status
+              if ($status -ne "Valid") { throw "$($file.Name) is not signed ($status)" }
+            }
+          }
+          Get-ChildItem dist | Format-Table Name, Length
+      - name: winget manifests
+        run: |
+          $ErrorActionPreference = "Stop"
+          $hash = (Get-FileHash "dist\Endos-Unified-Downloader-v$env:VERSION-windows-x64-setup.exe" -Algorithm SHA256).Hash
+          New-Item -ItemType Directory winget | Out-Null
+          foreach ($template in Get-ChildItem packaging\winget\*.yaml) {
+            $text = (Get-Content -Raw $template) -replace '\{\{VERSION\}\}', $env:VERSION -replace '\{\{SHA256\}\}', $hash
+            if ($text -match '\{\{') { throw "$($template.Name) has a placeholder left" }
+            $text | Out-File -NoNewline "winget\$($template.Name)"
+          }
+      - uses: actions/upload-artifact@v5
+        with:
+          name: windows-x64
+          path: dist/*
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v5
+        with:
+          name: winget
+          path: winget/*
+          if-no-files-found: error
+
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The oldest supported Ubuntu, so the builds run on every glibc since.
+          - os: ubuntu-22.04
+            arch: x64
+            deb: amd64
+          - os: ubuntu-22.04-arm
+            arch: arm64
+            deb: arm64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq pkg-config libxkbcommon-dev libwayland-dev libgl1-mesa-dev desktop-file-utils rpm
+      - run: cargo build --release --locked
+      - name: Package
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          if [[ "$GITHUB_REF" == refs/tags/v* && "${GITHUB_REF_NAME#v}" != "$version" ]]; then
+            echo "::error::The tag $GITHUB_REF_NAME does not match the version $version in Cargo.toml"
+            exit 1
+          fi
+          bash packaging/linux/package.sh "$version" dist
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+      - name: Check the packages
+        run: |
+          desktop-file-validate packaging/linux/endos-unified-downloader.desktop
+          deb="dist/endos-unified-downloader_${VERSION}_${{ matrix.deb }}.deb"
+          rpm="$(ls dist/*.rpm)"
+          dpkg-deb --info "$deb"
+          rpm -qip "$rpm"
+          sudo apt-get install -y -qq "./$deb"
+          [ "$(endos-downloader --version)" = "Endos-Unified-Downloader-CLI $VERSION" ]
+          [ -f "$(dirname "$(readlink -f "$(command -v endos-downloader-gui)")")/extension/manifest.json" ]
+          sudo apt-get remove -y -qq endos-unified-downloader
+          [ ! -e /usr/lib/endos-unified-downloader ]
+          ls -l dist
+      - uses: actions/upload-artifact@v5
+        with:
+          name: linux-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  # The CLI linked statically against musl: one file that runs on any x86_64 Linux.
+  linux-static:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
+      - run: cargo build --release --locked -p hyperfetch-cli --target x86_64-unknown-linux-musl
+      - name: Package
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          bin=target/x86_64-unknown-linux-musl/release/Endos-Unified-Downloader-CLI
+          [ "$("$bin" --version)" = "Endos-Unified-Downloader-CLI $version" ]
+          file "$bin" | tee /dev/stderr | grep -q 'static'
+          if ldd "$bin" 2>/dev/null | grep -q '=>'; then echo "::error::The static CLI links shared libraries"; exit 1; fi
+          name="Endos-Unified-Downloader-CLI-v$version-linux-x64-static"
+          mkdir -p "dist/$name"
+          cp "$bin" README.md "dist/$name/"
+          tar -czf "dist/$name.tar.gz" -C dist --owner=0 --group=0 "$name"
+          rm -rf "dist/$name"
+          tar -tzvf "dist/$name.tar.gz"
+      - uses: actions/upload-artifact@v5
+        with:
+          name: linux-x64-static
+          path: dist/*.tar.gz
+          if-no-files-found: error

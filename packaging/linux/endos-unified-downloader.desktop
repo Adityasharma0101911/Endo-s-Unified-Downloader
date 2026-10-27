@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Endo's Unified Downloader
+Comment=Multi-connection download accelerator
+Exec=endos-downloader-gui %u
+Icon=endos-unified-downloader
+Terminal=false
+Categories=Network;FileTransfer;
+MimeType=x-scheme-handler/endo-dl;

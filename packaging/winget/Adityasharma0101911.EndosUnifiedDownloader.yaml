@@ -1,0 +1,8 @@
+# The winget manifests, as templates: the Packages workflow (.github/workflows/packages.yml) fills in
+# the version and the SHA-256 of the setup.exe it built and uploads them as the artifact winget.
+# Submitting them to winget is the maintainer's own step (see CLAUDE.md, Releasing).
+PackageIdentifier: Adityasharma0101911.EndosUnifiedDownloader
+PackageVersion: '{{VERSION}}'
+DefaultLocale: en-US
+ManifestType: version
+ManifestVersion: 1.9.0

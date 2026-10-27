@@ -3,11 +3,12 @@
 # Endo's Unified Downloader - Linux installer
 # Debian/Ubuntu, Fedora/RHEL, Arch, openSUSE and Alpine.
 #
-#   ./install.sh              build and install the CLI (plus the GUI when a display is present)
-#   ./install.sh --gui        also build and install the GUI
-#   ./install.sh --no-gui     CLI only
-#   ./install.sh --service    also install the systemd batch-queue service
-#   ./install.sh --uninstall  remove what the installer added (downloads and history are kept)
+#   ./install.sh                install the newest release's build (x86_64 or aarch64), checked against its signed sums
+#   ./install.sh --from-source  build it here instead (any architecture; run from a clone of the repository)
+#   ./install.sh --gui          also install the GUI (by default only when a display is present)
+#   ./install.sh --no-gui       CLI only
+#   ./install.sh --service      also install the systemd batch-queue service
+#   ./install.sh --uninstall    remove what the installer added (downloads and history are kept)
 #
 # Run it as your normal user; it uses sudo only for the system-wide install step.
 # ==============================================================================
@@ -16,6 +17,8 @@ set -euo pipefail
 
 PREFIX=/usr/local
 BIN_DIR="$PREFIX/bin"
+# The programs and the browser extension, side by side as the app expects; $BIN_DIR links to them.
+LIB_DIR="$PREFIX/lib/endos-unified-downloader"
 CLI_DEST="$BIN_DIR/endos-downloader-cli"
 GUI_DEST="$BIN_DIR/endos-downloader-gui"
 DESKTOP_FILE=/usr/share/applications/endos-downloader.desktop
@@ -25,6 +28,10 @@ SERVICE_USER=endos-downloader
 DOWNLOAD_DIR=/var/downloads
 MIN_RUST_MINOR=89 # Rust 1.89 or newer
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RELEASES=https://github.com/Adityasharma0101911/Endo-s-Unified-Downloader/releases
+# The maintainer's Ed25519 public key (raw, base64) a release's SHA256SUMS.sig must verify with:
+# PUBLIC_KEY in crates/hyperfetch-core/src/updater.rs, which CI checks this matches.
+PUBLIC_KEY=T0QVGQ63fXhyznv19veDUihSZBpBRxjGVOmPVoh85ms=
 
 CYAN='\033[0;36m'
 GREEN='\033[0;32m'
@@ -41,15 +48,17 @@ die() {
 }
 
 usage() {
-    sed -n '3,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '3,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # --- Options ------------------------------------------------------------------
 INSTALL_GUI=auto
 INSTALL_SERVICE=false
 UNINSTALL=false
+FROM_SOURCE=false
 for arg in "$@"; do
     case "$arg" in
+        --from-source) FROM_SOURCE=true ;;
         --gui) INSTALL_GUI=true ;;
         --no-gui) INSTALL_GUI=false ;;
         --service) INSTALL_SERVICE=true ;;
@@ -64,13 +73,27 @@ done
 if [ "$INSTALL_GUI" = auto ]; then
     if [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; then INSTALL_GUI=true; else INSTALL_GUI=false; fi
 fi
+if [ "$UNINSTALL" = false ]; then
+    if [ "$FROM_SOURCE" = true ]; then
+        [ -f "$SCRIPT_DIR/Cargo.toml" ] || die "--from-source builds the clone of the repository install.sh is in, and there is none here."
+    else
+        case "$(uname -m)" in
+            x86_64) ARCH=x64 ;;
+            aarch64 | arm64) ARCH=arm64 ;;
+            *) die "Releases are built for x86_64 and aarch64 only; on $(uname -m) run ./install.sh --from-source from a clone of the repository." ;;
+        esac
+    fi
+    if [ "$INSTALL_SERVICE" = true ] && [ ! -f "$SCRIPT_DIR/endos-downloader.service" ]; then
+        die "--service installs endos-downloader.service from a clone of the repository; run install.sh from one."
+    fi
+fi
 
 # --- Privileges -----------------------------------------------------------------
 SUDO=""
 if [ "$(id -u)" -ne 0 ]; then
     command -v sudo >/dev/null 2>&1 || die "sudo is not installed; run this script as root instead."
     SUDO=sudo
-elif [ -n "${SUDO_USER:-}" ] && [ "$UNINSTALL" = false ]; then
+elif [ -n "${SUDO_USER:-}" ] && [ "$UNINSTALL" = false ] && [ "$FROM_SOURCE" = true ]; then
     # Building under sudo would put rustup in /root and leave a root-owned target/ in the checkout.
     die "Run ./install.sh as your normal user (not with sudo); it asks for sudo when it installs."
 fi
@@ -83,6 +106,20 @@ install_file() {
     $SUDO cp "$src" "$tmp"
     $SUDO chmod "$mode" "$tmp"
     $SUDO mv -f "$tmp" "$dest"
+}
+
+# Points the symlink $2 at $1, atomically.
+link_file() {
+    $SUDO mkdir -p "$(dirname "$2")"
+    $SUDO ln -sfn "$1" "$2.new.$$"
+    $SUDO mv -f "$2.new.$$" "$2"
+}
+
+# Updates the menu's list of what opens endo-dl: links, when the desktop has that tool.
+refresh_menu() {
+    if command -v update-desktop-database >/dev/null 2>&1; then
+        $SUDO update-desktop-database -q "$(dirname "$DESKTOP_FILE")" || true
+    fi
 }
 
 # Links $BIN_DIR/<name> to the CLI unless that name belongs to something else.
@@ -113,6 +150,8 @@ uninstall() {
     remove_alias endos-downloader
     remove_alias hyperfetch
     $SUDO rm -f "$CLI_DEST" "$GUI_DEST" "$DESKTOP_FILE" "$ICON_FILE"
+    $SUDO rm -rf "$LIB_DIR"
+    refresh_menu
     echo -e "${GREEN}Removed. Downloads, $DOWNLOAD_DIR and download history were kept.${RESET}"
 }
 
@@ -179,32 +218,88 @@ build_binaries() {
             INSTALL_GUI=false
         }
     fi
+    BIN_SRC="$SCRIPT_DIR/target/release"
+    EXT_SRC="$SCRIPT_DIR/extension"
+    ICON_SRC="$SCRIPT_DIR/assets/logo.svg"
 }
 
-# --- 4. Install -----------------------------------------------------------------
+# --- Or: the newest release -----------------------------------------------------
+get() { curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o "$2" "$1" || die "Could not download $1"; }
+
+# Unpacks the newest release's Linux tar.gz into $WORK/app once it matches the release's
+# SHA256SUMS, and that list the maintainer's signature when OpenSSL 3 can check it. The list names
+# its version, so an older release cannot pass for the newest.
+fetch_release() {
+    step "[1/2] Downloading the newest release..."
+    local tool version tarball
+    for tool in curl tar sha256sum base64; do
+        command -v "$tool" >/dev/null 2>&1 || die "$tool is needed; install it first."
+    done
+    WORK="$(mktemp -d)"
+    trap 'rm -rf "$WORK"' EXIT
+    get "$RELEASES/latest/download/SHA256SUMS" "$WORK/SHA256SUMS"
+    version="$(sed -n '1s/^# version \([0-9]*\.[0-9]*\.[0-9]*\)$/\1/p' "$WORK/SHA256SUMS")"
+    [ -n "$version" ] || die "The release's SHA256SUMS does not name its version; nothing was installed."
+    tarball="Endos-Unified-Downloader-v$version-linux-$ARCH.tar.gz"
+    info "Version $version"
+    get "$RELEASES/download/v$version/$tarball" "$WORK/$tarball"
+    if openssl version 2>/dev/null | grep -q '^OpenSSL [3-9]'; then
+        get "$RELEASES/download/v$version/SHA256SUMS.sig" "$WORK/SHA256SUMS.sig"
+        # An Ed25519 public key's DER is a fixed 12-byte header and the raw key, so in base64 the
+        # header's MCowBQYDK2VwAyEA just goes in front.
+        printf -- '-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA%s\n-----END PUBLIC KEY-----\n' "$PUBLIC_KEY" >"$WORK/key.pem"
+        base64 -d "$WORK/SHA256SUMS.sig" >"$WORK/sig.bin" 2>/dev/null || die "The release's SHA256SUMS.sig is not base64; nothing was installed."
+        openssl pkeyutl -verify -pubin -inkey "$WORK/key.pem" -rawin -in "$WORK/SHA256SUMS" -sigfile "$WORK/sig.bin" >/dev/null 2>&1 ||
+            die "The release's SHA256SUMS is not signed by the maintainer's key; nothing was installed."
+        info "Signature: good"
+    else
+        warn "OpenSSL 3 is not installed, so only the file's SHA-256 was checked, not the signature of the list it is in."
+    fi
+    (cd "$WORK" && awk -v name="$tarball" '$2 == name' SHA256SUMS | sha256sum -c - >/dev/null 2>&1) ||
+        die "$tarball does not match the release's SHA256SUMS; nothing was installed."
+    info "SHA-256: good"
+    mkdir "$WORK/app"
+    tar -xzf "$WORK/$tarball" -C "$WORK/app" --strip-components=1
+    "$WORK/app/Endos-Unified-Downloader-CLI" --version >/dev/null 2>&1 ||
+        die "The release's build does not run on this system (it needs a recent glibc); run ./install.sh --from-source from a clone of the repository."
+    BIN_SRC="$WORK/app"
+    EXT_SRC="$WORK/app/extension"
+    ICON_SRC="$WORK/app/endos-unified-downloader.svg"
+}
+
+# --- Install ----------------------------------------------------------------------
 install_binaries() {
-    step "[4/4] Installing into $BIN_DIR..."
-    install_file 755 "$SCRIPT_DIR/target/release/Endos-Unified-Downloader-CLI" "$CLI_DEST"
+    step "[$STEPS/$STEPS] Installing into $LIB_DIR, with the commands in $BIN_DIR..."
+    install_file 755 "$BIN_SRC/Endos-Unified-Downloader-CLI" "$LIB_DIR/Endos-Unified-Downloader-CLI"
+    link_file "$LIB_DIR/Endos-Unified-Downloader-CLI" "$CLI_DEST"
     link_alias endos-downloader
     link_alias hyperfetch
 
     if [ "$INSTALL_GUI" = true ]; then
-        install_file 755 "$SCRIPT_DIR/target/release/Endos-Unified-Downloader" "$GUI_DEST"
-        install_file 644 "$SCRIPT_DIR/assets/logo.svg" "$ICON_FILE"
+        install_file 755 "$BIN_SRC/Endos-Unified-Downloader" "$LIB_DIR/Endos-Unified-Downloader"
+        link_file "$LIB_DIR/Endos-Unified-Downloader" "$GUI_DEST"
+        # The browser extension next to the GUI, where its Settings show it; without its tests.
+        $SUDO rm -rf "$LIB_DIR/extension.new"
+        $SUDO cp -R "$EXT_SRC" "$LIB_DIR/extension.new"
+        $SUDO rm -rf "$LIB_DIR/extension.new/test" "$LIB_DIR/extension.new/package.json" "$LIB_DIR/extension"
+        $SUDO mv "$LIB_DIR/extension.new" "$LIB_DIR/extension"
+        install_file 644 "$ICON_SRC" "$ICON_FILE"
         local desktop
         desktop="$(mktemp)"
         cat >"$desktop" <<EOF
 [Desktop Entry]
 Name=Endo's Unified Downloader
 Comment=Multi-connection download accelerator
-Exec=$GUI_DEST
+Exec=$GUI_DEST %u
 Icon=endos-downloader
 Terminal=false
 Type=Application
 Categories=Network;FileTransfer;
+MimeType=x-scheme-handler/endo-dl;
 EOF
         install_file 644 "$desktop" "$DESKTOP_FILE"
         rm -f "$desktop"
+        refresh_menu
     fi
 }
 
@@ -238,9 +333,15 @@ if [ "$UNINSTALL" = true ]; then
     exit 0
 fi
 
-install_system_deps
-install_rust
-build_binaries
+if [ "$FROM_SOURCE" = true ]; then
+    STEPS=4
+    install_system_deps
+    install_rust
+    build_binaries
+else
+    STEPS=2
+    fetch_release
+fi
 install_binaries
 if [ "$INSTALL_SERVICE" = true ]; then install_service; fi
 
