@@ -462,9 +462,21 @@ pub fn parse_bytes(s: &str) -> Result<u64, String> {
 
 /// Accepts curl-style "Name: VALUE", or a bare "VALUE" for Authorization, as (name, value); the
 /// Authorization header is named "Authorization" whatever its case. The headers a download sets
-/// itself are refused.
+/// itself, or that would change what the server sends, are refused, as `run()` refuses them.
 pub fn parse_header(s: &str) -> Result<(String, String), String> {
-    const OWN: [&str; 5] = ["host", "range", "content-length", "transfer-encoding", "connection"];
+    const OWN: [&str; 11] = [
+        "host",
+        "range",
+        "content-length",
+        "transfer-encoding",
+        "connection",
+        "accept-encoding",
+        "te",
+        "upgrade",
+        "expect",
+        "keep-alive",
+        "proxy-connection",
+    ];
     let s = s.trim();
     let (name, value) = match s.split_once(':') {
         // A name is a single token ("Bearer abc:def" is a value that contains a colon).
@@ -475,8 +487,8 @@ pub fn parse_header(s: &str) -> Result<(String, String), String> {
     if reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_err() {
         return Err(format!("'{}' is not a header name", name));
     }
-    if OWN.iter().any(|own| name.eq_ignore_ascii_case(own)) {
-        return Err(format!("the download sets the {} header itself", name));
+    if OWN.iter().any(|own| name.eq_ignore_ascii_case(own)) || name.get(..3).is_some_and(|start| start.eq_ignore_ascii_case("if-")) {
+        return Err(format!("the download sets the {} header itself, or it would change what the server sends", name));
     }
     if value.is_empty() {
         return Err(format!("the {} header value is empty", name));
@@ -618,9 +630,13 @@ mod tests {
         assert!(header("Bearer x\r\nX-Evil: 1").is_err());
         assert!(header("X-A: b\nc").is_err());
         assert!(header("X(A): b").unwrap_err().contains("not a header name"));
-        for own in ["Host: h", "range: bytes=0-", "Content-Length: 1", "Transfer-Encoding: chunked", "Connection: close"] {
+        let changing = ["Accept-Encoding: gzip", "TE: trailers", "Upgrade: h2c", "Expect: 100-continue", "Keep-Alive: 5", "Proxy-Connection: close"];
+        for own in ["Host: h", "range: bytes=0-", "Content-Length: 1", "Transfer-Encoding: chunked", "Connection: close"].iter().chain(&changing) {
             assert!(header(own).unwrap_err().contains("sets the"), "{own}");
         }
+        assert!(header("If-None-Match: \"v1\"").unwrap_err().contains("change what the server sends"));
+        assert!(header("if-range: x").is_err());
+        assert_eq!(header("Ifx: 1").as_deref(), Ok("Ifx=1"), "only If-*");
     }
 
     #[test]
