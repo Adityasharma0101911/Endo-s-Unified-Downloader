@@ -2403,8 +2403,13 @@ mod tests {
             run_job(&engines, vec![url], options, folder, leftovers_of, cancel_job, job_slot, egui::Context::default()).await
         });
         if let Some(delay) = pause_after {
+            // Paused `delay` after the first snapshot, which a slow machine may give late.
+            let start = Instant::now();
+            while lock(&slot).is_none() {
+                assert!(start.elapsed() < Duration::from_secs(10), "snapshots reach the UI slot");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
             tokio::time::sleep(delay).await;
-            assert!(lock(&slot).is_some(), "snapshots reach the UI slot");
             cancel.notify_one();
         }
         tokio::time::timeout(Duration::from_secs(60), job).await.unwrap().unwrap()
@@ -2529,6 +2534,12 @@ mod tests {
         let (clear, refresh) = (clear.join().unwrap(), refresh.join().unwrap());
         assert_eq!(clear, (1, vec![]));
         assert_eq!(refresh, (2, vec![]), "the refresh reads after the clear and is numbered after it");
+    }
+
+    thread_local! {
+        /// A test's own folder for the settings, queue and logs (see `settings::app_file`), for a
+        /// test that reads back what the app saved, which another test would overwrite.
+        pub(crate) static OWN_DATA_DIR: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
     }
 
     /// Points download history, and with it the settings, queue and logs (see
@@ -3344,6 +3355,7 @@ mod tests {
     fn the_countdown_waits_for_a_new_download_and_saves_the_settings_first() {
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
         let dir = tempfile::tempdir().unwrap();
+        OWN_DATA_DIR.with(|own| *own.borrow_mut() = Some(dir.path().to_path_buf()));
         let mut app = test_app(&rt, dir.path());
         let slept = Arc::new(Mutex::new(Vec::new()));
         let log = Arc::clone(&slept);
