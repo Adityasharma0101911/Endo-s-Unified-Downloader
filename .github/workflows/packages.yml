@@ -7,7 +7,7 @@ name: Packages
 
 on:
   push:
-    branches: ["release/**"]
+    branches: ["release/**", "feat/next"] # shortcut: feat/next only until packages.yml is on main (workflow_dispatch needs it there)
     tags: ["v*"]
   workflow_dispatch:
 
