@@ -727,7 +727,7 @@ mod tests {
     }
 
     /// Serves `body` at every path over keep-alive HTTP/1.1 (HEAD, and GET with or without a
-    /// Range) and counts the connections it accepts.
+    /// Range), dated under /dated/, and counts the connections it accepts.
     async fn keep_alive_server(body: Vec<u8>) -> (String, Arc<AtomicUsize>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -760,10 +760,13 @@ mod tests {
                             Some(_) => format!("206 Partial Content\r\nContent-Range: bytes {}-{}/{}", start, end, body.len()),
                             None => "200 OK".to_string(),
                         };
+                        // Only there: a date lets a probe go without its HEAD, which then costs a connection.
+                        let dated = if head.contains(" /dated/") { "Last-Modified: Wed, 21 Oct 2015 07:28:00 GMT\r\n" } else { "" };
                         let mut response = format!(
-                            "HTTP/1.1 {}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nLast-Modified: Wed, 21 Oct 2015 07:28:00 GMT\r\n\r\n",
+                            "HTTP/1.1 {}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\n{}\r\n",
                             status,
-                            end + 1 - start
+                            end + 1 - start,
+                            dated
                         )
                         .into_bytes();
                         if !head.starts_with("head ") {
@@ -826,7 +829,7 @@ mod tests {
         ui.log = Some(Arc::new(std::fs::File::create(&log).unwrap()));
         let job = |name: &str| Job {
             label: name.to_string(),
-            urls: vec![Url::parse(&format!("{}/{}.bin?token=secret", server, name)).unwrap()],
+            urls: vec![Url::parse(&format!("{}/dated/{}.bin?token=secret", server, name)).unwrap()],
             options: DownloadOptions { output_path: Some(dir.join("")), only_if_newer: true, ..Default::default() },
             line: None,
         };
@@ -845,7 +848,7 @@ mod tests {
         assert!(failed.contains(r#","path":null,"size":null,"checksum":null,"checked_against":null,"error":""#), "{failed}");
         let path = dir.join("a.bin").display().to_string();
         assert_eq!((items[0]["path"].as_str(), items[0]["size"].as_u64()), (Some(path.as_str()), Some(body.len() as u64)));
-        assert!(items[0]["url"].as_str().unwrap().ends_with("/a.bin?token=REDACTED"), "{}", items[0]);
+        assert!(items[0]["url"].as_str().unwrap().ends_with("/dated/a.bin?token=REDACTED"), "{}", items[0]);
         assert!(items[0]["error"].is_null() && items[0]["checksum"].is_null() && items[0]["checked_against"].is_null());
         assert!(items[1]["error"].as_str().unwrap().contains("cookies"), "{}", items[1]);
         assert_eq!(items[2]["path"].as_str(), Some(path.as_str()));
