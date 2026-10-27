@@ -2283,7 +2283,7 @@ dependencies = [
 
 [[package]]
 name = "hyperfetch-cli"
-version = "1.7.0"
+version = "1.8.0"
 dependencies = [
  "base64 0.22.1",
  "clap",
@@ -2304,7 +2304,7 @@ dependencies = [
 
 [[package]]
 name = "hyperfetch-core"
-version = "1.7.0"
+version = "1.8.0"
 dependencies = [
  "aes",
  "base64 0.22.1",
@@ -2340,7 +2340,7 @@ dependencies = [
 
 [[package]]
 name = "hyperfetch-gui"
-version = "1.7.0"
+version = "1.8.0"
 dependencies = [
  "arboard",
  "eframe",
