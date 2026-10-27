@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { CAPTURE_TYPES, extensionOf, parseSites, parseTypes, shouldCapture } from "../lib/capture.js";
+import { ALT_WINDOW_MS, CAPTURE_TYPES, altClicked, extensionOf, originOf, parseSites, parseTypes, shouldCapture } from "../lib/capture.js";
 
 test("file types as typed keep their last extension, lower case, once each", () => {
   assert.deepEqual(parseTypes(".ZIP, iso;tar.gz  *.exe exe bad! "), ["zip", "iso", "gz", "exe"]);
@@ -81,4 +81,24 @@ test("types, the minimum size and excluded sites filter", () => {
   assert.equal(takes({ referrer: "https://skip.test/" }), false);
   assert.equal(takes({ referrer: "https://notskip.test/" }), true);
   assert.equal(takes({ referrer: "" }), true);
+});
+
+test("a .torrent is not sent by default: a page could start a swarm download with it", () => {
+  assert.equal(CAPTURE_TYPES.includes("torrent"), false);
+  assert.equal(takes({ filename: "x.torrent", finalUrl: "https://cdn.example.com/x.torrent", totalBytes: 0 }), false);
+  assert.equal(takes({ filename: "x.torrent", totalBytes: 0 }, { captureTypes: ["torrent"] }), true);
+});
+
+test("an Alt-click keeps the downloads of its own page in the browser, not those of other pages", () => {
+  const now = 1_000_000;
+  const clicks = new Map([["https://www.example.com", now - 1000]]);
+  assert.equal(altClicked(clicks, "https://www.example.com/downloads", now), true);
+  assert.equal(altClicked(clicks, "https://other.test/page", now), false);
+  assert.equal(altClicked(clicks, "https://www.example.com/", now + ALT_WINDOW_MS), false, "too long ago");
+  // No page known: any page's Alt-click counts.
+  assert.equal(altClicked(clicks, "", now), true);
+  assert.equal(altClicked(new Map(), undefined, now), false);
+  assert.equal(originOf("https://a.test:8443/x?y"), "https://a.test:8443");
+  assert.equal(originOf("about:blank"), "");
+  assert.equal(originOf(undefined), "");
 });

@@ -2,13 +2,34 @@
 // settings' file types and sites as typed. No chrome.* in here, so node can test it.
 import { cleanHost, isBlocked } from "./detect.js";
 
-/** The file types sent to the app until the user changes them. */
+/** The file types sent to the app until the user changes them. Not `torrent`: any page could then start a swarm download. */
 export const CAPTURE_TYPES = [
   "zip", "7z", "rar", "tar", "gz", "xz", "bz2", "zst", "iso", "img", "dmg", "pkg", "exe", "msi", "msix", "appimage",
-  "deb", "rpm", "apk", "mp4", "mkv", "webm", "avi", "mov", "mp3", "flac", "wav", "m4a", "pdf", "epub", "torrent",
+  "deb", "rpm", "apk", "mp4", "mkv", "webm", "avi", "mov", "mp3", "flac", "wav", "m4a", "pdf", "epub",
 ];
 /** How long after an Alt-click a download stays in the browser. */
 export const ALT_WINDOW_MS = 5000;
+
+/**
+ * Whether a download whose page is `referrer` came within ALT_WINDOW_MS of an Alt-click (`clicks`: when the last one
+ * on each page origin happened), so it stays in the browser. A download has no tab, so its page's origin stands for
+ * it; one whose page is not known (no referrer) goes by an Alt-click on any page.
+ */
+export function altClicked(clicks, referrer, now = Date.now()) {
+  const origin = originOf(referrer);
+  const times = origin ? [clicks.get(origin)] : [...clicks.values()];
+  return times.some((at) => at !== undefined && now - at < ALT_WINDOW_MS);
+}
+
+/** The origin of a page's link ("https://example.com"); "" when it has none. */
+export function originOf(url) {
+  try {
+    const { origin } = new URL(url);
+    return origin === "null" ? "" : origin;
+  } catch {
+    return "";
+  }
+}
 
 /** The words of a list as typed ("zip, .iso tar") or as stored (an array). */
 const words = (value) => (Array.isArray(value) ? value.join(" ") : String(value ?? "")).split(/[\s,;]+/).filter(Boolean);

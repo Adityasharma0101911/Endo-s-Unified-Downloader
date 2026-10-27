@@ -2,7 +2,7 @@
 // from this repo's releases and updates itself through the manifest's update_url.
 //
 //   node scripts/sign-firefox.mjs <folder> --version X.Y.Z [--dry-run]
-//     Copies extension/ without test/ and package.json (as the release zip), has `npx web-ext sign
+//     Copies the files git tracks in extension/, without test/ and package.json (as the release zip), has `npx web-ext sign
 //     --channel=unlisted` upload it and fetch the signed file, and writes into <folder>:
 //       Endos-Unified-Downloader-Firefox-vX.Y.Z.xpi  the signed add-on
 //       firefox-updates.json                         what update_url serves (releases/latest/download/…)
@@ -14,13 +14,14 @@
 
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { cpSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, relative, sep } from "node:path";
+import { dirname, join, relative, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
 
-const EXTENSION = fileURLToPath(new URL("../extension", import.meta.url));
+const ROOT = fileURLToPath(new URL("..", import.meta.url));
+const EXTENSION = join(ROOT, "extension");
 const REPO = "https://github.com/Adityasharma0101911/Endo-s-Unified-Downloader";
 // Pinned: what signs the release doesn't change under it.
 const WEB_EXT = "web-ext@10.7.0";
@@ -61,7 +62,14 @@ function main() {
   try {
     const source = join(work, "extension");
     const artifacts = join(work, "signed");
-    cpSync(EXTENSION, source, { recursive: true, filter: (path) => !["test", "package.json"].includes(relative(EXTENSION, path).split(sep)[0]) });
+    // What git tracks only: an ignored or stray file in the folder is no part of the add-on.
+    const tracked = spawnSync("git", ["ls-files", "-z", "--", "extension"], { cwd: ROOT, encoding: "utf8" });
+    if (tracked.status !== 0) fail("git ls-files failed: run this from a clone of the repo.");
+    for (const path of tracked.stdout.split("\0").filter(Boolean).map((path) => path.slice("extension/".length))) {
+      if (["test", "package.json"].includes(path.split("/")[0])) continue;
+      mkdirSync(dirname(join(source, path)), { recursive: true });
+      cpSync(join(EXTENSION, path), join(source, path));
+    }
     const command = `npx --yes ${WEB_EXT} sign --channel=unlisted --no-input --source-dir "${source}" --artifacts-dir "${artifacts}"`;
     if (values["dry-run"]) {
       console.log(`Dry run: ${filesOf(source).length} files packed for ${gecko.id} ${version}:\n  ${filesOf(source).sort().join("\n  ")}`);
