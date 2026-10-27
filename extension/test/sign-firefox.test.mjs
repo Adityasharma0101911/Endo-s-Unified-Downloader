@@ -56,6 +56,11 @@ test("--dry-run packs the extension as the release zip does, stops before the up
     assert.match(out, /^  manifest\.json$/m);
     assert.match(out, /^  background\.js$/m);
     assert.doesNotMatch(out, /^  (test\/|package\.json)/m);
+    // Exactly what git tracks there: nothing ignored or left lying in the folder.
+    const tracked = spawnSync("git", ["ls-files", "--", "."], { cwd: fileURLToPath(new URL("..", import.meta.url)), encoding: "utf8" });
+    const shipped = tracked.stdout.split("\n").filter((path) => path && !/^(test\/|package\.json$)/.test(path)).sort();
+    const packed = out.split(/\r?\n/).filter((line) => line.startsWith("  ")).map((line) => line.trim()).sort();
+    assert.deepEqual(packed, shipped);
     assert.ok(!out.includes(KEYS.AMO_JWT_SECRET) && !out.includes(KEYS.AMO_JWT_ISSUER));
     assert.deepEqual(readdirSync(folder), []);
   } finally {

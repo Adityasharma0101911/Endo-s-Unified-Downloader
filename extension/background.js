@@ -4,7 +4,7 @@
 // queues that may start empty. Listeners are registered at the top level so a restarted worker gets the event that
 // woke it.
 
-import { ALT_WINDOW_MS, CAPTURE_TYPES, parseSites, parseTypes, shouldCapture } from "./lib/capture.js";
+import { ALT_WINDOW_MS, CAPTURE_TYPES, altClicked, originOf, parseSites, parseTypes, shouldCapture } from "./lib/capture.js";
 import {
   classifyResponse,
   cleanHost,
@@ -765,8 +765,8 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
 // ---------------------------------------------------------------------------------------------------------------
 // Browser downloads sent to the app ("Send browser downloads to the app", off by default)
 
-/** When an Alt-click last happened in a tab (bridge.js tells): a download it starts stays in the browser. */
-let altClickAt = 0;
+/** When an Alt-click last happened on each page origin (bridge.js tells): a download it starts stays in the browser. */
+const altClicks = new Map();
 /** The latest URLs pages sent a form to (POST): what they answered can't be fetched again by the app. */
 const posted = new Set();
 
@@ -788,9 +788,12 @@ chrome.webRequest.onBeforeRequest.addListener(
  */
 async function captureDownload(item) {
   const url = item.finalUrl || item.url;
-  const flags = { altClicked: Date.now() - altClickAt < ALT_WINDOW_MS, posted: posted.has(item.url) || posted.has(url) };
+  const flags = { altClicked: altClicked(altClicks, item.referrer), posted: posted.has(item.url) || posted.has(url) };
   if (!shouldCapture(item, await getSettings(), flags)) return false;
   await chrome.downloads.pause(item.id).catch(() => {});
+  // Firefox: a small download can be done before it is paused; the browser's copy then stays, so the app gets none.
+  const [now] = await chrome.downloads.search({ id: item.id }).catch(() => []);
+  if (now && now.state !== "in_progress") return false;
   // Firefox: the container the download was made in.
   const store = item.cookieStoreId ? { storeId: item.cookieStoreId } : {};
   const cookies = chrome.cookies ? cookieHeader(await chrome.cookies.getAll({ url, ...store }).catch(() => [])) : "";
@@ -1404,8 +1407,10 @@ const PAGE_COMMANDS = {
   },
 
   /** An Alt-click (bridge.js): the download it starts stays in the browser. */
-  ALT_CLICK() {
-    altClickAt = Date.now();
+  ALT_CLICK(_message, sender) {
+    const now = Date.now();
+    for (const [origin, at] of altClicks) if (now - at >= ALT_WINDOW_MS) altClicks.delete(origin);
+    altClicks.set(originOf(sender.url), now);
     return { ok: true };
   },
 
