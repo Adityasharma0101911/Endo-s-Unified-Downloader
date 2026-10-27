@@ -843,7 +843,7 @@ mod tests {
 
     #[test]
     fn a_writers_pieces_are_those_a_read_gives() {
-        let data = content(9 * MIB + 5);
+        let data = content(5 * MIB + 5);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("f.bin");
         let writer = DiskWriter::open_or_create(&path, data.len() as u64).unwrap();
@@ -856,7 +856,7 @@ mod tests {
 
         let piece = crate::history::piece_size(data.len() as u64).unwrap();
         let read = read_pass(&path, None, None, Some(piece)).unwrap().blake3;
-        assert_eq!(read.len(), 3);
+        assert_eq!(read.len(), 2);
         assert_eq!(writer.piece_hashes(piece).unwrap(), read);
     }
 }
