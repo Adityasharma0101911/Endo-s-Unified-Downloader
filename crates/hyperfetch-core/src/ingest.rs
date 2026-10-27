@@ -50,6 +50,8 @@ pub struct Task {
     /// A BitTorrent swarm download: `urls` holds the magnet link, the .torrent link or the
     /// `file:` URL of a local .torrent (see `engine::DownloadOptions::bittorrent`).
     pub p2p: bool,
+    /// Piece hashes a metalink publishes for the file (see `metalink::Pieces`).
+    pub pieces: Option<metalink::Pieces>,
 }
 
 impl Task {
@@ -430,8 +432,8 @@ pub fn link_task(tokens: &[impl AsRef<str>]) -> Result<Task, String> {
             magnet.web_seeds
         } else {
             let url = Url::parse(token).map_err(|e| format!("Invalid URL '{}': {}", truncate_chars(token, 80), e))?;
-            if !matches!(url.scheme(), "http" | "https") {
-                return Err(format!("Unsupported URL scheme '{}': only http and https can be downloaded", url.scheme()));
+            if !matches!(url.scheme(), "http" | "https" | "ftp") {
+                return Err(format!("Unsupported URL scheme '{}': only http, https and ftp can be downloaded", url.scheme()));
             }
             vec![resolver::unwrap_redirect(&url).unwrap_or(url)]
         };
@@ -572,7 +574,7 @@ fn metalink_tasks(bytes: &[u8]) -> Result<Vec<Task>, String> {
                     .find(|c| crate::storage::validate_checksum(c).is_ok())
             });
             let name = Some(clean_path(file.name.split('/'))?);
-            Ok(Task { name, urls: file.urls, checksum, size: file.size, from_document: true, ..Task::default() })
+            Ok(Task { name, urls: file.urls, checksum, size: file.size, from_document: true, pieces: file.pieces, ..Task::default() })
         })
         .collect()
 }
@@ -664,7 +666,8 @@ mod tests {
 
     #[test]
     fn rejects_non_http_inputs() {
-        assert!(run("ftp://x.example/f").unwrap_err().contains("scheme 'ftp'"));
+        assert!(run("gopher://x.example/f").unwrap_err().contains("scheme 'gopher'"));
+        assert_eq!(run("ftp://x.example/f").unwrap()[0].urls[0].scheme(), "ftp");
         assert!(run("blob:https://www.youtube.com/abc").unwrap_err().contains("blob:"));
         assert!(run("C:\\file.bin").is_err());
         assert!(run("https://a.example/x.torrent https://b.example/y").unwrap_err().contains("on its own"));
@@ -675,7 +678,8 @@ mod tests {
         let task = link("  https://a.com/f.iso\thttp://b.com/f.iso https://a.com/f.iso ").unwrap();
         assert_eq!(task.urls.len(), 2, "duplicates are dropped");
         assert_eq!(link("   ").unwrap_err(), "Enter a download URL");
-        assert!(link("ftp://a.com/f").unwrap_err().contains("scheme"));
+        assert!(link("gopher://a.com/f").unwrap_err().contains("scheme"));
+        assert!(link("ftp://a.com/f").is_ok());
         assert!(link("not a url").unwrap_err().contains("Invalid URL"));
         assert_eq!(link("blob:https://www.youtube.com/x").unwrap_err(), BLOB_MESSAGE);
         assert_eq!(link("https://www.youtube.com/0b9f5e2c-1d3a-4c5e-9f7a-123456789abc").unwrap_err(), BLOB_MESSAGE);

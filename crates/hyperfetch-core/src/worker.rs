@@ -237,6 +237,9 @@ pub struct WorkerShared {
     /// Max wait between body reads once the answer has started. Shorter than `stall_timeout`:
     /// a retry keeps what arrived and starts at once, so a quiet connection is best replaced.
     pub body_idle: Duration,
+    /// Connections the download keeps open (see `DownloadOptions::adaptive`): a worker whose id
+    /// is not below it stops once its attempt ends.
+    pub width: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl WorkerShared {
@@ -315,7 +318,7 @@ impl HttpWorker {
         }
         let s = &self.shared;
         loop {
-            if s.cancel.is_cancelled() {
+            if s.cancel.is_cancelled() || self.worker_id >= s.width.load(Ordering::Relaxed) {
                 return;
             }
             let slot = tokio::select! {
@@ -1012,6 +1015,7 @@ mod tests {
             host_limit: 0,
             stall_timeout: Duration::from_secs(10),
             body_idle: Duration::from_secs(5),
+            width: Arc::new(usize::MAX.into()),
         };
         (HttpWorker::new(0, shared), chunk, rx)
     }
@@ -1431,6 +1435,15 @@ mod tests {
         }
         assert!(racer.all_inactive());
         assert!(chunks.has_fatal_failure().unwrap().1.contains("every mirror failed"));
+    }
+
+    #[tokio::test]
+    async fn test_a_worker_past_the_width_stops_once_its_attempt_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = Url::parse("http://127.0.0.1:9/f").unwrap();
+        let (worker, _, _events) = test_worker(&url, &dir.path().join("f.part"), 1 << 20);
+        worker.shared.width.store(0, Ordering::Relaxed);
+        tokio::time::timeout(Duration::from_secs(5), worker.run(None)).await.expect("the worker stopped");
     }
 
     #[test]

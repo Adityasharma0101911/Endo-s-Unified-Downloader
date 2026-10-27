@@ -36,7 +36,7 @@ use crate::worker::{
 
 /// What a download stopped by [`DownloadEngine::cancel`] fails with.
 pub const CANCELLED: &str = "Download cancelled by user";
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long a client keeps a connection whose request ended, for the next request to its host.
 pub(crate) const POOL_IDLE: Duration = Duration::from_secs(90);
 /// Most connections a client keeps that way per host.
@@ -93,6 +93,14 @@ const MAX_CONNECTIONS: usize = 64;
 /// off is decided by time (see `ChunkManager::steal_work`); this only keeps rates measured over
 /// a few packets from splitting off slivers.
 const MIN_STEAL: u64 = 64 * 1024;
+/// Free space a download leaves on its disk besides the file.
+const DISK_HEADROOM: u64 = 64 * 1024 * 1024;
+/// One more connection is kept when it raises the speed by this factor (see `Ramp`), which
+/// measures over this many times what a new request takes to answer, within these bounds.
+const RAMP_GAIN: f64 = 1.10;
+const RAMP_STARTUPS: u32 = 4;
+const MIN_RAMP_WINDOW: Duration = Duration::from_millis(500);
+const MAX_RAMP_WINDOW: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Default)]
 pub struct EngineSnapshot {
@@ -249,6 +257,16 @@ pub struct DownloadOptions {
     pub gallery_dl: bool,
     /// What happens to the file once downloaded.
     pub post: crate::postprocess::PostOptions,
+    /// A download over ranges adapts its connections as it goes (see `Ramp`): from the number
+    /// the probe chose, one more while that raises its speed by a tenth, and back by one when the
+    /// last one slowed it; never past `num_connections` or what the host takes. Off (the
+    /// default), the connections the probe chose are kept to the end.
+    pub adaptive: bool,
+    /// The largest file downloaded, in bytes: a larger one fails at the probe, or, when the server
+    /// does not tell the size, as soon as more has arrived.
+    pub max_filesize: Option<u64>,
+    /// The finished file takes the date its server gives it (`Last-Modified`, or MDTM over FTP).
+    pub remote_time: bool,
 }
 
 impl Default for DownloadOptions {
@@ -303,6 +321,10 @@ impl Default for DownloadOptions {
             debrid_magnets: true,
             gallery_dl: true,
             post: Default::default(),
+            // Measured on local servers, it made no download faster: see `bench_downloads_from_a_local_server`.
+            adaptive: false,
+            max_filesize: None,
+            remote_time: false,
         }
     }
 }
@@ -363,6 +385,8 @@ pub struct DownloadEngine {
     cancel_token: CancellationToken,
     /// What a MEGA download decrypts what it writes with (see `fetch_mega`).
     decrypt: Option<Arc<crate::mega::Cipher>>,
+    /// How an FTP download's connections are made (see `fetch_ftp`): its ranges go to FTP workers.
+    ftp: Option<Arc<crate::ftp::Net>>,
     /// A file found downloaded already (see `plan_target`): `run` leaves it as it is instead of
     /// post-processing it again.
     already_done: Arc<std::sync::Mutex<Option<PathBuf>>>,
@@ -404,6 +428,7 @@ impl DownloadEngine {
                     cancel_flag: Arc::new(AtomicBool::new(false)),
                     cancel_token: CancellationToken::new(),
                     decrypt: None,
+                    ftp: None,
                     already_done: Arc::default(),
                 },
             },
@@ -421,6 +446,7 @@ impl DownloadEngine {
             cancel_flag: Arc::new(AtomicBool::new(false)),
             cancel_token: CancellationToken::new(),
             decrypt: None,
+            ftp: None,
             already_done: Arc::default(),
         }
     }
@@ -474,8 +500,20 @@ impl DownloadEngine {
         }
         let reused = result.as_ref().is_ok_and(|path| self.already_done.lock().unwrap().as_ref() == Some(path));
         if let (Ok(path), Some(source), false) = (&result, self.urls.first(), reused) {
+            // Post-processing writes to the file (its mark of the web does): the server's date the
+            // download gave it (see `DownloadOptions::remote_time`) is given again after.
+            let dated = if self.options.remote_time {
+                let path = path.clone();
+                blocking(move || std::fs::metadata(path).and_then(|m| m.modified()).ok()).await.ok().flatten()
+            } else {
+                None
+            };
             let (post, proxy, password) = (&self.options.post, self.options.proxy.as_deref(), self.options.password.as_deref());
             let done = crate::postprocess::after_download(path, post, source, proxy, password).await;
+            if let Some(time) = dated {
+                let path = done.path.clone();
+                let _ = blocking(move || File::options().write(true).open(path).and_then(|f| f.set_modified(time))).await;
+            }
             if !done.notes.is_empty() {
                 let size = crate::postprocess::size_of(&done.path);
                 emit(&snapshot_tx, || EngineSnapshot { notes: done.notes, ..done_snapshot(size, &done.path) });
@@ -499,6 +537,10 @@ impl DownloadEngine {
         if self.options.bittorrent {
             let source = self.urls.first().ok_or("No URLs to download")?;
             return self.unless_rerun(crate::p2p::run(source, &self.options, &self.save_dir(), snapshot_tx, self.cancel_token.clone()).await);
+        }
+
+        if self.urls.first().is_some_and(crate::ftp::handles) {
+            return Box::pin(self.fetch_ftp(client, snapshot_tx)).await;
         }
 
         // A playlist the page built itself: the link is only the base of its URIs.
@@ -708,6 +750,39 @@ impl DownloadEngine {
             engine.download(client, probed, snapshot_tx).await
         };
         fetched.await.map_err(|e| if e.contains("HTTP 509") { crate::mega::QUOTA.to_string() } else { e })
+    }
+
+    /// Downloads the file of the engine's ftp:// links (see `crate::ftp`): each link is asked for
+    /// the file's size and date, and those serving the same file download it over ranges, as
+    /// mirrors of an HTTP file do, through FTP workers. The links go on without the logins they
+    /// carry, which only `crate::ftp::Net` keeps: no password reaches the state or the history.
+    async fn fetch_ftp(&self, client: Client, snapshot_tx: Option<broadcast::Sender<EngineSnapshot>>) -> Result<PathBuf, String> {
+        let (net, links) = crate::ftp::Net::new(&self.options, &self.urls)?;
+        let probe = |url: &Url| {
+            let (net, url) = (&net, url.clone());
+            async move {
+                let (size, last_modified) = net.probe(&url).await?;
+                let size = size.ok_or_else(|| format!("{url}: the FTP server does not tell the file's size"))?;
+                let filename = extract_filename(std::iter::empty(), &url);
+                Ok(ProbeInfo {
+                    final_url: url.clone(),
+                    url,
+                    size: Some(size),
+                    accepts_ranges: true,
+                    filename,
+                    etag: None,
+                    last_modified,
+                    prefetch: Bytes::new(),
+                    per_setup: None,
+                    answer_time: None,
+                    headers: HeaderMap::new(),
+                })
+            }
+        };
+        let probes = futures_util::future::join_all(links.iter().map(probe));
+        let (reference, mirrors) = select_mirrors(self.guarded(PROBE_TIMEOUT, "asking the FTP server for the file", probes).await?)?;
+        let engine = Self { urls: links, ftp: Some(Arc::new(net)), ..self.clone() };
+        engine.download(client, Probed { reference, mirrors, live: None, late: None }, snapshot_tx).await
     }
 
     /// Downloads the DASH manifest `manifest` with yt-dlp, which picks and merges its video and
@@ -1391,6 +1466,11 @@ impl DownloadEngine {
         snapshot_tx: Option<broadcast::Sender<EngineSnapshot>>,
     ) -> Result<PathBuf, String> {
         let Probed { reference, mirrors, live, late } = probed;
+        if let (Some(max), Some(size)) = (self.options.max_filesize, reference.size) {
+            if size > max {
+                return Err(too_large(max, Some(size)));
+            }
+        }
         // Mirrors answering late only join a download over ranges: otherwise their probes, and
         // the host slots they hold, are given up now.
         let late = late.filter(|_| reference.accepts_ranges && reference.size != Some(reference.prefetch.len() as u64));
@@ -1441,6 +1521,15 @@ impl DownloadEngine {
             tracing::info!("Resuming {} with {} completed range(s)", part.display(), previous.completed_ranges.len());
             state.completed_ranges = previous.completed_ranges;
         }
+        // A download that would fill its disk fails before it starts.
+        if let Some(size) = reference.size {
+            let have: u64 = crate::range::merge_ranges(state.completed_ranges.clone()).iter().map(ByteRange::len).sum();
+            let needs = size.saturating_sub(have).saturating_add(DISK_HEADROOM);
+            let dir = final_path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new(".")).to_path_buf();
+            if let Some(free) = blocking(move || crate::media::free_space(&dir)).await?.filter(|&free| free < needs) {
+                return Err(format!("Not enough disk space: needs {}, {} free", size_text(needs), size_text(free)));
+            }
+        }
         let mut prefetched = reference.prefetch.clone();
         if let Some(cipher) = &self.decrypt {
             let mut start = prefetched.to_vec();
@@ -1464,6 +1553,7 @@ impl DownloadEngine {
             mirrors.len(),
             reference.accepts_ranges
         );
+        let modified = reference.last_modified.clone().filter(|_| self.options.remote_time);
         let written = match reference.size {
             // A plain write (no sparse file, no preallocation, no flush unless fsync_on_complete
             // asks for one in `finalize`), hashed from memory.
@@ -1493,7 +1583,12 @@ impl DownloadEngine {
             }
             _ => Written::Digest(self.fetch_stream(&client, &reference, live, &part, &final_path, &snapshot_tx).await?),
         };
-        this.finalize(final_path, claim, written, started_at, &snapshot_tx).await
+        let done = this.finalize(final_path, claim, written, started_at, &snapshot_tx).await?;
+        if let Some(modified) = modified {
+            let path = done.clone();
+            blocking(move || set_remote_time(&path, &modified)).await?;
+        }
+        Ok(done)
     }
 
     /// Multi-connection download of a file whose size is known and whose server honours ranges.
@@ -1606,6 +1701,14 @@ impl DownloadEngine {
             host_limit: self.options.max_connections_per_host,
             stall_timeout: self.stall_timeout(),
             body_idle: self.stall_timeout().min(BODY_IDLE),
+            width: Arc::new(num_workers.into()),
+        };
+        // An FTP download's workers fetch over FTP (see `crate::ftp::work`).
+        let spawn = |workers: &mut JoinSet<()>, worker_id: usize, shared: &WorkerShared| {
+            match &self.ftp {
+                Some(net) => workers.spawn(crate::ftp::work(worker_id, shared.clone(), Arc::clone(net))),
+                None => workers.spawn(HttpWorker::new(worker_id, shared.clone()).run(None)),
+            };
         };
         let mut workers = JoinSet::new();
         let seeded = seed.is_some() as usize;
@@ -1613,9 +1716,16 @@ impl DownloadEngine {
             workers.spawn(HttpWorker::new(0, shared.clone()).run(Some(seed)));
         }
         for worker_id in seeded..num_workers {
-            workers.spawn(HttpWorker::new(worker_id, shared.clone()).run(None));
+            spawn(&mut workers, worker_id, &shared);
         }
-        drop(shared);
+        let width = Arc::clone(&shared.width);
+        // A speed limit holds every width to the same speed.
+        let mut ramp = (self.options.adaptive && self.limiter.is_none())
+            .then(|| Ramp::new(num_workers, max_workers as usize, Instant::now(), job.chunks.lock().total_downloaded()))
+            .filter(|ramp| !ramp.done);
+        // What the workers the ramp adds share, kept only while it may add one: the download
+        // notices that its workers all stopped once nothing else holds it.
+        let mut spare = ramp.is_some().then_some(shared);
 
         let mut tick = tokio::time::interval(SNAPSHOT_INTERVAL);
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -1644,6 +1754,19 @@ impl DownloadEngine {
                 },
                 _ = tick.tick() => {
                     emit(snapshot_tx, || job.snapshot(size, &mut meter, final_path));
+                    if let Some(next) = ramp.as_mut().and_then(|ramp| job.ramp(ramp)) {
+                        // Workers past a lower width stop once their attempt ends.
+                        let was = width.swap(next, Ordering::Relaxed);
+                        if let Some(shared) = &spare {
+                            for worker_id in was..next {
+                                spawn(&mut workers, worker_id, shared);
+                            }
+                        }
+                        tracing::info!("Going on with {} connection(s)", next);
+                    }
+                    if ramp.as_ref().is_some_and(|ramp| ramp.done) {
+                        (ramp, spare) = (None, None);
+                    }
                     if last_persist.elapsed() >= PERSIST_INTERVAL {
                         if let Err(e) = job.persist().await {
                             tracing::warn!("Failed to save resume state: {}", e);
@@ -1660,7 +1783,7 @@ impl DownloadEngine {
         // would leave its blocking write running on its own.
         stop.cancel();
         // Probes still out are given up, and the host slots they hold with them.
-        drop((events, late));
+        drop((events, late, spare));
         while workers.join_next().await.is_some() {}
 
         match outcome {
@@ -1827,6 +1950,9 @@ impl DownloadEngine {
                     written += bytes.len() as u64;
                     if remote.size.is_some_and(|size| written > size) {
                         return Err((FailureKind::Fatal, "remote file changed: server sent more data than expected".to_string()));
+                    }
+                    if let Some(max) = self.options.max_filesize.filter(|&max| written > max) {
+                        return Err((FailureKind::Fatal, too_large(max, None)));
                     }
                     out = out.push(&bytes).await.map_err(disk_error)?;
                 }
@@ -2348,6 +2474,18 @@ impl RangeJob {
         }
     }
 
+    /// The width `ramp` moves an adaptive download to, if it moves (see [`Ramp::next`]); call it
+    /// every few hundred milliseconds.
+    fn ramp(&self, ramp: &mut Ramp) -> Option<usize> {
+        let (downloaded, size) = {
+            let chunks = self.chunks.lock();
+            (chunks.total_downloaded(), chunks.total_size())
+        };
+        // What a new request takes to answer: the least of the mirrors in use.
+        let startup = self.mirrors.lock().mirrors().iter().filter(|m| m.in_flight > 0).map(crate::mirror::Mirror::ttfb).min();
+        ramp.next(Instant::now(), downloaded, size.saturating_sub(downloaded), startup.unwrap_or_default())
+    }
+
     /// Adds the mirror a probe that came in after the download started found, if it serves the
     /// file `reference` describes, and keeps its URL for a resume.
     fn admit(&mut self, probe: Result<ProbeInfo, String>, reference: &ProbeInfo) {
@@ -2437,6 +2575,70 @@ impl SpeedMeter {
             self.last_at = now;
         }
         self.speed
+    }
+}
+
+/// Grows a download's connections one at a time while each one more raises its speed by
+/// `RAMP_GAIN`, and takes back the last one when the download slowed after it came: the server
+/// or the link has more connections then than it serves well (see `DownloadOptions::adaptive`).
+/// Speeds are measured over windows of `RAMP_STARTUPS` times what a new request takes to answer;
+/// the first window, which the connections spend starting, is not compared.
+struct Ramp {
+    width: usize,
+    max: usize,
+    /// When the window being measured began, and the bytes downloaded then.
+    began: (Instant, u64),
+    /// How fast the last window went, in bytes per second.
+    speed: Option<f64>,
+    /// How fast the window before the connection on trial went.
+    trial: Option<f64>,
+    /// No more connections are tried: the last did not pay, or too little is left to try one.
+    done: bool,
+}
+
+impl Ramp {
+    fn new(width: usize, max: usize, now: Instant, downloaded: u64) -> Self {
+        Self { width, max, began: (now, downloaded), speed: None, trial: None, done: width >= max }
+    }
+
+    /// The width to go on at, when it changes, with `downloaded` bytes in at `now` and `left` to
+    /// come; `startup` is what a new request takes to answer.
+    fn next(&mut self, now: Instant, downloaded: u64, left: u64, startup: Duration) -> Option<usize> {
+        let window = startup.saturating_mul(RAMP_STARTUPS).clamp(MIN_RAMP_WINDOW, MAX_RAMP_WINDOW);
+        let (began, from) = self.began;
+        let elapsed = now.saturating_duration_since(began);
+        if elapsed < window {
+            return None;
+        }
+        self.began = (now, downloaded);
+        let speed = downloaded.saturating_sub(from) as f64 / elapsed.as_secs_f64();
+        let first = self.speed.replace(speed).is_none();
+        if self.done || first {
+            return None;
+        }
+        if let Some(before) = self.trial.take() {
+            if speed < before {
+                self.done = true;
+                self.width -= 1;
+                return Some(self.width);
+            }
+            if speed < before * RAMP_GAIN {
+                self.done = true;
+                return None;
+            }
+        }
+        // Nothing moved: nothing to compare one more with.
+        if speed <= 0.0 {
+            return None;
+        }
+        // One more, if it has the time to show what it brings.
+        if self.width >= self.max || (left as f64) < 3.0 * speed * window.as_secs_f64() {
+            self.done = true;
+            return None;
+        }
+        self.trial = Some(speed);
+        self.width += 1;
+        Some(self.width)
     }
 }
 
@@ -3954,6 +4156,37 @@ pub(crate) fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let doy = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     era * 146_097 + doe - 719_468
+}
+
+/// Gives the file at `path` the date `http_date` (see [`DownloadOptions::remote_time`]). A date
+/// that cannot be read or set is only logged: the file is there all the same. Blocking.
+fn set_remote_time(path: &Path, http_date: &str) {
+    let Some(secs) = parse_http_date(http_date) else {
+        tracing::warn!("Keeping the date of {}: the server's {:?} cannot be read", path.display(), http_date);
+        return;
+    };
+    let set = File::options().write(true).open(path).and_then(|f| f.set_modified(UNIX_EPOCH + Duration::from_secs(secs)));
+    if let Err(e) = set {
+        tracing::warn!("Cannot give {} the server's date: {}", path.display(), e);
+    }
+}
+
+/// What a download larger than `DownloadOptions::max_filesize` fails with; `size` when known.
+fn too_large(max: u64, size: Option<u64>) -> String {
+    let size = size.map(|size| format!(" ({})", size_text(size))).unwrap_or_default();
+    format!("File is larger than the limit of {}{size}", size_text(max))
+}
+
+/// `bytes` for a message: "900 bytes", "1.5 MiB".
+fn size_text(bytes: u64) -> String {
+    let (mut value, mut unit) = (bytes as f64, 0);
+    while value >= 1024.0 && unit < 4 {
+        (value, unit) = (value / 1024.0, unit + 1);
+    }
+    match unit {
+        0 => format!("{bytes} bytes"),
+        _ => format!("{value:.1} {}", ["KiB", "MiB", "GiB", "TiB"][unit - 1]),
+    }
 }
 
 #[cfg(test)]
@@ -5688,6 +5921,205 @@ mod tests {
             }
         });
         base
+    }
+
+    /// A file server (see `file_server`) whose host is known not to cap a connection's speed: the
+    /// probe then gives each connection a MiB of the file, which leaves a small file's download
+    /// room for more.
+    async fn uncapped_file_server(data: Vec<u8>, pace: Duration) -> Url {
+        let base = file_server(data, pace).await;
+        hosts::record(&base, HostProfile { capped_per_connection: Some(false), ..Default::default() });
+        base
+    }
+
+    /// Not a test: how long downloads from a local server take with `adaptive` off and on, by size
+    /// and pace, each from a host seen for the first time.
+    /// `cargo test -p hyperfetch-core --lib bench_ -- --ignored --nocapture`
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn bench_downloads_from_a_local_server() {
+        const MIB: usize = 1024 * 1024;
+        for (label, size, pace, uncapped) in [
+            ("256 KiB", MIB / 4, Duration::ZERO, false),
+            ("3 MiB", 3 * MIB, Duration::ZERO, false),
+            ("32 MiB", 32 * MIB, Duration::ZERO, false),
+            ("8 MiB, 3.2 MB/s per connection", 8 * MIB, Duration::from_millis(20), false),
+            ("5 MiB, 330 KB/s per connection, host known uncapped", 5 * MIB, Duration::from_millis(200), true),
+        ] {
+            let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+            let mut times = [Vec::new(), Vec::new()];
+            for _ in 0..5 {
+                for adaptive in [false, true] {
+                    let base = if uncapped { uncapped_file_server(data.clone(), pace).await } else { file_server(data.clone(), pace).await };
+                    let dir = tempdir().unwrap();
+                    let options = DownloadOptions { output_path: Some(dir.path().join("f.bin")), adaptive, ..Default::default() };
+                    let started = Instant::now();
+                    DownloadEngine::new(vec![base.join("f.bin").unwrap()], options).run(None).await.unwrap();
+                    times[adaptive as usize].push(started.elapsed());
+                }
+            }
+            for (times, mode) in times.iter_mut().zip(["fixed", "adaptive"]) {
+                times.sort();
+                println!("{label}, {mode}: median {:?} (min {:?}, max {:?})", times[2], times[0], times[4]);
+            }
+        }
+    }
+
+    /// An adaptive download opens one more connection while that pays; a fixed one keeps to the
+    /// connections the probe chose (five here: one per MiB).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_an_adaptive_download_adds_a_connection_that_pays() {
+        const MIB: usize = 1024 * 1024;
+        let data: Vec<u8> = (0..5 * MIB).map(|i| (i % 251) as u8).collect();
+        let dir = tempdir().unwrap();
+        let fetch = |adaptive: bool| {
+            let (data, dir) = (data.clone(), dir.path().to_path_buf());
+            async move {
+                // 64 KiB per 200 ms on each connection: more connections, more speed.
+                let base = uncapped_file_server(data, Duration::from_millis(200)).await;
+                let options = DownloadOptions { output_path: Some(dir.join(format!("{adaptive}.bin"))), num_connections: 16, adaptive, ..Default::default() };
+                let path = DownloadEngine::new(vec![base.join("f.bin").unwrap()], options).run(None).await.unwrap();
+                (path, hosts::peak(&base))
+            }
+        };
+        let ((fixed, fixed_peak), (adapted, adapted_peak)) = tokio::join!(fetch(false), fetch(true));
+        assert_eq!(std::fs::read(fixed).unwrap(), data);
+        assert_eq!(std::fs::read(adapted).unwrap(), data);
+        assert_eq!(fixed_peak, 5);
+        assert!(adapted_peak > 5, "{adapted_peak}");
+    }
+
+    /// A ramp measures windows of four times a new request's startup, the first of them only to
+    /// start from; adds a connection while each one more raised the speed by a tenth, up to its
+    /// most; keeps one that did not raise it enough, and takes back one after which the speed
+    /// fell; and adds none with too little left for one to show what it brings.
+    #[test]
+    fn test_a_ramp_adds_connections_while_they_pay() {
+        const MB: u64 = 1_000_000;
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let (left, startup) = (100 * MB, Duration::from_millis(100));
+
+        let mut ramp = Ramp::new(2, 4, t0, 0);
+        assert_eq!(ramp.next(at(400), MB, left, startup), None, "windows are at least 500 ms");
+        assert_eq!(ramp.next(at(500), MB, left, startup), None, "the first window is the start");
+        assert_eq!(ramp.next(at(1000), 2 * MB, left, startup), Some(3));
+        assert_eq!(ramp.next(at(1500), 3_500_000, left, startup), Some(4), "+50%");
+        assert_eq!(ramp.next(at(2000), 5_500_000, left, startup), None, "never past its most");
+        assert!(ramp.done);
+
+        let mut ramp = Ramp::new(2, 8, t0, 0);
+        ramp.next(at(500), MB, left, startup);
+        assert_eq!(ramp.next(at(1000), 2 * MB, left, startup), Some(3));
+        assert_eq!(ramp.next(at(1500), 3_050_000, left, startup), None, "+5%: kept, and no more tried");
+        assert!(ramp.done);
+
+        let mut ramp = Ramp::new(2, 8, t0, 0);
+        ramp.next(at(500), MB, left, startup);
+        assert_eq!(ramp.next(at(1000), 2 * MB, left, startup), Some(3));
+        assert_eq!(ramp.next(at(1500), 2_500_000, left, startup), Some(2), "slower: taken back");
+        assert_eq!(ramp.next(at(5000), 9 * MB, left, startup), None, "for good");
+
+        let slow = Duration::from_secs(1);
+        let mut ramp = Ramp::new(1, 8, t0, 0);
+        assert_eq!(ramp.next(at(3999), MB, left, slow), None, "four startups make a window");
+        ramp.next(at(4000), MB, left, slow);
+        assert_eq!(ramp.next(at(8000), 2 * MB, 2 * MB, slow), None, "2 MB left at 250 kB/s");
+        assert!(ramp.done);
+        assert!(Ramp::new(8, 8, t0, 0).done, "nothing to add");
+    }
+
+    /// A local server answering each request with what `reply` makes of its head (lowercased): a
+    /// raw HTTP answer, of which a HEAD request gets the head only.
+    async fn answering_server(reply: impl Fn(&str) -> String + Send + Sync + 'static) -> Url {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = crate::hosts::unseen_listener().await;
+        let base = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let reply = Arc::new(reply);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let reply = Arc::clone(&reply);
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => head.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
+                    let mut answer = reply(&head);
+                    if head.starts_with("head ") {
+                        answer.truncate(answer.find("\r\n\r\n").map_or(answer.len(), |at| at + 4));
+                    }
+                    let _ = socket.write_all(answer.as_bytes()).await;
+                });
+            }
+        });
+        base
+    }
+
+    /// A file larger than `max_filesize` fails at the probe when its server tells its size, and
+    /// once more than that has arrived when it does not. One of the limit's size is let through.
+    #[tokio::test]
+    async fn test_a_file_over_the_size_limit_fails() {
+        let body = "x".repeat(300 * 1024);
+        let told = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        let chunks: String = body.as_bytes().chunks(64 * 1024).map(|c| format!("{:x}\r\n{}\r\n", c.len(), String::from_utf8_lossy(c))).collect();
+        let untold = format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{chunks}0\r\n\r\n");
+        for (answer, expected) in [(told, "File is larger than the limit of 100.0 KiB (300.0 KiB)"), (untold, "File is larger than the limit of 100.0 KiB")] {
+            let dir = tempdir().unwrap();
+            let fetch = |max: u64| {
+                let answer = answer.clone();
+                let options = DownloadOptions { output_path: Some(dir.path().join("f.bin")), max_filesize: Some(max), ..Default::default() };
+                async move {
+                    let url = answering_server(move |_| answer.clone()).await.join("f.bin").unwrap();
+                    DownloadEngine::new(vec![url], options).run(None).await
+                }
+            };
+            let error = fetch(100 * 1024).await.unwrap_err();
+            assert!(error.starts_with(expected), "{error}");
+            assert!(!dir.path().join("f.bin").exists());
+            let path = fetch(300 * 1024).await.unwrap();
+            assert_eq!(std::fs::read(path).unwrap(), body.as_bytes());
+        }
+    }
+
+    /// With `remote_time` the file takes its server's Last-Modified; without, it keeps its own.
+    #[tokio::test]
+    async fn test_remote_time_dates_the_file_as_its_server_does() {
+        let dir = tempdir().unwrap();
+        for remote_time in [true, false] {
+            let answer = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nLast-Modified: Sun, 06 Nov 1994 08:49:37 GMT\r\nConnection: close\r\n\r\ndata";
+            let url = answering_server(move |_| answer.to_string()).await.join("f.bin").unwrap();
+            let options = DownloadOptions { output_path: Some(dir.path().join(format!("{remote_time}.bin"))), remote_time, ..Default::default() };
+            let path = DownloadEngine::new(vec![url], options).run(None).await.unwrap();
+            let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+            assert_eq!(modified == UNIX_EPOCH + Duration::from_secs(784_111_777), remote_time);
+        }
+    }
+
+    /// A download larger than the free space on its disk fails before anything is written.
+    #[tokio::test]
+    async fn test_a_download_larger_than_the_free_space_fails_at_once() {
+        let dir = tempdir().unwrap();
+        let huge = crate::media::free_space(dir.path()).unwrap() + (1 << 30);
+        let url = answering_server(move |head| match head {
+            h if h.starts_with("head ") => format!("HTTP/1.1 200 OK\r\nContent-Length: {huge}\r\nAccept-Ranges: bytes\r\nETag: \"v1\"\r\n\r\n"),
+            h if h.contains("range: bytes=0-") => {
+                format!("HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-0/{huge}\r\nContent-Length: 1\r\nETag: \"v1\"\r\nConnection: close\r\n\r\nx")
+            }
+            // Never asked: the download stops before.
+            _ => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+        })
+        .await
+        .join("f.bin")
+        .unwrap();
+        let options = DownloadOptions { output_path: Some(dir.path().join("f.bin")), ..Default::default() };
+        let error = DownloadEngine::new(vec![url], options).run(None).await.unwrap_err();
+        assert!(error.starts_with("Not enough disk space"), "{error}");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0, "nothing written");
     }
 
     #[tokio::test]
