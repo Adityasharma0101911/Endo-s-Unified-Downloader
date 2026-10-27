@@ -30,19 +30,44 @@ pub struct Launch {
 
 impl Launch {
     /// Reads the arguments after the program's name; any other is ignored, and an `endo-dl:`
-    /// link only starts the app: its text is never read.
+    /// link only starts the app: its text is never read, nor anything after it.
     pub fn parse(args: impl IntoIterator<Item = OsString>) -> Self {
         let mut launch = Self::default();
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
             let text = arg.to_string_lossy();
-            if text == "--minimized" || text.get(..8).is_some_and(|scheme| scheme.eq_ignore_ascii_case("endo-dl:")) {
+            let link = text.get(..8).is_some_and(|scheme| scheme.eq_ignore_ascii_case("endo-dl:"));
+            if text == "--minimized" || link {
                 launch.minimized = true;
             } else if text == "--data-dir" {
                 launch.data_dir = args.next().map(PathBuf::from);
             }
+            // The link comes last (see `protocol_entries`): what follows is its own text, split
+            // where it held a `"`, and could otherwise name a data folder.
+            if link {
+                break;
+            }
         }
         launch
+    }
+}
+
+/// Whether this copy registers the `endo-dl:` link: not a portable one, nor one started with
+/// `ENDO_HISTORY_PATH` set (a test or development run), as their data is elsewhere. Asked before
+/// `main` sets that variable for a portable copy.
+pub fn takes_links(portable: bool) -> bool {
+    !portable && std::env::var_os("ENDO_HISTORY_PATH").is_none()
+}
+
+/// Locks the data folder `dir` for this app (its `instance.lock`, while the file is open), so
+/// that two started at once never both run on it; None while another copy holds it.
+pub fn lock_instance(dir: &Path) -> io::Result<Option<File>> {
+    std::fs::create_dir_all(dir)?;
+    let file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(dir.join("instance.lock"))?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(e)) => Err(e),
     }
 }
 
@@ -308,8 +333,10 @@ pub fn minute_of(text: &str) -> Option<u16> {
 /// What the schedule does as the local time moves from `last` to `now` (the day of the week,
 /// Monday 0, and the minute of the day): `Some(true)` starts the queue, at its start time on a
 /// ticked day; `Some(false)` pauses it, at its stop time on any day (so that a night begun on a
-/// ticked day ends). When both came, the later wins. A first check (no `last`) takes only the
-/// minute it is on, and a minute is never taken twice.
+/// ticked day ends). When both came, the later wins. A first check (no `last`: at launch, or the
+/// schedule just turned on) starts the queue inside the time it runs (see `inside`), whose
+/// start may have come while the app was not running; else it takes only the minute it is on.
+/// A minute is never taken twice.
 pub fn schedule_due(schedule: &Schedule, last: Option<(u8, u16)>, now: (u8, u16)) -> Option<bool> {
     if !schedule.enabled {
         return None;
@@ -318,6 +345,7 @@ pub fn schedule_due(schedule: &Schedule, last: Option<(u8, u16)>, now: (u8, u16)
         Some((day, minute)) if day == now.0 => minute + 1,
         // A new day: since its midnight.
         Some(_) => 0,
+        None if inside(schedule, now) => return Some(true),
         None => now.1,
     };
     let came = |at: &Option<String>| at.as_deref().and_then(minute_of).filter(|at| (from..=now.1).contains(at));
@@ -325,6 +353,18 @@ pub fn schedule_due(schedule: &Schedule, last: Option<(u8, u16)>, now: (u8, u16)
     match (start, came(&schedule.stop)) {
         (Some(start), Some(stop)) => Some(start > stop),
         (start, stop) => start.map(|_| true).or(stop.map(|_| false)),
+    }
+}
+
+/// Whether `now` is between the start time of a ticked day and the stop time after it (that
+/// day's end when there is none), a night running into the next day.
+fn inside(schedule: &Schedule, (day, minute): (u8, u16)) -> bool {
+    let Some(start) = schedule.start.as_deref().and_then(minute_of) else { return false };
+    let ticked = |day: u8| schedule.days[usize::from(day) % 7];
+    match schedule.stop.as_deref().and_then(minute_of) {
+        Some(stop) if stop < start => (minute >= start && ticked(day)) || (minute < stop && ticked((day + 6) % 7)),
+        Some(stop) => (start..stop).contains(&minute) && ticked(day),
+        None => minute >= start && ticked(day),
     }
 }
 
@@ -424,6 +464,27 @@ mod tests {
         assert!(parse(&["ENDO-DL:open"]).minimized);
         assert_eq!(parse(&["--data-dir", "D:\\Endo data", "--other"]), Launch { minimized: false, data_dir: Some("D:\\Endo data".into()) });
         assert_eq!(parse(&["--data-dir"]).data_dir, None);
+        // A `"` in a link splits it into more arguments: none of them is read.
+        assert_eq!(parse(&["--minimized", "endo-dl:x", "--data-dir", "D:\\x"]), Launch { minimized: true, data_dir: None });
+    }
+
+    /// A portable copy, or a run with a history file of its own (as tests have), leaves the
+    /// `endo-dl:` link to the installed app.
+    #[test]
+    fn only_the_installed_app_takes_endo_dl_links() {
+        crate::tests::isolate_history();
+        assert!(!takes_links(true));
+        assert!(!takes_links(false), "ENDO_HISTORY_PATH is set");
+    }
+
+    /// One app holds a data folder at a time; once it ends, the next one may.
+    #[test]
+    fn one_app_holds_a_data_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = lock_instance(&dir.path().join("data")).unwrap().expect("the folder is free");
+        assert!(lock_instance(&dir.path().join("data")).unwrap().is_none(), "the first holds it");
+        drop(first);
+        assert!(lock_instance(&dir.path().join("data")).unwrap().is_some(), "free again");
     }
 
     #[test]
@@ -519,12 +580,22 @@ mod tests {
         let mut days = [false; 7];
         days[0] = true;
         let schedule = Schedule { enabled: true, start: Some("22:00".into()), stop: Some("06:30".into()), days };
-        let (monday, tuesday) = (0, 1);
+        let (monday, tuesday, wednesday) = (0, 1, 2);
         assert_eq!(schedule_due(&schedule, None, (monday, 22 * 60)), Some(true));
         assert_eq!(schedule_due(&schedule, Some((monday, 22 * 60)), (monday, 22 * 60)), None, "a minute is taken once");
         assert_eq!(schedule_due(&schedule, Some((monday, 21 * 60 + 58)), (monday, 22 * 60 + 3)), Some(true), "a late check");
-        assert_eq!(schedule_due(&schedule, None, (monday, 22 * 60 + 1)), None, "a first check takes its own minute only");
+        // A first check (a launch) inside the night starts it, its start having come before.
+        assert_eq!(schedule_due(&schedule, None, (monday, 22 * 60 + 1)), Some(true));
+        assert_eq!(schedule_due(&schedule, None, (tuesday, 3 * 60)), Some(true), "the night begun on Monday");
+        assert_eq!(schedule_due(&schedule, None, (tuesday, 7 * 60)), None, "a first check takes its own minute only");
+        assert_eq!(schedule_due(&schedule, None, (tuesday, 6 * 60 + 30)), Some(false));
+        assert_eq!(schedule_due(&schedule, None, (wednesday, 3 * 60)), None, "Tuesday's night is not ticked");
         assert_eq!(schedule_due(&schedule, None, (tuesday, 22 * 60)), None, "Tuesday is not ticked");
+        let day = Schedule { start: Some("08:00".into()), stop: Some("18:00".into()), days: [true; 7], ..schedule.clone() };
+        assert_eq!(schedule_due(&day, None, (tuesday, 12 * 60)), Some(true));
+        assert_eq!(schedule_due(&day, None, (tuesday, 19 * 60)), None);
+        assert_eq!(schedule_due(&Schedule { stop: None, ..day.clone() }, None, (tuesday, 23 * 60)), Some(true), "no stop: until midnight");
+        assert_eq!(schedule_due(&Schedule { start: None, ..day }, None, (tuesday, 12 * 60)), None, "nothing to start");
         assert_eq!(schedule_due(&schedule, Some((monday, 23 * 60)), (tuesday, 6 * 60 + 31)), Some(false), "the night ends on any day");
         assert_eq!(schedule_due(&schedule, Some((tuesday, 6 * 60 + 31)), (tuesday, 7 * 60)), None);
         let both = Schedule { start: Some("06:00".into()), stop: Some("06:10".into()), ..schedule.clone() };

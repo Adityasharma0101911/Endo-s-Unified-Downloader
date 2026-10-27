@@ -444,7 +444,9 @@ fn keys(text: &str) -> std::borrow::Cow<'_, str> {
 /// and contents together; a theme switch cross-fades the colors.
 pub fn render(app: &mut App, ctx: &egui::Context) {
     ctx.set_theme(theme_preference(app.settings.theme));
-    anim::set_reduced(ctx, app.settings.reduces_motion());
+    // Hidden in the tray nothing is seen, so nothing moves: on macOS and Linux a hidden window
+    // still gets the frames motion asks for.
+    anim::set_reduced(ctx, app.settings.reduces_motion() || app.hidden);
     follow_theme(ctx);
     shortcuts(app, ctx);
     sidebar(app, ctx);
@@ -641,7 +643,8 @@ mod tests {
     }
 
     /// A running download keeps frames coming while it shows, in the queue or on its own page;
-    /// none while another page shows or the window is minimized, and none once it is done.
+    /// none while another page shows or the window is minimized or hidden in the tray, and none
+    /// once it is done.
     #[test]
     fn a_running_download_asks_for_frames_only_while_it_shows() {
         let mut h = Harness::new();
@@ -655,6 +658,11 @@ mod tests {
         assert_eq!(h.frames(40), Duration::MAX, "minimized");
         h.minimized = false;
         assert!(h.frames(2) <= SOON, "restored");
+        // A window hidden in the tray keeps its size and is not minimized on macOS and Linux.
+        h.app.hide_window();
+        assert_eq!(h.frames(40), Duration::MAX, "hidden");
+        h.app.show_window();
+        assert!(h.frames(2) <= SOON, "shown");
         h.click("Settings");
         h.leave();
         assert_eq!(h.frames(40), Duration::MAX, "out of sight");
