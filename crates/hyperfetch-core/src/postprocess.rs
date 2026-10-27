@@ -54,7 +54,7 @@ const RUN_AFTER_LIMIT: Duration = Duration::from_secs(600);
 /// Archive extensions tar unpacks, longest first so `.tar.gz` wins over a bare `.gz`.
 const ARCHIVES: &[&str] = &[".tar.gz", ".tar.xz", ".tar.bz2", ".tgz", ".txz", ".tbz2", ".tar", ".zip", ".7z", ".rar"];
 
-/// The folders [`sort`] moves files into, by extension.
+/// The folders [`sort`] moves files into, by extension, unless [`set_categories`] gave others.
 const CATEGORIES: &[(&str, &[&str])] = &[
     ("Video", &["mp4", "mkv", "webm", "avi", "mov", "wmv", "flv", "m4v", "ts", "mpg", "mpeg", "3gp"]),
     ("Music", &["mp3", "m4a", "flac", "wav", "ogg", "opus", "aac", "wma", "aiff", "alac"]),
@@ -63,6 +63,36 @@ const CATEGORIES: &[(&str, &[&str])] = &[
     ("Archives", &["zip", "7z", "rar", "tar", "gz", "tgz", "xz", "bz2", "zst", "iso"]),
     ("Programs", &["exe", "msi", "msix", "appx", "dmg", "pkg", "deb", "rpm", "apk", "appimage", "elf"]),
 ];
+
+/// A folder sorting moves files into: the folder `name` of the save folder, or `folder` when
+/// set (relative to the save folder, or absolute); it takes the files with one of `extensions`
+/// (lower case, without the dot).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Category {
+    pub name: String,
+    pub extensions: Vec<String>,
+    pub folder: Option<PathBuf>,
+}
+
+/// The categories [`set_categories`] gave; None sorts by [`CATEGORIES`].
+static CHOSEN: std::sync::RwLock<Option<Vec<Category>>> = std::sync::RwLock::new(None);
+
+/// Sorting in this process uses `categories` from now on instead of [`default_categories`]: the
+/// first that takes a file's extension wins. The GUI sets its user's; the command line never
+/// calls it.
+pub fn set_categories(categories: Vec<Category>) {
+    *CHOSEN.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(categories);
+}
+
+/// The built-in categories: Video, Music, Pictures, Documents, Archives and Programs, each a
+/// folder of the save folder.
+pub fn default_categories() -> Vec<Category> {
+    CATEGORIES
+        .iter()
+        .map(|(name, extensions)| Category { name: name.to_string(), extensions: extensions.iter().map(|e| e.to_string()).collect(), folder: None })
+        .collect()
+}
 
 /// Post-processes the download at `path` (a file or a folder) of `source` as `post` says; the
 /// VirusTotal lookup goes through `proxy`, as the download did. An archive is opened with
@@ -115,7 +145,8 @@ fn on_disk(mut path: PathBuf, post: &PostOptions, source: &Url, hash: bool, pass
         }
     }
     if post.sort && path.is_file() {
-        match sort(&path) {
+        let chosen = CHOSEN.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        match sort(&path, &chosen.unwrap_or_else(default_categories)) {
             Ok(Some(moved)) => {
                 moved_in_history(&path, &moved);
                 path = moved;
@@ -384,18 +415,22 @@ pub(crate) fn has_links(dir: &Path) -> bool {
     })
 }
 
-/// Moves `file` into the category folder of its extension (see [`CATEGORIES`]) next to it,
-/// numbered if the name is taken: of its contents' type when its name says nothing of it (see
-/// `crate::sniff::says_nothing`). Ok(None) if no category fits. The front ends turn sorting
-/// off for a download in a folder of its own (see `ingest::Task::keeps_its_place`).
-fn sort(file: &Path) -> std::io::Result<Option<PathBuf>> {
+/// Moves `file` into the folder of the first of `categories` that takes its extension, numbered
+/// if the name is taken: of its contents' type when its name says nothing of it (see
+/// `crate::sniff::says_nothing`). Ok(None) if no category fits, or the one that does names no
+/// other folder. The front ends turn sorting off for a download in a folder of its own (see
+/// `ingest::Task::keeps_its_place`).
+fn sort(file: &Path, categories: &[Category]) -> std::io::Result<Option<PathBuf>> {
     let ext = match crate::sniff::says_nothing(file) {
         true => crate::sniff::type_of(file).unwrap_or_default().to_string(),
         false => file.extension().unwrap_or_default().to_string_lossy().to_ascii_lowercase(),
     };
-    let Some((category, _)) = CATEGORIES.iter().find(|(_, exts)| exts.contains(&ext.as_str())) else { return Ok(None) };
+    let Some(category) = categories.iter().find(|c| c.extensions.contains(&ext)) else { return Ok(None) };
     let (Some(parent), Some(name)) = (file.parent(), file.file_name()) else { return Ok(None) };
-    let dir = parent.join(category);
+    let dir = parent.join(category.folder.as_deref().unwrap_or(Path::new(&category.name)));
+    if dir == parent {
+        return Ok(None);
+    }
     std::fs::create_dir_all(&dir)?;
     let base = dir.join(name);
     // ponytail: checks then renames, so a file appearing in between is replaced; claim the name
@@ -767,6 +802,42 @@ mod tests {
         let folder = dir.path().join("Torrent");
         std::fs::create_dir(&folder).unwrap();
         assert_eq!(after_download(&folder, &post, &source, None, None).await.path, folder);
+    }
+
+    /// The user's categories sort as the built-in ones do: by name in the save folder, or into a
+    /// folder of their own; the first that takes an extension wins, and one that names no other
+    /// folder leaves the file where it is. The built-in ones are the folders above.
+    #[test]
+    fn sorting_takes_the_users_categories() {
+        let (dir, elsewhere) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let category = |name: &str, extensions: &[&str], folder: Option<&Path>| Category {
+            name: name.into(),
+            extensions: extensions.iter().map(|e| e.to_string()).collect(),
+            folder: folder.map(Path::to_path_buf),
+        };
+        let mine = [
+            category("Clips", &["mp4", "pdf"], None),
+            category("Books", &["pdf"], Some(elsewhere.path())),
+            category("Ebooks", &["epub"], Some(elsewhere.path())),
+            category("", &["txt"], None),
+        ];
+        for (name, to) in [
+            ("a.mp4", Some(dir.path().join("Clips").join("a.mp4"))),
+            ("b.pdf", Some(dir.path().join("Clips").join("b.pdf"))),
+            ("c.epub", Some(elsewhere.path().join("c.epub"))),
+            ("d.txt", None),
+            ("e.mp3", None),
+        ] {
+            let file = dir.path().join(name);
+            std::fs::write(&file, b"x").unwrap();
+            assert_eq!(sort(&file, &mine).unwrap(), to, "{name}");
+            assert!(to.as_ref().unwrap_or(&file).is_file(), "{name}");
+        }
+        let defaults = default_categories();
+        let names: Vec<&str> = defaults.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["Video", "Music", "Pictures", "Documents", "Archives", "Programs"]);
+        assert!(defaults.iter().all(|c| c.folder.is_none()) && defaults[5].extensions.contains(&"elf".to_string()));
+        assert_eq!(defaults.iter().map(|c| c.extensions.len()).sum::<usize>(), CATEGORIES.iter().map(|(_, e)| e.len()).sum::<usize>());
     }
 
     #[test]

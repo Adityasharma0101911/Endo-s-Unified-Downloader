@@ -1,11 +1,11 @@
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
-use hyperfetch_core::engine::DownloadOptions;
+use hyperfetch_core::engine::{DownloadOptions, IpFamily};
 use hyperfetch_core::history::DownloadHistoryManager;
 use hyperfetch_core::ingest::ListOptions;
 use hyperfetch_core::media::{is_supported_media_site, BrowserCookieSource, MediaQualityPreset};
-use hyperfetch_core::postprocess::PostOptions;
+use hyperfetch_core::postprocess::{Category, PostOptions};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -147,6 +147,22 @@ pub struct Settings {
     pub launch_at_startup: bool,
     /// When the queue starts and stops by itself.
     pub schedule: Schedule,
+    /// The folders `sort_downloads` moves single files into, by extension, as typed (see
+    /// [`Settings::sort_categories`]); the built-in ones until changed.
+    pub categories: Vec<Category>,
+    /// Check a download against the checksum its site publishes, when it has none of the user's.
+    pub remote_checksum: bool,
+    /// A finished file takes the date its server gives it.
+    pub remote_time: bool,
+    /// Add and drop connections as they speed a download up or slow it (see
+    /// `DownloadOptions::adaptive`).
+    pub adaptive: bool,
+    /// The User-Agent sent in place of the app's (empty = the app's).
+    pub user_agent: String,
+    /// The IP version connections use.
+    pub ip_family: IpFamily,
+    /// Seconds a connection may take to open.
+    pub connect_timeout_secs: u64,
 }
 
 /// When the queue runs by itself (see `desktop::schedule_due`): at `start` on the ticked days it
@@ -224,6 +240,13 @@ impl Default for Settings {
             start_minimized: false,
             launch_at_startup: false,
             schedule: Schedule::default(),
+            categories: hyperfetch_core::postprocess::default_categories(),
+            remote_checksum: engine.remote_checksum,
+            remote_time: engine.remote_time,
+            adaptive: engine.adaptive,
+            user_agent: String::new(),
+            ip_family: engine.ip_family,
+            connect_timeout_secs: engine.connect_timeout_secs,
         }
     }
 }
@@ -326,6 +349,8 @@ impl Settings {
                 _ => None,
             },
             hls_to_mp4: self.hls_to_mp4,
+            remote_checksum: self.remote_checksum,
+            remote_time: self.remote_time,
             post: PostOptions {
                 extract: self.auto_extract,
                 delete_archive: self.delete_archives,
@@ -341,8 +366,10 @@ impl Settings {
 
     /// Puts the keys a queued download is never saved with (debrid, VirusTotal) into its
     /// `options`, from these settings, as it starts; and the local addresses it connects from,
-    /// as the networks of when it was queued may be gone.
+    /// as the networks of when it was queued may be gone. Its TLS certificates are checked,
+    /// whatever an edited queue file says: the app never turns that off.
     pub fn fill_keys(&self, options: &mut DownloadOptions) {
+        options.insecure = false;
         options.bind_addresses = self.bind_addresses();
         options.debrid_api_key = non_empty(&self.debrid_api_key);
         options.debrid_provider = non_empty(&self.debrid_provider);
@@ -395,13 +422,31 @@ impl Settings {
         }
     }
 
+    /// The categories as sorting takes them (see `postprocess::set_categories`): names trimmed,
+    /// extensions split on commas and spaces, lower case and without their dot, empty ones left out.
+    pub fn sort_categories(&self) -> Vec<Category> {
+        let category = |c: &Category| Category {
+            name: c.name.trim().to_string(),
+            extensions: c
+                .extensions
+                .iter()
+                .flat_map(|e| e.split(|ch: char| ch == ',' || ch.is_whitespace()))
+                .map(|e| e.trim_start_matches('.').to_lowercase())
+                .filter(|e| !e.is_empty())
+                .collect(),
+            folder: c.folder.clone(),
+        };
+        self.categories.iter().map(category).collect()
+    }
+
     /// Whether to reduce motion: as set, else as the system's animation setting says.
     pub fn reduces_motion(&self) -> bool {
         self.reduce_motion.unwrap_or_else(system_reduces_motion)
     }
 
     /// The engine settings shared by every download and repair: connections, speed limit,
-    /// retries, timeouts, disk flushing and the per-host connection budget.
+    /// retries, timeouts, disk flushing, the per-host connection budget, the User-Agent and the
+    /// IP version.
     pub fn tuning(&self) -> DownloadOptions {
         let proxy_pool = self.proxy_pool
             .split(',')
@@ -427,6 +472,10 @@ impl Settings {
             bt_upnp: self.bt_upnp,
             debrid_magnets: self.debrid_magnets,
             gallery_dl: self.gallery_dl,
+            adaptive: self.adaptive,
+            user_agent: non_empty(&self.user_agent),
+            ip_family: self.ip_family,
+            connect_timeout_secs: self.connect_timeout_secs.max(1),
             ..Default::default()
         }
     }
@@ -706,6 +755,47 @@ mod tests {
         assert!(saved.check_updates, "updates are checked unless turned off");
         let chosen = Settings { fsync_on_complete: true, max_connections_per_host: 8, check_updates: false, ..defaults };
         let json = serde_json::to_string(&chosen).unwrap();
+        assert_eq!(serde_json::from_str::<Settings>(&json).unwrap(), chosen);
+    }
+
+    /// A settings file from before the categories and the connection rows loads with their
+    /// defaults: the built-in categories, the site's checksum checked, the server's date and
+    /// adaptive connections off, the app's User-Agent, either IP version, 15 s to connect. What
+    /// is chosen reaches the engine, a 0 s timeout as 1 s, and is kept; TLS is always checked.
+    #[test]
+    fn new_rows_take_defaults_from_old_files_and_reach_the_engine() {
+        let old = r#"{"save_dir": "dl", "sort_downloads": true, "schedule": {"enabled": false}}"#;
+        let saved: Settings = serde_json::from_str(old).unwrap();
+        assert_eq!(saved.categories, hyperfetch_core::postprocess::default_categories());
+        assert!(saved.sort_downloads && saved.remote_checksum && !saved.remote_time && !saved.adaptive);
+        assert_eq!((saved.user_agent.as_str(), saved.ip_family, saved.connect_timeout_secs), ("", IpFamily::Any, 15));
+        let file = [Url::parse("https://example.com/a.iso").unwrap()];
+        let opts = saved.download_options(&file, "", "").unwrap();
+        assert!(opts.post.sort && opts.remote_checksum && !opts.remote_time && !opts.adaptive && !opts.insecure);
+        assert_eq!((opts.user_agent, opts.ip_family, opts.connect_timeout_secs), (None, IpFamily::Any, 15));
+
+        let chosen = Settings {
+            remote_checksum: false,
+            remote_time: true,
+            adaptive: true,
+            user_agent: " Agent/1.0 ".into(),
+            ip_family: IpFamily::V6,
+            connect_timeout_secs: 0,
+            categories: vec![Category { name: " Clips ".into(), extensions: vec![".MP4".into(), " webm mkv".into(), "".into()], folder: None }],
+            ..saved
+        };
+        let mut opts = chosen.download_options(&file, "", "").unwrap();
+        assert!(!opts.remote_checksum && opts.remote_time && opts.adaptive);
+        assert_eq!((opts.user_agent.as_deref(), opts.ip_family, opts.connect_timeout_secs), (Some("Agent/1.0"), IpFamily::V6, 1));
+        let tuned = chosen.tuning();
+        assert_eq!((tuned.user_agent.as_deref(), tuned.ip_family, tuned.adaptive), (Some("Agent/1.0"), IpFamily::V6, true), "repairs too");
+        opts.insecure = true;
+        chosen.fill_keys(&mut opts);
+        assert!(!opts.insecure, "a queue file cannot turn TLS checks off");
+        let sorted = chosen.sort_categories();
+        assert_eq!((sorted[0].name.as_str(), sorted[0].extensions.as_slice()), ("Clips", &["mp4", "webm", "mkv"].map(String::from)[..]));
+        let json = serde_json::to_string(&chosen).unwrap();
+        assert!(!json.contains("insecure"));
         assert_eq!(serde_json::from_str::<Settings>(&json).unwrap(), chosen);
     }
 

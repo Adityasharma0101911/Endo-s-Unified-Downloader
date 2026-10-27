@@ -27,6 +27,7 @@ use hyperfetch_core::paste;
 use hyperfetch_core::queue::{DownloadQueue, QueueItem, QueueItemStatus};
 use hyperfetch_core::updater::{self, Installed, Update};
 use hyperfetch_core::verify::{self, BuildVerificationResult};
+use hyperfetch_core::zipdir::ZipEntry;
 use tokio::sync::{broadcast, Notify};
 use tokio::task::JoinHandle;
 use url::Url;
@@ -70,6 +71,8 @@ enum Dialog {
     SaveDir,
     CookiesFile,
     VerifyFile,
+    /// The folder of the `n`th sorting category (see `Settings::categories`).
+    CategoryFolder(usize),
 }
 
 /// Where a .metalink, .meta4 or .torrent came from, which decides what happens to its downloads.
@@ -154,6 +157,8 @@ enum AppEvent {
     UpdateInstalled(Result<Installed, String>),
     /// A choice in the tray's menu, or a second launch asking for the window (`POST /show`).
     Tray(TrayAction),
+    /// What the ZIP at `link` holds (see [`App::preview_zip`]), or why it could not be listed.
+    ZipListed { link: String, result: Result<Vec<ZipEntry>, String> },
 }
 
 /// Handles to a running engine task.
@@ -331,6 +336,8 @@ struct App {
     taskbar_shown: Option<taskbar::Progress>,
     /// A download failed since the queue last stood still: the taskbar's progress is red.
     batch_failed: bool,
+    /// The ZIP link the Add page lists the contents of, and what it holds once read.
+    zip_preview: Option<(String, Option<Result<Vec<ZipEntry>, String>>)>,
 }
 
 impl App {
@@ -462,7 +469,24 @@ impl App {
             taskbar: None,
             taskbar_shown: None,
             batch_failed: false,
+            zip_preview: None,
         }
+    }
+
+    /// Lists what the ZIP at `url` holds without downloading it (see `zipdir::list_zip`), through
+    /// the proxy and with the cookies file and User-Agent of the settings; the Add page shows it.
+    fn preview_zip(&mut self, url: Url) {
+        let link = url.to_string();
+        self.zip_preview = Some((link.clone(), None));
+        let options = self.settings.download_options(std::slice::from_ref(&url), "", "");
+        self.spawn_event(async move {
+            let listed = async {
+                let options = options?;
+                let client = unblock(move || build_client(&options)).await??;
+                hyperfetch_core::zipdir::list_zip(&client, &url).await
+            };
+            AppEvent::ZipListed { link, result: listed.await }
+        });
     }
 
     /// Runs `fut` on the runtime and delivers its event to the UI thread.
@@ -903,6 +927,10 @@ impl App {
         let (urls, mut options, folder) = (item.urls.clone(), item.options.clone(), util::folder_to_create(item));
         options.install_ffmpeg = self.settings.install_ffmpeg == Some(true);
         self.settings.fill_keys(&mut options);
+        if options.post.sort {
+            // As they are now, for every download that sorts (see `Settings::categories`).
+            hyperfetch_core::postprocess::set_categories(self.settings.sort_categories());
+        }
         let leftovers_of = if fresh { item.target_path.clone() } else { None };
         if !self.queue.mark_started(id) {
             return false;
@@ -1252,6 +1280,11 @@ impl App {
                     Dialog::SaveDir => self.settings.save_dir = path.to_string_lossy().into_owned(),
                     Dialog::CookiesFile => self.settings.cookies_path = path.to_string_lossy().into_owned(),
                     Dialog::VerifyFile => self.verify(VerifyRequest { path, expected_size: None, checksum: None }),
+                    Dialog::CategoryFolder(n) => {
+                        if let Some(category) = self.settings.categories.get_mut(n) {
+                            category.folder = Some(path);
+                        }
+                    }
                 }
             }
             AppEvent::Pasted(result) => match result {
@@ -1314,6 +1347,12 @@ impl App {
                 }
             }
             AppEvent::Tray(action) => self.tray_action(action),
+            // Only for the link still asked about.
+            AppEvent::ZipListed { link, result } => {
+                if let Some((_, listed)) = self.zip_preview.as_mut().filter(|(asked, _)| *asked == link) {
+                    *listed = Some(result);
+                }
+            }
         }
     }
 
@@ -1432,7 +1471,7 @@ impl App {
         self.dialog_open = true;
         let picked = move |handle: Option<rfd::FileHandle>| AppEvent::Picked(dialog, handle.map(|h| h.path().to_path_buf()));
         match dialog {
-            Dialog::SaveDir => {
+            Dialog::SaveDir | Dialog::CategoryFolder(_) => {
                 let pick = picker.set_directory(&self.settings.save_dir).pick_folder();
                 self.spawn_event(async move { picked(pick.await) });
             }
@@ -2070,7 +2109,7 @@ async fn run_job(
         loop {
             match rx.recv().await {
                 Ok(snapshot) => {
-                    *lock(&slot) = Some(snapshot);
+                    *lock(&slot) = Some(with_check_note(snapshot));
                     ctx.request_repaint();
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {}
@@ -2100,6 +2139,13 @@ async fn run_job(
     // A folder's (a torrent's, a gallery's) is the snapshots' total, which this keeps.
     let size = tokio::fs::metadata(&path).await.ok().filter(|m| m.is_file()).map(|m| m.len());
     Ok((path, size))
+}
+
+/// `snapshot` with whose checksum the finished file matched, when not the user's ("Checked
+/// against the site's SHA-256"), among the notes the rows and the download's page show.
+fn with_check_note(mut snapshot: EngineSnapshot) -> EngineSnapshot {
+    snapshot.notes.extend(snapshot.checked_against.as_ref().map(|whose| format!("Checked against {}", whose)));
+    snapshot
 }
 
 #[cfg(windows)]
@@ -2229,8 +2275,9 @@ mod tests {
     use hyperfetch_core::state::DownloadState;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    /// Minimal HTTP/1.1 file server with range support, sending about 800 KB/s per connection.
-    async fn serve(body: Arc<Vec<u8>>) -> std::net::SocketAddr {
+    /// Minimal HTTP/1.1 file server with range support (suffix ranges too), sending about 800 KB/s
+    /// per connection; the same body for every path.
+    pub(crate) async fn serve(body: Arc<Vec<u8>>) -> std::net::SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -2249,7 +2296,10 @@ mod tests {
                     let last = body.len() - 1;
                     let range = request.lines().find_map(|l| l.strip_prefix("range: bytes=")).map(|r| {
                         let (a, b) = r.trim().split_once('-').unwrap();
-                        (a.parse::<usize>().unwrap(), b.parse::<usize>().map_or(last, |b| b.min(last)))
+                        match a.parse::<usize>() {
+                            Ok(a) => (a, b.parse::<usize>().map_or(last, |b| b.min(last))),
+                            Err(_) => (body.len().saturating_sub(b.parse().unwrap()), last),
+                        }
                     });
                     let (start, end) = range.unwrap_or((0, last));
                     let status = match range {

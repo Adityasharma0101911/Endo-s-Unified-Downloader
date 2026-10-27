@@ -1,4 +1,7 @@
 use std::hash::Hash;
+use std::path::PathBuf;
+
+use hyperfetch_core::engine::IpFamily;
 
 use super::*;
 
@@ -82,7 +85,7 @@ pub(super) fn settings_page(app: &mut App, ui: &mut Ui) {
     section(ui, 3, icon::MAGNET, "BitTorrent", |ui| torrent_settings(app, ui));
     section(ui, 4, icon::CLOUD_ARROW_DOWN, "Debrid & hosts", |ui| host_settings(app, ui));
     section(ui, 5, icon::FILM_STRIP, "Media", |ui| media_settings(app, ui));
-    section(ui, 6, icon::PACKAGE, "Post-processing", |ui| post_settings(&mut app.settings, ui));
+    section(ui, 6, icon::PACKAGE, "Post-processing", |ui| post_settings(app, ui));
     section(ui, 7, icon::PUZZLE_PIECE, "Browser extension", |ui| {
         let p = palette(ui);
         ui.separator();
@@ -233,6 +236,9 @@ fn connection_settings(s: &mut Settings, ui: &mut Ui) {
     setting(ui, "Connections per server", "All running downloads together, to one server (0 = no limit).", s.max_connections_per_host, |ui| {
         ui.add(egui::DragValue::new(&mut s.max_connections_per_host).range(0..=256));
     });
+    let about = "Start with the connections the server suits and add one while that makes the download faster, up to the \
+                 number above; drop one that slows it. Off, a download keeps the number it starts with.";
+    switch(ui, "Smarter connection count", about, &mut s.adaptive);
     setting(ui, "Speed limit", "For all downloads together (0 = unlimited).", (s.max_speed_in_mb, s.max_speed.to_bits()), |ui| {
         let in_mb = &mut s.max_speed_in_mb;
         egui::ComboBox::from_id_salt("speed_unit_combo").width(70.0).selected_text(if *in_mb { "MB/s" } else { "KB/s" }).show_ui(
@@ -247,6 +253,18 @@ fn connection_settings(s: &mut Settings, ui: &mut Ui) {
     text_setting(ui, "Proxy", "Every connection goes through it.", &mut s.proxy, "http://127.0.0.1:8080 or socks5://127.0.0.1:1080", false);
     let about = "Several proxies, comma-separated; connections take turns over them.";
     text_setting(ui, "Proxy pool", about, &mut s.proxy_pool, "http://p1:8080, http://p2:8080", false);
+    let about = "Connect over IPv4 or IPv6 only, or whichever works (Any). Videos yt-dlp fetches take either.";
+    setting(ui, "IP version", about, s.ip_family, |ui| {
+        for (value, name) in [(IpFamily::V6, "IPv6"), (IpFamily::V4, "IPv4"), (IpFamily::Any, "Any")] {
+            ui.selectable_value(&mut s.ip_family, value, name);
+        }
+    });
+    let about = "How long opening a connection may take: DNS, TCP and TLS. Not for videos yt-dlp fetches.";
+    setting(ui, "Connect timeout", about, s.connect_timeout_secs, |ui| {
+        ui.add(egui::DragValue::new(&mut s.connect_timeout_secs).range(1..=600).suffix(" s"));
+    });
+    let about = "Sent in place of the browser one the app sends (and the browser's own, from the extension), video sites included.";
+    text_setting(ui, "User agent", about, &mut s.user_agent, "Empty: the app's", false);
     let about = "Spread connections over every network this computer is on (Wi-Fi and Ethernet, say), or the ones chosen below.";
     switch(ui, "Use several networks", about, &mut s.multi_network);
     ui.add_enabled_ui(s.multi_network, |ui| network_choice(ui, &mut s.bind_addresses));
@@ -408,7 +426,8 @@ fn media_settings(app: &mut App, ui: &mut Ui) {
     }
 }
 
-fn post_settings(s: &mut Settings, ui: &mut Ui) {
+fn post_settings(app: &mut App, ui: &mut Ui) {
+    let s = &mut app.settings;
     ui.add_enabled_ui(cfg!(any(windows, target_os = "macos")), |ui| {
         let about = if cfg!(target_os = "macos") {
             "macOS then asks before opening a downloaded program, as it does for browser downloads."
@@ -417,12 +436,19 @@ fn post_settings(s: &mut Settings, ui: &mut Ui) {
         };
         switch(ui, "Mark as downloaded from the internet", about, &mut s.mark_of_the_web);
     });
+    let about = "When the site publishes the file's checksum (a .sha256 file next to it, say) and you gave none, a \
+                 download that does not match it fails; one that does says so.";
+    switch(ui, "Check against the site's checksum", about, &mut s.remote_checksum);
+    let about = "A finished file is dated as on the server, not when it was downloaded.";
+    switch(ui, "Keep the server's file date", about, &mut s.remote_time);
     switch(ui, "Unpack archives", "Zip, 7z, rar and tar files unpack into a folder next to them.", &mut s.auto_extract);
     ui.add_enabled_ui(s.auto_extract, |ui| {
         switch(ui, "Delete archives after unpacking", "Only once everything is unpacked.", &mut s.delete_archives);
     });
-    let about = "Single files move into Video, Music, Pictures, Documents, Archives or Programs in the save folder.";
+    let about = "Single files move into the folder of the first category below that takes their extension.";
     switch(ui, "Sort into folders", about, &mut s.sort_downloads);
+    ui.add_enabled_ui(s.sort_downloads, |ui| category_settings(app, ui));
+    let s = &mut app.settings;
     let about = "Sends the file's SHA-256 only, never the file, and notes how many engines flag it.";
     switch(ui, "Look files up on VirusTotal", about, &mut s.virustotal_check);
     ui.add_enabled_ui(s.virustotal_check, |ui| {
@@ -432,6 +458,54 @@ fn post_settings(s: &mut Settings, ui: &mut Ui) {
     let about = "A program and its arguments, run without a shell after each download. {path}, {dir}, {name} and {url} are filled in.";
     let hint = if cfg!(windows) { "e.g. C:\\Tools\\scan.exe \"{path}\"" } else { "e.g. /usr/local/bin/scan \"{path}\"" };
     text_setting(ui, "Run after each download", about, &mut s.run_after, hint, false);
+}
+
+/// The categories sorting uses, a line each: its name, its extensions (comma-separated) and its
+/// folder (empty: the folder of its name in the save folder; a picked or typed one replaces it),
+/// then Add category (a new one goes first) and Reset to the built-in ones. The first that takes
+/// an extension wins.
+fn category_settings(app: &mut App, ui: &mut Ui) {
+    let p = palette(ui);
+    let (mut delete, dialog_open) = (None, app.dialog_open);
+    let categories = &mut app.settings.categories;
+    for (n, category) in categories.iter_mut().enumerate() {
+        ui.horizontal(|ui| {
+            ui.add(egui::TextEdit::singleline(&mut category.name).hint_text("Name").desired_width(110.0));
+            // Split and joined on the same ", ", so typing is never undone.
+            let mut extensions = category.extensions.join(", ");
+            if ui.add(egui::TextEdit::singleline(&mut extensions).hint_text("mp4, mkv").desired_width(230.0)).changed() {
+                category.extensions = extensions.split(", ").map(str::to_string).collect();
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if icon_button(ui, icon::TRASH, "Delete this category", true).clicked() {
+                    delete = Some(n);
+                }
+                if icon_button(ui, icon::FOLDER_OPEN, "Choose its folder", !dialog_open).clicked() {
+                    app.pending_dialog = Some(Dialog::CategoryFolder(n));
+                }
+                let mut folder = category.folder.as_ref().map(|f| f.display().to_string()).unwrap_or_default();
+                let hint = format!("{} in the save folder", category.name.trim());
+                if ui.add(egui::TextEdit::singleline(&mut folder).hint_text(hint).desired_width(ui.available_width())).changed() {
+                    category.folder = (!folder.trim().is_empty()).then(|| PathBuf::from(folder));
+                }
+            });
+        });
+    }
+    if let Some(n) = delete {
+        categories.remove(n);
+    }
+    ui.horizontal(|ui| {
+        // At the top, so it takes its extensions from the ones below.
+        if ui.add(button(format!("{} Add category", icon::PLUS))).clicked() {
+            categories.insert(0, Default::default());
+        }
+        if ui.add(button(format!("{} Reset", icon::ARROW_COUNTER_CLOCKWISE))).on_hover_text("Back to the built-in categories").clicked() {
+            *categories = hyperfetch_core::postprocess::default_categories();
+        }
+        if categories.is_empty() {
+            ui.label(RichText::new("No categories: nothing is sorted").small().color(p.muted));
+        }
+    });
 }
 
 #[cfg(test)]
@@ -498,6 +572,97 @@ mod tests {
         assert_eq!((h.app.settings.schedule.start.as_deref(), h.app.settings.schedule.stop.as_deref()), (Some("7:30"), Some("25:00")));
         assert!(h.settle());
         assert!(h.find("25:00 is not a time like 08:30; it is left out").is_some());
+    }
+
+    /// Scrolls the Settings page with the wheel until `title` shows near its top.
+    fn scroll_to(h: &mut Harness, title: &str) {
+        h.hover(Pos2::new(600.0, 400.0));
+        for _ in 0..40 {
+            let top = h.find(title).map(|rect| rect.top());
+            if top.is_some_and(|top| (80.0..=200.0).contains(&top)) {
+                break;
+            }
+            let delta = Vec2::new(0.0, top.map_or(-400.0, |top| 120.0 - top));
+            h.frame(vec![egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta, modifiers: egui::Modifiers::NONE }]);
+            h.frames(30);
+        }
+        h.leave();
+        assert!(h.settle() && h.find(title).is_some(), "{title}");
+    }
+
+    /// A click on what `find` finds, the pointer there first: a press that comes with a move drags
+    /// the page.
+    fn click(h: &mut Harness, find: impl Fn(&Harness) -> Option<Rect>) {
+        let at = find(h).unwrap_or_else(|| panic!("not shown: {:?}", h.texts())).center();
+        h.hover(at);
+        h.click_at(at);
+        h.frames(30);
+    }
+
+    /// The connection rows and the checks before sorting set their settings through input.
+    #[test]
+    fn new_rows_work_through_input() {
+        let mut h = Harness::new();
+        h.app.tab = Tab::Settings;
+        assert!(h.settle());
+        scroll_to(&mut h, "Smarter connection count");
+        click(&mut h, |h| h.find_near("Smarter connection count", TOGGLE));
+        click(&mut h, |h| h.find_near("IP version", "IPv6"));
+        click(&mut h, |h| h.find("Empty: the app's"));
+        h.type_text("Agent/2.0");
+        h.key(egui::Key::Escape, egui::Modifiers::NONE);
+        let s = &h.app.settings;
+        assert!(s.adaptive && s.ip_family == IpFamily::V6 && s.user_agent == "Agent/2.0", "{s:?}");
+        assert!(h.find("Connect timeout").is_some());
+
+        scroll_to(&mut h, "Check against the site's checksum");
+        click(&mut h, |h| h.find_near("Check against the site's checksum", TOGGLE));
+        click(&mut h, |h| h.find_near("Keep the server's file date", TOGGLE));
+        assert!(!h.app.settings.remote_checksum && h.app.settings.remote_time);
+    }
+
+    /// The categories under Sort into folders are edited in place: one deleted, a new one (first,
+    /// so it takes .pdf from Documents) named, given extensions and a folder of its own; a download
+    /// then sorts into it; Reset brings back the built-in ones.
+    #[test]
+    fn categories_are_edited_and_sort_downloads() {
+        let server = tokio::runtime::Runtime::new().unwrap();
+        let addr = server.block_on(crate::tests::serve(Arc::new(vec![b'%'; 4096])));
+        let elsewhere = tempfile::tempdir().unwrap();
+        let mut h = Harness::new();
+        h.app.tab = Tab::Settings;
+        assert!(h.settle());
+        scroll_to(&mut h, "Sort into folders");
+        click(&mut h, |h| h.find_near("Sort into folders", TOGGLE));
+        assert!(h.app.settings.sort_downloads && h.settle());
+        click(&mut h, |h| h.find_near("Music", icon::TRASH));
+        assert!(h.app.settings.categories.iter().all(|c| c.name != "Music") && h.app.settings.categories.len() == 5);
+        click(&mut h, |h| h.find("Add category"));
+        assert!(h.settle());
+        click(&mut h, |h| h.find("Name"));
+        h.type_text("Papers");
+        click(&mut h, |h| h.find("mp4, mkv"));
+        h.type_text("PDF, .Epub");
+        h.key(egui::Key::Escape, egui::Modifiers::NONE);
+        assert!(h.settle() && h.find("Papers in the save folder").is_some(), "{:?}", h.texts());
+        click(&mut h, |h| h.find_near("Papers", icon::FOLDER_OPEN));
+        assert!(matches!(h.app.pending_dialog, Some(Dialog::CategoryFolder(0))), "{:?}", h.app.pending_dialog);
+        h.app.pending_dialog = None;
+        h.app.handle_event(crate::AppEvent::Picked(Dialog::CategoryFolder(0), Some(elsewhere.path().to_path_buf())));
+        assert!(h.settle() && h.find(&elsewhere.path().display().to_string()).is_some(), "{:?}", h.texts());
+        let papers = &h.app.settings.sort_categories()[0];
+        assert_eq!((papers.name.as_str(), papers.extensions.as_slice()), ("Papers", &["pdf".to_string(), "epub".to_string()][..]));
+
+        h.app.settings.remote_checksum = false;
+        let id = h.app.add_download(&format!("http://{addr}/report.pdf"), "", "").unwrap();
+        assert!(h.app.start_job(id, false));
+        h.wait_for(|app| app.queue.get_item(id).is_some_and(|item| !item.status.is_active()));
+        let item = h.app.queue.get_item(id).unwrap();
+        assert_eq!(item.target_path.as_deref(), Some(elsewhere.path().join("report.pdf").as_path()), "{:?}", item.status);
+        assert_eq!(std::fs::read(elsewhere.path().join("report.pdf")).unwrap().len(), 4096);
+
+        click(&mut h, |h| h.find("Reset"));
+        assert_eq!(h.app.settings.categories, hyperfetch_core::postprocess::default_categories());
     }
 
     /// A setting changed on the open page lights its row up for a moment, after which frames

@@ -1,3 +1,6 @@
+use hyperfetch_core::zipdir::ZipEntry;
+use url::Url;
+
 use super::*;
 
 use super::queue::download_details;
@@ -292,6 +295,9 @@ pub(super) fn add_page(app: &mut App, ui: &mut Ui) {
             }
         }
 
+        if focused.is_none() {
+            zip_preview(app, ui);
+        }
         if focused.is_none() && ingest::is_blob_url(&app.url_input) {
             error_alert(ui, ingest::BLOB_MESSAGE);
         }
@@ -377,6 +383,59 @@ pub(super) fn add_page(app: &mut App, ui: &mut Ui) {
             });
         }
     }
+}
+
+/// The link in `input` when it is a single http(s) link to a .zip, whose contents can be listed.
+fn zip_link(input: &str) -> Option<Url> {
+    let input = input.trim();
+    let url = Url::parse(input).ok().filter(|u| matches!(u.scheme(), "http" | "https") && !input.contains(char::is_whitespace))?;
+    url.path().to_ascii_lowercase().ends_with(".zip").then_some(url)
+}
+
+/// For a single .zip link in the box, See what's inside: the ZIP's files with their sizes and
+/// the total, read without downloading it (see `App::preview_zip`); or why it could not be.
+fn zip_preview(app: &mut App, ui: &mut Ui) {
+    let Some(url) = zip_link(&app.url_input) else { return };
+    let p = palette(ui);
+    match app.zip_preview.as_ref().filter(|(link, _)| link == url.as_str()).map(|(_, listed)| listed) {
+        None => {
+            ui.add_space(4.0);
+            let see = ui.add(button(format!("{} See what's inside", icon::FILE_ZIP)));
+            if see.on_hover_text("List the files in the ZIP without downloading it").clicked() {
+                app.preview_zip(url);
+            }
+        }
+        Some(None) => {
+            ui.horizontal(|ui| {
+                anim::spinner(ui, 14.0, p.muted);
+                ui.label(RichText::new("Reading what the ZIP holds…").color(p.muted));
+            });
+        }
+        Some(Some(Err(error))) => error_alert(ui, error),
+        Some(Some(Ok(entries))) => zip_entries(ui, entries),
+    }
+}
+
+/// A ZIP's entries, a line each with its size, in a list that scrolls past twelve of them; then
+/// how many there are and their size, unpacked and packed.
+fn zip_entries(ui: &mut Ui, entries: &[ZipEntry]) {
+    let p = palette(ui);
+    ui.add_space(4.0);
+    let row = ui.spacing().interact_size.y;
+    let most = 12.0 * (row + ui.spacing().item_spacing.y);
+    egui::ScrollArea::vertical().id_salt("zip entries").max_height(most).auto_shrink([false, true]).show_rows(ui, row, entries.len(), |ui, rows| {
+        for entry in &entries[rows] {
+            ui.horizontal(|ui| {
+                left_part(ui, 96.0, |ui| {
+                    ui.add(egui::Label::new(RichText::new(&entry.name).color(p.text)).truncate()).on_hover_text(&entry.name);
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.label(RichText::new(format_bytes(entry.size)).color(p.muted)));
+            });
+        }
+    });
+    let (size, packed) = entries.iter().fold((0u64, 0u64), |(size, packed), e| (size.saturating_add(e.size), packed.saturating_add(e.compressed)));
+    let total = format!("{} entries, {} ({} compressed)", entries.len(), format_bytes(size), format_bytes(packed));
+    ui.label(RichText::new(total).small().color(p.muted));
 }
 
 /// The form's Download button. For a moment after a download is added (Ctrl+V, the clipboard
@@ -566,6 +625,69 @@ mod tests {
         h.settle();
         assert!(h.texts().iter().any(|(text, _)| text.contains("Using the password from your paste for g.example")), "{:?}", h.app.notice);
         assert!(h.texts().iter().all(|(text, _)| !text.contains(SECRET)));
+    }
+
+    /// A ZIP of `files` (name, size) as `zipdir::list_zip` reads one: only its central directory
+    /// and end record are real, and each entry claims half its size packed (no file data is sent).
+    fn zip_of(files: &[(&str, u32)]) -> Vec<u8> {
+        let mut out = b"data".to_vec();
+        let offset = out.len() as u32;
+        for (name, size) in files {
+            out.extend(0x0201_4b50u32.to_le_bytes());
+            out.extend([0u8; 16]);
+            out.extend([size / 2, *size].iter().flat_map(|v| v.to_le_bytes()));
+            out.extend((name.len() as u16).to_le_bytes());
+            out.extend([0u8; 16]);
+            out.extend(name.as_bytes());
+        }
+        let directory = out.len() as u32 - offset;
+        out.extend(0x0605_4b50u32.to_le_bytes());
+        out.extend([0u16, 0, files.len() as u16, files.len() as u16].iter().flat_map(|v| v.to_le_bytes()));
+        out.extend([directory, offset].iter().flat_map(|v| v.to_le_bytes()));
+        out.extend(0u16.to_le_bytes());
+        out
+    }
+
+    /// One .zip link typed in the box offers See what's inside, which lists the ZIP (from a local
+    /// server) with each file's size and the total; a file that is no ZIP says so. Two links, or
+    /// a link to another file, offer nothing.
+    #[test]
+    fn see_whats_inside_a_zip_link() {
+        let server = tokio::runtime::Runtime::new().unwrap();
+        let zip = zip_of(&[("docs/", 0), ("docs/readme.txt", 2048), ("setup.exe", 3 << 20)]);
+        let addr = server.block_on(crate::tests::serve(std::sync::Arc::new(zip)));
+        let other = server.block_on(crate::tests::serve(std::sync::Arc::new(vec![0; 1000])));
+        let link = format!("http://{addr}/pack.ZIP");
+        assert_eq!(zip_link(&format!(" {link} ")).map(String::from), Some(link.clone()));
+        for no in [format!("{link} {link}"), format!("http://{addr}/a.iso"), "ftp://h.example/a.zip".to_string()] {
+            assert!(zip_link(&no).is_none(), "{no}");
+        }
+
+        let mut h = Harness::new();
+        assert!(h.settle());
+        assert!(h.find("See what's inside").is_none());
+        let input = h.app.ctx.read_response(egui::Id::new("url_input")).unwrap().rect;
+        h.click_at(input.center());
+        h.type_text(&link);
+        h.key(egui::Key::Escape, egui::Modifiers::NONE);
+        assert!(h.settle());
+        h.click("See what's inside");
+        h.wait_for(|app| app.zip_preview.as_ref().is_some_and(|(_, listed)| listed.is_some()));
+        assert!(h.settle());
+        for shown in ["docs/", "docs/readme.txt", "2.00 KiB", "setup.exe", "3.00 MiB", "3 entries, 3.00 MiB (1.50 MiB compressed)"] {
+            assert!(h.find(shown).is_some(), "{shown} in {:?}", h.texts());
+        }
+        assert!(h.find("See what's inside").is_none());
+
+        h.click_at(input.center());
+        h.key(egui::Key::A, egui::Modifiers::COMMAND);
+        h.type_text(&format!("http://{other}/fake.zip"));
+        h.key(egui::Key::Escape, egui::Modifiers::NONE);
+        assert!(h.settle() && h.find("setup.exe").is_none(), "another link's list goes");
+        h.click("See what's inside");
+        h.wait_for(|app| app.zip_preview.as_ref().is_some_and(|(_, listed)| listed.is_some()));
+        assert!(h.settle());
+        assert!(h.texts().iter().any(|(text, _)| text.starts_with("The file is not a ZIP")), "{:?}", h.texts());
     }
 
     /// A notice opens its room over a few frames, pushing the card under it down smoothly; once

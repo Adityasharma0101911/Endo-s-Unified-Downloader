@@ -833,6 +833,33 @@ mod tests {
         assert_eq!(h.app.queue.items().len(), 4, "showing changes nothing");
     }
 
+    /// A download checked against its site's checksum says so with its other notes: on its row
+    /// in the queue and on its own page. One without says nothing of it.
+    #[test]
+    fn a_site_checked_download_says_so() {
+        let mut h = Harness::new();
+        let done = h.add("site.iso");
+        h.app.queue.mark_started(done);
+        let checked = EngineSnapshot { checked_against: Some("the site's SHA-256".into()), ..Default::default() };
+        h.app.queue.apply_snapshot(done, &crate::with_check_note(checked));
+        h.finish(done, None);
+        let plain = h.add("plain.iso");
+        h.app.queue.mark_started(plain);
+        h.app.queue.apply_snapshot(plain, &crate::with_check_note(EngineSnapshot::default()));
+        h.finish(plain, None);
+        assert!(h.app.queue.get_item(plain).unwrap().notes.is_empty());
+
+        assert!(h.settle());
+        h.click("Queue");
+        assert!(h.settle());
+        let row = h.texts().into_iter().find(|(text, _)| text.ends_with("Checked against the site's SHA-256")).map(|(_, rect)| rect);
+        let name = h.find("site.iso").unwrap();
+        assert!(row.is_some_and(|row| row.top() > name.top() && row.top() - name.top() < 40.0), "under its name: {:?}", h.texts());
+        h.double_click("site.iso");
+        assert!(h.settle());
+        assert!(h.find("Checked against the site's SHA-256").is_some(), "{:?}", h.texts());
+    }
+
     /// Ctrl+V outside a text box adds the copied links to the queue; in one, it is typed there.
     /// Delete removes the selected download, but not one that is running; Ctrl+number switches
     /// pages.
