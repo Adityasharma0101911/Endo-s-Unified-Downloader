@@ -1,5 +1,6 @@
 mod cli;
 mod download;
+mod probe;
 
 use std::future::Future;
 use std::io::{IsTerminal, Write};
@@ -8,9 +9,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use clap::Parser;
-use hyperfetch_core::engine::DownloadOptions;
-use hyperfetch_core::history::{is_redacted, DownloadHistoryManager, HistoryEntry, HistoryStatus, REDACTED_LINK};
+use clap::{CommandFactory, Parser};
+use hyperfetch_core::engine::{build_client, stream_to, DownloadOptions, IpFamily};
+use hyperfetch_core::history::{
+    is_redacted, redact_url, DownloadHistoryManager, HistoryEntry, HistoryStatus, REDACTED_LINK,
+};
 use hyperfetch_core::ingest::{decode_text, descriptor_client, http_url, ingest, input_tokens, ListOptions, Task};
 use hyperfetch_core::media::{self, find_ffmpeg_path, is_supported_media_site, BrowserCookieSource};
 use hyperfetch_core::p2p;
@@ -25,8 +28,8 @@ use url::Url;
 
 use cli::Args;
 use download::{
-    printable, run_jobs, stderr_line, stdout_line, stop_requested, truncate, FfmpegAnswer, Job, Shutdown, Ui, EXIT_FAILED,
-    EXIT_OK, EXIT_USAGE,
+    item, printable, run_jobs, stderr_line, stdout_line, stop_requested, truncate, FfmpegAnswer, Job, Shutdown, Ui,
+    EXIT_FAILED, EXIT_OK, EXIT_USAGE,
 };
 
 fn main() {
@@ -37,6 +40,13 @@ fn main() {
     updater::cleanup_old();
     updater::refresh_extension();
     let args = Args::parse();
+    if let Some(shell) = args.completions {
+        // For the name it was started by (a link such as `endos-downloader` included).
+        let argv0 = std::env::args_os().next().map(PathBuf::from);
+        let name = argv0.as_deref().and_then(Path::file_stem).map_or("Endos-Unified-Downloader-CLI".into(), |n| n.to_string_lossy());
+        clap_complete::generate(shell, &mut Args::command(), name.into_owned(), &mut std::io::stdout());
+        return;
+    }
     // On a thread of its own: a MEGA or swarm download nests futures deep enough to overflow
     // the main thread's 1 MiB stack on Windows in a debug build.
     let code = std::thread::Builder::new()
@@ -62,9 +72,21 @@ fn run_detached(app: impl Future<Output = i32>) -> std::io::Result<i32> {
     Ok(code)
 }
 
-async fn app(args: Args) -> i32 {
-    let ui = Ui::new(args.quiet);
+async fn app(mut args: Args) -> i32 {
+    let mut ui = Ui::new(args.quiet);
+    ui.json = args.json;
+    if let Some(path) = &args.logfile {
+        match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            Ok(file) => ui.log = Some(Arc::new(file)),
+            Err(e) => return usage(&format!("cannot open the log file {}: {}", path.display(), e)),
+        }
+    }
     init_tracing(args.verbose, &ui);
+    // The password is asked on stderr, so stdout may be a pipe (--json, --stdout).
+    let typed = std::io::stdin().is_terminal() && in_foreground();
+    if let Err(e) = sign_in(&mut args, typed.then_some(read_password as fn(&str) -> Option<String>)) {
+        return usage(&e);
+    }
     let shutdown = Shutdown::install();
 
     if args.history {
@@ -75,6 +97,16 @@ async fn app(args: Args) -> i32 {
     }
     if let Some(path) = &args.verify {
         return verify_file(&args, path, &ui, &shutdown).await;
+    }
+    // Each prints or writes something else than the downloads of an interactive prompt.
+    if args.urls.is_empty() && args.input_file.is_none() && (args.json || args.spider || args.dry_run || args.preview || args.stdout) {
+        return usage("--json, --spider, --dry-run, --preview and --stdout need URLs or -i");
+    }
+    if args.stdout {
+        return to_stdout(&args, &ui, &shutdown).await;
+    }
+    if args.preview {
+        return preview(&args, &ui).await;
     }
     let http = match descriptor_client(args.proxy.as_deref()) {
         Ok(client) => client,
@@ -100,6 +132,148 @@ async fn app(args: Args) -> i32 {
 fn usage(message: &str) -> i32 {
     stderr_line(&format!("error: {}", message));
     EXIT_USAGE
+}
+
+/// Turns `-u USER[:PASS]` into an Authorization header (an Authorization --header wins over it),
+/// with the password asked of `ask` when it is missing (see [`cli::basic_auth`]).
+fn sign_in(args: &mut Args, ask: Option<fn(&str) -> Option<String>>) -> Result<(), String> {
+    let Some(user) = args.user.take() else { return Ok(()) };
+    let basic = cli::basic_auth(&user, ask)?;
+    if args.auth_header().is_none() {
+        args.headers.push(("Authorization".to_string(), basic));
+    }
+    Ok(())
+}
+
+/// Asks at the terminal for `user`'s password, which is not shown as it is typed. Blocking.
+fn read_password(user: &str) -> Option<String> {
+    eprint!("Password for {}: ", printable(user));
+    let mut line = String::new();
+    let read = {
+        let _hidden = EchoOff::new();
+        std::io::stdin().read_line(&mut line)
+    };
+    eprintln!();
+    read.ok().filter(|&n| n > 0).map(|_| line.trim_end_matches(['\r', '\n']).to_string())
+}
+
+/// Keeps what is typed at the terminal from being shown while it lives.
+#[cfg(unix)]
+struct EchoOff(Option<libc::termios>);
+
+#[cfg(unix)]
+impl EchoOff {
+    fn new() -> Self {
+        // SAFETY: termios is plain data that tcgetattr fills in for the standard input.
+        unsafe {
+            let mut mode: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(libc::STDIN_FILENO, &mut mode) != 0 {
+                return Self(None);
+            }
+            let shown = mode;
+            mode.c_lflag &= !libc::ECHO;
+            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &mode);
+            Self(Some(shown))
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for EchoOff {
+    fn drop(&mut self) {
+        if let Some(mode) = &self.0 {
+            // SAFETY: restores the mode tcgetattr gave.
+            unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, mode) };
+        }
+    }
+}
+
+#[cfg(windows)]
+struct EchoOff(Option<u32>);
+
+#[cfg(windows)]
+impl EchoOff {
+    fn new() -> Self {
+        use windows_sys::Win32::System::Console::{GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_ECHO_INPUT, STD_INPUT_HANDLE};
+        // SAFETY: plain calls on the console's input handle, with a mode to fill in.
+        unsafe {
+            let input = GetStdHandle(STD_INPUT_HANDLE);
+            let mut mode = 0;
+            if GetConsoleMode(input, &mut mode) == 0 {
+                return Self(None);
+            }
+            SetConsoleMode(input, mode & !ENABLE_ECHO_INPUT);
+            Self(Some(mode))
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for EchoOff {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Console::{GetStdHandle, SetConsoleMode, STD_INPUT_HANDLE};
+        if let Some(mode) = self.0 {
+            // SAFETY: restores the mode GetConsoleMode gave.
+            unsafe { SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), mode) };
+        }
+    }
+}
+
+/// --stdout: the one link's bytes to stdout as they arrive (see `stream_to`), progress and
+/// messages on stderr.
+async fn to_stdout(args: &Args, ui: &Ui, shutdown: &Shutdown) -> i32 {
+    let [link] = args.urls.as_slice() else { return usage("--stdout takes one link") };
+    if std::io::stdout().is_terminal() {
+        return usage("--stdout writes the file's bytes: send them to a file or a pipe, not the terminal");
+    }
+    let url = match Url::parse(link) {
+        Ok(url) => url,
+        Err(e) => return usage(&format!("'{}' is not a link: {}", redact_url(link), e)),
+    };
+    let options = job(args, 1, Path::new("."), Task { urls: vec![url.clone()], ..Default::default() }).options;
+    let bar = ui.byte_bar("stdout", None, None);
+    let progress = bar.clone();
+    let out = tokio_util::io::InspectWriter::new(tokio::io::stdout(), move |bytes: &[u8]| progress.inc(bytes.len() as u64));
+    let mut stop = shutdown.subscribe();
+    let streamed = tokio::select! {
+        streamed = stream_to(url, options, out) => streamed,
+        () = stop_requested(&mut stop) => Err("stopped".to_string()),
+    };
+    bar.finish_and_clear();
+    match streamed {
+        Ok(bytes) => {
+            if !ui.quiet() {
+                ui.error(&format!("[OK] {} to stdout", HumanBytes(bytes)));
+            }
+            EXIT_OK
+        }
+        Err(e) => {
+            ui.error(&format!("[FAILED] {}: {}", redact_url(link), e));
+            shutdown.requested().unwrap_or(EXIT_FAILED)
+        }
+    }
+}
+
+/// --preview: the files in the remote ZIP the link names, without downloading it.
+async fn preview(args: &Args, ui: &Ui) -> i32 {
+    let Some(link) = args.urls.first() else { return usage("--preview takes a link") };
+    let listed = async {
+        let url = Url::parse(link).map_err(|e| format!("not a link: {}", e))?;
+        let options = job(args, 1, Path::new("."), Task { urls: vec![url.clone()], ..Default::default() }).options;
+        let client = build_client(&options)?;
+        hyperfetch_core::zipdir::list_zip(&client, &probe::resolve(&client, &url, &options).await?).await
+    }
+    .await;
+    match listed {
+        Ok(entries) => {
+            probe::zip_lines(&entries).iter().for_each(|line| ui.print(line));
+            EXIT_OK
+        }
+        Err(e) => {
+            ui.error(&format!("[FAILED] {}: {}", redact_url(link), e));
+            EXIT_FAILED
+        }
+    }
 }
 
 /// The exit code once every download has run.
@@ -131,7 +305,8 @@ fn init_tracing(verbose: u8, ui: &Ui) {
             tracing_subscriber::fmt::layer()
                 .with_writer(move || writer.clone())
                 .without_time()
-                .with_ansi(std::io::stderr().is_terminal())
+                // No colour codes in a --logfile.
+                .with_ansi(std::io::stderr().is_terminal() && ui.log.is_none())
                 .with_target(verbose >= 2),
         )
         .with(filter)
@@ -192,8 +367,12 @@ fn job(args: &Args, connections: u64, dir: &Path, task: Task) -> Job {
         // --checksum is for the file a document lists, not for the document downloaded itself.
         expected_checksum: args.checksum.clone().filter(|_| !task.document_itself).or(task.checksum),
         cookies_path: args.load_cookies.clone(),
-        // --header is for the hosts the user named, not those a .metalink or .torrent lists.
-        auth_header: args.auth_header.clone().filter(|_| !task.from_document),
+        // --header, -u and --cookie are for the hosts the user named, not those a .metalink or
+        // .torrent lists.
+        auth_header: args.auth_header().filter(|_| !task.from_document),
+        extra_headers: if task.from_document { Vec::new() } else { args.extra_headers() },
+        cookie_string: args.cookie.clone().filter(|_| !task.from_document),
+        metalink_pieces: task.pieces,
         password: args.password.clone(),
         referer: args.referer.clone().filter(|_| !task.from_document).or(task.referer),
         proxy: args.proxy.clone(),
@@ -205,6 +384,7 @@ fn job(args: &Args, connections: u64, dir: &Path, task: Task) -> Job {
         embed_metadata: !args.no_embed_metadata,
         live_from_start: args.live_from_start,
         wait_for_video: args.wait_for_video,
+        record_seconds: args.record_seconds,
         sections: args.sections.clone(),
         sponsorblock: args.sponsorblock.clone(),
         merge_format: args.merge_format.clone(),
@@ -309,6 +489,20 @@ fn tuning(args: &Args, connections: u64) -> DownloadOptions {
         bt_port: args.bt_port,
         bt_upnp: args.upnp,
         gallery_dl: !args.no_gallery_dl,
+        insecure: args.insecure,
+        ip_family: match (args.ipv4, args.ipv6) {
+            (true, _) => IpFamily::V4,
+            (_, true) => IpFamily::V6,
+            _ => IpFamily::Any,
+        },
+        connect_timeout_secs: args.connect_timeout,
+        user_agent: args.user_agent.clone(),
+        no_proxy: args.no_proxy,
+        only_if_newer: args.only_if_newer,
+        remote_time: args.remote_time,
+        max_filesize: args.max_filesize,
+        remote_checksum: !args.no_remote_checksum,
+        adaptive: args.adaptive,
         ..Default::default()
     }
 }
@@ -402,6 +596,7 @@ async fn read_tasks(
         }
         for e in &missing {
             ui.error(&format!("[FAILED] {}: {}", truncate(&tokens.join(" "), 60), e));
+            ui.report(item("failed", Some(&tokens.join(" ")), None, None, None, None, Some(e)));
         }
         failed += usize::from(!missing.is_empty());
     }
@@ -447,20 +642,53 @@ async fn batch(args: &Args, ui: &Ui, shutdown: &Shutdown, http: &reqwest::Client
         }
         return exit_code(None, failed);
     }
-    let dir = match prepare_dir(args.dir.as_deref().unwrap_or(Path::new("."))).await {
-        Ok(dir) => dir,
-        Err(e) => return usage(&e),
+    let dir = args.dir.clone().unwrap_or_else(|| PathBuf::from("."));
+    // A probe or a dry run writes nothing, not even the download directory.
+    let dir = match args.spider || args.dry_run {
+        true => dir,
+        false => match prepare_dir(&dir).await {
+            Ok(dir) => dir,
+            Err(e) => return usage(&e),
+        },
     };
     if let Err(e) = check_output_file(&dir, args.output.as_deref()).await {
         return usage(&e);
     }
 
-    let jobs: Vec<Job> = tasks.into_iter().map(|(line, task, pasted)| pasted_job(args, &dir, line, task, pasted)).collect();
-    // Asked only where someone answers: at a terminal that is not reading the input file.
-    let can_ask = !ui.quiet() && args.input_file.as_deref() != Some(Path::new("-")) && !stdin && at_terminal();
+    let sized: Vec<(Job, Option<u64>)> = tasks
+        .into_iter()
+        .map(|(line, task, pasted)| {
+            let size = task.size;
+            (pasted_job(args, &dir, line, task, pasted), size)
+        })
+        .collect();
+    if args.dry_run {
+        probe::dry_run(&sized, http, ui, args.no_clobber).await;
+        return exit_code(None, failed);
+    }
+    if args.spider {
+        failed += probe::spider(&sized, ui, args.server_response).await;
+        return exit_code(None, failed);
+    }
+    let jobs = before_running(args, sized.into_iter().map(|(job, _)| job).collect(), ui).await;
+    // Asked only where someone answers: at a terminal that is not reading the input file, nor
+    // printing JSON.
+    let can_ask = !ui.quiet() && !ui.json && args.input_file.as_deref() != Some(Path::new("-")) && !stdin && at_terminal();
     let ffmpeg = ffmpeg_question(args, &jobs, can_ask.then_some(find_ffmpeg_path as Finder), ui);
     failed += run_jobs(jobs, args.jobs as usize, ui, shutdown, ffmpeg).await;
     exit_code(shutdown.requested(), failed)
+}
+
+/// `jobs` as they are to run: the headers of each probe printed first with -S, and those whose
+/// file is there already left out with --no-clobber.
+async fn before_running(args: &Args, jobs: Vec<Job>, ui: &Ui) -> Vec<Job> {
+    if args.server_response {
+        probe::show_responses(&jobs, ui).await;
+    }
+    if args.no_clobber {
+        return probe::without_existing(jobs, ui).await;
+    }
+    jobs
 }
 
 /// The download of `task` from input-file line `line` with the secrets of the `pasted` link it
@@ -648,7 +876,8 @@ where
             }
         };
 
-        let mut jobs: Vec<Job> = tasks.into_iter().map(|t| job(args, connections, &dir, t)).collect();
+        let jobs = tasks.into_iter().map(|t| job(args, connections, &dir, t)).collect();
+        let mut jobs = before_running(args, jobs, ui).await;
         let install = may_install_ffmpeg(args, &jobs, &mut ffmpeg_answer, find, &mut ask).await;
         for job in &mut jobs {
             job.options.install_ffmpeg = install;
@@ -1162,6 +1391,193 @@ mod tests {
         let itself = Task { urls, document_itself: true, ..Default::default() };
         assert_eq!(job(&args, 4, Path::new("d"), file).options.expected_checksum, Some(checksum));
         assert_eq!(job(&args, 4, Path::new("d"), itself).options.expected_checksum, None);
+    }
+
+    /// The request flags reach every download, and the user's own headers, cookies and sign-in
+    /// only those of the links given, not the files a document lists.
+    #[test]
+    fn request_flags_reach_the_engine() {
+        let mut args = parse(&[
+            "-u", "bob:pw", "-U", "agent/1", "--cookie", "sid=1", "--header", "X-Key: k", "-k", "-6", "--connect-timeout", "7",
+            "--no-proxy", "-N", "--max-filesize", "2G", "--record-seconds", "30", "--no-remote-checksum", "--adaptive", "u",
+        ]);
+        sign_in(&mut args, None).unwrap();
+        let urls = vec![Url::parse("https://a.example/f.iso").unwrap()];
+        let pieces = hyperfetch_core::metalink::Pieces { length: 4 << 20, algo: "sha1".into(), hashes: vec!["00".repeat(20)] };
+        let typed = Task { urls: urls.clone(), pieces: Some(pieces.clone()), ..Default::default() };
+        let options = job(&args, 4, Path::new("d"), typed).options;
+        assert_eq!((options.auth_header.as_deref(), options.cookie_string.as_deref()), (Some("Basic Ym9iOnB3"), Some("sid=1")));
+        assert_eq!(options.extra_headers, [("X-Key".to_string(), "k".to_string())]);
+        assert_eq!((options.user_agent.as_deref(), options.ip_family, options.connect_timeout_secs), (Some("agent/1"), IpFamily::V6, 7));
+        assert!(options.insecure && options.no_proxy && options.only_if_newer && !options.remote_checksum && options.adaptive);
+        assert_eq!((options.max_filesize, options.record_seconds, options.metalink_pieces), (Some(2 << 30), Some(30), Some(pieces)));
+        let listed = job(&args, 4, Path::new("d"), Task { urls: urls.clone(), from_document: true, ..Default::default() }).options;
+        assert!(listed.auth_header.is_none() && listed.extra_headers.is_empty() && listed.cookie_string.is_none());
+        assert_eq!(listed.user_agent.as_deref(), Some("agent/1"), "not a secret");
+
+        let defaults = job(&parse(&["u"]), 4, Path::new("d"), Task { urls, ..Default::default() }).options;
+        assert!(defaults.remote_checksum && !defaults.adaptive && !defaults.insecure && !defaults.no_proxy && !defaults.only_if_newer);
+        assert_eq!((defaults.ip_family, defaults.connect_timeout_secs, defaults.max_filesize), (IpFamily::Any, 15, None));
+        assert_eq!(tuning(&parse(&["-4", "u"]), 1).ip_family, IpFamily::V4);
+        // An Authorization --header wins over -u; -u without a password, with no one to ask, fails.
+        let mut args = parse(&["-u", "bob:pw", "--header", "Bearer t", "u"]);
+        sign_in(&mut args, None).unwrap();
+        assert_eq!(args.auth_header().as_deref(), Some("Bearer t"));
+        assert!(sign_in(&mut parse(&["-u", "bob", "u"]), None).unwrap_err().contains("bob:PASS"));
+        let mut asked = parse(&["-u", "bob", "u"]);
+        sign_in(&mut asked, Some(|_| Some("pw".to_string()))).unwrap();
+        assert_eq!(asked.auth_header().as_deref(), Some("Basic Ym9iOnB3"));
+    }
+
+    #[test]
+    fn completions_cover_the_flags() {
+        let mut script = Vec::new();
+        clap_complete::generate(clap_complete::Shell::Bash, &mut Args::command(), "endos-downloader", &mut script);
+        let script = String::from_utf8(script).unwrap();
+        assert!(["endos-downloader", "--spider", "--dry-run", "--server-response", "--only-if-newer"].iter().all(|s| script.contains(s)));
+    }
+
+    /// A quiet Ui printing --json, everything it prints also in a log file, and that file.
+    fn json_ui(dir: &Path) -> (Ui, PathBuf) {
+        let log = dir.join("out.log");
+        let mut ui = Ui::new(true);
+        ui.json = true;
+        ui.log = Some(Arc::new(std::fs::File::create(&log).unwrap()));
+        (ui, log)
+    }
+
+    /// The --json items in the log of [`json_ui`].
+    fn json_items(log: &Path) -> Vec<serde_json::Value> {
+        let text = std::fs::read_to_string(log).unwrap();
+        text.lines().filter(|line| line.starts_with('{')).map(|line| serde_json::from_str(line).unwrap()).collect()
+    }
+
+    /// --spider tells what a link serves and the checksum its site publishes, writing nothing; -S
+    /// shows each probe's headers with the sign-in, cookies and the user's own headers masked,
+    /// which go to the link's host all the same; a bad link fails.
+    #[tokio::test]
+    async fn the_spider_tells_what_a_link_serves() {
+        let sum = "ab".repeat(32);
+        let heads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&heads);
+        let sidecar = format!("{sum}  data.bin\n");
+        let server = serve_answers(move |head| {
+            seen.lock().unwrap().push(head.to_ascii_lowercase());
+            match head.split_whitespace().nth(1).unwrap_or_default() {
+                "/files/data.bin" => "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-0/4096\r\nContent-Length: 1\r\n\
+                    Content-Type: application/octet-stream\r\nETag: \"v1\"\r\nLast-Modified: Wed, 21 Oct 2015 07:28:00 GMT\r\n\
+                    Set-Cookie: session=hidden\r\nConnection: close\r\n\r\nx"
+                    .to_string(),
+                "/files/data.bin.sha256" => response("200 OK", "text/plain", &sidecar),
+                _ => response("404 Not Found", "text/html", "gone"),
+            }
+        })
+        .await;
+        let dir = test_dir("spider");
+        let (ui, log) = json_ui(&dir);
+        let args = parse(&["--header", "Bearer s3cret", "--cookie", "sid=1", "--header", "X-Key: k1", "u"]);
+        let link = |path: &str| {
+            let task = Task { urls: vec![Url::parse(&format!("{server}{path}")).unwrap()], ..Default::default() };
+            (job(&args, 4, &dir, task), None)
+        };
+        assert_eq!(probe::spider(&[link("/files/data.bin"), link("/missing.bin")], &ui, true).await, 1);
+
+        let items = json_items(&log);
+        let found = &items[0];
+        assert_eq!((found["status"].as_str(), found["name"].as_str(), found["size"].as_u64()), (Some("ok"), Some("data.bin"), Some(4096)));
+        assert_eq!((found["resumable"].as_bool(), found["etag"].as_str()), (Some(true), Some("\"v1\"")));
+        assert_eq!(found["checksum"].as_str(), Some(format!("sha256:{sum}").as_str()));
+        assert_eq!(found["last_modified"].as_str(), Some("Wed, 21 Oct 2015 07:28:00 GMT"));
+        assert_eq!(found["type"].as_str(), Some("application/octet-stream"));
+        assert_eq!(items[1]["status"].as_str(), Some("failed"));
+        assert!(items[1]["error"].as_str().unwrap().contains("404"), "{}", items[1]);
+        let out = std::fs::read_to_string(&log).unwrap();
+        assert!(out.contains("> GET ") && out.contains("< HTTP/1.1 206 Partial Content"), "{out}");
+        for masked in ["authorization: ***", "cookie: ***", "x-key: ***", "set-cookie: ***"] {
+            assert!(out.contains(masked), "{masked}: {out}");
+        }
+        assert!(!out.contains("s3cret") && !out.contains("hidden") && !out.contains("k1"), "{out}");
+        let heads = heads.lock().unwrap().join("\n");
+        assert!(heads.contains("authorization: bearer s3cret") && heads.contains("cookie: sid=1") && heads.contains("x-key: k1"));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "only the log was written");
+    }
+
+    /// --no-clobber skips a download whose file is there: at its own path, or under the name its
+    /// server gives; one whose file is not there runs.
+    #[tokio::test]
+    async fn no_clobber_skips_a_file_that_is_there() {
+        let server = serve_answers(|head| match head.starts_with("GET /named ") {
+            true => "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-0/10\r\nContent-Length: 1\r\n\
+                Content-Disposition: attachment; filename=\"kept.bin\"\r\nConnection: close\r\n\r\nx"
+                .to_string(),
+            false => response("200 OK", "application/octet-stream", "0123456789"),
+        })
+        .await;
+        let dir = test_dir("no-clobber");
+        std::fs::write(dir.join("kept.bin"), "old").unwrap();
+        std::fs::write(dir.join("mine.bin"), "old").unwrap();
+        let (ui, log) = json_ui(&dir);
+        let args = parse(&["--no-clobber", "u"]);
+        let task = |path: &str, name: Option<&str>| Task {
+            urls: vec![Url::parse(&format!("{server}{path}")).unwrap()],
+            name: name.map(PathBuf::from),
+            ..Default::default()
+        };
+        let jobs = [task("/named", None), task("/x", Some("mine.bin")), task("/new.bin", None)].map(|t| job(&args, 4, &dir, t));
+        let kept = probe::without_existing(Vec::from(jobs), &ui).await;
+        assert_eq!(kept.iter().map(|job| job.label.as_str()).collect::<Vec<_>>(), ["new.bin"]);
+        let skipped: Vec<(String, String, u64)> = json_items(&log)
+            .iter()
+            .map(|i| (i["status"].as_str().unwrap().into(), i["path"].as_str().unwrap().into(), i["size"].as_u64().unwrap()))
+            .collect();
+        let path = |name: &str| dir.join(name).display().to_string();
+        assert_eq!(skipped, [("skipped".into(), path("kept.bin"), 3), ("skipped".into(), path("mine.bin"), 3)]);
+    }
+
+    /// --dry-run lists what would be downloaded where, a torrent's files one by one, and writes
+    /// nothing, not even the download directory.
+    #[tokio::test]
+    async fn a_dry_run_lists_a_torrents_files_and_writes_nothing() {
+        let dir = test_dir("dry-run");
+        let torrent = dir.join("pack.torrent");
+        let bencoded = "d4:infod5:filesld6:lengthi3e4:pathl5:a.txteed6:lengthi5e4:pathl3:sub5:b.txteee4:name4:packee";
+        std::fs::write(&torrent, bencoded).unwrap();
+        std::fs::write(dir.join("there.iso"), "x").unwrap();
+        let out = dir.join("out");
+        let (ui, log) = json_ui(&dir);
+        let args = parse(&["--dry-run", "--no-clobber", "u"]);
+        let swarm = Task { urls: vec![Url::from_file_path(&torrent).unwrap()], name: Some("pack".into()), p2p: true, ..Default::default() };
+        let there = Task { urls: vec![Url::parse("https://a.example/there.iso").unwrap()], name: Some("there.iso".into()), ..Default::default() };
+        let unnamed = Task { urls: vec![Url::parse("https://a.example/get?id=1").unwrap()], ..Default::default() };
+        let jobs = [(job(&args, 4, &out, swarm), None), (job(&args, 4, &dir, there), None), (job(&args, 4, &out, unnamed), Some(7))];
+        probe::dry_run(&jobs, &reqwest::Client::new(), &ui, true).await;
+        let listed: Vec<(String, String, Option<u64>)> = json_items(&log)
+            .iter()
+            .map(|i| (i["status"].as_str().unwrap().into(), i["path"].as_str().unwrap().into(), i["size"].as_u64()))
+            .collect();
+        let at = |path: PathBuf| path.display().to_string();
+        let expected = [
+            ("ok".into(), at(out.join("pack").join("a.txt")), Some(3)),
+            ("ok".into(), at(out.join("pack").join("sub").join("b.txt")), Some(5)),
+            ("skipped".into(), at(dir.join("there.iso")), None),
+            ("ok".into(), at(out.join("")), Some(7)),
+        ];
+        assert_eq!(listed, expected);
+        assert!(!out.exists());
+    }
+
+    #[tokio::test]
+    async fn a_zip_preview_lists_sizes_names_and_the_total() {
+        use hyperfetch_core::zipdir::ZipEntry;
+        let entry = |name: &str, size, compressed| ZipEntry { name: name.into(), size, compressed, modified: None };
+        let lines = probe::zip_lines(&[entry("docs/", 0, 0), entry("docs/a.txt", 2048, 1000), entry("b.bin", 1024, 1024)]);
+        assert_eq!(lines.len(), 4);
+        assert!(lines[1].ends_with("2.00 KiB  docs/a.txt"), "{}", lines[1]);
+        assert_eq!(lines[3], "3 entries, 3.00 KiB (1.98 KiB compressed)");
+        // A server that sends whole files only cannot show what is inside one.
+        let server = serve_answers(|_| response("200 OK", "application/zip", "PK")).await;
+        assert_eq!(preview(&parse(&[&format!("{server}/a.zip")]), &Ui::new(true)).await, EXIT_FAILED);
+        assert_eq!(to_stdout(&parse(&["--stdout", "https://a.example/1", "https://b.example/1"]), &Ui::new(true), &Shutdown::install()).await, EXIT_USAGE);
     }
 
     #[test]

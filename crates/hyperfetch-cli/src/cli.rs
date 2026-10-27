@@ -66,7 +66,7 @@ pub struct Args {
 
     /// Speed limit in bytes/s for all running downloads (-j) together, e.g. 500K, 2M, 1.5MiB (K/M/G
     /// are powers of 1024; 0 = unlimited)
-    #[arg(long = "max-speed", value_name = "RATE", value_parser = parse_speed)]
+    #[arg(long = "max-speed", value_name = "RATE", value_parser = parse_bytes)]
     pub max_speed: Option<u64>,
 
     /// Failed attempts per chunk before a download gives up (attempts that made progress are free)
@@ -76,6 +76,35 @@ pub struct Args {
     /// Seconds without data before a connection is considered stalled and retried (1-3600)
     #[arg(long = "stall-timeout", value_name = "SECS", default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3600))]
     pub stall_timeout: u64,
+
+    /// Skip a download whose file is there already
+    #[arg(long = "no-clobber", conflicts_with = "only_if_newer")]
+    pub no_clobber: bool,
+
+    /// Download a file that is there already again only when its server has a newer one (implies
+    /// --remote-time)
+    #[arg(short = 'N', long = "only-if-newer")]
+    pub only_if_newer: bool,
+
+    /// Give each finished file the date its server gives it
+    #[arg(long = "remote-time")]
+    pub remote_time: bool,
+
+    /// Fail a download larger than this, e.g. 10M or 2G (K/M/G are powers of 1024)
+    #[arg(long = "max-filesize", value_name = "SIZE", value_parser = parse_bytes)]
+    pub max_filesize: Option<u64>,
+
+    /// Do not check a download against the checksum its site publishes
+    #[arg(long = "no-remote-checksum")]
+    pub no_remote_checksum: bool,
+
+    /// Adapt each download's connections as it goes: one more while that makes it faster
+    #[arg(long = "adaptive", overrides_with = "no_adaptive")]
+    pub adaptive: bool,
+
+    /// Keep the connections each download starts with
+    #[arg(long = "no-adaptive", overrides_with = "adaptive")]
+    pub no_adaptive: bool,
 
     /// Wait until each finished file is on the disk before reporting it done. Without it the OS
     /// writes the file out on its own schedule, so a power loss right after a download finishes
@@ -91,9 +120,44 @@ pub struct Args {
     #[arg(long = "load-cookies", value_name = "FILE", value_parser = existing_file, conflicts_with = "repair")]
     pub load_cookies: Option<PathBuf>,
 
-    /// Authorization header, e.g. "Authorization: Bearer TOKEN" or just "Bearer TOKEN"
-    #[arg(long = "header", value_name = "HEADER", value_parser = parse_auth_header, conflicts_with = "repair")]
-    pub auth_header: Option<String>,
+    /// Request header "Name: value", repeat it for several; a bare value ("Bearer TOKEN") is an
+    /// Authorization header. Sent only to the hosts of the links given, never to the mirrors or
+    /// files a .metalink, .torrent or folder lists
+    #[arg(long = "header", value_name = "HEADER", value_parser = parse_header, conflicts_with = "repair")]
+    pub headers: Vec<(String, String)>,
+
+    /// Basic sign-in sent only to the hosts of the links given; without :PASS a terminal asks for
+    /// the password (an Authorization --header wins over it)
+    #[arg(short = 'u', long = "user", value_name = "USER[:PASS]", conflicts_with = "repair")]
+    pub user: Option<String>,
+
+    /// Cookies, e.g. "a=b; c=d", sent only to the hosts of the links given
+    #[arg(long = "cookie", value_name = "STRING", conflicts_with = "repair")]
+    pub cookie: Option<String>,
+
+    /// User-Agent sent in place of the browser one
+    #[arg(short = 'U', long = "user-agent", value_name = "UA")]
+    pub user_agent: Option<String>,
+
+    /// Do not check TLS certificates: anyone on the way can then read and change the download
+    #[arg(short = 'k', long = "insecure")]
+    pub insecure: bool,
+
+    /// Connect over IPv4 only
+    #[arg(short = '4', long = "ipv4", conflicts_with = "ipv6")]
+    pub ipv4: bool,
+
+    /// Connect over IPv6 only
+    #[arg(short = '6', long = "ipv6")]
+    pub ipv6: bool,
+
+    /// Seconds opening a connection may take: DNS, TCP and TLS (1-3600)
+    #[arg(long = "connect-timeout", value_name = "SECS", default_value_t = DownloadOptions::default().connect_timeout_secs, value_parser = clap::value_parser!(u64).range(1..=3600))]
+    pub connect_timeout: u64,
+
+    /// Connect directly, ignoring the proxy variables of the environment
+    #[arg(long = "no-proxy", conflicts_with_all = ["proxy", "proxy_pool", "proxies_file"])]
+    pub no_proxy: bool,
 
     /// Password of a share, a video or an archive (over one given in a paste)
     #[arg(long = "password", value_name = "PASS", conflicts_with = "repair")]
@@ -210,6 +274,10 @@ pub struct Args {
     #[arg(long = "live-from-start")]
     pub live_from_start: bool,
 
+    /// End a live recording after N seconds of it
+    #[arg(long = "record-seconds", value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
+    pub record_seconds: Option<u64>,
+
     /// Wait for a scheduled stream or premiere to start instead of failing
     #[arg(long = "wait-for-video")]
     pub wait_for_video: bool,
@@ -279,6 +347,72 @@ pub struct Args {
     /// whole app bundle; then exit
     #[arg(long = "update", conflicts_with_all = ["urls", "input_file", "verify", "repair", "history"])]
     pub update: bool,
+
+    /// One JSON object per finished item on stdout: {"status": "ok", "failed", "skipped" or
+    /// "up-to-date", "url", "path", "size", "checksum", "checked_against", "error"}; what is
+    /// printed otherwise goes to stderr
+    #[arg(long = "json", conflicts_with_all = ["history", "update", "verify", "preview", "stdout"])]
+    pub json: bool,
+
+    /// Probe only: print each link's file name, size, type, whether it resumes, its validators
+    /// and the checksum its site publishes. Nothing is written; a bad link exits with 1
+    #[arg(long = "spider", conflicts_with_all = ["dry_run", "preview", "stdout", "history", "update", "verify"])]
+    pub spider: bool,
+
+    /// Print the request and response headers of each link's probe (> and < lines, on stderr),
+    /// with sign-ins and cookies masked
+    #[arg(short = 'S', long = "server-response")]
+    pub server_response: bool,
+
+    /// List the files in a remote ZIP (name, size, total) without downloading it
+    #[arg(long = "preview", conflicts_with_all = ["dry_run", "stdout", "input_file", "history", "update", "verify"])]
+    pub preview: bool,
+
+    /// Print what the run would download (name, size if known, path), with folders, playlists,
+    /// channels, feeds, metalinks and torrents expanded; nothing is written
+    #[arg(long = "dry-run", conflicts_with_all = ["stdout", "history", "update", "verify"])]
+    pub dry_run: bool,
+
+    /// Write one direct file link's bytes to stdout as they arrive (progress and messages go to
+    /// stderr)
+    #[arg(long = "stdout", conflicts_with_all = ["input_file", "output", "history", "update", "verify"])]
+    pub stdout: bool,
+
+    /// Append what is printed (warnings, results; not progress bars) to FILE too
+    #[arg(long = "logfile", value_name = "FILE")]
+    pub logfile: Option<PathBuf>,
+
+    /// Print a completion script for this shell, then exit
+    #[arg(long = "completions", value_name = "SHELL", value_enum)]
+    pub completions: Option<clap_complete::Shell>,
+}
+
+impl Args {
+    /// The Authorization header of --header (or -u), if any.
+    pub fn auth_header(&self) -> Option<String> {
+        self.headers.iter().rev().find(|(name, _)| name == AUTHORIZATION).map(|(_, value)| value.clone())
+    }
+
+    /// The other headers of --header.
+    pub fn extra_headers(&self) -> Vec<(String, String)> {
+        self.headers.iter().filter(|(name, _)| name != AUTHORIZATION).cloned().collect()
+    }
+}
+
+const AUTHORIZATION: &str = "Authorization";
+
+/// The Basic Authorization value of `-u USER[:PASS]`, the password asked of `ask` when it is
+/// missing; without `ask` (no terminal) that is an error.
+pub fn basic_auth(user: &str, ask: Option<fn(&str) -> Option<String>>) -> Result<String, String> {
+    use base64::Engine as _;
+    let pair = match user.contains(':') {
+        true => user.to_string(),
+        false => {
+            let missing = || format!("-u {user} has no password: give it as -u {user}:PASS, or run at a terminal to be asked for it");
+            format!("{user}:{}", ask.and_then(|ask| ask(user)).ok_or_else(missing)?)
+        }
+    };
+    Ok(format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(pair)))
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug)]
@@ -304,8 +438,9 @@ impl From<Browser> for BrowserCookieSource {
     }
 }
 
-/// Parses "500K", "2M", "1.5MiB", "750kb/s" or plain bytes. K/M/G are binary multiples.
-pub fn parse_speed(s: &str) -> Result<u64, String> {
+/// Parses a speed or size: "500K", "2M", "1.5MiB", "750kb/s" or plain bytes. K/M/G are binary
+/// multiples.
+pub fn parse_bytes(s: &str) -> Result<u64, String> {
     let lower = s.trim().to_ascii_lowercase();
     let lower = lower.strip_suffix("/s").unwrap_or(&lower);
     let split = lower.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(lower.len());
@@ -317,7 +452,7 @@ pub fn parse_speed(s: &str) -> Result<u64, String> {
         "g" | "gb" | "gib" => 1024.0 * 1024.0 * 1024.0,
         other => return Err(format!("unknown unit '{}' (use K, M or G, e.g. 500K or 2M)", other)),
     };
-    let value: f64 = number.parse().map_err(|_| format!("'{}' is not a speed (e.g. 500K, 2M, 1.5MiB)", s))?;
+    let value: f64 = number.parse().map_err(|_| format!("'{}' is not a number of bytes (e.g. 500K, 2M, 1.5MiB)", s))?;
     let bytes = value * multiplier;
     if !bytes.is_finite() || bytes > u64::MAX as f64 {
         return Err(format!("'{}' is too large", s));
@@ -325,30 +460,31 @@ pub fn parse_speed(s: &str) -> Result<u64, String> {
     Ok(bytes.round() as u64)
 }
 
-/// Accepts curl-style "Authorization: VALUE" or a bare "VALUE" and returns the header value.
-/// The engine can only send an Authorization header, so any other header name is rejected.
-pub fn parse_auth_header(s: &str) -> Result<String, String> {
+/// Accepts curl-style "Name: VALUE", or a bare "VALUE" for Authorization, as (name, value); the
+/// Authorization header is named "Authorization" whatever its case. The headers a download sets
+/// itself are refused.
+pub fn parse_header(s: &str) -> Result<(String, String), String> {
+    const OWN: [&str; 5] = ["host", "range", "content-length", "transfer-encoding", "connection"];
     let s = s.trim();
-    let value = match s.split_once(':') {
+    let (name, value) = match s.split_once(':') {
         // A name is a single token ("Bearer abc:def" is a value that contains a colon).
-        Some((name, value)) if !name.is_empty() && !name.contains(char::is_whitespace) => {
-            if !name.eq_ignore_ascii_case("authorization") {
-                return Err(format!(
-                    "only the Authorization header is supported, not '{}' (use --load-cookies for cookies)",
-                    name
-                ));
-            }
-            value.trim()
-        }
-        _ => s,
+        Some((name, value)) if !name.is_empty() && !name.contains(char::is_whitespace) => (name, value.trim()),
+        _ => (AUTHORIZATION, s),
     };
+    let name = if name.eq_ignore_ascii_case(AUTHORIZATION) { AUTHORIZATION } else { name };
+    if reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_err() {
+        return Err(format!("'{}' is not a header name", name));
+    }
+    if OWN.iter().any(|own| name.eq_ignore_ascii_case(own)) {
+        return Err(format!("the download sets the {} header itself", name));
+    }
     if value.is_empty() {
-        return Err("the Authorization header value is empty".to_string());
+        return Err(format!("the {} header value is empty", name));
     }
     if value.chars().any(|c| c.is_control()) {
         return Err("the header value contains control characters".to_string());
     }
-    Ok(value.to_string())
+    Ok((name.to_string(), value.to_string()))
 }
 
 fn parse_proxy(s: &str) -> Result<String, String> {
@@ -456,28 +592,80 @@ mod tests {
 
     #[test]
     fn speed_units() {
-        assert_eq!(parse_speed("1048576"), Ok(1_048_576));
-        assert_eq!(parse_speed("500K"), Ok(512_000));
-        assert_eq!(parse_speed("2M"), Ok(2 * 1024 * 1024));
-        assert_eq!(parse_speed("1.5MiB"), Ok(1_572_864));
-        assert_eq!(parse_speed("750kb/s"), Ok(768_000));
-        assert_eq!(parse_speed("1g"), Ok(1024 * 1024 * 1024));
-        assert_eq!(parse_speed("0"), Ok(0));
-        assert!(parse_speed("fast").is_err());
-        assert!(parse_speed("5T").is_err());
-        assert!(parse_speed("").is_err());
-        assert!(parse_speed("1.2.3M").is_err());
+        assert_eq!(parse_bytes("1048576"), Ok(1_048_576));
+        assert_eq!(parse_bytes("500K"), Ok(512_000));
+        assert_eq!(parse_bytes("2M"), Ok(2 * 1024 * 1024));
+        assert_eq!(parse_bytes("1.5MiB"), Ok(1_572_864));
+        assert_eq!(parse_bytes("750kb/s"), Ok(768_000));
+        assert_eq!(parse_bytes("1g"), Ok(1024 * 1024 * 1024));
+        assert_eq!(parse_bytes("0"), Ok(0));
+        assert!(parse_bytes("fast").is_err());
+        assert!(parse_bytes("5T").is_err());
+        assert!(parse_bytes("").is_err());
+        assert!(parse_bytes("1.2.3M").is_err());
     }
 
     #[test]
-    fn auth_header_forms() {
-        assert_eq!(parse_auth_header("Authorization: Bearer x").as_deref(), Ok("Bearer x"));
-        assert_eq!(parse_auth_header("authorization:Basic abc=").as_deref(), Ok("Basic abc="));
-        assert_eq!(parse_auth_header("Bearer x").as_deref(), Ok("Bearer x"));
-        assert_eq!(parse_auth_header("Bearer a:b").as_deref(), Ok("Bearer a:b"));
-        assert!(parse_auth_header("Cookie: a=b").unwrap_err().contains("only the Authorization"));
-        assert!(parse_auth_header("Authorization:   ").is_err());
-        assert!(parse_auth_header("Bearer x\r\nX-Evil: 1").is_err());
+    fn header_forms() {
+        let header = |s: &str| parse_header(s).map(|(name, value)| format!("{name}={value}"));
+        assert_eq!(header("Authorization: Bearer x").as_deref(), Ok("Authorization=Bearer x"));
+        assert_eq!(header("authorization:Basic abc=").as_deref(), Ok("Authorization=Basic abc="));
+        assert_eq!(header("Bearer x").as_deref(), Ok("Authorization=Bearer x"));
+        assert_eq!(header("Bearer a:b").as_deref(), Ok("Authorization=Bearer a:b"));
+        assert_eq!(header("Cookie: a=b").as_deref(), Ok("Cookie=a=b"));
+        assert_eq!(header("X-Api-Key:  k:1 ").as_deref(), Ok("X-Api-Key=k:1"));
+        assert!(header("Authorization:   ").is_err());
+        assert!(header("Bearer x\r\nX-Evil: 1").is_err());
+        assert!(header("X-A: b\nc").is_err());
+        assert!(header("X(A): b").unwrap_err().contains("not a header name"));
+        for own in ["Host: h", "range: bytes=0-", "Content-Length: 1", "Transfer-Encoding: chunked", "Connection: close"] {
+            assert!(header(own).unwrap_err().contains("sets the"), "{own}");
+        }
+    }
+
+    #[test]
+    fn a_user_without_a_password_is_asked_only_where_someone_answers() {
+        assert_eq!(basic_auth("bob:pw", None).as_deref(), Ok("Basic Ym9iOnB3"));
+        assert_eq!(basic_auth("bob:", None).as_deref(), Ok("Basic Ym9iOg=="), "an empty password is one");
+        assert_eq!(basic_auth("bob", Some(|user| Some(format!("{user}-pw")))).as_deref(), Ok("Basic Ym9iOmJvYi1wdw=="));
+        assert!(basic_auth("bob", None).unwrap_err().contains("-u bob:PASS"));
+        assert!(basic_auth("bob", Some(|_| None)).is_err(), "no answer");
+    }
+
+    #[test]
+    fn request_and_output_flags() {
+        let parse = |args: &[&str]| Args::try_parse_from(std::iter::once("cli").chain(args.iter().copied()));
+        let args = parse(&["u"]).unwrap();
+        assert!(!args.json && !args.spider && !args.server_response && !args.preview && !args.dry_run && !args.stdout);
+        assert!(!args.insecure && !args.ipv4 && !args.ipv6 && !args.no_proxy && !args.no_clobber && !args.adaptive);
+        assert_eq!((args.connect_timeout, args.max_filesize, args.record_seconds), (15, None, None));
+        let args = parse(&[
+            "-S", "-k", "-4", "-N", "-U", "agent/1", "-u", "bob:pw", "--cookie", "a=b; c=d", "--header", "X-A: 1", "--header",
+            "Bearer t", "--max-filesize", "10M", "--connect-timeout", "5", "--record-seconds", "60", "--no-remote-checksum",
+            "--remote-time", "--logfile", "log.txt", "--json", "u",
+        ])
+        .unwrap();
+        assert!(args.server_response && args.insecure && args.ipv4 && args.only_if_newer && args.no_remote_checksum && args.remote_time);
+        assert_eq!((args.user_agent.as_deref(), args.user.as_deref(), args.cookie.as_deref()), (Some("agent/1"), Some("bob:pw"), Some("a=b; c=d")));
+        assert_eq!((args.auth_header().as_deref(), args.extra_headers()), (Some("Bearer t"), vec![("X-A".to_string(), "1".to_string())]));
+        assert_eq!((args.max_filesize, args.connect_timeout, args.record_seconds), (Some(10 << 20), 5, Some(60)));
+        assert!(parse(&["-4", "-6", "u"]).is_err());
+        assert!(parse(&["--no-clobber", "-N", "u"]).is_err());
+        assert!(parse(&["--no-proxy", "--proxy", "http://p:1", "u"]).is_err());
+        assert!(parse(&["--connect-timeout", "0", "u"]).is_err());
+        assert!(parse(&["--record-seconds", "0", "u"]).is_err());
+        assert!(parse(&["--header", "Host: x", "u"]).is_err());
+        assert!(parse(&["--verify", "f", "--repair", "-u", "bob:pw"]).is_err());
+        assert!(parse(&["--verify", "f", "--repair", "--cookie", "a=b"]).is_err());
+        // The last of --adaptive and --no-adaptive wins.
+        assert!(parse(&["--no-adaptive", "--adaptive", "u"]).unwrap().adaptive);
+        assert!(!parse(&["--adaptive", "--no-adaptive", "u"]).unwrap().adaptive);
+        for exclusive in [["--spider", "--dry-run"], ["--preview", "--json"], ["--stdout", "--json"], ["--stdout", "--spider"], ["--json", "--history"]] {
+            assert!(parse(&[exclusive[0], exclusive[1], "u"]).is_err(), "{exclusive:?}");
+        }
+        assert!(parse(&["--stdout", "-o", "f", "u"]).is_err());
+        assert!(parse(&["--completions", "powershell"]).unwrap().completions.is_some());
+        assert!(parse(&["--completions", "tcsh"]).is_err());
     }
 
     #[test]
@@ -513,7 +701,7 @@ mod tests {
         assert!(parse(&["--verify", "f", "--repair", "--header", "Bearer t"]).is_err());
         assert!(parse(&["--verify", "f", "--repair", "--cookies-from-browser", "firefox"]).is_err());
         let args = parse(&["-vv", "--max-speed", "2M", "--header", "Authorization: Bearer t", "u"]).unwrap();
-        assert_eq!((args.verbose, args.max_speed, args.auth_header.as_deref()), (2, Some(2 << 20), Some("Bearer t")));
+        assert_eq!((args.verbose, args.max_speed, args.auth_header().as_deref()), (2, Some(2 << 20), Some("Bearer t")));
         assert_eq!(parse(&["--password", "p w", "u"]).unwrap().password.as_deref(), Some("p w"));
         assert!(parse(&["--verify", "f", "--repair", "--password", "p"]).is_err());
     }
