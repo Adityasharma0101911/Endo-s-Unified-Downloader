@@ -21,6 +21,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::chunk::{ChunkManager, ChunkSnapshot};
+use crate::digest::Unfinished;
 use crate::history::{is_redacted, redact_url, DownloadHistoryManager, HistoryEntry, HistoryStatus};
 use crate::hls::HlsError;
 use crate::hosts::{self, HostKey, HostProfile, HostSlot};
@@ -116,6 +117,9 @@ pub struct EngineSnapshot {
     pub torrent: Option<crate::p2p::TorrentProgress>,
     /// What post-processing tells the user (see `crate::postprocess`), in the last snapshot.
     pub notes: Vec<String>,
+    /// Whose checksum the finished file matched when it was not the user's ("the site's
+    /// SHA-256", see `DownloadOptions::remote_checksum`), in the last snapshots.
+    pub checked_against: Option<String>,
 }
 
 impl EngineSnapshot {
@@ -267,6 +271,15 @@ pub struct DownloadOptions {
     pub max_filesize: Option<u64>,
     /// The finished file takes the date its server gives it (`Last-Modified`, or MDTM over FTP).
     pub remote_time: bool,
+    /// Without `expected_checksum`, the file is checked against the checksum its site publishes,
+    /// if any (see `crate::digest::published_checksum`): a mismatch fails the download as the
+    /// user's checksum would, and a match shows in `EngineSnapshot::checked_against`.
+    pub remote_checksum: bool,
+    /// A metalink's hashes of the file's pieces (`ingest::Task::pieces`): when the whole file
+    /// fails `expected_checksum`, or there is none, the pieces that fail theirs are fetched again,
+    /// from another mirror when there are several. Not saved: a file may have thousands.
+    #[serde(skip)]
+    pub metalink_pieces: Option<crate::metalink::Pieces>,
 }
 
 impl Default for DownloadOptions {
@@ -325,6 +338,8 @@ impl Default for DownloadOptions {
             adaptive: false,
             max_filesize: None,
             remote_time: false,
+            remote_checksum: true,
+            metalink_pieces: None,
         }
     }
 }
@@ -390,6 +405,9 @@ pub struct DownloadEngine {
     /// A file found downloaded already (see `plan_target`): `run` leaves it as it is instead of
     /// post-processing it again.
     already_done: Arc<std::sync::Mutex<Option<PathBuf>>>,
+    /// The checksum the file's site publishes, being looked for, and whether it confirmed the
+    /// file (see `DownloadOptions::remote_checksum`).
+    site: Arc<Mutex<crate::digest::Site>>,
 }
 
 impl DownloadEngine {
@@ -430,6 +448,7 @@ impl DownloadEngine {
                     decrypt: None,
                     ftp: None,
                     already_done: Arc::default(),
+                    site: Arc::default(),
                 },
             },
             // A password alone adds no header, but is scoped as they are (see `media_options_for`).
@@ -448,6 +467,7 @@ impl DownloadEngine {
             decrypt: None,
             ftp: None,
             already_done: Arc::default(),
+            site: Arc::default(),
         }
     }
 
@@ -494,6 +514,18 @@ impl DownloadEngine {
                 result = engine.boxed(|engine| engine.fetch_all(tx)).await;
             }
         }
+        // Pieces that fail a metalink's hashes come again (see `crate::digest::finish`), each round
+        // from one mirror, another than the round before when there are several.
+        for round in 1..=crate::digest::REFETCH_ROUNDS {
+            if !result.as_ref().is_err_and(|e| e == crate::digest::REFETCH) || self.cancel_token.is_cancelled() {
+                break;
+            }
+            let Some(mirror) = self.urls.get(round % self.urls.len().max(1)).cloned() else { break };
+            let engine = self.alike(vec![mirror], self.options.clone(), self.client.clone());
+            let tx = snapshot_tx.clone();
+            result = engine.boxed(|engine| engine.fetch_all(tx)).await;
+        }
+        let mut result = result.map_err(crate::digest::refetch_failed);
         let lines = &self.options.archive_lines;
         if result.is_ok() && !lines.is_empty() && !self.cancel_token.is_cancelled() {
             crate::media::archive_downloaded(crate::media::archive_file().as_deref(), lines.clone()).await;
@@ -516,7 +548,8 @@ impl DownloadEngine {
             }
             if !done.notes.is_empty() {
                 let size = crate::postprocess::size_of(&done.path);
-                emit(&snapshot_tx, || EngineSnapshot { notes: done.notes, ..done_snapshot(size, &done.path) });
+                let checked_against = self.checked_against();
+                emit(&snapshot_tx, || EngineSnapshot { notes: done.notes, checked_against, ..done_snapshot(size, &done.path) });
             }
             result = Ok(done.path);
         }
@@ -621,12 +654,25 @@ impl DownloadEngine {
     fn over_http2(&self) -> Self {
         let options = DownloadOptions { http2: true, ..self.options.clone() };
         let client = build_client(&options);
-        let mut engine = Self::with_client_result(self.urls.clone(), options, client);
+        self.alike(self.urls.clone(), options, client)
+    }
+
+    /// A download of `urls` with `options` through `client`, held to this one's speed limit,
+    /// stopped by its `cancel` and telling its results through it.
+    fn alike(&self, urls: Vec<Url>, options: DownloadOptions, client: Result<Client, String>) -> Self {
+        let mut engine = Self::with_client_result(urls, options, client);
         engine.limiter = self.limiter.clone();
         engine.cancel_flag = Arc::clone(&self.cancel_flag);
         engine.cancel_token = self.cancel_token.clone();
         engine.already_done = Arc::clone(&self.already_done);
+        engine.site = Arc::clone(&self.site);
         engine
+    }
+
+    /// Whose checksum the finished file matched when it was not the user's: "the site's SHA-256"
+    /// (see `DownloadOptions::remote_checksum`). Also in the last snapshots.
+    pub fn checked_against(&self) -> Option<String> {
+        self.site.lock().note.clone()
     }
 
     /// Downloads what the resolved mirrors serve: an HLS stream if one is a playlist, by its URL
@@ -1130,8 +1176,10 @@ impl DownloadEngine {
         let options = DownloadOptions {
             output_path: Some(stream.path.clone()),
             base_chunk_size: stream.chunk_size.unwrap_or(self.options.base_chunk_size),
-            // The checksum, the user's credentials and cookies are for the page, not this stream.
+            // The checksum, the user's credentials and cookies are for the page, not this stream,
+            // and its server publishes none.
             expected_checksum: None,
+            remote_checksum: false,
             cookies_path: None,
             auth_header: None,
             secret_headers: Vec::new(),
@@ -1554,6 +1602,10 @@ impl DownloadEngine {
             reference.accepts_ranges
         );
         let modified = reference.last_modified.clone().filter(|_| self.options.remote_time);
+        // A MEGA file is held to its MAC; its server's answers are of the ciphertext.
+        if self.decrypt.is_none() {
+            crate::digest::look_for(&self.site, &self.options, &client, self.auth.clone(), &reference.url, &reference.headers);
+        }
         let written = match reference.size {
             // A plain write (no sparse file, no preallocation, no flush unless fsync_on_complete
             // asks for one in `finalize`), hashed from memory.
@@ -1980,9 +2032,14 @@ impl DownloadEngine {
     ) -> Result<PathBuf, String> {
         let part = part_path(&final_path);
         let state_path = DownloadState::state_file_path(&part);
-        let blake3_hex = match self.verify_written(&part, written).await {
+        let writer = match &written {
+            Written::Writer(writer) => Some(writer.clone()),
+            _ => None,
+        };
+        let verified = self.verify_written(&part, written).await;
+        let blake3_hex = match crate::digest::finish(&part, verified, &self.options, &self.site, writer).await {
             Ok(hash) => hash,
-            Err(VerifyError::Mismatch(e)) => {
+            Err(Unfinished::Wrong(e)) => {
                 // Resuming would only reproduce the same bytes, so start from scratch next time.
                 let _ = blocking(move || {
                     let _ = std::fs::remove_file(&part);
@@ -1992,10 +2049,15 @@ impl DownloadEngine {
                 .await;
                 return Err(e);
             }
-            Err(VerifyError::Io(e)) => return Err(e),
+            Err(Unfinished::Io(e)) => return Err(e),
+            // The `.part` and its state stay, for `run` to fetch those pieces again.
+            Err(Unfinished::Refetch) => return Err(crate::digest::REFETCH.to_string()),
         };
 
+        // A name from the server without a real extension takes the one its contents show.
+        let by_content = self.options.output_path.as_deref().is_none_or(is_dir_target);
         let (target, size) = blocking(move || -> Result<(PathBuf, u64), String> {
+            let final_path = if by_content { crate::sniff::named_by_content(&part, final_path) } else { final_path };
             // Someone may have created the final name while we were downloading.
             let target = if final_path.exists() { free_path(&final_path) } else { final_path };
             let size = std::fs::metadata(&part).map(|m| m.len()).map_err(|e| e.to_string())?;
@@ -2011,7 +2073,7 @@ impl DownloadEngine {
         tracing::info!("Download completed: {} (BLAKE3 {})", target.display(), blake3_hex);
         self.record_completed(target.clone(), Some(size), blake3_hex, started_at, None).await;
 
-        emit(snapshot_tx, || done_snapshot(size, &target));
+        emit(snapshot_tx, || EngineSnapshot { checked_against: self.checked_against(), ..done_snapshot(size, &target) });
         Ok(target)
     }
 
@@ -5977,7 +6039,9 @@ mod tests {
             async move {
                 // 64 KiB per 200 ms on each connection: more connections, more speed.
                 let base = uncapped_file_server(data, Duration::from_millis(200)).await;
-                let options = DownloadOptions { output_path: Some(dir.join(format!("{adaptive}.bin"))), num_connections: 16, adaptive, ..Default::default() };
+                // The site's checksum files would take a slot of the host too.
+                let output_path = Some(dir.join(format!("{adaptive}.bin")));
+                let options = DownloadOptions { output_path, num_connections: 16, adaptive, remote_checksum: false, ..Default::default() };
                 let path = DownloadEngine::new(vec![base.join("f.bin").unwrap()], options).run(None).await.unwrap();
                 (path, hosts::peak(&base))
             }

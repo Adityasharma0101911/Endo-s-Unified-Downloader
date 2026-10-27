@@ -61,7 +61,7 @@ const CATEGORIES: &[(&str, &[&str])] = &[
     ("Pictures", &["jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "heic", "avif", "tif", "tiff"]),
     ("Documents", &["pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "odp", "txt", "rtf", "epub", "mobi", "csv", "md"]),
     ("Archives", &["zip", "7z", "rar", "tar", "gz", "tgz", "xz", "bz2", "zst", "iso"]),
-    ("Programs", &["exe", "msi", "msix", "appx", "dmg", "pkg", "deb", "rpm", "apk", "appimage"]),
+    ("Programs", &["exe", "msi", "msix", "appx", "dmg", "pkg", "deb", "rpm", "apk", "appimage", "elf"]),
 ];
 
 /// Post-processes the download at `path` (a file or a folder) of `source` as `post` says; the
@@ -385,10 +385,14 @@ pub(crate) fn has_links(dir: &Path) -> bool {
 }
 
 /// Moves `file` into the category folder of its extension (see [`CATEGORIES`]) next to it,
-/// numbered if the name is taken. Ok(None) if no category fits. The front ends turn sorting
+/// numbered if the name is taken: of its contents' type when its name says nothing of it (see
+/// `crate::sniff::says_nothing`). Ok(None) if no category fits. The front ends turn sorting
 /// off for a download in a folder of its own (see `ingest::Task::keeps_its_place`).
 fn sort(file: &Path) -> std::io::Result<Option<PathBuf>> {
-    let ext = file.extension().unwrap_or_default().to_string_lossy().to_ascii_lowercase();
+    let ext = match crate::sniff::says_nothing(file) {
+        true => crate::sniff::type_of(file).unwrap_or_default().to_string(),
+        false => file.extension().unwrap_or_default().to_string_lossy().to_ascii_lowercase(),
+    };
     let Some((category, _)) = CATEGORIES.iter().find(|(_, exts)| exts.contains(&ext.as_str())) else { return Ok(None) };
     let (Some(parent), Some(name)) = (file.parent(), file.file_name()) else { return Ok(None) };
     let dir = parent.join(category);
@@ -685,13 +689,14 @@ mod tests {
         let mut made = Vec::new();
         // bsdtar (Windows' and macOS' tar) writes a zip encrypted the traditional way.
         let tar = if cfg!(target_os = "linux") { crate::media::find_in_path("bsdtar") } else { Some(crate::media::system_tar()) };
-        if let Some(tar) = tar {
+        if let Some(tar) = &tar {
             let zip = dir.path().join("locked.zip");
             let options = ["--options", "zip:encryption=traditional", "--passphrase", "s3cret", "-C"];
-            assert!(quiet_command(&tar).args(["-a", "-cf"]).arg(&zip).args(options).arg(&src).arg("inner.txt").status().unwrap().success());
+            assert!(quiet_command(tar).args(["-a", "-cf"]).arg(&zip).args(options).arg(&src).arg("inner.txt").status().unwrap().success());
             made.push(zip);
         }
-        match seven_zip() {
+        // Without a password a .7z goes to tar too, which on Linux only bsdtar reads.
+        match seven_zip().filter(|_| tar.is_some()) {
             Some(seven) => {
                 let archive = dir.path().join("locked.7z");
                 let mut made_7z = quiet_command(&seven);
@@ -699,7 +704,7 @@ mod tests {
                 assert!(made_7z.status().unwrap().success());
                 made.push(archive);
             }
-            None => eprintln!("7-Zip is not installed: its part of the test is skipped"),
+            None => eprintln!("7-Zip or bsdtar is not installed: the .7z part of the test is skipped"),
         }
         let source = url("https://example.com/locked");
         for archive in made {
@@ -750,6 +755,15 @@ mod tests {
         let odd = dir.path().join("thing.xyz");
         std::fs::write(&odd, b"?").unwrap();
         assert_eq!(after_download(&odd, &post, &source, None, None).await.path, odd);
+        // A name that says nothing of the type goes by the contents; a real extension by itself.
+        for (name, folder) in [("bundle", "Archives"), ("get.php", "Archives"), ("tool", "Programs")] {
+            let file = dir.path().join(name);
+            std::fs::write(&file, if name == "tool" { &b"\x7FELF\x02\x01"[..] } else { &b"PK\x03\x04\x14\0"[..] }).unwrap();
+            assert_eq!(after_download(&file, &post, &source, None, None).await.path, dir.path().join(folder).join(name));
+        }
+        let zipped = dir.path().join("notes.txt");
+        std::fs::write(&zipped, b"PK\x03\x04\x14\0").unwrap();
+        assert_eq!(after_download(&zipped, &post, &source, None, None).await.path, dir.path().join("Documents").join("notes.txt"));
         let folder = dir.path().join("Torrent");
         std::fs::create_dir(&folder).unwrap();
         assert_eq!(after_download(&folder, &post, &source, None, None).await.path, folder);
