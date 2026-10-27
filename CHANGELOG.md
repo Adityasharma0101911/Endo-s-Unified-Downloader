@@ -2,10 +2,10 @@
 
 What changed in each release, newest first. Each release's page on [GitHub](https://github.com/Adityasharma0101911/Endo-s-Unified-Downloader/releases) has its files and the full notes.
 
-## Unreleased
+## 1.8.0 (2026-10-27)
 
 - **Installers and packages:** a Windows setup.exe (also for winget), Linux x64 and arm64 `.tar.gz`, `.deb` and `.rpm`, and a static Linux CLI; the Windows programs are code-signed when the project's signing is set up. `install.sh` installs the release for the machine's architecture.
-- **Browser downloads to the app** (off by default): files of chosen types and size go to the app instead of the browser, except from blocked sites, private windows or an Alt-click; the popup can start the app. **Firefox:** a signed add-on that updates itself from the releases.
+- **Browser downloads to the app** (off by default): files of chosen types and size go to the app instead of the browser, except from blocked sites, private windows or an Alt-click; the popup can start the app.
 - **FTP** downloads with several connections and resume; `--max-filesize`; keep the server's file date (`--remote-time`); download only when the server has a newer copy (`-N`).
 - **Checksums the site publishes** (in its headers or a `.sha256`/`SHA256SUMS` file beside the download) are checked by themselves. A finished file that fails its check later is repaired by fetching only its damaged pieces; a metalink's piece hashes re-fetch only the bad pieces. A file with no proper extension gets one from its contents, and sorting goes by it.
 - **Request options:** custom headers, user agent, cookies, IPv4 or IPv6 only, connect timeout, no proxy, and (CLI only) skipping certificate checks; live recordings for a set time (`--record-seconds`); a connection count that adapts (off by default).
