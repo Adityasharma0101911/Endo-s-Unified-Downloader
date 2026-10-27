@@ -854,6 +854,8 @@ mod tests {
         assert_eq!(items[2]["path"].as_str(), Some(path.as_str()));
         assert!(text.contains("[FAILED] b: "), "the human lines too: {text}");
         assert!(!text.contains("secret"), "{text}");
+        drop(ui);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Downloads running at once stay within --max-speed together, not each on its own.

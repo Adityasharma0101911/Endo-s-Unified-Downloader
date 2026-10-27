@@ -1500,6 +1500,8 @@ mod tests {
         let heads = heads.lock().unwrap().join("\n");
         assert!(heads.contains("authorization: bearer s3cret") && heads.contains("cookie: sid=1") && heads.contains("x-key: k1"));
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "only the log was written");
+        drop(ui);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// --no-clobber skips a download whose file is there: at its own path, or under the name its
@@ -1532,6 +1534,8 @@ mod tests {
             .collect();
         let path = |name: &str| dir.join(name).display().to_string();
         assert_eq!(skipped, [("skipped".into(), path("kept.bin"), 3), ("skipped".into(), path("mine.bin"), 3)]);
+        drop(ui);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// --dry-run lists what would be downloaded where, a torrent's files one by one, and writes
@@ -1564,6 +1568,8 @@ mod tests {
         ];
         assert_eq!(listed, expected);
         assert!(!out.exists());
+        drop(ui);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
