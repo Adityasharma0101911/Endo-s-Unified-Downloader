@@ -224,7 +224,8 @@ build_binaries() {
 }
 
 # --- Or: the newest release -----------------------------------------------------
-get() { curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o "$2" "$1" || die "Could not download $1"; }
+# get URL FILE [MESSAGE]: MESSAGE is the error when it cannot be downloaded.
+get() { curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o "$2" "$1" || die "${3:-Could not download $1}"; }
 
 # Unpacks the newest release's Linux tar.gz into $WORK/app once it matches the release's
 # SHA256SUMS, and that list the maintainer's signature when OpenSSL 3 can check it. The list names
@@ -242,7 +243,8 @@ fetch_release() {
     [ -n "$version" ] || die "The release's SHA256SUMS does not name its version; nothing was installed."
     tarball="Endos-Unified-Downloader-v$version-linux-$ARCH.tar.gz"
     info "Version $version"
-    get "$RELEASES/download/v$version/$tarball" "$WORK/$tarball"
+    get "$RELEASES/download/v$version/$tarball" "$WORK/$tarball" \
+        "Could not download $tarball (the release may have no Linux $ARCH build); run ./install.sh --from-source from a clone of the repository."
     if openssl version 2>/dev/null | grep -q '^OpenSSL [3-9]'; then
         get "$RELEASES/download/v$version/SHA256SUMS.sig" "$WORK/SHA256SUMS.sig"
         # An Ed25519 public key's DER is a fixed 12-byte header and the raw key, so in base64 the
