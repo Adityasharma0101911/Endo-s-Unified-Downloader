@@ -63,8 +63,12 @@
 
   <div id="app-hint" class="banner tone-amber" hidden>
     <svg class="icon" aria-hidden="true"><use href="#i-plugs"/></svg>
-    <p><strong>The desktop app isn't running.</strong> Open Endo's Unified Downloader on this computer; until it runs, downloads fail with an error.</p>
+    <div>
+      <p><strong>The desktop app isn't running.</strong> Start it here, or open Endo's Unified Downloader on this computer; until it runs, downloads fail with an error.</p>
+      <button id="start-app" type="button" class="btn small primary"><svg class="icon" aria-hidden="true"><use href="#i-play"/></svg><span>Start the app</span></button>
+    </div>
   </div>
+  <p id="start-msg" class="msg" role="status" aria-live="polite"></p>
   <div id="app-outdated" class="banner tone-amber" hidden>
     <svg class="icon" aria-hidden="true"><use href="#i-update"/></svg>
     <p><strong>An older Endo's Unified Downloader is running.</strong> Update it, then restart it.</p>
@@ -273,6 +277,26 @@
         <div class="setting">
           <label for="convert-mp4">Convert HLS to MP4<small>The app turns saved streams into MP4 files</small></label>
           <input id="convert-mp4" type="checkbox" class="switch" role="switch">
+        </div>
+      </div>
+
+      <div class="card">
+        <h2 class="card-title"><svg class="icon" aria-hidden="true"><use href="#i-download"/></svg>Browser downloads</h2>
+        <div class="setting">
+          <label for="capture">Send browser downloads to the app<small>Files of these types go to the app instead of the browser. When the app isn't running, the browser keeps them. Hold Alt while clicking a link to keep it in the browser.</small></label>
+          <input id="capture" type="checkbox" class="switch" role="switch">
+        </div>
+        <div class="setting stack">
+          <label for="capture-types">File types<small>Extensions, separated by spaces</small></label>
+          <input id="capture-types" type="text" spellcheck="false" autocomplete="off">
+        </div>
+        <div class="setting">
+          <label for="capture-min">Min size<small>MB; smaller downloads stay in the browser (0 = any)</small></label>
+          <input id="capture-min" type="number" min="0" step="1" inputmode="numeric">
+        </div>
+        <div class="setting stack">
+          <label for="capture-sites">Never from these sites<small>Hosts, separated by spaces; their subdomains too</small></label>
+          <input id="capture-sites" type="text" spellcheck="false" autocomplete="off" placeholder="example.com">
         </div>
       </div>
 

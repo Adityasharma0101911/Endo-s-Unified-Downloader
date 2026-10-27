@@ -8,6 +8,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { CAPTURE_TYPES } from "../../lib/capture.js";
 import { normalizeLinks } from "../../lib/links.js";
 import { startFixtures } from "./fixtures/serve.mjs";
 import { INFO, INFO_ERROR, startMockApp } from "./mock-app.mjs";
@@ -776,6 +777,12 @@ async function main() {
   // Throwaway profile, deleted at the end. A short path: under a deep --out, Edge's LevelDB files pass Windows'
   // 260-character limit and chrome.storage.local fails ("IO error: .../LOCK").
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), "eu-"));
+  // Browser downloads (the capture checks) land in the profile, never in the user's Downloads; a page may start
+  // several without the "download multiple files" prompt.
+  const downloads = path.join(profile, "dl");
+  fs.mkdirSync(path.join(profile, "Default"), { recursive: true });
+  const prefs = { download: { default_directory: downloads, prompt_for_download: false }, profile: { default_content_setting_values: { automatic_downloads: 1 } } };
+  fs.writeFileSync(path.join(profile, "Default", "Preferences"), JSON.stringify(prefs));
   const edge = spawn(
     EDGE,
     [
@@ -929,6 +936,116 @@ async function main() {
       check("tabs: the popup reopens on the last tab", after.tab === "tab-settings", after);
       await set(before.min, true);
       await sleep(800);
+      await closePage(page);
+    });
+
+    // "Start the app": with the app gone a failed Download offers it; the click opens endo-dl://open (recorded here:
+    // a headless browser launches nothing), waits for the app (the mock comes back after 1.5 s) and sends it again.
+    await step("start the app", async () => {
+      await evaluate(sw, `{
+        globalThis.__launched = [];
+        const create = chrome.tabs.create.bind(chrome.tabs);
+        chrome.tabs.create = (props) =>
+          !String(props?.url).startsWith("endo-dl:")
+            ? create(props)
+            : create(props).then(
+                (tab) => (__launched.push({ url: props.url, ok: !!tab }), tab),
+                (error) => (__launched.push({ url: props.url, error: String(error) }), Promise.reject(error)),
+              );
+      }`);
+      app.mode = "absent";
+      const page = await openPopup(tabId);
+      labels.set(page.sessionId, "popup, start the app");
+      await view(page, "Media");
+      const failed = await click(page, "/^\\s*download\\s*$/i");
+      const offered = await until(() => evaluate(page.sessionId, "__vis(document.getElementById('start-app'))"), 10000);
+      await captureAfter(page, "start-app", "offered");
+      const since = app.requests.length;
+      const clicked = await click(page, "/start the app/i");
+      await sleep(1500);
+      app.mode = "running";
+      const msg = await until(() => evaluate(page.sessionId, "/started/i.test(document.getElementById('start-msg').innerText) && document.getElementById('start-msg').innerText"), 20000);
+      const resent = app.since(since, /^\/add$/).filter((r) => r.method === "POST" && r.mode === "running");
+      const launched = await evaluate(sw, "globalThis.__launched");
+      check(
+        "start the app: offered after a failed Download; opens endo-dl://open, waits for the app, sends the Download again",
+        failed === "clicked" && !!offered && !!msg && resent.length === 1 && launched.length === 1 && launched[0].url === "endo-dl://open" && launched[0].ok,
+        { failed, clicked, msg, resent: resent.map((r) => r.body?.url), launched },
+      );
+      await captureAfter(page, "start-app", "started");
+      await closePage(page);
+    });
+
+    // "Send browser downloads to the app": off by default; its settings as typed are saved cleaned up. Then a 2 MB
+    // .zip goes to the app with its referrer and cookies and leaves the browser; a small one, one made while the app
+    // is gone and an Alt-click stay in the browser and finish there.
+    await step("capture", async () => {
+      const page = await openPopup(tabId);
+      labels.set(page.sessionId, "popup, capture settings");
+      const fields = () =>
+        evaluate(page.sessionId, `({ on: document.getElementById("capture").checked, types: document.getElementById("capture-types").value, min: document.getElementById("capture-min").value, sites: document.getElementById("capture-sites").value })`);
+      const type = (id, value) =>
+        evaluate(page.sessionId, `{ const i = document.getElementById(${JSON.stringify(id)}); i.value = ${JSON.stringify(value)}; i.dispatchEvent(new Event("change")); }`);
+      await view(page, "Settings");
+      const before = await fields();
+      await type("capture-min", "-3");
+      const refused = await until(() => evaluate(page.sessionId, `document.querySelector("#settings-msg.err") ? document.getElementById("capture-min").value : null`), 2000);
+      await evaluate(page.sessionId, `document.getElementById("capture").click()`);
+      await type("capture-types", ".ZIP, iso tar.gz");
+      await type("capture-sites", "https://Skip.Test/x *.other.test");
+      await sleep(800);
+      await captureAfter(page, "capture", "settings");
+      await send("Page.reload", {}, page.sessionId);
+      await until(() => evaluate(page.sessionId, "document.readyState === 'complete' && document.getElementById('capture-types').value !== ''"), 5000);
+      await evaluate(page.sessionId, PAGE_HELPERS);
+      await view(page, "Settings");
+      const after = await fields();
+      check(
+        "capture settings: off by default; types and sites saved as typed but cleaned up; a bad minimum refused",
+        before.on === false && before.types === CAPTURE_TYPES.join(" ") && before.min === "1" && before.sites === "" &&
+          after.on === true && after.types === "zip iso gz" && after.min === "1" && after.sites === "skip.test other.test" && refused === "1",
+        { before, after, refused },
+      );
+
+      // Each download from a page of its own (a page's second automatic download waits for a prompt): a link to
+      // `file` fixed at its top left, clicked by script, or with Alt held by CDP mouse events.
+      const pages = [];
+      const start = async (file, alt = false) => {
+        const fx = await open(`${FX}/links.html`, { newWindow: true });
+        pages.push(fx);
+        labels.set(fx.sessionId, "capture page");
+        await evaluate(fx.sessionId, `document.cookie = "sess=fixture1; path=/"`);
+        await evaluate(fx.sessionId, `{ const a = document.createElement("a"); a.href = ${JSON.stringify(file)}; a.textContent = "get"; a.style.cssText = "position:fixed;left:0;top:0;width:100px;height:40px;display:block;z-index:9"; document.body.append(a); ${alt ? "" : "a.click();"} }`);
+        if (alt) for (const t of ["mousePressed", "mouseReleased"]) await send("Input.dispatchMouseEvent", { type: t, x: 20, y: 20, button: "left", clickCount: 1, modifiers: 1 }, fx.sessionId);
+      };
+      const inBrowser = (file) => evaluate(sw, `chrome.downloads.search({}).then((all) => all.filter((d) => d.url.endsWith(${JSON.stringify(file)})).map((d) => d.state))`);
+      const added = (since, file) => app.since(since, /^\/add$/).filter((r) => r.method === "POST" && r.mode === "running" && String(r.body?.url).endsWith(file));
+
+      let since = app.requests.length;
+      await start("/files/setup.zip?a");
+      const sent = await until(async () => added(since, "setup.zip?a")[0]?.body, 10000);
+      const gone = await until(async () => (await inBrowser("setup.zip?a")).length === 0, 5000);
+      const leftovers = fs.existsSync(downloads) ? fs.readdirSync(downloads) : [];
+      check(
+        "capture: a matching download goes to the app with its referrer, cookies and name, and leaves the browser",
+        !!sent && sent.referer === `${FX}/links.html` && /sess=fixture1/.test(sent.cookies || "") && sent.filename === "setup.zip" && !!gone && leftovers.length === 0,
+        { sent, gone, leftovers },
+      );
+
+      const staysInBrowser = async (name, file, alt) => {
+        since = app.requests.length;
+        await start(`/files/${file}`, alt);
+        const done = await until(async () => (await inBrowser(file)).join() === "complete", 15000);
+        check(`capture: ${name} stays in the browser and finishes there`, !!done && added(since, file).length === 0, { states: await inBrowser(file), all: await evaluate(sw, `chrome.downloads.search({}).then((all) => all.map((d) => [d.url, d.state, d.error]))`) });
+      };
+      await staysInBrowser("a download under the minimum size", "small.zip?b");
+      app.mode = "absent";
+      await staysInBrowser("a download while the app is unreachable", "setup.zip?c");
+      app.mode = "running";
+      await staysInBrowser("an Alt-click's download", "setup.zip?d", true);
+
+      for (const fx of pages) await send("Target.closeTarget", { targetId: fx.targetId });
+      await evaluate(page.sessionId, `chrome.runtime.sendMessage({ cmd: "SET_SETTINGS", settings: { captureEnabled: false, captureTypes: ${JSON.stringify(CAPTURE_TYPES)}, captureExcludedSites: [] } })`);
       await closePage(page);
     });
 

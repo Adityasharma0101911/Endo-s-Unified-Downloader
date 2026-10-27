@@ -1,5 +1,6 @@
 // Popup: shows what the background found on the active tab and hands it to the desktop app.
 // Everything shown comes from web pages, so it is only ever put into the DOM as text.
+import { parseSites, parseTypes } from "./lib/capture.js";
 import { formatDuration, isMediaSiteHost, sanitizeFilename, suggestFilename } from "./lib/detect.js";
 import { LINK_KINDS, MAX_BATCH, largestSrcset, linkFilter, normalizeLinks, textMatcher } from "./lib/links.js";
 import { isMediaPage, mediaPayload, pickQuality, rememberedChoice, subtitleChoices, videoChoices } from "./lib/media.js";
@@ -24,6 +25,8 @@ let blockedKey = null;
 let ticker = null;
 /** Where the last tab shown in this window is remembered. */
 let viewKey = "";
+/** The last request that failed because the app wasn't running: "Start the app" sends it again. */
+let lastFailed = null;
 
 /** Creates an element with the given properties and children. */
 function el(tag, props = {}, ...children) {
@@ -62,7 +65,13 @@ function iconButton(iconName, name, className = "btn ghost icon-btn") {
 async function ask(msg) {
   try {
     const reply = await chrome.runtime.sendMessage(msg);
-    return reply && typeof reply === "object" ? reply : { ok: false, error: "No reply from the extension." };
+    if (!reply || typeof reply !== "object") return { ok: false, error: "No reply from the extension." };
+    // The app went away: its banner shows, with "Start the app".
+    if (reply.notRunning) {
+      lastFailed = msg.cmd === "START_APP" ? msg.retry : msg;
+      refresh();
+    }
+    return reply;
   } catch (e) {
     return { ok: false, error: String(e?.message || e) };
   }
@@ -429,6 +438,7 @@ let last = rememberedChoice(null);
 async function loadMediaCard() {
   const card = $("media-card");
   card.hidden = false;
+  $("mc-error").hidden = true;
   say($("mc-msg"), "Looking into this page…");
   const [reply, stored] = await Promise.all([ask({ cmd: "MEDIA_INFO", tabId: tab.id, url: tab.url }), chrome.storage.local.get("mediaLast").catch(() => ({}))]);
   last = rememberedChoice(stored.mediaLast);
@@ -826,6 +836,11 @@ function renderSettings(s) {
   $("convert-mp4").checked = s.convertToMp4 !== false;
   $("media-cookies").checked = s.mediaCookies === true;
   $("youtube-button").checked = s.youtubeButton !== false;
+  $("capture").checked = s.captureEnabled === true;
+  const typed = { "capture-types": s.captureTypes?.join(" "), "capture-min": s.captureMinMB, "capture-sites": s.captureExcludedSites?.join(" ") };
+  for (const [id, value] of Object.entries(typed)) {
+    if (document.activeElement !== $(id)) $(id).value = String(value ?? "");
+  }
   const hosts = Array.isArray(s.blockedHosts) ? s.blockedHosts : [];
   const key = hosts.join("\n");
   if (key === blockedKey) return;
@@ -874,6 +889,22 @@ function sizeInput(id, key) {
     }
     if (n !== state.settings?.[key]) saveSettings({ [key]: n }, "Saved.");
   });
+}
+
+/**
+ * "Start the app": the background starts it and sends the last request that failed for want of it again. The popup
+ * may close meanwhile (the browser asks before opening the app); the tab's badge then tells how it went.
+ */
+async function startApp() {
+  const retry = lastFailed;
+  lastFailed = null;
+  $("start-app").disabled = true;
+  say($("start-msg"), "Starting the app… Allow it if the browser asks.");
+  const reply = await ask({ cmd: "START_APP", tabId: tab?.id ?? -1, retry });
+  $("start-app").disabled = false;
+  report($("start-msg"), reply, retry ? "The app started and has the download." : "The app started.");
+  if (reply.ok && mediaPage && !$("mc-error").hidden) loadMediaCard();
+  refresh();
 }
 
 // ---- Wiring ----
@@ -992,6 +1023,16 @@ async function init() {
   );
   $("media-cookies").addEventListener("change", (event) => saveSettings({ mediaCookies: event.target.checked }, "Saved."));
   $("youtube-button").addEventListener("change", (event) => saveSettings({ youtubeButton: event.target.checked }, "Saved."));
+  $("capture").addEventListener("change", (event) => saveSettings({ captureEnabled: event.target.checked }, "Saved."));
+  $("capture-types").addEventListener("change", (event) => saveSettings({ captureTypes: parseTypes(event.target.value) }, "Saved."));
+  $("capture-sites").addEventListener("change", (event) => saveSettings({ captureExcludedSites: parseSites(event.target.value) }, "Saved."));
+  $("capture-min").addEventListener("change", (event) => {
+    const n = Number(event.target.value);
+    if (event.target.value.trim() !== "" && Number.isInteger(n) && n >= 0) return saveSettings({ captureMinMB: n }, "Saved.");
+    say($("settings-msg"), "Enter a whole number of MB (0 = any size).", "err");
+    event.target.value = String(state.settings?.captureMinMB ?? 1);
+  });
+  $("start-app").addEventListener("click", startApp);
   $("mc-form").addEventListener("change", updateMediaForm);
   $("mc-form").addEventListener("submit", downloadMedia);
   $("mc-start-now").addEventListener("click", () => useCurrentTime($("mc-start")));
