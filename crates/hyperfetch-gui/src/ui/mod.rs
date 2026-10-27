@@ -20,6 +20,7 @@ use hyperfetch_core::ingest::{self, truncate_chars};
 use hyperfetch_core::media;
 use hyperfetch_core::queue::{QueueItem, QueueItemStatus};
 
+use crate::desktop::WhenDone;
 use crate::settings::{Settings, BROWSERS, MEDIA_PRESETS};
 use crate::util::{self, format_bytes, format_duration, lock, Verdict};
 use crate::{Answer, App, Dialog, Origin, Tab, VerifyRequest, GRAPH_WINDOW};
@@ -457,6 +458,7 @@ pub fn render(app: &mut App, ctx: &egui::Context) {
             let text = "Finishing the live recordings; the window closes once they are saved. Close it again to quit now and cut them off.";
             banner(ui, p.amber, icon::WARNING, RichText::new(text).color(p.text), |_| {});
         }
+        countdown_banner(app, ui);
         update_banner(app, ui);
         clipboard_banner(app, ui);
         listing_prompt(app, ui);
@@ -479,6 +481,20 @@ pub fn render(app: &mut App, ctx: &egui::Context) {
                 });
             }
         });
+    });
+}
+
+/// The seconds left before the computer sleeps or shuts down, the queue being done, with Cancel.
+fn countdown_banner(app: &mut App, ui: &mut Ui) {
+    let Some((action, at)) = app.countdown else { return };
+    let p = palette(ui);
+    let left = at.saturating_duration_since(Instant::now()).as_secs_f32().ceil();
+    let doing = if action == WhenDone::Sleep { "Going to sleep" } else { "Shutting down" };
+    let text = format!("The queue is done. {} in {} s.", doing, left);
+    keyed_banner(ui, egui::Id::new("countdown"), p.amber, icon::POWER, RichText::new(text).color(p.text), |ui| {
+        if ui.add(button("Cancel")).clicked() {
+            app.countdown = None;
+        }
     });
 }
 

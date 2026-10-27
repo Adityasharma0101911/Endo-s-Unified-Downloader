@@ -1,8 +1,9 @@
 //! The local HTTP API the browser extension talks to, on 127.0.0.1 only: `GET /ping` finds the
 //! app, `POST /add` adds a download with what the browser sent to fetch it, `POST /info` tells
 //! what a media link holds (see `media::info`), and the `/record/…` routes take the video the
-//! extension records from a page (see `recording`). Every route answers only the extension and
-//! local programs, which send no web `Origin`; web pages get 403.
+//! extension records from a page (see `recording`). `POST /show` shows the window: a second
+//! launch asks it (see [`running_instance`]). Every route answers only the extension and local
+//! programs, which send no web `Origin`; web pages get 403.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -17,11 +18,12 @@ use tokio::net::TcpListener;
 use url::Url;
 
 use crate::recording::{self, Recordings, Refusal};
+use crate::tray::TrayAction;
 use crate::util::lock;
 use crate::AppEvent;
 
 /// Ports tried in turn; the extension looks for the app on each.
-const PORTS: [u16; 4] = [49152, 49153, 49154, 49155];
+pub const PORTS: [u16; 4] = [49152, 49153, 49154, 49155];
 /// What `GET /ping` calls the app, which the extension checks.
 const APP: &str = "endos-unified-downloader";
 /// Origins of browser extensions, the only web origins trusted beyond `/add`.
@@ -320,15 +322,16 @@ pub fn save_cookies(url: &Url, text: &str) -> Option<PathBuf> {
 }
 
 /// Serves the API on the first free port of [`PORTS`] for as long as the app runs, handing what
-/// it receives to the UI thread through `events`.
-pub fn spawn(events: mpsc::Sender<AppEvent>, ctx: egui::Context, rt: &tokio::runtime::Handle) {
+/// it receives to the UI thread through `events`; `/ping` tells the data folder's tag `data`
+/// (see `desktop::data_tag`).
+pub fn spawn(events: mpsc::Sender<AppEvent>, ctx: egui::Context, rt: &tokio::runtime::Handle, data: String) {
     rt.spawn(async move {
         for port in PORTS {
             match TcpListener::bind(("127.0.0.1", port)).await {
                 Ok(listener) => {
                     tracing::info!("Local IPC listener bound on 127.0.0.1:{}", port);
                     let recordings = Recordings::new(std::env::temp_dir().join("endos-recordings"));
-                    let server = Arc::new(Server { port, events, ctx, recordings, extension: updater::extension_dir() });
+                    let server = Arc::new(Server { port, events, ctx, recordings, extension: updater::extension_dir(), data });
                     // What an earlier run left recording is joined before this one records.
                     for finished in server.recordings.recover().await {
                         server.send(AppEvent::Recorded(finished));
@@ -359,14 +362,50 @@ async fn listen(listener: TcpListener, server: Arc<Server>) {
     }
 }
 
-/// What the API answers from: its port, the recordings open, the way to the UI thread, and the
-/// browser extension's folder (see `updater::extension_dir`), which an update replaces.
+/// The port of this app already running with the data folder tagged `data` (see
+/// `desktop::data_tag`), asking each of `ports` at once; None when none answers so. Blocking.
+pub fn running_instance(ports: &[u16], data: &str) -> Option<u16> {
+    std::thread::scope(|scope| {
+        let pings: Vec<_> = ports.iter().map(|&port| scope.spawn(move || ask(port, "GET /ping"))).collect();
+        pings.into_iter().zip(ports).find_map(|(ping, &port)| {
+            let ping: serde_json::Value = serde_json::from_str(&ping.join().ok()??).ok()?;
+            (ping["app"] == APP && ping["data"] == data).then_some(port)
+        })
+    })
+}
+
+/// Asks the app on `port` to show its window (`POST /show`); whether it said it would. Blocking.
+pub fn show_instance(port: u16) -> bool {
+    ask(port, "POST /show").is_some()
+}
+
+/// The body (at most 64 KiB) of the answer to `request` (`METHOD /path`) from 127.0.0.1:`port`
+/// when it is 200 OK, within 200 ms to connect (a running app answers at once; a closed port
+/// may take a second to refuse on Windows) and 2 s to answer.
+fn ask(port: u16, request: &str) -> Option<String> {
+    use std::io::{Read, Write};
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut stream = std::net::TcpStream::connect_timeout(&address, Duration::from_millis(200)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    stream.set_write_timeout(Some(Duration::from_secs(2))).ok()?;
+    write!(stream, "{} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", request, port).ok()?;
+    let mut response = Vec::new();
+    stream.take(64 * 1024).read_to_end(&mut response).ok()?;
+    let response = String::from_utf8(response).ok()?;
+    let (head, body) = response.split_once("\r\n\r\n")?;
+    head.starts_with("HTTP/1.1 200 ").then(|| body.to_string())
+}
+
+/// What the API answers from: its port, the recordings open, the way to the UI thread, the
+/// browser extension's folder (see `updater::extension_dir`), which an update replaces, and the
+/// data folder's tag.
 struct Server {
     port: u16,
     events: mpsc::Sender<AppEvent>,
     ctx: egui::Context,
     recordings: Recordings,
     extension: Option<PathBuf>,
+    data: String,
 }
 
 impl Server {
@@ -397,13 +436,17 @@ impl Server {
         };
         match (method.as_str(), path.as_str()) {
             ("GET", "/ping") => {
-                let mut ping = json!({"app": APP, "version": env!("CARGO_PKG_VERSION"), "port": self.port});
+                let mut ping = json!({"app": APP, "version": env!("CARGO_PKG_VERSION"), "port": self.port, "data": self.data});
                 // The version of the extension in its folder (read anew, as an update may have
                 // replaced it), so an older one loaded from there reloads itself.
                 if let Some(version) = self.extension.as_deref().and_then(updater::manifest_version) {
                     ping["extension"] = version.into();
                 }
                 reply("200 OK", ping)
+            }
+            ("POST", "/show") => {
+                self.send(AppEvent::Tray(TrayAction::Show));
+                reply("200 OK", json!({"status": "shown"}))
             }
             ("POST", "/add") => match parse_add(&body) {
                 Ok(payload) => {
@@ -674,7 +717,8 @@ mod tests {
     fn server(root: &Path) -> (Server, mpsc::Receiver<AppEvent>) {
         let (events, received) = mpsc::channel();
         let recordings = Recordings::new(root.to_path_buf());
-        let server = Server { port: 49152, events, ctx: egui::Context::default(), recordings, extension: Some(root.join("extension")) };
+        let extension = Some(root.join("extension"));
+        let server = Server { port: 49152, events, ctx: egui::Context::default(), recordings, extension, data: "0a1b2c3d".to_string() };
         (server, received)
     }
 
@@ -762,19 +806,53 @@ mod tests {
         let (server, _) = server(root.path());
         let response = exchange(&server, &request("GET", "/ping", Some("chrome-extension://abc"), None)).await;
         assert!(response.contains("Content-Type: application/json\r\n") && response.contains("Connection: close\r\n"), "{response}");
-        let expected = json!({"app": "endos-unified-downloader", "version": env!("CARGO_PKG_VERSION"), "port": 49152});
+        let version = env!("CARGO_PKG_VERSION");
+        let expected = json!({"app": "endos-unified-downloader", "version": version, "port": 49152, "data": "0a1b2c3d"});
         assert_eq!(parts(&response), ("HTTP/1.1 200 OK", expected));
 
         // With the extension next to the app, its version too, for the extension to reload when older.
         std::fs::create_dir(root.path().join("extension")).unwrap();
         std::fs::write(root.path().join("extension").join("manifest.json"), r#"{"version": "1.4.0"}"#).unwrap();
         let response = exchange(&server, &request("GET", "/ping", Some("chrome-extension://abc"), None)).await;
-        let expected = json!({"app": "endos-unified-downloader", "version": env!("CARGO_PKG_VERSION"), "port": 49152, "extension": "1.4.0"});
+        let expected = json!({"app": "endos-unified-downloader", "version": version, "port": 49152, "data": "0a1b2c3d", "extension": "1.4.0"});
         assert_eq!(parts(&response), ("HTTP/1.1 200 OK", expected));
 
         let response = exchange(&server, &request("GET", "/ping", Some("https://page.example"), None)).await;
         assert_eq!(parts(&response), ("HTTP/1.1 403 Forbidden", json!({"error": "forbidden origin"})));
         assert!(!response.contains("Access-Control"), "{response}");
+    }
+
+    /// A second launch finds the app running with the same data folder and asks it to show its
+    /// window; one with another data folder, or another program on the port, is not it. A web
+    /// page cannot show the window.
+    #[test]
+    fn a_second_launch_finds_the_app_and_shows_it() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let (server, received) = server(root.path());
+        let server = Arc::new(server);
+        let listener = rt.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        rt.spawn(listen(listener, Arc::clone(&server)));
+        let other = rt.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
+        let other_port = other.local_addr().unwrap().port();
+        rt.spawn(async move {
+            while let Ok((mut socket, _)) = other.accept().await {
+                let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 15\r\n\r\n{\"app\":\"other\"}").await;
+            }
+        });
+
+        assert_eq!(running_instance(&[other_port, port], "0a1b2c3d"), Some(port));
+        assert_eq!(running_instance(&[other_port, port], "ffffffff"), None, "another data folder");
+        assert!(show_instance(port));
+        assert!(matches!(received.recv_timeout(Duration::from_secs(5)), Ok(AppEvent::Tray(TrayAction::Show))));
+
+        let page = rt.block_on(exchange(&server, &request("POST", "/show", Some("https://page.example"), Some(b""))));
+        assert_eq!(parts(&page).0, "HTTP/1.1 403 Forbidden");
+        assert!(received.try_recv().is_err(), "a page showed the window");
+        drop(rt);
+        // Nothing listens there now.
+        assert_eq!(running_instance(&[port], "0a1b2c3d"), None);
     }
 
     #[tokio::test]

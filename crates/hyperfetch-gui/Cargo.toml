@@ -25,7 +25,19 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_DataExchange", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_DataExchange", "Win32_System_Power", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_Security", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+
+# The tray icon (src/tray.rs). Its menu crate builds no GTK.
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+tray-icon = { version = "0.24", default-features = false }
+
+# The tray icon on Linux: a StatusNotifierItem over D-Bus, pure Rust, no GTK.
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = "0.3"
+
+# The local time the schedule runs by (src/desktop.rs); already built for the core.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3.17"
