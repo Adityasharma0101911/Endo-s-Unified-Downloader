@@ -124,6 +124,19 @@ impl Harness {
         }
     }
 
+    /// Handles what the app's background work sends, as each frame of the real window does,
+    /// until `done`; panics after 20 s of real time.
+    pub fn wait_for(&mut self, done: impl Fn(&App) -> bool) {
+        let start = Instant::now();
+        while !done(&self.app) {
+            assert!(start.elapsed() < Duration::from_secs(20), "timed out");
+            std::thread::sleep(Duration::from_millis(20));
+            while let Ok(event) = self.app.events_rx.try_recv() {
+                self.app.handle_event(event);
+            }
+        }
+    }
+
     /// Frames without input until one asks for no other, up to 10 s of them: whether it came.
     pub fn settle(&mut self) -> bool {
         (0..600).any(|_| self.frame(Vec::new()) == Duration::MAX)
