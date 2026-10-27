@@ -260,7 +260,7 @@
       const age = Date.now() - Number(raw);
       armed = age >= 0 && age < 60000;
       // Removed a little later rather than at once, so the page's same-origin frames that load
-      // with it are armed too (as FetchV does).
+      // with it are armed too.
       setTimeout(() => {
         try {
           if (store.getItem(ARM_KEY) === raw) store.removeItem(ARM_KEY);
@@ -398,7 +398,7 @@
     }
 
     // Players often resume where the viewer left off. For the first 10 s the first seek, and any
-    // within 1 s of it, goes to 0 instead, so the capture starts at the beginning (as FetchV).
+    // within 1 s of it, goes to 0 instead, so the capture starts at the beginning.
     try {
       const proto = HTMLMediaElement.prototype;
       const native = Object.getOwnPropertyDescriptor(proto, "currentTime");

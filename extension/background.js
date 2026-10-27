@@ -4,10 +4,13 @@
 // queues that may start empty. Listeners are registered at the top level so a restarted worker gets the event that
 // woke it.
 
+import { ALT_WINDOW_MS, CAPTURE_TYPES, parseSites, parseTypes, shouldCapture } from "./lib/capture.js";
 import {
   classifyResponse,
+  cleanHost,
   fetchableHeaders,
   isAdHost,
+  isBlocked,
   isMediaSiteHost,
   mediaUrlFormat,
   newerVersion,
@@ -38,7 +41,19 @@ const MAX_CHUNK_BASE64 = Math.ceil((64 * 1024 * 1024) / 3) * 4;
 const HEADER_CACHE_SIZE = 300;
 const REQUEST_FILTER = { urls: ["<all_urls>"], types: ["media", "xmlhttprequest", "object", "other"] };
 // mediaCookies: "Use my browser sign-in on media sites", off until the user turns it on (see mediaCookieJar).
-const DEFAULT_SETTINGS = { minSizeKB: 500, maxSizeKB: 0, blockedHosts: [], convertToMp4: true, mediaCookies: false, youtubeButton: true };
+// captureEnabled: "Send browser downloads to the app", off until the user turns it on (see captureDownload).
+const DEFAULT_SETTINGS = {
+  minSizeKB: 500,
+  maxSizeKB: 0,
+  blockedHosts: [],
+  convertToMp4: true,
+  mediaCookies: false,
+  youtubeButton: true,
+  captureEnabled: false,
+  captureTypes: CAPTURE_TYPES,
+  captureMinMB: 1,
+  captureExcludedSites: [],
+};
 const BADGE_COLOR = "#ef4444";
 const MENU_TITLE = "Download with Endo's Unified Downloader";
 const PLAYBACK_RATES = [1, 2, 4, 8, 16];
@@ -86,17 +101,6 @@ function initiatorOf(details) {
 /** Which document sent a message: Chrome's documentId, else (Firefox has none) the frame URL. */
 const documentOf = (sender) => sender.documentId ?? `url:${sender.url}`;
 
-/** True when `host` is a blocked host or a subdomain of one. */
-function isBlocked(host, blockedHosts) {
-  return blockedHosts.some((blocked) => host === blocked || host.endsWith("." + blocked));
-}
-
-/** A lower-cased host name, or "" when `value` is not one. */
-function cleanHost(value) {
-  const host = typeof value === "string" ? value.trim().toLowerCase().replace(/\.$/, "") : "";
-  return /^[a-z0-9-]+(\.[a-z0-9-]+)*$/.test(host) && host.length <= 253 ? host : "";
-}
-
 /** Tells an open popup that a tab's items or recordings changed; with no popup open there is nobody to tell. */
 function notifyPopup(tabId) {
   chrome.runtime.sendMessage({ cmd: "STATE_CHANGED", tabId }).catch(() => {});
@@ -128,18 +132,23 @@ let settingsPromise = null;
 
 function normalizeSettings(raw) {
   const settings = raw && typeof raw === "object" ? raw : {};
-  const kb = (value, fallback) => {
+  const whole = (value, fallback) => {
     const number = Number(value);
     return value !== null && value !== "" && Number.isFinite(number) && number >= 0 ? Math.floor(number) : fallback;
   };
   const hosts = Array.isArray(settings.blockedHosts) ? settings.blockedHosts.map(cleanHost).filter(Boolean) : [];
   return {
-    minSizeKB: kb(settings.minSizeKB, DEFAULT_SETTINGS.minSizeKB),
-    maxSizeKB: kb(settings.maxSizeKB, DEFAULT_SETTINGS.maxSizeKB),
+    minSizeKB: whole(settings.minSizeKB, DEFAULT_SETTINGS.minSizeKB),
+    maxSizeKB: whole(settings.maxSizeKB, DEFAULT_SETTINGS.maxSizeKB),
     blockedHosts: [...new Set(hosts)].slice(0, 500),
     convertToMp4: typeof settings.convertToMp4 === "boolean" ? settings.convertToMp4 : DEFAULT_SETTINGS.convertToMp4,
     mediaCookies: settings.mediaCookies === true,
     youtubeButton: settings.youtubeButton !== false,
+    captureEnabled: settings.captureEnabled === true,
+    // An empty list is the user's: nothing is sent.
+    captureTypes: Array.isArray(settings.captureTypes) ? parseTypes(settings.captureTypes) : CAPTURE_TYPES,
+    captureMinMB: whole(settings.captureMinMB, DEFAULT_SETTINGS.captureMinMB),
+    captureExcludedSites: parseSites(settings.captureExcludedSites),
   };
 }
 
@@ -540,6 +549,29 @@ async function requestApp(path, { json, body, timeout = 10000, verify = false } 
   return reply;
 }
 
+/** A failed call's reply; `notRunning` when the app was not there, so "Start the app" can send it again. */
+const failure = (error) => ({ ok: false, error: error.message, notRunning: error.message === NOT_RUNNING });
+
+/** What "Start the app" opens: the app registers it, and the browser asks before the first time it opens it. */
+const LAUNCH_URL = "endo-dl://open";
+const START_WAIT_MS = 15000;
+
+/**
+ * Starts the app when it isn't running: opens LAUNCH_URL in a tab of its own (the page is left alone), waits up to
+ * 15 s for /ping to answer, then closes that tab. Returns findApp's answer.
+ */
+async function startApp() {
+  let app = await findApp();
+  if (app.ok || app.outdated) return app;
+  const tab = await chrome.tabs.create({ url: LAUNCH_URL }).catch(() => null);
+  for (const end = Date.now() + START_WAIT_MS; !app.ok && Date.now() < end; ) {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    app = await findApp();
+  }
+  if (tab) chrome.tabs.remove(tab.id).catch(() => {});
+  return app;
+}
+
 /**
  * Queues a download in the app via POST /add; empty fields are left out. `playlist` is the text of a playlist the
  * page built itself (then `url` is the base for its relative links); `height` caps the quality the app picks; `media`
@@ -568,7 +600,7 @@ async function sendToApp({ url, tabId, cookies, cookieJar, userAgent, referer, h
     await callApp("/add", { json: body, verify: true });
     return { ok: true };
   } catch (error) {
-    return { ok: false, error: error.message };
+    return failure(error);
   }
 }
 
@@ -708,16 +740,84 @@ async function flashBadge(tabId, ok) {
   }, 2000);
 }
 
-chrome.contextMenus.onClicked.addListener(async (info, tab) => {
-  const url = { "endo-link": info.linkUrl, "endo-media": info.srcUrl, "endo-page": info.pageUrl }[info.menuItemId];
-  if (url === undefined) return;
+/**
+ * Sends a link of tab `tab` (a link, a media element's source or a page) the way the context menu does: with the
+ * headers its request was seen with, `pageUrl` as the referer and, for a media page, the media card's last choice.
+ */
+async function sendLink(url, tab, pageUrl) {
   // A media element's request headers (cookies, Origin) are usually still in the cache by URL.
   const seen = headersByUrl.get(url);
   const request = seen ? splitRequestHeaders(seen.headers) : {};
   const media = isMediaPage(url) ? await lastMediaChoice() : undefined;
-  const result = await sendToApp({ ...request, url, tabId: tab?.id, referer: info.pageUrl || tab?.url, media });
+  return sendToApp({ ...request, url, tabId: tab?.id, referer: pageUrl, media });
+}
+
+chrome.contextMenus.onClicked.addListener(async (info, tab) => {
+  const url = { "endo-link": info.linkUrl, "endo-media": info.srcUrl, "endo-page": info.pageUrl }[info.menuItemId];
+  if (url === undefined) return;
+  const send = () => sendLink(url, tab, info.pageUrl || tab?.url);
+  let result = await send();
+  // The click asked for the app: it is started (the browser asks first), then sent the link again.
+  if (result.notRunning && (await startApp()).ok) result = await send();
   flashBadge(tab?.id, result.ok);
 });
+
+// ---------------------------------------------------------------------------------------------------------------
+// Browser downloads sent to the app ("Send browser downloads to the app", off by default)
+
+/** When an Alt-click last happened in a tab (bridge.js tells): a download it starts stays in the browser. */
+let altClickAt = 0;
+/** The latest URLs pages sent a form to (POST): what they answered can't be fetched again by the app. */
+const posted = new Set();
+
+chrome.webRequest.onBeforeRequest.addListener(
+  (details) => {
+    if (details.method !== "POST") return;
+    posted.delete(details.url);
+    posted.add(details.url);
+    if (posted.size > 100) posted.delete(posted.values().next().value);
+  },
+  { urls: ["<all_urls>"], types: ["main_frame", "sub_frame"] },
+);
+
+/**
+ * Sends a browser download the filters pick (see lib/capture.js shouldCapture) to the app, with its referrer, the
+ * browser's cookies for its host and its file name: paused meanwhile, then cancelled and erased from the browser's
+ * list once the app has it. When the app is unreachable or refuses it, it resumes in the browser; the app is never
+ * started for it. Returns whether the app took it.
+ */
+async function captureDownload(item) {
+  const url = item.finalUrl || item.url;
+  const flags = { altClicked: Date.now() - altClickAt < ALT_WINDOW_MS, posted: posted.has(item.url) || posted.has(url) };
+  if (!shouldCapture(item, await getSettings(), flags)) return false;
+  await chrome.downloads.pause(item.id).catch(() => {});
+  // Firefox: the container the download was made in.
+  const store = item.cookieStoreId ? { storeId: item.cookieStoreId } : {};
+  const cookies = chrome.cookies ? cookieHeader(await chrome.cookies.getAll({ url, ...store }).catch(() => [])) : "";
+  const filename = String(item.filename || "").split(/[/\\]/).pop();
+  const result = await sendToApp({ url, cookies, userAgent: navigator.userAgent, referer: item.referrer, filename });
+  if (!result.ok) {
+    chrome.downloads.resume(item.id).catch(() => {});
+    return false;
+  }
+  await chrome.downloads.cancel(item.id).catch(() => {});
+  chrome.downloads.erase({ id: item.id }).catch(() => {});
+  return true;
+}
+
+// Chrome and Edge ask for the file name once the answer's headers (name, type, size) are in, before a Save As
+// dialog: the download waits there until it is taken or `suggest` lets it go on. Firefox has only onCreated.
+if (chrome.downloads?.onDeterminingFilename) {
+  chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
+    captureDownload(item).then(
+      (taken) => taken || suggest(),
+      () => suggest(),
+    );
+    return true;
+  });
+} else {
+  chrome.downloads?.onCreated.addListener((item) => captureDownload(item).catch((error) => console.warn("Endo:", error)));
+}
 
 // ---------------------------------------------------------------------------------------------------------------
 // Recording relay: chunks from the bridge go to the app in arrival order, one queue per recording key.
@@ -955,7 +1055,7 @@ const POPUP_COMMANDS = {
     try {
       appId = (await callApp("/record/start", { json: { title, page_url: item.pageUrl || "" }, verify: true })).id;
     } catch (error) {
-      return { ok: false, error: error.message };
+      return failure(error);
     }
     if (!/^[A-Za-z0-9]{1,32}$/.test(appId)) return { ok: false, error: "The downloader gave an unexpected answer." };
     // Unguessable, so the page cannot feed chunks into it; the bridge alone learns it.
@@ -1044,7 +1144,7 @@ const POPUP_COMMANDS = {
       await callApp("/add", { json: body, verify: true });
       return { ok: true };
     } catch (error) {
-      return { ok: false, error: error.message };
+      return failure(error);
     }
   },
 
@@ -1085,6 +1185,19 @@ const POPUP_COMMANDS = {
     if (!settings || typeof settings !== "object") return { ok: false, error: "bad settings" };
     await saveSettings({ ...(await getSettings()), ...settings });
     return { ok: true };
+  },
+
+  /**
+   * "Start the app": starts it (see startApp), then sends `retry`, a request that failed because it wasn't running,
+   * again. Done here, not in the popup, which closes when the browser asks whether to open the app.
+   */
+  async START_APP({ tabId, retry }) {
+    const app = await startApp();
+    if (!app.ok) return { ok: false, error: app.outdated ? OUTDATED : "The app didn't start. Open Endo's Unified Downloader yourself, or get it from the releases page." };
+    if (!["SEND", "SEND_URL", "SEND_MEDIA", "SEND_LINKS", "BROWSER_DL"].includes(retry?.cmd)) return { ok: true };
+    const reply = await POPUP_COMMANDS[retry.cmd](retry);
+    flashBadge(retry.tabId, reply.ok);
+    return reply;
   },
 
   async REC_ARM({ tabId }) {
@@ -1288,6 +1401,12 @@ const PAGE_COMMANDS = {
     } catch {
       return { ok: false };
     }
+  },
+
+  /** An Alt-click (bridge.js): the download it starts stays in the browser. */
+  ALT_CLICK() {
+    altClickAt = Date.now();
+    return { ok: true };
   },
 
   REC_END({ ms }, sender) {

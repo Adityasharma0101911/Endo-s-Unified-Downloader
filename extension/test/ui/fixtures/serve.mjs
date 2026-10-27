@@ -38,6 +38,13 @@ export function startFixtures(port = FIXTURE_PORT) {
       }, 100);
       return res.on("close", () => clearInterval(timer));
     }
+    // Browser downloads for "Send browser downloads to the app": setup.zip is 2 MB (over its 1 MB minimum), small.zip
+    // 100 KB (under it).
+    if (pathname === "/files/setup.zip" || pathname === "/files/small.zip") {
+      const size = pathname.endsWith("setup.zip") ? 2 * 1024 * 1024 : 100 * 1024;
+      res.writeHead(200, { "Content-Type": "application/zip", "Content-Length": size, "Content-Disposition": "attachment", "Cache-Control": "no-store" });
+      return res.end(Buffer.alloc(size));
+    }
     const file = host !== "127.0.0.1" && host !== "localhost" ? "media-site.html" : path.normalize(pathname).replace(/^[\/]+/, "");
     try {
       if (file.startsWith("..") || file.endsWith(".mjs")) throw new Error("outside");

@@ -25,6 +25,17 @@ export function isMediaSiteHost(hostname) {
   return MEDIA_SITE_HOSTS.some((site) => host === site || host.endsWith("." + site));
 }
 
+/** True when `host` is one of `hosts` or a subdomain of one. */
+export function isBlocked(host, hosts) {
+  return hosts.some((blocked) => host === blocked || host.endsWith("." + blocked));
+}
+
+/** A lower-cased host name, or "" when `value` is not one. */
+export function cleanHost(value) {
+  const host = typeof value === "string" ? value.trim().toLowerCase().replace(/\.$/, "") : "";
+  return /^[a-z0-9-]+(\.[a-z0-9-]+)*$/.test(host) && host.length <= 253 ? host : "";
+}
+
 /** Content types that name their format outright. */
 const TYPE_FORMATS = {
   "application/vnd.apple.mpegurl": "m3u8",
@@ -102,8 +113,8 @@ function rangeTotal(header) {
 }
 
 /**
- * Decides whether a response is a video/audio file, an HLS playlist or a DASH manifest worth listing, following
- * FetchV's rules: the content type (lower-cased, parameters stripped) names the format; octet-stream, text/plain,
+ * Decides whether a response is a video/audio file, an HLS playlist or a DASH manifest worth listing: the content
+ * type (lower-cased, parameters stripped) names the format; octet-stream, text/plain,
  * application/mp4… count by the file name's extension; any other video/* or audio/* type is a file named by its
  * subtype; a "media" request with an octet-stream type and no media extension is taken for an mp4. With no content
  * type, a "media" request for .mp4/.webm or an XHR for .m3u8/.mpd still counts. The file name is the
@@ -195,7 +206,7 @@ export function passesSizeFilter(item, { minSizeKB = 0, maxSizeKB = 0 } = {}) {
   return size > 0 && (!min || size >= min) && (!max || size <= max);
 }
 
-/** Ad/tracker CDNs FetchV ignores, matched on the label before the top-level domain. */
+/** Ad/tracker CDNs that are ignored, matched on the label before the top-level domain. */
 const AD_LABELS = ["doppiocdn", "adtng", "afcdn", "sacdnssedge"];
 
 /** True for hosts like "x.doppiocdn.com" whose second-level label is a known ad CDN. */

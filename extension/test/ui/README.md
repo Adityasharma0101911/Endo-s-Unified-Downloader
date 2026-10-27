@@ -48,6 +48,15 @@ with `--load-extension` always has it). Min size and Convert to MP4 are changed,
 last tab must survive) and put back. Last, on the `dash` tab, Block host (two clicks in the ⋯ menu) must drop the item
 and list the host in Settings, whose ✕ unblocks it.
 
+"Start the app": with the mock absent, a failed Download must show the button; its click must open `endo-dl://open` (a
+headless browser launches nothing, so the background's `chrome.tabs.create` is wrapped to record it), and when the mock
+comes back 1.5 s later the Download must reach `/add` again. "Send browser downloads to the app": off by default; the
+types and sites typed in Settings come back cleaned up after a reload and a negative minimum is refused (captures
+`capture-settings-<theme>.png`, `start-app-<step>-<theme>.png`). Then each from a page of its own, `/files/setup.zip`
+(2 MB) must reach `/add` with the page as referer, the page's cookie and its name, and leave the browser's list with no
+file written; `/files/small.zip` (100 KB), one made while the app is absent and an Alt-click (CDP mouse events with
+Alt held) must finish in the browser, which saves into the throwaway profile.
+
 Every capture is also checked for sideways overflow, and every visible text and form field in it for WCAG AA contrast
 (4.5:1 against the colours actually behind it; disabled or faded controls exempt); the popups must log no exceptions or
 console errors.

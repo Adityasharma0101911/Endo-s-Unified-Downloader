@@ -1,8 +1,9 @@
 // Endo's Unified Downloader: the content script in the extension's isolated world, in every
 // frame. It passes what hook.js (the page's world) finds on to the background service worker,
 // arms "Capture from start" for the reload, changes the playback speed of a buffer capture,
-// records one video with MediaRecorder ("Record playback"), and downloads a stream or file with
-// the page's own requests ("Via browser") for sites that refuse the desktop app.
+// records one video with MediaRecorder ("Record playback"), downloads a stream or file with
+// the page's own requests ("Via browser") for sites that refuse the desktop app, and reports
+// Alt-clicks, whose downloads stay in the browser.
 (() => {
   "use strict";
 
@@ -749,6 +750,10 @@
       if (done) return;
     }
   }
+
+  // ---- Alt-click: the browser download it starts stays in the browser (background.js captureDownload) ----
+
+  window.addEventListener("click", (e) => e.altKey && e.isTrusted && send({ cmd: "ALT_CLICK" }), true);
 
   // ---- Commands from the background ----
 
