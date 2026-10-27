@@ -11,6 +11,23 @@
 - To look at the animations: `cargo test -p hyperfetch-gui capture_gallery -- --ignored` writes frame strips of each one, dark and light, and every page at 100/125/150 %, to the folder in `ENDO_CAPTURE_DIR` (default `target/ui-captures`).
 - Never move the mouse, send keys, focus windows or capture the screen to test the app: the user works on this PC. If a real run is needed (an idle CPU check), start the release build with `Start-Process -WindowStyle Minimized`, `ENDO_HISTORY_PATH` (its settings and queue live next to it) and `TEMP`/`TMP` pointing into a scratch folder, and close it with `CloseMainWindow()`.
 
+## Keep the PC usable: CPU, memory and disk
+
+The user works on this PC (32 threads, 32 GB RAM) while you build and test, so builds and tests must leave it usable. A past session filled the disk with a single 200 GB file. Don't let that happen again.
+
+- Set `CARGO_BUILD_JOBS=8` on every cargo command, and keep `--test-threads=4`.
+- Run one cargo build or test at a time, across every agent and subagent. Parallel agents take turns on the one `target` folder and never build side by side.
+- Don't use separate git worktrees (or `isolation: "worktree"`) for Rust work: each one builds its own `target` of several GB.
+- Run the full suite before a commit, not after every edit. While working, run only the tests of the crate or module you touched (`cargo test -p hyperfetch-core <name>`).
+- Run `cargo build --release`, `bench/` and the capture gallery only when releasing, when asked, or for a real run. Never run them in a loop.
+- Run at most one headless browser, and close it when its check is done.
+- Before finishing, stop everything you started: the app, test servers, headless Edge, `yt-dlp`, `ffmpeg`, cargo runs in the background. Check with `Get-Process` that none of them is left.
+- No test, benchmark or real run may write more than 1 GB. Test files are KB to a few MB. A test that needs a large size fakes it in the test server's headers and never writes the body.
+- Every test server sends a body of fixed length, then ends: never an endless stream. Every download, recording or capture in a test or a real run has a size or time limit (`max_filesize`, a timeout). Every test that waits has a timeout, so a hung test can't keep writing.
+- Throwaway files go in the session scratchpad. That covers real-run downloads, `ENDO_CAPTURE_DIR`, `gh run download` artifacts and cloned repos. Tests write only to temp dirs that delete themselves. Never write into the user's Downloads folder or the repo.
+- Keep one `target` folder: no `CARGO_TARGET_DIR` elsewhere. Delete `target/ui-captures` once you've looked at the captures.
+- At the end, check the size of the scratchpad and of `target`, and the free space on C:. Delete what you made. If C: lost more than 5 GB, find out why before you stop.
+
 ## Releasing
 
 The app updates itself from this repo's GitHub releases and installs only what `SHA256SUMS.sig` signs with the key at `%USERPROFILE%\.endo-release\update-key.pem` (its public half is `PUBLIC_KEY` in `crates/hyperfetch-core/src/updater.rs`).
