@@ -265,6 +265,10 @@ fn history_path() -> PathBuf {
 
 /// A file of the GUI's own, stored next to the download history.
 pub fn app_file(name: &str) -> PathBuf {
+    #[cfg(test)]
+    if let Some(dir) = crate::tests::OWN_DATA_DIR.with(|dir| dir.borrow().clone()) {
+        return dir.join(name);
+    }
     history_path().with_file_name(name)
 }
 
