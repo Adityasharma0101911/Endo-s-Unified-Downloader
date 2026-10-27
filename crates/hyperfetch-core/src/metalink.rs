@@ -12,6 +12,32 @@ pub struct MetalinkFile {
     /// Whole-file hashes as (type, lowercase hex). Types are normalized without dashes
     /// ("sha-256" -> "sha256"). Piece hashes are not included.
     pub hashes: Vec<(String, String)>,
+    /// The file's piece hashes, SHA-256 ones over SHA-1 ones when it lists both.
+    pub pieces: Option<Pieces>,
+}
+
+/// A metalink's hashes of a file's pieces (RFC 5854 `<pieces>`, Metalink 3's inside
+/// `<verification>`): when the whole file fails its hash, or has none, they show which pieces to
+/// fetch again.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Pieces {
+    /// Bytes per piece; the last one may be shorter.
+    pub length: u64,
+    /// "sha1" or "sha256".
+    pub algo: String,
+    /// Each piece's hash in file order, lowercase hex.
+    pub hashes: Vec<String>,
+}
+
+impl Pieces {
+    /// Whether these are the hashes of a `size`-byte file: one per piece, each of its algorithm's
+    /// length.
+    pub fn fit(&self, size: u64) -> bool {
+        let hex_len = if self.algo == "sha256" { 64 } else { 40 };
+        self.length > 0
+            && self.hashes.len() as u64 == size.div_ceil(self.length)
+            && self.hashes.iter().all(|h| h.len() == hex_len && h.bytes().all(|b| b.is_ascii_hexdigit()))
+    }
 }
 
 /// Returns a metalink file name as a relative path ("dir/file.iso"), each component made valid
@@ -48,6 +74,8 @@ pub fn parse_metalink(xml_content: &str) -> Result<Vec<MetalinkFile>, String> {
     let mut current_url_rank = u32::MAX;
     let mut current_url_usable = true;
     let mut in_pieces = false;
+    // The `<pieces>` being read, if its type is one the download can check.
+    let mut current_pieces: Option<Pieces> = None;
 
     let mut buf = Vec::new();
 
@@ -75,14 +103,20 @@ pub fn parse_metalink(xml_content: &str) -> Result<Vec<MetalinkFile>, String> {
                             size: None,
                             urls: Vec::new(),
                             hashes: Vec::new(),
+                            pieces: None,
                         });
                     }
-                    "pieces" => in_pieces = true,
+                    "pieces" => {
+                        in_pieces = true;
+                        let algo = attr(b"type").unwrap_or_default().to_ascii_lowercase().replace('-', "");
+                        let length = attr(b"length").and_then(|l| l.trim().parse().ok()).unwrap_or(0);
+                        current_pieces = matches!(algo.as_str(), "sha1" | "sha256")
+                            .then_some(Pieces { length, algo, hashes: Vec::new() });
+                    }
                     "hash" => current_hash_type = attr(b"type").unwrap_or_default().to_ascii_lowercase().replace('-', ""),
                     "url" => {
                         // Metalink 3 also lists e.g. `type="bittorrent"` links to .torrent files.
-                        current_url_usable = attr(b"type")
-                            .is_none_or(|t| t.eq_ignore_ascii_case("http") || t.eq_ignore_ascii_case("https"));
+                        current_url_usable = attr(b"type").is_none_or(|t| ["http", "https", "ftp"].iter().any(|s| t.eq_ignore_ascii_case(s)));
                         // RFC 5854: priority 1 is best. Metalink 3: preference 100 is best.
                         current_url_rank = match (attr(b"priority"), attr(b"preference")) {
                             (Some(p), _) => p.trim().parse().unwrap_or(u32::MAX),
@@ -105,12 +139,17 @@ pub fn parse_metalink(xml_content: &str) -> Result<Vec<MetalinkFile>, String> {
                         }
                         "url" if current_url_usable => {
                             if let Ok(u) = Url::parse(&text) {
-                                if matches!(u.scheme(), "http" | "https") && !ranked_urls.iter().any(|(_, x)| *x == u) {
+                                if matches!(u.scheme(), "http" | "https" | "ftp") && !ranked_urls.iter().any(|(_, x)| *x == u) {
                                     ranked_urls.push((current_url_rank, u));
                                 }
                             }
                         }
-                        "hash" if !in_pieces => {
+                        "hash" if in_pieces => {
+                            if let Some(pieces) = current_pieces.as_mut() {
+                                pieces.hashes.push(text.trim().to_ascii_lowercase());
+                            }
+                        }
+                        "hash" => {
                             let clean_hash = text.trim().to_ascii_lowercase();
                             if !clean_hash.is_empty() {
                                 let htype = if current_hash_type.is_empty() {
@@ -137,10 +176,19 @@ pub fn parse_metalink(xml_content: &str) -> Result<Vec<MetalinkFile>, String> {
                         if let Some(mut f) = current_file.take() {
                             ranked_urls.sort_by_key(|(rank, _)| *rank);
                             f.urls = ranked_urls.drain(..).map(|(_, u)| u).collect();
+                            // Pieces that do not fit the file's size check nothing.
+                            f.pieces = f.pieces.filter(|p| f.size.is_none_or(|size| p.fit(size)));
                             files.push(f);
                         }
                     }
-                    b"pieces" => in_pieces = false,
+                    b"pieces" => {
+                        in_pieces = false;
+                        if let (Some(file), Some(pieces)) = (current_file.as_mut(), current_pieces.take()) {
+                            if file.pieces.as_ref().is_none_or(|p| p.algo != "sha256") {
+                                file.pieces = Some(pieces);
+                            }
+                        }
+                    }
                     _ => {}
                 }
                 current_tag.clear();
@@ -185,8 +233,9 @@ mod tests {
         let f = &files[0];
         assert_eq!(f.name, "example.tar.gz");
         assert_eq!(f.size, Some(10485760));
-        assert_eq!(f.urls.len(), 2, "only HTTP(S) URLs are usable");
+        assert_eq!(f.urls.len(), 3, "HTTP(S) and FTP URLs are usable");
         assert_eq!(f.urls[0].host_str(), Some("mirror1.example.com"), "sorted by priority");
+        assert_eq!(f.urls[2].scheme(), "ftp", "unranked last");
         assert_eq!(f.hashes.len(), 1);
         assert_eq!(f.hashes[0].0, "sha256");
         assert_eq!(f.hashes[0].1, "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
@@ -203,6 +252,35 @@ mod tests {
             <url>https://m/a.bin</url></file></metalink>"#;
         let files = parse_metalink(xml).unwrap();
         assert_eq!(files[0].hashes, vec![("sha256".to_string(), "a".repeat(64))]);
+        let pieces = Pieces { length: 262144, algo: "sha256".into(), hashes: vec!["b".repeat(64), "c".repeat(64)] };
+        assert_eq!(files[0].pieces, Some(pieces));
+    }
+
+    #[test]
+    fn pieces_prefer_sha256_and_must_fit_the_size() {
+        // Metalink 3 keeps them under <verification>; SHA-256 wins over SHA-1, MD5 is no use.
+        let xml = |size: u64, sha1: &str| {
+            format!(
+                r#"<metalink version="3.0"><files><file name="p.bin"><size>{size}</size><verification>
+                <pieces length="4" type="md5"><hash piece="0">{md5}</hash></pieces>
+                <pieces length="4" type="sha1"><hash piece="0">{sha1}</hash><hash piece="1">{sha1}</hash></pieces>
+                <pieces length="4" type="sha-256"><hash piece="0">{a}</hash><hash piece="1">{a}</hash></pieces>
+                </verification><resources><url type="http">http://m/p.bin</url></resources></file></files></metalink>"#,
+                md5 = "d".repeat(32),
+                a = "A".repeat(64),
+            )
+        };
+        let pieces = parse_metalink(&xml(8, &"1".repeat(40))).unwrap()[0].pieces.clone().unwrap();
+        assert_eq!((pieces.length, pieces.algo.as_str(), pieces.hashes), (4, "sha256", vec!["a".repeat(64); 2]));
+        // Two 4-byte pieces cannot be the hashes of a 9-byte file.
+        assert_eq!(parse_metalink(&xml(9, &"1".repeat(40))).unwrap()[0].pieces, None);
+
+        let sha1_only = r#"<metalink><file name="q.bin"><size>5</size>
+            <pieces length="4" type="sha-1"><hash>0000000000000000000000000000000000000000</hash><hash>not hex</hash></pieces>
+            <url>http://m/q.bin</url></file></metalink>"#;
+        assert_eq!(parse_metalink(sha1_only).unwrap()[0].pieces, None, "a malformed hash spoils the set");
+        let good = sha1_only.replace("not hex", &"f".repeat(40));
+        assert_eq!(parse_metalink(&good).unwrap()[0].pieces.as_ref().map(|p| p.algo.as_str()), Some("sha1"));
     }
 
     #[test]

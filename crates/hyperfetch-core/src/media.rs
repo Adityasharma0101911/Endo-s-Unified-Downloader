@@ -3396,7 +3396,7 @@ fn room_left(files: &[PathBuf]) -> Option<(u64, u64)> {
 
 /// Bytes this user may still write on the disk that holds `dir`; None when that cannot be told.
 /// Blocking.
-fn free_space(dir: &Path) -> Option<u64> {
+pub(crate) fn free_space(dir: &Path) -> Option<u64> {
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
