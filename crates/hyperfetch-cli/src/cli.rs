@@ -375,7 +375,7 @@ pub struct Args {
 
     /// Write one direct file link's bytes to stdout as they arrive (progress and messages go to
     /// stderr)
-    #[arg(long = "stdout", conflicts_with_all = ["input_file", "output", "history", "update", "verify"])]
+    #[arg(long = "stdout", conflicts_with_all = ["input_file", "output", "checksum", "history", "update", "verify"])]
     pub stdout: bool,
 
     /// Append what is printed (warnings, results; not progress bars) to FILE too
@@ -657,6 +657,8 @@ mod tests {
         assert!(parse(&["--header", "Host: x", "u"]).is_err());
         assert!(parse(&["--verify", "f", "--repair", "-u", "bob:pw"]).is_err());
         assert!(parse(&["--verify", "f", "--repair", "--cookie", "a=b"]).is_err());
+        // --stdout checks no checksum: the bytes are gone by the time it could.
+        assert!(parse(&["--stdout", "--checksum", &"ab".repeat(32), "u"]).is_err());
         // The last of --adaptive and --no-adaptive wins.
         assert!(parse(&["--no-adaptive", "--adaptive", "u"]).unwrap().adaptive);
         assert!(!parse(&["--adaptive", "--no-adaptive", "u"]).unwrap().adaptive);

@@ -129,9 +129,10 @@ impl Ui {
         self.quiet
     }
 
-    /// Prints to stdout (stderr with --json) without tearing the progress bars.
+    /// Prints to stdout (stderr with --json) without tearing the progress bars, links without
+    /// their secrets.
     pub fn print(&self, line: &str) {
-        let _ = self.write(self.json, format!("{}\n", printable(line)).as_bytes());
+        let _ = self.write(self.json, format!("{}\n", printable(&redact_text(line))).as_bytes());
     }
 
     /// Prints `item` (see [`item`]) as one JSON object on a line of stdout with --json, its keys
@@ -143,9 +144,10 @@ impl Ui {
         }
     }
 
-    /// Prints to stderr without tearing the progress bars.
+    /// Prints to stderr without tearing the progress bars, links without their secrets (an
+    /// error's text names the link it failed on).
     pub fn error(&self, line: &str) {
-        let _ = self.write(true, format!("{}\n", printable(line)).as_bytes());
+        let _ = self.write(true, format!("{}\n", printable(&redact_text(line))).as_bytes());
     }
 
     /// Writes `bytes` to stderr, else stdout, without tearing the progress bars; while a question
@@ -225,7 +227,7 @@ pub struct LogWriter(Ui);
 
 impl Write for LogWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.write(true, buf)?;
+        self.0.write(true, redact_text(&String::from_utf8_lossy(buf)).as_bytes())?;
         Ok(buf.len())
     }
 
@@ -260,15 +262,15 @@ pub fn printable(s: &str) -> String {
     s.chars().map(|c| if c.is_control() && c != '\n' && c != '\t' { '?' } else { c }).collect()
 }
 
-/// Prints a line to stdout. Write errors are ignored: a reader that went away (`| head`) must
-/// not abort the process and the downloads still running in it.
+/// Prints a line to stdout, links without their secrets. Write errors are ignored: a reader that
+/// went away (`| head`) must not abort the process and the downloads still running in it.
 pub fn stdout_line(line: &str) {
-    let _ = writeln!(std::io::stdout(), "{}", printable(line));
+    let _ = writeln!(std::io::stdout(), "{}", printable(&redact_text(line)));
 }
 
 /// Prints a line to stderr, ignoring write errors like [`stdout_line`].
 pub fn stderr_line(line: &str) {
-    let _ = writeln!(std::io::stderr(), "{}", printable(line));
+    let _ = writeln!(std::io::stderr(), "{}", printable(&redact_text(line)));
 }
 
 /// Shortens `s` to at most `max` characters, marking the cut with "...".
@@ -455,8 +457,8 @@ fn done_line(input: Option<&str>, path: &std::path::Path) -> String {
 }
 
 /// One --json result: every key always there, null where it does not apply. `status` is "ok",
-/// "failed", "skipped" (--no-clobber) or "up-to-date" (--only-if-newer); `url` is shown without
-/// its secrets; `checksum` is the one the file was to match (--checksum, a metalink's), and
+/// "failed", "skipped" (--no-clobber) or "up-to-date" (--only-if-newer); `url`, and the links in
+/// `error`, are shown without their secrets; `checksum` is the one the file was to match (--checksum, a metalink's), and
 /// `checked_against` says whose checksum it matched when it was not yours ("the site's SHA-256").
 pub fn item(
     status: &str,
@@ -474,7 +476,7 @@ pub fn item(
         ("size", size.into()),
         ("checksum", checksum.into()),
         ("checked_against", checked_against.into()),
-        ("error", error.into()),
+        ("error", error.map(redact_text).into()),
     ]
 }
 
@@ -855,6 +857,30 @@ mod tests {
         assert!(text.contains("[FAILED] b: "), "the human lines too: {text}");
         assert!(!text.contains("secret"), "{text}");
         drop(ui);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A sign-in or token in a link an error names is printed, logged and reported without it.
+    #[test]
+    fn links_in_messages_lose_their_secrets() {
+        let dir = std::env::temp_dir().join(format!("hf-cli-redact-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("out.log");
+        let mut ui = Ui::new(true);
+        ui.json = true;
+        ui.log = Some(Arc::new(std::fs::File::create(&log).unwrap()));
+        let error = "https://u:p@host.test/missing: Cannot read \"https://cdn.test/f.zip?token=abc\": HTTP 404";
+        ui.error(&format!("[FAILED] x: {error}"));
+        ui.print(error);
+        let _ = ui.log_writer().write(format!("WARN {error}\n").as_bytes());
+        ui.report(item("failed", Some("https://u:p@host.test/missing"), None, None, None, None, Some(error)));
+        drop(ui);
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert!(!text.contains("u:p@") && !text.contains("abc"), "{text}");
+        assert_eq!(text.matches("https://host.test/missing").count(), 5, "{text}");
+        let json: serde_json::Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+        assert!(json["error"].as_str().unwrap().contains("f.zip?token=REDACTED\""), "{json}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
