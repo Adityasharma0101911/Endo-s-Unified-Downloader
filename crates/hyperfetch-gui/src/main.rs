@@ -1,9 +1,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod desktop;
 mod ipc;
 mod queue_store;
 mod recording;
 mod settings;
+mod taskbar;
+mod tray;
 mod ui;
 mod util;
 
@@ -21,16 +24,23 @@ use hyperfetch_core::history::{DownloadHistoryManager, HistoryEntry};
 use hyperfetch_core::ingest::{self, Task};
 use hyperfetch_core::media;
 use hyperfetch_core::paste;
-use hyperfetch_core::queue::{DownloadQueue, QueueItem};
+use hyperfetch_core::queue::{DownloadQueue, QueueItem, QueueItemStatus};
 use hyperfetch_core::updater::{self, Installed, Update};
 use hyperfetch_core::verify::{self, BuildVerificationResult};
 use tokio::sync::{broadcast, Notify};
 use tokio::task::JoinHandle;
 use url::Url;
 
+use desktop::WhenDone;
 use settings::Settings;
+use tray::TrayAction;
 use util::{lock, Verdict};
 
+/// The window's title and the app's name.
+const TITLE: &str = "Endo's Unified Downloader";
+/// Set for the build an update starts, which must not take the closing app for another copy
+/// already running (see `main`).
+const RESTARTED: &str = "ENDO_RESTARTED";
 /// How long closing the window waits for downloads to save their resume state. Live recordings
 /// are finished before it closes (see [`stop_recordings`]).
 const EXIT_GRACE: Duration = Duration::from_secs(3);
@@ -142,6 +152,8 @@ enum AppEvent {
     UpdateChecked { result: Result<Option<Update>, String>, manual: bool },
     /// The update the user chose was installed (the app then restarts), or why not.
     UpdateInstalled(Result<Installed, String>),
+    /// A choice in the tray's menu, or a second launch asking for the window (`POST /show`).
+    Tray(TrayAction),
 }
 
 /// Handles to a running engine task.
@@ -292,10 +304,40 @@ struct App {
     /// The program to start once the window has closed: the new build an update installed. Read
     /// by `main` after the window closes.
     restart: Arc<Mutex<Option<PathBuf>>>,
+
+    /// The tray icon, while there is one (see `tray::start`).
+    tray: Option<tray::Tray>,
+    /// The window is hidden in the tray.
+    hidden: bool,
+    /// Hide the window in the tray once its first frame is up (a start hidden).
+    hide_at_start: bool,
+    /// The window closes for good: Quit in the tray, an update, the queue done with "Quit the
+    /// app" chosen. Closing it otherwise may only hide it (see `Settings::close_to_tray`).
+    quitting: bool,
+    /// What to do once the queue is done; this session only.
+    when_done: WhenDone,
+    /// Sleep or shut down at this time, unless cancelled.
+    countdown: Option<(WhenDone, Instant)>,
+    /// Sleeps or shuts down the computer (see `desktop::power`).
+    power: desktop::Power,
+    /// Writes launch at startup and the `endo-dl:` link (see `desktop::write`).
+    writer: desktop::Writer,
+    /// The local time the schedule was last checked at (see `desktop::schedule_due`).
+    schedule_seen: Option<(u8, u16)>,
+    /// Downloads the schedule paused at its stop time, which its start resumes.
+    schedule_paused: Vec<usize>,
+    /// The window's taskbar button (Windows), and the progress it shows.
+    taskbar: Option<taskbar::Taskbar>,
+    taskbar_shown: Option<taskbar::Progress>,
+    /// A download failed since the queue last stood still: the taskbar's progress is red.
+    batch_failed: bool,
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>, rt: tokio::runtime::Handle, restart: Arc<Mutex<Option<PathBuf>>>) -> Self {
+    /// The app with its saved settings and queue, its tray icon, the local API and the
+    /// background work; hidden in the tray when `minimized` (or the setting says so). A
+    /// `portable` copy leaves the `endo-dl:` link to the installed app.
+    fn new(cc: &eframe::CreationContext<'_>, rt: tokio::runtime::Handle, restart: Arc<Mutex<Option<PathBuf>>>, minimized: bool, portable: bool) -> Self {
         ui::setup(&cc.egui_ctx);
         let settings = Settings::load();
         let (queue, queue_problem) = queue_store::load(&queue_store::path());
@@ -305,6 +347,29 @@ impl App {
         let mut app = Self::with(cc.egui_ctx.clone(), rt.clone(), settings, queue, queue_saver);
         app.notice = queue_problem.map(Err);
         app.restart = restart;
+        let (tx, ctx) = (app.events_tx.clone(), cc.egui_ctx.clone());
+        app.tray = tray::start(
+            move |action| {
+                if tx.send(AppEvent::Tray(action)).is_ok() {
+                    ctx.request_repaint();
+                }
+            },
+            &rt,
+        );
+        app.taskbar = taskbar::Taskbar::new(TITLE);
+        if cfg!(windows) && !portable {
+            app.register_protocol();
+        }
+        // Written again: the program may have moved.
+        if app.settings.launch_at_startup {
+            app.set_launch_at_startup(true);
+        }
+        if minimized || app.settings.start_minimized {
+            // eframe shows the window after its first frame: it comes up minimized, and hides
+            // in the tray on the next (see `update`).
+            cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            app.hide_at_start = app.tray.is_some();
+        }
         // What an earlier update left next to the exe; it no longer runs.
         rt.spawn_blocking(|| {
             updater::cleanup_old();
@@ -319,7 +384,7 @@ impl App {
             app.events_tx.clone(),
             cc.egui_ctx.clone(),
         );
-        ipc::spawn(app.events_tx.clone(), cc.egui_ctx.clone(), &rt);
+        ipc::spawn(app.events_tx.clone(), cc.egui_ctx.clone(), &rt, desktop::data_tag(&settings::data_dir()));
         app.refresh_history();
         if app.settings.install_ffmpeg.is_none() {
             let found = unblock(hyperfetch_core::media::find_ffmpeg_path);
@@ -384,6 +449,19 @@ impl App {
             updating: false,
             install_task: None,
             restart: Arc::default(),
+            tray: None,
+            hidden: false,
+            hide_at_start: false,
+            quitting: false,
+            when_done: WhenDone::Nothing,
+            countdown: None,
+            power: Box::new(desktop::power),
+            writer: Box::new(desktop::write),
+            schedule_seen: None,
+            schedule_paused: Vec::new(),
+            taskbar: None,
+            taskbar_shown: None,
+            batch_failed: false,
         }
     }
 
@@ -1112,6 +1190,12 @@ impl App {
                 self.queue.finish(id, result);
                 // The engine records completed downloads in the history.
                 self.refresh_history();
+                // One that ended by itself (not paused) may have been the queue's last.
+                let ended = self.queue.get_item(id).map(|item| item.status.clone());
+                self.batch_failed |= matches!(ended, Some(QueueItemStatus::Failed(_)));
+                if matches!(ended, Some(QueueItemStatus::Completed | QueueItemStatus::Failed(_))) && self.queue_done() {
+                    self.queue_finished();
+                }
             }
             AppEvent::History(result) => match result {
                 Ok((generation, entries)) if generation > self.history_applied => {
@@ -1224,11 +1308,12 @@ impl App {
                         let version = self.update.take().map(|update| update.version).unwrap_or_default();
                         self.notice = Some(Ok(format!("Updated to {}; restarting...", version)));
                         *lock(&self.restart) = Some(installed.own);
-                        self.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        self.quit();
                     }
                     Err(e) => self.notice = Some(Err(format!("Could not update: {}", e))),
                 }
             }
+            AppEvent::Tray(action) => self.tray_action(action),
         }
     }
 
@@ -1395,6 +1480,204 @@ impl App {
             AppEvent::UpdateInstalled(updater::install(proxy.as_deref(), &update, updater::Program::Gui).await)
         }));
     }
+
+    // ---- desktop: tray, startup, schedule, when done --------------------------------------
+
+    /// The desktop's part of a frame: hiding a window started hidden, the countdown, the
+    /// schedule (checked as each minute begins) and the taskbar's progress. It asks only for the
+    /// frames these need.
+    fn desktop_frame(&mut self, ctx: &egui::Context) {
+        if self.hide_at_start && ctx.cumulative_pass_nr() > 0 {
+            self.hide_at_start = false;
+            self.hide_window();
+        }
+        // Brought back from the tray another way (Alt+Tab): its taskbar button comes back too.
+        if cfg!(windows) && self.hidden && ctx.input(|i| i.viewport().minimized) == Some(false) {
+            self.show_window();
+        }
+        self.tick_countdown(Instant::now());
+        if self.countdown.is_some() {
+            ctx.request_repaint_after(Duration::from_secs(1));
+        }
+        if self.settings.schedule.enabled {
+            self.run_schedule(desktop::local_now());
+            ctx.request_repaint_after(desktop::until_next_minute());
+        }
+        if self.queue.active_count() == 0 {
+            self.batch_failed = false;
+        }
+        if let Some(taskbar) = &self.taskbar {
+            let progress = self.overall_progress();
+            if self.taskbar_shown != Some(progress) && taskbar.set_progress(progress) {
+                self.taskbar_shown = Some(progress);
+            }
+        }
+    }
+
+    fn tray_action(&mut self, action: TrayAction) {
+        match action {
+            TrayAction::Show => self.show_window(),
+            TrayAction::PauseAll => {
+                self.pause_all();
+            }
+            TrayAction::ResumeAll => self.resume_all(),
+            TrayAction::StartQueue => self.settings.auto_run_queue = true,
+            TrayAction::StopQueue => self.settings.auto_run_queue = false,
+            TrayAction::Quit => self.quit(),
+        }
+    }
+
+    /// Brings the window back from the tray (or from minimized) to the front.
+    fn show_window(&mut self) {
+        if let Some(taskbar) = self.taskbar.as_ref().filter(|_| self.hidden) {
+            taskbar.show_button(true);
+        }
+        self.hidden = false;
+        self.hide_at_start = false;
+        for command in [egui::ViewportCommand::Visible(true), egui::ViewportCommand::Minimized(false), egui::ViewportCommand::Focus] {
+            self.ctx.send_viewport_cmd(command);
+        }
+    }
+
+    /// Hides the window in the tray; downloads go on. On Windows it is minimized and its taskbar
+    /// button taken off, as a hidden window there gets no frames, so nothing would run.
+    fn hide_window(&mut self) {
+        self.hidden = true;
+        if !cfg!(target_os = "macos") {
+            self.ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
+        if cfg!(windows) {
+            if let Some(taskbar) = &self.taskbar {
+                taskbar.show_button(false);
+            }
+        } else {
+            self.ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+    }
+
+    /// Closes the app the way closing the window does when it is not kept in the tray.
+    fn quit(&mut self) {
+        self.quitting = true;
+        self.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
+    /// Stops the queue and pauses every running download; the ones it paused.
+    fn pause_all(&mut self) -> Vec<usize> {
+        self.settings.auto_run_queue = false;
+        let running: Vec<usize> =
+            self.queue.items().iter().filter(|item| item.status == QueueItemStatus::Downloading).map(|item| item.id).collect();
+        for &id in &running {
+            self.pause_job(id);
+        }
+        running
+    }
+
+    /// Starts the queue and resumes every paused download.
+    fn resume_all(&mut self) {
+        self.settings.auto_run_queue = true;
+        let paused: Vec<usize> = self.queue.items().iter().filter(|item| item.status == QueueItemStatus::Paused).map(|item| item.id).collect();
+        for id in paused {
+            self.start_job(id, false);
+        }
+    }
+
+    /// Starts or pauses the queue as the schedule says for the local time `now` (see
+    /// `desktop::schedule_due`): its start resumes what its stop paused.
+    fn run_schedule(&mut self, now: (u8, u16)) {
+        match desktop::schedule_due(&self.settings.schedule, self.schedule_seen.replace(now), now) {
+            Some(true) => {
+                self.settings.auto_run_queue = true;
+                for id in std::mem::take(&mut self.schedule_paused) {
+                    if self.queue.get_item(id).is_some_and(|item| item.status == QueueItemStatus::Paused) {
+                        self.start_job(id, false);
+                    }
+                }
+            }
+            Some(false) => {
+                let paused = self.pause_all();
+                self.schedule_paused.extend(paused);
+            }
+            None => {}
+        }
+    }
+
+    /// Nothing runs, and nothing queued will start by itself.
+    fn queue_done(&self) -> bool {
+        let waiting = self.settings.auto_run_queue && self.queue.items().iter().any(|item| item.status == QueueItemStatus::Queued);
+        self.queue.active_count() == 0 && !waiting
+    }
+
+    /// Does what the user chose for when the queue is done, once: quits, or counts down to
+    /// sleeping or shutting down, the window shown to cancel it.
+    fn queue_finished(&mut self) {
+        match std::mem::take(&mut self.when_done) {
+            WhenDone::Nothing => {}
+            WhenDone::Quit => self.quit(),
+            action => {
+                self.countdown = Some((action, Instant::now() + desktop::COUNTDOWN));
+                self.show_window();
+            }
+        }
+    }
+
+    /// Sleeps or shuts down once the countdown is over at `now`.
+    fn tick_countdown(&mut self, now: Instant) {
+        let Some((action, _)) = self.countdown.filter(|&(_, at)| now >= at) else { return };
+        self.countdown = None;
+        if let Err(e) = (self.power)(action) {
+            self.notice = Some(Err(format!("Could not {}: {}", action.name().to_lowercase(), e)));
+        }
+    }
+
+    /// Registers launch at startup (or removes it): the setting changes only when that worked,
+    /// else a notice says why.
+    fn set_launch_at_startup(&mut self, on: bool) {
+        let exe = match std::env::current_exe() {
+            Ok(exe) => exe,
+            Err(e) => {
+                self.notice = Some(Err(format!("Could not find this program to start it with the system: {}", e)));
+                return;
+            }
+        };
+        let (place, value) = desktop::startup_entry(&exe, &desktop::startup_root());
+        match (self.writer)(&place, on.then_some(value.as_str())) {
+            Ok(()) => self.settings.launch_at_startup = on,
+            Err(e) => self.notice = Some(Err(format!("Could not change launch at startup: {}", e))),
+        }
+    }
+
+    /// Makes `endo-dl:` links start this program (Windows; see `desktop::protocol_entries`).
+    fn register_protocol(&self) {
+        let Ok(exe) = std::env::current_exe() else { return };
+        for (place, value) in desktop::protocol_entries(&exe) {
+            if let Err(e) = (self.writer)(&place, Some(&value)) {
+                tracing::warn!("Could not register endo-dl: links: {}", e);
+                return;
+            }
+        }
+    }
+
+    /// What the taskbar button shows: nothing while no download runs; else the share of their
+    /// bytes done, red when one failed since the queue last stood still, yellow when all that
+    /// run are pausing or stalled.
+    fn overall_progress(&self) -> taskbar::Progress {
+        let running: Vec<&QueueItem> = self.queue.items().iter().filter(|item| item.status.is_active()).collect();
+        if running.is_empty() {
+            return taskbar::Progress::None;
+        }
+        let (done, total) = running
+            .iter()
+            .filter(|item| item.total_bytes > 0)
+            .fold((0u64, 0u64), |(done, total), item| (done + item.downloaded_bytes.min(item.total_bytes), total + item.total_bytes));
+        let share = (done.saturating_mul(1000) / total.max(1)) as u16;
+        if self.batch_failed {
+            taskbar::Progress::Error(share)
+        } else if running.iter().all(|item| item.status == QueueItemStatus::Pausing || self.stalled_for(item.id).is_some()) {
+            taskbar::Progress::Paused(share)
+        } else {
+            taskbar::Progress::Normal(share)
+        }
+    }
 }
 
 impl eframe::App for App {
@@ -1407,9 +1690,14 @@ impl eframe::App for App {
             self.add_dropped(path);
         }
         self.drain_snapshots();
-        // Asked to close, the window first stays open for the live recordings to finish; asked
-        // again, it closes at once.
-        if ctx.input(|i| i.viewport().close_requested()) && !self.closing && stop_recordings(&mut self.queue, &self.jobs) {
+        self.desktop_frame(ctx);
+        // Kept in the tray, the window only hides. Asked to close, the window first stays open
+        // for the live recordings to finish; asked again, it closes at once.
+        let close = ctx.input(|i| i.viewport().close_requested());
+        if close && self.settings.close_to_tray && self.tray.is_some() && !self.quitting && !self.closing {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.hide_window();
+        } else if close && !self.closing && stop_recordings(&mut self.queue, &self.jobs) {
             self.closing = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
@@ -1513,6 +1801,7 @@ fn task_options(settings: &Settings, task: &Task, checksum: &str, auth: &str) ->
         options.output_path = options.output_path.map(|path| path.join(""));
     }
     options.media_name = task.media_name.clone();
+    options.metalink_pieces = task.pieces.clone();
     options.archive_lines = task.archive.clone();
     options.bittorrent = task.p2p;
     options.post.sort &= !task.keeps_its_place();
@@ -1882,31 +2171,51 @@ fn spawn_clipboard_watcher(
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Started again to stop a live recording (a debug build has a console), this only does that.
+    use tracing_subscriber::fmt::writer::MakeWriterExt;
+
     hyperfetch_core::media::serve_ctrl_c();
     hyperfetch_core::media::prepare_macos();
-    let _ = tracing_subscriber::fmt().try_init();
+    let launch = desktop::Launch::parse(std::env::args_os().skip(1));
+    // Before any thread starts, so that everything reading the history or the download archive
+    // finds them in the portable data folder.
+    let portable = desktop::portable_dir(launch.data_dir.clone(), std::env::current_exe().ok().as_deref());
+    if let Some(dir) = &portable {
+        std::env::set_var("ENDO_HISTORY_PATH", dir.join("history.json"));
+        std::env::set_var("ENDO_ARCHIVE_PATH", dir.join("download-archive.txt"));
+    }
+    let data = settings::data_dir();
+    let log = Mutex::new(desktop::LogFile::new(data.join("logs").join("endo.log"), desktop::LOG_LIMIT));
+    let _ = tracing_subscriber::fmt().with_ansi(false).with_writer(std::io::stderr.and(log)).try_init();
+    // One app per data folder: a second launch shows the running one's window and ends, one
+    // started hidden (at startup, by a link) just ends. Not the build an update started, which
+    // would find the app it replaces still closing.
+    let restarted = std::env::var_os(RESTARTED).is_some();
+    std::env::remove_var(RESTARTED);
+    if !restarted {
+        if let Some(port) = ipc::running_instance(&ipc::PORTS, &desktop::data_tag(&data)) {
+            if !launch.minimized {
+                ipc::show_instance(port);
+            }
+            return Ok(());
+        }
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     let handle = runtime.handle().clone();
 
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([980.0, 720.0])
-            .with_min_inner_size([760.0, 520.0])
-            .with_title("Endo's Unified Downloader"),
+        viewport: egui::ViewportBuilder::default().with_inner_size([980.0, 720.0]).with_min_inner_size([760.0, 520.0]).with_title(TITLE),
         ..Default::default()
     };
     let restart = Arc::new(Mutex::new(None));
     let restart_for_app = Arc::clone(&restart);
-    let result = eframe::run_native(
-        "Endo's Unified Downloader",
-        options,
-        Box::new(move |cc| Ok(Box::new(App::new(cc, handle, restart_for_app)))),
-    );
+    let (minimized, portable) = (launch.minimized, portable.is_some());
+    let result = eframe::run_native(TITLE, options, Box::new(move |cc| Ok(Box::new(App::new(cc, handle, restart_for_app, minimized, portable)))));
     // Downloads were stopped in `on_exit`; leftover blocking work (e.g. hashing for a verify)
     // must not keep the process alive.
     runtime.shutdown_background();
     // An update was installed: the new build takes over.
     if let Some(exe) = lock(&restart).take() {
+        std::env::set_var(RESTARTED, "1");
         if let Err(e) = updater::restart(&exe) {
             tracing::warn!("Could not start the updated app {}: {}", exe.display(), e);
         }
@@ -2138,6 +2447,10 @@ mod tests {
         assert_eq!(options.expected_checksum, Some(listed));
         let typed = format!("md5:{}", "cd".repeat(16));
         assert_eq!(task_options(&settings, &named, &typed, "").unwrap().expected_checksum, Some(typed));
+        // A metalink's piece hashes, for repairing only the damaged pieces.
+        let pieces = hyperfetch_core::metalink::Pieces { length: 1 << 20, algo: "sha256".into(), hashes: vec!["cd".repeat(32)] };
+        let with_pieces = Task { urls: vec![url.clone()], pieces: Some(pieces.clone()), ..Task::default() };
+        assert_eq!(task_options(&settings, &with_pieces, "", "").unwrap().metalink_pieces, Some(pieces));
 
         let plain = Task { urls: vec![url], ..Task::default() };
         assert_eq!(task_options(&settings, &plain, " ", "").unwrap().output_path, Some(PathBuf::from("dl")));
@@ -2820,5 +3133,185 @@ mod tests {
         app.handle_event(AppEvent::UpdateInstalled(Ok(Installed { own: own.clone(), ..Installed::default() })));
         assert_eq!(lock(&app.restart).as_ref(), Some(&own), "started once the window has closed");
         assert!(app.update.is_none() && !app.updating);
+        assert!(app.quitting, "it closes for good, not into the tray");
+    }
+
+    /// Download `id` of `app` running, as far as the app can tell (no engine runs on `rt`).
+    fn running(app: &mut App, rt: &tokio::runtime::Runtime, id: usize) {
+        app.queue.mark_started(id);
+        let running = Running { cancel: Arc::default(), task: rt.spawn(async {}), snapshot: Arc::default() };
+        app.jobs.insert(id, JobView { running: Some(running), ..JobView::default() });
+    }
+
+    fn add(app: &mut App, name: &str) -> usize {
+        app.queue.add_item(vec![Url::parse(&format!("https://example.com/{}", name)).unwrap()], DownloadOptions::default())
+    }
+
+    fn status(app: &App, id: usize) -> QueueItemStatus {
+        app.queue.get_item(id).unwrap().status.clone()
+    }
+
+    /// Once the queue is done (its last download ended by itself and nothing queued is left to
+    /// start), what was chosen for it happens, once: Sleep and Shut down after 30 s, through the
+    /// stand-in for the computer, unless cancelled; Quit closes the app as closing the window
+    /// does. A paused download is not done.
+    #[test]
+    fn when_the_queue_is_done_the_choice_happens_once() {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(&rt, dir.path());
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&ran);
+        app.power = Box::new(move |action| {
+            lock(&log).push(action);
+            Ok(())
+        });
+        let end = |app: &mut App, id, result| app.handle_event(AppEvent::JobFinished { id, result });
+        let done = |name: &str| Ok((PathBuf::from(name), Some(1)));
+
+        app.when_done = WhenDone::ShutDown;
+        let (a, b) = (add(&mut app, "a.iso"), add(&mut app, "b.iso"));
+        running(&mut app, &rt, a);
+        end(&mut app, a, done("a.iso"));
+        assert!(app.countdown.is_none(), "b.iso waits to start");
+        running(&mut app, &rt, b);
+        app.pause_job(b);
+        end(&mut app, b, Err(hyperfetch_core::engine::CANCELLED.to_string()));
+        assert!(app.countdown.is_none(), "paused is not done");
+        running(&mut app, &rt, b);
+        end(&mut app, b, Err("The server answered 404 Not Found".to_string()));
+        let (action, at) = app.countdown.expect("counting down");
+        assert_eq!((action, app.when_done), (WhenDone::ShutDown, WhenDone::Nothing), "once");
+        app.tick_countdown(at - Duration::from_secs(1));
+        assert!(lock(&ran).is_empty() && app.countdown.is_some());
+        app.tick_countdown(at);
+        assert_eq!(*lock(&ran), [WhenDone::ShutDown]);
+        assert!(app.countdown.is_none());
+
+        // Cancel (the banner's button) takes the countdown away.
+        app.when_done = WhenDone::Sleep;
+        let c = add(&mut app, "c.iso");
+        running(&mut app, &rt, c);
+        end(&mut app, c, done("c.iso"));
+        let (_, at) = app.countdown.take().expect("counting down");
+        app.tick_countdown(at);
+        assert_eq!(lock(&ran).len(), 1);
+
+        // What the computer refused is told.
+        app.power = Box::new(|_| Err(std::io::Error::other("not allowed")));
+        app.when_done = WhenDone::Sleep;
+        let d = add(&mut app, "d.iso");
+        running(&mut app, &rt, d);
+        end(&mut app, d, done("d.iso"));
+        app.tick_countdown(app.countdown.unwrap().1);
+        assert_eq!(app.notice, Some(Err("Could not sleep: not allowed".to_string())));
+
+        let e = add(&mut app, "e.iso");
+        running(&mut app, &rt, e);
+        app.when_done = WhenDone::Quit;
+        end(&mut app, e, done("e.iso"));
+        assert!(app.quitting && app.countdown.is_none());
+    }
+
+    /// Pause all stops the queue and pauses what runs, Resume all starts both again, and the
+    /// queue's switch follows Start and Stop. The schedule's stop pauses what runs, and its start
+    /// resumes only that, not a download the user paused.
+    #[test]
+    fn the_tray_and_the_schedule_pause_and_resume_the_queue() {
+        use QueueItemStatus::{Downloading, Paused, Pausing, Queued};
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(&rt, dir.path());
+        let [a, b, c] = ["a.iso", "b.iso", "c.iso"].map(|name| add(&mut app, name));
+        running(&mut app, &rt, a);
+        running(&mut app, &rt, b);
+        let stopped = |app: &mut App, id| app.handle_event(AppEvent::JobFinished { id, result: Err(hyperfetch_core::engine::CANCELLED.to_string()) });
+
+        app.handle_event(AppEvent::Tray(TrayAction::PauseAll));
+        assert!(!app.settings.auto_run_queue);
+        assert_eq!([a, b, c].map(|id| status(&app, id)), [Pausing, Pausing, Queued]);
+        stopped(&mut app, a);
+        stopped(&mut app, b);
+        app.handle_event(AppEvent::Tray(TrayAction::ResumeAll));
+        assert!(app.settings.auto_run_queue);
+        assert_eq!([a, b, c].map(|id| status(&app, id)), [Downloading, Downloading, Queued]);
+        app.handle_event(AppEvent::Tray(TrayAction::StopQueue));
+        assert!(!app.settings.auto_run_queue);
+        app.handle_event(AppEvent::Tray(TrayAction::StartQueue));
+        assert!(app.settings.auto_run_queue);
+
+        app.pause_job(b);
+        stopped(&mut app, b);
+        let schedule = settings::Schedule { enabled: true, start: Some("08:00".into()), stop: Some("18:00".into()), ..Default::default() };
+        app.settings.schedule = schedule;
+        app.run_schedule((0, 17 * 60 + 59));
+        assert_eq!(status(&app, a), Downloading);
+        app.run_schedule((0, 18 * 60));
+        assert!(!app.settings.auto_run_queue);
+        assert_eq!([a, b].map(|id| status(&app, id)), [Pausing, Paused]);
+        stopped(&mut app, a);
+        app.run_schedule((1, 8 * 60 + 2));
+        assert!(app.settings.auto_run_queue);
+        assert_eq!([a, b].map(|id| status(&app, id)), [Downloading, Paused], "the user's pause stays");
+
+        app.hide_window();
+        assert!(app.hidden);
+        app.handle_event(AppEvent::Tray(TrayAction::Show));
+        assert!(!app.hidden && !app.quitting);
+        app.handle_event(AppEvent::Tray(TrayAction::Quit));
+        assert!(app.quitting);
+    }
+
+    /// The taskbar shows nothing while no download runs, else the share of their bytes done:
+    /// yellow when all are pausing, red once one failed until the queue stands still.
+    #[test]
+    fn the_taskbar_shows_the_running_downloads() {
+        use taskbar::Progress;
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(&rt, dir.path());
+        let [a, b] = ["a.iso", "b.iso"].map(|name| add(&mut app, name));
+        assert_eq!(app.overall_progress(), Progress::None);
+        running(&mut app, &rt, a);
+        running(&mut app, &rt, b);
+        app.queue.apply_snapshot(a, &EngineSnapshot { total_bytes: 1000, downloaded_bytes: 250, ..Default::default() });
+        assert_eq!(app.overall_progress(), Progress::Normal(250), "a size not known yet counts for nothing");
+        app.queue.apply_snapshot(b, &EngineSnapshot { total_bytes: 3000, downloaded_bytes: 3000, ..Default::default() });
+        assert_eq!(app.overall_progress(), Progress::Normal(812));
+        app.pause_job(a);
+        assert_eq!(app.overall_progress(), Progress::Normal(812));
+        app.pause_job(b);
+        assert_eq!(app.overall_progress(), Progress::Paused(812));
+        app.batch_failed = true;
+        assert_eq!(app.overall_progress(), Progress::Error(812));
+    }
+
+    /// Launch at startup is written where the system looks, through the writer the app holds,
+    /// and the setting changes only when that worked.
+    #[test]
+    fn launch_at_startup_is_registered_and_removed() {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(&rt, dir.path());
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&written);
+        app.writer = Box::new(move |place, value| {
+            lock(&log).push((place.clone(), value.map(str::to_string)));
+            Ok(())
+        });
+        app.set_launch_at_startup(true);
+        assert!(app.settings.launch_at_startup);
+        let (place, value) = desktop::startup_entry(&std::env::current_exe().unwrap(), &desktop::startup_root());
+        app.set_launch_at_startup(false);
+        assert!(!app.settings.launch_at_startup);
+        assert_eq!(*lock(&written), [(place.clone(), Some(value)), (place, None)]);
+
+        app.register_protocol();
+        assert_eq!(lock(&written).len(), 5, "the endo-dl: key, its URL Protocol value and its command");
+
+        app.writer = Box::new(|_, _| Err(std::io::Error::other("access denied")));
+        app.set_launch_at_startup(true);
+        assert!(!app.settings.launch_at_startup);
+        assert_eq!(app.notice, Some(Err("Could not change launch at startup: access denied".to_string())));
     }
 }

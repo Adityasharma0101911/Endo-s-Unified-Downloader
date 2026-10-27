@@ -695,6 +695,15 @@ pub(super) fn queue_page(app: &mut App, ui: &mut Ui) {
         if running > 0 {
             ui.label(RichText::new(format!("{} running", running)).color(p.accent));
         }
+        // For this session only; it applies once.
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            egui::ComboBox::from_id_salt("when_done").selected_text(app.when_done.name()).show_ui(ui, |ui| {
+                for (choice, name) in WhenDone::CHOICES {
+                    ui.selectable_value(&mut app.when_done, choice, name);
+                }
+            });
+            ui.label(RichText::new("When the queue is done:").color(p.muted));
+        });
     });
     ui.add_space(4.0);
 
@@ -787,6 +796,29 @@ mod tests {
 
     fn add(queue: &mut DownloadQueue, name: &str) -> usize {
         queue.add_item(vec![url::Url::parse(&format!("https://example.com/{}", name)).unwrap()], DownloadOptions::default())
+    }
+
+    /// What to do when the queue is done is picked on the queue page; once it is done, the
+    /// countdown shows over every page until Cancel.
+    #[test]
+    fn the_queue_done_choice_counts_down_until_cancelled() {
+        let mut h = Harness::new();
+        h.app.tab = Tab::Queue;
+        assert!(h.settle());
+        h.click("Do nothing");
+        h.frames(10);
+        h.click("Shut down");
+        assert_eq!(h.app.when_done, WhenDone::ShutDown);
+        let id = h.add("big.iso");
+        h.progress(id, 0.5);
+        h.app.handle_event(crate::AppEvent::JobFinished { id, result: Ok((std::env::temp_dir().join("big.iso"), Some(1))) });
+        assert!(h.app.countdown.is_some());
+        h.app.tab = Tab::Settings;
+        assert!(h.settle());
+        assert!(h.texts().iter().any(|(text, _)| text.starts_with("The queue is done. Shutting down in ")), "{:?}", h.texts());
+        h.click("Cancel");
+        assert!(h.app.countdown.is_none());
+        h.wait_for_background();
     }
 
     /// Each line's file name, whether it is a ghost, and how many rows down it is pushed.

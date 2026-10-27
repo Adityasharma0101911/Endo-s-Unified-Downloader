@@ -77,12 +77,13 @@ fn text_setting(ui: &mut Ui, title: &str, about: &str, value: &mut String, hint:
 
 pub(super) fn settings_page(app: &mut App, ui: &mut Ui) {
     section(ui, 0, icon::SLIDERS, "General", |ui| general_settings(app, ui));
-    section(ui, 1, icon::NETWORK, "Connections & networks", |ui| connection_settings(&mut app.settings, ui));
-    section(ui, 2, icon::MAGNET, "BitTorrent", |ui| torrent_settings(app, ui));
-    section(ui, 3, icon::CLOUD_ARROW_DOWN, "Debrid & hosts", |ui| host_settings(app, ui));
-    section(ui, 4, icon::FILM_STRIP, "Media", |ui| media_settings(app, ui));
-    section(ui, 5, icon::PACKAGE, "Post-processing", |ui| post_settings(&mut app.settings, ui));
-    section(ui, 6, icon::PUZZLE_PIECE, "Browser extension", |ui| {
+    section(ui, 1, icon::DESKTOP, "Desktop", |ui| desktop_settings(app, ui));
+    section(ui, 2, icon::NETWORK, "Connections & networks", |ui| connection_settings(&mut app.settings, ui));
+    section(ui, 3, icon::MAGNET, "BitTorrent", |ui| torrent_settings(app, ui));
+    section(ui, 4, icon::CLOUD_ARROW_DOWN, "Debrid & hosts", |ui| host_settings(app, ui));
+    section(ui, 5, icon::FILM_STRIP, "Media", |ui| media_settings(app, ui));
+    section(ui, 6, icon::PACKAGE, "Post-processing", |ui| post_settings(&mut app.settings, ui));
+    section(ui, 7, icon::PUZZLE_PIECE, "Browser extension", |ui| {
         let p = palette(ui);
         ui.separator();
         let text = "The extension hands this app the links, videos and cookies of the pages you visit, on this computer \
@@ -101,7 +102,7 @@ pub(super) fn settings_page(app: &mut App, ui: &mut Ui) {
             });
         }
     });
-    section(ui, 7, icon::ARROW_CIRCLE_UP, "Updates", |ui| {
+    section(ui, 8, icon::ARROW_CIRCLE_UP, "Updates", |ui| {
         setting(ui, "Version", "", (), |ui| {
             if ui.add(button("Check now")).clicked() {
                 app.check_for_update(true);
@@ -112,7 +113,7 @@ pub(super) fn settings_page(app: &mut App, ui: &mut Ui) {
                      and only releases signed by the maintainer are.";
         switch(ui, "Check for updates at startup", about, &mut app.settings.check_updates);
     });
-    section(ui, 8, icon::WRENCH, "Advanced", |ui| {
+    section(ui, 9, icon::WRENCH, "Advanced", |ui| {
         let s = &mut app.settings;
         setting(ui, "Retries", "Failed attempts per chunk before the download fails; attempts that made progress don't count.", s.max_retries, |ui| {
             ui.add(egui::DragValue::new(&mut s.max_retries).range(0..=100));
@@ -157,6 +158,72 @@ fn general_settings(app: &mut App, ui: &mut Ui) {
     setting(ui, "Downloads at once", "How many queued downloads run together.", s.max_concurrent, |ui| {
         ui.add(egui::DragValue::new(&mut s.max_concurrent).range(1..=8));
     });
+}
+
+/// The days of the week, as `Schedule::days` keeps them.
+const DAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+
+/// The tray, launch at startup, the queue's schedule and where the data and logs are.
+fn desktop_settings(app: &mut App, ui: &mut Ui) {
+    let p = palette(ui);
+    let s = &mut app.settings;
+    let about = "Closing the window hides it in the tray (the menu bar on macOS) and downloads go on; Quit in the tray's \
+                 menu closes the app. Where the desktop has no tray, closing closes.";
+    switch(ui, "Close to the tray", about, &mut s.close_to_tray);
+    let about = "Start hidden in the tray, as --minimized does (minimized where there is no tray).";
+    switch(ui, "Start minimized", about, &mut s.start_minimized);
+    let about = if cfg!(windows) {
+        "Start with Windows, hidden in the tray."
+    } else if cfg!(target_os = "macos") {
+        "Start when you log in, hidden in the menu bar."
+    } else {
+        "Start with your desktop session, hidden in the tray."
+    };
+    let mut startup = s.launch_at_startup;
+    if switch(ui, "Launch at startup", about, &mut startup) {
+        app.set_launch_at_startup(startup);
+    }
+    let s = &mut app.settings.schedule;
+    let about = "At the start time, on the days ticked, the queue starts; at the stop time the running downloads pause \
+                 until the next start. Local time.";
+    switch(ui, "Schedule the queue", about, &mut s.enabled);
+    ui.add_enabled_ui(s.enabled, |ui| {
+        setting(ui, "Start and stop", "HH:MM; leave one empty to only start or only stop.", (egui::Id::new(&s.start), egui::Id::new(&s.stop)), |ui| {
+            time_edit(ui, &mut s.stop, "Stop");
+            ui.label("to");
+            time_edit(ui, &mut s.start, "Start");
+        });
+        setting(ui, "Days", "The days the queue starts on.", s.days, |ui| {
+            for (on, day) in s.days.iter_mut().zip(DAYS).rev() {
+                ui.toggle_value(on, day);
+            }
+        });
+        for time in [&s.start, &s.stop].into_iter().flatten() {
+            if crate::desktop::minute_of(time).is_none() {
+                error_alert(ui, &format!("{} is not a time like 08:30; it is left out", time));
+            }
+        }
+    });
+    let data = crate::settings::data_dir();
+    let about = "Settings, queue, history and logs. A file named portable next to the program keeps them in a data folder \
+                 beside it; --data-dir DIR keeps them in DIR.";
+    setting(ui, "Data folder", about, (), |ui| {
+        if ui.add(button("Open logs folder")).clicked() {
+            let logs = data.join("logs");
+            if let Err(e) = std::fs::create_dir_all(&logs).and_then(|()| util::open_path(&logs)) {
+                app.notice = Some(Err(format!("Could not open {}: {}", logs.display(), e)));
+            }
+        }
+        ui.add(egui::Label::new(RichText::new(data.display().to_string()).small().color(p.muted)).truncate());
+    });
+}
+
+/// A text box for a time of day, kept as written, None when empty.
+fn time_edit(ui: &mut Ui, time: &mut Option<String>, hint: &str) {
+    let mut text = time.clone().unwrap_or_default();
+    if ui.add(egui::TextEdit::singleline(&mut text).hint_text(hint).desired_width(56.0)).changed() {
+        *time = Some(text.trim().to_string()).filter(|t| !t.is_empty());
+    }
 }
 
 fn connection_settings(s: &mut Settings, ui: &mut Ui) {
@@ -369,8 +436,69 @@ fn post_settings(s: &mut Settings, ui: &mut Ui) {
 
 #[cfg(test)]
 mod tests {
-    use super::super::harness::Harness;
+    use std::sync::{Arc, Mutex};
+
+    use super::super::harness::{Harness, TOGGLE};
     use super::*;
+
+    /// The Desktop section's switches set their settings; launch at startup goes through the
+    /// app's writer and is on once written; the schedule takes its times as typed and its days
+    /// as ticked, and says when a time is none.
+    #[test]
+    fn desktop_settings_work_through_input() {
+        let mut h = Harness::new();
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&written);
+        h.app.writer = Box::new(move |place, value| {
+            lock(&log).push((place.clone(), value.map(str::to_string)));
+            Ok(())
+        });
+        h.app.tab = Tab::Settings;
+        assert!(h.settle());
+        // The section's first row brought up to the top of the page.
+        let top = h.find("Close to the tray").unwrap().top();
+        h.hover(h.find("Desktop").unwrap().center());
+        let wheel = egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: Vec2::new(0.0, 100.0 - top), modifiers: egui::Modifiers::NONE };
+        h.frame(vec![wheel]);
+        h.frames(60);
+        h.leave();
+        assert!(h.settle());
+        assert!(h.find("Data folder").is_some(), "{:?}", h.texts());
+        // The pointer goes there first: a press that comes with a move drags the page.
+        let click = |h: &mut Harness, at: Pos2| {
+            h.hover(at);
+            h.click_at(at);
+            h.frames(30);
+        };
+        let switch = |h: &mut Harness, title: &str| {
+            let knob = h.find_near(title, TOGGLE).unwrap_or_else(|| panic!("{title}")).center();
+            click(h, knob);
+        };
+        let press = |h: &mut Harness, label: &str| {
+            let at = h.find(label).unwrap_or_else(|| panic!("{label} in {:?}", h.texts())).center();
+            click(h, at);
+        };
+        switch(&mut h, "Close to the tray");
+        switch(&mut h, "Start minimized");
+        switch(&mut h, "Launch at startup");
+        let s = &h.app.settings;
+        assert!(s.close_to_tray && s.start_minimized && s.launch_at_startup);
+        assert_eq!(lock(&written).iter().map(|(_, value)| value.is_some()).collect::<Vec<_>>(), [true]);
+
+        switch(&mut h, "Schedule the queue");
+        assert!(h.app.settings.schedule.enabled);
+        press(&mut h, "Sun");
+        assert_eq!(h.app.settings.schedule.days, [true, true, true, true, true, true, false]);
+        press(&mut h, "Start");
+        h.type_text("7:30");
+        h.key(egui::Key::Escape, egui::Modifiers::NONE);
+        press(&mut h, "Stop");
+        h.type_text("25:00");
+        h.key(egui::Key::Escape, egui::Modifiers::NONE);
+        assert_eq!((h.app.settings.schedule.start.as_deref(), h.app.settings.schedule.stop.as_deref()), (Some("7:30"), Some("25:00")));
+        assert!(h.settle());
+        assert!(h.find("25:00 is not a time like 08:30; it is left out").is_some());
+    }
 
     /// A setting changed on the open page lights its row up for a moment, after which frames
     /// stop; one changed elsewhere does not light up when the page opens.

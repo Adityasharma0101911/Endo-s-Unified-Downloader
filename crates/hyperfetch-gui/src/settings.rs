@@ -139,6 +139,32 @@ pub struct Settings {
     /// Instant transitions and nothing moving by itself; None follows the system (see
     /// [`Settings::reduces_motion`]).
     pub reduce_motion: Option<bool>,
+    /// Closing the window hides it in the tray, where there is one; downloads go on.
+    pub close_to_tray: bool,
+    /// Start hidden in the tray (minimized where there is none), as `--minimized` does.
+    pub start_minimized: bool,
+    /// Start with the system, hidden (see `desktop::startup_entry`).
+    pub launch_at_startup: bool,
+    /// When the queue starts and stops by itself.
+    pub schedule: Schedule,
+}
+
+/// When the queue runs by itself (see `desktop::schedule_due`): at `start` on the ticked days it
+/// starts, at `stop` the running downloads pause. Local time, "HH:MM".
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Schedule {
+    pub enabled: bool,
+    pub start: Option<String>,
+    pub stop: Option<String>,
+    /// Monday to Sunday.
+    pub days: [bool; 7],
+}
+
+impl Default for Schedule {
+    fn default() -> Self {
+        Self { enabled: false, start: None, stop: None, days: [true; 7] }
+    }
 }
 
 impl Default for Settings {
@@ -194,6 +220,10 @@ impl Default for Settings {
             virustotal_check: false,
             theme: 0,
             reduce_motion: None,
+            close_to_tray: false,
+            start_minimized: false,
+            launch_at_startup: false,
+            schedule: Schedule::default(),
         }
     }
 }
@@ -201,6 +231,11 @@ impl Default for Settings {
 /// A file of the GUI's own, stored next to the download history.
 pub fn app_file(name: &str) -> PathBuf {
     DownloadHistoryManager::default_history_path().with_file_name(name)
+}
+
+/// The data folder: the history's, with the settings, the queue and the `logs` folder.
+pub fn data_dir() -> PathBuf {
+    DownloadHistoryManager::default_history_path().parent().map_or_else(|| PathBuf::from("."), Path::to_path_buf)
 }
 
 /// Replaces `path` with `bytes` in one step: a crash leaves either the old file or the new one.
@@ -672,5 +707,20 @@ mod tests {
         let chosen = Settings { fsync_on_complete: true, max_connections_per_host: 8, check_updates: false, ..defaults };
         let json = serde_json::to_string(&chosen).unwrap();
         assert_eq!(serde_json::from_str::<Settings>(&json).unwrap(), chosen);
+    }
+
+    /// The desktop settings start off, also in settings an older version saved, and keep what
+    /// was chosen.
+    #[test]
+    fn desktop_settings_start_off() {
+        let saved: Settings = serde_json::from_str(r#"{"theme": 1, "schedule": {"enabled": true}}"#).unwrap();
+        assert!(!saved.close_to_tray && !saved.start_minimized && !saved.launch_at_startup);
+        assert_eq!(saved.schedule, Schedule { enabled: true, ..Schedule::default() });
+        assert_eq!(Settings::default().schedule, Schedule { enabled: false, start: None, stop: None, days: [true; 7] });
+        let mut days = [true; 7];
+        days[6] = false;
+        let schedule = Schedule { enabled: true, start: Some("01:00".into()), stop: Some("07:00".into()), days };
+        let chosen = Settings { close_to_tray: true, start_minimized: true, launch_at_startup: true, schedule, ..saved };
+        assert_eq!(serde_json::from_str::<Settings>(&serde_json::to_string(&chosen).unwrap()).unwrap(), chosen);
     }
 }
