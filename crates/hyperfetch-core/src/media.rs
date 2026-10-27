@@ -181,6 +181,8 @@ pub struct MediaDownloadOptions {
     /// files of the run, never on its command line (see [`CookieRun::sign_in`]).
     pub video_password: Option<String>,
     pub login: Option<(&'static str, String, String)>,
+    /// A live recording ends after this many seconds of it, as a stop ends it (see [`run_ytdlp`]).
+    pub record_seconds: Option<u64>,
 }
 
 impl MediaDownloadOptions {
@@ -214,6 +216,7 @@ impl Default for MediaDownloadOptions {
             merge_format: None,
             video_password: None,
             login: None,
+            record_seconds: None,
         }
     }
 }
@@ -3250,14 +3253,16 @@ pub(crate) fn ytdlp_command(bin: &Path, args: &[String], proxy: Option<&str>, wo
 /// is left to finish its file), and then gives the file recorded so far (see [`stopped`]): only
 /// part of the stream, which the archive does not record. A live recording is also ended so when
 /// less than what it recorded and [`MIN_FREE_SPACE`] is left on its disk, while it can still be
-/// finished, and one that breaks off keeps what it recorded; both fail, naming the file kept.
+/// finished, and one that breaks off keeps what it recorded; both fail, naming the file kept. One
+/// given a time to `record` is ended as a stop ends it once it has recorded that long.
 async fn run_ytdlp(
     cmd: Command,
     progress_tx: Option<&Sender<ProgressUpdate>>,
     cancel_flag: Option<Arc<AtomicBool>>,
     ffmpeg: Option<&Path>,
+    record: Option<Duration>,
 ) -> Result<(PathBuf, Vec<(String, bool)>), String> {
-    run_ytdlp_watching(cmd, progress_tx, cancel_flag, ffmpeg, MIN_FREE_SPACE).await
+    run_ytdlp_watching(cmd, progress_tx, cancel_flag, ffmpeg, MIN_FREE_SPACE, record).await
 }
 
 /// [`run_ytdlp`], ending a live recording once less than what it recorded and `margin` bytes
@@ -3268,6 +3273,7 @@ async fn run_ytdlp_watching(
     cancel_flag: Option<Arc<AtomicBool>>,
     ffmpeg: Option<&Path>,
     margin: u64,
+    record: Option<Duration>,
 ) -> Result<(PathBuf, Vec<(String, bool)>), String> {
     #[cfg(windows)]
     let_children_take_ctrl_c();
@@ -3282,6 +3288,8 @@ async fn run_ytdlp_watching(
     tokio::pin!(cancelled);
     // A live recording asked to stop, and until when it may take to stop recording.
     let (mut interrupted, mut deadline) = (false, None);
+    // When a recording given `record` is stopped, timed from when it starts.
+    let mut record_end = None;
     // The space left on a live recording's disk when it was ended for that.
     let mut disk_full = None;
     let mut disk_check = tokio::time::interval(DISK_CHECK_EVERY);
@@ -3294,7 +3302,7 @@ async fn run_ytdlp_watching(
     // ERROR lines are always collected; then wait for it to exit.
     let status = loop {
         let update = tokio::select! {
-            () = &mut cancelled, if !interrupted => {
+            () = async { tokio::select! { () = &mut cancelled => {}, () = sleep_until(record_end) => {} } }, if !interrupted => {
                 // A recording that has ended already is left to finish its file: a Ctrl+C would
                 // cut that short.
                 if state.live && (state.finishing || tree.interrupt(&child).await) {
@@ -3337,6 +3345,9 @@ async fn run_ytdlp_watching(
         };
         if state.finishing {
             deadline = None;
+        }
+        if state.live && record_end.is_none() {
+            record_end = record.map(|record| tokio::time::Instant::now() + record);
         }
         if let (Some(update), Some(tx)) = (update, progress_tx) {
             // Progress is lossy by nature; never let a slow consumer stall pipe draining.
@@ -5145,7 +5156,8 @@ async fn download_with(
             let source = found.as_ref().map_or(Source::Url(url), |file| Source::Info(&file.path));
             let cookies = tools.cookies.for_run(&options.cookies).await.sign_in(options).await;
             let command = command(source, RunKind::Download, &cookies, regional.as_ref().unwrap_or(options));
-            let result = run_ytdlp(command, progress_tx.as_ref(), cancel_flag.clone(), tools.ffmpeg.as_deref()).await;
+            let record = options.record_seconds.map(Duration::from_secs);
+            let result = run_ytdlp(command, progress_tx.as_ref(), cancel_flag.clone(), tools.ffmpeg.as_deref(), record).await;
             if !is_cancelled(&cancel_flag) {
                 cookies.finish(result.is_ok()).await;
             }
@@ -9158,10 +9170,10 @@ bbd8671c6c05eaa3ec29d690695aebadff0871faa3efe9051581afbf3c01e80e  ffmpeg-master-
         #[cfg(unix)]
         make_executable(&bin).unwrap();
         // The file it reported is missing: the step's error is the failure.
-        assert_eq!(run_ytdlp(tree_command(&bin), None, None, None).await, Err("ERROR: Conversion failed!".to_string()));
+        assert_eq!(run_ytdlp(tree_command(&bin), None, None, None, None).await, Err("ERROR: Conversion failed!".to_string()));
         let mut make = tree_command(&bin);
         make.arg("make");
-        assert_eq!(run_ytdlp(make, None, None, None).await, Ok((output, Vec::new())));
+        assert_eq!(run_ytdlp(make, None, None, None, None).await, Ok((output, Vec::new())));
     }
 
     #[test]
@@ -9488,7 +9500,7 @@ bbd8671c6c05eaa3ec29d690695aebadff0871faa3efe9051581afbf3c01e80e  ffmpeg-master-
             first
         };
         let started = std::time::Instant::now();
-        let (result, first) = tokio::join!(run_ytdlp(tree_command(&bin), Some(&tx), Some(Arc::clone(&cancel)), ffmpeg.as_deref()), stop);
+        let (result, first) = tokio::join!(run_ytdlp(tree_command(&bin), Some(&tx), Some(Arc::clone(&cancel)), ffmpeg.as_deref(), None), stop);
         assert!(started.elapsed() < Duration::from_secs(25), "{:?}", started.elapsed());
         let first = first.expect("progress");
         assert_eq!((first.downloaded, first.total), (1000, 0));
@@ -9539,7 +9551,7 @@ bbd8671c6c05eaa3ec29d690695aebadff0871faa3efe9051581afbf3c01e80e  ffmpeg-master-
         let output = dir.path().join("clip.mp4");
         ts_recording(None, &with_part(&output));
         let bin = live_ytdlp(dir.path(), &output, &[], true);
-        let error = run_ytdlp(tree_command(&bin), None, None, None).await.unwrap_err();
+        let error = run_ytdlp(tree_command(&bin), None, None, None, None).await.unwrap_err();
         let kept = dir.path().join("clip.ts");
         assert!(error.contains(&format!("kept as {}", kept.display())) && error.ends_with("Connection reset by peer"), "{error}");
         assert!(kept.is_file() && !with_part(&output).exists());
@@ -9556,7 +9568,7 @@ bbd8671c6c05eaa3ec29d690695aebadff0871faa3efe9051581afbf3c01e80e  ffmpeg-master-
             std::fs::write(with_part(stream), b"stream").unwrap();
         }
         let bin = live_ytdlp(dir.path(), &output, &[&video, &audio], true);
-        let error = run_ytdlp(tree_command(&bin), None, None, None).await.unwrap_err();
+        let error = run_ytdlp(tree_command(&bin), None, None, None, None).await.unwrap_err();
         assert!(error.contains(RECORDING_KEPT) && error.contains("ffmpeg is missing"), "{error}");
         assert!(error.ends_with("Connection reset by peer"), "{error}");
         assert!(with_part(&video).is_file() && with_part(&audio).is_file());
@@ -9572,13 +9584,27 @@ bbd8671c6c05eaa3ec29d690695aebadff0871faa3efe9051581afbf3c01e80e  ffmpeg-master-
         ts_recording(None, &with_part(&output));
         let bin = live_ytdlp(dir.path(), &output, &[], false);
         let started = std::time::Instant::now();
-        let error = run_ytdlp_watching(tree_command(&bin), None, None, None, u64::MAX).await.unwrap_err();
+        let error = run_ytdlp_watching(tree_command(&bin), None, None, None, u64::MAX, None).await.unwrap_err();
         assert!(started.elapsed() < Duration::from_secs(25), "{:?}", started.elapsed());
         let kept = dir.path().join("clip.ts");
         assert!(error.starts_with("The live recording was ended with only"), "{error}");
         assert!(error.ends_with(&format!("kept as {}", kept.display())) && kept.is_file(), "{error}");
         // With room left it records on until it ends.
         assert_eq!(ended(Ok(kept.clone()), None), Ok(kept));
+    }
+
+    /// A live recording given a time (`record_seconds`) is ended once it has recorded that long,
+    /// keeping what it recorded, as a stop ends it.
+    #[tokio::test]
+    async fn a_live_recording_ends_after_the_time_it_was_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("clip.mp4");
+        ts_recording(None, &with_part(&output));
+        let bin = live_ytdlp(dir.path(), &output, &[], false);
+        let started = std::time::Instant::now();
+        let kept = run_ytdlp_watching(tree_command(&bin), None, None, None, 0, Some(Duration::from_secs(1))).await;
+        assert!(started.elapsed() < Duration::from_secs(25), "{:?}", started.elapsed());
+        assert_eq!(kept, Ok((dir.path().join("clip.ts"), Vec::new())));
     }
 
     /// Makes `file` `len` bytes long without taking that room on its disk: a sparse file.
@@ -9617,7 +9643,7 @@ bbd8671c6c05eaa3ec29d690695aebadff0871faa3efe9051581afbf3c01e80e  ffmpeg-master-
         sparse_len(&with_part(&output), free_space(dir.path()).unwrap() + (1 << 30));
         let bin = live_ytdlp(dir.path(), &output, &[], false);
         let started = std::time::Instant::now();
-        let error = run_ytdlp(tree_command(&bin), None, None, None).await.unwrap_err();
+        let error = run_ytdlp(tree_command(&bin), None, None, None, None).await.unwrap_err();
         assert!(started.elapsed() < Duration::from_secs(25), "{:?}", started.elapsed());
         assert!(error.starts_with("The live recording was ended with only"), "{error}");
         assert!(error.ends_with(&format!("kept as {}", dir.path().join("clip.ts").display())), "{error}");
@@ -9706,7 +9732,7 @@ bbd8671c6c05eaa3ec29d690695aebadff0871faa3efe9051581afbf3c01e80e  ffmpeg-master-
             }
             cancel.store(true, Ordering::Relaxed);
         };
-        let (result, ()) = tokio::join!(run_ytdlp(tree_command(&bin), Some(&tx), Some(Arc::clone(&cancel)), None), stop);
+        let (result, ()) = tokio::join!(run_ytdlp(tree_command(&bin), Some(&tx), Some(Arc::clone(&cancel)), None, None), stop);
         assert_eq!(result, Ok((output.clone(), Vec::new())));
         assert!(std::fs::read_to_string(&output).unwrap().starts_with("finished"));
     }
@@ -9793,7 +9819,7 @@ bbd8671c6c05eaa3ec29d690695aebadff0871faa3efe9051581afbf3c01e80e  ffmpeg-master-
             cancel.store(true, Ordering::Relaxed);
         };
         let started = std::time::Instant::now();
-        let (result, ()) = tokio::join!(run_ytdlp(cmd, Some(&tx), Some(Arc::clone(&cancel)), None), stop);
+        let (result, ()) = tokio::join!(run_ytdlp(cmd, Some(&tx), Some(Arc::clone(&cancel)), None, None), stop);
         let kept = result.map(|(path, archive)| {
             assert!(archive.is_empty(), "a recording stopped is not archived: {archive:?}");
             path

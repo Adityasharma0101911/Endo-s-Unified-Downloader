@@ -1845,6 +1845,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let content: Vec<u8> = (0..6 * MIB).map(|i| (i % 251) as u8 ^ (i >> 13) as u8).collect();
         let (url, _) = engine_server(content.clone(), Mode::Paced(Duration::ZERO)).await;
+        let _kept = crate::history::test_pieces::Keep::new(blake3::hash(&content).to_hex().as_str());
         let options = DownloadOptions { output_path: Some(dir.path().join("")), remote_checksum: false, ..DownloadOptions::default() };
         let path = DownloadEngine::new(vec![url.clone()], options.clone()).run(None).await.unwrap();
         let mut data = std::fs::read(&path).unwrap();
