@@ -457,7 +457,21 @@ impl DownloadHistoryManager {
         }
         // Unit tests never touch the user's history, and never switch files mid-run.
         if cfg!(test) {
-            return std::env::temp_dir().join(format!("hf-unit-history-{}.json", std::process::id()));
+            static SWEEP: std::sync::Once = std::sync::Once::new();
+            let dir = std::env::temp_dir();
+            // Each run's files stay behind it (with its `.lock` and `.pieces`): earlier runs' go
+            // once they are an hour old.
+            SWEEP.call_once(|| {
+                let stale = |entry: &std::fs::DirEntry| {
+                    let age = entry.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
+                    entry.file_name().to_string_lossy().starts_with("hf-unit-history-") && age.is_some_and(|age| age.as_secs() > 3600)
+                };
+                for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten().filter(stale) {
+                    let path = entry.path();
+                    let _ = if path.is_dir() { std::fs::remove_dir_all(&path) } else { std::fs::remove_file(&path) };
+                }
+            });
+            return dir.join(format!("hf-unit-history-{}.json", std::process::id()));
         }
 
         #[cfg(windows)]

@@ -56,6 +56,9 @@ const PROBE_ATTEMPTS: u32 = 3;
 const PROBE_RETRY_CAP: Duration = Duration::from_secs(5);
 /// How long the probe still waits for HEAD once the ranged GET has answered.
 const HEAD_GRACE: Duration = Duration::from_millis(500);
+/// How long the first mirror's probe is still waited for once another mirror answered: the first
+/// says which file is downloaded, but one that does not answer must not hold the download up.
+const FIRST_GRACE: Duration = Duration::from_secs(1);
 /// The first mirror's probe fetches this much of the file: a file this small needs no other
 /// request, and a larger one has its start on disk before the workers begin.
 const PREFETCH: u64 = 1024 * 1024;
@@ -292,8 +295,10 @@ pub struct DownloadOptions {
     pub user_agent: Option<String>,
     /// The user's own request headers, sent like `secret_headers`: only to the hosts of the
     /// download's own links, never along a redirect to another host, to mirrors or files it lists,
-    /// and never saved. One with CR or LF, or one the download sets itself (`Host`, `Range`,
-    /// `Content-Length`, `Transfer-Encoding`, `Connection`), fails the download.
+    /// and never saved. One with CR or LF, one the download sets itself (`Host`, `Range`,
+    /// `Content-Length`, `Transfer-Encoding`, `Connection`) or one that would change what the
+    /// server sends (`If-*`, `Accept-Encoding`, `TE`, `Upgrade`, `Expect`, `Keep-Alive`,
+    /// `Proxy-Connection`) fails the download.
     #[serde(skip)]
     pub extra_headers: Vec<(String, String)>,
     /// Cookies (`"a=b; c=d"`) sent as `extra_headers` are, in place of a cookies file's for those
@@ -306,8 +311,10 @@ pub struct DownloadOptions {
     /// newer one: asked with `If-Modified-Since` (the file's date) and `If-None-Match` (the ETag
     /// history recorded for it), a 304, or an answer of the same size that is not newer, leaves
     /// it as it is. A newer one is downloaded to `.part` and then takes the old file's place in one
-    /// rename: the only case where a download replaces a file. Implies `remote_time`. For direct
-    /// HTTP and FTP files.
+    /// rename: the only case where a download replaces a file. A file sorting or naming by content
+    /// moved (history's last file for the link, in the download's folder or one inside it) is
+    /// checked the same way, but a newer one is a new download, not put in its place. Implies
+    /// `remote_time`. For direct HTTP and FTP files.
     pub only_if_newer: bool,
     /// A live recording ends after this many seconds of it, finished as a stop ends it.
     pub record_seconds: Option<u64>,
@@ -412,13 +419,27 @@ fn scoped_headers(options: &DownloadOptions) -> Vec<(String, String)> {
     options.secret_headers.iter().chain(&options.extra_headers).cloned().chain(cookie).collect()
 }
 
-/// Refuses `extra_headers` that are no valid header or that the download sets itself, and a
-/// cookie string that is no valid header value.
+/// Refuses `extra_headers` that are no valid header, that the download sets itself or that would
+/// change what the server sends (`If-*`, an encoding), and a cookie string that is no valid
+/// header value.
 fn check_extra_headers(options: &DownloadOptions) -> Result<(), String> {
-    const OWN: [&str; 5] = ["host", "range", "content-length", "transfer-encoding", "connection"];
+    const OWN: [&str; 11] = [
+        "host",
+        "range",
+        "content-length",
+        "transfer-encoding",
+        "connection",
+        "accept-encoding",
+        "te",
+        "upgrade",
+        "expect",
+        "keep-alive",
+        "proxy-connection",
+    ];
     for (name, value) in &options.extra_headers {
-        if OWN.iter().any(|own| name.eq_ignore_ascii_case(own)) {
-            return Err(format!("The {name} header is set by the download itself"));
+        let lower = name.to_ascii_lowercase();
+        if OWN.contains(&lower.as_str()) || lower.starts_with("if-") {
+            return Err(format!("The {name} header is set by the download itself or would change what the server sends"));
         }
         request_header(name, value).ok_or_else(|| format!("Invalid header {name:?} (no line breaks, a name of letters, digits and dashes)"))?;
     }
@@ -1643,12 +1664,14 @@ impl DownloadEngine {
     /// Probes all mirrors concurrently; returns the reference probe, the mirrors that serve the
     /// same file and the reference's answer while it is still coming. The mirror that leads is the
     /// first, in URL order, of those whose probes answered (failures aside), the first mirror's
-    /// counting from when its answer is in, while its start is read. When that mirror takes ranges
-    /// or brought the whole file it is the reference, and the download starts without waiting for
-    /// the probes still out, which come with it as `late`: a mirror that answers later, listed
-    /// before it or not, only joins if it serves the same file. Otherwise another mirror may have
-    /// to lead, so every probe is waited for, and no answer holds its host slot meanwhile: another
-    /// probe may need it. A Google Drive answer that is a web page fails its mirror's probe.
+    /// counting while its probe is out until `FIRST_GRACE` after another answered, and while its
+    /// start is read: a quick mirror serving another file does not decide the download, nor does
+    /// a first one that does not answer hold it up. When that mirror takes ranges or brought the
+    /// whole file it is the reference, and the download starts without waiting for the probes
+    /// still out, which come with it as `late`: a mirror that answers later, listed before it or
+    /// not, only joins if it serves the same file. Otherwise another mirror may have to lead, so
+    /// every probe is waited for, and no answer holds its host slot meanwhile: another probe may
+    /// need it. A Google Drive answer that is a web page fails its mirror's probe.
     async fn probe_all(&self, client: &Client, urls: &[Url]) -> Result<Probed, String> {
         let (limiter, stall) = (self.limiter(), self.stall_timeout());
         let several_connections = self.options.num_connections > 1;
@@ -1692,24 +1715,35 @@ impl DownloadEngine {
             .boxed();
         // Each mirror's probe, in URL order, once it is in.
         let mut done: Vec<Option<Probe>> = urls.iter().map(|_| None).collect();
+        // Until when the first mirror is waited for, once another answered; whether that is over.
+        let (mut grace, mut gave_up) = (None, false);
         let starts = loop {
             let next = tokio::select! {
                 biased;
                 _ = self.cancel_token.cancelled() => return Err(CANCELLED.to_string()),
-                next = probes.next() => next,
+                next = probes.next() => Some(next),
+                () = tokio::time::sleep_until(grace.unwrap_or_else(tokio::time::Instant::now)), if grace.is_some() && !gave_up => None,
             };
-            let Some((i, probe)) = next else { break false };
-            if let Some(slot) = done.get_mut(i) {
-                *slot = Some(probe);
+            match next {
+                Some(Some((i, probe))) => {
+                    if let Some(slot) = done.get_mut(i) {
+                        *slot = Some(probe);
+                    }
+                }
+                Some(None) => break false,
+                None => gave_up = true,
             }
             let lead = done.iter().enumerate().find(|&(i, probe)| match probe {
                 Some(probe) => probe.is_ok(),
-                None => i == 0 && reading.load(Ordering::Relaxed),
+                None => i == 0 && (!gave_up || reading.load(Ordering::Relaxed)),
             });
             if let Some((_, Some(Ok((info, _))))) = lead {
                 if info.accepts_ranges || info.size == Some(info.prefetch.len() as u64) {
                     break true;
                 }
+            }
+            if grace.is_none() && done.iter().flatten().any(Result::is_ok) {
+                grace = Some(tokio::time::Instant::now() + FIRST_GRACE);
             }
             if done.iter().any(Option::is_none) {
                 for (_, live) in done.iter_mut().flatten().flatten() {
@@ -1757,11 +1791,23 @@ impl DownloadEngine {
         let base = self.output_path_for(&reference.filename);
         // A file there is replaced only by a newer one (see `DownloadOptions::only_if_newer`).
         let replace = self.options.only_if_newer && base.is_file();
-        if replace && !self.newer_than(&client, &reference, &base).await {
-            tracing::info!("{} is up to date", base.display());
-            *self.already_done.lock().unwrap() = Some(base.clone());
-            emit(&snapshot_tx, || done_snapshot(crate::postprocess::size_of(&base), &base));
-            return Ok(base);
+        // Without one there, the file history last saw these links finish into, which sorting into
+        // a folder inside this one or naming by content may have moved, is kept the same way.
+        let existing = match replace {
+            true => Some(base.clone()),
+            false if self.options.only_if_newer => {
+                let (links, base): (Vec<String>, _) = (self.url_strings().iter().map(|u| redact_url(u)).collect(), base.clone());
+                blocking(move || last_finished(&links, &base)).await?
+            }
+            false => None,
+        };
+        if let Some(existing) = existing {
+            if !self.newer_than(&client, &reference, &existing).await {
+                tracing::info!("{} is up to date", existing.display());
+                *self.already_done.lock().unwrap() = Some(existing.clone());
+                emit(&snapshot_tx, || done_snapshot(crate::postprocess::size_of(&existing), &existing));
+                return Ok(existing);
+            }
         }
         // The mirrors, as resolvers made them of the links, among its URLs: a repair of the file
         // asks them, not a page the link was (see `naming`). A MEGA file keeps to its link (see
@@ -1811,9 +1857,10 @@ impl DownloadEngine {
         // A download that would fill its disk fails before it starts.
         if let Some(size) = reference.size {
             let have: u64 = crate::range::merge_ranges(state.completed_ranges.clone()).iter().map(ByteRange::len).sum();
-            let needs = size.saturating_sub(have).saturating_add(DISK_HEADROOM);
             let dir = final_path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new(".")).to_path_buf();
-            if let Some(free) = blocking(move || crate::media::free_space(&dir)).await?.filter(|&free| free < needs) {
+            let held = part.clone();
+            let (needs, free) = blocking(move || (space_needed(size, have, &held), crate::media::free_space(&dir))).await?;
+            if let Some(free) = free.filter(|&free| free < needs) {
                 return Err(format!("Not enough disk space: needs {}, {} free", size_text(needs), size_text(free)));
             }
         }
@@ -3937,6 +3984,17 @@ pub fn discard_partial(final_path: &Path) -> Result<usize, String> {
     Ok(removed)
 }
 
+/// The file history last saw a download of one of `links` (redacted) finish into, if it is still
+/// there, in the folder of `base` or one inside it. Blocking.
+fn last_finished(links: &[String], base: &Path) -> Option<PathBuf> {
+    let history = DownloadHistoryManager::load_from_path(&DownloadHistoryManager::default_history_path());
+    let last = history.entries().iter().find(|e| {
+        e.status == HistoryStatus::Completed && e.urls.iter().any(|u| links.contains(u) && !is_redacted(u))
+    });
+    let path = absolute(&last?.file_path);
+    (path.starts_with(absolute(base).parent()?) && path.is_file()).then_some(path)
+}
+
 /// Chooses the output path. Walks `name`, `name (1)`, `name (2)`... and takes the first one that
 /// is already this exact file, or that it can claim and that holds our resumable (or stale)
 /// `.part` or is free. Existing files, claimed names and other downloads' `.part` files are never
@@ -4479,10 +4537,11 @@ fn parse_http_date(value: &str) -> Option<u64> {
     let day: i64 = parts.next()?.parse().ok()?;
     let month_name = parts.next()?;
     let month = MONTHS.iter().position(|m| m.eq_ignore_ascii_case(month_name))? as i64 + 1;
-    let year: i64 = parts.next()?.parse().ok()?;
+    // A four-digit year: a later one is no file's date, and would overflow a file time.
+    let year: i64 = parts.next()?.parse().ok().filter(|y| (1970..=9999).contains(y))?;
     let mut hms = parts.next()?.split(':').map(|p| p.parse::<i64>().ok());
     let (h, m, s) = (hms.next()??, hms.next()??, hms.next()??);
-    if parts.next()? != "GMT" || !(1..=31).contains(&day) || h > 23 || m > 59 || s > 60 {
+    if parts.next()? != "GMT" || !(1..=31).contains(&day) || !(0..24).contains(&h) || !(0..60).contains(&m) || !(0..=60).contains(&s) {
         return None;
     }
     u64::try_from(days_from_civil(year, month, day) * 86_400 + h * 3600 + m * 60 + s).ok()
@@ -4520,13 +4579,44 @@ pub(crate) fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 /// Gives the file at `path` the date `http_date` (see [`DownloadOptions::remote_time`]). A date
 /// that cannot be read or set is only logged: the file is there all the same. Blocking.
 fn set_remote_time(path: &Path, http_date: &str) {
-    let Some(secs) = parse_http_date(http_date) else {
+    let date = parse_http_date(http_date).and_then(|secs| UNIX_EPOCH.checked_add(Duration::from_secs(secs)));
+    let Some(date) = date else {
         tracing::warn!("Keeping the date of {}: the server's {:?} cannot be read", path.display(), http_date);
         return;
     };
-    let set = File::options().write(true).open(path).and_then(|f| f.set_modified(UNIX_EPOCH + Duration::from_secs(secs)));
+    let set = File::options().write(true).open(path).and_then(|f| f.set_modified(date));
     if let Err(e) = set {
         tracing::warn!("Cannot give {} the server's date: {}", path.display(), e);
+    }
+}
+
+/// The disk space a download of `size` bytes, `have` of them written to `part`, still needs: what
+/// the `.part` already takes up is not asked for again (on Linux and macOS it was reserved whole
+/// when it was made, see `DiskWriter::open_or_create`; on Windows it is sparse). Blocking.
+fn space_needed(size: u64, have: u64, part: &Path) -> u64 {
+    size.saturating_sub(have.max(allocated(part))).saturating_add(DISK_HEADROOM)
+}
+
+/// The bytes `path` takes up on its disk: a sparse file only its written ranges; 0 when it isn't
+/// there. Blocking.
+fn allocated(path: &Path) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).map_or(0, |meta| meta.blocks().saturating_mul(512))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{GetCompressedFileSizeW, INVALID_FILE_SIZE};
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        let mut high = 0u32;
+        // SAFETY: a NUL-terminated path and a valid out-pointer.
+        let low = unsafe { GetCompressedFileSizeW(wide.as_ptr(), &mut high) };
+        if low == INVALID_FILE_SIZE && std::io::Error::last_os_error().raw_os_error() != Some(0) {
+            return 0;
+        }
+        u64::from(high) << 32 | u64::from(low)
     }
 }
 
@@ -6138,6 +6228,23 @@ mod tests {
         assert_eq!(parse_http_date("Tue, 29 Feb 2000 12:00:00 GMT"), Some(951_825_600));
         assert_eq!(parse_http_date("Sunday, 06-Nov-94 08:49:37 GMT"), None);
         assert_eq!(parse_http_date("garbage"), None);
+        assert_eq!(parse_http_date("Fri, 31 Dec 9999 23:59:59 GMT"), Some(253_402_300_799));
+        assert_eq!(parse_http_date("Sun, 06 Nov 99999 08:49:37 GMT"), None);
+        assert_eq!(parse_http_date("Sun, 06 Nov 9223372036854775807 08:49:37 GMT"), None);
+        assert_eq!(parse_http_date("Sun, 06 Nov 1994 -1:49:37 GMT"), None);
+    }
+
+    /// A server's date far in the future leaves the file's date alone instead of panicking.
+    #[test]
+    fn test_set_remote_time_ignores_an_impossible_date() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("f.bin");
+        std::fs::write(&file, b"x").unwrap();
+        let before = std::fs::metadata(&file).unwrap().modified().unwrap();
+        set_remote_time(&file, "Sun, 06 Nov 99999 08:49:37 GMT");
+        assert_eq!(std::fs::metadata(&file).unwrap().modified().unwrap(), before);
+        set_remote_time(&file, "Sun, 06 Nov 1994 08:49:37 GMT");
+        assert_eq!(std::fs::metadata(&file).unwrap().modified().unwrap(), UNIX_EPOCH + Duration::from_secs(784_111_777));
     }
 
     #[test]
@@ -6353,6 +6460,10 @@ mod tests {
         let ((fixed, fixed_peak), (adapted, adapted_peak)) = tokio::join!(fetch(false), fetch(true));
         assert_eq!(std::fs::read(fixed).unwrap(), data);
         assert_eq!(std::fs::read(adapted).unwrap(), data);
+        // Not timing: a host known not to cap gives each connection 1 MiB, and the start read in
+        // 250 ms at this pace is at most 192 KiB, so 5 MiB less it takes five; the probe's HEAD
+        // is let go before the workers start, and each worker's request lets its slot go before
+        // the next takes one.
         assert_eq!(fixed_peak, 5);
         assert!(adapted_peak > 5, "{adapted_peak}");
     }
@@ -6525,7 +6636,18 @@ mod tests {
             assert!(!head.contains("secret") && head.lines().any(|l| l == "user-agent: testagent/1"), "{head}");
         }
         let asked = own.lock().len();
-        for (name, value) in [("Host", "x"), ("range", "bytes=0-1"), ("X-Bad", "a\r\nInjected: 1"), ("Bad Name", "v")] {
+        let refused = [
+            ("Host", "x"),
+            ("range", "bytes=0-1"),
+            ("X-Bad", "a\r\nInjected: 1"),
+            ("Bad Name", "v"),
+            ("Accept-Encoding", "gzip"),
+            ("TE", "gzip"),
+            ("Expect", "100-continue"),
+            ("If-Range", "\"v1\""),
+            ("if-modified-since", "Sun, 06 Nov 1994 08:49:37 GMT"),
+        ];
+        for (name, value) in refused {
             let options = DownloadOptions { extra_headers: vec![(name.into(), value.into())], ..options("bad.bin") };
             assert!(DownloadEngine::new(vec![url.join("direct.bin").unwrap()], options).run(None).await.is_err(), "{name}");
         }
@@ -6602,6 +6724,29 @@ mod tests {
         assert_eq!(names, ["f.bin"]);
     }
 
+    /// With `only_if_newer`, a file sorted into a folder since (history follows it there) is up
+    /// to date as it would be at the download's path: no second copy is downloaded.
+    #[tokio::test]
+    async fn test_only_if_newer_finds_a_file_sorting_moved() {
+        let answer = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nLast-Modified: Sun, 06 Nov 1994 08:49:37 GMT\r\nConnection: close\r\n\r\nold!";
+        let url = answering_server(move |_| answer.to_string()).await.join("moved.bin").unwrap();
+        let dir = tempdir().unwrap();
+        let options = DownloadOptions { output_path: Some(dir.path().to_path_buf()), only_if_newer: true, remote_checksum: false, ..Default::default() };
+        let file = DownloadEngine::new(vec![url.clone()], options.clone()).run(None).await.unwrap();
+        let sorted = dir.path().join("Programs").join("moved.bin");
+        std::fs::create_dir(sorted.parent().unwrap()).unwrap();
+        std::fs::rename(&file, &sorted).unwrap();
+        let history = DownloadHistoryManager::default_history_path();
+        let recorded = DownloadHistoryManager::load_from_path(&history);
+        let mut entry = recorded.entries().iter().find(|e| absolute(&e.file_path) == absolute(&file)).cloned().unwrap();
+        entry.file_path = sorted.clone();
+        DownloadHistoryManager::record_replacing(&history, entry, &file).unwrap();
+
+        let engine = DownloadEngine::new(vec![url], options);
+        assert_eq!(engine.run(None).await, Ok(absolute(&sorted)));
+        assert!(engine.kept_existing() && !file.exists());
+    }
+
     /// `stream_to` writes a direct file's bytes in order, within `max_filesize`, and refuses a
     /// link that is no direct file.
     #[tokio::test]
@@ -6645,6 +6790,18 @@ mod tests {
         let error = DownloadEngine::new(vec![url], options).run(None).await.unwrap_err();
         assert!(error.starts_with("Not enough disk space"), "{error}");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0, "nothing written");
+    }
+
+    /// A resumed `.part` that already holds the whole file (reserved when it was made) needs no
+    /// more space than the headroom, however little of it was downloaded.
+    #[test]
+    fn test_a_part_that_holds_the_file_needs_no_more_space() {
+        let dir = tempdir().unwrap();
+        let part = dir.path().join("f.bin.part");
+        assert_eq!(space_needed(1 << 20, 0, &part), (1 << 20) + DISK_HEADROOM);
+        assert_eq!(space_needed(1 << 20, 1000, &part), (1 << 20) - 1000 + DISK_HEADROOM);
+        std::fs::write(&part, vec![1u8; 1 << 20]).unwrap();
+        assert_eq!(space_needed(1 << 20, 0, &part), DISK_HEADROOM);
     }
 
     #[tokio::test]

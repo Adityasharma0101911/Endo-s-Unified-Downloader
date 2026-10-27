@@ -920,7 +920,10 @@ async fn test_cancel_saves_state_and_resume_skips_completed_bytes() {
 async fn test_mirror_with_wrong_content_range_total_is_rejected() {
     let _history = setup().await;
     let data = payload(3 * PREFETCH, 101);
-    let good = Arc::new(Mock::new(data.clone()));
+    // Listed first, it answers last: the mirrors answering before it still don't decide the file.
+    let mut good = Mock::new(data.clone());
+    good.latency = Duration::from_millis(150);
+    let good = Arc::new(good);
     let mut bad = Mock::new(vec![0xEE; data.len()]);
     bad.content_range_total = Some(data.len() + 1);
     let bad = Arc::new(bad);

@@ -116,11 +116,14 @@ fn from_headers(headers: &HeaderMap) -> Option<String> {
     if whole_content {
         found.extend(named("md5", &all("content-md5")));
     }
-    // `crc32c=...,md5=...`; S3 marks a checksum of the parts of an upload with a `-N` suffix.
-    found.extend(all("x-goog-hash").split(',').filter_map(|item| match item.trim().split_once('=') {
+    // `crc32c=...,md5=...`, of the object as stored: not of a gzipped one served unzipped.
+    let stored = all("x-goog-stored-content-encoding");
+    let unzipped = !stored.trim().is_empty() && !stored.trim().eq_ignore_ascii_case("identity");
+    found.extend(all("x-goog-hash").split(',').filter(|_| !unzipped).filter_map(|item| match item.trim().split_once('=') {
         Some(("md5", value)) => named("md5", value),
         _ => None,
     }));
+    // S3 marks a checksum of the parts of an upload with a `-N` suffix.
     for algo in ["sha256", "sha1"] {
         let value = all(&format!("x-amz-checksum-{algo}"));
         if !value.contains('-') {
@@ -182,34 +185,38 @@ async fn fetch_small(client: &Client, auth: Option<&Auth>, limit: usize, url: Ur
 }
 
 /// The checksum the checksum file `text` gives for the file `name`: a line `<hex>  <name>`
-/// (`*<name>` too, names compared without their folders) or `SHA256 (<name>) = <hex>`. In a file
-/// named after the download (`<url>.<ext>`), whose extension names the algorithm, the hex may
-/// stand alone. Elsewhere the algorithm goes by the hex's length.
+/// (`*<name>` too) or `SHA256 (<name>) = <hex>`; the line for the file itself (`./<name>` too)
+/// before one for a file of that name in a folder. In a file named after the download
+/// (`<url>.<ext>`), whose extension names the algorithm, the hex may stand alone. Elsewhere the
+/// algorithm goes by the hex's length.
 fn checksum_line(text: &str, name: &str, ext: Option<&str>) -> Option<String> {
-    let base = |file: &str| file.rsplit(['/', '\\']).next().unwrap_or(file).to_string();
-    text.lines().find_map(|line| {
-        let line = line.trim();
-        let bsd = line.split_once(" (").and_then(|(tag, rest)| Some((tag, rest.rsplit_once(") = ")?)));
-        let (tag, hex, file) = match bsd {
-            Some((tag, (file, hex))) => (Some(tag), hex.trim(), Some(base(file))),
-            None => {
-                let (hex, file) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
-                let file = file.trim().trim_start_matches('*');
-                (None, hex, (!file.is_empty()).then(|| base(file)))
+    let line_for = |same: &dyn Fn(&str) -> bool| {
+        text.lines().find_map(|line| {
+            let line = line.trim();
+            let bsd = line.split_once(" (").and_then(|(tag, rest)| Some((tag, rest.rsplit_once(") = ")?)));
+            let (tag, hex, file) = match bsd {
+                Some((tag, (file, hex))) => (Some(tag), hex.trim(), Some(file)),
+                None => {
+                    let (hex, file) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+                    let file = file.trim().trim_start_matches('*');
+                    (None, hex, (!file.is_empty()).then_some(file))
+                }
+            };
+            match file {
+                Some(file) if !same(file) => return None,
+                None if ext.is_none() => return None,
+                _ => {}
             }
-        };
-        match &file {
-            Some(file) if *file != name => return None,
-            None if ext.is_none() => return None,
-            _ => {}
-        }
-        let digest = from_hex(hex)?;
-        let algo = match tag.or(ext) {
-            Some(algo) => named(algo, hex)?.0,
-            None => ALGOS.iter().find(|(_, len)| *len == digest.len())?.0,
-        };
-        (ALGOS.iter().any(|&(name, len)| name == algo && len == digest.len())).then(|| checksum(algo, &digest))
-    })
+            let digest = from_hex(hex)?;
+            let algo = match tag.or(ext) {
+                Some(algo) => named(algo, hex)?.0,
+                None => ALGOS.iter().find(|(_, len)| *len == digest.len())?.0,
+            };
+            (ALGOS.iter().any(|&(name, len)| name == algo && len == digest.len())).then(|| checksum(algo, &digest))
+        })
+    };
+    line_for(&|file| file.strip_prefix("./").or(file.strip_prefix(".\\")).unwrap_or(file) == name)
+        .or_else(|| line_for(&|file| file.rsplit(['/', '\\']).next() == Some(name)))
 }
 
 /// "SHA-256" and so on, for `algo` as `ALGOS` names it.
@@ -516,8 +523,9 @@ mod tests {
         files: Vec<(String, String, String)>,
         /// Bytes of the file sent damaged (inverted) the first time they are asked for.
         damaged_once: Option<std::ops::Range<usize>>,
-        /// Requests wait to be answered until this long after the server started.
-        opens_after: Duration,
+        /// HEAD and one-byte probes, a mirror's beside the first, go unanswered: it takes part
+        /// only as the first (or only) mirror, whose probe asks for the file's start.
+        only_as_first: bool,
         /// Sidecar answers wait this long.
         sidecars_wait: Duration,
     }
@@ -530,7 +538,6 @@ mod tests {
         let log = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (content, site, seen) = (Arc::new(content), Arc::new(site), Arc::clone(&log));
         let damaged = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let opens = tokio::time::Instant::now() + site.opens_after;
         tokio::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
                 let (content, site, seen, damaged) = (Arc::clone(&content), Arc::clone(&site), Arc::clone(&seen), Arc::clone(&damaged));
@@ -552,7 +559,11 @@ mod tests {
                         Some((s.parse::<u64>().ok()?, e.parse::<u64>().map_or(len - 1, |e| e.min(len - 1))))
                     });
                     seen.lock().unwrap().push((path.clone(), range));
-                    tokio::time::sleep_until(opens).await;
+                    if site.only_as_first && (method == "head" || range == Some((0, 0))) {
+                        // Held unanswered until the test is over (at most a minute).
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                        return;
+                    }
                     let resp = if path == "/dir/file.bin" {
                         let (s, e) = range.unwrap_or((0, len - 1));
                         let mut body = content[s as usize..=e as usize].to_vec();
@@ -655,6 +666,8 @@ mod tests {
             (vec![format!("Repr-Digest: sha-256=:{}:", b64(&sha256)), "Content-Encoding: br".into()], partial),
             (vec![format!("x-amz-checksum-sha256: {}-3", b64(&sha256))], None),
             (vec!["x-goog-hash: crc32c=n03x6A==".into()], None),
+            // A gzipped object served unzipped: its hash is of the gzip.
+            (vec![format!("x-goog-hash: md5={}", b64(&md5)), "x-goog-stored-content-encoding: gzip".into()], None),
             (vec![format!("ETag: \"{}\"", sha256_hex(&data))], None),
             (vec!["Repr-Digest: sha-256=:dG9vIHNob3J0:".into(), "Digest: UNIXsum=30637".into()], None),
         ] {
@@ -687,6 +700,11 @@ mod tests {
                 checksum("sha256", &sha256),
             ),
             (vec![("/dir/sha256sums.txt", text, format!("{h256} *sub/file.bin\r\n"))], checksum("sha256", &sha256)),
+            // The file's own line wins over one for a file of its name in a folder.
+            (
+                vec![("/dir/SHA256SUMS", text, format!("{}  sub/file.bin\n{h256}  file.bin\n", "0".repeat(64)))],
+                checksum("sha256", &sha256),
+            ),
             (
                 vec![("/dir/CHECKSUMS", text, format!("SHA256 (other.bin) = {}\nSHA512 (file.bin) = {h512}\n", "0".repeat(64)))],
                 checksum("sha512", &sha512),
@@ -795,10 +813,11 @@ mod tests {
     async fn only_the_pieces_that_fail_a_metalinks_hashes_are_fetched_again_from_another_mirror() {
         let data = content(3 * MIB);
         let dir = tempfile::tempdir().unwrap();
-        // The first mirror damages the middle piece; the second starts too late to share the work.
+        // The first mirror damages the middle piece; the second never answers its probe beside
+        // the first, so it shares none of the work: it is asked again on its own.
         let damaged = Site { damaged_once: Some(MIB + 10..MIB + 20), ..Site::default() };
         let (bad, _) = serve(data.clone(), damaged).await;
-        let (good, log) = serve(data.clone(), Site { opens_after: Duration::from_secs(3), ..Site::default() }).await;
+        let (good, log) = serve(data.clone(), Site { only_as_first: true, ..Site::default() }).await;
         let options = DownloadOptions {
             expected_checksum: Some(format!("sha256:{}", sha256_hex(&data))),
             metalink_pieces: Some(pieces_of(&data, MIB)),

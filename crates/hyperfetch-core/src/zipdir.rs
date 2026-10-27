@@ -3,10 +3,14 @@
 
 use reqwest::header::{ACCEPT_ENCODING, CONTENT_RANGE, RANGE};
 use reqwest::{Client, StatusCode};
+use std::time::Duration;
+use tokio::time::timeout;
 use url::Url;
 
 /// Bytes read from the end of the file: the end of central directory record and its comment.
 const TAIL: u64 = 64 * 1024;
+/// Longest wait for an answer, and between two reads of its body.
+const IDLE: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 30 });
 /// Largest central directory read.
 const MAX_DIRECTORY: u64 = 16 * 1024 * 1024;
 /// Most entries listed.
@@ -60,13 +64,17 @@ pub async fn list_zip(client: &Client, url: &Url) -> Result<Vec<ZipEntry>, Strin
 }
 
 /// `len` bytes of `url` from `start`, or its last `len` bytes without one, and the file's size.
+/// Redirects to another host are followed even on a client that stops at them (see
+/// `worker::send`); a server quiet for `IDLE` fails it.
 async fn fetch(client: &Client, url: &Url, start: Option<u64>, len: u64) -> Result<(Vec<u8>, u64), String> {
     let range = match start {
         Some(start) => format!("bytes={}-{}", start, start + len.max(1) - 1),
         None => format!("bytes=-{}", len),
     };
     let fail = |e: reqwest::Error| format!("Cannot read {}: {}", url, e);
-    let mut resp = client.get(url.clone()).header(RANGE, range).header(ACCEPT_ENCODING, "identity").send().await.map_err(fail)?;
+    let quiet = |_| format!("Cannot read {}: no answer for {} seconds", url, IDLE.as_secs());
+    let request = |url: &Url| client.get(url.clone()).header(RANGE, range.as_str()).header(ACCEPT_ENCODING, "identity");
+    let mut resp = timeout(IDLE, crate::worker::send(request, url)).await.map_err(quiet)?.map_err(fail)?;
     match resp.status() {
         StatusCode::PARTIAL_CONTENT => {}
         status if status.is_success() => {
@@ -81,7 +89,7 @@ async fn fetch(client: &Client, url: &Url, start: Option<u64>, len: u64) -> Resu
         _ => return Err(format!("{} answered a range request with Content-Range {:?}", url, header)),
     };
     let mut body = Vec::new();
-    while let Some(chunk) = resp.chunk().await.map_err(fail)? {
+    while let Some(chunk) = timeout(IDLE, resp.chunk()).await.map_err(quiet)?.map_err(fail)? {
         body.extend_from_slice(&chunk);
         if body.len() as u64 > range.len() {
             return Err(format!("{} sent more than the {} bytes asked for", url, range.len()));
@@ -411,6 +419,46 @@ mod tests {
         assert_eq!(requests.load(Ordering::SeqCst), 1);
         let (url, _) = serve(b"just some text, no archive at all".to_vec(), true).await;
         assert!(list_zip(&Client::new(), &url).await.unwrap_err().contains("not a ZIP"));
+    }
+
+    /// Serves every request with `answer` (taking `wait` first) on a port of its own.
+    async fn answering(answer: String, wait: Duration) -> Url {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let answer = answer.clone();
+                tokio::spawn(async move {
+                    let _ = sock.read(&mut [0u8; 1024]).await;
+                    tokio::time::sleep(wait).await;
+                    let _ = sock.write_all(answer.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        Url::parse(&format!("http://{addr}/a.zip")).unwrap()
+    }
+
+    /// A client carrying the user's headers stops at a redirect to another host; the listing
+    /// follows it (as a download does), without those headers.
+    #[tokio::test]
+    async fn follows_a_redirect_to_another_host() {
+        let (zip_url, _) = serve(zip(&[(b"a.txt", true, b"a")], b"", None), true).await;
+        let moved = answering(format!("HTTP/1.1 302 Found\r\nLocation: {zip_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"), Duration::ZERO).await;
+        let options = crate::engine::DownloadOptions { extra_headers: vec![("X-Team".into(), "t".into())], ..Default::default() };
+        let client = crate::engine::build_client(&options).unwrap();
+        let listed = list_zip(&client, &moved).await.unwrap();
+        assert_eq!(listed.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["a.txt"]);
+    }
+
+    /// A server that never answers fails the listing instead of hanging it.
+    #[tokio::test]
+    async fn a_silent_server_fails_in_time() {
+        let silent = answering(String::new(), Duration::from_secs(10)).await;
+        let started = std::time::Instant::now();
+        let err = list_zip(&Client::new(), &silent).await.unwrap_err();
+        assert!(err.contains("no answer"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
     }
 
     #[tokio::test]

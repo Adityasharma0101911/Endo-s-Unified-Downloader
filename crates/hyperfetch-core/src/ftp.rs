@@ -337,10 +337,12 @@ fn epsv_port(text: &str) -> Option<u16> {
 
 /// The port of a PASV reply: `Entering Passive Mode (h1,h2,h3,h4,p1,p2)`. Its address is not
 /// used: the data connection goes to the control connection's server, never to another host a
-/// server names (or a private address behind its NAT).
+/// server names (or a private address behind its NAT). The six numbers are the first of the
+/// reply (inside its parentheses when it has them): text after them may hold more.
 fn pasv_port(text: &str) -> Option<u16> {
-    let numbers: Vec<u16> = text.split(|c: char| !c.is_ascii_digit()).filter_map(|n| n.parse().ok()).collect();
-    let [.., high, low] = numbers[..] else { return None };
+    let inside = text.split_once('(').and_then(|(_, rest)| rest.split_once(')')).map_or(text, |(inside, _)| inside);
+    let mut numbers = inside.split(|c: char| !c.is_ascii_digit()).filter(|n| !n.is_empty()).map(|n| n.parse::<u16>().ok());
+    let (high, low) = (numbers.nth(4)??, numbers.next()??);
     Some(high.checked_mul(256)?.checked_add(low)?).filter(|&p| p > 0 && high < 256 && low < 256)
 }
 
@@ -964,6 +966,9 @@ mod tests {
         assert_eq!(pasv_port("Entering Passive Mode (192,168,1,2,19,137)."), Some(19 * 256 + 137));
         assert_eq!(pasv_port("Entering Passive Mode 10,0,0,1,4,1"), Some(1025));
         assert_eq!(pasv_port("Entering Passive Mode (1,2,3,4,999,1)"), None);
+        assert_eq!(pasv_port("Entering Passive Mode (127,0,0,1,4,1). Timeout 30 seconds"), Some(1025));
+        assert_eq!(pasv_port("Entering Passive Mode 127,0,0,1,4,1. Timeout 30 seconds"), Some(1025));
+        assert_eq!(pasv_port("Entering Passive Mode (127,0,0,1,4)"), None);
         assert_eq!(http_date("19941106084937").as_deref(), Some("Sun, 06 Nov 1994 08:49:37 GMT"));
         assert_eq!(http_date("20240229123456.789").as_deref(), Some("Thu, 29 Feb 2024 12:34:56 GMT"));
         assert_eq!(http_date("2024022912345"), None);
