@@ -3347,7 +3347,8 @@ async fn run_ytdlp_watching(
             deadline = None;
         }
         if state.live && record_end.is_none() {
-            record_end = record.map(|record| tokio::time::Instant::now() + record);
+            // A time too long to count to has no end.
+            record_end = record.and_then(|record| tokio::time::Instant::now().checked_add(record));
         }
         if let (Some(update), Some(tx)) = (update, progress_tx) {
             // Progress is lossy by nature; never let a slow consumer stall pipe draining.
@@ -9607,6 +9608,18 @@ bbd8671c6c05eaa3ec29d690695aebadff0871faa3efe9051581afbf3c01e80e  ffmpeg-master-
         let kept = run_ytdlp_watching(tree_command(&bin), None, None, None, 0, Some(Duration::from_secs(1))).await;
         assert!(started.elapsed() < Duration::from_secs(25), "{:?}", started.elapsed());
         assert_eq!(kept, Ok((dir.path().join("clip.ts"), Vec::new())));
+    }
+
+    /// A time too long to count to (`record_seconds` of u64::MAX) records until the stream ends,
+    /// instead of panicking.
+    #[tokio::test]
+    async fn a_live_recording_given_an_endless_time_records_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("clip.mp4");
+        ts_recording(None, &with_part(&output));
+        let bin = live_ytdlp(dir.path(), &output, &[], true);
+        let error = run_ytdlp_watching(tree_command(&bin), None, None, None, 0, Some(Duration::from_secs(u64::MAX))).await.unwrap_err();
+        assert!(error.ends_with("Connection reset by peer"), "{error}");
     }
 
     /// Makes `file` `len` bytes long without taking that room on its disk: a sparse file.

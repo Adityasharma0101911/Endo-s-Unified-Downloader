@@ -425,6 +425,10 @@ fn prepare_repair(
                 urls.iter().map(|u| u.to_string()).collect(),
             );
             state.completed_ranges.extend(ByteRange::from_len(0, total_size).ok());
+            // The version history recorded for the file: a mirror serving another one is refused.
+            let history = DownloadHistoryManager::load();
+            let recorded = history_entry_for(&history, &final_path).filter(|e| e.file_size == total_size);
+            state.etag = recorded.and_then(|e| e.etag.clone());
             state
         }
     };
@@ -1696,6 +1700,28 @@ mod tests {
         assert!(std::fs::read(&path).unwrap() == new_build, "the engine saved something else");
         let res = verify_build_file(&path, None, None).unwrap();
         assert!(res.is_complete && res.checksum_match == Some(true), "{}", res.status_message);
+    }
+
+    /// A finished file has no state, but history recorded its ETag: a server now serving another
+    /// version is refused, and none of its bytes are spliced into the file.
+    #[tokio::test]
+    async fn repair_of_a_finished_file_holds_to_the_version_history_recorded() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("build.bin");
+        let mut data = content();
+        data[100..200].fill(0);
+        std::fs::write(&path, &data).unwrap();
+        let new_build: Vec<u8> = content().iter().map(|b| b ^ 0xff).collect();
+        let url = mock_server(new_build, |_, _, s, e, c| with_header(partial(s, e, c, usize::MAX), "ETag: \"v2\"")).await;
+        let mut entry = HistoryEntry::new("build.bin".into(), std::path::absolute(&path).unwrap(), 1000, vec![url.to_string()]);
+        entry.etag = Some("\"v1\"".into());
+        DownloadHistoryManager::load().add_or_update(entry);
+
+        let gaps = [ByteRange::new(100, 199).unwrap()];
+        let res = repair_missing_ranges(&path, 1000, &gaps, &[url], &DownloadOptions::default(), None, |_, _| {}).await;
+        assert!(res.is_err(), "{res:?}");
+        let on_disk = std::fs::read(if path.exists() { path.clone() } else { part_of(&path) }).unwrap();
+        assert!(on_disk == data, "no byte of the new version may be written");
     }
 
     /// Checked only against each other, a mirror serving another version would lead the engine
