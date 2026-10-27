@@ -31,9 +31,10 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: 22
-      # The GUI's window libraries (the tray uses no GTK); the rest of Linux's are loaded at run time.
+      # The GUI's window libraries (the tray uses no GTK; the rest are loaded at run time), and bsdtar,
+      # which unpacks archives on Linux (the tests of encrypted ones need it).
       - if: runner.os == 'Linux'
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq pkg-config libxkbcommon-dev libwayland-dev libgl1-mesa-dev
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq pkg-config libxkbcommon-dev libwayland-dev libgl1-mesa-dev libarchive-tools
       - run: cargo build --workspace
       - run: cargo test --workspace --no-fail-fast -- --test-threads=4
       - run: node --test "extension/test/*.test.mjs"
