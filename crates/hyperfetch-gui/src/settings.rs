@@ -163,6 +163,9 @@ pub struct Settings {
     pub ip_family: IpFamily,
     /// Seconds a connection may take to open.
     pub connect_timeout_secs: u64,
+    /// Downloads the schedule paused at its stop time, which its start resumes, also after a
+    /// restart in between (see `App::run_schedule`).
+    pub schedule_paused: Vec<usize>,
 }
 
 /// When the queue runs by itself (see `desktop::schedule_due`): at `start` on the ticked days it
@@ -247,18 +250,27 @@ impl Default for Settings {
             user_agent: String::new(),
             ip_family: engine.ip_family,
             connect_timeout_secs: engine.connect_timeout_secs,
+            schedule_paused: Vec::new(),
         }
     }
 }
 
+/// The download history's file, which the GUI's own files sit next to.
+fn history_path() -> PathBuf {
+    // Tests never read or write the user's settings, queue or logs.
+    #[cfg(test)]
+    crate::tests::isolate_history();
+    DownloadHistoryManager::default_history_path()
+}
+
 /// A file of the GUI's own, stored next to the download history.
 pub fn app_file(name: &str) -> PathBuf {
-    DownloadHistoryManager::default_history_path().with_file_name(name)
+    history_path().with_file_name(name)
 }
 
 /// The data folder: the history's, with the settings, the queue and the `logs` folder.
 pub fn data_dir() -> PathBuf {
-    DownloadHistoryManager::default_history_path().parent().map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+    history_path().parent().map_or_else(|| PathBuf::from("."), Path::to_path_buf)
 }
 
 /// Replaces `path` with `bytes` in one step: a crash leaves either the old file or the new one.
@@ -804,13 +816,14 @@ mod tests {
     #[test]
     fn desktop_settings_start_off() {
         let saved: Settings = serde_json::from_str(r#"{"theme": 1, "schedule": {"enabled": true}}"#).unwrap();
-        assert!(!saved.close_to_tray && !saved.start_minimized && !saved.launch_at_startup);
+        assert!(!saved.close_to_tray && !saved.start_minimized && !saved.launch_at_startup && saved.schedule_paused.is_empty());
         assert_eq!(saved.schedule, Schedule { enabled: true, ..Schedule::default() });
         assert_eq!(Settings::default().schedule, Schedule { enabled: false, start: None, stop: None, days: [true; 7] });
         let mut days = [true; 7];
         days[6] = false;
         let schedule = Schedule { enabled: true, start: Some("01:00".into()), stop: Some("07:00".into()), days };
-        let chosen = Settings { close_to_tray: true, start_minimized: true, launch_at_startup: true, schedule, ..saved };
+        let paused = vec![3, 7];
+        let chosen = Settings { close_to_tray: true, start_minimized: true, launch_at_startup: true, schedule, schedule_paused: paused, ..saved };
         assert_eq!(serde_json::from_str::<Settings>(&serde_json::to_string(&chosen).unwrap()).unwrap(), chosen);
     }
 }

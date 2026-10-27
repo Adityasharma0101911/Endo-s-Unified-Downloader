@@ -56,6 +56,9 @@ const CLIPBOARD_POLL: Duration = Duration::from_millis(500);
 const CONFIRM_FILES: usize = 50;
 /// Why the form's checksum is refused for several downloads.
 const SINGLE_CHECKSUM: &str = "The checksum in Advanced Options is for a single file: add that download on its own";
+/// How long "See what's inside" waits for a ZIP's list of files, all its requests together (each
+/// gives up after 30 s without an answer: see `zipdir::list_zip`).
+const ZIP_PREVIEW_LIMIT: Duration = Duration::from_secs(if cfg!(test) { 2 } else { 60 });
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -329,8 +332,9 @@ struct App {
     writer: desktop::Writer,
     /// The local time the schedule was last checked at (see `desktop::schedule_due`).
     schedule_seen: Option<(u8, u16)>,
-    /// Downloads the schedule paused at its stop time, which its start resumes.
-    schedule_paused: Vec<usize>,
+    /// Paused downloads Resume all or the schedule's start resumes, first come first, as the
+    /// queue has room for them (see `App::run_scheduler`).
+    resuming: Vec<usize>,
     /// The window's taskbar button (Windows), and the progress it shows.
     taskbar: Option<taskbar::Taskbar>,
     taskbar_shown: Option<taskbar::Progress>,
@@ -342,9 +346,9 @@ struct App {
 
 impl App {
     /// The app with its saved settings and queue, its tray icon, the local API and the
-    /// background work; hidden in the tray when `minimized` (or the setting says so). A
-    /// `portable` copy leaves the `endo-dl:` link to the installed app.
-    fn new(cc: &eframe::CreationContext<'_>, rt: tokio::runtime::Handle, restart: Arc<Mutex<Option<PathBuf>>>, minimized: bool, portable: bool) -> Self {
+    /// background work; hidden in the tray when `minimized` (or the setting says so). It
+    /// registers the `endo-dl:` link when it takes `links` (see `desktop::takes_links`).
+    fn new(cc: &eframe::CreationContext<'_>, rt: tokio::runtime::Handle, restart: Arc<Mutex<Option<PathBuf>>>, minimized: bool, links: bool) -> Self {
         ui::setup(&cc.egui_ctx);
         let settings = Settings::load();
         let (queue, queue_problem) = queue_store::load(&queue_store::path());
@@ -364,7 +368,7 @@ impl App {
             &rt,
         );
         app.taskbar = taskbar::Taskbar::new(TITLE);
-        if cfg!(windows) && !portable {
+        if cfg!(windows) && links {
             app.register_protocol();
         }
         // Written again: the program may have moved.
@@ -465,7 +469,7 @@ impl App {
             power: Box::new(desktop::power),
             writer: Box::new(desktop::write),
             schedule_seen: None,
-            schedule_paused: Vec::new(),
+            resuming: Vec::new(),
             taskbar: None,
             taskbar_shown: None,
             batch_failed: false,
@@ -475,6 +479,7 @@ impl App {
 
     /// Lists what the ZIP at `url` holds without downloading it (see `zipdir::list_zip`), through
     /// the proxy and with the cookies file and User-Agent of the settings; the Add page shows it.
+    /// It gives up after [`ZIP_PREVIEW_LIMIT`].
     fn preview_zip(&mut self, url: Url) {
         let link = url.to_string();
         self.zip_preview = Some((link.clone(), None));
@@ -485,7 +490,10 @@ impl App {
                 let client = unblock(move || build_client(&options)).await??;
                 hyperfetch_core::zipdir::list_zip(&client, &url).await
             };
-            AppEvent::ZipListed { link, result: listed.await }
+            let result = tokio::time::timeout(ZIP_PREVIEW_LIMIT, listed).await.unwrap_or_else(|_| {
+                Err(format!("Gave up listing the ZIP: the server took over {} seconds", ZIP_PREVIEW_LIMIT.as_secs()))
+            });
+            AppEvent::ZipListed { link, result }
         });
     }
 
@@ -1104,15 +1112,23 @@ impl App {
         }
     }
 
-    /// Starts queued downloads while fewer than the configured number are running; none while the
-    /// window waits to close. One that cannot start yet (a video waiting for the answer about
-    /// ffmpeg, a file under repair) holds up none after it.
+    /// Starts the paused downloads waiting to resume (see `App::resuming`), then queued ones,
+    /// while fewer than the configured number are running; none while the window waits to close.
+    /// One that cannot start yet (a video waiting for the answer about ffmpeg, a file under
+    /// repair) holds up none after it.
     fn run_scheduler(&mut self) {
         if !self.settings.auto_run_queue || self.closing {
             return;
         }
+        let max = self.settings.max_concurrent.max(1);
+        while self.queue.active_count() < max && !self.resuming.is_empty() {
+            let id = self.resuming.remove(0);
+            if self.queue.get_item(id).is_some_and(|item| item.status == QueueItemStatus::Paused) {
+                self.start_job(id, false);
+            }
+        }
         let mut held = HashSet::new();
-        while let Some(id) = self.queue.next_to_start(self.settings.max_concurrent.max(1), |id| held.contains(&id)) {
+        while let Some(id) = self.queue.next_to_start(max, |id| held.contains(&id)) {
             if !self.start_job(id, false) {
                 held.insert(id);
             }
@@ -1541,6 +1557,9 @@ impl App {
         if self.settings.schedule.enabled {
             self.run_schedule(desktop::local_now());
             ctx.request_repaint_after(desktop::until_next_minute());
+        } else {
+            // Turned on again, it starts from then, not from when it was turned off.
+            self.schedule_seen = None;
         }
         if self.queue.active_count() == 0 {
             self.batch_failed = false;
@@ -1571,6 +1590,8 @@ impl App {
         if let Some(taskbar) = self.taskbar.as_ref().filter(|_| self.hidden) {
             taskbar.show_button(true);
         }
+        // A taskbar button put back shows no progress until it is set again.
+        self.taskbar_shown = None;
         self.hidden = false;
         self.hide_at_start = false;
         for command in [egui::ViewportCommand::Visible(true), egui::ViewportCommand::Minimized(false), egui::ViewportCommand::Focus] {
@@ -1579,8 +1600,11 @@ impl App {
     }
 
     /// Hides the window in the tray; downloads go on. On Windows it is minimized and its taskbar
-    /// button taken off, as a hidden window there gets no frames, so nothing would run.
+    /// button taken off, as a hidden window there gets no frames, so nothing would run. The
+    /// settings are saved, as the system may end the app there without closing it (a shutdown,
+    /// restart or logoff).
     fn hide_window(&mut self) {
+        self.save_settings();
         self.hidden = true;
         if !cfg!(target_os = "macos") {
             self.ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
@@ -1600,7 +1624,8 @@ impl App {
         self.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 
-    /// Stops the queue and pauses every running download; the ones it paused.
+    /// Stops the queue and pauses every running download; the ones it paused, and those that
+    /// were waiting to resume.
     fn pause_all(&mut self) -> Vec<usize> {
         self.settings.auto_run_queue = false;
         let running: Vec<usize> =
@@ -1608,36 +1633,38 @@ impl App {
         for &id in &running {
             self.pause_job(id);
         }
-        running
+        let mut paused = std::mem::take(&mut self.resuming);
+        paused.extend(running);
+        paused
     }
 
-    /// Starts the queue and resumes every paused download.
+    /// Starts the queue and resumes every paused download, as many at once as the queue runs.
     fn resume_all(&mut self) {
         self.settings.auto_run_queue = true;
-        let paused: Vec<usize> = self.queue.items().iter().filter(|item| item.status == QueueItemStatus::Paused).map(|item| item.id).collect();
-        for id in paused {
-            self.start_job(id, false);
-        }
+        let paused = self.queue.items().iter().filter(|item| item.status == QueueItemStatus::Paused).map(|item| item.id);
+        self.resuming.extend(paused);
+        self.run_scheduler();
     }
 
     /// Starts or pauses the queue as the schedule says for the local time `now` (see
-    /// `desktop::schedule_due`): its start resumes what its stop paused.
+    /// `desktop::schedule_due`): its start resumes what its stop paused, also after a restart.
     fn run_schedule(&mut self, now: (u8, u16)) {
-        match desktop::schedule_due(&self.settings.schedule, self.schedule_seen.replace(now), now) {
+        let last = self.schedule_seen;
+        // A clock set back (the hour that repeats as summer time ends) takes no minute twice.
+        self.schedule_seen = Some(last.filter(|&(day, minute)| day == now.0 && minute > now.1).unwrap_or(now));
+        match desktop::schedule_due(&self.settings.schedule, last, now) {
             Some(true) => {
                 self.settings.auto_run_queue = true;
-                for id in std::mem::take(&mut self.schedule_paused) {
-                    if self.queue.get_item(id).is_some_and(|item| item.status == QueueItemStatus::Paused) {
-                        self.start_job(id, false);
-                    }
-                }
+                self.resuming.extend(std::mem::take(&mut self.settings.schedule_paused));
+                self.run_scheduler();
             }
             Some(false) => {
                 let paused = self.pause_all();
-                self.schedule_paused.extend(paused);
+                self.settings.schedule_paused.extend(paused);
             }
-            None => {}
+            None => return,
         }
+        self.save_settings();
     }
 
     /// Nothing runs, and nothing queued will start by itself.
@@ -1659,17 +1686,36 @@ impl App {
         }
     }
 
-    /// Sleeps or shuts down once the countdown is over at `now`.
+    /// Sleeps or shuts down once the countdown is over at `now`, the settings saved first (the
+    /// app may not get to save them on its way out). A download started meanwhile stops the
+    /// countdown, the choice kept for when the queue is done again.
     fn tick_countdown(&mut self, now: Instant) {
-        let Some((action, _)) = self.countdown.filter(|&(_, at)| now >= at) else { return };
+        let Some((action, at)) = self.countdown else { return };
+        if !self.queue_done() {
+            self.countdown = None;
+            self.when_done = action;
+            return;
+        }
+        if now < at {
+            return;
+        }
         self.countdown = None;
+        self.save_settings();
         if let Err(e) = (self.power)(action) {
             self.notice = Some(Err(format!("Could not {}: {}", action.name().to_lowercase(), e)));
         }
     }
 
-    /// Registers launch at startup (or removes it): the setting changes only when that worked,
-    /// else a notice says why.
+    /// Saves the settings now: on the way out, and wherever the app may be ended without one.
+    fn save_settings(&mut self) {
+        self.settings.clipboard_watch = self.clipboard_enabled.load(Ordering::Relaxed);
+        if let Err(e) = self.settings.save() {
+            tracing::warn!("Failed to save settings: {}", e);
+        }
+    }
+
+    /// Registers launch at startup (or removes it): the setting changes, and is saved at once,
+    /// only when that worked (so that the next start does not undo it), else a notice says why.
     fn set_launch_at_startup(&mut self, on: bool) {
         let exe = match std::env::current_exe() {
             Ok(exe) => exe,
@@ -1680,7 +1726,10 @@ impl App {
         };
         let (place, value) = desktop::startup_entry(&exe, &desktop::startup_root());
         match (self.writer)(&place, on.then_some(value.as_str())) {
-            Ok(()) => self.settings.launch_at_startup = on,
+            Ok(()) => {
+                self.settings.launch_at_startup = on;
+                self.save_settings();
+            }
             Err(e) => self.notice = Some(Err(format!("Could not change launch at startup: {}", e))),
         }
     }
@@ -1768,10 +1817,7 @@ impl eframe::App for App {
     /// then saves the queue. Live recordings have finished by now, unless the user closed the
     /// window a second time while they did (see [`stop_recordings`]).
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        self.settings.clipboard_watch = self.clipboard_enabled.load(Ordering::Relaxed);
-        if let Err(e) = self.settings.save() {
-            tracing::warn!("Failed to save settings: {}", e);
-        }
+        self.save_settings();
         let mut tasks = Vec::new();
         for (&id, view) in &mut self.jobs {
             if let Some(running) = view.running.take() {
@@ -2225,6 +2271,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Before any thread starts, so that everything reading the history or the download archive
     // finds them in the portable data folder.
     let portable = desktop::portable_dir(launch.data_dir.clone(), std::env::current_exe().ok().as_deref());
+    let links = desktop::takes_links(portable.is_some());
     if let Some(dir) = &portable {
         std::env::set_var("ENDO_HISTORY_PATH", dir.join("history.json"));
         std::env::set_var("ENDO_ARCHIVE_PATH", dir.join("download-archive.txt"));
@@ -2232,16 +2279,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let data = settings::data_dir();
     let log = Mutex::new(desktop::LogFile::new(data.join("logs").join("endo.log"), desktop::LOG_LIMIT));
     let _ = tracing_subscriber::fmt().with_ansi(false).with_writer(std::io::stderr.and(log)).try_init();
-    // One app per data folder: a second launch shows the running one's window and ends, one
-    // started hidden (at startup, by a link) just ends. Not the build an update started, which
-    // would find the app it replaces still closing.
+    // One app per data folder, which it locks (two started at once): a second launch shows the
+    // running one's window and ends, one started hidden (at startup, by a link) just ends. Not
+    // the build an update started, which would find the app it replaces still closing.
     let restarted = std::env::var_os(RESTARTED).is_some();
     std::env::remove_var(RESTARTED);
+    let instance = desktop::lock_instance(&data).inspect_err(|e| tracing::warn!("Could not lock the data folder: {}", e));
+    let held = matches!(instance, Ok(None));
     if !restarted {
-        if let Some(port) = ipc::running_instance(&ipc::PORTS, &desktop::data_tag(&data)) {
+        // The app holding the lock may still be starting its local API.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let running = loop {
+            let port = ipc::running_instance(&ipc::PORTS, &desktop::data_tag(&data));
+            if port.is_some() || !held || Instant::now() >= deadline {
+                break port;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        };
+        if let Some(port) = running {
             if !launch.minimized {
                 ipc::show_instance(port);
             }
+            return Ok(());
+        }
+        if held {
             return Ok(());
         }
     }
@@ -2254,13 +2315,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let restart = Arc::new(Mutex::new(None));
     let restart_for_app = Arc::clone(&restart);
-    let (minimized, portable) = (launch.minimized, portable.is_some());
-    let result = eframe::run_native(TITLE, options, Box::new(move |cc| Ok(Box::new(App::new(cc, handle, restart_for_app, minimized, portable)))));
+    let minimized = launch.minimized;
+    let result = eframe::run_native(TITLE, options, Box::new(move |cc| Ok(Box::new(App::new(cc, handle, restart_for_app, minimized, links)))));
     // Downloads were stopped in `on_exit`; leftover blocking work (e.g. hashing for a verify)
     // must not keep the process alive.
     runtime.shutdown_background();
-    // An update was installed: the new build takes over.
+    // An update was installed: the new build takes over, the data folder unlocked for it.
     if let Some(exe) = lock(&restart).take() {
+        drop(instance);
         std::env::set_var(RESTARTED, "1");
         if let Err(e) = updater::restart(&exe) {
             tracing::warn!("Could not start the updated app {}: {}", exe.display(), e);
@@ -2469,13 +2531,25 @@ mod tests {
         assert_eq!(refresh, (2, vec![]), "the refresh reads after the clear and is numbered after it");
     }
 
-    /// Points download history at a file of this test process, once for every test, so no test
-    /// touches the user's history or switches the file while another runs.
+    /// Points download history, and with it the settings, queue and logs (see
+    /// `settings::app_file`), and the download archive at a folder of this test process, once for
+    /// every test, so no test touches the user's files or switches the folder while another runs.
+    /// Earlier runs' folders go once they are an hour old.
     pub(crate) fn isolate_history() {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
-            let path = std::env::temp_dir().join(format!("hf-gui-test-history-{}.json", std::process::id()));
-            std::env::set_var("ENDO_HISTORY_PATH", path);
+            let temp = std::env::temp_dir();
+            let stale = |entry: &std::fs::DirEntry| {
+                let age = entry.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
+                entry.file_name().to_string_lossy().starts_with("hf-gui-tests-") && age.is_some_and(|age| age.as_secs() > 3600)
+            };
+            for entry in std::fs::read_dir(&temp).into_iter().flatten().flatten().filter(stale) {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+            let dir = temp.join(format!("hf-gui-tests-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            std::env::set_var("ENDO_HISTORY_PATH", dir.join("history.json"));
+            std::env::set_var("ENDO_ARCHIVE_PATH", dir.join("download-archive.txt"));
         });
     }
 
@@ -2630,8 +2704,9 @@ mod tests {
     }
 
     /// The app, saving into `dir`, on `rt`: a runtime that never runs what it is given here, so
-    /// nothing is read or downloaded.
+    /// nothing is read or downloaded. Its settings and history are this test process's.
     fn test_app(rt: &tokio::runtime::Runtime, dir: &std::path::Path) -> App {
+        isolate_history();
         let settings = Settings { save_dir: dir.to_string_lossy().into_owned(), ..Settings::default() };
         App::with(egui::Context::default(), rt.handle().clone(), settings, DownloadQueue::new(), None)
     }
@@ -3263,15 +3338,75 @@ mod tests {
         assert!(app.quitting && app.countdown.is_none());
     }
 
-    /// Pause all stops the queue and pauses what runs, Resume all starts both again, and the
-    /// queue's switch follows Start and Stop. The schedule's stop pauses what runs, and its start
-    /// resumes only that, not a download the user paused.
+    /// A download started while the countdown runs stops it, the choice kept for when the queue
+    /// is done again; the settings are saved before the computer sleeps.
     #[test]
-    fn the_tray_and_the_schedule_pause_and_resume_the_queue() {
-        use QueueItemStatus::{Downloading, Paused, Pausing, Queued};
+    fn the_countdown_waits_for_a_new_download_and_saves_the_settings_first() {
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let mut app = test_app(&rt, dir.path());
+        let slept = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&slept);
+        app.power = Box::new(move |action| {
+            let saved = std::fs::read_to_string(settings::app_file("gui-settings.json")).unwrap_or_default();
+            lock(&log).push((action, saved.contains("countdown-test-agent")));
+            Ok(())
+        });
+        app.settings.user_agent = "countdown-test-agent".to_string();
+        app.when_done = WhenDone::Sleep;
+        let done = |name: &str| Ok((PathBuf::from(name), Some(1)));
+        let a = add(&mut app, "a.iso");
+        running(&mut app, &rt, a);
+        app.handle_event(AppEvent::JobFinished { id: a, result: done("a.iso") });
+        let (_, at) = app.countdown.expect("counting down");
+        let b = add(&mut app, "b.iso");
+        running(&mut app, &rt, b);
+        app.tick_countdown(at);
+        assert!(app.countdown.is_none() && lock(&slept).is_empty(), "b runs");
+        assert_eq!(app.when_done, WhenDone::Sleep, "the choice is kept");
+        app.handle_event(AppEvent::JobFinished { id: b, result: done("b.iso") });
+        let (_, at) = app.countdown.expect("counting down again");
+        app.tick_countdown(at);
+        assert_eq!(*lock(&slept), [(WhenDone::Sleep, true)], "the settings were saved first");
+    }
+
+    /// "See what's inside" gives up on a server that never answers, and says so.
+    #[test]
+    fn a_zip_preview_gives_up_on_a_silent_server() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(&rt, dir.path());
+        // Takes connections and never answers; they close with the runtime.
+        let addr = rt.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                let mut held = Vec::new();
+                while let Ok((socket, _)) = listener.accept().await {
+                    held.push(socket);
+                }
+            });
+            addr
+        });
+        app.preview_zip(Url::parse(&format!("http://{addr}/pack.zip")).unwrap());
+        let event = app.events_rx.recv_timeout(Duration::from_secs(20)).expect("an answer within the limit");
+        app.handle_event(event);
+        let listed = app.zip_preview.as_ref().and_then(|(_, listed)| listed.as_ref());
+        let Some(Err(error)) = listed else { panic!("no error") };
+        assert_eq!(error, "Gave up listing the ZIP: the server took over 2 seconds");
+    }
+
+    /// Pause all stops the queue and pauses what runs; Resume all starts both again, as many at
+    /// once as the queue runs, the paused ones first; the queue's switch follows Start and Stop.
+    /// The schedule's stop pauses what runs, and its start resumes only that, not a download the
+    /// user paused.
+    #[test]
+    fn the_tray_and_the_schedule_pause_and_resume_the_queue() {
+        use QueueItemStatus::{Completed, Downloading, Paused, Pausing, Queued};
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(&rt, dir.path());
+        app.settings.max_concurrent = 1;
         let [a, b, c] = ["a.iso", "b.iso", "c.iso"].map(|name| add(&mut app, name));
         running(&mut app, &rt, a);
         running(&mut app, &rt, b);
@@ -3284,32 +3419,85 @@ mod tests {
         stopped(&mut app, b);
         app.handle_event(AppEvent::Tray(TrayAction::ResumeAll));
         assert!(app.settings.auto_run_queue);
-        assert_eq!([a, b, c].map(|id| status(&app, id)), [Downloading, Downloading, Queued]);
+        assert_eq!([a, b, c].map(|id| status(&app, id)), [Downloading, Paused, Queued], "one at a time");
+        app.handle_event(AppEvent::JobFinished { id: a, result: Ok((PathBuf::from("a.iso"), Some(1))) });
+        app.run_scheduler();
+        assert_eq!([a, b, c].map(|id| status(&app, id)), [Completed, Downloading, Queued], "the paused one first");
         app.handle_event(AppEvent::Tray(TrayAction::StopQueue));
         assert!(!app.settings.auto_run_queue);
         app.handle_event(AppEvent::Tray(TrayAction::StartQueue));
         assert!(app.settings.auto_run_queue);
 
-        app.pause_job(b);
-        stopped(&mut app, b);
         let schedule = settings::Schedule { enabled: true, start: Some("08:00".into()), stop: Some("18:00".into()), ..Default::default() };
         app.settings.schedule = schedule;
+        app.schedule_seen = Some((0, 17 * 60 + 58));
         app.run_schedule((0, 17 * 60 + 59));
-        assert_eq!(status(&app, a), Downloading);
+        assert_eq!(status(&app, b), Downloading);
         app.run_schedule((0, 18 * 60));
         assert!(!app.settings.auto_run_queue);
-        assert_eq!([a, b].map(|id| status(&app, id)), [Pausing, Paused]);
-        stopped(&mut app, a);
+        assert_eq!(status(&app, b), Pausing);
+        stopped(&mut app, b);
+        assert_eq!(app.settings.schedule_paused, [b], "kept with the settings");
+        assert!(app.start_job(c, false));
+        app.pause_job(c);
+        stopped(&mut app, c);
         app.run_schedule((1, 8 * 60 + 2));
-        assert!(app.settings.auto_run_queue);
-        assert_eq!([a, b].map(|id| status(&app, id)), [Downloading, Paused], "the user's pause stays");
+        assert!(app.settings.auto_run_queue && app.settings.schedule_paused.is_empty());
+        assert_eq!([b, c].map(|id| status(&app, id)), [Downloading, Paused], "the user's pause stays");
 
         app.hide_window();
         assert!(app.hidden);
+        app.taskbar_shown = Some(taskbar::Progress::Normal(500));
         app.handle_event(AppEvent::Tray(TrayAction::Show));
         assert!(!app.hidden && !app.quitting);
+        assert_eq!(app.taskbar_shown, None, "set again on the button put back");
         app.handle_event(AppEvent::Tray(TrayAction::Quit));
         assert!(app.quitting);
+    }
+
+    /// What the schedule paused is resumed at its start after a restart in between, a launch
+    /// inside its time starting the queue. Each minute is taken once, also as the clock goes back
+    /// an hour; turned off and on again, it starts from then.
+    #[test]
+    fn the_schedule_outlives_a_restart_and_takes_each_minute_once() {
+        use QueueItemStatus::{Downloading, Paused, Pausing};
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(&rt, dir.path());
+        app.settings.schedule = settings::Schedule { enabled: true, start: Some("08:00".into()), stop: Some("18:00".into()), ..Default::default() };
+        let [a, b] = ["a.iso", "b.iso"].map(|name| add(&mut app, name));
+        running(&mut app, &rt, a);
+        app.schedule_seen = Some((0, 17 * 60 + 59));
+        app.run_schedule((0, 18 * 60));
+        app.handle_event(AppEvent::JobFinished { id: a, result: Err(hyperfetch_core::engine::CANCELLED.to_string()) });
+        assert_eq!([a, b].map(|id| status(&app, id)), [Paused, QueueItemStatus::Queued]);
+
+        // Started again the next morning, with the settings and queue it saved.
+        let mut app = App::with(egui::Context::default(), rt.handle().clone(), app.settings.clone(), app.queue.clone(), None);
+        app.run_schedule((1, 9 * 60));
+        assert!(app.settings.auto_run_queue);
+        assert_eq!([a, b].map(|id| status(&app, id)), [Downloading, Downloading]);
+
+        app.run_schedule((1, 18 * 60));
+        assert_eq!([a, b].map(|id| status(&app, id)), [Pausing, Pausing]);
+        for id in [a, b] {
+            app.handle_event(AppEvent::JobFinished { id, result: Err(hyperfetch_core::engine::CANCELLED.to_string()) });
+        }
+        // Summer time ends: 18:00 comes again an hour later, and stops nothing the user resumed.
+        app.run_schedule((1, 17 * 60));
+        assert_eq!(app.schedule_seen, Some((1, 18 * 60)));
+        running(&mut app, &rt, b);
+        app.run_schedule((1, 18 * 60));
+        assert_eq!(status(&app, b), Downloading);
+
+        // Off, then on again two days later: yesterday's stop time is not taken now.
+        app.settings.schedule.enabled = false;
+        let ctx = app.ctx.clone();
+        app.desktop_frame(&ctx);
+        assert_eq!(app.schedule_seen, None);
+        app.settings.schedule.enabled = true;
+        app.run_schedule((3, 19 * 60));
+        assert_eq!(status(&app, b), Downloading);
     }
 
     /// The taskbar shows nothing while no download runs, else the share of their bytes done:
