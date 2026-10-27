@@ -7363,3 +7363,10 @@ mod tests {
         assert_eq!(back.media_name, Some(template));
     }
 }
+
+/// The file name a download takes from an answer with `headers` from `url`: its
+/// Content-Disposition name, else the link's last segment, with an extension from its Content-Type
+/// when it has none (for `--spider` and `--no-clobber`).
+pub fn file_name_from(headers: &HeaderMap, url: &Url) -> String {
+    extract_filename([headers], url)
+}

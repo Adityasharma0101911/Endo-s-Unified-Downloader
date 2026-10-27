@@ -10,7 +10,7 @@ use futures_util::future::{BoxFuture, OptionFuture, Shared};
 use futures_util::stream::FuturesUnordered;
 use futures_util::StreamExt;
 use hyperfetch_core::engine::{build_client, ClientKey, DownloadEngine, DownloadOptions, EngineSnapshot, SharedLimits};
-use hyperfetch_core::history::{DownloadHistoryManager, HistoryEntry, HistoryStatus};
+use hyperfetch_core::history::{redact_text, DownloadHistoryManager, HistoryEntry, HistoryStatus};
 use hyperfetch_core::media::is_supported_media_site;
 use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use tokio::sync::{broadcast, mpsc, watch};
@@ -103,6 +103,11 @@ pub struct Ui {
     /// stderr is not a terminal: print a progress line now and then instead of bars.
     plain: bool,
     held: Arc<Mutex<Held>>,
+    /// --json: results go to stdout as JSON lines (see [`Ui::report`]), what [`Ui::print`] says to
+    /// stderr.
+    pub json: bool,
+    /// --logfile: what is written here is appended there too, progress bars aside.
+    pub log: Option<Arc<std::fs::File>>,
 }
 
 /// Output held back while a question waits for its answer (see [`Ui::hiding_bars`]), each piece
@@ -116,7 +121,7 @@ impl Ui {
         } else {
             MultiProgress::new()
         };
-        Self { multi, quiet, plain: !quiet && !std::io::stderr().is_terminal(), held: Arc::default() }
+        Self { multi, quiet, plain: !quiet && !std::io::stderr().is_terminal(), held: Arc::default(), json: false, log: None }
     }
 
     /// -q was given: no progress or status output.
@@ -124,9 +129,18 @@ impl Ui {
         self.quiet
     }
 
-    /// Prints to stdout without tearing the progress bars.
+    /// Prints to stdout (stderr with --json) without tearing the progress bars.
     pub fn print(&self, line: &str) {
-        let _ = self.write(false, format!("{}\n", printable(line)).as_bytes());
+        let _ = self.write(self.json, format!("{}\n", printable(line)).as_bytes());
+    }
+
+    /// Prints `item` (see [`item`]) as one JSON object on a line of stdout with --json, its keys
+    /// in their order; nothing without.
+    pub fn report(&self, item: Item) {
+        if self.json {
+            let fields: Vec<String> = item.iter().map(|(key, value)| format!("\"{}\":{}", key, value)).collect();
+            let _ = self.write(false, format!("{{{}}}\n", fields.join(",")).as_bytes());
+        }
     }
 
     /// Prints to stderr without tearing the progress bars.
@@ -137,6 +151,9 @@ impl Ui {
     /// Writes `bytes` to stderr, else stdout, without tearing the progress bars; while a question
     /// waits for its answer, once it is answered.
     fn write(&self, stderr: bool, bytes: &[u8]) -> std::io::Result<()> {
+        if let Some(log) = &self.log {
+            let _ = (&**log).write_all(bytes);
+        }
         let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
         match held.as_mut() {
             Some(held) => {
@@ -437,6 +454,33 @@ fn done_line(input: Option<&str>, path: &std::path::Path) -> String {
     }
 }
 
+/// One --json result: every key always there, null where it does not apply. `status` is "ok",
+/// "failed", "skipped" (--no-clobber) or "up-to-date" (--only-if-newer); `url` is shown without
+/// its secrets; `checksum` is the one the file was to match (--checksum, a metalink's), and
+/// `checked_against` says whose checksum it matched when it was not yours ("the site's SHA-256").
+pub fn item(
+    status: &str,
+    url: Option<&str>,
+    path: Option<&std::path::Path>,
+    size: Option<u64>,
+    checksum: Option<&str>,
+    checked_against: Option<&str>,
+    error: Option<&str>,
+) -> Item {
+    vec![
+        ("status", status.into()),
+        ("url", url.map(redact_text).into()),
+        ("path", path.map(|path| path.display().to_string()).into()),
+        ("size", size.into()),
+        ("checksum", checksum.into()),
+        ("checked_against", checked_against.into()),
+        ("error", error.into()),
+    ]
+}
+
+/// The keys and values of a --json object, in order (see [`item`]).
+pub type Item = Vec<(&'static str, serde_json::Value)>;
+
 /// `input` is what result lines call the download (see [`input_name`]); None uses its file name.
 async fn run_job(
     job: Job,
@@ -452,10 +496,15 @@ async fn run_job(
     }
     let started_at = unix_now();
     let urls: Vec<String> = job.urls.iter().map(Url::to_string).collect();
+    let (url, checksum, only_if_newer) = (urls.first().cloned(), job.options.expected_checksum.clone(), job.options.only_if_newer);
+    let failed = |path: Option<&std::path::Path>, size: Option<u64>, error: &str| {
+        item("failed", url.as_deref(), path, size, checksum.as_deref(), None, Some(error))
+    };
     let engine = match clients.engine(job.urls, job.options) {
         Ok(engine) => engine,
         Err(err) => {
             ui.error(&format!("[FAILED] {}: {}", input.as_deref().unwrap_or(&job.label), err));
+            ui.report(failed(None, None, &err));
             return Outcome::Failed;
         }
     };
@@ -499,8 +548,17 @@ async fn run_job(
 
     match result {
         Ok(path) => {
+            let checked_against = engine.checked_against();
+            let up_to_date = only_if_newer && engine.kept_existing();
             if !ui.quiet {
-                ui.print(&done_line(input.as_deref(), &path));
+                let mut line = done_line(input.as_deref(), &path);
+                if up_to_date {
+                    line.push_str(" (up to date)");
+                }
+                if let Some(whose) = &checked_against {
+                    line.push_str(&format!(" (checked against {})", whose));
+                }
+                ui.print(&line);
                 // Post-processing notes come in the last snapshot, which may still be queued.
                 while let Ok(snapshot) = rx.try_recv() {
                     last = Some(snapshot);
@@ -509,6 +567,10 @@ async fn run_job(
                     ui.print(&format!("  {}", printable(note)));
                 }
             }
+            // A folder (a torrent's, an unpacked archive's) has no one size.
+            let size = tokio::fs::metadata(&path).await.ok().filter(|m| m.is_file()).map(|m| m.len());
+            let status = if up_to_date { "up-to-date" } else { "ok" };
+            ui.report(item(status, url.as_deref(), Some(&path), size, checksum.as_deref(), checked_against.as_deref(), None));
             Outcome::Done
         }
         Err(err) => {
@@ -519,6 +581,8 @@ async fn run_job(
             } else {
                 ui.error(&format!("[FAILED] {}: {}", subject, err));
             }
+            let target = last.as_ref().and_then(|s| s.target_path.clone());
+            ui.report(failed(target.as_deref(), last.as_ref().map(|s| s.total_bytes).filter(|&n| n > 0), &err));
             if let Some(snapshot) = last.filter(|s| s.target_path.is_some()) {
                 let status = if interrupted { HistoryStatus::Cancelled } else { HistoryStatus::Failed(err) };
                 record_unfinished(snapshot, urls, status, started_at).await;
@@ -697,7 +761,7 @@ mod tests {
                             None => "200 OK".to_string(),
                         };
                         let mut response = format!(
-                            "HTTP/1.1 {}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\n\r\n",
+                            "HTTP/1.1 {}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nLast-Modified: Wed, 21 Oct 2015 07:28:00 GMT\r\n\r\n",
                             status,
                             end + 1 - start
                         )
@@ -744,6 +808,49 @@ mod tests {
         }
         let accepted = accepted.load(Ordering::SeqCst);
         assert!(accepted < 6, "{} connections for 3 downloads: the later ones did not reuse any", accepted);
+    }
+
+    /// With --json each finished download is one JSON line: done, failed, or with --only-if-newer
+    /// left as it is (up to date); --logfile gets them with the other lines printed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn each_result_is_a_json_line_and_in_the_log() {
+        let dir = std::env::temp_dir().join(format!("hf-cli-json-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("ENDO_HISTORY_PATH", dir.join("history.json"));
+        let body: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
+        let (server, _) = keep_alive_server(body.clone()).await;
+        let log = dir.join("out.log");
+        let mut ui = Ui::new(true);
+        ui.json = true;
+        ui.log = Some(Arc::new(std::fs::File::create(&log).unwrap()));
+        let job = |name: &str| Job {
+            label: name.to_string(),
+            urls: vec![Url::parse(&format!("{}/{}.bin?token=secret", server, name)).unwrap()],
+            options: DownloadOptions { output_path: Some(dir.join("")), only_if_newer: true, ..Default::default() },
+            line: None,
+        };
+        let mut broken = job("b");
+        broken.options.cookies_path = Some(dir.join("missing-cookies.txt"));
+        assert_eq!(run_jobs(vec![job("a"), broken], 1, &ui, &Shutdown::install(), None).await, 1);
+        assert_eq!(run_jobs(vec![job("a")], 1, &ui, &Shutdown::install(), None).await, 0);
+
+        let text = std::fs::read_to_string(&log).unwrap();
+        let items: Vec<serde_json::Value> =
+            text.lines().filter(|line| line.starts_with('{')).map(|line| serde_json::from_str(line).unwrap()).collect();
+        let statuses: Vec<&str> = items.iter().map(|item| item["status"].as_str().unwrap()).collect();
+        assert_eq!(statuses, ["ok", "failed", "up-to-date"], "{text}");
+        // The keys in their documented order.
+        let failed = text.lines().find(|line| line.starts_with(r#"{"status":"failed","url":"#)).unwrap();
+        assert!(failed.contains(r#","path":null,"size":null,"checksum":null,"checked_against":null,"error":""#), "{failed}");
+        let path = dir.join("a.bin").display().to_string();
+        assert_eq!((items[0]["path"].as_str(), items[0]["size"].as_u64()), (Some(path.as_str()), Some(body.len() as u64)));
+        assert!(items[0]["url"].as_str().unwrap().ends_with("/a.bin?token=REDACTED"), "{}", items[0]);
+        assert!(items[0]["error"].is_null() && items[0]["checksum"].is_null() && items[0]["checked_against"].is_null());
+        assert!(items[1]["error"].as_str().unwrap().contains("cookies"), "{}", items[1]);
+        assert_eq!(items[2]["path"].as_str(), Some(path.as_str()));
+        assert!(text.contains("[FAILED] b: "), "the human lines too: {text}");
+        assert!(!text.contains("secret"), "{text}");
     }
 
     /// Downloads running at once stay within --max-speed together, not each on its own.

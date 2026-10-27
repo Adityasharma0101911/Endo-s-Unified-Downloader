@@ -27,7 +27,7 @@
 - A finished file is not flushed to disk before it is reported done; the operating system writes it out on its own schedule, as with curl, wget and browsers. A power loss right after a download finishes can therefore leave a damaged file, which `--verify` detects. `--fsync` (GUI: **Flush finished files to disk**) waits for each finished file to reach the disk first.
 - A download whose size the server tells fails before anything is written when its disk lacks room for what is still missing plus 64 MiB ("Not enough disk space: needs ..., ... free").
 - Stopping (Ctrl+C, `systemctl stop`) saves the resume state. Running the same command again continues where it stopped, but only if the server still reports the same size, validators (ETag/Last-Modified) and range support. Otherwise the stale `.part` is discarded and the download starts over.
-- Existing files are never overwritten, except by a newer version with `--only-if-newer` (see Requests and connections below). A different file with the same name is saved as `name (1).ext`. A file that is already complete (the checksum matches, or history recorded it as completed at that exact path) is not downloaded again.
+- Existing files are never overwritten, except by a newer version with `--only-if-newer` (see Requests and connections below). A different file with the same name is saved as `name (1).ext`, or, with `--no-clobber`, not downloaded at all. A file that is already complete (the checksum matches, or history recorded it as completed at that exact path) is not downloaded again.
 - File type from the contents: when the name the server gives has no extension, or a page script's (`.php`, `.asp`, `.aspx`, `.jsp`, `.cgi`), the finished file gets the extension its first bytes show added (`get.php` becomes `get.php.zip`, numbered if taken): ZIP, EPUB, 7z, RAR, gzip, xz, bzip2, Zstandard, PDF, PNG, JPEG, GIF, WebP, MP4, MOV, M4A, MKV, WebM, MP3, FLAC, Ogg, WAV, AVI, Windows programs, `.deb` and `.rpm`. A real extension is never replaced, a name you chose (`-o FILE`) is kept, and a Linux program keeps its bare name.
 - Checksums: `sha256:`, `sha512:`, `sha1:`, `md5:`, `blake3:` or bare hex. The BLAKE3 hash of every finished download is recorded in the history, so `--verify` can check the file later. The hashes are taken while the file is written (SHA-256, SHA-512, SHA-1 and MD5 follow the file's start as it grows, so with such a checksum chunks are at most 8 MiB unless `-c` sets their size), and finishing a download reads back only what was not hashed on the way. A mismatch is confirmed by reading the whole file before it is discarded.
 - Without a checksum of yours, a download is checked against the one its site publishes, if it has one (on by default): a digest header of its answer (`Repr-Digest`, `Content-Digest`, `Digest`, `Content-MD5`, or the MD5 or SHA-256 cloud storage sends with a file, never one of an encoded answer or of parts), else a checksum file beside it on the same site (`<file>.sha256`, `.sha512`, `.sha1` or `.md5`, or the file's line in `SHA256SUMS`, `sha256sums.txt` or `CHECKSUMS` in its folder). The checksum files are looked for alongside the download, each at most 64 KiB and all within 3 seconds, so a download that finishes sooner waits at most that long; an ETag is never taken for a hash. A mismatch fails the download as your checksum would, saying it is the site's, and a match shows as checked against the site's SHA-256 (or SHA-512, SHA-1, MD5). The file is read once more at the end for that checksum.
@@ -186,13 +186,26 @@ All `URLS` given on the command line are **mirrors of one file**, except a link 
 | `--fsync` | Wait until each finished file is on the disk before reporting it done. | off |
 | `-d, --dir DIR` | Directory to save into. It is created if it is missing. | current directory |
 | `-o, --output FILE` | Output file name for a single download. It is relative to `-d` when both are given. | name from the server |
+| `--no-clobber` | Skip a download whose file is already there (`skipped`). Where the server names the file, its probe asks for the name first; yt-dlp's and torrent downloads are not checked. | `name (1).ext` |
+| `-N, --only-if-newer` | Download a file that is already there again only when the server has a newer one (see Requests and connections under [Features](#features)). | |
+| `--remote-time` | Give each finished file the date its server gives it (`Last-Modified`, or `MDTM` over FTP). | the time it finished |
+| `--max-filesize SIZE` | Fail a download larger than this, e.g. `10M` or `2G` (powers of 1024): before anything is written when the server gives the size, else as soon as more has arrived. Direct HTTP(S) and FTP files. | no limit |
 | `-s, --split N` | Connections per download (1-64). | `16` |
 | `-c, --chunk-size MIB` | Base chunk size in MiB (1-1024). | `4` |
+| `--adaptive` / `--no-adaptive` | Adapt each download's connections as it goes, one more while that makes it faster (see Adaptive connections under [Features](#features)). | off |
 | `--max-speed RATE` | Speed limit for all running downloads together (`-j`), e.g. `500K`, `2M`, `1.5MiB`. K/M/G are powers of 1024, and `0` means unlimited. | unlimited |
 | `--max-retries N` | Failed attempts allowed per chunk before the download gives up. | `8` |
 | `--stall-timeout SECS` | Seconds without data before a connection is retried (1-3600). | `30` |
 | `--checksum SUM` | Expected checksum: `sha256:HEX`, `sha512:HEX`, `sha1:HEX`, `md5:HEX`, `blake3:HEX` or bare hex. Only for a single download or `--verify`. | |
-| `--header HEADER` | Authorization header, as `"Authorization: Bearer TOKEN"` or `"Bearer TOKEN"`. Other header names are rejected. It is never sent to the mirrors a `.metalink` or `.torrent` lists, nor to the files, episodes and videos a folder, feed, playlist or channel lists, except a repository's files on that service's own host (see Code and model repositories under [Features](#features)). | |
+| `--no-remote-checksum` | Do not check a download against the checksum its site publishes (see Checksums under [Features](#features)). | checked |
+| `--header HEADER` | A request header, `"Name: value"`; repeat it for several. A bare value (`"Bearer TOKEN"`) is an Authorization header. `Host`, `Range`, `Content-Length`, `Transfer-Encoding` and `Connection` are refused. Headers are never sent to the mirrors a `.metalink` or `.torrent` lists, nor to the files, episodes and videos a folder, feed, playlist or channel lists, except a repository's files on that service's own host (see Code and model repositories under [Features](#features)). | |
+| `-u, --user USER[:PASS]` | Basic sign-in, sent like `--header` only to the hosts of the links given. Without `:PASS` the password is asked for at a terminal, and not shown as it is typed; elsewhere that is an error. An Authorization `--header` wins over it. | |
+| `--cookie STRING` | Cookies, `"a=b; c=d"`, sent like `--header`. | |
+| `-U, --user-agent UA` | User-Agent sent in place of the browser one. | a browser's |
+| `-k, --insecure` | Do not check TLS certificates. | checked |
+| `-4, --ipv4` / `-6, --ipv6` | Connect over IPv4 or IPv6 only. | either |
+| `--connect-timeout SECS` | Seconds opening a connection may take: DNS, TCP and TLS (1-3600). | `15` |
+| `--no-proxy` | Connect directly, ignoring the proxy variables of the environment. | |
 | `--password PASS` | Password of a share (a Gofile folder), a video (yt-dlp's `--video-password`) or an archive `--extract` unpacks, for every download of the run. It wins over a password in a paste, and is never shown or saved. | |
 | `--load-cookies FILE` | Netscape `cookies.txt` file. | |
 | `--proxy URL` | `http://`, `https://`, `socks5://` or `socks5h://` proxy. | |
@@ -205,6 +218,7 @@ All `URLS` given on the command line are **mirrors of one file**, except a link 
 | `--merge-format F` | Container a video's streams are joined in: `mp4`, `mkv` or `webm`. | `mp4` |
 | `--no-embed-metadata` | Leave out the tags, chapters and cover art written into media files. | embedded |
 | `--live-from-start` | Record a live stream from its start, where the site keeps it, instead of from now (see [Live streams](#live-streams)). | from now |
+| `--record-seconds N` | End a live recording after N seconds of it. | until it ends |
 | `--wait-for-video` | Wait for a scheduled stream or premiere to begin instead of failing. | off |
 | `--hls-mp4` | Remux an HLS stream saved as MPEG-TS into an `.mp4` once downloaded, without re-encoding (see HLS under [Features](#features)). | keeps the `.ts` |
 | `--install-ffmpeg` | Install ffmpeg (about 200 MB) when a media download needs it and finds none (see ffmpeg under [Features](#features)). | asks at a terminal |
@@ -231,6 +245,14 @@ All `URLS` given on the command line are **mirrors of one file**, except a link 
 | `--history` | List past downloads, including failed and stopped ones, then exit. | |
 | `--verify FILE` | Check whether a downloaded or partial file is complete and intact. | |
 | `--repair` | Used with `--verify`: download the missing ranges, or the damaged pieces, again. | |
+| `--spider` | Probe each link without downloading it (see below). | |
+| `-S, --server-response` | Print the request and response headers of each link's probe on stderr (see below). | |
+| `--dry-run` | Print what the run would download, and where, without writing anything (see below). | |
+| `--preview` | List the files in a remote ZIP without downloading it (see below). | |
+| `--stdout` | Write one direct file link's bytes to standard output, a file or a pipe (not the terminal), with progress and messages on stderr (see Requests and connections under [Features](#features)). | |
+| `--json` | One JSON object per finished item on stdout (see below). | |
+| `--logfile FILE` | Append what is printed, progress bars aside, to FILE too. | |
+| `--completions SHELL` | Print a completion script for `bash`, `zsh`, `fish`, `powershell` or `elvish`, then exit. | |
 | `-q, --quiet` | Hide progress output. Errors and warnings are still printed. | |
 | `-v, --verbose` | More log output: `-v` info, `-vv` debug, `-vvv` trace. | warnings |
 | `-h, --help` / `-V, --version` | Show help or the version. | |
@@ -245,7 +267,21 @@ https://example.com/release.meta4
 /home/me/debian.torrent
 ```
 
-**Results.** Each finished download prints `[OK] <path>`, and a failed one `[FAILED] <name>: <reason>` on stderr. With `-j` above 1 results arrive in the order the downloads finish, so each line names its input: the line of the `-i` file that listed it, and its first URL without the user name, password and query string, which may hold credentials: `[OK] line 3 https://example.com/file.iso -> /srv/downloads/file.iso`. The files of one metalink or torrent share its line.
+**Results.** Each finished download prints `[OK] <path>`, and a failed one `[FAILED] <name>: <reason>` on stderr. With `-j` above 1 results arrive in the order the downloads finish, so each line names its input: the line of the `-i` file that listed it, and its first URL without the user name, password and query string, which may hold credentials: `[OK] line 3 https://example.com/file.iso -> /srv/downloads/file.iso`. The files of one metalink or torrent share its line. A file checked against the checksum its site publishes says so: `[OK] /srv/downloads/file.iso (checked against the site's SHA-256)`; one `--only-if-newer` left as it was ends in `(up to date)`.
+
+**JSON.** With `--json`, each finished item is one JSON object on a line of stdout, and everything else printed goes to stderr. Every object has the same keys, in this order, `null` where one does not apply:
+
+```json
+{"status":"ok","url":"https://example.com/file.iso","path":"/srv/downloads/file.iso","size":4096,"checksum":null,"checked_against":"the site's SHA-256","error":null}
+```
+
+`status` is `ok`, `failed`, `skipped` (`--no-clobber`) or `up-to-date` (`--only-if-newer`). `url` is the link without its secrets (as history keeps it), `path` where the file is (for a failed download, where it was going), `size` its size in bytes (`null` for a folder), `checksum` the one it had to match (yours, or a metalink's), `checked_against` whose checksum it matched when it was not yours, and `error` why it failed. An input that could not be read at all (a folder that does not open) is a `failed` item too. With `--spider` each object also has `name`, `type`, `resumable`, `etag` and `last_modified`, and `checksum` is the one the site publishes; with `--dry-run`, each is a file the run would download (`ok`) or skip (`skipped`). `--json` needs URLs or `-i`: it does not start the interactive prompt.
+
+**Probing without downloading.**
+- `--spider` asks each link's server for the file's first byte, as a download's probe does (file host pages resolved, your headers to the link's own host only), and prints its name, size, type, whether it can resume, its validators (ETag, Last-Modified) and the checksum its site publishes, if any. Nothing is written. It works with `-i` and with folders, playlists and feeds, which are listed first; a bad link (an error answer, no answer) exits with `1` and its reason. FTP links and torrents are listed, not probed.
+- `-S, --server-response` prints the headers of each link's probe request (`>` lines) and answer (`<` lines) on stderr, before the downloads start or with `--spider`. The values of `Authorization`, `Cookie`, `Set-Cookie` and of your own `--header`s are shown as `***`; the link is shown without its secrets.
+- `--dry-run` prints what the run would download (size if known, and the path; `(named when downloaded)` where the server or yt-dlp names it), with folders, playlists, channels, feeds, metalinks and torrents expanded, a torrent's files one by one. Nothing is written, not even the download folder.
+- `--preview` lists the files in the remote ZIP the link names (size and name of each, then the total) without downloading it: its end and its list of files are read with one or two range requests (at most 64 KiB, then at most 16 MiB), so the server must send parts of files. ZIP64 archives work, and names are read as UTF-8 or, without that flag, CP437.
 
 **Progress.** Each running download shows a bar with the engine's measured speed, the number of open connections and the ETA. If no data arrives for 5 seconds, the bar shows `STALLED`. Batches also show a total bar. When stderr is not a terminal (journald, cron, pipes), a plain progress line is printed every 10 seconds instead of the bars.
 
@@ -256,11 +292,13 @@ https://example.com/release.meta4
 | Code | Meaning |
 | :--- | :--- |
 | `0` | All downloads finished (or the file verified). |
-| `1` | At least one download or repair failed. |
+| `1` | At least one download, repair, `--spider` probe or `--preview` failed. |
 | `2` | Usage error, unreadable input, or the file failed `--verify`. |
 | `130` / `143` | Stopped by Ctrl+C (SIGINT) / SIGTERM. |
 
-**Logging.** Warnings from the engine (a dropped mirror, a retried chunk, an ignored option) are printed to stderr. `-v` adds more detail. `RUST_LOG` (for example `RUST_LOG=hyperfetch_core=debug`) overrides the level.
+**Logging.** Warnings from the engine (a dropped mirror, a retried chunk, an ignored option) are printed to stderr. `-v` adds more detail. `RUST_LOG` (for example `RUST_LOG=hyperfetch_core=debug`) overrides the level. `--logfile FILE` appends everything printed (log lines, results, `--json` objects, not the progress bars) to FILE too, as it is printed, without colours.
+
+**Shell completions.** `--completions bash` (or `zsh`, `fish`, `powershell`, `elvish`) prints a completion script for the name the program was started by. For example `endos-downloader --completions bash > ~/.local/share/bash-completion/completions/endos-downloader`, or in PowerShell `.\Endos-Unified-Downloader-CLI.exe --completions powershell | Out-String | Invoke-Expression` (add it to `$PROFILE` to keep it).
 
 ### Examples
 
@@ -310,6 +348,18 @@ endos-downloader https://example.com/pack.zip --extract --delete-archive --virus
 # Behind a proxy, with a token
 endos-downloader https://api.example.com/export.zip --proxy socks5h://127.0.0.1:1080 \
     --header "Authorization: Bearer $TOKEN"
+
+# What a link serves, with its headers; what is in a ZIP; what a batch would download, as JSON
+endos-downloader --spider -S https://example.com/file.iso
+endos-downloader --preview https://example.com/pack.zip
+endos-downloader --dry-run --json -i queue.txt
+
+# Keep a folder in sync: skip what is there, or fetch only what changed on the server
+endos-downloader -i queue.txt --no-clobber -d /srv/mirror
+endos-downloader -i queue.txt -N -d /srv/mirror --json --logfile /var/log/endo.log
+
+# Stream a file into another program
+endos-downloader --stdout https://example.com/data.tar.gz | tar -xz
 
 # Check a file, and repair missing ranges using the URLs from its resume state or history
 endos-downloader --verify ~/Downloads/file.iso
