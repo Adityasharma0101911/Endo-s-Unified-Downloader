@@ -1212,9 +1212,26 @@ mod tests {
         Args::parse_from(std::iter::once("cli").chain(args.iter().copied()))
     }
 
-    /// A fresh, empty directory for one test.
-    fn test_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("hf-cli-{}-{}", name, std::process::id()));
+    /// A fresh, empty directory for one test, in a folder of this test process that the download
+    /// history and archive go to too (their variables are the whole process's, so they are set
+    /// once). Earlier runs' folders go once they are an hour old.
+    pub(crate) fn test_dir(name: &str) -> PathBuf {
+        static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        let root = ROOT.get_or_init(|| {
+            let temp = std::env::temp_dir();
+            let stale = |entry: &std::fs::DirEntry| {
+                let age = entry.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
+                entry.file_name().to_string_lossy().starts_with("hf-cli-tests-") && age.is_some_and(|age| age.as_secs() > 3600)
+            };
+            for entry in std::fs::read_dir(&temp).into_iter().flatten().flatten().filter(stale) {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+            let root = temp.join(format!("hf-cli-tests-{}", std::process::id()));
+            std::env::set_var("ENDO_HISTORY_PATH", root.join("history.json"));
+            std::env::set_var("ENDO_ARCHIVE_PATH", root.join("download-archive.txt"));
+            root
+        });
+        let dir = root.join(name);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -1971,9 +1988,9 @@ mod tests {
     async fn repair_skips_range_less_mirrors_and_verifies_the_result() {
         let data: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 251) as u8).collect();
         let server = serve(data.clone()).await;
+        // The repair runs through the engine, which records the finished file in this process's
+        // history (see `test_dir`).
         let dir = test_dir("repair");
-        // The repair runs through the engine, which records the finished file in history.
-        std::env::set_var("ENDO_HISTORY_PATH", dir.join("history.json"));
         let final_file = dir.join("data.bin");
         let part = dir.join("data.bin.part");
         let mut on_disk = data.clone();

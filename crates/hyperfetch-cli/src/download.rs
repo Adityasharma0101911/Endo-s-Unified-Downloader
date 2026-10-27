@@ -788,10 +788,7 @@ mod tests {
     /// its own (each download here needs two: the probe's HEAD and GET).
     #[tokio::test(flavor = "multi_thread")]
     async fn a_batch_shares_one_client() {
-        let dir = std::env::temp_dir().join(format!("hf-cli-shared-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("ENDO_HISTORY_PATH", dir.join("history.json"));
+        let dir = crate::tests::test_dir("shared");
         let body: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
         let (server, accepted) = keep_alive_server(body.clone()).await;
         let job = |name: &str| Job {
@@ -819,10 +816,7 @@ mod tests {
     /// left as it is (up to date); --logfile gets them with the other lines printed.
     #[tokio::test(flavor = "multi_thread")]
     async fn each_result_is_a_json_line_and_in_the_log() {
-        let dir = std::env::temp_dir().join(format!("hf-cli-json-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("ENDO_HISTORY_PATH", dir.join("history.json"));
+        let dir = crate::tests::test_dir("json");
         let body: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
         let (server, _) = keep_alive_server(body.clone()).await;
         let log = dir.join("out.log");
@@ -863,9 +857,7 @@ mod tests {
     /// A sign-in or token in a link an error names is printed, logged and reported without it.
     #[test]
     fn links_in_messages_lose_their_secrets() {
-        let dir = std::env::temp_dir().join(format!("hf-cli-redact-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::tests::test_dir("redact");
         let log = dir.join("out.log");
         let mut ui = Ui::new(true);
         ui.json = true;
@@ -887,10 +879,7 @@ mod tests {
     /// Downloads running at once stay within --max-speed together, not each on its own.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_batch_shares_the_speed_limit() {
-        let dir = std::env::temp_dir().join(format!("hf-cli-limit-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("ENDO_HISTORY_PATH", dir.join("history.json"));
+        let dir = crate::tests::test_dir("limit");
         let body: Vec<u8> = (0..96 * 1024u32).map(|i| (i % 251) as u8).collect();
         let (server, _) = keep_alive_server(body.clone()).await;
         let limit = 64 * 1024;
@@ -916,9 +905,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn only_the_downloads_that_need_ffmpeg_wait_for_the_answer() {
         use futures_util::FutureExt;
-        let dir = std::env::temp_dir().join(format!("hf-cli-ffmpeg-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::tests::test_dir("ffmpeg");
         let body: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
         let (server, _) = keep_alive_server(body.clone()).await;
         let jobs = || {
