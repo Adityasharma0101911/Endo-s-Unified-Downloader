@@ -253,6 +253,10 @@ pub struct HistoryEntry {
     pub started_at: u64,
     #[serde(default)]
     pub completed_at: Option<u64>,
+    /// The ETag the server sent with the file, which a download that replaces it only with a
+    /// newer one asks with (see `DownloadOptions::only_if_newer`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub etag: Option<String>,
 }
 
 impl HistoryEntry {
@@ -282,6 +286,7 @@ impl HistoryEntry {
             sha256_hash: None,
             started_at: now,
             completed_at: None,
+            etag: None,
         }
     }
 
@@ -601,11 +606,46 @@ fn pieces_path(history: &Path, blake3_hex: &str) -> Option<PathBuf> {
 /// pieces went bad. The file holds the piece size, then each piece's hash.
 pub(crate) fn save_pieces(history: &Path, blake3_hex: &str, piece: u64, hashes: &[[u8; 32]]) -> io::Result<()> {
     let path = pieces_path(history, blake3_hex).ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "not a BLAKE3 hash"))?;
+    #[cfg(test)]
+    if history == DownloadHistoryManager::default_history_path() && !test_pieces::KEPT.lock().unwrap().iter().any(|h| h == &blake3_hex.to_ascii_lowercase()) {
+        return Ok(());
+    }
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
     let bytes: Vec<u8> = piece.to_le_bytes().into_iter().chain(hashes.iter().flatten().copied()).collect();
     fs::write(path, bytes)
+}
+
+/// Unit tests share one history in the temp folder, which nothing deletes: their downloads keep
+/// piece hashes there only for a file a test names with [`test_pieces::Keep`], which removes them.
+#[cfg(test)]
+pub(crate) mod test_pieces {
+    use super::*;
+
+    pub(crate) static KEPT: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    /// Keeps the piece hashes of the file whose BLAKE3 is the hex it holds while it lives.
+    pub(crate) struct Keep(pub(crate) String);
+
+    impl Keep {
+        pub(crate) fn new(blake3_hex: &str) -> Self {
+            KEPT.lock().unwrap().push(blake3_hex.to_ascii_lowercase());
+            Self(blake3_hex.to_ascii_lowercase())
+        }
+    }
+
+    impl Drop for Keep {
+        fn drop(&mut self) {
+            KEPT.lock().unwrap().retain(|h| *h != self.0);
+            let history = DownloadHistoryManager::default_history_path();
+            if let Some(path) = pieces_path(&history, &self.0) {
+                let _ = fs::remove_file(path);
+            }
+            // Only when no other test's are in it.
+            let _ = fs::remove_dir(with_suffix(&history, ".pieces"));
+        }
+    }
 }
 
 /// The piece size and hashes [`save_pieces`] kept for a `size`-byte file, unless they are missing

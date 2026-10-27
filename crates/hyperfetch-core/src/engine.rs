@@ -10,10 +10,11 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use parking_lot::Mutex;
 use reqwest::header::{
-    HeaderMap, HeaderName, ACCEPT_ENCODING, ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_RANGE, CONTENT_TYPE, ETAG, LAST_MODIFIED,
-    RANGE,
+    HeaderMap, HeaderName, ACCEPT_ENCODING, ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_RANGE, CONTENT_TYPE, ETAG, IF_MODIFIED_SINCE,
+    IF_NONE_MATCH, LAST_MODIFIED, RANGE, USER_AGENT,
 };
 use reqwest::{Client, Response, StatusCode};
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
@@ -280,6 +281,36 @@ pub struct DownloadOptions {
     /// from another mirror when there are several. Not saved: a file may have thousands.
     #[serde(skip)]
     pub metalink_pieces: Option<crate::metalink::Pieces>,
+    /// TLS certificates are not checked: an expired, self-signed or wrong-host certificate is
+    /// taken, so anyone on the way can read and change the download. Logged once per download.
+    pub insecure: bool,
+    /// The IP version the connections use; `bind_addresses`, when set, decide it instead.
+    pub ip_family: IpFamily,
+    /// Seconds a connection may take to open (DNS, TCP and TLS).
+    pub connect_timeout_secs: u64,
+    /// The User-Agent sent in place of ours (and of the browser's, see `headers`).
+    pub user_agent: Option<String>,
+    /// The user's own request headers, sent like `secret_headers`: only to the hosts of the
+    /// download's own links, never along a redirect to another host, to mirrors or files it lists,
+    /// and never saved. One with CR or LF, or one the download sets itself (`Host`, `Range`,
+    /// `Content-Length`, `Transfer-Encoding`, `Connection`), fails the download.
+    #[serde(skip)]
+    pub extra_headers: Vec<(String, String)>,
+    /// Cookies (`"a=b; c=d"`) sent as `extra_headers` are, in place of a cookies file's for those
+    /// hosts. Never saved.
+    #[serde(skip)]
+    pub cookie_string: Option<String>,
+    /// Ignore `proxy`, `proxy_pool` and the system's proxy settings: connect directly.
+    pub no_proxy: bool,
+    /// When the file is there already, finished, it is downloaded again only if the server has a
+    /// newer one: asked with `If-Modified-Since` (the file's date) and `If-None-Match` (the ETag
+    /// history recorded for it), a 304, or an answer of the same size that is not newer, leaves
+    /// it as it is. A newer one is downloaded to `.part` and then takes the old file's place in one
+    /// rename: the only case where a download replaces a file. Implies `remote_time`. For direct
+    /// HTTP and FTP files.
+    pub only_if_newer: bool,
+    /// A live recording ends after this many seconds of it, finished as a stop ends it.
+    pub record_seconds: Option<u64>,
 }
 
 impl Default for DownloadOptions {
@@ -340,7 +371,60 @@ impl Default for DownloadOptions {
             remote_time: false,
             remote_checksum: true,
             metalink_pieces: None,
+            insecure: false,
+            ip_family: IpFamily::Any,
+            connect_timeout_secs: CONNECT_TIMEOUT.as_secs(),
+            user_agent: None,
+            extra_headers: Vec::new(),
+            cookie_string: None,
+            no_proxy: false,
+            only_if_newer: false,
+            record_seconds: None,
         }
+    }
+}
+
+/// The IP version a download's connections use (see `DownloadOptions::ip_family`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum IpFamily {
+    /// Whichever the system resolves and reaches.
+    #[default]
+    Any,
+    V4,
+    V6,
+}
+
+impl IpFamily {
+    /// The local address that keeps connections to this version: `0.0.0.0` or `::`.
+    pub(crate) fn local_address(self) -> Option<std::net::IpAddr> {
+        match self {
+            Self::Any => None,
+            Self::V4 => Some(std::net::Ipv4Addr::UNSPECIFIED.into()),
+            Self::V6 => Some(std::net::Ipv6Addr::UNSPECIFIED.into()),
+        }
+    }
+}
+
+/// The headers sent only to the hosts of a download's own links (see `Auth`): a paste's, the
+/// user's own and their cookie string.
+fn scoped_headers(options: &DownloadOptions) -> Vec<(String, String)> {
+    let cookie = options.cookie_string.iter().map(|cookie| ("Cookie".to_string(), cookie.clone()));
+    options.secret_headers.iter().chain(&options.extra_headers).cloned().chain(cookie).collect()
+}
+
+/// Refuses `extra_headers` that are no valid header or that the download sets itself, and a
+/// cookie string that is no valid header value.
+fn check_extra_headers(options: &DownloadOptions) -> Result<(), String> {
+    const OWN: [&str; 5] = ["host", "range", "content-length", "transfer-encoding", "connection"];
+    for (name, value) in &options.extra_headers {
+        if OWN.iter().any(|own| name.eq_ignore_ascii_case(own)) {
+            return Err(format!("The {name} header is set by the download itself"));
+        }
+        request_header(name, value).ok_or_else(|| format!("Invalid header {name:?} (no line breaks, a name of letters, digits and dashes)"))?;
+    }
+    match &options.cookie_string {
+        Some(cookie) if request_header("Cookie", cookie).is_none() => Err("Invalid cookie string (no line breaks)".to_string()),
+        _ => Ok(()),
     }
 }
 
@@ -359,13 +443,18 @@ pub struct ClientKey {
     headers: Vec<(String, String)>,
     http2: bool,
     bind_addresses: Vec<std::net::IpAddr>,
+    insecure: bool,
+    ip_family: IpFamily,
+    connect_timeout_secs: u64,
+    user_agent: Option<String>,
+    no_proxy: bool,
 }
 
 impl ClientKey {
     pub fn of(options: &DownloadOptions) -> Self {
         Self {
             credentials: options.auth_header.is_some(),
-            secret_headers: !options.secret_headers.is_empty(),
+            secret_headers: !scoped_headers(options).is_empty(),
             proxy: options.proxy.clone(),
             proxy_pool: options.proxy_pool.clone(),
             cookies_path: options.cookies_path.clone(),
@@ -373,6 +462,11 @@ impl ClientKey {
             headers: options.headers.clone(),
             http2: options.http2,
             bind_addresses: options.bind_addresses.clone(),
+            insecure: options.insecure,
+            ip_family: options.ip_family,
+            connect_timeout_secs: options.connect_timeout_secs,
+            user_agent: options.user_agent.clone(),
+            no_proxy: options.no_proxy,
         }
     }
 }
@@ -424,10 +518,17 @@ impl DownloadEngine {
         Self::with_client_result(urls, options, Ok(client))
     }
 
-    fn with_client_result(urls: Vec<Url>, options: DownloadOptions, client: Result<Client, String>) -> Self {
+    fn with_client_result(urls: Vec<Url>, mut options: DownloadOptions, client: Result<Client, String>) -> Self {
         // A "leaving this site" link stands for its target, as the front ends' ingest takes it:
         // that is what is downloaded, recorded, and given the credentials.
         let urls: Vec<Url> = urls.into_iter().map(|u| crate::resolver::unwrap_redirect(&u).unwrap_or(u)).collect();
+        // Nothing else of the download (yt-dlp, torrents, FTP, installs) goes through the proxy either.
+        if options.no_proxy {
+            (options.proxy, options.proxy_pool) = (None, Vec::new());
+        }
+        options.remote_time |= options.only_if_newer;
+        let client = client.and_then(|client| check_extra_headers(&options).map(|()| client));
+        let scoped = scoped_headers(&options);
         let client_pool = if options.proxy_pool.is_empty() && options.bind_addresses.is_empty() {
             client.as_ref().map(|c| vec![c.clone()]).map_err(|e| e.clone())
         } else {
@@ -435,7 +536,7 @@ impl DownloadEngine {
         };
         let auth = match (options.auth_header.as_deref(), options.referer.as_deref()) {
             (Some(value), referer) => match Auth::new(value, &urls) {
-                Ok(a) => Some(Arc::new(a.with_referer(referer.map(str::to_string)).with_headers(&options.secret_headers))),
+                Ok(a) => Some(Arc::new(a.with_referer(referer.map(str::to_string)).with_headers(&scoped))),
                 Err(e) => return Self {
                     limiter: None,
                     options,
@@ -452,8 +553,8 @@ impl DownloadEngine {
                 },
             },
             // A password alone adds no header, but is scoped as they are (see `media_options_for`).
-            (None, None) if options.secret_headers.is_empty() && options.password.is_none() => None,
-            (None, referer) => Some(Arc::new(Auth::only_referer(referer, &urls).with_headers(&options.secret_headers))),
+            (None, None) if scoped.is_empty() && options.password.is_none() => None,
+            (None, referer) => Some(Arc::new(Auth::only_referer(referer, &urls).with_headers(&scoped))),
         };
         Self {
             limiter: options.max_speed.filter(|&s| s > 0).map(|s| Arc::new(RateLimiter::new(s))),
@@ -505,6 +606,7 @@ impl DownloadEngine {
         &self,
         snapshot_tx: Option<broadcast::Sender<EngineSnapshot>>,
     ) -> Result<PathBuf, String> {
+        self.warn_if_insecure();
         let mut result = self.fetch_all(snapshot_tx.clone()).await;
         if let Err(error) = &result {
             if self.refuses_http1(error).await {
@@ -673,6 +775,131 @@ impl DownloadEngine {
     /// (see `DownloadOptions::remote_checksum`). Also in the last snapshots.
     pub fn checked_against(&self) -> Option<String> {
         self.site.lock().note.clone()
+    }
+
+    /// Whether `run` found its file there already, downloaded before or no older than the
+    /// server's (see `DownloadOptions::only_if_newer`), and left it as it was.
+    pub fn kept_existing(&self) -> bool {
+        self.already_done.lock().unwrap().is_some()
+    }
+
+    /// Says once per download that `DownloadOptions::insecure` leaves its TLS unchecked.
+    fn warn_if_insecure(&self) {
+        if self.options.insecure {
+            let link = self.urls.first().map(|u| redact_url(u.as_str())).unwrap_or_default();
+            tracing::warn!("TLS certificates are not checked for {link}: anyone on the way can read or change it");
+        }
+    }
+
+    /// See [`stream_to`].
+    async fn stream_into<W: AsyncWrite + Unpin>(&self, writer: &mut W) -> Result<u64, String> {
+        const DIRECT: &str = "streaming takes a direct file link";
+        self.warn_if_insecure();
+        let client = self.client.clone()?;
+        let options = &self.options;
+        let lists = |u: &Url| {
+            crate::mega::handles(u)
+                || crate::shares::lists(u)
+                || crate::cloud::lists(u)
+                || crate::repos::lists(u)
+                || crate::folders::lists(u)
+                || crate::feeds::lists(u)
+                || crate::media::lists(u)
+        };
+        let not_direct = |u: &Url| !matches!(u.scheme(), "http" | "https") || lists(u);
+        if options.bittorrent || options.hls || options.dash || options.playlist_text.is_some() || self.media_target().is_some() {
+            return Err(DIRECT.to_string());
+        }
+        if self.urls.iter().any(not_direct) {
+            return Err(DIRECT.to_string());
+        }
+        let resolved = self.resolve_all(&client).await?;
+        let url = resolved.first().ok_or("No URLs to download")?;
+        let manifest = [".m3u8", ".mpd"].iter().any(|ext| url.path().to_ascii_lowercase().ends_with(ext));
+        if not_direct(url) || manifest || crate::media::is_supported_media_site(url) {
+            return Err(DIRECT.to_string());
+        }
+        let stall = self.stall_timeout();
+        let _slot = hosts::acquire(url, options.max_connections_per_host).await;
+        let request = send(|u: &Url| authorize(client.get(u.clone()), self.auth.as_deref(), u).header(ACCEPT_ENCODING, "identity"), url);
+        let response = match tokio::time::timeout(stall, request).await {
+            Err(_) => return Err(format!("{url}: no answer within {}s", stall.as_secs())),
+            Ok(answer) => answer.map_err(|e| format!("{url}: {e}"))?,
+        };
+        if !response.status().is_success() {
+            return Err(format!("{url}: HTTP {}", response.status()));
+        }
+        let kind = response.headers().get(CONTENT_TYPE).and_then(|t| t.to_str().ok()).unwrap_or_default().to_ascii_lowercase();
+        if ["mpegurl", "dash+xml", "bittorrent"].iter().any(|t| kind.contains(t)) {
+            return Err(DIRECT.to_string());
+        }
+        let size = content_length(response.headers());
+        if let (Some(max), Some(size)) = (options.max_filesize, size) {
+            if size > max {
+                return Err(too_large(max, Some(size)));
+            }
+        }
+        let write_error = |e: std::io::Error| format!("Write error: {e}");
+        let (mut body, mut written) = (response.bytes_stream(), 0u64);
+        loop {
+            let next = tokio::time::timeout(stall, body.next()).await;
+            let bytes = match next.map_err(|_| format!("stalled: no data for {}s at offset {written}", stall.as_secs()))? {
+                None => break,
+                Some(bytes) => bytes.map_err(|e| format!("read error at offset {written}: {e}"))?,
+            };
+            if let Some(limiter) = &self.limiter {
+                limiter.acquire(bytes.len() as u64).await;
+            }
+            written += bytes.len() as u64;
+            if let Some(max) = options.max_filesize.filter(|&max| written > max) {
+                return Err(too_large(max, None));
+            }
+            writer.write_all(&bytes).await.map_err(write_error)?;
+        }
+        writer.flush().await.map_err(write_error)?;
+        match size {
+            Some(size) if written != size => Err(format!("connection closed after {written} of {size} bytes")),
+            _ => Ok(written),
+        }
+    }
+
+    /// Whether the server has a newer file than the finished one at `path` (see
+    /// `DownloadOptions::only_if_newer`): not when `remote`, its probe, gives the file's size and a
+    /// date no later than the file's, nor when a request with `If-Modified-Since` (the file's
+    /// date) and `If-None-Match` (the ETag history recorded for it) answers 304. FTP and MEGA files
+    /// go by the probe alone.
+    async fn newer_than(&self, client: &Client, remote: &ProbeInfo, path: &Path) -> bool {
+        let file = path.to_path_buf();
+        let found = blocking(move || {
+            let meta = std::fs::metadata(&file).ok().filter(|m| m.is_file())?;
+            let modified = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_secs();
+            let (path, size) = (absolute(&file), meta.len());
+            let history = DownloadHistoryManager::load_from_path(&DownloadHistoryManager::default_history_path());
+            let recorded = history.entries().iter().rev().filter(|e| e.status == HistoryStatus::Completed);
+            let etag = recorded.filter(|e| e.file_size == size && absolute(&e.file_path) == path).find_map(|e| e.etag.clone());
+            Some((size, modified, etag))
+        });
+        let Ok(Some((size, modified, etag))) = found.await else { return true };
+        let dated = remote.last_modified.as_deref().and_then(parse_http_date);
+        if remote.size == Some(size) && dated.is_some_and(|date| date <= modified) {
+            return false;
+        }
+        if self.ftp.is_some() || self.decrypt.is_some() {
+            return true;
+        }
+        let since = http_date(modified);
+        let ask = |url: &Url| {
+            let request = authorize(client.get(url.clone()), self.auth.as_deref(), url)
+                .header(RANGE, "bytes=0-0")
+                .header(ACCEPT_ENCODING, "identity")
+                .header(IF_MODIFIED_SINCE, since.as_str());
+            match &etag {
+                Some(etag) => request.header(IF_NONE_MATCH, etag.as_str()),
+                None => request,
+            }
+        };
+        let answer = tokio::time::timeout(self.stall_timeout(), send(ask, &remote.url)).await;
+        !matches!(answer, Ok(Ok(response)) if response.status() == StatusCode::NOT_MODIFIED)
     }
 
     /// Downloads what the resolved mirrors serve: an HLS stream if one is a playlist, by its URL
@@ -1070,7 +1297,7 @@ impl DownloadEngine {
             cookies,
             proxy: self.options.proxy.clone(),
             referer: self.options.referer.clone(),
-            headers: self.options.headers.clone(),
+            headers: self.options.headers.iter().cloned().chain(self.options.user_agent.clone().map(|ua| ("User-Agent".to_string(), ua))).collect(),
             output_dir,
             output_filename,
             custom_ytdlp_path: self.options.ytdlp_path.clone(),
@@ -1085,6 +1312,7 @@ impl DownloadEngine {
             merge_format: self.options.merge_format.clone(),
             video_password: None,
             login: None,
+            record_seconds: self.options.record_seconds,
         }
     }
 
@@ -1183,6 +1411,9 @@ impl DownloadEngine {
             cookies_path: None,
             auth_header: None,
             secret_headers: Vec::new(),
+            extra_headers: Vec::new(),
+            cookie_string: None,
+            only_if_newer: false,
             media_preset: None,
             browser_cookies: None,
             fsync_on_complete: false,
@@ -1280,7 +1511,7 @@ impl DownloadEngine {
         if self.options.expected_checksum.is_some() {
             tracing::info!("Checksum verification passed for {}", path.display());
         }
-        self.record_completed(path.clone(), None, blake3_hex, started_at, None).await;
+        self.record_completed(path.clone(), None, blake3_hex, started_at, None, None).await;
         Ok(path)
     }
 
@@ -1315,7 +1546,7 @@ impl DownloadEngine {
         engine.options.expected_checksum = None;
         engine.options.fsync_on_complete = false;
         let blake3_hex = engine.verify_written(&mp4, Written::File).await.map_err(|e| e.to_string())?;
-        self.record_completed(mp4.clone(), None, blake3_hex, started_at, Some(path)).await;
+        self.record_completed(mp4.clone(), None, blake3_hex, started_at, Some(path), None).await;
         Ok(mp4)
     }
 
@@ -1524,6 +1755,14 @@ impl DownloadEngine {
         let late = late.filter(|_| reference.accepts_ranges && reference.size != Some(reference.prefetch.len() as u64));
         let started_at = unix_now();
         let base = self.output_path_for(&reference.filename);
+        // A file there is replaced only by a newer one (see `DownloadOptions::only_if_newer`).
+        let replace = self.options.only_if_newer && base.is_file();
+        if replace && !self.newer_than(&client, &reference, &base).await {
+            tracing::info!("{} is up to date", base.display());
+            *self.already_done.lock().unwrap() = Some(base.clone());
+            emit(&snapshot_tx, || done_snapshot(crate::postprocess::size_of(&base), &base));
+            return Ok(base);
+        }
         // The mirrors, as resolvers made them of the links, among its URLs: a repair of the file
         // asks them, not a page the link was (see `naming`). A MEGA file keeps to its link (see
         // `fetch_mega`).
@@ -1541,7 +1780,7 @@ impl DownloadEngine {
                     std::fs::create_dir_all(dir).map_err(|e| format!("Failed to create {}: {}", dir.display(), e))?;
                 }
                 let history = DownloadHistoryManager::default_history_path();
-                plan_target(&base, &remote, &urls, &history, checksum.as_deref())
+                plan_target(&base, &remote, &urls, &history, checksum.as_deref(), replace)
             })
             .await?
         };
@@ -1602,6 +1841,8 @@ impl DownloadEngine {
             reference.accepts_ranges
         );
         let modified = reference.last_modified.clone().filter(|_| self.options.remote_time);
+        let replace = replace && final_path == base;
+        let etag = reference.etag.clone();
         // A MEGA file is held to its MAC; its server's answers are of the ciphertext.
         if self.decrypt.is_none() {
             crate::digest::look_for(&self.site, &self.options, &client, self.auth.clone(), &reference.url, &reference.headers);
@@ -1635,7 +1876,7 @@ impl DownloadEngine {
             }
             _ => Written::Digest(self.fetch_stream(&client, &reference, live, &part, &final_path, &snapshot_tx).await?),
         };
-        let done = this.finalize(final_path, claim, written, started_at, &snapshot_tx).await?;
+        let done = this.finalize(final_path, claim, written, started_at, &snapshot_tx, etag, replace).await?;
         if let Some(modified) = modified {
             let path = done.clone();
             blocking(move || set_remote_time(&path, &modified)).await?;
@@ -2021,7 +2262,10 @@ impl DownloadEngine {
     }
 
     /// Verifies the finished `.part` of `final_path`, moves it to its final name and records it in
-    /// history. The claim on the name is released only once the file is in place (or discarded).
+    /// history, with the server's `etag`. The claim on the name is released only once the file is
+    /// in place (or discarded). With `replace` (see `DownloadOptions::only_if_newer`) it takes the
+    /// place of the file at `final_path`, if it keeps that name.
+    #[allow(clippy::too_many_arguments)]
     async fn finalize(
         &self,
         final_path: PathBuf,
@@ -2029,6 +2273,8 @@ impl DownloadEngine {
         written: Written,
         started_at: u64,
         snapshot_tx: &Option<broadcast::Sender<EngineSnapshot>>,
+        etag: Option<String>,
+        replace: bool,
     ) -> Result<PathBuf, String> {
         let part = part_path(&final_path);
         let state_path = DownloadState::state_file_path(&part);
@@ -2057,9 +2303,10 @@ impl DownloadEngine {
         // A name from the server without a real extension takes the one its contents show.
         let by_content = self.options.output_path.as_deref().is_none_or(is_dir_target);
         let (target, size) = blocking(move || -> Result<(PathBuf, u64), String> {
-            let final_path = if by_content { crate::sniff::named_by_content(&part, final_path) } else { final_path };
-            // Someone may have created the final name while we were downloading.
-            let target = if final_path.exists() { free_path(&final_path) } else { final_path };
+            let named = if by_content { crate::sniff::named_by_content(&part, final_path.clone()) } else { final_path.clone() };
+            // Someone may have created the final name while we were downloading. The rename
+            // replaces the file only `replace` asks to replace, in one step.
+            let target = if named.exists() && !(replace && named == final_path) { free_path(&named) } else { named };
             let size = std::fs::metadata(&part).map(|m| m.len()).map_err(|e| e.to_string())?;
             std::fs::rename(&part, &target)
                 .map_err(|e| format!("Failed to move {} to {}: {}", part.display(), target.display(), e))?;
@@ -2071,7 +2318,7 @@ impl DownloadEngine {
         })
         .await??;
         tracing::info!("Download completed: {} (BLAKE3 {})", target.display(), blake3_hex);
-        self.record_completed(target.clone(), Some(size), blake3_hex, started_at, None).await;
+        self.record_completed(target.clone(), Some(size), blake3_hex, started_at, None, etag).await;
 
         emit(snapshot_tx, || EngineSnapshot { checked_against: self.checked_against(), ..done_snapshot(size, &target) });
         Ok(target)
@@ -2137,8 +2384,16 @@ impl DownloadEngine {
     /// Records `path` as completed in the download history, which is read only once, under its
     /// lock: it may have been edited (entries removed, other downloads finished) while this
     /// download ran. `size` is looked up if not given. `replaced`, the file `path` was made from
-    /// and took the place of, loses its entries in the same write.
-    async fn record_completed(&self, path: PathBuf, size: Option<u64>, blake3_hex: String, started_at: u64, replaced: Option<PathBuf>) {
+    /// and took the place of, loses its entries in the same write. `etag` is the server's.
+    async fn record_completed(
+        &self,
+        path: PathBuf,
+        size: Option<u64>,
+        blake3_hex: String,
+        started_at: u64,
+        replaced: Option<PathBuf>,
+        etag: Option<String>,
+    ) {
         let urls = self.url_strings();
         let _ = blocking(move || {
             let size = size.unwrap_or_else(|| std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0));
@@ -2146,6 +2401,7 @@ impl DownloadEngine {
             entry.downloaded_bytes = size;
             entry.status = HistoryStatus::Completed;
             entry.blake3_hash = Some(blake3_hex);
+            entry.etag = etag;
             entry.started_at = started_at;
             entry.completed_at = Some(unix_now());
             let history = DownloadHistoryManager::default_history_path();
@@ -2383,6 +2639,15 @@ pub fn build_client(options: &DownloadOptions) -> Result<Client, String> {
     build_client_with_proxy(options, options.proxy.as_deref())
 }
 
+/// Writes the file at `url` to `writer` as it arrives and returns how many bytes that was: over
+/// one connection, in order, with the client, headers, redirects and link resolvers a download
+/// with `options` has, the speed limit, stall timeout and `max_filesize` included, but no `.part`,
+/// resume state, retries or history. Media, torrent, FTP, folder and listing links fail
+/// ("streaming takes a direct file link").
+pub async fn stream_to<W: AsyncWrite + Unpin>(url: Url, options: DownloadOptions, mut writer: W) -> Result<u64, String> {
+    DownloadEngine::new(vec![url], options).stream_into(&mut writer).await
+}
+
 /// Builds an HTTP client with the specified proxy URL override (if any).
 pub fn build_client_with_proxy(options: &DownloadOptions, proxy_url: Option<&str>) -> Result<Client, String> {
     build_route_client(options, proxy_url, None)
@@ -2400,22 +2665,29 @@ fn build_route_client(options: &DownloadOptions, proxy_url: Option<&str>, local:
     for (name, value) in options.headers.iter().filter_map(|(name, value)| request_header(name, value)) {
         headers.insert(name, value);
     }
+    if let Some(agent) = &options.user_agent {
+        let agent = reqwest::header::HeaderValue::from_str(agent).map_err(|_| "Invalid User-Agent (no line breaks)".to_string())?;
+        headers.insert(USER_AGENT, agent);
+    }
 
     // One TCP connection per worker: over HTTP/2 every "connection" would be a stream
     // multiplexed onto a single TCP connection, defeating multi-connection downloads. Only a
     // server that refuses HTTP/1.1 is worth that (see `DownloadOptions::http2`).
     let builder = if options.http2 { Client::builder() } else { Client::builder().http1_only() };
+    // Bound to `0.0.0.0` (or `::`), a connection only goes to the addresses of that version.
+    let local = local.or(options.ip_family.local_address().filter(|_| options.bind_addresses.is_empty()));
     let mut builder = builder
         .tcp_nodelay(true)
-        .connect_timeout(CONNECT_TIMEOUT)
+        .connect_timeout(Duration::from_secs(options.connect_timeout_secs.max(1)))
         .tcp_keepalive(Duration::from_secs(30))
         .local_address(local)
         .pool_max_idle_per_host(POOL_MAX_IDLE)
         .pool_idle_timeout(Some(POOL_IDLE))
+        .danger_accept_invalid_certs(options.insecure)
         .default_headers(headers);
 
     let auth_header = options.auth_header.is_some();
-    let secret_headers = !options.secret_headers.is_empty();
+    let secret_headers = !scoped_headers(options).is_empty();
     builder = builder.redirect(reqwest::redirect::Policy::custom(move |attempt| {
         let target_url = attempt.url();
         let target_host = target_url.host_str().unwrap_or("").to_ascii_lowercase();
@@ -2446,7 +2718,9 @@ fn build_route_client(options: &DownloadOptions, proxy_url: Option<&str>, local:
         }
     }));
 
-    if let Some(proxy_url) = proxy_url {
+    if options.no_proxy {
+        builder = builder.no_proxy();
+    } else if let Some(proxy_url) = proxy_url {
         let proxy = reqwest::Proxy::all(proxy_url).map_err(|e| format!("Invalid proxy URL {}: {}", proxy_url, e))?;
         builder = builder.proxy(proxy);
     }
@@ -3668,21 +3942,25 @@ pub fn discard_partial(final_path: &Path) -> Result<usize, String> {
 /// `.part` or is free. Existing files, claimed names and other downloads' `.part` files are never
 /// touched. Our `.part` holding progress that no mirror can resume right now (`remote` takes ranges
 /// if any mirror serving the file does) fails the plan and is kept. The history file at
-/// `history_path` is read only if an existing file has to be compared with it.
+/// `history_path` is read only if an existing file has to be compared with it. With `replace`
+/// (see `DownloadOptions::only_if_newer`), the file at `base` is taken to be replaced, when the
+/// name can be claimed.
 fn plan_target(
     base: &Path,
     remote: &ProbeInfo,
     urls: &[String],
     history_path: &Path,
     checksum: Option<&str>,
+    replace: bool,
 ) -> Result<Plan, String> {
     let loaded = std::cell::OnceCell::new();
     let history = || loaded.get_or_init(|| DownloadHistoryManager::load_from_path(history_path));
     let mut n = 0;
     loop {
         let candidate = numbered(base, n);
+        let replacing = replace && n == 0;
         n += 1;
-        if already_downloaded(&candidate, remote, urls, history, checksum) {
+        if !replacing && already_downloaded(&candidate, remote, urls, history, checksum) {
             return Ok(Plan::AlreadyDone(candidate));
         }
         // A running download owns this name, whether or not its `.part` exists yet.
@@ -3692,7 +3970,7 @@ fn plan_target(
         let part = part_path(&candidate);
         let part_state = DownloadState::state_file_path(&part);
 
-        if candidate.exists() && (part.exists() || !migrate_legacy(&candidate, &part, remote, urls)?) {
+        if candidate.exists() && !replacing && (part.exists() || !migrate_legacy(&candidate, &part, remote, urls)?) {
             continue;
         }
 
@@ -4210,6 +4488,25 @@ fn parse_http_date(value: &str) -> Option<u64> {
     u64::try_from(days_from_civil(year, month, day) * 86_400 + h * 3600 + m * 60 + s).ok()
 }
 
+/// Unix seconds as an IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`), the inverse of
+/// [`parse_http_date`] (Howard Hinnant's civil-from-days).
+fn http_date(secs: u64) -> String {
+    const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let (days, time) = ((secs / 86_400) as i64, secs % 86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    let (weekday, month) = (DAYS[days.rem_euclid(7) as usize], MONTHS[month as usize - 1]);
+    format!("{weekday}, {day:02} {month} {year:04} {:02}:{:02}:{:02} GMT", time / 3600, time / 60 % 60, time % 60)
+}
+
 /// Days from 1970-01-01 to the civil date (Howard Hinnant's algorithm).
 pub(crate) fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let y = if month <= 2 { year - 1 } else { year };
@@ -4470,6 +4767,13 @@ mod tests {
             DownloadOptions { proxy: Some("http://p:8080".into()), ..DownloadOptions::default() },
             DownloadOptions { cookies_path: Some("c.txt".into()), ..DownloadOptions::default() },
             DownloadOptions { headers: vec![("Origin".into(), "https://page.example".into())], ..DownloadOptions::default() },
+            DownloadOptions { extra_headers: vec![("X-Team".into(), "x".into())], ..DownloadOptions::default() },
+            DownloadOptions { cookie_string: Some("a=b".into()), ..DownloadOptions::default() },
+            DownloadOptions { insecure: true, ..DownloadOptions::default() },
+            DownloadOptions { ip_family: IpFamily::V6, ..DownloadOptions::default() },
+            DownloadOptions { connect_timeout_secs: 3, ..DownloadOptions::default() },
+            DownloadOptions { user_agent: Some("A/1".into()), ..DownloadOptions::default() },
+            DownloadOptions { no_proxy: true, ..DownloadOptions::default() },
         ] {
             assert_ne!(ClientKey::of(&base), ClientKey::of(&other));
         }
@@ -5798,7 +6102,7 @@ mod tests {
         let history = dir.path().join("h.json");
         // Another download planned this name but has not created its .part yet.
         let other = Claim::try_take(&base).unwrap().unwrap();
-        match plan_target(&base, &remote(1000), &urls(), &history, None).unwrap() {
+        match plan_target(&base, &remote(1000), &urls(), &history, None, false).unwrap() {
             Plan::Fetch { final_path, resume: None, .. } => assert_eq!(final_path, dir.path().join("file (1).bin")),
             other => panic!("{other:?}"),
         }
@@ -5811,7 +6115,7 @@ mod tests {
         state.save_atomic(&DownloadState::state_file_path(&part_path(&base))).unwrap();
         let live = Claim::try_take(&base).unwrap().unwrap();
         assert!(matches!(
-            plan_target(&base, &remote(1000), &urls(), &history, None).unwrap(),
+            plan_target(&base, &remote(1000), &urls(), &history, None, false).unwrap(),
             Plan::Fetch { ref final_path, .. } if *final_path == dir.path().join("file (1).bin")
         ));
         assert!(part_path(&base).exists(), "a live download's .part must survive");
@@ -6164,6 +6468,163 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_http_date_is_what_parse_http_date_reads() {
+        assert_eq!(http_date(784_111_777), "Sun, 06 Nov 1994 08:49:37 GMT");
+        // The epoch, a leap day, the last second of a year.
+        for secs in [0, 951_825_600, 4_102_444_799, 1_761_523_200] {
+            assert_eq!(parse_http_date(&http_date(secs)), Some(secs), "{}", http_date(secs));
+        }
+    }
+
+    /// The user's own headers and cookie string go to the link's host only, not along a
+    /// redirect to another host, which still serves the download; the User-Agent goes everywhere.
+    /// A header the download sets itself, or one with a line break, fails the download.
+    #[tokio::test]
+    async fn test_extra_headers_and_cookie_stay_with_the_links_host() {
+        const FILE: &str = "HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\nPAYLOAD";
+        let (own, other) = (Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(Vec::new())));
+        let seen = Arc::clone(&other);
+        let elsewhere = answering_server(move |head| {
+            seen.lock().push(head.to_string());
+            FILE.to_string()
+        })
+        .await;
+        // The other server, under another name.
+        let moved = format!("http://localhost:{}/file.bin", elsewhere.port().unwrap());
+        let seen = Arc::clone(&own);
+        let url = answering_server(move |head| {
+            seen.lock().push(head.to_string());
+            match head.split_whitespace().nth(1) {
+                Some("/moved.bin") => format!("HTTP/1.1 302 Found\r\nLocation: {moved}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
+                _ => FILE.to_string(),
+            }
+        })
+        .await;
+        let dir = tempdir().unwrap();
+        let options = |name: &str| DownloadOptions {
+            output_path: Some(dir.path().join(name)),
+            extra_headers: vec![("X-Team".into(), "t-secret".into())],
+            cookie_string: Some("sid=c-secret; theme=dark".into()),
+            user_agent: Some("TestAgent/1".into()),
+            remote_checksum: false,
+            ..Default::default()
+        };
+        for name in ["direct.bin", "moved.bin"] {
+            let saved = DownloadEngine::new(vec![url.join(name).unwrap()], options(name)).run(None).await.unwrap();
+            assert_eq!(std::fs::read(saved).unwrap(), b"PAYLOAD", "{name}");
+        }
+        for head in own.lock().iter() {
+            for line in ["x-team: t-secret", "cookie: sid=c-secret; theme=dark", "user-agent: testagent/1"] {
+                assert!(head.lines().any(|l| l == line), "{line} missing from {head}");
+            }
+        }
+        let other = other.lock().clone();
+        assert!(!other.is_empty(), "the redirect was not followed");
+        for head in &other {
+            assert!(!head.contains("secret") && head.lines().any(|l| l == "user-agent: testagent/1"), "{head}");
+        }
+        let asked = own.lock().len();
+        for (name, value) in [("Host", "x"), ("range", "bytes=0-1"), ("X-Bad", "a\r\nInjected: 1"), ("Bad Name", "v")] {
+            let options = DownloadOptions { extra_headers: vec![(name.into(), value.into())], ..options("bad.bin") };
+            assert!(DownloadEngine::new(vec![url.join("direct.bin").unwrap()], options).run(None).await.is_err(), "{name}");
+        }
+        let options = DownloadOptions { cookie_string: Some("a=b\nc=d".into()), ..options("bad.bin") };
+        assert!(DownloadEngine::new(vec![url.join("direct.bin").unwrap()], options).run(None).await.is_err());
+        assert_eq!(own.lock().len(), asked, "refused before anything is asked");
+    }
+
+    /// IPv4 or IPv6 only: connections go only to addresses of that version.
+    #[tokio::test]
+    async fn test_ip_family_keeps_connections_to_its_version() {
+        let answer = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+        let url = answering_server(move |_| answer.to_string()).await.join("f.bin").unwrap();
+        assert!(url.host_str().is_some_and(|host| host.parse::<std::net::Ipv4Addr>().is_ok()), "{url}");
+        let dir = tempdir().unwrap();
+        for (family, reaches) in [(IpFamily::Any, true), (IpFamily::V4, true), (IpFamily::V6, false)] {
+            let options = DownloadOptions {
+                output_path: Some(dir.path().join(format!("{family:?}.bin"))),
+                ip_family: family,
+                remote_checksum: false,
+                ..Default::default()
+            };
+            assert_eq!(DownloadEngine::new(vec![url.clone()], options).run(None).await.is_ok(), reaches, "{family:?}");
+        }
+    }
+
+    /// With `only_if_newer` a file there stays while the server has no newer one (the same size
+    /// and no later date, or a 304 to its date and recorded ETag), and a newer one takes its place.
+    #[tokio::test]
+    async fn test_only_if_newer_replaces_a_file_only_with_a_newer_one() {
+        let served = Arc::new(Mutex::new(("old!", "Sun, 06 Nov 1994 08:49:37 GMT", "\"v1\"")));
+        let asked: Arc<Mutex<Vec<String>>> = Arc::default();
+        let (now, seen) = (Arc::clone(&served), Arc::clone(&asked));
+        let url = answering_server(move |head| {
+            seen.lock().push(head.to_string());
+            let (body, date, etag) = *now.lock();
+            if head.lines().any(|l| l == format!("if-none-match: {etag}")) {
+                return "HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n".to_string();
+            }
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nLast-Modified: {date}\r\nETag: {etag}\r\nConnection: close\r\n\r\n{body}", body.len())
+        })
+        .await
+        .join("f.bin")
+        .unwrap();
+        let dir = tempdir().unwrap();
+        let options = DownloadOptions { output_path: Some(dir.path().to_path_buf()), only_if_newer: true, remote_checksum: false, ..Default::default() };
+        let fetch = || {
+            let engine = DownloadEngine::new(vec![url.clone()], options.clone());
+            async move { (engine.run(None).await, engine.kept_existing()) }
+        };
+        let file = dir.path().join("f.bin");
+        assert_eq!(fetch().await, (Ok(file.clone()), false));
+        let dated = |secs: u64| std::fs::metadata(&file).unwrap().modified().unwrap() == UNIX_EPOCH + Duration::from_secs(secs);
+        assert!(dated(784_111_777), "it implies remote_time");
+
+        // The same size and date: up to date from the probe alone.
+        let before = asked.lock().len();
+        assert_eq!(fetch().await, (Ok(file.clone()), true));
+        assert!(asked.lock()[before..].iter().all(|head| !head.contains("if-none-match")));
+        // A later date, but the same ETag: the server says 304.
+        *served.lock() = ("old!", "Mon, 07 Nov 1994 08:49:37 GMT", "\"v1\"");
+        let before = asked.lock().len();
+        assert_eq!(fetch().await, (Ok(file.clone()), true));
+        let conditional = asked.lock()[before..].iter().find(|head| head.contains("if-none-match")).cloned().unwrap();
+        assert!(conditional.lines().any(|l| l == "if-modified-since: sun, 06 nov 1994 08:49:37 gmt"), "{conditional}");
+        assert_eq!(std::fs::read(&file).unwrap(), b"old!");
+        // A newer file replaces it, under its name.
+        *served.lock() = ("new content", "Tue, 08 Nov 1994 08:49:37 GMT", "\"v2\"");
+        assert_eq!(fetch().await, (Ok(file.clone()), false));
+        assert_eq!(std::fs::read(&file).unwrap(), b"new content");
+        assert!(dated(784_111_777 + 2 * 86_400));
+        let mut names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        names.sort();
+        assert_eq!(names, ["f.bin"]);
+    }
+
+    /// `stream_to` writes a direct file's bytes in order, within `max_filesize`, and refuses a
+    /// link that is no direct file.
+    #[tokio::test]
+    async fn test_stream_to_writes_a_direct_files_bytes() {
+        let body = "0123456789".repeat(1000);
+        let answer = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        let url = answering_server(move |_| answer.clone()).await.join("f.bin").unwrap();
+        let mut out = Vec::new();
+        assert_eq!(stream_to(url.clone(), DownloadOptions::default(), &mut out).await, Ok(body.len() as u64));
+        assert!(out == body.as_bytes());
+        let limited = DownloadOptions { max_filesize: Some(100), ..Default::default() };
+        assert!(stream_to(url, limited, &mut Vec::new()).await.unwrap_err().starts_with("File is larger than the limit"));
+        for link in [
+            "ftp://h.example/f.bin",
+            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "https://github.com/owner/repo",
+        ] {
+            let refused = stream_to(Url::parse(link).unwrap(), DownloadOptions::default(), &mut Vec::new()).await;
+            assert_eq!(refused, Err("streaming takes a direct file link".to_string()), "{link}");
+        }
+    }
+
     /// A download larger than the free space on its disk fails before anything is written.
     #[tokio::test]
     async fn test_a_download_larger_than_the_free_space_fails_at_once() {
@@ -6427,7 +6888,7 @@ mod tests {
         let base = dir.path().join("file.bin");
         std::fs::write(&base, vec![7u8; 1000]).unwrap(); // same name AND same size
         let history = dir.path().join("h.json");
-        match plan_target(&base, &remote(1000), &urls(), &history, None).unwrap() {
+        match plan_target(&base, &remote(1000), &urls(), &history, None, false).unwrap() {
             Plan::Fetch { final_path, resume: None, .. } => assert_eq!(final_path, dir.path().join("file (1).bin")),
             other => panic!("{other:?}"),
         }
@@ -6446,18 +6907,18 @@ mod tests {
         // Same name and URL, but recorded in another directory: not this file.
         let elsewhere = dir.path().join("other").join("file.bin");
         recorded.add_or_update(completed_entry(&elsewhere, 1000, urls()));
-        assert!(matches!(plan_target(&base, &remote(1000), &urls(), &history, None).unwrap(), Plan::Fetch { .. }));
+        assert!(matches!(plan_target(&base, &remote(1000), &urls(), &history, None, false).unwrap(), Plan::Fetch { .. }));
 
         recorded.add_or_update(completed_entry(&base, 1000, urls()));
         assert!(matches!(
-            plan_target(&base, &remote(1000), &urls(), &history, None).unwrap(),
+            plan_target(&base, &remote(1000), &urls(), &history, None, false).unwrap(),
             Plan::AlreadyDone(p) if p == base
         ));
         // Different size on the server now, or modified after we fetched it: download again.
-        assert!(matches!(plan_target(&base, &remote(1001), &urls(), &history, None).unwrap(), Plan::Fetch { .. }));
+        assert!(matches!(plan_target(&base, &remote(1001), &urls(), &history, None, false).unwrap(), Plan::Fetch { .. }));
         let mut newer = remote(1000);
         newer.last_modified = Some("Fri, 01 Jan 2100 00:00:00 GMT".into());
-        assert!(matches!(plan_target(&base, &newer, &urls(), &history, None).unwrap(), Plan::Fetch { .. }));
+        assert!(matches!(plan_target(&base, &newer, &urls(), &history, None, false).unwrap(), Plan::Fetch { .. }));
     }
 
     /// History saved a link without its secret, which may have named the file (`object_key=`
@@ -6473,16 +6934,16 @@ mod tests {
         DownloadHistoryManager::load_from_path(&history).add_or_update(completed_entry(&base, 1000, vec![link("a.bin")]));
         let mut older = remote(1000);
         older.last_modified = Some("Thu, 01 Jan 1970 00:00:00 GMT".into());
-        match plan_target(&base, &older, &[link("b.bin")], &history, None).unwrap() {
+        match plan_target(&base, &older, &[link("b.bin")], &history, None, false).unwrap() {
             Plan::Fetch { final_path, .. } => assert_eq!(final_path, dir.path().join("file (1).bin")),
             other => panic!("b.bin was taken for a.bin: {other:?}"),
         }
-        assert!(matches!(plan_target(&base, &older, &[link("a.bin")], &history, None).unwrap(), Plan::Fetch { .. }));
+        assert!(matches!(plan_target(&base, &older, &[link("a.bin")], &history, None, false).unwrap(), Plan::Fetch { .. }));
 
         let landed = "http://files.example/a.bin".to_string();
         DownloadHistoryManager::load_from_path(&history).add_or_update(completed_entry(&base, 1000, vec![link("a.bin"), landed.clone()]));
         assert!(matches!(
-            plan_target(&base, &older, &[link("a.bin"), landed], &history, None).unwrap(),
+            plan_target(&base, &older, &[link("a.bin"), landed], &history, None, false).unwrap(),
             Plan::AlreadyDone(p) if p == base
         ));
     }
@@ -6495,8 +6956,8 @@ mod tests {
         let history = dir.path().join("h.json");
         let good = Some("md5:5d41402abc4b2a76b9719d911017c592");
         let bad = Some("md5:00000000000000000000000000000000");
-        assert!(matches!(plan_target(&base, &remote(5), &urls(), &history, good).unwrap(), Plan::AlreadyDone(_)));
-        assert!(matches!(plan_target(&base, &remote(5), &urls(), &history, bad).unwrap(), Plan::Fetch { .. }));
+        assert!(matches!(plan_target(&base, &remote(5), &urls(), &history, good, false).unwrap(), Plan::AlreadyDone(_)));
+        assert!(matches!(plan_target(&base, &remote(5), &urls(), &history, bad, false).unwrap(), Plan::Fetch { .. }));
     }
 
     #[test]
@@ -6509,7 +6970,7 @@ mod tests {
 
         std::fs::write(&part, vec![1u8; 1000]).unwrap();
         state_for(1000, "\"v1\"", urls()).save_atomic(&part_state).unwrap();
-        match plan_target(&base, &remote(1000), &urls(), &history, None).unwrap() {
+        match plan_target(&base, &remote(1000), &urls(), &history, None, false).unwrap() {
             Plan::Fetch { final_path, resume: Some(state), .. } => {
                 assert_eq!(final_path, base);
                 assert_eq!(state.completed_ranges, vec![ByteRange::new(0, 499).unwrap()]);
@@ -6521,14 +6982,14 @@ mod tests {
         // say): the progress cannot resume, and it is not stale either, so it is kept.
         let mut no_ranges = remote(1000);
         no_ranges.accepts_ranges = false;
-        let err = plan_target(&base, &no_ranges, &urls(), &history, None).unwrap_err();
+        let err = plan_target(&base, &no_ranges, &urls(), &history, None, false).unwrap_err();
         assert!(err.contains("kept"), "{err}");
         assert!(part.exists() && part_state.exists() && !lock_path(&base).exists());
         // Unless the probe brought the whole file: then nothing is lost.
         let mut whole = no_ranges.clone();
         whole.prefetch = Bytes::from(vec![1u8; 1000]);
         assert!(matches!(
-            plan_target(&base, &whole, &urls(), &history, None).unwrap(),
+            plan_target(&base, &whole, &urls(), &history, None, false).unwrap(),
             Plan::Fetch { resume: None, ref final_path, .. } if *final_path == base
         ));
         assert!(!part.exists() && !part_state.exists());
@@ -6539,7 +7000,7 @@ mod tests {
         let mut changed = remote(1000);
         changed.etag = Some("\"v2\"".into());
         assert!(matches!(
-            plan_target(&base, &changed, &urls(), &history, None).unwrap(),
+            plan_target(&base, &changed, &urls(), &history, None, false).unwrap(),
             Plan::Fetch { resume: None, ref final_path, .. } if *final_path == base
         ));
         assert!(!part.exists() && !part_state.exists());
@@ -6550,7 +7011,7 @@ mod tests {
         nothing.completed_ranges.clear();
         nothing.save_atomic(&part_state).unwrap();
         assert!(matches!(
-            plan_target(&base, &no_ranges, &urls(), &history, None).unwrap(),
+            plan_target(&base, &no_ranges, &urls(), &history, None, false).unwrap(),
             Plan::Fetch { resume: None, ref final_path, .. } if *final_path == base
         ));
         assert!(!part.exists() && !part_state.exists());
@@ -6559,7 +7020,7 @@ mod tests {
         std::fs::write(&part, vec![1u8; 1000]).unwrap();
         state_for(1000, "\"v1\"", vec!["http://other.example/x".into()]).save_atomic(&part_state).unwrap();
         assert!(matches!(
-            plan_target(&base, &remote(1000), &urls(), &history, None).unwrap(),
+            plan_target(&base, &remote(1000), &urls(), &history, None, false).unwrap(),
             Plan::Fetch { ref final_path, .. } if *final_path == dir.path().join("file (1).bin")
         ));
         assert!(part.exists());
@@ -6567,7 +7028,7 @@ mod tests {
         // So is a .part without any state.
         std::fs::remove_file(&part_state).unwrap();
         assert!(matches!(
-            plan_target(&base, &remote(1000), &urls(), &history, None).unwrap(),
+            plan_target(&base, &remote(1000), &urls(), &history, None, false).unwrap(),
             Plan::Fetch { ref final_path, .. } if *final_path == dir.path().join("file (1).bin")
         ));
     }
@@ -6580,7 +7041,7 @@ mod tests {
         state_for(1000, "\"v1\"", urls()).save_atomic(&DownloadState::state_file_path(&base)).unwrap();
         let history = dir.path().join("h.json");
 
-        match plan_target(&base, &remote(1000), &urls(), &history, None).unwrap() {
+        match plan_target(&base, &remote(1000), &urls(), &history, None, false).unwrap() {
             Plan::Fetch { final_path, resume: Some(_), .. } => assert_eq!(final_path, base),
             other => panic!("{other:?}"),
         }
@@ -6610,10 +7071,10 @@ mod tests {
         let reads = || crate::history::READS.with(std::cell::Cell::get);
         let before = reads();
 
-        assert!(matches!(plan_target(&base, &remote(1000), &urls(), &history, None).unwrap(), Plan::Fetch { .. }));
+        assert!(matches!(plan_target(&base, &remote(1000), &urls(), &history, None, false).unwrap(), Plan::Fetch { .. }));
         assert_eq!(reads(), before, "no file to judge, so no history to read");
         std::fs::write(&base, vec![7u8; 1000]).unwrap();
-        assert!(matches!(plan_target(&base, &remote(1000), &urls(), &history, None).unwrap(), Plan::AlreadyDone(_)));
+        assert!(matches!(plan_target(&base, &remote(1000), &urls(), &history, None, false).unwrap(), Plan::AlreadyDone(_)));
         assert_eq!(reads(), before + 1);
     }
 
@@ -6641,7 +7102,7 @@ mod tests {
         std::io::Write::write_all(&mut File::options().write(true).open(part_path(&target)).unwrap(), &on_disk).unwrap();
         let engine = engine_with(DownloadOptions { expected_checksum: checksum.clone(), ..Default::default() });
         let claim = Claim::try_take(&target).unwrap().unwrap();
-        let done = engine.finalize(target.clone(), claim, Written::Writer(writer), unix_now(), &None).await;
+        let done = engine.finalize(target.clone(), claim, Written::Writer(writer), unix_now(), &None, None, false).await;
         assert_eq!(done.unwrap(), target);
         assert_eq!(std::fs::read(&target).unwrap(), on_disk);
 
@@ -6649,7 +7110,7 @@ mod tests {
         let target = dir.path().join("discarded.bin");
         let writer = written_part(&target, &seen);
         let claim = Claim::try_take(&target).unwrap().unwrap();
-        let err = engine.finalize(target.clone(), claim, Written::Writer(writer), unix_now(), &None).await.unwrap_err();
+        let err = engine.finalize(target.clone(), claim, Written::Writer(writer), unix_now(), &None, None, false).await.unwrap_err();
         assert!(err.contains("Checksum verification failed"), "{err}");
         assert!(!part_path(&target).exists() && !target.exists());
     }
@@ -6662,7 +7123,7 @@ mod tests {
             let writer = written_part(&target, b"abc");
             let engine = engine_with(DownloadOptions { fsync_on_complete: fsync, ..Default::default() });
             let claim = Claim::try_take(&target).unwrap().unwrap();
-            let done = engine.finalize(target.clone(), claim, Written::Writer(writer.clone()), unix_now(), &None).await;
+            let done = engine.finalize(target.clone(), claim, Written::Writer(writer.clone()), unix_now(), &None, None, false).await;
             assert_eq!(done.unwrap(), target);
             assert_eq!(writer.sync_count(), usize::from(fsync), "fsync_on_complete: {fsync}");
             assert_eq!(std::fs::read(&target).unwrap(), b"abc");

@@ -20,7 +20,7 @@ use tokio::net::{TcpSocket, TcpStream};
 use url::{Host, Url};
 
 use crate::chunk::{Chunk, StealRule, StealTiming};
-use crate::engine::{DownloadOptions, CONNECT_TIMEOUT};
+use crate::engine::DownloadOptions;
 use crate::hosts::{self, HostSlot};
 use crate::worker::{FailureKind, WorkerEvent, WorkerShared};
 
@@ -61,7 +61,8 @@ pub(crate) struct Net {
     connect_timeout: Duration,
     /// Longest wait for a reply.
     reply_timeout: Duration,
-    /// Local addresses connections go out from, in turn (see `DownloadOptions::bind_addresses`).
+    /// Local addresses connections go out from, in turn (see `DownloadOptions::bind_addresses`
+    /// and `ip_family`).
     locals: Vec<IpAddr>,
     /// User and password by server (`host:port`), taken out of the links.
     logins: Vec<(String, (String, String))>,
@@ -99,10 +100,15 @@ impl Net {
         if links.is_empty() {
             return Err("No ftp:// link to download".to_string());
         }
+        let locals = match options.bind_addresses.is_empty() {
+            // `0.0.0.0` or `::` keeps the connections to that IP version.
+            true => options.ip_family.local_address().into_iter().collect(),
+            false => options.bind_addresses.clone(),
+        };
         let net = Self {
-            connect_timeout: CONNECT_TIMEOUT,
+            connect_timeout: Duration::from_secs(options.connect_timeout_secs.max(1)),
             reply_timeout: Duration::from_secs(options.stall_timeout_secs.max(1)),
-            locals: options.bind_addresses.clone(),
+            locals,
             logins,
         };
         Ok((net, links))
@@ -818,6 +824,18 @@ mod tests {
 
     fn options_into(dir: &std::path::Path, connections: usize) -> DownloadOptions {
         DownloadOptions { output_path: Some(dir.join("")), num_connections: connections, ..Default::default() }
+    }
+
+    /// Connections open within `connect_timeout_secs`, from `0.0.0.0` or `::` for one IP version,
+    /// unless local addresses are given.
+    #[test]
+    fn connections_take_the_ip_version_and_connect_timeout() {
+        let url = Url::parse("ftp://h.example/f.bin").unwrap();
+        let v6 = DownloadOptions { ip_family: crate::engine::IpFamily::V6, connect_timeout_secs: 3, ..Default::default() };
+        let (net, _) = Net::new(&v6, std::slice::from_ref(&url)).unwrap();
+        assert_eq!((net.locals, net.connect_timeout), (vec![IpAddr::from(std::net::Ipv6Addr::UNSPECIFIED)], Duration::from_secs(3)));
+        let bound = DownloadOptions { bind_addresses: vec![IpAddr::from([10, 0, 0, 1])], ..v6 };
+        assert_eq!(Net::new(&bound, &[url]).unwrap().0.locals, bound.bind_addresses);
     }
 
     /// Anonymous, over several connections, each starting where REST says, each reading its range;
