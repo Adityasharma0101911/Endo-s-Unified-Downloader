@@ -16,6 +16,7 @@
 The user works on this PC (32 threads, 32 GB RAM) while you build and test, so builds and tests must leave it usable. A past session filled the disk with a single 200 GB file. Don't let that happen again.
 
 - Set `CARGO_BUILD_JOBS=8` on every cargo command, and keep `--test-threads=4`.
+- Run cargo, node and headless Edge at below-normal priority, so games and the user's apps come first. In Git Bash that's `nice -n 10 cargo ...`; the compiler processes inherit the priority.
 - Run one cargo build or test at a time, across every agent and subagent. Parallel agents take turns on the one `target` folder and never build side by side.
 - Don't use separate git worktrees (or `isolation: "worktree"`) for Rust work: each one builds its own `target` of several GB.
 - Run the full suite before a commit, not after every edit. While working, run only the tests of the crate or module you touched (`cargo test -p hyperfetch-core <name>`).
