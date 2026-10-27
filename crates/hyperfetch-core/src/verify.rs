@@ -1843,7 +1843,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn only_the_damaged_pieces_of_a_finished_file_are_fetched_again() {
         let dir = tempdir().unwrap();
-        let content: Vec<u8> = (0..9 * MIB).map(|i| (i % 251) as u8 ^ (i >> 13) as u8).collect();
+        let content: Vec<u8> = (0..6 * MIB).map(|i| (i % 251) as u8 ^ (i >> 13) as u8).collect();
         let (url, _) = engine_server(content.clone(), Mode::Paced(Duration::ZERO)).await;
         let options = DownloadOptions { output_path: Some(dir.path().join("")), remote_checksum: false, ..DownloadOptions::default() };
         let path = DownloadEngine::new(vec![url.clone()], options.clone()).run(None).await.unwrap();
@@ -1851,17 +1851,17 @@ mod tests {
         data[5 * MIB] ^= 0xff;
         std::fs::write(&path, &data).unwrap();
 
-        // Pieces of 4 MiB: the second one is bad.
+        // Pieces of 4 MiB: the second one, the last 2 MiB, is bad.
         let res = verify_build_file(&path, None, None).unwrap();
         assert!(!res.is_complete && res.status_message.contains("1 damaged piece(s)"), "{}", res.status_message);
-        assert_eq!(res.missing_ranges, vec![ByteRange::from_len(4 * MIB as u64, 4 * MIB as u64).unwrap()]);
+        assert_eq!(res.missing_ranges, vec![ByteRange::from_len(4 * MIB as u64, 2 * MIB as u64).unwrap()]);
         let fetched = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let total = Arc::clone(&fetched);
         let size = content.len() as u64;
         repair_missing_ranges(&path, size, &res.missing_ranges, &[url], &options, None, move |_, of| total.store(of, Ordering::SeqCst))
             .await
             .unwrap();
-        assert_eq!(fetched.load(Ordering::SeqCst), 4 * MIB as u64);
+        assert_eq!(fetched.load(Ordering::SeqCst), 2 * MIB as u64);
         assert!(std::fs::read(&path).unwrap() == content, "repaired file differs");
         assert!(verify_build_file(&path, None, None).unwrap().is_complete);
     }

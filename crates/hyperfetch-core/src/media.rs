@@ -9144,12 +9144,13 @@ bbd8671c6c05eaa3ec29d690695aebadff0871faa3efe9051581afbf3c01e80e  ffmpeg-master-
             ),
         );
         // stdout and stderr are two pipes read side by side, so a line on one is not ordered against
-        // the other: the pause lets the error arrive before what follows it, as a real step's work does.
+        // the other: the pause lets the error arrive before what follows it, as a real step's work does,
+        // long enough for a test thread kept waiting by the tests that hash beside it.
         #[cfg(not(windows))]
         let (bin, script) = (
             dir.path().join("yt-dlp"),
             format!(
-                "#!/bin/sh\necho 'HFLIVE False {out_s}'\necho 'ERROR: Conversion failed!' >&2\nsleep 0.2\necho HFPOST x\n\
+                "#!/bin/sh\necho 'HFLIVE False {out_s}'\necho 'ERROR: Conversion failed!' >&2\nsleep 1\necho HFPOST x\n\
                  [ \"$1\" = make ] && echo video > '{out_s}'\necho 'HFPATH {out_s}'\nexit 1\n"
             ),
         );
