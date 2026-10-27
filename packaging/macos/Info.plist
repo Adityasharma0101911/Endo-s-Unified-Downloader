@@ -18,6 +18,17 @@
 	<string>Endo's Unified Downloader</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>io.github.adityasharma0101911.endos-unified-downloader</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>endo-dl</string>
+			</array>
+		</dict>
+	</array>
 	<key>CFBundleShortVersionString</key>
 	<string>@VERSION@</string>
 	<key>CFBundleVersion</key>

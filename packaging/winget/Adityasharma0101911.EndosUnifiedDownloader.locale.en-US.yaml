@@ -1,0 +1,18 @@
+PackageIdentifier: Adityasharma0101911.EndosUnifiedDownloader
+PackageVersion: '{{VERSION}}'
+PackageLocale: en-US
+Publisher: Endo's Unified Downloader contributors
+PublisherUrl: https://github.com/Adityasharma0101911
+PublisherSupportUrl: https://github.com/Adityasharma0101911/Endo-s-Unified-Downloader/issues
+PackageName: Endo's Unified Downloader
+PackageUrl: https://github.com/Adityasharma0101911/Endo-s-Unified-Downloader
+License: MIT OR Apache-2.0
+LicenseUrl: https://github.com/Adityasharma0101911/Endo-s-Unified-Downloader#license
+ShortDescription: Multi-connection download accelerator with a GUI, a command-line tool and a browser extension.
+Tags:
+  - download-manager
+  - downloader
+  - accelerator
+ReleaseNotesUrl: https://github.com/Adityasharma0101911/Endo-s-Unified-Downloader/releases/tag/v{{VERSION}}
+ManifestType: defaultLocale
+ManifestVersion: 1.9.0

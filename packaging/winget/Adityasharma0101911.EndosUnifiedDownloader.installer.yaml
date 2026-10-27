@@ -1,0 +1,15 @@
+PackageIdentifier: Adityasharma0101911.EndosUnifiedDownloader
+PackageVersion: '{{VERSION}}'
+InstallerType: inno
+Scope: user
+InstallModes:
+  - interactive
+  - silent
+UpgradeBehavior: install
+ProductCode: '{45CE9D6F-9031-44A4-A9B4-727B24AD5F92}_is1'
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/Adityasharma0101911/Endo-s-Unified-Downloader/releases/download/v{{VERSION}}/Endos-Unified-Downloader-v{{VERSION}}-windows-x64-setup.exe
+    InstallerSha256: '{{SHA256}}'
+ManifestType: installer
+ManifestVersion: 1.9.0

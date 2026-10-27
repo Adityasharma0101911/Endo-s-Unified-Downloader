@@ -92,9 +92,16 @@ A pasted link gives the file or the media it stands for, judged by where it land
 
 ## Installation
 
+Every [release](https://github.com/Adityasharma0101911/Endo-s-Unified-Downloader/releases) has the Windows, Linux and macOS files below, the browser extension as a zip and as a signed Firefox add-on (`Endos-Unified-Downloader-Firefox-vX.Y.Z.xpi`, see [Browser extension](#browser-extension)), and `SHA256SUMS` with its signature `SHA256SUMS.sig` (the maintainer's Ed25519 key, the one the app's updater trusts): 20 files in all.
+
 ### Windows
 
-Install Rust 1.89 or newer from <https://rustup.rs>, then build the project:
+Windows 10 or 11, x64. From the [releases page](https://github.com/Adityasharma0101911/Endo-s-Unified-Downloader/releases), or with winget (`winget install Adityasharma0101911.EndosUnifiedDownloader`, once the version is listed there), which runs the installer:
+
+- **Installer:** `Endos-Unified-Downloader-vX.Y.Z-windows-x64-setup.exe` installs for your user only, without admin rights, into `%LOCALAPPDATA%\Programs\Endo's Unified Downloader`: the GUI, the CLI and the `extension` folder, a Start menu shortcut and, if you tick it, a desktop one. The app updates itself there (see [Updates](#updates)). Uninstall it from Settings > Apps; that removes the launch-at-startup entry and the `endo-dl:` link too, and keeps your downloads and the data folder (`%LOCALAPPDATA%\EndosUnifiedDownloader`: settings, history, queue, managed tools).
+- **Zip:** `Endos-Unified-Downloader-vX.Y.Z-windows-x64.zip` holds the same files to run from any folder you can write to.
+- **Code signing:** the programs and the installer are built on GitHub Actions and code-signed there when the project's signing account is set up (Properties > Digital Signatures shows it). An unsigned build may get SmartScreen's "unknown publisher" warning on first run: More info > Run anyway.
+- **Build it yourself:** install Rust 1.89 or newer from <https://rustup.rs>, then:
 
 ```powershell
 git clone https://github.com/Adityasharma0101911/Endo-s-Unified-Downloader.git
@@ -108,18 +115,28 @@ The build produces two programs:
 
 ### Linux
 
+x86_64 (`x64`) and aarch64 (`arm64`) builds, both needing glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36 or later). From the [releases page](https://github.com/Adityasharma0101911/Endo-s-Unified-Downloader/releases):
+
+- **Debian and Ubuntu:** `sudo apt install ./endos-unified-downloader_X.Y.Z_amd64.deb` (`_arm64.deb` on arm64) installs `endos-downloader-gui` with a menu entry that also opens `endo-dl:` links, `endos-downloader-cli` and its alias `endos-downloader`, and the browser extension in `/usr/share/endos-unified-downloader/extension`. `sudo apt remove endos-unified-downloader` removes them.
+- **Fedora, RHEL and openSUSE:** `sudo dnf install ./endos-unified-downloader-X.Y.Z-1.x86_64.rpm` (`.aarch64.rpm` on arm64; `sudo zypper install` on openSUSE) installs the same files. `sudo dnf remove endos-unified-downloader` removes them.
+- **Any distribution:** `Endos-Unified-Downloader-vX.Y.Z-linux-x64.tar.gz` (or `-linux-arm64.tar.gz`) holds both programs, the `extension` folder, a menu entry and its icon, to run from where you unpack it.
+- **CLI only, any x86_64 Linux:** `Endos-Unified-Downloader-CLI-vX.Y.Z-linux-x64-static.tar.gz` holds the CLI linked statically (musl): one file with no dependencies, for old distributions, Alpine and containers.
+- **install.sh:**
+
 ```bash
 git clone https://github.com/Adityasharma0101911/Endo-s-Unified-Downloader.git
 cd Endo-s-Unified-Downloader
-./install.sh            # add --gui, --no-gui, --service or --uninstall as needed
+./install.sh            # add --from-source, --gui, --no-gui, --service or --uninstall as needed
 ```
 
-Run `install.sh` as your normal user. It asks for `sudo` only for the system-wide steps. It does the following:
+Run `install.sh` as your normal user. It asks for `sudo` only for the system-wide steps. By default it downloads the newest release's tar.gz for the machine (x86_64 or aarch64, from `uname -m`) and its `SHA256SUMS`, and installs nothing unless the file matches its SHA-256 there. With OpenSSL 3 installed it also checks the list's signature against the maintainer's key, the one the app's updater trusts (see [Updates](#updates)); without it, it warns that only the SHA-256 was checked. It needs `curl`; on other architectures use `--from-source`, which:
 - installs a C toolchain with apt, dnf, pacman, zypper or apk (Debian/Ubuntu, Fedora/RHEL, Arch, openSUSE, Alpine). No OpenSSL is needed because TLS is provided by rustls.
 - installs Rust with rustup (for your user only) if it is missing or older than 1.89.
 - runs `cargo build --release --locked`.
-- installs `/usr/local/bin/endos-downloader-cli` with the aliases `endos-downloader` and `hyperfetch`. An alias is not created if another program already uses that name.
-- installs the GUI as `endos-downloader-gui`, with a menu entry, when a display is present or `--gui` is given.
+
+Either way it installs the programs and the browser extension in `/usr/local/lib/endos-unified-downloader` and links them from `/usr/local/bin`:
+- `endos-downloader-cli`, with the aliases `endos-downloader` and `hyperfetch`. An alias is not created if another program already uses that name.
+- the GUI as `endos-downloader-gui`, with a menu entry that also opens `endo-dl:` links, when a display is present or `--gui` is given.
 
 The installer is safe to run again to upgrade, even while the CLI or the service is running, because the binaries are replaced atomically. To build without installing, use `./build-linux.sh [--gui]`.
 
@@ -384,7 +401,7 @@ The service downloads every line of the queue, two at a time, and then exits. Fi
 - **Command line:** `Endos-Unified-Downloader-CLI --update` checks and installs (through `--proxy` if given). The CLI never checks on its own.
 - **Signed releases only:** a release is installed only when its `SHA256SUMS` carries a valid signature from the maintainer's key, whose public half is built into the app, and every file matches its SHA-256 there. The list also names its version, so an older release cannot be offered as a new one. Whoever takes over the GitHub account or the download servers cannot make the app install anything else; a release that fails a check changes nothing.
 - **What is replaced:** the GUI and the CLI in the app's folder (whichever of them are there) and the `extension/` folder next to them. The GUI saves its queue, finishes live recordings and restarts as the new version. The previous programs are kept as `.old.exe` until the next start deletes them, and a swap that fails puts them back. On macOS the whole `Endo's Unified Downloader.app` is replaced by the release's `.app.tar.gz` for the Mac's chip (the GUI and the CLI in it update it alike), the old bundle is deleted at the next start, and the extension in the data folder is refreshed from the new one.
-- **Windows and macOS only:** on Linux What's new opens the release page; pull and run `./install.sh` again. On macOS the app must be in a folder it can write to (Applications), not run from the disk image or from where macOS translocated it: move it to Applications, open it once, then update.
+- **Windows and macOS only:** on Linux What's new opens the release page; run `./install.sh` again (with `--from-source`, pull first), or install the new `.deb` or `.rpm`. On macOS the app must be in a folder it can write to (Applications), not run from the disk image or from where macOS translocated it: move it to Applications, open it once, then update.
 - **Browser extension:** when it was loaded from the `extension/` folder next to the app, it reloads itself once the app reports a newer version there.
 - **From 1.3.0:** 1.3.0 and earlier have no updater, so download the first release that has one from the [releases page](https://github.com/Adityasharma0101911/Endo-s-Unified-Downloader/releases) by hand; it updates itself from then on.
 

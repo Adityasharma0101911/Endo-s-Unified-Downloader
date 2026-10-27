@@ -1,0 +1,26 @@
+name: Feature request
+description: Something the app could do.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What you want to do
+      description: The task, and what gets in the way today.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: How it could work
+      description: In the GUI, the command line or the browser extension.
+  - type: dropdown
+    id: where
+    attributes:
+      label: Where
+      multiple: true
+      options:
+        - GUI
+        - Command line
+        - Browser extension
+        - Packaging and installers
