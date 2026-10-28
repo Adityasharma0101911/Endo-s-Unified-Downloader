@@ -127,11 +127,11 @@ fn proxies(vars: impl Iterator<Item = (String, String)>) -> Vec<(String, String)
     found
 }
 
-/// `value` with the `user:password@` of the link in it as `***@`.
+/// `value` with the `user:password@` of the link in it as `***@`: all up to the last `@`, since a
+/// password may hold `/` and `@`.
 fn masked(value: &str) -> String {
     let start = value.find("://").map_or(0, |at| at + 3);
-    let host_end = value[start..].find('/').map_or(value.len(), |end| start + end);
-    match value[start..host_end].rfind('@') {
+    match value[start..].rfind('@') {
         Some(at) => format!("{}***{}", &value[..start], &value[start + at..]),
         None => value.to_string(),
     }
@@ -147,7 +147,9 @@ mod tests {
         assert_eq!(masked("http://bob:s3cret@proxy.example:8080"), "http://***@proxy.example:8080");
         assert_eq!(masked("bob:pw@10.0.0.1:3128"), "***@10.0.0.1:3128");
         assert_eq!(masked("socks5h://127.0.0.1:9050"), "socks5h://127.0.0.1:9050");
-        assert_eq!(masked("http://proxy.example/@path"), "http://proxy.example/@path", "only the host part");
+        assert_eq!(masked("http://bob:pa/ss@p:1"), "http://***@p:1", "a / in the password");
+        assert_eq!(masked("bob:p@ss/word@host"), "***@host");
+        assert_eq!(masked("http://proxy.example/@path"), "http://***@path", "a proxy has no path: rather too much than too little");
         let vars = [("HTTPS_PROXY", "http://u:p@p.example:1"), ("PATH", "/bin"), ("no_proxy", "localhost"), ("HTTP_PROXY_X", "x")];
         let found = proxies(vars.iter().map(|(n, v)| (n.to_string(), v.to_string())));
         assert_eq!(found, [("HTTPS_PROXY".to_string(), "http://***@p.example:1".to_string()), ("no_proxy".into(), "localhost".into())]);

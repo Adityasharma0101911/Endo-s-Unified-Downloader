@@ -766,22 +766,42 @@ pub fn start_time(text: &str, now: f64) -> Result<f64, String> {
     }
 }
 
-/// Options a config file may not hold: the run's links and inputs, the config file's own, and the
-/// actions that are not downloads.
-const NOT_IN_CONFIG: [&str; 10] = ["urls", "input_file", "config", "no_config", "history", "update", "verify", "repair", "doctor", "completions"];
+/// Options a config file may not hold: the run's links and inputs, the config file's own, the
+/// actions that are not downloads and what makes a run wait, list or probe in place of one.
+const NOT_IN_CONFIG: [&str; 17] = [
+    "urls", "input_file", "config", "no_config", "history", "update", "verify", "repair", "doctor", "completions", "start_at", "list_tracks",
+    "json", "dry_run", "spider", "preview", "stdout",
+];
+
+/// Options that do the same job another way, so either one on the command line leaves the other
+/// out of a config file: a proxy and a pool of them, a cookie string and cookies from a file or a
+/// browser.
+const ONE_OF: [(&str, &str); 4] = [("proxy", "proxy_pool"), ("proxy", "proxies_file"), ("cookie", "load_cookies"), ("cookie", "cookies_from_browser")];
 
 /// The run's options: the command line `argv` after the options of a config file (see
 /// [`config_args`]): `--config FILE`, else `default` when that file is there; none with
 /// `--no-config` or `--completions`. A command line clap refuses (or `--help`) exits as
 /// `Args::parse` does; Err is what to print about a config file that is refused.
 pub fn load(argv: Vec<OsString>, default: Option<PathBuf>) -> Result<Args, String> {
-    let given = Args::command().try_get_matches_from(&argv).unwrap_or_else(|e| e.exit());
+    let (given, missing) = match Args::command().try_get_matches_from(&argv) {
+        Ok(given) => (given, None),
+        // What an option needs (--delete-archive, --extract) may be in the config file: the merged parse checks it.
+        Err(e) if e.kind() == ErrorKind::MissingRequiredArgument => {
+            (Args::command().ignore_errors(true).try_get_matches_from(&argv).unwrap_or_else(|e| e.exit()), Some(e))
+        }
+        Err(e) => e.exit(),
+    };
     let path = match given.get_one::<PathBuf>("config") {
         Some(path) => Some(path.clone()),
         None if given.get_flag("no_config") || given.contains_id("completions") => None,
         None => default.filter(|path| path.is_file()),
     };
-    let Some(path) = path else { return Args::from_arg_matches(&given).map_err(|e| e.to_string()) };
+    let Some(path) = path else {
+        if let Some(e) = missing {
+            e.exit();
+        }
+        return Args::from_arg_matches(&given).map_err(|e| e.to_string());
+    };
     let refused = |e: String| format!("error: the config file {}: {}", path.display(), e);
     let bytes = std::fs::read(&path).map_err(|e| refused(e.to_string()))?;
     let text = hyperfetch_core::ingest::decode_text(&bytes).map_err(refused)?;
@@ -801,10 +821,11 @@ pub fn load(argv: Vec<OsString>, default: Option<PathBuf>) -> Result<Args, Strin
 /// The options of a config file's `text`, as arguments to go before those of the command line
 /// `given` (see [`load`]): options as on a command line, any number a line ("double quotes"
 /// around a value with spaces), `#` starting a comment line. An option the command line (or the
-/// environment) gives too, or one that cannot go with one it gives, is left out, unless it can be
-/// repeated (--header, --ad-pattern, --channel, --sections, --bind-address): then the file's come
-/// first. Links, inputs, unknown options, bad values and [`NOT_IN_CONFIG`] are an error that names
-/// the line.
+/// environment) gives too, or one that cannot go with one it gives or does its job ([`ONE_OF`], an
+/// Authorization --header against -u or another), is left out, unless it can be repeated
+/// (--header, --ad-pattern, --channel, --sections, --bind-address): then the file's come first.
+/// Links, inputs, unknown options, bad values, a bare `--` and [`NOT_IN_CONFIG`] are an error that
+/// names the line.
 pub fn config_args(text: &str, given: &ArgMatches) -> Result<Vec<String>, String> {
     let command = Args::command();
     let set = |matches: &ArgMatches, sources: &[ValueSource]| -> Vec<clap::Id> {
@@ -815,8 +836,14 @@ pub fn config_args(text: &str, given: &ArgMatches) -> Result<Vec<String>, String
     let arg = |id: &clap::Id| command.get_arguments().find(|arg| arg.get_id() == id);
     let against = |a: &clap::Id, b: &clap::Id| {
         let conflicts = |x: &clap::Id, y: &clap::Id| arg(x).is_some_and(|x| command.get_arg_conflicts_with(x).iter().any(|c| c.get_id() == y));
-        conflicts(a, b) || conflicts(b, a)
+        let one_of = |x: &clap::Id, y: &clap::Id| ONE_OF.contains(&(x.as_str(), y.as_str()));
+        conflicts(a, b) || conflicts(b, a) || one_of(a, b) || one_of(b, a)
     };
+    let authorizes = |matches: &ArgMatches| {
+        let typed = matches.value_source("headers") == Some(ValueSource::CommandLine);
+        typed && matches.get_many::<(String, String)>("headers").into_iter().flatten().any(|(name, _)| name == "Authorization")
+    };
+    let signs_in = given.value_source("user") == Some(ValueSource::CommandLine) || authorizes(given);
     let mut out = Vec::new();
     for (number, line) in text.lines().enumerate() {
         let line = line.trim();
@@ -825,8 +852,20 @@ pub fn config_args(text: &str, given: &ArgMatches) -> Result<Vec<String>, String
         }
         let at = |e: String| format!("line {}: {}", number + 1, e);
         for option in options_of(split_words(line).map_err(at)?) {
+            if option[0] == "--" {
+                return Err(at("a bare -- cannot be in a config file: it would make the command line's options links".to_string()));
+            }
             let argv = || std::iter::once("cli".to_string()).chain(option.iter().cloned());
-            let not_here = || at(format!("{} cannot be in a config file: links, inputs and actions go on the command line", option[0]));
+            // A stray word is often a 'single-quoted' value or a # comment after an option: say so.
+            let hint = || {
+                option.iter().find_map(|word| match word {
+                    w if w.starts_with('#') => Some("a # comment goes on a line of its own"),
+                    w if w.starts_with('\'') || w.ends_with('\'') => Some("put a value with spaces in \"double quotes\": 'single' ones are not taken"),
+                    _ => None,
+                })
+            };
+            let refuse = |e: String| at(hint().map_or(e, str::to_string));
+            let not_here = || refuse(format!("{} cannot be in a config file: links, inputs and actions go on the command line", option[0]));
             let found = match command.clone().try_get_matches_from(argv()) {
                 Ok(found) => found,
                 // An option that needs another (--delete-archive, --extract) may have it on another line.
@@ -834,14 +873,16 @@ pub fn config_args(text: &str, given: &ArgMatches) -> Result<Vec<String>, String
                     command.clone().ignore_errors(true).try_get_matches_from(argv()).map_err(|e| at(e.to_string()))?
                 }
                 Err(e) if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) => return Err(not_here()),
-                Err(e) => return Err(at(e.to_string().lines().next().unwrap_or_default().trim_start_matches("error: ").to_string())),
+                Err(e) => return Err(refuse(e.to_string().lines().next().unwrap_or_default().trim_start_matches("error: ").to_string())),
             };
             let ids = set(&found, &[ValueSource::CommandLine]);
             if ids.iter().any(|id| NOT_IN_CONFIG.contains(&id.as_str())) {
                 return Err(not_here());
             }
-            let repeatable = |id: &clap::Id| arg(id).is_some_and(|arg| matches!(arg.get_action(), ArgAction::Append));
-            let overridden = ids.iter().any(|id| typed.iter().any(|t| (t == id && !repeatable(id)) || against(t, id)));
+            // --tracks picks the stream's tracks: the command line's replace the file's.
+            let repeatable = |id: &clap::Id| id != "tracks" && arg(id).is_some_and(|arg| matches!(arg.get_action(), ArgAction::Append));
+            let overridden = ids.iter().any(|id| typed.iter().any(|t| (t == id && !repeatable(id)) || against(t, id)))
+                || (signs_in && authorizes(&found));
             if !overridden {
                 out.extend(option);
             }
@@ -1157,7 +1198,7 @@ mod tests {
         let options = config_args(text, &given(&["-s", "8", "--header", "X-B: 2", "--ipv6", "--subs", "fr", "u"])).unwrap();
         assert_eq!(options, ["--header", "X-A: 1", "--delete-archive", "--extract", "--name-pattern", "{name} {height}p"]);
         for (text, line) in [
-            ("--json\nhttps://a.example/f", "line 2"),
+            ("--hls-mp4\nhttps://a.example/f", "line 2"),
             ("--hls-mp4 -i list.txt", "line 1"),
             ("\n\n--history", "line 3"),
             ("--config other.conf", "line 1"),
@@ -1166,9 +1207,49 @@ mod tests {
             ("--no-such-option", "line 1"),
             ("# ok\n--video 8k", "line 2"),
             ("--header \"X-A: 1", "line 1"),
+            ("--split 4\n--", "line 2"),
         ] {
             let e = config_args(text, &given(&["u"])).unwrap_err();
             assert!(e.starts_with(line), "{text:?}: {e}");
+        }
+    }
+
+    /// What makes a run wait, list or probe in place of a download stays on the command line, and a
+    /// 'single-quoted' value or a # comment after an option is named as such.
+    #[test]
+    fn a_config_file_holds_no_run_mode_and_its_mistakes_are_named() {
+        for text in ["--start-at 21:30", "--list-tracks", "--json", "--dry-run", "--spider", "--preview", "--stdout"] {
+            let e = config_args(text, &given(&["u"])).unwrap_err();
+            assert!(e.starts_with("line 1") && e.contains("cannot be in a config file"), "{text:?}: {e}");
+        }
+        let e = config_args("--header 'X-A: 1'", &given(&["u"])).unwrap_err();
+        assert!(e.starts_with("line 1") && e.contains("double quotes"), "{e}");
+        let e = config_args("--split 4 # four", &given(&["u"])).unwrap_err();
+        assert!(e.starts_with("line 1") && e.contains("comment"), "{e}");
+    }
+
+    /// The command line's sign-in, proxy, cookies and --tracks leave out the file's that do the same
+    /// job: an Authorization header against -u, a proxy pool against a proxy, a cookie string
+    /// against cookies from a file or a browser.
+    #[test]
+    fn the_command_line_s_sign_in_proxy_cookies_and_tracks_win() {
+        let auth = "--header \"Authorization: Bearer FILE\"\n--header \"X-A: 1\"\n";
+        assert_eq!(config_args(auth, &given(&["-u", "bob:pw", "u"])).unwrap(), ["--header", "X-A: 1"]);
+        assert_eq!(config_args(auth, &given(&["--header", "Bearer CLI", "u"])).unwrap(), ["--header", "X-A: 1"]);
+        assert_eq!(config_args(auth, &given(&["--header", "X-B: 2", "u"])).unwrap().len(), 4, "another header leaves it in");
+        for (text, typed) in [
+            ("--proxy-pool socks5://a:1080", "--proxy=http://corp:3128"),
+            ("--proxies-file Cargo.toml", "--proxy=http://corp:3128"),
+            ("--proxy http://corp:3128", "--proxy-pool=socks5://a:1080"),
+            ("--proxy http://corp:3128", "--proxies-file=Cargo.toml"),
+            ("--cookie sid=old", "--load-cookies=Cargo.toml"),
+            ("--cookie sid=old", "--cookies-from-browser=firefox"),
+            ("--load-cookies Cargo.toml", "--cookie=sid=new"),
+            ("--cookies-from-browser firefox", "--cookie=sid=new"),
+            ("--tracks v0", "--tracks=v1,a0"),
+        ] {
+            assert_eq!(config_args(text, &given(&[typed, "u"])).unwrap(), Vec::<String>::new(), "{text} against {typed}");
+            assert!(!config_args(text, &given(&["u"])).unwrap().is_empty(), "{text} alone");
         }
     }
 
@@ -1198,8 +1279,12 @@ mod tests {
         assert!(e.contains("line 2") && e.contains(&default.display().to_string()), "{e}");
         // What clap refuses only once both are put together names the file too.
         std::fs::write(&default, "--delete-archive\n").unwrap();
-        let e = load(argv(&["u"]), Some(default)).unwrap_err();
+        let e = load(argv(&["u"]), Some(default.clone())).unwrap_err();
         assert!(e.contains("--extract") && e.contains("--no-config"), "{e}");
+        // What a command-line option needs may be in the file.
+        std::fs::write(&default, "--extract\n").unwrap();
+        let args = load(argv(&["--delete-archive", "u"]), Some(default)).unwrap();
+        assert!(args.delete_archive && args.extract);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

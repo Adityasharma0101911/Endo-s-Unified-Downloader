@@ -211,10 +211,28 @@ test("Smooth Streaming manifests are found by content type or path, their fragme
     size: 0,
   });
   assert.equal(classifyResponse({ url: "https://a.example/api/play", contentType: "application/vnd.ms-sstr+xml" }).name, "play");
-  assert.equal(classifyResponse({ url: "https://a.example/v/Show.ISML/manifest(format=mpd-time-csf)", contentType: "text/xml" }).kind, "smooth");
+  assert.equal(classifyResponse({ url: "https://a.example/v/Show.ISML/manifest(format=xml)", contentType: "text/xml" }).kind, "smooth");
   assert.equal(classifyResponse({ url: "https://a.example/v/Show.ism/Manifest", type: "xmlhttprequest" }).kind, "smooth");
   assert.equal(classifyResponse({ url: "https://a.example/v/Show.ism/Manifest", type: "other" }), null);
   assert.equal(classifyResponse({ url: "https://a.example/v/Show.ism/QualityLevels(800000)/Fragments(video=0)", contentType: "video/mp4" }), null);
+  assert.equal(classifyResponse({ url: "https://a.example/v/x.ism/manifestation.html", contentType: "text/html" }), null);
+  assert.equal(classifyResponse({ url: "https://a.example/v/a.ism/manifest.json", type: "xmlhttprequest" }), null);
+});
+
+test("a Smooth Streaming server's HLS and DASH forms are HLS and DASH", () => {
+  const hls = classifyResponse({ url: "https://a.example/v/Show.ISML/manifest(format=m3u8-aapl)", contentType: "text/plain" });
+  assert.deepEqual(hls, { format: "m3u8", kind: "hls", name: "Show.ISML", size: 0 });
+  assert.equal(classifyResponse({ url: "https://a.example/v/Show.ism/Manifest(format=mpd-time-csf)", contentType: "text/xml" }).kind, "dash");
+  assert.equal(classifyResponse({ url: "https://a.example/v/Show.ism/Manifest(format=mpd-time-csf)", type: "xmlhttprequest" }).kind, "dash");
+  assert.equal(classifyResponse({ url: "https://a.example/v/Show.ism/Manifest(format=m3u8-aapl-v3)", type: "xmlhttprequest" }).kind, "hls");
+});
+
+test("a long path is classified in linear time", () => {
+  const url = "https://a.example/" + "a".repeat(1 << 20);
+  const start = performance.now();
+  assert.equal(classifyResponse({ url, contentType: "text/html" }), null);
+  assert.equal(mediaUrlFormat(url), null);
+  assert.ok(performance.now() - start < 50, `${performance.now() - start} ms`);
 });
 
 test("other video/audio types are files named by their subtype; MPEG-TS and segments are not", () => {
@@ -250,7 +268,11 @@ test("rangedVideoCandidate: an XHR range of an untyped file is an mp4 to confirm
 test("mediaUrlFormat names m3u8, mpd and Smooth Streaming links by path, then query", () => {
   assert.equal(mediaUrlFormat("https://cdn.example/v/index.m3u8?sig=1"), "m3u8");
   assert.equal(mediaUrlFormat("https://cdn.example/v/Manifest.MPD"), "mpd");
-  assert.equal(mediaUrlFormat("https://cdn.example/v/Show.isml/Manifest(format=m3u8-aapl)"), "ism");
+  assert.equal(mediaUrlFormat("https://cdn.example/v/Show.isml/Manifest(format=m3u8-aapl)"), "m3u8");
+  assert.equal(mediaUrlFormat("https://cdn.example/v/Show.isml/Manifest(format=mpd-time-csf)"), "mpd");
+  assert.equal(mediaUrlFormat("https://cdn.example/v/Show.isml/Manifest"), "ism");
+  assert.equal(mediaUrlFormat("https://cdn.example/v/Show.isml/Manifest(format=xml)"), "ism");
+  assert.equal(mediaUrlFormat("https://cdn.example/x.ism/manifestation.html"), null);
   assert.equal(mediaUrlFormat("https://cdn.example/v/Show.ism"), null);
   assert.equal(mediaUrlFormat("https://proxy.example/get?u=https%3A%2F%2Fx%2Fa.m3u8"), "m3u8");
   assert.equal(mediaUrlFormat("https://cdn.example/v/a.mpdx"), null);

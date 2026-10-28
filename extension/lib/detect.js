@@ -60,8 +60,15 @@ const TYPE_FORMATS = {
   "application/vnd.ms-sstr+xml": "ism",
 };
 
-/** A Smooth Streaming manifest's path (`.ism/Manifest`, `.isml/manifest(format=...)`), any case; its name is group 1. */
-const SMOOTH_MANIFEST = /([^/]+\.isml?)\/manifest/i;
+/**
+ * A Smooth Streaming manifest's path (`.ism/Manifest`, `.isml/manifest(format=...)`), any case; its name is group 1.
+ * Group 2 is "m3u8" or "mpd" when `(format=m3u8-aapl)` or `(format=mpd-time-csf)` makes it HLS or DASH. Anchored at a
+ * `/` so a long path costs linear time, not quadratic.
+ */
+const SMOOTH_MANIFEST = /\/([^/]*\.isml?)\/manifest(?=$|[(&])(?:\(format=(m3u8|mpd))?/i;
+
+/** The type of a Smooth Streaming server's HLS or DASH form (group 2 of SMOOTH_MANIFEST). */
+const SMOOTH_TYPES = { m3u8: "application/vnd.apple.mpegurl", mpd: "application/dash+xml" };
 
 /** A Smooth Streaming fragment's path: a segment, never an item. */
 const SMOOTH_FRAGMENT = /\.isml?\/QualityLevels\(/i;
@@ -147,14 +154,14 @@ export function classifyResponse({ url, type, contentType, contentDisposition, c
     else if (type === "media" && path.endsWith(".webm")) mime = "video/webm";
     else if (type === "xmlhttprequest" && path.endsWith(".m3u8")) mime = "application/vnd.apple.mpegurl";
     else if (type === "xmlhttprequest" && path.endsWith(".mpd")) mime = "application/dash+xml";
-    else if (type === "xmlhttprequest" && smooth) mime = "application/vnd.ms-sstr+xml";
+    else if (type === "xmlhttprequest" && smooth) mime = SMOOTH_TYPES[smooth[2]?.toLowerCase()] ?? "application/vnd.ms-sstr+xml";
     else return null;
   }
 
   let format = null;
   if (mime === "text/plain" && fileName.includes("master.txt")) format = "m3u8";
   else if (TYPE_FORMATS[mime]) format = TYPE_FORMATS[mime];
-  else if (smooth && !/^(video|audio)\//.test(mime)) format = "ism";
+  else if (smooth && !/^(video|audio)\//.test(mime)) format = smooth[2]?.toLowerCase() || "ism";
   else if (EXTENSION_FORMATS.includes(ext)) format = ext;
   else if (/^(video|audio)\/./.test(mime) && !/mp2t|segment/.test(mime)) {
     const subtype = mime.slice(mime.indexOf("/") + 1).replace(/^x-/, "");
@@ -166,7 +173,7 @@ export function classifyResponse({ url, type, contentType, contentDisposition, c
   return {
     format,
     kind: format === "m3u8" || format === "m3u" ? "hls" : format === "mpd" ? "dash" : format === "ism" ? "smooth" : "file",
-    name: (format === "ism" && smooth && lastPathSegment(smooth[1])) || fileName || `video.${format}`,
+    name: (smooth && ["ism", "m3u8", "mpd"].includes(format) && lastPathSegment(smooth[1])) || fileName || `video.${format}`,
     size: rangeTotal(contentRange) || (length > 0 ? length : 0),
   };
 }
@@ -191,8 +198,9 @@ export function rangedVideoCandidate({ url, type, contentType, contentDispositio
 }
 
 /**
- * The format a URL found in page data names: "m3u8" or "mpd" when its path (else its query) holds that extension,
- * "ism" when it holds a Smooth Streaming manifest's `.ism/Manifest`, else null. Only http(s) URLs count.
+ * The format a URL found in page data names: "m3u8" or "mpd" when its path (else its query) holds that extension or a
+ * `.ism/Manifest(format=m3u8...)` or `(format=mpd...)`, "ism" when it holds another Smooth Streaming `.ism/Manifest`, else
+ * null. Only http(s) URLs count.
  */
 export function mediaUrlFormat(url) {
   if (typeof url !== "string" || !/^https?:\/\//i.test(url)) return null;
@@ -203,7 +211,8 @@ export function mediaUrlFormat(url) {
     return null;
   }
   for (const part of [parsed.pathname, parsed.search]) {
-    if (SMOOTH_MANIFEST.test(part)) return "ism";
+    const smooth = SMOOTH_MANIFEST.exec(part);
+    if (smooth) return smooth[2]?.toLowerCase() || "ism";
     const match = /\.(m3u8|mpd)\b/i.exec(part);
     if (match) return match[1].toLowerCase();
   }
