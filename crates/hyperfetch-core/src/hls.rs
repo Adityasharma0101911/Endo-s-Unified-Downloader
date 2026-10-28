@@ -17,6 +17,7 @@ use thiserror::Error;
 use crate::engine::EngineSnapshot;
 use crate::range::ByteRange;
 use crate::storage::{FileDigest, StreamHasher};
+use crate::stream::{Kind, Role, Track};
 use crate::worker::{authorize, send, Auth, RateLimiter};
 
 const MAX_CONNECTIONS: usize = 64;
@@ -57,7 +58,9 @@ const MAX_MERGED_BYTES: u64 = if MAX_SEGMENT_BYTES < 8 * 1024 * 1024 { MAX_SEGME
 /// Most bytes that merged requests hold in memory at once (see [`merge_limit`]).
 const MERGE_BUDGET: u64 = 8 * MAX_MERGED_BYTES;
 /// Longest media playlist accepted (a day of 2-second segments is about 43,000).
-const MAX_SEGMENTS: usize = if cfg!(test) { 1000 } else { 1_000_000 };
+pub(crate) const MAX_SEGMENTS: usize = if cfg!(test) { 1000 } else { 1_000_000 };
+/// Most tracks read of a master playlist.
+const MAX_TRACKS: usize = 1000;
 const SNAPSHOT_INTERVAL: Duration = Duration::from_millis(200);
 /// First retry delay; doubles on every further attempt (0.5s, 1s, 2s, 4s, 8s, 8s, ...).
 const RETRY_BASE_DELAY: Duration = if cfg!(test) { Duration::from_millis(20) } else { Duration::from_millis(500) };
@@ -109,40 +112,50 @@ pub struct HlsOptions {
     pub expected_checksum: Option<String>,
     /// The download's speed limit, which the segments' bodies are held to together.
     pub limiter: Option<Arc<RateLimiter>>,
-    /// The playlist the segments came from, fetched again when their links expire (see
-    /// [`Refresh`]); None never renews them.
-    pub refresh_from: Option<Url>,
+    /// Where the segments came from, read again when their links expire (see [`Refresh`]); None
+    /// never renews them. [`HlsEngine::download_tracks`] takes each track's of its own.
+    pub refresh_from: Option<Origin>,
 }
 
+/// Where a download's segments came from: an HLS playlist or DASH manifest, read again for fresh
+/// links when theirs expire (see [`Refresh`]), and the track (its id, see `stream::Track`) they
+/// are of; None for the stream's only one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Origin {
+    pub manifest: Url,
+    pub track: Option<String>,
+}
+
+/// What can go wrong with an HLS or DASH stream.
 #[derive(Error, Debug)]
 pub enum HlsError {
-    #[error("Network error during HLS transfer: {0}")]
+    #[error("Network error during stream transfer: {0}")]
     Network(#[from] reqwest::Error),
-    #[error("I/O error during HLS assembly: {0}")]
+    #[error("I/O error during stream assembly: {0}")]
     Io(#[from] std::io::Error),
-    /// The top-level response is not an HLS playlist at all (no `#EXTM3U` header), so it may
-    /// be an ordinary file. Never used once a real playlist has been seen.
-    #[error("Invalid HLS playlist: {0}")]
+    /// The top-level response is neither an HLS playlist (no `#EXTM3U` header) nor a DASH
+    /// manifest, so it may be an ordinary file. Never used once a real one has been seen.
+    #[error("Not a stream playlist or manifest: {0}")]
     InvalidPlaylist(String),
-    /// A playlist or key could not be fetched (network error, HTTP error status, bad key).
-    #[error("HLS stream unavailable: {0}")]
+    /// A playlist, manifest or key could not be fetched (network error, HTTP error status, bad
+    /// key).
+    #[error("Stream unavailable: {0}")]
     Unavailable(String),
-    #[error("No video segments found in playlist")]
+    #[error("No segments found in the stream")]
     NoSegments,
-    /// A real HLS stream this engine cannot download correctly. Falling back to a
-    /// plain download of the playlist URL would not help either.
-    #[error("Unsupported HLS stream: {0}")]
+    /// A real stream this engine cannot download correctly. Falling back to a plain download of
+    /// its link would not help either.
+    #[error("Unsupported stream: {0}")]
     Unsupported(String),
     /// A live playlist (no `#EXT-X-ENDLIST`) without DRM: it lists only the latest segments, so
     /// it is recorded (by the media engine), not downloaded.
-    #[error("Live HLS stream: only a recording can download it")]
+    #[error("Live stream: only a recording can download it")]
     Live,
-    /// A master playlist whose audio is delivered only as a separate `#EXT-X-MEDIA` rendition:
-    /// a variant alone would come out silent, so the media engine (yt-dlp + ffmpeg) downloads
-    /// the video and audio playlists and merges them.
-    #[error("HLS stream with its audio in a separate rendition: only the media engine can merge it")]
-    SeparateAudio,
-    #[error("HLS segment {index} could not be downloaded: {reason}")]
+    /// The tracks asked for are not in the stream (see `stream::choose`): the message lists
+    /// what it has.
+    #[error("{0}")]
+    NoMatch(String),
+    #[error("Stream segment {index} could not be downloaded: {reason}")]
     SegmentFailed { index: usize, reason: String },
     #[error("Download cancelled by user")]
     Cancelled,
@@ -190,88 +203,173 @@ pub struct Subtitle {
     pub language: String,
 }
 
-/// What [`parse_hls`] finds: the segments to download and the subtitles of the master playlist
-/// they came from.
-#[derive(Debug)]
-pub struct HlsStream {
-    pub segments: Vec<HlsSegment>,
-    pub subtitles: Vec<Subtitle>,
-}
-
 /// File extension matching the container the segments form: fMP4 streams need an
 /// init section (`#EXT-X-MAP`), everything else is MPEG-TS.
 pub fn container_extension(segments: &[HlsSegment]) -> &'static str {
     if segments.iter().any(|s| s.init.is_some()) { "mp4" } else { "ts" }
 }
 
-/// Parses an HLS (.m3u8) playlist. If it is a master playlist, it selects the best
-/// variant that carries audio and returns that variant's media segments, with
-/// AES-128 keys already fetched. `auth` is added to every request it covers.
+/// The segments of the HLS media playlist at `playlist_url`, with AES-128 keys already fetched;
+/// of a master playlist, those of the one track the default specs choose (see
+/// `stream::choose`): a stream whose video and audio are apart is refused. `auth` is added to
+/// every request it covers.
 pub async fn parse_hls_playlist(
     client: &Client,
     playlist_url: &Url,
     auth: Option<&Auth>,
     fetch: FetchPolicy,
 ) -> Result<Vec<HlsSegment>, HlsError> {
-    parse_hls(client, playlist_url, None, auth, fetch).await.map(|stream| stream.segments)
+    crate::stream::relist(client, auth, &Origin { manifest: playlist_url.clone(), track: None }, fetch).await
 }
 
-/// [`parse_hls_playlist`], with the subtitle renditions of the master playlist. `text`, when
-/// given, is the playlist at `playlist_url` (one a web page built itself): it is read in place of
-/// fetching that URL, which then only resolves its relative URIs.
-pub async fn parse_hls(
-    client: &Client,
-    playlist_url: &Url,
-    text: Option<&str>,
-    auth: Option<&Auth>,
-    fetch: FetchPolicy,
-) -> Result<HlsStream, HlsError> {
-    let mut url = playlist_url.clone();
-    let mut subtitles = Vec::new();
-    for hop in 0..=MAX_MASTER_DEPTH {
-        let fetched = match text.filter(|_| hop == 0) {
-            Some(text) => Ok((text.as_bytes().to_vec(), url.clone())),
-            None => fetch_with_retry(client, auth, &url, None, MAX_PLAYLIST_BYTES, None, fetch).await,
-        };
-        let (body, final_url) = fetched.map_err(|e| {
-            let reason = format!("could not fetch {}: {}", url, e.reason);
-            match e.kind {
-                // A large file whose URL merely mentions .m3u8: download it as a plain file.
-                FetchErrorKind::TooLarge { playlist: false } if hop == 0 => HlsError::InvalidPlaylist(reason),
-                // A real playlist, or a variant: saving playlist text as the download would be
-                // a fake success.
-                FetchErrorKind::TooLarge { .. } => HlsError::Unsupported(reason),
-                _ => HlsError::Unavailable(reason),
-            }
-        })?;
+/// Fetches the playlist or manifest at `url`: the body and where it came from after redirects.
+/// `top` when `url` is the link itself, which may turn out to be a plain file.
+pub(crate) async fn fetch_manifest(client: &Client, auth: Option<&Auth>, url: &Url, fetch: FetchPolicy, top: bool) -> Result<(Vec<u8>, Url), HlsError> {
+    fetch_with_retry(client, auth, url, None, MAX_PLAYLIST_BYTES, None, fetch).await.map_err(|e| {
+        let reason = format!("could not fetch {}: {}", url, e.reason);
+        match e.kind {
+            // A large file whose URL merely mentions .m3u8: download it as a plain file.
+            FetchErrorKind::TooLarge { playlist: false } if top => HlsError::InvalidPlaylist(reason),
+            // A real playlist, or a variant: saving playlist text as the download would be a fake
+            // success.
+            FetchErrorKind::TooLarge { .. } => HlsError::Unsupported(reason),
+            _ => HlsError::Unavailable(reason),
+        }
+    })
+}
+
+/// Whether the playlist `text` is a master playlist (it lists variants).
+pub(crate) fn is_master(text: &str) -> bool {
+    text.lines().any(|l| l.trim_start().starts_with("#EXT-X-STREAM-INF:"))
+}
+
+/// The segments of the media playlist at `url`, a variant or rendition of a master playlist. A
+/// further master playlist there is followed to its default variant, at most
+/// [`MAX_MASTER_DEPTH`] times.
+pub(crate) async fn media_segments(client: &Client, auth: Option<&Auth>, url: &Url, fetch: FetchPolicy) -> Result<Vec<HlsSegment>, HlsError> {
+    let mut url = url.clone();
+    for _ in 0..MAX_MASTER_DEPTH {
+        let (body, final_url) = fetch_manifest(client, auth, &url, fetch, false).await?;
         let text = String::from_utf8_lossy(&body);
         let text = text.trim_start_matches('\u{feff}').trim_start();
         if !text.starts_with("#EXTM3U") {
-            // Only the URL the caller named may turn out to be a plain file. A variant that is not
-            // a playlist (typically an error page for an expired token) means the stream failed.
-            return Err(if hop == 0 {
-                HlsError::InvalidPlaylist("Missing #EXTM3U header".to_string())
-            } else {
-                HlsError::Unavailable(format!("variant {} is not an HLS playlist", url))
-            });
+            // Typically an error page for an expired token: the stream failed.
+            return Err(HlsError::Unavailable(format!("variant {} is not an HLS playlist", url)));
         }
-
-        if text.lines().any(|l| l.trim_start().starts_with("#EXT-X-STREAM-INF:")) {
-            // Relative URIs resolve against where the playlist actually came from (post-redirect).
-            url = select_variant(text, &final_url)?;
-            subtitles = subtitle_renditions(text, &final_url);
-            tracing::info!("Selected HLS variant: {}", url);
-            continue;
+        if !is_master(text) {
+            return parse_media_playlist(client, auth, text, &final_url, fetch).await;
         }
-        let segments = parse_media_playlist(client, auth, text, &final_url, fetch).await?;
-        return Ok(HlsStream { segments, subtitles });
+        let tracks = master_tracks(text, &final_url);
+        let info = crate::stream::StreamInfo {
+            format: crate::stream::Format::Hls,
+            live: false,
+            duration: None,
+            tracks: tracks.iter().map(|(track, _)| track.clone()).collect(),
+            parts: Vec::new(),
+        };
+        let chosen = crate::stream::choose(&info, &Default::default()).map_err(HlsError::NoMatch)?;
+        url = chosen.into_iter().find_map(|at| tracks[at].1.clone()).ok_or_else(|| malformed("no variant stream URI found"))?;
+        tracing::info!("Selected HLS variant: {}", url);
     }
     Err(malformed(format!("master playlists nested more than {} levels deep", MAX_MASTER_DEPTH)))
 }
 
+/// The tracks a master playlist lists, each with the media playlist of its segments: its variants
+/// (`v0`, `v1`, ... in playlist order; audio-only ones are audio tracks), audio renditions
+/// (`a0`, ...) and subtitle renditions (`s0`, ...), at most [`MAX_TRACKS`] of them. An audio
+/// rendition without a playlist of its own is inside its variants' segments: None. An audio
+/// rendition's codecs are those the variants playing with its group list for audio.
+pub(crate) fn master_tracks(master: &str, base: &Url) -> Vec<(Track, Option<Url>)> {
+    let mut variants = Vec::new();
+    let mut media = Vec::new();
+    let mut pending = None;
+    for line in master.lines() {
+        let trimmed = line.trim();
+        if let Some(list) = trimmed.strip_prefix("#EXT-X-MEDIA:") {
+            media.push(parse_attributes(list));
+        } else if let Some(list) = trimmed.strip_prefix("#EXT-X-STREAM-INF:") {
+            pending = Some(parse_attributes(list));
+        } else if !trimmed.is_empty() && !trimmed.starts_with('#') {
+            if let Some(attrs) = pending.take() {
+                variants.push((attrs, trimmed));
+            }
+        }
+    }
+    let mut group_codecs: HashMap<&str, String> = HashMap::new();
+    for (attrs, _) in &variants {
+        if let (Some(group), Some(codecs)) = (attrs.get("AUDIO"), attrs.get("CODECS")) {
+            let audio: Vec<&str> = codecs.split(',').map(str::trim).filter(|c| crate::stream::is_audio_codec(c)).collect();
+            group_codecs.entry(group).or_insert_with(|| audio.join(","));
+        }
+    }
+    let number = |attrs: &HashMap<&str, &str>, name: &str| attrs.get(name).and_then(|v| v.parse::<u64>().ok());
+    let mut tracks = Vec::new();
+    for (n, (attrs, uri)) in variants.iter().enumerate() {
+        let Ok(url) = base.join(uri) else { continue };
+        let codecs = attrs.get("CODECS").copied().unwrap_or_default();
+        let size = attrs.get("RESOLUTION").and_then(|r| r.split_once('x')).and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)));
+        let audio_only = !codecs.is_empty() && codecs.split(',').all(crate::stream::is_audio_codec);
+        let dolby = [codecs, attrs.get("SUPPLEMENTAL-CODECS").copied().unwrap_or_default()].join(",");
+        let track = Track {
+            id: format!("v{n}"),
+            kind: if audio_only { Kind::Audio } else { Kind::Video },
+            codecs: codecs.to_string(),
+            width: size.map(|(w, _)| w),
+            height: size.map(|(_, h)| h),
+            frame_rate: attrs.get("FRAME-RATE").and_then(|f| f.parse().ok()).filter(|f: &f64| f.is_finite() && *f > 0.0),
+            bandwidth: number(attrs, "BANDWIDTH"),
+            range: crate::stream::dynamic_range(&dolby, attrs.get("VIDEO-RANGE").copied()),
+            group: attrs.get("AUDIO").map(|g| g.to_string()),
+            ..Default::default()
+        };
+        tracks.push((track, Some(url)));
+    }
+    let mut counts = [0usize; 2];
+    for attrs in &media {
+        let (kind, letter) = match attrs.get("TYPE").copied() {
+            Some("AUDIO") => (Kind::Audio, 0),
+            Some("SUBTITLES") => (Kind::Subtitles, 1),
+            _ => continue,
+        };
+        let url = attrs.get("URI").and_then(|u| base.join(u).ok());
+        if kind == Kind::Subtitles && url.is_none() {
+            continue;
+        }
+        let id = format!("{}{}", ["a", "s"][letter], counts[letter]);
+        counts[letter] += 1;
+        let group = attrs.get("GROUP-ID").map(|g| g.to_string());
+        let traits = attrs.get("CHARACTERISTICS").copied().unwrap_or_default();
+        let default = attrs.get("DEFAULT") == Some(&"YES");
+        let role = match () {
+            _ if traits.contains("describes-video") => Role::Description,
+            _ if traits.contains("transcribes-spoken-dialog") => Role::Caption,
+            _ if attrs.get("FORCED") == Some(&"YES") => Role::Forced,
+            _ if kind == Kind::Subtitles => Role::Subtitle,
+            _ if default => Role::Main,
+            _ => Role::Alternate,
+        };
+        let codecs = group.as_deref().filter(|_| kind == Kind::Audio).and_then(|g| group_codecs.get(g)).cloned().unwrap_or_default();
+        let track = Track {
+            id,
+            kind,
+            codecs,
+            channels: attrs.get("CHANNELS").and_then(|c| c.split('/').next()?.trim().parse().ok()),
+            language: attrs.get("LANGUAGE").filter(|l| !l.is_empty()).map(|l| l.to_string()),
+            name: attrs.get("NAME").filter(|n| !n.is_empty()).map(|n| n.to_string()),
+            role,
+            default,
+            group,
+            ..Default::default()
+        };
+        tracks.push((track, url));
+    }
+    tracks.truncate(MAX_TRACKS);
+    tracks
+}
+
 /// The subtitle renditions a master playlist lists, each language and name once, at most
 /// [`MAX_SUBTITLES`] of them.
-fn subtitle_renditions(master: &str, base: &Url) -> Vec<Subtitle> {
+pub(crate) fn subtitle_renditions(master: &str, base: &Url) -> Vec<Subtitle> {
     let mut seen = HashSet::new();
     master
         .lines()
@@ -393,76 +491,6 @@ fn epoch_seconds(date: &str) -> Option<f64> {
     Some(days * 86_400.0 + h * 3600.0 + m * 60.0 + s - offset)
 }
 
-const AUDIO_CODEC_PREFIXES: [&str; 8] = ["mp4a", "ac-3", "ec-3", "ac-4", "opus", "flac", "alac", "dts"];
-
-/// Picks the best variant of a master playlist. Variants whose audio is muxed in are
-/// preferred; a variant whose audio lives only in a separate `#EXT-X-MEDIA` rendition
-/// would come out silent, so that case is [`HlsError::SeparateAudio`], for the media engine.
-fn select_variant(master: &str, base: &Url) -> Result<Url, HlsError> {
-    struct Variant<'a> {
-        bandwidth: u64,
-        pixels: u64,
-        audio_group: Option<&'a str>,
-        codecs: Option<&'a str>,
-        uri: &'a str,
-    }
-
-    // GROUP-ID -> whether every audio rendition of the group is a separate playlist.
-    let mut audio_groups: HashMap<&str, bool> = HashMap::new();
-    let mut variants = Vec::new();
-    let mut pending = None;
-    for line in master.lines() {
-        let trimmed = line.trim();
-        if let Some(list) = trimmed.strip_prefix("#EXT-X-MEDIA:") {
-            let attrs = parse_attributes(list);
-            if attrs.get("TYPE") == Some(&"AUDIO") {
-                if let Some(group) = attrs.get("GROUP-ID") {
-                    let separate = attrs.contains_key("URI");
-                    audio_groups.entry(*group).and_modify(|s| *s &= separate).or_insert(separate);
-                }
-            }
-        } else if let Some(list) = trimmed.strip_prefix("#EXT-X-STREAM-INF:") {
-            pending = Some(parse_attributes(list));
-        } else if !trimmed.is_empty() && !trimmed.starts_with('#') {
-            if let Some(attrs) = pending.take() {
-                let pixels = attrs
-                    .get("RESOLUTION")
-                    .and_then(|r| r.split_once('x'))
-                    .and_then(|(w, h)| Some(w.parse::<u64>().ok()?.saturating_mul(h.parse().ok()?)))
-                    .unwrap_or(0);
-                variants.push(Variant {
-                    bandwidth: attrs.get("BANDWIDTH").and_then(|b| b.parse().ok()).unwrap_or(0),
-                    pixels,
-                    audio_group: attrs.get("AUDIO").copied(),
-                    codecs: attrs.get("CODECS").copied(),
-                    uri: trimmed,
-                });
-            }
-        }
-    }
-
-    let separate_audio = |v: &Variant| v.audio_group.is_some_and(|g| audio_groups.get(g) == Some(&true));
-    let muxed_audio = |v: &Variant| {
-        !separate_audio(v)
-            && v.codecs.is_none_or(|c| {
-                c.split(',').any(|codec| AUDIO_CODEC_PREFIXES.iter().any(|p| codec.trim().starts_with(p)))
-            })
-    };
-    let rank = |v: &&Variant| (v.bandwidth, v.pixels);
-
-    let chosen = match variants.iter().filter(|v| muxed_audio(v)).max_by_key(rank) {
-        Some(v) => v.uri,
-        None if variants.iter().any(separate_audio) => return Err(HlsError::SeparateAudio),
-        // No variant advertises audio at all: the stream is video-only by design.
-        None => variants
-            .iter()
-            .max_by_key(rank)
-            .map(|v| v.uri)
-            .ok_or_else(|| malformed("no variant stream URI found"))?,
-    };
-    base.join(chosen).map_err(|e| malformed(format!("invalid variant URL '{}': {}", chosen, e)))
-}
-
 /// Whether a `#EXT-X-KEY` (its attributes) starts AES-128 encryption with a key anyone can fetch,
 /// or ends encryption (`METHOD=NONE`). DRM (a key format other than `identity`, whatever the
 /// method: FairPlay and Widevine use SAMPLE-AES) and other methods are refused.
@@ -489,7 +517,7 @@ struct ActiveKey {
     iv: Option<[u8; 16]>,
 }
 
-async fn parse_media_playlist(
+pub(crate) async fn parse_media_playlist(
     client: &Client,
     auth: Option<&Auth>,
     text: &str,
@@ -708,7 +736,7 @@ impl FetchError {
     /// `head` is the start of the body, as far as it was read.
     fn too_large(max_bytes: u64, head: &[u8]) -> Self {
         Self {
-            kind: FetchErrorKind::TooLarge { playlist: is_playlist_start(head) },
+            kind: FetchErrorKind::TooLarge { playlist: is_playlist_start(head) || crate::dash::is_mpd(head) },
             reason: format!("response larger than the {} byte limit", max_bytes),
         }
     }
@@ -879,6 +907,49 @@ async fn fetch_with_retry(
     }
 }
 
+/// The bytes `range` of `url` (at most `max_bytes` of them), as [`fetch_with_retry`] fetches them.
+pub(crate) async fn fetch_range(client: &Client, auth: Option<&Auth>, url: &Url, range: ByteRange, max_bytes: u64, fetch: FetchPolicy) -> Result<Vec<u8>, HlsError> {
+    let fetched = fetch_with_retry(client, auth, url, Some(range), max_bytes, None, fetch).await;
+    fetched.map(|(body, _)| body).map_err(|e| HlsError::Unavailable(format!("could not fetch {}: {}", url, e.reason)))
+}
+
+/// The size of the file at `url`, as the answer to a request for its first byte tells it
+/// (`Content-Range: bytes 0-0/<size>`), retried as [`fetch_with_retry`] retries. A server that
+/// serves no byte ranges is refused: the file could only be fetched as one segment.
+pub(crate) async fn size_of(client: &Client, auth: Option<&Auth>, url: &Url, fetch: FetchPolicy) -> Result<u64, HlsError> {
+    let mut delay = RETRY_BASE_DELAY;
+    let mut failures = 0;
+    loop {
+        let answer = async {
+            let _slot = crate::hosts::acquire(url, fetch.host_limit).await;
+            let req = |u: &Url| authorize(client.get(u.clone()), auth, u).header(reqwest::header::RANGE, "bytes=0-0");
+            let response = tokio::time::timeout(fetch.stall_timeout, send(req, url)).await.map_err(|_| "timed out waiting for a response".to_string())?;
+            response.map_err(|e| e.to_string())
+        };
+        let reason = match answer.await {
+            Ok(response) if response.status() == StatusCode::PARTIAL_CONTENT => {
+                let range = response.headers().get(reqwest::header::CONTENT_RANGE).and_then(|v| v.to_str().ok());
+                let size = range.and_then(|r| r.rsplit_once('/')?.1.trim().parse::<u64>().ok()).filter(|&size| size > 0);
+                return size.ok_or_else(|| HlsError::Unavailable(format!("{} does not tell its size", url)));
+            }
+            Ok(response) if response.status().is_success() => {
+                return Err(HlsError::Unsupported(format!("the server of {} serves no byte ranges", url)));
+            }
+            Ok(response) if !response.status().is_server_error() && !matches!(response.status().as_u16(), 408 | 429) => {
+                return Err(HlsError::Unavailable(format!("could not fetch {}: HTTP {}", url, response.status())));
+            }
+            Ok(response) => format!("HTTP {}", response.status()),
+            Err(reason) => reason,
+        };
+        if failures == fetch.max_retries {
+            return Err(HlsError::Unavailable(format!("could not fetch {}: {} (after {} attempt(s))", url, reason, failures + 1)));
+        }
+        failures += 1;
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(RETRY_MAX_DELAY);
+    }
+}
+
 async fn decrypt(data: Vec<u8>, key: &Option<Aes128Key>) -> Result<Vec<u8>, String> {
     let Some(key) = key.clone() else { return Ok(data) };
     tokio::task::spawn_blocking(move || {
@@ -910,15 +981,15 @@ fn strip_disguise(mut data: Vec<u8>) -> Vec<u8> {
     data
 }
 
-/// Fetches the playlist of a download again when the links of its segments expire mid-download
-/// (401, 403, 404 or 410, as a CDN answers a signed link past its time), at most
-/// [`MAX_REFRESHES`] times per download, for fresh links (and keys) of those segments: found by
-/// media sequence number, else by position in a playlist as long as before. Segments whose links
-/// expire together share one fetch.
+/// Reads the playlist or manifest of a download's track again when the links of its segments
+/// expire mid-download (401, 403, 404 or 410, as a CDN answers a signed link past its time), at
+/// most [`MAX_REFRESHES`] times per track, for fresh links (and keys) of those segments: found by
+/// media sequence number (a DASH segment's position), else by position in a list as long as
+/// before. Segments whose links expire together share one fetch.
 struct Refresh<'a> {
     client: &'a Client,
     auth: Option<&'a Auth>,
-    playlist: &'a Url,
+    origin: Origin,
     fetch: FetchPolicy,
     /// Segments the download started with.
     count: usize,
@@ -945,10 +1016,10 @@ impl Refresh<'_> {
             return None;
         }
         fresh.0 += 1;
-        tracing::warn!("HLS segment {} is gone at {}; fetching the playlist again for fresh links ({}/{})", stale.index, stale.url, fresh.0, MAX_REFRESHES);
-        match parse_hls(self.client, self.playlist, None, self.auth, self.fetch).await {
-            Ok(stream) => fresh.1 = stream.segments,
-            Err(e) => tracing::warn!("Fetching the playlist {} again failed: {}", self.playlist, e),
+        tracing::warn!("Stream segment {} is gone at {}; reading {} again for fresh links ({}/{})", stale.index, stale.url, self.origin.manifest, fresh.0, MAX_REFRESHES);
+        match crate::stream::relist(self.client, self.auth, &self.origin, self.fetch).await {
+            Ok(segments) => fresh.1 = segments,
+            Err(e) => tracing::warn!("Reading {} again failed: {}", self.origin.manifest, e),
         }
         find(&fresh.1)
     }
@@ -1635,91 +1706,121 @@ impl HlsEngine {
         snapshot_tx: Option<broadcast::Sender<EngineSnapshot>>,
         cancel_flag: Option<Arc<AtomicBool>>,
     ) -> Result<(PathBuf, FileDigest, Vec<u64>), HlsError> {
+        let track = (segments, target, options.refresh_from.clone());
+        let mut done = Self::download_tracks(client, auth, vec![track], options, snapshot_tx, cancel_flag).await?;
+        done.pop().ok_or(HlsError::NoSegments)
+    }
+
+    /// [`HlsEngine::download`] of several tracks at once, each given as its segments, its target
+    /// and where fresh links for them come from (`options.refresh_from` is not used): one window
+    /// over the segments of all of them, track after track, each track written to its own `.part`
+    /// by a writer of its own and resumed on its own. Their progress shows together, under the
+    /// first track's path. Returns what [`HlsEngine::download`] returns for each, in order.
+    pub async fn download_tracks(
+        client: &Client,
+        auth: Option<&Auth>,
+        tracks: Vec<(Vec<HlsSegment>, HlsTarget, Option<Origin>)>,
+        options: &HlsOptions,
+        snapshot_tx: Option<broadcast::Sender<EngineSnapshot>>,
+        cancel_flag: Option<Arc<AtomicBool>>,
+    ) -> Result<Vec<(PathBuf, FileDigest, Vec<u64>)>, HlsError> {
         let num_connections = options.connections.clamp(1, MAX_CONNECTIONS);
-        let total_segments = segments.len();
-        if total_segments == 0 {
+        if tracks.is_empty() || tracks.iter().any(|(segments, ..)| segments.is_empty()) {
             return Err(HlsError::NoSegments);
         }
         let is_cancelled = || cancel_flag.as_ref().is_some_and(|c| c.load(Ordering::Relaxed));
-        let refresh = options.refresh_from.as_ref().map(|playlist| Refresh {
-            client,
-            auth,
-            playlist,
-            fetch: options.fetch,
-            count: total_segments,
-            fresh: tokio::sync::Mutex::new((0, Vec::new())),
-        });
-        let breaks_known = !segments.iter().take(target.resume_from).skip(1).any(|s| s.discontinuity);
-        let mut breaks = Vec::new();
+        let total_segments: usize = tracks.iter().map(|(segments, ..)| segments.len()).sum();
+        let limit = merge_limit(num_connections);
+        // Per track: its fresh links, the queue to its writer and the writer, and its path, bytes
+        // written, where its discontinuities start and whether that is known of all of them.
+        let (mut refreshes, mut queues, mut writers, mut files) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        // Per track: segments not yet handed to its writer.
+        let mut left = Vec::new();
+        // Every track's requests, in order, with the track's position.
+        let mut requests = Vec::new();
+        // Segments and bytes handed to the writers.
+        let (mut written, mut written_bytes) = (0, 0);
+        for (t, (segments, target, origin)) in tracks.into_iter().enumerate() {
+            let count = segments.len();
+            let breaks_known = !segments.iter().take(target.resume_from).skip(1).any(|s| s.discontinuity);
+            let HlsTarget { path, fingerprints, resume_from, resume_bytes, claim } = target;
+            let state = ResumeState { target: path.clone(), fingerprints };
+            let held = (resume_from, resume_bytes);
+            // Whatever touches the `.part` holds the claim, even if this future is dropped meanwhile.
+            let (part, state, claim) = tokio::task::spawn_blocking(move || -> std::io::Result<_> {
+                if let Some(dir) = state.target.parent() {
+                    std::fs::create_dir_all(dir)?;
+                }
+                let part =
+                    std::fs::OpenOptions::new().create(true).read(true).write(true).truncate(false).open(state.part())?;
+                part.set_len(held.1)?;
+                // A new `.part` names its stream from the start: without a state it would pass for
+                // another download's and be left behind.
+                if held.0 == 0 {
+                    state.save(&part, held)?;
+                }
+                Ok((part, state, claim))
+            })
+            .await
+            .map_err(std::io::Error::other)??;
+            // Written on a thread of its own, fed by a short queue: the fetches go on while it writes.
+            let (to_disk, queued) = mpsc::channel(WRITE_QUEUE);
+            let (fsync, hasher) = (options.fsync_on_complete, StreamHasher::new(options.expected_checksum.as_deref()));
+            writers.push(tokio::task::spawn_blocking(move || {
+                let _claim = claim;
+                write_segments(part, &state, held, count, fsync, hasher, queued)
+            }));
+            queues.push(to_disk);
+            let fresh = tokio::sync::Mutex::new((0, Vec::new()));
+            refreshes.push(origin.map(|origin| Refresh { client, auth, origin, fetch: options.fetch, count, fresh }));
+            tracing::info!(
+                "Starting stream ingestion: {} segments ({} already done) across {} connections -> {}",
+                count,
+                resume_from,
+                num_connections,
+                path.display()
+            );
+            requests.extend(plan_requests(segments, resume_from, limit).into_iter().map(|request| (t, request)));
+            (written, written_bytes) = (written + resume_from, written_bytes + resume_bytes);
+            files.push((path, resume_bytes, Vec::new(), breaks_known));
+            left.push(count.saturating_sub(resume_from));
+        }
 
-        let HlsTarget { path: target_file, fingerprints, resume_from, resume_bytes: mut written_bytes, claim } = target;
-        let part_path = with_suffix(&target_file, ".part");
-        let state = ResumeState { target: target_file.clone(), fingerprints };
-        let held = (resume_from, written_bytes);
-        // Whatever touches the `.part` holds the claim, even if this future is dropped meanwhile.
-        let (part, state, claim) = tokio::task::spawn_blocking(move || -> std::io::Result<_> {
-            if let Some(dir) = state.target.parent() {
-                std::fs::create_dir_all(dir)?;
-            }
-            let part =
-                std::fs::OpenOptions::new().create(true).read(true).write(true).truncate(false).open(state.part())?;
-            part.set_len(held.1)?;
-            // A new `.part` names its stream from the start: without a state it would pass for
-            // another download's and be left behind.
-            if held.0 == 0 {
-                state.save(&part, held)?;
-            }
-            Ok((part, state, claim))
-        })
-        .await
-        .map_err(std::io::Error::other)??;
-        // Written on a thread of its own, fed by a short queue: the fetches go on while it writes.
-        let (to_disk, queued) = mpsc::channel(WRITE_QUEUE);
-        let (fsync, hasher) = (options.fsync_on_complete, StreamHasher::new(options.expected_checksum.as_deref()));
-        let writer = tokio::task::spawn_blocking(move || {
-            let _claim = claim;
-            write_segments(part, &state, held, total_segments, fsync, hasher, queued)
-        });
-
-        tracing::info!(
-            "Starting HLS ingestion: {} segments ({} already done) across {} streams -> {}",
-            total_segments,
-            resume_from,
-            num_connections,
-            target_file.display()
-        );
-
-        let requests = plan_requests(segments, resume_from, merge_limit(num_connections));
         let received = AtomicU64::new(written_bytes);
         // Dropping it aborts the fetches in flight.
         let window = WINDOW_PER_CONNECTION * num_connections;
         let mut window = InOrder::new(requests.len(), num_connections, window, options.fetch.stall_timeout, |i| {
-            fetch_request(client, auth, &requests[i], &received, options.limiter.as_deref(), options.fetch, refresh.as_ref())
+            let (t, request) = &requests[i];
+            fetch_request(client, auth, request, &received, options.limiter.as_deref(), options.fetch, refreshes[*t].as_ref())
         });
 
-        // Segments handed to the writer.
-        let mut written = resume_from;
+        let target_file = files[0].0.clone();
         let start_time = Instant::now();
         let start_bytes = written_bytes;
         let mut ticker = tokio::time::interval(SNAPSHOT_INTERVAL);
-        // Why the download stopped early; `None` once every segment is with the writer, or if the
+        // Why the download stopped early; `None` once every segment is with its writer, or if a
         // writer failed, which its own error explains.
         let stopped = loop {
             if window.is_done() {
                 break None;
             }
+            // The track of the next request to hand out.
+            let next = requests[window.head].0;
             tokio::select! {
-                room = to_disk.reserve(), if window.head_ready() => {
+                room = queues[next].reserve(), if window.head_ready() => {
                     let Ok(room) = room else { break None };
                     match window.pop() {
                         Some(Ok((i, data))) => {
-                            let first = &requests[i].segment;
-                            if first.discontinuity && first.index > 0 {
-                                breaks.push(written_bytes);
+                            let (t, request) = &requests[i];
+                            let file = &mut files[*t];
+                            if request.segment.discontinuity && request.segment.index > 0 {
+                                file.2.push(file.1);
                             }
-                            written += requests[i].segments();
+                            file.1 += data.len() as u64;
+                            written += request.segments();
+                            left[*t] = left[*t].saturating_sub(request.segments());
                             written_bytes += data.len() as u64;
-                            room.send((requests[i].segments(), data));
+                            room.send((request.segments(), data));
                         }
                         Some(Err(e)) => break Some(e),
                         None => {}
@@ -1745,21 +1846,29 @@ impl HlsEngine {
                 }
             }
         };
-        // Stops the fetches, then lets the writer finish. Its queue stays open until then only if
-        // every segment went to it: closed early, it tells the writer that the download stopped,
-        // so it writes what it was given, saves the state and closes the file.
+        // Stops the fetches, then lets the writers finish. A track's queue stays open until then
+        // only if every segment of it went to its writer, which then names the file even when
+        // another track failed: closed early, it tells the writer that the download stopped, so it
+        // writes what it was given, saves its state and closes its file.
         drop(window);
-        let queue = stopped.is_none().then_some(to_disk);
-        let wrote = writer.await.map_err(std::io::Error::other).and_then(|wrote| wrote);
-        drop(queue);
+        let queues: Vec<_> = queues.into_iter().zip(&left).map(|(queue, &left)| (left == 0).then_some(queue)).collect();
+        let wrote = futures_util::future::join_all(writers).await;
+        drop(queues);
+        let wrote = wrote.into_iter().map(|wrote| wrote.map_err(std::io::Error::other).and_then(|wrote| wrote));
         if let Some(e) = stopped {
-            if let Err(save) = wrote {
-                tracing::warn!("Failed to save the HLS resume state of {}: {}", part_path.display(), save);
+            for (wrote, (path, ..)) in wrote.zip(&files) {
+                if let Err(save) = wrote {
+                    tracing::warn!("Failed to save the resume state of {}.part: {}", path.display(), save);
+                }
             }
             return Err(e);
         }
-        // With every segment written the writer has named the file.
-        let digest = wrote?.ok_or_else(|| std::io::Error::other("the HLS writer stopped before the last segment"))?;
+        let mut done = Vec::new();
+        for (wrote, (path, _, breaks, known)) in wrote.zip(files) {
+            // With every segment written the writer has named the file.
+            let digest = wrote?.ok_or_else(|| std::io::Error::other("the stream writer stopped before the last segment"))?;
+            done.push((path, digest, if known { breaks } else { Vec::new() }));
+        }
 
         if let Some(tx) = &snapshot_tx {
             let _ = tx.send(progress_snapshot(
@@ -1772,8 +1881,8 @@ impl HlsEngine {
                 &target_file,
             ));
         }
-        tracing::info!("HLS download and stitching completed: {}", target_file.display());
-        Ok((target_file, digest, if breaks_known { breaks } else { Vec::new() }))
+        tracing::info!("Stream download and stitching completed: {}", target_file.display());
+        Ok(done)
     }
 }
 
@@ -2338,7 +2447,7 @@ pub(crate) mod tests {
                 let segments = parse_hls_playlist(&client, &url, None, FETCH).await?;
                 let out = dir.join(format!("{name}-{refresh}.ts"));
                 let target = HlsEngine::prepare(&client, None, &url, &segments, &out, FETCH, &None).await?.unwrap();
-                let options = HlsOptions { refresh_from: refresh.then_some(url), ..options(1) };
+                let options = HlsOptions { refresh_from: refresh.then_some(Origin { manifest: url, track: None }), ..options(1) };
                 HlsEngine::download(&client, None, segments, target, &options, None, None).await.map(|(path, ..)| path)
             }
         };
@@ -2408,6 +2517,22 @@ pub(crate) mod tests {
         assert_eq!(join_vtt(&["WEBVTT\n\n01:02.000 --> 01:03.000\nno map\n".to_string()], Some(5.0)), "WEBVTT\n\n00:01:02.000 --> 00:01:03.000\nno map\n");
     }
 
+    /// The playlists of the tracks the default specs choose of `master` ("inside" for audio inside
+    /// its variant's segments).
+    fn default_tracks(master: &str) -> Vec<String> {
+        let base = Url::parse("https://cdn.example.com/hls/master.m3u8").unwrap();
+        let tracks = master_tracks(master, &base);
+        let info = crate::stream::StreamInfo {
+            format: crate::stream::Format::Hls,
+            live: false,
+            duration: None,
+            tracks: tracks.iter().map(|(track, _)| track.clone()).collect(),
+            parts: Vec::new(),
+        };
+        let chosen = crate::stream::choose(&info, &Default::default()).unwrap();
+        chosen.into_iter().map(|at| tracks[at].1.as_ref().map_or("inside".to_string(), |url| url.as_str().replace("https://cdn.example.com/hls/", ""))).collect()
+    }
+
     #[test]
     fn test_parse_best_variant() {
         let master = r#"#EXTM3U
@@ -2418,34 +2543,51 @@ pub(crate) mod tests {
 #EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080
 1080p.m3u8
 "#;
-        let base = Url::parse("https://cdn.example.com/hls/master.m3u8").unwrap();
-        let best = select_variant(master, &base).unwrap();
-        assert_eq!(best, Url::parse("https://cdn.example.com/hls/1080p.m3u8").unwrap());
+        assert_eq!(default_tracks(master), ["1080p.m3u8"]);
     }
 
+    /// The best variant that plays with audio, muxed or in a rendition of its group, and that
+    /// rendition; a rendition without a playlist is inside the variant's segments. Variants and
+    /// renditions are tracks with what their attributes tell.
     #[test]
     fn test_variant_attributes_and_audio_preference() {
         // AVERAGE-BANDWIDTH must not be mistaken for BANDWIDTH, and quoted CODECS contain commas.
         let master = r#"#EXTM3U
-#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="en",URI="audio/en.m3u8"
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="English",LANGUAGE="en",CHANNELS="6/JOC",URI="audio/en.m3u8"
+#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="Français",LANGUAGE="fr",FORCED=YES,URI="subs/fr.m3u8"
+#EXT-X-MEDIA:TYPE=CLOSED-CAPTIONS,GROUP-ID="cc",NAME="CC",INSTREAM-ID="CC1"
 #EXT-X-STREAM-INF:AVERAGE-BANDWIDTH=9000000,BANDWIDTH=1000000,CODECS="avc1.4d401f,mp4a.40.2"
 low.m3u8
 #EXT-X-STREAM-INF:BANDWIDTH=2000000,CODECS="avc1.4d401f,mp4a.40.2"
 mid.m3u8
-#EXT-X-STREAM-INF:BANDWIDTH=8000000,CODECS="avc1.640028,mp4a.40.2",AUDIO="aud"
-high-silent.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=8000000,CODECS="avc1.640028,ec-3",AUDIO="aud",RESOLUTION=1920x1080,FRAME-RATE=29.970,VIDEO-RANGE=PQ
+high.m3u8
 #EXT-X-STREAM-INF:BANDWIDTH=9000000,CODECS="avc1.640028"
 video-only.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=64000,CODECS="mp4a.40.5"
+radio.m3u8
 "#;
+        assert_eq!(default_tracks(master), ["high.m3u8", "audio/en.m3u8"]);
         let base = Url::parse("https://cdn.example.com/hls/master.m3u8").unwrap();
-        assert_eq!(select_variant(master, &base).unwrap().as_str(), "https://cdn.example.com/hls/mid.m3u8");
+        let tracks: Vec<Track> = master_tracks(master, &base).into_iter().map(|(track, _)| track).collect();
+        let described: Vec<String> = tracks.iter().map(Track::describe).collect();
+        assert_eq!(described, [
+            "v0 video avc aac 1000 kbps",
+            "v1 video avc aac 2000 kbps",
+            "v2 video 1920x1080 29.97fps avc eac3 hdr10 8000 kbps",
+            "v3 video avc 9000 kbps",
+            "v4 audio aac 64 kbps",
+            "a0 audio en eac3 6ch \"English\"",
+            "s0 subtitles fr \"Français\" forced",
+        ]);
+        assert_eq!(tracks[5].group.as_deref(), Some("aud"));
 
         let demuxed = r#"#EXTM3U
 #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="en",URI="audio/en.m3u8"
 #EXT-X-STREAM-INF:BANDWIDTH=8000000,CODECS="avc1.640028,mp4a.40.2",AUDIO="aud"
 video.m3u8
 "#;
-        assert!(matches!(select_variant(demuxed, &base), Err(HlsError::SeparateAudio)));
+        assert_eq!(default_tracks(demuxed), ["video.m3u8", "audio/en.m3u8"]);
 
         // An audio group whose rendition has no URI means the audio is muxed into the variant.
         let muxed_group = r#"#EXTM3U
@@ -2453,7 +2595,7 @@ video.m3u8
 #EXT-X-STREAM-INF:BANDWIDTH=8000000,AUDIO="aud"
 video.m3u8
 "#;
-        assert_eq!(select_variant(muxed_group, &base).unwrap().as_str(), "https://cdn.example.com/hls/video.m3u8");
+        assert_eq!(default_tracks(muxed_group), ["video.m3u8", "inside"]);
     }
 
     #[test]

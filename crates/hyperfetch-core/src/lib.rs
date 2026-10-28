@@ -32,6 +32,8 @@ pub mod ftp;
 pub mod digest;
 pub mod zipdir;
 pub mod sniff;
+pub mod stream;
+pub mod dash;
 pub mod subs;
 
 pub use range::{ByteRange, RangeError};
@@ -45,6 +47,10 @@ pub use engine::{
 };
 pub use resolver::SmartResolver;
 pub use hls::{HlsEngine, HlsSegment, HlsError, parse_hls_playlist};
+pub use stream::{
+    choose as choose_tracks, list_tracks, AudioSpec, DynamicRange, Format as StreamFormat, Kind as TrackKind, Part, Role as TrackRole,
+    StreamInfo, Track, TrackChoice, VideoSpec,
+};
 pub use metalink::{parse_metalink, MetalinkFile};
 pub use torrent::{parse_magnet_uri, parse_torrent_bytes, is_magnet_uri, MagnetInfo, TorrentInfo};
 pub use queue::{DownloadQueue, QueueItem, QueueItemStatus};
