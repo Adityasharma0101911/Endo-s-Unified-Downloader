@@ -60,7 +60,8 @@ fn picks(ui: &mut Ui, info: &StreamInfo, picks: &mut Picks, saves: bool) -> Opti
         ui.radio_value(&mut picks.video, None, "No video");
     }
     for (kind, title, ticked) in [(TrackKind::Audio, "Audio", &mut picks.audio), (TrackKind::Subtitles, "Subtitles", &mut picks.subtitles)] {
-        if of(kind).next().is_none() {
+        // A live recording takes no subtitles (see `Picks::of`).
+        if of(kind).next().is_none() || (info.live && kind == TrackKind::Subtitles) {
             continue;
         }
         heading(ui, title);
@@ -273,6 +274,13 @@ mod tests {
         let reopened = h.app.tracks.as_ref().map(|chooser| chooser.picks.clone()).unwrap();
         assert_eq!((reopened.audio.len(), reopened.dropped.as_slice(), reopened.from.as_str()), (2, &[1][..], "00:05"), "as it was saved");
         h.click_at(starting(&h, "Japanese").center());
+        // Its row's icon again only shows the chooser open, with what is ticked.
+        h.app.tab = Tab::Queue;
+        assert!(h.settle());
+        h.click_at(h.find_near(&item.filename, icon::SLIDERS_HORIZONTAL).unwrap().center());
+        assert!(h.settle());
+        let kept = h.app.tracks.as_ref().filter(|chooser| chooser.info.is_some()).map(|chooser| chooser.picks.audio.len());
+        assert_eq!((h.app.tab == Tab::Downloader, kept), (true, Some(1)));
         h.click("Save tracks");
         assert!(h.app.tracks.is_none());
         let saved = h.app.queue.get_item(item.id).unwrap().options.tracks.ids.clone();

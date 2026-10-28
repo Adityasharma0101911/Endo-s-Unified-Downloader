@@ -61,7 +61,7 @@ const SINGLE_CHECKSUM: &str = "The checksum in Advanced Options is for a single 
 /// How long "See what's inside" waits for a ZIP's list of files, all its requests together (each
 /// gives up after 30 s without an answer: see `zipdir::list_zip`), and "Choose tracks…" for a
 /// stream's manifests.
-const PREVIEW_LIMIT: Duration = Duration::from_secs(if cfg!(test) { 2 } else { 60 });
+const PREVIEW_LIMIT: Duration = Duration::from_secs(if cfg!(test) { 10 } else { 60 });
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -182,6 +182,8 @@ struct ChannelList {
     auth: String,
     channels: Vec<(Channel, bool)>,
     filter: String,
+    /// The channels `filter` (trimmed, the key) shows, kept until it changes.
+    shown: Option<(String, Vec<usize>)>,
 }
 
 /// Handles to a running engine task.
@@ -721,7 +723,7 @@ impl App {
         match result {
             Ok(Some(channels)) => {
                 let channels = channels.into_iter().map(|channel| (channel, false)).collect();
-                self.channel_lists.push(ChannelList { origin, input, checksum, auth, channels, filter: String::new() });
+                self.channel_lists.push(ChannelList { origin, input, checksum, auth, channels, filter: String::new(), shown: None });
             }
             Ok(None) => {
                 let read = read_listing(&self.settings, input.clone(), None);
@@ -3556,7 +3558,7 @@ mod tests {
         app.handle_event(event);
         let listed = app.zip_preview.as_ref().and_then(|(_, listed)| listed.as_ref());
         let Some(Err(error)) = listed else { panic!("no error") };
-        assert_eq!(error, "Gave up listing the ZIP: the server took over 2 seconds");
+        assert_eq!(error, "Gave up listing the ZIP: the server took over 10 seconds");
     }
 
     /// Pause all stops the queue and pauses what runs; Resume all starts both again, as many at

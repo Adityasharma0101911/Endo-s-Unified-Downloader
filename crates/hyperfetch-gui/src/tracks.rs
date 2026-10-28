@@ -76,9 +76,11 @@ impl Picks {
         // A spec the stream does not fit starts from its best tracks.
         let chosen = choose_tracks(info, &choice).or_else(|_| choose_tracks(info, &TrackChoice::default())).unwrap_or_default();
         let of_kind = |kind| chosen.iter().copied().filter(|&at| info.tracks[at].kind == kind).collect::<Vec<_>>();
-        let subtitles = match options.tracks.ids.is_empty() {
-            true => choose_subtitles(info, options.subtitles.as_deref()),
-            false => of_kind(TrackKind::Subtitles),
+        // A live recording takes no subtitles: their raw segments would not join.
+        let subtitles = match (info.live, options.tracks.ids.is_empty()) {
+            (true, _) => Vec::new(),
+            (false, true) => choose_subtitles(info, options.subtitles.as_deref()),
+            (false, false) => of_kind(TrackKind::Subtitles),
         };
         let (start, minutes_ago, at) = match options.live_from.as_deref().map(|text| (text, LiveStart::parse(text))) {
             Some((_, Ok(LiveStart::Ago(secs)))) => (Start::MinutesAgo, (secs / 60.0).round() as u32, String::new()),
@@ -86,6 +88,11 @@ impl Picks {
             _ if options.live_from_start => (Start::Oldest, 30, String::new()),
             _ => (Start::Now, 30, String::new()),
         };
+        // Parts gone from the stream, or all of them dropped, would leave Save off with no way back.
+        let mut dropped: Vec<usize> = options.drop_parts.iter().copied().filter(|&id| info.parts.iter().any(|part| part.id == id)).collect();
+        if dropped.len() >= info.parts.len() {
+            dropped.clear();
+        }
         let end = info.duration.unwrap_or(f64::MAX);
         let time = |secs: f64| crate::util::format_duration(secs as u64);
         let (from, to) = options.sections.first().map_or_else(Default::default, |&(from, to)| {
@@ -95,7 +102,7 @@ impl Picks {
             video: of_kind(TrackKind::Video).first().copied(),
             audio: of_kind(TrackKind::Audio),
             subtitles,
-            dropped: options.drop_parts.clone(),
+            dropped,
             from,
             to,
             start,
@@ -108,7 +115,10 @@ impl Picks {
 
     /// `options` with these picks for `info`, or why they cannot be had.
     pub fn apply(&self, info: &StreamInfo, options: &mut DownloadOptions) -> Result<(), String> {
-        let ids: Vec<String> = self.video.iter().chain(&self.audio).chain(&self.subtitles).filter_map(|&at| info.tracks.get(at)).map(|t| t.id.clone()).collect();
+        let ids: Vec<String> = self.video.iter().chain(&self.audio).chain(&self.subtitles).filter_map(|&at| info.tracks.get(at))
+            .filter(|t| !(info.live && t.kind == TrackKind::Subtitles))
+            .map(|t| t.id.clone())
+            .collect();
         // No ids would leave the choice to the specs: not what was asked.
         if ids.is_empty() && !info.tracks.is_empty() {
             return Err("Tick a track to download".to_string());
@@ -116,7 +126,7 @@ impl Picks {
         if info.live {
             options.live_from = match self.start {
                 Start::MinutesAgo => Some(format!("{}m", self.minutes_ago)),
-                Start::At => LiveStart::parse(&self.at).map(|_| Some(self.at.trim().to_string()))?,
+                Start::At => Some(clock_start(&self.at, now())?),
                 Start::Now | Start::Oldest => None,
             };
             options.live_from_start = self.start == Start::Oldest;
@@ -147,6 +157,39 @@ impl Picks {
         }
         Ok(if from <= 0.0 && to >= end { Vec::new() } else { vec![(from, to)] })
     }
+}
+
+/// Seconds since 1970, now.
+fn now() -> f64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64())
+}
+
+/// A live recording's start typed as a clock time, as `DownloadOptions::live_from` keeps it: a
+/// date and time, or a bare `21:00` (or `21:00:30`) for the last time this computer's clock showed
+/// it before `now` (today, else yesterday), since a recording can only start in what has passed.
+fn clock_start(text: &str, now: f64) -> Result<String, String> {
+    let text = text.trim();
+    let bad = || format!("\"{text}\" is not a clock time: type one, e.g. 21:00 or 2026-10-28 21:00");
+    let at = |text: &str| match LiveStart::parse(text) {
+        Ok(LiveStart::At(at)) => Ok(at),
+        _ => Err(bad()),
+    };
+    let pieces: Vec<&str> = text.split(':').collect();
+    let bare = (2..=3).contains(&pieces.len()) && pieces.iter().all(|n| (1..=2).contains(&n.len()) && n.bytes().all(|b| b.is_ascii_digit()));
+    if !bare {
+        at(text)?;
+        return Ok(text.to_string());
+    }
+    let day = |epoch: f64| hyperfetch_core::stream::clock_text(epoch)[..10].to_string();
+    let today = format!("{} {text}", day(now));
+    if at(&today)? <= now {
+        return Ok(today);
+    }
+    // Yesterday's date from today's noon: a day of 23 or 25 hours (a clock change) leaves it so.
+    let noon = at(&format!("{} 12:00", day(now)))?;
+    let yesterday = format!("{} {text}", day(noon - 86_400.0));
+    at(&yesterday)?;
+    Ok(yesterday)
 }
 
 /// Common languages by their ISO 639-1 code and ISO 639-2 codes, for naming a track's language
@@ -302,7 +345,42 @@ mod tests {
         let oldest = Picks { start: Start::Oldest, ..picks.clone() };
         oldest.apply(&info, &mut options).unwrap();
         assert!(options.live_from.is_none() && options.live_from_start);
-        assert!(Picks { start: Start::At, at: "tonight".into(), ..picks }.apply(&info, &mut options).unwrap_err().starts_with("Unknown start"));
+        for bad in ["tonight", "45", "1:02:03:04", "21:75"] {
+            let error = Picks { start: Start::At, at: bad.into(), ..picks.clone() }.apply(&info, &mut options).unwrap_err();
+            assert!(error.contains("is not a clock time"), "{bad}: {error}");
+        }
+
+        // It records no subtitles, even ticked: their raw segments would not join.
+        assert!(picks.subtitles.is_empty());
+        Picks { subtitles: vec![4], ..picks }.apply(&info, &mut options).unwrap();
+        assert_eq!(options.tracks.ids, ["v0", "a0"]);
+    }
+
+    /// A bare clock time is the last time the clock showed it: today, or yesterday when it is
+    /// still to come today.
+    #[test]
+    fn a_bare_clock_time_is_the_last_one_passed() {
+        let Ok(LiveStart::At(now)) = LiveStart::parse("2026-10-28 22:00") else { panic!("a clock time") };
+        assert_eq!(clock_start("21:00", now).as_deref(), Ok("2026-10-28 21:00"));
+        assert_eq!(clock_start(" 9:30:15 ", now).as_deref(), Ok("2026-10-28 9:30:15"));
+        assert_eq!(clock_start("23:00", now).as_deref(), Ok("2026-10-27 23:00"));
+        assert_eq!(clock_start("2026-10-01 08:00", now).as_deref(), Ok("2026-10-01 08:00"));
+        for bad in ["45", "30m", "1:30:00:00", "25:00", "2026-10-01"] {
+            assert!(clock_start(bad, now).unwrap_err().contains("is not a clock time"), "{bad}");
+        }
+    }
+
+    /// Saved dropped parts the stream no longer has, or that would drop all it has, open undropped.
+    #[test]
+    fn dropped_parts_open_only_while_some_are_kept() {
+        let info = stream(false);
+        let dropped = |ids: &[usize]| Picks::of(&info, &DownloadOptions { drop_parts: ids.to_vec(), ..Default::default() }).dropped;
+        assert_eq!(dropped(&[1, 7]), [1]);
+        assert!(dropped(&[0, 1]).is_empty());
+        let one = StreamInfo { parts: info.parts[..1].to_vec(), ..info.clone() };
+        let picks = Picks::of(&one, &DownloadOptions { drop_parts: vec![0], ..Default::default() });
+        assert!(picks.dropped.is_empty());
+        picks.apply(&one, &mut DownloadOptions::default()).unwrap();
     }
 
     #[test]

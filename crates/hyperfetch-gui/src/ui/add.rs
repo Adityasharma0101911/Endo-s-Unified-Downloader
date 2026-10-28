@@ -462,13 +462,19 @@ pub(super) fn channel_prompt(app: &mut App, ui: &mut Ui) {
         // Answered, its ghost fades out as the banner alone.
         let Some(list) = app.channel_lists.first_mut().filter(|list| list.input == input) else { return };
         let filter = list.filter.trim().to_string();
-        let matches = |text: &str| hyperfetch_core::pattern_matches(&filter, text);
-        let shown: Vec<usize> = (0..list.channels.len())
-            .filter(|&at| {
-                let channel = &list.channels[at].0;
-                filter.is_empty() || matches(&channel.name) || channel.group.as_deref().is_some_and(matches)
-            })
-            .collect();
+        // Matched again only when the filter changes: a list may hold 100,000 channels.
+        let shown = match list.shown.take() {
+            Some((key, shown)) if key == filter => shown,
+            _ => {
+                let matches = |text: &str| hyperfetch_core::pattern_matches(&filter, text);
+                (0..list.channels.len())
+                    .filter(|&at| {
+                        let channel = &list.channels[at].0;
+                        filter.is_empty() || matches(&channel.name) || channel.group.as_deref().is_some_and(matches)
+                    })
+                    .collect()
+            }
+        };
         ui.add_space(4.0);
         card(ui).inner_margin(10.0).show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -496,6 +502,7 @@ pub(super) fn channel_prompt(app: &mut App, ui: &mut Ui) {
                 }
             });
         });
+        list.shown = Some((filter, shown));
     });
 }
 
