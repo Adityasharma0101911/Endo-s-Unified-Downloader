@@ -1064,7 +1064,7 @@ fn local_offset(epoch: i64) -> i64 {
 }
 
 /// `epoch` (seconds since 1970) as this computer's clock shows it: `2026-10-10 21:00:05`.
-pub(crate) fn clock_text(epoch: f64) -> String {
+pub fn clock_text(epoch: f64) -> String {
     let local = epoch.floor() as i64 + local_offset(epoch.floor() as i64);
     let (year, month, day) = crate::engine::civil_from_days(local.div_euclid(86_400));
     let time = local.rem_euclid(86_400);

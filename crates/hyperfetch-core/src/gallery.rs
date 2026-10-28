@@ -215,11 +215,7 @@ fn asset() -> Option<&'static str> {
 async fn gallery_dl(proxy: Option<&str>) -> Result<PathBuf, String> {
     // Serializes installs across concurrent galleries.
     static INSTALL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-    let found = || {
-        let name = exe_name("gallery-dl");
-        let managed = crate::media::managed_bin_dir().map(|dir| dir.join(&name));
-        crate::media::find_in_path(&name).or_else(|| managed.filter(|p| p.is_file()))
-    };
+    let found = find_gallery_dl;
     if let Ok(Some(bin)) = tokio::task::spawn_blocking(found).await {
         return Ok(bin);
     }
@@ -229,6 +225,14 @@ async fn gallery_dl(proxy: Option<&str>) -> Result<PathBuf, String> {
     }
     let bin_dir = crate::media::managed_bin_dir().ok_or("Cannot determine a per-user directory to install gallery-dl into")?;
     install(&crate::media::http_client(proxy)?, LATEST, &bin_dir).await
+}
+
+/// The gallery-dl a gallery would run when one is there already (see [`gallery_dl`]): on PATH,
+/// else the managed one. Installs nothing. Blocking.
+pub fn find_gallery_dl() -> Option<PathBuf> {
+    let name = exe_name("gallery-dl");
+    let managed = crate::media::managed_bin_dir().map(|dir| dir.join(&name));
+    crate::media::find_in_path(&name).or_else(|| managed.filter(|p| p.is_file()))
 }
 
 /// Installs the release file of [`asset`] that `api` (Codeberg's description of a release) lists
