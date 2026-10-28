@@ -5,7 +5,8 @@ What changed in each release, newest first. Each release's page on [GitHub](http
 ## Unreleased
 
 - Subtitles in WebVTT, TTML/IMSC and inside MP4 segments (`stpp`, `wvtt`) are read into one timeline, joined across segments and written as SRT or WebVTT, for stream downloads to keep.
-- **DASH and stream tracks:** on-demand DASH manifests (`.mpd`) download natively, with resume, expired links renewed and several periods joined; an HLS master playlist's separate audio downloads natively too. A video spec (`1080p`, `hevc`, `hdr`, `30fps`, ...) and an audio spec (languages, `all`, `eac3`, `6ch`, ...) or track ids choose the tracks; several are joined by ffmpeg without re-encoding, each audio track tagged with its language. Live DASH still goes to yt-dlp.
+- **DASH and stream tracks:** on-demand DASH manifests (`.mpd`) download natively, with resume, expired links renewed and several periods joined; an HLS master playlist's separate audio downloads natively too. A video spec (`1080p`, `hevc`, `hdr`, `30fps`, ...) and an audio spec (languages, `all`, `eac3`, `6ch`, ...) or track ids choose the tracks; several are joined by ffmpeg without re-encoding, each audio track tagged with its language.
+- **Live HLS and DASH recorded natively:** a live playlist or dynamic DASH manifest is recorded by the engine itself, every chosen track side by side and written as it comes, from now, its oldest segment (`--live-from-start`) or a time ago or clock time (`--live-from`), until it ends, `--record-seconds`, no new segment for `--live-idle-timeout` seconds, or a stop, then joined and remuxed as a download is. Expired segments are skipped as gaps; the free-space guard and "keep what was recorded" rules apply as for other recordings. Media sites are still recorded by yt-dlp.
 
 ## 1.8.0 (2026-10-27)
 

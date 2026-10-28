@@ -48,7 +48,7 @@ pub use engine::{
 pub use resolver::SmartResolver;
 pub use hls::{HlsEngine, HlsSegment, HlsError, parse_hls_playlist};
 pub use stream::{
-    choose as choose_tracks, list_tracks, AudioSpec, DynamicRange, Format as StreamFormat, Kind as TrackKind, Part, Role as TrackRole,
+    choose as choose_tracks, list_tracks, AudioSpec, DynamicRange, Format as StreamFormat, Kind as TrackKind, LiveStart, Part, Role as TrackRole,
     StreamInfo, Track, TrackChoice, VideoSpec,
 };
 pub use metalink::{parse_metalink, MetalinkFile};

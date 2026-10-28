@@ -192,6 +192,8 @@ pub(crate) struct Piece {
     pub protected: bool,
     /// Shared by every track that follows its representation.
     pub addressing: Arc<Addressing>,
+    /// Seconds after the presentation's start the period starts, when the manifest tells.
+    pub start: Option<f64>,
 }
 
 /// A track's representation in each period it is in, in order, and its file extension.
@@ -590,6 +592,14 @@ pub(crate) struct Mpd {
     pub duration: Option<f64>,
     pub tracks: Vec<(crate::stream::Track, Rendition)>,
     pub parts: Vec<Part>,
+    /// `availabilityStartTime`, in seconds since 1970: when a live manifest's time starts.
+    pub available_from: Option<f64>,
+    /// `minimumUpdatePeriod`, in seconds: how long a live manifest stays as it is, at least.
+    pub update_every: Option<f64>,
+    /// `timeShiftBufferDepth`, in seconds: how far back a live manifest's segments are kept.
+    pub buffer: Option<f64>,
+    /// Its first `UTCTiming` that [`clock_offset`] reads: scheme and value.
+    pub clock: Option<(String, String)>,
 }
 
 /// Reads the manifest `text`, fetched from `url` (after redirects; its `BaseURL`s resolve against
@@ -646,7 +656,7 @@ pub(crate) fn parse(text: &str, url: &Url) -> Result<Mpd, HlsError> {
             .enumerate()
             .filter_map(|(n, period)| {
                 let same = if n == reference { rep } else { follow(period, rep)? };
-                Some(Piece { length: lengths[n], protected: same.protected, addressing: same.addressing.clone() })
+                Some(Piece { length: lengths[n], protected: same.protected, addressing: same.addressing.clone(), start: starts[n] })
             })
             .collect();
         tracks.push((Track { id, ..rep.track.clone() }, Rendition { ext: rep.ext, pieces }));
@@ -662,12 +672,171 @@ pub(crate) fn parse(text: &str, url: &Url) -> Result<Mpd, HlsError> {
         .collect();
     let settings: Vec<String> = parts.iter().map(|p| p.summary.clone()).collect();
     mark_ads(&mut parts, &settings);
+    const CLOCKS: [&str; 4] = ["utc:direct", "utc:http-iso", "utc:http-xsdate", "utc:http-head"];
+    let clock = mpd
+        .all("UTCTiming")
+        .filter_map(|timing| Some((timing.attr("schemeIdUri")?.to_string(), timing.attr("value")?.to_string())))
+        .find(|(scheme, _)| CLOCKS.iter().any(|known| scheme.contains(known)));
     Ok(Mpd {
         live: mpd.attr("type") == Some("dynamic"),
         duration: total.or_else(|| lengths.iter().copied().sum()),
         tracks,
         parts,
+        available_from: mpd.attr("availabilityStartTime").and_then(crate::hls::epoch_seconds),
+        update_every: mpd.attr("minimumUpdatePeriod").and_then(seconds),
+        buffer: mpd.attr("timeShiftBufferDepth").and_then(seconds),
+        clock,
     })
+}
+
+/// Seconds back a live manifest that does not say how far back it keeps its segments
+/// (`timeShiftBufferDepth`) and numbers them (no timeline) is taken to keep them.
+// shortcut: such a manifest keeps them all by the standard; six hours bounds what one listing makes.
+const UNTOLD_BUFFER: f64 = 6.0 * 3600.0;
+
+impl Template {
+    /// The segments of a period `length` seconds long (when told) that have ended `elapsed`
+    /// seconds after it started, and not `buffer` seconds or more before that: each its number,
+    /// its time (in `timescale` units), and its start and length in seconds from the period's
+    /// start.
+    fn live(&self, elapsed: f64, length: Option<f64>, buffer: f64) -> Result<Vec<(u64, u64, f64, f64)>, HlsError> {
+        let scale = self.timescale as f64;
+        let end = length.unwrap_or(f64::INFINITY);
+        let since = if buffer.is_finite() { elapsed - buffer } else { f64::NEG_INFINITY };
+        let mut out = Vec::new();
+        let mut keep = |number: u64, time: u64, at: f64, secs: f64| {
+            if at + secs <= elapsed + 1e-6 && at < end - 1e-6 && at + secs > since {
+                if out.len() == MAX_SEGMENTS {
+                    return Err(too_many());
+                }
+                out.push((number, time, at, secs));
+            }
+            Ok(())
+        };
+        if !self.timeline.is_empty() {
+            // Times in `timescale` units, as the timeline gives them (from `presentationTimeOffset`).
+            let at = |secs: f64| self.offset as f64 + secs * scale;
+            let (now, gone, stop) = (at(elapsed), at(since), at(end));
+            let (mut time, mut number) = (0u64, self.start_number);
+            for (k, &(t, d, r)) in self.timeline.iter().enumerate() {
+                time = t.unwrap_or(time);
+                if d == 0 {
+                    return Err(malformed("a SegmentTimeline entry without a duration"));
+                }
+                let count = match u64::try_from(r) {
+                    Ok(r) => r.saturating_add(1),
+                    Err(_) => {
+                        let next = self.timeline.get(k + 1).and_then(|next| next.0).map_or(stop.min(now), |next| next as f64);
+                        ((next - time as f64) / d as f64).ceil().max(0.0) as u64
+                    }
+                };
+                // Only those that have ended by now, from about the oldest still kept.
+                let ready = (((now - time as f64) / d as f64).floor().max(0.0) as u64).min(count);
+                let first = (((gone - time as f64) / d as f64).floor() - 1.0).max(0.0) as u64;
+                for n in first.min(ready)..ready {
+                    let start = time.saturating_add(n.saturating_mul(d));
+                    keep(number.saturating_add(n), start, (start as f64 - self.offset as f64) / scale, d as f64 / scale)?;
+                }
+                time = time.saturating_add(count.saturating_mul(d));
+                number = number.saturating_add(count);
+            }
+        } else if let Some(d) = self.duration {
+            let secs = d as f64 / scale;
+            if !end.is_finite() && !elapsed.is_finite() && self.end_number.is_none() {
+                return Err(malformed("a SegmentTemplate without an end: the period's length is not given"));
+            }
+            // Segment k runs from k * secs to (k + 1) * secs: the last is the last to have ended,
+            // or to start before the period's end.
+            let mut last = ((elapsed / secs + 1e-6).floor() as i64).saturating_sub(1).min(((end / secs - 1e-6).ceil() as i64).saturating_sub(1));
+            if let Some(end) = self.end_number {
+                last = last.min(end.saturating_sub(self.start_number) as i64);
+            }
+            let first = ((since / secs).floor() as i64).saturating_sub(1).max(0).max(last.saturating_sub(MAX_SEGMENTS as i64 - 1));
+            for k in first..=last {
+                let k = k as u64;
+                keep(self.start_number.saturating_add(k), self.offset.saturating_add(k.saturating_mul(d)), k as f64 * secs, secs)?;
+            }
+        } else {
+            return Err(malformed("a live SegmentTemplate with neither a duration nor a timeline"));
+        }
+        Ok(out)
+    }
+}
+
+/// The segments of `rendition` a live manifest `mpd` offers at `now` (seconds since 1970 by its
+/// server's clock), after the one numbered `after` (see [`crate::stream::Listing`]): its periods'
+/// segments that have ended by then and are not older than its `timeShiftBufferDepth`, all of
+/// them once it is static. A segment is numbered by its start in milliseconds from the
+/// presentation's start; each period after the first starts a new part. It has ended once it is
+/// static, its presentation's length has passed, or its last period has with no updates to come.
+/// Only segments a `SegmentTemplate` gives are found; a DRM-protected representation is refused.
+pub(crate) fn live_listing(mpd: &Mpd, rendition: &Rendition, now: f64, after: Option<u64>) -> Result<crate::stream::Listing, HlsError> {
+    if rendition.pieces.iter().any(|p| p.protected) {
+        return Err(HlsError::Unsupported("DRM-protected stream".to_string()));
+    }
+    let origin = mpd.available_from.unwrap_or(0.0);
+    let (mut segments, mut dates) = (Vec::new(), Vec::new());
+    for (n, piece) in rendition.pieces.iter().enumerate() {
+        // shortcut: a live SegmentList or SegmentBase is refused; read their segments by position if one turns up.
+        let Addressing::Template(template) = &*piece.addressing else {
+            return Err(HlsError::Unsupported("a live DASH stream whose segments no SegmentTemplate gives".to_string()));
+        };
+        let start = piece.start.unwrap_or(0.0);
+        // A static manifest has all of each period.
+        let elapsed = if mpd.live { now - origin - start } else { f64::INFINITY };
+        let buffer = match (mpd.live, mpd.buffer) {
+            (true, Some(buffer)) => buffer,
+            (true, None) if template.timeline.is_empty() => UNTOLD_BUFFER,
+            _ => f64::INFINITY,
+        };
+        let init = template.init()?.map(|url| Arc::new(InitSection { url, byte_range: None, encryption: None }));
+        for (k, (number, time, at, secs)) in template.live(elapsed, piece.length, buffer)?.into_iter().enumerate() {
+            let sequence = ((start + at) * 1000.0).round().max(0.0) as u64;
+            if after.is_some_and(|after| sequence <= after) {
+                continue;
+            }
+            let url = template.link(&template.media, number, time)?;
+            let index = segments.len();
+            segments.push(HlsSegment { index, sequence, url, duration_secs: secs, byte_range: None, encryption: None, init: init.clone(), discontinuity: n > 0 && k == 0 });
+            dates.push(origin + start + at);
+        }
+    }
+    // A manifest that may still change (`minimumUpdatePeriod`) ends by turning static.
+    let over = |length: Option<f64>, start: Option<f64>| length.is_some_and(|length| now - origin - start.unwrap_or(0.0) >= length);
+    let last = rendition.pieces.last();
+    let ended = !mpd.live || (mpd.update_every.is_none() && (over(mpd.duration, None) || last.is_some_and(|p| over(p.length, p.start))));
+    let lasts = segments.last().map_or(2.0, |s| s.duration_secs);
+    Ok(crate::stream::Listing { segments, dates, ended, refresh: mpd.update_every.map_or(lasts, |every| every.min(lasts)), ext: rendition.ext, now })
+}
+
+/// Seconds the clock of `mpd`'s server (fetched from `base`) is ahead of this computer's at `now`
+/// (seconds since 1970), as its `UTCTiming` tells: the time itself (`direct`), or a link whose
+/// answer gives it in its body (`http-iso`, `http-xsdate`) or `Date` header (`http-head`). 0 when
+/// it gives none this reads, or that fails: the clocks are taken to agree.
+pub(crate) async fn clock_offset(client: &Client, auth: Option<&Auth>, fetch: FetchPolicy, mpd: &Mpd, base: &Url, now: f64) -> f64 {
+    let Some((scheme, value)) = &mpd.clock else { return 0.0 };
+    let link = value.split_whitespace().next().and_then(|first| base.join(first).ok());
+    let server = match link {
+        _ if scheme.contains("direct") => crate::hls::epoch_seconds(value),
+        Some(link) if scheme.contains("http-head") => {
+            let request = |url: &Url| crate::worker::authorize(client.head(url.clone()), auth, url);
+            let answer = tokio::time::timeout(fetch.stall_timeout, crate::worker::send(request, &link)).await.ok().and_then(Result::ok);
+            let date = answer.and_then(|a| a.headers().get(reqwest::header::DATE)?.to_str().ok().and_then(crate::engine::parse_http_date));
+            date.map(|secs| secs as f64)
+        }
+        Some(link) => {
+            let body = crate::hls::fetch_manifest(client, auth, &link, fetch, false).await.ok();
+            body.and_then(|(body, _)| crate::hls::epoch_seconds(String::from_utf8_lossy(&body).trim()))
+        }
+        None => None,
+    };
+    match server {
+        Some(server) => server - now,
+        None => {
+            tracing::warn!("Could not read the time from the stream's server ({scheme} {value}); going by this computer's clock");
+            0.0
+        }
+    }
 }
 
 /// The segments of `rendition`: its periods one after the other, each after the first starting a
@@ -900,6 +1069,73 @@ pub(crate) mod tests {
         );
         let err = segments(&Client::new(), None, FETCH, &endless.tracks[0].1).await.unwrap_err();
         assert!(matches!(err, HlsError::Unsupported(_)), "{err}");
+    }
+
+    /// The segments of a live manifest's track at `now` seconds after its start, after `after`:
+    /// (number in its link, start in ms, date after the start, discontinuity).
+    fn live_at(mpd: &Mpd, now: f64, after: Option<u64>) -> (Vec<(String, u64, f64, bool)>, bool) {
+        let origin = mpd.available_from.unwrap();
+        let listing = live_listing(mpd, &mpd.tracks[0].1, origin + now, after).unwrap();
+        let name = |s: &HlsSegment| s.url.path().rsplit('/').next().unwrap().trim_end_matches(".m4s").to_string();
+        let segments = listing.segments.iter().zip(&listing.dates).map(|(s, date)| (name(s), s.sequence, date - origin, s.discontinuity)).collect();
+        (segments, listing.ended)
+    }
+
+    /// A live manifest offers the segments its clock has made: by number, those that have ended
+    /// and are still in its time-shift buffer; by a timeline (repeating up to now), what it lists
+    /// that has ended; a later period goes on from the one before, its first segment a new part.
+    /// Each is numbered by its start in milliseconds, and dated from the manifest's start. Turned
+    /// static, it offers all of each period and has ended.
+    #[test]
+    fn test_a_live_manifest_offers_the_segments_its_clock_has_made() {
+        let numbered = |kind: &str, update: &str| {
+            parsed(&format!(
+                r#"<MPD type="{kind}" availabilityStartTime="2024-01-01T00:00:00Z" timeShiftBufferDepth="PT6S" {update} mediaPresentationDuration="PT12S">
+                <Period id="a" start="PT0S" duration="PT8S"><AdaptationSet contentType="audio"><SegmentTemplate media="a/$Number$.m4s" duration="2" startNumber="10"/>
+                <Representation id="a" bandwidth="1" codecs="mp4a.40.2"/></AdaptationSet></Period>
+                <Period id="b" start="PT8S"><AdaptationSet contentType="audio"><SegmentTemplate media="b/$Number$.m4s" initialization="b/init.mp4" duration="2"/>
+                <Representation id="a" bandwidth="1" codecs="mp4a.40.2"/></AdaptationSet></Period></MPD>"#
+            ))
+        };
+        let live = numbered("dynamic", r#"minimumUpdatePeriod="PT1S""#);
+        assert_eq!((live.available_from, live.update_every, live.buffer), (Some(1_704_067_200.0), Some(1.0), Some(6.0)));
+        // 9.5 s in: segments 0 to 3 of the first period have ended, 1 to 3 within the buffer.
+        let segments = vec![("11".into(), 2000, 2.0, false), ("12".into(), 4000, 4.0, false), ("13".into(), 6000, 6.0, false)];
+        assert_eq!(live_at(&live, 9.5, None), (segments, false));
+        // 11 s in, after the second: the first period's last one, and the second's first, a new part.
+        assert_eq!(live_at(&live, 11.0, Some(4000)), (vec![("13".into(), 6000, 6.0, false), ("1".into(), 8000, 8.0, true)], false));
+        assert!(!live_at(&live, 12.5, None).1, "it may still change");
+        assert!(live_at(&numbered("dynamic", ""), 12.5, None).1, "the presentation's length has passed");
+        let (segments, ended) = live_at(&numbered("static", ""), 1.0, Some(8000));
+        assert_eq!((segments, ended), (vec![("2".into(), 10_000, 10.0, false)], true));
+        let timeline = parsed(
+            r#"<MPD type="dynamic" availabilityStartTime="2024-01-01T00:00:00Z"><Period start="PT10S"><AdaptationSet contentType="audio">
+            <SegmentTemplate timescale="10" presentationTimeOffset="100" media="t/$Time$.m4s"><SegmentTimeline><S t="100" d="20" r="1"/><S d="10" r="-1"/></SegmentTimeline></SegmentTemplate>
+            <Representation id="a" bandwidth="1" codecs="mp4a.40.2"/></AdaptationSet></Period></MPD>"#,
+        );
+        // 7.5 s into the period: two of 2 s, then of 1 s up to now.
+        let (segments, _) = live_at(&timeline, 17.5, None);
+        let starts: Vec<(String, u64)> = segments.into_iter().map(|(name, sequence, ..)| (name, sequence)).collect();
+        let expected = [("100", 10_000), ("120", 12_000), ("140", 14_000), ("150", 15_000), ("160", 16_000)];
+        assert_eq!(starts, expected.map(|(name, at)| (name.to_string(), at)));
+        assert!(live_at(&timeline, 5.0, None).0.is_empty(), "the period has not started");
+        let listed = parsed(
+            r#"<MPD type="dynamic" availabilityStartTime="2024-01-01T00:00:00Z"><Period><AdaptationSet contentType="audio">
+            <SegmentList duration="2"><SegmentURL media="a.m4s"/></SegmentList><Representation id="a" bandwidth="1" codecs="mp4a.40.2"/></AdaptationSet></Period></MPD>"#,
+        );
+        assert!(matches!(live_listing(&listed, &listed.tracks[0].1, 1e9, None), Err(HlsError::Unsupported(_))));
+    }
+
+    /// The server's clock is read from the manifest's `UTCTiming`: given in it, or not at all.
+    #[tokio::test]
+    async fn test_the_servers_clock_is_read_from_the_manifest() {
+        let mpd = |timing: &str| parsed(&format!(r#"<MPD type="dynamic"><UTCTiming {timing}/><Period><AdaptationSet contentType="audio"><SegmentTemplate media="$Number$" duration="2"/><Representation id="a" bandwidth="1" codecs="mp4a.40.2"/></AdaptationSet></Period></MPD>"#));
+        let base = Url::parse("http://127.0.0.1:9/m.mpd").unwrap();
+        let direct = mpd(r#"schemeIdUri="urn:mpeg:dash:utc:direct:2014" value="2024-01-01T00:00:30Z""#);
+        assert_eq!(clock_offset(&Client::new(), None, FETCH, &direct, &base, 1_704_067_225.0).await, 5.0);
+        let unknown = mpd(r#"schemeIdUri="urn:mpeg:dash:utc:ntp:2014" value="pool.ntp.org""#);
+        assert!(unknown.clock.is_none());
+        assert_eq!(clock_offset(&Client::new(), None, FETCH, &unknown, &base, 0.0).await, 0.0);
     }
 
     /// A file with a segment index is fetched as its init section and the segments the index

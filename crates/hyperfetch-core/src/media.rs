@@ -307,9 +307,9 @@ const LIVE_STOP_GRACE: Duration = if cfg!(test) { Duration::from_secs(3) } else 
 /// A live recording is ended as a stop ends it once less than what it recorded and this is left
 /// on its disk (see [`run_ytdlp`]): finishing the file (yt-dlp's fixup and tags, the remux to
 /// MP4, joining its streams) writes a copy of it, and a full disk would cut it off mid-write.
-const MIN_FREE_SPACE: u64 = 512 * 1024 * 1024;
+pub(crate) const MIN_FREE_SPACE: u64 = 512 * 1024 * 1024;
 /// How often the space left on a live recording's disk is looked at.
-const DISK_CHECK_EVERY: Duration = if cfg!(test) { Duration::from_millis(100) } else { Duration::from_secs(10) };
+pub(crate) const DISK_CHECK_EVERY: Duration = if cfg!(test) { Duration::from_millis(100) } else { Duration::from_secs(10) };
 /// Keeps ffmpeg from moving the index of a file it writes tags into to the front (see
 /// [`NO_FASTSTART`]).
 const NO_FASTSTART_METADATA: [&str; 2] = ["--postprocessor-args", "Metadata+ffmpeg_o:-movflags -faststart"];
@@ -3383,11 +3383,11 @@ async fn run_ytdlp_watching(
 }
 
 /// How the error of a live recording that ended early goes on, naming the file it was kept as.
-const RECORDING_KEPT: &str = "what it recorded is kept as";
+pub(crate) const RECORDING_KEPT: &str = "what it recorded is kept as";
 
 /// What a stopped run gives (see [`stopped`]): a live recording ended because only `disk_full`
 /// bytes were left on its disk fails, naming the file that keeps what it recorded.
-fn ended(kept: Result<PathBuf, String>, disk_full: Option<u64>) -> Result<PathBuf, String> {
+pub(crate) fn ended(kept: Result<PathBuf, String>, disk_full: Option<u64>) -> Result<PathBuf, String> {
     match (kept, disk_full) {
         (Ok(path), Some(free)) => Err(format!(
             "The live recording was ended with only {:.1} MiB left on the disk; {RECORDING_KEPT} {}",
@@ -3400,7 +3400,7 @@ fn ended(kept: Result<PathBuf, String>, disk_full: Option<u64>) -> Result<PathBu
 
 /// The bytes left on the disk of the live recording `files` (see [`OutputState::recording`]),
 /// and those recorded into them so far; None when the space left cannot be told. Blocking.
-fn room_left(files: &[PathBuf]) -> Option<(u64, u64)> {
+pub(crate) fn room_left(files: &[PathBuf]) -> Option<(u64, u64)> {
     let free = free_space(files.first()?.parent()?)?;
     let written = files.iter().flat_map(|file| [crate::engine::part_path(file), file.clone()]).filter_map(|file| std::fs::metadata(file).ok());
     Some((free, written.map(|meta| meta.len()).sum()))
