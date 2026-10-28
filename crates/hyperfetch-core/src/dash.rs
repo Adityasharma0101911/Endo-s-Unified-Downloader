@@ -872,7 +872,7 @@ pub(crate) fn live_listing(mpd: &Mpd, rendition: &Rendition, now: f64, after: Op
     let over = |length: Option<f64>, start: Option<f64>| length.is_some_and(|length| now - origin - start.unwrap_or(0.0) >= length + late);
     let ended = !mpd.live || (mpd.update_every.is_none() && (over(mpd.duration, None) || last.is_some_and(|p| over(p.length, p.start))));
     let lasts = segments.last().map_or(2.0, |s| s.duration_secs);
-    Ok(crate::stream::Listing { segments, dates, ended, refresh: mpd.update_every.map_or(lasts, |every| every.min(lasts)), ext: rendition.ext, now })
+    Ok(crate::stream::Listing { segments, dates, ended, refresh: mpd.update_every.map_or(lasts, |every| every.min(lasts)), ext: rendition.ext })
 }
 
 /// Seconds the clock of `mpd`'s server (fetched from `base`) is ahead of this computer's at `now`

@@ -854,8 +854,6 @@ pub(crate) struct Listing {
     pub refresh: f64,
     /// The extension of a file of them.
     pub ext: &'static str,
-    /// Now, in seconds since 1970, by the clock of `dates`.
-    pub now: f64,
 }
 
 /// The manifests of a live recording's tracks, read again each round (see
