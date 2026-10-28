@@ -10,14 +10,14 @@ use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
 use futures_util::stream::FuturesUnordered;
 use futures_util::StreamExt;
 use reqwest::{Client, StatusCode};
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use url::Url;
 use thiserror::Error;
 use crate::engine::EngineSnapshot;
 use crate::range::ByteRange;
 use crate::storage::{FileDigest, StreamHasher};
-use crate::stream::{Kind, Role, Track};
+use crate::stream::{Kind, LiveStart, Role, Track};
 use crate::worker::{authorize, send, Auth, RateLimiter};
 
 const MAX_CONNECTIONS: usize = 64;
@@ -472,7 +472,7 @@ fn break_left(spec: &str) -> f64 {
 
 /// Seconds since 1970 of an ISO 8601 date and time as playlists give them
 /// (`2024-05-01T12:00:00.250Z`, `...+02:00`).
-fn epoch_seconds(date: &str) -> Option<f64> {
+pub(crate) fn epoch_seconds(date: &str) -> Option<f64> {
     let (day, time) = date.trim().split_once(['T', 't'])?;
     let mut ymd = day.splitn(3, '-').map(|n| n.parse::<i64>().ok());
     let (year, month, day) = (ymd.next()??, ymd.next()??, ymd.next()??);
@@ -530,22 +530,41 @@ pub(crate) async fn parse_media_playlist(
         let keys = text.lines().filter_map(|l| l.trim().strip_prefix("#EXT-X-KEY:"));
         return Err(keys.map(|list| clear_key(&parse_attributes(list))).find_map(Result::err).unwrap_or(HlsError::Live));
     }
+    let (segments, _) = walk_media_playlist(client, auth, text, base, fetch, &mut HashMap::new()).await?;
+    if segments.is_empty() {
+        return Err(HlsError::NoSegments);
+    }
+    Ok(segments)
+}
 
+/// The segments the media playlist `text` lists, ads left out, with when each starts by
+/// `#EXT-X-PROGRAM-DATE-TIME` (seconds since 1970). `keys` holds the AES keys known already, and
+/// gets those fetched for it.
+async fn walk_media_playlist(
+    client: &Client,
+    auth: Option<&Auth>,
+    text: &str,
+    base: &Url,
+    fetch: FetchPolicy,
+    keys: &mut HashMap<Url, [u8; 16]>,
+) -> Result<(Vec<HlsSegment>, Vec<Option<f64>>), HlsError> {
     let join = |uri: &str| base.join(uri).map_err(|e| malformed(format!("invalid URL '{}': {}", uri, e)));
 
     // Playlists that rotate keys name hundreds of them: they are fetched several at once, ahead of
     // the walk below, which waits only for the key it has reached. A key that could not be fetched
     // ends the walk where it is used, so errors come in playlist order, and the fetches still in
     // flight then, never needed, are dropped.
-    let mut prefetched = futures_util::stream::iter(key_urls(text, base))
+    let known: Vec<Url> = keys.keys().cloned().collect();
+    let mut prefetched = futures_util::stream::iter(key_urls(text, base).into_iter().filter(|url| !known.contains(url)))
         .map(|url| async move {
             let key = fetch_key(client, auth, &url, fetch).await;
             (url, key)
         })
         .buffer_unordered(KEY_CONCURRENCY);
-    let mut key_cache: HashMap<Url, Result<[u8; 16], String>> = HashMap::new();
+    let mut key_cache: HashMap<Url, Result<[u8; 16], String>> = keys.iter().map(|(url, key)| (url.clone(), Ok(*key))).collect();
 
     let mut segments = Vec::new();
+    let mut dates = Vec::new();
     let mut media_sequence: u64 = 0;
     // Segments listed so far, ads included.
     let mut listed: u64 = 0;
@@ -605,12 +624,13 @@ pub(crate) async fn parse_media_playlist(
                             // Not among the keys fetched ahead: fetch it now.
                             None => {
                                 let k = fetch_key(client, auth, &key_url, fetch).await;
-                                key_cache.insert(key_url, k.clone());
+                                key_cache.insert(key_url.clone(), k.clone());
                                 break k;
                             }
                         }
                     }
                     .map_err(HlsError::Unavailable)?;
+                    keys.insert(key_url, key_bytes);
                     let iv = match attrs.get("IV") {
                         Some(iv) => Some(parse_iv(iv).ok_or_else(|| malformed(format!("invalid IV '{}'", iv)))?),
                         None => None,
@@ -672,13 +692,90 @@ pub(crate) async fn parse_media_playlist(
                 init: init.clone(),
                 discontinuity: std::mem::take(&mut discontinuity),
             });
+            dates.push(starts);
         }
     }
+    Ok((segments, dates))
+}
 
-    if segments.is_empty() {
-        return Err(HlsError::NoSegments);
-    }
-    Ok(segments)
+/// How a live recording goes (see [`HlsEngine::record`]).
+#[derive(Debug, Clone)]
+pub(crate) struct LiveOptions {
+    pub start: LiveStart,
+    /// It ends once its first track has recorded this many seconds of the stream.
+    pub record_seconds: Option<u64>,
+    /// It ends once no track has had a new segment for this long.
+    pub idle: Option<Duration>,
+    /// It ends once its disk has no more than what it recorded and this many bytes left (see
+    /// `media::MIN_FREE_SPACE`).
+    pub margin: u64,
+}
+
+/// Why a live recording ended (see [`HlsEngine::record`]).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum LiveEnd {
+    /// The stream ended (`#EXT-X-ENDLIST`, a DASH manifest that turned static or whose last period
+    /// is over).
+    Stream,
+    /// It was stopped (cancelled).
+    Stopped,
+    /// No segment came for `LiveOptions::idle`.
+    Idle,
+    /// It recorded `LiveOptions::record_seconds`.
+    Time,
+    /// Only this many bytes were left on its disk.
+    DiskFull(u64),
+    /// It broke off: why.
+    Failed(String),
+}
+
+/// Segments of each track a live recording starts with at the newest, as players do.
+const LIVE_START_SEGMENTS: usize = 3;
+/// Shortest and longest wait before a live stream's manifests are read again.
+const LIVE_MIN_REFRESH: f64 = if cfg!(test) { 0.05 } else { 0.5 };
+const LIVE_MAX_REFRESH: f64 = 30.0;
+/// Segments of a track that may be gone in a row (see [`HlsEngine::record`]), the newest the
+/// server lists among them, before the recording gives up: the server refuses them, they did not
+/// expire.
+const MAX_GONE_IN_A_ROW: usize = 10;
+
+/// The segments of a live media playlist `text` (fetched from `base`) of a track of `kind` (see
+/// [`crate::stream::Listing`]), after the one numbered `after`. `now` is seconds since 1970.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn live_playlist(
+    client: &Client,
+    auth: Option<&Auth>,
+    text: &str,
+    base: &Url,
+    fetch: FetchPolicy,
+    keys: &mut HashMap<Url, [u8; 16]>,
+    kind: Kind,
+    now: f64,
+    after: Option<u64>,
+) -> Result<crate::stream::Listing, HlsError> {
+    let (segments, dated) = walk_media_playlist(client, auth, text, base, fetch, keys).await?;
+    let tag = |name: &str| text.lines().map(str::trim).find_map(|line| line.strip_prefix(name)).map(str::trim);
+    let target = tag("#EXT-X-TARGETDURATION:").and_then(|t| t.parse::<f64>().ok()).filter(|t| t.is_finite() && *t > 0.0);
+    // Without program dates, the newest segment is taken to end now.
+    let dates: Vec<f64> = match dated.iter().copied().collect::<Option<Vec<f64>>>() {
+        Some(dates) => dates,
+        None => {
+            let mut at = now;
+            let mut dates: Vec<f64> = segments.iter().rev().map(|s| { at -= s.duration_secs; at }).collect();
+            dates.reverse();
+            dates
+        }
+    };
+    let ext = crate::stream::segments_extension(kind, &segments);
+    let (segments, dates) = segments.into_iter().zip(dates).filter(|(s, _)| after.is_none_or(|after| s.sequence > after)).unzip();
+    Ok(crate::stream::Listing {
+        segments,
+        dates,
+        ended: text.lines().any(|l| l.trim() == "#EXT-X-ENDLIST"),
+        refresh: target.unwrap_or(2.0),
+        ext,
+        now,
+    })
 }
 
 /// The URLs of the AES-128 keys `text` names, each once, in playlist order. Lines the walk in
@@ -1884,6 +1981,266 @@ impl HlsEngine {
         tracing::info!("Stream download and stitching completed: {}", target_file.display());
         Ok(done)
     }
+
+    /// Records the live stream whose tracks `sources` reads, each into its file of `files` (made
+    /// here: none may exist), from where `live` asks to its end (see [`LiveEnd`]). `listings` are
+    /// what the tracks' manifests list now; they are read again each round, every target duration
+    /// of an HLS playlist (half of it after an answer with nothing new), as often as a DASH
+    /// manifest asks or a segment lasts. Each track takes the segments listed after the last one
+    /// it took, fetched at most `options.connections` at once and appended to its file in order
+    /// (see [`InOrder`]), its init section before the first and wherever it changes: what was
+    /// recorded is in the files even after a crash. A segment the server no longer has (401, 403,
+    /// 404 or 410: it expired before it could be fetched) is skipped, and the log names the gap;
+    /// [`MAX_GONE_IN_A_ROW`] of a track gone in a row, the newest it lists among them, end the
+    /// recording, as the server refuses them. Its progress is the size recorded, with nothing to
+    /// reach (see `EngineSnapshot::is_recording`). Returns why it ended, and per track the bytes
+    /// it recorded and where its discontinuities start in them.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn record(
+        client: &Client,
+        auth: Option<&Auth>,
+        sources: &mut crate::stream::LiveSources,
+        mut listings: Vec<crate::stream::Listing>,
+        files: &[PathBuf],
+        options: &HlsOptions,
+        live: &LiveOptions,
+        snapshot_tx: Option<broadcast::Sender<EngineSnapshot>>,
+        cancel_flag: Option<Arc<AtomicBool>>,
+    ) -> (LiveEnd, Vec<(u64, Vec<u64>)>) {
+        let connections = options.connections.clamp(1, MAX_CONNECTIONS);
+        let mut written: Vec<(u64, Vec<u64>)> = vec![(0, Vec::new()); files.len()];
+        let mut outs = Vec::new();
+        for file in files {
+            match tokio::fs::OpenOptions::new().write(true).create_new(true).open(file).await {
+                Ok(out) => outs.push(out),
+                Err(e) => return (LiveEnd::Failed(format!("Failed to create {}: {e}", file.display())), written),
+            }
+        }
+        let is_cancelled = || cancel_flag.as_ref().is_some_and(|c| c.load(Ordering::Relaxed));
+        // Per track: the last segment it took, the init section written last, segments taken and
+        // segments gone in a row.
+        let mut last: Vec<Option<u64>> = vec![None; files.len()];
+        let mut inits: Vec<Option<Arc<InitSection>>> = vec![None; files.len()];
+        let (mut taken, mut gone) = (vec![0usize; files.len()], vec![0usize; files.len()]);
+        // When the recording starts (see `start_from`); with `record_seconds`, the seconds its
+        // first track took and when that ends.
+        let mut from = None;
+        let (mut recorded_secs, mut until) = (0.0, None::<f64>);
+        let received = AtomicU64::new(0);
+        let started = Instant::now();
+        let mut last_new = Instant::now();
+        let mut disk_checked: Option<Instant> = None;
+        let end = 'record: loop {
+            if is_cancelled() {
+                break LiveEnd::Stopped;
+            }
+            if let (None, Some(lead)) = (from, listings.first()) {
+                match start_from(lead, live.start) {
+                    Ok(start) => from = start,
+                    Err(e) => break LiveEnd::Failed(e),
+                }
+            }
+            // The segments new since the last round, track after track, each with whether it is
+            // the newest its track lists.
+            let mut batch: Vec<(usize, HlsSegment, bool)> = Vec::new();
+            for (t, listing) in listings.iter().enumerate().filter(|_| from.is_some()) {
+                let newest = listing.segments.last().map(|s| s.sequence);
+                for (segment, &date) in listing.segments.iter().zip(&listing.dates) {
+                    let new = last[t].map_or(date + segment.duration_secs > from.unwrap_or_default() + 0.001, |last| segment.sequence > last);
+                    let within = match (t, live.record_seconds) {
+                        (0, Some(limit)) => recorded_secs < limit as f64,
+                        _ => until.is_none_or(|until| date < until),
+                    };
+                    if !new || !within {
+                        continue;
+                    }
+                    if let (0, Some(limit)) = (t, live.record_seconds) {
+                        recorded_secs += segment.duration_secs;
+                        if recorded_secs >= limit as f64 {
+                            until = Some(date + segment.duration_secs - 0.001);
+                        }
+                    }
+                    last[t] = Some(segment.sequence);
+                    taken[t] += 1;
+                    batch.push((t, HlsSegment { index: taken[t] - 1, ..segment.clone() }, Some(segment.sequence) == newest));
+                }
+            }
+            if !batch.is_empty() {
+                last_new = Instant::now();
+            }
+            let fetch_one = |i: usize| {
+                let (segment, received, limiter, fetch) = (&batch[i].1, &received, options.limiter.as_deref(), options.fetch);
+                async move {
+                    let tally = Tally::new(received, limiter);
+                    match fetch_segment_once(client, auth, segment, false, &tally, fetch).await {
+                        Ok(data) => {
+                            tally.keep();
+                            Ok(data)
+                        }
+                        Err(e) if e.kind == FetchErrorKind::Expired => {
+                            tracing::warn!("Skipped {} of the live stream, gone from its server ({}): a gap of {:.1} s", segment.url, e.reason, segment.duration_secs);
+                            Ok(Vec::new())
+                        }
+                        Err(e) => Err(HlsError::SegmentFailed { index: segment.index, reason: e.reason }),
+                    }
+                }
+            };
+            let mut window = InOrder::new(batch.len(), connections, WINDOW_PER_CONNECTION * connections, options.fetch.stall_timeout, fetch_one);
+            let mut ticker = tokio::time::interval(SNAPSHOT_INTERVAL);
+            while !window.is_done() {
+                if !window.head_ready() {
+                    tokio::select! {
+                        () = window.progress() => {}
+                        _ = ticker.tick() => if is_cancelled() {
+                            break 'record LiveEnd::Stopped;
+                        },
+                    }
+                    continue;
+                }
+                let (i, mut data) = match window.pop() {
+                    Some(Ok(popped)) => popped,
+                    Some(Err(e)) => break 'record LiveEnd::Failed(e.to_string()),
+                    None => continue,
+                };
+                let (t, segment, newest) = (batch[i].0, &batch[i].1, batch[i].2);
+                if data.is_empty() {
+                    gone[t] += 1;
+                    if gone[t] >= MAX_GONE_IN_A_ROW && newest {
+                        break 'record LiveEnd::Failed(format!("its server refuses the stream's segments ({} in a row, the newest it lists among them)", gone[t]));
+                    }
+                    continue;
+                }
+                gone[t] = 0;
+                if segment.init != inits[t] {
+                    if let Some(init) = &segment.init {
+                        match fetch_init(client, auth, init, options.fetch).await {
+                            Ok(head) => data = [head, data].concat(),
+                            Err(e) => break 'record LiveEnd::Failed(e),
+                        }
+                    }
+                    inits[t].clone_from(&segment.init);
+                }
+                let (bytes, breaks) = &mut written[t];
+                if segment.discontinuity && *bytes > 0 {
+                    breaks.push(*bytes);
+                }
+                if let Err(e) = outs[t].write_all(&data).await {
+                    break 'record LiveEnd::Failed(format!("Failed to write {}: {e}", files[t].display()));
+                }
+                written[t].0 += data.len() as u64;
+                if let Some(tx) = &snapshot_tx {
+                    let _ = tx.send(recording_snapshot(written.iter().map(|w| w.0).sum(), started));
+                }
+                if disk_checked.is_none_or(|at| at.elapsed() >= crate::media::DISK_CHECK_EVERY) {
+                    disk_checked = Some(Instant::now());
+                    if let Some(free) = disk_full(files, live.margin).await {
+                        break 'record LiveEnd::DiskFull(free);
+                    }
+                }
+            }
+            drop(window);
+            if until.is_some() {
+                break LiveEnd::Time;
+            }
+            if listings.iter().all(|l| l.ended) {
+                break LiveEnd::Stream;
+            }
+            if live.idle.is_some_and(|idle| last_new.elapsed() >= idle) {
+                break LiveEnd::Idle;
+            }
+            let refresh = listings.iter().map(|l| l.refresh).fold(f64::INFINITY, f64::min);
+            let mut wait = if batch.is_empty() { refresh / 2.0 } else { refresh }.clamp(LIVE_MIN_REFRESH, LIVE_MAX_REFRESH);
+            if let Some(idle) = live.idle {
+                wait = wait.min(idle.saturating_sub(last_new.elapsed()).as_secs_f64());
+            }
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs_f64(wait.max(0.0))) => {}
+                () = cancelled(&cancel_flag) => break LiveEnd::Stopped,
+            }
+            if disk_checked.is_none_or(|at| at.elapsed() >= crate::media::DISK_CHECK_EVERY) {
+                disk_checked = Some(Instant::now());
+                if let Some(free) = disk_full(files, live.margin).await {
+                    break LiveEnd::DiskFull(free);
+                }
+            }
+            listings = tokio::select! {
+                read = sources.listings(client, auth, options.fetch, crate::stream::now(), &last) => match read {
+                    Ok(read) => read,
+                    Err(e) => break LiveEnd::Failed(e.to_string()),
+                },
+                () = cancelled(&cancel_flag) => break LiveEnd::Stopped,
+            };
+        };
+        for (out, file) in outs.iter_mut().zip(files) {
+            let finished = async {
+                out.flush().await?;
+                if options.fsync_on_complete {
+                    out.sync_data().await?;
+                }
+                Ok::<_, std::io::Error>(())
+            };
+            if let Err(e) = finished.await {
+                tracing::warn!("Failed to finish writing {}: {e}", file.display());
+            }
+        }
+        if let Some(tx) = &snapshot_tx {
+            let _ = tx.send(recording_snapshot(written.iter().map(|w| w.0).sum(), started));
+        }
+        tracing::info!("The live recording ended ({end:?}) with {} bytes", written.iter().map(|w| w.0).sum::<u64>());
+        (end, written)
+    }
+}
+
+/// Where a live recording starts, as `start` asks, by what its first track lists in `lead` (None
+/// while that lists nothing): the newest [`LIVE_START_SEGMENTS`] segments, the oldest, or the time
+/// asked, which must lie in what the server keeps (a time ago later than the newest segment starts
+/// at that one).
+fn start_from(lead: &crate::stream::Listing, start: LiveStart) -> Result<Option<f64>, String> {
+    let (Some(&first), Some(&newest), Some(last)) = (lead.dates.first(), lead.dates.last(), lead.segments.last()) else {
+        return Ok(None);
+    };
+    let asked = match start {
+        LiveStart::Now => return Ok(Some(lead.dates[lead.dates.len().saturating_sub(LIVE_START_SEGMENTS)])),
+        LiveStart::Oldest => return Ok(Some(f64::NEG_INFINITY)),
+        LiveStart::Ago(secs) => (lead.now - secs).min(newest),
+        LiveStart::At(at) => at,
+    };
+    let (edge, slack) = (newest + last.duration_secs, lead.segments[0].duration_secs);
+    if asked + slack < first || asked >= edge {
+        let clock = crate::stream::clock_text;
+        let why = if asked >= edge { "is still to come" } else { "is no longer there" };
+        return Err(format!(
+            "The live stream keeps only {} to {} ({:.0} min): the start asked for, {}, {why}",
+            clock(first),
+            clock(edge),
+            (edge - first) / 60.0,
+            clock(asked)
+        ));
+    }
+    Ok(Some(asked))
+}
+
+/// A live recording's progress: `bytes` recorded since `started`, with no size to reach.
+fn recording_snapshot(bytes: u64, started: Instant) -> EngineSnapshot {
+    let speed_bytes_per_sec = bytes as f64 / started.elapsed().as_secs_f64().max(0.001);
+    EngineSnapshot { downloaded_bytes: bytes, speed_bytes_per_sec, active_workers: 1, ..Default::default() }
+}
+
+/// The bytes left on the disk of the live recording `files`, when less than what it recorded and
+/// `margin` are.
+async fn disk_full(files: &[PathBuf], margin: u64) -> Option<u64> {
+    let files = files.to_vec();
+    let room = tokio::task::spawn_blocking(move || crate::media::room_left(&files)).await.ok().flatten();
+    room.filter(|&(free, recorded)| free < recorded.saturating_add(margin)).map(|(free, _)| free)
+}
+
+/// The init section `init`, fetched and decrypted.
+async fn fetch_init(client: &Client, auth: Option<&Auth>, init: &InitSection, fetch: FetchPolicy) -> Result<Vec<u8>, String> {
+    let limit = init.byte_range.map_or(MAX_SEGMENT_BYTES, |r| r.len().min(MAX_SEGMENT_BYTES));
+    let (data, _) = fetch_with_retry(client, auth, &init.url, init.byte_range, limit, None, fetch)
+        .await
+        .map_err(|e| format!("init section {}: {}", init.url, e.reason))?;
+    decrypt(data, &init.encryption).await.map_err(|e| format!("init section {}: {e}", init.url))
 }
 
 /// Builds a progress snapshot, shown as up to 64 blocks of segments. The total size
@@ -2648,6 +3005,61 @@ video.m3u8
         let start = Url::parse(&format!("http://{}/start/master.m3u8", addr)).unwrap();
         let segments = parse_hls_playlist(&client, &start, None, FETCH).await.unwrap();
         assert_eq!(segments[0].url.path(), "/cdn/abc/v/seg0.ts");
+    }
+
+    /// A listing of segments `secs` long starting at `dates`, read at `now`.
+    fn listing(dates: &[f64], secs: f64, now: f64) -> crate::stream::Listing {
+        let segment = |n: usize| HlsSegment {
+            index: n,
+            sequence: n as u64,
+            url: Url::parse(&format!("http://host.example/{n}.ts")).unwrap(),
+            duration_secs: secs,
+            byte_range: None,
+            encryption: None,
+            init: None,
+            discontinuity: false,
+        };
+        crate::stream::Listing { segments: (0..dates.len()).map(segment).collect(), dates: dates.to_vec(), ended: false, refresh: secs, ext: "ts", now }
+    }
+
+    /// A live recording starts at the newest three segments, the oldest, or the time asked, which
+    /// must lie in what the server keeps (a time ago later than the newest segment starts at it);
+    /// nothing listed yet leaves it to the next read.
+    #[test]
+    fn test_a_live_recording_starts_where_asked_within_what_the_server_keeps() {
+        let lead = listing(&[100.0, 110.0, 120.0, 130.0, 140.0], 10.0, 150.0);
+        assert_eq!(start_from(&lead, LiveStart::Now), Ok(Some(120.0)));
+        assert_eq!(start_from(&lead, LiveStart::Oldest), Ok(Some(f64::NEG_INFINITY)));
+        assert_eq!(start_from(&lead, LiveStart::Ago(35.0)), Ok(Some(115.0)));
+        assert_eq!(start_from(&lead, LiveStart::Ago(2.0)), Ok(Some(140.0)));
+        assert_eq!(start_from(&lead, LiveStart::At(95.0)), Ok(Some(95.0)), "within a segment of the oldest");
+        let gone = start_from(&lead, LiveStart::Ago(80.0)).unwrap_err();
+        assert!(gone.contains("keeps only") && gone.contains("(1 min)") && gone.contains("is no longer there"), "{gone}");
+        assert!(start_from(&lead, LiveStart::At(150.0)).unwrap_err().contains("is still to come"));
+        assert_eq!(start_from(&listing(&[], 10.0, 150.0), LiveStart::Now), Ok(None));
+    }
+
+    /// A live recording ends once its disk has no more left than what it recorded and the margin,
+    /// keeping what it wrote; a playlist's segments are each taken once, from its oldest here.
+    #[tokio::test]
+    async fn test_a_live_recording_ends_when_its_disk_is_nearly_full() {
+        let (addr, _) = serve(|path: &str, _| match path {
+            "/live.m3u8" => ok("#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\ns0.ts\n#EXTINF:1,\ns1.ts\n"),
+            other => ok(other.to_uppercase()),
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let client = Client::new();
+        let origin = Origin { manifest: Url::parse(&format!("http://{addr}/live.m3u8")).unwrap(), track: None };
+        let mut sources = crate::stream::LiveSources::new(vec![(origin, Kind::Video)]);
+        let listings = sources.listings(&client, None, FETCH, crate::stream::now(), &[None]).await.unwrap();
+        assert_eq!((listings[0].ext, listings[0].segments.len(), listings[0].ended), ("ts", 2, false));
+        let file = dir.path().join("live.ts");
+        let live = LiveOptions { start: LiveStart::Oldest, record_seconds: None, idle: None, margin: u64::MAX };
+        let (end, written) = HlsEngine::record(&client, None, &mut sources, listings, &[file.clone()], &options(1), &live, None, None).await;
+        assert!(matches!(end, LiveEnd::DiskFull(_)), "{end:?}");
+        assert_eq!(std::fs::read(&file).unwrap(), b"/S0.TS");
+        assert_eq!(written, [(6, Vec::new())]);
     }
 
     #[tokio::test]

@@ -552,14 +552,20 @@ impl Opened {
     /// by its type; an HLS track's `mp4` (`m4a` for audio) when they have an init section, else
     /// that of packed audio (`.aac`, ...) its segments name, else `ts`.
     pub fn extension(&self, at: usize, segments: &[HlsSegment]) -> &'static str {
-        if let Source::Dash(rendition) = &self.sources[at] {
-            return rendition.ext;
+        match &self.sources[at] {
+            Source::Dash(rendition) => rendition.ext,
+            _ => segments_extension(self.info.tracks[at].kind, segments),
         }
-        if segments.iter().any(|s| s.init.is_some()) {
-            return if self.info.tracks[at].kind == Kind::Audio { "m4a" } else { "mp4" };
+    }
+
+    /// Where a live recording of the stream at `link` reads track `at`'s segments: an HLS
+    /// track's own playlist, a DASH track's manifest; None for audio inside its video's segments.
+    pub fn live_origin(&self, link: &Url, at: usize) -> Option<Origin> {
+        match &self.sources[at] {
+            Source::InVideo => None,
+            Source::Playlist(url) => Some(Origin { manifest: url.clone(), track: None }),
+            Source::Read(_) | Source::Dash(_) => Some(Origin { manifest: link.clone(), track: Some(self.info.tracks[at].id.clone()) }),
         }
-        let named = segments.first().and_then(|s| s.url.path().rsplit_once('.')).map(|(_, ext)| ext.to_ascii_lowercase());
-        ["aac", "mp3", "ac3", "ec3"].into_iter().find(|ext| named.as_deref() == Some(*ext)).unwrap_or("ts")
     }
 
     /// [`Self::info`], with the length and parts of an HLS master playlist's stream, read from
@@ -602,6 +608,232 @@ pub(crate) async fn relist(client: &Client, auth: Option<&Auth>, origin: &Origin
     };
     let at = at.ok_or_else(|| HlsError::Unavailable(format!("{} no longer lists the track", origin.manifest)))?;
     opened.segments(client, auth, fetch, at).await?.ok_or(HlsError::NoSegments)
+}
+
+/// The file extension of an HLS track of `kind` whose segments are `segments`: `mp4` (`m4a` for
+/// audio) when they have an init section, else that of packed audio (`.aac`, ...) they name, else
+/// `ts`.
+pub(crate) fn segments_extension(kind: Kind, segments: &[HlsSegment]) -> &'static str {
+    if segments.iter().any(|s| s.init.is_some()) {
+        return if kind == Kind::Audio { "m4a" } else { "mp4" };
+    }
+    let named = segments.first().and_then(|s| s.url.path().rsplit_once('.')).map(|(_, ext)| ext.to_ascii_lowercase());
+    ["aac", "mp3", "ac3", "ec3"].into_iter().find(|ext| named.as_deref() == Some(*ext)).unwrap_or("ts")
+}
+
+/// The segments a live track's manifest lists now (see [`LiveSources::listings`]).
+#[derive(Debug)]
+pub(crate) struct Listing {
+    /// Their `sequence` grows with time: an HLS media sequence number, a DASH segment's start in
+    /// milliseconds.
+    pub segments: Vec<HlsSegment>,
+    /// When each starts, in seconds since 1970: by the manifest's clock (HLS
+    /// `#EXT-X-PROGRAM-DATE-TIME`, a DASH timeline), else counted back from `now` at the newest.
+    pub dates: Vec<f64>,
+    /// Nothing comes after these: the stream has ended.
+    pub ended: bool,
+    /// Seconds until the manifest is worth reading again.
+    pub refresh: f64,
+    /// The extension of a file of them.
+    pub ext: &'static str,
+    /// Now, in seconds since 1970, by the clock of `dates`.
+    pub now: f64,
+}
+
+/// The manifests of a live recording's tracks, read again each round (see
+/// `HlsEngine::record`).
+pub(crate) struct LiveSources {
+    /// Each track's origin and kind.
+    tracks: Vec<(Origin, Kind)>,
+    /// The AES keys of the HLS playlists, fetched once.
+    keys: std::collections::HashMap<Url, [u8; 16]>,
+    /// Seconds the DASH server's clock is ahead of ours (see `dash::clock_offset`), once known.
+    offset: Option<f64>,
+}
+
+/// A manifest, read for one round of [`LiveSources::listings`].
+enum Read {
+    Playlist(String, Url),
+    Mpd(crate::dash::Mpd),
+}
+
+impl LiveSources {
+    pub fn new(tracks: Vec<(Origin, Kind)>) -> Self {
+        Self { tracks, keys: Default::default(), offset: None }
+    }
+
+    /// What each track's manifest lists at `now` (seconds since 1970 by this computer's clock),
+    /// after the segment numbered `after[track]` when given; each manifest read once. A live HLS
+    /// playlist may not be a master playlist; a DASH track is found by its id.
+    pub async fn listings(&mut self, client: &Client, auth: Option<&Auth>, fetch: FetchPolicy, now: f64, after: &[Option<u64>]) -> Result<Vec<Listing>, HlsError> {
+        let mut read: Vec<(Url, Read)> = Vec::new();
+        let mut listings = Vec::new();
+        for (t, (origin, kind)) in self.tracks.iter().enumerate() {
+            let after = after.get(t).copied().flatten();
+            let at = match read.iter().position(|(url, _)| *url == origin.manifest) {
+                Some(at) => at,
+                None => {
+                    let (body, base) = crate::hls::fetch_manifest(client, auth, &origin.manifest, fetch, false).await?;
+                    let body = String::from_utf8_lossy(&body);
+                    let body = body.trim_start_matches('\u{feff}').trim_start();
+                    let manifest = if body.starts_with("#EXTM3U") {
+                        if crate::hls::is_master(body) {
+                            return Err(HlsError::Unsupported(format!("{} is a master playlist inside a master playlist", origin.manifest)));
+                        }
+                        Read::Playlist(body.to_string(), base)
+                    } else if crate::dash::is_mpd(body.as_bytes()) {
+                        let mpd = crate::dash::parse(body, &base)?;
+                        if self.offset.is_none() {
+                            self.offset = Some(crate::dash::clock_offset(client, auth, fetch, &mpd, &base, now).await);
+                        }
+                        Read::Mpd(mpd)
+                    } else {
+                        return Err(HlsError::Unavailable(format!("{} is no longer a playlist or manifest", origin.manifest)));
+                    };
+                    read.push((origin.manifest.clone(), manifest));
+                    read.len() - 1
+                }
+            };
+            listings.push(match &read[at].1 {
+                Read::Playlist(text, base) => crate::hls::live_playlist(client, auth, text, base, fetch, &mut self.keys, *kind, now, after).await?,
+                Read::Mpd(mpd) => {
+                    let track = mpd.tracks.iter().find(|(track, _)| origin.track.as_ref() == Some(&track.id));
+                    let (_, rendition) = track.ok_or_else(|| HlsError::Unavailable(format!("{} no longer lists the track", origin.manifest)))?;
+                    crate::dash::live_listing(mpd, rendition, now + self.offset.unwrap_or(0.0), after)?
+                }
+            });
+        }
+        Ok(listings)
+    }
+}
+
+/// Where a live recording starts (see `DownloadOptions::live_from_start` and `live_from`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LiveStart {
+    /// At the newest segments, as players start (the default).
+    Now,
+    /// At the oldest segment the server still keeps.
+    Oldest,
+    /// This many seconds before now.
+    Ago(f64),
+    /// At this time, in seconds since 1970.
+    At(f64),
+}
+
+impl LiveStart {
+    /// A catch-up start as `DownloadOptions::live_from` gives it: a time ago (`30m`, `1h30m`,
+    /// `90s`, `45` seconds, `M:SS`, `H:MM:SS`), or a clock time (`2026-10-10T21:00`, `2026-10-10
+    /// 21:00:00`, with `Z` or `+08:00` after it for another time zone than this computer's).
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let text = text.trim();
+        let bad = || format!("Unknown start \"{text}\": a time ago (30m, 1h30m, 90s, 01:00:00) or a clock time (2026-10-10T21:00, 2026-10-10 21:00:00+08:00)");
+        if text.get(4..5) == Some("-") {
+            return clock_time(text).map(Self::At).ok_or_else(bad);
+        }
+        let seconds = if text.contains(':') {
+            let parts: Vec<Option<f64>> = text.split(':').map(|p| p.parse::<f64>().ok().filter(|n| n.is_finite() && *n >= 0.0)).collect();
+            match parts[..] {
+                [Some(m), Some(s)] if s < 60.0 => Some(m * 60.0 + s),
+                [Some(h), Some(m), Some(s)] if m < 60.0 && s < 60.0 => Some(h * 3600.0 + m * 60.0 + s),
+                _ => None,
+            }
+        } else if let Ok(secs) = text.parse::<f64>() {
+            Some(secs).filter(|s| s.is_finite() && *s >= 0.0)
+        } else {
+            // Numbers with units, largest first: `1h30m`, `90s`.
+            let (mut total, mut number, mut units) = (0.0, String::new(), "hms");
+            for c in text.chars() {
+                if c.is_ascii_digit() || c == '.' {
+                    number.push(c);
+                    continue;
+                }
+                let at = units.find(c.to_ascii_lowercase()).ok_or_else(bad)?;
+                total += number.parse::<f64>().map_err(|_| bad())? * [3600.0, 60.0, 1.0][at + 3 - units.len()];
+                (number, units) = (String::new(), &units[at + 1..]);
+            }
+            Some(total).filter(|_| number.is_empty() && !text.is_empty())
+        };
+        seconds.map(Self::Ago).ok_or_else(bad)
+    }
+}
+
+/// Seconds since 1970 of a clock time `YYYY-MM-DD[T ]HH:MM[:SS[.fff]]`, in this computer's time
+/// zone unless `Z` or an offset (`+08:00`, `-0500`) follows it.
+fn clock_time(text: &str) -> Option<f64> {
+    let (day, rest) = (text.get(..10)?, text.get(10..)?);
+    let time = rest.strip_prefix(['T', 't', ' '])?;
+    let (clock, zone) = time.split_at(time.find(['Z', 'z', '+', '-']).unwrap_or(time.len()));
+    let number = |s: &str| s.parse::<i64>().ok().filter(|_| s.bytes().all(|b| b.is_ascii_digit()) && !s.is_empty());
+    let mut date = day.split('-').map(number);
+    let (year, month, mday) = (date.next()??, date.next()??, date.next()??);
+    let mut hms = clock.splitn(3, ':');
+    let (hour, minute) = (number(hms.next()?)?, number(hms.next()?)?);
+    let second = hms.next().map_or(Some(0.0), |s| s.parse::<f64>().ok().filter(|s| s.is_finite() && *s >= 0.0 && *s < 61.0))?;
+    let valid = (1..=12).contains(&month) && (1..=31).contains(&mday) && hour < 24 && minute < 60;
+    let local = (crate::engine::days_from_civil(year, month, mday) * 86_400 + hour * 3600 + minute * 60) as f64 + second;
+    let offset = match zone {
+        "" => local_offset(local as i64) as f64,
+        "Z" | "z" => 0.0,
+        _ => {
+            let digits: String = zone[1..].chars().filter(|c| *c != ':').collect();
+            let (h, m) = (number(digits.get(..2)?)?, number(digits.get(2..).filter(|m| !m.is_empty()).unwrap_or("0"))?);
+            let secs = (h * 3600 + m * 60) as f64;
+            if zone.starts_with('-') { -secs } else { secs }
+        }
+    };
+    valid.then_some(local - offset)
+}
+
+/// Seconds since 1970, now.
+pub(crate) fn now() -> f64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64())
+}
+
+/// Seconds this computer's time zone is ahead of UTC at `epoch` (seconds since 1970); 0 where that
+/// cannot be told.
+fn local_offset(epoch: i64) -> i64 {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::FILETIME;
+        // FILETIMEs count 100 ns from 1601.
+        let ticks = (epoch.saturating_add(11_644_473_600)).max(0) as u64 * 10_000_000;
+        let utc = FILETIME { dwLowDateTime: ticks as u32, dwHighDateTime: (ticks >> 32) as u32 };
+        let mut local = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+        // SAFETY: both point at valid FILETIMEs for the length of the call.
+        if unsafe { windows_sys::Win32::Storage::FileSystem::FileTimeToLocalFileTime(&utc, &mut local) } == 0 {
+            return 0;
+        }
+        let local = (u64::from(local.dwHighDateTime) << 32 | u64::from(local.dwLowDateTime)) as i64;
+        (local - ticks as i64) / 10_000_000
+    }
+    #[cfg(unix)]
+    {
+        let time = epoch as libc::time_t;
+        // SAFETY: tm is plain data, which all zeros is a valid value of; localtime_r fills it from
+        // a valid time.
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        if unsafe { libc::localtime_r(&time, &mut tm) }.is_null() {
+            return 0;
+        }
+        // Its type differs between platforms.
+        #[allow(clippy::unnecessary_cast)]
+        {
+            tm.tm_gmtoff as i64
+        }
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = epoch;
+        0
+    }
+}
+
+/// `epoch` (seconds since 1970) as this computer's clock shows it: `2026-10-10 21:00:05`.
+pub(crate) fn clock_text(epoch: f64) -> String {
+    let local = epoch.floor() as i64 + local_offset(epoch.floor() as i64);
+    let (year, month, day) = crate::engine::civil_from_days(local.div_euclid(86_400));
+    let time = local.rem_euclid(86_400);
+    format!("{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02}", time / 3600, time / 60 % 60, time % 60)
 }
 
 /// What the HLS or DASH stream at `url` holds: its tracks, parts, length and whether it is live,
@@ -728,6 +960,26 @@ mod tests {
         assert_eq!(ids(&info, "none", "fr").unwrap(), ["a2"]);
         let muxed = hls(vec![video("v0", 720, "avc1.64001f,mp4a.40.2", 1), video("v1", 1080, "avc1.640028,mp4a.40.2", 2)]);
         assert_eq!(ids(&muxed, "", "en,6ch").unwrap(), ["v1"]);
+    }
+
+    /// A live start reads as a time ago (units, `M:SS`, `H:MM:SS`, seconds) or as a clock time,
+    /// in this computer's time zone unless it gives one; anything else is refused, saying what
+    /// is taken.
+    #[test]
+    fn test_a_live_start_reads_as_a_time_ago_or_a_clock_time() {
+        for (text, secs) in [("30m", 1800.0), ("1h30m", 5400.0), (" 90s ", 90.0), ("1.5h", 5400.0), ("01:00:00", 3600.0), ("2:30", 150.0), ("45", 45.0)] {
+            assert_eq!(LiveStart::parse(text), Ok(LiveStart::Ago(secs)), "{text}");
+        }
+        let day = crate::engine::days_from_civil(2026, 10, 10) as f64 * 86_400.0;
+        assert_eq!(LiveStart::parse("2026-10-10T21:00Z"), Ok(LiveStart::At(day + 21.0 * 3600.0)));
+        assert_eq!(LiveStart::parse("2026-10-10 21:00:30.5+08:00"), Ok(LiveStart::At(day + 13.0 * 3600.0 + 30.5)));
+        assert_eq!(LiveStart::parse("2026-10-10T21:00-0130"), Ok(LiveStart::At(day + 22.5 * 3600.0)));
+        let Ok(LiveStart::At(local)) = LiveStart::parse("2026-10-10 21:00") else { panic!("a clock time") };
+        assert_eq!(clock_text(local), "2026-10-10 21:00:00");
+        for bad in ["", "soon", "30x", "1m30h", "-5m", "1:75", "2026-13-10T21:00", "2026-10-10T25:00", "2026-10-10", "2026-10-10T21"] {
+            let err = LiveStart::parse(bad).unwrap_err();
+            assert!(err.contains("a time ago (30m"), "{bad}: {err}");
+        }
     }
 
     /// A part much shorter than its neighbours and unlike them looks like an ad; one alike, or
