@@ -792,7 +792,9 @@ pub(super) fn queue_page(app: &mut App, ui: &mut Ui) {
         }
         RowAction::Tracks => {
             app.show_job(id);
-            if let Some(url) = app.queue.get_item(id).and_then(|item| item.urls.first().cloned()) {
+            // Open already: listing again would throw away what is ticked.
+            let open = app.tracks.as_ref().is_some_and(|chooser| chooser.item == Some(id));
+            if let Some(url) = app.queue.get_item(id).and_then(|item| item.urls.first().cloned()).filter(|_| !open) {
                 app.list_tracks(Some(id), url);
             }
         }
