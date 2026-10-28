@@ -171,6 +171,8 @@ struct Stats {
     authorized: AtomicUsize,
     /// The address each GET came from, in request order.
     peers: Mutex<Vec<std::net::IpAddr>>,
+    /// Each request's target with its `Referer` and `Origin`, in request order.
+    browser_heads: Mutex<Vec<(String, Option<String>, Option<String>)>>,
 }
 
 impl Mock {
@@ -275,6 +277,7 @@ async fn handle(mut socket: TcpStream, mock: Arc<Mock>) {
     if header("authorization").is_some() {
         s.authorized.fetch_add(1, Ordering::SeqCst);
     }
+    s.browser_heads.lock().unwrap().push((target.clone(), header("referer"), header("origin")));
     let range = header("range");
     let probe = range.as_deref() == Some("bytes=0-0") || range == Some(format!("bytes=0-{}", PREFETCH - 1));
     if let Some(location) = &mock.redirect {
@@ -4009,7 +4012,8 @@ async fn test_a_drm_protected_live_hls_stream_is_an_error_not_a_recording() {
 
 /// A live DASH manifest is recorded by the engine itself, not yt-dlp: a `.mpd` link, one the
 /// browser saw read as DASH (`dash`), one that answers as DASH, and one with the height the
-/// browser's user chose. Each records its first new segment, a stream second being asked for.
+/// browser's user chose. Each records its first new segment, a stream second being asked for;
+/// the manifest and the segments are asked for with the page's referer and the browser's headers.
 #[tokio::test]
 async fn test_live_dash_manifests_are_recorded_by_the_engine() {
     isolate_history();
@@ -4017,17 +4021,19 @@ async fn test_live_dash_manifests_are_recorded_by_the_engine() {
     const MPD: &[u8] = b"<?xml version=\"1.0\"?><MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\" type=\"dynamic\" availabilityStartTime=\"2024-01-01T00:00:00Z\">        <Period start=\"PT0S\"><AdaptationSet contentType=\"video\"><SegmentTemplate media=\"v-$Number$.m4s\" duration=\"2\"/>        <Representation id=\"v\" bandwidth=\"1\" width=\"1280\" height=\"720\" codecs=\"avc1.64001f\"/></AdaptationSet></Period></MPD>";
     let mut answers_dash = Mock::new(MPD.to_vec());
     answers_dash.content_type = Some("application/dash+xml");
+    let mocks = [Mock::new(MPD.to_vec()), Mock::new(MPD.to_vec()), answers_dash, Mock::new(MPD.to_vec())].map(Arc::new);
     let links = [
-        (serve(Arc::new(Mock::new(MPD.to_vec())), "show/manifest.mpd").await, false, None),
-        (serve(Arc::new(Mock::new(MPD.to_vec())), "api/play?id=7").await, true, None),
-        (serve(Arc::new(answers_dash), "api/stream").await, false, None),
-        (serve(Arc::new(Mock::new(MPD.to_vec())), "live/show.mpd").await, false, Some(720)),
+        (serve(Arc::clone(&mocks[0]), "show/manifest.mpd").await, false, None),
+        (serve(Arc::clone(&mocks[1]), "api/play?id=7").await, true, None),
+        (serve(Arc::clone(&mocks[2]), "api/stream").await, false, None),
+        (serve(Arc::clone(&mocks[3]), "live/show.mpd").await, false, Some(720)),
     ];
-    for (url, dash, height) in links {
+    for ((url, dash, height), mock) in links.into_iter().zip(&mocks) {
         let (tools, temp) = (tempdir().unwrap(), tempdir().unwrap());
         let opts = DownloadOptions {
             ytdlp_path: Some(fake_ytdlp(tools.path(), &temp.path().join("show.mp4"))),
             referer: Some("https://page.example/watch".into()),
+            headers: vec![("Origin".into(), "https://page.example".into())],
             dash,
             height,
             record_seconds: Some(1),
@@ -4039,6 +4045,15 @@ async fn test_live_dash_manifests_are_recorded_by_the_engine() {
         // Every path of the mock serves the manifest, so the segment is it.
         assert_file(&path, MPD);
         assert!(runs_of(tools.path()).is_empty(), "{url}: yt-dlp was asked to record it");
+        let heads = mock.stats.browser_heads.lock().unwrap().clone();
+        let manifest = url.query().map_or_else(|| url.path().to_string(), |query| format!("{}?{query}", url.path()));
+        for asked in [manifest.as_str(), ".m4s"] {
+            let sent: Vec<_> = heads.iter().filter(|(target, ..)| target.ends_with(asked)).collect();
+            let browsers = |(_, referer, origin): &&(String, Option<String>, Option<String>)| {
+                referer.as_deref() == Some("https://page.example/watch") && origin.as_deref() == Some("https://page.example")
+            };
+            assert!(!sent.is_empty() && sent.iter().all(browsers), "{url}: {asked} asked for as {heads:?}");
+        }
     }
 }
 
