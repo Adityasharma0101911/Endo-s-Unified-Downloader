@@ -551,10 +551,14 @@ fn stpp_cues(sample: &[u8], from: i64, to: i64, cues: &mut Vec<Cue>) -> usize {
     let Ok((timed, images)) = ttml_cues(&String::from_utf8_lossy(&sample[..length])) else { return 0 };
     let spans: Vec<(i64, Option<i64>, String)> = timed.into_iter().map(|t| (secs_ms(t.begin), t.end.map(secs_ms), t.text)).collect();
     // How long the text shows inside the sample when its times are moved by `shift`.
-    let inside = |shift: i64| -> i64 { spans.iter().map(|(b, e, _)| (e.map_or(to, |e| e + shift).min(to) - (b + shift).max(from)).max(0)).sum() };
+    // Saturating: a document's times may be any number.
+    let inside = |shift: i64| -> i64 {
+        let shown = spans.iter().map(|(b, e, _)| e.map_or(to, |e| e.saturating_add(shift)).min(to).saturating_sub(b.saturating_add(shift).max(from)).max(0));
+        shown.fold(0, i64::saturating_add)
+    };
     // A tie (the sample starts at 0, or the text is untimed) counts from the sample's start.
     let shift = if inside(from) >= inside(0) { from } else { 0 };
-    cues.extend(spans.into_iter().filter_map(|(b, e, text)| cue(b + shift, e.map_or(to, |e| e + shift), text)));
+    cues.extend(spans.into_iter().filter_map(|(b, e, text)| cue(b.saturating_add(shift), e.map_or(to, |e| e.saturating_add(shift)), text)));
     images
 }
 
@@ -953,6 +957,14 @@ pub(crate) mod tests {
         let sample = [ttml(r##"<div smpte:backgroundImage="#i"/><p>untimed</p>"##), b"\x89PNG\r\n\x1a\n\0\0<<garbage".to_vec(), vec![0; 4]].concat();
         let data = [init(b"stpp", 1000), fragment(Some(20_000), &[(2000, sample)], Durations::Trun, true)].concat();
         assert_eq!(parse_mp4(&data).unwrap(), (vec![c(20_000, 22_000, "untimed")], 1));
+    }
+
+    /// A time too large for any clock is taken as the largest, not overflowed.
+    #[test]
+    fn stpp_huge_times_saturate() {
+        let sample = ttml(r#"<p begin="0s" end="99999999999999999999999s">long</p>"#);
+        let data = [init(b"stpp", 1000), fragment(Some(10_000), &[(2000, sample)], Durations::Trun, true)].concat();
+        assert_eq!(parse_mp4(&data).unwrap().0, [c(10_000, i64::MAX as u64, "long")]);
     }
 
     #[test]

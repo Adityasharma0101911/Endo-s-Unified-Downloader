@@ -20,8 +20,9 @@ const MAX_DEPTH: usize = 32;
 /// through every period.
 const MAX_TRACKS: usize = 200;
 const MAX_PERIODS: usize = 1000;
-/// Largest segment index (`sidx` box) read.
+/// Largest segment index (`sidx` box) read, and most read of a file (one may list others).
 const MAX_INDEX_BYTES: u64 = 1024 * 1024;
+const MAX_INDEXES: usize = 64;
 /// A representation that is one file with no index is fetched in pieces this large, after a
 /// first piece of [`HEAD_BYTES`] (see [`Addressing::Whole`]).
 const PIECE_BYTES: u64 = if cfg!(test) { 4 * 1024 } else { 8 * 1024 * 1024 };
@@ -203,6 +204,8 @@ pub(crate) struct Piece {
 pub(crate) struct Rendition {
     pub ext: &'static str,
     pub pieces: Vec<Piece>,
+    /// The representation the track is (see [`Mpd::follow`]).
+    pub rep: Rep,
 }
 
 /// How a representation's segments are found: by its `SegmentTemplate`, `SegmentList` or
@@ -309,8 +312,9 @@ impl Template {
             }
         } else if let Some(d) = self.duration {
             let count = match (self.end_number, length) {
-                (Some(last), _) => last.saturating_sub(self.start_number).saturating_add(1),
-                (None, Some(length)) => (length * scale / d as f64).ceil() as u64,
+                (Some(last), _) => last.saturating_add(1).saturating_sub(self.start_number),
+                // A length of a whole number of segments may come out a hair over it.
+                (None, Some(length)) => (length * scale / d as f64 - 1e-6).ceil().max(0.0) as u64,
                 (None, None) => return Err(malformed("a SegmentTemplate without an end: the period's length is not given")),
             };
             if count > MAX_SEGMENTS as u64 {
@@ -346,11 +350,27 @@ impl Piece {
                 (first.clone().and_then(|(url, range)| init(url, range)), listed)
             }
             Addressing::Indexed { url, index, init: given } => {
-                let data = crate::hls::fetch_range(client, auth, url, *index, MAX_INDEX_BYTES, fetch).await?;
-                let listed = sidx_segments(&data, index.start)
-                    .ok_or_else(|| malformed(format!("no segment index (sidx) at bytes {}-{} of {url}", index.start, index.end)))?;
+                // An index may list further indexes, each read in its place: at most MAX_INDEXES.
+                // shortcut: a further index is read with up to 1 MiB of the segments after it; read
+                // its box's size first if such files turn up.
+                let mut listed = vec![(*index, 0.0, true)];
+                for _ in 0..MAX_INDEXES {
+                    let Some(at) = listed.iter().position(|s| s.2) else { break };
+                    let range = listed[at].0;
+                    let first = ByteRange::new(range.start, range.end.min(range.start.saturating_add(MAX_INDEX_BYTES - 1))).map_err(malformed)?;
+                    let data = crate::hls::fetch_range(client, auth, url, first, MAX_INDEX_BYTES, fetch).await?;
+                    let found = sidx_segments(&data, range.start)
+                        .ok_or_else(|| malformed(format!("no segment index (sidx) at bytes {}-{} of {url}", range.start, range.end)))?;
+                    listed.splice(at..=at, found);
+                    if listed.len() > MAX_SEGMENTS {
+                        return Err(too_many());
+                    }
+                }
+                if listed.iter().any(|s| s.2) {
+                    return Err(malformed(format!("more than {MAX_INDEXES} segment indexes in {url}")));
+                }
                 let head = given.or_else(|| index.start.checked_sub(1).and_then(|last| ByteRange::new(0, last).ok()));
-                (head.and_then(|range| init(url.clone(), Some(range))), listed.into_iter().map(|(range, secs)| (url.clone(), Some(range), secs)).collect())
+                (head.and_then(|range| init(url.clone(), Some(range))), listed.into_iter().map(|(range, secs, _)| (url.clone(), Some(range), secs)).collect())
             }
             Addressing::Whole { url, init: given } => {
                 let size = crate::hls::size_of(client, auth, url, fetch).await?;
@@ -379,9 +399,10 @@ impl Piece {
     }
 }
 
-/// The segments a segment index (`sidx` box) lists: their byte ranges in the file and their
-/// lengths in seconds. `data` is the file from byte `at` on, where the index starts.
-fn sidx_segments(data: &[u8], at: u64) -> Option<Vec<(ByteRange, f64)>> {
+/// The segments a segment index (`sidx` box) lists: their byte ranges in the file, their lengths
+/// in seconds, and whether each is a further index (followed by the segments it lists). `data` is
+/// the file from byte `at` on, where the index starts.
+fn sidx_segments(data: &[u8], at: u64) -> Option<Vec<(ByteRange, f64, bool)>> {
     let u32_at = |bytes: &[u8], i: usize| Some(u32::from_be_bytes(bytes.get(i..i + 4)?.try_into().ok()?));
     let u64_at = |bytes: &[u8], i: usize| Some(u64::from_be_bytes(bytes.get(i..i + 8)?.try_into().ok()?));
     let mut pos = 0usize;
@@ -409,10 +430,11 @@ fn sidx_segments(data: &[u8], at: u64) -> Option<Vec<(ByteRange, f64)>> {
         let mut offset = at.checked_add((pos + size) as u64)?.checked_add(first_offset)?;
         let mut listed = Vec::with_capacity(count);
         for reference in rest.get(4..4 + 12 * count)?.chunks_exact(12) {
-            let length = u64::from(u32_at(reference, 0)? & 0x7fff_ffff);
+            let word = u32_at(reference, 0)?;
+            let length = u64::from(word & 0x7fff_ffff);
             let secs = f64::from(u32_at(reference, 4)?) / timescale;
             if length > 0 {
-                listed.push((ByteRange::from_len(offset, length).ok()?, secs));
+                listed.push((ByteRange::from_len(offset, length).ok()?, secs, word >> 31 == 1));
             }
             offset = offset.checked_add(length)?;
         }
@@ -458,10 +480,13 @@ fn base_url(node: &Node, base: &Url) -> Url {
 }
 
 /// A representation of a period, as a track (its id given later) and how its segments are found.
-struct Rep {
+#[derive(Debug, Clone)]
+pub(crate) struct Rep {
     track: Track,
     /// Its `id` in the manifest.
     key: String,
+    /// The first codec family its codecs name.
+    family: Option<&'static str>,
     ext: &'static str,
     protected: bool,
     addressing: Arc<Addressing>,
@@ -569,18 +594,18 @@ fn representation(period: &Node, set: &Node, rep: &Node, base: &Url) -> Option<R
         }
     };
     let protected = set.first("ContentProtection").is_some() || rep.first("ContentProtection").is_some();
-    Some(Rep { track, key, ext, protected, addressing: Arc::new(addressing) })
+    let family = crate::stream::families(codecs).next();
+    Some(Rep { track, key, family, ext, protected, addressing: Arc::new(addressing) })
 }
 
 /// The representation among `reps` (another period's) that goes on with `like`: of its kind,
 /// best its id, else its language, else its codec family, else the closest bandwidth.
 fn follow<'a>(reps: &'a [Rep], like: &Rep) -> Option<&'a Rep> {
-    let family = |t: &Track| crate::stream::families(&t.codecs).next();
     reps.iter().filter(|r| r.track.kind == like.track.kind).max_by_key(|r| {
         (
             !like.key.is_empty() && r.key == like.key,
             r.track.language == like.track.language,
-            family(&r.track) == family(&like.track),
+            r.family == like.family,
             std::cmp::Reverse(r.track.bandwidth.unwrap_or(0).abs_diff(like.track.bandwidth.unwrap_or(0))),
         )
     })
@@ -602,6 +627,26 @@ pub(crate) struct Mpd {
     pub buffer: Option<f64>,
     /// Its first `UTCTiming` that [`clock_offset`] reads: scheme and value.
     pub clock: Option<(String, String)>,
+    /// Each period's representations, when it starts and how long it lasts (see [`Mpd::follow`]).
+    periods: Vec<(Vec<Rep>, Option<f64>, Option<f64>)>,
+}
+
+impl Mpd {
+    /// The track that is the representation `like` (see [`Rendition::rep`]), followed into each
+    /// period (see [`follow`]): a live manifest's track ids change as its periods come and go.
+    /// None when no period has one of its kind.
+    pub fn follow(&self, like: &Rep) -> Option<Rendition> {
+        let pieces: Vec<Piece> = self
+            .periods
+            .iter()
+            .enumerate()
+            .filter_map(|(n, (reps, start, length))| {
+                let same = follow(reps, like)?;
+                Some(Piece { length: *length, protected: same.protected, addressing: same.addressing.clone(), start: *start, period: n })
+            })
+            .collect();
+        (!pieces.is_empty()).then(|| Rendition { ext: like.ext, pieces, rep: like.clone() })
+    }
 }
 
 /// Reads the manifest `text`, fetched from `url` (after redirects; its `BaseURL`s resolve against
@@ -612,7 +657,10 @@ pub(crate) fn parse(text: &str, url: &Url) -> Result<Mpd, HlsError> {
     let mpd = parse_xml(text).map_err(malformed)?;
     let total = mpd.attr("mediaPresentationDuration").and_then(seconds);
     let base = base_url(&mpd, url);
-    let periods: Vec<&Node> = mpd.all("Period").take(MAX_PERIODS).collect();
+    let live = mpd.attr("type") == Some("dynamic");
+    // Of a live manifest, the newest periods.
+    let skip = if live { mpd.all("Period").count().saturating_sub(MAX_PERIODS) } else { 0 };
+    let periods: Vec<&Node> = mpd.all("Period").skip(skip).take(MAX_PERIODS).collect();
     // When each period starts, and how long it lasts.
     let mut starts: Vec<Option<f64>> = Vec::new();
     for (n, period) in periods.iter().enumerate() {
@@ -638,7 +686,7 @@ pub(crate) fn parse(text: &str, url: &Url) -> Result<Mpd, HlsError> {
         .map(|period| {
             let base = base_url(period, &base);
             let sets = period.all("AdaptationSet").map(|set| (set, base_url(set, &base)));
-            let reps = sets.flat_map(|(set, base)| set.all("Representation").filter_map(|rep| representation(period, set, rep, &base)).collect::<Vec<_>>());
+            let reps = sets.flat_map(|(set, base)| set.all("Representation").take(MAX_TRACKS).filter_map(|rep| representation(period, set, rep, &base)).collect::<Vec<_>>());
             reps.take(MAX_TRACKS).collect()
         })
         .collect();
@@ -661,7 +709,7 @@ pub(crate) fn parse(text: &str, url: &Url) -> Result<Mpd, HlsError> {
                 Some(Piece { length: lengths[n], protected: same.protected, addressing: same.addressing.clone(), start: starts[n], period: n })
             })
             .collect();
-        tracks.push((Track { id, ..rep.track.clone() }, Rendition { ext: rep.ext, pieces }));
+        tracks.push((Track { id, ..rep.track.clone() }, Rendition { ext: rep.ext, pieces, rep: rep.clone() }));
     }
     let mut parts: Vec<Part> = reps
         .iter()
@@ -680,7 +728,7 @@ pub(crate) fn parse(text: &str, url: &Url) -> Result<Mpd, HlsError> {
         .filter_map(|timing| Some((timing.attr("schemeIdUri")?.to_string(), timing.attr("value")?.to_string())))
         .find(|(scheme, _)| CLOCKS.iter().any(|known| scheme.contains(known)));
     Ok(Mpd {
-        live: mpd.attr("type") == Some("dynamic"),
+        live,
         duration: total.or_else(|| lengths.iter().copied().sum()),
         tracks,
         parts,
@@ -688,15 +736,25 @@ pub(crate) fn parse(text: &str, url: &Url) -> Result<Mpd, HlsError> {
         update_every: mpd.attr("minimumUpdatePeriod").and_then(seconds),
         buffer: mpd.attr("timeShiftBufferDepth").and_then(seconds),
         clock,
+        periods: reps.into_iter().zip(starts).zip(lengths).map(|((reps, start), length)| (reps, start, length)).collect(),
     })
 }
 
 /// Seconds back a live manifest that does not say how far back it keeps its segments
-/// (`timeShiftBufferDepth`) and numbers them (no timeline) is taken to keep them.
+/// (`timeShiftBufferDepth`) is taken to keep them.
 // shortcut: such a manifest keeps them all by the standard; six hours bounds what one listing makes.
 const UNTOLD_BUFFER: f64 = 6.0 * 3600.0;
 
 impl Template {
+    /// Seconds after a segment its number and the clock give (no timeline) ends that it is
+    /// listed: its server may publish it late, or keep a clock behind this computer's.
+    fn late(&self) -> f64 {
+        match self.duration {
+            Some(d) if self.timeline.is_empty() => (d as f64 / self.timescale as f64).max(2.0),
+            _ => 0.0,
+        }
+    }
+
     /// The segments of a period `length` seconds long (when told) that have ended `elapsed`
     /// seconds after it started, and not `buffer` seconds or more before that: each its number,
     /// its time (in `timescale` units), and its start and length in seconds from the period's
@@ -732,9 +790,10 @@ impl Template {
                         ((next - time as f64) / d as f64).ceil().max(0.0) as u64
                     }
                 };
-                // Only those that have ended by now, from about the oldest still kept.
-                let ready = (((now - time as f64) / d as f64).floor().max(0.0) as u64).min(count);
-                let first = (((gone - time as f64) / d as f64).floor() - 1.0).max(0.0) as u64;
+                // Only those that have ended by now and start before the period's end, from about the
+                // oldest still kept, and at most the newest MAX_SEGMENTS: `r` is the server's word.
+                let ready = (((now - time as f64) / d as f64).floor().max(0.0) as u64).min(count).min(((stop - time as f64) / d as f64).ceil().max(0.0) as u64);
+                let first = ((((gone - time as f64) / d as f64).floor() - 1.0).max(0.0) as u64).max(ready.saturating_sub(MAX_SEGMENTS as u64));
                 for n in first.min(ready)..ready {
                     let start = time.saturating_add(n.saturating_mul(d));
                     keep(number.saturating_add(n), start, (start as f64 - self.offset as f64) / scale, d as f64 / scale)?;
@@ -747,11 +806,11 @@ impl Template {
             if !end.is_finite() && !elapsed.is_finite() && self.end_number.is_none() {
                 return Err(malformed("a SegmentTemplate without an end: the period's length is not given"));
             }
-            // Segment k runs from k * secs to (k + 1) * secs: the last is the last to have ended,
-            // or to start before the period's end.
-            let mut last = ((elapsed / secs + 1e-6).floor() as i64).saturating_sub(1).min(((end / secs - 1e-6).ceil() as i64).saturating_sub(1));
+            // Segment k runs from k * secs to (k + 1) * secs: the last is the last to have ended
+            // [`Self::late`] seconds ago, or to start before the period's end.
+            let mut last = (((elapsed - self.late()) / secs + 1e-6).floor() as i64).saturating_sub(1).min(((end / secs - 1e-6).ceil() as i64).saturating_sub(1));
             if let Some(end) = self.end_number {
-                last = last.min(end.saturating_sub(self.start_number) as i64);
+                last = last.min(end.checked_sub(self.start_number).map_or(-1, |n| i64::try_from(n).unwrap_or(i64::MAX)));
             }
             let first = ((since / secs).floor() as i64).saturating_sub(1).max(0).max(last.saturating_sub(MAX_SEGMENTS as i64 - 1));
             for k in first..=last {
@@ -788,7 +847,7 @@ pub(crate) fn live_listing(mpd: &Mpd, rendition: &Rendition, now: f64, after: Op
         let elapsed = if mpd.live { now - origin - start } else { f64::INFINITY };
         let buffer = match (mpd.live, mpd.buffer) {
             (true, Some(buffer)) => buffer,
-            (true, None) if template.timeline.is_empty() => UNTOLD_BUFFER,
+            (true, None) => UNTOLD_BUFFER,
             _ => f64::INFINITY,
         };
         let init = template.init()?.map(|url| Arc::new(InitSection { url, byte_range: None, encryption: None }));
@@ -803,9 +862,14 @@ pub(crate) fn live_listing(mpd: &Mpd, rendition: &Rendition, now: f64, after: Op
             dates.push(origin + start + at);
         }
     }
-    // A manifest that may still change (`minimumUpdatePeriod`) ends by turning static.
-    let over = |length: Option<f64>, start: Option<f64>| length.is_some_and(|length| now - origin - start.unwrap_or(0.0) >= length);
+    // A manifest that may still change (`minimumUpdatePeriod`) ends by turning static; else once
+    // its last segment is listed (see `Template::late`).
     let last = rendition.pieces.last();
+    let late = match last.map(|p| &*p.addressing) {
+        Some(Addressing::Template(template)) => template.late(),
+        _ => 0.0,
+    };
+    let over = |length: Option<f64>, start: Option<f64>| length.is_some_and(|length| now - origin - start.unwrap_or(0.0) >= length + late);
     let ended = !mpd.live || (mpd.update_every.is_none() && (over(mpd.duration, None) || last.is_some_and(|p| over(p.length, p.start))));
     let lasts = segments.last().map_or(2.0, |s| s.duration_secs);
     Ok(crate::stream::Listing { segments, dates, ended, refresh: mpd.update_every.map_or(lasts, |every| every.min(lasts)), ext: rendition.ext, now })
@@ -931,8 +995,8 @@ pub(crate) mod tests {
     fn test_a_segment_index_lists_the_segments_after_it() {
         let index = [b"\0\0\0\x08free".as_slice(), &sidx(&[(500, 2000), (300, 1000)])].concat();
         let listed = sidx_segments(&index, 1000).unwrap();
-        let ranges: Vec<(u64, u64, f64)> = listed.iter().map(|(r, secs)| (r.start, r.end, *secs)).collect();
-        assert_eq!(ranges, [(1064, 1563, 2.0), (1564, 1863, 1.0)]);
+        let ranges: Vec<(u64, u64, f64, bool)> = listed.iter().map(|&(r, secs, further)| (r.start, r.end, secs, further)).collect();
+        assert_eq!(ranges, [(1064, 1563, 2.0, false), (1564, 1863, 1.0, false)]);
         assert_eq!(sidx_segments(&index[..index.len() - 4], 0), None);
         assert_eq!(sidx_segments(b"\0\0\0\x08free", 0), None);
     }
@@ -1044,6 +1108,29 @@ pub(crate) mod tests {
         assert_eq!(mpd.duration, Some(40.0));
     }
 
+    /// A period a whole number of segments long lists that many, though its length (from the
+    /// next period's start) comes out a hair over; an end number before the start number lists
+    /// none, on demand or live.
+    #[tokio::test]
+    async fn test_whole_periods_list_no_extra_segment() {
+        let period = |start: &str, folder: &str| {
+            format!(
+                r#"<Period start="{start}"><AdaptationSet contentType="audio"><SegmentTemplate timescale="1000" duration="2002" media="{folder}/$Number$.m4s"/>
+                <Representation id="a" bandwidth="1" codecs="mp4a.40.2"/></AdaptationSet></Period>"#
+            )
+        };
+        let mpd = parsed(&format!(r#"<MPD type="static" mediaPresentationDuration="PT8.008S">{}{}</MPD>"#, period("PT2.002S", "a"), period("PT6.006S", "b")));
+        let names: Vec<String> = links(&mpd, 0).await.into_iter().map(|(url, ..)| url.replace("https://host.example/show/", "")).collect();
+        assert_eq!(names, ["a/1.m4s", "a/2.m4s", "b/1.m4s"]);
+        let backwards = parsed(
+            r#"<MPD mediaPresentationDuration="PT8S"><Period><AdaptationSet contentType="audio"><SegmentTemplate duration="2" startNumber="5" endNumber="4" media="$Number$.m4s"/>
+            <Representation id="a" bandwidth="1" codecs="mp4a.40.2"/></AdaptationSet></Period></MPD>"#,
+        );
+        assert!(matches!(segments(&Client::new(), None, FETCH, &backwards.tracks[0].1).await, Err(HlsError::NoSegments)));
+        let Addressing::Template(template) = &*backwards.tracks[0].1.pieces[0].addressing else { panic!("a template") };
+        assert!(template.live(100.0, None, f64::INFINITY).unwrap().is_empty());
+    }
+
     /// Protection on a chosen track refuses it as DRM; a live manifest is read as live; one that
     /// is no XML, has no MPD or nothing to play, or a timeline with no end, is malformed.
     #[tokio::test]
@@ -1101,13 +1188,17 @@ pub(crate) mod tests {
         };
         let live = numbered("dynamic", r#"minimumUpdatePeriod="PT1S""#);
         assert_eq!((live.available_from, live.update_every, live.buffer), (Some(1_704_067_200.0), Some(1.0), Some(6.0)));
-        // 9.5 s in: segments 0 to 3 of the first period have ended, 1 to 3 within the buffer.
-        let segments = vec![("11".into(), 2000, 2.0, false), ("12".into(), 4000, 4.0, false), ("13".into(), 6000, 6.0, false)];
+        // 9.5 s in: segments 0 to 2 of the first period ended 2 s ago or more (3 only 1.5 s ago),
+        // 1 and 2 within the buffer.
+        let segments = vec![("11".into(), 2000, 2.0, false), ("12".into(), 4000, 4.0, false)];
         assert_eq!(live_at(&live, 9.5, None), (segments, false));
-        // 11 s in, after the second: the first period's last one, and the second's first, a new part.
-        assert_eq!(live_at(&live, 11.0, Some(4000)), (vec![("13".into(), 6000, 6.0, false), ("1".into(), 8000, 8.0, true)], false));
-        assert!(!live_at(&live, 12.5, None).1, "it may still change");
-        assert!(live_at(&numbered("dynamic", ""), 12.5, None).1, "the presentation's length has passed");
+        // 12 s in, after the second: the first period's last one, and the second's first, a new part.
+        assert_eq!(live_at(&live, 12.0, Some(4000)), (vec![("13".into(), 6000, 6.0, false), ("1".into(), 8000, 8.0, true)], false));
+        assert!(!live_at(&live, 14.5, None).1, "it may still change");
+        let untold = numbered("dynamic", "");
+        assert!(!live_at(&untold, 13.5, None).1, "its last segment is still to be listed");
+        let (segments, ended) = live_at(&untold, 14.0, Some(8000));
+        assert_eq!((segments, ended), (vec![("2".into(), 10_000, 10.0, false)], true), "the presentation's length has passed");
         let (segments, ended) = live_at(&numbered("static", ""), 1.0, Some(8000));
         assert_eq!((segments, ended), (vec![("2".into(), 10_000, 10.0, false)], true));
         let timeline = parsed(
@@ -1128,6 +1219,28 @@ pub(crate) mod tests {
         assert!(matches!(live_listing(&listed, &listed.tracks[0].1, 1e9, None), Err(HlsError::Unsupported(_))));
     }
 
+    /// A live timeline that repeats far past its period's end lists only what plays in the
+    /// period, at once, at most the newest MAX_SEGMENTS; one repeating up to now for weeks, with
+    /// no time-shift buffer given, the newest six hours.
+    #[test]
+    fn test_a_live_timeline_lists_a_bounded_window() {
+        let timeline = |period: &str, entry: &str| {
+            parsed(&format!(
+                r#"<MPD type="dynamic" availabilityStartTime="2024-01-01T00:00:00Z"><Period start="PT0S" {period}><AdaptationSet contentType="audio">
+                <SegmentTemplate timescale="10000" media="t/$Time$.m4s"><SegmentTimeline>{entry}</SegmentTimeline></SegmentTemplate>
+                <Representation id="a" bandwidth="1" codecs="mp4a.40.2"/></AdaptationSet></Period></MPD>"#
+            ))
+        };
+        let huge = timeline(r#"duration="PT1S""#, r#"<S t="0" d="1" r="9000000000000000000"/>"#);
+        let Addressing::Template(template) = &*huge.tracks[0].1.pieces[0].addressing else { panic!("a template") };
+        let listed = template.live(1e9, Some(1.0), f64::INFINITY).unwrap();
+        assert_eq!((listed.len(), listed.last().map(|s| s.1)), (MAX_SEGMENTS, Some(9999)));
+        let now = 30.0 * 86_400.0;
+        let (segments, _) = live_at(&timeline("", r#"<S t="0" d="300000" r="-1"/>"#), now, None);
+        let (first, last) = (segments.first().unwrap().2, segments.last().unwrap().2);
+        assert_eq!((segments.len(), first, last), (720, now - UNTOLD_BUFFER, now - 30.0));
+    }
+
     /// The server's clock is read from the manifest's `UTCTiming`: given in it, or not at all.
     #[tokio::test]
     async fn test_the_servers_clock_is_read_from_the_manifest() {
@@ -1141,14 +1254,18 @@ pub(crate) mod tests {
     }
 
     /// A file with a segment index is fetched as its init section and the segments the index
-    /// lists; one with only a base link, as its start and pieces after it, by the size a request
-    /// for its first byte tells; a server that serves no ranges is refused.
+    /// lists, those of an index it points at in that one's place; one with only a base link, as
+    /// its start and pieces after it, by the size a request for its first byte tells; a server
+    /// that serves no ranges is refused.
     #[tokio::test]
     async fn test_indexed_and_whole_files_are_fetched_in_pieces() {
         let indexed = [vec![b'I'; 100], sidx(&[(500, 2000), (300, 1000)]), vec![b'M'; 800]].concat();
+        // An index of a further index (56 bytes, then the 800 it lists) and a segment of 200.
+        let chained = [vec![b'I'; 100], sidx(&[(0x8000_0000 | 856, 3000), (200, 1000)]), sidx(&[(500, 2000), (300, 1000)]), vec![b'M'; 1000]].concat();
         let whole: Vec<u8> = (0..10_000u32).map(|n| n as u8).collect();
         let (addr, _) = crate::hls::tests::serve(move |path: &str, range| match path {
             "/indexed.mp4" => ranged(&indexed, range),
+            "/chained.mp4" => ranged(&chained, range),
             "/whole.mp4" => ranged(&whole, range),
             "/norange.mp4" => ok(b"no ranges here".to_vec()),
             _ => (404, String::new(), Vec::new()),
@@ -1159,6 +1276,7 @@ pub(crate) mod tests {
                 <Representation id="i" bandwidth="1"><BaseURL>indexed.mp4</BaseURL><SegmentBase indexRange="100-155"><Initialization range="0-99"/></SegmentBase></Representation>
                 <Representation id="w" bandwidth="2"><BaseURL>whole.mp4</BaseURL></Representation>
                 <Representation id="n" bandwidth="3"><BaseURL>norange.mp4</BaseURL></Representation>
+                <Representation id="c" bandwidth="4"><BaseURL>chained.mp4</BaseURL><SegmentBase indexRange="100-155"/></Representation>
             </AdaptationSet></Period></MPD>"#,
             &Url::parse(&format!("http://{addr}/stream/../manifest.mpd")).unwrap(),
         )
@@ -1172,5 +1290,8 @@ pub(crate) mod tests {
         assert_eq!(listed[0].init.as_ref().unwrap().byte_range, ByteRange::new(0, 1023).ok());
         let err = segments(&Client::new(), None, FETCH, &mpd.tracks[2].1).await.unwrap_err();
         assert!(err.to_string().contains("serves no byte ranges"), "{err}");
+        let listed = segments(&Client::new(), None, FETCH, &mpd.tracks[3].1).await.unwrap();
+        assert_eq!(ranges(&listed), [(212, 711), (712, 1011), (1012, 1211)]);
+        assert_eq!(listed.iter().map(|s| s.duration_secs).collect::<Vec<_>>(), [2.0, 1.0, 1.0]);
     }
 }
