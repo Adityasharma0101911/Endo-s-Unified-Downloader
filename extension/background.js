@@ -1277,6 +1277,7 @@ const POPUP_COMMANDS = {
 
 const HLS_FIELDS = { kind: "hls", format: "m3u8", contentType: "application/vnd.apple.mpegurl" };
 const DASH_FIELDS = { kind: "dash", format: "mpd", contentType: "application/dash+xml" };
+const SMOOTH_FIELDS = { kind: "smooth", format: "ism", contentType: "application/vnd.ms-sstr+xml" };
 
 /** The request headers to repeat for a URL a frame reported: those the browser sent for it, else the frame's own. */
 function requestFor(url, sender) {
@@ -1349,12 +1350,17 @@ const PAGE_COMMANDS = {
   MEDIA_URL_SEEN({ url }, sender) {
     const format = mediaUrlFormat(url);
     if (!format) return { ok: false };
-    return addPageItem(sender, url, format === "mpd" ? DASH_FIELDS : HLS_FIELDS);
+    return addPageItem(sender, url, format === "mpd" ? DASH_FIELDS : format === "ism" ? SMOOTH_FIELDS : HLS_FIELDS);
   },
 
   /** A response the page read whose text is a DASH manifest. */
   MPD_SEEN({ url }, sender) {
     return isHttpUrl(url) ? addPageItem(sender, url, DASH_FIELDS) : { ok: false };
+  },
+
+  /** A response the page read whose text is a Smooth Streaming manifest. */
+  ISM_SEEN({ url }, sender) {
+    return isHttpUrl(url) ? addPageItem(sender, url, SMOOTH_FIELDS) : { ok: false };
   },
 
   /** How far the bridge's download for BROWSER_DL got, and why it failed (its last progress has `error`). */

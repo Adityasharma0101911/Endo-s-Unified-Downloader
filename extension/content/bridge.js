@@ -139,8 +139,8 @@
       } else if (isUrl(m.url, HTTP)) {
         send({ cmd: "M3U8_SEEN", url: m.url, text: m.text });
       }
-    } else if (m.t === "media-url" || m.t === "mpd") {
-      if (isUrl(m.url, HTTP)) send({ cmd: m.t === "mpd" ? "MPD_SEEN" : "MEDIA_URL_SEEN", url: m.url });
+    } else if (m.t === "media-url" || m.t === "mpd" || m.t === "ism") {
+      if (isUrl(m.url, HTTP)) send({ cmd: m.t === "mpd" ? "MPD_SEEN" : m.t === "ism" ? "ISM_SEEN" : "MEDIA_URL_SEEN", url: m.url });
     } else if (m.t === "rec-active") {
       send({ cmd: "REC_ACTIVE" });
     } else if (m.t === "rec-chunk") {

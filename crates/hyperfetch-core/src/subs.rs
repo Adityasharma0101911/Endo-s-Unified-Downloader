@@ -593,6 +593,22 @@ impl SubtitleTrack {
     }
 }
 
+/// Where a fragmented MP4 starts on its first track's clock, in ms: its first fragment's `tfdt` at
+/// that track's `mdhd` timescale. `data` is its start, the init segment and a first fragment.
+pub fn mp4_start(data: &[u8]) -> Option<u64> {
+    let trak = child(child(data, b"moov")?, b"trak")?;
+    let tkhd = child(trak, b"tkhd")?;
+    let id = be(tkhd, if *tkhd.first()? == 1 { 20 } else { 12 }, 4)?;
+    let mdhd = child(child(trak, b"mdia")?, b"mdhd")?;
+    let timescale = be(mdhd, if *mdhd.first()? == 1 { 20 } else { 12 }, 4).filter(|&t| t > 0)?;
+    let moof = child(data, b"moof")?;
+    let mut trafs = boxes(moof).into_iter().filter(|b| &b.0 == b"traf").map(|b| &moof[b.2]);
+    let traf = trafs.find(|traf| child(traf, b"tfhd").and_then(|tfhd| be(tfhd, 4, 4)) == Some(id))?;
+    let tfdt = child(traf, b"tfdt")?;
+    let time = if tfdt.first() == Some(&1) { be(tfdt, 4, 8) } else { be(tfdt, 4, 4) }?;
+    Some(ticks_ms(time as i128, timescale) as u64)
+}
+
 /// The boxes laid one after another in `data`: type, where the box starts and where its contents
 /// are. A box that runs past the end stops the list.
 fn boxes(data: &[u8]) -> Vec<([u8; 4], usize, Range<usize>)> {
@@ -703,7 +719,7 @@ fn escape_vtt(text: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn c(start: u64, end: u64, text: &str) -> Cue {
@@ -809,7 +825,7 @@ mod tests {
 
     // ----- MP4
 
-    fn bx(kind: &[u8; 4], parts: &[&[u8]]) -> Vec<u8> {
+    pub(crate) fn bx(kind: &[u8; 4], parts: &[&[u8]]) -> Vec<u8> {
         let body = parts.concat();
         [&((body.len() + 8) as u32).to_be_bytes()[..], kind, &body].concat()
     }
@@ -822,7 +838,7 @@ mod tests {
         values.iter().flat_map(|v| v.to_be_bytes()).collect()
     }
 
-    fn trak(id: u32, codec: &[u8; 4], timescale: u32) -> Vec<u8> {
+    pub(crate) fn trak(id: u32, codec: &[u8; 4], timescale: u32) -> Vec<u8> {
         let tkhd = full(b"tkhd", 0, 3, &[&words(&[0, 0, id])[..], &[0; 68]].concat());
         let mdhd = full(b"mdhd", 0, 0, &words(&[0, 0, timescale, 0, 0]));
         let stsd = full(b"stsd", 0, 0, &[&words(&[1])[..], &bx(codec, &[&[0; 8]])].concat());
@@ -831,12 +847,12 @@ mod tests {
 
     /// An init segment with a video track (1) and a subtitle track (7) of `codec`, whose `trex`
     /// gives samples 1000 ticks.
-    fn init(codec: &[u8; 4], timescale: u32) -> Vec<u8> {
+    pub(crate) fn init(codec: &[u8; 4], timescale: u32) -> Vec<u8> {
         let mvex = bx(b"mvex", &[&full(b"trex", 0, 0, &words(&[1, 1, 3000, 0, 0])), &full(b"trex", 0, 0, &words(&[7, 1, 1000, 0, 0]))]);
         [bx(b"ftyp", &[b"iso6"]), bx(b"moov", &[&trak(1, b"avc1", 90_000), &trak(7, codec, timescale), &mvex])].concat()
     }
 
-    enum Durations {
+    pub(crate) enum Durations {
         Trun,
         Tfhd(u32),
         Trex,
@@ -844,7 +860,7 @@ mod tests {
 
     /// A `moof` + `mdat` of track 7 with `samples` (duration, data) from `time` (no `tfdt` when
     /// None); the `trun` gives the data's offset when `offset`.
-    fn fragment(time: Option<u64>, samples: &[(u32, Vec<u8>)], durations: Durations, offset: bool) -> Vec<u8> {
+    pub(crate) fn fragment(time: Option<u64>, samples: &[(u32, Vec<u8>)], durations: Durations, offset: bool) -> Vec<u8> {
         let tfhd = match durations {
             Durations::Tfhd(d) => full(b"tfhd", 0, 0x020008, &words(&[7, d])),
             _ => full(b"tfhd", 0, 0x020000, &words(&[7])),
@@ -863,7 +879,7 @@ mod tests {
         [moof(size + 8), bx(b"mdat", &[&data])].concat()
     }
 
-    fn vttc(text: &str) -> Vec<u8> {
+    pub(crate) fn vttc(text: &str) -> Vec<u8> {
         bx(b"vttc", &[&bx(b"iden", &[b"7"]), &bx(b"sttg", &[b"align:start"]), &bx(b"payl", &[text.as_bytes()])])
     }
 
@@ -981,6 +997,17 @@ mod tests {
         assert_eq!(parse_mp4(&huge).unwrap().0, [c(0, 1000, "a")]);
         huge[at + 1..at + 4].copy_from_slice(&[0, 0, 1]);
         assert_eq!(parse_mp4(&huge).unwrap(), (vec![], 0));
+    }
+
+    /// A fragmented MP4 starts at its first fragment's `tfdt`, on its first track's clock; one whose
+    /// first fragment is another track's tells nothing.
+    #[test]
+    fn mp4_start_is_the_first_fragments_decode_time() {
+        let moov = |codec: &[u8; 4]| [bx(b"ftyp", &[b"iso6"]), bx(b"moov", &[&trak(7, codec, 1000)])].concat();
+        let data = [moov(b"wvtt"), fragment(Some(5_250), &[(1000, vttc("x"))], Durations::Trun, true)].concat();
+        assert_eq!(mp4_start(&data), Some(5_250));
+        assert_eq!(mp4_start(&[init(b"wvtt", 1000), fragment(Some(5_250), &[(1000, vttc("x"))], Durations::Trun, true)].concat()), None);
+        assert_eq!(mp4_start(&moov(b"stpp")), None);
     }
 
     // ----- Joining, moving, writing

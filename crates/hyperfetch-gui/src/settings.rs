@@ -423,6 +423,7 @@ impl Settings {
             debrid_magnets: self.debrid_magnets,
             password: None,
             auth: None,
+            channels: Vec::new(),
         }
     }
 
