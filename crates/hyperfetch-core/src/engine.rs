@@ -274,7 +274,8 @@ pub struct DownloadOptions {
     /// default), the connections the probe chose are kept to the end.
     pub adaptive: bool,
     /// The largest file downloaded, in bytes: a larger one fails at the probe, or, when the server
-    /// does not tell the size, as soon as more has arrived.
+    /// does not tell the size, as soon as more has arrived. A live recording ends there instead,
+    /// kept as a stop keeps it.
     pub max_filesize: Option<u64>,
     /// The finished file takes the date its server gives it (`Last-Modified`, or MDTM over FTP).
     pub remote_time: bool,
@@ -331,8 +332,8 @@ pub struct DownloadOptions {
     /// `live_from_start`: yt-dlp records them.
     pub live_from: Option<String>,
     /// A live HLS or DASH stream's recording ends once no new segment has come for this many
-    /// seconds, finished as a stop ends it; so does the recording of a channel's endless MPEG-TS
-    /// once no byte has come for that long.
+    /// seconds, finished as a stop ends it; so does the recording of an endless MPEG-TS, or of a
+    /// channel's stream with no length, once no byte has come for that long.
     pub live_idle_timeout: Option<u64>,
     /// Segments of an HLS or DASH stream whose links one of these patterns matches are left out
     /// of every track, as the ad breaks a playlist marks are (see
@@ -347,7 +348,8 @@ pub struct DownloadOptions {
     /// `check_name_pattern`). Made safe as every file name is.
     pub name_pattern: Option<String>,
     /// The channel of a channel list this download records (`ingest::Task::channel`), for
-    /// `name_pattern`'s `{channel}`.
+    /// `name_pattern`'s `{channel}`. Its stream with no length, of any kind, is recorded (see
+    /// `DownloadEngine::record_ts`).
     pub channel: Option<String>,
 }
 
@@ -1219,9 +1221,10 @@ impl DownloadEngine {
         }
         let (at, segments) = tracks.remove(0);
         let named: Vec<&crate::stream::Track> = std::iter::once(at).chain(carried).map(|at| &info.tracks[at]).collect();
-        let base = self.stream_output_path(link, opened.extension(at, &segments), &named);
+        let base = self.work_path(link, opened.extension(at, &segments), &named);
         let origin = crate::hls::Origin { manifest: link.clone(), track: Some(info.tracks[at].id.clone()) };
         let (path, digest, breaks) = self.fetch_hls(client, vec![(origin, segments, base)], snapshot_tx).await?.remove(0);
+        let path = self.dated(path, link, &named).await?;
         // Into the MP4 an MPEG-TS is remuxed to, as WebVTT; else beside it as SRT.
         let remux = self.options.hls_to_mp4 && path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("ts"));
         let cues = self.subtitle_cues(client, info, texts, Some(&path)).await;
@@ -1249,7 +1252,7 @@ impl DownloadEngine {
 
     /// Downloads `tracks` (positions in `opened`'s tracks, each with its segments; videos first) of
     /// the stream at `link` at once (see `HlsEngine::download_tracks`), each into a file of its
-    /// own next to the output (see `crate::media::stream_path`), then joins them with ffmpeg into
+    /// own next to the output (see [`track_path`]), then joins them with ffmpeg into
     /// the output, without re-encoding (see `crate::media::join_tracks`), with the subtitles
     /// tracks `texts`, and deletes them. `carried` are audio tracks inside the video's own
     /// segments. Without ffmpeg (installed only as `install_ffmpeg` allows), or when the join
@@ -1271,13 +1274,15 @@ impl DownloadEngine {
         let info = &opened.info;
         let chosen: Vec<&crate::stream::Track> = tracks.iter().map(|(at, _)| at).chain(&carried).map(|&at| &info.tracks[at]).collect();
         let format = self.join_format(&chosen);
-        let base = self.stream_output_path(link, format, &chosen);
-        // Two jobs for the same stream would write the same tracks.
-        let (output, _claim) = blocking(move || claim_mp4_output(&base, format)).await??;
-        let files: Vec<PathBuf> =
-            tracks.iter().map(|(at, segments)| crate::media::stream_path(&output, &info.tracks[*at].id, opened.extension(*at, segments))).collect();
-        // shortcut: a track's finished file from an earlier attempt is taken as it is, unchecked
-        // against the manifest; record its fingerprint if a manifest that changed meanwhile matters.
+        let base = self.work_path(link, format, &chosen).with_extension(format);
+        // Two jobs for the same stream would write the same tracks. Another stream's tracks there
+        // make the name taken: joined, this download deletes every track of its name.
+        let owner = link.clone();
+        let (output, _, _claim) = blocking(move || claim_free(&base, |output| (!other_tracks(output, &owner)).then(Vec::new))).await??;
+        let files: Vec<PathBuf> = tracks.iter().map(|(at, segments)| track_path(&output, link, &info.tracks[*at].id, opened.extension(*at, segments))).collect();
+        // shortcut: a track's finished file from an earlier attempt of this link is taken as it is,
+        // unchecked against the manifest; record its fingerprint if a manifest that changed
+        // meanwhile matters.
         let finished: Vec<bool> = files.iter().map(|file| file.is_file()).collect();
         let to_fetch: Vec<_> = tracks
             .into_iter()
@@ -1289,6 +1294,9 @@ impl DownloadEngine {
         let files: Vec<PathBuf> = files.into_iter().zip(finished).map(|(file, done)| if done { Some(file) } else { fetched.next() }).collect::<Option<_>>().ok_or("a track's download went missing")?;
         let subtitles = self.subtitle_cues(client, info, texts, files.first().map(PathBuf::as_path)).await;
         let path = self.join_or_keep(&subtitles, &chosen, files, output, format, &snapshot_tx).await?;
+        // shortcut: tracks kept apart (no ffmpeg) beside the first keep the name without `{date}`
+        // and `{time}`; move them too if a dated name pattern without ffmpeg turns out to matter.
+        let path = self.dated(path, link, &chosen).await?;
         self.finish_external(path, started_at, None).await
     }
 
@@ -1336,6 +1344,8 @@ impl DownloadEngine {
                 }
                 match joined {
                     Ok(()) => {
+                        // Only this download's: `output` was claimed with no other stream's tracks
+                        // beside it (see `other_tracks`), and is held still.
                         let gone = output.clone();
                         let _ = blocking(move || crate::media::remove_streams_of(&gone)).await;
                         tracing::info!("Joined {} tracks into {}", files.len(), output.display());
@@ -1465,6 +1475,10 @@ impl DownloadEngine {
             Some(opened) => {
                 for at in crate::stream::choose(&opened.info, &self.track_choice())? {
                     let track = opened.info.tracks[at].clone();
+                    if track.kind == crate::stream::Kind::Subtitles {
+                        tracing::info!("Leaving out the subtitles {}: a live recording takes none", track.describe());
+                        continue;
+                    }
                     match opened.live_origin(link, at) {
                         Some(origin) => tracks.push((track, origin)),
                         None => carried.push(track),
@@ -1494,9 +1508,15 @@ impl DownloadEngine {
             blocking(move || std::fs::create_dir_all(&parent).map_err(|e| format!("Failed to create {}: {e}", parent.display()))).await??;
         }
         let names: Vec<(String, &'static str)> = tracks.iter().zip(&listings).map(|((track, _), listing)| (track.id.clone(), listing.ext)).collect();
-        let alone = tracks.len() == 1;
+        let (alone, owner) = (tracks.len() == 1, link.clone());
+        // Several tracks are joined, which deletes every track of the name: another stream's
+        // tracks there make it taken. A recording's own carry no link's hash (see `track_path`):
+        // written in place, one a crash cut short is never taken for a finished track.
         let (output, files, _claim) = blocking(move || {
-            claim_free(&base, |output| if alone { vec![output.to_path_buf()] } else { names.iter().map(|(id, ext)| crate::media::stream_path(output, id, ext)).collect() })
+            claim_free(&base, |output| match alone {
+                true => Some(vec![output.to_path_buf()]),
+                false => (!other_tracks(output, &owner)).then(|| names.iter().map(|(id, ext)| crate::media::stream_path(output, id, ext)).collect()),
+            })
         })
         .await??;
         let options = crate::hls::HlsOptions {
@@ -1511,6 +1531,7 @@ impl DownloadEngine {
             start,
             record_seconds: self.options.record_seconds,
             idle: self.options.live_idle_timeout.map(Duration::from_secs),
+            max_bytes: self.options.max_filesize,
             margin: crate::media::MIN_FREE_SPACE,
         };
         let flag = Some(Arc::clone(&self.cancel_flag));
@@ -1565,23 +1586,28 @@ impl DownloadEngine {
         }
     }
 
-    /// Records the MPEG-TS `probed`'s link streams with no length (a TV channel) as a live stream
-    /// is recorded (see [`Self::record_live`]): appended to its file as it comes, until the stream
+    /// Records the MPEG-TS `probed`'s link streams with no length (a TV channel), or a channel's
+    /// stream of another kind with no length (a radio station's), as a live stream is recorded
+    /// (see [`Self::record_live`]): appended to its file as it comes, until the stream
     /// ends, `record_seconds` pass (from its first byte), `max_filesize` is reached, nothing comes
     /// for `live_idle_timeout`, it is stopped, or its disk comes down to what it recorded and
     /// `media::MIN_FREE_SPACE`; then finished as a recording (see [`Self::finish_recording`]).
-    /// Nothing coming for the stall timeout, without an idle timeout, breaks it off.
+    /// Nothing coming for the stall timeout, without an idle timeout, breaks it off. MPEG-TS goes
+    /// in a `.ts` as a stream's segments do (see [`Self::media_output_path`]); another kind keeps
+    /// its name.
     async fn record_ts(&self, client: Client, probed: Probed, snapshot_tx: Option<broadcast::Sender<EngineSnapshot>>) -> Result<PathBuf, String> {
         let Probed { reference, live, .. } = probed;
         tracing::info!("Recording the stream {}", reference.url);
         let started_at = unix_now();
-        let mut name = PathBuf::from(&reference.filename);
-        name.set_extension("ts");
-        let base = self.named(self.output_path_for(&name.to_string_lossy()), &[]);
+        let out = match typed_ts(&reference) {
+            true => self.media_output_path(&reference.filename, "ts"),
+            false => self.output_path_for(&reference.filename),
+        };
+        let base = self.named(out, &[], true);
         if let Some(parent) = base.parent().filter(|p| !p.as_os_str().is_empty()).map(Path::to_path_buf) {
             blocking(move || std::fs::create_dir_all(&parent).map_err(|e| format!("Failed to create {}: {e}", parent.display()))).await??;
         }
-        let (path, _, _claim) = blocking(move || claim_free(&base, |_| Vec::new())).await??;
+        let (path, _, _claim) = blocking(move || claim_free(&base, |_| Some(Vec::new()))).await??;
         let (response, _slot) = match live {
             Some(Live::Stream { response, slot }) => (response, slot),
             _ => {
@@ -1642,7 +1668,10 @@ impl DownloadEngine {
                         if let Some(limiter) = &limiter {
                             limiter.acquire(bytes.len() as u64).await;
                         }
-                        silence.as_mut().reset(tokio::time::Instant::now() + quiet);
+                        // Past what an instant holds, the silence stays as far off as it was set.
+                        if let Some(until) = tokio::time::Instant::now().checked_add(quiet) {
+                            silence.as_mut().reset(until);
+                        }
                         first_byte.get_or_insert_with(Instant::now);
                         if let Err(e) = file.write_all(&bytes).await {
                             break LiveEnd::Failed(format!("Failed to write {}: {e}", path.display()));
@@ -1677,15 +1706,23 @@ impl DownloadEngine {
     }
 
     /// Hands the Smooth Streaming manifest at `link` to yt-dlp, the media engine, which reads
-    /// them, once the manifest shows it is not DRM-protected (a `ProtectionHeader`).
+    /// them, once the manifest shows it is not DRM-protected (a `ProtectionHeader`, in any case or
+    /// encoding). An HLS playlist or DASH manifest there after all is downloaded as one (see
+    /// [`Self::fetch_adaptive`]).
     async fn fetch_smooth(&self, client: &Client, link: Url, snapshot_tx: Option<broadcast::Sender<EngineSnapshot>>) -> Result<PathBuf, String> {
         tracing::info!("Detected a Smooth Streaming manifest: {}", link);
         let (auth, fetch) = (self.auth.as_deref(), self.fetch_policy());
         let limit = HLS_PARSE_TIMEOUT.saturating_add(fetch.give_up_after());
         let read = self.guarded(limit, "fetching the stream's manifest", crate::hls::fetch_manifest(client, auth, &link, fetch, false)).await?;
         let (body, _) = read.map_err(|e| e.to_string())?;
-        let body = String::from_utf8_lossy(&body);
-        if body.contains("<ProtectionHeader") || body.contains("<ContentProtection") {
+        let text = crate::ingest::decode_text(&body).unwrap_or_else(|_| String::from_utf8_lossy(&body).into_owned());
+        if text.trim_start_matches('\u{feff}').trim_start().starts_with("#EXTM3U") || crate::dash::is_mpd(text.as_bytes()) {
+            if let Some(path) = self.boxed(|engine| engine.fetch_adaptive(client, &link, snapshot_tx.clone())).await? {
+                return Ok(path);
+            }
+        }
+        let text = text.to_ascii_lowercase();
+        if text.contains("protectionheader") || text.contains("contentprotection") {
             return Err(HlsError::Unsupported("DRM-protected stream".to_string()).to_string());
         }
         self.naming(link.clone()).run_media(link, None, snapshot_tx).await
@@ -1695,13 +1732,38 @@ impl DownloadEngine {
     /// [`Self::hls_output_path`]), named by `name_pattern` for the `chosen` tracks (see
     /// [`Self::named`]).
     fn stream_output_path(&self, link: &Url, ext: &str, chosen: &[&crate::stream::Track]) -> PathBuf {
-        self.named(self.hls_output_path(link, ext), chosen)
+        self.named(self.hls_output_path(link, ext), chosen, true)
+    }
+
+    /// [`Self::stream_output_path`] without the `{date}` and `{time}` of `name_pattern`, which
+    /// change from one attempt to the next: where a download that resumes works, so the next
+    /// attempt finds what it left. Once finished, it takes its name (see [`Self::dated`]).
+    fn work_path(&self, link: &Url, ext: &str, chosen: &[&crate::stream::Track]) -> PathBuf {
+        self.named(self.hls_output_path(link, ext), chosen, false)
+    }
+
+    /// Moves `path`, the finished file of a download of the stream at `link` named by
+    /// [`Self::work_path`] for the `chosen` tracks, to its name with the `{date}` and `{time}` of
+    /// now, never over a file there; leaves it where it is when the name pattern has neither.
+    async fn dated(&self, path: PathBuf, link: &Url, chosen: &[&crate::stream::Track]) -> Result<PathBuf, String> {
+        let ext = path.extension().unwrap_or_default().to_string_lossy().into_owned();
+        let to = self.stream_output_path(link, &ext, chosen);
+        if to == self.work_path(link, &ext, chosen) {
+            return Ok(path);
+        }
+        blocking(move || {
+            let (to, _, _claim) = claim_free(&to.with_extension(&ext), |_| Some(Vec::new()))?;
+            std::fs::rename(&path, &to).map_err(|e| format!("Failed to move {} to {}: {e}", path.display(), to.display()))?;
+            Ok(to)
+        })
+        .await?
     }
 
     /// `out`, renamed by `name_pattern` (see `DownloadOptions::name_pattern`) when there is one:
-    /// the `chosen` tracks of a stream fill in its track variables, `out`'s own name `{name}`.
-    /// Its extension stays; a pattern that leaves no name leaves `out` as it is.
-    fn named(&self, out: PathBuf, chosen: &[&crate::stream::Track]) -> PathBuf {
+    /// the `chosen` tracks of a stream fill in its track variables, `out`'s own name `{name}`,
+    /// now `{date}` and `{time}` when `dated` (else they are left out). Its extension stays; a
+    /// pattern that leaves no name leaves `out` as it is.
+    fn named(&self, out: PathBuf, chosen: &[&crate::stream::Track], dated: bool) -> PathBuf {
         let Some(pattern) = self.options.name_pattern.as_deref().filter(|p| !p.trim().is_empty()) else { return out };
         let stem = out.file_stem().unwrap_or_default().to_string_lossy().into_owned();
         let clock = crate::stream::clock_text(crate::stream::now());
@@ -1709,8 +1771,8 @@ impl DownloadEngine {
         let value = |variable: &str| match variable {
             "name" => Some(stem.clone()),
             "channel" => self.options.channel.clone(),
-            "date" => Some(date.to_string()),
-            "time" => Some(time.replace(':', "-")),
+            "date" => dated.then(|| date.to_string()),
+            "time" => dated.then(|| time.replace(':', "-")),
             _ => crate::stream::track_value(variable, chosen),
         };
         let name = sanitize_component(&crate::stream::fill_name(pattern, value));
@@ -1961,6 +2023,12 @@ impl DownloadEngine {
         extracted: Option<crate::media::Extracted>,
         snapshot_tx: Option<broadcast::Sender<EngineSnapshot>>,
     ) -> Result<PathBuf, String> {
+        if self.options.live_from.as_deref().is_some_and(|from| !from.trim().is_empty()) {
+            return Err(format!(
+                "{}: a start time ago or at a clock time (live_from) is only for HLS and DASH links; the media engine, which records this one, starts at the stream's start (live_from_start) or now",
+                crate::history::redact_url(media_url.as_str())
+            ));
+        }
         tracing::info!("Routing download to Media Engine: {}", media_url);
         let started_at = unix_now();
         let (prog_tx, mut prog_rx) = mpsc::channel::<crate::media::ProgressUpdate>(64);
@@ -2389,7 +2457,8 @@ impl DownloadEngine {
         probed: Probed,
         snapshot_tx: Option<broadcast::Sender<EngineSnapshot>>,
     ) -> Result<PathBuf, String> {
-        if streams_ts(&probed.reference) {
+        // MPEG-TS with no length is a TV channel's stream; so is any of a channel list's.
+        if probed.reference.size.is_none() && (typed_ts(&probed.reference) || self.options.channel.is_some()) {
             return self.boxed(|engine| engine.record_ts(client, probed, snapshot_tx)).await;
         }
         let Probed { reference, mirrors, live, late } = probed;
@@ -3110,8 +3179,13 @@ impl DownloadEngine {
 
     /// Where a stream from `playlist` whose file takes the extension `ext` goes.
     fn hls_output_path(&self, playlist: &Url, ext: &str) -> PathBuf {
-        // The playlist URL's extension (.m3u8, .php, ...) says nothing about the media.
-        let mut name = PathBuf::from(filename_from_url(playlist).unwrap_or_else(|| "stream".to_string()));
+        self.media_output_path(&filename_from_url(playlist).unwrap_or_else(|| "stream".to_string()), ext)
+    }
+
+    /// Where a stream named `name` whose file takes the extension `ext` goes.
+    fn media_output_path(&self, name: &str, ext: &str) -> PathBuf {
+        // The link's extension (.m3u8, .php, ...) says nothing about the media.
+        let mut name = PathBuf::from(name);
         name.set_extension(ext);
         let mut out = self.output_path_for(&name.to_string_lossy());
         // A name given without an extension, or with the other container's (a browser's
@@ -3301,19 +3375,53 @@ fn keep_tracks(output: &Path, files: &[PathBuf], tags: &[String]) -> Result<Vec<
 /// where neither a file nor a `.part` (a remux a crash cut short, another download's) is. Nothing
 /// there is touched. Blocking.
 fn claim_mp4_output(ts: &Path, ext: &str) -> Result<(PathBuf, Claim), String> {
-    claim_free(&ts.with_extension(ext), |_| Vec::new()).map(|(path, _, claim)| (path, claim))
+    claim_free(&ts.with_extension(ext), |_| Some(Vec::new())).map(|(path, _, claim)| (path, claim))
+}
+
+/// Where the track `id` (in a file `ext`) of the stream at `link` downloads next to `output` (see
+/// `crate::media::stream_path`): its name carries a short hash of the link, so a download of
+/// another stream to the same name never takes it for its own.
+fn track_path(output: &Path, link: &Url, id: &str, ext: &str) -> PathBuf {
+    crate::media::stream_path(output, &format!("{id}-{}", link_tag(link)), ext)
+}
+
+/// The short hash of `link` that names its tracks (see [`track_path`]).
+fn link_tag(link: &Url) -> String {
+    blake3::hash(link.as_str().as_bytes()).to_hex()[..8].to_string()
+}
+
+/// Whether a stream file of `output` is next to it (see `crate::media::stream_path`), finished or
+/// partial, that is no track of the stream at `link` (see [`track_path`]): another download's,
+/// which one to `output` would join or delete with its own. Blocking.
+fn other_tracks(output: &Path, link: &Url) -> bool {
+    let own = format!("-{}", link_tag(link));
+    let dir = output.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let Ok(entries) = std::fs::read_dir(dir) else { return false };
+    // The id of the stream file `name`, as `media::remove_streams_of` knows them: partial, or
+    // numbered as `free_path` numbers.
+    let stream_id = |name: &str| {
+        let file = [".part.hfstate", ".part.hlsstate", ".part"].iter().find_map(|partial| name.strip_suffix(partial)).unwrap_or(name);
+        let (stem, ext) = file.rsplit_once('.')?;
+        let numbered = stem.strip_suffix(')').and_then(|s| s.rsplit_once(" (")).filter(|(_, n)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+        let head = numbered.map_or(stem, |(s, _)| s).strip_suffix(".hf")?;
+        let plain = format!("{head}.hf.{ext}");
+        let made = |id: &str| crate::media::stream_path(output, id, ext).file_name().and_then(|n| n.to_str()) == Some(plain.as_str());
+        head.match_indices(".f").map(|(at, _)| head[at + 2..].to_string()).find(|id| made(id))
+    };
+    entries.flatten().any(|entry| entry.file_name().to_str().and_then(stream_id).is_some_and(|id| !id.ends_with(&own)))
 }
 
 /// Chooses and claims the first of `base`, `base (1)`, ... that no other download holds, where
 /// neither a file nor a `.part` is, nor is one of the `files` it names (a live recording's tracks,
-/// see `DownloadEngine::record_live`), which it returns. Nothing there is touched. Blocking.
-fn claim_free(base: &Path, files: impl Fn(&Path) -> Vec<PathBuf>) -> Result<(PathBuf, Vec<PathBuf>, Claim), String> {
+/// see `DownloadEngine::record_live`), which it returns; `files` gives None for a name taken all
+/// the same (see [`other_tracks`]). Nothing there is touched. Blocking.
+fn claim_free(base: &Path, files: impl Fn(&Path) -> Option<Vec<PathBuf>>) -> Result<(PathBuf, Vec<PathBuf>, Claim), String> {
     let free = |path: &Path| !path.exists() && !part_path(path).exists();
     let mut n = 0;
     loop {
         let candidate = numbered(base, n);
         n += 1;
-        let named = files(&candidate);
+        let Some(named) = files(&candidate) else { continue };
         if let Some(claim) = Claim::try_take(&candidate)?.filter(|_| free(&candidate) && named.iter().all(|file| free(file))) {
             return Ok((candidate, named, claim));
         }
@@ -3825,18 +3933,18 @@ fn shortener_host(url: &Url) -> Option<&str> {
 }
 
 /// Whether `url` is a Smooth Streaming manifest's link: `.ism/Manifest` (or `.isml/`), any case,
-/// with or without `(format=...)` after it.
+/// with or without `(format=...)` after it, but for `(format=m3u8...)` and `(format=mpd...)`: the
+/// HLS and DASH the server makes of it, which are downloaded as such.
 fn smooth_manifest(url: &Url) -> bool {
     let path = url.path().to_ascii_lowercase();
-    path.contains(".ism/manifest") || path.contains(".isml/manifest")
+    let after = [".ism/manifest", ".isml/manifest"].iter().find_map(|end| path.find(end).map(|at| &path[at + end.len()..]));
+    after.is_some_and(|after| !after.starts_with("(format=m3u8") && !after.starts_with("(format=mpd"))
 }
 
-/// Whether `answer` streams MPEG-TS with no length, as a TV channel does (see
-/// `DownloadEngine::record_ts`): typed so, or a `.ts` link.
-fn streams_ts(answer: &ProbeInfo) -> bool {
-    let typed = answer.headers.get(CONTENT_TYPE).and_then(|t| t.to_str().ok()).is_some_and(|t| t.to_ascii_lowercase().contains("mp2t"));
-    let named = [&answer.url, &answer.final_url].iter().any(|url| url.path().to_ascii_lowercase().ends_with(".ts"));
-    answer.size.is_none() && (typed || named)
+/// Whether `answer` is typed MPEG-TS: with no length, a TV channel's stream (see
+/// `DownloadEngine::record_ts`).
+fn typed_ts(answer: &ProbeInfo) -> bool {
+    answer.headers.get(CONTENT_TYPE).and_then(|t| t.to_str().ok()).is_some_and(|t| t.to_ascii_lowercase().contains("mp2t"))
 }
 
 /// Why a live recording that ended as `end` before it recorded anything failed.
@@ -6241,13 +6349,17 @@ mod tests {
     }
 
     /// A Smooth Streaming manifest, known by its link or by its answer's type, goes to yt-dlp
-    /// once it shows no DRM protection; a protected one is refused before.
+    /// once it shows no DRM protection (in any case or encoding); a protected one is refused
+    /// before, and so is a start time ago, which only HLS and DASH take. Its `(format=m3u8...)`
+    /// and `(format=mpd...)` forms, or an HLS playlist there after all, are downloaded natively.
     #[tokio::test]
     async fn test_smooth_streaming_goes_to_the_media_engine_unless_protected() {
         use crate::hls::tests::{ok, serve};
         for (link, smooth) in [
             ("https://a.example/v/Show.ism/Manifest", true),
-            ("https://a.example/v/Show.ISML/manifest(format=mpd-time-csf)", true),
+            ("https://a.example/v/Show.ISML/manifest(format=smooth)", true),
+            ("https://a.example/v/Show.ISML/manifest(format=mpd-time-csf)", false),
+            ("https://a.example/v/Show.ism/Manifest(format=m3u8-aapl)", false),
             ("https://a.example/v/Show.ism", false),
             ("https://a.example/v/manifest", false),
         ] {
@@ -6255,10 +6367,16 @@ mod tests {
         }
         const ISM: &str = r#"<?xml version="1.0"?><SmoothStreamingMedia MajorVersion="2" MinorVersion="0" Duration="20000000"><StreamIndex Type="video" Chunks="1" Url="QualityLevels({bitrate})/Fragments(video={start time})"><QualityLevel Index="0" Bitrate="100000" FourCC="H264" MaxWidth="64" MaxHeight="48"/><c d="20000000"/></StreamIndex></SmoothStreamingMedia>"#;
         let drm = ISM.replace("</SmoothStreamingMedia>", r#"<Protection><ProtectionHeader SystemID="00000000-0000-0000-0000-000000000000">AAAA</ProtectionHeader></Protection></SmoothStreamingMedia>"#);
+        let prefixed = ISM.replace("</SmoothStreamingMedia>", r#"<sm:Protection><sm:protectionHeader SystemID="0">AAAA</sm:protectionHeader></sm:Protection></SmoothStreamingMedia>"#);
+        let utf16: Vec<u8> = [0xFF, 0xFE].into_iter().chain(drm.encode_utf16().flat_map(u16::to_le_bytes)).collect();
         let (addr, _) = serve(move |path: &str, _| match path {
             "/v/Show.ism/Manifest" => ok(ISM),
             "/v/Drm.ism/Manifest" => ok(drm.clone()),
+            "/v/Prefixed.ism/Manifest" => ok(prefixed.clone()),
+            "/v/Wide.ism/Manifest" => ok(utf16.clone()),
             "/api/drm" => (200, "Content-Type: application/vnd.ms-sstr+xml\r\n".to_string(), drm.clone().into()),
+            "/v/Hls.ism/Manifest" => ok("#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2,\nseg.ts\n#EXT-X-ENDLIST\n"),
+            "/v/Hls.ism/seg.ts" => ok("SEGMENT"),
             _ => (404, String::new(), Vec::new()),
         })
         .await;
@@ -6270,17 +6388,27 @@ mod tests {
         std::fs::write(&bin, script).unwrap();
         #[cfg(unix)]
         crate::media::make_executable(&bin).unwrap();
-        let run = |path: &str| {
-            let options = DownloadOptions { output_path: Some(dir.path().to_path_buf()), ytdlp_path: Some(bin.clone()), ..Default::default() };
+        let run_from = |path: &str, from: Option<&str>| {
+            let options = DownloadOptions {
+                output_path: Some(dir.path().to_path_buf()),
+                ytdlp_path: Some(bin.clone()),
+                live_from: from.map(str::to_string),
+                ..Default::default()
+            };
             let engine = DownloadEngine::new(vec![Url::parse(&format!("http://{addr}{path}")).unwrap()], options);
             async move { engine.run(None).await }
         };
+        let run = |path: &str| run_from(path, None);
         let err = run("/v/Show.ism/Manifest").await.unwrap_err();
         assert!(err.contains("the media engine has it"), "{err}");
-        for protected in ["/v/Drm.ism/Manifest", "/api/drm"] {
+        let err = run_from("/v/Show.ism/Manifest", Some("30m")).await.unwrap_err();
+        assert!(err.contains("live_from") && !err.contains("the media engine has it"), "{err}");
+        for protected in ["/v/Drm.ism/Manifest", "/api/drm", "/v/Prefixed.ism/Manifest", "/v/Wide.ism/Manifest"] {
             let err = run(protected).await.unwrap_err();
             assert!(err.contains("DRM-protected stream"), "{protected}: {err}");
         }
+        let path = run("/v/Hls.ism/Manifest").await.unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"SEGMENT");
     }
 
     /// Several tracks of a stream are downloaded together and joined by ffmpeg, without
@@ -6364,7 +6492,7 @@ mod tests {
         let url = Url::parse(&format!("http://{addr}/v/Show.mpd")).unwrap();
         let err = DownloadEngine::new(vec![url.clone()], options.clone()).run(None).await.unwrap_err();
         assert!(err.contains("HTTP 400"), "{err}");
-        assert!(dir.path().join("Show.fv0.hf.mp4").is_file(), "the finished track: {:?}", file_names(dir.path()));
+        assert!(track_path(&dir.path().join("Show.mp4"), &url, "v0", "mp4").is_file(), "the finished track: {:?}", file_names(dir.path()));
         broken.store(false, Ordering::SeqCst);
         let path = DownloadEngine::new(vec![url], options).run(None).await.unwrap();
         assert_eq!(path, dir.path().join("Show.mp4"));
@@ -6375,6 +6503,76 @@ mod tests {
         let hits = hits.lock();
         let count = |path: &str| hits.get(path).copied().unwrap_or(0);
         assert_eq!([count("/v/v/1.m4s"), count("/v/v/2.m4s"), count("/v/a/1.m4s"), count("/v/a/2.m4s")], [1, 1, 1, 2]);
+    }
+
+    /// Tracks belong to the link they came from: a download of another stream that takes the
+    /// same name never takes for its own, nor deletes, the tracks one left half done, which
+    /// resumes them later; it takes another name.
+    #[tokio::test]
+    async fn test_two_streams_of_the_same_name_keep_their_tracks_apart() {
+        use crate::hls::tests::{ok, serve};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        const MPD: &str = r#"<MPD type="static" mediaPresentationDuration="PT4S"><Period>
+            <AdaptationSet contentType="video"><SegmentTemplate media="$RepresentationID$/$Number$.m4s" initialization="$RepresentationID$/init.mp4" duration="2"/>
+            <Representation id="v" bandwidth="100000" width="64" height="48" codecs="avc1.64001f"/></AdaptationSet>
+            <AdaptationSet contentType="audio" lang="en"><SegmentTemplate media="$RepresentationID$/$Number$.m4s" initialization="$RepresentationID$/init.mp4" duration="2"/>
+            <Representation id="a" bandwidth="64000" codecs="mp4a.40.2"/></AdaptationSet></Period></MPD>"#;
+        let broken = Arc::new(AtomicBool::new(true));
+        let breaks = Arc::clone(&broken);
+        let (addr, hits) = serve(move |path: &str, _| match path.split_once("/manifest.mpd") {
+            Some((_, "")) => ok(MPD),
+            _ if path == "/a/a/2.m4s" && breaks.load(Ordering::SeqCst) => (400, String::new(), Vec::new()),
+            _ if path.ends_with(".m4s") || path.ends_with("init.mp4") => ok(path.to_uppercase()),
+            _ => (404, String::new(), Vec::new()),
+        })
+        .await;
+        let dir = tempdir().unwrap();
+        let options = DownloadOptions { output_path: Some(dir.path().to_path_buf()), ..Default::default() };
+        let (a, b) = (Url::parse(&format!("http://{addr}/a/manifest.mpd")).unwrap(), Url::parse(&format!("http://{addr}/b/manifest.mpd")).unwrap());
+        let err = DownloadEngine::new(vec![a.clone()], options.clone()).run(None).await.unwrap_err();
+        assert!(err.contains("HTTP 400"), "{err}");
+        let left = file_names(dir.path());
+        let path = DownloadEngine::new(vec![b], options.clone()).run(None).await.unwrap();
+        assert_eq!(path, dir.path().join("manifest (1).mp4"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"/B/V/INIT.MP4/B/V/1.M4S/B/V/2.M4S");
+        assert!(left.iter().all(|name| dir.path().join(name).is_file()), "what the first left is there still: {:?}", file_names(dir.path()));
+        broken.store(false, Ordering::SeqCst);
+        let path = DownloadEngine::new(vec![a], options).run(None).await.unwrap();
+        assert_eq!(path, dir.path().join("manifest.mp4"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"/A/V/INIT.MP4/A/V/1.M4S/A/V/2.M4S");
+        assert_eq!(std::fs::read(dir.path().join("manifest.en.m4a")).unwrap(), b"/A/A/INIT.MP4/A/A/1.M4S/A/A/2.M4S");
+        assert_eq!(file_names(dir.path()), ["manifest (1).en.m4a", "manifest (1).mp4", "manifest.en.m4a", "manifest.mp4"]);
+        assert_eq!(hits.lock().get("/a/v/1.m4s"), Some(&1), "the first's finished track is not fetched again");
+    }
+
+    /// `{date}` and `{time}` in a name pattern are left out of the name a stream downloads under,
+    /// so an attempt after a failure resumes what one left; the finished file takes them.
+    #[tokio::test]
+    async fn test_a_dated_name_pattern_does_not_stop_a_resume() {
+        use crate::hls::tests::{ok, serve};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let broken = Arc::new(AtomicBool::new(true));
+        let breaks = Arc::clone(&broken);
+        let (addr, hits) = serve(move |path: &str, _| match path {
+            "/v/show.m3u8" => ok("#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2,\n1.ts\n#EXTINF:2,\n2.ts\n#EXT-X-ENDLIST\n"),
+            "/v/2.ts" if breaks.load(Ordering::SeqCst) => (400, String::new(), Vec::new()),
+            "/v/1.ts" | "/v/2.ts" => ok(path.to_uppercase()),
+            _ => (404, String::new(), Vec::new()),
+        })
+        .await;
+        let dir = tempdir().unwrap();
+        let options = DownloadOptions { output_path: Some(dir.path().to_path_buf()), name_pattern: Some("{name} {date} {time}".into()), ..Default::default() };
+        let url = Url::parse(&format!("http://{addr}/v/show.m3u8")).unwrap();
+        let err = DownloadEngine::new(vec![url.clone()], options.clone()).run(None).await.unwrap_err();
+        assert!(err.contains("HTTP 400"), "{err}");
+        assert!(dir.path().join("show.ts.part").is_file(), "{:?}", file_names(dir.path()));
+        broken.store(false, Ordering::SeqCst);
+        let path = DownloadEngine::new(vec![url], options).run(None).await.unwrap();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("show 20") && name.ends_with(".ts") && name.len() == "show 2026-10-28 21-00-00.ts".len(), "{name}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"/V/1.TS/V/2.TS");
+        assert_eq!(file_names(dir.path()), [name]);
+        assert_eq!(hits.lock().get("/v/1.ts"), Some(&1), "resumed");
     }
 
     /// A DASH segment whose link expired mid-download is fetched by the link the manifest, read
@@ -6442,14 +6640,16 @@ mod tests {
     }
 
     /// Serves `stream` as live HLS: `/v/live.m3u8`, and a master `/v/master.m3u8` whose variant
-    /// `/v/video.m3u8` plays with the English audio rendition `/v/en.m3u8`. Read the r-th time, a
-    /// playlist lists its segments r-1 to r+4 (`/v/<playlist>-<n>.ts`, `.aac` for audio, each
-    /// `<playlist><n>;`) and asks to be read again after 0.2 s.
+    /// `/v/video.m3u8` plays with the English audio rendition `/v/en.m3u8` and has the subtitles
+    /// `/v/subs.m3u8`. Read the r-th time, a playlist lists its segments r-1 to r+4
+    /// (`/v/<playlist>-<n>.ts`, `.aac` for audio, each `<playlist><n>;`) and asks to be read again
+    /// after 0.2 s.
     async fn serve_live(stream: LiveStream) -> std::net::SocketAddr {
         use crate::hls::tests::{ok, serve};
         const MASTER: &str = "#EXTM3U\n\
             #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"English\",LANGUAGE=\"en\",DEFAULT=YES,URI=\"en.m3u8\"\n\
-            #EXT-X-STREAM-INF:BANDWIDTH=900000,CODECS=\"avc1.4d401e,mp4a.40.2\",AUDIO=\"aud\"\nvideo.m3u8\n";
+            #EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"English\",LANGUAGE=\"en\",URI=\"subs.m3u8\"\n\
+            #EXT-X-STREAM-INF:BANDWIDTH=900000,CODECS=\"avc1.4d401e,mp4a.40.2\",AUDIO=\"aud\",SUBTITLES=\"subs\"\nvideo.m3u8\n";
         let reads = parking_lot::Mutex::new(std::collections::HashMap::<String, usize>::new());
         let (addr, _) = serve(move |path: &str, _| {
             let Some(name) = path.strip_prefix("/v/") else { return (404, String::new(), Vec::new()) };
@@ -6617,6 +6817,11 @@ mod tests {
     /// Serves an MPEG-TS with no length, as a TV channel does, at any path: `packets` 188-byte
     /// packets, one every `every`, then nothing for `hold`, then the end. A HEAD gets the head.
     async fn serve_ts(packets: usize, every: Duration, hold: Duration) -> std::net::SocketAddr {
+        serve_endless("video/mp2t", packets, every, hold).await
+    }
+
+    /// [`serve_ts`], typed `kind`.
+    async fn serve_endless(kind: &'static str, packets: usize, every: Duration, hold: Duration) -> std::net::SocketAddr {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = crate::hosts::unseen_listener().await;
         let addr = listener.local_addr().unwrap();
@@ -6625,7 +6830,7 @@ mod tests {
                 tokio::spawn(async move {
                     let mut request = vec![0; 4096];
                     let n = socket.read(&mut request).await.unwrap_or(0);
-                    let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nConnection: close\r\n\r\n").await;
+                    let _ = socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nConnection: close\r\n\r\n").as_bytes()).await;
                     if request[..n].starts_with(b"HEAD") {
                         return;
                     }
@@ -6667,6 +6872,35 @@ mod tests {
         assert!((188..100 * 188).contains(&size(record_live(addr, "news", DownloadOptions { record_seconds: Some(1), ..options() }).await.0)));
         assert!((1000..2000).contains(&size(record_live(addr, "news", DownloadOptions { max_filesize: Some(1000), ..options() }).await.0)));
         assert_eq!(file_names(dir.path()).len(), 5, "{:?}", file_names(dir.path()));
+
+        // An idle timeout too long to count from now waits for ever.
+        let addr = serve_ts(3, Duration::from_millis(10), Duration::ZERO).await;
+        assert_eq!(size(record_live(addr, "news", DownloadOptions { live_idle_timeout: Some(u64::MAX), ..options() }).await.0), 3 * 188);
+        // A name given as .mp4 holds MPEG-TS as .ts, as a stream's would.
+        let options = DownloadOptions { output_path: Some(dir.path().join("show.mp4")), ..options() };
+        assert_eq!(record_live(addr, "news", options).await.0.unwrap(), dir.path().join("show.ts"));
+    }
+
+    /// Only an answer typed MPEG-TS with no length is recorded: a `.ts` link of another type is a
+    /// file, which `max_filesize` fails; a channel's stream of any type with no length is
+    /// recorded, for `record_seconds`, under the name its channel gave it.
+    #[tokio::test]
+    async fn test_only_mpeg_ts_or_a_channels_stream_is_recorded() {
+        let dir = tempdir().unwrap();
+        let addr = serve_endless("application/octet-stream", 5, Duration::from_millis(10), Duration::ZERO).await;
+        let options = DownloadOptions { output_path: Some(dir.path().to_path_buf()), max_filesize: Some(500), ..Default::default() };
+        let err = record_live(addr, "clip.ts", options).await.0.unwrap_err();
+        assert!(err.contains("larger than the limit"), "{err}");
+        let addr = serve_endless("audio/mpeg", 200, Duration::from_millis(20), Duration::ZERO).await;
+        let options = DownloadOptions {
+            output_path: Some(dir.path().join("Radio X.mp3")),
+            channel: Some("Radio X".into()),
+            record_seconds: Some(1),
+            ..Default::default()
+        };
+        let path = record_live(addr, "stream.mp3", options).await.0.unwrap();
+        assert_eq!(path, dir.path().join("Radio X.mp3"));
+        assert!((188..200 * 188).contains(&std::fs::metadata(&path).unwrap().len()));
     }
 
     /// Stopping the recording of an MPEG-TS stream keeps what it recorded.
@@ -6691,17 +6925,20 @@ mod tests {
 
     /// A live master playlist's video and the audio it plays apart are recorded side by side from
     /// the same time, and kept as files of their own when they cannot be joined (here, as they
-    /// are no media).
+    /// are no media). Its subtitles are left out, even chosen by their id.
     #[tokio::test]
     async fn test_a_live_master_records_its_video_and_audio_together() {
-        let addr = serve_live(LiveStream { end: 4, ..Default::default() }).await;
-        let dir = tempdir().unwrap();
-        let options = DownloadOptions { output_path: Some(dir.path().to_path_buf()), ..Default::default() };
-        let path = record_live(addr, "master.m3u8", options).await.0.unwrap();
-        assert_eq!(path, dir.path().join("master.ts"));
-        assert_eq!(recorded(&path), "video4;video5;video6;video7;video8;");
-        assert_eq!(recorded(&dir.path().join("master.en.aac")), "en3;en4;en5;en6;en7;en8;");
-        assert_eq!(file_names(dir.path()), ["master.en.aac", "master.ts"]);
+        for ids in [Vec::new(), vec!["v0".to_string(), "a0".to_string(), "s0".to_string()]] {
+            let addr = serve_live(LiveStream { end: 4, ..Default::default() }).await;
+            let dir = tempdir().unwrap();
+            let tracks = crate::stream::TrackChoice { ids, ..Default::default() };
+            let options = DownloadOptions { output_path: Some(dir.path().to_path_buf()), tracks, ..Default::default() };
+            let path = record_live(addr, "master.m3u8", options).await.0.unwrap();
+            assert_eq!(path, dir.path().join("master.ts"));
+            assert_eq!(recorded(&path), "video4;video5;video6;video7;video8;");
+            assert_eq!(recorded(&dir.path().join("master.en.aac")), "en3;en4;en5;en6;en7;en8;");
+            assert_eq!(file_names(dir.path()), ["master.en.aac", "master.ts"]);
+        }
     }
 
     /// A live master playlist's video and audio, real media here, recorded from its start, are

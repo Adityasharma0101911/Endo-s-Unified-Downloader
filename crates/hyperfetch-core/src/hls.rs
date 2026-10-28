@@ -680,6 +680,8 @@ pub(crate) struct LiveOptions {
     pub record_seconds: Option<u64>,
     /// It ends once no track has had a new segment for this long.
     pub idle: Option<Duration>,
+    /// It ends once its tracks have recorded this many bytes (see `DownloadOptions::max_filesize`).
+    pub max_bytes: Option<u64>,
     /// It ends once its disk has no more than what it recorded and this many bytes left (see
     /// `media::MIN_FREE_SPACE`).
     pub margin: u64,
@@ -695,7 +697,7 @@ pub(crate) enum LiveEnd {
     Stopped,
     /// No segment came for `LiveOptions::idle`.
     Idle,
-    /// It recorded `LiveOptions::record_seconds`.
+    /// It recorded `LiveOptions::record_seconds`, or `LiveOptions::max_bytes`.
     Time,
     /// Only this many bytes were left on its disk.
     DiskFull(u64),
@@ -1966,8 +1968,11 @@ impl HlsEngine {
     /// recorded is in the files even after a crash. A segment the server no longer has (401, 403,
     /// 404 or 410: it expired before it could be fetched) is skipped, and the log names the gap;
     /// [`MAX_GONE_IN_A_ROW`] of a track gone in a row, the newest it lists among them, end the
-    /// recording, as the server refuses them. Its progress is the size recorded, with nothing to
-    /// reach (see `EngineSnapshot::is_recording`). Returns why it ended, and per track the bytes
+    /// recording, as the server refuses them. Segments that left the manifest before a round read
+    /// them are a gap too, logged, and so is a restart that numbers the segments from the start
+    /// again: the recording goes on, a discontinuity marking each. Its progress is the size
+    /// recorded, with nothing to reach (see `EngineSnapshot::is_recording`). It ends once it has
+    /// `live.max_bytes`. Returns why it ended, and per track the bytes
     /// it recorded and where its discontinuities start in them.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn record(
@@ -1991,11 +1996,14 @@ impl HlsEngine {
             }
         }
         let is_cancelled = || cancel_flag.as_ref().is_some_and(|c| c.load(Ordering::Relaxed));
-        // Per track: the last segment it took, the init section written last, segments taken and
-        // segments gone in a row.
+        // Per track: the last segment it took and when that ends, whether a gap comes before the
+        // next, the init section written last, segments taken and segments gone in a row.
         let mut last: Vec<Option<u64>> = vec![None; files.len()];
+        let (mut ends, mut broken) = (vec![None::<f64>; files.len()], vec![false; files.len()]);
         let mut inits: Vec<Option<Arc<InitSection>>> = vec![None; files.len()];
         let (mut taken, mut gone) = (vec![0usize; files.len()], vec![0usize; files.len()]);
+        // Each round reads all a manifest lists: a restart shows only as numbers that went back.
+        let whole = vec![None; files.len()];
         // When the recording starts (see `start_from`); with `record_seconds`, the seconds its
         // first track took and when that ends.
         let mut from = None;
@@ -2019,6 +2027,10 @@ impl HlsEngine {
             let mut batch: Vec<(usize, HlsSegment, bool)> = Vec::new();
             for (t, listing) in listings.iter().enumerate().filter(|_| from.is_some()) {
                 let newest = listing.segments.last().map(|s| s.sequence);
+                if let Some((newest, before)) = newest.zip(last[t]).filter(|(newest, before)| newest < before) {
+                    tracing::warn!("The live stream's segment numbers went back from {before} to {newest}: it restarted, and the recording goes on with it");
+                    (last[t], ends[t], broken[t]) = (None, None, true);
+                }
                 for (segment, &date) in listing.segments.iter().zip(&listing.dates) {
                     let new = last[t].map_or(date + segment.duration_secs > from.unwrap_or_default() + 0.001, |last| segment.sequence > last);
                     let within = match (t, live.record_seconds) {
@@ -2034,13 +2046,20 @@ impl HlsEngine {
                             until = Some(date + segment.duration_secs - 0.001);
                         }
                     }
-                    last[t] = Some(segment.sequence);
+                    // Segments that left the manifest before this round read it: not the next
+                    // number (an HLS one), and starting well after the last one ended (a DASH one,
+                    // or one HLS dates). A discontinuity or a left-out ad says so already.
+                    if let Some((before, end)) = last[t].zip(ends[t]) {
+                        if !segment.discontinuity && segment.sequence != before + 1 && date > end + segment.duration_secs / 2.0 {
+                            tracing::warn!("Skipped {:.1} s of the live stream, gone from its manifest before it could be fetched: a gap", date - end);
+                            broken[t] = true;
+                        }
+                    }
+                    (last[t], ends[t]) = (Some(segment.sequence), Some(date + segment.duration_secs));
                     taken[t] += 1;
-                    batch.push((t, HlsSegment { index: taken[t] - 1, ..segment.clone() }, Some(segment.sequence) == newest));
+                    let discontinuity = segment.discontinuity || std::mem::take(&mut broken[t]);
+                    batch.push((t, HlsSegment { index: taken[t] - 1, discontinuity, ..segment.clone() }, Some(segment.sequence) == newest));
                 }
-            }
-            if !batch.is_empty() {
-                last_new = Instant::now();
             }
             let fetch_one = |i: usize| {
                 let (segment, received, limiter, fetch) = (&batch[i].1, &received, options.limiter.as_deref(), options.fetch);
@@ -2102,8 +2121,12 @@ impl HlsEngine {
                     break 'record LiveEnd::Failed(format!("Failed to write {}: {e}", files[t].display()));
                 }
                 written[t].0 += data.len() as u64;
+                let total: u64 = written.iter().map(|w| w.0).sum();
                 if let Some(tx) = &snapshot_tx {
-                    let _ = tx.send(recording_snapshot(written.iter().map(|w| w.0).sum(), started));
+                    let _ = tx.send(recording_snapshot(total, started));
+                }
+                if live.max_bytes.is_some_and(|max| total >= max) {
+                    break 'record LiveEnd::Time;
                 }
                 if disk_checked.is_none_or(|at| at.elapsed() >= crate::media::DISK_CHECK_EVERY) {
                     disk_checked = Some(Instant::now());
@@ -2113,6 +2136,10 @@ impl HlsEngine {
                 }
             }
             drop(window);
+            // Idle from when the new segments are in, however long a catch-up took to fetch them.
+            if !batch.is_empty() {
+                last_new = Instant::now();
+            }
             if until.is_some() {
                 break LiveEnd::Time;
             }
@@ -2138,7 +2165,7 @@ impl HlsEngine {
                 }
             }
             listings = tokio::select! {
-                read = sources.listings(client, auth, options.fetch, crate::stream::now(), &last) => match read {
+                read = sources.listings(client, auth, options.fetch, crate::stream::now(), &whole) => match read {
                     Ok(read) => read,
                     Err(e) => break LiveEnd::Failed(e.to_string()),
                 },
@@ -2167,19 +2194,20 @@ impl HlsEngine {
 
 /// Where a live recording starts, as `start` asks, by what its first track lists in `lead` (None
 /// while that lists nothing): the newest [`LIVE_START_SEGMENTS`] segments, the oldest, or the time
-/// asked, which must lie in what the server keeps (a time ago later than the newest segment starts
-/// at that one).
+/// asked, which must lie in what the server keeps (a time ago, counted back from where the newest
+/// segment ends, so a server's clock that is off does not matter; one later than the newest
+/// segment starts at that one).
 fn start_from(lead: &crate::stream::Listing, start: LiveStart) -> Result<Option<f64>, String> {
     let (Some(&first), Some(&newest), Some(last)) = (lead.dates.first(), lead.dates.last(), lead.segments.last()) else {
         return Ok(None);
     };
+    let (edge, slack) = (newest + last.duration_secs, lead.segments[0].duration_secs);
     let asked = match start {
         LiveStart::Now => return Ok(Some(lead.dates[lead.dates.len().saturating_sub(LIVE_START_SEGMENTS)])),
         LiveStart::Oldest => return Ok(Some(f64::NEG_INFINITY)),
-        LiveStart::Ago(secs) => (lead.now - secs).min(newest),
+        LiveStart::Ago(secs) => (edge - secs).min(newest),
         LiveStart::At(at) => at,
     };
-    let (edge, slack) = (newest + last.duration_secs, lead.segments[0].duration_secs);
     if asked + slack < first || asked >= edge {
         let clock = crate::stream::clock_text;
         let why = if asked >= edge { "is still to come" } else { "is no longer there" };
@@ -3063,6 +3091,8 @@ video.m3u8
         assert_eq!(start_from(&lead, LiveStart::Oldest), Ok(Some(f64::NEG_INFINITY)));
         assert_eq!(start_from(&lead, LiveStart::Ago(35.0)), Ok(Some(115.0)));
         assert_eq!(start_from(&lead, LiveStart::Ago(2.0)), Ok(Some(140.0)));
+        let skewed = listing(&[100.0, 110.0, 120.0, 130.0, 140.0], 10.0, 1000.0);
+        assert_eq!(start_from(&skewed, LiveStart::Ago(35.0)), Ok(Some(115.0)), "a time ago counts back from the newest segment's end");
         assert_eq!(start_from(&lead, LiveStart::At(95.0)), Ok(Some(95.0)), "within a segment of the oldest");
         let gone = start_from(&lead, LiveStart::Ago(80.0)).unwrap_err();
         assert!(gone.contains("keeps only") && gone.contains("(1 min)") && gone.contains("is no longer there"), "{gone}");
@@ -3086,10 +3116,85 @@ video.m3u8
         let listings = sources.listings(&client, None, FETCH, crate::stream::now(), &[None]).await.unwrap();
         assert_eq!((listings[0].ext, listings[0].segments.len(), listings[0].ended), ("ts", 2, false));
         let file = dir.path().join("live.ts");
-        let live = LiveOptions { start: LiveStart::Oldest, record_seconds: None, idle: None, margin: u64::MAX };
+        let live = LiveOptions { start: LiveStart::Oldest, record_seconds: None, idle: None, max_bytes: None, margin: u64::MAX };
         let (end, written) = HlsEngine::record(&client, None, &mut sources, listings, &[file.clone()], &options(1), &live, None, None).await;
         assert!(matches!(end, LiveEnd::DiskFull(_)), "{end:?}");
         assert_eq!(std::fs::read(&file).unwrap(), b"/S0.TS");
+        assert_eq!(written, [(6, Vec::new())]);
+    }
+
+    /// Records `/live.m3u8` of a server that answers its r-th read with `reads[r - 1]` (the last
+    /// one from then on), each segment `/<name>.ts` with `<name>;` after `delay`, as `live` says,
+    /// from its oldest segment; at most 20 s.
+    async fn record_reads(reads: &[&str], delay: Duration, live: LiveOptions) -> (LiveEnd, Vec<(u64, Vec<u64>)>, String) {
+        let reads: Vec<String> = reads.iter().map(|r| r.to_string()).collect();
+        let read = Arc::new(AtomicUsize::new(0));
+        let (addr, _) = serve_async(move |path: &str, _| {
+            let reply = match path {
+                "/live.m3u8" => ok(reads[read.fetch_add(1, Ordering::SeqCst).min(reads.len() - 1)].clone()),
+                name => ok(format!("{};", name.trim_start_matches('/').trim_end_matches(".ts"))),
+            };
+            let delay = if path.ends_with(".ts") { delay } else { Duration::ZERO };
+            async move {
+                tokio::time::sleep(delay).await;
+                reply
+            }
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let client = Client::new();
+        let origin = Origin { manifest: Url::parse(&format!("http://{addr}/live.m3u8")).unwrap(), track: None };
+        let mut sources = crate::stream::LiveSources::new(vec![(origin, Kind::Video)]);
+        let listings = sources.listings(&client, None, FETCH, crate::stream::now(), &[None]).await.unwrap();
+        let (file, options) = (dir.path().join("live.ts"), options(1));
+        let recording = HlsEngine::record(&client, None, &mut sources, listings, std::slice::from_ref(&file), &options, &live, None, None);
+        let (end, written) = tokio::time::timeout(Duration::from_secs(20), recording).await.expect("the recording ends");
+        (end, written, std::fs::read_to_string(&file).unwrap())
+    }
+
+    /// A live playlist read again every 0.2 s with segments `first..first + count` (1 s each,
+    /// dated from 2026-01-01 00:00:00 UTC on by their numbers plus `shift`), ended when `end`.
+    fn live_list(first: u64, count: u64, shift: u64, end: bool) -> String {
+        let mut text = format!("#EXTM3U\n#EXT-X-TARGETDURATION:0.2\n#EXT-X-MEDIA-SEQUENCE:{first}\n#EXT-X-PROGRAM-DATE-TIME:2026-01-01T00:00:{:02}.000Z\n", first + shift);
+        for n in first..first + count {
+            text += &format!("#EXTINF:1,\ns{n}.ts\n");
+        }
+        text + if end { "#EXT-X-ENDLIST\n" } else { "" }
+    }
+
+    const FROM_THE_START: LiveOptions = LiveOptions { start: LiveStart::Oldest, record_seconds: None, idle: None, max_bytes: None, margin: 0 };
+
+    /// Segments that left the playlist before a read took them are a gap, and segments numbered
+    /// from the start again are a restart: the recording goes on through both, a discontinuity
+    /// marking each.
+    #[tokio::test]
+    async fn test_a_live_recording_goes_on_through_a_gap_and_a_restart() {
+        let reads = [live_list(10, 2, 0, false), live_list(14, 2, 0, false), live_list(0, 2, 20, true)];
+        let reads: Vec<&str> = reads.iter().map(String::as_str).collect();
+        let (end, written, file) = record_reads(&reads, Duration::ZERO, FROM_THE_START).await;
+        assert_eq!((end, file.as_str()), (LiveEnd::Stream, "s10;s11;s14;s15;s0;s1;"));
+        assert_eq!(written, [(22, vec![8, 16])]);
+    }
+
+    /// Idle counts from when a round's new segments are in: a catch-up that takes longer than the
+    /// idle timeout to fetch does not end the recording.
+    #[tokio::test]
+    async fn test_a_slow_catch_up_is_not_idle() {
+        let reads = [live_list(0, 2, 0, false), live_list(0, 3, 0, true)];
+        let reads: Vec<&str> = reads.iter().map(String::as_str).collect();
+        // Each segment alone takes longer than that.
+        let live = LiveOptions { idle: Some(Duration::from_millis(200)), ..FROM_THE_START };
+        let (end, _, file) = record_reads(&reads, Duration::from_millis(300), live).await;
+        assert_eq!((end, file.as_str()), (LiveEnd::Stream, "s0;s1;s2;"));
+    }
+
+    /// A live recording ends once it has recorded `max_bytes`.
+    #[tokio::test]
+    async fn test_a_live_recording_ends_at_its_largest_size() {
+        let reads = live_list(0, 5, 0, false);
+        let live = LiveOptions { max_bytes: Some(6), ..FROM_THE_START };
+        let (end, written, file) = record_reads(&[reads.as_str()], Duration::ZERO, live).await;
+        assert_eq!((end, file.as_str()), (LiveEnd::Time, "s0;s1;"));
         assert_eq!(written, [(6, Vec::new())]);
     }
 
