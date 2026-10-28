@@ -359,6 +359,8 @@ enum RowAction {
     Remove,
     Open,
     Reveal,
+    /// Shows the download with its track chooser open (see `App::list_tracks`).
+    Tracks,
 }
 
 /// Height of one queue row: every row has the same, so only the rows in view are laid out.
@@ -601,10 +603,12 @@ fn queue_row(app: &App, ui: &mut Ui, line: &Line, action: &mut Option<(usize, Ro
     let item_id = egui::Id::new(("item", item.id));
     let (status, color) = status_badge(app, item, &p);
     let actions = row_actions(&item.status);
+    // A stream's row offers its track chooser too, left of the others.
+    let tracks = crate::tracks::offered(item);
     ui.horizontal(|ui| {
         status_icon(ui, item, waiting, app.stalled_for(item.id).is_some(), color, t);
         status_chip(ui, item_id, status, color, downloading && !waiting && seen);
-        left_part(ui, actions.len() as f32 * 30.0, |ui| {
+        left_part(ui, (actions.len() + usize::from(tracks)) as f32 * 30.0, |ui| {
             let name = egui::Label::new(bold(&item.filename).color(p.strong)).truncate().selectable(false);
             ui.add(name).on_hover_text(&item.filename);
         });
@@ -613,6 +617,9 @@ fn queue_row(app: &App, ui: &mut Ui, line: &Line, action: &mut Option<(usize, Ro
                 if icon_button(ui, glyph, tip, true).clicked() {
                     *action = Some((item.id, what));
                 }
+            }
+            if tracks && icon_button(ui, icon::SLIDERS_HORIZONTAL, "Choose tracks…", true).clicked() {
+                *action = Some((item.id, RowAction::Tracks));
             }
         });
     });
@@ -781,6 +788,12 @@ pub(super) fn queue_page(app: &mut App, ui: &mut Ui) {
         RowAction::Reveal => {
             if let Some(path) = target {
                 report(app, util::reveal_in_folder(&path));
+            }
+        }
+        RowAction::Tracks => {
+            app.show_job(id);
+            if let Some(url) = app.queue.get_item(id).and_then(|item| item.urls.first().cloned()) {
+                app.list_tracks(Some(id), url);
             }
         }
     }
