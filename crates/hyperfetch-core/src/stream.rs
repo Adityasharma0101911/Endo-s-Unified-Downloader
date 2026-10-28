@@ -518,7 +518,8 @@ impl Cuts<'_> {
         for (n, segment) in segments.into_iter().enumerate() {
             let (from, to) = (at, at + segment.duration_secs);
             at = to;
-            let kept = (self.sections.is_empty() || self.sections.iter().any(|&(start, end)| from < end && to > start))
+            // A segment of no length (one file of subtitles for the whole stream) plays in every section.
+            let kept = (self.sections.is_empty() || from == to || self.sections.iter().any(|&(start, end)| from < end && to > start))
                 && !parts.get(n).is_some_and(|part| self.parts.contains(part))
                 && !self.ads.iter().any(|pattern| pattern_matches(pattern, segment.url.as_str()));
             if !kept {
@@ -866,6 +867,8 @@ pub(crate) struct LiveSources {
     keys: std::collections::HashMap<Url, [u8; 16]>,
     /// Seconds the DASH server's clock is ahead of ours (see `dash::clock_offset`), once known.
     offset: Option<f64>,
+    /// Each DASH track's representation, once found by its id (see `dash::Mpd::follow`).
+    reps: Vec<Option<crate::dash::Rep>>,
     /// Segments whose links one of these matches are left out (see `DownloadOptions::ad_patterns`).
     pub ads: Vec<String>,
 }
@@ -878,12 +881,13 @@ enum Read {
 
 impl LiveSources {
     pub fn new(tracks: Vec<(Origin, Kind)>) -> Self {
-        Self { tracks, keys: Default::default(), offset: None, ads: Vec::new() }
+        Self { reps: vec![None; tracks.len()], tracks, keys: Default::default(), offset: None, ads: Vec::new() }
     }
 
     /// What each track's manifest lists at `now` (seconds since 1970 by this computer's clock),
     /// after the segment numbered `after[track]` when given; each manifest read once. A live HLS
-    /// playlist may not be a master playlist; a DASH track is found by its id.
+    /// playlist may not be a master playlist; a DASH track is found by its id the first time, then
+    /// by its representation, as ids change when periods come and go.
     pub async fn listings(&mut self, client: &Client, auth: Option<&Auth>, fetch: FetchPolicy, now: f64, after: &[Option<u64>]) -> Result<Vec<Listing>, HlsError> {
         let mut read: Vec<(Url, Read)> = Vec::new();
         let mut listings = Vec::new();
@@ -916,9 +920,13 @@ impl LiveSources {
             let mut listing = match &read[at].1 {
                 Read::Playlist(text, base) => crate::hls::live_playlist(client, auth, text, base, fetch, &mut self.keys, *kind, now, after).await?,
                 Read::Mpd(mpd) => {
-                    let track = mpd.tracks.iter().find(|(track, _)| origin.track.as_ref() == Some(&track.id));
-                    let (_, rendition) = track.ok_or_else(|| HlsError::Unavailable(format!("{} no longer lists the track", origin.manifest)))?;
-                    crate::dash::live_listing(mpd, rendition, now + self.offset.unwrap_or(0.0), after)?
+                    let rendition = match &self.reps[t] {
+                        Some(rep) => mpd.follow(rep),
+                        None => mpd.tracks.iter().find(|(track, _)| origin.track.as_ref() == Some(&track.id)).map(|(_, rendition)| rendition.clone()),
+                    };
+                    let rendition = rendition.ok_or_else(|| HlsError::Unavailable(format!("{} no longer lists the track", origin.manifest)))?;
+                    self.reps[t].get_or_insert_with(|| rendition.rep.clone());
+                    crate::dash::live_listing(mpd, &rendition, now + self.offset.unwrap_or(0.0), after)?
                 }
             };
             if !self.ads.is_empty() {
@@ -1004,10 +1012,12 @@ fn clock_time(text: &str) -> Option<f64> {
     let mut hms = clock.splitn(3, ':');
     let (hour, minute) = (number(hms.next()?)?, number(hms.next()?)?);
     let second = hms.next().map_or(Some(0.0), |s| s.parse::<f64>().ok().filter(|s| s.is_finite() && *s >= 0.0 && *s < 61.0))?;
-    let valid = (1..=12).contains(&month) && (1..=31).contains(&mday) && hour < 24 && minute < 60;
-    let local = (crate::engine::days_from_civil(year, month, mday) * 86_400 + hour * 3600 + minute * 60) as f64 + second;
+    let days = crate::engine::days_from_civil(year, month, mday);
+    // A day the month has: 2026-02-31 would be March 3.
+    let valid = crate::engine::civil_from_days(days) == (year, month, mday) && hour < 24 && minute < 60;
+    let local = (days * 86_400 + hour * 3600 + minute * 60) as f64 + second;
     let offset = match zone {
-        "" => local_offset(local as i64) as f64,
+        "" => offset_at_local(local as i64, local_offset) as f64,
         "Z" | "z" => 0.0,
         _ => {
             let digits: String = zone[1..].chars().filter(|c| *c != ':').collect();
@@ -1017,6 +1027,13 @@ fn clock_time(text: &str) -> Option<f64> {
         }
     };
     valid.then_some(local - offset)
+}
+
+/// Seconds a time zone `offset(instant)` seconds ahead of UTC is ahead at the wall-clock time
+/// `local` (seconds since 1970, read as UTC): looked up at about that instant, then at it, so a
+/// date across a clock change takes the offset it has.
+fn offset_at_local(local: i64, offset: impl Fn(i64) -> i64) -> i64 {
+    offset(local.saturating_sub(offset(local)))
 }
 
 /// Seconds since 1970, now.
@@ -1029,13 +1046,22 @@ pub(crate) fn now() -> f64 {
 fn local_offset(epoch: i64) -> i64 {
     #[cfg(windows)]
     {
-        use windows_sys::Win32::Foundation::FILETIME;
+        use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};
+        use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToFileTime, SystemTimeToTzSpecificLocalTime};
         // FILETIMEs count 100 ns from 1601.
         let ticks = (epoch.saturating_add(11_644_473_600)).max(0) as u64 * 10_000_000;
         let utc = FILETIME { dwLowDateTime: ticks as u32, dwHighDateTime: (ticks >> 32) as u32 };
         let mut local = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
-        // SAFETY: both point at valid FILETIMEs for the length of the call.
-        if unsafe { windows_sys::Win32::Storage::FileSystem::FileTimeToLocalFileTime(&utc, &mut local) } == 0 {
+        // SAFETY: SYSTEMTIME is plain data, which all zeros is a valid value of.
+        let (mut utc_day, mut local_day): (SYSTEMTIME, SYSTEMTIME) = unsafe { std::mem::zeroed() };
+        // By the zone's rule for that date (FileTimeToLocalFileTime takes today's); null is this
+        // computer's zone. SAFETY: each points at a valid value for the length of its call.
+        let converted = unsafe {
+            FileTimeToSystemTime(&utc, &mut utc_day) != 0
+                && SystemTimeToTzSpecificLocalTime(std::ptr::null(), &utc_day, &mut local_day) != 0
+                && SystemTimeToFileTime(&local_day, &mut local) != 0
+        };
+        if !converted {
             return 0;
         }
         let local = (u64::from(local.dwHighDateTime) << 32 | u64::from(local.dwLowDateTime)) as i64;
@@ -1065,7 +1091,9 @@ fn local_offset(epoch: i64) -> i64 {
 
 /// `epoch` (seconds since 1970) as this computer's clock shows it: `2026-10-10 21:00:05`.
 pub fn clock_text(epoch: f64) -> String {
-    let local = epoch.floor() as i64 + local_offset(epoch.floor() as i64);
+    // A server's date may be any number: about 3000 years either way keeps the sums in range.
+    let epoch = epoch.clamp(-1e11, 1e11).floor() as i64;
+    let local = epoch + local_offset(epoch);
     let (year, month, day) = crate::engine::civil_from_days(local.div_euclid(86_400));
     let time = local.rem_euclid(86_400);
     format!("{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02}", time / 3600, time / 60 % 60, time % 60)
@@ -1211,10 +1239,59 @@ mod tests {
         assert_eq!(LiveStart::parse("2026-10-10T21:00-0130"), Ok(LiveStart::At(day + 22.5 * 3600.0)));
         let Ok(LiveStart::At(local)) = LiveStart::parse("2026-10-10 21:00") else { panic!("a clock time") };
         assert_eq!(clock_text(local), "2026-10-10 21:00:00");
-        for bad in ["", "soon", "30x", "1m30h", "-5m", "1:75", "2026-13-10T21:00", "2026-10-10T25:00", "2026-10-10", "2026-10-10T21"] {
+        for bad in ["", "soon", "30x", "1m30h", "-5m", "1:75", "2026-13-10T21:00", "2026-10-10T25:00", "2026-10-10", "2026-10-10T21", "2026-02-29 10:00", "2026-04-31T10:00Z"] {
             let err = LiveStart::parse(bad).unwrap_err();
             assert!(err.contains("a time ago (30m"), "{bad}: {err}");
         }
+        assert!(LiveStart::parse("2028-02-29 10:00").is_ok(), "a leap day");
+        for far in [1e300, -1e300, f64::NAN] {
+            assert!(clock_text(far).contains(':'), "{far}");
+        }
+    }
+
+    /// A clock time takes the offset its own date has, looked up at the instant it names: New
+    /// York's clocks go back at 2026-11-01 06:00 UTC, Berlin's at 2026-10-25 01:00 UTC.
+    #[test]
+    fn test_a_clock_time_takes_the_offset_of_its_date() {
+        let utc = |year, month, day, hour: i64, minute: i64| crate::engine::days_from_civil(year, month, day) * 86_400 + hour * 3600 + minute * 60;
+        let zone = |change: i64, before: i64, after: i64| move |instant: i64| if instant < change { before } else { after };
+        let new_york = zone(utc(2026, 11, 1, 6, 0), -4 * 3600, -5 * 3600);
+        let berlin = zone(utc(2026, 10, 25, 1, 0), 2 * 3600, 3600);
+        // 04:00 EST, after New York's change, is 04:00 UTC before it; 01:30 CEST, before Berlin's,
+        // is 01:30 UTC after it.
+        let offsets = [offset_at_local(utc(2026, 11, 1, 4, 0), new_york), offset_at_local(utc(2026, 11, 2, 21, 0), new_york), offset_at_local(utc(2026, 10, 25, 1, 30), berlin)];
+        assert_eq!(offsets, [-5 * 3600, -5 * 3600, 2 * 3600]);
+    }
+
+    /// A live DASH track is followed by its representation: once the period whose
+    /// representations gave the tracks their ids has scrolled out, the ids name others, and the
+    /// track goes on with its own.
+    #[tokio::test]
+    async fn test_a_live_dash_track_outlives_the_period_its_id_came_from() {
+        use crate::hls::tests::{ok, serve};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let content = |id: &str, timing: &str| {
+            let reps: String = (1..=4).map(|n| format!(r#"<Representation id="{n}" bandwidth="{n}000000"/>"#)).collect();
+            format!(r#"<Period id="{id}" {timing}><AdaptationSet contentType="video" codecs="avc1.64001f"><SegmentTemplate media="{id}/$RepresentationID$/$Number$.m4s" duration="2"/>{reps}</AdaptationSet></Period>"#)
+        };
+        let ad = r#"<Period id="ad" start="PT20S" duration="PT4S"><AdaptationSet contentType="video" codecs="avc1.64001f"><SegmentTemplate media="ad/$RepresentationID$/$Number$.m4s" duration="2"/>
+            <Representation id="x" bandwidth="1500000"/><Representation id="y" bandwidth="3000000"/></AdaptationSet></Period>"#;
+        let mpd = |periods: String| format!(r#"<MPD type="dynamic" availabilityStartTime="1970-01-01T00:00:00Z" minimumUpdatePeriod="PT2S">{periods}</MPD>"#);
+        let first = mpd(format!("{}{ad}{}", content("c1", r#"start="PT0S" duration="PT20S""#), content("c2", r#"start="PT24S""#)));
+        let later = mpd(format!("{ad}{}", content("c2", r#"start="PT24S""#)));
+        let reads = std::sync::Arc::new(AtomicUsize::new(0));
+        let (addr, _) = serve(move |_: &str, _| ok(if reads.fetch_add(1, Ordering::SeqCst) == 0 { first.clone() } else { later.clone() })).await;
+        // v3 is the fourth representation of the longest period, the first.
+        let origin = Origin { manifest: Url::parse(&format!("http://{addr}/live.mpd")).unwrap(), track: Some("v3".to_string()) };
+        let mut sources = LiveSources::new(vec![(origin, Kind::Video)]);
+        let fetch = FetchPolicy { stall_timeout: std::time::Duration::from_secs(5), max_retries: 0, host_limit: 0 };
+        let links = |listing: &Listing| listing.segments.iter().map(|s| s.url.path().to_string()).collect::<Vec<_>>();
+        let listed = sources.listings(&Client::new(), None, fetch, 31.0, &[None]).await.unwrap();
+        let expected: Vec<String> = (1..=10).map(|n| format!("/c1/4/{n}.m4s")).chain(["/ad/y/1.m4s", "/ad/y/2.m4s", "/c2/4/1.m4s", "/c2/4/2.m4s"].map(String::from)).collect();
+        assert_eq!(links(&listed[0]), expected);
+        let after = listed[0].segments.last().map(|s| s.sequence);
+        let listed = sources.listings(&Client::new(), None, fetch, 33.0, &[after]).await.unwrap();
+        assert_eq!(links(&listed[0]), ["/c2/4/3.m4s"]);
     }
 
     /// A part much shorter than its neighbours and unlike them looks like an ad; one alike, or
@@ -1283,6 +1360,8 @@ mod tests {
         let ads = ["/AD.".to_string()];
         assert_eq!(kept(Cuts { ads: &ads, sections: &[(0.0, 5.0), (40.0, 41.0)], ..Default::default() }), [(0, 0, false), (4, 1, true)]);
         assert!(kept(Cuts { sections: &[(50.0, 60.0)], ..Default::default() }).is_empty());
+        let whole = Cuts { sections: &[(12.0, 26.0)], ..Default::default() }.apply(vec![segment(0, 0.0, false)], &[0]);
+        assert_eq!(whole.len(), 1, "one file of subtitles for the whole stream plays in every section");
     }
 
     /// Subtitles go by the subtitle languages: all of them when none are given, none for `none`;

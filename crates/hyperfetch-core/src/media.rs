@@ -4901,9 +4901,10 @@ fn join_args(files: &[(PathBuf, Vec<&crate::stream::Track>)], subtitles: &[(Path
         for (n, (language, title)) in tracks.iter().enumerate() {
             args.extend([format!("-metadata:s:{kind}:{n}").into(), format!("language={}", mp4_language(language)).into()]);
             if let Some(title) = title {
-                // ffmpeg cannot take a NUL on its command line. An MP4 keeps no title of a track:
-                // players show its handler's name.
-                let title = title.replace('\0', "");
+                // ffmpeg cannot take a NUL on its command line, which has a length limit: a
+                // manifest's title may be anything. An MP4 keeps no title of a track: players show
+                // its handler's name.
+                let title: String = title.chars().filter(|c| !c.is_control()).take(200).collect();
                 let keys: &[&str] = if format == "mp4" { &["title", "handler_name"] } else { &["title"] };
                 for key in keys {
                     args.extend([format!("-metadata:s:{kind}:{n}").into(), format!("{key}={title}").into()]);
@@ -5530,6 +5531,11 @@ pub(crate) mod tests {
         let tags = "-metadata:s:a:0 language=por -metadata:s:a:0 title=Main -metadata:s:a:0 handler_name=Main -metadata:s:a:1 language=deu";
         assert!(args.contains(&format!("{tags} -metadata:s:s:0 language=eng")), "{args}");
         assert!(args.ends_with("-disposition:a:0 default -disposition:a:1 0 -tag:v hvc1 -movflags +faststart -f mp4 file:out.tmp"), "{args}");
+        // A manifest's title of any length and with any characters becomes a short line.
+        let long = Track { kind: Kind::Audio, name: Some(format!("Line\r\n{}", "x".repeat(300))), ..Default::default() };
+        let args = join_args(&[(PathBuf::from("a.m4a"), vec![&long])], &[], "mkv", Path::new("out.tmp"));
+        let title = args.iter().map(|a| a.to_string_lossy().into_owned()).find(|a| a.starts_with("title="));
+        assert_eq!(title, Some(format!("title=Line{}", "x".repeat(196))));
         let vorbis = Track { kind: Kind::Audio, codecs: "vorbis".into(), ..Default::default() };
         assert_eq!(join_format(None, &[&video, &dub]), ("mp4", None));
         assert_eq!(join_format(Some("MKV"), &[&video]), ("mkv", None));
