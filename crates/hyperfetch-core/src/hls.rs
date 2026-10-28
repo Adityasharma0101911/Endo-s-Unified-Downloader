@@ -69,8 +69,10 @@ const RETRY_MAX_DELAY: Duration = Duration::from_secs(8);
 /// Most times one download fetches its playlist again for segment links that expired (see
 /// [`Refresh`]).
 const MAX_REFRESHES: u32 = 3;
-/// Most subtitle renditions of a master playlist that are downloaded.
-const MAX_SUBTITLES: usize = 32;
+/// Most subtitles tracks of a stream that are downloaded.
+pub(crate) const MAX_SUBTITLES: usize = 32;
+/// Most bytes of subtitles one track may have, all its segments together.
+const MAX_SUBTITLE_BYTES: u64 = if cfg!(test) { 1024 * 1024 } else { 64 * 1024 * 1024 };
 /// Subtitle segments fetched at once.
 const SUBTITLE_CONCURRENCY: usize = 8;
 /// MPEG-TS stream types of video: MPEG-1/2, MPEG-4 Part 2, H.264, MVC, HEVC, VVC, Dirac, VC-1.
@@ -192,15 +194,6 @@ pub struct HlsSegment {
     /// Its timestamps need not follow on from the segment before (`#EXT-X-DISCONTINUITY`, or
     /// segments left out before it).
     pub discontinuity: bool,
-}
-
-/// A WebVTT subtitle rendition of a master playlist (`#EXT-X-MEDIA:TYPE=SUBTITLES`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Subtitle {
-    /// Its media playlist, which lists its `.vtt` segments.
-    pub url: Url,
-    /// Its `LANGUAGE` (a BCP 47 tag such as "en" or "pt-BR"), else "und".
-    pub language: String,
 }
 
 /// File extension matching the container the segments form: fMP4 streams need an
@@ -365,25 +358,6 @@ pub(crate) fn master_tracks(master: &str, base: &Url) -> Vec<(Track, Option<Url>
     }
     tracks.truncate(MAX_TRACKS);
     tracks
-}
-
-/// The subtitle renditions a master playlist lists, each language and name once, at most
-/// [`MAX_SUBTITLES`] of them.
-pub(crate) fn subtitle_renditions(master: &str, base: &Url) -> Vec<Subtitle> {
-    let mut seen = HashSet::new();
-    master
-        .lines()
-        .filter_map(|line| line.trim().strip_prefix("#EXT-X-MEDIA:"))
-        .map(parse_attributes)
-        .filter(|attrs| attrs.get("TYPE") == Some(&"SUBTITLES"))
-        .filter_map(|attrs| {
-            let url = base.join(attrs.get("URI")?).ok()?;
-            let language = attrs.get("LANGUAGE").filter(|l| !l.is_empty()).unwrap_or(&"und").to_string();
-            let name = attrs.get("NAME").copied().unwrap_or_default();
-            seen.insert((language.clone(), name)).then_some(Subtitle { url, language })
-        })
-        .take(MAX_SUBTITLES)
-        .collect()
 }
 
 /// Whether `body` starts like an HLS playlist: `#EXTM3U` after an optional BOM and whitespace.
@@ -2221,14 +2195,14 @@ fn start_from(lead: &crate::stream::Listing, start: LiveStart) -> Result<Option<
 }
 
 /// A live recording's progress: `bytes` recorded since `started`, with no size to reach.
-fn recording_snapshot(bytes: u64, started: Instant) -> EngineSnapshot {
+pub(crate) fn recording_snapshot(bytes: u64, started: Instant) -> EngineSnapshot {
     let speed_bytes_per_sec = bytes as f64 / started.elapsed().as_secs_f64().max(0.001);
     EngineSnapshot { downloaded_bytes: bytes, speed_bytes_per_sec, active_workers: 1, ..Default::default() }
 }
 
 /// The bytes left on the disk of the live recording `files`, when less than what it recorded and
 /// `margin` are.
-async fn disk_full(files: &[PathBuf], margin: u64) -> Option<u64> {
+pub(crate) async fn disk_full(files: &[PathBuf], margin: u64) -> Option<u64> {
     let files = files.to_vec();
     let room = tokio::task::spawn_blocking(move || crate::media::room_left(&files)).await.ok().flatten();
     room.filter(|&(free, recorded)| free < recorded.saturating_add(margin)).map(|(free, _)| free)
@@ -2361,108 +2335,114 @@ pub(crate) fn scan_ts(data: &[u8]) -> TsHead {
     head
 }
 
-/// [`scan_ts`] of the first MiB of the file at `path`; nothing is known of one that cannot be read.
-pub(crate) async fn read_ts_head(path: &Path) -> TsHead {
+/// The first MiB of the file at `path`; nothing of one that cannot be read.
+async fn head_of(path: &Path) -> Vec<u8> {
     let mut head = Vec::new();
     if let Ok(file) = tokio::fs::File::open(path).await {
         let _ = file.take(1 << 20).read_to_end(&mut head).await;
     }
-    scan_ts(&head)
+    head
 }
 
-/// Saves `subtitles` (playlists of WebVTT segments, or WebVTT files) beside `media`, the file their
-/// stream was saved as, each as `<stem>.<language>.vtt` (numbered if taken): its cues joined
-/// under one header and timed as `media` plays (see [`join_vtt`]). One that cannot be fetched or
-/// saved, or has no cues, is left out with a warning: subtitles never fail a download. Returns the
-/// files saved, with their languages.
-pub async fn save_subtitles(
+/// [`scan_ts`] of the first MiB of the file at `path`; nothing is known of one that cannot be read.
+pub(crate) async fn read_ts_head(path: &Path) -> TsHead {
+    scan_ts(&head_of(path).await)
+}
+
+/// Where the media file at `path` starts on its stream's clock, in seconds: an MPEG-TS's first
+/// presentation time, a fragmented MP4's first fragment's decode time; None when it tells neither.
+pub(crate) async fn media_start(path: &Path) -> Option<f64> {
+    let head = head_of(path).await;
+    let pts = scan_ts(&head).first_pts.map(|pts| pts as f64 / 90_000.0);
+    pts.or_else(|| crate::subs::mp4_start(&head).map(|ms| ms as f64 / 1000.0))
+}
+
+/// The cues of a subtitles track whose segments are `segments`, joined (see `subs::join`): WebVTT
+/// or TTML files, or a fragmented MP4 (`stpp` or `wvtt`) after its init section, which a file cut
+/// into byte ranges also has and is then read whole. Cues on the stream's clock (WebVTT an
+/// `X-TIMESTAMP-MAP` puts there, MP4 samples) are moved back by `start`, where the media plays
+/// from on that clock (seconds, see [`media_start`]); when that is unknown, by where the first of
+/// them starts, as the stream is taken to. Other cues (TTML, WebVTT without a map) count from the
+/// stream's start already.
+pub(crate) async fn subtitle_cues(
     client: &Client,
     auth: Option<&Auth>,
-    subtitles: &[Subtitle],
-    media: &Path,
+    segments: &[HlsSegment],
     fetch: FetchPolicy,
-) -> Vec<(PathBuf, String)> {
-    if subtitles.is_empty() {
-        return Vec::new();
-    }
-    let start = read_ts_head(media).await.first_pts.map(|pts| pts as f64 / 90_000.0);
-    let mut saved = Vec::new();
-    for subtitle in subtitles {
-        let vtt = match fetch_vtt(client, auth, &subtitle.url, fetch).await {
-            Ok(segments) => join_vtt(&segments, start),
-            Err(e) => {
-                tracing::warn!("Subtitles '{}' ({}) could not be downloaded: {}", subtitle.language, subtitle.url, e);
-                continue;
-            }
-        };
-        if !vtt.contains("-->") {
-            tracing::warn!("Subtitles '{}' ({}) have no cues", subtitle.language, subtitle.url);
-            continue;
-        }
-        let language: String = subtitle.language.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').take(35).collect();
-        let mut name = media.file_stem().unwrap_or_default().to_os_string();
-        name.push(format!(".{}.vtt", if language.is_empty() { "und" } else { &language }));
-        let path = crate::engine::free_path(&media.with_file_name(name));
-        match tokio::fs::write(&path, vtt).await {
-            Ok(()) => saved.push((path, subtitle.language.clone())),
-            Err(e) => tracing::warn!("Failed to save subtitles {}: {}", path.display(), e),
-        }
-    }
-    saved
-}
-
-/// The WebVTT segments the playlist at `url` lists, in order, or the WebVTT file it is.
-async fn fetch_vtt(client: &Client, auth: Option<&Auth>, url: &Url, fetch: FetchPolicy) -> Result<Vec<String>, String> {
+    start: Option<f64>,
+) -> Result<Vec<crate::subs::Cue>, String> {
+    use crate::subs;
     use futures_util::TryStreamExt;
-    let (body, final_url) =
-        fetch_with_retry(client, auth, url, None, MAX_PLAYLIST_BYTES, None, fetch).await.map_err(|e| e.reason)?;
-    if !is_playlist_start(&body) {
-        return Ok(vec![String::from_utf8_lossy(&body).into_owned()]);
-    }
-    let text = String::from_utf8_lossy(&body);
-    let urls = text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).take(MAX_SEGMENTS);
-    let urls: Vec<Url> = urls.map(|uri| final_url.join(uri).map_err(|e| format!("invalid URL '{}': {}", uri, e))).collect::<Result<_, _>>()?;
-    futures_util::stream::iter(urls)
-        .map(|url| async move {
-            let (body, _) = fetch_with_retry(client, auth, &url, None, MAX_PLAYLIST_BYTES, None, fetch)
-                .await
-                .map_err(|e| format!("{}: {}", url, e.reason))?;
-            Ok::<_, String>(String::from_utf8_lossy(&body).into_owned())
+    let total = &AtomicU64::new(0);
+    // Owned, as a future that borrows from the iterator it came from would not be `Send`.
+    let fetched: Vec<Vec<u8>> = futures_util::stream::iter(segments.to_vec())
+        .map(|segment| {
+            async move {
+                let limit = segment.byte_range.map_or(MAX_PLAYLIST_BYTES, |r| r.len().min(MAX_PLAYLIST_BYTES));
+                let (data, _) = fetch_with_retry(client, auth, &segment.url, segment.byte_range, limit, None, fetch)
+                    .await
+                    .map_err(|e| format!("{}: {}", segment.url, e.reason))?;
+                if total.fetch_add(data.len() as u64, Ordering::Relaxed) + data.len() as u64 > MAX_SUBTITLE_BYTES {
+                    return Err(format!("more than {} MiB of subtitles", MAX_SUBTITLE_BYTES >> 20));
+                }
+                decrypt(data, &segment.encryption).await
+            }
         })
         .buffered(SUBTITLE_CONCURRENCY)
         .try_collect()
-        .await
-}
-
-/// WebVTT `segments` joined into one file: one header, then the cues of each, moved onto the
-/// media's clock by the segment's `X-TIMESTAMP-MAP` (a cue at LOCAL plays at MPEGTS), less
-/// `start`, where the media's clock starts (seconds); when that is unknown, less the first
-/// segment's mapping, which leaves its cues as they are. Other blocks (notes, styles) are left
-/// out, and so is a cue repeated from a segment before.
-fn join_vtt(segments: &[String], start: Option<f64>) -> String {
-    let mut out = String::from("WEBVTT\n");
-    let mut seen = HashSet::new();
-    let mut start = start;
-    for segment in segments {
-        let segment = segment.replace("\r\n", "\n");
-        let mut blocks = segment.split("\n\n");
-        let header = blocks.next().unwrap_or_default();
-        let mapped = header.lines().find_map(|l| l.trim().strip_prefix("X-TIMESTAMP-MAP=")).and_then(timestamp_map);
-        let base = *start.get_or_insert(mapped.unwrap_or(0.0));
-        let shift = mapped.map_or(0.0, |at| at - base);
-        for block in blocks.map(str::trim).filter(|b| !b.is_empty()) {
-            // An optional identifier, the timing line, then the text.
-            let mut lines = block.lines();
-            let Some(timing) = lines.by_ref().find(|l| l.contains("-->")).and_then(|t| retime(t, |at| at + shift)) else { continue };
-            let cue = std::iter::once(timing.as_str()).chain(lines).collect::<Vec<_>>().join("\n");
-            if seen.insert(cue.clone()) {
-                out.push('\n');
-                out.push_str(&cue);
-                out.push('\n');
-            }
+        .await?;
+    let documents = match segments.first().and_then(|s| s.init.as_deref()) {
+        Some(init) => vec![[fetch_init(client, auth, init, fetch).await?, fetched.concat()].concat()],
+        None => fetched,
+    };
+    let ms = |secs: f64| (secs * 1000.0).round() as i64;
+    let mut start = start.map(ms);
+    let (mut cues, mut images) = (Vec::new(), 0);
+    for data in documents {
+        if data.get(4..8).is_some_and(|kind| [b"ftyp", b"styp", b"moov", b"moof"].iter().any(|k| k[..] == *kind)) {
+            let (read, pictures) = subs::parse_mp4(&data)?;
+            images += pictures;
+            let from = *start.get_or_insert_with(|| subs::mp4_start(&data).map_or(0, |ms| ms as i64));
+            cues.extend(subs::shift(read, -from));
+            continue;
+        }
+        let text = String::from_utf8_lossy(&data);
+        let text = text.trim_start_matches('\u{feff}').trim_start();
+        if text.starts_with("WEBVTT") {
+            let header = text.lines().take_while(|line| !line.trim().is_empty());
+            let mapped = header.filter_map(|line| line.trim().strip_prefix("X-TIMESTAMP-MAP=")).find_map(timestamp_map);
+            let read = subs::parse_vtt(text);
+            cues.extend(match mapped {
+                Some(at) => subs::shift(read, -*start.get_or_insert(ms(at))),
+                None => read,
+            });
+        } else if text.starts_with('<') {
+            let (read, pictures) = subs::parse_ttml(text)?;
+            images += pictures;
+            cues.extend(read);
         }
     }
-    out
+    if images > 0 {
+        tracing::warn!("Left out {images} subtitle image(s): only text subtitles are kept");
+    }
+    Ok(subs::join(cues))
+}
+
+/// Writes `cues` beside `media` as `<its stem>.<language>.<ext>` (numbered if taken), SRT or
+/// WebVTT as `ext` (`srt` or `vtt`) says; None, with a warning, when it cannot.
+pub(crate) async fn write_cues(media: &Path, cues: &[crate::subs::Cue], language: &str, ext: &str) -> Option<PathBuf> {
+    let language: String = language.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').take(35).collect();
+    let mut name = media.file_stem().unwrap_or_default().to_os_string();
+    name.push(format!(".{}.{ext}", if language.is_empty() { "und" } else { &language }));
+    let path = crate::engine::free_path(&media.with_file_name(name));
+    let text = if ext == "srt" { crate::subs::to_srt(cues) } else { crate::subs::to_vtt(cues) };
+    match tokio::fs::write(&path, text).await {
+        Ok(()) => Some(path),
+        Err(e) => {
+            tracing::warn!("Failed to save subtitles {}: {}", path.display(), e);
+            None
+        }
+    }
 }
 
 /// Where cue time 0 plays on the media's clock, in seconds, by an `X-TIMESTAMP-MAP`
@@ -2486,7 +2466,7 @@ fn vtt_time(time: &str) -> Option<f64> {
     Some(seconds + millis.parse::<f64>().ok()? / 1000.0)
 }
 
-/// `vtt`, a WebVTT file as [`join_vtt`] writes one, with each cue's times moved by `to` (seconds).
+/// `vtt`, a WebVTT file as `subs::to_vtt` writes one, with each cue's times moved by `to` (seconds).
 pub(crate) fn retime_vtt(vtt: &str, to: impl Fn(f64) -> f64) -> String {
     let lines = vtt.lines().map(|line| if line.contains("-->") { retime(line, &to).unwrap_or_else(|| line.to_string()) } else { line.to_string() });
     lines.map(|line| line + "\n").collect()
@@ -2856,22 +2836,73 @@ pub(crate) mod tests {
         assert!(!TsHead::default().audio_only(), "a stream nothing is known of may well be video");
     }
 
-    /// Subtitle segments join into one WebVTT file timed by their `X-TIMESTAMP-MAP`s against
-    /// where the media's clock starts, a cue repeated across segments only once.
-    #[test]
-    fn test_subtitle_segments_join_on_the_medias_clock() {
-        let segments = [
-            "WEBVTT\r\nX-TIMESTAMP-MAP=MPEGTS:990000,LOCAL:00:00:00.000\r\n\r\n1\r\n00:00:00.500 --> 00:00:00.900\r\nhello\r\n".to_string(),
-            "WEBVTT\nX-TIMESTAMP-MAP=LOCAL:00:00:10.000,MPEGTS:990000\n\nNOTE a note\n\n00:00:10.500 --> 00:00:10.900\nhello\n\n\
-             2\n00:00:11.000 --> 00:00:11.500 align:start line:0\nworld\nagain\n"
-                .to_string(),
-        ];
+    /// Subtitle segments join into one track timed by their `X-TIMESTAMP-MAP`s against where the
+    /// media's clock starts, a cue repeated across segments only once; WebVTT without a map and
+    /// TTML count from the stream's start already.
+    #[tokio::test]
+    async fn test_subtitle_segments_join_on_the_medias_clock() {
+        let (addr, _) = serve(|path: &str, _| match path {
+            "/0.vtt" => ok("WEBVTT\r\nX-TIMESTAMP-MAP=MPEGTS:990000,LOCAL:00:00:00.000\r\n\r\n1\r\n00:00:00.500 --> 00:00:00.900\r\nhello\r\n"),
+            "/1.vtt" => ok("WEBVTT\nX-TIMESTAMP-MAP=LOCAL:00:00:10.000,MPEGTS:990000\n\nNOTE a note\n\n00:00:10.500 --> 00:00:10.900\nhello\n\n\
+                2\n00:00:11.000 --> 00:00:11.500 align:start line:0\nworld\nagain\n"),
+            "/plain.vtt" => ok("WEBVTT\n\n01:02.000 --> 01:03.000\nno map\n"),
+            "/doc.ttml" => ok(r#"<tt xmlns="http://www.w3.org/ns/ttml"><body><div><p begin="1s" end="2s">text</p></div></body></tt>"#),
+            _ => (404, String::new(), Vec::new()),
+        })
+        .await;
+        let segment = |path: &str| HlsSegment {
+            index: 0,
+            sequence: 0,
+            url: Url::parse(&format!("http://{addr}{path}")).unwrap(),
+            duration_secs: 6.0,
+            byte_range: None,
+            encryption: None,
+            init: None,
+            discontinuity: false,
+        };
+        let client = Client::new();
+        let vtt = |paths: &[&str], start: Option<f64>| {
+            let segments: Vec<HlsSegment> = paths.iter().map(|p| segment(p)).collect();
+            let client = &client;
+            async move { crate::subs::to_vtt(&subtitle_cues(client, None, &segments, FETCH, start).await.unwrap()) }
+        };
         // The media starts at 10 s: the first map plays cue time 0 at 11 s.
-        let expected = "WEBVTT\n\n00:00:01.500 --> 00:00:01.900\nhello\n\n00:00:02.000 --> 00:00:02.500 align:start line:0\nworld\nagain\n";
-        assert_eq!(join_vtt(&segments, Some(10.0)), expected);
+        let expected = "WEBVTT\n\n00:00:01.500 --> 00:00:01.900\nhello\n\n00:00:02.000 --> 00:00:02.500\nworld\nagain\n";
+        assert_eq!(vtt(&["/0.vtt", "/1.vtt"], Some(10.0)).await, expected);
         // Not knowing where it starts, the first segment's cues stay as they are.
-        assert!(join_vtt(&segments, None).starts_with("WEBVTT\n\n00:00:00.500 --> 00:00:00.900\nhello\n\n00:00:01.000 -->"));
-        assert_eq!(join_vtt(&["WEBVTT\n\n01:02.000 --> 01:03.000\nno map\n".to_string()], Some(5.0)), "WEBVTT\n\n00:01:02.000 --> 00:01:03.000\nno map\n");
+        assert!(vtt(&["/0.vtt", "/1.vtt"], None).await.starts_with("WEBVTT\n\n00:00:00.500 --> 00:00:00.900\nhello\n\n00:00:01.000 -->"));
+        assert_eq!(vtt(&["/plain.vtt"], Some(5.0)).await, "WEBVTT\n\n00:01:02.000 --> 00:01:03.000\nno map\n");
+        assert_eq!(vtt(&["/doc.ttml"], Some(5.0)).await, "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\ntext\n");
+        let missing = vec![segment("/gone.vtt")];
+        assert!(subtitle_cues(&client, None, &missing, FETCH, None).await.unwrap_err().contains("gone.vtt"));
+    }
+
+    /// Subtitles in fragmented MP4 (wvtt here) read with their init section, timed against where
+    /// the media starts; not knowing that (nor where the init's first track starts), as they are.
+    #[tokio::test]
+    async fn test_mp4_subtitle_segments_join_on_the_medias_clock() {
+        use crate::subs::tests::{fragment, init, vttc, Durations};
+        let (addr, _) = serve(|path: &str, _| match path {
+            "/init.mp4" => ok(init(b"wvtt", 1000)),
+            "/0.m4s" => ok(fragment(Some(100_000), &[(1000, vttc("zero")), (2000, vttc("one"))], Durations::Trun, true)),
+            "/1.m4s" => ok(fragment(Some(103_000), &[(1000, vttc("two"))], Durations::Trun, true)),
+            _ => (404, String::new(), Vec::new()),
+        })
+        .await;
+        let url = |path: &str| Url::parse(&format!("http://{addr}{path}")).unwrap();
+        let init = Some(Arc::new(InitSection { url: url("/init.mp4"), byte_range: None, encryption: None }));
+        let segments: Vec<HlsSegment> = ["/0.m4s", "/1.m4s"]
+            .iter()
+            .enumerate()
+            .map(|(n, path)| HlsSegment { index: n, sequence: n as u64, url: url(path), duration_secs: 3.0, byte_range: None, encryption: None, init: init.clone(), discontinuity: false })
+            .collect();
+        let client = Client::new();
+        let read = |cues: Vec<crate::subs::Cue>| cues.into_iter().map(|c| (c.start, c.end, c.text)).collect::<Vec<_>>();
+        let cue = |start: u64, end: u64, text: &str| (start, end, text.to_string());
+        let on_the_media = read(subtitle_cues(&client, None, &segments, FETCH, Some(101.0)).await.unwrap());
+        assert_eq!(on_the_media, [cue(0, 2000, "one"), cue(2000, 3000, "two")]);
+        let as_they_are = read(subtitle_cues(&client, None, &segments, FETCH, None).await.unwrap());
+        assert_eq!(as_they_are, [cue(100_000, 101_000, "zero"), cue(101_000, 103_000, "one"), cue(103_000, 104_000, "two")]);
     }
 
     /// The playlists of the tracks the default specs choose of `master` ("inside" for audio inside

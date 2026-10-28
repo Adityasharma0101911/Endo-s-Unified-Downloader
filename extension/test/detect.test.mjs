@@ -203,6 +203,20 @@ test("DASH manifests are found by content type or extension", () => {
   assert.equal(classifyResponse({ url: "https://a.example/v/stream.mpd", type: "other" }), null);
 });
 
+test("Smooth Streaming manifests are found by content type or path, their fragments never", () => {
+  assert.deepEqual(classifyResponse({ url: "https://a.example/v/My%20Show.ism/Manifest", contentType: "application/vnd.ms-sstr+xml" }), {
+    format: "ism",
+    kind: "smooth",
+    name: "My Show.ism",
+    size: 0,
+  });
+  assert.equal(classifyResponse({ url: "https://a.example/api/play", contentType: "application/vnd.ms-sstr+xml" }).name, "play");
+  assert.equal(classifyResponse({ url: "https://a.example/v/Show.ISML/manifest(format=mpd-time-csf)", contentType: "text/xml" }).kind, "smooth");
+  assert.equal(classifyResponse({ url: "https://a.example/v/Show.ism/Manifest", type: "xmlhttprequest" }).kind, "smooth");
+  assert.equal(classifyResponse({ url: "https://a.example/v/Show.ism/Manifest", type: "other" }), null);
+  assert.equal(classifyResponse({ url: "https://a.example/v/Show.ism/QualityLevels(800000)/Fragments(video=0)", contentType: "video/mp4" }), null);
+});
+
 test("other video/audio types are files named by their subtype; MPEG-TS and segments are not", () => {
   assert.equal(classifyResponse({ url: "https://a.example/a", contentType: "video/x-m4v", contentLength: "9" }).format, "m4v");
   assert.equal(classifyResponse({ url: "https://a.example/a", contentType: "audio/flac" }).format, "flac");
@@ -233,9 +247,11 @@ test("rangedVideoCandidate: an XHR range of an untyped file is an mp4 to confirm
   assert.equal(rangedVideoCandidate({ ...base, url: "not a url" }), null);
 });
 
-test("mediaUrlFormat names m3u8 and mpd links by path, then query", () => {
+test("mediaUrlFormat names m3u8, mpd and Smooth Streaming links by path, then query", () => {
   assert.equal(mediaUrlFormat("https://cdn.example/v/index.m3u8?sig=1"), "m3u8");
   assert.equal(mediaUrlFormat("https://cdn.example/v/Manifest.MPD"), "mpd");
+  assert.equal(mediaUrlFormat("https://cdn.example/v/Show.isml/Manifest(format=m3u8-aapl)"), "ism");
+  assert.equal(mediaUrlFormat("https://cdn.example/v/Show.ism"), null);
   assert.equal(mediaUrlFormat("https://proxy.example/get?u=https%3A%2F%2Fx%2Fa.m3u8"), "m3u8");
   assert.equal(mediaUrlFormat("https://cdn.example/v/a.mpdx"), null);
   assert.equal(mediaUrlFormat("https://cdn.example/v/a.mp4"), null);
@@ -243,10 +259,12 @@ test("mediaUrlFormat names m3u8 and mpd links by path, then query", () => {
   assert.equal(mediaUrlFormat(42), null);
 });
 
-test("passesSizeFilter lets DASH through like HLS; suggestFilename saves DASH as mp4", () => {
+test("passesSizeFilter lets DASH and Smooth Streaming through like HLS; suggestFilename saves them as mp4", () => {
   assert.ok(passesSizeFilter({ kind: "dash", size: 0 }, { minSizeKB: 500, maxSizeKB: 0 }));
+  assert.ok(passesSizeFilter({ kind: "smooth", size: 0 }, { minSizeKB: 500, maxSizeKB: 0 }));
   assert.equal(suggestFilename("Show", "mpd"), "Show.mp4");
   assert.equal(suggestFilename("Show", "dash"), "Show.mp4");
+  assert.equal(suggestFilename("Show", "ism"), "Show.mp4");
 });
 
 test("fetchableHeaders drops what fetch() may not set or would throw on", () => {

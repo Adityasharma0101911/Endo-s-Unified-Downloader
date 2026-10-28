@@ -431,6 +431,7 @@ fn list_options(args: &Args) -> ListOptions {
         debrid_magnets: !(args.dry_run || args.spider),
         password: args.password.clone(),
         auth: None,
+        channels: Vec::new(),
     }
 }
 

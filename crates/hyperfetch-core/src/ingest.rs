@@ -52,6 +52,9 @@ pub struct Task {
     pub p2p: bool,
     /// Piece hashes a metalink publishes for the file (see `metalink::Pieces`).
     pub pieces: Option<metalink::Pieces>,
+    /// The channel of a channel list it records (see [`Channel`]): its name, for
+    /// `engine::DownloadOptions::channel`.
+    pub channel: Option<String>,
 }
 
 impl Task {
@@ -114,6 +117,10 @@ pub struct ListOptions {
     /// sent when a feed or a remote .torrent or .metalink is fetched from that link's host alone
     /// (see [`ListOptions::get`]).
     pub auth: Option<(Url, String)>,
+    /// The channels of a channel list (see [`parse_channels`]) that become downloads: those whose
+    /// name or group one of these patterns matches (see `stream::pattern_matches`; `*` takes them
+    /// all). Without any, a channel list is an error that lists its channels.
+    pub channels: Vec<String>,
 }
 
 impl ListOptions {
@@ -160,6 +167,7 @@ impl Default for ListOptions {
             debrid_magnets: true,
             password: None,
             auth: None,
+            channels: Vec::new(),
         }
     }
 }
@@ -265,7 +273,139 @@ fn listing_url(token: &str) -> Option<Url> {
 /// may take it). A UI thread leaves that to the runtime.
 pub fn needs_reading(text: &str) -> bool {
     names_document(text)
-        || matches!(&split_tokens(text)[..], [token] if listing_url(token).is_some() || torrent::is_magnet_uri(token))
+        || might_be_channel_list(&unquote(text))
+        || matches!(&split_tokens(text)[..], [token] if listing_url(token).is_some() || torrent::is_magnet_uri(token) || might_be_channel_list(token))
+}
+
+/// A channel of a channel list (see [`parse_channels`]).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Channel {
+    pub name: String,
+    /// Its `group-title` (or `#EXTGRP`), if any.
+    pub group: Option<String>,
+    pub url: Url,
+}
+
+/// Most channels read of a list.
+const MAX_CHANNELS: usize = 100_000;
+
+/// The channels `text` lists when it is a channel list: an extended M3U (`#EXTM3U`) whose entries
+/// are all http(s) links (`#EXTINF:-1 tvg-name="..." group-title="...",Name`, then the channel's
+/// stream), with none of the `#EXT-X-` tags an HLS playlist has. None for anything else (an HLS
+/// playlist, a list of local files), and for a list with no entries.
+pub fn parse_channels(text: &str) -> Option<Vec<Channel>> {
+    let text = text.trim_start_matches('\u{feff}').trim_start();
+    if !text.starts_with("#EXTM3U") || text.contains("#EXT-X-") {
+        return None;
+    }
+    let (mut channels, mut info, mut group) = (Vec::new(), None::<&str>, None::<&str>);
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        if let Some(rest) = line.strip_prefix("#EXTINF:") {
+            info = Some(rest);
+        } else if let Some(rest) = line.strip_prefix("#EXTGRP:") {
+            group = Some(rest.trim()).filter(|g| !g.is_empty());
+        } else if !line.starts_with('#') {
+            let url = http_url(line)?;
+            let (attributes, title) = info.take().map_or(("", ""), extinf_parts);
+            let name = [title.trim(), m3u_attribute(attributes, "tvg-name").unwrap_or_default()]
+                .into_iter()
+                .find(|name| !name.is_empty())
+                .map_or_else(|| url.path_segments().and_then(|mut s| s.next_back()).filter(|s| !s.is_empty()).unwrap_or("channel").to_string(), str::to_string);
+            let group = m3u_attribute(attributes, "group-title").or(group.take()).map(str::to_string);
+            channels.push(Channel { name: truncate_chars(&name, 200), group, url });
+            if channels.len() == MAX_CHANNELS {
+                break;
+            }
+        }
+    }
+    (!channels.is_empty()).then_some(channels)
+}
+
+/// An `#EXTINF` line after its tag, split into its duration and attributes, and its title: at the
+/// first comma outside quotes.
+fn extinf_parts(info: &str) -> (&str, &str) {
+    let mut quoted = false;
+    for (at, c) in info.char_indices() {
+        match c {
+            '"' => quoted = !quoted,
+            ',' if !quoted => return (&info[..at], &info[at + 1..]),
+            _ => {}
+        }
+    }
+    (info, "")
+}
+
+/// The value of attribute `key` (`tvg-name="..."`) among an `#EXTINF` line's `attributes`.
+fn m3u_attribute<'a>(attributes: &'a str, key: &str) -> Option<&'a str> {
+    let at = attributes.to_ascii_lowercase().find(&format!("{key}=\""))? + key.len() + 2;
+    attributes[at..].split('"').next().map(str::trim).filter(|value| !value.is_empty())
+}
+
+/// Whether `token` may name a channel list [`ingest`] reads: an http(s) link whose path ends in
+/// `.m3u`, or a local file named `.m3u` or `.m3u8`. (An `.m3u8` link is an HLS stream's; one that
+/// lists channels is downloaded as the file it is.)
+pub fn might_be_channel_list(token: &str) -> bool {
+    let ends = |path: &str, extensions: &[&str]| extensions.iter().any(|ext| path.to_ascii_lowercase().ends_with(ext));
+    match http_url(token) {
+        Some(url) => ends(url.path(), &[".m3u"]),
+        None => ends(token, &[".m3u", ".m3u8"]),
+    }
+}
+
+/// The channels of the channel list at `token`, an http(s) link (fetched as `options` say) or a
+/// local file; None when it is no channel list (see [`parse_channels`]) or its server answers
+/// with a client error.
+pub async fn list_channels(token: &str, http: &reqwest::Client, options: &ListOptions) -> Result<Option<Vec<Channel>>, String> {
+    let bytes = match http_url(token) {
+        Some(url) => match fetch(options.get(http, &url), &url).await? {
+            Some((bytes, _)) => bytes,
+            None => return Ok(None),
+        },
+        None => read_local(Path::new(token)).await?,
+    };
+    Ok(decode_text(&bytes).ok().as_deref().and_then(parse_channels))
+}
+
+/// One download per channel among `channels` whose name or group one of `patterns` matches (see
+/// `stream::pattern_matches`), named after it: `.ts` (a stream of a DASH manifest `.mp4`), which
+/// an HLS or DASH download corrects to its own. Its hosts are none the user named.
+pub fn channel_tasks(channels: &[Channel], patterns: &[String]) -> Vec<Task> {
+    let matches = |text: &str| patterns.iter().any(|pattern| crate::stream::pattern_matches(pattern, text));
+    channels
+        .iter()
+        .filter(|channel| matches(&channel.name) || channel.group.as_deref().is_some_and(matches))
+        .map(|channel| {
+            let ext = if channel.url.path().to_ascii_lowercase().ends_with(".mpd") { "mp4" } else { "ts" };
+            Task {
+                urls: vec![channel.url.clone()],
+                name: clean_component(&format!("{}.{ext}", channel.name)).map(PathBuf::from),
+                from_document: true,
+                channel: Some(channel.name.clone()),
+                ..Task::default()
+            }
+        })
+        .collect()
+}
+
+/// The downloads of the channel list `source` lists as `channels`, as `patterns` choose them (see
+/// [`ListOptions::channels`]).
+fn chosen_channels(source: &str, channels: &[Channel], patterns: &[String]) -> Result<Vec<Task>, String> {
+    let shown = || {
+        let mut names: Vec<String> = channels.iter().take(20).map(|c| c.group.as_ref().map_or(c.name.clone(), |g| format!("{} [{g}]", c.name))).collect();
+        if channels.len() > 20 {
+            names.push(format!("and {} more", channels.len() - 20));
+        }
+        names.join(", ")
+    };
+    let source = truncate_chars(source, 80);
+    if patterns.is_empty() {
+        return Err(format!("{source} is a list of {} channels; choose which to record by their names or groups: {}", channels.len(), shown()));
+    }
+    let tasks = channel_tasks(channels, patterns);
+    if tasks.is_empty() {
+        return Err(format!("No channel of {source} matches {}; it has: {}", patterns.join(", "), shown()));
+    }
+    Ok(tasks)
 }
 
 /// `name` (from a torrent, metalink or magnet, so untrusted) made safe as one path component on
@@ -308,7 +448,9 @@ pub async fn input_tokens(line: &str) -> Vec<String> {
 ///
 /// The tokens are mirrors of one file (see [`link_task`]), unless they are one link that
 /// [`might_list`]: the lister that takes it (folders, then feeds, then media) lists its
-/// downloads, as `options` say, or finds it lists nothing after all. A local or remote
+/// downloads, as `options` say, or finds it lists nothing after all. A channel list (a link or
+/// file [`might_be_channel_list`] names, see [`parse_channels`]) yields the channels
+/// `options.channels` chooses (see [`channel_tasks`]). A local or remote
 /// .metalink/.meta4/.torrent must stand alone and may yield several tasks, one per file. A
 /// remote .torrent none of whose files has an HTTP web seed yields the .torrent itself, for a
 /// torrent client. A remote document is fetched from where its host's resolver says the file is
@@ -332,6 +474,15 @@ pub async fn ingest(tokens: &[impl AsRef<str>], http: &reqwest::Client, options:
                     document_tasks(kind, &read_local(&path).await?, None, swarm.as_ref())
                 }
             };
+        }
+        if might_be_channel_list(token.as_ref()) {
+            match list_channels(token.as_ref(), http, options).await {
+                Ok(Some(channels)) => return chosen_channels(token.as_ref(), &channels, &options.channels),
+                Ok(None) => {}
+                // The engine tries the link itself, and says what fails.
+                Err(e) if http_url(token.as_ref()).is_some() => tracing::info!("{e}: the download engine takes {}", token.as_ref()),
+                Err(e) => return Err(e),
+            }
         }
         if let Some(url) = listing_url(token.as_ref()) {
             if let Some(listed) = list(http, &url, options).await {
@@ -1004,5 +1155,64 @@ d6:lengthi4e4:pathl5:y.bineee4:name4:root12:piece lengthi16384e6:pieces20:aaaaaa
         assert!(short.ends_with("..."));
         assert_eq!(truncate_chars("héllo", 5), "héllo");
         assert_eq!(truncate_chars("héllo!", 5), "hé...");
+    }
+
+    const CHANNELS: &str = "\u{feff}#EXTM3U x-tvg-url=\"https://epg.example/guide.xml\"\n\
+        #EXTINF:-1 tvg-id=\"n1\" tvg-name=\"News One\" group-title=\"News\",News One HD\n\
+        https://tv.example/news1/index.m3u8\n\
+        #EXTINF:-1 tvg-name=\"Sport, Live\" GROUP-TITLE=\"Sports\",\n\
+        http://tv.example/sport.ts\n\
+        #EXTGRP:Movies\n\
+        https://tv.example/films/main.mpd\n";
+
+    /// A channel list is an extended M3U of stream links; an HLS playlist, a list of local files
+    /// or an empty list is not one.
+    #[test]
+    fn channel_lists_read_names_groups_and_links() {
+        let channels = parse_channels(CHANNELS).unwrap();
+        let read: Vec<(&str, Option<&str>, &str)> = channels.iter().map(|c| (c.name.as_str(), c.group.as_deref(), c.url.as_str())).collect();
+        assert_eq!(
+            read,
+            [
+                ("News One HD", Some("News"), "https://tv.example/news1/index.m3u8"),
+                ("Sport, Live", Some("Sports"), "http://tv.example/sport.ts"),
+                ("main.mpd", Some("Movies"), "https://tv.example/films/main.mpd"),
+            ]
+        );
+        for not_one in ["#EXTM3U\n#EXT-X-TARGETDURATION:10\n#EXTINF:10,\nhttps://a.example/0.ts\n", "#EXTM3U\n#EXTINF:1,a\nC:\\music\\a.mp3\n", "#EXTM3U\n", "https://a.example/0.ts\n"] {
+            assert_eq!(parse_channels(not_one), None, "{not_one}");
+        }
+        assert!(might_be_channel_list("https://a.example/tv.M3U?x=1") && might_be_channel_list("C:\\lists\\tv.m3u8"));
+        assert!(!might_be_channel_list("https://a.example/live.m3u8") && !might_be_channel_list("https://a.example/tv.m3u/x"));
+    }
+
+    /// Each channel chosen by its name or group is a download of its own, named after it; with
+    /// none chosen, or none matching, the error lists the channels.
+    #[test]
+    fn a_channel_list_becomes_one_download_per_chosen_channel() {
+        let (_dir, path) = write_temp("tv.m3u", CHANNELS.as_bytes());
+        let token = path.to_str().unwrap();
+        assert!(needs_reading(token));
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let choose = |patterns: &[&str]| {
+            let options = ListOptions { channels: patterns.iter().map(|p| p.to_string()).collect(), ..ListOptions::default() };
+            rt.block_on(ingest(&[token], &reqwest::Client::new(), &options))
+        };
+        let err = choose(&[]).unwrap_err();
+        assert!(err.contains("is a list of 3 channels") && err.contains("News One HD [News]"), "{err}");
+        let err = choose(&["weather"]).unwrap_err();
+        assert!(err.starts_with("No channel of") && err.contains("weather") && err.contains("Sport, Live [Sports]"), "{err}");
+        let tasks = choose(&["NEWS", "*.mpd"]).unwrap();
+        let read: Vec<(Option<&str>, Option<&str>, &str)> =
+            tasks.iter().map(|t| (t.name.as_deref().and_then(Path::to_str), t.channel.as_deref(), t.urls[0].as_str())).collect();
+        assert_eq!(
+            read,
+            [
+                (Some("News One HD.ts"), Some("News One HD"), "https://tv.example/news1/index.m3u8"),
+                (Some("main.mpd.mp4"), Some("main.mpd"), "https://tv.example/films/main.mpd"),
+            ]
+        );
+        assert!(tasks.iter().all(|t| t.from_document));
+        assert_eq!(choose(&["sports"]).unwrap()[0].name, Some(PathBuf::from("Sport, Live.ts")));
     }
 }

@@ -194,6 +194,8 @@ pub(crate) struct Piece {
     pub addressing: Arc<Addressing>,
     /// Seconds after the presentation's start the period starts, when the manifest tells.
     pub start: Option<f64>,
+    /// Which period it is, from 0.
+    pub period: usize,
 }
 
 /// A track's representation in each period it is in, in order, and its file extension.
@@ -656,7 +658,7 @@ pub(crate) fn parse(text: &str, url: &Url) -> Result<Mpd, HlsError> {
             .enumerate()
             .filter_map(|(n, period)| {
                 let same = if n == reference { rep } else { follow(period, rep)? };
-                Some(Piece { length: lengths[n], protected: same.protected, addressing: same.addressing.clone(), start: starts[n] })
+                Some(Piece { length: lengths[n], protected: same.protected, addressing: same.addressing.clone(), start: starts[n], period: n })
             })
             .collect();
         tracks.push((Track { id, ..rep.track.clone() }, Rendition { ext: rep.ext, pieces }));

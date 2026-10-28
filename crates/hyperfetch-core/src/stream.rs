@@ -433,6 +433,196 @@ fn pick_audio(info: &StreamInfo, video: Option<&Track>, spec: &AudioSpec, text: 
     Ok(unique)
 }
 
+/// The subtitles tracks of `info` in the languages `langs` asks for (`DownloadOptions::subtitles`:
+/// `all`, `none` or a comma-separated list such as `en,pt-BR`; None takes them all, as an HLS
+/// download always did), each language and name once, at most [`crate::hls::MAX_SUBTITLES`].
+pub fn choose_subtitles(info: &StreamInfo, langs: Option<&str>) -> Vec<usize> {
+    let asked: Vec<&str> = langs.map_or(vec!["all"], |langs| langs.split(',').map(str::trim).filter(|l| !l.is_empty()).collect());
+    let all = asked.iter().any(|lang| lang.eq_ignore_ascii_case("all"));
+    let mut seen = Vec::new();
+    let mut chosen = Vec::new();
+    for (at, track) in info.tracks.iter().enumerate().filter(|(_, t)| t.kind == Kind::Subtitles) {
+        let wanted = all || asked.iter().any(|asked| track.language.as_deref().is_some_and(|lang| same_language(asked, lang)));
+        if wanted && !seen.contains(&(&track.language, &track.name)) && chosen.len() < crate::hls::MAX_SUBTITLES {
+            seen.push((&track.language, &track.name));
+            chosen.push(at);
+        }
+    }
+    chosen
+}
+
+/// Whether `text` (a segment link, a channel's name) holds what `pattern` describes, ignoring
+/// case: `*` stands for any run of characters, anything else for itself, anywhere in `text`
+/// (`ad*.ts` matches `https://cdn/ad_01.ts?x`). A blank pattern matches nothing.
+pub fn pattern_matches(pattern: &str, text: &str) -> bool {
+    let (pattern, text) = (pattern.trim().to_lowercase(), text.to_lowercase());
+    if pattern.is_empty() {
+        return false;
+    }
+    let mut rest = text.as_str();
+    for piece in pattern.split('*').filter(|piece| !piece.is_empty()) {
+        match rest.find(piece) {
+            Some(at) => rest = &rest[at + piece.len()..],
+            None => return false,
+        }
+    }
+    true
+}
+
+/// Checks a pattern the user gives (`DownloadOptions::ad_patterns`, `ingest::ListOptions::channels`,
+/// see [`pattern_matches`]): it may not be blank.
+pub fn check_pattern(pattern: &str) -> Result<(), String> {
+    if pattern.trim().is_empty() {
+        return Err("A pattern may not be empty (e.g. ad*.ts, or *news*)".to_string());
+    }
+    Ok(())
+}
+
+/// Highest part id [`parse_part_ids`] takes.
+const MAX_PART_ID: usize = 100_000;
+
+/// The part ids `text` gives (`0,2-4`, see `DownloadOptions::drop_parts`), each once, in order.
+pub fn parse_part_ids(text: &str) -> Result<Vec<usize>, String> {
+    let mut ids = Vec::new();
+    for term in text.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+        let bad = || format!("\"{term}\" is not a part number or range of them (e.g. 0,2-4)");
+        let (from, to) = term.split_once('-').unwrap_or((term, term));
+        let number = |n: &str| n.trim().parse::<usize>().map_err(|_| bad());
+        let (from, to) = (number(from)?, number(to)?);
+        if from > to || to > MAX_PART_ID {
+            return Err(bad());
+        }
+        ids.extend(from..=to);
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    Ok(ids)
+}
+
+/// What a download leaves out of an HLS or DASH stream: the segments outside every section (by
+/// when they play, from the track's start: one that overlaps a section is kept whole), those of
+/// the parts dropped, and those whose links an ad pattern matches (see `DownloadOptions::sections`,
+/// `drop_parts` and `ad_patterns`).
+#[derive(Default)]
+pub(crate) struct Cuts<'a> {
+    pub sections: &'a [(f64, f64)],
+    pub parts: &'a [usize],
+    pub ads: &'a [String],
+}
+
+impl Cuts<'_> {
+    /// `segments` of one track, each in the part `parts` gives it (see [`Opened::parts_of`]),
+    /// without what is cut, numbered again; what follows a gap starts a new run (a discontinuity).
+    pub fn apply(&self, segments: Vec<HlsSegment>, parts: &[usize]) -> Vec<HlsSegment> {
+        let (mut out, mut at, mut gap) = (Vec::with_capacity(segments.len()), 0.0, false);
+        for (n, segment) in segments.into_iter().enumerate() {
+            let (from, to) = (at, at + segment.duration_secs);
+            at = to;
+            let kept = (self.sections.is_empty() || self.sections.iter().any(|&(start, end)| from < end && to > start))
+                && !parts.get(n).is_some_and(|part| self.parts.contains(part))
+                && !self.ads.iter().any(|pattern| pattern_matches(pattern, segment.url.as_str()));
+            if !kept {
+                gap = true;
+                continue;
+            }
+            let discontinuity = (std::mem::take(&mut gap) && !out.is_empty()) || segment.discontinuity;
+            out.push(HlsSegment { index: out.len(), discontinuity, ..segment });
+        }
+        out
+    }
+}
+
+/// The variables a stream's file-name pattern (`DownloadOptions::name_pattern`) takes, each in
+/// braces: `{name}` is the name the download would get without one.
+pub const NAME_VARIABLES: [&str; 11] = ["name", "height", "width", "fps", "codec", "range", "audio", "bitrate", "channel", "date", "time"];
+
+/// Checks a file-name pattern: not blank, and every `{...}` in it one of [`NAME_VARIABLES`].
+pub fn check_name_pattern(pattern: &str) -> Result<(), String> {
+    if pattern.trim().is_empty() {
+        return Err("The name pattern is empty (e.g. {name} {height}p)".to_string());
+    }
+    let mut rest = pattern;
+    while let Some(open) = rest.find('{') {
+        let close = rest[open..].find('}').ok_or("The name pattern has a { without its }")? + open;
+        let name = &rest[open + 1..close];
+        if !NAME_VARIABLES.contains(&name) {
+            return Err(format!("Unknown name variable {{{name}}}: the variables are {{{}}}", NAME_VARIABLES.join("}, {")));
+        }
+        rest = &rest[close + 1..];
+    }
+    Ok(())
+}
+
+/// `pattern` with each `{variable}` (see [`NAME_VARIABLES`]) replaced by what `value` gives for
+/// it, empty when nothing; then brackets left empty go, a run of separators doubled by an empty
+/// value (`" -  - "`) becomes one, and the ends lose theirs. Not yet made safe as a file name.
+pub(crate) fn fill_name(pattern: &str, value: impl Fn(&str) -> Option<String>) -> String {
+    let mut filled = String::new();
+    let mut rest = pattern;
+    while let Some(open) = rest.find('{') {
+        filled.push_str(&rest[..open]);
+        match rest[open..].find('}').map(|close| close + open) {
+            Some(close) if NAME_VARIABLES.contains(&&rest[open + 1..close]) => {
+                filled.push_str(&value(&rest[open + 1..close]).unwrap_or_default());
+                rest = &rest[close + 1..];
+            }
+            _ => {
+                filled.push('{');
+                rest = &rest[open + 1..];
+            }
+        }
+    }
+    filled.push_str(rest);
+    for empty in ["()", "[]", "( )", "[ ]"] {
+        filled = filled.replace(empty, "");
+    }
+    const SEPARATORS: [char; 4] = [' ', '-', '_', '.'];
+    let mut out = String::with_capacity(filled.len());
+    let mut chars = filled.chars().peekable();
+    while let Some(c) = chars.next() {
+        if !SEPARATORS.contains(&c) {
+            out.push(c);
+            continue;
+        }
+        let mut run = String::from(c);
+        while let Some(next) = chars.next_if(|next| SEPARATORS.contains(next)) {
+            run.push(next);
+        }
+        // `" -  - "` is `" - "`: spaces around one of each separator.
+        let mut core: Vec<char> = run.chars().filter(|c| *c != ' ').collect();
+        core.dedup();
+        if run.starts_with(' ') || core.is_empty() {
+            out.push(' ');
+        }
+        out.extend(&core);
+        if run.ends_with(' ') && !core.is_empty() {
+            out.push(' ');
+        }
+    }
+    out.trim_matches(&SEPARATORS[..]).to_string()
+}
+
+/// What a track variable of a file-name pattern (see [`NAME_VARIABLES`]) is for the `chosen`
+/// tracks of a download, its video first: None when they do not tell, and for the others.
+pub(crate) fn track_value(variable: &str, chosen: &[&Track]) -> Option<String> {
+    let video = chosen.iter().find(|t| t.kind == Kind::Video);
+    Some(match variable {
+        "height" => video?.height?.to_string(),
+        "width" => video?.width?.to_string(),
+        "fps" => ((video?.frame_rate? * 100.0).round() / 100.0).to_string(),
+        "codec" => video_family(&video?.codecs)?.to_string(),
+        "range" => match video?.range {
+            DynamicRange::Sdr => "sdr",
+            DynamicRange::Hdr10 | DynamicRange::Hlg => "hdr",
+            DynamicRange::DolbyVision => "dv",
+        }
+        .to_string(),
+        "audio" => chosen.iter().filter(|t| t.kind == Kind::Audio).filter_map(|t| t.language.clone()).collect::<Vec<_>>().join("+"),
+        "bitrate" => (video.or(chosen.first())?.bandwidth? / 1000).to_string(),
+        _ => return None,
+    })
+}
+
 /// Marks as ads the parts that are much shorter than the parts around them (less than half of
 /// each) and unlike them (`settings`, per part, differ).
 pub(crate) fn mark_ads(parts: &mut [Part], settings: &[String]) {
@@ -485,14 +675,13 @@ pub(crate) struct Opened {
     pub info: StreamInfo,
     /// Per track of `info.tracks`.
     sources: Vec<Source>,
-    /// An HLS master playlist's WebVTT subtitle renditions, saved with a download of it.
-    pub subtitles: Vec<crate::hls::Subtitle>,
 }
 
 /// Reads the HLS playlist or DASH manifest at `url`, or `text` in its place (a playlist a page
 /// built itself, whose URIs resolve against `url`). [`HlsError::InvalidPlaylist`] when it is
-/// neither (a plain file, maybe); [`HlsError::Live`] for a live HLS media playlist. A live DASH
-/// manifest is read, with `info.live` set.
+/// neither (a plain file, maybe, or a list of channels: see `ingest::parse_channels`);
+/// [`HlsError::Live`] for a live HLS media playlist. A live DASH manifest is read, with
+/// `info.live` set.
 pub(crate) async fn open(
     client: &Client,
     url: &Url,
@@ -507,6 +696,10 @@ pub(crate) async fn open(
     let body = String::from_utf8_lossy(&body);
     let body = body.trim_start_matches('\u{feff}').trim_start();
     if body.starts_with("#EXTM3U") {
+        // Its entries are streams of their own, which would be fetched as segments: some never end.
+        if crate::ingest::parse_channels(body).is_some() {
+            return Err(HlsError::InvalidPlaylist("a list of channels, not a stream".to_string()));
+        }
         if !crate::hls::is_master(body) {
             let segments = crate::hls::parse_media_playlist(client, auth, body, &base, fetch).await?;
             let info = StreamInfo {
@@ -516,7 +709,7 @@ pub(crate) async fn open(
                 parts: hls_parts(&segments, ""),
                 tracks: vec![Track { id: "v0".to_string(), ..Default::default() }],
             };
-            return Ok(Opened { info, sources: vec![Source::Read(segments)], subtitles: Vec::new() });
+            return Ok(Opened { info, sources: vec![Source::Read(segments)] });
         }
         let (tracks, sources): (Vec<Track>, Vec<Source>) = crate::hls::master_tracks(body, &base)
             .into_iter()
@@ -526,26 +719,50 @@ pub(crate) async fn open(
             return Err(HlsError::Unsupported("malformed playlist: no variant stream URI found".to_string()));
         }
         let info = StreamInfo { format: Format::Hls, live: false, duration: None, tracks, parts: Vec::new() };
-        return Ok(Opened { info, sources, subtitles: crate::hls::subtitle_renditions(body, &base) });
+        return Ok(Opened { info, sources });
     }
     if crate::dash::is_mpd(body.as_bytes()) {
         let mpd = crate::dash::parse(body, &base)?;
         let (tracks, sources) = mpd.tracks.into_iter().map(|(track, rendition)| (track, Source::Dash(rendition))).unzip();
         let info = StreamInfo { format: Format::Dash, live: mpd.live, duration: mpd.duration, tracks, parts: mpd.parts };
-        return Ok(Opened { info, sources, subtitles: Vec::new() });
+        return Ok(Opened { info, sources });
     }
     Err(HlsError::InvalidPlaylist("neither an HLS playlist nor a DASH manifest".to_string()))
 }
 
 impl Opened {
-    /// The segments of track `at`; None for one inside its video's segments.
+    /// The segments of track `at`; None for one inside its video's segments. An HLS subtitles
+    /// rendition whose link is no playlist is taken for one WebVTT file.
     pub async fn segments(&self, client: &Client, auth: Option<&Auth>, fetch: FetchPolicy, at: usize) -> Result<Option<Vec<HlsSegment>>, HlsError> {
         match &self.sources[at] {
             Source::Read(segments) => Ok(Some(segments.clone())),
-            Source::Playlist(url) => crate::hls::media_segments(client, auth, url, fetch).await.map(Some),
+            Source::Playlist(url) => match crate::hls::media_segments(client, auth, url, fetch).await {
+                Err(HlsError::Unavailable(_)) if self.info.tracks[at].kind == Kind::Subtitles => {
+                    let whole = HlsSegment { index: 0, sequence: 0, url: url.clone(), duration_secs: 0.0, byte_range: None, encryption: None, init: None, discontinuity: false };
+                    Ok(Some(vec![whole]))
+                }
+                listed => listed.map(Some),
+            },
             Source::InVideo => Ok(None),
             Source::Dash(rendition) => crate::dash::segments(client, auth, fetch, rendition).await.map(Some),
         }
+    }
+
+    /// The part (see [`Part`]) each of `segments`, track `at`'s, is in: a new one after each
+    /// discontinuity; a DASH representation's piece, the period it is in.
+    pub fn parts_of(&self, at: usize, segments: &[HlsSegment]) -> Vec<usize> {
+        let mut piece = 0;
+        let mut parts = Vec::with_capacity(segments.len());
+        for (n, segment) in segments.iter().enumerate() {
+            piece += usize::from(n > 0 && segment.discontinuity);
+            parts.push(match &self.sources[at] {
+                // shortcut: a period a representation lists no segment in is not counted; count the
+                // segments per period in `dash::segments` if such manifests turn up.
+                Source::Dash(rendition) => rendition.pieces.get(piece).map_or(piece, |p| p.period),
+                _ => piece,
+            });
+        }
+        parts
     }
 
     /// The file extension of track `at`, whose segments are `segments`: a DASH representation's
@@ -649,6 +866,8 @@ pub(crate) struct LiveSources {
     keys: std::collections::HashMap<Url, [u8; 16]>,
     /// Seconds the DASH server's clock is ahead of ours (see `dash::clock_offset`), once known.
     offset: Option<f64>,
+    /// Segments whose links one of these matches are left out (see `DownloadOptions::ad_patterns`).
+    pub ads: Vec<String>,
 }
 
 /// A manifest, read for one round of [`LiveSources::listings`].
@@ -659,7 +878,7 @@ enum Read {
 
 impl LiveSources {
     pub fn new(tracks: Vec<(Origin, Kind)>) -> Self {
-        Self { tracks, keys: Default::default(), offset: None }
+        Self { tracks, keys: Default::default(), offset: None, ads: Vec::new() }
     }
 
     /// What each track's manifest lists at `now` (seconds since 1970 by this computer's clock),
@@ -694,14 +913,30 @@ impl LiveSources {
                     read.len() - 1
                 }
             };
-            listings.push(match &read[at].1 {
+            let mut listing = match &read[at].1 {
                 Read::Playlist(text, base) => crate::hls::live_playlist(client, auth, text, base, fetch, &mut self.keys, *kind, now, after).await?,
                 Read::Mpd(mpd) => {
                     let track = mpd.tracks.iter().find(|(track, _)| origin.track.as_ref() == Some(&track.id));
                     let (_, rendition) = track.ok_or_else(|| HlsError::Unavailable(format!("{} no longer lists the track", origin.manifest)))?;
                     crate::dash::live_listing(mpd, rendition, now + self.offset.unwrap_or(0.0), after)?
                 }
-            });
+            };
+            if !self.ads.is_empty() {
+                // An ad left out is listed again next round, after the same segment: what follows it
+                // then follows a gap.
+                let (mut kept, mut dates, mut gap) = (Vec::new(), Vec::new(), false);
+                for (segment, date) in listing.segments.into_iter().zip(listing.dates) {
+                    if self.ads.iter().any(|pattern| pattern_matches(pattern, segment.url.as_str())) {
+                        gap = true;
+                        continue;
+                    }
+                    let discontinuity = std::mem::take(&mut gap) || segment.discontinuity;
+                    kept.push(HlsSegment { discontinuity, ..segment });
+                    dates.push(date);
+                }
+                (listing.segments, listing.dates) = (kept, dates);
+            }
+            listings.push(listing);
         }
         Ok(listings)
     }
@@ -994,5 +1229,97 @@ mod tests {
         let mut alone = vec![part(0, 5.0)];
         mark_ads(&mut alone, &["x".to_string()]);
         assert!(!alone[0].ad);
+    }
+
+    /// A pattern is a substring of any case, `*` any run of characters; a blank one matches
+    /// nothing and is refused.
+    #[test]
+    fn test_patterns_match_substrings_with_stars() {
+        let link = "https://CDN.example/ads/Ad_01.ts?x=1";
+        for hit in ["ad_01", "/ADS/", "ad*.ts", "*", "cdn*ads*01", "x=1"] {
+            assert!(pattern_matches(hit, link), "{hit}");
+        }
+        for miss in ["ad_02", "ts*ads", "", "  "] {
+            assert!(!pattern_matches(miss, link), "{miss}");
+        }
+        assert!(check_pattern(" ").is_err() && check_pattern("*news*").is_ok());
+    }
+
+    /// Part ids are numbers and ranges, each once, in order; anything else is refused.
+    #[test]
+    fn test_part_ids_read_as_numbers_and_ranges() {
+        assert_eq!(parse_part_ids(" 4, 0,2-4 ,").unwrap(), [0, 2, 3, 4]);
+        assert_eq!(parse_part_ids("").unwrap(), Vec::<usize>::new());
+        for bad in ["a", "3-1", "1-", "-2", "0-999999999"] {
+            assert!(parse_part_ids(bad).unwrap_err().contains(&format!("\"{bad}\"")), "{bad}");
+        }
+    }
+
+    fn segment(n: usize, secs: f64, discontinuity: bool) -> HlsSegment {
+        HlsSegment {
+            index: n,
+            sequence: n as u64,
+            url: Url::parse(&format!("https://cdn.example/{}.ts", if n == 2 { "ad".to_string() } else { n.to_string() })).unwrap(),
+            duration_secs: secs,
+            byte_range: None,
+            encryption: None,
+            init: None,
+            discontinuity,
+        }
+    }
+
+    /// Cuts keep the whole segments that overlap a section, and leave out the parts dropped and
+    /// the segments whose links an ad pattern matches; what is left is numbered again, and what
+    /// follows a gap starts a new run.
+    #[test]
+    fn test_cuts_keep_whole_segments_and_mark_the_gaps() {
+        // 0-10, 10-20, ad 20-25 (part 1), 25-35 (part 2), 35-45.
+        let segments = vec![segment(0, 10.0, false), segment(1, 10.0, false), segment(2, 5.0, true), segment(3, 10.0, true), segment(4, 10.0, false)];
+        let parts = [0, 0, 1, 2, 2];
+        let kept = |cuts: Cuts| cuts.apply(segments.clone(), &parts).iter().map(|s| (s.sequence, s.index, s.discontinuity)).collect::<Vec<_>>();
+        assert_eq!(kept(Cuts::default()).len(), 5);
+        assert_eq!(kept(Cuts { sections: &[(12.0, 26.0)], ..Default::default() }), [(1, 0, false), (2, 1, true), (3, 2, true)]);
+        assert_eq!(kept(Cuts { parts: &[1], ..Default::default() }), [(0, 0, false), (1, 1, false), (3, 2, true), (4, 3, false)]);
+        let ads = ["/AD.".to_string()];
+        assert_eq!(kept(Cuts { ads: &ads, sections: &[(0.0, 5.0), (40.0, 41.0)], ..Default::default() }), [(0, 0, false), (4, 1, true)]);
+        assert!(kept(Cuts { sections: &[(50.0, 60.0)], ..Default::default() }).is_empty());
+    }
+
+    /// Subtitles go by the subtitle languages: all of them when none are given, none for `none`;
+    /// the same language and name only once.
+    #[test]
+    fn test_subtitles_are_chosen_by_language() {
+        let text = |id: &str, lang: &str, name: &str| Track { language: Some(lang.into()), name: Some(name.into()), ..track(id, Kind::Subtitles, "") };
+        let info = dash(vec![video("v0", 720, "avc1", 1), text("s0", "en-US", "English"), text("s1", "fr", "French"), text("s2", "en-US", "English"), text("s3", "en", "SDH")]);
+        let ids = |langs: Option<&str>| choose_subtitles(&info, langs).into_iter().map(|at| info.tracks[at].id.as_str()).collect::<Vec<_>>();
+        assert_eq!(ids(None), ["s0", "s1", "s3"]);
+        assert_eq!(ids(Some("all")), ["s0", "s1", "s3"]);
+        assert_eq!(ids(Some("en")), ["s0", "s3"]);
+        assert_eq!(ids(Some("fr,de")), ["s1"]);
+        assert!(ids(Some("none")).is_empty() && ids(Some("")).is_empty());
+    }
+
+    /// A name pattern is filled from the tracks chosen, an empty value taking its separators and
+    /// brackets with it; an unknown variable or a blank pattern is refused.
+    #[test]
+    fn test_name_patterns_fill_in_the_tracks() {
+        let chosen = [
+            &Track { frame_rate: Some(29.97), range: DynamicRange::Hdr10, ..video("v1", 1080, "hvc1.2.4.L123", 6_000_000) },
+            &audio("a0", "en", "mp4a.40.2", 2, 1),
+            &audio("a1", "ja", "ec-3", 6, 1),
+        ];
+        let value = |v: &str| match v {
+            "name" => Some("Show".to_string()),
+            "channel" => None,
+            _ => track_value(v, &chosen),
+        };
+        let fill = |pattern: &str| fill_name(pattern, value);
+        assert_eq!(fill("{name} - {height}p {codec} {range} [{audio}] {fps}fps {bitrate}k"), "Show - 1080p hevc hdr [en+ja] 29.97fps 6000k");
+        assert_eq!(fill("{name} - {channel} - {width}x{height}"), "Show - 1920x1080");
+        assert_eq!(fill("{channel}_{name}.({channel}).{unknown}"), "Show.{unknown}");
+        assert_eq!(fill_name("{name} {height}p", |v| (v == "name").then(|| "Show".to_string())), "Show p");
+        assert!(check_name_pattern("{name} {height}p {date} {time}").is_ok());
+        assert!(check_name_pattern("{name} {size}").unwrap_err().contains("{size}"));
+        assert!(check_name_pattern("{name").is_err() && check_name_pattern(" ").is_err());
     }
 }
