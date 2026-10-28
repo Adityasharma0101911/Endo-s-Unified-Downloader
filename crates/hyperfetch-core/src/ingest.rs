@@ -291,22 +291,31 @@ const MAX_CHANNELS: usize = 100_000;
 
 /// The channels `text` lists when it is a channel list: an extended M3U (`#EXTM3U`) whose entries
 /// are all http(s) links (`#EXTINF:-1 tvg-name="..." group-title="...",Name`, then the channel's
-/// stream), with none of the `#EXT-X-` tags an HLS playlist has. None for anything else (an HLS
-/// playlist, a list of local files), and for a list with no entries.
+/// stream), with none of the `#EXT-X-` tags an HLS playlist has, and something of a channel list:
+/// an entry with no length (`-1`), `tvg-` or `group-title` attributes, `#EXTGRP`, or a stream's
+/// link (`.m3u8`, `.mpd`, `.ts`). None for anything else (an HLS playlist, a list of local files,
+/// a playlist of songs), and for a list with no entries.
 pub fn parse_channels(text: &str) -> Option<Vec<Channel>> {
     let text = text.trim_start_matches('\u{feff}').trim_start();
     if !text.starts_with("#EXTM3U") || text.contains("#EXT-X-") {
         return None;
     }
-    let (mut channels, mut info, mut group) = (Vec::new(), None::<&str>, None::<&str>);
+    let (mut channels, mut info, mut group, mut signs) = (Vec::new(), None::<&str>, None::<&str>, false);
     for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
         if let Some(rest) = line.strip_prefix("#EXTINF:") {
             info = Some(rest);
         } else if let Some(rest) = line.strip_prefix("#EXTGRP:") {
             group = Some(rest.trim()).filter(|g| !g.is_empty());
+            signs = true;
         } else if !line.starts_with('#') {
             let url = http_url(line)?;
             let (attributes, title) = info.take().map_or(("", ""), extinf_parts);
+            let lower = attributes.to_ascii_lowercase();
+            signs = signs
+                || attributes.split_whitespace().next() == Some("-1")
+                || lower.contains("tvg-")
+                || lower.contains("group-title=")
+                || [".m3u8", ".mpd", ".ts"].iter().any(|ext| url.path().to_ascii_lowercase().ends_with(ext));
             let name = [title.trim(), m3u_attribute(attributes, "tvg-name").unwrap_or_default()]
                 .into_iter()
                 .find(|name| !name.is_empty())
@@ -318,7 +327,7 @@ pub fn parse_channels(text: &str) -> Option<Vec<Channel>> {
             }
         }
     }
-    (!channels.is_empty()).then_some(channels)
+    (signs && !channels.is_empty()).then_some(channels)
 }
 
 /// An `#EXTINF` line after its tag, split into its duration and attributes, and its title: at the
@@ -366,16 +375,25 @@ pub async fn list_channels(token: &str, http: &reqwest::Client, options: &ListOp
     Ok(decode_text(&bytes).ok().as_deref().and_then(parse_channels))
 }
 
+/// Extensions of audio and video files a channel's link may end in, which its download keeps.
+const CHANNEL_FILES: &[&str] = &["mp3", "aac", "m4a", "ogg", "oga", "opus", "flac", "wav", "mp4", "m4v", "mkv", "webm", "flv", "mov"];
+
 /// One download per channel among `channels` whose name or group one of `patterns` matches (see
 /// `stream::pattern_matches`), named after it: `.ts` (a stream of a DASH manifest `.mp4`), which
-/// an HLS or DASH download corrects to its own. Its hosts are none the user named.
+/// an HLS or DASH download corrects to its own, or the audio or video extension its link ends
+/// in (a radio station's `.mp3`). Its hosts are none the user named.
 pub fn channel_tasks(channels: &[Channel], patterns: &[String]) -> Vec<Task> {
     let matches = |text: &str| patterns.iter().any(|pattern| crate::stream::pattern_matches(pattern, text));
     channels
         .iter()
         .filter(|channel| matches(&channel.name) || channel.group.as_deref().is_some_and(matches))
         .map(|channel| {
-            let ext = if channel.url.path().to_ascii_lowercase().ends_with(".mpd") { "mp4" } else { "ts" };
+            let own = channel.url.path_segments().and_then(|mut s| s.next_back()).and_then(|last| last.rsplit_once('.')).map(|(_, ext)| ext.to_ascii_lowercase());
+            let ext = match own.as_deref() {
+                Some("mpd") => "mp4",
+                Some(own) => CHANNEL_FILES.iter().copied().find(|known| *known == own).unwrap_or("ts"),
+                None => "ts",
+            };
             Task {
                 urls: vec![channel.url.clone()],
                 name: clean_component(&format!("{}.{ext}", channel.name)).map(PathBuf::from),
@@ -397,7 +415,7 @@ fn chosen_channels(source: &str, channels: &[Channel], patterns: &[String]) -> R
         }
         names.join(", ")
     };
-    let source = truncate_chars(source, 80);
+    let source = truncate_chars(&crate::history::redact_url(source), 80);
     if patterns.is_empty() {
         return Err(format!("{source} is a list of {} channels; choose which to record by their names or groups: {}", channels.len(), shown()));
     }
@@ -480,7 +498,9 @@ pub async fn ingest(tokens: &[impl AsRef<str>], http: &reqwest::Client, options:
                 Ok(Some(channels)) => return chosen_channels(token.as_ref(), &channels, &options.channels),
                 Ok(None) => {}
                 // The engine tries the link itself, and says what fails.
-                Err(e) if http_url(token.as_ref()).is_some() => tracing::info!("{e}: the download engine takes {}", token.as_ref()),
+                Err(e) if http_url(token.as_ref()).is_some() => {
+                    tracing::info!("{}: the download engine takes {}", crate::history::redact_text(&e), crate::history::redact_url(token.as_ref()))
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -1214,5 +1234,17 @@ d6:lengthi4e4:pathl5:y.bineee4:name4:root12:piece lengthi16384e6:pieces20:aaaaaa
         );
         assert!(tasks.iter().all(|t| t.from_document));
         assert_eq!(choose(&["sports"]).unwrap()[0].name, Some(PathBuf::from("Sport, Live.ts")));
+    }
+
+    /// A playlist of songs is no channel list; a radio station's channel keeps the audio
+    /// extension its link ends in; the list's link is named without its secrets.
+    #[test]
+    fn songs_are_no_channels_and_a_radio_channel_keeps_its_extension() {
+        assert_eq!(parse_channels("#EXTM3U\n#EXTINF:215,Artist - Song\nhttps://a.example/song.mp3\n"), None);
+        let radio = parse_channels("#EXTM3U\n#EXTINF:-1,Radio X\nhttps://radio.example/live/stream.MP3\n#EXTINF:-1,Talk\nhttps://radio.example/talk.php\n").unwrap();
+        let names: Vec<PathBuf> = channel_tasks(&radio, &["*".to_string()]).into_iter().filter_map(|t| t.name).collect();
+        assert_eq!(names, [PathBuf::from("Radio X.mp3"), PathBuf::from("Talk.ts")]);
+        let err = chosen_channels("https://tv.example/list.m3u?username=bob&password=hunter2", &radio, &[]).unwrap_err();
+        assert!(err.contains("is a list of 2 channels") && !err.contains("hunter2"), "{err}");
     }
 }
