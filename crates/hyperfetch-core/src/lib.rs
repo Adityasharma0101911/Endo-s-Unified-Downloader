@@ -32,6 +32,7 @@ pub mod ftp;
 pub mod digest;
 pub mod zipdir;
 pub mod sniff;
+pub mod subs;
 
 pub use range::{ByteRange, RangeError};
 pub use chunk::{Chunk, ChunkManager, ChunkStatus, ChunkError};
