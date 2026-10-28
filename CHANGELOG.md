@@ -5,6 +5,7 @@ What changed in each release, newest first. Each release's page on [GitHub](http
 ## Unreleased
 
 - Subtitles in WebVTT, TTML/IMSC and inside MP4 segments (`stpp`, `wvtt`) are read into one timeline, joined across segments and written as SRT or WebVTT, for stream downloads to keep.
+- **DASH and stream tracks:** on-demand DASH manifests (`.mpd`) download natively, with resume, expired links renewed and several periods joined; an HLS master playlist's separate audio downloads natively too. A video spec (`1080p`, `hevc`, `hdr`, `30fps`, ...) and an audio spec (languages, `all`, `eac3`, `6ch`, ...) or track ids choose the tracks; several are joined by ffmpeg without re-encoding, each audio track tagged with its language. Live DASH still goes to yt-dlp.
 
 ## 1.8.0 (2026-10-27)
 

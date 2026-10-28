@@ -4013,56 +4013,23 @@ async fn test_a_drm_protected_live_hls_stream_is_an_error_not_a_recording() {
     }
 }
 
-/// A stream whose audio is a playlist of its own goes to yt-dlp, which merges the two, with the
-/// page's referer and the browser's headers.
+/// A live DASH manifest goes to yt-dlp, which records it, with the page's referer and the
+/// browser's headers: a `.mpd` link, one the browser saw read as DASH (`dash`), and one that
+/// answers as DASH. The height the browser's user chose is the format yt-dlp gets.
 #[tokio::test]
-async fn test_an_hls_stream_with_separate_audio_goes_to_yt_dlp_with_the_browsers_request() {
+async fn test_live_dash_manifests_and_a_chosen_height_go_to_yt_dlp() {
     isolate_history();
     let _history = HISTORY.write().await;
-    let (tools, temp) = (tempdir().unwrap(), tempdir().unwrap());
-    let master = "#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"en\",URI=\"audio/en.m3u8\"\n\
-                  #EXT-X-STREAM-INF:BANDWIDTH=8000000,CODECS=\"avc1.640028,mp4a.40.2\",AUDIO=\"aud\"\nvideo.m3u8\n";
-    let url = serve(Arc::new(Mock::new(master.as_bytes().to_vec())), "show/master.m3u8").await;
-    // What yt-dlp's generic site finds there, left to yt-dlp to download.
-    let output = temp.path().join("master.mp4");
-    let info = serde_json::json!({
-        "_type": "video", "extractor_key": "Generic", "id": "master", "title": "master",
-        "requested_downloads": [{ "filename": output }],
-    });
-    std::fs::write(tools.path().join("info.json"), serde_json::to_vec(&info).unwrap()).unwrap();
-    let opts = DownloadOptions {
-        ytdlp_path: Some(fake_ytdlp(tools.path(), &output)),
-        referer: Some("https://page.example/watch".into()),
-        headers: vec![("Origin".into(), "https://page.example".into())],
-        ..options(temp.path(), 4, 64 * KB)
-    };
-
-    assert_eq!(run(&DownloadEngine::new(vec![url.clone()], opts), None).await, Ok(output));
-    let runs = runs_of(tools.path());
-    assert!(runs.first().is_some_and(|found| found.contains(&"-J".to_string()) && found.last() == Some(&url.to_string())), "{runs:?}");
-    for args in &runs {
-        assert!(has_arg(args, "--referer", "https://page.example/watch"), "{args:?}");
-        assert!(has_arg(args, "--add-header", "Origin:https://page.example"), "{args:?}");
-    }
-}
-
-/// A DASH manifest goes to yt-dlp, with the browser's request: a `.mpd` link, one the browser saw
-/// read as DASH (`dash`), and one that answers as DASH. The height the browser's user chose is
-/// the format yt-dlp gets, here for a stream with its audio apart.
-#[tokio::test]
-async fn test_dash_manifests_and_a_chosen_height_go_to_yt_dlp() {
-    isolate_history();
-    let _history = HISTORY.write().await;
-    const MPD: &[u8] = b"<?xml version=\"1.0\"?><MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\"></MPD>";
-    let master = "#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"en\",URI=\"audio/en.m3u8\"\n\
-                  #EXT-X-STREAM-INF:BANDWIDTH=8000000,RESOLUTION=1280x720,AUDIO=\"aud\"\nvideo.m3u8\n";
+    const MPD: &[u8] = b"<?xml version=\"1.0\"?><MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\" type=\"dynamic\"><Period start=\"PT0S\">\
+        <AdaptationSet contentType=\"video\"><SegmentTemplate media=\"v-$Number$.m4s\" duration=\"2\"/>\
+        <Representation id=\"v\" bandwidth=\"1\" width=\"1280\" height=\"720\" codecs=\"avc1.64001f\"/></AdaptationSet></Period></MPD>";
     let mut answers_dash = Mock::new(MPD.to_vec());
     answers_dash.content_type = Some("application/dash+xml");
     let links = [
         (serve(Arc::new(Mock::new(MPD.to_vec())), "show/manifest.mpd").await, false, None),
         (serve(Arc::new(Mock::new(MPD.to_vec())), "api/play?id=7").await, true, None),
         (serve(Arc::new(answers_dash), "api/stream").await, false, None),
-        (serve(Arc::new(Mock::new(master.as_bytes().to_vec())), "show/master.m3u8").await, false, Some(720)),
+        (serve(Arc::new(Mock::new(MPD.to_vec())), "live/show.mpd").await, false, Some(720)),
     ];
     for (url, dash, height) in links {
         let (tools, temp) = (tempdir().unwrap(), tempdir().unwrap());
@@ -4074,6 +4041,7 @@ async fn test_dash_manifests_and_a_chosen_height_go_to_yt_dlp() {
         std::fs::write(tools.path().join("info.json"), serde_json::to_vec(&info).unwrap()).unwrap();
         let opts = DownloadOptions {
             ytdlp_path: Some(fake_ytdlp(tools.path(), &output)),
+            referer: Some("https://page.example/watch".into()),
             headers: vec![("Origin".into(), "https://page.example".into())],
             dash,
             height,
@@ -4085,6 +4053,7 @@ async fn test_dash_manifests_and_a_chosen_height_go_to_yt_dlp() {
         let found = runs.first().is_some_and(|find| find.contains(&"-J".to_string()) && find.last() == Some(&url.to_string()));
         assert!(found && runs.len() == 2, "{url}: {runs:?}");
         for args in &runs {
+            assert!(has_arg(args, "--referer", "https://page.example/watch"), "{args:?}");
             assert!(has_arg(args, "--add-header", "Origin:https://page.example"), "{args:?}");
             if height.is_some() {
                 assert!(has_arg(args, "-f", "bv*[height<=720]+ba/b[height<=720]"), "{args:?}");
