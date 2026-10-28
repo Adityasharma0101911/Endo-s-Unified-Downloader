@@ -219,19 +219,29 @@ All `URLS` given on the command line are **mirrors of one file**, except a link 
 | `--media-preset PRESET` | `best`, `1080p`, `720p`, `mp3`, `m4a`, or any yt-dlp format selector. With a preset, page URLs that are not direct files are also sent to yt-dlp. | `best` |
 | `--cookies-from-browser B` | `chrome`, `edge`, `firefox`, `brave`, `opera` or `vivaldi` (media downloads). | |
 | `--concurrent-fragments N` | Connections for yt-dlp media downloads (1-32). | `8` |
-| `--subs LANGS` | Subtitle languages to save next to a video, e.g. `en,es` or `all`, as `.srt` when ffmpeg is present (see [Subtitles and tags](#subtitles-and-tags)). | none |
-| `--sections START-END` | Download only this part of a video, e.g. `90-150`, `1:30-2:30` or `1:02:03-1:05:00`; repeat it for several parts (see [Clips, SponsorBlock and formats](#clips-sponsorblock-and-formats)). | the whole video |
+| `--subs LANGS` | Subtitle languages to save next to a video, e.g. `en,es` or `all`, as `.srt` when ffmpeg is present (see [Subtitles and tags](#subtitles-and-tags)). For an HLS or DASH link, its subtitles tracks in these languages, `none` for none (see Stream subtitles under [Features](#features)). | none; every track of an HLS or DASH link |
+| `--sections START-END` | Download only this part of a video, e.g. `90-150`, `1:30-2:30` or `1:02:03-1:05:00`; repeat it for several parts (see [Clips, SponsorBlock and formats](#clips-sponsorblock-and-formats)). An HLS or DASH link keeps the whole segments that overlap it (see Stream cuts under [Features](#features)). | the whole video |
 | `--sponsorblock MODE` | `remove` cuts YouTube's sponsor, self-promotion and interaction segments out; `mark` marks every SponsorBlock segment as a chapter. | off |
 | `--merge-format F` | Container a video's streams are joined in: `mp4`, `mkv` or `webm`. | `mp4` |
 | `--no-embed-metadata` | Leave out the tags, chapters and cover art written into media files. | embedded |
 | `--live-from-start` | Record a live stream from its start, where the site keeps it, instead of from now (see [Live streams](#live-streams)). | from now |
+| `--live-from TIME` | Start an HLS or DASH recording further back: a time ago (`30m`, `1h30m`, `90s`, `01:00:00`) or a clock time (`2026-10-10T21:00`, `"2026-10-10 21:00:00+08:00"`). Not with `--live-from-start`; a media site's link (or any with `--media-preset`) is refused, since only `--live-from-start` works there. | from now |
 | `--record-seconds N` | End a live recording after N seconds of it. | until it ends |
+| `--live-idle-timeout SECS` | End an HLS or DASH recording, or an MPEG-TS stream's, once nothing new has come for SECS seconds, keeping it. | until it ends |
 | `--wait-for-video` | Wait for a scheduled stream or premiere to begin instead of failing. | off |
 | `--hls-mp4` | Remux an HLS stream saved as MPEG-TS into an `.mp4` once downloaded, without re-encoding (see HLS under [Features](#features)). | keeps the `.ts` |
+| `--video SPEC` | The video track of an HLS or DASH link: comma-separated terms that must all hold, e.g. `1080p,hevc,sdr` (see Stream tracks under [Features](#features)). | `best` |
+| `--audio SPEC` | The audio tracks of an HLS or DASH link: languages and what each track must be, e.g. `en,ja,eac3`, or `best`, `all`, `none`. | `best` |
+| `--tracks IDS` | Exactly these tracks of an HLS or DASH link, by the ids `--list-tracks` gives (`v0,a1,s0`), whatever `--video` and `--audio` say. | |
+| `--list-tracks` | Print each HLS or DASH link's tracks and parts, or a channel list's channels, and download nothing (see below). | |
+| `--drop-parts IDS` | Leave out these parts of an HLS or DASH link, by the ids `--list-tracks` gives: `0,2-4` (see Stream cuts under [Features](#features)). | |
+| `--ad-pattern PATTERN` | Leave out the segments of an HLS or DASH link whose links match, in any case; `*` stands for any run of characters (`/ads/`, `*-ad-*.ts`). Repeat it for several. | |
+| `--name-pattern PATTERN` | Name an HLS, DASH or channel download after the stream, e.g. `"{name} {height}p {codec}"` (see Stream file names under [Features](#features)). | the usual name |
 | `--install-ffmpeg` | Install ffmpeg (about 200 MB) when a media download needs it and finds none (see ffmpeg under [Features](#features)). | asks at a terminal |
 | `--no-install-ffmpeg` | Never install ffmpeg, and do not ask. | |
 | `--latest N` | Only the newest N items of a channel, playlist or feed: a channel's first, a playlist's last, a feed's latest episodes. | all |
-| `--all-items` | Download every item of a channel, playlist, feed or cloud folder, also those downloaded before (in the download archive, or for a feed's episodes also in the history). | only new items |
+| `--all-items` | Download every item of a channel, playlist, feed or cloud folder, also those downloaded before (in the download archive, or for a feed's episodes also in the history). Every channel of a channel list. | only new items |
+| `--channel PATTERN` | Record the channels of a channel list whose name or group matches, in any case (`*` for any run of characters); repeat it for several (see Channel lists under [Features](#features)). | lists them and asks you to choose |
 | `--yes-playlist` | For a video link that also names its playlist (`watch?v=...&list=...`), download the whole playlist. | the one video |
 | `--google-api-key KEY` | Google API key (or `ENDO_GOOGLE_API_KEY`) that lists a whole Google Drive folder through the Drive API, with sizes and checksums, and is sent nowhere else. Without it the folder's public page is read. | |
 | `--debrid-key KEY` | Debrid API key (or `ENDO_DEBRID_KEY`): file host links are unlocked and magnets downloaded through the service (see Debrid under [Features](#features)). | |
@@ -259,6 +269,9 @@ All `URLS` given on the command line are **mirrors of one file**, except a link 
 | `--stdout` | Write one direct file link's bytes to standard output, a file or a pipe (not the terminal), with progress and messages on stderr (see Requests and connections under [Features](#features)). | |
 | `--json` | One JSON object per finished item on stdout (see below). | |
 | `--logfile FILE` | Append what is printed, progress bars aside, to FILE too. | |
+| `--config FILE` / `--no-config` | Default options from FILE (see below); read none. | `cli.conf` in the data folder, when it is there |
+| `--start-at TIME` | Wait until `HH:MM` (the next time the clock shows it) or `"YYYY-MM-DD HH:MM"`, then run (see below). | now |
+| `--doctor` | Print the version, the system, the data folder, the config file, yt-dlp, ffmpeg, ffprobe and gallery-dl, the proxy variables and the free space, then exit (see below). | |
 | `--completions SHELL` | Print a completion script for `bash`, `zsh`, `fish`, `powershell` or `elvish`, then exit. | |
 | `-q, --quiet` | Hide progress output. Errors and warnings are still printed. | |
 | `-v, --verbose` | More log output: `-v` info, `-vv` debug, `-vvv` trace. | warnings |
@@ -282,13 +295,14 @@ https://example.com/release.meta4
 {"status":"ok","url":"https://example.com/file.iso","path":"/srv/downloads/file.iso","size":4096,"checksum":null,"checked_against":"the site's SHA-256","error":null}
 ```
 
-`status` is `ok`, `failed`, `skipped` (`--no-clobber`) or `up-to-date` (`--only-if-newer`). `url` is the link without its secrets (as history keeps it), `path` where the file is (for a failed download, where it was going), `size` its size in bytes (`null` for a folder), `checksum` the one it had to match (yours, or a metalink's), `checked_against` whose checksum it matched when it was not yours, and `error` why it failed. An input that could not be read at all (a folder that does not open) is a `failed` item too. With `--spider` each object also has `name`, `type`, `resumable`, `etag` and `last_modified`, and `checksum` is the one the site publishes; with `--dry-run`, each is a file the run would download (`ok`) or skip (`skipped`). `--json` needs URLs or `-i`: it does not start the interactive prompt.
+`status` is `ok`, `failed`, `skipped` (`--no-clobber`) or `up-to-date` (`--only-if-newer`). `url` is the link without its secrets (as history keeps it), `path` where the file is (for a failed download, where it was going), `size` its size in bytes (`null` for a folder), `checksum` the one it had to match (yours, or a metalink's), `checked_against` whose checksum it matched when it was not yours, and `error` why it failed. An input that could not be read at all (a folder that does not open) is a `failed` item too. With `--spider` each object also has `name`, `type`, `resumable`, `etag` and `last_modified`, and `checksum` is the one the site publishes; with `--dry-run`, each is a file the run would download (`ok`) or skip (`skipped`); `--list-tracks` and `--doctor` print objects of their own (see below). `--json` needs URLs or `-i` (but for `--doctor`): it does not start the interactive prompt.
 
 **Probing without downloading.**
 - `--spider` asks each link's server for the file's first byte, as a download's probe does (file host pages resolved, your headers to the link's own host only), and prints its name, size, type, whether it can resume, its validators (ETag, Last-Modified) and the checksum its site publishes, if any. Nothing is written. It works with `-i` and with folders, playlists and feeds, which are listed first; a bad link (an error answer, no answer) exits with `1` and its reason. FTP links and torrents are listed, not probed.
 - `-S, --server-response` prints the headers of each link's probe request (`>` lines) and answer (`<` lines) on stderr, before the downloads start or with `--spider`. The values of `Authorization`, `Cookie`, `Set-Cookie` and of your own `--header`s are shown as `***`; the link, and where a redirect (`Location`, `Content-Location`) leads, are shown without their secrets.
 - `--dry-run` prints what the run would download (size if known, and the path; `(named when downloaded)` where the server or yt-dlp names it), with folders, playlists, channels, feeds, metalinks and torrents expanded, a torrent's files one by one. Nothing is written, not even the download folder.
 - `--preview` lists the files in the remote ZIP the link names (size and name of each, then the total) without downloading it, with your `--header`s, `-u` and `--cookie` sent to the link's own host only, as `--spider` sends them: its end and its list of files are read with one or two range requests (at most 64 KiB, then at most 16 MiB), so the server must send parts of files. ZIP64 archives work, and names are read as UTF-8 or, without that flag, CP437.
+- `--list-tracks` reads each HLS or DASH link's manifest as its download would (your headers, cookies, sign-in and proxy) and prints whether it is live, its length, a line per track (id, kind, resolution, frame rate, language, codec, dynamic range, channels, bitrate, name, and `default`, e.g. `v2 video 1920x1080 29.97fps avc hdr10 8000 kbps`) and a line per part (id, length, what it holds, `(looks like an ad)`). Use the ids with `--tracks` and `--drop-parts`. For a channel list it prints each channel's name, group and link. With `--json`, one object per link: `status`, `url`, then `format` (`hls` or `dash`), `live`, `duration` (seconds), `tracks` and `parts`, or `channels` (`name`, `group`, `url`). A live media playlist lists no tracks: it is recorded as it is. A link that cannot be read exits with `1`.
 
 **Progress.** Each running download shows a bar with the engine's measured speed, the number of open connections and the ETA. If no data arrives for 5 seconds, the bar shows `STALLED`. Batches also show a total bar. When stderr is not a terminal (journald, cron, pipes), a plain progress line is printed every 10 seconds instead of the bars.
 
@@ -299,13 +313,29 @@ https://example.com/release.meta4
 | Code | Meaning |
 | :--- | :--- |
 | `0` | All downloads finished (or the file verified). |
-| `1` | At least one download, repair, `--spider` probe or `--preview` failed. |
-| `2` | Usage error, unreadable input, or the file failed `--verify`. |
+| `1` | At least one download, repair, `--spider` probe, `--preview` or `--list-tracks` failed. |
+| `2` | Usage error, unreadable input or config file, a `--start-at` time that has passed, or the file failed `--verify`. |
 | `130` / `143` | Stopped by Ctrl+C (SIGINT) / SIGTERM. |
 
 **Logging.** Warnings from the engine (a dropped mirror, a retried chunk, an ignored option) are printed to stderr. `-v` adds more detail. `RUST_LOG` (for example `RUST_LOG=hyperfetch_core=debug`) overrides the level. `--logfile FILE` appends everything printed (log lines, results, `--json` objects, not the progress bars) to FILE too, as it is printed, without colours.
 
 **Shell completions.** `--completions bash` (or `zsh`, `fish`, `powershell`, `elvish`) prints a completion script for the name the program was started by. For example `endos-downloader --completions bash > ~/.local/share/bash-completion/completions/endos-downloader`, or in PowerShell `.\Endos-Unified-Downloader-CLI.exe --completions powershell | Out-String | Invoke-Expression` (add it to `$PROFILE` to keep it).
+
+**Config file.** Options you always want go in `cli.conf` in the data folder (the one that holds the history, see [History](#history); read only when it is there), or in another file given with `--config FILE`; `--no-config` reads none. Each line holds options as on the command line, as many as you like, with "double quotes" around a value with spaces; lines starting with `#` are comments. The file may be UTF-8, with or without a BOM, or UTF-16 with a BOM.
+
+```text
+# cli.conf
+--split 8 --max-speed 20M
+--header "X-Api-Key: abc"
+--video 1080p --audio en --hls-mp4
+--ad-pattern /ads/
+```
+
+The command line wins: an option it gives (or one it gives that cannot go with the file's, such as `-6` over `-4`) leaves the file's out. The options that can be repeated (`--header`, `--ad-pattern`, `--channel`, `--sections`, `--bind-address`) add up, the file's first. A file with links or inputs, `--config`, `--no-config`, or an action that is not a download (`--history`, `--update`, `--verify`, `--repair`, `--doctor`, `--completions`), an unknown option or a bad value is refused with an error that names its line.
+
+**Start later.** `--start-at 02:00` waits until the clock next shows 2:00 (today, else tomorrow), `--start-at "2026-11-01 02:00"` until then (a time zone may follow, e.g. `+08:00`; a time that has passed is an error), saying when it will start; then the run goes as it would have. It needs URLs or `-i`. Ctrl+C while it waits ends the program without downloading.
+
+**Doctor.** `--doctor` prints what the program runs with, to check a setup or attach to a bug report: its version, the system and architecture, the data folder, the config file in use (or none), where yt-dlp, ffmpeg, ffprobe and gallery-dl are and the version each tells (each asked with a 10-second limit), the proxy variables of the environment (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`, any case; a sign-in in them shown as `***`) and the free space on the disk of the download folder (`-d`). It goes online for nothing, and exits with `0` even when a tool is missing. With `--json` it prints one object: `version`, `os`, `arch`, `data_folder`, `config`, `tools` (by name: `path`, `version`, `error`), `proxy`, `output_folder` and `free_space` (bytes).
 
 ### Examples
 
@@ -332,6 +362,19 @@ endos-downloader "https://www.youtube.com/watch?v=..." --media-preset 720p --coo
 # A video with its English subtitles; a live stream recorded from its start (Ctrl+C ends it)
 endos-downloader "https://www.youtube.com/watch?v=..." --subs en
 endos-downloader "https://www.youtube.com/watch?v=..." --live-from-start
+
+# An HLS or DASH stream: what it has, then 1080p HEVC with English and Japanese audio, ads left out
+endos-downloader --list-tracks "https://example.com/show/master.m3u8"
+endos-downloader "https://example.com/show/manifest.mpd" --video 1080p,hevc --audio en,ja --ad-pattern "/ads/" \
+    --name-pattern "{name} {height}p {codec}"
+
+# A live stream from 30 minutes ago until nothing new comes for a minute; a channel list's news channels for an hour
+endos-downloader "https://example.com/live/master.m3u8" --live-from 30m --live-idle-timeout 60
+endos-downloader ~/tv.m3u --channel "*news*" --record-seconds 3600 --name-pattern "{channel} {date} {time}"
+
+# What the program runs with; a queue started at 2:00 at night
+endos-downloader --doctor
+endos-downloader -i queue.txt -d /srv/downloads --start-at 02:00
 
 # Every file of a shared Google Drive folder, subfolders kept
 endos-downloader "https://drive.google.com/drive/folders/..." -d ~/Downloads
@@ -383,6 +426,8 @@ Windows (PowerShell):
 Get-Content .\links.txt | .\Endos-Unified-Downloader-CLI.exe -i - -d D:\Downloads
 .\Endos-Unified-Downloader-CLI.exe --history
 .\Endos-Unified-Downloader-CLI.exe --verify D:\Downloads\file.zip --repair
+.\Endos-Unified-Downloader-CLI.exe --doctor --json
+.\Endos-Unified-Downloader-CLI.exe https://example.com/show/master.m3u8 --tracks v1,a0,s0 -d D:\Videos
 ```
 
 ### Verify and repair

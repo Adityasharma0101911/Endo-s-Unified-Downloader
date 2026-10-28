@@ -1,5 +1,5 @@
 //! What a link's server says before anything is downloaded: --spider, -S (--server-response),
-//! --dry-run, --no-clobber and --preview.
+//! --dry-run, --no-clobber, --preview and --list-tracks.
 
 use std::path::{Path, PathBuf};
 
@@ -7,7 +7,9 @@ use futures_util::StreamExt;
 use hyperfetch_core::digest::published_checksum;
 use hyperfetch_core::engine::{build_client, file_name_from, request_header, DownloadOptions};
 use hyperfetch_core::history::{redact_text, redact_url};
+use hyperfetch_core::ingest::Channel;
 use hyperfetch_core::resolver::SmartResolver;
+use hyperfetch_core::{StreamFormat, StreamInfo};
 use hyperfetch_core::torrent::parse_torrent_bytes;
 use hyperfetch_core::zipdir::ZipEntry;
 use indicatif::HumanBytes;
@@ -370,9 +372,132 @@ pub fn zip_lines(entries: &[ZipEntry]) -> Vec<String> {
     lines
 }
 
+/// `seconds` as a clock shows a length: `1:02:03`, `2:03`.
+fn length(seconds: f64) -> String {
+    let s = seconds.max(0.0).round() as u64;
+    match s >= 3600 {
+        true => format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60),
+        false => format!("{}:{:02}", s / 60, s % 60),
+    }
+}
+
+/// --list-tracks' lines for a stream: what it is, then a line per track (see `Track::describe`)
+/// and per part (its id, length, what it holds, and whether it looks like an ad).
+pub fn track_lines(info: &StreamInfo) -> Vec<String> {
+    let format = match info.format {
+        StreamFormat::Hls => "HLS",
+        StreamFormat::Dash => "DASH",
+    };
+    let kind = match (info.live, info.duration) {
+        (true, _) => "live".to_string(),
+        (false, Some(duration)) => length(duration),
+        (false, None) => "on demand".to_string(),
+    };
+    let mut lines = vec![format!("  {}, {}", format, kind)];
+    match info.tracks.is_empty() {
+        true => lines.push("  Tracks: one, as the playlist has it (it lists none)".to_string()),
+        false => lines.push("  Tracks:".to_string()),
+    }
+    lines.extend(info.tracks.iter().map(|track| format!("    {}", track.describe())));
+    if !info.parts.is_empty() {
+        lines.push("  Parts:".to_string());
+    }
+    for part in &info.parts {
+        let ad = if part.ad { "  (looks like an ad)" } else { "" };
+        lines.push(format!("    {:<4} {:>9}  {}{}", part.id, length(part.duration), part.summary, ad));
+    }
+    lines
+}
+
+/// --list-tracks' --json item for a stream: its link without secrets, then `format`, `live`,
+/// `duration`, `tracks` and `parts` as the engine gives them.
+pub fn tracks_item(link: &str, info: &StreamInfo) -> Item {
+    let value = |value: serde_json::Result<serde_json::Value>| value.unwrap_or_default();
+    vec![
+        ("status", "ok".into()),
+        ("url", redact_url(link).into()),
+        ("format", value(serde_json::to_value(info.format))),
+        ("live", info.live.into()),
+        ("duration", info.duration.into()),
+        ("tracks", value(serde_json::to_value(&info.tracks))),
+        ("parts", value(serde_json::to_value(&info.parts))),
+    ]
+}
+
+/// A channel as a line: its name and, in brackets, its group.
+fn channel_name(channel: &Channel) -> String {
+    match &channel.group {
+        Some(group) => format!("{} [{}]", channel.name, group),
+        None => channel.name.clone(),
+    }
+}
+
+/// --list-tracks' lines for a channel list: each channel's name, group and link.
+pub fn channel_lines(channels: &[Channel]) -> Vec<String> {
+    let mut lines = vec![format!("  A list of {} channels (--channel NAME records one):", channels.len())];
+    lines.extend(channels.iter().map(|channel| format!("    {}  {}", channel_name(channel), channel.url)));
+    lines
+}
+
+/// --list-tracks' --json item for a channel list: its link, and each channel's name, group and
+/// link, the links without their secrets.
+pub fn channels_item(link: &str, channels: &[Channel]) -> Item {
+    let channels: Vec<serde_json::Value> = channels
+        .iter()
+        .map(|c| serde_json::json!({"name": c.name, "group": c.group, "url": redact_url(c.url.as_str())}))
+        .collect();
+    vec![("status", "ok".into()), ("url", redact_url(link).into()), ("channels", channels.into())]
+}
+
+/// Most channels [`choose_channels`] names.
+const CHANNELS_SHOWN: usize = 50;
+
+/// The error of a channel list given no --channel nor --all-items: its channels (the first
+/// [`CHANNELS_SHOWN`]), and how to choose among them.
+pub fn choose_channels(channels: &[Channel]) -> String {
+    let mut text = format!(
+        "a list of {} channels: choose which to record with --channel PATTERN (a name or group; * stands for any run of \
+         characters; repeat it for several), or record them all with --all-items",
+        channels.len()
+    );
+    for channel in channels.iter().take(CHANNELS_SHOWN) {
+        text.push_str(&format!("\n  {}", channel_name(channel)));
+    }
+    if channels.len() > CHANNELS_SHOWN {
+        text.push_str(&format!("\n  and {} more (--list-tracks lists them all)", channels.len() - CHANNELS_SHOWN));
+    }
+    text
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyperfetch_core::{Part, Track, TrackKind};
+
+    /// --list-tracks shows what a stream is, a line per track and per part (ads marked); a channel
+    /// list's error names its first channels and how to choose.
+    #[test]
+    fn stream_listings_show_tracks_parts_and_channels() {
+        let video = Track { id: "v0".into(), height: Some(1080), width: Some(1920), codecs: "avc1.640028".into(), bandwidth: Some(5_000_000), ..Default::default() };
+        let audio = Track { id: "a0".into(), kind: TrackKind::Audio, language: Some("en".into()), default: true, ..Default::default() };
+        let part = |id, duration, ad| Part { id, duration, summary: "1920x1080 avc".into(), ad };
+        let info = StreamInfo { format: StreamFormat::Dash, live: false, duration: Some(3723.4), tracks: vec![video, audio], parts: vec![part(0, 3693.0, false), part(1, 30.4, true)] };
+        let lines = track_lines(&info);
+        assert_eq!(lines[0], "  DASH, 1:02:03");
+        assert_eq!(lines[2], "    v0 video 1920x1080 avc 5000 kbps");
+        assert!(lines[3].starts_with("    a0 audio en") && lines[3].ends_with("default"), "{}", lines[3]);
+        assert_eq!(lines[4], "  Parts:");
+        assert_eq!(lines[6], "    1         0:30  1920x1080 avc  (looks like an ad)");
+        let live = StreamInfo { live: true, tracks: Vec::new(), parts: Vec::new(), ..info };
+        assert_eq!(track_lines(&live), ["  DASH, live", "  Tracks: one, as the playlist has it (it lists none)"]);
+
+        let channel = |n: usize| Channel { name: format!("Channel {n}"), group: None, url: url::Url::parse(&format!("https://tv.example/{n}.m3u8")).unwrap() };
+        let channels: Vec<Channel> = (0..60).map(channel).collect();
+        let text = choose_channels(&channels);
+        assert!(text.starts_with("a list of 60 channels") && text.contains("--channel PATTERN") && text.contains("--all-items"), "{text}");
+        assert!(text.contains("\n  Channel 49\n  and 10 more") && !text.contains("Channel 50"), "{text}");
+        assert_eq!(channel_lines(&channels[..1])[1], "    Channel 0  https://tv.example/0.m3u8");
+    }
 
     /// -S shows where a redirect leads without the signature or sign-in in the link.
     #[test]
