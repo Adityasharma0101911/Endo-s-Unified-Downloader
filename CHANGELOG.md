@@ -2,6 +2,10 @@
 
 What changed in each release, newest first. Each release's page on [GitHub](https://github.com/Adityasharma0101911/Endo-s-Unified-Downloader/releases) has its files and the full notes.
 
+## Unreleased
+
+- Subtitles in WebVTT, TTML/IMSC and inside MP4 segments (`stpp`, `wvtt`) are read into one timeline, joined across segments and written as SRT or WebVTT, for stream downloads to keep.
+
 ## 1.8.0 (2026-10-27)
 
 - **Installers and packages:** a Windows setup.exe (also for winget), Linux x64 and arm64 `.tar.gz`, `.deb` and `.rpm`, and a static Linux CLI; the Windows programs are code-signed when the project's signing is set up. `install.sh` installs the release for the machine's architecture.
