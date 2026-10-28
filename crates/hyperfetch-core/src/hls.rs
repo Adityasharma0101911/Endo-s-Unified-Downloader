@@ -750,7 +750,6 @@ pub(crate) async fn live_playlist(
         ended: text.lines().any(|l| l.trim() == "#EXT-X-ENDLIST"),
         refresh: target.unwrap_or(2.0),
         ext,
-        now,
     })
 }
 
@@ -3066,8 +3065,8 @@ video.m3u8
         assert_eq!(segments[0].url.path(), "/cdn/abc/v/seg0.ts");
     }
 
-    /// A listing of segments `secs` long starting at `dates`, read at `now`.
-    fn listing(dates: &[f64], secs: f64, now: f64) -> crate::stream::Listing {
+    /// A listing of segments `secs` long starting at `dates`.
+    fn listing(dates: &[f64], secs: f64) -> crate::stream::Listing {
         let segment = |n: usize| HlsSegment {
             index: n,
             sequence: n as u64,
@@ -3078,7 +3077,7 @@ video.m3u8
             init: None,
             discontinuity: false,
         };
-        crate::stream::Listing { segments: (0..dates.len()).map(segment).collect(), dates: dates.to_vec(), ended: false, refresh: secs, ext: "ts", now }
+        crate::stream::Listing { segments: (0..dates.len()).map(segment).collect(), dates: dates.to_vec(), ended: false, refresh: secs, ext: "ts" }
     }
 
     /// A live recording starts at the newest three segments, the oldest, or the time asked, which
@@ -3086,18 +3085,16 @@ video.m3u8
     /// nothing listed yet leaves it to the next read.
     #[test]
     fn test_a_live_recording_starts_where_asked_within_what_the_server_keeps() {
-        let lead = listing(&[100.0, 110.0, 120.0, 130.0, 140.0], 10.0, 150.0);
+        let lead = listing(&[100.0, 110.0, 120.0, 130.0, 140.0], 10.0);
         assert_eq!(start_from(&lead, LiveStart::Now), Ok(Some(120.0)));
         assert_eq!(start_from(&lead, LiveStart::Oldest), Ok(Some(f64::NEG_INFINITY)));
-        assert_eq!(start_from(&lead, LiveStart::Ago(35.0)), Ok(Some(115.0)));
+        assert_eq!(start_from(&lead, LiveStart::Ago(35.0)), Ok(Some(115.0)), "a time ago counts back from the newest segment's end");
         assert_eq!(start_from(&lead, LiveStart::Ago(2.0)), Ok(Some(140.0)));
-        let skewed = listing(&[100.0, 110.0, 120.0, 130.0, 140.0], 10.0, 1000.0);
-        assert_eq!(start_from(&skewed, LiveStart::Ago(35.0)), Ok(Some(115.0)), "a time ago counts back from the newest segment's end");
         assert_eq!(start_from(&lead, LiveStart::At(95.0)), Ok(Some(95.0)), "within a segment of the oldest");
         let gone = start_from(&lead, LiveStart::Ago(80.0)).unwrap_err();
         assert!(gone.contains("keeps only") && gone.contains("(1 min)") && gone.contains("is no longer there"), "{gone}");
         assert!(start_from(&lead, LiveStart::At(150.0)).unwrap_err().contains("is still to come"));
-        assert_eq!(start_from(&listing(&[], 10.0, 150.0), LiveStart::Now), Ok(None));
+        assert_eq!(start_from(&listing(&[], 10.0), LiveStart::Now), Ok(None));
     }
 
     /// A live recording ends once its disk has no more left than what it recorded and the margin,
