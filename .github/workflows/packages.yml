@@ -116,6 +116,17 @@ jobs:
           $ext = & $tar -tf "dist\Endos-Unified-Downloader-Extension-v$env:VERSION.zip"
           if (-not ($ext -match "^(\./)?manifest\.json$")) { throw "The extension's zip has no manifest.json at its root" }
           if ($ext -match "^(\./)?(test/|package\.json)") { throw "The extension's zip holds its tests" }
+          # The Chrome Web Store's copy of the extension, without YouTube as the store's rules ask (not a release file).
+          New-Item -ItemType Directory chrome-store | Out-Null
+          Copy-Item -Recurse extension chrome-store\extension
+          Remove-Item -Recurse chrome-store\extension	est, chrome-store\extension\package.json
+          node scripts/chrome-store.mjs chrome-store\extension
+          if ($LASTEXITCODE) { exit 1 }
+          & $tar -a -cf "chrome-store\Endos-Unified-Downloader-Chrome-Web-Store-v$env:VERSION.zip" -C chrome-store\extension .
+          if ($LASTEXITCODE) { exit 1 }
+          $store = & $tar -tf "chrome-store\Endos-Unified-Downloader-Chrome-Web-Store-v$env:VERSION.zip"
+          if (-not ($store -match "^(\./)?manifest\.json$")) { throw "The Chrome Web Store zip has no manifest.json at its root" }
+          if ($store -match "youtube\.js$") { throw "The Chrome Web Store zip has the YouTube button" }
           if ($env:SIGN -eq "true") {
             foreach ($file in Get-ChildItem dist\*.exe) {
               $status = (Get-AuthenticodeSignature $file.FullName).Status
@@ -142,6 +153,11 @@ jobs:
         with:
           name: winget
           path: winget/*
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v5
+        with:
+          name: chrome-web-store
+          path: chrome-store/*.zip
           if-no-files-found: error
 
   linux:
