@@ -57,7 +57,21 @@ const TYPE_FORMATS = {
   "audio/ogg": "ogg",
   "application/dash+xml": "mpd",
   "video/vnd.mpeg.dash.mpd": "mpd",
+  "application/vnd.ms-sstr+xml": "ism",
 };
+
+/**
+ * A Smooth Streaming manifest's path (`.ism/Manifest`, `.isml/manifest(format=...)`), any case; its name is group 1.
+ * Group 2 is "m3u8" or "mpd" when `(format=m3u8-aapl)` or `(format=mpd-time-csf)` makes it HLS or DASH. Anchored at a
+ * `/` so a long path costs linear time, not quadratic.
+ */
+const SMOOTH_MANIFEST = /\/([^/]*\.isml?)\/manifest(?=$|[(&])(?:\(format=(m3u8|mpd))?/i;
+
+/** The type of a Smooth Streaming server's HLS or DASH form (group 2 of SMOOTH_MANIFEST). */
+const SMOOTH_TYPES = { m3u8: "application/vnd.apple.mpegurl", mpd: "application/dash+xml" };
+
+/** A Smooth Streaming fragment's path: a segment, never an item. */
+const SMOOTH_FRAGMENT = /\.isml?\/QualityLevels\(/i;
 
 /** Extensions that make a file a media item whatever its content type (octet-stream, text/plain, application/mp4…). */
 const EXTENSION_FORMATS = ["m3u8", "m3u", "mpd", "mp4", "webm", "avi", "ogg", "flv", "mkv", "3gp", "mp3"];
@@ -113,12 +127,14 @@ function rangeTotal(header) {
 }
 
 /**
- * Decides whether a response is a video/audio file, an HLS playlist or a DASH manifest worth listing: the content
- * type (lower-cased, parameters stripped) names the format; octet-stream, text/plain,
- * application/mp4… count by the file name's extension; any other video/* or audio/* type is a file named by its
- * subtype; a "media" request with an octet-stream type and no media extension is taken for an mp4. With no content
- * type, a "media" request for .mp4/.webm or an XHR for .m3u8/.mpd still counts. The file name is the
- * Content-Disposition one, else the URL's last path segment. Segments (.ts, .m4s, MPEG-TS types) never count.
+ * Decides whether a response is a video/audio file, an HLS playlist, a DASH or a Smooth Streaming manifest worth
+ * listing: the content type (lower-cased, parameters stripped) names the format; octet-stream, text/plain,
+ * application/mp4… count by the file name's extension (a Smooth Streaming manifest by its `.ism/Manifest` path); any
+ * other video/* or audio/* type is a file named by its subtype; a "media" request with an octet-stream type and no
+ * media extension is taken for an mp4. With no content type, a "media" request for .mp4/.webm or an XHR for
+ * .m3u8/.mpd/.ism/Manifest still counts. The file name is the Content-Disposition one, else the URL's last path
+ * segment (a Smooth Streaming manifest's, its `.ism` one). Segments (.ts, .m4s, Smooth Streaming fragments, MPEG-TS
+ * types) never count.
  */
 export function classifyResponse({ url, type, contentType, contentDisposition, contentLength, contentRange } = {}) {
   let parsed;
@@ -128,7 +144,8 @@ export function classifyResponse({ url, type, contentType, contentDisposition, c
     return null;
   }
   const { fileName, ext } = nameAndExt(parsed, contentDisposition);
-  if (SEGMENT_EXTENSIONS.has(ext)) return null;
+  if (SEGMENT_EXTENSIONS.has(ext) || SMOOTH_FRAGMENT.test(parsed.pathname)) return null;
+  const smooth = SMOOTH_MANIFEST.exec(parsed.pathname);
 
   let mime = mimeOf(contentType);
   if (!mime) {
@@ -137,12 +154,14 @@ export function classifyResponse({ url, type, contentType, contentDisposition, c
     else if (type === "media" && path.endsWith(".webm")) mime = "video/webm";
     else if (type === "xmlhttprequest" && path.endsWith(".m3u8")) mime = "application/vnd.apple.mpegurl";
     else if (type === "xmlhttprequest" && path.endsWith(".mpd")) mime = "application/dash+xml";
+    else if (type === "xmlhttprequest" && smooth) mime = SMOOTH_TYPES[smooth[2]?.toLowerCase()] ?? "application/vnd.ms-sstr+xml";
     else return null;
   }
 
   let format = null;
   if (mime === "text/plain" && fileName.includes("master.txt")) format = "m3u8";
   else if (TYPE_FORMATS[mime]) format = TYPE_FORMATS[mime];
+  else if (smooth && !/^(video|audio)\//.test(mime)) format = smooth[2]?.toLowerCase() || "ism";
   else if (EXTENSION_FORMATS.includes(ext)) format = ext;
   else if (/^(video|audio)\/./.test(mime) && !/mp2t|segment/.test(mime)) {
     const subtype = mime.slice(mime.indexOf("/") + 1).replace(/^x-/, "");
@@ -153,8 +172,8 @@ export function classifyResponse({ url, type, contentType, contentDisposition, c
   const length = Number.parseInt(String(contentLength ?? ""), 10);
   return {
     format,
-    kind: format === "m3u8" || format === "m3u" ? "hls" : format === "mpd" ? "dash" : "file",
-    name: fileName || `video.${format}`,
+    kind: format === "m3u8" || format === "m3u" ? "hls" : format === "mpd" ? "dash" : format === "ism" ? "smooth" : "file",
+    name: (smooth && ["ism", "m3u8", "mpd"].includes(format) && lastPathSegment(smooth[1])) || fileName || `video.${format}`,
     size: rangeTotal(contentRange) || (length > 0 ? length : 0),
   };
 }
@@ -179,8 +198,9 @@ export function rangedVideoCandidate({ url, type, contentType, contentDispositio
 }
 
 /**
- * The format a URL found in page data names: "m3u8" or "mpd" when its path (else its query) holds that extension,
- * else null. Only http(s) URLs count.
+ * The format a URL found in page data names: "m3u8" or "mpd" when its path (else its query) holds that extension or a
+ * `.ism/Manifest(format=m3u8...)` or `(format=mpd...)`, "ism" when it holds another Smooth Streaming `.ism/Manifest`, else
+ * null. Only http(s) URLs count.
  */
 export function mediaUrlFormat(url) {
   if (typeof url !== "string" || !/^https?:\/\//i.test(url)) return null;
@@ -191,15 +211,17 @@ export function mediaUrlFormat(url) {
     return null;
   }
   for (const part of [parsed.pathname, parsed.search]) {
+    const smooth = SMOOTH_MANIFEST.exec(part);
+    if (smooth) return smooth[2]?.toLowerCase() || "ism";
     const match = /\.(m3u8|mpd)\b/i.exec(part);
     if (match) return match[1].toLowerCase();
   }
   return null;
 }
 
-/** HLS and DASH always pass (their size is unknown); a file needs a known size inside the min/max KB bounds (0 = none). */
+/** Streams always pass (their size is unknown); a file needs a known size inside the min/max KB bounds (0 = none). */
 export function passesSizeFilter(item, { minSizeKB = 0, maxSizeKB = 0 } = {}) {
-  if (item.kind === "hls" || item.kind === "dash") return true;
+  if (item.kind === "hls" || item.kind === "dash" || item.kind === "smooth") return true;
   const size = Number(item.size) || 0;
   const min = (Number(minSizeKB) || 0) * 1024;
   const max = (Number(maxSizeKB) || 0) * 1024;
@@ -404,10 +426,10 @@ export function sanitizeFilename(name) {
   return short || "video";
 }
 
-/** "<clean title>.<ext>"; HLS and DASH downloads are saved as mp4. */
+/** "<clean title>.<ext>"; stream downloads (HLS, DASH, Smooth Streaming) are saved as mp4. */
 export function suggestFilename(title, ext) {
   let extension = String(ext ?? "").replace(/^\./, "").toLowerCase();
-  if (!extension || ["hls", "m3u8", "m3u", "dash", "mpd"].includes(extension)) extension = "mp4";
+  if (!extension || ["hls", "m3u8", "m3u", "dash", "mpd", "smooth", "ism"].includes(extension)) extension = "mp4";
   return `${sanitizeFilename(title)}.${extension}`;
 }
 

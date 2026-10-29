@@ -32,6 +32,22 @@ pub mod ftp;
 pub mod digest;
 pub mod zipdir;
 pub mod sniff;
+pub mod stream;
+pub mod dash;
+pub mod dash_spec;
+pub mod subs;
+pub mod stream_spec;
+pub mod stream_filter;
+pub mod custom_range;
+pub mod mss;
+pub mod iptv;
+pub mod decrypt;
+pub mod concat_server;
+pub mod save_pattern;
+pub mod subtitle_fix;
+pub mod muxer;
+pub mod config_file;
+pub mod doctor;
 
 pub use range::{ByteRange, RangeError};
 pub use chunk::{Chunk, ChunkManager, ChunkStatus, ChunkError};
@@ -44,6 +60,10 @@ pub use engine::{
 };
 pub use resolver::SmartResolver;
 pub use hls::{HlsEngine, HlsSegment, HlsError, parse_hls_playlist};
+pub use stream::{
+    choose as choose_tracks, list_tracks, AudioSpec, DynamicRange, Format as StreamFormat, Kind as TrackKind, LiveStart, Part, Role as TrackRole,
+    StreamInfo, Track, TrackChoice, VideoSpec, check_name_pattern, check_pattern, choose_subtitles, parse_part_ids, pattern_matches, NAME_VARIABLES,
+};
 pub use metalink::{parse_metalink, MetalinkFile};
 pub use torrent::{parse_magnet_uri, parse_torrent_bytes, is_magnet_uri, MagnetInfo, TorrentInfo};
 pub use queue::{DownloadQueue, QueueItem, QueueItemStatus};
@@ -55,3 +75,19 @@ pub use history::{DownloadHistoryManager, HistoryEntry, HistoryStatus};
 pub use verify::{BuildVerificationResult, verify_build_file, repair_missing_ranges};
 pub use hosts::{HostKey, HostProfile};
 
+pub use stream_spec::{StreamSpec, MediaSegment, MediaType, DrmKeyInfo};
+pub use stream_filter::{StreamFilter, ForTarget, filter_keep, filter_drop, auto_select};
+pub use custom_range::CustomRange;
+pub use dash_spec::parse_dash_manifest;
+pub use mss::parse_mss_manifest;
+pub use iptv::{is_iptv_playlist, parse_iptv_playlist};
+pub use decrypt::{DecryptionConfig, DecryptEngine, CustomHlsMethod, CustomHlsScope, DrmKeyPair};
+pub use concat_server::ConcatInputServer;
+pub use save_pattern::render_save_pattern;
+pub use subtitle_fix::{fix_and_convert_subtitles, SubtitleFormat};
+pub use muxer::{
+    binary_concat_files, ffmpeg_merge_segments, mux_tracks, FFmpegConcatMode, MuxAfterDoneOptions,
+    MuxContainerFormat, MuxImportTrack, MuxerTool, TrackToMux,
+};
+pub use config_file::{default_config_path, parse_config_file};
+pub use doctor::{DoctorReport, ToolStatus};

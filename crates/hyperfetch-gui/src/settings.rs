@@ -6,6 +6,7 @@ use hyperfetch_core::history::DownloadHistoryManager;
 use hyperfetch_core::ingest::ListOptions;
 use hyperfetch_core::media::{is_supported_media_site, BrowserCookieSource, MediaQualityPreset};
 use hyperfetch_core::postprocess::{Category, PostOptions};
+use hyperfetch_core::{check_name_pattern, check_pattern, AudioSpec, TrackChoice};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -22,6 +23,12 @@ pub const SPONSORBLOCK_MODES: [&str; 3] = ["Off", "Remove them", "Mark as chapte
 
 /// The containers `Settings::merge_format` merges video and audio into.
 pub const MERGE_FORMATS: [&str; 3] = ["MP4", "MKV", "WebM"];
+
+/// The choices of `Settings::stream_height`, `stream_codec` and `stream_range`: what each shows,
+/// and its term in the video spec (see `hyperfetch_core::VideoSpec`).
+pub const VIDEO_HEIGHTS: [(&str, &str); 6] = [("Best", ""), ("2160p", "2160p"), ("1440p", "1440p"), ("1080p", "1080p"), ("720p", "720p"), ("480p", "480p")];
+pub const VIDEO_CODECS: [(&str, &str); 5] = [("Any codec", ""), ("AVC (H.264)", "avc"), ("HEVC (H.265)", "hevc"), ("AV1", "av1"), ("VP9", "vp9")];
+pub const VIDEO_RANGES: [(&str, &str); 4] = [("SDR or HDR", ""), ("SDR", "sdr"), ("HDR", "hdr"), ("Dolby Vision", "dv")];
 
 pub const BROWSERS: [&str; 7] = [
     "None",
@@ -166,6 +173,23 @@ pub struct Settings {
     /// Downloads the schedule paused at its stop time, which its start resumes, also after a
     /// restart in between (see `App::run_schedule`).
     pub schedule_paused: Vec<usize>,
+    /// The video an HLS or DASH download takes: the best at most this tall, in this codec and
+    /// dynamic range (see [`VIDEO_HEIGHTS`], [`VIDEO_CODECS`], [`VIDEO_RANGES`]; 0 = any).
+    pub stream_height: usize,
+    pub stream_codec: usize,
+    pub stream_range: usize,
+    /// The audio spec of an HLS or DASH download (`en, ja`; empty: the default track's language).
+    pub audio_languages: String,
+    /// Patterns of segment links left out of streams, comma-separated (see
+    /// `DownloadOptions::ad_patterns`).
+    pub ad_patterns: String,
+    /// Seconds without a new segment that end a live recording (0 = never).
+    pub live_idle_timeout: u64,
+    /// Minutes after which a live recording ends (0 = no limit).
+    pub record_minutes: u64,
+    /// How an HLS, DASH or channel download is named (empty: as it would be; see
+    /// `DownloadOptions::name_pattern`).
+    pub name_pattern: String,
 }
 
 /// When the queue runs by itself (see `desktop::schedule_due`): at `start` on the ticked days it
@@ -251,6 +275,14 @@ impl Default for Settings {
             ip_family: engine.ip_family,
             connect_timeout_secs: engine.connect_timeout_secs,
             schedule_paused: Vec::new(),
+            stream_height: 0,
+            stream_codec: 0,
+            stream_range: 0,
+            audio_languages: String::new(),
+            ad_patterns: String::new(),
+            live_idle_timeout: 0,
+            record_minutes: 0,
+            name_pattern: String::new(),
         }
     }
 }
@@ -376,8 +408,26 @@ impl Settings {
                 // Never saved with the queue: see `fill_keys`.
                 virustotal_key: None,
             },
+            // What the Streams section shows as refused is left out.
+            tracks: TrackChoice {
+                video: self.video_spec(),
+                audio: Some(self.audio_languages.trim()).filter(|audio| AudioSpec::parse(audio).is_ok()).unwrap_or_default().to_string(),
+                ids: Vec::new(),
+            },
+            ad_patterns: self.ad_patterns.split(',').map(str::trim).filter(|p| check_pattern(p).is_ok()).map(str::to_string).collect(),
+            live_idle_timeout: Some(self.live_idle_timeout).filter(|&secs| secs > 0),
+            record_seconds: Some(self.record_minutes.saturating_mul(60)).filter(|&secs| secs > 0),
+            name_pattern: non_empty(&self.name_pattern).filter(|pattern| check_name_pattern(pattern).is_ok()),
             ..self.tuning()
         })
+    }
+
+    /// The video spec of [`Settings::stream_height`], `stream_codec` and `stream_range`
+    /// (`1080p,hevc`; empty: the best).
+    pub fn video_spec(&self) -> String {
+        let terms = [(&VIDEO_HEIGHTS[..], self.stream_height), (&VIDEO_CODECS[..], self.stream_codec), (&VIDEO_RANGES[..], self.stream_range)];
+        let terms: Vec<&str> = terms.iter().filter_map(|(choices, at)| choices.get(*at).map(|(_, term)| *term).filter(|t| !t.is_empty())).collect();
+        terms.join(",")
     }
 
     /// Puts the keys a queued download is never saved with (debrid, VirusTotal) into its
@@ -423,6 +473,7 @@ impl Settings {
             debrid_magnets: self.debrid_magnets,
             password: None,
             auth: None,
+            channels: Vec::new(),
         }
     }
 
@@ -813,6 +864,40 @@ mod tests {
         let json = serde_json::to_string(&chosen).unwrap();
         assert!(!json.contains("insecure"));
         assert_eq!(serde_json::from_str::<Settings>(&json).unwrap(), chosen);
+    }
+
+    /// The Streams settings take the command line's defaults, also from a file an older version
+    /// saved (the best video and the default audio, no ad patterns, idle or time limit, the usual
+    /// names); what is chosen reaches the engine and is kept, but a spec, pattern or name the
+    /// page shows as refused is left out.
+    #[test]
+    fn stream_settings_take_the_defaults_and_reach_the_engine() {
+        let saved: Settings = serde_json::from_str(r#"{"save_dir": "dl", "subtitles": "en"}"#).unwrap();
+        let file = [Url::parse("https://example.com/v/master.m3u8").unwrap()];
+        let opts = saved.download_options(&file, "", "").unwrap();
+        assert_eq!((opts.tracks, opts.ad_patterns.len()), (TrackChoice::default(), 0));
+        assert_eq!((opts.live_idle_timeout, opts.record_seconds, opts.name_pattern), (None, None, None));
+        assert_eq!(opts.subtitles.as_deref(), Some("en"), "the subtitle languages are the streams' too");
+
+        let chosen = Settings {
+            stream_height: 3,
+            stream_codec: 2,
+            stream_range: 1,
+            audio_languages: " en, ja ".into(),
+            ad_patterns: "ad*.ts, ,/ads/".into(),
+            live_idle_timeout: 30,
+            record_minutes: 90,
+            name_pattern: "{name} {height}p".into(),
+            ..saved
+        };
+        let opts = chosen.download_options(&file, "", "").unwrap();
+        assert_eq!((opts.tracks.video.as_str(), opts.tracks.audio.as_str()), ("1080p,hevc,sdr", "en, ja"));
+        assert_eq!(opts.ad_patterns, ["ad*.ts", "/ads/"]);
+        assert_eq!((opts.live_idle_timeout, opts.record_seconds, opts.name_pattern.as_deref()), (Some(30), Some(5400), Some("{name} {height}p")));
+        assert_eq!(serde_json::from_str::<Settings>(&serde_json::to_string(&chosen).unwrap()).unwrap(), chosen);
+
+        let refused = Settings { audio_languages: "english!".into(), name_pattern: "{title}".into(), ..chosen }.download_options(&file, "", "").unwrap();
+        assert_eq!((refused.tracks.audio.as_str(), refused.name_pattern), ("", None));
     }
 
     /// The desktop settings start off, also in settings an older version saved, and keep what

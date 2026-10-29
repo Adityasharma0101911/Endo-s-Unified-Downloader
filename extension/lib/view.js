@@ -14,7 +14,7 @@ const masterOf = (item) => (item.hls?.kind === "master" && Array.isArray(item.hl
 /** A media item's chips as [text, tone]: its kind, then what sets it apart; tone is a palette colour or "". */
 export function itemChips(item) {
   const hls = hlsOf(item);
-  const stream = item.kind === "hls" || item.kind === "dash";
+  const stream = item.kind === "hls" || item.kind === "dash" || item.kind === "smooth";
   const chips = [[stream ? item.kind.toUpperCase() : String(item.format || "file").toUpperCase(), stream ? "accent" : "cyan"]];
   if (item.inline) chips.push(["Inline", ""]);
   if (hls?.live) chips.push(["LIVE", "red"]);
@@ -40,6 +40,7 @@ export function itemNote(item) {
   if (hls?.drm) return "DRM-protected (SAMPLE-AES or a key system): it can't be downloaded.";
   if (masterOf(item)?.separateAudio) return "Separate audio: the downloader merges it with the chosen quality.";
   if (item.kind === "dash") return "DASH stream: the downloader fetches it and merges the audio.";
+  if (item.kind === "smooth") return "Smooth Streaming: the downloader hands it to its media engine.";
   if (hls?.live) return "Live stream: the downloader records it as it plays.";
   return "";
 }

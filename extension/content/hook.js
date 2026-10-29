@@ -1,7 +1,8 @@
 // Endo's Unified Downloader: runs in the page's own JavaScript world (MAIN), in every frame,
-// before any of the page's scripts. It finds HLS playlists, DASH manifests and JSON naming either
-// among the responses the page itself reads and, only after the user chose "Capture from start"
-// for the tab, copies the media bytes the page's player hands to Media Source Extensions.
+// before any of the page's scripts. It finds HLS playlists, DASH and Smooth Streaming manifests and
+// JSON naming them among the responses the page itself reads and, only after the user chose
+// "Capture from start" for the tab, copies the media bytes the page's player hands to Media
+// Source Extensions.
 // Everything goes to bridge.js over a private MessageChannel. It must stay cheap and invisible:
 // patched methods return exactly what the originals return, and nothing here may throw into the
 // page.
@@ -18,7 +19,7 @@
   const MAX_VALUES = 20000;
   /** Longest link reported (the bridge's limit). */
   const MAX_URL = 32 * 1024;
-  /** Characters at the start of a body that tell a DASH manifest. */
+  /** Characters at the start of a body that tell a DASH or Smooth Streaming manifest. */
   const HEAD = 4096;
   /** Bytes held for bridge.js until its port arrives. */
   const HOLD_LIMIT = 64 * 1024 * 1024;
@@ -28,11 +29,11 @@
   /** sessionStorage key bridge.js sets so "Capture from start" survives the reload. */
   const ARM_KEY = "__endo_rec_armed";
   const PLAYLIST = /^\s*#EXTM3U/;
-  const MANIFEST = /^\s*<(?:\?xml|MPD)/;
+  const MANIFEST = /^\s*<(?:\?xml|MPD|SmoothStreamingMedia)/;
   const JSON_TEXT = /^\s*[[{]/;
   /** A JSON body is parsed only when it holds one of these. */
-  const JSON_HINT = /#EXTM3U|\.m3u8|\.mpd/i;
-  const STREAM_LINK = /^https?:\/\/\S*\.(?:m3u8|mpd)/i;
+  const JSON_HINT = /#EXTM3U|\.m3u8|\.mpd|\.isml?\/manifest/i;
+  const STREAM_LINK = /^https?:\/\/\S*(?:\.m3u8|\.mpd|\.isml?\/manifest)/i;
   /** A master playlist, or a media playlist that is not live. */
   const FINISHED = /#EXT-X-STREAM-INF|#EXT-X-ENDLIST|#EXT-X-PLAYLIST-TYPE:VOD/;
 
@@ -133,7 +134,7 @@
 
   // ---- Streams the page reads ----
 
-  /** Reported already: playlist URLs (the text, for inline playlists), "mpd:" and "link:" URLs. */
+  /** Reported already: playlist URLs (the text, for inline playlists), "mpd:", "ism:" and "link:" URLs. */
   const reported = new Set();
 
   function once(key, msg) {
@@ -186,9 +187,9 @@
   }
 
   /**
-   * Reports what a body the page read (text, or an ArrayBuffer) holds: an HLS playlist, a DASH
-   * manifest, or JSON naming either. Never throws: it runs inside the page's own event listeners
-   * and promise chains.
+   * Reports what a body the page read (text, or an ArrayBuffer) holds: an HLS playlist, a DASH or
+   * Smooth Streaming manifest, or JSON naming one. Never throws: it runs inside the page's own
+   * event listeners and promise chains.
    */
   function inspect(url, body) {
     try {
@@ -209,6 +210,7 @@
       if (PLAYLIST.test(text)) reportPlaylist(url, text, inline);
       else if (inline) return;
       else if (MANIFEST.test(text) && text.slice(0, HEAD).includes("<MPD")) once("mpd:" + url, { t: "mpd", url });
+      else if (MANIFEST.test(text) && text.slice(0, HEAD).includes("<SmoothStreamingMedia")) once("ism:" + url, { t: "ism", url });
       // JSON is parsed only when it names a stream, so most API responses cost one regex test.
       else if (text.length <= MAX_JSON && JSON_TEXT.test(text) && JSON_HINT.test(text)) scanJson(url, parseJson(text));
     } catch {}
