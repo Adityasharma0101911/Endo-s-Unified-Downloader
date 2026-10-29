@@ -1,7 +1,7 @@
 // Pure helpers of the media card (popup), the YouTube button and the context menu: which pages are media pages,
 // clip times, the qualities /info's answer allows and the `media` choice POST /add takes. No chrome.* in here, so
 // node can test it.
-import { formatDuration, isMediaSiteHost } from "./detect.js";
+import { formatDuration, isMediaSiteHost, isOffLimits } from "./detect.js";
 
 /** The qualities /add's `media` takes (crates/hyperfetch-gui/src/ipc.rs QUALITIES). */
 export const QUALITIES = ["best", "2160", "1440", "1080", "720", "480", "360", "audio-m4a", "audio-mp3"];
@@ -22,7 +22,7 @@ export function isMediaPage(url) {
     return false;
   }
   const host = u.hostname.toLowerCase();
-  if (!/^https?:$/.test(u.protocol) || !isMediaSiteHost(host)) return false;
+  if (!/^https?:$/.test(u.protocol) || !isMediaSiteHost(host) || isOffLimits(host)) return false;
   if (host === "youtu.be") return u.pathname.length > 1;
   if (/(^|\.)youtube\.com$/.test(host)) {
     const path = u.pathname;

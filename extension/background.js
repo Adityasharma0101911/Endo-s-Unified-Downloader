@@ -12,10 +12,12 @@ import {
   isAdHost,
   isBlocked,
   isMediaSiteHost,
+  isOffLimits,
   mediaUrlFormat,
   newerVersion,
   parseM3u8,
   passesSizeFilter,
+  NO_YOUTUBE,
   rangedVideoCandidate,
   sanitizeFilename,
   splitRequestHeaders,
@@ -76,6 +78,9 @@ function isHttpUrl(value) {
     return false;
   }
 }
+
+/** Why a YouTube link is refused in the Chrome Web Store build (see lib/detect.js NO_YOUTUBE). */
+const OFF_LIMITS = "This version of the extension doesn't work on YouTube.";
 
 function hostOf(url) {
   try {
@@ -580,6 +585,7 @@ async function startApp() {
  */
 async function sendToApp({ url, tabId, cookies, cookieJar, userAgent, referer, headers, filename, hls, dash, mp4, height, playlist, media }) {
   if (!isHttpUrl(url)) return { ok: false, error: "Only http(s) links can be downloaded." };
+  if (isOffLimits(hostOf(url))) return { ok: false, error: OFF_LIMITS };
   const body = { url };
   // The app only takes a link for a playlist by its URL; one served from /api/… must be named one.
   if (hls) body.hls = true;
@@ -701,7 +707,7 @@ async function injectIntoOpenTabs() {
     const target = { tabId: tab.id, allFrames: true };
     chrome.scripting.executeScript({ target, files: ["content/hook.js"], world: "MAIN", injectImmediately: true }).catch(() => {});
     chrome.scripting.executeScript({ target, files: ["content/bridge.js"], injectImmediately: true }).catch(() => {});
-    if (/^https:\/\/(www|m)\.youtube\.com\//.test(tab.url || "")) {
+    if (!NO_YOUTUBE && /^https:\/\/(www|m)\.youtube\.com\//.test(tab.url || "")) {
       chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["content/youtube.js"] }).catch(() => {});
     }
   }
@@ -1139,6 +1145,8 @@ const POPUP_COMMANDS = {
    */
   async SEND_LINKS({ tabId, urls }) {
     if (!validTabId(tabId) || !Array.isArray(urls) || urls.length === 0 || !urls.every(isHttpUrl)) return { ok: false, error: "bad request" };
+    urls = urls.filter((url) => !isOffLimits(hostOf(url)));
+    if (urls.length === 0) return { ok: false, error: OFF_LIMITS };
     if (urls.length > MAX_BATCH) return { ok: false, error: `Send at most ${MAX_BATCH} links at once.` };
     const tab = await chrome.tabs.get(tabId).catch(() => null);
     const body = { urls, user_agent: navigator.userAgent, cookies_by_origin: await cookiesByOrigin(urls, tabId) };

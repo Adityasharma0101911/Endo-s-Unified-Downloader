@@ -46,6 +46,7 @@ The app updates itself from this repo's GitHub releases and installs only what `
 4. `node scripts/sign-release.mjs <folder> --version X.Y.Z` writes `SHA256SUMS` and `SHA256SUMS.sig` over every file in the folder (it refuses a key that is not the one the app trusts).
 5. `gh release create vX.Y.Z <folder>/*` with all twenty files. Signing stays on this PC: the key never goes to GitHub Actions.
 6. winget, once the release is public: `gh run download <run id> -n winget -D <another folder>` gives this version's three manifests (`Adityasharma0101911.EndosUnifiedDownloader`, pointing at the release's setup.exe). Submitting them to winget (`wingetcreate submit <that folder>`, or a pull request to microsoft/winget-pkgs under `manifests/a/Adityasharma0101911/EndosUnifiedDownloader/X.Y.Z/`) is the maintainer's own step: an agent never submits anything to winget.
+7. Chrome Web Store, once the release is public: `gh run download <run id> -n chrome-web-store -D <another folder>` gives `Endos-Unified-Downloader-Chrome-Web-Store-vX.Y.Z.zip`, the extension without YouTube (the store's rules ban downloading from it; `scripts/chrome-store.mjs` makes it). Uploading it on the store's developer dashboard is the maintainer's own step, like winget.
 
 Never commit the key or put it in the repo, and keep a backup of it offline: a lost key means users must download the next release by hand (a new key needs a new `PUBLIC_KEY`). `node scripts/sign-release.mjs --keygen` makes one only when none exists.
 

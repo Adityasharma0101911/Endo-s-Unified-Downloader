@@ -25,9 +25,20 @@ export function isMediaSiteHost(hostname) {
   return MEDIA_SITE_HOSTS.some((site) => host === site || host.endsWith("." + site));
 }
 
-/** True when `host` is one of `hosts` or a subdomain of one. */
+/**
+ * False here; scripts/chrome-store.mjs sets it in the Chrome Web Store build, whose rules ban downloading from
+ * YouTube. There the extension leaves YouTube alone: no button, media card, sniffed stream, recording or sent link.
+ */
+export const NO_YOUTUBE = false;
+
+/** True when `host` is YouTube's and this is the Chrome Web Store build (see NO_YOUTUBE). */
+export function isOffLimits(host) {
+  return NO_YOUTUBE && /(^|\.)(youtube\.com|youtu\.be|youtube-nocookie\.com|googlevideo\.com)$/.test(String(host || "").toLowerCase());
+}
+
+/** True when `host` is one of `hosts` or a subdomain of one, or off limits (see isOffLimits). */
 export function isBlocked(host, hosts) {
-  return hosts.some((blocked) => host === blocked || host.endsWith("." + blocked));
+  return isOffLimits(host) || hosts.some((blocked) => host === blocked || host.endsWith("." + blocked));
 }
 
 /** A lower-cased host name, or "" when `value` is not one. */

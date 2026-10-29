@@ -1,7 +1,7 @@
 // Popup: shows what the background found on the active tab and hands it to the desktop app.
 // Everything shown comes from web pages, so it is only ever put into the DOM as text.
 import { parseSites, parseTypes } from "./lib/capture.js";
-import { formatDuration, isMediaSiteHost, sanitizeFilename, suggestFilename } from "./lib/detect.js";
+import { NO_YOUTUBE, formatDuration, isMediaSiteHost, isOffLimits, sanitizeFilename, suggestFilename } from "./lib/detect.js";
 import { LINK_KINDS, MAX_BATCH, largestSrcset, linkFilter, normalizeLinks, textMatcher } from "./lib/links.js";
 import { isMediaPage, mediaPayload, pickQuality, rememberedChoice, subtitleChoices, videoChoices } from "./lib/media.js";
 import { itemChips, itemMeta, itemNote, linkName, recordingView, variantLabel } from "./lib/view.js";
@@ -836,6 +836,7 @@ function renderSettings(s) {
   $("convert-mp4").checked = s.convertToMp4 !== false;
   $("media-cookies").checked = s.mediaCookies === true;
   $("youtube-button").checked = s.youtubeButton !== false;
+  $("youtube-button").closest(".setting").hidden = NO_YOUTUBE;
   $("capture").checked = s.captureEnabled === true;
   const typed = { "capture-types": s.captureTypes?.join(" "), "capture-min": s.captureMinMB, "capture-sites": s.captureExcludedSites?.join(" ") };
   for (const [id, value] of Object.entries(typed)) {
@@ -913,8 +914,11 @@ async function init() {
   // Test hook: popup.html?tab=<id> acts on that tab instead of the active one.
   const forced = Number(new URLSearchParams(location.search).get("tab"));
   [tab] = forced > 0 ? [await chrome.tabs.get(forced).catch(() => null)] : await chrome.tabs.query({ active: true, currentWindow: true });
-  httpTab = /^https?:\/\//i.test(tab?.url || "");
+  // The Chrome Web Store build leaves YouTube alone (lib/detect.js NO_YOUTUBE): there it is like a browser page.
+  const offLimits = isOffLimits(hostOf(tab?.url || ""));
+  httpTab = /^https?:\/\//i.test(tab?.url || "") && !offLimits;
   $("unsupported").hidden = httpTab;
+  if (offLimits) $("unsupported").querySelector("p").textContent = "This version of the extension doesn't work on YouTube.";
   // Off a web page only Settings has anything to show.
   for (const view of ["media", "links", "record"]) $(`tab-${view}`).disabled = !httpTab;
   $("about-ext").textContent = `v${chrome.runtime.getManifest().version}`;
