@@ -385,6 +385,222 @@ pub struct Args {
     /// Print a completion script for this shell, then exit
     #[arg(long = "completions", value_name = "SHELL", value_enum)]
     pub completions: Option<clap_complete::Shell>,
+
+    /// Subcommand (concat, merge, mux, doctor)
+    #[command(subcommand)]
+    pub command: Option<SubCommand>,
+
+    /// Read a configuration file instead of the user default
+    #[arg(long = "config", value_name = "FILE")]
+    pub config: Option<PathBuf>,
+
+    /// Disable configuration loading
+    #[arg(long = "no-config")]
+    pub no_config: bool,
+
+    /// Select video streams by regular expressions (e.g. res=^1920x:for=best)
+    #[arg(long = "select-video", value_name = "OPTIONS")]
+    pub select_video: Option<String>,
+
+    /// Select audio streams by regular expressions (e.g. lang=en:for=best)
+    #[arg(long = "select-audio", value_name = "OPTIONS")]
+    pub select_audio: Option<String>,
+
+    /// Select subtitle streams by regular expressions (e.g. lang=en:for=all)
+    #[arg(long = "select-subtitle", value_name = "OPTIONS")]
+    pub select_subtitle: Option<String>,
+
+    /// Drop video streams by regular expressions
+    #[arg(long = "drop-video", value_name = "OPTIONS")]
+    pub drop_video: Option<String>,
+
+    /// Drop audio streams by regular expressions
+    #[arg(long = "drop-audio", value_name = "OPTIONS")]
+    pub drop_audio: Option<String>,
+
+    /// Drop subtitle streams by regular expressions
+    #[arg(long = "drop-subtitle", value_name = "OPTIONS")]
+    pub drop_subtitle: Option<String>,
+
+    /// Automatically selects the best tracks of all types
+    #[arg(long = "auto-select")]
+    pub auto_select: bool,
+
+    /// Select only subtitle tracks
+    #[arg(long = "sub-only")]
+    pub sub_only: bool,
+
+    /// Subtitle output format (SRT | VTT)
+    #[arg(long = "sub-format", value_name = "FORMAT")]
+    pub sub_format: Option<String>,
+
+    /// Automatically fix subtitles
+    #[arg(long = "auto-subtitle-fix")]
+    pub auto_subtitle_fix: bool,
+
+    /// Download only part of the segments (e.g. 0-10 or 05:00-20:00)
+    #[arg(long = "custom-range", value_name = "RANGE")]
+    pub custom_range: Option<String>,
+
+    /// Set URL keywords (regular expressions) for AD segments
+    #[arg(long = "ad-keyword", value_name = "REG")]
+    pub ad_keyword: Option<String>,
+
+    /// Exclude VOD sections by IDs (e.g. 0,2-4)
+    #[arg(long = "vod-drop-parts", value_name = "IDS")]
+    pub vod_drop_parts: Option<String>,
+
+    /// List VOD sections and exit
+    #[arg(long = "vod-list-parts")]
+    pub vod_list_parts: bool,
+
+    /// Decryption key(s) in KID:KEY or KEY format (HEX or Base64)
+    #[arg(long = "key", value_name = "KEY")]
+    pub keys: Vec<String>,
+
+    /// File containing KID:KEY lines
+    #[arg(long = "key-text-file", value_name = "FILE")]
+    pub key_text_file: Option<PathBuf>,
+
+    /// Decryption engine program (MP4DECRYPT | SHAKA_PACKAGER | FFMPEG)
+    #[arg(long = "decryption-engine", value_name = "ENGINE")]
+    pub decryption_engine: Option<String>,
+
+    /// Path to MP4 decryption binary
+    #[arg(long = "decryption-binary-path", value_name = "PATH")]
+    pub decryption_binary_path: Option<PathBuf>,
+
+    /// Custom HLS encryption method (AES_128 | AES_128_ECB | CENC | CHACHA20 | SAMPLE_AES)
+    #[arg(long = "custom-hls-method", value_name = "METHOD")]
+    pub custom_hls_method: Option<String>,
+
+    /// Custom HLS decryption key (FILE | HEX | BASE64)
+    #[arg(long = "custom-hls-key", value_name = "KEY")]
+    pub custom_hls_key: Option<String>,
+
+    /// Custom HLS decryption IV (FILE | HEX | BASE64)
+    #[arg(long = "custom-hls-iv", value_name = "IV")]
+    pub custom_hls_iv: Option<String>,
+
+    /// Custom HLS scope (ALL | VIDEO | AUDIO)
+    #[arg(long = "custom-hls-scope", value_name = "SCOPE")]
+    pub custom_hls_scope: Option<String>,
+
+    /// Binary merge segments without FFmpeg
+    #[arg(long = "binary-merge")]
+    pub binary_merge: bool,
+
+    /// Skip segments merge
+    #[arg(long = "skip-merge")]
+    pub skip_merge: bool,
+
+    /// Skip download
+    #[arg(long = "skip-download")]
+    pub skip_download: bool,
+
+    /// Check if actual number of downloaded segments matches expected count
+    #[arg(long = "check-segments-count")]
+    pub check_segments_count: bool,
+
+    /// Delete temporary files when done
+    #[arg(long = "del-after-done")]
+    pub del_after_done: bool,
+
+    /// Date information is not written during muxing
+    #[arg(long = "no-date-info")]
+    pub no_date_info: bool,
+
+    /// Write meta json after parsed
+    #[arg(long = "write-meta-json")]
+    pub write_meta_json: bool,
+
+    /// Append input URL query parameters to segments
+    #[arg(long = "append-url-params")]
+    pub append_url_params: bool,
+
+    /// Concurrently download the selected audio, video and subtitles
+    #[arg(long = "concurrent-download")]
+    pub concurrent_download: bool,
+
+    /// Mux downloaded streams after finish (e.g. format=mp4:muxer=ffmpeg)
+    #[arg(short = 'M', long = "mux-after-done", value_name = "OPTIONS")]
+    pub mux_after_done: Option<String>,
+
+    /// Import external media files when muxing (path=FILE:lang=CODE:name=NAME)
+    #[arg(long = "mux-import", value_name = "OPTIONS")]
+    pub mux_imports: Vec<String>,
+
+    /// FFmpeg merge input mode: LOCAL_HTTP (default), PROTOCOL, DEMUXER
+    #[arg(long = "ffmpeg-concat-mode", value_name = "MODE")]
+    pub ffmpeg_concat_mode: Option<String>,
+
+    /// Merge with concat demuxer
+    #[arg(long = "use-ffmpeg-concat-demuxer")]
+    pub use_ffmpeg_concat_demuxer: bool,
+
+    /// Path to ffmpeg binary
+    #[arg(long = "ffmpeg-binary-path", value_name = "PATH")]
+    pub ffmpeg_binary_path: Option<PathBuf>,
+
+    /// Set output filename stem
+    #[arg(long = "save-name", value_name = "NAME")]
+    pub save_name: Option<String>,
+
+    /// Set output directory
+    #[arg(long = "save-dir", value_name = "DIR")]
+    pub save_dir: Option<PathBuf>,
+
+    /// Set temporary file directory
+    #[arg(long = "tmp-dir", value_name = "DIR")]
+    pub tmp_dir: Option<PathBuf>,
+
+    /// Set output filename pattern (<SaveName>, <Resolution>, <Bandwidth>, etc.)
+    #[arg(long = "save-pattern", value_name = "PATTERN")]
+    pub save_pattern: Option<String>,
+
+    /// Recording time limit when recording live (HH:mm:ss)
+    #[arg(long = "live-record-limit", value_name = "DURATION")]
+    pub live_record_limit: Option<String>,
+
+    /// Manually set live playlist refresh interval in seconds
+    #[arg(long = "live-wait-time", value_name = "SEC")]
+    pub live_wait_time: Option<u64>,
+
+    /// Stop recording when live playlist has no new segments for SEC seconds
+    #[arg(long = "live-idle-timeout", value_name = "SEC")]
+    pub live_idle_timeout: Option<u64>,
+
+    /// Number of segments downloaded for the first time when recording live
+    #[arg(long = "live-take-count", value_name = "NUM")]
+    pub live_take_count: Option<usize>,
+
+    /// Download live history from lookback duration or timestamp
+    #[arg(long = "live-catchup", value_name = "TIME")]
+    pub live_catchup: Option<String>,
+
+    /// Real-time merge into file when recording live
+    #[arg(long = "live-real-time-merge")]
+    pub live_real_time_merge: bool,
+
+    /// Keep segments when recording live with real-time merge
+    #[arg(long = "live-keep-segments")]
+    pub live_keep_segments: bool,
+
+    /// Real-time muxing to TS file through pipeline + ffmpeg
+    #[arg(long = "live-pipe-mux")]
+    pub live_pipe_mux: bool,
+
+    /// Download live stream as vod
+    #[arg(long = "live-perform-as-vod")]
+    pub live_perform_as_vod: bool,
+
+    /// Correct VTT sub by reading start time of audio file
+    #[arg(long = "live-fix-vtt-by-audio")]
+    pub live_fix_vtt_by_audio: bool,
+
+    /// Show detailed help for an option
+    #[arg(long = "morehelp", value_name = "OPTION")]
+    pub morehelp: Option<String>,
 }
 
 impl Args {
@@ -590,6 +806,73 @@ pub fn parse_media_preset(s: &str) -> Result<MediaQualityPreset, String> {
         "m4a" | "aac" => MediaQualityPreset::AudioM4a,
         _ => MediaQualityPreset::Custom(s.to_string()),
     })
+}
+
+/// N_m3u8DL-RE style subcommands.
+#[derive(clap::Subcommand, Debug, Clone)]
+pub enum SubCommand {
+    /// Concatenate file bytes without FFmpeg
+    Concat {
+        #[arg(short = 'i', long = "input", value_name = "FILE|DIR", num_args = 0..)]
+        inputs: Vec<PathBuf>,
+        #[arg(long = "input-dir", value_name = "DIR")]
+        input_dir: Option<PathBuf>,
+        #[arg(long = "pattern", default_value = "*.ts")]
+        pattern: String,
+        #[arg(short = 'o', long = "output", value_name = "FILE")]
+        output: PathBuf,
+    },
+    /// Use FFmpeg to merge segments from files or directory
+    Merge {
+        #[arg(short = 'i', long = "input", value_name = "FILE|DIR", num_args = 0..)]
+        inputs: Vec<PathBuf>,
+        #[arg(long = "input-dir", value_name = "DIR")]
+        input_dir: Option<PathBuf>,
+        #[arg(long = "pattern", default_value = "*.ts")]
+        pattern: String,
+        #[arg(short = 'o', long = "output", value_name = "FILE")]
+        output: PathBuf,
+        #[arg(long = "ffmpeg-concat-mode", value_enum, default_value = "local-http")]
+        mode: ConcatModeArg,
+        #[arg(long = "ffmpeg-binary-path", value_name = "PATH")]
+        ffmpeg_binary_path: Option<PathBuf>,
+    },
+    /// Mux video, audio and subtitles into container
+    Mux {
+        #[arg(short = 'i', long = "input", value_name = "FILE|DIR|OPTIONS", num_args = 1..)]
+        inputs: Vec<String>,
+        #[arg(short = 'o', long = "output", value_name = "FILE")]
+        output: PathBuf,
+        #[arg(long = "title", value_name = "TITLE")]
+        title: Option<String>,
+        #[arg(long = "muxer", default_value = "ffmpeg")]
+        muxer: String,
+        #[arg(long = "mux-import", value_name = "OPTIONS")]
+        mux_imports: Vec<String>,
+        #[arg(long = "auto-subtitle-fix", default_value_t = true)]
+        auto_subtitle_fix: bool,
+        #[arg(long = "ffmpeg-binary-path", value_name = "PATH")]
+        ffmpeg_binary_path: Option<PathBuf>,
+    },
+    /// Check tool versions and system environment
+    Doctor {
+        #[arg(long = "json")]
+        json: bool,
+        #[arg(long = "ffmpeg-binary-path", value_name = "PATH")]
+        ffmpeg_binary_path: Option<PathBuf>,
+        #[arg(long = "mkvmerge-binary-path", value_name = "PATH")]
+        mkvmerge_binary_path: Option<PathBuf>,
+        #[arg(long = "decryption-binary-path", value_name = "PATH")]
+        decryption_binary_path: Option<PathBuf>,
+    },
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ConcatModeArg {
+    #[default]
+    LocalHttp,
+    Demuxer,
+    Protocol,
 }
 
 #[cfg(test)]
