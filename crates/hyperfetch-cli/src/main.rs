@@ -2,6 +2,7 @@ mod cli;
 mod doctor;
 mod download;
 mod probe;
+mod tools;
 
 use std::future::Future;
 use std::io::{IsTerminal, Write};
@@ -43,26 +44,12 @@ fn main() {
     // What an earlier update left behind (the old programs) can be deleted once they have exited.
     updater::cleanup_old();
     updater::refresh_extension();
-    let args = match cli::load(std::env::args_os().collect(), data_folder().map(|dir| dir.join("cli.conf"))) {
-        Ok(args) => args,
-        Err(e) => {
-            stderr_line(&e);
-            std::process::exit(EXIT_USAGE);
-        }
-    };
-    if let Some(shell) = args.completions {
-        // For the name it was started by (a link such as `endos-downloader` included).
-        let argv0 = std::env::args_os().next().map(PathBuf::from);
-        let name = argv0.as_deref().and_then(Path::file_stem).map_or("Endos-Unified-Downloader-CLI".into(), |n| n.to_string_lossy());
-        clap_complete::generate(shell, &mut Args::command(), name.into_owned(), &mut std::io::stdout());
-        return;
-    }
     // On a thread of its own: a MEGA or swarm download nests futures deep enough to overflow
     // the main thread's 1 MiB stack on Windows in a debug build.
     let code = std::thread::Builder::new()
         .stack_size(8 << 20)
-        .spawn(move || run_detached(app(args)))
-        .and_then(|runner| runner.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)))
+        .spawn(run_cli)
+        .and_then(|runner| Ok(runner.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))))
         .unwrap_or_else(|e| {
             stderr_line(&format!("error: cannot start the async runtime: {}", e));
             EXIT_FAILED
@@ -75,6 +62,40 @@ fn main() {
 /// Runs `app` to completion, then shuts the runtime down without waiting for blocking work that
 /// was abandoned: a final hash or disk sync still running past the stop timeout, or a stdin read.
 /// Dropping the runtime normally would wait for it, with the signal listener already gone.
+fn run_cli() -> i32 {
+    let raw_args: Vec<String> = std::env::args().collect();
+    let preprocessed = tools::preprocess_cli_args(&raw_args);
+    let os_args: Vec<std::ffi::OsString> = preprocessed.into_iter().map(std::ffi::OsString::from).collect();
+    let args = match cli::load(os_args, data_folder().map(|dir| dir.join("cli.conf"))) {
+        Ok(a) => a,
+        Err(e) => {
+            stderr_line(&e);
+            return EXIT_USAGE;
+        }
+    };
+
+    if let Some(ref opt) = args.morehelp {
+        tools::print_morehelp(opt);
+        return 0;
+    }
+
+    if let Some(subcmd) = args.command {
+        return run_detached(tools::execute_subcommand(subcmd)).unwrap_or(1);
+    }
+
+    if let Some(shell) = args.completions {
+        let argv0 = std::env::args_os().next().map(PathBuf::from);
+        let name = argv0.as_deref().and_then(Path::file_stem).map_or("Endos-Unified-Downloader-CLI".into(), |n| n.to_string_lossy());
+        clap_complete::generate(shell, &mut Args::command(), name.into_owned(), &mut std::io::stdout());
+        return 0;
+    }
+
+    run_detached(app(args)).unwrap_or_else(|e| {
+        stderr_line(&format!("error: cannot start the async runtime: {}", e));
+        EXIT_FAILED
+    })
+}
+
 fn run_detached(app: impl Future<Output = i32>) -> std::io::Result<i32> {
     let runtime = tokio::runtime::Runtime::new()?;
     let code = runtime.block_on(app);
