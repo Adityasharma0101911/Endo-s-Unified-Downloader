@@ -1,7 +1,8 @@
 # On a v* tag, a release/* branch or a manual run: builds and checks a release's Windows and Linux
 # files and uploads them as the artifacts windows-x64 (the programs, both zips and the installer,
 # code-signed when the signing secrets are set), winget (the filled-in manifests), linux-x64 and
-# linux-arm64 (tar.gz, .deb, .rpm) and linux-x64-static (the static CLI); see CLAUDE.md, Releasing.
+# linux-arm64 (tar.gz, .deb, .rpm), linux-x64-static (the static CLI) and chrome-web-store (the
+# extension for the Chrome Web Store, without YouTube); see CLAUDE.md, Releasing.
 # The updater's signature (SHA256SUMS.sig) is made on the maintainer's PC, never here.
 name: Packages
 
