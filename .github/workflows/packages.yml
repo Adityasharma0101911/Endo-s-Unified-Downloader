@@ -120,7 +120,7 @@ jobs:
           # The Chrome Web Store's copy of the extension, without YouTube as the store's rules ask (not a release file).
           New-Item -ItemType Directory chrome-store | Out-Null
           Copy-Item -Recurse extension chrome-store\extension
-          Remove-Item -Recurse chrome-store\extension	est, chrome-store\extension\package.json
+          Remove-Item -Recurse chrome-store/extension/test, chrome-store/extension/package.json
           node scripts/chrome-store.mjs chrome-store\extension
           if ($LASTEXITCODE) { exit 1 }
           & $tar -a -cf "chrome-store\Endos-Unified-Downloader-Chrome-Web-Store-v$env:VERSION.zip" -C chrome-store\extension .
