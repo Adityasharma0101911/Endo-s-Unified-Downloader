@@ -159,7 +159,7 @@ impl DownloadQueue {
         self.items.iter().find(|i| i.id == id)
     }
 
-    fn get_item_mut(&mut self, id: usize) -> Option<&mut QueueItem> {
+    pub fn get_item_mut(&mut self, id: usize) -> Option<&mut QueueItem> {
         self.revision += 1;
         self.items.iter_mut().find(|i| i.id == id)
     }

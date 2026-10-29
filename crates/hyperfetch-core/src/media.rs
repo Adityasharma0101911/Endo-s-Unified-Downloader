@@ -307,9 +307,9 @@ const LIVE_STOP_GRACE: Duration = if cfg!(test) { Duration::from_secs(3) } else 
 /// A live recording is ended as a stop ends it once less than what it recorded and this is left
 /// on its disk (see [`run_ytdlp`]): finishing the file (yt-dlp's fixup and tags, the remux to
 /// MP4, joining its streams) writes a copy of it, and a full disk would cut it off mid-write.
-const MIN_FREE_SPACE: u64 = 512 * 1024 * 1024;
+pub(crate) const MIN_FREE_SPACE: u64 = 512 * 1024 * 1024;
 /// How often the space left on a live recording's disk is looked at.
-const DISK_CHECK_EVERY: Duration = if cfg!(test) { Duration::from_millis(100) } else { Duration::from_secs(10) };
+pub(crate) const DISK_CHECK_EVERY: Duration = if cfg!(test) { Duration::from_millis(100) } else { Duration::from_secs(10) };
 /// Keeps ffmpeg from moving the index of a file it writes tags into to the front (see
 /// [`NO_FASTSTART`]).
 const NO_FASTSTART_METADATA: [&str; 2] = ["--postprocessor-args", "Metadata+ffmpeg_o:-movflags -faststart"];
@@ -3383,11 +3383,11 @@ async fn run_ytdlp_watching(
 }
 
 /// How the error of a live recording that ended early goes on, naming the file it was kept as.
-const RECORDING_KEPT: &str = "what it recorded is kept as";
+pub(crate) const RECORDING_KEPT: &str = "what it recorded is kept as";
 
 /// What a stopped run gives (see [`stopped`]): a live recording ended because only `disk_full`
 /// bytes were left on its disk fails, naming the file that keeps what it recorded.
-fn ended(kept: Result<PathBuf, String>, disk_full: Option<u64>) -> Result<PathBuf, String> {
+pub(crate) fn ended(kept: Result<PathBuf, String>, disk_full: Option<u64>) -> Result<PathBuf, String> {
     match (kept, disk_full) {
         (Ok(path), Some(free)) => Err(format!(
             "The live recording was ended with only {:.1} MiB left on the disk; {RECORDING_KEPT} {}",
@@ -3400,7 +3400,7 @@ fn ended(kept: Result<PathBuf, String>, disk_full: Option<u64>) -> Result<PathBu
 
 /// The bytes left on the disk of the live recording `files` (see [`OutputState::recording`]),
 /// and those recorded into them so far; None when the space left cannot be told. Blocking.
-fn room_left(files: &[PathBuf]) -> Option<(u64, u64)> {
+pub(crate) fn room_left(files: &[PathBuf]) -> Option<(u64, u64)> {
     let free = free_space(files.first()?.parent()?)?;
     let written = files.iter().flat_map(|file| [crate::engine::part_path(file), file.clone()]).filter_map(|file| std::fs::metadata(file).ok());
     Some((free, written.map(|meta| meta.len()).sum()))
@@ -3408,7 +3408,7 @@ fn room_left(files: &[PathBuf]) -> Option<(u64, u64)> {
 
 /// Bytes this user may still write on the disk that holds `dir`; None when that cannot be told.
 /// Blocking.
-pub(crate) fn free_space(dir: &Path) -> Option<u64> {
+pub fn free_space(dir: &Path) -> Option<u64> {
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
@@ -3955,7 +3955,7 @@ fn stream_client(stream: &PlannedStream, browser: &[(String, String)], proxy: Op
 
 /// Where a stream of `output` downloads: next to it, named apart from yt-dlp's own
 /// `<name>.f<format>.<ext>` files, so neither ever takes the other's partial file for its own.
-fn stream_path(output: &Path, format_id: &str, ext: &str) -> PathBuf {
+pub(crate) fn stream_path(output: &Path, format_id: &str, ext: &str) -> PathBuf {
     let tail = crate::engine::sanitize_component(&format!(".f{format_id}.hf.{ext}"));
     let stem = output.file_stem().map_or_else(String::new, |s| s.to_string_lossy().into_owned());
     // The whole tail stays: two streams may differ only there.
@@ -4293,7 +4293,7 @@ fn stream_of(output: &Path, name: &str) -> Option<String> {
 }
 
 /// Where ffmpeg joins the streams of `output` before the result is moved there.
-fn merge_temp(output: &Path) -> PathBuf {
+pub(crate) fn merge_temp(output: &Path) -> PathBuf {
     let ext = output.extension().map_or_else(String::new, |e| format!(".{}", e.to_string_lossy()));
     let stem = output.file_stem().map_or_else(String::new, |s| s.to_string_lossy().into_owned());
     output.with_file_name(format!("{stem}.hfmerge{ext}"))
@@ -4303,7 +4303,7 @@ fn merge_temp(output: &Path) -> PathBuf {
 /// history entries the engine made for them, except what a download holds, and what a merge a
 /// crash cut short left (see [`merge_temp`] and [`chapters_file`]). The caller holds the claim on
 /// `output`, so no job is downloading these streams for it or joining them. Blocking.
-fn remove_streams_of(output: &Path) {
+pub(crate) fn remove_streams_of(output: &Path) {
     let Some(dir) = output.parent() else { return };
     for temp in [merge_temp(output), chapters_file(output)] {
         match std::fs::remove_file(&temp) {
@@ -4824,12 +4824,122 @@ const LANGUAGES: [(&str, &str); 53] = [
 
 /// The ISO 639-2 code an MP4 track's language is written in for `tag`, a BCP 47 tag as HLS gives
 /// it ("en", "pt-BR", "spa"): ffmpeg writes no language for a two-letter code.
-fn mp4_language(tag: &str) -> String {
+pub(crate) fn mp4_language(tag: &str) -> String {
     let primary = tag.split(['-', '_']).next().unwrap_or_default().to_ascii_lowercase();
     match primary.len() {
         3 if primary.bytes().all(|b| b.is_ascii_lowercase()) => primary,
         _ => LANGUAGES.iter().find(|(two, _)| *two == primary).map_or("und", |(_, three)| three).to_string(),
     }
+}
+
+/// Codec families an MP4 cannot hold as ffmpeg writes one, and those a WebM can.
+const NOT_IN_MP4: [&str; 3] = ["vorbis", "vp8", "dts"];
+const IN_WEBM: [&str; 5] = ["vp8", "vp9", "av1", "opus", "vorbis"];
+
+/// The container a stream's `tracks` are joined into (see [`join_tracks`]): `asked` (`mp4`, `mkv`
+/// or `webm`; `mp4` when none), else `mkv` when one of their codecs cannot go into it, with why.
+pub(crate) fn join_format(asked: Option<&str>, tracks: &[&crate::stream::Track]) -> (&'static str, Option<String>) {
+    let asked = match asked.map(str::to_ascii_lowercase).as_deref() {
+        Some("mkv") => "mkv",
+        Some("webm") => "webm",
+        _ => "mp4",
+    };
+    let fits = |family: &str| match asked {
+        "mp4" => !NOT_IN_MP4.contains(&family),
+        "webm" => IN_WEBM.contains(&family),
+        _ => true,
+    };
+    match tracks.iter().flat_map(|t| crate::stream::families(&t.codecs)).find(|family| !fits(family)) {
+        Some(family) => ("mkv", Some(format!("{} cannot hold the {} track", asked.to_ascii_uppercase(), family))),
+        None => (asked, None),
+    }
+}
+
+/// ffmpeg arguments that join `files` (each with the tracks it carries, in its own order: a video
+/// and the audio inside it, or one audio or subtitles track) and the WebVTT `subtitles` (with
+/// their languages) into `out`, a `format` file (`mp4`, `mkv` or `webm`), without re-encoding:
+/// every audio and subtitles track tagged with its language (ISO 639-2) and title (in an MP4 its
+/// handler's name too, which players show), the first audio track the default one, HEVC tagged `hvc1` in an MP4 as Apple's players need, an MP4's
+/// index in front. `out` is a temporary name, so the container is named.
+fn join_args(files: &[(PathBuf, Vec<&crate::stream::Track>)], subtitles: &[(PathBuf, String)], format: &str, out: &Path) -> Vec<OsString> {
+    use crate::stream::Kind;
+    let mut args: Vec<OsString> = FFMPEG_QUIET.map(OsString::from).to_vec();
+    for path in files.iter().map(|(file, _)| file).chain(subtitles.iter().map(|(vtt, _)| vtt)) {
+        args.extend([OsString::from("-i"), file_arg(path)]);
+    }
+    // The output's audio and subtitles tracks, in order: language and title.
+    let (mut audio, mut text): (Vec<(String, Option<String>)>, Vec<(String, Option<String>)>) = (Vec::new(), Vec::new());
+    let mut hevc = false;
+    for (i, (_, tracks)) in files.iter().enumerate() {
+        let mut taken = [0usize; 3];
+        for track in tracks {
+            let kind = track.kind as usize;
+            args.extend(["-map".into(), format!("{i}:{}:{}", ["v", "a", "s"][kind], taken[kind]).into()]);
+            taken[kind] += 1;
+            let tags = (track.language.clone().unwrap_or_default(), track.name.clone());
+            match track.kind {
+                Kind::Video => hevc |= track.codecs.split(',').any(|c| matches!(c.trim().split('.').next(), Some("hvc1" | "hev1"))),
+                Kind::Audio => audio.push(tags),
+                Kind::Subtitles => text.push(tags),
+            }
+        }
+    }
+    for (n, (_, language)) in subtitles.iter().enumerate() {
+        args.extend(["-map".into(), format!("{}:s:0", files.len() + n).into()]);
+        text.push((language.clone(), None));
+    }
+    args.extend(["-c", "copy"].map(OsString::from));
+    if !text.is_empty() {
+        let codec = match format {
+            "mp4" => "mov_text",
+            "webm" => "webvtt",
+            _ => "srt",
+        };
+        args.extend(["-c:s", codec].map(OsString::from));
+    }
+    for (kind, tracks) in [("a", &audio), ("s", &text)] {
+        for (n, (language, title)) in tracks.iter().enumerate() {
+            args.extend([format!("-metadata:s:{kind}:{n}").into(), format!("language={}", mp4_language(language)).into()]);
+            if let Some(title) = title {
+                // ffmpeg cannot take a NUL on its command line, which has a length limit: a
+                // manifest's title may be anything. An MP4 keeps no title of a track: players show
+                // its handler's name.
+                let title: String = title.chars().filter(|c| !c.is_control()).take(200).collect();
+                let keys: &[&str] = if format == "mp4" { &["title", "handler_name"] } else { &["title"] };
+                for key in keys {
+                    args.extend([format!("-metadata:s:{kind}:{n}").into(), format!("{key}={title}").into()]);
+                }
+            }
+        }
+    }
+    for n in 0..audio.len() {
+        args.extend([format!("-disposition:a:{n}").into(), OsString::from(if n == 0 { "default" } else { "0" })]);
+    }
+    if hevc && format == "mp4" {
+        args.extend(["-tag:v", "hvc1"].map(OsString::from));
+    }
+    match format {
+        "mp4" => args.extend(["-movflags", "+faststart", "-f", "mp4"].map(OsString::from)),
+        "webm" => args.extend(["-f", "webm"].map(OsString::from)),
+        _ => args.extend(["-f", "matroska"].map(OsString::from)),
+    }
+    args.push(file_arg(out));
+    args
+}
+
+/// Joins a stream's track `files` and `subtitles` into `out` with `ffmpeg` (see [`join_args`]).
+/// Cancelling kills ffmpeg, which lets go of `out` before this returns.
+pub(crate) async fn join_tracks(
+    ffmpeg: &Path,
+    files: &[(PathBuf, Vec<&crate::stream::Track>)],
+    subtitles: &[(PathBuf, String)],
+    format: &str,
+    out: &Path,
+    cancel_flag: Option<Arc<AtomicBool>>,
+) -> Result<(), String> {
+    let mut cmd = tree_command(ffmpeg);
+    cmd.args(join_args(files, subtitles, format, out));
+    run_to_end(cmd, cancel_flag).await.map(drop)
 }
 
 /// What one of yt-dlp's own sites finds at `url` (see [`RunKind::Find`]), for a download with
@@ -5403,6 +5513,35 @@ fn said(error: &str) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// A stream's tracks are joined as they are: each mapped from its file, every audio and
+    /// subtitles track with its language as ISO 639-2 and its title, the first audio track the
+    /// default; HEVC tagged for Apple's players in an MP4, and a codec an MP4 cannot hold sends
+    /// the join to MKV.
+    #[test]
+    fn test_tracks_are_joined_with_their_languages_and_the_first_audio_default() {
+        use crate::stream::{Kind, Track};
+        let video = Track { id: "v0".into(), codecs: "hvc1.1.6.L93.B0,mp4a.40.2".into(), ..Default::default() };
+        let inside = Track { id: "a0".into(), kind: Kind::Audio, language: Some("pt-BR".into()), name: Some("Main\0".into()), ..Default::default() };
+        let dub = Track { id: "a1".into(), kind: Kind::Audio, language: Some("de".into()), ..Default::default() };
+        let files = [(PathBuf::from("v.mp4"), vec![&video, &inside]), (PathBuf::from("a.m4a"), vec![&dub])];
+        let args = join_args(&files, &[(PathBuf::from("s.vtt"), "en".to_string())], "mp4", Path::new("out.tmp"));
+        let args = args.iter().map(|a| a.to_string_lossy()).collect::<Vec<_>>().join(" ");
+        assert!(args.contains("-i file:v.mp4 -i file:a.m4a -i file:s.vtt -map 0:v:0 -map 0:a:0 -map 1:a:0 -map 2:s:0 -c copy -c:s mov_text"), "{args}");
+        let tags = "-metadata:s:a:0 language=por -metadata:s:a:0 title=Main -metadata:s:a:0 handler_name=Main -metadata:s:a:1 language=deu";
+        assert!(args.contains(&format!("{tags} -metadata:s:s:0 language=eng")), "{args}");
+        assert!(args.ends_with("-disposition:a:0 default -disposition:a:1 0 -tag:v hvc1 -movflags +faststart -f mp4 file:out.tmp"), "{args}");
+        // A manifest's title of any length and with any characters becomes a short line.
+        let long = Track { kind: Kind::Audio, name: Some(format!("Line\r\n{}", "x".repeat(300))), ..Default::default() };
+        let args = join_args(&[(PathBuf::from("a.m4a"), vec![&long])], &[], "mkv", Path::new("out.tmp"));
+        let title = args.iter().map(|a| a.to_string_lossy().into_owned()).find(|a| a.starts_with("title="));
+        assert_eq!(title, Some(format!("title=Line{}", "x".repeat(196))));
+        let vorbis = Track { kind: Kind::Audio, codecs: "vorbis".into(), ..Default::default() };
+        assert_eq!(join_format(None, &[&video, &dub]), ("mp4", None));
+        assert_eq!(join_format(Some("MKV"), &[&video]), ("mkv", None));
+        assert_eq!(join_format(None, &[&video, &vorbis]), ("mkv", Some("MP4 cannot hold the vorbis track".to_string())));
+        assert_eq!(join_format(Some("webm"), &[&video]).0, "mkv");
+    }
 
     /// `POST /info` answers MediaInfo as the extension reads it.
     #[test]

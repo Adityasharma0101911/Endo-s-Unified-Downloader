@@ -298,6 +298,7 @@ pub(super) fn add_page(app: &mut App, ui: &mut Ui) {
         if focused.is_none() {
             zip_preview(app, ui);
         }
+        stream_tracks(app, ui, focused.as_ref());
         if focused.is_none() && ingest::is_blob_url(&app.url_input) {
             error_alert(ui, ingest::BLOB_MESSAGE);
         }
@@ -416,6 +417,95 @@ fn zip_preview(app: &mut App, ui: &mut Ui) {
     }
 }
 
+/// For a single HLS or DASH link in the box, Choose tracks…, which reads the stream and opens its
+/// track chooser here (see `App::list_tracks`); for the download shown, its chooser once opened
+/// (from its queue row or its own button).
+fn stream_tracks(app: &mut App, ui: &mut Ui, focused: Option<&QueueItem>) {
+    let open = match focused {
+        Some(item) => app.tracks.as_ref().is_some_and(|chooser| chooser.item == Some(item.id)),
+        None => {
+            let Some(url) = crate::tracks::stream_link(&app.url_input) else { return };
+            let open = app.tracks.as_ref().is_some_and(|chooser| chooser.item.is_none() && chooser.link == url.as_str());
+            if !open {
+                ui.add_space(4.0);
+                let choose = ui.add(button(format!("{} Choose tracks…", icon::SLIDERS_HORIZONTAL)));
+                if choose.on_hover_text("Pick the video, audio, subtitles and parts of the stream to download").clicked() {
+                    app.list_tracks(None, url);
+                }
+            }
+            open
+        }
+    };
+    if open {
+        super::chooser::chooser(app, ui);
+    }
+}
+
+/// Asks which channels of the first channel list waiting to record: its channels with their
+/// groups to tick, filtered by what is typed, then a download each or none.
+pub(super) fn channel_prompt(app: &mut App, ui: &mut Ui) {
+    let asked = app.channel_lists.first().map(|list| (list.input.clone(), list.channels.len()));
+    fading(ui, "channels", asked, |ui, (input, count)| {
+        let p = palette(ui);
+        let ticked = app.channel_lists.first().filter(|list| list.input == input).map_or(0, |list| list.channels.iter().filter(|(_, on)| *on).count());
+        let text = format!("{} is a list of {} channels. Tick the ones to record:", truncate_chars(&input, 55), count);
+        banner(ui, p.amber, icon::TELEVISION, RichText::new(text).color(p.text), |ui| {
+            if ui.add(button("Cancel")).clicked() {
+                app.answer_channels(false);
+            }
+            let add = if ticked == 1 { "Add 1 channel".to_string() } else { format!("Add {} channels", ticked) };
+            if ui.add_enabled(ticked > 0, primary_button(&add, p.accent)).clicked() {
+                app.answer_channels(true);
+            }
+        })
+        .on_hover_text(&input);
+        // Answered, its ghost fades out as the banner alone.
+        let Some(list) = app.channel_lists.first_mut().filter(|list| list.input == input) else { return };
+        let filter = list.filter.trim().to_string();
+        // Matched again only when the filter changes: a list may hold 100,000 channels.
+        let shown = match list.shown.take() {
+            Some((key, shown)) if key == filter => shown,
+            _ => {
+                let matches = |text: &str| hyperfetch_core::pattern_matches(&filter, text);
+                (0..list.channels.len())
+                    .filter(|&at| {
+                        let channel = &list.channels[at].0;
+                        filter.is_empty() || matches(&channel.name) || channel.group.as_deref().is_some_and(matches)
+                    })
+                    .collect()
+            }
+        };
+        ui.add_space(4.0);
+        card(ui).inner_margin(10.0).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let edit = egui::TextEdit::singleline(&mut list.filter).hint_text("Filter by name or group (* for any run)").desired_width(280.0);
+                ui.add(edit);
+                let mut all = !shown.is_empty() && shown.iter().all(|&at| list.channels[at].1);
+                if ui.checkbox(&mut all, format!("All {} shown", shown.len())).changed() {
+                    for &at in &shown {
+                        list.channels[at].1 = all;
+                    }
+                }
+            });
+            let row = ui.spacing().interact_size.y;
+            let most = 10.0 * (row + ui.spacing().item_spacing.y);
+            egui::ScrollArea::vertical().id_salt("channels").max_height(most).auto_shrink([false, true]).show_rows(ui, row, shown.len(), |ui, rows| {
+                for &at in &shown[rows] {
+                    let (channel, on) = &mut list.channels[at];
+                    ui.horizontal(|ui| {
+                        ui.checkbox(on, &channel.name);
+                        if let Some(group) = &channel.group {
+                            ui.label(RichText::new(group).small().color(p.muted));
+                        }
+                    });
+                }
+            });
+        });
+        list.shown = Some((filter, shown));
+    });
+}
+
 /// A ZIP's entries, a line each with its size, in a list that scrolls past twelve of them; then
 /// how many there are and their size, unpacked and packed.
 fn zip_entries(ui: &mut Ui, entries: &[ZipEntry]) {
@@ -460,7 +550,7 @@ fn download_button(app: &App, ui: &mut Ui) -> egui::Response {
     response
 }
 
-fn start_from_form(app: &mut App) {
+pub(super) fn start_from_form(app: &mut App) {
     let (text, checksum, auth) = (app.url_input.clone(), app.checksum_input.clone(), app.auth_input.clone());
     app.download_now(&text, &checksum, &auth);
 }
@@ -528,6 +618,12 @@ fn download_actions(app: &mut App, ui: &mut Ui, item: &QueueItem) {
                     });
                 }
             }
+        }
+    }
+    let choosing = app.tracks.as_ref().is_some_and(|chooser| chooser.item == Some(id));
+    if let Some(url) = item.urls.first().filter(|_| crate::tracks::offered(item) && !choosing) {
+        if ui.add(button(format!("{} Choose tracks…", icon::SLIDERS_HORIZONTAL))).clicked() {
+            app.list_tracks(Some(id), url.clone());
         }
     }
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -688,6 +784,40 @@ mod tests {
         h.wait_for(|app| app.zip_preview.as_ref().is_some_and(|(_, listed)| listed.is_some()));
         assert!(h.settle());
         assert!(h.texts().iter().any(|(text, _)| text.starts_with("The file is not a ZIP")), "{:?}", h.texts());
+    }
+
+    /// A dropped channel list shows its channels and groups to tick, which a filter narrows and
+    /// All shown ticks; each ticked channel becomes a download named after it that records it as
+    /// long as Settings say. Nothing can be added before a channel is ticked.
+    #[test]
+    fn a_dropped_channel_list_offers_its_channels_to_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        let list = dir.path().join("tv.m3u");
+        let entries = [("News", "News One", "news1.m3u8"), ("News", "News Two", "news2.m3u8"), ("Sport", "Sport HD", "sport.ts")];
+        let text: String = entries.iter().map(|(group, name, file)| format!("#EXTINF:-1 group-title=\"{group}\",{name}\nhttp://tv.example/{file}\n")).collect();
+        std::fs::write(&list, format!("#EXTM3U\n{text}")).unwrap();
+        let mut h = Harness::new();
+        (h.app.settings.auto_run_queue, h.app.settings.record_minutes) = (false, 60);
+        h.app.add_dropped(list.clone());
+        h.wait_for(|app| !app.channel_lists.is_empty());
+        assert!(h.settle());
+        assert!(h.texts().iter().any(|(text, _)| text.ends_with("is a list of 3 channels. Tick the ones to record:")), "{:?}", h.texts());
+        for shown in ["News One", "News Two", "Sport HD", "News", "Sport"] {
+            assert!(h.find(shown).is_some(), "{shown} in {:?}", h.texts());
+        }
+        h.click("Add 0 channels");
+        assert_eq!(h.app.channel_lists.len(), 1, "nothing ticked, nothing to add");
+
+        h.click("Filter by name or group (* for any run)");
+        h.type_text("news");
+        h.key(egui::Key::Escape, egui::Modifiers::NONE);
+        assert!(h.settle() && h.find("Sport HD").is_none());
+        h.click("All 2 shown");
+        assert!(h.settle());
+        h.click("Add 2 channels");
+        assert!(h.app.channel_lists.is_empty());
+        let added: Vec<_> = h.app.queue.items().iter().map(|item| (item.filename.as_str(), item.options.channel.as_deref(), item.options.record_seconds)).collect();
+        assert_eq!(added, [("News One.ts", Some("News One"), Some(3600)), ("News Two.ts", Some("News Two"), Some(3600))]);
     }
 
     /// A notice opens its room over a few frames, pushing the card under it down smoothly; once

@@ -6,6 +6,7 @@ mod queue_store;
 mod recording;
 mod settings;
 mod taskbar;
+mod tracks;
 mod tray;
 mod ui;
 mod util;
@@ -21,13 +22,14 @@ use eframe::egui;
 use hyperfetch_core::chunk::ChunkSnapshot;
 use hyperfetch_core::engine::{build_client, ClientKey, DownloadEngine, DownloadOptions, EngineSnapshot, SharedLimits};
 use hyperfetch_core::history::{DownloadHistoryManager, HistoryEntry};
-use hyperfetch_core::ingest::{self, Task};
+use hyperfetch_core::ingest::{self, Channel, Task};
 use hyperfetch_core::media;
 use hyperfetch_core::paste;
 use hyperfetch_core::queue::{DownloadQueue, QueueItem, QueueItemStatus};
 use hyperfetch_core::updater::{self, Installed, Update};
 use hyperfetch_core::verify::{self, BuildVerificationResult};
 use hyperfetch_core::zipdir::ZipEntry;
+use hyperfetch_core::StreamInfo;
 use tokio::sync::{broadcast, Notify};
 use tokio::task::JoinHandle;
 use url::Url;
@@ -57,8 +59,9 @@ const CONFIRM_FILES: usize = 50;
 /// Why the form's checksum is refused for several downloads.
 const SINGLE_CHECKSUM: &str = "The checksum in Advanced Options is for a single file: add that download on its own";
 /// How long "See what's inside" waits for a ZIP's list of files, all its requests together (each
-/// gives up after 30 s without an answer: see `zipdir::list_zip`).
-const ZIP_PREVIEW_LIMIT: Duration = Duration::from_secs(if cfg!(test) { 2 } else { 60 });
+/// gives up after 30 s without an answer: see `zipdir::list_zip`), and "Choose tracks…" for a
+/// stream's manifests.
+const PREVIEW_LIMIT: Duration = Duration::from_secs(if cfg!(test) { 10 } else { 60 });
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -162,6 +165,25 @@ enum AppEvent {
     Tray(TrayAction),
     /// What the ZIP at `link` holds (see [`App::preview_zip`]), or why it could not be listed.
     ZipListed { link: String, result: Result<Vec<ZipEntry>, String> },
+    /// What the stream at `link` holds, for the track chooser of `item` (see [`App::list_tracks`]).
+    TracksListed { item: Option<usize>, link: String, result: Result<StreamInfo, String> },
+    /// The channels of the channel list `input` may be (see [`App::read_document`]): None when it
+    /// is none, and is read as any other input.
+    Channels { origin: Origin, input: String, checksum: String, auth: String, result: Result<Option<Vec<Channel>>, String> },
+}
+
+/// A channel list read, waiting for the user to tick the channels to record (see
+/// `ui::add::channel_prompt`): where it came from, its channels, each with whether it is ticked,
+/// and the filter typed over them.
+struct ChannelList {
+    origin: Origin,
+    input: String,
+    checksum: String,
+    auth: String,
+    channels: Vec<(Channel, bool)>,
+    filter: String,
+    /// The channels `filter` (trimmed, the key) shows, kept until it changes.
+    shown: Option<(String, Vec<usize>)>,
 }
 
 /// Handles to a running engine task.
@@ -342,6 +364,10 @@ struct App {
     batch_failed: bool,
     /// The ZIP link the Add page lists the contents of, and what it holds once read.
     zip_preview: Option<(String, Option<Result<Vec<ZipEntry>, String>>)>,
+    /// The track chooser open (see [`App::list_tracks`]).
+    tracks: Option<tracks::Chooser>,
+    /// Channel lists waiting for the channels to record to be ticked, first come first.
+    channel_lists: Vec<ChannelList>,
 }
 
 impl App {
@@ -474,12 +500,14 @@ impl App {
             taskbar_shown: None,
             batch_failed: false,
             zip_preview: None,
+            tracks: None,
+            channel_lists: Vec::new(),
         }
     }
 
     /// Lists what the ZIP at `url` holds without downloading it (see `zipdir::list_zip`), through
     /// the proxy and with the cookies file and User-Agent of the settings; the Add page shows it.
-    /// It gives up after [`ZIP_PREVIEW_LIMIT`].
+    /// It gives up after [`PREVIEW_LIMIT`].
     fn preview_zip(&mut self, url: Url) {
         let link = url.to_string();
         self.zip_preview = Some((link.clone(), None));
@@ -490,11 +518,65 @@ impl App {
                 let client = unblock(move || build_client(&options)).await??;
                 hyperfetch_core::zipdir::list_zip(&client, &url).await
             };
-            let result = tokio::time::timeout(ZIP_PREVIEW_LIMIT, listed).await.unwrap_or_else(|_| {
-                Err(format!("Gave up listing the ZIP: the server took over {} seconds", ZIP_PREVIEW_LIMIT.as_secs()))
+            let result = tokio::time::timeout(PREVIEW_LIMIT, listed).await.unwrap_or_else(|_| {
+                Err(format!("Gave up listing the ZIP: the server took over {} seconds", PREVIEW_LIMIT.as_secs()))
             });
             AppEvent::ZipListed { link, result }
         });
+    }
+
+    /// Opens the track chooser of the HLS or DASH stream at `url` (see `tracks::Chooser`) for
+    /// queued download `item` with its options, or for the link in the form (None) with the
+    /// settings' and the form's Authorization header, and reads what the stream holds as its
+    /// download would. It gives up after [`PREVIEW_LIMIT`].
+    fn list_tracks(&mut self, item: Option<usize>, url: Url) {
+        let link = url.to_string();
+        self.tracks = Some(tracks::Chooser { item, link: link.clone(), info: None, picks: Default::default() });
+        let options = match item.and_then(|id| self.queue.get_item(id)) {
+            Some(queued) => {
+                let mut options = queued.options.clone();
+                self.settings.fill_keys(&mut options);
+                Ok(options)
+            }
+            None => self.settings.download_options(std::slice::from_ref(&url), "", &self.auth_input),
+        };
+        self.spawn_event(async move {
+            let listed = async { hyperfetch_core::list_tracks(&url, &options?).await };
+            let result = tokio::time::timeout(PREVIEW_LIMIT, listed).await.unwrap_or_else(|_| {
+                Err(format!("Gave up reading the stream: the server took over {} seconds", PREVIEW_LIMIT.as_secs()))
+            });
+            AppEvent::TracksListed { item, link, result }
+        });
+    }
+
+    /// Takes what the track chooser read: its tracks ticked as the download's options (the
+    /// item's, else the settings') take them. Only for the chooser still open on that link.
+    fn tracks_listed(&mut self, item: Option<usize>, link: String, result: Result<StreamInfo, String>) {
+        let options = match item {
+            Some(id) => self.queue.get_item(id).map(|queued| queued.options.clone()),
+            None => Url::parse(&link).ok().and_then(|url| self.settings.download_options(&[url], "", "").ok()),
+        };
+        let Some(chooser) = self.tracks.as_mut().filter(|chooser| chooser.item == item && chooser.link == link) else { return };
+        if let (Ok(info), Some(options)) = (&result, &options) {
+            chooser.picks = tracks::Picks::of(info, options);
+        }
+        chooser.info = Some(result);
+    }
+
+    /// Saves the track chooser's picks with its queued download, which then downloads them (also
+    /// after a restart), and closes it; or says why they cannot be.
+    fn save_tracks(&mut self) {
+        let Some(chooser) = self.tracks.take() else { return };
+        let (Some(id), Some(Ok(info))) = (chooser.item, &chooser.info) else { return };
+        let saved = match self.queue.get_item_mut(id) {
+            Some(item) if !item.status.is_active() => chooser.picks.apply(info, &mut item.options),
+            Some(_) => Err(format!("Download #{} is running: pause it to change its tracks", id)),
+            None => Err(format!("Download #{} is no longer in the queue", id)),
+        };
+        if let Err(e) = saved {
+            self.notice = Some(Err(e));
+            self.tracks = Some(chooser);
+        }
     }
 
     /// Runs `fut` on the runtime and delivers its event to the UI thread.
@@ -612,10 +694,58 @@ impl App {
 
     /// Reads the downloads a .metalink, .meta4 or .torrent, or a folder, feed or playlist link
     /// lists (see `ingest::needs_reading`) off the UI thread and adds them as `origin` says. A
-    /// document already being read is not read again.
+    /// document already being read is not read again. A `.m3u` that lists channels offers them
+    /// to tick (see [`App::answer_channels`]); one that does not is read as any other.
     fn read_document(&mut self, input: String, origin: Origin, checksum: String, auth: String) {
+        let token = input.trim().trim_matches('"').to_string();
+        if ingest::might_be_channel_list(&token) && !self.reading.contains_key(&input) {
+            self.notice = Some(Ok(format!("Reading {}...", ingest::truncate_chars(&input, 60))));
+            let list = self.settings.list_options();
+            let key = input.clone();
+            let reading = self.spawn_event(async move {
+                let listed = async { ingest::list_channels(&token, &ingest::descriptor_client(list.proxy.as_deref())?, &list).await };
+                AppEvent::Channels { origin, input, checksum, auth, result: listed.await }
+            });
+            self.reading.insert(key, reading);
+            return;
+        }
         let read = read_listing(&self.settings, input.clone(), None);
         self.start_reading(input, origin, checksum, auth, read);
+    }
+
+    /// Takes what reading a channel list gave (see [`App::read_document`]): its channels to tick,
+    /// else the input read as any other, or why it could not be read.
+    fn channels_read(&mut self, origin: Origin, input: String, checksum: String, auth: String, result: Result<Option<Vec<Channel>>, String>) {
+        if self.reading.remove(&input).is_none() {
+            return;
+        }
+        self.notice = None;
+        match result {
+            Ok(Some(channels)) => {
+                let channels = channels.into_iter().map(|channel| (channel, false)).collect();
+                self.channel_lists.push(ChannelList { origin, input, checksum, auth, channels, filter: String::new(), shown: None });
+            }
+            Ok(None) => {
+                let read = read_listing(&self.settings, input.clone(), None);
+                self.start_reading(input, origin, checksum, auth, read);
+            }
+            Err(e) => {
+                self.add_listing(origin, &input, &checksum, &auth, Err(e));
+            }
+        }
+    }
+
+    /// Answers the first channel list waiting: queues a download for each channel ticked, named
+    /// after it, as `origin` says (the form starts the first); or drops the list.
+    fn answer_channels(&mut self, add: bool) {
+        if self.channel_lists.is_empty() {
+            return;
+        }
+        let ChannelList { origin, input, checksum, auth, channels, .. } = self.channel_lists.remove(0);
+        if add {
+            let ticked: Vec<Channel> = channels.into_iter().filter(|(_, on)| *on).map(|(channel, _)| channel).collect();
+            self.add_listing(origin, &input, &checksum, &auth, Ok(ingest::channel_tasks(&ticked, &["*".to_string()])));
+        }
     }
 
     /// [`App::read_document`] with `read`, which reads `input`. A video link that names its
@@ -829,8 +959,24 @@ impl App {
             self.read_document(text.trim().to_string(), Origin::Form, checksum.trim().to_string(), auth.to_string());
             return;
         }
+        // The tracks chosen for this link (see `App::list_tracks`), checked before it is added.
+        let link = tracks::stream_link(text).map(String::from);
+        let chosen = self.tracks.as_ref().filter(|c| c.item.is_none() && link.as_ref() == Some(&c.link)).and_then(|c| match &c.info {
+            Some(Ok(info)) => Some((info.clone(), c.picks.clone())),
+            _ => None,
+        });
+        if let Some(Err(e)) = chosen.as_ref().map(|(info, picks)| picks.apply(info, &mut DownloadOptions::default())) {
+            return self.form_error = Some(e);
+        }
         match self.add_download(text, checksum, auth) {
-            Ok(id) => self.start_added(id),
+            Ok(id) => {
+                if let (Some((info, picks)), Some(item)) = (&chosen, self.queue.get_item_mut(id)) {
+                    // Checked above.
+                    let _ = picks.apply(info, &mut item.options);
+                    self.tracks = None;
+                }
+                self.start_added(id)
+            }
             Err(e) => self.form_error = Some(e),
         }
     }
@@ -1369,6 +1515,8 @@ impl App {
                     *listed = Some(result);
                 }
             }
+            AppEvent::TracksListed { item, link, result } => self.tracks_listed(item, link, result),
+            AppEvent::Channels { origin, input, checksum, auth, result } => self.channels_read(origin, input, checksum, auth, result),
         }
     }
 
@@ -1478,6 +1626,10 @@ impl App {
         }
         if let Some(choice) = &payload.media {
             choose_media(&mut options, choice);
+        }
+        // The video the browser wants is over the Settings' video quality, which would hide it.
+        if options.height.is_some() {
+            options.tracks.video.clear();
         }
         Ok(queue_task(&mut self.queue, task, options))
     }
@@ -1886,6 +2038,7 @@ fn task_options(settings: &Settings, task: &Task, checksum: &str, auth: &str) ->
         options.output_path = options.output_path.map(|path| path.join(""));
     }
     options.media_name = task.media_name.clone();
+    options.channel = task.channel.clone();
     options.metalink_pieces = task.pieces.clone();
     options.archive_lines = task.archive.clone();
     options.bittorrent = task.p2p;
@@ -3405,7 +3558,7 @@ mod tests {
         app.handle_event(event);
         let listed = app.zip_preview.as_ref().and_then(|(_, listed)| listed.as_ref());
         let Some(Err(error)) = listed else { panic!("no error") };
-        assert_eq!(error, "Gave up listing the ZIP: the server took over 2 seconds");
+        assert_eq!(error, "Gave up listing the ZIP: the server took over 10 seconds");
     }
 
     /// Pause all stops the queue and pauses what runs; Resume all starts both again, as many at

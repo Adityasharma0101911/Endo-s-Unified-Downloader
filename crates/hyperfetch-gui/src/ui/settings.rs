@@ -2,8 +2,10 @@ use std::hash::Hash;
 use std::path::PathBuf;
 
 use hyperfetch_core::engine::IpFamily;
+use hyperfetch_core::AudioSpec;
 
 use super::*;
+use crate::settings::{VIDEO_CODECS, VIDEO_HEIGHTS, VIDEO_RANGES};
 
 /// Seconds since the Settings page was opened (`render` keys the page change the same way).
 fn opened(ctx: &egui::Context) -> f32 {
@@ -85,8 +87,9 @@ pub(super) fn settings_page(app: &mut App, ui: &mut Ui) {
     section(ui, 3, icon::MAGNET, "BitTorrent", |ui| torrent_settings(app, ui));
     section(ui, 4, icon::CLOUD_ARROW_DOWN, "Debrid & hosts", |ui| host_settings(app, ui));
     section(ui, 5, icon::FILM_STRIP, "Media", |ui| media_settings(app, ui));
-    section(ui, 6, icon::PACKAGE, "Post-processing", |ui| post_settings(app, ui));
-    section(ui, 7, icon::PUZZLE_PIECE, "Browser extension", |ui| {
+    section(ui, 6, icon::BROADCAST, "Streams", |ui| stream_settings(&mut app.settings, ui));
+    section(ui, 7, icon::PACKAGE, "Post-processing", |ui| post_settings(app, ui));
+    section(ui, 8, icon::PUZZLE_PIECE, "Browser extension", |ui| {
         let p = palette(ui);
         ui.separator();
         let text = "The extension hands this app the links, videos and cookies of the pages you visit, on this computer \
@@ -105,7 +108,7 @@ pub(super) fn settings_page(app: &mut App, ui: &mut Ui) {
             });
         }
     });
-    section(ui, 8, icon::ARROW_CIRCLE_UP, "Updates", |ui| {
+    section(ui, 9, icon::ARROW_CIRCLE_UP, "Updates", |ui| {
         setting(ui, "Version", "", (), |ui| {
             if ui.add(button("Check now")).clicked() {
                 app.check_for_update(true);
@@ -116,7 +119,7 @@ pub(super) fn settings_page(app: &mut App, ui: &mut Ui) {
                      and only releases signed by the maintainer are.";
         switch(ui, "Check for updates at startup", about, &mut app.settings.check_updates);
     });
-    section(ui, 9, icon::WRENCH, "Advanced", |ui| {
+    section(ui, 10, icon::WRENCH, "Advanced", |ui| {
         let s = &mut app.settings;
         setting(ui, "Retries", "Failed attempts per chunk before the download fails; attempts that made progress don't count.", s.max_retries, |ui| {
             ui.add(egui::DragValue::new(&mut s.max_retries).range(0..=100));
@@ -397,7 +400,8 @@ fn media_settings(app: &mut App, ui: &mut Ui) {
     setting(ui, "SponsorBlock", about, s.sponsorblock, |ui| {
         combo(ui, "sponsorblock_combo", &mut s.sponsorblock, &crate::settings::SPONSORBLOCK_MODES);
     });
-    let about = "Languages to save a video's subtitles in, as .srt or .vtt files next to it: the site's own, else its automatic captions.";
+    let about = "Languages to save a video's subtitles in, as .srt or .vtt files next to it: the site's own, else its automatic captions. \
+                 An HLS or DASH stream takes its subtitles tracks in them (empty: all of them; none: none).";
     text_setting(ui, "Subtitles", about, &mut s.subtitles, "en,es or all", false);
     let about = "Title, artist, date, description, link and chapters inside the file (needs ffmpeg).";
     switch(ui, "Embed tags and chapters", about, &mut s.embed_metadata);
@@ -423,6 +427,40 @@ fn media_settings(app: &mut App, ui: &mut Ui) {
     let mut install = app.settings.install_ffmpeg == Some(true);
     if switch(ui, "Install ffmpeg when a video needs it", FFMPEG_ABOUT, &mut install) {
         app.answer_ffmpeg(install);
+    }
+}
+
+/// What HLS and DASH downloads take when their tracks are not chosen (see `Choose tracks…`), what
+/// they leave out, how live recordings end and how stream files are named. A value the engine
+/// would refuse says so and is left out.
+fn stream_settings(s: &mut Settings, ui: &mut Ui) {
+    let about = "The video an HLS or DASH stream's download takes: the best at most this tall, in this codec and range.";
+    setting(ui, "Video quality", about, (s.stream_height, s.stream_codec, s.stream_range), |ui| {
+        combo(ui, "stream_range_combo", &mut s.stream_range, &VIDEO_RANGES.map(|(name, _)| name));
+        combo(ui, "stream_codec_combo", &mut s.stream_codec, &VIDEO_CODECS.map(|(name, _)| name));
+        combo(ui, "stream_height_combo", &mut s.stream_height, &VIDEO_HEIGHTS.map(|(name, _)| name));
+    });
+    let about = "The audio tracks it takes, the best of each language in this order (all: every language). Empty: the default track.";
+    text_setting(ui, "Audio languages", about, &mut s.audio_languages, "en, ja", false);
+    if let Err(e) = AudioSpec::parse(&s.audio_languages) {
+        error_alert(ui, &format!("{}; it is left out", e));
+    }
+    let about = "Segments whose links hold one of these, comma-separated (* for any run of characters), are left out of every track, \
+                 as the ad breaks a playlist marks are.";
+    text_setting(ui, "Ad link patterns", about, &mut s.ad_patterns, "ad*.ts, /ads/", false);
+    let about = "A live recording ends after this long and is kept, a channel's too (0 = until the stream ends or you stop it).";
+    setting(ui, "Stop live recordings after", about, s.record_minutes, |ui| {
+        ui.add(egui::DragValue::new(&mut s.record_minutes).range(0..=100_000).suffix(" min"));
+    });
+    let about = "A live HLS or DASH recording, or a channel's, ends and is kept once nothing new came for this long (0 = never).";
+    setting(ui, "Stop when idle for", about, s.live_idle_timeout, |ui| {
+        ui.add(egui::DragValue::new(&mut s.live_idle_timeout).range(0..=86_400).suffix(" s"));
+    });
+    let variables: Vec<String> = hyperfetch_core::NAME_VARIABLES.iter().map(|name| format!("{{{}}}", name)).collect();
+    let about = format!("How a stream's file is named, its extension added (empty: as it would be). Variables: {}.", variables.join(" "));
+    text_setting(ui, "File name pattern", &about, &mut s.name_pattern, "{name} {height}p {audio}", false);
+    if let Err(e) = Some(s.name_pattern.as_str()).filter(|pattern| !pattern.trim().is_empty()).map_or(Ok(()), hyperfetch_core::check_name_pattern) {
+        error_alert(ui, &format!("{}; it is left out", e));
     }
 }
 
@@ -619,6 +657,44 @@ mod tests {
         click(&mut h, |h| h.find_near("Check against the site's checksum", TOGGLE));
         click(&mut h, |h| h.find_near("Keep the server's file date", TOGGLE));
         assert!(!h.app.settings.remote_checksum && h.app.settings.remote_time);
+    }
+
+    /// The Streams rows set their settings through input: the video quality from its three
+    /// choices, the audio languages, ad patterns and file-name pattern as typed, the variables
+    /// listed; a value the engine would refuse says so until it is put right.
+    #[test]
+    fn stream_rows_work_through_input() {
+        let mut h = Harness::new();
+        h.app.tab = Tab::Settings;
+        assert!(h.settle());
+        scroll_to(&mut h, "Video quality");
+        click(&mut h, |h| h.find_near("Video quality", "Best"));
+        click(&mut h, |h| h.find("1080p"));
+        click(&mut h, |h| h.find_near("Video quality", "Any codec"));
+        click(&mut h, |h| h.find("HEVC (H.265)"));
+        assert_eq!(h.app.settings.video_spec(), "1080p,hevc");
+        assert!(h.texts().iter().any(|(text, _)| text.contains("{name} {height} {width}") && text.contains("{channel} {date} {time}")), "{:?}", h.texts());
+
+        let refused = |h: &Harness, start: &str| h.texts().iter().any(|(text, _)| text.starts_with(start) && text.ends_with("it is left out"));
+        click(&mut h, |h| h.find("en, ja"));
+        h.type_text("en, ja, english!");
+        h.key(egui::Key::Escape, egui::Modifiers::NONE);
+        assert!(h.settle() && refused(&h, "Unknown audio term \"english!\""), "{:?}", h.texts());
+        click(&mut h, |h| h.find("{name} {height}p {audio}"));
+        h.type_text("{name} [{heigth}p]");
+        h.key(egui::Key::Escape, egui::Modifiers::NONE);
+        assert!(h.settle() && refused(&h, "Unknown name variable {heigth}"), "{:?}", h.texts());
+        click(&mut h, |h| h.find("ad*.ts, /ads/"));
+        h.type_text("/ads/, *promo*.ts");
+        h.key(egui::Key::Escape, egui::Modifiers::NONE);
+        let s = &mut h.app.settings;
+        assert_eq!((s.audio_languages.as_str(), s.ad_patterns.as_str()), ("en, ja, english!", "/ads/, *promo*.ts"));
+        (s.audio_languages, s.name_pattern) = ("en, ja".into(), "{name} [{height}p]".into());
+        assert!(h.settle() && !h.texts().iter().any(|(text, _)| text.ends_with("it is left out")), "put right");
+        let file = [url::Url::parse("https://example.com/v/master.m3u8").unwrap()];
+        let opts = h.app.settings.download_options(&file, "", "").unwrap();
+        assert_eq!((opts.tracks.video.as_str(), opts.tracks.audio.as_str(), opts.name_pattern.as_deref()), ("1080p,hevc", "en, ja", Some("{name} [{height}p]")));
+        assert_eq!(opts.ad_patterns, ["/ads/", "*promo*.ts"]);
     }
 
     /// The categories under Sort into folders are edited in place: one deleted, a new one (first,

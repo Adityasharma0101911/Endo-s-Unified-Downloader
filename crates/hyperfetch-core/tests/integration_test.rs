@@ -171,6 +171,8 @@ struct Stats {
     authorized: AtomicUsize,
     /// The address each GET came from, in request order.
     peers: Mutex<Vec<std::net::IpAddr>>,
+    /// Each request's target with its `Referer` and `Origin`, in request order.
+    browser_heads: Mutex<Vec<(String, Option<String>, Option<String>)>>,
 }
 
 impl Mock {
@@ -275,6 +277,7 @@ async fn handle(mut socket: TcpStream, mock: Arc<Mock>) {
     if header("authorization").is_some() {
         s.authorized.fetch_add(1, Ordering::SeqCst);
     }
+    s.browser_heads.lock().unwrap().push((target.clone(), header("referer"), header("origin")));
     let range = header("range");
     let probe = range.as_deref() == Some("bytes=0-0") || range == Some(format!("bytes=0-{}", PREFETCH - 1));
     if let Some(location) = &mock.redirect {
@@ -3964,33 +3967,27 @@ fn live_playlist(key: &str) -> Vec<u8> {
         .into_bytes()
 }
 
+/// A live HLS playlist is recorded by the engine itself, not yt-dlp, here until no new segment
+/// has come for a second.
 #[tokio::test]
-async fn test_a_live_hls_stream_is_recorded_with_yt_dlp() {
+async fn test_a_live_hls_stream_is_recorded_by_the_engine() {
     isolate_history();
     let _history = HISTORY.write().await;
     let (tools, temp) = (tempdir().unwrap(), tempdir().unwrap());
+    // Every path of the mock serves the playlist, so each segment is it.
     let url = serve(Arc::new(Mock::new(live_playlist(""))), "live/index.m3u8").await;
-    // What yt-dlp's generic site finds there: a live stream, which only it records.
-    let output = temp.path().join("index.mp4");
-    let info = serde_json::json!({
-        "_type": "video", "extractor_key": "Generic", "id": "index", "title": "index",
-        "is_live": true, "live_status": "is_live", "url": url.as_str(), "protocol": "m3u8_native",
-        "format_id": "0", "ext": "mp4", "requested_downloads": [{ "filename": output }],
-    });
-    std::fs::write(tools.path().join("info.json"), serde_json::to_vec(&info).unwrap()).unwrap();
     let opts = DownloadOptions {
-        ytdlp_path: Some(fake_ytdlp(tools.path(), &output)),
+        ytdlp_path: Some(fake_ytdlp(tools.path(), &temp.path().join("index.mp4"))),
+        live_idle_timeout: Some(1),
         ..options(temp.path(), 4, 64 * KB)
     };
 
-    let path = run(&DownloadEngine::new(vec![url.clone()], opts), None).await.expect("the stream should be recorded");
-    assert_eq!(path, output);
-    // Found, then recorded from the link again: yt-dlp dates a live stream's title each time it
-    // takes it in, so what was found would name the recording with the date twice.
-    let runs = runs_of(tools.path());
-    assert_eq!(runs.len(), 2, "{runs:?}");
-    assert!(runs[0].contains(&"-J".to_string()) && runs[0].last() == Some(&url.to_string()), "{runs:?}");
-    assert!(!runs[1].contains(&"--load-info-json".to_string()) && runs[1].last() == Some(&url.to_string()), "{runs:?}");
+    let path = run(&DownloadEngine::new(vec![url], opts), None).await.expect("the stream should be recorded");
+    assert_eq!(path, temp.path().join("index.ts"));
+    assert_file(&path, &[live_playlist(""), live_playlist("")].concat());
+    assert!(runs_of(tools.path()).is_empty(), "yt-dlp was asked to record it");
+    let entry = history_entry(&path).expect("the recording is recorded");
+    assert_eq!(entry.status, HistoryStatus::Completed);
 }
 
 /// Live TV behind FairPlay or Widevine is refused, not handed to a recording.
@@ -4013,82 +4010,49 @@ async fn test_a_drm_protected_live_hls_stream_is_an_error_not_a_recording() {
     }
 }
 
-/// A stream whose audio is a playlist of its own goes to yt-dlp, which merges the two, with the
-/// page's referer and the browser's headers.
+/// A live DASH manifest is recorded by the engine itself, not yt-dlp: a `.mpd` link, one the
+/// browser saw read as DASH (`dash`), one that answers as DASH, and one with the height the
+/// browser's user chose. Each records its first new segment, a stream second being asked for;
+/// the manifest and the segments are asked for with the page's referer and the browser's headers.
 #[tokio::test]
-async fn test_an_hls_stream_with_separate_audio_goes_to_yt_dlp_with_the_browsers_request() {
+async fn test_live_dash_manifests_are_recorded_by_the_engine() {
     isolate_history();
     let _history = HISTORY.write().await;
-    let (tools, temp) = (tempdir().unwrap(), tempdir().unwrap());
-    let master = "#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"en\",URI=\"audio/en.m3u8\"\n\
-                  #EXT-X-STREAM-INF:BANDWIDTH=8000000,CODECS=\"avc1.640028,mp4a.40.2\",AUDIO=\"aud\"\nvideo.m3u8\n";
-    let url = serve(Arc::new(Mock::new(master.as_bytes().to_vec())), "show/master.m3u8").await;
-    // What yt-dlp's generic site finds there, left to yt-dlp to download.
-    let output = temp.path().join("master.mp4");
-    let info = serde_json::json!({
-        "_type": "video", "extractor_key": "Generic", "id": "master", "title": "master",
-        "requested_downloads": [{ "filename": output }],
-    });
-    std::fs::write(tools.path().join("info.json"), serde_json::to_vec(&info).unwrap()).unwrap();
-    let opts = DownloadOptions {
-        ytdlp_path: Some(fake_ytdlp(tools.path(), &output)),
-        referer: Some("https://page.example/watch".into()),
-        headers: vec![("Origin".into(), "https://page.example".into())],
-        ..options(temp.path(), 4, 64 * KB)
-    };
-
-    assert_eq!(run(&DownloadEngine::new(vec![url.clone()], opts), None).await, Ok(output));
-    let runs = runs_of(tools.path());
-    assert!(runs.first().is_some_and(|found| found.contains(&"-J".to_string()) && found.last() == Some(&url.to_string())), "{runs:?}");
-    for args in &runs {
-        assert!(has_arg(args, "--referer", "https://page.example/watch"), "{args:?}");
-        assert!(has_arg(args, "--add-header", "Origin:https://page.example"), "{args:?}");
-    }
-}
-
-/// A DASH manifest goes to yt-dlp, with the browser's request: a `.mpd` link, one the browser saw
-/// read as DASH (`dash`), and one that answers as DASH. The height the browser's user chose is
-/// the format yt-dlp gets, here for a stream with its audio apart.
-#[tokio::test]
-async fn test_dash_manifests_and_a_chosen_height_go_to_yt_dlp() {
-    isolate_history();
-    let _history = HISTORY.write().await;
-    const MPD: &[u8] = b"<?xml version=\"1.0\"?><MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\"></MPD>";
-    let master = "#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"en\",URI=\"audio/en.m3u8\"\n\
-                  #EXT-X-STREAM-INF:BANDWIDTH=8000000,RESOLUTION=1280x720,AUDIO=\"aud\"\nvideo.m3u8\n";
+    const MPD: &[u8] = b"<?xml version=\"1.0\"?><MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\" type=\"dynamic\" availabilityStartTime=\"2024-01-01T00:00:00Z\">        <Period start=\"PT0S\"><AdaptationSet contentType=\"video\"><SegmentTemplate media=\"v-$Number$.m4s\" duration=\"2\"/>        <Representation id=\"v\" bandwidth=\"1\" width=\"1280\" height=\"720\" codecs=\"avc1.64001f\"/></AdaptationSet></Period></MPD>";
     let mut answers_dash = Mock::new(MPD.to_vec());
     answers_dash.content_type = Some("application/dash+xml");
+    let mocks = [Mock::new(MPD.to_vec()), Mock::new(MPD.to_vec()), answers_dash, Mock::new(MPD.to_vec())].map(Arc::new);
     let links = [
-        (serve(Arc::new(Mock::new(MPD.to_vec())), "show/manifest.mpd").await, false, None),
-        (serve(Arc::new(Mock::new(MPD.to_vec())), "api/play?id=7").await, true, None),
-        (serve(Arc::new(answers_dash), "api/stream").await, false, None),
-        (serve(Arc::new(Mock::new(master.as_bytes().to_vec())), "show/master.m3u8").await, false, Some(720)),
+        (serve(Arc::clone(&mocks[0]), "show/manifest.mpd").await, false, None),
+        (serve(Arc::clone(&mocks[1]), "api/play?id=7").await, true, None),
+        (serve(Arc::clone(&mocks[2]), "api/stream").await, false, None),
+        (serve(Arc::clone(&mocks[3]), "live/show.mpd").await, false, Some(720)),
     ];
-    for (url, dash, height) in links {
+    for ((url, dash, height), mock) in links.into_iter().zip(&mocks) {
         let (tools, temp) = (tempdir().unwrap(), tempdir().unwrap());
-        let output = temp.path().join("show.mp4");
-        let info = serde_json::json!({
-            "_type": "video", "extractor_key": "Generic", "id": "show", "title": "show",
-            "requested_downloads": [{ "filename": output }],
-        });
-        std::fs::write(tools.path().join("info.json"), serde_json::to_vec(&info).unwrap()).unwrap();
         let opts = DownloadOptions {
-            ytdlp_path: Some(fake_ytdlp(tools.path(), &output)),
+            ytdlp_path: Some(fake_ytdlp(tools.path(), &temp.path().join("show.mp4"))),
+            referer: Some("https://page.example/watch".into()),
             headers: vec![("Origin".into(), "https://page.example".into())],
             dash,
             height,
+            record_seconds: Some(1),
             ..options(temp.path(), 4, 64 * KB)
         };
 
-        assert_eq!(run(&DownloadEngine::new(vec![url.clone()], opts), None).await, Ok(output), "{url}");
-        let runs = runs_of(tools.path());
-        let found = runs.first().is_some_and(|find| find.contains(&"-J".to_string()) && find.last() == Some(&url.to_string()));
-        assert!(found && runs.len() == 2, "{url}: {runs:?}");
-        for args in &runs {
-            assert!(has_arg(args, "--add-header", "Origin:https://page.example"), "{args:?}");
-            if height.is_some() {
-                assert!(has_arg(args, "-f", "bv*[height<=720]+ba/b[height<=720]"), "{args:?}");
-            }
+        let path = run(&DownloadEngine::new(vec![url.clone()], opts), None).await.unwrap_or_else(|e| panic!("{url}: {e}"));
+        assert_eq!(path.parent(), Some(temp.path()), "{url}");
+        // Every path of the mock serves the manifest, so the segment is it.
+        assert_file(&path, MPD);
+        assert!(runs_of(tools.path()).is_empty(), "{url}: yt-dlp was asked to record it");
+        let heads = mock.stats.browser_heads.lock().unwrap().clone();
+        let manifest = url.query().map_or_else(|| url.path().to_string(), |query| format!("{}?{query}", url.path()));
+        for asked in [manifest.as_str(), ".m4s"] {
+            let sent: Vec<_> = heads.iter().filter(|(target, ..)| target.ends_with(asked)).collect();
+            let browsers = |(_, referer, origin): &&(String, Option<String>, Option<String>)| {
+                referer.as_deref() == Some("https://page.example/watch") && origin.as_deref() == Some("https://page.example")
+            };
+            assert!(!sent.is_empty() && sent.iter().all(browsers), "{url}: {asked} asked for as {heads:?}");
         }
     }
 }

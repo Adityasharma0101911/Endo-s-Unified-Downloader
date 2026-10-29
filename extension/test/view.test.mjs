@@ -22,6 +22,7 @@ test("chips name the kind first, then live, encryption and DRM", () => {
   assert.deepEqual(itemChips({ kind: "file", format: "webm" }), [["WEBM", "cyan"]]);
   assert.deepEqual(itemChips({ kind: "file" }), [["FILE", "cyan"]]);
   assert.deepEqual(itemChips({ kind: "dash" }), [["DASH", "accent"]]);
+  assert.deepEqual(itemChips({ kind: "smooth", format: "ism" }), [["SMOOTH", "accent"]]);
   assert.deepEqual(itemChips({ kind: "hls", inline: true, hls: { kind: "media", live: true, encrypted: true, drm: true } }), [
     ["HLS", "accent"],
     ["Inline", ""],
@@ -42,6 +43,7 @@ test("the note says why an item downloads as it does, DRM first", () => {
   assert.match(itemNote({ kind: "hls", hls: { drm: true, live: true } }), /DRM/);
   assert.match(itemNote({ kind: "hls", hls: master({ separateAudio: true }) }), /Separate audio/);
   assert.match(itemNote({ kind: "dash" }), /DASH/);
+  assert.match(itemNote({ kind: "smooth" }), /Smooth Streaming/);
   assert.match(itemNote({ kind: "hls", hls: { kind: "media", live: true } }), /Live/);
   assert.equal(itemNote({ kind: "file" }), "");
 });

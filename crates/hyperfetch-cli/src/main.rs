@@ -1,6 +1,8 @@
 mod cli;
+mod doctor;
 mod download;
 mod probe;
+mod tools;
 
 use std::future::Future;
 use std::io::{IsTerminal, Write};
@@ -9,12 +11,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use clap::{CommandFactory, Parser};
+use clap::CommandFactory;
 use hyperfetch_core::engine::{build_client, stream_to, DownloadOptions, IpFamily};
 use hyperfetch_core::history::{
     is_redacted, redact_url, DownloadHistoryManager, HistoryEntry, HistoryStatus, REDACTED_LINK,
 };
-use hyperfetch_core::ingest::{decode_text, descriptor_client, http_url, ingest, input_tokens, ListOptions, Task};
+use hyperfetch_core::ingest::{
+    decode_text, descriptor_client, http_url, ingest, input_tokens, list_channels, might_be_channel_list, ListOptions, Task,
+};
+use hyperfetch_core::TrackChoice;
 use hyperfetch_core::media::{self, find_ffmpeg_path, is_supported_media_site, BrowserCookieSource};
 use hyperfetch_core::p2p;
 use hyperfetch_core::paste::{self, PastedLink};
@@ -39,20 +44,12 @@ fn main() {
     // What an earlier update left behind (the old programs) can be deleted once they have exited.
     updater::cleanup_old();
     updater::refresh_extension();
-    let args = Args::parse();
-    if let Some(shell) = args.completions {
-        // For the name it was started by (a link such as `endos-downloader` included).
-        let argv0 = std::env::args_os().next().map(PathBuf::from);
-        let name = argv0.as_deref().and_then(Path::file_stem).map_or("Endos-Unified-Downloader-CLI".into(), |n| n.to_string_lossy());
-        clap_complete::generate(shell, &mut Args::command(), name.into_owned(), &mut std::io::stdout());
-        return;
-    }
     // On a thread of its own: a MEGA or swarm download nests futures deep enough to overflow
     // the main thread's 1 MiB stack on Windows in a debug build.
     let code = std::thread::Builder::new()
         .stack_size(8 << 20)
-        .spawn(move || run_detached(app(args)))
-        .and_then(|runner| runner.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)))
+        .spawn(run_cli)
+        .and_then(|runner| Ok(runner.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))))
         .unwrap_or_else(|e| {
             stderr_line(&format!("error: cannot start the async runtime: {}", e));
             EXIT_FAILED
@@ -65,6 +62,40 @@ fn main() {
 /// Runs `app` to completion, then shuts the runtime down without waiting for blocking work that
 /// was abandoned: a final hash or disk sync still running past the stop timeout, or a stdin read.
 /// Dropping the runtime normally would wait for it, with the signal listener already gone.
+fn run_cli() -> i32 {
+    let raw_args: Vec<String> = std::env::args().collect();
+    let preprocessed = tools::preprocess_cli_args(&raw_args);
+    let os_args: Vec<std::ffi::OsString> = preprocessed.into_iter().map(std::ffi::OsString::from).collect();
+    let args = match cli::load(os_args, data_folder().map(|dir| dir.join("cli.conf"))) {
+        Ok(a) => a,
+        Err(e) => {
+            stderr_line(&e);
+            return EXIT_USAGE;
+        }
+    };
+
+    if let Some(ref opt) = args.morehelp {
+        tools::print_morehelp(opt);
+        return 0;
+    }
+
+    if let Some(subcmd) = args.command {
+        return run_detached(tools::execute_subcommand(subcmd)).unwrap_or(1);
+    }
+
+    if let Some(shell) = args.completions {
+        let argv0 = std::env::args_os().next().map(PathBuf::from);
+        let name = argv0.as_deref().and_then(Path::file_stem).map_or("Endos-Unified-Downloader-CLI".into(), |n| n.to_string_lossy());
+        clap_complete::generate(shell, &mut Args::command(), name.into_owned(), &mut std::io::stdout());
+        return 0;
+    }
+
+    run_detached(app(args)).unwrap_or_else(|e| {
+        stderr_line(&format!("error: cannot start the async runtime: {}", e));
+        EXIT_FAILED
+    })
+}
+
 fn run_detached(app: impl Future<Output = i32>) -> std::io::Result<i32> {
     let runtime = tokio::runtime::Runtime::new()?;
     let code = runtime.block_on(app);
@@ -95,12 +126,21 @@ async fn app(mut args: Args) -> i32 {
     if args.update {
         return update(args.proxy.as_deref()).await;
     }
+    if args.doctor {
+        return doctor::run(&args, data_folder(), &ui).await;
+    }
     if let Some(path) = &args.verify {
         return verify_file(&args, path, &ui, &shutdown).await;
     }
     // Each prints or writes something else than the downloads of an interactive prompt.
-    if args.urls.is_empty() && args.input_file.is_none() && (args.json || args.spider || args.dry_run || args.preview || args.stdout) {
-        return usage("--json, --spider, --dry-run, --preview and --stdout need URLs or -i");
+    let other = args.json || args.spider || args.dry_run || args.preview || args.stdout || args.list_tracks || args.start_at.is_some();
+    if args.urls.is_empty() && args.input_file.is_none() && other {
+        return usage("--json, --spider, --dry-run, --preview, --stdout, --list-tracks and --start-at need URLs or -i");
+    }
+    if let Some(time) = &args.start_at {
+        if let Err(e) = wait_until(time, &ui).await {
+            return usage(&e);
+        }
     }
     if args.stdout {
         return to_stdout(&args, &ui, &shutdown).await;
@@ -112,6 +152,9 @@ async fn app(mut args: Args) -> i32 {
         Ok(client) => client,
         Err(e) => return usage(&e),
     };
+    if args.list_tracks {
+        return list_tracks(&args, &ui, &http).await;
+    }
     let code = if args.urls.is_empty() && args.input_file.is_none() {
         interactive(&args, &ui, &shutdown, &http, at_terminal().then_some(find_ffmpeg_path as Finder), prompt).await
     } else {
@@ -136,10 +179,10 @@ fn usage(message: &str) -> i32 {
 
 /// Turns `-u USER[:PASS]` into an Authorization header (an Authorization --header wins over it),
 /// with the password asked of `ask` when it is missing (see [`cli::basic_auth`]); not asked when
-/// nothing would send it (--history, --update, --verify).
+/// nothing would send it (--history, --update, --verify, --doctor).
 fn sign_in(args: &mut Args, ask: Option<fn(&str) -> Option<String>>) -> Result<(), String> {
     let Some(user) = args.user.take() else { return Ok(()) };
-    if args.auth_header().is_some() || args.history || args.update || args.verify.is_some() {
+    if args.auth_header().is_some() || args.history || args.update || args.verify.is_some() || args.doctor {
         return Ok(());
     }
     args.headers.push(("Authorization".to_string(), cli::basic_auth(&user, ask)?));
@@ -344,6 +387,72 @@ async fn check_output_file(dir: &Path, output: Option<&Path>) -> Result<(), Stri
     Ok(())
 }
 
+/// Refuses --live-from for a download that goes to yt-dlp (a media site's link, or any with
+/// --media-preset; see [`Job::needs_ffmpeg`]), which can only start a recording at its start.
+fn check_live_from<'a>(args: &Args, mut jobs: impl Iterator<Item = &'a Job>) -> Result<(), String> {
+    match args.live_from.is_some() && jobs.any(Job::needs_ffmpeg) {
+        true => Err("--live-from is for HLS and DASH links: a media site's live stream (or any link with --media-preset) takes only --live-from-start".to_string()),
+        false => Ok(()),
+    }
+}
+
+/// The folder of the download history, where the CLI's config file is too.
+fn data_folder() -> Option<PathBuf> {
+    DownloadHistoryManager::default_history_path().parent().map(Path::to_path_buf)
+}
+
+/// Waits until the time `--start-at` gives (see [`cli::start_time`]), saying when that is. Ctrl+C
+/// meanwhile ends the program at once: nothing is running yet (see `Shutdown::install`).
+async fn wait_until(time: &str, ui: &Ui) -> Result<(), String> {
+    let start = cli::start_time(time, cli::now())?;
+    if !ui.quiet() {
+        ui.error(&format!("Waiting to start at {} (Ctrl+C ends the program)", hyperfetch_core::stream::clock_text(start)));
+    }
+    // By the clock, in steps: time the computer spends asleep counts.
+    loop {
+        let left = start - cli::now();
+        if left <= 0.0 {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_secs_f64(left.min(30.0))).await;
+    }
+}
+
+/// --list-tracks: the tracks and parts of each HLS or DASH link (see `list_tracks`), read as its
+/// download would read them, or the channels of a channel list. Nothing is downloaded.
+async fn list_tracks(args: &Args, ui: &Ui, http: &reqwest::Client) -> i32 {
+    let mut failed = 0;
+    for link in &args.urls {
+        let listed = async {
+            if might_be_channel_list(link) {
+                if let Some(channels) = list_channels(link, http, &list_options(args)).await? {
+                    return Ok((probe::channel_lines(&channels), probe::channels_item(link, &channels)));
+                }
+            }
+            let url = Url::parse(link).map_err(|e| format!("not a link: {}", e))?;
+            let options = job(args, 1, Path::new("."), Task { urls: vec![url.clone()], ..Default::default() }).options;
+            let info = hyperfetch_core::list_tracks(&url, &options).await?;
+            Ok::<_, String>((probe::track_lines(&info), probe::tracks_item(link, &info)))
+        }
+        .await;
+        match listed {
+            Ok((lines, json)) => {
+                if !ui.json {
+                    ui.print(link);
+                    lines.iter().for_each(|line| ui.print(line));
+                }
+                ui.report(json);
+            }
+            Err(e) => {
+                failed += 1;
+                ui.error(&format!("[FAILED] {}: {}", link, e));
+                ui.report(item("failed", Some(link), None, None, None, None, Some(&e)));
+            }
+        }
+    }
+    exit_code(None, failed)
+}
+
 /// The download directory, created if missing.
 async fn prepare_dir(dir: &Path) -> Result<PathBuf, String> {
     tokio::fs::create_dir_all(dir)
@@ -392,6 +501,17 @@ fn job(args: &Args, connections: u64, dir: &Path, task: Task) -> Job {
         sponsorblock: args.sponsorblock.clone(),
         merge_format: args.merge_format.clone(),
         hls_to_mp4: args.hls_mp4,
+        tracks: TrackChoice {
+            video: args.video.clone().unwrap_or_default(),
+            audio: args.audio.clone().unwrap_or_default(),
+            ids: args.tracks.clone(),
+        },
+        live_from: args.live_from.clone(),
+        live_idle_timeout: args.live_idle_timeout,
+        ad_patterns: args.ad_patterns.clone(),
+        drop_parts: cli::part_ids(args.drop_parts.as_deref()),
+        name_pattern: args.name_pattern.clone(),
+        channel: task.channel,
         media_name: task.media_name,
         archive_lines: task.archive,
         bittorrent: task.p2p,
@@ -431,12 +551,21 @@ fn list_options(args: &Args) -> ListOptions {
         debrid_magnets: !(args.dry_run || args.spider),
         password: args.password.clone(),
         auth: None,
+        channels: args.channels.iter().cloned().chain(args.all_items.then(|| "*".to_string())).collect(),
     }
 }
 
 /// What `tokens` list, and what of it could not be read (see `ListNote::failed`); the other
-/// notes of the listing are logged: warnings reach stderr.
+/// notes of the listing are logged: warnings reach stderr. A channel list with no channel chosen
+/// is an error that lists them and says how to choose.
 async fn listed(tokens: &[String], http: &reqwest::Client, list: &ListOptions) -> (Result<Vec<Task>, String>, Vec<String>) {
+    if let [token] = tokens {
+        if list.channels.is_empty() && might_be_channel_list(token) {
+            if let Ok(Some(channels)) = list_channels(token, http, list).await {
+                return (Err(probe::choose_channels(&channels)), Vec::new());
+            }
+        }
+    }
     let (notes, noted) = std::sync::mpsc::channel();
     let result = ingest(tokens, http, &ListOptions { notes: Some(notes), ..list.clone() }).await;
     let mut missing = Vec::new();
@@ -666,6 +795,9 @@ async fn batch(args: &Args, ui: &Ui, shutdown: &Shutdown, http: &reqwest::Client
             (pasted_job(args, &dir, line, task, pasted), size)
         })
         .collect();
+    if let Err(e) = check_live_from(args, sized.iter().map(|(job, _)| job)) {
+        return usage(&e);
+    }
     if args.dry_run {
         probe::dry_run(&sized, http, ui, args.no_clobber).await;
         return exit_code(None, failed);
@@ -880,7 +1012,11 @@ where
             }
         };
 
-        let jobs = tasks.into_iter().map(|t| job(args, connections, &dir, t)).collect();
+        let jobs: Vec<Job> = tasks.into_iter().map(|t| job(args, connections, &dir, t)).collect();
+        if let Err(e) = check_live_from(args, jobs.iter()) {
+            stderr_line(&format!("[ERROR] {}", e));
+            continue;
+        }
         let mut jobs = before_running(args, jobs, ui).await;
         let install = may_install_ffmpeg(args, &jobs, &mut ffmpeg_answer, find, &mut ask).await;
         for job in &mut jobs {
@@ -1205,6 +1341,7 @@ async fn verify_file(args: &Args, path: &Path, ui: &Ui, shutdown: &Shutdown) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
     use hyperfetch_core::ByteRange;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1465,6 +1602,99 @@ mod tests {
         clap_complete::generate(clap_complete::Shell::Bash, &mut Args::command(), "endos-downloader", &mut script);
         let script = String::from_utf8(script).unwrap();
         assert!(["endos-downloader", "--spider", "--dry-run", "--server-response", "--only-if-newer"].iter().all(|s| script.contains(s)));
+        let streams = ["--video", "--audio", "--tracks", "--list-tracks", "--drop-parts", "--ad-pattern", "--live-from", "--live-idle-timeout"];
+        let run = ["--channel", "--name-pattern", "--config", "--no-config", "--doctor", "--start-at"];
+        for flag in streams.iter().chain(&run) {
+            assert!(script.contains(flag), "{flag}");
+        }
+    }
+
+    /// The stream flags reach the engine, and a channel's name its download.
+    #[test]
+    fn stream_flags_reach_the_engine() {
+        let args = parse(&[
+            "--video", "720p", "--audio", "en,ja", "--tracks", "v1,a0", "--drop-parts", "1-2", "--ad-pattern", "/ads/", "--name-pattern",
+            "{channel} {date}", "--live-from", "30m", "--live-idle-timeout", "15", "--subs", "none", "--sections", "10-20", "u",
+        ]);
+        let task = Task { urls: vec![Url::parse("https://tv.example/news.m3u8").unwrap()], channel: Some("News".into()), ..Default::default() };
+        let options = job(&args, 4, Path::new("d"), task).options;
+        let tracks = TrackChoice { video: "720p".into(), audio: "en,ja".into(), ids: vec!["v1".into(), "a0".into()] };
+        assert_eq!((options.tracks, options.drop_parts, options.ad_patterns), (tracks, vec![1, 2], vec!["/ads/".to_string()]));
+        assert_eq!((options.name_pattern.as_deref(), options.channel.as_deref()), (Some("{channel} {date}"), Some("News")));
+        assert_eq!((options.live_from.as_deref(), options.live_idle_timeout), (Some("30m"), Some(15)));
+        assert_eq!((options.subtitles.as_deref(), options.sections), (Some("none"), vec![(10.0, 20.0)]));
+        let defaults = job(&parse(&["u"]), 4, Path::new("d"), Task { urls: vec![Url::parse("https://a.example/f").unwrap()], ..Default::default() }).options;
+        assert_eq!((defaults.tracks, defaults.drop_parts, defaults.channel), (TrackChoice::default(), Vec::new(), None));
+        assert!(defaults.live_from.is_none() && defaults.live_idle_timeout.is_none() && defaults.ad_patterns.is_empty() && defaults.name_pattern.is_none());
+        // --channel chooses a channel list's channels, --all-items every one.
+        assert!(list_options(&parse(&["u"])).channels.is_empty());
+        assert_eq!(list_options(&parse(&["--channel", "news", "--channel", "*sport*", "u"])).channels, ["news", "*sport*"]);
+        assert_eq!(list_options(&parse(&["--all-items", "u"])).channels, ["*"]);
+    }
+
+    /// --live-from is refused for what goes to yt-dlp, which can only start at a stream's start.
+    #[test]
+    fn live_from_is_for_hls_and_dash_links() {
+        let jobs = |args: &Args, link: &str| vec![job(args, 4, Path::new("d"), Task { urls: vec![Url::parse(link).unwrap()], ..Default::default() })];
+        let args = parse(&["--live-from", "30m", "u"]);
+        assert!(check_live_from(&args, jobs(&args, "https://tv.example/live.m3u8").iter()).is_ok());
+        let e = check_live_from(&args, jobs(&args, "https://www.youtube.com/watch?v=jNQXAC9IVRw").iter()).unwrap_err();
+        assert!(e.contains("--live-from-start"), "{e}");
+        let preset = parse(&["--live-from", "30m", "--media-preset", "best", "u"]);
+        assert!(check_live_from(&preset, jobs(&preset, "https://tv.example/live.m3u8").iter()).is_err());
+        let plain = parse(&["u"]);
+        assert!(check_live_from(&plain, jobs(&plain, "https://www.youtube.com/watch?v=jNQXAC9IVRw").iter()).is_ok());
+    }
+
+    /// --list-tracks lists an HLS stream's tracks and parts (as JSON with --json), and a channel
+    /// list's channels; a link that is neither fails. Nothing is written.
+    #[tokio::test]
+    async fn list_tracks_lists_a_streams_tracks_and_a_lists_channels() {
+        let server = serve_answers(|head| {
+            let path = head.split_whitespace().nth(1).unwrap_or_default();
+            let playlist = |body: &str| response("200 OK", "application/vnd.apple.mpegurl", body);
+            match path {
+                "/master.m3u8" => playlist(
+                    "#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",LANGUAGE=\"en\",NAME=\"English\",DEFAULT=YES,URI=\"en.m3u8\"\n\
+                     #EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=1280x720,CODECS=\"avc1.64001f,mp4a.40.2\",AUDIO=\"aud\"\nlow.m3u8\n\
+                     #EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1920x1080,CODECS=\"avc1.640028,mp4a.40.2\",AUDIO=\"aud\"\nhigh.m3u8\n",
+                ),
+                "/low.m3u8" | "/high.m3u8" | "/en.m3u8" => playlist(
+                    "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\na.ts\n#EXTINF:4,\nb.ts\n#EXT-X-DISCONTINUITY\n#EXTINF:4,\nc.ts\n#EXT-X-ENDLIST\n",
+                ),
+                _ => response("404 Not Found", "text/plain", "gone"),
+            }
+        })
+        .await;
+        let dir = test_dir("list-tracks");
+        let channels = dir.join("tv.m3u");
+        std::fs::write(&channels, "#EXTM3U\n#EXTINF:-1 group-title=\"News\",News One\nhttps://tv.example/one.m3u8\n#EXTINF:-1,Sport\nhttps://tv.example/sport.mpd\n").unwrap();
+        let (ui, log) = json_ui(&dir);
+        let (master, missing) = (format!("{server}/master.m3u8"), format!("{server}/missing.m3u8"));
+        let args = parse(&["--list-tracks", "--json", &master, channels.to_str().unwrap(), &missing]);
+        assert_eq!(list_tracks(&args, &ui, &reqwest::Client::new()).await, EXIT_FAILED, "the missing one");
+        let items = json_items(&log);
+        let ids: Vec<&str> = items[0]["tracks"].as_array().unwrap().iter().map(|t| t["id"].as_str().unwrap()).collect();
+        assert_eq!((items[0]["status"].as_str(), items[0]["format"].as_str(), items[0]["live"].as_bool()), (Some("ok"), Some("hls"), Some(false)));
+        assert_eq!(ids, ["v0", "v1", "a0"]);
+        assert_eq!(items[0]["tracks"][1]["height"], 1080);
+        assert_eq!(items[0]["parts"].as_array().map(Vec::len), Some(2), "{}", items[0]);
+        let names: Vec<(&str, &str)> = items[1]["channels"].as_array().unwrap().iter().map(|c| (c["name"].as_str().unwrap(), c["url"].as_str().unwrap())).collect();
+        assert_eq!(names, [("News One", "https://tv.example/one.m3u8"), ("Sport", "https://tv.example/sport.mpd")]);
+        assert_eq!(items[1]["channels"][0]["group"], "News");
+        assert_eq!(items[2]["status"].as_str(), Some("failed"));
+        drop(ui);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2, "only the list and the log");
+
+        // Without a choice, a channel list is an error that lists its channels and says how to choose.
+        let (result, _) = listed(&[channels.to_str().unwrap().to_string()], &reqwest::Client::new(), &ListOptions::default()).await;
+        let e = result.unwrap_err();
+        assert!(e.contains("--channel") && e.contains("--all-items") && e.contains("News One [News]") && e.contains("\n  Sport"), "{e}");
+        let chosen = ListOptions { channels: vec!["sport".into()], ..ListOptions::default() };
+        let (result, _) = listed(&[channels.to_str().unwrap().to_string()], &reqwest::Client::new(), &chosen).await;
+        let tasks = result.unwrap();
+        assert_eq!((tasks.len(), tasks[0].channel.as_deref()), (1, Some("Sport")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A quiet Ui printing --json, everything it prints also in a log file, and that file.
