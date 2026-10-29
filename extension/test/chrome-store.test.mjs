@@ -33,6 +33,12 @@ test("the Chrome Web Store build has no YouTube button and leaves YouTube's host
   assert.equal(media.isMediaPage("https://vimeo.com/123"), true);
 });
 
+test("the manifest fits the Chrome Web Store's limits", () => {
+  const manifest = JSON.parse(readFileSync(join(EXTENSION, "manifest.json"), "utf8"));
+  assert.ok(manifest.description.length <= 132, `description is ${manifest.description.length} characters, the store takes 132`);
+  assert.ok(manifest.name.length <= 75 && manifest.short_name.length <= 12);
+});
+
 test("the extension itself keeps YouTube", () => {
   assert.equal(isBlocked("www.youtube.com", []), false);
   assert.equal(isMediaPage("https://www.youtube.com/watch?v=abc"), true);
