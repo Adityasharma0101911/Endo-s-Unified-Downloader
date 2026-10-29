@@ -123,10 +123,11 @@ jobs:
           Remove-Item -Recurse chrome-store/extension/test, chrome-store/extension/package.json
           node scripts/chrome-store.mjs chrome-store\extension
           if ($LASTEXITCODE) { exit 1 }
-          & $tar -a -cf "chrome-store\Endos-Unified-Downloader-Chrome-Web-Store-v$env:VERSION.zip" -C chrome-store\extension .
-          if ($LASTEXITCODE) { exit 1 }
+          # Not tar: its entries start with "./", and the store finds no manifest.json in "./manifest.json".
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          [System.IO.Compression.ZipFile]::CreateFromDirectory("$PWD\chrome-store\extension", "$PWD\chrome-store\Endos-Unified-Downloader-Chrome-Web-Store-v$env:VERSION.zip")
           $store = & $tar -tf "chrome-store\Endos-Unified-Downloader-Chrome-Web-Store-v$env:VERSION.zip"
-          if (-not ($store -match "^(\./)?manifest\.json$")) { throw "The Chrome Web Store zip has no manifest.json at its root" }
+          if ($store -notcontains "manifest.json") { throw "The Chrome Web Store zip has no manifest.json at its root" }
           if ($store -match "youtube\.js$") { throw "The Chrome Web Store zip has the YouTube button" }
           if ($env:SIGN -eq "true") {
             foreach ($file in Get-ChildItem dist\*.exe) {
