@@ -54,11 +54,11 @@ pub struct Args {
     pub max_connections_per_host: usize,
 
     /// Output FILE path (single download only; relative to -d when both are given)
-    #[arg(short = 'o', long = "output", value_name = "FILE")]
+    #[arg(short = 'o', long = "output", alias = "save-name", value_name = "FILE")]
     pub output: Option<PathBuf>,
 
     /// Directory to save downloads in (created if missing) [default: current directory]
-    #[arg(short = 'd', long = "dir", value_name = "DIR")]
+    #[arg(short = 'd', long = "dir", alias = "save-dir", value_name = "DIR")]
     pub dir: Option<PathBuf>,
 
     /// No progress bars or status lines (errors and warnings still go to stderr)
@@ -269,7 +269,7 @@ pub struct Args {
     /// Subtitle languages to save next to media files, e.g. "en" or "en,es" or "all" (as .srt
     /// when ffmpeg is at hand); for an HLS or DASH link, its subtitles tracks in these languages
     /// (all of them unless given, "none" for none)
-    #[arg(long = "subs", value_name = "LANGS", value_parser = parse_subtitle_langs)]
+    #[arg(long = "subs", alias = "select-subtitle", value_name = "LANGS", value_parser = parse_subtitle_langs)]
     pub subs: Option<String>,
 
     /// Do not write the title, artist, date and URL tags, chapters and cover art into media files
@@ -287,7 +287,7 @@ pub struct Args {
     pub live_from: Option<String>,
 
     /// End a live recording after N seconds of it
-    #[arg(long = "record-seconds", value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
+    #[arg(long = "record-seconds", alias = "live-record-limit", value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
     pub record_seconds: Option<u64>,
 
     /// End an HLS or DASH recording, or an MPEG-TS stream's, once nothing new has come for SECS
@@ -301,7 +301,7 @@ pub struct Args {
 
     /// Download only this part of a media file, e.g. 90-150, 1:30-2:30 or 1:02:03-1:05:00;
     /// repeat it for several parts. An HLS or DASH stream keeps the whole segments that overlap it
-    #[arg(long = "sections", value_name = "START-END", value_parser = parse_section)]
+    #[arg(long = "sections", alias = "custom-range", value_name = "START-END", value_parser = parse_section)]
     pub sections: Vec<(f64, f64)>,
 
     /// Remove a YouTube video's sponsor, self-promotion and subscribe reminder segments, or mark
@@ -321,13 +321,13 @@ pub struct Args {
     /// The video of an HLS or DASH stream: comma-separated terms that must all hold: best, worst
     /// or none; 1080p (at most that many lines); avc, hevc, av1 or vp9; sdr, hdr or dv; 30fps
     /// (at most that rate), e.g. "1080p,hevc" [default: best]
-    #[arg(long = "video", value_name = "SPEC", value_parser = parse_video_spec)]
+    #[arg(long = "video", alias = "select-video", value_name = "SPEC", value_parser = parse_video_spec)]
     pub video: Option<String>,
 
     /// The audio of an HLS or DASH stream: languages (each its best track, all kept, in that
     /// order), best, all or none; and aac, ac3, eac3, opus or flac, 6ch (at least that many
     /// channels), e.g. "en,ja,eac3" [default: best, the default track's language]
-    #[arg(long = "audio", value_name = "SPEC", value_parser = parse_audio_spec)]
+    #[arg(long = "audio", alias = "select-audio", value_name = "SPEC", value_parser = parse_audio_spec)]
     pub audio: Option<String>,
 
     /// The tracks of an HLS or DASH stream to take, by the ids --list-tracks gives, e.g.
@@ -337,22 +337,22 @@ pub struct Args {
 
     /// Print the tracks and parts of each HLS or DASH link, or the channels of a channel list,
     /// and download nothing
-    #[arg(long = "list-tracks", conflicts_with_all = ["input_file", "dry_run", "spider", "preview", "stdout", "history", "update", "verify"])]
+    #[arg(long = "list-tracks", alias = "vod-list-parts", conflicts_with_all = ["input_file", "dry_run", "spider", "preview", "stdout", "history", "update", "verify"])]
     pub list_tracks: bool,
 
     /// Leave these parts of an HLS or DASH stream out, by the ids --list-tracks gives, e.g. 0,2-4
-    #[arg(long = "drop-parts", value_name = "IDS", value_parser = parse_drop_parts)]
+    #[arg(long = "drop-parts", alias = "vod-drop-parts", value_name = "IDS", value_parser = parse_drop_parts)]
     pub drop_parts: Option<String>,
 
     /// Leave out the segments of an HLS or DASH stream whose links PATTERN matches, in any case:
     /// * stands for any run of characters, else it is found anywhere in the link (e.g. "/ads/");
     /// repeat it for several
-    #[arg(long = "ad-pattern", value_name = "PATTERN", value_parser = parse_pattern)]
+    #[arg(long = "ad-pattern", alias = "ad-keyword", value_name = "PATTERN", value_parser = parse_pattern)]
     pub ad_patterns: Vec<String>,
 
     /// Name HLS, DASH and channel downloads by PATTERN, e.g. "{name} {height}p": {name}, {height},
     /// {width}, {fps}, {codec}, {range}, {audio}, {bitrate}, {channel}, {date}, {time}
-    #[arg(long = "name-pattern", value_name = "PATTERN", value_parser = parse_name_pattern)]
+    #[arg(long = "name-pattern", alias = "save-pattern", value_name = "PATTERN", value_parser = parse_name_pattern)]
     pub name_pattern: Option<String>,
 
     #[cfg_attr(not(target_os = "macos"), doc = "Install ffmpeg (the checked build yt-dlp's makers publish, about 200 MB) when media needs")]
@@ -456,7 +456,7 @@ pub struct Args {
 
     /// Print what the run would download (name, size if known, path), with folders, playlists,
     /// channels, feeds, metalinks and torrents expanded; nothing is written
-    #[arg(long = "dry-run", conflicts_with_all = ["stdout", "history", "update", "verify"])]
+    #[arg(long = "dry-run", alias = "skip-download", conflicts_with_all = ["stdout", "history", "update", "verify"])]
     pub dry_run: bool,
 
     /// Write one direct file link's bytes to stdout as they arrive (progress and messages go to
@@ -475,63 +475,6 @@ pub struct Args {
     /// Subcommand (concat, merge, mux, doctor)
     #[command(subcommand)]
     pub command: Option<SubCommand>,
-
-
-    /// Select video streams by regular expressions (e.g. res=^1920x:for=best)
-    #[arg(long = "select-video", value_name = "OPTIONS")]
-    pub select_video: Option<String>,
-
-    /// Select audio streams by regular expressions (e.g. lang=en:for=best)
-    #[arg(long = "select-audio", value_name = "OPTIONS")]
-    pub select_audio: Option<String>,
-
-    /// Select subtitle streams by regular expressions (e.g. lang=en:for=all)
-    #[arg(long = "select-subtitle", value_name = "OPTIONS")]
-    pub select_subtitle: Option<String>,
-
-    /// Drop video streams by regular expressions
-    #[arg(long = "drop-video", value_name = "OPTIONS")]
-    pub drop_video: Option<String>,
-
-    /// Drop audio streams by regular expressions
-    #[arg(long = "drop-audio", value_name = "OPTIONS")]
-    pub drop_audio: Option<String>,
-
-    /// Drop subtitle streams by regular expressions
-    #[arg(long = "drop-subtitle", value_name = "OPTIONS")]
-    pub drop_subtitle: Option<String>,
-
-    /// Automatically selects the best tracks of all types
-    #[arg(long = "auto-select")]
-    pub auto_select: bool,
-
-    /// Select only subtitle tracks
-    #[arg(long = "sub-only")]
-    pub sub_only: bool,
-
-    /// Subtitle output format (SRT | VTT)
-    #[arg(long = "sub-format", value_name = "FORMAT")]
-    pub sub_format: Option<String>,
-
-    /// Automatically fix subtitles
-    #[arg(long = "auto-subtitle-fix")]
-    pub auto_subtitle_fix: bool,
-
-    /// Download only part of the segments (e.g. 0-10 or 05:00-20:00)
-    #[arg(long = "custom-range", value_name = "RANGE")]
-    pub custom_range: Option<String>,
-
-    /// Set URL keywords (regular expressions) for AD segments
-    #[arg(long = "ad-keyword", value_name = "REG")]
-    pub ad_keyword: Option<String>,
-
-    /// Exclude VOD sections by IDs (e.g. 0,2-4)
-    #[arg(long = "vod-drop-parts", value_name = "IDS")]
-    pub vod_drop_parts: Option<String>,
-
-    /// List VOD sections and exit
-    #[arg(long = "vod-list-parts")]
-    pub vod_list_parts: bool,
 
     /// Decryption key(s) in KID:KEY or KEY format (HEX or Base64)
     #[arg(long = "key", value_name = "KEY")]
@@ -564,119 +507,6 @@ pub struct Args {
     /// Custom HLS scope (ALL | VIDEO | AUDIO)
     #[arg(long = "custom-hls-scope", value_name = "SCOPE")]
     pub custom_hls_scope: Option<String>,
-
-    /// Binary merge segments without FFmpeg
-    #[arg(long = "binary-merge")]
-    pub binary_merge: bool,
-
-    /// Skip segments merge
-    #[arg(long = "skip-merge")]
-    pub skip_merge: bool,
-
-    /// Skip download
-    #[arg(long = "skip-download")]
-    pub skip_download: bool,
-
-    /// Check if actual number of downloaded segments matches expected count
-    #[arg(long = "check-segments-count")]
-    pub check_segments_count: bool,
-
-    /// Delete temporary files when done
-    #[arg(long = "del-after-done")]
-    pub del_after_done: bool,
-
-    /// Date information is not written during muxing
-    #[arg(long = "no-date-info")]
-    pub no_date_info: bool,
-
-    /// Write meta json after parsed
-    #[arg(long = "write-meta-json")]
-    pub write_meta_json: bool,
-
-    /// Append input URL query parameters to segments
-    #[arg(long = "append-url-params")]
-    pub append_url_params: bool,
-
-    /// Concurrently download the selected audio, video and subtitles
-    #[arg(long = "concurrent-download")]
-    pub concurrent_download: bool,
-
-    /// Mux downloaded streams after finish (e.g. format=mp4:muxer=ffmpeg)
-    #[arg(short = 'M', long = "mux-after-done", value_name = "OPTIONS")]
-    pub mux_after_done: Option<String>,
-
-    /// Import external media files when muxing (path=FILE:lang=CODE:name=NAME)
-    #[arg(long = "mux-import", value_name = "OPTIONS")]
-    pub mux_imports: Vec<String>,
-
-    /// FFmpeg merge input mode: LOCAL_HTTP (default), PROTOCOL, DEMUXER
-    #[arg(long = "ffmpeg-concat-mode", value_name = "MODE")]
-    pub ffmpeg_concat_mode: Option<String>,
-
-    /// Merge with concat demuxer
-    #[arg(long = "use-ffmpeg-concat-demuxer")]
-    pub use_ffmpeg_concat_demuxer: bool,
-
-    /// Path to ffmpeg binary
-    #[arg(long = "ffmpeg-binary-path", value_name = "PATH")]
-    pub ffmpeg_binary_path: Option<PathBuf>,
-
-    /// Set output filename stem
-    #[arg(long = "save-name", value_name = "NAME")]
-    pub save_name: Option<String>,
-
-    /// Set output directory
-    #[arg(long = "save-dir", value_name = "DIR")]
-    pub save_dir: Option<PathBuf>,
-
-    /// Set temporary file directory
-    #[arg(long = "tmp-dir", value_name = "DIR")]
-    pub tmp_dir: Option<PathBuf>,
-
-    /// Set output filename pattern (<SaveName>, <Resolution>, <Bandwidth>, etc.)
-    #[arg(long = "save-pattern", value_name = "PATTERN")]
-    pub save_pattern: Option<String>,
-
-    /// Recording time limit when recording live (HH:mm:ss)
-    #[arg(long = "live-record-limit", value_name = "DURATION")]
-    pub live_record_limit: Option<String>,
-
-    /// Manually set live playlist refresh interval in seconds
-    #[arg(long = "live-wait-time", value_name = "SEC")]
-    pub live_wait_time: Option<u64>,
-
-
-    /// Number of segments downloaded for the first time when recording live
-    #[arg(long = "live-take-count", value_name = "NUM")]
-    pub live_take_count: Option<usize>,
-
-    /// Download live history from lookback duration or timestamp
-    #[arg(long = "live-catchup", value_name = "TIME")]
-    pub live_catchup: Option<String>,
-
-    /// Real-time merge into file when recording live
-    #[arg(long = "live-real-time-merge")]
-    pub live_real_time_merge: bool,
-
-    /// Keep segments when recording live with real-time merge
-    #[arg(long = "live-keep-segments")]
-    pub live_keep_segments: bool,
-
-    /// Real-time muxing to TS file through pipeline + ffmpeg
-    #[arg(long = "live-pipe-mux")]
-    pub live_pipe_mux: bool,
-
-    /// Download live stream as vod
-    #[arg(long = "live-perform-as-vod")]
-    pub live_perform_as_vod: bool,
-
-    /// Correct VTT sub by reading start time of audio file
-    #[arg(long = "live-fix-vtt-by-audio")]
-    pub live_fix_vtt_by_audio: bool,
-
-    /// Show detailed help for an option
-    #[arg(long = "morehelp", value_name = "OPTION")]
-    pub morehelp: Option<String>,
 }
 
 impl Args {
@@ -1134,7 +964,7 @@ fn options_of(words: Vec<String>) -> Vec<Vec<String>> {
     options
 }
 
-/// N_m3u8DL-RE style subcommands.
+/// The tool commands: concat, merge, mux and doctor.
 #[derive(clap::Subcommand, Debug, Clone)]
 pub enum SubCommand {
     /// Concatenate file bytes without FFmpeg
@@ -1173,10 +1003,10 @@ pub enum SubCommand {
         title: Option<String>,
         #[arg(long = "muxer", default_value = "ffmpeg")]
         muxer: String,
+        /// Add a file of your own: path=FILE (\: for a colon in it), lang=CODE, name=NAME, e.g.
+        /// "path=sub.srt:lang=eng:name=English"
         #[arg(long = "mux-import", value_name = "OPTIONS")]
         mux_imports: Vec<String>,
-        #[arg(long = "auto-subtitle-fix", default_value_t = true)]
-        auto_subtitle_fix: bool,
         #[arg(long = "ffmpeg-binary-path", value_name = "PATH")]
         ffmpeg_binary_path: Option<PathBuf>,
     },

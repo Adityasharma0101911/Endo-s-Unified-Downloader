@@ -49,7 +49,7 @@ fn main() {
     let code = std::thread::Builder::new()
         .stack_size(8 << 20)
         .spawn(run_cli)
-        .and_then(|runner| Ok(runner.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))))
+        .map(|runner| runner.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)))
         .unwrap_or_else(|e| {
             stderr_line(&format!("error: cannot start the async runtime: {}", e));
             EXIT_FAILED
@@ -59,43 +59,42 @@ fn main() {
     std::process::exit(code);
 }
 
-/// Runs `app` to completion, then shuts the runtime down without waiting for blocking work that
-/// was abandoned: a final hash or disk sync still running past the stop timeout, or a stdin read.
-/// Dropping the runtime normally would wait for it, with the signal listener already gone.
+/// Parses the command line (and the config file), then runs what it asks for.
 fn run_cli() -> i32 {
-    let raw_args: Vec<String> = std::env::args().collect();
-    let preprocessed = tools::preprocess_cli_args(&raw_args);
-    let os_args: Vec<std::ffi::OsString> = preprocessed.into_iter().map(std::ffi::OsString::from).collect();
-    let args = match cli::load(os_args, data_folder().map(|dir| dir.join("cli.conf"))) {
-        Ok(a) => a,
+    let argv = tools::preprocess_cli_args(std::env::args_os().collect());
+    let args = match cli::load(argv, data_folder().map(|dir| dir.join("cli.conf"))) {
+        Ok(args) => args,
         Err(e) => {
             stderr_line(&e);
             return EXIT_USAGE;
         }
     };
-
-    if let Some(ref opt) = args.morehelp {
-        tools::print_morehelp(opt);
-        return 0;
+    let decrypting = !args.keys.is_empty() || args.key_text_file.is_some() || args.decryption_engine.is_some();
+    let custom_hls = args.custom_hls_method.is_some() || args.custom_hls_key.is_some() || args.custom_hls_iv.is_some();
+    if decrypting || custom_hls || args.decryption_binary_path.is_some() || args.custom_hls_scope.is_some() {
+        stderr_line("error: --key, --key-text-file, --decryption-* and --custom-hls-* are not connected to downloads yet");
+        return EXIT_USAGE;
     }
-
-    if let Some(subcmd) = args.command {
-        return run_detached(tools::execute_subcommand(subcmd)).unwrap_or(1);
-    }
-
     if let Some(shell) = args.completions {
+        // For the name it was started by (a link such as `endos-downloader` included).
         let argv0 = std::env::args_os().next().map(PathBuf::from);
         let name = argv0.as_deref().and_then(Path::file_stem).map_or("Endos-Unified-Downloader-CLI".into(), |n| n.to_string_lossy());
         clap_complete::generate(shell, &mut Args::command(), name.into_owned(), &mut std::io::stdout());
         return 0;
     }
-
-    run_detached(app(args)).unwrap_or_else(|e| {
+    let ran = match args.command {
+        Some(command) => run_detached(tools::execute_subcommand(command)),
+        None => run_detached(app(args)),
+    };
+    ran.unwrap_or_else(|e| {
         stderr_line(&format!("error: cannot start the async runtime: {}", e));
         EXIT_FAILED
     })
 }
 
+/// Runs `app` to completion, then shuts the runtime down without waiting for blocking work that
+/// was abandoned: a final hash or disk sync still running past the stop timeout, or a stdin read.
+/// Dropping the runtime normally would wait for it, with the signal listener already gone.
 fn run_detached(app: impl Future<Output = i32>) -> std::io::Result<i32> {
     let runtime = tokio::runtime::Runtime::new()?;
     let code = runtime.block_on(app);

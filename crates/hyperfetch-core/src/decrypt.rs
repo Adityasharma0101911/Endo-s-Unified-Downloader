@@ -1,4 +1,4 @@
-//! Decryption engine and DRM management matching N_m3u8DL-RE.
+//! Decryption engine and DRM key handling.
 //! Supports CENC/ClearKey with external tools (mp4decrypt, shaka-packager, ffmpeg)
 //! and custom HLS ciphers (AES-128-CBC, AES-128-ECB, ChaCha20).
 

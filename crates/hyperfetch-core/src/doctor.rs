@@ -1,11 +1,9 @@
-//! System environment and binary tool inspection matching N_m3u8DL-RE `doctor`.
+//! The `doctor` command's report: this system and the outside tools it finds (ffmpeg, mkvmerge, decryptors).
 
 use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 use serde::{Deserialize, Serialize};
-
-use crate::config_file::default_config_path;
 
 /// Status and version of an external utility tool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,7 +20,6 @@ pub struct ToolStatus {
 pub struct DoctorReport {
     pub os: String,
     pub arch: String,
-    pub config_file: Option<String>,
     pub tools: Vec<ToolStatus>,
 }
 
@@ -35,7 +32,6 @@ impl DoctorReport {
     ) -> Self {
         let os = env::consts::OS.to_string();
         let arch = env::consts::ARCH.to_string();
-        let config_file = default_config_path().map(|p| p.display().to_string());
 
         let mut tools = Vec::new();
 
@@ -74,7 +70,6 @@ impl DoctorReport {
         Self {
             os,
             arch,
-            config_file,
             tools,
         }
     }

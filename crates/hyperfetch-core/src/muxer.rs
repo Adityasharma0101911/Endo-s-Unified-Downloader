@@ -1,4 +1,4 @@
-//! Stream merging and post-muxing engine matching N_m3u8DL-RE `--mux-after-done` and `--mux-import`.
+//! Joining segment files and muxing tracks (with files of your own) for the CLI's merge, concat and mux commands.
 
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Write};
