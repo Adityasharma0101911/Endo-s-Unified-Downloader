@@ -13,6 +13,14 @@ const BACKOFF_CAP: Duration = Duration::from_secs(30);
 /// A timed steal leaves a chunk alone unless its worker needs more than this many times a new
 /// request's startup to finish it: otherwise the new request barely gets going before it ends.
 const STEAL_MIN_STARTUPS: f64 = 2.0;
+/// A connection is judged by its speed over windows this long: shorter ones see bursts and TCP's
+/// slow start, not a route. Also the least time between two replaced connections of a download
+/// (see `ChunkManager::replaces`).
+pub(crate) const LAG_WINDOW: Duration = Duration::from_secs(5);
+/// A connection going at under this share of the median of the others makes way for a new one.
+const LAG_SHARE: f64 = 0.3;
+/// Fewest connections to a mirror, the slow one included, for their median to say anything.
+const LAG_PEERS: usize = 4;
 
 /// How a thief may split a chunk.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -108,6 +116,8 @@ struct Attempt {
     /// Next byte its worker has yet to receive (0 until it tells): it writes what arrived in
     /// batches, so the bytes it holds would otherwise look left to fetch.
     received: u64,
+    /// Bytes per second over its worker's last full `LAG_WINDOW`.
+    window_rate: Option<f64>,
 }
 
 impl Chunk {
@@ -147,6 +157,11 @@ impl Chunk {
     /// The attempt's worker holds the chunk's bytes before `to`, on disk or about to be.
     pub(crate) fn received(&self, to: u64) {
         self.attempt.lock().received = to;
+    }
+
+    /// The attempt went at `rate` bytes per second over its worker's last `LAG_WINDOW`.
+    pub(crate) fn went_at(&self, rate: f64) {
+        self.attempt.lock().window_rate = Some(rate);
     }
 
     /// Bytes still to arrive before the (possibly stolen-from) end: what the worker holds to
@@ -239,6 +254,8 @@ pub struct ChunkManager {
     retry_queue: Vec<usize>,
     max_retries: u32,
     fatal: Option<(usize, String)>,
+    /// When a slow connection last made way for a new one (see `replaces`).
+    replaced_at: Option<Instant>,
 }
 
 impl ChunkManager {
@@ -294,6 +311,7 @@ impl ChunkManager {
             retry_queue: Vec::new(),
             max_retries: 8,
             fatal: None,
+            replaced_at: None,
         })
     }
 
@@ -501,6 +519,39 @@ impl ChunkManager {
         let stolen = Chunk::new(stolen_id, ByteRange::new(split_offset, cur_end).ok()?);
         self.chunks.push(stolen);
         Some((victim_id, self.assign(stolen_id, thief_worker_id, thief_mirror_id, now)))
+    }
+
+    /// Whether the attempt at `chunk_id`, which went at `rate` over its worker's last
+    /// `LAG_WINDOW`, makes way for a new connection: a slow route tends to stay slow, and a new
+    /// connection often gets a faster one. Only while at least `LAG_PEERS` connections to
+    /// `mirror_id` run, at under `LAG_SHARE` of the median of the others (over their last window,
+    /// or since their answer before they had one), with enough left to take that median a window,
+    /// as stealing sees to a short rest; and at most once per window in a download, so
+    /// connections do not churn.
+    pub(crate) fn replaces(&mut self, chunk_id: usize, mirror_id: usize, rate: f64, now: Instant) -> bool {
+        if self.replaced_at.is_some_and(|at| now.saturating_duration_since(at) < LAG_WINDOW) {
+            return false;
+        }
+        let mut others: Vec<f64> = self
+            .chunks
+            .iter()
+            .filter(|c| c.id != chunk_id && matches!(c.status, ChunkStatus::Assigned { mirror_id: m, .. } if m == mirror_id))
+            .filter_map(|c| {
+                let window_rate = c.attempt.lock().window_rate;
+                window_rate.or_else(|| c.rate(now))
+            })
+            .collect();
+        if others.len() + 1 < LAG_PEERS {
+            return false;
+        }
+        others.sort_by(f64::total_cmp);
+        let median = others[others.len() / 2];
+        let left = self.chunks.get(chunk_id).map_or(0, Chunk::unreceived);
+        if rate >= LAG_SHARE * median || (left as f64) < median * LAG_WINDOW.as_secs_f64() {
+            return false;
+        }
+        self.replaced_at = Some(now);
+        true
     }
 
     /// Marks a chunk as completed.
@@ -822,6 +873,30 @@ mod tests {
         manager.chunks()[0].received(16 * MB);
         let (_, stolen) = manager.steal_work(1, 0, timed(64 * 1024, &mirror)).unwrap();
         assert!(stolen.range.start > 18 * MB, "{:?}", stolen.range);
+    }
+
+    #[test]
+    fn test_a_connection_far_slower_than_the_others_on_its_mirror_makes_way() {
+        let mut manager = ChunkManager::new(100 * MB, 20 * MB).unwrap();
+        let [slow, a, b, c, elsewhere] = [0, 0, 0, 0, 1].map(|mirror| manager.get_next_work(0, mirror).unwrap());
+        let t0 = Instant::now();
+        for peer in [&a, &b, &elsewhere] {
+            peer.went_at(2e6);
+        }
+        // Two others on its mirror are too few to judge by, whatever another mirror does.
+        assert!(!manager.replaces(slow.id, 0, 1e5, t0));
+        // A third, yet to finish a window, goes by its rate since its answer: 4 MiB in 2 s.
+        c.answered(t0);
+        c.current_offset.store(c.range.start + 4 * MB, Ordering::SeqCst);
+        manager.backdate(c.id, Duration::from_secs(2));
+        assert!(!manager.replaces(slow.id, 0, 0.7e6, t0), "over 0.3 of their median");
+        assert!(manager.replaces(slow.id, 0, 0.5e6, t0));
+        assert!(!manager.replaces(slow.id, 0, 1e5, t0 + LAG_WINDOW / 2), "once per window");
+        // Less left than the median brings in a window (10 MB): stealing sees to that rest.
+        slow.received(slow.range.end + 1 - 5 * MB);
+        assert!(!manager.replaces(slow.id, 0, 1e5, t0 + LAG_WINDOW));
+        slow.received(slow.range.start);
+        assert!(manager.replaces(slow.id, 0, 1e5, t0 + LAG_WINDOW));
     }
 
     const SILENT: Duration = Duration::from_secs(2);
