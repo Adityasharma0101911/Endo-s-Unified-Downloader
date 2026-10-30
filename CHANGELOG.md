@@ -2,7 +2,7 @@
 
 What changed in each release, newest first. Each release's page on [GitHub](https://github.com/Adityasharma0101911/Endo-s-Unified-Downloader/releases) has its files and the full notes.
 
-## Unreleased
+## 1.9.0 (2026-10-30)
 
 - **Expired links rescued.** A download whose signed link expired once it had started shows "Link expired: get a new link"; New link… takes a fresh link to the same file (checked by its size first) and resumes from the partial file, and the browser extension sends the new link by itself when you start the file again or the page plays its video again.
 - **App: send links from your phone.** Turned on in Settings > Phone (off by default), the app shows a QR code that opens a small page on your phone to send it links over your local network, the way the browser extension does; only devices on the local network with the code in the QR code can, and New code makes another.

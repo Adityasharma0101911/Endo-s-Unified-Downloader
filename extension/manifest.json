@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Endo's Unified Downloader",
   "short_name": "Endo DL",
-  "version": "1.8.0",
+  "version": "1.9.0",
   "description": "Finds videos and HLS/DASH streams on any page and sends them to Endo's Unified Downloader; records video it can't fetch.",
   "minimum_chrome_version": "121",
   "permissions": ["webRequest", "storage", "scripting", "contextMenus", "cookies", "downloads"],
