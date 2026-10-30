@@ -2,6 +2,7 @@
 
 mod desktop;
 mod ipc;
+mod phone;
 mod queue_store;
 mod recording;
 mod settings;
@@ -374,6 +375,10 @@ struct App {
     tracks: Option<tracks::Chooser>,
     /// Channel lists waiting for the channels to record to be ticked, first come first.
     channel_lists: Vec<ChannelList>,
+    /// What the server of the phone's page shares with the window: its code and the links it took.
+    phone: Arc<phone::Shared>,
+    /// That server, while "Send links from your phone" is on (see [`App::set_phone_links`]).
+    phone_server: Option<phone::Server>,
 }
 
 impl App {
@@ -428,6 +433,9 @@ impl App {
             cc.egui_ctx.clone(),
         );
         ipc::spawn(app.events_tx.clone(), cc.egui_ctx.clone(), &rt, desktop::data_tag(&settings::data_dir()));
+        if app.settings.phone_links {
+            app.set_phone_links(true);
+        }
         app.refresh_history();
         if app.settings.install_ffmpeg.is_none() {
             let found = unblock(hyperfetch_core::media::find_ffmpeg_path);
@@ -446,6 +454,7 @@ impl App {
     ) -> Self {
         let (events_tx, events_rx) = mpsc::channel();
         let clipboard_enabled = Arc::new(AtomicBool::new(settings.clipboard_watch));
+        let phone = Arc::new(phone::Shared::new(settings.phone_token.clone(), events_tx.clone(), ctx.clone()));
         Self {
             rt,
             ctx,
@@ -509,6 +518,8 @@ impl App {
             zip_preview: None,
             tracks: None,
             channel_lists: Vec::new(),
+            phone,
+            phone_server: None,
         }
     }
 
@@ -1909,6 +1920,35 @@ impl App {
             }
             Err(e) => self.notice = Some(Err(format!("Could not change launch at startup: {}", e))),
         }
+    }
+
+    /// Starts the server of the phone's page (see `phone::start`), with a new code when there is
+    /// none yet, or stops it. The setting is saved at once; it stays off, with a notice saying
+    /// why, when the server cannot start.
+    fn set_phone_links(&mut self, on: bool) {
+        self.phone_server = None;
+        self.settings.phone_links = false;
+        if on {
+            let started = if self.settings.phone_token.usable() { Ok(()) } else { self.new_phone_code() };
+            match started.and_then(|()| phone::start(&self.rt, Arc::clone(&self.phone))) {
+                Ok(server) => {
+                    self.phone_server = Some(server);
+                    self.settings.phone_links = true;
+                }
+                Err(e) => self.notice = Some(Err(format!("Could not listen for links from your phone: {}", e))),
+            }
+        }
+        self.save_settings();
+    }
+
+    /// A new code for the phone's page, saved at once: pages opened with the old one are refused
+    /// from now on.
+    fn new_phone_code(&mut self) -> std::io::Result<()> {
+        let token = phone::Token::new()?;
+        self.phone.set_token(token.clone());
+        self.settings.phone_token = token;
+        self.save_settings();
+        Ok(())
     }
 
     /// Makes `endo-dl:` links start this program (Windows; see `desktop::protocol_entries`).

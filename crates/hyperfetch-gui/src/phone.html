@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Endo's Unified Downloader</title>
+<style>
+:root { color-scheme: light dark; --bg: #f5f6f8; --card: #ffffff; --text: #15171c; --muted: #5b6270; --border: #d5d9e1; --accent: #4a63e7; --ok: #17803d; --bad: #c62f2f; }
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #111318; --card: #1b1e25; --text: #e9ebf0; --muted: #9ba2ae; --border: #2e333d; --accent: #4a63e7; --ok: #4cc38a; --bad: #ff7272; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 17px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+main { max-width: 34rem; margin: 0 auto; padding: 28px 16px; }
+h1 { font-size: 1.3rem; margin: 0 0 4px; }
+p { margin: 0 0 20px; color: var(--muted); }
+label { display: block; font-weight: 600; margin-bottom: 6px; }
+input, button { width: 100%; font: inherit; border-radius: 12px; padding: 14px; }
+input { border: 1px solid var(--border); background: var(--card); color: var(--text); }
+input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+button { margin-top: 12px; border: 0; background: var(--accent); color: #fff; font-weight: 600; }
+button:disabled { opacity: 0.6; }
+#result { margin-top: 16px; min-height: 1.5em; font-weight: 600; overflow-wrap: anywhere; }
+.ok { color: var(--ok); }
+.bad { color: var(--bad); }
+</style>
+</head>
+<body>
+<main>
+<h1>Endo's Unified Downloader</h1>
+<p>Send a link to download it on your PC.</p>
+<form id="form">
+<label for="url">Link</label>
+<input id="url" type="text" inputmode="url" placeholder="https://… or magnet:?…" autocomplete="off" autocapitalize="off" spellcheck="false" required>
+<button id="send" type="submit">Send to PC</button>
+</form>
+<div id="result" role="status" aria-live="polite"></div>
+</main>
+<script>
+"use strict";
+// The code is in the address after #, which the browser never sends anywhere; it goes only in the header below.
+const code = new URLSearchParams(location.hash.slice(1)).get("t") || "";
+const field = document.getElementById("url");
+const send = document.getElementById("send");
+const result = document.getElementById("result");
+const show = (text, ok) => { result.textContent = text; result.className = ok ? "ok" : "bad"; };
+const given = new URLSearchParams(location.search).get("url");
+if (given) field.value = given;
+if (!code) show("This page needs the code from the app: scan its QR code again.", false);
+document.getElementById("form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  send.disabled = true;
+  result.textContent = "";
+  try {
+    const answer = await fetch("/add", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": "Bearer " + code },
+      body: JSON.stringify({ url: field.value.trim() }),
+      cache: "no-store",
+    });
+    const reply = await answer.json().catch(() => ({}));
+    if (answer.ok) {
+      show("Sent", true);
+      field.value = "";
+    } else {
+      show(reply.error || "Not sent (" + answer.status + ")", false);
+    }
+  } catch (e) {
+    show("Could not reach the PC: is the app open, and the phone on the same network?", false);
+  }
+  send.disabled = false;
+});
+</script>
+</body>
+</html>
