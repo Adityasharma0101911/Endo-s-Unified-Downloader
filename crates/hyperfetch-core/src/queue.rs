@@ -256,8 +256,11 @@ impl DownloadQueue {
     /// own from the resume state, and the queue saved on exit has it.
     pub fn apply_snapshot(&mut self, id: usize, snapshot: &EngineSnapshot) {
         let Some(item) = self.items.iter_mut().find(|i| i.id == id) else { return };
-        item.total_bytes = snapshot.total_bytes;
         item.small = snapshot.small;
+        if snapshot.from_probe() {
+            return;
+        }
+        item.total_bytes = snapshot.total_bytes;
         item.downloaded_bytes = snapshot.downloaded_bytes;
         // Nothing is transferred any more once every byte has arrived.
         item.speed_bytes_per_sec = if item.is_finishing() { 0.0 } else { snapshot.speed_bytes_per_sec };
@@ -514,7 +517,9 @@ mod tests {
         q.mark_started(ids[0]);
         q.mark_started(ids[1]);
         assert_eq!(q.next_to_start(2, |_| false), None);
+        q.apply_snapshot(ids[0], &EngineSnapshot { total_bytes: 1000, downloaded_bytes: 400, ..Default::default() });
         q.apply_snapshot(ids[0], &EngineSnapshot { total_bytes: 1000, small: true, ..Default::default() });
+        assert_eq!(q.get_item(ids[0]).unwrap().downloaded_bytes, 400, "the probe's word tells nothing of the progress");
         assert!(!q.may_start(1));
         assert_eq!(q.next_to_start(2, |_| false), Some(ids[2]));
         q.mark_started(ids[2]);

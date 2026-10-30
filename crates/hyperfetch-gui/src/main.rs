@@ -1238,6 +1238,10 @@ impl App {
         let now = Instant::now();
         for (&id, view) in &mut self.jobs {
             let Some(snapshot) = view.running.as_ref().and_then(|r| lock(&r.snapshot).take()) else { continue };
+            if snapshot.from_probe() {
+                self.queue.apply_snapshot(id, &snapshot);
+                continue;
+            }
             let previous = self.queue.get_item(id).map_or(0, |item| item.downloaded_bytes);
             if !view.got_snapshot || snapshot.downloaded_bytes > previous {
                 view.last_progress = Some(now);

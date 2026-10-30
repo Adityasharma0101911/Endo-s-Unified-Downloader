@@ -140,10 +140,17 @@ pub struct EngineSnapshot {
 
 impl EngineSnapshot {
     /// A live recording's progress: what yt-dlp has recorded, with no size to reach. yt-dlp's
-    /// progress is the only kind without a `target_path` (see `run_media`), and it has a size
-    /// for every other download.
+    /// progress is the only kind without a `target_path` (see `run_media`) besides the probe's
+    /// word (see `from_probe`), and it has a size for every other download.
     pub fn is_recording(&self) -> bool {
         self.target_path.is_none() && self.total_bytes == 0 && self.downloaded_bytes > 0
+    }
+
+    /// The probe's early word that the file is small (see `probe_all`), before the download's
+    /// own snapshots: it tells nothing of the progress, which a resumed download already has,
+    /// and a slow start after it is no stall.
+    pub fn from_probe(&self) -> bool {
+        self.small && self.target_path.is_none()
     }
 }
 

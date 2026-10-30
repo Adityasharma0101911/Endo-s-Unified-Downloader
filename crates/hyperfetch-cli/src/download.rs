@@ -563,9 +563,11 @@ async fn run_job(
             res = &mut run => break res,
             snapshot = rx.recv(), if snapshots_open => match snapshot {
                 Ok(snapshot) => {
-                    view.update(&snapshot);
                     small.see(&snapshot);
-                    last = Some(snapshot);
+                    if !snapshot.from_probe() {
+                        view.update(&snapshot);
+                        last = Some(snapshot);
+                    }
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Err(broadcast::error::RecvError::Closed) => snapshots_open = false,
