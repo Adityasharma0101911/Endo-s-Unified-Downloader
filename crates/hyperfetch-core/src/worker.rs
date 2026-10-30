@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-use crate::chunk::{Chunk, ChunkManager, StealRule, StealTiming};
+use crate::chunk::{Chunk, ChunkManager, StealRule, StealTiming, LAG_WINDOW};
 use crate::hosts::{self, HostKey, HostProfile, HostSlot};
 use crate::mirror::{Mirror, MirrorRacer};
 use crate::range::ByteRange;
@@ -531,8 +531,10 @@ impl HttpWorker {
     }
 
     /// Streams `body`, the chunk's bytes from `start`, into the file. The attempt ends once
-    /// `body_idle` passes without a byte: what arrived is kept for the retry. It ends at once when
-    /// another worker takes the chunk over; what arrived is then left to that worker.
+    /// `body_idle` passes without a byte, or once a window of it went far slower than the other
+    /// connections (see [`Self::lags`]): what arrived is kept for the retry, which starts at once
+    /// on another connection. It ends at once when another worker takes the chunk over; what
+    /// arrived is then left to that worker.
     async fn receive(
         &self,
         chunk: &Chunk,
@@ -553,6 +555,8 @@ impl HttpWorker {
         tokio::pin!(idle);
         let mut pending: u64 = 0;
         let mut last_report = Instant::now();
+        // The window the attempt's speed is measured over: since when, from which byte.
+        let mut window = (tokio::time::Instant::now(), start);
         let result = loop {
             // Only time spent waiting on the server counts as the chunk's silence, not writing or
             // rate limiting what arrived.
@@ -619,6 +623,18 @@ impl HttpWorker {
             if take < bytes.len() {
                 break Ok(());
             }
+            let now = tokio::time::Instant::now();
+            if now - window.0 >= LAG_WINDOW {
+                let rate = (batch.end() - window.1) as f64 / (now - window.0).as_secs_f64();
+                window = (now, batch.end());
+                chunk.went_at(rate);
+                if self.lags(chunk.id, mirror_id, rate, now.into_std()) {
+                    break Err((
+                        FailureKind::Transient,
+                        format!("{:.0} KB/s, far slower than the other connections: going on over a new one", rate / 1000.0),
+                    ));
+                }
+            }
         };
         // What arrived is kept even when the attempt failed or was cancelled: a retry resumes
         // after it. A disk error outranks the network outcome.
@@ -634,6 +650,23 @@ impl HttpWorker {
             ));
         }
         Ok(())
+    }
+
+    /// Whether the attempt at `chunk_id`, which went at `rate` over its last window, makes way for
+    /// a new connection (see [`ChunkManager::replaces`]). Never under our own speed limit, which
+    /// slows connections that are not to blame, nor on a host that caps its connections: there
+    /// the new one may be refused, and the slowness may be the host's.
+    fn lags(&self, chunk_id: usize, mirror_id: usize, rate: f64, now: Instant) -> bool {
+        let s = &self.shared;
+        if s.limiter.is_some() {
+            return false;
+        }
+        let racer = s.mirrors.lock();
+        let Some(mirror) = racer.get_mirror(mirror_id) else { return false };
+        let capped = mirror.max_connections != usize::MAX
+            || HostKey::of(&mirror.url).default_connection_cap().is_some()
+            || hosts::profile(&mirror.url).connection_cap.is_some();
+        !capped && s.chunks.lock().replaces(chunk_id, mirror_id, rate, now)
     }
 
     /// Writes the batch at its offset on the blocking pool, then advances the chunk's offset.
@@ -1099,6 +1132,32 @@ mod tests {
             assert!(waited >= expected && waited < expected + Duration::from_millis(50), "{waited:?}");
             assert_eq!(chunk.current_offset.load(Ordering::SeqCst), 128 * 1024, "what arrived is kept");
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_a_connection_throttled_far_below_the_others_makes_way_for_a_new_one() {
+        const MB: u64 = 1_000_000;
+        let dir = tempfile::tempdir().unwrap();
+        let url = Url::parse("http://lagging.worker.invalid/f").unwrap();
+        let (worker, _, _events) = test_worker(&url, &dir.path().join("f.part"), 4 * MB);
+        // Three other connections bring 100 KB/s each; the server holds this one to 10 KB/s.
+        let slow = {
+            let mut chunks = worker.shared.chunks.lock();
+            *chunks = ChunkManager::new(4 * MB, MB).unwrap();
+            let slow = chunks.get_next_work(0, 0).unwrap();
+            for peer in 1..4 {
+                chunks.get_next_work(peer, 0).unwrap().went_at(100_000.0);
+            }
+            slow
+        };
+        let started = tokio::time::Instant::now();
+        let body = silent_after(vec![(100, 1000); 100]);
+        let err = worker.receive(&slow, 0, body, 0).await.unwrap_err();
+        assert_eq!(err.0, FailureKind::Transient);
+        assert!(err.1.contains("far slower than the other connections"), "{}", err.1);
+        let waited = started.elapsed();
+        assert!(waited >= LAG_WINDOW && waited < LAG_WINDOW + Duration::from_millis(200), "judged after a window: {waited:?}");
+        assert!(slow.current_offset.load(Ordering::SeqCst) >= 50_000, "what arrived is kept");
     }
 
     #[tokio::test(start_paused = true)]
