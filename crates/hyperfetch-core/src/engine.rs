@@ -258,6 +258,11 @@ pub struct DownloadOptions {
     /// Local addresses the connections go out from, spread over them (several networks at once);
     /// empty lets the system choose.
     pub bind_addresses: Vec<std::net::IpAddr>,
+    /// A download over ranges spreads its connections over the addresses its host's name has (a
+    /// CDN's, one of which may be busy or throttled), taking turns as over `bind_addresses`: those
+    /// of `ip_family`, else of the system's first choice's version (see `address_routes`). Not
+    /// through a proxy, which resolves the name itself, nor with `bind_addresses`, nor over FTP.
+    pub spread_addresses: bool,
     /// The download is a BitTorrent swarm download (see `ingest::Task::p2p`).
     pub bittorrent: bool,
     /// A finished torrent seeds until it has uploaded this many times its size (0 = no seeding).
@@ -404,6 +409,7 @@ impl Default for DownloadOptions {
             debrid_api_key: None,
             debrid_provider: None,
             bind_addresses: Vec::new(),
+            spread_addresses: true,
             bittorrent: false,
             seed_ratio: 0.0,
             seed_minutes: 0,
@@ -2714,13 +2720,18 @@ impl DownloadEngine {
         let (events_tx, mut events) = mpsc::channel(1024);
         // Workers stop when the user cancels or when this download is over.
         let stop = self.cancel_token.child_token();
-        let pool_clients = match self.client_pool.as_ref() {
-            Ok(p) if !p.is_empty() => p.clone(),
+        // One connection has nothing to spread; one the ramp adds stays on the system's choice.
+        let spread = if num_workers > 1 { self.address_routes(&client, &reference.final_url).await } else { None };
+        let addresses = spread.is_some();
+        let pool_clients = match (spread, self.client_pool.as_ref()) {
+            (Some(routes), _) => routes,
+            (None, Ok(p)) if !p.is_empty() => p.clone(),
             _ => vec![client.clone()],
         };
         let shared = WorkerShared {
             client,
             clients: Arc::new(pool_clients),
+            addresses,
             dropped_routes: Default::default(),
             reached: Default::default(),
             auth: self.auth.clone(),
@@ -2835,6 +2846,29 @@ impl DownloadEngine {
                 Err(e)
             }
         }
+    }
+
+    /// The routes a download from `url` takes turns on over its host's addresses (see
+    /// `DownloadOptions::spread_addresses`): `client`, which connects to the system's choice, the
+    /// first address, then a client for each other address, up to `MAX_ROUTES` in all. None when
+    /// it does not spread: off, through a proxy, over other routes or FTP, or with one address.
+    async fn address_routes(&self, client: &Client, url: &Url) -> Option<Vec<Client>> {
+        let o = &self.options;
+        let direct = o.no_proxy || (o.proxy.is_none() && o.proxy_pool.is_empty() && !proxy_in_env());
+        let host = url.domain().filter(|_| o.spread_addresses && direct && o.bind_addresses.is_empty() && self.ftp.is_none())?;
+        let addresses = server_addresses(host, url.port_or_known_default().unwrap_or(0), o.ip_family).await;
+        let mut routes = vec![client.clone()];
+        for address in addresses.into_iter().skip(1).take(MAX_ROUTES - 1) {
+            match build_route_client(o, None, None, Some((host, address))) {
+                Ok(pinned) => routes.push(pinned),
+                Err(e) => tracing::warn!("No connections to {} at {}: {}", host, address, e),
+            }
+        }
+        if routes.len() < 2 {
+            return None;
+        }
+        tracing::info!("Spreading the connections over {} addresses of {}", routes.len(), host);
+        Some(routes)
     }
 
     /// Single-connection download for servers without range support or without a known length.
@@ -3462,11 +3496,17 @@ pub async fn stream_to<W: AsyncWrite + Unpin>(url: Url, options: DownloadOptions
 
 /// Builds an HTTP client with the specified proxy URL override (if any).
 pub fn build_client_with_proxy(options: &DownloadOptions, proxy_url: Option<&str>) -> Result<Client, String> {
-    build_route_client(options, proxy_url, None)
+    build_route_client(options, proxy_url, None, None)
 }
 
-/// A client whose connections go through `proxy_url` (if any) and leave from `local` (if any).
-fn build_route_client(options: &DownloadOptions, proxy_url: Option<&str>, local: Option<std::net::IpAddr>) -> Result<Client, String> {
+/// A client whose connections go through `proxy_url` (if any), leave from `local` (if any), and
+/// go to `server`'s address for its host name (if given).
+fn build_route_client(
+    options: &DownloadOptions,
+    proxy_url: Option<&str>,
+    local: Option<std::net::IpAddr>,
+    server: Option<(&str, std::net::SocketAddr)>,
+) -> Result<Client, String> {
     let mut headers = crate::resolver::SmartResolver::default_anti_qos_headers();
     if let Some(referer) = &options.referer {
         if let Ok(val) = reqwest::header::HeaderValue::from_str(referer) {
@@ -3497,6 +3537,11 @@ fn build_route_client(options: &DownloadOptions, proxy_url: Option<&str>, local:
         .pool_idle_timeout(Some(POOL_IDLE))
         .danger_accept_invalid_certs(options.insecure)
         .default_headers(headers);
+    // The request keeps the host's name (Host, and TLS's server name and certificate check): only
+    // where its connections go changes.
+    if let Some((host, address)) = server {
+        builder = builder.resolve(host, address);
+    }
 
     let auth_header = options.auth_header.is_some();
     let secret_headers = !scoped_headers(options).is_empty();
@@ -3581,8 +3626,49 @@ pub fn build_client_pool(options: &DownloadOptions) -> Result<Vec<Client>, Strin
         .iter()
         .flat_map(|&proxy| locals.iter().map(move |&local| (proxy, local)))
         .take(MAX_ROUTES)
-        .map(|(proxy, local)| build_route_client(options, proxy, local))
+        .map(|(proxy, local)| build_route_client(options, proxy, local, None))
         .collect()
+}
+
+/// The addresses `host` resolves to, in the order the system gives them, of one IP version:
+/// `family`'s, else the first address's (the system's choice); none when it does not resolve in
+/// a few seconds.
+async fn server_addresses(host: &str, port: u16, family: IpFamily) -> Vec<std::net::SocketAddr> {
+    // The probe just resolved it: the system has it at hand, unless its resolver is in trouble.
+    let looked_up = async {
+        match tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host((host, port))).await {
+            Ok(Ok(found)) => found.collect(),
+            _ => Vec::new(),
+        }
+    };
+    #[cfg(test)]
+    let found: Vec<std::net::SocketAddr> = match tests::resolves(host) {
+        Some(found) => found,
+        None => looked_up.await,
+    };
+    #[cfg(not(test))]
+    let found: Vec<std::net::SocketAddr> = looked_up.await;
+    let v4 = match family {
+        IpFamily::V4 => true,
+        IpFamily::V6 => false,
+        IpFamily::Any => found.first().is_some_and(std::net::SocketAddr::is_ipv4),
+    };
+    let mut kept = Vec::new();
+    for address in found.into_iter().filter(|address| address.is_ipv4() == v4) {
+        if !kept.contains(&address) {
+            kept.push(address);
+        }
+    }
+    kept
+}
+
+/// Whether the environment names a proxy for the clients (they take `HTTP_PROXY` and the like).
+// shortcut: the system's own proxy settings (Windows' Internet Options, macOS's) are not looked
+// at, as reqwest is built here without them; look if it ever reads them.
+fn proxy_in_env() -> bool {
+    ["http_proxy", "https_proxy", "all_proxy"]
+        .iter()
+        .any(|name| [name.to_string(), name.to_ascii_uppercase()].iter().any(|var| std::env::var_os(var).is_some_and(|v| !v.is_empty())))
 }
 
 /// Shared state of one multi-connection download.
@@ -8096,14 +8182,20 @@ mod tests {
     /// no ETag, and the first GET of `/stall/<name>` past the file's start goes silent after
     /// 64 KiB.
     async fn file_server(data: Vec<u8>, pace: Duration) -> Url {
+        serve_file(crate::hosts::unseen_listener().await, data, pace).0
+    }
+
+    /// `file_server` on `listener`, with the number of ranged GETs it answered.
+    fn serve_file(listener: tokio::net::TcpListener, data: Vec<u8>, pace: Duration) -> (Url, Arc<std::sync::atomic::AtomicUsize>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = crate::hosts::unseen_listener().await;
         let base = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
         let data = Arc::new(data);
         let seen = Arc::new(Mutex::new(std::collections::HashSet::new()));
+        let ranged = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&ranged);
         tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
-                let (data, seen) = (Arc::clone(&data), Arc::clone(&seen));
+                let (data, seen, counter) = (Arc::clone(&data), Arc::clone(&seen), Arc::clone(&counter));
                 tokio::spawn(async move {
                     let mut head = Vec::new();
                     let mut buf = [0u8; 4096];
@@ -8140,6 +8232,7 @@ mod tests {
                     if !answer.starts_with("HTTP/1.1 206") {
                         return;
                     }
+                    counter.fetch_add(1, Ordering::SeqCst);
                     let silent = stall && first;
                     for piece in data[start..=end].chunks(64 * 1024).take(if silent { 1 } else { usize::MAX }) {
                         tokio::time::sleep(pace).await;
@@ -8153,7 +8246,53 @@ mod tests {
                 });
             }
         });
-        base
+        (base, ranged)
+    }
+
+    /// Host names the tests resolve themselves, to the addresses given (see `server_addresses`).
+    static RESOLVES: Mutex<Vec<(String, Vec<std::net::SocketAddr>)>> = Mutex::new(Vec::new());
+
+    pub(super) fn resolves(host: &str) -> Option<Vec<std::net::SocketAddr>> {
+        RESOLVES.lock().iter().find(|(name, _)| name == host).map(|(_, found)| found.clone())
+    }
+
+    /// A host name with two addresses gets a download's connections over both, the name kept in
+    /// each request; one of them that cannot connect is dropped, and the other serves the rest.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_connections_are_spread_over_a_hosts_addresses() {
+        let data: Vec<u8> = (0..4 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        for second_listens in [true, false] {
+            let first = crate::hosts::unseen_listener().await;
+            let port = first.local_addr().unwrap().port();
+            // A loopback address on Windows and Linux, not on macOS.
+            let second = match tokio::net::TcpListener::bind(("127.0.0.2", port)).await {
+                Ok(second) => second,
+                Err(e) => return eprintln!("skipped, no 127.0.0.2 here: {e}"),
+            };
+            let addresses: Vec<std::net::SocketAddr> = vec![(std::net::Ipv4Addr::LOCALHOST, port).into(), ([127, 0, 0, 2], port).into()];
+            let host = format!("spread{port}.engine.test");
+            RESOLVES.lock().push((host.clone(), addresses.clone()));
+            let (_, at_first) = serve_file(first, data.clone(), Duration::from_millis(2));
+            let at_second = match second_listens {
+                true => Some(serve_file(second, data.clone(), Duration::from_millis(2)).1),
+                false => {
+                    drop(second);
+                    None
+                }
+            };
+            let url = Url::parse(&format!("http://{host}:{port}/f.bin")).unwrap();
+            // Three connections, a MiB each.
+            hosts::record(&url, HostProfile { capped_per_connection: Some(false), ..Default::default() });
+            let dir = tempdir().unwrap();
+            let options = DownloadOptions { output_path: Some(dir.path().join("f.bin")), num_connections: 4, ..Default::default() };
+            let client = Client::builder().http1_only().resolve_to_addrs(&host, &addresses).build().unwrap();
+            let done = DownloadEngine::with_client(vec![url], options, client).run(None).await.unwrap();
+            assert!(std::fs::read(done).unwrap() == data, "second listens: {second_listens}");
+            assert!(at_first.load(Ordering::SeqCst) > 0);
+            if let Some(at_second) = at_second {
+                assert!(at_second.load(Ordering::SeqCst) > 0, "the second address serves its share");
+            }
+        }
     }
 
     /// A file server (see `file_server`) whose host is known not to cap a connection's speed: the

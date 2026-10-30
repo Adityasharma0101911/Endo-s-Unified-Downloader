@@ -214,6 +214,9 @@ pub struct WorkerShared {
     pub client: Client,
     /// One per route (proxy and/or local address) the workers take turns on; empty for `client`.
     pub clients: Arc<Vec<Client>>,
+    /// The routes are the addresses of the host's name (see `DownloadOptions::spread_addresses`),
+    /// whose connections share the host's budget as one route's do.
+    pub addresses: bool,
     /// Routes of `clients` that could not connect, dropped for the rest of the download.
     pub dropped_routes: Arc<Mutex<Vec<usize>>>,
     /// The routes and the origins (`scheme://host:port`) each has reached in this download.
@@ -251,6 +254,12 @@ impl WorkerShared {
         (0..routes).map(|i| (worker_id + i) % routes).find(|r| !dropped.contains(r)).unwrap_or(0)
     }
 
+    /// The route whose share of a host's budget (see [`crate::hosts`]) a request on `route` takes:
+    /// its own, but the first for every address of the host.
+    fn budget(&self, route: usize) -> usize {
+        if self.addresses { 0 } else { route }
+    }
+
     /// Notes that `route` reached the server of `url` (it answered).
     fn reached(&self, route: usize, url: &Url) {
         let origin = url.origin().ascii_serialization();
@@ -268,10 +277,15 @@ impl WorkerShared {
         if !self.reached.lock().iter().any(|(r, o)| *r != route && *o == origin) {
             return;
         }
+        self.retire(route, "cannot connect");
+    }
+
+    /// Stops using `route` for the rest of the download, saying `why`; never the last route left.
+    fn retire(&self, route: usize, why: &str) {
         let mut dropped = self.dropped_routes.lock();
         if self.clients.len() > dropped.len() + 1 && !dropped.contains(&route) {
             dropped.push(route);
-            tracing::warn!("Route {} cannot connect; dropping it, {} left", route, self.clients.len() - dropped.len());
+            tracing::warn!("Route {} {}; dropping it, {} left", route, why, self.clients.len() - dropped.len());
         }
     }
 }
@@ -311,10 +325,11 @@ impl HttpWorker {
         if let Some(Seed { chunk, mirror_id, url, body, slot }) = seed {
             // The probe's answer, which this goes on with, shows the server answers: a route of
             // this download that cannot connect to it is at fault (see `WorkerShared::drop_route`).
-            self.shared.reached(self.shared.route_for_worker(self.worker_id), &url);
+            let route = self.shared.route_for_worker(self.worker_id);
+            self.shared.reached(route, &url);
             self.shared.mirrors.lock().acquire_mirror(mirror_id);
             let start = chunk.current_offset.load(Ordering::SeqCst);
-            let outcome = self.receive(&chunk, mirror_id, body, start).await;
+            let outcome = self.receive(&chunk, mirror_id, body, start, route).await;
             if !self.conclude(&chunk, mirror_id, &url, outcome, slot).await {
                 return;
             }
@@ -367,7 +382,7 @@ impl HttpWorker {
     /// whose host has one free, else the best one's, once it has. `None` while no mirror can.
     async fn take_slot(&self) -> Option<(usize, HostSlot)> {
         let s = &self.shared;
-        let route_id = s.route_for_worker(self.worker_id);
+        let route_id = s.budget(s.route_for_worker(self.worker_id));
         let ranked: Vec<(usize, Url)> = {
             let racer = s.mirrors.lock();
             racer.ranked().into_iter().filter_map(|id| Some((id, racer.get_mirror(id)?.url.clone()))).collect()
@@ -388,7 +403,7 @@ impl HttpWorker {
     /// chunks.
     fn next_job(&self, mirror_id: usize, slot: &HostSlot) -> Option<(Chunk, Url, Option<String>, bool)> {
         let s = &self.shared;
-        let route_id = s.route_for_worker(self.worker_id);
+        let route_id = s.budget(s.route_for_worker(self.worker_id));
         let mut racer = s.mirrors.lock();
         // Meanwhile the mirror may have filled up, cooled down or gone back to its own URL.
         let mirror = racer
@@ -527,20 +542,21 @@ impl HttpWorker {
         let setup_time = (response.url() == url && slot.opens_connection()).then_some(ttfb);
         hosts::record(response.url(), HostProfile { accepts_ranges, setup_time, ..Default::default() });
         let _ = s.events.try_send(WorkerEvent::Ttfb { worker_id: self.worker_id, mirror_id, ttfb });
-        self.receive(chunk, mirror_id, response.bytes_stream(), start).await
+        self.receive(chunk, mirror_id, response.bytes_stream(), start, route).await
     }
 
     /// Streams `body`, the chunk's bytes from `start`, into the file. The attempt ends once
     /// `body_idle` passes without a byte, or once a window of it went far slower than the other
     /// connections (see [`Self::lags`]): what arrived is kept for the retry, which starts at once
     /// on another connection. It ends at once when another worker takes the chunk over; what
-    /// arrived is then left to that worker.
+    /// arrived is then left to that worker. `route` is the one the body comes over.
     async fn receive(
         &self,
         chunk: &Chunk,
         mirror_id: usize,
         body: impl Stream<Item = reqwest::Result<Bytes>>,
         start: u64,
+        route: usize,
     ) -> Result<(), Failure> {
         let s = &self.shared;
         // The wait before is the answer's: the chunk's rate, and its silence, count from here.
@@ -629,6 +645,10 @@ impl HttpWorker {
                 window = (now, batch.end());
                 chunk.went_at(rate);
                 if self.lags(chunk.id, mirror_id, rate, now.into_std()) {
+                    // Of a host's addresses, the one a connection keeps so slow on is likely why.
+                    if s.addresses {
+                        s.retire(route, "is far slower than the others");
+                    }
                     break Err((
                         FailureKind::Transient,
                         format!("{:.0} KB/s, far slower than the other connections: going on over a new one", rate / 1000.0),
@@ -1045,6 +1065,7 @@ mod tests {
         let shared = WorkerShared {
             client: Client::new(),
             clients: Arc::new(Vec::new()),
+            addresses: false,
             dropped_routes: Default::default(),
             reached: Default::default(),
             auth: None,
@@ -1123,7 +1144,7 @@ mod tests {
             let started = tokio::time::Instant::now();
             // A pause just under the idle timeout is fine; one as long ends the attempt.
             let body = silent_after(vec![(0, 64 * 1024), (idle * 1000 - 100, 64 * 1024)]);
-            let err = worker.receive(&chunk, 0, body, 0).await.unwrap_err();
+            let err = worker.receive(&chunk, 0, body, 0, 0).await.unwrap_err();
 
             assert_eq!(err.0, FailureKind::Transient, "{}", err.1);
             assert!(err.1.contains(&format!("no data for {idle}s")), "{}", err.1);
@@ -1140,6 +1161,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let url = Url::parse("http://lagging.worker.invalid/f").unwrap();
         let (worker, _, _events) = test_worker(&url, &dir.path().join("f.part"), 4 * MB);
+        // It goes over the second of the host's two addresses (see `WorkerShared::addresses`).
+        let two = Arc::new(vec![Client::new(), Client::new()]);
+        let worker = HttpWorker::new(0, WorkerShared { clients: two, addresses: true, ..worker.shared.clone() });
         // Three other connections bring 100 KB/s each; the server holds this one to 10 KB/s.
         let slow = {
             let mut chunks = worker.shared.chunks.lock();
@@ -1152,9 +1176,10 @@ mod tests {
         };
         let started = tokio::time::Instant::now();
         let body = silent_after(vec![(100, 1000); 100]);
-        let err = worker.receive(&slow, 0, body, 0).await.unwrap_err();
+        let err = worker.receive(&slow, 0, body, 0, 1).await.unwrap_err();
         assert_eq!(err.0, FailureKind::Transient);
         assert!(err.1.contains("far slower than the other connections"), "{}", err.1);
+        assert_eq!(*worker.shared.dropped_routes.lock(), [1], "and so is the address it was on");
         let waited = started.elapsed();
         assert!(waited >= LAG_WINDOW && waited < LAG_WINDOW + Duration::from_millis(200), "judged after a window: {waited:?}");
         assert!(slow.current_offset.load(Ordering::SeqCst) >= 50_000, "what arrived is kept");
@@ -1167,7 +1192,7 @@ mod tests {
         let (worker, chunk, _events) = test_worker(&url, &dir.path().join("f.part"), 1 << 20);
         let (end, offset) = (Arc::clone(&chunk.end_offset), Arc::clone(&chunk.current_offset));
         let started = tokio::time::Instant::now();
-        let task = tokio::spawn(async move { worker.receive(&chunk, 0, silent_after(vec![(0, 64 * 1024)]), 0).await });
+        let task = tokio::spawn(async move { worker.receive(&chunk, 0, silent_after(vec![(0, 64 * 1024)]), 0, 0).await });
 
         // 64 KiB arrived, then the server went quiet and a thief took everything after it.
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1185,7 +1210,7 @@ mod tests {
         let (worker, chunk, _events) = test_worker(&url, &path, 1 << 20);
         let (revoked, offset) = (chunk.revoked.clone(), Arc::clone(&chunk.current_offset));
         let started = tokio::time::Instant::now();
-        let task = tokio::spawn(async move { worker.receive(&chunk, 0, silent_after(vec![(0, 64 * 1024)]), 0).await });
+        let task = tokio::spawn(async move { worker.receive(&chunk, 0, silent_after(vec![(0, 64 * 1024)]), 0, 0).await });
 
         // 64 KiB arrived and waits to be written when another worker takes the chunk over.
         tokio::time::sleep(Duration::from_millis(100)).await;
