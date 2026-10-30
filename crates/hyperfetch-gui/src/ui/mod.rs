@@ -52,6 +52,8 @@ struct Palette {
     amber: Color32,
     red: Color32,
     cyan: Color32,
+    /// One colour per connection of a download, none of them green (done) or red (failed).
+    lanes: [Color32; 6],
 }
 
 const DARK: Palette = Palette {
@@ -70,6 +72,14 @@ const DARK: Palette = Palette {
     amber: Color32::from_rgb(234, 179, 8),
     red: Color32::from_rgb(239, 68, 68),
     cyan: Color32::from_rgb(56, 189, 248),
+    lanes: [
+        Color32::from_rgb(59, 130, 246),
+        Color32::from_rgb(249, 115, 22),
+        Color32::from_rgb(139, 92, 246),
+        Color32::from_rgb(6, 182, 212),
+        Color32::from_rgb(236, 72, 153),
+        Color32::from_rgb(234, 179, 8),
+    ],
 };
 
 const LIGHT: Palette = Palette {
@@ -88,6 +98,14 @@ const LIGHT: Palette = Palette {
     amber: Color32::from_rgb(180, 83, 9),
     red: Color32::from_rgb(220, 38, 38),
     cyan: Color32::from_rgb(2, 132, 199),
+    lanes: [
+        Color32::from_rgb(37, 99, 235),
+        Color32::from_rgb(234, 88, 12),
+        Color32::from_rgb(124, 58, 237),
+        Color32::from_rgb(8, 145, 178),
+        Color32::from_rgb(219, 39, 119),
+        Color32::from_rgb(202, 138, 4),
+    ],
 };
 
 impl Palette {
@@ -110,6 +128,7 @@ impl Palette {
             amber: m(self.amber, other.amber),
             red: m(self.red, other.red),
             cyan: m(self.cyan, other.cyan),
+            lanes: std::array::from_fn(|n| m(self.lanes[n], other.lanes[n])),
         }
     }
 }

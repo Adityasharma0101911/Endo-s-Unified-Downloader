@@ -20,7 +20,7 @@ pub(super) fn download_details(app: &App, ui: &mut Ui, item: &QueueItem) {
         ui.add_space(12.0);
         ui.horizontal(|ui| {
             ui.label(bold("Chunks").color(p.strong));
-            let about = format!("{} ranges, handed to connections as they free up", chunks.len());
+            let about = format!("{} ranges, each in the colour of the connection that holds it", chunks.len());
             ui.label(RichText::new(about).small().color(p.muted));
         });
         ui.add_space(4.0);
@@ -163,51 +163,101 @@ fn is_active_chunk(chunk: &ChunkSnapshot) -> bool {
     chunk.status.starts_with("Worker") || chunk.status == "Downloading"
 }
 
-/// The ranges of download `item` side by side: each fills smoothly as its bytes come in and
-/// turns green when done; one handed out but not yet receiving glows while the download runs.
+/// The colour of connection `worker`: the theme's `worker`th, around again past the last.
+fn lane(p: &Palette, worker: usize) -> Color32 {
+    p.lanes[worker % p.lanes.len()]
+}
+
+/// How long a piece split off another (see [`chunk_map`]) takes to turn from its colour to its own.
+const SPLIT: f64 = 0.4;
+
+/// What a download's chunk map showed, kept between frames to tell pieces split off others.
+#[derive(Clone, Default)]
+struct Pieces {
+    /// The pass that last drew the map; a gap means it was away and starts over.
+    pass: Option<u64>,
+    /// The id the next piece split off gets.
+    next: usize,
+    /// Pieces split off while the map showed: id, when, and the colour of the piece cut.
+    split: Vec<(usize, f64, Color32)>,
+}
+
+/// The ranges of download `item` side by side, each in the colour of the connection that holds
+/// it: each fills smoothly as its bytes come in and turns green when done; one handed out but not
+/// yet receiving glows while the download runs. A piece a connection takes over from the end of
+/// another's (work stealing) splits off: a light flashes on the cut, and the piece turns from the
+/// other's colour to its own.
 fn chunk_map(ui: &mut Ui, item: usize, chunks: &[ChunkSnapshot], total_bytes: u64, live: bool) {
     let p = palette(ui);
+    let ctx = ui.ctx().clone();
     let height = 22.0;
     let (response, painter) = ui.allocate_painter(Vec2::new(ui.available_width(), height), Sense::hover());
     let rect = response.rect;
+    let key = egui::Id::new(("chunk map", item));
+    // Where tests find it.
+    ui.interact(rect, key, Sense::hover());
     painter.rect_filled(rect, 6.0, p.field);
     if chunks.is_empty() || total_bytes == 0 {
         return;
     }
+    let base = |chunk: &ChunkSnapshot| match chunk.worker_id {
+        _ if chunk.total_bytes > 0 && chunk.downloaded_bytes >= chunk.total_bytes => p.green,
+        Some(worker) => lane(&p, worker),
+        None if chunk.status.starts_with("Failed") => p.red,
+        None => p.dim,
+    };
+    // Pieces get the next free id as they are split off; ones that come with the map are no news.
+    let (now, pass) = (ctx.input(|i| i.time), ctx.cumulative_pass_nr());
+    let mut pieces: Pieces = ctx.data_mut(|d| d.remove_temp(key)).unwrap_or_default();
+    if pieces.pass.is_some_and(|last| last + 1 == pass) {
+        for chunk in chunks.iter().filter(|chunk| chunk.id >= pieces.next) {
+            if let Some(cut) = chunks.iter().find(|other| other.range_end + 1 == chunk.range_start) {
+                pieces.split.push((chunk.id, now, base(cut)));
+            }
+        }
+    }
+    pieces.split.retain(|&(_, at, _)| !anim::reduced(&ctx) && now - at < SPLIT);
+    pieces.pass = Some(pass);
+    pieces.next = pieces.next.max(chunks.iter().map(|chunk| chunk.id + 1).max().unwrap_or(0));
+
     let painter = painter.with_clip_rect(rect.shrink(1.0));
-    let total = total_bytes as f32;
-    let width = rect.width();
-    let glow = if live { anim::pulse(ui.ctx(), 1.8) } else { 0.0 };
+    let x = |bytes: u64| rect.min.x + (bytes as f32 / total_bytes as f32).clamp(0.0, 1.0) * rect.width();
+    let glow = if live { anim::pulse(&ctx, 1.8) } else { 0.0 };
+    let mut cuts = Vec::new();
     for chunk in chunks {
-        let start_ratio = (chunk.range_start as f32 / total).clamp(0.0, 1.0);
-        let end_ratio = ((chunk.range_end + 1) as f32 / total).clamp(0.0, 1.0);
-        let seg_x = rect.min.x + start_ratio * width;
-        let seg_w = ((end_ratio - start_ratio) * width).max(1.0);
-        let seg_rect = Rect::from_min_size(Pos2::new(seg_x, rect.min.y + 1.0), Vec2::new(seg_w, height - 2.0));
+        let (left, right) = (x(chunk.range_start), x(chunk.range_end + 1));
+        let seg_rect = Rect::from_x_y_ranges(left..=right.max(left + 1.0), rect.min.y + 1.0..=rect.max.y - 1.0);
+        // Keyed like the chunk table's bars.
+        let id = egui::Id::new(("chunk", item, chunk.id));
+        let mut color = anim::color(&ctx, id.with("bar"), base(chunk), 0.3);
+        if let Some(&(_, at, from)) = pieces.split.iter().find(|split| split.0 == chunk.id) {
+            let t = anim::ease(anim::progress(&ctx, (now - at) as f32, 0.0, SPLIT as f32));
+            color = from.lerp_to_gamma(color, t);
+            cuts.push((left, t));
+        }
 
         if chunk.total_bytes > 0 && chunk.downloaded_bytes > 0 {
-            // Keyed like the chunk table's bars, which ease the same way.
-            let id = egui::Id::new(("chunk", item, chunk.id));
-            let done = chunk.downloaded_bytes >= chunk.total_bytes;
-            let filled = eased_progress(ui, id, chunk.downloaded_bytes as f32 / chunk.total_bytes as f32);
-            let color = anim::color(ui.ctx(), id.with("bar"), if done { p.green } else { p.accent }, 0.3);
-            painter.rect_filled(seg_rect, 0.0, p.accent.gamma_multiply(0.3));
-            let fill_rect = Rect::from_min_size(seg_rect.min, Vec2::new(seg_w * filled, height - 2.0));
-            painter.rect_filled(fill_rect, 0.0, color);
+            painter.rect_filled(seg_rect, 0.0, color.gamma_multiply(0.3));
+            // Where its bytes reach in the file, so that a piece cut shorter keeps its fill still.
+            let reach = (chunk.range_start + chunk.downloaded_bytes.min(chunk.total_bytes)) as f32 / total_bytes as f32;
+            let reach = rect.min.x + anim::value(&ctx, id.with("reach"), reach.clamp(0.0, 1.0), 0.35) * rect.width();
+            painter.rect_filled(Rect::from_x_y_ranges(left..=reach.clamp(left, seg_rect.right()), seg_rect.y_range()), 0.0, color);
         } else if live && is_active_chunk(chunk) {
             // Handed out but no bytes yet.
-            painter.rect_filled(seg_rect, 0.0, p.cyan.gamma_multiply(0.35 + glow * 0.5));
+            painter.rect_filled(seg_rect, 0.0, color.gamma_multiply(0.35 + glow * 0.5));
         } else if chunk.status.starts_with("Failed") {
-            painter.rect_filled(seg_rect, 0.0, p.red.gamma_multiply(0.6));
+            painter.rect_filled(seg_rect, 0.0, color.gamma_multiply(0.6));
         } else {
             painter.rect_filled(seg_rect, 0.0, p.border);
         }
-        painter.line_segment(
-            [Pos2::new(seg_x + seg_w, rect.min.y + 1.0), Pos2::new(seg_x + seg_w, rect.max.y - 1.0)],
-            Stroke::new(1.0, p.card),
-        );
+        painter.line_segment([seg_rect.right_top(), seg_rect.right_bottom()], Stroke::new(1.0, p.card));
+    }
+    for (left, t) in cuts {
+        let light = Stroke::new(2.0, Color32::WHITE.gamma_multiply(1.0 - t));
+        painter.line_segment([Pos2::new(left, rect.min.y + 1.0), Pos2::new(left, rect.max.y - 1.0)], light);
     }
     painter.rect_stroke(rect, 6.0, Stroke::new(1.0, p.border));
+    ctx.data_mut(|d| d.insert_temp(key, pieces));
 }
 
 fn chunk_table(ui: &mut Ui, item: usize, chunks: &[ChunkSnapshot], live: bool) {
@@ -244,7 +294,7 @@ fn chunk_table(ui: &mut Ui, item: usize, chunks: &[ChunkSnapshot], live: bool) {
                     let color = if chunk.status == "Completed" {
                         p.green
                     } else if live && is_active_chunk(chunk) {
-                        p.cyan
+                        chunk.worker_id.map_or(p.cyan, |worker| lane(&p, worker))
                     } else if chunk.status.starts_with("Failed") {
                         p.red
                     } else {
@@ -1104,6 +1154,55 @@ mod tests {
                 assert!(xs.iter().any(|&x| (x - rest).abs() > 1.0), "shakes: {xs:?}");
             }
             assert_eq!(h.frames(2), Duration::MAX, "and keeps still");
+        }
+    }
+
+    /// The chunk map paints each connection's piece in its own colour. When a connection takes
+    /// over the end of another's piece, a light flashes on the cut and the new piece turns from
+    /// the other's colour to its own; then frames stop. Under Reduce motion it has its own colour
+    /// at once and nothing flashes.
+    #[test]
+    fn the_chunk_map_colours_each_connection_and_splits_a_stolen_piece() {
+        for reduce in [false, true] {
+            let mut h = Harness::new();
+            h.app.settings.reduce_motion = Some(reduce);
+            let id = h.add("ubuntu.iso");
+            h.progress(id, 0.5);
+            h.app.focused = Some(id);
+            // Paused, so that nothing else on its page moves.
+            h.app.jobs.get_mut(&id).unwrap().running = None;
+            h.app.queue.get_item_mut(id).unwrap().status = QueueItemStatus::Paused;
+            assert!(h.settle());
+            let map = h.app.ctx.read_response(egui::Id::new(("chunk map", id))).unwrap().rect;
+            // The colour shown `share` of the way along the map.
+            let at = |h: &Harness, share: f32| {
+                let spot = Rect::from_min_size(Pos2::new(map.left() + share * map.width(), map.center().y), Vec2::splat(1.0));
+                let [r, g, b, _] = h.shot(Some(spot)).get_pixel(0, 0).0;
+                Color32::from_rgb(r, g, b)
+            };
+            // Each quarter is half done: its first eighth filled.
+            for n in 0..4 {
+                assert_eq!(at(&h, n as f32 / 4.0 + 1.0 / 16.0), DARK.lanes[n], "connection {n}");
+            }
+
+            // Connection 4 takes the last quarter of the second piece and gets 80 % of it.
+            let quarter = (100u64 << 20) / 4;
+            let cut = quarter + quarter * 3 / 4;
+            let chunks = &mut h.app.jobs.get_mut(&id).unwrap().chunks;
+            (chunks[1].range_end, chunks[1].total_bytes) = (cut - 1, cut - quarter);
+            let status = "Worker 4".to_string();
+            chunks.push(ChunkSnapshot { id: 4, range_start: cut, range_end: 2 * quarter - 1, downloaded_bytes: quarter / 5, total_bytes: quarter / 4, status, worker_id: Some(4) });
+            let (stolen, seam) = ((cut + quarter / 10) as f32 / (4 * quarter) as f32, cut as f32 / (4 * quarter) as f32);
+            let delay = h.frame(Vec::new());
+            let white = |color: Color32| color.r().min(color.g()).min(color.b()) > 230;
+            if reduce {
+                assert!(delay == Duration::MAX && at(&h, stolen) == DARK.lanes[4] && !white(at(&h, seam)), "split at once");
+            } else {
+                assert!(delay < Duration::MAX && at(&h, stolen) != DARK.lanes[4], "turning");
+                assert!(white(at(&h, seam)), "the cut flashes: {:?}", at(&h, seam));
+                assert!(h.settle());
+                assert!(at(&h, stolen) == DARK.lanes[4] && !white(at(&h, seam)), "split");
+            }
         }
     }
 }

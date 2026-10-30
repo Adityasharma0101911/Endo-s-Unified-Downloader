@@ -692,6 +692,19 @@ mod tests {
             });
             h.progress(1, 0.6);
             shoot(&mut h, "download-details", &[0, 100, 200, 400], page);
+            // Connection 4 takes over the last quarter of the second piece.
+            let mut h = scene(Tab::Downloader, &|h| {
+                let id = h.add("ubuntu.iso");
+                h.progress(id, 0.5);
+                h.app.focused = Some(id);
+            });
+            let quarter = (100u64 << 20) / 4;
+            let chunks = &mut h.app.jobs.get_mut(&1).unwrap().chunks;
+            (chunks[1].range_end, chunks[1].total_bytes) = (quarter * 7 / 4 - 1, quarter * 3 / 4);
+            let status = "Worker 4".to_string();
+            chunks.push(ChunkSnapshot { id: 4, range_start: quarter * 7 / 4, range_end: 2 * quarter - 1, downloaded_bytes: 0, total_bytes: quarter / 4, status, worker_id: Some(4) });
+            let map = h.app.ctx.read_response(egui::Id::new(("chunk map", 1usize))).unwrap().rect;
+            shoot(&mut h, "chunk-map-split", &[0, 50, 100, 200, 450], Some(map.expand(8.0)));
 
             // History.
             let mut h = scene(Tab::Downloader, &|h| {
