@@ -65,11 +65,10 @@ pub(super) fn sidebar(app: &mut App, ctx: &egui::Context) {
     let frame = Frame::none().fill(p.side).inner_margin(Margin::symmetric(12.0, 16.0));
     egui::SidePanel::left("nav").resizable(false).exact_width(196.0).frame(frame).show(ctx, |ui| {
         ui.horizontal(|ui| {
-            // The icon dips and the tile swells as a download finishes.
+            // The logo dips and the tile swells as a download finishes.
             let (rect, _) = ui.allocate_exact_size(Vec2::splat(34.0), Sense::hover());
             ui.painter().rect_filled(rect.expand(1.5 * anim::bump(finished)), 9.0, p.accent);
-            let arrow = rect.center() + Vec2::new(0.0, 4.0 * anim::bump(finished));
-            anim::paint_icon(ui.painter(), arrow, icon::DOWNLOAD_SIMPLE, 20.0, Color32::WHITE, 0.0);
+            paint_logo(ui.painter(), rect.translate(Vec2::new(0.0, 4.0 * anim::bump(finished))), Color32::WHITE, p.accent);
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 ui.label(bold("Endo's").size(15.0).color(p.strong));
@@ -129,6 +128,19 @@ pub(super) fn sidebar(app: &mut App, ctx: &egui::Context) {
     });
     // The drop zone covers the whole window; this runs once a frame on every page.
     super::add::drop_zone(ctx);
+}
+
+/// The marks of the app's logo (`assets/logo.svg`) in `color` on a plate of `plate`, `rect` being
+/// the logo's 256-unit square: three bars, the arrowhead and the line under it.
+fn paint_logo(painter: &egui::Painter, rect: Rect, color: Color32, plate: Color32) {
+    let unit = rect.width() / 256.0;
+    let at = |x: f32, y: f32| rect.min + Vec2::new(x, y) * unit;
+    for (x, y, w, h, alpha) in [(74.0, 52.0, 22.0, 72.0, 0.65), (117.0, 38.0, 22.0, 86.0, 1.0), (160.0, 52.0, 22.0, 72.0, 0.65), (88.0, 218.0, 80.0, 6.0, 0.4)] {
+        painter.rect_filled(Rect::from_min_max(at(x, y), at(x + w, y + h)), 4.0 * unit, color.gamma_multiply(alpha));
+    }
+    // The arrowhead is concave: a triangle, with the plate painted over its notch.
+    painter.add(egui::Shape::convex_polygon(vec![at(52.0, 136.0), at(204.0, 136.0), at(128.0, 206.0)], color, Stroke::NONE));
+    painter.add(egui::Shape::convex_polygon(vec![at(88.0, 136.0), at(168.0, 136.0), at(128.0, 172.0)], plate, Stroke::NONE));
 }
 
 #[cfg(test)]
