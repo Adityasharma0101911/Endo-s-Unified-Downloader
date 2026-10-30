@@ -14,6 +14,7 @@ What changed in each release, newest first. Each release's page on [GitHub](http
 - **CLI:** `--video`, `--audio` and `--tracks` choose a stream's tracks, which `--list-tracks` lists with its parts (or a channel list's channels, also as JSON); `--drop-parts`, `--ad-pattern`, `--name-pattern`, `--live-from`, `--live-idle-timeout` and `--channel`; `--subs` and `--sections` work for HLS and DASH links. Default options from a config file (`cli.conf` in the data folder, or `--config`), `--doctor` to see what the program runs with, and `--start-at` to start later.
 - **CLI tool commands:** `concat` joins files byte by byte, `merge` joins segments with ffmpeg, `mux` puts video, audio and subtitles (files of your own too) into one file, and `doctor` lists the outside tools it finds. `-sv`, `-sa` and `-ss` are short for `--video`, `--audio` and `--subs`, and other common option names (`--select-video`, `--save-dir`, `--save-name`, `--save-pattern`, `--custom-range`, `--ad-keyword`, `--live-record-limit` and more) do the job of the matching option.
 - **Chrome Web Store:** each release's Packages run also builds the extension for the Chrome Web Store, without YouTube, as the store's rules ask.
+- **A server busy at the start** (HTTP 429 or 503 to the first requests, HEAD included) no longer fails the download at once: it is asked again once its `Retry-After` is over, else after 2, 4, 8 and then every 16 s, for up to 2 minutes. A `Retry-After` given as a date is honoured too, not only seconds.
 
 ## 1.8.0 (2026-10-27)
 

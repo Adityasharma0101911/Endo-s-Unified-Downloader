@@ -100,6 +100,8 @@ struct Mock {
     rejects_range: bool,
     /// This many probes are answered 503 before the server recovers.
     busy_probes: AtomicUsize,
+    /// The Retry-After seconds those 503s carry.
+    busy_retry_after: Option<u64>,
     /// No Content-Length anywhere; chunked transfer encoding; ranges ignored.
     chunked: bool,
     etag: Option<&'static str>,
@@ -189,6 +191,7 @@ impl Mock {
             etag_only_on_head: false,
             rejects_range: false,
             busy_probes: AtomicUsize::new(0),
+            busy_retry_after: None,
             chunked: false,
             etag: None,
             disposition: None,
@@ -324,7 +327,7 @@ async fn handle(mut socket: TcpStream, mock: Arc<Mock>) {
     let (reply, _guard) = if probe {
         s.probes.fetch_add(1, Ordering::SeqCst);
         let busy = mock.busy_probes.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok();
-        (if busy { Reply::Status(503, None) } else { mock.probe_reply }, None)
+        (if busy { Reply::Status(503, mock.busy_retry_after) } else { mock.probe_reply }, None)
     } else {
         let index = s.gets.fetch_add(1, Ordering::SeqCst);
         s.peers.lock().unwrap().extend(socket.peer_addr().map(|a| a.ip()));
@@ -1248,6 +1251,32 @@ async fn test_busy_probe_is_retried_instead_of_losing_ranges() {
     assert_file(&out, &data);
     assert_eq!(mock.stats.probes.load(Ordering::SeqCst), 2);
     assert!(mock.served_ranges().len() >= 8, "a momentary 503 must not demote the download to one stream");
+}
+
+/// A server busy past the probe's own tries, HEAD included, is not given up on: it is asked again
+/// once its Retry-After is over, and the download then goes on as usual.
+#[tokio::test]
+async fn test_a_server_busy_at_first_is_waited_out() {
+    let _history = setup().await;
+    let data = payload(PREFETCH + 512 * KB, 157);
+    let mut mock = Mock::new(data.clone());
+    // The probe's three tries, then one more: only waiting saves this download.
+    mock.busy_probes = AtomicUsize::new(4);
+    mock.busy_retry_after = Some(1);
+    mock.head_status = Some(503);
+    let mock = Arc::new(mock);
+    let url = serve(Arc::clone(&mock), "busy_at_first.bin").await;
+    let temp = tempdir().unwrap();
+    let out = temp.path().join("busy_at_first.bin");
+
+    let started = std::time::Instant::now();
+    run(&DownloadEngine::new(vec![url], options(&out, 4, 64 * KB)), None).await.expect("the busy server is waited out");
+    assert_file(&out, &data);
+    assert_eq!(mock.stats.probes.load(Ordering::SeqCst), 5);
+    assert!(mock.served_ranges().len() >= 8, "with ranges, as from a server never busy");
+    // Four waits of the one second asked for, give or take.
+    let took = started.elapsed();
+    assert!(took >= Duration::from_secs(3) && took < Duration::from_secs(15), "{took:?}");
 }
 
 #[tokio::test]

@@ -69,7 +69,7 @@ Notes (a refused archive, the VirusTotal verdict, a failed command) show under t
 
 **Resilient transfers**
 - Stall detection: a connection that receives no data for `--stall-timeout` seconds (default 30) is dropped and retried. A chunk's connection that goes quiet mid-body is replaced after 5 s (or the stall timeout, if shorter), keeping what it received.
-- Retries with exponential backoff and jitter. HTTP 429/503 responses respect `Retry-After` and reduce the number of connections. Mirrors that keep failing are disabled. An attempt that made progress does not count against `--max-retries`.
+- Retries with exponential backoff and jitter. HTTP 429/503 responses respect `Retry-After` (in seconds or as a date, at most 60 s) and reduce the number of connections. A server that answers 429 or 503 from the start, HEAD included, is asked again once its `Retry-After` is over, else after 2, 4, 8 and then every 16 s, for up to 2 minutes before the download fails; each wait is logged, and pausing or Ctrl+C ends it. Mirrors that keep failing are disabled. An attempt that made progress does not count against `--max-retries`.
 - Servers without range support or without a known length are downloaded as a single stream, which goes on with the probe's answer instead of asking again.
 
 **Many kinds of input**

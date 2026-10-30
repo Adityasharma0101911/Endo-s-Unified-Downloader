@@ -47,11 +47,17 @@ pub(crate) const POOL_MAX_IDLE: usize = 64;
 /// keeps what arrived and starts at once, so a connection gone quiet is best replaced soon.
 const BODY_IDLE: Duration = Duration::from_secs(5);
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(30);
-/// Bound on one mirror's whole probe: HEAD, the ranged GET's tries and the pauses between them.
+/// Bound on one mirror's probe (each time a busy server is probed again): HEAD, the ranged GET's
+/// tries and the pauses between them.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 const PROBE_CONCURRENCY: usize = 8;
 /// Tries of a probe's ranged GET while the server is busy or the connection fails.
 const PROBE_ATTEMPTS: u32 = 3;
+/// How long a probe keeps asking a server busy past those tries (429 or 503, with no HEAD to go
+/// by), waiting as its Retry-After says, else this long and then twice as long each time, up to
+/// eight times as long.
+const BUSY_PATIENCE: Duration = Duration::from_secs(120);
+const BUSY_BACKOFF: Duration = Duration::from_secs(2);
 /// Longest pause between probe tries, whatever Retry-After asks for.
 const PROBE_RETRY_CAP: Duration = Duration::from_secs(5);
 /// How long the probe still waits for HEAD once the ranged GET has answered.
@@ -4015,6 +4021,12 @@ struct Pace {
 /// alongside only with a slot free at once: waiting for one while the GET holds another could be
 /// waiting for the GET's own. Without one, HEAD goes out after a GET that left no body to read,
 /// under the GET's slot, and is left out otherwise.
+///
+/// A server still answering 429 or 503 after the GET's tries, with no HEAD to go by, is probed
+/// again once the wait its Retry-After asks for is over, else after `BUSY_BACKOFF`, doubling up
+/// to eight times that, for up to `BUSY_PATIENCE` in all: a server that sheds load at first is
+/// common, and the download would otherwise fail at once. Each wait is logged; it holds no slot,
+/// and ends with the probe when the download is cancelled or paused.
 async fn probe_url(
     client: &Client,
     auth: Option<&Auth>,
@@ -4022,10 +4034,37 @@ async fn probe_url(
     prefetch: bool,
     limit: usize,
 ) -> Result<(ProbeInfo, Option<ProbeBody>), String> {
-    let slot = hosts::acquire(url, limit).await;
-    tokio::time::timeout(PROBE_TIMEOUT, probe_with(client, auth, url, prefetch, limit, slot))
-        .await
-        .unwrap_or_else(|_| Err(format!("{}: no answer within {}s", url, PROBE_TIMEOUT.as_secs())))
+    let deadline = tokio::time::Instant::now() + BUSY_PATIENCE;
+    let mut waits = 0u32;
+    loop {
+        let slot = hosts::acquire(url, limit).await;
+        let (message, asked) = match tokio::time::timeout(PROBE_TIMEOUT, probe_with(client, auth, url, prefetch, limit, slot)).await {
+            Ok(Ok(found)) => return Ok(found),
+            Ok(Err(ProbeError::Busy(message, asked))) => (message, asked),
+            Ok(Err(ProbeError::Failed(message))) => return Err(message),
+            Err(_) => return Err(format!("{}: no answer within {}s", url, PROBE_TIMEOUT.as_secs())),
+        };
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            return Err(message);
+        }
+        let wait = asked.unwrap_or(BUSY_BACKOFF * (1 << waits.min(3))).min(left);
+        tracing::warn!("{}; asking again in {:.0} s", message, wait.as_secs_f64().ceil());
+        tokio::time::sleep(wait).await;
+        waits += 1;
+    }
+}
+
+/// Why a probe failed: a server still busy, with the wait its Retry-After asked for, or anything else.
+enum ProbeError {
+    Busy(String, Option<Duration>),
+    Failed(String),
+}
+
+impl From<String> for ProbeError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
 }
 
 /// `probe_url` once the GET holds `slot`.
@@ -4036,7 +4075,7 @@ async fn probe_with(
     prefetch: bool,
     limit: usize,
     slot: HostSlot,
-) -> Result<(ProbeInfo, Option<ProbeBody>), String> {
+) -> Result<(ProbeInfo, Option<ProbeBody>), ProbeError> {
     let cold = slot.opens_connection();
     let send_head = || async move {
         match send(|url: &Url| authorize(client.head(url.clone()), auth, url), url).await {
@@ -4130,15 +4169,21 @@ async fn probe_with(
             info.accepts_ranges = unanswered && info.size.is_some() && ranges;
             return Ok((info, None));
         }
-        (Ok(resp), None) if unanswered => return Err(format!("{}: server busy (HTTP {})", url, resp.status())),
-        (Err(e), None) => return Err(format!("{}: {}", url, e)),
+        (Ok(resp), None) if unanswered => {
+            let message = format!("{}: server busy (HTTP {})", url, resp.status());
+            return Err(match resp.status() {
+                StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE => ProbeError::Busy(message, retry_after(resp.headers())),
+                _ => ProbeError::Failed(message),
+            });
+        }
+        (Err(e), None) => return Err(format!("{}: {}", url, e).into()),
         // Some servers reject HEAD and any Range header: a plain GET is the last resort.
         (Ok(_), None) => {
             let plain = send(|url: &Url| authorize(client.get(url.clone()), auth, url).header(ACCEPT_ENCODING, "identity"), url)
                 .await
                 .map_err(|e| format!("{}: {}", url, e))?;
             if !plain.status().is_success() {
-                return Err(format!("{}: HTTP {}", url, plain.status()));
+                return Err(format!("{}: HTTP {}", url, plain.status()).into());
             }
             let mut info = ProbeInfo::describe(url, &[&plain]);
             info.size = content_length(plain.headers());
@@ -4163,7 +4208,7 @@ async fn probe_with(
             }
             // `bytes 0-0/*`: the length is unknown, so only a single stream can fetch the file.
             Some(Ok((range, None))) if range.start == 0 => None,
-            _ => return Err(format!("{}: invalid Content-Range {:?}", url, content_range)),
+            _ => return Err(format!("{}: invalid Content-Range {:?}", url, content_range).into()),
         },
         StatusCode::OK => {
             info.size = content_length(get.headers());
@@ -4176,7 +4221,7 @@ async fn probe_with(
                 .and_then(|n| n.parse().ok())
                 .or(head_len.filter(|&n| n == 0));
             if info.size.is_none() {
-                return Err(format!("{}: 416 for {} without a size", url, range));
+                return Err(format!("{}: 416 for {} without a size", url, range).into());
             }
             None
         }
@@ -5325,7 +5370,7 @@ pub(crate) fn parse_http_date(value: &str) -> Option<u64> {
 
 /// Unix seconds as an IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`), the inverse of
 /// [`parse_http_date`] (Howard Hinnant's civil-from-days).
-fn http_date(secs: u64) -> String {
+pub(crate) fn http_date(secs: u64) -> String {
     const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
     const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
     let (days, time) = ((secs / 86_400) as i64, secs % 86_400);

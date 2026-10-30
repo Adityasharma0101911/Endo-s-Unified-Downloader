@@ -863,9 +863,16 @@ fn names_another_version(headers: &HeaderMap, validator: &str) -> bool {
     headers.get(name).and_then(|v| v.to_str().ok()).is_some_and(|v| v.trim() != validator)
 }
 
-/// `Retry-After` in delta-seconds form, capped.
+/// `Retry-After` in delta-seconds or as an HTTP date (one gone by asks for no wait), capped.
 pub(crate) fn retry_after(headers: &HeaderMap) -> Option<Duration> {
-    let secs: u64 = headers.get(RETRY_AFTER)?.to_str().ok()?.trim().parse().ok()?;
+    let value = headers.get(RETRY_AFTER)?.to_str().ok()?.trim();
+    let secs = match value.parse::<u64>() {
+        Ok(secs) => secs,
+        Err(_) => {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+            crate::engine::parse_http_date(value)?.saturating_sub(now)
+        }
+    };
     Some(Duration::from_secs(secs).min(MAX_RETRY_AFTER))
 }
 
@@ -1459,7 +1466,16 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(RETRY_AFTER, HeaderValue::from_static("86400"));
         assert_eq!(retry_after(&headers), Some(MAX_RETRY_AFTER));
+        // A date: the time until then, none once it has gone by, and never past the cap either.
         headers.insert(RETRY_AFTER, HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"));
+        assert_eq!(retry_after(&headers), Some(Duration::ZERO));
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let soon = crate::engine::http_date(now + 30);
+        headers.insert(RETRY_AFTER, HeaderValue::from_str(&soon).unwrap());
+        assert!(retry_after(&headers).is_some_and(|wait| (29..=30).contains(&wait.as_secs())), "{soon}");
+        headers.insert(RETRY_AFTER, HeaderValue::from_str(&crate::engine::http_date(now + 3600)).unwrap());
+        assert_eq!(retry_after(&headers), Some(MAX_RETRY_AFTER));
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("soon"));
         assert_eq!(retry_after(&headers), None);
     }
 
