@@ -1194,7 +1194,9 @@ mod tests {
             chunks.push(ChunkSnapshot { id: 4, range_start: cut, range_end: 2 * quarter - 1, downloaded_bytes: quarter / 5, total_bytes: quarter / 4, status, worker_id: Some(4) });
             let (stolen, seam) = ((cut + quarter / 10) as f32 / (4 * quarter) as f32, cut as f32 / (4 * quarter) as f32);
             let delay = h.frame(Vec::new());
-            let white = |color: Color32| color.r().min(color.g()).min(color.b()) > 230;
+            // The light's edge is smoothed, so the pixel under it shows a little of the piece; no
+            // connection's colour or the card is that light in every channel.
+            let white = |color: Color32| color.r().min(color.g()).min(color.b()) > 150;
             if reduce {
                 assert!(delay == Duration::MAX && at(&h, stolen) == DARK.lanes[4] && !white(at(&h, seam)), "split at once");
             } else {
