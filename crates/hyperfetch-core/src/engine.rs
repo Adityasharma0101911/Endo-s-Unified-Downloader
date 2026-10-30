@@ -8878,8 +8878,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let options = DownloadOptions { num_connections: 4, output_path: Some(dir.path().to_path_buf()), ..Default::default() };
         let (tx, mut rx) = broadcast::channel(1024);
-        let run = DownloadEngine::new(vec![base.join("f.bin").unwrap()], options).run(Some(tx));
-        tokio::time::timeout(Duration::from_secs(30), run).await.expect("it finishes").unwrap();
+        let engine = DownloadEngine::new(vec![base.join("f.bin").unwrap()], options);
+        tokio::time::timeout(Duration::from_secs(30), engine.run(Some(tx))).await.expect("it finishes").unwrap();
         let mut hosts = Vec::new();
         loop {
             match rx.try_recv() {
