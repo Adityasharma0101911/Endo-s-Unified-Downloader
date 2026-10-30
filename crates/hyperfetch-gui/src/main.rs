@@ -28,6 +28,7 @@ use hyperfetch_core::ingest::{self, Channel, Task};
 use hyperfetch_core::media;
 use hyperfetch_core::paste;
 use hyperfetch_core::queue::{DownloadQueue, QueueItem, QueueItemStatus};
+use hyperfetch_core::relink;
 use hyperfetch_core::updater::{self, Installed, Update};
 use hyperfetch_core::verify::{self, BuildVerificationResult};
 use hyperfetch_core::zipdir::ZipEntry;
@@ -172,6 +173,27 @@ enum AppEvent {
     /// The channels of the channel list `input` may be (see [`App::read_document`]): None when it
     /// is none, and is read as any other input.
     Channels { origin: Origin, input: String, checksum: String, auth: String, result: Result<Option<Vec<Channel>>, String> },
+    /// New links for stopped download `id`, fetched with `options`, checked against its file (see
+    /// `relink::relink`): from the New link box (see [`App::check_new_link`]) or the extension
+    /// (`POST /relink`), which sends only those it took.
+    Relinked { id: usize, urls: Vec<Url>, options: DownloadOptions, result: Result<(), String> },
+}
+
+/// The New link box of a stopped download (see `ui::queue`): what is typed in it, whether that is
+/// being checked (see [`App::check_new_link`]), why the last one was refused, and whether it is to
+/// take the keyboard.
+struct NewLink {
+    id: usize,
+    text: String,
+    checking: bool,
+    refused: Option<String>,
+    focus: bool,
+}
+
+impl NewLink {
+    fn new(id: usize) -> Self {
+        Self { id, text: String::new(), checking: false, refused: None, focus: true }
+    }
 }
 
 /// A channel list read, waiting for the user to tick the channels to record (see
@@ -379,6 +401,8 @@ struct App {
     phone: Arc<phone::Shared>,
     /// That server, while "Send links from your phone" is on (see [`App::set_phone_links`]).
     phone_server: Option<phone::Server>,
+    /// The New link box open on a stopped download's page.
+    new_link: Option<NewLink>,
 }
 
 impl App {
@@ -433,6 +457,7 @@ impl App {
             cc.egui_ctx.clone(),
         );
         ipc::spawn(app.events_tx.clone(), cc.egui_ctx.clone(), &rt, desktop::data_tag(&settings::data_dir()));
+        ipc::set_expired(&app.queue);
         if app.settings.phone_links {
             app.set_phone_links(true);
         }
@@ -520,6 +545,7 @@ impl App {
             channel_lists: Vec::new(),
             phone,
             phone_server: None,
+            new_link: None,
         }
     }
 
@@ -1175,6 +1201,48 @@ impl App {
         }
     }
 
+    /// Checks the link in the New link box as the new link of its stopped download, off the UI
+    /// thread (see `relink::relink`): the answer comes as `AppEvent::Relinked`.
+    fn check_new_link(&mut self) {
+        let Some(new_link) = self.new_link.as_mut().filter(|new_link| !new_link.checking) else { return };
+        let id = new_link.id;
+        let Some(item) = self.queue.get_item(id).filter(|item| !item.status.is_active()) else { return };
+        let Some(url) = Url::parse(new_link.text.trim()).ok().filter(|url| matches!(url.scheme(), "http" | "https")) else {
+            new_link.refused = Some("Paste an http or https link".to_string());
+            return;
+        };
+        (new_link.checking, new_link.refused) = (true, None);
+        let (target, size, options) = (item.target_path.clone(), item.total_bytes, item.options.clone());
+        self.spawn_event(async move {
+            let urls = vec![url];
+            let result = relink::relink(target, size, urls.clone(), options.clone()).await;
+            AppEvent::Relinked { id, urls, options, result }
+        });
+    }
+
+    /// Takes new links checked for stopped download `id`: it resumes through them from where it
+    /// stopped. A refused one says why in the New link box.
+    fn relinked(&mut self, id: usize, urls: Vec<Url>, options: DownloadOptions, result: Result<(), String>) {
+        let shown = self.new_link.as_mut().filter(|new_link| new_link.id == id);
+        match result {
+            Err(why) => {
+                if let Some(new_link) = shown {
+                    (new_link.checking, new_link.refused) = (false, Some(why));
+                }
+            }
+            Ok(()) => {
+                if shown.is_some() {
+                    self.new_link = None;
+                }
+                let name = self.queue.get_item(id).map(|item| item.filename.clone()).unwrap_or_default();
+                if self.queue.relink(id, urls, options) {
+                    self.notice = Some(Ok(format!("New link taken: {} resumes where it stopped", name)));
+                    self.start_job(id, false);
+                }
+            }
+        }
+    }
+
     /// Starts running download `id` again from where it is with its options changed by `change`:
     /// it pauses, and starts again as soon as its state is saved (see `AppEvent::JobFinished`).
     fn restart_with(&mut self, id: usize, change: impl FnOnce(&mut DownloadOptions)) {
@@ -1553,6 +1621,7 @@ impl App {
             }
             AppEvent::TracksListed { item, link, result } => self.tracks_listed(item, link, result),
             AppEvent::Channels { origin, input, checksum, auth, result } => self.channels_read(origin, input, checksum, auth, result),
+            AppEvent::Relinked { id, urls, options, result } => self.relinked(id, urls, options, result),
         }
     }
 
@@ -2019,6 +2088,7 @@ impl eframe::App for App {
         }
         if self.queue.revision() != self.queue_saved {
             self.queue_saved = self.queue.revision();
+            ipc::set_expired(&self.queue);
             if let Some(saver) = &self.queue_saver {
                 saver.save(self.queue.clone());
             }

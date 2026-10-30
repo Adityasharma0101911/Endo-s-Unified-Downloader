@@ -10,6 +10,7 @@ pub mod hls;
 pub mod metalink;
 pub mod torrent;
 pub mod queue;
+pub mod relink;
 pub mod media;
 pub mod history;
 pub mod verify;

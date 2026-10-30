@@ -107,6 +107,23 @@ impl QueueItem {
     pub fn is_finishing(&self) -> bool {
         self.status == QueueItemStatus::Downloading && self.total_bytes > 0 && self.downloaded_bytes >= self.total_bytes
     }
+
+    /// A file over plain http(s) links, resumed from its partial file: one whose links can be
+    /// swapped for new ones (see [`DownloadQueue::relink`]); not a stream, a media site's page, a
+    /// swarm or an FTP download.
+    pub fn relinkable(&self) -> bool {
+        let o = &self.options;
+        let plain = |url: &Url| matches!(url.scheme(), "http" | "https") && !crate::media::is_supported_media_site(url);
+        !self.urls.is_empty()
+            && self.urls.iter().all(plain)
+            && !(o.hls || o.dash || o.bittorrent || o.playlist_text.is_some() || o.media_preset.is_some())
+    }
+
+    /// It failed because its link expired: once bytes had come, its server refused a resume or a
+    /// range request with 401, 403, 404 or 410 (see `relink::refused`). A new link lets it go on.
+    pub fn link_expired(&self) -> bool {
+        matches!(&self.status, QueueItemStatus::Failed(error) if crate::relink::refused(error)) && self.downloaded_bytes > 0 && self.relinkable()
+    }
 }
 
 /// What the downloads still to come have left (see [`DownloadQueue::remaining`]).
@@ -395,6 +412,28 @@ impl DownloadQueue {
             Some(item) if !item.status.is_active() => {
                 item.options.auth_header = Some(header);
                 if item.status == QueueItemStatus::AuthRequired {
+                    item.status = QueueItemStatus::Paused;
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Gives stopped item `id` new links to the same file (checked first: see `relink::relink`),
+    /// with the `options` they are fetched with (a new sign-in), keeping what it has downloaded:
+    /// its progress, and the file it is saved as, which the new links' names must not change. A
+    /// failed one becomes `Paused`, to resume. Returns false if it is missing or running.
+    pub fn relink(&mut self, id: usize, urls: Vec<Url>, options: DownloadOptions) -> bool {
+        match self.get_item_mut(id) {
+            Some(item) if !item.status.is_active() => {
+                item.urls = urls;
+                item.options = options;
+                if let Some(target) = item.target_path.clone() {
+                    item.options.output_path = Some(target);
+                    item.names_file = true;
+                }
+                if matches!(item.status, QueueItemStatus::Failed(_)) {
                     item.status = QueueItemStatus::Paused;
                 }
                 true
@@ -936,5 +975,67 @@ mod tests {
         // The live queue is untouched until it is saved.
         assert_eq!(item(&q, ids[1]).urls, vec![url("https://e.com/failed.bin?sig=s2")]);
         assert!(q.mark_started(ids[1]));
+    }
+
+    /// A download's link expired when its server refused it (401, 403, 404, 410) after bytes had
+    /// come; not when it was refused at once, failed otherwise or is not failed, nor for a stream
+    /// or a media page, whose links are not swapped.
+    #[test]
+    fn a_link_expires_once_a_download_has_started_and_is_refused() {
+        let failed = |link: &str, options: DownloadOptions, done: u64, error: &str| {
+            let mut q = DownloadQueue::new();
+            let id = q.add_item(vec![url(link)], options);
+            q.mark_started(id);
+            q.apply_snapshot(id, &EngineSnapshot { total_bytes: 1000, downloaded_bytes: done, ..Default::default() });
+            q.finish(id, Err(error.to_string()));
+            q.get_item(id).unwrap().link_expired()
+        };
+        let plain = || DownloadOptions::default();
+        for status in [401, 403, 404, 410] {
+            assert!(failed("https://cdn.example/a.bin?sig=1", plain(), 400, &format!("https://cdn.example/a.bin?sig=1: HTTP {status} X")), "{status}");
+        }
+        assert!(failed("https://cdn.example/a.bin", plain(), 400, "Download failed: every mirror failed; last error: HTTP 403 Forbidden"));
+        assert!(!failed("https://cdn.example/a.bin", plain(), 0, "HTTP 403 Forbidden"), "refused before any byte came");
+        assert!(!failed("https://cdn.example/a.bin", plain(), 400, "HTTP 500 Internal Server Error"));
+        assert!(!failed("https://cdn.example/a.bin", plain(), 400, "connection reset"));
+        assert!(!failed("https://cdn.example/a.m3u8", DownloadOptions { hls: true, ..plain() }, 400, "HTTP 403 Forbidden"));
+        assert!(!failed("https://www.youtube.com/watch?v=x", plain(), 400, "HTTP 403 Forbidden"));
+        assert!(!failed("ftp://ftp.example/a.bin", plain(), 400, "HTTP 403 Forbidden"));
+
+        let (mut q, ids) = queue_of(&["https://cdn.example/a.bin"]);
+        q.mark_started(ids[0]);
+        q.apply_snapshot(ids[0], &snapshot("/dl/a.bin"));
+        assert!(!q.get_item(ids[0]).unwrap().link_expired(), "running");
+        q.mark_pausing(ids[0]);
+        q.finish(ids[0], Err(CANCELLED.to_string()));
+        assert!(!q.get_item(ids[0]).unwrap().link_expired(), "paused");
+    }
+
+    /// A new link keeps what was downloaded: progress, the file it is saved as (even when the new
+    /// link names another), and it resumes as paused. A running item keeps its link.
+    #[test]
+    fn a_new_link_keeps_the_download() {
+        let (mut q, ids) = queue_of(&["https://cdn.example/v/a.bin?sig=old", "https://e.com/running.bin"]);
+        let (id, running) = (ids[0], ids[1]);
+        q.mark_started(id);
+        q.apply_snapshot(id, &snapshot("/dl/a.bin"));
+        q.finish(id, Err("https://cdn.example/v/a.bin?sig=old: HTTP 410 Gone".into()));
+        assert!(q.get_item(id).unwrap().link_expired());
+        let signed_in = DownloadOptions { referer: Some("https://page.example/".into()), headers: vec![("X-Token".into(), "new".into())], ..Default::default() };
+        let revision = q.revision();
+        assert!(q.relink(id, vec![url("https://edge2.example/x/renamed?sig=new")], signed_in));
+        assert!(q.revision() > revision, "saved");
+        let item = q.get_item(id).unwrap();
+        assert_eq!(item.urls, vec![url("https://edge2.example/x/renamed?sig=new")]);
+        assert_eq!((item.total_bytes, item.downloaded_bytes, item.filename.as_str()), (100, 40, "a.bin"));
+        assert_eq!((item.target_path.as_deref(), item.options.output_path.as_deref(), item.names_file), (Some(Path::new("/dl/a.bin")), Some(Path::new("/dl/a.bin")), true));
+        assert_eq!((item.options.referer.as_deref(), &item.options.headers[..]), (Some("https://page.example/"), &[("X-Token".to_string(), "new".to_string())][..]));
+        assert_eq!(item.status, QueueItemStatus::Paused);
+        assert!(!item.link_expired());
+
+        q.mark_started(running);
+        assert!(!q.relink(running, vec![url("https://e.com/other.bin")], DownloadOptions::default()));
+        assert_eq!(q.get_item(running).unwrap().urls, vec![url("https://e.com/running.bin")]);
+        assert!(!q.relink(999, vec![url("https://e.com/x")], DownloadOptions::default()));
     }
 }
