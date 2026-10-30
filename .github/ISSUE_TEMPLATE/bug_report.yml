@@ -7,7 +7,7 @@ body:
     attributes:
       label: Version
       description: The app's version (Settings > Updates, or `Endos-Unified-Downloader-CLI --version`).
-      placeholder: "1.8.0"
+      placeholder: "1.9.0"
     validations:
       required: true
   - type: dropdown
