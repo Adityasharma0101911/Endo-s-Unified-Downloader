@@ -103,7 +103,8 @@ pub struct Args {
     #[arg(long = "no-remote-checksum")]
     pub no_remote_checksum: bool,
 
-    /// Adapt each download's connections as it goes: one more while that makes it faster
+    /// Adapt each download's connections as it goes: one more while that makes it faster (the
+    /// default; this undoes a --no-adaptive from the config file)
     #[arg(long = "adaptive", overrides_with = "no_adaptive")]
     pub adaptive: bool,
 
@@ -1092,7 +1093,7 @@ mod tests {
         let parse = |args: &[&str]| Args::try_parse_from(std::iter::once("cli").chain(args.iter().copied()));
         let args = parse(&["u"]).unwrap();
         assert!(!args.json && !args.spider && !args.server_response && !args.preview && !args.dry_run && !args.stdout);
-        assert!(!args.insecure && !args.ipv4 && !args.ipv6 && !args.no_proxy && !args.no_clobber && !args.adaptive);
+        assert!(!args.insecure && !args.ipv4 && !args.ipv6 && !args.no_proxy && !args.no_clobber && !args.no_adaptive);
         assert_eq!((args.connect_timeout, args.max_filesize, args.record_seconds), (15, None, None));
         let args = parse(&[
             "-S", "-k", "-4", "-N", "-U", "agent/1", "-u", "bob:pw", "--cookie", "a=b; c=d", "--header", "X-A: 1", "--header",
@@ -1115,8 +1116,8 @@ mod tests {
         // --stdout checks no checksum: the bytes are gone by the time it could.
         assert!(parse(&["--stdout", "--checksum", &"ab".repeat(32), "u"]).is_err());
         // The last of --adaptive and --no-adaptive wins.
-        assert!(parse(&["--no-adaptive", "--adaptive", "u"]).unwrap().adaptive);
-        assert!(!parse(&["--adaptive", "--no-adaptive", "u"]).unwrap().adaptive);
+        assert!(!parse(&["--no-adaptive", "--adaptive", "u"]).unwrap().no_adaptive);
+        assert!(parse(&["--adaptive", "--no-adaptive", "u"]).unwrap().no_adaptive);
         for exclusive in [["--spider", "--dry-run"], ["--preview", "--json"], ["--stdout", "--json"], ["--stdout", "--spider"], ["--json", "--history"]] {
             assert!(parse(&[exclusive[0], exclusive[1], "u"]).is_err(), "{exclusive:?}");
         }
