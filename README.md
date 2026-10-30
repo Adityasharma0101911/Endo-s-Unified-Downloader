@@ -637,6 +637,6 @@ cargo bench --bench range_bench -p hyperfetch-core
 
 ## License
 
-Licensed under either of the Apache License, Version 2.0 or the MIT license, at your option.
+Copyright (C) 2026 Aditya Sharma. From version 1.9.0, Endo's Unified Downloader is free software under the [GNU General Public License, version 3 or later](LICENSE) (GPL-3.0-or-later): anyone may use, change and share it, and whoever shares it, or a version they changed, must share its source code under the same license. As the GPL allows, [NOTICE](NOTICE) adds that copies and changed versions keep the credit "Endo's Unified Downloader by Aditya Sharma" and are marked as changed. Versions up to 1.8.0 were released under the MIT or Apache-2.0 license.
 
 The ffmpeg the app installs when a video needs it (see ffmpeg under Features) is a separate program under the GPL, downloaded from [yt-dlp/FFmpeg-Builds](https://github.com/yt-dlp/FFmpeg-Builds); its licence and sources are published there.

@@ -4,6 +4,8 @@ What changed in each release, newest first. Each release's page on [GitHub](http
 
 ## 1.9.0 (2026-10-30)
 
+- **License: GPL-3.0-or-later** (it was MIT or Apache-2.0). Anyone may use, change and share the app; whoever shares it, or a version they changed, must share its source under the same license and keep the credit to its author (see `NOTICE`). The programs, packages and installer now carry `LICENSE` and `NOTICE`.
+
 - **Expired links rescued.** A download whose signed link expired once it had started shows "Link expired: get a new link"; New link… takes a fresh link to the same file (checked by its size first) and resumes from the partial file, and the browser extension sends the new link by itself when you start the file again or the page plays its video again.
 - **App: send links from your phone.** Turned on in Settings > Phone (off by default), the app shows a QR code that opens a small page on your phone to send it links over your local network, the way the browser extension does; only devices on the local network with the code in the QR code can, and New code makes another.
 - Subtitles in WebVTT, TTML/IMSC and inside MP4 segments (`stpp`, `wvtt`) are read into one timeline, joined across segments and written as SRT or WebVTT, for stream downloads to keep.

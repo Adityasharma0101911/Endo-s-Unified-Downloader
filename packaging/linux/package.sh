@@ -39,7 +39,7 @@ trap 'rm -rf "$work"' EXIT
 # The tar.gz: everything in one folder named like it; the extension without its tests.
 dir="$work/$name"
 mkdir "$dir"
-cp "$bin/Endos-Unified-Downloader" "$bin/Endos-Unified-Downloader-CLI" "$repo/README.md" "$here/endos-unified-downloader.desktop" "$dir/"
+cp "$bin/Endos-Unified-Downloader" "$bin/Endos-Unified-Downloader-CLI" "$repo/README.md" "$repo/LICENSE" "$repo/NOTICE" "$here/endos-unified-downloader.desktop" "$dir/"
 cp "$repo/assets/logo.svg" "$dir/endos-unified-downloader.svg"
 cp -R "$repo/extension" "$dir/extension"
 rm -rf "$dir/extension/test" "$dir/extension/package.json"
@@ -60,6 +60,7 @@ ln -s ../lib/endos-unified-downloader/Endos-Unified-Downloader "$root/usr/bin/en
 ln -s ../lib/endos-unified-downloader/Endos-Unified-Downloader-CLI "$root/usr/bin/endos-downloader-cli"
 ln -s endos-downloader-cli "$root/usr/bin/endos-downloader"
 install -m 644 "$here/endos-unified-downloader.desktop" "$share/applications/"
+install -m 644 "$repo/LICENSE" "$repo/NOTICE" "$share/endos-unified-downloader/"
 install -m 644 "$repo/assets/logo.svg" "$share/icons/hicolor/scalable/apps/endos-unified-downloader.svg"
 
 # The newest glibc symbol version the programs use is the oldest glibc they run with.
@@ -95,7 +96,7 @@ Name: endos-unified-downloader
 Version: $version
 Release: 1
 Summary: $summary
-License: MIT OR Apache-2.0
+License: GPL-3.0-or-later
 URL: $home
 AutoReqProv: no
 Requires: glibc >= $glibc
@@ -127,13 +128,13 @@ mv "$work/rpm/RPMS/$rpm_arch/endos-unified-downloader-$version-1.$rpm_arch.rpm" 
 
 # What install.sh and the app rely on.
 listing="$(tar -tzf "$tarball")"
-for file in Endos-Unified-Downloader Endos-Unified-Downloader-CLI endos-unified-downloader.desktop endos-unified-downloader.svg extension/manifest.json; do
+for file in Endos-Unified-Downloader Endos-Unified-Downloader-CLI LICENSE NOTICE endos-unified-downloader.desktop endos-unified-downloader.svg extension/manifest.json; do
   grep -qx "$name/$file" <<<"$listing" || fail "the tar.gz has no $file"
 done
 if grep -q "^$name/extension/test/" <<<"$listing"; then fail "the tar.gz holds the extension's tests"; fi
 contents="$(dpkg-deb --contents "$deb")"
 rpm_contents="$(rpm -qlp "$rpm" 2>/dev/null)"
-for file in /usr/bin/endos-downloader-cli /usr/bin/endos-downloader-gui /usr/lib/endos-unified-downloader/extension /usr/share/endos-unified-downloader/extension/manifest.json /usr/share/applications/endos-unified-downloader.desktop; do
+for file in /usr/bin/endos-downloader-cli /usr/bin/endos-downloader-gui /usr/lib/endos-unified-downloader/extension /usr/share/endos-unified-downloader/extension/manifest.json /usr/share/endos-unified-downloader/LICENSE /usr/share/applications/endos-unified-downloader.desktop; do
   grep -q " \.$file\( ->\|$\)" <<<"$contents" || fail "the .deb has no $file"
   grep -qx "$file" <<<"$rpm_contents" || fail "the .rpm has no $file"
 done
