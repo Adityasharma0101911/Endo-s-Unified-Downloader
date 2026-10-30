@@ -20,6 +20,7 @@ What changed in each release, newest first. Each release's page on [GitHub](http
 - **Adaptive connections are on by default**, in the CLI (`--no-adaptive` turns them off) and in the app (a smarter connection count, in Settings). In the app they are on again also where an older version saved them off, which was its default then.
 - **Each site's best connection count is remembered across restarts**, with a connection cap it was seen to enforce, for 30 days, in `hosts.json` in the data folder (host names only): the next download from it starts at the count adaptive connections settled on, instead of finding it again.
 - **A download's connections are spread over its server's addresses**, when its name has several (a CDN's), as over several networks: an address that fails, or where a connection stays far slower than the others, is dropped. Not through a proxy, and not over FTP. On by default; `--no-spread-addresses`, or "Use the server's addresses" in Settings > Connections & networks, turns it off.
+- **Small files run beside the batch's or queue's downloads at once**, up to 16 more: a file its probe finds under 8 MiB stops holding its place as soon as the probe's answer tells its size (not when they run one at a time). They keep to the per-host connection limit and the speed limit as every download does.
 
 ## 1.8.0 (2026-10-27)
 
