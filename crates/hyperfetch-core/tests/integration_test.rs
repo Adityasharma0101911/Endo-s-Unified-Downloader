@@ -995,7 +995,8 @@ async fn test_redownload_existing_complete_file_does_not_overwrite() {
     assert_eq!(path, out);
     assert_eq!(mock.stats.gets.load(Ordering::SeqCst), gets, "nothing may be downloaded again");
     assert_eq!(std::fs::metadata(&out).unwrap().modified().unwrap(), modified);
-    assert_eq!(rx.try_recv().unwrap().progress_ratio, 1.0);
+    let told = std::iter::from_fn(|| rx.try_recv().ok()).find(|s| !s.from_probe()).unwrap();
+    assert_eq!(told.progress_ratio, 1.0);
     assert_file(&out, &data);
 }
 
@@ -2294,7 +2295,9 @@ async fn test_a_mirror_answering_later_joins_the_download() {
     let mirrors_seen = async {
         let mut seen = Vec::new();
         while let Ok(snapshot) = rx.recv().await {
-            seen.push(snapshot.mirror_speeds.len());
+            if !snapshot.from_probe() {
+                seen.push(snapshot.mirror_speeds.len());
+            }
         }
         seen
     };
