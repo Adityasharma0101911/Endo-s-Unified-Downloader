@@ -3,16 +3,31 @@ use std::collections::{HashMap, HashSet};
 use hyperfetch_core::queue::{Priority, Remaining};
 
 use super::*;
+use crate::slow::{self, Fix};
 
 const AUTH_REQUIRED: &str =
     "Authorization header not saved: enter it again under Advanced options, then Resume to continue from the partial file.";
 
-pub(super) fn download_details(app: &App, ui: &mut Ui, item: &QueueItem) {
+pub(super) fn download_details(app: &mut App, ui: &mut Ui, item: &QueueItem) {
     let p = palette(ui);
     progress_card(app, ui, item);
     ui.add_space(6.0);
     let (status, color) = status_line(app, item, &p);
     ui.label(RichText::new(status).color(color));
+    // While its bytes come in, it can tell what holds it back.
+    if item.status == QueueItemStatus::Downloading && !app.is_resolving(item.id) && !item.is_finishing() {
+        let open = egui::Id::new(("why slow", item.id));
+        ui.add_space(4.0);
+        if ui.add(button(format!("{} Why is it slow?", icon::GAUGE))).clicked() {
+            ui.data_mut(|d| {
+                let shown = d.get_temp_mut_or_default::<bool>(open);
+                *shown = !*shown;
+            });
+        }
+        if ui.data(|d| d.get_temp::<bool>(open)).unwrap_or(false) {
+            why_slow(app, ui, item);
+        }
+    }
 
     let view = app.jobs.get(&item.id);
     let chunks: &[ChunkSnapshot] = view.map_or(&[], |v| &v.chunks);
@@ -32,6 +47,57 @@ pub(super) fn download_details(app: &App, ui: &mut Ui, item: &QueueItem) {
     }
     ui.add_space(12.0);
     throughput_graph(ui, item.id, view.map(|view| &view.speed_history), eased_speed(ui, item), live);
+}
+
+/// What holds running download `item` back (see `slow::findings`), coming in one after another,
+/// each with the button of its fix when the app has one; or that nothing in the app does.
+fn why_slow(app: &mut App, ui: &mut Ui, item: &QueueItem) {
+    let p = palette(ui);
+    let Some(view) = app.jobs.get(&item.id) else { return };
+    let running = || app.queue.items().iter().filter(|other| other.status == QueueItemStatus::Downloading);
+    // shortcut: downloads share a server when their links' do, not where those redirect to; the
+    // engine's own host slots would be exact.
+    let server = |other: &QueueItem| other.urls.first().map(hyperfetch_core::hosts::HostKey::of);
+    let on_host: usize = running().filter(|other| server(*other) == server(item)).map(|other| app.jobs.get(&other.id).map_or(0, |v| v.active_workers)).sum();
+    let limited: f64 = running().filter(|other| other.options.max_speed == item.options.max_speed).map(|other| other.speed_bytes_per_sec).sum();
+    let found = slow::findings(item, view, on_host, limited);
+    let mut fix = None;
+    ui.add_space(8.0);
+    card(ui).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(bold("What holds it back").color(p.strong));
+        ui.add_space(4.0);
+        if found.is_empty() {
+            ui.label(RichText::new("Nothing in the app: the server or your internet line sets its speed.").color(p.muted));
+        }
+        for (n, finding) in found.iter().enumerate() {
+            anim::fade_in(ui, egui::Id::new(("why slow", item.id, n)), anim::stagger(n), anim::RISE, |ui| {
+                ui.horizontal(|ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if let Some(change) = finding.fix {
+                            let name = match change {
+                                Fix::NoLimit => "Lift the limit for it".to_string(),
+                                Fix::Connections(n) => format!("Use {n} connections"),
+                            };
+                            if ui.add(button(name)).on_hover_text("Starts it again from where it is, with this change").clicked() {
+                                fix = Some(change);
+                            }
+                        }
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                            ui.label(RichText::new(icon::INFO).color(p.amber));
+                            ui.add(egui::Label::new(finding.text.as_str()).wrap());
+                        });
+                    });
+                });
+            });
+        }
+    });
+    if let Some(change) = fix {
+        app.restart_with(item.id, |options| match change {
+            Fix::NoLimit => options.max_speed = None,
+            Fix::Connections(n) => options.num_connections = n,
+        });
+    }
 }
 
 fn metric(ui: &mut Ui, label: &str, value: String, color: Option<Color32>) {
@@ -1047,6 +1113,34 @@ mod tests {
         assert_eq!(done(&mut h).as_deref(), Some("All done in about 00:18"));
         h.finish(a, None);
         assert_eq!(done(&mut h), None);
+    }
+
+    /// "Why is it slow?" on a running download's page lists what holds it back: here the speed
+    /// limit, which it runs at. The fix lifts the limit for this download, which pauses and at
+    /// once starts again from where it was, without it.
+    #[test]
+    fn why_is_it_slow_finds_the_speed_limit_and_lifts_it() {
+        let mut h = Harness::new();
+        // Started again, it fails at once instead of fetching anything.
+        h.app.engines = std::sync::Arc::new(|_: Vec<url::Url>, _: DownloadOptions| Err("not downloaded here".to_string()));
+        let id = h.add("big.iso");
+        h.app.queue.get_item_mut(id).unwrap().options.max_speed = Some(3_000_000);
+        // At 3 MB/s.
+        h.progress(id, 0.4);
+        h.app.focused = Some(id);
+        h.frames(10);
+        assert!(h.find("What holds it back").is_none());
+        h.click("Why is it slow?");
+        h.frames(30);
+        let lines: Vec<String> = h.texts().into_iter().map(|(text, _)| text).collect();
+        assert!(lines.iter().any(|text| text.starts_with("Your speed limit holds it")), "{lines:?}");
+        h.click("Lift the limit for it");
+        let item = h.app.queue.get_item(id).unwrap();
+        assert_eq!((item.options.max_speed, item.status.clone()), (None, QueueItemStatus::Pausing));
+        h.app.handle_event(crate::AppEvent::JobFinished { id, result: Err(hyperfetch_core::engine::CANCELLED.to_string()) });
+        assert_eq!(h.app.queue.get_item(id).unwrap().status, QueueItemStatus::Downloading, "started again at once");
+        h.wait_for(|app| matches!(app.queue.get_item(id).unwrap().status, QueueItemStatus::Failed(_)));
+        h.wait_for_background();
     }
 
     /// Each line's file name, whether it is a ghost, and how many rows down it is pushed.

@@ -5,6 +5,7 @@ mod ipc;
 mod queue_store;
 mod recording;
 mod settings;
+mod slow;
 mod taskbar;
 mod tracks;
 mod tray;
@@ -213,6 +214,8 @@ struct JobView {
     recording: bool,
     /// Peers and upload of a BitTorrent download, from its last snapshot.
     torrent: Option<hyperfetch_core::p2p::TorrentProgress>,
+    /// What is known of its server, from its last snapshot (see `EngineSnapshot::host`).
+    host: Option<hyperfetch_core::hosts::HostProfile>,
 }
 
 impl JobView {
@@ -357,6 +360,9 @@ struct App {
     /// Paused downloads Resume all or the schedule's start resumes, first come first, as the
     /// queue has room for them (see `App::run_scheduler`).
     resuming: Vec<usize>,
+    /// Running downloads paused to start again at once with changed options (see
+    /// `App::restart_with`).
+    restarting: HashSet<usize>,
     /// The window's taskbar button (Windows), and the progress it shows.
     taskbar: Option<taskbar::Taskbar>,
     taskbar_shown: Option<taskbar::Progress>,
@@ -496,6 +502,7 @@ impl App {
             writer: Box::new(desktop::write),
             schedule_seen: None,
             resuming: Vec::new(),
+            restarting: HashSet::new(),
             taskbar: None,
             taskbar_shown: None,
             batch_failed: false,
@@ -1157,6 +1164,15 @@ impl App {
         }
     }
 
+    /// Starts running download `id` again from where it is with its options changed by `change`:
+    /// it pauses, and starts again as soon as its state is saved (see `AppEvent::JobFinished`).
+    fn restart_with(&mut self, id: usize, change: impl FnOnce(&mut DownloadOptions)) {
+        let Some(item) = self.queue.get_item_mut(id).filter(|item| item.status == QueueItemStatus::Downloading) else { return };
+        change(&mut item.options);
+        self.restarting.insert(id);
+        self.pause_job(id);
+    }
+
     /// Asks a running download to stop; it stays "Pausing" until the engine has saved its state.
     fn pause_job(&mut self, id: usize) {
         let Some(running) = self.jobs.get(&id).and_then(|view| view.running.as_ref()) else { return };
@@ -1255,6 +1271,7 @@ impl App {
             }
             self.queue.apply_snapshot(id, &snapshot);
             view.torrent.clone_from(&snapshot.torrent);
+            view.host = snapshot.host;
             view.mirror_speeds = snapshot.mirror_speeds;
             if !snapshot.chunks.is_empty() {
                 view.chunks = snapshot.chunks;
@@ -1383,6 +1400,9 @@ impl App {
                     }
                 }
                 self.queue.finish(id, result);
+                if self.restarting.remove(&id) && self.queue.get_item(id).is_some_and(|item| item.status == QueueItemStatus::Paused) {
+                    self.start_job(id, false);
+                }
                 // The engine records completed downloads in the history.
                 self.refresh_history();
                 // One that ended by itself (not paused) may have been the queue's last.

@@ -136,6 +136,9 @@ pub struct EngineSnapshot {
     /// A file its probe found smaller than `SMALL_FILE`: done soon, it need not hold one of a
     /// batch's or queue's places for long (see `crate::queue::may_start`).
     pub small: bool,
+    /// What is known of the server a download over HTTP comes from, after redirects (see
+    /// `crate::hosts::profile`), for a front end to tell what holds it back; None for others.
+    pub host: Option<HostProfile>,
 }
 
 impl EngineSnapshot {
@@ -3025,7 +3028,10 @@ impl DownloadEngine {
                     return Err(transient(format!("stalled: no data for {}s at offset {}", stall.as_secs(), written)));
                 }
                 _ = tick.tick() => {
-                    emit(snapshot_tx, || stream_snapshot(remote.size, written, meter.update(written), final_path));
+                    emit(snapshot_tx, || {
+                        let host = HostProfile { accepts_ranges: Some(remote.accepts_ranges), ..hosts::profile(&remote.final_url) };
+                        EngineSnapshot { host: Some(host), ..stream_snapshot(remote.size, written, meter.update(written), final_path) }
+                    });
                 }
                 item = stream.next() => {
                     let bytes = match item {
@@ -3768,15 +3774,17 @@ impl RangeJob {
             let m = self.chunks.lock();
             (m.total_downloaded(), m.chunk_snapshots())
         };
-        let (mirror_speeds, active_workers) = {
+        let (mirror_speeds, active_workers, host) = {
             let r = self.mirrors.lock();
             let speeds = r
                 .mirrors()
                 .iter()
                 .map(|m| (m.id, m.url.host_str().unwrap_or("unknown").to_string(), m.speed_ewma))
                 .collect();
-            (speeds, r.in_flight())
+            (speeds, r.in_flight(), r.mirrors().first().map(|m| m.url.clone()))
         };
+        // Not under the mirrors' lock.
+        let host = host.map(|url| hosts::profile(&url));
         EngineSnapshot {
             total_bytes: size,
             downloaded_bytes: downloaded,
@@ -3787,6 +3795,7 @@ impl RangeJob {
             chunks,
             target_path: Some(target.to_path_buf()),
             small: size < SMALL_FILE,
+            host,
             ..Default::default()
         }
     }
@@ -8859,6 +8868,27 @@ mod tests {
         assert_eq!(host_room(&mirrors, 2), 2 + 2);
         assert_eq!(host_room(&mirrors[..1], 0), 3);
         assert_eq!(host_room(&mirrors, 0), usize::MAX, "no limit, and no cap seen on one host");
+    }
+
+    /// The snapshots of a download over HTTP tell what is known of its server (see
+    /// `EngineSnapshot::host`): this one takes ranges.
+    #[tokio::test]
+    async fn test_snapshots_tell_what_is_known_of_the_server() {
+        let base = file_server(vec![7u8; 2 << 20], Duration::from_millis(20)).await;
+        let dir = tempdir().unwrap();
+        let options = DownloadOptions { num_connections: 4, output_path: Some(dir.path().to_path_buf()), ..Default::default() };
+        let (tx, mut rx) = broadcast::channel(1024);
+        let run = DownloadEngine::new(vec![base.join("f.bin").unwrap()], options).run(Some(tx));
+        tokio::time::timeout(Duration::from_secs(30), run).await.expect("it finishes").unwrap();
+        let mut hosts = Vec::new();
+        loop {
+            match rx.try_recv() {
+                Ok(snapshot) => hosts.push(snapshot.host),
+                Err(broadcast::error::TryRecvError::Lagged(_)) => {}
+                Err(_) => break,
+            }
+        }
+        assert!(hosts.iter().any(|host| host.is_some_and(|host| host.accepts_ranges == Some(true))), "{hosts:?}");
     }
 
     #[tokio::test]
