@@ -105,6 +105,9 @@ struct Attempt {
     /// busy (writing, rate limited) rather than waiting, and until the answer came: a server slow
     /// to answer is no silent one, and the wait for an answer has the stall timeout of its own.
     waiting: Option<Instant>,
+    /// Next byte its worker has yet to receive (0 until it tells): it writes what arrived in
+    /// batches, so the bytes it holds would otherwise look left to fetch.
+    received: u64,
 }
 
 impl Chunk {
@@ -139,6 +142,19 @@ impl Chunk {
     /// The attempt's worker is busy with what arrived, not waiting for the server.
     pub(crate) fn busy(&self) {
         self.attempt.lock().waiting = None;
+    }
+
+    /// The attempt's worker holds the chunk's bytes before `to`, on disk or about to be.
+    pub(crate) fn received(&self, to: u64) {
+        self.attempt.lock().received = to;
+    }
+
+    /// Bytes still to arrive before the (possibly stolen-from) end: what the worker holds to
+    /// write is no more left to fetch than what is on disk.
+    fn unreceived(&self) -> u64 {
+        let held = self.attempt.lock().received;
+        let pos = self.current_offset.load(Ordering::SeqCst).max(self.range.start).max(held);
+        self.end_offset.load(Ordering::SeqCst).saturating_add(1).saturating_sub(pos)
     }
 
     /// How long the attempt's worker has been waiting for the server without a byte.
@@ -430,10 +446,11 @@ impl ChunkManager {
     /// mirror's rate once its mirror's startup is over. A timed steal splits where both sides
     /// finish together, the thief starting after its mirror's startup at its mirror's rate, and
     /// leaves the chunk alone if its worker finishes within `STEAL_MIN_STARTUPS` of those startups
-    /// anyway. Without timing the rest is split in half. A split that would hand the thief fewer
-    /// than `min_bytes` is not made, and the victim keeps at least one byte. The victim is always
-    /// truncated and the thief always gets `[split, old_end]`; if the victim's worker already
-    /// wrote past the split, those bytes are identical and simply get written twice.
+    /// anyway. Without timing the rest is split in half. Bytes the victim's worker received but
+    /// has yet to write count as its own: the split comes after them. A split that would hand the
+    /// thief fewer than `min_bytes` is not made, and the victim keeps at least one byte. The victim
+    /// is always truncated and the thief always gets `[split, old_end]`; if the victim's worker
+    /// already wrote past the split, those bytes are identical and simply get written twice.
     /// Returns `(victim_chunk_id, new_stolen_chunk)`.
     pub fn steal_work<'a>(
         &mut self,
@@ -453,7 +470,7 @@ impl ChunkManager {
             .iter()
             .filter_map(|c| match c.status {
                 ChunkStatus::Assigned { mirror_id, .. } => {
-                    let remaining = c.remaining_bytes();
+                    let remaining = c.unreceived();
                     (remaining > min_bytes).then(|| (c.id, remaining, c.pace(now, expected(mirror_id))))
                 }
                 _ => None,
@@ -461,9 +478,8 @@ impl ChunkManager {
             .max_by(|a, b| eta_secs(a.1, a.2).total_cmp(&eta_secs(b.1, b.2)).then(a.1.cmp(&b.1)))?;
 
         let victim = &mut self.chunks[victim_id];
-        let cur_pos = victim.current_offset.load(Ordering::SeqCst).max(victim.range.start);
         let cur_end = victim.end_offset.load(Ordering::SeqCst);
-        let remaining = cur_end.checked_sub(cur_pos)?.saturating_add(1);
+        let remaining = Some(victim.unreceived()).filter(|&n| n > 0)?;
         let keep = match (expected(thief_mirror_id).filter(|t| t.rate > 0.0), pace) {
             (Some(thief), Some((wait, victim_rate))) => {
                 let (startup, left) = (thief.startup.as_secs_f64(), remaining as f64);
@@ -792,6 +808,20 @@ mod tests {
             manager.chunks().iter().map(|c| eta_secs(c.remaining_bytes(), c.pace(now, Some(&mirror[0])))).collect();
         assert_eq!(finish.len(), 8);
         assert!(finish.iter().all(|&secs| (1.3..1.5).contains(&secs)), "{finish:?}");
+    }
+
+    #[test]
+    fn test_bytes_received_but_not_yet_written_are_the_victims() {
+        let mirror = [cost(0.3, 2.0 * MB as f64)];
+        // 2 MiB/s, and all but half a MiB received, if not yet written: done in 0.25 s, sooner
+        // than a thief could start twice.
+        let mut manager = one_victim(20 * MB, 2 * MB, 1);
+        manager.chunks()[0].received(20 * MB - MB / 2);
+        assert!(manager.steal_work(1, 0, timed(64 * 1024, &mirror)).is_none());
+        // 4 MiB still to come: the split is timed on those, after what the victim holds.
+        manager.chunks()[0].received(16 * MB);
+        let (_, stolen) = manager.steal_work(1, 0, timed(64 * 1024, &mirror)).unwrap();
+        assert!(stolen.range.start > 18 * MB, "{:?}", stolen.range);
     }
 
     const SILENT: Duration = Duration::from_secs(2);
