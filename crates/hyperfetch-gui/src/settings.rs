@@ -162,7 +162,10 @@ pub struct Settings {
     /// A finished file takes the date its server gives it.
     pub remote_time: bool,
     /// Add and drop connections as they speed a download up or slow it (see
-    /// `DownloadOptions::adaptive`).
+    /// `DownloadOptions::adaptive`). On by default; saved under a key of its own, as the
+    /// `adaptive: false` older versions saved was their default, not a choice. Who turned it off
+    /// before cannot be told from who left it, so it is on again for them too.
+    #[serde(rename = "adaptive_connections")]
     pub adaptive: bool,
     /// The User-Agent sent in place of the app's (empty = the app's).
     pub user_agent: String,
@@ -270,7 +273,7 @@ impl Default for Settings {
             categories: hyperfetch_core::postprocess::default_categories(),
             remote_checksum: engine.remote_checksum,
             remote_time: engine.remote_time,
-            adaptive: engine.adaptive,
+            adaptive: true,
             user_agent: String::new(),
             ip_family: engine.ip_family,
             connect_timeout_secs: engine.connect_timeout_secs,
@@ -826,25 +829,26 @@ mod tests {
     }
 
     /// A settings file from before the categories and the connection rows loads with their
-    /// defaults: the built-in categories, the site's checksum checked, the server's date and
-    /// adaptive connections off, the app's User-Agent, either IP version, 15 s to connect. What
-    /// is chosen reaches the engine, a 0 s timeout as 1 s, and is kept; TLS is always checked.
+    /// defaults: the built-in categories, the site's checksum checked, the server's date off,
+    /// adaptive connections on (also where an older version saved them off, its default then),
+    /// the app's User-Agent, either IP version, 15 s to connect. What is chosen reaches the
+    /// engine, a 0 s timeout as 1 s, and is kept; TLS is always checked.
     #[test]
     fn new_rows_take_defaults_from_old_files_and_reach_the_engine() {
-        let old = r#"{"save_dir": "dl", "sort_downloads": true, "schedule": {"enabled": false}}"#;
+        let old = r#"{"save_dir": "dl", "sort_downloads": true, "schedule": {"enabled": false}, "adaptive": false}"#;
         let saved: Settings = serde_json::from_str(old).unwrap();
         assert_eq!(saved.categories, hyperfetch_core::postprocess::default_categories());
-        assert!(saved.sort_downloads && saved.remote_checksum && !saved.remote_time && !saved.adaptive);
+        assert!(saved.sort_downloads && saved.remote_checksum && !saved.remote_time && saved.adaptive);
         assert_eq!((saved.user_agent.as_str(), saved.ip_family, saved.connect_timeout_secs), ("", IpFamily::Any, 15));
         let file = [Url::parse("https://example.com/a.iso").unwrap()];
         let opts = saved.download_options(&file, "", "").unwrap();
-        assert!(opts.post.sort && opts.remote_checksum && !opts.remote_time && !opts.adaptive && !opts.insecure);
+        assert!(opts.post.sort && opts.remote_checksum && !opts.remote_time && opts.adaptive && !opts.insecure);
         assert_eq!((opts.user_agent, opts.ip_family, opts.connect_timeout_secs), (None, IpFamily::Any, 15));
 
         let chosen = Settings {
             remote_checksum: false,
             remote_time: true,
-            adaptive: true,
+            adaptive: false,
             user_agent: " Agent/1.0 ".into(),
             ip_family: IpFamily::V6,
             connect_timeout_secs: 0,
@@ -852,10 +856,10 @@ mod tests {
             ..saved
         };
         let mut opts = chosen.download_options(&file, "", "").unwrap();
-        assert!(!opts.remote_checksum && opts.remote_time && opts.adaptive);
+        assert!(!opts.remote_checksum && opts.remote_time && !opts.adaptive);
         assert_eq!((opts.user_agent.as_deref(), opts.ip_family, opts.connect_timeout_secs), (Some("Agent/1.0"), IpFamily::V6, 1));
         let tuned = chosen.tuning();
-        assert_eq!((tuned.user_agent.as_deref(), tuned.ip_family, tuned.adaptive), (Some("Agent/1.0"), IpFamily::V6, true), "repairs too");
+        assert_eq!((tuned.user_agent.as_deref(), tuned.ip_family, tuned.adaptive), (Some("Agent/1.0"), IpFamily::V6, false), "repairs too");
         opts.insecure = true;
         chosen.fill_keys(&mut opts);
         assert!(!opts.insecure, "a queue file cannot turn TLS checks off");

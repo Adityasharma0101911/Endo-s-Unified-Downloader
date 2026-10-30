@@ -17,6 +17,7 @@ What changed in each release, newest first. Each release's page on [GitHub](http
 - **A server busy at the start** (HTTP 429 or 503 to the first requests, HEAD included) no longer fails the download at once: it is asked again once its `Retry-After` is over, else after 2, 4, 8 and then every 16 s, for up to 2 minutes. A `Retry-After` given as a date is honoured too, not only seconds.
 - **Faster with many connections:** a large file's connections all start as soon as the probe answers, instead of after it measured the host, and a chunk about to finish is no longer split for one more request and connection (the bytes a connection had received but not yet written counted as left).
 - **Slow connections are replaced**, not only stuck ones: a connection that stays far slower than the others (under 0.3 of their median for 5 s) is closed and its rest goes on over a new one, which often gets a faster route.
+- **Adaptive connections are on by default**, in the CLI (`--no-adaptive` turns them off) and in the app (a smarter connection count, in Settings). In the app they are on again also where an older version saved them off, which was its default then.
 
 ## 1.8.0 (2026-10-27)
 

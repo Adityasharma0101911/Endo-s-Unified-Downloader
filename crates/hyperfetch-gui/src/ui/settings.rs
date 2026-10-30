@@ -650,7 +650,7 @@ mod tests {
         h.type_text("Agent/2.0");
         h.key(egui::Key::Escape, egui::Modifiers::NONE);
         let s = &h.app.settings;
-        assert!(s.adaptive && s.ip_family == IpFamily::V6 && s.user_agent == "Agent/2.0", "{s:?}");
+        assert!(!s.adaptive && s.ip_family == IpFamily::V6 && s.user_agent == "Agent/2.0", "on by default, so off: {s:?}");
         assert!(h.find("Connect timeout").is_some());
 
         scroll_to(&mut h, "Check against the site's checksum");

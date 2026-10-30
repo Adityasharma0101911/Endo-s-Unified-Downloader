@@ -276,8 +276,9 @@ pub struct DownloadOptions {
     pub post: crate::postprocess::PostOptions,
     /// A download over ranges adapts its connections as it goes (see `Ramp`): from the number
     /// the probe chose, one more while that raises its speed by a tenth, and back by one when the
-    /// last one slowed it; never past `num_connections` or what the host takes. Off (the
-    /// default), the connections the probe chose are kept to the end.
+    /// last one slowed it; never past `num_connections` or what the host takes. Off, the
+    /// connections the probe chose are kept to the end. Off by default here; the CLI and the app
+    /// turn it on unless told not to.
     pub adaptive: bool,
     /// The largest file downloaded, in bytes: a larger one fails at the probe, or, when the server
     /// does not tell the size, as soon as more has arrived. A live recording ends there instead,

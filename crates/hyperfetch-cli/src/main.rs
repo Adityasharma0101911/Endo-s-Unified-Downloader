@@ -634,7 +634,7 @@ fn tuning(args: &Args, connections: u64) -> DownloadOptions {
         remote_time: args.remote_time,
         max_filesize: args.max_filesize,
         remote_checksum: !args.no_remote_checksum,
-        adaptive: args.adaptive,
+        adaptive: !args.no_adaptive,
         ..Default::default()
     }
 }
@@ -1556,7 +1556,7 @@ mod tests {
     fn request_flags_reach_the_engine() {
         let mut args = parse(&[
             "-u", "bob:pw", "-U", "agent/1", "--cookie", "sid=1", "--header", "X-Key: k", "-k", "-6", "--connect-timeout", "7",
-            "--no-proxy", "-N", "--max-filesize", "2G", "--record-seconds", "30", "--no-remote-checksum", "--adaptive", "u",
+            "--no-proxy", "-N", "--max-filesize", "2G", "--record-seconds", "30", "--no-remote-checksum", "--no-adaptive", "u",
         ]);
         sign_in(&mut args, None).unwrap();
         let urls = vec![Url::parse("https://a.example/f.iso").unwrap()];
@@ -1566,14 +1566,14 @@ mod tests {
         assert_eq!((options.auth_header.as_deref(), options.cookie_string.as_deref()), (Some("Basic Ym9iOnB3"), Some("sid=1")));
         assert_eq!(options.extra_headers, [("X-Key".to_string(), "k".to_string())]);
         assert_eq!((options.user_agent.as_deref(), options.ip_family, options.connect_timeout_secs), (Some("agent/1"), IpFamily::V6, 7));
-        assert!(options.insecure && options.no_proxy && options.only_if_newer && !options.remote_checksum && options.adaptive);
+        assert!(options.insecure && options.no_proxy && options.only_if_newer && !options.remote_checksum && !options.adaptive);
         assert_eq!((options.max_filesize, options.record_seconds, options.metalink_pieces), (Some(2 << 30), Some(30), Some(pieces)));
         let listed = job(&args, 4, Path::new("d"), Task { urls: urls.clone(), from_document: true, ..Default::default() }).options;
         assert!(listed.auth_header.is_none() && listed.extra_headers.is_empty() && listed.cookie_string.is_none());
         assert_eq!(listed.user_agent.as_deref(), Some("agent/1"), "not a secret");
 
         let defaults = job(&parse(&["u"]), 4, Path::new("d"), Task { urls, ..Default::default() }).options;
-        assert!(defaults.remote_checksum && !defaults.adaptive && !defaults.insecure && !defaults.no_proxy && !defaults.only_if_newer);
+        assert!(defaults.remote_checksum && defaults.adaptive && !defaults.insecure && !defaults.no_proxy && !defaults.only_if_newer);
         assert_eq!((defaults.ip_family, defaults.connect_timeout_secs, defaults.max_filesize), (IpFamily::Any, 15, None));
         assert_eq!(tuning(&parse(&["-4", "u"]), 1).ip_family, IpFamily::V4);
         // An Authorization --header wins over -u; -u without a password, with no one to ask, fails.
