@@ -22,7 +22,7 @@ The extension finds videos, streams and downloadable links on the pages you visi
 
 ## The desktop app
 
-The app stores its settings, queue and download history in its own folder on your computer. It connects only to:
+The app stores its settings, queue and download history in its own folder on your computer, along with the names of the sites it downloaded from and how many connections each was fastest with (forgotten after 30 days). It connects only to:
 
 - the sites you download from;
 - GitHub, to check for and download its own updates, and the tools it uses (yt-dlp and ffmpeg). It also contacts Codeberg for gallery-dl;
