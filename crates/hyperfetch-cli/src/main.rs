@@ -118,6 +118,10 @@ async fn app(mut args: Args) -> i32 {
         return usage(&e);
     }
     let shutdown = Shutdown::install();
+    // What hosts were seen to do (the connections each went fastest with, a cap), from earlier runs.
+    if let Some(dir) = data_folder() {
+        hyperfetch_core::hosts::keep_in(dir.join("hosts.json"));
+    }
 
     if args.history {
         return show_history().await;
