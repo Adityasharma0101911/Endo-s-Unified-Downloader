@@ -1000,4 +1000,110 @@ mod tests {
         assert_eq!(h.frames(60), Duration::MAX);
     }
 
+    /// `n` frames, and what `f` sees after each.
+    fn over<R>(h: &mut Harness, n: usize, f: impl Fn(&Harness) -> R) -> Vec<R> {
+        (0..n).map(|_| (h.frame(Vec::new()), f(&*h)).1).collect()
+    }
+
+    /// A download added while the queue shows fades into its row rising from a little below, and
+    /// the Queue count in the sidebar pops; then frames stop. Under Reduce motion both are in
+    /// place at once.
+    #[test]
+    fn a_new_download_rises_into_its_row_and_the_count_pops() {
+        for reduce in [false, true] {
+            let mut h = Harness::new();
+            h.app.settings.reduce_motion = Some(reduce);
+            h.add("a.iso");
+            h.app.tab = Tab::Queue;
+            assert!(h.settle());
+            let place = h.find("a.iso").unwrap().top() + ROW_HEIGHT + 2.0;
+            h.add("b.iso");
+            let seen = over(&mut h, 30, |h| (h.find("b.iso").map(|rect| rect.top()), h.find_near("Queue", "2").unwrap().height()));
+            let tops: Vec<f32> = seen.iter().filter_map(|(top, _)| *top).collect();
+            let heights: Vec<f32> = seen.iter().map(|(_, height)| *height).collect();
+            let (rest, last) = (heights[heights.len() - 1], tops[tops.len() - 1]);
+            assert_eq!(last, place);
+            if reduce {
+                assert!(tops.len() == 30 && tops.iter().all(|&top| top == place), "in place at once: {tops:?}");
+                assert!(heights.iter().all(|&height| height == rest), "no pop: {heights:?}");
+            } else {
+                assert!(tops[0] > place + 2.0 && tops.windows(2).all(|w| w[0] >= w[1]), "rises: {tops:?}");
+                assert!(heights.iter().any(|&height| height > rest + 1.0), "the count pops: {heights:?}");
+            }
+            // The Add page's Download button says Added for 1.2 s after an add (see `just_added`).
+            assert_eq!(h.frames(60), Duration::MAX, "and keeps still");
+        }
+    }
+
+    /// Removing a download fades its row out, then the rows under it glide up into its room, none
+    /// jumping; then frames stop. Under Reduce motion they are in their new places at once.
+    #[test]
+    fn rows_glide_up_into_a_removed_rows_room() {
+        for reduce in [false, true] {
+            let mut h = Harness::new();
+            h.app.settings.reduce_motion = Some(reduce);
+            for name in ["a.iso", "b.iso", "c.iso", "d.iso"] {
+                h.add(name);
+            }
+            h.app.tab = Tab::Queue;
+            assert!(h.settle());
+            let stride = ROW_HEIGHT + 2.0;
+            let place = h.find("d.iso").unwrap().top() - stride;
+            h.click_at(h.find_near("b.iso", icon::X).unwrap().center());
+            assert_eq!(h.app.queue.items().len(), 3);
+            let tops = over(&mut h, 40, |h| h.find("d.iso").unwrap().top());
+            assert_eq!(tops[tops.len() - 1], place);
+            if reduce {
+                assert!(tops.iter().all(|&top| top == place), "at once: {tops:?}");
+            } else {
+                assert_eq!(tops[0], place + stride, "it waits while the removed row fades");
+                assert!(tops.windows(2).all(|w| w[1] <= w[0] && w[0] - w[1] < stride / 3.0), "glides: {tops:?}");
+            }
+            h.leave();
+            assert_eq!(h.frames(30), Duration::MAX, "and keeps still");
+        }
+    }
+
+    /// A download that completes flashes its row green as its check draws itself; one that fails
+    /// flashes red and shakes. Then frames stop. Under Reduce motion nothing flashes or moves.
+    #[test]
+    fn a_finished_row_glows_and_a_failed_one_shakes() {
+        for reduce in [false, true] {
+            let mut h = Harness::new();
+            h.app.settings.reduce_motion = Some(reduce);
+            let [done, failed] = ["done.iso", "failed.iso"].map(|name| h.add(name));
+            h.progress(done, 0.9);
+            h.progress(failed, 0.4);
+            h.app.tab = Tab::Queue;
+            h.frames(60);
+            // Inside the row, left of its icon, where only the card shows.
+            let spot = |h: &Harness| {
+                let row = h.app.ctx.read_response(egui::Id::new(("queue row", done)).with("row")).unwrap().rect;
+                let pixel = h.shot(Some(Rect::from_min_size(row.left_center() + Vec2::new(3.0, 0.0), Vec2::splat(1.0)))).get_pixel(0, 0).0;
+                [pixel[0], pixel[1], pixel[2]]
+            };
+            let card = [DARK.card.r(), DARK.card.g(), DARK.card.b()];
+            assert_eq!(spot(&h), card);
+            h.finish(done, None);
+            h.finish(failed, Some("The server answered 404 Not Found"));
+            let (mut xs, mut glow) = (Vec::new(), Vec::new());
+            for n in 0..50 {
+                h.frame(Vec::new());
+                xs.push(h.find("failed.iso").unwrap().left());
+                if n % 5 == 0 {
+                    glow.push(spot(&h));
+                }
+            }
+            let rest = xs[xs.len() - 1];
+            assert_eq!(glow[glow.len() - 1], card, "the glow is gone");
+            if reduce {
+                assert!(glow.iter().all(|&g| g == card) && xs.iter().all(|&x| x == rest), "no glow or shake: {glow:?} {xs:?}");
+            } else {
+                let greens: Vec<u8> = glow.iter().map(|g| g[1]).collect();
+                assert!(greens[0] > card[1] + 10 && greens.windows(2).all(|w| w[1] <= w[0]), "glows and fades: {greens:?}");
+                assert!(xs.iter().any(|&x| (x - rest).abs() > 1.0), "shakes: {xs:?}");
+            }
+            assert_eq!(h.frames(2), Duration::MAX, "and keeps still");
+        }
+    }
 }
