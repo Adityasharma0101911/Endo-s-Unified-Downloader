@@ -96,6 +96,19 @@ impl QueueItem {
     }
 }
 
+/// What the downloads still to come have left (see [`DownloadQueue::remaining`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Remaining {
+    /// Bytes still to come of those whose size is known.
+    pub bytes: u64,
+    /// Those whose size is not known yet: no Content-Length, a stream before it tells, a
+    /// download not started yet.
+    pub unknown: usize,
+    /// How fast the running ones come in together: each one's speed, smoothed as for its own
+    /// time left.
+    pub speed: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DownloadQueue {
     items: Vec<QueueItem>,
@@ -184,6 +197,21 @@ impl DownloadQueue {
 
     pub fn active_count(&self) -> usize {
         self.items.iter().filter(|i| i.status.is_active()).count()
+    }
+
+    /// What the downloads still to come have left: those running and, when `waiting` (the queue
+    /// starts them by itself), those queued; not paused or stopped ones.
+    pub fn remaining(&self, waiting: bool) -> Remaining {
+        let mut left = Remaining::default();
+        let to_come = |i: &&QueueItem| i.status == QueueItemStatus::Downloading || waiting && i.status == QueueItemStatus::Queued;
+        for item in self.items.iter().filter(to_come) {
+            match item.total_bytes {
+                0 => left.unknown += 1,
+                total => left.bytes += total.saturating_sub(item.downloaded_bytes),
+            }
+            left.speed += item.speed_bytes_per_sec;
+        }
+        left
     }
 
     /// Whether the queue, running `max_concurrent` downloads at once, may start another (see
@@ -527,6 +555,29 @@ mod tests {
         q.finish(ids[0], Err(CANCELLED.into()));
         q.mark_started(ids[0]);
         assert!(!q.may_start(3), "started again, it takes a place until its snapshot tells");
+    }
+
+    /// What is left to download: running and queued downloads (queued ones only when the queue
+    /// starts them by itself), not paused or stopped ones; those of no known size are counted
+    /// apart, not as nothing left.
+    #[test]
+    fn what_is_left_counts_unknown_sizes_apart() {
+        let (mut q, ids) = queue_of(&["https://e.com/a", "https://e.com/b", "https://e.com/c", "https://e.com/d", "https://e.com/e"]);
+        for &id in &ids[..4] {
+            q.mark_started(id);
+        }
+        q.apply_snapshot(ids[0], &snapshot("/dl/a"));
+        q.apply_snapshot(ids[1], &EngineSnapshot { total_bytes: 0, downloaded_bytes: 7, speed_bytes_per_sec: 5.0, ..snapshot("/dl/b") });
+        q.apply_snapshot(ids[2], &snapshot("/dl/c"));
+        q.mark_pausing(ids[2]);
+        q.finish(ids[2], Err(CANCELLED.into()));
+        q.apply_snapshot(ids[3], &snapshot("/dl/d"));
+        q.finish(ids[3], Err("HTTP 404".into()));
+        assert_eq!(q.remaining(true), Remaining { bytes: 60, unknown: 2, speed: 15.0 }, "the one not started has no size yet");
+        assert_eq!(q.remaining(false), Remaining { bytes: 60, unknown: 1, speed: 15.0 });
+        q.finish(ids[0], Ok((PathBuf::from("/dl/a"), Some(100))));
+        q.mark_pausing(ids[1]);
+        assert_eq!(q.remaining(false), Remaining::default(), "a pausing one is stopping");
     }
 
     #[test]

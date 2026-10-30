@@ -1,5 +1,7 @@
 use std::collections::HashSet;
 
+use hyperfetch_core::queue::Remaining;
+
 use super::*;
 
 const AUTH_REQUIRED: &str =
@@ -703,6 +705,17 @@ fn queue_row(app: &App, ui: &mut Ui, line: &Line, action: &mut Option<(usize, Ro
     });
 }
 
+/// When everything still to come (see `DownloadQueue::remaining`) is done at the speed the
+/// running downloads have together: "at least" when some have no known size, which are left out;
+/// None without an estimate (no speed yet, or no size known).
+fn finish_time(left: Remaining) -> Option<String> {
+    let secs = util::eta_secs(left.bytes, 0, left.speed)?;
+    Some(match left.unknown {
+        0 => format!("All done in about {}", format_duration(secs)),
+        n => format!("All done in at least {} ({} size unknown)", format_duration(secs), n),
+    })
+}
+
 pub(super) fn queue_page(app: &mut App, ui: &mut Ui) {
     let p = palette(ui);
     card(ui).show(ui, |ui| {
@@ -751,6 +764,11 @@ pub(super) fn queue_page(app: &mut App, ui: &mut Ui) {
         let running = app.queue.active_count();
         if running > 0 {
             ui.label(RichText::new(format!("{} running", running)).color(p.accent));
+            if let Some(text) = finish_time(app.queue.remaining(app.settings.auto_run_queue)) {
+                let about = "The bytes left of the running downloads and of those waiting to start, at the speed the running ones \
+                             have together; paused and stopped ones are left out.";
+                ui.label(RichText::new(text).small().color(p.muted)).on_hover_text(about);
+            }
         }
         // For this session only; it applies once.
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -884,6 +902,30 @@ mod tests {
         h.click("Cancel");
         assert!(h.app.countdown.is_none());
         h.wait_for_background();
+    }
+
+    /// While downloads run, the queue's header says when everything to come is done at their
+    /// speed together: "about", or "at least" when some have no known size yet, which are left
+    /// out; waiting ones count only when the queue starts them by itself. With nothing running it
+    /// says nothing.
+    #[test]
+    fn the_header_says_when_the_queue_will_be_done() {
+        let mut h = Harness::new();
+        h.app.settings.auto_run_queue = true;
+        let [a, _] = ["a.iso", "b.iso"].map(|name| h.add(name));
+        h.app.tab = Tab::Queue;
+        let done = |h: &mut Harness| {
+            h.frames(2);
+            h.texts().into_iter().map(|(text, _)| text).find(|text| text.starts_with("All done"))
+        };
+        assert_eq!(done(&mut h), None, "nothing runs");
+        // 50 MiB left at 3 MB/s.
+        h.progress(a, 0.5);
+        assert_eq!(done(&mut h).as_deref(), Some("All done in at least 00:18 (1 size unknown)"));
+        h.app.settings.auto_run_queue = false;
+        assert_eq!(done(&mut h).as_deref(), Some("All done in about 00:18"));
+        h.finish(a, None);
+        assert_eq!(done(&mut h), None);
     }
 
     /// Each line's file name, whether it is a ghost, and how many rows down it is pushed.
