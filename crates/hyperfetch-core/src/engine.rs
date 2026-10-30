@@ -2657,7 +2657,11 @@ impl DownloadEngine {
         // Mirrors still to come may bring hosts with room of their own.
         let room = if late.is_some() { usize::MAX } else { host_room(&mirrors, self.options.max_connections_per_host) };
         let max_workers = self.options.num_connections.clamp(1, MAX_CONNECTIONS).min(room).max(1) as u64;
-        let num_workers = remaining.div_ceil(per_connection).clamp(1, max_workers) as usize;
+        // An adaptive download starts where one from the host ended up fastest, also in an earlier
+        // run, when the file gives each of those connections a MiB; the ramp goes on from there.
+        let adapts = self.options.adaptive && self.limiter.is_none();
+        let best = hosts::best_connections(&reference.final_url).filter(|&best| adapts && remaining >= best as u64 * BYTES_PER_CONNECTION);
+        let num_workers = best.map_or_else(|| remaining.div_ceil(per_connection), |best| best as u64).clamp(1, max_workers) as usize;
         let in_order = crate::storage::hashes_prefix(self.options.expected_checksum.as_deref());
         let throttled_host = mirrors.iter().any(|m| HostKey::of(&m.url).is_bitrate_throttled());
         let chunk_size = effective_chunk_size(remaining, num_workers as u64, self.options.base_chunk_size, in_order, throttled_host);
@@ -2750,7 +2754,7 @@ impl DownloadEngine {
         }
         let width = Arc::clone(&shared.width);
         // A speed limit holds every width to the same speed.
-        let mut ramp = (self.options.adaptive && self.limiter.is_none())
+        let mut ramp = adapts
             .then(|| Ramp::new(num_workers, max_workers as usize, Instant::now(), job.chunks.lock().total_downloaded()))
             .filter(|ramp| !ramp.done);
         // What the workers the ramp adds share, kept only while it may add one: the download
@@ -2794,7 +2798,10 @@ impl DownloadEngine {
                         }
                         tracing::info!("Going on with {} connection(s)", next);
                     }
-                    if ramp.as_ref().is_some_and(|ramp| ramp.done) {
+                    if let Some(done) = ramp.as_ref().filter(|ramp| ramp.done) {
+                        if let Some(best) = done.settled {
+                            hosts::record_best_connections(&reference.final_url, best);
+                        }
                         (ramp, spare) = (None, None);
                     }
                     if last_persist.elapsed() >= PERSIST_INTERVAL {
@@ -2815,6 +2822,8 @@ impl DownloadEngine {
         // Probes still out are given up, and the host slots they hold with them.
         drop((events, late, spare));
         while workers.join_next().await.is_some() {}
+        // What this download learned of its hosts, for the next run too.
+        let _ = blocking(hosts::save).await;
 
         match outcome {
             // No flush here: `finalize` flushes (with fsync_on_complete) while it hashes.
@@ -3733,11 +3742,14 @@ struct Ramp {
     trial: Option<f64>,
     /// No more connections are tried: the last did not pay, or too little is left to try one.
     done: bool,
+    /// The width the download goes fastest at, once found: the last one slowed it or did not
+    /// pay, or `max` was reached. Not when too little was left to try one more.
+    settled: Option<usize>,
 }
 
 impl Ramp {
     fn new(width: usize, max: usize, now: Instant, downloaded: u64) -> Self {
-        Self { width, max, began: (now, downloaded), speed: None, trial: None, done: width >= max }
+        Self { width, max, began: (now, downloaded), speed: None, trial: None, done: width >= max, settled: None }
     }
 
     /// The width to go on at, when it changes, with `downloaded` bytes in at `now` and `left` to
@@ -3759,10 +3771,12 @@ impl Ramp {
             if speed < before {
                 self.done = true;
                 self.width -= 1;
+                self.settled = Some(self.width);
                 return Some(self.width);
             }
             if speed < before * RAMP_GAIN {
                 self.done = true;
+                self.settled = Some(self.width);
                 return None;
             }
         }
@@ -3773,6 +3787,7 @@ impl Ramp {
         // One more, if it has the time to show what it brings.
         if self.width >= self.max || (left as f64) < 3.0 * speed * window.as_secs_f64() {
             self.done = true;
+            self.settled = (self.width >= self.max).then_some(self.width);
             return None;
         }
         self.trial = Some(speed);
@@ -8230,26 +8245,27 @@ mod tests {
         assert_eq!(ramp.next(at(1000), 2 * MB, left, startup), Some(3));
         assert_eq!(ramp.next(at(1500), 3_500_000, left, startup), Some(4), "+50%");
         assert_eq!(ramp.next(at(2000), 5_500_000, left, startup), None, "never past its most");
-        assert!(ramp.done);
+        assert_eq!((ramp.done, ramp.settled), (true, Some(4)));
 
         let mut ramp = Ramp::new(2, 8, t0, 0);
         ramp.next(at(500), MB, left, startup);
         assert_eq!(ramp.next(at(1000), 2 * MB, left, startup), Some(3));
         assert_eq!(ramp.next(at(1500), 3_050_000, left, startup), None, "+5%: kept, and no more tried");
-        assert!(ramp.done);
+        assert_eq!((ramp.done, ramp.settled), (true, Some(3)));
 
         let mut ramp = Ramp::new(2, 8, t0, 0);
         ramp.next(at(500), MB, left, startup);
         assert_eq!(ramp.next(at(1000), 2 * MB, left, startup), Some(3));
         assert_eq!(ramp.next(at(1500), 2_500_000, left, startup), Some(2), "slower: taken back");
         assert_eq!(ramp.next(at(5000), 9 * MB, left, startup), None, "for good");
+        assert_eq!(ramp.settled, Some(2));
 
         let slow = Duration::from_secs(1);
         let mut ramp = Ramp::new(1, 8, t0, 0);
         assert_eq!(ramp.next(at(3999), MB, left, slow), None, "four startups make a window");
         ramp.next(at(4000), MB, left, slow);
         assert_eq!(ramp.next(at(8000), 2 * MB, 2 * MB, slow), None, "2 MB left at 250 kB/s");
-        assert!(ramp.done);
+        assert_eq!((ramp.done, ramp.settled), (true, None), "no width found to go by");
         assert!(Ramp::new(8, 8, t0, 0).done, "nothing to add");
     }
 

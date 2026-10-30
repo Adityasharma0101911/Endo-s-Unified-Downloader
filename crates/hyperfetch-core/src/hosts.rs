@@ -10,11 +10,19 @@
 //! differing `max_connections_per_host` share one host at the strictest, from the moment the
 //! strict one asks), and than the connection cap the host was seen to enforce. A limit of 0 sets
 //! none.
+//!
+//! Two facts are also kept across restarts once a front end names a file for them (see
+//! [`keep_in`]): the connections a download from the host ended up fastest with, and the
+//! connection cap it was seen to enforce. They are kept for `KEPT_FOR` after they were last
+//! learned, by host only (`https://cdn.example:443`, never a path or query). A kept cap holds the
+//! host's first requests in a run as one learned then would.
 
 use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 use std::sync::LazyLock;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 use url::Url;
 
@@ -27,6 +35,10 @@ pub const PROFILE_TTL: Duration = Duration::from_secs(10 * 60);
 const CAP_PROBE_INTERVAL: Duration = Duration::from_secs(60);
 /// Hosts remembered before those with nothing fresh to tell are dropped.
 const KEEP_HOSTS: usize = 256;
+/// How long what is kept of a host across restarts lasts after it was last learned.
+const KEPT_FOR: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+/// Hosts kept across restarts: those learned about last.
+const KEEP_KEPT: usize = 300;
 
 static HOSTS: LazyLock<Hosts> = LazyLock::new(Hosts::default);
 
@@ -51,6 +63,13 @@ impl HostKey {
             port: url.port_or_known_default(),
             route_id,
         }
+    }
+
+    /// What it is kept under across restarts: scheme, host and port; None for a route's own
+    /// (a proxy's, a network's), which a later run may number otherwise.
+    fn origin(&self) -> Option<String> {
+        let port = self.port.map_or_else(String::new, |port| format!(":{port}"));
+        (self.route_id == 0).then(|| format!("{}://{}{}", self.scheme, self.host, port))
     }
 
     /// Default connection cap for hosts known to aggressively throttle or sinkhole concurrent connections.
@@ -98,6 +117,32 @@ pub fn profile(url: &Url) -> HostProfile {
 /// trusted for `PROFILE_TTL` from now. Facts left `None` are kept as they are.
 pub fn record(url: &Url, seen: HostProfile) {
     HOSTS.record(&HostKey::of(url), seen, Instant::now())
+}
+
+/// Keeps what is kept of each host across restarts in `file` from now on, starting from what it
+/// holds. A front end calls it once, at start, with a file in its data folder; without it nothing
+/// outlives the process. Blocking.
+pub fn keep_in(file: PathBuf) {
+    HOSTS.keep_in(file, unix_now())
+}
+
+/// Writes what is kept of the hosts to its file, if that changed since. Blocking.
+pub fn save() {
+    HOSTS.save(unix_now())
+}
+
+/// The connections a download from `url`'s host ended up fastest with, if that is kept.
+pub fn best_connections(url: &Url) -> Option<usize> {
+    HOSTS.kept(&HostKey::of(url), unix_now()).and_then(|kept| kept.connections)
+}
+
+/// Keeps that a download from `url`'s host ended up fastest with `connections`.
+pub fn record_best_connections(url: &Url, connections: usize) {
+    HOSTS.keep(&HostKey::of(url), unix_now(), |kept| kept.connections = Some(connections).filter(|&n| n > 0))
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs())
 }
 
 /// Waits until a request to `url`'s host may be opened under `limit` (see the module docs) and
@@ -308,14 +353,108 @@ impl Entry {
     }
 }
 
+/// What is kept of a host across restarts, each as last learned, and when that was (seconds since
+/// the Unix epoch).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+struct Kept {
+    /// The connections a download from it ended up fastest with (see `engine::Ramp`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    connections: Option<usize>,
+    /// The connection cap it was seen to enforce.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cap: Option<usize>,
+    at: u64,
+}
+
+#[derive(Debug, Default)]
+struct Memory {
+    /// By `HostKey::origin`.
+    hosts: HashMap<String, Kept>,
+    /// Where it is saved, once a front end named a file (see [`keep_in`]).
+    file: Option<PathBuf>,
+    changed: bool,
+}
+
+impl Memory {
+    /// Drops what is older than `KEPT_FOR` or tells nothing, and past `KEEP_KEPT` what was
+    /// learned first.
+    fn prune(&mut self, now: u64) {
+        self.hosts.retain(|_, kept| (kept.connections.is_some() || kept.cap.is_some()) && now.saturating_sub(kept.at) < KEPT_FOR.as_secs());
+        if self.hosts.len() > KEEP_KEPT {
+            let mut ages: Vec<u64> = self.hosts.values().map(|kept| kept.at).collect();
+            ages.sort_unstable_by(|a, b| b.cmp(a));
+            let oldest_kept = ages[KEEP_KEPT - 1];
+            self.hosts.retain(|_, kept| kept.at >= oldest_kept);
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct Hosts {
     entries: Mutex<HashMap<HostKey, Entry>>,
     /// Woken whenever a host may take more requests: a slot was freed or a cap rose.
     freed: Notify,
+    /// Locked after `entries` when both are.
+    kept: Mutex<Memory>,
 }
 
 impl Hosts {
+    fn keep_in(&self, file: PathBuf, now: u64) {
+        let read = std::fs::read(&file).ok().and_then(|bytes| serde_json::from_slice::<HashMap<String, Kept>>(&bytes).ok());
+        let mut memory = self.kept.lock();
+        for (origin, kept) in read.unwrap_or_default() {
+            memory.hosts.entry(origin).or_insert(kept);
+        }
+        memory.prune(now);
+        memory.file = Some(file);
+    }
+
+    fn save(&self, now: u64) {
+        let mut memory = self.kept.lock();
+        let Some(file) = memory.file.clone().filter(|_| memory.changed) else { return };
+        memory.prune(now);
+        // shortcut: the last process to save wins (the CLI's run beside the app's); merge with the
+        // file first if what one learns going missing ever matters.
+        let written = serde_json::to_vec(&memory.hosts).map_err(std::io::Error::from).and_then(|bytes| {
+            if let Some(dir) = file.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            let tmp = file.with_extension("json.tmp");
+            std::fs::write(&tmp, bytes)?;
+            std::fs::rename(&tmp, &file)
+        });
+        match written {
+            Ok(()) => memory.changed = false,
+            Err(e) => tracing::warn!("Could not save what is known of hosts to {}: {}", file.display(), e),
+        }
+    }
+
+    /// What is kept of `key`'s host, if anything and not too old.
+    fn kept(&self, key: &HostKey, now: u64) -> Option<Kept> {
+        let kept = *self.kept.lock().hosts.get(&key.origin()?)?;
+        (now.saturating_sub(kept.at) < KEPT_FOR.as_secs()).then_some(kept)
+    }
+
+    /// Changes what is kept of `key`'s host, learned `now`.
+    fn keep(&self, key: &HostKey, now: u64, change: impl FnOnce(&mut Kept)) {
+        let Some(origin) = key.origin() else { return };
+        let mut memory = self.kept.lock();
+        let kept = memory.hosts.entry(origin).or_default();
+        change(kept);
+        kept.at = now;
+        memory.changed = true;
+    }
+
+    /// `key`'s entry; a new one starts from the connection cap kept for the host, as if just
+    /// learned.
+    fn entry<'a>(&self, entries: &'a mut HashMap<HostKey, Entry>, key: &HostKey, now: Instant) -> &'a mut Entry {
+        entries.entry(key.clone()).or_insert_with(|| {
+            let mut entry = Entry::default();
+            entry.facts.connection_cap = self.kept(key, unix_now()).and_then(|kept| kept.cap).map(|cap| (cap, now));
+            entry
+        })
+    }
+
     fn profile(&self, key: &HostKey, now: Instant) -> HostProfile {
         let mut prof = self.entries.lock().get(key).map_or_else(HostProfile::default, |entry| entry.facts.profile(now));
         if prof.connection_cap.is_none() {
@@ -327,7 +466,7 @@ impl Hosts {
     fn record(&self, key: &HostKey, seen: HostProfile, now: Instant) {
         {
             let mut entries = self.entries.lock();
-            entries.entry(key.clone()).or_default().facts.record(seen, now);
+            self.entry(&mut entries, key, now).facts.record(seen, now);
             forget_idle(&mut entries, now);
         }
         if seen.connection_cap.is_some() {
@@ -337,7 +476,7 @@ impl Hosts {
 
     fn try_acquire(&'static self, key: &HostKey, limit: usize, now: Instant) -> Option<HostSlot> {
         let mut entries = self.entries.lock();
-        let entry = entries.entry(key.clone()).or_default();
+        let entry = self.entry(&mut entries, key, now);
         if entry.open >= entry.allowance(key, limit, now) {
             return None;
         }
@@ -356,7 +495,7 @@ impl Hosts {
         // A lenient download re-taking slots as its requests end would otherwise keep a strict
         // one waiting until it is nearly done: the strict limit counts from now on.
         let _waiting = {
-            add_limit(&mut self.entries.lock().entry(key.clone()).or_default().waiting, limit);
+            add_limit(&mut self.entry(&mut self.entries.lock(), &key, Instant::now()).waiting, limit);
             Waiting { hosts: self, key: key.clone(), limit }
         };
         loop {
@@ -410,6 +549,7 @@ impl Hosts {
             let others = entry.open.saturating_sub(1);
             if others > 0 {
                 entry.facts.connection_cap = Some((others, now));
+                self.keep(key, unix_now(), |kept| kept.cap = Some(others));
             }
         }
     }
@@ -425,7 +565,16 @@ impl Hosts {
                     // The cap keeps the time it was learned at, so it still expires.
                     entry.facts.connection_cap = Some((cap + 1, learned));
                     entry.cap_raised = Some(now);
+                    self.keep(key, unix_now(), |kept| kept.cap = Some(cap + 1));
                     true
+                }
+                // Serving more than a cap kept from before, which has since expired, the host
+                // has none so low any more.
+                (_, None) => {
+                    if self.kept(key, unix_now()).and_then(|kept| kept.cap).is_some_and(|cap| entry.open > cap) {
+                        self.keep(key, unix_now(), |kept| kept.cap = None);
+                    }
+                    false
                 }
                 _ => false,
             }
@@ -645,6 +794,48 @@ mod tests {
         assert!(try_acquire(&Url::parse("http://budget-test.hosts.example/other.bin").unwrap(), 1).is_none());
         drop(slot);
         assert!(try_acquire(&url, 1).is_some());
+    }
+
+    #[test]
+    fn test_a_cap_and_the_best_connection_count_are_kept_across_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("hosts.json");
+        let (host, now) = (key("http://kept.example/dir/f.bin?token=secret"), unix_now());
+        let before = leaked();
+        before.keep_in(file.clone(), now);
+        let three: Vec<HostSlot> = (0..3).map(|_| before.try_acquire(&host, 32, Instant::now()).unwrap()).collect();
+        three[2].throttled();
+        drop(three);
+        before.keep(&host, now, |kept| kept.connections = Some(6));
+        before.save(now);
+        let saved = std::fs::read_to_string(&file).unwrap();
+        assert!(saved.contains("http://kept.example:80") && !saved.contains("dir") && !saved.contains("secret"), "{saved}");
+
+        // The next run starts from them: its first requests to the host are held to the cap.
+        let after = leaked();
+        after.keep_in(file.clone(), now);
+        assert_eq!(after.kept(&host, now).map(|kept| (kept.connections, kept.cap)), Some((Some(6), Some(2))));
+        let t0 = Instant::now();
+        let two: Vec<HostSlot> = (0..2).map(|_| after.try_acquire(&host, 32, t0).unwrap()).collect();
+        assert!(after.try_acquire(&host, 32, t0).is_none());
+        drop(two);
+        // Once it expired as any cap learned does, a host serving more has none so low any more.
+        let late = t0 + PROFILE_TTL;
+        let _three: Vec<HostSlot> = (0..3).map(|_| after.try_acquire(&host, 32, late).unwrap()).collect();
+        after.accepted(&host, late);
+        assert_eq!(after.kept(&host, now).map(|kept| (kept.connections, kept.cap)), Some((Some(6), None)));
+
+        // Thirty days after it was learned, nothing is kept.
+        let later = now + KEPT_FOR.as_secs();
+        assert_eq!(after.kept(&host, later), None);
+        let reloaded = leaked();
+        reloaded.keep_in(file, later);
+        assert!(reloaded.kept.lock().hosts.is_empty());
+        let many = (0..KEEP_KEPT + 10).map(|n| (format!("http://h{n}.example:80"), Kept { connections: Some(4), cap: None, at: now + n as u64 }));
+        let mut memory = Memory { hosts: many.collect(), ..Memory::default() };
+        memory.prune(now);
+        assert_eq!(memory.hosts.len(), KEEP_KEPT, "those learned about last");
+        assert!(!memory.hosts.contains_key("http://h9.example:80") && memory.hosts.contains_key("http://h10.example:80"));
     }
 
     #[test]

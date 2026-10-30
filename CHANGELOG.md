@@ -18,6 +18,7 @@ What changed in each release, newest first. Each release's page on [GitHub](http
 - **Faster with many connections:** a large file's connections all start as soon as the probe answers, instead of after it measured the host, and a chunk about to finish is no longer split for one more request and connection (the bytes a connection had received but not yet written counted as left).
 - **Slow connections are replaced**, not only stuck ones: a connection that stays far slower than the others (under 0.3 of their median for 5 s) is closed and its rest goes on over a new one, which often gets a faster route.
 - **Adaptive connections are on by default**, in the CLI (`--no-adaptive` turns them off) and in the app (a smarter connection count, in Settings). In the app they are on again also where an older version saved them off, which was its default then.
+- **Each site's best connection count is remembered across restarts**, with a connection cap it was seen to enforce, for 30 days, in `hosts.json` in the data folder (host names only): the next download from it starts at the count adaptive connections settled on, instead of finding it again.
 
 ## 1.8.0 (2026-10-27)
 
