@@ -232,7 +232,8 @@ test("a long path is classified in linear time", () => {
   const start = performance.now();
   assert.equal(classifyResponse({ url, contentType: "text/html" }), null);
   assert.equal(mediaUrlFormat(url), null);
-  assert.ok(performance.now() - start < 50, `${performance.now() - start} ms`);
+  // Backtracking over a 1 MiB path would take minutes; a slow CI runner still needs over 100 ms.
+  assert.ok(performance.now() - start < 1000, `${performance.now() - start} ms`);
 });
 
 test("other video/audio types are files named by their subtype; MPEG-TS and segments are not", () => {
