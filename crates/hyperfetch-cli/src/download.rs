@@ -960,7 +960,9 @@ mod tests {
             line: None,
         });
         assert_eq!(run_jobs(Vec::from(jobs), 2, &Ui::new(true), &Shutdown::install(), None).await, 0);
-        assert_eq!(most.load(Ordering::SeqCst), 3);
+        // At least all three at once: the server counts an answer until its sleep ends, even one
+        // the client already gave up on, so a fourth can show (seen once on Windows CI).
+        assert!(most.load(Ordering::SeqCst) >= 3, "{}", most.load(Ordering::SeqCst));
         for name in ["a", "b", "c"] {
             assert_eq!(std::fs::read(dir.join(format!("{}.bin", name))).unwrap(), body);
         }
