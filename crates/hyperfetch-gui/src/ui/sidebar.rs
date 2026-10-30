@@ -130,3 +130,39 @@ pub(super) fn sidebar(app: &mut App, ctx: &egui::Context) {
     // The drop zone covers the whole window; this runs once a frame on every page.
     super::add::drop_zone(ctx);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::harness::Harness;
+    use super::*;
+
+    /// The top of the selection pill as last drawn.
+    fn pill(h: &Harness) -> f32 {
+        h.app.ctx.data(|d| d.get_temp::<[f32; 3]>(egui::Id::new("nav pill").with("top"))).unwrap()[2]
+    }
+
+    /// A page change slides the selection pill down from Add to Settings over a few frames, never
+    /// back, after which frames stop; under Reduce motion it is there at once.
+    #[test]
+    fn the_selection_pill_slides_to_the_new_page() {
+        for reduce in [false, true] {
+            let mut h = Harness::new();
+            h.app.settings.reduce_motion = Some(reduce);
+            assert!(h.settle());
+            let start = pill(&h);
+            h.click("Settings");
+            h.leave();
+            let tops: Vec<f32> = std::iter::once(pill(&h)).chain((0..30).map(|_| (h.frame(Vec::new()), pill(&h)).1)).collect();
+            let end = *tops.last().unwrap();
+            assert!(end - start > 100.0, "three items down: {start} to {end}");
+            if reduce {
+                assert!(tops.iter().all(|&top| top == end), "at once: {tops:?}");
+            } else {
+                let between = tops.iter().filter(|&&top| start < top && top < end).count();
+                assert!(between >= 5 && tops.windows(2).all(|w| w[0] <= w[1]), "slides: {tops:?}");
+            }
+            // The Settings page's cards may still be coming in.
+            assert_eq!(h.frames(30), Duration::MAX, "and keeps still");
+        }
+    }
+}
