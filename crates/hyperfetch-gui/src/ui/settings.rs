@@ -108,7 +108,8 @@ pub(super) fn settings_page(app: &mut App, ui: &mut Ui) {
             });
         }
     });
-    section(ui, 9, icon::ARROW_CIRCLE_UP, "Updates", |ui| {
+    section(ui, 9, icon::DEVICE_MOBILE, "Phone", |ui| phone_settings(app, ui));
+    section(ui, 10, icon::ARROW_CIRCLE_UP, "Updates", |ui| {
         setting(ui, "Version", "", (), |ui| {
             if ui.add(button("Check now")).clicked() {
                 app.check_for_update(true);
@@ -119,7 +120,7 @@ pub(super) fn settings_page(app: &mut App, ui: &mut Ui) {
                      and only releases signed by the maintainer are.";
         switch(ui, "Check for updates at startup", about, &mut app.settings.check_updates);
     });
-    section(ui, 10, icon::WRENCH, "Advanced", |ui| {
+    section(ui, 11, icon::WRENCH, "Advanced", |ui| {
         let s = &mut app.settings;
         setting(ui, "Retries", "Failed attempts per chunk before the download fails; attempts that made progress don't count.", s.max_retries, |ui| {
             ui.add(egui::DragValue::new(&mut s.max_retries).range(0..=100));
@@ -164,6 +165,100 @@ fn general_settings(app: &mut App, ui: &mut Ui) {
     setting(ui, "Downloads at once", "How many queued downloads run together.", s.max_concurrent, |ui| {
         ui.add(egui::DragValue::new(&mut s.max_concurrent).range(1..=8));
     });
+}
+
+/// "Send links from your phone", and while it is on the QR code of the phone's page, its link, the
+/// address to put in it when this computer has several on local networks (looked up once, and
+/// again on request), New code and how many links came.
+fn phone_settings(app: &mut App, ui: &mut Ui) {
+    let p = palette(ui);
+    let about = if cfg!(windows) {
+        "A page on your phone sends links here, over your local network only. Windows Firewall asks once: allow private networks."
+    } else {
+        "A page on your phone sends links here, over your local network only."
+    };
+    let mut on = app.settings.phone_links;
+    if switch(ui, "Send links from your phone", about, &mut on) {
+        app.set_phone_links(on);
+    }
+    let Some(port) = app.phone_server.as_ref().map(|server| server.port) else { return };
+    let id = egui::Id::new("phone_addresses");
+    let found = ui.data(|d| d.get_temp::<Vec<(String, std::net::IpAddr)>>(id)).unwrap_or_else(|| {
+        let found = crate::phone::addresses();
+        ui.data_mut(|d| d.insert_temp(id, found.clone()));
+        found
+    });
+    ui.separator();
+    let again = |ui: &mut Ui| {
+        if icon_button(ui, icon::ARROWS_CLOCKWISE, "Look for networks again", true).clicked() {
+            ui.data_mut(|d| d.remove::<Vec<(String, std::net::IpAddr)>>(id));
+        }
+    };
+    if found.is_empty() {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("This PC isn't on a local network: connect it to the Wi-Fi your phone is on.").color(p.muted));
+            again(ui);
+        });
+        return;
+    }
+    let chosen = found.iter().position(|(_, address)| address.to_string() == app.settings.phone_address).unwrap_or(0);
+    let link = crate::phone::page_link(found[chosen].1, port, &app.settings.phone_token);
+    qr_code(ui, &link);
+    ui.label(RichText::new("Scan it with your phone's camera, then bookmark the page.").color(p.muted));
+    ui.horizontal(|ui| {
+        if icon_button(ui, icon::COPY, "Copy the link", true).clicked() {
+            app.copy_text(link.clone());
+        }
+        ui.add(egui::Label::new(RichText::new(&link).monospace().small().color(p.text)).wrap());
+    });
+    if found.len() > 1 {
+        setting(ui, "Address in the code", "The one of the network your phone is on.", chosen, |ui| {
+            again(ui);
+            let names: Vec<String> = found.iter().map(|(name, address)| format!("{} ({})", name, address)).collect();
+            let mut pick = chosen;
+            combo(ui, "phone_address_combo", &mut pick, &names.iter().map(String::as_str).collect::<Vec<_>>());
+            if pick != chosen {
+                app.settings.phone_address = found[pick].1.to_string();
+            }
+        });
+    }
+    ui.horizontal(|ui| {
+        let tip = "Pages opened with the old code stop working: scan the new one.";
+        if ui.add(button(format!("{} New code", icon::ARROWS_CLOCKWISE))).on_hover_text(tip).clicked() {
+            if let Err(e) = app.new_phone_code() {
+                app.notice = Some(Err(format!("Could not make a new code: {}", e)));
+            }
+        }
+        let text = match app.phone.received() {
+            0 => "No link received yet".to_string(),
+            1 => "1 link received since the app started".to_string(),
+            n => format!("{} links received since the app started", n),
+        };
+        ui.label(RichText::new(text).color(p.muted));
+    });
+}
+
+/// `text` as a QR code, black on white in both themes as phones read it best, with a quiet zone of
+/// four modules around; about 200 points wide. Tests find it as "phone qr".
+fn qr_code(ui: &mut Ui, text: &str) {
+    const QUIET: i32 = 4;
+    let Ok(qr) = qrcodegen::QrCode::encode_text(text, qrcodegen::QrCodeEcc::Medium) else { return };
+    let modules = qr.size() + 2 * QUIET;
+    let module = (200.0 / modules as f32).floor().max(2.0);
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(module * modules as f32), Sense::hover());
+    ui.interact(rect, egui::Id::new("phone qr"), Sense::hover());
+    // Plain quads, no anti-aliased edges to blur the modules.
+    let mut mesh = egui::epaint::Mesh::default();
+    mesh.add_colored_rect(rect, Color32::WHITE);
+    for y in 0..qr.size() {
+        for x in 0..qr.size() {
+            if qr.get_module(x, y) {
+                let min = rect.min + Vec2::new((x + QUIET) as f32, (y + QUIET) as f32) * module;
+                mesh.add_colored_rect(Rect::from_min_size(min, Vec2::splat(module)), Color32::BLACK);
+            }
+        }
+    }
+    ui.painter().add(mesh);
 }
 
 /// The days of the week, as `Schedule::days` keeps them.
@@ -768,5 +863,69 @@ mod tests {
         h.app.tab = Tab::Settings;
         h.frames(2);
         assert_eq!(lit(&h), 0.0, "changed while away");
+    }
+
+    /// "Send links from your phone" is off at first: no code, no server, no QR code. Turned on, it
+    /// listens (on loopback in tests, where the app's server turns this computer away all the
+    /// same) and shows the QR code of its page, black on white, and the link, with the first of
+    /// this PC's addresses; the code is saved. Another address picked goes in the link, and New
+    /// code changes it. Turned off, the server stops.
+    #[test]
+    fn phone_links_show_a_code_to_scan() {
+        use std::io::{Read, Write};
+        use std::net::IpAddr;
+
+        let data = tempfile::tempdir().unwrap();
+        crate::tests::OWN_DATA_DIR.with(|own| *own.borrow_mut() = Some(data.path().to_path_buf()));
+        let mut h = Harness::new();
+        let found = vec![("Wi-Fi".to_string(), IpAddr::from([192, 168, 1, 20])), ("Ethernet".to_string(), IpAddr::from([10, 0, 0, 5]))];
+        h.app.ctx.data_mut(|d| d.insert_temp(egui::Id::new("phone_addresses"), found));
+        h.app.tab = Tab::Settings;
+        assert!(h.settle());
+        scroll_to(&mut h, "Send links from your phone");
+        let qr = |h: &Harness| h.app.ctx.read_response(egui::Id::new("phone qr")).map(|response| response.rect);
+        assert!(!h.app.settings.phone_links && h.app.phone_server.is_none() && qr(&h).is_none());
+        assert!(!h.app.settings.phone_token.usable(), "no code before it is turned on");
+
+        click(&mut h, |h| h.find_near("Send links from your phone", TOGGLE));
+        assert!(h.settle());
+        let port = h.app.phone_server.as_ref().expect("listening").port;
+        assert!(h.app.settings.phone_links && h.app.settings.phone_token.usable());
+        assert_eq!(crate::settings::Settings::load().phone_token, h.app.settings.phone_token, "saved");
+        let link = |h: &Harness| {
+            let link = h.texts().into_iter().map(|(text, _)| text).find(|text| text.starts_with("http://"));
+            link.unwrap_or_else(|| panic!("no link in {:?}", h.texts()))
+        };
+        let first = link(&h);
+        let prefix = format!("http://192.168.1.20:{port}/phone#t=");
+        assert!(first.starts_with(&prefix) && first.len() == prefix.len() + 32, "{first}");
+        let code = h.shot(Some(qr(&h).expect("the QR code shows")));
+        let dark = code.pixels().filter(|pixel| pixel.0[..3].iter().all(|&c| c < 40)).count();
+        let light = code.pixels().filter(|pixel| pixel.0[..3].iter().all(|&c| c > 215)).count();
+        assert!(dark > 1000 && light > 1000, "{dark} black and {light} white pixels");
+
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let _ = stream.write_all(b"GET /phone HTTP/1.1\r\n\r\n");
+        let mut answer = Vec::new();
+        let _ = stream.read_to_end(&mut answer);
+        assert!(answer.is_empty(), "loopback is no local network: {}", String::from_utf8_lossy(&answer));
+
+        click(&mut h, |h| h.find("Wi-Fi (192.168.1.20)"));
+        click(&mut h, |h| h.find("Ethernet (10.0.0.5)"));
+        assert!(h.settle());
+        assert_eq!(h.app.settings.phone_address, "10.0.0.5");
+        let second = link(&h);
+        assert_eq!(second, first.replace("192.168.1.20", "10.0.0.5"));
+        let old = h.app.settings.phone_token.clone();
+        click(&mut h, |h| h.find("New code"));
+        assert!(h.settle());
+        assert!(h.app.settings.phone_token != old && h.app.settings.phone_token.usable());
+        let third = link(&h);
+        assert!(third.starts_with("http://10.0.0.5:") && third != second, "{third}");
+
+        click(&mut h, |h| h.find_near("Send links from your phone", TOGGLE));
+        assert!(h.settle());
+        assert!(!h.app.settings.phone_links && h.app.phone_server.is_none() && qr(&h).is_none());
     }
 }

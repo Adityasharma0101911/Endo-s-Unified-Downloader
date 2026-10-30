@@ -23,6 +23,10 @@ tracing-subscriber = "0.3"
 arboard = "3.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# The code links from the phone need (src/phone.rs): the OS's random source, already built for ring.
+getrandom = "0.2"
+# The QR code of the phone page: pure Rust, no dependencies, MIT.
+qrcodegen = "1.8"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_DataExchange", "Win32_System_Power", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_Security", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }

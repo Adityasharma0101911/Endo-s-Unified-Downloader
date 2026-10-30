@@ -196,6 +196,13 @@ pub struct Settings {
     /// How an HLS, DASH or channel download is named (empty: as it would be; see
     /// `DownloadOptions::name_pattern`).
     pub name_pattern: String,
+    /// Listen on the local network for links sent from the phone (see `phone`). Off by default.
+    pub phone_links: bool,
+    /// The code the phone's page sends (see `phone::Token`), kept so a bookmarked page goes on
+    /// working; none until the first time it is turned on.
+    pub phone_token: crate::phone::Token,
+    /// The address the QR code holds, of this computer's on local networks (empty: the first).
+    pub phone_address: String,
 }
 
 /// When the queue runs by itself (see `desktop::schedule_due`): at `start` on the ticked days it
@@ -290,6 +297,9 @@ impl Default for Settings {
             live_idle_timeout: 0,
             record_minutes: 0,
             name_pattern: String::new(),
+            phone_links: false,
+            phone_token: Default::default(),
+            phone_address: String::new(),
         }
     }
 }

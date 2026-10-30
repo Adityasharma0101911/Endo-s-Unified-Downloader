@@ -1,6 +1,6 @@
 # Privacy Policy
 
-Endo's Unified Downloader is a desktop download manager with a browser extension (for Chrome, Edge, Firefox and other browsers). This policy covers both. Effective October 28, 2026.
+Endo's Unified Downloader is a desktop download manager with a browser extension (for Chrome, Edge, Firefox and other browsers). This policy covers both. Effective October 29, 2026.
 
 **The short version:** everything stays on your computer. Neither the extension nor the app collects, sells or shares your data, and neither sends anything to the developer. There are no accounts, ads, analytics or tracking.
 
@@ -28,7 +28,9 @@ The app stores its settings, queue and download history in its own folder on you
 - GitHub, to check for and download its own updates, and the tools it uses (yt-dlp and ffmpeg). It also contacts Codeberg for gallery-dl;
 - services you turn on and give your own key for: VirusTotal (it sends only a downloaded file's SHA-256 hash, never the file), Real-Debrid or AllDebrid, and the Google Drive API.
 
-Your keys and passwords are saved only on your computer. They are never stored with the queue or the history.
+When you turn on "Send links from your phone" (off by default), the app also listens on your local network for links sent from your own phone, from the page its QR code opens. It answers only devices on your local network, and adds a link only when the request carries the code from that QR code, which is saved in the app's settings and never logged. The links go from your phone straight to the app: nothing leaves your network for this.
+
+Your keys, passwords and that code are saved only on your computer. They are never stored with the queue or the history.
 
 ## Deleting your data
 
