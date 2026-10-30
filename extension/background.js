@@ -24,6 +24,7 @@ import {
 } from "./lib/detect.js";
 import { MAX_BATCH, cookieHeader, siteOf } from "./lib/links.js";
 import { QUALITIES, isMediaPage, mediaPayload, rememberedChoice } from "./lib/media.js";
+import { WaitingList, rescueWithMedia, sendCaptured } from "./lib/rescue.js";
 
 const APP_NAME = "endos-unified-downloader";
 const APP_PORTS = [49152, 49153, 49154, 49155];
@@ -417,7 +418,7 @@ async function onMediaResponse(details, requestHeaders) {
   if (!tab || isMediaSiteHost(hostOf(tab.url))) return;
   // An untyped ranged XHR is only a video when the page plays that URL.
   if (!classified && !(await isVideoSrc(tab.id, details.frameId, details.url))) return;
-  await addItem(tab.id, {
+  const item = {
     id: details.requestId,
     url: details.url,
     kind: found.kind,
@@ -435,7 +436,9 @@ async function onMediaResponse(details, requestHeaders) {
     hidden: false,
     // Whether the page may read it itself ("Via browser"): a <video>'s own request needs no CORS, the page's fetch does.
     pageCanFetch: details.type !== "media" || new URL(details.url).origin === initiator || Boolean(header("access-control-allow-origin")),
-  });
+  };
+  await addItem(tab.id, item);
+  await rescueMedia(item);
 }
 
 chrome.tabs.onUpdated.addListener((tabId, info) => {
@@ -804,7 +807,14 @@ async function captureDownload(item) {
   const store = item.cookieStoreId ? { storeId: item.cookieStoreId } : {};
   const cookies = chrome.cookies ? cookieHeader(await chrome.cookies.getAll({ url, ...store }).catch(() => [])) : "";
   const filename = String(item.filename || "").split(/[/\\]/).pop();
-  const result = await sendToApp({ url, cookies, userAgent: navigator.userAgent, referer: item.referrer, filename });
+  // The file of a download of the app's whose link expired: its new link goes to that download, not to a new one.
+  const request = { cookies, user_agent: navigator.userAgent, referer: isHttpUrl(item.referrer) ? item.referrer : undefined };
+  const result = await sendCaptured(
+    await waiting.get({ fresh: true }),
+    { ...item, filename },
+    (download) => relink(download, url, request),
+    () => sendToApp({ url, cookies, userAgent: navigator.userAgent, referer: item.referrer, filename }),
+  );
   if (!result.ok) {
     chrome.downloads.resume(item.id).catch(() => {});
     return false;
@@ -812,6 +822,42 @@ async function captureDownload(item) {
   await chrome.downloads.cancel(item.id).catch(() => {});
   chrome.downloads.erase({ id: item.id }).catch(() => {});
   return true;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Downloads whose link expired: a new link the browser comes upon goes to the app for one (see lib/rescue.js)
+
+/** The app's downloads waiting for a new link (POST /expired); an app too old to list them has none. */
+const waiting = new WaitingList(async () => (await callApp("/expired", { timeout: 3000 })).downloads);
+/** The links tried for each waiting download, from the media pages play (see lib/rescue.js firstTry). */
+const tried = new Map();
+/** How long the popup tells of a download rescued. */
+const RESCUED_NOTE_MS = 10 * 60 * 1000;
+
+/**
+ * Gives waiting download `download` the new link `url`, with the browser's request for it (`cookies`, `user_agent`,
+ * `referer`, `headers`), through the app's POST /relink; whether the app took it, having checked it is the same file.
+ * One taken shows in the popup.
+ */
+async function relink(download, url, request) {
+  if (!isHttpUrl(url) || isOffLimits(hostOf(url))) return false;
+  try {
+    await callApp("/relink", { json: { id: download.id, url, ...request }, timeout: 45000, verify: true });
+  } catch {
+    return false;
+  }
+  waiting.drop(download.id);
+  await chrome.storage.session.set({ rescued: { name: download.name, time: Date.now() } }).catch(() => {});
+  return true;
+}
+
+/** Tries a file a page plays as the new link of a waiting download from that page (see lib/rescue.js matchMedia). */
+async function rescueMedia(item) {
+  // Streams are no candidates: the list is not asked for them.
+  if (item.kind !== "file") return;
+  const { referer, userAgent, cookies, headers } = item.request;
+  const request = { referer: referer || item.pageUrl, user_agent: userAgent, cookies, headers };
+  await rescueWithMedia(await waiting.get(), item, tried, (download) => relink(download, item.url, request));
 }
 
 // Chrome and Edge ask for the file name once the answer's headers (name, type, size) are in, before a Save As
@@ -968,13 +1014,14 @@ const validTabId = (tabId) => Number.isInteger(tabId) && tabId >= 0;
 const POPUP_COMMANDS = {
   async GET_STATE({ tabId }) {
     if (!validTabId(tabId)) return { ok: false, error: "bad tabId" };
-    const [state, app, recs, settings, hostAccess] = await Promise.all([
+    const [state, app, recs, settings, hostAccess, { rescued }] = await Promise.all([
       readTab(tabId),
       findApp(),
       loadRecs(),
       getSettings(),
       // Firefox (and Chrome's "on click" site access) can withhold the host access detection needs.
       chrome.permissions.contains({ origins: ["<all_urls>"] }).catch(() => false),
+      chrome.storage.session.get("rescued").catch(() => ({})),
     ]);
     const recordings = Object.entries(recs)
       .filter(([, rec]) => rec.tabId === tabId)
@@ -992,7 +1039,9 @@ const POPUP_COMMANDS = {
         started: rec.started ?? null,
       }));
     const items = Object.values(state.items).sort((a, b) => b.time - a.time);
-    return { items, app, recordings, settings, armed: Boolean(state.armed), hostAccess };
+    // The last download of the app's given a new link the browser came upon, lately.
+    const recent = rescued && Date.now() - rescued.time < RESCUED_NOTE_MS ? rescued.name : null;
+    return { items, app, recordings, settings, armed: Boolean(state.armed), hostAccess, rescued: recent };
   },
 
   async SEND({ tabId, id, url, filename, mp4, height }) {

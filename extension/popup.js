@@ -144,6 +144,8 @@ function render() {
   pill.className = `pill tone-${tone}`;
   pill.title = app.ok ? `Desktop app on port ${app.port}` : app.outdated ? `Older app on port ${app.port}` : app.error || "Start the desktop app";
   $("about-app").textContent = app.ok ? `v${app.version || "?"} · port ${app.port}` : app.outdated ? "An older version: update it" : "Not running";
+  // A download of the app's whose link expired took a new link the browser came upon.
+  if (state.rescued && !$("start-msg").textContent) say($("start-msg"), `Rescued: ${state.rescued}, resuming`, "ok");
   $("app-hint").hidden = !!app.ok || !!app.outdated;
   $("app-outdated").hidden = !!app.ok || !app.outdated;
   // Without host access (Firefox grants it separately) the background sees no requests at all.

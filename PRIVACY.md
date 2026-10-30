@@ -1,6 +1,6 @@
 # Privacy Policy
 
-Endo's Unified Downloader is a desktop download manager with a browser extension (for Chrome, Edge, Firefox and other browsers). This policy covers both. Effective October 29, 2026.
+Endo's Unified Downloader is a desktop download manager with a browser extension (for Chrome, Edge, Firefox and other browsers). This policy covers both. Effective October 30, 2026.
 
 **The short version:** everything stays on your computer. Neither the extension nor the app collects, sells or shares your data, and neither sends anything to the developer. There are no accounts, ads, analytics or tracking.
 
@@ -13,6 +13,7 @@ The extension finds videos, streams and downloadable links on the pages you visi
 - **Page addresses, and the links, video and stream addresses found on a page or in what the page loads.** They are used to show you what can be downloaded, and to send what you pick to the app. Only video and stream addresses are picked out of what a page loads; nothing else from it is kept.
 - **Request headers of those links (such as the referring page and the browser's user agent).** Many sites only serve a file to a request that looks like the browser's own, so the app repeats them.
 - **Cookies of the site a link belongs to, and of no other site.** They go to the app only with that link, when you send it, so the app can download files that need you to be signed in, the same way your browser does. For media sites they are sent only when you turn on "Use my browser sign-in on media sites".
+- **New links for the app's downloads whose link expired.** The app tells the extension which of its downloads need a new link (their file names, sizes, sites and the pages they came from). When you start one of those files again in the browser, or its page plays its video again, the extension sends that new link to the app with the same request headers and cookies as above, in place of a new download. Nothing else is sent for this.
 - **Video recorded from a page,** only when you start a recording yourself. It is passed to the app in pieces as it is recorded.
 - **Your settings and your last download choices.** They are stored in the browser's local extension storage. What the extension found on each tab is kept in the browser's session storage and is cleared when the browser closes.
 
