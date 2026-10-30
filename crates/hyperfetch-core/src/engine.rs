@@ -97,6 +97,9 @@ const DEFAULT_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
 /// Largest default chunk while the file is hashed from its start as that is written.
 const IN_ORDER_CHUNK: u64 = 8 * 1024 * 1024;
 const DEFAULT_MIN_STEAL: u64 = 1024 * 1024;
+/// A file smaller than this (see `EngineSnapshot::small`) spends more of its download on
+/// handshakes than on bandwidth.
+pub const SMALL_FILE: u64 = 8 * 1024 * 1024;
 /// Most connections one download opens, whatever `num_connections` asks for; also the default
 /// per-host budget, so that alone never holds a download back.
 const MAX_CONNECTIONS: usize = 64;
@@ -130,6 +133,9 @@ pub struct EngineSnapshot {
     /// Whose checksum the finished file matched when it was not the user's ("the site's
     /// SHA-256", see `DownloadOptions::remote_checksum`), in the last snapshots.
     pub checked_against: Option<String>,
+    /// A file its probe found smaller than `SMALL_FILE`: done soon, it need not hold one of a
+    /// batch's or queue's places for long (see `crate::queue::may_start`).
+    pub small: bool,
 }
 
 impl EngineSnapshot {
@@ -1007,7 +1013,7 @@ impl DownloadEngine {
             }
         }
 
-        let mut probed = self.probe_all(&client, &resolved).await?;
+        let mut probed = self.probe_all(&client, &resolved, &snapshot_tx).await?;
         let kind = probed.reference.headers.get(CONTENT_TYPE).and_then(|t| t.to_str().ok());
         let dash = kind.is_some_and(|t| t.to_ascii_lowercase().starts_with("application/dash+xml"));
         if kind.is_some_and(|t| t.to_ascii_lowercase().starts_with("application/vnd.ms-sstr+xml")) {
@@ -1023,7 +1029,7 @@ impl DownloadEngine {
             if let Some(path) = self.boxed(|engine| engine.fetch_adaptive(&client, &manifest, snapshot_tx.clone())).await? {
                 return Ok(path);
             }
-            probed = self.probe_all(&client, &resolved).await?;
+            probed = self.probe_all(&client, &resolved, &snapshot_tx).await?;
         }
         let (url, final_url) = (probed.reference.url.clone(), probed.reference.final_url.clone());
         route.tried.push(url.clone());
@@ -1087,7 +1093,7 @@ impl DownloadEngine {
         let source = self.guarded(RESOLVE_TIMEOUT, "asking MEGA for the file", crate::mega::file(&client, &link)).await??;
         let engine = Self { decrypt: Some(Arc::new(source.cipher)), ..self.naming(link) };
         let fetched = async {
-            let mut probed = engine.probe_all(&client, std::slice::from_ref(&source.url)).await?;
+            let mut probed = engine.probe_all(&client, std::slice::from_ref(&source.url), &snapshot_tx).await?;
             // The ciphertext's validators tell a resume nothing the MAC does not check.
             for probe in std::iter::once(&mut probed.reference).chain(&mut probed.mirrors) {
                 (probe.etag, probe.last_modified) = (None, None);
@@ -2144,7 +2150,7 @@ impl DownloadEngine {
     ) -> Result<PathBuf, String> {
         let client = &stream.client;
         if !stream.hls {
-            let probed = self.probe_all(client, std::slice::from_ref(&stream.url)).await?;
+            let probed = self.probe_all(client, std::slice::from_ref(&stream.url), &None).await?;
             return self.download(client.clone(), probed, Some(snapshot_tx)).await;
         }
         // Finished by an earlier attempt whose other streams did not finish: kept for this one,
@@ -2364,7 +2370,7 @@ impl DownloadEngine {
     /// not, only joins if it serves the same file. Otherwise another mirror may have to lead, so
     /// every probe is waited for, and no answer holds its host slot meanwhile: another probe may
     /// need it. A Google Drive answer that is a web page fails its mirror's probe.
-    async fn probe_all(&self, client: &Client, urls: &[Url]) -> Result<Probed, String> {
+    async fn probe_all(&self, client: &Client, urls: &[Url], snapshot_tx: &Option<broadcast::Sender<EngineSnapshot>>) -> Result<Probed, String> {
         let (limiter, stall) = (self.limiter(), self.stall_timeout());
         let connections = self.options.num_connections.clamp(1, MAX_CONNECTIONS);
         let limit = self.options.max_connections_per_host;
@@ -2373,15 +2379,23 @@ impl DownloadEngine {
         let (reading, started) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
         // Owned, as the probes may still be out once this returns.
         let (client, auth, owned) = (client.clone(), self.auth.clone(), urls.to_vec());
-        let flags = (Arc::clone(&reading), Arc::clone(&started));
+        let (flags, tell) = ((Arc::clone(&reading), Arc::clone(&started)), snapshot_tx.clone());
         let mut probes: ProbeStream = futures_util::stream::iter(owned.into_iter().enumerate())
             .map(move |(i, url)| {
-                let (client, auth, limiter) = (client.clone(), auth.clone(), limiter.clone());
+                let (client, auth, limiter, tell) = (client.clone(), auth.clone(), limiter.clone(), tell.clone());
                 let (reading, started) = (Arc::clone(&flags.0), Arc::clone(&flags.1));
                 async move {
                     let probe = async {
                         // Only the first mirror fetches the file's start: the download uses one copy.
                         let (mut info, body) = probe_url(&client, auth.as_deref(), &url, i == 0, limit).await?;
+                        // A small file need not hold a batch's or queue's place while it comes (see
+                        // `EngineSnapshot::small`); its later snapshots say so again, or that it
+                        // was no file after all.
+                        let kind = info.headers.get(CONTENT_TYPE).and_then(|t| t.to_str().ok()).unwrap_or_default().to_ascii_lowercase();
+                        let listing = ["html", "mpegurl", "dash+xml", "sstr+xml"].iter().any(|k| kind.contains(k));
+                        if let Some(size) = info.size.filter(|&size| i == 0 && size < SMALL_FILE && !listing) {
+                            emit(&tell, || EngineSnapshot { total_bytes: size, small: true, ..Default::default() });
+                        }
                         let live = match body {
                             Some(body) if !started.load(Ordering::Relaxed) => {
                                 reading.store(true, Ordering::Relaxed);
@@ -3765,6 +3779,7 @@ impl RangeJob {
             mirror_speeds,
             chunks,
             target_path: Some(target.to_path_buf()),
+            small: size < SMALL_FILE,
             ..Default::default()
         }
     }
@@ -5228,6 +5243,7 @@ fn stream_snapshot(size: Option<u64>, written: u64, speed: f64, path: &Path) -> 
         mirror_speeds: Vec::new(),
         chunks: Vec::new(),
         target_path: Some(path.to_path_buf()),
+        small: size.is_some_and(|size| size < SMALL_FILE),
         ..Default::default()
     }
 }
@@ -8800,11 +8816,11 @@ mod tests {
         let drive = Url::parse("http://drive.usercontent.google.com/download?id=abc&export=download&confirm=t").unwrap();
         let engine = DownloadEngine::new(vec![drive.clone()], options);
         let client = engine.client.clone().unwrap();
-        let err = engine.probe_all(&client, &[drive]).await.err().expect("a web page is no file");
+        let err = engine.probe_all(&client, &[drive], &None).await.err().expect("a web page is no file");
         assert!(err.contains("Google Drive served a web page instead of the file"), "{err}");
         // The same answer from anywhere else is what was asked for.
         let elsewhere = Url::parse("http://files.engine.invalid/download?id=abc").unwrap();
-        assert!(engine.probe_all(&client, &[elsewhere]).await.is_ok());
+        assert!(engine.probe_all(&client, &[elsewhere], &None).await.is_ok());
     }
 
     #[tokio::test]

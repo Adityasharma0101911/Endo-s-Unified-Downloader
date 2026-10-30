@@ -1259,7 +1259,8 @@ impl App {
     }
 
     /// Starts the paused downloads waiting to resume (see `App::resuming`), then queued ones,
-    /// while fewer than the configured number are running; none while the window waits to close.
+    /// while fewer than the configured number are running, small files beside them (see
+    /// `queue::may_start`); none while the window waits to close.
     /// One that cannot start yet (a video waiting for the answer about ffmpeg, a file under
     /// repair) holds up none after it.
     fn run_scheduler(&mut self) {
@@ -1267,7 +1268,7 @@ impl App {
             return;
         }
         let max = self.settings.max_concurrent.max(1);
-        while self.queue.active_count() < max && !self.resuming.is_empty() {
+        while self.queue.may_start(max) && !self.resuming.is_empty() {
             let id = self.resuming.remove(0);
             if self.queue.get_item(id).is_some_and(|item| item.status == QueueItemStatus::Paused) {
                 self.start_job(id, false);

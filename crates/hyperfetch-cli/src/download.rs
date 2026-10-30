@@ -3,6 +3,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::io::{IsTerminal, Write};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -12,8 +13,9 @@ use futures_util::StreamExt;
 use hyperfetch_core::engine::{build_client, ClientKey, DownloadEngine, DownloadOptions, EngineSnapshot, SharedLimits};
 use hyperfetch_core::history::{redact_text, DownloadHistoryManager, HistoryEntry, HistoryStatus};
 use hyperfetch_core::media::is_supported_media_site;
+use hyperfetch_core::queue::may_start;
 use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch, Notify};
 use url::Url;
 
 pub const EXIT_OK: i32 = 0;
@@ -372,12 +374,46 @@ impl Clients {
     }
 }
 
-/// Runs `jobs` in order with at most `concurrency` at a time and returns how many failed. While
-/// `ffmpeg`, the answer whether ffmpeg may be installed, is not known, the downloads that need it
-/// (see [`Job::needs_ffmpeg`]) wait for it and the others go ahead of them; every download that
-/// starts once it is known goes by it. After a shutdown request no new job starts and running
-/// ones stop with their state saved. Running several at once, results arrive in completion
-/// order, so each result line names its input.
+/// The running downloads of a batch known to be small (see `EngineSnapshot::small`), and a wake-up
+/// for the batch when one becomes so: it may start another (see [`may_start`]).
+#[derive(Default)]
+struct Small {
+    count: AtomicUsize,
+    found: Notify,
+}
+
+/// A download counted among the small ones while its last snapshot says it is, until it ends.
+struct CountedSmall<'a>(&'a Small, bool);
+
+impl CountedSmall<'_> {
+    fn see(&mut self, snapshot: &EngineSnapshot) {
+        if snapshot.small == self.1 {
+            return;
+        }
+        self.1 = snapshot.small;
+        if self.1 {
+            self.0.count.fetch_add(1, Ordering::SeqCst);
+            self.0.found.notify_one();
+        } else {
+            self.0.count.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+impl Drop for CountedSmall<'_> {
+    fn drop(&mut self) {
+        if self.1 {
+            self.0.count.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Runs `jobs` in order with at most `concurrency` at a time and returns how many failed, small
+/// files beside those (see [`may_start`]). While `ffmpeg`, the answer whether ffmpeg may be
+/// installed, is not known, the downloads that need it (see [`Job::needs_ffmpeg`]) wait for it and
+/// the others go ahead of them; every download that starts once it is known goes by it. After a
+/// shutdown request no new job starts and running ones stop with their state saved. Running
+/// several at once, results arrive in completion order, so each result line names its input.
 pub async fn run_jobs(jobs: Vec<Job>, concurrency: usize, ui: &Ui, shutdown: &Shutdown, ffmpeg: Option<FfmpegAnswer>) -> usize {
     let overall = (jobs.len() > 1 && !ui.quiet).then(|| {
         let bar = ui.multi.add(ProgressBar::new(jobs.len() as u64).with_style(style(OVERALL)).with_prefix("Total"));
@@ -386,11 +422,12 @@ pub async fn run_jobs(jobs: Vec<Job>, concurrency: usize, ui: &Ui, shutdown: &Sh
     });
     let named = concurrency > 1 && jobs.len() > 1;
     let clients = Clients::for_jobs(&jobs).await;
+    let small = Small::default();
     let mut stop = shutdown.subscribe();
     let (mut waiting, mut running) = (VecDeque::from(jobs), FuturesUnordered::new());
     let mut failed = 0;
     loop {
-        while running.len() < concurrency.max(1) {
+        while may_start(running.len(), small.count.load(Ordering::SeqCst), concurrency) {
             // None when nothing is asked; Some(None) while it is not answered.
             let answer = ffmpeg.as_ref().map(|answer| answer.peek().copied());
             let next = waiting.iter().position(|job| answer != Some(None) || !job.needs_ffmpeg());
@@ -399,7 +436,7 @@ pub async fn run_jobs(jobs: Vec<Job>, concurrency: usize, ui: &Ui, shutdown: &Sh
                 job.options.install_ffmpeg = install;
             }
             let input = named.then(|| input_name(job.line, &job.urls)).flatten();
-            running.push(run_job(job, input, &clients, ui, shutdown, overall.as_ref()));
+            running.push(run_job(job, input, &clients, ui, shutdown, overall.as_ref(), &small));
         }
         let unanswered = ffmpeg.clone().filter(|answer| answer.peek().is_none() && !waiting.is_empty());
         tokio::select! {
@@ -417,6 +454,7 @@ pub async fn run_jobs(jobs: Vec<Job>, concurrency: usize, ui: &Ui, shutdown: &Sh
                 }
             }
             Some(_) = OptionFuture::from(unanswered) => {}
+            () = small.found.notified(), if !running.is_empty() => {}
             () = stop_requested(&mut stop), if !waiting.is_empty() => waiting.clear(),
             else => break,
         }
@@ -491,7 +529,9 @@ async fn run_job(
     ui: &Ui,
     shutdown: &Shutdown,
     overall: Option<&ProgressBar>,
+    small: &Small,
 ) -> Outcome {
+    let mut small = CountedSmall(small, false);
     let mut stop = shutdown.subscribe();
     if stop.borrow().is_some() {
         return Outcome::Interrupted;
@@ -524,6 +564,7 @@ async fn run_job(
             snapshot = rx.recv(), if snapshots_open => match snapshot {
                 Ok(snapshot) => {
                     view.update(&snapshot);
+                    small.see(&snapshot);
                     last = Some(snapshot);
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {}
@@ -873,6 +914,54 @@ mod tests {
         assert_eq!(text.matches("https://host.test/missing").count(), 5, "{text}");
         let json: serde_json::Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
         assert!(json["error"].as_str().unwrap().contains("f.zip?token=REDACTED\""), "{json}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Small files run beside the batch's places: with -j 2, a third starts as soon as the probes
+    /// of the two tell their size, while their bodies are still on the way.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn small_files_run_beside_the_batchs_places() {
+        let dir = crate::tests::test_dir("small");
+        let body: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = format!("http://{}", listener.local_addr().unwrap());
+        // GETs whose body is on its way, and the most there were at once.
+        let (sending, most) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let (counters, file) = ((Arc::clone(&sending), Arc::clone(&most)), body.clone());
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let ((sending, most), body) = ((Arc::clone(&counters.0), Arc::clone(&counters.1)), file.clone());
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => head.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let answer = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                    if socket.write_all(answer.as_bytes()).await.is_err() || head.starts_with(b"HEAD") {
+                        return;
+                    }
+                    most.fetch_max(sending.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    let _ = socket.write_all(&body).await;
+                    sending.fetch_sub(1, Ordering::SeqCst);
+                });
+            }
+        });
+        let jobs = ["a", "b", "c"].map(|name| Job {
+            label: name.to_string(),
+            urls: vec![Url::parse(&format!("{}/{}.bin", server, name)).unwrap()],
+            options: DownloadOptions { output_path: Some(dir.join("")), ..Default::default() },
+            line: None,
+        });
+        assert_eq!(run_jobs(Vec::from(jobs), 2, &Ui::new(true), &Shutdown::install(), None).await, 0);
+        assert_eq!(most.load(Ordering::SeqCst), 3);
+        for name in ["a", "b", "c"] {
+            assert_eq!(std::fs::read(dir.join(format!("{}.bin", name))).unwrap(), body);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

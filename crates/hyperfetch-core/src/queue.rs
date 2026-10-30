@@ -4,6 +4,20 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::engine::{DownloadOptions, EngineSnapshot, CANCELLED};
+
+/// Small downloads that run beside a batch's or queue's places (see [`may_start`]).
+pub const SMALL_AT_ONCE: usize = 16;
+
+/// Whether a batch or queue that runs `at_once` downloads at once (the CLI's `-j`, the app's
+/// setting) may start another while `running` run, `small` of them known small (see
+/// `EngineSnapshot::small`): up to `SMALL_AT_ONCE` of those take no place, as handshakes, not
+/// bandwidth, are what they wait on. They still keep to the hosts' connection limits and the speed
+/// limit, as every download does. One at a time stays one at a time: it is asked for to keep the
+/// order, or to spare a server.
+pub fn may_start(running: usize, small: usize, at_once: usize) -> bool {
+    let beside = if at_once > 1 { small.min(SMALL_AT_ONCE) } else { 0 };
+    running.saturating_sub(beside) < at_once.max(1)
+}
 use crate::history::{is_redacted, redact_text, redact_url, REDACTED_LINK};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,6 +69,9 @@ pub struct QueueItem {
     /// What post-processing told the user once the download finished (see `EngineSnapshot::notes`).
     #[serde(default)]
     pub notes: Vec<String>,
+    /// Running, it is known small (see `EngineSnapshot::small`).
+    #[serde(skip)]
+    pub small: bool,
 }
 
 impl QueueItem {
@@ -134,6 +151,7 @@ impl DownloadQueue {
             target_path: None,
             names_file: false,
             notes: Vec::new(),
+            small: false,
         });
         id
     }
@@ -168,10 +186,17 @@ impl DownloadQueue {
         self.items.iter().filter(|i| i.status.is_active()).count()
     }
 
-    /// The first queued item to start while fewer than `max_concurrent` items are active, but
-    /// for those `skip` holds back (ones that cannot start yet, which the others go past).
+    /// Whether the queue, running `max_concurrent` downloads at once, may start another (see
+    /// [`may_start`]).
+    pub fn may_start(&self, max_concurrent: usize) -> bool {
+        let small = self.items.iter().filter(|i| i.status.is_active() && i.small).count();
+        may_start(self.active_count(), small, max_concurrent)
+    }
+
+    /// The first queued item to start while the queue may start one (see [`may_start`]), but for
+    /// those `skip` holds back (ones that cannot start yet, which the others go past).
     pub fn next_to_start(&self, max_concurrent: usize, skip: impl Fn(usize) -> bool) -> Option<usize> {
-        if self.active_count() >= max_concurrent {
+        if !self.may_start(max_concurrent) {
             return None;
         }
         self.items
@@ -208,6 +233,7 @@ impl DownloadQueue {
                 }
                 item.status = QueueItemStatus::Downloading;
                 item.speed_bytes_per_sec = 0.0;
+                item.small = false;
                 true
             }
             _ => false,
@@ -231,6 +257,7 @@ impl DownloadQueue {
     pub fn apply_snapshot(&mut self, id: usize, snapshot: &EngineSnapshot) {
         let Some(item) = self.items.iter_mut().find(|i| i.id == id) else { return };
         item.total_bytes = snapshot.total_bytes;
+        item.small = snapshot.small;
         item.downloaded_bytes = snapshot.downloaded_bytes;
         // Nothing is transferred any more once every byte has arrived.
         item.speed_bytes_per_sec = if item.is_finishing() { 0.0 } else { snapshot.speed_bytes_per_sec };
@@ -475,6 +502,26 @@ mod tests {
         assert_eq!(q.next_to_start(2, |_| false), Some(ids[2]), "paused items are not restarted automatically");
         let (q, ids) = queue_of(&["https://e.com/a", "https://e.com/b"]);
         assert_eq!(q.next_to_start(2, |id| id == ids[0]), Some(ids[1]), "one held back holds none after it");
+    }
+
+    /// A download its probe found small takes no place of the queue's, up to `SMALL_AT_ONCE` of
+    /// them, from when its snapshot says so until it runs again; but for a queue of one at a time.
+    #[test]
+    fn small_files_run_beside_the_queues_places() {
+        assert!(may_start(3, 2, 2) && !may_start(4, 2, 2) && !may_start(40, 20, 4) && may_start(19, 20, 4));
+        assert!(!may_start(1, 1, 1), "one at a time");
+        let (mut q, ids) = queue_of(&["https://e.com/a", "https://e.com/b", "https://e.com/c", "https://e.com/d"]);
+        q.mark_started(ids[0]);
+        q.mark_started(ids[1]);
+        assert_eq!(q.next_to_start(2, |_| false), None);
+        q.apply_snapshot(ids[0], &EngineSnapshot { total_bytes: 1000, small: true, ..Default::default() });
+        assert!(!q.may_start(1));
+        assert_eq!(q.next_to_start(2, |_| false), Some(ids[2]));
+        q.mark_started(ids[2]);
+        assert_eq!(q.next_to_start(2, |_| false), None, "until it is known small, the third takes the place");
+        q.finish(ids[0], Err(CANCELLED.into()));
+        q.mark_started(ids[0]);
+        assert!(!q.may_start(3), "started again, it takes a place until its snapshot tells");
     }
 
     #[test]
