@@ -818,16 +818,24 @@ mod tests {
         let damaged = Site { damaged_once: Some(MIB + 10..MIB + 20), ..Site::default() };
         let (bad, _) = serve(data.clone(), damaged).await;
         let (good, log) = serve(data.clone(), Site { only_as_first: true, ..Site::default() }).await;
+        // Pieces of 768 KiB: a piece fetched again is never mistaken for a probe's request.
+        let piece = 3 * MIB / 4;
         let options = DownloadOptions {
             expected_checksum: Some(format!("sha256:{}", sha256_hex(&data))),
-            metalink_pieces: Some(pieces_of(&data, MIB)),
+            metalink_pieces: Some(pieces_of(&data, piece)),
             ..DownloadOptions::default()
         };
         let (done, _) = download(vec![bad, good], dir.path(), options).await;
         assert!(std::fs::read(done.unwrap()).unwrap() == data);
-        // The second mirror's probe, then the damaged piece only.
-        let fetched: Vec<(u64, u64)> = log.lock().unwrap().iter().filter_map(|(_, range)| *range).skip(2).collect();
-        assert!(!fetched.is_empty() && fetched.iter().all(|&(s, e)| s >= MIB as u64 && e < 2 * MIB as u64), "{:?}", log.lock().unwrap());    }
+        // Besides its probes (HEAD, and a GET of the file's first byte or of the first MiB it reads
+        // ahead), as many as got out before the download no longer needed them, the second mirror
+        // was asked for the damaged piece only.
+        let log = log.lock().unwrap();
+        let probe = |(start, end): (u64, u64)| start == 0 && (end == 0 || end == 1024 * 1024 - 1);
+        let fetched: Vec<(u64, u64)> = log.iter().filter_map(|(_, range)| *range).filter(|&range| !probe(range)).collect();
+        let damaged = piece as u64..2 * piece as u64;
+        assert!(!fetched.is_empty() && fetched.iter().all(|&(s, e)| damaged.contains(&s) && damaged.contains(&e)), "{log:?}");
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn pieces_check_a_download_without_a_whole_hash() {
