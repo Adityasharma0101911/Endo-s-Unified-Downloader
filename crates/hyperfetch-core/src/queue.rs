@@ -44,6 +44,16 @@ impl QueueItemStatus {
     }
 }
 
+/// Which waiting downloads start first: High before Normal, Normal before Low, and within one the
+/// queue's order. It decides only when they start, not how they share the speed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum Priority {
+    High,
+    #[default]
+    Normal,
+    Low,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueueItem {
     pub id: usize,
@@ -69,6 +79,9 @@ pub struct QueueItem {
     /// What post-processing told the user once the download finished (see `EngineSnapshot::notes`).
     #[serde(default)]
     pub notes: Vec<String>,
+    /// When it starts among the waiting downloads; Normal in a queue saved before priorities.
+    #[serde(default)]
+    pub priority: Priority,
     /// Running, it is known small (see `EngineSnapshot::small`).
     #[serde(skip)]
     pub small: bool,
@@ -164,6 +177,7 @@ impl DownloadQueue {
             target_path: None,
             names_file: false,
             notes: Vec::new(),
+            priority: Priority::Normal,
             small: false,
         });
         id
@@ -221,16 +235,45 @@ impl DownloadQueue {
         may_start(self.active_count(), small, max_concurrent)
     }
 
-    /// The first queued item to start while the queue may start one (see [`may_start`]), but for
-    /// those `skip` holds back (ones that cannot start yet, which the others go past).
+    /// The queued item to start while the queue may start one (see [`may_start`]): the first of
+    /// the highest priority, but for those `skip` holds back (ones that cannot start yet, which
+    /// the others go past).
     pub fn next_to_start(&self, max_concurrent: usize, skip: impl Fn(usize) -> bool) -> Option<usize> {
         if !self.may_start(max_concurrent) {
             return None;
         }
-        self.items
-            .iter()
-            .find(|i| i.status == QueueItemStatus::Queued && !skip(i.id) && self.active_conflict(i.id).is_none())
-            .map(|i| i.id)
+        let first = |priority: Priority| {
+            self.items.iter().find(|i| {
+                i.priority == priority && i.status == QueueItemStatus::Queued && !skip(i.id) && self.active_conflict(i.id).is_none()
+            })
+        };
+        [Priority::High, Priority::Normal, Priority::Low].into_iter().find_map(first).map(|i| i.id)
+    }
+
+    /// Moves item `id` to place `index` of the list (the last one past its end): the order the
+    /// waiting downloads start in, within a priority. Returns false if it is missing.
+    pub fn move_item(&mut self, id: usize, index: usize) -> bool {
+        let Some(from) = self.items.iter().position(|i| i.id == id) else { return false };
+        let item = self.items.remove(from);
+        self.items.insert(index.min(self.items.len()), item);
+        self.revision += 1;
+        true
+    }
+
+    /// Puts waiting item `id` first among the waiting ones, as high as the highest priority among
+    /// them, so that it starts next; what runs goes on. Returns false if it is not waiting.
+    pub fn download_next(&mut self, id: usize) -> bool {
+        let waiting = |i: &&QueueItem| i.status == QueueItemStatus::Queued;
+        if !self.get_item(id).is_some_and(|i| waiting(&i)) {
+            return false;
+        }
+        let first = self.items.iter().position(|i| waiting(&i)).unwrap_or(0);
+        let top = self.items.iter().filter(waiting).map(|i| i.priority).min().unwrap_or_default();
+        self.move_item(id, first);
+        if let Some(item) = self.get_item_mut(id) {
+            item.priority = item.priority.min(top);
+        }
+        true
     }
 
     /// Another active item downloading the same file as `id` (same mirror URL or target path).
@@ -533,6 +576,70 @@ mod tests {
         assert_eq!(q.next_to_start(2, |_| false), Some(ids[2]), "paused items are not restarted automatically");
         let (q, ids) = queue_of(&["https://e.com/a", "https://e.com/b"]);
         assert_eq!(q.next_to_start(2, |id| id == ids[0]), Some(ids[1]), "one held back holds none after it");
+    }
+
+    /// A waiting High download starts before any waiting Normal one, and Normal before Low;
+    /// within a priority the queue's order decides, which moving an item changes.
+    #[test]
+    fn waiting_downloads_start_by_priority_then_order() {
+        let (mut q, ids) = queue_of(&["https://e.com/a", "https://e.com/b", "https://e.com/c", "https://e.com/d"]);
+        q.get_item_mut(ids[0]).unwrap().priority = Priority::Low;
+        q.get_item_mut(ids[3]).unwrap().priority = Priority::High;
+        let mut started = Vec::new();
+        while let Some(id) = q.next_to_start(9, |_| false) {
+            q.mark_started(id);
+            started.push(id);
+        }
+        assert_eq!(started, [ids[3], ids[1], ids[2], ids[0]]);
+
+        let (mut q, ids) = queue_of(&["https://e.com/a", "https://e.com/b", "https://e.com/c"]);
+        let before = q.revision();
+        assert!(q.move_item(ids[2], 0));
+        assert_ne!(q.revision(), before, "the new order is saved");
+        assert_eq!(q.next_to_start(9, |_| false), Some(ids[2]));
+        assert!(q.move_item(ids[2], 99), "past the end is the last place");
+        let order: Vec<usize> = q.items().iter().map(|i| i.id).collect();
+        assert_eq!(order, [ids[0], ids[1], ids[2]]);
+        assert!(!q.move_item(42, 0));
+        assert_eq!(q.next_to_start(9, |id| id == ids[0]), Some(ids[1]), "one held back holds none after it");
+    }
+
+    /// Download next puts a waiting download first among the waiting ones (a running one keeps
+    /// its place) and as high as the highest priority waiting, so that it starts next; it stops
+    /// nothing, and does nothing to a download that is not waiting.
+    #[test]
+    fn download_next_starts_a_waiting_download_next() {
+        let (mut q, ids) = queue_of(&["https://e.com/run", "https://e.com/b", "https://e.com/c", "https://e.com/d"]);
+        q.mark_started(ids[0]);
+        q.get_item_mut(ids[1]).unwrap().priority = Priority::High;
+        q.get_item_mut(ids[3]).unwrap().priority = Priority::Low;
+        assert!(q.download_next(ids[3]));
+        let order: Vec<usize> = q.items().iter().map(|i| i.id).collect();
+        assert_eq!(order, [ids[0], ids[3], ids[1], ids[2]]);
+        assert_eq!(q.get_item(ids[3]).unwrap().priority, Priority::High);
+        assert_eq!(q.get_item(ids[0]).unwrap().status, QueueItemStatus::Downloading, "what runs goes on");
+        assert_eq!(q.next_to_start(9, |_| false), Some(ids[3]));
+        assert!(!q.download_next(ids[0]), "it runs already");
+        assert!(!q.download_next(42));
+    }
+
+    /// The order and priorities are saved with the queue; a queue saved before priorities loads
+    /// with every download Normal, in its order.
+    #[test]
+    fn order_and_priorities_survive_a_restart() {
+        let (mut q, ids) = queue_of(&["https://e.com/a", "https://e.com/b", "https://e.com/c"]);
+        q.move_item(ids[2], 0);
+        q.get_item_mut(ids[1]).unwrap().priority = Priority::High;
+        q.get_item_mut(ids[0]).unwrap().priority = Priority::Low;
+        let json = serde_json::to_string(&q).unwrap();
+        let back: DownloadQueue = serde_json::from_str(&json).unwrap();
+        let saved = |q: &DownloadQueue| q.items().iter().map(|i| (i.id, i.priority)).collect::<Vec<_>>();
+        assert_eq!(saved(&back), [(ids[2], Priority::Normal), (ids[0], Priority::Low), (ids[1], Priority::High)]);
+
+        let old = json.replace(",\"priority\":\"High\"", "").replace(",\"priority\":\"Low\"", "").replace(",\"priority\":\"Normal\"", "");
+        assert!(!old.contains("priority"), "{old}");
+        let back: DownloadQueue = serde_json::from_str(&old).unwrap();
+        assert_eq!(saved(&back), [(ids[2], Priority::Normal), (ids[0], Priority::Normal), (ids[1], Priority::Normal)]);
     }
 
     /// A download its probe found small takes no place of the queue's, up to `SMALL_AT_ONCE` of
