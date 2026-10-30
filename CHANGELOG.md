@@ -23,6 +23,7 @@ What changed in each release, newest first. Each release's page on [GitHub](http
 - **Small files run beside the batch's or queue's downloads at once**, up to 16 more: a file its probe finds under 8 MiB stops holding its place as soon as the probe's answer tells its size (not when they run one at a time). They keep to the per-host connection limit and the speed limit as every download does.
 - **App: a living chunk map.** A download's chunk map shows each connection's pieces in its own colour (the Chunks table's status too), filling as they download; when a connection takes over the end of another's piece, a light flashes on the cut and the new piece turns from the other's colour to its own.
 - **App:** while a ZIP's files or a stream's tracks are read, grey rows shaped like the list to come shimmer under the spinner (still under Reduce motion).
+- **App: when the queue will be done.** While downloads run, the Queue's header says when everything still to download will be done, from the bytes left of the running and waiting downloads at the speed the running ones have together; "at least", and how many sizes it leaves out, while some are not known yet.
 
 ## 1.8.0 (2026-10-27)
 
