@@ -411,6 +411,8 @@ fn zip_preview(app: &mut App, ui: &mut Ui) {
                 anim::spinner(ui, 14.0, p.muted);
                 ui.label(RichText::new("Reading what the ZIP holds…").color(p.muted));
             });
+            // Files with their sizes, then the total.
+            skeleton(ui, &[(0.42, 56.0), (0.3, 48.0), (0.36, 60.0), (0.26, 0.0)]);
         }
         Some(Some(Err(error))) => error_alert(ui, error),
         Some(Some(Ok(entries))) => zip_entries(ui, entries),
@@ -818,6 +820,42 @@ mod tests {
         assert!(h.app.channel_lists.is_empty());
         let added: Vec<_> = h.app.queue.items().iter().map(|item| (item.filename.as_str(), item.options.channel.as_deref(), item.options.record_seconds)).collect();
         assert_eq!(added, [("News One.ts", Some("News One"), Some(3600)), ("News Two.ts", Some("News Two"), Some(3600))]);
+    }
+
+    /// While a ZIP's files or a stream's tracks are read, grey bars shaped like the lines to come
+    /// show under the spinner, a light sweeping over them; once read they go and frames stop.
+    /// Under Reduce motion they keep still and ask for no frames.
+    #[test]
+    fn a_link_being_read_shows_shimmering_rows() {
+        for reduce in [false, true] {
+            let mut h = Harness::new();
+            h.app.settings.reduce_motion = Some(reduce);
+            for (link, reading) in [("https://example.com/pack.zip", "Reading what the ZIP holds…"), ("https://example.com/v/master.m3u8", "Reading the stream's tracks…")] {
+                h.app.url_input = link.to_string();
+                if link.ends_with(".zip") {
+                    h.app.zip_preview = Some((link.to_string(), None));
+                } else {
+                    h.app.tracks = Some(crate::tracks::Chooser { item: None, link: link.to_string(), info: None, picks: Default::default() });
+                }
+                h.frames(60);
+                let label = h.find(reading).unwrap();
+                let rows = Some(Rect::from_x_y_ranges(196.0..=980.0, label.bottom() + 4.0..=label.bottom() + 70.0));
+                // Shots a tenth of a second apart, over half the light's sweep.
+                let shots: Vec<_> = (0..9).map(|_| (h.frames(6), h.shot(rows))).collect();
+                let bar = [DARK.hover.r(), DARK.hover.g(), DARK.hover.b()];
+                let bars = shots[0].1.pixels().filter(|px| px.0[..3] == bar).count();
+                assert!(bars > 500, "bars under {reading}: {bars}");
+                let moved = shots.windows(2).any(|w| w[0].1 != w[1].1);
+                if reduce {
+                    assert!(shots.iter().all(|(delay, _)| *delay == Duration::MAX) && !moved, "still under {reading}");
+                } else {
+                    assert!(shots.iter().all(|(delay, _)| *delay <= Duration::from_millis(16)) && moved, "the light sweeps under {reading}");
+                }
+                h.app.zip_preview = Some((link.to_string(), Some(Err("The file is not a ZIP".to_string()))));
+                h.app.tracks = None;
+                assert!(h.settle() && h.find(reading).is_none(), "read: the bars go");
+            }
+        }
     }
 
     /// A notice opens its room over a few frames, pushing the card under it down smoothly; once

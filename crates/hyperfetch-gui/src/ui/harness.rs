@@ -705,6 +705,12 @@ mod tests {
             chunks.push(ChunkSnapshot { id: 4, range_start: quarter * 7 / 4, range_end: 2 * quarter - 1, downloaded_bytes: 0, total_bytes: quarter / 4, status, worker_id: Some(4) });
             let map = h.app.ctx.read_response(egui::Id::new(("chunk map", 1usize))).unwrap().rect;
             shoot(&mut h, "chunk-map-split", &[0, 50, 100, 200, 450], Some(map.expand(8.0)));
+            let mut h = scene(Tab::Downloader, &|h| {
+                let link = "https://example.com/pack.zip".to_string();
+                h.app.url_input = link.clone();
+                h.app.zip_preview = Some((link, None));
+            });
+            shoot(&mut h, "link-reading-skeleton", &[0, 200, 400, 600, 800], area(196.0, 60.0, 980.0, 320.0));
 
             // History.
             let mut h = scene(Tab::Downloader, &|h| {

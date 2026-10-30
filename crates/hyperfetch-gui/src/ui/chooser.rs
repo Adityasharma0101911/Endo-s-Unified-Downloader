@@ -24,6 +24,8 @@ pub(super) fn chooser(app: &mut App, ui: &mut Ui) {
                     anim::spinner(ui, 14.0, p.muted);
                     ui.label(RichText::new("Reading the stream's tracks…").color(p.muted));
                 });
+                // Videos, then audio tracks: a heading and its options each.
+                skeleton(ui, &[(0.1, 0.0), (0.34, 0.0), (0.28, 0.0), (0.1, 0.0), (0.24, 0.0)]);
             }
             Some(Err(error)) => {
                 error_alert(ui, error);

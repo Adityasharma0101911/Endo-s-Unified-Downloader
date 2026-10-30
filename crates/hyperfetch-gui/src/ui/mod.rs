@@ -365,6 +365,26 @@ fn progress_bar(ui: &mut Ui, id: egui::Id, size: Vec2, ratio: f32, color: Color3
     response
 }
 
+/// Grey bars where the lines of something still being read will show, one light sweeping over
+/// them all: `rows` gives each line's bar as a share of the width, and the width of a second
+/// one at its right end (0.0: none), as for a size.
+fn skeleton(ui: &mut Ui, rows: &[(f32, f32)]) {
+    let p = palette(ui);
+    let line = ui.spacing().interact_size.y;
+    let (area, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), rows.len() as f32 * line), Sense::hover());
+    for (n, &(share, right)) in rows.iter().enumerate() {
+        let row = Rect::from_min_size(area.min + Vec2::new(0.0, n as f32 * line), Vec2::new(area.width(), line));
+        let bar = |left: f32, width: f32| Rect::from_min_size(Pos2::new(left, row.center().y - 5.0), Vec2::new(width, 10.0));
+        for bar in [bar(row.left(), share * row.width()), bar(row.right() - right, right)].into_iter().filter(|it| it.width() > 0.0) {
+            ui.painter().rect_filled(bar, 5.0, p.hover);
+            // Every row's light is at the same place: one light, seen through each bar.
+            let mut lit = ui.new_child(egui::UiBuilder::new().max_rect(row));
+            lit.set_clip_rect(bar.intersect(ui.clip_rect()));
+            anim::sheen(&lit, row);
+        }
+    }
+}
+
 /// A tinted strip: `glyph` and `text` on the left, the buttons `buttons` adds (right to left) on
 /// the right. Returns the text's response, for a tooltip. It drops in and fades in the first
 /// time its text shows, its icon popping.
