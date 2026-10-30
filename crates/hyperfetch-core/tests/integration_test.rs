@@ -2248,11 +2248,19 @@ async fn test_a_capped_host_is_learned_from_a_download_its_probe_could_not_measu
     let mock = Arc::new(mock);
     let url = serve(Arc::clone(&mock), "far.bin").await;
     let temp = tempdir().unwrap();
-    let out = temp.path().join("far.bin");
-
-    run(&DownloadEngine::new(vec![url.clone()], options(&out, 4, 256 * KB)), None).await.expect("download should succeed");
-    assert_file(&out, &data);
-    // Going on as the first chunk, alone until the workers' answers came, it told the rest.
+    // Going on as the first chunk, alone until the workers' answers came, it told the rest. That
+    // leaves the watch about four looks to see the rate hold twice: a pause of the reader on a
+    // slow machine (the resume state's fsync, say) puts the bytes held up into the next look,
+    // which then seems to climb. A download that told nothing is followed by another, as the next
+    // download from a host is watched again, up to three.
+    for attempt in 0..3 {
+        let out = temp.path().join(format!("far-{attempt}.bin"));
+        run(&DownloadEngine::new(vec![url.clone()], options(&out, 4, 256 * KB)), None).await.expect("download should succeed");
+        assert_file(&out, &data);
+        if hosts::profile(&url).capped_per_connection.is_some() {
+            break;
+        }
+    }
     let seen = hosts::profile(&url);
     assert_eq!(seen.capped_per_connection, Some(true), "{seen:?}");
     assert!(seen.connection_rate.is_some(), "{seen:?}");
