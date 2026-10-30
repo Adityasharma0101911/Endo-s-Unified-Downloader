@@ -453,6 +453,7 @@ fn status_badge(app: &App, item: &QueueItem, p: &Palette) -> (&'static str, Colo
         QueueItemStatus::Pausing => ("PAUSING", p.muted),
         QueueItemStatus::Paused => ("PAUSED", p.muted),
         QueueItemStatus::Completed => ("COMPLETED", p.green),
+        QueueItemStatus::Failed(_) if item.link_expired() => ("LINK EXPIRED", p.amber),
         QueueItemStatus::Failed(_) => ("FAILED", p.red),
         QueueItemStatus::AuthRequired => ("NEEDS AUTH", p.amber),
     }

@@ -7,6 +7,18 @@ use crate::slow::{self, Fix};
 
 const AUTH_REQUIRED: &str =
     "Authorization header not saved: enter it again under Advanced options, then Resume to continue from the partial file.";
+/// What the row of a download whose link expired says (see `QueueItem::link_expired`).
+const LINK_EXPIRED: &str = "Link expired: get a new link";
+
+/// The page `item` came from, to open: the referer it was sent with, when that is a link.
+fn page_of(item: &QueueItem) -> Option<&str> {
+    item.options.referer.as_deref().filter(|page| page.starts_with("https://") || page.starts_with("http://"))
+}
+
+/// Whether `item` is stopped and over plain links, so that it can take a new one.
+fn takes_new_link(item: &QueueItem) -> bool {
+    matches!(item.status, QueueItemStatus::Paused | QueueItemStatus::Failed(_)) && item.relinkable()
+}
 
 pub(super) fn download_details(app: &mut App, ui: &mut Ui, item: &QueueItem) {
     let p = palette(ui);
@@ -14,6 +26,22 @@ pub(super) fn download_details(app: &mut App, ui: &mut Ui, item: &QueueItem) {
     ui.add_space(6.0);
     let (status, color) = status_line(app, item, &p);
     ui.label(RichText::new(status).color(color));
+    if takes_new_link(item) {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let open = app.new_link.as_ref().is_some_and(|new_link| new_link.id == item.id);
+            let about = "Its link expired? Paste a fresh one to the same file: the download resumes where it stopped";
+            if !open && ui.add(button(format!("{} New link…", icon::LINK))).on_hover_text(about).clicked() {
+                app.new_link = Some(crate::NewLink::new(item.id));
+            }
+            if let Some(page) = page_of(item) {
+                if ui.add(button(format!("{} Open the page", icon::ARROW_SQUARE_OUT))).on_hover_text(page).clicked() {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(page));
+                }
+            }
+        });
+        new_link_box(app, ui, item);
+    }
     // While its bytes come in, it can tell what holds it back.
     if item.status == QueueItemStatus::Downloading && !app.is_resolving(item.id) && !item.is_finishing() {
         let open = egui::Id::new(("why slow", item.id));
@@ -47,6 +75,45 @@ pub(super) fn download_details(app: &mut App, ui: &mut Ui, item: &QueueItem) {
     }
     ui.add_space(12.0);
     throughput_graph(ui, item.id, view.map(|view| &view.speed_history), eased_speed(ui, item), live);
+}
+
+/// The New link box of stopped download `item`, when open: a fresh link to paste, checked to be
+/// the same file before it is taken (see `App::check_new_link`), and why one was refused.
+fn new_link_box(app: &mut App, ui: &mut Ui, item: &QueueItem) {
+    let p = palette(ui);
+    let Some(new_link) = app.new_link.as_mut().filter(|new_link| new_link.id == item.id) else { return };
+    let (mut check, mut cancel) = (false, false);
+    ui.add_space(8.0);
+    card(ui).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(bold("New link").color(p.strong));
+        let about = "A fresh link to the same file, from the page it came from. It is checked to be the same size first; the \
+                     download then resumes where it stopped.";
+        ui.label(RichText::new(about).small().color(p.muted));
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let width = (ui.available_width() - 190.0).max(120.0);
+            let field = egui::TextEdit::singleline(&mut new_link.text).hint_text("https://…").desired_width(width);
+            let field = ui.add_enabled(!new_link.checking, field);
+            if std::mem::take(&mut new_link.focus) {
+                field.request_focus();
+                field.scroll_to_me(Some(Align::Center));
+            }
+            let entered = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let label = if new_link.checking { "Checking…" } else { "Use this link" };
+            let ready = !new_link.checking && !new_link.text.trim().is_empty();
+            check = ui.add_enabled(ready, primary_button(label, p.accent)).clicked() || entered && ready;
+            cancel = ui.add(button("Cancel")).clicked();
+        });
+        if let Some(why) = &new_link.refused {
+            error_alert(ui, why);
+        }
+    });
+    if cancel {
+        app.new_link = None;
+    } else if check {
+        app.check_new_link();
+    }
 }
 
 /// What holds running download `item` back (see `slow::findings`), coming in one after another,
@@ -220,6 +287,9 @@ fn status_line(app: &App, item: &QueueItem, p: &Palette) -> (String, Color32) {
         QueueItemStatus::Completed => {
             let path = item.target_path.as_ref().map_or_else(|| item.filename.clone(), |p| p.display().to_string());
             (format!("Completed: {}", path), p.green)
+        }
+        QueueItemStatus::Failed(error) if item.link_expired() => {
+            (format!("{}. Its server refused the old one ({}), as it does once a link's time is up.", LINK_EXPIRED, error), p.amber)
         }
         QueueItemStatus::Failed(error) => (format!("Error: {}", error), p.red),
         QueueItemStatus::AuthRequired => (AUTH_REQUIRED.to_string(), p.amber),
@@ -484,10 +554,15 @@ enum RowAction {
     /// Moves it to this place of the list.
     MoveTo(usize),
     Priority(Priority),
+    /// Shows it with its New link box open (see `App::check_new_link`).
+    NewLink,
+    /// Opens the page it came from in the browser.
+    OpenPage,
 }
 
 /// The order and priority of `item`, the `index`th of `len` downloads: Download next, Move up and
-/// Move down, and for a waiting one its priority. Its row's ⋯ menu and right-click menu.
+/// Move down, and for a waiting one its priority; for a stopped one, New link… and the page it
+/// came from. Its row's ⋯ menu and right-click menu.
 fn order_menu(ui: &mut Ui, item: &QueueItem, index: usize, len: usize, action: &mut Option<(usize, RowAction)>) {
     let waiting = item.status == QueueItemStatus::Queued;
     let moves = [
@@ -508,6 +583,16 @@ fn order_menu(ui: &mut Ui, item: &QueueItem, index: usize, len: usize, action: &
         for (priority, name) in [(Priority::High, "High"), (Priority::Normal, "Normal"), (Priority::Low, "Low")] {
             if ui.selectable_label(item.priority == priority, name).clicked() {
                 *action = Some((item.id, RowAction::Priority(priority)));
+                ui.close_menu();
+            }
+        }
+    }
+    if takes_new_link(item) {
+        ui.separator();
+        let page = page_of(item).map(|_| (icon::ARROW_SQUARE_OUT, "Open the page", RowAction::OpenPage));
+        for (glyph, name, what) in std::iter::once((icon::LINK, "New link…", RowAction::NewLink)).chain(page) {
+            if ui.button(format!("{glyph} {name}")).clicked() {
+                *action = Some((item.id, what));
                 ui.close_menu();
             }
         }
@@ -806,7 +891,7 @@ fn queue_row(app: &App, ui: &mut Ui, line: &Line, action: &mut Option<(usize, Ro
             ui.add(name).on_hover_text(&item.filename);
         });
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let more = icon_button(ui, icon::DOTS_THREE_VERTICAL, "Order and priority", true);
+            let more = icon_button(ui, icon::DOTS_THREE_VERTICAL, "More: order, priority, new link", true);
             let menu = id.with("menu");
             if more.clicked() {
                 ui.memory_mut(|m| m.toggle_popup(menu));
@@ -830,6 +915,7 @@ fn queue_row(app: &App, ui: &mut Ui, line: &Line, action: &mut Option<(usize, Ro
     ui.add_space(2.0);
     ui.horizontal(|ui| {
         let (text, color) = match &item.status {
+            QueueItemStatus::Failed(_) if item.link_expired() => (LINK_EXPIRED.to_string(), p.amber),
             QueueItemStatus::Failed(error) => (truncate_chars(error, 200), p.red),
             QueueItemStatus::AuthRequired => ("Authorization header not saved: open Details to enter it again and resume".to_string(), p.amber),
             status => {
@@ -1043,6 +1129,15 @@ pub(super) fn queue_page(app: &mut App, ui: &mut Ui) {
         RowAction::Reveal => {
             if let Some(path) = target {
                 report(app, util::reveal_in_folder(&path));
+            }
+        }
+        RowAction::NewLink => {
+            app.show_job(id);
+            app.new_link = Some(crate::NewLink::new(id));
+        }
+        RowAction::OpenPage => {
+            if let Some(page) = app.queue.get_item(id).and_then(page_of) {
+                ui.ctx().open_url(egui::OpenUrl::new_tab(page));
             }
         }
         RowAction::Tracks => {
@@ -1369,6 +1464,101 @@ mod tests {
             h.leave();
             assert_eq!(h.frames(30), Duration::MAX, "and keeps still");
         }
+    }
+
+    /// A server of two files by the first segment of their path, as a download's probe asks for
+    /// them: `same/…`, of 1000 bytes, and `other/…`, of 2000. Its address.
+    fn sizes_server() -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/", listener.local_addr().unwrap());
+        // Two probes of a HEAD and a GET each, and room for retries.
+        std::thread::spawn(move || {
+            for mut socket in listener.incoming().take(16).flatten() {
+                let _ = socket.set_read_timeout(Some(Duration::from_secs(5)));
+                let (mut head, mut buf) = (Vec::new(), [0u8; 1024]);
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match socket.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => head.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&head);
+                let size = if head.contains(" /other/") { 2000 } else { 1000 };
+                let answer = if head.starts_with("HEAD ") {
+                    format!("HTTP/1.1 200 OK\r\nContent-Length: {size}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n")
+                } else {
+                    format!("HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-0/{size}\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx")
+                };
+                let _ = socket.write_all(answer.as_bytes());
+            }
+        });
+        base
+    }
+
+    /// A download whose link expired says so on its row, with New link… in its ⋯ menu. There a
+    /// link to a file of another size is refused, saying why, and nothing changes; one to the same
+    /// file is taken, its resume state keeps what was downloaded, and it resumes.
+    #[test]
+    fn an_expired_link_takes_a_new_one_once_it_is_the_same_file() {
+        use hyperfetch_core::state::DownloadState;
+        let mut h = Harness::new();
+        // Resumed, it fails at once instead of fetching anything.
+        h.app.engines = std::sync::Arc::new(|_: Vec<url::Url>, _: DownloadOptions| Err("not downloaded here".to_string()));
+        let server = sizes_server();
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("talk.mp4");
+        // What the engine left: 400 bytes of 1000, the link it had them from.
+        let old = "https://cdn.example/talk.mp4?sig=old";
+        let state_path = DownloadState::state_file_path(&dir.path().join("talk.mp4.part"));
+        std::fs::write(dir.path().join("talk.mp4.part"), [0u8; 1000]).unwrap();
+        let mut state = DownloadState::new("talk.mp4".into(), 1000, 256 << 10, vec![old.into()]);
+        state.completed_ranges.push(hyperfetch_core::range::ByteRange::new(0, 399).unwrap());
+        state.save_atomic(&state_path).unwrap();
+        let saved = std::fs::read(&state_path).unwrap();
+        let from_page = DownloadOptions { referer: Some("https://page.example/talk".into()), ..Default::default() };
+        let id = h.app.queue.add_item(vec![url::Url::parse(old).unwrap()], from_page);
+        h.app.queue.mark_started(id);
+        let snapshot = hyperfetch_core::engine::EngineSnapshot {
+            total_bytes: 1000,
+            downloaded_bytes: 400,
+            progress_ratio: 0.4,
+            target_path: Some(target.clone()),
+            ..Default::default()
+        };
+        h.app.queue.apply_snapshot(id, &snapshot);
+        h.app.queue.finish(id, Err(format!("{old}: HTTP 403 Forbidden")));
+        h.app.tab = Tab::Queue;
+        h.frames(5);
+        assert!(h.find(LINK_EXPIRED).is_some() && h.find("LINK EXPIRED").is_some(), "the row says so");
+
+        from_menu(&mut h, "talk.mp4", "New link…");
+        h.frames(20);
+        assert!(h.find("Open the page").is_some(), "the page it came from is known");
+        h.paste(&format!("{server}other/talk.mp4?sig=new"));
+        h.click("Use this link");
+        h.wait_for(|app| app.new_link.as_ref().is_some_and(|new_link| new_link.refused.is_some()));
+        h.frames(3);
+        let why = "This link is for a different file: 2.0 KiB, not 1000 bytes";
+        assert!(h.texts().iter().any(|(text, _)| text == why), "{:?}", h.texts());
+        let item = h.app.queue.get_item(id).unwrap();
+        assert!(item.link_expired() && item.urls[0].as_str() == old, "nothing changes");
+        assert_eq!(std::fs::read(&state_path).unwrap(), saved);
+
+        let fresh = format!("{server}same/renamed.mp4?sig=new");
+        h.app.new_link.as_mut().unwrap().text = fresh.clone();
+        h.frames(2);
+        h.click("Use this link");
+        h.wait_for(|app| app.new_link.is_none());
+        let item = h.app.queue.get_item(id).unwrap().clone();
+        assert_eq!(item.urls, [url::Url::parse(&fresh).unwrap()]);
+        assert_eq!((item.options.output_path.as_deref(), item.downloaded_bytes), (Some(target.as_path()), 400), "into its own file");
+        let state = DownloadState::load_from_path(&state_path).unwrap().unwrap();
+        assert!(state.mirrors.contains(&fresh) && state.completed_ranges.len() == 1, "{:?}", state.mirrors);
+        assert!(matches!(&h.app.notice, Some(Ok(notice)) if notice.starts_with("New link taken")), "{:?}", h.app.notice);
+        // It resumed: the stand-in engine fails it at once.
+        h.wait_for(|app| app.queue.get_item(id).unwrap().status == QueueItemStatus::Failed("not downloaded here".to_string()));
+        h.wait_for_background();
     }
 
     /// The queue's file names, top to bottom.

@@ -2,8 +2,10 @@
 //! app, `POST /add` adds a download with what the browser sent to fetch it, `POST /info` tells
 //! what a media link holds (see `media::info`), and the `/record/…` routes take the video the
 //! extension records from a page (see `recording`). `POST /show` shows the window: a second
-//! launch asks it (see [`running_instance`]). Every route answers only the extension and local
-//! programs, which send no web `Origin`; web pages get 403.
+//! launch asks it (see [`running_instance`]). `POST /expired` lists the downloads whose link
+//! expired, and `POST /relink` gives one a new link the extension found (see [`Expired`]). Every
+//! route answers only the extension and local programs, which send no web `Origin`; web pages get
+//! 403.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -11,6 +13,8 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use eframe::egui;
+use hyperfetch_core::engine::DownloadOptions;
+use hyperfetch_core::queue::DownloadQueue;
 use hyperfetch_core::{engine, media, updater};
 use serde_json::json;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -34,7 +38,7 @@ const MAX_HEAD: usize = 64 * 1024;
 /// cookie jar), of a recording chunk, and of any other request.
 const MAX_ADD_BODY: usize = 4 << 20;
 const MAX_CHUNK_BODY: usize = 64 << 20;
-/// Largest body of `POST /info`: a link and a site's cookie jar.
+/// Largest body of `POST /info` and `POST /relink`: a link and a site's cookie jar.
 const MAX_INFO_BODY: usize = 256 << 10;
 const MAX_BODY: usize = 64 * 1024;
 /// Largest playlist a page built itself that `/add` takes.
@@ -45,6 +49,8 @@ const MAX_JAR_COOKIES: usize = 500;
 const MAX_BATCH: usize = 1000;
 /// How long a connection may take to send its request, so a stalled client never holds a task.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long `/relink` waits for the new link's server to tell what it serves.
+const RELINK_LIMIT: Duration = Duration::from_secs(40);
 /// Request headers of the browser's that a download does not send: the engine sets them per
 /// request (Range, Accept-Encoding, …), they belong to the browser's connection, or they reach
 /// the download another way (Cookie, Referer). `sec-fetch-*` goes too.
@@ -235,6 +241,23 @@ impl RemoteAddPayload {
     /// None when neither holds a usable cookie.
     pub fn cookies_file(&self, url: &Url) -> Option<String> {
         jar_file_text(&self.cookie_jar).or_else(|| cookies_file_text(url, self.cookies.as_deref()?))
+    }
+
+    /// `options` with the browser's request for `url` in place of what they were made with: its
+    /// headers, Authorization header, referer and cookies (see [`RemoteAddPayload::cookies_file`]),
+    /// the sign-in a new link of an expired download may need.
+    pub fn sign_in(&self, url: &Url, mut options: DownloadOptions) -> DownloadOptions {
+        let (headers, auth) = self.request_headers();
+        if !headers.is_empty() {
+            options.headers = headers;
+        }
+        options.auth_header = auth.or(options.auth_header);
+        options.referer = self.referer().or(options.referer);
+        if let Some(path) = self.cookies_file(url).and_then(|text| save_cookies(url, &text)) {
+            options.cookies_path = Some(path);
+            options.browser_cookies = None;
+        }
+        options
     }
 
     /// The downloads of a batch, one per link of `urls`: each with the page's referer and
@@ -466,6 +489,34 @@ impl Server {
                 }
                 Err(e) => Response::error("400 Bad Request", allow_origin.clone(), &e),
             },
+            // POST, not GET: a browser sends a web page's POST with its Origin, even to its own
+            // host, so that no page can read the list (see `admit`).
+            ("POST", "/expired") => {
+                let listed = |e: &Expired| json!({"id": e.id, "name": e.name, "size": e.size, "host": e.host, "page": e.page});
+                let downloads: Vec<serde_json::Value> = lock(&EXPIRED).iter().map(listed).collect();
+                reply("200 OK", json!({"downloads": downloads}))
+            }
+            // A new link for a download whose link expired, taken once it is checked to be the
+            // same file; with the browser's request for it, as `/add` takes it.
+            ("POST", "/relink") => match parse_relink(&body) {
+                Ok((id, url, payload)) => {
+                    let expired = lock(&EXPIRED).iter().find(|e| e.id == id).cloned();
+                    let Some(expired) = expired else {
+                        return Response::error("404 Not Found", allow_origin.clone(), "no download waits for a new link under that id");
+                    };
+                    let options = payload.sign_in(&url, expired.options.clone());
+                    let check = check_link(expired.target.clone(), expired.size, url.clone(), options.clone());
+                    match tokio::time::timeout(RELINK_LIMIT, check).await {
+                        Ok(Ok(())) => {
+                            self.send(AppEvent::Relinked { id, urls: vec![url], options, result: Ok(()) });
+                            reply("200 OK", json!({"status": "resuming", "name": expired.name}))
+                        }
+                        Ok(Err(why)) => Response::error("422 Unprocessable Entity", allow_origin.clone(), &why),
+                        Err(_) => Response::error("504 Gateway Timeout", allow_origin.clone(), "the new link did not answer in time"),
+                    }
+                }
+                Err(e) => Response::error("400 Bad Request", allow_origin.clone(), &e),
+            },
             ("POST", "/record/start") => {
                 #[derive(Default, serde::Deserialize)]
                 #[serde(default)]
@@ -520,6 +571,53 @@ impl Server {
             },
             _ => Response::error("404 Not Found", allow_origin.clone(), "not found"),
         }
+    }
+}
+
+/// A download whose link expired (see `QueueItem::link_expired`): as `POST /expired` lists it, for
+/// the extension to find it a new link where it came from, and what `POST /relink` checks one by.
+#[derive(Clone)]
+pub struct Expired {
+    id: usize,
+    name: String,
+    size: u64,
+    host: String,
+    /// The page it came from: the referer it was sent with, when that is a link.
+    page: Option<String>,
+    target: Option<PathBuf>,
+    options: DownloadOptions,
+}
+
+/// The downloads whose link expired, as the queue last had them (see [`set_expired`]).
+static EXPIRED: Mutex<Vec<Expired>> = Mutex::new(Vec::new());
+
+/// Keeps the downloads of `queue` whose link expired, as they are now, for `/expired` and `/relink`.
+pub fn set_expired(queue: &DownloadQueue) {
+    let expired = queue.items().iter().filter(|item| item.link_expired()).map(|item| Expired {
+        id: item.id,
+        name: item.filename.clone(),
+        size: item.total_bytes,
+        host: item.urls.first().and_then(Url::host_str).unwrap_or_default().to_string(),
+        page: item.options.referer.clone().filter(|page| http_link(page)),
+        target: item.target_path.clone(),
+        options: item.options.clone(),
+    });
+    *lock(&EXPIRED) = expired.collect();
+}
+
+/// Whether `url` links to the file of the download of `size` bytes saved as `target`, asked with
+/// `options` (see `relink::relink`, which then records it in the download's resume state).
+#[cfg(not(test))]
+async fn check_link(target: Option<PathBuf>, size: u64, url: Url, options: DownloadOptions) -> Result<(), String> {
+    hyperfetch_core::relink::relink(target, size, vec![url], options).await
+}
+
+/// A stand-in for `relink::relink` that asks no server: a link to `other.example` is another file.
+#[cfg(test)]
+async fn check_link(_: Option<PathBuf>, size: u64, url: Url, _: DownloadOptions) -> Result<(), String> {
+    match url.host_str() {
+        Some("other.example") => Err(format!("This link is for a different file: 812.0 MiB, not {} bytes", size)),
+        _ => Ok(()),
     }
 }
 
@@ -584,6 +682,22 @@ fn parse_info(body: &[u8]) -> Result<(Url, RemoteAddPayload), String> {
     let payload: RemoteAddPayload = serde_json::from_slice(body).map_err(|e| format!("invalid JSON: {}", e))?;
     match Url::parse(payload.url.trim()) {
         Ok(url) if matches!(url.scheme(), "http" | "https") => Ok((url, payload)),
+        _ => Err("url must be an http or https link".to_string()),
+    }
+}
+
+/// The new link `body` gives a download whose link expired (`POST /relink`): JSON with its `id`,
+/// an http(s) `url` and the browser's request for it as `/add` takes it. Else why it is refused.
+fn parse_relink(body: &[u8]) -> Result<(usize, Url, RemoteAddPayload), String> {
+    #[derive(serde::Deserialize)]
+    struct Relink {
+        id: usize,
+        #[serde(flatten)]
+        payload: RemoteAddPayload,
+    }
+    let Relink { id, payload } = serde_json::from_slice(body).map_err(|e| format!("invalid JSON: {}", e))?;
+    match Url::parse(payload.url.trim()) {
+        Ok(url) if matches!(url.scheme(), "http" | "https") => Ok((id, url, payload)),
         _ => Err("url must be an http or https link".to_string()),
     }
 }
@@ -663,7 +777,7 @@ fn admit(method: &str, path: &str, origin: Option<&str>) -> Result<(Option<Strin
     }
     let max_body = match path {
         "/add" => MAX_ADD_BODY,
-        "/info" => MAX_INFO_BODY,
+        "/info" | "/relink" => MAX_INFO_BODY,
         _ if record_route(path).is_some_and(|(_, action)| action == "chunk") => MAX_CHUNK_BODY,
         _ => MAX_BODY,
     };
@@ -758,6 +872,8 @@ mod tests {
         assert_eq!(admit("POST", "/add", None), Ok((None, MAX_ADD_BODY)));
         assert_eq!(admit("GET", "/ping", None), Ok((None, MAX_BODY)));
         assert_eq!(admit("POST", "/info", None), Ok((None, MAX_INFO_BODY)));
+        assert_eq!(admit("POST", "/relink", Some("moz-extension://1234")), Ok((Some("moz-extension://1234".to_string()), MAX_INFO_BODY)));
+        assert_eq!(admit("POST", "/expired", None), Ok((None, MAX_BODY)));
         let extension = "chrome-extension://abcdefghijklmnop";
         assert_eq!(admit("GET", "/ping", Some(extension)), Ok((Some(extension.to_string()), MAX_BODY)));
         assert!(admit("POST", "/record/start", Some("moz-extension://1234")).is_ok());
@@ -766,6 +882,10 @@ mod tests {
         for (method, path, origin) in [
             ("POST", "/add", "https://page.example"),
             ("POST", "/info", "https://page.example"),
+            ("POST", "/expired", "https://page.example"),
+            ("POST", "/expired", "http://127.0.0.1:49152"),
+            ("POST", "/relink", "https://page.example"),
+            ("POST", "/relink", "null"),
             ("GET", "/ping", "https://page.example"),
             ("POST", "/record/start", "null"),
             ("POST", "/record/a1/chunk", "http://127.0.0.1:8000"),
@@ -921,6 +1041,67 @@ mod tests {
         let too_big = format!("POST /info HTTP/1.1\r\nContent-Length: {}\r\n\r\n", MAX_INFO_BODY + 1);
         assert_eq!(parts(&exchange(&server, too_big.as_bytes()).await).0, "HTTP/1.1 413 Payload Too Large");
         assert!(received.try_recv().is_err(), "nothing is added");
+    }
+
+    /// `/expired` lists the downloads whose link expired, to the extension alone. `/relink` gives
+    /// one a new link once it is checked (here by a stand-in, see `check_link`), which the app then
+    /// takes with the browser's request; another file, an id that waits for none, a link that is no
+    /// http(s) one, a page or too big a body is refused, and nothing reaches the app.
+    #[tokio::test]
+    async fn expired_downloads_are_listed_and_take_a_new_link_from_the_extension() {
+        let root = tempfile::tempdir().unwrap();
+        let (server, received) = server(root.path());
+        let ext = Some("chrome-extension://abc");
+        let mut queue = DownloadQueue::new();
+        let from_page = DownloadOptions { referer: Some("https://page.example/watch".into()), ..Default::default() };
+        let id = queue.add_item(vec![Url::parse("https://cdn.example/v/a.mp4?token=old").unwrap()], from_page);
+        let running = queue.add_item(vec![Url::parse("https://cdn.example/v/b.mp4").unwrap()], DownloadOptions::default());
+        queue.mark_started(id);
+        let target = Some(root.path().join("a.mp4"));
+        queue.apply_snapshot(id, &engine::EngineSnapshot { total_bytes: 1000, downloaded_bytes: 400, target_path: target, ..Default::default() });
+        queue.finish(id, Err("https://cdn.example/v/a.mp4?token=old: HTTP 403 Forbidden".into()));
+        queue.mark_started(running);
+        set_expired(&queue);
+
+        let response = exchange(&server, &request("POST", "/expired", ext, Some(b""))).await;
+        let listed = json!({"downloads": [{"id": id, "name": "a.mp4", "size": 1000, "host": "cdn.example", "page": "https://page.example/watch"}]});
+        assert_eq!(parts(&response), ("HTTP/1.1 200 OK", listed));
+        assert!(response.contains("Access-Control-Allow-Origin: chrome-extension://abc\r\n"), "{response}");
+        let response = exchange(&server, &request("POST", "/expired", Some("https://page.example"), Some(b""))).await;
+        assert_eq!(parts(&response), ("HTTP/1.1 403 Forbidden", json!({"error": "forbidden origin"})));
+        assert_eq!(parts(&exchange(&server, &request("GET", "/expired", ext, None)).await).0, "HTTP/1.1 404 Not Found", "POST only");
+
+        let relink = |body: serde_json::Value, origin: Option<&'static str>| {
+            let sent = request("POST", "/relink", origin, Some(body.to_string().as_bytes()));
+            let server = &server;
+            async move { exchange(server, &sent).await }
+        };
+        let fresh = "https://cdn2.example/v/a.mp4?token=new";
+        let response = relink(json!({"id": id, "url": fresh}), Some("https://page.example")).await;
+        assert_eq!(parts(&response).0, "HTTP/1.1 403 Forbidden");
+        for (body, status) in [
+            (json!({"id": id, "url": "ftp://cdn.example/a.mp4"}), "HTTP/1.1 400 Bad Request"),
+            (json!({"url": fresh}), "HTTP/1.1 400 Bad Request"),
+            (json!({"id": running, "url": fresh}), "HTTP/1.1 404 Not Found"),
+            (json!({"id": 999, "url": fresh}), "HTTP/1.1 404 Not Found"),
+        ] {
+            assert_eq!(parts(&relink(body.clone(), ext).await).0, status, "{body}");
+        }
+        let response = relink(json!({"id": id, "url": "https://other.example/a.mp4"}), ext).await;
+        let why = json!({"error": "This link is for a different file: 812.0 MiB, not 1000 bytes"});
+        assert_eq!(parts(&response), ("HTTP/1.1 422 Unprocessable Entity", why));
+        assert!(response.contains("Access-Control-Allow-Origin: chrome-extension://abc\r\n"), "the extension may read why: {response}");
+        let too_big = format!("POST /relink HTTP/1.1\r\nContent-Length: {}\r\n\r\n", MAX_INFO_BODY + 1);
+        assert_eq!(parts(&exchange(&server, too_big.as_bytes()).await).0, "HTTP/1.1 413 Payload Too Large");
+        assert!(received.try_recv().is_err(), "nothing refused reaches the app");
+
+        let body = json!({"id": id, "url": fresh, "referer": "https://page.example/watch?again", "user_agent": "Mozilla/5.0 Test", "headers": {"X-Token": "t2"}});
+        let response = relink(body, ext).await;
+        assert_eq!(parts(&response), ("HTTP/1.1 200 OK", json!({"status": "resuming", "name": "a.mp4"})));
+        let Ok(AppEvent::Relinked { id: taken, urls, options, result }) = received.try_recv() else { panic!("the new link reaches the app") };
+        assert_eq!((taken, urls, result), (id, vec![Url::parse(fresh).unwrap()], Ok(())));
+        assert_eq!(options.referer.as_deref(), Some("https://page.example/watch?again"));
+        assert!(options.headers.contains(&("X-Token".to_string(), "t2".to_string())), "{:?}", options.headers);
     }
 
     /// `/add`'s `media`: every field optional, each value from its list, at most 10 clips within

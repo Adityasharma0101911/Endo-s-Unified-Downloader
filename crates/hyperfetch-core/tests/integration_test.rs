@@ -230,14 +230,7 @@ impl Drop for ActiveGuard<'_> {
 /// remembers what each host (scheme, host and port) was seen to do, which must not carry over
 /// from one test's mock to another's.
 async fn serve(mock: Arc<Mock>, file: &str) -> Url {
-    static NEXT_PORT: AtomicU16 = AtomicU16::new(20_000);
-    let listener = loop {
-        let port = NEXT_PORT.fetch_add(1, Ordering::SeqCst);
-        assert!(port < 32_768, "out of ports below the ephemeral range");
-        if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)).await {
-            break listener;
-        }
-    };
+    let listener = unseen_listener().await;
     let url = Url::parse(&format!("http://{}/{}", listener.local_addr().unwrap(), file)).unwrap();
     tokio::spawn(async move {
         while let Ok((socket, _)) = listener.accept().await {
@@ -245,6 +238,18 @@ async fn serve(mock: Arc<Mock>, file: &str) -> Url {
         }
     });
     url
+}
+
+/// A listener on a port no earlier one in this process had (see [`serve`]).
+async fn unseen_listener() -> TcpListener {
+    static NEXT_PORT: AtomicU16 = AtomicU16::new(20_000);
+    loop {
+        let port = NEXT_PORT.fetch_add(1, Ordering::SeqCst);
+        assert!(port < 32_768, "out of ports below the ephemeral range");
+        if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)).await {
+            return listener;
+        }
+    }
 }
 
 async fn read_head(socket: &mut TcpStream) -> Option<String> {
@@ -4324,5 +4329,145 @@ async fn test_streaming_video_cdn_and_html_tag_resolution() {
     let url = candidate.unwrap();
     assert!(url.as_str().contains("cloudatacdn.com"));
     assert!(url.as_str().contains("hxuat4j6gm~tPjDFEERXb"));
+}
+
+/// What [`serve_signed`] sent under one link (`old`, `new` or `other`), past the probes: body bytes,
+/// and the ranges asked for.
+#[derive(Default)]
+struct Served {
+    bytes: u64,
+    ranges: Vec<ByteRange>,
+}
+
+/// A CDN's signed links to `data`: `/old/…` serves it until its first GET past the probes, then
+/// answers everything with 403, as a link that expired (each after a pause, so that the probe's start
+/// is in before the download fails); `/new/…` serves it at a fresh link, with another ETag (another
+/// edge); `/other/…` is another, larger file. What each served past the probes is counted.
+async fn serve_signed(data: Vec<u8>) -> (Url, Arc<Mutex<std::collections::HashMap<String, Served>>>) {
+    let listener = unseen_listener().await;
+    let base = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+    let served: Arc<Mutex<std::collections::HashMap<String, Served>>> = Arc::default();
+    let (data, expired, counts) = (Arc::new(data), Arc::new(std::sync::atomic::AtomicBool::new(false)), Arc::clone(&served));
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let (data, expired, counts) = (Arc::clone(&data), Arc::clone(&expired), Arc::clone(&counts));
+            tokio::spawn(async move {
+                let Some(head) = read_head(&mut socket).await else { return };
+                let mut line = head.lines().next().unwrap_or("").split(' ');
+                let (method, target) = (line.next().unwrap_or("").to_string(), line.next().unwrap_or("/").to_string());
+                let link = target.trim_start_matches('/').split('/').next().unwrap_or("").to_string();
+                let range = head.lines().skip(1).find_map(|l| {
+                    let (name, value) = l.split_once(':')?;
+                    name.trim().eq_ignore_ascii_case("range").then(|| value.trim().to_string())
+                });
+                let probe = range.as_deref() == Some("bytes=0-0") || range == Some(format!("bytes=0-{}", PREFETCH - 1));
+                if link == "old" && expired.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    let _ = socket.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                    return;
+                }
+                let body: Vec<u8> = if link == "other" { (0..2 * data.len()).map(|i| (i % 7) as u8).collect() } else { data.to_vec() };
+                let (len, etag) = (body.len(), if link == "new" { "\"edge-b\"" } else { "\"edge-a\"" });
+                let head = |status: &str, extra: String, length: usize| {
+                    format!("HTTP/1.1 {status}\r\nContent-Length: {length}\r\n{extra}Accept-Ranges: bytes\r\nETag: {etag}\r\nConnection: close\r\n\r\n")
+                };
+                if method == "HEAD" {
+                    let _ = socket.write_all(head("200 OK", String::new(), len).as_bytes()).await;
+                    return;
+                }
+                let asked = range.as_deref().and_then(|r| r.strip_prefix("bytes=")?.split_once('-')).and_then(|(a, b)| {
+                    let end = if b.is_empty() { len - 1 } else { b.parse::<usize>().ok()?.min(len - 1) };
+                    Some((a.parse::<usize>().ok()?, end))
+                });
+                let (start, end) = asked.unwrap_or((0, len - 1));
+                let answer = match asked {
+                    Some(_) => head("206 Partial Content", format!("Content-Range: bytes {start}-{end}/{len}\r\n"), end + 1 - start),
+                    None => head("200 OK", String::new(), len),
+                };
+                if !probe {
+                    let mut counts = counts.lock().unwrap();
+                    let seen = counts.entry(link.clone()).or_default();
+                    seen.bytes += (end + 1 - start) as u64;
+                    seen.ranges.push(ByteRange::new(start as u64, end as u64).unwrap());
+                }
+                if socket.write_all(answer.as_bytes()).await.is_ok() {
+                    let _ = socket.write_all(&body[start..=end]).await;
+                }
+                // The link expires once the download is under way.
+                if link == "old" && !probe {
+                    expired.store(true, Ordering::SeqCst);
+                }
+            });
+        }
+    });
+    (base, served)
+}
+
+/// A download whose signed link expires once it is under way (403 on its range requests) fails
+/// marked "link expired"; a new link to a file of another size is refused with both sizes and
+/// changes nothing on disk; a new link to the same file (another name, another edge's ETag) is
+/// taken, and the download resumes through it into its own file, fetching only what it lacked.
+#[tokio::test]
+async fn test_an_expired_link_is_swapped_and_the_download_resumes_where_it_was() {
+    use hyperfetch_core::queue::DownloadQueue;
+    use hyperfetch_core::relink;
+
+    let _history = setup().await;
+    let size = PREFETCH + 1024 * KB;
+    let data = payload(size, 61);
+    let (base, served) = serve_signed(data.clone()).await;
+    let temp = tempdir().unwrap();
+    // Saved into the folder under the server's name, as the app saves a link.
+    let opts = options(temp.path(), 1, 256 * KB);
+    let mut queue = DownloadQueue::new();
+    let old = base.join("old/signed.bin?sig=1").unwrap();
+    let id = queue.add_item(vec![old.clone()], opts.clone());
+    queue.mark_started(id);
+
+    let engine = DownloadEngine::new(vec![old], opts);
+    let (tx, mut rx) = broadcast::channel::<EngineSnapshot>(1024);
+    let error = run(&engine, Some(tx)).await.expect_err("the expired link fails the download");
+    assert!(relink::refused(&error), "{error}");
+    loop {
+        match rx.try_recv() {
+            Ok(snapshot) => queue.apply_snapshot(id, &snapshot),
+            Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+            Err(_) => break,
+        }
+    }
+    queue.finish(id, Err(error));
+    let item = queue.get_item(id).unwrap().clone();
+    assert!(item.link_expired(), "{:?} after {} bytes", item.status, item.downloaded_bytes);
+    let target = temp.path().join("signed.bin");
+    assert_eq!(item.target_path.as_deref(), Some(target.as_path()));
+    let (part, state_path) = (part_of(&target), DownloadState::state_file_path(&part_of(&target)));
+    let state = DownloadState::load_from_path(&state_path).unwrap().unwrap();
+    let done = merge_ranges(state.completed_ranges.clone());
+    let done_bytes: u64 = done.iter().map(ByteRange::len).sum();
+    assert!(done_bytes >= PREFETCH as u64 && done_bytes < size as u64, "the probe's start and the range served: {done:?}");
+    let (part_bytes, state_bytes) = (std::fs::read(&part).unwrap(), std::fs::read(&state_path).unwrap());
+
+    // Another file: refused, saying why, and nothing on disk or in the queue changes.
+    let other = base.join("other/signed.bin?sig=2").unwrap();
+    let why = relink::relink(item.target_path.clone(), item.total_bytes, vec![other], item.options.clone()).await.unwrap_err();
+    assert_eq!(why, "This link is for a different file: 4.0 MiB, not 2.0 MiB");
+    assert_eq!((std::fs::read(&part).unwrap(), std::fs::read(&state_path).unwrap()), (part_bytes, state_bytes));
+    assert!(queue.get_item(id).unwrap().link_expired());
+
+    // The same file at a new link of another name: taken, and the download resumes into its file.
+    let new = base.join("new/renamed.bin?sig=3").unwrap();
+    relink::relink(item.target_path.clone(), item.total_bytes, vec![new.clone()], item.options.clone()).await.expect("the same file");
+    assert!(queue.relink(id, vec![new.clone()], item.options.clone()));
+    let item = queue.get_item(id).unwrap().clone();
+    assert_eq!(item.urls, vec![new]);
+    let engine = DownloadEngine::new(item.urls.clone(), item.options.clone());
+    let path = run(&engine, None).await.expect("the download resumes through the new link");
+    assert_eq!(path, target);
+    assert_file(&target, &data);
+    assert_no_leftovers(&target);
+    let served = served.lock().unwrap();
+    let fresh = &served["new"];
+    assert_eq!(fresh.bytes, size as u64 - done_bytes, "only what was missing: {:?}", fresh.ranges);
+    assert!(fresh.ranges.iter().all(|range| done.iter().all(|had| !range.intersects(had))), "{:?}", fresh.ranges);
 }
 

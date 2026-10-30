@@ -686,6 +686,16 @@ impl DownloadEngine {
         self.cancel_token.cancel();
     }
 
+    /// What the server of the first link tells of its file, asked as a download's probe asks
+    /// (with the download's sign-in, headers, cookies and proxy), without downloading it: what a
+    /// new link is checked by (see `crate::relink`).
+    pub async fn probe(&self) -> Result<crate::relink::RemoteFile, String> {
+        let client = self.client.clone()?;
+        let url = self.urls.first().ok_or_else(|| "no link to ask".to_string())?;
+        let (info, _) = probe_url(&client, self.auth.as_deref(), url, false, self.options.max_connections_per_host).await?;
+        Ok(crate::relink::RemoteFile { size: info.size, accepts_ranges: info.accepts_ranges, etag: info.etag, last_modified: info.last_modified })
+    }
+
     /// Downloads the engine's URLs and returns the path of the finished file, adding the
     /// options' `archive_lines` to the download archive once it is (not for a recording stopped
     /// early: it is not the whole of it). A download that fails on a server refusing HTTP/1.1
@@ -5597,7 +5607,7 @@ fn too_large(max: u64, size: Option<u64>) -> String {
 }
 
 /// `bytes` for a message: "900 bytes", "1.5 MiB".
-fn size_text(bytes: u64) -> String {
+pub(crate) fn size_text(bytes: u64) -> String {
     let (mut value, mut unit) = (bytes as f64, 0);
     while value >= 1024.0 && unit < 4 {
         (value, unit) = (value / 1024.0, unit + 1);
