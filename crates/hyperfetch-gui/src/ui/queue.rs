@@ -1,6 +1,6 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use hyperfetch_core::queue::Remaining;
+use hyperfetch_core::queue::{Priority, Remaining};
 
 use super::*;
 
@@ -413,6 +413,39 @@ enum RowAction {
     Reveal,
     /// Shows the download with its track chooser open (see `App::list_tracks`).
     Tracks,
+    /// Puts it first among the waiting downloads (see `DownloadQueue::download_next`).
+    Next,
+    /// Moves it to this place of the list.
+    MoveTo(usize),
+    Priority(Priority),
+}
+
+/// The order and priority of `item`, the `index`th of `len` downloads: Download next, Move up and
+/// Move down, and for a waiting one its priority. Its row's ⋯ menu and right-click menu.
+fn order_menu(ui: &mut Ui, item: &QueueItem, index: usize, len: usize, action: &mut Option<(usize, RowAction)>) {
+    let waiting = item.status == QueueItemStatus::Queued;
+    let moves = [
+        (waiting, icon::ARROW_LINE_UP, "Download next", RowAction::Next),
+        (index > 0, icon::ARROW_UP, "Move up", RowAction::MoveTo(index.saturating_sub(1))),
+        (index + 1 < len, icon::ARROW_DOWN, "Move down", RowAction::MoveTo(index + 1)),
+    ];
+    // Download next only where it applies; the others greyed out at the ends.
+    for (enabled, glyph, name, what) in moves.into_iter().filter(|&(enabled, _, name, _)| enabled || name != "Download next") {
+        if ui.add_enabled(enabled, egui::Button::new(format!("{glyph} {name}"))).clicked() {
+            *action = Some((item.id, what));
+            ui.close_menu();
+        }
+    }
+    if waiting {
+        ui.separator();
+        ui.label(RichText::new("Priority: which waiting download starts first").small().color(palette(ui).muted));
+        for (priority, name) in [(Priority::High, "High"), (Priority::Normal, "Normal"), (Priority::Low, "Low")] {
+            if ui.selectable_label(item.priority == priority, name).clicked() {
+                *action = Some((item.id, RowAction::Priority(priority)));
+                ui.close_menu();
+            }
+        }
+    }
 }
 
 /// Height of one queue row: every row has the same, so only the rows in view are laid out.
@@ -494,11 +527,24 @@ struct Rows {
     revision: u64,
     items: Vec<QueueItem>,
     ghosts: Vec<Ghost>,
+    /// Rows that changed places: id, how many rows below its new place it was (above it when
+    /// negative), and when.
+    moves: Vec<(usize, f32, f64)>,
+}
+
+/// How long a row that changed places takes to glide to its new one.
+const GLIDE: f64 = 0.3;
+
+/// How many rows below its place (above it when negative) row `id` still shows while it glides
+/// there (see [`Rows::moves`]).
+fn glide(moves: &[(usize, f32, f64)], id: usize, now: f64) -> f32 {
+    moves.iter().find(|m| m.0 == id).map_or(0.0, |&(_, from, since)| from * (1.0 - anim::ease(((now - since) / GLIDE) as f32)))
 }
 
 /// Notes what changed since the list was drawn on the frame before (`pass - 1`): removed
-/// downloads become ghosts, and the ids returned are new. A list that was not drawn then (the
-/// page just opened) starts over: nothing is new or removed. No ghosts under Reduce motion.
+/// downloads become ghosts, rows that changed places glide there from where they showed, and the
+/// ids returned are new. A list that was not drawn then (the page just opened) starts over:
+/// nothing is new, removed or moved. No ghosts or glides under Reduce motion.
 fn track(rows: &mut Rows, items: &[QueueItem], revision: u64, pass: u64, now: f64, reduced: bool) -> Vec<usize> {
     let continuous = rows.pass.is_some_and(|last| last + 1 == pass);
     let mut new = Vec::new();
@@ -510,12 +556,23 @@ fn track(rows: &mut Rows, items: &[QueueItem], revision: u64, pass: u64, now: f6
                 rows.ghosts.push(Ghost { item: item.clone(), index, since: now });
             }
             new = items.iter().map(|item| item.id).filter(|id| !old.contains(id)).collect();
+            // Places among the rows there before and still: rows that come or go move none.
+            let was: HashMap<usize, usize> =
+                rows.items.iter().filter(|item| ids.contains(&item.id)).enumerate().map(|(place, item)| (item.id, place)).collect();
+            for (place, item) in items.iter().filter(|item| old.contains(&item.id)).enumerate() {
+                if was[&item.id] != place {
+                    let from = was[&item.id] as f32 - place as f32 + glide(&rows.moves, item.id, now);
+                    rows.moves.retain(|m| m.0 != item.id);
+                    rows.moves.push((item.id, from, now));
+                }
+            }
         }
         rows.items = items.to_vec();
         rows.revision = revision;
     }
     rows.pass = Some(pass);
     rows.ghosts.retain(|ghost| !reduced && now - ghost.since < GHOST);
+    rows.moves.retain(|&(_, _, since)| !reduced && now - since < GLIDE);
     new
 }
 
@@ -526,13 +583,14 @@ struct Line<'a> {
     ghost: Option<f32>,
     /// Added since the frame before: it fades in.
     new: bool,
-    /// How many rows down it still is while ghosts above it close their gap (see [`GHOST`]).
+    /// How many rows down it still is while ghosts above it close their gap (see [`GHOST`]), or
+    /// it glides to a new place (see [`GLIDE`]).
     drop: f32,
 }
 
-/// The lines of the list: `items`, ghosts fading out where they were, and the rows under a ghost
-/// closing its gap pushed down by what is left of it; and how many rows of gap are still closing
-/// under the last line.
+/// The lines of the list: `items`, ghosts fading out where they were, the rows under a ghost
+/// closing its gap pushed down by what is left of it, and rows that changed places on their way;
+/// and how many rows of gap are still closing under the last line.
 // ponytail: ghosts of separate removals less than GHOST apart may land a row off; placing them
 // by their neighbours would be exact.
 fn lines<'a>(items: &'a [QueueItem], rows: &'a Rows, new: &[usize], now: f64) -> (Vec<Line<'a>>, f32) {
@@ -555,7 +613,7 @@ fn lines<'a>(items: &'a [QueueItem], rows: &'a Rows, new: &[usize], now: f64) ->
             true
         }
         None => {
-            line.drop = drop;
+            line.drop = drop + glide(&rows.moves, line.item.id, now);
             true
         }
     });
@@ -603,9 +661,11 @@ fn status_icon(ui: &mut Ui, item: &QueueItem, waiting: bool, stalled: bool, colo
 
 /// One line of the queue list: the row of `line.item`, with its status, name and buttons, then
 /// progress, speed, time left, peers and notes; or why it failed (in full on hover), or why one
-/// restored without its Authorization header waits. A click selects it, a double click shows it.
-/// It fades in when new and out as a ghost, flashes green on completion and shakes on failure.
-fn queue_row(app: &App, ui: &mut Ui, line: &Line, action: &mut Option<(usize, RowAction)>) {
+/// restored without its Authorization header waits. A click selects it, a double click shows it,
+/// and it can be dragged (see `queue_page`); its ⋯ button and a right click open its
+/// [`order_menu`]. A High or Low priority shows by its name. It fades in when new and out as a
+/// ghost, flashes green on completion and shakes on failure. Returns the row's response.
+fn queue_row(app: &App, ui: &mut Ui, line: &Line, action: &mut Option<(usize, RowAction)>) -> egui::Response {
     let p = palette(ui);
     let item = line.item;
     let ctx = ui.ctx().clone();
@@ -624,7 +684,7 @@ fn queue_row(app: &App, ui: &mut Ui, line: &Line, action: &mut Option<(usize, Ro
     let stride = ROW_HEIGHT + ui.spacing().item_spacing.y;
     let rect = slot.translate(shift + Vec2::new(shake, line.drop * stride));
     // Clicks go where the row is drawn, also while it slides into a closing gap.
-    let response = ui.interact(rect, id.with("row"), Sense::click());
+    let response = ui.interact(rect, id.with("row"), Sense::click_and_drag());
     let mut ignored = None;
     let action = if line.ghost.is_some() { &mut ignored } else { action };
     if response.double_clicked() {
@@ -632,11 +692,18 @@ fn queue_row(app: &App, ui: &mut Ui, line: &Line, action: &mut Option<(usize, Ro
     } else if response.clicked() {
         *action = Some((item.id, RowAction::Select));
     }
+    // Its place in the list, for its order menu; a ghost has none.
+    let items = app.queue.items();
+    let place = items.iter().position(|other| other.id == item.id).filter(|_| line.ghost.is_none());
+    if let Some(index) = place {
+        response.context_menu(|ui| order_menu(ui, item, index, items.len(), action));
+    }
     // Pulses only in view: the list lays out one row past its bottom edge.
     let seen = ui.is_rect_visible(rect);
     let inner = egui::UiBuilder::new().max_rect(rect.shrink2(Vec2::new(12.0, 7.0))).layout(Layout::top_down(Align::LEFT));
     let mut ui = ui.new_child(inner);
-    ui.multiply_opacity(opacity);
+    // A row being dragged stays dimmed in its place until it is dropped.
+    ui.multiply_opacity(if response.dragged() { 0.5 * opacity } else { opacity });
 
     // The selected row's highlight is the list's (it slides); the others light up under the pointer.
     let hover = anim::presence(&ctx, id.with("hover"), response.hovered() && line.ghost.is_none(), 0.12);
@@ -660,11 +727,30 @@ fn queue_row(app: &App, ui: &mut Ui, line: &Line, action: &mut Option<(usize, Ro
     ui.horizontal(|ui| {
         status_icon(ui, item, waiting, app.stalled_for(item.id).is_some(), color, t);
         status_chip(ui, item_id, status, color, downloading && !waiting && seen);
-        left_part(ui, (actions.len() + usize::from(tracks)) as f32 * 30.0, |ui| {
+        left_part(ui, (actions.len() + usize::from(tracks) + 1) as f32 * 30.0, |ui| {
+            let mark = match item.priority {
+                Priority::High => Some((icon::CARET_DOUBLE_UP, p.amber, "High priority: starts before the other waiting downloads")),
+                Priority::Low => Some((icon::CARET_DOUBLE_DOWN, p.dim, "Low priority: starts after the other waiting downloads")),
+                Priority::Normal => None,
+            };
+            if let Some((glyph, color, tip)) = mark {
+                ui.add(egui::Label::new(RichText::new(glyph).color(color)).selectable(false)).on_hover_text(tip);
+            }
             let name = egui::Label::new(bold(&item.filename).color(p.strong)).truncate().selectable(false);
             ui.add(name).on_hover_text(&item.filename);
         });
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let more = icon_button(ui, icon::DOTS_THREE_VERTICAL, "Order and priority", true);
+            let menu = id.with("menu");
+            if more.clicked() {
+                ui.memory_mut(|m| m.toggle_popup(menu));
+            }
+            if let Some(index) = place {
+                egui::popup_below_widget(ui, menu, &more, egui::PopupCloseBehavior::CloseOnClick, |ui| {
+                    ui.set_min_width(170.0);
+                    order_menu(ui, item, index, items.len(), action);
+                });
+            }
             for &(glyph, tip, what) in actions.iter().rev() {
                 if icon_button(ui, glyph, tip, true).clicked() {
                     *action = Some((item.id, what));
@@ -703,6 +789,7 @@ fn queue_row(app: &App, ui: &mut Ui, line: &Line, action: &mut Option<(usize, Ro
             _ => {}
         }
     });
+    response
 }
 
 /// When everything still to come (see `DownloadQueue::remaining`) is done at the speed the
@@ -789,7 +876,7 @@ pub(super) fn queue_page(app: &mut App, ui: &mut Ui) {
     let mut rows: Rows = ctx.data_mut(|d| d.remove_temp(list)).unwrap_or_default();
     let now = ctx.input(|i| i.time);
     let new = track(&mut rows, items, shown.queue.revision(), ctx.cumulative_pass_nr(), now, anim::reduced(&ctx));
-    if !rows.ghosts.is_empty() {
+    if !rows.ghosts.is_empty() || !rows.moves.is_empty() {
         ctx.request_repaint();
     }
     let (lines, closing) = lines(items, &rows, &new, now);
@@ -825,8 +912,31 @@ pub(super) fn queue_page(app: &mut App, ui: &mut Ui) {
                 let stripe = Rect::from_min_size(rect.min + Vec2::new(0.0, 10.0), Vec2::new(3.0, rect.height() - 20.0));
                 ui.painter().rect_filled(stripe, 2.0, p.accent);
             }
+            // Where the list's first row is, in view or not.
+            let top = ui.cursor().min.y - range.start as f32 * stride;
+            let mut dragged = None;
             for line in &lines[range] {
-                queue_row(shown, ui, line, &mut action);
+                let row = queue_row(shown, ui, line, &mut action);
+                if line.ghost.is_none() && (row.dragged() || row.drag_stopped()) {
+                    dragged = Some((line.item.id, row.drag_stopped()));
+                }
+            }
+            // A row being dragged lands in the gap nearest the pointer, which a line shows;
+            // dropped there, it moves.
+            if let (Some((id, dropped)), Some(pointer)) = (dragged, ui.ctx().pointer_latest_pos()) {
+                let from = items.iter().position(|item| item.id == id).unwrap_or_default();
+                let gap = ((pointer.y - top) / stride).round().clamp(0.0, items.len() as f32) as usize;
+                let to = if gap > from { gap - 1 } else { gap };
+                if to != from {
+                    let y = top + gap as f32 * stride - ui.spacing().item_spacing.y / 2.0;
+                    let (left, right) = (ui.max_rect().left() + 4.0, ui.max_rect().right() - 4.0);
+                    ui.painter().line_segment([Pos2::new(left, y), Pos2::new(right, y)], Stroke::new(2.0, p.accent));
+                    ui.painter().circle_filled(Pos2::new(left, y), 4.0, p.accent);
+                    if dropped {
+                        action = Some((id, RowAction::MoveTo(to)));
+                    }
+                }
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
             }
             // The list's end comes up with the gap closing under its last line, so that a list
             // scrolled to its end does not jump as a removed row's room goes.
@@ -845,6 +955,17 @@ pub(super) fn queue_page(app: &mut App, ui: &mut Ui) {
         }
         RowAction::Pause => app.pause_job(id),
         RowAction::Show => app.show_job(id),
+        RowAction::Next => {
+            app.queue.download_next(id);
+        }
+        RowAction::MoveTo(index) => {
+            app.queue.move_item(id, index);
+        }
+        RowAction::Priority(priority) => {
+            if let Some(item) = app.queue.get_item_mut(id) {
+                item.priority = priority;
+            }
+        }
         RowAction::Remove => {
             app.remove_job(id);
         }
@@ -1154,6 +1275,117 @@ mod tests {
             h.leave();
             assert_eq!(h.frames(30), Duration::MAX, "and keeps still");
         }
+    }
+
+    /// The queue's file names, top to bottom.
+    fn order(h: &Harness) -> Vec<String> {
+        h.app.queue.items().iter().map(|item| item.filename.clone()).collect()
+    }
+
+    /// Opens the ⋯ menu of `name`'s row and clicks `entry` in it.
+    fn from_menu(h: &mut Harness, name: &str, entry: &str) {
+        h.click_at(h.find_near(name, icon::DOTS_THREE_VERTICAL).unwrap().center());
+        // A menu is laid out unseen the first time.
+        h.frames(2);
+        h.click(entry);
+    }
+
+    /// "Download next" in a waiting row's ⋯ menu puts it first among the waiting downloads (a
+    /// paused one keeps its place); the rows glide to their new places, none jumping, then frames
+    /// stop. Under Reduce motion they are in place at once.
+    #[test]
+    fn download_next_moves_a_row_up_and_the_rows_glide_there() {
+        for reduce in [false, true] {
+            let mut h = Harness::new();
+            h.app.settings.reduce_motion = Some(reduce);
+            let [paused, ..] = ["paused.iso", "b.iso", "c.iso", "d.iso"].map(|name| h.add(name));
+            h.app.queue.mark_started(paused);
+            h.app.queue.mark_pausing(paused);
+            h.app.queue.finish(paused, Err(hyperfetch_core::engine::CANCELLED.to_string()));
+            h.app.tab = Tab::Queue;
+            assert!(h.settle());
+            let stride = ROW_HEIGHT + 2.0;
+            let place = h.find("b.iso").unwrap().top();
+            from_menu(&mut h, "d.iso", "Download next");
+            assert_eq!(order(&h), ["paused.iso", "d.iso", "b.iso", "c.iso"]);
+            let tops = over(&mut h, 40, |h| (h.find("d.iso").unwrap().top(), h.find("c.iso").unwrap().top()));
+            let (d, c): (Vec<f32>, Vec<f32>) = tops.into_iter().unzip();
+            assert_eq!((d[d.len() - 1], c[c.len() - 1]), (place, place + 2.0 * stride));
+            if reduce {
+                assert!(d.iter().all(|&top| top == place) && c.iter().all(|&top| top == place + 2.0 * stride), "at once: {d:?} {c:?}");
+            } else {
+                assert_eq!(d[0], place + 2.0 * stride, "it starts from where it was");
+                assert!(d.windows(2).all(|w| w[1] <= w[0] && w[0] - w[1] < stride / 2.0), "glides up: {d:?}");
+                assert!(c[0] < c[c.len() - 1] && c.windows(2).all(|w| w[1] >= w[0]), "c glides down: {c:?}");
+            }
+            h.leave();
+            assert_eq!(h.frames(30), Duration::MAX, "and keeps still");
+        }
+    }
+
+    /// A waiting row's ⋯ menu sets its priority: a High or Low one shows a mark by its name, a
+    /// Normal one none, and the High one starts first.
+    #[test]
+    fn a_waiting_row_takes_a_priority_from_its_menu() {
+        let mut h = Harness::new();
+        let [_, b] = ["a.iso", "b.iso"].map(|name| h.add(name));
+        h.app.tab = Tab::Queue;
+        assert!(h.settle());
+        let marked = |h: &Harness, glyph: &str| {
+            let name = h.find("b.iso").unwrap();
+            h.find(glyph).is_some_and(|mark| (mark.center().y - name.center().y).abs() < 4.0 && mark.right() <= name.left())
+        };
+        assert!(!marked(&h, icon::CARET_DOUBLE_UP));
+        from_menu(&mut h, "b.iso", "High");
+        assert_eq!(h.app.queue.get_item(b).unwrap().priority, Priority::High);
+        h.frames(2);
+        assert!(marked(&h, icon::CARET_DOUBLE_UP), "a mark before its name");
+        assert_eq!(h.app.queue.next_to_start(1, |_| false), Some(b), "it starts first");
+        from_menu(&mut h, "b.iso", "Low");
+        h.frames(2);
+        assert!(marked(&h, icon::CARET_DOUBLE_DOWN) && !marked(&h, icon::CARET_DOUBLE_UP));
+        from_menu(&mut h, "b.iso", "Normal");
+        h.frames(2);
+        assert!(h.find(icon::CARET_DOUBLE_UP).is_none() && h.find(icon::CARET_DOUBLE_DOWN).is_none(), "a Normal one shows none");
+    }
+
+    /// A row dragged over the list shows where it would land, as a line in the gap nearest the
+    /// pointer; dropped there it moves, and once it has glided into place frames stop. A row
+    /// dropped on its own place stays.
+    #[test]
+    fn a_dragged_row_lands_where_the_line_shows() {
+        let mut h = Harness::new();
+        let ids = ["a.iso", "b.iso", "c.iso", "d.iso"].map(|name| h.add(name));
+        h.app.tab = Tab::Queue;
+        assert!(h.settle());
+        let b = h.app.ctx.read_response(egui::Id::new(("queue row", ids[1])).with("row")).unwrap().rect;
+        let landing = h.find("b.iso").unwrap().top();
+        // The dot at the left end of the line in the gap above b, as painted.
+        let dot = |h: &Harness| {
+            let [r, _, blue, _] = h.shot(Some(Rect::from_min_size(Pos2::new(b.left() + 4.0, b.top() - 1.0), Vec2::splat(1.0)))).get_pixel(0, 0).0;
+            blue > 180 && r < 120
+        };
+        assert!(!dot(&h));
+        let (from, to) = (h.find("d.iso").unwrap().center(), Pos2::new(b.center().x, b.top() + 10.0));
+        h.press(from);
+        for n in 1..=6 {
+            h.hover(from.lerp(to, n as f32 / 6.0));
+        }
+        assert!(dot(&h), "the line shows the gap above b");
+        assert_eq!(order(&h), ["a.iso", "b.iso", "c.iso", "d.iso"], "nothing moves before the drop");
+        h.release(to);
+        assert_eq!(order(&h), ["a.iso", "d.iso", "b.iso", "c.iso"]);
+        h.leave();
+        assert!(h.settle());
+        assert_eq!(h.find("d.iso").unwrap().top(), landing);
+        assert!(!dot(&h), "the line is gone");
+
+        let a = h.find("a.iso").unwrap().center();
+        h.press(a);
+        h.hover(a + Vec2::new(0.0, 10.0));
+        h.hover(a + Vec2::new(0.0, 20.0));
+        h.release(a + Vec2::new(0.0, 20.0));
+        assert_eq!(order(&h), ["a.iso", "d.iso", "b.iso", "c.iso"], "dropped on its own place");
     }
 
     /// A download that completes flashes its row green as its check draws itself; one that fails

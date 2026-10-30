@@ -598,7 +598,7 @@ fn page_title(app: &App, ui: &mut Ui) {
         },
         Tab::Queue => (
             "Queue".to_string(),
-            "Click a download to select it; Delete removes it, a double click shows it. Ctrl+V adds a copied link.",
+            "Click a download to select it; Delete removes it, a double click shows it, a drag moves it. Ctrl+V adds a copied link.",
         ),
         Tab::History => ("History".to_string(), "Finished downloads, with their links and checksums."),
         Tab::Settings => ("Settings".to_string(), "Saved when the app closes; downloads started or queued afterwards use them."),

@@ -24,6 +24,7 @@ What changed in each release, newest first. Each release's page on [GitHub](http
 - **App: a living chunk map.** A download's chunk map shows each connection's pieces in its own colour (the Chunks table's status too), filling as they download; when a connection takes over the end of another's piece, a light flashes on the cut and the new piece turns from the other's colour to its own.
 - **App:** while a ZIP's files or a stream's tracks are read, grey rows shaped like the list to come shimmer under the spinner (still under Reduce motion).
 - **App: when the queue will be done.** While downloads run, the Queue's header says when everything still to download will be done, from the bytes left of the running and waiting downloads at the speed the running ones have together; "at least", and how many sizes it leaves out, while some are not known yet.
+- **App: reorder the queue.** Drag a row to another place (a line shows where it lands), or use its ⋯ menu (or a right click): Download next puts a waiting download first among the waiting ones, Move up and Move down move it a place, and a waiting download takes a High, Normal or Low priority, which decides which waiting download starts first (High and Low show a mark by the name). The rows glide to their new places, and the order and priorities are saved with the queue.
 
 ## 1.8.0 (2026-10-27)
 
