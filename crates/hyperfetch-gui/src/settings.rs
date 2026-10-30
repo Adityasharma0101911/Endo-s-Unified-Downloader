@@ -113,6 +113,9 @@ pub struct Settings {
     pub multi_network: bool,
     /// The local IP addresses chosen for that; none means every usable network.
     pub bind_addresses: Vec<String>,
+    /// Spread a download's connections over its server's addresses (see
+    /// `DownloadOptions::spread_addresses`). On by default.
+    pub spread_addresses: bool,
     /// Download magnet links and .torrent files without web seeds from the BitTorrent swarm.
     pub p2p: bool,
     /// Seed a finished torrent until it has uploaded this many times its size (0 = don't seed).
@@ -250,6 +253,7 @@ impl Default for Settings {
             check_updates: true,
             multi_network: false,
             bind_addresses: Vec::new(),
+            spread_addresses: engine.spread_addresses,
             p2p: true,
             seed_ratio: 1.0,
             seed_minutes: 60,
@@ -543,6 +547,7 @@ impl Settings {
             debrid_magnets: self.debrid_magnets,
             gallery_dl: self.gallery_dl,
             adaptive: self.adaptive,
+            spread_addresses: self.spread_addresses,
             user_agent: non_empty(&self.user_agent),
             ip_family: self.ip_family,
             connect_timeout_secs: self.connect_timeout_secs.max(1),

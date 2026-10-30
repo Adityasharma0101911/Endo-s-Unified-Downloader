@@ -268,6 +268,8 @@ fn connection_settings(s: &mut Settings, ui: &mut Ui) {
     });
     let about = "Sent in place of the browser one the app sends (and the browser's own, from the extension), video sites included.";
     text_setting(ui, "User agent", about, &mut s.user_agent, "Empty: the app's", false);
+    let about = "Spread a download's connections over the addresses its server has (a CDN often has several, one of them busy),                  dropping one that fails or stays far slower. Not through a proxy.";
+    switch(ui, "Use the server's addresses", about, &mut s.spread_addresses);
     let about = "Spread connections over every network this computer is on (Wi-Fi and Ethernet, say), or the ones chosen below.";
     switch(ui, "Use several networks", about, &mut s.multi_network);
     ui.add_enabled_ui(s.multi_network, |ui| network_choice(ui, &mut s.bind_addresses));
@@ -652,6 +654,9 @@ mod tests {
         let s = &h.app.settings;
         assert!(!s.adaptive && s.ip_family == IpFamily::V6 && s.user_agent == "Agent/2.0", "on by default, so off: {s:?}");
         assert!(h.find("Connect timeout").is_some());
+        scroll_to(&mut h, "Use the server's addresses");
+        click(&mut h, |h| h.find_near("Use the server's addresses", TOGGLE));
+        assert!(!h.app.settings.tuning().spread_addresses, "on by default, so off");
 
         scroll_to(&mut h, "Check against the site's checksum");
         click(&mut h, |h| h.find_near("Check against the site's checksum", TOGGLE));

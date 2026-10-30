@@ -202,6 +202,11 @@ pub struct Args {
     #[arg(long = "all-networks", conflicts_with = "bind_address")]
     pub all_networks: bool,
 
+    /// Keep each download's connections on one address of its server, instead of spreading them
+    /// over the several a server's name often has
+    #[arg(long = "no-spread-addresses")]
+    pub no_spread_addresses: bool,
+
     /// Never download magnet links and .torrent files from the BitTorrent swarm
     #[arg(long = "no-p2p")]
     pub no_p2p: bool,
