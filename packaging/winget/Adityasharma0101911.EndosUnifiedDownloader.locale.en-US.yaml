@@ -6,7 +6,7 @@ PublisherUrl: https://github.com/Adityasharma0101911
 PublisherSupportUrl: https://github.com/Adityasharma0101911/Endo-s-Unified-Downloader/issues
 PackageName: Endo's Unified Downloader
 PackageUrl: https://github.com/Adityasharma0101911/Endo-s-Unified-Downloader
-License: MIT OR Apache-2.0
+License: GPL-3.0-or-later
 LicenseUrl: https://github.com/Adityasharma0101911/Endo-s-Unified-Downloader#license
 ShortDescription: Multi-connection download accelerator with a GUI, a command-line tool and a browser extension.
 Tags:

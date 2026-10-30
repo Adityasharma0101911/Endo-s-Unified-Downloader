@@ -44,6 +44,6 @@
 	<key>NSSupportsAutomaticGraphicsSwitching</key>
 	<true/>
 	<key>NSHumanReadableCopyright</key>
-	<string>Endo's Unified Downloader contributors. MIT or Apache-2.0.</string>
+	<string>Copyright (C) 2026 Aditya Sharma. GPL-3.0-or-later.</string>
 </dict>
 </plist>
