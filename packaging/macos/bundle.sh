@@ -31,6 +31,7 @@ done
 rm -rf "$app" "$dmg" "$tarball" "$out/AppIcon.iconset" "$out/dmg"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$bin/Endos-Unified-Downloader" "$bin/Endos-Unified-Downloader-CLI" "$app/Contents/MacOS/"
+cp "$repo/LICENSE" "$repo/NOTICE" "$app/Contents/Resources/"
 sed "s/@VERSION@/$version/g" "$here/Info.plist" > "$app/Contents/Info.plist"
 plutil -lint "$app/Contents/Info.plist"
 

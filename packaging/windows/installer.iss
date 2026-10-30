@@ -45,6 +45,8 @@ Type: filesandordirs; Name: "{app}\extension"
 Source: "..\..\target\release\{#GuiExe}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\target\release\Endos-Unified-Downloader-CLI.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\README.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\..\NOTICE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\extension\*"; DestDir: "{app}\extension"; Excludes: "\test\*,\package.json"; Flags: ignoreversion recursesubdirs
 
 [Icons]

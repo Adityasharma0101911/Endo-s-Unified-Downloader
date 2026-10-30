@@ -10,8 +10,8 @@ members = [
 version = "1.9.0"
 rust-version = "1.89"
 edition = "2021"
-authors = ["HyperFetch Contributors"]
-license = "MIT OR Apache-2.0"
+authors = ["Aditya Sharma"]
+license = "GPL-3.0-or-later"
 
 [profile.release]
 opt-level = 3

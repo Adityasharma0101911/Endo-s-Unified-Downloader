@@ -107,12 +107,12 @@ jobs:
           $ErrorActionPreference = "Stop"
           $tar = "$env:SystemRoot\System32\tar.exe"
           Copy-Item target\release\Endos-Unified-Downloader.exe, target\release\Endos-Unified-Downloader-CLI.exe dist\
-          & $tar -a -cf "dist\Endos-Unified-Downloader-v$env:VERSION-windows-x64.zip" --exclude extension/test --exclude extension/package.json -C target\release Endos-Unified-Downloader.exe Endos-Unified-Downloader-CLI.exe -C ..\.. README.md extension
+          & $tar -a -cf "dist\Endos-Unified-Downloader-v$env:VERSION-windows-x64.zip" --exclude extension/test --exclude extension/package.json -C target\release Endos-Unified-Downloader.exe Endos-Unified-Downloader-CLI.exe -C ..\.. README.md LICENSE NOTICE extension
           if ($LASTEXITCODE) { exit 1 }
           & $tar -a -cf "dist\Endos-Unified-Downloader-Extension-v$env:VERSION.zip" -C extension --exclude test --exclude package.json .
           if ($LASTEXITCODE) { exit 1 }
           $zip = & $tar -tf "dist\Endos-Unified-Downloader-v$env:VERSION-windows-x64.zip"
-          foreach ($file in "Endos-Unified-Downloader.exe", "Endos-Unified-Downloader-CLI.exe", "README.md", "extension/manifest.json") { if ($zip -notcontains $file) { throw "The zip has no $file" } }
+          foreach ($file in "Endos-Unified-Downloader.exe", "Endos-Unified-Downloader-CLI.exe", "README.md", "LICENSE", "NOTICE", "extension/manifest.json") { if ($zip -notcontains $file) { throw "The zip has no $file" } }
           if ($zip -match "^extension/(test/|package\.json)") { throw "The zip holds the extension's tests" }
           $ext = & $tar -tf "dist\Endos-Unified-Downloader-Extension-v$env:VERSION.zip"
           if (-not ($ext -match "^(\./)?manifest\.json$")) { throw "The extension's zip has no manifest.json at its root" }
@@ -234,7 +234,7 @@ jobs:
           if ldd "$bin" 2>/dev/null | grep -q '=>'; then echo "::error::The static CLI links shared libraries"; exit 1; fi
           name="Endos-Unified-Downloader-CLI-v$version-linux-x64-static"
           mkdir -p "dist/$name"
-          cp "$bin" README.md "dist/$name/"
+          cp "$bin" README.md LICENSE NOTICE "dist/$name/"
           tar -czf "dist/$name.tar.gz" -C dist --owner=0 --group=0 "$name"
           rm -rf "dist/$name"
           tar -tzvf "dist/$name.tar.gz"
