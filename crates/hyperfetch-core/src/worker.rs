@@ -309,6 +309,9 @@ impl HttpWorker {
     /// the request.
     pub async fn run(self, seed: Option<Seed>) {
         if let Some(Seed { chunk, mirror_id, url, body, slot }) = seed {
+            // The probe's answer, which this goes on with, shows the server answers: a route of
+            // this download that cannot connect to it is at fault (see `WorkerShared::drop_route`).
+            self.shared.reached(self.shared.route_for_worker(self.worker_id), &url);
             self.shared.mirrors.lock().acquire_mirror(mirror_id);
             let start = chunk.current_offset.load(Ordering::SeqCst);
             let outcome = self.receive(&chunk, mirror_id, body, start).await;
@@ -607,6 +610,7 @@ impl HttpWorker {
                 flush_due.as_mut().reset(tokio::time::Instant::now() + WRITE_INTERVAL);
             }
             batch.buf.extend_from_slice(&bytes[..take]);
+            chunk.received(batch.end());
             pending += take as u64;
 
             if pending >= 1024 * 1024 || last_report.elapsed() >= Duration::from_millis(100) {

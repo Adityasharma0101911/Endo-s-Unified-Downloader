@@ -15,6 +15,7 @@ What changed in each release, newest first. Each release's page on [GitHub](http
 - **CLI tool commands:** `concat` joins files byte by byte, `merge` joins segments with ffmpeg, `mux` puts video, audio and subtitles (files of your own too) into one file, and `doctor` lists the outside tools it finds. `-sv`, `-sa` and `-ss` are short for `--video`, `--audio` and `--subs`, and other common option names (`--select-video`, `--save-dir`, `--save-name`, `--save-pattern`, `--custom-range`, `--ad-keyword`, `--live-record-limit` and more) do the job of the matching option.
 - **Chrome Web Store:** each release's Packages run also builds the extension for the Chrome Web Store, without YouTube, as the store's rules ask.
 - **A server busy at the start** (HTTP 429 or 503 to the first requests, HEAD included) no longer fails the download at once: it is asked again once its `Retry-After` is over, else after 2, 4, 8 and then every 16 s, for up to 2 minutes. A `Retry-After` given as a date is honoured too, not only seconds.
+- **Faster with many connections:** a large file's connections all start as soon as the probe answers, instead of after it measured the host, and a chunk about to finish is no longer split for one more request and connection (the bytes a connection had received but not yet written counted as left).
 
 ## 1.8.0 (2026-10-27)
 

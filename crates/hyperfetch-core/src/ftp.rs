@@ -546,6 +546,7 @@ async fn receive(s: &WorkerShared, worker_id: usize, chunk: &Chunk, mirror_id: u
             flush_due.as_mut().reset(tokio::time::Instant::now() + WRITE_INTERVAL);
         }
         batch.extend_from_slice(&buf[..keep]);
+        chunk.received(pos + batch.len() as u64);
         pending += keep as u64;
         if pending >= 1024 * 1024 || reported.elapsed() >= Duration::from_millis(100) {
             report(s, worker_id, chunk.id, mirror_id, &mut pending, &mut reported);

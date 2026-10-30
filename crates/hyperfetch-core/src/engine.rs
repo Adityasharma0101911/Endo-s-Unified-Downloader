@@ -2359,7 +2359,7 @@ impl DownloadEngine {
     /// need it. A Google Drive answer that is a web page fails its mirror's probe.
     async fn probe_all(&self, client: &Client, urls: &[Url]) -> Result<Probed, String> {
         let (limiter, stall) = (self.limiter(), self.stall_timeout());
-        let several_connections = self.options.num_connections > 1;
+        let connections = self.options.num_connections.clamp(1, MAX_CONNECTIONS);
         let limit = self.options.max_connections_per_host;
         // Whether the first mirror's start is being read, and whether the download went ahead
         // without its answer, which then has no start to read.
@@ -2378,7 +2378,7 @@ impl DownloadEngine {
                         let live = match body {
                             Some(body) if !started.load(Ordering::Relaxed) => {
                                 reading.store(true, Ordering::Relaxed);
-                                take_start(&mut info, body, several_connections, limiter.as_deref(), stall).await
+                                take_start(&mut info, body, connections, limiter.as_deref(), stall).await
                             }
                             _ => None,
                         };
@@ -4573,11 +4573,13 @@ async fn read_prefix(
 /// judge it): that file is read, to be written as it is. On a host known not to cap, the start is
 /// read as if no rate could be measured. Otherwise what the measurement tells is recorded for the
 /// next download, and while it tells nothing yet, the answer's connection is watched on as the
-/// first chunk (see `Watched`).
+/// first chunk (see `Watched`). A file large enough to get all the `connections` asked for,
+/// whatever the measurement says (see `fetch_ranges`), has its workers start at once too, the
+/// answer watched on as its first chunk: waiting for the start would only hold them up.
 async fn take_start(
     info: &mut ProbeInfo,
     body: ProbeBody,
-    several_connections: bool,
+    connections: usize,
     limiter: Option<&RateLimiter>,
     stall: Duration,
 ) -> Option<Live> {
@@ -4592,7 +4594,7 @@ async fn take_start(
     let setup = known.setup_time.or(setup);
     // Workers can take over early only where ranges work (without them only the whole body is of
     // use) and there can be several.
-    let splits = info.accepts_ranges && several_connections;
+    let splits = info.accepts_ranges && connections > 1;
     if splits && known.capped_per_connection == Some(true) {
         let per_setup = bytes_per_setup(known.connection_rate, setup);
         let whole_soon = info.size == Some(len) && per_setup.is_some_and(|bytes| len <= bytes.saturating_mul(2));
@@ -4601,12 +4603,19 @@ async fn take_start(
             return Some(Live::Range { response, slot, end: len.saturating_sub(1), watch: None });
         }
     }
-    // Only the start of a larger file keeps workers waiting.
-    let deadline = (info.size != Some(len)).then(|| tokio::time::Instant::now() + PREFETCH_TIME);
     // A speed limit would make every connection look capped.
     let watch = setup
         .filter(|_| splits && limiter.is_none() && known.capped_per_connection.is_none())
         .map(|setup| RateWatch::new(Pace { answered, setup }));
+    // A web page's start may yet show it is a file (see `probe_all`), so that is read. A resumed
+    // download with less than this left may start fewer connections than a measured cap would
+    // give it; not worth holding every large download up for.
+    let maxed = info.size.is_some_and(|size| size.saturating_sub(len) >= connections as u64 * BYTES_PER_CONNECTION);
+    if splits && maxed && !crate::resolver::html_type(&info.headers) {
+        return Some(Live::Range { response, slot, end: len.saturating_sub(1), watch });
+    }
+    // Only the start of a larger file keeps workers waiting.
+    let deadline = (info.size != Some(len)).then(|| tokio::time::Instant::now() + PREFETCH_TIME);
     let prefix = read_prefix(&mut response, len, deadline, watch, stall, limiter).await;
     info.prefetch = prefix.bytes;
     info.per_setup = bytes_per_setup(prefix.watch.as_ref().and_then(|watch| watch.capped_at), setup);
@@ -5906,12 +5915,12 @@ mod tests {
         // file from the host, as capped, is measured and split, not kept on one connection.
         let mut info = probed(url.as_str(), 20 * 1024);
         let body = probe_body(&url, paced(vec![(0, 16 * 1024), (32, 4 * 1024)]), 20 * 1024, setup);
-        assert!(take_start(&mut info, body, true, None, Duration::from_secs(1)).await.is_none());
+        assert!(take_start(&mut info, body, 8, None, Duration::from_secs(1)).await.is_none());
         assert_eq!(info.prefetch.len(), 20 * 1024);
         assert_eq!(hosts::profile(&url).capped_per_connection, None);
         let mut info = probed(url.as_str(), PREFETCH);
         let body = probe_body(&url, capped_body(), PREFETCH, setup);
-        assert!(matches!(take_start(&mut info, body, true, None, Duration::from_secs(1)).await, Some(Live::Range { .. })));
+        assert!(matches!(take_start(&mut info, body, 8, None, Duration::from_secs(1)).await, Some(Live::Range { .. })));
         assert_eq!(hosts::profile(&url).capped_per_connection, Some(true));
 
         // So fast that, in the time a new connection needs, it brings all a connection is asked
@@ -5919,7 +5928,7 @@ mod tests {
         let url = Url::parse("http://told-fast.engine.invalid/f").unwrap();
         let mut info = probed(url.as_str(), PREFETCH);
         let body = probe_body(&url, paced(vec![(0, 256 * 1024), (2, 256 * 1024), (2, 256 * 1024), (2, 256 * 1024)]), PREFETCH, setup);
-        assert!(take_start(&mut info, body, true, None, Duration::from_secs(1)).await.is_none());
+        assert!(take_start(&mut info, body, 8, None, Duration::from_secs(1)).await.is_none());
         let seen = hosts::profile(&url);
         assert_eq!((seen.capped_per_connection, seen.connection_rate), (Some(false), None));
     }
@@ -5934,7 +5943,7 @@ mod tests {
             let body = probe_body(url, capped_body(), PREFETCH, Duration::from_millis(200));
             async move {
                 let mut info = info;
-                match take_start(&mut info, body, true, None, Duration::from_secs(1)).await {
+                match take_start(&mut info, body, 8, None, Duration::from_secs(1)).await {
                     Some(Live::Range { response, watch: Some(watch), .. }) => (response, watch),
                     _ => panic!("the answer goes on, still watched"),
                 }
@@ -6003,7 +6012,7 @@ mod tests {
         // The answer came in 10 ms over a connection already open; a new one took 200 ms.
         hosts::record(&info.final_url, HostProfile { setup_time: Some(Duration::from_millis(200)), ..Default::default() });
         let body = probe_body(&info.final_url, capped_body(), PREFETCH, Duration::from_millis(10));
-        let live = take_start(&mut info, body, true, None, Duration::from_secs(1)).await;
+        let live = take_start(&mut info, body, 8, None, Duration::from_secs(1)).await;
         // The rest took less than two new connections' setup: no worker takes over.
         assert!(live.is_none());
         assert_eq!(info.prefetch.len() as u64, PREFETCH);
@@ -6029,7 +6038,7 @@ mod tests {
         hosts::record(&Url::parse(capped).unwrap(), seen);
         let mut info = probed(capped, 4 * PREFETCH);
         let body = probe_body(&info.final_url, capped_body(), PREFETCH, Duration::from_millis(10));
-        let Some(Live::Range { response, end, .. }) = take_start(&mut info, body, true, None, stall).await else {
+        let Some(Live::Range { response, end, .. }) = take_start(&mut info, body, 8, None, stall).await else {
             panic!("the answer goes on as the first chunk");
         };
         assert_eq!((info.prefetch.len(), end, info.per_setup), (0, PREFETCH - 1, Some(100_000)));
@@ -6037,7 +6046,7 @@ mod tests {
         // With a single connection there is nobody to hand over to: the start is read as ever.
         let mut info = probed(capped, 4 * PREFETCH);
         let body = probe_body(&info.final_url, capped_body(), PREFETCH, Duration::from_millis(10));
-        take_start(&mut info, body, false, None, stall).await;
+        take_start(&mut info, body, 1, None, stall).await;
         assert!(!info.prefetch.is_empty());
         // Nor for a file the answer brings whole in less than two setups (200 KB at the rate
         // seen): it is read, to be written as it is without resume state or workers. One that
@@ -6045,7 +6054,7 @@ mod tests {
         for (size, whole) in [(64 * 1024, true), (200_000, true), (PREFETCH, false)] {
             let mut info = probed(capped, size);
             let body = probe_body(&info.final_url, paced(vec![(0, size as usize)]), size, Duration::from_millis(10));
-            let live = take_start(&mut info, body, true, None, stall).await;
+            let live = take_start(&mut info, body, 8, None, stall).await;
             assert_eq!((live.is_none(), info.prefetch.len() as u64 == size), (whole, whole), "{size} bytes");
         }
 
@@ -6055,9 +6064,34 @@ mod tests {
         hosts::record(&Url::parse(uncapped).unwrap(), HostProfile { capped_per_connection: Some(false), ..Default::default() });
         let mut info = probed(uncapped, PREFETCH);
         let body = probe_body(&info.final_url, capped_body(), PREFETCH, Duration::from_millis(10));
-        assert!(take_start(&mut info, body, true, None, stall).await.is_none());
+        assert!(take_start(&mut info, body, 8, None, stall).await.is_none());
         assert_eq!((info.prefetch.len() as u64, info.per_setup), (PREFETCH, None));
         assert_eq!(hosts::profile(&info.final_url).capped_per_connection, Some(false));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_a_file_large_enough_for_every_connection_starts_its_workers_at_once() {
+        let stall = Duration::from_secs(1);
+        // 8 MiB past the probe's answer gets eight connections whatever a measurement would say:
+        // nothing is read, the answer goes on as the first chunk, its rate still watched.
+        let url = Url::parse("http://large.engine.invalid/f").unwrap();
+        let mut info = probed(url.as_str(), 9 * PREFETCH);
+        let body = probe_body(&url, capped_body(), PREFETCH, Duration::from_millis(40));
+        let started = tokio::time::Instant::now();
+        let Some(Live::Range { response, end, watch: Some(_), .. }) = take_start(&mut info, body, 8, None, stall).await else {
+            panic!("the answer goes on as the first chunk, watched");
+        };
+        assert_eq!((started.elapsed(), info.prefetch.len(), end), (Duration::ZERO, 0, PREFETCH - 1));
+        assert_eq!(rest_of(response).await, PREFETCH as usize);
+        // A byte less, or a web page, whose start may show it is a file: the start is read. (Each
+        // from a host of its own, which the measurement then tells about.)
+        let mut page = probed("http://large-page.engine.invalid/f", 9 * PREFETCH);
+        page.headers.insert(reqwest::header::CONTENT_TYPE, "text/html".parse().unwrap());
+        for mut info in [probed("http://large-less.engine.invalid/f", 9 * PREFETCH - 1), page] {
+            let body = probe_body(&info.final_url, capped_body(), PREFETCH, Duration::from_millis(40));
+            take_start(&mut info, body, 8, None, stall).await;
+            assert!(!info.prefetch.is_empty(), "{}", info.url);
+        }
     }
 
     #[tokio::test(start_paused = true)]
