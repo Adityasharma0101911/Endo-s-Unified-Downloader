@@ -44,6 +44,8 @@ use util::{lock, Verdict};
 
 /// The window's title and the app's name.
 const TITLE: &str = "Endo's Unified Downloader";
+/// The app's logo for the title bar and taskbar (`assets/logo.svg`, 256 px).
+const WINDOW_ICON: &[u8] = include_bytes!("../assets/icon-256.png");
 /// Set for the build an update starts, which must not take the closing app for another copy
 /// already running (see `main`).
 const RESTARTED: &str = "ENDO_RESTARTED";
@@ -2599,8 +2601,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     let handle = runtime.handle().clone();
 
+    // Without an icon eframe shows egui's "e". On macOS it would also cover the bundle's icon in
+    // the Dock, which an empty one leaves alone.
+    let icon = if cfg!(target_os = "macos") { egui::IconData::default() } else { eframe::icon_data::from_png_bytes(WINDOW_ICON)? };
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([980.0, 720.0]).with_min_inner_size([760.0, 520.0]).with_title(TITLE),
+        viewport: egui::ViewportBuilder::default().with_inner_size([980.0, 720.0]).with_min_inner_size([760.0, 520.0]).with_title(TITLE).with_icon(icon),
         ..Default::default()
     };
     let restart = Arc::new(Mutex::new(None));
@@ -2626,6 +2631,13 @@ mod tests {
     use super::*;
     use hyperfetch_core::state::DownloadState;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// The window's icon reads as a PNG, or the app would not start.
+    #[test]
+    fn the_window_icon_is_the_logo() {
+        let icon = eframe::icon_data::from_png_bytes(WINDOW_ICON).unwrap();
+        assert_eq!((icon.width, icon.height), (256, 256));
+    }
 
     /// Minimal HTTP/1.1 file server with range support (suffix ranges too), sending about 800 KB/s
     /// per connection; the same body for every path.
