@@ -263,9 +263,46 @@ pub fn reveal_in_folder(path: &Path) -> std::io::Result<()> {
     launch(command).map(|_| ())
 }
 
+/// What to do about a download's error `raw`, in plain words, for the common ones.
+pub fn error_hint(raw: &str) -> Option<&'static str> {
+    let error = raw.to_lowercase();
+    let says = |words: &[&str]| words.iter().any(|word| error.contains(word));
+    // An HTTP status as a number of its own, not digits inside a size or an id.
+    let status = |codes: &[&str]| error.split(|c: char| !c.is_ascii_digit()).any(|number| codes.contains(&number));
+    Some(if status(&["404", "410"]) {
+        "The file is no longer at this link. Open its page and copy the link again."
+    } else if status(&["401", "403"]) {
+        "The server refused. The link may have expired or need you to be signed in: copy it again, or choose your browser under Settings, Browser cookies."
+    } else if status(&["429", "503"]) {
+        "The server is busy or limits downloads. Wait a little, then retry."
+    } else if says(&["dns", "resolve", "no such host", "lookup"]) {
+        "The site's address was not found. Check the link and your internet connection."
+    } else if says(&["timed out", "timeout", "connection reset", "connection refused", "connection closed"]) {
+        "The connection dropped. Check your internet connection, then retry: the download goes on from where it stopped."
+    } else if says(&["no space", "os error 112", "disk full"]) {
+        "The disk is full. Free some space, then retry."
+    } else if says(&["access is denied", "permission denied"]) {
+        "The app may not write there. Choose another save folder."
+    } else {
+        return None;
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn common_errors_get_a_hint() {
+        assert!(error_hint("The server answered 404 Not Found").unwrap().contains("no longer at this link"));
+        assert!(error_hint("HTTP 403 Forbidden").unwrap().contains("refused"));
+        assert!(error_hint("Failed: HTTP 503 Service Unavailable").unwrap().contains("busy"));
+        assert!(error_hint("operation timed out").unwrap().contains("connection dropped"));
+        assert!(error_hint("There is not enough space on the disk. (os error 112)").unwrap().contains("disk is full"));
+        // Digits inside a size are no status.
+        assert_eq!(error_hint("expected 14040 bytes, got 12"), None);
+        assert_eq!(error_hint("checksum mismatch"), None);
+    }
 
     #[test]
     fn clipboard_link_only_takes_single_links() {

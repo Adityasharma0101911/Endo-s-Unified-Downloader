@@ -12,22 +12,101 @@ fn opened(ctx: &egui::Context) -> f32 {
     anim::since(ctx, egui::Id::new("page"), (Tab::Settings as u8, None::<usize>), false)
 }
 
+/// The settings most people change: the page shows only these until All settings is on or
+/// something is searched for.
+const COMMON: [&str; 21] = [
+    "Save folder",
+    "Theme",
+    "Reduce motion",
+    "Watch the clipboard",
+    "Run the queue automatically",
+    "Downloads at once",
+    "Close to the tray",
+    "Start minimized",
+    "Launch at startup",
+    "Connections per download",
+    "Speed limit",
+    "Browser cookies",
+    "Quality",
+    "Video format",
+    "Subtitles",
+    "Unpack archives",
+    "Sort into folders",
+    "Extension folder",
+    "Send links from your phone",
+    "Version",
+    "Check for updates at startup",
+];
+
+/// Which rows the page shows this frame: those matching `search` (lower case) when there is one,
+/// else all of them or the [`COMMON`] ones; `whole` while the section being drawn matches the
+/// search by its title, and so shows every row.
+#[derive(Clone, Default)]
+struct Shown {
+    search: String,
+    all: bool,
+    whole: bool,
+}
+
+fn shown_id() -> egui::Id {
+    egui::Id::new("settings shown")
+}
+
+/// Whether the row of setting `title` shows (see [`Shown`]); counted for its section when it does.
+fn shows(ui: &Ui, title: &str, about: &str) -> bool {
+    let shown = ui.data(|d| d.get_temp::<Shown>(shown_id())).unwrap_or_default();
+    let show = if shown.search.is_empty() {
+        shown.all || COMMON.contains(&title)
+    } else {
+        shown.whole || title.to_lowercase().contains(&shown.search) || about.to_lowercase().contains(&shown.search)
+    };
+    if show {
+        ui.data_mut(|d| *d.get_temp_mut_or_default::<u32>(shown_id().with("count")) += 1);
+    }
+    show
+}
+
 /// The `n`th card of the page: as the page opens the cards rise in one after another, each icon
-/// popping.
+/// popping. A section none of whose rows show (see [`Shown`]) is left out: it is then laid out
+/// unseen and out of reach, to learn when it has a row to show again.
 fn section(ui: &mut Ui, n: usize, glyph: &str, title: &str, add: impl FnOnce(&mut Ui)) {
     let p = palette(ui);
-    let t = anim::progress(ui.ctx(), opened(ui.ctx()), anim::stagger(n), anim::APPEAR);
-    anim::shifted(ui, anim::ease(t), anim::RISE, |ui| {
-        card(ui).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                anim::icon(ui, glyph, 18.0, p.accent, 0.6 + 0.4 * anim::overshoot(t), 0.0);
-                ui.label(bold(title).size(16.0).color(p.strong));
-            });
-            add(ui);
-        });
+    let id = shown_id();
+    let mut shown = ui.data(|d| d.get_temp::<Shown>(id)).unwrap_or_default();
+    shown.whole = !shown.search.is_empty() && title.to_lowercase().contains(&shown.search);
+    ui.data_mut(|d| {
+        d.insert_temp(id, shown);
+        d.insert_temp(id.with("count"), 0u32);
     });
-    ui.add_space(12.0);
+    let key = id.with(("section", n));
+    let had = ui.data(|d| d.get_temp::<bool>(key)).unwrap_or(true);
+    if had {
+        let t = anim::progress(ui.ctx(), opened(ui.ctx()), anim::stagger(n), anim::APPEAR);
+        anim::shifted(ui, anim::ease(t), anim::RISE, |ui| {
+            card(ui).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    anim::icon(ui, glyph, 18.0, p.accent, 0.6 + 0.4 * anim::overshoot(t), 0.0);
+                    ui.label(bold(title).size(16.0).color(p.strong));
+                });
+                add(ui);
+            });
+        });
+        ui.add_space(12.0);
+    } else {
+        let mut hidden = ui.new_child(egui::UiBuilder::new().max_rect(ui.available_rect_before_wrap()));
+        hidden.set_invisible();
+        hidden.set_clip_rect(Rect::NOTHING);
+        add(&mut hidden);
+    }
+    let count = ui.data(|d| d.get_temp::<u32>(id.with("count"))).unwrap_or(0);
+    ui.data_mut(|d| {
+        d.insert_temp(key, count > 0);
+        *d.get_temp_mut_or_default::<u32>(id.with("total")) += count;
+    });
+    if (count > 0) != had {
+        ui.ctx().request_repaint();
+    }
 }
 
 /// How lit the row of setting `title` is: 1.0 as `value` changes on the open page, fading out
@@ -45,6 +124,9 @@ fn flash(ctx: &egui::Context, title: &str, value: impl Hash) -> f32 {
 /// One row of a Settings section: `title` and what it does on the left, `control` on the right
 /// (laid out right to left). The row lights up for a moment as `value`, what it sets, changes.
 fn setting(ui: &mut Ui, title: &str, about: &str, value: impl Hash, control: impl FnOnce(&mut Ui)) {
+    if !shows(ui, title, about) {
+        return;
+    }
     let p = palette(ui);
     let lit = flash(ui.ctx(), title, value);
     ui.separator();
@@ -81,6 +163,46 @@ fn text_setting(ui: &mut Ui, title: &str, about: &str, value: &mut String, hint:
 }
 
 pub(super) fn settings_page(app: &mut App, ui: &mut Ui) {
+    let p = palette(ui);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(icon::MAGNIFYING_GLASS).size(16.0).color(p.muted));
+        ui.add(egui::TextEdit::singleline(&mut app.settings_search).hint_text("Search settings").desired_width(280.0));
+        if !app.settings_search.is_empty() && icon_button(ui, icon::X, "Clear the search", true).clicked() {
+            app.settings_search.clear();
+        }
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let all = ui.selectable_label(app.settings.show_all_settings, "All settings");
+            if all.on_hover_text("Show every setting, not only the common ones").clicked() {
+                app.settings.show_all_settings = !app.settings.show_all_settings;
+            }
+        });
+    });
+    ui.add_space(10.0);
+    let search = app.settings_search.trim().to_lowercase();
+    let all = app.settings.show_all_settings;
+    ui.data_mut(|d| {
+        d.insert_temp(shown_id(), Shown { search: search.clone(), all, whole: false });
+        d.insert_temp(shown_id().with("total"), 0u32);
+    });
+    settings_sections(app, ui);
+    let total = ui.data(|d| d.get_temp::<u32>(shown_id().with("total"))).unwrap_or(0);
+    if total == 0 && !search.is_empty() {
+        ui.vertical_centered(|ui| {
+            ui.add_space(30.0);
+            ui.label(RichText::new(icon::MAGNIFYING_GLASS).size(28.0).color(p.dim));
+            ui.label(RichText::new(format!("No setting matches \u{201c}{}\u{201d}.", app.settings_search.trim())).color(p.muted));
+        });
+    } else if search.is_empty() && !all {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("These are the common settings.").color(p.muted));
+            if ui.add(button("Show all settings")).clicked() {
+                app.settings.show_all_settings = true;
+            }
+        });
+    }
+}
+
+fn settings_sections(app: &mut App, ui: &mut Ui) {
     section(ui, 0, icon::SLIDERS, "General", |ui| general_settings(app, ui));
     section(ui, 1, icon::DESKTOP, "Desktop", |ui| desktop_settings(app, ui));
     section(ui, 2, icon::NETWORK, "Connections & networks", |ui| connection_settings(&mut app.settings, ui));
@@ -732,6 +854,38 @@ mod tests {
         h.hover(at);
         h.click_at(at);
         h.frames(30);
+    }
+
+    /// Typing in the search box leaves only the rows (and sections) that match, by title or by
+    /// what they say; without a search and All settings, only the common ones show.
+    #[test]
+    fn the_page_is_searched_and_starts_with_the_common_settings() {
+        let mut h = Harness::new();
+        h.app.tab = Tab::Settings;
+        assert!(h.settle());
+        assert!(h.find("Theme").is_some() && h.find("General").is_some());
+
+        h.app.settings_search = " Proxy ".to_string();
+        h.frames(30);
+        assert!(h.settle());
+        assert!(h.find("Proxy").is_some() && h.find("Proxy pool").is_some(), "{:?}", h.texts());
+        assert!(h.find("Theme").is_none() && h.find("General").is_none() && h.find("BitTorrent").is_none());
+        // A section's title brings all its rows.
+        h.app.settings_search = "bittorrent".to_string();
+        h.frames(30);
+        assert!(h.find("BitTorrent").is_some() && h.find("Seed ratio").is_some(), "{:?}", h.texts());
+        h.app.settings_search = "no such setting".to_string();
+        h.frames(30);
+        assert!(h.find("General").is_none() && h.texts().iter().any(|(text, _)| text.starts_with("No setting matches")));
+
+        h.app.settings_search.clear();
+        h.app.settings.show_all_settings = false;
+        h.frames(30);
+        assert!(h.settle());
+        assert!(h.find("Save folder").is_some() && h.find("Theme").is_some());
+        assert!(h.find("BitTorrent").is_none() && h.find("Retries").is_none(), "{:?}", h.texts());
+        h.click("Show all settings");
+        assert!(h.app.settings.show_all_settings);
     }
 
     /// The connection rows and the checks before sorting set their settings through input.
