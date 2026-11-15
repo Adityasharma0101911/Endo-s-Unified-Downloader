@@ -157,6 +157,10 @@ pub struct Settings {
     pub s3_region: String,
     /// An S3-compatible server on a host of its own (`sigv4::S3Key::endpoint`); empty for none.
     pub s3_endpoint: String,
+    /// The private key file SFTP servers are signed in to with, and its passphrase. Saved here,
+    /// never with the queue or in the history.
+    pub ssh_key_file: String,
+    pub ssh_key_passphrase: String,
     /// Look each downloaded file's SHA-256 up on VirusTotal (the hash only, never the file).
     pub virustotal_check: bool,
     /// 0 follows the system, 1 dark, 2 light.
@@ -297,6 +301,8 @@ impl Default for Settings {
             s3_session_token: String::new(),
             s3_region: String::new(),
             s3_endpoint: String::new(),
+            ssh_key_file: String::new(),
+            ssh_key_passphrase: String::new(),
             theme: 0,
             reduce_motion: None,
             close_to_tray: false,
@@ -480,6 +486,13 @@ impl Settings {
         options.debrid_provider = non_empty(&self.debrid_provider);
         options.post.virustotal_key = non_empty(&self.virustotal_api_key).filter(|_| self.virustotal_check);
         options.s3 = self.s3_key();
+        options.ssh_key = self.ssh_key();
+    }
+
+    /// The SFTP private key of these settings, when a file is named.
+    pub fn ssh_key(&self) -> Option<hyperfetch_core::sftp::SshKey> {
+        let path = PathBuf::from(non_empty(&self.ssh_key_file)?);
+        Some(hyperfetch_core::sftp::SshKey { path, passphrase: non_empty(&self.ssh_key_passphrase) })
     }
 
     /// The S3 key of these settings, when the access key and its secret are set; an endpoint that
@@ -527,6 +540,7 @@ impl Settings {
             auth: None,
             channels: Vec::new(),
             s3: self.s3_key(),
+            ssh_key: self.ssh_key(),
         }
     }
 
@@ -907,6 +921,8 @@ mod tests {
             s3_access_key: " AKID ".into(),
             s3_secret_key: "SECRET".into(),
             s3_endpoint: "http://minio.lan:9000".into(),
+            ssh_key_file: "C:/keys/id_ed25519".into(),
+            ssh_key_passphrase: "PASSPHRASE".into(),
             ..saved
         };
         let mut opts = chosen.download_options(&file, "", "").unwrap();
@@ -922,7 +938,9 @@ mod tests {
         assert_eq!(key.endpoint.map(String::from).as_deref(), Some("http://minio.lan:9000/"));
         assert_eq!(chosen.list_options().s3.map(|k| k.access_key).as_deref(), Some("AKID"));
         let queued = serde_json::to_string(&opts).unwrap();
-        assert!(!queued.contains("SECRET") && !queued.contains("AKID"), "never with the queue");
+        assert!(!queued.contains("SECRET") && !queued.contains("AKID") && !queued.contains("PASSPHRASE"), "never with the queue");
+        assert_eq!(opts.ssh_key.as_ref().map(|k| (k.path.clone(), k.passphrase.as_deref())), Some((PathBuf::from("C:/keys/id_ed25519"), Some("PASSPHRASE"))));
+        assert_eq!(chosen.list_options().ssh_key, opts.ssh_key);
         assert!(Settings { s3_secret_key: " ".into(), ..chosen.clone() }.s3_key().is_none());
         let sorted = chosen.sort_categories();
         assert_eq!((sorted[0].name.as_str(), sorted[0].extensions.as_slice()), ("Clips", &["mp4", "webm", "mkv"].map(String::from)[..]));

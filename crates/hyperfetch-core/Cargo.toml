@@ -37,6 +37,9 @@ flate2 = "1.1"
 netdev = { version = "0.46", default-features = false, features = ["gateway"] }
 # BitTorrent swarm downloads (p2p.rs): rustls instead of the OS TLS stack, no web UI or HTTP API.
 librqbit = { version = "9.0.1", default-features = false, features = ["rust-tls"] }
+# SFTP downloads (sftp.rs): pure-Rust SSH on the aws-lc-rs that rustls already builds; no compression.
+russh = { version = "0.65", default-features = false, features = ["aws-lc-rs", "rsa"] }
+russh-sftp = "3.0"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Time", "Win32_Security"] }
@@ -49,6 +52,8 @@ tempfile = "3.17"
 criterion = "0.5"
 http = "1"
 tokio = { version = "1.43", features = ["test-util"] }
+# Host and user keys of the in-process SSH server in sftp.rs's tests; russh already builds it.
+rand = "0.10"
 
 [[bench]]
 name = "range_bench"

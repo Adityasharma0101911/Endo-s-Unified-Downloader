@@ -230,6 +230,15 @@ pub struct Args {
     #[arg(long = "s3-endpoint", value_name = "URL", value_parser = parse_endpoint, requires = "s3_access_key")]
     pub s3_endpoint: Option<url::Url>,
 
+    /// Private key file to sign in to SFTP servers with (sftp://USER@host/path), besides a password
+    /// in the link. An encrypted one is opened with --ssh-key-passphrase, or asks for it
+    #[arg(long = "ssh-key", value_name = "FILE")]
+    pub ssh_key: Option<PathBuf>,
+
+    /// Passphrase of an encrypted --ssh-key
+    #[arg(long = "ssh-key-passphrase", value_name = "PASS", env = "ENDO_SSH_KEY_PASSPHRASE", hide_env_values = true, requires = "ssh_key")]
+    pub ssh_key_passphrase: Option<String>,
+
     /// Local IP address to connect from; repeat it to spread connections over several networks
     #[arg(long = "bind-address", value_name = "IP")]
     pub bind_address: Vec<std::net::IpAddr>,
@@ -578,6 +587,11 @@ impl Args {
             region: self.s3_region.clone(),
             endpoint: self.s3_endpoint.clone(),
         })
+    }
+
+    /// The private key of --ssh-key and its passphrase, if any.
+    pub fn ssh_key(&self) -> Option<hyperfetch_core::sftp::SshKey> {
+        Some(hyperfetch_core::sftp::SshKey { path: self.ssh_key.clone()?, passphrase: self.ssh_key_passphrase.clone() })
     }
 }
 
@@ -1316,6 +1330,9 @@ mod tests {
         assert_eq!((key.access_key.as_str(), key.secret.as_str(), key.session_token.as_deref()), ("AK", "SK", Some("T")));
         assert_eq!((key.region.as_deref(), key.endpoint.as_ref().map(|u| u.as_str())), (Some("eu-west-1"), Some("http://minio.lan:9000/")));
         assert!(parse(&["u"]).unwrap().s3_key().is_none());
+        let key = parse(&["--ssh-key", "id_ed25519", "--ssh-key-passphrase", "pp", "u"]).unwrap().ssh_key().unwrap();
+        assert_eq!((key.path, key.passphrase.as_deref()), (PathBuf::from("id_ed25519"), Some("pp")));
+        assert!(parse(&["--ssh-key-passphrase", "pp", "u"]).is_err(), "a passphrase needs its key");
         assert!(parse(&["--live-from", "2026-10-10 21:00:00+08:00", "u"]).is_ok());
         for bad in [
             &["--video", "8k"][..], &["--audio", "en,loud"], &["--tracks", "x1"], &["--tracks", "v"], &["--tracks", "v0,"], &["--drop-parts", "3-1"],
