@@ -103,6 +103,11 @@ pub struct Args {
     #[arg(long = "zsync", value_name = "URL", value_parser = parse_zsync)]
     pub zsync: Option<String>,
 
+    /// The build of a container image to download (docker.io/..., ghcr.io/..., quay.io/...), such
+    /// as linux/arm64 or linux/arm/v7, in place of this machine's Linux build
+    #[arg(long = "platform", value_name = "OS/ARCH", value_parser = parse_platform)]
+    pub platform: Option<String>,
+
     /// Give each finished file the date its server gives it
     #[arg(long = "remote-time")]
     pub remote_time: bool,
@@ -726,6 +731,12 @@ fn parse_checksum(s: &str) -> Result<String, String> {
     Ok(s.to_string())
 }
 
+fn parse_platform(s: &str) -> Result<String, String> {
+    let parts: Vec<&str> = s.split('/').collect();
+    let named = (2..=3).contains(&parts.len()) && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'));
+    if named { Ok(s.to_ascii_lowercase()) } else { Err(format!("'{}' is not OS/ARCH or OS/ARCH/VARIANT, such as linux/arm64", s)) }
+}
+
 fn parse_endpoint(s: &str) -> Result<url::Url, String> {
     match url::Url::parse(s) {
         Ok(url) if matches!(url.scheme(), "http" | "https") && url.host_str().is_some() => Ok(url),
@@ -1333,6 +1344,8 @@ mod tests {
         let key = parse(&["--ssh-key", "id_ed25519", "--ssh-key-passphrase", "pp", "u"]).unwrap().ssh_key().unwrap();
         assert_eq!((key.path, key.passphrase.as_deref()), (PathBuf::from("id_ed25519"), Some("pp")));
         assert!(parse(&["--ssh-key-passphrase", "pp", "u"]).is_err(), "a passphrase needs its key");
+        assert_eq!(parse(&["--platform", "Linux/ARM/v7", "u"]).unwrap().platform.as_deref(), Some("linux/arm/v7"));
+        assert!(parse(&["--platform", "arm64", "u"]).is_err() && parse(&["--platform", "linux//x", "u"]).is_err());
         assert!(parse(&["--live-from", "2026-10-10 21:00:00+08:00", "u"]).is_ok());
         for bad in [
             &["--video", "8k"][..], &["--audio", "en,loud"], &["--tracks", "x1"], &["--tracks", "v"], &["--tracks", "v0,"], &["--drop-parts", "3-1"],

@@ -267,64 +267,9 @@ async fn fill(
             continue;
         }
         // The user's network settings only: no sign-in, cookies or headers of theirs go to a seed.
-        let http = DownloadOptions {
-            output_path: Some(path.clone()),
-            metalink_pieces: file.pieces.clone(),
-            remote_checksum: false,
-            post: crate::postprocess::PostOptions { mark_of_the_web: false, ..Default::default() },
-            num_connections: options.num_connections,
-            max_connections_per_host: options.max_connections_per_host,
-            proxy: options.proxy.clone(),
-            proxy_pool: options.proxy_pool.clone(),
-            no_proxy: options.no_proxy,
-            max_speed: options.max_speed,
-            priority: options.priority,
-            max_retries: options.max_retries,
-            stall_timeout_secs: options.stall_timeout_secs,
-            fsync_on_complete: options.fsync_on_complete,
-            bind_addresses: options.bind_addresses.clone(),
-            spread_addresses: options.spread_addresses,
-            adaptive: options.adaptive,
-            insecure: options.insecure,
-            ip_family: options.ip_family,
-            connect_timeout_secs: options.connect_timeout_secs,
-            user_agent: options.user_agent.clone(),
-            ..Default::default()
-        };
-        let engine = DownloadEngine::new(file.urls.clone(), http);
-        let (tx, mut rx) = broadcast::channel::<EngineSnapshot>(64);
-        let (out, whole, before) = (snapshots.clone(), target.to_path_buf(), done);
-        let forward = tokio::spawn(async move {
-            loop {
-                match rx.recv().await {
-                    Ok(s) => emit(&out, EngineSnapshot {
-                        total_bytes: total,
-                        downloaded_bytes: before + s.downloaded_bytes,
-                        speed_bytes_per_sec: s.speed_bytes_per_sec,
-                        progress_ratio: if total > 0 { (before + s.downloaded_bytes) as f64 / total as f64 } else { 0.0 },
-                        active_workers: s.active_workers,
-                        target_path: Some(whole.clone()),
-                        torrent: Some(TorrentProgress::default()),
-                        host: s.host,
-                        ..Default::default()
-                    }),
-                    Err(broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(_) => break,
-                }
-            }
-        });
-        let stop = engine.clone();
-        let stopping = async {
-            cancel.cancelled().await;
-            stop.cancel();
-            std::future::pending::<()>().await
-        };
-        // A cancel lets the download save its state before it returns, for the next run to resume.
-        let result = tokio::select! {
-            result = engine.run(Some(tx)) => result,
-            () = stopping => unreachable!(),
-        };
-        forward.abort();
+        let http = DownloadOptions { output_path: Some(path.clone()), metalink_pieces: file.pieces.clone(), ..network_only(options) };
+        let progress = Progress { total, before: done, target: target.to_path_buf(), torrent: true };
+        let result = run_nested(DownloadEngine::new(file.urls.clone(), http), snapshots, progress, cancel).await;
         match result {
             _ if cancel.is_cancelled() => return Err(CANCELLED.to_string()),
             Ok(_) => filled = true,
@@ -565,6 +510,92 @@ fn progress(stats: &TorrentStats, target: &Path, seeding: bool) -> EngineSnapsho
         }),
         ..Default::default()
     }
+}
+
+/// The user's network settings alone, for a download the app makes as part of another (a torrent's
+/// file from its web seed, an image's layer): no sign-in, cookies or headers of theirs, no
+/// checksum from the server, no Mark-of-the-Web on a part of something else.
+pub(crate) fn network_only(options: &DownloadOptions) -> DownloadOptions {
+    DownloadOptions {
+        remote_checksum: false,
+        post: crate::postprocess::PostOptions { mark_of_the_web: false, ..Default::default() },
+        num_connections: options.num_connections,
+        max_connections_per_host: options.max_connections_per_host,
+        proxy: options.proxy.clone(),
+        proxy_pool: options.proxy_pool.clone(),
+        no_proxy: options.no_proxy,
+        max_speed: options.max_speed,
+        priority: options.priority,
+        max_retries: options.max_retries,
+        stall_timeout_secs: options.stall_timeout_secs,
+        fsync_on_complete: options.fsync_on_complete,
+        bind_addresses: options.bind_addresses.clone(),
+        spread_addresses: options.spread_addresses,
+        adaptive: options.adaptive,
+        insecure: options.insecure,
+        ip_family: options.ip_family,
+        connect_timeout_secs: options.connect_timeout_secs,
+        user_agent: options.user_agent.clone(),
+        ..Default::default()
+    }
+}
+
+/// How a part's progress shows as the whole's: `before` bytes of `total` done ahead of it, at
+/// `target`, as a torrent's when `torrent`.
+pub(crate) struct Progress {
+    pub total: u64,
+    pub before: u64,
+    pub target: PathBuf,
+    pub torrent: bool,
+}
+
+/// Runs `engine`, one part of a bigger download, its snapshots sent on `out` as `progress` makes
+/// them the whole's. A cancel of `cancel` lets it save its state first, for the next run to resume.
+///
+/// A boxed Send future of a declared type: the engine's run leads here again, which the compiler
+/// could not size or prove Send otherwise.
+pub(crate) fn run_nested<'a>(
+    engine: DownloadEngine,
+    out: &'a Option<broadcast::Sender<EngineSnapshot>>,
+    progress: Progress,
+    cancel: &'a CancellationToken,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<PathBuf, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let (tx, mut rx) = broadcast::channel::<EngineSnapshot>(64);
+        let shown = out.clone();
+        let forward = tokio::spawn(async move {
+            let Progress { total, before, target, torrent } = progress;
+            loop {
+                match rx.recv().await {
+                    Ok(s) => emit(&shown, EngineSnapshot {
+                        total_bytes: total,
+                        downloaded_bytes: before + s.downloaded_bytes,
+                        speed_bytes_per_sec: s.speed_bytes_per_sec,
+                        progress_ratio: if total > 0 { (before + s.downloaded_bytes) as f64 / total as f64 } else { 0.0 },
+                        active_workers: s.active_workers,
+                        target_path: Some(target.clone()),
+                        torrent: torrent.then(TorrentProgress::default),
+                        host: s.host,
+                        ..Default::default()
+                    }),
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(_) => break,
+                }
+            }
+        });
+        let stop = engine.clone();
+        let stopping = async {
+            cancel.cancelled().await;
+            stop.cancel();
+            std::future::pending::<()>().await
+        };
+        let result = tokio::select! {
+            result = engine.run(Some(tx)) => result,
+            () = stopping => unreachable!(),
+        };
+        forward.abort();
+        result
+    })
 }
 
 fn emit(snapshots: &Option<broadcast::Sender<EngineSnapshot>>, snapshot: EngineSnapshot) {

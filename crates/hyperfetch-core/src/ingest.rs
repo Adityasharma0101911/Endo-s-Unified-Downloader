@@ -516,6 +516,10 @@ pub async fn ingest(tokens: &[impl AsRef<str>], http: &reqwest::Client, options:
                 Err(e) => return Err(e),
             }
         }
+        // A container image is one download, whatever lister its page's site has.
+        if crate::oci::reference(token.as_ref()).is_some() {
+            return link_task(tokens).map(|task| vec![task]);
+        }
         if let Some(url) = listing_url(token.as_ref()) {
             if let Some(listed) = list(http, &url, options).await {
                 return listed;
@@ -621,6 +625,8 @@ pub fn link_task(tokens: &[impl AsRef<str>]) -> Result<Task, String> {
                 task.name = magnet.display_name.as_deref().and_then(clean_component).map(PathBuf::from);
             }
             magnet.web_seeds
+        } else if let Some(image) = crate::oci::reference(token) {
+            vec![image]
         } else {
             let mut url = Url::parse(token).map_err(|e| format!("Invalid URL '{}': {}", truncate_chars(token, 80), e))?;
             // An ipfs:// link downloads through the public gateways (see `resolver::ipfs_mirrors`).

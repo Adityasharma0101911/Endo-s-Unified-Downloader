@@ -696,6 +696,7 @@ fn tuning(args: &Args, connections: u64) -> DownloadOptions {
         only_if_newer: args.only_if_newer,
         delta_from: args.delta_from.clone(),
         zsync: args.zsync.clone(),
+        platform: args.platform.clone(),
         // Signs only for S3 hosts, so a document's files on them get it too.
         s3: args.s3_key(),
         // Used only by sftp:// links.
