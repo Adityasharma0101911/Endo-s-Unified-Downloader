@@ -829,7 +829,7 @@ mod tests {
         h.type_text("https://example.com/a.iso");
         assert_eq!(h.app.url_input, "https://example.com/a.iso");
         h.key(Key::Escape, Modifiers::NONE);
-        let advanced = "Advanced options: checksum and Authorization header";
+        let advanced = "Advanced options: checksum, older version and Authorization header";
         h.click(advanced);
         assert!(h.app.show_advanced);
         assert!(h.settle() && h.find("Checksum").is_some());

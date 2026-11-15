@@ -82,6 +82,7 @@ enum Dialog {
     SaveDir,
     CookiesFile,
     VerifyFile,
+    OlderVersion,
     /// The folder of the `n`th sorting category (see `Settings::categories`).
     CategoryFolder(usize),
 }
@@ -301,6 +302,12 @@ struct App {
     /// Per-download inputs; never saved.
     checksum_input: String,
     auth_input: String,
+    /// An older version of the file, to copy what the new one still holds from (see
+    /// `DownloadOptions::delta_from`).
+    delta_input: String,
+    /// The file an earlier download of the link finished into, which the next one from the form
+    /// updates in place, only if the server has a newer one (see "Update from the copy on disk").
+    update_on_disk: Option<PathBuf>,
     queue_input: String,
     show_advanced: bool,
     form_error: Option<String>,
@@ -503,6 +510,8 @@ impl App {
             url_input: String::new(),
             checksum_input: String::new(),
             auth_input: String::new(),
+            delta_input: String::new(),
+            update_on_disk: None,
             queue_input: String::new(),
             show_advanced: false,
             form_error: None,
@@ -1028,6 +1037,7 @@ impl App {
     /// starts, the others wait in the queue.
     fn download_now(&mut self, text: &str, checksum: &str, auth: &str) {
         self.tab = Tab::Downloader;
+        let update = self.update_on_disk.take();
         // The first link of a paste with secrets starts, the others wait; the form clears as
         // it starts (it held the secrets).
         match self.add_pasted(text, checksum, auth, Origin::Form) {
@@ -1060,12 +1070,23 @@ impl App {
         if let Some(Err(e)) = chosen.as_ref().map(|(info, picks)| picks.apply(info, &mut DownloadOptions::default())) {
             return self.form_error = Some(e);
         }
+        let older = Some(PathBuf::from(self.delta_input.trim())).filter(|_| !self.delta_input.trim().is_empty());
+        if let Some(older) = older.as_ref().filter(|path| !path.is_file()) {
+            return self.form_error = Some(format!("The older version is not a file: {}", older.display()));
+        }
         match self.add_download(text, checksum, auth) {
             Ok(id) => {
-                if let (Some((info, picks)), Some(item)) = (&chosen, self.queue.get_item_mut(id)) {
-                    // Checked above.
-                    let _ = picks.apply(info, &mut item.options);
-                    self.tracks = None;
+                if let Some(item) = self.queue.get_item_mut(id) {
+                    if let Some((info, picks)) = &chosen {
+                        // Checked above.
+                        let _ = picks.apply(info, &mut item.options);
+                        self.tracks = None;
+                    }
+                    item.options.delta_from = older;
+                    // The earlier download's file is replaced, only by a newer one (see `only_if_newer`).
+                    if let Some(file) = update {
+                        (item.options.output_path, item.options.only_if_newer) = (Some(file), true);
+                    }
                 }
                 self.start_added(id)
             }
@@ -1087,6 +1108,7 @@ impl App {
         self.focused = Some(id);
         self.url_input.clear();
         self.checksum_input.clear();
+        self.delta_input.clear();
         self.start_job(id, false);
     }
 
@@ -1387,6 +1409,7 @@ impl App {
         self.focused = None;
         self.url_input.clear();
         self.checksum_input.clear();
+        self.delta_input.clear();
         self.form_error = None;
         self.notice = None;
     }
@@ -1618,6 +1641,7 @@ impl App {
                     Dialog::SaveDir => self.settings.save_dir = path.to_string_lossy().into_owned(),
                     Dialog::CookiesFile => self.settings.cookies_path = path.to_string_lossy().into_owned(),
                     Dialog::VerifyFile => self.verify(VerifyRequest { path, expected_size: None, checksum: None }),
+                    Dialog::OlderVersion => self.delta_input = path.to_string_lossy().into_owned(),
                     Dialog::CategoryFolder(n) => {
                         if let Some(category) = self.settings.categories.get_mut(n) {
                             category.folder = Some(path);
@@ -1824,7 +1848,7 @@ impl App {
                 let pick = picker.add_filter("Netscape cookies", &["txt"]).pick_file();
                 self.spawn_event(async move { picked(pick.await) });
             }
-            Dialog::VerifyFile => {
+            Dialog::VerifyFile | Dialog::OlderVersion => {
                 let pick = picker.set_directory(&self.settings.save_dir).pick_file();
                 self.spawn_event(async move { picked(pick.await) });
             }
