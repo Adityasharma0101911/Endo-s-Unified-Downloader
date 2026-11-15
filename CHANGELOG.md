@@ -2,6 +2,14 @@
 
 What changed in each release, newest first. Each release's page on [GitHub](https://github.com/Adityasharma0101911/Endo-s-Unified-Downloader/releases) has its files and the full notes.
 
+## Unreleased
+
+- **App: find things faster.** Settings has a search box and starts with the common settings (All settings shows the rest); the Queue's list is narrowed by text in a name or link and by status (Running, Waiting, Failed, Done).
+- **App: Undo.** Removing a download, Clear completed and Clear all offer Undo for 8 seconds, in a note at the bottom of the window.
+- **App: a first-run welcome** on the Add page with the three steps to a first download, a list of the keyboard shortcuts (F1, or Shortcuts in the sidebar), and empty pages that say what to do.
+- **App: plainer words.** Common errors say what to do about them ("The file is no longer at this link…"), a download's workers are called connections, and "resolving" is "connecting".
+- Fixed: a progress bar's fill went square when short and the light sweeping over it was cut to a rectangle; both now follow the bar's round ends.
+
 ## 1.9.0 (2026-10-30)
 
 - **License: GPL-3.0-or-later** (it was MIT or Apache-2.0). Anyone may use, change and share the app; whoever shares it, or a version they changed, must share its source under the same license and keep the credit to its author (see `NOTICE`). The programs, packages and installer now carry `LICENSE` and `NOTICE`.
