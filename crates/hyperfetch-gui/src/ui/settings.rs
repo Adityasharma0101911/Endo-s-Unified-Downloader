@@ -456,9 +456,10 @@ fn connection_settings(s: &mut Settings, ui: &mut Ui) {
     setting(ui, "Connections per server", "All running downloads together, to one server (0 = no limit).", s.max_connections_per_host, |ui| {
         ui.add(egui::DragValue::new(&mut s.max_connections_per_host).range(0..=256));
     });
-    let about = "Start with the connections the server suits and add one while that makes the download faster, up to the \
-                 number above; drop one that slows it. Off, a download keeps the number it starts with.";
-    switch(ui, "Smarter connection count", about, &mut s.adaptive);
+    let about = "Each download finds its own number of connections, up to the one above: more while they make it faster, \
+                 and the fewest that reach what the server or your line allows. Its page says why. Off, a download keeps \
+                 the number it starts with.";
+    switch(ui, "Autopilot", about, &mut s.adaptive);
     setting(ui, "Speed limit", "For all downloads together (0 = unlimited).", (s.max_speed_in_mb, s.max_speed.to_bits()), |ui| {
         let in_mb = &mut s.max_speed_in_mb;
         egui::ComboBox::from_id_salt("speed_unit_combo").width(70.0).selected_text(if *in_mb { "MB/s" } else { "KB/s" }).show_ui(
@@ -894,8 +895,8 @@ mod tests {
         let mut h = Harness::new();
         h.app.tab = Tab::Settings;
         assert!(h.settle());
-        scroll_to(&mut h, "Smarter connection count");
-        click(&mut h, |h| h.find_near("Smarter connection count", TOGGLE));
+        scroll_to(&mut h, "Autopilot");
+        click(&mut h, |h| h.find_near("Autopilot", TOGGLE));
         click(&mut h, |h| h.find_near("IP version", "IPv6"));
         click(&mut h, |h| h.find("Empty: the app's"));
         h.type_text("Agent/2.0");
