@@ -1641,11 +1641,13 @@ async fn test_connections_follow_the_size_of_the_file_on_a_fast_server() {
     let _history = setup().await;
     let data = payload(3 * PREFETCH, 167);
     let mut mock = Mock::new(data.clone());
-    // Connections take 50 ms to answer, then the probe's MiB arrives before any rate is measured:
-    // a connection per MiB, as more would spend longer starting than fetching.
+    // Connections take 50 ms to answer and the host does not cap each one: a connection per MiB,
+    // as more would spend longer starting than fetching.
     mock.latency = Duration::from_millis(50);
     let mock = Arc::new(mock);
     let url = serve(Arc::clone(&mock), "three.bin").await;
+    // A loaded runner can read two flat looks at the probe as a cap for each connection and split finer.
+    hosts::record(&url, HostProfile { capped_per_connection: Some(false), ..Default::default() });
     let temp = tempdir().unwrap();
     let out = temp.path().join("three.bin");
 
