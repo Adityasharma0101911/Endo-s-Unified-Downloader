@@ -2805,6 +2805,7 @@ impl DownloadEngine {
             clients: Arc::new(pool_clients),
             addresses,
             dropped_routes: Default::default(),
+            resting_routes: Default::default(),
             reached: Default::default(),
             auth: self.auth.clone(),
             writer: job.writer.clone(),
