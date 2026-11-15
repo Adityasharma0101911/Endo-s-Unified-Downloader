@@ -1966,6 +1966,35 @@ mod tests {
         let resolved = DropboxResolver.resolve(&client, &url).await.unwrap();
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].query(), Some("dl=1"));
+        // A folder's link is the zip Dropbox makes of it; with `preview=`, Dropbox sends `dl=1`
+        // on to that one file (both checked live). Its key and other parameters stay.
+        for (shared, wanted) in [
+            ("https://www.dropbox.com/scl/fi/abc/f.pdf?rlkey=k1&st=s1&dl=0", "rlkey=k1&st=s1&dl=1"),
+            ("https://www.dropbox.com/scl/fo/abc/AAB?rlkey=k1&e=1&dl=0", "rlkey=k1&e=1&dl=1"),
+            ("https://www.dropbox.com/scl/fo/abc/AAB?rlkey=k1&preview=a+b.pdf&dl=0", "rlkey=k1&preview=a+b.pdf&dl=1"),
+            ("https://www.dropbox.com/sh/abc/AAB", "dl=1"),
+        ] {
+            let resolved = DropboxResolver.resolve(&client, &Url::parse(shared).unwrap()).await.unwrap();
+            assert_eq!(resolved[0].query(), Some(wanted), "{shared}");
+        }
+    }
+
+    /// Live: a shared file's link resolves to the file, a shared folder's to its zip, both with
+    /// their size (the answers are dropped after their headers).
+    #[tokio::test]
+    #[ignore]
+    async fn live_dropbox_files_and_folders() {
+        let client = Client::builder().default_headers(SmartResolver::default_anti_qos_headers()).build().unwrap();
+        for (shared, zip) in [
+            ("https://www.dropbox.com/scl/fi/hzfx1l267m8gwyhcjvfk4/Quantization-Cuda-vs-Triton.pdf?rlkey=s4j64ivi2kpp2l0uq8xjdwbab&dl=0", false),
+            ("https://www.dropbox.com/scl/fo/3pmq3139vtifnaak3h41a/AMOH18OVsLBp9M72WyPjitI?rlkey=q77k3bbkl1bcil3qrvrsvz7se&dl=0", true),
+        ] {
+            let resolved = SmartResolver::resolve(&client, &Url::parse(shared).unwrap()).await.unwrap();
+            let answer = client.get(resolved[0].clone()).send().await.unwrap();
+            let kind = answer.headers().get(CONTENT_TYPE).map(|t| t.to_str().unwrap().to_string()).unwrap_or_default();
+            assert!(answer.status().is_success() && !kind.starts_with("text/html") && answer.content_length().is_some_and(|n| n > 0), "{shared}: {kind}");
+            assert_eq!(kind == "application/zip", zip, "{shared}: {kind}");
+        }
     }
 
     #[test]
