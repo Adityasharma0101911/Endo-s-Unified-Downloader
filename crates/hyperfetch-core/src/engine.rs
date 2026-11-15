@@ -11,7 +11,7 @@ use futures_util::StreamExt;
 use parking_lot::Mutex;
 use reqwest::header::{
     HeaderMap, HeaderName, ACCEPT_ENCODING, ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_RANGE, CONTENT_TYPE, ETAG, IF_MODIFIED_SINCE,
-    IF_NONE_MATCH, LAST_MODIFIED, RANGE, USER_AGENT,
+    IF_NONE_MATCH, LAST_MODIFIED, LINK, RANGE, USER_AGENT,
 };
 use reqwest::{Client, Response, StatusCode};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -54,6 +54,10 @@ const RESOLVE_TIMEOUT: Duration = Duration::from_secs(30);
 /// tries and the pauses between them.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 const PROBE_CONCURRENCY: usize = 8;
+/// Most copies of a file its server names (see `advertised`) that are probed.
+const MAX_ADVERTISED: usize = 8;
+/// Largest Metalink a server names that is read.
+const MAX_METALINK: usize = 1 << 20;
 /// Tries of a probe's ranged GET while the server is busy or the connection fails.
 const PROBE_ATTEMPTS: u32 = 3;
 /// How long a probe keeps asking a server busy past those tries (429 or 503, with no HEAD to go
@@ -2532,7 +2536,16 @@ impl DownloadEngine {
         }
         // Mirrors answering late only join a download over ranges: otherwise their probes, and
         // the host slots they hold, are given up now.
-        let late = late.filter(|_| reference.accepts_ranges && reference.size != Some(reference.prefetch.len() as u64));
+        let ranged = reference.accepts_ranges && reference.size != Some(reference.prefetch.len() as u64);
+        let late = late.filter(|_| ranged);
+        // So do the copies of the file its server names.
+        let late = match ranged.then(|| self.probe_advertised(&client, &reference, &mirrors)).flatten() {
+            Some(named) => Some(match late {
+                Some(late) => futures_util::stream::select(late, named).boxed(),
+                None => named,
+            }),
+            None => late,
+        };
         let started_at = unix_now();
         let base = self.output_path_for(&reference.filename);
         // A file there is replaced only by a newer one (see `DownloadOptions::only_if_newer`).
@@ -2864,7 +2877,7 @@ impl DownloadEngine {
                         limiter.nearly_done((left as f64) < meter.speed * NEARLY_DONE_SECS);
                     }
                     if let Some(pilot) = pilot.as_mut().filter(|pilot| !pilot.done) {
-                        if let Some(next) = job.steer(pilot, &reference.final_url) {
+                        if let Some(next) = job.steer(pilot) {
                             // Workers past a lower width hand back what they have yet to receive.
                             if width.swap(next, Ordering::Relaxed) > next {
                                 job.chunks.lock().give_back(next);
@@ -2922,6 +2935,38 @@ impl DownloadEngine {
                 Err(e)
             }
         }
+    }
+
+    /// Probes of the copies of the file `reference` names (see [`advertised`]) that are none of
+    /// `mirrors`, coming in as late probes do: each joins the download only if it serves the
+    /// same file (see `RangeJob::admit`). None when it names none.
+    fn probe_advertised(&self, client: &Client, reference: &ProbeInfo, mirrors: &[ProbeInfo]) -> Option<ProbeStream> {
+        let (copies, metalink) = advertised(&reference.headers, &reference.final_url);
+        if copies.is_empty() && metalink.is_none() {
+            return None;
+        }
+        let mut seen: Vec<Url> = mirrors.iter().flat_map(|m| [m.url.clone(), m.final_url.clone()]).collect();
+        let (client, auth, limit, size) = (client.clone(), self.auth.clone(), self.options.max_connections_per_host, reference.size);
+        let listed = {
+            let client = client.clone();
+            async move {
+                let mut urls = copies;
+                if let Some(metalink) = metalink {
+                    urls.extend(metalink_mirrors(&client, &metalink, size).await);
+                }
+                urls.retain(|url| !seen.contains(url) && {
+                    seen.push(url.clone());
+                    true
+                });
+                urls.truncate(MAX_ADVERTISED);
+                futures_util::stream::iter(urls)
+            }
+        };
+        let probes = futures_util::stream::once(listed).flatten().map(move |url| {
+            let (client, auth) = (client.clone(), auth.clone());
+            async move { (0, probe_url(&client, auth.as_deref(), &url, false, limit).await.map(|(info, _)| (info, None))) }
+        });
+        Some(probes.buffer_unordered(PROBE_CONCURRENCY).boxed())
     }
 
     /// The routes a download from `url` takes turns on over its host's addresses (see
@@ -3787,20 +3832,22 @@ impl RangeJob {
         }
     }
 
-    /// The width `pilot` moves an adaptive download from `url` to, if it moves (see
-    /// [`Autopilot::next`]); call it every few hundred milliseconds.
-    fn steer(&self, pilot: &mut Autopilot, url: &Url) -> Option<usize> {
+    /// The width `pilot` moves an adaptive download to, if it moves (see [`Autopilot::next`]);
+    /// call it every few hundred milliseconds.
+    fn steer(&self, pilot: &mut Autopilot) -> Option<usize> {
         let (downloaded, size) = {
             let chunks = self.chunks.lock();
             (chunks.total_received(), chunks.total_size())
         };
         // What a new request takes to answer: the least of the mirrors in use.
-        let (startup, mirrors) = {
+        let (startup, urls) = {
             let racer = self.mirrors.lock();
-            (racer.mirrors().iter().filter(|m| m.in_flight > 0).map(crate::mirror::Mirror::ttfb).min(), racer.mirrors().len())
+            let startup = racer.mirrors().iter().filter(|m| m.in_flight > 0).map(crate::mirror::Mirror::ttfb).min();
+            (startup, racer.mirrors().iter().filter(|m| m.is_active).map(|m| m.url.clone()).collect::<Vec<_>>())
         };
-        // Other mirrors' hosts have room of their own.
-        let cap = hosts::profile(url).connection_cap.filter(|_| mirrors == 1);
+        // Each mirror's host has room of its own: the caps of them all, when each has one.
+        let mut seen = std::collections::HashSet::new();
+        let cap = urls.iter().filter(|url| seen.insert(HostKey::of(url))).map(|url| hosts::profile(url).connection_cap).sum();
         pilot.next(Instant::now(), downloaded, size.saturating_sub(downloaded), startup.unwrap_or_default(), cap)
     }
 
@@ -4405,6 +4452,51 @@ fn add_mirror(racer: &mut MirrorRacer, probe: &ProbeInfo) {
     if let Some(answer) = probe.answer_time {
         mirror.ttfb_ewma_ms = answer.as_secs_f64() * 1000.0;
     }
+}
+
+/// The copies of a file an answer names in its `Link` headers (RFC 6249): those with
+/// `rel=duplicate`, best `pri` first, and the Metalink a `rel=describedby` one points to, if any.
+/// Only HTTP(S) links; relative ones are taken from `base`.
+fn advertised(headers: &HeaderMap, base: &Url) -> (Vec<Url>, Option<Url>) {
+    let (mut copies, mut metalink) = (Vec::new(), None);
+    for value in headers.get_all(LINK).iter().filter_map(|v| v.to_str().ok()) {
+        // `<url>; name=value; ...`, comma-separated; a URL holds no `<` or `>`.
+        for link in value.split('<').skip(1) {
+            let Some((target, params)) = link.split_once('>') else { continue };
+            let Some(url) = base.join(target.trim()).ok().filter(|u| matches!(u.scheme(), "http" | "https")) else { continue };
+            let param = |name: &str| {
+                let found = params.split(';').filter_map(|p| p.split_once('=')).find(|(key, _)| key.trim().eq_ignore_ascii_case(name));
+                found.map(|(_, value)| value.trim().trim_end_matches(',').trim().trim_matches('"').to_ascii_lowercase())
+            };
+            let rel = param("rel").unwrap_or_default();
+            if rel.split_whitespace().any(|r| r == "duplicate") {
+                copies.push((param("pri").and_then(|p| p.parse::<u32>().ok()).unwrap_or(u32::MAX), url));
+            } else if rel.split_whitespace().any(|r| r == "describedby") && param("type").is_some_and(|t| t.contains("metalink")) {
+                metalink.get_or_insert(url);
+            }
+        }
+    }
+    copies.sort_by_key(|(pri, _)| *pri);
+    (copies.into_iter().map(|(_, url)| url).collect(), metalink)
+}
+
+/// The mirrors the Metalink at `url` lists for the file of `size`, or for its only file.
+async fn metalink_mirrors(client: &Client, url: &Url, size: Option<u64>) -> Vec<Url> {
+    let fetched = async {
+        let mut response = client.get(url.clone()).send().await.ok()?.error_for_status().ok()?;
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.ok()? {
+            body.extend_from_slice(&chunk);
+            if body.len() > MAX_METALINK {
+                return None;
+            }
+        }
+        String::from_utf8(body).ok()
+    };
+    let Ok(Some(text)) = tokio::time::timeout(PROBE_TIMEOUT, fetched).await else { return Vec::new() };
+    let files = crate::metalink::parse_metalink(&text).unwrap_or_default();
+    let only = files.len() == 1;
+    files.into_iter().find(|f| only || (f.size.is_some() && f.size == size)).map(|f| f.urls).unwrap_or_default()
 }
 
 /// The next probe of those still out, if any are; never while none are.
@@ -8429,6 +8521,45 @@ mod tests {
         assert!(high.as_secs_f64() < 0.75 * low.as_secs_f64(), "{high:?} {low:?}");
         // 3 MiB in all at 1 MB/s, less a second of credit.
         assert!(low > Duration::from_millis(2500), "{low:?}");
+    }
+
+    /// `Link` headers name copies of the file best `pri` first, relative links taken from the
+    /// answer's, and a Metalink; other relations and schemes are left out.
+    #[test]
+    fn test_copies_are_read_from_link_headers() {
+        let mut headers = HeaderMap::new();
+        headers.append(LINK, "<http://b.test/f>; rel=duplicate; pri=2, <ftp://c.test/f>; rel=duplicate".parse().unwrap());
+        let second = r#"<../m/f.meta4>; rel="describedby"; type="application/metalink4+xml", <http://a.test/f>; rel="duplicate"; pri=1, <http://x.test/>; rel=next"#;
+        headers.append(LINK, second.parse().unwrap());
+        let (copies, metalink) = advertised(&headers, &Url::parse("http://o.test/d/f").unwrap());
+        assert_eq!(copies, [Url::parse("http://a.test/f").unwrap(), Url::parse("http://b.test/f").unwrap()]);
+        assert_eq!(metalink, Some(Url::parse("http://o.test/m/f.meta4").unwrap()));
+    }
+
+    /// A server naming copies of its file (RFC 6249): the copy in its `Link` header and the one in
+    /// the Metalink it points to join the download; one of another size answers only its probe.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_copies_a_server_names_join_the_download_when_they_serve_the_same_file() {
+        let size = 4 * 1024 * 1024;
+        // Each slow, so every copy has work left when it joins.
+        let slow = |size| crate::netsim::Server { size, per_client: Some(1e6), ..Default::default() };
+        let (copy, at_copy) = crate::netsim::serve(slow(size)).await;
+        let (listed, at_listed) = crate::netsim::serve(slow(size)).await;
+        let (other, at_other) = crate::netsim::serve(slow(size + 1)).await;
+        let metalink = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><metalink xmlns="urn:ietf:params:xml:ns:metalink"><file name="f.bin"><size>{size}</size><url>{listed}</url></file></metalink>"#
+        );
+        let link = format!(r#"<{other}>; rel=duplicate; pri=2, <{copy}>; rel=duplicate; pri=1, <f.meta4>; rel=describedby; type="application/metalink4+xml""#);
+        let origin = crate::netsim::Server { link: Some(link), metalink: Some(metalink), ..slow(size) };
+        let (url, _) = crate::netsim::serve(origin).await;
+        let dir = tempdir().unwrap();
+        // Chunks to come, for workers to take to the copies once they join.
+        let options = DownloadOptions { base_chunk_size: 256 * 1024, ..sim_options(dir.path(), 4, false) };
+        let (got, _) = fetch_from_sim(&url, options).await;
+        assert!(got == crate::netsim::file(size));
+        assert!(at_copy.gets.load(Ordering::SeqCst) > 1, "the copy served ranges");
+        assert!(at_listed.gets.load(Ordering::SeqCst) > 1, "the Metalink's copy served ranges");
+        assert!(at_other.gets.load(Ordering::SeqCst) <= 1, "the other file answered only its probe");
     }
 
     fn sim_options(dir: &Path, connections: usize, adaptive: bool) -> DownloadOptions {

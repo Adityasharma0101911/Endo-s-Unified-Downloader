@@ -50,6 +50,10 @@ pub(crate) struct Server {
     pub decay: Option<Decay>,
     /// The first GET whose range starts at this offset or later is cut off after this many bytes.
     pub cut: Option<(usize, usize)>,
+    /// A `Link` header every answer carries.
+    pub link: Option<String>,
+    /// A Metalink, the answer to a GET of any path ending in `.meta4`.
+    pub metalink: Option<String>,
 }
 
 /// A connection that slows down and then stalls.
@@ -119,8 +123,13 @@ async fn answer(mut socket: tokio::net::TcpStream, server: Arc<Server>, stats: A
         .filter(|_| !server.no_ranges);
     tokio::time::sleep(server.first_byte).await;
     let ranges = if server.no_ranges { "" } else { "Accept-Ranges: bytes\r\n" };
+    let link = server.link.as_ref().map(|link| format!("Link: {link}\r\n")).unwrap_or_default();
+    if let Some(meta) = server.metalink.as_ref().filter(|_| head.split_whitespace().nth(1).is_some_and(|path| path.ends_with(".meta4"))) {
+        let _ = socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{meta}", meta.len()).as_bytes()).await;
+        return;
+    }
     if head.starts_with("head ") {
-        let _ = socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {size}\r\n{ranges}Connection: close\r\n\r\n").as_bytes()).await;
+        let _ = socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {size}\r\n{ranges}{link}Connection: close\r\n\r\n").as_bytes()).await;
         return;
     }
     stats.gets.fetch_add(1, Ordering::SeqCst);
@@ -139,7 +148,7 @@ async fn answer(mut socket: tokio::net::TcpStream, server: Arc<Server>, stats: A
         Some(_) => format!("206 Partial Content\r\nContent-Range: bytes {start}-{end}/{size}"),
         None => "200 OK".to_string(),
     };
-    let reply = format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\n{ranges}ETag: \"v1\"\r\nConnection: close\r\n\r\n", end + 1 - start);
+    let reply = format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\n{ranges}{link}ETag: \"v1\"\r\nConnection: close\r\n\r\n", end + 1 - start);
     if socket.write_all(reply.as_bytes()).await.is_err() {
         return;
     }
