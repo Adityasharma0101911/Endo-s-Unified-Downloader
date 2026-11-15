@@ -234,6 +234,14 @@ fn progress_card(app: &App, ui: &mut Ui, item: &QueueItem) {
             });
         }
 
+        if let Some(why) = view.and_then(|view| view.autopilot.as_deref()).filter(|_| downloading) {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Autopilot").small().color(p.muted));
+                ui.add(egui::Label::new(RichText::new(why).color(p.strong)).truncate()).on_hover_text(why);
+            });
+        }
+
         if let Some(stalled) = app.stalled_for(item.id).filter(|_| downloading) {
             ui.add_space(6.0);
             let text = format!(
@@ -1294,6 +1302,22 @@ mod tests {
         assert_eq!(h.app.queue.get_item(id).unwrap().status, QueueItemStatus::Downloading, "started again at once");
         h.wait_for(|app| matches!(app.queue.get_item(id).unwrap().status, QueueItemStatus::Failed(_)));
         h.wait_for_background();
+    }
+
+    /// A running download's page says on one line why it has the connections it has, as the
+    /// engine's Autopilot last told it.
+    #[test]
+    fn a_running_download_says_why_it_has_its_connections() {
+        let mut h = Harness::new();
+        let id = h.add("big.iso");
+        h.progress(id, 0.4);
+        let why = "2 connections: the server limits each user to about 3.8 MiB/s, so more would not help";
+        h.app.jobs.get_mut(&id).unwrap().autopilot = Some(why.to_string());
+        h.app.focused = Some(id);
+        h.frames(10);
+        let lines: Vec<String> = h.texts().into_iter().map(|(text, _)| text).collect();
+        let at = lines.iter().position(|text| text == "Autopilot").expect("labelled");
+        assert_eq!(lines.get(at + 1).map(String::as_str), Some(why), "{lines:?}");
     }
 
     /// Each line's file name, whether it is a ghost, and how many rows down it is pushed.

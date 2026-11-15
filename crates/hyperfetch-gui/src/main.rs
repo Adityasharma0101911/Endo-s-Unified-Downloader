@@ -241,6 +241,8 @@ struct JobView {
     torrent: Option<hyperfetch_core::p2p::TorrentProgress>,
     /// What is known of its server, from its last snapshot (see `EngineSnapshot::host`).
     host: Option<hyperfetch_core::hosts::HostProfile>,
+    /// Why it has the connections it has, from its last snapshot (see `EngineSnapshot::autopilot`).
+    autopilot: Option<String>,
 }
 
 impl JobView {
@@ -1385,6 +1387,7 @@ impl App {
             self.queue.apply_snapshot(id, &snapshot);
             view.torrent.clone_from(&snapshot.torrent);
             view.host = snapshot.host;
+            view.autopilot = snapshot.autopilot;
             view.mirror_speeds = snapshot.mirror_speeds;
             if !snapshot.chunks.is_empty() {
                 view.chunks = snapshot.chunks;
