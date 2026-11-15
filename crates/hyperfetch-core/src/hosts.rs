@@ -11,6 +11,11 @@
 //! strict one asks), and than the connection cap the host was seen to enforce. A limit of 0 sets
 //! none.
 //!
+//! A host that refused a request with 429/503 takes none for the rest it asked for (its
+//! Retry-After), whichever download or probe would send it; nor while it leaves requests
+//! unanswered just after (see [`HostSlot::unanswered`]). From then on, until it answers again,
+//! requests go out one at a time, and one more at once with each answer, as a new download's do.
+//!
 //! Some facts are also kept across restarts once a front end names a file for them (see
 //! [`keep_in`]): the connections a download from the host ended up fastest with, the connection
 //! cap it was seen to enforce, the speed it held a download to whatever its connections, and what
@@ -43,6 +48,14 @@ const KEPT_FOR: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const KEEP_KEPT: usize = 300;
 /// What the line speed is kept under: no host's name, as those have a scheme.
 const LINE: &str = "line";
+/// How long after a host refused a request (429/503) a request it leaves unanswered (it refuses or
+/// drops connections) is taken for a ban to wait out rather than a failure: firewalls shut out an
+/// address that kept asking for minutes. Past it, a host that does not answer is dead.
+pub const BANNED_FOR: Duration = Duration::from_secs(10 * 60);
+/// The rest of a host after the first request it left unanswered within `BANNED_FOR`; twice as
+/// long after each further one in a row, up to `MAX_BAN_REST`.
+const BAN_REST: Duration = Duration::from_secs(5);
+const MAX_BAN_REST: Duration = Duration::from_secs(60);
 /// A download within this share of the fastest one went as fast as the line lets it.
 const LINE_BAND: f64 = 0.1;
 
@@ -188,6 +201,11 @@ fn unix_now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs())
 }
 
+/// Now, by the runtime's clock, which a host's rest is waited out by (paused in tests).
+fn clock() -> Instant {
+    tokio::time::Instant::now().into_std()
+}
+
 /// Waits until a request to `url`'s host may be opened under `limit` (see the module docs) and
 /// returns its slot. Waiting is no failure: nothing else is held meanwhile, and dropping the
 /// future gives up the wait. Never wait for a slot while holding another.
@@ -207,7 +225,7 @@ pub fn try_acquire(url: &Url, limit: usize) -> Option<HostSlot> {
 
 /// A slot for a request to `url`'s host on specific route `route_id` under `limit`, if one is free now.
 pub fn try_acquire_routed(url: &Url, limit: usize, route_id: usize) -> Option<HostSlot> {
-    HOSTS.try_acquire(&HostKey::routed(url, route_id), limit, Instant::now())
+    HOSTS.try_acquire(&HostKey::routed(url, route_id), limit, clock())
 }
 
 /// The most requests `url`'s host has had open at once.
@@ -240,6 +258,8 @@ pub struct HostSlot {
     key: HostKey,
     limit: usize,
     opens_connection: bool,
+    /// Its request has no answer yet (counted in `Entry::asking`).
+    asking: std::sync::atomic::AtomicBool,
 }
 
 impl HostSlot {
@@ -257,24 +277,38 @@ impl HostSlot {
         self.opens_connection
     }
 
-    /// The host refused this request with 429/503. With other requests to it open at the time, it
+    /// The host refused this request with 429/503, asking for a `pause` (its Retry-After): no
+    /// request goes to it until that is over. With other requests to it open at the time, it
     /// serves no more than those at once: every download to it is held to that, for
     /// `PROFILE_TTL`. With none, the host was just busy.
-    pub fn throttled(&self) {
-        self.hosts.throttled(&self.key, Instant::now())
+    pub fn throttled(&self, pause: Duration) {
+        self.hosts.throttled(&self.key, self.answer(), pause, clock())
     }
 
     /// The host accepted this request. Serving as many as the cap it was seen to enforce, it is
     /// offered one more, at most once per `CAP_PROBE_INTERVAL` after the cap was learned or last
     /// raised: a host that means its cap refuses each request offered past it.
     pub fn accepted(&self) {
-        self.hosts.accepted(&self.key, Instant::now())
+        self.hosts.accepted(&self.key, self.answer(), clock())
+    }
+
+    /// This request got no answer: its connection failed or was dropped. Within `BANNED_FOR` of
+    /// the host refusing a request, that is the host shutting us out for a while: it rests,
+    /// `BAN_REST` and twice as long after each such request in a row, up to `MAX_BAN_REST`, and
+    /// that rest is returned. None otherwise: the request failed.
+    pub fn unanswered(&self) -> Option<Duration> {
+        self.hosts.unanswered(&self.key, self.answer(), clock())
+    }
+
+    /// Whether its request was waiting for an answer, which it no longer is.
+    fn answer(&self) -> bool {
+        self.asking.swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 }
 
 impl Drop for HostSlot {
     fn drop(&mut self) {
-        self.hosts.release(&self.key, self.limit, Instant::now())
+        self.hosts.release(&self.key, self.limit, self.answer(), clock())
     }
 }
 
@@ -365,6 +399,15 @@ struct Entry {
     idle: Vec<Instant>,
     /// When the connection cap was last raised.
     cap_raised: Option<Instant>,
+    /// Requests open that have no answer yet.
+    asking: usize,
+    /// No request goes out before this.
+    rest_until: Option<Instant>,
+    /// When the host last refused a request (429/503), and the answers it gave since: while it
+    /// gave fewer than the requests waiting for one, no other goes out.
+    refused: Option<(Instant, usize)>,
+    /// Requests it left unanswered in a row within `BANNED_FOR` of that.
+    unanswered: u32,
     /// The most requests ever open at once.
     #[cfg(test)]
     peak: usize,
@@ -377,6 +420,19 @@ impl Entry {
             && self.waiting.is_empty()
             && self.facts.profile(now) == HostProfile::default()
             && self.idle.iter().all(|&at| now.saturating_duration_since(at) >= POOL_IDLE)
+            && self.refused.is_none_or(|(at, _)| now.saturating_duration_since(at) >= BANNED_FOR)
+    }
+
+    /// Whether a request may go out `now` as far as the host's rest and its answers since it
+    /// refused one go; also when the rest ends, if it rests.
+    fn ready(&self, now: Instant) -> Result<(), Option<Instant>> {
+        if let Some(until) = self.rest_until.filter(|&until| until > now) {
+            return Err(Some(until));
+        }
+        match self.refused {
+            Some((_, answers)) if self.asking > answers => Err(None),
+            _ => Ok(()),
+        }
     }
 
     /// The smallest limit among the requests open or waiting.
@@ -573,12 +629,19 @@ impl Hosts {
     }
 
     fn try_acquire(&'static self, key: &HostKey, limit: usize, now: Instant) -> Option<HostSlot> {
+        self.take(key, limit, now).ok()
+    }
+
+    /// A slot, else when the host's rest ends if that is what holds the request back.
+    fn take(&'static self, key: &HostKey, limit: usize, now: Instant) -> Result<HostSlot, Option<Instant>> {
         let mut entries = self.entries.lock();
         let entry = self.entry(&mut entries, key, now);
+        entry.ready(now)?;
         if entry.open >= entry.allowance(key, limit, now) {
-            return None;
+            return Err(None);
         }
         entry.open += 1;
+        entry.asking += 1;
         add_limit(&mut entry.held, limit);
         #[cfg(test)]
         {
@@ -586,7 +649,7 @@ impl Hosts {
         }
         entry.idle.retain(|&at| now.saturating_duration_since(at) < POOL_IDLE);
         let opens_connection = entry.idle.pop().is_none();
-        Some(HostSlot { hosts: self, key: key.clone(), limit, opens_connection })
+        Ok(HostSlot { hosts: self, key: key.clone(), limit, opens_connection, asking: true.into() })
     }
 
     async fn acquire(&'static self, key: HostKey, limit: usize) -> HostSlot {
@@ -601,11 +664,30 @@ impl Hosts {
             let freed = self.freed.notified();
             tokio::pin!(freed);
             freed.as_mut().enable();
-            if let Some(slot) = self.try_acquire(&key, limit, Instant::now()) {
-                return slot;
+            match self.take(&key, limit, clock()) {
+                Ok(slot) => return slot,
+                // Nothing is freed when a rest ends.
+                Err(Some(rested)) => {
+                    tokio::select! {
+                        _ = freed => {}
+                        _ = tokio::time::sleep_until(rested.into()) => {}
+                    }
+                }
+                Err(None) => freed.await,
             }
-            freed.await;
         }
+    }
+
+    /// Counts a request that `asked` for an answer until now as no longer asking.
+    fn answered(entry: &mut Entry, asked: bool) {
+        if asked {
+            entry.asking = entry.asking.saturating_sub(1);
+        }
+    }
+
+    /// Rests `entry`'s host until at least `until`.
+    fn rest(entry: &mut Entry, until: Instant) {
+        entry.rest_until = Some(entry.rest_until.map_or(until, |rest| rest.max(until)));
     }
 
     fn stop_waiting(&self, key: &HostKey, limit: usize, now: Instant) {
@@ -625,10 +707,11 @@ impl Hosts {
         }
     }
 
-    fn release(&self, key: &HostKey, limit: usize, now: Instant) {
+    fn release(&self, key: &HostKey, limit: usize, asked: bool, now: Instant) {
         {
             let mut entries = self.entries.lock();
             if let Some(entry) = entries.get_mut(key) {
+                Self::answered(entry, asked);
                 entry.open = entry.open.saturating_sub(1);
                 remove_limit(&mut entry.held, limit);
                 if entry.idle.len() >= POOL_MAX_IDLE {
@@ -641,8 +724,12 @@ impl Hosts {
         self.freed.notify_waiters();
     }
 
-    fn throttled(&self, key: &HostKey, now: Instant) {
+    fn throttled(&self, key: &HostKey, asked: bool, pause: Duration, now: Instant) {
         if let Some(entry) = self.entries.lock().get_mut(key) {
+            Self::answered(entry, asked);
+            Self::rest(entry, now + pause);
+            entry.refused = Some((now, 0));
+            entry.unanswered = 0;
             // The refused request still holds its slot.
             let others = entry.open.saturating_sub(1);
             if others > 0 {
@@ -652,13 +739,35 @@ impl Hosts {
         }
     }
 
-    fn accepted(&self, key: &HostKey, now: Instant) {
+    fn unanswered(&self, key: &HostKey, asked: bool, now: Instant) -> Option<Duration> {
+        let mut entries = self.entries.lock();
+        let entry = entries.get_mut(key)?;
+        Self::answered(entry, asked);
+        if !asked || entry.refused.is_none_or(|(at, _)| now.saturating_duration_since(at) >= BANNED_FOR) {
+            return None;
+        }
+        // Requests out before the host began to rest for this fail alike: they are one sign.
+        if entry.unanswered > 0 && entry.rest_until.is_some_and(|until| until > now) {
+            return entry.rest_until.map(|until| until - now);
+        }
+        entry.unanswered += 1;
+        let pause = BAN_REST.saturating_mul(1 << (entry.unanswered - 1).min(8)).min(MAX_BAN_REST);
+        Self::rest(entry, now + pause);
+        entry.refused = entry.refused.map(|(at, _)| (at, 0));
+        Some(pause)
+    }
+
+    fn accepted(&self, key: &HostKey, asked: bool, now: Instant) {
         let raised = self.entries.lock().get_mut(key).is_some_and(|entry| {
-            match (entry.facts.connection_cap, fresh(entry.facts.connection_cap, now)) {
+            Self::answered(entry, asked);
+            entry.unanswered = 0;
+            // Each answer since a refusal lets one more request wait for its answer at once.
+            let grew = entry.refused.as_mut().map(|(_, answers)| *answers += 1).is_some();
+            grew | match (entry.facts.connection_cap, fresh(entry.facts.connection_cap, now)) {
                 (Some((cap, learned)), Some(_)) if entry.open >= cap => {
                     let since = entry.cap_raised.map_or(learned, |raised| raised.max(learned));
                     if now.saturating_duration_since(since) < CAP_PROBE_INTERVAL {
-                        return false;
+                        return grew;
                     }
                     // The cap keeps the time it was learned at, so it still expires.
                     entry.facts.connection_cap = Some((cap + 1, learned));
@@ -785,39 +894,102 @@ mod tests {
         let (hosts, host, t0) = (leaked(), key("http://capped.example/"), Instant::now());
         // Refused with nothing else open, the host was only busy.
         let alone = hosts.try_acquire(&host, 32, t0).unwrap();
-        alone.throttled();
+        alone.throttled(Duration::ZERO);
         drop(alone);
         assert_eq!(hosts.profile(&host, t0).connection_cap, None);
-        // Refused with two others open, it serves two at once.
-        let three: Vec<HostSlot> = (0..3).map(|_| hosts.try_acquire(&host, 32, t0).unwrap()).collect();
-        three[2].throttled();
+        // Refused with two others open, it serves two at once. (Since the refusal each request
+        // waits for the answers of those before it.)
+        let three: Vec<HostSlot> = (0..3).map(|_| answered(hosts.try_acquire(&host, 32, t0).unwrap())).collect();
+        three[2].throttled(Duration::ZERO);
         drop(three);
         assert_eq!(hosts.profile(&host, Instant::now()).connection_cap, Some(2));
 
         // A later download from the host starts at that cap, whatever its own limit allows.
         let now = Instant::now();
-        let mut later: Vec<HostSlot> = (0..2).map(|_| hosts.try_acquire(&host, 32, now).unwrap()).collect();
+        let mut later: Vec<HostSlot> = (0..2).map(|_| answered(hosts.try_acquire(&host, 32, now).unwrap())).collect();
         assert!(hosts.try_acquire(&host, 32, now).is_none());
         // Served in full at the cap, the host is offered one more request, but not every time:
         // each offer a capped host refuses costs a request.
-        hosts.accepted(&host, now);
+        hosts.accepted(&host, false, now);
         assert!(hosts.try_acquire(&host, 32, now).is_none(), "the cap was just learned");
         let probe = now + CAP_PROBE_INTERVAL;
-        hosts.accepted(&host, probe);
-        later.push(hosts.try_acquire(&host, 32, probe).unwrap());
+        hosts.accepted(&host, false, probe);
+        later.push(answered(hosts.try_acquire(&host, 32, probe).unwrap()));
         assert_eq!(hosts.profile(&host, probe).connection_cap, Some(3));
-        hosts.accepted(&host, probe);
+        hosts.accepted(&host, false, probe);
         assert!(hosts.try_acquire(&host, 32, probe).is_none(), "the cap was just raised");
         // Refused again: back to what it served, and the next offer waits a full interval from then.
         let refused = probe + Duration::from_secs(5);
-        hosts.throttled(&host, refused);
+        hosts.throttled(&host, false, Duration::ZERO, refused);
         drop(later.pop());
-        hosts.accepted(&host, probe + CAP_PROBE_INTERVAL);
+        hosts.accepted(&host, false, probe + CAP_PROBE_INTERVAL);
         assert_eq!(hosts.profile(&host, refused).connection_cap, Some(2));
-        hosts.accepted(&host, refused + CAP_PROBE_INTERVAL);
+        hosts.accepted(&host, false, refused + CAP_PROBE_INTERVAL);
         assert_eq!(hosts.profile(&host, refused).connection_cap, Some(3));
         // Ten minutes after it was seen, the cap is forgotten.
         assert!(hosts.try_acquire(&host, 32, refused + PROFILE_TTL).is_some());
+    }
+
+    fn answered(slot: HostSlot) -> HostSlot {
+        slot.accepted();
+        slot
+    }
+
+    #[tokio::test]
+    async fn test_a_refusal_rests_the_host_and_requests_come_back_one_at_a_time() {
+        let (hosts, host) = (leaked(), key("http://resting.example/"));
+        let refused = hosts.try_acquire(&host, 0, clock()).unwrap();
+        hosts.throttled(&host, refused.answer(), Duration::from_millis(300), clock());
+        drop(refused);
+        assert!(hosts.try_acquire(&host, 0, clock()).is_none(), "no request goes out while it rests");
+        let started = tokio::time::Instant::now();
+        let first = tokio::time::timeout(Duration::from_secs(10), hosts.acquire(host.clone(), 0)).await.expect("taken once the rest is over");
+        assert!(started.elapsed() >= Duration::from_millis(250));
+        // The next waits for the first's answer; after it, two may wait for theirs at once.
+        let second = tokio::spawn(hosts.acquire(host.clone(), 0));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!second.is_finished(), "one request at a time");
+        first.accepted();
+        let _second = tokio::time::timeout(Duration::from_secs(10), second).await.expect("the answer lets the next go").unwrap();
+        let _third = hosts.try_acquire(&host, 0, clock()).expect("one answer lets two ask at once");
+        assert!(hosts.try_acquire(&host, 0, clock()).is_none());
+    }
+
+    #[test]
+    fn test_a_host_that_shuts_us_out_after_refusing_us_is_waited_for_with_growing_rests() {
+        let (hosts, host, t0) = (leaked(), key("http://banning.example/"), Instant::now());
+        let slot = hosts.try_acquire(&host, 0, t0).unwrap();
+        assert_eq!(hosts.unanswered(&host, slot.answer(), t0), None, "a host that never refused us: the request failed");
+        drop(slot);
+        let (out, also) = (hosts.try_acquire(&host, 0, t0).unwrap(), hosts.try_acquire(&host, 0, t0).unwrap());
+        let refused = hosts.try_acquire(&host, 0, t0).unwrap();
+        hosts.throttled(&host, refused.answer(), Duration::from_secs(1), t0);
+        drop(refused);
+        // Two requests out when it shut us out fail alike: one sign, one rest.
+        let at = t0 + Duration::from_secs(1);
+        assert_eq!(hosts.unanswered(&host, out.answer(), at), Some(BAN_REST));
+        assert_eq!(hosts.unanswered(&host, also.answer(), at + Duration::from_secs(1)), Some(BAN_REST - Duration::from_secs(1)));
+        drop((out, also));
+        // From then on one request at a time, each rest twice the last, up to a bound.
+        let (mut at, mut rests) = (at + BAN_REST, Vec::new());
+        for _ in 0..5 {
+            let slot = hosts.try_acquire(&host, 0, at).expect("the rest is over");
+            assert!(hosts.try_acquire(&host, 0, at).is_none(), "one request at a time");
+            let rest = hosts.unanswered(&host, slot.answer(), at).unwrap();
+            assert!(hosts.try_acquire(&host, 0, at + rest - Duration::from_millis(1)).is_none(), "it rests");
+            rests.push(rest.as_secs());
+            at += rest;
+        }
+        assert_eq!(rests, [10, 20, 40, 60, 60]);
+        // An answer ends the streak.
+        hosts.accepted(&host, hosts.try_acquire(&host, 0, at).unwrap().answer(), at);
+        let slot = hosts.try_acquire(&host, 0, at).unwrap();
+        assert_eq!(hosts.unanswered(&host, slot.answer(), at), Some(BAN_REST));
+        drop(slot);
+        // Long after the refusal a host that does not answer is dead: its requests fail.
+        let late = t0 + BANNED_FOR;
+        let slot = hosts.try_acquire(&host, 0, late).unwrap();
+        assert_eq!(hosts.unanswered(&host, slot.answer(), late), None);
     }
 
     #[tokio::test(start_paused = true)]
