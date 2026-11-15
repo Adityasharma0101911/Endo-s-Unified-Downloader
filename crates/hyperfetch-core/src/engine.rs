@@ -33,7 +33,7 @@ use crate::resolver::HtmlVideoResolver;
 use crate::state::DownloadState;
 use crate::storage::{verify_digest, DiskWriter, FileDigest, StorageError, StreamHasher, VerifyError};
 use crate::worker::{
-    authorize, content_length, retry_after, send, Auth, Body, FailureKind, HttpWorker, RateLimiter, Seed, WorkerEvent,
+    authorize, content_length, retry_after, send, Auth, Body, FailureKind, HttpWorker, Ramp, RateLimiter, Seed, WorkerEvent,
     WorkerShared,
 };
 
@@ -63,7 +63,7 @@ const PROBE_ATTEMPTS: u32 = 3;
 /// How long a probe keeps asking a server busy past those tries (429 or 503, with no HEAD to go
 /// by), waiting as its Retry-After says, else this long and then twice as long each time, up to
 /// eight times as long.
-const BUSY_PATIENCE: Duration = Duration::from_secs(120);
+const BUSY_PATIENCE: Duration = Duration::from_secs(5 * 60);
 const BUSY_BACKOFF: Duration = Duration::from_secs(2);
 /// Longest pause between probe tries, whatever Retry-After asks for.
 const PROBE_RETRY_CAP: Duration = Duration::from_secs(5);
@@ -2950,6 +2950,8 @@ impl DownloadEngine {
             stall_timeout: self.stall_timeout(),
             body_idle: self.stall_timeout().min(BODY_IDLE),
             width: Arc::new(num_workers.into()),
+            // FTP and SFTP sessions are no requests a host counts.
+            ramp: Arc::new(Ramp::new(if self.ftp.is_some() || self.sftp.is_some() { usize::MAX } else { 2 })),
         };
         // An FTP or SFTP download's workers fetch over it (see `crate::ftp::work`).
         let spawn = |workers: &mut JoinSet<()>, worker_id: usize, shared: &WorkerShared| {
@@ -3160,6 +3162,14 @@ impl DownloadEngine {
             if bad_responses >= 2 {
                 return Err(format!("Download failed: every mirror failed; last error: {}", error));
             }
+            // A host shutting us out is waited for; `hosts::BANNED_FOR` bounds how long.
+            if let FailureKind::Banned(rest) = kind {
+                tracing::warn!("Download attempt failed ({}); the host rests {:?}", error, rest);
+                tokio::select! {
+                    _ = self.cancel_token.cancelled() => return Err(CANCELLED.to_string()),
+                    _ = tokio::time::sleep(rest) => continue,
+                }
+            }
             failures += 1;
             if failures > self.options.max_retries {
                 return Err(format!("Download failed after {} attempts: {}", failures, error));
@@ -3193,7 +3203,9 @@ impl DownloadEngine {
     ) -> Result<FileDigest, (FailureKind, String)> {
         let stall = self.stall_timeout();
         let transient = |msg: String| (FailureKind::Transient, msg);
-        let (response, _slot) = match answered {
+        // No answer from a host that refused us just before: it shuts us out for a while.
+        let unanswered = |slot: &HostSlot, msg: String| slot.unanswered().map_or((FailureKind::Transient, msg.clone()), |rest| (FailureKind::Banned(rest), msg));
+        let (response, slot) = match answered {
             Some(answered) => answered,
             None => {
                 // Waiting for the host's other requests is no stall.
@@ -3210,8 +3222,8 @@ impl DownloadEngine {
                     biased;
                     _ = self.cancel_token.cancelled() => return Err(transient(CANCELLED.to_string())),
                     res = tokio::time::timeout(stall, request) => match res {
-                        Err(_) => return Err(transient(format!("no response within {}s", stall.as_secs()))),
-                        Ok(Err(e)) => return Err(transient(format!("request failed: {}", e))),
+                        Err(_) => return Err(unanswered(&slot, format!("no response within {}s", stall.as_secs()))),
+                        Ok(Err(e)) => return Err(unanswered(&slot, format!("request failed: {}", e))),
                         Ok(Ok(resp)) => resp,
                     },
                 };
@@ -3222,7 +3234,9 @@ impl DownloadEngine {
         if !status.is_success() {
             let kind = match status {
                 StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE => {
-                    FailureKind::Throttled(retry_after(response.headers()))
+                    let after = retry_after(response.headers());
+                    slot.throttled(after.unwrap_or_default());
+                    FailureKind::Throttled(after)
                 }
                 StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND | StatusCode::GONE => {
                     FailureKind::BadMirror
@@ -3231,6 +3245,7 @@ impl DownloadEngine {
             };
             return Err((kind, format!("HTTP {}", status)));
         }
+        slot.accepted();
         if let (Some(expected), Some(len)) = (remote.size, content_length(response.headers())) {
             if len != expected {
                 return Err((FailureKind::Fatal, format!("remote file changed: server now sends {} bytes, expected {}", len, expected)));
@@ -4533,9 +4548,11 @@ async fn probe_with(
                 Err(_) => Some(Duration::ZERO),
             };
             match retry_in {
-                Some(after) if attempt < PROBE_ATTEMPTS => {
+                // A wait asked for is waited out holding no slot, while the host rests (see
+                // `crate::hosts`): by `probe_url`, or by the download going by HEAD.
+                Some(after) if attempt < PROBE_ATTEMPTS && after.is_zero() => {
                     drop(sent);
-                    tokio::time::sleep(crate::chunk::backoff_delay(attempt).max(after).min(PROBE_RETRY_CAP)).await;
+                    tokio::time::sleep(crate::chunk::backoff_delay(attempt).min(PROBE_RETRY_CAP)).await;
                 }
                 _ => {
                     let answered = tokio::time::Instant::now();
@@ -4555,6 +4572,18 @@ async fn probe_with(
             let head = if complete { None } else { tokio::time::timeout(HEAD_GRACE, head).await.ok().flatten() };
             (head, ranged)
         }
+    };
+    // The GET's host answered, asked for a rest, or shuts us out for one (see `crate::hosts`).
+    let shut_out = match &ranged {
+        Ok(resp) if is_busy(resp.status()) => {
+            slot.throttled(retry_after(resp.headers()).unwrap_or_default());
+            None
+        }
+        Ok(_) => {
+            slot.accepted();
+            None
+        }
+        Err(_) => slot.unanswered(),
     };
     // Still busy or unreachable after every try: that says nothing about range support.
     let unanswered = ranged.as_ref().map_or(true, |resp| is_busy(resp.status()));
@@ -4595,7 +4624,14 @@ async fn probe_with(
                 _ => ProbeError::Failed(message),
             });
         }
-        (Err(e), None) => return Err(format!("{}: {}", url, e).into()),
+        // A host that refused us just before shuts us out for a while: asked again after it.
+        (Err(e), None) => {
+            let message = format!("{}: {}", url, e);
+            return Err(match shut_out {
+                Some(rest) => ProbeError::Busy(message, Some(rest)),
+                None => message.into(),
+            });
+        }
         // Some servers reject HEAD and any Range header: a plain GET is the last resort.
         (Ok(_), None) => {
             let plain = send(|url: &Url| authorize(client.get(url.clone()), auth, url).header(ACCEPT_ENCODING, "identity"), url)
@@ -4680,7 +4716,7 @@ fn slot_at(slot: HostSlot, url: &Url, limit: usize) -> Option<HostSlot> {
     if *slot.host() == HostKey::of(url) {
         Some(slot)
     } else {
-        hosts::try_acquire(url, limit)
+        hosts::try_acquire(url, limit).inspect(HostSlot::accepted)
     }
 }
 
@@ -8949,6 +8985,64 @@ mod tests {
         assert!(said.starts_with("1 connection: the server or your line holds it to about "), "{said}");
         assert_eq!(hosts::best_connections(&url), Some(1));
         assert!(hosts::limit(&url).is_some_and(|limit| (1.5e6..2.5e6).contains(&limit)), "{:?}", hosts::limit(&url));
+    }
+
+    /// The (refused, too early, shut out) counts of a rate-limited server.
+    fn refusals(stats: &crate::netsim::Stats) -> (usize, usize, usize) {
+        let seen = |n: &std::sync::atomic::AtomicUsize| n.load(Ordering::SeqCst);
+        (seen(&stats.throttled), seen(&stats.early), seen(&stats.shut))
+    }
+
+    /// A server that takes 4 requests a second, answers 429 past them and shuts out a client it
+    /// refused 6 times in a second: a new download opens its connections in rounds instead of 7
+    /// at once, rests the host whenever it is refused and is never shut out, which would fail it
+    /// with its 2 retries.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_host_that_limits_how_fast_requests_come_is_not_rushed() {
+        let size = 6 * 1024 * 1024;
+        let rate = crate::netsim::RateLimit { requests: 4, window: Duration::from_secs(1), retry_after: 1, ban_after: 6, ban: Duration::from_secs(5) };
+        let (url, stats) = crate::netsim::serve(crate::netsim::Server { size, per_connection: Some(2e6), rate: Some(rate), ..Default::default() }).await;
+        let dir = tempdir().unwrap();
+        let (got, _) = fetch_from_sim(&url, DownloadOptions { max_retries: 2, ..sim_options(dir.path(), 8, true) }).await;
+        assert!(got == crate::netsim::file(size));
+        let (refused, early, shut) = refusals(&stats);
+        assert_eq!((early, shut), (0, 0), "no request in a rest the server asked for, so never shut out ({refused} refused)");
+    }
+
+    /// A server that shuts out a client at its first refusal, for 3 s: the requests it then leaves
+    /// unanswered are waited out without costing retries, of which the download has one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_host_that_shuts_us_out_for_a_while_is_waited_for() {
+        let size = 4 * 1024 * 1024;
+        let rate = crate::netsim::RateLimit { requests: 3, window: Duration::from_secs(1), retry_after: 1, ban_after: 1, ban: Duration::from_secs(3) };
+        let (url, stats) = crate::netsim::serve(crate::netsim::Server { size, per_connection: Some(1e6), rate: Some(rate), ..Default::default() }).await;
+        let dir = tempdir().unwrap();
+        let (got, _) = fetch_from_sim(&url, DownloadOptions { max_retries: 1, ..sim_options(dir.path(), 8, true) }).await;
+        assert!(got == crate::netsim::file(size));
+        let (refused, _, shut) = refusals(&stats);
+        assert!(refused >= 1 && shut >= 1, "the server shut us out ({refused} refused, {shut} shut out)");
+    }
+
+    /// Four files from one such host at once, as a batch fetches them: a refusal rests the host
+    /// for them all, probes included, and requests come back one at a time; every file finishes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_batch_from_a_host_that_limits_how_fast_requests_come_finishes() {
+        let size = 1536 * 1024;
+        let rate = crate::netsim::RateLimit { requests: 6, window: Duration::from_secs(1), retry_after: 1, ban_after: 8, ban: Duration::from_secs(5) };
+        let (url, stats) = crate::netsim::serve(crate::netsim::Server { size, per_connection: Some(1e6), rate: Some(rate), ..Default::default() }).await;
+        let dir = tempdir().unwrap();
+        let files = ["a", "b", "c", "d"].map(|name| {
+            let url = url.join(&format!("{name}.bin")).unwrap();
+            let options = DownloadOptions { remote_checksum: false, ..sim_options(dir.path(), 4, true) };
+            let options = DownloadOptions { output_path: Some(dir.path().join(name)), ..options };
+            async move { DownloadEngine::new(vec![url], options).run(None).await }
+        });
+        let done = tokio::time::timeout(Duration::from_secs(60), futures_util::future::join_all(files)).await.expect("finished in a minute");
+        for path in done {
+            assert!(std::fs::read(path.unwrap()).unwrap() == crate::netsim::file(size));
+        }
+        let (refused, early, shut) = refusals(&stats);
+        assert_eq!((early, shut), (0, 0), "{refused} refused");
     }
 
     /// A server that caps each connection at 256 KB/s: seen to, the download opens all it may at

@@ -648,8 +648,8 @@ pub(crate) fn settle(s: &WorkerShared, worker_id: usize, chunk: &Chunk, mirror_i
     }
     let (delay, counts) = match kind {
         FailureKind::Throttled(_) => {
-            slot.throttled();
             let others = mirror.in_flight;
+            slot.throttled(if others > 0 { THROTTLE_RETRY } else { THROTTLE_COOLDOWN });
             mirror.record_throttled(others);
             if others > 0 {
                 (THROTTLE_RETRY, false)

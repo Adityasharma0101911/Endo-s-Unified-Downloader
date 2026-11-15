@@ -46,6 +46,9 @@ pub enum FailureKind {
     Transient,
     /// 429/503, with the server's Retry-After if it sent one.
     Throttled(Option<Duration>),
+    /// No answer from a host that refused a request just before: it shuts us out for a while, and
+    /// rests this long (see [`HostSlot::unanswered`]). Waited out without costing a retry.
+    Banned(Duration),
     /// This mirror cannot serve the file (wrong Content-Range, ignored Range).
     BadMirror,
     /// The URL refused the request (401/403/404/410), or a redirect target answered with anything
@@ -385,18 +388,48 @@ pub struct WorkerShared {
     /// Connections the download keeps open (see `DownloadOptions::adaptive`): a worker whose id
     /// is not below it waits, once its attempt ends, until it is again.
     pub width: Arc<std::sync::atomic::AtomicUsize>,
+    /// Workers that may have sent a request yet: those past it wait as those past `width` do.
+    pub ramp: Arc<Ramp>,
+}
+
+/// How many of a download's workers may have sent a request: twice the answers it had, the
+/// probe's among them. A download opens its connections in rounds, each twice the last once the
+/// host answered it, instead of all at once: a host that limits how fast requests come refuses a
+/// burst, and some then shut out whoever sent it.
+pub struct Ramp {
+    open: std::sync::atomic::AtomicUsize,
+    widened: tokio::sync::Notify,
+}
+
+impl Ramp {
+    /// `open` workers may send requests from the start.
+    pub fn new(open: usize) -> Self {
+        Self { open: open.into(), widened: tokio::sync::Notify::new() }
+    }
+
+    /// A request was answered: two more workers may send theirs.
+    fn answered(&self) {
+        let _ = self.open.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |open| Some(open.saturating_add(2)));
+        self.widened.notify_waiters();
+    }
 }
 
 impl WorkerShared {
-    /// Waits while `worker_id` is past the width; false once the workers are to stop.
+    /// Waits while `worker_id` is past the width or the ramp; false once the workers are to stop.
     pub(crate) async fn within_width(&self, worker_id: usize) -> bool {
-        while worker_id >= self.width.load(Ordering::Relaxed) {
+        loop {
+            let widened = self.ramp.widened.notified();
+            tokio::pin!(widened);
+            widened.as_mut().enable();
+            if worker_id < self.width.load(Ordering::Relaxed).min(self.ramp.open.load(Ordering::Relaxed)) {
+                return !self.cancel.is_cancelled();
+            }
             tokio::select! {
                 _ = self.cancel.cancelled() => return false,
+                _ = widened => {}
                 _ = tokio::time::sleep(IDLE_POLL) => {}
             }
         }
-        !self.cancel.is_cancelled()
     }
 
     /// The worker's own route (workers take turns on them), or while that is dropped or resting
@@ -624,8 +657,8 @@ impl HttpWorker {
             }
             Err((kind, error)) => {
                 if !revoked {
-                    if matches!(kind, FailureKind::Throttled(_)) {
-                        slot.throttled();
+                    if let FailureKind::Throttled(after) = kind {
+                        slot.throttled(after.unwrap_or(THROTTLE_RETRY));
                     }
                     record_failure(&mut racer, &mut chunks, chunk_id, mirror_id, url, kind, &error);
                 } else if kind == FailureKind::Fatal {
@@ -674,13 +707,21 @@ impl HttpWorker {
         };
 
         let sent_at = Instant::now();
+        // A host that refused us just before and now leaves us unanswered is shutting us out.
+        let banned = |error: String| slot.unanswered().map(|rest| (FailureKind::Banned(rest), error));
         let response = tokio::select! {
             biased;
             _ = s.cancel.cancelled() => return Err(cancelled()),
             _ = chunk.revoked.cancelled() => return Err(taken_over()),
             res = tokio::time::timeout(s.stall_timeout, send(request, url)) => match res {
-                Err(_) => return Err((FailureKind::Transient, format!("no response within {}s", s.stall_timeout.as_secs()))),
+                Err(_) => {
+                    let error = format!("no response within {}s", s.stall_timeout.as_secs());
+                    return Err(banned(error.clone()).unwrap_or((FailureKind::Transient, error)));
+                }
                 Ok(Err(e)) => {
+                    if let Some(failure) = banned(format!("no answer from a host that refused us just before: {e}")) {
+                        return Err(failure);
+                    }
                     // A name that did not resolve says nothing of the route.
                     if e.is_connect() && !format!("{e:?}").contains("dns error") {
                         s.drop_route(route, url);
@@ -700,6 +741,7 @@ impl HttpWorker {
         check_response(response.status(), response.headers(), start, end, s.file_size, if_range.as_deref())
             .map_err(|failure| if redirected { at_redirect_target(response.status(), failure) } else { failure })?;
         slot.accepted();
+        s.ramp.answered();
         let ttfb = sent_at.elapsed();
         // The host answering honours ranges (a 200 from the file's start says nothing) and, on a
         // new connection straight to it, takes this long to answer: the next download from it
@@ -963,6 +1005,8 @@ fn record_failure(
             mirror.cool_down(Instant::now() + pause);
             (pause, true)
         }
+        // The host rests meanwhile; `hosts::BANNED_FOR` bounds how long this goes on.
+        FailureKind::Banned(rest) => (rest, false),
     };
     if let Err(e) = chunks.mark_failed(chunk_id, error, delay, counts) {
         chunks.abort(chunk_id, &e.to_string());
@@ -1248,6 +1292,7 @@ mod tests {
             stall_timeout: Duration::from_secs(10),
             body_idle: Duration::from_secs(5),
             width: Arc::new(usize::MAX.into()),
+            ramp: Arc::new(Ramp::new(usize::MAX)),
         };
         (HttpWorker::new(0, shared), chunk, rx)
     }
@@ -1431,6 +1476,7 @@ mod tests {
         let url = Url::parse("http://refusing.worker.example/f").unwrap();
         let (worker, chunk, _events) = test_worker(&url, &dir.path().join("f.part"), 1 << 20);
         let mut open: Vec<HostSlot> = (0..4).map(|_| slot(&url)).collect();
+        open[..3].iter().for_each(HostSlot::accepted);
         let refused = FailureKind::Throttled(None);
         worker.settle(&chunk, 0, &url, Err((refused, "HTTP 503".into())), &open[3]);
         open.pop();
@@ -1438,6 +1484,8 @@ mod tests {
         assert_eq!(hosts::profile(&url).connection_cap, Some(3));
         assert!(hosts::try_acquire(&url, 0).is_none(), "three are open");
         open.pop();
+        assert!(hosts::try_acquire(&url, 0).is_none(), "the host rests a moment after a refusal");
+        std::thread::sleep(THROTTLE_RETRY);
         assert!(hosts::try_acquire(&url, 0).is_some());
     }
 

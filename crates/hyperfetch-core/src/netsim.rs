@@ -56,6 +56,70 @@ pub(crate) struct Server {
     pub metalink: Option<String>,
     /// A zsync control file, the answer to a GET of any path ending in `.zsync`.
     pub zsync: Option<Vec<u8>>,
+    /// A limit on how fast requests (of any path, HEAD too) may come.
+    pub rate: Option<RateLimit>,
+}
+
+/// At most `requests` requests in any `window`; one more is refused with 429 and Retry-After
+/// `retry_after` seconds. A client refused `ban_after` times within a window is shut out for
+/// `ban`: each of its connections is closed unanswered, as a firewall does.
+#[derive(Clone, Copy)]
+pub(crate) struct RateLimit {
+    pub requests: usize,
+    pub window: Duration,
+    pub retry_after: u64,
+    pub ban_after: usize,
+    pub ban: Duration,
+}
+
+/// A request that comes this long after a 429, within the rest it asked for, came too early: one
+/// sent before the 429 arrived may come a little later.
+const EARLY_SLACK: Duration = Duration::from_millis(200);
+
+/// Where a [`RateLimit`] stands.
+#[derive(Default)]
+struct Limiting {
+    taken: std::collections::VecDeque<tokio::time::Instant>,
+    refusals: std::collections::VecDeque<tokio::time::Instant>,
+    last_refusal: Option<tokio::time::Instant>,
+    shut_until: Option<tokio::time::Instant>,
+}
+
+enum Verdict {
+    Served,
+    Refused,
+    Shut,
+}
+
+impl Limiting {
+    fn shuts_out(&self, now: tokio::time::Instant) -> bool {
+        self.shut_until.is_some_and(|until| until > now)
+    }
+
+    fn admit(&mut self, limit: &RateLimit, stats: &Stats, now: tokio::time::Instant) -> Verdict {
+        if self.shuts_out(now) {
+            return Verdict::Shut;
+        }
+        let rest = Duration::from_secs(limit.retry_after);
+        if self.last_refusal.is_some_and(|at| (EARLY_SLACK..rest).contains(&(now - at))) {
+            stats.early.fetch_add(1, Ordering::SeqCst);
+        }
+        self.taken.retain(|&at| now - at < limit.window);
+        if self.taken.len() < limit.requests {
+            self.taken.push_back(now);
+            return Verdict::Served;
+        }
+        stats.throttled.fetch_add(1, Ordering::SeqCst);
+        self.refusals.retain(|&at| now - at < limit.window);
+        self.refusals.push_back(now);
+        self.last_refusal = Some(now);
+        if self.refusals.len() >= limit.ban_after {
+            self.shut_until = Some(now + limit.ban);
+            self.refusals.clear();
+            self.taken.clear();
+        }
+        Verdict::Refused
+    }
 }
 
 /// A connection that slows down and then stalls.
@@ -81,6 +145,11 @@ pub(crate) struct Stats {
     pub peak: AtomicUsize,
     /// Bytes of the file sent.
     pub served: AtomicUsize,
+    /// Requests refused for `Server::rate`, those that came in a rest a 429 asked for, and
+    /// connections closed unanswered while the client was shut out.
+    pub throttled: AtomicUsize,
+    pub early: AtomicUsize,
+    pub shut: AtomicUsize,
     decayed: AtomicBool,
     cut: AtomicBool,
 }
@@ -100,22 +169,48 @@ pub(crate) async fn serve(server: Server) -> (Url, Arc<Stats>) {
     let url = Url::parse(&format!("http://{}/f.bin", listener.local_addr().unwrap())).unwrap();
     let (server, stats) = (Arc::new(server), Arc::new(Stats::default()));
     let shared = server.per_client.map(|rate| Arc::new(RateLimiter::new(rate as u64)));
+    let limiting = Arc::new(parking_lot::Mutex::new(Limiting::default()));
     let seen = Arc::clone(&stats);
     tokio::spawn(async move {
         while let Ok((socket, _)) = listener.accept().await {
-            tokio::spawn(answer(socket, Arc::clone(&server), Arc::clone(&seen), shared.clone()));
+            if limiting.lock().shuts_out(tokio::time::Instant::now()) {
+                seen.shut.fetch_add(1, Ordering::SeqCst);
+                continue;
+            }
+            tokio::spawn(answer(socket, Arc::clone(&server), Arc::clone(&seen), shared.clone(), Arc::clone(&limiting)));
         }
     });
     (url, stats)
 }
 
-async fn answer(mut socket: tokio::net::TcpStream, server: Arc<Server>, stats: Arc<Stats>, shared: Option<Arc<RateLimiter>>) {
+async fn answer(
+    mut socket: tokio::net::TcpStream,
+    server: Arc<Server>,
+    stats: Arc<Stats>,
+    shared: Option<Arc<RateLimiter>>,
+    limiting: Arc<parking_lot::Mutex<Limiting>>,
+) {
     let mut head = Vec::new();
     let mut buf = [0u8; 4096];
     while !head.windows(4).any(|w| w == b"\r\n\r\n") {
         match socket.read(&mut buf).await {
             Ok(0) | Err(_) => return,
             Ok(n) => head.extend_from_slice(&buf[..n]),
+        }
+    }
+    if let Some(limit) = &server.rate {
+        let verdict = limiting.lock().admit(limit, &stats, tokio::time::Instant::now());
+        match verdict {
+            Verdict::Served => {}
+            Verdict::Shut => {
+                stats.shut.fetch_add(1, Ordering::SeqCst);
+                return;
+            }
+            Verdict::Refused => {
+                let refusal = format!("HTTP/1.1 429 Too Many Requests\r\nRetry-After: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", limit.retry_after);
+                let _ = socket.write_all(refusal.as_bytes()).await;
+                return;
+            }
         }
     }
     let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
@@ -287,6 +382,27 @@ mod tests {
         let whole = get(&url, Some((500, 999))).await;
         assert_eq!(whole.status().as_u16(), 200);
         assert_eq!(whole.bytes().await.unwrap().to_vec(), file(1000));
+    }
+
+    /// Past its requests per window the server answers 429, and past its refusals it closes
+    /// connections unanswered until the ban is over; requests within an asked rest are told apart.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_the_server_limits_how_fast_requests_come_and_shuts_out_who_keeps_asking() {
+        let rate = RateLimit { requests: 2, window: Duration::from_secs(5), retry_after: 2, ban_after: 2, ban: Duration::from_millis(600) };
+        let (url, stats) = serve(Server { size: 1000, rate: Some(rate), ..Default::default() }).await;
+        let try_get = || async { tokio::time::timeout(Duration::from_secs(10), reqwest::Client::new().get(url.clone()).send()).await.unwrap() };
+        for _ in 0..2 {
+            assert_eq!(try_get().await.unwrap().status().as_u16(), 200);
+        }
+        let refused = try_get().await.unwrap();
+        assert_eq!((refused.status().as_u16(), refused.headers()["retry-after"].to_str().unwrap()), (429, "2"));
+        tokio::time::sleep(EARLY_SLACK).await;
+        assert_eq!(try_get().await.unwrap().status().as_u16(), 429, "asked again within the rest");
+        assert_eq!((stats.throttled.load(Ordering::SeqCst), stats.early.load(Ordering::SeqCst)), (2, 1));
+        assert!(try_get().await.is_err(), "shut out");
+        assert_eq!(stats.shut.load(Ordering::SeqCst), 1);
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert_eq!(try_get().await.unwrap().status().as_u16(), 200, "the ban is over and the window starts afresh");
     }
 
     /// The first GET from the given offset slows down and then goes silent; or is cut off. Others
