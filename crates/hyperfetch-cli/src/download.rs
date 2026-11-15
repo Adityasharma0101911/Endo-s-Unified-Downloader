@@ -497,7 +497,9 @@ fn done_line(input: Option<&str>, path: &std::path::Path) -> String {
 /// One --json result: every key always there, null where it does not apply. `status` is "ok",
 /// "failed", "skipped" (--no-clobber) or "up-to-date" (--only-if-newer); `url`, and the links in
 /// `error`, are shown without their secrets; `checksum` is the one the file was to match (--checksum, a metalink's), and
-/// `checked_against` says whose checksum it matched when it was not yours ("the site's SHA-256").
+/// `checked_against` says whose checksum it matched when it was not yours ("the site's SHA-256"),
+/// and `autopilot` why a download over ranges had the connections it ended with (see `-v`).
+#[allow(clippy::too_many_arguments)]
 pub fn item(
     status: &str,
     url: Option<&str>,
@@ -506,6 +508,7 @@ pub fn item(
     checksum: Option<&str>,
     checked_against: Option<&str>,
     error: Option<&str>,
+    autopilot: Option<&str>,
 ) -> Item {
     vec![
         ("status", status.into()),
@@ -515,6 +518,7 @@ pub fn item(
         ("checksum", checksum.into()),
         ("checked_against", checked_against.into()),
         ("error", error.map(redact_text).into()),
+        ("autopilot", autopilot.into()),
     ]
 }
 
@@ -540,7 +544,7 @@ async fn run_job(
     let urls: Vec<String> = job.urls.iter().map(Url::to_string).collect();
     let (url, checksum, only_if_newer) = (urls.first().cloned(), job.options.expected_checksum.clone(), job.options.only_if_newer);
     let failed = |path: Option<&std::path::Path>, size: Option<u64>, error: &str| {
-        item("failed", url.as_deref(), path, size, checksum.as_deref(), None, Some(error))
+        item("failed", url.as_deref(), path, size, checksum.as_deref(), None, Some(error), None)
     };
     let engine = match clients.engine(job.urls, job.options) {
         Ok(engine) => engine,
@@ -615,7 +619,8 @@ async fn run_job(
             // A folder (a torrent's, an unpacked archive's) has no one size.
             let size = tokio::fs::metadata(&path).await.ok().filter(|m| m.is_file()).map(|m| m.len());
             let status = if up_to_date { "up-to-date" } else { "ok" };
-            ui.report(item(status, url.as_deref(), Some(&path), size, checksum.as_deref(), checked_against.as_deref(), None));
+            let autopilot = last.as_ref().and_then(|snapshot| snapshot.autopilot.as_deref());
+            ui.report(item(status, url.as_deref(), Some(&path), size, checksum.as_deref(), checked_against.as_deref(), None, autopilot));
             Outcome::Done
         }
         Err(err) => {
@@ -909,7 +914,7 @@ mod tests {
         ui.error(&format!("[FAILED] x: {error}"));
         ui.print(error);
         let _ = ui.log_writer().write(format!("WARN {error}\n").as_bytes());
-        ui.report(item("failed", Some("https://u:p@host.test/missing"), None, None, None, None, Some(error)));
+        ui.report(item("failed", Some("https://u:p@host.test/missing"), None, None, None, None, Some(error), None));
         drop(ui);
         let text = std::fs::read_to_string(&log).unwrap();
         assert!(!text.contains("u:p@") && !text.contains("abc"), "{text}");

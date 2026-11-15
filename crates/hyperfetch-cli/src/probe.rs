@@ -197,7 +197,7 @@ impl Found {
 
     /// The --json item of `link`, with the keys only --spider has.
     fn json(&self, link: &str) -> Item {
-        let mut fields = item("ok", Some(link), None, self.size, self.checksum.as_deref(), None, None);
+        let mut fields = item("ok", Some(link), None, self.size, self.checksum.as_deref(), None, None, None);
         fields.extend([
             ("name", self.name.clone().into()),
             ("type", self.kind.clone().into()),
@@ -221,7 +221,7 @@ pub async fn spider(jobs: &[(Job, Option<u64>)], ui: &Ui, show: bool) -> usize {
             if !ui.json {
                 ui.print(&format!("{}: not probed (only HTTP and HTTPS links are)", job.label));
             }
-            ui.report(item("ok", Some(url.as_str()), None, *size, None, None, None));
+            ui.report(item("ok", Some(url.as_str()), None, *size, None, None, None, None));
             continue;
         }
         let found = async {
@@ -244,7 +244,7 @@ pub async fn spider(jobs: &[(Job, Option<u64>)], ui: &Ui, show: bool) -> usize {
             Err(e) => {
                 failed += 1;
                 ui.error(&format!("[FAILED] {}: {}", job.label, e));
-                ui.report(item("failed", Some(url.as_str()), None, None, None, None, Some(&e)));
+                ui.report(item("failed", Some(url.as_str()), None, None, None, None, Some(&e), None));
             }
         }
     }
@@ -276,7 +276,7 @@ pub async fn dry_run(jobs: &[(Job, Option<u64>)], http: &Client, ui: &Ui, no_clo
                 ui.print(&format!("{:>12}  {}{}{}", shown, path.display(), named, there));
             }
             let status = if skipped { "skipped" } else { "ok" };
-            ui.report(item(status, url.map(Url::as_str), Some(&path), size, job.options.expected_checksum.as_deref(), None, None));
+            ui.report(item(status, url.map(Url::as_str), Some(&path), size, job.options.expected_checksum.as_deref(), None, None, None));
         }
     }
 }
@@ -346,7 +346,7 @@ pub async fn without_existing(jobs: Vec<Job>, ui: &Ui) -> Vec<Job> {
         }
         let size = std::fs::metadata(&path).ok().map(|m| m.len());
         let checksum = job.options.expected_checksum.as_deref();
-        ui.report(item("skipped", job.urls.first().map(Url::as_str), Some(&path), size, checksum, None, None));
+        ui.report(item("skipped", job.urls.first().map(Url::as_str), Some(&path), size, checksum, None, None, None));
     }
     kept
 }
