@@ -68,7 +68,7 @@ async fn published(client: &Client, auth: Option<&Auth>, limit: usize, url: &Url
 }
 
 /// `algo:hex` for `digest` of `algo` (one of `ALGOS`).
-fn checksum(algo: &str, digest: &[u8]) -> String {
+pub(crate) fn checksum(algo: &str, digest: &[u8]) -> String {
     let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
     format!("{algo}:{hex}")
 }
