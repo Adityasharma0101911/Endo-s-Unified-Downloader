@@ -386,6 +386,7 @@ pub(super) fn add_page(app: &mut App, ui: &mut Ui) {
 
         if focused.is_none() {
             zip_preview(app, ui);
+            update_offer(app, ui);
         }
         stream_tracks(app, ui, focused.as_ref());
         if focused.is_none() && ingest::is_blob_url(&app.url_input) {
@@ -437,7 +438,7 @@ pub(super) fn add_page(app: &mut App, ui: &mut Ui) {
             .horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
                 let caret = anim::icon(ui, icon::CARET_RIGHT, 14.0, p.muted, 1.0, open * std::f32::consts::FRAC_PI_2);
-                let label = RichText::new("Advanced options: checksum and Authorization header").color(p.muted);
+                let label = RichText::new("Advanced options: checksum, older version and Authorization header").color(p.muted);
                 let button = ui.add(egui::Button::new(label).frame(false));
                 button.clicked() || ui.interact(caret.rect, egui::Id::new("advanced caret"), Sense::click()).clicked()
             })
@@ -479,6 +480,36 @@ pub(super) fn add_page(app: &mut App, ui: &mut Ui) {
             });
         }
     }
+}
+
+/// The file an earlier download of the single link in the box finished into, when it is still
+/// there (history keeps links without their secrets; one that had any is not matched).
+fn copy_on_disk(app: &App) -> Option<std::path::PathBuf> {
+    use hyperfetch_core::history::{is_redacted, redact_url};
+    let link = app.url_input.trim();
+    let url = Url::parse(link).ok().filter(|u| matches!(u.scheme(), "http" | "https" | "ftp" | "ftps") && !link.contains(char::is_whitespace))?;
+    let saved = redact_url(url.as_str());
+    let finished = app.history.iter().find(|e| e.status == HistoryStatus::Completed && e.urls.iter().any(|u| *u == saved && !is_redacted(u)))?;
+    finished.file_path.is_file().then(|| finished.file_path.clone())
+}
+
+/// For a link whose earlier download's file is still on disk: Update from the copy on disk, which
+/// downloads it again in that file's place only if the server has a newer one, reusing what the
+/// copy still holds when the server publishes block checksums (see `App::download_now`).
+fn update_offer(app: &mut App, ui: &mut Ui) {
+    let Some(copy) = copy_on_disk(app) else { return };
+    let p = palette(ui);
+    ui.add_space(4.0);
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new(icon::INFO).color(p.accent));
+        let name = copy.file_name().unwrap_or_default().to_string_lossy();
+        ui.label(RichText::new(format!("{name} is on disk from an earlier download of this link.")).color(p.muted));
+        let hint = "Download it again in its place only if the server has a newer version; what the copy still holds is                     reused when the server publishes block checksums (a .zsync file or a metalink's pieces)";
+        if ui.add(button(format!("{} Update from the copy on disk", icon::ARROWS_CLOCKWISE))).on_hover_text(hint).clicked() {
+            app.update_on_disk = Some(copy.clone());
+            start_from_form(app);
+        }
+    });
 }
 
 /// The link in `input` when it is a single http(s) link to a .zip, whose contents can be listed.
@@ -765,17 +796,29 @@ fn download_actions(app: &mut App, ui: &mut Ui, item: &QueueItem) {
 /// The inputs that belong to one download and are never saved.
 fn advanced_options(app: &mut App, ui: &mut Ui) {
     let p = palette(ui);
-    for (label, value, hint) in [
-        ("Checksum", &mut app.checksum_input, "Optional, this download only: sha256:..., sha512:..., sha1:..., md5:..., blake3:..., or hex"),
-        ("Authorization", &mut app.auth_input, "Optional header, e.g. Bearer <token>: not saved, never sent with clipboard links"),
-    ] {
-        ui.horizontal(|ui| {
-            left_part(ui, ui.available_width() - 110.0, |ui| {
-                ui.label(label);
-            });
-            ui.add(egui::TextEdit::singleline(value).hint_text(hint).desired_width(f32::INFINITY));
-        });
-    }
+    let label = |ui: &mut Ui, text: &str| {
+        left_part(ui, ui.available_width() - 110.0, |ui| {
+            ui.label(text);
+        })
+    };
+    let checksum = "Optional, this download only: sha256:..., sha512:..., sha1:..., md5:..., blake3:..., or hex";
+    ui.horizontal(|ui| {
+        label(ui, "Checksum");
+        ui.add(egui::TextEdit::singleline(&mut app.checksum_input).hint_text(checksum).desired_width(f32::INFINITY));
+    });
+    ui.horizontal(|ui| {
+        label(ui, "Older version");
+        let hint = "Optional file: what the new one still holds is copied from it, when the server publishes block checksums";
+        ui.add(egui::TextEdit::singleline(&mut app.delta_input).hint_text(hint).desired_width(ui.available_width() - 90.0));
+        if ui.add_enabled(!app.dialog_open, button("Browse…")).clicked() {
+            app.pending_dialog = Some(Dialog::OlderVersion);
+        }
+    });
+    let auth = "Optional header, e.g. Bearer <token>: not saved, never sent with clipboard links";
+    ui.horizontal(|ui| {
+        label(ui, "Authorization");
+        ui.add(egui::TextEdit::singleline(&mut app.auth_input).hint_text(auth).desired_width(f32::INFINITY));
+    });
     ui.horizontal(|ui| {
         ui.label(RichText::new("Cookies, proxy, quality, speed limit and the rest are under").small().color(p.muted));
         if ui.link(RichText::new("Settings").small()).clicked() {
@@ -917,6 +960,41 @@ mod tests {
     /// The files of a listed ZIP have boxes to tick (not its folders, nor an encrypted file), All
     /// ticks them all or none, and Download selected downloads only those ticked, each into its
     /// folder under the save folder: the first starts, the others wait.
+    /// A link whose earlier download's file is still there offers Update from the copy on disk,
+    /// which replaces that file, only by a newer one; the older version under Advanced options
+    /// is the download's `delta_from`, and one that is not a file is refused.
+    #[test]
+    fn a_copy_on_disk_is_updated_and_an_older_version_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let copy = dir.path().join("nightly.iso");
+        std::fs::write(&copy, b"old").unwrap();
+        let link = "https://example.com/nightly.iso";
+        let mut h = Harness::new();
+        let mut entry = HistoryEntry::new("nightly.iso".into(), copy.clone(), 3, vec![link.to_string()]);
+        entry.status = HistoryStatus::Completed;
+        h.app.history = vec![entry];
+        assert!(h.settle());
+        let input = h.app.ctx.read_response(egui::Id::new("url_input")).unwrap().rect;
+        h.click_at(input.center());
+        h.type_text(link);
+        h.key(egui::Key::Escape, egui::Modifiers::NONE);
+        assert!(h.settle());
+        h.click("Update from the copy on disk");
+        let item = &h.app.queue.items()[0];
+        assert!(item.options.only_if_newer && item.options.output_path.as_deref() == Some(copy.as_path()));
+
+        h.app.new_download();
+        h.app.url_input = "https://example.com/b.iso".into();
+        h.app.delta_input = dir.path().join("missing.iso").to_string_lossy().into_owned();
+        start_from_form(&mut h.app);
+        assert!(h.app.form_error.as_deref().is_some_and(|e| e.contains("not a file")), "{:?}", h.app.form_error);
+        h.app.delta_input = copy.to_string_lossy().into_owned();
+        start_from_form(&mut h.app);
+        let item = h.app.queue.items().iter().find(|item| item.filename == "b.iso").unwrap();
+        assert_eq!((item.options.delta_from.as_deref(), item.options.only_if_newer), (Some(copy.as_path()), false));
+        assert!(h.app.delta_input.is_empty(), "the form clears as it starts");
+    }
+
     #[test]
     fn download_files_ticked_in_a_zip() {
         let crc = |data: &[u8]| !data.iter().fold(!0u32, |c, &b| (0..8).fold(c ^ u32::from(b), |c, _| if c & 1 == 1 { (c >> 1) ^ 0xedb8_8320 } else { c >> 1 }));

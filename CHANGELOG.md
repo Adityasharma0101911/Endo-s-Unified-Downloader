@@ -4,6 +4,8 @@ What changed in each release, newest first. Each release's page on [GitHub](http
 
 ## Unreleased
 
+- **App: update from the copy on disk.** A link whose earlier download's file is still on disk offers "Update from the copy on disk": downloaded again in its place only if the server has a newer one, reusing what the copy holds where the server publishes block checksums. Advanced options take an older version to reuse (Browse…), and the download's page says how much was reused ("Reused 3.1 GiB of the old file, downloaded 240 MiB"; the CLI prints it too).
+
 - **Torrents with web seeds, then the swarm.** With BitTorrent on, a `.torrent` whose files have HTTP web seeds downloads them from the seeds first, checked by the torrent's piece hashes, and then fetches from peers only the pieces still bad or missing (one after the other, not at once). With BitTorrent off, a web-seeded file is now checked by the torrent's piece hashes, and bad pieces come again from another seed.
 
 - **Only what changed of a new version.** With an older version of a file on disk (`--delta-from FILE` in the CLI, or the file `-N` replaces), the blocks it still holds are copied from it and only the rest is downloaded, when the server publishes the new version's block checksums: a metalink's piece hashes, or a zsync file (beside the link, or `--zsync URL`). The result is checked whole against the zsync file's SHA-1 or your checksum; without published block checksums the file is downloaded whole, as before.

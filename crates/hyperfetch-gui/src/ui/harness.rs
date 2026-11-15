@@ -613,7 +613,7 @@ mod tests {
             h.app.updating = true;
             shoot(&mut h, "update-banner-downloading", &[0, 50, 100, 250], area(196.0, 0.0, 980.0, 180.0));
             let mut h = scene(Tab::Downloader, &|_| {});
-            h.click("Advanced options: checksum and Authorization header");
+            h.click("Advanced options: checksum, older version and Authorization header");
             shoot(&mut h, "advanced-options", &[0, 50, 100, 200], area(196.0, 120.0, 980.0, 420.0));
             let mut h = Harness::new();
             h.app.settings.theme = theme;

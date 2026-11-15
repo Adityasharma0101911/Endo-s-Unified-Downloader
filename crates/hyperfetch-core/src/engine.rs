@@ -617,6 +617,9 @@ pub struct DownloadEngine {
     /// A file found downloaded already (see `plan_target`): `run` leaves it as it is instead of
     /// post-processing it again.
     already_done: Arc<std::sync::Mutex<Option<PathBuf>>>,
+    /// The bytes a delta copied from the older version, and the file's size (see `delta`): what
+    /// the last snapshot's notes tell.
+    reused: Arc<std::sync::Mutex<Option<(u64, u64)>>>,
     /// The checksum the file's site publishes, being looked for, and whether it confirmed the
     /// file (see `DownloadOptions::remote_checksum`).
     site: Arc<Mutex<crate::digest::Site>>,
@@ -667,6 +670,7 @@ impl DownloadEngine {
                     decrypt: None,
                     ftp: None,
                     already_done: Arc::default(),
+                    reused: Arc::default(),
                     site: Arc::default(),
                 },
             },
@@ -686,6 +690,7 @@ impl DownloadEngine {
             decrypt: None,
             ftp: None,
             already_done: Arc::default(),
+            reused: Arc::default(),
             site: Arc::default(),
         }
     }
@@ -789,10 +794,13 @@ impl DownloadEngine {
                 None
             };
             let (post, proxy, password) = (&self.options.post, self.options.proxy.as_deref(), self.options.password.as_deref());
-            let done = crate::postprocess::after_download(path, post, source, proxy, password).await;
+            let mut done = crate::postprocess::after_download(path, post, source, proxy, password).await;
             if let Some(time) = dated {
                 let path = done.path.clone();
                 let _ = blocking(move || File::options().write(true).open(path).and_then(|f| f.set_modified(time))).await;
+            }
+            if let Some((copied, size)) = *self.reused.lock().unwrap() {
+                done.notes.insert(0, format!("Reused {} of the old file, downloaded {}", size_text(copied), size_text(size - copied)));
             }
             if !done.notes.is_empty() {
                 let size = crate::postprocess::size_of(&done.path);
@@ -918,6 +926,7 @@ impl DownloadEngine {
         engine.cancel_flag = Arc::clone(&self.cancel_flag);
         engine.cancel_token = self.cancel_token.clone();
         engine.already_done = Arc::clone(&self.already_done);
+        engine.reused = Arc::clone(&self.reused);
         engine.site = Arc::clone(&self.site);
         engine
     }
@@ -2444,7 +2453,9 @@ impl DownloadEngine {
     async fn probe_all(&self, client: &Client, urls: &[Url], snapshot_tx: &Option<broadcast::Sender<EngineSnapshot>>) -> Result<Probed, String> {
         let (limiter, stall) = (self.limiter(), self.stall_timeout());
         let connections = self.options.num_connections.clamp(1, MAX_CONNECTIONS);
-        let (limit, delta) = (self.options.max_connections_per_host, self.options.delta_from.is_some());
+        // An older version given, or the file -N replaces when it is named: a delta may run.
+        let replacing = self.options.only_if_newer && self.options.output_path.as_deref().is_some_and(Path::is_file);
+        let (limit, delta) = (self.options.max_connections_per_host, self.options.delta_from.is_some() || replacing);
         // Whether the first mirror's start is being read, and whether the download went ahead
         // without its answer, which then has no start to read.
         let (reading, started) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
@@ -2659,6 +2670,7 @@ impl DownloadEngine {
                 if fresh {
                     tracing::info!("{} of the {} bytes of {} are copied from {}", copied, size, final_path.display(), old.display());
                     state.completed_ranges = seeded;
+                    *self.reused.lock().unwrap() = Some((copied, size));
                 }
                 new_sha1 = sha1;
             }
@@ -8809,11 +8821,14 @@ mod tests {
         assert_eq!(DownloadEngine::new(vec![url], options).run(Some(tx)).await.unwrap(), target);
         assert!(std::fs::read(&target).unwrap() == new);
         assert!(stats.served.load(Ordering::SeqCst) < size / 2, "{}", stats.served.load(Ordering::SeqCst));
-        let mut against = None;
+        let (mut against, mut notes) = (None, Vec::new());
         while let Ok(snapshot) = rx.try_recv() {
             against = snapshot.checked_against.or(against);
+            notes.extend(snapshot.notes);
         }
         assert_eq!(against.as_deref(), Some("the site's SHA-1"));
+        // The file repeats every 251 bytes, so zsync finds even the changed blocks elsewhere in it.
+        assert!(notes.contains(&"Reused 4.0 MiB of the old file, downloaded 0 bytes".to_string()), "{notes:?}");
 
         // A zsync file whose SHA-1 is not the new version's fails what it put together.
         std::fs::write(&target, &old).unwrap();
