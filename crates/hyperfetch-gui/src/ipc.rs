@@ -1471,7 +1471,7 @@ mod tests {
             assert_eq!(add(json!({"urls": bad})).unwrap_err(), "every link of urls must be http or https, or a magnet link");
         }
         assert_eq!(add(json!({"url": "https://a.example/1", "urls": ["https://a.example/2"]})).unwrap_err(), "send url or urls, not both");
-        assert_eq!(add(json!({"urls": []})).unwrap_err(), "url must be an http or https link");
+        assert_eq!(add(json!({"urls": []})).unwrap_err(), "url must be an http or https link, or a magnet link");
         assert!(add(json!({"urls": "https://a.example/1"})).is_err(), "urls is a list");
     }
 
