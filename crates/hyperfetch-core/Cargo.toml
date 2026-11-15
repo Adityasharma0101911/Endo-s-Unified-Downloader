@@ -31,6 +31,8 @@ aes = "0.8"
 cbc = "0.1"
 percent-encoding = "2.3"
 ring = "0.17"
+# Unpacks the files picked out of a remote ZIP as they arrive (zipdir.rs); already built for png.
+flate2 = "1.1"
 # Network interfaces with their gateways, on every OS (netif.rs); without the Apple/Android extras.
 netdev = { version = "0.46", default-features = false, features = ["gateway"] }
 # BitTorrent swarm downloads (p2p.rs): rustls instead of the OS TLS stack, no web UI or HTTP API.

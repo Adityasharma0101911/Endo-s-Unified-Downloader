@@ -510,7 +510,7 @@ fn zip_preview(app: &mut App, ui: &mut Ui) {
             skeleton(ui, &[(0.42, 56.0), (0.3, 48.0), (0.36, 60.0), (0.26, 0.0)]);
         }
         Some(Some(Err(error))) => error_alert(ui, error),
-        Some(Some(Ok(entries))) => zip_entries(ui, entries),
+        Some(Some(Ok(_))) => zip_entries(app, ui),
     }
 }
 
@@ -603,26 +603,57 @@ pub(super) fn channel_prompt(app: &mut App, ui: &mut Ui) {
     });
 }
 
-/// A ZIP's entries, a line each with its size, in a list that scrolls past twelve of them; then
-/// how many there are and their size, unpacked and packed.
-fn zip_entries(ui: &mut Ui, entries: &[ZipEntry]) {
+/// A ZIP's entries, a line each with its size, in a list that scrolls past twelve of them: a file
+/// with a box to tick, greyed with the reason when it cannot be unpacked on its own. Then how many
+/// there are and their size, unpacked and packed, All to tick every file or none, and Download
+/// selected (see `App::download_zip_entries`).
+fn zip_entries(app: &mut App, ui: &mut Ui) {
     let p = palette(ui);
+    let Some((_, Some(Ok(entries)))) = app.zip_preview.as_mut() else { return };
     ui.add_space(4.0);
     let row = ui.spacing().interact_size.y;
     let most = 12.0 * (row + ui.spacing().item_spacing.y);
+    let tickable = |entry: &ZipEntry| !entry.is_folder() && entry.unsupported().is_none();
     egui::ScrollArea::vertical().id_salt("zip entries").max_height(most).auto_shrink([false, true]).show_rows(ui, row, entries.len(), |ui, rows| {
-        for entry in &entries[rows] {
+        for (entry, on) in &mut entries[rows] {
             ui.horizontal(|ui| {
                 left_part(ui, 96.0, |ui| {
-                    ui.add(egui::Label::new(RichText::new(&entry.name).color(p.text)).truncate()).on_hover_text(&entry.name);
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                    let name = RichText::new(&entry.name).color(p.text);
+                    let shown = match entry.unsupported() {
+                        _ if entry.is_folder() => {
+                            // In line with the names of the files beside their boxes.
+                            ui.add_space(ui.spacing().icon_width + ui.spacing().icon_spacing);
+                            ui.label(name.color(p.muted))
+                        }
+                        Some(why) => ui.add_enabled(false, egui::Checkbox::new(&mut false, name)).on_disabled_hover_text(why),
+                        None => ui.checkbox(on, name),
+                    };
+                    shown.on_hover_text(&entry.name);
                 });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.label(RichText::new(format_bytes(entry.size)).color(p.muted)));
             });
         }
     });
-    let (size, packed) = entries.iter().fold((0u64, 0u64), |(size, packed), e| (size.saturating_add(e.size), packed.saturating_add(e.compressed)));
+    let (size, packed) = entries.iter().fold((0u64, 0u64), |(size, packed), (e, _)| (size.saturating_add(e.size), packed.saturating_add(e.compressed)));
     let total = format!("{} entries, {} ({} compressed)", entries.len(), format_bytes(size), format_bytes(packed));
-    ui.label(RichText::new(total).small().color(p.muted));
+    let (files, ticked) = (entries.iter().filter(|(e, _)| tickable(e)).count(), entries.iter().filter(|(_, on)| *on).count());
+    let mut go = false;
+    ui.horizontal(|ui| {
+        let mut all = files > 0 && ticked == files;
+        if ui.add_enabled(files > 0, egui::Checkbox::new(&mut all, "All")).changed() {
+            entries.iter_mut().for_each(|(entry, on)| *on = all && tickable(entry));
+        }
+        ui.label(RichText::new(total).small().color(p.muted));
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let download = primary_button(&format!("{} Download selected", icon::DOWNLOAD_SIMPLE), p.accent);
+            let hint = "Download only the ticked files, each into its folder under Save to, unpacked and checked against its CRC-32";
+            go = ui.add_enabled(ticked > 0, download).on_hover_text(hint).on_disabled_hover_text("Tick the files to download first").clicked();
+        });
+    });
+    if go {
+        app.download_zip_entries();
+    }
 }
 
 /// The form's Download button. For a moment after a download is added (Ctrl+V, the clipboard
@@ -881,6 +912,64 @@ mod tests {
         h.wait_for(|app| app.zip_preview.as_ref().is_some_and(|(_, listed)| listed.is_some()));
         assert!(h.settle());
         assert!(h.texts().iter().any(|(text, _)| text.starts_with("The file is not a ZIP")), "{:?}", h.texts());
+    }
+
+    /// The files of a listed ZIP have boxes to tick (not its folders, nor an encrypted file), All
+    /// ticks them all or none, and Download selected downloads only those ticked, each into its
+    /// folder under the save folder: the first starts, the others wait.
+    #[test]
+    fn download_files_ticked_in_a_zip() {
+        let crc = |data: &[u8]| !data.iter().fold(!0u32, |c, &b| (0..8).fold(c ^ u32::from(b), |c, _| if c & 1 == 1 { (c >> 1) ^ 0xedb8_8320 } else { c >> 1 }));
+        let le16 = |values: &[u16]| values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>();
+        let le32 = |values: &[u32]| values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>();
+        let files: [(&str, &[u8], u16); 4] = [("docs/", b"", 0), ("docs/readme.txt", b"read me", 0), ("tools/run.sh", b"echo hi", 0), ("secret.txt", b"shh", 1)];
+        let (mut zip, mut directory) = (Vec::new(), Vec::new());
+        for (name, data, flags) in files {
+            let (at, sums) = (zip.len() as u32, le32(&[crc(data), data.len() as u32, data.len() as u32]));
+            zip.extend([le32(&[0x0403_4b50]), le16(&[20, flags, 0, 0, 0]), sums.clone(), le16(&[name.len() as u16, 0]), name.as_bytes().to_vec(), data.to_vec()].concat());
+            directory.extend([le32(&[0x0201_4b50]), le16(&[20, 20, flags, 0, 0, 0]), sums, le16(&[name.len() as u16, 0, 0, 0, 0]), le32(&[0, at])].concat());
+            directory.extend(name.as_bytes());
+        }
+        let (at, size) = (zip.len() as u32, directory.len() as u32);
+        zip.extend([directory, le32(&[0x0605_4b50]), le16(&[0, 0, 4, 4]), le32(&[size, at]), le16(&[0])].concat());
+        let server = tokio::runtime::Runtime::new().unwrap();
+        let addr = server.block_on(crate::tests::serve(std::sync::Arc::new(zip)));
+
+        let mut h = Harness::new();
+        assert!(h.settle());
+        let input = h.app.ctx.read_response(egui::Id::new("url_input")).unwrap().rect;
+        h.click_at(input.center());
+        h.type_text(&format!("http://{addr}/pack.zip"));
+        h.key(egui::Key::Escape, egui::Modifiers::NONE);
+        assert!(h.settle());
+        h.click("See what's inside");
+        h.wait_for(|app| app.zip_preview.as_ref().is_some_and(|(_, listed)| listed.is_some()));
+        assert!(h.settle());
+        let ticked = |h: &Harness| match &h.app.zip_preview {
+            Some((_, Some(Ok(entries)))) => entries.iter().filter(|(_, on)| *on).map(|(e, _)| e.name.clone()).collect::<Vec<_>>(),
+            _ => panic!("no listing"),
+        };
+        let all = h.find_near("Download selected", "All").unwrap().center();
+        h.click_at(all);
+        assert!(h.settle());
+        assert_eq!(ticked(&h), ["docs/readme.txt", "tools/run.sh"], "neither the folder nor the encrypted file");
+        h.click_at(all);
+        assert!(h.settle() && ticked(&h).is_empty());
+        h.click("Download selected");
+        assert!(h.settle() && h.app.queue.items().is_empty(), "nothing is ticked");
+        h.click("docs/readme.txt");
+        h.click("tools/run.sh");
+        assert!(h.settle());
+        h.click("Download selected");
+        let items: Vec<(String, Option<String>)> =
+            h.app.queue.items().iter().map(|item| (item.filename.clone(), item.options.zip_entry.as_ref().map(|e| e.name.clone()))).collect();
+        assert_eq!(items, [("readme.txt".to_string(), Some("docs/readme.txt".to_string())), ("run.sh".to_string(), Some("tools/run.sh".to_string()))]);
+        assert!(h.app.zip_preview.is_none());
+        let first = h.app.queue.items()[0].id;
+        h.wait_for(|app| app.queue.get_item(first).is_some_and(|item| item.status == QueueItemStatus::Completed));
+        let saved = std::path::PathBuf::from(&h.app.settings.save_dir);
+        assert_eq!(std::fs::read(saved.join("docs").join("readme.txt")).unwrap(), b"read me");
+        assert!(!saved.join("pack.zip").exists());
     }
 
     /// A dropped channel list shows its channels and groups to tick, which a filter narrows and

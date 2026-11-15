@@ -403,8 +403,9 @@ struct App {
     taskbar_shown: Option<taskbar::Progress>,
     /// A download failed since the queue last stood still: the taskbar's progress is red.
     batch_failed: bool,
-    /// The ZIP link the Add page lists the contents of, and what it holds once read.
-    zip_preview: Option<(String, Option<Result<Vec<ZipEntry>, String>>)>,
+    /// The ZIP link the Add page lists the contents of, and what it holds once read, each file
+    /// with whether it is ticked to download (see [`App::download_zip_entries`]).
+    zip_preview: Option<(String, Option<Result<Vec<(ZipEntry, bool)>, String>>)>,
     /// The track chooser open (see [`App::list_tracks`]).
     tracks: Option<tracks::Chooser>,
     /// Channel lists waiting for the channels to record to be ticked, first come first.
@@ -583,6 +584,37 @@ impl App {
             });
             AppEvent::ZipListed { link, result }
         });
+    }
+
+    /// Queues a download of each file ticked in the ZIP the Add page lists (see
+    /// `DownloadOptions::zip_entry`): into the save folder under its path in the ZIP, with the
+    /// form's Authorization header. The first starts and is shown; the others wait in the queue.
+    fn download_zip_entries(&mut self) {
+        let Some((link, Some(Ok(entries)))) = &self.zip_preview else { return };
+        let picked: Vec<ZipEntry> = entries.iter().filter(|(_, on)| *on).map(|(entry, _)| entry.clone()).collect();
+        let options = ingest::link_task(&[link.as_str()]).and_then(|task| Ok((task_options(&self.settings, &task, "", &self.auth_input)?, task)));
+        let (mut options, task) = match options {
+            Ok(made) => made,
+            Err(e) => return self.form_error = Some(e),
+        };
+        // A folder even before it exists.
+        options.output_path = options.output_path.map(|path| path.join(""));
+        let mut ids = Vec::new();
+        for entry in picked {
+            let name = entry.local_path().and_then(|path| Some(path.file_name()?.to_string_lossy().into_owned()));
+            let id = self.queue.add_item(task.urls.clone(), DownloadOptions { zip_entry: Some(entry), ..options.clone() });
+            if let (Some(name), Some(item)) = (name, self.queue.get_item_mut(id)) {
+                item.filename = name;
+            }
+            ids.push(id);
+        }
+        let Some(&first) = ids.first() else { return };
+        self.zip_preview = None;
+        self.tab = Tab::Downloader;
+        self.start_added(first);
+        if ids.len() > 1 {
+            self.notice = Some(Ok(format!("Started the first of {} files; the others wait in the queue", ids.len())));
+        }
     }
 
     /// Opens the track chooser of the HLS or DASH stream at `url` (see `tracks::Chooser`) for
@@ -1656,7 +1688,7 @@ impl App {
             // Only for the link still asked about.
             AppEvent::ZipListed { link, result } => {
                 if let Some((_, listed)) = self.zip_preview.as_mut().filter(|(asked, _)| *asked == link) {
-                    *listed = Some(result);
+                    *listed = Some(result.map(|entries| entries.into_iter().map(|entry| (entry, false)).collect()));
                 }
             }
             AppEvent::TracksListed { item, link, result } => self.tracks_listed(item, link, result),

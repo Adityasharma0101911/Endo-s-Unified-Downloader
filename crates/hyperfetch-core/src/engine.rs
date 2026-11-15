@@ -390,6 +390,10 @@ pub struct DownloadOptions {
     pub name_pattern: Option<String>,
     /// The channel of a channel list this download records (`ingest::Task::channel`), for
     /// `name_pattern`'s `{channel}`. Its stream with no length, of any kind, is recorded (see
+    /// Only this file of the ZIP the link names is downloaded (see `crate::zipdir::extract`):
+    /// into the download's folder under its path in the ZIP, unpacked as it arrives and checked
+    /// against its CRC-32. A stop starts it over.
+    pub zip_entry: Option<crate::zipdir::ZipEntry>,
     /// `DownloadEngine::record_ts`).
     pub channel: Option<String>,
 }
@@ -468,6 +472,7 @@ impl Default for DownloadOptions {
             live_idle_timeout: None,
             ad_patterns: Vec::new(),
             drop_parts: Vec::new(),
+            zip_entry: None,
             name_pattern: None,
             channel: None,
         }
@@ -808,6 +813,11 @@ impl DownloadEngine {
 
         if self.urls.first().is_some_and(crate::ftp::handles) {
             return Box::pin(self.fetch_ftp(client, snapshot_tx)).await;
+        if let Some(entry) = &self.options.zip_entry {
+            let url = self.urls.first().ok_or("No URLs to download")?;
+            return Box::pin(self.fetch_zip_entry(&client, url, entry, snapshot_tx)).await;
+        }
+
         }
 
         // A playlist the page built itself: the link is only the base of its URIs.
@@ -3359,6 +3369,60 @@ impl DownloadEngine {
             None => PathBuf::from("."),
         }
     }
+    /// The file `entry` of the ZIP at `url` (see `DownloadOptions::zip_entry`), at its path in the
+    /// ZIP under the download's folder, numbered when a file is there; a folder entry is made.
+    async fn fetch_zip_entry(
+        &self,
+        client: &Client,
+        url: &Url,
+        entry: &crate::zipdir::ZipEntry,
+        snapshot_tx: Option<broadcast::Sender<EngineSnapshot>>,
+    ) -> Result<PathBuf, String> {
+        let local = entry.local_path().ok_or_else(|| format!("{:?} names no file that can be saved", entry.name))?;
+        let base = self.save_dir().join(local);
+        let made = |e: std::io::Error| format!("Failed to create {}: {}", base.display(), e);
+        if entry.is_folder() {
+            let folder = base.clone();
+            blocking(move || std::fs::create_dir_all(folder)).await?.map_err(made)?;
+            return Ok(base);
+        }
+        if let Some(why) = entry.unsupported() {
+            return Err(why);
+        }
+        if let Some(max) = self.options.max_filesize.filter(|&max| entry.size > max) {
+            return Err(too_large(max, Some(entry.size)));
+        }
+        let parent = base.parent().map(Path::to_path_buf).unwrap_or_default();
+        blocking(move || std::fs::create_dir_all(parent)).await?.map_err(made)?;
+        let (path, _, _claim) = blocking(move || claim_free(&base, |_| Some(Vec::new()))).await??;
+        let part = part_path(&path);
+        let mut file = tokio::fs::File::create(&part).await.map_err(|e| format!("Failed to create {}: {}", part.display(), e))?;
+        let (mut meter, mut shown) = (SpeedMeter::new(0), Instant::now());
+        let mut written = |made: u64| {
+            if shown.elapsed() >= SNAPSHOT_INTERVAL {
+                shown = Instant::now();
+                emit(&snapshot_tx, || stream_snapshot(Some(entry.size), made, meter.update(made), &path));
+            }
+        };
+        let auth = self.auth.as_deref();
+        let extracted = tokio::select! {
+            biased;
+            _ = self.cancel_token.cancelled() => Err(CANCELLED.to_string()),
+            done = crate::zipdir::extract(client, auth, url, entry, &mut file, self.limiter.as_deref(), &mut written) => done,
+        };
+        drop(file);
+        let kept = match extracted {
+            Ok(()) => tokio::fs::rename(&part, &path).await.map_err(|e| format!("Failed to rename {}: {}", part.display(), e)),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = kept {
+            let _ = tokio::fs::remove_file(&part).await;
+            return Err(e);
+        }
+        emit(&snapshot_tx, || done_snapshot(entry.size, &path));
+        Ok(path)
+    }
+
 
     fn output_path_for(&self, filename: &str) -> PathBuf {
         match &self.options.output_path {

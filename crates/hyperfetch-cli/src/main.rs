@@ -28,6 +28,7 @@ use hyperfetch_core::resolver::SmartResolver;
 use hyperfetch_core::state::DownloadState;
 use hyperfetch_core::updater;
 use hyperfetch_core::verify::{self, BuildVerificationResult};
+use hyperfetch_core::zipdir::ZipEntry;
 use indicatif::HumanBytes;
 use url::Url;
 
@@ -301,20 +302,19 @@ async fn to_stdout(args: &Args, ui: &Ui, shutdown: &Shutdown) -> i32 {
     }
 }
 
-/// --preview: the files in the remote ZIP the link names, without downloading it.
+/// --preview: the files in the remote ZIP the link names, without downloading it; with --zip-file,
+/// those it picks.
 async fn preview(args: &Args, ui: &Ui) -> i32 {
     let Some(link) = args.urls.first() else { return usage("--preview takes a link") };
     let listed = async {
         let url = Url::parse(link).map_err(|e| format!("not a link: {}", e))?;
         let options = job(args, 1, Path::new("."), Task { urls: vec![url.clone()], ..Default::default() }).options;
-        let client = build_client(&options)?;
-        // Where the link leads, found as a download finds it: the user's headers to its host only.
-        let at = probe::probe(&client, &url, &options, None).await?.url().clone();
-        hyperfetch_core::zipdir::list_zip(&build_client(&probe::sending_own(&options, &at, &url))?, &at).await
+        list_zip(&url, &options).await
     }
     .await;
     match listed {
         Ok(entries) => {
+            let entries: Vec<ZipEntry> = entries.into_iter().filter(|e| args.zip_files.is_empty() || picked(args, e)).collect();
             probe::zip_lines(&entries).iter().for_each(|line| ui.print(line));
             EXIT_OK
         }
@@ -323,6 +323,54 @@ async fn preview(args: &Args, ui: &Ui) -> i32 {
             EXIT_FAILED
         }
     }
+}
+
+/// The files of the ZIP at `url`, read without downloading it, with the user's headers in
+/// `options` going to its host only.
+async fn list_zip(url: &Url, options: &DownloadOptions) -> Result<Vec<ZipEntry>, String> {
+    let client = build_client(options)?;
+    // Where the link leads, found as a download finds it.
+    let at = probe::probe(&client, url, options, None).await?.url().clone();
+    hyperfetch_core::zipdir::list_zip(&build_client(&probe::sending_own(options, &at, url))?, &at).await
+}
+
+/// Whether a --zip-file pattern matches `entry`'s path in its ZIP.
+fn picked(args: &Args, entry: &ZipEntry) -> bool {
+    args.zip_files.iter().any(|pattern| hyperfetch_core::pattern_matches(pattern, &entry.name))
+}
+
+/// With --zip-file, each of `jobs` becomes a download of each file its ZIP holds that a pattern
+/// matches (see `DownloadOptions::zip_entry`), named by its path in the ZIP; a link that is no
+/// ZIP, or whose ZIP has none, fails. Returns them and how many failed.
+async fn zip_jobs(args: &Args, jobs: Vec<Job>, ui: &Ui) -> (Vec<Job>, usize) {
+    if args.zip_files.is_empty() {
+        return (jobs, 0);
+    }
+    let (mut picks, mut failed) = (Vec::new(), 0);
+    for job in jobs {
+        let Some(url) = job.urls.first() else { continue };
+        let listed = list_zip(url, &job.options).await.and_then(|entries| {
+            let entries: Vec<ZipEntry> = entries.into_iter().filter(|e| picked(args, e)).collect();
+            if entries.is_empty() {
+                return Err("no file in the ZIP matches --zip-file".to_string());
+            }
+            Ok(entries)
+        });
+        match listed {
+            Ok(entries) => picks.extend(entries.into_iter().map(|entry| Job {
+                label: entry.name.clone(),
+                urls: job.urls.clone(),
+                options: DownloadOptions { zip_entry: Some(entry), ..job.options.clone() },
+                line: job.line,
+            })),
+            Err(e) => {
+                failed += 1;
+                ui.error(&format!("[FAILED] {}: {}", job.label, e));
+                ui.report(item("failed", Some(url.as_str()), None, None, None, None, Some(&e), None));
+            }
+        }
+    }
+    (picks, failed)
 }
 
 /// The exit code once every download has run.
@@ -810,7 +858,9 @@ async fn batch(args: &Args, ui: &Ui, shutdown: &Shutdown, http: &reqwest::Client
         failed += probe::spider(&sized, ui, args.server_response).await;
         return exit_code(None, failed);
     }
-    let jobs = before_running(args, sized.into_iter().map(|(job, _)| job).collect(), ui).await;
+    let (jobs, unlisted) = zip_jobs(args, sized.into_iter().map(|(job, _)| job).collect(), ui).await;
+    failed += unlisted;
+    let jobs = before_running(args, jobs, ui).await;
     // Asked only where someone answers: at a terminal that is not reading the input file, nor
     // printing JSON.
     let can_ask = !ui.quiet() && !ui.json && args.input_file.as_deref() != Some(Path::new("-")) && !stdin && at_terminal();
@@ -1841,8 +1891,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_zip_preview_lists_sizes_names_and_the_total() {
-        use hyperfetch_core::zipdir::ZipEntry;
-        let entry = |name: &str, size, compressed| ZipEntry { name: name.into(), size, compressed, modified: None };
+        let entry = |name: &str, size, compressed| ZipEntry { name: name.into(), size, compressed, ..Default::default() };
         let lines = probe::zip_lines(&[entry("docs/", 0, 0), entry("docs/a.txt", 2048, 1000), entry("b.bin", 1024, 1024)]);
         assert_eq!(lines.len(), 4);
         assert!(lines[1].ends_with("2.00 KiB  docs/a.txt"), "{}", lines[1]);
@@ -1874,6 +1923,59 @@ mod tests {
         let link = format!("{site}/a.zip");
         assert_eq!(preview(&parse(&["--preview", "--header", "X-Key: k1", &link]), &Ui::new(true)).await, EXIT_OK);
         assert_eq!(preview(&parse(&["--preview", &link]), &Ui::new(true)).await, EXIT_FAILED);
+    }
+
+    /// --zip-file downloads only the files of a remote ZIP it matches, each into its folder under
+    /// -d; a ZIP with none fails, and --preview with it lists them.
+    #[tokio::test]
+    async fn zip_files_download_only_what_they_match() {
+        let crc = |data: &[u8]| !data.iter().fold(!0u32, |c, &b| (0..8).fold(c ^ u32::from(b), |c, _| if c & 1 == 1 { (c >> 1) ^ 0xedb8_8320 } else { c >> 1 }));
+        let le16 = |values: &[u16]| values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>();
+        let le32 = |values: &[u32]| values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>();
+        let files: [(&str, &[u8]); 3] = [("docs/a.txt", b"alpha"), ("docs/b.md", b"bravo!"), ("c.txt", b"charlie")];
+        let (mut zip, mut directory) = (Vec::new(), Vec::new());
+        for (name, data) in files {
+            let (at, sums) = (zip.len() as u32, le32(&[crc(data), data.len() as u32, data.len() as u32]));
+            zip.extend([le32(&[0x0403_4b50]), le16(&[20, 0, 0, 0, 0]), sums.clone(), le16(&[name.len() as u16, 0])].concat());
+            zip.extend([name.as_bytes(), data].concat());
+            directory.extend([le32(&[0x0201_4b50]), le16(&[20, 20, 0, 0, 0, 0]), sums, le16(&[name.len() as u16, 0, 0, 0, 0]), le32(&[0, at])].concat());
+            directory.extend(name.as_bytes());
+        }
+        let (at, size) = (zip.len() as u32, directory.len() as u32);
+        zip.extend([directory, le32(&[0x0605_4b50]), le16(&[0, 0, 3, 3]), le32(&[size, at]), le16(&[0])].concat());
+        let (zip, listener) = (Arc::new(zip), tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap());
+        let link = format!("http://{}/pack.zip", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let zip = Arc::clone(&zip);
+                tokio::spawn(async move {
+                    let (mut head, mut buf) = (Vec::new(), [0u8; 1024]);
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => head.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let (head, len) = (String::from_utf8_lossy(&head).to_ascii_lowercase(), zip.len());
+                    let (s, e) = match head.lines().find_map(|l| l.strip_prefix("range: bytes=")).and_then(|r| r.trim().split_once('-')) {
+                        Some(("", n)) => (len - n.parse::<usize>().unwrap().min(len), len - 1),
+                        Some((s, e)) => (s.parse().unwrap(), e.parse::<usize>().unwrap().min(len - 1)),
+                        None => (0, len - 1),
+                    };
+                    let head = format!("HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {s}-{e}/{len}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", e + 1 - s);
+                    let _ = socket.write_all(&[head.as_bytes(), &zip[s..=e]].concat()).await;
+                });
+            }
+        });
+        let out = test_dir("zip-files");
+        let run = |pattern: &str| parse(&["-q", "--zip-file", pattern, "-d", out.to_str().unwrap(), &link]);
+        assert_eq!(batch(&run("*.txt"), &Ui::new(true), &Shutdown::install(), &reqwest::Client::new()).await, EXIT_OK);
+        assert_eq!(std::fs::read(out.join("docs").join("a.txt")).unwrap(), b"alpha");
+        assert_eq!(std::fs::read(out.join("c.txt")).unwrap(), b"charlie");
+        assert!(!out.join("docs").join("b.md").exists() && !out.join("pack.zip").exists());
+        assert_eq!(batch(&run("nothing-like-it"), &Ui::new(true), &Shutdown::install(), &reqwest::Client::new()).await, EXIT_FAILED);
+        assert_eq!(preview(&parse(&["--preview", "--zip-file", "B.MD", &link]), &Ui::new(true)).await, EXIT_OK);
+        let _ = std::fs::remove_dir_all(&out);
     }
 
     #[test]

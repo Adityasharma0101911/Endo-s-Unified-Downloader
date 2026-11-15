@@ -2326,6 +2326,7 @@ dependencies = [
  "cbc",
  "chacha20 0.9.1",
  "criterion",
+ "flate2",
  "futures-util",
  "http",
  "libc",
