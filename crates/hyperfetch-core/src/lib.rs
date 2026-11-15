@@ -40,6 +40,8 @@ pub mod decrypt;
 pub mod concat_server;
 pub mod muxer;
 pub mod doctor;
+#[cfg(test)]
+pub(crate) mod netsim;
 
 pub use range::{ByteRange, RangeError};
 pub use chunk::{Chunk, ChunkManager, ChunkStatus, ChunkError};
