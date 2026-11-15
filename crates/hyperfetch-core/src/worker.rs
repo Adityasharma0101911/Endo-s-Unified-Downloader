@@ -657,10 +657,11 @@ impl HttpWorker {
             }
             Err((kind, error)) => {
                 if !revoked {
-                    if let FailureKind::Throttled(after) = kind {
-                        slot.throttled(after.unwrap_or(THROTTLE_RETRY));
-                    }
-                    record_failure(&mut racer, &mut chunks, chunk_id, mirror_id, url, kind, &error);
+                    let paced = match kind {
+                        FailureKind::Throttled(after) => slot.throttled(after.unwrap_or(THROTTLE_RETRY)),
+                        _ => false,
+                    };
+                    record_failure(&mut racer, &mut chunks, chunk_id, mirror_id, url, kind, paced, &error);
                 } else if kind == FailureKind::Fatal {
                     chunks.abort(chunk_id, &error);
                 } else if let Some(mirror) = racer.get_mirror_mut(mirror_id) {
@@ -948,8 +949,10 @@ impl HttpWorker {
 /// policy: transient errors cost the chunk a retry (unless it made progress) and back off;
 /// bad mirrors are dropped after repeated bad answers, though a redirect target that refuses
 /// first sends the mirror back to its own URL; throttling while other connections are being
-/// served lowers the connection cap instead of costing retries.
+/// served lowers the connection cap instead of costing retries, and so does throttling by a host
+/// `paced` us with (it answered a request lately: see [`HostSlot::throttled`]).
 /// `mirror.in_flight` must already exclude the failed connection.
+#[allow(clippy::too_many_arguments)]
 fn record_failure(
     racer: &mut MirrorRacer,
     chunks: &mut ChunkManager,
@@ -957,6 +960,7 @@ fn record_failure(
     mirror_id: usize,
     url: &Url,
     kind: FailureKind,
+    paced: bool,
     error: &str,
 ) {
     let Some(mirror) = racer.get_mirror_mut(mirror_id) else {
@@ -999,11 +1003,11 @@ fn record_failure(
         }
         FailureKind::Throttled(after) => {
             // Refused with nothing else running: the server is busy. Pause it and count the
-            // attempt, so a server that never recovers still ends the download.
+            // attempt, unless it paces us, so a server that never recovers still ends the download.
             let pause = after.unwrap_or(THROTTLE_COOLDOWN);
             mirror.record_throttled(1);
             mirror.cool_down(Instant::now() + pause);
-            (pause, true)
+            (pause, !paced)
         }
         // The host rests meanwhile; `hosts::BANNED_FOR` bounds how long this goes on.
         FailureKind::Banned(rest) => (rest, false),
@@ -1678,7 +1682,7 @@ mod tests {
     /// A failed request to the mirror's current URL.
     fn fail(racer: &mut MirrorRacer, chunks: &mut ChunkManager, chunk: usize, mirror: usize, kind: FailureKind, error: &str) {
         let url = racer.get_mirror(mirror).unwrap().url.clone();
-        record_failure(racer, chunks, chunk, mirror, &url, kind, error);
+        record_failure(racer, chunks, chunk, mirror, &url, kind, false, error);
     }
 
     #[test]
@@ -1706,6 +1710,13 @@ mod tests {
         assert_eq!(chunks.chunks()[0].retries, 1);
         assert_eq!(racer.select_best_mirror(), None, "mirror pauses for Retry-After");
         assert!(chunks.get_next_work(0, 0).is_none_or(|c| c.id != 0), "chunk waits for Retry-After");
+
+        // From a host that answered lately the refusal only paces us: no retry is spent.
+        let (mut racer, mut chunks) = setup(1);
+        chunks.get_next_work(0, 0).unwrap();
+        let url = racer.get_mirror(0).unwrap().url.clone();
+        record_failure(&mut racer, &mut chunks, 0, 0, &url, busy, true, "HTTP 503");
+        assert_eq!(chunks.chunks()[0].retries, 0);
     }
 
     #[test]
@@ -1734,7 +1745,7 @@ mod tests {
         // Every connection finds the signed target expired at once: none of that counts.
         for _ in 0..3 {
             let chunk = chunks.get_next_work(0, 0).unwrap().id;
-            record_failure(&mut racer, &mut chunks, chunk, 0, &target, FailureKind::Denied, "HTTP 403");
+            record_failure(&mut racer, &mut chunks, chunk, 0, &target, FailureKind::Denied, false, "HTTP 403");
         }
         let mirror = racer.get_mirror(0).unwrap();
         assert_eq!((&mirror.url, &mirror.fallback), (&own, &None));
@@ -1745,7 +1756,7 @@ mod tests {
         // The mirror's own URL refusing is a bad mirror, as always.
         for _ in 0..2 {
             let chunk = chunks.get_next_work(0, 0).unwrap().id;
-            record_failure(&mut racer, &mut chunks, chunk, 0, &own, FailureKind::Denied, "HTTP 404");
+            record_failure(&mut racer, &mut chunks, chunk, 0, &own, FailureKind::Denied, false, "HTTP 404");
         }
         assert!(racer.all_inactive());
         assert!(chunks.has_fatal_failure().unwrap().1.contains("every mirror failed"));

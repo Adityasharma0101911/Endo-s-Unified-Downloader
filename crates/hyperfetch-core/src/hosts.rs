@@ -280,8 +280,9 @@ impl HostSlot {
     /// The host refused this request with 429/503, asking for a `pause` (its Retry-After): no
     /// request goes to it until that is over. With other requests to it open at the time, it
     /// serves no more than those at once: every download to it is held to that, for
-    /// `PROFILE_TTL`. With none, the host was just busy.
-    pub fn throttled(&self, pause: Duration) {
+    /// `PROFILE_TTL`. With none, the host was just busy. Whether it answered a request within
+    /// `BANNED_FOR`: then it paces us rather than refusing everything.
+    pub fn throttled(&self, pause: Duration) -> bool {
         self.hosts.throttled(&self.key, self.answer(), pause, clock())
     }
 
@@ -408,6 +409,8 @@ struct Entry {
     refused: Option<(Instant, usize)>,
     /// Requests it left unanswered in a row within `BANNED_FOR` of that.
     unanswered: u32,
+    /// When it last answered a request.
+    answered_at: Option<Instant>,
     /// The most requests ever open at once.
     #[cfg(test)]
     peak: usize,
@@ -724,19 +727,20 @@ impl Hosts {
         self.freed.notify_waiters();
     }
 
-    fn throttled(&self, key: &HostKey, asked: bool, pause: Duration, now: Instant) {
-        if let Some(entry) = self.entries.lock().get_mut(key) {
-            Self::answered(entry, asked);
-            Self::rest(entry, now + pause);
-            entry.refused = Some((now, 0));
-            entry.unanswered = 0;
-            // The refused request still holds its slot.
-            let others = entry.open.saturating_sub(1);
-            if others > 0 {
-                entry.facts.connection_cap = Some((others, now));
-                self.keep(key, unix_now(), |kept| kept.cap = Some(others));
-            }
+    fn throttled(&self, key: &HostKey, asked: bool, pause: Duration, now: Instant) -> bool {
+        let mut entries = self.entries.lock();
+        let Some(entry) = entries.get_mut(key) else { return false };
+        Self::answered(entry, asked);
+        Self::rest(entry, now + pause);
+        entry.refused = Some((now, 0));
+        entry.unanswered = 0;
+        // The refused request still holds its slot.
+        let others = entry.open.saturating_sub(1);
+        if others > 0 {
+            entry.facts.connection_cap = Some((others, now));
+            self.keep(key, unix_now(), |kept| kept.cap = Some(others));
         }
+        entry.answered_at.is_some_and(|at| now.saturating_duration_since(at) < BANNED_FOR)
     }
 
     fn unanswered(&self, key: &HostKey, asked: bool, now: Instant) -> Option<Duration> {
@@ -761,6 +765,7 @@ impl Hosts {
         let raised = self.entries.lock().get_mut(key).is_some_and(|entry| {
             Self::answered(entry, asked);
             entry.unanswered = 0;
+            entry.answered_at = Some(now);
             // Each answer since a refusal lets one more request wait for its answer at once.
             let grew = entry.refused.as_mut().map(|(_, answers)| *answers += 1).is_some();
             grew | match (entry.facts.connection_cap, fresh(entry.facts.connection_cap, now)) {
@@ -899,7 +904,7 @@ mod tests {
         assert_eq!(hosts.profile(&host, t0).connection_cap, None);
         // Refused with two others open, it serves two at once. (Since the refusal each request
         // waits for the answers of those before it.)
-        let three: Vec<HostSlot> = (0..3).map(|_| answered(hosts.try_acquire(&host, 32, t0).unwrap())).collect();
+        let three: Vec<HostSlot> = (0..3).map(|_| answered(hosts.try_acquire(&host, 32, Instant::now()).unwrap())).collect();
         three[2].throttled(Duration::ZERO);
         drop(three);
         assert_eq!(hosts.profile(&host, Instant::now()).connection_cap, Some(2));
@@ -963,7 +968,7 @@ mod tests {
         drop(slot);
         let (out, also) = (hosts.try_acquire(&host, 0, t0).unwrap(), hosts.try_acquire(&host, 0, t0).unwrap());
         let refused = hosts.try_acquire(&host, 0, t0).unwrap();
-        hosts.throttled(&host, refused.answer(), Duration::from_secs(1), t0);
+        assert!(!hosts.throttled(&host, refused.answer(), Duration::from_secs(1), t0), "it never answered: it does not pace us");
         drop(refused);
         // Two requests out when it shut us out fail alike: one sign, one rest.
         let at = t0 + Duration::from_secs(1);
@@ -990,6 +995,13 @@ mod tests {
         let late = t0 + BANNED_FOR;
         let slot = hosts.try_acquire(&host, 0, late).unwrap();
         assert_eq!(hosts.unanswered(&host, slot.answer(), late), None);
+        drop(slot);
+        // A refusal by a host that answered lately paces us; long after its last answer it does not.
+        let slot = hosts.try_acquire(&host, 0, late).unwrap();
+        assert!(hosts.throttled(&host, slot.answer(), Duration::ZERO, late));
+        drop(slot);
+        let slot = hosts.try_acquire(&host, 0, at + BANNED_FOR).unwrap();
+        assert!(!hosts.throttled(&host, slot.answer(), Duration::ZERO, at + BANNED_FOR));
     }
 
     #[tokio::test(start_paused = true)]
