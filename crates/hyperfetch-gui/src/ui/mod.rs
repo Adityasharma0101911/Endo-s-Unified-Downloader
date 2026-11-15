@@ -26,7 +26,7 @@ use crate::settings::{Settings, BROWSERS, MEDIA_PRESETS};
 use crate::util::{self, format_bytes, format_duration, lock, Verdict};
 use crate::{Answer, App, Dialog, Origin, Tab, VerifyRequest, GRAPH_WINDOW};
 
-use add::{add_link, add_page, channel_prompt, clipboard_banner, ffmpeg_notice, ffmpeg_prompt, listing_prompt, notice_banner, undo_banner, update_banner};
+use add::{add_link, add_page, channel_prompt, clipboard_banner, ffmpeg_notice, ffmpeg_prompt, listing_prompt, notice_banner, undo_toast, update_banner};
 use history::history_page;
 use queue::queue_page;
 use settings::settings_page;
@@ -510,7 +510,6 @@ pub fn render(app: &mut App, ctx: &egui::Context) {
         channel_prompt(app, ui);
         ffmpeg_prompt(app, ui);
         notice_banner(app, ui);
-        undo_banner(app, ui);
         ffmpeg_notice(ui, media::installing_ffmpeg());
         ui.add_space(12.0);
         anim::shifted(ui, shown, anim::RISE, |ui| match app.tab {
@@ -529,6 +528,7 @@ pub fn render(app: &mut App, ctx: &egui::Context) {
             }
         });
     });
+    undo_toast(app, ctx);
     shortcuts_window(ctx);
 }
 

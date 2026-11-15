@@ -84,32 +84,49 @@ pub(super) fn notice_banner(app: &mut App, ui: &mut Ui) {
     });
 }
 
-/// For 8 s after downloads left the queue (Remove, Clear), says so and offers Undo, which puts
-/// them back where they were.
-pub(super) fn undo_banner(app: &mut App, ui: &mut Ui) {
+/// For 8 s after downloads left the queue (Remove, Clear), a note at the bottom of the window
+/// says so and offers Undo, which puts them back where they were. It floats over the page, so
+/// that nothing on it moves; it slides up and fades in, and out again.
+pub(super) fn undo_toast(app: &mut App, ctx: &egui::Context) {
     const SHOWN: f64 = 8.0;
-    let now = ui.input(|i| i.time);
+    let now = ctx.input(|i| i.time);
     if app.removed.as_ref().is_some_and(|(_, at)| now - at >= SHOWN) {
         app.removed = None;
     }
-    let removed = app.removed.as_ref().map(|(items, at)| (items.len(), items[0].1.filename.clone(), *at));
-    fading(ui, "undo", removed, |ui, (count, name, at)| {
-        let p = palette(ui);
-        let text = match count {
-            1 => format!("Removed {}", truncate_chars(&name, 50)),
-            n => format!("Removed {} downloads", n),
+    let id = egui::Id::new("undo toast");
+    if let Some((items, _)) = &app.removed {
+        let text = match &items[..] {
+            [(_, item)] => format!("Removed {}", truncate_chars(&item.filename, 50)),
+            items => format!("Removed {} downloads", items.len()),
         };
-        keyed_banner(ui, egui::Id::new(("undo", at.to_bits())), p.accent, icon::TRASH, RichText::new(text).color(p.text), |ui| {
-            if icon_button(ui, icon::X, "Dismiss", true).clicked() {
-                app.removed = None;
-            }
-            if ui.add(primary_button("Undo", p.accent)).clicked() {
-                app.undo_remove();
-            }
+        ctx.data_mut(|d| d.insert_temp(id, text));
+    }
+    let live = app.removed.is_some();
+    let shown = anim::ease(anim::presence(ctx, id, live, 0.2));
+    let Some(text) = ctx.data(|d| d.get_temp::<String>(id)).filter(|_| shown > 0.0) else { return };
+    let p = palette_of(ctx);
+    let rise = Vec2::new(0.0, -24.0 + 12.0 * (1.0 - shown));
+    egui::Area::new(id).order(egui::Order::Foreground).anchor(Align2::CENTER_BOTTOM, rise).interactable(live).show(ctx, |ui| {
+        ui.multiply_opacity(shown);
+        let shadow = egui::Shadow { offset: Vec2::new(0.0, 6.0), blur: 18.0, spread: 0.0, color: Color32::from_black_alpha(70) };
+        Frame::none().fill(p.card).stroke(Stroke::new(1.0, p.border)).rounding(10.0).shadow(shadow).inner_margin(Margin::symmetric(14.0, 8.0)).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(icon::TRASH).size(16.0).color(p.muted));
+                ui.label(RichText::new(text).color(p.text));
+                ui.add_space(8.0);
+                if ui.add(primary_button("Undo", p.accent)).clicked() {
+                    app.undo_remove();
+                }
+                if icon_button(ui, icon::X, "Dismiss", true).clicked() {
+                    app.removed = None;
+                }
+            });
         });
-        // A frame when its time is up, so that it goes by itself.
-        ui.ctx().request_repaint_after(Duration::from_secs_f64((at + SHOWN - now).clamp(0.0, SHOWN)));
     });
+    // A frame when its time is up, so that it goes by itself.
+    if let Some((_, at)) = &app.removed {
+        ctx.request_repaint_after(Duration::from_secs_f64((at + SHOWN - now).clamp(0.0, SHOWN)));
+    }
 }
 
 /// The first-run card: the three steps to a first download, until it is closed.

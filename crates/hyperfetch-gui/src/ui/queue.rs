@@ -1520,6 +1520,8 @@ mod tests {
                 assert!(tops.windows(2).all(|w| w[1] <= w[0] && w[0] - w[1] < stride / 3.0), "glides: {tops:?}");
             }
             h.leave();
+            // The Undo note asks for a frame when its time is up: closed, it is out of the way.
+            h.app.removed = None;
             assert_eq!(h.frames(30), Duration::MAX, "and keeps still");
         }
     }
