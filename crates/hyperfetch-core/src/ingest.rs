@@ -557,7 +557,9 @@ async fn list(http: &reqwest::Client, url: &Url, options: &ListOptions) -> Optio
         return Some(shares::list(http, url, options.password.as_deref()).await);
     }
     if cloud::lists(url) {
-        return Some(cloud::list(http, url).await);
+        if let Some(listed) = cloud::list(http, url, options).await {
+            return Some(listed);
+        }
     }
     if repos::lists(url) {
         let auth = options.auth.as_ref().filter(|(link, _)| link == url).map(|(_, header)| header.as_str());

@@ -5,18 +5,23 @@
 //! A Yandex Disk video the API will not hand over, and a Box share whose page the app cannot
 //! read, resolve to the share link itself: its page goes on to yt-dlp, whose extractors take
 //! them (see `resolver::yt_dlp_share_page`), as all of their links did before.
+//!
+//! Nextcloud and ownCloud public shares (`/s/{token}` on any host that runs one) are listed over
+//! the share's public WebDAV into one task per file, a shared file into its one task.
 
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 
 use percent_encoding::percent_decode_str;
-use reqwest::header::{CONTENT_TYPE, RANGE};
+use quick_xml::events::Event;
+use quick_xml::reader::Reader;
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, RANGE};
 use reqwest::{RequestBuilder, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use url::Url;
 
-use crate::ingest::{clean_path, Task};
+use crate::ingest::{clean_path, ListOptions, Task};
 use crate::resolver::ResolverError;
 
 const PCLOUD_API: &str = "https://api.pcloud.com";
@@ -36,6 +41,12 @@ const LISTS_MANY: &str = "this link is a folder: add it as a new download to get
 const WETRANSFER_GONE: &str = "the WeTransfer transfer has expired or was deleted";
 const YANDEX_GONE: &str = "the Yandex Disk link does not exist or was removed";
 const BOX_GONE: &str = "the Box link does not exist or was removed";
+const SHARE_GONE: &str = "the share does not exist or was removed (or has no such folder)";
+const SHARE_LOCKED: &str = "the share wants a password (or no longer exists): add its link with the password before the host, https://TOKEN:PASSWORD@host/s/TOKEN, where TOKEN is the share's";
+const SHARE_REFUSED: &str = "the share's password is wrong (or the share no longer exists); give it as https://TOKEN:PASSWORD@host/s/TOKEN, where TOKEN is the share's";
+
+/// What a Nextcloud or ownCloud share's WebDAV is asked of each entry.
+const PROPFIND: &str = r#"<?xml version="1.0"?><d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns"><d:prop><d:displayname/><d:getcontentlength/><d:resourcetype/><oc:checksums/></d:prop></d:propfind>"#;
 
 /// What a share link is, from its shape.
 #[derive(Debug, PartialEq)]
@@ -123,18 +134,30 @@ fn transfer_of(url: &Url) -> Option<(String, Option<String>, String)> {
 }
 
 /// Whether `url` is a link [`list`] reads: a pCloud, Yandex Disk or Box share that may be a
-/// folder (their links do not say).
+/// folder (their links do not say), or one shaped as a Nextcloud or ownCloud share.
 pub fn lists(url: &Url) -> bool {
     match link_of(url) {
         Some(Link::PCloud { file, .. } | Link::Box { file, .. }) => file.is_none(),
         Some(Link::Yandex { key, .. }) => key.contains("/d/"),
-        _ => false,
+        _ => share_of(url).is_some(),
     }
 }
 
 /// One task per file the folder at `url` holds, in a folder named after it; a file's link is its
-/// one task, as typed.
-pub async fn list(http: &reqwest::Client, url: &Url) -> Result<Vec<Task>, String> {
+/// one task, as typed. A Nextcloud or ownCloud share is read with the Authorization `options`
+/// gave its link (a share's password, see [`share_tasks`]); None when its host runs neither.
+pub async fn list(http: &reqwest::Client, url: &Url, options: &ListOptions) -> Option<Result<Vec<Task>, String>> {
+    match share_of(url) {
+        Some(share) => {
+            let auth = options.auth.as_ref().filter(|(link, _)| link == url).map(|(_, header)| header.as_str());
+            share_tasks(http, &share, auth).await
+        }
+        None => Some(list_link(http, url).await),
+    }
+}
+
+/// [`list`] for the services' own links.
+async fn list_link(http: &reqwest::Client, url: &Url) -> Result<Vec<Task>, String> {
     let listed = match link_of(url) {
         Some(Link::PCloud { api, code, file: None }) => pcloud_list(http, api, url, &code).await?,
         Some(Link::Yandex { key, path }) => yandex_list(http, YANDEX_API, &key, &path).await?,
@@ -569,6 +592,229 @@ async fn box_list(http: &reqwest::Client, link: &Url, name: &str, folder: Option
     Ok(Some(tasks))
 }
 
+/// A link shaped as a Nextcloud or ownCloud public share: {base}[/index.php]/s/{token}[?path=...].
+#[derive(Debug, PartialEq)]
+struct Share {
+    /// Where the server's own pages are: its scheme, host and the path it is installed under.
+    base: String,
+    /// The link up to its token, as typed.
+    link: String,
+    token: String,
+    /// The folder in the share the link opens (`?path=`), "/" for its top.
+    path: String,
+}
+
+fn share_of(url: &Url) -> Option<Share> {
+    if link_of(url).is_some() || !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    let segs: Vec<&str> = url.path_segments()?.collect();
+    let segs = segs.strip_suffix(&[""]).unwrap_or(&segs);
+    let [before @ .., "s", token] = segs else { return None };
+    if !is_id(token) {
+        return None;
+    }
+    let origin = url.origin().ascii_serialization();
+    let join = |parts: &[&str]| std::iter::once(origin.as_str()).chain(parts.iter().copied()).collect::<Vec<_>>().join("/");
+    let path = url.query_pairs().find(|(k, _)| k == "path").map_or_else(|| "/".to_string(), |(_, v)| v.into_owned());
+    Some(Share {
+        base: join(before.strip_suffix(&["index.php"]).unwrap_or(before)),
+        link: join(&[before, &["s", token]].concat()),
+        token: token.to_string(),
+        path,
+    })
+}
+
+/// One file or folder a WebDAV listing names.
+#[derive(Debug, Default)]
+struct DavEntry {
+    href: String,
+    name: String,
+    folder: bool,
+    size: Option<u64>,
+    /// The `oc:checksums` the server keeps ("SHA1:... MD5:..."), if any.
+    checksums: String,
+}
+
+/// The entries of a WebDAV PROPFIND answer.
+fn dav_entries(xml: &str) -> Vec<DavEntry> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+    let (mut entries, mut entry, mut tag) = (Vec::new(), None::<DavEntry>, String::new());
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) => {
+                tag = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
+                match tag.as_str() {
+                    "response" => entry = Some(DavEntry::default()),
+                    "collection" => entry.iter_mut().for_each(|entry| entry.folder = true),
+                    _ => {}
+                }
+            }
+            Ok(Event::Empty(e)) if e.local_name().as_ref() == b"collection" => entry.iter_mut().for_each(|entry| entry.folder = true),
+            Ok(Event::Text(t)) => {
+                let text = t.unescape().map_or_else(|_| String::from_utf8_lossy(&t).into_owned(), |t| t.into_owned());
+                let Some(entry) = entry.as_mut() else { continue };
+                match tag.as_str() {
+                    "href" => entry.href = text,
+                    "displayname" => entry.name = text,
+                    "getcontentlength" => entry.size = text.trim().parse().ok(),
+                    "checksum" => entry.checksums = format!("{} {}", entry.checksums, text),
+                    _ => {}
+                }
+            }
+            Ok(Event::End(e)) => {
+                if e.local_name().as_ref() == b"response" {
+                    entries.extend(entry.take());
+                }
+                tag.clear();
+            }
+            Ok(Event::Eof) | Err(_) => return entries,
+            _ => {}
+        }
+    }
+}
+
+/// The strongest checksum among a server's `oc:checksums`.
+fn dav_checksum(checksums: &str) -> Option<String> {
+    ["sha256", "sha1", "md5"].into_iter().find_map(|algo| {
+        let hex = checksums.split_whitespace().find_map(|c| c.split_once(':').filter(|(a, _)| a.eq_ignore_ascii_case(algo)).map(|(_, hex)| hex))?;
+        Some(format!("{}:{}", algo, hex.to_ascii_lowercase())).filter(|c| crate::storage::validate_checksum(c).is_ok())
+    })
+}
+
+/// The path `href` names inside the WebDAV folder `root`, a part per folder, decoded; None when it
+/// is not inside it.
+fn dav_path(root: &Url, href: &str) -> Option<Vec<String>> {
+    let path = root.join(href).ok()?.path().to_string();
+    let rest = path.strip_prefix(root.path()).or_else(|| (path == root.path().trim_end_matches('/')).then_some(""))?;
+    Some(rest.split('/').filter(|s| !s.is_empty()).map(|s| percent_decode_str(s).decode_utf8_lossy().into_owned()).collect())
+}
+
+/// How a share's WebDAV answered.
+enum Walk {
+    Listed(Vec<Task>),
+    /// It wants a password, or a right one.
+    Locked,
+    /// Not there: an older server without it, or no such share or folder.
+    Absent,
+}
+
+/// The files of the share `share` on a host that runs Nextcloud or ownCloud (its `status.php`
+/// says it is installed), read with `auth` (the user's `TOKEN:PASSWORD` sign-in, for a share with
+/// a password); None for any other host. Nextcloud 29 and later list it over
+/// `public.php/dav/files/{token}` (any user name goes with the password), ownCloud and older ones
+/// over `public.php/webdav`, whose user name is the token.
+async fn share_tasks(http: &reqwest::Client, share: &Share, auth: Option<&str>) -> Option<Result<Vec<Task>, String>> {
+    #[derive(Default, Deserialize)]
+    #[serde(default)]
+    struct Status {
+        installed: bool,
+    }
+    let status = get_json::<Status>(http.get(format!("{}/status.php", share.base)), "the share's server").await;
+    if !status.is_ok_and(|(code, status)| code.is_success() && status.installed) {
+        return None;
+    }
+    let mut locked = false;
+    for (root, legacy) in [(format!("{}/public.php/dav/files/{}/", share.base, share.token), false), (format!("{}/public.php/webdav/", share.base), true)] {
+        match share_walk(http, share, &root, legacy, auth).await {
+            Ok(Walk::Listed(tasks)) if tasks.is_empty() => return Some(Err("the share holds no files the app can download".to_string())),
+            Ok(Walk::Listed(tasks)) => return Some(Ok(tasks)),
+            Ok(Walk::Locked) => locked = true,
+            Ok(Walk::Absent) => {}
+            Err(e) => return Some(Err(e)),
+        }
+    }
+    Some(Err(match (locked, auth) {
+        (false, _) => SHARE_GONE,
+        (true, None) => SHARE_LOCKED,
+        (true, Some(_)) => SHARE_REFUSED,
+    }
+    .to_string()))
+}
+
+/// Every file under the share's folder in the WebDAV at `root` (`legacy`: the one whose user name
+/// is the token), subfolders kept, folder after folder. A file downloads from the share's own
+/// download link, or with `auth` from its WebDAV link, which takes the user's sign-in.
+async fn share_walk(http: &reqwest::Client, share: &Share, root: &str, legacy: bool, auth: Option<&str>) -> Result<Walk, String> {
+    let cannot_reach = |e: reqwest::Error| format!("Cannot reach the share's server: {}", e.without_url());
+    let method = reqwest::Method::from_bytes(b"PROPFIND").map_err(|e| e.to_string())?;
+    let root = Url::parse(root).map_err(|e| e.to_string())?;
+    let start: Vec<String> = share.path.split('/').filter(|s| !s.is_empty()).map(str::to_string).collect();
+    let (mut folders, mut tasks, mut top) = (VecDeque::from([start.clone()]), Vec::new(), None::<PathBuf>);
+    let mut listed = 0;
+    while let Some(dir) = folders.pop_front() {
+        listed += 1;
+        if listed > MAX_FOLDERS {
+            return Err(format!("the share holds more than {} folders: add a subfolder's link instead", MAX_FOLDERS));
+        }
+        let mut url = root.clone();
+        url.path_segments_mut().map_err(|_| "unusable share link".to_string())?.pop_if_empty().extend(&dir).push("");
+        let request = http.request(method.clone(), url).header("Depth", "1").header("X-Requested-With", "XMLHttpRequest");
+        let request = match auth.and_then(|auth| reqwest::header::HeaderValue::from_str(auth).ok()) {
+            Some(mut auth) => {
+                auth.set_sensitive(true);
+                request.header(AUTHORIZATION, auth)
+            }
+            None if legacy => request.basic_auth(&share.token, None::<&str>),
+            None => request,
+        };
+        let answer = request.header(CONTENT_TYPE, "application/xml").body(PROPFIND).send().await.map_err(cannot_reach)?;
+        match answer.status().as_u16() {
+            207 => {}
+            401 => return Ok(Walk::Locked),
+            _ if top.is_none() => return Ok(Walk::Absent),
+            status => return Err(format!("the share's server answered HTTP {} while listing it", status)),
+        }
+        let xml = answer.text().await.map_err(cannot_reach)?;
+        for entry in dav_entries(&xml) {
+            let Some(path) = dav_path(&root, &entry.href) else { continue };
+            if path == dir {
+                if top.is_none() && !entry.folder {
+                    // A shared file: the share is that file, named as the server names it.
+                    let url = match auth {
+                        Some(_) => root.join(&entry.href).map_err(|e| e.to_string())?,
+                        None => Url::parse(&format!("{}/download", share.link)).map_err(|e| e.to_string())?,
+                    };
+                    let name = clean_path([entry.name.as_str()]).ok();
+                    return Ok(Walk::Listed(vec![Task { urls: vec![url], name, size: entry.size, checksum: dav_checksum(&entry.checksums), ..Task::default() }]));
+                }
+                if top.is_none() {
+                    top = Some(component(&entry.name, &share.token)?);
+                }
+                continue;
+            }
+            // Only what is in the folder asked for: a server's answer is not trusted to stay in it.
+            if path.len() != dir.len() + 1 || !path.starts_with(&dir) {
+                continue;
+            }
+            if entry.folder {
+                folders.push_back(path);
+                continue;
+            }
+            // Untrusted names: an unusable one is left out.
+            let Ok(name) = clean_path(path[start.len()..].iter().map(String::as_str)) else { continue };
+            let url = match auth {
+                Some(_) => root.join(&entry.href).map_err(|e| e.to_string())?,
+                None => {
+                    let (file, parent) = path.split_last().ok_or("unusable share entry")?;
+                    let query = [("path", format!("/{}", parent.join("/"))), ("files", file.clone())];
+                    Url::parse_with_params(&format!("{}/download", share.link), query).map_err(|e| e.to_string())?
+                }
+            };
+            tasks.push(Task {
+                urls: vec![url],
+                name: Some(name),
+                folder: top.clone(),
+                size: entry.size,
+                checksum: dav_checksum(&entry.checksums),
+                ..Task::default()
+            });
+        }
+    }
+    Ok(Walk::Listed(tasks))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -838,6 +1084,140 @@ mod tests {
         assert_eq!(box_list(&http, &at("/s/gone1"), "gone1", None).await.unwrap_err(), BOX_GONE);
     }
 
+    #[test]
+    fn nextcloud_shares_are_told_by_their_shape() {
+        let share = |link: &str| share_of(&Url::parse(link).unwrap());
+        assert_eq!(
+            share("https://cloud.example.org/index.php/s/kFy9Lek5sm928xP"),
+            Some(Share {
+                base: "https://cloud.example.org".into(),
+                link: "https://cloud.example.org/index.php/s/kFy9Lek5sm928xP".into(),
+                token: "kFy9Lek5sm928xP".into(),
+                path: "/".into(),
+            })
+        );
+        assert_eq!(
+            share("https://h.example/owncloud/s/Tok3n/?path=%2FA%20Folder"),
+            Some(Share { base: "https://h.example/owncloud".into(), link: "https://h.example/owncloud/s/Tok3n".into(), token: "Tok3n".into(), path: "/A Folder".into() })
+        );
+        for other in [
+            // A file's own download link, the share's whole download, Box's and Terabox's shares.
+            "https://cloud.example.org/s/kFy9Lek5sm928xP/download?path=%2F&files=a.txt",
+            "https://cloud.example.org/s/kFy9Lek5sm928xP/download",
+            "https://app.box.com/s/17vthb1z",
+            "https://cloud.example.org/s/",
+            "https://cloud.example.org/s/a.b",
+            "ftp://cloud.example.org/s/kFy9Lek5sm928xP",
+        ] {
+            assert_eq!(share(other), None, "{other}");
+        }
+        assert!(lists(&Url::parse("https://cloud.example.org/s/kFy9Lek5sm928xP").unwrap()));
+        assert!(!handles(&Url::parse("https://cloud.example.org/s/kFy9Lek5sm928xP").unwrap()), "as one download it is any link");
+    }
+
+    /// A WebDAV answer as Nextcloud writes it: one `<d:response>` per (href, displayname,
+    /// size or folder, checksums).
+    fn multistatus(entries: &[(&str, &str, Option<u64>, &str)]) -> Reply {
+        let response = |(href, name, size, sums): &(&str, &str, Option<u64>, &str)| match size {
+            Some(size) => format!(
+                "<d:response><d:href>{href}</d:href><d:propstat><d:prop><d:displayname>{name}</d:displayname><d:getcontentlength>{size}</d:getcontentlength><d:resourcetype/><oc:checksums><oc:checksum>{sums}</oc:checksum></oc:checksums></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"
+            ),
+            None => format!(
+                "<d:response><d:href>{href}</d:href><d:propstat><d:prop><d:displayname>{name}</d:displayname><d:resourcetype><d:collection/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat><d:propstat><d:prop><d:getcontentlength/><oc:checksums/></d:prop><d:status>HTTP/1.1 404 Not Found</d:status></d:propstat></d:response>"
+            ),
+        };
+        let body = format!(
+            r#"<?xml version="1.0"?><d:multistatus xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">{}</d:multistatus>"#,
+            entries.iter().map(response).collect::<String>()
+        );
+        (207, "Content-Type: application/xml; charset=utf-8\r\n".into(), body.into_bytes())
+    }
+
+    fn nextcloud(path: &str, _: Option<crate::range::ByteRange>) -> Reply {
+        let sha1 = "SHA1:3E20A009994405F535CDF07CDC2974CEF2FCE8F2 MD5:9366a4b09386bf673c447e33d806d904 ADLER32:2283b5fd";
+        match path {
+            "/nc/status.php" | "/old/status.php" | "/gone/status.php" => json(200, r#"{"installed":true,"maintenance":false,"productname":"Nextcloud"}"#),
+            "/nc/public.php/dav/files/FOLDER/" => multistatus(&[
+                ("/nc/public.php/dav/files/FOLDER/", "My/Pack", None, ""),
+                ("/nc/public.php/dav/files/FOLDER/a%20b.txt", "a b.txt", Some(3), sha1),
+                ("/nc/public.php/dav/files/FOLDER/Sub/", "Sub", None, ""),
+                // Outside the share, and deeper than asked.
+                ("/nc/public.php/dav/files/OTHER/x.bin", "x.bin", Some(1), ""),
+                ("/nc/public.php/dav/files/FOLDER/Sub/deep/y.bin", "y.bin", Some(1), ""),
+            ]),
+            "/nc/public.php/dav/files/FOLDER/Sub/" => multistatus(&[
+                ("/nc/public.php/dav/files/FOLDER/Sub/", "Sub", None, ""),
+                ("/nc/public.php/dav/files/FOLDER/Sub/c.bin", "c.bin", Some(5), "ADLER32:1"),
+                ("/nc/public.php/dav/files/FOLDER/Sub/..", "..", Some(1), ""),
+            ]),
+            // An older server, or ownCloud: no public.php/dav, a shared file at its WebDAV's top.
+            "/old/public.php/webdav/" => multistatus(&[("/old/public.php/webdav/", "report.pdf", Some(9), "")]),
+            "/nc/public.php/dav/files/LOCKED/" | "/nc/public.php/webdav/" => (401, String::new(), Vec::new()),
+            _ => (404, String::new(), Vec::new()),
+        }
+    }
+
+    /// A folder share is one task per file, folder after folder, subfolders kept, each the share's
+    /// own download link with its size and strongest checksum; nothing outside the folder asked
+    /// for is listed. An older server's shared file is its one task; a share with a password says
+    /// how to give it; a host that runs neither Nextcloud nor ownCloud is left to the other listers.
+    #[tokio::test]
+    async fn nextcloud_shares_list_their_files() {
+        let (addr, _) = serve(nextcloud).await;
+        let at = |path: &str| share_of(&Url::parse(&format!("http://{addr}{path}")).unwrap()).unwrap();
+        let tasks = share_tasks(&http(), &at("/nc/index.php/s/FOLDER"), None).await.unwrap().unwrap();
+        let listed: Vec<_> = tasks.iter().map(|t| (t.urls[0].to_string(), t.name.clone().unwrap(), t.size, t.checksum.clone())).collect();
+        let download = format!("http://{addr}/nc/index.php/s/FOLDER/download");
+        assert_eq!(
+            listed,
+            [
+                (format!("{download}?path=%2F&files=a+b.txt"), PathBuf::from("a b.txt"), Some(3), Some("sha1:3e20a009994405f535cdf07cdc2974cef2fce8f2".into())),
+                (format!("{download}?path=%2FSub&files=c.bin"), PathBuf::from("Sub").join("c.bin"), Some(5), None),
+            ]
+        );
+        assert!(tasks.iter().all(|t| t.folder == Some("My_Pack".into()) && !t.from_document));
+        let sub = share_tasks(&http(), &at("/nc/s/FOLDER?path=/Sub"), None).await.unwrap().unwrap();
+        assert_eq!((sub[0].name.clone(), sub[0].folder.clone()), (Some("c.bin".into()), Some("Sub".into())));
+        let file = share_tasks(&http(), &at("/old/s/FILE"), None).await.unwrap().unwrap();
+        assert_eq!(file, [Task { urls: vec![Url::parse(&format!("http://{addr}/old/s/FILE/download")).unwrap()], name: Some("report.pdf".into()), size: Some(9), ..Task::default() }]);
+        assert_eq!(share_tasks(&http(), &at("/nc/s/LOCKED"), None).await.unwrap().unwrap_err(), SHARE_LOCKED);
+        assert_eq!(share_tasks(&http(), &at("/nc/s/LOCKED"), Some("Basic eDp5")).await.unwrap().unwrap_err(), SHARE_REFUSED);
+        assert_eq!(share_tasks(&http(), &at("/gone/s/GONE"), None).await.unwrap().unwrap_err(), SHARE_GONE);
+        assert!(share_tasks(&http(), &at("/other/s/FOLDER"), None).await.is_none());
+    }
+
+    /// A share with a password is listed with the user's sign-in, and its files download from
+    /// their WebDAV links, which take it.
+    #[tokio::test]
+    async fn a_share_with_a_password_lists_and_downloads_with_the_sign_in() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = vec![0; 8192];
+                let n = socket.read(&mut request).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&request[..n]).to_ascii_lowercase();
+                let (status, body) = if request.starts_with("get /status.php") {
+                    (200, r#"{"installed":true}"#.to_string())
+                } else if request.contains("authorization: basic dg9rzw46chc=") {
+                    let (_, _, body) = multistatus(&[("/public.php/dav/files/TOKEN/", "Pack", None, ""), ("/public.php/dav/files/TOKEN/a.txt", "a.txt", Some(3), "")]);
+                    (207, String::from_utf8(body).unwrap())
+                } else {
+                    (401, String::new())
+                };
+                let head = format!("HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
+                let _ = socket.write_all(format!("{head}{body}").as_bytes()).await;
+            }
+        });
+        let share = share_of(&Url::parse(&format!("http://{addr}/s/TOKEN")).unwrap()).unwrap();
+        // "token:pw"
+        let tasks = share_tasks(&http(), &share, Some("Basic dG9rZW46cHc=")).await.unwrap().unwrap();
+        assert_eq!(tasks[0].urls[0].as_str(), format!("http://{addr}/public.php/dav/files/TOKEN/a.txt"));
+        assert!(!tasks[0].from_document, "the user's sign-in goes with it");
+        assert_eq!(share_tasks(&http(), &share, None).await.unwrap().unwrap_err(), SHARE_LOCKED);
+    }
+
     fn live(link: &str) -> Url {
         Url::parse(link).unwrap()
     }
@@ -848,7 +1228,7 @@ mod tests {
     async fn live_pcloud() {
         let file = resolve(&http(), &live("https://u.pcloud.link/publink/show?code=XZtTpwVZnMvzSRIY2vhs6zCQgfHtI8Oya3YV"), None).await.unwrap();
         assert!(file[0].path().ends_with("/llama.sh"), "{file:?}");
-        let tasks = list(&http(), &live("https://u.pcloud.link/publink/show?code=kZBjoO0Z0N6DdHilOAyiT3Vnb4u0nRJ2WBxk")).await.unwrap();
+        let tasks = list_link(&http(), &live("https://u.pcloud.link/publink/show?code=kZBjoO0Z0N6DdHilOAyiT3Vnb4u0nRJ2WBxk")).await.unwrap();
         assert!(tasks.len() > 1 && tasks.iter().all(|t| t.folder == Some("debs".into())), "{tasks:?}");
         assert!(resolve(&http(), &tasks[0].urls[0], None).await.is_ok());
     }
@@ -860,7 +1240,7 @@ mod tests {
     async fn live_yandex_disk() {
         let file = resolve(&http(), &live("https://yadi.sk/d/BdyBP6SpI1-HVg"), None).await.unwrap();
         assert!(file[0].as_str().contains("filename=AllDatasets.zip"), "{file:?}");
-        let tasks = list(&http(), &live("https://yadi.sk/d/loPpY45J3EAYfU")).await.unwrap();
+        let tasks = list_link(&http(), &live("https://yadi.sk/d/loPpY45J3EAYfU")).await.unwrap();
         assert!(tasks.len() > 50 && tasks.iter().all(|t| t.folder == Some("RL_lectures".into())), "{}", tasks.len());
         let err = resolve(&http(), &live("https://yadi.sk/d/MBruQdRo3WSdCx"), None).await.unwrap_err();
         assert!(err.to_string().contains("does not exist"), "{err}");
@@ -873,8 +1253,26 @@ mod tests {
     async fn live_box() {
         let file = resolve(&http(), &live("https://app.box.com/s/17vthb1zl0zeh340m4gaw0luuf2vscne"), None).await.unwrap();
         assert!(file[0].as_str().ends_with("file_id=f_272056515134"), "{file:?}");
-        let tasks = list(&http(), &live("https://app.box.com/s/1cwdnolsmtf0s04o0hshbv4vxiuqcmi9")).await.unwrap();
+        let tasks = list_link(&http(), &live("https://app.box.com/s/1cwdnolsmtf0s04o0hshbv4vxiuqcmi9")).await.unwrap();
         assert!(tasks.iter().any(|t| t.name == Some("osgeopy-data-misc.zip".into())), "{tasks:?}");
+    }
+
+    /// Live: public shares on Nextcloud 30 and 35 (public.php/dav), Nextcloud 26 and ownCloud 10
+    /// (public.php/webdav) list their files, and the first answers a range request with its bytes.
+    #[tokio::test]
+    #[ignore]
+    async fn live_nextcloud_and_owncloud() {
+        for link in [
+            "https://libdrive.ethz.ch/index.php/s/wfmZSbsx4x7yFPA",
+            "https://dataserv.ub.tum.de/s/m1459172",
+            "https://kiwi.cmla.ens-cachan.fr/index.php/s/ss3rZwNSKwGtyQW",
+            "https://box.skoltech.ru/index.php/s/ib52BOoV58ztuPM",
+        ] {
+            let tasks = list(&http(), &live(link), &ListOptions::default()).await.unwrap().unwrap();
+            let answer = http().get(tasks[0].urls[0].clone()).header(RANGE, "bytes=0-1").send().await.unwrap();
+            let page = answer.headers().get(CONTENT_TYPE).is_some_and(|t| t.as_bytes().starts_with(b"text/html"));
+            assert!(answer.status() == StatusCode::PARTIAL_CONTENT && !page, "{link}: {:?} {}", tasks[0], answer.status());
+        }
     }
 
     /// Live: WeTransfer's API says a transfer that does not exist has expired.
