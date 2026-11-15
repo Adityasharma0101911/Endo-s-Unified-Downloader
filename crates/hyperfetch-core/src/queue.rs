@@ -488,6 +488,18 @@ impl DownloadQueue {
         self.revision += 1;
         self.items.retain(|i| i.status.is_active());
     }
+
+    /// Puts back items that were removed, each at the place it had (given with it, lowest first)
+    /// or at the end; one whose id is in the queue again is left out.
+    pub fn restore(&mut self, removed: Vec<(usize, QueueItem)>) {
+        self.revision += 1;
+        for (index, item) in removed {
+            if self.items.iter().all(|other| other.id != item.id) {
+                let index = index.min(self.items.len());
+                self.items.insert(index, item);
+            }
+        }
+    }
 }
 
 /// URLs as strings (the `url` crate is built without serde).

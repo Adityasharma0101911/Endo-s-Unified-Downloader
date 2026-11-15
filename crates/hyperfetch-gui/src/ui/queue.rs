@@ -274,7 +274,7 @@ fn eased_speed(ui: &Ui, item: &QueueItem) -> f64 {
 fn status_line(app: &App, item: &QueueItem, p: &Palette) -> (String, Color32) {
     match &item.status {
         QueueItemStatus::Queued => ("Queued: starts when a download slot is free (see the Queue)".to_string(), p.muted),
-        QueueItemStatus::Downloading if app.is_resolving(item.id) => ("Resolving mirrors and probing endpoints...".to_string(), p.muted),
+        QueueItemStatus::Downloading if app.is_resolving(item.id) => ("Connecting to the server\u{2026}".to_string(), p.muted),
         QueueItemStatus::Downloading if item.is_finishing() => {
             (format!("Finishing {}: verifying the file and moving it into place...", item.filename), p.muted)
         }
@@ -291,7 +291,10 @@ fn status_line(app: &App, item: &QueueItem, p: &Palette) -> (String, Color32) {
         QueueItemStatus::Failed(error) if item.link_expired() => {
             (format!("{}. Its server refused the old one ({}), as it does once a link's time is up.", LINK_EXPIRED, error), p.amber)
         }
-        QueueItemStatus::Failed(error) => (format!("Error: {}", error), p.red),
+        QueueItemStatus::Failed(error) => match util::error_hint(error) {
+            Some(hint) => (format!("Error: {}. {}", error.trim_end_matches('.'), hint), p.red),
+            None => (format!("Error: {}", error), p.red),
+        },
         QueueItemStatus::AuthRequired => (AUTH_REQUIRED.to_string(), p.amber),
     }
 }
@@ -402,7 +405,7 @@ fn chunk_table(ui: &mut Ui, item: usize, chunks: &[ChunkSnapshot], live: bool) {
     let p = palette(ui);
     card(ui).inner_margin(10.0).show(ui, |ui| {
         ui.set_width(ui.available_width());
-        let columns = [(50.0, "ID"), (160.0, "Byte range"), (130.0, "Downloaded"), (140.0, "Progress"), (160.0, "Status")];
+        let columns = [(50.0, "ID"), (160.0, "Part of the file"), (130.0, "Downloaded"), (140.0, "Progress"), (160.0, "Status")];
         ui.horizontal(|ui| {
             for (width, title) in columns {
                 ui.add_sized([width, 20.0], egui::Label::new(bold(title).size(12.0).color(p.muted)));
@@ -438,7 +441,12 @@ fn chunk_table(ui: &mut Ui, item: usize, chunks: &[ChunkSnapshot], live: bool) {
                     } else {
                         p.muted
                     };
-                    let status = if !live && is_active_chunk(chunk) { "Stopped" } else { chunk.status.as_str() };
+                    // The engine's "Worker 3" is the download's third connection.
+                    let status = match chunk.status.strip_prefix("Worker ") {
+                        _ if !live && is_active_chunk(chunk) => "Stopped".to_string(),
+                        Some(n) => format!("Connection {}", n),
+                        None => chunk.status.clone(),
+                    };
                     ui.add_sized([160.0, 18.0], egui::Label::new(RichText::new(status).color(color)).truncate())
                         .on_hover_text(&chunk.status);
                 });
@@ -916,7 +924,7 @@ fn queue_row(app: &App, ui: &mut Ui, line: &Line, action: &mut Option<(usize, Ro
     ui.horizontal(|ui| {
         let (text, color) = match &item.status {
             QueueItemStatus::Failed(_) if item.link_expired() => (LINK_EXPIRED.to_string(), p.amber),
-            QueueItemStatus::Failed(error) => (truncate_chars(error, 200), p.red),
+            QueueItemStatus::Failed(error) => (truncate_chars(util::error_hint(error).unwrap_or(error.as_str()), 200), p.red),
             QueueItemStatus::AuthRequired => ("Authorization header not saved: open Details to enter it again and resume".to_string(), p.amber),
             status => {
                 let bar = match status {
@@ -953,6 +961,27 @@ fn finish_time(left: Remaining) -> Option<String> {
         0 => format!("All done in about {}", format_duration(secs)),
         n => format!("All done in at least {} ({} size unknown)", format_duration(secs), n),
     })
+}
+
+/// The Queue's status filters, by number (`App::queue_filter`).
+const FILTERS: [&str; 5] = ["All", "Running", "Waiting", "Failed", "Done"];
+
+/// Whether a download of `status` is in the filter `group` (see [`FILTERS`]).
+fn in_group(group: usize, status: &QueueItemStatus) -> bool {
+    match group {
+        1 => status.is_active(),
+        2 => matches!(status, QueueItemStatus::Queued | QueueItemStatus::Paused),
+        3 => matches!(status, QueueItemStatus::Failed(_) | QueueItemStatus::AuthRequired),
+        4 => *status == QueueItemStatus::Completed,
+        _ => true,
+    }
+}
+
+/// Whether the list shows `item` under the filter `group` and `search` (lower case), which looks
+/// in its name and its links.
+fn listed(item: &QueueItem, group: usize, search: &str) -> bool {
+    let found = || item.filename.to_lowercase().contains(search) || item.urls.iter().any(|url| url.as_str().to_lowercase().contains(search));
+    in_group(group, &item.status) && (search.is_empty() || found())
 }
 
 pub(super) fn queue_page(app: &mut App, ui: &mut Ui) {
@@ -1020,6 +1049,25 @@ pub(super) fn queue_page(app: &mut App, ui: &mut Ui) {
         });
     });
     ui.add_space(4.0);
+    // What narrows the list: text in a name or a link, and a status.
+    if !items.is_empty() {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(icon::MAGNIFYING_GLASS).size(16.0).color(p.muted));
+            ui.add(egui::TextEdit::singleline(&mut app.queue_search).hint_text("Filter by name or link").desired_width(220.0));
+            ui.add_space(8.0);
+            for (group, name) in FILTERS.into_iter().enumerate() {
+                let label = match group {
+                    0 => name.to_string(),
+                    _ => format!("{} {}", name, items.iter().filter(|item| in_group(group, &item.status)).count()),
+                };
+                ui.selectable_value(&mut app.queue_filter, group, label);
+            }
+        });
+        ui.add_space(4.0);
+    }
+    let search = app.queue_search.trim().to_lowercase();
+    let group = app.queue_filter;
+    let filtering = group != 0 || !search.is_empty();
 
     let mut action = None;
     let shown: &App = app;
@@ -1032,13 +1080,22 @@ pub(super) fn queue_page(app: &mut App, ui: &mut Ui) {
         ctx.request_repaint();
     }
     let (lines, closing) = lines(items, &rows, &new, now);
+    let lines: Vec<_> = lines.into_iter().filter(|line| !filtering || listed(line.item, group, &search)).collect();
     card(ui).inner_margin(4.0).show(ui, |ui| {
         if lines.is_empty() {
             ui.set_width(ui.available_width());
+            let (glyph, title, about) = if items.is_empty() {
+                (icon::QUEUE, "Nothing in the queue yet", "Add links above, drop a .torrent on the window, or press Ctrl+V with a link copied.")
+            } else {
+                (icon::MAGNIFYING_GLASS, "No download matches", "Clear the filter above to see them all.")
+            };
             ui.vertical_centered(|ui| {
                 ui.add_space(30.0);
-                ui.label(RichText::new(icon::QUEUE).size(28.0).color(p.dim));
-                ui.label(RichText::new(keys("The queue is empty. Add links above, or press Ctrl+V with one copied.")).color(p.muted));
+                anim::fade_in(ui, egui::Id::new(("queue empty", title)), 0.0, anim::RISE, |ui| {
+                    ui.label(RichText::new(glyph).size(28.0).color(p.dim));
+                    ui.label(bold(title).color(p.text));
+                    ui.label(RichText::new(keys(about)).color(p.muted));
+                });
                 ui.add_space(30.0);
             });
             return;
@@ -1069,7 +1126,8 @@ pub(super) fn queue_page(app: &mut App, ui: &mut Ui) {
             let mut dragged = None;
             for line in &lines[range] {
                 let row = queue_row(shown, ui, line, &mut action);
-                if line.ghost.is_none() && (row.dragged() || row.drag_stopped()) {
+                // A narrowed list is not reordered by dragging: its gaps are not the queue's.
+                if !filtering && line.ghost.is_none() && (row.dragged() || row.drag_stopped()) {
                     dragged = Some((line.item.id, row.drag_stopped()));
                 }
             }
@@ -1764,5 +1822,30 @@ mod tests {
                 assert!(at(&h, stolen) == DARK.lanes[4] && !white(at(&h, seam)), "split");
             }
         }
+    }
+    /// The filter row narrows the list by text in a name or link and by status; a narrowed list
+    /// that shows nothing says so.
+    #[test]
+    fn the_list_is_filtered_by_text_and_status() {
+        let mut h = Harness::new();
+        let (_, zip) = (h.add("a.iso"), h.add("b.zip"));
+        h.app.tab = Tab::Queue;
+        h.frames(40);
+        assert!(h.find("a.iso").is_some() && h.find("b.zip").is_some());
+        assert!(h.find("Running 0").is_some() && h.find("Waiting 2").is_some(), "{:?}", h.texts());
+
+        h.app.queue_search = " ZIP ".to_string();
+        h.frames(10);
+        assert!(h.find("a.iso").is_none() && h.find("b.zip").is_some());
+        h.app.queue_search.clear();
+        h.app.queue.mark_started(zip);
+        h.frames(2);
+        h.click("Running 1");
+        assert_eq!(h.app.queue_filter, 1);
+        h.frames(10);
+        assert!(h.find("a.iso").is_none() && h.find("b.zip").is_some());
+        h.app.queue_filter = 4;
+        h.frames(40);
+        assert!(h.find("b.zip").is_none() && h.find("No download matches").is_some(), "{:?}", h.texts());
     }
 }

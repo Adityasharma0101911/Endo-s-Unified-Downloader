@@ -57,7 +57,7 @@ impl Harness {
         let ctx = egui::Context::default();
         setup(&ctx);
         let save_dir = dir.path().to_string_lossy().into_owned();
-        let settings = Settings { save_dir, theme: 1, reduce_motion: Some(false), ..Settings::default() };
+        let settings = Settings { save_dir, theme: 1, reduce_motion: Some(false), show_all_settings: true, welcomed: true, ..Settings::default() };
         Self {
             app: App::with(ctx, rt.handle().clone(), settings, DownloadQueue::new(), None),
             output: FullOutput::default(),

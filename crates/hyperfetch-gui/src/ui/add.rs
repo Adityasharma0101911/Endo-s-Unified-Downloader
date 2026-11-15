@@ -84,6 +84,78 @@ pub(super) fn notice_banner(app: &mut App, ui: &mut Ui) {
     });
 }
 
+/// For 8 s after downloads left the queue (Remove, Clear), says so and offers Undo, which puts
+/// them back where they were.
+pub(super) fn undo_banner(app: &mut App, ui: &mut Ui) {
+    const SHOWN: f64 = 8.0;
+    let now = ui.input(|i| i.time);
+    if app.removed.as_ref().is_some_and(|(_, at)| now - at >= SHOWN) {
+        app.removed = None;
+    }
+    let removed = app.removed.as_ref().map(|(items, at)| (items.len(), items[0].1.filename.clone(), *at));
+    fading(ui, "undo", removed, |ui, (count, name, at)| {
+        let p = palette(ui);
+        let text = match count {
+            1 => format!("Removed {}", truncate_chars(&name, 50)),
+            n => format!("Removed {} downloads", n),
+        };
+        keyed_banner(ui, egui::Id::new(("undo", at.to_bits())), p.accent, icon::TRASH, RichText::new(text).color(p.text), |ui| {
+            if icon_button(ui, icon::X, "Dismiss", true).clicked() {
+                app.removed = None;
+            }
+            if ui.add(primary_button("Undo", p.accent)).clicked() {
+                app.undo_remove();
+            }
+        });
+        // A frame when its time is up, so that it goes by itself.
+        ui.ctx().request_repaint_after(Duration::from_secs_f64((at + SHOWN - now).clamp(0.0, SHOWN)));
+    });
+}
+
+/// The first-run card: the three steps to a first download, until it is closed.
+fn welcome(app: &mut App, ui: &mut Ui) {
+    let p = palette(ui);
+    anim::fade_in(ui, egui::Id::new("welcome"), 0.0, anim::RISE, |ui| {
+        card(ui).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(bold("Welcome").size(16.0).color(p.strong));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.add(primary_button("Got it", p.accent)).clicked() {
+                        app.settings.welcomed = true;
+                    }
+                });
+            });
+            ui.label(RichText::new("Three steps to your first download:").color(p.muted));
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                chip(ui, "1", p.accent);
+                ui.label(RichText::new("Choose where downloads are saved.").color(p.text));
+                if ui.add_enabled(!app.dialog_open, button("Choose folder\u{2026}")).clicked() {
+                    app.pending_dialog = Some(Dialog::SaveDir);
+                }
+            });
+            ui.horizontal(|ui| {
+                chip(ui, "2", p.accent);
+                ui.label(RichText::new("Add the browser extension, which sends the videos and links of the pages you visit.").color(p.text));
+                if let Some(dir) = hyperfetch_core::updater::extension_dir().filter(|dir| dir.is_dir()) {
+                    let about = "Chrome, Edge and Brave load it from this folder: Extensions, Developer mode, Load unpacked.";
+                    if ui.add(button("Open its folder")).on_hover_text(about).clicked() {
+                        if let Err(e) = util::open_path(&dir) {
+                            app.notice = Some(Err(format!("Could not open {}: {}", dir.display(), e)));
+                        }
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                chip(ui, "3", p.accent);
+                ui.label(RichText::new(keys("Paste a link in the box above and press Download, or press Ctrl+V anywhere in the window.")).color(p.text));
+            });
+        });
+    });
+    ui.add_space(12.0);
+}
+
 /// Asks whether ffmpeg may be installed, while a media download waits for the answer (see
 /// `App::start_job`).
 pub(super) fn ffmpeg_prompt(app: &mut App, ui: &mut Ui) {
@@ -309,7 +381,10 @@ pub(super) fn add_page(app: &mut App, ui: &mut Ui) {
         fading(ui, "form error", app.form_error.clone(), |ui, error| nudged(ui, dx, |ui| error_alert(ui, &error)));
         if let Some(item) = &focused {
             let error = match &item.status {
-                QueueItemStatus::Failed(error) => Some(format!("Download failed: {}", error)),
+                QueueItemStatus::Failed(error) => Some(match util::error_hint(error) {
+                    Some(hint) => format!("Download failed: {}. {}", error.trim_end_matches('.'), hint),
+                    None => format!("Download failed: {}", error),
+                }),
                 _ => None,
             };
             let dx = anim::shake(ui.ctx(), egui::Id::new(("failed", item.id)), error.is_some());
@@ -361,6 +436,9 @@ pub(super) fn add_page(app: &mut App, ui: &mut Ui) {
     match &focused {
         Some(item) => download_details(app, ui, item),
         None => {
+            if !app.settings.welcomed {
+                welcome(app, ui);
+            }
             card(ui).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.label(bold("Tips").color(p.strong));
@@ -887,5 +965,17 @@ mod tests {
         assert_eq!(h.frames(30), Duration::MAX, "gone");
         assert_eq!(ghost(&h), None);
         assert_eq!(card(&h), top);
+    }
+    /// A new user's Add page starts with the three steps, until Got it.
+    #[test]
+    fn the_welcome_shows_until_it_is_closed() {
+        let mut h = Harness::new();
+        assert!(h.settle() && h.find("Welcome").is_none());
+        h.app.settings.welcomed = false;
+        h.frames(40);
+        assert!(h.find("Welcome").is_some() && h.find("Tips").is_some(), "{:?}", h.texts());
+        h.click("Got it");
+        h.frames(5);
+        assert!(h.app.settings.welcomed && h.find("Welcome").is_none());
     }
 }

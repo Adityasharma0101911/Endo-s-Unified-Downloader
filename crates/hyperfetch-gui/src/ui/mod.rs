@@ -26,7 +26,7 @@ use crate::settings::{Settings, BROWSERS, MEDIA_PRESETS};
 use crate::util::{self, format_bytes, format_duration, lock, Verdict};
 use crate::{Answer, App, Dialog, Origin, Tab, VerifyRequest, GRAPH_WINDOW};
 
-use add::{add_link, add_page, channel_prompt, clipboard_banner, ffmpeg_notice, ffmpeg_prompt, listing_prompt, notice_banner, update_banner};
+use add::{add_link, add_page, channel_prompt, clipboard_banner, ffmpeg_notice, ffmpeg_prompt, listing_prompt, notice_banner, undo_banner, update_banner};
 use history::history_page;
 use queue::queue_page;
 use settings::settings_page;
@@ -448,7 +448,7 @@ fn report(app: &mut App, result: std::io::Result<()>) {
 fn status_badge(app: &App, item: &QueueItem, p: &Palette) -> (&'static str, Color32) {
     match &item.status {
         QueueItemStatus::Queued => ("QUEUED", p.dim),
-        QueueItemStatus::Downloading if app.is_resolving(item.id) => ("RESOLVING", p.amber),
+        QueueItemStatus::Downloading if app.is_resolving(item.id) => ("CONNECTING", p.amber),
         QueueItemStatus::Downloading if item.is_finishing() => ("FINISHING", p.cyan),
         QueueItemStatus::Downloading if app.stalled_for(item.id).is_some() => ("STALLED", p.amber),
         QueueItemStatus::Downloading => ("DOWNLOADING", p.accent),
@@ -510,6 +510,7 @@ pub fn render(app: &mut App, ctx: &egui::Context) {
         channel_prompt(app, ui);
         ffmpeg_prompt(app, ui);
         notice_banner(app, ui);
+        undo_banner(app, ui);
         ffmpeg_notice(ui, media::installing_ffmpeg());
         ui.add_space(12.0);
         anim::shifted(ui, shown, anim::RISE, |ui| match app.tab {
@@ -528,6 +529,46 @@ pub fn render(app: &mut App, ctx: &egui::Context) {
             }
         });
     });
+    shortcuts_window(ctx);
+}
+
+/// Where it is kept whether the list of keyboard shortcuts shows.
+fn shortcuts_id() -> egui::Id {
+    egui::Id::new("shortcuts shown")
+}
+
+/// The list of keyboard shortcuts, in the middle of the window: F1 or Shortcuts in the sidebar
+/// opens and closes it, Escape closes it.
+fn shortcuts_window(ctx: &egui::Context) {
+    let mut open = ctx.data(|d| d.get_temp::<bool>(shortcuts_id())).unwrap_or(false);
+    if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F1)) {
+        open = !open;
+    }
+    if open && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+        open = false;
+    }
+    if open {
+        let p = palette_of(ctx);
+        let window = egui::Window::new("Keyboard shortcuts").open(&mut open).collapsible(false).resizable(false);
+        window.anchor(Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
+            egui::Grid::new("shortcuts").num_columns(2).spacing(Vec2::new(24.0, 8.0)).show(ui, |ui| {
+                for (key, what) in [
+                    ("Ctrl+1 to Ctrl+4", "Add, Queue, History, Settings"),
+                    ("Ctrl+V", "Add the copied link or links to the queue (outside a text box)"),
+                    ("Enter", "In the link box: start the download"),
+                    ("Delete", "In the Queue: remove the selected download (its files are kept)"),
+                    ("Double click", "In the Queue: show the download's details"),
+                    ("Drag", "In the Queue: move a download up or down"),
+                    ("F1", "This list"),
+                ] {
+                    ui.label(bold(keys(key)).color(p.strong));
+                    ui.label(RichText::new(what).color(p.muted));
+                    ui.end_row();
+                }
+            });
+        });
+    }
+    ctx.data_mut(|d| d.insert_temp(shortcuts_id(), open));
 }
 
 /// The seconds left before the computer sleeps or shuts down, the queue being done, with Cancel.
@@ -910,6 +951,52 @@ mod tests {
         h.double_click("site.iso");
         assert!(h.settle());
         assert!(h.find("Checked against the site's SHA-256").is_some(), "{:?}", h.texts());
+    }
+
+    /// A download removed with Delete comes back in its place with Undo; so do those Clear all took.
+    #[test]
+    fn removed_downloads_come_back_with_undo() {
+        let ids = |h: &Harness| h.app.queue.items().iter().map(|item| item.id).collect::<Vec<_>>();
+        let mut h = Harness::new();
+        let (a, b, c) = (h.add("a.iso"), h.add("b.iso"), h.add("c.iso"));
+        h.app.tab = Tab::Queue;
+        h.frames(30);
+        assert!(h.find("Undo").is_none());
+        h.app.selected = Some(b);
+        h.key(Key::Delete, Modifiers::NONE);
+        assert_eq!(ids(&h), [a, c]);
+        h.frames(30);
+        assert!(h.find("Removed b.iso").is_some(), "{:?}", h.texts());
+        h.click("Undo");
+        h.frames(30);
+        assert_eq!(ids(&h), [a, b, c]);
+        assert!(h.find("Undo").is_none());
+
+        h.app.clear_queue(false);
+        assert!(ids(&h).is_empty());
+        h.frames(30);
+        assert!(h.find("Removed 3 downloads").is_some(), "{:?}", h.texts());
+        h.app.undo_remove();
+        assert_eq!(ids(&h), [a, b, c]);
+        // Left alone, the offer goes by itself.
+        h.app.clear_queue(false);
+        assert!(h.settle() && h.app.removed.is_none() && h.find("Undo").is_none());
+    }
+
+    /// F1 opens the list of shortcuts and Escape closes it.
+    #[test]
+    fn the_shortcuts_list_opens_and_closes() {
+        let mut h = Harness::new();
+        assert!(h.settle() && h.find("Keyboard shortcuts").is_none());
+        h.key(Key::F1, Modifiers::NONE);
+        h.frames(20);
+        assert!(h.find("Keyboard shortcuts").is_some() && h.find("This list").is_some(), "{:?}", h.texts());
+        h.key(Key::Escape, Modifiers::NONE);
+        h.frames(20);
+        assert!(h.find("Keyboard shortcuts").is_none());
+        h.click("Shortcuts");
+        h.frames(20);
+        assert!(h.find("Keyboard shortcuts").is_some());
     }
 
     /// Ctrl+V outside a text box adds the copied links to the queue; in one, it is typed there.

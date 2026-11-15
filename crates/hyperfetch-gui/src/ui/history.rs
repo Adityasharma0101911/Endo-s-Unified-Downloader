@@ -46,7 +46,12 @@ pub(super) fn history_page(app: &mut App, ui: &mut Ui) {
             ui.vertical_centered(|ui| {
                 ui.add_space(30.0);
                 ui.label(RichText::new(icon::CLOCK_COUNTER_CLOCKWISE).size(28.0).color(p.dim));
-                ui.label(RichText::new("No downloads recorded in history yet.").color(p.muted));
+                let (title, about) = match app.history_search.trim().is_empty() {
+                    true => ("No downloads yet", "Finished downloads are kept here with their links and checksums, to check or repair a file later."),
+                    false => ("Nothing in the history matches", "Clear the filter above to see every download."),
+                };
+                ui.label(bold(title).color(p.text));
+                ui.label(RichText::new(about).color(p.muted));
                 ui.add_space(30.0);
             });
             return;

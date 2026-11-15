@@ -65,6 +65,10 @@ pub struct Settings {
     /// Connections all running downloads may hold to one host together (0 = no limit).
     pub max_connections_per_host: usize,
     pub clipboard_watch: bool,
+    /// The Settings page shows every setting, not only the common ones.
+    pub show_all_settings: bool,
+    /// The welcome on the Add page was read and closed.
+    pub welcomed: bool,
     pub auto_run_queue: bool,
     pub max_concurrent: usize,
     /// The user's Google API key, for listing whole Google Drive folders (empty = none). Never
@@ -240,6 +244,8 @@ impl Default for Settings {
             fsync_on_complete: engine.fsync_on_complete,
             max_connections_per_host: engine.max_connections_per_host,
             clipboard_watch: true,
+            show_all_settings: false,
+            welcomed: false,
             auto_run_queue: true,
             max_concurrent: 4,
             google_api_key: String::new(),

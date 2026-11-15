@@ -115,6 +115,16 @@ pub(super) fn sidebar(app: &mut App, ctx: &egui::Context) {
                 });
             });
             ui.horizontal(|ui| {
+                ui.label(RichText::new(icon::KEYBOARD).size(16.0).color(p.muted));
+                let list = ui.add(egui::Button::new("Shortcuts").frame(false));
+                if list.on_hover_text("The keyboard shortcuts (F1)").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    ctx.data_mut(|d| {
+                        let open = d.get_temp_mut_or_default::<bool>(super::shortcuts_id());
+                        *open = !*open;
+                    });
+                }
+            });
+            ui.horizontal(|ui| {
                 ui.label(RichText::new(icon::CLIPBOARD_TEXT).size(16.0).color(p.muted));
                 ui.label("Clipboard watch");
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {

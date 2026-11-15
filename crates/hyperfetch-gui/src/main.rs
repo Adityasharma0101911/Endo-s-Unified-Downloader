@@ -342,6 +342,14 @@ struct App {
     history_sequence: Arc<Mutex<u64>>,
     history_applied: u64,
     history_search: String,
+    /// What narrows the Settings page and the Queue's list: the text typed there, and the Queue's
+    /// status filter (see `ui::queue`).
+    settings_search: String,
+    queue_search: String,
+    queue_filter: usize,
+    /// The downloads the last Remove or Clear took out of the queue, each with the place it had,
+    /// and when (the window's clock): Undo puts them back for a few seconds.
+    removed: Option<(Vec<(usize, QueueItem)>, f64)>,
     verify_request: Option<VerifyRequest>,
     verifying: bool,
     verification: Option<Verification>,
@@ -516,6 +524,10 @@ impl App {
             history_sequence: Arc::new(Mutex::new(0)),
             history_applied: 0,
             history_search: String::new(),
+            settings_search: String::new(),
+            queue_search: String::new(),
+            queue_filter: 0,
+            removed: None,
             verify_request: None,
             verifying: false,
             verification: None,
@@ -1283,6 +1295,7 @@ impl App {
             }
             None => {
                 if self.remove_job(id) {
+                    self.removed = None;
                     self.notice = Some(Ok("Removed the download; no partial file was recorded for it".to_string()));
                 }
             }
@@ -1291,9 +1304,11 @@ impl App {
 
     /// Removes a stopped download from the list, keeping its files. Running ones are kept.
     fn remove_job(&mut self, id: usize) -> bool {
+        let before = self.queue.items().to_vec();
         if !self.queue.remove_item(id) {
             return false;
         }
+        self.note_removed(before);
         self.jobs.remove(&id);
         if self.focused == Some(id) {
             self.new_download();
@@ -1303,6 +1318,7 @@ impl App {
 
     /// Clears completed downloads, or every download that is not running.
     fn clear_queue(&mut self, completed_only: bool) {
+        let before = self.queue.items().to_vec();
         if completed_only {
             self.queue.clear_completed();
         } else {
@@ -1312,6 +1328,22 @@ impl App {
         self.jobs.retain(|id, _| queue.get_item(*id).is_some());
         if self.focused.is_some_and(|id| self.queue.get_item(id).is_none()) {
             self.new_download();
+        }
+        self.note_removed(before);
+    }
+
+    /// Keeps what left the queue since it held `before`, for Undo (see `removed`).
+    fn note_removed(&mut self, before: Vec<QueueItem>) {
+        let removed: Vec<_> = before.into_iter().enumerate().filter(|(_, item)| self.queue.get_item(item.id).is_none()).collect();
+        if !removed.is_empty() {
+            self.removed = Some((removed, self.ctx.input(|i| i.time)));
+        }
+    }
+
+    /// Puts the downloads last removed back in the queue, where they were.
+    fn undo_remove(&mut self) {
+        if let Some((removed, _)) = self.removed.take() {
+            self.queue.restore(removed);
         }
     }
 
@@ -1504,6 +1536,8 @@ impl App {
             AppEvent::Discarded { id, name, result } => match result {
                 Ok(removed) => {
                     self.remove_job(id);
+                    // Its files are gone: nothing to put back.
+                    self.removed = None;
                     self.notice = Some(Ok(match removed {
                         0 => format!("Removed the download; no leftover files of {} were found", name),
                         n => format!("Removed the download and deleted {} leftover file(s) of {}", n, name),
