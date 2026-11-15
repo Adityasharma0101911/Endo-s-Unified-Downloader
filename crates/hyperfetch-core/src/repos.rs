@@ -34,6 +34,7 @@ const ARCHIVE_OWN_FORMATS: &[&str] = &["Metadata", "JPEG Thumb", "Item Image"];
 const BITBUCKET: &str = "https://bitbucket.org";
 const BITBUCKET_API: &str = "https://api.bitbucket.org/2.0";
 const PYPI: &str = "https://pypi.org";
+const NPM_REGISTRY: &str = "https://registry.npmjs.org";
 
 /// Most path segments a GitHub ref with slashes in it (`feature/x`) is tried with.
 const MAX_REF_PARTS: usize = 4;
@@ -102,6 +103,8 @@ enum Repo {
     GiteaRelease { origin: String, owner: String, repo: String, tag: Option<String> },
     /// pypi.org/project/{name}/[{version}/]: the release's files, the latest release's without a version.
     PyPi { name: String, version: Option<String> },
+    /// npmjs.com/package/[@{scope}/]{name}[/v/{version}]: the package's tarball, the latest's without a version.
+    Npm { name: String, version: Option<String> },
 }
 
 fn repo_of(url: &Url) -> Option<Repo> {
@@ -176,6 +179,18 @@ fn repo_of(url: &Url) -> Option<Repo> {
             ["project", name, version] => Some(Repo::PyPi { name: name.into(), version: Some(version.into()) }),
             _ => None,
         },
+        "npmjs.com" | "www.npmjs.com" => {
+            let (name, rest) = match segs[..] {
+                ["package", scope, name, ref rest @ ..] if scope.starts_with('@') => (format!("{scope}/{name}"), rest),
+                ["package", name, ref rest @ ..] => (name.to_string(), rest),
+                _ => return None,
+            };
+            match rest {
+                [] => Some(Repo::Npm { name, version: None }),
+                ["v", version] => Some(Repo::Npm { name, version: Some(version.to_string()) }),
+                _ => None,
+            }
+        }
         host => {
             let origin = url.origin().ascii_serialization();
             // GitLab's pages of a project are under {project}/-/.
@@ -236,6 +251,7 @@ pub async fn list(http: &reqwest::Client, url: &Url, auth: Option<&str>) -> Resu
         Some(Repo::GiteaSrc { origin, owner, repo, kind, rest }) => gitea_src(http, auth, &origin, &owner, &repo, &kind, &rest).await?,
         Some(Repo::GiteaRelease { origin, owner, repo, tag }) => gitea_release(http, auth, &origin, &owner, &repo, tag.as_deref()).await?,
         Some(Repo::PyPi { name, version }) => pypi(http, PYPI, &name, version.as_deref()).await?,
+        Some(Repo::Npm { name, version }) => npm(http, NPM_REGISTRY, &name, version.as_deref()).await?,
         None => return Err(format!("{} is not a repository, folder, release, model or item link", url)),
     };
     if tasks.is_empty() {
@@ -248,7 +264,7 @@ pub async fn list(http: &reqwest::Client, url: &Url, auth: Option<&str>) -> Resu
 /// archive.org item's page is not: as one download it goes on as any page does (to yt-dlp); nor
 /// is a Gitea /src/ link, which may be a file's (see `resolver::CodeHostResolver`), nor a package's page.
 pub fn handles(url: &Url) -> bool {
-    repo_of(url).is_some_and(|repo| !matches!(repo, Repo::Archive { .. } | Repo::GiteaSrc { .. } | Repo::PyPi { .. }))
+    repo_of(url).is_some_and(|repo| !matches!(repo, Repo::Archive { .. } | Repo::GiteaSrc { .. } | Repo::PyPi { .. } | Repo::Npm { .. }))
 }
 
 /// Where the zip of the repository link `url` downloads from.
@@ -919,6 +935,43 @@ async fn pypi(http: &reqwest::Client, base: &str, name: &str, version: Option<&s
         .collect())
 }
 
+#[derive(Deserialize)]
+struct NpmVersion {
+    dist: NpmDist,
+}
+
+#[derive(Deserialize)]
+struct NpmDist {
+    tarball: Url,
+    integrity: Option<String>,
+    shasum: Option<String>,
+}
+
+/// The tarball of npm's package `name` at `version` (a version or a tag such as `next`), the
+/// latest without one, with its SHA-512 integrity hash, else its SHA-1.
+async fn npm(http: &reqwest::Client, registry: &str, name: &str, version: Option<&str>) -> Result<Vec<Task>, String> {
+    use base64::Engine as _;
+    let api = url_at(registry, name.split('/').chain([version.unwrap_or("latest")]))?;
+    let Some(answer) = fetch(http.get(api), None, "npm").await? else {
+        return Err(match version {
+            Some(version) => format!("npm has no version {version} of {name}"),
+            None => format!("npm has no package {name}"),
+        });
+    };
+    let NpmVersion { dist } = json(answer, "npm").await?;
+    let sha512 = dist.integrity.as_deref().unwrap_or_default().split_whitespace().find_map(|sri| sri.strip_prefix("sha512-"));
+    let sha512 = sha512.and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok()).filter(|d| d.len() == 64);
+    let file = dist.tarball.path_segments().and_then(|mut s| s.next_back()).unwrap_or_default().to_string();
+    Ok(vec![Task {
+        name: Some(component(&percent_decode_str(&file).decode_utf8_lossy(), "package.tgz")?),
+        checksum: sha512.map(|d| crate::digest::checksum("sha512", &d)).or_else(|| checksum("sha1", dist.shasum.as_deref()?)),
+        // On the registry's host, not the site the user typed.
+        from_document: true,
+        urls: vec![dist.tarball],
+        ..Task::default()
+    }])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1258,6 +1311,50 @@ mod tests {
         assert!(lists(&link) && !handles(&link));
     }
 
+    fn npm_api(path: &str, _: Option<crate::range::ByteRange>) -> Reply {
+        match path {
+            // As the registry answers, cut down.
+            "/left-pad/latest" | "/left-pad/1.3.0" => json_reply(
+                r#"{"name":"left-pad","version":"1.3.0","dist":{"shasum":"5b8a3a7765dfe001261dde915589e782f8c94d1e",
+                    "tarball":"https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz","fileCount":10,
+                    "integrity":"sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA=="}}"#,
+            ),
+            "/@scope/old/next" => json_reply(
+                r#"{"name":"@scope/old","version":"0.1.0","dist":{"shasum":"5B8A3A7765DFE001261DDE915589E782F8C94D1E",
+                    "tarball":"https://registry.npmjs.org/@scope/old/-/old-0.1.0.tgz"}}"#,
+            ),
+            _ => (404, "Content-Type: application/json\r\n".into(), br#""version not found: 9.9.9""#.to_vec()),
+        }
+    }
+
+    /// An npm package is its latest version's tarball, a version's or tag's link that one's, with
+    /// its SHA-512 integrity hash, else its SHA-1; a missing one says so.
+    #[tokio::test]
+    async fn npm_packages_are_their_tarball() {
+        let (addr, _) = serve(npm_api).await;
+        let base = format!("http://{addr}");
+        let sha512 = "sha512:5c8e4c3f354d0298c0ca1433a615fc06498ab0a5310f82ddc8adb88997901a29c137dc93413ddb165081cbf695c761eb35ca901ac768b7c821ae3cabbcc0a810";
+        for version in [None, Some("1.3.0")] {
+            let [task] = &npm(&http(), &base, "left-pad", version).await.unwrap()[..] else { panic!("one tarball") };
+            assert_eq!(task.urls[0].as_str(), "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz");
+            assert_eq!((task.name.clone().unwrap(), task.checksum.as_deref(), task.from_document), (PathBuf::from("left-pad-1.3.0.tgz"), Some(sha512), true));
+        }
+        let [old] = &npm(&http(), &base, "@scope/old", Some("next")).await.unwrap()[..] else { panic!("one tarball") };
+        assert_eq!((old.name.clone().unwrap(), old.checksum.as_deref()), (PathBuf::from("old-0.1.0.tgz"), Some("sha1:5b8a3a7765dfe001261dde915589e782f8c94d1e")));
+        assert_eq!(npm(&http(), &base, "left-pad", Some("9.9.9")).await.unwrap_err(), "npm has no version 9.9.9 of left-pad");
+        assert_eq!(npm(&http(), &base, "gone", None).await.unwrap_err(), "npm has no package gone");
+        let pkg = |name: &str, version: Option<&str>| Some(Repo::Npm { name: name.into(), version: version.map(Into::into) });
+        assert_eq!(repo("https://www.npmjs.com/package/left-pad"), pkg("left-pad", None));
+        assert_eq!(repo("https://www.npmjs.com/package/left-pad/v/1.3.0?activeTab=versions"), pkg("left-pad", Some("1.3.0")));
+        assert_eq!(repo("https://www.npmjs.com/package/%40types/node"), pkg("@types/node", None));
+        assert_eq!(repo("https://www.npmjs.com/package/@types/node/v/22.0.0"), pkg("@types/node", Some("22.0.0")));
+        for other in ["https://www.npmjs.com/search?q=pad", "https://www.npmjs.com/package/left-pad/x", "https://www.npmjs.com/~user"] {
+            assert_eq!(repo(other), None, "{other}");
+        }
+        let link = Url::parse("https://www.npmjs.com/package/left-pad").unwrap();
+        assert!(lists(&link) && !handles(&link));
+    }
+
     /// GitLab (gitlab.com and self-hosted), Bitbucket and Gitea links are told by their shape; a
     /// repository is its default branch's zip, with no request made.
     #[tokio::test]
@@ -1549,6 +1646,17 @@ mod tests {
         assert_eq!(wheel.checksum.as_deref(), Some("sha256:8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254"));
         assert_eq!((tasks.len(), wheel.size), (2, Some(11053)));
         assert!(!live("https://pypi.org/project/six/").await.unwrap().is_empty());
+    }
+
+    /// Live: an npm package, scoped or not, is its tarball with its SHA-512.
+    #[tokio::test]
+    #[ignore]
+    async fn live_npm() {
+        let [pad] = &live("https://www.npmjs.com/package/left-pad/v/1.3.0").await.unwrap()[..] else { panic!("one tarball") };
+        assert_eq!(pad.urls[0].as_str(), "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz");
+        assert!(pad.checksum.as_deref().unwrap().starts_with("sha512:5c8e4c3f354d0298"));
+        let [node] = &live("https://www.npmjs.com/package/@types/node").await.unwrap()[..] else { panic!("one tarball") };
+        assert!(node.urls[0].as_str().starts_with("https://registry.npmjs.org/@types/node/-/node-"), "{node:?}");
     }
 
     /// Live: a GitLab folder lists its files, and its latest release its asset links.
