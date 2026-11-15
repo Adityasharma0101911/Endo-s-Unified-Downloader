@@ -27,6 +27,7 @@ What changed in each release, newest first. Each release's page on [GitHub](http
 - **SwissTransfer:** a transfer link (`swisstransfer.com/d/...`) adds one download per file with its size, folders kept, read from SwissTransfer's public API; one with a password opens with the password pasted with it. It downloaded the transfer's web page before.
 - **Telegram:** a public channel's post (`t.me/<channel>/<post>`) downloads the photos and videos its public page shows, an album's all; a photo post was an error before. Files posted in a channel are only in Telegram's app.
 - **Public buckets:** an Amazon S3 (`s3://`, virtual-hosted or path-style), Backblaze B2, Wasabi or DigitalOcean Spaces bucket, a Google Cloud Storage bucket (`gs://`, `storage.googleapis.com/<bucket>/`) or an Azure Blob container that anyone may list adds one download per object under its prefix, folders kept, with its size and MD5 where it is one; a private one says it needs its owner's key.
+- **WebDAV:** a `webdav://`, `webdavs://`, `dav://` or `davs://` link downloads the file it names, or adds one download per file of the folder it names (subfolders kept), with a sign-in given in the link; these links were refused before.
 - Fixed: a progress bar's fill went square when short and the light sweeping over it was cut to a rectangle; both now follow the bar's round ends.
 
 ## 1.9.0 (2026-10-30)

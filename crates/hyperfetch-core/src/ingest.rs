@@ -265,8 +265,8 @@ pub fn might_list(url: &Url) -> bool {
 fn listing_url(token: &str) -> Option<Url> {
     let url = match http_url(token) {
         Some(url) => resolver::unwrap_redirect(&url).unwrap_or(url),
-        // A bucket's s3:// or gs:// link.
-        None => Url::parse(token).ok().filter(|u| matches!(u.scheme(), "s3" | "gs"))?,
+        // A bucket's s3:// or gs:// link, or a WebDAV one.
+        None => Url::parse(token).ok().filter(|u| matches!(u.scheme(), "s3" | "gs" | "webdav" | "webdavs" | "dav" | "davs"))?,
     };
     might_list(&url).then_some(url)
 }
