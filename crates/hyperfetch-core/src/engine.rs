@@ -850,6 +850,11 @@ impl DownloadEngine {
         if let Some(image) = self.urls.first().filter(|u| crate::oci::handles(u)) {
             return self.unless_rerun(crate::oci::run(image, &self.options, &self.save_dir(), snapshot_tx, self.cancel_token.clone()).await);
         }
+        // A Send share, decrypted as it arrives (see `crate::send`).
+        if let Some(share) = self.urls.first().filter(|u| crate::send::handles(u)) {
+            let done = crate::send::run(share, &client, &self.options, &self.save_dir(), snapshot_tx, self.cancel_token.clone()).await;
+            return self.unless_rerun(done);
+        }
 
         if self.urls.first().is_some_and(crate::ftp::handles) {
             return Box::pin(self.fetch_ftp(client, snapshot_tx)).await;
