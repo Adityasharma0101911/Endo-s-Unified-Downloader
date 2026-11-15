@@ -869,7 +869,7 @@ mod tests {
         h.frames(30);
         assert!(h.settle());
         assert!(h.find("Proxy").is_some() && h.find("Proxy pool").is_some(), "{:?}", h.texts());
-        assert!(h.find("Theme").is_none() && h.find("General").is_none() && h.find("BitTorrent").is_none());
+        assert!(h.find("Reduce motion").is_none() && h.find("General").is_none() && h.find("Updates").is_none(), "{:?}", h.texts());
         // A section's title brings all its rows.
         h.app.settings_search = "bittorrent".to_string();
         h.frames(30);
