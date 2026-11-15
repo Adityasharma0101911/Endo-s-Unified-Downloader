@@ -10,8 +10,8 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use parking_lot::Mutex;
 use reqwest::header::{
-    HeaderMap, HeaderName, ACCEPT_ENCODING, ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_RANGE, CONTENT_TYPE, ETAG, IF_MODIFIED_SINCE,
-    IF_NONE_MATCH, LAST_MODIFIED, LINK, RANGE, USER_AGENT,
+    HeaderMap, HeaderName, ACCEPT_ENCODING, ACCEPT_RANGES, ALT_SVC, CONTENT_DISPOSITION, CONTENT_RANGE, CONTENT_TYPE, ETAG,
+    IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, LINK, RANGE, USER_AGENT,
 };
 use reqwest::{Client, Response, StatusCode};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -727,13 +727,25 @@ impl DownloadEngine {
         snapshot_tx: Option<broadcast::Sender<EngineSnapshot>>,
     ) -> Result<PathBuf, String> {
         self.warn_if_insecure();
-        let mut result = self.fetch_all(snapshot_tx.clone()).await;
+        // A site that refused HTTP/1.1 before is asked over HTTP/2 at once.
+        let refused = !self.options.http2 && self.urls.first().and_then(hosts::protocol) == Some(hosts::Protocol::H2);
+        let mut result = match refused {
+            true => {
+                let (engine, tx) = (self.over_http2(), snapshot_tx.clone());
+                engine.boxed(|engine| engine.fetch_all(tx)).await
+            }
+            false => self.fetch_all(snapshot_tx.clone()).await,
+        };
         if let Err(error) = &result {
-            if self.refuses_http1(error).await {
+            if !refused && self.refuses_http1(error).await {
                 tracing::warn!("The server refuses HTTP/1.1 ({}); downloading again over HTTP/2", error);
                 let engine = self.over_http2();
                 let tx = snapshot_tx.clone();
                 result = engine.boxed(|engine| engine.fetch_all(tx)).await;
+                if let Some(url) = self.urls.first().filter(|_| result.is_ok()) {
+                    hosts::record_protocol(url, hosts::Protocol::H2);
+                    let _ = blocking(hosts::save).await;
+                }
             }
         }
         // Pieces that fail a metalink's hashes come again (see `crate::digest::finish`), each round
@@ -2538,6 +2550,10 @@ impl DownloadEngine {
         // the host slots they hold, are given up now.
         let ranged = reference.accepts_ranges && reference.size != Some(reference.prefetch.len() as u64);
         let late = late.filter(|_| ranged);
+        // Kept for a build that speaks HTTP/3, which would race it against these connections here.
+        if offers_h3(&reference.headers) {
+            hosts::record_protocol(&reference.final_url, hosts::Protocol::H3);
+        }
         // So do the copies of the file its server names.
         let late = match ranged.then(|| self.probe_advertised(&client, &reference, &mirrors)).flatten() {
             Some(named) => Some(match late {
@@ -4479,6 +4495,12 @@ fn advertised(headers: &HeaderMap, base: &Url) -> (Vec<Url>, Option<Url>) {
     }
     copies.sort_by_key(|(pri, _)| *pri);
     (copies.into_iter().map(|(_, url)| url).collect(), metalink)
+}
+
+/// Whether an answer offers HTTP/3 elsewhere (`Alt-Svc: h3=":443"`, or a draft's `h3-29`).
+fn offers_h3(headers: &HeaderMap) -> bool {
+    let entries = headers.get_all(ALT_SVC).iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(','));
+    entries.filter_map(|entry| entry.split('=').next()).any(|id| id.trim() == "h3" || id.trim().starts_with("h3-"))
 }
 
 /// The mirrors the Metalink at `url` lists for the file of `size`, or for its only file.
@@ -7695,6 +7717,20 @@ mod tests {
         };
         let once = tries(true).await;
         assert!(tries(false).await > once * 2, "run again after one request that told");
+        // Known to refuse HTTP/1.1 (as an HTTP/2 run that worked keeps), the site is asked over
+        // HTTP/2 at once; an offer of HTTP/3 does not undo that.
+        hosts::record_protocol(&url, hosts::Protocol::H2);
+        hosts::record_protocol(&url, hosts::Protocol::H3);
+        assert_eq!(tries(false).await, once);
+    }
+
+    /// An answer offering HTTP/3 elsewhere says so in `Alt-Svc`, a draft's version too.
+    #[test]
+    fn test_an_offer_of_http3_is_read_from_alt_svc() {
+        let offers = |value: &str| offers_h3(&HeaderMap::from_iter([(ALT_SVC, value.parse().unwrap())]));
+        assert!(offers(r#"h3=":443"; ma=86400"#));
+        assert!(offers(r#"h2=":443", h3-29=":8443""#));
+        assert!(!offers(r#"h2=":443"; ma=60"#) && !offers("clear"));
     }
 
     /// A `.ts` yt-dlp saved is remuxed only with `hls_to_mp4`, as the engine's own HLS download
