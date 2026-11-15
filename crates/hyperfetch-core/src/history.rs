@@ -189,6 +189,15 @@ fn scrub(input: &str) -> (Cow<'_, str>, bool) {
         url.set_fragment(Some(&fragment));
         changed = true;
     }
+    // A Send share's key is its whole fragment.
+    if crate::send::keyed_path(&url) {
+        if url.fragment() == Some(REDACTED) {
+            marked = true;
+        } else {
+            url.set_fragment(Some(REDACTED));
+            changed = true;
+        }
+    }
     (if changed { Cow::Owned(url.into()) } else { Cow::Borrowed(input) }, marked)
 }
 

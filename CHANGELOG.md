@@ -4,6 +4,8 @@ What changed in each release, newest first. Each release's page on [GitHub](http
 
 ## Unreleased
 
+- **Send shares.** Links of the open-source Send (`https://host/download/<id>/#<key>`) download and decrypt their file, each encrypted record checked before it is written; the key stays on this computer and out of the history. Shares with a password are not supported yet.
+
 - **Container images.** A public image on Docker Hub, ghcr.io or Quay (`docker.io/library/alpine:3.20`, its web page, or `docker://` on any registry) downloads into an OCI image layout folder that skopeo and podman load as it is, and docker as a tar of it: this machine's Linux build or the one `--platform` names, every layer checked against its digest, with the registry's anonymous token, fetched again when it expires and never sent to the CDN.
 
 - **SFTP.** `sftp://user[:password]@host/path` links download over SSH as FTP ones do, over several connections; a folder link adds one download per file under it. Sign-in is by the link's password or a private key file (`--ssh-key`, with its passphrase asked for when it is encrypted; GUI: Settings > Debrid & hosts). A server's host key is trusted the first time and kept in `known_hosts` in the app's data folder; a key that changed is refused, every time, until you remove the old one.

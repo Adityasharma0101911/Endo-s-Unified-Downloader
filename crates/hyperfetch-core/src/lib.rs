@@ -33,6 +33,7 @@ pub mod paste;
 pub mod ftp;
 pub mod sftp;
 pub mod oci;
+pub mod send;
 pub mod digest;
 pub mod zipdir;
 pub mod delta;

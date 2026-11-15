@@ -516,8 +516,8 @@ pub async fn ingest(tokens: &[impl AsRef<str>], http: &reqwest::Client, options:
                 Err(e) => return Err(e),
             }
         }
-        // A container image is one download, whatever lister its page's site has.
-        if crate::oci::reference(token.as_ref()).is_some() {
+        // A container image or a Send share is one download, whatever lister its site has.
+        if crate::oci::reference(token.as_ref()).is_some() || http_url(token.as_ref()).is_some_and(|u| crate::send::handles(&u)) {
             return link_task(tokens).map(|task| vec![task]);
         }
         if let Some(url) = listing_url(token.as_ref()) {
