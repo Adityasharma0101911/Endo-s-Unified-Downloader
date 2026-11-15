@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { MAX_LINKS, cookieHeader, largestSrcset, linkFilter, linkKind, normalizeLinks, siteOf, textMatcher } from "../lib/links.js";
+import { MAX_LINKS, cookieHeader, fullSizeImages, isMagnet, largestSrcset, linkFilter, linkKind, linksInText, normalizeLinks, siteOf, textMatcher } from "../lib/links.js";
 
 test("a link's chip is the extension of its path, whatever the query says", () => {
   assert.equal(linkKind("https://a.example/v/Clip.MP4?x=1.zip"), "Video");
@@ -88,4 +88,31 @@ test("a Cookie header leaves out what it can't carry", () => {
   assert.equal(cookieHeader(cookies), "sid=a b; t=");
   assert.equal(cookieHeader([]), "");
   assert.equal(cookieHeader(undefined), "");
+});
+
+test("magnet links and .torrent files are listed as Torrents", () => {
+  const magnet = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=ubuntu.iso";
+  assert.equal(linkKind(magnet), "Torrents");
+  assert.equal(linkKind("https://a.example/ubuntu.iso.torrent"), "Torrents");
+  assert.deepEqual(normalizeLinks([magnet, magnet, "magnet:no-query"]), [{ url: magnet, host: "", kind: "Torrents" }]);
+  assert.equal(isMagnet(magnet), true);
+  assert.equal(isMagnet("https://a.example/?magnet:?x"), false);
+});
+
+test("the links written in a selection, without the punctuation after them", () => {
+  const text = "Get it at https://a.example/x.zip, or (https://b.example/y.iso). Torrent: magnet:?xt=urn:btih:abc&dn=y; again https://a.example/x.zip!";
+  assert.deepEqual(linksInText(text), ["https://a.example/x.zip", "https://b.example/y.iso", "magnet:?xt=urn:btih:abc&dn=y"]);
+  assert.deepEqual(linksInText("no links, ftp://x.example/y nor javascript:alert(1)"), []);
+  assert.deepEqual(linksInText(undefined), []);
+});
+
+test("full-size images: a thumbnail's linked original, else the image when big enough", () => {
+  const images = [
+    { url: "https://a.example/thumb1.jpg", width: 150, height: 100, linked: "https://a.example/full1.jpg" },
+    { url: "https://a.example/thumb2.jpg", width: 150, height: 100, linked: "https://a.example/post/2" },
+    { url: "https://a.example/hero.webp", width: 1920, height: 1080, linked: "" },
+    { url: "https://a.example/hero.webp", width: 1920, height: 1080 },
+  ];
+  assert.deepEqual(fullSizeImages(images), ["https://a.example/full1.jpg", "https://a.example/thumb2.jpg", "https://a.example/hero.webp"]);
+  assert.deepEqual(fullSizeImages(images, 800), ["https://a.example/full1.jpg", "https://a.example/hero.webp"], "a linked original's size is not known");
 });

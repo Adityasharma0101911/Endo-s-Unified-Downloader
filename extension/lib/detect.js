@@ -63,8 +63,18 @@ const TYPE_FORMATS = {
   "video/x-matroska": "mkv",
   "video/3gpp": "3gp",
   "video/x-f4v": "f4v",
+  "video/x-m4v": "m4v",
   "audio/mpeg": "mp3",
+  "audio/mp4": "m4a",
+  "audio/x-m4a": "m4a",
+  "audio/aac": "aac",
+  "audio/flac": "flac",
+  "audio/opus": "opus",
+  "audio/webm": "weba",
   "audio/wav": "wav",
+  "audio/wave": "wav",
+  "audio/vnd.wave": "wav",
+  "audio/x-wav": "wav",
   "audio/ogg": "ogg",
   "application/dash+xml": "mpd",
   "video/vnd.mpeg.dash.mpd": "mpd",
@@ -85,7 +95,12 @@ const SMOOTH_TYPES = { m3u8: "application/vnd.apple.mpegurl", mpd: "application/
 const SMOOTH_FRAGMENT = /\.isml?\/QualityLevels\(/i;
 
 /** Extensions that make a file a media item whatever its content type (octet-stream, text/plain, application/mp4…). */
-const EXTENSION_FORMATS = ["m3u8", "m3u", "mpd", "mp4", "webm", "avi", "ogg", "flv", "mkv", "3gp", "mp3"];
+const EXTENSION_FORMATS = [
+  "m3u8", "m3u", "mpd", "mp4", "m4v", "mov", "webm", "avi", "ogg", "flv", "mkv", "3gp",
+  "mp3", "m4a", "aac", "flac", "wav", "opus", "oga", "weba",
+];
+/** Of those, the files a media request with no content type is taken for. */
+const FILE_EXTENSIONS = new Set(EXTENSION_FORMATS.filter((ext) => !["m3u8", "m3u", "mpd"].includes(ext)));
 
 /** Segments are never items: the playlist or manifest that lists them is the download. */
 const SEGMENT_EXTENSIONS = new Set(["ts", "m4s"]);
@@ -161,8 +176,8 @@ export function classifyResponse({ url, type, contentType, contentDisposition, c
   let mime = mimeOf(contentType);
   if (!mime) {
     const path = parsed.pathname.toLowerCase();
-    if (type === "media" && path.endsWith(".mp4")) mime = "video/mp4";
-    else if (type === "media" && path.endsWith(".webm")) mime = "video/webm";
+    // Named by its extension below.
+    if (type === "media" && FILE_EXTENSIONS.has(path.slice(path.lastIndexOf(".") + 1))) mime = "application/octet-stream";
     else if (type === "xmlhttprequest" && path.endsWith(".m3u8")) mime = "application/vnd.apple.mpegurl";
     else if (type === "xmlhttprequest" && path.endsWith(".mpd")) mime = "application/dash+xml";
     else if (type === "xmlhttprequest" && smooth) mime = SMOOTH_TYPES[smooth[2]?.toLowerCase()] ?? "application/vnd.ms-sstr+xml";
@@ -228,6 +243,42 @@ export function mediaUrlFormat(url) {
     if (match) return match[1].toLowerCase();
   }
   return null;
+}
+
+/**
+ * What a video or audio link a page names (og:video, JSON-LD, a <video>'s src…) is, by its link alone: {kind, format}
+ * of a stream (see mediaUrlFormat), or {kind: "file", format, name} by a media extension; null for anything else (a
+ * player page, an image, a segment).
+ */
+export function pageMediaOf(url) {
+  const stream = mediaUrlFormat(url);
+  if (stream) return { kind: { m3u8: "hls", mpd: "dash", ism: "smooth" }[stream], format: stream };
+  if (typeof url !== "string" || !/^https?:\/\//i.test(url)) return null;
+  const found = classifyResponse({ url, contentType: "application/octet-stream" });
+  return found && { kind: found.kind, format: found.format, name: found.name };
+}
+
+/**
+ * A subtitle file a response is, by its type (text/vtt, application/x-subrip) or else its extension: {format: "vtt" or
+ * "srt"}; null for anything else, and for the numbered WebVTT segments of an HLS subtitle rendition ("seg-12.vtt").
+ */
+export function subtitleOf({ url, contentType } = {}) {
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return null;
+  }
+  const { fileName, ext } = nameAndExt(parsed, "");
+  const mime = mimeOf(contentType);
+  const vague = !mime || mime === "text/plain" || OCTET_TYPES.has(mime);
+  const format =
+    mime === "text/vtt" || (vague && (ext === "vtt" || ext === "webvtt"))
+      ? "vtt"
+      : mime === "application/x-subrip" || mime === "text/srt" || (vague && ext === "srt")
+        ? "srt"
+        : null;
+  return format && !(format === "vtt" && /^\D*\d+\.(web)?vtt$/i.test(fileName)) ? { format } : null;
 }
 
 /** Streams always pass (their size is unknown); a file needs a known size inside the min/max KB bounds (0 = none). */
@@ -336,8 +387,26 @@ function resolveUrl(ref, base) {
 }
 
 /**
+ * Whether an HLS key's attributes name a DRM key system: a METHOD other than NONE and AES-128 (SAMPLE-AES, SAMPLE-AES-CTR,
+ * …), or a KEYFORMAT other than "identity" (FairPlay, Widevine, PlayReady).
+ */
+function protectedKey(attributes) {
+  const method = (attributes.METHOD || "").toUpperCase();
+  return (method !== "" && method !== "NONE" && method !== "AES-128") || Boolean(attributes.KEYFORMAT && attributes.KEYFORMAT !== "identity");
+}
+
+/**
+ * What a DASH manifest's text (or its start) says of it: {live} when it is a live one (type="dynamic"), {drm} when
+ * its media is encrypted (any ContentProtection: each needs a licence from a key system).
+ */
+export function mpdFlags(text) {
+  const head = String(text || "");
+  return { live: /<MPD\b[^>]*\btype\s*=\s*["']dynamic["']/i.test(head), drm: /<ContentProtection\b/i.test(head) };
+}
+
+/**
  * Reads an m3u8 playlist. A master playlist gives its variants (best first), audio renditions and subtitle
- * renditions; a media playlist gives its duration and segment count, whether it is live, AES-128 encrypted or
+ * renditions, and whether a session key names a DRM key system; a media playlist gives its duration and segment count, whether it is live, AES-128 encrypted or
  * DRM-protected, and the http(s) hosts its segments, keys and init sections come from (their cookies matter). Null
  * when the text is not a playlist.
  */
@@ -379,7 +448,9 @@ export function parseM3u8(text, baseUrl) {
     });
     variants.sort((a, b) => b.bandwidth - a.bandwidth);
     const separateAudio = variants.some((variant) => variant.audioGroup && audio.some((rendition) => rendition.groupId === variant.audioGroup));
-    return { kind: "master", variants, audio, separateAudio, subtitles };
+    // A key system named up front (EXT-X-SESSION-KEY) marks the master itself, before any rendition is read.
+    const drm = lines.some((line) => line.startsWith("#EXT-X-SESSION-KEY:") && protectedKey(parseAttributes(line.slice(20))));
+    return { kind: "master", variants, audio, separateAudio, subtitles, drm };
   }
 
   const hosts = new Set();
@@ -403,9 +474,8 @@ export function parseM3u8(text, baseUrl) {
       vod = line.slice("#EXT-X-PLAYLIST-TYPE:".length).trim().toUpperCase() === "VOD";
     } else if (line.startsWith("#EXT-X-KEY:")) {
       const attributes = parseAttributes(line.slice("#EXT-X-KEY:".length));
-      const method = (attributes.METHOD || "").toUpperCase();
-      if (method === "AES-128") encrypted = true;
-      if (method.startsWith("SAMPLE-AES") || (attributes.KEYFORMAT && attributes.KEYFORMAT !== "identity")) drm = true;
+      if ((attributes.METHOD || "").toUpperCase() === "AES-128") encrypted = true;
+      if (protectedKey(attributes)) drm = true;
       addHost(attributes.URI);
     } else if (line.startsWith("#EXT-X-MAP:")) {
       addHost(parseAttributes(line.slice("#EXT-X-MAP:".length)).URI);

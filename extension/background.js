@@ -14,15 +14,18 @@ import {
   isMediaSiteHost,
   isOffLimits,
   mediaUrlFormat,
+  mpdFlags,
   newerVersion,
+  pageMediaOf,
   parseM3u8,
   passesSizeFilter,
   NO_YOUTUBE,
   rangedVideoCandidate,
   sanitizeFilename,
   splitRequestHeaders,
+  subtitleOf,
 } from "./lib/detect.js";
-import { MAX_BATCH, cookieHeader, siteOf } from "./lib/links.js";
+import { MAX_BATCH, cookieHeader, isMagnet, siteOf } from "./lib/links.js";
 import { QUALITIES, isMediaPage, mediaPayload, rememberedChoice } from "./lib/media.js";
 import { WaitingList, rescueWithMedia, sendCaptured } from "./lib/rescue.js";
 
@@ -306,6 +309,24 @@ function clearTab(tabId) {
   return updateTab(tabId, (state) => {
     state.items = {};
     state.armed = false;
+    delete state.subs;
+    delete state.drm;
+    return true;
+  });
+}
+
+/** Most subtitle files kept per tab (see addSubtitle). */
+const MAX_SUBS = 20;
+
+/**
+ * Keeps a subtitle file the tab loaded or names in a <track> (`url`, its `lang` and `label`, how it is `format`ted and
+ * the `request` to repeat for it), at most MAX_SUBS a tab; the popup offers them with its videos (see SEND_SUBS).
+ */
+function addSubtitle(tabId, sub) {
+  return updateTab(tabId, (state) => {
+    state.subs ??= {};
+    if (state.subs[sub.url] || Object.keys(state.subs).length >= MAX_SUBS) return false;
+    state.subs[sub.url] = sub;
     return true;
   });
 }
@@ -359,6 +380,8 @@ function addItem(tabId, item) {
       existing.lastSeen = Date.now();
       existing.size = Math.max(existing.size || 0, item.size || 0);
       if (item.hls) existing.hls = item.hls;
+      // A DASH manifest's flags come from its text, which only the page's own read of it shows.
+      for (const flag of ["live", "drm"]) if (item[flag]) existing[flag] = true;
       for (const field of ["referer", "userAgent", "cookies"]) existing.request[field] ||= item.request[field];
       existing.request.headers = { ...item.request.headers, ...existing.request.headers };
     } else {
@@ -422,12 +445,14 @@ async function onMediaResponse(details, requestHeaders) {
   };
   const classified = classifyResponse(response);
   const found = classified || rangedVideoCandidate(response);
-  if (!found) return;
+  const subtitle = !found && subtitleOf(response);
+  if (!found && !subtitle) return;
   const host = hostOf(details.url);
   const settings = await getSettings();
-  if (isAdHost(host) || isBlocked(host, settings.blockedHosts) || !passesSizeFilter(found, settings)) return;
+  if (isAdHost(host) || isBlocked(host, settings.blockedHosts) || !(subtitle || passesSizeFilter(found, settings))) return;
   const tab = await tabFor(details.tabId, initiator);
   if (!tab || isMediaSiteHost(hostOf(tab.url))) return;
+  if (subtitle) return addSubtitle(tab.id, { url: details.url, lang: "", label: "", format: subtitle.format, request: splitRequestHeaders(requestHeaders) });
   // An untyped ranged XHR is only a video when the page plays that URL.
   if (!classified && !(await isVideoSrc(tab.id, details.frameId, details.url))) return;
   const item = {
@@ -606,7 +631,7 @@ async function launchApp() {
  * of its own goes with the user's sign-in there when they allowed it, from tab `tabId`'s cookie store (see mediaCookieJar).
  */
 async function sendToApp({ url, tabId, cookies, cookieJar, userAgent, referer, headers, filename, hls, dash, mp4, height, playlist, media }) {
-  if (!isHttpUrl(url)) return { ok: false, error: "Only http(s) links can be downloaded." };
+  if (!isHttpUrl(url) && !isMagnet(url)) return { ok: false, error: "Only http(s) and magnet links can be downloaded." };
   if (isOffLimits(hostOf(url))) return { ok: false, error: OFF_LIMITS };
   const body = { url };
   // The app only takes a link for a playlist by its URL; one served from /api/… must be named one.
@@ -706,7 +731,8 @@ async function mediaCookieJar(url, tabId) {
 async function cookiesByOrigin(urls, tabId) {
   if (!chrome.cookies) return {};
   const first = new Map();
-  for (const url of urls) {
+  // A magnet link has no origin, and no cookies.
+  for (const url of urls.filter(isHttpUrl)) {
     const origin = new URL(url).origin;
     if (!first.has(origin)) first.set(origin, url);
   }
@@ -1156,7 +1182,64 @@ const POPUP_COMMANDS = {
     const items = Object.values(state.items).sort((a, b) => b.time - a.time);
     // The last download of the app's given a new link the browser came upon, lately.
     const recent = rescued && Date.now() - rescued.time < RESCUED_NOTE_MS ? rescued.name : null;
-    return { items, app, recordings, settings, armed: Boolean(state.armed), hostAccess, rescued: recent, log: log || [] };
+    // The subtitle files of the tab, without the request headers they are fetched with.
+    const subs = Object.values(state.subs || {}).map(({ url, lang, label, format }) => ({ url, lang, label, format }));
+    // A video of the tab was given DRM keys, and of which key system when the page named one.
+    const drm = { on: Boolean(state.drm), system: typeof state.drm === "string" ? state.drm : "" };
+    return { items, app, recordings, settings, armed: Boolean(state.armed), hostAccess, rescued: recent, log: log || [], subs, drm };
+  },
+
+  /**
+   * The videos and subtitles the page names (og:video, twitter:player:stream, JSON-LD VideoObject, <video>, <source>
+   * and <audio> sources, lazy data-src ones, <track> subtitles), as the popup read them from each frame when it
+   * opened: those that are a stream or a media file by their link join the tab's items (one already found merges
+   * with it), the subtitles its subtitle files.
+   */
+  async PAGE_VIDEOS({ tabId, frames }) {
+    if (!validTabId(tabId) || !Array.isArray(frames)) return { ok: false, error: "bad request" };
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (!isHttpUrl(tab?.url) || isOffLimits(hostOf(tab.url))) return { ok: false, error: "Not a web page." };
+    const { blockedHosts } = await getSettings();
+    for (const frame of frames.slice(0, 50)) {
+      const sender = { tab, frameId: Number.isInteger(frame?.frameId) ? frame.frameId : 0, url: tab.url };
+      for (const url of Array.isArray(frame?.urls) ? frame.urls.slice(0, 200) : []) {
+        const found = pageMediaOf(url);
+        const fields = found?.kind === "hls" ? HLS_FIELDS : found?.kind === "dash" ? DASH_FIELDS : found?.kind === "smooth" ? SMOOTH_FIELDS : null;
+        if (found) await addPageItem(sender, url, fields || { kind: "file", format: found.format, name: found.name, contentType: "" });
+      }
+      for (const track of Array.isArray(frame?.tracks) ? frame.tracks.slice(0, MAX_SUBS) : []) {
+        if (!isHttpUrl(track?.url) || isAdHost(hostOf(track.url)) || isBlocked(hostOf(track.url), blockedHosts)) continue;
+        const text = (value, pattern) => (typeof value === "string" && pattern.test(value) ? value : "");
+        await addSubtitle(tabId, {
+          url: track.url,
+          lang: text(track.lang, /^[A-Za-z0-9-]{1,20}$/),
+          label: text(track.label, /^[^\0-\x1f]{1,80}$/),
+          format: subtitleOf({ url: track.url })?.format || "vtt",
+          request: requestFor(track.url, sender),
+        });
+      }
+    }
+    return { ok: true };
+  },
+
+  /**
+   * Sends the tab's subtitle files with a video: each as a download of its own named after it ("<base>.<lang>.vtt"),
+   * with the request the browser made for it; the app's /add has no place for subtitles of a link.
+   */
+  async SEND_SUBS({ tabId, base }) {
+    if (!validTabId(tabId) || typeof base !== "string") return { ok: false, error: "bad request" };
+    const [state, tab] = await Promise.all([readTab(tabId), chrome.tabs.get(tabId).catch(() => null)]);
+    const subs = Object.values(state.subs || {});
+    const used = new Set();
+    for (const [i, sub] of subs.entries()) {
+      // Two of one language, or none named, are told apart by their place.
+      const tag = sub.lang && !used.has(sub.lang) ? sub.lang : String(i + 1);
+      used.add(tag);
+      const { referer, userAgent, cookies, headers } = sub.request || {};
+      const reply = await sendToApp({ url: sub.url, tabId, referer: referer || tab?.url, userAgent, cookies, headers, filename: `${base}.${tag}.${sub.format}` });
+      if (!reply.ok) return reply;
+    }
+    return { ok: true, count: subs.length };
   },
 
   /**
@@ -1179,6 +1262,29 @@ const POPUP_COMMANDS = {
     }
     await changeLog((log) => log.map((logged) => (logged.id === id ? { ...logged, sent: true, reason: "Sent to the app" } : logged)));
     return { ok: true };
+  },
+
+  /** The app's downloads (POST /queue), for the Downloads view, which asks each second while it shows. */
+  async APP_QUEUE() {
+    try {
+      const { downloads } = await callApp("/queue", { timeout: 2000 });
+      return { ok: true, downloads: Array.isArray(downloads) ? downloads : [] };
+    } catch (error) {
+      // An app from before /queue answers 404. Not `notRunning`: polling must not stand for a failed send.
+      const old = error.message === "not found";
+      return { ok: false, error: old ? "This Endo's Unified Downloader can't list its downloads yet: update it." : error.message };
+    }
+  },
+
+  /** Pauses, resumes or removes (its files kept) one of the app's downloads (POST /queue/<id>/<action>). */
+  async APP_QUEUE_ACTION({ id, action }) {
+    if (!Number.isSafeInteger(id) || id < 0 || !["pause", "resume", "remove"].includes(action)) return { ok: false, error: "bad request" };
+    try {
+      await callApp(`/queue/${id}/${action}`, { timeout: 3000 });
+      return { ok: true };
+    } catch (error) {
+      return failure(error);
+    }
   },
 
   /**
@@ -1347,11 +1453,13 @@ const POPUP_COMMANDS = {
   },
 
   /**
-   * The link grabber's batch: the chosen links of the tab, with its URL as the referer, the browser's User-Agent and
-   * each origin's cookies, which the app gives only to that origin's links.
+   * The link grabber's batch: the chosen links of the tab (http(s) and magnet), with its URL as the referer, the
+   * browser's User-Agent and each origin's cookies, which the app gives only to that origin's links.
    */
   async SEND_LINKS({ tabId, urls }) {
-    if (!validTabId(tabId) || !Array.isArray(urls) || urls.length === 0 || !urls.every(isHttpUrl)) return { ok: false, error: "bad request" };
+    if (!validTabId(tabId) || !Array.isArray(urls) || urls.length === 0 || !urls.every((url) => isHttpUrl(url) || isMagnet(url))) {
+      return { ok: false, error: "bad request" };
+    }
     urls = urls.filter((url) => !isOffLimits(hostOf(url)));
     if (urls.length === 0) return { ok: false, error: OFF_LIMITS };
     if (urls.length > MAX_BATCH) return { ok: false, error: `Send at most ${MAX_BATCH} links at once.` };
@@ -1568,9 +1676,22 @@ const PAGE_COMMANDS = {
     return addPageItem(sender, url, format === "mpd" ? DASH_FIELDS : format === "ism" ? SMOOTH_FIELDS : HLS_FIELDS);
   },
 
-  /** A response the page read whose text is a DASH manifest. */
-  MPD_SEEN({ url }, sender) {
-    return isHttpUrl(url) ? addPageItem(sender, url, DASH_FIELDS) : { ok: false };
+  /** A response the page read whose text is a DASH manifest; its start (`head`) says whether it is live or protected. */
+  MPD_SEEN({ url, head }, sender) {
+    if (!isHttpUrl(url)) return { ok: false };
+    const { live, drm } = typeof head === "string" && head.length <= 64 * 1024 ? mpdFlags(head) : {};
+    return addPageItem(sender, url, { ...DASH_FIELDS, live: live === true, drm: drm === true });
+  },
+
+  /** A video of the frame was given DRM keys (hook.js), with the key system the page asked for: the popup says so. */
+  async DRM_SEEN({ system }, sender) {
+    const name = typeof system === "string" && /^[\w.-]{1,100}$/.test(system) ? system : true;
+    await updateTab(sender.tab.id, (state) => {
+      if (state.drm) return false;
+      state.drm = name;
+      return true;
+    });
+    return { ok: true };
   },
 
   /** A response the page read whose text is a Smooth Streaming manifest. */

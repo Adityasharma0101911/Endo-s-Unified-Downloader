@@ -8,6 +8,9 @@ import {
   isAdHost,
   isMediaSiteHost,
   mediaUrlFormat,
+  mpdFlags,
+  pageMediaOf,
+  subtitleOf,
   newerVersion,
   parseM3u8,
   passesSizeFilter,
@@ -355,4 +358,58 @@ test("newerVersion compares numeric dot parts and is false for anything else", (
     assert.equal(newerVersion(bad, "1.0.0"), false, String(bad));
     assert.equal(newerVersion("9.9.9", bad), false, String(bad));
   }
+});
+
+test("more audio and video files are found by type, and by extension when the type says nothing", () => {
+  for (const [type, format] of [["audio/mp4", "m4a"], ["audio/webm", "weba"], ["audio/x-wav", "wav"], ["audio/vnd.wave", "wav"], ["audio/opus", "opus"], ["video/quicktime", "mov"]]) {
+    assert.equal(classifyResponse({ url: "https://a.example/x", contentType: type }).format, format, type);
+  }
+  for (const ext of ["m4a", "aac", "flac", "wav", "opus", "mov", "m4v", "oga", "weba"]) {
+    const url = `https://a.example/files/clip.${ext}`;
+    assert.equal(classifyResponse({ url, contentType: "application/octet-stream" }).format, ext, ext);
+    assert.equal(classifyResponse({ url, type: "media" }).format, ext, `${ext} with no type`);
+    assert.equal(classifyResponse({ url, type: "xmlhttprequest" }), null, `${ext}: an XHR with no type is not one`);
+  }
+  assert.equal(classifyResponse({ url: "https://a.example/seg-2.m4s", contentType: "audio/mp4" }), null, "segments stay out");
+  assert.equal(classifyResponse({ url: "https://a.example/x.ts", type: "media" }), null);
+});
+
+test("any HLS key method but AES-128, and any key format but identity, is DRM; a session key marks the master", () => {
+  assert.equal(parseM3u8('#EXTM3U\n#EXT-X-KEY:METHOD=ISO-23001-7,URI="data:x"\n#EXTINF:4,\na.ts', "").drm, true);
+  assert.equal(parseM3u8('#EXTM3U\n#EXT-X-KEY:METHOD=NONE\n#EXTINF:4,\na.ts', "").drm, false);
+  const master = (key) => parseM3u8(`#EXTM3U\n${key}\n#EXT-X-STREAM-INF:BANDWIDTH=1\nv.m3u8`, "https://a.example/");
+  assert.equal(master('#EXT-X-SESSION-KEY:METHOD=SAMPLE-AES,URI="skd://x",KEYFORMAT="com.apple.streamingkeydelivery"').drm, true);
+  assert.equal(master('#EXT-X-SESSION-KEY:METHOD=AES-128,URI="k.bin"').drm, false);
+  assert.equal(master("").drm, false);
+});
+
+test("a DASH manifest says whether it is live and whether it is protected", () => {
+  assert.deepEqual(mpdFlags('<?xml version="1.0"?>\n<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="dynamic" minimumUpdatePeriod="PT2S">'), { live: true, drm: false });
+  const vod = '<MPD type="static"><Period><AdaptationSet><ContentProtection schemeIdUri="urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"/>';
+  assert.deepEqual(mpdFlags(vod), { live: false, drm: true });
+  assert.deepEqual(mpdFlags("<MPD><Period/></MPD>"), { live: false, drm: false });
+  assert.deepEqual(mpdFlags(undefined), { live: false, drm: false });
+});
+
+test("a video a page names is a stream or a media file by its link; anything else is not", () => {
+  assert.deepEqual(pageMediaOf("https://cdn.example/v/master.m3u8?t=1"), { kind: "hls", format: "m3u8" });
+  assert.deepEqual(pageMediaOf("https://cdn.example/v/manifest.mpd"), { kind: "dash", format: "mpd" });
+  assert.deepEqual(pageMediaOf("https://cdn.example/v/Clip%20One.mp4"), { kind: "file", format: "mp4", name: "Clip One.mp4" });
+  assert.deepEqual(pageMediaOf("https://cdn.example/a/song.flac"), { kind: "file", format: "flac", name: "song.flac" });
+  for (const none of ["https://www.example.com/embed/xyz", "https://cdn.example/poster.jpg", "https://cdn.example/seg-1.ts", "blob:https://a.example/1", "", undefined]) {
+    assert.equal(pageMediaOf(none), null, String(none));
+  }
+});
+
+test("subtitle files are found by type or extension; HLS's numbered WebVTT segments are not", () => {
+  assert.deepEqual(subtitleOf({ url: "https://a.example/subs/en.vtt", contentType: "text/vtt; charset=utf-8" }), { format: "vtt" });
+  assert.deepEqual(subtitleOf({ url: "https://a.example/subs?id=4", contentType: "text/vtt" }), { format: "vtt" });
+  assert.deepEqual(subtitleOf({ url: "https://a.example/movie.en.srt", contentType: "application/octet-stream" }), { format: "srt" });
+  assert.deepEqual(subtitleOf({ url: "https://a.example/movie.srt", contentType: "application/x-subrip" }), { format: "srt" });
+  assert.deepEqual(subtitleOf({ url: "https://a.example/captions_fr.vtt" }), { format: "vtt" });
+  assert.equal(subtitleOf({ url: "https://a.example/subs/seg-12.vtt", contentType: "text/vtt" }), null);
+  assert.equal(subtitleOf({ url: "https://a.example/subs/fileSequence3.webvtt" }), null);
+  assert.equal(subtitleOf({ url: "https://a.example/page.html", contentType: "text/html" }), null);
+  assert.equal(subtitleOf({ url: "https://a.example/en.vtt", contentType: "text/html" }), null);
+  assert.equal(subtitleOf({ url: "not a url" }), null);
 });

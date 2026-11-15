@@ -2,9 +2,9 @@
 // Everything shown comes from web pages, so it is only ever put into the DOM as text.
 import { parseSites, parseTypes } from "./lib/capture.js";
 import { NO_YOUTUBE, formatDuration, isMediaSiteHost, isOffLimits, sanitizeFilename, suggestFilename } from "./lib/detect.js";
-import { LINK_KINDS, MAX_BATCH, largestSrcset, linkFilter, normalizeLinks, siteOf, textMatcher } from "./lib/links.js";
+import { LINK_KINDS, MAX_BATCH, fullSizeImages, largestSrcset, linkFilter, normalizeLinks, siteOf, textMatcher } from "./lib/links.js";
 import { isMediaPage, mediaPayload, pickQuality, rememberedChoice, subtitleChoices, videoChoices } from "./lib/media.js";
-import { itemChips, itemMeta, itemNote, linkName, logView, recordingView, variantLabel } from "./lib/view.js";
+import { drmNote, isProtected, itemChips, itemMeta, itemNote, linkName, logView, queueView, recordingView, variantLabel } from "./lib/view.js";
 
 const $ = (id) => document.getElementById(id);
 /** The tabs of the popup; each has a `tab-<name>` button and a `<name>-view` panel. */
@@ -155,6 +155,9 @@ function render() {
   if (!httpTab) return;
   $("page-title").textContent = tab.title || hostOf(tab.url);
   $("page-host").textContent = hostOf(tab.url);
+  // A video of the page was given DRM keys: nothing of it can be downloaded or recorded, so the popup says so first.
+  $("drm-note").hidden = !state.drm?.on;
+  $("drm-text").textContent = state.drm?.on ? drmNote(state.drm.system) : "";
   renderItems(state.items || []);
   renderRecordings(Array.isArray(state.recordings) ? state.recordings : [], state.armed === true);
 }
@@ -178,6 +181,7 @@ function showView(name, { focus = false, remember = false } = {}) {
     }
   }
   if (name === "links" && links === null && httpTab) scanLinks();
+  pollQueue(name === "downloads");
 }
 
 /** Arrow keys, Home and End move between the enabled tabs (the WAI-ARIA tabs pattern). */
@@ -249,6 +253,11 @@ function makeRow() {
     row.mp4Set = true;
   });
   row.mp4Wrap = el("label", { className: "check", title: "Convert the stream to MP4 once downloaded", hidden: true }, row.mp4, "MP4");
+  // The page's subtitle files (see SEND_SUBS), downloaded beside the video under its name when ticked.
+  row.subs = el("input", { type: "checkbox", className: "switch" });
+  row.subs.setAttribute("role", "switch");
+  row.subsText = el("span");
+  row.subsWrap = el("label", { className: "check", title: "Also download the page's subtitle files, named after the video", hidden: true }, row.subs, row.subsText);
   row.download = button("Download", "btn primary", "download");
   row.more = iconButton("dots", "More actions", "btn icon-btn");
   // Fallback for servers that refuse the app (TLS fingerprint, bot checks): the page itself fetches the media.
@@ -280,7 +289,7 @@ function makeRow() {
     row.name,
     row.url,
     row.note,
-    el("div", { className: "item-actions" }, row.quality, el("span", { className: "spacer" }), row.mp4Wrap, row.download, row.more),
+    el("div", { className: "item-actions" }, row.quality, el("span", { className: "spacer" }), row.subsWrap, row.mp4Wrap, row.download, row.more),
     row.msg,
     row.menu,
   );
@@ -335,15 +344,19 @@ function updateRow(row, item) {
   const note = itemNote(item);
   row.note.textContent = note;
   row.note.hidden = !note;
-  row.download.disabled = !!hls?.drm;
-  row.download.title = hls?.drm ? note : "";
+  const locked = isProtected(item);
+  row.download.disabled = locked;
+  row.download.title = locked ? note : "";
   // The page downloads only what it can fetch once and whole: not inline, DASH, live or DRM streams, nor a file its
   // server lets only the <video> read (no CORS).
   row.via.hidden = !!item.inline || !(item.kind === "hls" || item.kind === "file") || item.pageCanFetch === false;
-  row.via.disabled = !!(hls?.drm || hls?.live);
-  row.via.sub.textContent = hls?.live ? "Live streams can't be downloaded through the browser." : hls?.drm ? "DRM-protected: it can't be downloaded." : VIA_HINT;
-  row.mp4Wrap.hidden = item.kind !== "hls" || !!hls?.drm;
+  row.via.disabled = locked || !!hls?.live;
+  row.via.sub.textContent = hls?.live ? "Live streams can't be downloaded through the browser." : locked ? "DRM-protected: it can't be downloaded." : VIA_HINT;
+  row.mp4Wrap.hidden = item.kind !== "hls" || locked;
   if (!row.mp4Set) row.mp4.checked = state.settings?.convertToMp4 !== false;
+  const subs = Array.isArray(state.subs) ? state.subs.length : 0;
+  row.subsWrap.hidden = subs === 0 || locked;
+  row.subsText.textContent = `Subtitles (${subs})`;
 
   row.host = hostOf(item.url);
   if (!row.blockTimer) row.block.label.textContent = row.host ? `Block ${row.host}` : "Block host";
@@ -377,8 +390,12 @@ async function download(row) {
   if (height) Object.assign(msg, { url: row.item.url, height });
   else msg.url = chosenUrl(row);
   const reply = await ask(msg);
-  row.download.disabled = !!row.item.hls?.drm;
-  report(row.msg, reply, "Sent to the downloader.");
+  if (reply.ok && row.subs.checked && !row.subsWrap.hidden) {
+    // Named after the video: "<name>.<language>.vtt" beside it, which players pick up.
+    const subs = await ask({ cmd: "SEND_SUBS", tabId: tab.id, base: chosenName(row).replace(/\.[^.]+$/, "") });
+    report(row.msg, subs, `Sent to the downloader, with ${subs.count} subtitle ${subs.count === 1 ? "file" : "files"}.`);
+  } else report(row.msg, reply, "Sent to the downloader.");
+  row.download.disabled = isProtected(row.item);
 }
 
 async function viaBrowser(row) {
@@ -386,7 +403,7 @@ async function viaBrowser(row) {
   row.via.disabled = true;
   say(row.msg, "Starting…");
   const reply = await ask({ cmd: "BROWSER_DL", tabId: tab.id, id: row.item.id, url: chosenUrl(row), filename: chosenName(row) });
-  row.via.disabled = !!(row.item.hls?.drm || row.item.hls?.live);
+  row.via.disabled = isProtected(row.item) || !!row.item.hls?.live;
   report(row.msg, reply, "Downloading in the page; progress shows under Record. Keep the tab open.");
   if (reply.ok) refresh();
 }
@@ -581,6 +598,78 @@ function downloadMedia(event) {
   sendMedia(media, $("mc-download"));
 }
 
+/**
+ * What the app makes of the tab's page (see PAGE_KIND): a page of a site its video engine takes gets the media card;
+ * a file host's, share's or folder's page puts "Download this page" first; any other offers to ask the app's video
+ * engine about it, which takes a few seconds, only when clicked.
+ */
+async function showPageKind() {
+  const kind = await pageKind(tab.url);
+  // The sites of MEDIA_SITE_HOSTS went by isMediaPage already, which leaves out their home and search pages.
+  if (kind === "media" && !mediaSite) {
+    mediaPage = true;
+    $("page-card").hidden = true;
+    return loadMediaCard();
+  }
+  const files = kind === "files";
+  $("page-card").classList.toggle("featured", files || mediaSite);
+  $("send-page").classList.toggle("primary", files || mediaSite);
+  if (files) {
+    $("page-note").textContent = "The downloader finds the files of this page itself: send the page.";
+    $("page-note").hidden = false;
+  }
+  $("find-video").hidden = files || mediaSite;
+}
+
+/**
+ * Runs in every frame of the tab (isolated world); must not reference anything outside itself. The media the page
+ * names without having played it: og:video and twitter:player:stream, a JSON-LD VideoObject's or AudioObject's
+ * contentUrl, the sources of <video>, <audio> and <source> (lazy data-src ones too), and its <track> subtitles.
+ */
+function collectPageMedia() {
+  const urls = [];
+  const add = (value) => {
+    try {
+      if (typeof value === "string" && value) urls.push(new URL(value, document.baseURI).href);
+    } catch {
+      // Not a URL: skipped.
+    }
+  };
+  const metas = ["og:video", "og:video:url", "og:video:secure_url", "twitter:player:stream"].map((name) => `meta[property="${name}"], meta[name="${name}"]`);
+  for (const meta of document.querySelectorAll(metas.join(", "))) add(meta.content);
+  const visit = (node, depth) => {
+    if (!node || typeof node !== "object" || depth > 6) return;
+    if (Array.isArray(node)) return node.slice(0, 50).forEach((child) => visit(child, depth + 1));
+    const types = [].concat(node["@type"] || []);
+    if (types.includes("VideoObject") || types.includes("AudioObject")) add(node.contentUrl);
+    for (const key of ["@graph", "video", "audio", "associatedMedia", "hasPart", "mainEntity"]) visit(node[key], depth + 1);
+  };
+  for (const script of document.querySelectorAll('script[type="application/ld+json"]')) {
+    try {
+      visit(JSON.parse(script.textContent), 0);
+    } catch {
+      // Not JSON: skipped.
+    }
+  }
+  for (const node of document.querySelectorAll("video, audio, source")) {
+    add(node.getAttribute("src"));
+    add(node.getAttribute("data-src"));
+  }
+  const tracks = Array.from(document.querySelectorAll("track[src]"))
+    .filter((track) => track.kind === "subtitles" || track.kind === "captions")
+    .map((track) => ({ url: track.src, lang: track.srclang, label: track.label }));
+  return { urls: [...new Set(urls)].filter((url) => /^https?:/i.test(url)).slice(0, 200), tracks: tracks.slice(0, 20) };
+}
+
+/** Hands what collectPageMedia finds in each frame to the background, which lists its videos with the others. */
+async function scanPageMedia() {
+  const results = await chrome.scripting.executeScript({ target: { tabId: tab.id, allFrames: true }, func: collectPageMedia }).catch(() => []);
+  const frames = results
+    .filter((r) => r?.result && (r.result.urls?.length || r.result.tracks?.length))
+    .map((r) => ({ frameId: r.frameId, urls: r.result.urls, tracks: r.result.tracks }));
+  if (frames.length) await ask({ cmd: "PAGE_VIDEOS", tabId: tab.id, frames });
+}
+
 // ---- Recording ----
 
 /** Runs inside every frame of the tab (isolated world); must not reference anything outside itself. */
@@ -734,22 +823,30 @@ function updateRecRow(row, r, now) {
 
 /** The page's links (see normalizeLinks), the ones ticked, and the chips chosen; null until the page is read. */
 let links = null;
+/** The page's images as collectPageLinks found them, for "Full-size images". */
+let pageImages = [];
 const picked = new Set();
 const kinds = new Set();
 
 /**
  * Runs in the tab's top frame (isolated world); must not reference anything outside itself. The links and media of
- * the page and its same-origin frames, as the URLs the browser resolved, and srcsets with the base they resolve against.
+ * the page and its same-origin frames, as the URLs the browser resolved, and srcsets with the base they resolve against;
+ * and each image with its sizes, its size in pixels and the link around it, for "Full-size images".
  */
 function collectPageLinks() {
   const urls = [];
   const srcsets = [];
+  const images = [];
   const rels = new Set(["alternate", "enclosure", "preload", "prefetch", "image_src"]);
   const visit = (doc) => {
     if (!doc) return;
     for (const node of doc.querySelectorAll("a[href], area[href]")) if (typeof node.href === "string") urls.push(node.href);
     for (const node of doc.querySelectorAll("img[src], video[src], audio[src], source[src]")) urls.push(node.src);
     for (const node of doc.querySelectorAll("img[srcset], source[srcset]")) srcsets.push([node.getAttribute("srcset"), doc.baseURI]);
+    for (const img of Array.from(doc.images).slice(0, 5000)) {
+      const linked = img.closest("a[href]")?.href;
+      images.push({ src: img.src, srcset: img.getAttribute("srcset") || "", base: doc.baseURI, width: img.naturalWidth, height: img.naturalHeight, linked: typeof linked === "string" ? linked : "" });
+    }
     for (const node of doc.querySelectorAll("link[href][rel]")) {
       if (node.rel.toLowerCase().split(/\s+/).some((rel) => rels.has(rel))) urls.push(node.href);
     }
@@ -763,7 +860,7 @@ function collectPageLinks() {
     }
   };
   visit(document);
-  return { urls, srcsets };
+  return { urls, srcsets, images };
 }
 
 async function scanLinks() {
@@ -776,11 +873,30 @@ async function scanLinks() {
     renderLinks();
     return say($("links-msg"), `Can't read this page's links: ${e?.message || e}`, "err");
   }
-  const { urls = [], srcsets = [] } = found?.result || {};
+  const { urls = [], srcsets = [], images = [] } = found?.result || {};
   links = normalizeLinks([...urls, ...srcsets.map(([srcset, base]) => largestSrcset(srcset, base))]);
+  // Each image at its largest source; the pixel size is the one the page shows, which the largest is at least.
+  pageImages = images.map(({ src, srcset, base, width, height, linked }) => ({ url: largestSrcset(srcset, base) || src, width, height, linked }));
   picked.clear();
   say($("links-msg"), "");
   renderLinks();
+}
+
+/**
+ * "Full-size images": selects the page's images at their largest (see fullSizeImages), no smaller than the size
+ * chosen beside it, instead of what was selected; a linked original not yet listed joins the list. The type chips
+ * are cleared so every one of them shows (and is sent).
+ */
+function pickImages() {
+  const wanted = normalizeLinks(fullSizeImages(pageImages, Number($("image-min").value) || 0));
+  const listed = new Set((links || []).map((link) => link.url));
+  links = [...(links || []), ...wanted.filter((link) => !listed.has(link.url))];
+  picked.clear();
+  for (const link of wanted) picked.add(link.url);
+  kinds.clear();
+  for (const chip of $("kinds").children) chip.setAttribute("aria-pressed", "false");
+  renderLinks();
+  say($("links-msg"), wanted.length ? `Selected ${wanted.length} full-size ${wanted.length === 1 ? "image" : "images"}.` : "No images of that size on this page.", wanted.length ? "ok" : "");
 }
 
 /** The links the filters let through. */
@@ -827,6 +943,94 @@ async function sendLinks() {
   const reply = await ask({ cmd: "SEND_LINKS", tabId: tab.id, urls });
   report($("links-msg"), reply, `Sent ${urls.length} ${urls.length === 1 ? "link" : "links"} to the downloader.`);
   renderCount();
+}
+
+// ---- Downloads: the app's ----
+
+/** Download id → its row of the app's list, kept across polls so a focused button is not replaced. */
+const queueRows = new Map();
+/** Which polling of the app's list runs (see pollQueue); an older one stops at its next turn. */
+let queuePoll = 0;
+
+/** Asks the app for its downloads now and each second after while `on` (the Downloads view shows); stops otherwise. */
+function pollQueue(on) {
+  const poll = ++queuePoll;
+  const tick = async () => {
+    const reply = await ask({ cmd: "APP_QUEUE" });
+    if (poll !== queuePoll) return;
+    renderQueue(reply);
+    setTimeout(tick, 1000);
+  };
+  if (on) tick();
+}
+
+function renderQueue(reply) {
+  const listed = reply.ok && Array.isArray(reply.downloads) ? reply.downloads.filter((d) => d && Number.isSafeInteger(d.id)) : [];
+  // Running and waiting ones first, then the stopped and done ones as the app lists them (newest first).
+  const rank = { downloading: 0, pausing: 0, queued: 1, auth: 1, paused: 2, failed: 3, done: 4 };
+  const shown = listed.sort((a, b) => (rank[a.status] ?? 5) - (rank[b.status] ?? 5)).slice(0, 30);
+  const list = $("queue");
+  const keep = new Set(shown.map((d) => d.id));
+  for (const [id, row] of queueRows) {
+    if (!keep.has(id)) {
+      row.li.remove();
+      queueRows.delete(id);
+    }
+  }
+  shown.forEach((d, i) => {
+    let row = queueRows.get(d.id);
+    if (!row) queueRows.set(d.id, (row = makeQueueRow(d.id)));
+    updateQueueRow(row, d);
+    if (list.children[i] !== row.li) list.insertBefore(row.li, list.children[i] || null);
+  });
+  const note = !reply.ok ? reply.error || "The app didn't answer." : shown.length ? "" : "No downloads in the app.";
+  $("queue-note").textContent = note;
+  $("queue-note").hidden = !note;
+}
+
+const QUEUE_ACTIONS = { pause: "Pause", resume: "Resume", remove: "Remove" };
+
+function makeQueueRow(id) {
+  const row = { buttons: {} };
+  row.chip = el("span", { className: "chip" });
+  row.label = el("span", { className: "label" });
+  row.bar = el("div", { className: "bar", hidden: true }, el("i"));
+  row.bar.setAttribute("role", "progressbar");
+  row.bar.setAttribute("aria-valuemin", "0");
+  row.bar.setAttribute("aria-valuemax", "100");
+  row.info = el("span", { className: "info" });
+  for (const [action, text] of Object.entries(QUEUE_ACTIONS)) {
+    const node = button(text, action === "remove" ? "btn small ghost" : "btn small");
+    node.addEventListener("click", async () => {
+      node.disabled = true;
+      const reply = await ask({ cmd: "APP_QUEUE_ACTION", id, action });
+      node.disabled = false;
+      if (!reply.ok) report($("queue-msg"), reply, "");
+    });
+    row.buttons[action] = node;
+  }
+  row.li = el("li", { className: "rec" }, el("div", { className: "rec-top" }, row.chip, row.label, ...Object.values(row.buttons)), row.bar, row.info);
+  return row;
+}
+
+function updateQueueRow(row, d) {
+  const view = queueView(d);
+  row.chip.textContent = view.chip[0];
+  row.chip.className = view.chip[1] ? `chip tone-${view.chip[1]}` : "chip";
+  row.label.textContent = view.title;
+  row.label.title = view.title;
+  row.info.textContent = view.info;
+  row.li.classList.toggle("failed", d.status === "failed");
+  row.bar.hidden = view.percent === null;
+  row.bar.style.setProperty("--p", String((view.percent ?? 0) / 100));
+  row.bar.setAttribute("aria-valuenow", String(view.percent ?? 0));
+  row.bar.setAttribute("aria-label", `${view.title}: ${view.percent ?? 0}%`);
+  for (const [action, node] of Object.entries(row.buttons)) {
+    node.hidden = !view.actions.includes(action);
+    const text = action === "resume" && d.status === "failed" ? "Retry" : QUEUE_ACTIONS[action];
+    node.label.textContent = text;
+    node.setAttribute("aria-label", `${text} ${view.title}`);
+  }
 }
 
 // ---- Downloads: the browser's ----
@@ -1058,6 +1262,8 @@ async function init() {
     mediaPage = isMediaPage(tab.url);
     $("page-card").hidden = mediaPage;
     if (mediaPage) loadMediaCard();
+    else showPageKind();
+    if (!mediaSite && !mediaPage) scanPageMedia();
     scanVideos();
   }
 
@@ -1131,6 +1337,7 @@ async function init() {
   $("same-site").addEventListener("change", renderLinks);
   $("links-rescan").addEventListener("click", scanLinks);
   $("send-links").addEventListener("click", sendLinks);
+  $("pick-images").addEventListener("click", pickImages);
   for (const [id, tick] of [["select-all", true], ["select-none", false]]) {
     $(id).addEventListener("click", () => {
       for (const link of shownLinks()) {
@@ -1163,6 +1370,11 @@ async function init() {
   $("mc-start-now").addEventListener("click", () => useCurrentTime($("mc-start")));
   $("mc-end-now").addEventListener("click", () => useCurrentTime($("mc-end")));
   $("mc-anyway").addEventListener("click", () => sendMedia({ quality: "best" }, $("mc-anyway")));
+  $("find-video").addEventListener("click", () => {
+    $("find-video").hidden = true;
+    $("media-card").classList.add("loading");
+    loadMediaCard();
+  });
 
   showView(httpTab ? (VIEWS.includes(saved) ? saved : "media") : "settings");
   chrome.runtime.onMessage.addListener((msg) => {

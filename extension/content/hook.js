@@ -1,8 +1,8 @@
 // Endo's Unified Downloader: runs in the page's own JavaScript world (MAIN), in every frame,
 // before any of the page's scripts. It finds HLS playlists, DASH and Smooth Streaming manifests and
-// JSON naming them among the responses the page itself reads and, only after the user chose
-// "Capture from start" for the tab, copies the media bytes the page's player hands to Media
-// Source Extensions.
+// JSON naming them among the responses the page itself reads, notices a video given DRM keys, and,
+// only after the user chose "Capture from start" for the tab, copies the media bytes the page's
+// player hands to Media Source Extensions.
 // Everything goes to bridge.js over a private MessageChannel. It must stay cheap and invisible:
 // patched methods return exactly what the originals return, and nothing here may throw into the
 // page.
@@ -21,6 +21,8 @@
   const MAX_URL = 32 * 1024;
   /** Characters at the start of a body that tell a DASH or Smooth Streaming manifest. */
   const HEAD = 4096;
+  /** Characters of a DASH manifest passed on, for whether it is live or protected (see lib/detect.js mpdFlags). */
+  const MPD_HEAD = 64 * 1024;
   /** Bytes held for bridge.js until its port arrives. */
   const HOLD_LIMIT = 64 * 1024 * 1024;
   /** Tracks per MediaSource the desktop app accepts (track 0..=15), and parts per track (0..=255). */
@@ -204,12 +206,12 @@
         // BOM or blanks); binary JSON bodies are not looked at.
         const head = decoder.decode(new Uint8Array(body, 0, Math.min(body.byteLength, 64)));
         if (PLAYLIST.test(head) && body.byteLength <= MAX_PLAYLIST) text = decoder.decode(body);
-        else if (MANIFEST.test(head) && !inline) text = decoder.decode(new Uint8Array(body, 0, Math.min(body.byteLength, HEAD)));
+        else if (MANIFEST.test(head) && !inline) text = decoder.decode(new Uint8Array(body, 0, Math.min(body.byteLength, MPD_HEAD)));
         else return;
       }
       if (PLAYLIST.test(text)) reportPlaylist(url, text, inline);
       else if (inline) return;
-      else if (MANIFEST.test(text) && text.slice(0, HEAD).includes("<MPD")) once("mpd:" + url, { t: "mpd", url });
+      else if (MANIFEST.test(text) && text.slice(0, HEAD).includes("<MPD")) once("mpd:" + url, { t: "mpd", url, head: text.slice(0, MPD_HEAD) });
       else if (MANIFEST.test(text) && text.slice(0, HEAD).includes("<SmoothStreamingMedia")) once("ism:" + url, { t: "ism", url });
       // JSON is parsed only when it names a stream, so most API responses cost one regex test.
       else if (text.length <= MAX_JSON && JSON_TEXT.test(text) && JSON_HINT.test(text)) scanJson(url, parseJson(text));
@@ -251,6 +253,36 @@
       },
     })[name]);
   }
+
+  // ---- Protected video: the page asks for a key system (Encrypted Media Extensions) ----
+  // Only noticed, never changed: the popup then says the tab's video is DRM-protected and can't be downloaded.
+
+  /** The key system the page asked for last ("com.widevine.alpha", …), named in the report. */
+  let keySystem = "";
+  let drmReported = false;
+  if (typeof Navigator === "function") {
+    patch(Navigator, "requestMediaKeySystemAccess", (request) => ({
+      requestMediaKeySystemAccess(system) {
+        try {
+          if (typeof system === "string" && system.length <= 100) keySystem = system;
+        } catch {}
+        return request.apply(this, arguments);
+      },
+    }).requestMediaKeySystemAccess);
+  }
+  // Pages ask which key systems the browser has without using one; a video given keys is the sign.
+  patch(window.HTMLMediaElement, "setMediaKeys", (setKeys) => ({
+    setMediaKeys(mediaKeys) {
+      const result = setKeys.apply(this, arguments);
+      try {
+        if (mediaKeys && !drmReported) {
+          drmReported = true;
+          post({ t: "drm", system: keySystem });
+        }
+      } catch {}
+      return result;
+    },
+  }).setMediaKeys);
 
   // ---- "Capture from start": Media Source Extensions buffer capture ----
 

@@ -59,8 +59,8 @@
     <button type="button" class="tab" role="tab" id="tab-downloads" aria-controls="downloads-view" aria-selected="false" tabindex="-1">
       <svg class="icon" aria-hidden="true"><use href="#i-download"/></svg><span>Downloads</span>
     </button>
-    <button type="button" class="tab icon-tab" role="tab" id="tab-settings" aria-controls="settings-view" aria-selected="false" tabindex="-1" aria-label="Settings" title="Settings">
-      <svg class="icon" aria-hidden="true"><use href="#i-gear"/></svg>
+    <button type="button" class="tab icon-tab" role="tab" id="tab-settings" aria-controls="settings-view" aria-selected="false" tabindex="-1" title="Settings">
+      <svg class="icon" aria-hidden="true"><use href="#i-gear"/></svg><span class="visually-hidden">Settings</span>
     </button>
   </nav>
 
@@ -177,8 +177,11 @@
           <button id="send-page" type="button" class="btn"><svg class="icon" aria-hidden="true"><use href="#i-download"/></svg><span>Download this page</span></button>
         </div>
         <p id="page-note" class="note" hidden>This site is handled by yt-dlp in the downloader: send the page, not its streams.</p>
+        <button id="find-video" type="button" class="btn small ghost" hidden title="The app's video engine looks at the page; it takes a few seconds"><svg class="icon" aria-hidden="true"><use href="#i-search"/></svg><span>Ask the app for a video on this page</span></button>
         <p id="page-msg" class="msg" role="status" aria-live="polite"></p>
       </div>
+
+      <p id="drm-note" class="drm-note" hidden><svg class="icon" aria-hidden="true"><use href="#i-shield"/></svg><span id="drm-text"></span></p>
 
       <div id="media-head" class="section-head" hidden>
         <h2 id="media-title">Detected media</h2>
@@ -210,6 +213,15 @@
           <button id="links-rescan" type="button" class="btn icon-btn" title="Rescan page" aria-label="Rescan page"><svg class="icon" aria-hidden="true"><use href="#i-reload"/></svg></button>
         </div>
         <div id="kinds" class="chips filters" role="group" aria-label="File types"></div>
+        <div class="list-head">
+          <button id="pick-images" type="button" class="btn small" title="Selects the page's images at their largest: a thumbnail's linked original, else the largest of its sizes"><svg class="icon" aria-hidden="true"><use href="#i-check"/></svg><span>Full-size images</span></button>
+          <select id="image-min" aria-label="Smallest image to select">
+            <option value="0">Any size</option>
+            <option value="300">300 px and up</option>
+            <option value="800">800 px and up</option>
+            <option value="1600">1600 px and up</option>
+          </select>
+        </div>
         <div class="list-head">
           <span id="selected-count" class="note"></span>
           <button id="select-all" type="button" class="btn small ghost">Select all</button>
@@ -266,6 +278,12 @@
     </section>
 
     <section id="downloads-view" class="panel" role="tabpanel" aria-labelledby="tab-downloads" hidden>
+      <div class="card">
+        <h2 class="card-title"><svg class="icon" aria-hidden="true"><use href="#i-download"/></svg>In the app</h2>
+        <p id="queue-note" class="note" hidden></p>
+        <ul id="queue" class="rows" aria-label="Downloads in the app"></ul>
+        <p id="queue-msg" class="msg" role="status" aria-live="polite"></p>
+      </div>
       <div class="card">
         <h2 class="card-title"><svg class="icon" aria-hidden="true"><use href="#i-browser"/></svg>From the browser</h2>
         <div id="site-capture" class="site-capture" hidden>

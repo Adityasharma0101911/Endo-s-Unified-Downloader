@@ -13,12 +13,18 @@ export const LINK_KINDS = {
   Archives: ["zip", "rar", "7z", "tar", "gz", "tgz", "bz2", "xz", "zst", "iso", "cab"],
   Documents: ["pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "odp", "rtf", "txt", "csv", "epub", "mobi", "djvu"],
   Programs: ["exe", "msi", "msix", "dmg", "pkg", "deb", "rpm", "apk", "appimage", "jar"],
+  // Magnet links too (see linkKind).
+  Torrents: ["torrent"],
 };
 
 const KIND_OF = new Map(Object.entries(LINK_KINDS).flatMap(([kind, exts]) => exts.map((ext) => [ext, kind])));
 
-/** The chip a link belongs to, by the extension of its path; "" for none. */
+/** Whether `url` is a magnet link (a torrent by its hash), which the app takes as it takes a link. */
+export const isMagnet = (url) => typeof url === "string" && url.length <= 16384 && /^magnet:\?/i.test(url);
+
+/** The chip a link belongs to, by the extension of its path (a magnet link is a torrent); "" for none. */
 export function linkKind(url) {
+  if (isMagnet(url)) return "Torrents";
   try {
     const name = new URL(url).pathname.split("/").pop();
     const dot = name.lastIndexOf(".");
@@ -52,13 +58,17 @@ export function largestSrcset(srcset, base) {
 }
 
 /**
- * The links of a page as the popup lists them: absolute http(s) only, without a #fragment, each once in the order
- * found, at most MAX_LINKS, with their host and chip.
+ * The links of a page as the popup lists them: absolute http(s) ones without a #fragment, and magnet links, each once
+ * in the order found, at most MAX_LINKS, with their host and chip.
  */
 export function normalizeLinks(urls) {
   const seen = new Map();
   for (const raw of urls) {
     if (seen.size >= MAX_LINKS) break;
+    if (isMagnet(raw)) {
+      if (!seen.has(raw)) seen.set(raw, { url: raw, host: "", kind: "Torrents" });
+      continue;
+    }
     let url;
     try {
       url = new URL(raw);
@@ -70,6 +80,27 @@ export function normalizeLinks(urls) {
     if (!seen.has(url.href)) seen.set(url.href, { url: url.href, host: url.hostname.toLowerCase(), kind: linkKind(url.href) });
   }
   return [...seen.values()];
+}
+
+/** The http(s) and magnet links written out in `text` (a selection), trailing punctuation left out, each once. */
+export function linksInText(text) {
+  const found = String(text || "").match(/\b(?:https?:\/\/|magnet:\?)[^\s<>"'`]+/gi) || [];
+  return [...new Set(found.map((link) => link.replace(/[.,;:!?)\]}]+$/, "")))];
+}
+
+/**
+ * The full-size images of a page, from what it shows of each image ([{url, width, height, linked}]: its largest
+ * source, that one's size in pixels, and the link around it): a thumbnail's linked original (a link to an image) in
+ * its place, else the image itself unless its longer side is under `minPixels`. A linked original's size is not
+ * known, so it stays. Each once.
+ */
+export function fullSizeImages(images, minPixels = 0) {
+  const urls = new Set();
+  for (const { url, width = 0, height = 0, linked = "" } of images) {
+    if (linked && linkKind(linked) === "Images") urls.add(linked);
+    else if (url && Math.max(width, height) >= minPixels) urls.add(url);
+  }
+  return [...urls];
 }
 
 /**

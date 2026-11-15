@@ -17,11 +17,14 @@ export function itemChips(item) {
   const stream = item.kind === "hls" || item.kind === "dash" || item.kind === "smooth";
   const chips = [[stream ? item.kind.toUpperCase() : String(item.format || "file").toUpperCase(), stream ? "accent" : "cyan"]];
   if (item.inline) chips.push(["Inline", ""]);
-  if (hls?.live) chips.push(["LIVE", "red"]);
+  if (hls?.live || item.live) chips.push(["LIVE", "red"]);
   if (hls?.encrypted) chips.push(["AES-128", "amber"]);
-  if (hls?.drm) chips.push(["DRM", "red"]);
+  if (isProtected(item)) chips.push(["DRM", "red"]);
   return chips;
 }
+
+/** Whether an item is DRM-protected: an HLS key system, or a DASH manifest's ContentProtection. */
+export const isProtected = (item) => Boolean(hlsOf(item)?.drm || item.drm);
 
 /** "12.3 MB · 4:05 · 1920×1080": what is known of an item's size, length and best resolution. */
 export function itemMeta(item) {
@@ -37,8 +40,9 @@ export function itemMeta(item) {
 /** Why an item downloads the way it does, or "". */
 export function itemNote(item) {
   const hls = hlsOf(item);
-  if (hls?.drm) return "DRM-protected (SAMPLE-AES or a key system): it can't be downloaded.";
+  if (isProtected(item)) return "Protected (DRM): it can't be downloaded.";
   if (masterOf(item)?.separateAudio) return "Separate audio: the downloader merges it with the chosen quality.";
+  if (item.kind === "dash" && item.live) return "Live DASH stream: the downloader records it as it plays.";
   if (item.kind === "dash") return "DASH stream: the downloader fetches it and merges the audio.";
   if (item.kind === "smooth") return "Smooth Streaming: the downloader hands it to its media engine.";
   if (hls?.live) return "Live stream: the downloader records it as it plays.";
@@ -75,6 +79,13 @@ export function recordingView(r, now) {
   };
 }
 
+/** What the popup says of a tab whose video was given DRM keys by `system` (a key system's name, or ""). */
+export function drmNote(system) {
+  const names = [[/widevine/i, "Widevine"], [/playready/i, "PlayReady"], [/^com\.apple\.fps/i, "FairPlay"], [/clearkey/i, "ClearKey"]];
+  const name = names.find(([pattern]) => pattern.test(system))?.[1];
+  return `Protected (DRM${name ? `, ${name}` : ""}): this page's video can't be downloaded or recorded.`;
+}
+
 /** "just now", "5 min ago", "2 h ago" for a time `then` (ms) seen at `now`. */
 export function timeAgo(then, now) {
   const minutes = Math.floor(Math.max(0, now - then) / 60000);
@@ -99,7 +110,48 @@ export function logView(e, now) {
   };
 }
 
-/** The name a link list row leads with: the last part of the path, decoded, else the host. */
+/** A queue status of the app's (POST /queue) as the chip the popup shows: [text, tone]. */
+const QUEUE_CHIPS = {
+  downloading: ["Downloading", "accent"],
+  pausing: ["Pausing", "amber"],
+  queued: ["Waiting", ""],
+  paused: ["Paused", "amber"],
+  failed: ["Failed", "red"],
+  done: ["Done", "green"],
+  auth: ["Needs its sign-in", "amber"],
+};
+
+/**
+ * What a row of the app's downloads shows for `d` (as POST /queue lists it): its name, status chip, how far it got
+ * (percent, or null when the size is not known or it is done), done of total · speed (or why it failed), and the
+ * actions the app takes for its status: "pause" a running one, "resume" a stopped one, "remove" one not running.
+ */
+export function queueView(d) {
+  const done = Math.max(0, Number(d.done) || 0);
+  const total = Math.max(0, Number(d.total) || 0);
+  const percent = total > 0 && d.status !== "done" ? Math.min(100, Math.floor((done / total) * 100)) : null;
+  const bits = [];
+  if (percent !== null) bits.push(`${percent}%`);
+  bits.push(total > 0 && d.status !== "done" ? `${formatBytes(done)} of ${formatBytes(total)}` : formatBytes(total || done));
+  if (d.status === "downloading" && d.speed > 0) bits.push(`${formatBytes(d.speed)}/s`);
+  const actions = {
+    downloading: ["pause"],
+    paused: ["resume", "remove"],
+    failed: ["resume", "remove"],
+    queued: ["remove"],
+    done: ["remove"],
+    auth: ["remove"],
+  };
+  return {
+    title: d.name || `Download #${d.id}`,
+    chip: QUEUE_CHIPS[d.status] || ["", ""],
+    percent,
+    info: d.status === "failed" && d.error ? d.error : bits.join(" · "),
+    actions: actions[d.status] || [],
+  };
+}
+
+/** The name a link list row leads with: the last part of the path, decoded, else the host; a magnet link's own name. */
 export function linkName(url) {
   let parsed;
   try {
@@ -107,6 +159,7 @@ export function linkName(url) {
   } catch {
     return String(url);
   }
+  if (parsed.protocol === "magnet:") return parsed.searchParams.get("dn") || "Magnet link";
   const last = parsed.pathname.split("/").filter(Boolean).pop();
   if (!last) return parsed.hostname;
   try {

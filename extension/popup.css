@@ -148,6 +148,7 @@ a { color: var(--accent-text); }
 .tab[aria-selected="true"] .icon { color: var(--accent-text); }
 .tab:disabled { opacity: 0.4; cursor: default; }
 .tab.icon-tab { flex: 0 0 34px; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 .tab:focus-visible { outline-offset: -2px; }
 
 .count {
@@ -445,9 +446,9 @@ button.chip[aria-pressed="true"] { --c: var(--accent); --ct: var(--accent-text);
 .links > li:hover { background: var(--hover); }
 .links > li:has(input:checked) { background: color-mix(in srgb, var(--accent) 9%, var(--card)); }
 .links label { display: flex; flex: 1; align-items: center; gap: 10px; min-width: 0; cursor: pointer; }
-/* A row's checkbox scrolls clear of the sticky filter bar (104 px) and Send footer (59 px) when it takes focus.
+/* A row's checkbox scrolls clear of the sticky filter bar (138 px) and Send footer (59 px) when it takes focus.
    ponytail: fixed heights; measure them in JS if those bars ever change height. */
-.links input { scroll-margin: 118px 0 73px; }
+.links input { scroll-margin: 152px 0 73px; }
 .link-text { display: grid; min-width: 0; line-height: 1.3; }
 .link-text > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .link-url { color: var(--muted); font-size: 11px; }
@@ -480,6 +481,10 @@ button.chip[aria-pressed="true"] { --c: var(--accent); --ct: var(--accent-text);
 .site-capture .note { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .site-capture .btn[aria-pressed="true"] { border-color: color-mix(in srgb, var(--accent) 60%, transparent); background: color-mix(in srgb, var(--accent) 18%, var(--field)); color: var(--strong); }
 .rec .reason { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+#find-video { justify-self: start; }
+.drm-note { display: flex; align-items: flex-start; gap: 8px; padding: 8px 10px; border-radius: 8px; background: color-mix(in srgb, var(--red) 12%, transparent); color: var(--red-text); font-size: 12px; }
+.drm-note .icon { margin-top: 1px; }
+#image-min { height: 26px; font-size: 12px; }
 
 /* ---- Settings ---- */
 
