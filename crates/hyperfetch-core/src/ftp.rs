@@ -388,11 +388,11 @@ fn http_date(mdtm: &str) -> Option<String> {
 
 /// One connection of an FTP download (see the module docs): takes ranges as an HTTP worker does
 /// (fresh ones, the rest of a silent one, part of a slow one) and fetches each over a connection
-/// of its own, until the download stops it or lowers its width below this worker.
+/// of its own, until the download stops it; while its width is below this worker, it waits.
 pub(crate) async fn work(worker_id: usize, shared: WorkerShared, net: Arc<Net>) {
     let s = &shared;
     loop {
-        if worker_id >= s.width.load(Ordering::Relaxed) {
+        if !s.within_width(worker_id).await {
             return;
         }
         let taken = tokio::select! {

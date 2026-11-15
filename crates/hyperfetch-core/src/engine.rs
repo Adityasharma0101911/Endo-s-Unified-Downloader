@@ -21,6 +21,7 @@ use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
+use crate::autopilot::{self, Autopilot};
 use crate::chunk::{ChunkManager, ChunkSnapshot};
 use crate::digest::Unfinished;
 use crate::history::{is_redacted, redact_url, DownloadHistoryManager, HistoryEntry, HistoryStatus};
@@ -109,12 +110,10 @@ const MAX_CONNECTIONS: usize = 64;
 const MIN_STEAL: u64 = 64 * 1024;
 /// Free space a download leaves on its disk besides the file.
 const DISK_HEADROOM: u64 = 64 * 1024 * 1024;
-/// One more connection is kept when it raises the speed by this factor (see `Ramp`), which
-/// measures over this many times what a new request takes to answer, within these bounds.
-const RAMP_GAIN: f64 = 1.10;
-const RAMP_STARTUPS: u32 = 4;
-const MIN_RAMP_WINDOW: Duration = Duration::from_millis(500);
-const MAX_RAMP_WINDOW: Duration = Duration::from_secs(5);
+/// Most connections an adaptive download starts with, unless its host was seen to cap each
+/// connection or ended up fastest with more: the Autopilot adds more as they pay, and a server
+/// that serves few well is not opened every connection the user allows at once.
+const AUTOPILOT_START: usize = 8;
 
 #[derive(Debug, Clone, Default)]
 pub struct EngineSnapshot {
@@ -139,6 +138,9 @@ pub struct EngineSnapshot {
     /// What is known of the server a download over HTTP comes from, after redirects (see
     /// `crate::hosts::profile`), for a front end to tell what holds it back; None for others.
     pub host: Option<HostProfile>,
+    /// Why a download over ranges has the connections it has, in a line for the user: what the
+    /// Autopilot chose and why (see `crate::autopilot`), or that it is off. None for others.
+    pub autopilot: Option<String>,
 }
 
 impl EngineSnapshot {
@@ -295,11 +297,12 @@ pub struct DownloadOptions {
     pub gallery_dl: bool,
     /// What happens to the file once downloaded.
     pub post: crate::postprocess::PostOptions,
-    /// A download over ranges adapts its connections as it goes (see `Ramp`): from the number
-    /// the probe chose, one more while that raises its speed by a tenth, and back by one when the
-    /// last one slowed it; never past `num_connections` or what the host takes. Off, the
-    /// connections the probe chose are kept to the end. Off by default here; the CLI and the app
-    /// turn it on unless told not to.
+    /// A download over ranges has the Autopilot choose its connections as it goes (see
+    /// `crate::autopilot`): from where downloads from the host ended up fastest, or the probe's
+    /// count up to `AUTOPILOT_START`, more while they raise its speed by a tenth, and the fewest
+    /// that reach a speed more do not raise; never past `num_connections` or what the host takes.
+    /// Off, the connections the probe chose are kept to the end. Off by default here; the CLI and
+    /// the app turn it on unless told not to.
     pub adaptive: bool,
     /// The largest file downloaded, in bytes: a larger one fails at the probe, or, when the server
     /// does not tell the size, as soon as more has arrived. A live recording ends there instead,
@@ -2698,10 +2701,19 @@ impl DownloadEngine {
         let room = if late.is_some() { usize::MAX } else { host_room(&mirrors, self.options.max_connections_per_host) };
         let max_workers = self.options.num_connections.clamp(1, MAX_CONNECTIONS).min(room).max(1) as u64;
         // An adaptive download starts where one from the host ended up fastest, also in an earlier
-        // run, when the file gives each of those connections a MiB; the ramp goes on from there.
+        // run, when the file gives each of those connections a MiB; the Autopilot goes on from there.
         let adapts = self.options.adaptive && self.limiter.is_none();
         let best = hosts::best_connections(&reference.final_url).filter(|&best| adapts && remaining >= best as u64 * BYTES_PER_CONNECTION);
-        let num_workers = best.map_or_else(|| remaining.div_ceil(per_connection), |best| best as u64).clamp(1, max_workers) as usize;
+        let known = hosts::profile(&reference.final_url);
+        let start = autopilot::Start {
+            remembered: best.is_some(),
+            rate: known.connection_rate.filter(|_| known.capped_per_connection == Some(true)),
+            limit: hosts::limit(&reference.final_url),
+            line: hosts::line(),
+        };
+        let counted = remaining.div_ceil(per_connection);
+        let counted = if adapts && start.rate.is_none() { counted.min(AUTOPILOT_START as u64) } else { counted };
+        let num_workers = best.map_or(counted, |best| best as u64).clamp(1, max_workers) as usize;
         let in_order = crate::storage::hashes_prefix(self.options.expected_checksum.as_deref());
         let throttled_host = mirrors.iter().any(|m| HostKey::of(&m.url).is_bitrate_throttled());
         let chunk_size = effective_chunk_size(remaining, num_workers as u64, self.options.base_chunk_size, in_order, throttled_host);
@@ -2799,12 +2811,13 @@ impl DownloadEngine {
         }
         let width = Arc::clone(&shared.width);
         // A speed limit holds every width to the same speed.
-        let mut ramp = adapts
-            .then(|| Ramp::new(num_workers, max_workers as usize, Instant::now(), job.chunks.lock().total_downloaded()))
-            .filter(|ramp| !ramp.done);
-        // What the workers the ramp adds share, kept only while it may add one: the download
+        let mut pilot = adapts.then(|| Autopilot::new(num_workers, max_workers as usize, start, Instant::now(), job.chunks.lock().total_received()));
+        let mut why = Some(pilot.as_ref().map_or_else(|| autopilot::off(num_workers, self.limiter.is_some()), Autopilot::why));
+        // What the workers the Autopilot adds share, kept only while it may add one: the download
         // notices that its workers all stopped once nothing else holds it.
-        let mut spare = ramp.is_some().then_some(shared);
+        let mut spare = pilot.is_some().then_some(shared);
+        // Workers past the width wait until it takes them again, so each is spawned once.
+        let mut spawned = num_workers;
 
         let mut tick = tokio::time::interval(SNAPSHOT_INTERVAL);
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -2832,22 +2845,31 @@ impl DownloadEngine {
                     None => break Err("Download aborted: all workers stopped before the download completed".to_string()),
                 },
                 _ = tick.tick() => {
-                    emit(snapshot_tx, || job.snapshot(size, &mut meter, final_path));
-                    if let Some(next) = ramp.as_mut().and_then(|ramp| job.ramp(ramp)) {
-                        // Workers past a lower width stop once their attempt ends.
-                        let was = width.swap(next, Ordering::Relaxed);
-                        if let Some(shared) = &spare {
-                            for worker_id in was..next {
-                                spawn(&mut workers, worker_id, shared);
+                    emit(snapshot_tx, || EngineSnapshot { autopilot: why.clone(), ..job.snapshot(size, &mut meter, final_path) });
+                    if let Some(pilot) = pilot.as_mut().filter(|pilot| !pilot.done) {
+                        if let Some(next) = job.steer(pilot, &reference.final_url) {
+                            // Workers past a lower width hand back what they have yet to receive.
+                            if width.swap(next, Ordering::Relaxed) > next {
+                                job.chunks.lock().give_back(next);
                             }
+                            if let Some(shared) = &spare {
+                                for worker_id in spawned..next {
+                                    spawn(&mut workers, worker_id, shared);
+                                }
+                            }
+                            spawned = spawned.max(next);
                         }
-                        tracing::info!("Going on with {} connection(s)", next);
-                    }
-                    if let Some(done) = ramp.as_ref().filter(|ramp| ramp.done) {
-                        if let Some(best) = done.settled {
-                            hosts::record_best_connections(&reference.final_url, best);
+                        let now = pilot.why();
+                        if why.as_ref() != Some(&now) {
+                            tracing::info!("Autopilot: {}", now);
+                            why = Some(now);
                         }
-                        (ramp, spare) = (None, None);
+                        if pilot.done {
+                            if let Some(best) = pilot.settled {
+                                hosts::record_settled(&reference.final_url, best, pilot.limit());
+                            }
+                            spare = None;
+                        }
                     }
                     if last_persist.elapsed() >= PERSIST_INTERVAL {
                         if let Err(e) = job.persist().await {
@@ -2867,7 +2889,10 @@ impl DownloadEngine {
         // Probes still out are given up, and the host slots they hold with them.
         drop((events, late, spare));
         while workers.join_next().await.is_some() {}
-        // What this download learned of its hosts, for the next run too.
+        // What this download learned of its hosts and the line, for the next run too.
+        if let Some(pilot) = pilot.filter(|_| outcome.is_ok()) {
+            hosts::record_line(pilot.best);
+        }
         let _ = blocking(hosts::save).await;
 
         match outcome {
@@ -3745,16 +3770,21 @@ impl RangeJob {
         }
     }
 
-    /// The width `ramp` moves an adaptive download to, if it moves (see [`Ramp::next`]); call it
-    /// every few hundred milliseconds.
-    fn ramp(&self, ramp: &mut Ramp) -> Option<usize> {
+    /// The width `pilot` moves an adaptive download from `url` to, if it moves (see
+    /// [`Autopilot::next`]); call it every few hundred milliseconds.
+    fn steer(&self, pilot: &mut Autopilot, url: &Url) -> Option<usize> {
         let (downloaded, size) = {
             let chunks = self.chunks.lock();
-            (chunks.total_downloaded(), chunks.total_size())
+            (chunks.total_received(), chunks.total_size())
         };
         // What a new request takes to answer: the least of the mirrors in use.
-        let startup = self.mirrors.lock().mirrors().iter().filter(|m| m.in_flight > 0).map(crate::mirror::Mirror::ttfb).min();
-        ramp.next(Instant::now(), downloaded, size.saturating_sub(downloaded), startup.unwrap_or_default())
+        let (startup, mirrors) = {
+            let racer = self.mirrors.lock();
+            (racer.mirrors().iter().filter(|m| m.in_flight > 0).map(crate::mirror::Mirror::ttfb).min(), racer.mirrors().len())
+        };
+        // Other mirrors' hosts have room of their own.
+        let cap = hosts::profile(url).connection_cap.filter(|_| mirrors == 1);
+        pilot.next(Instant::now(), downloaded, size.saturating_sub(downloaded), startup.unwrap_or_default(), cap)
     }
 
     /// Adds the mirror a probe that came in after the download started found, if it serves the
@@ -3850,76 +3880,6 @@ impl SpeedMeter {
             self.last_at = now;
         }
         self.speed
-    }
-}
-
-/// Grows a download's connections one at a time while each one more raises its speed by
-/// `RAMP_GAIN`, and takes back the last one when the download slowed after it came: the server
-/// or the link has more connections then than it serves well (see `DownloadOptions::adaptive`).
-/// Speeds are measured over windows of `RAMP_STARTUPS` times what a new request takes to answer;
-/// the first window, which the connections spend starting, is not compared.
-struct Ramp {
-    width: usize,
-    max: usize,
-    /// When the window being measured began, and the bytes downloaded then.
-    began: (Instant, u64),
-    /// How fast the last window went, in bytes per second.
-    speed: Option<f64>,
-    /// How fast the window before the connection on trial went.
-    trial: Option<f64>,
-    /// No more connections are tried: the last did not pay, or too little is left to try one.
-    done: bool,
-    /// The width the download goes fastest at, once found: the last one slowed it or did not
-    /// pay, or `max` was reached. Not when too little was left to try one more.
-    settled: Option<usize>,
-}
-
-impl Ramp {
-    fn new(width: usize, max: usize, now: Instant, downloaded: u64) -> Self {
-        Self { width, max, began: (now, downloaded), speed: None, trial: None, done: width >= max, settled: None }
-    }
-
-    /// The width to go on at, when it changes, with `downloaded` bytes in at `now` and `left` to
-    /// come; `startup` is what a new request takes to answer.
-    fn next(&mut self, now: Instant, downloaded: u64, left: u64, startup: Duration) -> Option<usize> {
-        let window = startup.saturating_mul(RAMP_STARTUPS).clamp(MIN_RAMP_WINDOW, MAX_RAMP_WINDOW);
-        let (began, from) = self.began;
-        let elapsed = now.saturating_duration_since(began);
-        if elapsed < window {
-            return None;
-        }
-        self.began = (now, downloaded);
-        let speed = downloaded.saturating_sub(from) as f64 / elapsed.as_secs_f64();
-        let first = self.speed.replace(speed).is_none();
-        if self.done || first {
-            return None;
-        }
-        if let Some(before) = self.trial.take() {
-            if speed < before {
-                self.done = true;
-                self.width -= 1;
-                self.settled = Some(self.width);
-                return Some(self.width);
-            }
-            if speed < before * RAMP_GAIN {
-                self.done = true;
-                self.settled = Some(self.width);
-                return None;
-            }
-        }
-        // Nothing moved: nothing to compare one more with.
-        if speed <= 0.0 {
-            return None;
-        }
-        // One more, if it has the time to show what it brings.
-        if self.width >= self.max || (left as f64) < 3.0 * speed * window.as_secs_f64() {
-            self.done = true;
-            self.settled = (self.width >= self.max).then_some(self.width);
-            return None;
-        }
-        self.trial = Some(speed);
-        self.width += 1;
-        Some(self.width)
     }
 }
 
@@ -8409,45 +8369,117 @@ mod tests {
         assert!(adapted_peak > 5, "{adapted_peak}");
     }
 
-    /// A ramp measures windows of four times a new request's startup, the first of them only to
-    /// start from; adds a connection while each one more raised the speed by a tenth, up to its
-    /// most; keeps one that did not raise it enough, and takes back one after which the speed
-    /// fell; and adds none with too little left for one to show what it brings.
-    #[test]
-    fn test_a_ramp_adds_connections_while_they_pay() {
-        const MB: u64 = 1_000_000;
-        let t0 = Instant::now();
-        let at = |ms: u64| t0 + Duration::from_millis(ms);
-        let (left, startup) = (100 * MB, Duration::from_millis(100));
+    /// Downloads `url` (a [`crate::netsim`] server's) with `options`, within a minute: the file, and
+    /// what the Autopilot said last.
+    async fn fetch_from_sim(url: &Url, options: DownloadOptions) -> (Vec<u8>, Option<String>) {
+        let (tx, mut rx) = broadcast::channel::<EngineSnapshot>(16);
+        let engine = DownloadEngine::new(vec![url.clone()], DownloadOptions { remote_checksum: false, ..options });
+        let mut said = None;
+        let listen = async {
+            loop {
+                match rx.recv().await {
+                    Ok(snapshot) => said = snapshot.autopilot.or(said.take()),
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        };
+        let both = tokio::time::timeout(Duration::from_secs(60), async { tokio::join!(engine.run(Some(tx)), listen) });
+        let (path, ()) = both.await.expect("finished in a minute");
+        (std::fs::read(path.unwrap()).unwrap(), said)
+    }
 
-        let mut ramp = Ramp::new(2, 4, t0, 0);
-        assert_eq!(ramp.next(at(400), MB, left, startup), None, "windows are at least 500 ms");
-        assert_eq!(ramp.next(at(500), MB, left, startup), None, "the first window is the start");
-        assert_eq!(ramp.next(at(1000), 2 * MB, left, startup), Some(3));
-        assert_eq!(ramp.next(at(1500), 3_500_000, left, startup), Some(4), "+50%");
-        assert_eq!(ramp.next(at(2000), 5_500_000, left, startup), None, "never past its most");
-        assert_eq!((ramp.done, ramp.settled), (true, Some(4)));
+    fn sim_options(dir: &Path, connections: usize, adaptive: bool) -> DownloadOptions {
+        DownloadOptions { output_path: Some(dir.join("f.bin")), num_connections: connections, adaptive, ..Default::default() }
+    }
 
-        let mut ramp = Ramp::new(2, 8, t0, 0);
-        ramp.next(at(500), MB, left, startup);
-        assert_eq!(ramp.next(at(1000), 2 * MB, left, startup), Some(3));
-        assert_eq!(ramp.next(at(1500), 3_050_000, left, startup), None, "+5%: kept, and no more tried");
-        assert_eq!((ramp.done, ramp.settled), (true, Some(3)));
+    /// Records that one connection to `url`'s host keeps to `rate`, as the probe's watch finds when
+    /// its looks are timed well, which a busy test machine does not promise.
+    fn one_connection_went_at(url: &Url, rate: f64) {
+        hosts::record(url, HostProfile { capped_per_connection: Some(true), connection_rate: Some(rate), ..Default::default() });
+    }
 
-        let mut ramp = Ramp::new(2, 8, t0, 0);
-        ramp.next(at(500), MB, left, startup);
-        assert_eq!(ramp.next(at(1000), 2 * MB, left, startup), Some(3));
-        assert_eq!(ramp.next(at(1500), 2_500_000, left, startup), Some(2), "slower: taken back");
-        assert_eq!(ramp.next(at(5000), 9 * MB, left, startup), None, "for good");
-        assert_eq!(ramp.settled, Some(2));
+    /// A server that holds each user to 2 MB/s, however many connections: one connection already
+    /// went that fast alone, so the Autopilot comes down from all it may open to one, says why, and
+    /// keeps it and the speed for the site.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_the_autopilot_comes_down_to_one_connection_under_a_cap_for_each_user() {
+        let size = 8 * 1024 * 1024;
+        let (url, _) = crate::netsim::serve(crate::netsim::Server { size, per_client: Some(2e6), ..Default::default() }).await;
+        one_connection_went_at(&url, 2e6);
+        let dir = tempdir().unwrap();
+        let (got, said) = fetch_from_sim(&url, sim_options(dir.path(), 16, true)).await;
+        assert!(got == crate::netsim::file(size));
+        let said = said.unwrap();
+        assert!(said.starts_with("1 connection: the server or your line holds it to about "), "{said}");
+        assert_eq!(hosts::best_connections(&url), Some(1));
+        assert!(hosts::limit(&url).is_some_and(|limit| (1.5e6..2.5e6).contains(&limit)), "{:?}", hosts::limit(&url));
+    }
 
-        let slow = Duration::from_secs(1);
-        let mut ramp = Ramp::new(1, 8, t0, 0);
-        assert_eq!(ramp.next(at(3999), MB, left, slow), None, "four startups make a window");
-        ramp.next(at(4000), MB, left, slow);
-        assert_eq!(ramp.next(at(8000), 2 * MB, 2 * MB, slow), None, "2 MB left at 250 kB/s");
-        assert_eq!((ramp.done, ramp.settled), (true, None), "no width found to go by");
-        assert!(Ramp::new(8, 8, t0, 0).done, "nothing to add");
+    /// A server that caps each connection at 256 KB/s: seen to, the download opens all it may at
+    /// once, and keeps them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_the_autopilot_keeps_many_connections_under_a_cap_on_each() {
+        let size = 6 * 1024 * 1024;
+        let (url, _) = crate::netsim::serve(crate::netsim::Server { size, per_connection: Some(256e3), ..Default::default() }).await;
+        one_connection_went_at(&url, 256e3);
+        let dir = tempdir().unwrap();
+        let (got, said) = fetch_from_sim(&url, sim_options(dir.path(), 16, true)).await;
+        assert!(got == crate::netsim::file(size));
+        assert_eq!(said.as_deref(), Some("16 connections: the most it may open"));
+        assert_eq!(hosts::best_connections(&url), Some(16));
+        assert_eq!(hosts::peak(&url), 16);
+    }
+
+    /// A server that serves three connections at once and refuses more with 429: the download
+    /// keeps under it, and the next one from the site starts there, refused no more.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_refusing_servers_ceiling_is_kept_to_and_remembered() {
+        let size = 8 * 1024 * 1024;
+        let sim = crate::netsim::Server { size, per_connection: Some(512e3), max_connections: Some(3), refusal: (429, Some(1)), ..Default::default() };
+        let (url, stats) = crate::netsim::serve(sim).await;
+        let dir = tempdir().unwrap();
+        let (got, said) = fetch_from_sim(&url, sim_options(dir.path(), 8, true)).await;
+        assert!(got == crate::netsim::file(size));
+        let refused = stats.refused.load(Ordering::SeqCst);
+        assert!(refused >= 1, "{said:?}");
+        // A connection the download cut may hold the server's count a moment longer than its own.
+        let cap = hosts::profile(&url).connection_cap;
+        assert!(cap.is_some_and(|cap| (2..=3).contains(&cap)), "{said:?} {cap:?} {refused} {:?}", hosts::best_connections(&url));
+        assert!(hosts::best_connections(&url).is_some_and(|best| best <= 3), "{said:?}");
+
+        let again = tempdir().unwrap();
+        let (got, _) = fetch_from_sim(&url, sim_options(again.path(), 8, true)).await;
+        assert!(got == crate::netsim::file(size));
+        assert_eq!(stats.refused.load(Ordering::SeqCst), refused, "refused no more");
+    }
+
+    /// A connection that slows to a trickle, with no other to compare it with, makes way for a new
+    /// one within two of its windows, long before it would stall (30 s here) or the trickle end.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_connection_slowing_down_is_replaced_before_it_stalls() {
+        let size = 3 * 1024 * 1024;
+        let decay = crate::netsim::Decay { from: 1024 * 1024, full: 512 * 1024, rate: 8e3, every: Duration::from_secs(10) };
+        let (url, stats) = crate::netsim::serve(crate::netsim::Server { size, decay: Some(decay), ..Default::default() }).await;
+        let dir = tempdir().unwrap();
+        let started = Instant::now();
+        let (got, _) = fetch_from_sim(&url, sim_options(dir.path(), 1, false)).await;
+        assert!(got == crate::netsim::file(size));
+        assert!(started.elapsed() < Duration::from_secs(20), "{:?}", started.elapsed());
+        assert!(stats.gets.load(Ordering::SeqCst) >= 3, "the probe's, the slowing one's, and its replacement's");
+    }
+
+    /// A count the user fixed is left alone: all four connections, whatever the server's cap.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_fixed_connection_count_is_left_alone() {
+        let size = 4 * 1024 * 1024;
+        let (url, _) = crate::netsim::serve(crate::netsim::Server { size, per_client: Some(4e6), ..Default::default() }).await;
+        let dir = tempdir().unwrap();
+        let (got, said) = fetch_from_sim(&url, sim_options(dir.path(), 4, false)).await;
+        assert!(got == crate::netsim::file(size));
+        assert_eq!(said.as_deref(), Some("Off: keeps the 4 connections it started with"));
+        assert_eq!(hosts::peak(&url), 4);
+        assert_eq!(hosts::best_connections(&url), None);
     }
 
     /// A local server answering each request with what `reply` makes of its head (lowercased): a

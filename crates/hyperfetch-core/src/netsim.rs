@@ -148,35 +148,47 @@ async fn answer(mut socket: tokio::net::TcpStream, server: Arc<Server>, stats: A
     let cut = server.cut.filter(|&(from, _)| first(from, &stats.cut)).map(|(_, after)| after);
     let own = server.per_connection.map(|rate| RateLimiter::new(rate as u64));
     let (mut sent, mut slowed) = (0, None);
+    let (mut from_client, mut to_client) = socket.split();
     for offset in (start..=end).step_by(PIECE) {
         let piece: Vec<u8> = (offset..=end.min(offset + PIECE - 1)).map(byte).collect();
         if cut.is_some_and(|after| sent >= after) {
             return;
         }
-        match decay.filter(|decay| sent >= decay.full) {
-            Some(decay) => {
-                let since = *slowed.get_or_insert_with(tokio::time::Instant::now);
-                let rate = decay.rate / 2f64.powf(since.elapsed().as_secs_f64() / decay.every.as_secs_f64());
-                if rate < 1024.0 {
-                    tokio::time::sleep(HOLD).await;
-                    return;
+        let pace = async {
+            match decay.filter(|decay| sent >= decay.full) {
+                Some(decay) => {
+                    let since = *slowed.get_or_insert_with(tokio::time::Instant::now);
+                    let rate = decay.rate / 2f64.powf(since.elapsed().as_secs_f64() / decay.every.as_secs_f64());
+                    tokio::time::sleep(if rate < 1024.0 { HOLD } else { Duration::from_secs_f64(piece.len() as f64 / rate) }).await;
+                    rate >= 1024.0
                 }
-                tokio::time::sleep(Duration::from_secs_f64(piece.len() as f64 / rate)).await;
+                None => {
+                    if let Some(own) = &own {
+                        own.acquire(piece.len() as u64).await;
+                    }
+                    if let Some(shared) = &shared {
+                        shared.acquire(piece.len() as u64).await;
+                    }
+                    true
+                }
             }
-            None => {
-                if let Some(own) = &own {
-                    own.acquire(piece.len() as u64).await;
-                }
-                if let Some(shared) = &shared {
-                    shared.acquire(piece.len() as u64).await;
-                }
-            }
-        }
-        if socket.write_all(&piece).await.is_err() {
+        };
+        // A connection the client closed stops counting at once, as with servers that watch for it.
+        let paced = tokio::select! {
+            paced = pace => paced,
+            _ = closed(&mut from_client) => false,
+        };
+        if !paced || to_client.write_all(&piece).await.is_err() {
             return;
         }
         sent += piece.len();
     }
+}
+
+/// Once the client closes its side: it sends nothing after its request.
+async fn closed(from_client: &mut tokio::net::tcp::ReadHalf<'_>) {
+    let mut byte = [0u8; 1];
+    while let Ok(1..) = from_client.read(&mut byte).await {}
 }
 
 /// The caps of a [`Server`] as numbers: what `width` connections bring together, in bytes per
@@ -196,7 +208,7 @@ pub(crate) struct Model {
 
 impl Default for Model {
     fn default() -> Self {
-        Self { per_connection: f64::INFINITY, per_client: f64::INFINITY, line: f64::INFINITY, max_connections: usize::MAX, noise: 0.05, seed: 0x9E37_79B9_7F4A_7C15 }
+        Self { per_connection: f64::INFINITY, per_client: f64::INFINITY, line: f64::INFINITY, max_connections: usize::MAX, noise: 0.04, seed: 0x9E37_79B9_7F4A_7C15 }
     }
 }
 
