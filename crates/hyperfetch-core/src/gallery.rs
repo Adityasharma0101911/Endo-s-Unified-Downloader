@@ -40,7 +40,10 @@ pub fn handles(url: &Url) -> bool {
     let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
     let pinterest = host.split('.').any(|label| label == "pinterest") || host == "pin.it";
     let reddit_gallery = on(url, "reddit.com") && url.path().starts_with("/gallery/");
-    !is_file && (SITES.iter().any(|site| on(url, site)) || pinterest || reddit_gallery)
+    // Bunkr and Cyberdrop move between domains (bunkr.cr, bunkr.si, cyberdrop.me, ...).
+    let file_host = host.split('.').any(|label| matches!(label, "bunkr" | "bunkrr" | "cyberdrop"));
+    let catbox_album = on(url, "catbox.moe") && url.path().starts_with("/c/");
+    !is_file && (SITES.iter().any(|site| on(url, site)) || pinterest || reddit_gallery || file_host || catbox_album)
 }
 
 /// Whether `url` is an X/Twitter or Reddit post, which goes to gallery-dl when yt-dlp finds no
@@ -312,11 +315,19 @@ mod tests {
             "https://e621.net/posts/1",
             "https://bsky.app/profile/me.bsky.social/post/1",
             "https://www.reddit.com/gallery/abc",
+            "https://bunkr.cr/a/AbC123",
+            "https://bunkr.si/f/AbC123",
+            "https://cyberdrop.me/a/AbC123",
+            "https://catbox.moe/c/abc123",
         ] {
             assert!(handles(&url(yes)), "{yes}");
         }
         for no in [
             "https://i.imgur.com/AbC.jpg",
+            "https://files.catbox.moe/abc123.zip",
+            "https://litter.catbox.moe/abc123.png",
+            "https://catbox.moe/user/view.php",
+            "https://bunkr.cr/videos/clip.mp4",
             "https://64.media.tumblr.com/x/s1280x1920/y.png",
             "https://www.reddit.com/r/pics/comments/abc/title/",
             "https://notimgur.com/a/AbC",
