@@ -1,6 +1,10 @@
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
+use std::time::Duration;
 use url::Url;
+
+/// Largest Metalink a server's `Link` header points to that is read.
+const MAX_DESCRIBED: usize = 1 << 20;
 
 #[derive(Debug, Clone)]
 pub struct MetalinkFile {
@@ -58,6 +62,27 @@ fn safe_path(name: &str) -> Result<String, String> {
         return Err(unsafe_name());
     }
     Ok(parts.join("/"))
+}
+
+/// The file of `size` bytes, or the only one, that the Metalink at `url` describes: the one a
+/// server's `Link: rel=describedby` names (RFC 6249). None when it is not read within `wait`, is
+/// larger than 1 MiB or lists no such file.
+pub(crate) async fn described(client: &reqwest::Client, url: &Url, size: Option<u64>, wait: Duration) -> Option<MetalinkFile> {
+    let fetched = async {
+        let mut response = client.get(url.clone()).send().await.ok()?.error_for_status().ok()?;
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.ok()? {
+            body.extend_from_slice(&chunk);
+            if body.len() > MAX_DESCRIBED {
+                return None;
+            }
+        }
+        String::from_utf8(body).ok()
+    };
+    let text = tokio::time::timeout(wait, fetched).await.ok().flatten()?;
+    let files = parse_metalink(&text).ok()?;
+    let only = files.len() == 1;
+    files.into_iter().find(|f| only || (f.size.is_some() && f.size == size))
 }
 
 /// Parses RFC 5854 (.meta4) and Metalink 3.0 (.metalink) XML documents.
