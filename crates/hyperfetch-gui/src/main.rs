@@ -1139,6 +1139,7 @@ impl App {
         }
         let Some(item) = self.queue.get_item(id) else { return false };
         let (urls, mut options, folder) = (item.urls.clone(), item.options.clone(), util::folder_to_create(item));
+        options.priority = item.priority;
         options.install_ffmpeg = self.settings.install_ffmpeg == Some(true);
         self.settings.fill_keys(&mut options);
         if options.post.sort {

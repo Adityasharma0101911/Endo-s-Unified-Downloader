@@ -47,6 +47,8 @@ pub(crate) const POOL_MAX_IDLE: usize = 64;
 /// Longest a range worker waits between body reads (the stall timeout, if shorter): its retry
 /// keeps what arrived and starts at once, so a connection gone quiet is best replaced soon.
 const BODY_IDLE: Duration = Duration::from_secs(5);
+/// Seconds left at its speed under which a download sharing a speed limit gets a little more of it.
+const NEARLY_DONE_SECS: f64 = 5.0;
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Bound on one mirror's probe (each time a busy server is probed again): HEAD, the ranged GET's
 /// tries and the pauses between them.
@@ -225,6 +227,10 @@ pub struct DownloadOptions {
     pub ytdlp_path: Option<PathBuf>,
     /// Global download speed cap in bytes/sec across all connections (None = unlimited).
     pub max_speed: Option<u64>,
+    /// The download's part of a `max_speed` it shares with others (see `sharing_limit`): a High
+    /// one's is twice a Normal's, a Low one's half. Not saved: the queue sets it at each start.
+    #[serde(skip)]
+    pub priority: crate::queue::Priority,
     /// Failed attempts allowed per chunk before the download fails. Attempts that made progress don't count.
     pub max_retries: u32,
     /// Seconds without receiving a byte before a connection is treated as stalled and retried.
@@ -439,6 +445,7 @@ impl Default for DownloadOptions {
             post: Default::default(),
             // Measured on local servers, it made no download faster: see `bench_downloads_from_a_local_server`.
             adaptive: false,
+            priority: Default::default(),
             max_filesize: None,
             remote_time: false,
             remote_checksum: true,
@@ -666,11 +673,17 @@ impl DownloadEngine {
     }
 
     /// Holds the download to the limit `limits` keeps for its `max_speed`, together with the other
-    /// downloads there, instead of to a limit of its own. A download without a limit ignores it.
+    /// downloads there, instead of to a limit of its own: it takes a share of it by its `priority`
+    /// (see [`RateLimiter::share`]). A download without a limit ignores it.
     pub fn sharing_limit(mut self, limits: &SharedLimits) -> Self {
         if let Some(speed) = self.options.max_speed.filter(|&s| s > 0) {
-            let shared = Arc::clone(limits.0.lock().entry(speed).or_insert_with(|| Arc::new(RateLimiter::new(speed))));
-            self.limiter = Some(shared);
+            let whole = Arc::clone(limits.0.lock().entry(speed).or_insert_with(|| Arc::new(RateLimiter::new(speed))));
+            let weight = match self.options.priority {
+                crate::queue::Priority::High => 4,
+                crate::queue::Priority::Normal => 2,
+                crate::queue::Priority::Low => 1,
+            };
+            self.limiter = Some(RateLimiter::share(&whole, weight));
         }
         self
     }
@@ -2846,6 +2859,10 @@ impl DownloadEngine {
                 },
                 _ = tick.tick() => {
                     emit(snapshot_tx, || EngineSnapshot { autopilot: why.clone(), ..job.snapshot(size, &mut meter, final_path) });
+                    if let Some(limiter) = &self.limiter {
+                        let left = size.saturating_sub(job.chunks.lock().total_downloaded());
+                        limiter.nearly_done((left as f64) < meter.speed * NEARLY_DONE_SECS);
+                    }
                     if let Some(pilot) = pilot.as_mut().filter(|pilot| !pilot.done) {
                         if let Some(next) = job.steer(pilot, &reference.final_url) {
                             // Workers past a lower width hand back what they have yet to receive.
@@ -8387,6 +8404,31 @@ mod tests {
         let both = tokio::time::timeout(Duration::from_secs(60), async { tokio::join!(engine.run(Some(tx)), listen) });
         let (path, ()) = both.await.expect("finished in a minute");
         (std::fs::read(path.unwrap()).unwrap(), said)
+    }
+
+    /// Two downloads under one 1 MB/s limit: the High one gets four times the Low one's part, so it
+    /// is done in about 2 s, well before the Low one, which then has the limit to itself. Served
+    /// first come first served, both would take about 3 s.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_downloads_share_a_speed_limit_by_priority() {
+        let size = 1536 * 1024;
+        let (url, _) = crate::netsim::serve(crate::netsim::Server { size, ..Default::default() }).await;
+        let (dir, limits) = (tempdir().unwrap(), SharedLimits::default());
+        let run = |name: &str, priority| {
+            let output_path = Some(dir.path().join(name));
+            let options = DownloadOptions { output_path, num_connections: 4, max_speed: Some(1_000_000), priority, remote_checksum: false, ..Default::default() };
+            let engine = DownloadEngine::new(vec![url.clone()], options).sharing_limit(&limits);
+            async move {
+                let started = Instant::now();
+                engine.run(None).await.unwrap();
+                started.elapsed()
+            }
+        };
+        let both = async { tokio::join!(run("high.bin", crate::queue::Priority::High), run("low.bin", crate::queue::Priority::Low)) };
+        let (high, low) = tokio::time::timeout(Duration::from_secs(60), both).await.expect("finished in a minute");
+        assert!(high.as_secs_f64() < 0.75 * low.as_secs_f64(), "{high:?} {low:?}");
+        // 3 MiB in all at 1 MB/s, less a second of credit.
+        assert!(low > Duration::from_millis(2500), "{low:?}");
     }
 
     fn sim_options(dir: &Path, connections: usize, adaptive: bool) -> DownloadOptions {

@@ -896,8 +896,8 @@ fn queue_row(app: &App, ui: &mut Ui, line: &Line, action: &mut Option<(usize, Ro
         status_chip(ui, item_id, status, color, downloading && !waiting && seen);
         left_part(ui, (actions.len() + usize::from(tracks) + 1) as f32 * 30.0, |ui| {
             let mark = match item.priority {
-                Priority::High => Some((icon::CARET_DOUBLE_UP, p.amber, "High priority: starts before the other waiting downloads")),
-                Priority::Low => Some((icon::CARET_DOUBLE_DOWN, p.dim, "Low priority: starts after the other waiting downloads")),
+                Priority::High => Some((icon::CARET_DOUBLE_UP, p.amber, "High priority: starts before the other waiting downloads, and gets more of a speed limit")),
+                Priority::Low => Some((icon::CARET_DOUBLE_DOWN, p.dim, "Low priority: starts after the other waiting downloads, and gets less of a speed limit")),
                 Priority::Normal => None,
             };
             if let Some((glyph, color, tip)) = mark {
