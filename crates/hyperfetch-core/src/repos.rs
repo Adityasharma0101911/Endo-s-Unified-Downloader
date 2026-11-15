@@ -1,8 +1,9 @@
-//! Code and model repositories (GitHub, Hugging Face, Civitai): their folders, releases and
-//! models read into one task per file, a repository itself into its default branch's zip.
+//! Code and model repositories (GitHub, Hugging Face, Civitai) and the Internet Archive: their
+//! folders, releases, models and items read into one task per file, a repository itself into its
+//! default branch's zip.
 //!
 //! The files download from the service's own host the user typed (github.com, huggingface.co,
-//! civitai.com), so the Authorization header the user gave goes with them there and nowhere
+//! civitai.com, archive.org), so the Authorization header the user gave goes with them there and nowhere
 //! else. A listing is read with the Authorization a paste gave its link (a `ghp_`/`hf_` token, say), sent
 //! to that service's API alone, so a private or gated repository can be listed; without one it cannot.
 
@@ -24,6 +25,11 @@ const GITHUB: &str = "https://github.com";
 const GITHUB_API: &str = "https://api.github.com";
 const HUGGING_FACE: &str = "https://huggingface.co";
 const CIVITAI: &str = "https://civitai.com";
+const ARCHIVE: &str = "https://archive.org";
+
+/// Formats of the files archive.org makes of an item for itself (its records, thumbnail and
+/// tile), which it lists as the item's own.
+const ARCHIVE_OWN_FORMATS: &[&str] = &["Metadata", "JPEG Thumb", "Item Image"];
 
 /// Most path segments a GitHub ref with slashes in it (`feature/x`) is tried with.
 const MAX_REF_PARTS: usize = 4;
@@ -62,6 +68,8 @@ enum Repo {
     HuggingFace { kind: &'static str, repo: String, rev: String, path: Vec<String> },
     /// civitai.com/models/{id}[?modelVersionId={version}]
     Civitai { model: u64, version: Option<u64> },
+    /// archive.org/details/{item}, /download/{item}, or a folder of it, /download/{item}/{path}/.
+    Archive { item: String, path: Vec<String> },
 }
 
 fn repo_of(url: &Url) -> Option<Repo> {
@@ -111,11 +119,17 @@ fn repo_of(url: &Url) -> Option<Repo> {
             }
             _ => None,
         },
+        "archive.org" | "www.archive.org" => match segs[..] {
+            ["details" | "download", item] => Some(Repo::Archive { item: item.to_string(), path: Vec::new() }),
+            // A file's link names no folder: only a folder's ends in a slash.
+            ["download", item, ref path @ ..] if url.path().ends_with('/') => Some(Repo::Archive { item: item.to_string(), path: owned(path) }),
+            _ => None,
+        },
         _ => None,
     }
 }
 
-/// Whether `url` is a repository, folder, release or model link [`list`] reads.
+/// Whether `url` is a repository, folder, release, model or item link [`list`] reads.
 pub fn lists(url: &Url) -> bool {
     repo_of(url).is_some()
 }
@@ -130,7 +144,8 @@ pub async fn list(http: &reqwest::Client, url: &Url, auth: Option<&str>) -> Resu
         Some(Repo::GitHubRelease { owner, repo, tag }) => github_release(http, auth, GITHUB_API, &owner, &repo, tag.as_deref()).await?,
         Some(Repo::HuggingFace { kind, repo, rev, path }) => hugging_face(http, auth, HUGGING_FACE, kind, &repo, &rev, &path).await?,
         Some(Repo::Civitai { model, version }) => civitai(http, auth, CIVITAI, model, version).await?,
-        None => return Err(format!("{} is not a repository, folder, release or model link", url)),
+        Some(Repo::Archive { item, path }) => archive(http, auth, ARCHIVE, &item, &path).await?,
+        None => return Err(format!("{} is not a repository, folder, release, model or item link", url)),
     };
     if tasks.is_empty() {
         return Err("the link holds no files the app can download".to_string());
@@ -138,9 +153,10 @@ pub async fn list(http: &reqwest::Client, url: &Url, auth: Option<&str>) -> Resu
     Ok(tasks)
 }
 
-/// Whether `url` is a repository link [`resolve`] takes (a folder's says it must be listed).
+/// Whether `url` is a repository link [`resolve`] takes (a folder's says it must be listed). An
+/// archive.org item's page is not: as one download it goes on as any page does (to yt-dlp).
 pub fn handles(url: &Url) -> bool {
-    repo_of(url).is_some()
+    repo_of(url).is_some_and(|repo| !matches!(repo, Repo::Archive { .. }))
 }
 
 /// Where the zip of the GitHub repository link `url` downloads from.
@@ -444,6 +460,57 @@ async fn civitai(http: &reqwest::Client, auth: Option<&str>, api: &str, model: u
         .collect())
 }
 
+/// One field of an archive.org item's metadata: `{"result": ...}`, `{"error": ...}` when there is
+/// no such item.
+#[derive(Deserialize)]
+struct ArchiveField<T> {
+    result: Option<T>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct ArchiveFile {
+    name: String,
+    /// "original" for an uploaded file, "derivative" for one made of it, "metadata" for records.
+    source: String,
+    format: String,
+    /// A number, written as a string.
+    size: Option<String>,
+    md5: String,
+    sha1: String,
+    /// "true" for a file lent or kept to signed-in readers.
+    private: Option<String>,
+}
+
+/// Every file uploaded to archive.org's `item` (not the copies archive.org made of them, nor its
+/// own records), under `path` in it, subfolders kept, each a task for its /download/ link with
+/// its size and SHA-1 (else MD5).
+async fn archive(http: &reqwest::Client, auth: Option<&str>, base: &str, item: &str, path: &[String]) -> Result<Vec<Task>, String> {
+    let url = url_at(base, ["metadata", item, "files"])?;
+    let missing = || format!("archive.org has no item {} (or it is dark)", item);
+    let answer = fetch(http.get(url), auth, "archive.org").await?.ok_or_else(missing)?;
+    let files = json::<ArchiveField<Vec<ArchiveFile>>>(answer, "archive.org").await?.result.ok_or_else(missing)?;
+    let prefix = path.join("/");
+    let folder = component(path.last().map_or(item, String::as_str), item)?;
+    let mut tasks = Vec::new();
+    for file in files {
+        if file.source != "original" || ARCHIVE_OWN_FORMATS.contains(&file.format.as_str()) || file.private.as_deref() == Some("true") {
+            continue;
+        }
+        let inside = if prefix.is_empty() { Some(file.name.as_str()) } else { file.name.strip_prefix(&prefix).and_then(|p| p.strip_prefix('/')) };
+        let Some(name) = inside.and_then(relative) else { continue };
+        tasks.push(Task {
+            urls: vec![url_at(base, ["download", item].into_iter().chain(file.name.split('/')))?],
+            name: Some(name),
+            folder: Some(folder.clone()),
+            size: file.size.and_then(|size| size.parse().ok()),
+            checksum: checksum("sha1", &file.sha1).or_else(|| checksum("md5", &file.md5)),
+            ..Task::default()
+        });
+    }
+    Ok(tasks)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -681,6 +748,59 @@ mod tests {
         assert!(civitai(&http(), None, &api, 8, None).await.unwrap_err().contains("no model 8"));
     }
 
+    fn archive_api(path: &str, _: Option<crate::range::ByteRange>) -> Reply {
+        match path {
+            // As archive.org answers (sizes as strings), its own files and derived copies among them.
+            "/metadata/item/files" => json_reply(
+                r#"{"result":[
+                    {"name":"__ia_thumb.jpg","source":"original","size":"5399","format":"JPEG Thumb","md5":"f2d804af1cdc63b13db38474ba26c5bb"},
+                    {"name":"globe west.jpg","source":"original","size":"66065","format":"JPEG","md5":"9366a4b09386bf673c447e33d806d904","sha1":"3e20a009994405f535cdf07cdc2974cef2fce8f2"},
+                    {"name":"globe west_thumb.jpg","source":"derivative","format":"JPEG Thumb","original":"globe west.jpg","size":"6168"},
+                    {"name":"item_archive.torrent","source":"metadata","format":"Archive BitTorrent","size":"2246"},
+                    {"name":"item_meta.xml","source":"original","format":"Metadata","size":"7105"},
+                    {"name":"item_itemimage.jpg","source":"original","format":"Item Image","size":"38366"},
+                    {"name":"disc 1/track.flac","source":"original","format":"Flac","size":"12","md5":"51a545810bc354a03263332b7654c5fa"},
+                    {"name":"disc 1/lent.pdf","source":"original","format":"Text PDF","private":"true"},
+                    {"name":"disc 10/other.flac","source":"original","format":"Flac"},
+                    {"name":"disc 1/../../evil.exe","source":"original","format":"Unknown"}]}"#,
+            ),
+            _ => json_reply(r#"{"error":"Couldn't locate item 'gone'"}"#),
+        }
+    }
+
+    /// An item is one task per file uploaded to it (not archive.org's copies of them or its own
+    /// records, nor a file lent to signed-in readers), each its /download/ link with its size and
+    /// SHA-1, else MD5; a folder of it, the files under it; an item that does not exist says so.
+    #[tokio::test]
+    async fn archive_items_list_their_original_files() {
+        let (addr, _) = serve(archive_api).await;
+        let base = format!("http://{addr}");
+        let tasks = archive(&http(), None, &base, "item", &[]).await.unwrap();
+        let listed: Vec<_> = tasks.iter().map(|t| (t.urls[0].to_string(), t.name.clone().unwrap(), t.size, t.checksum.clone())).collect();
+        assert_eq!(
+            listed,
+            [
+                (format!("{base}/download/item/globe%20west.jpg"), PathBuf::from("globe west.jpg"), Some(66065), Some("sha1:3e20a009994405f535cdf07cdc2974cef2fce8f2".into())),
+                (format!("{base}/download/item/disc%201/track.flac"), PathBuf::from("disc 1").join("track.flac"), Some(12), Some("md5:51a545810bc354a03263332b7654c5fa".into())),
+                (format!("{base}/download/item/disc%2010/other.flac"), PathBuf::from("disc 10").join("other.flac"), None, None),
+            ]
+        );
+        assert!(tasks.iter().all(|t| t.folder == Some("item".into()) && !t.from_document));
+        let folder = archive(&http(), None, &base, "item", &strings(&["disc 1"])).await.unwrap();
+        assert_eq!(folder.iter().map(|t| (t.folder.clone().unwrap(), t.name.clone().unwrap())).collect::<Vec<_>>(), [(PathBuf::from("disc 1"), PathBuf::from("track.flac"))]);
+        assert!(archive(&http(), None, &base, "gone", &[]).await.unwrap_err().contains("no item gone"));
+        assert_eq!(
+            repo("https://archive.org/details/item"),
+            Some(Repo::Archive { item: "item".into(), path: Vec::new() })
+        );
+        assert_eq!(repo("https://archive.org/download/item/disc%201/"), Some(Repo::Archive { item: "item".into(), path: strings(&["disc 1"]) }));
+        assert_eq!(repo("https://archive.org/download/item/"), Some(Repo::Archive { item: "item".into(), path: Vec::new() }));
+        for other in ["https://archive.org/download/item/disc%201/track.flac", "https://archive.org/details/item/page/n5", "https://web.archive.org/details/item"] {
+            assert_eq!(repo(other), None, "{other}");
+        }
+        assert!(lists(&Url::parse("https://archive.org/details/item").unwrap()) && !handles(&Url::parse("https://archive.org/details/item").unwrap()));
+    }
+
     /// A token pasted with the link goes to the service's API with the listing.
     #[tokio::test]
     async fn a_pasted_token_goes_with_the_listing() {
@@ -729,6 +849,18 @@ mod tests {
         let tasks = live("https://huggingface.co/hf-internal-testing/tiny-random-gpt2").await.unwrap();
         let model = tasks.iter().find(|t| t.name == Some("model.safetensors".into())).unwrap();
         assert!(model.checksum.as_deref().is_some_and(|c| c.starts_with("sha256:")), "{model:?}");
+    }
+
+    /// Live: a small archive.org item lists its uploaded files with their checksums, and none of
+    /// the copies and records archive.org made.
+    #[tokio::test]
+    #[ignore]
+    async fn live_archive_item() {
+        let tasks = live("https://archive.org/details/nasa").await.unwrap();
+        let globe = tasks.iter().find(|t| t.name == Some("globe_west_540.jpg".into())).unwrap();
+        assert_eq!(globe.checksum.as_deref(), Some("sha1:3e20a009994405f535cdf07cdc2974cef2fce8f2"));
+        assert_eq!(globe.size, Some(66065));
+        assert!(tasks.iter().all(|t| !t.name.as_ref().unwrap().to_string_lossy().contains("thumb") && t.name != Some("nasa_meta.xml".into())), "{tasks:?}");
     }
 
     /// Live: a Civitai model lists its newest version's files.
