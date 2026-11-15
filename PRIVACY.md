@@ -26,6 +26,7 @@ The extension finds videos, streams and downloadable links on the pages you visi
 The app stores its settings, queue and download history in its own folder on your computer, along with the names of the sites it downloaded from, how many connections each was fastest with, how many it served at once, the speed it held a download to and whether it speaks HTTP/2 or HTTP/3, and the top speed your internet line reached (all forgotten after 30 days). It connects only to:
 
 - the sites you download from;
+- for a container image, its registry and the token service the registry names (for Docker Hub, `auth.docker.io`), asked for an anonymous pull token that names only the image;
 - for an IPFS link (`ipfs://...`, or a gateway's `/ipfs/...` link), public IPFS gateways (ipfs.io, dweb.link, Pinata, Filebase and 4EVERLAND), which then learn the content address it names;
 - GitHub, to check for and download its own updates, and the tools it uses (yt-dlp and ffmpeg). It also contacts Codeberg for gallery-dl;
 - services you turn on and give your own key for: VirusTotal (it sends only a downloaded file's SHA-256 hash, never the file), Real-Debrid or AllDebrid, and the Google Drive API. An S3 access key you give signs requests only to the S3 storage you download from (Amazon S3, Wasabi, Backblaze B2, DigitalOcean Spaces, R2, or the server you name as its endpoint); its secret is never sent, only signatures made with it.

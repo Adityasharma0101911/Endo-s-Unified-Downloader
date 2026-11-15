@@ -411,6 +411,9 @@ pub struct DownloadOptions {
     /// front ends fill it in each time the download starts.
     #[serde(skip)]
     pub ssh_key: Option<crate::sftp::SshKey>,
+    /// The build of a container image to download (`os/arch[/variant]`, see `crate::oci`); None
+    /// for this machine's Linux build.
+    pub platform: Option<String>,
 }
 
 impl Default for DownloadOptions {
@@ -494,6 +497,7 @@ impl Default for DownloadOptions {
             zsync: None,
             s3: None,
             ssh_key: None,
+            platform: None,
         }
     }
 }
@@ -840,6 +844,11 @@ impl DownloadEngine {
         if self.options.bittorrent {
             let source = self.urls.first().ok_or("No URLs to download")?;
             return self.unless_rerun(crate::p2p::run(source, &self.options, &self.save_dir(), snapshot_tx, self.cancel_token.clone()).await);
+        }
+
+        // A container image into an OCI layout folder (see `crate::oci`).
+        if let Some(image) = self.urls.first().filter(|u| crate::oci::handles(u)) {
+            return self.unless_rerun(crate::oci::run(image, &self.options, &self.save_dir(), snapshot_tx, self.cancel_token.clone()).await);
         }
 
         if self.urls.first().is_some_and(crate::ftp::handles) {
@@ -5512,7 +5521,7 @@ fn lock_path(final_path: &Path) -> PathBuf {
 
 /// Whether an output path names a directory to save into: it ends with a path separator or is
 /// an existing directory.
-fn is_dir_target(path: &Path) -> bool {
+pub(crate) fn is_dir_target(path: &Path) -> bool {
     ends_with_separator(path) || path.is_dir()
 }
 
