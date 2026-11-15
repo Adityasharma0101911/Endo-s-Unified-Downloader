@@ -449,7 +449,7 @@ async fn list_tracks(args: &Args, ui: &Ui, http: &reqwest::Client) -> i32 {
             Err(e) => {
                 failed += 1;
                 ui.error(&format!("[FAILED] {}: {}", link, e));
-                ui.report(item("failed", Some(link), None, None, None, None, Some(&e)));
+                ui.report(item("failed", Some(link), None, None, None, None, Some(&e), None));
             }
         }
     }
@@ -733,7 +733,7 @@ async fn read_tasks(
         }
         for e in &missing {
             ui.error(&format!("[FAILED] {}: {}", truncate(&tokens.join(" "), 60), e));
-            ui.report(item("failed", Some(&tokens.join(" ")), None, None, None, None, Some(e)));
+            ui.report(item("failed", Some(&tokens.join(" ")), None, None, None, None, Some(e), None));
         }
         failed += usize::from(!missing.is_empty());
     }

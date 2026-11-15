@@ -444,7 +444,7 @@ pub struct Args {
     pub config_in_use: Option<PathBuf>,
 
     /// One JSON object per finished item on stdout: {"status": "ok", "failed", "skipped" or
-    /// "up-to-date", "url", "path", "size", "checksum", "checked_against", "error"}; with
+    /// "up-to-date", "url", "path", "size", "checksum", "checked_against", "error", "autopilot"}; with
     /// --list-tracks one per link, with --doctor one. What is printed otherwise goes to stderr
     #[arg(long = "json", conflicts_with_all = ["history", "update", "verify", "preview", "stdout"])]
     pub json: bool,
