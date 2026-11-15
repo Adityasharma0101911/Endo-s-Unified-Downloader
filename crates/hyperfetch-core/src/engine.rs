@@ -407,6 +407,10 @@ pub struct DownloadOptions {
     /// `crate::sigv4`). Never saved: the front ends fill it in each time the download starts.
     #[serde(skip)]
     pub s3: Option<crate::sigv4::S3Key>,
+    /// The private key SFTP servers are signed in to with (see `crate::sftp`). Never saved: the
+    /// front ends fill it in each time the download starts.
+    #[serde(skip)]
+    pub ssh_key: Option<crate::sftp::SshKey>,
 }
 
 impl Default for DownloadOptions {
@@ -489,6 +493,7 @@ impl Default for DownloadOptions {
             delta_from: None,
             zsync: None,
             s3: None,
+            ssh_key: None,
         }
     }
 }
@@ -619,6 +624,8 @@ pub struct DownloadEngine {
     decrypt: Option<Arc<crate::mega::Cipher>>,
     /// How an FTP download's connections are made (see `fetch_ftp`): its ranges go to FTP workers.
     ftp: Option<Arc<crate::ftp::Net>>,
+    /// The same for an SFTP download (see `fetch_sftp`).
+    sftp: Option<Arc<crate::sftp::Net>>,
     /// A file found downloaded already (see `plan_target`): `run` leaves it as it is instead of
     /// post-processing it again.
     already_done: Arc<std::sync::Mutex<Option<PathBuf>>>,
@@ -674,6 +681,7 @@ impl DownloadEngine {
                     cancel_token: CancellationToken::new(),
                     decrypt: None,
                     ftp: None,
+                    sftp: None,
                     already_done: Arc::default(),
                     reused: Arc::default(),
                     site: Arc::default(),
@@ -694,6 +702,7 @@ impl DownloadEngine {
             cancel_token: CancellationToken::new(),
             decrypt: None,
             ftp: None,
+            sftp: None,
             already_done: Arc::default(),
             reused: Arc::default(),
             site: Arc::default(),
@@ -835,6 +844,9 @@ impl DownloadEngine {
 
         if self.urls.first().is_some_and(crate::ftp::handles) {
             return Box::pin(self.fetch_ftp(client, snapshot_tx)).await;
+        }
+        if self.urls.first().is_some_and(crate::sftp::handles) {
+            return Box::pin(self.fetch_sftp(client, snapshot_tx)).await;
         }
 
         if let Some(entry) = &self.options.zip_entry {
@@ -1049,7 +1061,7 @@ impl DownloadEngine {
         if remote.size == Some(size) && dated.is_some_and(|date| date <= modified) {
             return false;
         }
-        if self.ftp.is_some() || self.decrypt.is_some() {
+        if self.ftp.is_some() || self.sftp.is_some() || self.decrypt.is_some() {
             return true;
         }
         let since = http_date(modified);
@@ -1222,6 +1234,38 @@ impl DownloadEngine {
         let probes = futures_util::future::join_all(links.iter().map(probe));
         let (reference, mirrors) = select_mirrors(self.guarded(PROBE_TIMEOUT, "asking the FTP server for the file", probes).await?)?;
         let engine = Self { urls: links, ftp: Some(Arc::new(net)), ..self.clone() };
+        engine.download(client, Probed { reference, mirrors, live: None, late: None }, snapshot_tx).await
+    }
+
+    /// Downloads the file of the engine's sftp:// links (see `crate::sftp`) as [`Self::fetch_ftp`]
+    /// does an FTP one's: the links go on without the logins they carry, which only
+    /// `crate::sftp::Net` keeps.
+    async fn fetch_sftp(&self, client: Client, snapshot_tx: Option<broadcast::Sender<EngineSnapshot>>) -> Result<PathBuf, String> {
+        let (net, links) = crate::sftp::Net::new(&self.options, &self.urls)?;
+        let probe = |url: &Url| {
+            let (net, url) = (&net, url.clone());
+            async move {
+                let (size, last_modified) = net.probe(&url).await?;
+                let size = size.ok_or_else(|| format!("{url}: the SFTP server does not tell the file's size"))?;
+                let filename = extract_filename(std::iter::empty(), &url);
+                Ok(ProbeInfo {
+                    final_url: url.clone(),
+                    url,
+                    size: Some(size),
+                    accepts_ranges: true,
+                    filename,
+                    etag: None,
+                    last_modified,
+                    prefetch: Bytes::new(),
+                    per_setup: None,
+                    answer_time: None,
+                    headers: HeaderMap::new(),
+                })
+            }
+        };
+        let probes = futures_util::future::join_all(links.iter().map(probe));
+        let (reference, mirrors) = select_mirrors(self.guarded(PROBE_TIMEOUT, "asking the SFTP server for the file", probes).await?)?;
+        let engine = Self { urls: links, sftp: Some(Arc::new(net)), ..self.clone() };
         engine.download(client, Probed { reference, mirrors, live: None, late: None }, snapshot_tx).await
     }
 
@@ -2893,11 +2937,12 @@ impl DownloadEngine {
             body_idle: self.stall_timeout().min(BODY_IDLE),
             width: Arc::new(num_workers.into()),
         };
-        // An FTP download's workers fetch over FTP (see `crate::ftp::work`).
+        // An FTP or SFTP download's workers fetch over it (see `crate::ftp::work`).
         let spawn = |workers: &mut JoinSet<()>, worker_id: usize, shared: &WorkerShared| {
-            match &self.ftp {
-                Some(net) => workers.spawn(crate::ftp::work(worker_id, shared.clone(), Arc::clone(net))),
-                None => workers.spawn(HttpWorker::new(worker_id, shared.clone()).run(None)),
+            match (&self.ftp, &self.sftp) {
+                (Some(net), _) => workers.spawn(crate::ftp::work(worker_id, shared.clone(), Arc::clone(net))),
+                (_, Some(net)) => workers.spawn(crate::sftp::work(worker_id, shared.clone(), Arc::clone(net))),
+                _ => workers.spawn(HttpWorker::new(worker_id, shared.clone()).run(None)),
             };
         };
         let mut workers = JoinSet::new();
@@ -3049,7 +3094,7 @@ impl DownloadEngine {
     async fn address_routes(&self, client: &Client, url: &Url) -> Option<Vec<Client>> {
         let o = &self.options;
         let direct = o.no_proxy || (o.proxy.is_none() && o.proxy_pool.is_empty() && !proxy_in_env());
-        let host = url.domain().filter(|_| o.spread_addresses && direct && o.bind_addresses.is_empty() && self.ftp.is_none())?;
+        let host = url.domain().filter(|_| o.spread_addresses && direct && o.bind_addresses.is_empty() && self.ftp.is_none() && self.sftp.is_none())?;
         let addresses = server_addresses(host, url.port_or_known_default().unwrap_or(0), o.ip_family).await;
         let mut routes = vec![client.clone()];
         for address in addresses.into_iter().skip(1).take(MAX_ROUTES - 1) {

@@ -32,6 +32,8 @@ The app stores its settings, queue and download history in its own folder on you
 
 When you turn on "Send links from your phone" (off by default), the app also listens on your local network for links sent from your own phone, from the page its QR code opens. It answers only devices on your local network, and adds a link only when the request carries the code from that QR code, which is saved in the app's settings and never logged. The links go from your phone straight to the app: nothing leaves your network for this.
 
+For SFTP downloads the app keeps, in a `known_hosts` file in its folder, the name or address and port of each SFTP server it signed in to and that server's public host key, so that it can tell when a server's key changes. It holds no passwords and nothing about the files.
+
 Your keys, passwords and that code are saved only on your computer. They are never stored with the queue or the history.
 
 ## Deleting your data

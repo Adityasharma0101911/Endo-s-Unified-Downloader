@@ -118,10 +118,14 @@ async fn app(mut args: Args) -> i32 {
     if let Err(e) = sign_in(&mut args, typed.then_some(read_password as fn(&str) -> Option<String>)) {
         return usage(&e);
     }
+    if let Some(key) = args.ssh_key.as_deref().filter(|key| typed && args.ssh_key_passphrase.is_none() && hyperfetch_core::sftp::needs_passphrase(key)) {
+        args.ssh_key_passphrase = read_hidden(&format!("Passphrase for {}: ", printable(&key.display().to_string())));
+    }
     let shutdown = Shutdown::install();
     // What hosts were seen to do (the connections each went fastest with, a cap), from earlier runs.
     if let Some(dir) = data_folder() {
         hyperfetch_core::hosts::keep_in(dir.join("hosts.json"));
+        hyperfetch_core::sftp::keep_known_hosts_in(dir.join("known_hosts"));
     }
 
     if args.history {
@@ -195,7 +199,12 @@ fn sign_in(args: &mut Args, ask: Option<fn(&str) -> Option<String>>) -> Result<(
 
 /// Asks at the terminal for `user`'s password, which is not shown as it is typed. Blocking.
 fn read_password(user: &str) -> Option<String> {
-    eprint!("Password for {}: ", printable(user));
+    read_hidden(&format!("Password for {}: ", printable(user)))
+}
+
+/// Asks at the terminal with `prompt` for what is not shown as it is typed. Blocking.
+fn read_hidden(prompt: &str) -> Option<String> {
+    eprint!("{prompt}");
     let mut line = String::new();
     let read = {
         let _hidden = EchoOff::new();
@@ -604,6 +613,7 @@ fn list_options(args: &Args) -> ListOptions {
         auth: None,
         channels: args.channels.iter().cloned().chain(args.all_items.then(|| "*".to_string())).collect(),
         s3: args.s3_key(),
+        ssh_key: args.ssh_key(),
     }
 }
 
@@ -688,6 +698,8 @@ fn tuning(args: &Args, connections: u64) -> DownloadOptions {
         zsync: args.zsync.clone(),
         // Signs only for S3 hosts, so a document's files on them get it too.
         s3: args.s3_key(),
+        // Used only by sftp:// links.
+        ssh_key: args.ssh_key(),
         remote_time: args.remote_time,
         max_filesize: args.max_filesize,
         remote_checksum: !args.no_remote_checksum,
@@ -1618,7 +1630,7 @@ mod tests {
             "-u", "bob:pw", "-U", "agent/1", "--cookie", "sid=1", "--header", "X-Key: k", "-k", "-6", "--connect-timeout", "7",
             "--no-proxy", "-N", "--max-filesize", "2G", "--record-seconds", "30", "--no-remote-checksum", "--no-adaptive",
             "--no-spread-addresses", "--delta-from", "Cargo.toml", "--zsync", "https://a.example/f.iso.zsync", "--s3-access-key", "AK",
-            "--s3-secret-key", "SK", "u",
+            "--s3-secret-key", "SK", "--ssh-key", "id_ed25519", "u",
         ]);
         sign_in(&mut args, None).unwrap();
         let urls = vec![Url::parse("https://a.example/f.iso").unwrap()];
@@ -1636,6 +1648,7 @@ mod tests {
         assert!(listed.auth_header.is_none() && listed.extra_headers.is_empty() && listed.cookie_string.is_none());
         let keys = (options.s3.as_ref().map(|k| k.access_key.as_str()), listed.s3.as_ref().map(|k| k.secret.as_str()));
         assert_eq!(keys, (Some("AK"), Some("SK")), "signed for S3 hosts alone, a document's files too");
+        assert_eq!(listed.ssh_key.map(|k| k.path), Some(PathBuf::from("id_ed25519")));
         assert_eq!(listed.user_agent.as_deref(), Some("agent/1"), "not a secret");
 
         let defaults = job(&parse(&["u"]), 4, Path::new("d"), Task { urls, ..Default::default() }).options;

@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use percent_encoding::percent_decode_str;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpSocket, TcpStream};
 use url::{Host, Url};
 
@@ -39,7 +39,7 @@ const WRITE_BATCH: usize = 512 * 1024;
 /// Longest a received byte waits in memory, so progress and resume state keep up on slow links.
 const WRITE_INTERVAL: Duration = Duration::from_millis(250);
 /// How long a worker without work waits before looking again.
-const IDLE_POLL: Duration = Duration::from_millis(50);
+pub(crate) const IDLE_POLL: Duration = Duration::from_millis(50);
 /// Silence after which an idle worker takes over what is left of a range, or four of its
 /// mirror's answer times if longer.
 const TAKEOVER_SILENCE: Duration = Duration::from_secs(2);
@@ -48,7 +48,7 @@ const THROTTLE_RETRY: Duration = Duration::from_millis(500);
 /// Pause of a server that refused with none of ours open: it is just busy.
 const THROTTLE_COOLDOWN: Duration = Duration::from_secs(1);
 
-type Failure = (FailureKind, String);
+pub(crate) type Failure = (FailureKind, String);
 
 /// Whether `url` is for this module: `ftp://`, or `ftps://` to refuse.
 pub(crate) fn handles(url: &Url) -> bool {
@@ -58,14 +58,78 @@ pub(crate) fn handles(url: &Url) -> bool {
 /// How a download's FTP connections are made, with the logins its links carried. Never printed:
 /// it holds passwords.
 pub(crate) struct Net {
-    connect_timeout: Duration,
+    dialer: Dialer,
     /// Longest wait for a reply.
     reply_timeout: Duration,
+    /// User and password by server (`host:port`), taken out of the links.
+    logins: Vec<(String, (String, String))>,
+}
+
+/// How a download's TCP connections are made: within its connect timeout, from its local
+/// addresses in turn. Shared with SFTP (see `crate::sftp`).
+pub(crate) struct Dialer {
+    connect_timeout: Duration,
     /// Local addresses connections go out from, in turn (see `DownloadOptions::bind_addresses`
     /// and `ip_family`).
     locals: Vec<IpAddr>,
-    /// User and password by server (`host:port`), taken out of the links.
-    logins: Vec<(String, (String, String))>,
+}
+
+impl Dialer {
+    pub(crate) fn new(options: &DownloadOptions) -> Self {
+        let locals = match options.bind_addresses.is_empty() {
+            // `0.0.0.0` or `::` keeps the connections to that IP version.
+            true => options.ip_family.local_address().into_iter().collect(),
+            false => options.bind_addresses.clone(),
+        };
+        Self { connect_timeout: Duration::from_secs(options.connect_timeout_secs.max(1)), locals }
+    }
+
+    /// A TCP connection to `url`'s server at `port`, over an address the local addresses can
+    /// reach, for worker `worker`.
+    pub(crate) async fn dial(&self, url: &Url, port: u16, worker: usize) -> Result<TcpStream, Failure> {
+        let addrs: Vec<SocketAddr> = match url.host() {
+            Some(Host::Ipv4(ip)) => vec![SocketAddr::new(ip.into(), port)],
+            Some(Host::Ipv6(ip)) => vec![SocketAddr::new(ip.into(), port)],
+            Some(Host::Domain(name)) => match tokio::time::timeout(self.connect_timeout, tokio::net::lookup_host((name, port))).await {
+                Ok(Ok(found)) => found.collect(),
+                Ok(Err(e)) => return Err(transient(format!("cannot resolve {name}: {e}"))),
+                Err(_) => return Err(transient(format!("cannot resolve {name} in time"))),
+            },
+            None => return Err((FailureKind::Fatal, format!("{url} names no server"))),
+        };
+        let mut failed = None;
+        for addr in addrs.into_iter().filter(|a| self.takes(a)) {
+            match self.connect(addr, worker).await {
+                Ok(stream) => return Ok(stream),
+                Err(e) => failed = Some(e),
+            }
+        }
+        Err(failed.unwrap_or_else(|| transient(format!("{} has no address the local addresses can reach", url.host_str().unwrap_or("")))))
+    }
+
+    /// Whether a connection may go to `addr`: of the IP version of one of the local addresses,
+    /// when there are any.
+    fn takes(&self, addr: &SocketAddr) -> bool {
+        self.locals.is_empty() || self.locals.iter().any(|l| l.is_ipv4() == addr.is_ipv4())
+    }
+
+    /// A TCP connection to `addr`, from the local address that is worker `worker`'s turn.
+    async fn connect(&self, addr: SocketAddr, worker: usize) -> Result<TcpStream, Failure> {
+        let fail = |e: std::io::Error| transient(format!("cannot connect to {addr}: {e}"));
+        let socket = if addr.is_ipv4() { TcpSocket::new_v4() } else { TcpSocket::new_v6() }.map_err(fail)?;
+        let locals: Vec<&IpAddr> = self.locals.iter().filter(|l| l.is_ipv4() == addr.is_ipv4()).collect();
+        if let Some(local) = locals.get(worker % locals.len().max(1)) {
+            socket.bind(SocketAddr::new(**local, 0)).map_err(fail)?;
+        }
+        match tokio::time::timeout(self.connect_timeout, socket.connect(addr)).await {
+            Ok(Ok(stream)) => {
+                let _ = stream.set_nodelay(true);
+                Ok(stream)
+            }
+            Ok(Err(e)) => Err(fail(e)),
+            Err(_) => Err(transient(format!("cannot connect to {addr} within {}s", self.connect_timeout.as_secs()))),
+        }
+    }
 }
 
 impl Net {
@@ -100,17 +164,7 @@ impl Net {
         if links.is_empty() {
             return Err("No ftp:// link to download".to_string());
         }
-        let locals = match options.bind_addresses.is_empty() {
-            // `0.0.0.0` or `::` keeps the connections to that IP version.
-            true => options.ip_family.local_address().into_iter().collect(),
-            false => options.bind_addresses.clone(),
-        };
-        let net = Self {
-            connect_timeout: Duration::from_secs(options.connect_timeout_secs.max(1)),
-            reply_timeout: Duration::from_secs(options.stall_timeout_secs.max(1)),
-            locals,
-            logins,
-        };
+        let net = Self { dialer: Dialer::new(options), reply_timeout: Duration::from_secs(options.stall_timeout_secs.max(1)), logins };
         Ok((net, links))
     }
 
@@ -174,54 +228,11 @@ impl Net {
         }
     }
 
-    /// A TCP connection to `url`'s server, over an address the local addresses can reach.
+    /// A control connection to `url`'s server.
     async fn open(&self, url: &Url, worker: usize) -> Result<Control, Failure> {
-        let port = url.port_or_known_default().unwrap_or(21);
-        let addrs: Vec<SocketAddr> = match url.host() {
-            Some(Host::Ipv4(ip)) => vec![SocketAddr::new(ip.into(), port)],
-            Some(Host::Ipv6(ip)) => vec![SocketAddr::new(ip.into(), port)],
-            Some(Host::Domain(name)) => match tokio::time::timeout(self.connect_timeout, tokio::net::lookup_host((name, port))).await {
-                Ok(Ok(found)) => found.collect(),
-                Ok(Err(e)) => return Err(transient(format!("cannot resolve {name}: {e}"))),
-                Err(_) => return Err(transient(format!("cannot resolve {name} in time"))),
-            },
-            None => return Err((FailureKind::Fatal, format!("{url} names no server"))),
-        };
-        let mut failed = None;
-        for addr in addrs.into_iter().filter(|a| self.takes(a)) {
-            match self.connect(addr, worker).await {
-                Ok(stream) => {
-                    let peer = stream.peer_addr().map_err(|e| transient(e.to_string()))?.ip();
-                    return Ok(Control { stream: BufReader::new(stream), peer, timeout: self.reply_timeout });
-                }
-                Err(e) => failed = Some(e),
-            }
-        }
-        Err(failed.unwrap_or_else(|| transient(format!("{} has no address the local addresses can reach", url.host_str().unwrap_or("")))))
-    }
-
-    /// Whether a connection may go to `addr`: of the IP version of one of the local addresses,
-    /// when there are any.
-    fn takes(&self, addr: &SocketAddr) -> bool {
-        self.locals.is_empty() || self.locals.iter().any(|l| l.is_ipv4() == addr.is_ipv4())
-    }
-
-    /// A TCP connection to `addr`, from the local address that is worker `worker`'s turn.
-    async fn connect(&self, addr: SocketAddr, worker: usize) -> Result<TcpStream, Failure> {
-        let fail = |e: std::io::Error| transient(format!("cannot connect to {addr}: {e}"));
-        let socket = if addr.is_ipv4() { TcpSocket::new_v4() } else { TcpSocket::new_v6() }.map_err(fail)?;
-        let locals: Vec<&IpAddr> = self.locals.iter().filter(|l| l.is_ipv4() == addr.is_ipv4()).collect();
-        if let Some(local) = locals.get(worker % locals.len().max(1)) {
-            socket.bind(SocketAddr::new(**local, 0)).map_err(fail)?;
-        }
-        match tokio::time::timeout(self.connect_timeout, socket.connect(addr)).await {
-            Ok(Ok(stream)) => {
-                let _ = stream.set_nodelay(true);
-                Ok(stream)
-            }
-            Ok(Err(e)) => Err(fail(e)),
-            Err(_) => Err(transient(format!("cannot connect to {addr} within {}s", self.connect_timeout.as_secs()))),
-        }
+        let stream = self.dialer.dial(url, url.port_or_known_default().unwrap_or(21), worker).await?;
+        let peer = stream.peer_addr().map_err(|e| transient(e.to_string()))?.ip();
+        Ok(Control { stream: BufReader::new(stream), peer, timeout: self.reply_timeout })
     }
 }
 
@@ -265,7 +276,7 @@ impl Control {
             },
         };
         let port = port.ok_or_else(|| (FailureKind::BadMirror, "the FTP server's passive mode answer cannot be read".to_string()))?;
-        let data = net.connect(SocketAddr::new(self.peer, port), worker).await?;
+        let data = net.dialer.connect(SocketAddr::new(self.peer, port), worker).await?;
         if offset > 0 {
             let (code, text) = self.command(&format!("REST {offset}")).await?;
             if code != 350 {
@@ -324,7 +335,7 @@ fn refused(code: u16, text: &str) -> Failure {
     (kind, format!("FTP {code} {}", text.trim()))
 }
 
-fn transient(error: String) -> Failure {
+pub(crate) fn transient(error: String) -> Failure {
     (FailureKind::Transient, error)
 }
 
@@ -426,7 +437,7 @@ pub(crate) async fn work(worker_id: usize, shared: WorkerShared, net: Arc<Net>) 
 /// A range for worker `worker_id` on the best mirror whose server has room (else the best one,
 /// once it has), with the mirror, its link and the slot on its server; `None` while no mirror
 /// takes another connection or nothing is left to take.
-async fn take(s: &WorkerShared, worker_id: usize) -> Option<(Chunk, usize, Url, HostSlot)> {
+pub(crate) async fn take(s: &WorkerShared, worker_id: usize) -> Option<(Chunk, usize, Url, HostSlot)> {
     let ranked: Vec<(usize, Url)> = {
         let racer = s.mirrors.lock();
         racer.ranked().into_iter().filter_map(|id| Some((id, racer.get_mirror(id)?.url.clone()))).collect()
@@ -495,7 +506,7 @@ async fn fetch(s: &WorkerShared, net: &Net, worker_id: usize, chunk: &Chunk, mir
 /// (which a thief may lower meanwhile), in batches on the blocking pool. What arrived stays
 /// written whatever ends the transfer: a retry starts after it. Each read waits `body_idle` at
 /// most.
-async fn receive(s: &WorkerShared, worker_id: usize, chunk: &Chunk, mirror_id: usize, mut data: TcpStream, start: u64) -> Result<(), Failure> {
+pub(crate) async fn receive(s: &WorkerShared, worker_id: usize, chunk: &Chunk, mirror_id: usize, mut data: impl AsyncRead + Unpin, start: u64) -> Result<(), Failure> {
     chunk.answered(Instant::now());
     let (mut pos, mut batch) = (start, Vec::with_capacity(WRITE_BATCH));
     let mut buf = vec![0u8; READ_SIZE];
@@ -611,7 +622,7 @@ fn report(s: &WorkerShared, worker_id: usize, chunk_id: usize, mirror_id: usize,
 /// open holds the mirror and its server to those, and costs the range no retry; refusing with
 /// none open, it is just busy, and cools down. A chunk another worker took over is no longer this
 /// worker's to settle.
-fn settle(s: &WorkerShared, worker_id: usize, chunk: &Chunk, mirror_id: usize, outcome: Result<(), Failure>, slot: &HostSlot) -> Option<WorkerEvent> {
+pub(crate) fn settle(s: &WorkerShared, worker_id: usize, chunk: &Chunk, mirror_id: usize, outcome: Result<(), Failure>, slot: &HostSlot) -> Option<WorkerEvent> {
     let mut racer = s.mirrors.lock();
     racer.release_mirror(mirror_id);
     let mut chunks = s.chunks.lock();
@@ -668,11 +679,11 @@ fn settle(s: &WorkerShared, worker_id: usize, chunk: &Chunk, mirror_id: usize, o
     failed
 }
 
-fn cancelled() -> Failure {
+pub(crate) fn cancelled() -> Failure {
     transient("cancelled".to_string())
 }
 
-fn taken_over() -> Failure {
+pub(crate) fn taken_over() -> Failure {
     transient("no data for too long; another connection took over".to_string())
 }
 
@@ -836,9 +847,9 @@ mod tests {
         let url = Url::parse("ftp://h.example/f.bin").unwrap();
         let v6 = DownloadOptions { ip_family: crate::engine::IpFamily::V6, connect_timeout_secs: 3, ..Default::default() };
         let (net, _) = Net::new(&v6, std::slice::from_ref(&url)).unwrap();
-        assert_eq!((net.locals, net.connect_timeout), (vec![IpAddr::from(std::net::Ipv6Addr::UNSPECIFIED)], Duration::from_secs(3)));
+        assert_eq!((net.dialer.locals, net.dialer.connect_timeout), (vec![IpAddr::from(std::net::Ipv6Addr::UNSPECIFIED)], Duration::from_secs(3)));
         let bound = DownloadOptions { bind_addresses: vec![IpAddr::from([10, 0, 0, 1])], ..v6 };
-        assert_eq!(Net::new(&bound, &[url]).unwrap().0.locals, bound.bind_addresses);
+        assert_eq!(Net::new(&bound, &[url]).unwrap().0.dialer.locals, bound.bind_addresses);
     }
 
     /// Anonymous, over several connections, each starting where REST says, each reading its range;

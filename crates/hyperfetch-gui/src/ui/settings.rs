@@ -606,6 +606,10 @@ fn host_settings(app: &mut App, ui: &mut Ui) {
     let about = "An S3-compatible server on a host of its own (MinIO, R2's S3 endpoint): its links are signed too, and a \
                  folder link on it (/bucket/ or /bucket/folder/) lists the bucket.";
     text_setting(ui, "S3 endpoint", about, &mut app.settings.s3_endpoint, "https://minio.example:9000", false);
+    let about = "Signs in to SFTP servers (sftp://USER@host/path) with this private key file, besides a password in the link.";
+    text_setting(ui, "SSH private key", about, &mut app.settings.ssh_key_file, "Optional: the key file's path", false);
+    let about = "For an encrypted private key. Saved in the settings only, never with the queue or in the history.";
+    text_setting(ui, "SSH key passphrase", about, &mut app.settings.ssh_key_passphrase, "Optional", true);
     setting(ui, "Browser cookies", "Sign in to sites as in this browser, for videos and folders that need it.", app.settings.browser_cookies, |ui| {
         combo(ui, "browser_cookies_combo", &mut app.settings.browser_cookies, &BROWSERS);
     });

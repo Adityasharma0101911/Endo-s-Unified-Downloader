@@ -2663,6 +2663,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let data = settings::data_dir();
     // What hosts were seen to do (the connections each went fastest with, a cap), from earlier runs.
     hyperfetch_core::hosts::keep_in(data.join("hosts.json"));
+    hyperfetch_core::sftp::keep_known_hosts_in(data.join("known_hosts"));
     let log = Mutex::new(desktop::LogFile::new(data.join("logs").join("endo.log"), desktop::LOG_LIMIT));
     let _ = tracing_subscriber::fmt().with_ansi(false).with_writer(std::io::stderr.and(log)).try_init();
     // One app per data folder, which it locks (two started at once): a second launch shows the

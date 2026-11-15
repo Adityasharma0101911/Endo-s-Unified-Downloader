@@ -124,6 +124,8 @@ pub struct ListOptions {
     /// The access key S3 and S3-compatible buckets are listed with (see `crate::sigv4`), whose
     /// endpoint's folder links list its buckets too.
     pub s3: Option<crate::sigv4::S3Key>,
+    /// The private key SFTP folders are listed with (see `crate::sftp`).
+    pub ssh_key: Option<crate::sftp::SshKey>,
 }
 
 impl ListOptions {
@@ -172,6 +174,7 @@ impl Default for ListOptions {
             auth: None,
             channels: Vec::new(),
             s3: None,
+            ssh_key: None,
         }
     }
 }
@@ -264,6 +267,7 @@ pub fn might_list(url: &Url) -> bool {
         || feeds::lists(url)
         || media::lists(url)
         || folders::directory_lists(url)
+        || crate::sftp::handles(url)
 }
 
 /// `token` as a link [`might_list`] takes, a "leaving this site" link replaced by its target.
@@ -271,7 +275,7 @@ fn listing_url(token: &str) -> Option<Url> {
     let url = match http_url(token) {
         Some(url) => resolver::unwrap_redirect(&url).unwrap_or(url),
         // A bucket's s3:// or gs:// link, or a WebDAV one.
-        None => Url::parse(token).ok().filter(|u| matches!(u.scheme(), "s3" | "gs" | "webdav" | "webdavs" | "dav" | "davs"))?,
+        None => Url::parse(token).ok().filter(|u| matches!(u.scheme(), "s3" | "gs" | "webdav" | "webdavs" | "dav" | "davs" | "sftp"))?,
     };
     might_list(&url).then_some(url)
 }
@@ -558,6 +562,9 @@ async fn magnet_tasks(http: &reqwest::Client, token: &str, options: &ListOptions
 /// The downloads the folder, feed or playlist at `url` lists, from the first lister whose `lists`
 /// takes it and that finds a listing there; None when none does.
 async fn list(http: &reqwest::Client, url: &Url, options: &ListOptions) -> Option<Result<Vec<Task>, String>> {
+    if crate::sftp::handles(url) {
+        return crate::sftp::list(url, options).await;
+    }
     if mega::lists(url) {
         return Some(mega::list(http, url).await);
     }
@@ -627,8 +634,8 @@ pub fn link_task(tokens: &[impl AsRef<str>]) -> Result<Task, String> {
             if task.checksum.is_none() {
                 task.checksum = resolver::ipfs_checksum(&url);
             }
-            if !matches!(url.scheme(), "http" | "https" | "ftp") {
-                return Err(format!("Unsupported URL scheme '{}': only http, https and ftp can be downloaded", url.scheme()));
+            if !matches!(url.scheme(), "http" | "https" | "ftp" | "sftp") {
+                return Err(format!("Unsupported URL scheme '{}': only http, https, ftp and sftp can be downloaded", url.scheme()));
             }
             vec![resolver::unwrap_redirect(&url).unwrap_or(url)]
         };

@@ -31,6 +31,7 @@ pub mod gallery;
 pub mod postprocess;
 pub mod paste;
 pub mod ftp;
+pub mod sftp;
 pub mod digest;
 pub mod zipdir;
 pub mod delta;
