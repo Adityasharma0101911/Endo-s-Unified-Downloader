@@ -604,7 +604,14 @@ pub fn link_task(tokens: &[impl AsRef<str>]) -> Result<Task, String> {
             }
             magnet.web_seeds
         } else {
-            let url = Url::parse(token).map_err(|e| format!("Invalid URL '{}': {}", truncate_chars(token, 80), e))?;
+            let mut url = Url::parse(token).map_err(|e| format!("Invalid URL '{}': {}", truncate_chars(token, 80), e))?;
+            // An ipfs:// link downloads through the public gateways (see `resolver::ipfs_mirrors`).
+            if let Some(gateway) = resolver::ipfs_mirrors(&url).filter(|_| url.scheme() == "ipfs").and_then(|m| m.into_iter().next()) {
+                url = gateway;
+            }
+            if task.checksum.is_none() {
+                task.checksum = resolver::ipfs_checksum(&url);
+            }
             if !matches!(url.scheme(), "http" | "https" | "ftp") {
                 return Err(format!("Unsupported URL scheme '{}': only http, https and ftp can be downloaded", url.scheme()));
             }
@@ -853,6 +860,10 @@ mod tests {
         assert_eq!(link("   ").unwrap_err(), "Enter a download URL");
         assert!(link("gopher://a.com/f").unwrap_err().contains("scheme"));
         assert!(link("ftp://a.com/f").is_ok());
+        let ipfs = link("ipfs://bafkreifzjut3te2nhyekklss27nh3k72ysco7y32koao5eei66wof36n5e").unwrap();
+        assert_eq!(ipfs.urls[0].as_str(), "https://ipfs.io/ipfs/bafkreifzjut3te2nhyekklss27nh3k72ysco7y32koao5eei66wof36n5e");
+        assert_eq!(ipfs.checksum.as_deref(), Some("sha256:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"));
+        assert!(link("ipfs://not-a-cid").unwrap_err().contains("scheme"));
         assert!(link("not a url").unwrap_err().contains("Invalid URL"));
         assert_eq!(link("blob:https://www.youtube.com/x").unwrap_err(), BLOB_MESSAGE);
         assert_eq!(link("https://www.youtube.com/0b9f5e2c-1d3a-4c5e-9f7a-123456789abc").unwrap_err(), BLOB_MESSAGE);

@@ -1,6 +1,6 @@
 # Privacy Policy
 
-Endo's Unified Downloader is a desktop download manager with a browser extension (for Chrome, Edge, Firefox and other browsers). This policy covers both. Effective October 30, 2026.
+Endo's Unified Downloader is a desktop download manager with a browser extension (for Chrome, Edge, Firefox and other browsers). This policy covers both. Effective November 15, 2026.
 
 **The short version:** everything stays on your computer. Neither the extension nor the app collects, sells or shares your data, and neither sends anything to the developer. There are no accounts, ads, analytics or tracking.
 
@@ -26,6 +26,7 @@ The extension finds videos, streams and downloadable links on the pages you visi
 The app stores its settings, queue and download history in its own folder on your computer, along with the names of the sites it downloaded from, how many connections each was fastest with, how many it served at once and the speed it held a download to, and the top speed your internet line reached (all forgotten after 30 days). It connects only to:
 
 - the sites you download from;
+- for an IPFS link (`ipfs://...`, or a gateway's `/ipfs/...` link), public IPFS gateways (ipfs.io, dweb.link, Pinata, Filebase and 4EVERLAND), which then learn the content address it names;
 - GitHub, to check for and download its own updates, and the tools it uses (yt-dlp and ffmpeg). It also contacts Codeberg for gallery-dl;
 - services you turn on and give your own key for: VirusTotal (it sends only a downloaded file's SHA-256 hash, never the file), Real-Debrid or AllDebrid, and the Google Drive API.
 
