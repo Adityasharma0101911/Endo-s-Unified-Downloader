@@ -1019,7 +1019,7 @@ fn read_blocks(file: &File, offset: u64, len: u64, mut f: impl FnMut(&[u8])) -> 
 }
 
 #[cfg(unix)]
-fn write_all_at(file: &File, data: &[u8], offset: u64) -> std::io::Result<()> {
+pub(crate) fn write_all_at(file: &File, data: &[u8], offset: u64) -> std::io::Result<()> {
     std::os::unix::fs::FileExt::write_all_at(file, data, offset)
 }
 
@@ -1029,7 +1029,7 @@ fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()
 }
 
 #[cfg(windows)]
-fn write_all_at(file: &File, mut data: &[u8], mut offset: u64) -> std::io::Result<()> {
+pub(crate) fn write_all_at(file: &File, mut data: &[u8], mut offset: u64) -> std::io::Result<()> {
     use std::os::windows::fs::FileExt;
     while !data.is_empty() {
         match file.seek_write(data, offset) {

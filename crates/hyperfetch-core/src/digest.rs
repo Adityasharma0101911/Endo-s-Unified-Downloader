@@ -273,6 +273,16 @@ pub(crate) fn look_for(
     *site.lock() = Site { search, note: None };
 }
 
+/// Holds the download to `checksum` (`algo:hex`) in place of what [`look_for`] looks for: the
+/// checksum of a file put together from an older version (see `crate::delta`).
+pub(crate) fn expect(site: &Mutex<Site>, checksum: String) {
+    let mut site = site.lock();
+    if let Some(search) = site.search.take() {
+        search.abort();
+    }
+    site.search = Some(tokio::spawn(async move { Some(checksum) }));
+}
+
 /// Why the engine does not keep a finished download (see [`finish`]).
 pub(crate) enum Unfinished {
     /// The file could not be read; it stays for another try.

@@ -683,6 +683,8 @@ fn tuning(args: &Args, connections: u64) -> DownloadOptions {
         user_agent: args.user_agent.clone(),
         no_proxy: args.no_proxy,
         only_if_newer: args.only_if_newer,
+        delta_from: args.delta_from.clone(),
+        zsync: args.zsync.clone(),
         remote_time: args.remote_time,
         max_filesize: args.max_filesize,
         remote_checksum: !args.no_remote_checksum,
@@ -1612,7 +1614,7 @@ mod tests {
         let mut args = parse(&[
             "-u", "bob:pw", "-U", "agent/1", "--cookie", "sid=1", "--header", "X-Key: k", "-k", "-6", "--connect-timeout", "7",
             "--no-proxy", "-N", "--max-filesize", "2G", "--record-seconds", "30", "--no-remote-checksum", "--no-adaptive",
-            "--no-spread-addresses", "u",
+            "--no-spread-addresses", "--delta-from", "Cargo.toml", "--zsync", "https://a.example/f.iso.zsync", "u",
         ]);
         sign_in(&mut args, None).unwrap();
         let urls = vec![Url::parse("https://a.example/f.iso").unwrap()];
@@ -1624,6 +1626,7 @@ mod tests {
         assert_eq!((options.user_agent.as_deref(), options.ip_family, options.connect_timeout_secs), (Some("agent/1"), IpFamily::V6, 7));
         assert!(options.insecure && options.no_proxy && options.only_if_newer && !options.remote_checksum && !options.adaptive);
         assert!(!options.spread_addresses);
+        assert_eq!((options.delta_from.as_deref(), options.zsync.as_deref()), (Some(Path::new("Cargo.toml")), Some("https://a.example/f.iso.zsync")));
         assert_eq!((options.max_filesize, options.record_seconds, options.metalink_pieces), (Some(2 << 30), Some(30), Some(pieces)));
         let listed = job(&args, 4, Path::new("d"), Task { urls: urls.clone(), from_document: true, ..Default::default() }).options;
         assert!(listed.auth_header.is_none() && listed.extra_headers.is_empty() && listed.cookie_string.is_none());

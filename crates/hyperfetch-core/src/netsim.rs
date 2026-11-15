@@ -54,6 +54,8 @@ pub(crate) struct Server {
     pub link: Option<String>,
     /// A Metalink, the answer to a GET of any path ending in `.meta4`.
     pub metalink: Option<String>,
+    /// A zsync control file, the answer to a GET of any path ending in `.zsync`.
+    pub zsync: Option<Vec<u8>>,
 }
 
 /// A connection that slows down and then stalls.
@@ -77,6 +79,8 @@ pub(crate) struct Stats {
     /// GETs being answered now, and the most ever at once.
     pub open: AtomicUsize,
     pub peak: AtomicUsize,
+    /// Bytes of the file sent.
+    pub served: AtomicUsize,
     decayed: AtomicBool,
     cut: AtomicBool,
 }
@@ -126,6 +130,11 @@ async fn answer(mut socket: tokio::net::TcpStream, server: Arc<Server>, stats: A
     let link = server.link.as_ref().map(|link| format!("Link: {link}\r\n")).unwrap_or_default();
     if let Some(meta) = server.metalink.as_ref().filter(|_| head.split_whitespace().nth(1).is_some_and(|path| path.ends_with(".meta4"))) {
         let _ = socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{meta}", meta.len()).as_bytes()).await;
+        return;
+    }
+    if let Some(zsync) = server.zsync.as_ref().filter(|_| head.split_whitespace().nth(1).is_some_and(|path| path.ends_with(".zsync"))) {
+        let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", zsync.len());
+        let _ = socket.write_all(&[head.as_bytes(), zsync].concat()).await;
         return;
     }
     if head.starts_with("head ") {
@@ -191,6 +200,7 @@ async fn answer(mut socket: tokio::net::TcpStream, server: Arc<Server>, stats: A
             return;
         }
         sent += piece.len();
+        stats.served.fetch_add(piece.len(), Ordering::SeqCst);
     }
 }
 
