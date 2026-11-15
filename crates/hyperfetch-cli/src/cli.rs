@@ -22,11 +22,12 @@ use hyperfetch_core::{check_name_pattern, check_pattern, parse_part_ids, AudioSp
                   kept); press it again to quit immediately."
 )]
 pub struct Args {
-    /// Mirrors of ONE file (all must serve identical bytes), a magnet link, a local/remote
-    /// .metalink, .meta4 or .torrent, or a link that lists many downloads (a Google Drive,
-    /// MediaFire or MEGA folder, a Pixeldrain list or Gofile folder, a Nextcloud or ownCloud share,
-    /// an Internet Archive item, a GitLab, Bitbucket or Gitea folder or release, a playlist or
-    /// channel, a podcast feed). A paste works too: links with "Password: x", "Key: x" or a token, a
+    /// Mirrors of ONE file (all must serve identical bytes), an ipfs:// link, a magnet link, a
+    /// local/remote .metalink, .meta4 or .torrent, or a link that lists many downloads (a Google
+    /// Drive, MediaFire or MEGA folder, a Pixeldrain list or Gofile folder, a Nextcloud or ownCloud
+    /// share, a SwissTransfer transfer, an Internet Archive item, a GitLab, Bitbucket or Gitea
+    /// folder or release, a PyPI release, a Telegram post, a playlist or channel, a podcast feed).
+    /// A paste works too: links with "Password: x", "Key: x" or a token, a
     /// user:pass@ link, or a copied curl/wget/fetch/PowerShell command (each link then is its
     /// own download, with its secrets, which are never shown or saved); "-" reads it from stdin.
     /// Without URLs and without -i an interactive prompt starts.
