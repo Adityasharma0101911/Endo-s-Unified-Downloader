@@ -1,7 +1,9 @@
-//! BitTorrent swarm downloads (magnet links and .torrent files without HTTP web seeds), with
-//! librqbit. One session serves the whole process, started with the port, UPnP and proxy
-//! settings of the download that needs it; one that wants other settings gets a new session once
-//! no torrent runs. The DHT keeps its state in the app's data folder.
+//! BitTorrent swarm downloads (magnet links without HTTP web seeds, and .torrent files), with
+//! librqbit. A .torrent's files with web seeds come over HTTP first, as librqbit has no web seeds
+//! of its own (see [`fill_from_web_seeds`]). One session serves the whole process, started with
+//! the port, UPnP and proxy settings of the download that needs it; one that wants other
+//! settings gets a new session once no torrent runs. The DHT keeps its state in the app's data
+//! folder.
 //!
 //! A cancelled download leaves the session (its files stay); running it again adds it back, and
 //! librqbit checks the pieces already on disk before fetching the rest. A finished torrent seeds
@@ -25,7 +27,7 @@ use tokio::sync::{broadcast, watch, Mutex};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-use crate::engine::{DownloadOptions, EngineSnapshot, CANCELLED};
+use crate::engine::{DownloadEngine, DownloadOptions, EngineSnapshot, CANCELLED};
 
 /// A torrent's swarm side of its progress (see `EngineSnapshot::torrent`).
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -181,13 +183,17 @@ pub async fn run(
     // Resuming writes over what an earlier run of it left; librqbit keeps the pieces that check out.
     let resuming = taken(&target);
     claim(&hash, &target);
+    // Files with web seeds come over HTTP first; librqbit's first check then keeps the pieces of
+    // them that match, and the swarm brings the rest: one after the other, not at once.
+    let kept: Vec<(PathBuf, u64)> = info.iter_file_details().filter(|f| !f.attrs().padding).map(|f| (f.filename.to_pathbuf(), f.len)).collect();
+    let filled = fill_from_web_seeds(&listed.torrent_bytes, &kept, &folder, &target, options, &snapshots, &cancel).await?;
     let torrent = match proxied {
         true => http_trackers_only(&listed.torrent_bytes)?.into(),
         false => listed.torrent_bytes,
     };
     let speed = options.max_speed.and_then(|bps| NonZeroU32::new(bps.min(u32::MAX.into()) as u32));
     let adding = AddTorrentOptions {
-        overwrite: resuming,
+        overwrite: resuming || filled,
         output_folder: Some(folder.to_str().ok_or("The save folder's name is not valid Unicode")?.to_string()),
         initial_peers: Some([hints, listed.seen_peers].concat()),
         ratelimits: LimitsConfig { download_bps: speed, ..Default::default() },
@@ -213,7 +219,127 @@ pub async fn run(
     } else if ours {
         let _ = session.delete(handle.id().into(), false).await;
     }
-    watched.map(|fresh| (target, fresh))
+    watched.map(|fresh| (target, fresh || filled))
+}
+
+/// Downloads over HTTP each file of the torrent `bytes` that has web seeds and is not on disk yet,
+/// to where librqbit puts it in `folder` (`kept`: its files' names and sizes, padding files left
+/// out), checked by the torrent's piece hashes where they hold it alone (see
+/// `torrent::TorrentFile::pieces`). A file that fails keeps what came: its `.part` takes its
+/// place, for librqbit's check (not one the probe brought whole, up to 1 MiB, which has no state
+/// to say what in it is good). Whether any file was written; an error only when `cancel` fires.
+///
+/// A boxed Send future of a declared type: the engine's run leads here again (for a torrent),
+/// which the compiler could not size or prove Send otherwise.
+#[allow(clippy::too_many_arguments)]
+fn fill_from_web_seeds<'a>(
+    bytes: &'a [u8],
+    kept: &'a [(PathBuf, u64)],
+    folder: &'a Path,
+    target: &'a Path,
+    options: &'a DownloadOptions,
+    snapshots: &'a Option<broadcast::Sender<EngineSnapshot>>,
+    cancel: &'a CancellationToken,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + 'a>> {
+    Box::pin(fill(bytes, kept, folder, target, options, snapshots, cancel))
+}
+
+async fn fill(
+    bytes: &[u8],
+    kept: &[(PathBuf, u64)],
+    folder: &Path,
+    target: &Path,
+    options: &DownloadOptions,
+    snapshots: &Option<broadcast::Sender<EngineSnapshot>>,
+    cancel: &CancellationToken,
+) -> Result<bool, String> {
+    let Ok(torrent) = crate::torrent::parse_torrent_bytes(bytes) else { return Ok(false) };
+    // Both are the torrent's files in order; at any doubt the swarm brings them all.
+    let same = torrent.files.len() == kept.len() && torrent.files.iter().zip(kept).all(|(f, (_, len))| f.length == *len);
+    if !same {
+        return Ok(false);
+    }
+    let (total, mut done, mut filled) = (torrent.total_length, 0, false);
+    for (file, (name, _)) in torrent.files.iter().zip(kept) {
+        let path = folder.join(name);
+        if file.urls.is_empty() || std::fs::symlink_metadata(&path).is_ok() {
+            done += file.length;
+            continue;
+        }
+        // The user's network settings only: no sign-in, cookies or headers of theirs go to a seed.
+        let http = DownloadOptions {
+            output_path: Some(path.clone()),
+            metalink_pieces: file.pieces.clone(),
+            remote_checksum: false,
+            post: crate::postprocess::PostOptions { mark_of_the_web: false, ..Default::default() },
+            num_connections: options.num_connections,
+            max_connections_per_host: options.max_connections_per_host,
+            proxy: options.proxy.clone(),
+            proxy_pool: options.proxy_pool.clone(),
+            no_proxy: options.no_proxy,
+            max_speed: options.max_speed,
+            priority: options.priority,
+            max_retries: options.max_retries,
+            stall_timeout_secs: options.stall_timeout_secs,
+            fsync_on_complete: options.fsync_on_complete,
+            bind_addresses: options.bind_addresses.clone(),
+            spread_addresses: options.spread_addresses,
+            adaptive: options.adaptive,
+            insecure: options.insecure,
+            ip_family: options.ip_family,
+            connect_timeout_secs: options.connect_timeout_secs,
+            user_agent: options.user_agent.clone(),
+            ..Default::default()
+        };
+        let engine = DownloadEngine::new(file.urls.clone(), http);
+        let (tx, mut rx) = broadcast::channel::<EngineSnapshot>(64);
+        let (out, whole, before) = (snapshots.clone(), target.to_path_buf(), done);
+        let forward = tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(s) => emit(&out, EngineSnapshot {
+                        total_bytes: total,
+                        downloaded_bytes: before + s.downloaded_bytes,
+                        speed_bytes_per_sec: s.speed_bytes_per_sec,
+                        progress_ratio: if total > 0 { (before + s.downloaded_bytes) as f64 / total as f64 } else { 0.0 },
+                        active_workers: s.active_workers,
+                        target_path: Some(whole.clone()),
+                        torrent: Some(TorrentProgress::default()),
+                        host: s.host,
+                        ..Default::default()
+                    }),
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(_) => break,
+                }
+            }
+        });
+        let stop = engine.clone();
+        let stopping = async {
+            cancel.cancelled().await;
+            stop.cancel();
+            std::future::pending::<()>().await
+        };
+        // A cancel lets the download save its state before it returns, for the next run to resume.
+        let result = tokio::select! {
+            result = engine.run(Some(tx)) => result,
+            () = stopping => unreachable!(),
+        };
+        forward.abort();
+        match result {
+            _ if cancel.is_cancelled() => return Err(CANCELLED.to_string()),
+            Ok(_) => filled = true,
+            Err(e) => {
+                tracing::warn!("{} did not come whole from its web seeds ({}); the swarm brings the rest", path.display(), e);
+                let part = crate::engine::part_path(&path);
+                if std::fs::rename(&part, &path).is_ok() {
+                    let _ = crate::state::DownloadState::remove(&crate::state::DownloadState::state_file_path(&part));
+                    filled = true;
+                }
+            }
+        }
+        done += file.length;
+    }
+    Ok(filled)
 }
 
 /// Resolves once no torrent is seeding any more (the command line waits for it before exiting).
@@ -515,6 +641,16 @@ mod tests {
         assert_eq!(trackers, [b"https://t.example/a".as_slice()]);
     }
 
+    /// The torrent of `file` in 64 KiB pieces, and its bytes with `web` as its web seed.
+    async fn with_web_seed(file: &Path, web: &Url) -> (librqbit::CreateTorrentResult, Vec<u8>) {
+        let pieces = CreateTorrentOptions { piece_length: Some(64 * 1024), ..Default::default() };
+        let made = create_torrent(file, pieces, &BlockingSpawner::new(1)).await.unwrap();
+        let bytes = made.as_bytes().unwrap();
+        // The root dictionary's last key, after "info".
+        let seeded = [&bytes[..bytes.len() - 1], format!("8:url-list{}:{web}e", web.as_str().len()).as_bytes()].concat();
+        (made, seeded)
+    }
+
     /// A session that only talks to peers it is told of, on loopback.
     async fn offline(dir: &Path) -> Arc<Session> {
         let options = SessionOptions {
@@ -610,6 +746,41 @@ mod tests {
             assert!(!Path::new("C:bad.bin").exists());
             assert_eq!(session.with_torrents(|t| t.count()), 0);
         }
+
+        // A .torrent with a web seed: its file comes over HTTP first, checked by its pieces.
+        // Over 1 MiB, as the probe brings a smaller file whole and keeps no state to repair it by.
+        let size = 1536 * 1024;
+        let (web, stats) = crate::netsim::serve(crate::netsim::Server { size, ..Default::default() }).await;
+        let content = crate::netsim::file(size);
+        std::fs::write(seeds.join("web.bin"), &content).unwrap();
+        let (_, bytes) = with_web_seed(&seeds.join("web.bin"), &web).await;
+        let file = tmp.path().join("web.torrent");
+        std::fs::write(&file, bytes).unwrap();
+        // All of it checks out: nothing is asked of the swarm (no peer is known).
+        let (path, fresh) = run(&Url::from_file_path(&file).unwrap(), &options, &out, None, CancellationToken::new()).await.unwrap();
+        assert_eq!((path.as_path(), fresh), (out.join("web.bin").as_path(), true));
+        assert!(std::fs::read(&path).unwrap() == content);
+        assert!(stats.served.load(Ordering::SeqCst) >= size);
+
+        // The seed serves other bytes in one piece: the swarm brings that piece alone.
+        let mut changed = content.clone();
+        changed[200_000..210_000].fill(0xee);
+        std::fs::write(seeds.join("mixed.bin"), &changed).unwrap();
+        let (made, bytes) = with_web_seed(&seeds.join("mixed.bin"), &web).await;
+        let seeding = AddTorrentOptions { overwrite: true, output_folder: Some(seeds.to_str().unwrap().into()), ..Default::default() };
+        let added = seeder.add_torrent(AddTorrent::from_bytes(made.as_bytes().unwrap()), Some(seeding)).await;
+        let mixed = added.unwrap().into_handle().unwrap();
+        mixed.wait_until_completed().await.unwrap();
+        let file = tmp.path().join("mixed.torrent");
+        std::fs::write(&file, bytes).unwrap();
+        // The local file's link names the seeder as a magnet's `x.pe` would.
+        let mut source = Url::from_file_path(&file).unwrap();
+        source.set_query(Some(&format!("x.pe=127.0.0.1:{port}")));
+        let running = run(&source, &options, &out, None, CancellationToken::new());
+        let (path, _) = tokio::time::timeout(Duration::from_secs(60), running).await.expect("done within a minute").unwrap();
+        assert!(std::fs::read(&path).unwrap() == changed);
+        let sent = mixed.stats().uploaded_bytes;
+        assert!(sent > 0 && sent <= 2 * 64 * 1024, "the swarm sent {sent} bytes");
         seeder.stop().await;
     }
 

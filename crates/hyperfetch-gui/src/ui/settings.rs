@@ -539,7 +539,7 @@ fn network_choice(ui: &mut Ui, chosen: &mut Vec<String>) {
 
 fn torrent_settings(app: &mut App, ui: &mut Ui) {
     let s = &mut app.settings;
-    let about = "Magnet links and .torrent files without web seeds download from the BitTorrent swarm.";
+    let about = "Magnet links without web seeds and .torrent files download from the BitTorrent swarm; a .torrent's web seeds are tried first.";
     // Turned off: no torrent goes on seeding, listening or forwarding a port.
     if switch(ui, "Download from peers", about, &mut s.p2p) && !s.p2p {
         app.rt.spawn(hyperfetch_core::p2p::shutdown());

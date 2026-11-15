@@ -120,7 +120,8 @@ pub struct Settings {
     /// Spread a download's connections over its server's addresses (see
     /// `DownloadOptions::spread_addresses`). On by default.
     pub spread_addresses: bool,
-    /// Download magnet links and .torrent files without web seeds from the BitTorrent swarm.
+    /// Download magnet links without web seeds and .torrent files from the BitTorrent swarm (a
+    /// .torrent's web seeds first).
     pub p2p: bool,
     /// Seed a finished torrent until it has uploaded this many times its size (0 = don't seed).
     pub seed_ratio: f64,
