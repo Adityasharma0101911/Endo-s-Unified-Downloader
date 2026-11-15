@@ -22,6 +22,9 @@ pub struct TorrentFile {
     pub length: u64,
     /// URLs this file can be downloaded from, built from the web seeds per BEP 19.
     pub urls: Vec<Url>,
+    /// The torrent's SHA-1 piece hashes of this file, when its pieces hold it alone: it starts on
+    /// a piece and ends on one or ends the torrent. A download from `urls` is checked against them.
+    pub pieces: Option<crate::metalink::Pieces>,
 }
 
 #[derive(Debug, Clone)]
@@ -211,13 +214,16 @@ pub fn parse_torrent_bytes(data: &[u8]) -> Result<TorrentInfo, String> {
         _ => 0,
     };
 
-    let num_pieces = match dict_get(info_dict, b"pieces") {
-        Some(BValue::Bytes(b)) => b.len() / 20,
-        _ => 0,
+    let hashes: &[u8] = match dict_get(info_dict, b"pieces") {
+        Some(BValue::Bytes(b)) => b,
+        _ => &[],
     };
+    let num_pieces = hashes.len() / 20;
 
     // Single-file torrents have `length`; multi-file ones a `files` list under the `name` directory.
     let mut files = Vec::new();
+    // Where each file starts in the bytes the pieces hash, padding files included.
+    let (mut starts, mut stream) = (Vec::new(), 0u64);
     if let Some(BValue::Int(len)) = dict_get(info_dict, b"length") {
         let urls = web_seeds
             .iter()
@@ -225,7 +231,9 @@ pub fn parse_torrent_bytes(data: &[u8]) -> Result<TorrentInfo, String> {
                 if seed.path().ends_with('/') { web_seed_file_url(seed, &[&raw_name]) } else { Some(seed.clone()) }
             })
             .collect();
-        files.push(TorrentFile { path: vec![name.clone()], length: non_negative(*len, "length")?, urls });
+        stream = non_negative(*len, "length")?;
+        starts.push(0);
+        files.push(TorrentFile { path: vec![name.clone()], length: stream, urls, pieces: None });
     } else if let Some(BValue::List(entries)) = dict_get(info_dict, b"files") {
         for entry in entries {
             let BValue::Dict(fd) = entry else {
@@ -251,6 +259,8 @@ pub fn parse_torrent_bytes(data: &[u8]) -> Result<TorrentInfo, String> {
                 Some(BValue::Bytes(attr)) => attr.contains(&b'p'),
                 _ => raw_path.first().is_some_and(|c| c == ".pad" || c.starts_with("_____padding_file_")),
             };
+            let start = stream;
+            stream = stream.checked_add(length).ok_or_else(|| "Invalid torrent: total length overflows".to_string())?;
             if padding {
                 continue;
             }
@@ -264,7 +274,19 @@ pub fn parse_torrent_bytes(data: &[u8]) -> Result<TorrentInfo, String> {
             components.extend(raw_path.iter().map(String::as_str));
             // A multi-file web seed is always a directory, even if the trailing '/' is missing.
             let urls = web_seeds.iter().filter_map(|seed| web_seed_file_url(seed, &components)).collect();
-            files.push(TorrentFile { path, length, urls });
+            starts.push(start);
+            files.push(TorrentFile { path, length, urls, pieces: None });
+        }
+    }
+
+    // Hashes that are not one per piece of all the files are not trusted for any of them.
+    let pieces_fit = piece_length > 0 && hashes.len() % 20 == 0 && num_pieces as u64 == stream.div_ceil(piece_length);
+    for (file, start) in files.iter_mut().zip(starts).filter(|_| pieces_fit) {
+        let end = start + file.length;
+        if file.length > 0 && start % piece_length == 0 && (end % piece_length == 0 || end == stream) {
+            let held = &hashes[(start / piece_length) as usize * 20..end.div_ceil(piece_length) as usize * 20];
+            let hex = held.chunks(20).map(|h| h.iter().map(|b| format!("{b:02x}")).collect()).collect();
+            file.pieces = Some(crate::metalink::Pieces { length: piece_length, algo: "sha1".into(), hashes: hex });
         }
     }
 
@@ -418,6 +440,29 @@ mod tests {
         assert_eq!(info.trackers.len(), 1);
         assert_eq!(info.files.len(), 1);
         assert_eq!(info.files[0].urls[0].as_str(), "https://mirror.com/test.iso");
+    }
+
+    /// A file gets the piece hashes that hold it alone: it starts on a piece and ends on one or
+    /// ends the torrent (padding files count). Hashes that are not one per piece are not used.
+    #[test]
+    fn test_files_get_the_piece_hashes_that_hold_them_alone() {
+        let (a, b, c) = ("a".repeat(20), "b".repeat(20), "c".repeat(20));
+        let multi = format!(
+            "d4:infod5:filesld6:lengthi4e4:pathl5:a.binee\
+             d6:lengthi3e4:pathl5:b.binee\
+             d4:attr1:p6:lengthi1e4:pathl4:.pad1:1ee\
+             d6:lengthi2e4:pathl5:c.binee\
+             e4:name1:d12:piece lengthi4e6:pieces60:{a}{b}{c}ee"
+        );
+        let info = parse_torrent_bytes(multi.as_bytes()).unwrap();
+        let pieces: Vec<_> = info.files.iter().map(|f| f.pieces.as_ref().map(|p| p.hashes.clone())).collect();
+        assert_eq!(pieces, [Some(vec!["61".repeat(20)]), None, Some(vec!["63".repeat(20)])]);
+        assert!(info.files.iter().all(|f| f.pieces.as_ref().is_none_or(|p| p.fit(f.length) && p.algo == "sha1")));
+
+        let single = format!("d4:infod6:lengthi5e4:name5:a.iso12:piece lengthi4e6:pieces40:{a}{b}ee");
+        assert_eq!(parse_torrent_bytes(single.as_bytes()).unwrap().files[0].pieces.as_ref().map(|p| p.hashes.len()), Some(2));
+        let short = format!("d4:infod6:lengthi5e4:name5:a.iso12:piece lengthi4e6:pieces20:{a}ee");
+        assert!(parse_torrent_bytes(short.as_bytes()).unwrap().files[0].pieces.is_none());
     }
 
     #[test]
