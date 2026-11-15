@@ -409,7 +409,10 @@ impl Ramp {
 
     /// A request was answered: two more workers may send theirs.
     fn answered(&self) {
-        let _ = self.open.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |open| Some(open.saturating_add(2)));
+        // A ramp that lets every worker go stays so (atomics wrap).
+        if self.open.fetch_add(2, Ordering::Relaxed) > usize::MAX - 2 {
+            self.open.store(usize::MAX, Ordering::Relaxed);
+        }
         self.widened.notify_waiters();
     }
 }
