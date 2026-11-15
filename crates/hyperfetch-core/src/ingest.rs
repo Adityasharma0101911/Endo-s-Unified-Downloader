@@ -263,8 +263,11 @@ pub fn might_list(url: &Url) -> bool {
 
 /// `token` as a link [`might_list`] takes, a "leaving this site" link replaced by its target.
 fn listing_url(token: &str) -> Option<Url> {
-    let url = http_url(token)?;
-    let url = resolver::unwrap_redirect(&url).unwrap_or(url);
+    let url = match http_url(token) {
+        Some(url) => resolver::unwrap_redirect(&url).unwrap_or(url),
+        // A bucket's s3:// or gs:// link.
+        None => Url::parse(token).ok().filter(|u| matches!(u.scheme(), "s3" | "gs"))?,
+    };
     might_list(&url).then_some(url)
 }
 
@@ -608,6 +611,10 @@ pub fn link_task(tokens: &[impl AsRef<str>]) -> Result<Task, String> {
             // An ipfs:// link downloads through the public gateways (see `resolver::ipfs_mirrors`).
             if let Some(gateway) = resolver::ipfs_mirrors(&url).filter(|_| url.scheme() == "ipfs").and_then(|m| m.into_iter().next()) {
                 url = gateway;
+            }
+            // An s3:// or gs:// object downloads from its bucket's public address.
+            if let Some(object) = crate::cloud::bucket_object(&url) {
+                url = object;
             }
             if task.checksum.is_none() {
                 task.checksum = resolver::ipfs_checksum(&url);

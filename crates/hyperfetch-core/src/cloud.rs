@@ -9,7 +9,7 @@
 //! Nextcloud and ownCloud public shares (`/s/{token}` on any host that runs one) are listed over
 //! the share's public WebDAV into one task per file, a shared file into its one task.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 
 use percent_encoding::percent_decode_str;
@@ -31,6 +31,14 @@ const SWISSTRANSFER: &str = "https://www.swisstransfer.com";
 const SWISSTRANSFER_GONE: &str = "the SwissTransfer transfer has expired or was deleted";
 const SWISSTRANSFER_LOCKED: &str = "the SwissTransfer transfer wants a password: add its link again with the password on the next line (Password: ...)";
 const SWISSTRANSFER_REFUSED: &str = "the SwissTransfer transfer's password is wrong";
+/// Cloud Storage's JSON API, which lists a public bucket to anyone.
+const GCS_API: &str = "https://storage.googleapis.com";
+/// The Azure Blob service version asked for: older ones cannot read every kind of blob.
+const AZURE_VERSION: &str = "2021-08-06";
+/// Most objects one bucket listing reads.
+const MAX_OBJECTS: usize = 100_000;
+const BUCKET_PRIVATE: &str = "the bucket does not let anyone list it: listing it needs its owner's access key (a signed request), which the app cannot make yet; add the links of its files instead";
+const BUCKET_GONE: &str = "the bucket does not exist, or is private (Azure answers so for a private container)";
 
 const YANDEX: &[&str] = &[
     "yadi.sk", "disk.yandex.ru", "disk.yandex.com", "disk.yandex.com.tr", "disk.yandex.by", "disk.yandex.kz",
@@ -66,6 +74,94 @@ enum Link {
     Box { name: String, file: Option<u64>, folder: Option<u64> },
     /// A SwissTransfer transfer (swisstransfer.com/d/{link}).
     SwissTransfer { link: String },
+    /// A public bucket, or a folder of it: the objects whose keys start with `prefix`.
+    Bucket { bucket: Bucket, prefix: String },
+}
+
+/// Where a bucket is listed and its objects are read.
+#[derive(Debug, PartialEq)]
+enum Bucket {
+    /// An S3 or S3-compatible bucket `name`, at `base` (its own host's root, or the endpoint's
+    /// /{bucket}/); `md5_etags` when a one-part upload's ETag is its MD5, as Amazon's are.
+    S3 { base: Url, name: String, md5_etags: bool },
+    /// A Google Cloud Storage bucket.
+    Gcs { bucket: String },
+    /// An Azure Blob container `name`, at https://{account}.blob.core.windows.net/{name}/.
+    Azure { base: Url, name: String },
+}
+
+/// The bucket and prefix of a link that lists one: `s3://` and `gs://` with no key or a key
+/// ending in `/`, an S3, S3-compatible, Cloud Storage or Azure address of a bucket or of a folder
+/// (a path ending in `/`, or `?prefix=`). A link to an object is not one.
+fn bucket_of(url: &Url) -> Option<(Bucket, String)> {
+    let host = url.host_str()?.trim_end_matches('.').to_ascii_lowercase();
+    let path = percent_decode_str(url.path()).decode_utf8_lossy().into_owned();
+    let query = |name: &str| url.query_pairs().find(|(k, _)| k == name).map(|(_, v)| v.into_owned());
+    let folder = |key: &str| (key.is_empty() || key.ends_with('/')).then(|| key.to_string());
+    let https = |s: &str| Url::parse(s).ok();
+    match url.scheme() {
+        "s3" => return Some((Bucket::S3 { base: https(&format!("https://{host}.s3.amazonaws.com/"))?, name: host, md5_etags: true }, folder(path.trim_start_matches('/'))?)),
+        "gs" => return Some((Bucket::Gcs { bucket: host }, folder(path.trim_start_matches('/'))?)),
+        "http" | "https" => {}
+        _ => return None,
+    }
+    let origin = url.origin().ascii_serialization();
+    // The key after the bucket in a path-style address, and the bucket.
+    let path_style = || {
+        let (bucket, key) = path.trim_start_matches('/').split_once('/').unwrap_or((path.trim_start_matches('/'), ""));
+        Some((bucket.to_string(), query("prefix").or_else(|| folder(key))?)).filter(|(b, _)| !b.is_empty())
+    };
+    let labels: Vec<&str> = host.split('.').collect();
+    let s3_hosts = ["amazonaws.com", "wasabisys.com", "backblazeb2.com"];
+    if s3_hosts.iter().any(|h| host.ends_with(&format!(".{h}"))) {
+        // {bucket}.s3[.-{region}].{host} or s3[.-{region}].{host}/{bucket}; not a website endpoint.
+        let at = labels.iter().position(|l| *l == "s3" || (l.starts_with("s3-") && !l.starts_with("s3-website")))?;
+        let md5_etags = host.ends_with(".amazonaws.com");
+        return if at == 0 {
+            let (bucket, prefix) = path_style()?;
+            Some((Bucket::S3 { base: https(&format!("{origin}/{bucket}/"))?, name: bucket, md5_etags }, prefix))
+        } else {
+            let name = labels[..at].join(".");
+            Some((Bucket::S3 { base: https(&format!("{origin}/"))?, name, md5_etags }, query("prefix").or_else(|| folder(path.trim_start_matches('/')))?))
+        };
+    }
+    if host.ends_with(".digitaloceanspaces.com") {
+        // {bucket}.{region}.digitaloceanspaces.com, or {region}.digitaloceanspaces.com/{bucket}.
+        return match labels.len() {
+            4 => Some((Bucket::S3 { base: https(&format!("{origin}/"))?, name: labels[0].to_string(), md5_etags: false }, query("prefix").or_else(|| folder(path.trim_start_matches('/')))?)),
+            3 => path_style().and_then(|(bucket, prefix)| Some((Bucket::S3 { base: https(&format!("{origin}/{bucket}/"))?, name: bucket, md5_etags: false }, prefix))),
+            _ => None,
+        };
+    }
+    if host == "storage.googleapis.com" {
+        let (bucket, prefix) = path_style()?;
+        return (!["storage", "download", "upload"].contains(&bucket.as_str())).then_some((Bucket::Gcs { bucket }, prefix));
+    }
+    if let Some(bucket) = host.strip_suffix(".storage.googleapis.com") {
+        return Some((Bucket::Gcs { bucket: bucket.to_string() }, query("prefix").or_else(|| folder(path.trim_start_matches('/')))?));
+    }
+    if host.ends_with(".blob.core.windows.net") {
+        let listing = query("comp").as_deref() == Some("list");
+        let (container, key) = path.trim_start_matches('/').split_once('/').unwrap_or((path.trim_start_matches('/'), ""));
+        let prefix = query("prefix").or_else(|| if listing { Some(String::new()) } else { folder(key) })?;
+        return (!container.is_empty()).then(|| Some((Bucket::Azure { base: https(&format!("{origin}/{container}/"))?, name: container.to_string() }, prefix))).flatten();
+    }
+    None
+}
+
+/// The https address of the object an `s3://` or `gs://` link names (one whose key does not end
+/// in `/`, which lists a folder instead).
+pub fn bucket_object(url: &Url) -> Option<Url> {
+    let key = url.path().trim_start_matches('/');
+    if key.is_empty() || key.ends_with('/') {
+        return None;
+    }
+    let host = url.host_str()?;
+    match url.scheme() {
+        "s3" => Url::parse(&format!("https://{host}.s3.amazonaws.com/{key}")).ok(),
+        "gs" => Url::parse(&format!("https://storage.googleapis.com/{host}/{key}")).ok(),
+        _ => None,
+    }
 }
 
 /// Whether `url`'s host is one of `domains` or under one.
@@ -80,6 +176,9 @@ fn is_id(s: &str) -> bool {
 }
 
 fn link_of(url: &Url) -> Option<Link> {
+    if let Some((bucket, prefix)) = bucket_of(url) {
+        return Some(Link::Bucket { bucket, prefix });
+    }
     let segs: Vec<&str> = url.path_segments()?.filter(|s| !s.is_empty()).collect();
     let host = url.host_str()?.trim_end_matches('.');
     let param = |name: &str| url.query_pairs().find(|(k, _)| k == name).map(|(_, v)| v.into_owned());
@@ -152,7 +251,7 @@ pub fn lists(url: &Url) -> bool {
     match link_of(url) {
         Some(Link::PCloud { file, .. } | Link::Box { file, .. }) => file.is_none(),
         Some(Link::Yandex { key, .. }) => key.contains("/d/"),
-        Some(Link::SwissTransfer { .. }) => true,
+        Some(Link::SwissTransfer { .. } | Link::Bucket { .. }) => true,
         _ => share_of(url).is_some(),
     }
 }
@@ -162,8 +261,9 @@ pub fn lists(url: &Url) -> bool {
 /// gave its link (a share's password, see [`share_tasks`]); None when its host runs neither. A
 /// SwissTransfer transfer opens with the password a paste gave.
 pub async fn list(http: &reqwest::Client, url: &Url, options: &ListOptions) -> Option<Result<Vec<Task>, String>> {
-    if let Some(Link::SwissTransfer { link }) = link_of(url) {
-        return Some(swisstransfer_list(http, SWISSTRANSFER, &link, options.password.as_deref()).await);
+    match link_of(url) {
+        Some(Link::SwissTransfer { link }) => return Some(swisstransfer_list(http, SWISSTRANSFER, &link, options.password.as_deref()).await),
+        _ => {}
     }
     match share_of(url) {
         Some(share) => {
@@ -180,6 +280,7 @@ async fn list_link(http: &reqwest::Client, url: &Url) -> Result<Vec<Task>, Strin
         Some(Link::PCloud { api, code, file: None }) => pcloud_list(http, api, url, &code).await?,
         Some(Link::Yandex { key, path }) => yandex_list(http, YANDEX_API, &key, &path).await?,
         Some(Link::Box { name, file: None, folder }) => box_list(http, url, &name, folder).await?,
+        Some(Link::Bucket { bucket, prefix }) => Some(bucket_list(http, &bucket, &prefix, GCS_API).await?),
         _ => return Err(format!("{} is not a folder link", url)),
     };
     match listed {
@@ -204,7 +305,7 @@ pub async fn resolve(client: &reqwest::Client, url: &Url, _proxy: Option<&str>) 
             yandex_file(client, YANDEX_API, &key, &path).await.map(|file| vec![file.unwrap_or_else(|| url.clone())])
         }
         Some(Link::Box { name, file, .. }) => box_file(client, url, &name, file).await.map(|file| vec![file.unwrap_or_else(|| url.clone())]),
-        Some(Link::SwissTransfer { .. }) => Err(LISTS_MANY.to_string()),
+        Some(Link::SwissTransfer { .. } | Link::Bucket { .. }) => Err(LISTS_MANY.to_string()),
         None => Err(format!("{} is not a share link", url)),
     };
     found.map_err(ResolverError::NotFound)
@@ -918,6 +1019,169 @@ async fn swisstransfer_list(http: &reqwest::Client, base: &str, link: &str, pass
     Ok(tasks)
 }
 
+/// The `record` elements of an XML listing, each its child elements' text by name, and the text of
+/// the elements outside them (the next page's token, an error's code).
+fn xml_records(xml: &str, record: &[u8]) -> (Vec<HashMap<String, String>>, HashMap<String, String>) {
+    let mut reader = Reader::from_str(xml.trim_start_matches('\u{feff}'));
+    reader.config_mut().trim_text(true);
+    let (mut records, mut outside, mut current, mut tag) = (Vec::new(), HashMap::new(), None::<HashMap<String, String>>, String::new());
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) => {
+                if e.local_name().as_ref() == record {
+                    current = Some(HashMap::new());
+                }
+                tag = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
+            }
+            Ok(Event::Text(t)) => {
+                let text = t.unescape().map_or_else(|_| String::from_utf8_lossy(&t).into_owned(), |t| t.into_owned());
+                current.as_mut().unwrap_or(&mut outside).insert(tag.clone(), text);
+            }
+            Ok(Event::End(e)) => {
+                if e.local_name().as_ref() == record {
+                    records.extend(current.take());
+                }
+                tag.clear();
+            }
+            Ok(Event::Eof) | Err(_) => return (records, outside),
+            _ => {}
+        }
+    }
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct GcsPage {
+    items: Vec<GcsObject>,
+    next_page_token: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct GcsObject {
+    name: String,
+    /// A number in a string.
+    size: Option<String>,
+    /// Base64; a composite object has none.
+    md5_hash: Option<String>,
+}
+
+/// `md5:<hex>` of a base64 MD5.
+fn md5_base64(b64: &str) -> Option<String> {
+    use base64::Engine as _;
+    let digest = base64::engine::general_purpose::STANDARD.decode(b64.trim()).ok().filter(|d| d.len() == 16)?;
+    Some(crate::digest::checksum("md5", &digest))
+}
+
+/// What a bucket's host answered with an error `status` (and the error `code` its XML gives).
+fn bucket_refused(status: StatusCode, code: Option<&String>) -> String {
+    match status {
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => BUCKET_PRIVATE.to_string(),
+        StatusCode::NOT_FOUND => BUCKET_GONE.to_string(),
+        _ => format!("the bucket's host answered HTTP {}{}", status.as_u16(), code.map(|c| format!(" ({c})")).unwrap_or_default()),
+    }
+}
+
+/// One page of `bucket`'s objects under `prefix`, from `token` on: each object's key, size and MD5
+/// (where the service gives a real one), and the next page's token.
+async fn bucket_page(http: &reqwest::Client, bucket: &Bucket, prefix: &str, token: Option<&str>, gcs_api: &str) -> Result<(Vec<(String, Option<u64>, Option<String>)>, Option<String>), String> {
+    let cannot_reach = |e: reqwest::Error| format!("Cannot reach the bucket's host: {}", e.without_url());
+    let (request, record) = match bucket {
+        Bucket::Gcs { bucket } => {
+            let mut url = Url::parse(gcs_api).map_err(|e| e.to_string())?;
+            url.path_segments_mut().map_err(|_| "bad Cloud Storage address".to_string())?.extend(["storage", "v1", "b", bucket, "o"]);
+            url.query_pairs_mut().append_pair("prefix", prefix).append_pair("fields", "items(name,size,md5Hash),nextPageToken");
+            if let Some(token) = token {
+                url.query_pairs_mut().append_pair("pageToken", token);
+            }
+            let (status, page) = get_json::<GcsPage>(http.get(url), "Cloud Storage").await?;
+            if !status.is_success() {
+                return Err(bucket_refused(status, None));
+            }
+            let objects = page.items.into_iter().map(|o| (o.name, o.size.and_then(|s| s.parse().ok()), o.md5_hash.as_deref().and_then(md5_base64)));
+            return Ok((objects.collect(), page.next_page_token.filter(|t| !t.is_empty())));
+        }
+        Bucket::S3 { base, .. } => {
+            let mut url = base.clone();
+            url.query_pairs_mut().append_pair("list-type", "2").append_pair("prefix", prefix);
+            if let Some(token) = token {
+                url.query_pairs_mut().append_pair("continuation-token", token);
+            }
+            (http.get(url), b"Contents".as_slice())
+        }
+        Bucket::Azure { base, .. } => {
+            let mut url = base.clone();
+            url.set_path(base.path().trim_end_matches('/'));
+            url.query_pairs_mut().append_pair("restype", "container").append_pair("comp", "list").append_pair("prefix", prefix);
+            if let Some(token) = token {
+                url.query_pairs_mut().append_pair("marker", token);
+            }
+            (http.get(url).header("x-ms-version", AZURE_VERSION), b"Blob".as_slice())
+        }
+    };
+    let answer = request.send().await.map_err(cannot_reach)?;
+    let status = answer.status();
+    let xml = answer.text().await.map_err(cannot_reach)?;
+    let (records, outside) = xml_records(&xml, record);
+    if !status.is_success() {
+        return Err(bucket_refused(status, outside.get("Code")));
+    }
+    let field = |r: &HashMap<String, String>, name: &str| r.get(name).cloned().unwrap_or_default();
+    Ok(match bucket {
+        Bucket::Azure { .. } => {
+            let objects = records.iter().map(|r| (field(r, "Name"), field(r, "Content-Length").parse().ok(), md5_base64(&field(r, "Content-MD5"))));
+            (objects.collect(), outside.get("NextMarker").filter(|m| !m.is_empty()).cloned())
+        }
+        _ => {
+            let md5_etags = matches!(bucket, Bucket::S3 { md5_etags: true, .. });
+            // A multipart upload's ETag ("...-3") is no MD5 of the object.
+            let md5 = |etag: String| {
+                let hex = etag.trim_matches('"').to_ascii_lowercase();
+                (md5_etags && hex.len() == 32 && hex.bytes().all(|b| b.is_ascii_hexdigit())).then(|| format!("md5:{hex}"))
+            };
+            let objects = records.iter().map(|r| (field(r, "Key"), field(r, "Size").parse().ok(), md5(field(r, "ETag"))));
+            let truncated = outside.get("IsTruncated").is_some_and(|t| t == "true");
+            (objects.collect(), outside.get("NextContinuationToken").filter(|_| truncated).cloned())
+        }
+    })
+}
+
+/// Every object of `bucket` whose key starts with `prefix`, page by page, each named by its key
+/// after the prefix's folder (folders kept), in a folder named after that folder or the bucket.
+async fn bucket_list(http: &reqwest::Client, bucket: &Bucket, prefix: &str, gcs_api: &str) -> Result<Vec<Task>, String> {
+    // "a/b" lists "a/b1.txt" as "b1.txt", in a folder "a".
+    let parent = prefix.rfind('/').map_or("", |at| &prefix[..=at]);
+    let (base, name) = match bucket {
+        Bucket::S3 { base, name, .. } | Bucket::Azure { base, name } => (base.clone(), name.as_str()),
+        Bucket::Gcs { bucket } => (Url::parse(&format!("{gcs_api}/{bucket}/")).map_err(|e| e.to_string())?, bucket.as_str()),
+    };
+    let folder = component(parent.trim_end_matches('/').rsplit('/').next().filter(|n| !n.is_empty()).unwrap_or(name), "bucket")?;
+    let (mut tasks, mut token) = (Vec::new(), None);
+    for _ in 0..MAX_PAGES {
+        let (objects, next) = bucket_page(http, bucket, prefix, token.as_deref(), gcs_api).await?;
+        for (key, size, checksum) in objects {
+            // A key ending in `/` is a folder's marker, no file.
+            let Some(rest) = key.strip_prefix(parent).filter(|r| !r.is_empty() && !r.ends_with('/')) else { continue };
+            let Ok(file) = clean_path(rest.split('/')) else {
+                tracing::warn!("left out {:?}: not a usable file name", key);
+                continue;
+            };
+            let mut url = base.clone();
+            url.path_segments_mut().map_err(|_| "bad bucket address".to_string())?.pop_if_empty().extend(key.split('/'));
+            let checksum = checksum.filter(|c| crate::storage::validate_checksum(c).is_ok());
+            tasks.push(Task { urls: vec![url], name: Some(file), folder: Some(folder.clone()), size, checksum, from_document: true, ..Task::default() });
+        }
+        if tasks.len() > MAX_OBJECTS {
+            return Err(format!("the bucket holds more than {MAX_OBJECTS} objects there: add the link of one of its folders instead"));
+        }
+        match next {
+            Some(next) => token = Some(next),
+            None => return Ok(tasks),
+        }
+    }
+    Err(format!("the bucket's listing goes on past {MAX_PAGES} pages: add the link of one of its folders instead"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1375,6 +1639,128 @@ mod tests {
         assert_eq!(link_of(&link), Some(Link::SwissTransfer { link: "c96350da-4d8c-4c43-aa6a-40f2d2b31eac".into() }));
         assert!(lists(&link) && handles(&link));
         assert_eq!(link_of(&Url::parse("https://www.swisstransfer.com/en-us").unwrap()), None);
+    }
+
+    fn buckets(path: &str, _: Option<crate::range::ByteRange>) -> Reply {
+        let xml = |status: u16, body: &str| (status, "Content-Type: application/xml\r\n".to_string(), body.as_bytes().to_vec());
+        match path {
+            // As S3 answers, cut down: a folder's marker, a one-part and a multipart upload, a key that climbs out.
+            "/bk/?list-type=2&prefix=data%2F" => xml(200, r#"<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>bk</Name><Prefix>data/</Prefix>
+                <NextContinuationToken>t+1/=</NextContinuationToken><IsTruncated>true</IsTruncated>
+                <Contents><Key>data/</Key><Size>0</Size><ETag>&quot;d41d8cd98f00b204e9800998ecf8427e&quot;</ETag></Contents>
+                <Contents><Key>data/a b.txt</Key><Size>25333</Size><ETag>&quot;A82389915A3D59147C906FE72463312A&quot;</ETag></Contents>
+                <Contents><Key>data/../evil.exe</Key><Size>1</Size></Contents></ListBucketResult>"#),
+            "/bk/?list-type=2&prefix=data%2F&continuation-token=t%2B1%2F%3D" => xml(200, r#"<ListBucketResult><IsTruncated>false</IsTruncated>
+                <Contents><Key>data/sub/c.bin</Key><Size>9</Size><ETag>"0a3d8b5b0fb4a2a3b3c3d3e3f3a3b3c3-2"</ETag></Contents></ListBucketResult>"#),
+            "/private/?list-type=2&prefix=" => xml(403, "<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>"),
+            // As Azure answers (a BOM first), two pages.
+            "/cont?restype=container&comp=list&prefix=" => xml(200, "\u{feff}<?xml version=\"1.0\" encoding=\"utf-8\"?><EnumerationResults ContainerName=\"cont\"><Blobs><Blob><Name>x/y.parquet</Name><Properties><Content-Length>51431175</Content-Length><Content-MD5 /></Properties></Blob></Blobs><NextMarker>m2</NextMarker></EnumerationResults>"),
+            "/cont?restype=container&comp=list&prefix=&marker=m2" => xml(200, "<EnumerationResults><Blobs><Blob><Name>z.txt</Name><Properties><Content-Length>3</Content-Length><Content-MD5>ziZNd8uikTtDCkBTgS5Riw==</Content-MD5></Properties></Blob></Blobs><NextMarker /></EnumerationResults>"),
+            "/gone?restype=container&comp=list&prefix=" => xml(404, "<Error><Code>ResourceNotFound</Code></Error>"),
+            _ if path.starts_with("/storage/v1/b/bk/o?prefix=LC08%2Fa&fields=") => {
+                let body = if path.ends_with("pageToken=p2") {
+                    r#"{"items":[{"name":"LC08/b.txt","size":"3"}]}"#
+                } else {
+                    r#"{"items":[{"name":"LC08/a_MTL.txt","size":"8454","md5Hash":"ziZNd8uikTtDCkBTgS5Riw=="}],"nextPageToken":"p2"}"#
+                };
+                (200, "Content-Type: application/json\r\n".into(), body.as_bytes().to_vec())
+            }
+            _ => xml(404, "<Error><Code>NoSuchBucket</Code></Error>"),
+        }
+    }
+
+    /// A public bucket is one task per object under the prefix (S3 and Azure page by page, Cloud
+    /// Storage too), named from the prefix's folder, subfolders kept, with its size and its MD5
+    /// where it is one (not a multipart ETag); a bucket that is private or missing says so.
+    #[tokio::test]
+    async fn public_buckets_list_their_objects() {
+        let (addr, _) = serve(buckets).await;
+        let base = format!("http://{addr}");
+        let at = |path: &str| Url::parse(&format!("{base}{path}")).unwrap();
+        let listed = |tasks: Vec<Task>| tasks.into_iter().map(|t| (t.urls[0].to_string(), t.folder.unwrap(), t.name.unwrap(), t.size, t.checksum)).collect::<Vec<_>>();
+        let s3 = Bucket::S3 { base: at("/bk/"), name: "bk".into(), md5_etags: true };
+        assert_eq!(
+            listed(bucket_list(&http(), &s3, "data/", &base).await.unwrap()),
+            [
+                (format!("{base}/bk/data/a%20b.txt"), PathBuf::from("data"), PathBuf::from("a b.txt"), Some(25333), Some("md5:a82389915a3d59147c906fe72463312a".to_string())),
+                (format!("{base}/bk/data/sub/c.bin"), PathBuf::from("data"), PathBuf::from("sub").join("c.bin"), Some(9), None),
+            ]
+        );
+        let private = Bucket::S3 { base: at("/private/"), name: "private".into(), md5_etags: true };
+        assert_eq!(bucket_list(&http(), &private, "", &base).await.unwrap_err(), BUCKET_PRIVATE);
+        let azure = Bucket::Azure { base: at("/cont/"), name: "cont".into() };
+        assert_eq!(
+            listed(bucket_list(&http(), &azure, "", &base).await.unwrap()),
+            [
+                (format!("{base}/cont/x/y.parquet"), PathBuf::from("cont"), PathBuf::from("x").join("y.parquet"), Some(51431175), None),
+                (format!("{base}/cont/z.txt"), PathBuf::from("cont"), PathBuf::from("z.txt"), Some(3), Some("md5:ce264d77cba2913b430a4053812e518b".to_string())),
+            ]
+        );
+        assert_eq!(bucket_list(&http(), &Bucket::Azure { base: at("/gone/"), name: "gone".into() }, "", &base).await.unwrap_err(), BUCKET_GONE);
+        assert_eq!(
+            listed(bucket_list(&http(), &Bucket::Gcs { bucket: "bk".into() }, "LC08/a", &base).await.unwrap()),
+            [
+                (format!("{base}/bk/LC08/a_MTL.txt"), PathBuf::from("LC08"), PathBuf::from("a_MTL.txt"), Some(8454), Some("md5:ce264d77cba2913b430a4053812e518b".to_string())),
+                (format!("{base}/bk/LC08/b.txt"), PathBuf::from("LC08"), PathBuf::from("b.txt"), Some(3), None),
+            ]
+        );
+    }
+
+    /// Which links list a bucket, and where: S3's s3://, virtual-hosted and path-style addresses
+    /// (and S3-compatible hosts'), Cloud Storage's gs:// and storage.googleapis.com, Azure's
+    /// container; an object's link is not one, and an s3:// or gs:// object's is its https address.
+    #[test]
+    fn bucket_links_are_told_by_their_shape() {
+        let s3 = |base: &str, name: &str, md5_etags: bool, prefix: &str| Some((Bucket::S3 { base: Url::parse(base).unwrap(), name: name.into(), md5_etags }, prefix.to_string()));
+        let of = |link: &str| bucket_of(&Url::parse(link).unwrap());
+        assert_eq!(of("s3://noaa-ghcn-pds/csv/"), s3("https://noaa-ghcn-pds.s3.amazonaws.com/", "noaa-ghcn-pds", true, "csv/"));
+        assert_eq!(of("s3://bk"), s3("https://bk.s3.amazonaws.com/", "bk", true, ""));
+        assert_eq!(of("https://my.bk.s3.eu-west-1.amazonaws.com/a%20b/"), s3("https://my.bk.s3.eu-west-1.amazonaws.com/", "my.bk", true, "a b/"));
+        assert_eq!(of("https://bk.s3.amazonaws.com/?prefix=csv/by_year/176"), s3("https://bk.s3.amazonaws.com/", "bk", true, "csv/by_year/176"));
+        assert_eq!(of("https://s3.us-east-2.amazonaws.com/bk"), s3("https://s3.us-east-2.amazonaws.com/bk/", "bk", true, ""));
+        assert_eq!(of("https://s3-eu-west-1.amazonaws.com/bk/x/"), s3("https://s3-eu-west-1.amazonaws.com/bk/", "bk", true, "x/"));
+        assert_eq!(of("https://s3.us-west-004.backblazeb2.com/bk/"), s3("https://s3.us-west-004.backblazeb2.com/bk/", "bk", false, ""));
+        assert_eq!(of("https://bk.s3.eu-central-1.wasabisys.com/"), s3("https://bk.s3.eu-central-1.wasabisys.com/", "bk", false, ""));
+        assert_eq!(of("https://bk.nyc3.digitaloceanspaces.com/"), s3("https://bk.nyc3.digitaloceanspaces.com/", "bk", false, ""));
+        assert_eq!(of("https://nyc3.digitaloceanspaces.com/bk/d/"), s3("https://nyc3.digitaloceanspaces.com/bk/", "bk", false, "d/"));
+        assert_eq!(of("gs://gcp-public-data-landsat/LC08/"), Some((Bucket::Gcs { bucket: "gcp-public-data-landsat".into() }, "LC08/".into())));
+        assert_eq!(of("https://storage.googleapis.com/bk/"), Some((Bucket::Gcs { bucket: "bk".into() }, String::new())));
+        let azure = |prefix: &str| Some((Bucket::Azure { base: Url::parse("https://acct.blob.core.windows.net/cont/").unwrap(), name: "cont".into() }, prefix.to_string()));
+        assert_eq!(of("https://acct.blob.core.windows.net/cont?restype=container&comp=list"), azure(""));
+        assert_eq!(of("https://acct.blob.core.windows.net/cont?restype=container&comp=list&prefix=a/b"), azure("a/b"));
+        assert_eq!(of("https://acct.blob.core.windows.net/cont"), azure(""));
+        for object in [
+            "s3://bk/a.zip", "https://bk.s3.amazonaws.com/a.zip", "https://s3.amazonaws.com/bk/a.zip", "https://storage.googleapis.com/bk/a.zip",
+            "https://storage.googleapis.com/storage/v1/b/bk/o", "https://acct.blob.core.windows.net/cont/a.zip", "https://bk.s3-website-us-east-1.amazonaws.com/",
+            "https://ec2-1-2-3-4.compute-1.amazonaws.com/", "https://example.com/bk/",
+        ] {
+            assert_eq!(of(object), None, "{object}");
+        }
+        let object = |link: &str| bucket_object(&Url::parse(link).unwrap()).map(|u| u.to_string());
+        assert_eq!(object("s3://bk/a%20b/c.zip").as_deref(), Some("https://bk.s3.amazonaws.com/a%20b/c.zip"));
+        assert_eq!(object("gs://bk/c.zip").as_deref(), Some("https://storage.googleapis.com/bk/c.zip"));
+        assert_eq!(object("s3://bk/dir/"), None);
+        assert!(lists(&Url::parse("s3://bk/").unwrap()) && handles(&Url::parse("gs://bk/").unwrap()));
+    }
+
+    /// Live: public buckets on S3, Cloud Storage and Azure list their objects, with the MD5 S3 and
+    /// Cloud Storage give.
+    #[tokio::test]
+    #[ignore]
+    async fn live_public_buckets() {
+        let client = crate::ingest::descriptor_client(None).unwrap();
+        let read = |link: &'static str| {
+            let client = client.clone();
+            async move { list(&client, &live(link), &ListOptions::default()).await.unwrap().unwrap() }
+        };
+        let s3 = read("https://noaa-ghcn-pds.s3.amazonaws.com/?prefix=csv/by_year/176").await;
+        let first = s3.iter().find(|t| t.name == Some("1763.csv".into())).unwrap();
+        assert_eq!((first.size, first.checksum.as_deref()), (Some(25333), Some("md5:a82389915a3d59147c906fe72463312a")));
+        let gcs = read("gs://gcp-public-data-landsat/LC08/01/044/034/LC08_L1GT_044034_20130330_20170310_01_T2/").await;
+        let mtl = gcs.iter().find(|t| t.name == Some("LC08_L1GT_044034_20130330_20170310_01_T2_MTL.txt".into())).unwrap();
+        assert_eq!((mtl.size, mtl.checksum.as_deref()), (Some(8454), Some("md5:ce264d77cba2913b430a4053812e518b")));
+        let azure = read("https://azureopendatastorage.blob.core.windows.net/nyctlc?restype=container&comp=list&prefix=_manifest").await;
+        assert!(!azure.is_empty() && azure.iter().all(|t| t.size.is_some()), "{azure:?}");
     }
 
     /// Live: an expired SwissTransfer transfer says so (transfers last 30 days at most, so no
