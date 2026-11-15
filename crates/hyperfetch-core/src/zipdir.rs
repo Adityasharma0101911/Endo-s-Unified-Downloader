@@ -146,6 +146,19 @@ async fn fetch(client: &Client, auth: Option<&Auth>, url: &Url, start: Option<u6
 /// once its Content-Range is checked: with the bytes it holds and the file's size. `auth` goes
 /// only where it covers (see `worker::authorize`).
 async fn ranged(client: &Client, auth: Option<&Auth>, url: &Url, start: Option<u64>, len: u64) -> Result<(Response, u64, u64), String> {
+    match ranged_once(client, auth, url, start, len).await {
+        // Some servers refuse "the last n bytes" and still send a range from a given start: ask
+        // one byte for the size, then the end by its place.
+        Err(refused) if start.is_none() && refused.contains(": HTTP ") => {
+            let Ok((_, _, size)) = ranged_once(client, auth, url, Some(0), 1).await else { return Err(refused) };
+            let len = len.min(size);
+            ranged_once(client, auth, url, Some(size - len), len).await
+        }
+        other => other,
+    }
+}
+
+async fn ranged_once(client: &Client, auth: Option<&Auth>, url: &Url, start: Option<u64>, len: u64) -> Result<(Response, u64, u64), String> {
     let range = match start {
         Some(start) => format!("bytes={}-{}", start, start + len.max(1) - 1),
         None => format!("bytes=-{}", len),
@@ -514,6 +527,11 @@ mod tests {
                         ("", n) => Some((len.saturating_sub(n.parse().ok()?), len - 1)),
                         (s, e) => Some((s.parse().ok()?, e.parse::<u64>().ok()?.min(len - 1))),
                     });
+                    // A path with "nosuffix" refuses "the last n bytes", as some object stores do.
+                    if req.starts_with("get /nosuffix") && spec.is_some_and(|spec| spec.starts_with('-')) {
+                        let _ = sock.write_all(b"HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                        return;
+                    }
                     let resp = match range {
                         Some((s, e)) => {
                             let body = &data[s as usize..=e as usize];
@@ -556,6 +574,17 @@ mod tests {
             ]
         );
         assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_server_that_refuses_the_last_bytes_is_asked_by_place() {
+        let data = zip(&[(b"a.txt", true, b"hello")], b"", None);
+        let (mut url, requests) = serve(data, true).await;
+        url.set_path("/nosuffix.zip");
+        let listed = list_zip(&Client::new(), &url).await.unwrap();
+        assert_eq!(listed[0].name, "a.txt");
+        // The refused request, one byte for the size, then the end.
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]
