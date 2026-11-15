@@ -4,7 +4,7 @@
 // queues that may start empty. Listeners are registered at the top level so a restarted worker gets the event that
 // woke it.
 
-import { ALT_WINDOW_MS, CAPTURE_TYPES, altClicked, originOf, parseSites, parseTypes, shouldCapture } from "./lib/capture.js";
+import { ALT_WINDOW_MS, CAPTURE_TYPES, altClicked, captureDecision, originOf, parseSites, parseTypes, upgradedTypes } from "./lib/capture.js";
 import {
   classifyResponse,
   cleanHost,
@@ -43,6 +43,8 @@ const MAX_COOKIES = 500;
 const MAX_CHUNK_BASE64 = Math.ceil((64 * 1024 * 1024) / 3) * 4;
 const HEADER_CACHE_SIZE = 300;
 const REQUEST_FILTER = { urls: ["<all_urls>"], types: ["media", "xmlhttprequest", "object", "other"] };
+/** Requests whose headers are kept: media ones, and the pages and frames a browser download comes from (see captureDownload). */
+const HEADER_FILTER = { urls: ["<all_urls>"], types: [...REQUEST_FILTER.types, "main_frame", "sub_frame"] };
 // mediaCookies: "Use my browser sign-in on media sites", off until the user turns it on (see mediaCookieJar).
 // captureEnabled: "Send browser downloads to the app", off until the user turns it on (see captureDownload).
 const DEFAULT_SETTINGS = {
@@ -52,10 +54,15 @@ const DEFAULT_SETTINGS = {
   convertToMp4: true,
   mediaCookies: false,
   youtubeButton: true,
+  videoButton: true,
   captureEnabled: false,
   captureTypes: CAPTURE_TYPES,
   captureMinMB: 1,
+  captureAnyOverMB: 50,
+  captureAll: false,
+  captureAlwaysSites: [],
   captureExcludedSites: [],
+  captureStartsApp: true,
 };
 const BADGE_COLOR = "#ef4444";
 const MENU_TITLE = "Download with Endo's Unified Downloader";
@@ -150,11 +157,16 @@ function normalizeSettings(raw) {
     convertToMp4: typeof settings.convertToMp4 === "boolean" ? settings.convertToMp4 : DEFAULT_SETTINGS.convertToMp4,
     mediaCookies: settings.mediaCookies === true,
     youtubeButton: settings.youtubeButton !== false,
+    videoButton: settings.videoButton !== false,
     captureEnabled: settings.captureEnabled === true,
-    // An empty list is the user's: nothing is sent.
-    captureTypes: Array.isArray(settings.captureTypes) ? parseTypes(settings.captureTypes) : CAPTURE_TYPES,
+    // An empty list is the user's: nothing is sent. One still the old default takes the new defaults.
+    captureTypes: Array.isArray(settings.captureTypes) ? upgradedTypes(parseTypes(settings.captureTypes)) : CAPTURE_TYPES,
     captureMinMB: whole(settings.captureMinMB, DEFAULT_SETTINGS.captureMinMB),
+    captureAnyOverMB: whole(settings.captureAnyOverMB, DEFAULT_SETTINGS.captureAnyOverMB),
+    captureAll: settings.captureAll === true,
+    captureAlwaysSites: parseSites(settings.captureAlwaysSites),
     captureExcludedSites: parseSites(settings.captureExcludedSites),
+    captureStartsApp: settings.captureStartsApp !== false,
   };
 }
 
@@ -211,14 +223,14 @@ chrome.webRequest.onSendHeaders.addListener(
     if (headersByUrl.size > HEADER_CACHE_SIZE) headersByUrl.delete(headersByUrl.keys().next().value);
     noteCookiesSent(details, headers);
   },
-  REQUEST_FILTER,
+  HEADER_FILTER,
   // Chrome hides Cookie/Referer/Origin without "extraHeaders"; Firefox shows them and rejects the option.
   chrome.webRequest.OnSendHeadersOptions?.EXTRA_HEADERS ? ["requestHeaders", "extraHeaders"] : ["requestHeaders"],
 );
 
 const forgetRequest = (details) => headersByRequest.delete(details.requestId);
-chrome.webRequest.onCompleted.addListener(forgetRequest, REQUEST_FILTER);
-chrome.webRequest.onErrorOccurred.addListener(forgetRequest, REQUEST_FILTER);
+chrome.webRequest.onCompleted.addListener(forgetRequest, HEADER_FILTER);
+chrome.webRequest.onErrorOccurred.addListener(forgetRequest, HEADER_FILTER);
 
 // ---------------------------------------------------------------------------------------------------------------
 // Per-tab items in chrome.storage.session
@@ -564,11 +576,18 @@ const failure = (error) => ({ ok: false, error: error.message, notRunning: error
 const LAUNCH_URL = "endo-dl://open";
 const START_WAIT_MS = 15000;
 
+/** The start under way (see startApp), so downloads captured together open the app once. */
+let starting = null;
+
 /**
  * Starts the app when it isn't running: opens LAUNCH_URL in a tab of its own (the page is left alone), waits up to
  * 15 s for /ping to answer, then closes that tab. Returns findApp's answer.
  */
-async function startApp() {
+function startApp() {
+  return (starting ??= launchApp().finally(() => (starting = null)));
+}
+
+async function launchApp() {
   let app = await findApp();
   if (app.ok || app.outdated) return app;
   const tab = await chrome.tabs.create({ url: LAUNCH_URL }).catch(() => null);
@@ -790,38 +809,131 @@ chrome.webRequest.onBeforeRequest.addListener(
 );
 
 /**
- * Sends a browser download the filters pick (see lib/capture.js shouldCapture) to the app, with its referrer, the
- * browser's cookies for its host and its file name: paused meanwhile, then cancelled and erased from the browser's
- * list once the app has it. When the app is unreachable or refuses it, it resumes in the browser; the app is never
- * started for it. Returns whether the app took it.
+ * Sends a browser download the filters pick (see lib/capture.js captureDecision) to the app, with its referrer, the
+ * browser's cookies for its host, the other headers the browser sent for it (Authorization among them) and its file
+ * name: paused meanwhile, then cancelled and erased from the browser's list once the app has it. When the app is not
+ * running it is started first (unless "captureStartsApp" is off); when it is unreachable or refuses it, the download
+ * resumes in the browser. Each download is noted in the log with why (see logDownload). Returns whether the app took it.
  */
 async function captureDownload(item) {
   const url = item.finalUrl || item.url;
-  const flags = { altClicked: altClicked(altClicks, item.referrer), posted: posted.has(item.url) || posted.has(url) };
-  if (!shouldCapture(item, await getSettings(), flags)) return false;
-  await chrome.downloads.pause(item.id).catch(() => {});
-  // Firefox: a small download can be done before it is paused; the browser's copy then stays, so the app gets none.
+  const settings = await getSettings();
+  const wasPosted = posted.has(item.url) || posted.has(url);
+  const decision = captureDecision(item, settings, { altClicked: altClicked(altClicks, item.referrer), posted: wasPosted });
+  if (!decision.capture) {
+    const page = /^(blob|data):/i.test(url || "") ? await pageOfMadeDownload(item) : "";
+    logDownload(item, decision.reason, { posted: wasPosted, page });
+    return false;
+  }
+  const paused = await chrome.downloads.pause(item.id).then(() => true, () => false);
+  // Firefox: a small download can be done before it is paused. Only one known to be paused is handed over, so a file
+  // is never both in the browser and in the app, nor in neither: one that finished stays in the browser.
   const [now] = await chrome.downloads.search({ id: item.id }).catch(() => []);
-  if (now && now.state !== "in_progress") return false;
+  const kept = now && now.state !== "in_progress" ? "Finished before it could be handed over" : IS_FIREFOX && !paused ? "The browser could not pause it" : "";
+  if (kept) {
+    logDownload(item, kept);
+    return false;
+  }
   // Firefox: the container the download was made in.
   const store = item.cookieStoreId ? { storeId: item.cookieStoreId } : {};
   const cookies = chrome.cookies ? cookieHeader(await chrome.cookies.getAll({ url, ...store }).catch(() => [])) : "";
-  const filename = String(item.filename || "").split(/[/\\]/).pop();
+  const filename = fileNameOf(item);
+  const sent = sentRequest(url, item.url);
+  if (settings.captureStartsApp && !(await findApp()).ok) await startApp();
   // The file of a download of the app's whose link expired: its new link goes to that download, not to a new one.
-  const request = { cookies, user_agent: navigator.userAgent, referer: isHttpUrl(item.referrer) ? item.referrer : undefined };
+  const referer = isHttpUrl(item.referrer) ? item.referrer : undefined;
+  const request = { cookies, user_agent: sent.userAgent, referer, headers: sent.headers };
   const result = await sendCaptured(
     await waiting.get({ fresh: true }),
     { ...item, filename },
     (download) => relink(download, url, request),
-    () => sendToApp({ url, cookies, userAgent: navigator.userAgent, referer: item.referrer, filename }),
+    () => sendToApp({ url, cookies, userAgent: sent.userAgent, referer, headers: sent.headers, filename }),
   );
   if (!result.ok) {
     chrome.downloads.resume(item.id).catch(() => {});
+    logDownload(item, `Stayed in the browser: ${result.error}`);
     return false;
   }
   await chrome.downloads.cancel(item.id).catch(() => {});
   chrome.downloads.erase({ id: item.id }).catch(() => {});
+  logDownload(item, "Sent to the app", { sent: true });
   return true;
+}
+
+/** A download's file name, without its folder; its link's last part when the browser has none yet. */
+function fileNameOf(item) {
+  const name = String(item.filename || "").split(/[/\\]/).pop();
+  if (name) return name;
+  try {
+    return decodeURIComponent(new URL(item.finalUrl || item.url).pathname.split("/").pop());
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * What the browser sent for a download's request (its final link, else the first): its other headers (Origin,
+ * Authorization, …) and its User-Agent, else this browser's.
+ */
+function sentRequest(...urls) {
+  const seen = urls.map((url) => headersByUrl.get(url)).find(Boolean);
+  const { userAgent, headers } = splitRequestHeaders(seen?.headers);
+  return { userAgent: userAgent || navigator.userAgent, headers };
+}
+
+/**
+ * The page a download the page made itself (blob: or data:) came from: its referrer, else the active tab when it
+ * shows the blob's origin; "" when that is not known.
+ */
+async function pageOfMadeDownload(item) {
+  if (isHttpUrl(item.referrer)) return item.referrer;
+  const origin = originOf(item.url);
+  if (!origin) return "";
+  const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true }).catch(() => []);
+  return isHttpUrl(tab?.url) && originOf(tab.url) === origin ? tab.url : "";
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// The log of browser downloads (the popup's Downloads view): the last LOG_SIZE the extension saw and why each went
+// to the app or stayed in the browser. It is kept in session storage and never leaves the browser.
+
+const LOG_KEY = "downloadLog";
+const LOG_SIZE = 20;
+const logQueue = new Map();
+
+/** Changes the log under its queue (`change` gets the list, newest first, and returns the new one), then tells the popup. */
+function changeLog(change) {
+  return serialize(logQueue, LOG_KEY, async () => {
+    const log = (await chrome.storage.session.get(LOG_KEY))[LOG_KEY] || [];
+    await chrome.storage.session.set({ [LOG_KEY]: change(log).slice(0, LOG_SIZE) });
+    chrome.runtime.sendMessage({ cmd: "LOG_CHANGED" }).catch(() => {});
+  });
+}
+
+/**
+ * Notes browser download `item` in the log with `reason`: whether it was `sent` to the app, whether it answered a
+ * form (`posted`, which the app can't ask for again) and, for one the page made, the `page` it came from. A private
+ * window's downloads are not noted.
+ */
+function logDownload(item, reason, { sent = false, posted = false, page = "" } = {}) {
+  if (item.incognito) return;
+  const url = item.finalUrl || item.url || "";
+  const entry = {
+    id: item.id,
+    name: fileNameOf(item),
+    host: hostOf(url),
+    size: item.totalBytes > 0 ? item.totalBytes : item.fileSize > 0 ? item.fileSize : 0,
+    time: Date.now(),
+    reason,
+    sent,
+    posted,
+    // A data: link can be megabytes, and neither it nor a blob: one can be fetched by the app.
+    url: isHttpUrl(url) ? url : "",
+    referrer: isHttpUrl(item.referrer) ? item.referrer : "",
+    page,
+    store: item.cookieStoreId || "",
+  };
+  changeLog((log) => [entry, ...log.filter((other) => other.id !== item.id)]);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -833,6 +945,9 @@ const waiting = new WaitingList(async () => (await callApp("/expired", { timeout
 const tried = new Map();
 /** How long the popup tells of a download rescued. */
 const RESCUED_NOTE_MS = 10 * 60 * 1000;
+/** What the app said of the pages asked about (see PAGE_KIND), by link, and the most kept. */
+const KIND_KEY = "pageKinds";
+const MAX_KINDS = 200;
 
 /**
  * Gives waiting download `download` the new link `url`, with the browser's request for it (`cookies`, `user_agent`,
@@ -1014,14 +1129,14 @@ const validTabId = (tabId) => Number.isInteger(tabId) && tabId >= 0;
 const POPUP_COMMANDS = {
   async GET_STATE({ tabId }) {
     if (!validTabId(tabId)) return { ok: false, error: "bad tabId" };
-    const [state, app, recs, settings, hostAccess, { rescued }] = await Promise.all([
+    const [state, app, recs, settings, hostAccess, { rescued, [LOG_KEY]: log }] = await Promise.all([
       readTab(tabId),
       findApp(),
       loadRecs(),
       getSettings(),
       // Firefox (and Chrome's "on click" site access) can withhold the host access detection needs.
       chrome.permissions.contains({ origins: ["<all_urls>"] }).catch(() => false),
-      chrome.storage.session.get("rescued").catch(() => ({})),
+      chrome.storage.session.get(["rescued", LOG_KEY]).catch(() => ({})),
     ]);
     const recordings = Object.entries(recs)
       .filter(([, rec]) => rec.tabId === tabId)
@@ -1041,7 +1156,50 @@ const POPUP_COMMANDS = {
     const items = Object.values(state.items).sort((a, b) => b.time - a.time);
     // The last download of the app's given a new link the browser came upon, lately.
     const recent = rescued && Date.now() - rescued.time < RESCUED_NOTE_MS ? rescued.name : null;
-    return { items, app, recordings, settings, armed: Boolean(state.armed), hostAccess, rescued: recent };
+    return { items, app, recordings, settings, armed: Boolean(state.armed), hostAccess, rescued: recent, log: log || [] };
+  },
+
+  /**
+   * "Send to app" on a browser download of the log: its link, with its referrer, the browser's cookies for it and the
+   * headers it was asked with, as captureDownload sends one; the browser's download is cancelled once the app has it,
+   * when it still runs.
+   */
+  async SEND_LOGGED({ id }) {
+    const entry = ((await chrome.storage.session.get(LOG_KEY))[LOG_KEY] || []).find((logged) => logged.id === id);
+    if (!entry || !isHttpUrl(entry.url) || entry.posted) return { ok: false, error: "The app can't fetch this download." };
+    const store = entry.store ? { storeId: entry.store } : {};
+    const cookies = chrome.cookies ? cookieHeader(await chrome.cookies.getAll({ url: entry.url, ...store }).catch(() => [])) : "";
+    const sent = sentRequest(entry.url);
+    const result = await sendToApp({ url: entry.url, cookies, userAgent: sent.userAgent, referer: entry.referrer, headers: sent.headers, filename: entry.name });
+    if (!result.ok) return result;
+    const [now] = await chrome.downloads.search({ id }).catch(() => []);
+    if (now?.state === "in_progress") {
+      await chrome.downloads.cancel(id).catch(() => {});
+      chrome.downloads.erase({ id }).catch(() => {});
+    }
+    await changeLog((log) => log.map((logged) => (logged.id === id ? { ...logged, sent: true, reason: "Sent to the app" } : logged)));
+    return { ok: true };
+  },
+
+  /**
+   * What the app makes of a page by its link (POST /handles): "media" (its video engine takes it), "files" (it finds
+   * the files of a share, folder or file host's page) or "none". Asked when the popup opens, kept per link for the
+   * session; an app that is not running, or too old to say, gives "none", not kept.
+   */
+  async PAGE_KIND({ url }) {
+    if (!isHttpUrl(url) || isOffLimits(hostOf(url))) return { ok: true, kind: "none" };
+    const kinds = (await chrome.storage.session.get(KIND_KEY))[KIND_KEY] || {};
+    if (kinds[url]) return { ok: true, kind: kinds[url] };
+    let kind;
+    try {
+      kind = (await callApp("/handles", { json: { url }, timeout: 3000 })).kind;
+    } catch {
+      return { ok: true, kind: "none" };
+    }
+    kind = ["media", "files"].includes(kind) ? kind : "none";
+    const kept = Object.entries(kinds).slice(-(MAX_KINDS - 1));
+    await chrome.storage.session.set({ [KIND_KEY]: Object.fromEntries([...kept, [url, kind]]) });
+    return { ok: true, kind };
   },
 
   async SEND({ tabId, id, url, filename, mp4, height }) {
@@ -1254,7 +1412,7 @@ const POPUP_COMMANDS = {
   async START_APP({ tabId, retry }) {
     const app = await startApp();
     if (!app.ok) return { ok: false, error: app.outdated ? OUTDATED : "The app didn't start. Open Endo's Unified Downloader yourself, or get it from the releases page." };
-    if (!["SEND", "SEND_URL", "SEND_MEDIA", "SEND_LINKS", "BROWSER_DL"].includes(retry?.cmd)) return { ok: true };
+    if (!["SEND", "SEND_URL", "SEND_MEDIA", "SEND_LINKS", "BROWSER_DL", "SEND_LOGGED"].includes(retry?.cmd)) return { ok: true };
     const reply = await POPUP_COMMANDS[retry.cmd](retry);
     flashBadge(retry.tabId, reply.ok);
     return reply;

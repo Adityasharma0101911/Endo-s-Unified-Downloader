@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { itemChips, itemMeta, itemNote, linkName, recordingView, variantLabel } from "../lib/view.js";
+import { itemChips, itemMeta, itemNote, linkName, logView, recordingView, timeAgo, variantLabel } from "../lib/view.js";
 
 const master = (extra = {}) => ({
   kind: "master",
@@ -81,4 +81,25 @@ test("a link row leads with the decoded file name, else the host", () => {
   assert.equal(linkName("https://a.example/"), "a.example");
   assert.equal(linkName("https://a.example/bad%E0%A4%A"), "bad%E0%A4%A");
   assert.equal(linkName("not a url"), "not a url");
+});
+
+test("a browser download of the log says where it went, why, and what it offers", () => {
+  const now = 10 * 3600 * 1000;
+  const entry = { name: "a.dat", host: "cdn.example", size: 5 * 1024 ** 3, time: now - 5 * 60000, reason: ".dat isn't one of the file types", url: "https://cdn.example/a.dat" };
+  assert.deepEqual(logView(entry, now), {
+    chip: ["Browser", ""],
+    title: "a.dat",
+    info: "cdn.example · 5.0 GB · 5 min ago",
+    reason: ".dat isn't one of the file types",
+    action: "send",
+  });
+  assert.equal(logView({ ...entry, sent: true }, now).action, null);
+  assert.deepEqual(logView({ ...entry, sent: true }, now).chip, ["App", "green"]);
+  assert.equal(logView({ ...entry, posted: true }, now).action, null, "a form's answer can't be asked for again");
+  const made = { ...entry, url: "", host: "", size: 0, page: "https://mega.example/file/x" };
+  assert.equal(logView(made, now).action, "page");
+  assert.equal(logView(made, now).info, "made by the page · 5 min ago");
+  assert.equal(logView({ ...made, page: "" }, now).action, null);
+  assert.equal(timeAgo(now - 30000, now), "just now");
+  assert.equal(timeAgo(now - 3 * 3600 * 1000, now), "3 h ago");
 });

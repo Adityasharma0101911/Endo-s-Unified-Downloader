@@ -2,13 +2,13 @@
 // Everything shown comes from web pages, so it is only ever put into the DOM as text.
 import { parseSites, parseTypes } from "./lib/capture.js";
 import { NO_YOUTUBE, formatDuration, isMediaSiteHost, isOffLimits, sanitizeFilename, suggestFilename } from "./lib/detect.js";
-import { LINK_KINDS, MAX_BATCH, largestSrcset, linkFilter, normalizeLinks, textMatcher } from "./lib/links.js";
+import { LINK_KINDS, MAX_BATCH, largestSrcset, linkFilter, normalizeLinks, siteOf, textMatcher } from "./lib/links.js";
 import { isMediaPage, mediaPayload, pickQuality, rememberedChoice, subtitleChoices, videoChoices } from "./lib/media.js";
-import { itemChips, itemMeta, itemNote, linkName, recordingView, variantLabel } from "./lib/view.js";
+import { itemChips, itemMeta, itemNote, linkName, logView, recordingView, variantLabel } from "./lib/view.js";
 
 const $ = (id) => document.getElementById(id);
 /** The tabs of the popup; each has a `tab-<name>` button and a `<name>-view` panel. */
-const VIEWS = ["media", "links", "record", "settings"];
+const VIEWS = ["media", "links", "record", "downloads", "settings"];
 const VIA_HINT = "For sites that block the app";
 
 let tab = null;
@@ -151,6 +151,7 @@ function render() {
   // Without host access (Firefox grants it separately) the background sees no requests at all.
   $("host-access").hidden = state.hostAccess !== false;
   if (state.settings) renderSettings(state.settings);
+  renderLog(Array.isArray(state.log) ? state.log : []);
   if (!httpTab) return;
   $("page-title").textContent = tab.title || hostOf(tab.url);
   $("page-host").textContent = hostOf(tab.url);
@@ -828,6 +829,104 @@ async function sendLinks() {
   renderCount();
 }
 
+// ---- Downloads: the browser's ----
+
+/** Download id → its row of the log, kept across refreshes so a focused button is not replaced. */
+const logRows = new Map();
+/** What the app makes of the pages asked about (see PAGE_KIND): link → "media", "files" or "none", once known. */
+const knownKinds = new Map();
+const askedKinds = new Map();
+
+/** What the app makes of the page at `url`, asked once per popup; known in knownKinds once it answers. */
+function pageKind(url) {
+  if (!askedKinds.has(url)) {
+    askedKinds.set(url, ask({ cmd: "PAGE_KIND", url }).then((reply) => knownKinds.set(url, reply.kind || "none").get(url)));
+  }
+  return askedKinds.get(url);
+}
+
+function renderLog(log) {
+  const list = $("log");
+  const now = Date.now();
+  const keep = new Set(log.map((entry) => entry.id));
+  for (const [id, row] of logRows) {
+    if (!keep.has(id)) {
+      row.li.remove();
+      logRows.delete(id);
+    }
+  }
+  log.forEach((entry, i) => {
+    let row = logRows.get(entry.id);
+    if (!row) logRows.set(entry.id, (row = makeLogRow(entry.id)));
+    updateLogRow(row, entry, now);
+    if (list.children[i] !== row.li) list.insertBefore(row.li, list.children[i] || null);
+  });
+  $("log-empty").hidden = log.length > 0;
+  renderSiteCapture();
+}
+
+function makeLogRow(id) {
+  const row = {};
+  row.chip = el("span", { className: "chip" });
+  row.label = el("span", { className: "label" });
+  row.action = button("", "btn small", "send");
+  row.info = el("span", { className: "info" });
+  row.reason = el("span", { className: "reason" });
+  row.action.addEventListener("click", async () => {
+    const page = row.mode === "page";
+    row.action.disabled = true;
+    say($("log-msg"), "Sending…");
+    const reply = page
+      ? await ask({ cmd: "SEND_URL", tabId: tab?.id ?? -1, url: row.entry.page, referer: row.entry.page })
+      : await ask({ cmd: "SEND_LOGGED", id });
+    row.action.disabled = false;
+    report($("log-msg"), reply, page ? "Page sent to the downloader." : "Sent to the downloader.");
+    refresh();
+  });
+  row.li = el("li", { className: "rec" }, el("div", { className: "rec-top" }, row.chip, row.label, row.action), row.info, row.reason);
+  return row;
+}
+
+function updateLogRow(row, entry, now) {
+  const view = logView(entry, now);
+  row.entry = entry;
+  row.mode = view.action;
+  row.chip.textContent = view.chip[0];
+  row.chip.className = view.chip[1] ? `chip tone-${view.chip[1]}` : "chip";
+  row.label.textContent = view.title;
+  row.label.title = view.title;
+  row.info.textContent = view.info;
+  row.reason.textContent = view.reason;
+  row.action.label.textContent = view.action === "page" ? "Send page" : "Send to app";
+  row.action.setAttribute("aria-label", `${row.action.label.textContent}: ${view.title}`);
+  // The page a download the page made came from is offered once the app says it can take something from it.
+  const kind = view.action === "page" ? knownKinds.get(entry.page) : null;
+  if (kind === undefined) pageKind(entry.page).then(() => renderLog(state.log || []));
+  row.action.hidden = !view.action || (view.action === "page" && kind !== "media" && kind !== "files");
+}
+
+/** "Always send" and "Never" for the tab's site (see setSiteCapture), pressed as the settings say. */
+function renderSiteCapture() {
+  const s = state.settings;
+  const site = httpTab ? siteOf(hostOf(tab.url)) : "";
+  $("site-capture").hidden = !site || !s;
+  if (!site || !s) return;
+  $("site-name").textContent = site;
+  $("site-always").setAttribute("aria-pressed", String(s.captureAlwaysSites.includes(site)));
+  $("site-never").setAttribute("aria-pressed", String(s.captureExcludedSites.includes(site)));
+}
+
+/** Puts the tab's site on `list` ("captureAlwaysSites" or "captureExcludedSites") and off the other, or takes it off again. */
+function setSiteCapture(list) {
+  const s = state.settings;
+  const site = siteOf(hostOf(tab.url));
+  const other = list === "captureAlwaysSites" ? "captureExcludedSites" : "captureAlwaysSites";
+  const on = s[list].includes(site);
+  const patch = { [list]: on ? s[list].filter((host) => host !== site) : [...s[list], site], [other]: s[other].filter((host) => host !== site) };
+  const done = on ? `${site} follows the usual rules again.` : list === "captureAlwaysSites" ? `Downloads from ${site} go to the app.` : `Downloads from ${site} stay in the browser.`;
+  saveSettings(patch, s.captureEnabled ? done : `${done} Turn on "Send browser downloads to the app" in Settings for it to apply.`, $("log-msg"));
+}
+
 // ---- Settings ----
 
 function renderSettings(s) {
@@ -840,7 +939,15 @@ function renderSettings(s) {
   $("youtube-button").checked = s.youtubeButton !== false;
   $("youtube-button").closest(".setting").hidden = NO_YOUTUBE;
   $("capture").checked = s.captureEnabled === true;
-  const typed = { "capture-types": s.captureTypes?.join(" "), "capture-min": s.captureMinMB, "capture-sites": s.captureExcludedSites?.join(" ") };
+  $("capture-all").checked = s.captureAll === true;
+  $("capture-start").checked = s.captureStartsApp !== false;
+  const typed = {
+    "capture-types": s.captureTypes?.join(" "),
+    "capture-min": s.captureMinMB,
+    "capture-over": s.captureAnyOverMB,
+    "capture-always": s.captureAlwaysSites?.join(" "),
+    "capture-sites": s.captureExcludedSites?.join(" "),
+  };
   for (const [id, value] of Object.entries(typed)) {
     if (document.activeElement !== $(id)) $(id).value = String(value ?? "");
   }
@@ -865,16 +972,27 @@ function renderSettings(s) {
  * at once, and two saves built from the same settings would undo each other.
  */
 let saving = Promise.resolve();
-function saveSettings(patch, success) {
+function saveSettings(patch, success, node = $("settings-msg")) {
   saving = saving.then(async () => {
-    if (!state.settings) return say($("settings-msg"), "Settings haven't loaded; reopen the popup.", "err");
+    if (!state.settings) return say(node, "Settings haven't loaded; reopen the popup.", "err");
     const settings = { ...state.settings, ...patch };
     const reply = await ask({ cmd: "SET_SETTINGS", settings });
     if (reply.ok) state.settings = settings;
-    report($("settings-msg"), reply, success);
+    report(node, reply, success);
     renderSettings(state.settings);
+    renderSiteCapture();
   });
   return saving;
+}
+
+/** A whole-number setting typed in `id` (`what` names its unit for the error), saved under `key`. */
+function wholeInput(id, key, what) {
+  $(id).addEventListener("change", (event) => {
+    const n = Number(event.target.value);
+    if (event.target.value.trim() !== "" && Number.isInteger(n) && n >= 0) return saveSettings({ [key]: n }, "Saved.");
+    say($("settings-msg"), `Enter a whole number of ${what}.`, "err");
+    event.target.value = String(state.settings?.[key] ?? 0);
+  });
 }
 
 function sizeInput(id, key) {
@@ -1030,14 +1148,15 @@ async function init() {
   $("media-cookies").addEventListener("change", (event) => saveSettings({ mediaCookies: event.target.checked }, "Saved."));
   $("youtube-button").addEventListener("change", (event) => saveSettings({ youtubeButton: event.target.checked }, "Saved."));
   $("capture").addEventListener("change", (event) => saveSettings({ captureEnabled: event.target.checked }, "Saved."));
+  $("capture-all").addEventListener("change", (event) => saveSettings({ captureAll: event.target.checked }, "Saved."));
+  $("capture-start").addEventListener("change", (event) => saveSettings({ captureStartsApp: event.target.checked }, "Saved."));
   $("capture-types").addEventListener("change", (event) => saveSettings({ captureTypes: parseTypes(event.target.value) }, "Saved."));
+  $("capture-always").addEventListener("change", (event) => saveSettings({ captureAlwaysSites: parseSites(event.target.value) }, "Saved."));
   $("capture-sites").addEventListener("change", (event) => saveSettings({ captureExcludedSites: parseSites(event.target.value) }, "Saved."));
-  $("capture-min").addEventListener("change", (event) => {
-    const n = Number(event.target.value);
-    if (event.target.value.trim() !== "" && Number.isInteger(n) && n >= 0) return saveSettings({ captureMinMB: n }, "Saved.");
-    say($("settings-msg"), "Enter a whole number of MB (0 = any size).", "err");
-    event.target.value = String(state.settings?.captureMinMB ?? 1);
-  });
+  wholeInput("capture-min", "captureMinMB", "MB (0 = any size)");
+  wholeInput("capture-over", "captureAnyOverMB", "MB (0 = off)");
+  $("site-always").addEventListener("click", () => setSiteCapture("captureAlwaysSites"));
+  $("site-never").addEventListener("click", () => setSiteCapture("captureExcludedSites"));
   $("start-app").addEventListener("click", startApp);
   $("mc-form").addEventListener("change", updateMediaForm);
   $("mc-form").addEventListener("submit", downloadMedia);
@@ -1047,7 +1166,7 @@ async function init() {
 
   showView(httpTab ? (VIEWS.includes(saved) ? saved : "media") : "settings");
   chrome.runtime.onMessage.addListener((msg) => {
-    if (msg?.cmd === "STATE_CHANGED" && msg.tabId === tab?.id) refresh();
+    if ((msg?.cmd === "STATE_CHANGED" && msg.tabId === tab?.id) || msg?.cmd === "LOG_CHANGED") refresh();
   });
   await refresh();
 }

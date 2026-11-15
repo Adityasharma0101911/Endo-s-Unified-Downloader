@@ -2,11 +2,28 @@
 // settings' file types and sites as typed. No chrome.* in here, so node can test it.
 import { cleanHost, isBlocked } from "./detect.js";
 
-/** The file types sent to the app until the user changes them. Not `torrent`: any page could then start a swarm download. */
-export const CAPTURE_TYPES = [
+/** The file types sent to the app until 1.9 (see upgradedTypes). */
+const FIRST_TYPES = [
   "zip", "7z", "rar", "tar", "gz", "xz", "bz2", "zst", "iso", "img", "dmg", "pkg", "exe", "msi", "msix", "appimage",
   "deb", "rpm", "apk", "mp4", "mkv", "webm", "avi", "mov", "mp3", "flac", "wav", "m4a", "pdf", "epub",
 ];
+/** The file types sent to the app until the user changes them. Not `torrent`: any page could then start a swarm download. */
+export const CAPTURE_TYPES = [
+  ...FIRST_TYPES,
+  "tgz", "lz", "lzma", "cab", "wim", "esd", "dat", "bin", "jar", "ipa", "appx", "appxbundle", "msixbundle", "xapk",
+  "vhd", "vhdx", "vmdk", "vdi", "qcow2", "ova", "safetensors", "gguf", "ckpt", "pth", "onnx", "m4v", "ts", "m2ts",
+  "wmv", "flv", "ogg", "opus", "aac", "wma", "mobi", "azw3", "djvu", "cbz", "cbr", "psd", "ttf", "otf",
+];
+const MB = 1024 * 1024;
+
+/**
+ * A stored list of types, with the new defaults when it is still exactly the list of before 1.9: a list the user
+ * edited is kept as it is.
+ */
+export function upgradedTypes(types) {
+  const same = types.length === FIRST_TYPES.length && FIRST_TYPES.every((type) => types.includes(type));
+  return same ? CAPTURE_TYPES : types;
+}
 /** How long after an Alt-click a download stays in the browser. */
 export const ALT_WINDOW_MS = 5000;
 
@@ -68,20 +85,47 @@ function hostOf(url) {
   }
 }
 
+/** Whether `host` is one of the sites of `sites` or under one. */
+const onList = (host, sites = []) => Boolean(host) && sites.some((site) => host === site || host.endsWith("." + site));
+
 /**
- * Whether a browser download (a downloads.DownloadItem) goes to the app: capture is on; it is an http(s) download
- * the app can fetch again (not incognito, not blob: or data:, not the answer to a form sent with POST, `posted`)
- * that no extension started;
- * Alt was not held on the click that started it (`altClicked`); its file name, else its link, has one of the types;
- * it is at least the minimum size (an unknown size passes); and neither it nor the page it came from is on an
- * excluded site.
+ * Whether a browser download (a downloads.DownloadItem) goes to the app, and why, as {capture, reason}. It stays in
+ * the browser when capture is off; in a private window; when an extension started it; after an Alt-click
+ * (`altClicked`); once it is no longer running; when the app can't fetch it again (not http(s), such as blob: and
+ * data:, or the answer to a form sent with POST, `posted`); or when it or the page it came from is on an excluded
+ * site. Past those, a download from an "always" site goes; one under the minimum size stays (an unknown size
+ * passes); and the rest goes with "Everything" on, else when it is at least `captureAnyOverMB` (0: off), else when
+ * its file name, else its link, has one of the types.
  */
-export function shouldCapture(item, settings, { altClicked = false, posted = false } = {}) {
+export function captureDecision(item, settings, { altClicked = false, posted = false } = {}) {
   const url = item.finalUrl || item.url;
-  if (!settings.captureEnabled || item.incognito || item.byExtensionId || altClicked || posted) return false;
-  if ((item.state && item.state !== "in_progress") || ![item.url, url].every((link) => /^https?:\/\//i.test(link || ""))) return false;
-  if (!settings.captureTypes.includes(extensionOf(item.filename) || extensionOf(url))) return false;
+  const stay = (reason) => ({ capture: false, reason });
+  if (!settings.captureEnabled) return stay("Sending browser downloads to the app is off");
+  if (item.incognito) return stay("Private window");
+  if (item.byExtensionId) return stay("Started by an extension");
+  if (altClicked) return stay("Alt was held on the click");
+  if (item.state && item.state !== "in_progress") return stay("Finished before it could be handed over");
+  if (![item.url, url].every((link) => /^https?:\/\//i.test(link || ""))) {
+    return stay(/^(blob|data):/i.test(url || "") ? "Made by the page (blob: or data:): only the browser has it" : "Not an http(s) link");
+  }
+  if (posted) return stay("The answer to a form sent with POST: the app can only ask for a link again");
+  const hosts = [url, item.referrer].map(hostOf).filter(Boolean);
+  const excluded = hosts.find((host) => isBlocked(host, settings.captureExcludedSites));
+  if (excluded) return stay(`Never from ${excluded}`);
+  const always = hosts.find((host) => onList(host, settings.captureAlwaysSites));
+  if (always) return { capture: true, reason: `Always from ${always}` };
   const size = item.totalBytes > 0 ? item.totalBytes : item.fileSize > 0 ? item.fileSize : 0;
-  if (size && size < settings.captureMinMB * 1024 * 1024) return false;
-  return ![url, item.referrer].some((link) => isBlocked(hostOf(link), settings.captureExcludedSites));
+  if (size && size < settings.captureMinMB * MB) return stay(`Under the minimum size (${settings.captureMinMB} MB)`);
+  if (settings.captureAll) return { capture: true, reason: "Everything goes to the app" };
+  const over = settings.captureAnyOverMB > 0 ? settings.captureAnyOverMB : 0;
+  if (size && over && size >= over * MB) return { capture: true, reason: `${over} MB or more` };
+  const type = extensionOf(item.filename) || extensionOf(url);
+  if (type && settings.captureTypes.includes(type)) return { capture: true, reason: `.${type} is one of the file types` };
+  const why = type ? `.${type} isn't one of the file types` : "No file type in its name or link";
+  return stay(!over ? why : size ? `${why}, and it's under ${over} MB` : `${why}, and its size isn't known`);
+}
+
+/** Whether a browser download goes to the app (see captureDecision). */
+export function shouldCapture(item, settings, flags) {
+  return captureDecision(item, settings, flags).capture;
 }
