@@ -21,6 +21,8 @@
   const ARM_KEY = "__endo_rec_armed";
   const MAX_PLAYLIST = 2 * 1024 * 1024;
   const MAX_URL = 32 * 1024;
+  /** The start of a DASH manifest hook.js passes on (its MPD_HEAD). */
+  const MPD_HEAD = 64 * 1024;
   /** Raw bytes per REC_CHUNK: base64 adds a third, and Chrome refuses messages over 64 MiB. */
   const SLICE = 8 * 1024 * 1024;
   /** Bytes per ranged request of a browser file download. */
@@ -139,8 +141,14 @@
       } else if (isUrl(m.url, HTTP)) {
         send({ cmd: "M3U8_SEEN", url: m.url, text: m.text });
       }
-    } else if (m.t === "media-url" || m.t === "mpd" || m.t === "ism") {
-      if (isUrl(m.url, HTTP)) send({ cmd: m.t === "mpd" ? "MPD_SEEN" : m.t === "ism" ? "ISM_SEEN" : "MEDIA_URL_SEEN", url: m.url });
+    } else if (m.t === "mpd") {
+      // The manifest's start tells whether it is live or protected.
+      const head = typeof m.head === "string" ? m.head.slice(0, MPD_HEAD) : "";
+      if (isUrl(m.url, HTTP)) send({ cmd: "MPD_SEEN", url: m.url, head });
+    } else if (m.t === "media-url" || m.t === "ism") {
+      if (isUrl(m.url, HTTP)) send({ cmd: m.t === "ism" ? "ISM_SEEN" : "MEDIA_URL_SEEN", url: m.url });
+    } else if (m.t === "drm") {
+      send({ cmd: "DRM_SEEN", system: typeof m.system === "string" ? m.system.slice(0, 100) : "" });
     } else if (m.t === "rec-active") {
       send({ cmd: "REC_ACTIVE" });
     } else if (m.t === "rec-chunk") {

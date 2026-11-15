@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { itemChips, itemMeta, itemNote, linkName, logView, recordingView, timeAgo, variantLabel } from "../lib/view.js";
+import { itemChips, itemMeta, itemNote, linkName, logView, queueView, recordingView, timeAgo, variantLabel } from "../lib/view.js";
 
 const master = (extra = {}) => ({
   kind: "master",
@@ -81,6 +81,8 @@ test("a link row leads with the decoded file name, else the host", () => {
   assert.equal(linkName("https://a.example/"), "a.example");
   assert.equal(linkName("https://a.example/bad%E0%A4%A"), "bad%E0%A4%A");
   assert.equal(linkName("not a url"), "not a url");
+  assert.equal(linkName("magnet:?xt=urn:btih:abc&dn=Some%20Show"), "Some Show");
+  assert.equal(linkName("magnet:?xt=urn:btih:abc"), "Magnet link");
 });
 
 test("a browser download of the log says where it went, why, and what it offers", () => {
@@ -102,4 +104,28 @@ test("a browser download of the log says where it went, why, and what it offers"
   assert.equal(logView({ ...made, page: "" }, now).action, null);
   assert.equal(timeAgo(now - 30000, now), "just now");
   assert.equal(timeAgo(now - 3 * 3600 * 1000, now), "3 h ago");
+});
+
+test("a download of the app's shows its progress and what the app can do with it", () => {
+  const running = { id: 3, name: "big.iso", status: "downloading", done: 512 * 1024 ** 2, total: 1024 ** 3, speed: 5 * 1024 ** 2 };
+  assert.deepEqual(queueView(running), {
+    title: "big.iso",
+    chip: ["Downloading", "accent"],
+    percent: 50,
+    info: "50% · 512.0 MB of 1.0 GB · 5.0 MB/s",
+    actions: ["pause"],
+  });
+  assert.deepEqual(queueView({ ...running, status: "paused" }).actions, ["resume", "remove"]);
+  assert.equal(queueView({ ...running, status: "paused" }).info, "50% · 512.0 MB of 1.0 GB", "no speed when stopped");
+  assert.deepEqual(queueView({ ...running, status: "done", done: 1024 ** 3 }), {
+    title: "big.iso",
+    chip: ["Done", "green"],
+    percent: null,
+    info: "1.0 GB",
+    actions: ["remove"],
+  });
+  assert.equal(queueView({ ...running, status: "failed", error: "HTTP 404" }).info, "HTTP 404");
+  assert.equal(queueView({ id: 9, status: "queued", done: 0, total: 0 }).title, "Download #9");
+  assert.equal(queueView({ id: 9, status: "queued", done: 0, total: 0 }).percent, null);
+  assert.deepEqual(queueView({ id: 9, status: "pausing" }).actions, []);
 });
