@@ -2,6 +2,7 @@
 
 - After every change, commit it and push it to the current branch (`git push -u origin <branch>` the first time). Don't wait to be asked.
 - Work on a feature branch, never directly on `main`. Merge to `main` only when asked.
+- After every change to the app, build it so the user can run and test it: `cargo build -p hyperfetch-gui` (and `-p hyperfetch-cli` when the CLI changed), under the memory rules below. Then tell the user where it is: `target\debug\Endos-Unified-Downloader.exe`. If too little memory is free to build, say so instead of skipping it silently.
 - Never touch, stage or commit `reference(dont commit)/`.
 - Before committing, make sure it builds and the tests pass: `cargo build --workspace`, `cargo test --workspace -- --test-threads=4`, `node --test "extension/test/*.test.mjs"`.
 
