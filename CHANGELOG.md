@@ -8,6 +8,7 @@ What changed in each release, newest first. Each release's page on [GitHub](http
 - **App: Undo.** Removing a download, Clear completed and Clear all offer Undo for 8 seconds, in a note at the bottom of the window.
 - **App: a first-run welcome** on the Add page with the three steps to a first download, a list of the keyboard shortcuts (F1, or Shortcuts in the sidebar), and empty pages that say what to do.
 - **App: plainer words.** Common errors say what to do about them ("The file is no longer at this link…"), a download's workers are called connections, and "resolving" is "connecting".
+- **SourceForge:** its links failed, as SourceForge answers the browser User-Agent the app sent with a 403 page; it now gets the app's own, and a file downloads from SourceForge's pick of a mirror and up to five more from the mirror list it gives for that file.
 - Fixed: a progress bar's fill went square when short and the light sweeping over it was cut to a rectangle; both now follow the bar's round ends.
 
 ## 1.9.0 (2026-10-30)

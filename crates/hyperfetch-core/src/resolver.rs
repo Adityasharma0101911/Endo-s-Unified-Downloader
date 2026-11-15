@@ -27,8 +27,6 @@ const META_VIDEO_KEYS: &[&str] = &["og:video", "og:video:url", "og:video:secure_
 /// JSON keys used by custom players (Zoom recordings, Panopto, Loom, ...) for the video file.
 const JSON_VIDEO_KEYS: &[&str] = &["viewMp4Url", "downloadUrl", "videoUrl", "video_url", "contentUrl", "stream_url", "fileUrl"];
 
-const SOURCEFORGE_MIRRORS: &[&str] = &["autoselect", "netix", "phoenixnap", "netcologne", "jaist", "liquidtelecom"];
-
 /// "You are leaving this site" links: their hosts (a trailing `*` for any of the site's country
 /// domains, see `country_domain`), their path (trailing slash aside; `None` for any) and the query
 /// parameters that may hold the target, in the order they are tried.
@@ -1011,22 +1009,51 @@ impl HostResolver for SourceForgeResolver {
         matches!(url.host_str(), Some("sourceforge.net" | "www.sourceforge.net")) && sourceforge_file_path(url).is_some()
     }
 
-    async fn resolve(&self, _client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
+    async fn resolve(&self, client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
         let (project, file) = sourceforge_file_path(url)
             .ok_or_else(|| ResolverError::Parse(format!("Not a SourceForge file URL: {}", url)))?;
-        // downloads.sourceforge.net always redirects straight to the mirror, never to the HTML
-        // "your download will start shortly" page that sourceforge.net serves to browsers.
-        let base = Url::parse(&format!("https://downloads.sourceforge.net/project/{}/{}", project, file))
-            .map_err(|e| ResolverError::Parse(e.to_string()))?;
-        Ok(SOURCEFORGE_MIRRORS
-            .iter()
-            .map(|code| {
-                let mut mirror = base.clone();
-                mirror.query_pairs_mut().append_pair("use_mirror", code);
-                mirror
-            })
-            .collect())
+        sourceforge_mirrors(client, SOURCEFORGE_MIRROR_CHOICES, &project, &file).await
     }
+}
+
+/// The page that lists the mirrors holding a SourceForge file, each a radio button whose value is
+/// "{id},{name}".
+const SOURCEFORGE_MIRROR_CHOICES: &str = "https://sourceforge.net/settings/mirror_choices";
+
+/// Most mirrors one SourceForge file downloads from.
+const SOURCEFORGE_MAX_MIRRORS: usize = 6;
+
+/// The file `file` (percent-encoded) of SourceForge's `project` on SourceForge's own pick of a
+/// mirror, then on those of the mirrors `choices` lists for it; on its own pick alone when the
+/// list cannot be read. downloads.sourceforge.net redirects straight to the mirror, never to the
+/// "your download will start shortly" page sourceforge.net shows browsers.
+async fn sourceforge_mirrors(client: &Client, choices: &str, project: &str, file: &str) -> Result<Vec<Url>, ResolverError> {
+    let base = Url::parse(&format!("https://downloads.sourceforge.net/project/{}/{}", project, file)).map_err(|e| ResolverError::Parse(e.to_string()))?;
+    let decoded = percent_encoding::percent_decode_str(file).decode_utf8_lossy();
+    let listed = async {
+        let page = Url::parse_with_params(choices, [("projectname", project), ("filename", &decoded)]).ok()?;
+        let answer = client.get(page).header(USER_AGENT, APP_USER_AGENT).send().await.ok()?.error_for_status().ok()?;
+        read_capped(answer, MAX_HTML_BYTES).await.ok()
+    };
+    let html = tokio::time::timeout(RESOLVE_TIMEOUT, listed).await.ok().flatten().unwrap_or_default();
+    let ids = html.split("name=\"mirror\"").skip(1).filter_map(|input| {
+        let value = input.split_once("value=\"")?.1.split(['"', ',']).next()?;
+        (!value.is_empty() && value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')).then_some(value)
+    });
+    let mut codes = vec!["autoselect"];
+    for id in ids {
+        if !codes.contains(&id) && codes.len() < SOURCEFORGE_MAX_MIRRORS {
+            codes.push(id);
+        }
+    }
+    Ok(codes
+        .into_iter()
+        .map(|code| {
+            let mut mirror = base.clone();
+            mirror.query_pairs_mut().append_pair("use_mirror", code);
+            mirror
+        })
+        .collect())
 }
 
 /// Code Host Resolver (Turns a "view file" page on GitHub, GitLab, Codeberg, Bitbucket or Hugging
@@ -1405,7 +1432,7 @@ impl SmartResolver {
             return DropboxResolver.resolve(client, url).await;
         }
         if SourceForgeResolver.can_handle(url) {
-            return SourceForgeResolver.resolve(client, url).await;
+            return with_timeout(SourceForgeResolver.resolve(client, url)).await;
         }
         if CodeHostResolver.can_handle(url) {
             return CodeHostResolver.resolve(client, url).await;
@@ -1471,8 +1498,9 @@ pub(crate) const APP_USER_AGENT: &str = concat!("EndosUnifiedDownloader/", env!(
 
 /// Hosts that refuse the browser User-Agent of `SmartResolver::default_anti_qos_headers`, and
 /// get [`APP_USER_AGENT`] instead: Codeberg answers /raw/ and /media/ for an older Chrome with
-/// "403 Access denied, old Chrome version".
-const OWN_AGENT_HOSTS: &[&str] = &["codeberg.org"];
+/// "403 Access denied, old Chrome version"; SourceForge answers a browser's that runs no script
+/// with a 403 page (its mirrors take either).
+const OWN_AGENT_HOSTS: &[&str] = &["codeberg.org", "sourceforge.net", "www.sourceforge.net", "downloads.sourceforge.net"];
 
 /// `request`, for `url`, with the User-Agent `url`'s host takes.
 pub(crate) fn with_agent_for(request: reqwest::RequestBuilder, url: &Url) -> reqwest::RequestBuilder {
@@ -2216,6 +2244,8 @@ mod tests {
         let app = Some(APP_USER_AGENT.to_string());
         assert_eq!(agent("https://codeberg.org/forgejo/forgejo/media/branch/forgejo/README.md"), app);
         assert_eq!(agent("https://codeberg.org./o/r/raw/branch/main/app.zip"), app);
+        assert_eq!(agent("https://downloads.sourceforge.net/project/p/f.zip?use_mirror=netix"), app);
+        assert_eq!(agent("https://sourceforge.net/projects/p/files/latest/download"), app);
         // Elsewhere the client's own, a browser's, stays.
         for other in ["https://github.com/o/r/raw/main/app.zip", "https://docs.codeberg.org/x", "https://example.com/codeberg.org"] {
             assert_eq!(agent(other), None, "{other}");
@@ -2600,17 +2630,47 @@ mod tests {
         }
     }
 
+    /// A file is SourceForge's own pick of a mirror, then the mirrors its list names (as its page
+    /// gives them, the first few, each once); its own pick alone when the list cannot be read.
     #[tokio::test]
-    async fn test_sourceforge_mirror_generation() {
-        let client = Client::new();
-        let url = Url::parse("https://sourceforge.net/projects/sevenzip/files/7-Zip/24.09/7z2409-x64.exe/download?ts=123").unwrap();
-        let resolved = SourceForgeResolver.resolve(&client, &url).await.unwrap();
-        assert_eq!(resolved.len(), SOURCEFORGE_MIRRORS.len());
-        assert_eq!(
-            resolved[1].as_str(),
-            "https://downloads.sourceforge.net/project/sevenzip/7-Zip/24.09/7z2409-x64.exe?use_mirror=netix"
-        );
-        assert!(resolved.iter().all(|u| u.query_pairs().count() == 1));
+    async fn test_sourceforge_mirrors_come_from_its_list() {
+        let (addr, hits) = crate::hls::tests::serve(|path, _| match path {
+            "/settings/mirror_choices?projectname=sevenzip&filename=7-Zip%2F24.09%2F7z+2409.exe" => {
+                let mirror = |id: &str| format!(r#"<li id="{id}"><input type="radio" name="mirror" id="mirror_{id}" value="{id},Name of {id}" /></li>"#);
+                let ids = ["autoselect", "cytranet-dal", "netix", "netix", "bad id", "a", "b", "c", "d"];
+                (200, "Content-Type: text/html\r\n".into(), ids.map(mirror).concat().into_bytes())
+            }
+            _ => (404, String::new(), Vec::new()),
+        })
+        .await;
+        let choices = format!("http://{addr}/settings/mirror_choices");
+        let mirrors = sourceforge_mirrors(&Client::new(), &choices, "sevenzip", "7-Zip/24.09/7z%202409.exe").await.unwrap();
+        let codes: Vec<_> = mirrors.iter().map(|u| u.query_pairs().find(|(k, _)| k == "use_mirror").unwrap().1.into_owned()).collect();
+        assert_eq!(codes, ["autoselect", "cytranet-dal", "netix", "a", "b", "c"]);
+        assert_eq!(mirrors[2].as_str(), "https://downloads.sourceforge.net/project/sevenzip/7-Zip/24.09/7z%202409.exe?use_mirror=netix");
+        assert_eq!(hits.lock().len(), 1);
+        let alone = sourceforge_mirrors(&Client::new(), &choices, "gone", "f.zip").await.unwrap();
+        assert_eq!(alone.iter().map(Url::as_str).collect::<Vec<_>>(), ["https://downloads.sourceforge.net/project/gone/f.zip?use_mirror=autoselect"]);
+    }
+
+    /// Live: SourceForge answers the engine's browser User-Agent with a 403 page, and the app's
+    /// own with the redirect to a mirror; its mirror list names several mirrors.
+    #[tokio::test]
+    #[ignore]
+    async fn live_sourceforge_wants_the_apps_own_agent() {
+        let client = Client::builder()
+            .default_headers(SmartResolver::default_anti_qos_headers())
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let url = Url::parse("https://downloads.sourceforge.net/project/sevenzip/7-Zip/24.09/7z2409-x64.exe?use_mirror=netix").unwrap();
+        assert_eq!(client.get(url.clone()).send().await.unwrap().status(), 403);
+        let answer = with_agent_for(client.get(url.clone()), &url).send().await.unwrap();
+        assert_eq!(answer.status(), 302);
+        assert!(answer.headers()["location"].to_str().unwrap().starts_with("https://netix.dl.sourceforge.net/"));
+        let page = Url::parse("https://sourceforge.net/projects/sevenzip/files/7-Zip/24.09/7z2409-x64.exe/download").unwrap();
+        let mirrors = SourceForgeResolver.resolve(&client, &page).await.unwrap();
+        assert_eq!(mirrors.len(), SOURCEFORGE_MAX_MIRRORS, "{mirrors:?}");
     }
 
     #[test]
