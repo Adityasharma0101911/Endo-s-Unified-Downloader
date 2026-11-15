@@ -13,7 +13,8 @@
 //!
 //! Some facts are also kept across restarts once a front end names a file for them (see
 //! [`keep_in`]): the connections a download from the host ended up fastest with, the connection
-//! cap it was seen to enforce, and the speed it held a download to whatever its connections. They
+//! cap it was seen to enforce, the speed it held a download to whatever its connections, and what
+//! it speaks besides HTTP/1.1 (see [`protocol`]). They
 //! are kept for `KEPT_FOR` after they were last learned, by host only (`https://cdn.example:443`,
 //! never a path or query). A kept cap holds the host's first requests in a run as one learned then
 //! would. So is the user's line speed (see [`line`]), under a name no host has.
@@ -153,6 +154,21 @@ pub fn record_settled(url: &Url, connections: usize, limit: Option<f64>) {
     HOSTS.keep(&HostKey::of(url), unix_now(), |kept| {
         kept.connections = Some(connections).filter(|&n| n > 0);
         kept.limit = limit;
+    })
+}
+
+/// What `url`'s host was seen to speak besides HTTP/1.1, if that is kept.
+pub fn protocol(url: &Url) -> Option<Protocol> {
+    HOSTS.kept(&HostKey::of(url), unix_now()).and_then(|kept| kept.protocol)
+}
+
+/// Keeps that `url`'s host speaks `protocol`; an offer of HTTP/3 never replaces a refusal of
+/// HTTP/1.1, which a download must know of first.
+pub fn record_protocol(url: &Url, protocol: Protocol) {
+    HOSTS.keep(&HostKey::of(url), unix_now(), |kept| {
+        if !(protocol == Protocol::H3 && kept.protocol == Some(Protocol::H2)) {
+            kept.protocol = Some(protocol);
+        }
     })
 }
 
@@ -396,13 +412,28 @@ struct Kept {
     /// Under `LINE` only: the fastest a download went, and how many went within `LINE_BAND` of it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     line: Option<(f64, u32)>,
+    /// The HTTP version it is asked in (see [`protocol`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    protocol: Option<Protocol>,
     at: u64,
 }
 
 impl Kept {
     fn tells(&self) -> bool {
-        self.connections.is_some() || self.cap.is_some() || self.limit.is_some() || self.line.is_some()
+        self.connections.is_some() || self.cap.is_some() || self.limit.is_some() || self.line.is_some() || self.protocol.is_some()
     }
+}
+
+/// What a host was seen to speak besides HTTP/1.1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Protocol {
+    /// It refused HTTP/1.1 and answered over HTTP/2: a download from it asks over HTTP/2 at once.
+    #[serde(rename = "h2")]
+    H2,
+    /// It offers HTTP/3 (`Alt-Svc`), for a build that speaks it: reqwest's HTTP/3 still needs
+    /// the unstable `reqwest_unstable` flag. This one asks over HTTP/1.1 as before.
+    #[serde(rename = "h3")]
+    H3,
 }
 
 #[derive(Debug, Default)]
@@ -916,7 +947,7 @@ mod tests {
         hosts.record_line(9e6, now);
         assert_eq!(hosts.kept_as(LINE, now), None, "no file, no user");
         hosts.keep_in(file.clone(), now);
-        hosts.keep(&host, now, |kept| (kept.connections, kept.limit) = (Some(2), Some(4e6)));
+        hosts.keep(&host, now, |kept| (kept.connections, kept.limit, kept.protocol) = (Some(2), Some(4e6), Some(Protocol::H2)));
         for (speed, line) in [(9e6, None), (5e6, None), (9.5e6, Some(9.5e6)), (20e6, None), (19e6, Some(20e6))] {
             hosts.record_line(speed, now);
             assert_eq!(hosts.line(now), line, "after {speed}");
@@ -924,10 +955,12 @@ mod tests {
         hosts.save(now);
         let saved = std::fs::read_to_string(&file).unwrap();
         assert!(saved.contains("\"line\"") && saved.contains("https://capped.example:443") && !saved.contains("sig"), "{saved}");
+        assert!(saved.contains("\"protocol\":\"h2\""), "{saved}");
 
         let after = leaked();
         after.keep_in(file, now);
-        assert_eq!(after.kept(&host, now).map(|kept| (kept.connections, kept.limit)), Some((Some(2), Some(4e6))));
+        let kept = after.kept(&host, now).map(|kept| (kept.connections, kept.limit, kept.protocol));
+        assert_eq!(kept, Some((Some(2), Some(4e6), Some(Protocol::H2))));
         assert_eq!(after.line(now), Some(20e6));
         assert_eq!(after.line(now + KEPT_FOR.as_secs()), None, "forgotten as the rest is");
     }
