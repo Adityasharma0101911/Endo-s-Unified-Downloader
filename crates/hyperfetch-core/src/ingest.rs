@@ -659,7 +659,7 @@ fn too_large(what: impl std::fmt::Display) -> String {
 /// The tasks of the document at `typed`, fetched from where its host's resolver says the file is.
 /// The link itself when its host answers with a client error (see [`fetch`]), or with a web page
 /// that is no such document: a host may label any file a page (PHP sends text/html unless told
-/// otherwise). A torrent without web seeds goes to the swarm when `p2p` is on.
+/// otherwise). A torrent goes to the swarm when `p2p` is on.
 async fn remote_tasks(http: &reqwest::Client, typed: Url, kind: Descriptor, options: &ListOptions) -> Result<Vec<Task>, String> {
     let url = resolver::SmartResolver::resolve_mirrors(http, &typed).await.into_iter().next().unwrap_or_else(|| typed.clone());
     match fetch(options.get(http, &url), &url).await? {
@@ -770,14 +770,15 @@ fn metalink_tasks(bytes: &[u8]) -> Result<Vec<Task>, String> {
         .collect()
 }
 
-/// One task per torrent file with HTTP web seeds. When no file has any, the torrent at `swarm`
-/// (its link, or the `file:` URL of a local one, when the swarm is allowed) is one swarm download;
-/// else the torrent at `remote` (the link typed for it, if it was fetched) is the one download: a
-/// torrent client takes it from there.
+/// The torrent at `swarm` (its link, or the `file:` URL of a local one, when the swarm is allowed)
+/// is one swarm download, which fills the files with web seeds over HTTP first (see `crate::p2p`).
+/// Else one task per file with HTTP web seeds, checked by the torrent's piece hashes; when no file
+/// has any, the torrent at `remote` (the link typed for it, if it was fetched) is the one
+/// download: a torrent client takes it from there.
 fn torrent_tasks(bytes: &[u8], remote: Option<&Url>, swarm: Option<&Url>) -> Result<Vec<Task>, String> {
     let info = torrent::parse_torrent_bytes(bytes)?;
     let seedless = info.files.iter().all(|f| f.urls.is_empty());
-    if let Some(url) = swarm.filter(|_| seedless) {
+    if let Some(url) = swarm {
         let name = clean_component(&info.name).map(PathBuf::from);
         return Ok(vec![Task { urls: vec![url.clone()], name, p2p: true, ..Task::default() }]);
     }
@@ -800,7 +801,14 @@ fn torrent_tasks(bytes: &[u8], remote: Option<&Url>, swarm: Option<&Url>) -> Res
                 ));
             }
             let name = if single_file { relative } else { clean_path([info.name.as_str()])?.join(relative) };
-            Ok(Task { urls: file.urls.clone(), name: Some(name), size: Some(file.length), from_document: true, ..Task::default() })
+            Ok(Task {
+                urls: file.urls.clone(),
+                name: Some(name),
+                size: Some(file.length),
+                from_document: true,
+                pieces: file.pieces.clone(),
+                ..Task::default()
+            })
         })
         .collect()
 }
@@ -1058,7 +1066,7 @@ d6:lengthi4e4:pathl5:y.bineee4:name4:root12:piece lengthi16384e6:pieces20:aaaaaa
         assert_eq!(tasks, [Task { urls: vec![url], document_itself: true, ..Task::default() }]);
     }
 
-    /// With the swarm allowed, a magnet link or a .torrent (remote or local) without web seeds is
+    /// With the swarm allowed, a magnet link without web seeds or a .torrent (remote or local) is
     /// one swarm download; a magnet with web seeds is still downloaded over HTTP.
     #[test]
     fn seedless_torrents_go_to_the_swarm_when_allowed() {
@@ -1075,8 +1083,14 @@ d6:lengthi4e4:pathl5:y.bineee4:name4:root12:piece lengthi16384e6:pieces20:aaaaaa
 
         let no_seeds = b"d4:infod6:lengthi3e4:name5:x.bin12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaaee";
         let url = Url::parse("https://releases.example/x.bin.torrent").unwrap();
-        let swarm = Task { urls: vec![url.clone()], name: Some("x.bin".into()), p2p: true, ..Task::default() };
-        assert_eq!(torrent_tasks(no_seeds, Some(&url), Some(&url)).unwrap(), [swarm]);
+        let swarm = || Task { urls: vec![url.clone()], name: Some("x.bin".into()), p2p: true, ..Task::default() };
+        assert_eq!(torrent_tasks(no_seeds, Some(&url), Some(&url)).unwrap(), [swarm()]);
+        // One with web seeds goes to the swarm too, which fills it from them first (see `crate::p2p`);
+        // without the swarm its file is checked by the torrent's piece hashes.
+        let seeded = b"d8:url-list23:https://s.example/x.bin4:infod6:lengthi3e4:name5:x.bin12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaaee";
+        assert_eq!(torrent_tasks(seeded, Some(&url), Some(&url)).unwrap(), [swarm()]);
+        let http = torrent_tasks(seeded, Some(&url), None).unwrap();
+        assert_eq!(http[0].pieces.as_ref().map(|p| p.hashes.clone()), Some(vec!["61".repeat(20)]));
         let (_dir, path) = write_temp("x.bin.torrent", no_seeds);
         let local = read(path.to_str().unwrap()).unwrap();
         assert!(local[0].p2p && local[0].urls[0].scheme() == "file", "{:?}", local);
