@@ -26,6 +26,17 @@ export function itemChips(item) {
 /** Whether an item is DRM-protected: an HLS key system, or a DASH manifest's ContentProtection. */
 export const isProtected = (item) => Boolean(hlsOf(item)?.drm || item.drm);
 
+/**
+ * The item a one-click download sends (Alt+Shift+D, the button over a video, every open tab): of those shown and not
+ * protected, a stream before a file (an HLS master, then DASH, an HLS media playlist, Smooth Streaming), then the
+ * largest, then the newest; null when there is none.
+ */
+export function bestItem(items) {
+  const rank = (item) => (hlsOf(item)?.kind === "master" ? 4 : { dash: 3, hls: 2, smooth: 1 }[item.kind] || 0);
+  const shown = items.filter((item) => item && !item.hidden && !isProtected(item));
+  return shown.sort((a, b) => rank(b) - rank(a) || (b.size || 0) - (a.size || 0) || (b.time || 0) - (a.time || 0))[0] || null;
+}
+
 /** "12.3 MB · 4:05 · 1920×1080": what is known of an item's size, length and best resolution. */
 export function itemMeta(item) {
   const hls = hlsOf(item);

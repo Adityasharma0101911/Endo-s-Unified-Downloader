@@ -20,7 +20,7 @@ The extension finds videos, streams and downloadable links on the pages you visi
 
 **Where it goes:** only to the Endo's Unified Downloader app on your computer, at `127.0.0.1` (your own computer's local network address, which no other computer can reach). The extension makes no requests to any other server. When it fetches a file for you from inside a page, the request goes only to the site that serves that file.
 
-**What it never does:** send your data to the developer or to anyone else, sell it, use it for ads or credit decisions, or let people read it. It does not read anything you type into pages.
+**What it never does:** send your data to the developer or to anyone else, sell it, use it for ads or credit decisions, or let people read it. It does not read anything you type into pages. It reads the text you select on a page only when you choose "Download the links in the selection", to find the links in it.
 
 ## The desktop app
 

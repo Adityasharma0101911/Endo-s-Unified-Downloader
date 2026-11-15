@@ -63,6 +63,23 @@ export function parseSites(value) {
   return [...new Set(hosts.filter(Boolean))].slice(0, 500);
 }
 
+/**
+ * The settings in the text of an exported settings file (the popup's Export), or null when it is not one: a JSON
+ * object with at least one of `keys`, whose other fields are left out. The background then checks each value
+ * (normalizeSettings), so a wrong one falls back to its default.
+ */
+export function settingsOfFile(text, keys) {
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  const known = Object.fromEntries(Object.entries(parsed).filter(([key]) => keys.includes(key)));
+  return Object.keys(known).length > 0 ? known : null;
+}
+
 /** The extension of a file name, a path or a link's path, lower case; "" when it has none. */
 export function extensionOf(name) {
   let path = String(name || "");

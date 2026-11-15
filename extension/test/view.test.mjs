@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { itemChips, itemMeta, itemNote, linkName, logView, queueView, recordingView, timeAgo, variantLabel } from "../lib/view.js";
+import { bestItem, itemChips, itemMeta, itemNote, linkName, logView, queueView, recordingView, timeAgo, variantLabel } from "../lib/view.js";
 
 const master = (extra = {}) => ({
   kind: "master",
@@ -73,6 +73,20 @@ test("a browser download shows its percentage, or why it failed", () => {
   assert.equal(failed.failed, true);
   assert.equal(failed.info, "Failed: HTTP 403");
   assert.equal(recordingView({ mode: "mse", error: "x" }, 0).failed, false);
+});
+
+test("a one-click download takes a stream before a file, then the largest, then the newest, never a protected one", () => {
+  const file = { id: "f", kind: "file", size: 9e9, time: 5 };
+  const media = { id: "m", kind: "hls", hls: { kind: "media" }, time: 1 };
+  const master = { id: "a", kind: "hls", hls: { kind: "master", variants: [] }, time: 1 };
+  const locked = { id: "d", kind: "hls", hls: { kind: "master", drm: true }, time: 9 };
+  assert.equal(bestItem([file, media, master, locked]).id, "a");
+  assert.equal(bestItem([file, media]).id, "m");
+  assert.equal(bestItem([{ id: "dash", kind: "dash", drm: true }, file]).id, "f");
+  assert.equal(bestItem([{ ...file, id: "small", size: 1 }, file]).id, "f");
+  assert.equal(bestItem([{ ...file, id: "old", time: 1 }, file]).id, "f");
+  assert.equal(bestItem([{ ...master, hidden: true }]), null);
+  assert.equal(bestItem([]), null);
 });
 
 test("a link row leads with the decoded file name, else the host", () => {
