@@ -15,6 +15,7 @@ What changed in each release, newest first. Each release's page on [GitHub](http
 - **Nextcloud and ownCloud shares:** a public share link (`/s/<token>`, `/index.php/s/<token>`) on any server that runs one adds one download per file of a shared folder (subfolders kept, with the server's SHA-1 or MD5 where it keeps one), or the shared file; a share with a password opens with it in the link, `https://TOKEN:PASSWORD@host/s/TOKEN`.
 - **PyPI:** a project link (`pypi.org/project/<name>/`) adds its latest release's files, and a release link (`/project/<name>/<version>/`) that release's, each with its size and SHA-256; they downloaded the project's web page before.
 - **npm:** a package link (`npmjs.com/package/<name>`, `/v/<version>`, scoped packages too) downloads the package's tarball, checked against its SHA-512; it downloaded the package's web page before.
+- **crates.io:** a crate link (`crates.io/crates/<name>`, `/<version>`) downloads the crate's `.crate` file with its size and SHA-256; it downloaded the site's web page before.
 - Fixed: a progress bar's fill went square when short and the light sweeping over it was cut to a rectangle; both now follow the bar's round ends.
 
 ## 1.9.0 (2026-10-30)

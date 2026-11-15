@@ -35,6 +35,9 @@ const BITBUCKET: &str = "https://bitbucket.org";
 const BITBUCKET_API: &str = "https://api.bitbucket.org/2.0";
 const PYPI: &str = "https://pypi.org";
 const NPM_REGISTRY: &str = "https://registry.npmjs.org";
+const CRATES_IO: &str = "https://crates.io";
+/// Where crates.io's index says its .crate files are (`dl` in its config.json).
+const CRATE_FILES: &str = "https://static.crates.io/crates";
 
 /// Most path segments a GitHub ref with slashes in it (`feature/x`) is tried with.
 const MAX_REF_PARTS: usize = 4;
@@ -105,6 +108,8 @@ enum Repo {
     PyPi { name: String, version: Option<String> },
     /// npmjs.com/package/[@{scope}/]{name}[/v/{version}]: the package's tarball, the latest's without a version.
     Npm { name: String, version: Option<String> },
+    /// crates.io/crates/{name}[/{version}]: the crate's .crate file, the default version's without a version.
+    Crate { name: String, version: Option<String> },
 }
 
 fn repo_of(url: &Url) -> Option<Repo> {
@@ -191,6 +196,14 @@ fn repo_of(url: &Url) -> Option<Repo> {
                 _ => None,
             }
         }
+        // A crate's other pages (/versions, /dependencies) are the crate's; a version starts with a digit.
+        "crates.io" | "www.crates.io" => match segs[..] {
+            ["crates", name, version, ..] if version.starts_with(|c: char| c.is_ascii_digit()) => {
+                Some(Repo::Crate { name: name.into(), version: Some(version.into()) })
+            }
+            ["crates", name, ..] => Some(Repo::Crate { name: name.into(), version: None }),
+            _ => None,
+        },
         host => {
             let origin = url.origin().ascii_serialization();
             // GitLab's pages of a project are under {project}/-/.
@@ -252,6 +265,7 @@ pub async fn list(http: &reqwest::Client, url: &Url, auth: Option<&str>) -> Resu
         Some(Repo::GiteaRelease { origin, owner, repo, tag }) => gitea_release(http, auth, &origin, &owner, &repo, tag.as_deref()).await?,
         Some(Repo::PyPi { name, version }) => pypi(http, PYPI, &name, version.as_deref()).await?,
         Some(Repo::Npm { name, version }) => npm(http, NPM_REGISTRY, &name, version.as_deref()).await?,
+        Some(Repo::Crate { name, version }) => crates_io(http, CRATES_IO, CRATE_FILES, &name, version.as_deref()).await?,
         None => return Err(format!("{} is not a repository, folder, release, model or item link", url)),
     };
     if tasks.is_empty() {
@@ -264,7 +278,7 @@ pub async fn list(http: &reqwest::Client, url: &Url, auth: Option<&str>) -> Resu
 /// archive.org item's page is not: as one download it goes on as any page does (to yt-dlp); nor
 /// is a Gitea /src/ link, which may be a file's (see `resolver::CodeHostResolver`), nor a package's page.
 pub fn handles(url: &Url) -> bool {
-    repo_of(url).is_some_and(|repo| !matches!(repo, Repo::Archive { .. } | Repo::GiteaSrc { .. } | Repo::PyPi { .. } | Repo::Npm { .. }))
+    repo_of(url).is_some_and(|repo| !matches!(repo, Repo::Archive { .. } | Repo::GiteaSrc { .. } | Repo::PyPi { .. } | Repo::Npm { .. } | Repo::Crate { .. }))
 }
 
 /// Where the zip of the repository link `url` downloads from.
@@ -972,6 +986,58 @@ async fn npm(http: &reqwest::Client, registry: &str, name: &str, version: Option
     }])
 }
 
+#[derive(Deserialize)]
+struct CrateAnswer {
+    #[serde(rename = "crate")]
+    krate: Option<CrateInfo>,
+    version: Option<CrateVersion>,
+}
+
+#[derive(Deserialize)]
+struct CrateInfo {
+    default_version: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CrateVersion {
+    #[serde(rename = "crate")]
+    name: String,
+    num: String,
+    checksum: Option<String>,
+    crate_size: Option<u64>,
+}
+
+/// The .crate file of crates.io's crate `name` at `version`, its default version (the newest
+/// stable one) without one, from `files` with its size and SHA-256.
+async fn crates_io(http: &reqwest::Client, api: &str, files: &str, name: &str, version: Option<&str>) -> Result<Vec<Task>, String> {
+    let version = match version {
+        Some(version) => version.to_string(),
+        None => {
+            let url = url_at(api, ["api", "v1", "crates", name])?;
+            let Some(answer) = fetch(http.get(url).query(&[("include", "default_version")]), None, "crates.io").await? else {
+                return Err(format!("crates.io has no crate {name}"));
+            };
+            let crate_info = json::<CrateAnswer>(answer, "crates.io").await?.krate;
+            crate_info.and_then(|c| c.default_version).ok_or_else(|| format!("crates.io names no version of {name}"))?
+        }
+    };
+    let url = url_at(api, ["api", "v1", "crates", name, &version])?;
+    let Some(answer) = fetch(http.get(url), None, "crates.io").await? else {
+        return Err(format!("crates.io has no version {version} of {name}"));
+    };
+    let found = json::<CrateAnswer>(answer, "crates.io").await?.version.ok_or_else(|| format!("crates.io has no version {version} of {name}"))?;
+    let file = format!("{}-{}.crate", found.name, found.num);
+    Ok(vec![Task {
+        urls: vec![url_at(files, [found.name.as_str(), &file])?],
+        name: Some(component(&file, "package.crate")?),
+        size: found.crate_size,
+        checksum: found.checksum.and_then(|hex| checksum("sha256", &hex)),
+        // On crates.io's file host, not the site the user typed.
+        from_document: true,
+        ..Task::default()
+    }])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1355,6 +1421,47 @@ mod tests {
         assert!(lists(&link) && !handles(&link));
     }
 
+    fn crates_api(path: &str, _: Option<crate::range::ByteRange>) -> Reply {
+        match path {
+            // As crates.io answers, cut down: the name in its own spelling.
+            "/api/v1/crates/Cfg_If?include=default_version" => json_reply(r#"{"crate":{"id":"cfg-if","name":"cfg-if","default_version":"1.0.0"},"versions":null}"#),
+            "/api/v1/crates/Cfg_If/1.0.0" | "/api/v1/crates/cfg-if/1.0.0" => json_reply(
+                r#"{"version":{"crate":"cfg-if","num":"1.0.0","crate_size":7934,"yanked":false,"dl_path":"/api/v1/crates/cfg-if/1.0.0/download",
+                    "checksum":"baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"}}"#,
+            ),
+            "/api/v1/crates/none?include=default_version" => json_reply(r#"{"crate":{"name":"none","default_version":null}}"#),
+            _ => (404, "Content-Type: application/json\r\n".into(), br#"{"errors":[{"detail":"Not Found"}]}"#.to_vec()),
+        }
+    }
+
+    /// A crate is its default version's .crate file, a version's link that one's, with its size and
+    /// SHA-256; a missing one says so.
+    #[tokio::test]
+    async fn crates_are_their_crate_file() {
+        let (addr, _) = serve(crates_api).await;
+        let api = format!("http://{addr}");
+        for (name, version) in [("Cfg_If", None), ("cfg-if", Some("1.0.0"))] {
+            let [task] = &crates_io(&http(), &api, CRATE_FILES, name, version).await.unwrap()[..] else { panic!("one file") };
+            assert_eq!(task.urls[0].as_str(), "https://static.crates.io/crates/cfg-if/cfg-if-1.0.0.crate");
+            assert_eq!(
+                (task.name.clone().unwrap(), task.size, task.checksum.as_deref(), task.from_document),
+                (PathBuf::from("cfg-if-1.0.0.crate"), Some(7934), Some("sha256:baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"), true)
+            );
+        }
+        assert_eq!(crates_io(&http(), &api, CRATE_FILES, "cfg-if", Some("9.9.9")).await.unwrap_err(), "crates.io has no version 9.9.9 of cfg-if");
+        assert_eq!(crates_io(&http(), &api, CRATE_FILES, "gone", None).await.unwrap_err(), "crates.io has no crate gone");
+        assert_eq!(crates_io(&http(), &api, CRATE_FILES, "none", None).await.unwrap_err(), "crates.io names no version of none");
+        let krate = |name: &str, version: Option<&str>| Some(Repo::Crate { name: name.into(), version: version.map(Into::into) });
+        assert_eq!(repo("https://crates.io/crates/serde"), krate("serde", None));
+        assert_eq!(repo("https://crates.io/crates/serde/versions"), krate("serde", None));
+        assert_eq!(repo("https://crates.io/crates/serde/1.0.200/dependencies"), krate("serde", Some("1.0.200")));
+        for other in ["https://crates.io/search?q=serde", "https://crates.io/categories/x", "https://crates.io/crates"] {
+            assert_eq!(repo(other), None, "{other}");
+        }
+        let link = Url::parse("https://crates.io/crates/serde").unwrap();
+        assert!(lists(&link) && !handles(&link));
+    }
+
     /// GitLab (gitlab.com and self-hosted), Bitbucket and Gitea links are told by their shape; a
     /// repository is its default branch's zip, with no request made.
     #[tokio::test]
@@ -1657,6 +1764,17 @@ mod tests {
         assert!(pad.checksum.as_deref().unwrap().starts_with("sha512:5c8e4c3f354d0298"));
         let [node] = &live("https://www.npmjs.com/package/@types/node").await.unwrap()[..] else { panic!("one tarball") };
         assert!(node.urls[0].as_str().starts_with("https://registry.npmjs.org/@types/node/-/node-"), "{node:?}");
+    }
+
+    /// Live: a crate is its .crate file on crates.io's file host, with its SHA-256.
+    #[tokio::test]
+    #[ignore]
+    async fn live_crates_io() {
+        let [old] = &live("https://crates.io/crates/cfg-if/1.0.0").await.unwrap()[..] else { panic!("one file") };
+        assert_eq!(old.urls[0].as_str(), "https://static.crates.io/crates/cfg-if/cfg-if-1.0.0.crate");
+        assert_eq!((old.size, old.checksum.as_deref()), (Some(7934), Some("sha256:baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd")));
+        let [latest] = &live("https://crates.io/crates/cfg-if").await.unwrap()[..] else { panic!("one file") };
+        assert!(latest.checksum.is_some() && latest.urls[0].as_str().ends_with(".crate"), "{latest:?}");
     }
 
     /// Live: a GitLab folder lists its files, and its latest release its asset links.
