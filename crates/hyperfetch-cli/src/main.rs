@@ -603,6 +603,7 @@ fn list_options(args: &Args) -> ListOptions {
         password: args.password.clone(),
         auth: None,
         channels: args.channels.iter().cloned().chain(args.all_items.then(|| "*".to_string())).collect(),
+        s3: args.s3_key(),
     }
 }
 
@@ -685,6 +686,8 @@ fn tuning(args: &Args, connections: u64) -> DownloadOptions {
         only_if_newer: args.only_if_newer,
         delta_from: args.delta_from.clone(),
         zsync: args.zsync.clone(),
+        // Signs only for S3 hosts, so a document's files on them get it too.
+        s3: args.s3_key(),
         remote_time: args.remote_time,
         max_filesize: args.max_filesize,
         remote_checksum: !args.no_remote_checksum,
@@ -1614,7 +1617,8 @@ mod tests {
         let mut args = parse(&[
             "-u", "bob:pw", "-U", "agent/1", "--cookie", "sid=1", "--header", "X-Key: k", "-k", "-6", "--connect-timeout", "7",
             "--no-proxy", "-N", "--max-filesize", "2G", "--record-seconds", "30", "--no-remote-checksum", "--no-adaptive",
-            "--no-spread-addresses", "--delta-from", "Cargo.toml", "--zsync", "https://a.example/f.iso.zsync", "u",
+            "--no-spread-addresses", "--delta-from", "Cargo.toml", "--zsync", "https://a.example/f.iso.zsync", "--s3-access-key", "AK",
+            "--s3-secret-key", "SK", "u",
         ]);
         sign_in(&mut args, None).unwrap();
         let urls = vec![Url::parse("https://a.example/f.iso").unwrap()];
@@ -1630,6 +1634,8 @@ mod tests {
         assert_eq!((options.max_filesize, options.record_seconds, options.metalink_pieces), (Some(2 << 30), Some(30), Some(pieces)));
         let listed = job(&args, 4, Path::new("d"), Task { urls: urls.clone(), from_document: true, ..Default::default() }).options;
         assert!(listed.auth_header.is_none() && listed.extra_headers.is_empty() && listed.cookie_string.is_none());
+        let keys = (options.s3.as_ref().map(|k| k.access_key.as_str()), listed.s3.as_ref().map(|k| k.secret.as_str()));
+        assert_eq!(keys, (Some("AK"), Some("SK")), "signed for S3 hosts alone, a document's files too");
         assert_eq!(listed.user_agent.as_deref(), Some("agent/1"), "not a secret");
 
         let defaults = job(&parse(&["u"]), 4, Path::new("d"), Task { urls, ..Default::default() }).options;

@@ -207,6 +207,29 @@ pub struct Args {
     #[arg(long = "debrid-provider", value_name = "PROVIDER", value_parser = debrid_providers(), ignore_case = true)]
     pub debrid_provider: Option<String>,
 
+    /// Access key ID requests to S3 and S3-compatible servers are signed with (with
+    /// --s3-secret-key): private buckets list and download. Only those servers' hosts get it
+    #[arg(long = "s3-access-key", value_name = "KEY", env = "ENDO_S3_ACCESS_KEY", hide_env_values = true, requires = "s3_secret_key")]
+    pub s3_access_key: Option<String>,
+
+    /// Secret access key of --s3-access-key
+    #[arg(long = "s3-secret-key", value_name = "SECRET", env = "ENDO_S3_SECRET_KEY", hide_env_values = true, requires = "s3_access_key")]
+    pub s3_secret_key: Option<String>,
+
+    /// Session token of temporary credentials, with --s3-access-key
+    #[arg(long = "s3-session-token", value_name = "TOKEN", env = "ENDO_S3_SESSION_TOKEN", hide_env_values = true, requires = "s3_access_key")]
+    pub s3_session_token: Option<String>,
+
+    /// Region requests are signed for, when the bucket's address does not name it (default
+    /// us-east-1, auto on R2)
+    #[arg(long = "s3-region", value_name = "REGION", requires = "s3_access_key")]
+    pub s3_region: Option<String>,
+
+    /// An S3-compatible server on a host of its own (MinIO, R2's S3 endpoint): its links are
+    /// signed too, and a folder link on it (URL/BUCKET/ or URL/BUCKET/FOLDER/) lists the bucket
+    #[arg(long = "s3-endpoint", value_name = "URL", value_parser = parse_endpoint, requires = "s3_access_key")]
+    pub s3_endpoint: Option<url::Url>,
+
     /// Local IP address to connect from; repeat it to spread connections over several networks
     #[arg(long = "bind-address", value_name = "IP")]
     pub bind_address: Vec<std::net::IpAddr>,
@@ -545,6 +568,17 @@ impl Args {
     pub fn extra_headers(&self) -> Vec<(String, String)> {
         self.headers.iter().filter(|(name, _)| name != AUTHORIZATION).cloned().collect()
     }
+
+    /// The S3 key of --s3-access-key and the options with it, if any.
+    pub fn s3_key(&self) -> Option<hyperfetch_core::sigv4::S3Key> {
+        Some(hyperfetch_core::sigv4::S3Key {
+            access_key: self.s3_access_key.clone()?,
+            secret: self.s3_secret_key.clone()?,
+            session_token: self.s3_session_token.clone(),
+            region: self.s3_region.clone(),
+            endpoint: self.s3_endpoint.clone(),
+        })
+    }
 }
 
 const AUTHORIZATION: &str = "Authorization";
@@ -676,6 +710,13 @@ fn parse_ratio(s: &str) -> Result<f64, String> {
 fn parse_checksum(s: &str) -> Result<String, String> {
     hyperfetch_core::storage::validate_checksum(s)?;
     Ok(s.to_string())
+}
+
+fn parse_endpoint(s: &str) -> Result<url::Url, String> {
+    match url::Url::parse(s) {
+        Ok(url) if matches!(url.scheme(), "http" | "https") && url.host_str().is_some() => Ok(url),
+        _ => Err(format!("'{}' is not an http(s) address", s)),
+    }
 }
 
 fn parse_zsync(s: &str) -> Result<String, String> {
@@ -1270,6 +1311,11 @@ mod tests {
         assert_eq!(parse(&["--zip-file", "*.txt", "--zip-file", "docs/", "--preview", "u"]).unwrap().zip_files, ["*.txt", "docs/"]);
         let args = parse(&["--delta-from", "Cargo.toml", "--zsync", "https://h/f.zsync", "u"]).unwrap();
         assert_eq!((args.delta_from, args.zsync.as_deref()), (Some(PathBuf::from("Cargo.toml")), Some("https://h/f.zsync")));
+        let args = parse(&["--s3-access-key", "AK", "--s3-secret-key", "SK", "--s3-session-token", "T", "--s3-region", "eu-west-1", "--s3-endpoint", "http://minio.lan:9000", "u"]).unwrap();
+        let key = args.s3_key().unwrap();
+        assert_eq!((key.access_key.as_str(), key.secret.as_str(), key.session_token.as_deref()), ("AK", "SK", Some("T")));
+        assert_eq!((key.region.as_deref(), key.endpoint.as_ref().map(|u| u.as_str())), (Some("eu-west-1"), Some("http://minio.lan:9000/")));
+        assert!(parse(&["u"]).unwrap().s3_key().is_none());
         assert!(parse(&["--live-from", "2026-10-10 21:00:00+08:00", "u"]).is_ok());
         for bad in [
             &["--video", "8k"][..], &["--audio", "en,loud"], &["--tracks", "x1"], &["--tracks", "v"], &["--tracks", "v0,"], &["--drop-parts", "3-1"],
@@ -1277,6 +1323,7 @@ mod tests {
             &["--live-from", "yesterday"], &["--live-from", "30m", "--live-from-start"], &["--live-idle-timeout", "0"],
             &["--list-tracks", "--dry-run"], &["--list-tracks", "-i", "list.txt"], &["--zip-file", " "], &["--zip-file", "a", "-o", "f"],
             &["--zip-file", "a", "--dry-run"], &["--delta-from", "no-such-file"], &["--zsync", "f.zsync"], &["--zsync", "ftp://h/f.zsync"],
+            &["--s3-access-key", "AK"], &["--s3-region", "eu-west-1"], &["--s3-access-key", "AK", "--s3-secret-key", "SK", "--s3-endpoint", "minio.lan"],
         ] {
             assert!(parse(&[bad, &["u"]].concat()).is_err(), "{bad:?}");
         }

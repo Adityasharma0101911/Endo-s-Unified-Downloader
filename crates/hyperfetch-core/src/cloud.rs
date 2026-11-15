@@ -37,7 +37,9 @@ const GCS_API: &str = "https://storage.googleapis.com";
 const AZURE_VERSION: &str = "2021-08-06";
 /// Most objects one bucket listing reads.
 const MAX_OBJECTS: usize = 100_000;
-const BUCKET_PRIVATE: &str = "the bucket does not let anyone list it: listing it needs its owner's access key (a signed request), which the app cannot make yet; add the links of its files instead";
+const BUCKET_PRIVATE: &str = "the bucket does not let anyone list it: listing it needs its owner's access key, which the app signs with only for S3 and S3-compatible servers; add the links of its files instead";
+const S3_PRIVATE: &str = "the bucket does not let anyone list it: give an access key that may (in the app, Settings > Debrid & hosts; in the CLI, --s3-access-key and --s3-secret-key)";
+const S3_REFUSED: &str = "the bucket refused the access key: check the key, its secret, the session token and the region (set the region when the bucket's address does not name it)";
 const BUCKET_GONE: &str = "the bucket does not exist, or is private (Azure answers so for a private container)";
 
 const YANDEX: &[&str] = &[
@@ -280,6 +282,9 @@ pub fn lists(url: &Url) -> bool {
 /// gave its link (a share's password, see [`share_tasks`]); None when its host runs neither. A
 /// SwissTransfer transfer opens with the password a paste gave.
 pub async fn list(http: &reqwest::Client, url: &Url, options: &ListOptions) -> Option<Result<Vec<Task>, String>> {
+    if let Some((bucket, prefix)) = options.s3.as_ref().and_then(|key| endpoint_bucket(url, key)) {
+        return Some(bucket_list(http, &bucket, &prefix, GCS_API, options.s3.as_ref()).await);
+    }
     match link_of(url) {
         Some(Link::SwissTransfer { link }) => return Some(swisstransfer_list(http, SWISSTRANSFER, &link, options.password.as_deref()).await),
         Some(Link::WebDav { link }) => {
@@ -298,17 +303,39 @@ pub async fn list(http: &reqwest::Client, url: &Url, options: &ListOptions) -> O
             let auth = options.auth.as_ref().filter(|(link, _)| link == url).map(|(_, header)| header.as_str());
             share_tasks(http, &share, auth).await
         }
-        None => Some(list_link(http, url).await),
+        None => Some(list_link(http, url, options.s3.as_ref()).await),
     }
 }
 
-/// [`list`] for the services' own links.
-async fn list_link(http: &reqwest::Client, url: &Url) -> Result<Vec<Task>, String> {
+/// Whether `url` is a folder link on the S3-compatible server the user's key names (see
+/// `sigv4::S3Key::endpoint`), which [`list`] lists as a bucket.
+pub fn endpoint_lists(url: &Url, options: &ListOptions) -> bool {
+    options.s3.as_ref().is_some_and(|key| endpoint_bucket(url, key).is_some())
+}
+
+/// The bucket and prefix of a folder link on `key`'s endpoint, path-style: /{bucket}/ or
+/// /{bucket}/{folder}/, or with `?prefix=`.
+fn endpoint_bucket(url: &Url, key: &crate::sigv4::S3Key) -> Option<(Bucket, String)> {
+    let endpoint = key.endpoint.as_ref()?;
+    let same = endpoint.host_str()?.eq_ignore_ascii_case(url.host_str()?) && endpoint.port_or_known_default() == url.port_or_known_default();
+    if !same || !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    let path = percent_decode_str(url.path()).decode_utf8_lossy().into_owned();
+    let (bucket, folder) = path.trim_start_matches('/').split_once('/')?;
+    let prefix = url.query_pairs().find(|(k, _)| k == "prefix").map(|(_, v)| v.into_owned());
+    let prefix = prefix.or_else(|| (folder.is_empty() || folder.ends_with('/')).then(|| folder.to_string()))?;
+    let base = Url::parse(&format!("{}/{bucket}/", url.origin().ascii_serialization())).ok()?;
+    (!bucket.is_empty()).then(|| (Bucket::S3 { base, name: bucket.to_string(), md5_etags: false }, prefix))
+}
+
+/// [`list`] for the services' own links; a bucket's with `s3`, the user's key.
+async fn list_link(http: &reqwest::Client, url: &Url, s3: Option<&crate::sigv4::S3Key>) -> Result<Vec<Task>, String> {
     let listed = match link_of(url) {
         Some(Link::PCloud { api, code, file: None }) => pcloud_list(http, api, url, &code).await?,
         Some(Link::Yandex { key, path }) => yandex_list(http, YANDEX_API, &key, &path).await?,
         Some(Link::Box { name, file: None, folder }) => box_list(http, url, &name, folder).await?,
-        Some(Link::Bucket { bucket, prefix }) => Some(bucket_list(http, &bucket, &prefix, GCS_API).await?),
+        Some(Link::Bucket { bucket, prefix }) => Some(bucket_list(http, &bucket, &prefix, GCS_API, s3).await?),
         _ => return Err(format!("{} is not a folder link", url)),
     };
     match listed {
@@ -1111,8 +1138,16 @@ fn bucket_refused(status: StatusCode, code: Option<&String>) -> String {
 }
 
 /// One page of `bucket`'s objects under `prefix`, from `token` on: each object's key, size and MD5
-/// (where the service gives a real one), and the next page's token.
-async fn bucket_page(http: &reqwest::Client, bucket: &Bucket, prefix: &str, token: Option<&str>, gcs_api: &str) -> Result<(Vec<(String, Option<u64>, Option<String>)>, Option<String>), String> {
+/// (where the service gives a real one), and the next page's token. An S3 bucket is asked with
+/// `s3`, the user's key, when it is for its host.
+async fn bucket_page(
+    http: &reqwest::Client,
+    bucket: &Bucket,
+    prefix: &str,
+    token: Option<&str>,
+    gcs_api: &str,
+    s3: Option<&crate::sigv4::S3Key>,
+) -> Result<(Vec<(String, Option<u64>, Option<String>)>, Option<String>), String> {
     let cannot_reach = |e: reqwest::Error| format!("Cannot reach the bucket's host: {}", e.without_url());
     let (request, record) = match bucket {
         Bucket::Gcs { bucket } => {
@@ -1135,7 +1170,21 @@ async fn bucket_page(http: &reqwest::Client, bucket: &Bucket, prefix: &str, toke
             if let Some(token) = token {
                 url.query_pairs_mut().append_pair("continuation-token", token);
             }
-            (http.get(url), b"Contents".as_slice())
+            let key = s3.filter(|key| key.applies(&url));
+            let request = |url: &Url| match key {
+                Some(key) => crate::sigv4::signed(http.get(url.clone()), key),
+                None => http.get(url.clone()),
+            };
+            // A signed request turned away for a clock minutes off goes again, as the engine's do.
+            let answer = crate::worker::send(request, &url).await.map_err(cannot_reach)?;
+            let status = answer.status();
+            let xml = answer.text().await.map_err(cannot_reach)?;
+            let (records, outside) = xml_records(&xml, b"Contents");
+            return match status {
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err((if key.is_some() { S3_REFUSED } else { S3_PRIVATE }).to_string()),
+                _ if !status.is_success() => Err(bucket_refused(status, outside.get("Code"))),
+                _ => Ok(s3_objects(bucket, &records, &outside)),
+            };
         }
         Bucket::Azure { base, .. } => {
             let mut url = base.clone();
@@ -1155,28 +1204,29 @@ async fn bucket_page(http: &reqwest::Client, bucket: &Bucket, prefix: &str, toke
         return Err(bucket_refused(status, outside.get("Code")));
     }
     let field = |r: &HashMap<String, String>, name: &str| r.get(name).cloned().unwrap_or_default();
-    Ok(match bucket {
-        Bucket::Azure { .. } => {
-            let objects = records.iter().map(|r| (field(r, "Name"), field(r, "Content-Length").parse().ok(), md5_base64(&field(r, "Content-MD5"))));
-            (objects.collect(), outside.get("NextMarker").filter(|m| !m.is_empty()).cloned())
-        }
-        _ => {
-            let md5_etags = matches!(bucket, Bucket::S3 { md5_etags: true, .. });
-            // A multipart upload's ETag ("...-3") is no MD5 of the object.
-            let md5 = |etag: String| {
-                let hex = etag.trim_matches('"').to_ascii_lowercase();
-                (md5_etags && hex.len() == 32 && hex.bytes().all(|b| b.is_ascii_hexdigit())).then(|| format!("md5:{hex}"))
-            };
-            let objects = records.iter().map(|r| (field(r, "Key"), field(r, "Size").parse().ok(), md5(field(r, "ETag"))));
-            let truncated = outside.get("IsTruncated").is_some_and(|t| t == "true");
-            (objects.collect(), outside.get("NextContinuationToken").filter(|_| truncated).cloned())
-        }
-    })
+    let objects = records.iter().map(|r| (field(r, "Name"), field(r, "Content-Length").parse().ok(), md5_base64(&field(r, "Content-MD5"))));
+    Ok((objects.collect(), outside.get("NextMarker").filter(|m| !m.is_empty()).cloned()))
+}
+
+/// The objects of an S3 listing's `records` and the next page's token.
+#[allow(clippy::type_complexity)]
+fn s3_objects(bucket: &Bucket, records: &[HashMap<String, String>], outside: &HashMap<String, String>) -> (Vec<(String, Option<u64>, Option<String>)>, Option<String>) {
+    let field = |r: &HashMap<String, String>, name: &str| r.get(name).cloned().unwrap_or_default();
+    let md5_etags = matches!(bucket, Bucket::S3 { md5_etags: true, .. });
+    // A multipart upload's ETag ("...-3") is no MD5 of the object.
+    let md5 = |etag: String| {
+        let hex = etag.trim_matches('"').to_ascii_lowercase();
+        (md5_etags && hex.len() == 32 && hex.bytes().all(|b| b.is_ascii_hexdigit())).then(|| format!("md5:{hex}"))
+    };
+    let objects = records.iter().map(|r| (field(r, "Key"), field(r, "Size").parse().ok(), md5(field(r, "ETag"))));
+    let truncated = outside.get("IsTruncated").is_some_and(|t| t == "true");
+    (objects.collect(), outside.get("NextContinuationToken").filter(|_| truncated).cloned())
 }
 
 /// Every object of `bucket` whose key starts with `prefix`, page by page, each named by its key
 /// after the prefix's folder (folders kept), in a folder named after that folder or the bucket.
-async fn bucket_list(http: &reqwest::Client, bucket: &Bucket, prefix: &str, gcs_api: &str) -> Result<Vec<Task>, String> {
+/// An S3 bucket is listed with `s3`, the user's key, when it is for its host.
+async fn bucket_list(http: &reqwest::Client, bucket: &Bucket, prefix: &str, gcs_api: &str, s3: Option<&crate::sigv4::S3Key>) -> Result<Vec<Task>, String> {
     // "a/b" lists "a/b1.txt" as "b1.txt", in a folder "a".
     let parent = prefix.rfind('/').map_or("", |at| &prefix[..=at]);
     let (base, name) = match bucket {
@@ -1186,7 +1236,7 @@ async fn bucket_list(http: &reqwest::Client, bucket: &Bucket, prefix: &str, gcs_
     let folder = component(parent.trim_end_matches('/').rsplit('/').next().filter(|n| !n.is_empty()).unwrap_or(name), "bucket")?;
     let (mut tasks, mut token) = (Vec::new(), None);
     for _ in 0..MAX_PAGES {
-        let (objects, next) = bucket_page(http, bucket, prefix, token.as_deref(), gcs_api).await?;
+        let (objects, next) = bucket_page(http, bucket, prefix, token.as_deref(), gcs_api, s3).await?;
         for (key, size, checksum) in objects {
             // A key ending in `/` is a folder's marker, no file.
             let Some(rest) = key.strip_prefix(parent).filter(|r| !r.is_empty() && !r.ends_with('/')) else { continue };
@@ -1777,25 +1827,25 @@ mod tests {
         let listed = |tasks: Vec<Task>| tasks.into_iter().map(|t| (t.urls[0].to_string(), t.folder.unwrap(), t.name.unwrap(), t.size, t.checksum)).collect::<Vec<_>>();
         let s3 = Bucket::S3 { base: at("/bk/"), name: "bk".into(), md5_etags: true };
         assert_eq!(
-            listed(bucket_list(&http(), &s3, "data/", &base).await.unwrap()),
+            listed(bucket_list(&http(), &s3, "data/", &base, None).await.unwrap()),
             [
                 (format!("{base}/bk/data/a%20b.txt"), PathBuf::from("data"), PathBuf::from("a b.txt"), Some(25333), Some("md5:a82389915a3d59147c906fe72463312a".to_string())),
                 (format!("{base}/bk/data/sub/c.bin"), PathBuf::from("data"), PathBuf::from("sub").join("c.bin"), Some(9), None),
             ]
         );
         let private = Bucket::S3 { base: at("/private/"), name: "private".into(), md5_etags: true };
-        assert_eq!(bucket_list(&http(), &private, "", &base).await.unwrap_err(), BUCKET_PRIVATE);
+        assert_eq!(bucket_list(&http(), &private, "", &base, None).await.unwrap_err(), S3_PRIVATE);
         let azure = Bucket::Azure { base: at("/cont/"), name: "cont".into() };
         assert_eq!(
-            listed(bucket_list(&http(), &azure, "", &base).await.unwrap()),
+            listed(bucket_list(&http(), &azure, "", &base, None).await.unwrap()),
             [
                 (format!("{base}/cont/x/y.parquet"), PathBuf::from("cont"), PathBuf::from("x").join("y.parquet"), Some(51431175), None),
                 (format!("{base}/cont/z.txt"), PathBuf::from("cont"), PathBuf::from("z.txt"), Some(3), Some("md5:ce264d77cba2913b430a4053812e518b".to_string())),
             ]
         );
-        assert_eq!(bucket_list(&http(), &Bucket::Azure { base: at("/gone/"), name: "gone".into() }, "", &base).await.unwrap_err(), BUCKET_GONE);
+        assert_eq!(bucket_list(&http(), &Bucket::Azure { base: at("/gone/"), name: "gone".into() }, "", &base, None).await.unwrap_err(), BUCKET_GONE);
         assert_eq!(
-            listed(bucket_list(&http(), &Bucket::Gcs { bucket: "bk".into() }, "LC08/a", &base).await.unwrap()),
+            listed(bucket_list(&http(), &Bucket::Gcs { bucket: "bk".into() }, "LC08/a", &base, None).await.unwrap()),
             [
                 (format!("{base}/bk/LC08/a_MTL.txt"), PathBuf::from("LC08"), PathBuf::from("a_MTL.txt"), Some(8454), Some("md5:ce264d77cba2913b430a4053812e518b".to_string())),
                 (format!("{base}/bk/LC08/b.txt"), PathBuf::from("LC08"), PathBuf::from("b.txt"), Some(3), None),
@@ -1948,7 +1998,7 @@ mod tests {
     async fn live_pcloud() {
         let file = resolve(&http(), &live("https://u.pcloud.link/publink/show?code=XZtTpwVZnMvzSRIY2vhs6zCQgfHtI8Oya3YV"), None).await.unwrap();
         assert!(file[0].path().ends_with("/llama.sh"), "{file:?}");
-        let tasks = list_link(&http(), &live("https://u.pcloud.link/publink/show?code=kZBjoO0Z0N6DdHilOAyiT3Vnb4u0nRJ2WBxk")).await.unwrap();
+        let tasks = list_link(&http(), &live("https://u.pcloud.link/publink/show?code=kZBjoO0Z0N6DdHilOAyiT3Vnb4u0nRJ2WBxk"), None).await.unwrap();
         assert!(tasks.len() > 1 && tasks.iter().all(|t| t.folder == Some("debs".into())), "{tasks:?}");
         assert!(resolve(&http(), &tasks[0].urls[0], None).await.is_ok());
     }
@@ -1960,7 +2010,7 @@ mod tests {
     async fn live_yandex_disk() {
         let file = resolve(&http(), &live("https://yadi.sk/d/BdyBP6SpI1-HVg"), None).await.unwrap();
         assert!(file[0].as_str().contains("filename=AllDatasets.zip"), "{file:?}");
-        let tasks = list_link(&http(), &live("https://yadi.sk/d/loPpY45J3EAYfU")).await.unwrap();
+        let tasks = list_link(&http(), &live("https://yadi.sk/d/loPpY45J3EAYfU"), None).await.unwrap();
         assert!(tasks.len() > 50 && tasks.iter().all(|t| t.folder == Some("RL_lectures".into())), "{}", tasks.len());
         let err = resolve(&http(), &live("https://yadi.sk/d/MBruQdRo3WSdCx"), None).await.unwrap_err();
         assert!(err.to_string().contains("does not exist"), "{err}");
@@ -1973,7 +2023,7 @@ mod tests {
     async fn live_box() {
         let file = resolve(&http(), &live("https://app.box.com/s/17vthb1zl0zeh340m4gaw0luuf2vscne"), None).await.unwrap();
         assert!(file[0].as_str().ends_with("file_id=f_272056515134"), "{file:?}");
-        let tasks = list_link(&http(), &live("https://app.box.com/s/1cwdnolsmtf0s04o0hshbv4vxiuqcmi9")).await.unwrap();
+        let tasks = list_link(&http(), &live("https://app.box.com/s/1cwdnolsmtf0s04o0hshbv4vxiuqcmi9"), None).await.unwrap();
         assert!(tasks.iter().any(|t| t.name == Some("osgeopy-data-misc.zip".into())), "{tasks:?}");
     }
 

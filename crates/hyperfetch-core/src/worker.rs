@@ -262,6 +262,8 @@ pub struct Auth {
     referer: Option<String>,
     /// A paste's headers (see `DownloadOptions::secret_headers`), scoped as `value` is.
     headers: HeaderMap,
+    /// The key requests to S3 hosts among them are signed with (see `crate::sigv4`).
+    s3: Option<Arc<crate::sigv4::S3Key>>,
     user_urls: Vec<Url>,
 }
 
@@ -269,7 +271,7 @@ impl Auth {
     pub(crate) fn new(value: &str, user_urls: &[Url]) -> Result<Self, String> {
         let mut value = HeaderValue::from_str(value).map_err(|_| "Invalid Authorization header value".to_string())?;
         value.set_sensitive(true);
-        Ok(Self { value: Some(value), referer: None, headers: HeaderMap::new(), user_urls: user_urls.to_vec() })
+        Ok(Self { value: Some(value), referer: None, headers: HeaderMap::new(), s3: None, user_urls: user_urls.to_vec() })
     }
 
     pub(crate) fn with_referer(mut self, referer: Option<String>) -> Self {
@@ -278,7 +280,12 @@ impl Auth {
     }
 
     pub(crate) fn only_referer(referer: Option<&str>, user_urls: &[Url]) -> Self {
-        Self { value: None, referer: referer.map(str::to_string), headers: HeaderMap::new(), user_urls: user_urls.to_vec() }
+        Self { value: None, referer: referer.map(str::to_string), headers: HeaderMap::new(), s3: None, user_urls: user_urls.to_vec() }
+    }
+
+    pub(crate) fn with_s3(mut self, key: Option<crate::sigv4::S3Key>) -> Self {
+        self.s3 = key.map(Arc::new);
+        self
     }
 
     /// With `headers` too; a pair that is no valid header is left out.
@@ -299,7 +306,8 @@ impl Auth {
 }
 
 /// Adds the user's `Authorization` header and a paste's headers (replacing those of the same
-/// name) to a request for `url` when `auth` covers that URL, the User-Agent `url`'s host takes
+/// name) to a request for `url` when `auth` covers that URL (or signs it with the user's S3 key,
+/// for an S3 host, see `crate::sigv4`), the User-Agent `url`'s host takes
 /// (see [`crate::resolver::with_agent_for`]), and the appropriate `Referer` header (see
 /// [`crate::resolver::with_referer_for`]).
 pub(crate) fn authorize(request: RequestBuilder, auth: Option<&Auth>, url: &Url) -> RequestBuilder {
@@ -308,6 +316,9 @@ pub(crate) fn authorize(request: RequestBuilder, auth: Option<&Auth>, url: &Url)
     let request = crate::resolver::with_referer_for(request, url, explicit_referer);
     let Some(auth) = auth.filter(|a| a.allows(url)) else { return request };
     let request = request.headers(auth.headers.clone());
+    if let Some(key) = auth.s3.as_deref().filter(|key| key.applies(url)) {
+        return crate::sigv4::signed(request, key);
+    }
     match &auth.value {
         Some(v) => request.header(AUTHORIZATION, v.clone()),
         None => request,
@@ -321,6 +332,11 @@ pub(crate) fn authorize(request: RequestBuilder, auth: Option<&Auth>, url: &Url)
 /// themselves, so their answers come back as they are.
 pub(crate) async fn send(build: impl Fn(&Url) -> RequestBuilder, url: &Url) -> reqwest::Result<Response> {
     let mut response = build(url).send().await?;
+    // A signed request turned away for a clock minutes off is signed again by the server's.
+    let signed = || build(url).build().is_ok_and(|request| request.headers().contains_key("x-amz-date"));
+    if response.status() == reqwest::StatusCode::FORBIDDEN && signed() && crate::sigv4::learn_skew(response.headers()) {
+        response = build(url).send().await?;
+    }
     for _ in 0..10 {
         let moved = matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308);
         let location = response.headers().get(LOCATION).and_then(|l| l.to_str().ok());

@@ -34,6 +34,7 @@ pub mod ftp;
 pub mod digest;
 pub mod zipdir;
 pub mod delta;
+pub mod sigv4;
 pub mod sniff;
 pub mod stream;
 pub mod dash;
