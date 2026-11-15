@@ -13,6 +13,14 @@ edition = "2021"
 authors = ["Aditya Sharma"]
 license = "GPL-3.0-or-later"
 
+# Test and debug builds: line numbers in backtraces for our crates, no debug info for dependencies.
+# It keeps `target` several GB smaller and linking lighter on memory.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 [profile.release]
 opt-level = 3
 lto = "thin"

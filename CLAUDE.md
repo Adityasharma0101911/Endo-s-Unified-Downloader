@@ -28,6 +28,8 @@ The user works on this PC (32 threads, 32 GB RAM) while you build and test, so b
 - Every test server sends a body of fixed length, then ends: never an endless stream. Every download, recording or capture in a test or a real run has a size or time limit (`max_filesize`, a timeout). Every test that waits has a timeout, so a hung test can't keep writing.
 - Throwaway files go in the session scratchpad. That covers real-run downloads, `ENDO_CAPTURE_DIR`, `gh run download` artifacts and cloned repos. Tests write only to temp dirs that delete themselves. Never write into the user's Downloads folder or the repo.
 - Keep one `target` folder: no `CARGO_TARGET_DIR` elsewhere. Delete `target/ui-captures` once you've looked at the captures.
+- Keep `target` small. The dev profile in `Cargo.toml` keeps debug info to line numbers for our crates and none for dependencies: don't turn it back up. When `target` passes 10 GB, run `cargo clean -p hyperfetch-core -p hyperfetch-cli -p hyperfetch-gui` (it keeps the dependencies' builds); stale builds of our crates once piled up to 28 GB.
+- For UI work, build and test only the GUI crate (`cargo test -p hyperfetch-gui <name>`), not the workspace.
 - At the end, check the size of the scratchpad and of `target`, and the free space on C:. Delete what you made. If C: lost more than 5 GB, find out why before you stop.
 
 ## Releasing

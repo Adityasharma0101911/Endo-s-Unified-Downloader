@@ -350,11 +350,13 @@ fn progress_bar(ui: &mut Ui, id: egui::Id, size: Vec2, ratio: f32, color: Color3
     let rounding = rect.height() / 2.0;
     // A thin bar sits on a card, where the field color hardly shows.
     ui.painter().rect_filled(rect, rounding, if rect.height() < 10.0 { p.border } else { p.field });
-    let done = Rect::from_min_size(rect.min, Vec2::new(rect.width() * ratio, rect.height()));
     if ratio > 0.0 {
-        ui.painter().rect_filled(done, rounding, color);
+        // The filled part keeps the bar's round ends at any length, and so does the light on it.
+        let done = Rect::from_min_size(rect.min, Vec2::new(rect.width() * ratio, rect.height()));
+        let half = anim::fill_half(rect, done.right());
+        ui.painter().add(egui::Shape::convex_polygon(anim::outline(done, half), color, Stroke::NONE));
         if active {
-            anim::sheen(ui, done.shrink2(Vec2::new(rounding, 0.0)));
+            anim::sweep(ui, done, half);
         }
     }
     if let Some(text) = text {
