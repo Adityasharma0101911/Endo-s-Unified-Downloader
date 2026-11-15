@@ -19,7 +19,9 @@ test("the Chrome Web Store build has no YouTube button and leaves YouTube's host
 
   const manifest = JSON.parse(readFileSync(join(dir, "manifest.json"), "utf8"));
   assert.equal(existsSync(join(dir, "content", "youtube.js")), false);
-  assert.equal(manifest.content_scripts.length, 2);
+  // hook.js, bridge.js and the button over videos (button.js), none of them in YouTube's pages.
+  assert.equal(manifest.content_scripts.length, 3);
+  assert.ok(manifest.content_scripts.some((script) => script.js.includes("content/button.js")));
   for (const script of manifest.content_scripts) assert.ok(script.exclude_matches.includes("*://*.youtube.com/*"));
   assert.equal(manifest.browser_specific_settings, undefined);
   assert.deepEqual(manifest.background, { service_worker: "background.js", type: "module" });

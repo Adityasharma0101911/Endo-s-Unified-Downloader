@@ -485,6 +485,8 @@ button.chip[aria-pressed="true"] { --c: var(--accent); --ct: var(--accent-text);
 .drm-note { display: flex; align-items: flex-start; gap: 8px; padding: 8px 10px; border-radius: 8px; background: color-mix(in srgb, var(--red) 12%, transparent); color: var(--red-text); font-size: 12px; }
 .drm-note .icon { margin-top: 1px; }
 #image-min { height: 26px; font-size: 12px; }
+.all-tabs { display: grid; justify-items: center; gap: 4px; margin-top: 4px; }
+.backup-actions { display: flex; gap: 8px; }
 
 /* ---- Settings ---- */
 

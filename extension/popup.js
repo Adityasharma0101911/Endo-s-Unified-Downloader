@@ -356,7 +356,7 @@ function updateRow(row, item) {
   if (!row.mp4Set) row.mp4.checked = state.settings?.convertToMp4 !== false;
   const subs = Array.isArray(state.subs) ? state.subs.length : 0;
   row.subsWrap.hidden = subs === 0 || locked;
-  row.subsText.textContent = `Subtitles (${subs})`;
+  row.subsText.textContent = `Subs (${subs})`;
 
   row.host = hostOf(item.url);
   if (!row.blockTimer) row.block.label.textContent = row.host ? `Block ${row.host}` : "Block host";
@@ -619,6 +619,34 @@ async function showPageKind() {
     $("page-note").hidden = false;
   }
   $("find-video").hidden = files || mediaSite;
+}
+
+/** The timer of a first click on "every open tab" (it then asks to be clicked again), 0 when none is waiting. */
+let allTabsArmed = 0;
+const ALL_TABS_LABEL = "Send the videos of every open tab";
+
+function disarmAllTabs() {
+  clearTimeout(allTabsArmed);
+  allTabsArmed = 0;
+  $("all-tabs").querySelector("span").textContent = ALL_TABS_LABEL;
+}
+
+/** "Every open tab": the first click counts what would go and asks again, a second within 6 s sends it. */
+async function sendAllTabs() {
+  const node = $("all-tabs-msg");
+  if (!allTabsArmed) {
+    const { count = 0 } = await ask({ cmd: "ALL_TABS" });
+    if (count === 0) return say(node, "No videos found in the open tabs.");
+    $("all-tabs").querySelector("span").textContent = `Send ${count} ${count === 1 ? "video" : "videos"}`;
+    allTabsArmed = setTimeout(disarmAllTabs, 6000);
+    return say(node, `${count} open ${count === 1 ? "tab has" : "tabs have"} a video to send. Click again to send ${count === 1 ? "it" : "them"}.`);
+  }
+  disarmAllTabs();
+  $("all-tabs").disabled = true;
+  say(node, "Sending…");
+  const reply = await ask({ cmd: "SEND_ALL_TABS" });
+  $("all-tabs").disabled = false;
+  report(node, reply, `Sent ${reply.sent} to the downloader.`);
 }
 
 /**
@@ -1141,6 +1169,7 @@ function renderSettings(s) {
   $("convert-mp4").checked = s.convertToMp4 !== false;
   $("media-cookies").checked = s.mediaCookies === true;
   $("youtube-button").checked = s.youtubeButton !== false;
+  $("video-button").checked = s.videoButton !== false;
   $("youtube-button").closest(".setting").hidden = NO_YOUTUBE;
   $("capture").checked = s.captureEnabled === true;
   $("capture-all").checked = s.captureAll === true;
@@ -1187,6 +1216,38 @@ function saveSettings(patch, success, node = $("settings-msg")) {
     renderSiteCapture();
   });
   return saving;
+}
+
+/** Export: the settings as a JSON file in the browser's downloads (one the extension starts stays in the browser). */
+async function exportSettings() {
+  if (!state.settings) return say($("backup-msg"), "Settings haven't loaded; reopen the popup.", "err");
+  const blob = new Blob([JSON.stringify(state.settings, null, 2) + "\n"], { type: "application/json" });
+  try {
+    await chrome.downloads.download({ url: URL.createObjectURL(blob), filename: "endo-extension-settings.json", saveAs: false });
+    say($("backup-msg"), "Saved as endo-extension-settings.json in your downloads.", "ok");
+  } catch (e) {
+    say($("backup-msg"), `Couldn't save the file: ${e?.message || e}`, "err");
+  }
+}
+
+/** Import…: picks a settings file. Firefox closes the popup when a file picker opens, so there it opens in a tab. */
+function chooseSettingsFile() {
+  if (chrome.runtime.getURL("").startsWith("moz-extension:") && !new URLSearchParams(location.search).has("tab")) {
+    chrome.tabs.create({ url: chrome.runtime.getURL(`popup.html?tab=${tab?.id ?? 0}&view=settings`) });
+    return window.close();
+  }
+  $("import-file").click();
+}
+
+/** The picked settings file replaces the settings it names; the background checks each value. */
+async function importSettings(event) {
+  const file = event.target.files?.[0];
+  event.target.value = "";
+  if (!file) return;
+  if (file.size > 1 << 20) return say($("backup-msg"), "That file is too big to be a settings file.", "err");
+  const reply = await ask({ cmd: "IMPORT_SETTINGS", text: await file.text() });
+  report($("backup-msg"), reply, "Settings imported.");
+  if (reply.ok) refresh();
 }
 
 /** A whole-number setting typed in `id` (`what` names its unit for the error), saved under `key`. */
@@ -1354,6 +1415,11 @@ async function init() {
   );
   $("media-cookies").addEventListener("change", (event) => saveSettings({ mediaCookies: event.target.checked }, "Saved."));
   $("youtube-button").addEventListener("change", (event) => saveSettings({ youtubeButton: event.target.checked }, "Saved."));
+  $("video-button").addEventListener("change", (event) => saveSettings({ videoButton: event.target.checked }, "Saved."));
+  $("all-tabs").addEventListener("click", sendAllTabs);
+  $("export-settings").addEventListener("click", exportSettings);
+  $("import-settings").addEventListener("click", chooseSettingsFile);
+  $("import-file").addEventListener("change", importSettings);
   $("capture").addEventListener("change", (event) => saveSettings({ captureEnabled: event.target.checked }, "Saved."));
   $("capture-all").addEventListener("change", (event) => saveSettings({ captureAll: event.target.checked }, "Saved."));
   $("capture-start").addEventListener("change", (event) => saveSettings({ captureStartsApp: event.target.checked }, "Saved."));
@@ -1376,7 +1442,9 @@ async function init() {
     loadMediaCard();
   });
 
-  showView(httpTab ? (VIEWS.includes(saved) ? saved : "media") : "settings");
+  // popup.html?view=<name> opens on that view (Firefox's Import opens Settings in a tab).
+  const asked = new URLSearchParams(location.search).get("view");
+  showView(VIEWS.includes(asked) && !$(`tab-${asked}`).disabled ? asked : httpTab ? (VIEWS.includes(saved) ? saved : "media") : "settings");
   chrome.runtime.onMessage.addListener((msg) => {
     if ((msg?.cmd === "STATE_CHANGED" && msg.tabId === tab?.id) || msg?.cmd === "LOG_CHANGED") refresh();
   });

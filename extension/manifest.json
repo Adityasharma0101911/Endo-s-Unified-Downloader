@@ -60,6 +60,20 @@
       "js": ["content/youtube.js"],
       "run_at": "document_idle",
       "world": "ISOLATED"
+    },
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "exclude_matches": ["https://www.youtube.com/*", "https://m.youtube.com/*", "https://*.doubleclick.net/*"],
+      "js": ["content/button.js"],
+      "run_at": "document_idle",
+      "all_frames": true,
+      "world": "ISOLATED"
     }
-  ]
+  ],
+  "commands": {
+    "send-best": {
+      "suggested_key": { "default": "Alt+Shift+D" },
+      "description": "Send the page's best video to the app"
+    }
+  }
 }

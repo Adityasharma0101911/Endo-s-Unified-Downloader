@@ -4,7 +4,7 @@
 // queues that may start empty. Listeners are registered at the top level so a restarted worker gets the event that
 // woke it.
 
-import { ALT_WINDOW_MS, CAPTURE_TYPES, altClicked, captureDecision, originOf, parseSites, parseTypes, upgradedTypes } from "./lib/capture.js";
+import { ALT_WINDOW_MS, CAPTURE_TYPES, altClicked, captureDecision, originOf, parseSites, parseTypes, settingsOfFile, upgradedTypes } from "./lib/capture.js";
 import {
   classifyResponse,
   cleanHost,
@@ -24,10 +24,12 @@ import {
   sanitizeFilename,
   splitRequestHeaders,
   subtitleOf,
+  suggestFilename,
 } from "./lib/detect.js";
-import { MAX_BATCH, cookieHeader, isMagnet, siteOf } from "./lib/links.js";
+import { MAX_BATCH, cookieHeader, isMagnet, linksInText, siteOf } from "./lib/links.js";
 import { QUALITIES, isMediaPage, mediaPayload, rememberedChoice } from "./lib/media.js";
 import { WaitingList, rescueWithMedia, sendCaptured } from "./lib/rescue.js";
+import { bestItem, drmNote, isProtected } from "./lib/view.js";
 
 const APP_NAME = "endos-unified-downloader";
 const APP_PORTS = [49152, 49153, 49154, 49155];
@@ -755,9 +757,12 @@ async function injectIntoOpenTabs() {
     const target = { tabId: tab.id, allFrames: true };
     chrome.scripting.executeScript({ target, files: ["content/hook.js"], world: "MAIN", injectImmediately: true }).catch(() => {});
     chrome.scripting.executeScript({ target, files: ["content/bridge.js"], injectImmediately: true }).catch(() => {});
-    if (!NO_YOUTUBE && /^https:\/\/(www|m)\.youtube\.com\//.test(tab.url || "")) {
+    const youtube = /^https:\/\/(www|m)\.youtube\.com\//.test(tab.url || "");
+    if (!NO_YOUTUBE && youtube) {
       chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["content/youtube.js"] }).catch(() => {});
     }
+    // YouTube has its own button (youtube.js); button.js also leaves YouTube's frames inside other pages alone.
+    if (!youtube && !isOffLimits(hostOf(tab.url))) chrome.scripting.executeScript({ target, files: ["content/button.js"] }).catch(() => {});
   }
 }
 
@@ -769,10 +774,42 @@ chrome.runtime.onInstalled.addListener((details) => {
   if ((details.reason === "install" || details.reason === "update") && !IS_FIREFOX) injectIntoOpenTabs();
   chrome.contextMenus.removeAll(() => {
     chrome.contextMenus.create({ id: "endo-link", title: MENU_TITLE, contexts: ["link"] });
-    chrome.contextMenus.create({ id: "endo-media", title: MENU_TITLE, contexts: ["video", "audio"] });
+    chrome.contextMenus.create({ id: "endo-media", title: MENU_TITLE, contexts: ["video", "audio", "image"] });
     chrome.contextMenus.create({ id: "endo-page", title: MENU_TITLE, contexts: ["page"] });
+    chrome.contextMenus.create({ id: "endo-selection", title: "Download the links in the selection with Endo's Unified Downloader", contexts: ["selection"] });
   });
 });
+
+/**
+ * Runs in the frame the selection is in (isolated world); must not reference anything outside itself. The selected
+ * text, and the links of the anchors the selection touches.
+ */
+function selectedLinks() {
+  const selection = getSelection();
+  const urls = [];
+  for (let i = 0; i < selection.rangeCount; i++) {
+    const range = selection.getRangeAt(i);
+    const node = range.commonAncestorContainer;
+    const scope = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
+    const around = scope?.closest("a[href]");
+    if (around) urls.push(around.href);
+    for (const anchor of scope?.querySelectorAll("a[href]") || []) if (range.intersectsNode(anchor)) urls.push(anchor.href);
+  }
+  return { text: selection.toString().slice(0, 200000), urls: urls.filter((url) => typeof url === "string").slice(0, 5000) };
+}
+
+/**
+ * The links of a selection (see selectedLinks; the menu's selectionText when the frame can't be read): those written
+ * out in it and those its anchors point to, http(s) and magnet ones, each once, at most MAX_BATCH.
+ */
+async function selectionLinks(info, tab) {
+  const [found] = await chrome.scripting
+    .executeScript({ target: { tabId: tab.id, frameIds: [info.frameId ?? 0] }, func: selectedLinks })
+    .catch(() => []);
+  const { text = info.selectionText || "", urls = [] } = found?.result || {};
+  const all = [...new Set([...urls, ...linksInText(text)])];
+  return all.filter((url) => isMagnet(url) || (isHttpUrl(url) && !isOffLimits(hostOf(url)))).slice(0, MAX_BATCH);
+}
 
 /**
  * The quality, container and subtitles the media card last sent (the defaults it opens with) as /add's `media`, for
@@ -807,13 +844,57 @@ async function sendLink(url, tab, pageUrl) {
 }
 
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
-  const url = { "endo-link": info.linkUrl, "endo-media": info.srcUrl, "endo-page": info.pageUrl }[info.menuItemId];
-  if (url === undefined) return;
-  const send = () => sendLink(url, tab, info.pageUrl || tab?.url);
-  let result = await send();
-  // The click asked for the app: it is started (the browser asks first), then sent the link again.
-  if (result.notRunning && (await startApp()).ok) result = await send();
-  flashBadge(tab?.id, result.ok);
+  let send;
+  if (info.menuItemId === "endo-selection") {
+    if (!validTabId(tab?.id)) return;
+    const urls = await selectionLinks(info, tab);
+    if (urls.length === 0) return flashBadge(tab.id, false);
+    // One link goes as the link menu sends one; more as the Links view sends its batch.
+    send = () => (urls.length === 1 ? sendLink(urls[0], tab, info.pageUrl || tab.url) : POPUP_COMMANDS.SEND_LINKS({ tabId: tab.id, urls }));
+  } else {
+    const url = { "endo-link": info.linkUrl, "endo-media": info.srcUrl, "endo-page": info.pageUrl }[info.menuItemId];
+    if (url === undefined) return;
+    send = () => sendLink(url, tab, info.pageUrl || tab?.url);
+  }
+  flashBadge(tab?.id, (await withApp(send)).ok);
+});
+
+/** Runs `send`; when the app was not running, starts it (the browser asks first) and runs `send` again. */
+async function withApp(send) {
+  const result = await send();
+  return result.notRunning && (await startApp()).ok ? send() : result;
+}
+
+/** Sends a tab's item as the popup's Download does with what it shows at first: its name, the MP4 setting. */
+async function sendItem(tab, item) {
+  const { convertToMp4 } = await getSettings();
+  const filename = suggestFilename(item.title || tab.title || "video", item.kind === "hls" ? "mp4" : String(item.format || "mp4"));
+  return POPUP_COMMANDS.SEND({ tabId: tab.id, id: item.id, filename, mp4: convertToMp4 !== false });
+}
+
+/**
+ * What one click sends from tab `tab` (Alt+Shift+D, every open tab): a media site's video page itself, with the
+ * media card's last choice, else the tab's best item (see bestItem); null when there is neither, or the tab is no
+ * web page or off limits.
+ */
+async function bestOfTab(tab) {
+  if (!validTabId(tab?.id) || !isHttpUrl(tab.url) || isOffLimits(hostOf(tab.url))) return null;
+  if (isMediaPage(tab.url)) return () => sendLink(tab.url, tab, tab.url);
+  const item = bestItem(Object.values((await readTab(tab.id)).items));
+  return item ? () => sendItem(tab, item) : null;
+}
+
+// Alt+Shift+D (the manifest's "send-best"; the browser's shortcut settings can change it): the tab's best video, else
+// the page itself when the app can take it (a file host's page, a site its video engine knows); "!" when neither.
+chrome.commands?.onCommand.addListener(async (command, tab) => {
+  if (command !== "send-best") return;
+  tab ??= (await chrome.tabs.query({ active: true, currentWindow: true }).catch(() => []))[0];
+  let send = await bestOfTab(tab);
+  if (!send && isHttpUrl(tab?.url) && !isOffLimits(hostOf(tab.url))) {
+    const { kind } = await POPUP_COMMANDS.PAGE_KIND({ url: tab.url });
+    if (kind === "media" || kind === "files") send = () => sendLink(tab.url, tab, tab.url);
+  }
+  flashBadge(tab?.id, send ? (await withApp(send)).ok : false);
 });
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -1287,6 +1368,41 @@ const POPUP_COMMANDS = {
     }
   },
 
+  /** How many open tabs "every open tab" would send from (see bestOfTab), for the popup to ask first. */
+  async ALL_TABS() {
+    const tabs = await chrome.tabs.query({ url: ["http://*/*", "https://*/*"] }).catch(() => []);
+    const plans = await Promise.all(tabs.filter((tab) => !tab.incognito).map(bestOfTab));
+    return { ok: true, count: plans.filter(Boolean).length };
+  },
+
+  /**
+   * Sends the best video of every open tab, one tab after the other (see bestOfTab); private windows' tabs are left
+   * alone. Stops at the first tab when the app is not running, so "Start the app" sends them all again.
+   */
+  async SEND_ALL_TABS() {
+    const tabs = await chrome.tabs.query({ url: ["http://*/*", "https://*/*"] }).catch(() => []);
+    let sent = 0;
+    let error = "";
+    for (const tab of tabs.filter((open) => !open.incognito)) {
+      const send = await bestOfTab(tab);
+      if (!send) continue;
+      const reply = await send();
+      if (reply.notRunning) return reply;
+      if (reply.ok) sent++;
+      else error ||= reply.error || "Failed.";
+      flashBadge(tab.id, reply.ok);
+    }
+    return error ? { ok: false, sent, error: `${sent} sent; one or more failed: ${error}` } : { ok: true, sent };
+  },
+
+  /** A settings file the popup read (its Import): the settings it knows replace the current ones, each checked. */
+  async IMPORT_SETTINGS({ text }) {
+    const imported = typeof text === "string" && text.length <= 1 << 20 ? settingsOfFile(text, Object.keys(DEFAULT_SETTINGS)) : null;
+    if (!imported) return { ok: false, error: "That is not a settings file of this extension." };
+    await saveSettings({ ...(await getSettings()), ...imported });
+    return { ok: true };
+  },
+
   /**
    * What the app makes of a page by its link (POST /handles): "media" (its video engine takes it), "files" (it finds
    * the files of a share, folder or file host's page) or "none". Asked when the popup opens, kept per link for the
@@ -1520,7 +1636,7 @@ const POPUP_COMMANDS = {
   async START_APP({ tabId, retry }) {
     const app = await startApp();
     if (!app.ok) return { ok: false, error: app.outdated ? OUTDATED : "The app didn't start. Open Endo's Unified Downloader yourself, or get it from the releases page." };
-    if (!["SEND", "SEND_URL", "SEND_MEDIA", "SEND_LINKS", "BROWSER_DL", "SEND_LOGGED"].includes(retry?.cmd)) return { ok: true };
+    if (!["SEND", "SEND_URL", "SEND_MEDIA", "SEND_LINKS", "BROWSER_DL", "SEND_LOGGED", "SEND_ALL_TABS"].includes(retry?.cmd)) return { ok: true };
     const reply = await POPUP_COMMANDS[retry.cmd](retry);
     flashBadge(retry.tabId, reply.ok);
     return reply;
@@ -1681,6 +1797,32 @@ const PAGE_COMMANDS = {
     if (!isHttpUrl(url)) return { ok: false };
     const { live, drm } = typeof head === "string" && head.length <= 64 * 1024 ? mpdFlags(head) : {};
     return addPageItem(sender, url, { ...DASH_FIELDS, live: live === true, drm: drm === true });
+  },
+
+  /**
+   * The Download button over a video (button.js), clicked: that video, as the popup's Download sends it: the item it
+   * plays, else the best of its frame, else of the tab (see bestItem); on a media site's video page, the page itself;
+   * else the link it plays. A protected one is refused with the popup's words.
+   */
+  async VIDEO_SEND({ src }, sender) {
+    const tab = sender.tab;
+    if (!isHttpUrl(tab.url) || isOffLimits(hostOf(tab.url))) return { ok: false, error: OFF_LIMITS };
+    const state = await readTab(tab.id);
+    const items = Object.values(state.items).filter((item) => !item.hidden);
+    const playing = typeof src === "string" ? items.find((item) => item.url === src) : null;
+    if (state.drm || (playing && isProtected(playing))) return { ok: false, error: drmNote(typeof state.drm === "string" ? state.drm : "") };
+    const item = playing || bestItem(items.filter((it) => it.frameId === sender.frameId)) || bestItem(items);
+    const send = isMediaPage(tab.url)
+      ? () => sendLink(tab.url, tab, tab.url)
+      : item
+        ? () => sendItem(tab, item)
+        : isHttpUrl(src) && !isBlocked(hostOf(src), (await getSettings()).blockedHosts)
+          ? () => sendLink(src, tab, sender.url)
+          : null;
+    if (!send) return { ok: false, error: "No link for this video yet: let it play a moment, or record it from the popup." };
+    const result = await withApp(send);
+    flashBadge(tab.id, result.ok);
+    return result;
   },
 
   /** A video of the frame was given DRM keys (hook.js), with the key system the page asked for: the popup says so. */

@@ -200,6 +200,11 @@
         </div>
         <p id="reload-hint" class="note" hidden>Loaded before the extension? Reload the page to detect it.</p>
       </div>
+
+      <div class="all-tabs">
+        <button id="all-tabs" type="button" class="btn small ghost" title="The best video found in each open tab, and each open video page of a media site; private windows are left out"><svg class="icon" aria-hidden="true"><use href="#i-send"/></svg><span>Send the videos of every open tab</span></button>
+        <p id="all-tabs-msg" class="msg" role="status" aria-live="polite"></p>
+      </div>
     </section>
 
     <section id="links-view" class="panel" role="tabpanel" aria-labelledby="tab-links" hidden>
@@ -313,6 +318,10 @@
           <label for="convert-mp4">Convert HLS to MP4<small>The app turns saved streams into MP4 files</small></label>
           <input id="convert-mp4" type="checkbox" class="switch" role="switch">
         </div>
+        <div class="setting">
+          <label for="video-button">Show a Download button on videos<small>At the top right of a video while the pointer is over it (YouTube has its own)</small></label>
+          <input id="video-button" type="checkbox" class="switch" role="switch">
+        </div>
       </div>
 
       <div class="card">
@@ -367,6 +376,17 @@
         <h2 class="card-title"><svg class="icon" aria-hidden="true"><use href="#i-prohibit"/></svg>Blocked hosts</h2>
         <p id="no-blocked" class="note">None. Block a host from a media card's menu to stop detecting its media.</p>
         <ul id="blocked" class="rows" aria-label="Blocked hosts"></ul>
+      </div>
+
+      <div class="card">
+        <h2 class="card-title"><svg class="icon" aria-hidden="true"><use href="#i-copy"/></svg>Settings file</h2>
+        <p class="note">Keep these settings in a file, or take them from one (another browser's, say).</p>
+        <div class="backup-actions">
+          <button id="export-settings" type="button" class="btn small"><svg class="icon" aria-hidden="true"><use href="#i-download"/></svg><span>Export</span></button>
+          <button id="import-settings" type="button" class="btn small"><svg class="icon" aria-hidden="true"><use href="#i-update"/></svg><span>Import…</span></button>
+          <input id="import-file" type="file" accept=".json,application/json" hidden>
+        </div>
+        <p id="backup-msg" class="msg" role="status" aria-live="polite"></p>
       </div>
 
       <div class="card">

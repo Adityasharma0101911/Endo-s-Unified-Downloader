@@ -9,9 +9,19 @@ import {
   originOf,
   parseSites,
   parseTypes,
+  settingsOfFile,
   shouldCapture,
   upgradedTypes,
 } from "../lib/capture.js";
+
+test("a settings file gives only the settings it knows, and nothing when it is not one", () => {
+  const keys = ["captureAll", "blockedHosts"];
+  assert.deepEqual(settingsOfFile('{"captureAll":true,"blockedHosts":["a.example"],"evil":1}', keys), { captureAll: true, blockedHosts: ["a.example"] });
+  assert.equal(settingsOfFile('{"other":1}', keys), null);
+  assert.equal(settingsOfFile("[1,2]", keys), null);
+  assert.equal(settingsOfFile("null", keys), null);
+  assert.equal(settingsOfFile("not json", keys), null);
+});
 
 test("file types as typed keep their last extension, lower case, once each", () => {
   assert.deepEqual(parseTypes(".ZIP, iso;tar.gz  *.exe exe bad! "), ["zip", "iso", "gz", "exe"]);
