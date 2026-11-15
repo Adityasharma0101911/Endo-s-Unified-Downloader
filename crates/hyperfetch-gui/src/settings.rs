@@ -147,6 +147,16 @@ pub struct Settings {
     pub mark_of_the_web: bool,
     /// VirusTotal API key. Saved here, never with the queue or in the history.
     pub virustotal_api_key: String,
+    /// The access key S3 and S3-compatible servers' requests are signed with (see
+    /// [`Settings::s3_key`]), and its secret and session token. Saved here, never with the queue
+    /// or in the history.
+    pub s3_access_key: String,
+    pub s3_secret_key: String,
+    pub s3_session_token: String,
+    /// The region signed for when a bucket's address does not name it; empty for the default.
+    pub s3_region: String,
+    /// An S3-compatible server on a host of its own (`sigv4::S3Key::endpoint`); empty for none.
+    pub s3_endpoint: String,
     /// Look each downloaded file's SHA-256 up on VirusTotal (the hash only, never the file).
     pub virustotal_check: bool,
     /// 0 follows the system, 1 dark, 2 light.
@@ -282,6 +292,11 @@ impl Default for Settings {
             mark_of_the_web: engine.post.mark_of_the_web,
             virustotal_api_key: String::new(),
             virustotal_check: false,
+            s3_access_key: String::new(),
+            s3_secret_key: String::new(),
+            s3_session_token: String::new(),
+            s3_region: String::new(),
+            s3_endpoint: String::new(),
             theme: 0,
             reduce_motion: None,
             close_to_tray: false,
@@ -464,6 +479,19 @@ impl Settings {
         options.debrid_api_key = non_empty(&self.debrid_api_key);
         options.debrid_provider = non_empty(&self.debrid_provider);
         options.post.virustotal_key = non_empty(&self.virustotal_api_key).filter(|_| self.virustotal_check);
+        options.s3 = self.s3_key();
+    }
+
+    /// The S3 key of these settings, when the access key and its secret are set; an endpoint that
+    /// is no http(s) address is left out.
+    pub fn s3_key(&self) -> Option<hyperfetch_core::sigv4::S3Key> {
+        Some(hyperfetch_core::sigv4::S3Key {
+            access_key: non_empty(&self.s3_access_key)?,
+            secret: non_empty(&self.s3_secret_key)?,
+            session_token: non_empty(&self.s3_session_token),
+            region: non_empty(&self.s3_region),
+            endpoint: Url::parse(self.s3_endpoint.trim()).ok().filter(|u| matches!(u.scheme(), "http" | "https") && u.host_str().is_some()),
+        })
     }
 
     /// The local addresses downloads connect from when `multi_network` is on: the chosen ones,
@@ -498,6 +526,7 @@ impl Settings {
             password: None,
             auth: None,
             channels: Vec::new(),
+            s3: self.s3_key(),
         }
     }
 
@@ -875,6 +904,9 @@ mod tests {
             ip_family: IpFamily::V6,
             connect_timeout_secs: 0,
             categories: vec![Category { name: " Clips ".into(), extensions: vec![".MP4".into(), " webm mkv".into(), "".into()], folder: None }],
+            s3_access_key: " AKID ".into(),
+            s3_secret_key: "SECRET".into(),
+            s3_endpoint: "http://minio.lan:9000".into(),
             ..saved
         };
         let mut opts = chosen.download_options(&file, "", "").unwrap();
@@ -885,6 +917,13 @@ mod tests {
         opts.insecure = true;
         chosen.fill_keys(&mut opts);
         assert!(!opts.insecure, "a queue file cannot turn TLS checks off");
+        let key = opts.s3.clone().unwrap();
+        assert_eq!((key.access_key.as_str(), key.secret.as_str(), key.region.as_deref()), ("AKID", "SECRET", None));
+        assert_eq!(key.endpoint.map(String::from).as_deref(), Some("http://minio.lan:9000/"));
+        assert_eq!(chosen.list_options().s3.map(|k| k.access_key).as_deref(), Some("AKID"));
+        let queued = serde_json::to_string(&opts).unwrap();
+        assert!(!queued.contains("SECRET") && !queued.contains("AKID"), "never with the queue");
+        assert!(Settings { s3_secret_key: " ".into(), ..chosen.clone() }.s3_key().is_none());
         let sorted = chosen.sort_categories();
         assert_eq!((sorted[0].name.as_str(), sorted[0].extensions.as_slice()), ("Clips", &["mp4", "webm", "mkv"].map(String::from)[..]));
         let json = serde_json::to_string(&chosen).unwrap();

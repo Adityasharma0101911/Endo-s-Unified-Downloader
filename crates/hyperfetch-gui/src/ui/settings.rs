@@ -594,6 +594,18 @@ fn host_settings(app: &mut App, ui: &mut Ui) {
                  the app closes; set ENDO_GOOGLE_API_KEY to have it at every launch. Without one a folder is read from its \
                  public page, which has no sizes or checksums.";
     text_setting(ui, "Google API key", about, &mut app.settings.google_api_key, "Optional", true);
+    let about = "Signs requests to S3 and S3-compatible servers (Amazon S3, Wasabi, Backblaze B2, DigitalOcean Spaces, R2, \
+                 the endpoint below) so that private buckets list and download. Sent only to those servers; saved in the \
+                 settings only, never with the queue or in the history.";
+    text_setting(ui, "S3 access key ID", about, &mut app.settings.s3_access_key, "Optional", false);
+    text_setting(ui, "S3 secret access key", "The access key's secret.", &mut app.settings.s3_secret_key, "Optional", true);
+    let about = "For temporary credentials only.";
+    text_setting(ui, "S3 session token", about, &mut app.settings.s3_session_token, "Optional", true);
+    let about = "Signed for when a bucket's address does not name its region: us-east-1 when empty, auto on R2.";
+    text_setting(ui, "S3 region", about, &mut app.settings.s3_region, "us-east-1", false);
+    let about = "An S3-compatible server on a host of its own (MinIO, R2's S3 endpoint): its links are signed too, and a \
+                 folder link on it (/bucket/ or /bucket/folder/) lists the bucket.";
+    text_setting(ui, "S3 endpoint", about, &mut app.settings.s3_endpoint, "https://minio.example:9000", false);
     setting(ui, "Browser cookies", "Sign in to sites as in this browser, for videos and folders that need it.", app.settings.browser_cookies, |ui| {
         combo(ui, "browser_cookies_combo", &mut app.settings.browser_cookies, &BROWSERS);
     });

@@ -4,6 +4,8 @@ What changed in each release, newest first. Each release's page on [GitHub](http
 
 ## Unreleased
 
+- **Private S3 buckets.** With an access key (`--s3-access-key` and `--s3-secret-key`, a session token for temporary credentials, a region; GUI: Settings > Debrid & hosts), requests to Amazon S3 and the S3-compatible Wasabi, Backblaze B2, DigitalOcean Spaces and R2 are signed, so private buckets list and their files download; `--s3-endpoint` adds an S3-compatible server on a host of its own, such as MinIO, whose folder links then list too. The key goes to those servers alone and is never saved with the queue or in the history; a server whose clock is off is signed for at its own time.
+
 - **App: update from the copy on disk.** A link whose earlier download's file is still on disk offers "Update from the copy on disk": downloaded again in its place only if the server has a newer one, reusing what the copy holds where the server publishes block checksums. Advanced options take an older version to reuse (Browse…), and the download's page says how much was reused ("Reused 3.1 GiB of the old file, downloaded 240 MiB"; the CLI prints it too).
 
 - **Torrents with web seeds, then the swarm.** With BitTorrent on, a `.torrent` whose files have HTTP web seeds downloads them from the seeds first, checked by the torrent's piece hashes, and then fetches from peers only the pieces still bad or missing (one after the other, not at once). With BitTorrent off, a web-seeded file is now checked by the torrent's piece hashes, and bad pieces come again from another seed.

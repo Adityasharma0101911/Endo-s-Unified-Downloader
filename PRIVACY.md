@@ -28,7 +28,7 @@ The app stores its settings, queue and download history in its own folder on you
 - the sites you download from;
 - for an IPFS link (`ipfs://...`, or a gateway's `/ipfs/...` link), public IPFS gateways (ipfs.io, dweb.link, Pinata, Filebase and 4EVERLAND), which then learn the content address it names;
 - GitHub, to check for and download its own updates, and the tools it uses (yt-dlp and ffmpeg). It also contacts Codeberg for gallery-dl;
-- services you turn on and give your own key for: VirusTotal (it sends only a downloaded file's SHA-256 hash, never the file), Real-Debrid or AllDebrid, and the Google Drive API.
+- services you turn on and give your own key for: VirusTotal (it sends only a downloaded file's SHA-256 hash, never the file), Real-Debrid or AllDebrid, and the Google Drive API. An S3 access key you give signs requests only to the S3 storage you download from (Amazon S3, Wasabi, Backblaze B2, DigitalOcean Spaces, R2, or the server you name as its endpoint); its secret is never sent, only signatures made with it.
 
 When you turn on "Send links from your phone" (off by default), the app also listens on your local network for links sent from your own phone, from the page its QR code opens. It answers only devices on your local network, and adds a link only when the request carries the code from that QR code, which is saved in the app's settings and never logged. The links go from your phone straight to the app: nothing leaves your network for this.
 

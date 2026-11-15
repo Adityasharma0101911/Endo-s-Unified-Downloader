@@ -121,6 +121,9 @@ pub struct ListOptions {
     /// name or group one of these patterns matches (see `stream::pattern_matches`; `*` takes them
     /// all). Without any, a channel list is an error that lists its channels.
     pub channels: Vec<String>,
+    /// The access key S3 and S3-compatible buckets are listed with (see `crate::sigv4`), whose
+    /// endpoint's folder links list its buckets too.
+    pub s3: Option<crate::sigv4::S3Key>,
 }
 
 impl ListOptions {
@@ -168,6 +171,7 @@ impl Default for ListOptions {
             password: None,
             auth: None,
             channels: Vec::new(),
+            s3: None,
         }
     }
 }
@@ -560,7 +564,7 @@ async fn list(http: &reqwest::Client, url: &Url, options: &ListOptions) -> Optio
     if shares::lists(url) {
         return Some(shares::list(http, url, options.password.as_deref()).await);
     }
-    if cloud::lists(url) {
+    if cloud::lists(url) || cloud::endpoint_lists(url, options) {
         if let Some(listed) = cloud::list(http, url, options).await {
             return Some(listed);
         }

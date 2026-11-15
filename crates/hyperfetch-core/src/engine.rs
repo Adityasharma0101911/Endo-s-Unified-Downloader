@@ -403,6 +403,10 @@ pub struct DownloadOptions {
     pub delta_from: Option<PathBuf>,
     /// The new version's zsync control file, for `delta_from`, in place of `<link>.zsync`.
     pub zsync: Option<String>,
+    /// The access key requests to S3 and S3-compatible servers are signed with (see
+    /// `crate::sigv4`). Never saved: the front ends fill it in each time the download starts.
+    #[serde(skip)]
+    pub s3: Option<crate::sigv4::S3Key>,
 }
 
 impl Default for DownloadOptions {
@@ -484,6 +488,7 @@ impl Default for DownloadOptions {
             zip_entry: None,
             delta_from: None,
             zsync: None,
+            s3: None,
         }
     }
 }
@@ -657,7 +662,7 @@ impl DownloadEngine {
         };
         let auth = match (options.auth_header.as_deref(), options.referer.as_deref()) {
             (Some(value), referer) => match Auth::new(value, &urls) {
-                Ok(a) => Some(Arc::new(a.with_referer(referer.map(str::to_string)).with_headers(&scoped))),
+                Ok(a) => Some(Arc::new(a.with_referer(referer.map(str::to_string)).with_headers(&scoped).with_s3(options.s3.clone()))),
                 Err(e) => return Self {
                     limiter: None,
                     options,
@@ -675,8 +680,8 @@ impl DownloadEngine {
                 },
             },
             // A password alone adds no header, but is scoped as they are (see `media_options_for`).
-            (None, None) if scoped.is_empty() && options.password.is_none() => None,
-            (None, referer) => Some(Arc::new(Auth::only_referer(referer, &urls).with_headers(&scoped))),
+            (None, None) if scoped.is_empty() && options.password.is_none() && options.s3.is_none() => None,
+            (None, referer) => Some(Arc::new(Auth::only_referer(referer, &urls).with_headers(&scoped).with_s3(options.s3.clone()))),
         };
         Self {
             limiter: options.max_speed.filter(|&s| s > 0).map(|s| Arc::new(RateLimiter::new(s))),
