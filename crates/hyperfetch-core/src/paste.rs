@@ -386,9 +386,11 @@ fn plain(text: &str) -> Vec<PastedLink> {
 fn read_line(line: &str) -> (Vec<Url>, Vec<Item>) {
     let lower = line.to_ascii_lowercase();
     let (mut links, mut rest, mut at) = (Vec::new(), String::new(), 0);
-    while let Some(start) = ["http://", "https://"].iter().filter_map(|s| lower[at..].find(s)).min().map(|i| at + i) {
+    // WebDAV links too, so their `user:pass@` is taken out like an http link's.
+    let schemes = ["http://", "https://", "webdav://", "webdavs://", "dav://", "davs://"];
+    while let Some(start) = schemes.iter().filter_map(|s| lower[at..].find(s)).min().map(|i| at + i) {
         let link = link_end(&line[start..]);
-        links.extend(http_url(link));
+        links.extend(http_url(link).or_else(|| Url::parse(link).ok().filter(|u| u.scheme().contains("dav"))));
         rest.push_str(&line[at..start]);
         rest.push(' ');
         at = start + link.len();
@@ -952,6 +954,7 @@ mod tests {
             ("<https://user:p@ss@h.example/f>", "https://h.example/f", "user:p@ss"),
             ("https://ghtoken@github.com/o/r/archive/main.zip", "https://github.com/o/r/archive/main.zip", "ghtoken:"),
             ("http://u:@h.example:8080/f", "http://h.example:8080/f", "u:"),
+            ("WebDAV: webdavs://bob:pw@h.example/dav/", "webdavs://h.example/dav/", "bob:pw"),
         ] {
             let link = one(text);
             assert_eq!(link.url.as_str(), url, "{text}");

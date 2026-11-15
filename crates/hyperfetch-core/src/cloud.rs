@@ -76,6 +76,22 @@ enum Link {
     SwissTransfer { link: String },
     /// A public bucket, or a folder of it: the objects whose keys start with `prefix`.
     Bucket { bucket: Bucket, prefix: String },
+    /// A WebDAV file or folder (webdav://, webdavs://, dav:// or davs://), at its http(s) address.
+    WebDav { link: Url },
+}
+
+/// The http(s) address of a `webdav://`, `webdavs://`, `dav://` or `davs://` link, without its
+/// sign-in.
+fn webdav_of(url: &Url) -> Option<Url> {
+    let scheme = match url.scheme() {
+        "webdav" | "dav" => "http",
+        "webdavs" | "davs" => "https",
+        _ => return None,
+    };
+    let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
+    let query = url.query().map(|q| format!("?{q}")).unwrap_or_default();
+    let path = if url.path().is_empty() { "/" } else { url.path() };
+    Url::parse(&format!("{scheme}://{}{port}{path}{query}", url.host_str()?)).ok()
 }
 
 /// Where a bucket is listed and its objects are read.
@@ -179,6 +195,9 @@ fn link_of(url: &Url) -> Option<Link> {
     if let Some((bucket, prefix)) = bucket_of(url) {
         return Some(Link::Bucket { bucket, prefix });
     }
+    if let Some(link) = webdav_of(url) {
+        return Some(Link::WebDav { link });
+    }
     let segs: Vec<&str> = url.path_segments()?.filter(|s| !s.is_empty()).collect();
     let host = url.host_str()?.trim_end_matches('.');
     let param = |name: &str| url.query_pairs().find(|(k, _)| k == name).map(|(_, v)| v.into_owned());
@@ -251,7 +270,7 @@ pub fn lists(url: &Url) -> bool {
     match link_of(url) {
         Some(Link::PCloud { file, .. } | Link::Box { file, .. }) => file.is_none(),
         Some(Link::Yandex { key, .. }) => key.contains("/d/"),
-        Some(Link::SwissTransfer { .. } | Link::Bucket { .. }) => true,
+        Some(Link::SwissTransfer { .. } | Link::Bucket { .. } | Link::WebDav { .. }) => true,
         _ => share_of(url).is_some(),
     }
 }
@@ -263,6 +282,15 @@ pub fn lists(url: &Url) -> bool {
 pub async fn list(http: &reqwest::Client, url: &Url, options: &ListOptions) -> Option<Result<Vec<Task>, String>> {
     match link_of(url) {
         Some(Link::SwissTransfer { link }) => return Some(swisstransfer_list(http, SWISSTRANSFER, &link, options.password.as_deref()).await),
+        Some(Link::WebDav { link }) => {
+            // The sign-in a paste took out of the link, else one still in it.
+            use base64::Engine as _;
+            let pasted = options.auth.as_ref().filter(|(typed, _)| typed == url).map(|(_, auth)| auth.clone());
+            let decode = |s: &str| percent_decode_str(s).decode_utf8_lossy().into_owned();
+            let pair = format!("{}:{}", decode(url.username()), decode(url.password().unwrap_or_default()));
+            let inline = (!url.username().is_empty()).then(|| format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(pair)));
+            return Some(webdav_list(http, &link, pasted.or(inline).as_deref()).await);
+        }
         _ => {}
     }
     match share_of(url) {
@@ -305,7 +333,7 @@ pub async fn resolve(client: &reqwest::Client, url: &Url, _proxy: Option<&str>) 
             yandex_file(client, YANDEX_API, &key, &path).await.map(|file| vec![file.unwrap_or_else(|| url.clone())])
         }
         Some(Link::Box { name, file, .. }) => box_file(client, url, &name, file).await.map(|file| vec![file.unwrap_or_else(|| url.clone())]),
-        Some(Link::SwissTransfer { .. } | Link::Bucket { .. }) => Err(LISTS_MANY.to_string()),
+        Some(Link::SwissTransfer { .. } | Link::Bucket { .. } | Link::WebDav { .. }) => Err(LISTS_MANY.to_string()),
         None => Err(format!("{} is not a share link", url)),
     };
     found.map_err(ResolverError::NotFound)
@@ -1182,6 +1210,75 @@ async fn bucket_list(http: &reqwest::Client, bucket: &Bucket, prefix: &str, gcs_
     Err(format!("the bucket's listing goes on past {MAX_PAGES} pages: add the link of one of its folders instead"))
 }
 
+const WEBDAV_LOCKED: &str = "the WebDAV server wants a sign-in: add the link with it, webdavs://USER:PASSWORD@host/path";
+const WEBDAV_REFUSED: &str = "the WebDAV server refused the sign-in given with the link";
+
+/// The file at the WebDAV address `link`, or one task per file under the folder there (subfolders
+/// kept, in a folder named after it), each with its size and the checksum the server keeps, read
+/// with PROPFIND and `auth` (the link's sign-in), which goes with the downloads too.
+async fn webdav_list(http: &reqwest::Client, link: &Url, auth: Option<&str>) -> Result<Vec<Task>, String> {
+    let cannot_reach = |e: reqwest::Error| format!("Cannot reach the WebDAV server: {}", e.without_url());
+    let method = reqwest::Method::from_bytes(b"PROPFIND").map_err(|e| e.to_string())?;
+    // Paths are read below `root`, the folder's address with its last slash.
+    let mut root = link.clone();
+    root.path_segments_mut().map_err(|_| "unusable WebDAV link".to_string())?.pop_if_empty().push("");
+    let top = link.path_segments().and_then(|s| s.filter(|s| !s.is_empty()).last()).map(|s| percent_decode_str(s).decode_utf8_lossy().into_owned());
+    let folder = component(top.as_deref().unwrap_or_default(), link.host_str().unwrap_or("webdav"))?;
+    let (mut folders, mut tasks, mut listed) = (VecDeque::from([Vec::<String>::new()]), Vec::new(), 0);
+    while let Some(dir) = folders.pop_front() {
+        listed += 1;
+        if listed > MAX_FOLDERS {
+            return Err(format!("the WebDAV folder holds more than {} folders: add a subfolder's link instead", MAX_FOLDERS));
+        }
+        let url = if dir.is_empty() {
+            link.clone()
+        } else {
+            let mut url = root.clone();
+            url.path_segments_mut().map_err(|_| "unusable WebDAV link".to_string())?.pop_if_empty().extend(&dir).push("");
+            url
+        };
+        let mut request = http.request(method.clone(), url).header("Depth", "1").header(CONTENT_TYPE, "application/xml").body(PROPFIND);
+        if let Some(mut auth) = auth.and_then(|a| reqwest::header::HeaderValue::from_str(a).ok()) {
+            auth.set_sensitive(true);
+            request = request.header(AUTHORIZATION, auth);
+        }
+        let answer = request.send().await.map_err(cannot_reach)?;
+        match answer.status().as_u16() {
+            207 => {}
+            401 | 403 => return Err(if auth.is_some() { WEBDAV_REFUSED } else { WEBDAV_LOCKED }.to_string()),
+            404 => return Err("the WebDAV server has nothing at that link".to_string()),
+            405 | 501 if dir.is_empty() => return Err("the server does not answer as WebDAV (PROPFIND) at that link".to_string()),
+            status => return Err(format!("the WebDAV server answered HTTP {} while listing it", status)),
+        }
+        let xml = answer.text().await.map_err(cannot_reach)?;
+        for entry in dav_entries(&xml) {
+            let Some(path) = dav_path(&root, &entry.href) else { continue };
+            if path == dir {
+                if dir.is_empty() && !entry.folder {
+                    // The link is a file's.
+                    let name = clean_path([top.as_deref().unwrap_or(entry.name.as_str())]).ok();
+                    return Ok(vec![Task { urls: vec![link.clone()], name, size: entry.size, checksum: dav_checksum(&entry.checksums), ..Task::default() }]);
+                }
+                continue;
+            }
+            // Only what is in the folder asked for: a server's answer is not trusted to stay in it.
+            if path.len() != dir.len() + 1 || !path.starts_with(&dir) {
+                continue;
+            }
+            if entry.folder {
+                folders.push_back(path);
+                continue;
+            }
+            let Ok(name) = clean_path(path.iter().map(String::as_str)) else { continue };
+            let mut url = root.clone();
+            url.path_segments_mut().map_err(|_| "unusable WebDAV link".to_string())?.pop_if_empty().extend(&path);
+            // Not from a document: the link's sign-in goes with it, to the link's own host.
+            tasks.push(Task { urls: vec![url], name: Some(name), folder: Some(folder.clone()), size: entry.size, checksum: dav_checksum(&entry.checksums), ..Task::default() });
+        }
+    }
+    Ok(tasks)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1761,6 +1858,74 @@ mod tests {
         assert_eq!((mtl.size, mtl.checksum.as_deref()), (Some(8454), Some("md5:ce264d77cba2913b430a4053812e518b")));
         let azure = read("https://azureopendatastorage.blob.core.windows.net/nyctlc?restype=container&comp=list&prefix=_manifest").await;
         assert!(!azure.is_empty() && azure.iter().all(|t| t.size.is_some()), "{azure:?}");
+    }
+
+    /// A WebDAV folder is one task per file under it (subfolders kept, nothing outside it), read
+    /// with PROPFIND and the link's sign-in; a file's link is that file; a missing or wrong
+    /// sign-in, and a server that is no WebDAV one, say so.
+    #[tokio::test]
+    async fn webdav_folders_list_their_files() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = vec![0; 8192];
+                let n = socket.read(&mut request).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&request[..n]).to_string();
+                let lower = request.to_ascii_lowercase();
+                let target = request.split(' ').nth(1).unwrap_or_default();
+                let (status, body) = if !request.starts_with("PROPFIND ") {
+                    (405, Vec::new())
+                } else if !lower.contains("\r\ndepth: 1\r\n") || !lower.contains("authorization: basic ym9ionb3") {
+                    // "bob:pw"
+                    (401, Vec::new())
+                } else {
+                    let (status, _, body) = match target {
+                        // Apache's mod_dav names no displayname: the href does.
+                        "/dav/Docs" => multistatus(&[("/dav/Docs/", "", None, ""), ("/dav/Docs/a%20b.txt", "", Some(3), "SHA1:A9993E364706816ABA3E25717850C26C9CD0D89D"), ("/dav/Docs/Sub/", "", None, ""), ("/dav/Docs2/out.txt", "", Some(1), ""), ("/dav/x.txt", "", Some(1), "")]),
+                        "/dav/Docs/Sub/" => multistatus(&[("/dav/Docs/Sub/", "", None, ""), ("/dav/Docs/Sub/c.bin", "", Some(5), "")]),
+                        "/dav/one.iso" => multistatus(&[("/dav/one.iso", "", Some(9), "")]),
+                        _ => (404, String::new(), Vec::new()),
+                    };
+                    (status, body)
+                };
+                let head = format!("HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(&body).await;
+            }
+        });
+        let base = format!("http://{addr}");
+        let bob = Some("Basic Ym9iOnB3");
+        let folder = webdav_list(&http(), &Url::parse(&format!("{base}/dav/Docs")).unwrap(), bob).await.unwrap();
+        let listed: Vec<_> = folder.iter().map(|t| (t.urls[0].to_string(), t.folder.clone().unwrap(), t.name.clone().unwrap(), t.size, t.checksum.clone(), t.from_document)).collect();
+        assert_eq!(
+            listed,
+            [
+                (format!("{base}/dav/Docs/a%20b.txt"), PathBuf::from("Docs"), PathBuf::from("a b.txt"), Some(3), Some("sha1:a9993e364706816aba3e25717850c26c9cd0d89d".to_string()), false),
+                (format!("{base}/dav/Docs/Sub/c.bin"), PathBuf::from("Docs"), PathBuf::from("Sub").join("c.bin"), Some(5), None, false),
+            ]
+        );
+        let file = webdav_list(&http(), &Url::parse(&format!("{base}/dav/one.iso")).unwrap(), bob).await.unwrap();
+        assert_eq!((file[0].urls[0].to_string(), file[0].name.clone(), file[0].size), (format!("{base}/dav/one.iso"), Some(PathBuf::from("one.iso")), Some(9)));
+        let docs = Url::parse(&format!("{base}/dav/Docs")).unwrap();
+        assert_eq!(webdav_list(&http(), &docs, None).await.unwrap_err(), WEBDAV_LOCKED);
+        assert_eq!(webdav_list(&http(), &docs, Some("Basic eDp5")).await.unwrap_err(), WEBDAV_REFUSED);
+        // Through `list`: the sign-in in the link itself, or the one a paste took out of it.
+        let inline = Url::parse(&format!("webdav://bob:pw@{addr}/dav/one.iso")).unwrap();
+        assert_eq!(list(&http(), &inline, &ListOptions::default()).await.unwrap().unwrap().len(), 1);
+        let pasted = Url::parse(&format!("webdav://{addr}/dav/one.iso")).unwrap();
+        let options = ListOptions { auth: Some((pasted.clone(), "Basic Ym9iOnB3".into())), ..ListOptions::default() };
+        assert_eq!(list(&http(), &pasted, &options).await.unwrap().unwrap().len(), 1);
+        for (link, http_link) in [
+            ("webdav://h.example/a/", "http://h.example/a/"),
+            ("webdavs://u:p@h.example:8443/a%20b", "https://h.example:8443/a%20b"),
+            ("davs://h.example", "https://h.example/"),
+            ("dav://h.example/x?y=1", "http://h.example/x?y=1"),
+        ] {
+            assert_eq!(link_of(&Url::parse(link).unwrap()), Some(Link::WebDav { link: Url::parse(http_link).unwrap() }), "{link}");
+            assert!(lists(&Url::parse(link).unwrap()));
+        }
     }
 
     /// Live: an expired SwissTransfer transfer says so (transfers last 30 days at most, so no
