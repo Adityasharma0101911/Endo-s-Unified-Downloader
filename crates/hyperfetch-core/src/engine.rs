@@ -56,6 +56,8 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 const PROBE_CONCURRENCY: usize = 8;
 /// Most copies of a file its server names (see `advertised`) that are probed.
 const MAX_ADVERTISED: usize = 8;
+/// Largest zsync control file read (see `DownloadEngine::delta`): a 4 GB file's is about 14 MB.
+const MAX_ZSYNC: usize = 64 << 20;
 /// Tries of a probe's ranged GET while the server is busy or the connection fails.
 const PROBE_ATTEMPTS: u32 = 3;
 /// How long a probe keeps asking a server busy past those tries (429 or 503, with no HEAD to go
@@ -394,6 +396,13 @@ pub struct DownloadOptions {
     /// into the download's folder under its path in the ZIP, unpacked as it arrives and checked
     /// against its CRC-32. A stop starts it over.
     pub zip_entry: Option<crate::zipdir::ZipEntry>,
+    /// An older version of the file (with `only_if_newer`, the file there is one too): the blocks of
+    /// the new version it still holds are copied from it instead of downloaded, when checksums of
+    /// the new version's blocks are published (`metalink_pieces`, or a zsync file: `zsync`, else
+    /// `<link>.zsync`); see `crate::delta`. Without them it downloads whole.
+    pub delta_from: Option<PathBuf>,
+    /// The new version's zsync control file, for `delta_from`, in place of `<link>.zsync`.
+    pub zsync: Option<String>,
 }
 
 impl Default for DownloadOptions {
@@ -473,6 +482,8 @@ impl Default for DownloadOptions {
             name_pattern: None,
             channel: None,
             zip_entry: None,
+            delta_from: None,
+            zsync: None,
         }
     }
 }
@@ -2433,7 +2444,7 @@ impl DownloadEngine {
     async fn probe_all(&self, client: &Client, urls: &[Url], snapshot_tx: &Option<broadcast::Sender<EngineSnapshot>>) -> Result<Probed, String> {
         let (limiter, stall) = (self.limiter(), self.stall_timeout());
         let connections = self.options.num_connections.clamp(1, MAX_CONNECTIONS);
-        let limit = self.options.max_connections_per_host;
+        let (limit, delta) = (self.options.max_connections_per_host, self.options.delta_from.is_some());
         // Whether the first mirror's start is being read, and whether the download went ahead
         // without its answer, which then has no start to read.
         let (reading, started) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
@@ -2446,8 +2457,9 @@ impl DownloadEngine {
                 let (reading, started) = (Arc::clone(&flags.0), Arc::clone(&flags.1));
                 async move {
                     let probe = async {
-                        // Only the first mirror fetches the file's start: the download uses one copy.
-                        let (mut info, body) = probe_url(&client, auth.as_deref(), &url, i == 0, limit).await?;
+                        // Only the first mirror fetches the file's start: the download uses one copy;
+                        // none does when an older version may hold it (see `DownloadEngine::delta`).
+                        let (mut info, body) = probe_url(&client, auth.as_deref(), &url, i == 0 && !delta, limit).await?;
                         // A small file need not hold a batch's or queue's place while it comes (see
                         // `EngineSnapshot::small`); its later snapshots say so again, or that it
                         // was no file after all.
@@ -2584,6 +2596,7 @@ impl DownloadEngine {
             }
             false => None,
         };
+        let old = self.options.delta_from.clone().or_else(|| existing.clone());
         if let Some(existing) = existing {
             if !self.newer_than(&client, &reference, &existing).await {
                 tracing::info!("{} is up to date", existing.display());
@@ -2637,6 +2650,19 @@ impl DownloadEngine {
             tracing::info!("Resuming {} with {} completed range(s)", part.display(), previous.completed_ranges.len());
             state.completed_ranges = previous.completed_ranges;
         }
+        let mut new_sha1 = None;
+        let (fresh, ranged) = (state.completed_ranges.is_empty(), reference.accepts_ranges && self.decrypt.is_none());
+        if let (true, Some(old), Some(size)) = (ranged, old, reference.size) {
+            // A resumed `.part` may hold blocks a delta copied: it is held to the same SHA-1.
+            if let Some((seeded, sha1)) = self.delta(&client, &reference.final_url, size, &old, &part, fresh).await {
+                let copied: u64 = seeded.iter().map(ByteRange::len).sum();
+                if fresh {
+                    tracing::info!("{} of the {} bytes of {} are copied from {}", copied, size, final_path.display(), old.display());
+                    state.completed_ranges = seeded;
+                }
+                new_sha1 = sha1;
+            }
+        }
         // A download that would fill its disk fails before it starts.
         if let Some(size) = reference.size {
             let have: u64 = crate::range::merge_ranges(state.completed_ranges.clone()).iter().map(ByteRange::len).sum();
@@ -2677,6 +2703,10 @@ impl DownloadEngine {
         if self.decrypt.is_none() {
             let described = advertised(&reference.headers, &reference.final_url).1.map(|metalink| (metalink, reference.size));
             crate::digest::look_for(&self.site, &self.options, &client, self.auth.clone(), &reference.url, &reference.headers, described);
+        }
+        // What a delta put together is held to its zsync file's SHA-1 when the user gave no checksum.
+        if let Some(sha1) = new_sha1.filter(|_| self.options.expected_checksum.is_none()) {
+            crate::digest::expect(&self.site, sha1);
         }
         let written = match reference.size {
             // A plain write (no sparse file, no preallocation, no flush unless fsync_on_complete
@@ -3367,6 +3397,72 @@ impl DownloadEngine {
             Some(p) => p.parent().unwrap_or(Path::new(".")).to_path_buf(),
             None => PathBuf::from("."),
         }
+    }
+
+    /// The ranges of the new `.part` at `part` that the older version at `old` fills, copied there
+    /// (see `DownloadOptions::delta_from`), and the new version's SHA-1 when a zsync file gives
+    /// it: by the user's zsync file, else the metalink's pieces, else the zsync file beside `url`.
+    /// None when there are no such checksums, nothing matches, or a zsync file has no SHA-1 and
+    /// the user gave no checksum: what is put together is always checked whole. Without `seed` (a
+    /// resumed `.part`) nothing is copied: only the SHA-1 is looked for.
+    async fn delta(&self, client: &Client, url: &Url, size: u64, old: &Path, part: &Path, seed: bool) -> Option<(Vec<ByteRange>, Option<String>)> {
+        let pieces = self.options.metalink_pieces.clone().filter(|p| p.fit(size) && self.options.zsync.is_none());
+        let zsync = match (&pieces, &self.options.zsync) {
+            (Some(_), _) => None,
+            (None, Some(link)) => Some(Url::parse(link).ok()?),
+            (None, None) => {
+                let mut beside = url.clone();
+                beside.set_query(None);
+                beside.set_fragment(None);
+                beside.set_path(&format!("{}.zsync", url.path()));
+                Some(beside)
+            }
+        };
+        let zsync = match zsync {
+            Some(link) => Some(self.fetch_zsync(client, &link).await.filter(|z| {
+                z.length == size && (z.sha1.is_some() || self.options.expected_checksum.is_some())
+            })?),
+            None => None,
+        };
+        let sha1 = zsync.as_ref().and_then(|z| z.sha1.clone());
+        if !seed {
+            return Some((Vec::new(), sha1));
+        }
+        let (old, part) = (old.to_path_buf(), part.to_path_buf());
+        let seeded = blocking(move || {
+            let found = crate::delta::plan(&old, size, pieces.as_ref(), zsync.as_ref())?;
+            match found.is_empty() {
+                true => Ok(Vec::new()),
+                false => crate::delta::seed(&old, &part, size, &found),
+            }
+        });
+        match seeded.await.ok()? {
+            Ok(seeded) if !seeded.is_empty() => Some((seeded, sha1)),
+            Ok(_) => None,
+            Err(e) => {
+                tracing::warn!("Could not reuse the older version of {}: {}", url, e);
+                None
+            }
+        }
+    }
+
+    /// The zsync control file at `link`, read as the download's own requests are, if it is one
+    /// (at most `MAX_ZSYNC`).
+    async fn fetch_zsync(&self, client: &Client, link: &Url) -> Option<crate::delta::Zsync> {
+        let fetched = async {
+            let request = |u: &Url| authorize(client.get(u.clone()), self.auth.as_deref(), u).header(ACCEPT_ENCODING, "identity");
+            let mut response = send(request, link).await.ok()?.error_for_status().ok()?;
+            let mut body = Vec::new();
+            while let Some(chunk) = response.chunk().await.ok()? {
+                body.extend_from_slice(&chunk);
+                if body.len() > MAX_ZSYNC {
+                    return None;
+                }
+            }
+            Some(body)
+        };
+        let body = tokio::time::timeout(PROBE_TIMEOUT, fetched).await.ok().flatten()?;
+        crate::delta::parse_zsync(&body).inspect_err(|e| tracing::info!("{}: {}", link, e)).ok()
     }
 
     /// The file `entry` of the ZIP at `url` (see `DownloadOptions::zip_entry`), at its path in the
@@ -8675,6 +8771,78 @@ mod tests {
                 (false, _) => assert!(ran.unwrap_err().contains("published SHA-256"), "a wrong hash fails"),
             }
         }
+    }
+
+    /// An older version on disk gives the blocks the new one still holds (see
+    /// `DownloadOptions::delta_from`): by the metalink's pieces only those it spoiled are
+    /// downloaded; by the zsync file beside the link, with `only_if_newer` replacing the file
+    /// there, every block it holds, and the result is held to the zsync file's SHA-1. Without
+    /// checksums of the new version's blocks, it downloads whole.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_an_older_version_gives_the_blocks_it_still_holds() {
+        use sha2::Digest;
+        let size = 4 << 20;
+        let new = crate::netsim::file(size);
+        let mut old = new.clone();
+        old[300_000..400_000].fill(0xee);
+        let dir = tempdir().unwrap();
+        let old_path = dir.path().join("old.bin");
+        std::fs::write(&old_path, &old).unwrap();
+        let paced = |zsync| crate::netsim::Server { size, per_connection: Some(8e6), zsync, ..Default::default() };
+
+        // Pieces 4 to 6 hold the change.
+        let hashes = new.chunks(65_536).map(|p| sha2::Sha256::digest(p).iter().map(|b| format!("{b:02x}")).collect()).collect();
+        let pieces = crate::metalink::Pieces { length: 65_536, algo: "sha256".into(), hashes };
+        let (url, stats) = crate::netsim::serve(paced(None)).await;
+        let options = DownloadOptions { delta_from: Some(old_path.clone()), metalink_pieces: Some(pieces), remote_checksum: false, ..sim_options(dir.path(), 2, false) };
+        let path = DownloadEngine::new(vec![url.clone()], options).run(None).await.unwrap();
+        assert!(std::fs::read(&path).unwrap() == new);
+        let served = stats.served.load(Ordering::SeqCst);
+        assert!((3 * 65_536..size / 4).contains(&served), "{served}");
+
+        // The file there is the older version: what zsync finds of the new one in it is copied.
+        let target = dir.path().join("f.bin");
+        std::fs::write(&target, &old).unwrap();
+        let (url, stats) = crate::netsim::serve(paced(Some(crate::delta::tests::zsync_of(&new, 4096, 2, 3, 8)))).await;
+        let (tx, mut rx) = broadcast::channel(1024);
+        let options = DownloadOptions { only_if_newer: true, remote_checksum: false, ..sim_options(dir.path(), 2, false) };
+        assert_eq!(DownloadEngine::new(vec![url], options).run(Some(tx)).await.unwrap(), target);
+        assert!(std::fs::read(&target).unwrap() == new);
+        assert!(stats.served.load(Ordering::SeqCst) < size / 2, "{}", stats.served.load(Ordering::SeqCst));
+        let mut against = None;
+        while let Ok(snapshot) = rx.try_recv() {
+            against = snapshot.checked_against.or(against);
+        }
+        assert_eq!(against.as_deref(), Some("the site's SHA-1"));
+
+        // A zsync file whose SHA-1 is not the new version's fails what it put together.
+        std::fs::write(&target, &old).unwrap();
+        let text = String::from_utf8_lossy(&crate::delta::tests::zsync_of(&new, 4096, 1, 4, 16)).into_owned();
+        let sha1 = text.lines().find_map(|l| l.strip_prefix("SHA-1: ")).unwrap().to_string();
+        let mut wrong = crate::delta::tests::zsync_of(&new, 4096, 1, 4, 16);
+        let at = wrong.windows(40).position(|w| w == sha1.as_bytes()).unwrap();
+        wrong[at..at + 40].copy_from_slice(&[b'0'; 40]);
+        let (url, _) = crate::netsim::serve(paced(Some(wrong))).await;
+        let options = DownloadOptions { only_if_newer: true, remote_checksum: false, ..sim_options(dir.path(), 2, false) };
+        let failed = DownloadEngine::new(vec![url], options).run(None).await.unwrap_err();
+        assert!(failed.contains("published SHA-1"), "{failed}");
+
+        // A resumed `.part` (here with a block a delta took wrongly) is held to that SHA-1 too.
+        let (url, _) = crate::netsim::serve(paced(Some(crate::delta::tests::zsync_of(&new, 4096, 2, 3, 8)))).await;
+        let resumed = dir.path().join("resumed.bin");
+        let mut spoiled = new.clone();
+        spoiled[..4096].fill(0);
+        std::fs::write(part_path(&resumed), &spoiled).unwrap();
+        state_for(size as u64, "\"v1\"", vec![url.to_string()]).save_atomic(&DownloadState::state_file_path(&part_path(&resumed))).unwrap();
+        let options = DownloadOptions { delta_from: Some(old_path.clone()), output_path: Some(resumed), remote_checksum: false, ..sim_options(dir.path(), 2, false) };
+        let failed = DownloadEngine::new(vec![url], options).run(None).await.unwrap_err();
+        assert!(failed.contains("published SHA-1"), "{failed}");
+
+        // No checksums of the new version's blocks: the whole file comes.
+        let (url, stats) = crate::netsim::serve(paced(None)).await;
+        let options = DownloadOptions { delta_from: Some(old_path), output_path: Some(dir.path().join("whole.bin")), ..sim_options(dir.path(), 2, false) };
+        assert!(std::fs::read(DownloadEngine::new(vec![url], options).run(None).await.unwrap()).unwrap() == new);
+        assert!(stats.served.load(Ordering::SeqCst) >= size);
     }
 
     fn sim_options(dir: &Path, connections: usize, adaptive: bool) -> DownloadOptions {

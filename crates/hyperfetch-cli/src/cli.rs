@@ -94,6 +94,15 @@ pub struct Args {
     #[arg(short = 'N', long = "only-if-newer")]
     pub only_if_newer: bool,
 
+    /// An older version of the file: the blocks the new one shares with it are copied from it, when
+    /// the server publishes the new version's block checksums (a metalink's pieces, or a zsync file)
+    #[arg(long = "delta-from", value_name = "FILE", value_parser = existing_file)]
+    pub delta_from: Option<PathBuf>,
+
+    /// The new version's zsync control file, for --delta-from or -N, in place of <link>.zsync
+    #[arg(long = "zsync", value_name = "URL", value_parser = parse_zsync)]
+    pub zsync: Option<String>,
+
     /// Give each finished file the date its server gives it
     #[arg(long = "remote-time")]
     pub remote_time: bool,
@@ -669,6 +678,13 @@ fn parse_checksum(s: &str) -> Result<String, String> {
     Ok(s.to_string())
 }
 
+fn parse_zsync(s: &str) -> Result<String, String> {
+    match url::Url::parse(s) {
+        Ok(url) if matches!(url.scheme(), "http" | "https") => Ok(s.to_string()),
+        _ => Err(format!("'{}' is not an http(s) link", s)),
+    }
+}
+
 fn existing_file(s: &str) -> Result<PathBuf, String> {
     let path = PathBuf::from(s);
     if path.is_file() {
@@ -821,9 +837,9 @@ pub fn start_time(text: &str, now: f64) -> Result<f64, String> {
 
 /// Options a config file may not hold: the run's links and inputs, the config file's own, the
 /// actions that are not downloads and what makes a run wait, list or probe in place of one.
-const NOT_IN_CONFIG: [&str; 18] = [
+const NOT_IN_CONFIG: [&str; 20] = [
     "urls", "input_file", "config", "no_config", "history", "update", "verify", "repair", "doctor", "completions", "start_at", "list_tracks",
-    "json", "dry_run", "spider", "preview", "stdout", "zip_files",
+    "json", "dry_run", "spider", "preview", "stdout", "zip_files", "delta_from", "zsync",
 ];
 
 /// Options that do the same job another way, so either one on the command line leaves the other
@@ -1252,13 +1268,15 @@ mod tests {
         assert_eq!((args.name_pattern.as_deref(), args.live_from.as_deref(), args.live_idle_timeout), (Some("{name} {height}p"), Some("1h30m"), Some(20)));
         assert!(parse(&["--list-tracks", "u"]).unwrap().list_tracks);
         assert_eq!(parse(&["--zip-file", "*.txt", "--zip-file", "docs/", "--preview", "u"]).unwrap().zip_files, ["*.txt", "docs/"]);
+        let args = parse(&["--delta-from", "Cargo.toml", "--zsync", "https://h/f.zsync", "u"]).unwrap();
+        assert_eq!((args.delta_from, args.zsync.as_deref()), (Some(PathBuf::from("Cargo.toml")), Some("https://h/f.zsync")));
         assert!(parse(&["--live-from", "2026-10-10 21:00:00+08:00", "u"]).is_ok());
         for bad in [
             &["--video", "8k"][..], &["--audio", "en,loud"], &["--tracks", "x1"], &["--tracks", "v"], &["--tracks", "v0,"], &["--drop-parts", "3-1"],
             &["--drop-parts", ","], &["--ad-pattern", " "], &["--channel", ""], &["--name-pattern", "{title}"], &["--name-pattern", "{name"],
             &["--live-from", "yesterday"], &["--live-from", "30m", "--live-from-start"], &["--live-idle-timeout", "0"],
             &["--list-tracks", "--dry-run"], &["--list-tracks", "-i", "list.txt"], &["--zip-file", " "], &["--zip-file", "a", "-o", "f"],
-            &["--zip-file", "a", "--dry-run"],
+            &["--zip-file", "a", "--dry-run"], &["--delta-from", "no-such-file"], &["--zsync", "f.zsync"], &["--zsync", "ftp://h/f.zsync"],
         ] {
             assert!(parse(&[bad, &["u"]].concat()).is_err(), "{bad:?}");
         }
@@ -1340,7 +1358,7 @@ mod tests {
     /// 'single-quoted' value or a # comment after an option is named as such.
     #[test]
     fn a_config_file_holds_no_run_mode_and_its_mistakes_are_named() {
-        for text in ["--start-at 21:30", "--list-tracks", "--json", "--dry-run", "--spider", "--preview", "--stdout", "--zip-file a"] {
+        for text in ["--start-at 21:30", "--list-tracks", "--json", "--dry-run", "--spider", "--preview", "--stdout", "--zip-file a", "--delta-from Cargo.toml"] {
             let e = config_args(text, &given(&["u"])).unwrap_err();
             assert!(e.starts_with("line 1") && e.contains("cannot be in a config file"), "{text:?}: {e}");
         }
