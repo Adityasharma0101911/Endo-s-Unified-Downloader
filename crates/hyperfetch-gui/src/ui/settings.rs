@@ -873,7 +873,7 @@ mod tests {
         // A section's title brings all its rows.
         h.app.settings_search = "bittorrent".to_string();
         h.frames(30);
-        assert!(h.find("BitTorrent").is_some() && h.find("Seed ratio").is_some(), "{:?}", h.texts());
+        assert!(h.find("BitTorrent").is_some() && h.find("Download from peers").is_some(), "{:?}", h.texts());
         h.app.settings_search = "no such setting".to_string();
         h.frames(30);
         assert!(h.find("General").is_none() && h.texts().iter().any(|(text, _)| text.starts_with("No setting matches")));
@@ -884,7 +884,7 @@ mod tests {
         assert!(h.settle());
         assert!(h.find("Save folder").is_some() && h.find("Theme").is_some());
         assert!(h.find("BitTorrent").is_none() && h.find("Retries").is_none(), "{:?}", h.texts());
-        h.click("Show all settings");
+        h.click("All settings");
         assert!(h.app.settings.show_all_settings);
     }
 
