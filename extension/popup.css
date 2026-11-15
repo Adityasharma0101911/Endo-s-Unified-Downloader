@@ -125,15 +125,16 @@ a { color: var(--accent-text); }
 .pill::before { content: ""; display: inline-block; margin-right: 6px; vertical-align: 1px; width: 7px; height: 7px; border-radius: 50%; background: var(--c, var(--dim)); }
 
 .tabs { display: flex; gap: 4px; padding: 0 10px 8px; border-bottom: 1px solid var(--border); }
+/* Wide as their labels, so Downloads fits beside the others in 420 px; Settings is its icon alone. */
 .tab {
-  flex: 1;
+  flex: 1 1 auto;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 6px;
+  gap: 5px;
   min-width: 0;
   height: 32px;
-  padding: 0 6px;
+  padding: 0 5px;
   border: 0;
   border-radius: 8px;
   background: transparent;
@@ -146,6 +147,7 @@ a { color: var(--accent-text); }
 .tab[aria-selected="true"] { background: color-mix(in srgb, var(--accent) 18%, transparent); color: var(--strong); font-weight: 600; }
 .tab[aria-selected="true"] .icon { color: var(--accent-text); }
 .tab:disabled { opacity: 0.4; cursor: default; }
+.tab.icon-tab { flex: 0 0 34px; }
 .tab:focus-visible { outline-offset: -2px; }
 
 .count {
@@ -471,6 +473,13 @@ button.chip[aria-pressed="true"] { --c: var(--accent); --ct: var(--accent-text);
 .video-text { display: grid; flex: 1; min-width: 0; line-height: 1.3; }
 .video-text > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .video-text .note { font-size: 11.5px; }
+
+/* ---- Downloads ---- */
+
+.site-capture { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.site-capture .note { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.site-capture .btn[aria-pressed="true"] { border-color: color-mix(in srgb, var(--accent) 60%, transparent); background: color-mix(in srgb, var(--accent) 18%, var(--field)); color: var(--strong); }
+.rec .reason { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
 
 /* ---- Settings ---- */
 

@@ -1,6 +1,17 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { ALT_WINDOW_MS, CAPTURE_TYPES, altClicked, extensionOf, originOf, parseSites, parseTypes, shouldCapture } from "../lib/capture.js";
+import {
+  ALT_WINDOW_MS,
+  CAPTURE_TYPES,
+  altClicked,
+  captureDecision,
+  extensionOf,
+  originOf,
+  parseSites,
+  parseTypes,
+  shouldCapture,
+  upgradedTypes,
+} from "../lib/capture.js";
 
 test("file types as typed keep their last extension, lower case, once each", () => {
   assert.deepEqual(parseTypes(".ZIP, iso;tar.gz  *.exe exe bad! "), ["zip", "iso", "gz", "exe"]);
@@ -87,6 +98,66 @@ test("a .torrent is not sent by default: a page could start a swarm download wit
   assert.equal(CAPTURE_TYPES.includes("torrent"), false);
   assert.equal(takes({ filename: "x.torrent", finalUrl: "https://cdn.example.com/x.torrent", totalBytes: 0 }), false);
   assert.equal(takes({ filename: "x.torrent", totalBytes: 0 }, { captureTypes: ["torrent"] }), true);
+});
+
+const GB = 1024 * 1024 * 1024;
+const why = (item, settings = {}, flags) => captureDecision({ ...ITEM, ...item }, { ...SETTINGS, ...settings }, flags);
+
+test("a download of any type goes when it is at least captureAnyOverMB; types decide below it", () => {
+  const dat = { filename: "dump.dat", finalUrl: "https://cdn.example.com/dump.dat" };
+  const big = { ...dat, filename: "dump.unknownext", totalBytes: 5 * GB };
+  assert.deepEqual(why(big, { captureAnyOverMB: 50 }), { capture: true, reason: "50 MB or more" });
+  assert.equal(takes(big, { captureAnyOverMB: 0 }), false, "0 turns it off");
+  assert.deepEqual(why({ ...big, totalBytes: 10 * 1024 * 1024 }, { captureAnyOverMB: 50 }), {
+    capture: false,
+    reason: ".unknownext isn't one of the file types, and it's under 50 MB",
+  });
+  // The size unknown: the type decides, as before.
+  assert.deepEqual(why({ ...big, totalBytes: 0 }, { captureAnyOverMB: 50 }), {
+    capture: false,
+    reason: ".unknownext isn't one of the file types, and its size isn't known",
+  });
+  assert.equal(takes({ ...dat, totalBytes: 0 }, { captureTypes: CAPTURE_TYPES }), true, ".dat is a default type now");
+  // Every other rule still applies.
+  assert.equal(takes(big, { captureAnyOverMB: 50 }, { posted: true }), false);
+  assert.equal(takes({ ...big, referrer: "https://skip.test/" }, { captureAnyOverMB: 50 }), false);
+});
+
+test("Everything sends any http(s) download but those under the minimum size or kept by the other rules", () => {
+  const page = { filename: "page.html", finalUrl: "https://cdn.example.com/page.html" };
+  assert.deepEqual(why(page, { captureAll: true }), { capture: true, reason: "Everything goes to the app" });
+  assert.equal(takes({ ...page, totalBytes: 0 }, { captureAll: true }), true);
+  assert.equal(takes({ ...page, totalBytes: 1000 }, { captureAll: true }), false);
+  assert.equal(takes({ ...page, finalUrl: "https://a.skip.test/x" }, { captureAll: true }), false);
+  assert.equal(takes({ ...page, incognito: true }, { captureAll: true }), false);
+  assert.equal(takes(page, { captureAll: true }, { altClicked: true }), false);
+});
+
+test("an always site's downloads go whatever their type or size; an excluded site wins", () => {
+  const tiny = { filename: "notes.txt", finalUrl: "https://files.always.test/notes.txt", totalBytes: 10 };
+  assert.deepEqual(why(tiny, { captureAlwaysSites: ["always.test"] }), { capture: true, reason: "Always from files.always.test" });
+  assert.equal(takes({ ...tiny, finalUrl: "https://cdn.other.test/notes.txt", referrer: "https://always.test/page" }, { captureAlwaysSites: ["always.test"] }), true);
+  assert.equal(takes(tiny, { captureAlwaysSites: ["always.test"], captureExcludedSites: ["always.test"] }), false);
+  assert.equal(takes(tiny, { captureAlwaysSites: ["notalways.test"] }), false);
+});
+
+test("why a download stays in the browser", () => {
+  assert.equal(why({}, { captureEnabled: false }).reason, "Sending browser downloads to the app is off");
+  assert.equal(why({ url: "blob:https://www.example.com/5e1f", finalUrl: "" }).reason, "Made by the page (blob: or data:): only the browser has it");
+  assert.equal(why({}, {}, { posted: true }).reason, "The answer to a form sent with POST: the app can only ask for a link again");
+  assert.equal(why({ state: "complete" }).reason, "Finished before it could be handed over");
+  assert.equal(why({ totalBytes: 10 }).reason, "Under the minimum size (1 MB)");
+  assert.equal(why({ finalUrl: "https://files.skip.test/setup.exe" }).reason, "Never from files.skip.test");
+  assert.equal(why({ filename: "", finalUrl: "https://x.test/get" }).reason, "No file type in its name or link");
+  assert.deepEqual(why({}), { capture: true, reason: ".exe is one of the file types" });
+});
+
+test("a stored type list still the old default gets the new defaults; an edited one is kept", () => {
+  const old = CAPTURE_TYPES.slice(0, 30);
+  assert.equal(upgradedTypes([...old].reverse()), CAPTURE_TYPES);
+  assert.deepEqual(upgradedTypes(["zip"]), ["zip"]);
+  assert.deepEqual(upgradedTypes([...old, "torrent"]), [...old, "torrent"]);
+  for (const type of ["dat", "bin", "vhdx", "safetensors", "gguf", "opus", "cbz", "ttf", "esd"]) assert.ok(CAPTURE_TYPES.includes(type), type);
 });
 
 test("an Alt-click keeps the downloads of its own page in the browser, not those of other pages", () => {

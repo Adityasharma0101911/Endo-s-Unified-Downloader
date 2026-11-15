@@ -75,6 +75,30 @@ export function recordingView(r, now) {
   };
 }
 
+/** "just now", "5 min ago", "2 h ago" for a time `then` (ms) seen at `now`. */
+export function timeAgo(then, now) {
+  const minutes = Math.floor(Math.max(0, now - then) / 60000);
+  return minutes < 1 ? "just now" : minutes < 60 ? `${minutes} min ago` : `${Math.floor(minutes / 60)} h ago`;
+}
+
+/**
+ * What a row of the browser downloads log shows for entry `e` at `now`: where it went (chip), its name, host · size ·
+ * when, why, and what it offers: "send" (to the app again: a link the app can fetch that it doesn't have) or "page"
+ * (the page a download the page made came from), else null.
+ */
+export function logView(e, now) {
+  const bits = [e.host || "made by the page"];
+  if (e.size > 0) bits.push(formatBytes(e.size));
+  bits.push(timeAgo(e.time, now));
+  return {
+    chip: e.sent ? ["App", "green"] : ["Browser", ""],
+    title: e.name || "Unnamed download",
+    info: bits.join(" · "),
+    reason: e.reason || "",
+    action: e.sent ? null : e.url && !e.posted ? "send" : !e.url && e.page ? "page" : null,
+  };
+}
+
 /** The name a link list row leads with: the last part of the path, decoded, else the host. */
 export function linkName(url) {
   let parsed;
