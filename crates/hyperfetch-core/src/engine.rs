@@ -56,8 +56,6 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 const PROBE_CONCURRENCY: usize = 8;
 /// Most copies of a file its server names (see `advertised`) that are probed.
 const MAX_ADVERTISED: usize = 8;
-/// Largest Metalink a server names that is read.
-const MAX_METALINK: usize = 1 << 20;
 /// Tries of a probe's ranged GET while the server is busy or the connection fails.
 const PROBE_ATTEMPTS: u32 = 3;
 /// How long a probe keeps asking a server busy past those tries (429 or 503, with no HEAD to go
@@ -390,12 +388,12 @@ pub struct DownloadOptions {
     pub name_pattern: Option<String>,
     /// The channel of a channel list this download records (`ingest::Task::channel`), for
     /// `name_pattern`'s `{channel}`. Its stream with no length, of any kind, is recorded (see
+    /// `DownloadEngine::record_ts`).
+    pub channel: Option<String>,
     /// Only this file of the ZIP the link names is downloaded (see `crate::zipdir::extract`):
     /// into the download's folder under its path in the ZIP, unpacked as it arrives and checked
     /// against its CRC-32. A stop starts it over.
     pub zip_entry: Option<crate::zipdir::ZipEntry>,
-    /// `DownloadEngine::record_ts`).
-    pub channel: Option<String>,
 }
 
 impl Default for DownloadOptions {
@@ -472,9 +470,9 @@ impl Default for DownloadOptions {
             live_idle_timeout: None,
             ad_patterns: Vec::new(),
             drop_parts: Vec::new(),
-            zip_entry: None,
             name_pattern: None,
             channel: None,
+            zip_entry: None,
         }
     }
 }
@@ -813,11 +811,11 @@ impl DownloadEngine {
 
         if self.urls.first().is_some_and(crate::ftp::handles) {
             return Box::pin(self.fetch_ftp(client, snapshot_tx)).await;
+        }
+
         if let Some(entry) = &self.options.zip_entry {
             let url = self.urls.first().ok_or("No URLs to download")?;
             return Box::pin(self.fetch_zip_entry(&client, url, entry, snapshot_tx)).await;
-        }
-
         }
 
         // A playlist the page built itself: the link is only the base of its URIs.
@@ -2677,7 +2675,8 @@ impl DownloadEngine {
         let etag = reference.etag.clone();
         // A MEGA file is held to its MAC; its server's answers are of the ciphertext.
         if self.decrypt.is_none() {
-            crate::digest::look_for(&self.site, &self.options, &client, self.auth.clone(), &reference.url, &reference.headers);
+            let described = advertised(&reference.headers, &reference.final_url).1.map(|metalink| (metalink, reference.size));
+            crate::digest::look_for(&self.site, &self.options, &client, self.auth.clone(), &reference.url, &reference.headers, described);
         }
         let written = match reference.size {
             // A plain write (no sparse file, no preallocation, no flush unless fsync_on_complete
@@ -3369,6 +3368,7 @@ impl DownloadEngine {
             None => PathBuf::from("."),
         }
     }
+
     /// The file `entry` of the ZIP at `url` (see `DownloadOptions::zip_entry`), at its path in the
     /// ZIP under the download's folder, numbered when a file is there; a folder entry is made.
     async fn fetch_zip_entry(
@@ -3422,7 +3422,6 @@ impl DownloadEngine {
         emit(&snapshot_tx, || done_snapshot(entry.size, &path));
         Ok(path)
     }
-
 
     fn output_path_for(&self, filename: &str) -> PathBuf {
         match &self.options.output_path {
@@ -4569,21 +4568,7 @@ fn offers_h3(headers: &HeaderMap) -> bool {
 
 /// The mirrors the Metalink at `url` lists for the file of `size`, or for its only file.
 async fn metalink_mirrors(client: &Client, url: &Url, size: Option<u64>) -> Vec<Url> {
-    let fetched = async {
-        let mut response = client.get(url.clone()).send().await.ok()?.error_for_status().ok()?;
-        let mut body = Vec::new();
-        while let Some(chunk) = response.chunk().await.ok()? {
-            body.extend_from_slice(&chunk);
-            if body.len() > MAX_METALINK {
-                return None;
-            }
-        }
-        String::from_utf8(body).ok()
-    };
-    let Ok(Some(text)) = tokio::time::timeout(PROBE_TIMEOUT, fetched).await else { return Vec::new() };
-    let files = crate::metalink::parse_metalink(&text).unwrap_or_default();
-    let only = files.len() == 1;
-    files.into_iter().find(|f| only || (f.size.is_some() && f.size == size)).map(|f| f.urls).unwrap_or_default()
+    crate::metalink::described(client, url, size, PROBE_TIMEOUT).await.map(|f| f.urls).unwrap_or_default()
 }
 
 /// The next probe of those still out, if any are; never while none are.
@@ -8661,6 +8646,35 @@ mod tests {
         assert!(at_copy.gets.load(Ordering::SeqCst) > 1, "the copy served ranges");
         assert!(at_listed.gets.load(Ordering::SeqCst) > 1, "the Metalink's copy served ranges");
         assert!(at_other.gets.load(Ordering::SeqCst) <= 1, "the other file answered only its probe");
+    }
+
+    /// The whole-file hash of the Metalink a server's `Link` header names checks the file as a
+    /// published checksum does: a match says so, a mismatch fails the download, and the hash of a
+    /// file of another size is no hash of this one.
+    #[tokio::test]
+    async fn test_the_metalink_a_server_names_checks_the_whole_file() {
+        use sha2::Digest;
+        let size = 300 * 1024;
+        let sum: String = sha2::Sha256::digest(crate::netsim::file(size)).iter().map(|b| format!("{b:02x}")).collect();
+        for (hash, listed, kept) in [(sum.clone(), size, true), ("0".repeat(64), size, false), ("0".repeat(64), size + 1, true)] {
+            let metalink = format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?><metalink xmlns="urn:ietf:params:xml:ns:metalink"><file name="f.bin"><size>{listed}</size><hash type="sha-256">{hash}</hash></file></metalink>"#
+            );
+            let link = r#"<f.meta4>; rel=describedby; type="application/metalink4+xml""#.to_string();
+            let (url, _) = crate::netsim::serve(crate::netsim::Server { size, link: Some(link), metalink: Some(metalink), ..Default::default() }).await;
+            let dir = tempdir().unwrap();
+            let (tx, mut rx) = broadcast::channel(1024);
+            let ran = DownloadEngine::new(vec![url], sim_options(dir.path(), 2, false)).run(Some(tx)).await;
+            let mut against = None;
+            while let Ok(snapshot) = rx.try_recv() {
+                against = snapshot.checked_against.or(against);
+            }
+            match (kept, listed == size) {
+                (true, true) => assert_eq!((ran.is_ok(), against.as_deref()), (true, Some("the site's SHA-256"))),
+                (true, false) => assert_eq!((ran.is_ok(), against), (true, None)),
+                (false, _) => assert!(ran.unwrap_err().contains("published SHA-256"), "a wrong hash fails"),
+            }
+        }
     }
 
     fn sim_options(dir: &Path, connections: usize, adaptive: bool) -> DownloadOptions {

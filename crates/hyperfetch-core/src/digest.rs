@@ -54,17 +54,34 @@ pub(crate) const REFETCH_ROUNDS: usize = 3;
 /// `CHECKSUMS` in its folder, by the line for its name. Those are fetched one after the other,
 /// with GET only, each at most 64 KiB, within 3 seconds in all.
 pub async fn published_checksum(client: &Client, url: &Url, probe_headers: &HeaderMap) -> Option<String> {
-    published(client, None, 0, url, probe_headers).await
+    published(client, None, 0, url, probe_headers, None).await
 }
 
 /// [`published_checksum`], the checksum files asked for with `auth` as the download's own
 /// requests are (see `worker::authorize`): its credentials go to its own hosts alone. Each takes
-/// a slot of the host's `limit` (see `crate::hosts`), as every request of a download does.
-async fn published(client: &Client, auth: Option<&Auth>, limit: usize, url: &Url, probe_headers: &HeaderMap) -> Option<String> {
-    match from_headers(probe_headers) {
-        Some(found) => Some(found),
-        None => from_sidecars(client, auth, limit, url).await,
+/// a slot of the host's `limit` (see `crate::hosts`), as every request of a download does. Between
+/// the headers and the checksum files comes the Metalink they name for the file (`described`, its
+/// link and the file's size; see `metalink::described`): its strongest hash of the whole file.
+async fn published(
+    client: &Client,
+    auth: Option<&Auth>,
+    limit: usize,
+    url: &Url,
+    probe_headers: &HeaderMap,
+    described: Option<(Url, Option<u64>)>,
+) -> Option<String> {
+    if let Some(found) = from_headers(probe_headers) {
+        return Some(found);
     }
+    if let Some((metalink, size)) = described {
+        // One of another size describes another file.
+        let file = crate::metalink::described(client, &metalink, size, SIDECAR_BUDGET).await.filter(|f| f.size.is_none() || f.size == size);
+        let found: Vec<_> = file.iter().flat_map(|f| &f.hashes).filter_map(|(algo, hex)| named(algo, hex)).collect();
+        if let Some((algo, digest)) = ALGOS.iter().find_map(|(algo, _)| found.iter().find(|(name, _)| name == algo)) {
+            return Some(checksum(algo, digest));
+        }
+    }
+    from_sidecars(client, auth, limit, url).await
 }
 
 /// `algo:hex` for `digest` of `algo` (one of `ALGOS`).
@@ -237,8 +254,9 @@ pub(crate) struct Site {
 }
 
 /// Starts looking for the site's published checksum of the download at `url`, whose probe
-/// answered with `headers`, alongside the download (its checksum files asked for with `auth`),
-/// unless the user gave a checksum or turned this off (`DownloadOptions::remote_checksum`).
+/// answered with `headers`, alongside the download (its checksum files asked for with `auth`; the
+/// Metalink they name, `described`, read too), unless the user gave a checksum or turned this off
+/// (`DownloadOptions::remote_checksum`).
 pub(crate) fn look_for(
     site: &Mutex<Site>,
     options: &DownloadOptions,
@@ -246,10 +264,11 @@ pub(crate) fn look_for(
     auth: Option<Arc<Auth>>,
     url: &Url,
     headers: &HeaderMap,
+    described: Option<(Url, Option<u64>)>,
 ) {
     let search = (options.remote_checksum && options.expected_checksum.is_none()).then(|| {
         let (client, url, headers, limit) = (client.clone(), url.clone(), headers.clone(), options.max_connections_per_host);
-        tokio::spawn(async move { published(&client, auth.as_deref(), limit, &url, &headers).await })
+        tokio::spawn(async move { published(&client, auth.as_deref(), limit, &url, &headers, described).await })
     });
     *site.lock() = Site { search, note: None };
 }
