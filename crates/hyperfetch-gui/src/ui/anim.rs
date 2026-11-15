@@ -256,21 +256,71 @@ pub fn paint_check(painter: &Painter, rect: Rect, t: f32, stroke: Stroke) {
     painter.add(Shape::line(points, stroke));
 }
 
+/// Half the height of the pill `rect` (a bar whose ends are half circles) at `x`.
+pub fn pill_half(rect: Rect, x: f32) -> f32 {
+    let r = rect.height() / 2.0;
+    let d = (rect.left() + r - x).max(x - (rect.right() - r)).clamp(0.0, r);
+    (r * r - d * d).sqrt()
+}
+
+/// Half the height, at each x, of the part of the pill `track` filled from its left end to
+/// `reach`: round at both ends like the track itself, also when it is shorter than the bar is
+/// high (a round end sliding in, never a squashed or square one).
+pub fn fill_half(track: Rect, reach: f32) -> impl Fn(f32) -> f32 + Copy {
+    let fill = Rect::from_min_max(Pos2::new(reach - (reach - track.left()).max(track.height()), track.top()), Pos2::new(reach, track.bottom()));
+    move |x| pill_half(track, x).min(pill_half(fill, x))
+}
+
+/// The outline of the shape `half` high (see [`fill_half`]) around the middle line of `rect`,
+/// from the left end of `rect` to its right end: a convex polygon.
+pub fn outline(rect: Rect, half: impl Fn(f32) -> f32) -> Vec<Pos2> {
+    let cap = (rect.height() / 2.0).min(rect.width() / 2.0);
+    let steps = 10;
+    let left = (0..=steps).map(|i| rect.left() + cap * i as f32 / steps as f32);
+    let right = (0..=steps).map(|i| rect.right() - cap + cap * i as f32 / steps as f32);
+    let sides: Vec<(f32, f32)> = left.chain(right).map(|x| (x, half(x))).collect();
+    let y = rect.center().y;
+    let top = sides.iter().map(|&(x, h)| Pos2::new(x, y - h));
+    // Where the shape comes to a point the top has it already.
+    let bottom = sides.iter().rev().filter(|&&(_, h)| h > 0.05).map(|&(x, h)| Pos2::new(x, y + h));
+    let mut points: Vec<Pos2> = top.chain(bottom).collect();
+    points.dedup();
+    points
+}
+
 /// A soft light sweeping across `rect` (and clipped to it) every 1.6 s, while called: for a bar
 /// that is filling. Nothing under Reduce motion or when out of view.
 pub fn sheen(ui: &Ui, rect: Rect) {
+    sweep(ui, rect, |_| rect.height() / 2.0);
+}
+
+/// [`sheen`] over the shape `half` high at each x around the middle line of `rect` (see
+/// [`fill_half`]), so that the light follows a bar's round ends.
+pub fn sweep(ui: &Ui, rect: Rect, half: impl Fn(f32) -> f32) {
     if !ui.is_rect_visible(rect) {
         return;
     }
     let Some(time) = tick(ui.ctx()) else { return };
     let band = (rect.height() * 4.0).max(48.0);
-    let x = rect.left() - band + (time / 1.6).fract() as f32 * (rect.width() + band);
-    let mut mesh = Mesh::default();
-    for (dx, color) in [(0.0, Color32::TRANSPARENT), (band / 2.0, Color32::from_white_alpha(60)), (band, Color32::TRANSPARENT)] {
-        mesh.colored_vertex(Pos2::new(x + dx, rect.top()), color);
-        mesh.colored_vertex(Pos2::new(x + dx, rect.bottom()), color);
+    let start = rect.left() - band + (time / 1.6).fract() as f32 * (rect.width() + band);
+    let (from, to) = (start.max(rect.left()), (start + band).min(rect.right()));
+    if to <= from {
+        return;
     }
-    for i in [0, 2] {
+    let y = rect.center().y;
+    let slices = ((to - from) / 3.0).ceil().max(1.0) as u32;
+    let mut mesh = Mesh::default();
+    for i in 0..=slices {
+        let x = from + (to - from) * i as f32 / slices as f32;
+        // Brightest in the middle of the band, nothing at its edges.
+        let light = 1.0 - (2.0 * (x - start) / band - 1.0).abs();
+        let color = Color32::from_white_alpha((60.0 * light.clamp(0.0, 1.0)) as u8);
+        let h = half(x);
+        mesh.colored_vertex(Pos2::new(x, y - h), color);
+        mesh.colored_vertex(Pos2::new(x, y + h), color);
+    }
+    for i in 0..slices {
+        let i = 2 * i;
         mesh.add_triangle(i, i + 1, i + 2);
         mesh.add_triangle(i + 1, i + 3, i + 2);
     }
@@ -305,6 +355,25 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(delay, Duration::MAX, "still asking for frames");
         second
+    }
+
+    #[test]
+    fn a_filled_bar_is_round_at_both_ends_however_short() {
+        let track = Rect::from_min_size(Pos2::new(10.0, 0.0), Vec2::new(140.0, 18.0));
+        for reach in [11.0, 14.0, 19.0, 28.0, 80.0, 150.0] {
+            let half = fill_half(track, reach);
+            let filled = Rect::from_min_max(track.min, Pos2::new(reach, track.bottom()));
+            // Never outside the track, nothing past its reach, and its ends come to a point.
+            for x in (0..=1500).map(|i| 10.0 + i as f32 * 0.1) {
+                assert!(half(x) <= pill_half(track, x) + 1e-3, "reach {reach}, x {x}");
+            }
+            assert!(half(reach) < 0.01 && half(track.left()) < 0.01, "reach {reach}");
+            let points = outline(filled, half);
+            assert!(points.len() >= 6, "reach {reach}: {points:?}");
+            assert!(points.iter().all(|p| filled.expand(0.01).contains(*p)), "reach {reach}: {points:?}");
+        }
+        // A long fill is as high as the bar in its middle.
+        assert_eq!(fill_half(track, 150.0)(80.0), 9.0);
     }
 
     #[test]
