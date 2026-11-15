@@ -19,6 +19,7 @@ What changed in each release, newest first. Each release's page on [GitHub](http
 - **IPFS:** an `ipfs://<cid>` link, a gateway's `/ipfs/<cid>` link or a subdomain gateway's downloads from several public gateways at once as mirrors, checked against the CID when it is the file's own SHA-256; `ipfs://` links were refused, and the gateway list no longer has cloudflare-ipfs.com, closed since 2024.
 - **Steam Workshop:** an item link (`steamcommunity.com/sharedfiles/filedetails/?id=...`) downloads the item's file, with its name and size, when Steam's public Web API has one (items stored the older way); a newer item says it comes only through the Steam client, where its page was downloaded before.
 - **Bunkr, Cyberdrop and Catbox albums** go to gallery-dl, which reads them, as imgur's do; they downloaded the album's web page before. A Catbox or Litterbox file link was already its file.
+- **SwissTransfer:** a transfer link (`swisstransfer.com/d/...`) adds one download per file with its size, folders kept, read from SwissTransfer's public API; one with a password opens with the password pasted with it. It downloaded the transfer's web page before.
 - Fixed: a progress bar's fill went square when short and the light sweeping over it was cut to a rectangle; both now follow the bar's round ends.
 
 ## 1.9.0 (2026-10-30)

@@ -27,6 +27,10 @@ use crate::resolver::ResolverError;
 const PCLOUD_API: &str = "https://api.pcloud.com";
 const PCLOUD_EU_API: &str = "https://eapi.pcloud.com";
 const YANDEX_API: &str = "https://cloud-api.yandex.net";
+const SWISSTRANSFER: &str = "https://www.swisstransfer.com";
+const SWISSTRANSFER_GONE: &str = "the SwissTransfer transfer has expired or was deleted";
+const SWISSTRANSFER_LOCKED: &str = "the SwissTransfer transfer wants a password: add its link again with the password on the next line (Password: ...)";
+const SWISSTRANSFER_REFUSED: &str = "the SwissTransfer transfer's password is wrong";
 
 const YANDEX: &[&str] = &[
     "yadi.sk", "disk.yandex.ru", "disk.yandex.com", "disk.yandex.com.tr", "disk.yandex.by", "disk.yandex.kz",
@@ -60,6 +64,8 @@ enum Link {
     Yandex { key: String, path: String },
     /// A Box shared link (/s/{name}), the file or folder in it it names.
     Box { name: String, file: Option<u64>, folder: Option<u64> },
+    /// A SwissTransfer transfer (swisstransfer.com/d/{link}).
+    SwissTransfer { link: String },
 }
 
 /// Whether `url`'s host is one of `domains` or under one.
@@ -118,6 +124,12 @@ fn link_of(url: &Url) -> Option<Link> {
             _ => None,
         };
     }
+    if on(url, &["swisstransfer.com"]) {
+        return match segs[..] {
+            ["d", link] if is_id(link) => Some(Link::SwissTransfer { link: link.to_string() }),
+            _ => None,
+        };
+    }
     None
 }
 
@@ -134,19 +146,25 @@ fn transfer_of(url: &Url) -> Option<(String, Option<String>, String)> {
 }
 
 /// Whether `url` is a link [`list`] reads: a pCloud, Yandex Disk or Box share that may be a
-/// folder (their links do not say), or one shaped as a Nextcloud or ownCloud share.
+/// folder (their links do not say), a SwissTransfer transfer, or one shaped as a Nextcloud or
+/// ownCloud share.
 pub fn lists(url: &Url) -> bool {
     match link_of(url) {
         Some(Link::PCloud { file, .. } | Link::Box { file, .. }) => file.is_none(),
         Some(Link::Yandex { key, .. }) => key.contains("/d/"),
+        Some(Link::SwissTransfer { .. }) => true,
         _ => share_of(url).is_some(),
     }
 }
 
 /// One task per file the folder at `url` holds, in a folder named after it; a file's link is its
 /// one task, as typed. A Nextcloud or ownCloud share is read with the Authorization `options`
-/// gave its link (a share's password, see [`share_tasks`]); None when its host runs neither.
+/// gave its link (a share's password, see [`share_tasks`]); None when its host runs neither. A
+/// SwissTransfer transfer opens with the password a paste gave.
 pub async fn list(http: &reqwest::Client, url: &Url, options: &ListOptions) -> Option<Result<Vec<Task>, String>> {
+    if let Some(Link::SwissTransfer { link }) = link_of(url) {
+        return Some(swisstransfer_list(http, SWISSTRANSFER, &link, options.password.as_deref()).await);
+    }
     match share_of(url) {
         Some(share) => {
             let auth = options.auth.as_ref().filter(|(link, _)| link == url).map(|(_, header)| header.as_str());
@@ -186,6 +204,7 @@ pub async fn resolve(client: &reqwest::Client, url: &Url, _proxy: Option<&str>) 
             yandex_file(client, YANDEX_API, &key, &path).await.map(|file| vec![file.unwrap_or_else(|| url.clone())])
         }
         Some(Link::Box { name, file, .. }) => box_file(client, url, &name, file).await.map(|file| vec![file.unwrap_or_else(|| url.clone())]),
+        Some(Link::SwissTransfer { .. }) => Err(LISTS_MANY.to_string()),
         None => Err(format!("{} is not a share link", url)),
     };
     found.map_err(ResolverError::NotFound)
@@ -815,6 +834,90 @@ async fn share_walk(http: &reqwest::Client, share: &Share, root: &str, legacy: b
     Ok(Walk::Listed(tasks))
 }
 
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct SwissAnswer {
+    data: SwissTransfer,
+}
+
+/// A transfer, or `kind` and `message` when it cannot be read (expired, need_password, ...).
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct SwissTransfer {
+    #[serde(rename = "type")]
+    kind: String,
+    message: String,
+    #[serde(rename = "linkUUID")]
+    link_uuid: String,
+    download_host: String,
+    container: SwissContainer,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct SwissContainer {
+    #[serde(rename = "UUID")]
+    uuid: String,
+    files: Vec<SwissFile>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct SwissFile {
+    #[serde(rename = "UUID")]
+    uuid: String,
+    file_name: String,
+    file_size_in_bytes: Option<u64>,
+    /// The folder it was uploaded in, if any.
+    path: Option<String>,
+    deleted_date: Option<String>,
+}
+
+/// One task per file of SwissTransfer's transfer `link` (read at `base`), subfolders kept, each
+/// from the download host the transfer names; a transfer with a password opens with `password`,
+/// and each of its files then downloads with a token made for it.
+async fn swisstransfer_list(http: &reqwest::Client, base: &str, link: &str, password: Option<&str>) -> Result<Vec<Task>, String> {
+    use base64::Engine as _;
+    let mut request = http.get(format!("{base}/api/links/{link}"));
+    if let Some(password) = password {
+        // As SwissTransfer's own apps send it: the password in base64, no scheme.
+        request = request.header(AUTHORIZATION, base64::engine::general_purpose::STANDARD.encode(password));
+    }
+    // An unknown link is sent on to a "not found" page, which is no JSON.
+    let (_, answer) = get_json::<SwissAnswer>(request, "SwissTransfer").await.map_err(|_| SWISSTRANSFER_GONE.to_string())?;
+    let transfer = answer.data;
+    match transfer.kind.as_str() {
+        "" => {}
+        "expired" => return Err(SWISSTRANSFER_GONE.to_string()),
+        kind if kind.contains("password") => return Err(if password.is_some() { SWISSTRANSFER_REFUSED } else { SWISSTRANSFER_LOCKED }.to_string()),
+        _ => return Err(format!("SwissTransfer: {}", transfer.message)),
+    }
+    let mut tasks = Vec::new();
+    for file in transfer.container.files.into_iter().filter(|f| f.deleted_date.is_none()) {
+        let mut url = Url::parse(&format!("https://{}/api/download/{}/{}", transfer.download_host, transfer.link_uuid, file.uuid))
+            .map_err(|_| "SwissTransfer answered with a download host the app cannot read".to_string())?;
+        if let Some(password) = password {
+            let body = serde_json::json!({ "containerUUID": transfer.container.uuid, "fileUUID": file.uuid, "password": password });
+            let token = http.post(format!("{base}/api/generateDownloadToken")).header(CONTENT_TYPE, "application/json").body(body.to_string());
+            let token = token.send().await.and_then(|a| a.error_for_status()).map_err(|e| format!("Cannot reach SwissTransfer: {}", e.without_url()))?;
+            let token = token.text().await.map_err(|e| format!("Cannot reach SwissTransfer: {}", e.without_url()))?;
+            url.query_pairs_mut().append_pair("token", token.trim().trim_matches('"'));
+        }
+        // shortcut: `path` is taken as the folder, or the folder and name, not seen live; check it on a transfer with folders.
+        let path = file.path.as_deref().unwrap_or_default();
+        let folder = path.strip_suffix(file.file_name.as_str()).unwrap_or(path);
+        let Ok(name) = clean_path(folder.split('/').filter(|s| !s.is_empty()).chain([file.file_name.as_str()])) else {
+            tracing::warn!("left out {:?}: not a usable file name", file.file_name);
+            continue;
+        };
+        tasks.push(Task { urls: vec![url], name: Some(name), size: file.file_size_in_bytes, from_document: true, ..Task::default() });
+    }
+    if tasks.is_empty() {
+        return Err("the transfer holds no files the app can download".to_string());
+    }
+    Ok(tasks)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1216,6 +1319,72 @@ mod tests {
         assert_eq!(tasks[0].urls[0].as_str(), format!("http://{addr}/public.php/dav/files/TOKEN/a.txt"));
         assert!(!tasks[0].from_document, "the user's sign-in goes with it");
         assert_eq!(share_tasks(&http(), &share, None).await.unwrap().unwrap_err(), SHARE_LOCKED);
+    }
+
+    /// A SwissTransfer transfer is one task per file from its download host, subfolders kept; one
+    /// with a password opens with it (sent as SwissTransfer's apps send it) and its files download
+    /// with a token; an expired or unknown one, and a missing or wrong password, say so.
+    #[tokio::test]
+    async fn swisstransfer_transfers_list_their_files() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        // As SwissTransfer answers, cut down (`needPassword` is a number).
+        const TRANSFER: &str = r#"{"result":"success","data":{"linkUUID":"c96350da-4d8c-4c43-aa6a-40f2d2b31eac","containerUUID":"77f4f5c8","downloadHost":"dl-x.swisstransfer.com",
+            "container":{"UUID":"77f4f5c8","needPassword":0,"numberOfFile":3,"files":[
+                {"UUID":"2e085789","fileName":"app (1).aab","fileSizeInBytes":26070874,"deletedDate":null,"path":null},
+                {"UUID":"3f196890","fileName":"b.txt","fileSizeInBytes":3,"deletedDate":null,"path":"Docs/Old"},
+                {"UUID":"4a2b7c01","fileName":"gone.txt","fileSizeInBytes":3,"deletedDate":"2024-12-01T00:00:00+01:00","path":null}]}}}"#;
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = vec![0; 8192];
+                let n = socket.read(&mut request).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&request[..n]).to_ascii_lowercase();
+                let body = match request.split(' ').nth(1).unwrap_or_default() {
+                    "/api/links/open" => TRANSFER.to_string(),
+                    // "pw"
+                    "/api/links/locked" if request.contains("authorization: chc=\r\n") => TRANSFER.to_string(),
+                    "/api/links/locked" if request.contains("authorization:") => r#"{"result":"success","data":{"type":"wrong_password","message":"Wrong password"}}"#.into(),
+                    "/api/links/locked" => r#"{"result":"success","data":{"type":"need_password","message":"Transfer need a password"}}"#.into(),
+                    "/api/links/old" => r#"{"result":"success","data":{"type":"expired","message":"Transfer is expired"}}"#.into(),
+                    "/api/generatedownloadtoken" if request.starts_with("post ") => "\"tok\"".into(),
+                    _ => "<!DOCTYPE html><html>not found</html>".into(),
+                };
+                let head = format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
+                let _ = socket.write_all(format!("{head}{body}").as_bytes()).await;
+            }
+        });
+        let files = |tasks: &[Task]| tasks.iter().map(|t| (t.urls[0].to_string(), t.name.clone().unwrap(), t.size)).collect::<Vec<_>>();
+        let download = "https://dl-x.swisstransfer.com/api/download/c96350da-4d8c-4c43-aa6a-40f2d2b31eac";
+        let open = swisstransfer_list(&http(), &base, "open", None).await.unwrap();
+        assert_eq!(
+            files(&open),
+            [
+                (format!("{download}/2e085789"), PathBuf::from("app (1).aab"), Some(26070874)),
+                (format!("{download}/3f196890"), PathBuf::from("Docs").join("Old").join("b.txt"), Some(3)),
+            ]
+        );
+        assert!(open.iter().all(|t| t.from_document));
+        let locked = swisstransfer_list(&http(), &base, "locked", Some("pw")).await.unwrap();
+        assert_eq!(locked[0].urls[0].as_str(), format!("{download}/2e085789?token=tok"));
+        assert_eq!(swisstransfer_list(&http(), &base, "locked", None).await.unwrap_err(), SWISSTRANSFER_LOCKED);
+        assert_eq!(swisstransfer_list(&http(), &base, "locked", Some("no")).await.unwrap_err(), SWISSTRANSFER_REFUSED);
+        assert_eq!(swisstransfer_list(&http(), &base, "old", None).await.unwrap_err(), SWISSTRANSFER_GONE);
+        assert_eq!(swisstransfer_list(&http(), &base, "unknown", None).await.unwrap_err(), SWISSTRANSFER_GONE);
+        let link = Url::parse("https://www.swisstransfer.com/d/c96350da-4d8c-4c43-aa6a-40f2d2b31eac").unwrap();
+        assert_eq!(link_of(&link), Some(Link::SwissTransfer { link: "c96350da-4d8c-4c43-aa6a-40f2d2b31eac".into() }));
+        assert!(lists(&link) && handles(&link));
+        assert_eq!(link_of(&Url::parse("https://www.swisstransfer.com/en-us").unwrap()), None);
+    }
+
+    /// Live: an expired SwissTransfer transfer says so (transfers last 30 days at most, so no
+    /// public one stays to list).
+    #[tokio::test]
+    #[ignore]
+    async fn live_swisstransfer_expired() {
+        let link = live("https://www.swisstransfer.com/d/1759d19c-516c-4682-826a-1346c75aea10");
+        let listed = list(&crate::ingest::descriptor_client(None).unwrap(), &link, &ListOptions::default()).await.unwrap();
+        assert_eq!(listed.unwrap_err(), SWISSTRANSFER_GONE);
     }
 
     fn live(link: &str) -> Url {
