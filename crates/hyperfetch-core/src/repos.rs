@@ -1,6 +1,6 @@
 //! Code and model repositories (GitHub, GitLab, Bitbucket, Gitea and Forgejo, Hugging Face,
-//! Civitai) and the Internet Archive: their folders, releases, models and items read into one task
-//! per file, a repository itself into its default branch's zip.
+//! Civitai), the Internet Archive and package registries: their folders, releases, models, items
+//! and packages read into one task per file, a repository itself into its default branch's zip.
 //!
 //! The files download from the service's own host the user typed (github.com, huggingface.co,
 //! civitai.com, archive.org, the GitLab or Gitea site, bitbucket.org), so the Authorization header the user gave goes with them there and nowhere
@@ -33,6 +33,7 @@ const ARCHIVE_OWN_FORMATS: &[&str] = &["Metadata", "JPEG Thumb", "Item Image"];
 
 const BITBUCKET: &str = "https://bitbucket.org";
 const BITBUCKET_API: &str = "https://api.bitbucket.org/2.0";
+const PYPI: &str = "https://pypi.org";
 
 /// Most path segments a GitHub ref with slashes in it (`feature/x`) is tried with.
 const MAX_REF_PARTS: usize = 4;
@@ -99,6 +100,8 @@ enum Repo {
     GiteaSrc { origin: String, owner: String, repo: String, kind: String, rest: Vec<String> },
     /// {owner}/{repo}/releases/latest, or /releases/tag/{tag}, on a Gitea site as above.
     GiteaRelease { origin: String, owner: String, repo: String, tag: Option<String> },
+    /// pypi.org/project/{name}/[{version}/]: the release's files, the latest release's without a version.
+    PyPi { name: String, version: Option<String> },
 }
 
 fn repo_of(url: &Url) -> Option<Repo> {
@@ -168,6 +171,11 @@ fn repo_of(url: &Url) -> Option<Repo> {
                 _ => None,
             }
         }
+        "pypi.org" | "www.pypi.org" => match segs[..] {
+            ["project", name] => Some(Repo::PyPi { name: name.into(), version: None }),
+            ["project", name, version] => Some(Repo::PyPi { name: name.into(), version: Some(version.into()) }),
+            _ => None,
+        },
         host => {
             let origin = url.origin().ascii_serialization();
             // GitLab's pages of a project are under {project}/-/.
@@ -227,6 +235,7 @@ pub async fn list(http: &reqwest::Client, url: &Url, auth: Option<&str>) -> Resu
         Some(Repo::BitbucketDownloads { owner, repo }) => bitbucket_downloads(http, auth, BITBUCKET_API, &owner, &repo).await?,
         Some(Repo::GiteaSrc { origin, owner, repo, kind, rest }) => gitea_src(http, auth, &origin, &owner, &repo, &kind, &rest).await?,
         Some(Repo::GiteaRelease { origin, owner, repo, tag }) => gitea_release(http, auth, &origin, &owner, &repo, tag.as_deref()).await?,
+        Some(Repo::PyPi { name, version }) => pypi(http, PYPI, &name, version.as_deref()).await?,
         None => return Err(format!("{} is not a repository, folder, release, model or item link", url)),
     };
     if tasks.is_empty() {
@@ -237,9 +246,9 @@ pub async fn list(http: &reqwest::Client, url: &Url, auth: Option<&str>) -> Resu
 
 /// Whether `url` is a repository link [`resolve`] takes (a folder's says it must be listed). An
 /// archive.org item's page is not: as one download it goes on as any page does (to yt-dlp); nor
-/// is a Gitea /src/ link, which may be a file's (see `resolver::CodeHostResolver`).
+/// is a Gitea /src/ link, which may be a file's (see `resolver::CodeHostResolver`), nor a package's page.
 pub fn handles(url: &Url) -> bool {
-    repo_of(url).is_some_and(|repo| !matches!(repo, Repo::Archive { .. } | Repo::GiteaSrc { .. }))
+    repo_of(url).is_some_and(|repo| !matches!(repo, Repo::Archive { .. } | Repo::GiteaSrc { .. } | Repo::PyPi { .. }))
 }
 
 /// Where the zip of the repository link `url` downloads from.
@@ -859,6 +868,57 @@ async fn gitea_release(http: &reqwest::Client, auth: Option<&str>, origin: &str,
     release_tasks(&json(answer, &site(origin)).await?, repo, origin)
 }
 
+#[derive(Deserialize)]
+struct PyPiRelease {
+    info: PyPiInfo,
+    urls: Vec<PyPiFile>,
+}
+
+#[derive(Deserialize)]
+struct PyPiInfo {
+    name: String,
+    version: String,
+}
+
+#[derive(Deserialize)]
+struct PyPiFile {
+    filename: String,
+    url: Url,
+    size: Option<u64>,
+    #[serde(default)]
+    digests: HashMap<String, String>,
+}
+
+/// The files (wheels and source) of the release `version` of PyPI's project `name`, its latest
+/// without one, each with its size and SHA-256, in a folder named after the release.
+async fn pypi(http: &reqwest::Client, base: &str, name: &str, version: Option<&str>) -> Result<Vec<Task>, String> {
+    let api = url_at(base, ["pypi", name].into_iter().chain(version).chain(["json"]))?;
+    let Some(answer) = fetch(http.get(api), None, "PyPI").await? else {
+        return Err(match version {
+            Some(version) => format!("PyPI has no version {version} of {name}"),
+            None => format!("PyPI has no project {name}"),
+        });
+    };
+    let release: PyPiRelease = json(answer, "PyPI").await?;
+    let folder = component(&format!("{}-{}", release.info.name, release.info.version), name)?;
+    Ok(release
+        .urls
+        .into_iter()
+        .filter_map(|file| {
+            Some(Task {
+                name: Some(relative(&file.filename)?),
+                folder: Some(folder.clone()),
+                size: file.size,
+                checksum: file.digests.get("sha256").and_then(|hex| checksum("sha256", hex)),
+                // On PyPI's file host, not the site the user typed.
+                from_document: true,
+                urls: vec![file.url],
+                ..Task::default()
+            })
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1149,6 +1209,55 @@ mod tests {
         assert!(lists(&Url::parse("https://archive.org/details/item").unwrap()) && !handles(&Url::parse("https://archive.org/details/item").unwrap()));
     }
 
+    fn pypi_api(path: &str, _: Option<crate::range::ByteRange>) -> Reply {
+        match path {
+            // As PyPI answers, cut down.
+            "/pypi/Six/json" | "/pypi/six/1.16.0/json" => json_reply(
+                r#"{"info":{"name":"six","version":"1.16.0"},"urls":[
+                    {"filename":"six-1.16.0-py2.py3-none-any.whl","packagetype":"bdist_wheel","size":11053,"yanked":false,
+                     "url":"https://files.pythonhosted.org/packages/d9/5a/e7c31adbe875f2abbb91bd84cf2dc52d792b5a01506781dbcf25c91daf11/six-1.16.0-py2.py3-none-any.whl",
+                     "digests":{"blake2b_256":"d95ae7c31adbe875f2abbb91bd84cf2dc52d792b5a01506781dbcf25c91daf11","md5":"529d7fd7e14612ccde86417b4402d6f3","sha256":"8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254"}},
+                    {"filename":"six-1.16.0.tar.gz","packagetype":"sdist","size":34041,"yanked":false,
+                     "url":"https://files.pythonhosted.org/packages/71/39/171f1c67cd00715f190ba0b100d606d440a28c93c7714febeca8b79af85e/six-1.16.0.tar.gz",
+                     "digests":{"sha256":"1E61C37477A1626458E36F7B1D82AA5C9B094FA4802892072E49DE9C60C4C926"}}]}"#,
+            ),
+            "/pypi/empty/json" => json_reply(r#"{"info":{"name":"empty","version":"0.1"},"urls":[]}"#),
+            _ => (404, "Content-Type: application/json\r\n".into(), br#"{"message": "Not Found"}"#.to_vec()),
+        }
+    }
+
+    /// A PyPI project is its latest release's files, a version's link that release's, each with
+    /// its size and SHA-256, in a folder named after the release; a missing one says so.
+    #[tokio::test]
+    async fn pypi_releases_list_their_files() {
+        let (addr, _) = serve(pypi_api).await;
+        let base = format!("http://{addr}");
+        for version in [None, Some("1.16.0")] {
+            let name = if version.is_some() { "six" } else { "Six" };
+            let tasks = pypi(&http(), &base, name, version).await.unwrap();
+            let listed: Vec<_> = tasks.iter().map(|t| (t.name.clone().unwrap(), t.size, t.checksum.clone().unwrap())).collect();
+            assert_eq!(
+                listed,
+                [
+                    (PathBuf::from("six-1.16.0-py2.py3-none-any.whl"), Some(11053), "sha256:8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254".to_string()),
+                    (PathBuf::from("six-1.16.0.tar.gz"), Some(34041), "sha256:1e61c37477a1626458e36f7b1d82aa5c9b094fa4802892072e49de9c60c4c926".to_string()),
+                ]
+            );
+            assert!(tasks.iter().all(|t| t.folder == Some("six-1.16.0".into()) && t.from_document && t.urls[0].host_str() == Some("files.pythonhosted.org")));
+        }
+        assert_eq!(pypi(&http(), &base, "six", Some("9.9")).await.unwrap_err(), "PyPI has no version 9.9 of six");
+        assert_eq!(pypi(&http(), &base, "gone", None).await.unwrap_err(), "PyPI has no project gone");
+        assert!(pypi(&http(), &base, "empty", None).await.unwrap().is_empty());
+        let pkg = |name: &str, version: Option<&str>| Some(Repo::PyPi { name: name.into(), version: version.map(Into::into) });
+        assert_eq!(repo("https://pypi.org/project/six/"), pkg("six", None));
+        assert_eq!(repo("https://pypi.org/project/six/1.16.0/#files"), pkg("six", Some("1.16.0")));
+        for other in ["https://pypi.org/search/?q=six", "https://pypi.org/project/six/1.16.0/x/", "https://pypi.org/user/x/"] {
+            assert_eq!(repo(other), None, "{other}");
+        }
+        let link = Url::parse("https://pypi.org/project/six/").unwrap();
+        assert!(lists(&link) && !handles(&link));
+    }
+
     /// GitLab (gitlab.com and self-hosted), Bitbucket and Gitea links are told by their shape; a
     /// repository is its default branch's zip, with no request made.
     #[tokio::test]
@@ -1429,6 +1538,17 @@ mod tests {
         assert_eq!(globe.checksum.as_deref(), Some("sha1:3e20a009994405f535cdf07cdc2974cef2fce8f2"));
         assert_eq!(globe.size, Some(66065));
         assert!(tasks.iter().all(|t| !t.name.as_ref().unwrap().to_string_lossy().contains("thumb") && t.name != Some("nasa_meta.xml".into())), "{tasks:?}");
+    }
+
+    /// Live: a PyPI release lists its wheel and source files with their SHA-256.
+    #[tokio::test]
+    #[ignore]
+    async fn live_pypi() {
+        let tasks = live("https://pypi.org/project/six/1.16.0/").await.unwrap();
+        let wheel = tasks.iter().find(|t| t.name == Some("six-1.16.0-py2.py3-none-any.whl".into())).unwrap();
+        assert_eq!(wheel.checksum.as_deref(), Some("sha256:8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254"));
+        assert_eq!((tasks.len(), wheel.size), (2, Some(11053)));
+        assert!(!live("https://pypi.org/project/six/").await.unwrap().is_empty());
     }
 
     /// Live: a GitLab folder lists its files, and its latest release its asset links.

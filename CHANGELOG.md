@@ -4,6 +4,7 @@ What changed in each release, newest first. Each release's page on [GitHub](http
 
 ## Unreleased
 
+- **Autopilot for connections.** Each download finds its own number of connections as it goes: more while they make it faster (twice as many while each one added keeps its speed), and the fewest that reach what the server or your line allows when more do not help, never past what a server that refuses more (429/503) serves at once. A download starts with at most 8 unless the server caps each connection or downloads from it were fastest with more, so a server that serves few well is not hit with 64 at once. A connection slowing down before a stall now makes way for a new one even with fewer than four running. The download's page says why it has the connections it has (Autopilot), as does `-v` in the CLI; the setting is called Autopilot. `hosts.json` also keeps the speed a site held downloads to, and your line's top speed.
 - **App: find things faster.** Settings has a search box and starts with the common settings (All settings shows the rest); the Queue's list is narrowed by text in a name or link and by status (Running, Waiting, Failed, Done).
 - **App: Undo.** Removing a download, Clear completed and Clear all offer Undo for 8 seconds, in a note at the bottom of the window.
 - **App: a first-run welcome** on the Add page with the three steps to a first download, a list of the keyboard shortcuts (F1, or Shortcuts in the sidebar), and empty pages that say what to do.
@@ -12,6 +13,7 @@ What changed in each release, newest first. Each release's page on [GitHub](http
 - **Internet Archive items:** an `archive.org/details/<item>` or `/download/<item>` link (or a folder of it, `/download/<item>/<folder>/`) adds one download per file uploaded to the item, with archive.org's size and SHA-1 to check it, leaving out the copies and records archive.org makes.
 - **GitLab, Bitbucket, Codeberg, Gitea and Forgejo:** a repository link downloads its default branch as a zip, a folder link adds one download per file (subfolders kept), and a release (or Bitbucket's Downloads) one per asset, as GitHub's do; self-hosted GitLab, Gitea and Forgejo are recognised by their links' paths, and their "view file" links download the file.
 - **Nextcloud and ownCloud shares:** a public share link (`/s/<token>`, `/index.php/s/<token>`) on any server that runs one adds one download per file of a shared folder (subfolders kept, with the server's SHA-1 or MD5 where it keeps one), or the shared file; a share with a password opens with it in the link, `https://TOKEN:PASSWORD@host/s/TOKEN`.
+- **PyPI:** a project link (`pypi.org/project/<name>/`) adds its latest release's files, and a release link (`/project/<name>/<version>/`) that release's, each with its size and SHA-256; they downloaded the project's web page before.
 - Fixed: a progress bar's fill went square when short and the light sweeping over it was cut to a rectangle; both now follow the bar's round ends.
 
 ## 1.9.0 (2026-10-30)
