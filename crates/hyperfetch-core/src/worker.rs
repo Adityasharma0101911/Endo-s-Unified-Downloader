@@ -1,5 +1,5 @@
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 use bytes::Bytes;
 use futures_util::stream::BoxStream;
@@ -99,34 +99,156 @@ impl Batch {
 
 /// Download-wide bandwidth cap shared by every connection. Each caller reserves the next time
 /// slot for its bytes (the GCRA form of a token bucket), so callers are served in order and
-/// waiting is a single timer, not polling.
+/// waiting is a single timer, not polling. Downloads that share one limit each take a share of it
+/// (see [`RateLimiter::share`]).
 #[derive(Debug)]
 pub struct RateLimiter {
     bytes_per_sec: f64,
     /// Idle credit a caller may use immediately.
     burst: Duration,
     next_free: Mutex<Instant>,
+    /// The limit this is a share of, and the share's weight there.
+    whole: Option<(Arc<RateLimiter>, u32)>,
+    /// The share's download is nearly done: its weight is one more.
+    nearly_done: AtomicBool,
+    /// What the share's callers asked for and what it paid for of that.
+    owed: Mutex<Owed>,
+    /// What the share took lately: since when, how much since, and the speed of the window before.
+    used: Mutex<(Instant, u64, f64)>,
+    /// The shares of this limit.
+    shares: Mutex<Vec<Weak<RateLimiter>>>,
+}
+
+/// How long a share's speed is measured over.
+const SHARE_WINDOW: Duration = Duration::from_millis(500);
+/// Longest a caller waits on its share before it looks again at what the share is now.
+const SHARE_LOOK: Duration = Duration::from_millis(100);
+
+/// Bytes a share's callers asked for and those paid for so far, paid at `rate` since `at`.
+#[derive(Debug)]
+struct Owed {
+    asked: f64,
+    paid: f64,
+    at: Instant,
+    rate: f64,
+}
+
+impl Owed {
+    /// Whether some of what was asked is not paid for at `now`.
+    fn short(&self, now: Instant) -> bool {
+        self.asked > self.paid + self.rate * now.saturating_duration_since(self.at).as_secs_f64()
+    }
+
+    /// Pays from now on at `rate`, keeping at most `burst` of credit.
+    fn pay_at(&mut self, rate: f64, now: Instant, burst: Duration) {
+        let paid = self.paid + self.rate * now.duration_since(self.at).as_secs_f64();
+        (self.paid, self.at, self.rate) = (paid.min(self.asked + rate * burst.as_secs_f64()), now, rate);
+    }
 }
 
 impl RateLimiter {
     pub fn new(bytes_per_sec: u64) -> Self {
+        let now = Instant::now();
         Self {
             bytes_per_sec: bytes_per_sec.max(1) as f64,
             burst: Duration::from_millis(100),
-            next_free: Mutex::new(Instant::now()),
+            // With all the idle credit it may have: a limit the shares start on at once must not
+            // serve them first come first served for want of it.
+            next_free: Mutex::new(now.checked_sub(2 * SHARE_WINDOW).unwrap_or(now)),
+            whole: None,
+            nearly_done: AtomicBool::new(false),
+            owed: Mutex::new(Owed { asked: 0.0, paid: 0.0, at: Instant::now(), rate: 0.0 }),
+            used: Mutex::new((Instant::now(), 0, 0.0)),
+            shares: Mutex::default(),
         }
+    }
+
+    /// A download's share of `whole`: the shares held back by it split what the others leave of
+    /// it by their weights (a High download's is 4, a Normal's 2, a Low's 1), so a share that
+    /// takes less leaves the rest to them, and `whole` still holds them all to its speed.
+    pub fn share(whole: &Arc<RateLimiter>, weight: u32) -> Arc<RateLimiter> {
+        let share = Arc::new(Self { whole: Some((Arc::clone(whole), weight.max(1))), ..Self::new(whole.bytes_per_sec as u64) });
+        let mut shares = whole.shares.lock();
+        shares.retain(|s| s.strong_count() > 0);
+        shares.push(Arc::downgrade(&share));
+        share
+    }
+
+    /// A share's download is nearly done (or no longer): it gets a little more of the limit.
+    pub(crate) fn nearly_done(&self, yes: bool) {
+        self.nearly_done.store(yes, Ordering::Relaxed);
+    }
+
+    fn weight(&self) -> u32 {
+        self.whole.as_ref().map_or(1, |(_, weight)| *weight) + self.nearly_done.load(Ordering::Relaxed) as u32
+    }
+
+    /// The speed of a share, given the others: the weights of those held back by theirs (waiting
+    /// on it now, or taking about all of it), and what the others take.
+    fn share_rate(&self, whole: &RateLimiter, now: Instant) -> f64 {
+        let (mut held, mut free) = (self.weight(), 0.0);
+        for other in whole.shares.lock().iter().filter_map(Weak::upgrade).filter(|s| !std::ptr::eq(Arc::as_ptr(s), self)) {
+            let (since, _, took) = *other.used.lock();
+            if now.saturating_duration_since(since) >= 2 * SHARE_WINDOW {
+                continue;
+            }
+            let owed = other.owed.lock();
+            if owed.short(now) || took >= 0.8 * owed.rate {
+                held += other.weight();
+            } else {
+                free += took;
+            }
+        }
+        // Never starved outright: a share's speed is measured late.
+        (whole.bytes_per_sec - free).max(whole.bytes_per_sec / 20.0) * self.weight() as f64 / held as f64
+    }
+
+    /// The end of the next time slot for `bytes`, reserved, with at most `burst` of idle credit.
+    fn reserve(&self, bytes: u64, burst: Duration) -> Instant {
+        let now = Instant::now();
+        let mut next = self.next_free.lock();
+        let floor = now.checked_sub(burst).unwrap_or(now);
+        *next = (*next).max(floor) + Duration::from_secs_f64(bytes as f64 / self.bytes_per_sec);
+        *next
     }
 
     /// Waits until `bytes` more may be consumed without exceeding the rate.
     pub async fn acquire(&self, bytes: u64) {
-        let ready_at = {
-            let now = Instant::now();
-            let mut next = self.next_free.lock();
-            let floor = now.checked_sub(self.burst).unwrap_or(now);
-            *next = (*next).max(floor) + Duration::from_secs_f64(bytes as f64 / self.bytes_per_sec);
-            *next
+        let Some((whole, _)) = &self.whole else {
+            return tokio::time::sleep_until(self.reserve(bytes, self.burst).into()).await;
         };
-        tokio::time::sleep_until(ready_at.into()).await;
+        // A share pays for what it asked at its share's speed as that changes, not at the one it
+        // had when asked: what a Low download asked for is paid sooner once a High one is done.
+        let asked = {
+            let mut owed = self.owed.lock();
+            owed.asked += bytes as f64;
+            owed.asked
+        };
+        loop {
+            let now = Instant::now();
+            let rate = self.share_rate(whole, now);
+            let short = {
+                let mut owed = self.owed.lock();
+                owed.pay_at(rate, now, self.burst);
+                asked - owed.paid
+            };
+            if short <= 0.0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs_f64(short / rate).min(SHARE_LOOK)).await;
+        }
+        let now = Instant::now();
+        {
+            let mut used = self.used.lock();
+            used.1 += bytes;
+            let took = now.duration_since(used.0);
+            if took >= SHARE_WINDOW {
+                *used = (now, 0, used.1 as f64 / took.as_secs_f64());
+            }
+        }
+        // The shares together keep to the whole limit, which only catches their swings: held to
+        // it closely, it would serve them first come first served.
+        tokio::time::sleep_until(whole.reserve(bytes, 2 * SHARE_WINDOW).into()).await;
     }
 }
 
@@ -1608,6 +1730,50 @@ mod tests {
         let elapsed = started.elapsed();
         assert!(elapsed >= Duration::from_millis(850), "{elapsed:?}");
         assert!(elapsed < Duration::from_millis(2000), "{elapsed:?}");
+    }
+
+    /// Two shares of a 1 MB/s limit, four connections each, for a second: while both want more
+    /// they split it by weight, and one that takes less than its part leaves the rest to the other;
+    /// together they keep to the limit.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_shares_of_a_limit_split_it_by_weight() {
+        // What each share got; the first takes 50 KB every `pace` if given, else all it may.
+        async fn run(weights: (u32, u32), pace: Option<Duration>) -> (u64, u64) {
+            let whole = Arc::new(RateLimiter::new(1_000_000));
+            let until = Instant::now() + Duration::from_secs(1);
+            let take = |share: Arc<RateLimiter>, pace: Option<Duration>| {
+                tokio::spawn(async move {
+                    let mut got = 0;
+                    while Instant::now() < until {
+                        share.acquire(50_000).await;
+                        got += if Instant::now() <= until { 50_000 } else { 0 };
+                        if let Some(pace) = pace {
+                            tokio::time::sleep(pace).await;
+                        }
+                    }
+                    got
+                })
+            };
+            let (a, b) = (RateLimiter::share(&whole, weights.0), RateLimiter::share(&whole, weights.1));
+            let a: Vec<_> = (0..if pace.is_some() { 1 } else { 4 }).map(|_| take(Arc::clone(&a), pace)).collect();
+            let b: Vec<_> = (0..4).map(|_| take(Arc::clone(&b), None)).collect();
+            let mut got = (0, 0);
+            for task in a {
+                got.0 += task.await.unwrap();
+            }
+            for task in b {
+                got.1 += task.await.unwrap();
+            }
+            got
+        }
+        // First come first served, four connections each would get about as much.
+        let (high, low) = run((4, 1), None).await;
+        assert!(high > 2 * low, "{high} {low}");
+        assert!(high + low < 1_200_000, "{high} {low}");
+        // Held to its weight, the Low share would get 200 KB.
+        let (high, low) = run((4, 1), Some(Duration::from_millis(250))).await;
+        assert!(low > 450_000, "{high} {low}");
+        assert!(high >= 100_000 && high + low < 1_200_000, "{high} {low}");
     }
 
     /// A route is dropped for a failed connection only once another route reached that server:

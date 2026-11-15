@@ -45,7 +45,8 @@ impl QueueItemStatus {
 }
 
 /// Which waiting downloads start first: High before Normal, Normal before Low, and within one the
-/// queue's order. It decides only when they start, not how they share the speed.
+/// queue's order; and, under a speed limit, how much of it each running download gets (see
+/// `DownloadOptions::priority`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Priority {
     High,
