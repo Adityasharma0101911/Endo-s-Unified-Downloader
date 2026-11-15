@@ -1056,7 +1056,7 @@ mod tests {
             ("https://vimeo.com/123", "media"),
             ("https://mega.nz/file/abcdefgh#0123456789abcdefghijklmnopqrstuvwxyzABCDEFG", "files"),
             ("https://www.mediafire.com/file/abc123/setup.zip/file", "files"),
-            ("https://github.com/owner/repo/releases", "files"),
+            ("https://github.com/owner/repo/releases/latest", "files"),
             ("https://news.example/article", "none"),
         ] {
             let body = json!({ "url": url }).to_string();
@@ -1468,7 +1468,7 @@ mod tests {
         assert_eq!(add(json!({"urls": many})).unwrap_err(), "urls takes at most 1000 links");
         assert_eq!(add(json!({"urls": &many[..MAX_BATCH]})).unwrap().batch().len(), MAX_BATCH);
         for bad in [json!(["https://a.example/1", "ftp://a.example/2"]), json!(["javascript:alert(1)"]), json!([""])] {
-            assert_eq!(add(json!({"urls": bad})).unwrap_err(), "every link of urls must be http or https");
+            assert_eq!(add(json!({"urls": bad})).unwrap_err(), "every link of urls must be http or https, or a magnet link");
         }
         assert_eq!(add(json!({"url": "https://a.example/1", "urls": ["https://a.example/2"]})).unwrap_err(), "send url or urls, not both");
         assert_eq!(add(json!({"urls": []})).unwrap_err(), "url must be an http or https link");
