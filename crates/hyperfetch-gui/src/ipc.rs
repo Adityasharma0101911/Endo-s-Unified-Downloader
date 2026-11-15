@@ -3,9 +3,11 @@
 //! what a media link holds (see `media::info`), and the `/record/…` routes take the video the
 //! extension records from a page (see `recording`). `POST /show` shows the window: a second
 //! launch asks it (see [`running_instance`]). `POST /expired` lists the downloads whose link
-//! expired, and `POST /relink` gives one a new link the extension found (see [`Expired`]). Every
-//! route answers only the extension and local programs, which send no web `Origin`; web pages get
-//! 403.
+//! expired, and `POST /relink` gives one a new link the extension found (see [`Expired`]).
+//! `POST /handles` says what the app makes of a page by its link (see [`page_kind`]), and `POST
+//! /queue` lists the queue for the extension's popup, `POST /queue/<id>/<action>` pausing, resuming
+//! or removing one (see [`Listed`]). Every route answers only the extension and local programs,
+//! which send no web `Origin`; web pages get 403.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -14,8 +16,8 @@ use std::time::Duration;
 
 use eframe::egui;
 use hyperfetch_core::engine::DownloadOptions;
-use hyperfetch_core::queue::DownloadQueue;
-use hyperfetch_core::{engine, media, updater};
+use hyperfetch_core::queue::{DownloadQueue, QueueItemStatus};
+use hyperfetch_core::{engine, media, torrent, updater};
 use serde_json::json;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -284,6 +286,12 @@ fn http_link(text: &str) -> bool {
     Url::parse(text.trim()).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
 }
 
+/// Whether `text` is a link `/add` takes: an http(s) one, or a magnet link the extension's
+/// context menu or link grabber sends (read as one pasted is).
+fn add_link(text: &str) -> bool {
+    http_link(text) || torrent::parse_magnet_uri(text).is_ok()
+}
+
 /// A Netscape cookies file holding the cookies of `jar` (the first [`MAX_JAR_COOKIES`] usable
 /// ones): each for its domain and its subdomains, or for its host alone when it is host-only,
 /// HttpOnly ones marked so. One without a domain or name, or with a field a tab or line break
@@ -517,6 +525,20 @@ impl Server {
                 }
                 Err(e) => Response::error("400 Bad Request", allow_origin.clone(), &e),
             },
+            ("POST", "/handles") => match parse_info(&body) {
+                Ok((url, _)) => reply("200 OK", json!({"kind": page_kind(&url)})),
+                Err(e) => Response::error("400 Bad Request", allow_origin.clone(), &e),
+            },
+            // POST, as `/expired`: no web page can read the list.
+            ("POST", "/queue") => reply("200 OK", json!({"downloads": lock(&QUEUE).clone()})),
+            ("POST", path) if path.starts_with("/queue/") => {
+                let listed = queue_route(path).filter(|(id, _)| lock(&QUEUE).iter().any(|item| item.id == *id));
+                let Some((id, action)) = listed else {
+                    return Response::error("404 Not Found", allow_origin.clone(), "no such download, or no such action");
+                };
+                self.send(AppEvent::Queue { id, action });
+                reply("200 OK", json!({"status": "asked"}))
+            }
             ("POST", "/record/start") => {
                 #[derive(Default, serde::Deserialize)]
                 #[serde(default)]
@@ -621,6 +643,86 @@ async fn check_link(_: Option<PathBuf>, size: u64, url: Url, _: DownloadOptions)
     }
 }
 
+/// What the app makes of a page by its link's shape alone, nothing fetched (`POST /handles`, asked
+/// when the extension's popup opens): "media" for a site its video engine takes, "files" for a
+/// file host's, share's, cloud folder's, repository's or gallery's page whose files it finds, else
+/// "none".
+fn page_kind(url: &Url) -> &'static str {
+    use hyperfetch_core::{cloud, folders, gallery, mega, repos, resolver::SmartResolver, shares};
+    if media::is_supported_media_site(url) {
+        "media"
+    } else if SmartResolver::handles(url)
+        || gallery::handles(url)
+        || folders::lists(url)
+        || mega::lists(url)
+        || shares::lists(url)
+        || cloud::lists(url)
+        || repos::lists(url)
+    {
+        "files"
+    } else {
+        "none"
+    }
+}
+
+/// What the extension's popup may ask of a download of the queue (`POST /queue/<id>/<action>`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueAction {
+    Pause,
+    Resume,
+    /// Off the list, its files kept, as the queue's Remove does; not a running one.
+    Remove,
+}
+
+/// `/queue/<id>/<action>` as its download's id and action.
+fn queue_route(path: &str) -> Option<(usize, QueueAction)> {
+    let (id, action) = path.strip_prefix("/queue/")?.split_once('/')?;
+    let action = match action {
+        "pause" => QueueAction::Pause,
+        "resume" => QueueAction::Resume,
+        "remove" => QueueAction::Remove,
+        _ => return None,
+    };
+    Some((id.parse().ok()?, action))
+}
+
+/// A download of the queue as `POST /queue` lists it for the extension's popup: what the queue's
+/// row shows, no link or option.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Listed {
+    id: usize,
+    name: String,
+    /// queued, downloading, pausing, paused, done, failed or auth (waits for its Authorization).
+    status: &'static str,
+    done: u64,
+    total: u64,
+    speed: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+/// The newest [`MAX_LISTED`] downloads of the queue as the UI thread last had them (see [`set_queue`]).
+static QUEUE: Mutex<Vec<Listed>> = Mutex::new(Vec::new());
+const MAX_LISTED: usize = 100;
+
+/// Keeps the downloads of `queue` as they are now, newest first, for `/queue`.
+pub fn set_queue(queue: &DownloadQueue) {
+    let listed = queue.items().iter().rev().take(MAX_LISTED).map(|item| {
+        let (status, error) = match &item.status {
+            QueueItemStatus::Queued => ("queued", None),
+            QueueItemStatus::Downloading => ("downloading", None),
+            QueueItemStatus::Pausing => ("pausing", None),
+            QueueItemStatus::Paused => ("paused", None),
+            QueueItemStatus::Completed => ("done", None),
+            QueueItemStatus::Failed(why) => ("failed", Some(why.chars().take(300).collect())),
+            QueueItemStatus::AuthRequired => ("auth", None),
+        };
+        let speed = if item.status == QueueItemStatus::Downloading { item.speed_bytes_per_sec } else { 0.0 };
+        Listed { id: item.id, name: item.filename.clone(), status, done: item.downloaded_bytes, total: item.total_bytes, speed, error }
+    });
+    *lock(&QUEUE) = listed.collect();
+}
+
 /// The proxy setting, which `/info` asks yt-dlp through (see [`set_proxy`]).
 static PROXY: Mutex<Option<String>> = Mutex::new(None);
 
@@ -665,13 +767,13 @@ fn parse_add(body: &[u8]) -> Result<RemoteAddPayload, String> {
     }
     payload.media.as_ref().map_or(Ok(()), MediaChoice::check)?;
     let refused = if payload.urls.is_empty() {
-        (!http_link(&payload.url)).then(|| "url must be an http or https link".to_string())
+        (!add_link(&payload.url)).then(|| "url must be an http or https link, or a magnet link".to_string())
     } else if !payload.url.trim().is_empty() {
         Some("send url or urls, not both".to_string())
     } else if payload.urls.len() > MAX_BATCH {
         Some(format!("urls takes at most {} links", MAX_BATCH))
     } else {
-        (!payload.urls.iter().all(|url| http_link(url))).then(|| "every link of urls must be http or https".to_string())
+        (!payload.urls.iter().all(|url| add_link(url))).then(|| "every link of urls must be http or https, or a magnet link".to_string())
     };
     refused.map_or(Ok(payload), Err)
 }
@@ -942,6 +1044,67 @@ mod tests {
         assert!(!response.contains("Access-Control"), "{response}");
     }
 
+    /// `/handles` tells a media site's page, a file host's, and any other by the link alone; a web
+    /// page cannot ask.
+    #[tokio::test]
+    async fn handles_says_what_the_app_makes_of_a_page() {
+        let root = tempfile::tempdir().unwrap();
+        let (server, _) = server(root.path());
+        let ext = Some("chrome-extension://abc");
+        for (url, kind) in [
+            ("https://www.youtube.com/watch?v=abc", "media"),
+            ("https://vimeo.com/123", "media"),
+            ("https://mega.nz/file/abcdefgh#0123456789abcdefghijklmnopqrstuvwxyzABCDEFG", "files"),
+            ("https://www.mediafire.com/file/abc123/setup.zip/file", "files"),
+            ("https://github.com/owner/repo/releases", "files"),
+            ("https://news.example/article", "none"),
+        ] {
+            let body = json!({ "url": url }).to_string();
+            let response = exchange(&server, &request("POST", "/handles", ext, Some(body.as_bytes()))).await;
+            assert_eq!(parts(&response), ("HTTP/1.1 200 OK", json!({ "kind": kind })), "{url}");
+        }
+        let response = exchange(&server, &request("POST", "/handles", ext, Some(br#"{"url":"file:///etc/passwd"}"#))).await;
+        assert_eq!(parts(&response).0, "HTTP/1.1 400 Bad Request");
+        let body = br#"{"url":"https://vimeo.com/123"}"#;
+        assert_eq!(parts(&exchange(&server, &request("POST", "/handles", Some("https://page.example"), Some(body))).await).0, "HTTP/1.1 403 Forbidden");
+    }
+
+    /// `/queue` lists the queue as the UI last had it, without links; an action on a download it
+    /// lists goes to the UI, one on another is refused. A web page can do neither.
+    #[tokio::test]
+    async fn the_queue_is_listed_and_paused_for_the_extension() {
+        let root = tempfile::tempdir().unwrap();
+        let (server, received) = server(root.path());
+        let ext = Some("moz-extension://abc");
+        let mut queue = DownloadQueue::new();
+        let a = queue.add_item(vec![Url::parse("https://h.example/a.iso?token=secret").unwrap()], DownloadOptions::default());
+        let b = queue.add_item(vec![Url::parse("https://h.example/b.zip").unwrap()], DownloadOptions::default());
+        queue.get_item_mut(b).unwrap().status = QueueItemStatus::Failed("HTTP 404".to_string());
+        set_queue(&queue);
+        let response = exchange(&server, &request("POST", "/queue", ext, Some(b""))).await;
+        let (status, body) = parts(&response);
+        assert_eq!(status, "HTTP/1.1 200 OK");
+        let listed = body["downloads"].as_array().unwrap();
+        assert_eq!(listed.iter().map(|d| d["id"].as_u64().unwrap() as usize).collect::<Vec<_>>(), [b, a], "newest first");
+        assert_eq!((listed[0]["status"].as_str(), listed[0]["error"].as_str()), (Some("failed"), Some("HTTP 404")));
+        assert_eq!(listed[1]["status"], "queued");
+        assert!(!response.contains("token=secret"), "no link: {response}");
+
+        let response = exchange(&server, &request("POST", &format!("/queue/{a}/pause"), ext, Some(b""))).await;
+        assert_eq!(parts(&response).0, "HTTP/1.1 200 OK");
+        let Ok(AppEvent::Queue { id, action }) = received.try_recv() else { panic!("the action reaches the app") };
+        assert_eq!((id, action), (a, QueueAction::Pause));
+        for path in [format!("/queue/{a}/delete"), "/queue/99999/resume".to_string(), "/queue/x/pause".to_string()] {
+            assert_eq!(parts(&exchange(&server, &request("POST", &path, ext, Some(b""))).await).0, "HTTP/1.1 404 Not Found", "{path}");
+        }
+        assert!(received.try_recv().is_err());
+        for path in ["/queue".to_string(), format!("/queue/{a}/remove")] {
+            let response = exchange(&server, &request("POST", &path, Some("https://page.example"), Some(b""))).await;
+            assert_eq!(parts(&response).0, "HTTP/1.1 403 Forbidden", "{path}");
+        }
+        assert_eq!(parts(&exchange(&server, &request("GET", "/queue", ext, None)).await).0, "HTTP/1.1 404 Not Found", "POST only");
+    }
+
     /// A second launch finds the app running with the same data folder and asks it to show its
     /// window; one with another data folder, or another program on the port, is not it. A web
     /// page cannot show the window.
@@ -1009,6 +1172,19 @@ mod tests {
         let body = br#"{"url":"https://www.youtube.com/watch?v=x","media":{"quality":"8k"}}"#;
         assert_eq!(parts(&exchange(&server, &request("POST", "/add", page, Some(body))).await).0, "HTTP/1.1 400 Bad Request");
         assert!(received.try_recv().is_err());
+
+        // A magnet link the context menu sends, alone or in a batch; one with no hash is not one.
+        let magnet = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=ubuntu.iso";
+        let body = json!({ "url": magnet }).to_string();
+        assert_eq!(parts(&exchange(&server, &request("POST", "/add", page, Some(body.as_bytes()))).await).0, "HTTP/1.1 200 OK");
+        assert!(matches!(received.try_recv(), Ok(AppEvent::RemoteAdd(payload)) if payload.url == magnet));
+        let body = json!({ "urls": ["https://h.example/a.zip", magnet] }).to_string();
+        assert_eq!(parts(&exchange(&server, &request("POST", "/add", page, Some(body.as_bytes()))).await).0, "HTTP/1.1 200 OK");
+        assert!(matches!(received.try_recv(), Ok(AppEvent::RemoteAdd(payload)) if payload.batch().len() == 2));
+        for url in ["magnet:?dn=no-hash", "javascript:alert(1)"] {
+            let body = json!({ "url": url }).to_string();
+            assert_eq!(parts(&exchange(&server, &request("POST", "/add", page, Some(body.as_bytes()))).await).0, "HTTP/1.1 400 Bad Request", "{url}");
+        }
     }
 
     /// `/info` takes an http(s) link from the extension alone, in a body of at most 256 KiB, and

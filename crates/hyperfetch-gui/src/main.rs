@@ -158,6 +158,8 @@ enum AppEvent {
     FfmpegFound(bool),
     /// A download the browser extension sent to `POST /add`.
     RemoteAdd(ipc::RemoteAddPayload),
+    /// What the extension's popup asked of download `id` (`POST /queue/<id>/<action>`).
+    Queue { id: usize, action: ipc::QueueAction },
     /// A recording the browser extension finished, to be joined into the save folder.
     Recorded(recording::Finished),
     /// The notice saying where a recording was saved, or why it could not be joined.
@@ -1709,6 +1711,17 @@ impl App {
                 }
             }
             AppEvent::Tray(action) => self.tray_action(action),
+            // As the queue's row buttons do.
+            AppEvent::Queue { id, action } => match action {
+                ipc::QueueAction::Pause => self.pause_job(id),
+                ipc::QueueAction::Resume if self.queue.get_item(id).is_some_and(|item| !item.status.is_active()) => {
+                    self.start_job(id, false);
+                }
+                ipc::QueueAction::Resume => {}
+                ipc::QueueAction::Remove => {
+                    self.remove_job(id);
+                }
+            },
             // Only for the link still asked about.
             AppEvent::ZipListed { link, result } => {
                 if let Some((_, listed)) = self.zip_preview.as_mut().filter(|(asked, _)| *asked == link) {
@@ -2178,6 +2191,7 @@ impl eframe::App for App {
 
         ui::render(self, ctx);
         ipc::set_proxy(&self.settings.proxy);
+        ipc::set_queue(&self.queue);
 
         if let Some(dialog) = self.pending_dialog.take() {
             self.open_dialog(dialog, frame);
