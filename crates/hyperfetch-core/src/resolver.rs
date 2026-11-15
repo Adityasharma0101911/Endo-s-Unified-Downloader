@@ -370,13 +370,7 @@ impl AnnaArchiveResolver {
 
     /// Constructs high-speed public IPFS CDN gateway URLs for racing from a CID.
     pub fn construct_gateway_urls(cid: &str) -> Vec<Url> {
-        let gateways = [
-            format!("https://cloudflare-ipfs.com/ipfs/{}", cid),
-            format!("https://ipfs.io/ipfs/{}", cid),
-            format!("https://gateway.pinata.cloud/ipfs/{}", cid),
-            format!("https://dweb.link/ipfs/{}", cid),
-        ];
-        gateways.into_iter().filter_map(|s| Url::parse(&s).ok()).collect()
+        IPFS_GATEWAYS.iter().filter_map(|gateway| Url::parse(&format!("{gateway}/ipfs/{cid}")).ok()).collect()
     }
 
     /// Extracts external mirrors (LibGen, Z-Lib, Archive.org) from book HTML.
@@ -489,6 +483,72 @@ pub fn is_valid_ipfs_cid(cid: &str) -> bool {
         return cid.chars().all(|c| c.is_ascii_alphanumeric());
     }
     false
+}
+
+/// Public IPFS gateways an IPFS link downloads from, as mirrors of one another (cloudflare-ipfs.com
+/// closed in 2024).
+const IPFS_GATEWAYS: &[&str] = &["https://ipfs.io", "https://dweb.link", "https://gateway.pinata.cloud", "https://ipfs.filebase.io", "https://4everland.io"];
+
+/// The CID an IPFS link names and the (percent-encoded) path after it: `ipfs://<cid>/<path>`, a
+/// gateway's `/ipfs/<cid>/<path>` on any host, or a subdomain gateway's `<cid>.ipfs.<host>/<path>`.
+fn ipfs_parts(url: &Url) -> Option<(String, String)> {
+    let (cid, rest) = match url.scheme() {
+        "ipfs" => (url.host_str()?, url.path()),
+        "http" | "https" => match url.host_str()?.split_once(".ipfs.") {
+            Some((cid, _)) => (cid, url.path()),
+            None => {
+                let after = url.path().strip_prefix("/ipfs/")?;
+                after.find('/').map_or((after, ""), |at| after.split_at(at))
+            }
+        },
+        _ => return None,
+    };
+    is_valid_ipfs_cid(cid).then(|| (cid.to_string(), if rest == "/" { String::new() } else { rest.to_string() }))
+}
+
+/// An IPFS link on each of [`IPFS_GATEWAYS`], after the link itself when it is a gateway's: all
+/// serve the same bytes, as a CID names them.
+pub fn ipfs_mirrors(url: &Url) -> Option<Vec<Url>> {
+    let (cid, rest) = ipfs_parts(url)?;
+    let query = url.query().map(|q| format!("?{q}")).unwrap_or_default();
+    let mut mirrors: Vec<Url> = matches!(url.scheme(), "http" | "https").then(|| url.clone()).into_iter().collect();
+    for gateway in IPFS_GATEWAYS {
+        let mirror = Url::parse(&format!("{gateway}/ipfs/{cid}{rest}{query}")).ok()?;
+        if mirror.host_str() != url.host_str() {
+            mirrors.push(mirror);
+        }
+    }
+    Some(mirrors)
+}
+
+/// `sha256:<hex>` of the file an IPFS link names when its CID is that file's own SHA-256: a CIDv1
+/// of raw bytes (`bafkrei...`) with no path after it. Other CIDs hash a tree of blocks, not the file.
+pub fn ipfs_checksum(url: &Url) -> Option<String> {
+    let (cid, rest) = ipfs_parts(url)?;
+    if !rest.is_empty() {
+        return None;
+    }
+    // Multibase `b`: RFC 4648 base32, lowercase, unpadded.
+    let (mut bytes, mut acc, mut bits) = (Vec::new(), 0u32, 0u32);
+    for c in cid.strip_prefix('b')?.bytes() {
+        let value = match c {
+            b'a'..=b'z' => c - b'a',
+            b'2'..=b'7' => c - b'2' + 26,
+            _ => return None,
+        };
+        acc = (acc << 5) | u32::from(value);
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            bytes.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    // CID version 1, codec raw (0x55), multihash sha2-256 (0x12) of 32 bytes.
+    match bytes.as_slice() {
+        [0x01, 0x55, 0x12, 0x20, digest @ ..] if digest.len() == 32 => Some(crate::digest::checksum("sha256", digest)),
+        _ => None,
+    }
 }
 
 /// Helper to retrieve session cookies and browser User-Agent for a target domain.
@@ -1445,6 +1505,10 @@ impl SmartResolver {
             return tokio::time::timeout(timeout, AnnaArchiveResolver.resolve(client, url))
                 .await
                 .unwrap_or(Err(ResolverError::Timeout(timeout.as_secs())));
+        }
+
+        if let Some(mirrors) = ipfs_mirrors(url) {
+            return Ok(mirrors);
         }
 
         // These only add mirrors or find an embedded stream; the input URL remains a valid source.
@@ -2945,11 +3009,59 @@ host.example.com\tFALSE\t/\tFALSE\t0\thostonly\t1
     fn test_anna_archive_construct_gateway_urls() {
         let cid = "QmXoypizjW3WknFiJnKLwHCnL72vedxjQkDDP1mXWo6uco";
         let urls = AnnaArchiveResolver::construct_gateway_urls(cid);
-        assert_eq!(urls.len(), 4);
-        assert!(urls[0].as_str().contains("cloudflare-ipfs.com"));
-        assert!(urls[1].as_str().contains("ipfs.io"));
-        assert!(urls[2].as_str().contains("pinata.cloud"));
-        assert!(urls[3].as_str().contains("dweb.link"));
+        assert_eq!(urls.len(), IPFS_GATEWAYS.len());
+        assert_eq!(urls[0].as_str(), format!("https://ipfs.io/ipfs/{cid}"));
+        assert!(urls[1].as_str().contains("dweb.link"));
+    }
+
+    /// An IPFS link (ipfs://, a gateway's /ipfs/ path, a subdomain gateway) is downloaded from the
+    /// public gateways as mirrors, its own gateway first; a raw-bytes CIDv1 is the file's SHA-256.
+    #[tokio::test]
+    async fn ipfs_links_download_from_several_gateways() {
+        let v0 = "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG";
+        let raw = "bafkreifzjut3te2nhyekklss27nh3k72ysco7y32koao5eei66wof36n5e";
+        let mirrors = |link: &str| ipfs_mirrors(&Url::parse(link).unwrap()).map(|m| m.iter().map(Url::to_string).collect::<Vec<_>>());
+        let all = |rest: &str| IPFS_GATEWAYS.iter().map(|g| format!("{g}/ipfs/{rest}")).collect::<Vec<_>>();
+        assert_eq!(mirrors(&format!("ipfs://{v0}/readme")), Some(all(&format!("{v0}/readme"))), "the CID keeps its case");
+        assert_eq!(mirrors(&format!("ipfs://{raw}?filename=a%20b.txt")), Some(all(&format!("{raw}?filename=a%20b.txt"))));
+        let own = format!("http://127.0.0.1:8080/ipfs/{v0}/My%20Dir/f.bin");
+        let mut want = vec![own.clone()];
+        want.extend(all(&format!("{v0}/My%20Dir/f.bin")));
+        assert_eq!(mirrors(&own), Some(want));
+        let listed = mirrors(&format!("https://dweb.link/ipfs/{raw}")).unwrap();
+        assert_eq!(listed.len(), IPFS_GATEWAYS.len(), "its own gateway once: {listed:?}");
+        assert_eq!(mirrors(&format!("https://{raw}.ipfs.w3s.link/")).unwrap()[1], format!("https://ipfs.io/ipfs/{raw}"));
+        for other in ["https://example.com/ipfs/notacid", "https://example.com/files/QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG", "ipns://example.com/x"] {
+            assert_eq!(mirrors(other), None, "{other}");
+        }
+        let resolved = SmartResolver::resolve(&Client::new(), &Url::parse(&format!("ipfs://{v0}")).unwrap()).await.unwrap();
+        assert_eq!(resolved.len(), IPFS_GATEWAYS.len());
+        // `raw` is "hello world" as a raw CIDv1.
+        let sum = "sha256:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+        assert_eq!(ipfs_checksum(&Url::parse(&format!("ipfs://{raw}")).unwrap()).as_deref(), Some(sum));
+        assert_eq!(ipfs_checksum(&Url::parse(&format!("https://{raw}.ipfs.dweb.link/")).unwrap()).as_deref(), Some(sum));
+        for none in [format!("ipfs://{v0}"), format!("ipfs://{raw}/x"), "ipfs://bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi".to_string()] {
+            assert_eq!(ipfs_checksum(&Url::parse(&none).unwrap()), None, "{none}");
+        }
+    }
+
+    /// Live: the public gateways serve a raw CID's 11 bytes, which match the SHA-256 in the CID
+    /// (a gateway limiting requests or out of reach is let off, as long as two answer).
+    #[tokio::test]
+    #[ignore]
+    async fn live_ipfs_gateways_serve_what_the_cid_names() {
+        use sha2::Digest as _;
+        let link = Url::parse("ipfs://bafkreifzjut3te2nhyekklss27nh3k72ysco7y32koao5eei66wof36n5e").unwrap();
+        let want = ipfs_checksum(&link).unwrap();
+        let client = Client::builder().user_agent(APP_USER_AGENT).timeout(Duration::from_secs(30)).build().unwrap();
+        let mut matched = 0;
+        for mirror in ipfs_mirrors(&link).unwrap() {
+            let Ok(answer) = client.get(mirror.clone()).send().await.and_then(|a| a.error_for_status()) else { continue };
+            let body = answer.bytes().await.unwrap();
+            assert_eq!(crate::digest::checksum("sha256", &sha2::Sha256::digest(&body)), want, "{mirror}");
+            matched += 1;
+        }
+        assert!(matched >= 2, "only {matched} gateways answered");
     }
 
     #[test]

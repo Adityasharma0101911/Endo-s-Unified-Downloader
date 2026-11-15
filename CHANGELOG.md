@@ -16,6 +16,7 @@ What changed in each release, newest first. Each release's page on [GitHub](http
 - **PyPI:** a project link (`pypi.org/project/<name>/`) adds its latest release's files, and a release link (`/project/<name>/<version>/`) that release's, each with its size and SHA-256; they downloaded the project's web page before.
 - **npm:** a package link (`npmjs.com/package/<name>`, `/v/<version>`, scoped packages too) downloads the package's tarball, checked against its SHA-512; it downloaded the package's web page before.
 - **crates.io:** a crate link (`crates.io/crates/<name>`, `/<version>`) downloads the crate's `.crate` file with its size and SHA-256; it downloaded the site's web page before.
+- **IPFS:** an `ipfs://<cid>` link, a gateway's `/ipfs/<cid>` link or a subdomain gateway's downloads from several public gateways at once as mirrors, checked against the CID when it is the file's own SHA-256; `ipfs://` links were refused, and the gateway list no longer has cloudflare-ipfs.com, closed since 2024.
 - Fixed: a progress bar's fill went square when short and the light sweeping over it was cut to a rectangle; both now follow the bar's round ends.
 
 ## 1.9.0 (2026-10-30)

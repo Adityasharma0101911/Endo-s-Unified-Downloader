@@ -4302,8 +4302,8 @@ async fn test_anna_archive_resolution_and_fallback_racing() {
     assert_eq!(cid, Some("QmXoypizjW3WknFiJnKLwHCnL72vedxjQkDDP1mXWo6uco".to_string()));
 
     let gateways = hyperfetch_core::resolver::AnnaArchiveResolver::construct_gateway_urls(&cid.unwrap());
-    assert_eq!(gateways.len(), 4);
-    assert!(gateways.iter().any(|u| u.as_str().contains("cloudflare-ipfs.com")));
+    assert!(gateways.len() > 1);
+    assert!(gateways.iter().any(|u| u.as_str().contains("ipfs.io")));
 
     let mirrors = hyperfetch_core::resolver::AnnaArchiveResolver::extract_external_mirrors(html, &base);
     assert_eq!(mirrors.len(), 2);
