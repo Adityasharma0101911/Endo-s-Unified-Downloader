@@ -1078,11 +1078,6 @@ fn code_host_raw_url(url: &Url) -> Option<Url> {
                 (!segs[..at].contains(&"-")).then_some((at, "-/raw", 1))?
             }
         },
-        // /{owner}/{repo}/src/{branch|tag|commit}/{ref}/{path}. /media/ serves what /raw/ does,
-        // but for a Git LFS file the file itself instead of its pointer.
-        "codeberg.org" if segs.get(2) == Some(&"src") && matches!(segs.get(3), Some(&("branch" | "tag" | "commit"))) => {
-            (2, "media", 2)
-        }
         // /{owner}/{repo}/src/{ref}/{path}
         "bitbucket.org" if segs.get(2) == Some(&"src") => (2, "raw", 1),
         // [/datasets|/spaces]/{owner}/{repo}/blob/{ref}/{path}, or {repo} alone for older repos.
@@ -1092,7 +1087,11 @@ fn code_host_raw_url(url: &Url) -> Option<Url> {
             let view = |&i: &usize| matches!(segs.get(i), Some(&("blob" | "raw")));
             ([start + 2, start + 1].into_iter().find(view)?, "resolve", 1)
         }
-        _ => return None,
+        // Gitea and Forgejo (Codeberg's), on any host: /{owner}/{repo}/src/{branch|tag|commit}/{ref}/{path}.
+        // /media/ serves what /raw/ does, but for a Git LFS file the file itself instead of its pointer.
+        _ if segs.get(2) == Some(&"src") && matches!(segs.get(3), Some(&("branch" | "tag" | "commit"))) => (2, "media", 2),
+        // A self-hosted GitLab's /{namespace...}/-/blob/{ref}/{path}.
+        _ => (segs.windows(2).skip(2).position(|w| w == ["-", "blob"])? + 3, "raw", 1),
     };
     // The ref, then a path whose last segment names a file.
     if segs.len() <= at + refs + 1 || segs.last().is_none_or(|s| s.is_empty()) {
@@ -2157,6 +2156,9 @@ mod tests {
                 "https://codeberg.org/forgejo/forgejo/src/tag/v12.0.0/README.md",
                 "https://codeberg.org/forgejo/forgejo/media/tag/v12.0.0/README.md",
             ),
+            // Self-hosted Gitea, Forgejo and GitLab, told by their paths.
+            ("https://git.example.org/o/r/src/commit/0abc/dist/app.zip", "https://git.example.org/o/r/media/commit/0abc/dist/app.zip"),
+            ("https://gitlab.gnome.org/GNOME/gtk/-/blob/main/README.md", "https://gitlab.gnome.org/GNOME/gtk/-/raw/main/README.md"),
             (
                 "https://bitbucket.org/multicoreware/x265_git/src/master/COPYING?at=master",
                 "https://bitbucket.org/multicoreware/x265_git/raw/master/COPYING?at=master",

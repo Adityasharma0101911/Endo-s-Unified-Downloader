@@ -2501,9 +2501,9 @@ async fn test_a_code_host_folder_is_an_error_not_a_download() {
     let mut page = Mock::new(b"<!doctype html><title>docs at main</title>".to_vec());
     page.content_type = Some("text/html; charset=utf-8");
     let proxy = serve(Arc::new(page), "").await;
-    // A GitHub folder is listed into its files (repos.rs); as one download it says so.
+    // A GitHub or GitLab folder is listed into its files (repos.rs); as one download it says so.
     for (link, expected) in [
-        ("http://gitlab.com/links-lane/repo/-/tree/main/docs", "the link leads to a folder, not a file"),
+        ("http://gitlab.com/links-lane/repo/-/tree/main/docs", "this link lists several files"),
         ("http://github.com/links-lane/repo/tree/main/docs", "this link lists several files"),
     ] {
         let temp = tempdir().unwrap();

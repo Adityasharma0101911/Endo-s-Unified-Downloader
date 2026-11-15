@@ -1,9 +1,9 @@
-//! Code and model repositories (GitHub, Hugging Face, Civitai) and the Internet Archive: their
-//! folders, releases, models and items read into one task per file, a repository itself into its
-//! default branch's zip.
+//! Code and model repositories (GitHub, GitLab, Bitbucket, Gitea and Forgejo, Hugging Face,
+//! Civitai) and the Internet Archive: their folders, releases, models and items read into one task
+//! per file, a repository itself into its default branch's zip.
 //!
 //! The files download from the service's own host the user typed (github.com, huggingface.co,
-//! civitai.com, archive.org), so the Authorization header the user gave goes with them there and nowhere
+//! civitai.com, archive.org, the GitLab or Gitea site, bitbucket.org), so the Authorization header the user gave goes with them there and nowhere
 //! else. A listing is read with the Authorization a paste gave its link (a `ghp_`/`hf_` token, say), sent
 //! to that service's API alone, so a private or gated repository can be listed; without one it cannot.
 
@@ -31,10 +31,20 @@ const ARCHIVE: &str = "https://archive.org";
 /// tile), which it lists as the item's own.
 const ARCHIVE_OWN_FORMATS: &[&str] = &["Metadata", "JPEG Thumb", "Item Image"];
 
+const BITBUCKET: &str = "https://bitbucket.org";
+const BITBUCKET_API: &str = "https://api.bitbucket.org/2.0";
+
 /// Most path segments a GitHub ref with slashes in it (`feature/x`) is tried with.
 const MAX_REF_PARTS: usize = 4;
-/// Most pages of one Hugging Face listing (1000 files each).
+/// Most pages of one Hugging Face, GitLab, Bitbucket or Gitea listing.
 const MAX_PAGES: usize = 100;
+
+/// First path segments of gitlab.com, bitbucket.org and Gitea's sites that are their own pages,
+/// not namespaces or owners.
+const CODE_HOST_PAGES: &[&str] = &[
+    "account", "admin", "api", "assets", "blog", "dashboard", "explore", "groups", "help", "issues", "notifications",
+    "org", "product", "profile", "projects", "pulls", "repo", "search", "site", "snippets", "user", "users", "workspace",
+];
 
 /// First path segments of github.com that are its own pages, not owners.
 const GITHUB_PAGES: &[&str] = &[
@@ -70,6 +80,25 @@ enum Repo {
     Civitai { model: u64, version: Option<u64> },
     /// archive.org/details/{item}, /download/{item}, or a folder of it, /download/{item}/{path}/.
     Archive { item: String, path: Vec<String> },
+    /// A GitLab project, {namespace...}/{project} at `origin` (gitlab.com, or a host named gitlab.*).
+    GitLabRoot { origin: String, project: String },
+    /// {project}/-/tree/{ref}/{path} on any host (`/-/` is GitLab's), the ref and path in `rest`.
+    GitLabTree { origin: String, project: String, rest: Vec<String> },
+    /// {project}/-/releases/{tag}, or /-/releases/permalink/latest.
+    GitLabRelease { origin: String, project: String, tag: Option<String> },
+    /// bitbucket.org/{workspace}/{repo}
+    BitbucketRoot { owner: String, repo: String },
+    /// bitbucket.org/{workspace}/{repo}/src/{ref}[/{path}]/: a folder's link ends in a slash.
+    BitbucketTree { owner: String, repo: String, rest: Vec<String> },
+    /// bitbucket.org/{workspace}/{repo}/downloads/, the files uploaded beside the code.
+    BitbucketDownloads { owner: String, repo: String },
+    /// A Gitea or Forgejo repository, {owner}/{repo} at `origin` (codeberg.org, gitea.com, or a host
+    /// named gitea.*).
+    GiteaRoot { origin: String, owner: String, repo: String },
+    /// {owner}/{repo}/src/{branch|tag|commit}/{ref}/{path} on any host: a folder or a file.
+    GiteaSrc { origin: String, owner: String, repo: String, kind: String, rest: Vec<String> },
+    /// {owner}/{repo}/releases/latest, or /releases/tag/{tag}, on a Gitea site as above.
+    GiteaRelease { origin: String, owner: String, repo: String, tag: Option<String> },
 }
 
 fn repo_of(url: &Url) -> Option<Repo> {
@@ -125,7 +154,53 @@ fn repo_of(url: &Url) -> Option<Repo> {
             ["download", item, ref path @ ..] if url.path().ends_with('/') => Some(Repo::Archive { item: item.to_string(), path: owned(path) }),
             _ => None,
         },
-        _ => None,
+        "bitbucket.org" | "www.bitbucket.org" => {
+            let (owner, repo) = (segs.first()?.to_string(), segs.get(1)?.to_string());
+            if CODE_HOST_PAGES.contains(&owner.as_str()) {
+                return None;
+            }
+            match segs[2..] {
+                [] => Some(Repo::BitbucketRoot { owner, repo }),
+                ["src", ref rest @ ..] if rest.len() == 1 || (rest.len() > 1 && url.path().ends_with('/')) => {
+                    Some(Repo::BitbucketTree { owner, repo, rest: owned(rest) })
+                }
+                ["downloads"] => Some(Repo::BitbucketDownloads { owner, repo }),
+                _ => None,
+            }
+        }
+        host => {
+            let origin = url.origin().ascii_serialization();
+            // GitLab's pages of a project are under {project}/-/.
+            if let Some(dash) = segs.iter().position(|s| *s == "-").filter(|&at| at >= 2) {
+                let project = segs[..dash].join("/");
+                return match segs[dash + 1..] {
+                    ["tree", ref rest @ ..] if !rest.is_empty() => Some(Repo::GitLabTree { origin, project, rest: owned(rest) }),
+                    ["releases", "permalink", "latest"] => Some(Repo::GitLabRelease { origin, project, tag: None }),
+                    ["releases", tag] => Some(Repo::GitLabRelease { origin, project, tag: Some(tag.to_string()) }),
+                    _ => None,
+                };
+            }
+            if let [owner, repo, "src", kind @ ("branch" | "tag" | "commit"), ref rest @ ..] = segs[..] {
+                return (!rest.is_empty()).then(|| Repo::GiteaSrc { origin, owner: owner.into(), repo: repo.into(), kind: kind.into(), rest: owned(rest) });
+            }
+            let named = |name: &str| host == format!("{name}.com") || host.starts_with(&format!("{name}."));
+            if segs.first().is_some_and(|first| CODE_HOST_PAGES.contains(first)) {
+                return None;
+            }
+            if named("gitlab") && segs.len() >= 2 {
+                return Some(Repo::GitLabRoot { origin, project: segs.join("/") });
+            }
+            if !(host == "codeberg.org" || named("gitea")) {
+                return None;
+            }
+            let (owner, repo) = (segs.first()?.to_string(), segs.get(1)?.to_string());
+            match segs[2..] {
+                [] => Some(Repo::GiteaRoot { origin, owner, repo }),
+                ["releases", "latest"] => Some(Repo::GiteaRelease { origin, owner, repo, tag: None }),
+                ["releases", "tag", tag] => Some(Repo::GiteaRelease { origin, owner, repo, tag: Some(tag.to_string()) }),
+                _ => None,
+            }
+        }
     }
 }
 
@@ -137,14 +212,21 @@ pub fn lists(url: &Url) -> bool {
 /// One task per file at `url`, in a folder named after it; a repository's zip.
 pub async fn list(http: &reqwest::Client, url: &Url, auth: Option<&str>) -> Result<Vec<Task>, String> {
     let tasks = match repo_of(url) {
-        Some(Repo::GitHubRoot { owner, repo }) => {
-            vec![Task { urls: vec![zip_of(&owner, &repo)?], name: Some(component(&format!("{repo}.zip"), "repository.zip")?), ..Task::default() }]
+        Some(repo @ (Repo::GitHubRoot { .. } | Repo::GitLabRoot { .. } | Repo::BitbucketRoot { .. } | Repo::GiteaRoot { .. })) => {
+            let (zip, name) = zip_of(&repo)?;
+            vec![Task { urls: vec![zip], name: Some(component(&format!("{name}.zip"), "repository.zip")?), ..Task::default() }]
         }
         Some(Repo::GitHubTree { owner, repo, rest }) => github_tree(http, auth, GITHUB_API, &owner, &repo, &rest).await?,
         Some(Repo::GitHubRelease { owner, repo, tag }) => github_release(http, auth, GITHUB_API, &owner, &repo, tag.as_deref()).await?,
         Some(Repo::HuggingFace { kind, repo, rev, path }) => hugging_face(http, auth, HUGGING_FACE, kind, &repo, &rev, &path).await?,
         Some(Repo::Civitai { model, version }) => civitai(http, auth, CIVITAI, model, version).await?,
         Some(Repo::Archive { item, path }) => archive(http, auth, ARCHIVE, &item, &path).await?,
+        Some(Repo::GitLabTree { origin, project, rest }) => gitlab_tree(http, auth, &origin, &project, &rest).await?,
+        Some(Repo::GitLabRelease { origin, project, tag }) => gitlab_release(http, auth, &origin, &project, tag.as_deref()).await?,
+        Some(Repo::BitbucketTree { owner, repo, rest }) => bitbucket_tree(http, auth, BITBUCKET_API, &owner, &repo, &rest).await?,
+        Some(Repo::BitbucketDownloads { owner, repo }) => bitbucket_downloads(http, auth, BITBUCKET_API, &owner, &repo).await?,
+        Some(Repo::GiteaSrc { origin, owner, repo, kind, rest }) => gitea_src(http, auth, &origin, &owner, &repo, &kind, &rest).await?,
+        Some(Repo::GiteaRelease { origin, owner, repo, tag }) => gitea_release(http, auth, &origin, &owner, &repo, tag.as_deref()).await?,
         None => return Err(format!("{} is not a repository, folder, release, model or item link", url)),
     };
     if tasks.is_empty() {
@@ -154,23 +236,34 @@ pub async fn list(http: &reqwest::Client, url: &Url, auth: Option<&str>) -> Resu
 }
 
 /// Whether `url` is a repository link [`resolve`] takes (a folder's says it must be listed). An
-/// archive.org item's page is not: as one download it goes on as any page does (to yt-dlp).
+/// archive.org item's page is not: as one download it goes on as any page does (to yt-dlp); nor
+/// is a Gitea /src/ link, which may be a file's (see `resolver::CodeHostResolver`).
 pub fn handles(url: &Url) -> bool {
-    repo_of(url).is_some_and(|repo| !matches!(repo, Repo::Archive { .. }))
+    repo_of(url).is_some_and(|repo| !matches!(repo, Repo::Archive { .. } | Repo::GiteaSrc { .. }))
 }
 
-/// Where the zip of the GitHub repository link `url` downloads from.
+/// Where the zip of the repository link `url` downloads from.
 pub async fn resolve(_client: &reqwest::Client, url: &Url, _proxy: Option<&str>) -> Result<Vec<Url>, ResolverError> {
     match repo_of(url) {
-        Some(Repo::GitHubRoot { owner, repo }) => zip_of(&owner, &repo).map(|zip| vec![zip]).map_err(ResolverError::Parse),
-        Some(_) => Err(ResolverError::NotFound(LISTS_MANY.to_string())),
+        Some(repo) => zip_of(&repo).map(|(zip, _)| vec![zip]).map_err(ResolverError::NotFound),
         None => Err(ResolverError::NotFound(format!("{} is not a repository link", url))),
     }
 }
 
-/// The zip of the default branch of GitHub's `owner`/`repo`, without asking its API.
-fn zip_of(owner: &str, repo: &str) -> Result<Url, String> {
-    url_at(GITHUB, [owner, repo, "archive", "HEAD.zip"])
+/// The zip of a repository's default branch, without asking its API, and the repository's name;
+/// an error for a link that lists files.
+fn zip_of(repo: &Repo) -> Result<(Url, &str), String> {
+    match repo {
+        Repo::GitHubRoot { owner, repo } => Ok((url_at(GITHUB, [owner.as_str(), repo.as_str(), "archive", "HEAD.zip"])?, repo.as_str())),
+        Repo::GitLabRoot { origin, project } => {
+            let name = project.rsplit('/').next().unwrap_or(project);
+            let file = format!("{name}-HEAD.zip");
+            Ok((url_at(origin, project.split('/').chain(["-", "archive", "HEAD", &file]))?, name))
+        }
+        Repo::BitbucketRoot { owner, repo } => Ok((url_at(BITBUCKET, [owner.as_str(), repo.as_str(), "get", "HEAD.zip"])?, repo.as_str())),
+        Repo::GiteaRoot { origin, owner, repo } => Ok((url_at(origin, [owner.as_str(), repo.as_str(), "archive", "HEAD.zip"])?, repo.as_str())),
+        _ => Err(LISTS_MANY.to_string()),
+    }
 }
 
 /// `base` with `segments` added to its path, each percent-encoded as one segment.
@@ -315,7 +408,12 @@ async fn github_release(http: &reqwest::Client, auth: Option<&str>, api: &str, o
     let Some(answer) = fetch(http.get(url), auth, "GitHub").await? else {
         return Err(format!("{}/{} has no such release on GitHub (or the repository is private)", owner, repo));
     };
-    let release: Release = json(answer, "GitHub").await?;
+    release_tasks(&json(answer, "GitHub").await?, repo, GITHUB)
+}
+
+/// One task per asset of `release` (GitHub's, or a Gitea site's at `base`) of the repository
+/// `repo`, in a folder named after it and the tag.
+fn release_tasks(release: &Release, repo: &str, base: &str) -> Result<Vec<Task>, String> {
     let folder = component(&format!("{} {}", repo, release.tag_name), repo)?;
     let tasks: Vec<Task> = release
         .assets
@@ -327,8 +425,8 @@ async fn github_release(http: &reqwest::Client, auth: Option<&str>, api: &str, o
                 folder: Some(folder.clone()),
                 size: asset.size,
                 checksum: asset.digest.as_deref().and_then(|d| d.split_once(':')).and_then(|(algo, hex)| checksum(algo, hex)),
-                // Only GitHub's own host gets the user's Authorization.
-                from_document: !own(&url, GITHUB),
+                // Only the service's own host gets the user's Authorization.
+                from_document: !own(&url, base),
                 urls: vec![url],
                 ..Task::default()
             })
@@ -497,8 +595,7 @@ async fn archive(http: &reqwest::Client, auth: Option<&str>, base: &str, item: &
         if file.source != "original" || ARCHIVE_OWN_FORMATS.contains(&file.format.as_str()) || file.private.as_deref() == Some("true") {
             continue;
         }
-        let inside = if prefix.is_empty() { Some(file.name.as_str()) } else { file.name.strip_prefix(&prefix).and_then(|p| p.strip_prefix('/')) };
-        let Some(name) = inside.and_then(relative) else { continue };
+        let Some(name) = inside(&file.name, &prefix).and_then(relative) else { continue };
         tasks.push(Task {
             urls: vec![url_at(base, ["download", item].into_iter().chain(file.name.split('/')))?],
             name: Some(name),
@@ -509,6 +606,257 @@ async fn archive(http: &reqwest::Client, auth: Option<&str>, base: &str, item: &
         });
     }
     Ok(tasks)
+}
+
+/// `path` (an entry's, from the repository's top) inside the folder `prefix` ("" for the top).
+fn inside<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
+    if prefix.is_empty() {
+        return Some(path);
+    }
+    path.strip_prefix(prefix)?.strip_prefix('/')
+}
+
+/// The name of a GitLab project, its path's last part.
+fn last_part(project: &str) -> &str {
+    project.rsplit('/').next().unwrap_or(project)
+}
+
+/// Every file under the folder `rest` (its ref, then its path) names in the GitLab project
+/// `project` at `origin`, subfolders kept, each a task for its /-/raw/ link (which serves Git
+/// LFS files too). The ref is the shortest start of `rest` GitLab knows.
+async fn gitlab_tree(http: &reqwest::Client, auth: Option<&str>, origin: &str, project: &str, rest: &[String]) -> Result<Vec<Task>, String> {
+    #[derive(Default, Deserialize)]
+    #[serde(default)]
+    struct Entry {
+        path: String,
+        #[serde(rename = "type")]
+        kind: String,
+    }
+    for parts in 1..=rest.len().min(MAX_REF_PARTS) {
+        let (git_ref, path) = (rest[..parts].join("/"), rest[parts..].join("/"));
+        let mut page = url_at(origin, ["api", "v4", "projects", project, "repository", "tree"])?;
+        let query = [("ref", git_ref.as_str()), ("path", path.as_str()), ("recursive", "true"), ("per_page", "100"), ("pagination", "keyset")];
+        page.query_pairs_mut().extend_pairs(query);
+        let Some(mut answer) = fetch(http.get(page), auth, "GitLab").await? else { continue };
+        let folder = component(rest[parts..].last().map_or(last_part(project), String::as_str), last_part(project))?;
+        let mut tasks = Vec::new();
+        for _ in 0..MAX_PAGES {
+            let next = next_page(&answer, origin);
+            let entries: Vec<Entry> = json(answer, "GitLab").await?;
+            for entry in entries.iter().filter(|e| e.kind == "blob") {
+                let Some(name) = inside(&entry.path, &path).and_then(relative) else { continue };
+                let raw = project.split('/').chain(["-", "raw"]).chain(git_ref.split('/')).chain(entry.path.split('/'));
+                tasks.push(Task { urls: vec![url_at(origin, raw)?], name: Some(name), folder: Some(folder.clone()), ..Task::default() });
+            }
+            let Some(next) = next else { return Ok(tasks) };
+            answer = fetch(http.get(next), auth, "GitLab").await?.ok_or_else(|| "GitLab lost the rest of the listing".to_string())?;
+        }
+        return Err(format!("the folder holds more than {} files: add the links of its subfolders instead", MAX_PAGES * 100));
+    }
+    Err(format!("GitLab has no such folder in {} (or the project is private)", project))
+}
+
+/// Every file of the release `tag` (None the latest) of the GitLab project `project` at
+/// `origin`: its asset links, each named after the file it points at.
+async fn gitlab_release(http: &reqwest::Client, auth: Option<&str>, origin: &str, project: &str, tag: Option<&str>) -> Result<Vec<Task>, String> {
+    #[derive(Default, Deserialize)]
+    #[serde(default)]
+    struct Release {
+        tag_name: String,
+        assets: Assets,
+    }
+    #[derive(Default, Deserialize)]
+    #[serde(default)]
+    struct Assets {
+        links: Vec<Link>,
+    }
+    #[derive(Default, Deserialize)]
+    #[serde(default)]
+    struct Link {
+        name: String,
+        url: String,
+        direct_asset_url: Option<String>,
+    }
+    let api = ["api", "v4", "projects", project, "releases"];
+    let url = match tag {
+        Some(tag) => url_at(origin, api.into_iter().chain([tag]))?,
+        None => url_at(origin, api.into_iter().chain(["permalink", "latest"]))?,
+    };
+    let Some(answer) = fetch(http.get(url), auth, "GitLab").await? else {
+        return Err(format!("{} has no such release on GitLab (or the project is private)", project));
+    };
+    let release: Release = json(answer, "GitLab").await?;
+    let folder = component(&format!("{} {}", last_part(project), release.tag_name), last_part(project))?;
+    let tasks: Vec<Task> = release
+        .assets
+        .links
+        .iter()
+        .filter_map(|link| {
+            let url = Url::parse(link.direct_asset_url.as_deref().unwrap_or(&link.url)).ok()?;
+            // A link's name is a label ("Linux build"); the file's is the last part of its URL.
+            let file = url.path_segments().and_then(|mut s| s.next_back()).map(|s| percent_decode_str(s).decode_utf8_lossy().into_owned());
+            Some(Task {
+                name: file.as_deref().and_then(|f| clean_path([f]).ok()).or_else(|| clean_path([link.name.as_str()]).ok()),
+                folder: Some(folder.clone()),
+                from_document: !own(&url, origin),
+                urls: vec![url],
+                ..Task::default()
+            })
+        })
+        .collect();
+    if tasks.is_empty() {
+        return Err(format!("the release {} has no files besides its source code: add the project's link to get that", release.tag_name));
+    }
+    Ok(tasks)
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct BitbucketEntry {
+    #[serde(rename = "type")]
+    kind: String,
+    path: String,
+    name: String,
+    size: Option<u64>,
+}
+
+/// The entries of every page of the Bitbucket listing at `url`, through its `next` links on
+/// `api`; None when there is no such thing.
+async fn bitbucket_pages(http: &reqwest::Client, auth: Option<&str>, api: &str, mut url: Url) -> Result<Option<Vec<BitbucketEntry>>, String> {
+    #[derive(Deserialize)]
+    struct Page {
+        #[serde(default)]
+        values: Vec<BitbucketEntry>,
+        next: Option<String>,
+    }
+    let mut entries = Vec::new();
+    for _ in 0..MAX_PAGES {
+        let Some(answer) = fetch(http.get(url), auth, "Bitbucket").await? else { return Ok(None) };
+        let page: Page = json(answer, "Bitbucket").await?;
+        entries.extend(page.values);
+        match page.next.and_then(|next| Url::parse(&next).ok()).filter(|next| own(next, api)) {
+            Some(next) => url = next,
+            None => return Ok(Some(entries)),
+        }
+    }
+    Err(format!("the listing holds more than {} files: add the links of its subfolders instead", MAX_PAGES * 100))
+}
+
+/// Every file under the folder `rest` (its ref, then its path) names in Bitbucket's
+/// `owner`/`repo`, subfolders kept, each a task for its /raw/ link. The ref is the shortest start
+/// of `rest` Bitbucket knows.
+async fn bitbucket_tree(http: &reqwest::Client, auth: Option<&str>, api: &str, owner: &str, repo: &str, rest: &[String]) -> Result<Vec<Task>, String> {
+    for parts in 1..=rest.len().min(MAX_REF_PARTS) {
+        let (git_ref, path) = (rest[..parts].join("/"), &rest[parts..]);
+        // The last empty segment makes it a folder's link.
+        let segments = ["repositories", owner, repo, "src", git_ref.as_str()].into_iter().chain(path.iter().map(String::as_str)).chain([""]);
+        let mut url = url_at(api, segments)?;
+        url.set_query(Some("max_depth=100&pagelen=100"));
+        let Some(entries) = bitbucket_pages(http, auth, api, url).await? else { continue };
+        let (prefix, folder) = (path.join("/"), component(path.last().map_or(repo, String::as_str), repo)?);
+        let mut tasks = Vec::new();
+        for entry in entries.iter().filter(|e| e.kind == "commit_file") {
+            let Some(name) = inside(&entry.path, &prefix).and_then(relative) else { continue };
+            let raw = [owner, repo, "raw"].into_iter().chain(git_ref.split('/')).chain(entry.path.split('/'));
+            tasks.push(Task { urls: vec![url_at(BITBUCKET, raw)?], name: Some(name), folder: Some(folder.clone()), size: entry.size, ..Task::default() });
+        }
+        return Ok(tasks);
+    }
+    Err(format!("Bitbucket has no such folder in {}/{} (or the repository is private)", owner, repo))
+}
+
+/// Every file uploaded to the Downloads of Bitbucket's `owner`/`repo`.
+async fn bitbucket_downloads(http: &reqwest::Client, auth: Option<&str>, api: &str, owner: &str, repo: &str) -> Result<Vec<Task>, String> {
+    let mut url = url_at(api, ["repositories", owner, repo, "downloads"])?;
+    url.set_query(Some("pagelen=100"));
+    let entries = bitbucket_pages(http, auth, api, url).await?;
+    let entries = entries.ok_or_else(|| format!("Bitbucket has no repository {}/{} (or it is private)", owner, repo))?;
+    let folder = component(&format!("{} downloads", repo), repo)?;
+    entries
+        .iter()
+        .filter_map(|entry| Some((clean_path([entry.name.as_str()]).ok()?, entry)))
+        .map(|(name, entry)| {
+            let url = url_at(BITBUCKET, [owner, repo, "downloads", entry.name.as_str()])?;
+            Ok(Task { urls: vec![url], name: Some(name), folder: Some(folder.clone()), size: entry.size, ..Task::default() })
+        })
+        .collect()
+}
+
+/// The host of `origin`, which names a Gitea site in errors.
+fn site(origin: &str) -> String {
+    Url::parse(origin).ok().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_else(|| "Gitea".to_string())
+}
+
+/// Every entry of the Gitea repository `owner`/`repo` at `origin` at `git_ref`, page after page;
+/// None when it has no such ref.
+async fn gitea_tree(http: &reqwest::Client, auth: Option<&str>, origin: &str, owner: &str, repo: &str, git_ref: &str) -> Result<Option<Vec<GitEntry>>, String> {
+    #[derive(Default, Deserialize)]
+    #[serde(default)]
+    struct Tree {
+        tree: Vec<GitEntry>,
+        total_count: usize,
+    }
+    let service = site(origin);
+    let mut entries = Vec::new();
+    for page in 1..=MAX_PAGES {
+        let mut url = url_at(origin, ["api", "v1", "repos", owner, repo, "git", "trees", git_ref])?;
+        url.set_query(Some(&format!("recursive=true&per_page=1000&page={page}")));
+        let answer = match fetch(http.get(url), auth, &service).await {
+            Ok(Some(answer)) => answer,
+            // Gitea answers a ref it does not have with 400.
+            Ok(None) => return Ok(None),
+            Err(e) if e.ends_with("HTTP 400") => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let tree: Tree = json(answer, &service).await?;
+        let read = tree.tree.len();
+        entries.extend(tree.tree);
+        if read == 0 || entries.len() >= tree.total_count {
+            return Ok(Some(entries));
+        }
+    }
+    Err(format!("the repository holds more than {} files: add the links of its subfolders instead", MAX_PAGES * 1000))
+}
+
+/// What `rest` (a ref, then a path) names in the Gitea repository `owner`/`repo` at `origin`
+/// (`kind` says whether the ref is a branch, tag or commit): a folder, every file under it as a
+/// task for its /media/ link (which serves Git LFS files too), subfolders kept; or a file, its one
+/// task. The ref is the shortest start of `rest` with something at the path after it.
+async fn gitea_src(http: &reqwest::Client, auth: Option<&str>, origin: &str, owner: &str, repo: &str, kind: &str, rest: &[String]) -> Result<Vec<Task>, String> {
+    for parts in 1..=rest.len().min(MAX_REF_PARTS) {
+        let (git_ref, path) = (rest[..parts].join("/"), rest[parts..].join("/"));
+        let Some(entries) = gitea_tree(http, auth, origin, owner, repo, &git_ref).await? else { continue };
+        let media = |file: &str| url_at(origin, [owner, repo, "media", kind].into_iter().chain(git_ref.split('/')).chain(file.split('/')));
+        if let Some(file) = entries.iter().find(|e| e.kind == "blob" && e.path == path) {
+            let name = rest.last().and_then(|last| clean_path([last.as_str()]).ok());
+            return Ok(vec![Task { urls: vec![media(&file.path)?], name, size: file.size, ..Task::default() }]);
+        }
+        let folder = component(rest[parts..].last().map_or(repo, String::as_str), repo)?;
+        let mut tasks = Vec::new();
+        for entry in entries.iter().filter(|e| e.kind == "blob") {
+            let Some(name) = inside(&entry.path, &path).and_then(relative) else { continue };
+            tasks.push(Task { urls: vec![media(&entry.path)?], name: Some(name), folder: Some(folder.clone()), size: entry.size, ..Task::default() });
+        }
+        // Nothing there: the ref may go on past this part.
+        if !tasks.is_empty() || path.is_empty() {
+            return Ok(tasks);
+        }
+    }
+    Err(format!("{} has no such file or folder in {}/{} (or the repository is private)", site(origin), owner, repo))
+}
+
+/// Every file of the release `tag` (None the latest) of the Gitea repository `owner`/`repo` at
+/// `origin`.
+async fn gitea_release(http: &reqwest::Client, auth: Option<&str>, origin: &str, owner: &str, repo: &str, tag: Option<&str>) -> Result<Vec<Task>, String> {
+    let api = ["api", "v1", "repos", owner, repo, "releases"];
+    let url = match tag {
+        Some(tag) => url_at(origin, api.into_iter().chain(["tags", tag]))?,
+        None => url_at(origin, api.into_iter().chain(["latest"]))?,
+    };
+    let Some(answer) = fetch(http.get(url), auth, &site(origin)).await? else {
+        return Err(format!("{}/{} has no such release on {} (or the repository is private)", owner, repo, site(origin)));
+    };
+    release_tasks(&json(answer, &site(origin)).await?, repo, origin)
 }
 
 #[cfg(test)]
@@ -801,6 +1149,226 @@ mod tests {
         assert!(lists(&Url::parse("https://archive.org/details/item").unwrap()) && !handles(&Url::parse("https://archive.org/details/item").unwrap()));
     }
 
+    /// GitLab (gitlab.com and self-hosted), Bitbucket and Gitea links are told by their shape; a
+    /// repository is its default branch's zip, with no request made.
+    #[tokio::test]
+    async fn other_code_hosts_are_told_by_their_shape() {
+        let origin = |host: &str| format!("https://{host}");
+        let gl = |rest: &[&str]| Some(Repo::GitLabTree { origin: origin("gitlab.com"), project: "g/sub/p".into(), rest: strings(rest) });
+        assert_eq!(repo("https://gitlab.com/g/sub/p/-/tree/feature/x/My%20Docs?ref_type=heads"), gl(&["feature", "x", "My Docs"]));
+        assert_eq!(
+            repo("https://code.example.org/g/p/-/tree/main"),
+            Some(Repo::GitLabTree { origin: origin("code.example.org"), project: "g/p".into(), rest: strings(&["main"]) })
+        );
+        let release = |tag: Option<&str>| Some(Repo::GitLabRelease { origin: origin("gitlab.gnome.org"), project: "GNOME/gtk".into(), tag: tag.map(Into::into) });
+        assert_eq!(repo("https://gitlab.gnome.org/GNOME/gtk/-/releases/4.16.0"), release(Some("4.16.0")));
+        assert_eq!(repo("https://gitlab.gnome.org/GNOME/gtk/-/releases/permalink/latest"), release(None));
+        assert_eq!(repo("https://gitlab.com/g/sub/p"), Some(Repo::GitLabRoot { origin: origin("gitlab.com"), project: "g/sub/p".into() }));
+        let bb = |owner: &str, repo: &str| (owner.to_string(), repo.to_string());
+        let (owner, name) = bb("o", "r");
+        assert_eq!(repo("https://bitbucket.org/o/r"), Some(Repo::BitbucketRoot { owner: owner.clone(), repo: name.clone() }));
+        assert_eq!(repo("https://bitbucket.org/o/r/src/main/doc/"), Some(Repo::BitbucketTree { owner: owner.clone(), repo: name.clone(), rest: strings(&["main", "doc"]) }));
+        assert_eq!(repo("https://bitbucket.org/o/r/src/main"), Some(Repo::BitbucketTree { owner: owner.clone(), repo: name.clone(), rest: strings(&["main"]) }));
+        assert_eq!(repo("https://bitbucket.org/o/r/downloads/"), Some(Repo::BitbucketDownloads { owner, repo: name }));
+        let src = |host: &str, kind: &str, rest: &[&str]| Some(Repo::GiteaSrc { origin: origin(host), owner: "o".into(), repo: "r".into(), kind: kind.into(), rest: strings(rest) });
+        assert_eq!(repo("https://codeberg.org/o/r/src/branch/main/docs"), src("codeberg.org", "branch", &["main", "docs"]));
+        assert_eq!(repo("https://git.example.org/o/r/src/tag/v1/a.zip"), src("git.example.org", "tag", &["v1", "a.zip"]));
+        let gitea = |tag: Option<&str>| Some(Repo::GiteaRelease { origin: origin("codeberg.org"), owner: "o".into(), repo: "r".into(), tag: tag.map(Into::into) });
+        assert_eq!(repo("https://codeberg.org/o/r/releases/tag/v1.0"), gitea(Some("v1.0")));
+        assert_eq!(repo("https://codeberg.org/o/r/releases/latest"), gitea(None));
+        assert_eq!(repo("https://gitea.com/o/r"), Some(Repo::GiteaRoot { origin: origin("gitea.com"), owner: "o".into(), repo: "r".into() }));
+        for other in [
+            // Files, which the code host resolver takes, and pages of the sites themselves.
+            "https://gitlab.com/g/p/-/blob/main/a.zip",
+            "https://gitlab.com/g/p/-/raw/main/a.zip",
+            "https://gitlab.com/g/p/-/releases",
+            "https://gitlab.com/explore/projects",
+            "https://gitlab.com/g",
+            "https://about.gitlab.com/pricing",
+            "https://bitbucket.org/o/r/src/main/a.zip",
+            "https://bitbucket.org/o/r/downloads/a.zip",
+            "https://bitbucket.org/product/pricing",
+            "https://codeberg.org/o/r/src/branch",
+            "https://codeberg.org/o/r/media/branch/main/a.zip",
+            "https://codeberg.org/user/login",
+            "https://codeberg.org/o/r/releases/download/v1/a.zip",
+            "https://forgejo.org/docs/latest",
+            "https://example.com/o/r",
+            "https://example.com/o/r/releases/tag/v1",
+        ] {
+            assert_eq!(repo(other), None, "{other}");
+        }
+        let gitea_src = Url::parse("https://codeberg.org/o/r/src/branch/main/a.zip").unwrap();
+        assert!(lists(&gitea_src) && !handles(&gitea_src), "a file's /src/ link is listed, and as one download it is the code host resolver's");
+        for (root, zip) in [
+            ("https://gitlab.com/g/sub/My%20P", "https://gitlab.com/g/sub/My%20P/-/archive/HEAD/My%20P-HEAD.zip"),
+            ("https://bitbucket.org/o/r", "https://bitbucket.org/o/r/get/HEAD.zip"),
+            ("https://codeberg.org/o/r", "https://codeberg.org/o/r/archive/HEAD.zip"),
+        ] {
+            let root = Url::parse(root).unwrap();
+            assert_eq!(resolve(&http(), &root, None).await.unwrap()[0].as_str(), zip);
+            assert_eq!(list(&http(), &root, None).await.unwrap()[0].urls[0].as_str(), zip);
+        }
+        assert_eq!(list(&http(), &Url::parse("https://gitlab.com/g/sub/My%20P").unwrap(), None).await.unwrap()[0].name, Some("My P.zip".into()));
+    }
+
+    fn gitlab(path: &str) -> Reply {
+        let tree = "/api/v4/projects/g%2Fsub%2Fp/repository/tree?";
+        match path.strip_prefix(tree) {
+            Some("ref=feature%2Fx&path=docs&recursive=true&per_page=100&pagination=keyset") => (
+                200,
+                format!("Content-Type: application/json\r\nLink: <{{base}}{tree}page_token=2>; rel=\"next\"\r\n"),
+                br#"[{"type":"tree","path":"docs/img"},{"type":"blob","path":"docs/a.md"},{"type":"blob","path":"docs/../../evil.exe"}]"#.to_vec(),
+            ),
+            Some("page_token=2") => json_reply(r#"[{"type":"blob","path":"docs/img/b c.png"}]"#),
+            _ => match path {
+                "/api/v4/projects/g%2Fsub%2Fp/releases/permalink/latest" => json_reply(
+                    r#"{"tag_name":"v2.0","assets":{"sources":[{"format":"zip","url":"https://x/src.zip"}],"links":[
+                        {"name":"Linux build","url":"https://cdn.example/files/app-linux.tar.gz","direct_asset_url":"{base}/g/sub/p/-/releases/v2.0/downloads/app-linux.tar.gz"},
+                        {"name":"checksums","url":"https://cdn.example/files/SHA256SUMS"},
+                        {"name":"docs","url":"https://cdn.example/"}]}}"#,
+                ),
+                "/api/v4/projects/g%2Fsub%2Fp/releases/v0" => json_reply(r#"{"tag_name":"v0","assets":{"links":[]}}"#),
+                _ => (404, String::new(), br#"{"message":"404 Tree Not Found"}"#.to_vec()),
+            },
+        }
+    }
+
+    /// A GitLab folder is listed at the ref GitLab knows (the shortest start of the rest of the
+    /// link), page after page, each file its /-/raw/ link, subfolders kept, names that would leave
+    /// the folder left out; a release is one task per asset link, named after its file, on the
+    /// project's host with the user's Authorization and elsewhere without.
+    #[tokio::test]
+    async fn gitlab_folders_and_releases() {
+        let (origin, hits) = serve_naming_itself(gitlab).await;
+        let tasks = gitlab_tree(&http(), None, &origin, "g/sub/p", &strings(&["feature", "x", "docs"])).await.unwrap();
+        let listed: Vec<_> = tasks.iter().map(|t| (t.urls[0].to_string(), t.name.clone().unwrap())).collect();
+        assert_eq!(
+            listed,
+            [
+                (format!("{origin}/g/sub/p/-/raw/feature/x/docs/a.md"), PathBuf::from("a.md")),
+                (format!("{origin}/g/sub/p/-/raw/feature/x/docs/img/b%20c.png"), PathBuf::from("img").join("b c.png")),
+            ]
+        );
+        assert!(tasks.iter().all(|t| t.folder == Some("docs".into())));
+        assert_eq!(hits.lock().get("/api/v4/projects/g%2Fsub%2Fp/repository/tree?ref=feature&path=x%2Fdocs&recursive=true&per_page=100&pagination=keyset"), Some(&1));
+        let err = gitlab_tree(&http(), None, &origin, "g/sub/p", &strings(&["nope"])).await.unwrap_err();
+        assert!(err.contains("no such folder in g/sub/p"), "{err}");
+
+        let tasks = gitlab_release(&http(), None, &origin, "g/sub/p", None).await.unwrap();
+        let listed: Vec<_> = tasks.iter().map(|t| (t.urls[0].to_string(), t.name.clone(), t.from_document)).collect();
+        assert_eq!(
+            listed,
+            [
+                (format!("{origin}/g/sub/p/-/releases/v2.0/downloads/app-linux.tar.gz"), Some("app-linux.tar.gz".into()), false),
+                ("https://cdn.example/files/SHA256SUMS".to_string(), Some("SHA256SUMS".into()), true),
+                ("https://cdn.example/".to_string(), Some("docs".into()), true),
+            ]
+        );
+        assert!(tasks.iter().all(|t| t.folder == Some("p v2.0".into())));
+        assert!(gitlab_release(&http(), None, &origin, "g/sub/p", Some("v0")).await.unwrap_err().contains("source code"));
+        assert!(gitlab_release(&http(), None, &origin, "g/sub/p", Some("gone")).await.unwrap_err().contains("no such release"));
+    }
+
+    /// A server whose answers name its own address (`{base}` in them), as APIs that give their
+    /// next page's or a file's full link do.
+    async fn serve_naming_itself(handler: fn(&str) -> Reply) -> (String, std::sync::Arc<parking_lot::Mutex<HashMap<String, usize>>>) {
+        let base = std::sync::Arc::new(std::sync::OnceLock::<String>::new());
+        let named = std::sync::Arc::clone(&base);
+        let (addr, hits) = serve(move |path, _| {
+            let (status, headers, body) = handler(path);
+            let base = named.get().unwrap();
+            (status, headers.replace("{base}", base), String::from_utf8(body).unwrap().replace("{base}", base).into_bytes())
+        })
+        .await;
+        base.set(format!("http://{addr}")).unwrap();
+        (format!("http://{addr}"), hits)
+    }
+
+    fn bitbucket(path: &str) -> Reply {
+        match path {
+            "/repositories/o/r/src/main/doc/?max_depth=100&pagelen=100" => json_reply(
+                r#"{"values":[{"type":"commit_directory","path":"doc/sub"},{"type":"commit_file","path":"doc/a.txt","size":3}],
+                    "next":"{base}/repositories/o/r/src/main/doc/?max_depth=100&pagelen=100&page=2"}"#,
+            ),
+            "/repositories/o/r/src/main/doc/?max_depth=100&pagelen=100&page=2" => {
+                json_reply(r#"{"values":[{"type":"commit_file","path":"doc/sub/b c.txt","size":5}],"next":"https://elsewhere.example/x"}"#)
+            }
+            "/repositories/o/r/downloads?pagelen=100" => {
+                json_reply(r#"{"values":[{"name":"r-1.0.tar.gz","size":7,"type":"download"},{"name":"..","type":"download"}]}"#)
+            }
+            _ => (404, String::new(), br#"{"type":"error","error":{"message":"Commit not found"}}"#.to_vec()),
+        }
+    }
+
+    /// A Bitbucket folder is listed at the ref Bitbucket knows, page after page on its API's own
+    /// host, each file its /raw/ link with its size; Downloads are one task per file.
+    #[tokio::test]
+    async fn bitbucket_folders_and_downloads() {
+        let (api, hits) = serve_naming_itself(bitbucket).await;
+        let tasks = bitbucket_tree(&http(), None, &api, "o", "r", &strings(&["main", "doc"])).await.unwrap();
+        let listed: Vec<_> = tasks.iter().map(|t| (t.urls[0].to_string(), t.name.clone().unwrap(), t.size)).collect();
+        assert_eq!(
+            listed,
+            [
+                ("https://bitbucket.org/o/r/raw/main/doc/a.txt".to_string(), PathBuf::from("a.txt"), Some(3)),
+                ("https://bitbucket.org/o/r/raw/main/doc/sub/b%20c.txt".to_string(), PathBuf::from("sub").join("b c.txt"), Some(5)),
+            ]
+        );
+        assert!(tasks.iter().all(|t| t.folder == Some("doc".into())));
+        assert_eq!(hits.lock().len(), 2, "the page on another host was not asked for");
+        let err = bitbucket_tree(&http(), None, &api, "o", "r", &strings(&["nope", "doc"])).await.unwrap_err();
+        assert!(err.contains("no such folder in o/r"), "{err}");
+        let downloads = bitbucket_downloads(&http(), None, &api, "o", "r").await.unwrap();
+        let listed: Vec<_> = downloads.iter().map(|t| (t.urls[0].as_str(), t.name.clone().unwrap(), t.size, t.folder.clone().unwrap())).collect();
+        assert_eq!(listed, [("https://bitbucket.org/o/r/downloads/r-1.0.tar.gz", PathBuf::from("r-1.0.tar.gz"), Some(7), PathBuf::from("r downloads"))]);
+    }
+
+    fn gitea(path: &str) -> Reply {
+        match path {
+            "/api/v1/repos/o/r/git/trees/feature?recursive=true&per_page=1000&page=1" => {
+                (400, "Content-Type: application/json\r\n".into(), br#"{"message":"sha not supported: feature"}"#.to_vec())
+            }
+            "/api/v1/repos/o/r/git/trees/feature%2Fx?recursive=true&per_page=1000&page=1" => json_reply(
+                r#"{"total_count":4,"truncated":true,"page":1,"tree":[
+                    {"path":"docs","type":"tree"},{"path":"docs/a.md","type":"blob","size":3},{"path":"docs/img/b c.png","type":"blob","size":5}]}"#,
+            ),
+            "/api/v1/repos/o/r/git/trees/feature%2Fx?recursive=true&per_page=1000&page=2" => {
+                json_reply(r#"{"total_count":4,"truncated":true,"page":2,"tree":[{"path":"README.md","type":"blob","size":9}]}"#)
+            }
+            "/api/v1/repos/o/r/releases/tags/v1.0" => json_reply(
+                r#"{"tag_name":"v1.0","assets":[{"name":"app.zip","size":7,"browser_download_url":"{base}/o/r/releases/download/v1.0/app.zip"}]}"#,
+            ),
+            _ => (404, String::new(), br#"{"message":"not found"}"#.to_vec()),
+        }
+    }
+
+    /// A Gitea /src/ link is a folder (every file under it, each its /media/ link with its size)
+    /// or a file (its one task), at the ref the repository has (it answers 400 to one it does not),
+    /// read page after page; a release is one task per asset.
+    #[tokio::test]
+    async fn gitea_folders_files_and_releases() {
+        let (origin, _) = serve_naming_itself(gitea).await;
+        let tasks = gitea_src(&http(), None, &origin, "o", "r", "branch", &strings(&["feature", "x", "docs"])).await.unwrap();
+        let listed: Vec<_> = tasks.iter().map(|t| (t.urls[0].to_string(), t.name.clone().unwrap(), t.size)).collect();
+        assert_eq!(
+            listed,
+            [
+                (format!("{origin}/o/r/media/branch/feature/x/docs/a.md"), PathBuf::from("a.md"), Some(3)),
+                (format!("{origin}/o/r/media/branch/feature/x/docs/img/b%20c.png"), PathBuf::from("img").join("b c.png"), Some(5)),
+            ]
+        );
+        assert!(tasks.iter().all(|t| t.folder == Some("docs".into())));
+        let file = gitea_src(&http(), None, &origin, "o", "r", "branch", &strings(&["feature", "x", "README.md"])).await.unwrap();
+        assert_eq!(file, [Task { urls: vec![Url::parse(&format!("{origin}/o/r/media/branch/feature/x/README.md")).unwrap()], name: Some("README.md".into()), size: Some(9), ..Task::default() }]);
+        let err = gitea_src(&http(), None, &origin, "o", "r", "branch", &strings(&["feature", "x", "nope"])).await.unwrap_err();
+        assert!(err.contains("no such file or folder in o/r"), "{err}");
+        let release = gitea_release(&http(), None, &origin, "o", "r", Some("v1.0")).await.unwrap();
+        assert_eq!((release[0].name.clone(), release[0].size, release[0].folder.clone()), (Some("app.zip".into()), Some(7), Some("r v1.0".into())));
+        assert!(!release[0].from_document, "the site's own host gets the user's Authorization");
+        assert!(gitea_release(&http(), None, &origin, "o", "r", None).await.unwrap_err().contains("no such release"));
+    }
+
     /// A token pasted with the link goes to the service's API with the listing.
     #[tokio::test]
     async fn a_pasted_token_goes_with_the_listing() {
@@ -861,6 +1429,40 @@ mod tests {
         assert_eq!(globe.checksum.as_deref(), Some("sha1:3e20a009994405f535cdf07cdc2974cef2fce8f2"));
         assert_eq!(globe.size, Some(66065));
         assert!(tasks.iter().all(|t| !t.name.as_ref().unwrap().to_string_lossy().contains("thumb") && t.name != Some("nasa_meta.xml".into())), "{tasks:?}");
+    }
+
+    /// Live: a GitLab folder lists its files, and its latest release its asset links.
+    #[tokio::test]
+    #[ignore]
+    async fn live_gitlab() {
+        let tasks = live("https://gitlab.com/gitlab-org/gitlab-runner/-/tree/main/docs/install").await.unwrap();
+        assert!(tasks.iter().any(|t| t.urls[0].as_str() == "https://gitlab.com/gitlab-org/gitlab-runner/-/raw/main/docs/install/_index.md"), "{tasks:?}");
+        let release = live("https://gitlab.com/gitlab-org/gitlab-runner/-/releases/permalink/latest").await.unwrap();
+        assert!(release.len() > 1 && release.iter().all(|t| t.name.is_some()), "{release:?}");
+    }
+
+    /// Live: a Bitbucket folder lists its files with their sizes, and Downloads its files.
+    #[tokio::test]
+    #[ignore]
+    async fn live_bitbucket() {
+        let tasks = live("https://bitbucket.org/multicoreware/x265_git/src/master/doc/").await.unwrap();
+        let rst = tasks.iter().find(|t| t.name == Some(PathBuf::from("reST").join("api.rst"))).unwrap();
+        assert!(rst.size.is_some() && rst.urls[0].as_str() == "https://bitbucket.org/multicoreware/x265_git/raw/master/doc/reST/api.rst", "{rst:?}");
+        let downloads = live("https://bitbucket.org/multicoreware/x265_git/downloads/").await.unwrap();
+        assert!(downloads.iter().any(|t| t.name.as_ref().is_some_and(|n| n.to_string_lossy().ends_with(".tar.gz"))), "{downloads:?}");
+    }
+
+    /// Live: a Codeberg folder lists its files, a file's /src/ link is that file, and the latest
+    /// release lists its assets.
+    #[tokio::test]
+    #[ignore]
+    async fn live_codeberg() {
+        let tasks = live("https://codeberg.org/mikf/gallery-dl/src/branch/master/docs").await.unwrap();
+        assert!(tasks.len() > 1 && tasks.iter().all(|t| t.folder == Some("docs".into())), "{tasks:?}");
+        let file = live("https://codeberg.org/mikf/gallery-dl/src/branch/master/README.rst").await.unwrap();
+        assert_eq!(file[0].urls[0].as_str(), "https://codeberg.org/mikf/gallery-dl/media/branch/master/README.rst");
+        let release = live("https://codeberg.org/mikf/gallery-dl/releases/latest").await.unwrap();
+        assert!(release.iter().any(|t| t.name.as_ref().is_some_and(|n| n.to_string_lossy().ends_with(".whl"))), "{release:?}");
     }
 
     /// Live: a Civitai model lists its newest version's files.

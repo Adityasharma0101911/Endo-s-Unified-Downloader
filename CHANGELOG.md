@@ -10,6 +10,7 @@ What changed in each release, newest first. Each release's page on [GitHub](http
 - **App: plainer words.** Common errors say what to do about them ("The file is no longer at this link…"), a download's workers are called connections, and "resolving" is "connecting".
 - **SourceForge:** its links failed, as SourceForge answers the browser User-Agent the app sent with a 403 page; it now gets the app's own, and a file downloads from SourceForge's pick of a mirror and up to five more from the mirror list it gives for that file.
 - **Internet Archive items:** an `archive.org/details/<item>` or `/download/<item>` link (or a folder of it, `/download/<item>/<folder>/`) adds one download per file uploaded to the item, with archive.org's size and SHA-1 to check it, leaving out the copies and records archive.org makes.
+- **GitLab, Bitbucket, Codeberg, Gitea and Forgejo:** a repository link downloads its default branch as a zip, a folder link adds one download per file (subfolders kept), and a release (or Bitbucket's Downloads) one per asset, as GitHub's do; self-hosted GitLab, Gitea and Forgejo are recognised by their links' paths, and their "view file" links download the file.
 - Fixed: a progress bar's fill went square when short and the light sweeping over it was cut to a rectangle; both now follow the bar's round ends.
 
 ## 1.9.0 (2026-10-30)
