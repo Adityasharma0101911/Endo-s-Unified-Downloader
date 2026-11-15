@@ -1074,7 +1074,7 @@ mod tests {
         let before = leaked();
         before.keep_in(file.clone(), now);
         let three: Vec<HostSlot> = (0..3).map(|_| before.try_acquire(&host, 32, Instant::now()).unwrap()).collect();
-        three[2].throttled();
+        three[2].throttled(Duration::ZERO);
         drop(three);
         before.keep(&host, now, |kept| kept.connections = Some(6));
         before.save(now);
@@ -1092,7 +1092,7 @@ mod tests {
         // Once it expired as any cap learned does, a host serving more has none so low any more.
         let late = t0 + PROFILE_TTL;
         let _three: Vec<HostSlot> = (0..3).map(|_| after.try_acquire(&host, 32, late).unwrap()).collect();
-        after.accepted(&host, late);
+        after.accepted(&host, false, late);
         assert_eq!(after.kept(&host, now).map(|kept| (kept.connections, kept.cap)), Some((Some(6), None)));
 
         // Thirty days after it was learned, nothing is kept.
