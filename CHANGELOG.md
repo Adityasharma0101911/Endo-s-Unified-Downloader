@@ -5,6 +5,7 @@ What changed in each release, newest first. Each release's page on [GitHub](http
 ## Unreleased
 
 - **Autopilot for connections.** Each download finds its own number of connections as it goes: more while they make it faster (twice as many while each one added keeps its speed), and the fewest that reach what the server or your line allows when more do not help, never past what a server that refuses more (429/503) serves at once. A download starts with at most 8 unless the server caps each connection or downloads from it were fastest with more, so a server that serves few well is not hit with 64 at once. A connection slowing down before a stall now makes way for a new one even with fewer than four running. The download's page says why it has the connections it has (Autopilot), as does `-v` in the CLI; the setting is called Autopilot. `hosts.json` also keeps the speed a site held downloads to, and your line's top speed.
+- **App: priorities share the speed limit.** Under a speed limit, running downloads share it by priority instead of first come first served: a High one gets twice a Normal one's part and a Low one half, a download that takes less leaves the rest to the others, and one with a few seconds left gets a little more.
 - **App: find things faster.** Settings has a search box and starts with the common settings (All settings shows the rest); the Queue's list is narrowed by text in a name or link and by status (Running, Waiting, Failed, Done).
 - **App: Undo.** Removing a download, Clear completed and Clear all offer Undo for 8 seconds, in a note at the bottom of the window.
 - **App: a first-run welcome** on the Add page with the three steps to a first download, a list of the keyboard shortcuts (F1, or Shortcuts in the sidebar), and empty pages that say what to do.
@@ -20,6 +21,7 @@ What changed in each release, newest first. Each release's page on [GitHub](http
 - **Steam Workshop:** an item link (`steamcommunity.com/sharedfiles/filedetails/?id=...`) downloads the item's file, with its name and size, when Steam's public Web API has one (items stored the older way); a newer item says it comes only through the Steam client, where its page was downloaded before.
 - **Bunkr, Cyberdrop and Catbox albums** go to gallery-dl, which reads them, as imgur's do; they downloaded the album's web page before. A Catbox or Litterbox file link was already its file.
 - **SwissTransfer:** a transfer link (`swisstransfer.com/d/...`) adds one download per file with its size, folders kept, read from SwissTransfer's public API; one with a password opens with the password pasted with it. It downloaded the transfer's web page before.
+- **Telegram:** a public channel's post (`t.me/<channel>/<post>`) downloads the photos and videos its public page shows, an album's all; a photo post was an error before. Files posted in a channel are only in Telegram's app.
 - Fixed: a progress bar's fill went square when short and the light sweeping over it was cut to a rectangle; both now follow the bar's round ends.
 
 ## 1.9.0 (2026-10-30)

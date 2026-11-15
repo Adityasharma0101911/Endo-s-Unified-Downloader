@@ -45,7 +45,10 @@ const LISTS_MANY: &str = "this link lists several files: add it as a new downloa
 
 /// Steam's public Web API, whose GetPublishedFileDetails wants no key.
 const STEAM_API: &str = "https://api.steampowered.com";
-const STEAM_CLIENT_ONLY: &str = "this Steam Workshop item comes only through the Steam client, with its game: subscribe to it in Steam (only items stored the older way have a file on the web)";
+/// Where a public channel's posts are shown to anyone, without Telegram's app.
+const TELEGRAM: &str = "https://t.me";
+const TELEGRAM_NOTHING: &str = "the Telegram post shows no photo or video on its public page: files and private channels are only in Telegram's app";
+const STEAM_CLIENT_ONLY: &str ="this Steam Workshop item comes only through the Steam client, with its game: subscribe to it in Steam (only items stored the older way have a file on the web)";
 
 /// What a share link is, from its shape.
 #[derive(Debug, PartialEq)]
@@ -63,6 +66,8 @@ enum Share {
     Terabox(String),
     /// A Steam Workshop item (steamcommunity.com/sharedfiles/filedetails/?id={id}).
     SteamItem(String),
+    /// A public Telegram channel's post (t.me/[s/]{channel}/{post}).
+    TelegramPost { channel: String, post: u64 },
 }
 
 /// Whether `url`'s host is one of `domains` or under one.
@@ -109,6 +114,14 @@ fn share_of(url: &Url) -> Option<Share> {
         };
         return short.map(Share::Terabox);
     }
+    if matches!(host, "t.me" | "telegram.me") {
+        // A channel's username: 4 to 32 letters, digits and underscores ("s" is the preview's, "c" a private channel's).
+        let channel = |s: &str| (4..=32).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+        return match segs[..] {
+            ["s", name, post] | [name, post] if channel(name) => post.parse().ok().map(|post| Share::TelegramPost { channel: name.to_string(), post }),
+            _ => None,
+        };
+    }
     if on(url, &["steamcommunity.com"]) {
         return match segs[..] {
             ["sharedfiles" | "workshop", "filedetails"] => param("id").filter(|id| id.bytes().all(|b| b.is_ascii_digit()) && !id.is_empty()).map(Share::SteamItem),
@@ -139,10 +152,13 @@ fn share_of(url: &Url) -> Option<Share> {
     }
 }
 
-/// Whether `url` is a folder or list link [`list`] reads, or a Steam Workshop item (its file is
-/// named only in Steam's answer).
+/// Whether `url` is a folder or list link [`list`] reads, a Steam Workshop item (its file is
+/// named only in Steam's answer) or a Telegram post (photos and videos).
 pub fn lists(url: &Url) -> bool {
-    matches!(share_of(url), Some(Share::PixeldrainList(_) | Share::GofileFolder(_) | Share::Microsoft { folder: true } | Share::SteamItem(_)))
+    matches!(
+        share_of(url),
+        Some(Share::PixeldrainList(_) | Share::GofileFolder(_) | Share::Microsoft { folder: true } | Share::SteamItem(_) | Share::TelegramPost { .. })
+    )
 }
 
 /// One task per file the share at `url` holds, in a folder named after it; a Gofile folder
@@ -153,6 +169,7 @@ pub async fn list(http: &reqwest::Client, url: &Url, password: Option<&str>) -> 
         Some(Share::GofileFolder(id)) => gofile_list(http, GOFILE_API, &id, password).await?,
         Some(Share::Microsoft { folder: true }) => return Err(MICROSOFT_FOLDER.to_string()),
         Some(Share::SteamItem(id)) => vec![steam_item(http, STEAM_API, &id).await?],
+        Some(Share::TelegramPost { channel, post }) => telegram_post(http, TELEGRAM, &channel, post).await?,
         _ => return Err(format!("{} is not a folder or list link", url)),
     };
     if tasks.is_empty() {
@@ -501,6 +518,30 @@ async fn terabox_file(client: &reqwest::Client, base: &str, short: &str) -> Resu
             items.len()
         )),
     }
+}
+
+/// The photos and videos of post `post` of the public Telegram channel `channel`, as its public
+/// page at `base` shows them (an album's all), named after the post.
+async fn telegram_post(http: &reqwest::Client, base: &str, channel: &str, post: u64) -> Result<Vec<Task>, String> {
+    let page = http.get(format!("{base}/{channel}/{post}?embed=1&mode=tme")).send().await.and_then(|a| a.error_for_status());
+    let html = page.map_err(|e| format!("Cannot reach Telegram: {}", e.without_url()))?.text().await.map_err(|e| format!("Cannot reach Telegram: {}", e.without_url()))?;
+    // A photo is a background image of its frame; a video, the source of its player.
+    let photos = html.split("tgme_widget_message_photo_wrap").skip(1).filter_map(|s| between(s.split('>').next()?, "background-image:url('", "')"));
+    let videos = html.split("<video").skip(1).filter_map(|s| between(s.split('>').next()?, "src=\"", "\""));
+    let mut tasks: Vec<Task> = Vec::new();
+    for found in photos.chain(videos) {
+        let Ok(url) = Url::parse(&found.replace("&amp;", "&")) else { continue };
+        if url.scheme() != "https" || tasks.iter().any(|t| t.urls[0] == url) {
+            continue;
+        }
+        let ext = url.path().rsplit_once('.').map(|(_, e)| e).filter(|e| e.len() <= 4 && e.bytes().all(|b| b.is_ascii_alphanumeric())).unwrap_or("jpg");
+        let name = component(&format!("{channel}-{post}-{}.{ext}", tasks.len() + 1), "telegram")?;
+        tasks.push(Task { urls: vec![url], name: Some(name), from_document: true, ..Task::default() });
+    }
+    if tasks.is_empty() {
+        return Err(TELEGRAM_NOTHING.to_string());
+    }
+    Ok(tasks)
 }
 
 #[derive(Default, Deserialize)]
@@ -879,6 +920,59 @@ mod tests {
         for other in ["https://steamcommunity.com/sharedfiles/filedetails/?id=x1", "https://steamcommunity.com/app/4000/workshop/", "https://steamcommunity.com/linkfilter/?u=https://a.example"] {
             assert_eq!(share(other), None, "{other}");
         }
+    }
+
+    fn telegram(head: &str) -> (u16, String, String) {
+        // As a post's public page shows an album, cut down: two photos (one shown twice), a video and its thumbnail.
+        const ALBUM: &str = r#"<div class="tgme_widget_message_grouped_wrap js-message_grouped_wrap">
+            <a class="tgme_widget_message_photo_wrap grouped_media_wrap blured js-message_photo" style="left:0px;width:149px;background-image:url('https://cdn4.telesco.pe/file/AbC-1.jpg')" href="https://t.me/chan_1/300?single"></a>
+            <a class="tgme_widget_message_photo_wrap grouped_media_wrap" style="background-image:url('https://cdn4.telesco.pe/file/AbC-1.jpg')"></a>
+            <a class="tgme_widget_message_photo_wrap" style="background-image:url('http://cdn4.telesco.pe/file/plain.jpg')"></a>
+            <i class="tgme_widget_message_video_thumb" style="background-image:url('https://cdn4.telesco.pe/file/thumb.jpg')"></i>
+            <video src="https://cdn1.telesco.pe/file/f4a2c11d62.mp4?token=x&amp;h=1" class="tgme_widget_message_video js-message_video" playsinline></video>
+            <a class="tgme_widget_message_photo_wrap" style="background-image:url('https://cdn5.telesco.pe/file/DeF_2.png')"></a></div>"#;
+        match target(head) {
+            "/chan_1/300?embed=1&mode=tme" => (200, "Content-Type: text/html\r\n".into(), ALBUM.into()),
+            "/chan_1/301?embed=1&mode=tme" => (200, "Content-Type: text/html\r\n".into(), r#"<div class="tgme_widget_message_text">Only words</div>"#.into()),
+            _ => (404, String::new(), String::new()),
+        }
+    }
+
+    /// A public Telegram post is its photos and videos as its public page shows them, named after
+    /// the post; one with none (words, a file) says why.
+    #[tokio::test]
+    async fn telegram_posts_are_their_photos_and_videos() {
+        let (base, _) = serve(telegram).await;
+        let tasks = telegram_post(&http(), &base, "chan_1", 300).await.unwrap();
+        let listed: Vec<_> = tasks.iter().map(|t| (t.urls[0].to_string(), t.name.clone().unwrap())).collect();
+        assert_eq!(
+            listed,
+            [
+                ("https://cdn4.telesco.pe/file/AbC-1.jpg".to_string(), PathBuf::from("chan_1-300-1.jpg")),
+                ("https://cdn5.telesco.pe/file/DeF_2.png".to_string(), PathBuf::from("chan_1-300-2.png")),
+                ("https://cdn1.telesco.pe/file/f4a2c11d62.mp4?token=x&h=1".to_string(), PathBuf::from("chan_1-300-3.mp4")),
+            ]
+        );
+        assert_eq!(telegram_post(&http(), &base, "chan_1", 301).await.unwrap_err(), TELEGRAM_NOTHING);
+        assert!(telegram_post(&http(), &base, "chan_1", 302).await.unwrap_err().starts_with("Cannot reach Telegram"));
+        let post = |channel: &str, post: u64| Some(Share::TelegramPost { channel: channel.into(), post });
+        assert_eq!(share("https://t.me/durov/300"), post("durov", 300));
+        assert_eq!(share("https://t.me/s/durov/300?single"), post("durov", 300));
+        for other in ["https://t.me/durov", "https://t.me/c/1234567/5", "https://t.me/+AbCdEf/5", "https://t.me/joinchat/AbC", "https://t.me/s/durov"] {
+            assert_eq!(share(other), None, "{other}");
+        }
+        assert!(lists(&Url::parse("https://t.me/durov/300").unwrap()));
+    }
+
+    /// Live: an album post of a public channel is its ten photos, and a video post its video.
+    #[tokio::test]
+    #[ignore]
+    async fn live_telegram_posts() {
+        let album = list(&http(), &Url::parse("https://t.me/durov/300").unwrap(), None).await.unwrap();
+        assert_eq!(album.len(), 10, "{album:?}");
+        assert!(album.iter().all(|t| t.urls[0].host_str().is_some_and(|h| h.ends_with(".telesco.pe"))), "{album:?}");
+        let video = list(&http(), &Url::parse("https://t.me/telegram/300").unwrap(), None).await.unwrap();
+        assert!(video.iter().any(|t| t.name.as_ref().is_some_and(|n| n.extension() == Some("mp4".as_ref()))), "{video:?}");
     }
 
     /// Live: a Workshop item stored the older way is its file on Steam's CDN; a newer one says it
