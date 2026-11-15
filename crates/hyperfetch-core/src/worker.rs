@@ -36,6 +36,8 @@ const WRITE_INTERVAL: Duration = Duration::from_millis(250);
 const TAKEOVER_SILENCE: Duration = Duration::from_secs(2);
 /// ...or this many of the mirror's answer times, if longer.
 const TAKEOVER_TTFBS: u32 = 4;
+/// How long an address a connection kept far slower on than the others is left alone.
+const ROUTE_REST: Duration = Duration::from_secs(30);
 
 /// Why an attempt failed, which decides how the engine retries it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -341,6 +343,8 @@ pub struct WorkerShared {
     pub addresses: bool,
     /// Routes of `clients` that could not connect, dropped for the rest of the download.
     pub dropped_routes: Arc<Mutex<Vec<usize>>>,
+    /// Routes resting until then (see `WorkerShared::rest`).
+    pub resting_routes: Arc<Mutex<Vec<(usize, tokio::time::Instant)>>>,
     /// The routes and the origins (`scheme://host:port`) each has reached in this download.
     pub reached: Arc<Mutex<Vec<(usize, String)>>>,
     pub auth: Option<Arc<Auth>>,
@@ -379,12 +383,25 @@ impl WorkerShared {
         !self.cancel.is_cancelled()
     }
 
-    /// The worker's own route (workers take turns on them), or once that is dropped the next one
-    /// still in use: an index into `clients`, whose request goes out on `client` when that is empty.
+    /// The worker's own route (workers take turns on them), or while that is dropped or resting
+    /// the next one in use: an index into `clients`, whose request goes out on `client` when that
+    /// is empty.
     pub fn route_for_worker(&self, worker_id: usize) -> usize {
         let routes = self.clients.len().max(1);
-        let dropped = self.dropped_routes.lock();
-        (0..routes).map(|i| (worker_id + i) % routes).find(|r| !dropped.contains(r)).unwrap_or(0)
+        let (dropped, resting, now) = (self.dropped_routes.lock(), self.resting_routes.lock(), tokio::time::Instant::now());
+        let rests = |r: &usize| resting.iter().any(|(rested, until)| rested == r && *until > now);
+        let turns = || (0..routes).map(|i| (worker_id + i) % routes).filter(|r| !dropped.contains(r));
+        turns().find(|r| !rests(r)).or_else(|| turns().next()).unwrap_or(0)
+    }
+
+    /// Rests `route`, an address of the host a connection kept far slower on than the others, for
+    /// `ROUTE_REST`: then it is measured again, as the address may be busy only for a while.
+    fn rest(&self, route: usize) {
+        let until = tokio::time::Instant::now() + ROUTE_REST;
+        let mut resting = self.resting_routes.lock();
+        resting.retain(|(rested, _)| *rested != route);
+        resting.push((route, until));
+        tracing::warn!("Route {} is far slower than the others; resting it for {}s", route, ROUTE_REST.as_secs());
     }
 
     /// The route whose share of a host's budget (see [`crate::hosts`]) a request on `route` takes:
@@ -780,7 +797,7 @@ impl HttpWorker {
                 if self.lags(chunk.id, mirror_id, rate, now.into_std()) {
                     // Of a host's addresses, the one a connection keeps so slow on is likely why.
                     if s.addresses {
-                        s.retire(route, "is far slower than the others");
+                        s.rest(route);
                     }
                     break Err((
                         FailureKind::Transient,
@@ -1200,6 +1217,7 @@ mod tests {
             clients: Arc::new(Vec::new()),
             addresses: false,
             dropped_routes: Default::default(),
+            resting_routes: Default::default(),
             reached: Default::default(),
             auth: None,
             writer: DiskWriter::open_or_create(path, size).unwrap(),
@@ -1312,9 +1330,13 @@ mod tests {
         let err = worker.receive(&slow, 0, body, 0, 1).await.unwrap_err();
         assert_eq!(err.0, FailureKind::Transient);
         assert!(err.1.contains("far slower than the other connections"), "{}", err.1);
-        assert_eq!(*worker.shared.dropped_routes.lock(), [1], "and so is the address it was on");
         let waited = started.elapsed();
         assert!(waited >= LAG_WINDOW && waited < LAG_WINDOW + Duration::from_millis(200), "judged after a window: {waited:?}");
+        // The address it was on rests, and is measured again after.
+        assert_eq!(worker.shared.route_for_worker(1), 0);
+        tokio::time::advance(ROUTE_REST).await;
+        assert_eq!(worker.shared.route_for_worker(1), 1);
+        assert!(worker.shared.dropped_routes.lock().is_empty());
         assert!(slow.current_offset.load(Ordering::SeqCst) >= 50_000, "what arrived is kept");
     }
 
