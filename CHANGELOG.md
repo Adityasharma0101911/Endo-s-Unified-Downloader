@@ -2,7 +2,7 @@
 
 What changed in each release, newest first. Each release's page on [GitHub](https://github.com/Adityasharma0101911/Endo-s-Unified-Downloader/releases) has its files and the full notes.
 
-## Unreleased
+## 2.0.0 (2026-11-15)
 
 - **Extension: big downloads go to the app whatever their type.** With "Send browser downloads to the app" on, a download of 50 MB or more goes to the app whatever its type ("Any file from", 0 turns it off): a 5 GB `.dat` no longer stays in the browser. The file types decide below that, and their default list is longer (`.dat`, `.bin`, `.vhdx`, `.qcow2`, `.safetensors`, `.gguf`, more video, audio, e-book and font types); a list you edited is kept. "Send everything" sends every download of at least the minimum size, "Always from these sites" a site's downloads whatever their type or size. A captured download now goes with the other headers the browser sent for it (Authorization among them), and the app is started when it is not running ("Start the app when needed", on by default).
 - **Extension: why a download stayed in the browser.** The popup's new Downloads view lists the last 20 browser downloads with where each went and why, "Send to app" for one that stayed, and Always send / Never for the tab's site. A file the page made itself (`blob:` or `data:`) offers "Send page" when the app can take the page it came from. The list stays in the browser for the session.
