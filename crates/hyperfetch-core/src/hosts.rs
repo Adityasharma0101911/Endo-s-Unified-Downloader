@@ -11,11 +11,12 @@
 //! strict one asks), and than the connection cap the host was seen to enforce. A limit of 0 sets
 //! none.
 //!
-//! Two facts are also kept across restarts once a front end names a file for them (see
-//! [`keep_in`]): the connections a download from the host ended up fastest with, and the
-//! connection cap it was seen to enforce. They are kept for `KEPT_FOR` after they were last
-//! learned, by host only (`https://cdn.example:443`, never a path or query). A kept cap holds the
-//! host's first requests in a run as one learned then would.
+//! Some facts are also kept across restarts once a front end names a file for them (see
+//! [`keep_in`]): the connections a download from the host ended up fastest with, the connection
+//! cap it was seen to enforce, and the speed it held a download to whatever its connections. They
+//! are kept for `KEPT_FOR` after they were last learned, by host only (`https://cdn.example:443`,
+//! never a path or query). A kept cap holds the host's first requests in a run as one learned then
+//! would. So is the user's line speed (see [`line`]), under a name no host has.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -39,6 +40,10 @@ const KEEP_HOSTS: usize = 256;
 const KEPT_FOR: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// Hosts kept across restarts: those learned about last.
 const KEEP_KEPT: usize = 300;
+/// What the line speed is kept under: no host's name, as those have a scheme.
+const LINE: &str = "line";
+/// A download within this share of the fastest one went as fast as the line lets it.
+const LINE_BAND: f64 = 0.1;
 
 static HOSTS: LazyLock<Hosts> = LazyLock::new(Hosts::default);
 
@@ -136,9 +141,31 @@ pub fn best_connections(url: &Url) -> Option<usize> {
     HOSTS.kept(&HostKey::of(url), unix_now()).and_then(|kept| kept.connections)
 }
 
-/// Keeps that a download from `url`'s host ended up fastest with `connections`.
-pub fn record_best_connections(url: &Url, connections: usize) {
-    HOSTS.keep(&HostKey::of(url), unix_now(), |kept| kept.connections = Some(connections).filter(|&n| n > 0))
+/// The speed, in bytes per second, more connections did not raise a download from `url`'s host
+/// past, if that is kept: the most it serves one user.
+pub fn limit(url: &Url) -> Option<f64> {
+    HOSTS.kept(&HostKey::of(url), unix_now()).and_then(|kept| kept.limit)
+}
+
+/// Keeps what a download from `url`'s host settled on (see `crate::autopilot`): it was fastest
+/// with `connections`, and more did not raise it past `limit`, if that is what held it.
+pub fn record_settled(url: &Url, connections: usize, limit: Option<f64>) {
+    HOSTS.keep(&HostKey::of(url), unix_now(), |kept| {
+        kept.connections = Some(connections).filter(|&n| n > 0);
+        kept.limit = limit;
+    })
+}
+
+/// The user's line speed, in bytes per second: the fastest a download went, once another went
+/// within `LINE_BAND` of it. None before.
+pub fn line() -> Option<f64> {
+    HOSTS.line(unix_now())
+}
+
+/// A download went at most `speed` bytes per second. Learned only once a front end named a file
+/// to keep it in (see [`keep_in`]): without one, there is no user whose line it is.
+pub fn record_line(speed: f64) {
+    HOSTS.record_line(speed, unix_now())
 }
 
 fn unix_now() -> u64 {
@@ -357,13 +384,25 @@ impl Entry {
 /// the Unix epoch).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 struct Kept {
-    /// The connections a download from it ended up fastest with (see `engine::Ramp`).
+    /// The connections a download from it ended up fastest with (see `crate::autopilot`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     connections: Option<usize>,
     /// The connection cap it was seen to enforce.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cap: Option<usize>,
+    /// The speed more connections did not raise a download from it past (see [`limit`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    limit: Option<f64>,
+    /// Under `LINE` only: the fastest a download went, and how many went within `LINE_BAND` of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    line: Option<(f64, u32)>,
     at: u64,
+}
+
+impl Kept {
+    fn tells(&self) -> bool {
+        self.connections.is_some() || self.cap.is_some() || self.limit.is_some() || self.line.is_some()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -379,7 +418,7 @@ impl Memory {
     /// Drops what is older than `KEPT_FOR` or tells nothing, and past `KEEP_KEPT` what was
     /// learned first.
     fn prune(&mut self, now: u64) {
-        self.hosts.retain(|_, kept| (kept.connections.is_some() || kept.cap.is_some()) && now.saturating_sub(kept.at) < KEPT_FOR.as_secs());
+        self.hosts.retain(|_, kept| kept.tells() && now.saturating_sub(kept.at) < KEPT_FOR.as_secs());
         if self.hosts.len() > KEEP_KEPT {
             let mut ages: Vec<u64> = self.hosts.values().map(|kept| kept.at).collect();
             ages.sort_unstable_by(|a, b| b.cmp(a));
@@ -431,15 +470,43 @@ impl Hosts {
 
     /// What is kept of `key`'s host, if anything and not too old.
     fn kept(&self, key: &HostKey, now: u64) -> Option<Kept> {
-        let kept = *self.kept.lock().hosts.get(&key.origin()?)?;
+        self.kept_as(&key.origin()?, now)
+    }
+
+    /// What is kept under `name`, if anything and not too old.
+    fn kept_as(&self, name: &str, now: u64) -> Option<Kept> {
+        let kept = *self.kept.lock().hosts.get(name)?;
         (now.saturating_sub(kept.at) < KEPT_FOR.as_secs()).then_some(kept)
     }
 
     /// Changes what is kept of `key`'s host, learned `now`.
     fn keep(&self, key: &HostKey, now: u64, change: impl FnOnce(&mut Kept)) {
-        let Some(origin) = key.origin() else { return };
+        if let Some(origin) = key.origin() {
+            self.keep_as(origin, now, change)
+        }
+    }
+
+    fn line(&self, now: u64) -> Option<f64> {
+        self.kept_as(LINE, now).and_then(|kept| kept.line).filter(|&(_, seen)| seen >= 2).map(|(fastest, _)| fastest)
+    }
+
+    fn record_line(&self, speed: f64, now: u64) {
+        if self.kept.lock().file.is_none() {
+            return;
+        }
+        let line = match self.kept_as(LINE, now).and_then(|kept| kept.line) {
+            // Slower tells nothing of the line: the server held it back, or other downloads shared it.
+            Some((fastest, _)) if speed < fastest * (1.0 - LINE_BAND) => return,
+            Some((fastest, seen)) if speed <= fastest * (1.0 + LINE_BAND) => (fastest.max(speed), seen + 1),
+            _ if speed > 0.0 => (speed, 1),
+            _ => return,
+        };
+        self.keep_as(LINE.to_string(), now, |kept| kept.line = Some(line))
+    }
+
+    fn keep_as(&self, name: String, now: u64, change: impl FnOnce(&mut Kept)) {
         let mut memory = self.kept.lock();
-        let kept = memory.hosts.entry(origin).or_default();
+        let kept = memory.hosts.entry(name).or_default();
         change(kept);
         kept.at = now;
         memory.changed = true;
@@ -831,11 +898,38 @@ mod tests {
         let reloaded = leaked();
         reloaded.keep_in(file, later);
         assert!(reloaded.kept.lock().hosts.is_empty());
-        let many = (0..KEEP_KEPT + 10).map(|n| (format!("http://h{n}.example:80"), Kept { connections: Some(4), cap: None, at: now + n as u64 }));
+        let many = (0..KEEP_KEPT + 10).map(|n| (format!("http://h{n}.example:80"), Kept { connections: Some(4), at: now + n as u64, ..Kept::default() }));
         let mut memory = Memory { hosts: many.collect(), ..Memory::default() };
         memory.prune(now);
         assert_eq!(memory.hosts.len(), KEEP_KEPT, "those learned about last");
         assert!(!memory.hosts.contains_key("http://h9.example:80") && memory.hosts.contains_key("http://h10.example:80"));
+    }
+
+    /// What a download settled on is kept by host, the speed that held it among it; the line's
+    /// speed once two downloads went about as fast, and only with a file to keep it in.
+    #[test]
+    fn test_a_hosts_limit_and_the_line_are_kept_across_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("hosts.json");
+        let (host, now) = (key("https://capped.example/a/b.iso?sig=1"), unix_now());
+        let hosts = leaked();
+        hosts.record_line(9e6, now);
+        assert_eq!(hosts.kept_as(LINE, now), None, "no file, no user");
+        hosts.keep_in(file.clone(), now);
+        hosts.keep(&host, now, |kept| (kept.connections, kept.limit) = (Some(2), Some(4e6)));
+        for (speed, line) in [(9e6, None), (5e6, None), (9.5e6, Some(9.5e6)), (20e6, None), (19e6, Some(20e6))] {
+            hosts.record_line(speed, now);
+            assert_eq!(hosts.line(now), line, "after {speed}");
+        }
+        hosts.save(now);
+        let saved = std::fs::read_to_string(&file).unwrap();
+        assert!(saved.contains("\"line\"") && saved.contains("https://capped.example:443") && !saved.contains("sig"), "{saved}");
+
+        let after = leaked();
+        after.keep_in(file, now);
+        assert_eq!(after.kept(&host, now).map(|kept| (kept.connections, kept.limit)), Some((Some(2), Some(4e6))));
+        assert_eq!(after.line(now), Some(20e6));
+        assert_eq!(after.line(now + KEPT_FOR.as_secs()), None, "forgotten as the rest is");
     }
 
     #[test]

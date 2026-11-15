@@ -241,11 +241,22 @@ pub struct WorkerShared {
     /// a retry keeps what arrived and starts at once, so a quiet connection is best replaced.
     pub body_idle: Duration,
     /// Connections the download keeps open (see `DownloadOptions::adaptive`): a worker whose id
-    /// is not below it stops once its attempt ends.
+    /// is not below it waits, once its attempt ends, until it is again.
     pub width: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl WorkerShared {
+    /// Waits while `worker_id` is past the width; false once the workers are to stop.
+    pub(crate) async fn within_width(&self, worker_id: usize) -> bool {
+        while worker_id >= self.width.load(Ordering::Relaxed) {
+            tokio::select! {
+                _ = self.cancel.cancelled() => return false,
+                _ = tokio::time::sleep(IDLE_POLL) => {}
+            }
+        }
+        !self.cancel.is_cancelled()
+    }
+
     /// The worker's own route (workers take turns on them), or once that is dropped the next one
     /// still in use: an index into `clients`, whose request goes out on `client` when that is empty.
     pub fn route_for_worker(&self, worker_id: usize) -> usize {
@@ -336,7 +347,7 @@ impl HttpWorker {
         }
         let s = &self.shared;
         loop {
-            if s.cancel.is_cancelled() || self.worker_id >= s.width.load(Ordering::Relaxed) {
+            if !s.within_width(self.worker_id).await {
                 return;
             }
             let slot = tokio::select! {
@@ -1533,12 +1544,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_a_worker_past_the_width_stops_once_its_attempt_ends() {
+    async fn test_a_worker_past_the_width_waits_until_it_is_taken_again_or_stopped() {
         let dir = tempfile::tempdir().unwrap();
         let url = Url::parse("http://127.0.0.1:9/f").unwrap();
         let (worker, _, _events) = test_worker(&url, &dir.path().join("f.part"), 1 << 20);
-        worker.shared.width.store(0, Ordering::Relaxed);
-        tokio::time::timeout(Duration::from_secs(5), worker.run(None)).await.expect("the worker stopped");
+        let shared = worker.shared.clone();
+        shared.width.store(0, Ordering::Relaxed);
+        assert!(tokio::time::timeout(IDLE_POLL * 4, shared.within_width(1)).await.is_err(), "waits");
+        shared.width.store(2, Ordering::Relaxed);
+        assert!(tokio::time::timeout(Duration::from_secs(5), shared.within_width(1)).await.unwrap(), "taken again");
+        shared.width.store(0, Ordering::Relaxed);
+        let run = tokio::spawn(worker.run(None));
+        tokio::time::sleep(IDLE_POLL * 4).await;
+        assert!(!run.is_finished(), "waits");
+        shared.cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(5), run).await.expect("the worker stopped").unwrap();
     }
 
     #[test]
