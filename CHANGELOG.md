@@ -29,6 +29,7 @@ What changed in each release, newest first. Each release's page on [GitHub](http
 - **Public buckets:** an Amazon S3 (`s3://`, virtual-hosted or path-style), Backblaze B2, Wasabi or DigitalOcean Spaces bucket, a Google Cloud Storage bucket (`gs://`, `storage.googleapis.com/<bucket>/`) or an Azure Blob container that anyone may list adds one download per object under its prefix, folders kept, with its size and MD5 where it is one; a private one says it needs its owner's key.
 - **WebDAV:** a `webdav://`, `webdavs://`, `dav://` or `davs://` link downloads the file it names, or adds one download per file of the folder it names (subfolders kept), with a sign-in given in the link; these links were refused before.
 - Fixed: a progress bar's fill went square when short and the light sweeping over it was cut to a rectangle; both now follow the bar's round ends.
+- **Open directories:** a link to a web server's directory index (Apache, nginx, lighttpd, IIS, Caddy, Python's http.server) adds one download per file below it, subfolders kept, with each file's size where the page gives it in bytes; before, the index page itself was downloaded.
 
 ## 1.9.0 (2026-10-30)
 

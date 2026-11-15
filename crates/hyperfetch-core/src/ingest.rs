@@ -259,6 +259,7 @@ pub fn might_list(url: &Url) -> bool {
         || folders::lists(url)
         || feeds::lists(url)
         || media::lists(url)
+        || folders::directory_lists(url)
 }
 
 /// `token` as a link [`might_list`] takes, a "leaving this site" link replaced by its target.
@@ -580,6 +581,9 @@ async fn list(http: &reqwest::Client, url: &Url, options: &ListOptions) -> Optio
     }
     if media::lists(url) {
         return media::list(http, url, options).await;
+    }
+    if folders::directory_lists(url) {
+        return folders::list_directory(http, url, options).await;
     }
     None
 }

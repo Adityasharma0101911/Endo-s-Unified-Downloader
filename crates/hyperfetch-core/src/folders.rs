@@ -8,6 +8,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use percent_encoding::percent_decode_str;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use url::Url;
@@ -868,6 +869,157 @@ async fn mediafire_files(
     Ok(tasks)
 }
 
+/// Most pages one open directory listing reads, how many folders deep below its link, and how
+/// much of one page is read.
+const MAX_DIRECTORY_PAGES: usize = 200;
+const MAX_DIRECTORY_DEPTH: usize = 10;
+const MAX_DIRECTORY_PAGE: usize = 4 << 20;
+
+/// Whether `url` may be a web server's directory index: an http(s) link whose path ends in `/`.
+/// Its page decides (see [`list_directory`]), so it is asked only when no other lister takes it.
+pub fn directory_lists(url: &Url) -> bool {
+    matches!(url.scheme(), "http" | "https") && url.path().ends_with('/') && url.query().is_none()
+}
+
+/// The page at `url`, when it is HTML of at most [`MAX_DIRECTORY_PAGE`] bytes; None otherwise.
+async fn directory_page(http: &reqwest::Client, url: &Url, options: &ListOptions) -> Option<String> {
+    let mut answer = options.get(http, url).send().await.ok()?.error_for_status().ok()?;
+    let html = answer.headers().get(reqwest::header::CONTENT_TYPE).and_then(|t| t.to_str().ok()).is_none_or(|t| t.contains("html"));
+    if !html || answer.content_length().is_some_and(|n| n > MAX_DIRECTORY_PAGE as u64) {
+        return None;
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = answer.chunk().await.ok()? {
+        body.extend_from_slice(&chunk);
+        if body.len() > MAX_DIRECTORY_PAGE {
+            return None;
+        }
+    }
+    Some(String::from_utf8_lossy(&body).into_owned())
+}
+
+/// The links of a directory index page at `page` below it (no parent, query or other host), each
+/// with its size where the page gives it in bytes; None when the page is no directory index:
+/// Apache's, nginx's, lighttpd's ("Index of /..."), Python's http.server's ("Directory listing
+/// for /..."), IIS's ("[To Parent Directory]", or "host - /path/" at a site's root) or Caddy's.
+fn index_entries(page: &Url, html: &str) -> Option<Vec<(Url, Option<u64>)>> {
+    let lower = html.to_ascii_lowercase();
+    let title = between(&lower, "<title>", "</title>").unwrap_or_default().trim();
+    let iis = lower.contains("[to parent directory]") || (lower.contains("<pre>") && title.ends_with(&format!(" - {}", page.path().to_ascii_lowercase())));
+    let index = title.starts_with("index of /") || title.starts_with("directory listing for /") || iis || lower.contains("class=\"caddy-logo\"");
+    if !index {
+        return None;
+    }
+    // Each link: where its tag starts, where its </a> ends, and its href.
+    let mut anchors = Vec::new();
+    let mut at = 0;
+    while let Some(start) = lower[at..].find("<a ").map(|i| at + i) {
+        let tag_end = lower[start..].find('>').map_or(lower.len(), |i| start + i);
+        let end = lower[tag_end..].find("</a>").map_or(tag_end, |i| tag_end + i + 4);
+        let tag = &html[start..tag_end];
+        let href = tag.to_ascii_lowercase().find("href=").map(|i| &tag[i + 5..]).and_then(|v| {
+            let quote = v.chars().next().filter(|c| *c == '"' || *c == '\'');
+            let v = quote.map_or(v, |q| &v[q.len_utf8()..]);
+            Some(&v[..v.find(|c: char| quote.map_or(c.is_whitespace(), |q| c == q)).unwrap_or(v.len())])
+        });
+        anchors.push((start, end, href.map(|h| h.replace("&amp;", "&"))));
+        at = end.max(start + 3);
+    }
+    // A size in bytes: Caddy's data-size, else a number that ends what is shown beside the link
+    // (nginx's after it, IIS's before it); "1.2K" and "-" give none.
+    let size_in = |text: &str| -> Option<u64> {
+        if let Some(size) = between(text, "data-size=\"", "\"") {
+            return size.parse().ok();
+        }
+        let mut plain = String::new();
+        let mut in_tag = false;
+        for c in text.chars() {
+            match c {
+                '<' => in_tag = true,
+                '>' => in_tag = false,
+                c if !in_tag => plain.push(c),
+                _ => {}
+            }
+        }
+        let last = plain.replace("&nbsp;", " ").split_whitespace().last()?.to_string();
+        last.bytes().all(|b| b.is_ascii_digit()).then(|| last.parse().ok()).flatten()
+    };
+    let mut found: Vec<(Url, Option<u64>)> = Vec::new();
+    for (i, (start, end, href)) in anchors.iter().enumerate() {
+        let Some(mut url) = href.as_deref().and_then(|h| page.join(h).ok()) else { continue };
+        url.set_fragment(None);
+        let below = url.origin() == page.origin() && url.query().is_none() && url.path().starts_with(page.path()) && url.path() != page.path();
+        if !below {
+            continue;
+        }
+        let segment = if iis {
+            &html[anchors.get(i.wrapping_sub(1)).map_or(0, |a| a.1)..*start]
+        } else {
+            &html[*end..anchors.get(i + 1).map_or(html.len(), |a| a.0)]
+        };
+        let size = size_in(segment).filter(|_| !url.path().ends_with('/'));
+        // An icon's link and the name's go to the same file: the size is beside one of them.
+        match found.iter_mut().find(|(known, _)| *known == url) {
+            Some((_, known)) => *known = known.or(size),
+            None => found.push((url, size)),
+        }
+    }
+    Some(found)
+}
+
+/// One task per file under the web server's directory index at `url`, subfolders kept (at most
+/// [`MAX_DIRECTORY_DEPTH`] deep, [`MAX_DIRECTORY_PAGES`] pages), in a folder named after it, with
+/// its size where the page gives it in bytes. None when its page is no directory index (or cannot
+/// be read): the link then goes on as any link.
+pub async fn list_directory(http: &reqwest::Client, url: &Url, options: &ListOptions) -> Option<Result<Vec<Task>, String>> {
+    let first = directory_page(http, url, options).await?;
+    let entries = index_entries(url, &first)?;
+    let start = url.path().to_string();
+    let top = url.path_segments().and_then(|s| s.filter(|s| !s.is_empty()).last()).map(|s| percent_decode_str(s).decode_utf8_lossy().into_owned());
+    let folder = match component(top.as_deref().unwrap_or_default(), url.host_str().unwrap_or("files")) {
+        Ok(folder) => folder,
+        Err(e) => return Some(Err(e)),
+    };
+    let (mut tasks, mut pending, mut seen, mut pages) = (Vec::new(), VecDeque::new(), HashSet::from([url.clone()]), 1);
+    let mut unread: Vec<String> = Vec::new();
+    let mut entries = Some(entries);
+    loop {
+        for (link, size) in entries.take().unwrap_or_default() {
+            let parts: Vec<String> = link.path()[start.len()..].split('/').filter(|s| !s.is_empty()).map(|s| percent_decode_str(s).decode_utf8_lossy().into_owned()).collect();
+            if link.path().ends_with('/') {
+                if parts.len() <= MAX_DIRECTORY_DEPTH && seen.insert(link.clone()) {
+                    pending.push_back(link);
+                }
+                continue;
+            }
+            let Ok(name) = clean_path(parts.iter().map(String::as_str)) else { continue };
+            if seen.insert(link.clone()) {
+                tasks.push(Task { urls: vec![link], name: Some(name), folder: Some(folder.clone()), size, ..Task::default() });
+            }
+        }
+        if let Err(e) = too_many(tasks.len()) {
+            return Some(Err(e));
+        }
+        let Some(next) = pending.pop_front() else { break };
+        pages += 1;
+        if pages > MAX_DIRECTORY_PAGES {
+            return Some(Err(format!("the directory holds more than {} folders: add a subfolder's link instead", MAX_DIRECTORY_PAGES)));
+        }
+        match directory_page(http, &next, options).await.and_then(|html| index_entries(&next, &html)) {
+            Some(found) => entries = Some(found),
+            None => unread.push(percent_decode_str(&next.path()[start.len()..]).decode_utf8_lossy().into_owned()),
+        }
+    }
+    if !unread.is_empty() {
+        let shown = if unread.len() > 3 { format!("{}, ...", unread[..3].join(", ")) } else { unread.join(", ") };
+        options.fail(format!("{} subfolder(s) of the directory could not be read, and the files in them are missing ({shown})", unread.len()));
+    }
+    if tasks.is_empty() {
+        return Some(Err("the directory holds no files".to_string()));
+    }
+    Some(Ok(tasks))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1241,5 +1393,126 @@ mod tests {
         );
         assert_eq!(error(503, b"<html>busy</html>"), (Why::Busy, "MediaFire answered HTTP 503 instead of listing the folder".into()));
         assert_eq!(error(200, b"<html>maintenance</html>").0, Why::Broken);
+    }
+
+    /// Directory index pages as nginx, Apache, Python's http.server, IIS and Caddy write them,
+    /// each server's folders below one another.
+    fn open_directories(path: &str, _: Option<crate::range::ByteRange>) -> crate::hls::tests::Reply {
+        let html = |body: &str| (200, "Content-Type: text/html; charset=utf-8\r\n".to_string(), body.as_bytes().to_vec());
+        match path {
+            "/pub/" => html(concat!(
+                "<html><head><title>Index of /pub/</title></head><body><h1>Index of /pub/</h1><hr><pre><a href=\"../\">../</a>\n",
+                "<a href=\"a%20b.txt\">a b.txt</a>                                    01-Jan-2024 10:00               12345\n",
+                "<a href=\"sub/\">sub/</a>                                           01-Jan-2024 10:00                   -\n",
+                "<a href=\"broken/\">broken/</a>                                     01-Jan-2024 10:00                   -\n",
+                "<a href=\"?C=N;O=D\">sorted</a> <a href=\"http://other.example/pub/x.bin\">x</a> <a href=\"/elsewhere/y.bin\">y</a> <a href=\"#top\">top</a>\n",
+                "</pre><hr></body></html>",
+            )),
+            "/pub/sub/" => html(concat!(
+                "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 3.2 Final//EN\"><html><head><title>Index of /pub/sub</title></head><body><table>",
+                "<tr><th><a href=\"?C=N;O=D\">Name</a></th><th><a href=\"?C=S;O=A\">Size</a></th></tr>",
+                "<tr><td><img src=\"/icons/back.gif\" alt=\"[PARENTDIR]\"></td><td><a href=\"/pub/\">Parent Directory</a></td><td>&nbsp;</td><td align=\"right\">  - </td></tr>",
+                "<tr><td><a href=\"c.iso\"><img src=\"/icons/unknown.gif\" alt=\"[   ]\"></a></td><td><a href=\"c.iso\">c.iso</a></td>",
+                "<td align=\"right\">2024-01-01 10:00  </td><td align=\"right\">1.2G</td></tr>",
+                "<tr><td><img src=\"/icons/folder.gif\" alt=\"[DIR]\"></td><td><a href=\"deep/\">deep/</a></td><td align=\"right\">2024-01-01 10:00  </td><td align=\"right\">  - </td></tr>",
+                "</table></body></html>",
+            )),
+            "/pub/sub/deep/" => html(concat!(
+                "<!DOCTYPE HTML><html lang=\"en\"><head><title>Directory listing for /pub/sub/deep/</title></head><body><ul>",
+                "<li><a href=\"d%C3%A9.bin\">d\u{e9}.bin</a></li><li><a href=\"..%2F..%2Fescape.bin\">x</a></li><li><a href=\"%2e%2e/up.bin\">up</a></li></ul></body></html>",
+            )),
+            "/pub/broken/" => (404, String::new(), b"gone".to_vec()),
+            "/iis/" => html(concat!(
+                "<html><head><title>host - /iis/</title></head><body><H1>host - /iis/</H1><hr><pre><A HREF=\"/\">[To Parent Directory]</A><br><br>",
+                " 1/1/2024 10:00 AM        12345 <A HREF=\"/iis/e.zip\">e.zip</A><br> 1/1/2024 10:00 AM        &lt;dir&gt; <A HREF=\"/iis/sub/\">sub</A><br>",
+                "</pre><hr></body></html>",
+            )),
+            "/iis/sub/" => html("<pre><A HREF=\"/iis/\">[To Parent Directory]</A><br><br> 1/2/2024 10:00 AM 7 <A HREF=\"/iis/sub/f.txt\">f.txt</A><br></pre>"),
+            "/caddy/" => html(concat!(
+                "<html><head><title>caddy</title></head><body><header><a href=\"/\">/</a><a href=\"/caddy/\">caddy/</a></header><table><thead>",
+                "<tr><th><a href=\"?sort=name&amp;order=desc\">Name</a></th></tr></thead><tbody>",
+                "<tr><td></td><td><a href=\"..\"><span class=\"go-up\">Up</span></a></td><td></td></tr>",
+                "<tr class=\"file\"><td></td><td><a href=\"./dir/\"><span class=\"name\">dir</span></a></td><td>&mdash;</td></tr>",
+                "<tr class=\"file\"><td></td><td><a href=\"./g.txt\"><span class=\"name\">g.txt</span></a></td>",
+                "<td class=\"size\" data-size=\"42\"><div class=\"sizebar-text\">42 B</div></td></tr></tbody></table>",
+                "<footer>Served with <a href=\"https://caddyserver.com\"><svg class=\"caddy-logo\"></svg></a></footer></body></html>",
+            )),
+            "/caddy/dir/" => html("<a href=\"./h.txt\">h.txt</a><td class=\"size\" data-size=\"3\"></td><svg class=\"caddy-logo\"></svg>"),
+            "/page/" => html("<html><head><title>Welcome</title></head><body><a href=\"about/\">About</a></body></html>"),
+            "/file/" => (200, "Content-Type: application/zip\r\n".into(), b"PK\x03\x04".to_vec()),
+            _ => (404, String::new(), Vec::new()),
+        }
+    }
+
+    /// Each file a listing gives: its path in the folder, the path of its link, and its size.
+    async fn directory(http: &reqwest::Client, url: &str, options: &ListOptions) -> Option<Result<Vec<(PathBuf, String, Option<u64>)>, String>> {
+        let listed = list_directory(http, &Url::parse(url).unwrap(), options).await?;
+        Some(listed.map(|tasks| tasks.into_iter().map(|t| (t.folder.unwrap().join(t.name.unwrap()), t.urls[0].path().to_string(), t.size)).collect()))
+    }
+
+    /// An open directory lists the files below its link, subfolders kept, with the sizes the page
+    /// gives in bytes; parent, sorting and other sites' links are never followed, and a subfolder
+    /// that cannot be read is told of. A page that is no directory index lists nothing.
+    #[tokio::test]
+    async fn open_directories_list_their_files() {
+        let (addr, hits) = crate::hls::tests::serve(open_directories).await;
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let (notes, noted) = std::sync::mpsc::channel();
+        let options = ListOptions { notes: Some(notes), ..ListOptions::default() };
+        let base = format!("http://{addr}");
+        let p = p_of;
+        let listed = directory(&http, &format!("{base}/pub/"), &options).await.unwrap().unwrap();
+        assert_eq!(
+            listed,
+            [
+                (p(&["pub", "a b.txt"]), "/pub/a%20b.txt".to_string(), Some(12345)),
+                (p(&["pub", "sub", "c.iso"]), "/pub/sub/c.iso".to_string(), None),
+                (p(&["pub", "sub", "deep", "d\u{e9}.bin"]), "/pub/sub/deep/d%C3%A9.bin".to_string(), None),
+                (p(&["pub", "sub", "deep", ".._.._escape.bin"]), "/pub/sub/deep/..%2F..%2Fescape.bin".to_string(), None),
+            ]
+        );
+        let mut asked: Vec<String> = hits.lock().keys().cloned().collect();
+        asked.sort();
+        assert_eq!(asked, ["/pub/", "/pub/broken/", "/pub/sub/", "/pub/sub/deep/"]);
+        let noted: Vec<crate::ingest::ListNote> = noted.try_iter().collect();
+        let [note] = &noted[..] else { panic!("one note: {noted:?}") };
+        assert!(note.text.starts_with("1 subfolder(s) of the directory could not be read, and the files in them are missing (broken/)"), "{}", note.text);
+
+        let iis = directory(&http, &format!("{base}/iis/"), &options).await.unwrap().unwrap();
+        assert_eq!(iis, [(p(&["iis", "e.zip"]), "/iis/e.zip".to_string(), Some(12345)), (p(&["iis", "sub", "f.txt"]), "/iis/sub/f.txt".to_string(), Some(7))]);
+        let caddy = directory(&http, &format!("{base}/caddy/"), &options).await.unwrap().unwrap();
+        assert_eq!(caddy, [(p(&["caddy", "g.txt"]), "/caddy/g.txt".to_string(), Some(42)), (p(&["caddy", "dir", "h.txt"]), "/caddy/dir/h.txt".to_string(), Some(3))]);
+        assert!(directory(&http, &format!("{base}/page/"), &options).await.is_none());
+        assert!(directory(&http, &format!("{base}/file/"), &options).await.is_none());
+        assert!(directory(&http, &format!("{base}/gone/"), &options).await.is_none());
+
+        // A link ending in '/' is read; one that is no directory index is the link itself.
+        let ingested = crate::ingest::ingest(&[format!("{base}/pub/sub/deep/")], &http, &ListOptions::default()).await.unwrap();
+        assert_eq!(ingested.len(), 2);
+        let page = crate::ingest::ingest(&[format!("{base}/page/")], &http, &ListOptions::default()).await.unwrap();
+        assert_eq!(page.iter().map(|t| t.urls[0].path()).collect::<Vec<_>>(), ["/page/"]);
+
+        assert!(directory_lists(&Url::parse("https://h.example/pub/").unwrap()));
+        assert!(!directory_lists(&Url::parse("https://h.example/pub").unwrap()));
+        assert!(!directory_lists(&Url::parse("https://h.example/pub/?C=M").unwrap()));
+        // IIS at a site's root has no parent link; its title names the folder.
+        let root = Url::parse("http://h.example/").unwrap();
+        let entries = index_entries(&root, "<title>h.example - /</title><pre> 1/1/2024 10:00 AM 5 <A HREF=\"/a.txt\">a.txt</A><br></pre>").unwrap();
+        assert_eq!(entries, [(root.join("a.txt").unwrap(), Some(5))]);
+    }
+
+    /// kernel.org's nginx index of Linux 1.0.
+    #[tokio::test]
+    #[ignore = "live: reads cdn.kernel.org"]
+    async fn live_open_directory() {
+        let http = reqwest::Client::builder().user_agent(crate::resolver::APP_USER_AGENT).build().unwrap();
+        let listed = directory(&http, "https://cdn.kernel.org/pub/linux/kernel/v1.0/", &ListOptions::default()).await.unwrap().unwrap();
+        assert!(listed.contains(&(p_of(&["v1.0", "CHANGES"]), "/pub/linux/kernel/v1.0/CHANGES".to_string(), Some(6281))), "{listed:?}");
+        let tarball = listed.iter().find(|(path, _, _)| path.ends_with("linux-1.0.tar.gz")).expect("linux-1.0.tar.gz");
+        assert_eq!(tarball.2, None, "nginx gives \"1M\", not bytes");
+    }
+
+    fn p_of(parts: &[&str]) -> PathBuf {
+        parts.iter().collect()
     }
 }
