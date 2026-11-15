@@ -152,6 +152,19 @@ impl ByteRange {
         Ok((range, total))
     }
 
+    /// As `parse_content_range`, with an end past the file's size cut to it: some object stores
+    /// answer a range longer than the file with the range that was asked for.
+    pub fn parse_content_range_cut(header: &str) -> Result<(ByteRange, Option<u64>), RangeError> {
+        Self::parse_content_range(header).or_else(|e| {
+            let cut = header.trim().rsplit_once('/').and_then(|(spec, total)| {
+                let total: u64 = total.parse().ok()?;
+                let (start, end) = spec.split_once('-')?;
+                (end.parse::<u64>().ok()? >= total && total > 0).then(|| format!("{}-{}/{}", start, total - 1, total))
+            });
+            cut.map_or(Err(e), |header| Self::parse_content_range(&header))
+        })
+    }
+
     /// Converts to standard Rust `RangeInclusive<u64>`.
     #[inline]
     pub fn as_inclusive_range(&self) -> RangeInclusive<u64> {
@@ -298,6 +311,16 @@ mod tests {
 
         assert!(ByteRange::parse_content_range("invalid").is_err());
         assert_eq!(ByteRange::parse_content_range("Bytes 5-9/10").unwrap().1, Some(10));
+    }
+
+    #[test]
+    fn a_content_range_past_the_end_is_cut_to_the_size() {
+        let (range, total) = ByteRange::parse_content_range_cut("bytes 0-1048575/16014").unwrap();
+        assert_eq!((range.start, range.end, total), (0, 16013, Some(16014)));
+        assert_eq!(ByteRange::parse_content_range_cut("bytes 0-499/1234").unwrap().0.end, 499);
+        for bad in ["bytes 20000-30000/16014", "bytes 0-5/0", "bytes 0-x/10", "items 0-99/10"] {
+            assert!(ByteRange::parse_content_range_cut(bad).is_err(), "accepted {bad:?}");
+        }
     }
 
     #[test]

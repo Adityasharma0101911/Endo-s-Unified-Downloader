@@ -4619,7 +4619,7 @@ async fn probe_with(
     info.answer_time = setup;
     let content_range = get.headers().get(CONTENT_RANGE).and_then(|v| v.to_str().ok());
     let holds = match get.status() {
-        StatusCode::PARTIAL_CONTENT => match content_range.map(ByteRange::parse_content_range) {
+        StatusCode::PARTIAL_CONTENT => match content_range.map(ByteRange::parse_content_range_cut) {
             Some(Ok((range, Some(total)))) if range.start == 0 => {
                 info.accepts_ranges = true;
                 info.size = Some(total);
