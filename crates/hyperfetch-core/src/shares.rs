@@ -43,6 +43,10 @@ const MICROSOFT_REFUSED: &str = "OneDrive or SharePoint did not hand over the fi
 const TERABOX_LOGIN: &str = "Terabox hands files only to a signed-in account: export your Terabox cookies to a cookies.txt file (a browser extension does this), set it as the cookies file (--load-cookies), and try again";
 const LISTS_MANY: &str = "this link lists several files: add it as a new download to get one download per file";
 
+/// Steam's public Web API, whose GetPublishedFileDetails wants no key.
+const STEAM_API: &str = "https://api.steampowered.com";
+const STEAM_CLIENT_ONLY: &str = "this Steam Workshop item comes only through the Steam client, with its game: subscribe to it in Steam (only items stored the older way have a file on the web)";
+
 /// What a share link is, from its shape.
 #[derive(Debug, PartialEq)]
 enum Share {
@@ -57,6 +61,8 @@ enum Share {
     Microsoft { folder: bool },
     /// A Terabox share, by its short id.
     Terabox(String),
+    /// A Steam Workshop item (steamcommunity.com/sharedfiles/filedetails/?id={id}).
+    SteamItem(String),
 }
 
 /// Whether `url`'s host is one of `domains` or under one.
@@ -103,6 +109,12 @@ fn share_of(url: &Url) -> Option<Share> {
         };
         return short.map(Share::Terabox);
     }
+    if on(url, &["steamcommunity.com"]) {
+        return match segs[..] {
+            ["sharedfiles" | "workshop", "filedetails"] => param("id").filter(|id| id.bytes().all(|b| b.is_ascii_digit()) && !id.is_empty()).map(Share::SteamItem),
+            _ => None,
+        };
+    }
     // The kind a share link names: f a folder; u any file; b w x p i t a PDF, Word, Excel,
     // PowerPoint, image or text file; v a video.
     let kind = if host == "1drv.ms" {
@@ -127,9 +139,10 @@ fn share_of(url: &Url) -> Option<Share> {
     }
 }
 
-/// Whether `url` is a folder or list link [`list`] reads.
+/// Whether `url` is a folder or list link [`list`] reads, or a Steam Workshop item (its file is
+/// named only in Steam's answer).
 pub fn lists(url: &Url) -> bool {
-    matches!(share_of(url), Some(Share::PixeldrainList(_) | Share::GofileFolder(_) | Share::Microsoft { folder: true }))
+    matches!(share_of(url), Some(Share::PixeldrainList(_) | Share::GofileFolder(_) | Share::Microsoft { folder: true } | Share::SteamItem(_)))
 }
 
 /// One task per file the share at `url` holds, in a folder named after it; a Gofile folder
@@ -139,6 +152,7 @@ pub async fn list(http: &reqwest::Client, url: &Url, password: Option<&str>) -> 
         Some(Share::PixeldrainList(id)) => pixeldrain_list(http, &url.origin().ascii_serialization(), &id).await?,
         Some(Share::GofileFolder(id)) => gofile_list(http, GOFILE_API, &id, password).await?,
         Some(Share::Microsoft { folder: true }) => return Err(MICROSOFT_FOLDER.to_string()),
+        Some(Share::SteamItem(id)) => vec![steam_item(http, STEAM_API, &id).await?],
         _ => return Err(format!("{} is not a folder or list link", url)),
     };
     if tasks.is_empty() {
@@ -166,6 +180,7 @@ pub async fn resolve(client: &reqwest::Client, url: &Url, proxy: Option<&str>) -
             file
         }),
         Some(Share::Terabox(short)) => terabox_file(client, &base, &short).await,
+        Some(Share::SteamItem(id)) => steam_item(client, STEAM_API, &id).await.map(|task| task.urls[0].clone()),
         Some(Share::Microsoft { folder: true }) => Err(MICROSOFT_FOLDER.to_string()),
         Some(_) => Err(LISTS_MANY.to_string()),
         None => Err(format!("{} is not a share link", url)),
@@ -488,6 +503,50 @@ async fn terabox_file(client: &reqwest::Client, base: &str, short: &str) -> Resu
     }
 }
 
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct SteamAnswer {
+    response: SteamItems,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct SteamItems {
+    publishedfiledetails: Vec<SteamItem>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct SteamItem {
+    /// 1 when the item exists and is public.
+    result: u32,
+    filename: String,
+    /// A number in a string.
+    file_size: serde_json::Value,
+    file_url: String,
+}
+
+/// The file of Steam Workshop item `id`, named and sized as Steam's public Web API at `api` gives
+/// it. Only an item stored the older way has a file there; a newer one comes only through the
+/// Steam client.
+async fn steam_item(http: &reqwest::Client, api: &str, id: &str) -> Result<Task, String> {
+    let form = [("itemcount", "1"), ("publishedfileids[0]", id)];
+    let answer: SteamAnswer = get_json(http.post(format!("{api}/ISteamRemoteStorage/GetPublishedFileDetails/v1/")).form(&form), "Steam").await?;
+    let item = answer.response.publishedfiledetails.into_iter().next().unwrap_or_default();
+    if item.result != 1 {
+        return Err(format!("Steam has no public Workshop item {id}: it may be private, hidden or removed"));
+    }
+    let url = Url::parse(&item.file_url).map_err(|_| STEAM_CLIENT_ONLY.to_string())?;
+    let name = item.filename.rsplit('/').next().unwrap_or_default();
+    Ok(Task {
+        urls: vec![url],
+        name: Some(component(name, &format!("{id}.bin"))?),
+        size: item.file_size.as_str().and_then(|s| s.parse().ok()).or_else(|| item.file_size.as_u64()),
+        from_document: true,
+        ..Task::default()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -788,6 +847,50 @@ mod tests {
         assert!(terabox_file(&signed_in, &base, "none").await.unwrap_err().contains("empty"));
         let anonymous = terabox_file(&http(), &base, "one").await.unwrap_err();
         assert!(anonymous.contains("cookies.txt") && anonymous.contains("error -6"), "{anonymous}");
+    }
+
+    fn steam(head: &str) -> (u16, String, String) {
+        let form = head.to_ascii_lowercase().contains("content-type: application/x-www-form-urlencoded");
+        let body = match target(head) {
+            // As Steam answers, cut down.
+            "/legacy/ISteamRemoteStorage/GetPublishedFileDetails/v1/" if form => r#"{"response":{"result":1,"resultcount":1,"publishedfiledetails":[{"publishedfileid":"104479831","result":1,
+                "filename":"uploads/addons/stacker_stool.gm","file_size":"4197","title":"Stacker STool",
+                "file_url":"https://cdn.steamusercontent.com/ugc/918994036723335461/714E79EDED6ECA83214391554E33127BF1D631C0/"}]}}"#,
+            "/client/ISteamRemoteStorage/GetPublishedFileDetails/v1/" => r#"{"response":{"result":1,"resultcount":1,"publishedfiledetails":[{"publishedfileid":"104603291","result":1,"filename":"","file_size":"42347","file_url":""}]}}"#,
+            _ => r#"{"response":{"result":1,"resultcount":1,"publishedfiledetails":[{"publishedfileid":"1","result":9}]}}"#,
+        };
+        (200, JSON.into(), body.into())
+    }
+
+    /// A Steam Workshop item stored the older way is its file, named and sized as Steam's Web API
+    /// says; a newer one, and a missing or private one, say why they cannot be downloaded.
+    #[tokio::test]
+    async fn steam_workshop_items_stored_the_older_way_are_their_file() {
+        let (base, _) = serve(steam).await;
+        let task = steam_item(&http(), &format!("{base}/legacy"), "104479831").await.unwrap();
+        assert_eq!(task.urls[0].as_str(), "https://cdn.steamusercontent.com/ugc/918994036723335461/714E79EDED6ECA83214391554E33127BF1D631C0/");
+        assert_eq!((task.name, task.size, task.from_document), (Some(PathBuf::from("stacker_stool.gm")), Some(4197), true));
+        assert_eq!(steam_item(&http(), &format!("{base}/client"), "104603291").await.unwrap_err(), STEAM_CLIENT_ONLY);
+        assert!(steam_item(&http(), &format!("{base}/gone"), "1").await.unwrap_err().contains("no public Workshop item 1"));
+        for link in ["https://steamcommunity.com/sharedfiles/filedetails/?id=104479831", "https://steamcommunity.com/workshop/filedetails?id=104479831&searchtext="] {
+            assert_eq!(share(link), Some(Share::SteamItem("104479831".into())), "{link}");
+            assert!(lists(&Url::parse(link).unwrap()) && handles(&Url::parse(link).unwrap()));
+        }
+        for other in ["https://steamcommunity.com/sharedfiles/filedetails/?id=x1", "https://steamcommunity.com/app/4000/workshop/", "https://steamcommunity.com/linkfilter/?u=https://a.example"] {
+            assert_eq!(share(other), None, "{other}");
+        }
+    }
+
+    /// Live: a Workshop item stored the older way is its file on Steam's CDN; a newer one says it
+    /// comes through the Steam client.
+    #[tokio::test]
+    #[ignore]
+    async fn live_steam_workshop() {
+        let link = Url::parse("https://steamcommunity.com/sharedfiles/filedetails/?id=104479831").unwrap();
+        let [task] = &list(&http(), &link, None).await.unwrap()[..] else { panic!("one file") };
+        assert_eq!((task.name.clone(), task.size), (Some(PathBuf::from("stacker_stool.gm")), Some(4197)));
+        assert!(task.urls[0].as_str().starts_with("https://cdn.steamusercontent.com/ugc/"), "{task:?}");
+        assert_eq!(steam_item(&http(), STEAM_API, "104603291").await.unwrap_err(), STEAM_CLIENT_ONLY);
     }
 
     /// Live: a public Pixeldrain file resolves to its API download.
