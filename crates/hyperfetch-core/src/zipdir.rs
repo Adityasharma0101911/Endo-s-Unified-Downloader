@@ -1,9 +1,15 @@
 //! Lists what a ZIP on a server holds without downloading it: a range request for its end, where
 //! its central directory is found, and one more for that directory when it lies further back.
+//! Downloads one of its files the same way (see [`extract`]): its local header, then its data,
+//! unpacked as it arrives.
 
+use crate::worker::Auth;
+use flate2::{Decompress, FlushDecompress, Status};
 use reqwest::header::{ACCEPT_ENCODING, CONTENT_RANGE, RANGE};
-use reqwest::{Client, StatusCode};
+use reqwest::{Client, Response, StatusCode};
+use std::path::PathBuf;
 use std::time::Duration;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
 use url::Url;
 
@@ -23,11 +29,15 @@ const ZIP64_END_SIG: u32 = 0x0606_4b50;
 const ZIP64_END_LEN: u64 = 56;
 const ENTRY_SIG: u32 = 0x0201_4b50;
 const ENTRY_LEN: usize = 46;
+const LOCAL_SIG: u32 = 0x0403_4b50;
+const LOCAL_LEN: u64 = 30;
+const STORED: u16 = 0;
+const DEFLATED: u16 = 8;
 /// Code page 437 from 0x80 on, which names without the UTF-8 flag use (below it is ASCII).
 const CP437_HIGH: &str = "ÇüéâäàåçêëèïîìÄÅÉæÆôöòûùÿÖÜ¢£¥₧ƒáíóúñÑªº¿⌐¬½¼¡«»░▒▓│┤╡╢╖╕╣║╗╝╜╛┐└┴┬├─┼╞╟╚╔╩╦╠═╬╧╨╤╥╙╘╒╓╫╪┘┌█▄▌▐▀αßΓπΣσµτΦΘΩδ∞φε∩≡±≥≤⌠⌡÷≈°∙·√ⁿ²■\u{a0}";
 
 /// One file or folder in a ZIP.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ZipEntry {
     /// Its path in the archive, '/'-separated; a folder's ends with '/'.
     pub name: String,
@@ -37,13 +47,64 @@ pub struct ZipEntry {
     pub compressed: u64,
     /// When it was last changed, as the archive records it ("2024-05-17 13:45:30", local time).
     pub modified: Option<String>,
+    /// How it is packed: 0 stored, 8 deflated (the two [`extract`] reads), or another method.
+    pub method: u16,
+    /// The CRC-32 of its extracted bytes.
+    pub crc32: u32,
+    /// Where its local header starts in the archive.
+    pub offset: u64,
+    /// Its data is encrypted.
+    pub encrypted: bool,
+}
+
+impl ZipEntry {
+    /// A folder, which has no data of its own.
+    pub fn is_folder(&self) -> bool {
+        self.name.ends_with('/')
+    }
+
+    /// Why this entry cannot be downloaded on its own, if it cannot: encrypted, or packed with a
+    /// method other than store and deflate.
+    pub fn unsupported(&self) -> Option<String> {
+        if self.is_folder() {
+            return None;
+        }
+        if self.encrypted {
+            return Some(format!("{} is encrypted, which only a download of the whole ZIP can open", self.name));
+        }
+        let method = match self.method {
+            STORED | DEFLATED => return None,
+            9 => "Deflate64",
+            12 => "bzip2",
+            14 => "LZMA",
+            93 => "Zstandard",
+            95 => "XZ",
+            98 => "PPMd",
+            _ => "a method",
+        };
+        Some(format!("{} is packed with {} (method {}), which cannot be unpacked on its own: download the whole ZIP", self.name, method, self.method))
+    }
+
+    /// Where the entry goes below a folder: the parts of its name, each made a valid file name;
+    /// None when one is ".." or nothing is left. A leading '/' or drive only names a folder.
+    pub fn local_path(&self) -> Option<PathBuf> {
+        let mut path = PathBuf::new();
+        for part in self.name.split(['/', '\\']).filter(|p| !p.is_empty() && *p != ".") {
+            let clean = crate::engine::sanitize_component(part);
+            if part == ".." || clean.is_empty() {
+                return None;
+            }
+            path.push(clean);
+        }
+        (!path.as_os_str().is_empty()).then_some(path)
+    }
 }
 
 /// The entries of the ZIP at `url`, read from its end and central directory with range requests,
 /// at most 64 KiB and 16 MiB of them. Fails when the server sends no parts of files, or the file
 /// is no ZIP, a damaged one or one split over several files, or lists more than 100 000 entries.
 pub async fn list_zip(client: &Client, url: &Url) -> Result<Vec<ZipEntry>, String> {
-    let (tail, size) = fetch(client, url, None, TAIL).await?;
+    let (tail, size) = fetch(client, None, url, None, TAIL).await?;
     let tail_start = size - tail.len() as u64;
     let within = |start: u64, len: u64| {
         let from = usize::try_from(start.checked_sub(tail_start)?).ok()?;
@@ -53,52 +114,158 @@ pub async fn list_zip(client: &Client, url: &Url) -> Result<Vec<ZipEntry>, Strin
         End::Directory(dir) => dir,
         End::Zip64At(at) => match within(at, ZIP64_END_LEN) {
             Some(record) => zip64_end(record)?,
-            None => zip64_end(&fetch(client, url, Some(at), ZIP64_END_LEN).await?.0)?,
+            None => zip64_end(&fetch(client, None, url, Some(at), ZIP64_END_LEN).await?.0)?,
         },
     };
     dir.check(size)?;
     match within(dir.offset, dir.size) {
         Some(listing) => entries(listing, dir.entries),
-        None => entries(&fetch(client, url, Some(dir.offset), dir.size).await?.0, dir.entries),
+        None => entries(&fetch(client, None, url, Some(dir.offset), dir.size).await?.0, dir.entries),
     }
 }
 
 /// `len` bytes of `url` from `start`, or its last `len` bytes without one, and the file's size.
 /// Redirects to another host are followed even on a client that stops at them (see
 /// `worker::send`); a server quiet for `IDLE` fails it.
-async fn fetch(client: &Client, url: &Url, start: Option<u64>, len: u64) -> Result<(Vec<u8>, u64), String> {
+async fn fetch(client: &Client, auth: Option<&Auth>, url: &Url, start: Option<u64>, len: u64) -> Result<(Vec<u8>, u64), String> {
+    let (mut resp, served, size) = ranged(client, auth, url, start, len).await?;
+    let mut body = Vec::new();
+    while let Some(chunk) = next(&mut resp, url).await? {
+        body.extend_from_slice(&chunk);
+        if body.len() as u64 > served {
+            return Err(format!("{} sent more than the {} bytes asked for", url, served));
+        }
+    }
+    if body.len() as u64 != served {
+        return Err(format!("{} sent {} bytes for a range of {}", url, body.len(), served));
+    }
+    Ok((body, size))
+}
+
+/// The answer to a request for `len` bytes of `url` from `start` (its last `len` without one),
+/// once its Content-Range is checked: with the bytes it holds and the file's size. `auth` goes
+/// only where it covers (see `worker::authorize`).
+async fn ranged(client: &Client, auth: Option<&Auth>, url: &Url, start: Option<u64>, len: u64) -> Result<(Response, u64, u64), String> {
     let range = match start {
         Some(start) => format!("bytes={}-{}", start, start + len.max(1) - 1),
         None => format!("bytes=-{}", len),
     };
     let fail = |e: reqwest::Error| format!("Cannot read {}: {}", url, e);
-    let quiet = |_| format!("Cannot read {}: no answer for {} seconds", url, IDLE.as_secs());
-    let request = |url: &Url| client.get(url.clone()).header(RANGE, range.as_str()).header(ACCEPT_ENCODING, "identity");
-    let mut resp = timeout(IDLE, crate::worker::send(request, url)).await.map_err(quiet)?.map_err(fail)?;
+    let request = |url: &Url| crate::worker::authorize(client.get(url.clone()), auth, url).header(RANGE, range.as_str()).header(ACCEPT_ENCODING, "identity");
+    let resp = timeout(IDLE, crate::worker::send(request, url)).await.map_err(|_| quiet(url))?.map_err(fail)?;
     match resp.status() {
         StatusCode::PARTIAL_CONTENT => {}
         status if status.is_success() => {
-            return Err(format!("{} does not send parts of files, so its contents cannot be listed without downloading it", url));
+            return Err(format!("{} does not send parts of files, so what the ZIP holds cannot be read without downloading it whole", url));
         }
         status => return Err(format!("Cannot read {}: HTTP {}", url, status)),
     }
     let header = resp.headers().get(CONTENT_RANGE).and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
-    let served = crate::range::ByteRange::parse_content_range(&header);
-    let (range, size) = match served {
-        Ok((range, Some(size))) if start.is_none_or(|s| range.start == s) && range.len() <= len => (range, size),
-        _ => return Err(format!("{} answered a range request with Content-Range {:?}", url, header)),
-    };
-    let mut body = Vec::new();
-    while let Some(chunk) = timeout(IDLE, resp.chunk()).await.map_err(quiet)?.map_err(fail)? {
-        body.extend_from_slice(&chunk);
-        if body.len() as u64 > range.len() {
-            return Err(format!("{} sent more than the {} bytes asked for", url, range.len()));
+    match crate::range::ByteRange::parse_content_range(&header) {
+        Ok((served, Some(size)))
+            if served.len() <= len && start.map_or(served.end + 1 == size, |s| served.start == s) =>
+        {
+            Ok((resp, served.len(), size))
         }
+        _ => Err(format!("{} answered a range request with Content-Range {:?}", url, header)),
     }
-    if body.len() as u64 != range.len() || (start.is_none() && range.end + 1 != size) {
-        return Err(format!("{} sent {} bytes for Content-Range {:?}", url, body.len(), header));
+}
+
+/// The next block of `resp`'s body; a server quiet for `IDLE` fails it.
+async fn next(resp: &mut Response, url: &Url) -> Result<Option<bytes::Bytes>, String> {
+    timeout(IDLE, resp.chunk()).await.map_err(|_| quiet(url))?.map_err(|e| format!("Cannot read {}: {}", url, e))
+}
+
+fn quiet(url: &Url) -> String {
+    format!("Cannot read {}: no answer for {} seconds", url, IDLE.as_secs())
+}
+
+/// Downloads `entry` of the ZIP at `url` into `out`, unpacked as it arrives, and checks it against
+/// the size and CRC-32 the ZIP's directory gives: a range request for its local header, which says
+/// where its data starts, then one for the data. `limiter` holds the packed bytes to the download's
+/// speed; `written` is told how many unpacked bytes are out so far. Fails for an entry
+/// [`ZipEntry::unsupported`] names, and when the data runs past what the directory says.
+pub async fn extract<W: AsyncWrite + Unpin>(
+    client: &Client,
+    auth: Option<&Auth>,
+    url: &Url,
+    entry: &ZipEntry,
+    out: &mut W,
+    limiter: Option<&crate::worker::RateLimiter>,
+    written: &mut (dyn FnMut(u64) + Send),
+) -> Result<(), String> {
+    if let Some(why) = entry.unsupported() {
+        return Err(why);
     }
-    Ok((body, size))
+    let (header, size) = fetch(client, auth, url, Some(entry.offset), LOCAL_LEN).await?;
+    if u32_at(&header, 0) != Some(LOCAL_SIG) {
+        return Err(format!("The ZIP has no file where its directory puts {}", entry.name));
+    }
+    let skip = |at| u16_at(&header, at).map(u64::from).ok_or_else(damaged);
+    let start = entry.offset + LOCAL_LEN + skip(26)? + skip(28)?;
+    if start.checked_add(entry.compressed).is_none_or(|end| end > size) {
+        return Err(damaged());
+    }
+    let damaged_data = |e: flate2::DecompressError| format!("{}'s data is damaged: {}", entry.name, e);
+    let too_long = || format!("{} unpacks to more than the {} bytes the ZIP says", entry.name, entry.size);
+    let mut inflate = (entry.method == DEFLATED).then(|| Decompress::new(false));
+    let (mut crc, mut buf) = (flate2::Crc::new(), vec![0u8; 256 * 1024]);
+    let (mut read, mut made, mut ended) = (0u64, 0u64, entry.method == STORED);
+    let mut resp = match entry.compressed {
+        0 => None,
+        len => Some(ranged(client, auth, url, Some(start), len).await?.0),
+    };
+    while let Some(chunk) = match resp.as_mut() {
+        Some(resp) => next(resp, url).await?,
+        None => None,
+    } {
+        read += chunk.len() as u64;
+        if read > entry.compressed {
+            return Err(format!("{} sent more than the {} bytes of {}", url, entry.compressed, entry.name));
+        }
+        if let Some(limiter) = limiter {
+            limiter.acquire(chunk.len() as u64).await;
+        }
+        let Some(z) = inflate.as_mut() else {
+            made += chunk.len() as u64;
+            if made > entry.size {
+                return Err(too_long());
+            }
+            crc.update(&chunk);
+            out.write_all(&chunk).await.map_err(|e| format!("Write error: {}", e))?;
+            written(made);
+            continue;
+        };
+        let mut input = &chunk[..];
+        while !ended {
+            let (taken, given) = (z.total_in(), z.total_out());
+            ended = z.decompress(input, &mut buf, FlushDecompress::None).map_err(damaged_data)? == Status::StreamEnd;
+            let (used, out_now) = ((z.total_in() - taken) as usize, (z.total_out() - given) as usize);
+            input = &input[used..];
+            made += out_now as u64;
+            if made > entry.size {
+                return Err(too_long());
+            }
+            crc.update(&buf[..out_now]);
+            out.write_all(&buf[..out_now]).await.map_err(|e| format!("Write error: {}", e))?;
+            // A full buffer may leave more to come out of what was already put in.
+            if out_now < buf.len() && (input.is_empty() || (used == 0 && out_now == 0)) {
+                break;
+            }
+        }
+        written(made);
+    }
+    out.flush().await.map_err(|e| format!("Write error: {}", e))?;
+    if read != entry.compressed || !ended {
+        return Err(format!("{} ended after {} of the {} bytes of {}", url, read, entry.compressed, entry.name));
+    }
+    if made != entry.size {
+        return Err(format!("{} unpacks to {} bytes, not the {} the ZIP says", entry.name, made, entry.size));
+    }
+    match crc.sum() {
+        sum if sum == entry.crc32 => Ok(()),
+        sum => Err(format!("{} fails its CRC-32 check: the ZIP says {:08x}, its data gives {:08x}", entry.name, entry.crc32, sum)),
+    }
 }
 
 fn u16_at(b: &[u8], at: usize) -> Option<u16> {
@@ -197,15 +364,16 @@ fn entries(dir: &[u8], count: u64) -> Result<Vec<ZipEntry>, String> {
         }
         let short = |offset| u16_at(dir, at + offset).map(usize::from).ok_or_else(damaged);
         let long = |offset| u32_at(dir, at + offset).ok_or_else(damaged);
-        let (flags, time, date) = (short(8)?, short(12)?, short(14)?);
+        let (flags, method, time, date, crc32) = (short(8)?, short(10)?, short(12)?, short(14)?, long(16)?);
         let (mut compressed, mut size) = (u64::from(long(20)?), u64::from(long(24)?));
         let (name_len, extra_len, comment_len) = (short(28)?, short(30)?, short(32)?);
+        let mut offset = u64::from(long(42)?);
         let name_at = at + ENTRY_LEN;
         let name = dir.get(name_at..name_at + name_len).ok_or_else(damaged)?;
         let extra = dir.get(name_at + name_len..name_at + name_len + extra_len).ok_or_else(damaged)?;
-        // The ZIP64 extra field holds, in order, the sizes too large for their own fields.
+        // The ZIP64 extra field holds, in order, the sizes and offset too large for their own fields.
         let mut zip64 = zip64_sizes(extra).into_iter();
-        for field in [&mut size, &mut compressed] {
+        for field in [&mut size, &mut compressed, &mut offset] {
             if *field == u64::from(u32::MAX) {
                 *field = zip64.next().ok_or_else(damaged)?;
             }
@@ -215,7 +383,8 @@ fn entries(dir: &[u8], count: u64) -> Result<Vec<ZipEntry>, String> {
         } else {
             name.iter().map(|&b| if b < 0x80 { char::from(b) } else { CP437_HIGH.chars().nth(usize::from(b - 0x80)).unwrap_or('?') }).collect()
         };
-        list.push(ZipEntry { name, size, compressed, modified: dos_time(date as u16, time as u16) });
+        let (method, encrypted) = (method as u16, flags & 1 != 0);
+        list.push(ZipEntry { name, size, compressed, modified: dos_time(date as u16, time as u16), method, crc32, offset, encrypted });
         at = name_at + name_len + extra_len + comment_len;
     }
     Ok(list)
@@ -381,9 +550,9 @@ mod tests {
         assert_eq!(
             listed,
             [
-                ZipEntry { name: "docs/".into(), size: 0, compressed: 0, modified: when.clone() },
-                ZipEntry { name: "caf\u{e9}.txt".into(), size: 5, compressed: 5, modified: when.clone() },
-                ZipEntry { name: "\u{fc}ber.txt".into(), size: 5, compressed: 5, modified: when },
+                ZipEntry { name: "docs/".into(), size: 0, compressed: 0, modified: when.clone(), ..Default::default() },
+                ZipEntry { name: "caf\u{e9}.txt".into(), size: 5, compressed: 5, modified: when.clone(), offset: 35, ..Default::default() },
+                ZipEntry { name: "\u{fc}ber.txt".into(), size: 5, compressed: 5, modified: when, offset: 79, ..Default::default() },
             ]
         );
         assert_eq!(requests.load(Ordering::SeqCst), 1);
@@ -536,5 +705,172 @@ mod tests {
         assert_eq!(dos_time(DATE, TIME).as_deref(), Some("2024-05-17 13:45:30"));
         assert_eq!(dos_time(0, 0), None);
         assert_eq!(dos_time((44 << 9) | (13 << 5) | 1, 0), None, "month 13");
+    }
+
+    /// A ZIP of `files` (name, contents, method, flags) with their true CRC-32s, deflated where the
+    /// method is 8, each local header with an extra field the directory lacks; with `zip64`, every
+    /// entry's sizes and offset are in its ZIP64 extra field.
+    fn packed(files: &[(&str, &[u8], u16, u16)], zip64: bool) -> Vec<u8> {
+        use std::io::Write;
+        let (mut out, mut directory) = (Vec::new(), Vec::new());
+        let le16 = |values: &[u16]| values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>();
+        let le32 = |values: &[u32]| values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>();
+        for &(name, data, method, flags) in files {
+            let offset = out.len() as u64;
+            let body = match method {
+                DEFLATED => {
+                    let mut packer = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+                    packer.write_all(data).unwrap();
+                    packer.finish().unwrap()
+                }
+                _ => data.to_vec(),
+            };
+            let mut crc = flate2::Crc::new();
+            crc.update(data);
+            out.extend(LOCAL_SIG.to_le_bytes());
+            out.extend(le16(&[20, flags | 0x800, method, TIME, DATE]));
+            out.extend(le32(&[crc.sum(), body.len() as u32, data.len() as u32]));
+            out.extend(le16(&[name.len() as u16, 4]));
+            out.extend(name.as_bytes());
+            out.extend(le16(&[0xcafe, 0]));
+            out.extend(&body);
+            let small = |v: u64| if zip64 { u32::MAX } else { v as u32 };
+            let extra: Vec<u8> = match zip64 {
+                true => le16(&[1, 24]).into_iter().chain([data.len() as u64, body.len() as u64, offset].iter().flat_map(|v| v.to_le_bytes())).collect(),
+                false => Vec::new(),
+            };
+            directory.extend(ENTRY_SIG.to_le_bytes());
+            directory.extend(le16(&[45, 20, flags | 0x800, method, TIME, DATE]));
+            directory.extend(le32(&[crc.sum(), small(body.len() as u64), small(data.len() as u64)]));
+            directory.extend(le16(&[name.len() as u16, extra.len() as u16, 0, 0, 0]));
+            directory.extend(le32(&[0, small(offset)]));
+            directory.extend(name.as_bytes());
+            directory.extend(extra);
+        }
+        let (at, size, count) = (out.len() as u32, directory.len() as u32, files.len() as u16);
+        out.extend(directory);
+        out.extend(END_SIG.to_le_bytes());
+        out.extend(le16(&[0, 0, count, count]));
+        out.extend(le32(&[size, at]));
+        out.extend(le16(&[0]));
+        out
+    }
+
+    /// What `extract` gives for `entry`, or why it failed.
+    async fn extracted(url: &Url, entry: &ZipEntry) -> Result<Vec<u8>, String> {
+        let mut out = Vec::new();
+        let mut shown = Vec::new();
+        extract(&Client::new(), None, url, entry, &mut out, None, &mut |n| shown.push(n)).await?;
+        assert!(shown.windows(2).all(|w| w[0] < w[1]) && shown.last().is_none_or(|&n| n == out.len() as u64), "{shown:?}");
+        Ok(out)
+    }
+
+    /// Text that deflates well, so one packed block unpacks to more than the buffer holds.
+    fn text(len: usize) -> Vec<u8> {
+        (0..len).map(|i| b"the quick brown fox jumps over the lazy dog "[i % 44]).collect()
+    }
+
+    /// Stored and deflated files come out whole, each in two range requests (its local header,
+    /// then its data); in a ZIP64 archive too, whose offsets are in the extra field.
+    #[tokio::test]
+    async fn extracts_stored_and_deflated_files_by_range() {
+        let (big, small) = (text(900_000), b"hello, zip".to_vec());
+        let noise: Vec<u8> = (0..70_000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+        for zip64 in [false, true] {
+            let files: [(&str, &[u8], u16, u16); 5] =
+                [("docs/", b"", 0, 0), ("docs/a.txt", &small, 0, 0), ("big.txt", &big, 8, 0), ("noise.bin", &noise, 8, 0), ("empty", b"", 0, 0)];
+            let (url, requests) = serve(packed(&files, zip64), true).await;
+            let listed = list_zip(&Client::new(), &url).await.unwrap();
+            assert_eq!(listed.iter().map(|e| (e.method, e.size)).collect::<Vec<_>>(), [(0, 0), (0, 10), (8, 900_000), (8, 70_000), (0, 0)]);
+            for (entry, (_, data, _, _)) in listed.iter().zip(&files).skip(1) {
+                let before = requests.load(Ordering::SeqCst);
+                assert_eq!(extracted(&url, entry).await.as_deref(), Ok(*data), "{} in ZIP64 {zip64}", entry.name);
+                let asked = if entry.compressed == 0 { 1 } else { 2 };
+                assert_eq!(requests.load(Ordering::SeqCst) - before, asked, "{}", entry.name);
+            }
+            assert!(listed[2].compressed < 10_000, "the text deflated");
+        }
+    }
+
+    /// Data that fails its CRC-32, unpacks past or short of its size, or is cut short fails;
+    /// encrypted files and other methods say why before any request.
+    #[tokio::test]
+    async fn bad_data_and_unsupported_files_fail() {
+        let data = text(50_000);
+        let (url, requests) = serve(packed(&[("a.txt", &data, 8, 0), ("s.txt", &data[..100], 0, 0)], false), true).await;
+        let listed = list_zip(&Client::new(), &url).await.unwrap();
+        let with = |change: &dyn Fn(&mut ZipEntry)| {
+            let mut entry = listed[0].clone();
+            change(&mut entry);
+            entry
+        };
+        for (entry, says) in [
+            (with(&|e| e.crc32 ^= 1), "fails its CRC-32 check"),
+            (with(&|e| e.size -= 1), "unpacks to more than"),
+            (with(&|e| e.size += 1), "unpacks to 50000 bytes, not the 50001"),
+            (with(&|e| e.compressed -= 5), "ended after"),
+            (ZipEntry { size: 99, ..listed[1].clone() }, "unpacks to more than"),
+            (with(&|e| e.offset += 1), "has no file where"),
+        ] {
+            let err = extracted(&url, &entry).await.unwrap_err();
+            assert!(err.contains(says), "{says}: {err}");
+        }
+        let before = requests.load(Ordering::SeqCst);
+        for (entry, says) in [(with(&|e| e.encrypted = true), "is encrypted"), (with(&|e| e.method = 12), "packed with bzip2 (method 12)")] {
+            assert!(entry.unsupported().is_some_and(|why| why.contains(says)), "{says}");
+            assert!(extracted(&url, &entry).await.unwrap_err().contains(says));
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), before, "nothing was asked for them");
+        let encrypted = list_bytes(&packed(&[("x", b"x", 0, 1)], false)).unwrap();
+        assert!(encrypted[0].encrypted && encrypted[0].unsupported().is_some());
+    }
+
+    /// An entry's name becomes a path below the folder, never above it.
+    #[test]
+    fn entry_paths_stay_in_the_folder() {
+        let path = |name: &str| ZipEntry { name: name.into(), ..Default::default() }.local_path();
+        let parts = |parts: &[&str]| Some(parts.iter().collect::<PathBuf>());
+        assert_eq!(path("docs/a.txt"), parts(&["docs", "a.txt"]));
+        assert_eq!(path("docs/"), parts(&["docs"]));
+        assert_eq!(path("/etc/./passwd"), parts(&["etc", "passwd"]));
+        assert_eq!(path("C:\\Windows\\x.dll"), parts(&["C_", "Windows", "x.dll"]));
+        assert_eq!(path("a/b?.txt"), parts(&["a", "b_.txt"]));
+        for escape in ["../x", "a/../../x", "a\\..\\x", "", "/", "./"] {
+            assert_eq!(path(escape), None, "{escape}");
+        }
+    }
+
+    /// A download of one entry (`DownloadOptions::zip_entry`) puts it at its path under the
+    /// folder, numbered beside a file of that name; a folder entry is made.
+    #[tokio::test]
+    async fn a_download_of_an_entry_keeps_its_folders() {
+        let data = text(300_000);
+        let (url, _) = serve(packed(&[("sub/", b"", 0, 0), ("sub/deep/t.txt", &data, 8, 0)], false), true).await;
+        let listed = list_zip(&Client::new(), &url).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let download = |entry: &ZipEntry| {
+            let options = crate::engine::DownloadOptions {
+                output_path: Some(dir.path().join("")),
+                zip_entry: Some(entry.clone()),
+                ..Default::default()
+            };
+            crate::engine::DownloadEngine::new(vec![url.clone()], options)
+        };
+        assert_eq!(download(&listed[0]).run(None).await.unwrap(), dir.path().join("sub"));
+        assert!(dir.path().join("sub").is_dir());
+        let (tx, mut rx) = tokio::sync::broadcast::channel(1024);
+        let first = download(&listed[1]).run(Some(tx)).await.unwrap();
+        assert_eq!(first, dir.path().join("sub").join("deep").join("t.txt"));
+        assert_eq!(std::fs::read(&first).unwrap(), data);
+        let mut last = None;
+        while let Ok(snapshot) = rx.try_recv() {
+            last = Some(snapshot);
+        }
+        assert_eq!(last.map(|s| (s.downloaded_bytes, s.total_bytes)), Some((300_000, 300_000)));
+        let second = download(&listed[1]).run(None).await.unwrap();
+        assert_eq!(second, dir.path().join("sub").join("deep").join("t (1).txt"));
+        assert_eq!(std::fs::read(&second).unwrap(), data);
+        let names: Vec<_> = std::fs::read_dir(dir.path().join("sub").join("deep")).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names.len(), 2, "no part or lock files are left: {names:?}");
     }
 }

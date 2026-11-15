@@ -464,6 +464,13 @@ pub struct Args {
     #[arg(long = "preview", conflicts_with_all = ["dry_run", "stdout", "input_file", "history", "update", "verify"])]
     pub preview: bool,
 
+    /// Download only the files of a remote ZIP whose path in it PATTERN matches, in any case (*
+    /// stands for any run of characters), each read by range and unpacked into its folder under
+    /// -d; with --preview, list only those. Repeat it for several. Stored and deflated files only,
+    /// not encrypted ones
+    #[arg(long = "zip-file", value_name = "PATTERN", value_parser = parse_pattern, conflicts_with_all = ["output", "stdout", "dry_run", "spider", "list_tracks", "no_clobber", "history", "update", "verify"])]
+    pub zip_files: Vec<String>,
+
     /// Print what the run would download (name, size if known, path), with folders, playlists,
     /// channels, feeds, metalinks and torrents expanded; nothing is written
     #[arg(long = "dry-run", alias = "skip-download", conflicts_with_all = ["stdout", "history", "update", "verify"])]
@@ -814,9 +821,9 @@ pub fn start_time(text: &str, now: f64) -> Result<f64, String> {
 
 /// Options a config file may not hold: the run's links and inputs, the config file's own, the
 /// actions that are not downloads and what makes a run wait, list or probe in place of one.
-const NOT_IN_CONFIG: [&str; 17] = [
+const NOT_IN_CONFIG: [&str; 18] = [
     "urls", "input_file", "config", "no_config", "history", "update", "verify", "repair", "doctor", "completions", "start_at", "list_tracks",
-    "json", "dry_run", "spider", "preview", "stdout",
+    "json", "dry_run", "spider", "preview", "stdout", "zip_files",
 ];
 
 /// Options that do the same job another way, so either one on the command line leaves the other
@@ -1244,12 +1251,14 @@ mod tests {
         assert_eq!((args.ad_patterns, args.channels), (vec!["/ads/".to_string(), "*-ad-*.ts".into()], vec!["news".to_string(), "*sport*".into()]));
         assert_eq!((args.name_pattern.as_deref(), args.live_from.as_deref(), args.live_idle_timeout), (Some("{name} {height}p"), Some("1h30m"), Some(20)));
         assert!(parse(&["--list-tracks", "u"]).unwrap().list_tracks);
+        assert_eq!(parse(&["--zip-file", "*.txt", "--zip-file", "docs/", "--preview", "u"]).unwrap().zip_files, ["*.txt", "docs/"]);
         assert!(parse(&["--live-from", "2026-10-10 21:00:00+08:00", "u"]).is_ok());
         for bad in [
             &["--video", "8k"][..], &["--audio", "en,loud"], &["--tracks", "x1"], &["--tracks", "v"], &["--tracks", "v0,"], &["--drop-parts", "3-1"],
             &["--drop-parts", ","], &["--ad-pattern", " "], &["--channel", ""], &["--name-pattern", "{title}"], &["--name-pattern", "{name"],
             &["--live-from", "yesterday"], &["--live-from", "30m", "--live-from-start"], &["--live-idle-timeout", "0"],
-            &["--list-tracks", "--dry-run"], &["--list-tracks", "-i", "list.txt"],
+            &["--list-tracks", "--dry-run"], &["--list-tracks", "-i", "list.txt"], &["--zip-file", " "], &["--zip-file", "a", "-o", "f"],
+            &["--zip-file", "a", "--dry-run"],
         ] {
             assert!(parse(&[bad, &["u"]].concat()).is_err(), "{bad:?}");
         }
@@ -1331,7 +1340,7 @@ mod tests {
     /// 'single-quoted' value or a # comment after an option is named as such.
     #[test]
     fn a_config_file_holds_no_run_mode_and_its_mistakes_are_named() {
-        for text in ["--start-at 21:30", "--list-tracks", "--json", "--dry-run", "--spider", "--preview", "--stdout"] {
+        for text in ["--start-at 21:30", "--list-tracks", "--json", "--dry-run", "--spider", "--preview", "--stdout", "--zip-file a"] {
             let e = config_args(text, &given(&["u"])).unwrap_err();
             assert!(e.starts_with("line 1") && e.contains("cannot be in a config file"), "{text:?}: {e}");
         }
