@@ -35,6 +35,10 @@ enum Files {
     /// One GET of `size` bytes over HTTP/2 through a link of `rtt` round trip (see [`h2_run`]),
     /// with the engine's HTTP/2 settings (`tuned`) or hyper's own.
     H2 { size: usize, rtt: Duration, tuned: bool },
+    /// `size` bytes as a one-file torrent of `piece`-byte pieces whose web seed is the scenario's
+    /// server, through the swarm (see `crate::p2p`), with a peer that sends `peer` bytes a second
+    /// when there is one (see [`torrent_run`]).
+    Torrent { size: usize, piece: usize, peer: Option<u32> },
 }
 
 struct Scenario {
@@ -48,7 +52,21 @@ struct Scenario {
 fn scenarios() -> Vec<Scenario> {
     let rate_limit = RateLimit { requests: 6, window: Duration::from_secs(1), retry_after: 1, ban_after: 8, ban: Duration::from_secs(5) };
     let decay = Decay { from: 8 * MIB, full: 256 * 1024, rate: 64e3, every: Duration::from_secs(1) };
+    // A server as archive.org's are: slow to answer, each connection held to a few MB/s.
+    let seed = Server { per_connection: Some(1.5e6), first_byte: Duration::from_millis(100), ..Default::default() };
+    let torrent = |peer| Files::Torrent { size: 64 * MIB, piece: 512 * 1024, peer };
     vec![
+        // A torrent whose web seed is that server must come as fast as the server's file over
+        // HTTP (`bench/sim-thresholds.json` holds them to a share of `web_seed_http`).
+        Scenario { name: "web_seed_http", what: "64 MiB, 100 ms to answer, 1.5 MB/s per connection", server: seed.clone(), files: Files::One(64 * MIB), runs: 3 },
+        Scenario {
+            name: "web_seed_torrent",
+            what: "the same as a torrent of 512 KiB pieces with that server its web seed, no peers",
+            server: seed.clone(),
+            files: torrent(None),
+            runs: 3,
+        },
+        Scenario { name: "web_seed_and_peer", what: "the same and one peer sending 1 MB/s", server: seed, files: torrent(Some(1_000_000)), runs: 3 },
         Scenario { name: "lan", what: "128 MiB, no cap", server: Server::default(), files: Files::One(128 * MIB), runs: 3 },
         Scenario {
             name: "per_connection",
@@ -141,6 +159,9 @@ struct Measured {
 struct Threshold {
     min_mb_per_s: Option<f64>,
     max_ttfb_ms: Option<f64>,
+    /// At least `min_share` of the speed the scenario `min_share_of` had in the same run.
+    min_share_of: Option<String>,
+    min_share: Option<f64>,
 }
 
 /// The sizes of a batch's files, the same every time (xorshift64 from a fixed seed).
@@ -182,6 +203,7 @@ async fn run(scenario: &Scenario) -> (Duration, Duration, usize) {
         Files::One(size) => size,
         Files::Many { .. } => 1,
         Files::H2 { size, rtt, tuned } => return h2_run(size, rtt, tuned).await,
+        Files::Torrent { size, piece, peer } => return torrent_run(&scenario.server, size, piece, peer).await,
     };
     let (url, stats) = netsim::serve(Server { size, ..scenario.server.clone() }).await;
     let files: Vec<(Url, usize, std::path::PathBuf)> = match scenario.files {
@@ -191,7 +213,7 @@ async fn run(scenario: &Scenario) -> (Duration, Duration, usize) {
             .enumerate()
             .map(|(i, size)| (url.join(&format!("/sized/{size}/{i}.bin")).unwrap(), size, dir.path().join(format!("{i}.bin"))))
             .collect(),
-        Files::H2 { .. } => unreachable!(),
+        Files::H2 { .. } | Files::Torrent { .. } => unreachable!(),
     };
     let hashed = matches!(scenario.files, Files::Many { hashed: true, .. });
     let checksum = |size: usize| {
@@ -261,6 +283,54 @@ async fn h2_run(size: usize, rtt: Duration, tuned: bool) -> (Duration, Duration,
     (started.elapsed(), first, 1)
 }
 
+/// `size` bytes of a one-file torrent of `piece`-byte pieces whose web seed is a `server`, through
+/// the swarm on a session of loopback alone (see `p2p::go_offline`), with a peer on this computer
+/// that sends `peer` bytes a second when there is one: from the start until the file is complete.
+async fn torrent_run(server: &Server, size: usize, piece: usize, peer: Option<u32>) -> (Duration, Duration, usize) {
+    use sha1::Digest;
+    let dir = tempfile::tempdir().unwrap();
+    let (url, stats) = netsim::serve(Server { size, ..server.clone() }).await;
+    let content = netsim::file(size);
+    let hashes: Vec<u8> = content.chunks(piece).flat_map(|p| sha1::Sha1::digest(p).to_vec()).collect();
+    let info = [format!("d6:lengthi{size}e4:name5:f.bin12:piece lengthi{piece}e6:pieces{}:", hashes.len()).as_bytes(), &hashes, b"e"].concat();
+    let torrent = [b"d4:info".as_slice(), &info, format!("8:url-listl{}:{url}ee", url.as_str().len()).as_bytes()].concat();
+    let file = dir.path().join("f.torrent");
+    std::fs::write(&file, &torrent).unwrap();
+    let mut source = Url::from_file_path(&file).unwrap();
+    let out = dir.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    crate::p2p::go_offline(&out).await;
+    let seeder = match peer {
+        None => None,
+        Some(rate) => {
+            let seeds = dir.path().join("seed");
+            std::fs::create_dir_all(&seeds).unwrap();
+            std::fs::write(seeds.join("f.bin"), &content).unwrap();
+            let seeder = crate::p2p::offline(&seeds).await;
+            let seeding = librqbit::AddTorrentOptions {
+                overwrite: true,
+                output_folder: Some(seeds.to_str().unwrap().into()),
+                ratelimits: librqbit::limits::LimitsConfig { upload_bps: std::num::NonZeroU32::new(rate), ..Default::default() },
+                ..Default::default()
+            };
+            let added = seeder.add_torrent(librqbit::AddTorrent::from_bytes(torrent.clone()), Some(seeding)).await.unwrap();
+            added.into_handle().unwrap().wait_until_completed().await.unwrap();
+            source.set_query(Some(&format!("x.pe=127.0.0.1:{}", seeder.listen_addr().unwrap().port())));
+            Some(seeder)
+        }
+    };
+    drop(content);
+    let started = Instant::now();
+    let running = crate::p2p::run(std::slice::from_ref(&source), &options(&out, "f.bin"), &out, None, tokio_util::sync::CancellationToken::new());
+    let (path, _) = tokio::time::timeout(RUN_LIMIT, running).await.expect("within the time limit").unwrap();
+    let took = started.elapsed();
+    assert!(holds(&path, size), "{} is wrong", path.display());
+    if let Some(seeder) = seeder {
+        seeder.stop().await;
+    }
+    (took, first_byte(&stats, started), requests(&stats))
+}
+
 /// A link to `to` that holds what goes through it `delay` each way, with no cap on how much it
 /// holds: the round trip alone limits what flow control lets through.
 async fn delayed(to: std::net::SocketAddr, delay: Duration) -> std::net::SocketAddr {
@@ -315,7 +385,7 @@ async fn measure(scenario: &Scenario) -> Measured {
     runs.sort_by_key(|run| run.0);
     let (took, ttfb, requests) = runs[runs.len() / 2];
     let (bytes, files) = match scenario.files {
-        Files::One(size) | Files::H2 { size, .. } => (size as u64, 1),
+        Files::One(size) | Files::H2 { size, .. } | Files::Torrent { size, .. } => (size as u64, 1),
         Files::Many { count, min, max, .. } => (sizes(count, min, max).iter().sum::<usize>() as u64, count),
     };
     let seconds = took.as_secs_f64();
@@ -354,6 +424,12 @@ fn regressions(results: &[Measured], thresholds: &std::collections::HashMap<Stri
         if let Some(max) = t.max_ttfb_ms.filter(|&max| m.ttfb_ms > max) {
             found.push(format!("{}: first byte after {:.0} ms, over the {max} ms allowed", m.name, m.ttfb_ms));
         }
+        let base = t.min_share_of.as_ref().and_then(|of| results.iter().find(|b| &b.name == of));
+        if let (Some(base), Some(share)) = (base, t.min_share) {
+            if m.mb_per_s < share * base.mb_per_s {
+                found.push(format!("{}: {:.1} MB/s, under {share} of {}'s {:.1} MB/s", m.name, m.mb_per_s, base.name, base.mb_per_s));
+            }
+        }
     }
     found
 }
@@ -371,15 +447,20 @@ fn test_regressions_are_told_from_the_thresholds() {
         files_per_s: 0.0,
     };
     let thresholds: std::collections::HashMap<String, Threshold> =
-        serde_json::from_str(r#"{"a": {"min_mb_per_s": 10}, "b": {"max_ttfb_ms": 100}}"#).unwrap();
+        serde_json::from_str(r#"{"a": {"min_mb_per_s": 10}, "b": {"max_ttfb_ms": 100}, "d": {"min_share_of": "a", "min_share": 0.85}}"#).unwrap();
     let found = regressions(&[m("a", 9.0, 999.0), m("b", 1.0, 101.0), m("c", 0.0, 1e9), m("a", 10.0, 0.0)], &thresholds);
     assert_eq!(found.len(), 2, "{found:?}");
     assert!(found[0].starts_with("a:") && found[1].starts_with("b:"));
+    // A share of another scenario's speed in the same run; none when that one did not run.
+    assert_eq!(regressions(&[m("a", 20.0, 0.0), m("d", 17.0, 0.0)], &thresholds), Vec::<String>::new());
+    assert!(regressions(&[m("a", 20.0, 0.0), m("d", 16.9, 0.0)], &thresholds)[0].starts_with("d: 16.9 MB/s, under 0.85 of a's"));
+    assert!(regressions(&[m("d", 1.0, 0.0)], &thresholds).is_empty());
     // The checked-in thresholds parse, and name only scenarios there are.
     let checked_in = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../bench/sim-thresholds.json")).unwrap();
     let checked_in: std::collections::HashMap<String, Threshold> = serde_json::from_str(&checked_in).unwrap();
     let names: Vec<&str> = scenarios().iter().map(|s| s.name).collect();
     assert!(checked_in.keys().all(|k| names.contains(&k.as_str())), "{:?}", checked_in.keys());
+    assert!(checked_in.values().filter_map(|t| t.min_share_of.as_deref()).all(|of| names.contains(&of)));
     assert_eq!(sizes(3, 1, 10), sizes(3, 1, 10));
 }
 
