@@ -1,9 +1,34 @@
 # Benchmarks
 
+## Simulated links (runs in CI)
+
+`crates/hyperfetch-core/src/speedbench.rs` downloads from in-process servers (`netsim.rs`) that
+behave as common links do, and times each scenario: a LAN with no cap, a server that caps each
+connection, one that caps all of a user's connections together, a long link (150 ms to answer, a
+cap per connection), a lossy one (one connection cut off, one fading out), a host that answers 429
+past 6 requests a second, 2,000 small files (with and without the SHA-256 a listing gives), and a
+single HTTP/2 download over a 100 ms round trip with hyper's flow-control windows and with the
+engine's. Every downloaded file is checked byte by byte; at most 128 MiB is on disk at once.
+
+```sh
+cargo test --release -p hyperfetch-core --lib speed_bench -- --ignored --nocapture
+ENDO_BENCH_ONLY=lan,small_files cargo test --release -p hyperfetch-core --lib speed_bench -- --ignored --nocapture
+```
+
+It prints JSON (or writes it to `ENDO_BENCH_OUT`) and a markdown table (or `ENDO_BENCH_SUMMARY`).
+The `speed` job of `.github/workflows/ci.yml` runs it on every push on Linux, puts the table in
+the job's summary and fails when `ENDO_BENCH_CHECK` finds a scenario under its floor in
+`sim-thresholds.json` (MB/s, and the most milliseconds to the first byte). The same job runs two
+comparisons that never fail it: 2 MiB disk writes per connection (`ENDO_WRITE_BATCH`) and mimalloc
+as the allocator (`--features bench-mimalloc`). A debug build's numbers are not comparable: the
+dependencies are not optimized there, and the thresholds are not checked.
+
+## v1.0 against the current CLI
+
 Compares the released v1.0 CLI (commit `976365a`) with the current CLI on a local server that caps
 every connection at 2 MiB/s and adds 40 ms before every response. Python 3.9+, stdlib only.
 
-## Build the two binaries
+### Build the two binaries
 
 v1.0, in a throwaway worktree outside the checkout (Windows paths; use any stable location):
 
@@ -21,7 +46,7 @@ Current build, from the repository root:
 cargo build --release -p hyperfetch-cli
 ```
 
-## Run
+### Run
 
 ```sh
 python bench/run_bench.py --old C:/tmp/endo-bench/bin/endo-v1.0-cli.exe \
@@ -55,7 +80,7 @@ All runs also pass `-q -d <tempdir>`. Pick scenarios with `--only large,stall`; 
 server with `--rate-mib`, `--latency-ms`, `--connect-ms` (the `handshake` scenario's setup
 time), `--large-mib`, `--small-count`, `--small-kib`, `--medium-count`, `--medium-mib`.
 
-## Results (2026-09-26, Windows 11, 32 threads, commit `bb0bc43`)
+### Results (2026-09-26, Windows 11, 32 threads, commit `bb0bc43`)
 
 Default server (2 MiB/s per connection, 40 ms per request; 80 ms connection setup in the
 slow-setup scenario):
@@ -91,7 +116,7 @@ slow-setup scenario):
 | Small-file batch via -i, slow connection setup | new -j 1 | 2.52 s | 2.48 s | 2.70 s | 8.3 | 3/3 | ok |
 | Small-file batch via -i, slow connection setup | new -j 4 | 0.88 s | 0.78 s | 0.90 s | 23.9 | 3/3 | ok |
 
-## Earlier results (2026-09-26, commit `da1613a`)
+### Earlier results (2026-09-26, commit `da1613a`)
 
 Taken before the runs alternated and before the `handshake` and `history` scenarios and the
 Min/Max columns existed, with the new build at commit `da1613a`.
@@ -126,7 +151,7 @@ file comes over the connection
 that probed it unless that connection is capped, so v1.0's fixed 16-way split still wins for
 tiny files from a server that caps every connection when they are fetched one at a time.
 
-## Server alone
+### Server alone
 
 ```sh
 python bench/throttled_server.py --port 8000             # prints READY 8000

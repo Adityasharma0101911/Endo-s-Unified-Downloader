@@ -48,6 +48,8 @@ pub mod muxer;
 pub mod doctor;
 #[cfg(test)]
 pub(crate) mod netsim;
+#[cfg(test)]
+mod speedbench;
 
 pub use range::{ByteRange, RangeError};
 pub use chunk::{Chunk, ChunkManager, ChunkStatus, ChunkError};
