@@ -614,6 +614,7 @@ fn list_options(args: &Args) -> ListOptions {
         only_new: !args.all_items,
         cookies,
         proxy: args.proxy.clone(),
+        proxy_pool: args.proxy_pool.is_some() || args.proxies_file.is_some(),
         // Each input's own (see `listed`).
         notes: None,
         p2p: !args.no_p2p,

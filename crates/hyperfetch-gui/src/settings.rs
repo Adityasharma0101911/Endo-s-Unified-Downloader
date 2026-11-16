@@ -536,6 +536,7 @@ impl Settings {
             only_new: self.only_new,
             cookies: self.browser_cookies().or_else(cookies_file).unwrap_or_default(),
             proxy: non_empty(&self.proxy),
+            proxy_pool: !self.proxy_pool.trim().is_empty(),
             notes: None,
             p2p: self.p2p,
             debrid_key: non_empty(&self.debrid_api_key),
