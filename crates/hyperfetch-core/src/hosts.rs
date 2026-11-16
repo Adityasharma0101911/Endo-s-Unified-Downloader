@@ -23,6 +23,10 @@
 //! are kept for `KEPT_FOR` after they were last learned, by host only (`https://cdn.example:443`,
 //! never a path or query). A kept cap holds the host's first requests in a run as one learned then
 //! would. So is the user's line speed (see [`line`]), under a name no host has.
+//!
+//! A host a resolver says asks to be asked slowly (see [`set_gap`]) gets every request, a
+//! download's or a listing's, a probe's or a chunk's, no sooner than its gap after the one before,
+//! through `crate::polite`'s pacing.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -60,6 +64,9 @@ const MAX_BAN_REST: Duration = Duration::from_secs(60);
 const LINE_BAND: f64 = 0.1;
 
 static HOSTS: LazyLock<Hosts> = LazyLock::new(Hosts::default);
+/// Least time between the starts of two requests to a host (by [`HostKey::origin`]), as
+/// resolvers set it (see [`set_gap`]).
+static GAPS: LazyLock<Mutex<HashMap<String, Duration>>> = LazyLock::new(Default::default);
 
 /// A host as this module tells hosts apart: scheme, host, port, and optional proxy route.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -100,12 +107,9 @@ impl HostKey {
             // Answers 403 to a fifth or sixth connection from one address.
             Some(4)
         } else if host == "export.arxiv.org" {
-            // arXiv asks programs to use one connection to it (see `crate::archives`).
+            // arXiv asks programs to use one connection to it, besides one request every 3 s
+            // (see `crate::archives`, which sets that gap).
             Some(1)
-        } else if host == "web.archive.org" {
-            // The Wayback Machine shuts out a client that asks it many things at once: a listing's
-            // captures (see `crate::wayback`) download two at a time.
-            Some(2)
         } else {
             None
         }
@@ -213,6 +217,22 @@ fn clock() -> Instant {
     tokio::time::Instant::now().into_std()
 }
 
+/// Holds every request to `url`'s host (scheme, host and port) in this process from now on to one
+/// start every `gap`, for a site that asks for that (arXiv: one request every 3 s). The longest
+/// gap set for a host holds.
+pub(crate) fn set_gap(url: &Url, gap: Duration) {
+    if let Some(origin) = HostKey::of(url).origin() {
+        let mut gaps = GAPS.lock();
+        let at = gaps.entry(origin).or_default();
+        *at = (*at).max(gap);
+    }
+}
+
+/// The gap set for `url`'s host (see [`set_gap`]); zero when none is.
+pub(crate) fn gap(url: &Url) -> Duration {
+    HostKey::of(url).origin().and_then(|origin| GAPS.lock().get(&origin).copied()).unwrap_or_default()
+}
+
 /// Waits until a request to `url`'s host may be opened under `limit` (see the module docs) and
 /// returns its slot. Waiting is no failure: nothing else is held meanwhile, and dropping the
 /// future gives up the wait. Never wait for a slot while holding another.
@@ -222,7 +242,18 @@ pub async fn acquire(url: &Url, limit: usize) -> HostSlot {
 
 /// Waits until a request to `url`'s host on specific route `route_id` may be opened under `limit`.
 pub async fn acquire_routed(url: &Url, limit: usize, route_id: usize) -> HostSlot {
-    HOSTS.acquire(HostKey::routed(url, route_id), limit).await
+    acquire_paced(url, limit, route_id, Duration::ZERO).await
+}
+
+/// [`acquire_routed`], then the host's gap waited out, or `gap` if that is longer (a listing's
+/// pace, see `crate::polite`): the slot's request may start once this returns.
+pub(crate) async fn acquire_paced(url: &Url, limit: usize, route_id: usize, gap: Duration) -> HostSlot {
+    let slot = HOSTS.acquire(HostKey::routed(url, route_id), limit).await;
+    let gap = gap.max(self::gap(url));
+    if !gap.is_zero() {
+        crate::polite::pace(url, gap).await;
+    }
+    slot
 }
 
 /// A slot for a request to `url`'s host under `limit`, if one is free now.
@@ -230,9 +261,12 @@ pub fn try_acquire(url: &Url, limit: usize) -> Option<HostSlot> {
     try_acquire_routed(url, limit, 0)
 }
 
-/// A slot for a request to `url`'s host on specific route `route_id` under `limit`, if one is free now.
+/// A slot for a request to `url`'s host on specific route `route_id` under `limit`, if one is free
+/// now and the host's gap since the request before is over.
 pub fn try_acquire_routed(url: &Url, limit: usize, route_id: usize) -> Option<HostSlot> {
-    HOSTS.try_acquire(&HostKey::routed(url, route_id), limit, clock())
+    let slot = HOSTS.try_acquire(&HostKey::routed(url, route_id), limit, clock())?;
+    let gap = gap(url);
+    (gap.is_zero() || crate::polite::try_pace(url, gap)).then_some(slot)
 }
 
 /// The most requests `url`'s host has had open at once.
@@ -1023,6 +1057,32 @@ mod tests {
         assert_eq!(hosts.profile(&host, Instant::now()).connection_cap, None);
         let slot = tokio::time::timeout(Duration::from_secs(60), hosts.acquire(host.clone(), 4)).await;
         assert!(slot.is_ok(), "a host always takes one request");
+    }
+
+    /// A host given a gap takes one request every gap, whichever way its slots are taken; a
+    /// listing's longer pace holds too, and other hosts are not held at all.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_host_with_a_gap_takes_one_request_every_gap() {
+        let url = Url::parse("http://gap.example/f").unwrap();
+        set_gap(&url, Duration::from_secs(3));
+        set_gap(&url, Duration::from_secs(1));
+        assert_eq!(gap(&url), Duration::from_secs(3), "the longest gap set holds");
+        let started = tokio::time::Instant::now();
+        for _ in 0..3 {
+            drop(acquire(&url, 0).await);
+        }
+        assert_eq!(started.elapsed(), Duration::from_secs(6), "three requests, two gaps");
+        assert!(try_acquire(&url, 0).is_none(), "the next is 3 s away");
+        tokio::time::advance(Duration::from_secs(3)).await;
+        assert!(try_acquire(&url, 0).is_some());
+        drop(acquire_paced(&url, 0, 0, Duration::from_secs(5)).await);
+        drop(acquire(&url, 0).await);
+        assert_eq!(started.elapsed(), Duration::from_secs(9 + 3 + 5), "a listing's longer pace holds the next");
+        let other = Url::parse("http://nogap.example/f").unwrap();
+        let at = tokio::time::Instant::now();
+        drop(acquire(&other, 0).await);
+        drop(acquire(&other, 0).await);
+        assert_eq!(at.elapsed(), Duration::ZERO);
     }
 
     #[tokio::test(start_paused = true)]

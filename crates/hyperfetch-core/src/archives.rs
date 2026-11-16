@@ -48,6 +48,9 @@ const SOFTWARE_HERITAGE: &str = "https://archive.softwareheritage.org";
 /// [`VAULT_POLL`]; Common Crawl asks for no more than one a second.
 const GAP: Duration = if cfg!(test) { Duration::ZERO } else { Duration::from_secs(1) };
 const ZENODO_GAP: Duration = if cfg!(test) { Duration::ZERO } else { Duration::from_secs(2) };
+/// arXiv asks for no more than one request every 3 seconds (and one connection, see
+/// `hosts::HostKey::default_connection_cap`): its files' downloads are held to that.
+const ARXIV_GAP: Duration = if cfg!(test) { Duration::ZERO } else { Duration::from_secs(3) };
 const VAULT_POLL: Duration = if cfg!(test) { Duration::from_millis(20) } else { Duration::from_secs(30) };
 /// How long a listing waits for Software Heritage to cook a tarball.
 const VAULT_PATIENCE: Duration = if cfg!(test) { Duration::from_secs(5) } else { Duration::from_secs(20 * 60) };
@@ -596,6 +599,7 @@ fn arxiv(export: &str, id: &str, options: &ListOptions) -> Result<Vec<Task>, Str
     let folder = component(&format!("arXiv {}", id.replace('/', "_")), "arXiv")?;
     let pdf = url_at(export, std::iter::once("pdf").chain(id.split('/')))?;
     let source = url_at(export, std::iter::once("src").chain(id.split('/')))?;
+    crate::hosts::set_gap(&pdf, ARXIV_GAP);
     options.note("arXiv asks for one request every 3 seconds over one connection: its files download one at a time".to_string());
     Ok(vec![
         Task { urls: vec![pdf], name: Some(component(&format!("{}.pdf", id.replace('/', "_")), "paper.pdf")?), folder: Some(folder.clone()), ..Task::default() },

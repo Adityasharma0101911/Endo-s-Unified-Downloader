@@ -5,8 +5,9 @@
 //! content (collapsed by digest), into a folder tree `host/path/timestamp/name`, each checked
 //! against the SHA-1 the CDX API gives (checked live: the digest is that of the bytes `id_` serves).
 //!
-//! The Wayback Machine limits requests hard: the CDX API is asked once every [`GAP`], under the
-//! host's shared rest (a 429 rests it, downloads too, for its Retry-After); one listing gives at
+//! The Wayback Machine limits requests hard: it is asked once every [`GAP`], the CDX API and the
+//! captures' downloads alike, under the host's shared rest (a 429 rests it, downloads too, for its
+//! Retry-After); one listing gives at
 //! most [`DEFAULT_CAPTURES`] captures not downloaded before (`ListOptions::max_items`), each with
 //! its download-archive line, so adding the link again goes on with the next ones.
 
@@ -20,7 +21,8 @@ use crate::ingest::{clean_path, ListOptions, Task};
 use crate::polite;
 
 const WAYBACK: &str = "https://web.archive.org";
-/// Least time between two requests to the CDX API.
+/// Least time between two requests to the Wayback Machine: the CDX API's, and the captures'
+/// downloads' (see [`paced`]).
 const GAP: Duration = if cfg!(test) { Duration::ZERO } else { Duration::from_secs(4) };
 /// Captures one listing gives, unless `ListOptions::max_items` says.
 pub const DEFAULT_CAPTURES: usize = 500;
@@ -102,9 +104,15 @@ pub fn handles(url: &Url) -> bool {
 /// The link of the bytes a capture's `url` captured (its `id_` form).
 pub fn resolve(url: &Url) -> Option<Url> {
     match link_of(url)? {
-        Link::Capture { timestamp, original } => Url::parse(&format!("{WAYBACK}/web/{timestamp}id_/{original}")).ok(),
+        Link::Capture { timestamp, original } => Url::parse(&format!("{WAYBACK}/web/{timestamp}id_/{original}")).ok().inspect(paced),
         Link::Listing(_) => None,
     }
+}
+
+/// Holds every request to the Wayback Machine, a capture's download's too, to one every [`GAP`]
+/// (see `crate::hosts::set_gap`): it shuts out a client that asks faster, whatever it asks.
+fn paced(url: &Url) {
+    crate::hosts::set_gap(url, GAP);
 }
 
 /// The CDX query link the CLI's `--wayback` asks with: the captures of `target` (everything
@@ -189,7 +197,7 @@ fn place(original: &str, timestamp: &str) -> Option<(PathBuf, PathBuf)> {
 fn capture_task(timestamp: &str, original: &str, digest: &str) -> Option<Task> {
     let (folder, name) = place(original, timestamp)?;
     Some(Task {
-        urls: vec![Url::parse(&format!("{WAYBACK}/web/{timestamp}id_/{original}")).ok()?],
+        urls: vec![Url::parse(&format!("{WAYBACK}/web/{timestamp}id_/{original}")).ok().inspect(paced)?],
         name: Some(name),
         folder: Some(folder),
         checksum: sha1_of(digest),
