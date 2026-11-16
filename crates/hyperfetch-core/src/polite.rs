@@ -1,7 +1,8 @@
 //! Requests a listing makes of a site that asks to be asked slowly (the Internet Archive, the
 //! Wayback Machine, arXiv, Common Crawl): at most one every `gap` to a host, across every listing
 //! of this process, and under the host's shared rest (see `crate::hosts`): a 429 or 503 rests the
-//! host for its Retry-After, downloads from it too, and the request is made again after.
+//! host for its Retry-After, downloads from it too, and the request is made again after. The same
+//! pacing holds a download's requests to a host a resolver gave a gap (see `hosts::set_gap`).
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -41,6 +42,19 @@ pub(crate) async fn pace(url: &Url, gap: Duration) {
     tokio::time::sleep(wait).await;
 }
 
+/// Whether `url`'s host may be asked now, `gap` after the request to it before; if so, the next
+/// may go `gap` from now (see [`pace`]).
+pub(crate) fn try_pace(url: &Url, gap: Duration) -> bool {
+    let mut next = NEXT.lock();
+    let next = next.get_or_insert_with(HashMap::new);
+    let now = tokio::time::Instant::now();
+    if next.get(&host_of(url)).is_some_and(|at| *at > now) {
+        return false;
+    }
+    next.insert(host_of(url), now + gap);
+    true
+}
+
 fn busy(status: StatusCode) -> bool {
     matches!(status, StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE)
 }
@@ -59,8 +73,8 @@ pub(crate) async fn send(url: &Url, gap: Duration, request: impl Fn() -> Request
     let mut rest = FIRST_REST;
     let host = url.host_str().unwrap_or_default().to_string();
     for attempt in 1..=ATTEMPTS {
-        pace(url, gap).await;
-        let slot = crate::hosts::acquire(url, 0).await;
+        // Paced to `gap`, or to the host's own gap if that is longer (see `crate::hosts::set_gap`).
+        let slot = crate::hosts::acquire_paced(url, 0, 0, gap).await;
         let sent = tokio::time::timeout(REQUEST_TIMEOUT, request().send()).await;
         match sent {
             Ok(Ok(answer)) if busy(answer.status()) => {
