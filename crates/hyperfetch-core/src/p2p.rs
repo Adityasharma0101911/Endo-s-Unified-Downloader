@@ -873,10 +873,12 @@ mod tests {
         let (path, _) = tokio::time::timeout(Duration::from_secs(60), running).await.expect("done within a minute").unwrap();
         done.cancel();
         let (samples, peers) = (samples.await.unwrap(), peers.await.unwrap());
+        assert!(crate::webseed::NOT_PEERS.lock().is_empty(), "the seed was no peer: {:?}", crate::webseed::NOT_PEERS.lock());
         assert!(std::fs::read(&path).unwrap() == changed);
+        // The swarm brought at least the piece the seed had wrong, the seed a good share of the rest.
         let sent = mixed.stats().uploaded_bytes;
         let served = at_web.served.load(Ordering::SeqCst);
-        assert!(sent > 0 && served > 0, "the swarm sent {sent} bytes, the seed {served}");
+        assert!(sent >= 64 * 1024 && served >= size / 4, "the swarm sent {sent} bytes, the seed {served}");
         let both = samples.windows(4).any(|w| w[3].0 > w[0].0 && w[3].1 > w[0].1);
         assert!(both, "within 300 ms both sent some: (seed, swarm, seeder's live peers) {samples:?}; the download's peers (ms, n) {peers:?}");
         seeder.stop().await;

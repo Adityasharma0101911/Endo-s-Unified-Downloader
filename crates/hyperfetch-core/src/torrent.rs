@@ -3,6 +3,10 @@ use url::Url;
 
 /// Nesting deeper than this is rejected instead of recursing (real torrents use < 10 levels).
 const MAX_BENCODE_DEPTH: usize = 64;
+/// The SHA-1 of no bytes.
+const EMPTY_SHA1: [u8; 20] = [
+    0xda, 0x39, 0xa3, 0xee, 0x5e, 0x6b, 0x4b, 0x0d, 0x32, 0x55, 0xbf, 0xef, 0x95, 0x60, 0x18, 0x90, 0xaf, 0xd8, 0x07, 0x09,
+];
 
 #[derive(Debug, Clone)]
 pub struct MagnetInfo {
@@ -27,6 +31,10 @@ pub struct TorrentFile {
     pub pieces: Option<crate::metalink::Pieces>,
     /// Where the file starts in the bytes the pieces hash (padding files included).
     pub start: u64,
+    /// The file's own SHA-1 and MD5 (lowercase hex), which some torrents list beside its path
+    /// (the Internet Archive's do).
+    pub sha1: Option<String>,
+    pub md5: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -148,6 +156,18 @@ pub fn parse_magnet_uri(uri: &str) -> Result<MagnetInfo, String> {
     })
 }
 
+/// A file's hash of `bytes` bytes under `key` in its dictionary, as lowercase hex: written as hex
+/// (the Internet Archive's torrents) or as the raw bytes.
+fn file_hash(dict: &[(Vec<u8>, BValue)], key: &[u8], bytes: usize) -> Option<String> {
+    let Some(BValue::Bytes(value)) = dict_get(dict, key) else { return None };
+    let hex = |raw: &[u8]| raw.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    match value.len() {
+        n if n == bytes * 2 && value.iter().all(u8::is_ascii_hexdigit) => Some(String::from_utf8_lossy(value).to_ascii_lowercase()),
+        n if n == bytes => Some(hex(value)),
+        _ => None,
+    }
+}
+
 fn non_negative(value: i64, what: &str) -> Result<u64, String> {
     u64::try_from(value).map_err(|_| format!("Invalid torrent: negative {}", what))
 }
@@ -220,11 +240,10 @@ pub fn parse_torrent_bytes(data: &[u8]) -> Result<TorrentInfo, String> {
         _ => 0,
     };
 
-    let hashes: &[u8] = match dict_get(info_dict, b"pieces") {
+    let mut hashes: &[u8] = match dict_get(info_dict, b"pieces") {
         Some(BValue::Bytes(b)) => b,
         _ => &[],
     };
-    let num_pieces = hashes.len() / 20;
 
     // Single-file torrents have `length`; multi-file ones a `files` list under the `name` directory.
     let mut files = Vec::new();
@@ -239,7 +258,8 @@ pub fn parse_torrent_bytes(data: &[u8]) -> Result<TorrentInfo, String> {
             .collect();
         stream = non_negative(*len, "length")?;
         starts.push(0);
-        files.push(TorrentFile { path: vec![name.clone()], length: stream, urls, pieces: None, start: 0 });
+        let (sha1, md5) = (file_hash(info_dict, b"sha1", 20), file_hash(info_dict, b"md5", 16));
+        files.push(TorrentFile { path: vec![name.clone()], length: stream, urls, pieces: None, start: 0, sha1, md5 });
     } else if let Some(BValue::List(entries)) = dict_get(info_dict, b"files") {
         for entry in entries {
             let BValue::Dict(fd) = entry else {
@@ -281,10 +301,18 @@ pub fn parse_torrent_bytes(data: &[u8]) -> Result<TorrentInfo, String> {
             // A multi-file web seed is always a directory, even if the trailing '/' is missing.
             let urls = web_seeds.iter().filter_map(|seed| web_seed_file_url(seed, &components)).collect();
             starts.push(start);
-            files.push(TorrentFile { path, length, urls, pieces: None, start });
+            let (sha1, md5) = (file_hash(fd, b"sha1", 20), file_hash(fd, b"md5", 16));
+            files.push(TorrentFile { path, length, urls, pieces: None, start, sha1, md5 });
         }
     }
 
+    // librqbit's torrent maker (rqbit's) adds the hash of nothing after a last full piece, which
+    // torrent clients read past: one hash too many, not a wrong one.
+    let whole = if piece_length > 0 { stream.div_ceil(piece_length) } else { 0 };
+    if hashes.len() as u64 == (whole + 1) * 20 && hashes.ends_with(&EMPTY_SHA1) {
+        hashes = &hashes[..hashes.len() - 20];
+    }
+    let num_pieces = hashes.len() / 20;
     // Hashes that are not one per piece of all the files are not trusted for any of them.
     let pieces_fit = piece_length > 0 && hashes.len() % 20 == 0 && num_pieces as u64 == stream.div_ceil(piece_length);
     for (file, start) in files.iter_mut().zip(starts).filter(|_| pieces_fit) {
@@ -475,6 +503,14 @@ mod tests {
         assert_eq!(parse_torrent_bytes(single.as_bytes()).unwrap().files[0].pieces.as_ref().map(|p| p.hashes.len()), Some(2));
         let short = format!("d4:infod6:lengthi5e4:name5:a.iso12:piece lengthi4e6:pieces20:{a}ee");
         assert!(parse_torrent_bytes(short.as_bytes()).unwrap().files[0].pieces.is_none());
+
+        // rqbit's torrents of whole pieces end with the hash of nothing: read past, as clients do.
+        let rqbit = [b"d4:infod6:lengthi8e4:name5:a.iso12:piece lengthi4e6:pieces60:".as_slice(), format!("{a}{b}").as_bytes(), &EMPTY_SHA1, b"ee"].concat();
+        let info = parse_torrent_bytes(&rqbit).unwrap();
+        assert_eq!((info.num_pieces, info.piece_hashes.len()), (2, 2));
+        assert_eq!(info.files[0].pieces.as_ref().map(|p| p.hashes.len()), Some(2));
+        let extra = format!("d4:infod6:lengthi8e4:name5:a.iso12:piece lengthi4e6:pieces60:{a}{b}{c}ee");
+        assert!(parse_torrent_bytes(extra.as_bytes()).unwrap().piece_hashes.is_empty(), "any other third hash is wrong");
     }
 
     #[test]
