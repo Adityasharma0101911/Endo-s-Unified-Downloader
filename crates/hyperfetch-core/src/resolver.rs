@@ -1837,7 +1837,7 @@ fn json_string_after_key(after_key: &str) -> Option<String> {
 
 /// Source text of every `<name ...>` start tag (case-insensitive), up to but excluding `>`.
 /// `lower` must be `html.to_ascii_lowercase()`, which keeps byte offsets identical.
-fn start_tags<'a>(html: &'a str, lower: &str, name: &str) -> Vec<&'a str> {
+pub(crate) fn start_tags<'a>(html: &'a str, lower: &str, name: &str) -> Vec<&'a str> {
     let open = format!("<{}", name);
     let mut tags = Vec::new();
     let mut from = 0;
@@ -1854,7 +1854,7 @@ fn start_tags<'a>(html: &'a str, lower: &str, name: &str) -> Vec<&'a str> {
 }
 
 /// Value of attribute `attr` (exact name, case-insensitive) in a start tag's source, with `&amp;` decoded.
-fn attr_value(tag: &str, attr: &str) -> Option<String> {
+pub(crate) fn attr_value(tag: &str, attr: &str) -> Option<String> {
     let lower = tag.to_ascii_lowercase();
     let needle = format!("{}=", attr);
     let mut from = 0;

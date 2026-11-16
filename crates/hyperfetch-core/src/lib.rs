@@ -29,6 +29,7 @@ pub mod shares;
 pub mod cloud;
 pub mod repos;
 pub mod iasearch;
+pub mod archives;
 pub(crate) mod polite;
 pub mod gallery;
 pub mod postprocess;

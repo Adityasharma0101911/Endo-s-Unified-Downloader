@@ -672,7 +672,7 @@ fn between<'a>(s: &'a str, start: &str, end: &str) -> Option<&'a str> {
 }
 
 /// `text` from HTML with its character references decoded (as it is if one is unknown).
-fn unescape(text: &str) -> String {
+pub(crate) fn unescape(text: &str) -> String {
     quick_xml::escape::unescape(text).map_or_else(|_| text.to_string(), |t| t.into_owned()).trim().to_string()
 }
 

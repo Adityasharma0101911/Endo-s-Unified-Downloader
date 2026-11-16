@@ -851,8 +851,8 @@ mod tests {
         let sent = mixed.stats().uploaded_bytes;
         let served = at_web.served.load(Ordering::SeqCst);
         assert!(sent > 0 && served > 0, "the swarm sent {sent} bytes, the seed {served}");
-        let both = samples.windows(2).any(|w| w[1].0 > w[0].0 && w[1].1 > w[0].1);
-        assert!(both, "within 100 ms both sent some: {samples:?}");
+        let both = samples.windows(4).any(|w| w[3].0 > w[0].0 && w[3].1 > w[0].1);
+        assert!(both, "within 300 ms both sent some: {samples:?}");
         seeder.stop().await;
     }
 

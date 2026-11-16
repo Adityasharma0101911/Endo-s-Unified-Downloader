@@ -5,6 +5,7 @@ What changed in each release, newest first. Each release's page on [GitHub](http
 ## Unreleased
 
 - **Internet Archive collections, searches and uploads.** A collection's page, a search (`archive.org/search?query=...`, `advancedsearch.php`) or an account's uploads (`details/@name`) adds each item's files, read through archive.org's scraping API, one item a second. One run lists at most 100 new items (`--max-items`), says so, and goes on with the next ones when the link is added again; items already downloaded are skipped without a request. `--formats` (GUI: "Archive formats") picks an item's files by format or extension, `original` or `derivative`.
+- **Archive sites.** Kiwix ZIM files and folders download from every mirror their Metalink names, checked by its hashes, and a library.kiwix.org book's page is its ZIM file; a Wikimedia dumps run is its finished files, with the documented mirrors that hold the same SHA-1; a Project Gutenberg book is its formats from Gutenberg's HTTPS mirrors; an arXiv paper is its PDF and source from `export.arxiv.org`, over one connection; Zenodo records, Figshare articles and Dataverse datasets are their files with MD5s; a Software Heritage ID is the tarball its vault cooks; a Common Crawl `*.paths.gz` is its files, 100 a run.
 - **Polite listings.** Every listing above paces its requests per site, rests a host that answers 429 or 503 for as long as it asks (the rest downloads to it share), and identifies with the app's own user agent.
 
 ## 2.0.0 (2026-11-15)

@@ -274,6 +274,7 @@ pub fn might_list(url: &Url) -> bool {
         || shares::lists(url)
         || cloud::lists(url)
         || crate::iasearch::lists(url)
+        || crate::archives::lists(url)
         || repos::lists(url)
         || folders::lists(url)
         || feeds::lists(url)
@@ -286,8 +287,8 @@ pub fn might_list(url: &Url) -> bool {
 fn listing_url(token: &str) -> Option<Url> {
     let url = match http_url(token) {
         Some(url) => resolver::unwrap_redirect(&url).unwrap_or(url),
-        // A bucket's s3:// or gs:// link, or a WebDAV one.
-        None => Url::parse(token).ok().filter(|u| matches!(u.scheme(), "s3" | "gs" | "webdav" | "webdavs" | "dav" | "davs" | "sftp"))?,
+        // A bucket's s3:// or gs:// link, a WebDAV one, or a Software Heritage ID (swh:1:...).
+        None => Url::parse(token).ok().filter(|u| matches!(u.scheme(), "s3" | "gs" | "webdav" | "webdavs" | "dav" | "davs" | "sftp" | "swh"))?,
     };
     might_list(&url).then_some(url)
 }
@@ -598,6 +599,12 @@ async fn list(http: &reqwest::Client, url: &Url, options: &ListOptions) -> Optio
             return Some(listed);
         }
     }
+    // Archive sites with APIs or file lists of their own.
+    if crate::archives::lists(url) {
+        if let Some(listed) = crate::archives::list(http, url, options).await {
+            return Some(listed);
+        }
+    }
     if repos::lists(url) {
         let auth = options.auth.as_ref().filter(|(link, _)| link == url).map(|(_, header)| header.as_str());
         return Some(repos::list(http, url, auth, &options.formats).await);
@@ -783,7 +790,7 @@ async fn read_local(path: &Path) -> Result<Vec<u8>, String> {
 }
 
 /// One task per metalink file, named by its relative path ("dir/file.iso" is saved in dir/).
-fn metalink_tasks(bytes: &[u8]) -> Result<Vec<Task>, String> {
+pub(crate) fn metalink_tasks(bytes: &[u8]) -> Result<Vec<Task>, String> {
     let text = decode_text(bytes)?;
     metalink::parse_metalink(&text)?
         .into_iter()
