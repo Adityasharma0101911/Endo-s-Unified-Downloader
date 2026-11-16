@@ -31,6 +31,7 @@ pub mod repos;
 pub mod iasearch;
 pub mod archives;
 pub mod wayback;
+pub mod sitemirror;
 pub(crate) mod polite;
 pub mod gallery;
 pub mod postprocess;
