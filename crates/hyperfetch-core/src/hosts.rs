@@ -99,6 +99,9 @@ impl HostKey {
         } else if host.contains("pixeldra") {
             // Answers 403 to a fifth or sixth connection from one address.
             Some(4)
+        } else if host == "export.arxiv.org" {
+            // arXiv asks programs to use one connection to it (see `crate::archives`).
+            Some(1)
         } else {
             None
         }
@@ -738,7 +741,12 @@ impl Hosts {
         let others = entry.open.saturating_sub(1);
         if others > 0 {
             entry.facts.connection_cap = Some((others, now));
-            self.keep(key, unix_now(), |kept| kept.cap = Some(others));
+            self.keep(key, unix_now(), |kept| {
+                kept.cap = Some(others);
+                // A download that settled while a slot it had just freed still counted settled past
+                // what the host serves at once: no later one starts there.
+                kept.connections = kept.connections.map(|n| n.min(others));
+            });
         }
         entry.answered_at.is_some_and(|at| now.saturating_duration_since(at) < BANNED_FOR)
     }
