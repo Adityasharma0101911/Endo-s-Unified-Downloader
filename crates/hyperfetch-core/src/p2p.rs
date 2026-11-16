@@ -734,12 +734,34 @@ fn failed(e: impl std::fmt::Display) -> String {
     format!("BitTorrent download failed: {e:#}")
 }
 
+/// A session that only talks to peers it is told of, on loopback (tests, the speed benchmark).
+#[cfg(test)]
+pub(crate) async fn offline(dir: &Path) -> Arc<Session> {
+    let options = SessionOptions {
+        dht: None,
+        disable_local_service_discovery: true,
+        listen: Some(ListenerOptions { listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(), ..Default::default() }),
+        ..Default::default()
+    };
+    Session::new_with_opts(dir.to_path_buf(), options).await.unwrap()
+}
+
+/// Makes an [`offline`] session in `dir` the process's, for the downloads [`run`] makes.
+#[cfg(test)]
+pub(crate) async fn go_offline(dir: &Path) -> Arc<Session> {
+    let session = offline(dir).await;
+    let before = SESSION.lock().await.replace((Setup::of(&DownloadOptions::default()).unwrap(), session.clone()));
+    if let Some((_, before)) = before {
+        before.stop().await;
+    }
+    session
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use librqbit::spawn_utils::BlockingSpawner;
     use librqbit::{create_torrent, CreateTorrentOptions};
-    use std::net::Ipv4Addr;
 
     #[test]
     fn seeding_stops_at_the_ratio_or_the_time_limit() {
@@ -819,17 +841,6 @@ mod tests {
         (made, seeded)
     }
 
-    /// A session that only talks to peers it is told of, on loopback.
-    async fn offline(dir: &Path) -> Arc<Session> {
-        let options = SessionOptions {
-            dht: None,
-            disable_local_service_discovery: true,
-            listen: Some(ListenerOptions { listen_addr: (Ipv4Addr::LOCALHOST, 0).into(), ..Default::default() }),
-            ..Default::default()
-        };
-        Session::new_with_opts(dir.to_path_buf(), options).await.unwrap()
-    }
-
     // One test, as the process-wide session lives on the runtime that started it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn downloads_from_a_local_swarm_and_resumes_after_cancel() {
@@ -856,9 +867,8 @@ mod tests {
         let port = seeder.listen_addr().unwrap().port();
         let magnet = format!("magnet:?xt=urn:btih:{}&dn=payload.bin&x.pe=127.0.0.1:{port}", torrent.info_hash().as_string());
         let magnet = Url::parse(&magnet).unwrap();
-        let session = offline(&out).await;
+        let session = go_offline(&out).await;
         let options = DownloadOptions::default();
-        *SESSION.lock().await = Some((Setup::of(&options).unwrap(), session.clone()));
         // A file of the user's with the torrent's name is never written over.
         std::fs::create_dir_all(&out).unwrap();
         std::fs::write(out.join("payload.bin"), b"mine").unwrap();
