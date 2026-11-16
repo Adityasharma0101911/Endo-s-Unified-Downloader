@@ -313,7 +313,7 @@ async fn items(http: &reqwest::Client, base: &str, mut pager: Pager, folder: Pat
                 continue;
             }
             polite::pace(&Url::parse(base).map_err(|e| e.to_string())?, GAP).await;
-            let found = match crate::repos::archive_item(http, base, &hit.identifier, &options.formats).await {
+            let found = match crate::repos::archive_item(http, base, &hit.identifier, &options.formats, options.swarm_with_http()).await {
                 Ok(found) => found,
                 Err(e) => {
                     in_a_row += 1;

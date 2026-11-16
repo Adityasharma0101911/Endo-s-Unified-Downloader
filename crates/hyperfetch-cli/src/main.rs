@@ -586,6 +586,7 @@ fn job(args: &Args, connections: u64, dir: &Path, task: Task) -> Job {
         media_name: task.media_name,
         archive_lines: task.archive,
         bittorrent: task.p2p,
+        torrent_files: task.torrent_files,
         post: PostOptions {
             extract: args.extract,
             delete_archive: args.delete_archive,

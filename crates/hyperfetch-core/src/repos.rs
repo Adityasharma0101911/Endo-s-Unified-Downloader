@@ -246,8 +246,9 @@ pub fn lists(url: &Url) -> bool {
 }
 
 /// One task per file at `url`, in a folder named after it; a repository's zip. An Internet
-/// Archive item's files are those `formats` choose (see [`archive_takes`]).
-pub async fn list(http: &reqwest::Client, url: &Url, auth: Option<&str>, formats: &[String]) -> Result<Vec<Task>, String> {
+/// Archive item's files are those `formats` choose (see [`archive_takes`]), its large ones from
+/// its torrent too with `p2p` (see [`archive_swarm`]).
+pub async fn list(http: &reqwest::Client, url: &Url, auth: Option<&str>, formats: &[String], p2p: bool) -> Result<Vec<Task>, String> {
     let tasks = match repo_of(url) {
         Some(repo @ (Repo::GitHubRoot { .. } | Repo::GitLabRoot { .. } | Repo::BitbucketRoot { .. } | Repo::GiteaRoot { .. })) => {
             let (zip, name) = zip_of(&repo)?;
@@ -257,7 +258,7 @@ pub async fn list(http: &reqwest::Client, url: &Url, auth: Option<&str>, formats
         Some(Repo::GitHubRelease { owner, repo, tag }) => github_release(http, auth, GITHUB_API, &owner, &repo, tag.as_deref()).await?,
         Some(Repo::HuggingFace { kind, repo, rev, path }) => hugging_face(http, auth, HUGGING_FACE, kind, &repo, &rev, &path).await?,
         Some(Repo::Civitai { model, version }) => civitai(http, auth, CIVITAI, model, version).await?,
-        Some(Repo::Archive { item, path }) => archive(http, auth, ARCHIVE, &item, &path, formats).await?,
+        Some(Repo::Archive { item, path }) => archive(http, auth, ARCHIVE, &item, &path, formats, p2p).await?,
         Some(Repo::GitLabTree { origin, project, rest }) => gitlab_tree(http, auth, &origin, &project, &rest).await?,
         Some(Repo::GitLabRelease { origin, project, tag }) => gitlab_release(http, auth, &origin, &project, tag.as_deref()).await?,
         Some(Repo::BitbucketTree { owner, repo, rest }) => bitbucket_tree(http, auth, BITBUCKET_API, &owner, &repo, &rest).await?,
@@ -644,22 +645,31 @@ fn archive_takes(file: &ArchiveFile, formats: &[String]) -> bool {
 /// The files of archive.org's `item` a listing with `formats` takes (see [`archive_takes`]), each a
 /// task for its /download/ link in a folder named after the item: the one way an item becomes
 /// downloads, whether its own link or a collection's or search's (`crate::iasearch`) names it.
-pub(crate) async fn archive_item(http: &reqwest::Client, base: &str, item: &str, formats: &[String]) -> Result<Vec<Task>, String> {
-    archive(http, None, base, item, &[], formats).await
+pub(crate) async fn archive_item(http: &reqwest::Client, base: &str, item: &str, formats: &[String], p2p: bool) -> Result<Vec<Task>, String> {
+    archive(http, None, base, item, &[], formats, p2p).await
 }
+
+/// Of an item's chosen files, at least this many bytes come from its torrent (see
+/// [`archive_swarm`]), else all stay on HTTP.
+const ARCHIVE_SWARM_MIN: u64 = crate::p2p::SWARM_MIN;
+/// An item's torrent larger than this is not read (as in `ingest`).
+const ARCHIVE_TORRENT_MAX: u64 = 16 << 20;
 
 /// The files of archive.org's `item` a listing with `formats` takes (see [`archive_takes`]: by
 /// default those uploaded to it, not the copies archive.org made of them, nor its own records),
 /// under `path` in it, subfolders kept, each a task for its /download/ link with its size and
-/// SHA-1 (else MD5).
-async fn archive(http: &reqwest::Client, auth: Option<&str>, base: &str, item: &str, path: &[String], formats: &[String]) -> Result<Vec<Task>, String> {
+/// SHA-1 (else MD5). With `p2p`, the whole item's large files come from its torrent, its web
+/// seeds and swarm at once (see [`archive_swarm`]).
+async fn archive(http: &reqwest::Client, auth: Option<&str>, base: &str, item: &str, path: &[String], formats: &[String], p2p: bool) -> Result<Vec<Task>, String> {
     let url = url_at(base, ["metadata", item, "files"])?;
     let missing = || format!("archive.org has no item {} (or it is dark)", item);
     let answer = fetch(http.get(url), auth, "archive.org").await?.ok_or_else(missing)?;
     let files = json::<ArchiveField<Vec<ArchiveFile>>>(answer, "archive.org").await?.result.ok_or_else(missing)?;
+    let torrent = format!("{item}_archive.torrent");
+    let torrent_size = files.iter().find(|f| f.name == torrent).and_then(|f| f.size.as_deref()?.parse::<u64>().ok());
     let prefix = path.join("/");
     let folder = component(path.last().map_or(item, String::as_str), item)?;
-    let mut tasks = Vec::new();
+    let (mut tasks, mut chosen) = (Vec::new(), Vec::new());
     for file in files {
         if !archive_takes(&file, formats) {
             continue;
@@ -669,12 +679,64 @@ async fn archive(http: &reqwest::Client, auth: Option<&str>, base: &str, item: &
             urls: vec![url_at(base, ["download", item].into_iter().chain(file.name.split('/')))?],
             name: Some(name),
             folder: Some(folder.clone()),
-            size: file.size.and_then(|size| size.parse().ok()),
+            size: file.size.as_deref().and_then(|size| size.parse().ok()),
             checksum: checksum("sha1", &file.sha1).or_else(|| checksum("md5", &file.md5)),
             ..Task::default()
         });
+        chosen.push(file);
     }
-    Ok(tasks)
+    let large = tasks.iter().filter_map(|t| t.size).sum::<u64>() >= ARCHIVE_SWARM_MIN;
+    if !(p2p && path.is_empty() && large && torrent_size.is_some_and(|size| size <= ARCHIVE_TORRENT_MAX)) {
+        return Ok(tasks);
+    }
+    let link = url_at(base, ["download", item, torrent.as_str()])?;
+    let answer = fetch(http.get(link.clone()), auth, "archive.org").await;
+    let bytes = match answer {
+        Ok(Some(answer)) => answer.bytes().await.ok().filter(|b| b.len() as u64 <= ARCHIVE_TORRENT_MAX),
+        _ => None,
+    };
+    match bytes.map(|bytes| crate::torrent::parse_torrent_bytes(&bytes)) {
+        Some(Ok(info)) => Ok(archive_swarm(tasks, &chosen, &info, item, link)),
+        // The item comes over HTTP alone.
+        why => {
+            tracing::debug!("{torrent} is not used: {:?}", why.map(|parsed| parsed.err()));
+            Ok(tasks)
+        }
+    }
+}
+
+/// `tasks` (an item's files, `chosen` their records) with those its torrent `info` (at `link`)
+/// holds as archive.org lists them (path and size, and SHA-1 and MD5 where both have one), and
+/// has web seeds for, in place of their own: one swarm download of them alone, when they are
+/// [`ARCHIVE_SWARM_MIN`] bytes or more. A file the torrent lacks or has otherwise (it was made
+/// before the item changed) stays on HTTP.
+fn archive_swarm(tasks: Vec<Task>, chosen: &[ArchiveFile], info: &crate::torrent::TorrentInfo, item: &str, link: Url) -> Vec<Task> {
+    if info.name != item || info.piece_hashes.is_empty() {
+        return tasks;
+    }
+    let same = |ours: &str, theirs: &Option<String>| ours.is_empty() || theirs.as_deref().is_none_or(|h| h.eq_ignore_ascii_case(ours));
+    let held: Vec<bool> = tasks
+        .iter()
+        .zip(chosen)
+        .map(|(task, file)| {
+            info.files.iter().any(|t| {
+                t.path.join("/") == file.name && Some(t.length) == task.size && !t.urls.is_empty() && same(&file.sha1, &t.sha1) && same(&file.md5, &t.md5)
+            })
+        })
+        .collect();
+    let bytes: u64 = tasks.iter().zip(&held).filter(|(_, held)| **held).filter_map(|(t, _)| t.size).sum();
+    if bytes < ARCHIVE_SWARM_MIN {
+        return tasks;
+    }
+    let (mut files, mut rest) = (Vec::new(), Vec::new());
+    for (task, held) in tasks.into_iter().zip(held) {
+        match task.name.clone().filter(|_| held) {
+            Some(name) => files.push(name),
+            None => rest.push(task),
+        }
+    }
+    let swarm = Task { urls: vec![link], name: Some(PathBuf::from(&info.name)), size: Some(bytes), p2p: true, torrent_files: files, ..Task::default() };
+    std::iter::once(swarm).chain(rest).collect()
 }
 
 /// `path` (an entry's, from the repository's top) inside the folder `prefix` ("" for the top).
@@ -1139,7 +1201,7 @@ mod tests {
     async fn a_repository_is_its_default_branchs_zip() {
         let root = Url::parse("https://github.com/o/My%20Repo").unwrap();
         let zip = "https://github.com/o/My%20Repo/archive/HEAD.zip";
-        let tasks = list(&http(), &root, None, &[]).await.unwrap();
+        let tasks = list(&http(), &root, None, &[], false).await.unwrap();
         assert_eq!(tasks, [Task { urls: vec![Url::parse(zip).unwrap()], name: Some("My Repo.zip".into()), ..Task::default() }]);
         assert_eq!(resolve(&http(), &root, None).await.unwrap()[0].as_str(), zip);
         let tree = Url::parse("https://github.com/o/r/tree/main").unwrap();
@@ -1322,8 +1384,54 @@ mod tests {
                     {"name":"disc 10/other.flac","source":"original","format":"Flac"},
                     {"name":"disc 1/../../evil.exe","source":"original","format":"Unknown"}]}"#,
             ),
+            // An item of large files and its torrent, which has one of them otherwise, another of
+            // another size, and lacks one.
+            "/metadata/big/files" => json_reply(&format!(
+                r#"{{"result":[
+                    {{"name":"big.iso","source":"original","size":"209715200","format":"ISO Image","sha1":"{a}"}},
+                    {{"name":"disc 1/track.flac","source":"original","format":"Flac","size":"12","md5":"51a545810bc354a03263332b7654c5fa"}},
+                    {{"name":"other.iso","source":"original","size":"209715200","format":"ISO Image","sha1":"{b}"}},
+                    {{"name":"stale.bin","source":"original","size":"6","format":"Unknown"}},
+                    {{"name":"new.txt","source":"original","size":"3","format":"Text"}},
+                    {{"name":"big_archive.torrent","source":"metadata","format":"Archive BitTorrent","size":"600"}}]}}"#,
+                a = "a".repeat(40),
+                b = "b".repeat(40),
+            )),
+            "/download/big/big_archive.torrent" => {
+                let torrent = format!(
+                    "d8:url-list29:https://archive.org/download/4:infod5:filesl\
+                     d6:lengthi209715200e4:pathl7:big.isoe4:sha140:{a}e\
+                     d6:lengthi12e3:md532:51a545810bc354a03263332b7654c5fa4:pathl6:disc 110:track.flacee\
+                     d6:lengthi209715200e4:pathl9:other.isoe4:sha140:{c}e\
+                     d6:lengthi5e4:pathl9:stale.binee\
+                     e4:name3:big12:piece lengthi536870912e6:pieces20:{p}ee",
+                    a = "a".repeat(40),
+                    c = "c".repeat(40),
+                    p = "p".repeat(20),
+                );
+                (200, "Content-Type: application/x-bittorrent\r\n".into(), torrent.into_bytes())
+            }
             _ => json_reply(r#"{"error":"Couldn't locate item 'gone'"}"#),
         }
+    }
+
+    /// An item's large files its torrent holds as archive.org lists them come from it (its web
+    /// seeds and swarm at once), one download of them alone; what the torrent lacks or has
+    /// otherwise (it was made before the item changed) stays on HTTP, and all of it without the
+    /// swarm. A small item never asks for its torrent (the other test's "item").
+    #[tokio::test]
+    async fn archive_items_large_files_come_from_their_torrent() {
+        let (addr, _) = serve(archive_api).await;
+        let base = format!("http://{addr}");
+        let tasks = archive_item(&http(), &base, "big", &[], true).await.unwrap();
+        let swarm = &tasks[0];
+        assert_eq!((swarm.urls[0].to_string(), swarm.p2p), (format!("{base}/download/big/big_archive.torrent"), true));
+        assert_eq!((swarm.name.clone(), swarm.size, swarm.folder.clone()), (Some("big".into()), Some(209715212), None));
+        assert_eq!(swarm.torrent_files, [PathBuf::from("big.iso"), PathBuf::from("disc 1").join("track.flac")]);
+        let rest: Vec<_> = tasks[1..].iter().map(|t| (t.name.clone().unwrap(), t.p2p)).collect();
+        assert_eq!(rest, [(PathBuf::from("other.iso"), false), (PathBuf::from("stale.bin"), false), (PathBuf::from("new.txt"), false)]);
+        let plain = archive_item(&http(), &base, "big", &[], false).await.unwrap();
+        assert!(plain.len() == 5 && plain.iter().all(|t| !t.p2p && t.folder == Some("big".into())));
     }
 
     /// An item is one task per file uploaded to it (not archive.org's copies of them or its own
@@ -1333,7 +1441,7 @@ mod tests {
     async fn archive_items_list_their_original_files() {
         let (addr, _) = serve(archive_api).await;
         let base = format!("http://{addr}");
-        let tasks = archive(&http(), None, &base, "item", &[], &[]).await.unwrap();
+        let tasks = archive(&http(), None, &base, "item", &[], &[], true).await.unwrap();
         let listed: Vec<_> = tasks.iter().map(|t| (t.urls[0].to_string(), t.name.clone().unwrap(), t.size, t.checksum.clone())).collect();
         assert_eq!(
             listed,
@@ -1344,9 +1452,9 @@ mod tests {
             ]
         );
         assert!(tasks.iter().all(|t| t.folder == Some("item".into()) && !t.from_document));
-        let folder = archive(&http(), None, &base, "item", &strings(&["disc 1"]), &[]).await.unwrap();
+        let folder = archive(&http(), None, &base, "item", &strings(&["disc 1"]), &[], false).await.unwrap();
         assert_eq!(folder.iter().map(|t| (t.folder.clone().unwrap(), t.name.clone().unwrap())).collect::<Vec<_>>(), [(PathBuf::from("disc 1"), PathBuf::from("track.flac"))]);
-        assert!(archive(&http(), None, &base, "gone", &[], &[]).await.unwrap_err().contains("no item gone"));
+        assert!(archive(&http(), None, &base, "gone", &[], &[], false).await.unwrap_err().contains("no item gone"));
         assert_eq!(
             repo("https://archive.org/details/item"),
             Some(Repo::Archive { item: "item".into(), path: Vec::new() })
@@ -1370,7 +1478,7 @@ mod tests {
             let (http, base) = (http(), base.clone());
             let formats = strings(formats);
             async move {
-                let tasks = archive_item(&http, &base, "item", &formats).await.unwrap();
+                let tasks = archive_item(&http, &base, "item", &formats, false).await.unwrap();
                 tasks.into_iter().map(|t| t.name.unwrap().to_string_lossy().replace('\\', "/")).collect::<Vec<_>>()
             }
         };
@@ -1573,9 +1681,9 @@ mod tests {
         ] {
             let root = Url::parse(root).unwrap();
             assert_eq!(resolve(&http(), &root, None).await.unwrap()[0].as_str(), zip);
-            assert_eq!(list(&http(), &root, None, &[]).await.unwrap()[0].urls[0].as_str(), zip);
+            assert_eq!(list(&http(), &root, None, &[], false).await.unwrap()[0].urls[0].as_str(), zip);
         }
-        assert_eq!(list(&http(), &Url::parse("https://gitlab.com/g/sub/My%20P").unwrap(), None, &[]).await.unwrap()[0].name, Some("My P.zip".into()));
+        assert_eq!(list(&http(), &Url::parse("https://gitlab.com/g/sub/My%20P").unwrap(), None, &[], false).await.unwrap()[0].name, Some("My P.zip".into()));
     }
 
     fn gitlab(path: &str) -> Reply {
@@ -1757,7 +1865,7 @@ mod tests {
 
     /// What `link` lists, through the client the front ends list with (GitHub wants its user agent).
     async fn live(link: &str) -> Result<Vec<Task>, String> {
-        list(&crate::ingest::descriptor_client(None).unwrap(), &Url::parse(link).unwrap(), None, &[]).await
+        list(&crate::ingest::descriptor_client(None).unwrap(), &Url::parse(link).unwrap(), None, &[], false).await
     }
 
     /// Live: a small public GitHub folder lists its files.

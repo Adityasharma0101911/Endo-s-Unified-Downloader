@@ -293,6 +293,11 @@ pub struct DownloadOptions {
     pub spread_addresses: bool,
     /// The download is a BitTorrent swarm download (see `ingest::Task::p2p`).
     pub bittorrent: bool,
+    /// Of a multi-file torrent, the files to download, by their paths in it (an archive.org
+    /// item's, see `repos`); empty for all. They come into a hidden folder beside the torrent's,
+    /// as the torrent library creates every file of a torrent, and move into its folder once
+    /// checked; such a torrent does not seed. See `p2p::run`.
+    pub torrent_files: Vec<PathBuf>,
     /// A finished torrent seeds until it has uploaded this many times its size (0 = no seeding).
     pub seed_ratio: f64,
     /// ... or for this many minutes, whichever comes first (0 = no time limit).
@@ -462,6 +467,7 @@ impl Default for DownloadOptions {
             bind_addresses: Vec::new(),
             spread_addresses: true,
             bittorrent: false,
+            torrent_files: Vec::new(),
             seed_ratio: 0.0,
             seed_minutes: 0,
             bt_port: None,
@@ -851,8 +857,7 @@ impl DownloadEngine {
 
         // A magnet link or .torrent for the swarm (see `ingest::Task::p2p`).
         if self.options.bittorrent {
-            let source = self.urls.first().ok_or("No URLs to download")?;
-            return self.unless_rerun(crate::p2p::run(source, &self.options, &self.save_dir(), snapshot_tx, self.cancel_token.clone()).await);
+            return self.unless_rerun(crate::p2p::run(&self.urls, &self.options, &self.save_dir(), snapshot_tx, self.cancel_token.clone()).await);
         }
 
         // A container image into an OCI layout folder (see `crate::oci`).
