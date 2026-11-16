@@ -2287,6 +2287,7 @@ fn task_options(settings: &Settings, task: &Task, checksum: &str, auth: &str) ->
     options.metalink_pieces = task.pieces.clone();
     options.archive_lines = task.archive.clone();
     options.bittorrent = task.p2p;
+    options.torrent_files = task.torrent_files.clone();
     options.post.sort &= !task.keeps_its_place();
     Ok(options)
 }

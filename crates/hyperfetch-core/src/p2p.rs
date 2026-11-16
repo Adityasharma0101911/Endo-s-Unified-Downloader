@@ -9,6 +9,10 @@
 //! A cancelled download leaves the session (its files stay); running it again adds it back, and
 //! librqbit checks the pieces already on disk before fetching the rest. A finished torrent seeds
 //! until its ratio or time limit, then leaves the session too.
+//!
+//! Some of a torrent's files alone (an archive.org item's, see `repos`) come into a hidden folder
+//! beside its own and move into it once complete; such a torrent does not seed, and three of them
+//! download at once.
 
 use std::io::Write;
 use std::net::{Ipv6Addr, SocketAddr};
@@ -24,7 +28,7 @@ use librqbit::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, ConnectionOptions, DhtSessionConfig, ListenerOptions, ManagedTorrent,
     Session, SessionOptions, TorrentStats, TorrentStatsState,
 };
-use tokio::sync::{broadcast, watch, Mutex};
+use tokio::sync::{broadcast, watch, Mutex, Semaphore};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
@@ -48,6 +52,14 @@ static HOLDS: AtomicUsize = AtomicUsize::new(0);
 static SEEDING: LazyLock<watch::Sender<usize>> = LazyLock::new(|| watch::Sender::new(0));
 /// A .torrent file larger than this is not read (as in `ingest`).
 const MAX_TORRENT_BYTES: usize = 16 * 1024 * 1024;
+/// Fewest bytes a site's files come from its torrent for (its web seeds and swarm at once: an
+/// archive.org item's, see `repos`, a Kiwix ZIM file's, see `archives`), else from its HTTP alone:
+/// a swarm takes seconds to start (the torrent, its trackers, the first peers), longer than HTTP
+/// needs for less, and small files seldom have peers anyway.
+pub(crate) const SWARM_MIN: u64 = 100 << 20;
+/// Torrents of chosen files (archive.org items', see `repos`) downloading at once: a collection's
+/// items wait for one of these turns rather than each joining its swarm.
+static CHOSEN: Semaphore = Semaphore::const_new(3);
 
 /// What a session is started with: the listen port (0 = librqbit's range), UPnP, and the SOCKS5
 /// proxy every connection goes through.
@@ -124,17 +136,29 @@ impl std::ops::Deref for Hold {
     }
 }
 
-/// Downloads the torrent `source` (a magnet link, an http(s) .torrent link or a `file:` URL of a
-/// local one) into `out_dir` and returns the file (one-file torrent) or the folder named after it,
-/// and whether any of it arrived now (false: every piece was on disk from an earlier run). A name
-/// taken by files this torrent did not write is never written over: it gets a numbered one.
+/// Downloads the torrent `urls` names first (a magnet link, an http(s) .torrent link or a `file:`
+/// URL of a local one) into `out_dir` and returns the file (one-file torrent) or the folder named
+/// after it, and whether any of it arrived now (false: every piece was on disk from an earlier
+/// run). The rest of `urls` are more web seeds of a one-file torrent (a Kiwix ZIM file's Metalink
+/// mirrors, see `archives`). A name taken by files this torrent did not write is never written
+/// over: it gets a numbered one.
 pub async fn run(
-    source: &Url,
+    urls: &[Url],
     options: &DownloadOptions,
     out_dir: &Path,
     snapshots: Option<broadcast::Sender<EngineSnapshot>>,
     cancel: CancellationToken,
 ) -> Result<(PathBuf, bool), String> {
+    let (source, more_seeds) = urls.split_first().ok_or("No URLs to download")?;
+    // Chosen files of a torrent (an archive.org item's): a collection's items take turns.
+    let _turn = match options.torrent_files.is_empty() {
+        true => None,
+        false => tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(CANCELLED.to_string()),
+            turn = CHOSEN.acquire() => turn.ok(),
+        },
+    };
     let setup = Setup::of(options)?;
     let proxied = setup.proxy.is_some();
     let session = session(setup, out_dir.to_path_buf()).await?;
@@ -180,21 +204,45 @@ pub async fn run(
         (folder, target)
     };
     let taken = |path: &Path| std::fs::symlink_metadata(path).is_ok();
-    let (folder, target) = (0..).map(place).find(|(_, target)| !taken(target) || claimed(&hash, target)).expect("a free name");
-    // Resuming writes over what an earlier run of it left; librqbit keeps the pieces that check out.
-    let resuming = taken(&target);
-    claim(&hash, &target);
+    // Chosen files (see `DownloadOptions::torrent_files`) come into a hidden folder beside the
+    // torrent's own, which librqbit fills with every file of it, and move into it once complete.
+    let only = match options.torrent_files.as_slice() {
+        [] => None,
+        chosen => {
+            let picked: Vec<usize> = (0..files.len()).filter(|&i| chosen.contains(&files[i])).collect();
+            if !multi || picked.len() != chosen.len() {
+                return Err(failed("the torrent lacks files it was chosen for"));
+            }
+            Some(picked)
+        }
+    };
+    let (folder, target, resuming) = match only {
+        // The folder is ours: what is there is an earlier run's.
+        Some(_) => (out_dir.join(format!(".{base}.torrent")), out_dir.join(&base), true),
+        None => {
+            let (folder, target) = (0..).map(place).find(|(_, target)| !taken(target) || claimed(&hash, target)).expect("a free name");
+            // Resuming writes over what an earlier run of it left; librqbit keeps the pieces that check out.
+            let resuming = taken(&target);
+            claim(&hash, &target);
+            (folder, target, resuming)
+        }
+    };
     // Web seeds are peers of the swarm (see `crate::webseed`): both serve the torrent at once.
     // Through a proxy librqbit cannot reach them on loopback, so their files come over HTTP
     // first; librqbit's first check then keeps the pieces of them that match, and the swarm
-    // brings the rest.
+    // brings the rest. A one-file torrent's further web seeds (a ZIM file's mirrors) join its own.
+    let seeded = match more_seeds {
+        [] => listed.torrent_bytes.to_vec(),
+        _ if multi => return Err(failed("only a one-file torrent takes more web seeds")),
+        more => with_web_seeds(&listed.torrent_bytes, more)?,
+    };
     let network = network_only(options);
     let web = match proxied {
         true => None,
         false => {
             let client = crate::engine::build_client(&network)?;
             let (connections, per_host) = (network.num_connections.clamp(4, 64), network.max_connections_per_host);
-            match crate::webseed::start(&listed.torrent_bytes, listed.info_hash.0, client, connections, per_host).await {
+            match crate::webseed::start(&seeded, listed.info_hash.0, client, connections, per_host).await {
                 Ok(web) => Some(web),
                 Err(why) => {
                     tracing::debug!("The torrent's web seeds are no peers: {why}");
@@ -208,7 +256,7 @@ pub async fn run(
     let kept: Vec<(PathBuf, u64)> = info.iter_file_details().filter(|f| !f.attrs().padding).map(|f| (f.filename.to_pathbuf(), f.len)).collect();
     let filled = match web {
         Some(_) => false,
-        None => fill_from_web_seeds(&listed.torrent_bytes, &kept, &folder, &target, options, &snapshots, &cancel).await?,
+        None => fill_from_web_seeds(&seeded, &kept, &folder, &target, options, &snapshots, &cancel).await?,
     };
     let seeds = web.as_ref().map(|web| web.addrs.clone()).unwrap_or_default();
     let torrent = match proxied {
@@ -221,23 +269,30 @@ pub async fn run(
         output_folder: Some(folder.to_str().ok_or("The save folder's name is not valid Unicode")?.to_string()),
         initial_peers: Some([hints, listed.seen_peers, seeds].concat()),
         ratelimits: LimitsConfig { download_bps: speed, ..Default::default() },
+        only_files: only.clone(),
         ..Default::default()
     };
     let (ours, handle) = match session.add_torrent(AddTorrent::from_bytes(torrent), Some(adding)).await {
         Ok(AddTorrentResponse::Added(_, handle)) => (true, handle),
+        Ok(AddTorrentResponse::AlreadyManaged(..)) if only.is_some() => return Err(failed("the torrent is already downloading")),
         Ok(AddTorrentResponse::AlreadyManaged(_, handle)) => (false, handle),
         Ok(AddTorrentResponse::ListOnly(_)) => return Err(failed("the torrent was only listed")),
         Err(e) => return Err(failed(e)),
     };
     // A torrent the session already had (another download of it) is where that one put it.
-    let target = if multi { handle.output_folder().to_path_buf() } else { handle.output_folder().join(&files[0]) };
+    let (target, marked) = match (&only, multi) {
+        (Some(_), _) => (target, folder.clone()),
+        (None, true) => (handle.output_folder().to_path_buf(), handle.output_folder().to_path_buf()),
+        (None, false) => (handle.output_folder().join(&files[0]), handle.output_folder().join(&files[0])),
+    };
 
     let mark = options.post.mark_of_the_web.then_some(source);
-    let watched = watch_until_complete(&session, &handle, &target, mark, &snapshots, &cancel).await;
+    let watched = watch_until_complete(&session, &handle, &target, (marked.as_path(), mark), &snapshots, &cancel).await;
     if let Some(web) = web {
         tracing::debug!("{} bytes came from the web seeds", web.fetched());
     }
-    let seeding = ours && watched.is_ok() && options.seed_ratio > 0.0;
+    // Chosen files leave the torrent's folder, so it cannot seed from them.
+    let seeding = ours && only.is_none() && watched.is_ok() && options.seed_ratio > 0.0;
     if watched.is_ok() {
         emit(&snapshots, progress(&handle.stats(), &target, seeding));
     }
@@ -246,7 +301,25 @@ pub async fn run(
     } else if ours {
         let _ = session.delete(handle.id().into(), false).await;
     }
+    // librqbit has let go of the files by now.
+    if let (Some(picked), Ok(_)) = (&only, &watched) {
+        move_chosen(&folder, &target, picked.iter().map(|&i| &files[i]))?;
+    }
     watched.map(|fresh| (target, fresh || filled))
+}
+
+/// Moves the chosen `files` of a torrent from the hidden folder `stage` into `folder`, each where
+/// no file is yet (see `engine::free_path`), then removes `stage` with the rest librqbit put there.
+fn move_chosen<'a>(stage: &Path, folder: &Path, files: impl Iterator<Item = &'a PathBuf>) -> Result<(), String> {
+    for file in files {
+        let to = crate::engine::free_path(&folder.join(file));
+        let moved = std::fs::create_dir_all(to.parent().unwrap_or(folder)).and_then(|()| std::fs::rename(stage.join(file), &to));
+        moved.map_err(|e| format!("Cannot move {} into {}: {e}", file.display(), folder.display()))?;
+    }
+    if let Err(e) = std::fs::remove_dir_all(stage) {
+        tracing::warn!("Cannot remove {}: {e}", stage.display());
+    }
+    Ok(())
 }
 
 /// Downloads over HTTP each file of the torrent `bytes` that has web seeds and is not on disk yet,
@@ -289,7 +362,8 @@ async fn fill(
     let (total, mut done, mut filled) = (torrent.total_length, 0, false);
     for (file, (name, _)) in torrent.files.iter().zip(kept) {
         let path = folder.join(name);
-        if file.urls.is_empty() || std::fs::symlink_metadata(&path).is_ok() {
+        let left_out = !options.torrent_files.is_empty() && !options.torrent_files.contains(name);
+        if file.urls.is_empty() || left_out || std::fs::symlink_metadata(&path).is_ok() {
             done += file.length;
             continue;
         }
@@ -355,13 +429,13 @@ async fn session(setup: Setup, out_dir: PathBuf) -> Result<Hold, String> {
 
 /// Sends progress every half second until the torrent has every piece, then says whether any of
 /// it arrived now; an error when it fails, leaves the session (another download of it stopped,
-/// or BitTorrent did) or `cancel` fires. Its files are marked as from the internet with `mark`
-/// as they appear, not only once it is complete.
+/// or BitTorrent did) or `cancel` fires. Its files (at `marked`) are marked as from the internet
+/// with `mark` as they appear, not only once it is complete.
 async fn watch_until_complete(
     session: &Session,
     handle: &ManagedTorrent,
     target: &Path,
-    mut mark: Option<&Url>,
+    (marked, mut mark): (&Path, Option<&Url>),
     snapshots: &Option<broadcast::Sender<EngineSnapshot>>,
     cancel: &CancellationToken,
 ) -> Result<bool, String> {
@@ -386,7 +460,7 @@ async fn watch_until_complete(
                 // librqbit has made every file by the time the torrent is live.
                 if let Some(source) = mark.filter(|_| stats.live.is_some()) {
                     mark = None;
-                    let (target, source) = (target.to_path_buf(), source.clone());
+                    let (target, source) = (marked.to_path_buf(), source.clone());
                     tokio::task::spawn_blocking(move || crate::postprocess::mark_from_internet(&target, &source));
                 }
                 emit(snapshots, progress(&stats, target, false));
@@ -453,6 +527,31 @@ fn http_trackers_only(torrent: &[u8]) -> Result<Vec<u8>, String> {
     out.extend(b"e4:info");
     out.extend(parsed.info.raw_bytes.as_ref());
     out.push(b'e');
+    Ok(out)
+}
+
+/// The .torrent file `torrent` with `more` among its web seeds (BEP 19's `url-list`), its trackers
+/// kept: the same info, so the same torrent.
+fn with_web_seeds(torrent: &[u8], more: &[Url]) -> Result<Vec<u8>, String> {
+    let parsed = librqbit::torrent_from_bytes(torrent).map_err(failed)?;
+    let had = crate::torrent::parse_torrent_bytes(torrent)?.web_seeds;
+    let text = |out: &mut Vec<u8>, bytes: &[u8]| {
+        out.extend(format!("{}:", bytes.len()).as_bytes());
+        out.extend(bytes);
+    };
+    let mut out = b"d13:announce-listl".to_vec();
+    for tracker in parsed.iter_announce() {
+        out.push(b'l');
+        text(&mut out, tracker.as_ref());
+        out.push(b'e');
+    }
+    out.extend(b"e4:info");
+    out.extend(parsed.info.raw_bytes.as_ref());
+    out.extend(b"8:url-listl");
+    for seed in had.iter().chain(more.iter().filter(|seed| !had.contains(seed))) {
+        text(&mut out, seed.as_str().as_bytes());
+    }
+    out.extend(b"ee");
     Ok(out)
 }
 
@@ -697,6 +796,17 @@ mod tests {
         assert_eq!(parsed.info.raw_bytes.as_ref(), info.as_bytes());
         let trackers: Vec<&[u8]> = parsed.iter_announce().map(|t| t.as_ref()).collect();
         assert_eq!(trackers, [b"https://t.example/a".as_slice()]);
+
+        // More web seeds join its own, the trackers and info kept.
+        let seeded = format!("{}8:url-listl{}ee", &torrent[..torrent.len() - 1], text("https://a.example/a.bin"));
+        let more = [Url::parse("https://a.example/a.bin").unwrap(), Url::parse("https://b.example/a.bin").unwrap()];
+        let rewritten = with_web_seeds(seeded.as_bytes(), &more).unwrap();
+        let parsed = librqbit::torrent_from_bytes(&rewritten).unwrap();
+        assert_eq!(parsed.info.raw_bytes.as_ref(), info.as_bytes());
+        let trackers: Vec<&[u8]> = parsed.iter_announce().map(|t| t.as_ref()).collect();
+        assert!(trackers.contains(&b"udp://t.example:1".as_slice()) && trackers.contains(&b"https://t.example/a".as_slice()));
+        let seeds = crate::torrent::parse_torrent_bytes(&rewritten).unwrap().files[0].urls.clone();
+        assert_eq!(seeds, more);
     }
 
     /// The torrent of `file` in 64 KiB pieces, and its bytes with `web` as its web seed.
@@ -769,7 +879,7 @@ mod tests {
             }
             seen
         });
-        assert_eq!(run(&magnet, &options, &out, Some(tx), cancel).await.unwrap_err(), CANCELLED);
+        assert_eq!(run(std::slice::from_ref(&magnet), &options, &out, Some(tx), cancel).await.unwrap_err(), CANCELLED);
         let seen = seen.await.unwrap();
         assert!(seen.iter().any(|s| s.torrent.as_ref().is_some_and(|t| t.peers >= 1)), "{seen:?}");
         let partial = seen.last().unwrap().downloaded_bytes;
@@ -779,7 +889,7 @@ mod tests {
         let uploaded = seeding.stats().uploaded_bytes;
 
         // Run again: the pieces on disk are kept, only the rest comes from the swarm.
-        let (path, fresh) = run(&magnet, &options, &out, None, CancellationToken::new()).await.unwrap();
+        let (path, fresh) = run(std::slice::from_ref(&magnet), &options, &out, None, CancellationToken::new()).await.unwrap();
         assert_eq!((path.as_path(), fresh), (target.as_path(), true));
         assert_eq!(std::fs::read(&path).unwrap(), payload);
         let resent = seeding.stats().uploaded_bytes - uploaded;
@@ -787,7 +897,7 @@ mod tests {
         assert_eq!(session.with_torrents(|t| t.count()), 0, "no seeding with a ratio of 0");
         assert_eq!(std::fs::read(out.join("payload.bin")).unwrap(), b"mine");
         // Once more: all of it is there already, so nothing new arrives.
-        let again = run(&magnet, &options, &out, None, CancellationToken::new()).await.unwrap();
+        let again = run(std::slice::from_ref(&magnet), &options, &out, None, CancellationToken::new()).await.unwrap();
         assert_eq!(again, (target, false));
 
         // A file name with a drive in it is refused before anything is written.
@@ -798,7 +908,7 @@ mod tests {
             let file = tmp.path().join("evil.torrent");
             std::fs::write(&file, evil).unwrap();
             let source = Url::from_file_path(&file).unwrap();
-            let refused = run(&source, &options, &out, None, CancellationToken::new());
+            let refused = run(std::slice::from_ref(&source), &options, &out, None, CancellationToken::new());
             let error = tokio::time::timeout(Duration::from_secs(10), refused).await.expect("refused at once");
             assert!(error.unwrap_err().contains("outside its folder"));
             assert!(!Path::new("C:bad.bin").exists());
@@ -815,23 +925,26 @@ mod tests {
         let file = tmp.path().join("web.torrent");
         std::fs::write(&file, bytes).unwrap();
         crate::webseed::NOT_PEERS.lock().clear();
-        let (path, fresh) = run(&Url::from_file_path(&file).unwrap(), &options, &out, None, CancellationToken::new()).await.unwrap();
+        let (path, fresh) = run(&[Url::from_file_path(&file).unwrap()], &options, &out, None, CancellationToken::new()).await.unwrap();
         assert!(crate::webseed::NOT_PEERS.lock().is_empty(), "the seed was no peer: {:?}", crate::webseed::NOT_PEERS.lock());
         assert_eq!((path.as_path(), fresh), (out.join("web.bin").as_path(), true));
         assert!(std::fs::read(&path).unwrap() == content);
         assert!(stats.served.load(Ordering::SeqCst) >= size);
 
-        // A slow seed serving other bytes in one piece, and a slow seeder in the swarm: both serve
-        // the download at once, and the file is the torrent's, the seed's wrong piece left out.
-        let (slow_web, at_web) = crate::netsim::serve(crate::netsim::Server { size, per_client: Some(400e3), ..Default::default() }).await;
-        let mut changed = content.clone();
+        // A slow seed serving other bytes in one piece, and a seeder as slow in the swarm: both
+        // serve the download at once, and the file is the torrent's, the seed's wrong piece left
+        // out. The torrent is larger than what librqbit asks of all of them at once (2 MiB of the
+        // seeder, 1 MiB of each of the seed's peers), so neither can hold every piece.
+        let size = 8 << 20;
+        let (slow_web, at_web) = crate::netsim::serve(crate::netsim::Server { size, per_client: Some(1e6), ..Default::default() }).await;
+        let mut changed = crate::netsim::file(size);
         changed[200_000..210_000].fill(0xee);
         std::fs::write(seeds.join("mixed.bin"), &changed).unwrap();
         let (made, bytes) = with_web_seed(&seeds.join("mixed.bin"), &slow_web).await;
         let seeding = AddTorrentOptions {
             overwrite: true,
             output_folder: Some(seeds.to_str().unwrap().into()),
-            ratelimits: LimitsConfig { upload_bps: NonZeroU32::new(400 * 1024), ..Default::default() },
+            ratelimits: LimitsConfig { upload_bps: NonZeroU32::new(1 << 20), ..Default::default() },
             ..Default::default()
         };
         let added = seeder.add_torrent(AddTorrent::from_bytes(made.as_bytes().unwrap()), Some(seeding)).await;
@@ -869,7 +982,7 @@ mod tests {
             }
             peers
         });
-        let running = run(&source, &options, &out, Some(tx), CancellationToken::new());
+        let running = run(std::slice::from_ref(&source), &options, &out, Some(tx), CancellationToken::new());
         let (path, _) = tokio::time::timeout(Duration::from_secs(60), running).await.expect("done within a minute").unwrap();
         done.cancel();
         let (samples, peers) = (samples.await.unwrap(), peers.await.unwrap());
@@ -878,9 +991,39 @@ mod tests {
         // The swarm brought at least the piece the seed had wrong, the seed a good share of the rest.
         let sent = mixed.stats().uploaded_bytes;
         let served = at_web.served.load(Ordering::SeqCst);
-        assert!(sent >= 64 * 1024 && served >= size / 4, "the swarm sent {sent} bytes, the seed {served}");
+        let trace = format!("(seed, swarm, seeder's live peers) every 100 ms {samples:?}; the download's peers (ms, n) {peers:?}");
+        assert!(sent >= 64 * 1024 && served >= size / 4, "the swarm sent {sent} bytes, the seed {served}: {trace}");
         let both = samples.windows(4).any(|w| w[3].0 > w[0].0 && w[3].1 > w[0].1);
-        assert!(both, "within 300 ms both sent some: (seed, swarm, seeder's live peers) {samples:?}; the download's peers (ms, n) {peers:?}");
+        assert!(both, "within 300 ms both sent some: {trace}");
+
+        // Some files of a torrent alone (an archive.org item's): they come into a hidden folder and
+        // move into the torrent's, beside what is there (a file of the user's keeps its name).
+        let pick = seeds.join("pick");
+        std::fs::create_dir_all(pick.join("sub")).unwrap();
+        let (a, b, c) = (crate::netsim::file(100 << 10), crate::netsim::file(70 << 10), crate::netsim::file(50 << 10));
+        std::fs::write(pick.join("a.bin"), &a).unwrap();
+        std::fs::write(pick.join("sub").join("b.bin"), &b).unwrap();
+        std::fs::write(pick.join("c.bin"), &c).unwrap();
+        let pieces = CreateTorrentOptions { piece_length: Some(64 * 1024), ..Default::default() };
+        let made = create_torrent(&pick, pieces, &BlockingSpawner::new(1)).await.unwrap();
+        let seeding = AddTorrentOptions { overwrite: true, output_folder: Some(pick.to_str().unwrap().into()), ..Default::default() };
+        let added = seeder.add_torrent(AddTorrent::from_bytes(made.as_bytes().unwrap()), Some(seeding)).await;
+        added.unwrap().into_handle().unwrap().wait_until_completed().await.unwrap();
+        let file = tmp.path().join("pick.torrent");
+        std::fs::write(&file, made.as_bytes().unwrap()).unwrap();
+        let mut source = Url::from_file_path(&file).unwrap();
+        source.set_query(Some(&format!("x.pe=127.0.0.1:{port}")));
+        std::fs::create_dir_all(out.join("pick")).unwrap();
+        std::fs::write(out.join("pick").join("a.bin"), b"mine").unwrap();
+        let chosen = DownloadOptions { torrent_files: vec!["a.bin".into(), Path::new("sub").join("b.bin")], ..DownloadOptions::default() };
+        let running = run(std::slice::from_ref(&source), &chosen, &out, None, CancellationToken::new());
+        let (path, fresh) = tokio::time::timeout(Duration::from_secs(60), running).await.expect("done within a minute").unwrap();
+        assert_eq!((path.as_path(), fresh), (out.join("pick").as_path(), true));
+        assert_eq!(std::fs::read(path.join("a.bin")).unwrap(), b"mine");
+        assert!(std::fs::read(path.join("a (1).bin")).unwrap() == a);
+        assert!(std::fs::read(path.join("sub").join("b.bin")).unwrap() == b);
+        assert!(!path.join("c.bin").exists() && !out.join(".pick.torrent").exists());
+        assert_eq!(session.with_torrents(|t| t.count()), 0, "chosen files do not seed");
         seeder.stop().await;
     }
 
@@ -907,7 +1050,7 @@ mod tests {
         });
         let options = DownloadOptions::default();
         let magnet = Url::parse(magnet).unwrap();
-        let run = run(&magnet, &options, tmp.path(), Some(tx), cancel);
+        let run = run(std::slice::from_ref(&magnet), &options, tmp.path(), Some(tx), cancel);
         let result = tokio::time::timeout(Duration::from_secs(180), run).await.expect("a megabyte within 3 minutes");
         assert_eq!(result.unwrap_err(), CANCELLED);
         let last = seen.await.unwrap();

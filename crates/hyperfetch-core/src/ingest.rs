@@ -48,8 +48,12 @@ pub struct Task {
     /// Optional HTTP Referer header for links requiring anti-hotlinking bypass.
     pub referer: Option<String>,
     /// A BitTorrent swarm download: `urls` holds the magnet link, the .torrent link or the
-    /// `file:` URL of a local .torrent (see `engine::DownloadOptions::bittorrent`).
+    /// `file:` URL of a local .torrent (see `engine::DownloadOptions::bittorrent`), then, for a
+    /// one-file torrent, more web seeds of it (a Kiwix ZIM file's mirrors, see `p2p::run`).
     pub p2p: bool,
+    /// Of a swarm download, the files of the torrent to download, by their paths in it; empty
+    /// for all (see `engine::DownloadOptions::torrent_files`).
+    pub torrent_files: Vec<PathBuf>,
     /// Piece hashes a metalink publishes for the file (see `metalink::Pieces`).
     pub pieces: Option<metalink::Pieces>,
     /// The channel of a channel list it records (see [`Channel`]): its name, for
@@ -138,6 +142,14 @@ pub struct ListOptions {
 }
 
 impl ListOptions {
+    /// Whether a large file a site publishes a torrent of too comes from that torrent, its web
+    /// seeds and swarm at once (an archive.org item's, see `repos::archive`; a Kiwix ZIM file, see
+    /// `archives`): with the swarm allowed, and not through a proxy, where web seeds are no peers
+    /// (see `crate::p2p`) and HTTP is as fast.
+    pub(crate) fn swarm_with_http(&self) -> bool {
+        self.p2p && self.proxy.is_none()
+    }
+
     /// A GET of `url` with [`ListOptions::auth`]'s header when `url` is on its link's host, and
     /// not over plain HTTP when the link is HTTPS (as `worker::Auth` scopes the user's).
     pub(crate) fn get(&self, http: &reqwest::Client, url: &Url) -> reqwest::RequestBuilder {
@@ -613,7 +625,7 @@ async fn list(http: &reqwest::Client, url: &Url, options: &ListOptions) -> Optio
     }
     if repos::lists(url) {
         let auth = options.auth.as_ref().filter(|(link, _)| link == url).map(|(_, header)| header.as_str());
-        return Some(repos::list(http, url, auth, &options.formats).await);
+        return Some(repos::list(http, url, auth, &options.formats, options.swarm_with_http()).await);
     }
     if folders::lists(url) {
         if let Some(listed) = folders::list(http, url, options).await {
