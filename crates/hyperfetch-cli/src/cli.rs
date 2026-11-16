@@ -446,7 +446,7 @@ pub struct Args {
     /// Download the Wayback Machine's captures of URL (of everything under it when it ends in *),
     /// one per content, into a folder tree host/path/timestamp, each checked against its SHA-1, with
     /// their list in wayback-manifest.tsv; run it again to go on with the next ones (--max-items)
-    #[arg(long = "wayback", value_name = "URL")]
+    #[arg(long = "wayback", value_name = "URL", conflicts_with = "mirror")]
     pub wayback: Option<String>,
 
     /// Only --wayback captures taken from TIME on: a timestamp or its start (2010, 20100603)
@@ -462,6 +462,33 @@ pub struct Args {
     /// "!mimetype:image/.*"); repeat it for several. By default those served with status 200
     #[arg(long = "wayback-filter", value_name = "FIELD:REGEX", requires = "wayback")]
     pub wayback_filter: Vec<String>,
+
+    /// Copy the web site at URL to disk to browse offline: the pages under its folder on its host,
+    /// up to --mirror-depth links away, with their links made relative, as its robots.txt allows,
+    /// one request at a time, with mirror-manifest.json listing each file and its SHA-256; run it
+    /// again to go on where it stopped. No script runs
+    #[arg(long = "mirror", value_name = "URL", conflicts_with_all = ["input_file", "urls", "dry_run", "spider", "preview", "stdout", "list_tracks"])]
+    pub mirror: Option<String>,
+
+    /// How many links away from the first page --mirror follows (0: that page alone)
+    #[arg(long = "mirror-depth", value_name = "N", default_value_t = 2, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(0..=20), requires = "mirror")]
+    pub mirror_depth: usize,
+
+    /// Also the style sheets, scripts, images and media the --mirror pages use (from that host)
+    #[arg(long = "mirror-requisites", requires = "mirror")]
+    pub mirror_requisites: bool,
+
+    /// Seconds between two --mirror requests (a longer Crawl-delay in robots.txt wins; 0.5-600)
+    #[arg(long = "mirror-delay", value_name = "SECS", default_value_t = 1.0, value_parser = parse_mirror_delay, requires = "mirror")]
+    pub mirror_delay: f64,
+
+    /// Most pages --mirror saves
+    #[arg(long = "mirror-max-pages", value_name = "N", default_value_t = 500, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=100_000), requires = "mirror")]
+    pub mirror_max_pages: usize,
+
+    /// Most bytes --mirror saves in all, e.g. 200M or 2G (powers of 1024)
+    #[arg(long = "mirror-max-size", value_name = "SIZE", default_value = "1G", value_parser = parse_bytes, requires = "mirror")]
+    pub mirror_max_size: u64,
 
     /// Record the channels of a channel list (an M3U of stream links) whose name or group PATTERN
     /// matches, in any case (* stands for any run of characters); repeat it for several
@@ -692,6 +719,14 @@ pub fn parse_bytes(s: &str) -> Result<u64, String> {
         return Err(format!("'{}' is too large", s));
     }
     Ok(bytes.round() as u64)
+}
+
+/// Parses `--mirror-delay`: seconds from 0.5 to 600, so a mirror never hammers a site.
+fn parse_mirror_delay(s: &str) -> Result<f64, String> {
+    match s.trim().parse::<f64>() {
+        Ok(secs) if (0.5..=600.0).contains(&secs) => Ok(secs),
+        _ => Err(format!("'{s}' is not a number of seconds from 0.5 to 600")),
+    }
 }
 
 /// Accepts curl-style "Name: VALUE", or a bare "VALUE" for Authorization, as (name, value); the

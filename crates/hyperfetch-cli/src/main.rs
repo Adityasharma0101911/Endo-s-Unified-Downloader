@@ -22,7 +22,7 @@ use hyperfetch_core::ingest::{
 use hyperfetch_core::TrackChoice;
 use hyperfetch_core::media::{self, find_ffmpeg_path, is_supported_media_site, BrowserCookieSource};
 use hyperfetch_core::p2p;
-use hyperfetch_core::wayback;
+use hyperfetch_core::{sitemirror, wayback};
 use hyperfetch_core::paste::{self, PastedLink};
 use hyperfetch_core::postprocess::PostOptions;
 use hyperfetch_core::resolver::SmartResolver;
@@ -170,6 +170,9 @@ async fn app(mut args: Args) -> i32 {
     };
     if args.list_tracks {
         return list_tracks(&args, &ui, &http).await;
+    }
+    if let Some(site) = &args.mirror {
+        return mirror_site(&args, site, &ui, &shutdown, &http).await;
     }
     let code = if args.urls.is_empty() && args.input_file.is_none() {
         interactive(&args, &ui, &shutdown, &http, at_terminal().then_some(find_ffmpeg_path as Finder), prompt).await
@@ -902,6 +905,59 @@ async fn batch(args: &Args, ui: &Ui, shutdown: &Shutdown, http: &reqwest::Client
     let ffmpeg = ffmpeg_question(args, &jobs, can_ask.then_some(find_ffmpeg_path as Finder), ui);
     failed += run_jobs(jobs, args.jobs as usize, ui, shutdown, ffmpeg).await;
     exit_code(shutdown.requested(), failed)
+}
+
+/// --mirror: copies the web site at `site` into the download directory (see `sitemirror`). Ctrl+C
+/// stops it; the files saved so far stay, and the next run goes on from them.
+async fn mirror_site(args: &Args, site: &str, ui: &Ui, shutdown: &Shutdown, http: &reqwest::Client) -> i32 {
+    let start = match Url::parse(site.trim()) {
+        Ok(url) if matches!(url.scheme(), "http" | "https") => url,
+        _ => return usage(&format!("--mirror takes a web site's http(s) link, not '{}'", redact_url(site))),
+    };
+    let dir = match prepare_dir(args.dir.as_deref().unwrap_or(Path::new("."))).await {
+        Ok(dir) => dir,
+        Err(e) => return usage(&e),
+    };
+    let options = sitemirror::MirrorOptions {
+        depth: args.mirror_depth,
+        requisites: args.mirror_requisites,
+        delay: Duration::from_secs_f64(args.mirror_delay),
+        max_pages: args.mirror_max_pages,
+        max_bytes: args.mirror_max_size,
+    };
+    let quiet = ui.quiet();
+    let tell = |url: &str| {
+        if !quiet {
+            ui.error(&format!("Fetching {}", truncate(url, 100)));
+        }
+    };
+    let mut stop = shutdown.subscribe();
+    let mirrored = tokio::select! {
+        mirrored = sitemirror::mirror(http, &start, &dir, &options, tell) => mirrored,
+        () = stop_requested(&mut stop) => Err("stopped; run it again to go on where it stopped".to_string()),
+    };
+    match mirrored {
+        Ok(done) => {
+            for (url, why) in &done.failed {
+                ui.error(&format!("[FAILED] {}: {}", truncate(url, 80), why));
+            }
+            if !quiet {
+                let mut line = format!("[OK] {} page(s) and {} other file(s), {}, in {}", done.pages, done.files, HumanBytes(done.bytes), dir.display());
+                if done.disallowed > 0 {
+                    line.push_str(&format!("; {} link(s) left out as robots.txt asks", done.disallowed));
+                }
+                ui.error(&line);
+                if let Some(why) = &done.stopped {
+                    ui.error(&format!("Stopped early: {why}. Run it again with a larger cap to go on"));
+                }
+            }
+            if done.pages == 0 { EXIT_FAILED } else { EXIT_OK }
+        }
+        Err(e) => {
+            ui.error(&format!("[FAILED] {}: {}", redact_url(site), e));
+            shutdown.requested().unwrap_or(EXIT_FAILED)
+        }
+    }
 }
 
 /// `jobs` as they are to run: the headers of each probe printed first with -S, and those whose
