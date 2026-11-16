@@ -1415,6 +1415,7 @@ impl SmartResolver {
             || crate::shares::handles(url)
             || crate::cloud::handles(url)
             || crate::repos::handles(url)
+            || crate::wayback::handles(url)
     }
 
     /// Resolves `url` into download sources that are byte-identical copies of one file.
@@ -1465,6 +1466,10 @@ impl SmartResolver {
         }
         if crate::repos::handles(url) {
             return with_timeout(crate::repos::resolve(client, url, proxy)).await;
+        }
+        // A Wayback Machine capture: the bytes it captured, not the page rewritten for browsing.
+        if let Some(captured) = crate::wayback::resolve(url) {
+            return Ok(vec![captured]);
         }
 
         // 1. DoodStream embed / watch resolver
