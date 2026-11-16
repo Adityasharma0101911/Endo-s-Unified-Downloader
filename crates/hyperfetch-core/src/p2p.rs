@@ -194,7 +194,15 @@ pub async fn run(
         false => {
             let client = crate::engine::build_client(&network)?;
             let (connections, per_host) = (network.num_connections.clamp(4, 64), network.max_connections_per_host);
-            crate::webseed::start(&listed.torrent_bytes, listed.info_hash.0, client, connections, per_host).await
+            match crate::webseed::start(&listed.torrent_bytes, listed.info_hash.0, client, connections, per_host).await {
+                Ok(web) => Some(web),
+                Err(why) => {
+                    tracing::debug!("The torrent's web seeds are no peers: {why}");
+                    #[cfg(test)]
+                    crate::webseed::NOT_PEERS.lock().push(why);
+                    None
+                }
+            }
         }
     };
     let kept: Vec<(PathBuf, u64)> = info.iter_file_details().filter(|f| !f.attrs().padding).map(|f| (f.filename.to_pathbuf(), f.len)).collect();
@@ -806,7 +814,9 @@ mod tests {
         let (_, bytes) = with_web_seed(&seeds.join("web.bin"), &web).await;
         let file = tmp.path().join("web.torrent");
         std::fs::write(&file, bytes).unwrap();
+        crate::webseed::NOT_PEERS.lock().clear();
         let (path, fresh) = run(&Url::from_file_path(&file).unwrap(), &options, &out, None, CancellationToken::new()).await.unwrap();
+        assert!(crate::webseed::NOT_PEERS.lock().is_empty(), "the seed was no peer: {:?}", crate::webseed::NOT_PEERS.lock());
         assert_eq!((path.as_path(), fresh), (out.join("web.bin").as_path(), true));
         assert!(std::fs::read(&path).unwrap() == content);
         assert!(stats.served.load(Ordering::SeqCst) >= size);
