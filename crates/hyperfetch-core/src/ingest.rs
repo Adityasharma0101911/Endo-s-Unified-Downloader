@@ -275,6 +275,7 @@ pub fn might_list(url: &Url) -> bool {
         || cloud::lists(url)
         || crate::iasearch::lists(url)
         || crate::archives::lists(url)
+        || crate::wayback::lists(url)
         || repos::lists(url)
         || folders::lists(url)
         || feeds::lists(url)
@@ -599,9 +600,14 @@ async fn list(http: &reqwest::Client, url: &Url, options: &ListOptions) -> Optio
             return Some(listed);
         }
     }
-    // Archive sites with APIs or file lists of their own.
+    // Archive sites with APIs or file lists of their own; the Wayback Machine's captures.
     if crate::archives::lists(url) {
         if let Some(listed) = crate::archives::list(http, url, options).await {
+            return Some(listed);
+        }
+    }
+    if crate::wayback::lists(url) {
+        if let Some(listed) = crate::wayback::list(http, url, options).await {
             return Some(listed);
         }
     }

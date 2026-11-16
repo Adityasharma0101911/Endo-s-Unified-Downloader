@@ -443,6 +443,26 @@ pub struct Args {
     #[arg(long = "max-items", value_name = "N", value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=10_000))]
     pub max_items: Option<usize>,
 
+    /// Download the Wayback Machine's captures of URL (of everything under it when it ends in *),
+    /// one per content, into a folder tree host/path/timestamp, each checked against its SHA-1, with
+    /// their list in wayback-manifest.tsv; run it again to go on with the next ones (--max-items)
+    #[arg(long = "wayback", value_name = "URL")]
+    pub wayback: Option<String>,
+
+    /// Only --wayback captures taken from TIME on: a timestamp or its start (2010, 20100603)
+    #[arg(long = "wayback-from", value_name = "TIME", requires = "wayback")]
+    pub wayback_from: Option<String>,
+
+    /// Only --wayback captures taken up to TIME: a timestamp or its start (2012, 201206)
+    #[arg(long = "wayback-to", value_name = "TIME", requires = "wayback")]
+    pub wayback_to: Option<String>,
+
+    /// Only --wayback captures whose FIELD (mimetype, statuscode, original, urlkey, digest or length)
+    /// matches REGEX, or does not with a leading ! ("mimetype:application/pdf",
+    /// "!mimetype:image/.*"); repeat it for several. By default those served with status 200
+    #[arg(long = "wayback-filter", value_name = "FIELD:REGEX", requires = "wayback")]
+    pub wayback_filter: Vec<String>,
+
     /// Record the channels of a channel list (an M3U of stream links) whose name or group PATTERN
     /// matches, in any case (* stands for any run of characters); repeat it for several
     #[arg(long = "channel", value_name = "PATTERN", value_parser = parse_pattern)]

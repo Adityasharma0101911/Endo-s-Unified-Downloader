@@ -22,6 +22,7 @@ use hyperfetch_core::ingest::{
 use hyperfetch_core::TrackChoice;
 use hyperfetch_core::media::{self, find_ffmpeg_path, is_supported_media_site, BrowserCookieSource};
 use hyperfetch_core::p2p;
+use hyperfetch_core::wayback;
 use hyperfetch_core::paste::{self, PastedLink};
 use hyperfetch_core::postprocess::PostOptions;
 use hyperfetch_core::resolver::SmartResolver;
@@ -139,6 +140,13 @@ async fn app(mut args: Args) -> i32 {
     }
     if let Some(path) = &args.verify {
         return verify_file(&args, path, &ui, &shutdown).await;
+    }
+    // --wayback is the link of its CDX query, which lists the captures.
+    if let Some(target) = &args.wayback {
+        match wayback::cdx_link(target, args.wayback_from.as_deref(), args.wayback_to.as_deref(), &args.wayback_filter) {
+            Ok(link) => args.urls.push(link.to_string()),
+            Err(e) => return usage(&e),
+        }
     }
     // Each prints or writes something else than the downloads of an interactive prompt.
     let other = args.json || args.spider || args.dry_run || args.preview || args.stdout || args.list_tracks || args.start_at.is_some();
@@ -836,6 +844,7 @@ async fn batch(args: &Args, ui: &Ui, shutdown: &Shutdown, http: &reqwest::Client
     }
 
     let (tasks, mut failed) = read_tasks(&inputs, ui, http, &list_options(args)).await;
+    let captures: Vec<String> = tasks.iter().filter_map(|(_, task, _)| wayback::manifest_line(task)).collect();
     let swarm = tasks.iter().any(|(_, task, _)| task.p2p);
     if let Err(e) = check_single_file_options(args.output.as_deref(), args.checksum.is_some(), tasks.len(), swarm) {
         return usage(&e);
@@ -877,6 +886,12 @@ async fn batch(args: &Args, ui: &Ui, shutdown: &Shutdown, http: &reqwest::Client
     if args.spider {
         failed += probe::spider(&sized, ui, args.server_response).await;
         return exit_code(None, failed);
+    }
+    if !captures.is_empty() {
+        let at = dir.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || wayback::write_manifest(&at, &captures)).await.map_err(|e| e.to_string()).and_then(|r| r.map_err(|e| e.to_string())) {
+            ui.error(&format!("Cannot write {}: {e}", dir.join(wayback::MANIFEST).display()));
+        }
     }
     let (jobs, unlisted) = zip_jobs(args, sized.into_iter().map(|(job, _)| job).collect(), ui).await;
     failed += unlisted;
