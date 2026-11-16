@@ -25,6 +25,8 @@ pub struct TorrentFile {
     /// The torrent's SHA-1 piece hashes of this file, when its pieces hold it alone: it starts on
     /// a piece and ends on one or ends the torrent. A download from `urls` is checked against them.
     pub pieces: Option<crate::metalink::Pieces>,
+    /// Where the file starts in the bytes the pieces hash (padding files included).
+    pub start: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -38,6 +40,10 @@ pub struct TorrentInfo {
     pub web_seeds: Vec<Url>,
     pub trackers: Vec<String>,
     pub files: Vec<TorrentFile>,
+    /// The SHA-1 of each piece, when they are one per piece of all the files (else none).
+    pub piece_hashes: Vec<[u8; 20]>,
+    /// The bytes the pieces hash: the files', padding files included.
+    pub stream_length: u64,
 }
 
 pub fn is_magnet_uri(s: &str) -> bool {
@@ -233,7 +239,7 @@ pub fn parse_torrent_bytes(data: &[u8]) -> Result<TorrentInfo, String> {
             .collect();
         stream = non_negative(*len, "length")?;
         starts.push(0);
-        files.push(TorrentFile { path: vec![name.clone()], length: stream, urls, pieces: None });
+        files.push(TorrentFile { path: vec![name.clone()], length: stream, urls, pieces: None, start: 0 });
     } else if let Some(BValue::List(entries)) = dict_get(info_dict, b"files") {
         for entry in entries {
             let BValue::Dict(fd) = entry else {
@@ -275,7 +281,7 @@ pub fn parse_torrent_bytes(data: &[u8]) -> Result<TorrentInfo, String> {
             // A multi-file web seed is always a directory, even if the trailing '/' is missing.
             let urls = web_seeds.iter().filter_map(|seed| web_seed_file_url(seed, &components)).collect();
             starts.push(start);
-            files.push(TorrentFile { path, length, urls, pieces: None });
+            files.push(TorrentFile { path, length, urls, pieces: None, start });
         }
     }
 
@@ -290,6 +296,10 @@ pub fn parse_torrent_bytes(data: &[u8]) -> Result<TorrentInfo, String> {
         }
     }
 
+    let piece_hashes = match pieces_fit {
+        true => hashes.chunks(20).map(|h| h.try_into().unwrap()).collect(),
+        false => Vec::new(),
+    };
     let total_length = files
         .iter()
         .try_fold(0u64, |sum, f| sum.checked_add(f.length))
@@ -303,6 +313,8 @@ pub fn parse_torrent_bytes(data: &[u8]) -> Result<TorrentInfo, String> {
         web_seeds,
         trackers,
         files,
+        piece_hashes,
+        stream_length: stream,
     })
 }
 
