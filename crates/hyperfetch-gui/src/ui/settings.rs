@@ -660,6 +660,10 @@ fn media_settings(app: &mut App, ui: &mut Ui) {
     setting(ui, "Newest items only", "Only this many of a channel's, playlist's or feed's newest items (0 = all).", s.latest, |ui| {
         ui.add(egui::DragValue::new(&mut s.latest).range(0..=100_000));
     });
+    let about = "Only these formats or extensions of an Internet Archive item's files and of a Project Gutenberg book, \
+                 comma-separated; \"original\" or \"derivative\" picks archive.org's uploaded files or the copies it made. \
+                 Empty: the uploaded files, and every format of a book.";
+    text_setting(ui, "Archive formats", about, &mut s.archive_formats, "e.g. pdf, epub", false);
     let mut install = app.settings.install_ffmpeg == Some(true);
     if switch(ui, "Install ffmpeg when a video needs it", FFMPEG_ABOUT, &mut install) {
         app.answer_ffmpeg(install);

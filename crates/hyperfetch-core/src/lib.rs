@@ -28,6 +28,8 @@ pub mod mega;
 pub mod shares;
 pub mod cloud;
 pub mod repos;
+pub mod iasearch;
+pub(crate) mod polite;
 pub mod gallery;
 pub mod postprocess;
 pub mod paste;
