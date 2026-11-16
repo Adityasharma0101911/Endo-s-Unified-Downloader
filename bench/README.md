@@ -21,9 +21,8 @@ the job's summary and fails when `ENDO_BENCH_CHECK` finds a scenario under its f
 `sim-thresholds.json` (MB/s, and the most milliseconds to the first byte). Each floor is about
 half what the CI runner measured, and each first-byte limit three times the measured plus 200 ms:
 a real regression (a scenario at half speed, a probe that waits a round trip more) fails the job,
-a slower runner does not. The same job runs one comparison that never fails it: mimalloc as the
-allocator (`--features bench-mimalloc`). A debug build's numbers are not comparable: the
-dependencies are not optimized there, and the thresholds are not checked.
+a slower runner does not. A debug build's numbers are not comparable: the dependencies are not
+optimized there, and the thresholds are not checked.
 
 ### Results (2026-11-16, GitHub's ubuntu-latest runner, release build)
 
@@ -40,9 +39,16 @@ dependencies are not optimized there, and the thresholds are not checked.
 | `small_files`: 2,000 files of 1–100 KB, 8 at once | 16.5 | 12.5 ms | 4000 | 332 |
 | `small_files_hashed`: the same, each with its SHA-256 | 15.3 | 12.1 ms | 2000 | 307 |
 
-A file with a known SHA-256 asks once (GET), not twice (HEAD beside the GET). Writing 2 MiB to
-disk at a time per connection instead of 512 KiB measured no faster (LAN 2531 against 2572 MB/s,
-the capped and lossy links the same), so the writes stay at 512 KiB.
+A file with a known SHA-256 asks once (GET), not twice (HEAD beside the GET); its batch is still
+a little slower, as each file is hashed once more to check it. The same runner measured two
+changes that were then left out, as neither was faster beyond the noise between runs (a second
+run of the table above: LAN 2711 MB/s, small files 422 a second):
+
+- 2 MiB disk writes per connection instead of 512 KiB: LAN 2531 against 2572 MB/s, the capped
+  and lossy links the same.
+- mimalloc as the allocator, in the same run as the second table: LAN 2629 against 2711 MB/s,
+  small files 437 against 422 a second (hashed 384 against 365), every link-bound scenario the
+  same.
 
 ## v1.0 against the current CLI
 
