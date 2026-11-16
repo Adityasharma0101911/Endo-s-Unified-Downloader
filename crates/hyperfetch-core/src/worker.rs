@@ -30,15 +30,6 @@ const THROTTLE_RETRY: Duration = Duration::from_millis(500);
 const THROTTLE_COOLDOWN: Duration = Duration::from_secs(1);
 /// Received bytes collected before one disk write: few blocking writes, little memory per connection.
 const WRITE_BATCH: usize = 512 * 1024;
-
-/// `WRITE_BATCH`, or in tests the size the speed benchmark tries instead (`ENDO_WRITE_BATCH`).
-fn write_batch() -> usize {
-    #[cfg(test)]
-    if let Some(bytes) = std::env::var("ENDO_WRITE_BATCH").ok().and_then(|v| v.parse().ok()) {
-        return bytes;
-    }
-    WRITE_BATCH
-}
 /// Longest a received byte waits in memory, so progress and resume state keep up on slow links.
 const WRITE_INTERVAL: Duration = Duration::from_millis(250);
 /// Wait for a byte after which an idle worker takes over what is left of a chunk.
@@ -788,8 +779,7 @@ impl HttpWorker {
         // The wait before is the answer's: the chunk's rate, and its silence, count from here.
         chunk.answered(Instant::now());
         let mut stream = std::pin::pin!(body);
-        let write_batch = write_batch();
-        let mut batch = Batch { pos: start, buf: Vec::with_capacity(write_batch), mirror: mirror_id };
+        let mut batch = Batch { pos: start, buf: Vec::with_capacity(WRITE_BATCH), mirror: mirror_id };
         // Due `WRITE_INTERVAL` after the oldest byte in `batch` arrived.
         let flush_due = tokio::time::sleep(WRITE_INTERVAL);
         tokio::pin!(flush_due);
@@ -841,7 +831,7 @@ impl HttpWorker {
             }
             idle.as_mut().reset(tokio::time::Instant::now() + s.body_idle);
 
-            if batch.buf.len() + bytes.len() > write_batch {
+            if batch.buf.len() + bytes.len() > WRITE_BATCH {
                 if let Err(e) = self.flush(chunk, &mut batch).await {
                     break Err(e);
                 }

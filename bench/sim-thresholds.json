@@ -1,1 +1,12 @@
-{}
+{
+  "lan": { "min_mb_per_s": 1200, "max_ttfb_ms": 200 },
+  "per_connection": { "min_mb_per_s": 8.5, "max_ttfb_ms": 200 },
+  "per_client": { "min_mb_per_s": 10.5, "max_ttfb_ms": 200 },
+  "high_latency": { "min_mb_per_s": 8.5, "max_ttfb_ms": 650 },
+  "lossy": { "min_mb_per_s": 4.8, "max_ttfb_ms": 450 },
+  "rate_limited": { "min_mb_per_s": 7, "max_ttfb_ms": 200 },
+  "h2_latency_hyper": { "min_mb_per_s": 8.5, "max_ttfb_ms": 600 },
+  "h2_latency": { "min_mb_per_s": 11, "max_ttfb_ms": 600 },
+  "small_files": { "min_mb_per_s": 8, "max_ttfb_ms": 240 },
+  "small_files_hashed": { "min_mb_per_s": 7.5, "max_ttfb_ms": 240 }
+}

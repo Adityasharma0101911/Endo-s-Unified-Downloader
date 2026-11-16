@@ -72,17 +72,6 @@ jobs:
       - if: always()
         run: cat speed.md >> "$GITHUB_STEP_SUMMARY" || true
       # Experiments on the same runner, for comparison only: never fail the job.
-      - name: "Experiment: 2 MiB disk writes"
-        continue-on-error: true
-        run: |
-          cargo test --release -p hyperfetch-core --lib speed_bench -- --ignored --nocapture --test-threads=1
-          cat speed-writes.md >> "$GITHUB_STEP_SUMMARY"
-        env:
-          ENDO_BENCH_ONLY: lan,per_client,lossy
-          ENDO_WRITE_BATCH: "2097152"
-          ENDO_BENCH_LABEL: 2 MiB disk writes
-          ENDO_BENCH_OUT: ${{ github.workspace }}/speed-writes.json
-          ENDO_BENCH_SUMMARY: ${{ github.workspace }}/speed-writes.md
       - name: "Experiment: mimalloc"
         continue-on-error: true
         run: |
