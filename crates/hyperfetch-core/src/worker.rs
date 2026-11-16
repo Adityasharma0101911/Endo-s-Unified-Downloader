@@ -30,6 +30,15 @@ const THROTTLE_RETRY: Duration = Duration::from_millis(500);
 const THROTTLE_COOLDOWN: Duration = Duration::from_secs(1);
 /// Received bytes collected before one disk write: few blocking writes, little memory per connection.
 const WRITE_BATCH: usize = 512 * 1024;
+
+/// `WRITE_BATCH`, or in tests the size the speed benchmark tries instead (`ENDO_WRITE_BATCH`).
+fn write_batch() -> usize {
+    #[cfg(test)]
+    if let Some(bytes) = std::env::var("ENDO_WRITE_BATCH").ok().and_then(|v| v.parse().ok()) {
+        return bytes;
+    }
+    WRITE_BATCH
+}
 /// Longest a received byte waits in memory, so progress and resume state keep up on slow links.
 const WRITE_INTERVAL: Duration = Duration::from_millis(250);
 /// Wait for a byte after which an idle worker takes over what is left of a chunk.
@@ -89,10 +98,11 @@ pub enum WorkerEvent {
 
 type Failure = (FailureKind, String);
 
-/// Received bytes not yet on disk; they belong at `pos..`.
+/// Received bytes not yet on disk; they belong at `pos..`, from mirror `mirror`.
 struct Batch {
     pos: u64,
     buf: Vec<u8>,
+    mirror: usize,
 }
 
 impl Batch {
@@ -390,6 +400,10 @@ pub struct WorkerShared {
     pub width: Arc<std::sync::atomic::AtomicUsize>,
     /// Workers that may have sent a request yet: those past it wait as those past `width` do.
     pub ramp: Arc<Ramp>,
+    /// The mirror the download goes by (the reference), and the ranges written from the others:
+    /// what a whole-file hash that fails has fetched again from it (see `crate::digest::finish`).
+    pub primary: usize,
+    pub from_copies: Arc<Mutex<Vec<ByteRange>>>,
 }
 
 /// How many of a download's workers may have sent a request: twice the answers it had, the
@@ -774,7 +788,8 @@ impl HttpWorker {
         // The wait before is the answer's: the chunk's rate, and its silence, count from here.
         chunk.answered(Instant::now());
         let mut stream = std::pin::pin!(body);
-        let mut batch = Batch { pos: start, buf: Vec::with_capacity(WRITE_BATCH) };
+        let write_batch = write_batch();
+        let mut batch = Batch { pos: start, buf: Vec::with_capacity(write_batch), mirror: mirror_id };
         // Due `WRITE_INTERVAL` after the oldest byte in `batch` arrived.
         let flush_due = tokio::time::sleep(WRITE_INTERVAL);
         tokio::pin!(flush_due);
@@ -826,7 +841,7 @@ impl HttpWorker {
             }
             idle.as_mut().reset(tokio::time::Instant::now() + s.body_idle);
 
-            if batch.buf.len() + bytes.len() > WRITE_BATCH {
+            if batch.buf.len() + bytes.len() > write_batch {
                 if let Err(e) = self.flush(chunk, &mut batch).await {
                     break Err(e);
                 }
@@ -924,6 +939,13 @@ impl HttpWorker {
         .await
         .map_err(|e| (FailureKind::Fatal, format!("Disk write task failed: {}", e)))?;
         written.map_err(|e| (FailureKind::Fatal, format!("Disk write error: {}", e)))?;
+        if batch.mirror != self.shared.primary {
+            let mut copies = self.shared.from_copies.lock();
+            match copies.last_mut() {
+                Some(last) if last.end + 1 == batch.pos => last.end += data.len() as u64,
+                _ => copies.extend(ByteRange::from_len(batch.pos, data.len() as u64)),
+            }
+        }
         batch.pos += data.len() as u64;
         chunk.current_offset.store(batch.pos, Ordering::SeqCst);
         data.clear();
@@ -1300,6 +1322,8 @@ mod tests {
             body_idle: Duration::from_secs(5),
             width: Arc::new(usize::MAX.into()),
             ramp: Arc::new(Ramp::new(usize::MAX)),
+            primary: 0,
+            from_copies: Default::default(),
         };
         (HttpWorker::new(0, shared), chunk, rx)
     }

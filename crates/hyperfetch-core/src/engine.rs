@@ -749,7 +749,7 @@ impl DownloadEngine {
     pub async fn probe(&self) -> Result<crate::relink::RemoteFile, String> {
         let client = self.client.clone()?;
         let url = self.urls.first().ok_or_else(|| "no link to ask".to_string())?;
-        let (info, _) = probe_url(&client, self.auth.as_deref(), url, false, self.options.max_connections_per_host).await?;
+        let (info, _) = probe_url(&client, self.auth.as_deref(), url, false, true, self.options.max_connections_per_host).await?;
         Ok(crate::relink::RemoteFile { size: info.size, accepts_ranges: info.accepts_ranges, etag: info.etag, last_modified: info.last_modified })
     }
 
@@ -793,6 +793,15 @@ impl DownloadEngine {
             }
             let Some(mirror) = self.urls.get(round % self.urls.len().max(1)).cloned() else { break };
             let engine = self.alike(vec![mirror], self.options.clone(), self.client.clone());
+            let tx = snapshot_tx.clone();
+            result = engine.boxed(|engine| engine.fetch_all(tx)).await;
+        }
+        // A whole-file hash that failed with ranges from other mirrors in the file has those
+        // fetched again from the mirror the download went by (see `crate::digest::finish`).
+        let primary = self.site.lock().primary.clone();
+        if let Some(primary) = primary.filter(|_| result.as_ref().is_err_and(|e| e == crate::digest::FROM_PRIMARY) && !self.cancel_token.is_cancelled()) {
+            self.site.lock().primary_only = true;
+            let engine = self.alike(vec![primary], self.options.clone(), self.client.clone());
             let tx = snapshot_tx.clone();
             result = engine.boxed(|engine| engine.fetch_all(tx)).await;
         }
@@ -2514,6 +2523,8 @@ impl DownloadEngine {
     /// every probe is waited for, and no answer holds its host slot meanwhile: another probe may
     /// need it. A Google Drive answer that is a web page fails its mirror's probe.
     async fn probe_all(&self, client: &Client, urls: &[Url], snapshot_tx: &Option<broadcast::Sender<EngineSnapshot>>) -> Result<Probed, String> {
+        // Fetching again from the mirror the download went by, the others are left out.
+        let urls = if self.site.lock().primary_only { &urls[..urls.len().min(1)] } else { urls };
         let (limiter, stall) = (self.limiter(), self.stall_timeout());
         let connections = self.options.num_connections.clamp(1, MAX_CONNECTIONS);
         // An older version given, or the file -N replaces when it is named: a delta may run.
@@ -2524,6 +2535,10 @@ impl DownloadEngine {
         let (reading, started) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
         // Owned, as the probes may still be out once this returns.
         let (client, auth, owned) = (client.clone(), self.auth.clone(), urls.to_vec());
+        // A file pinned by its hash (a listing's, or the user's) needs no HEAD beside the GET: what
+        // HEAD adds is hints, and each request counts against the host (a batch of small files
+        // otherwise asks twice per file).
+        let head = self.options.expected_checksum.is_none();
         let (flags, tell) = ((Arc::clone(&reading), Arc::clone(&started)), snapshot_tx.clone());
         let mut probes: ProbeStream = futures_util::stream::iter(owned.into_iter().enumerate())
             .map(move |(i, url)| {
@@ -2533,7 +2548,7 @@ impl DownloadEngine {
                     let probe = async {
                         // Only the first mirror fetches the file's start: the download uses one copy;
                         // none does when an older version may hold it (see `DownloadEngine::delta`).
-                        let (mut info, body) = probe_url(&client, auth.as_deref(), &url, i == 0 && !delta, limit).await?;
+                        let (mut info, body) = probe_url(&client, auth.as_deref(), &url, i == 0 && !delta, head, limit).await?;
                         // A small file need not hold a batch's or queue's place while it comes (see
                         // `EngineSnapshot::small`); its later snapshots say so again, or that it
                         // was no file after all.
@@ -2952,7 +2967,10 @@ impl DownloadEngine {
             width: Arc::new(num_workers.into()),
             // FTP and SFTP sessions are no requests a host counts.
             ramp: Arc::new(Ramp::new(if self.ftp.is_some() || self.sftp.is_some() { usize::MAX } else { 2 })),
+            primary: mirrors.iter().position(|m| m.url == reference.url).unwrap_or(usize::MAX),
+            from_copies: Default::default(),
         };
+        let from_copies = Arc::clone(&shared.from_copies);
         // An FTP or SFTP download's workers fetch over it (see `crate::ftp::work`).
         let spawn = |workers: &mut JoinSet<()>, worker_id: usize, shared: &WorkerShared| {
             match (&self.ftp, &self.sftp) {
@@ -3061,7 +3079,12 @@ impl DownloadEngine {
 
         match outcome {
             // No flush here: `finalize` flushes (with fsync_on_complete) while it hashes.
-            Ok(()) => Ok(job.writer),
+            Ok(()) => {
+                let mut site = self.site.lock();
+                site.copies = crate::range::merge_ranges(std::mem::take(&mut *from_copies.lock()));
+                site.primary = Some(reference.url.clone());
+                Ok(job.writer)
+            }
             Err(e) => {
                 if let Err(save_err) = job.persist().await {
                     tracing::warn!("Failed to save resume state: {}", save_err);
@@ -3076,7 +3099,7 @@ impl DownloadEngine {
     /// same file (see `RangeJob::admit`). None when it names none.
     fn probe_advertised(&self, client: &Client, reference: &ProbeInfo, mirrors: &[ProbeInfo]) -> Option<ProbeStream> {
         let (copies, metalink) = advertised(&reference.headers, &reference.final_url);
-        if copies.is_empty() && metalink.is_none() {
+        if copies.is_empty() && metalink.is_none() || self.site.lock().primary_only {
             return None;
         }
         let mut seen: Vec<Url> = mirrors.iter().flat_map(|m| [m.url.clone(), m.final_url.clone()]).collect();
@@ -3098,7 +3121,7 @@ impl DownloadEngine {
         };
         let probes = futures_util::stream::once(listed).flatten().map(move |url| {
             let (client, auth) = (client.clone(), auth.clone());
-            async move { (0, probe_url(&client, auth.as_deref(), &url, false, limit).await.map(|(info, _)| (info, None))) }
+            async move { (0, probe_url(&client, auth.as_deref(), &url, false, true, limit).await.map(|(info, _)| (info, None))) }
         });
         Some(probes.buffer_unordered(PROBE_CONCURRENCY).boxed())
     }
@@ -3349,6 +3372,7 @@ impl DownloadEngine {
             Err(Unfinished::Io(e)) => return Err(e),
             // The `.part` and its state stay, for `run` to fetch those pieces again.
             Err(Unfinished::Refetch) => return Err(crate::digest::REFETCH.to_string()),
+            Err(Unfinished::FromPrimary) => return Err(crate::digest::FROM_PRIMARY.to_string()),
         };
 
         // A name from the server without a real extension takes the one its contents show.
@@ -3916,7 +3940,7 @@ fn build_route_client(
     // One TCP connection per worker: over HTTP/2 every "connection" would be a stream
     // multiplexed onto a single TCP connection, defeating multi-connection downloads. Only a
     // server that refuses HTTP/1.1 is worth that (see `DownloadOptions::http2`).
-    let builder = if options.http2 { Client::builder() } else { Client::builder().http1_only() };
+    let builder = if options.http2 { http2_tuned(Client::builder()) } else { Client::builder().http1_only() };
     // Bound to `0.0.0.0` (or `::`), a connection only goes to the addresses of that version.
     let local = local.or(options.ip_family.local_address().filter(|_| options.bind_addresses.is_empty()));
     let mut builder = builder
@@ -3982,6 +4006,14 @@ fn build_route_client(
     }
 
     builder.build().map_err(|e| format!("Failed to build HTTP client: {}", e))
+}
+
+/// HTTP/2 as downloads speak it: the flow-control windows grow with what the link carries in a
+/// round trip (BDP pings), where hyper's fixed ones (5 MB a connection, 2 MB a stream) would hold
+/// a download over a long link to 5 MB per round trip (25 MB/s at 200 ms); see the speed
+/// benchmark's `h2_latency` scenarios.
+pub(crate) fn http2_tuned(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    builder.http2_adaptive_window(true)
 }
 
 /// `name: value` as a request header, if both are valid in one (see `DownloadOptions::headers`).
@@ -4466,13 +4498,14 @@ async fn probe_url(
     auth: Option<&Auth>,
     url: &Url,
     prefetch: bool,
+    head: bool,
     limit: usize,
 ) -> Result<(ProbeInfo, Option<ProbeBody>), String> {
     let deadline = tokio::time::Instant::now() + BUSY_PATIENCE;
     let mut waits = 0u32;
     loop {
         let slot = hosts::acquire(url, limit).await;
-        let (message, asked) = match tokio::time::timeout(PROBE_TIMEOUT, probe_with(client, auth, url, prefetch, limit, slot)).await {
+        let (message, asked) = match tokio::time::timeout(PROBE_TIMEOUT, probe_with(client, auth, url, prefetch, head, limit, slot)).await {
             Ok(Ok(found)) => return Ok(found),
             Ok(Err(ProbeError::Busy(message, asked))) => (message, asked),
             Ok(Err(ProbeError::Failed(message))) => return Err(message),
@@ -4507,6 +4540,7 @@ async fn probe_with(
     auth: Option<&Auth>,
     url: &Url,
     prefetch: bool,
+    head: bool,
     limit: usize,
     slot: HostSlot,
 ) -> Result<(ProbeInfo, Option<ProbeBody>), ProbeError> {
@@ -4524,7 +4558,8 @@ async fn probe_with(
             }
         }
     };
-    let head_slot = hosts::try_acquire(url, limit);
+    // Without `head`, HEAD goes out only as the last resort below.
+    let head_slot = if head { hosts::try_acquire(url, limit) } else { None };
     let alongside = head_slot.is_some();
     let head = async {
         let _slot = head_slot?;
@@ -8856,6 +8891,27 @@ mod tests {
         assert!(at_other.gets.load(Ordering::SeqCst) <= 1, "the other file answered only its probe");
     }
 
+    /// A copy a server names that serves another version under the same size and ETag: the file
+    /// fails its checksum, what the copy sent comes again from the server itself, and it matches.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_what_a_wrong_copy_sent_comes_again_from_the_first_server() {
+        use sha2::Digest;
+        let size = 4 * 1024 * 1024;
+        let slow = |size| crate::netsim::Server { size, per_client: Some(1e6), ..Default::default() };
+        let (copy, at_copy) = crate::netsim::serve(crate::netsim::Server { corrupt: Some((1 << 20, size)), ..slow(size) }).await;
+        let link = format!("<{copy}>; rel=duplicate; pri=1");
+        let (url, at_first) = crate::netsim::serve(crate::netsim::Server { link: Some(link), ..slow(size) }).await;
+        let dir = tempdir().unwrap();
+        let sum: String = sha2::Sha256::digest(crate::netsim::file(size)).iter().map(|b| format!("{b:02x}")).collect();
+        let checksum = Some(format!("sha256:{sum}"));
+        let options = DownloadOptions { base_chunk_size: 256 * 1024, expected_checksum: checksum, ..sim_options(dir.path(), 4, false) };
+        let (got, _) = fetch_from_sim(&url, options).await;
+        assert!(got == crate::netsim::file(size));
+        let (from_copy, from_first) = (at_copy.served.load(Ordering::SeqCst), at_first.served.load(Ordering::SeqCst));
+        assert!(from_copy > 0, "the copy served ranges");
+        assert!(from_first >= size, "the first server sent again what the copy had: {from_first} of {size}");
+    }
+
     /// The whole-file hash of the Metalink a server's `Link` header names checks the file as a
     /// published checksum does: a match says so, a mismatch fails the download, and the hash of a
     /// file of another size is no hash of this one.
@@ -9416,7 +9472,7 @@ mod tests {
         let client = Client::new();
         let probe = |path: &str| {
             let (client, url) = (client.clone(), base.join(path).unwrap());
-            async move { probe_url(&client, None, &url, false, 0).await.unwrap().0 }
+            async move { probe_url(&client, None, &url, false, true, 0).await.unwrap().0 }
         };
         // Chunk requests skip the redirect the probe went through: its wait overstates theirs, but
         // unlike an assumed one never makes a slow target look quick. What a new connection to the
@@ -9441,13 +9497,13 @@ mod tests {
         // One request to the host at a time, which the ranged GET holds: HEAD has no slot. A GET
         // naming the file without a validator would otherwise leave HEAD its grace.
         let started = std::time::Instant::now();
-        let (info, _) = probe_url(&client, None, &base.join("untagged/f.bin").unwrap(), false, 1).await.unwrap();
+        let (info, _) = probe_url(&client, None, &base.join("untagged/f.bin").unwrap(), false, true, 1).await.unwrap();
         assert!(started.elapsed() < HEAD_GRACE, "HEAD was waited for: {:?}", started.elapsed());
         assert_eq!((info.size, info.accepts_ranges, info.etag), (Some(4096), true, None));
         // A GET refused on every try leaves nothing to read: HEAD goes out after it, under its
         // slot, and says what the file is.
         let refused = base.join("refused/f.bin").unwrap();
-        let (info, body) = probe_url(&client, None, &refused, true, 1).await.expect("HEAD answers for the refused GET");
+        let (info, body) = probe_url(&client, None, &refused, true, true, 1).await.expect("HEAD answers for the refused GET");
         assert_eq!((info.size, info.accepts_ranges, info.etag.as_deref()), (Some(4096), true, Some("\"v1\"")));
         assert!(body.is_none());
     }
@@ -9519,14 +9575,14 @@ mod tests {
         let client = Client::new();
         // Nothing went to the host before: the probe's connection is new, and its wait what a
         // new one needs.
-        let (probe, _) = probe_url(&client, None, &url, false, 0).await.unwrap();
+        let (probe, _) = probe_url(&client, None, &url, false, true, 0).await.unwrap();
         let seen = hosts::profile(&url);
         assert_eq!(seen.accepts_ranges, Some(true));
         assert!(seen.setup_time.is_some() && seen.setup_time == probe.answer_time, "{seen:?}");
         // Right after, a connection may be open for reuse: the next probe's wait tells nothing.
         let cold = Duration::from_secs(7);
         hosts::record(&url, HostProfile { setup_time: Some(cold), ..Default::default() });
-        probe_url(&client, None, &url, false, 0).await.unwrap();
+        probe_url(&client, None, &url, false, true, 0).await.unwrap();
         assert_eq!(hosts::profile(&url).setup_time, Some(cold));
     }
 
