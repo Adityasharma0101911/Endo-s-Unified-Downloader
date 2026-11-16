@@ -102,6 +102,10 @@ impl HostKey {
         } else if host == "export.arxiv.org" {
             // arXiv asks programs to use one connection to it (see `crate::archives`).
             Some(1)
+        } else if host == "web.archive.org" {
+            // The Wayback Machine shuts out a client that asks it many things at once: a listing's
+            // captures (see `crate::wayback`) download two at a time.
+            Some(2)
         } else {
             None
         }
