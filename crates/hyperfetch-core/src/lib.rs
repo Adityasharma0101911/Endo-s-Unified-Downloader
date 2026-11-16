@@ -21,6 +21,7 @@ pub mod folders;
 pub mod feeds;
 pub mod updater;
 pub mod p2p;
+pub(crate) mod webseed;
 pub mod debrid;
 pub mod netif;
 pub mod mega;
