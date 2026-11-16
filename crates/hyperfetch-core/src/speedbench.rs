@@ -7,10 +7,10 @@
 //! It writes the results as JSON to the file `ENDO_BENCH_OUT` names and as a markdown table to
 //! `ENDO_BENCH_SUMMARY`'s (else prints both), titled with `ENDO_BENCH_LABEL`. With
 //! `ENDO_BENCH_CHECK` set, a release build fails when a scenario is slower than
-//! `bench/sim-thresholds.json` allows; `ENDO_BENCH_ONLY=lan,lossy` runs those alone. `ENDO_WRITE_BATCH`
-//! tries another size of the connections' disk writes (see `worker::write_batch`), and the feature
-//! `bench-mimalloc` mimalloc as the allocator, for the CI job to compare. Every server is new, on a
-//! port this process has not used, so no scenario starts with what another taught the Autopilot.
+//! `bench/sim-thresholds.json` allows; `ENDO_BENCH_ONLY=lan,lossy` runs those alone. The feature
+//! `bench-mimalloc` tries mimalloc as the allocator, for the CI job to compare. Every server is
+//! new, on a port this process has not used, so no scenario starts with what another taught the
+//! Autopilot.
 //! At most 128 MiB is on disk at once (a temporary folder each run), and every run has a time limit.
 
 use std::sync::atomic::Ordering;
