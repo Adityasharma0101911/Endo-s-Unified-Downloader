@@ -321,7 +321,8 @@ async fn torrent_run(server: &Server, size: usize, piece: usize, peer: Option<u3
     };
     drop(content);
     let started = Instant::now();
-    let running = crate::p2p::run(std::slice::from_ref(&source), &options(&out, "f.bin"), &out, None, tokio_util::sync::CancellationToken::new());
+    let options = options(&out, "f.bin");
+    let running = crate::p2p::run(std::slice::from_ref(&source), &options, &out, None, tokio_util::sync::CancellationToken::new());
     let (path, _) = tokio::time::timeout(RUN_LIMIT, running).await.expect("within the time limit").unwrap();
     let took = started.elapsed();
     assert!(holds(&path, size), "{} is wrong", path.display());
