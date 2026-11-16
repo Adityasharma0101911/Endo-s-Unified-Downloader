@@ -75,7 +75,7 @@ fn shape_of(url: &Url) -> Option<Shape> {
     let segs: Vec<String> = url.path_segments()?.filter(|s| !s.is_empty()).map(|s| percent_encoding::percent_decode_str(s).decode_utf8_lossy().into_owned()).collect();
     match segs.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         ["details", name, ..] if name.len() > 1 && name.starts_with('@') => Some(Shape::Uploads(name.to_string())),
-        ["details", id] => Some(Shape::Details { id: id.to_string(), query: query_of(url, "query") }),
+        ["details", id] if !id.starts_with('@') => Some(Shape::Details { id: id.to_string(), query: query_of(url, "query") }),
         ["search" | "search.php"] => query_of(url, "query").map(Shape::Search),
         ["advancedsearch.php"] => query_of(url, "q").map(Shape::Search),
         _ => None,
