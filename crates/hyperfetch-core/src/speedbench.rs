@@ -53,14 +53,15 @@ fn scenarios() -> Vec<Scenario> {
     let rate_limit = RateLimit { requests: 6, window: Duration::from_secs(1), retry_after: 1, ban_after: 8, ban: Duration::from_secs(5) };
     let decay = Decay { from: 8 * MIB, full: 256 * 1024, rate: 64e3, every: Duration::from_secs(1) };
     // A server as archive.org's are: slow to answer (its redirect to the server holding the file,
-    // then that server's wait), each connection held to a few MB/s. At 100 ms to answer a request
-    // per piece cost little, and the torrent was the faster; archive.org's wait made it a fifth.
-    let seed = Server { per_connection: Some(1.5e6), first_byte: Duration::from_millis(500), ..Default::default() };
+    // then that server's wait), each connection held to a few MB/s. Where answers were quick next
+    // to sending a piece (100 or 500 ms at 1.5 MB/s), a request per piece cost little and the
+    // torrent was even the faster; archive.org's made it a fifth of HTTP's speed.
+    let seed = Server { per_connection: Some(4e6), first_byte: Duration::from_secs(1), ..Default::default() };
     let torrent = |peer| Files::Torrent { size: 64 * MIB, piece: 512 * 1024, peer };
     vec![
         // A torrent whose web seed is that server must come as fast as the server's file over
         // HTTP (`bench/sim-thresholds.json` holds them to a share of `web_seed_http`).
-        Scenario { name: "web_seed_http", what: "64 MiB, 500 ms to answer, 1.5 MB/s per connection", server: seed.clone(), files: Files::One(64 * MIB), runs: 3 },
+        Scenario { name: "web_seed_http", what: "64 MiB, 1 s to answer, 4 MB/s per connection", server: seed.clone(), files: Files::One(64 * MIB), runs: 3 },
         Scenario {
             name: "web_seed_torrent",
             what: "the same as a torrent of 512 KiB pieces with that server its web seed, no peers",
