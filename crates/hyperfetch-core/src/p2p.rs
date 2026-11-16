@@ -242,7 +242,7 @@ pub async fn run(
         false => {
             let client = crate::engine::build_client(&network)?;
             let (connections, per_host) = (network.num_connections.clamp(4, 64), network.max_connections_per_host);
-            match crate::webseed::start(&seeded, listed.info_hash.0, client, connections, per_host).await {
+            match crate::webseed::start(&seeded, listed.info_hash.0, client, connections, per_host, &options.torrent_files).await {
                 Ok(web) => Some(web),
                 Err(why) => {
                     tracing::debug!("The torrent's web seeds are no peers: {why}");
