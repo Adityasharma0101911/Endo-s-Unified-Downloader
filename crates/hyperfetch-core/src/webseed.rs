@@ -7,9 +7,11 @@
 //! counts unchecked.
 //!
 //! A piece the seeds serve wrong (the file changed since the torrent was made) or not at all is
-//! offered no more: the connection that asked for it is closed, librqbit asks the swarm for it,
-//! and when it connects again (after its back-off, 10 s or more) the piece is not among those
-//! this peer has. Requests go through `crate::hosts`, so a host's rest after a 429 holds them too.
+//! offered no more: a request for it goes unanswered, so librqbit gives the piece to another peer
+//! (it takes pieces that are slow to come from one), and a connection made later does not list it.
+//! The connection serves on: closing it would put its other pieces back for the next of these
+//! peers, asked for the lost piece in turn, until none was left for 10 s or more (librqbit's
+//! back-off). Requests go through `crate::hosts`, so a host's rest after a 429 holds them too.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -178,7 +180,7 @@ fn invalid(what: &str) -> std::io::Error {
 }
 
 /// One connection from librqbit: the handshake, what this peer has, then a block for each request
-/// until the connection ends or a piece it asks for cannot be served.
+/// of a piece the seeds serve, until the connection ends.
 async fn peer(socket: TcpStream, seeds: Arc<Seeds>) -> std::io::Result<()> {
     let _ = socket.set_nodelay(true);
     let (mut from, mut to) = socket.into_split();
@@ -211,7 +213,6 @@ async fn peer(socket: TcpStream, seeds: Arc<Seeds>) -> std::io::Result<()> {
     to.write_all(&reply).await?;
 
     let (blocks, mut sending) = tokio::sync::mpsc::channel::<Bytes>(32);
-    let failed = CancellationToken::new();
     let mut asked = tokio::task::JoinSet::new();
     let writer = async {
         while let Some(frame) = sending.recv().await {
@@ -238,9 +239,10 @@ async fn peer(socket: TcpStream, seeds: Arc<Seeds>) -> std::io::Result<()> {
             if !seeds.holds(index, begin, length) {
                 return Err(invalid("request outside the torrent"));
             }
-            let (seeds, blocks, failed) = (seeds.clone(), blocks.clone(), failed.clone());
+            let (seeds, blocks) = (seeds.clone(), blocks.clone());
             asked.spawn(async move {
-                let Some(piece) = seeds.piece(index).await else { return failed.cancel() };
+                // A lost piece goes unanswered (see the module's docs).
+                let Some(piece) = seeds.piece(index).await else { return };
                 let block = &piece[begin as usize..(begin + length) as usize];
                 let mut frame = BytesMut::with_capacity(13 + block.len());
                 frame.put_u32(9 + length);
@@ -257,7 +259,6 @@ async fn peer(socket: TcpStream, seeds: Arc<Seeds>) -> std::io::Result<()> {
     let ended = tokio::select! {
         ended = reader => ended,
         ended = writer => ended,
-        _ = failed.cancelled() => Ok(()),
     };
     asked.abort_all();
     ended
@@ -417,7 +418,8 @@ mod tests {
     }
 
     /// A peer that speaks to librqbit as these do: handshake, bitfield, unchoke, then blocks of
-    /// checked pieces; a piece the seed serves wrong closes the connection and is offered no more.
+    /// checked pieces; a piece the seed serves wrong goes unanswered and is offered no more, and
+    /// the connection serves on.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_blocks_come_from_checked_pieces() {
         let size = 3 * 64 * 1024 + 1000;
@@ -448,13 +450,22 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(10), socket.read_exact(&mut block)).await.unwrap().unwrap();
         assert_eq!(block[..13], [&509u32.to_be_bytes()[..], &[7], &3u32.to_be_bytes(), &500u32.to_be_bytes()].concat()[..]);
         assert_eq!(block[13..], content[3 * 65536 + 500..3 * 65536 + 1000]);
-        // Piece 1 is not what the torrent says: the connection ends, and it is offered no more.
+        // Piece 1 is not what the torrent says: it is offered no more, its request goes unanswered
+        // (librqbit gives it to another peer), and the connection serves on.
         socket.write_all(&request(1, 0, 16384)).await.unwrap();
+        let lost = async {
+            while seeds.seeds.bitfield() != [0b1011_0000] {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), lost).await.expect("piece 1 found wrong");
+        socket.write_all(&request(0, 0, 100)).await.unwrap();
+        let mut block = [0u8; 13 + 100];
+        tokio::time::timeout(Duration::from_secs(10), socket.read_exact(&mut block)).await.unwrap().unwrap();
+        assert_eq!(block[..13], [&109u32.to_be_bytes()[..], &[7], &0u32.to_be_bytes(), &0u32.to_be_bytes()].concat()[..], "piece 0's, none of piece 1's");
+        assert_eq!(block[13..], content[..100]);
+        assert_eq!(seeds.fetched(), 1000 + 65536);
         let mut rest = Vec::new();
-        tokio::time::timeout(Duration::from_secs(10), socket.read_to_end(&mut rest)).await.unwrap().unwrap();
-        assert!(rest.is_empty());
-        assert_eq!(seeds.seeds.bitfield(), [0b1011_0000]);
-        assert_eq!(seeds.fetched(), 1000);
         // A peer that speaks extensions (BEP 10) is told how many requests to keep out. A request
         // outside the torrent ends the connection too.
         let mut socket = TcpStream::connect(seeds.addrs[1]).await.unwrap();
