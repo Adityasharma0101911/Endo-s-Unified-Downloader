@@ -1,4 +1,6 @@
 {
+  "web_seed_torrent": { "min_share_of": "web_seed_http", "min_share": 0.85 },
+  "web_seed_and_peer": { "min_share_of": "web_seed_http", "min_share": 0.85 },
   "lan": { "min_mb_per_s": 1200, "max_ttfb_ms": 200 },
   "per_connection": { "min_mb_per_s": 8.5, "max_ttfb_ms": 200 },
   "per_client": { "min_mb_per_s": 10.5, "max_ttfb_ms": 200 },

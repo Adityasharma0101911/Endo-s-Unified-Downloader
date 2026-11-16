@@ -6,6 +6,12 @@
 //! writes every piece itself and checks it again, so no piece is written by two writers and none
 //! counts unchecked.
 //!
+//! librqbit asks for pieces in order, a few at a time, so pieces are fetched ahead of its asking
+//! (see [`Seeds::read_ahead`]): as many long requests at once as the download may have
+//! connections, each for a run of pieces of one file, as the engine's own HTTP downloads ask. A
+//! request per piece as it was asked for (archive.org's are 512 KiB) waited on the server's answer
+//! each time: a fifth of the engine's speed from the same server.
+//!
 //! A piece the seeds serve wrong (the file changed since the torrent was made) or not at all is
 //! offered no more: a request for it goes unanswered, so librqbit gives the piece to another peer
 //! (it takes pieces that are slow to come from one), and a connection made later does not list it.
@@ -13,9 +19,10 @@
 //! peers, asked for the lost piece in turn, until none was left for 10 s or more (librqbit's
 //! back-off). Requests go through `crate::hosts`, so a host's rest after a 429 holds them too.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -27,7 +34,7 @@ use reqwest::{Client, StatusCode};
 use sha1::{Digest, Sha1};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{OnceCell, Semaphore};
+use tokio::sync::{oneshot, OnceCell, Semaphore};
 use tokio_util::sync::{CancellationToken, DropGuard};
 use url::Url;
 
@@ -49,6 +56,17 @@ const MAX_MESSAGE: u32 = 1 << 20;
 const KEEP: Duration = Duration::from_secs(30);
 /// Bytes of fetched pieces kept at most (and two pieces, however large they are).
 const KEPT_BYTES: u64 = 256 << 20;
+/// Bytes of pieces fetched ahead of librqbit's asking at most (see [`Seeds::read_ahead`]): the
+/// rest of [`KEPT_BYTES`] is for the pieces it asks for.
+const AHEAD: u64 = KEPT_BYTES / 4 * 3;
+/// Most bytes one request fetching ahead asks for, as the engine's HTTP downloads ask for 16 to
+/// 64 MiB over each connection.
+const SPAN: u64 = 16 << 20;
+/// A piece fetched ahead that librqbit has not asked for while asking for pieces this many bytes
+/// further on went to another peer: it is let go.
+const SLACK: u64 = 32 << 20;
+/// Longest a request fetching ahead may go without a byte.
+const STALL: Duration = Duration::from_secs(30);
 const PROTOCOL: &[u8; 20] = b"\x13BitTorrent protocol";
 /// The block librqbit asks for: the unit of the requests it keeps out to a peer.
 const BLOCK: u64 = 16 * 1024;
@@ -79,6 +97,9 @@ struct SeedFile {
     start: u64,
     length: u64,
     urls: Vec<Url>,
+    /// Among the files downloaded (see `DownloadOptions::torrent_files`): only these are fetched
+    /// ahead.
+    wanted: bool,
 }
 
 struct Seeds {
@@ -100,6 +121,15 @@ struct Seeds {
     lost: Mutex<Vec<bool>>,
     kept: Mutex<HashMap<u32, Kept>>,
     fetched: AtomicU64,
+    /// The furthest piece librqbit asked for, and the next one to fetch ahead from.
+    ahead: Mutex<(u32, u32)>,
+    /// Requests fetching ahead now, at most `width` (the download's connections), each for at
+    /// most `span` pieces.
+    streams: AtomicUsize,
+    width: usize,
+    span: u32,
+    /// Fires when these peers go: requests fetching ahead stop.
+    stop: CancellationToken,
 }
 
 /// A piece being fetched or fetched, while its blocks are asked for.
@@ -108,12 +138,30 @@ struct Kept {
     used: Instant,
     /// Bytes of its blocks sent.
     sent: u64,
+    /// librqbit asked for it; one fetched ahead waits for that (see [`Seeds::read_ahead`]).
+    asked: bool,
+    /// The piece from the request fetching it ahead, until it is asked for.
+    coming: Option<oneshot::Receiver<Option<Bytes>>>,
+}
+
+impl Kept {
+    fn new(now: Instant, asked: bool, coming: Option<oneshot::Receiver<Option<Bytes>>>) -> Self {
+        Kept { piece: Arc::default(), used: now, sent: 0, asked, coming }
+    }
 }
 
 /// Starts the web seeds of the torrent `torrent` (its .torrent bytes) as peers, fetching with
-/// `client`, at most `connections` requests at once and `per_host` to one host; why not when it
-/// has none, or no piece hashes to check what they serve against.
-pub(crate) async fn start(torrent: &[u8], info_hash: [u8; 20], client: Client, connections: usize, per_host: usize) -> Result<WebSeeds, String> {
+/// `client`, at most `connections` requests at once and `per_host` to one host, ahead only for
+/// the files `wanted` (by their paths in the torrent; all when none); why not when it has none,
+/// or no piece hashes to check what they serve against.
+pub(crate) async fn start(
+    torrent: &[u8],
+    info_hash: [u8; 20],
+    client: Client,
+    connections: usize,
+    per_host: usize,
+    wanted: &[PathBuf],
+) -> Result<WebSeeds, String> {
     let info = crate::torrent::parse_torrent_bytes(torrent)?;
     if info.piece_hashes.is_empty() || info.piece_length == 0 || info.piece_length > u64::from(u32::MAX) {
         return Err(format!("no piece hashes to check them by ({} pieces of {} bytes)", info.num_pieces, info.piece_length));
@@ -128,6 +176,19 @@ pub(crate) async fn start(torrent: &[u8], info_hash: [u8; 20], client: Client, c
     }
     let mut peer_id = *b"-EU2000-000000000000";
     ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut peer_id[8..]).map_err(|_| "no random peer id")?;
+    let files: Vec<SeedFile> = info
+        .files
+        .into_iter()
+        .map(|f| {
+            let wanted = wanted.is_empty() || wanted.contains(&f.path.iter().collect::<PathBuf>());
+            SeedFile { start: f.start, length: f.length, urls: f.urls, wanted }
+        })
+        .collect();
+    // Requests ahead share the bytes wanted out as the engine's connections share a file's.
+    let width = connections.max(1);
+    let wanted_bytes: u64 = files.iter().filter(|f| f.wanted).map(|f| f.length).sum();
+    let span = SPAN.min(AHEAD / width as u64).min(wanted_bytes / width as u64) / info.piece_length;
+    let stop = CancellationToken::new();
     let seeds = Arc::new(Seeds {
         info_hash,
         peer_id,
@@ -135,15 +196,20 @@ pub(crate) async fn start(torrent: &[u8], info_hash: [u8; 20], client: Client, c
         stream_length: info.stream_length,
         reqq: (info.stream_length / BLOCK / (2 * PEERS as u64)).clamp(16, 128),
         hashes: info.piece_hashes,
-        files: info.files.into_iter().map(|f| SeedFile { start: f.start, length: f.length, urls: f.urls }).collect(),
+        files,
         client,
-        requests: Semaphore::new(connections.max(1)),
+        // One more than may fetch ahead, for a piece asked for that is not among those.
+        requests: Semaphore::new(width + 1),
         per_host,
         lost: Mutex::new(lost),
         kept: Mutex::default(),
         fetched: AtomicU64::new(0),
+        ahead: Mutex::default(),
+        streams: AtomicUsize::new(0),
+        width,
+        span: span.clamp(1, u64::from(u32::MAX)) as u32,
+        stop: stop.clone(),
     });
-    let stop = CancellationToken::new();
     let mut addrs = Vec::new();
     for _ in 0..PEERS {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.map_err(|e| format!("no local port: {e}"))?;
@@ -239,6 +305,7 @@ async fn peer(socket: TcpStream, seeds: Arc<Seeds>) -> std::io::Result<()> {
             if !seeds.holds(index, begin, length) {
                 return Err(invalid("request outside the torrent"));
             }
+            seeds.read_ahead(index);
             let (seeds, blocks) = (seeds.clone(), blocks.clone());
             asked.spawn(async move {
                 // A lost piece goes unanswered (see the module's docs).
@@ -290,21 +357,34 @@ impl Seeds {
         if self.lost.lock()[index as usize] {
             return None;
         }
-        let cell = {
+        let (cell, coming) = {
             let mut kept = self.kept.lock();
             let now = Instant::now();
-            kept.retain(|_, k| now - k.used < KEEP);
+            // One fetched ahead waits to be asked for (see `read_ahead`, which lets it go).
+            kept.retain(|_, k| !k.asked || now - k.used < KEEP);
             // The oldest go first once they hold more than `KEPT_BYTES`.
             let most = (KEPT_BYTES / self.piece_length).max(2) as usize;
             while kept.len() >= most && !kept.contains_key(&index) {
                 let Some(oldest) = kept.iter().min_by_key(|(_, k)| k.used).map(|(&i, _)| i) else { break };
                 kept.remove(&oldest);
             }
-            let k = kept.entry(index).or_insert_with(|| Kept { piece: Arc::default(), used: now, sent: 0 });
-            k.used = now;
-            k.piece.clone()
+            let k = kept.entry(index).or_insert_with(|| Kept::new(now, true, None));
+            (k.used, k.asked) = (now, true);
+            (k.piece.clone(), k.coming.take())
         };
-        let piece = cell.get_or_init(|| self.fetch(index)).await.clone();
+        // A piece whose request ahead failed comes alone.
+        let piece = cell
+            .get_or_init(|| async {
+                match coming {
+                    Some(coming) => match coming.await {
+                        Ok(piece) => piece,
+                        Err(_) => self.fetch(index).await,
+                    },
+                    None => self.fetch(index).await,
+                }
+            })
+            .await
+            .clone();
         if piece.is_none() {
             self.lost.lock()[index as usize] = true;
             self.kept.lock().remove(&index);
@@ -342,14 +422,168 @@ impl Seeds {
         for (&(_, _, at, n), bytes) in parts.iter().zip(fetched) {
             piece[at..at + n as usize].copy_from_slice(&bytes?);
         }
+        self.checked(index, piece.into())
+    }
+
+    /// `piece` when it is piece `index` of the torrent (by its SHA-1), else None.
+    fn checked(&self, index: u32, piece: Bytes) -> Option<Bytes> {
         if Sha1::digest(&piece)[..] != self.hashes[index as usize] {
             tracing::warn!("a web seed serves other bytes than the torrent's in piece {index}: the swarm brings it");
             #[cfg(test)]
             WRONG.fetch_add(1, Ordering::SeqCst);
             return None;
         }
-        self.fetched.fetch_add(len, Ordering::Relaxed);
-        Some(piece.into())
+        self.fetched.fetch_add(piece.len() as u64, Ordering::Relaxed);
+        Some(piece)
+    }
+
+    /// Fetches pieces ahead of librqbit's asking, now that it asks for `asked`: from the next one
+    /// not fetched yet (or `asked`, past those), runs of [`Seeds::span`] pieces of a file each in
+    /// one request, as many at once as `width`, within [`AHEAD`] bytes kept. Pieces fetched ahead
+    /// that librqbit did not ask for, though it asked for pieces [`SLACK`] bytes further on, went
+    /// to other peers: they are let go.
+    fn read_ahead(self: &Arc<Self>, asked: u32) {
+        if self.stop.is_cancelled() {
+            return;
+        }
+        let mut ahead = self.ahead.lock();
+        let mut kept = self.kept.lock();
+        if asked > ahead.0 {
+            ahead.0 = asked;
+            let slack = (SLACK / self.piece_length).max(4) as u32;
+            kept.retain(|&i, k| k.asked || i.saturating_add(slack) >= asked);
+        }
+        ahead.1 = ahead.1.max(ahead.0);
+        let (count, room) = (self.hashes.len() as u32, (AHEAD / self.piece_length) as usize);
+        // A run starts with room for a whole one: runs cut short by room would each wait for a
+        // first byte for little.
+        while self.streams.load(Ordering::SeqCst) < self.width && ahead.1 < count && kept.len() + self.span as usize <= room {
+            let Some((file, first, pieces)) = self.run_from(ahead.1, self.span, &kept) else {
+                ahead.1 = count;
+                break;
+            };
+            let now = Instant::now();
+            let mut sending = VecDeque::new();
+            for index in first..first + pieces {
+                let (tx, rx) = oneshot::channel();
+                kept.insert(index, Kept::new(now, false, Some(rx)));
+                sending.push_back(tx);
+            }
+            ahead.1 = first + pieces;
+            self.streams.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(self.clone().stream(file, first, sending));
+        }
+    }
+
+    /// The bytes piece `index` covers in the torrent's stream.
+    fn bytes_of(&self, index: u32) -> (u64, u64) {
+        let start = u64::from(index) * self.piece_length;
+        (start, start + self.piece_len(index))
+    }
+
+    /// The next run of pieces from `from` on to fetch ahead, at most `most` long: of one wanted
+    /// file, none kept or lost (its file, first piece and length); or a wanted piece across files
+    /// alone (no file: see [`Seeds::fetch`]). None when there is none to the end.
+    fn run_from(&self, from: u32, most: u32, kept: &HashMap<u32, Kept>) -> Option<(Option<usize>, u32, u32)> {
+        let lost = self.lost.lock();
+        let free = |index: u32| (index as usize) < lost.len() && !lost[index as usize] && !kept.contains_key(&index);
+        let mut index = from;
+        while (index as usize) < lost.len() {
+            let (start, end) = self.bytes_of(index);
+            let holding = self.files.iter().position(|f| f.start <= start && start < f.start + f.length);
+            let Some(at) = holding.filter(|_| free(index)) else {
+                index += 1;
+                continue;
+            };
+            let file = &self.files[at];
+            let file_end = file.start + file.length;
+            if end > file_end {
+                // Across files: fetched alone, when any of them is wanted.
+                if self.files.iter().any(|f| f.wanted && f.start < end && start < f.start + f.length) {
+                    return Some((None, index, 1));
+                }
+                index += 1;
+                continue;
+            }
+            if !file.wanted {
+                // On to the file's last piece, which may reach into the next one.
+                index = ((file_end - 1) / self.piece_length).max(u64::from(index) + 1) as u32;
+                continue;
+            }
+            let mut pieces = 1;
+            while pieces < most && free(index + pieces) && self.bytes_of(index + pieces).1 <= file_end {
+                pieces += 1;
+            }
+            return Some((Some(at), index, pieces));
+        }
+        None
+    }
+
+    /// Fetches the `sending.len()` pieces from `first` on of the file `file` (each alone when
+    /// none, see [`Seeds::run_from`]) in one request, handing each over checked (None: not the
+    /// torrent's) as it is complete. A request that fails is made again from the piece it was in,
+    /// over the file's next seed after [`TRIES`]; pieces still left come alone when asked for
+    /// (see [`Seeds::piece`]). Then on to the next run.
+    async fn stream(self: Arc<Self>, file: Option<usize>, first: u32, mut sending: VecDeque<oneshot::Sender<Option<Bytes>>>) {
+        let fetching = async {
+            let Some(file) = file else {
+                let piece = self.fetch(first).await;
+                if let Some(tx) = sending.pop_front() {
+                    let _ = tx.send(piece);
+                }
+                return;
+            };
+            let mut index = first;
+            for url in &self.files[file].urls {
+                for _ in 0..TRIES {
+                    match self.try_stream(url, file, &mut index, &mut sending).await {
+                        Ok(()) => return,
+                        // This seed does not serve the file (gone, or no ranges): the next one.
+                        Err(None) => break,
+                        Err(Some(pause)) => tokio::time::sleep(pause).await,
+                    }
+                }
+            }
+        };
+        tokio::select! {
+            _ = self.stop.cancelled() => return,
+            _ = fetching => {}
+        }
+        self.streams.fetch_sub(1, Ordering::SeqCst);
+        let asked = self.ahead.lock().0;
+        self.read_ahead(asked);
+    }
+
+    /// One request for the pieces from `index` on that `sending` waits for, all of the file
+    /// `file`: each handed over as it is complete, `index` past it. The pause before trying again
+    /// when it fails (None: not again from `url`).
+    async fn try_stream(&self, url: &Url, file: usize, index: &mut u32, sending: &mut VecDeque<oneshot::Sender<Option<Bytes>>>) -> Result<(), Option<Duration>> {
+        let start = self.files[file].start;
+        let (from, _) = self.bytes_of(*index);
+        let (_, to) = self.bytes_of(*index + sending.len() as u32 - 1);
+        let (response, _open, _slot) = self.open(url, from - start, to - from).await?;
+        let mut body = response.bytes_stream();
+        let mut rest = Bytes::new();
+        // Pieces let go (see `read_ahead`) are not waited for: none left, the request ends.
+        while sending.iter().any(|tx| !tx.is_closed()) {
+            let want = self.piece_len(*index) as usize;
+            let mut piece = BytesMut::with_capacity(want);
+            while piece.len() < want {
+                if rest.is_empty() {
+                    rest = match tokio::time::timeout(STALL, body.next()).await {
+                        Ok(Some(Ok(chunk))) => chunk,
+                        _ => return Err(Some(PAUSE)),
+                    };
+                }
+                piece.extend_from_slice(&rest.split_to(rest.len().min(want - piece.len())));
+            }
+            let piece = self.checked(*index, piece.freeze());
+            if let Some(tx) = sending.pop_front() {
+                let _ = tx.send(piece);
+            }
+            *index += 1;
+        }
+        Ok(())
     }
 
     /// `n` bytes at `offset` of `file`, from the first of its seeds that serves them.
@@ -372,7 +606,22 @@ impl Seeds {
 
     /// One request: the bytes, or the pause before trying again (None: not again from `url`).
     async fn try_get(&self, url: &Url, offset: u64, n: u64) -> Result<Bytes, Option<Duration>> {
-        let _open = self.requests.acquire().await.map_err(|_| None::<Duration>)?;
+        let (response, _open, _slot) = self.open(url, offset, n).await?;
+        let (mut body, mut stream) = (BytesMut::with_capacity(n as usize), response.bytes_stream());
+        while (body.len() as u64) < n {
+            match stream.next().await {
+                Some(Ok(chunk)) => body.extend_from_slice(&chunk[..chunk.len().min(n as usize - body.len())]),
+                _ => return Err(Some(PAUSE)),
+            }
+        }
+        Ok(body.freeze())
+    }
+
+    /// A request for `n` bytes at `offset` of `url`, answered with them, holding its share of the
+    /// requests open and of the host's until its body is read; or the pause before trying again
+    /// (None: not again from `url`).
+    async fn open(&self, url: &Url, offset: u64, n: u64) -> Result<(reqwest::Response, tokio::sync::SemaphorePermit<'_>, crate::hosts::HostSlot), Option<Duration>> {
+        let open = self.requests.acquire().await.map_err(|_| None::<Duration>)?;
         let slot = crate::hosts::acquire(url, self.per_host).await;
         let range = format!("bytes={}-{}", offset, offset + n - 1);
         let response = match self.client.get(url.clone()).header(RANGE, range).send().await {
@@ -390,14 +639,7 @@ impl Seeds {
         if !(status == StatusCode::PARTIAL_CONTENT && from == Some(offset) || status == StatusCode::OK && offset == 0) {
             return Err(if status.is_server_error() { Some(PAUSE) } else { None });
         }
-        let (mut body, mut stream) = (BytesMut::with_capacity(n as usize), response.bytes_stream());
-        while (body.len() as u64) < n {
-            match stream.next().await {
-                Some(Ok(chunk)) => body.extend_from_slice(&chunk[..chunk.len().min(n as usize - body.len())]),
-                _ => return Err(Some(PAUSE)),
-            }
-        }
-        Ok(body.freeze())
+        Ok((response, open, slot))
     }
 }
 
@@ -436,7 +678,7 @@ mod tests {
         .concat();
         let hash = [7u8; 20];
         let client = Client::builder().http1_only().build().unwrap();
-        let seeds = start(&torrent, hash, client, 4, 0).await.unwrap();
+        let seeds = start(&torrent, hash, client, 4, 0, &[]).await.unwrap();
         let mut socket = TcpStream::connect(seeds.addrs[0]).await.unwrap();
         socket.write_all(&[&PROTOCOL[..], &[0; 8], &hash, &[1; 20]].concat()).await.unwrap();
         let mut hello = [0u8; 68 + 5 + 1 + 5];
@@ -480,5 +722,39 @@ mod tests {
         socket.write_all(&request(4, 0, 16384)).await.unwrap();
         let ended = tokio::time::timeout(Duration::from_secs(10), socket.read_to_end(&mut rest)).await.unwrap();
         assert!(ended.is_err() || rest.is_empty());
+    }
+
+    /// Pieces come ahead of librqbit's asking, a run of them in one request: here two runs (one
+    /// for each of the download's connections) of four pieces.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_pieces_ahead_come_in_runs() {
+        let (size, piece) = (8 * 64 * 1024, 64 * 1024);
+        let content = crate::netsim::file(size);
+        let (web, stats) = crate::netsim::serve(crate::netsim::Server { size, ..Default::default() }).await;
+        let pieces: Vec<u8> = content.chunks(piece).flat_map(|p| Sha1::digest(p).to_vec()).collect();
+        let torrent = [
+            format!("d8:url-list{}:{web}4:infod6:lengthi{size}e4:name5:f.bin12:piece lengthi{piece}e6:pieces{}:", web.as_str().len(), pieces.len()).as_bytes(),
+            &pieces,
+            b"ee",
+        ]
+        .concat();
+        let hash = [7u8; 20];
+        let client = Client::builder().http1_only().build().unwrap();
+        let seeds = start(&torrent, hash, client, 2, 0, &[]).await.unwrap();
+        let mut socket = TcpStream::connect(seeds.addrs[0]).await.unwrap();
+        socket.write_all(&[&PROTOCOL[..], &[0; 8], &hash, &[1; 20]].concat()).await.unwrap();
+        let mut hello = [0u8; 68 + 6 + 5];
+        socket.read_exact(&mut hello).await.unwrap();
+        for index in 0..8u32 {
+            socket.write_all(&[&13u32.to_be_bytes()[..], &[6], &index.to_be_bytes(), &0u32.to_be_bytes(), &16384u32.to_be_bytes()].concat()).await.unwrap();
+        }
+        for _ in 0..8 {
+            let mut block = vec![0u8; 13 + 16384];
+            tokio::time::timeout(Duration::from_secs(10), socket.read_exact(&mut block)).await.unwrap().unwrap();
+            let index = u32::from_be_bytes(block[5..9].try_into().unwrap()) as usize;
+            assert!(block[13..] == content[index * piece..index * piece + 16384], "piece {index}");
+        }
+        assert_eq!(stats.gets.load(Ordering::SeqCst), 2, "two runs of four pieces");
+        assert_eq!(seeds.fetched(), size as u64);
     }
 }
