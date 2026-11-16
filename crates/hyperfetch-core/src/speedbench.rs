@@ -209,7 +209,8 @@ async fn run(scenario: &Scenario) -> (Duration, Duration, usize) {
     let downloads = futures_util::stream::iter(files.iter().cloned())
         .map(|(url, size, path)| {
             let options = DownloadOptions { output_path: Some(path), expected_checksum: checksum(size), ..options(dir.path(), "") };
-            DownloadEngine::with_client(vec![url], options, client.clone()).run(None)
+            let engine = DownloadEngine::with_client(vec![url], options, client.clone());
+            async move { engine.run(None).await }
         })
         .buffer_unordered(at_once)
         .collect::<Vec<_>>();

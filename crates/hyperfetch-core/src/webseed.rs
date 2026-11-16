@@ -352,7 +352,7 @@ impl Seeds {
 
     /// One request: the bytes, or the pause before trying again (None: not again from `url`).
     async fn try_get(&self, url: &Url, offset: u64, n: u64) -> Result<Bytes, Option<Duration>> {
-        let _open = self.requests.acquire().await.map_err(|_| None)?;
+        let _open = self.requests.acquire().await.map_err(|_| None::<Duration>)?;
         let slot = crate::hosts::acquire(url, self.per_host).await;
         let range = format!("bytes={}-{}", offset, offset + n - 1);
         let response = match self.client.get(url.clone()).header(RANGE, range).send().await {
