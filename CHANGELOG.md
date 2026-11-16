@@ -2,7 +2,7 @@
 
 What changed in each release, newest first. Each release's page on [GitHub](https://github.com/Adityasharma0101911/Endo-s-Unified-Downloader/releases) has its files and the full notes.
 
-## Unreleased
+## 2.0.3 (2026-11-16)
 
 - **Torrents: web seeds and the swarm at once.** A `.torrent`'s HTTP web seeds now join the swarm as peers of their own, so pieces come from the seeds and from other peers at the same time, where before the seeds' files came first and the swarm only after. Each piece is fetched from the seeds (a large one in parts at once, within each host's connection limit and its rest after a 429), checked against the torrent's SHA-1 before the torrent library gets any of it, and checked again as it is written. A piece the seeds serve wrong (the file changed since the torrent was made) or cannot serve is left to the peers while the seeds go on serving the rest (one wrong piece no longer cut every seed off for 10 seconds or more), and in a small torrent the seeds are asked for at most half the pieces at once, so the peers get some from the start. A torrent of whole pieces made by rqbit (its last piece hash is that of no bytes) keeps its piece hashes, so its seeds are peers too. Through a SOCKS5 proxy it is HTTP first and then the swarm, as before.
 - **A wrong mirror no longer costs the whole file.** When a file fails its checksum (yours, a listing's or the site's) and other mirrors sent part of it (a copy a `Link: rel=duplicate` header or a Metalink names, another archive.org server), those parts are fetched again from the server the download went by and the file is checked again, instead of the download failing and starting over.
