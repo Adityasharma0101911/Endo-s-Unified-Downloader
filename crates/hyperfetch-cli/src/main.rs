@@ -614,6 +614,8 @@ fn list_options(args: &Args) -> ListOptions {
         channels: args.channels.iter().cloned().chain(args.all_items.then(|| "*".to_string())).collect(),
         s3: args.s3_key(),
         ssh_key: args.ssh_key(),
+        formats: args.formats.iter().map(|f| f.trim().to_string()).filter(|f| !f.is_empty()).collect(),
+        max_items: args.max_items,
     }
 }
 

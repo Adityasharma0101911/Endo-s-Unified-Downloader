@@ -430,6 +430,19 @@ pub struct Args {
     #[arg(long = "all-items")]
     pub all_items: bool,
 
+    /// Only these files of an Internet Archive item, collection or search, or formats of a Project
+    /// Gutenberg book: formats or extensions, comma-separated ("pdf,epub", "Text PDF"), and for the
+    /// Internet Archive "original" (uploaded) or "derivative" (made by archive.org). By default an
+    /// item's uploaded files and a book's every format
+    #[arg(long = "formats", value_name = "LIST", value_delimiter = ',')]
+    pub formats: Vec<String>,
+
+    /// Most items of an Internet Archive collection, search or account (default 100), captures of a
+    /// Wayback Machine listing (default 500) or files of a Common Crawl list (default 100) one run
+    /// lists; add the link again for the next ones
+    #[arg(long = "max-items", value_name = "N", value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=10_000))]
+    pub max_items: Option<usize>,
+
     /// Record the channels of a channel list (an M3U of stream links) whose name or group PATTERN
     /// matches, in any case (* stands for any run of characters); repeat it for several
     #[arg(long = "channel", value_name = "PATTERN", value_parser = parse_pattern)]

@@ -2,6 +2,11 @@
 
 What changed in each release, newest first. Each release's page on [GitHub](https://github.com/Adityasharma0101911/Endo-s-Unified-Downloader/releases) has its files and the full notes.
 
+## Unreleased
+
+- **Internet Archive collections, searches and uploads.** A collection's page, a search (`archive.org/search?query=...`, `advancedsearch.php`) or an account's uploads (`details/@name`) adds each item's files, read through archive.org's scraping API, one item a second. One run lists at most 100 new items (`--max-items`), says so, and goes on with the next ones when the link is added again; items already downloaded are skipped without a request. `--formats` (GUI: "Archive formats") picks an item's files by format or extension, `original` or `derivative`.
+- **Polite listings.** Every listing above paces its requests per site, rests a host that answers 429 or 503 for as long as it asks (the rest downloads to it share), and identifies with the app's own user agent.
+
 ## 2.0.0 (2026-11-15)
 
 - **Extension: big downloads go to the app whatever their type.** With "Send browser downloads to the app" on, a download of 50 MB or more goes to the app whatever its type ("Any file from", 0 turns it off): a 5 GB `.dat` no longer stays in the browser. The file types decide below that, and their default list is longer (`.dat`, `.bin`, `.vhdx`, `.qcow2`, `.safetensors`, `.gguf`, more video, audio, e-book and font types); a list you edited is kept. "Send everything" sends every download of at least the minimum size, "Always from these sites" a site's downloads whatever their type or size. A captured download now goes with the other headers the browser sent for it (Authorization among them), and the app is started when it is not running ("Start the app when needed", on by default).

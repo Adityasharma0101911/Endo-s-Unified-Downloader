@@ -25,7 +25,7 @@ const GITHUB: &str = "https://github.com";
 const GITHUB_API: &str = "https://api.github.com";
 const HUGGING_FACE: &str = "https://huggingface.co";
 const CIVITAI: &str = "https://civitai.com";
-const ARCHIVE: &str = "https://archive.org";
+pub(crate) const ARCHIVE: &str = "https://archive.org";
 
 /// Formats of the files archive.org makes of an item for itself (its records, thumbnail and
 /// tile), which it lists as the item's own.
@@ -245,8 +245,9 @@ pub fn lists(url: &Url) -> bool {
     repo_of(url).is_some()
 }
 
-/// One task per file at `url`, in a folder named after it; a repository's zip.
-pub async fn list(http: &reqwest::Client, url: &Url, auth: Option<&str>) -> Result<Vec<Task>, String> {
+/// One task per file at `url`, in a folder named after it; a repository's zip. An Internet
+/// Archive item's files are those `formats` choose (see [`archive_takes`]).
+pub async fn list(http: &reqwest::Client, url: &Url, auth: Option<&str>, formats: &[String]) -> Result<Vec<Task>, String> {
     let tasks = match repo_of(url) {
         Some(repo @ (Repo::GitHubRoot { .. } | Repo::GitLabRoot { .. } | Repo::BitbucketRoot { .. } | Repo::GiteaRoot { .. })) => {
             let (zip, name) = zip_of(&repo)?;
@@ -256,7 +257,7 @@ pub async fn list(http: &reqwest::Client, url: &Url, auth: Option<&str>) -> Resu
         Some(Repo::GitHubRelease { owner, repo, tag }) => github_release(http, auth, GITHUB_API, &owner, &repo, tag.as_deref()).await?,
         Some(Repo::HuggingFace { kind, repo, rev, path }) => hugging_face(http, auth, HUGGING_FACE, kind, &repo, &rev, &path).await?,
         Some(Repo::Civitai { model, version }) => civitai(http, auth, CIVITAI, model, version).await?,
-        Some(Repo::Archive { item, path }) => archive(http, auth, ARCHIVE, &item, &path).await?,
+        Some(Repo::Archive { item, path }) => archive(http, auth, ARCHIVE, &item, &path, formats).await?,
         Some(Repo::GitLabTree { origin, project, rest }) => gitlab_tree(http, auth, &origin, &project, &rest).await?,
         Some(Repo::GitLabRelease { origin, project, tag }) => gitlab_release(http, auth, &origin, &project, tag.as_deref()).await?,
         Some(Repo::BitbucketTree { owner, repo, rest }) => bitbucket_tree(http, auth, BITBUCKET_API, &owner, &repo, &rest).await?,
@@ -619,10 +620,39 @@ struct ArchiveFile {
     private: Option<String>,
 }
 
-/// Every file uploaded to archive.org's `item` (not the copies archive.org made of them, nor its
-/// own records), under `path` in it, subfolders kept, each a task for its /download/ link with
-/// its size and SHA-1 (else MD5).
-async fn archive(http: &reqwest::Client, auth: Option<&str>, base: &str, item: &str, path: &[String]) -> Result<Vec<Task>, String> {
+/// Whether a listing with `formats` (see `ingest::ListOptions::formats`) takes archive.org's `file`:
+/// without any, a file uploaded to the item; else one whose format ("Text PDF") or extension
+/// ("pdf") one of them names, of those uploaded ("original") or made of them by archive.org
+/// ("derivative") when one of those words is among them, else of both. Its records and thumbnail
+/// only when their format is named, a file lent to signed-in readers never.
+fn archive_takes(file: &ArchiveFile, formats: &[String]) -> bool {
+    if file.private.as_deref() == Some("true") {
+        return false;
+    }
+    let own = file.source == "metadata" || ARCHIVE_OWN_FORMATS.contains(&file.format.as_str());
+    let (sources, named): (Vec<&str>, Vec<&str>) =
+        formats.iter().map(|f| f.trim().trim_start_matches('.')).filter(|f| !f.is_empty()).partition(|f| f.eq_ignore_ascii_case("original") || f.eq_ignore_ascii_case("derivative"));
+    let extension = file.name.rsplit_once('.').map_or("", |(_, ext)| ext);
+    let names = |f: &&str| f.eq_ignore_ascii_case(&file.format) || f.eq_ignore_ascii_case(extension);
+    match (sources.is_empty(), named.is_empty()) {
+        (true, true) => file.source == "original" && !own,
+        _ if own => named.iter().any(|f| f.eq_ignore_ascii_case(&file.format)),
+        (sources_free, _) => (sources_free || sources.iter().any(|s| s.eq_ignore_ascii_case(&file.source))) && (named.is_empty() || named.iter().any(names)),
+    }
+}
+
+/// The files of archive.org's `item` a listing with `formats` takes (see [`archive_takes`]), each a
+/// task for its /download/ link in a folder named after the item: the one way an item becomes
+/// downloads, whether its own link or a collection's or search's (`crate::iasearch`) names it.
+pub(crate) async fn archive_item(http: &reqwest::Client, base: &str, item: &str, formats: &[String]) -> Result<Vec<Task>, String> {
+    archive(http, None, base, item, &[], formats).await
+}
+
+/// The files of archive.org's `item` a listing with `formats` takes (see [`archive_takes`]: by
+/// default those uploaded to it, not the copies archive.org made of them, nor its own records),
+/// under `path` in it, subfolders kept, each a task for its /download/ link with its size and
+/// SHA-1 (else MD5).
+async fn archive(http: &reqwest::Client, auth: Option<&str>, base: &str, item: &str, path: &[String], formats: &[String]) -> Result<Vec<Task>, String> {
     let url = url_at(base, ["metadata", item, "files"])?;
     let missing = || format!("archive.org has no item {} (or it is dark)", item);
     let answer = fetch(http.get(url), auth, "archive.org").await?.ok_or_else(missing)?;
@@ -631,7 +661,7 @@ async fn archive(http: &reqwest::Client, auth: Option<&str>, base: &str, item: &
     let folder = component(path.last().map_or(item, String::as_str), item)?;
     let mut tasks = Vec::new();
     for file in files {
-        if file.source != "original" || ARCHIVE_OWN_FORMATS.contains(&file.format.as_str()) || file.private.as_deref() == Some("true") {
+        if !archive_takes(&file, formats) {
             continue;
         }
         let Some(name) = inside(&file.name, &prefix).and_then(relative) else { continue };
@@ -1109,7 +1139,7 @@ mod tests {
     async fn a_repository_is_its_default_branchs_zip() {
         let root = Url::parse("https://github.com/o/My%20Repo").unwrap();
         let zip = "https://github.com/o/My%20Repo/archive/HEAD.zip";
-        let tasks = list(&http(), &root, None).await.unwrap();
+        let tasks = list(&http(), &root, None, &[]).await.unwrap();
         assert_eq!(tasks, [Task { urls: vec![Url::parse(zip).unwrap()], name: Some("My Repo.zip".into()), ..Task::default() }]);
         assert_eq!(resolve(&http(), &root, None).await.unwrap()[0].as_str(), zip);
         let tree = Url::parse("https://github.com/o/r/tree/main").unwrap();
@@ -1287,6 +1317,7 @@ mod tests {
                     {"name":"item_meta.xml","source":"original","format":"Metadata","size":"7105"},
                     {"name":"item_itemimage.jpg","source":"original","format":"Item Image","size":"38366"},
                     {"name":"disc 1/track.flac","source":"original","format":"Flac","size":"12","md5":"51a545810bc354a03263332b7654c5fa"},
+                    {"name":"disc 1/track.mp3","source":"derivative","format":"VBR MP3","original":"disc 1/track.flac","size":"7"},
                     {"name":"disc 1/lent.pdf","source":"original","format":"Text PDF","private":"true"},
                     {"name":"disc 10/other.flac","source":"original","format":"Flac"},
                     {"name":"disc 1/../../evil.exe","source":"original","format":"Unknown"}]}"#,
@@ -1302,7 +1333,7 @@ mod tests {
     async fn archive_items_list_their_original_files() {
         let (addr, _) = serve(archive_api).await;
         let base = format!("http://{addr}");
-        let tasks = archive(&http(), None, &base, "item", &[]).await.unwrap();
+        let tasks = archive(&http(), None, &base, "item", &[], &[]).await.unwrap();
         let listed: Vec<_> = tasks.iter().map(|t| (t.urls[0].to_string(), t.name.clone().unwrap(), t.size, t.checksum.clone())).collect();
         assert_eq!(
             listed,
@@ -1313,9 +1344,9 @@ mod tests {
             ]
         );
         assert!(tasks.iter().all(|t| t.folder == Some("item".into()) && !t.from_document));
-        let folder = archive(&http(), None, &base, "item", &strings(&["disc 1"])).await.unwrap();
+        let folder = archive(&http(), None, &base, "item", &strings(&["disc 1"]), &[]).await.unwrap();
         assert_eq!(folder.iter().map(|t| (t.folder.clone().unwrap(), t.name.clone().unwrap())).collect::<Vec<_>>(), [(PathBuf::from("disc 1"), PathBuf::from("track.flac"))]);
-        assert!(archive(&http(), None, &base, "gone", &[]).await.unwrap_err().contains("no item gone"));
+        assert!(archive(&http(), None, &base, "gone", &[], &[]).await.unwrap_err().contains("no item gone"));
         assert_eq!(
             repo("https://archive.org/details/item"),
             Some(Repo::Archive { item: "item".into(), path: Vec::new() })
@@ -1326,6 +1357,28 @@ mod tests {
             assert_eq!(repo(other), None, "{other}");
         }
         assert!(lists(&Url::parse("https://archive.org/details/item").unwrap()) && !handles(&Url::parse("https://archive.org/details/item").unwrap()));
+    }
+
+    /// Formats choose an item's files by their format or extension, of both sources unless
+    /// "original" or "derivative" says which; archive.org's own records only by their format's
+    /// name, a file lent to signed-in readers never.
+    #[tokio::test]
+    async fn archive_formats_choose_files() {
+        let (addr, _) = serve(archive_api).await;
+        let base = format!("http://{addr}");
+        let names = |formats: &[&str]| {
+            let (http, base) = (http(), base.clone());
+            let formats = strings(formats);
+            async move {
+                let tasks = archive_item(&http, &base, "item", &formats).await.unwrap();
+                tasks.into_iter().map(|t| t.name.unwrap().to_string_lossy().replace('\\', "/")).collect::<Vec<_>>()
+            }
+        };
+        assert_eq!(names(&["FLAC", ".mp3"]).await, ["disc 1/track.flac", "disc 1/track.mp3", "disc 10/other.flac"]);
+        assert_eq!(names(&["original", "mp3", "flac"]).await, ["disc 1/track.flac", "disc 10/other.flac"]);
+        assert_eq!(names(&["derivative"]).await, ["disc 1/track.mp3"]);
+        assert_eq!(names(&["jpg"]).await, ["globe west.jpg"], "not archive.org's thumbnails");
+        assert_eq!(names(&["JPEG Thumb", "Metadata", "Text PDF"]).await, ["__ia_thumb.jpg", "globe west_thumb.jpg", "item_meta.xml"]);
     }
 
     fn pypi_api(path: &str, _: Option<crate::range::ByteRange>) -> Reply {
@@ -1520,9 +1573,9 @@ mod tests {
         ] {
             let root = Url::parse(root).unwrap();
             assert_eq!(resolve(&http(), &root, None).await.unwrap()[0].as_str(), zip);
-            assert_eq!(list(&http(), &root, None).await.unwrap()[0].urls[0].as_str(), zip);
+            assert_eq!(list(&http(), &root, None, &[]).await.unwrap()[0].urls[0].as_str(), zip);
         }
-        assert_eq!(list(&http(), &Url::parse("https://gitlab.com/g/sub/My%20P").unwrap(), None).await.unwrap()[0].name, Some("My P.zip".into()));
+        assert_eq!(list(&http(), &Url::parse("https://gitlab.com/g/sub/My%20P").unwrap(), None, &[]).await.unwrap()[0].name, Some("My P.zip".into()));
     }
 
     fn gitlab(path: &str) -> Reply {
@@ -1704,7 +1757,7 @@ mod tests {
 
     /// What `link` lists, through the client the front ends list with (GitHub wants its user agent).
     async fn live(link: &str) -> Result<Vec<Task>, String> {
-        list(&crate::ingest::descriptor_client(None).unwrap(), &Url::parse(link).unwrap(), None).await
+        list(&crate::ingest::descriptor_client(None).unwrap(), &Url::parse(link).unwrap(), None, &[]).await
     }
 
     /// Live: a small public GitHub folder lists its files.

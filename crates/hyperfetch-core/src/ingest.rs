@@ -126,6 +126,15 @@ pub struct ListOptions {
     pub s3: Option<crate::sigv4::S3Key>,
     /// The private key SFTP folders are listed with (see `crate::sftp`).
     pub ssh_key: Option<crate::sftp::SshKey>,
+    /// Which files of an Internet Archive item (and of a collection's or search's items) and
+    /// which formats of a Project Gutenberg book are listed: formats or extensions ("pdf", "Text
+    /// PDF", "epub"), and for the Internet Archive "original" or "derivative" (see
+    /// `repos::archive_takes`). None: an item's uploaded files, a book's every format.
+    pub formats: Vec<String>,
+    /// Most items of an Internet Archive collection, search or account (see `crate::iasearch`)
+    /// or captures of a Wayback Machine listing (see `crate::wayback`) one listing gives; None
+    /// for their own default.
+    pub max_items: Option<usize>,
 }
 
 impl ListOptions {
@@ -175,6 +184,8 @@ impl Default for ListOptions {
             channels: Vec::new(),
             s3: None,
             ssh_key: None,
+            formats: Vec::new(),
+            max_items: None,
         }
     }
 }
@@ -262,6 +273,7 @@ pub fn might_list(url: &Url) -> bool {
     mega::lists(url)
         || shares::lists(url)
         || cloud::lists(url)
+        || crate::iasearch::lists(url)
         || repos::lists(url)
         || folders::lists(url)
         || feeds::lists(url)
@@ -580,9 +592,15 @@ async fn list(http: &reqwest::Client, url: &Url, options: &ListOptions) -> Optio
             return Some(listed);
         }
     }
+    // An Internet Archive collection, search or account; an item's page goes on to its files.
+    if crate::iasearch::lists(url) {
+        if let Some(listed) = crate::iasearch::list(http, url, options).await {
+            return Some(listed);
+        }
+    }
     if repos::lists(url) {
         let auth = options.auth.as_ref().filter(|(link, _)| link == url).map(|(_, header)| header.as_str());
-        return Some(repos::list(http, url, auth).await);
+        return Some(repos::list(http, url, auth, &options.formats).await);
     }
     if folders::lists(url) {
         if let Some(listed) = folders::list(http, url, options).await {

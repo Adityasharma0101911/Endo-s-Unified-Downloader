@@ -648,7 +648,7 @@ async fn check_link(_: Option<PathBuf>, size: u64, url: Url, _: DownloadOptions)
 /// file host's, share's, cloud folder's, repository's or gallery's page whose files it finds, else
 /// "none".
 fn page_kind(url: &Url) -> &'static str {
-    use hyperfetch_core::{cloud, folders, gallery, mega, repos, resolver::SmartResolver, shares};
+    use hyperfetch_core::{cloud, folders, gallery, iasearch, mega, repos, resolver::SmartResolver, shares};
     if media::is_supported_media_site(url) {
         "media"
     } else if SmartResolver::handles(url)
@@ -658,6 +658,7 @@ fn page_kind(url: &Url) -> &'static str {
         || shares::lists(url)
         || cloud::lists(url)
         || repos::lists(url)
+        || iasearch::lists(url)
     {
         "files"
     } else {
@@ -1057,6 +1058,7 @@ mod tests {
             ("https://mega.nz/file/abcdefgh#0123456789abcdefghijklmnopqrstuvwxyzABCDEFG", "files"),
             ("https://www.mediafire.com/file/abc123/setup.zip/file", "files"),
             ("https://github.com/owner/repo/releases/latest", "files"),
+            ("https://archive.org/search?query=apollo", "files"),
             ("https://news.example/article", "none"),
         ] {
             let body = json!({ "url": url }).to_string();

@@ -80,6 +80,10 @@ pub struct Settings {
     pub only_new: bool,
     /// Only the newest this many items of a channel, playlist or feed (0 = all).
     pub latest: usize,
+    /// Only these formats or extensions of an Internet Archive item's files and of a Project
+    /// Gutenberg book, comma-separated (see `ListOptions::formats`); empty for the uploaded files
+    /// and every format.
+    pub archive_formats: String,
     /// Install a managed ffmpeg (about 200 MB) when a media download needs one and none is found:
     /// None until the user answers (see `App::start_job`). Saved under a key of its own, as the
     /// `install_ffmpeg: true` older versions saved was their default, never an answer.
@@ -266,6 +270,7 @@ impl Default for Settings {
             google_api_key: String::new(),
             only_new: true,
             latest: 0,
+            archive_formats: String::new(),
             install_ffmpeg: None,
             subtitles: String::new(),
             embed_metadata: engine.embed_metadata,
@@ -541,6 +546,8 @@ impl Settings {
             channels: Vec::new(),
             s3: self.s3_key(),
             ssh_key: self.ssh_key(),
+            formats: self.archive_formats.split(',').map(str::trim).filter(|f| !f.is_empty()).map(str::to_string).collect(),
+            max_items: None,
         }
     }
 
