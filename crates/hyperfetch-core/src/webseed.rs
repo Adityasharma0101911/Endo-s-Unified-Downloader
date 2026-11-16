@@ -48,6 +48,8 @@ const KEEP: Duration = Duration::from_secs(30);
 /// Bytes of fetched pieces kept at most (and two pieces, however large they are).
 const KEPT_BYTES: u64 = 256 << 20;
 const PROTOCOL: &[u8; 20] = b"\x13BitTorrent protocol";
+/// The block librqbit asks for: the unit of the requests it keeps out to a peer.
+const BLOCK: u64 = 16 * 1024;
 
 /// Pieces the web seeds served other bytes of than the torrent's, for tests to count.
 #[cfg(test)]
@@ -79,6 +81,10 @@ struct Seeds {
     peer_id: [u8; 20],
     piece_length: u64,
     stream_length: u64,
+    /// Requests librqbit may keep out to each of these peers (BEP 10's `reqq`; its own most is
+    /// 128): together they reserve at most half the torrent, so in a small one the swarm's peers
+    /// still find pieces to fetch from the start.
+    reqq: u64,
     hashes: Vec<[u8; 20]>,
     files: Vec<SeedFile>,
     client: Client,
@@ -122,6 +128,7 @@ pub(crate) async fn start(torrent: &[u8], info_hash: [u8; 20], client: Client, c
         peer_id,
         piece_length: info.piece_length,
         stream_length: info.stream_length,
+        reqq: (info.stream_length / BLOCK / (2 * PEERS as u64)).clamp(16, 128),
         hashes: info.piece_hashes,
         files: info.files.into_iter().map(|f| SeedFile { start: f.start, length: f.length, urls: f.urls }).collect(),
         client,
@@ -177,15 +184,23 @@ async fn peer(socket: TcpStream, seeds: Arc<Seeds>) -> std::io::Result<()> {
     if hello[..20] != PROTOCOL[..] || hello[28..48] != seeds.info_hash {
         return Ok(());
     }
+    // Extensions (BEP 10) only to say how many requests to keep out to this peer (`Seeds::reqq`).
+    let extended = hello[25] & 0x10 != 0;
     let bitfield = seeds.bitfield();
-    let mut reply = Vec::with_capacity(68 + 5 + bitfield.len() + 5);
+    let mut reply = Vec::with_capacity(68 + 5 + bitfield.len() + 32 + 5);
     reply.extend_from_slice(PROTOCOL);
-    reply.extend_from_slice(&[0; 8]);
+    reply.extend_from_slice(&[0, 0, 0, 0, 0, if extended { 0x10 } else { 0 }, 0, 0]);
     reply.extend_from_slice(&seeds.info_hash);
     reply.extend_from_slice(&seeds.peer_id);
     reply.extend_from_slice(&(1 + bitfield.len() as u32).to_be_bytes());
     reply.push(5);
     reply.extend_from_slice(&bitfield);
+    if extended {
+        let handshake = format!("d1:mde4:reqqi{}ee", seeds.reqq);
+        reply.extend_from_slice(&(2 + handshake.len() as u32).to_be_bytes());
+        reply.extend_from_slice(&[20, 0]);
+        reply.extend_from_slice(handshake.as_bytes());
+    }
     // Unchoked from the start: this peer serves whoever asks.
     reply.extend_from_slice(&1u32.to_be_bytes());
     reply.push(1);
@@ -436,10 +451,17 @@ mod tests {
         assert!(rest.is_empty());
         assert_eq!(seeds.seeds.bitfield(), [0b1011_0000]);
         assert_eq!(seeds.fetched(), 1000);
-        // A request outside the torrent ends the connection too.
+        // A peer that speaks extensions (BEP 10) is told how many requests to keep out. A request
+        // outside the torrent ends the connection too.
         let mut socket = TcpStream::connect(seeds.addrs[1]).await.unwrap();
-        socket.write_all(&[&PROTOCOL[..], &[0; 8], &hash, &[1; 20]].concat()).await.unwrap();
+        socket.write_all(&[&PROTOCOL[..], &[0, 0, 0, 0, 0, 0x10, 0, 0], &hash, &[1; 20]].concat()).await.unwrap();
+        let said = b"d1:mde4:reqqi16ee";
+        let mut hello = [0u8; 68 + 6 + 6 + 17 + 5];
         socket.read_exact(&mut hello).await.unwrap();
+        assert_eq!(hello[25], 0x10);
+        assert_eq!(hello[74..80], [0, 0, 0, 19, 20, 0]);
+        assert_eq!(hello[80..97], said[..]);
+        assert_eq!(hello[97..], [0, 0, 0, 1, 1]);
         socket.write_all(&request(4, 0, 16384)).await.unwrap();
         let ended = tokio::time::timeout(Duration::from_secs(10), socket.read_to_end(&mut rest)).await.unwrap();
         assert!(ended.is_err() || rest.is_empty());
