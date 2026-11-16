@@ -120,7 +120,8 @@ mod tests {
         let url = |path: &str| Url::parse(&format!("http://{addr}{path}")).unwrap();
         let started = tokio::time::Instant::now();
         let gap = Duration::from_millis(150);
-        let (a, b, c) = tokio::join!(get(&http, &url("/a"), gap), get(&http, &url("/b"), gap), get(&http, &url("/c"), gap));
+        let (ua, ub, uc) = (url("/a"), url("/b"), url("/c"));
+        let (a, b, c) = tokio::join!(get(&http, &ua, gap), get(&http, &ub, gap), get(&http, &uc, gap));
         assert!([a, b, c].iter().all(|r| r.as_ref().is_ok_and(|r| r.status() == 200)));
         assert!(started.elapsed() >= gap * 2, "three requests, two gaps: {:?}", started.elapsed());
         let answer = get(&http, &url("/busy"), Duration::ZERO).await.unwrap();
