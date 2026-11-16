@@ -71,16 +71,6 @@ jobs:
           ENDO_BENCH_CHECK: "1"
       - if: always()
         run: cat speed.md >> "$GITHUB_STEP_SUMMARY" || true
-      # Experiments on the same runner, for comparison only: never fail the job.
-      - name: "Experiment: mimalloc"
-        continue-on-error: true
-        run: |
-          cargo test --release -p hyperfetch-core --features bench-mimalloc --lib speed_bench -- --ignored --nocapture --test-threads=1
-          cat speed-mimalloc.md >> "$GITHUB_STEP_SUMMARY"
-        env:
-          ENDO_BENCH_LABEL: mimalloc
-          ENDO_BENCH_OUT: ${{ github.workspace }}/speed-mimalloc.json
-          ENDO_BENCH_SUMMARY: ${{ github.workspace }}/speed-mimalloc.md
       - if: always()
         uses: actions/upload-artifact@v5
         with:
