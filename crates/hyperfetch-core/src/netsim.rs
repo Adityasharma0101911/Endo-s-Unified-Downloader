@@ -4,8 +4,9 @@
 //! ranges, a connection that slows down and stalls or is cut off), and [`Model`], the same caps as
 //! numbers, with noise from a fixed seed, for a controller to be stepped through without a clock.
 //!
-//! Bodies have a fixed length of a few MB at most, and every connection ends: a stalled one is
-//! closed after `HOLD`.
+//! Bodies have a fixed length of a few MB at most (the speed benchmark's, `crate::speedbench`, of
+//! up to 128 MiB), and every connection ends: a stalled one is closed after `HOLD`. A path
+//! `/sized/<n>/...` serves a file of `n` bytes in place of `Server::size`.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -23,6 +24,13 @@ const PIECE: usize = 16 * 1024;
 /// The file's byte at `offset`.
 pub(crate) fn byte(offset: usize) -> u8 {
     (offset % 251) as u8
+}
+
+/// The file's bytes from `offset`, `len` of them (at most `PIECE`), without a loop per byte: the
+/// benchmark's fast scenarios must time the client, not this server.
+fn bytes_at(offset: usize, len: usize) -> &'static [u8] {
+    static PATTERN: std::sync::LazyLock<Vec<u8>> = std::sync::LazyLock::new(|| (0..PIECE + 251).map(byte).collect());
+    &PATTERN[offset % 251..offset % 251 + len]
 }
 
 /// The whole file of `size` bytes, to compare a download with.
@@ -58,6 +66,9 @@ pub(crate) struct Server {
     pub zsync: Option<Vec<u8>>,
     /// A limit on how fast requests (of any path, HEAD too) may come.
     pub rate: Option<RateLimit>,
+    /// Bytes from the first offset up to the second are sent inverted: another version of the
+    /// file under the same size and ETag, as a stale mirror serves.
+    pub corrupt: Option<(usize, usize)>,
 }
 
 /// At most `requests` requests in any `window`; one more is refused with 429 and Retry-After
@@ -136,8 +147,9 @@ pub(crate) struct Decay {
 /// What the server saw.
 #[derive(Default)]
 pub(crate) struct Stats {
-    /// GETs answered, refused ones among them.
+    /// GETs answered, refused ones among them, and HEADs.
     pub gets: AtomicUsize,
+    pub heads: AtomicUsize,
     /// GETs refused for `max_connections`.
     pub refused: AtomicUsize,
     /// GETs being answered now, and the most ever at once.
@@ -150,6 +162,8 @@ pub(crate) struct Stats {
     pub throttled: AtomicUsize,
     pub early: AtomicUsize,
     pub shut: AtomicUsize,
+    /// When the first byte of a body went out.
+    pub first_sent: std::sync::OnceLock<std::time::Instant>,
     decayed: AtomicBool,
     cut: AtomicBool,
 }
@@ -214,7 +228,8 @@ async fn answer(
         }
     }
     let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
-    let size = server.size;
+    let path = head.split_whitespace().nth(1).unwrap_or("/");
+    let size = path.strip_prefix("/sized/").and_then(|rest| rest.split('/').next()?.parse().ok()).unwrap_or(server.size);
     let range = head
         .lines()
         .find_map(|l| l.strip_prefix("range: bytes=")?.trim().split_once('-'))
@@ -233,6 +248,7 @@ async fn answer(
         return;
     }
     if head.starts_with("head ") {
+        stats.heads.fetch_add(1, Ordering::SeqCst);
         let _ = socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {size}\r\n{ranges}{link}Connection: close\r\n\r\n").as_bytes()).await;
         return;
     }
@@ -263,7 +279,12 @@ async fn answer(
     let (mut sent, mut slowed) = (0, None);
     let (mut from_client, mut to_client) = socket.split();
     for offset in (start..=end).step_by(PIECE) {
-        let piece: Vec<u8> = (offset..=end.min(offset + PIECE - 1)).map(byte).collect();
+        let mut piece = std::borrow::Cow::Borrowed(bytes_at(offset, end.min(offset + PIECE - 1) + 1 - offset));
+        if let Some((from, to)) = server.corrupt.filter(|&(from, to)| from < offset + piece.len() && to > offset) {
+            for at in from.max(offset)..to.min(offset + piece.len()) {
+                piece.to_mut()[at - offset] ^= 0xff;
+            }
+        }
         if cut.is_some_and(|after| sent >= after) {
             return;
         }
@@ -294,6 +315,7 @@ async fn answer(
         if !paced || to_client.write_all(&piece).await.is_err() {
             return;
         }
+        stats.first_sent.get_or_init(std::time::Instant::now);
         sent += piece.len();
         stats.served.fetch_add(piece.len(), Ordering::SeqCst);
     }

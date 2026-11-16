@@ -40,6 +40,8 @@ librqbit = { version = "9.0.1", default-features = false, features = ["rust-tls"
 # SFTP downloads (sftp.rs): pure-Rust SSH on the aws-lc-rs that rustls already builds; no compression.
 russh = { version = "0.65", default-features = false, features = ["aws-lc-rs", "rsa"] }
 russh-sftp = "3.0"
+# The allocator the speed benchmark tries (feature bench-mimalloc); nothing else uses it.
+mimalloc = { version = "0.1", default-features = false, optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Time", "Win32_Security"] }
@@ -47,8 +49,14 @@ windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[features]
+# The speed benchmark with mimalloc as the allocator (see src/speedbench.rs), for CI to compare.
+bench-mimalloc = ["dep:mimalloc"]
+
 [dev-dependencies]
 tempfile = "3.17"
+# The speed benchmark's HTTP/2 server (reqwest's HTTP/2 builds it already).
+h2 = "0.4"
 criterion = "0.5"
 http = "1"
 tokio = { version = "1.43", features = ["test-util"] }
