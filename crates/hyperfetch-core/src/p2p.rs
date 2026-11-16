@@ -57,6 +57,14 @@ const MAX_TORRENT_BYTES: usize = 16 * 1024 * 1024;
 /// a swarm takes seconds to start (the torrent, its trackers, the first peers), longer than HTTP
 /// needs for less, and small files seldom have peers anyway.
 pub(crate) const SWARM_MIN: u64 = 100 << 20;
+
+/// Whether web seeds join the swarm as peers (see `crate::webseed`) and a site's large files
+/// take its torrent beside HTTP (see `ingest::ListOptions::swarm_with_http`).
+// shortcut: off unless ENDO_WEB_SEED_PEERS is set, as archive.org's 288 MiB took 46-57 s that way
+// and 7-9 s over HTTP first; on by default once a real run shows it no slower.
+pub(crate) fn web_seed_peers() -> bool {
+    cfg!(test) || std::env::var_os("ENDO_WEB_SEED_PEERS").is_some()
+}
 /// Torrents of chosen files (archive.org items', see `repos`) downloading at once: a collection's
 /// items wait for one of these turns rather than each joining its swarm.
 static CHOSEN: Semaphore = Semaphore::const_new(3);
@@ -237,7 +245,7 @@ pub async fn run(
         more => with_web_seeds(&listed.torrent_bytes, more)?,
     };
     let network = network_only(options);
-    let web = match proxied {
+    let web = match proxied || !web_seed_peers() {
         true => None,
         false => {
             let client = crate::engine::build_client(&network)?;
