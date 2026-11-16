@@ -832,27 +832,43 @@ mod tests {
         // The local file's link names the seeder as a magnet's `x.pe` would.
         let mut source = Url::from_file_path(&file).unwrap();
         source.set_query(Some(&format!("x.pe=127.0.0.1:{port}")));
-        // What each had sent, every 100 ms.
+        // What each had sent every 100 ms, and whether the seeder had the download connected.
         let (watched, done) = (mixed.clone(), CancellationToken::new());
         let (at, stop) = (at_web.clone(), done.clone());
         let samples = tokio::spawn(async move {
             let mut samples = Vec::new();
             while !stop.is_cancelled() {
-                samples.push((at.served.load(Ordering::SeqCst), watched.stats().uploaded_bytes));
+                let stats = watched.stats();
+                let live = stats.live.as_ref().map_or(0, |l| l.snapshot.peer_stats.live);
+                samples.push((at.served.load(Ordering::SeqCst), stats.uploaded_bytes, live));
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
             samples
         });
-        let running = run(&source, &options, &out, None, CancellationToken::new());
+        // The download's own count of peers, as it reports it.
+        let (tx, mut rx) = broadcast::channel::<EngineSnapshot>(256);
+        let began = Instant::now();
+        let peers = tokio::spawn(async move {
+            let mut peers = Vec::new();
+            while let Ok(snapshot) = rx.recv().await {
+                if let Some(t) = snapshot.torrent {
+                    if peers.last().is_none_or(|&(_, n)| n != t.peers) {
+                        peers.push((began.elapsed().as_millis(), t.peers));
+                    }
+                }
+            }
+            peers
+        });
+        let running = run(&source, &options, &out, Some(tx), CancellationToken::new());
         let (path, _) = tokio::time::timeout(Duration::from_secs(60), running).await.expect("done within a minute").unwrap();
         done.cancel();
-        let samples = samples.await.unwrap();
+        let (samples, peers) = (samples.await.unwrap(), peers.await.unwrap());
         assert!(std::fs::read(&path).unwrap() == changed);
         let sent = mixed.stats().uploaded_bytes;
         let served = at_web.served.load(Ordering::SeqCst);
         assert!(sent > 0 && served > 0, "the swarm sent {sent} bytes, the seed {served}");
         let both = samples.windows(4).any(|w| w[3].0 > w[0].0 && w[3].1 > w[0].1);
-        assert!(both, "within 300 ms both sent some: {samples:?}");
+        assert!(both, "within 300 ms both sent some: (seed, swarm, seeder's live peers) {samples:?}; the download's peers (ms, n) {peers:?}");
         seeder.stop().await;
     }
 
