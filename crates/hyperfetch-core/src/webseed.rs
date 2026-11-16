@@ -54,6 +54,9 @@ const BLOCK: u64 = 16 * 1024;
 /// Pieces the web seeds served other bytes of than the torrent's, for tests to count.
 #[cfg(test)]
 pub(crate) static WRONG: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Why `crate::p2p` found a torrent's web seeds could not be peers, for tests to read.
+#[cfg(test)]
+pub(crate) static NOT_PEERS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// The web seeds of one torrent as peers, until dropped.
 pub(crate) struct WebSeeds {
@@ -106,12 +109,12 @@ struct Kept {
 }
 
 /// Starts the web seeds of the torrent `torrent` (its .torrent bytes) as peers, fetching with
-/// `client`, at most `connections` requests at once and `per_host` to one host; None when it has
-/// none, or no piece hashes to check what they serve against.
-pub(crate) async fn start(torrent: &[u8], info_hash: [u8; 20], client: Client, connections: usize, per_host: usize) -> Option<WebSeeds> {
-    let info = crate::torrent::parse_torrent_bytes(torrent).ok()?;
+/// `client`, at most `connections` requests at once and `per_host` to one host; why not when it
+/// has none, or no piece hashes to check what they serve against.
+pub(crate) async fn start(torrent: &[u8], info_hash: [u8; 20], client: Client, connections: usize, per_host: usize) -> Result<WebSeeds, String> {
+    let info = crate::torrent::parse_torrent_bytes(torrent)?;
     if info.piece_hashes.is_empty() || info.piece_length == 0 || info.piece_length > u64::from(u32::MAX) {
-        return None;
+        return Err(format!("no piece hashes to check them by ({} pieces of {} bytes)", info.num_pieces, info.piece_length));
     }
     let mut lost = vec![false; info.piece_hashes.len()];
     for file in info.files.iter().filter(|f| f.urls.is_empty() && f.length > 0) {
@@ -119,10 +122,10 @@ pub(crate) async fn start(torrent: &[u8], info_hash: [u8; 20], client: Client, c
         lost[first as usize..=last as usize].fill(true);
     }
     if lost.iter().all(|&lost| lost) {
-        return None;
+        return Err("no web seeds".into());
     }
     let mut peer_id = *b"-EU2000-000000000000";
-    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut peer_id[8..]).ok()?;
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut peer_id[8..]).map_err(|_| "no random peer id")?;
     let seeds = Arc::new(Seeds {
         info_hash,
         peer_id,
@@ -141,11 +144,11 @@ pub(crate) async fn start(torrent: &[u8], info_hash: [u8; 20], client: Client, c
     let stop = CancellationToken::new();
     let mut addrs = Vec::new();
     for _ in 0..PEERS {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.ok()?;
-        addrs.push(listener.local_addr().ok()?);
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.map_err(|e| format!("no local port: {e}"))?;
+        addrs.push(listener.local_addr().map_err(|e| e.to_string())?);
         tokio::spawn(listen(listener, seeds.clone(), stop.clone()));
     }
-    Some(WebSeeds { addrs, seeds, _stop: stop.drop_guard() })
+    Ok(WebSeeds { addrs, seeds, _stop: stop.drop_guard() })
 }
 
 async fn listen(listener: TcpListener, seeds: Arc<Seeds>, stop: CancellationToken) {
