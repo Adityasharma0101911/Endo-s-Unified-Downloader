@@ -4,7 +4,9 @@
 //!
 //! - Kiwix: a ZIM file on download.kiwix.org (or a mirror's `/kiwix/zim/` tree) is its Metalink:
 //!   every mirror, its hashes and piece hashes. A folder there is its ZIM files so; a book's page
-//!   on library.kiwix.org the ZIM file its OPDS catalog names.
+//!   on library.kiwix.org the ZIM file its OPDS catalog names. With BitTorrent allowed, a large
+//!   one whose torrent holds the same bytes (by the Metalink's piece hashes) comes from its swarm
+//!   and every mirror at once.
 //! - Wikimedia dumps: a run (`dumps.wikimedia.org/<wiki>/<date>/`) is its files with the SHA-1 its
 //!   `dumpstatus.json` publishes; a documented mirror holding the same file (by the SHA-1 its own
 //!   sums file gives) is one of its mirrors.
@@ -279,12 +281,59 @@ async fn metalink_at(http: &reqwest::Client, meta4: &Url) -> Result<Vec<Task>, S
     crate::ingest::metalink_tasks(&bytes)
 }
 
-/// The ZIM file at `path` on Kiwix's server `base`, as its Metalink lists it.
+/// The ZIM file at `path` on Kiwix's server `base`, as its Metalink lists it (see [`kiwix_swarm`]).
 async fn kiwix_file(http: &reqwest::Client, base: &str, path: &str, options: &ListOptions) -> Result<Vec<Task>, String> {
     let file = Url::parse(&format!("{base}{path}")).map_err(|e| e.to_string())?;
-    let tasks = metalink_at(http, &Url::parse(&format!("{file}.meta4")).map_err(|e| e.to_string())?).await?;
-    options.note(format!("Downloading from the mirrors of its Metalink; it is on BitTorrent too: {file}.torrent"));
+    let meta4 = Url::parse(&format!("{file}.meta4")).map_err(|e| e.to_string())?;
+    let mut tasks = Vec::new();
+    for task in metalink_at(http, &meta4).await? {
+        tasks.push(kiwix_swarm(http, task, &meta4, options).await);
+    }
+    if !swarm_note(&tasks, options) {
+        options.note(format!("Downloading from the mirrors of its Metalink; it is on BitTorrent too: {file}.torrent"));
+    }
     Ok(tasks)
+}
+
+/// Tells that the ZIM files of `tasks` that come from their torrents' swarms too (see
+/// [`kiwix_swarm`]) do; false when none does.
+fn swarm_note(tasks: &[Task], options: &ListOptions) -> bool {
+    match tasks.iter().filter(|t| t.p2p).count() {
+        0 => false,
+        1 if tasks.len() == 1 => {
+            options.note("Downloading from its torrent's swarm and the mirrors of its Metalink at once".to_string());
+            true
+        }
+        n => {
+            options.note(format!("{n} ZIM file(s) download from their torrents' swarms and their Metalinks' mirrors at once"));
+            true
+        }
+    }
+}
+
+/// `task` (a ZIM file, as its Metalink at `meta4` lists it) from Kiwix's torrent of it, its web
+/// seeds, the Metalink's mirrors and the swarm at once, when the swarm is allowed (see
+/// `ListOptions::swarm_with_http`), the file is large (see `p2p::SWARM_MIN`), and the torrent
+/// holds the same bytes: one file of its size, of SHA-1 piece hashes the Metalink's own. Else as
+/// it was, from the mirrors alone.
+async fn kiwix_swarm(http: &reqwest::Client, task: Task, meta4: &Url, options: &ListOptions) -> Task {
+    let pieces = task.pieces.as_ref().filter(|p| p.algo == "sha1");
+    let (Some(pieces), Some(size)) = (pieces, task.size.filter(|&size| size >= crate::p2p::SWARM_MIN && options.swarm_with_http())) else { return task };
+    let Some(Ok(torrent)) = meta4.as_str().strip_suffix(".meta4").map(|file| Url::parse(&format!("{file}.torrent"))) else { return task };
+    let Ok(Some(bytes)) = fetch(http, &torrent, GAP, "Kiwix").await else { return task };
+    let Ok(info) = crate::torrent::parse_torrent_bytes(&bytes) else { return task };
+    let hex = |hash: &[u8; 20]| hash.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let same = info.files.len() == 1
+        && info.total_length == size
+        && info.piece_length == pieces.length
+        && info.piece_hashes.len() == pieces.hashes.len()
+        && info.piece_hashes.iter().zip(&pieces.hashes).all(|(theirs, ours)| hex(theirs) == *ours);
+    if !same {
+        tracing::debug!("{torrent} is not the bytes of its Metalink: the mirrors alone");
+        return task;
+    }
+    // Its mirrors are the torrent's web seeds too (see `p2p::run`).
+    Task { urls: [vec![torrent], task.urls].concat(), p2p: true, pieces: None, checksum: None, ..task }
 }
 
 /// The files of the folder at `path` on Kiwix's server `base` (an open directory), each ZIM file
@@ -305,9 +354,9 @@ async fn kiwix_folder(http: &reqwest::Client, base: &str, path: &str, options: &
         }
         let meta4 = Url::parse(&format!("{}.meta4", task.urls[0])).map_err(|e| e.to_string())?;
         let found = metalink_at(http, &meta4).await?.into_iter().next().ok_or_else(|| format!("{meta4} lists no file"))?;
-        tasks.push(Task { name: task.name, folder: task.folder, ..found });
+        tasks.push(kiwix_swarm(http, Task { name: task.name, folder: task.folder, ..found }, &meta4, options).await);
     }
-    if count > 0 {
+    if count > 0 && !swarm_note(&tasks, options) {
         options.note(format!("{count} ZIM file(s) download from the mirrors of their Metalinks; each is on BitTorrent too (its link with .torrent added)"));
     }
     Ok(tasks)
@@ -351,8 +400,13 @@ async fn kiwix_book(http: &reqwest::Client, library: &str, book: &str, options: 
         (None, None) => return Err(format!("Kiwix's library has no book {book}")),
     };
     let meta4 = Url::parse(library).and_then(|l| l.join(&meta4)).map_err(|e| e.to_string())?;
-    let tasks = metalink_at(http, &meta4).await?;
-    options.note(format!("Downloading from the mirrors of its Metalink; it is on BitTorrent too: {}", meta4.as_str().trim_end_matches(".meta4").to_string() + ".torrent"));
+    let mut tasks = Vec::new();
+    for task in metalink_at(http, &meta4).await? {
+        tasks.push(kiwix_swarm(http, task, &meta4, options).await);
+    }
+    if !swarm_note(&tasks, options) {
+        options.note(format!("Downloading from the mirrors of its Metalink; it is on BitTorrent too: {}", meta4.as_str().trim_end_matches(".meta4").to_string() + ".torrent"));
+    }
     Ok(tasks)
 }
 
@@ -946,7 +1000,29 @@ mod tests {
                 <url location="nl" priority="1">https://ftp.nluug.nl/pub/kiwix/zim/gutenberg/{name}</url><url location="dk" priority="2">https://mirrors.dotsrc.org/kiwix/zim/gutenberg/{name}</url></file></metalink>"#
             ))
         };
+        // A large file in two pieces, as MirrorBrain lists them, and its torrent (one of another
+        // file's pieces otherwise), as MirrorBrain makes them: web seeds of some of the mirrors.
+        let large = |name: &str| {
+            text(&format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?><metalink xmlns="urn:ietf:params:xml:ns:metalink"><file name="{name}"><size>209715200</size>
+                <hash type="sha-256">90532f41434bd797a943e7b9dd945915a3206f3c1c095188de52694ba562e41d</hash>
+                <pieces length="134217728" type="sha-1"><hash>{a}</hash><hash>{b}</hash></pieces>
+                <url location="nl" priority="1">https://ftp.nluug.nl/pub/kiwix/zim/gutenberg/{name}</url><url location="dk" priority="2">https://mirrors.dotsrc.org/kiwix/zim/gutenberg/{name}</url></file></metalink>"#,
+                a = "61".repeat(20),
+                b = "62".repeat(20),
+            ))
+        };
+        let torrent = |name: &str, second: char| {
+            let seed = format!("https://mirrors.dotsrc.org/kiwix/zim/gutenberg/{name}");
+            let pieces = format!("{}{}", "a".repeat(20), second.to_string().repeat(20));
+            let info = format!("d6:lengthi209715200e4:name{}:{name}12:piece lengthi134217728e6:pieces40:{pieces}e", name.len());
+            text(&format!("d8:url-listl{}:{seed}e4:info{info}e", seed.len()))
+        };
         match path {
+            "/zim/gutenberg/big.zim.meta4" => large("big.zim"),
+            "/zim/gutenberg/big.zim.torrent" => torrent("big.zim", 'b'),
+            "/zim/gutenberg/other.zim.meta4" => large("other.zim"),
+            "/zim/gutenberg/other.zim.torrent" => torrent("other.zim", 'c'),
             "/zim/gutenberg/" => (200, "Content-Type: text/html\r\n".into(), br#"<html><head><title>Index of /zim/gutenberg</title></head><body><pre><a href="/zim/">Parent Directory</a>
 <a href="a.zim">a.zim</a>  2025-06-06 17:00  1.9M
 <a href="README">README</a>  2025-06-06 17:00  1.0K</pre></body></html>"#.to_vec()),
@@ -979,6 +1055,31 @@ mod tests {
         assert_eq!(named(&book), ["gutenberg_ale_all_2025-09.zim"]);
         let older = kiwix_book(&http(), &base, "gutenberg_ale_all_2025-06", &ListOptions::default()).await.unwrap_err();
         assert_eq!(older, "Kiwix has no such file", "the older one is looked for beside the newest");
+    }
+
+    /// A large ZIM file whose torrent holds the same bytes (its size, and the Metalink's piece
+    /// hashes) comes from the torrent with the swarm allowed, the Metalink's mirrors its web seeds
+    /// too; one whose torrent is of other bytes, or any without the swarm, from the mirrors alone.
+    #[tokio::test]
+    async fn large_kiwix_files_come_from_their_torrent_too() {
+        let (addr, asked) = serve(kiwix_api).await;
+        let base = format!("http://{addr}");
+        let swarm = ListOptions { p2p: true, ..ListOptions::default() };
+        let big = kiwix_file(&http(), &base, "/zim/gutenberg/big.zim", &swarm).await.unwrap();
+        assert!(big[0].p2p && big[0].pieces.is_none() && big[0].name == Some("big.zim".into()));
+        let mirrors = ["https://ftp.nluug.nl/pub/kiwix/zim/gutenberg/big.zim", "https://mirrors.dotsrc.org/kiwix/zim/gutenberg/big.zim"];
+        let torrent = format!("{base}/zim/gutenberg/big.zim.torrent");
+        assert_eq!(big[0].urls.iter().map(Url::as_str).collect::<Vec<_>>(), [vec![torrent.as_str()], mirrors.to_vec()].concat());
+        let other = kiwix_file(&http(), &base, "/zim/gutenberg/other.zim", &swarm).await.unwrap();
+        assert!(!other[0].p2p && other[0].urls.len() == 2 && other[0].pieces.is_some());
+        let plain = kiwix_file(&http(), &base, "/zim/gutenberg/big.zim", &ListOptions::default()).await.unwrap();
+        assert!(!plain[0].p2p && plain[0].urls.len() == 2);
+        let behind = ListOptions { p2p: true, proxy: Some("socks5://127.0.0.1:9".into()), ..ListOptions::default() };
+        assert!(!kiwix_file(&http(), &base, "/zim/gutenberg/big.zim", &behind).await.unwrap()[0].p2p);
+        assert_eq!(asked.lock().get("/zim/gutenberg/big.zim.torrent"), Some(&1), "asked for with the swarm allowed alone");
+        // A small file never asks for its torrent.
+        kiwix_file(&http(), &base, "/zim/gutenberg/a.zim", &swarm).await.unwrap();
+        assert_eq!(asked.lock().get("/zim/gutenberg/a.zim.torrent"), None);
     }
 
     /// Wikimedia's dumps as they answer (checked live): a run's status, and the sums of the run on
