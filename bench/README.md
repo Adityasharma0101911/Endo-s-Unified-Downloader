@@ -18,10 +18,31 @@ ENDO_BENCH_ONLY=lan,small_files cargo test --release -p hyperfetch-core --lib sp
 It prints JSON (or writes it to `ENDO_BENCH_OUT`) and a markdown table (or `ENDO_BENCH_SUMMARY`).
 The `speed` job of `.github/workflows/ci.yml` runs it on every push on Linux, puts the table in
 the job's summary and fails when `ENDO_BENCH_CHECK` finds a scenario under its floor in
-`sim-thresholds.json` (MB/s, and the most milliseconds to the first byte). The same job runs two
-comparisons that never fail it: 2 MiB disk writes per connection (`ENDO_WRITE_BATCH`) and mimalloc
-as the allocator (`--features bench-mimalloc`). A debug build's numbers are not comparable: the
+`sim-thresholds.json` (MB/s, and the most milliseconds to the first byte). Each floor is about
+half what the CI runner measured, and each first-byte limit three times the measured plus 200 ms:
+a real regression (a scenario at half speed, a probe that waits a round trip more) fails the job,
+a slower runner does not. The same job runs one comparison that never fails it: mimalloc as the
+allocator (`--features bench-mimalloc`). A debug build's numbers are not comparable: the
 dependencies are not optimized there, and the thresholds are not checked.
+
+### Results (2026-11-16, GitHub's ubuntu-latest runner, release build)
+
+| Scenario | MB/s | First byte | Requests | Files/s |
+|---|---:|---:|---:|---:|
+| `lan`: 128 MiB, no cap | 2572 | 1.4 ms | 20 | |
+| `per_connection`: 2 MB/s per connection | 17.0 | 1.4 ms | 17 | |
+| `per_client`: 20 MB/s for all of a user's connections | 21.1 | 1.4 ms | 16 | |
+| `high_latency`: 150 ms to answer, 3 MB/s per connection | 17.6 | 152 ms | 11 | |
+| `lossy`: 80 ms, one connection cut, one fading | 9.6 | 82 ms | 15 | |
+| `rate_limited`: 429 past 6 requests a second | 14.2 | 1.4 ms | 20 | |
+| `h2_latency_hyper`: HTTP/2, 100 ms round trip, hyper's windows | 17.7 | 137 ms | 1 | |
+| `h2_latency`: the same, the engine's windows | 22.5 | 136 ms | 1 | |
+| `small_files`: 2,000 files of 1–100 KB, 8 at once | 16.5 | 12.5 ms | 4000 | 332 |
+| `small_files_hashed`: the same, each with its SHA-256 | 15.3 | 12.1 ms | 2000 | 307 |
+
+A file with a known SHA-256 asks once (GET), not twice (HEAD beside the GET). Writing 2 MiB to
+disk at a time per connection instead of 512 KiB measured no faster (LAN 2531 against 2572 MB/s,
+the capped and lossy links the same), so the writes stay at 512 KiB.
 
 ## v1.0 against the current CLI
 
