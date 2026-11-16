@@ -4284,7 +4284,10 @@ impl ProbeInfo {
 
     /// Validator for `If-Range`: weak ETags are not allowed there.
     fn if_range(&self) -> Option<String> {
-        self.strong_etag().map(str::to_string).or_else(|| self.last_modified.clone())
+        // shortcut: arXiv's cache gives each part of a file an ETag of its own, so only its date
+        // names the version; make this a check of the answers once a second host does the same.
+        let etag = self.strong_etag().filter(|_| self.final_url.host_str() != Some("export.arxiv.org"));
+        etag.map(str::to_string).or_else(|| self.last_modified.clone())
     }
 
     /// Name and validators of `url` from the first of `responses` that has each; without a
