@@ -41,6 +41,9 @@ pub(crate) const REFETCH: &str = "Some pieces do not match the metalink's hashes
 /// Most times those pieces are fetched again, each time from one mirror, another than before when
 /// there are several.
 pub(crate) const REFETCH_ROUNDS: usize = 3;
+/// What a download fails with while the ranges other mirrors wrote wait to be fetched again from
+/// the one it went by, its whole-file hash having failed (see [`finish`]).
+pub(crate) const FROM_PRIMARY: &str = "The file does not match its checksum; fetching what other mirrors sent again from the first";
 
 /// The checksum the site publishes for the file at `url`, in the form `--checksum` takes
 /// (`sha256:<hex>`, `sha512:`, `sha1:`, `md5:`), whose probe answered with `probe_headers`.
@@ -251,6 +254,11 @@ fn algo_name(algo: &str) -> String {
 pub(crate) struct Site {
     search: Option<JoinHandle<Option<String>>>,
     pub(crate) note: Option<String>,
+    /// The mirror the download went by, and the ranges written from others in its last run: a
+    /// whole-file hash that fails has those fetched again from it alone (`primary_only`).
+    pub(crate) primary: Option<Url>,
+    pub(crate) copies: Vec<ByteRange>,
+    pub(crate) primary_only: bool,
 }
 
 /// Starts looking for the site's published checksum of the download at `url`, whose probe
@@ -270,7 +278,9 @@ pub(crate) fn look_for(
         let (client, url, headers, limit) = (client.clone(), url.clone(), headers.clone(), options.max_connections_per_host);
         tokio::spawn(async move { published(&client, auth.as_deref(), limit, &url, &headers, described).await })
     });
-    *site.lock() = Site { search, note: None };
+    // What a run before left of the mirrors (`primary`, `primary_only`) holds for this one.
+    let mut site = site.lock();
+    (site.search, site.note) = (search, None);
 }
 
 /// Holds the download to `checksum` (`algo:hex`) in place of what [`look_for`] looks for: the
@@ -292,6 +302,9 @@ pub(crate) enum Unfinished {
     /// Pieces that failed the metalink's hashes are marked missing in its state, to be fetched
     /// again ([`REFETCH`]).
     Refetch,
+    /// What other mirrors wrote is marked missing, to be fetched again from the one the download
+    /// went by ([`FROM_PRIMARY`]).
+    FromPrimary,
 }
 
 /// The last checks of the finished `.part` at `part`, once the engine checked it against the
@@ -309,11 +322,15 @@ pub(crate) async fn finish(
     site: &Mutex<Site>,
     writer: Option<DiskWriter>,
 ) -> Result<String, Unfinished> {
+    let copies = {
+        let mut site = site.lock();
+        if site.primary_only { Vec::new() } else { std::mem::take(&mut site.copies) }
+    };
     let (hash, whole_failed) = match verified {
         Ok(hash) => (Some(hash), None),
         Err(VerifyError::Io(e)) => return Err(Unfinished::Io(e)),
         Err(VerifyError::Mismatch(e)) if options.metalink_pieces.is_some() => (None, Some(e)),
-        Err(VerifyError::Mismatch(e)) => return Err(Unfinished::Wrong(e)),
+        Err(VerifyError::Mismatch(e)) => return Err(from_primary(part, copies, e).await),
     };
     let search = site.lock().search.take();
     let published = match search {
@@ -342,12 +359,8 @@ pub(crate) async fn finish(
     let hash = hash.unwrap_or_default();
     if let (Some((algo, expected)), Some(actual)) = (published.as_deref().and_then(|c| c.split_once(':')), &pass.published) {
         if expected != actual {
-            return Err(Unfinished::Wrong(format!(
-                "Checksum verification failed against the site's published {}: expected {}, got {}",
-                algo_name(algo),
-                expected,
-                actual
-            )));
+            let e = format!("Checksum verification failed against the site's published {}: expected {}, got {}", algo_name(algo), expected, actual);
+            return Err(from_primary(part, copies, e).await);
         }
         site.lock().note = Some(format!("the site's {}", algo_name(algo)));
     }
@@ -364,27 +377,57 @@ pub(crate) async fn finish(
 /// Marks `bad` missing in the state of the `size`-byte `.part` at `part`, all else complete, for
 /// the engine to fetch them again. Without a state to resume from, the file is wrong. Blocking.
 fn refetch(part: &Path, size: u64, bad: &[ByteRange]) -> Unfinished {
-    let wrong = || {
-        let bytes: u64 = bad.iter().map(ByteRange::len).sum();
-        Unfinished::Wrong(format!("{} piece(s), {} bytes, do not match the metalink's hashes", bad.len(), bytes))
-    };
-    let state_path = DownloadState::state_file_path(part);
-    let Some(mut state) = DownloadState::load_from_path(&state_path).ok().flatten().filter(|s| s.file_size == size) else {
-        return wrong();
-    };
-    // The rest is on disk before the state says so.
-    if let Err(e) = OpenOptions::new().write(true).open(part).and_then(|f| f.sync_data()) {
-        return Unfinished::Io(format!("Failed to flush {}: {}", part.display(), e));
-    }
-    state.completed_ranges = compute_gaps(size, bad);
-    // Mirrors serve the file under validators of their own: the pieces' hashes hold it now.
-    (state.etag, state.last_modified) = (None, None);
-    match state.save_atomic(&state_path) {
-        Ok(()) => {
+    match mark_missing(part, size, bad) {
+        Ok(true) => {
             tracing::warn!("{} piece(s) of {} do not match the metalink's hashes; fetching them again", bad.len(), part.display());
             Unfinished::Refetch
         }
-        Err(e) => Unfinished::Io(format!("Failed to save download state: {}", e)),
+        Ok(false) => {
+            let bytes: u64 = bad.iter().map(ByteRange::len).sum();
+            Unfinished::Wrong(format!("{} piece(s), {} bytes, do not match the metalink's hashes", bad.len(), bytes))
+        }
+        Err(e) => Unfinished::Io(e),
+    }
+}
+
+/// Marks `bad` missing in the state of the `size`-byte `.part` at `part`, all else complete;
+/// false without a state of that size. Blocking.
+fn mark_missing(part: &Path, size: u64, bad: &[ByteRange]) -> Result<bool, String> {
+    let state_path = DownloadState::state_file_path(part);
+    let Some(mut state) = DownloadState::load_from_path(&state_path).ok().flatten().filter(|s| s.file_size == size) else {
+        return Ok(false);
+    };
+    // The rest is on disk before the state says so.
+    OpenOptions::new().write(true).open(part).and_then(|f| f.sync_data()).map_err(|e| format!("Failed to flush {}: {}", part.display(), e))?;
+    state.completed_ranges = compute_gaps(size, bad);
+    // Mirrors serve the file under validators of their own: the hashes hold it now.
+    (state.etag, state.last_modified) = (None, None);
+    state.save_atomic(&state_path).map_err(|e| format!("Failed to save download state: {}", e))?;
+    Ok(true)
+}
+
+/// A file that failed its whole-file hash (`error`) with `copies`, ranges other mirrors than the
+/// one the download went by wrote: those are marked missing, to be fetched again from that one
+/// ([`Unfinished::FromPrimary`]), as a mirror may serve another version under the same size. With
+/// none, or no state to mark them in, the file is wrong.
+async fn from_primary(part: &Path, copies: Vec<ByteRange>, error: String) -> Unfinished {
+    if copies.is_empty() {
+        return Unfinished::Wrong(error);
+    }
+    let part = part.to_path_buf();
+    let marked = tokio::task::spawn_blocking(move || {
+        let size = std::fs::metadata(&part).map_err(|e| format!("Failed to read {}: {}", part.display(), e))?.len();
+        let marked = mark_missing(&part, size, &copies)?;
+        if marked {
+            let bytes: u64 = copies.iter().map(ByteRange::len).sum();
+            tracing::warn!("{} does not match its checksum: fetching the {} bytes other mirrors sent again from the first", part.display(), bytes);
+        }
+        Ok::<bool, String>(marked)
+    });
+    match marked.await {
+        Ok(Ok(true)) => Unfinished::FromPrimary,
+        Ok(Err(e)) => Unfinished::Io(e),
+        _ => Unfinished::Wrong(error),
     }
 }
 
