@@ -192,15 +192,16 @@ async fn peer(socket: TcpStream, seeds: Arc<Seeds>) -> std::io::Result<()> {
     reply.extend_from_slice(&[0, 0, 0, 0, 0, if extended { 0x10 } else { 0 }, 0, 0]);
     reply.extend_from_slice(&seeds.info_hash);
     reply.extend_from_slice(&seeds.peer_id);
-    reply.extend_from_slice(&(1 + bitfield.len() as u32).to_be_bytes());
-    reply.push(5);
-    reply.extend_from_slice(&bitfield);
+    // Before the bitfield, as librqbit sends its own: it reserves pieces as soon as it has that.
     if extended {
         let handshake = format!("d1:mde4:reqqi{}ee", seeds.reqq);
         reply.extend_from_slice(&(2 + handshake.len() as u32).to_be_bytes());
         reply.extend_from_slice(&[20, 0]);
         reply.extend_from_slice(handshake.as_bytes());
     }
+    reply.extend_from_slice(&(1 + bitfield.len() as u32).to_be_bytes());
+    reply.push(5);
+    reply.extend_from_slice(&bitfield);
     // Unchoked from the start: this peer serves whoever asks.
     reply.extend_from_slice(&1u32.to_be_bytes());
     reply.push(1);
@@ -459,9 +460,9 @@ mod tests {
         let mut hello = [0u8; 68 + 6 + 6 + 17 + 5];
         socket.read_exact(&mut hello).await.unwrap();
         assert_eq!(hello[25], 0x10);
-        assert_eq!(hello[74..80], [0, 0, 0, 19, 20, 0]);
-        assert_eq!(hello[80..97], said[..]);
-        assert_eq!(hello[97..], [0, 0, 0, 1, 1]);
+        assert_eq!(hello[68..74], [0, 0, 0, 19, 20, 0]);
+        assert_eq!(hello[74..91], said[..]);
+        assert_eq!(hello[91..], [0, 0, 0, 2, 5, 0b1011_0000, 0, 0, 0, 1, 1]);
         socket.write_all(&request(4, 0, 16384)).await.unwrap();
         let ended = tokio::time::timeout(Duration::from_secs(10), socket.read_to_end(&mut rest)).await.unwrap();
         assert!(ended.is_err() || rest.is_empty());
