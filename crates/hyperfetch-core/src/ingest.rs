@@ -104,6 +104,8 @@ pub struct ListOptions {
     pub cookies: media::BrowserCookieSource,
     /// Proxy for listings made outside the HTTP client [`ingest`] is given (yt-dlp's).
     pub proxy: Option<String>,
+    /// The downloads go through a pool of proxies: as with `proxy`, no swarm beside HTTP.
+    pub proxy_pool: bool,
     /// Where a listing sends what the user should know besides its downloads (items left out, a
     /// folder listed in part), for a front end to show; None logs it as a warning.
     pub notes: Option<std::sync::mpsc::Sender<ListNote>>,
@@ -147,7 +149,7 @@ impl ListOptions {
     /// `archives`): with the swarm allowed, and not through a proxy, where web seeds are no peers
     /// (see `crate::p2p`) and HTTP is as fast.
     pub(crate) fn swarm_with_http(&self) -> bool {
-        self.p2p && self.proxy.is_none()
+        self.p2p && self.proxy.is_none() && !self.proxy_pool
     }
 
     /// A GET of `url` with [`ListOptions::auth`]'s header when `url` is on its link's host, and
@@ -186,6 +188,7 @@ impl Default for ListOptions {
             only_new: true,
             cookies: media::BrowserCookieSource::None,
             proxy: None,
+            proxy_pool: false,
             notes: None,
             p2p: false,
             debrid_key: None,
