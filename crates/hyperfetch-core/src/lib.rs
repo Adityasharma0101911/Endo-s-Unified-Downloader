@@ -52,6 +52,7 @@ pub mod decrypt;
 pub mod concat_server;
 pub mod muxer;
 pub mod doctor;
+pub mod nntp;
 #[cfg(test)]
 pub(crate) mod netsim;
 #[cfg(test)]

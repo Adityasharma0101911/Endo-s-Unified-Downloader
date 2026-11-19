@@ -419,6 +419,10 @@ pub struct DownloadOptions {
     /// The build of a container image to download (`os/arch[/variant]`, see `crate::oci`); None
     /// for this machine's Linux build.
     pub platform: Option<String>,
+    /// The Usenet servers an NZB's files download from (see `crate::nntp`). Never saved: the
+    /// front ends fill them in each time the download starts.
+    #[serde(skip)]
+    pub nntp: Vec<crate::nntp::Server>,
 }
 
 impl Default for DownloadOptions {
@@ -504,6 +508,7 @@ impl Default for DownloadOptions {
             s3: None,
             ssh_key: None,
             platform: None,
+            nntp: Vec::new(),
         }
     }
 }
@@ -867,6 +872,11 @@ impl DownloadEngine {
         // A Send share, decrypted as it arrives (see `crate::send`).
         if let Some(share) = self.urls.first().filter(|u| crate::send::handles(u)) {
             let done = crate::send::run(share, &client, &self.options, &self.save_dir(), snapshot_tx, self.cancel_token.clone()).await;
+            return self.unless_rerun(done);
+        }
+        // A file of an NZB, from the user's Usenet servers (see `crate::nntp`).
+        if let Some(link) = self.urls.first().filter(|u| crate::nntp::handles(u)) {
+            let done = crate::nntp::run(link, &self.options, self.limiter(), &self.save_dir(), snapshot_tx, self.cancel_token.clone()).await;
             return self.unless_rerun(done);
         }
 

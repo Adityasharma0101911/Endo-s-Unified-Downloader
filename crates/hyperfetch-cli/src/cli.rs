@@ -244,6 +244,21 @@ pub struct Args {
     #[arg(long = "ssh-key-passphrase", value_name = "PASS", env = "ENDO_SSH_KEY_PASSPHRASE", hide_env_values = true, requires = "ssh_key")]
     pub ssh_key_passphrase: Option<String>,
 
+    /// A Usenet server of your provider's account that .nzb files download from:
+    /// nntps://news.example.com[:563][?connections=8] (nntp:// without TLS; the provider's
+    /// connection limit is yours to set, 8 by default). Repeat it for backup servers, asked in
+    /// order for the articles those before them lack
+    #[arg(long = "nntp-server", value_name = "URL", env = "ENDO_NNTP_SERVERS", hide_env_values = true, value_delimiter = ',', value_parser = parse_nntp_server)]
+    pub nntp_servers: Vec<String>,
+
+    /// User name of the --nntp-server links that name none (USER@ in the link)
+    #[arg(long = "nntp-user", value_name = "USER", env = "ENDO_NNTP_USER")]
+    pub nntp_user: Option<String>,
+
+    /// Password of the --nntp-server links that name none
+    #[arg(long = "nntp-password", value_name = "PASS", env = "ENDO_NNTP_PASSWORD", hide_env_values = true)]
+    pub nntp_password: Option<String>,
+
     /// Local IP address to connect from; repeat it to spread connections over several networks
     #[arg(long = "bind-address", value_name = "IP")]
     pub bind_address: Vec<std::net::IpAddr>,
@@ -658,6 +673,19 @@ impl Args {
     pub fn ssh_key(&self) -> Option<hyperfetch_core::sftp::SshKey> {
         Some(hyperfetch_core::sftp::SshKey { path: self.ssh_key.clone()?, passphrase: self.ssh_key_passphrase.clone() })
     }
+
+    /// The Usenet servers of --nntp-server, asked in their order, with --nntp-user and
+    /// --nntp-password where their links name none.
+    pub fn nntp_servers(&self) -> Vec<hyperfetch_core::nntp::Server> {
+        let servers = self.nntp_servers.iter().enumerate().filter_map(|(n, link)| hyperfetch_core::nntp::Server::from_link(link, n as u32).ok());
+        servers
+            .map(|server| hyperfetch_core::nntp::Server {
+                user: Some(server.user.clone()).filter(|u| !u.is_empty()).or_else(|| self.nntp_user.clone()).unwrap_or_default(),
+                password: Some(server.password.clone()).filter(|p| !p.is_empty()).or_else(|| self.nntp_password.clone()).unwrap_or_default(),
+                ..server
+            })
+            .collect()
+    }
 }
 
 const AUTHORIZATION: &str = "Authorization";
@@ -810,6 +838,10 @@ fn parse_endpoint(s: &str) -> Result<url::Url, String> {
         Ok(url) if matches!(url.scheme(), "http" | "https") && url.host_str().is_some() => Ok(url),
         _ => Err(format!("'{}' is not an http(s) address", s)),
     }
+}
+
+fn parse_nntp_server(s: &str) -> Result<String, String> {
+    hyperfetch_core::nntp::Server::from_link(s, 0).map(|_| s.trim().to_string())
 }
 
 fn parse_zsync(s: &str) -> Result<String, String> {
@@ -1412,6 +1444,13 @@ mod tests {
         let key = parse(&["--ssh-key", "id_ed25519", "--ssh-key-passphrase", "pp", "u"]).unwrap().ssh_key().unwrap();
         assert_eq!((key.path, key.passphrase.as_deref()), (PathBuf::from("id_ed25519"), Some("pp")));
         assert!(parse(&["--ssh-key-passphrase", "pp", "u"]).is_err(), "a passphrase needs its key");
+        let args = parse(&["--nntp-server", "nntps://news.example.com", "--nntp-server", "nntp://me:pw@backup.example?connections=2", "--nntp-user", "u1", "--nntp-password", "p1", "u"]).unwrap();
+        let servers = args.nntp_servers();
+        assert_eq!(servers.iter().map(|s| (s.host.as_str(), s.user.as_str(), s.password.as_str(), s.tls, s.priority, s.connections)).collect::<Vec<_>>(), [
+            ("news.example.com", "u1", "p1", true, 0, 8),
+            ("backup.example", "me", "pw", false, 1, 2)
+        ]);
+        assert!(parse(&["--nntp-server", "https://news.example.com", "u"]).is_err());
         assert_eq!(parse(&["--platform", "Linux/ARM/v7", "u"]).unwrap().platform.as_deref(), Some("linux/arm/v7"));
         assert!(parse(&["--platform", "arm64", "u"]).is_err() && parse(&["--platform", "linux//x", "u"]).is_err());
         assert!(parse(&["--live-from", "2026-10-10 21:00:00+08:00", "u"]).is_ok());
