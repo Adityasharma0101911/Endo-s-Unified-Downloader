@@ -39,11 +39,13 @@ pub struct MirrorOptions {
     /// Most pages saved; most bytes saved in all.
     pub max_pages: usize,
     pub max_bytes: u64,
+    /// A WARC file each answer is also written to, as received (see `crate::warc`).
+    pub warc: Option<PathBuf>,
 }
 
 impl Default for MirrorOptions {
     fn default() -> Self {
-        Self { depth: 2, requisites: false, delay: Duration::from_secs(1), max_pages: 500, max_bytes: 1 << 30 }
+        Self { depth: 2, requisites: false, delay: Duration::from_secs(1), max_pages: 500, max_bytes: 1 << 30, warc: None }
     }
 }
 
@@ -84,9 +86,30 @@ struct Manifest {
 
 /// The rules robots.txt gives this app: (allow, path pattern) pairs, and its Crawl-delay.
 #[derive(Debug, Default)]
-struct Robots {
+pub(crate) struct Robots {
     rules: Vec<(bool, String)>,
-    delay: Option<Duration>,
+    pub(crate) delay: Option<Duration>,
+}
+
+/// The robots.txt rules of `site`'s host (none when it has none). `Err` when the host cannot be
+/// reached, or fails to answer for it.
+pub(crate) async fn robots_of(http: &reqwest::Client, site: &Url, delay: Duration) -> Result<Robots, String> {
+    let robots_url = site.join("/robots.txt").map_err(|e| e.to_string())?;
+    match polite::get(http, &robots_url, delay).await {
+        Ok(answer) if answer.status().is_success() => Ok(Robots::parse(&answer.text().await.unwrap_or_default(), crate::resolver::APP_USER_AGENT)),
+        // No robots.txt: nothing is forbidden.
+        Ok(answer) if answer.status().is_client_error() => Ok(Robots::default()),
+        Ok(answer) => Err(format!("{} answered HTTP {} for its robots.txt: try again later", site.host_str().unwrap_or_default(), answer.status().as_u16())),
+        Err(e) => Err(e),
+    }
+}
+
+/// `url`'s path with its query, as robots.txt rules match it.
+pub(crate) fn robots_path(url: &Url) -> String {
+    match url.query() {
+        Some(q) => format!("{}?{q}", url.path()),
+        None => url.path().to_string(),
+    }
 }
 
 impl Robots {
@@ -133,7 +156,7 @@ impl Robots {
 
     /// Whether `path` (with its query) may be fetched: the longest rule that matches it decides,
     /// Allow on a tie; none allows.
-    fn allows(&self, path: &str) -> bool {
+    pub(crate) fn allows(&self, path: &str) -> bool {
         let mut best: Option<(usize, bool)> = None;
         for (allow, pattern) in &self.rules {
             if robots_match(pattern, path) {
@@ -208,10 +231,10 @@ const LINK_PART: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS.add(b
 
 /// A link of a page: where its value is in the page's text, the URL it names, and whether it is a
 /// page of its own (else something the page uses).
-struct Link {
-    span: (usize, usize),
-    url: Url,
-    page: bool,
+pub(crate) struct Link {
+    pub(crate) span: (usize, usize),
+    pub(crate) url: Url,
+    pub(crate) page: bool,
 }
 
 /// Tags whose attribute names a page, and those whose attribute names something a page uses.
@@ -219,7 +242,7 @@ const PAGE_LINKS: &[(&str, &str)] = &[("a", "href"), ("area", "href"), ("iframe"
 const USED_LINKS: &[(&str, &str)] = &[("img", "src"), ("script", "src"), ("source", "src"), ("audio", "src"), ("video", "src"), ("video", "poster"), ("embed", "src"), ("input", "src"), ("track", "src")];
 
 /// Where the value of `attr` is in the start tag `tag` (its source, starting at `<`).
-fn attr_span(tag: &str, attr: &str) -> Option<(usize, usize)> {
+pub(crate) fn attr_span(tag: &str, attr: &str) -> Option<(usize, usize)> {
     let lower = tag.to_ascii_lowercase();
     let needle = format!("{attr}=");
     let mut from = 0;
@@ -238,14 +261,20 @@ fn attr_span(tag: &str, attr: &str) -> Option<(usize, usize)> {
     None
 }
 
-/// The links of the HTML `html`, resolved against `base` (or the page's `<base href>`).
-fn html_links(html: &str, base: &Url) -> Vec<Link> {
-    let lower = html.to_ascii_lowercase();
-    let base = crate::resolver::start_tags(html, &lower, "base")
+/// What the links of the HTML `html` (`lower` in lower case), fetched from `base`, are relative to:
+/// its `<base href>`, else `base`.
+pub(crate) fn page_base(html: &str, lower: &str, base: &Url) -> Url {
+    crate::resolver::start_tags(html, lower, "base")
         .first()
         .and_then(|tag| crate::resolver::attr_value(tag, "href"))
         .and_then(|href| base.join(&href).ok())
-        .unwrap_or_else(|| base.clone());
+        .unwrap_or_else(|| base.clone())
+}
+
+/// The links of the HTML `html`, resolved against `base` (or the page's `<base href>`).
+pub(crate) fn html_links(html: &str, base: &Url) -> Vec<Link> {
+    let lower = html.to_ascii_lowercase();
+    let base = page_base(html, &lower, base);
     let mut links = Vec::new();
     let mut add = |tag: &str, attr: &str, page: bool| {
         let offset = tag.as_ptr() as usize - html.as_ptr() as usize;
@@ -279,7 +308,7 @@ fn html_links(html: &str, base: &Url) -> Vec<Link> {
 }
 
 /// The links of the style sheet `css` (`url(...)` and `@import "..."`), resolved against `base`.
-fn css_links(css: &str, base: &Url) -> Vec<Link> {
+pub(crate) fn css_links(css: &str, base: &Url) -> Vec<Link> {
     let mut links = Vec::new();
     let mut push = |start: usize, end: usize| {
         let value = css[start..end].trim();
@@ -325,7 +354,7 @@ fn css_links(css: &str, base: &Url) -> Vec<Link> {
 
 /// `text` with each link's value replaced by what `to` gives for it (none: kept), HTML-escaped
 /// when `html`.
-fn rewrite(text: &str, links: &[Link], html: bool, mut to: impl FnMut(&Link) -> Option<String>) -> String {
+pub(crate) fn rewrite(text: &str, links: &[Link], html: bool, mut to: impl FnMut(&Link) -> Option<String>) -> String {
     let mut out = String::with_capacity(text.len());
     let mut at = 0;
     for link in links {
@@ -359,6 +388,7 @@ struct Crawl<'a> {
     /// The manifest's entries by URL (the URL a request was redirected to included).
     known: HashMap<String, usize>,
     done: Mirrored,
+    warc: Option<crate::warc::Writer>,
 }
 
 impl Crawl<'_> {
@@ -435,6 +465,7 @@ impl Crawl<'_> {
             tokio::fs::create_dir_all(parent).await.map_err(|e| format!("Cannot create {}: {e}", parent.display()))?;
         }
         let part = target.with_extension(format!("{}part", target.extension().map_or(String::new(), |e| format!("{}.", e.to_string_lossy()))));
+        let (head, date) = (crate::warc::head_of(&answer), std::time::SystemTime::now());
         let (mut written, mut hash, mut kept) = (0u64, Sha256::new(), Vec::new());
         let keep = (is_page && page) || (is_css && self.options.requisites);
         let mut out = tokio::fs::File::create(&part).await.map_err(|e| format!("Cannot write {}: {e}", part.display()))?;
@@ -471,6 +502,10 @@ impl Crawl<'_> {
                 return Ok(None);
             }
         }
+        if let Some(warc) = &mut self.warc {
+            let mut body = std::fs::File::open(&target).map_err(|e| format!("Cannot read {}: {e}", target.display()))?;
+            warc.response(&landed, date, &head, &mut body)?;
+        }
         self.done.bytes += written;
         let counted_page = is_page && page;
         if counted_page {
@@ -503,11 +538,7 @@ impl Crawl<'_> {
                 self.done.stopped = Some(format!("the page cap ({}) was reached", self.options.max_pages));
                 break;
             }
-            let path = match url.query() {
-                Some(q) => format!("{}?{q}", url.path()),
-                None => url.path().to_string(),
-            };
-            if !self.robots.allows(&path) {
+            if !self.robots.allows(&robots_path(&url)) {
                 self.done.disallowed += 1;
                 continue;
             }
@@ -584,19 +615,8 @@ pub async fn mirror(http: &reqwest::Client, start: &Url, dir: &Path, options: &M
     let mut start = start.clone();
     start.set_fragment(None);
     std::fs::create_dir_all(dir).map_err(|e| format!("Cannot create {}: {e}", dir.display()))?;
-    let robots_url = start.join("/robots.txt").map_err(|e| e.to_string())?;
-    let robots = match polite::get(http, &robots_url, options.delay).await {
-        Ok(answer) if answer.status().is_success() => Robots::parse(&answer.text().await.unwrap_or_default(), crate::resolver::APP_USER_AGENT),
-        // No robots.txt: nothing is forbidden.
-        Ok(answer) if answer.status().is_client_error() => Robots::default(),
-        Ok(answer) => return Err(format!("{} answered HTTP {} for its robots.txt: try again later", start.host_str().unwrap_or_default(), answer.status().as_u16())),
-        Err(e) => return Err(e),
-    };
-    let path = match start.query() {
-        Some(q) => format!("{}?{q}", start.path()),
-        None => start.path().to_string(),
-    };
-    if !robots.allows(&path) {
+    let robots = robots_of(http, &start, options.delay).await?;
+    if !robots.allows(&robots_path(&start)) {
         return Err(format!("the site's robots.txt asks robots not to fetch {start}"));
     }
     let gap = robots.delay.map_or(options.delay, |asked| asked.max(options.delay));
@@ -605,8 +625,12 @@ pub async fn mirror(http: &reqwest::Client, start: &Url, dir: &Path, options: &M
     let manifest = manifest.unwrap_or_else(|| Manifest { start: start.to_string(), files: Vec::new() });
     let known = manifest.files.iter().enumerate().map(|(at, e)| (e.url.clone(), at)).collect();
     let scope = start.path()[..start.path().rfind('/').map_or(1, |at| at + 1)].to_string();
-    let mut crawl = Crawl { http, start, scope, dir, options, robots, gap, manifest, known, done: Mirrored::default() };
+    let warc = options.warc.as_deref().map(crate::warc::Writer::open).transpose()?;
+    let mut crawl = Crawl { http, start, scope, dir, options, robots, gap, manifest, known, done: Mirrored::default(), warc };
     crawl.run(tell).await?;
+    if let Some(warc) = crawl.warc.take() {
+        warc.finish()?;
+    }
     Ok(crawl.done)
 }
 
@@ -709,6 +733,26 @@ mod tests {
         assert_eq!(done.pages, 3, "{done:?}");
         assert_eq!(hits.lock()["/img/i.png"], 1);
         assert!(read("docs/a.html").contains(r#"href="deep/b.html""#));
+    }
+
+    /// With a WARC file, each answer goes into it as received (not as rewritten), indexed.
+    #[tokio::test]
+    async fn a_mirror_writes_its_answers_into_a_warc() {
+        use std::io::Read;
+        let (addr, _) = serve(site).await;
+        let dir = tempfile::tempdir().unwrap();
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let warc = dir.path().join("site.warc.gz");
+        let options = MirrorOptions { depth: 1, requisites: true, delay: Duration::ZERO, warc: Some(warc.clone()), ..MirrorOptions::default() };
+        let done = mirror(&http, &Url::parse(&format!("http://{addr}/docs/")).unwrap(), &dir.path().join("out"), &options, |_| {}).await.unwrap();
+        let mut all = Vec::new();
+        flate2::read::MultiGzDecoder::new(std::fs::File::open(&warc).unwrap()).read_to_end(&mut all).unwrap();
+        let records = crate::warc::tests::records(&all);
+        let responses: Vec<_> = records.iter().filter(|r| r.field("WARC-Type") == Some("response")).collect();
+        assert_eq!(responses.len(), done.pages + done.files);
+        let css = responses.iter().find(|r| r.field("WARC-Target-URI").is_some_and(|u| u.ends_with("/docs/s.css"))).unwrap();
+        assert!(css.block.starts_with(b"HTTP/1.1 200 OK\r\n") && css.block.ends_with(b"\r\n\r\nbody { background: url(/img/bg.png) }"));
+        assert_eq!(std::fs::read_to_string(crate::warc::index_path(&warc)).unwrap().lines().count(), responses.len());
     }
 
     #[tokio::test]
