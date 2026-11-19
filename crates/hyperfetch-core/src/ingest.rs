@@ -570,7 +570,7 @@ pub async fn ingest(tokens: &[impl AsRef<str>], http: &reqwest::Client, options:
                 Source::Local(path) => {
                     let file = std::path::absolute(&path).ok().and_then(|p| Url::from_file_path(p).ok());
                     let bytes = read_local(&path).await?;
-                    // An NZB's files read it again from where it is.
+                    // An NZB's files read the copy the app keeps of it (see `nntp::keep`).
                     if let (Descriptor::Nzb, Some(file)) = (kind, &file) {
                         return crate::nntp::tasks(&bytes, file);
                     }
@@ -809,8 +809,8 @@ async fn remote_tasks(http: &reqwest::Client, typed: Url, kind: Descriptor, opti
     }
 }
 
-/// The tasks the document `bytes` lists (see [`torrent_tasks`] for `remote` and `swarm`; an NZB
-/// is read again from `remote` by its files' downloads).
+/// The tasks the document `bytes` lists (see [`torrent_tasks`] for `remote` and `swarm`; an NZB's
+/// files read the copy the app keeps of it).
 fn document_tasks(kind: Descriptor, bytes: &[u8], remote: Option<&Url>, swarm: Option<&Url>) -> Result<Vec<Task>, String> {
     match kind {
         Descriptor::Metalink => metalink_tasks(bytes),
@@ -824,7 +824,7 @@ fn parses(kind: Descriptor, bytes: &[u8]) -> bool {
     match kind {
         Descriptor::Metalink => decode_text(bytes).and_then(|text| metalink::parse_metalink(&text)).is_ok(),
         Descriptor::Torrent => torrent::parse_torrent_bytes(bytes).is_ok(),
-        Descriptor::Nzb => crate::nntp::tasks(bytes, &Url::parse("file:///x.nzb").expect("a valid URL")).is_ok(),
+        Descriptor::Nzb => crate::nntp::is_nzb(bytes),
     }
 }
 
