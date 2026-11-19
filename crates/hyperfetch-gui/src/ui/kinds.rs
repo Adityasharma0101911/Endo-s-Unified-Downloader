@@ -3,7 +3,7 @@
 //! lists every kind with an example to try and what it needs (your account, a helper tool). A new
 //! source is a new row of [`KINDS`], not a new screen.
 
-use hyperfetch_core::{archives, cloud, debrid, feeds, folders, gallery, iasearch, itch, kaggle, mega, oci, osm, packages, repos, shares, torrent, wayback};
+use hyperfetch_core::{archives, cloud, debrid, feeds, folders, gallery, iasearch, itch, kaggle, mega, mods, oci, osm, packages, repos, shares, torrent, wayback};
 use url::Url;
 
 use super::*;
@@ -183,6 +183,27 @@ pub const KINDS: &[Kind] = &[
         choice: Choice::Files,
         matches: |_, url| web(url).is_some_and(feeds::lists),
     },
+    // Listed in Sources only: a live stream's link reads as a video, subtitles come after one.
+    Kind {
+        name: "A live stream",
+        group: "Video & audio",
+        glyph: icon::RECORD,
+        about: "Recorded until it ends or reaches the time limit in Settings; streamlink records the ones yt-dlp cannot follow, when one of its plugins takes the link.",
+        example: "",
+        needs: Needs::Tool("yt-dlp"),
+        choice: Choice::None,
+        matches: |_, _| false,
+    },
+    Kind {
+        name: "Subtitles",
+        group: "Video & audio",
+        glyph: icon::SUBTITLES,
+        about: "A finished video's subtitles from OpenSubtitles, found by its hash or its title, in the languages Settings name: the Library's Find subtitles.",
+        example: "",
+        needs: Needs::Account("OpenSubtitles"),
+        choice: Choice::None,
+        matches: |_, _| false,
+    },
     // Before container images: an Ollama link reads as an image reference too.
     Kind {
         name: "A local AI model",
@@ -198,7 +219,7 @@ pub const KINDS: &[Kind] = &[
         name: "A container image",
         group: "Code, packages & models",
         glyph: icon::CUBE,
-        about: "Its layers from Docker Hub, GitHub or Quay, each checked against its digest.",
+        about: "Its layers from Docker Hub, GitHub, Quay or any registry, each checked against its digest; a Helm chart (oci://) as its .tgz with its provenance.",
         example: "docker.io/library/alpine:latest",
         needs: Needs::Nothing,
         choice: Choice::None,
@@ -218,7 +239,7 @@ pub const KINDS: &[Kind] = &[
         name: "A package",
         group: "Code, packages & models",
         glyph: icon::PACKAGE,
-        about: "From PyPI, npm, crates.io, Maven Central, NuGet, Go, Homebrew, conda, RubyGems, Packagist or F-Droid, checked against the hash its registry publishes.",
+        about: "A package's page on PyPI, npm, crates.io, Maven Central, NuGet, pkg.go.dev, Homebrew, Flathub, anaconda.org, RubyGems, Packagist or F-Droid, with the checksums its registry publishes.",
         example: "https://f-droid.org/packages/org.fdroid.fdroid/",
         needs: Needs::Nothing,
         choice: Choice::None,
@@ -239,7 +260,7 @@ pub const KINDS: &[Kind] = &[
         name: "A paper",
         group: "Science, archives & maps",
         glyph: icon::BOOK_OPEN,
-        about: "The open-access PDF of a DOI, arXiv, PubMed Central or bioRxiv paper; no paywall is bypassed.",
+        about: "The legal open copy of a DOI, arXiv, PubMed Central or bioRxiv paper (through Unpaywall with your email), else its page; no paywall is bypassed.",
         example: "https://arxiv.org/abs/1706.03762",
         needs: Needs::Nothing,
         choice: Choice::None,
@@ -293,7 +314,7 @@ pub const KINDS: &[Kind] = &[
         name: "A cloud drive",
         group: "Cloud & accounts",
         glyph: icon::CLOUD,
-        about: "A folder of one of your own cloud remotes, downloaded with the app's own connections.",
+        about: "A folder of one of your own rclone remotes (rclone://), its files downloaded with the app's own connections.",
         example: "",
         needs: Needs::Tool("rclone"),
         choice: Choice::Files,
@@ -333,11 +354,12 @@ pub const KINDS: &[Kind] = &[
         name: "A game from your library",
         group: "Games & mods",
         glyph: icon::GAME_CONTROLLER,
-        about: "Games you own on Epic, GOG or Steam, through their open-source helper tools and your own sign-in.",
+        about: "Games you own on Epic, GOG or Steam by their epic://, gog:// or steam:// link (never a store page), through helper programs and your own sign-in.",
         example: "",
         needs: Needs::Account("Accounts"),
         choice: Choice::Files,
-        matches: |text, url| text.trim().starts_with("epic://") || host_is(url, &["store.steampowered.com", "gog.com"]),
+        // A web link never starts one: any page can send one through the extension.
+        matches: |_, url| url.is_some_and(|url| matches!(url.scheme(), "epic" | "gog" | "steam")),
     },
     Kind {
         name: "A game from itch.io",
@@ -353,11 +375,12 @@ pub const KINDS: &[Kind] = &[
         name: "A mod or modpack",
         group: "Games & mods",
         glyph: icon::PUZZLE_PIECE,
-        about: "Modrinth, CurseForge and Thunderstore files and whole packs, with their hashes; a Nexus Mods link says which page to open.",
+        about: "Modrinth and Thunderstore files and whole packs (a .mrpack with modpack: before it), CurseForge's with your API key, each with its hash; a Nexus Mods link says which page to open.",
         example: "https://modrinth.com/mod/sodium",
         needs: Needs::Nothing,
         choice: Choice::Files,
-        matches: |text, url| text.trim().starts_with("modpack:") || host_is(url, &["modrinth.com", "curseforge.com", "thunderstore.io", "nexusmods.com"]),
+        // The pages and links the app reads as mods: not a file's own link on their servers.
+        matches: |_, url| url.is_some_and(mods::lists),
     },
     Kind {
         name: "A ZIP archive",
@@ -465,6 +488,16 @@ mod tests {
         assert_eq!(name("ftp://ftp.example/pub/a.iso").unwrap().0, "A file on a server");
         assert_eq!(name("https://example.com/about/index.html").unwrap().0, "A web page");
         assert_eq!(name("https://example.com/report.php?id=3").unwrap().0, "A file");
+        // Account games start from their own links, never from a store page.
+        assert_eq!(name("steam://app/228980").unwrap().0, "A game from your library");
+        assert_eq!(name("gog://game/1207").unwrap().0, "A game from your library");
+        assert_ne!(name("https://store.steampowered.com/app/228980/").unwrap().0, "A game from your library");
+        // A plain .mrpack link is a file; with modpack: before it, a modpack.
+        assert_eq!(name("https://cdn.modrinth.com/data/x/pack.mrpack").unwrap().0, "A file");
+        assert_eq!(name("modpack:https://cdn.modrinth.com/data/x/pack.mrpack").unwrap().0, "A mod or modpack");
+        assert_eq!(name("nxm://skyrimspecialedition/mods/266/files/1000172397").unwrap().0, "A mod or modpack");
+        assert_eq!(name("https://www.nexusmods.com/skyrimspecialedition/mods/266").unwrap().0, "A mod or modpack");
+        assert_eq!(name("oci://ghcr.io/org/charts/app:1.0.0").unwrap().0, "A container image");
     }
 
     /// Only kinds whose links end in their file's name show it; every name listed is a kind.
