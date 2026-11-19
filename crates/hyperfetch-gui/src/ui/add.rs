@@ -760,7 +760,8 @@ fn advanced_options(app: &mut App, ui: &mut Ui) {
     ui.horizontal(|ui| {
         label(ui, "Older version");
         let hint = "Optional file: what the new one still holds is copied from it, when the server publishes block checksums";
-        ui.add(egui::TextEdit::singleline(&mut app.delta_input).hint_text(hint).desired_width(ui.available_width() - 90.0));
+        // Room for Browse… and the field's own margins.
+        ui.add(egui::TextEdit::singleline(&mut app.delta_input).hint_text(hint).desired_width(ui.available_width() - 112.0));
         if ui.add_enabled(!app.dialog_open, button("Browse…")).clicked() {
             app.pending_dialog = Some(Dialog::OlderVersion);
         }

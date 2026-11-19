@@ -389,11 +389,14 @@ fn progress_block(app: &App, ui: &mut Ui, item: &QueueItem) {
     ui.horizontal(|ui| {
         let percent = if total > 0 || item.status == QueueItemStatus::Completed { format!("{:.0}%", shown.floor()) } else { "…".to_string() };
         ui.label(RichText::new(percent).font(FontId::new(34.0, semibold())).color(p.strong));
-        ui.vertical(|ui| {
-            ui.add_space(6.0);
-            let text = util::progress_text(total, downloaded, eased_progress(ui, id, ratio) as f64, 1, view.map(|_| elapsed));
-            ui.label(RichText::new(text).color(p.muted));
-        });
+        // Of a size not known, what came so far; a known one's share is the number already.
+        if total == 0 {
+            ui.vertical(|ui| {
+                ui.add_space(6.0);
+                let text = util::progress_text(total, downloaded, eased_progress(ui, id, ratio) as f64, 1, view.map(|_| elapsed));
+                ui.label(RichText::new(text).color(p.muted));
+            });
+        }
     });
     let live = downloading && app.stalled_for(item.id).is_none() && !app.is_resolving(item.id);
     progress_bar(ui, id, Vec2::new(ui.available_width(), 10.0), ratio, fill, live, None);
@@ -405,18 +408,27 @@ fn progress_block(app: &App, ui: &mut Ui, item: &QueueItem) {
         _ => "--:--".to_string(),
     };
     let speed = eased_speed(ui, item);
-    ui.columns(4, |cols| {
-        let transferred = if total > 0 { format!("{} / {}", format_bytes(downloaded), format_bytes(total)) } else { format_bytes(downloaded) };
-        metric(&mut cols[0], "Transferred", transferred, None);
-        metric(&mut cols[1], "Speed", format!("{}/s", format_bytes(speed as u64)), Some(p.cyan));
-        metric(&mut cols[2], "Elapsed / left", format!("{} / {}", format_duration(elapsed), eta), None);
-        let (label, connections) = match (torrent, view) {
-            (Some(torrent), _) if downloading => ("Peers", torrent.peers.to_string()),
-            (_, Some(view)) if downloading => ("Connections", format!("{} active", view.active_workers)),
-            _ => ("Connections", "none".to_string()),
-        };
-        metric(&mut cols[3], label, connections, None);
-    });
+    let transferred = if total > 0 { format!("{} / {}", format_bytes(downloaded), format_bytes(total)) } else { format_bytes(downloaded) };
+    let (label, connections) = match (torrent, view) {
+        (Some(torrent), _) if downloading => ("Peers", torrent.peers.to_string()),
+        (_, Some(view)) if downloading => ("Connections", format!("{} active", view.active_workers)),
+        _ => ("Connections", "none".to_string()),
+    };
+    let cells = [
+        ("Transferred", transferred, None),
+        ("Speed", format!("{}/s", format_bytes(speed as u64)), Some(p.cyan)),
+        ("Elapsed / left", format!("{} / {}", format_duration(elapsed), eta), None),
+        (label, connections, None),
+    ];
+    // Four across, or two by two where four would cut their values short (the details beside).
+    let across = if ui.available_width() < 560.0 { 2 } else { 4 };
+    for row in cells.chunks(across) {
+        ui.columns(across, |cols| {
+            for (col, (label, value, color)) in cols.iter_mut().zip(row) {
+                metric(col, label, value.clone(), *color);
+            }
+        });
+    }
 
     if let Some(torrent) = torrent {
         ui.add_space(6.0);
@@ -1232,6 +1244,7 @@ fn segment_bar(ui: &mut Ui, id: egui::Id, item: &QueueItem, chunks: &[ChunkSnaps
     painter.rect_filled(rect, 3.0, p.border);
     let total = item.total_bytes as f32;
     let x = |bytes: u64| rect.left() + (bytes as f32 / total).clamp(0.0, 1.0) * rect.width();
+    let mut filled = Vec::with_capacity(chunks.len());
     for chunk in chunks {
         let reach = chunk.range_start + chunk.downloaded_bytes.min(chunk.total_bytes);
         let (left, right) = (x(chunk.range_start), x(reach));
@@ -1244,10 +1257,11 @@ fn segment_bar(ui: &mut Ui, id: egui::Id, item: &QueueItem, chunks: &[ChunkSnaps
             None => color,
         };
         painter.rect_filled(Rect::from_x_y_ranges(left..=right, rect.y_range()), 0.0, tone);
+        filled.push(left..=right);
     }
+    // The light crosses the pieces that came, not the gaps between them.
     if live && shown > 0.0 {
-        let done = Rect::from_min_size(rect.min, Vec2::new(rect.width() * shown, rect.height()));
-        anim::sheen(ui, done);
+        anim::sweep(ui, rect, |x| if filled.iter().any(|piece| piece.contains(&x)) { rect.height() / 2.0 } else { 0.0 });
     }
 }
 
@@ -1321,9 +1335,11 @@ fn queue_row(app: &App, ui: &mut Ui, line: &Line, action: &mut Option<(usize, Ro
         };
         painter.rect(lifted, 14.0, fade(fill), Stroke::new(1.0, fade(p.border.lerp_to_gamma(p.dim, 0.5 * hover))));
     }
-    let inner = egui::UiBuilder::new().max_rect(lifted.shrink2(Vec2::new(16.0, 11.0))).layout(Layout::top_down(Align::LEFT));
+    let inner = egui::UiBuilder::new().max_rect(lifted.shrink2(Vec2::new(16.0, 9.0))).layout(Layout::top_down(Align::LEFT));
     let mut ui = ui.new_child(inner);
     ui.multiply_opacity(opacity);
+    // The list spaces its cards; inside one the name, the bar and the status line sit close.
+    ui.spacing_mut().item_spacing.y = 4.0;
     if app.selected == Some(item.id) && line.ghost.is_none() {
         ctx.data_mut(|d| d.insert_temp(super::ring_target_id(), lifted.expand(3.0)));
     }
@@ -1369,7 +1385,7 @@ fn queue_row(app: &App, ui: &mut Ui, line: &Line, action: &mut Option<(usize, Ro
             }
         });
     });
-    ui.add_space(5.0);
+    ui.add_space(3.0);
     let bar = match item.status {
         QueueItemStatus::Completed => p.green,
         QueueItemStatus::Downloading => p.accent,
@@ -1380,7 +1396,7 @@ fn queue_row(app: &App, ui: &mut Ui, line: &Line, action: &mut Option<(usize, Ro
     let chunks: &[ChunkSnapshot] = app.jobs.get(&item.id).map_or(&[], |view| &view.chunks);
     let arriving = downloading && seen && !waiting && app.stalled_for(item.id).is_none();
     segment_bar(&mut ui, item_id, item, chunks, bar, arriving);
-    ui.add_space(5.0);
+    ui.add_space(2.0);
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
         let chip = anim::color(&ctx, item_id.with("status chip"), color, 0.35);
@@ -1458,6 +1474,8 @@ fn toolbar(app: &mut App, ui: &mut Ui) {
     let counts: Vec<usize> = (0..FILTERS.len()).map(|group| items.iter().filter(|item| in_group(group, &item.status)).count()).collect();
     let running = app.queue.active_count();
     let finish = (running > 0).then(|| finish_time(app.queue.remaining(app.settings.auto_run_queue))).flatten();
+    // On a narrow page the search and the buttons go on a line of their own, under the filters.
+    let narrow = ui.available_width() < 820.0;
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
         for (group, name) in FILTERS.into_iter().enumerate() {
@@ -1467,43 +1485,17 @@ fn toolbar(app: &mut App, ui: &mut Ui) {
             };
             ui.selectable_value(&mut app.queue_filter, group, label);
         }
-        ui.add_space(8.0);
-        ui.label(RichText::new(icon::MAGNIFYING_GLASS).size(15.0).color(p.muted));
-        let width = (ui.available_width() - 190.0).clamp(90.0, 200.0);
-        ui.add(egui::TextEdit::singleline(&mut app.queue_search).hint_text("Filter by name or link").desired_width(width));
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.menu_button(icon::DOTS_THREE, |ui| {
-                ui.set_min_width(230.0);
-                if ui.button(format!("{} Clear all", icon::BROOM)).on_hover_text("Remove every download that is not running (files are kept)").clicked() {
-                    app.clear_queue(false);
-                    ui.close_menu();
-                }
-                if ui.button(format!("{} Add many links…", icon::LIST_PLUS)).clicked() {
-                    ui.data_mut(|d| d.insert_temp(many_links_id(), true));
-                    ui.close_menu();
-                }
-                ui.separator();
-                ui.horizontal(|ui| {
-                    toggle(ui, &mut app.settings.auto_run_queue).on_hover_text("Start queued downloads by themselves");
-                    ui.label("Run the queue,");
-                    ui.add(egui::DragValue::new(&mut app.settings.max_concurrent).range(1..=8));
-                    ui.label("at once");
-                });
-                ui.separator();
-                // For this session only; it applies once.
-                ui.label(RichText::new("When the queue is done").small().color(p.muted));
-                for (choice, name) in WhenDone::CHOICES {
-                    if ui.selectable_label(app.when_done == choice, name).clicked() {
-                        app.when_done = choice;
-                        ui.close_menu();
-                    }
-                }
-            });
-            if ui.add(button("Clear completed")).clicked() {
-                app.clear_queue(true);
-            }
-        });
+        if !narrow {
+            ui.add_space(8.0);
+            search_and_tools(app, ui, 200.0);
+        }
     });
+    if narrow {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            search_and_tools(app, ui, 360.0);
+        });
+    }
     // Under the filters, small: when it will all be done, and what happens then.
     if finish.is_some() || app.when_done != WhenDone::Nothing {
         ui.horizontal(|ui| {
@@ -1518,6 +1510,46 @@ fn toolbar(app: &mut App, ui: &mut Ui) {
             }
         });
     }
+}
+
+/// The toolbar's search (at most `widest` wide), Clear completed and its menu, on the right.
+fn search_and_tools(app: &mut App, ui: &mut Ui, widest: f32) {
+    let p = palette(ui);
+    ui.label(RichText::new(icon::MAGNIFYING_GLASS).size(15.0).color(p.muted));
+    let width = (ui.available_width() - 190.0).clamp(90.0, widest);
+    ui.add(egui::TextEdit::singleline(&mut app.queue_search).hint_text("Filter by name or link").desired_width(width));
+    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        ui.menu_button(icon::DOTS_THREE, |ui| {
+            ui.set_min_width(230.0);
+            if ui.button(format!("{} Clear all", icon::BROOM)).on_hover_text("Remove every download that is not running (files are kept)").clicked() {
+                app.clear_queue(false);
+                ui.close_menu();
+            }
+            if ui.button(format!("{} Add many links…", icon::LIST_PLUS)).clicked() {
+                ui.data_mut(|d| d.insert_temp(many_links_id(), true));
+                ui.close_menu();
+            }
+            ui.separator();
+            ui.horizontal(|ui| {
+                toggle(ui, &mut app.settings.auto_run_queue).on_hover_text("Start queued downloads by themselves");
+                ui.label("Run the queue,");
+                ui.add(egui::DragValue::new(&mut app.settings.max_concurrent).range(1..=8));
+                ui.label("at once");
+            });
+            ui.separator();
+            // For this session only; it applies once.
+            ui.label(RichText::new("When the queue is done").small().color(p.muted));
+            for (choice, name) in WhenDone::CHOICES {
+                if ui.selectable_label(app.when_done == choice, name).clicked() {
+                    app.when_done = choice;
+                    ui.close_menu();
+                }
+            }
+        });
+        if ui.add(button("Clear completed")).clicked() {
+            app.clear_queue(true);
+        }
+    });
 }
 
 /// The box for many links at once: one download a line, mirrors of one file on one line.
