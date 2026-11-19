@@ -22,7 +22,7 @@ the job's summary and fails when `ENDO_BENCH_CHECK` finds a scenario under its f
 half what the CI runner measured, and each first-byte limit three times the measured plus 200 ms:
 a real regression (a scenario at half speed, a probe that waits a round trip more) fails the job,
 a slower runner does not. The web seed scenarios are held to a share of `web_seed_http` in the
-same run: 0.6 for the torrent alone, which the runner measures at 0.68 when it opens two
+same run: 0.6, as the runner measures them at 0.68 when the torrent opens two
 connections where it mostly opens three. A debug build's numbers are not comparable: the dependencies are not
 optimized there, and the thresholds are not checked.
 
