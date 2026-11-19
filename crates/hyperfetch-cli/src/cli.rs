@@ -576,6 +576,11 @@ pub struct Args {
     #[arg(long = "itch-key", value_name = "KEY", env = "ENDO_ITCH_KEY", hide_env_values = true)]
     pub itch_key: Option<String>,
 
+    /// Your kaggle.json (from the Settings page of your Kaggle account), for Kaggle competitions and
+    /// private datasets (default: ~/.kaggle/kaggle.json)
+    #[arg(long = "kaggle-json", value_name = "FILE", env = "ENDO_KAGGLE_JSON")]
+    pub kaggle_json: Option<String>,
+
     /// Show download history and exit
     #[arg(long = "history", conflicts_with_all = ["urls", "input_file", "verify"])]
     pub history: bool,
@@ -1462,6 +1467,7 @@ mod tests {
         assert_eq!((args.curseforge_key.as_deref(), args.nexus_key.as_deref()), (Some("c"), Some("n")));
         assert_eq!(args.unpaywall_email.as_deref(), Some("me@example.org"));
         assert_eq!(parse(&["--itch-key", "i", "u"]).unwrap().itch_key.as_deref(), Some("i"));
+        assert_eq!(parse(&["--kaggle-json", "k.json", "u"]).unwrap().kaggle_json.as_deref(), Some("k.json"));
         assert!(parse(&["--latest", "0", "u"]).is_err());
         assert!(parse(&["--subs", " ", "u"]).is_err());
         assert!(parse(&["--subs", "en, es", "u"]).is_err());

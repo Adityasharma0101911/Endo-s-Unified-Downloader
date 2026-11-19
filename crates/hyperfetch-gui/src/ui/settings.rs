@@ -680,6 +680,9 @@ fn host_settings(app: &mut App, ui: &mut Ui) {
                  which needs your own key (itch.io/user/settings/api-keys): games you own and free ones. Sent only to itch.io; \
                  saved in the settings only, never with the queue or in the history.";
     text_setting(ui, "itch.io API key", about, &mut app.settings.itch_key, "Optional", true);
+    let about = "Kaggle competitions and private datasets sign in with your kaggle.json (from the Settings page of your Kaggle \
+                 account); public datasets need none. Its key is sent only to Kaggle.";
+    text_setting(ui, "kaggle.json", about, &mut app.settings.kaggle_json, "Optional: ~/.kaggle/kaggle.json", false);
     setting(ui, "Browser cookies", "Sign in to sites as in this browser, for videos and folders that need it.", app.settings.browser_cookies, |ui| {
         combo(ui, "browser_cookies_combo", &mut app.settings.browser_cookies, &BROWSERS);
     });

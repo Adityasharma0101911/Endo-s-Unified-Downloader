@@ -67,17 +67,22 @@ pub fn lists(url: &Url) -> bool {
 pub async fn list(http: &Client, url: &Url, options: &ListOptions) -> Result<Vec<Task>, String> {
     let itch = itch_of(url).ok_or_else(|| format!("{url} is not an itch.io page"))?;
     let key = options.keys.itch.as_deref().map(str::trim).filter(|k| !k.is_empty()).ok_or(NO_KEY)?;
-    // The download endpoint answers with a redirect to the file, which is the link wanted.
-    let mut client = Client::builder().redirect(reqwest::redirect::Policy::none()).user_agent(crate::resolver::APP_USER_AGENT);
-    if let Some(proxy) = &options.proxy {
-        client = client.proxy(reqwest::Proxy::all(proxy).map_err(|e| format!("invalid proxy: {e}"))?);
-    }
-    let api = Api { http: client.build().map_err(|e| format!("cannot create HTTP client: {e}"))?, base: API.to_string(), key: key.to_string() };
+    let api = Api { http: unredirected(options)?, base: API.to_string(), key: key.to_string() };
     let tasks = api.list(http, itch, options).await?;
     if tasks.is_empty() {
         return Err("itch.io lists no file of it the app can download".to_string());
     }
     Ok(tasks)
+}
+
+/// A client that does not follow redirects, through the user's proxy: a download endpoint's
+/// redirect is the file's link wanted, and the key stays with the API.
+pub(crate) fn unredirected(options: &ListOptions) -> Result<Client, String> {
+    let mut client = Client::builder().redirect(reqwest::redirect::Policy::none()).user_agent(crate::resolver::APP_USER_AGENT);
+    if let Some(proxy) = &options.proxy {
+        client = client.proxy(reqwest::Proxy::all(proxy).map_err(|e| format!("invalid proxy: {e}"))?);
+    }
+    client.build().map_err(|e| format!("cannot create HTTP client: {e}"))
 }
 
 /// A game to list: its id, title and the user's download key for it.
