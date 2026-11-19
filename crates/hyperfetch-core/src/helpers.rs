@@ -362,7 +362,7 @@ pub(crate) async fn run(
 }
 
 /// The snapshot of a helper's download into `target` that has come as far as `progress`.
-fn snapshot(progress: &Progress, target: &Path) -> EngineSnapshot {
+pub(crate) fn snapshot(progress: &Progress, target: &Path) -> EngineSnapshot {
     let share = match progress.ratio {
         Some(ratio) => ratio,
         None if progress.total > 0 => progress.done as f64 / progress.total as f64,
