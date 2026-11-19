@@ -15,6 +15,8 @@ use crate::ingest::{clean_path, ListOptions, Task};
 const GEOFABRIK_INDEX: &str = "https://download.geofabrik.de/index-v1-nogeom.json";
 /// Between two requests to one of these servers.
 const GAP: Duration = Duration::from_millis(300);
+/// How long a file's MD5 is waited for before the file downloads unchecked.
+const MD5_WAIT: Duration = Duration::from_secs(15);
 /// Most files of one region's page listed (Europe has some 70 countries).
 const MAX_REGIONS: usize = 100;
 /// The kinds of file these servers publish an `.md5` of.
@@ -64,8 +66,15 @@ pub async fn list(http: &Client, url: &Url, options: &ListOptions) -> Result<Vec
 /// as a link to it downloads anyway.
 async fn with_md5(http: &Client, file: Url, site: &str) -> Result<Task, String> {
     let name = file.path_segments().and_then(|mut s| s.next_back()).map(|n| percent_encoding::percent_decode_str(n).decode_utf8_lossy().into_owned()).unwrap_or_default();
-    let sum = Url::parse(&format!("{file}.md5")).map_err(|e| e.to_string())?;
-    let checksum = match crate::polite::get(http, &sum, GAP).await {
+    // A `-latest` link redirects to the dated file, beside which its MD5 is: Geofabrik's answer
+    // for `-latest...md5` is a 404 it takes half a minute over.
+    let dated = match tokio::time::timeout(MD5_WAIT, crate::polite::send(&file, GAP, || http.head(file.clone()))).await {
+        Ok(Ok(answer)) if answer.status().is_success() => answer.url().clone(),
+        _ => file.clone(),
+    };
+    let sum = Url::parse(&format!("{dated}.md5")).map_err(|e| e.to_string())?;
+    let asked = tokio::time::timeout(MD5_WAIT, crate::polite::get(http, &sum, GAP)).await;
+    let checksum = match asked.unwrap_or_else(|_| Err(format!("{site} did not answer for {sum} in time"))) {
         Ok(answer) if answer.status().is_success() => {
             let body = crate::archives::body(answer, site).await.unwrap_or_default();
             String::from_utf8_lossy(&body).split_whitespace().next().and_then(|hex| crate::repos::checksum("md5", hex))
@@ -195,6 +204,9 @@ mod tests {
                     {{"properties":{{"id":"berlin","parent":"germany","urls":{{"pbf":"{base}/europe/germany/berlin-latest.osm.pbf"}}}}}},
                     {{"properties":{{"id":"hamburg","parent":"germany","urls":{{"pbf":"{base}/europe/germany/hamburg-latest.osm.pbf"}}}}}}]}}"#)),
                 "/europe/germany/hamburg-latest.osm.pbf.md5" => (500, String::new(), Vec::new()),
+                "/europe/monaco-latest.osm.pbf" => (307, format!("Location: {base}/europe/monaco-261118.osm.pbf\r\n"), Vec::new()),
+                "/europe/monaco-261118.osm.pbf" => ok(""),
+                "/europe/monaco-261118.osm.pbf.md5" => ok("524e54114b05f99865e8dfb37a576d35  monaco-261118.osm.pbf\n"),
                 "/europe/germany-latest.osm.pbf.md5" => ok("04a445a266cc62177eb37c3bc489268a  germany-latest.osm.pbf\n"),
                 "/europe/germany/bremen-latest.osm.pbf.md5" => ok("14a445a266cc62177eb37c3bc489268a  bremen-latest.osm.pbf\n"),
                 "/pbf/planet-latest.osm.pbf.torrent" => (302, format!("Location: {base}/pbf/planet-261109.osm.pbf.torrent\r\n"), Vec::new()),
@@ -223,6 +235,10 @@ mod tests {
             ("/europe/germany/hamburg-latest.osm.pbf".to_string(), None),
         ]);
         assert!(tasks.iter().all(|t| t.from_document), "the user's headers go to no listed link");
+
+        // A -latest link's MD5 is the one beside the dated file it redirects to.
+        let latest = with_md5(&http, at("/europe/monaco-latest.osm.pbf"), "Geofabrik").await.unwrap();
+        assert_eq!((latest.urls[0].path(), latest.checksum.as_deref()), ("/europe/monaco-latest.osm.pbf", Some("md5:524e54114b05f99865e8dfb37a576d35")));
 
         let planet = planet(&http, at("/pbf/planet-latest.osm.pbf"), &options).await.unwrap();
         let task = &planet[0];

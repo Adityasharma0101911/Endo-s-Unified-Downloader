@@ -4351,7 +4351,8 @@ impl ProbeInfo {
         // shortcut: arXiv's cache gives each part of a file an ETag of its own, so only its date
         // names the version; make this a check of the answers once a second host does the same.
         let etag = self.strong_etag().filter(|_| self.final_url.host_str() != Some("export.arxiv.org"));
-        etag.map(str::to_string).or_else(|| self.last_modified.clone())
+        // An ETag sent without its quotes (NuGet's storage) is not one a server takes back.
+        etag.filter(|e| e.starts_with('"')).map(str::to_string).or_else(|| self.last_modified.clone())
     }
 
     /// Name and validators of `url` from the first of `responses` that has each; without a
@@ -6109,6 +6110,14 @@ mod tests {
 
     fn urls() -> Vec<String> {
         vec!["http://example.com/file.bin".to_string()]
+    }
+
+    #[test]
+    fn an_etag_without_quotes_is_not_sent_back() {
+        let date = Some("Wed, 08 Mar 2023 07:47:09 GMT".to_string());
+        let unquoted = ProbeInfo { etag: Some("0x8DB1FA95222F60F".to_string()), last_modified: date.clone(), ..remote(1) };
+        assert_eq!(unquoted.if_range(), date);
+        assert_eq!(remote(1).if_range().as_deref(), Some("\"v1\""));
     }
 
     #[test]
