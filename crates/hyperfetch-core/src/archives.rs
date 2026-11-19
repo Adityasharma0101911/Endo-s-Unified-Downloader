@@ -250,7 +250,7 @@ fn checksum(algo: &str, hex: &str) -> Option<String> {
 /// The body of `answer`, at most [`MAX_ANSWER`] bytes.
 pub(crate) async fn body(mut answer: Response, site: &str) -> Result<Vec<u8>, String> {
     let mut body = Vec::new();
-    while let Some(chunk) = answer.chunk().await.map_err(|e| format!("Cannot reach {site}: {e}"))? {
+    while let Some(chunk) = answer.chunk().await.map_err(|e| format!("Cannot reach {site}: {}", e.without_url()))? {
         body.extend_from_slice(&chunk);
         if body.len() > MAX_ANSWER {
             return Err(format!("{site} answered with more than the app reads"));

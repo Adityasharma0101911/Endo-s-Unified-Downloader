@@ -90,7 +90,8 @@ pub(crate) async fn send(url: &Url, gap: Duration, request: impl Fn() -> Request
                 slot.accepted();
                 return Ok(answer);
             }
-            Ok(Err(e)) if attempt == ATTEMPTS => return Err(format!("Cannot reach {}: {}", host, e)),
+            // Without the link, which may carry what the user typed (an email, a key).
+            Ok(Err(e)) if attempt == ATTEMPTS => return Err(format!("Cannot reach {}: {}", host, e.without_url())),
             Err(_) if attempt == ATTEMPTS => return Err(format!("{} did not answer within {} s", host, REQUEST_TIMEOUT.as_secs())),
             _ => {
                 let banned = slot.unanswered();
@@ -141,5 +142,16 @@ mod tests {
         let answer = get(&http, &url("/busy"), Duration::ZERO).await.unwrap();
         assert_eq!((answer.status(), hits.lock()["/busy"]), (StatusCode::OK, 2), "asked again after the rest it asked for");
         assert!(started.elapsed() >= Duration::from_secs(1));
+    }
+
+    /// A host that cannot be reached is said without the link, which may carry what the user
+    /// typed (Unpaywall's email).
+    #[tokio::test]
+    async fn an_unreachable_host_is_said_without_its_link() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let url = Url::parse(&format!("http://127.0.0.1:{port}/v2/10.1/x?email=me@example.org")).unwrap();
+        let failed = tokio::time::timeout(Duration::from_secs(60), get(&http, &url, Duration::ZERO)).await.unwrap().unwrap_err();
+        assert!(failed.starts_with("Cannot reach 127.0.0.1") && !failed.contains("me@example.org"), "{failed}");
     }
 }

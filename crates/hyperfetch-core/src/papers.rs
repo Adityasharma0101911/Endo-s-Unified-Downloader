@@ -4,10 +4,12 @@
 //! email address the user sets for it (its terms ask for one; none is ever made up or taken from
 //! elsewhere), whose best open copy is downloaded, or the arXiv preprint, PubMed Central article or
 //! Zenodo record it names; without an email, or when Unpaywall knows no PDF, the DOI's own
-//! metadata (content negotiation at doi.org) gives a PDF link under an open licence, if it has one.
+//! metadata (content negotiation at doi.org) gives a PDF link of the published version under a
+//! Creative Commons licence in force today, if it has one.
 //!
 //! Nothing behind a paywall is fetched: without an open copy, the answer says so and gives the
-//! paper's landing page.
+//! paper's landing page. A publisher's link straight to a file (`/doi/pdf/10...`) downloads as
+//! any link does.
 
 use std::time::Duration;
 
@@ -28,8 +30,9 @@ const PMC_BUCKET: &str = "https://pmc-oa-opendata.s3.amazonaws.com";
 const BIORXIV_API: &str = "https://api.biorxiv.org";
 /// Between two requests to one of these services.
 const GAP: Duration = Duration::from_millis(200);
-/// Path parts after which a publisher's link names the paper's DOI (`/doi/10...`, `/article/10...`).
-const DOI_AFTER: &[&str] = &["doi", "abs", "full", "pdf", "epdf", "epub", "reader", "article", "chapter", "book"];
+/// Path parts after which a publisher's link names the paper's DOI (`/doi/10...`, `/article/10...`):
+/// its pages. One to the file itself (`/doi/pdf/10...`, `/doi/epub/...`) is a file to download.
+const DOI_AFTER: &[&str] = &["doi", "abs", "full", "article", "chapter", "book"];
 const NO_EMAIL: &str = "Unpaywall, which finds a paper's legal open copy, asks for an email address: set yours in Settings (Unpaywall email), or with --unpaywall-email";
 
 /// What a paper link is.
@@ -86,7 +89,8 @@ fn paper_of(url: &Url) -> Option<Paper> {
         _ if url.path().to_ascii_lowercase().ends_with(".pdf") => None,
         _ => {
             let after = segs.windows(2).position(|w| DOI_AFTER.contains(&w[0].to_ascii_lowercase().as_str()) && w[1].starts_with("10."));
-            let in_query = || url.query_pairs().filter(|(k, _)| k == "doi" || k == "id").map(|(_, v)| v.into_owned()).find(|v| is_doi(v));
+            // `doi=` names one; `id=` of any site may be a file's own id.
+            let in_query = || url.query_pairs().filter(|(k, _)| k == "doi").map(|(_, v)| v.into_owned()).find(|v| is_doi(v));
             let doi = after.map(|at| segs[at + 1..].join("/")).or_else(in_query);
             doi.filter(|d| is_doi(d)).map(Paper::Doi)
         }
@@ -177,17 +181,53 @@ struct CslLink {
     url: String,
     #[serde(rename = "content-type")]
     content_type: Option<String>,
+    /// "vor" for the published version, "am" for the accepted manuscript.
+    #[serde(rename = "content-version")]
+    version: Option<String>,
+    /// "similarity-checking" for a link given only to plagiarism checks, "text-mining", ...
+    #[serde(rename = "intended-application")]
+    application: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct CslLicense {
     #[serde(rename = "URL")]
     url: String,
+    #[serde(rename = "content-version")]
+    version: Option<String>,
+    start: Option<CslStart>,
+    /// Days after `start` the licence is in force (an embargo).
+    #[serde(rename = "delay-in-days", default)]
+    delay: u64,
+}
+
+#[derive(Deserialize)]
+struct CslStart {
+    /// Milliseconds since 1970.
+    timestamp: Option<i64>,
+}
+
+impl Csl {
+    /// The PDF of the published version, when a Creative Commons licence of that version is in
+    /// force now (its start and embargo past) and the link is for anyone (not for similarity
+    /// checks alone).
+    fn open_pdf(&self, now_ms: i64) -> Option<Url> {
+        let vor = |version: &Option<String>| version.as_deref() == Some("vor");
+        let in_force = |l: &CslLicense| {
+            let start = l.start.as_ref().and_then(|s| s.timestamp);
+            start.is_some_and(|start| start.saturating_add(i64::try_from(l.delay).unwrap_or(i64::MAX / 2).saturating_mul(86_400_000)) <= now_ms)
+        };
+        self.license.iter().any(|l| l.url.contains("creativecommons.org") && vor(&l.version) && in_force(l)).then_some(())?;
+        self.link
+            .iter()
+            .filter(|l| l.content_type.as_deref() == Some("application/pdf") && vor(&l.version) && l.application.as_deref() != Some("similarity-checking"))
+            .find_map(|l| Url::parse(&l.url).ok().filter(|u| matches!(u.scheme(), "http" | "https")))
+    }
 }
 
 /// The open copy of `doi`: an arXiv DOI's preprint; Unpaywall's best PDF, or the arXiv, PubMed
 /// Central or Zenodo copy it names; else a PDF the DOI's metadata links under a Creative Commons
-/// licence. An error with the landing page when there is none.
+/// licence in force (see [`Csl::open_pdf`]). An error with the landing page when there is none.
 async fn resolve(http: &Client, at: &Services, doi: &str, email: Option<&str>, options: &ListOptions) -> Result<Vec<Task>, String> {
     if let Some(id) = doi.get(..15).filter(|p| p.eq_ignore_ascii_case("10.48550/arxiv.")).map(|_| &doi[15..]) {
         return elsewhere(http, &format!("https://arxiv.org/abs/{id}"), options).await.unwrap_or_else(|| Err(format!("arXiv has no paper {id}")));
@@ -216,9 +256,8 @@ async fn resolve(http: &Client, at: &Services, doi: &str, email: Option<&str>, o
     }
     let url = url_at(&at.doi, doi.split('/'))?;
     let csl = json::<Csl>(http, &url, "doi.org", "application/vnd.citationstyles.csl+json").await?.ok_or_else(|| format!("doi.org knows no DOI {doi}"))?;
-    let open = csl.license.iter().any(|l| l.url.contains("creativecommons.org"));
-    let pdf = csl.link.iter().filter(|_| open).find(|l| l.content_type.as_deref() == Some("application/pdf")).and_then(|l| Url::parse(&l.url).ok());
-    if let Some(pdf) = pdf.filter(|u| matches!(u.scheme(), "http" | "https")) {
+    let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);
+    if let Some(pdf) = csl.open_pdf(now_ms) {
         return Ok(vec![Task { urls: vec![pdf], name: named(csl.title.as_deref(), doi), from_document: true, ..Task::default() }]);
     }
     Err(match (email, page_only) {
@@ -323,9 +362,38 @@ mod tests {
         let pre = |server, version| Some(Paper::Preprint { server, doi: "10.1101/2020.03.19.999086".into(), version });
         assert_eq!(paper("https://www.biorxiv.org/content/10.1101/2020.03.19.999086v2.full.pdf"), pre("biorxiv", Some(2)));
         assert_eq!(paper("https://www.medrxiv.org/content/10.1101/2020.03.19.999086"), pre("medrxiv", None));
-        for not in ["https://doi.org/", "https://example.com/doi/10.1234/x/paper.pdf", "https://example.com/files/10.1234/x", "https://www.ncbi.nlm.nih.gov/pmc/articles/123/"] {
+        // A publisher's link to the file itself downloads as it is; so does a link whose `id=` looks like a DOI.
+        for not in [
+            "https://doi.org/",
+            "https://example.com/doi/10.1234/x/paper.pdf",
+            "https://example.com/files/10.1234/x",
+            "https://www.ncbi.nlm.nih.gov/pmc/articles/123/",
+            "https://onlinelibrary.wiley.com/doi/pdf/10.1002/anie.201915678",
+            "https://pubs.acs.org/doi/epdf/10.1021/acs.est.0c01234",
+            "https://www.tandfonline.com/doi/epub/10.1080/1234",
+            "https://files.example.com/get?id=10.1234/abc",
+        ] {
             assert_eq!(paper(not), None, "{not}");
         }
+    }
+
+    /// The DOI's metadata gives a PDF only of the published version, under a Creative Commons
+    /// licence of that version already in force, and not one given for similarity checks alone.
+    #[test]
+    fn only_a_published_version_under_a_licence_in_force_is_open() {
+        let now = 1_700_000_000_000;
+        let csl = |license: &str, link: &str| serde_json::from_str::<Csl>(&format!(r#"{{"license":[{license}],"link":[{link}]}}"#)).unwrap().open_pdf(now);
+        let cc = |version: &str, start: i64, delay: u64| format!(r#"{{"URL":"https://creativecommons.org/licenses/by/4.0/","content-version":"{version}","start":{{"timestamp":{start}}},"delay-in-days":{delay}}}"#);
+        let pdf = |version: &str, application: &str| format!(r#"{{"URL":"https://pub.example/x.pdf","content-type":"application/pdf","content-version":"{version}","intended-application":"{application}"}}"#);
+        let day = 86_400_000;
+        assert_eq!(csl(&cc("vor", now - day, 0), &pdf("vor", "text-mining")).unwrap().as_str(), "https://pub.example/x.pdf");
+        assert_eq!(csl(&cc("am", now - day, 0), &pdf("vor", "text-mining")), None, "the manuscript's licence is not the paper's");
+        assert_eq!(csl(&cc("vor", now + day, 0), &pdf("vor", "text-mining")), None, "not in force yet");
+        assert_eq!(csl(&cc("vor", now - day, 2), &pdf("vor", "text-mining")), None, "still under embargo");
+        assert_eq!(csl(&cc("vor", now - day, 0), &pdf("vor", "similarity-checking")), None, "for plagiarism checks alone");
+        assert_eq!(csl(&cc("vor", now - day, 0), &pdf("am", "text-mining")), None, "another version's file");
+        let undated = r#"{"URL":"https://creativecommons.org/licenses/by/4.0/","content-version":"vor"}"#;
+        assert_eq!(csl(undated, &pdf("vor", "text-mining")), None, "no start, nothing to tell it is in force");
     }
 
     /// Unpaywall's best PDF is the download, named by the title; without an email the DOI's own
@@ -342,8 +410,8 @@ mod tests {
             "/v2/10.1/page?email=me%40example.org" => reply(r#"{"is_oa":true,"best_oa_location":{"url":"https://repo.example/page","url_for_pdf":null}}"#),
             "/doi/10.1/closed" | "/doi/10.1/page" => reply(r#"{"title":"Closed","link":[{"URL":"https://pub.example/x.pdf","content-type":"application/pdf"}],"license":[{"URL":"https://pub.example/terms"}]}"#),
             "/doi/10.1/cc" => reply(
-                r#"{"title":"Libre","link":[{"URL":"https://pub.example/x.xml","content-type":"text/xml"},{"URL":"https://pub.example/libre.pdf","content-type":"application/pdf"}],
-                    "license":[{"URL":"http://creativecommons.org/licenses/by/4.0/"}]}"#,
+                r#"{"title":"Libre","link":[{"URL":"https://pub.example/x.xml","content-type":"text/xml","content-version":"vor"},{"URL":"https://pub.example/libre.pdf","content-type":"application/pdf","content-version":"vor","intended-application":"text-mining"}],
+                    "license":[{"URL":"http://creativecommons.org/licenses/by/4.0/","content-version":"vor","start":{"date-parts":[[2020,1,1]],"timestamp":1577836800000},"delay-in-days":0}]}"#,
             ),
             _ => (404, String::new(), b"{}".to_vec()),
         })

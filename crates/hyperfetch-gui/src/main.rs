@@ -2352,8 +2352,10 @@ fn task_options(settings: &Settings, task: &Task, checksum: &str, auth: &str) ->
     };
     let auth = if task.from_document { "" } else { auth };
     let mut options = settings.download_options(&task.urls, checksum, auth)?;
+    // A listed link gets the referer its lister gives (its page), never the user's, as on the
+    // command line.
     if task.from_document {
-        options.referer = None;
+        options.referer = task.referer.clone();
     } else if options.referer.is_none() {
         options.referer = task.referer.clone();
     }
@@ -3081,8 +3083,16 @@ mod tests {
         let with_pieces = Task { urls: vec![url.clone()], pieces: Some(pieces.clone()), ..Task::default() };
         assert_eq!(task_options(&settings, &with_pieces, "", "").unwrap().metalink_pieces, Some(pieces));
 
-        let plain = Task { urls: vec![url], ..Task::default() };
+        let plain = Task { urls: vec![url.clone()], ..Task::default() };
         assert_eq!(task_options(&settings, &plain, " ", "").unwrap().output_path, Some(PathBuf::from("dl")));
+
+        // A listed link takes its lister's referer (the page its expiring link is had again from),
+        // never the user's.
+        let settings = Settings { referer: "https://typed.example/".into(), ..settings };
+        let listed = Task { urls: vec![url.clone()], from_document: true, referer: Some("https://game.example/page".into()), ..Task::default() };
+        assert_eq!(task_options(&settings, &listed, "", "").unwrap().referer.as_deref(), Some("https://game.example/page"));
+        let bare = Task { urls: vec![url], from_document: true, ..Task::default() };
+        assert_eq!(task_options(&settings, &bare, "", "").unwrap().referer, None);
     }
 
     /// The Authorization header goes to the hosts the user typed, never to those a document lists.

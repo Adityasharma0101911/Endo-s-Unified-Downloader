@@ -572,12 +572,26 @@ async fn fdroid(http: &Client, repo: &str, id: &str, options: &ListOptions) -> R
     if entry.index.size > MAX_ANSWER as u64 {
         return Err("F-Droid's index is larger than the app reads".to_string());
     }
-    let index_url = url_at(repo, entry.index.name.split('/').filter(|s| !s.is_empty()))?;
-    let bytes = get(http, &index_url, "F-Droid").await?.ok_or("F-Droid's repository has no index")?;
-    if !entry.index.sha256.eq_ignore_ascii_case(&format!("{:x}", Sha256::digest(&bytes))) {
-        return Err("F-Droid's index does not match the SHA-256 its entry.json gives".to_string());
-    }
-    let index: IndexV2 = serde_json::from_slice(&bytes).map_err(|_| "F-Droid's index cannot be read".to_string())?;
+    // The index is read once while entry.json gives it the same SHA-256, not again for each app.
+    // shortcut: the last one read stays in memory until another replaces it; drop it after a while
+    // if that ever matters.
+    static READ: std::sync::LazyLock<tokio::sync::Mutex<Option<(String, std::sync::Arc<IndexV2>)>>> = std::sync::LazyLock::new(Default::default);
+    let mut read = READ.lock().await;
+    let sha256 = entry.index.sha256.to_ascii_lowercase();
+    let index = match &*read {
+        Some((had, index)) if *had == sha256 => std::sync::Arc::clone(index),
+        _ => {
+            let index_url = url_at(repo, entry.index.name.split('/').filter(|s| !s.is_empty()))?;
+            let bytes = get(http, &index_url, "F-Droid").await?.ok_or("F-Droid's repository has no index")?;
+            if sha256 != format!("{:x}", Sha256::digest(&bytes)) {
+                return Err("F-Droid's index does not match the SHA-256 its entry.json gives".to_string());
+            }
+            let index = std::sync::Arc::new(serde_json::from_slice::<IndexV2>(&bytes).map_err(|_| "F-Droid's index cannot be read".to_string())?);
+            *read = Some((sha256, std::sync::Arc::clone(&index)));
+            index
+        }
+    };
+    drop(read);
     let package = index.packages.get(id).ok_or_else(|| format!("F-Droid has no app {id}"))?;
     let newest = |stable: bool| package.versions.values().filter(|v| !stable || v.release_channels.is_empty()).max_by_key(|v| v.manifest.version_code);
     let version = newest(true).or_else(|| newest(false)).ok_or_else(|| format!("F-Droid lists no version of {id}"))?;
@@ -737,7 +751,7 @@ mod tests {
             conda_file("1.5.7", "linux-64", "py312_0", "2026-08-02"),
             conda_file("1.5.7", "osx-arm64", "py312_0", "2026-08-03")
         );
-        let (addr, _) = serve(move |path, _| match path {
+        let (addr, hits) = serve(move |path, _| match path {
             "/fdroid/entry.json" => ok(entry.as_bytes()),
             "/fdroid/index-v2.json" => ok(index.as_bytes()),
             "/go/github.com/!burnt!sushi/toml/@latest" => ok(br#"{"Version":"v1.4.0","Time":"2024-06-01T00:00:00Z"}"#),
@@ -781,6 +795,9 @@ mod tests {
         assert_eq!(urls, [local.as_str(), "https://f-droid.org/repo/org.x.app_2.apk", "https://mirror.example/fdroid/repo/org.x.app_2.apk"]);
         assert_eq!((apk.size, apk.checksum.clone()), (Some(200), Some(format!("sha256:{b}"))));
         assert!(notes.try_iter().any(|n| n.text.contains("c0ffee")));
+        let read = hits.lock().get("/fdroid/index-v2.json").copied();
         assert_eq!(fdroid(&http(), &format!("{base}/fdroid"), "org.none", &options).await.unwrap_err(), "F-Droid has no app org.none");
+        assert_eq!(hits.lock().get("/fdroid/index-v2.json").copied(), read, "the ~75 MB index is read once, not for each app");
+        assert!(hits.lock().get("/fdroid/entry.json").copied() >= Some(2), "its entry.json is, to see that it has not changed");
     }
 }

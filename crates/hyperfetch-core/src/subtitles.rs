@@ -44,14 +44,21 @@ impl fmt::Debug for Subtitles {
 /// Finds and saves subtitles for `video` (see the module docs), through `proxy` when set:
 /// the files written, or why there are none.
 pub async fn find(video: &Path, subs: &Subtitles, proxy: Option<&str>) -> Result<Vec<PathBuf>, String> {
-    let mut client = Client::builder().connect_timeout(Duration::from_secs(15)).timeout(Duration::from_secs(60));
-    if let Some(proxy) = proxy {
-        client = client.proxy(reqwest::Proxy::all(proxy).map_err(|e| format!("invalid proxy: {e}"))?);
-    }
-    find_at(&client.build().map_err(|e| e.to_string())?, API, video, subs).await
+    let client = |redirect: reqwest::redirect::Policy| {
+        let mut client = Client::builder().connect_timeout(Duration::from_secs(15)).timeout(Duration::from_secs(60)).redirect(redirect);
+        if let Some(proxy) = proxy {
+            client = client.proxy(reqwest::Proxy::all(proxy).map_err(|e| format!("invalid proxy: {e}"))?);
+        }
+        client.build().map_err(|e| e.to_string())
+    };
+    // The API key and sign-in go to OpenSubtitles' API alone, never on to where it redirects.
+    let (api, files) = (client(reqwest::redirect::Policy::none())?, client(reqwest::redirect::Policy::default())?);
+    find_at(&api, &files, API, video, subs).await
 }
 
-async fn find_at(http: &Client, api: &str, video: &Path, subs: &Subtitles) -> Result<Vec<PathBuf>, String> {
+/// [`find`], asking the API at `api` through `http`, which follows no redirect, and fetching the
+/// subtitle files it links through `files`.
+async fn find_at(http: &Client, files: &Client, api: &str, video: &Path, subs: &Subtitles) -> Result<Vec<PathBuf>, String> {
     let key = subs.api_key.trim();
     if key.is_empty() {
         return Err("OpenSubtitles needs your API key (from your account's API consumers page on opensubtitles.com): set it in Settings, or with --opensubtitles-key".to_string());
@@ -75,7 +82,7 @@ async fn find_at(http: &Client, api: &str, video: &Path, subs: &Subtitles) -> Re
     // OpenSubtitles asks each app to name itself and its version.
     headers.insert(USER_AGENT, HeaderValue::from_static(concat!("EndosUnifiedDownloader v", env!("CARGO_PKG_VERSION"))));
     headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
-    let mut api = Api { http, base: api.to_string(), headers };
+    let mut api = Api { http, files, base: api.to_string(), headers };
     if let (Some(user), Some(password)) = (subs.user.as_deref().filter(|u| !u.is_empty()), subs.password.as_deref().filter(|p| !p.is_empty())) {
         api.sign_in(user, password).await?;
     }
@@ -154,6 +161,7 @@ fn best(found: &[Attributes], language: &str, by_hash: bool) -> Option<u64> {
 
 struct Api<'a> {
     http: &'a Client,
+    files: &'a Client,
     base: String,
     headers: HeaderMap,
 }
@@ -214,18 +222,23 @@ impl Api<'_> {
             other => other?,
         };
         let link = found["link"].as_str().and_then(|l| url::Url::parse(l).ok()).ok_or("OpenSubtitles gave no link to the subtitles")?;
-        let answer = crate::polite::get(self.http, &link, GAP).await?;
+        let mut answer = crate::polite::get(self.files, &link, GAP).await?;
         if !answer.status().is_success() {
             return Err(crate::polite::refused("OpenSubtitles", answer.status()));
         }
+        let too_large = || "OpenSubtitles sent a subtitle file too large to be one".to_string();
         if answer.content_length().is_some_and(|n| n > MAX_SUBTITLE as u64) {
-            return Err("OpenSubtitles sent a subtitle file too large to be one".to_string());
+            return Err(too_large());
         }
-        let bytes = answer.bytes().await.map_err(|e| format!("OpenSubtitles: {e}"))?;
-        if bytes.len() > MAX_SUBTITLE {
-            return Err("OpenSubtitles sent a subtitle file too large to be one".to_string());
+        // Read a block at a time, so that an endless answer stops at the most a subtitle holds.
+        let mut bytes = Vec::new();
+        while let Some(chunk) = answer.chunk().await.map_err(|e| format!("OpenSubtitles: {}", e.without_url()))? {
+            bytes.extend_from_slice(&chunk);
+            if bytes.len() > MAX_SUBTITLE {
+                return Err(too_large());
+            }
         }
-        Ok((bytes.to_vec(), found["remaining"].as_i64().map(|n| n.max(0) as u64)))
+        Ok((bytes, found["remaining"].as_i64().map(|n| n.max(0) as u64)))
     }
 
     async fn post(&self, url: &str, body: Value) -> Result<reqwest::Response, String> {
@@ -307,6 +320,53 @@ mod tests {
     use super::*;
     use crate::hls::tests::{ok, serve};
     use std::sync::OnceLock;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A client of OpenSubtitles' API, as [`find`] makes it: it follows no redirect.
+    fn api() -> Client {
+        Client::builder().redirect(reqwest::redirect::Policy::none()).no_proxy().build().unwrap()
+    }
+
+    /// The API key goes to OpenSubtitles' API alone: a redirect to another host is not followed.
+    /// A subtitle file larger than one can be is refused as it comes, without a length to say so.
+    #[tokio::test]
+    async fn the_key_stays_with_the_api_and_an_endless_file_is_cut_short() {
+        let (elsewhere, seen) = serve(|_, _| ok("{}")).await;
+        let (moved, _) = serve(move |_, _| (302, format!("Location: http://{elsewhere}/stolen\r\n"), Vec::new())).await;
+        let dir = tempfile::tempdir().unwrap();
+        let video = dir.path().join("clip.mkv");
+        std::fs::write(&video, vec![0u8; 131_072]).unwrap();
+        let subs = Subtitles { api_key: "k".into(), languages: vec!["en".into()], ..Subtitles::default() };
+        assert!(find_at(&api(), &Client::new(), &format!("http://{moved}/api"), &video, &subs).await.is_err());
+        assert!(seen.lock().is_empty(), "nothing reached the other host");
+
+        // A file of 9 MiB sent with no Content-Length, then the connection closed.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let big = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let _ = socket.read(&mut [0u8; 4096]).await;
+                    let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n").await;
+                    let block = vec![b'x'; 1 << 20];
+                    for _ in 0..9 {
+                        if socket.write_all(&block).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        let (addr, _) = serve(move |path, _| match path {
+            p if p.starts_with("/api/subtitles") => ok(json!({"data": [{"attributes": {"language": "en", "moviehash_match": true, "files": [{"file_id": 7}]}}]}).to_string()),
+            "/api/download" => ok(json!({"link": format!("http://{big}/big.srt"), "remaining": 5}).to_string()),
+            _ => (404, String::new(), Vec::new()),
+        })
+        .await;
+        let refused = find_at(&api(), &Client::new(), &format!("http://{addr}/api"), &video, &subs).await.unwrap_err();
+        assert!(refused.contains("too large"), "{refused}");
+        assert!(!beside(&video, "en").exists());
+    }
 
     #[tokio::test]
     async fn hashes_titles_and_names_are_made_as_opensubtitles_and_players_want() {
@@ -351,20 +411,20 @@ mod tests {
         let video = dir.path().join("The.Film [x1].mp4");
         std::fs::write(&video, vec![0u8; 131_072]).unwrap();
         let subs = Subtitles { api_key: "k".into(), languages: vec!["FR".into(), "en".into()], user: Some("me".into()), password: Some("pw".into()) };
-        let saved = find_at(&Client::new(), &format!("{base}/api"), &video, &subs).await.unwrap();
+        let saved = find_at(&api(), &Client::new(), &format!("{base}/api"), &video, &subs).await.unwrap();
         assert_eq!(saved, [dir.path().join("The.Film [x1].en.srt"), dir.path().join("The.Film [x1].fr.srt")]);
         assert!(std::fs::read_to_string(&saved[1]).unwrap().contains("Hello"));
         assert_eq!(hits.lock().get("/api/download"), Some(&2));
 
         let asked = hits.lock().len();
-        let again = find_at(&Client::new(), &format!("{base}/api"), &video, &subs).await.unwrap();
+        let again = find_at(&api(), &Client::new(), &format!("{base}/api"), &video, &subs).await.unwrap();
         assert_eq!(again, saved, "files already there are kept");
         let seen = hits.lock();
         assert_eq!((seen.len(), seen.get("/api/download")), (asked, Some(&2)), "and not asked for again");
         drop(seen);
 
         let none = Subtitles { api_key: String::new(), ..subs.clone() };
-        assert!(find_at(&Client::new(), &base, &video, &none).await.unwrap_err().contains("API key"));
+        assert!(find_at(&api(), &Client::new(), &base, &video, &none).await.unwrap_err().contains("API key"));
     }
 
     #[tokio::test]
@@ -379,7 +439,7 @@ mod tests {
         let video = dir.path().join("clip.mkv");
         std::fs::write(&video, vec![0u8; 131_072]).unwrap();
         let subs = Subtitles { api_key: "k".into(), languages: vec!["en".into()], ..Subtitles::default() };
-        let said = find_at(&Client::new(), &format!("http://{addr}/api"), &video, &subs).await.unwrap_err();
+        let said = find_at(&api(), &Client::new(), &format!("http://{addr}/api"), &video, &subs).await.unwrap_err();
         assert!(said.contains("allowed 5 subtitles") && said.contains("resets in 3 hours") && said.contains("used up"), "{said}");
     }
 }
