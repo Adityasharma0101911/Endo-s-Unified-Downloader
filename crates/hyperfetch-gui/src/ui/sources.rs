@@ -44,9 +44,11 @@ pub(super) fn sources_page(app: &mut App, ui: &mut Ui) {
         }
         anim::fade_in(ui, egui::Id::new(("sources group", n)), anim::stagger(n + 1), anim::RISE, |ui| {
             ui.add_space(18.0);
-            ui.horizontal(|ui| {
-                ui.label(bold(group).size(15.0).color(p.strong));
-                ui.label(RichText::new(format!("{}", kinds.len())).small().color(p.dim));
+            anim::edge_faded(ui, 22.0, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(bold(group).size(15.0).color(p.strong));
+                    ui.label(RichText::new(format!("{}", kinds.len())).small().color(p.dim));
+                });
             });
             ui.add_space(6.0);
             let columns = ((ui.available_width() + 10.0) / 290.0).floor().clamp(1.0, 4.0) as usize;
@@ -68,14 +70,16 @@ fn tools_card(app: &mut App, ui: &mut Ui) {
     let found = tools(ui.ctx());
     card(ui).show(ui, |ui| {
         ui.set_width(ui.available_width());
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(icon::WRENCH).size(18.0).color(p.link));
-            ui.label(bold("Helper tools").size(15.0).color(p.strong));
-            ui.label(RichText::new("open-source programs some sources need, fetched from their official releases").small().color(p.muted));
+        anim::edge_faded(ui, 24.0, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(icon::WRENCH).size(18.0).color(p.link));
+                ui.label(bold("Helper tools").size(15.0).color(p.strong));
+                ui.label(RichText::new("open-source programs some sources need, fetched from their official releases").small().color(p.muted));
+            });
         });
         ui.add_space(6.0);
         for (name, about, path) in &found {
-            ui.horizontal(|ui| {
+            anim::edge_faded(ui, 24.0, |ui| ui.horizontal(|ui| {
                 let (glyph, color, state) = match path {
                     Some(_) => (icon::CHECK_CIRCLE, p.green, "Ready"),
                     // ffmpeg is installed only once you say so (the switch below, or the question).
@@ -96,15 +100,17 @@ fn tools_card(app: &mut App, ui: &mut Ui) {
                         label.on_hover_text(path.display().to_string());
                     }
                 });
-            });
+            }));
         }
         ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            let mut install = app.settings.install_ffmpeg == Some(true);
-            if toggle(ui, &mut install).on_hover_text(FFMPEG_ABOUT).changed() {
-                app.answer_ffmpeg(install);
-            }
-            ui.label(RichText::new("Install ffmpeg when a video needs it").color(p.text)).on_hover_text(FFMPEG_ABOUT);
+        anim::edge_faded(ui, 24.0, |ui| {
+            ui.horizontal(|ui| {
+                let mut install = app.settings.install_ffmpeg == Some(true);
+                if toggle(ui, &mut install).on_hover_text(FFMPEG_ABOUT).changed() {
+                    app.answer_ffmpeg(install);
+                }
+                ui.label(RichText::new("Install ffmpeg when a video needs it").color(p.text)).on_hover_text(FFMPEG_ABOUT);
+            });
         });
     });
 }
@@ -118,9 +124,15 @@ fn tile(app: &mut App, ui: &mut Ui, kind: &'static Kind) {
     let response = ui.interact(rect, id, Sense::hover());
     let hover = anim::presence(ui.ctx(), id.with("hover"), response.hovered(), 0.15);
     let lifted = rect.translate(Vec2::new(0.0, -1.5 * hover));
-    ui.painter().add(card_shadow(ui, hover).as_shape(lifted, 14.0));
-    ui.painter().rect(lifted, 14.0, p.card.lerp_to_gamma(p.hover, 0.2 * hover), Stroke::new(1.0, p.border.lerp_to_gamma(p.dim, 0.5 * hover)));
+    // Near the page's top and bottom edges a tile fades, as the Downloads list's cards do.
+    let fade = anim::edge_fade(rect, ui.clip_rect());
+    let mut shadow = card_shadow(ui, hover).as_shape(lifted, 14.0);
+    shadow.fill = shadow.fill.gamma_multiply(fade);
+    ui.painter().add(shadow);
+    let (fill, edge) = (p.card.lerp_to_gamma(p.hover, 0.2 * hover), p.border.lerp_to_gamma(p.dim, 0.5 * hover));
+    ui.painter().rect(lifted, 14.0, fill.gamma_multiply(fade), Stroke::new(1.0, edge.gamma_multiply(fade)));
     let mut ui = ui.new_child(egui::UiBuilder::new().max_rect(lifted.shrink(14.0)).layout(Layout::top_down(Align::LEFT)));
+    ui.multiply_opacity(fade);
     ui.horizontal(|ui| {
         let (badge, _) = ui.allocate_exact_size(Vec2::splat(30.0), Sense::hover());
         ui.painter().circle_filled(badge.center(), 15.0, p.accent.gamma_multiply(0.16));

@@ -67,6 +67,8 @@ const SINGLE_CHECKSUM: &str = "The checksum in Advanced Options is for a single 
 /// gives up after 30 s without an answer: see `zipdir::list_zip`), and "Choose tracks…" for a
 /// stream's manifests.
 const PREVIEW_LIMIT: Duration = Duration::from_secs(if cfg!(test) { 10 } else { 60 });
+/// Longest a page may take to be saved as one file, all it uses fetched one at a time.
+const PAGE_LIMIT: Duration = Duration::from_secs(if cfg!(test) { 20 } else { 300 });
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -186,6 +188,9 @@ enum AppEvent {
     /// `relink::relink`): from the New link box (see [`App::check_new_link`]) or the extension
     /// (`POST /relink`), which sends only those it took.
     Relinked { id: usize, urls: Vec<Url>, options: DownloadOptions, result: Result<(), String> },
+    /// The page at `link` saved as one file (see [`App::save_page`]), begun at Unix second
+    /// `started`: the file, its size, how many things were put in and how many left as links.
+    PageSaved { link: String, started: u64, result: Result<(PathBuf, u64, usize, usize), String> },
 }
 
 /// The New link box of a stopped download (see `ui::queue`): what is typed in it, whether that is
@@ -419,6 +424,10 @@ struct App {
     /// The ZIP link the Add page lists the contents of, and what it holds once read, each file
     /// with whether it is ticked to download (see [`App::download_zip_entries`]).
     zip_preview: Option<(String, Option<Result<Vec<(ZipEntry, bool)>, String>>)>,
+    /// Keep a saved page's scripts (the link bar's More options), for this session.
+    keep_scripts: bool,
+    /// The link of the page being saved as one file (see [`App::save_page`]).
+    saving_page: Option<String>,
     /// The track chooser open (see [`App::list_tracks`]).
     tracks: Option<tracks::Chooser>,
     /// Channel lists waiting for the channels to record to be ticked, first come first.
@@ -573,6 +582,8 @@ impl App {
             taskbar_shown: None,
             batch_failed: false,
             zip_preview: None,
+            keep_scripts: false,
+            saving_page: None,
             tracks: None,
             channel_lists: Vec::new(),
             phone,
@@ -599,6 +610,57 @@ impl App {
             });
             AppEvent::ZipListed { link, result }
         });
+    }
+
+    /// Saves the web page at `url` as one HTML file in the save folder (see `savepage`: its
+    /// images, styles and frames put in, its scripts left out unless kept in More options), off
+    /// the UI thread and through the proxy setting; the notice says how it went and the Library
+    /// keeps the file. One page at a time.
+    fn save_page(&mut self, url: Url) {
+        if self.saving_page.is_some() {
+            return;
+        }
+        let link = url.to_string();
+        self.saving_page = Some(link.clone());
+        self.notice = Some(Ok(format!("Saving the page from {} as one file…", url.host_str().unwrap_or("the web"))));
+        let options = self.settings.download_options(std::slice::from_ref(&url), "", "");
+        let dir = PathBuf::from(&self.settings.save_dir);
+        let save = hyperfetch_core::savepage::SaveOptions { keep_scripts: self.keep_scripts, ..Default::default() };
+        let started = SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        self.spawn_event(async move {
+            let saved = async {
+                let options = options?;
+                let client = unblock(move || build_client(&options)).await??;
+                tokio::fs::create_dir_all(&dir).await.map_err(|e| format!("Cannot create the folder {}: {}", dir.display(), e))?;
+                hyperfetch_core::savepage::save_page(&client, &url, &dir, &save).await
+            };
+            let result = tokio::time::timeout(PAGE_LIMIT, saved)
+                .await
+                .unwrap_or_else(|_| Err(format!("Gave up saving the page: it took over {} seconds", PAGE_LIMIT.as_secs())));
+            AppEvent::PageSaved { link, started, result: result.map(|saved| (saved.file, saved.bytes, saved.inlined, saved.left.len())) }
+        });
+    }
+
+    /// A page saved as one file (see [`App::save_page`]): the notice says which file and what it
+    /// holds, and the Library gets it; or the notice says why it could not be saved.
+    fn page_saved(&mut self, link: String, started: u64, result: Result<(PathBuf, u64, usize, usize), String>) {
+        self.saving_page = None;
+        let (file, bytes, inlined, left) = match result {
+            Ok(saved) => saved,
+            Err(e) => return self.notice = Some(Err(format!("Could not save the page: {}", e))),
+        };
+        let name = file.file_name().map_or_else(|| file.display().to_string(), |n| n.to_string_lossy().into_owned());
+        let left = match left {
+            0 => String::new(),
+            1 => ", 1 left as a link".to_string(),
+            n => format!(", {} left as links", n),
+        };
+        self.notice = Some(Ok(format!("Saved the page as one file: {} ({}; {} images, styles and frames put in{})", name, util::format_bytes(bytes), inlined, left)));
+        let mut entry = HistoryEntry::new(name, file, bytes, vec![link]);
+        entry.downloaded_bytes = bytes;
+        entry.started_at = started;
+        entry.completed_at = Some(SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()));
+        self.update_history(move |history| history.add_or_update(entry));
     }
 
     /// Queues a download of each file ticked in the ZIP the Add page lists (see
@@ -1750,6 +1812,7 @@ impl App {
             AppEvent::TracksListed { item, link, result } => self.tracks_listed(item, link, result),
             AppEvent::Channels { origin, input, checksum, auth, result } => self.channels_read(origin, input, checksum, auth, result),
             AppEvent::Relinked { id, urls, options, result } => self.relinked(id, urls, options, result),
+            AppEvent::PageSaved { link, started, result } => self.page_saved(link, started, result),
         }
     }
 

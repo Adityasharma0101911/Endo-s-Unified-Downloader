@@ -460,6 +460,26 @@ pub fn sweep(ui: &Ui, rect: Rect, half: impl Fn(f32) -> f32) {
     ui.painter().with_clip_rect(rect.intersect(ui.clip_rect())).add(Shape::mesh(mesh));
 }
 
+/// How much a card, tile or row at `rect` shows at the top and bottom edges of the scrolled
+/// `clip`, so that a list melts into the page instead of being cut: whole while all of it is in
+/// view, fading faster the more of it an edge cuts, to 0.15 with its middle on the edge.
+pub fn edge_fade(rect: Rect, clip: Rect) -> f32 {
+    let inside = (rect.center().y - clip.top()).min(clip.bottom() - rect.center().y);
+    0.15 + 0.85 * (inside / (rect.height() / 2.0).max(1.0)).clamp(0.0, 1.0).powf(1.5)
+}
+
+/// Lays out `add` at `ui`'s cursor, faded as [`edge_fade`] says for a row about `tall` points high
+/// there: for the rows of a scrolled page, whose size is known only once laid out.
+pub fn edge_faded<R>(ui: &mut Ui, tall: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
+    let rect = Rect::from_min_size(ui.cursor().min, Vec2::new(ui.available_width(), tall));
+    let fade = edge_fade(rect, ui.clip_rect());
+    ui.scope(|ui| {
+        ui.multiply_opacity(fade);
+        add(ui)
+    })
+    .inner
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

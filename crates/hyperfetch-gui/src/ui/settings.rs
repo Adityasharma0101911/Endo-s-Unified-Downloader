@@ -86,9 +86,11 @@ fn section(ui: &mut Ui, n: usize, glyph: &str, title: &str, add: impl FnOnce(&mu
         anim::shifted(ui, anim::ease(t), anim::RISE, |ui| {
             card(ui).show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    anim::icon(ui, glyph, 18.0, p.accent, 0.6 + 0.4 * anim::overshoot(t), 0.0);
-                    ui.label(bold(title).size(16.0).color(p.strong));
+                anim::edge_faded(ui, 24.0, |ui| {
+                    ui.horizontal(|ui| {
+                        anim::icon(ui, glyph, 18.0, p.accent, 0.6 + 0.4 * anim::overshoot(t), 0.0);
+                        ui.label(bold(title).size(16.0).color(p.strong));
+                    });
                 });
                 add(ui);
             });
@@ -130,24 +132,30 @@ fn setting(ui: &mut Ui, title: &str, about: &str, value: impl Hash, control: imp
     }
     let p = palette(ui);
     let lit = flash(ui.ctx(), title, value);
-    ui.separator();
-    let background = ui.painter().add(egui::Shape::Noop);
-    let row = ui.horizontal(|ui| {
-        let width = (ui.available_width() * 0.5).clamp(160.0, 380.0);
-        let size = Vec2::new(width, ui.spacing().interact_size.y);
-        ui.allocate_ui_with_layout(size, Layout::top_down(Align::LEFT), |ui| {
-            ui.set_width(width);
-            ui.label(RichText::new(title).color(p.text));
-            if !about.is_empty() {
-                ui.label(RichText::new(about).small().color(p.muted));
-            }
+    // Near the page's top and bottom edges a row fades, at its height of the frame before.
+    let tall_id = egui::Id::new(("setting height", title));
+    let tall = ui.data(|d| d.get_temp::<f32>(tall_id)).unwrap_or(44.0);
+    anim::edge_faded(ui, tall, |ui| {
+        ui.separator();
+        let background = ui.painter().add(egui::Shape::Noop);
+        let row = ui.horizontal(|ui| {
+            let width = (ui.available_width() * 0.5).clamp(160.0, 380.0);
+            let size = Vec2::new(width, ui.spacing().interact_size.y);
+            ui.allocate_ui_with_layout(size, Layout::top_down(Align::LEFT), |ui| {
+                ui.set_width(width);
+                ui.label(RichText::new(title).color(p.text));
+                if !about.is_empty() {
+                    ui.label(RichText::new(about).small().color(p.muted));
+                }
+            });
+            ui.with_layout(Layout::right_to_left(Align::Center), control);
         });
-        ui.with_layout(Layout::right_to_left(Align::Center), control);
+        ui.data_mut(|d| d.insert_temp(tall_id, row.response.rect.height() + ui.spacing().item_spacing.y));
+        if lit > 0.0 {
+            let glow = egui::epaint::RectShape::filled(row.response.rect.expand2(Vec2::new(8.0, 3.0)), 6.0, p.accent.gamma_multiply(0.14 * lit));
+            ui.painter().set(background, glow);
+        }
     });
-    if lit > 0.0 {
-        let glow = egui::epaint::RectShape::filled(row.response.rect.expand2(Vec2::new(8.0, 3.0)), 6.0, p.accent.gamma_multiply(0.14 * lit));
-        ui.painter().set(background, glow);
-    }
 }
 
 /// A setting with an on/off switch; true when it was switched.

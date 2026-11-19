@@ -411,8 +411,16 @@ fn preview_card(app: &mut App, ui: &mut Ui, kind: &kinds::Kind, source: &str) {
                         ui.label(RichText::new(format!("from {source}")).color(p.muted));
                     }
                 });
-                if let Some(name) = shown_name(&app.url_input) {
-                    ui.add(egui::Label::new(RichText::new(&name).color(p.text)).truncate()).on_hover_text(&name);
+                // A file's link ends in its name; a video page's ends in "watch": the site names it.
+                match shown_name(&app.url_input, kind) {
+                    Some(name) => {
+                        ui.add(egui::Label::new(RichText::new(&name).color(p.text)).truncate()).on_hover_text(&name);
+                    }
+                    None if kind.name != kinds::SEVERAL.name => {
+                        let what = if kind.choice == kinds::Choice::Quality { "Its title" } else { "Its name" };
+                        ui.label(RichText::new(format!("{what} comes from the site once it starts")).color(p.muted));
+                    }
+                    None => {}
                 }
                 ui.add(egui::Label::new(RichText::new(kind.about).small().color(p.muted)).wrap());
                 match kind.needs {
@@ -436,6 +444,18 @@ fn preview_card(app: &mut App, ui: &mut Ui, kind: &kinds::Kind, source: &str) {
             if kind.choice == kinds::Choice::Files {
                 ui.label(RichText::new(format!("{} You pick its files once it is read", icon::LIST_CHECKS)).color(p.muted));
             }
+            // Beside Download (what the page holds): the page itself, as one file.
+            if kind.choice == kinds::Choice::Page {
+                let link = Url::parse(app.url_input.trim()).ok();
+                let saving = app.saving_page.is_some();
+                let label = if saving { format!("{} Saving the page…", icon::HOURGLASS) } else { format!("{} Save this page as one file", icon::FILE_HTML) };
+                let tip = "Its images, styles and frames put into one HTML file that opens offline; its scripts left out unless More options keeps them";
+                if ui.add_enabled(link.is_some() && !saving, button(label)).on_hover_text(tip).clicked() {
+                    if let Some(link) = link {
+                        app.save_page(link);
+                    }
+                }
+            }
             ui.label(RichText::new(icon::FOLDER_OPEN).size(16.0).color(p.muted)).on_hover_text("Save to");
             let folder = std::path::Path::new(&app.settings.save_dir);
             let name = folder.file_name().map_or_else(|| app.settings.save_dir.clone(), |n| n.to_string_lossy().into_owned());
@@ -452,10 +472,15 @@ fn preview_card(app: &mut App, ui: &mut Ui, kind: &kinds::Kind, source: &str) {
     });
 }
 
-/// The file name the input names, from its link's last part: shown on the preview card.
-fn shown_name(input: &str) -> Option<String> {
+/// The name the input gives what it downloads, shown on the preview card: a magnet's own name, or
+/// the last part of a link of a `kind` that ends in its file's name (see `kinds::named_by_link`).
+fn shown_name(input: &str, kind: &kinds::Kind) -> Option<String> {
     let first = ingest::split_tokens(input.trim()).into_iter().next()?;
-    let url = Url::parse(&first).ok().filter(|url| matches!(url.scheme(), "http" | "https" | "ftp" | "ftps" | "sftp"))?;
+    let url = Url::parse(&first).ok()?;
+    if url.scheme() == "magnet" {
+        return url.query_pairs().find(|(key, _)| key == "dn").map(|(_, name)| name.into_owned()).filter(|name| !name.trim().is_empty());
+    }
+    let url = Some(url).filter(|url| kinds::named_by_link(kind) && matches!(url.scheme(), "http" | "https" | "ftp" | "ftps" | "sftp"))?;
     let last = url.path_segments()?.filter(|s| !s.is_empty()).next_back()?;
     let name = percent_decoded(last);
     (!name.is_empty()).then_some(name)
@@ -744,6 +769,15 @@ fn advanced_options(app: &mut App, ui: &mut Ui) {
             ui.label(text);
         })
     };
+    if kinds::recognise(&app.url_input).is_some_and(|(kind, _)| kind.choice == kinds::Choice::Page) {
+        ui.horizontal(|ui| {
+            label(ui, "Saved page");
+            let tip = "Put the page's scripts in the saved file too, where they run when it is opened. Left out, the file shows the \
+                       page as the server sent it and runs nothing.";
+            toggle(ui, &mut app.keep_scripts).on_hover_text(tip);
+            ui.label(RichText::new("Keep its scripts").color(p.text)).on_hover_text(tip);
+        });
+    }
     ui.horizontal(|ui| {
         label(ui, "Connections");
         ui.add(egui::Slider::new(&mut app.settings.connections, 1..=64)).on_hover_text("More can be faster; some servers allow only a few");
@@ -781,8 +815,93 @@ fn advanced_options(app: &mut App, ui: &mut Ui) {
 
 #[cfg(test)]
 mod tests {
-    use super::super::harness::Harness;
+    use super::super::harness::{Harness, TOGGLE};
     use super::*;
+
+    /// A page with a picture and a script, on this computer, for 20 s at most: every answer of a
+    /// fixed length, robots.txt not found.
+    fn serve_page() -> std::net::SocketAddr {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        std::thread::spawn(move || {
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while std::time::Instant::now() < until {
+                let Ok((mut socket, _)) = listener.accept() else {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                };
+                let _ = socket.set_nonblocking(false);
+                let _ = socket.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match socket.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let path = String::from_utf8_lossy(&request).split_whitespace().nth(1).unwrap_or("/").to_string();
+                let (status, kind, body): (&str, &str, &[u8]) = match path.as_str() {
+                    "/about.html" => ("200 OK", "text/html; charset=utf-8", b"<html><head><title>About us</title></head><body><h1>Hi</h1><img src=\"dot.png\"><script>document.title = 'x'</script></body></html>"),
+                    "/dot.png" => ("200 OK", "image/png", b"PNG"),
+                    _ => ("404 Not Found", "text/plain", b"no"),
+                };
+                let head = format!("HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                let _ = socket.write_all(head.as_bytes()).and_then(|_| socket.write_all(body));
+            }
+        });
+        addr
+    }
+
+    /// A web page's card says the site names it, and offers to save it as one file: that saves it
+    /// into the save folder off the UI thread, named after its title, its picture put in and its
+    /// script left out; the notice says so and the Library keeps it. Keep its scripts, in More
+    /// options, keeps the script in the next one.
+    #[test]
+    fn a_web_page_is_saved_as_one_file() {
+        let addr = serve_page();
+        let mut h = Harness::new();
+        h.app.url_input = format!("http://{addr}/about.html");
+        h.frames(30);
+        assert!(h.find("A web page").is_some() && h.find("Its name comes from the site once it starts").is_some(), "{:?}", h.texts());
+        assert!(h.find("about.html").is_none(), "no name made up from the link");
+        h.click("Save this page as one file");
+        assert!(h.app.saving_page.is_some());
+        h.wait_for(|app| app.saving_page.is_none());
+        assert!(matches!(&h.app.notice, Some(Ok(notice)) if notice.starts_with("Saved the page as one file: About us.html")), "{:?}", h.app.notice);
+        let saved = std::path::Path::new(&h.app.settings.save_dir).join("About us.html");
+        let html = std::fs::read_to_string(&saved).unwrap();
+        assert!(html.contains("data:image/png;base64,") && !html.contains("<script>"), "{html}");
+        h.wait_for(|app| app.history.iter().any(|entry| entry.file_path == saved));
+
+        h.app.show_advanced = true;
+        h.frames(30);
+        h.click_at(h.find_near("Keep its scripts", TOGGLE).unwrap().center());
+        assert!(h.app.keep_scripts);
+        h.click("Save this page as one file");
+        h.wait_for(|app| app.saving_page.is_none());
+        let kept = std::fs::read_to_string(std::path::Path::new(&h.app.settings.save_dir).join("About us (1).html")).unwrap();
+        assert!(kept.contains("<script>"), "{kept}");
+        h.wait_for_background();
+    }
+
+    /// A video page's link ends in "watch", a playlist's in "videos": the card names neither,
+    /// and says the site will; a file's link names its file, a magnet its own name.
+    #[test]
+    fn the_card_names_only_what_the_link_names() {
+        let named = |text: &str| shown_name(text, kinds::recognise(text).unwrap().0);
+        assert_eq!(named("https://www.youtube.com/watch?v=aqz-KE-bpKQ"), None);
+        assert_eq!(named("https://www.youtube.com/@BlenderOfficial/videos"), None);
+        assert_eq!(named("https://arxiv.org/abs/1706.03762"), None);
+        assert_eq!(named("https://ftp.gnu.org/gnu/hello/hello-2.12.1.tar.gz").as_deref(), Some("hello-2.12.1.tar.gz"));
+        assert_eq!(named("magnet:?xt=urn:btih:dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c&dn=Big+Buck+Bunny").as_deref(), Some("Big Buck Bunny"));
+        let mut h = Harness::new();
+        h.app.url_input = "https://www.youtube.com/watch?v=aqz-KE-bpKQ".to_string();
+        h.frames(30);
+        assert!(h.find("Its title comes from the site once it starts").is_some() && h.find("watch").is_none(), "{:?}", h.texts());
+    }
 
     /// A download added with the Downloads page shown turns its Download button into Added for a
     /// moment, after which frames stop; one added on another page is old news by the time the

@@ -1312,8 +1312,7 @@ fn queue_row(app: &App, ui: &mut Ui, line: &Line, action: &mut Option<(usize, Ro
     let seen = ui.is_rect_visible(rect);
     // Near the list's top and bottom edges a card fades, so that the list melts into the page.
     let clip = ui.clip_rect();
-    let edge = ((rect.center().y - clip.top()).min(clip.bottom() - rect.center().y) / (ROW_HEIGHT * 0.5)).clamp(0.0, 1.0);
-    let edge = 0.35 + 0.65 * edge;
+    let edge = anim::edge_fade(rect, clip);
     let hover = anim::presence(&ctx, id.with("hover"), response.hovered() && line.ghost.is_none(), 0.15);
     // A card being dragged stays dimmed in its place until it is dropped.
     let opacity = if response.dragged() { 0.5 * opacity } else { opacity } * edge;
