@@ -95,8 +95,20 @@ pub(crate) struct Robots {
 /// reached, or fails to answer for it.
 pub(crate) async fn robots_of(http: &reqwest::Client, site: &Url, delay: Duration) -> Result<Robots, String> {
     let robots_url = site.join("/robots.txt").map_err(|e| e.to_string())?;
+    // As much of it as search engines read: its first 500 KiB, up to its last whole line there.
+    const MAX_ROBOTS: usize = 500 << 10;
     match polite::get(http, &robots_url, delay).await {
-        Ok(answer) if answer.status().is_success() => Ok(Robots::parse(&answer.text().await.unwrap_or_default(), crate::resolver::APP_USER_AGENT)),
+        Ok(mut answer) if answer.status().is_success() => {
+            let mut text = Vec::new();
+            while let Ok(Some(chunk)) = answer.chunk().await {
+                text.extend_from_slice(&chunk);
+                if text.len() > MAX_ROBOTS {
+                    text.truncate(text[..MAX_ROBOTS].iter().rposition(|&b| b == b'\n').unwrap_or(0));
+                    break;
+                }
+            }
+            Ok(Robots::parse(&String::from_utf8_lossy(&text), crate::resolver::APP_USER_AGENT))
+        }
         // No robots.txt: nothing is forbidden.
         Ok(answer) if answer.status().is_client_error() => Ok(Robots::default()),
         Ok(answer) => Err(format!("{} answered HTTP {} for its robots.txt: try again later", site.host_str().unwrap_or_default(), answer.status().as_u16())),
