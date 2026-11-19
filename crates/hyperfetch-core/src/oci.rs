@@ -8,6 +8,13 @@
 //! fetched again and the blob resumed. The result is an OCI image layout folder (`oci-layout`,
 //! `index.json`, `blobs/sha256/...`), which `skopeo` and `podman` take as it is and `docker load`
 //! as a tar of it.
+//!
+//! Ollama's models come from its registry the same way (`ollama.com/library/llama3.2:3b`,
+//! `ollama.com/<user>/<model>`, `ollama://<model>[:tag]`): the model's layers are files of their
+//! own, named so that they can be used as they are (`llama3.2-3b.gguf`, `template.txt`,
+//! `params.json`, `license.txt`), unless the save folder is an Ollama models folder (it holds
+//! `blobs` and `manifests`), which then takes them as Ollama keeps them (`blobs/sha256-<hex>`,
+//! `manifests/registry.ollama.ai/library/<model>/<tag>`), ready for Ollama to run.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -33,6 +40,11 @@ const MAX_MANIFEST: usize = 4 << 20;
 const MAX_LAYERS: usize = 1000;
 /// Fresh tokens a blob may need while it downloads.
 const TOKEN_TRIES: u32 = 3;
+/// Ollama's registry, and the start of the media types of its models' layers.
+const OLLAMA: &str = "registry.ollama.ai";
+const OLLAMA_LAYER: &str = "application/vnd.ollama.image.";
+/// First path parts of ollama.com that are its own pages, not users.
+const OLLAMA_PAGES: &[&str] = &["blog", "docs", "download", "models", "public", "search", "settings", "signin", "signup", "turbo", "api"];
 
 /// An image: its registry (`host[:port]`), repository, and tag or digest.
 #[derive(Debug, Clone, PartialEq)]
@@ -90,6 +102,9 @@ impl Image {
 /// `docker://`, or an image's web page on Docker Hub, GitHub or Quay. None for anything else.
 pub fn reference(token: &str) -> Option<Url> {
     let token = token.trim();
+    if let Some(model) = token.strip_prefix("ollama://") {
+        return ollama(model.trim_end_matches('/'))?.link();
+    }
     let image = match token.strip_prefix("docker://") {
         Some(rest) => {
             let (registry, path) = rest.split_once('/')?;
@@ -98,7 +113,7 @@ pub fn reference(token: &str) -> Option<Url> {
         None if token.starts_with("http://") || token.starts_with("https://") => page(&Url::parse(token).ok()?)?,
         None => {
             let (registry, path) = token.split_once('/')?;
-            let known = ["docker.io", "index.docker.io", "registry-1.docker.io", "ghcr.io", "quay.io"];
+            let known = ["docker.io", "index.docker.io", "registry-1.docker.io", "ghcr.io", "quay.io", OLLAMA];
             known.contains(&registry.to_ascii_lowercase().as_str()).then(|| parse(registry, path))??
         }
     };
@@ -153,9 +168,19 @@ fn page(url: &Url) -> Option<Image> {
         ("github.com", [owner, _, "pkgs", "container", name, ..]) => ("ghcr.io", format!("{owner}/{name}")),
         ("github.com", ["users" | "orgs", owner, "packages", "container", "package", name, ..]) => ("ghcr.io", format!("{owner}/{name}")),
         ("quay.io", ["repository", org, name, ..]) => ("quay.io", format!("{org}/{name}")),
+        ("ollama.com", [user, model, ..]) if !OLLAMA_PAGES.contains(user) => return ollama(&format!("{user}/{model}")),
         _ => return None,
     };
     parse(registry, &format!("{}:{tag}", repo.to_ascii_lowercase()))
+}
+
+/// The Ollama model `[user/]model[:tag]` (`library/` is Ollama's own models); a tag keeps its
+/// case (`q4_K_M`).
+fn ollama(model: &str) -> Option<Image> {
+    let (name, tag) = model.rsplit_once(':').map_or((model, None), |(name, tag)| (name, Some(tag)));
+    let name = name.to_ascii_lowercase();
+    let name = if name.contains('/') { name } else { format!("library/{name}") };
+    parse(OLLAMA, &tag.map_or(name.clone(), |tag| format!("{name}:{tag}")))
 }
 
 /// The build of `index` for `platform` (`os/arch[/variant]`, else this machine's Linux build):
@@ -345,32 +370,79 @@ async fn download(
     if layers.len() > MAX_LAYERS {
         return Err("the image has too many layers".to_string());
     }
-    let blobs: Vec<(String, u64)> = std::iter::once(&doc["config"])
+    let blobs: Vec<(String, u64, &str)> = std::iter::once(&doc["config"])
         .chain(layers)
         .map(|blob| {
             let digest = blob["digest"].as_str().filter(|d| d.strip_prefix("sha256:").is_some_and(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit())));
-            Some((digest?.to_ascii_lowercase(), blob["size"].as_u64()?))
+            Some((digest?.to_ascii_lowercase(), blob["size"].as_u64()?, blob["mediaType"].as_str().unwrap_or_default()))
         })
         .collect::<Option<_>>()
         .ok_or("the image's manifest names a blob without a SHA-256 digest and size")?;
 
-    let folder = match &options.output_path {
-        Some(path) if !crate::engine::is_dir_target(path) => path.clone(),
+    // An Ollama model goes into the Ollama models folder picked as the save folder, else into
+    // files of its own (see the module docs).
+    let model = blobs.iter().any(|(_, _, media)| media.starts_with(OLLAMA_LAYER));
+    let models = Some(save_dir).filter(|dir| model && dir.join("blobs").is_dir() && dir.join("manifests").is_dir());
+    let folder = match (&options.output_path, models) {
+        (_, Some(models)) => models.to_path_buf(),
+        (Some(path), None) if !crate::engine::is_dir_target(path) => path.clone(),
         _ => save_dir.join(image.folder()),
     };
-    let total = blobs.iter().map(|(_, size)| size).sum::<u64>();
+    let named = model_files(&image, &blobs);
+    let total = blobs.iter().map(|(_, size, _)| size).sum::<u64>();
     let (mut done, mut fresh) = (0, false);
-    for (digest, size) in &blobs {
+    for (n, (digest, size, _)) in blobs.iter().enumerate() {
         let hex = &digest["sha256:".len()..];
-        let path = folder.join("blobs").join("sha256").join(hex);
+        let path = match (models, model) {
+            (Some(_), _) => folder.join("blobs").join(format!("sha256-{hex}")),
+            (None, true) => folder.join(&named[n]),
+            (None, false) => folder.join("blobs").join("sha256").join(hex),
+        };
         if !holds(&path, hex).await {
             fetch_blob(&mut registry, digest, &path, options, crate::p2p::Progress { total, before: done, target: folder.clone(), torrent: false }, &snapshots, &cancel).await?;
             fresh = true;
         }
         done += size;
     }
-    write_layout(&folder, &image, &manifest, &media, &platform)?;
+    if models.is_some() {
+        let mut at = folder.join("manifests").join(crate::engine::sanitize_component(&image.registry));
+        image.repo.split('/').chain([image.tag.as_str()]).for_each(|part| at.push(crate::engine::sanitize_component(part)));
+        let failed = |e: std::io::Error| format!("Cannot write the model's manifest {}: {e}", at.display());
+        std::fs::create_dir_all(at.parent().unwrap_or(&folder)).map_err(failed)?;
+        std::fs::write(&at, &manifest).map_err(failed)?;
+    } else if !model {
+        write_layout(&folder, &image, &manifest, &media, &platform)?;
+    }
     Ok((folder, fresh))
+}
+
+/// The file names an Ollama model's `blobs` (its config, then its layers) take outside an Ollama
+/// models folder: the model as `<name>-<tag>.gguf` (a projector or adapter beside it), its
+/// template, system prompt and licences as text, its parameters and messages as JSON, each name
+/// numbered when it comes again.
+fn model_files(image: &Image, blobs: &[(String, u64, &str)]) -> Vec<String> {
+    let last = image.repo.rsplit('/').next().unwrap_or(&image.repo);
+    let base = crate::engine::sanitize_component(&format!("{last}-{}", image.tag));
+    let mut seen = std::collections::HashMap::new();
+    blobs
+        .iter()
+        .enumerate()
+        .map(|(n, (_, _, media))| {
+            let (stem, ext) = match media.strip_prefix(OLLAMA_LAYER) {
+                _ if n == 0 => ("config".to_string(), "json"),
+                Some("model") => (base.clone(), "gguf"),
+                Some(kind @ ("projector" | "adapter")) => (format!("{base}-{kind}"), "gguf"),
+                Some(kind @ ("params" | "messages")) => (kind.to_string(), "json"),
+                Some(kind) => (crate::engine::sanitize_component(kind), "txt"),
+                None => ("layer".to_string(), "bin"),
+            };
+            let count = seen.entry((stem.clone(), ext)).and_modify(|c| *c += 1).or_insert(1);
+            match *count {
+                1 => format!("{stem}.{ext}"),
+                c => format!("{stem}-{c}.{ext}"),
+            }
+        })
+        .collect()
 }
 
 /// Downloads the blob `digest` into `path`, checked against it, from wherever the registry sends
@@ -467,6 +539,15 @@ mod tests {
         assert_eq!(link("https://github.com/Owner/repo/pkgs/container/App?tag=1.2").as_deref(), Some("docker://ghcr.io/owner/app:1.2"));
         assert_eq!(link("https://quay.io/repository/coreos/etcd?tab=tags").as_deref(), Some("docker://quay.io/coreos/etcd:latest"));
         for not in ["example.com/a/b", "docker.io/Bad/Name", "docker.io/a:b:c", "ghcr.io/a@sha256:12", "https://hub.docker.com/search", "alpine"] {
+            assert_eq!(link(not), None, "{not}");
+        }
+        assert_eq!(link("ollama://llama3.2").as_deref(), Some("docker://registry.ollama.ai/library/llama3.2:latest"));
+        assert_eq!(link("ollama://Llama3.2:3b-instruct-q4_K_M").as_deref(), Some("docker://registry.ollama.ai/library/llama3.2:3b-instruct-q4_K_M"));
+        assert_eq!(link("https://ollama.com/library/qwen3:8b").as_deref(), Some("docker://registry.ollama.ai/library/qwen3:8b"));
+        assert_eq!(link("https://ollama.com/library/llama3.2/tags").as_deref(), Some("docker://registry.ollama.ai/library/llama3.2:latest"));
+        assert_eq!(link("https://ollama.com/huihui_ai/deepseek-r1-abliterated:14b").as_deref(), Some("docker://registry.ollama.ai/huihui_ai/deepseek-r1-abliterated:14b"));
+        assert_eq!(link("registry.ollama.ai/library/smollm:135m").as_deref(), Some("docker://registry.ollama.ai/library/smollm:135m"));
+        for not in ["https://ollama.com/search?q=llama", "https://ollama.com/download/windows", "https://ollama.com/library", "ollama://"] {
             assert_eq!(link(not), None, "{not}");
         }
         let image = parse("docker.io", "library/alpine:3.20").unwrap();
@@ -645,5 +726,47 @@ mod tests {
         assert!(refused.to_ascii_lowercase().contains("checksum") || refused.contains("sha256"), "{refused}");
         let missing = run(&reference(&format!("docker://{host}/lib/app:2.0")).unwrap(), &options, dir.path(), None, CancellationToken::new()).await.unwrap_err();
         assert!(missing.contains("has no 2.0"), "{missing}");
+    }
+
+    /// An Ollama model's layers become files named for use (the model a .gguf, its template and
+    /// licences text, its parameters JSON), or, in an Ollama models folder, its blobs and manifest
+    /// where Ollama keeps them; each checked against its digest.
+    #[tokio::test]
+    async fn an_ollama_model_downloads_as_files_or_into_a_models_folder() {
+        let (config, gguf) = (br#"{"model_format":"gguf"}"#.to_vec(), [b"GGUF".to_vec(), crate::netsim::file(50_000)].concat());
+        let (template, license, terms, params) = (b"{{ .Prompt }}".to_vec(), b"LICENSE A".to_vec(), b"POLICY B".to_vec(), br#"{"stop":["<|end|>"]}"#.to_vec());
+        let layer = |media: &str, bytes: &[u8]| json!({"mediaType": format!("application/vnd.ollama.image.{media}"), "digest": format!("sha256:{}", hex(bytes)), "size": bytes.len()});
+        let manifest = serde_json::to_vec(&json!({
+            "schemaVersion": 2, "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+            "config": {"mediaType": "application/vnd.docker.container.image.v1+json", "digest": format!("sha256:{}", hex(&config)), "size": config.len()},
+            "layers": [layer("model", &gguf), layer("template", &template), layer("license", &license), layer("license", &terms), layer("params", &params)],
+        }))
+        .unwrap();
+        let all = [&config, &gguf, &template, &license, &terms, &params];
+        let blobs = all.iter().map(|b| (format!("sha256:{}", hex(b)), b.to_vec())).collect();
+        let manifests = vec![("1.0".to_string(), ("application/vnd.docker.distribution.manifest.v2+json".to_string(), manifest.clone()))];
+        let host = registry(blobs, manifests, Arc::new(Seen::default())).await;
+        let source = reference(&format!("docker://{host}/lib/app:1.0")).unwrap();
+        let options = DownloadOptions { num_connections: 2, max_retries: 1, ..Default::default() };
+
+        let dir = tempfile::tempdir().unwrap();
+        let (folder, fresh) = run(&source, &options, dir.path(), None, CancellationToken::new()).await.unwrap();
+        assert!(fresh && folder == dir.path().join("app_1.0"));
+        let names = ["config.json", "app-1.0.gguf", "template.txt", "license.txt", "license-2.txt", "params.json"];
+        for (name, bytes) in names.iter().zip(all) {
+            assert_eq!(&std::fs::read(folder.join(name)).unwrap(), bytes, "{name}");
+        }
+        assert!(!folder.join("index.json").exists() && !folder.join("blobs").exists());
+
+        let models = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(models.path().join("blobs")).unwrap();
+        std::fs::create_dir_all(models.path().join("manifests")).unwrap();
+        let (folder, _) = run(&source, &options, models.path(), None, CancellationToken::new()).await.unwrap();
+        assert_eq!(folder, models.path());
+        for bytes in all {
+            assert_eq!(&std::fs::read(folder.join("blobs").join(format!("sha256-{}", hex(bytes)))).unwrap(), bytes);
+        }
+        let kept = folder.join("manifests").join(crate::engine::sanitize_component(&host)).join("lib").join("app").join("1.0");
+        assert_eq!(std::fs::read(kept).unwrap(), manifest);
     }
 }
