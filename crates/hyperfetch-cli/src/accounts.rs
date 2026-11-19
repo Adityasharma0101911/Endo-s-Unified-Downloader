@@ -12,8 +12,8 @@ use crate::download::{EXIT_FAILED, EXIT_OK, EXIT_USAGE};
 
 const SERVICES: &str = "cloud, epic, gog, steam or streams";
 
-/// Runs `accounts ACTION [SERVICE] [ANSWER]`.
-pub async fn run(action: AccountAction, service: Option<&str>, answer: Option<&str>, json: bool, proxy: Option<&str>) -> i32 {
+/// Runs `accounts ACTION [SERVICE] [ANSWER]` under the proxy setting `proxy`.
+pub async fn run(action: AccountAction, service: Option<&str>, answer: Option<&str>, json: bool, proxy: helpers::Proxy<'_>) -> i32 {
     let service = match service.map(|name| Service::parse(name).ok_or(name)).transpose() {
         Ok(service) => service,
         Err(name) => {
@@ -29,7 +29,7 @@ pub async fn run(action: AccountAction, service: Option<&str>, answer: Option<&s
         }
         (AccountAction::SignIn, Some(service)) => sign_in(service, answer, json, proxy).await,
         (AccountAction::SignOut, Some(service)) => {
-            accounts::sign_out(service, answer, proxy).await.map(|()| println!("Signed out of {}", service.name()))
+            accounts::sign_out(service, answer, proxy).await.map(|done| println!("{done}"))
         }
         (AccountAction::Library, Some(service)) => library(service, json, proxy).await,
         (AccountAction::Install, Some(service)) => install(service, proxy).await,
@@ -75,7 +75,7 @@ async fn list(service: Option<Service>, json: bool) -> Result<(), String> {
 }
 
 /// The service's sign-in, its steps printed, what it asks for read from the terminal unless given.
-async fn sign_in(service: Service, answer: Option<&str>, json: bool, proxy: Option<&str>) -> Result<(), String> {
+async fn sign_in(service: Service, answer: Option<&str>, json: bool, proxy: helpers::Proxy<'_>) -> Result<(), String> {
     let mut answer = answer.map(str::to_string);
     for step in accounts::steps(service) {
         match step {
@@ -107,7 +107,7 @@ async fn sign_in(service: Service, answer: Option<&str>, json: bool, proxy: Opti
     Ok(())
 }
 
-async fn library(service: Service, json: bool, proxy: Option<&str>) -> Result<(), String> {
+async fn library(service: Service, json: bool, proxy: helpers::Proxy<'_>) -> Result<(), String> {
     let items = accounts::library(service, proxy).await?;
     if json {
         println!("{}", serde_json::to_string_pretty(&items).map_err(|e| e.to_string())?);
@@ -117,7 +117,7 @@ async fn library(service: Service, json: bool, proxy: Option<&str>) -> Result<()
         println!(
             "{}",
             match service {
-                Service::Steam => "Steam libraries are not listed: download steam://app/ID (or a store page's link while signed in)",
+                Service::Steam => "Steam libraries are not listed: download steam://app/ID (the number in the game's store page address)",
                 Service::Streams => "Live streams have no library",
                 _ => "Nothing to download",
             }
@@ -133,7 +133,7 @@ async fn library(service: Service, json: bool, proxy: Option<&str>) -> Result<()
     Ok(())
 }
 
-async fn install(service: Service, proxy: Option<&str>) -> Result<(), String> {
+async fn install(service: Service, proxy: helpers::Proxy<'_>) -> Result<(), String> {
     let tool = service.tool().ok_or_else(|| format!("{} needs no helper", service.name()))?;
     let path = helpers::ensure(tool, proxy).await?;
     println!("{} is at {}", tool.program, path.display());

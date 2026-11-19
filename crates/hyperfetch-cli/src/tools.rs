@@ -22,11 +22,13 @@ pub fn preprocess_cli_args(args: Vec<OsString>) -> Vec<OsString> {
         .collect()
 }
 
-/// Execute a subcommand, `proxy` being the one --proxy gave.
-pub async fn execute_subcommand(subcmd: SubCommand, proxy: Option<String>) -> i32 {
+/// Execute a subcommand, `proxy` being the one --proxy gave, `pool` whether a proxy pool is set
+/// (--proxy-pool, --proxies-file) and `direct` whether --no-proxy was.
+pub async fn execute_subcommand(subcmd: SubCommand, proxy: Option<String>, pool: bool, direct: bool) -> i32 {
     match subcmd {
         SubCommand::Accounts { action, service, answer, json } => {
-            crate::accounts::run(action, service.as_deref(), answer.as_deref(), json, proxy.as_deref()).await
+            let proxy = hyperfetch_core::helpers::Proxy { url: proxy.as_deref(), pool, direct };
+            crate::accounts::run(action, service.as_deref(), answer.as_deref(), json, proxy).await
         }
         SubCommand::Concat { inputs, input_dir, pattern, output } => {
             run_concat(inputs, input_dir, &pattern, &output)

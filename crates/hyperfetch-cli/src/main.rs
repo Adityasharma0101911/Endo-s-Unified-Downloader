@@ -86,7 +86,7 @@ fn run_cli() -> i32 {
         return 0;
     }
     let ran = match args.command {
-        Some(command) => run_detached(tools::execute_subcommand(command, args.proxy.clone())),
+        Some(command) => run_detached(tools::execute_subcommand(command, args.proxy.clone(), args.proxy_pool.is_some() || args.proxies_file.is_some(), args.no_proxy)),
         None => run_detached(app(args)),
     };
     ran.unwrap_or_else(|e| {

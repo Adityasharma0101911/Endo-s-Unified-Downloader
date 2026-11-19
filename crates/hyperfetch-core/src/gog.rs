@@ -8,12 +8,12 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use url::Url;
 
 use crate::accounts::Item;
-use crate::helpers;
+use crate::helpers::{self, Proxy};
 use crate::ingest::Task;
 
 /// GOG Galaxy's public client, whose sign-in the user completes on GOG's page.
@@ -86,12 +86,12 @@ fn code_of(answer: &str) -> Option<String> {
     (!code.is_empty() && code.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))).then_some(code)
 }
 
-/// Asks GOG's sign-in at `auth` for a token with `grant`. Its errors never quote the request,
-/// whose address holds the code or the refresh token.
+/// Asks GOG's sign-in at `auth` for a token with `grant`: the code or the refresh token, and the
+/// client's secret, go in the body of a POST, never in an address a log may keep.
 async fn token_request(http: &reqwest::Client, auth: &str, grant: &[(&str, &str)]) -> Result<Token, String> {
-    let mut url = Url::parse(&format!("{auth}/token")).map_err(|e| e.to_string())?;
-    url.query_pairs_mut().extend_pairs([("client_id", CLIENT_ID), ("client_secret", CLIENT_SECRET)]).extend_pairs(grant);
-    let resp = http.get(url).send().await.map_err(|e| format!("GOG's sign-in did not answer: {}", e.without_url()))?;
+    let form = url::form_urlencoded::Serializer::new(String::new()).extend_pairs([("client_id", CLIENT_ID), ("client_secret", CLIENT_SECRET)]).extend_pairs(grant).finish();
+    let request = http.post(format!("{auth}/token")).header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded").body(form);
+    let resp = request.send().await.map_err(|e| format!("GOG's sign-in did not answer: {}", e.without_url()))?;
     if !resp.status().is_success() {
         return Err(format!("GOG refused the sign-in ({}): sign in to GOG again", resp.status()));
     }
@@ -115,9 +115,9 @@ async fn get<T: serde::de::DeserializeOwned>(http: &reqwest::Client, url: &str, 
 
 /// Signs in with what the user pasted from GOG's sign-in page (see [`sign_in_page`]). Returns the
 /// account's name.
-pub async fn sign_in(answer: &str, proxy: Option<&str>) -> Result<String, String> {
+pub async fn sign_in(answer: &str, proxy: Proxy<'_>) -> Result<String, String> {
     let code = code_of(answer).ok_or("Paste the address GOG's sign-in page ended on (it holds code=...)")?;
-    signed_in(&crate::ingest::descriptor_client(proxy)?, AUTH, EMBED, &code).await
+    signed_in(&proxy.client(TIMEOUT)?, AUTH, EMBED, &code).await
 }
 
 async fn signed_in(http: &reqwest::Client, auth: &str, embed: &str, code: &str) -> Result<String, String> {
@@ -160,9 +160,12 @@ struct Product {
 }
 
 /// The games of the signed-in account.
-pub async fn library(proxy: Option<&str>) -> Result<Vec<Item>, String> {
-    games(&crate::ingest::descriptor_client(proxy)?, AUTH, EMBED).await
+pub async fn library(proxy: Proxy<'_>) -> Result<Vec<Item>, String> {
+    games(&proxy.client(TIMEOUT)?, AUTH, EMBED).await
 }
+
+/// Longest a request to GOG may take.
+const TIMEOUT: Duration = Duration::from_secs(60);
 
 async fn games(http: &reqwest::Client, auth: &str, embed: &str) -> Result<Vec<Item>, String> {
     let access = access(http, auth).await?;
@@ -261,10 +264,10 @@ fn tasks_of(details: &Details, choice: &Choice, into: &mut Vec<Task>) {
 
 /// The downloads of a `gog://` link: a game's files (see [`Choice`]), or the one file of a
 /// `gog://file/...` link.
-pub async fn list(url: &Url, proxy: Option<&str>) -> Result<Vec<Task>, String> {
+pub async fn list(url: &Url, proxy: Proxy<'_>) -> Result<Vec<Task>, String> {
     match url.host_str() {
         Some("file") => Ok(vec![Task { urls: vec![url.clone()], ..Task::default() }]),
-        Some("game") => game_tasks(&crate::ingest::descriptor_client(proxy)?, AUTH, EMBED, url).await,
+        Some("game") => game_tasks(&proxy.client(TIMEOUT)?, AUTH, EMBED, url).await,
         _ => Err(format!("{url} names no GOG game")),
     }
 }
@@ -282,17 +285,24 @@ async fn game_tasks(http: &reqwest::Client, auth: &str, embed: &str, url: &Url) 
 }
 
 /// Where the engine downloads a `gog://file/...` link from, and the Authorization header it sends
-/// there (to that host alone).
-pub(crate) async fn route(link: &Url, proxy: Option<&str>) -> Result<(Url, String), String> {
-    route_at(&crate::ingest::descriptor_client(proxy)?, AUTH, EMBED, link).await
+/// there (to that host alone): only a file of the account's downloads (`/downloads/...`), never
+/// another of GOG's pages for the account.
+pub(crate) async fn route(link: &Url, proxy: Proxy<'_>) -> Result<(Url, String), String> {
+    route_at(&proxy.client(TIMEOUT)?, AUTH, EMBED, link).await
 }
 
 async fn route_at(http: &reqwest::Client, auth: &str, embed: &str, link: &Url) -> Result<(Url, String), String> {
+    let refused = || format!("{link} names no GOG file");
     if link.host_str() != Some("file") {
-        return Err(format!("{link} names no GOG file"));
+        return Err(refused());
     }
     let query = link.query().map(|q| format!("?{q}")).unwrap_or_default();
     let url = Url::parse(&format!("{embed}{}{query}", link.path())).map_err(|e| format!("{link}: {e}"))?;
+    // Checked once the address is put together, `..` and the like resolved.
+    let downloads = format!("{}/downloads/", Url::parse(embed).map_err(|e| e.to_string())?.path().trim_end_matches('/'));
+    if !url.path().starts_with(&downloads) {
+        return Err(refused());
+    }
     Ok((url, format!("Bearer {}", access(http, auth).await?)))
 }
 
@@ -304,11 +314,8 @@ mod tests {
     /// token `secret`), the library lists a game, and the game's details become downloads.
     #[tokio::test]
     async fn a_sign_in_lists_the_games_and_their_files() {
-        let (addr, hits) = crate::hls::tests::serve(|path, _| {
+        let (addr, _) = crate::hls::tests::serve(|path, _| {
             let json = |s: &str| (200, String::new(), s.as_bytes().to_vec());
-            if path.starts_with("/token?") && path.contains("code=abc") {
-                return json(r#"{"access_token":"secret","refresh_token":"r1","expires_in":3600,"token_type":"bearer"}"#);
-            }
             match path {
                 "/private/userData.json" => json(r#"{"username":"tester"}"#),
                 "/private/account/getFilteredProducts?mediaType=1&page=1" => json(r#"{"totalPages":1,"products":[{"id":1207,"title":"Old Game"}]}"#),
@@ -321,7 +328,7 @@ mod tests {
             }
         })
         .await;
-        let (auth, embed) = (format!("http://{addr}"), format!("http://{addr}/private"));
+        let ((auth, tokens), embed) = (token_server().await, format!("http://{addr}/private"));
         let http = reqwest::Client::new();
         assert_eq!(code_of("https://embed.gog.com/on_login_success?origin=client&code=abc").as_deref(), Some("abc"));
         assert_eq!(code_of(" abc ").as_deref(), Some("abc"));
@@ -347,10 +354,59 @@ mod tests {
         let (url, header) = route_at(&http, &auth, &embed, &tasks[0].urls[0]).await.unwrap();
         assert_eq!(url.as_str(), format!("{embed}/downloads/old_game/de1installer0"));
         assert_eq!(header, "Bearer secret");
-        assert!(hits.lock().keys().all(|k| !k.contains("refresh_token")), "a fresh token is not refreshed");
+        assert!(tokens.lock().iter().all(|(_, body)| !body.contains("refresh_token")), "a fresh token is not refreshed");
+        let asked = tokens.lock().clone();
+        assert!(asked.len() == 2 && asked.iter().all(|(line, body)| line == "POST /token HTTP/1.1" && body.contains("client_secret=")), "{asked:?}");
+        // Only the account's downloads get its token: not its other pages, however the path is put.
+        for link in ["gog://file/account/userData.json", "gog://file/downloads/../userData.json", "gog://file/downloads/%2e%2e/userData.json"] {
+            assert!(route_at(&http, &auth, &embed, &Url::parse(link).unwrap()).await.is_err(), "{link}");
+        }
         sign_out().unwrap();
         assert!(account().is_none());
         assert!(game_tasks(&http, &auth, &embed, &link).await.unwrap_err().contains("Sign in to GOG first"));
         assert!(sign_in_page().starts_with("https://auth.gog.com/auth?client_id=46899977096215655&redirect_uri=https%3A%2F%2Fembed.gog.com"));
+    }
+
+    /// A stand-in for GOG's token endpoint: a POST whose form body holds the code `abc` (or the
+    /// refresh token `r1`) gets a token, anything else a refusal. It keeps each request's first
+    /// line and body.
+    async fn token_server() -> (String, std::sync::Arc<parking_lot::Mutex<Vec<(String, String)>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let kept = std::sync::Arc::clone(&seen);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let kept = std::sync::Arc::clone(&kept);
+                tokio::spawn(async move {
+                    let (mut req, mut buf) = (Vec::new(), [0u8; 4096]);
+                    let complete = |req: &[u8]| {
+                        let end = req.windows(4).position(|w| w == b"\r\n\r\n")?;
+                        let head = String::from_utf8_lossy(&req[..end]).to_string();
+                        let length = head.lines().find_map(|l| l.split_once(':').filter(|(n, _)| n.eq_ignore_ascii_case("content-length")).and_then(|(_, v)| v.trim().parse::<usize>().ok()));
+                        (req.len() >= end + 4 + length.unwrap_or(0)).then(|| (head, String::from_utf8_lossy(&req[end + 4..]).to_string()))
+                    };
+                    let (head, body) = loop {
+                        if let Some(done) = complete(&req) {
+                            break done;
+                        }
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => req.extend_from_slice(&buf[..n]),
+                        }
+                    };
+                    let line = head.lines().next().unwrap_or_default().to_string();
+                    let ok = line == "POST /token HTTP/1.1" && (body.contains("code=abc") || body.contains("refresh_token=r1"));
+                    kept.lock().push((line, body));
+                    let (status, json) = match ok {
+                        true => (200, r#"{"access_token":"secret","refresh_token":"r1","expires_in":3600,"token_type":"bearer"}"#),
+                        false => (400, r#"{"error":"invalid_grant"}"#),
+                    };
+                    let _ = socket.write_all(format!("HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{json}", json.len()).as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://{addr}"), seen)
     }
 }

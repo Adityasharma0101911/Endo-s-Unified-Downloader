@@ -891,11 +891,17 @@ fn accounts_and_tools(app: &mut App, ui: &mut Ui) {
         answer: String,
         shown: Vec<String>,
         message: Option<Result<String, String>>,
+        /// Stops the sign-in that is running (Close).
+        stop: Option<Arc<tokio::sync::Notify>>,
     }
     type Shared = Arc<Mutex<State>>;
     let p = palette(ui);
     let shared: Shared = ui.data_mut(|d| d.get_temp_mut_or_default::<Shared>(egui::Id::new("accounts and tools")).clone());
-    let proxy = Some(app.settings.proxy.trim().to_string()).filter(|p| !p.is_empty());
+    // The proxy setting each helper follows, or refuses (a pool, which none can take turns through).
+    let (proxy, pool) = (Some(app.settings.proxy.trim().to_string()).filter(|p| !p.is_empty()), !app.settings.proxy_pool.trim().is_empty());
+    fn proxy_setting(proxy: &Option<String>, pool: bool) -> hyperfetch_core::helpers::Proxy<'_> {
+        hyperfetch_core::helpers::Proxy { url: proxy.as_deref(), pool, direct: false }
+    }
     // Runs `job` (None: nothing but the reload), then reads every status again.
     let run = |job: Option<std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>>>, ctx: &egui::Context| {
         {
@@ -959,12 +965,12 @@ fn accounts_and_tools(app: &mut App, ui: &mut Ui) {
             }
             if status.account.is_some() && service != Service::Cloud && ui.add_enabled(!busy, button("Sign out")).clicked() {
                 let proxy = proxy.clone();
-                run(Some(Box::pin(async move { accounts::sign_out(service, None, proxy.as_deref()).await.map(|()| format!("Signed out of {}", service.name())) })), ui.ctx());
+                run(Some(Box::pin(async move { accounts::sign_out(service, None, proxy_setting(&proxy, pool)).await })), ui.ctx());
             }
             if let Some(tool) = service.tool().filter(|_| installable) {
                 if ui.add_enabled(!busy, button("Install")).clicked() {
                     let proxy = proxy.clone();
-                    run(Some(Box::pin(async move { hyperfetch_core::helpers::ensure(tool, proxy.as_deref()).await.map(|path| format!("Installed {}", path.display())) })), ui.ctx());
+                    run(Some(Box::pin(async move { hyperfetch_core::helpers::ensure(tool, proxy_setting(&proxy, pool)).await.map(|path| format!("Installed {}", path.display())) })), ui.ctx());
                 }
             }
         });
@@ -1017,11 +1023,24 @@ fn accounts_and_tools(app: &mut App, ui: &mut Ui) {
                         seen.lock().unwrap().shown.push(text);
                         ctx.request_repaint();
                     };
-                    let job = async move { accounts::sign_in(service, &answer, proxy.as_deref(), show).await.map(|who| format!("Signed in to {}: {who}", service.name())) };
+                    let stop = Arc::new(tokio::sync::Notify::new());
+                    shared.lock().unwrap().stop = Some(stop.clone());
+                    let job = async move {
+                        // Close stops the sign-in, and with it the helper it runs (a QR code or a
+                        // browser sign-in would wait for minutes).
+                        tokio::select! {
+                            signed = accounts::sign_in(service, &answer, proxy_setting(&proxy, pool), show) => signed.map(|who| format!("Signed in to {}: {who}", service.name())),
+                            () = stop.notified() => Err(format!("The sign-in to {} was stopped", service.name())),
+                        }
+                    };
                     run(Some(Box::pin(job)), ui.ctx());
                 }
                 if ui.add(button("Close")).clicked() {
-                    shared.lock().unwrap().signing = None;
+                    let mut state = shared.lock().unwrap();
+                    if let Some(stop) = state.stop.take() {
+                        stop.notify_one();
+                    }
+                    state.signing = None;
                 }
             });
         });

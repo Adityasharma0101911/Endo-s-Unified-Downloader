@@ -158,11 +158,71 @@ pub async fn state(tool: &'static Tool) -> ToolState {
     ToolState { program: tool.program, path, version, licence: tool.licence, home: tool.home, installs: tool.release().map(|r| (r.version, r.size)) }
 }
 
+/// The proxy setting a helper's traffic is to follow, and the app's own requests for it (an
+/// install, GOG's catalogue).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Proxy<'a> {
+    /// The one proxy set: a helper gets it in its environment.
+    pub url: Option<&'a str>,
+    /// A pool of proxies is set, which no helper can take turns through.
+    pub pool: bool,
+    /// No proxy at all, not even the environment's (`http_proxy` and the like).
+    pub direct: bool,
+}
+
+/// The proxy variables a program reads from its environment.
+const PROXY_VARS: [&str; 8] = ["http_proxy", "https_proxy", "all_proxy", "no_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"];
+
+impl<'a> Proxy<'a> {
+    /// The setting of a download's options.
+    pub fn of(options: &'a crate::engine::DownloadOptions) -> Self {
+        Self { url: options.proxy.as_deref(), pool: !options.proxy_pool.is_empty(), direct: options.no_proxy }
+    }
+
+    /// One proxy, or none (then the environment's, if it names one).
+    pub fn single(url: Option<&'a str>) -> Self {
+        Self { url, ..Self::default() }
+    }
+
+    /// Whether `tool` can follow this setting; else why not, said before it makes any request.
+    /// Every helper is given the one proxy or none (see [`command`]), and reads the environment's
+    /// itself; none can take turns through a pool. `takes_proxy` is false for a tool that goes
+    /// through no proxy at all (DepotDownloader), which then runs only without one.
+    pub fn check(self, tool: &str, takes_proxy: bool) -> Result<(), String> {
+        self.check_in(tool, takes_proxy, crate::engine::proxy_in_env())
+    }
+
+    /// [`Proxy::check`], `env` telling whether the environment names a proxy.
+    fn check_in(self, tool: &str, takes_proxy: bool, env: bool) -> Result<(), String> {
+        if self.pool {
+            return Err(format!("{tool} cannot take turns through a proxy pool: set one proxy for it, or none"));
+        }
+        if !takes_proxy && self.url.is_some() {
+            return Err(format!("{tool} cannot go through a proxy: turn the proxy off for it"));
+        }
+        if !takes_proxy && !self.direct && env {
+            return Err(format!("{tool} cannot go through a proxy, and one is set in the environment (http_proxy or the like): unset it, or choose no proxy, for it"));
+        }
+        Ok(())
+    }
+
+    /// A client for the app's own requests on a helper's behalf, following this setting.
+    pub(crate) fn client(self, timeout: Duration) -> Result<reqwest::Client, String> {
+        let mut builder = reqwest::Client::builder().connect_timeout(Duration::from_secs(15)).timeout(timeout).user_agent(crate::resolver::APP_USER_AGENT);
+        if let Some(url) = self.url {
+            builder = builder.proxy(reqwest::Proxy::all(url).map_err(|e| format!("Invalid proxy {url}: {e}"))?);
+        } else if self.direct {
+            builder = builder.no_proxy();
+        }
+        builder.build().map_err(|e| format!("Failed to build HTTP client: {e}"))
+    }
+}
+
 /// Serializes installs of helper programs.
 static INSTALLING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// The `tool` to run (see [`find`]), its pinned release installed now if it is not there.
-pub async fn ensure(tool: &'static Tool, proxy: Option<&str>) -> Result<PathBuf, String> {
+pub async fn ensure(tool: &'static Tool, proxy: Proxy<'_>) -> Result<PathBuf, String> {
     if let Ok(Some(found)) = tokio::task::spawn_blocking(move || find(tool)).await {
         return Ok(found);
     }
@@ -171,16 +231,17 @@ pub async fn ensure(tool: &'static Tool, proxy: Option<&str>) -> Result<PathBuf,
 
 /// Installs `tool`'s pinned release for this system into the managed folder (see
 /// [`install_release`]), unless it is there already. Returns the program to run.
-pub async fn install(tool: &'static Tool, proxy: Option<&str>) -> Result<PathBuf, String> {
+pub async fn install(tool: &'static Tool, proxy: Proxy<'_>) -> Result<PathBuf, String> {
     let release = tool
         .release()
         .ok_or_else(|| format!("No {0} build is published for this system: install {0} yourself and put it on PATH ({1})", tool.program, tool.home))?;
+    proxy.check(tool.program, true)?;
     let _guard = INSTALLING.lock().await;
     if let Ok(Some(found)) = tokio::task::spawn_blocking(move || find_managed(tool)).await {
         return Ok(found);
     }
     let bin_dir = crate::media::managed_bin_dir().ok_or("Cannot determine a per-user folder to install helper programs into")?;
-    install_release(&crate::media::http_client(proxy)?, tool, release, &bin_dir).await
+    install_release(&proxy.client(Duration::from_secs(1800))?, tool, release, &bin_dir).await
 }
 
 /// Downloads `release` of `tool`, checks it against its pinned size and SHA-256, and only then
@@ -248,13 +309,49 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
 
 /// `bin` with `args`, run in `work_dir` without a console window, at below-normal priority, with
-/// the proxy in its environment (see `media::ytdlp_command`) and its output piped.
-pub(crate) fn command(bin: &Path, args: &[String], proxy: Option<&str>, work_dir: &Path) -> Command {
-    #[allow(unused_mut)]
-    let mut cmd = crate::media::ytdlp_command(bin, args, proxy, work_dir);
+/// the proxy in its environment (see `media::ytdlp_command`; with no proxy at all, none of the
+/// environment's either) and its output piped.
+pub(crate) fn command(bin: &Path, args: &[String], proxy: Proxy<'_>, work_dir: &Path) -> Command {
+    let mut cmd = crate::media::ytdlp_command(bin, args, proxy.url, work_dir);
+    if proxy.direct && proxy.url.is_none() {
+        for var in PROXY_VARS {
+            cmd.env_remove(var);
+        }
+    }
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS);
     cmd
+}
+
+/// What `cmd` (made by [`command`]) prints, run to its end within `limit`; past it, it is killed
+/// with every process it started (a launcher's child too), and that is an error.
+pub(crate) async fn output(mut cmd: Command, name: &str, limit: Duration) -> Result<std::process::Output, String> {
+    let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| format!("Failed to run {name}: {e}"))?;
+    lower_priority(&child);
+    let mut tree = ProcessTree::attach(&child);
+    let (out, err) = (child.stdout.take(), child.stderr.take());
+    let waited = tokio::time::timeout(limit, async {
+        let read = |pipe: Option<Box<dyn AsyncRead + Unpin + Send>>| async move {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = tokio::io::AsyncReadExt::read_to_end(&mut pipe, &mut bytes).await;
+            }
+            bytes
+        };
+        let (stdout, stderr) = tokio::join!(read(out.map(|o| Box::new(o) as _)), read(err.map(|e| Box::new(e) as _)));
+        child.wait().await.map(|status| std::process::Output { status, stdout, stderr })
+    })
+    .await;
+    match waited {
+        Ok(done) => {
+            tree.disarm();
+            done.map_err(|e| format!("Failed to run {name}: {e}"))
+        }
+        Err(_) => {
+            tree.kill_and_reap(&mut child).await;
+            Err(format!("{name} gave no answer within {} s", limit.as_secs()))
+        }
+    }
 }
 
 /// Gives the process just started for `child` a lower priority than the user's own programs
@@ -401,15 +498,12 @@ pub(crate) fn parse_size(text: &str) -> Option<u64> {
     Some((number * scale).round() as u64)
 }
 
-/// A random string of `bytes` random bytes in hex: a session's password for a local server.
-pub(crate) fn random_hex(bytes: usize) -> String {
+/// A string of `bytes` random bytes in hex: a session's password for a local server. `Err`
+/// without the system's randomness: anything else could be guessed.
+pub(crate) fn random_hex(bytes: usize) -> Result<String, String> {
     let mut buf = vec![0u8; bytes];
-    // Without the system's randomness, the time and process make one unique enough to differ.
-    if ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut buf).is_err() {
-        let seed = Sha256::digest(crate::media::unique_suffix().as_bytes());
-        buf.iter_mut().zip(seed.iter().cycle()).for_each(|(b, s)| *b = *s);
-    }
-    buf.iter().map(|b| format!("{b:02x}")).collect()
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut buf).map_err(|_| "The system gave no random numbers".to_string())?;
+    Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 #[cfg(test)]
@@ -440,7 +534,7 @@ pub(crate) mod tests {
         assert_eq!(parse_size("1,024 bytes"), Some(1024));
         assert_eq!(parse_size("lots"), None);
         assert_eq!(parse_size("5 parsecs"), None);
-        assert_eq!(random_hex(16).len(), 32);
+        assert_eq!(random_hex(16).unwrap().len(), 32);
         assert_ne!(random_hex(16), random_hex(16));
     }
 
@@ -463,7 +557,7 @@ pub(crate) mod tests {
                 (p.done, p.total) = (done.trim().parse().unwrap_or(0), total.trim().parse().unwrap_or(0));
             }
         };
-        let cmd = command(&bin, &[], None, dir.path());
+        let cmd = command(&bin, &[], Proxy::default(), dir.path());
         let tail = run(cmd, "fake", dir.path(), parse, Some(tx), CancellationToken::new()).await.unwrap();
         assert_eq!(tail.last().map(String::as_str), Some("100 of 100"));
         assert!(dir.path().join("out.bin").is_file());
@@ -475,7 +569,7 @@ pub(crate) mod tests {
         assert_eq!(last.target_path.as_deref(), Some(dir.path()));
 
         let failing = fake_tool(dir.path(), "failing", "echo broken>&2\nexit /b 3", "echo broken >&2\nexit 3");
-        let e = run(command(&failing, &[], None, dir.path()), "failing", dir.path(), parse, None, CancellationToken::new()).await.unwrap_err();
+        let e = run(command(&failing, &[], Proxy::default(), dir.path()), "failing", dir.path(), parse, None, CancellationToken::new()).await.unwrap_err();
         assert!(e.starts_with("failing exited with") && e.ends_with("broken"), "{e}");
 
         let slow = fake_tool(dir.path(), "slow", "echo 1 of 100\nping -n 30 127.0.0.1 >nul", "echo 1 of 100\nsleep 30");
@@ -486,7 +580,7 @@ pub(crate) mod tests {
             cancel.cancel();
         };
         let started = Instant::now();
-        let (result, ()) = tokio::join!(run(command(&slow, &[], None, dir.path()), "slow", dir.path(), parse, Some(tx), cancel.clone()), stop);
+        let (result, ()) = tokio::join!(run(command(&slow, &[], Proxy::default(), dir.path()), "slow", dir.path(), parse, Some(tx), cancel.clone()), stop);
         assert_eq!(result.unwrap_err(), CANCELLED);
         assert!(started.elapsed() < Duration::from_secs(20), "{:?}", started.elapsed());
         assert!(FAKE.release().is_none(), "a tool without builds installs none");
@@ -520,5 +614,75 @@ pub(crate) mod tests {
         assert_eq!(installed, dir.path().join("hf-test-tool-1.0").join(exe_name("hf-test-tool")));
         assert_eq!(std::fs::read(&installed).unwrap(), program);
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "no temporary folder is left");
+    }
+
+    /// A download of a release cut off before its end is an error and leaves nothing behind.
+    #[tokio::test]
+    async fn an_install_cut_short_leaves_nothing() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                // 1000 bytes said, 10 sent, then the connection ends.
+                let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n0123456789").await;
+            }
+        });
+        let url: &'static str = Box::leak(format!("http://{addr}/tool").into_boxed_str());
+        let target: &'static str = Box::leak(format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH).into_boxed_str());
+        let release: &'static Release = Box::leak(Box::new(Release { target, version: "1.0", url, sha256: "00", size: 1000 }));
+        let tool: &'static Tool = Box::leak(Box::new(Tool { program: "hf-test-cut", licence: "MIT", home: "https://example.com", version_args: &[], releases: std::slice::from_ref(release) }));
+        let dir = tempfile::tempdir().unwrap();
+        let e = install_release(&Proxy::default().client(Duration::from_secs(20)).unwrap(), tool, release, dir.path()).await.unwrap_err();
+        assert!(e.contains("Failed to download") || e.contains("checksum"), "{e}");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0, "nothing is left behind");
+    }
+
+    /// A helper on PATH is the one run, nothing installed; one with no build for this system is
+    /// not installed but named for the user to install; a pool of proxies is refused first.
+    #[tokio::test]
+    async fn a_helper_on_path_comes_first_and_one_without_a_build_is_named() {
+        static ON_PATH: Tool = Tool { program: if cfg!(windows) { "cmd" } else { "sh" }, licence: "-", home: "-", version_args: &[], releases: &[] };
+        let found = ensure(&ON_PATH, Proxy::default()).await.unwrap();
+        assert!(found.is_file(), "{}", found.display());
+        let e = install(&FAKE, Proxy::default()).await.unwrap_err();
+        assert!(e.contains("No hf-fake-helper build is published for this system") && e.contains("PATH"), "{e}");
+    }
+
+    /// Each helper follows the proxy setting or refuses: none takes turns through a pool; one that
+    /// goes through no proxy refuses one set, or one the environment names unless no proxy at all
+    /// is asked for.
+    #[test]
+    fn helpers_refuse_a_proxy_setting_they_cannot_follow() {
+        let one = Proxy::single(Some("http://127.0.0.1:8080"));
+        let pool = Proxy { pool: true, ..Proxy::default() };
+        let direct = Proxy { direct: true, ..Proxy::default() };
+        assert!(pool.check_in("rclone", true, false).unwrap_err().contains("proxy pool"));
+        assert!(pool.check_in("DepotDownloader", false, false).unwrap_err().contains("proxy pool"));
+        assert!(one.check_in("rclone", true, true).is_ok() && Proxy::default().check_in("rclone", true, true).is_ok());
+        assert!(one.check_in("DepotDownloader", false, false).unwrap_err().contains("cannot go through a proxy"));
+        assert!(Proxy::default().check_in("DepotDownloader", false, true).unwrap_err().contains("environment"));
+        assert!(direct.check_in("DepotDownloader", false, true).is_ok() && Proxy::default().check_in("DepotDownloader", false, false).is_ok());
+        // With no proxy at all, a helper gets none of the environment's either.
+        let cmd = command(Path::new("helper"), &[], direct, Path::new("."));
+        let removed: Vec<_> = cmd.as_std().get_envs().filter(|(_, value)| value.is_none()).map(|(name, _)| name.to_string_lossy().into_owned()).collect();
+        // Windows takes their names in either case as one.
+        assert!(PROXY_VARS.iter().all(|var| removed.iter().any(|r| r.eq_ignore_ascii_case(var))), "{removed:?}");
+    }
+
+    /// Past its time limit, a helper's run is ended at once (with what it started).
+    #[tokio::test]
+    async fn a_helper_that_never_answers_is_ended_at_its_time_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let slow = fake_tool(dir.path(), "silent", "ping -n 30 127.0.0.1 >nul", "sleep 30");
+        let started = Instant::now();
+        let e = output(command(&slow, &[], Proxy::default(), dir.path()), "silent", Duration::from_secs(1)).await.unwrap_err();
+        assert!(e.contains("no answer within 1 s"), "{e}");
+        assert!(started.elapsed() < Duration::from_secs(15), "{:?}", started.elapsed());
+        let quick = fake_tool(dir.path(), "quick", "echo hello", "echo hello");
+        let out = output(command(&quick, &[], Proxy::default(), dir.path()), "quick", Duration::from_secs(20)).await.unwrap();
+        assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).contains("hello"));
     }
 }
