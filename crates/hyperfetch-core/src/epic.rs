@@ -1,7 +1,7 @@
 //! The user's Epic Games library through legendary (GPL-3.0), run with a config folder of the
 //! app's own (`LEGENDARY_CONFIG_PATH`, see `helpers::account_dir`), so a separate legendary setup
 //! is never read or changed. Sign-in is legendary's authorization-code flow: the user signs in on
-//! Epic's page (opened through legendary's login link) and pastes the code it shows; legendary
+//! Epic's own page (the one legendary's login link leads to) and pastes the code it shows; legendary
 //! keeps the sign-in in `user.json` there. `epic://<app name>` links download a game, or a DLC into
 //! its installed game, with legendary's own downloader (its chunked manifests give exact sizes),
 //! into the download's folder; a stopped one resumes where it was. Nothing is launched or imported.
@@ -17,7 +17,7 @@ use url::Url;
 
 use crate::accounts::Item;
 use crate::engine::{DownloadOptions, EngineSnapshot};
-use crate::helpers::{self, Progress, Release, Tool};
+use crate::helpers::{self, Progress, Proxy, Release, Tool};
 
 /// legendary 0.21.1: its release files and their SHA-256 digests as GitHub gives them.
 pub static LEGENDARY: Tool = Tool {
@@ -71,27 +71,34 @@ pub static LEGENDARY: Tool = Tool {
     ],
 };
 
-/// legendary's login link: it opens Epic's sign-in page, which then shows the code to paste.
-pub const SIGN_IN_PAGE: &str = "https://legendary.gl/epiclogin";
+/// Epic's sign-in page for the launcher's client, which legendary's login link
+/// (legendary.gl/epiclogin) leads to: after the sign-in it shows the code to paste.
+pub const SIGN_IN_PAGE: &str =
+    "https://www.epicgames.com/id/login?redirectUrl=https%3A//www.epicgames.com/id/api/redirect%3FclientId%3D34a02cf8f4414e29b15921876da36f9a%26responseType%3Dcode";
 
 /// `bin` (legendary) with `args`, its config in the app's folder.
-fn command(bin: &Path, args: &[String], proxy: Option<&str>) -> Result<Command, String> {
-    let dir = helpers::own_dir("epic")?;
-    let mut cmd = helpers::command(bin, args, proxy, &dir);
-    cmd.env("LEGENDARY_CONFIG_PATH", &dir);
-    Ok(cmd)
+fn command(bin: &Path, args: &[String], proxy: Proxy<'_>) -> Result<Command, String> {
+    Ok(command_in(bin, args, proxy, &helpers::own_dir("epic")?))
+}
+
+/// `bin` (legendary) with `args`, its config in `dir`.
+fn command_in(bin: &Path, args: &[String], proxy: Proxy<'_>, dir: &Path) -> Command {
+    let mut cmd = helpers::command(bin, args, proxy, dir);
+    cmd.env("LEGENDARY_CONFIG_PATH", dir);
+    cmd
 }
 
 /// What legendary prints on its output with `args`, within `limit`; its last error line when it
 /// fails.
-async fn output(args: &[&str], proxy: Option<&str>, limit: Duration) -> Result<(Vec<u8>, String), String> {
+async fn output(args: &[&str], proxy: Proxy<'_>, limit: Duration) -> Result<(Vec<u8>, String), String> {
     let bin = helpers::ensure(&LEGENDARY, proxy).await?;
+    output_in(&bin, &helpers::own_dir("epic")?, args, proxy, limit).await
+}
+
+/// [`output`] of `bin` with its config in `dir`.
+async fn output_in(bin: &Path, dir: &Path, args: &[&str], proxy: Proxy<'_>, limit: Duration) -> Result<(Vec<u8>, String), String> {
     let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
-    let mut cmd = command(&bin, &args, proxy)?;
-    let output = match tokio::time::timeout(limit, cmd.output()).await {
-        Ok(output) => output.map_err(|e| format!("Failed to run legendary: {e}"))?,
-        Err(_) => return Err(format!("legendary gave no answer within {} s", limit.as_secs())),
-    };
+    let output = helpers::output(command_in(bin, &args, proxy, dir), "legendary", limit).await?;
     let log = String::from_utf8_lossy(&output.stderr);
     let last = log.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("no message").trim().to_string();
     if !output.status.success() {
@@ -102,8 +109,12 @@ async fn output(args: &[&str], proxy: Option<&str>, limit: Duration) -> Result<(
 
 /// Who is signed in to Epic, by the name legendary keeps. Blocking (a small file).
 pub fn account() -> Option<String> {
-    let user: serde_json::Value = serde_json::from_slice(&std::fs::read(helpers::account_dir("epic").join("user.json")).ok()?).ok()?;
-    user.get("displayName")?.as_str().map(str::to_string)
+    display_name(&std::fs::read(helpers::account_dir("epic").join("user.json")).ok()?)
+}
+
+/// The account's name in legendary's `user.json`, `bytes`.
+fn display_name(bytes: &[u8]) -> Option<String> {
+    serde_json::from_slice::<serde_json::Value>(bytes).ok()?.get("displayName")?.as_str().map(str::to_string)
 }
 
 /// The code in what Epic's page shows: the code itself, or the whole JSON it is in.
@@ -118,15 +129,25 @@ fn auth_code(answer: &str) -> Option<String> {
 
 /// Signs in with the code from Epic's page (see [`SIGN_IN_PAGE`]); legendary trades it for its
 /// sign-in at once (it is good once, for minutes). Returns the account's name.
-pub async fn sign_in(answer: &str, proxy: Option<&str>) -> Result<String, String> {
+pub async fn sign_in(answer: &str, proxy: Proxy<'_>) -> Result<String, String> {
     let code = auth_code(answer).ok_or("Paste the authorizationCode Epic's page shows (or the whole text)")?;
-    let (_, last) = output(&["auth", "--code", code.as_str()], proxy, Duration::from_secs(120)).await?;
-    // legendary ends well even when Epic refused the code: only its sign-in file tells.
-    tokio::task::spawn_blocking(account).await.ok().flatten().ok_or_else(|| format!("Epic did not take the code: {last}"))
+    let bin = helpers::ensure(&LEGENDARY, proxy).await?;
+    sign_in_with(&bin, &helpers::own_dir("epic")?, &code, proxy).await
+}
+
+/// [`sign_in`] with legendary `bin`, its config in `dir`.
+async fn sign_in_with(bin: &Path, dir: &Path, code: &str, proxy: Proxy<'_>) -> Result<String, String> {
+    let file = dir.join("user.json");
+    let before = tokio::fs::read(&file).await.ok();
+    let (_, last) = output_in(bin, dir, &["auth", "--code", code], proxy, Duration::from_secs(120)).await?;
+    // legendary ends well even when Epic refused the code: only a sign-in file it wrote now tells
+    // (one of an earlier sign-in stays as it was).
+    let after = tokio::fs::read(&file).await.ok().filter(|after| Some(after) != before.as_ref());
+    after.and_then(|after| display_name(&after)).ok_or_else(|| format!("Epic did not take the code: {last}"))
 }
 
 /// Forgets the sign-in (legendary's `user.json` in the app's folder).
-pub async fn sign_out(_proxy: Option<&str>) -> Result<(), String> {
+pub async fn sign_out() -> Result<(), String> {
     let file = helpers::account_dir("epic").join("user.json");
     match tokio::fs::remove_file(&file).await {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(format!("Cannot delete {}: {e}", file.display())),
@@ -153,14 +174,14 @@ struct Installed {
 }
 
 /// What legendary has installed through the app, by app name.
-async fn installed(proxy: Option<&str>) -> Result<HashMap<String, Installed>, String> {
+async fn installed(proxy: Proxy<'_>) -> Result<HashMap<String, Installed>, String> {
     let (json, _) = output(&["list-installed", "--json"], proxy, Duration::from_secs(120)).await?;
     let list: Vec<Installed> = serde_json::from_slice(&json).map_err(|e| format!("Unreadable list from legendary: {e}"))?;
     Ok(list.into_iter().map(|i| (i.app_name.clone(), i)).collect())
 }
 
 /// The games (and DLC) of the signed-in account.
-pub async fn library(proxy: Option<&str>) -> Result<Vec<Item>, String> {
+pub async fn library(proxy: Proxy<'_>) -> Result<Vec<Item>, String> {
     let (json, _) = output(&["list", "--json"], proxy, Duration::from_secs(600)).await?;
     let games: Vec<Game> = serde_json::from_slice(&json).map_err(|e| format!("Unreadable library from legendary: {e}"))?;
     Ok(items(&games, &installed(proxy).await.unwrap_or_default()))
@@ -183,18 +204,19 @@ fn items(games: &[Game], installed: &HashMap<String, Installed>) -> Vec<Item> {
         .collect()
 }
 
-/// The app name an `epic://` link names.
+/// The app name an `epic://` link names (never one legendary would read as a flag).
 fn app_name(link: &Url) -> Option<String> {
     let name = link.host_str().filter(|h| !h.is_empty()).map(str::to_string).or_else(|| link.path().split('/').find(|s| !s.is_empty()).map(str::to_string))?;
-    name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-').then_some(name)
+    (!name.starts_with('-') && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')).then_some(name)
 }
 
 /// legendary's arguments that download the game of `link` into `dir`: its DLC too with
 /// `?dlcs=all`, for another system with `?platform=Mac` (or `Win32`), with the download's
-/// connections as legendary's workers. legendary has no speed limit.
+/// connections as legendary's workers. legendary has no speed limit. The app name comes last,
+/// after `--`: never a flag.
 fn install_args(app: &str, link: &Url, options: &DownloadOptions, dir: &Path) -> Vec<String> {
     let query: HashMap<String, String> = link.query_pairs().map(|(k, v)| (k.to_ascii_lowercase(), v.into_owned())).collect();
-    let mut args = vec!["-y".to_string(), "install".into(), app.into(), "--base-path".into(), dir.to_string_lossy().into_owned(), "--skip-sdl".into()];
+    let mut args = vec!["-y".to_string(), "install".into(), "--base-path".into(), dir.to_string_lossy().into_owned(), "--skip-sdl".into()];
     args.push(if query.get("dlcs").is_some_and(|v| v == "all") { "--with-dlcs" } else { "--skip-dlcs" }.into());
     if let Some(platform) = query.get("platform").filter(|p| matches!(p.as_str(), "Windows" | "Win32" | "Mac")) {
         args.extend(["--platform".to_string(), platform.clone()]);
@@ -202,6 +224,7 @@ fn install_args(app: &str, link: &Url, options: &DownloadOptions, dir: &Path) ->
     if options.num_connections > 0 {
         args.extend(["--max-workers".to_string(), options.num_connections.min(64).to_string()]);
     }
+    args.extend(["--".to_string(), app.to_string()]);
     args
 }
 
@@ -237,7 +260,7 @@ pub(crate) async fn download(
     cancel: CancellationToken,
 ) -> Result<(PathBuf, bool), String> {
     let app = app_name(link).ok_or_else(|| format!("{link} names no Epic game"))?;
-    let proxy = options.proxy.as_deref();
+    let proxy = Proxy::of(options);
     if options.max_speed.is_some() {
         tracing::warn!("legendary has no speed limit: {app} downloads at full speed");
     }
@@ -284,8 +307,9 @@ mod tests {
         let link = Url::parse("epic://Sugar?dlcs=all&platform=Mac").unwrap();
         assert_eq!(app_name(&link).as_deref(), Some("Sugar"));
         assert!(app_name(&Url::parse("epic://a%20b").unwrap()).is_none());
+        assert!(app_name(&Url::parse("epic://--ignore-free-space").unwrap()).is_none(), "never a flag");
         let args = install_args("Sugar", &link, &DownloadOptions::default(), Path::new("D:/Games"));
-        assert_eq!(args, ["-y", "install", "Sugar", "--base-path", "D:/Games", "--skip-sdl", "--with-dlcs", "--platform", "Mac", "--max-workers", "8"]);
+        assert_eq!(args, ["-y", "install", "--base-path", "D:/Games", "--skip-sdl", "--with-dlcs", "--platform", "Mac", "--max-workers", "8", "--", "Sugar"]);
     }
 
     /// A fake legendary that prints its install log, then lists the game as installed: the download
@@ -314,7 +338,7 @@ mod tests {
             let (bin, dir) = (bin.clone(), dir.path().to_path_buf());
             async move {
                 let link = Url::parse("epic://Sugar").unwrap();
-                let cmd = command(&bin, &install_args("Sugar", &link, &DownloadOptions::default(), &dir), None).unwrap();
+                let cmd = command(&bin, &install_args("Sugar", &link, &DownloadOptions::default(), &dir), Proxy::default()).unwrap();
                 let mut nothing = false;
                 helpers::run(cmd, "legendary", &dir, |line, p| nothing |= parse(line, p), None, cancel).await.map(|_| nothing)
             }
@@ -322,8 +346,26 @@ mod tests {
         assert!(!run(CancellationToken::new()).await.unwrap(), "the first run downloads");
         assert!(game.is_dir());
         assert!(run(CancellationToken::new()).await.unwrap(), "the second finds it up to date");
-        let cmd = command(&bin, &["list-installed".to_string(), "--json".to_string()], None).unwrap();
+        let cmd = command(&bin, &["list-installed".to_string(), "--json".to_string()], Proxy::default()).unwrap();
         let out = helpers::run(cmd, "legendary", dir.path(), |_, _| {}, None, CancellationToken::new()).await.unwrap();
         assert!(out.join("").contains("Sugar"));
+    }
+
+    /// A code Epic refused leaves the sign-in file of an earlier sign-in as it was: that is no new
+    /// sign-in. One legendary wrote now is.
+    #[tokio::test]
+    async fn a_refused_code_is_no_sign_in_even_after_an_earlier_one() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("user.json"), r#"{"displayName":"Old"}"#).unwrap();
+        let refusing = helpers::tests::fake_tool(dir.path(), "refusing", "echo [cli] ERROR: Login attempt failed>&2", "echo '[cli] ERROR: Login attempt failed' >&2");
+        let e = sign_in_with(&refusing, dir.path(), "0123", Proxy::default()).await.unwrap_err();
+        assert!(e.contains("did not take the code") && e.contains("Login attempt failed"), "{e}");
+        let taking = helpers::tests::fake_tool(
+            dir.path(),
+            "taking",
+            "echo {\"displayName\":\"New\"}> \"%LEGENDARY_CONFIG_PATH%\\user.json\"",
+            "printf '{\"displayName\":\"New\"}' > \"$LEGENDARY_CONFIG_PATH/user.json\"",
+        );
+        assert_eq!(sign_in_with(&taking, dir.path(), "0123", Proxy::default()).await.unwrap(), "New");
     }
 }

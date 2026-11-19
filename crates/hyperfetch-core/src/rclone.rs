@@ -17,7 +17,7 @@ use base64::Engine as _;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use url::Url;
 
-use crate::helpers::{self, Release, Tool};
+use crate::helpers::{self, Proxy, Release, Tool};
 use crate::ingest::Task;
 use crate::media::ProcessTree;
 
@@ -105,12 +105,27 @@ pub fn link(remote: &str, path: &str) -> Option<Url> {
     Url::parse(&format!("rclone://{}/{}", percent_encoding::utf8_percent_encode(remote, LINK_PART), parts.join("/"))).ok()
 }
 
-/// The drive and path an `rclone://` link names.
+/// The drive and path an `rclone://` link names: never a drive of one letter, which rclone reads
+/// as a Windows drive (`c:`).
 pub fn parts(url: &Url) -> Option<(String, String)> {
     let decode = |s: &str| percent_encoding::percent_decode_str(s).decode_utf8_lossy().into_owned();
     let remote = decode(url.host_str()?);
     let path: Vec<String> = url.path().split('/').filter(|s| !s.is_empty()).map(decode).collect();
-    (url.scheme() == "rclone" && remote_name(&remote)).then(|| (remote, path.join("/")))
+    (url.scheme() == "rclone" && remote_name(&remote) && remote.chars().count() >= 2).then(|| (remote, path.join("/")))
+}
+
+/// [`parts`] of a link to one of the drives `known` (the app's config); `Err` says why not.
+fn known_drive(url: &Url, known: &[String]) -> Result<(String, String), String> {
+    let (remote, path) = parts(url).ok_or_else(|| format!("{url} names no drive"))?;
+    match known.contains(&remote) {
+        true => Ok((remote, path)),
+        false => Err(format!("{remote:?} is not a drive set up in the app: sign in to it first")),
+    }
+}
+
+/// [`known_drive`] with the drives of the app's config.
+pub(crate) async fn configured(url: &Url) -> Result<(String, String), String> {
+    known_drive(url, &tokio::task::spawn_blocking(remotes).await.unwrap_or_default())
 }
 
 /// Whether `token` has the shape of a drive's `remote:path` (a name of one letter is a Windows
@@ -122,11 +137,16 @@ pub(crate) fn may_be_remote(token: &str) -> bool {
 /// `token` as an `rclone://` link: one already, or `remote:path` of a drive the app's config
 /// has. Blocking (it reads the config).
 pub fn link_of(token: &str) -> Option<Url> {
+    link_in(token, &remotes())
+}
+
+/// [`link_of`] with the drives `known`.
+fn link_in(token: &str, known: &[String]) -> Option<Url> {
     if let Some(url) = Url::parse(token).ok().filter(|u| u.scheme() == "rclone") {
-        return parts(&url).and_then(|(remote, path)| link(&remote, &path));
+        return known_drive(&url, known).ok().and_then(|(remote, path)| link(&remote, &path));
     }
     let (remote, path) = token.split_once(':').filter(|_| may_be_remote(token))?;
-    remotes().iter().any(|r| r == remote).then(|| link(remote, path)).flatten()
+    known.iter().any(|r| r == remote).then(|| link(remote, path)).flatten()
 }
 
 /// One item of `rclone lsjson`.
@@ -167,12 +187,12 @@ const LIST_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// Runs rclone (installed now if need be) with `args` and the app's config, and returns what it
 /// printed, or its last error line when it fails.
-async fn rclone(args: &[&str], proxy: Option<&str>, limit: Duration) -> Result<Vec<u8>, String> {
+async fn rclone(args: &[&str], proxy: Proxy<'_>, limit: Duration) -> Result<Vec<u8>, String> {
     let bin = helpers::ensure(&RCLONE, proxy).await?;
     run_with(&bin, args, proxy, limit).await
 }
 
-async fn run_with(bin: &Path, args: &[&str], proxy: Option<&str>, limit: Duration) -> Result<Vec<u8>, String> {
+async fn run_with(bin: &Path, args: &[&str], proxy: Proxy<'_>, limit: Duration) -> Result<Vec<u8>, String> {
     let dir = helpers::own_dir("rclone")?;
     let mut all: Vec<String> = args.iter().map(|a| a.to_string()).collect();
     all.extend(["--config".to_string(), dir.join("rclone.conf").to_string_lossy().into_owned()]);
@@ -190,8 +210,8 @@ async fn run_with(bin: &Path, args: &[&str], proxy: Option<&str>, limit: Duratio
 }
 
 /// The downloads of the `rclone://` link `url`: its file, or every file under its folder.
-pub async fn list(url: &Url, proxy: Option<&str>) -> Result<Vec<Task>, String> {
-    let (remote, path) = parts(url).ok_or_else(|| format!("{url} names no drive"))?;
+pub async fn list(url: &Url, proxy: Proxy<'_>) -> Result<Vec<Task>, String> {
+    let (remote, path) = configured(url).await?;
     let target = format!("{remote}:{path}");
     let stat = rclone(&["lsjson", "--stat", "--hash", target.as_str()], proxy, LIST_TIMEOUT).await?;
     let item: Entry = serde_json::from_slice(&stat).map_err(|e| format!("Unreadable rclone listing of {target}: {e}"))?;
@@ -233,23 +253,31 @@ fn served_url(base: &Url, remote: &str, path: &str) -> Option<Url> {
     Some(url)
 }
 
-static SERVER: tokio::sync::Mutex<Weak<Served>> = tokio::sync::Mutex::const_new(Weak::new());
+/// The server, with the proxy setting it was started with: the one proxy, and whether none at all.
+static SERVER: tokio::sync::Mutex<(Option<String>, bool, Weak<Served>)> = tokio::sync::Mutex::const_new((None, false, Weak::new()));
 
-/// The running server (see [`Served`]), started now if none is.
-pub(crate) async fn served(proxy: Option<&str>) -> Result<Arc<Served>, String> {
+/// The running server (see [`Served`]), started now if none is, or if the one running was
+/// started with another proxy setting (that one serves on, for the downloads that use it).
+pub(crate) async fn served(proxy: Proxy<'_>) -> Result<Arc<Served>, String> {
+    served_by(proxy, || helpers::ensure(&RCLONE, proxy)).await
+}
+
+/// [`served`], with the rclone `bin` gives.
+async fn served_by<F: std::future::Future<Output = Result<PathBuf, String>>>(proxy: Proxy<'_>, bin: impl FnOnce() -> F) -> Result<Arc<Served>, String> {
     let mut held = SERVER.lock().await;
-    if let Some(served) = held.upgrade() {
+    let setting = (proxy.url.map(str::to_string), proxy.direct);
+    if let Some(served) = held.2.upgrade().filter(|_| held.0 == setting.0 && held.1 == setting.1) {
         return Ok(served);
     }
-    let bin = helpers::ensure(&RCLONE, proxy).await?;
+    let bin = bin().await?;
     let served = Arc::new(start(&bin, proxy).await?);
-    *held = Arc::downgrade(&served);
+    *held = (setting.0, setting.1, Arc::downgrade(&served));
     Ok(served)
 }
 
 /// Starts the server on the port it had last time, so a download stopped then resumes (its
 /// links name the port); on another one when that is taken.
-async fn start(bin: &Path, proxy: Option<&str>) -> Result<Served, String> {
+async fn start(bin: &Path, proxy: Proxy<'_>) -> Result<Served, String> {
     let dir = helpers::own_dir("rclone")?;
     let saved = std::fs::read_to_string(dir.join("port")).ok().and_then(|p| p.trim().parse::<u16>().ok());
     match launch(bin, &dir, proxy, saved.unwrap_or(0)).await {
@@ -270,8 +298,8 @@ fn serving_url(line: &str) -> Option<Url> {
 /// How long rclone may take to say where it serves.
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 
-async fn launch(bin: &Path, dir: &Path, proxy: Option<&str>, port: u16) -> Result<Served, String> {
-    let (user, pass) = (helpers::random_hex(8), helpers::random_hex(16));
+async fn launch(bin: &Path, dir: &Path, proxy: Proxy<'_>, port: u16) -> Result<Served, String> {
+    let (user, pass) = (helpers::random_hex(8)?, helpers::random_hex(16)?);
     let config = dir.join("rclone.conf").to_string_lossy().into_owned();
     let args = vec!["rcd".to_string(), "--rc-serve".into(), "--rc-addr".into(), format!("127.0.0.1:{port}"), "--config".into(), config];
     let mut cmd = helpers::command(bin, &args, proxy, dir);
@@ -318,11 +346,11 @@ fn auth_page(line: &str) -> Option<String> {
 /// Sets up the drive `name` of the backend `kind` (`drive`, `onedrive`, `dropbox`, ...) with
 /// rclone's own sign-in, which opens the browser at the drive's page and waits for the user (5
 /// minutes at most); `show` is told the page's address. Returns the drives set up.
-pub async fn sign_in(name: &str, kind: &str, proxy: Option<&str>, mut show: impl FnMut(String)) -> Result<String, String> {
+pub async fn sign_in(name: &str, kind: &str, proxy: Proxy<'_>, mut show: impl FnMut(String)) -> Result<String, String> {
     if !remote_name(name) || name.chars().count() < 2 {
         return Err(format!("{name:?} cannot name a drive: letters, digits, spaces and _ . + @ - only, two characters at least"));
     }
-    if kind.is_empty() || !kind.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+    if kind.is_empty() || kind.starts_with('-') || !kind.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
         return Err(format!("{kind:?} is no rclone backend (drive, onedrive, dropbox, box, pcloud, ...)"));
     }
     let bin = helpers::ensure(&RCLONE, proxy).await?;
@@ -371,7 +399,10 @@ pub async fn sign_in(name: &str, kind: &str, proxy: Option<&str>, mut show: impl
 }
 
 /// Removes the drive `name` from the app's config (rclone forgets its sign-in with it).
-pub async fn sign_out(name: &str, proxy: Option<&str>) -> Result<(), String> {
+pub async fn sign_out(name: &str, proxy: Proxy<'_>) -> Result<(), String> {
+    if !remote_name(name) {
+        return Err(format!("{name:?} cannot name a drive"));
+    }
     rclone(&["config", "delete", name], proxy, Duration::from_secs(60)).await.map(|_| ())
 }
 
@@ -385,9 +416,17 @@ mod tests {
         let url = link("my box", "Films/Old #1.mkv").unwrap();
         assert_eq!(url.as_str(), "rclone://my%20box/Films/Old%20%231.mkv");
         assert_eq!(parts(&url).unwrap(), ("my box".to_string(), "Films/Old #1.mkv".to_string()));
-        assert_eq!(link_of("rclone://gdrive/a/b.txt").unwrap().as_str(), "rclone://gdrive/a/b.txt");
-        assert!(link_of("C:\\Users\\x.txt").is_none() && link_of("https://example.com/x").is_none());
+        let known = ["gdrive".to_string(), "c".to_string()];
+        assert_eq!(link_in("rclone://gdrive/a/b.txt", &known).unwrap().as_str(), "rclone://gdrive/a/b.txt");
+        assert_eq!(link_in("gdrive:a/b.txt", &known).unwrap().as_str(), "rclone://gdrive/a/b.txt");
+        assert!(link_in("C:\\Users\\x.txt", &known).is_none() && link_in("https://example.com/x", &known).is_none());
         assert!(link_of("nosuchdrive:x").is_none(), "only a drive the config has");
+        // Not set up, or one letter (rclone reads `c:` as the Windows drive): no drive.
+        for link in ["rclone://other/a.txt", "rclone://c/Users/x/token.json"] {
+            assert!(link_in(link, &known).is_none(), "{link}");
+            let refused = known_drive(&Url::parse(link).unwrap(), &known).unwrap_err();
+            assert!(refused.contains("not a drive set up") || refused.contains("names no drive"), "{refused}");
+        }
         assert!(!remote_name("-x") && !remote_name("a/b") && remote_name("work_2.0"));
     }
 
@@ -449,7 +488,7 @@ mod tests {
             &format!("echo NOTICE: Serving remote control on http://127.0.0.1:{}/ 1>&2\nping -n 30 127.0.0.1 >nul", addr.port()),
             &format!("echo \"NOTICE: Serving remote control on http://127.0.0.1:{}/\" >&2\nsleep 30", addr.port()),
         );
-        let server = Arc::new(launch(&fake, dir.path(), None, 0).await.unwrap());
+        let server = Arc::new(launch(&fake, dir.path(), Proxy::default(), 0).await.unwrap());
         assert_eq!(server.base.port(), Some(addr.port()));
         assert!(server.auth.starts_with("Basic "));
         assert_eq!(std::fs::read_to_string(dir.path().join("port")).unwrap(), addr.port().to_string());
@@ -465,5 +504,36 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), body);
         assert!(hits.lock().keys().any(|k| k.ends_with("/Films/a.bin")));
         drop(server);
+    }
+
+    /// What the user types never becomes one of rclone's flags: a backend or a drive's name that
+    /// starts with `-` is refused before rclone runs.
+    #[tokio::test]
+    async fn names_that_would_be_flags_are_refused() {
+        let kind = sign_in("work", "-flag", Proxy::default(), |_| {}).await.unwrap_err();
+        assert!(kind.contains("no rclone backend"), "{kind}");
+        let name = sign_out("--config", Proxy::default()).await.unwrap_err();
+        assert!(name.contains("cannot name a drive"), "{name}");
+    }
+
+    /// The server running is shared while the proxy setting is the same; under another one a new
+    /// server starts, so a drive is never reached through the wrong proxy or none.
+    #[tokio::test]
+    async fn the_server_starts_again_under_another_proxy_setting() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = helpers::tests::fake_tool(
+            dir.path(),
+            "rclone",
+            "echo NOTICE: Serving remote control on http://127.0.0.1:53682/ 1>&2\nping -n 30 127.0.0.1 >nul",
+            "echo \"NOTICE: Serving remote control on http://127.0.0.1:53682/\" >&2\nsleep 30",
+        );
+        let bin = || async { Ok::<_, String>(fake.clone()) };
+        let first = served_by(Proxy::default(), bin).await.unwrap();
+        let again = served_by(Proxy::default(), bin).await.unwrap();
+        assert!(Arc::ptr_eq(&first, &again), "the same setting shares the server");
+        let proxied = served_by(Proxy::single(Some("http://127.0.0.1:9")), bin).await.unwrap();
+        assert!(!Arc::ptr_eq(&first, &proxied), "another proxy starts another server");
+        let direct = served_by(Proxy { direct: true, ..Proxy::default() }, bin).await.unwrap();
+        assert!(!Arc::ptr_eq(&proxied, &direct) && !Arc::ptr_eq(&first, &direct));
     }
 }

@@ -96,15 +96,15 @@ pub fn capture_time(timestamp: &str) -> Option<SystemTime> {
 }
 
 /// A record's id: a random (version 4) UUID.
-fn record_id() -> String {
+fn record_id() -> Result<String, String> {
     let mut b = [0u8; 16];
-    let hex = crate::helpers::random_hex(16);
+    let hex = crate::helpers::random_hex(16)?;
     for (i, byte) in b.iter_mut().enumerate() {
         *byte = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap_or(0);
     }
     (b[6], b[8]) = ((b[6] & 0x0f) | 0x40, (b[8] & 0x3f) | 0x80);
     let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
-    format!("<urn:uuid:{}-{}-{}-{}-{}>", &h[..8], &h[8..12], &h[12..16], &h[16..20], &h[20..])
+    Ok(format!("<urn:uuid:{}-{}-{}-{}-{}>", &h[..8], &h[8..12], &h[12..16], &h[16..20], &h[20..]))
 }
 
 /// The SURT form of `url` the index is sorted by: host labels reversed (`com,example`), `www.`
@@ -212,7 +212,7 @@ impl Writer {
             block_hash.update(&buf[..n]);
             payload_len += n as u64;
         }
-        let (id, (date, _)) = (record_id(), dates(date));
+        let (id, (date, _)) = (record_id()?, dates(date));
         let digest = base32(&payload_hash.finalize());
         let mut fields = vec![("WARC-Type", kind.to_string()), ("WARC-Record-ID", id.clone()), ("WARC-Date", date)];
         if let Some(target) = target {
@@ -397,7 +397,7 @@ pub(crate) mod tests {
         assert_eq!(surt(&url("https://example.com:8443/")), "com,example:8443)/");
         assert_eq!(surt(&url("http://10.0.0.1/x")), "10.0.0.1)/x");
         assert_eq!(index_path(Path::new("out/site.warc.gz")), Path::new("out/site.cdxj"));
-        let id = record_id();
+        let id = record_id().unwrap();
         assert!(id.starts_with("<urn:uuid:") && id.len() == 47 && id.as_bytes()[24] == b'4', "{id}");
     }
 

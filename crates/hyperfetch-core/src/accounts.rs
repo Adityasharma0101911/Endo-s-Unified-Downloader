@@ -4,7 +4,9 @@
 //! ([`library`]), and links (`rclone://`, `epic://`, `gog://`, `steam://`) that download like any
 //! other: listed by [`list`] when they are added, run by the engine (see [`route`]). The app never
 //! sees a password: each tool keeps its sign-in where it keeps it, in a folder of the app's own
-//! (see `helpers::account_dir`).
+//! (see `helpers::account_dir`). No web link starts a download with an account by itself: such a
+//! link may come from any page, through the browser extension. Every helper follows the proxy
+//! setting, or refuses before it goes online (see `helpers::Proxy::check`).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -14,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::engine::{DownloadOptions, EngineSnapshot};
-use crate::helpers::{Tool, ToolState};
+use crate::helpers::{Proxy, Tool, ToolState};
 use crate::ingest::{ListOptions, Task};
 use crate::{epic, gog, helpers, livestream, rclone, steam};
 
@@ -147,10 +149,17 @@ pub fn steps(service: Service) -> Vec<Step> {
     }
 }
 
+/// Whether `service` can follow the proxy setting `proxy` (see `helpers::Proxy::check`):
+/// DepotDownloader goes through no proxy at all.
+fn proxy_check(service: Service, proxy: Proxy<'_>) -> Result<(), String> {
+    proxy.check(service.tool().map_or(service.name(), |tool| tool.program), service != Service::Steam)
+}
+
 /// Signs in to `service` with `answer` (what the user pasted, see [`steps`]), through the tool's
 /// own flow; `show` is told what to show meanwhile (the page rclone opens, Steam's QR code).
 /// Returns who is signed in now.
-pub async fn sign_in(service: Service, answer: &str, proxy: Option<&str>, mut show: impl FnMut(Step) + Send) -> Result<String, String> {
+pub async fn sign_in(service: Service, answer: &str, proxy: Proxy<'_>, mut show: impl FnMut(Step) + Send) -> Result<String, String> {
+    proxy_check(service, proxy)?;
     match service {
         Service::Cloud => {
             let mut words = answer.split_whitespace();
@@ -167,10 +176,12 @@ pub async fn sign_in(service: Service, answer: &str, proxy: Option<&str>, mut sh
 }
 
 /// Signs out of `service`: forgets the sign-in the app's folder holds. For cloud drives `what`
-/// names the drive to remove (all of them without it).
-pub async fn sign_out(service: Service, what: Option<&str>, proxy: Option<&str>) -> Result<(), String> {
+/// names the drive to remove (all of them without it). Returns what to tell the user: that it is
+/// done, and what stays (Steam's sign-in on Windows, see `steam::LEFT_AFTER_SIGN_OUT`).
+pub async fn sign_out(service: Service, what: Option<&str>, proxy: Proxy<'_>) -> Result<String, String> {
     match service {
         Service::Cloud => {
+            proxy_check(service, proxy)?;
             let names = match what {
                 Some(name) => vec![name.to_string()],
                 None => tokio::task::spawn_blocking(rclone::remotes).await.unwrap_or_default(),
@@ -178,13 +189,16 @@ pub async fn sign_out(service: Service, what: Option<&str>, proxy: Option<&str>)
             for name in names {
                 rclone::sign_out(&name, proxy).await?;
             }
-            Ok(())
         }
-        Service::Epic => epic::sign_out(proxy).await,
-        Service::Gog => gog::sign_out(),
-        Service::Steam => steam::sign_out(),
-        Service::Streams => Ok(()),
+        Service::Epic => epic::sign_out().await?,
+        Service::Gog => gog::sign_out()?,
+        Service::Steam => steam::sign_out()?,
+        Service::Streams => {}
     }
+    Ok(match steam::LEFT_AFTER_SIGN_OUT.filter(|_| service == Service::Steam) {
+        Some(left) => format!("Signed out of {}. {left}", service.name()),
+        None => format!("Signed out of {}", service.name()),
+    })
 }
 
 /// One thing an account can download.
@@ -202,7 +216,10 @@ pub struct Item {
 }
 
 /// What `service`'s account can download.
-pub async fn library(service: Service, proxy: Option<&str>) -> Result<Vec<Item>, String> {
+pub async fn library(service: Service, proxy: Proxy<'_>) -> Result<Vec<Item>, String> {
+    if matches!(service, Service::Epic | Service::Gog) {
+        proxy_check(service, proxy)?;
+    }
     match service {
         Service::Cloud => {
             let remotes = tokio::task::spawn_blocking(rclone::remotes).await.unwrap_or_default();
@@ -229,19 +246,16 @@ pub fn handles(url: &Url) -> bool {
 /// for a UI thread (see `ingest::needs_reading`).
 pub fn takes(token: &str) -> bool {
     let token = token.trim();
-    Url::parse(token).is_ok_and(|url| handles(&url) || steam::store_app(&url).is_some()) || rclone::may_be_remote(token)
+    Url::parse(token).is_ok_and(|url| handles(&url)) || rclone::may_be_remote(token)
 }
 
-/// `token` as such a link: one already, a cloud drive's `remote:path` (see
-/// `rclone::link_of`), or a Steam store page's while the user is signed in to Steam. Blocking (it
-/// reads the app's rclone config).
+/// `token` as such a link: one already, or a cloud drive's `remote:path` (see
+/// `rclone::link_of`). Never a web link (a Steam store page's goes the way any page does): one may
+/// come from any web page. Blocking (it reads the app's rclone config).
 pub fn link_of(token: &str) -> Option<Url> {
     let url = Url::parse(token.trim()).ok();
     if let Some(url) = url.as_ref().filter(|u| handles(u) && u.scheme() != "rclone") {
         return Some(url.clone());
-    }
-    if let Some(app) = url.as_ref().and_then(steam::store_app).filter(|_| steam::account().is_some()) {
-        return Url::parse(&format!("steam://app/{app}")).ok();
     }
     rclone::link_of(token.trim())
 }
@@ -252,10 +266,16 @@ pub fn link_of(token: &str) -> Option<Url> {
 pub async fn list(token: &str, options: &ListOptions) -> Option<Result<Vec<Task>, String>> {
     let owned = token.to_string();
     let url = tokio::task::spawn_blocking(move || link_of(&owned)).await.ok().flatten()?;
-    let proxy = options.proxy.as_deref();
+    let proxy = Proxy { url: options.proxy.as_deref(), pool: options.proxy_pool, direct: false };
     Some(match url.scheme() {
-        "rclone" => rclone::list(&url, proxy).await,
-        "gog" => gog::list(&url, proxy).await,
+        "rclone" => match proxy_check(Service::Cloud, proxy) {
+            Ok(()) => rclone::list(&url, proxy).await,
+            Err(e) => Err(e),
+        },
+        "gog" => match proxy_check(Service::Gog, proxy) {
+            Ok(()) => gog::list(&url, proxy).await,
+            Err(e) => Err(e),
+        },
         _ => Ok(vec![Task { urls: vec![url], ..Task::default() }]),
     })
 }
@@ -277,10 +297,18 @@ pub(crate) async fn route(
     snapshots: Option<broadcast::Sender<EngineSnapshot>>,
     cancel: CancellationToken,
 ) -> Result<Route, String> {
-    let proxy = options.proxy.as_deref();
-    match link.scheme() {
-        "rclone" => {
-            let (remote, path) = rclone::parts(link).ok_or_else(|| format!("{link} names no drive"))?;
+    let proxy = Proxy::of(options);
+    let service = match link.scheme() {
+        "rclone" => Service::Cloud,
+        "gog" => Service::Gog,
+        "epic" => Service::Epic,
+        "steam" => Service::Steam,
+        other => return Err(format!("{other}: links are not an account's")),
+    };
+    proxy_check(service, proxy)?;
+    match service {
+        Service::Cloud => {
+            let (remote, path) = rclone::configured(link).await?;
             let served = tokio::select! {
                 served = rclone::served(proxy) => served?,
                 () = cancel.cancelled() => return Err(crate::engine::CANCELLED.to_string()),
@@ -297,13 +325,13 @@ pub(crate) async fn route(
             };
             Ok(Route::Http { url, options, keep: Some(served) })
         }
-        "gog" => {
+        Service::Gog => {
             let (url, auth) = gog::route(link, proxy).await?;
             Ok(Route::Http { url, options: DownloadOptions { auth_header: Some(auth), ..options.clone() }, keep: None })
         }
-        "epic" => epic::download(link, options, save_dir, snapshots, cancel).await.map(Route::Done),
-        "steam" => steam::download(link, options, save_dir, snapshots, cancel).await.map(Route::Done),
-        other => Err(format!("{other}: links are not an account's")),
+        Service::Epic => epic::download(link, options, save_dir, snapshots, cancel).await.map(Route::Done),
+        Service::Steam => steam::download(link, options, save_dir, snapshots, cancel).await.map(Route::Done),
+        Service::Streams => Err(format!("{link}: live streams have no links of their own")),
     }
 }
 
@@ -324,8 +352,31 @@ mod tests {
         let url = |s: &str| Url::parse(s).unwrap();
         assert!(handles(&url("epic://Fortnite")) && handles(&url("gog://game/1")) && !handles(&url("https://example.com/")));
         assert_eq!(link_of("epic://Sugar").unwrap().as_str(), "epic://Sugar");
-        assert!(link_of("https://store.steampowered.com/app/440/").is_none(), "only while signed in to Steam");
+        assert!(link_of("https://store.steampowered.com/app/440/").is_none() && !takes("https://store.steampowered.com/app/440/"), "never from a web link");
         assert!(link_of("https://example.com/a.zip").is_none());
+    }
+
+    /// The links of each account are refused before anything goes online when the proxy setting
+    /// cannot be followed, and a drive's link only names a drive the app has set up.
+    #[tokio::test]
+    async fn links_are_routed_only_where_the_proxy_setting_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let route_of = |link: &str, options: DownloadOptions| {
+            let (link, dir) = (Url::parse(link).unwrap(), dir.path().to_path_buf());
+            async move { route(&link, &options, &dir, None, CancellationToken::new()).await.err().unwrap_or_default() }
+        };
+        let pool = DownloadOptions { proxy_pool: vec!["http://127.0.0.1:9".to_string()], ..DownloadOptions::default() };
+        for link in ["rclone://gdrive/a.txt", "gog://file/downloads/x", "epic://Sugar", "steam://app/228980"] {
+            let refused = route_of(link, pool.clone()).await;
+            assert!(refused.contains("proxy pool"), "{link}: {refused}");
+        }
+        let proxied = DownloadOptions { proxy: Some("http://127.0.0.1:9".to_string()), ..DownloadOptions::default() };
+        assert!(route_of("steam://app/228980", proxied).await.contains("cannot go through a proxy"));
+        assert!(route_of("rclone://nosuchdrive/a.txt", DownloadOptions::default()).await.contains("not a drive set up"));
+        assert!(route_of("rclone://c/Users/x/token.json", DownloadOptions::default()).await.contains("names no drive"));
+        assert!(route_of("https://example.com/a.zip", DownloadOptions::default()).await.contains("not an account's"));
+        let listed = list("gog://game/1207", &ListOptions { proxy_pool: true, ..ListOptions::default() }).await.unwrap();
+        assert!(listed.unwrap_err().contains("proxy pool"));
     }
 
     #[tokio::test]

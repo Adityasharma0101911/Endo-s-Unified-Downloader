@@ -944,8 +944,7 @@ impl DownloadEngine {
         if let Some(media_url) = self.media_target() {
             let result = self.run_media(media_url.clone(), None, snapshot_tx.clone()).await;
             // A live stream yt-dlp could not follow, which a streamlink already installed takes.
-            let proxy = self.options.proxy.as_deref();
-            if result.is_err() && !self.cancel_token.is_cancelled() && crate::livestream::takes(&media_url, proxy).await {
+            if result.is_err() && !self.cancel_token.is_cancelled() && crate::livestream::takes(&media_url, crate::helpers::Proxy::of(&self.options)).await {
                 let tx = snapshot_tx.clone();
                 match crate::livestream::run(&media_url, &self.options, &self.save_dir(), tx, self.cancel_token.clone()).await {
                     Ok(done) => return self.unless_rerun(Ok(done)),
@@ -4158,7 +4157,7 @@ async fn server_addresses(host: &str, port: u16, family: IpFamily) -> Vec<std::n
 /// Whether the environment names a proxy for the clients (they take `HTTP_PROXY` and the like).
 // shortcut: the system's own proxy settings (Windows' Internet Options, macOS's) are not looked
 // at, as reqwest is built here without them; look if it ever reads them.
-fn proxy_in_env() -> bool {
+pub(crate) fn proxy_in_env() -> bool {
     ["http_proxy", "https_proxy", "all_proxy"]
         .iter()
         .any(|name| [name.to_string(), name.to_ascii_uppercase()].iter().any(|var| std::env::var_os(var).is_some_and(|v| !v.is_empty())))
@@ -6033,6 +6032,7 @@ fn set_remote_time(path: &Path, http_date: &str) {
 fn space_needed(size: u64, have: u64, part: &Path) -> u64 {
     size.saturating_sub(have.max(allocated(part))).saturating_add(DISK_HEADROOM)
 }
+
 /// Fails when the disk of `dir` lacks the space a download of `size` bytes, `have` of them written
 /// to `part`, still needs (see [`space_needed`]). Blocking.
 pub(crate) fn check_space(dir: &Path, size: u64, have: u64, part: &Path) -> Result<(), String> {
@@ -6042,7 +6042,6 @@ pub(crate) fn check_space(dir: &Path, size: u64, have: u64, part: &Path) -> Resu
         _ => Ok(()),
     }
 }
-
 
 /// The bytes `path` takes up on its disk: a sparse file only its written ranges; 0 when it isn't
 /// there. Blocking.
