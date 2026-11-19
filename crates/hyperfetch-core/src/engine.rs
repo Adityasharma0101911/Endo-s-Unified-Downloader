@@ -8938,7 +8938,8 @@ mod tests {
         };
         let both = async { tokio::join!(run("high.bin", crate::queue::Priority::High), run("low.bin", crate::queue::Priority::Low)) };
         let (high, low) = tokio::time::timeout(Duration::from_secs(60), both).await.expect("finished in a minute");
-        assert!(high.as_secs_f64() < 0.75 * low.as_secs_f64(), "{high:?} {low:?}");
+        // By their gap, not their ratio: a slow machine starts both late, which shrinks the ratio.
+        assert!(high + Duration::from_millis(500) < low, "{high:?} {low:?}");
         // 3 MiB in all at 1 MB/s, less a second of credit.
         assert!(low > Duration::from_millis(2500), "{low:?}");
     }
