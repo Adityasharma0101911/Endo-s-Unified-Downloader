@@ -183,6 +183,139 @@ pub fn pulse(ctx: &Context, period: f32) -> f32 {
     tick(ctx).map_or(0.0, |time| (0.5 - 0.5 * (time * std::f64::consts::TAU / period as f64).cos()) as f32)
 }
 
+// ---- Springs --------------------------------------------------------------------------------
+
+/// How long a [`roll`]ing number takes to cover half the way to a new reading.
+pub const ROLL: f32 = 0.12;
+/// The half-life of things that glide into place: the focus ring, a lifted card.
+pub const GLIDE: f32 = 0.07;
+
+#[derive(Clone, Copy)]
+struct Spring {
+    pos: f32,
+    vel: f32,
+    time: f64,
+    /// The target it moves to, and how far it was from it when that target came.
+    target: f32,
+    span: f32,
+}
+
+/// One step of a critically damped spring from `pos` (moving at `vel`) towards `target`, `dt`
+/// seconds long. `half_life` sets its pace (from rest: 40 % of the way in one, 95 % in about
+/// six); it never overshoots.
+fn spring_step(pos: f32, vel: f32, target: f32, half_life: f32, dt: f32) -> (f32, f32) {
+    let y = 2.0 * std::f32::consts::LN_2 / half_life.max(1e-4);
+    let (j0, eydt) = (pos - target, (-y * dt).exp());
+    let j1 = vel + j0 * y;
+    (eydt * (j0 + j1 * dt) + target, eydt * (vel - j1 * y * dt))
+}
+
+/// `target`, followed by a critically damped spring keyed by `id`: no snapping, no overshoot,
+/// a new target taken up with the speed it already has. At the target the first time `id` is
+/// seen, at once under Reduce motion; asks for frames only while it moves.
+pub fn spring(ctx: &Context, id: Id, target: f32, half_life: f32) -> f32 {
+    let now = ctx.input(|i| i.time);
+    let reduced = reduced(ctx);
+    let (pos, moving) = ctx.data_mut(|d| {
+        let s = d.get_temp_mut_or_insert_with(id, || Spring { pos: target, vel: 0.0, time: now, target, span: 0.0 });
+        let dt = ((now - s.time) as f32).clamp(0.0, 0.1);
+        s.time = now;
+        if s.target != target {
+            (s.target, s.span) = (target, (target - s.pos).abs());
+        }
+        if reduced || !target.is_finite() || !s.pos.is_finite() {
+            (s.pos, s.vel) = (target, 0.0);
+        } else {
+            (s.pos, s.vel) = spring_step(s.pos, s.vel, target, half_life, dt);
+            // Settled: within a hundredth of a point (or of a unit), or a thousandth of the way
+            // it came (a speed falling from megabytes to nothing), and nearly still.
+            let near = 0.01_f32.max(target.abs() * 1e-4).max(s.span * 1e-3);
+            if (s.pos - target).abs() < near && s.vel.abs() < near * 10.0 {
+                (s.pos, s.vel) = (target, 0.0);
+            }
+        }
+        (s.pos, s.pos != target)
+    });
+    if moving {
+        ctx.request_repaint();
+    }
+    pos
+}
+
+/// A number (a speed, a percentage, seconds left) rolling smoothly to each new reading.
+pub fn roll(ctx: &Context, id: Id, target: f32) -> f32 {
+    spring(ctx, id, target, ROLL)
+}
+
+/// `rect` gliding to each new place and size (see [`spring`]).
+pub fn glide_rect(ctx: &Context, id: Id, rect: Rect) -> Rect {
+    let [x0, y0, x1, y1] = [rect.min.x, rect.min.y, rect.max.x, rect.max.y];
+    let at = |n: u8, v: f32| spring(ctx, id.with(n), v, GLIDE);
+    Rect::from_min_max(Pos2::new(at(0, x0), at(1, y0)), Pos2::new(at(2, x1), at(3, y1)))
+}
+
+// ---- Scrolling ------------------------------------------------------------------------------
+
+/// The share of a mouse wheel's turn still to scroll after `dt` seconds: it eases out over about
+/// a quarter of a second (egui's own reaches 90 % in a tenth).
+fn wheel_left(dt: f32) -> f32 {
+    (-dt / 0.085).exp()
+}
+
+/// Mouse wheel notches eased out over about a quarter of a second, for every scroll area of the
+/// frame: call it first thing each frame. Trackpads and Ctrl+wheel zoom are left as they come;
+/// under Reduce motion a notch scrolls at once.
+pub fn glide_scroll(ctx: &Context) {
+    let id = Id::new("wheel glide");
+    let reduced = reduced(ctx);
+    let (pending, now) = ctx.input_mut(|i| {
+        let (mut smooth, mut notches) = (Vec2::ZERO, Vec2::ZERO);
+        let screen = i.screen_rect().height();
+        for event in &i.events {
+            let egui::Event::MouseWheel { unit, delta, modifiers } = event else { continue };
+            let mut delta = match unit {
+                egui::MouseWheelUnit::Point => *delta,
+                egui::MouseWheelUnit::Line => 50.0 * *delta,
+                egui::MouseWheelUnit::Page => screen * *delta,
+            };
+            if modifiers.shift {
+                delta = Vec2::new(delta.x + delta.y, 0.0);
+            }
+            if modifiers.ctrl || modifiers.mac_cmd || modifiers.command {
+                continue;
+            }
+            // As egui tells a trackpad's fine steps from a wheel's notches.
+            let fine = matches!(unit, egui::MouseWheelUnit::Point) && delta.length() < 8.0;
+            if fine {
+                smooth += delta;
+            } else {
+                notches += delta;
+            }
+        }
+        (notches, (i.time, i.stable_dt.min(0.1), smooth))
+    });
+    let (time, dt, smooth) = now;
+    let left = ctx.data_mut(|d| {
+        let state = d.get_temp_mut_or_insert_with(id, || (Vec2::ZERO, time));
+        let dt = if time > state.1 { dt } else { 0.0 };
+        state.1 = time;
+        state.0 += pending;
+        let keep = if reduced { 0.0 } else { wheel_left(dt) };
+        let mut step = state.0 * (1.0 - keep);
+        if (state.0 - step).length() < 0.5 {
+            step = state.0;
+        }
+        state.0 -= step;
+        (step, state.0)
+    });
+    let (step, rest) = left;
+    // What egui eased out of earlier notches itself is replaced by this, the trackpad's kept.
+    ctx.input_mut(|i| i.smooth_scroll_delta = smooth + step);
+    if rest != Vec2::ZERO {
+        ctx.request_repaint();
+    }
+}
+
 // ---- Containers -----------------------------------------------------------------------------
 
 /// Shows `add` `t` opaque and `(1 - t) * from` away from its place, while what follows is laid
@@ -411,6 +544,83 @@ mod tests {
         let (mid, delay) = at(&ctx, 5.3, |ctx| color(ctx, chip, Color32::GREEN, 0.3));
         assert!(mid != Color32::RED && mid != Color32::GREEN && delay == Duration::ZERO, "{mid:?}");
         assert_eq!(settled(&ctx, 6.0, |ctx| color(ctx, chip, Color32::GREEN, 0.3)), Color32::GREEN);
+    }
+
+    /// A spring takes up a new target smoothly, never past it, settles on it exactly and then
+    /// asks for no frames; seen first, or under Reduce motion, it is at its target at once.
+    #[test]
+    fn a_spring_glides_without_overshoot_and_settles() {
+        let ctx = fresh();
+        let id = Id::new("spring");
+        assert_eq!(settled(&ctx, 1.0, |ctx| spring(ctx, id, 10.0, 0.1)), 10.0);
+        let mut seen = Vec::new();
+        let mut time = 2.0;
+        loop {
+            let (value, delay) = at(&ctx, time, |ctx| spring(ctx, id, 50.0, 0.1));
+            seen.push(value);
+            time += 1.0 / 60.0;
+            if delay == Duration::MAX || time > 4.0 {
+                break;
+            }
+        }
+        assert_eq!(*seen.last().unwrap(), 50.0, "settles exactly: {seen:?}");
+        assert!(seen.windows(2).all(|w| w[0] <= w[1]) && seen.iter().all(|&v| v <= 50.0), "no overshoot: {seen:?}");
+        assert!(seen.iter().filter(|&&v| v > 10.0 && v < 50.0).count() >= 10, "glides: {seen:?}");
+        assert!(time < 3.5, "within a second and a half");
+        // Under Reduce motion: there at once.
+        at(&ctx, 5.0, |ctx| set_reduced(ctx, true));
+        assert_eq!(at(&ctx, 5.1, |ctx| spring(ctx, id, -20.0, 0.1)), (-20.0, Duration::MAX));
+    }
+
+    /// One frame at `time` with `events`, after `glide_scroll`: how far a scroll area under the
+    /// pointer moves this frame (what `glide_scroll` leaves for it), and how soon the next frame
+    /// is asked for. The harness's page tests scroll real pages with it.
+    fn scroll_frame(ctx: &Context, time: f64, events: Vec<egui::Event>) -> (f32, Duration) {
+        let mut moved = 0.0;
+        let input = egui::RawInput {
+            time: Some(time),
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 300.0))),
+            events,
+            ..Default::default()
+        };
+        let output = ctx.run(input, |ctx| {
+            glide_scroll(ctx);
+            moved = -ctx.input(|i| i.smooth_scroll_delta.y);
+        });
+        (moved, output.viewport_output[&egui::ViewportId::ROOT].repaint_delay)
+    }
+
+    /// A mouse wheel's notch scrolls the list smoothly, easing out over a quarter of a second or
+    /// so, then frames stop; under Reduce motion it is there at once.
+    #[test]
+    fn a_wheel_notch_glides_and_then_stops() {
+        for reduce in [false, true] {
+            let ctx = Context::default();
+            ctx.data_mut(|d| d.insert_temp(reduced_id(), reduce));
+            let mut time = 1.0;
+            for _ in 0..3 {
+                scroll_frame(&ctx, time, vec![egui::Event::PointerMoved(Pos2::new(200.0, 150.0))]);
+                time += 1.0 / 60.0;
+            }
+            let wheel = egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: Vec2::new(0.0, -300.0), modifiers: egui::Modifiers::NONE };
+            let mut offsets = vec![scroll_frame(&ctx, time, vec![wheel]).0];
+            let mut delay = Duration::ZERO;
+            for _ in 0..90 {
+                time += 1.0 / 60.0;
+                let (moved, next) = scroll_frame(&ctx, time, Vec::new());
+                offsets.push(offsets.last().unwrap() + moved);
+                delay = next;
+            }
+            let end = *offsets.last().unwrap();
+            assert!((end - 300.0).abs() < 1.0, "the whole notch: {offsets:?}");
+            assert!(offsets.windows(2).all(|w| w[0] <= w[1] + 1e-3), "only forward: {offsets:?}");
+            assert_eq!(delay, Duration::MAX, "then still");
+            if reduce {
+                assert!(offsets[1] > 299.0, "at once: {offsets:?}");
+            } else {
+                assert!(offsets[1] < 150.0 && offsets[8] < 299.0 && offsets[8] > 150.0, "eases out: {offsets:?}");
+            }
+        }
     }
 
     /// Under Reduce motion every transition is over at once and nothing asks for frames, the

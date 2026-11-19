@@ -3,7 +3,6 @@ use url::Url;
 
 use super::*;
 
-use super::queue::download_details;
 
 /// Adds the links of `text` from the clipboard to the queue, which the form's checksum and
 /// Authorization header don't apply to: a paste with secrets or a copied request as
@@ -36,7 +35,7 @@ pub(super) fn add_link(app: &mut App, text: &str) {
 /// Shows the banner `show` makes of `now`. As `now` comes, its room opens over 0.2 s, pushing
 /// what is under it down smoothly; once it is gone (dismissed, answered, over), what it last
 /// showed fades out while its room closes up, its buttons no longer working.
-fn fading<T: Clone + Send + Sync + 'static>(ui: &mut Ui, name: &str, now: Option<T>, show: impl FnOnce(&mut Ui, T)) {
+pub(super) fn fading<T: Clone + Send + Sync + 'static>(ui: &mut Ui, name: &str, now: Option<T>, show: impl FnOnce(&mut Ui, T)) {
     let id = egui::Id::new(("banner ghost", name));
     let live = now.is_some();
     let shown = anim::presence(ui.ctx(), id, live, 0.2);
@@ -130,7 +129,7 @@ pub(super) fn undo_toast(app: &mut App, ctx: &egui::Context) {
 }
 
 /// The first-run card: the three steps to a first download, until it is closed.
-fn welcome(app: &mut App, ui: &mut Ui) {
+pub(super) fn welcome(app: &mut App, ui: &mut Ui) {
     let p = palette(ui);
     anim::fade_in(ui, egui::Id::new("welcome"), 0.0, anim::RISE, |ui| {
         card(ui).show(ui, |ui| {
@@ -166,7 +165,7 @@ fn welcome(app: &mut App, ui: &mut Ui) {
             });
             ui.horizontal(|ui| {
                 chip(ui, "3", p.accent);
-                ui.label(RichText::new(keys("Paste a link in the box above and press Download, or press Ctrl+V anywhere in the window.")).color(p.text));
+                ui.label(RichText::new(keys("Paste a link in the bar above and press Download, or press Ctrl+V anywhere in the window.")).color(p.text));
             });
         });
     });
@@ -237,7 +236,7 @@ pub(super) fn clipboard_banner(app: &mut App, ui: &mut Ui) {
                 app.clipboard_banner = None;
                 app.new_download();
                 app.url_input = link.clone();
-                app.tab = Tab::Downloader;
+                app.tab = Tab::Downloads;
             }
             if ui.add(button("Add to queue")).clicked() {
                 app.clipboard_banner = None;
@@ -326,160 +325,183 @@ pub(super) fn drop_zone(ctx: &egui::Context) {
 }
 
 /// `add` drawn `dx` points to the side, what follows laid out as if it were not: for a shake.
-fn nudged(ui: &mut Ui, dx: f32, add: impl FnOnce(&mut Ui)) {
+pub(super) fn nudged(ui: &mut Ui, dx: f32, add: impl FnOnce(&mut Ui)) {
     let offset = Vec2::new(dx, 0.0);
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(ui.available_rect_before_wrap().translate(offset)).layout(*ui.layout()));
     add(&mut child);
     ui.advance_cursor_after_rect(child.min_rect().translate(-offset));
 }
 
-pub(super) fn add_page(app: &mut App, ui: &mut Ui) {
+/// The front door: one large bar to paste or drop anything into, always at the top of the
+/// Downloads page. As soon as something is in it, a card under it says in plain words what it
+/// is (see `kinds::recognise`), where it comes from and the two or three choices that matter for
+/// that kind, with one Download button; More options holds the rest, and stays open once opened.
+pub(super) fn front_door(app: &mut App, ui: &mut Ui) {
     let p = palette(ui);
-    let focused = app.focused_item().cloned();
-    let active = focused.as_ref().is_some_and(|item| item.status.is_active());
-
-    card(ui).show(ui, |ui| {
+    let ctx = ui.ctx().clone();
+    let id = egui::Id::new("url_input");
+    let lit = anim::presence(&ctx, id.with("lit"), ctx.memory(|m| m.has_focus(id)) || !app.url_input.trim().is_empty(), 0.22);
+    let recognised = kinds::recognise(&app.url_input);
+    let glyph = recognised.as_ref().map_or(icon::LINK, |(kind, _)| kind.glyph);
+    let frame = Frame::none()
+        .fill(p.card)
+        .stroke(Stroke::new(1.0 + lit, p.border.lerp_to_gamma(p.link, lit)))
+        .rounding(16.0)
+        .inner_margin(Margin { left: 16.0, right: 8.0, top: 8.0, bottom: 8.0 })
+        .shadow(card_shadow(ui, 0.3 + 0.7 * lit));
+    frame.show(ui, |ui| {
         ui.set_width(ui.available_width());
-        match &focused {
-            Some(item) => {
-                ui.horizontal(|ui| {
-                    let (status, color) = status_badge(app, item, &p);
-                    let done = item.status == QueueItemStatus::Completed;
-                    // Kept current while shown, so that the check draws itself as the download completes.
-                    let drawn = anim::ease(anim::changed(ui.ctx(), egui::Id::new(("completed check", item.id)), done, 0.5));
-                    status_chip(ui, egui::Id::new(("item", item.id)), status, color, item.status == QueueItemStatus::Downloading);
-                    if done {
-                        let (rect, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
-                        ui.painter().circle_filled(rect.center(), 9.0 * anim::overshoot(drawn), p.green.gamma_multiply(0.2));
-                        anim::paint_check(ui.painter(), rect.shrink(3.0), drawn, Stroke::new(2.0, p.green));
-                    }
-                    ui.add(egui::Label::new(bold(&item.filename).size(16.0).color(p.strong)).truncate()).on_hover_text(&item.filename);
-                });
-                ui.add_space(4.0);
-                // The shown download keeps its own links; New download frees the box.
-                let urls = item.urls.iter().map(|u| u.as_str()).collect::<Vec<_>>().join(" ");
-                ui.add(egui::TextEdit::singleline(&mut urls.as_str()).desired_width(f32::INFINITY));
-            }
-            None => {
-                ui.horizontal(|ui| {
-                    let edit = egui::TextEdit::singleline(&mut app.url_input)
-                        .id(egui::Id::new("url_input"))
-                        .hint_text("File link, video page (YouTube, Vimeo, Reddit, ...), playlist or channel, magnet, .torrent or .metalink")
-                        .margin(Vec2::new(10.0, 7.0))
-                        .desired_width(ui.available_width() - 212.0);
-                    let response = ui.add(edit);
-                    if response.changed() {
-                        app.form_error = None;
-                    }
-                    if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        start_from_form(app);
-                    }
-                    if ui.add_sized([86.0, 32.0], button(format!("{} Paste", icon::CLIPBOARD_TEXT))).clicked() {
-                        app.paste_url();
-                    }
-                    if download_button(app, ui).clicked() {
-                        start_from_form(app);
-                    }
-                });
-            }
-        }
-
-        if focused.is_none() {
-            zip_preview(app, ui);
-            update_offer(app, ui);
-        }
-        stream_tracks(app, ui, focused.as_ref());
-        if focused.is_none() && ingest::is_blob_url(&app.url_input) {
-            error_alert(ui, ingest::BLOB_MESSAGE);
-        }
-        // A new error shakes its alert, as does the shown download failing; both open and close
-        // their room smoothly. The shake follows every change, but an alert fading out stays still.
-        let dx = anim::shake(ui.ctx(), egui::Id::new("form error"), &app.form_error);
-        let dx = if app.form_error.is_some() { dx } else { 0.0 };
-        fading(ui, "form error", app.form_error.clone(), |ui, error| nudged(ui, dx, |ui| error_alert(ui, &error)));
-        if let Some(item) = &focused {
-            let error = match &item.status {
-                QueueItemStatus::Failed(error) => Some(match util::error_hint(error) {
-                    Some(hint) => format!("Download failed: {}. {}", error.trim_end_matches('.'), hint),
-                    None => format!("Download failed: {}", error),
-                }),
-                _ => None,
-            };
-            let dx = anim::shake(ui.ctx(), egui::Id::new(("failed", item.id)), error.is_some());
-            let dx = if error.is_some() { dx } else { 0.0 };
-            fading(ui, &format!("failed {}", item.id), error, |ui, error| nudged(ui, dx, |ui| error_alert(ui, &error)));
-        }
-
-        ui.add_space(10.0);
         ui.horizontal(|ui| {
+            anim::icon(ui, glyph, 20.0, p.muted.lerp_to_gamma(p.link, lit), 1.0, 0.0);
+            let edit = egui::TextEdit::singleline(&mut app.url_input)
+                .id(id)
+                .hint_text("Paste or drop anything: a link, a magnet, a playlist, a .torrent…")
+                .font(FontId::proportional(16.0))
+                .frame(false)
+                .margin(Vec2::new(6.0, 10.0))
+                .desired_width((ui.available_width() - 214.0).max(120.0));
+            let response = ui.add(edit);
+            if response.changed() {
+                app.form_error = None;
+            }
+            if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                start_from_form(app);
+            }
+            if ui.add_sized([86.0, 38.0], button(format!("{} Paste", icon::CLIPBOARD_TEXT))).on_hover_text("Paste the copied link here").clicked() {
+                app.paste_url();
+            }
+            if download_button(app, ui).clicked() {
+                start_from_form(app);
+            }
+        });
+    });
+    if ingest::is_blob_url(&app.url_input) {
+        error_alert(ui, ingest::BLOB_MESSAGE);
+    }
+    // A new error shakes its alert; it opens and closes its room smoothly. The shake follows
+    // every change, but an alert fading out stays still.
+    let dx = anim::shake(&ctx, egui::Id::new("form error"), &app.form_error);
+    let dx = if app.form_error.is_some() { dx } else { 0.0 };
+    fading(ui, "form error", app.form_error.clone(), |ui, error| nudged(ui, dx, |ui| error_alert(ui, &error)));
+    let shown = recognised.map(|(kind, source)| (kind.name, source));
+    fading(ui, "recognised", shown, |ui, (name, source)| {
+        let Some(kind) = kinds::KINDS.iter().chain(std::iter::once(&kinds::SEVERAL)).find(|kind| kind.name == name) else { return };
+        ui.add_space(8.0);
+        preview_card(app, ui, kind, &source);
+    });
+    ui.add_space(14.0);
+}
+
+/// The card under the link bar: what the input is, where from and what it holds, the choices
+/// that matter for its kind (the quality of a video, a stream's tracks, a ZIP's files), where it
+/// goes, and More options.
+fn preview_card(app: &mut App, ui: &mut Ui, kind: &kinds::Kind, source: &str) {
+    let p = palette(ui);
+    card(ui).inner_margin(Margin::symmetric(18.0, 14.0)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            let (rect, _) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::hover());
+            ui.painter().circle_filled(rect.center(), 20.0, p.accent.gamma_multiply(0.16));
+            anim::paint_icon(ui.painter(), rect.center(), kind.glyph, 20.0, p.link, 0.0);
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                ui.horizontal(|ui| {
+                    ui.label(bold(kind.name).size(16.0).color(p.strong));
+                    if !source.is_empty() {
+                        ui.label(RichText::new(format!("from {source}")).color(p.muted));
+                    }
+                });
+                if let Some(name) = shown_name(&app.url_input) {
+                    ui.add(egui::Label::new(RichText::new(&name).color(p.text)).truncate()).on_hover_text(&name);
+                }
+                ui.add(egui::Label::new(RichText::new(kind.about).small().color(p.muted)).wrap());
+                match kind.needs {
+                    kinds::Needs::Account(what) => {
+                        ui.label(RichText::new(format!("{} Uses your own account: Settings, {what}", icon::KEY)).small().color(p.amber));
+                    }
+                    kinds::Needs::Tool(tool) => {
+                        ui.label(RichText::new(format!("{} {tool} is fetched the first time it is needed", icon::WRENCH)).small().color(p.dim));
+                    }
+                    kinds::Needs::Nothing => {}
+                }
+            });
+        });
+        ui.add_space(8.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
+            if kind.choice == kinds::Choice::Quality {
+                ui.label(RichText::new(icon::FILM_STRIP).size(16.0).color(p.muted)).on_hover_text("Quality");
+                combo(ui, "media_preset_combo", &mut app.settings.media_preset, &MEDIA_PRESETS);
+            }
+            if kind.choice == kinds::Choice::Files {
+                ui.label(RichText::new(format!("{} You pick its files once it is read", icon::LIST_CHECKS)).color(p.muted));
+            }
             ui.label(RichText::new(icon::FOLDER_OPEN).size(16.0).color(p.muted)).on_hover_text("Save to");
-            ui.add(egui::TextEdit::singleline(&mut app.settings.save_dir).desired_width(ui.available_width() - 96.0));
-            if ui.add_enabled(!app.dialog_open, button("Browse…")).clicked() {
+            let folder = std::path::Path::new(&app.settings.save_dir);
+            let name = folder.file_name().map_or_else(|| app.settings.save_dir.clone(), |n| n.to_string_lossy().into_owned());
+            ui.label(RichText::new(name).color(p.text)).on_hover_text(&app.settings.save_dir);
+            if ui.add_enabled(!app.dialog_open, button("Change…")).on_hover_text("Choose where downloads are saved").clicked() {
                 app.pending_dialog = Some(Dialog::SaveDir);
             }
         });
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(icon::LIGHTNING).size(16.0).color(p.muted)).on_hover_text("Connections");
-            ui.add_enabled(!active, egui::Slider::new(&mut app.settings.connections, 1..=64).text("connections"))
-                .on_disabled_hover_text("A running download keeps the connection count it started with");
-            ui.add_space(12.0);
-            ui.label(RichText::new(icon::FILM_STRIP).size(16.0).color(p.muted)).on_hover_text("Media quality");
-            combo(ui, "media_preset_combo", &mut app.settings.media_preset, &MEDIA_PRESETS);
-        });
-        if let Some(item) = &focused {
-            ui.add_space(8.0);
-            ui.horizontal(|ui| download_actions(app, ui, item));
-        }
-
+        zip_preview(app, ui);
+        update_offer(app, ui);
+        stream_tracks(app, ui, None);
         ui.add_space(4.0);
-        // The caret turns down and the options drop in, their room opening (and closing) smoothly.
-        let open = anim::presence(ui.ctx(), egui::Id::new("advanced options"), app.show_advanced, 0.18);
-        let clicked = ui
-            .horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
-                let caret = anim::icon(ui, icon::CARET_RIGHT, 14.0, p.muted, 1.0, open * std::f32::consts::FRAC_PI_2);
-                let label = RichText::new("Advanced options: checksum, older version and Authorization header").color(p.muted);
-                let button = ui.add(egui::Button::new(label).frame(false));
-                button.clicked() || ui.interact(caret.rect, egui::Id::new("advanced caret"), Sense::click()).clicked()
-            })
-            .inner;
-        if clicked {
-            app.show_advanced = !app.show_advanced;
-        }
-        let shown = app.show_advanced.then_some(());
-        fading(ui, "advanced options", shown, |ui, ()| anim::shifted(ui, open, anim::DROP, |ui| advanced_options(app, ui)));
+        more_options(app, ui);
     });
+}
 
-    ui.add_space(12.0);
-    match &focused {
-        Some(item) => download_details(app, ui, item),
-        None => {
-            if !app.settings.welcomed {
-                welcome(app, ui);
+/// The file name the input names, from its link's last part: shown on the preview card.
+fn shown_name(input: &str) -> Option<String> {
+    let first = ingest::split_tokens(input.trim()).into_iter().next()?;
+    let url = Url::parse(&first).ok().filter(|url| matches!(url.scheme(), "http" | "https" | "ftp" | "ftps" | "sftp"))?;
+    let last = url.path_segments()?.filter(|s| !s.is_empty()).next_back()?;
+    let name = percent_decoded(last);
+    (!name.is_empty()).then_some(name)
+}
+
+/// `text` with its `%XX` escapes decoded, as a link's path shows a file name.
+fn percent_decoded(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut n = 0;
+    while n < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        match (bytes[n], bytes.get(n + 1).copied().and_then(hex), bytes.get(n + 2).copied().and_then(hex)) {
+            (b'%', Some(high), Some(low)) => {
+                out.push((high * 16 + low) as u8);
+                n += 3;
             }
-            card(ui).show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.label(bold("Tips").color(p.strong));
-                // The first time they show, the tips come in one after another.
-                for (n, tip) in [
-                    "Ctrl+V outside a text box adds the copied link to the queue.",
-                    "Drop a .torrent, .metalink or .meta4 file on the window to add every file it lists.",
-                    "Links to the same file from several servers, separated by spaces, download from all of them at once.",
-                    "The browser extension sends the videos and links of the pages you visit.",
-                ]
-                .into_iter()
-                .enumerate()
-                {
-                    anim::fade_in(ui, egui::Id::new(("tip", n)), anim::stagger(n + 1), anim::RISE, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(icon::INFO).color(p.accent));
-                            ui.label(RichText::new(keys(tip)).color(p.muted));
-                        });
-                    });
-                }
-            });
+            (byte, ..) => {
+                out.push(byte);
+                n += 1;
+            }
         }
     }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// More options: a caret that turns, and the options dropping in, their room opening (and
+/// closing) smoothly: connections, a checksum, an older version and an Authorization header, all
+/// for this download only.
+fn more_options(app: &mut App, ui: &mut Ui) {
+    let p = palette(ui);
+    let open = anim::presence(ui.ctx(), egui::Id::new("advanced options"), app.show_advanced, 0.18);
+    let clicked = ui
+        .horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let caret = anim::icon(ui, icon::CARET_RIGHT, 14.0, p.muted, 1.0, open * std::f32::consts::FRAC_PI_2);
+            let button = ui.add(egui::Button::new(RichText::new("More options").color(p.muted)).frame(false));
+            let button = button.on_hover_text("Connections, checksum, an older version, an Authorization header");
+            button.clicked() || ui.interact(caret.rect, egui::Id::new("advanced caret"), Sense::click()).clicked()
+        })
+        .inner;
+    if clicked {
+        app.show_advanced = !app.show_advanced;
+    }
+    let shown = app.show_advanced.then_some(());
+    fading(ui, "advanced options", shown, |ui, ()| anim::shifted(ui, open, anim::DROP, |ui| advanced_options(app, ui)));
 }
 
 /// The file an earlier download of the single link in the box finished into, when it is still
@@ -548,7 +570,7 @@ fn zip_preview(app: &mut App, ui: &mut Ui) {
 /// For a single HLS or DASH link in the box, Choose tracks…, which reads the stream and opens its
 /// track chooser here (see `App::list_tracks`); for the download shown, its chooser once opened
 /// (from its queue row or its own button).
-fn stream_tracks(app: &mut App, ui: &mut Ui, focused: Option<&QueueItem>) {
+pub(super) fn stream_tracks(app: &mut App, ui: &mut Ui, focused: Option<&QueueItem>) {
     let open = match focused {
         Some(item) => app.tracks.as_ref().is_some_and(|chooser| chooser.item == Some(item.id)),
         None => {
@@ -714,85 +736,6 @@ pub(super) fn start_from_form(app: &mut App) {
     app.download_now(&text, &checksum, &auth);
 }
 
-/// The buttons for the shown download, left to right, and New download on the right.
-fn download_actions(app: &mut App, ui: &mut Ui, item: &QueueItem) {
-    let p = palette(ui);
-    let id = item.id;
-    match &item.status {
-        QueueItemStatus::Queued => {
-            if ui.add(primary_button(&format!("{} Start now", icon::PLAY), p.accent)).clicked() {
-                app.start_job(id, false);
-            }
-        }
-        QueueItemStatus::Downloading => {
-            if ui.add(button(RichText::new(format!("{} Pause", icon::PAUSE)).color(p.red))).clicked() {
-                app.pause_job(id);
-            }
-        }
-        QueueItemStatus::Pausing => {
-            anim::spinner(ui, 16.0, p.muted);
-            let text = if app.is_recording(id) { "Stopping: finishing the recording..." } else { "Pausing: saving the resume state..." };
-            ui.label(RichText::new(text).color(p.muted));
-        }
-        QueueItemStatus::Paused | QueueItemStatus::Failed(_) => {
-            let resume = if item.status == QueueItemStatus::Paused { "Resume" } else { "Retry" };
-            let go_on = primary_button(&format!("{} {}", icon::PLAY, resume), p.green);
-            if ui.add(go_on).on_hover_text("Continue from the saved state").clicked() {
-                app.start_job(id, false);
-            }
-            let start_over = ui.add(button(format!("{} Start over", icon::ARROW_COUNTER_CLOCKWISE)));
-            if start_over.on_hover_text("Delete the partial file and download from the beginning").clicked() {
-                app.start_job(id, true);
-            }
-            let delete = button(RichText::new(format!("{} Delete leftovers", icon::TRASH)).color(p.red));
-            if ui.add(delete).on_hover_text("Remove this download and delete its partial file and resume state").clicked() {
-                app.discard_job(id);
-            }
-        }
-        QueueItemStatus::AuthRequired => {
-            let ready = !app.auth_input.trim().is_empty();
-            let resume = ui
-                .add_enabled_ui(ready, |ui| ui.add(primary_button(&format!("{} Resume", icon::PLAY), p.green)))
-                .inner
-                .on_hover_text("Continue from the saved state with the Authorization header entered under Advanced options")
-                .on_disabled_hover_text("Enter the Authorization header under Advanced options first");
-            if resume.clicked() {
-                app.resume_with_auth(id);
-            }
-        }
-        QueueItemStatus::Completed => {
-            if let Some(path) = &item.target_path {
-                if ui.add(primary_button(&format!("{} Open file", icon::FILE), p.accent)).clicked() {
-                    report(app, util::open_path(path));
-                }
-                if ui.add(button(format!("{} Show in folder", icon::FOLDER_OPEN))).clicked() {
-                    report(app, util::reveal_in_folder(path));
-                }
-                let idle = !app.verifying && app.repair.is_none();
-                if ui.add_enabled(idle, button(format!("{} Verify", icon::SHIELD_CHECK))).clicked() {
-                    app.verify(VerifyRequest {
-                        path: path.clone(),
-                        expected_size: (item.total_bytes > 0).then_some(item.total_bytes),
-                        checksum: item.options.expected_checksum.clone(),
-                    });
-                }
-            }
-        }
-    }
-    let choosing = app.tracks.as_ref().is_some_and(|chooser| chooser.item == Some(id));
-    if let Some(url) = item.urls.first().filter(|_| crate::tracks::offered(item) && !choosing) {
-        if ui.add(button(format!("{} Choose tracks…", icon::SLIDERS_HORIZONTAL))).clicked() {
-            app.list_tracks(Some(id), url.clone());
-        }
-    }
-    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-        let new = ui.add(button(format!("{} New download", icon::PLUS)));
-        if new.on_hover_text("Keep this download in the queue and start another").clicked() {
-            app.new_download();
-        }
-    });
-}
-
 /// The inputs that belong to one download and are never saved.
 fn advanced_options(app: &mut App, ui: &mut Ui) {
     let p = palette(ui);
@@ -801,6 +744,14 @@ fn advanced_options(app: &mut App, ui: &mut Ui) {
             ui.label(text);
         })
     };
+    ui.horizontal(|ui| {
+        label(ui, "Connections");
+        ui.add(egui::Slider::new(&mut app.settings.connections, 1..=64)).on_hover_text("More can be faster; some servers allow only a few");
+    });
+    ui.horizontal(|ui| {
+        label(ui, "Quality");
+        combo(ui, "media_preset_more", &mut app.settings.media_preset, &MEDIA_PRESETS);
+    });
     let checksum = "Optional, this download only: sha256:..., sha512:..., sha1:..., md5:..., blake3:..., or hex";
     ui.horizontal(|ui| {
         label(ui, "Checksum");
@@ -832,9 +783,9 @@ mod tests {
     use super::super::harness::Harness;
     use super::*;
 
-    /// A download added with the Add page shown turns its Download button into Added for a
+    /// A download added with the Downloads page shown turns its Download button into Added for a
     /// moment, after which frames stop; one added on another page is old news by the time the
-    /// Add page shows.
+    /// Downloads page shows.
     #[test]
     fn the_download_button_says_added_just_after_an_add() {
         let mut h = Harness::new();
@@ -848,10 +799,10 @@ mod tests {
         assert_eq!(h.frames(90), Duration::MAX, "and then idle");
         assert_eq!(just_added(&h.app, &h.app.ctx), 1.0);
 
-        h.app.tab = Tab::Queue;
+        h.app.tab = Tab::Library;
         h.paste("https://example.com/b.iso");
         h.frames(90);
-        h.app.tab = Tab::Downloader;
+        h.app.tab = Tab::Downloads;
         h.frames(1);
         assert_eq!(just_added(&h.app, &h.app.ctx), 1.0, "added a while ago");
 
@@ -1101,7 +1052,7 @@ mod tests {
                 }
                 h.frames(60);
                 let label = h.find(reading).unwrap();
-                let rows = Some(Rect::from_x_y_ranges(196.0..=980.0, label.bottom() + 4.0..=label.bottom() + 70.0));
+                let rows = Some(Rect::from_x_y_ranges(212.0..=980.0, label.bottom() + 4.0..=label.bottom() + 70.0));
                 // Shots a tenth of a second apart, over half the light's sweep.
                 let shots: Vec<_> = (0..9).map(|_| (h.frames(6), h.shot(rows))).collect();
                 let bar = [DARK.hover.r(), DARK.hover.g(), DARK.hover.b()];
@@ -1128,7 +1079,8 @@ mod tests {
         let mut h = Harness::new();
         let ghost = |h: &Harness| h.app.ctx.data(|d| d.get_temp::<Result<String, String>>(egui::Id::new(("banner ghost", "notice"))));
         assert!(h.settle());
-        let card = |h: &Harness| h.find("Tips").unwrap().top();
+        // The link bar, under the banners.
+        let card = |h: &Harness| h.app.ctx.read_response(egui::Id::new("url_input")).unwrap().rect.top();
         let top = card(&h);
         let mut tops = Vec::new();
         h.app.notice = Some(Ok("Added #1 to the queue".to_string()));
@@ -1150,14 +1102,14 @@ mod tests {
         assert_eq!(ghost(&h), None);
         assert_eq!(card(&h), top);
     }
-    /// A new user's Add page starts with the three steps, until Got it.
+    /// A new user's Downloads page starts with the three steps, until Got it.
     #[test]
     fn the_welcome_shows_until_it_is_closed() {
         let mut h = Harness::new();
         assert!(h.settle() && h.find("Welcome").is_none());
         h.app.settings.welcomed = false;
         h.frames(40);
-        assert!(h.find("Welcome").is_some() && h.find("Tips").is_some(), "{:?}", h.texts());
+        assert!(h.find("Welcome").is_some() && h.find("Try one of these").is_some(), "{:?}", h.texts());
         h.click("Got it");
         h.frames(5);
         assert!(h.app.settings.welcomed && h.find("Welcome").is_none());

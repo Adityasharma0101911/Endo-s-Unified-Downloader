@@ -58,6 +58,9 @@ pub struct Settings {
     /// Speed cap in KB/s or MB/s (see `max_speed_in_mb`); 0 means unlimited.
     pub max_speed: f64,
     pub max_speed_in_mb: bool,
+    /// Whether `max_speed` applies: the header's switch turns the limit off and on again without
+    /// forgetting it.
+    pub speed_limit_on: bool,
     pub max_retries: u32,
     pub stall_timeout_secs: u64,
     /// Wait for each finished file to reach the disk before reporting it done.
@@ -183,6 +186,10 @@ pub struct Settings {
     /// Instant transitions and nothing moving by itself; None follows the system (see
     /// [`Settings::reduces_motion`]).
     pub reduce_motion: Option<bool>,
+    /// The drifting motes behind the pages (see `ui::backdrop`); Reduce motion stills them too.
+    pub moving_background: bool,
+    /// How busy the moving background is: 0 calm, 1 normal, 2 lively.
+    pub background_intensity: usize,
     /// Closing the window hides it in the tray, where there is one; downloads go on.
     pub close_to_tray: bool,
     /// Start hidden in the tray (minimized where there is none), as `--minimized` does.
@@ -269,6 +276,7 @@ impl Default for Settings {
             browser_cookies: 0,
             max_speed: 0.0,
             max_speed_in_mb: true,
+            speed_limit_on: true,
             max_retries: engine.max_retries,
             stall_timeout_secs: engine.stall_timeout_secs,
             fsync_on_complete: engine.fsync_on_complete,
@@ -321,6 +329,8 @@ impl Default for Settings {
             ssh_key_passphrase: String::new(),
             theme: 0,
             reduce_motion: None,
+            moving_background: true,
+            background_intensity: 1,
             close_to_tray: false,
             start_minimized: false,
             launch_at_startup: false,
@@ -623,7 +633,7 @@ impl Settings {
         let debrid_provider = (!self.debrid_provider.trim().is_empty()).then(|| self.debrid_provider.trim().to_string());
         DownloadOptions {
             num_connections: self.connections.clamp(1, 64),
-            max_speed: speed_limit_bytes(self.max_speed, self.max_speed_in_mb),
+            max_speed: speed_limit_bytes(self.max_speed, self.max_speed_in_mb).filter(|_| self.speed_limit_on),
             max_retries: self.max_retries,
             stall_timeout_secs: self.stall_timeout_secs.max(1),
             fsync_on_complete: self.fsync_on_complete,
@@ -807,6 +817,9 @@ mod tests {
         assert_eq!(opts.expected_checksum.as_deref(), Some("sha256:abababababababababababababababababababababababababababababababab"));
         assert_eq!(opts.auth_header.as_deref(), Some("Bearer t"));
         assert_eq!(opts.max_speed, Some(2 * 1024 * 1024));
+        // Switched off, the limit applies to nothing and is kept for when it is switched on.
+        let off = Settings { speed_limit_on: false, ..settings.clone() };
+        assert_eq!((off.download_options(&file, "", "").unwrap().max_speed, off.max_speed), (None, 2.0));
         assert_eq!((opts.max_retries, opts.stall_timeout_secs), (3, 1));
         assert_eq!(opts.browser_cookies, Some(BrowserCookieSource::Edge));
         assert_eq!((opts.fsync_on_complete, opts.max_connections_per_host), (true, 0));

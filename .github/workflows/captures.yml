@@ -1,0 +1,41 @@
+# Pictures of the interface (the headless harness's capture gallery, crates/hyperfetch-gui/src/ui/
+# harness.rs) and its frame time in a release build, for pushes whose message holds [captures].
+# Its own workflow, so that a later push to the branch does not cancel it. No secrets.
+name: Captures
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  captures:
+    if: contains(github.event.head_commit.message, '[captures]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: captures
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq pkg-config libxkbcommon-dev libwayland-dev libgl1-mesa-dev
+      - name: Capture gallery
+        run: cargo test -p hyperfetch-gui capture_gallery -- --ignored --test-threads=1
+        env:
+          ENDO_CAPTURE_DIR: ${{ github.workspace }}/ui-captures
+      - name: Frame time (release)
+        run: cargo test --release -p hyperfetch-gui frame_time -- --ignored --nocapture --test-threads=1
+      - if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: ui-captures
+          path: ui-captures/*.png
+          retention-days: 3
+          if-no-files-found: ignore

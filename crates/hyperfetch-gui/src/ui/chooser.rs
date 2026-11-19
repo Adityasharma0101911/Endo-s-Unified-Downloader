@@ -210,6 +210,16 @@ mod tests {
         ]
     }
 
+    /// The mouse wheel turned over the text starting with `over`, 300 pt down, settled.
+    fn down(h: &mut Harness, over: &str) {
+        h.hover(starting(h, over).center());
+        let wheel = egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::Vec2::new(0.0, -300.0), modifiers: egui::Modifiers::NONE };
+        h.frame(vec![wheel]);
+        h.frames(40);
+        h.leave();
+        assert!(h.settle());
+    }
+
     /// Where the last frame shows a text starting with `start`.
     fn starting(h: &Harness, start: &str) -> Rect {
         h.texts().into_iter().find(|(text, _)| text.starts_with(start)).map(|(_, rect)| rect).unwrap_or_else(|| panic!("{start} in {:?}", h.texts()))
@@ -250,6 +260,8 @@ mod tests {
         h.type_text("x");
         h.key(egui::Key::Escape, egui::Modifiers::NONE);
         assert!(h.settle());
+        // The card is taller than the window: the bar's area scrolls down to its end.
+        down(&mut h, "Time range");
         starting(&h, "\"x\" is not a time in the stream");
         h.click("Download with these tracks");
         assert!(h.app.queue.items().is_empty(), "nothing is added while the range is wrong");
@@ -267,22 +279,25 @@ mod tests {
 
         // It fails here (no engine runs), and offers its chooser again.
         h.wait_for(|app| matches!(app.queue.get_item(item.id).map(|item| &item.status), Some(QueueItemStatus::Failed(_))));
-        h.app.tab = Tab::Queue;
+        (h.app.tab, h.app.focused) = (Tab::Downloads, None);
         assert!(h.settle());
         h.click_at(h.find_near(&item.filename, icon::SLIDERS_HORIZONTAL).unwrap().center());
-        assert!(h.app.tab == Tab::Downloader && h.app.focused == Some(item.id));
+        assert!(h.app.tab == Tab::Downloads && h.app.focused == Some(item.id));
         h.wait_for(|app| app.tracks.as_ref().is_some_and(|chooser| chooser.info.is_some()));
         assert!(h.settle());
+        // Under its details, further down its page.
+        down(&mut h, "Video");
         let reopened = h.app.tracks.as_ref().map(|chooser| chooser.picks.clone()).unwrap();
         assert_eq!((reopened.audio.len(), reopened.dropped.as_slice(), reopened.from.as_str()), (2, &[1][..], "00:05"), "as it was saved");
         h.click_at(starting(&h, "Japanese").center());
         // Its row's icon again only shows the chooser open, with what is ticked.
-        h.app.tab = Tab::Queue;
+        (h.app.tab, h.app.focused) = (Tab::Downloads, None);
         assert!(h.settle());
         h.click_at(h.find_near(&item.filename, icon::SLIDERS_HORIZONTAL).unwrap().center());
         assert!(h.settle());
         let kept = h.app.tracks.as_ref().filter(|chooser| chooser.info.is_some()).map(|chooser| chooser.picks.audio.len());
-        assert_eq!((h.app.tab == Tab::Downloader, kept), (true, Some(1)));
+        assert_eq!((h.app.tab == Tab::Downloads, kept), (true, Some(1)));
+        down(&mut h, "Video");
         h.click("Save tracks");
         assert!(h.app.tracks.is_none());
         let saved = h.app.queue.get_item(item.id).unwrap().options.tracks.ids.clone();

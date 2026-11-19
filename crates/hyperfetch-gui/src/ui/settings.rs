@@ -14,10 +14,11 @@ fn opened(ctx: &egui::Context) -> f32 {
 
 /// The settings most people change: the page shows only these until All settings is on or
 /// something is searched for.
-const COMMON: [&str; 21] = [
+const COMMON: [&str; 22] = [
     "Save folder",
     "Theme",
     "Reduce motion",
+    "Moving background",
     "Watch the clipboard",
     "Run the queue automatically",
     "Downloads at once",
@@ -202,19 +203,53 @@ pub(super) fn settings_page(app: &mut App, ui: &mut Ui) {
     }
 }
 
+/// A heading inside a section over a group of its rows, shown while the whole section shows (no
+/// search, every setting): with only some rows showing, the groups mix and need none.
+fn subheading(ui: &mut Ui, text: &str) {
+    let shown = ui.data(|d| d.get_temp::<Shown>(shown_id())).unwrap_or_default();
+    if shown.search.is_empty() && shown.all {
+        let p = palette(ui);
+        ui.add_space(10.0);
+        ui.label(RichText::new(text).small().strong().color(p.link));
+    }
+}
+
+/// The groups of the page, in order: what most people set first, then how it looks, how fast and
+/// over which network it downloads, the sources and accounts, what happens after a download, the
+/// desktop and schedule, the browser and phone, and the rest.
 fn settings_sections(app: &mut App, ui: &mut Ui) {
     section(ui, 0, icon::SLIDERS, "General", |ui| general_settings(app, ui));
-    section(ui, 1, icon::DESKTOP, "Desktop", |ui| desktop_settings(app, ui));
-    section(ui, 2, icon::NETWORK, "Connections & networks", |ui| connection_settings(&mut app.settings, ui));
-    section(ui, 3, icon::MAGNET, "BitTorrent", |ui| torrent_settings(app, ui));
-    section(ui, 4, icon::CLOUD_ARROW_DOWN, "Debrid & hosts", |ui| {
+    section(ui, 1, icon::PALETTE, "Appearance", |ui| appearance_settings(app, ui));
+    section(ui, 2, icon::GAUGE, "Speed", |ui| speed_settings(&mut app.settings, ui));
+    section(ui, 3, icon::NETWORK, "Network", |ui| {
+        network_settings(&mut app.settings, ui);
+        subheading(ui, "BitTorrent");
+        torrent_settings(app, ui);
+    });
+    section(ui, 4, icon::KEY, "Sources & accounts", |ui| {
+        subheading(ui, "Accounts and sign-in");
         host_settings(app, ui);
+        subheading(ui, "Video and audio");
+        media_settings(app, ui);
+        subheading(ui, "Streams");
+        stream_settings(&mut app.settings, ui);
+        subheading(ui, "Accounts & tools");
         accounts_and_tools(app, ui);
     });
-    section(ui, 5, icon::FILM_STRIP, "Media", |ui| media_settings(app, ui));
-    section(ui, 6, icon::BROADCAST, "Streams", |ui| stream_settings(&mut app.settings, ui));
-    section(ui, 7, icon::PACKAGE, "Post-processing", |ui| post_settings(app, ui));
-    section(ui, 8, icon::PUZZLE_PIECE, "Browser extension", |ui| {
+    section(ui, 5, icon::PACKAGE, "After a download", |ui| post_settings(app, ui));
+    section(ui, 6, icon::DESKTOP, "Desktop and schedule", |ui| {
+        desktop_settings(app, ui);
+        setting(ui, "Version", "", (), |ui| {
+            if ui.add(button("Check now")).clicked() {
+                app.check_for_update(true);
+            }
+            ui.label(env!("CARGO_PKG_VERSION"));
+        });
+        let about = "Asks GitHub whether a newer release is out and offers it; nothing is installed unless you choose to, \
+                     and only releases signed by the maintainer are.";
+        switch(ui, "Check for updates at startup", about, &mut app.settings.check_updates);
+    });
+    section(ui, 7, icon::PUZZLE_PIECE, "Browser extension and phone", |ui| {
         let p = palette(ui);
         ui.separator();
         let text = "The extension hands this app the links, videos and cookies of the pages you visit, on this computer \
@@ -232,20 +267,10 @@ fn settings_sections(app: &mut App, ui: &mut Ui) {
                 ui.add(egui::Label::new(RichText::new(dir.display().to_string()).small().color(p.muted)).truncate());
             });
         }
+        subheading(ui, "Phone");
+        phone_settings(app, ui);
     });
-    section(ui, 9, icon::DEVICE_MOBILE, "Phone", |ui| phone_settings(app, ui));
-    section(ui, 10, icon::ARROW_CIRCLE_UP, "Updates", |ui| {
-        setting(ui, "Version", "", (), |ui| {
-            if ui.add(button("Check now")).clicked() {
-                app.check_for_update(true);
-            }
-            ui.label(env!("CARGO_PKG_VERSION"));
-        });
-        let about = "Asks GitHub whether a newer release is out and offers it; nothing is installed unless you choose to, \
-                     and only releases signed by the maintainer are.";
-        switch(ui, "Check for updates at startup", about, &mut app.settings.check_updates);
-    });
-    section(ui, 11, icon::WRENCH, "Advanced", |ui| {
+    section(ui, 8, icon::WRENCH, "Advanced", |ui| {
         let s = &mut app.settings;
         setting(ui, "Retries", "Failed attempts per chunk before the download fails; attempts that made progress don't count.", s.max_retries, |ui| {
             ui.add(egui::DragValue::new(&mut s.max_retries).range(0..=100));
@@ -266,21 +291,6 @@ fn general_settings(app: &mut App, ui: &mut Ui) {
         }
         ui.add(egui::TextEdit::singleline(&mut app.settings.save_dir).desired_width(ui.available_width()));
     });
-    setting(ui, "Theme", "", app.settings.theme, |ui| {
-        for (value, name) in [(2, "Light"), (1, "Dark"), (0, "System")] {
-            ui.selectable_value(&mut app.settings.theme, value, name);
-        }
-    });
-    let about = if cfg!(target_os = "macos") {
-        "Instant page changes and no moving icons. System follows Reduce motion in the Accessibility settings of macOS."
-    } else {
-        "Instant page changes and no moving icons. System follows the Animation effects setting of Windows."
-    };
-    setting(ui, "Reduce motion", about, app.settings.reduce_motion, |ui| {
-        for (value, name) in [(Some(false), "Off"), (Some(true), "On"), (None, "System")] {
-            ui.selectable_value(&mut app.settings.reduce_motion, value, name);
-        }
-    });
     let mut watch = app.settings.clipboard_watch;
     if switch(ui, "Watch the clipboard", "Offer links you copy anywhere as downloads.", &mut watch) {
         set_clipboard_watch(app, watch);
@@ -289,6 +299,36 @@ fn general_settings(app: &mut App, ui: &mut Ui) {
     switch(ui, "Run the queue automatically", "Start queued downloads by themselves.", &mut s.auto_run_queue);
     setting(ui, "Downloads at once", "How many queued downloads run together.", s.max_concurrent, |ui| {
         ui.add(egui::DragValue::new(&mut s.max_concurrent).range(1..=8));
+    });
+}
+
+/// The theme, motion, and the moving background behind the pages.
+fn appearance_settings(app: &mut App, ui: &mut Ui) {
+    let s = &mut app.settings;
+    setting(ui, "Theme", "", s.theme, |ui| {
+        for (value, name) in [(2, "Light"), (1, "Dark"), (0, "System")] {
+            ui.selectable_value(&mut s.theme, value, name);
+        }
+    });
+    let about = if cfg!(target_os = "macos") {
+        "Instant page changes, no moving icons and a still background. System follows Reduce motion in the Accessibility settings of macOS."
+    } else {
+        "Instant page changes, no moving icons and a still background. System follows the Animation effects setting of Windows."
+    };
+    setting(ui, "Reduce motion", about, s.reduce_motion, |ui| {
+        for (value, name) in [(Some(false), "Off"), (Some(true), "On"), (None, "System")] {
+            ui.selectable_value(&mut s.reduce_motion, value, name);
+        }
+    });
+    let about = "Slow drifting light behind the pages that follows your downloads: a current while they run, a ripple when \
+                 one finishes. It keeps still while the window is in the background, and under Reduce motion.";
+    switch(ui, "Moving background", about, &mut s.moving_background);
+    ui.add_enabled_ui(s.moving_background, |ui| {
+        setting(ui, "Background intensity", "How many lights drift, and how fast.", s.background_intensity, |ui| {
+            for (value, name) in [(2, "Lively"), (1, "Normal"), (0, "Calm")] {
+                ui.selectable_value(&mut s.background_intensity, value, name);
+            }
+        });
     });
 }
 
@@ -452,7 +492,9 @@ fn time_edit(ui: &mut Ui, time: &mut Option<String>, hint: &str) {
     }
 }
 
-fn connection_settings(s: &mut Settings, ui: &mut Ui) {
+/// How fast: connections, Autopilot, the speed limit, and spreading connections over a server's
+/// addresses and this computer's networks.
+fn speed_settings(s: &mut Settings, ui: &mut Ui) {
     setting(ui, "Connections per download", "More can be faster; some servers allow only a few.", s.connections, |ui| {
         ui.add(egui::Slider::new(&mut s.connections, 1..=64));
     });
@@ -474,6 +516,18 @@ fn connection_settings(s: &mut Settings, ui: &mut Ui) {
         );
         ui.add(egui::DragValue::new(&mut s.max_speed).range(0.0..=1_000_000.0).speed(1.0).max_decimals(1));
     });
+    let about = "Off, new and resumed downloads run free and the limit is kept for later; the switch in the bar at the top \
+                 of the window is this one.";
+    switch(ui, "Use the speed limit", about, &mut s.speed_limit_on);
+    let about = "Spread a download's connections over the addresses its server has (a CDN often has several, one of them busy),                  dropping one that fails or stays far slower. Not through a proxy.";
+    switch(ui, "Use the server's addresses", about, &mut s.spread_addresses);
+    let about = "Spread connections over every network this computer is on (Wi-Fi and Ethernet, say), or the ones chosen below.";
+    switch(ui, "Use several networks", about, &mut s.multi_network);
+    ui.add_enabled_ui(s.multi_network, |ui| network_choice(ui, &mut s.bind_addresses));
+}
+
+/// Which way connections go: proxies, the IP version, timeouts and the user agent.
+fn network_settings(s: &mut Settings, ui: &mut Ui) {
     text_setting(ui, "Proxy", "Every connection goes through it.", &mut s.proxy, "http://127.0.0.1:8080 or socks5://127.0.0.1:1080", false);
     let about = "Several proxies, comma-separated; connections take turns over them.";
     text_setting(ui, "Proxy pool", about, &mut s.proxy_pool, "http://p1:8080, http://p2:8080", false);
@@ -489,11 +543,6 @@ fn connection_settings(s: &mut Settings, ui: &mut Ui) {
     });
     let about = "Sent in place of the browser one the app sends (and the browser's own, from the extension), video sites included.";
     text_setting(ui, "User agent", about, &mut s.user_agent, "Empty: the app's", false);
-    let about = "Spread a download's connections over the addresses its server has (a CDN often has several, one of them busy),                  dropping one that fails or stays far slower. Not through a proxy.";
-    switch(ui, "Use the server's addresses", about, &mut s.spread_addresses);
-    let about = "Spread connections over every network this computer is on (Wi-Fi and Ethernet, say), or the ones chosen below.";
-    switch(ui, "Use several networks", about, &mut s.multi_network);
-    ui.add_enabled_ui(s.multi_network, |ui| network_choice(ui, &mut s.bind_addresses));
 }
 
 /// The local addresses to connect from: the usable networks (looked up once, and again on
@@ -980,9 +1029,10 @@ mod tests {
         h.app.tab = Tab::Settings;
         assert!(h.settle());
         // The section's first row brought up to the top of the page.
+        scroll_to(&mut h, "Close to the tray");
         let top = h.find("Close to the tray").unwrap().top();
-        h.hover(h.find("Desktop").unwrap().center());
-        let wheel = egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: Vec2::new(0.0, 100.0 - top), modifiers: egui::Modifiers::NONE };
+        h.hover(h.find("Close to the tray").unwrap().center());
+        let wheel = egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: Vec2::new(0.0, 170.0 - top), modifiers: egui::Modifiers::NONE };
         h.frame(vec![wheel]);
         h.frames(60);
         h.leave();
@@ -1024,15 +1074,16 @@ mod tests {
         assert!(h.find("25:00 is not a time like 08:30; it is left out").is_some());
     }
 
-    /// Scrolls the Settings page with the wheel until `title` shows near its top.
+    /// Scrolls the Settings page with the wheel until `title` shows near its top, under the
+    /// page's title and the pulse bar (the list starts about 150 pt down).
     fn scroll_to(h: &mut Harness, title: &str) {
         h.hover(Pos2::new(600.0, 400.0));
         for _ in 0..40 {
             let top = h.find(title).map(|rect| rect.top());
-            if top.is_some_and(|top| (80.0..=200.0).contains(&top)) {
+            if top.is_some_and(|top| (170.0..=280.0).contains(&top)) {
                 break;
             }
-            let delta = Vec2::new(0.0, top.map_or(-400.0, |top| 120.0 - top));
+            let delta = Vec2::new(0.0, top.map_or(-400.0, |top| 200.0 - top));
             h.frame(vec![egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta, modifiers: egui::Modifiers::NONE }]);
             h.frames(30);
         }
@@ -1062,11 +1113,14 @@ mod tests {
         h.frames(30);
         assert!(h.settle());
         assert!(h.find("Proxy").is_some() && h.find("Proxy pool").is_some(), "{:?}", h.texts());
-        assert!(h.find("Reduce motion").is_none() && h.find("General").is_none() && h.find("Updates").is_none(), "{:?}", h.texts());
-        // A section's title brings all its rows.
+        assert!(h.find("Reduce motion").is_none() && h.find("General").is_none() && h.find("Appearance").is_none(), "{:?}", h.texts());
+        // A section's title brings all its rows; a row is found by what it says too.
+        h.app.settings_search = "appearance".to_string();
+        h.frames(30);
+        assert!(h.find("Appearance").is_some() && h.find("Moving background").is_some() && h.find("Theme").is_some(), "{:?}", h.texts());
         h.app.settings_search = "bittorrent".to_string();
         h.frames(30);
-        assert!(h.find("BitTorrent").is_some() && h.find("Download from peers").is_some(), "{:?}", h.texts());
+        assert!(h.find("Download from peers").is_some() && h.find("Reduce motion").is_none(), "{:?}", h.texts());
         h.app.settings_search = "no such setting".to_string();
         h.frames(30);
         assert!(h.find("General").is_none() && h.texts().iter().any(|(text, _)| text.starts_with("No setting matches")));
@@ -1076,7 +1130,7 @@ mod tests {
         h.frames(30);
         assert!(h.settle());
         assert!(h.find("Save folder").is_some() && h.find("Theme").is_some());
-        assert!(h.find("BitTorrent").is_none() && h.find("Retries").is_none(), "{:?}", h.texts());
+        assert!(h.find("Download from peers").is_none() && h.find("Retries").is_none(), "{:?}", h.texts());
         h.click("All settings");
         assert!(h.app.settings.show_all_settings);
     }
@@ -1089,6 +1143,13 @@ mod tests {
         assert!(h.settle());
         scroll_to(&mut h, "Autopilot");
         click(&mut h, |h| h.find_near("Autopilot", TOGGLE));
+        let limited = h.app.settings.speed_limit_on;
+        click(&mut h, |h| h.find_near("Use the speed limit", TOGGLE));
+        assert_eq!(h.app.settings.speed_limit_on, !limited);
+        scroll_to(&mut h, "Use the server's addresses");
+        click(&mut h, |h| h.find_near("Use the server's addresses", TOGGLE));
+        assert!(!h.app.settings.tuning().spread_addresses, "on by default, so off");
+        scroll_to(&mut h, "IP version");
         click(&mut h, |h| h.find_near("IP version", "IPv6"));
         click(&mut h, |h| h.find("Empty: the app's"));
         h.type_text("Agent/2.0");
@@ -1096,9 +1157,6 @@ mod tests {
         let s = &h.app.settings;
         assert!(!s.adaptive && s.ip_family == IpFamily::V6 && s.user_agent == "Agent/2.0", "on by default, so off: {s:?}");
         assert!(h.find("Connect timeout").is_some());
-        scroll_to(&mut h, "Use the server's addresses");
-        click(&mut h, |h| h.find_near("Use the server's addresses", TOGGLE));
-        assert!(!h.app.settings.tuning().spread_addresses, "on by default, so off");
 
         scroll_to(&mut h, "Check against the site's checksum");
         click(&mut h, |h| h.find_near("Check against the site's checksum", TOGGLE));
@@ -1127,13 +1185,14 @@ mod tests {
         h.type_text("en, ja, english!");
         h.key(egui::Key::Escape, egui::Modifiers::NONE);
         assert!(h.settle() && refused(&h, "Unknown audio term \"english!\""), "{:?}", h.texts());
+        click(&mut h, |h| h.find("ad*.ts, /ads/"));
+        h.type_text("/ads/, *promo*.ts");
+        h.key(egui::Key::Escape, egui::Modifiers::NONE);
+        scroll_to(&mut h, "File name pattern");
         click(&mut h, |h| h.find("{name} {height}p {audio}"));
         h.type_text("{name} [{heigth}p]");
         h.key(egui::Key::Escape, egui::Modifiers::NONE);
         assert!(h.settle() && refused(&h, "Unknown name variable {heigth}"), "{:?}", h.texts());
-        click(&mut h, |h| h.find("ad*.ts, /ads/"));
-        h.type_text("/ads/, *promo*.ts");
-        h.key(egui::Key::Escape, egui::Modifiers::NONE);
         let s = &mut h.app.settings;
         assert_eq!((s.audio_languages.as_str(), s.ad_patterns.as_str()), ("en, ja, english!", "/ads/, *promo*.ts"));
         (s.audio_languages, s.name_pattern) = ("en, ja".into(), "{name} [{height}p]".into());
@@ -1204,7 +1263,7 @@ mod tests {
         assert_eq!(h.frames(60), Duration::MAX, "and then idle");
         assert_eq!(lit(&h), 0.0);
 
-        h.app.tab = Tab::Queue;
+        h.app.tab = Tab::Library;
         h.frames(2);
         h.app.settings.max_concurrent = 2;
         h.app.tab = Tab::Settings;

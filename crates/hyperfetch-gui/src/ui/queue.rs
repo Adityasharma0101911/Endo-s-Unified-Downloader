@@ -5,9 +5,8 @@ use hyperfetch_core::queue::{Priority, Remaining};
 use super::*;
 use crate::slow::{self, Fix};
 
-const AUTH_REQUIRED: &str =
-    "Authorization header not saved: enter it again under Advanced options, then Resume to continue from the partial file.";
-/// What the row of a download whose link expired says (see `QueueItem::link_expired`).
+const AUTH_REQUIRED: &str = "Its Authorization header was not saved: enter it again below, then Resume to continue from the partial file.";
+/// What the card of a download whose link expired says (see `QueueItem::link_expired`).
 const LINK_EXPIRED: &str = "Link expired: get a new link";
 
 /// The page `item` came from, to open: the referer it was sent with, when that is a link.
@@ -20,12 +19,48 @@ fn takes_new_link(item: &QueueItem) -> bool {
     matches!(item.status, QueueItemStatus::Paused | QueueItemStatus::Failed(_)) && item.relinkable()
 }
 
-pub(super) fn download_details(app: &mut App, ui: &mut Ui, item: &QueueItem) {
+// ---- Details --------------------------------------------------------------------------------
+
+/// Everything about one download, calm and in reading order: its name, status and actions; its
+/// progress with the pieces filling in; what holds it back; its speed over the last minute; its
+/// connections and mirrors; what it was checked against; where it goes and where it came from;
+/// and what happened to it. `in_place` (a narrow window): drawn on a card of its own with a way
+/// back to the list; beside the list, the panel is its card.
+pub(super) fn detail_page(app: &mut App, ui: &mut Ui, item: &QueueItem, in_place: bool) {
+    if in_place {
+        card(ui).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            detail_contents(app, ui, item, true);
+        });
+    } else {
+        detail_contents(app, ui, item, false);
+    }
+}
+
+fn detail_contents(app: &mut App, ui: &mut Ui, item: &QueueItem, in_place: bool) {
     let p = palette(ui);
-    progress_card(app, ui, item);
-    ui.add_space(6.0);
+    detail_header(app, ui, item, in_place);
+    ui.add_space(10.0);
+    ui.horizontal_wrapped(|ui| detail_actions(app, ui, item));
+    // The shown download failing shakes its alert, which opens and closes its room smoothly.
+    let error = match &item.status {
+        QueueItemStatus::Failed(error) => Some(match util::error_hint(error) {
+            Some(hint) => format!("Download failed: {}. {}", error.trim_end_matches('.'), hint),
+            None => format!("Download failed: {}", error),
+        }),
+        _ => None,
+    };
+    let dx = anim::shake(ui.ctx(), egui::Id::new(("failed", item.id)), error.is_some());
+    let dx = if error.is_some() { dx } else { 0.0 };
+    super::add::fading(ui, &format!("failed {}", item.id), error, |ui, error| super::add::nudged(ui, dx, |ui| error_alert(ui, &error)));
+    if item.status == QueueItemStatus::AuthRequired {
+        auth_box(app, ui, item);
+    }
+    ui.add_space(14.0);
+    progress_block(app, ui, item);
+    ui.add_space(8.0);
     let (status, color) = status_line(app, item, &p);
-    ui.label(RichText::new(status).color(color));
+    ui.add(egui::Label::new(RichText::new(status).color(color)).wrap());
     if takes_new_link(item) {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
@@ -56,25 +91,186 @@ pub(super) fn download_details(app: &mut App, ui: &mut Ui, item: &QueueItem) {
             why_slow(app, ui, item);
         }
     }
+    super::add::stream_tracks(app, ui, Some(item));
 
     let view = app.jobs.get(&item.id);
-    let chunks: &[ChunkSnapshot] = view.map_or(&[], |v| &v.chunks);
     // Once the engine has stopped, chunks it last reported as in flight are no longer being fetched.
     let live = view.is_some_and(|v| v.running.is_some());
+    let chunks: &[ChunkSnapshot] = view.map_or(&[], |v| &v.chunks);
     if !chunks.is_empty() {
-        ui.add_space(12.0);
-        ui.horizontal(|ui| {
-            ui.label(bold("Chunks").color(p.strong));
-            let about = format!("{} ranges, each in the colour of the connection that holds it", chunks.len());
-            ui.label(RichText::new(about).small().color(p.muted));
-        });
-        ui.add_space(4.0);
+        let about = format!("{} pieces, each in the colour of the connection that holds it", chunks.len());
+        section_title(ui, icon::PLUGS_CONNECTED, "Connections", &about);
         chunk_map(ui, item.id, chunks, item.total_bytes, live);
         ui.add_space(8.0);
-        chunk_table(ui, item.id, chunks, live);
+        chunk_table(ui, item.id, chunks, live, item.urls.first().and_then(|url| url.host_str()).unwrap_or_default());
     }
-    ui.add_space(12.0);
+    section_title(ui, icon::CHART_LINE, "Speed", "the last 60 seconds");
     throughput_graph(ui, item.id, view.map(|view| &view.speed_history), eased_speed(ui, item), live);
+    if let Some(view) = app.jobs.get(&item.id).filter(|view| view.mirror_speeds.len() > 1) {
+        section_title(ui, icon::TREE_STRUCTURE, "Mirrors", "the servers it takes pieces from, the fastest first");
+        mirrors(ui, &view.mirror_speeds);
+    }
+    checks(ui, item);
+    where_from(app, ui, item);
+    timeline_view(ui, item);
+    limit_for_this(app, ui, item);
+}
+
+/// A section of the details: its icon and title, and what it shows in a few words.
+fn section_title(ui: &mut Ui, glyph: &str, title: &str, about: &str) {
+    let p = palette(ui);
+    ui.add_space(18.0);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(glyph).size(16.0).color(p.link));
+        ui.label(bold(title).size(15.0).color(p.strong));
+        if !about.is_empty() {
+            ui.add(egui::Label::new(RichText::new(about).small().color(p.muted)).truncate());
+        }
+    });
+    ui.add_space(6.0);
+}
+
+/// The way back to the list (in place) or the close button (beside it), the download's status,
+/// its name (two lines at most, in full on hover), and where it comes from.
+fn detail_header(app: &mut App, ui: &mut Ui, item: &QueueItem, in_place: bool) {
+    let p = palette(ui);
+    ui.horizontal(|ui| {
+        if in_place {
+            if ui.add(button(format!("{} Downloads", icon::ARROW_LEFT))).on_hover_text("Back to the list (Escape)").clicked() {
+                app.focused = None;
+            }
+        }
+        let (status, color) = status_badge(app, item, &p);
+        let done = item.status == QueueItemStatus::Completed;
+        status_chip(ui, egui::Id::new(("item", item.id)), status, color, item.status == QueueItemStatus::Downloading);
+        if done {
+            // Kept current while shown, so that the check draws itself as the download completes.
+            let drawn = anim::ease(anim::changed(ui.ctx(), egui::Id::new(("completed check", item.id)), done, 0.5));
+            let (rect, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
+            ui.painter().circle_filled(rect.center(), 9.0 * anim::overshoot(drawn), p.green.gamma_multiply(0.2));
+            anim::paint_check(ui.painter(), rect.shrink(3.0), drawn, Stroke::new(2.0, p.green));
+        }
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if !in_place && icon_button(ui, icon::X, "Close the details (Escape)", true).clicked() {
+                app.focused = None;
+            }
+            ui.label(RichText::new(format!("#{}", item.id)).small().color(p.dim));
+        });
+    });
+    ui.add_space(6.0);
+    let name = egui::Label::new(bold(&item.filename).size(19.0).color(p.strong)).wrap();
+    ui.add(name).on_hover_text(&item.filename);
+    let host = item.urls.first().and_then(|url| url.host_str()).unwrap_or_default().trim_start_matches("www.").to_string();
+    let mut from = Vec::new();
+    if !host.is_empty() {
+        from.push(format!("from {host}"));
+    }
+    if item.urls.len() > 1 {
+        from.push(format!("{} mirrors", item.urls.len()));
+    }
+    if item.priority != Priority::Normal {
+        from.push(format!("{:?} priority", item.priority).to_lowercase());
+    }
+    if !from.is_empty() {
+        ui.label(RichText::new(from.join("  ·  ")).color(p.muted));
+    }
+}
+
+/// The buttons for the shown download, by its state, and New download on the right.
+fn detail_actions(app: &mut App, ui: &mut Ui, item: &QueueItem) {
+    let p = palette(ui);
+    let id = item.id;
+    match &item.status {
+        QueueItemStatus::Queued => {
+            if ui.add(primary_button(&format!("{} Start now", icon::PLAY), p.accent)).clicked() {
+                app.start_job(id, false);
+            }
+        }
+        QueueItemStatus::Downloading => {
+            if ui.add(button(format!("{} Pause", icon::PAUSE))).on_hover_text("Pause it; Resume goes on from where it is (Space)").clicked() {
+                app.pause_job(id);
+            }
+        }
+        QueueItemStatus::Pausing => {
+            anim::spinner(ui, 16.0, p.muted);
+            let text = if app.is_recording(id) { "Stopping: finishing the recording..." } else { "Pausing: saving the resume state..." };
+            ui.label(RichText::new(text).color(p.muted));
+        }
+        QueueItemStatus::Paused | QueueItemStatus::Failed(_) => {
+            let resume = if item.status == QueueItemStatus::Paused { "Resume" } else { "Retry" };
+            let go_on = primary_button(&format!("{} {}", icon::PLAY, resume), p.accent);
+            if ui.add(go_on).on_hover_text("Continue from the saved state").clicked() {
+                app.start_job(id, false);
+            }
+            let start_over = ui.add(button(format!("{} Start over", icon::ARROW_COUNTER_CLOCKWISE)));
+            if start_over.on_hover_text("Delete the partial file and download from the beginning").clicked() {
+                app.start_job(id, true);
+            }
+            let delete = button(RichText::new(format!("{} Delete leftovers", icon::TRASH)).color(p.red));
+            if ui.add(delete).on_hover_text("Remove this download and delete its partial file and resume state").clicked() {
+                app.discard_job(id);
+            }
+        }
+        QueueItemStatus::AuthRequired => {}
+        QueueItemStatus::Completed => {
+            if let Some(path) = &item.target_path {
+                if ui.add(primary_button(&format!("{} Open file", icon::FILE), p.accent)).clicked() {
+                    report(app, util::open_path(path));
+                }
+                let idle = !app.verifying && app.repair.is_none();
+                let check = ui.add_enabled(idle, button(format!("{} Check again", icon::SHIELD_CHECK)));
+                if check.on_hover_text("Read the file again and check it against its size and checksum").clicked() {
+                    app.verify(VerifyRequest {
+                        path: path.clone(),
+                        expected_size: (item.total_bytes > 0).then_some(item.total_bytes),
+                        checksum: item.options.expected_checksum.clone(),
+                    });
+                }
+            }
+        }
+    }
+    let choosing = app.tracks.as_ref().is_some_and(|chooser| chooser.item == Some(id));
+    if let Some(url) = item.urls.first().filter(|_| crate::tracks::offered(item) && !choosing) {
+        if ui.add(button(format!("{} Choose tracks…", icon::SLIDERS_HORIZONTAL))).clicked() {
+            app.list_tracks(Some(id), url.clone());
+        }
+    }
+    if let Some(path) = &item.target_path {
+        if ui.add(button(format!("{} Show in folder", icon::FOLDER_OPEN))).clicked() {
+            report(app, util::reveal_in_folder(path));
+        }
+    }
+    if let Some(url) = item.urls.first() {
+        if ui.add(button(format!("{} Copy link", icon::COPY))).clicked() {
+            app.copy_text(url.to_string());
+        }
+    }
+    if !item.status.is_active() && ui.add(button(format!("{} Remove", icon::X))).on_hover_text("Off the list; its files are kept (Undo brings it back)").clicked() {
+        app.remove_job(id);
+        app.focused = None;
+        app.selected = None;
+    }
+    let new = ui.add(button(format!("{} New download", icon::PLUS)));
+    if new.on_hover_text("Keep this download going and start another").clicked() {
+        app.new_download();
+    }
+}
+
+/// For a download restored without its Authorization header: the header to enter again, never
+/// saved, and Resume.
+fn auth_box(app: &mut App, ui: &mut Ui, item: &QueueItem) {
+    let p = palette(ui);
+    ui.add_space(8.0);
+    ui.label(RichText::new(AUTH_REQUIRED).color(p.amber));
+    ui.horizontal(|ui| {
+        let field = egui::TextEdit::singleline(&mut app.auth_input).hint_text("Bearer <token>").password(true).desired_width((ui.available_width() - 120.0).max(120.0));
+        ui.add(field);
+        let ready = !app.auth_input.trim().is_empty();
+        let resume = ui.add_enabled(ready, primary_button(&format!("{} Resume", icon::PLAY), p.accent)).on_disabled_hover_text("Enter the Authorization header first");
+        if resume.clicked() {
+            app.resume_with_auth(item.id);
+        }
+    });
 }
 
 /// The New link box of stopped download `item`, when open: a fresh link to paste, checked to be
@@ -84,12 +280,12 @@ fn new_link_box(app: &mut App, ui: &mut Ui, item: &QueueItem) {
     let Some(new_link) = app.new_link.as_mut().filter(|new_link| new_link.id == item.id) else { return };
     let (mut check, mut cancel) = (false, false);
     ui.add_space(8.0);
-    card(ui).show(ui, |ui| {
+    Frame::none().fill(p.field).rounding(12.0).inner_margin(14.0).show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.label(bold("New link").color(p.strong));
         let about = "A fresh link to the same file, from the page it came from. It is checked to be the same size first; the \
                      download then resumes where it stopped.";
-        ui.label(RichText::new(about).small().color(p.muted));
+        ui.add(egui::Label::new(RichText::new(about).small().color(p.muted)).wrap());
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             let width = (ui.available_width() - 190.0).max(120.0);
@@ -130,7 +326,7 @@ fn why_slow(app: &mut App, ui: &mut Ui, item: &QueueItem) {
     let found = slow::findings(item, view, on_host, limited);
     let mut fix = None;
     ui.add_space(8.0);
-    card(ui).show(ui, |ui| {
+    Frame::none().fill(p.field).rounding(12.0).inner_margin(14.0).show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.label(bold("What holds it back").color(p.strong));
         ui.add_space(4.0);
@@ -175,96 +371,85 @@ fn metric(ui: &mut Ui, label: &str, value: String, color: Option<Color32>) {
     ui.add(egui::Label::new(text).truncate()).on_hover_text(value);
 }
 
-fn progress_card(app: &App, ui: &mut Ui, item: &QueueItem) {
+/// The big percentage rolling to each reading, the pieces filling in, and the numbers that
+/// matter: how much, how fast, how long.
+fn progress_block(app: &App, ui: &mut Ui, item: &QueueItem) {
     let p = palette(ui);
     let view = app.jobs.get(&item.id);
     let torrent = view.and_then(|view| view.torrent.as_ref());
     let downloading = item.status == QueueItemStatus::Downloading;
     let (downloaded, total) = (item.downloaded_bytes, item.total_bytes);
     let elapsed = view.map_or(0, |view| view.elapsed().as_secs());
-    card(ui).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        // Shared with the download's row in the queue, so the bar carries on from where it was.
-        let id = egui::Id::new(("item", item.id));
-        let fill = if item.status == QueueItemStatus::Completed { p.green } else { p.accent };
-        let fill = anim::color(ui.ctx(), id.with("bar"), fill, 0.35);
-        let ratio = item.progress_ratio as f32;
-        let text = util::progress_text(total, downloaded, eased_progress(ui, id, ratio) as f64, 1, view.map(|_| elapsed));
-        let size = Vec2::new(ui.available_width(), 20.0);
-        progress_bar(ui, id, size, ratio, fill, downloading, Some(RichText::new(text).color(p.strong).into()));
-        ui.add_space(10.0);
-
-        let eta = match item.status {
-            QueueItemStatus::Completed => "Done".to_string(),
-            _ if downloading => util::eta_secs(total, downloaded, item.speed_bytes_per_sec).map_or_else(|| "--:--".to_string(), format_duration),
-            _ => "--:--".to_string(),
-        };
-        let speed = eased_speed(ui, item);
-        ui.columns(4, |cols| {
-            let transferred =
-                if total > 0 { format!("{} / {}", format_bytes(downloaded), format_bytes(total)) } else { format_bytes(downloaded) };
-            metric(&mut cols[0], "Transferred", transferred, None);
-            metric(&mut cols[1], "Speed", format!("{}/s", format_bytes(speed as u64)), Some(p.cyan));
-            metric(&mut cols[2], "Elapsed / ETA", format!("{} / {}", format_duration(elapsed), eta), None);
-            let (label, connections) = match (torrent, view) {
-                (Some(torrent), _) if downloading => ("Peers", torrent.peers.to_string()),
-                (_, Some(view)) if downloading => ("Connections", format!("{} active", view.active_workers)),
-                _ => ("Connections", "none".to_string()),
-            };
-            metric(&mut cols[3], label, connections, None);
-        });
-
-        if let Some(torrent) = torrent {
+    // Shared with the download's card in the list, so the bar carries on from where it was.
+    let id = egui::Id::new(("item", item.id));
+    let fill = if item.status == QueueItemStatus::Completed { p.green } else { p.accent };
+    let fill = anim::color(ui.ctx(), id.with("bar"), fill, 0.35);
+    let ratio = item.progress_ratio as f32;
+    let shown = anim::roll(ui.ctx(), id.with("percent"), ratio.clamp(0.0, 1.0) * 100.0);
+    ui.horizontal(|ui| {
+        let percent = if total > 0 || item.status == QueueItemStatus::Completed { format!("{:.0}%", shown.floor()) } else { "…".to_string() };
+        ui.label(RichText::new(percent).font(FontId::new(34.0, semibold())).color(p.strong));
+        ui.vertical(|ui| {
             ui.add_space(6.0);
-            let mut text = format!(
-                "{} Uploaded {} at {}/s",
-                icon::UPLOAD_SIMPLE,
-                format_bytes(torrent.uploaded_bytes),
-                format_bytes(torrent.upload_speed as u64)
-            );
-            if torrent.seeding {
-                text.push_str(", seeding");
-            }
+            let text = util::progress_text(total, downloaded, eased_progress(ui, id, ratio) as f64, 1, view.map(|_| elapsed));
             ui.label(RichText::new(text).color(p.muted));
-        }
-        for note in &item.notes {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(icon::INFO).color(p.accent));
-                ui.add(egui::Label::new(note.as_str()).wrap());
-            });
-        }
-
-        if let Some(why) = view.and_then(|view| view.autopilot.as_deref()).filter(|_| downloading) {
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Autopilot").small().color(p.muted));
-                ui.add(egui::Label::new(RichText::new(why).color(p.strong)).truncate()).on_hover_text(why);
-            });
-        }
-
-        if let Some(stalled) = app.stalled_for(item.id).filter(|_| downloading) {
-            ui.add_space(6.0);
-            let text = format!(
-                "Stalled: no data received for {}s. Stalled connections are retried after {}s without data.",
-                stalled.as_secs(),
-                item.options.stall_timeout_secs
-            );
-            ui.label(bold(text).color(p.amber));
-        }
-
-        if let Some(view) = view.filter(|view| view.mirror_speeds.len() > 1) {
-            ui.add_space(8.0);
-            ui.label(bold("Mirrors").size(12.0).color(p.muted));
-            egui::Grid::new("mirror_speeds").num_columns(3).striped(true).spacing([24.0, 2.0]).show(ui, |ui| {
-                for (id, host, speed) in &view.mirror_speeds {
-                    ui.label(RichText::new(format!("#{}", id)).small());
-                    ui.label(RichText::new(host).small().monospace());
-                    ui.label(RichText::new(format!("{}/s", format_bytes(*speed as u64))).small().color(p.cyan));
-                    ui.end_row();
-                }
-            });
-        }
+        });
     });
+    let live = downloading && app.stalled_for(item.id).is_none() && !app.is_resolving(item.id);
+    progress_bar(ui, id, Vec2::new(ui.available_width(), 10.0), ratio, fill, live, None);
+    ui.add_space(10.0);
+
+    let eta = match item.status {
+        QueueItemStatus::Completed => "Done".to_string(),
+        _ if downloading => util::eta_secs(total, downloaded, item.speed_bytes_per_sec).map_or_else(|| "--:--".to_string(), format_duration),
+        _ => "--:--".to_string(),
+    };
+    let speed = eased_speed(ui, item);
+    ui.columns(4, |cols| {
+        let transferred = if total > 0 { format!("{} / {}", format_bytes(downloaded), format_bytes(total)) } else { format_bytes(downloaded) };
+        metric(&mut cols[0], "Transferred", transferred, None);
+        metric(&mut cols[1], "Speed", format!("{}/s", format_bytes(speed as u64)), Some(p.cyan));
+        metric(&mut cols[2], "Elapsed / left", format!("{} / {}", format_duration(elapsed), eta), None);
+        let (label, connections) = match (torrent, view) {
+            (Some(torrent), _) if downloading => ("Peers", torrent.peers.to_string()),
+            (_, Some(view)) if downloading => ("Connections", format!("{} active", view.active_workers)),
+            _ => ("Connections", "none".to_string()),
+        };
+        metric(&mut cols[3], label, connections, None);
+    });
+
+    if let Some(torrent) = torrent {
+        ui.add_space(6.0);
+        let mut text = format!("{} Uploaded {} at {}/s", icon::UPLOAD_SIMPLE, format_bytes(torrent.uploaded_bytes), format_bytes(torrent.upload_speed as u64));
+        if torrent.seeding {
+            text.push_str(", seeding");
+        }
+        ui.label(RichText::new(text).color(p.muted));
+    }
+    for note in &item.notes {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(icon::INFO).color(p.link));
+            ui.add(egui::Label::new(note.as_str()).wrap());
+        });
+    }
+
+    if let Some(why) = view.and_then(|view| view.autopilot.as_deref()).filter(|_| downloading) {
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Autopilot").small().color(p.muted));
+            ui.add(egui::Label::new(RichText::new(why).color(p.strong)).truncate()).on_hover_text(why);
+        });
+    }
+
+    if let Some(stalled) = app.stalled_for(item.id).filter(|_| downloading) {
+        ui.add_space(6.0);
+        let text = format!(
+            "Stalled: no data received for {}s. Stalled connections are retried after {}s without data.",
+            stalled.as_secs(),
+            item.options.stall_timeout_secs
+        );
+        ui.add(egui::Label::new(bold(text).color(p.amber)).wrap());
+    }
 }
 
 /// The progress `progress_bar(ui, id, ..)` shows on its way to `ratio`, for numbers that keep up
@@ -274,14 +459,14 @@ fn eased_progress(ui: &Ui, id: egui::Id, ratio: f32) -> f32 {
     anim::value(ui.ctx(), id.with("progress"), ratio.clamp(0.0, 1.0), 0.35)
 }
 
-/// The download's speed, eased to each new reading.
+/// The download's speed, rolling to each new reading.
 fn eased_speed(ui: &Ui, item: &QueueItem) -> f64 {
-    anim::value(ui.ctx(), egui::Id::new(("item", item.id, "speed")), item.speed_bytes_per_sec as f32, 0.35) as f64
+    anim::roll(ui.ctx(), egui::Id::new(("item", item.id, "speed")), item.speed_bytes_per_sec.max(0.0) as f32).max(0.0) as f64
 }
 
 fn status_line(app: &App, item: &QueueItem, p: &Palette) -> (String, Color32) {
     match &item.status {
-        QueueItemStatus::Queued => ("Queued: starts when a download slot is free (see the Queue)".to_string(), p.muted),
+        QueueItemStatus::Queued => ("Waiting: starts when a download slot is free.".to_string(), p.muted),
         QueueItemStatus::Downloading if app.is_resolving(item.id) => ("Connecting to the server\u{2026}".to_string(), p.muted),
         QueueItemStatus::Downloading if item.is_finishing() => {
             (format!("Finishing {}: verifying the file and moving it into place...", item.filename), p.muted)
@@ -289,9 +474,7 @@ fn status_line(app: &App, item: &QueueItem, p: &Palette) -> (String, Color32) {
         QueueItemStatus::Downloading => (format!("Downloading {}", item.filename), p.muted),
         QueueItemStatus::Pausing if app.is_recording(item.id) => ("Stopping: yt-dlp is finishing the recording...".to_string(), p.muted),
         QueueItemStatus::Pausing => ("Pausing: saving resume state...".to_string(), p.muted),
-        QueueItemStatus::Paused => {
-            ("Paused. Resume continues where it stopped; Start over deletes the partial file first.".to_string(), p.muted)
-        }
+        QueueItemStatus::Paused => ("Paused. Resume continues where it stopped; Start over deletes the partial file first.".to_string(), p.muted),
         QueueItemStatus::Completed => {
             let path = item.target_path.as_ref().map_or_else(|| item.filename.clone(), |p| p.display().to_string());
             (format!("Completed: {}", path), p.green)
@@ -339,13 +522,13 @@ struct Pieces {
 fn chunk_map(ui: &mut Ui, item: usize, chunks: &[ChunkSnapshot], total_bytes: u64, live: bool) {
     let p = palette(ui);
     let ctx = ui.ctx().clone();
-    let height = 22.0;
+    let height = 26.0;
     let (response, painter) = ui.allocate_painter(Vec2::new(ui.available_width(), height), Sense::hover());
     let rect = response.rect;
     let key = egui::Id::new(("chunk map", item));
     // Where tests find it.
     ui.interact(rect, key, Sense::hover());
-    painter.rect_filled(rect, 6.0, p.field);
+    painter.rect_filled(rect, 8.0, p.field);
     if chunks.is_empty() || total_bytes == 0 {
         return;
     }
@@ -405,62 +588,152 @@ fn chunk_map(ui: &mut Ui, item: usize, chunks: &[ChunkSnapshot], total_bytes: u6
         let light = Stroke::new(2.0, Color32::WHITE.gamma_multiply(1.0 - t));
         painter.line_segment([Pos2::new(left, rect.min.y + 1.0), Pos2::new(left, rect.max.y - 1.0)], light);
     }
-    painter.rect_stroke(rect, 6.0, Stroke::new(1.0, p.border));
+    painter.rect_stroke(rect, 8.0, Stroke::new(1.0, p.border));
     ctx.data_mut(|d| d.insert_temp(key, pieces));
 }
 
-fn chunk_table(ui: &mut Ui, item: usize, chunks: &[ChunkSnapshot], live: bool) {
+/// Each piece of the file: the connection that holds it (in its colour) and its server, its
+/// part of the file, how much of it came, and its state. Only the rows in view are laid out: an
+/// HLS stream can have thousands of segments.
+fn chunk_table(ui: &mut Ui, item: usize, chunks: &[ChunkSnapshot], live: bool, host: &str) {
     let p = palette(ui);
-    card(ui).inner_margin(10.0).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        let columns = [(50.0, "ID"), (160.0, "Part of the file"), (130.0, "Downloaded"), (140.0, "Progress"), (160.0, "Status")];
-        ui.horizontal(|ui| {
-            for (width, title) in columns {
-                ui.add_sized([width, 20.0], egui::Label::new(bold(title).size(12.0).color(p.muted)));
-            }
-        });
-        ui.separator();
-        // Only visible rows are laid out: an HLS stream can have thousands of segments.
-        let row_height = 18.0 + ui.spacing().item_spacing.y;
-        let scroll = egui::ScrollArea::vertical().id_salt("chunk_table").max_height(200.0).auto_shrink([false, true]);
-        scroll.show_rows(ui, row_height, chunks.len(), |ui, rows| {
-            for chunk in &chunks[rows] {
-                ui.horizontal(|ui| {
-                    ui.add_sized([50.0, 18.0], egui::Label::new(format!("#{}", chunk.id)));
-                    let range = format!("{} - {}", format_bytes(chunk.range_start), format_bytes(chunk.range_end));
-                    ui.add_sized([160.0, 18.0], egui::Label::new(range));
-                    let done = format!("{} / {}", format_bytes(chunk.downloaded_bytes), format_bytes(chunk.total_bytes));
-                    ui.add_sized([130.0, 18.0], egui::Label::new(done));
-                    let ratio = if chunk.total_bytes > 0 {
-                        (chunk.downloaded_bytes as f32 / chunk.total_bytes as f32).clamp(0.0, 1.0)
-                    } else {
-                        0.0
-                    };
-                    let id = egui::Id::new(("chunk", item, chunk.id));
-                    let percent = format!("{:.0}%", eased_progress(ui, id, ratio) * 100.0);
-                    let busy = live && is_active_chunk(chunk);
-                    progress_bar(ui, id, Vec2::new(140.0, 18.0), ratio, p.accent, busy, Some(RichText::new(percent).small().into()));
-                    let color = if chunk.status == "Completed" {
-                        p.green
-                    } else if live && is_active_chunk(chunk) {
-                        chunk.worker_id.map_or(p.cyan, |worker| lane(&p, worker))
-                    } else if chunk.status.starts_with("Failed") {
-                        p.red
-                    } else {
-                        p.muted
-                    };
-                    // The engine's "Worker 3" is the download's third connection.
-                    let status = match chunk.status.strip_prefix("Worker ") {
-                        _ if !live && is_active_chunk(chunk) => "Stopped".to_string(),
-                        Some(n) => format!("Connection {}", n),
-                        None => chunk.status.clone(),
-                    };
-                    ui.add_sized([160.0, 18.0], egui::Label::new(RichText::new(status).color(color)).truncate())
-                        .on_hover_text(&chunk.status);
-                });
-            }
-        });
+    let row_height = 20.0;
+    let scroll = egui::ScrollArea::vertical().id_salt(("chunk_table", item)).max_height(220.0).auto_shrink([false, true]);
+    scroll.show_rows(ui, row_height, chunks.len(), |ui, rows| {
+        for chunk in &chunks[rows] {
+            ui.horizontal(|ui| {
+                ui.set_height(row_height);
+                let busy = live && is_active_chunk(chunk);
+                let color = if chunk.status == "Completed" {
+                    p.green
+                } else if busy {
+                    chunk.worker_id.map_or(p.cyan, |worker| lane(&p, worker))
+                } else if chunk.status.starts_with("Failed") {
+                    p.red
+                } else {
+                    p.muted
+                };
+                // The engine's "Worker 3" is the download's third connection.
+                let status = match chunk.status.strip_prefix("Worker ") {
+                    _ if !live && is_active_chunk(chunk) => "Stopped".to_string(),
+                    Some(n) => format!("Connection {}", n),
+                    None => chunk.status.clone(),
+                };
+                let (dot, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
+                ui.painter().circle_filled(dot.center(), 4.0, color);
+                ui.add_sized([108.0, row_height], egui::Label::new(RichText::new(status).color(color)).truncate()).on_hover_text(format!("{} on {host}", chunk.status));
+                let ratio = if chunk.total_bytes > 0 { (chunk.downloaded_bytes as f32 / chunk.total_bytes as f32).clamp(0.0, 1.0) } else { 0.0 };
+                let id = egui::Id::new(("chunk", item, chunk.id));
+                let percent = format!("{:.0}%", eased_progress(ui, id, ratio) * 100.0);
+                let width = (ui.available_width() - 150.0).clamp(60.0, 200.0);
+                progress_bar(ui, id, Vec2::new(width, 6.0), ratio, color, busy, None);
+                ui.add_sized([40.0, row_height], egui::Label::new(RichText::new(percent).small().color(p.text)));
+                let range = format!("{} – {}", format_bytes(chunk.range_start), format_bytes(chunk.range_end));
+                ui.add(egui::Label::new(RichText::new(range).small().color(p.dim)).truncate());
+            });
+        }
     });
+}
+
+/// The mirrors a download takes pieces from, fastest first, each with a bar of its speed; the
+/// fastest is marked as winning.
+fn mirrors(ui: &mut Ui, speeds: &[(usize, String, f64)]) {
+    let p = palette(ui);
+    let mut sorted: Vec<&(usize, String, f64)> = speeds.iter().collect();
+    sorted.sort_by(|a, b| b.2.total_cmp(&a.2));
+    let top = sorted.first().map_or(1.0, |m| m.2.max(1.0));
+    for (n, (id, host, speed)) in sorted.into_iter().enumerate() {
+        ui.horizontal(|ui| {
+            let mark = if n == 0 { RichText::new(icon::CROWN_SIMPLE).color(p.amber) } else { RichText::new(format!("#{id}")).small().color(p.dim) };
+            ui.add_sized([28.0, 20.0], egui::Label::new(mark)).on_hover_text(if n == 0 { "The fastest: it gets the most pieces" } else { "" });
+            ui.add_sized([160.0, 20.0], egui::Label::new(RichText::new(host).color(p.text)).truncate()).on_hover_text(host);
+            let width = (ui.available_width() - 90.0).max(40.0);
+            progress_bar(ui, egui::Id::new(("mirror", id)), Vec2::new(width, 6.0), (*speed / top) as f32, if n == 0 { p.link } else { p.dim }, false, None);
+            ui.label(RichText::new(format!("{}/s", format_bytes(*speed as u64))).small().color(p.cyan));
+        });
+    }
+}
+
+/// What the download was or will be checked against: the checksum given, the site's own, or
+/// only its size; after it finished, what post-processing said of it.
+fn checks(ui: &mut Ui, item: &QueueItem) {
+    let p = palette(ui);
+    section_title(ui, icon::SHIELD_CHECK, "Checks", "");
+    let verified = item.notes.iter().find(|note| note.starts_with("Checked against"));
+    let (glyph, color, text) = match (&item.options.expected_checksum, verified) {
+        (_, Some(note)) => (icon::CHECK_CIRCLE, p.green, note.clone()),
+        (Some(sum), None) => {
+            let kind = sum.split_once(':').map_or("checksum", |(kind, _)| kind).to_uppercase();
+            let when = if item.status == QueueItemStatus::Completed { "Matched" } else { "To be checked against" };
+            (icon::SHIELD_CHECK, p.link, format!("{when} the {kind} you gave: {}", truncate_chars(sum, 40)))
+        }
+        (None, None) if item.options.remote_checksum => (icon::SHIELD, p.muted, "Checked against the site's checksum when it publishes one; its size always".to_string()),
+        (None, None) => (icon::SHIELD, p.muted, "Checked against its size; give a checksum under More options to check its bytes too".to_string()),
+    };
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(glyph).color(color));
+        ui.add(egui::Label::new(RichText::new(text).color(p.text)).wrap());
+    });
+}
+
+/// Where the file goes (and Show in folder once there), and where it came from: the page, and
+/// its links to copy.
+fn where_from(app: &mut App, ui: &mut Ui, item: &QueueItem) {
+    let p = palette(ui);
+    section_title(ui, icon::FOLDER_OPEN, "Where", "");
+    let target = item.target_path.clone().or_else(|| item.options.output_path.clone());
+    if let Some(path) = target {
+        let shown = path.display().to_string();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Saved to").small().color(p.muted));
+            ui.add(egui::Label::new(RichText::new(&shown).monospace().color(p.text)).truncate()).on_hover_text(&shown);
+        });
+    }
+    if let Some(page) = page_of(item) {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("From the page").small().color(p.muted));
+            if ui.link(truncate_chars(page, 70)).on_hover_text(page).clicked() {
+                ui.ctx().open_url(egui::OpenUrl::new_tab(page));
+            }
+        });
+    }
+    for url in item.urls.iter().take(4) {
+        ui.horizontal(|ui| {
+            if icon_button(ui, icon::COPY, "Copy the link", true).clicked() {
+                app.copy_text(url.to_string());
+            }
+            let shown = hyperfetch_core::history::redact_url(url.as_str());
+            ui.add(egui::Label::new(RichText::new(&shown).small().monospace().color(p.dim)).truncate()).on_hover_text(shown.clone());
+        });
+    }
+}
+
+/// Speed limit for this download alone: running, it starts again from where it is with the new
+/// limit; waiting or paused, it takes it when it starts.
+fn limit_for_this(app: &mut App, ui: &mut Ui, item: &QueueItem) {
+    if matches!(item.status, QueueItemStatus::Completed | QueueItemStatus::Pausing) {
+        return;
+    }
+    let p = palette(ui);
+    section_title(ui, icon::GAUGE, "Speed limit for this one", "");
+    let id = egui::Id::new(("own limit", item.id));
+    let current = item.options.max_speed.map_or(0.0, |bytes| bytes as f64 / (1024.0 * 1024.0));
+    let mut typed = ui.data(|d| d.get_temp::<f64>(id)).unwrap_or(current);
+    let mut apply = None;
+    ui.horizontal(|ui| {
+        ui.add(egui::DragValue::new(&mut typed).range(0.0..=10_000.0).speed(0.1).max_decimals(1).suffix(" MB/s"));
+        ui.label(RichText::new("0 = none").small().color(p.muted));
+        if ui.add_enabled((typed - current).abs() > 0.05, button("Apply")).clicked() {
+            apply = Some((typed > 0.0).then(|| ((typed * 1024.0 * 1024.0) as u64).max(1)));
+        }
+    });
+    ui.data_mut(|d| d.insert_temp(id, typed));
+    let Some(limit) = apply else { return };
+    if item.status == QueueItemStatus::Downloading {
+        app.restart_with(item.id, move |options| options.max_speed = limit);
+    } else if let Some(item) = app.queue.get_item_mut(item.id) {
+        item.options.max_speed = limit;
+    }
 }
 
 /// The speed of download `item` over the last minute. A new sample rises from the one before
@@ -479,80 +752,182 @@ fn throughput_graph(ui: &mut Ui, item: usize, history: Option<&VecDeque<(Instant
         .collect();
     let peak = samples.iter().map(|(_, s)| *s).fold(0.0_f64, f64::max);
     let avg = if samples.is_empty() { 0.0 } else { samples.iter().map(|(_, s)| s).sum::<f64>() / samples.len() as f64 };
+    let stats = format!("Peak {}/s  ·  Average {}/s  ·  Now {}/s", format_bytes(peak as u64), format_bytes(avg as u64), format_bytes(current as u64));
+    ui.label(RichText::new(stats).small().color(p.muted));
+    ui.add_space(4.0);
 
-    card(ui).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        ui.horizontal(|ui| {
-            ui.label(bold("Throughput").color(p.strong));
-            ui.label(RichText::new("last 60 seconds").small().color(p.muted));
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let stats = format!(
-                    "Peak {}/s  ·  Avg {}/s  ·  Now {}/s",
-                    format_bytes(peak as u64),
-                    format_bytes(avg as u64),
-                    format_bytes(current as u64)
-                );
-                ui.label(RichText::new(stats).small().color(p.muted));
-            });
-        });
-        ui.add_space(6.0);
+    let graph_height = 96.0;
+    let (response, painter) = ui.allocate_painter(Vec2::new(ui.available_width(), graph_height), Sense::hover());
+    let rect = response.rect;
+    painter.rect_filled(rect, 10.0, p.field);
+    let y_mid = rect.center().y;
+    painter.line_segment([Pos2::new(rect.min.x + 8.0, y_mid), Pos2::new(rect.max.x - 8.0, y_mid)], Stroke::new(1.0, p.border));
 
-        let graph_height = 90.0;
-        let (response, painter) = ui.allocate_painter(Vec2::new(ui.available_width(), graph_height), Sense::hover());
-        let rect = response.rect;
-        painter.rect_filled(rect, 6.0, p.field);
-        let y_mid = rect.center().y;
-        painter.line_segment([Pos2::new(rect.min.x, y_mid), Pos2::new(rect.max.x, y_mid)], Stroke::new(1.0, p.border));
+    let max_y = anim::value(ui.ctx(), id.with("scale"), (peak * 1.15).max(1024.0 * 1024.0) as f32, 0.4) as f64;
+    if let Some((_, speed)) = samples.last_mut() {
+        *speed = anim::value(ui.ctx(), id.with("tip"), *speed as f32, 0.3) as f64;
+    }
+    for (y, value) in [(rect.min.y + 4.0, max_y), (y_mid + 2.0, max_y / 2.0)] {
+        let label = format!("{}/s", format_bytes(value as u64));
+        painter.text(Pos2::new(rect.min.x + 8.0, y), Align2::LEFT_TOP, label, FontId::proportional(10.5), p.dim);
+    }
 
-        let max_y = anim::value(ui.ctx(), id.with("scale"), (peak * 1.15).max(1024.0 * 1024.0) as f32, 0.4) as f64;
-        if let Some((_, speed)) = samples.last_mut() {
-            *speed = anim::value(ui.ctx(), id.with("tip"), *speed as f32, 0.3) as f64;
+    let points: Vec<Pos2> = samples
+        .iter()
+        .map(|(age, speed)| {
+            let x = rect.min.x + (1.0 - age / window) * rect.width();
+            let y = (rect.max.y - 2.0) - (*speed as f32 / max_y as f32).clamp(0.0, 1.0) * (rect.height() - 6.0);
+            Pos2::new(x, y)
+        })
+        .collect();
+    if points.len() >= 2 {
+        // Area fill as one mesh with a vertical gradient.
+        let mut mesh = egui::Mesh::default();
+        for point in &points {
+            mesh.colored_vertex(*point, p.link.gamma_multiply(0.28));
+            mesh.colored_vertex(Pos2::new(point.x, rect.max.y - 1.0), p.link.gamma_multiply(0.02));
         }
-        for (y, value) in [(rect.min.y + 4.0, max_y), (y_mid + 2.0, max_y / 2.0)] {
-            let label = format!("{}/s", format_bytes(value as u64));
-            painter.text(Pos2::new(rect.min.x + 6.0, y), Align2::LEFT_TOP, label, FontId::proportional(10.0), p.dim);
+        for i in 0..(points.len() as u32 - 1) {
+            let (top_left, bot_left, top_right, bot_right) = (i * 2, i * 2 + 1, i * 2 + 2, i * 2 + 3);
+            mesh.add_triangle(top_left, bot_left, bot_right);
+            mesh.add_triangle(top_left, bot_right, top_right);
         }
+        painter.add(egui::Shape::mesh(mesh));
+        painter.add(egui::Shape::line(points.clone(), Stroke::new(2.0, p.link)));
 
-        let points: Vec<Pos2> = samples
-            .iter()
-            .map(|(age, speed)| {
-                let x = rect.min.x + (1.0 - age / window) * rect.width();
-                let y = (rect.max.y - 2.0) - (*speed as f32 / max_y as f32).clamp(0.0, 1.0) * (rect.height() - 6.0);
-                Pos2::new(x, y)
+        if let Some(&last) = points.last() {
+            let pulse = if live { anim::pulse(ui.ctx(), 1.8) } else { 0.0 };
+            painter.circle_filled(last, 4.0 + pulse * 3.0, p.link.gamma_multiply(0.15 + pulse * 0.2));
+            painter.circle(last, 3.5, p.field, Stroke::new(2.0, p.link));
+        }
+    }
+
+    if let Some(hover) = response.hover_pos().filter(|pos| rect.contains(*pos)) {
+        let target_age = (1.0 - (hover.x - rect.min.x) / rect.width()) * window;
+        let nearest = samples.iter().min_by(|(a, _), (b, _)| (a - target_age).abs().total_cmp(&(b - target_age).abs()));
+        if let Some((_, speed)) = nearest {
+            painter.line_segment([Pos2::new(hover.x, rect.min.y), Pos2::new(hover.x, rect.max.y)], Stroke::new(1.0, p.muted));
+            response.show_tooltip_text(format!("{}s ago: {}/s", target_age as u64, format_bytes(*speed as u64)));
+        }
+    }
+}
+
+// ---- Timeline -------------------------------------------------------------------------------
+
+/// What happened to each download while the app watched: noted by [`observe`] as its status
+/// changes (added, started, resumed, stalled, paused, failed, finished) and as Autopilot changes
+/// its mind. Kept for this run of the app.
+#[derive(Clone, Default)]
+struct Timeline {
+    /// Each download's status kind, whether it was stalled, and Autopilot's last word.
+    seen: HashMap<usize, (u8, bool, Option<String>)>,
+    /// Each download's events: the local time (HH:MM) and what happened, oldest first.
+    events: HashMap<usize, Vec<(String, String)>>,
+}
+
+fn timeline_id() -> egui::Id {
+    egui::Id::new("download timeline")
+}
+
+/// A number for the kind of `status`, its error text aside.
+fn status_kind(status: &QueueItemStatus) -> u8 {
+    match status {
+        QueueItemStatus::Queued => 0,
+        QueueItemStatus::Downloading => 1,
+        QueueItemStatus::Pausing => 2,
+        QueueItemStatus::Paused => 3,
+        QueueItemStatus::Completed => 4,
+        QueueItemStatus::Failed(_) => 5,
+        QueueItemStatus::AuthRequired => 6,
+    }
+}
+
+/// Notes every download's news in its timeline (see [`Timeline`]); called once a frame.
+pub(super) fn observe(app: &App, ctx: &egui::Context) {
+    ctx.data_mut(|d| {
+        let timeline = d.get_temp_mut_or_default::<Timeline>(timeline_id());
+        let mut time = None;
+        let mut now = || {
+            time.get_or_insert_with(|| {
+                let (_, minute) = crate::desktop::local_now();
+                format!("{:02}:{:02}", minute / 60, minute % 60)
             })
-            .collect();
-        if points.len() >= 2 {
-            // Area fill as one mesh with a vertical gradient.
-            let mut mesh = egui::Mesh::default();
-            for point in &points {
-                mesh.colored_vertex(*point, p.accent.gamma_multiply(0.25));
-                mesh.colored_vertex(Pos2::new(point.x, rect.max.y - 1.0), p.accent.gamma_multiply(0.02));
+            .clone()
+        };
+        for item in app.queue.items() {
+            let kind = status_kind(&item.status);
+            let stalled = app.stalled_for(item.id).is_some();
+            let autopilot = app.jobs.get(&item.id).and_then(|view| view.autopilot.clone());
+            let before = timeline.seen.get(&item.id).cloned();
+            if before.as_ref() == Some(&(kind, stalled, autopilot.clone())) {
+                continue;
             }
-            for i in 0..(points.len() as u32 - 1) {
-                let (top_left, bot_left, top_right, bot_right) = (i * 2, i * 2 + 1, i * 2 + 2, i * 2 + 3);
-                mesh.add_triangle(top_left, bot_left, bot_right);
-                mesh.add_triangle(top_left, bot_right, top_right);
+            let mut news = Vec::new();
+            match &before {
+                None => {
+                    news.push(match item.status {
+                        QueueItemStatus::Completed => "Finished".to_string(),
+                        _ => "Added to the list".to_string(),
+                    });
+                    news.extend(autopilot.as_ref().map(|why| format!("Autopilot: {why}")));
+                }
+                Some((was, was_stalled, was_autopilot)) => {
+                    if *was != kind {
+                        news.push(match &item.status {
+                            QueueItemStatus::Queued => "Waiting for a free slot".to_string(),
+                            QueueItemStatus::Downloading if item.downloaded_bytes > 0 => format!("Resumed at {}", format_bytes(item.downloaded_bytes)),
+                            QueueItemStatus::Downloading => "Started".to_string(),
+                            QueueItemStatus::Pausing => "Pausing".to_string(),
+                            QueueItemStatus::Paused => "Paused".to_string(),
+                            QueueItemStatus::Completed => format!("Finished: {}", format_bytes(item.total_bytes.max(item.downloaded_bytes))),
+                            QueueItemStatus::Failed(error) => format!("Failed: {}", truncate_chars(error, 120)),
+                            QueueItemStatus::AuthRequired => "Waiting for its Authorization header".to_string(),
+                        });
+                    }
+                    if stalled != *was_stalled {
+                        news.push(if stalled { "Stalled: no data for a while" } else { "Data coming in again" }.to_string());
+                    }
+                    if autopilot != *was_autopilot {
+                        if let Some(why) = &autopilot {
+                            news.push(format!("Autopilot: {why}"));
+                        }
+                    }
+                }
             }
-            painter.add(egui::Shape::mesh(mesh));
-            painter.add(egui::Shape::line(points.clone(), Stroke::new(2.0, p.accent)));
-
-            if let Some(&last) = points.last() {
-                let pulse = if live { anim::pulse(ui.ctx(), 1.8) } else { 0.0 };
-                painter.circle_filled(last, 4.0 + pulse * 3.0, p.accent.gamma_multiply(0.15 + pulse * 0.2));
-                painter.circle(last, 3.5, p.card, Stroke::new(2.0, p.accent));
+            timeline.seen.insert(item.id, (kind, stalled, autopilot));
+            let events = timeline.events.entry(item.id).or_default();
+            for what in news {
+                events.push((now(), what));
             }
-        }
-
-        if let Some(hover) = response.hover_pos().filter(|pos| rect.contains(*pos)) {
-            let target_age = (1.0 - (hover.x - rect.min.x) / rect.width()) * window;
-            let nearest = samples.iter().min_by(|(a, _), (b, _)| (a - target_age).abs().total_cmp(&(b - target_age).abs()));
-            if let Some((_, speed)) = nearest {
-                painter.line_segment([Pos2::new(hover.x, rect.min.y), Pos2::new(hover.x, rect.max.y)], Stroke::new(1.0, p.muted));
-                response.show_tooltip_text(format!("T-{}s: {}/s", target_age as u64, format_bytes(*speed as u64)));
+            // The newest 40 are plenty to read.
+            if events.len() > 40 {
+                events.drain(..events.len() - 40);
             }
         }
     });
 }
+
+/// The timeline of `item` (see [`Timeline`]), newest first, a line each: the time on a dot, and
+/// what happened.
+fn timeline_view(ui: &mut Ui, item: &QueueItem) {
+    let p = palette(ui);
+    let events = ui.data(|d| d.get_temp::<Timeline>(timeline_id())).and_then(|t| t.events.get(&item.id).cloned()).unwrap_or_default();
+    if events.is_empty() {
+        return;
+    }
+    section_title(ui, icon::CLOCK_COUNTER_CLOCKWISE, "What happened", "while the app was open");
+    for (n, (time, what)) in events.iter().rev().enumerate() {
+        ui.horizontal(|ui| {
+            let (dot, _) = ui.allocate_exact_size(Vec2::new(10.0, 18.0), Sense::hover());
+            let color = if n == 0 { p.link } else { p.dim };
+            ui.painter().circle_filled(dot.center(), 3.5, color);
+            ui.add_sized([42.0, 18.0], egui::Label::new(RichText::new(time).small().color(p.muted)));
+            ui.add(egui::Label::new(RichText::new(what).color(if n == 0 { p.text } else { p.muted })).wrap());
+        });
+    }
+}
+
+// ---- Cards ----------------------------------------------------------------------------------
 
 #[derive(Clone, Copy)]
 enum RowAction {
@@ -578,7 +953,7 @@ enum RowAction {
 
 /// The order and priority of `item`, the `index`th of `len` downloads: Download next, Move up and
 /// Move down, and for a waiting one its priority; for a stopped one, New link… and the page it
-/// came from. Its row's ⋯ menu and right-click menu.
+/// came from. Its card's ⋯ menu and right-click menu.
 fn order_menu(ui: &mut Ui, item: &QueueItem, index: usize, len: usize, action: &mut Option<(usize, RowAction)>) {
     let waiting = item.status == QueueItemStatus::Queued;
     let moves = [
@@ -615,10 +990,12 @@ fn order_menu(ui: &mut Ui, item: &QueueItem, index: usize, len: usize, action: &
     }
 }
 
-/// Height of one queue row: every row has the same, so only the rows in view are laid out.
-const ROW_HEIGHT: f32 = 58.0;
+/// Height of one card: every card has the same, so only the cards in view are laid out.
+const ROW_HEIGHT: f32 = 82.0;
+/// The space between two cards.
+const GAP: f32 = 8.0;
 
-/// The buttons of a queue row for a download in `status`: icon, tooltip and action.
+/// The buttons of a card for a download in `status`: icon, tooltip and action.
 fn row_actions(status: &QueueItemStatus) -> &'static [(&'static str, &'static str, RowAction)] {
     use RowAction::*;
     match status {
@@ -641,12 +1018,12 @@ fn row_actions(status: &QueueItemStatus) -> &'static [(&'static str, &'static st
     }
 }
 
-/// The second line of a queue row: where it is (`ratio` as shown), how fast, how long still, its peers and upload,
-/// and what post-processing said.
+/// The plain one-line status of a card: where it is (`ratio` as shown), how fast, how long still,
+/// over how many connections or peers, and what post-processing said.
 fn row_summary(app: &App, item: &QueueItem, ratio: f64) -> String {
     let view = app.jobs.get(&item.id);
     let elapsed = view.map(|view| view.elapsed().as_secs());
-    let mut parts = vec![format!("#{}", item.id)];
+    let mut parts = Vec::new();
     if item.status == QueueItemStatus::Completed {
         parts.push(format_bytes(item.total_bytes.max(item.downloaded_bytes)));
     } else {
@@ -660,6 +1037,14 @@ fn row_summary(app: &App, item: &QueueItem, ratio: f64) -> String {
         if let Some(eta) = util::eta_secs(item.total_bytes, item.downloaded_bytes, item.speed_bytes_per_sec) {
             parts.push(format!("{} left", format_duration(eta)));
         }
+        if let Some(stalled) = app.stalled_for(item.id) {
+            parts.push(format!("no data for {} s, retrying", stalled.as_secs()));
+        } else if let Some(view) = view.filter(|view| view.active_workers > 0 && view.torrent.is_none()) {
+            parts.push(match view.active_workers {
+                1 => "1 connection".to_string(),
+                n => format!("{n} connections"),
+            });
+        }
     }
     if let Some(torrent) = view.and_then(|view| view.torrent.as_ref()) {
         parts.push(format!("{} peers", torrent.peers));
@@ -672,10 +1057,10 @@ fn row_summary(app: &App, item: &QueueItem, ratio: f64) -> String {
     parts.join("  ·  ")
 }
 
-/// How long a removed row lingers: fading out for the first half, then closing its gap.
+/// How long a removed card lingers: fading out for the first half, then closing its gap.
 const GHOST: f64 = 0.4;
 
-/// A removed download's row, still fading out.
+/// A removed download's card, still fading out.
 #[derive(Clone)]
 struct Ghost {
     item: QueueItem,
@@ -685,7 +1070,7 @@ struct Ghost {
     since: f64,
 }
 
-/// What the queue list showed, kept between frames to tell rows that come and go.
+/// What the list showed, kept between frames to tell cards that come and go.
 #[derive(Clone, Default)]
 struct Rows {
     /// The pass that last drew the list; a gap means the page was away and starts over.
@@ -694,22 +1079,22 @@ struct Rows {
     revision: u64,
     items: Vec<QueueItem>,
     ghosts: Vec<Ghost>,
-    /// Rows that changed places: id, how many rows below its new place it was (above it when
+    /// Cards that changed places: id, how many rows below its new place it was (above it when
     /// negative), and when.
     moves: Vec<(usize, f32, f64)>,
 }
 
-/// How long a row that changed places takes to glide to its new one.
+/// How long a card that changed places takes to glide to its new one.
 const GLIDE: f64 = 0.3;
 
-/// How many rows below its place (above it when negative) row `id` still shows while it glides
+/// How many rows below its place (above it when negative) card `id` still shows while it glides
 /// there (see [`Rows::moves`]).
 fn glide(moves: &[(usize, f32, f64)], id: usize, now: f64) -> f32 {
     moves.iter().find(|m| m.0 == id).map_or(0.0, |&(_, from, since)| from * (1.0 - anim::ease(((now - since) / GLIDE) as f32)))
 }
 
 /// Notes what changed since the list was drawn on the frame before (`pass - 1`): removed
-/// downloads become ghosts, rows that changed places glide there from where they showed, and the
+/// downloads become ghosts, cards that changed places glide there from where they showed, and the
 /// ids returned are new. A list that was not drawn then (the page just opened) starts over:
 /// nothing is new, removed or moved. No ghosts or glides under Reduce motion.
 fn track(rows: &mut Rows, items: &[QueueItem], revision: u64, pass: u64, now: f64, reduced: bool) -> Vec<usize> {
@@ -723,7 +1108,7 @@ fn track(rows: &mut Rows, items: &[QueueItem], revision: u64, pass: u64, now: f6
                 rows.ghosts.push(Ghost { item: item.clone(), index, since: now });
             }
             new = items.iter().map(|item| item.id).filter(|id| !old.contains(id)).collect();
-            // Places among the rows there before and still: rows that come or go move none.
+            // Places among the cards there before and still: cards that come or go move none.
             let was: HashMap<usize, usize> =
                 rows.items.iter().filter(|item| ids.contains(&item.id)).enumerate().map(|(place, item)| (item.id, place)).collect();
             for (place, item) in items.iter().filter(|item| old.contains(&item.id)).enumerate() {
@@ -743,7 +1128,7 @@ fn track(rows: &mut Rows, items: &[QueueItem], revision: u64, pass: u64, now: f6
     new
 }
 
-/// One line of the queue list.
+/// One line of the list.
 struct Line<'a> {
     item: &'a QueueItem,
     /// How far (0.0 to 1.0) the ghost of a removed download has faded out.
@@ -755,9 +1140,9 @@ struct Line<'a> {
     drop: f32,
 }
 
-/// The lines of the list: `items`, ghosts fading out where they were, the rows under a ghost
-/// closing its gap pushed down by what is left of it, and rows that changed places on their way;
-/// and how many rows of gap are still closing under the last line.
+/// The lines of the list: `items`, ghosts fading out where they were, the cards under a ghost
+/// closing its gap pushed down by what is left of it, and cards that changed places on their
+/// way; and how many rows of gap are still closing under the last line.
 // ponytail: ghosts of separate removals less than GHOST apart may land a row off; placing them
 // by their neighbours would be exact.
 fn lines<'a>(items: &'a [QueueItem], rows: &'a Rows, new: &[usize], now: f64) -> (Vec<Line<'a>>, f32) {
@@ -770,7 +1155,7 @@ fn lines<'a>(items: &'a [QueueItem], rows: &'a Rows, new: &[usize], now: f64) ->
     }
     let mut drop = 0.0;
     lines.retain_mut(|line| match line.ghost {
-        // Faded out: its row is gone, and what is under it slides up.
+        // Faded out: its card is gone, and what is under it slides up.
         Some(t) if t >= 0.5 => {
             drop += 1.0 - anim::ease(2.0 * t - 1.0);
             false
@@ -787,9 +1172,9 @@ fn lines<'a>(items: &'a [QueueItem], rows: &'a Rows, new: &[usize], now: f64) ->
     (lines, drop)
 }
 
-/// How far (0.0 to 1.0) `item`'s row is into its status, which changed when its kind did (not
+/// How far (0.0 to 1.0) `item`'s card is into its status, which changed when its kind did (not
 /// its progress or error text) or when it started or stopped `waiting`; and, just after it
-/// failed, how far its row shakes sideways.
+/// failed, how far its card shakes sideways.
 fn row_motion(ctx: &egui::Context, item: &QueueItem, waiting: bool) -> (f32, f32) {
     let id = egui::Id::new(("queue row", item.id));
     let kind = (std::mem::discriminant(&item.status), waiting);
@@ -799,11 +1184,11 @@ fn row_motion(ctx: &egui::Context, item: &QueueItem, waiting: bool) -> (f32, f32
     (t, if matches!(item.status, QueueItemStatus::Failed(_)) { shake } else { 0.0 })
 }
 
-/// The icon that leads a queue row, `t` (0.0 to 1.0) into its status: a spinner while it waits,
-/// an arrow bobbing while data comes in (still when `stalled`), a check that draws itself on
+/// The icon that leads a card, `t` (0.0 to 1.0) into its status: a spinner while it waits, an
+/// arrow bobbing while data comes in (still when `stalled`), a check that draws itself on
 /// completion; the others pop and fade in.
 fn status_icon(ui: &mut Ui, item: &QueueItem, waiting: bool, stalled: bool, color: Color32, t: f32) {
-    const SIZE: f32 = 16.0;
+    const SIZE: f32 = 18.0;
     if waiting {
         anim::spinner(ui, SIZE, color);
         return;
@@ -812,7 +1197,7 @@ fn status_icon(ui: &mut Ui, item: &QueueItem, waiting: bool, stalled: bool, colo
     let glyph = match item.status {
         QueueItemStatus::Completed => {
             ui.painter().circle_stroke(rect.center(), SIZE / 2.0 - 1.0, Stroke::new(1.5, color));
-            anim::paint_check(ui.painter(), rect.shrink(3.5), anim::ease(t), Stroke::new(2.0, color));
+            anim::paint_check(ui.painter(), rect.shrink(4.0), anim::ease(t), Stroke::new(2.0, color));
             return;
         }
         QueueItemStatus::Downloading => icon::ARROW_DOWN,
@@ -821,17 +1206,58 @@ fn status_icon(ui: &mut Ui, item: &QueueItem, waiting: bool, stalled: bool, colo
         QueueItemStatus::Queued => icon::CLOCK,
         QueueItemStatus::Paused | QueueItemStatus::Pausing => icon::PAUSE,
     };
-    let bob = if item.status == QueueItemStatus::Downloading && !stalled && ui.is_rect_visible(rect) { 2.0 - 4.0 * anim::pulse(ui.ctx(), 1.1) } else { 0.0 };
-    let size = 15.0 * (0.6 + 0.4 * anim::overshoot(t));
+    let bob = if item.status == QueueItemStatus::Downloading && !stalled && ui.is_rect_visible(rect) { 2.0 - 4.0 * anim::pulse(ui.ctx(), 1.3) } else { 0.0 };
+    let size = 16.0 * (0.6 + 0.4 * anim::overshoot(t));
     anim::paint_icon(ui.painter(), rect.center() + Vec2::new(0.0, bob), glyph, size, color.gamma_multiply(anim::ease(t)), 0.0);
 }
 
-/// One line of the queue list: the row of `line.item`, with its status, name and buttons, then
-/// progress, speed, time left, peers and notes; or why it failed (in full on hover), or why one
-/// restored without its Authorization header waits. A click selects it, a double click shows it,
-/// and it can be dragged (see `queue_page`); its ⋯ button and a right click open its
-/// [`order_menu`]. A High or Low priority shows by its name. It fades in when new and out as a
-/// ghost, flashes green on completion and shakes on failure. Returns the row's response.
+/// A card's progress: with the pieces known, each connection's piece filling in its own colour
+/// (a little towards the accent) on a thin track; else one bar. A light sweeps over what came
+/// while bytes arrive.
+fn segment_bar(ui: &mut Ui, id: egui::Id, item: &QueueItem, chunks: &[ChunkSnapshot], color: Color32, live: bool) {
+    let p = palette(ui);
+    let size = Vec2::new(ui.available_width(), 6.0);
+    let ratio = item.progress_ratio as f32;
+    if chunks.is_empty() || item.total_bytes == 0 || item.status == QueueItemStatus::Completed {
+        progress_bar(ui, id, size, ratio, color, live, None);
+        return;
+    }
+    // Keeps the shared bar's easing going for the details' bar.
+    let shown = anim::value(ui.ctx(), id.with("progress"), ratio.clamp(0.0, 1.0), 0.35);
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+    painter.rect_filled(rect, 3.0, p.border);
+    let total = item.total_bytes as f32;
+    let x = |bytes: u64| rect.left() + (bytes as f32 / total).clamp(0.0, 1.0) * rect.width();
+    for chunk in chunks {
+        let reach = chunk.range_start + chunk.downloaded_bytes.min(chunk.total_bytes);
+        let (left, right) = (x(chunk.range_start), x(reach));
+        if right <= left {
+            continue;
+        }
+        let tone = match chunk.worker_id {
+            _ if chunk.total_bytes > 0 && chunk.downloaded_bytes >= chunk.total_bytes => color,
+            Some(worker) => lane(&p, worker).lerp_to_gamma(color, 0.35),
+            None => color,
+        };
+        painter.rect_filled(Rect::from_x_y_ranges(left..=right, rect.y_range()), 0.0, tone);
+    }
+    if live && shown > 0.0 {
+        let done = Rect::from_min_size(rect.min, Vec2::new(rect.width() * shown, rect.height()));
+        anim::sheen(ui, done);
+    }
+}
+
+/// One card of the list: its status icon and name, its buttons on the right, the pieces filling
+/// in under them, and its plain status line; or why it failed (in full on hover), or why one
+/// restored without its Authorization header waits. A click selects it, a double click (or
+/// Enter) shows it, and it can be dragged (see `queue_page`); its ⋯ button and a right click
+/// open its [`order_menu`]. A High or Low priority shows by its name. Under the pointer it lifts
+/// a little on a softer, deeper shadow. It fades in when new and out as a ghost, glows green on
+/// completion and shakes on failure. Returns the card's response.
 fn queue_row(app: &App, ui: &mut Ui, line: &Line, action: &mut Option<(usize, RowAction)>) -> egui::Response {
     let p = palette(ui);
     let item = line.item;
@@ -848,9 +1274,9 @@ fn queue_row(app: &App, ui: &mut Ui, line: &Line, action: &mut Option<(usize, Ro
             (shown, anim::RISE * (1.0 - shown))
         }
     };
-    let stride = ROW_HEIGHT + ui.spacing().item_spacing.y;
+    let stride = ROW_HEIGHT + GAP;
     let rect = slot.translate(shift + Vec2::new(shake, line.drop * stride));
-    // Clicks go where the row is drawn, also while it slides into a closing gap.
+    // Clicks go where the card is drawn, also while it slides into a closing gap.
     let response = ui.interact(rect, id.with("row"), Sense::click_and_drag());
     let mut ignored = None;
     let action = if line.ghost.is_some() { &mut ignored } else { action };
@@ -865,35 +1291,50 @@ fn queue_row(app: &App, ui: &mut Ui, line: &Line, action: &mut Option<(usize, Ro
     if let Some(index) = place {
         response.context_menu(|ui| order_menu(ui, item, index, items.len(), action));
     }
-    // Pulses only in view: the list lays out one row past its bottom edge.
+    // Pulses only in view: the list lays out one card past its bottom edge.
     let seen = ui.is_rect_visible(rect);
-    let inner = egui::UiBuilder::new().max_rect(rect.shrink2(Vec2::new(12.0, 7.0))).layout(Layout::top_down(Align::LEFT));
-    let mut ui = ui.new_child(inner);
-    // A row being dragged stays dimmed in its place until it is dropped.
-    ui.multiply_opacity(if response.dragged() { 0.5 * opacity } else { opacity });
-
-    // The selected row's highlight is the list's (it slides); the others light up under the pointer.
-    let hover = anim::presence(&ctx, id.with("hover"), response.hovered() && line.ghost.is_none(), 0.12);
-    if hover > 0.0 && app.selected != Some(item.id) {
-        ui.painter().rect_filled(rect, 8.0, p.hover.gamma_multiply(0.6 * hover));
+    // Near the list's top and bottom edges a card fades, so that the list melts into the page.
+    let clip = ui.clip_rect();
+    let edge = ((rect.center().y - clip.top()).min(clip.bottom() - rect.center().y) / (ROW_HEIGHT * 0.5)).clamp(0.0, 1.0);
+    let edge = 0.35 + 0.65 * edge;
+    let hover = anim::presence(&ctx, id.with("hover"), response.hovered() && line.ghost.is_none(), 0.15);
+    // A card being dragged stays dimmed in its place until it is dropped.
+    let opacity = if response.dragged() { 0.5 * opacity } else { opacity } * edge;
+    let lifted = rect.translate(Vec2::new(0.0, -1.5 * hover));
+    if seen {
+        let painter = ui.painter().clone();
+        let painter = painter.with_clip_rect(clip);
+        let fade = |c: Color32| c.gamma_multiply(opacity);
+        let shadow = card_shadow(ui, hover);
+        let mut shade = shadow.as_shape(lifted, 14.0);
+        shade.fill = fade(shade.fill);
+        painter.add(shade);
+        let fill = p.card.lerp_to_gamma(p.hover, 0.25 * hover);
+        let flash = match item.status {
+            QueueItemStatus::Completed => Some(p.green),
+            QueueItemStatus::Failed(_) => Some(p.red),
+            _ => None,
+        };
+        let fill = match flash.filter(|_| t < 1.0) {
+            Some(color) => fill.lerp_to_gamma(color, 0.22 * (1.0 - anim::ease(t))),
+            None => fill,
+        };
+        painter.rect(lifted, 14.0, fade(fill), Stroke::new(1.0, fade(p.border.lerp_to_gamma(p.dim, 0.5 * hover))));
     }
-    let flash = match item.status {
-        QueueItemStatus::Completed => Some(p.green),
-        QueueItemStatus::Failed(_) => Some(p.red),
-        _ => None,
-    };
-    if let Some(color) = flash.filter(|_| t < 1.0) {
-        ui.painter().rect_filled(rect, 8.0, color.gamma_multiply(0.25 * (1.0 - anim::ease(t))));
+    let inner = egui::UiBuilder::new().max_rect(lifted.shrink2(Vec2::new(16.0, 11.0))).layout(Layout::top_down(Align::LEFT));
+    let mut ui = ui.new_child(inner);
+    ui.multiply_opacity(opacity);
+    if app.selected == Some(item.id) && line.ghost.is_none() {
+        ctx.data_mut(|d| d.insert_temp(super::ring_target_id(), lifted.expand(3.0)));
     }
 
     let item_id = egui::Id::new(("item", item.id));
     let (status, color) = status_badge(app, item, &p);
     let actions = row_actions(&item.status);
-    // A stream's row offers its track chooser too, left of the others.
+    // A stream's card offers its track chooser too, left of the others.
     let tracks = crate::tracks::offered(item);
     ui.horizontal(|ui| {
         status_icon(ui, item, waiting, app.stalled_for(item.id).is_some(), color, t);
-        status_chip(ui, item_id, status, color, downloading && !waiting && seen);
         left_part(ui, (actions.len() + usize::from(tracks) + 1) as f32 * 30.0, |ui| {
             let mark = match item.priority {
                 Priority::High => Some((icon::CARET_DOUBLE_UP, p.amber, "High priority: starts before the other waiting downloads, and gets more of a speed limit")),
@@ -903,7 +1344,7 @@ fn queue_row(app: &App, ui: &mut Ui, line: &Line, action: &mut Option<(usize, Ro
             if let Some((glyph, color, tip)) = mark {
                 ui.add(egui::Label::new(RichText::new(glyph).color(color)).selectable(false)).on_hover_text(tip);
             }
-            let name = egui::Label::new(bold(&item.filename).color(p.strong)).truncate().selectable(false);
+            let name = egui::Label::new(bold(&item.filename).size(14.5).color(p.strong)).truncate().selectable(false);
             ui.add(name).on_hover_text(&item.filename);
         });
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -928,23 +1369,27 @@ fn queue_row(app: &App, ui: &mut Ui, line: &Line, action: &mut Option<(usize, Ro
             }
         });
     });
-    ui.add_space(2.0);
+    ui.add_space(5.0);
+    let bar = match item.status {
+        QueueItemStatus::Completed => p.green,
+        QueueItemStatus::Downloading => p.accent,
+        QueueItemStatus::Failed(_) => p.red,
+        _ => p.dim,
+    };
+    let bar = anim::color(&ctx, item_id.with("bar"), bar, 0.35);
+    let chunks: &[ChunkSnapshot] = app.jobs.get(&item.id).map_or(&[], |view| &view.chunks);
+    let arriving = downloading && seen && !waiting && app.stalled_for(item.id).is_none();
+    segment_bar(&mut ui, item_id, item, chunks, bar, arriving);
+    ui.add_space(5.0);
     ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        let chip = anim::color(&ctx, item_id.with("status chip"), color, 0.35);
+        ui.add(egui::Label::new(bold(status).size(12.0).color(chip)).selectable(false));
         let (text, color) = match &item.status {
             QueueItemStatus::Failed(_) if item.link_expired() => (LINK_EXPIRED.to_string(), p.amber),
             QueueItemStatus::Failed(error) => (truncate_chars(util::error_hint(error).unwrap_or(error.as_str()), 200), p.red),
             QueueItemStatus::AuthRequired => ("Authorization header not saved: open Details to enter it again and resume".to_string(), p.amber),
-            status => {
-                let bar = match status {
-                    QueueItemStatus::Completed => p.green,
-                    QueueItemStatus::Downloading => p.accent,
-                    _ => p.dim,
-                };
-                let bar = anim::color(&ctx, item_id.with("bar"), bar, 0.35);
-                let ratio = item.progress_ratio as f32;
-                progress_bar(ui, item_id, Vec2::new(140.0, 6.0), ratio, bar, downloading, None);
-                (row_summary(app, item, eased_progress(ui, item_id, ratio) as f64), p.muted)
-            }
+            _ => (row_summary(app, item, eased_progress(ui, item_id, item.progress_ratio as f32) as f64), p.muted),
         };
         let label = ui.add(egui::Label::new(RichText::new(text).small().color(color)).truncate().selectable(false));
         match &item.status {
@@ -971,7 +1416,7 @@ fn finish_time(left: Remaining) -> Option<String> {
     })
 }
 
-/// The Queue's status filters, by number (`App::queue_filter`).
+/// The list's status filters, by number (`App::queue_filter`).
 const FILTERS: [&str; 5] = ["All", "Running", "Waiting", "Failed", "Done"];
 
 /// Whether a download of `status` is in the filter `group` (see [`FILTERS`]).
@@ -992,15 +1437,110 @@ fn listed(item: &QueueItem, group: usize, search: &str) -> bool {
     in_group(group, &item.status) && (search.is_empty() || found())
 }
 
-pub(super) fn queue_page(app: &mut App, ui: &mut Ui) {
+/// The downloads the list shows, top to bottom: for Up and Down.
+pub(super) fn visible_ids(app: &App) -> Vec<usize> {
+    let search = app.queue_search.trim().to_lowercase();
+    app.queue.items().iter().filter(|item| listed(item, app.queue_filter, &search)).map(|item| item.id).collect()
+}
+
+/// Whether the box for adding many links at once shows (from the toolbar's menu).
+fn many_links_id() -> egui::Id {
+    egui::Id::new("many links shown")
+}
+
+/// The toolbar over the cards: the status filters with their counts, a search, Clear completed,
+/// and a menu with the rest (Clear all, running the queue by itself and how many at once, what
+/// to do when it is done, adding many links at once); and, while downloads run, when everything
+/// will be done.
+fn toolbar(app: &mut App, ui: &mut Ui) {
     let p = palette(ui);
+    let items = app.queue.items();
+    let counts: Vec<usize> = (0..FILTERS.len()).map(|group| items.iter().filter(|item| in_group(group, &item.status)).count()).collect();
+    let running = app.queue.active_count();
+    let finish = (running > 0).then(|| finish_time(app.queue.remaining(app.settings.auto_run_queue))).flatten();
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        for (group, name) in FILTERS.into_iter().enumerate() {
+            let label = match group {
+                0 => name.to_string(),
+                _ => format!("{} {}", name, counts[group]),
+            };
+            ui.selectable_value(&mut app.queue_filter, group, label);
+        }
+        ui.add_space(8.0);
+        ui.label(RichText::new(icon::MAGNIFYING_GLASS).size(15.0).color(p.muted));
+        let width = (ui.available_width() - 190.0).clamp(90.0, 200.0);
+        ui.add(egui::TextEdit::singleline(&mut app.queue_search).hint_text("Filter by name or link").desired_width(width));
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.menu_button(icon::DOTS_THREE, |ui| {
+                ui.set_min_width(230.0);
+                if ui.button(format!("{} Clear all", icon::BROOM)).on_hover_text("Remove every download that is not running (files are kept)").clicked() {
+                    app.clear_queue(false);
+                    ui.close_menu();
+                }
+                if ui.button(format!("{} Add many links…", icon::LIST_PLUS)).clicked() {
+                    ui.data_mut(|d| d.insert_temp(many_links_id(), true));
+                    ui.close_menu();
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    toggle(ui, &mut app.settings.auto_run_queue).on_hover_text("Start queued downloads by themselves");
+                    ui.label("Run the queue,");
+                    ui.add(egui::DragValue::new(&mut app.settings.max_concurrent).range(1..=8));
+                    ui.label("at once");
+                });
+                ui.separator();
+                // For this session only; it applies once.
+                ui.label(RichText::new("When the queue is done").small().color(p.muted));
+                for (choice, name) in WhenDone::CHOICES {
+                    if ui.selectable_label(app.when_done == choice, name).clicked() {
+                        app.when_done = choice;
+                        ui.close_menu();
+                    }
+                }
+            });
+            if ui.add(button("Clear completed")).clicked() {
+                app.clear_queue(true);
+            }
+        });
+    });
+    // Under the filters, small: when it will all be done, and what happens then.
+    if finish.is_some() || app.when_done != WhenDone::Nothing {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 14.0;
+            if let Some(text) = &finish {
+                let about = "The bytes left of the running downloads and of those waiting to start, at the speed the running ones \
+                             have together; paused and stopped ones are left out.";
+                ui.label(RichText::new(text).small().color(p.muted)).on_hover_text(about);
+            }
+            if app.when_done != WhenDone::Nothing {
+                ui.label(RichText::new(format!("Then: {}", app.when_done.name().to_lowercase())).small().color(p.amber));
+            }
+        });
+    }
+}
+
+/// The box for many links at once: one download a line, mirrors of one file on one line.
+fn many_links(app: &mut App, ui: &mut Ui) {
+    if !ui.data(|d| d.get_temp::<bool>(many_links_id())).unwrap_or(false) {
+        return;
+    }
+    let p = palette(ui);
+    ui.add_space(8.0);
     card(ui).show(ui, |ui| {
         ui.set_width(ui.available_width());
-        ui.label(bold("Add to queue").color(p.strong));
+        ui.horizontal(|ui| {
+            ui.label(bold("Add many links").color(p.strong));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if icon_button(ui, icon::X, "Close", true).clicked() {
+                    ui.data_mut(|d| d.insert_temp(many_links_id(), false));
+                }
+            });
+        });
         let about = "One download per line; links to the same file from several servers go on one line, separated by \
                      spaces. A .torrent or .metalink (link, file path, or file dropped on the window) adds every file it \
                      lists, a playlist or channel every video. Uses the save folder and Settings.";
-        ui.label(RichText::new(about).small().color(p.muted));
+        ui.add(egui::Label::new(RichText::new(about).small().color(p.muted)).wrap());
         ui.add_space(4.0);
         ui.add(
             egui::TextEdit::multiline(&mut app.queue_input)
@@ -1009,70 +1549,59 @@ pub(super) fn queue_page(app: &mut App, ui: &mut Ui) {
                 .hint_text("https://example.com/file1.iso\nhttps://example.com/file2.zip https://mirror.example.org/file2.zip"),
         );
         ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            if ui.add(primary_button(&format!("{} Add to queue", icon::PLUS), p.accent)).clicked() {
-                app.add_queue_input();
-            }
-            ui.add_space(12.0);
-            toggle(ui, &mut app.settings.auto_run_queue).on_hover_text("Start queued downloads by themselves");
-            ui.label("Run automatically,");
-            ui.add(egui::DragValue::new(&mut app.settings.max_concurrent).range(1..=8));
-            ui.label("at once");
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let clear_all = ui.add(button(format!("{} Clear all", icon::BROOM)));
-                if clear_all.on_hover_text("Remove every download that is not running (files are kept)").clicked() {
-                    app.clear_queue(false);
-                }
-                if ui.add(button("Clear completed")).clicked() {
-                    app.clear_queue(true);
-                }
-            });
-        });
+        if ui.add(primary_button(&format!("{} Add to queue", icon::PLUS), p.accent)).clicked() {
+            app.add_queue_input();
+        }
         if let Some(error) = app.queue_error.clone() {
             error_alert(ui, &error);
         }
     });
+}
 
-    ui.add_space(12.0);
-    let items = app.queue.items();
-    ui.horizontal(|ui| {
-        ui.label(bold(format!("{} downloads", items.len())).color(p.strong));
-        let running = app.queue.active_count();
-        if running > 0 {
-            ui.label(RichText::new(format!("{} running", running)).color(p.accent));
-            if let Some(text) = finish_time(app.queue.remaining(app.settings.auto_run_queue)) {
-                let about = "The bytes left of the running downloads and of those waiting to start, at the speed the running ones \
-                             have together; paused and stopped ones are left out.";
-                ui.label(RichText::new(text).small().color(p.muted)).on_hover_text(about);
+/// The empty list teaches: the welcome for a new user, then what can go in the bar, with three
+/// things to try that fill it in.
+fn empty_state(app: &mut App, ui: &mut Ui) {
+    let p = palette(ui);
+    if !app.settings.welcomed {
+        super::add::welcome(app, ui);
+    }
+    anim::fade_in(ui, egui::Id::new("queue empty"), 0.0, anim::RISE, |ui| {
+        ui.vertical_centered(|ui| {
+            ui.add_space(26.0);
+            ui.label(RichText::new(icon::DOWNLOAD_SIMPLE).size(30.0).color(p.dim));
+            ui.label(bold("Nothing downloading yet").size(16.0).color(p.text));
+            let about = "Paste a link in the bar above, drop a file on the window, or press Ctrl+V anywhere.";
+            ui.label(RichText::new(keys(about)).color(p.muted));
+            ui.add_space(14.0);
+            ui.label(RichText::new("Try one of these").small().color(p.muted));
+            ui.add_space(4.0);
+        });
+        let tries = ["A file", "A video", "A torrent"].map(|name| kinds::KINDS.iter().find(|kind| kind.name == name));
+        ui.horizontal_wrapped(|ui| {
+            let width: f32 = 3.0 * 220.0;
+            ui.add_space(((ui.available_width() - width) / 2.0).max(0.0));
+            for (n, kind) in tries.into_iter().flatten().enumerate() {
+                anim::fade_in(ui, egui::Id::new(("try", n)), anim::stagger(n + 1), anim::RISE, |ui| {
+                    let text = RichText::new(format!("{} {}", kind.glyph, kind.name)).color(p.text);
+                    let chosen = ui.add_sized([210.0, 40.0], button(text)).on_hover_text(kind.example);
+                    if chosen.clicked() {
+                        app.url_input = kind.example.to_string();
+                        app.form_error = None;
+                    }
+                });
             }
-        }
-        // For this session only; it applies once.
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            egui::ComboBox::from_id_salt("when_done").selected_text(app.when_done.name()).show_ui(ui, |ui| {
-                for (choice, name) in WhenDone::CHOICES {
-                    ui.selectable_value(&mut app.when_done, choice, name);
-                }
-            });
-            ui.label(RichText::new("When the queue is done:").color(p.muted));
         });
     });
-    ui.add_space(4.0);
-    // What narrows the list: text in a name or a link, and a status.
-    if !items.is_empty() {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(icon::MAGNIFYING_GLASS).size(16.0).color(p.muted));
-            ui.add(egui::TextEdit::singleline(&mut app.queue_search).hint_text("Filter by name or link").desired_width(220.0));
-            ui.add_space(8.0);
-            for (group, name) in FILTERS.into_iter().enumerate() {
-                let label = match group {
-                    0 => name.to_string(),
-                    _ => format!("{} {}", name, items.iter().filter(|item| in_group(group, &item.status)).count()),
-                };
-                ui.selectable_value(&mut app.queue_filter, group, label);
-            }
-        });
-        ui.add_space(4.0);
+}
+
+pub(super) fn queue_page(app: &mut App, ui: &mut Ui) {
+    let p = palette(ui);
+    if !app.queue.items().is_empty() {
+        toolbar(app, ui);
     }
+    many_links(app, ui);
+    ui.add_space(8.0);
+    let items = app.queue.items();
     let search = app.queue_search.trim().to_lowercase();
     let group = app.queue_filter;
     let filtering = group != 0 || !search.is_empty();
@@ -1089,77 +1618,72 @@ pub(super) fn queue_page(app: &mut App, ui: &mut Ui) {
     }
     let (lines, closing) = lines(items, &rows, &new, now);
     let lines: Vec<_> = lines.into_iter().filter(|line| !filtering || listed(line.item, group, &search)).collect();
-    card(ui).inner_margin(4.0).show(ui, |ui| {
-        if lines.is_empty() {
-            ui.set_width(ui.available_width());
-            let (glyph, title, about) = if items.is_empty() {
-                (icon::QUEUE, "Nothing in the queue yet", "Add links above, drop a .torrent on the window, or press Ctrl+V with a link copied.")
-            } else {
-                (icon::MAGNIFYING_GLASS, "No download matches", "Clear the filter above to see them all.")
-            };
+    if lines.is_empty() {
+        ctx.data_mut(|d| d.insert_temp(list, rows));
+        if items.is_empty() {
+            egui::ScrollArea::vertical().id_salt("empty downloads").auto_shrink([false, false]).show(ui, |ui| empty_state(app, ui));
+        } else {
             ui.vertical_centered(|ui| {
                 ui.add_space(30.0);
-                anim::fade_in(ui, egui::Id::new(("queue empty", title)), 0.0, anim::RISE, |ui| {
-                    ui.label(RichText::new(glyph).size(28.0).color(p.dim));
-                    ui.label(bold(title).color(p.text));
-                    ui.label(RichText::new(keys(about)).color(p.muted));
+                anim::fade_in(ui, egui::Id::new(("queue empty", "filtered")), 0.0, anim::RISE, |ui| {
+                    ui.label(RichText::new(icon::MAGNIFYING_GLASS).size(28.0).color(p.dim));
+                    ui.label(bold("No download matches").color(p.text));
+                    ui.label(RichText::new("Clear the filter above to see them all.").color(p.muted));
                 });
-                ui.add_space(30.0);
             });
-            return;
         }
-        ui.spacing_mut().item_spacing.y = 2.0;
-        let scroll = egui::ScrollArea::vertical().id_salt("queue_rows").auto_shrink([false, false]).max_height(ui.available_height().max(120.0));
-        scroll.show_rows(ui, ROW_HEIGHT, lines.len(), |ui, range| {
-            ui.set_max_width(ui.available_width() - 10.0);
-            let stride = ROW_HEIGHT + ui.spacing().item_spacing.y;
-            // The selection's highlight sits on its row as drawn, and slides over from the row
-            // selected before: from where it was then, relative to the new row as that moves.
-            if let Some(index) = lines.iter().position(|line| line.ghost.is_none() && shown.selected == Some(line.item.id)) {
-                let row = index as f32 + lines[index].drop;
-                let key = list.with("selection");
-                let t = anim::changed(ui.ctx(), key, shown.selected, 0.2);
-                let (last, from) = ui.data(|d| d.get_temp::<(f32, f32)>(key.with("at"))).unwrap_or((row, 0.0));
-                let from = if t == 0.0 { last - row } else { from };
-                let y = row + from * (1.0 - anim::ease(t));
-                ui.data_mut(|d| d.insert_temp(key.with("at"), (y, from)));
-                let at = y - range.start as f32;
-                let rect = Rect::from_min_size(ui.cursor().min + Vec2::new(0.0, at * stride), Vec2::new(ui.available_width(), ROW_HEIGHT));
-                ui.painter().rect_filled(rect, 8.0, p.accent.gamma_multiply(0.14));
-                let stripe = Rect::from_min_size(rect.min + Vec2::new(0.0, 10.0), Vec2::new(3.0, rect.height() - 20.0));
-                ui.painter().rect_filled(stripe, 2.0, p.accent);
+        return;
+    }
+    ui.spacing_mut().item_spacing.y = GAP;
+    let scroll = egui::ScrollArea::vertical().id_salt("queue_rows").auto_shrink([false, false]).max_height(ui.available_height().max(120.0));
+    scroll.show_rows(ui, ROW_HEIGHT, lines.len(), |ui, range| {
+        ui.set_max_width(ui.available_width() - 10.0);
+        let stride = ROW_HEIGHT + ui.spacing().item_spacing.y;
+        // Where the list's first card is, in view or not.
+        let top = ui.cursor().min.y - range.start as f32 * stride;
+        let mut dragged = None;
+        let first = ui.cursor().min;
+        for line in &lines[range.clone()] {
+            let row = queue_row(shown, ui, line, &mut action);
+            // A narrowed list is not reordered by dragging: its gaps are not the queue's.
+            if !filtering && line.ghost.is_none() && (row.dragged() || row.drag_stopped()) {
+                dragged = Some((line.item.id, row.drag_stopped()));
             }
-            // Where the list's first row is, in view or not.
-            let top = ui.cursor().min.y - range.start as f32 * stride;
-            let mut dragged = None;
-            for line in &lines[range] {
-                let row = queue_row(shown, ui, line, &mut action);
-                // A narrowed list is not reordered by dragging: its gaps are not the queue's.
-                if !filtering && line.ghost.is_none() && (row.dragged() || row.drag_stopped()) {
-                    dragged = Some((line.item.id, row.drag_stopped()));
+        }
+        // The selection's outline sits on its card as drawn, and slides over from the card
+        // selected before: from where it was then, relative to the new card as that moves.
+        if let Some(index) = lines.iter().position(|line| line.ghost.is_none() && shown.selected == Some(line.item.id)) {
+            let row = index as f32 + lines[index].drop;
+            let key = list.with("selection");
+            let t = anim::changed(ui.ctx(), key, shown.selected, 0.2);
+            let (last, from) = ui.data(|d| d.get_temp::<(f32, f32)>(key.with("at"))).unwrap_or((row, 0.0));
+            let from = if t == 0.0 { last - row } else { from };
+            let y = row + from * (1.0 - anim::ease(t));
+            ui.data_mut(|d| d.insert_temp(key.with("at"), (y, from)));
+            let at = y - range.start as f32;
+            let rect = Rect::from_min_size(first + Vec2::new(0.0, at * stride), Vec2::new(ui.available_width(), ROW_HEIGHT));
+            ui.painter().rect(rect, 14.0, p.accent.gamma_multiply(0.07), Stroke::new(1.5, p.link.gamma_multiply(0.85)));
+        }
+        // A card being dragged lands in the gap nearest the pointer, which a line shows;
+        // dropped there, it moves.
+        if let (Some((id, dropped)), Some(pointer)) = (dragged, ui.ctx().pointer_latest_pos()) {
+            let from = items.iter().position(|item| item.id == id).unwrap_or_default();
+            let gap = ((pointer.y - top) / stride).round().clamp(0.0, items.len() as f32) as usize;
+            let to = if gap > from { gap - 1 } else { gap };
+            if to != from {
+                let y = top + gap as f32 * stride - ui.spacing().item_spacing.y / 2.0;
+                let (left, right) = (ui.max_rect().left() + 4.0, ui.max_rect().right() - 4.0);
+                ui.painter().line_segment([Pos2::new(left, y), Pos2::new(right, y)], Stroke::new(2.0, p.accent));
+                ui.painter().circle_filled(Pos2::new(left, y), 4.0, p.accent);
+                if dropped {
+                    action = Some((id, RowAction::MoveTo(to)));
                 }
             }
-            // A row being dragged lands in the gap nearest the pointer, which a line shows;
-            // dropped there, it moves.
-            if let (Some((id, dropped)), Some(pointer)) = (dragged, ui.ctx().pointer_latest_pos()) {
-                let from = items.iter().position(|item| item.id == id).unwrap_or_default();
-                let gap = ((pointer.y - top) / stride).round().clamp(0.0, items.len() as f32) as usize;
-                let to = if gap > from { gap - 1 } else { gap };
-                if to != from {
-                    let y = top + gap as f32 * stride - ui.spacing().item_spacing.y / 2.0;
-                    let (left, right) = (ui.max_rect().left() + 4.0, ui.max_rect().right() - 4.0);
-                    ui.painter().line_segment([Pos2::new(left, y), Pos2::new(right, y)], Stroke::new(2.0, p.accent));
-                    ui.painter().circle_filled(Pos2::new(left, y), 4.0, p.accent);
-                    if dropped {
-                        action = Some((id, RowAction::MoveTo(to)));
-                    }
-                }
-                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
-            }
-            // The list's end comes up with the gap closing under its last line, so that a list
-            // scrolled to its end does not jump as a removed row's room goes.
-            ui.expand_to_include_y(ui.min_rect().bottom() + closing * stride);
-        });
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        }
+        // The list's end comes up with the gap closing under its last line, so that a list
+        // scrolled to its end does not jump as a removed card's room goes.
+        ui.expand_to_include_y(ui.min_rect().bottom() + closing * stride);
     });
     ctx.data_mut(|d| d.insert_temp(list, rows));
 
@@ -1186,6 +1710,9 @@ pub(super) fn queue_page(app: &mut App, ui: &mut Ui) {
         }
         RowAction::Remove => {
             app.remove_job(id);
+            if app.focused == Some(id) {
+                app.focused = None;
+            }
         }
         RowAction::Open => {
             if let Some(path) = target {
@@ -1217,6 +1744,16 @@ pub(super) fn queue_page(app: &mut App, ui: &mut Ui) {
     }
 }
 
+/// Opens the toolbar's ⋯ menu and clicks `entry` in it.
+#[cfg(test)]
+pub(super) fn from_toolbar_menu(h: &mut super::harness::Harness, entry: &str) {
+    h.click(icon::DOTS_THREE);
+    // A menu is laid out unseen the first time.
+    h.frames(2);
+    h.click(entry);
+    h.frames(2);
+}
+
 #[cfg(test)]
 mod tests {
     use hyperfetch_core::engine::DownloadOptions;
@@ -1229,19 +1766,19 @@ mod tests {
         queue.add_item(vec![url::Url::parse(&format!("https://example.com/{}", name)).unwrap()], DownloadOptions::default())
     }
 
-    /// What to do when the queue is done is picked on the queue page; once it is done, the
+    /// What to do when the queue is done is picked in the toolbar's menu; once it is done, the
     /// countdown shows over every page until Cancel.
     #[test]
     fn the_queue_done_choice_counts_down_until_cancelled() {
         let mut h = Harness::new();
-        h.app.tab = Tab::Queue;
+        h.add("first.iso");
         assert!(h.settle());
-        h.click("Do nothing");
-        h.frames(10);
-        h.click("Shut down");
+        from_toolbar_menu(&mut h, "Shut down");
         assert_eq!(h.app.when_done, WhenDone::ShutDown);
+        assert!(h.find("Then: shut down").is_some(), "{:?}", h.texts());
         let id = h.add("big.iso");
         h.progress(id, 0.5);
+        h.app.queue.remove_item(1);
         h.app.handle_event(crate::AppEvent::JobFinished { id, result: Ok((std::env::temp_dir().join("big.iso"), Some(1))) });
         assert!(h.app.countdown.is_some());
         h.app.tab = Tab::Settings;
@@ -1252,16 +1789,15 @@ mod tests {
         h.wait_for_background();
     }
 
-    /// While downloads run, the queue's header says when everything to come is done at their
-    /// speed together: "about", or "at least" when some have no known size yet, which are left
-    /// out; waiting ones count only when the queue starts them by itself. With nothing running it
+    /// While downloads run, the toolbar says when everything to come is done at their speed
+    /// together: "about", or "at least" when some have no known size yet, which are left out;
+    /// waiting ones count only when the queue starts them by itself. With nothing running it
     /// says nothing.
     #[test]
     fn the_header_says_when_the_queue_will_be_done() {
         let mut h = Harness::new();
         h.app.settings.auto_run_queue = true;
         let [a, _] = ["a.iso", "b.iso"].map(|name| h.add(name));
-        h.app.tab = Tab::Queue;
         let done = |h: &mut Harness| {
             h.frames(2);
             h.texts().into_iter().map(|(text, _)| text).find(|text| text.starts_with("All done"))
@@ -1276,9 +1812,9 @@ mod tests {
         assert_eq!(done(&mut h), None);
     }
 
-    /// "Why is it slow?" on a running download's page lists what holds it back: here the speed
-    /// limit, which it runs at. The fix lifts the limit for this download, which pauses and at
-    /// once starts again from where it was, without it.
+    /// "Why is it slow?" in a running download's details lists what holds it back: here the
+    /// speed limit, which it runs at. The fix lifts the limit for this download, which pauses and
+    /// at once starts again from where it was, without it.
     #[test]
     fn why_is_it_slow_finds_the_speed_limit_and_lifts_it() {
         let mut h = Harness::new();
@@ -1304,8 +1840,8 @@ mod tests {
         h.wait_for_background();
     }
 
-    /// A running download's page says on one line why it has the connections it has, as the
-    /// engine's Autopilot last told it.
+    /// A running download's details say on one line why it has the connections it has, as the
+    /// engine's Autopilot last told it; its timeline says it too.
     #[test]
     fn a_running_download_says_why_it_has_its_connections() {
         let mut h = Harness::new();
@@ -1318,6 +1854,27 @@ mod tests {
         let lines: Vec<String> = h.texts().into_iter().map(|(text, _)| text).collect();
         let at = lines.iter().position(|text| text == "Autopilot").expect("labelled");
         assert_eq!(lines.get(at + 1).map(String::as_str), Some(why), "{lines:?}");
+        // Further down its page.
+        let events = h.app.ctx.data(|d| d.get_temp::<Timeline>(timeline_id())).unwrap().events[&id].iter().map(|(_, what)| what.clone()).collect::<Vec<_>>();
+        assert!(events.contains(&format!("Autopilot: {why}")), "in its timeline: {events:?}");
+    }
+
+    /// The timeline notes a download's news as it comes: added, started, finished; not its
+    /// progress.
+    #[test]
+    fn the_timeline_notes_what_happens() {
+        let mut h = Harness::new();
+        let id = h.add("big.iso");
+        h.frames(2);
+        h.progress(id, 0.4);
+        h.frames(2);
+        h.progress(id, 0.6);
+        h.frames(2);
+        h.finish(id, None);
+        h.frames(2);
+        let events = h.app.ctx.data(|d| d.get_temp::<Timeline>(timeline_id())).unwrap().events[&id].iter().map(|(_, what)| what.clone()).collect::<Vec<_>>();
+        let (at, total) = (format_bytes(40 << 20), format_bytes(100 << 20));
+        assert_eq!(events, ["Added to the list".to_string(), format!("Resumed at {at}"), format!("Finished: {total}")]);
     }
 
     /// Each line's file name, whether it is a ghost, and how many rows down it is pushed.
@@ -1325,9 +1882,9 @@ mod tests {
         lines(queue.items(), rows, &[], now).0.iter().map(|line| (line.item.filename.clone(), line.ghost.is_some(), line.drop)).collect()
     }
 
-    /// Removed downloads linger where they were, fade out, then close their gap as the rows under
-    /// them slide up; added ones are new. Nothing is new or removed when the list starts over,
-    /// and there are no ghosts under Reduce motion.
+    /// Removed downloads linger where they were, fade out, then close their gap as the cards
+    /// under them slide up; added ones are new. Nothing is new or removed when the list starts
+    /// over, and there are no ghosts under Reduce motion.
     #[test]
     fn removed_rows_linger_as_ghosts_and_added_ones_are_new() {
         let mut queue = DownloadQueue::new();
@@ -1366,7 +1923,7 @@ mod tests {
         assert!(rows.ghosts.is_empty(), "no ghosts under Reduce motion");
     }
 
-    /// A row's status changes when its kind does, not its progress or error text: then it runs
+    /// A card's status changes when its kind does, not its progress or error text: then it runs
     /// from 0.0 to 1.0, and a failure shakes it; retrying does not. Seen first, nothing moves.
     #[test]
     fn a_row_reacts_to_a_new_status_only() {
@@ -1404,24 +1961,23 @@ mod tests {
         assert!(t < 1.0 && shake == 0.0, "a retry does not shake");
     }
 
-    /// The queue page with downloads named item-00.iso and on, its list scrolled `by` points down
-    /// with the mouse wheel, settled; their ids.
+    /// The Downloads page with downloads named item-00.iso and on, its list scrolled `by` points
+    /// down with the mouse wheel, settled; their ids.
     fn scrolled(h: &mut Harness, rows: usize, by: f32) -> Vec<usize> {
         let ids = (0..rows).map(|n| h.add(&format!("item-{n:02}.iso"))).collect();
-        h.app.tab = Tab::Queue;
         h.frames(30);
         h.hover(h.find("item-00.iso").unwrap().center());
         let wheel = egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: Vec2::new(0.0, -by), modifiers: egui::Modifiers::NONE };
         h.frame(vec![wheel]);
-        // egui spreads a wheel turn over several frames.
+        // The wheel's turn is eased over several frames.
         h.frames(60);
         h.leave();
         assert!(h.settle());
         ids
     }
 
-    /// While the gap of removed rows closes, a row under it is drawn lower than its place in the
-    /// list: a click where it shows selects it, and the selection's highlight sits on it.
+    /// While the gap of removed cards closes, a card under it is drawn lower than its place in
+    /// the list: a click where it shows selects it, and the selection's outline sits on it.
     #[test]
     fn a_row_sliding_into_a_closing_gap_takes_clicks_where_it_shows() {
         let mut h = Harness::new();
@@ -1432,7 +1988,6 @@ mod tests {
         }
         let run = h.add("run.iso");
         h.progress(run, 0.5);
-        h.app.tab = Tab::Queue;
         h.frames(60);
         h.app.clear_queue(true);
         // Past the ghosts' fade, a quarter into the closing.
@@ -1446,40 +2001,42 @@ mod tests {
         h.frames(30);
         let down = drawn - h.find("run.iso").unwrap().top();
         assert!(down > 20.0, "still sliding: {down}");
-        assert!((y * (ROW_HEIGHT + 2.0) - down).abs() < 1.0, "the highlight is {y} rows down, the row {down} pt");
+        // Within the card's lift under the pointer.
+        assert!((y * (ROW_HEIGHT + GAP) - down).abs() < 2.0, "the outline is {y} rows down, the card {down} pt");
     }
 
-    /// With the list scrolled to its end, a row removed near the bottom closes its room without a
-    /// jump: the rows above come down smoothly, those under it stay about where they were.
+    /// With the list scrolled to its end, a card removed near the bottom closes its room without
+    /// a jump: the cards above come down smoothly, those under it stay about where they were.
     #[test]
     fn a_list_scrolled_to_its_end_closes_a_gap_without_jumping() {
         let mut h = Harness::new();
-        scrolled(&mut h, 12, 1000.0);
-        let at = |h: &Harness| [h.find("item-08.iso").unwrap().top(), h.find("item-11.iso").unwrap().top()];
+        scrolled(&mut h, 12, 2000.0);
+        let at = |h: &Harness| [h.find("item-09.iso").unwrap().top(), h.find("item-11.iso").unwrap().top()];
         let [above, under] = at(&h);
         h.click_at(h.find_near("item-10.iso", icon::X).unwrap().center());
+        h.leave();
         assert_eq!(h.app.queue.items().len(), 11);
         let mut last = above;
         for _ in 0..40 {
             h.frame(Vec::new());
             let [now_above, now_under] = at(&h);
-            assert!((now_above - last).abs() < 20.0, "the rows above jump: {last} to {now_above}");
-            assert!((now_under - under).abs() < 20.0, "the rows under move: {under} to {now_under}");
+            assert!((now_above - last).abs() < 24.0, "the cards above jump: {last} to {now_above}");
+            assert!((now_under - under).abs() < 24.0, "the cards under move: {under} to {now_under}");
             last = now_above;
         }
-        assert!((last - above - (ROW_HEIGHT + 2.0)).abs() < 0.5, "the rows above end a row lower: {above} to {last}");
+        assert!((last - above - (ROW_HEIGHT + GAP)).abs() < 0.5, "the cards above end a card lower: {above} to {last}");
         assert_eq!(at(&h)[1], under);
     }
 
-    /// A running download in the row the list lays out just past its bottom edge asks for no
-    /// frames: nothing that moves shows. (Scrolled half a row, that row is out of sight.)
+    /// A running download in the card the list lays out just past its bottom edge asks for no
+    /// frames: nothing that moves shows. (Scrolled a third of a card, that card is out of sight.)
     #[test]
     fn a_running_row_out_of_view_keeps_still() {
         let mut h = Harness::new();
         let ids = scrolled(&mut h, 12, 30.0);
         let row = |h: &Harness, id: usize| h.app.ctx.read_response(egui::Id::new(("queue row", id)).with("row"));
         let hidden = ids.iter().copied().find(|&id| row(&h, id).is_some_and(|r| !r.interact_rect.is_positive()));
-        let hidden = hidden.expect("a row laid out out of view");
+        let hidden = hidden.expect("a card laid out out of view");
         h.progress(hidden, 0.5);
         assert_eq!(h.frames(60), Duration::MAX);
     }
@@ -1489,20 +2046,19 @@ mod tests {
         (0..n).map(|_| (h.frame(Vec::new()), f(&*h)).1).collect()
     }
 
-    /// A download added while the queue shows fades into its row rising from a little below, and
-    /// the Queue count in the sidebar pops; then frames stop. Under Reduce motion both are in
-    /// place at once.
+    /// A download added while the list shows fades into its card rising from a little below,
+    /// and the Downloads count in the rail pops; then frames stop. Under Reduce motion both are
+    /// in place at once.
     #[test]
     fn a_new_download_rises_into_its_row_and_the_count_pops() {
         for reduce in [false, true] {
             let mut h = Harness::new();
             h.app.settings.reduce_motion = Some(reduce);
             h.add("a.iso");
-            h.app.tab = Tab::Queue;
             assert!(h.settle());
-            let place = h.find("a.iso").unwrap().top() + ROW_HEIGHT + 2.0;
+            let place = h.find("a.iso").unwrap().top() + ROW_HEIGHT + GAP;
             h.add("b.iso");
-            let seen = over(&mut h, 30, |h| (h.find("b.iso").map(|rect| rect.top()), h.find_near("Queue", "2").unwrap().height()));
+            let seen = over(&mut h, 30, |h| (h.find("b.iso").map(|rect| rect.top()), h.find_near("Downloads", "2").unwrap().height()));
             let tops: Vec<f32> = seen.iter().filter_map(|(top, _)| *top).collect();
             let heights: Vec<f32> = seen.iter().map(|(_, height)| *height).collect();
             let (rest, last) = (heights[heights.len() - 1], tops[tops.len() - 1]);
@@ -1514,13 +2070,12 @@ mod tests {
                 assert!(tops[0] > place + 2.0 && tops.windows(2).all(|w| w[0] >= w[1]), "rises: {tops:?}");
                 assert!(heights.iter().any(|&height| height > rest + 1.0), "the count pops: {heights:?}");
             }
-            // The Add page's Download button says Added for 1.2 s after an add (see `just_added`).
             assert_eq!(h.frames(60), Duration::MAX, "and keeps still");
         }
     }
 
-    /// Removing a download fades its row out, then the rows under it glide up into its room, none
-    /// jumping; then frames stop. Under Reduce motion they are in their new places at once.
+    /// Removing a download fades its card out, then the cards under it glide up into its room,
+    /// none jumping; then frames stop. Under Reduce motion they are in their new places at once.
     #[test]
     fn rows_glide_up_into_a_removed_rows_room() {
         for reduce in [false, true] {
@@ -1529,9 +2084,8 @@ mod tests {
             for name in ["a.iso", "b.iso", "c.iso", "d.iso"] {
                 h.add(name);
             }
-            h.app.tab = Tab::Queue;
             assert!(h.settle());
-            let stride = ROW_HEIGHT + 2.0;
+            let stride = ROW_HEIGHT + GAP;
             let place = h.find("d.iso").unwrap().top() - stride;
             h.click_at(h.find_near("b.iso", icon::X).unwrap().center());
             assert_eq!(h.app.queue.items().len(), 3);
@@ -1540,7 +2094,7 @@ mod tests {
             if reduce {
                 assert!(tops.iter().all(|&top| top == place), "at once: {tops:?}");
             } else {
-                assert_eq!(tops[0], place + stride, "it waits while the removed row fades");
+                assert_eq!(tops[0], place + stride, "it waits while the removed card fades");
                 assert!(tops.windows(2).all(|w| w[1] <= w[0] && w[0] - w[1] < stride / 3.0), "glides: {tops:?}");
             }
             h.leave();
@@ -1580,7 +2134,7 @@ mod tests {
         base
     }
 
-    /// A download whose link expired says so on its row, with New link… in its ⋯ menu. There a
+    /// A download whose link expired says so on its card, with New link… in its ⋯ menu. There a
     /// link to a file of another size is refused, saying why, and nothing changes; one to the same
     /// file is taken, its resume state keeps what was downloaded, and it resumes.
     #[test]
@@ -1612,9 +2166,8 @@ mod tests {
         };
         h.app.queue.apply_snapshot(id, &snapshot);
         h.app.queue.finish(id, Err(format!("{old}: HTTP 403 Forbidden")));
-        h.app.tab = Tab::Queue;
         h.frames(5);
-        assert!(h.find(LINK_EXPIRED).is_some() && h.find("LINK EXPIRED").is_some(), "the row says so");
+        assert!(h.find(LINK_EXPIRED).is_some() && h.find("Link expired").is_some(), "the card says so");
 
         from_menu(&mut h, "talk.mp4", "New link…");
         h.frames(20);
@@ -1650,7 +2203,7 @@ mod tests {
         h.app.queue.items().iter().map(|item| item.filename.clone()).collect()
     }
 
-    /// Opens the ⋯ menu of `name`'s row and clicks `entry` in it.
+    /// Opens the ⋯ menu of `name`'s card and clicks `entry` in it.
     fn from_menu(h: &mut Harness, name: &str, entry: &str) {
         h.click_at(h.find_near(name, icon::DOTS_THREE_VERTICAL).unwrap().center());
         // A menu is laid out unseen the first time.
@@ -1658,9 +2211,9 @@ mod tests {
         h.click(entry);
     }
 
-    /// "Download next" in a waiting row's ⋯ menu puts it first among the waiting downloads (a
-    /// paused one keeps its place); the rows glide to their new places, none jumping, then frames
-    /// stop. Under Reduce motion they are in place at once.
+    /// "Download next" in a waiting card's ⋯ menu puts it first among the waiting downloads (a
+    /// paused one keeps its place); the cards glide to their new places, none jumping, then
+    /// frames stop. Under Reduce motion they are in place at once.
     #[test]
     fn download_next_moves_a_row_up_and_the_rows_glide_there() {
         for reduce in [false, true] {
@@ -1670,17 +2223,17 @@ mod tests {
             h.app.queue.mark_started(paused);
             h.app.queue.mark_pausing(paused);
             h.app.queue.finish(paused, Err(hyperfetch_core::engine::CANCELLED.to_string()));
-            h.app.tab = Tab::Queue;
             assert!(h.settle());
-            let stride = ROW_HEIGHT + 2.0;
+            let stride = ROW_HEIGHT + GAP;
             let place = h.find("b.iso").unwrap().top();
             from_menu(&mut h, "d.iso", "Download next");
             assert_eq!(order(&h), ["paused.iso", "d.iso", "b.iso", "c.iso"]);
             let tops = over(&mut h, 40, |h| (h.find("d.iso").unwrap().top(), h.find("c.iso").unwrap().top()));
             let (d, c): (Vec<f32>, Vec<f32>) = tops.into_iter().unzip();
-            assert_eq!((d[d.len() - 1], c[c.len() - 1]), (place, place + 2.0 * stride));
+            // c ends under the pointer, lifted a little.
+            assert!(d[d.len() - 1] == place && (c[c.len() - 1] - place - 2.0 * stride).abs() <= 1.5, "{d:?} {c:?}");
             if reduce {
-                assert!(d.iter().all(|&top| top == place) && c.iter().all(|&top| top == place + 2.0 * stride), "at once: {d:?} {c:?}");
+                assert!(d.iter().all(|&top| top == place) && c.iter().all(|&top| (top - place - 2.0 * stride).abs() <= 1.5), "at once: {d:?} {c:?}");
             } else {
                 assert_eq!(d[0], place + 2.0 * stride, "it starts from where it was");
                 assert!(d.windows(2).all(|w| w[1] <= w[0] && w[0] - w[1] < stride / 2.0), "glides up: {d:?}");
@@ -1688,16 +2241,16 @@ mod tests {
             }
             h.leave();
             assert_eq!(h.frames(30), Duration::MAX, "and keeps still");
+            assert_eq!(h.find("c.iso").unwrap().top(), place + 2.0 * stride, "set down");
         }
     }
 
-    /// A waiting row's ⋯ menu sets its priority: a High or Low one shows a mark by its name, a
+    /// A waiting card's ⋯ menu sets its priority: a High or Low one shows a mark by its name, a
     /// Normal one none, and the High one starts first.
     #[test]
     fn a_waiting_row_takes_a_priority_from_its_menu() {
         let mut h = Harness::new();
         let [_, b] = ["a.iso", "b.iso"].map(|name| h.add(name));
-        h.app.tab = Tab::Queue;
         assert!(h.settle());
         let marked = |h: &Harness, glyph: &str| {
             let name = h.find("b.iso").unwrap();
@@ -1717,20 +2270,19 @@ mod tests {
         assert!(h.find(icon::CARET_DOUBLE_UP).is_none() && h.find(icon::CARET_DOUBLE_DOWN).is_none(), "a Normal one shows none");
     }
 
-    /// A row dragged over the list shows where it would land, as a line in the gap nearest the
-    /// pointer; dropped there it moves, and once it has glided into place frames stop. A row
+    /// A card dragged over the list shows where it would land, as a line in the gap nearest the
+    /// pointer; dropped there it moves, and once it has glided into place frames stop. A card
     /// dropped on its own place stays.
     #[test]
     fn a_dragged_row_lands_where_the_line_shows() {
         let mut h = Harness::new();
         let ids = ["a.iso", "b.iso", "c.iso", "d.iso"].map(|name| h.add(name));
-        h.app.tab = Tab::Queue;
         assert!(h.settle());
         let b = h.app.ctx.read_response(egui::Id::new(("queue row", ids[1])).with("row")).unwrap().rect;
         let landing = h.find("b.iso").unwrap().top();
-        // The dot at the left end of the line in the gap above b, as painted.
+        // A point of the line in the gap above b, as painted.
         let dot = |h: &Harness| {
-            let [r, _, blue, _] = h.shot(Some(Rect::from_min_size(Pos2::new(b.left() + 4.0, b.top() - 1.0), Vec2::splat(1.0)))).get_pixel(0, 0).0;
+            let [r, _, blue, _] = h.shot(Some(Rect::from_min_size(Pos2::new(b.left() + 4.0, b.top() - GAP / 2.0), Vec2::splat(1.0)))).get_pixel(0, 0).0;
             blue > 180 && r < 120
         };
         assert!(!dot(&h));
@@ -1756,8 +2308,9 @@ mod tests {
         assert_eq!(order(&h), ["a.iso", "d.iso", "b.iso", "c.iso"], "dropped on its own place");
     }
 
-    /// A download that completes flashes its row green as its check draws itself; one that fails
-    /// flashes red and shakes. Then frames stop. Under Reduce motion nothing flashes or moves.
+    /// A download that completes flashes its card green as its check draws itself; one that
+    /// fails flashes red and shakes. Then frames stop. Under Reduce motion nothing flashes or
+    /// moves.
     #[test]
     fn a_finished_row_glows_and_a_failed_one_shakes() {
         for reduce in [false, true] {
@@ -1766,12 +2319,11 @@ mod tests {
             let [done, failed] = ["done.iso", "failed.iso"].map(|name| h.add(name));
             h.progress(done, 0.9);
             h.progress(failed, 0.4);
-            h.app.tab = Tab::Queue;
             h.frames(60);
-            // Inside the row, left of its icon, where only the card shows.
+            // Inside the card, left of its icon, where only the card shows.
             let spot = |h: &Harness| {
                 let row = h.app.ctx.read_response(egui::Id::new(("queue row", done)).with("row")).unwrap().rect;
-                let pixel = h.shot(Some(Rect::from_min_size(row.left_center() + Vec2::new(3.0, 0.0), Vec2::splat(1.0)))).get_pixel(0, 0).0;
+                let pixel = h.shot(Some(Rect::from_min_size(row.left_center() + Vec2::new(5.0, 0.0), Vec2::splat(1.0)))).get_pixel(0, 0).0;
                 [pixel[0], pixel[1], pixel[2]]
             };
             let card = [DARK.card.r(), DARK.card.g(), DARK.card.b()];
@@ -1811,7 +2363,7 @@ mod tests {
             let id = h.add("ubuntu.iso");
             h.progress(id, 0.5);
             h.app.focused = Some(id);
-            // Paused, so that nothing else on its page moves.
+            // Paused, so that nothing else in its details moves.
             h.app.jobs.get_mut(&id).unwrap().running = None;
             h.app.queue.get_item_mut(id).unwrap().status = QueueItemStatus::Paused;
             assert!(h.settle());
@@ -1840,7 +2392,9 @@ mod tests {
             // connection's colour or the card is that light in every channel.
             let white = |color: Color32| color.r().min(color.g()).min(color.b()) > 150;
             if reduce {
-                assert!(delay == Duration::MAX && at(&h, stolen) == DARK.lanes[4] && !white(at(&h, seam)), "split at once");
+                assert!(at(&h, stolen) == DARK.lanes[4] && !white(at(&h, seam)), "split at once: {:?} {:?}", at(&h, stolen), at(&h, seam));
+                // The connections' table grows a scroll bar, for which egui takes a frame or two.
+                assert!(delay == Duration::MAX || (0..3).any(|_| h.frame(Vec::new()) == Duration::MAX), "then still");
             } else {
                 assert!(delay < Duration::MAX && at(&h, stolen) != DARK.lanes[4], "turning");
                 assert!(white(at(&h, seam)), "the cut flashes: {:?}", at(&h, seam));
@@ -1849,13 +2403,13 @@ mod tests {
             }
         }
     }
+
     /// The filter row narrows the list by text in a name or link and by status; a narrowed list
     /// that shows nothing says so.
     #[test]
     fn the_list_is_filtered_by_text_and_status() {
         let mut h = Harness::new();
         let (_, zip) = (h.add("a.iso"), h.add("b.zip"));
-        h.app.tab = Tab::Queue;
         h.frames(40);
         assert!(h.find("a.iso").is_some() && h.find("b.zip").is_some());
         assert!(h.find("Running 0").is_some() && h.find("Waiting 2").is_some(), "{:?}", h.texts());
@@ -1873,5 +2427,19 @@ mod tests {
         h.app.queue_filter = 4;
         h.frames(40);
         assert!(h.find("b.zip").is_none() && h.find("No download matches").is_some(), "{:?}", h.texts());
+    }
+
+    /// The empty list teaches: three things to try, each filling the link bar, which then says
+    /// what it is.
+    #[test]
+    fn the_empty_list_offers_things_to_try() {
+        let mut h = Harness::new();
+        assert!(h.settle());
+        assert!(h.find("Nothing downloading yet").is_some() && h.find("Try one of these").is_some(), "{:?}", h.texts());
+        h.click("A torrent");
+        assert_eq!(h.app.url_input, "https://webtorrent.io/torrents/big-buck-bunny.torrent");
+        assert!(h.settle());
+        assert!(h.texts().iter().filter(|(text, _)| text == "A torrent").count() >= 1);
+        assert!(h.find("from webtorrent.io").is_some(), "{:?}", h.texts());
     }
 }
