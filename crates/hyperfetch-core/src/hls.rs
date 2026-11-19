@@ -3656,10 +3656,12 @@ video.m3u8
         });
         let target = HlsEngine::prepare(&client, None, &url, &segments, &dir.path().join("x.ts"), FETCH, &None).await.unwrap();
         let started = Instant::now();
-        let result = HlsEngine::download(&client, None, segments, target.unwrap(), &options(2), None, Some(cancel)).await;
+        // A stall timeout far past the cancel, so a slow machine does not blur the two.
+        let slow = HlsOptions { fetch: FetchPolicy { stall_timeout: Duration::from_secs(10), ..FETCH }, ..options(2) };
+        let result = HlsEngine::download(&client, None, segments, target.unwrap(), &slow, None, Some(cancel)).await;
         assert!(matches!(result, Err(HlsError::Cancelled)));
         // Well under the stall timeout: the cancel must not wait for the fetch to give up.
-        assert!(started.elapsed() < FETCH.stall_timeout, "{:?}", started.elapsed());
+        assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
     }
 
     /// What a fake fetch saw: requests per unit, requests open at once (and the most ever), how

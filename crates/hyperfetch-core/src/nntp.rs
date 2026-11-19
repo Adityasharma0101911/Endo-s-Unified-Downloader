@@ -803,6 +803,9 @@ async fn work(job: Arc<Job>, s: usize, cancel: CancellationToken) {
         let batch = match job.take(s) {
             Take::Done => break,
             Take::Wait => {
+                // With nothing to ask, the connection's slot goes to a worker that waits for one:
+                // kept, two downloads each holding half the slots would wait for each other.
+                conn = None;
                 tokio::select! {
                     _ = cancel.cancelled() => break,
                     _ = tokio::time::sleep(WAIT) => continue,
@@ -1861,6 +1864,24 @@ mod tests {
         assert_eq!(std::fs::read(y.unwrap().0).unwrap(), two);
         let peak = counts.peak.load(Ordering::SeqCst);
         assert!(peak <= server.connections, "{peak} connections at once");
+    }
+
+    /// A connection with nothing left to ask gives its slot up: a worker that holds articles and
+    /// waits for a slot is not kept from it by workers of its own download that wait for it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_idle_connection_gives_its_slot_to_a_worker_that_waits() {
+        let file = bytes(48_000);
+        let a = post("solo.bin", &file, 12);
+        let nzb = nzb_of(&[("solo.bin", ids(&a))]);
+        let (server, _) = news_with(a, Behaviour { delay: Duration::from_millis(15), ..Behaviour::default() }).await;
+        let dir = tempfile::tempdir().unwrap();
+        let tasks = listed(dir.path(), &nzb);
+        // Another download holds one of the server's two connections throughout.
+        let _held = slots(&server).acquire_owned().await.unwrap();
+        let options = into(&dir.path().join("solo.bin"), vec![server.clone()]);
+        let run = run(&tasks[0].urls[0], &options, None, dir.path(), None, CancellationToken::new());
+        let done = tokio::time::timeout(Duration::from_secs(30), run).await.expect("the download ends");
+        assert_eq!(std::fs::read(done.unwrap().0).unwrap(), file);
     }
 
     /// A file is done only when its parts cover it whole: an NZB that leaves a part out, or parts
