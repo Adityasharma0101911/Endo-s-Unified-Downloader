@@ -78,10 +78,15 @@ fn tools_card(app: &mut App, ui: &mut Ui) {
             ui.horizontal(|ui| {
                 let (glyph, color, state) = match path {
                     Some(_) => (icon::CHECK_CIRCLE, p.green, "Ready"),
+                    // ffmpeg is installed only once you say so (the switch below, or the question).
+                    None if *name == "ffmpeg" && app.settings.install_ffmpeg != Some(true) => (icon::CLOUD_ARROW_DOWN, p.muted, "Asked for before the first video that needs it"),
                     None => (icon::CLOUD_ARROW_DOWN, p.muted, "Fetched the first time it is needed"),
                 };
                 ui.add_sized([20.0, 22.0], egui::Label::new(RichText::new(glyph).color(color)));
-                ui.add_sized([96.0, 22.0], egui::Label::new(bold(*name).color(p.text)));
+                ui.allocate_ui_with_layout(Vec2::new(96.0, 22.0), Layout::left_to_right(Align::Center), |ui| {
+                    ui.set_min_width(96.0);
+                    ui.label(bold(*name).color(p.text));
+                });
                 left_part(ui, 260.0, |ui| {
                     ui.add(egui::Label::new(RichText::new(*about).color(p.muted)).truncate());
                 });
