@@ -10,7 +10,7 @@
 //! beside the index, as casync names it. Fetched chunks are kept in `--chunk-cache`, its oldest
 //! dropped past `--chunk-cache-size`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -286,37 +286,45 @@ fn from_disk(out: &mut File, index: &Index, seed: Option<&Path>) -> io::Result<(
         }
     }
     let Some(seed) = seed.filter(|_| !missing.is_empty()) else { return Ok((missing, held)) };
-    let wanted: HashSet<[u8; 32]> = missing.iter().map(|c| c.id).collect();
-    let mut found: HashMap<[u8; 32], Vec<u8>> = HashMap::new();
+    // Each chunk found goes to its places at once, so one chunk of the seed is in memory at a time.
+    let mut wanted: HashMap<[u8; 32], Vec<u64>> = HashMap::new();
+    for chunk in &missing {
+        wanted.entry(chunk.id).or_default().push(chunk.start);
+    }
+    let mut failed = None;
     chunks(io::BufReader::new(File::open(seed)?), index.min, index.avg, index.max, |_, data| {
-        let id = id_of(data, index.sha512);
-        if wanted.contains(&id) && !found.contains_key(&id) {
-            found.insert(id, data.to_vec());
+        let Some(starts) = wanted.remove(&id_of(data, index.sha512)).filter(|_| failed.is_none()) else { return };
+        for start in starts {
+            if let Err(e) = out.seek(SeekFrom::Start(start)).and_then(|_| out.write_all(data)) {
+                failed = Some(e);
+                return;
+            }
         }
     })?;
-    let mut still = Vec::new();
-    for chunk in missing {
-        match found.get(&chunk.id) {
-            Some(data) => {
-                out.seek(SeekFrom::Start(chunk.start))?;
-                out.write_all(data)?;
-            }
-            None => still.push(chunk),
-        }
+    if let Some(e) = failed {
+        return Err(e);
     }
-    Ok((still, held))
+    missing.retain(|c| wanted.contains_key(&c.id));
+    Ok((missing, held))
 }
 
-/// Drops the oldest chunks of the cache `dir` until it holds at most `max` bytes. Blocking.
+/// Drops the oldest chunks of the cache `dir` until it holds at most `max` bytes. Only chunks count
+/// (`<first 4 hex>/<id>.cacnk`): any other file there, the user's, is left alone. Blocking.
 fn trim_cache(dir: &Path, max: u64) {
+    let hex = |s: &str, len: usize| s.len() == len && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    let chunk = |e: &std::fs::DirEntry, prefix: &str| {
+        let name = e.file_name();
+        let id = name.to_str().and_then(|n| n.strip_suffix(".cacnk")).unwrap_or_default();
+        hex(id, 64) && id.starts_with(prefix)
+    };
     let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = std::fs::read_dir(dir)
         .into_iter()
         .flatten()
         .flatten()
-        .filter_map(|e| std::fs::read_dir(e.path()).ok())
-        .flatten()
-        .flatten()
-        .filter_map(|e| e.metadata().ok().map(|m| (m.modified().unwrap_or(std::time::UNIX_EPOCH), m.len(), e.path())))
+        .filter_map(|e| e.file_name().to_str().filter(|n| hex(n, 4)).map(str::to_string))
+        .filter_map(|prefix| std::fs::read_dir(dir.join(&prefix)).ok().map(|files| (prefix, files)))
+        .flat_map(|(prefix, files)| files.flatten().filter(move |e| chunk(e, &prefix)))
+        .filter_map(|e| e.metadata().ok().filter(std::fs::Metadata::is_file).map(|m| (m.modified().unwrap_or(std::time::UNIX_EPOCH), m.len(), e.path())))
         .collect();
     let mut total: u64 = files.iter().map(|f| f.1).sum();
     files.sort();
@@ -362,7 +370,8 @@ fn unpack_catar(archive: &Path, into: &Path) -> Result<usize, String> {
                         std::fs::create_dir_all(&path).map_err(error)?;
                         folders.push(path);
                     }
-                    0o100000 => file = Some(File::create(&path).map_err(error)?),
+                    // Never over a file that is there: the tree goes into a folder of its own.
+                    0o100000 => file = Some(std::fs::OpenOptions::new().write(true).create_new(true).open(&path).map_err(error)?),
                     _ => skipped += 1,
                 }
             }
@@ -397,8 +406,29 @@ fn unpack_catar(archive: &Path, into: &Path) -> Result<usize, String> {
     Ok(skipped)
 }
 
+/// The first of `base`, `base (1)`, ... (numbered as the engine numbers names) that no file, folder
+/// or other download holds, its blob (`.casync.part`, or `.catar.part` for a tree) and the claim on
+/// it, held for the whole download: a name whose blob an earlier run left is taken up again, one
+/// with another download's `.part` skipped. Blocking.
+fn target_of(base: &Path, tree: bool) -> Result<(PathBuf, PathBuf, crate::engine::TargetClaim), String> {
+    let mut n = 0;
+    loop {
+        let target = crate::engine::numbered(base, n);
+        let mut blob = target.clone().into_os_string();
+        blob.push(if tree { ".catar.part" } else { ".casync.part" });
+        let blob = PathBuf::from(blob);
+        let taken = std::fs::symlink_metadata(&target).is_ok() || (!blob.exists() && crate::engine::part_path(&target).exists());
+        if !taken {
+            if let Some(claim) = crate::engine::claim_target(&target)? {
+                return Ok((target, blob, claim));
+            }
+        }
+        n += 1;
+    }
+}
+
 /// Downloads what the index `url` lists (see the module) into `save_dir`: a `.caibx`'s file, named
-/// after it, or a `.caidx`'s folder tree.
+/// after it, or a `.caidx`'s folder tree; numbered (`name (1)`) when that name is taken.
 pub(crate) async fn download(
     url: &Url,
     options: &DownloadOptions,
@@ -422,13 +452,24 @@ pub(crate) async fn download(
     let last = url.path_segments().and_then(|mut s| s.next_back()).unwrap_or_default();
     let stem = percent_encoding::percent_decode_str(&last[..last.len().saturating_sub(6)]).decode_utf8_lossy().into_owned();
     let name = crate::ingest::clean_path([stem.as_str()]).unwrap_or_else(|_| PathBuf::from("blob"));
-    let target = save_dir.join(&name);
-    let blob = save_dir.join(format!("{}{}", name.display(), if tree { ".catar.part" } else { ".part" }));
     let total = index.chunks.last().map_or(0, |c| c.start + c.size);
+    if let Some(max) = options.max_filesize.filter(|&max| total > max) {
+        return Err(crate::engine::too_large(max, Some(total)));
+    }
+    // The name and the room for it, as the engine takes them, before anything is written; a tree
+    // needs room for its archive and its files.
+    let (base, dir) = (save_dir.join(&name), save_dir.to_path_buf());
+    let (target, blob, _claim) = tokio::task::spawn_blocking(move || {
+        std::fs::create_dir_all(&dir).map_err(|e| format!("Cannot write {}: {e}", dir.display()))?;
+        let (target, blob, claim) = target_of(&base, tree)?;
+        crate::engine::check_space(&dir, if tree { total.saturating_mul(2) } else { total }, 0, &blob)?;
+        Ok::<_, String>((target, blob, claim))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
     let error = |e: io::Error| format!("Cannot write {}: {e}", blob.display());
 
     // What is on disk: the part file of an earlier run, and the older version.
-    std::fs::create_dir_all(save_dir).map_err(error)?;
     let mut out = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&blob).map_err(error)?;
     out.set_len(total).map_err(error)?;
     let (seed, local) = (options.delta_from.clone(), Arc::clone(&index));
@@ -499,11 +540,17 @@ mod tests {
     }
 
     /// The index of `data` cut with these sizes, as casync writes it, and its chunks.
-    fn index_of(data: &[u8], (min, avg, max): (u64, u64, u64)) -> (Vec<u8>, Vec<(Chunk, Vec<u8>)>) {
-        let mut out: Vec<u8> = [48, INDEX, SHA512_256, min, avg, max, u64::MAX, TABLE].iter().flat_map(|w| w.to_le_bytes()).collect();
+    fn index_of(data: &[u8], sizes: (u64, u64, u64)) -> (Vec<u8>, Vec<(Chunk, Vec<u8>)>) {
+        index_with(data, sizes, true)
+    }
+
+    /// [`index_of`], its ids SHA-512/256 or (older indexes) SHA-256.
+    fn index_with(data: &[u8], (min, avg, max): (u64, u64, u64), sha512: bool) -> (Vec<u8>, Vec<(Chunk, Vec<u8>)>) {
+        let flags = if sha512 { SHA512_256 } else { 0 };
+        let mut out: Vec<u8> = [48, INDEX, flags, min, avg, max, u64::MAX, TABLE].iter().flat_map(|w| w.to_le_bytes()).collect();
         let mut found = Vec::new();
         chunks(data, min, avg, max, |start, bytes| {
-            let id = id_of(bytes, true);
+            let id = id_of(bytes, sha512);
             out.extend((start + bytes.len() as u64).to_le_bytes());
             out.extend(id);
             found.push((Chunk { start, size: bytes.len() as u64, id }, bytes.to_vec()));
@@ -530,7 +577,7 @@ mod tests {
         let mut shifted = noise(777, 9);
         shifted.extend_from_slice(&data);
         let (_, moved) = index_of(&shifted, SIZES);
-        let ids: HashSet<[u8; 32]> = moved.iter().map(|(c, _)| c.id).collect();
+        let ids: std::collections::HashSet<[u8; 32]> = moved.iter().map(|(c, _)| c.id).collect();
         let kept = found.iter().filter(|(c, _)| ids.contains(&c.id)).count();
         assert!(kept + 3 >= found.len(), "only the first chunks change: {kept} of {}", found.len());
         assert!(parse_index(&index[..index.len() - 8]).is_err() && parse_index(b"not an index").is_err());
@@ -564,7 +611,7 @@ mod tests {
         part[last.start as usize..].copy_from_slice(&data[last.start as usize..]);
         let out = dir.path().join("out");
         std::fs::create_dir_all(&out).unwrap();
-        std::fs::write(out.join("os.part"), &part).unwrap();
+        std::fs::write(out.join("os.casync.part"), &part).unwrap();
         let cache = dir.path().join("cache");
         let options = DownloadOptions { chunk_store: Some(format!("http://{addr}/store")), delta_from: Some(seed), chunk_cache: Some(cache.clone()), ..DownloadOptions::default() };
         let url = Url::parse(&format!("http://{addr}/os.caibx")).unwrap();
@@ -584,16 +631,15 @@ mod tests {
         assert!(refused.contains("damaged"), "{refused}");
     }
 
-    /// A catar archive's folders and files unpack; a name that would climb out cannot, and a link
-    /// is left out.
-    #[test]
-    fn a_folder_tree_unpacks_from_its_archive() {
+    /// A catar archive as casync packs it: `docs/a.txt` ("hello"), a file named `..` ("up") and a
+    /// link.
+    fn sample_archive() -> Vec<u8> {
         fn record(kind: u64, body: &[u8]) -> Vec<u8> {
             [&(16 + body.len() as u64).to_le_bytes()[..], &kind.to_le_bytes(), body].concat()
         }
         let entry = |mode: u64| record(ENTRY, &[0u64, mode, 0, 0, 0, 0].iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>());
         let name = |n: &str| record(FILENAME, &[n.as_bytes(), &[0]].concat());
-        let archive = [
+        [
             entry(0o040755),
             name("docs"),
             entry(0o040755),
@@ -609,7 +655,14 @@ mod tests {
             record(0x664a6fb6830e0d6c, b"/etc/passwd\0"),
             record(GOODBYE, &[0u8; 24]),
         ]
-        .concat();
+        .concat()
+    }
+
+    /// A catar archive's folders and files unpack; a name that would climb out cannot, and a link
+    /// is left out.
+    #[test]
+    fn a_folder_tree_unpacks_from_its_archive() {
+        let archive = sample_archive();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("t.catar"), &archive).unwrap();
         let into = dir.path().join("tree");
@@ -620,4 +673,119 @@ mod tests {
         std::fs::write(dir.path().join("cut.catar"), &archive[..archive.len() - 30]).unwrap();
         assert!(unpack_catar(&dir.path().join("cut.catar"), &dir.path().join("cut")).is_err());
     }
+
+    /// A file or folder already there under the index's name stays as it is: the download takes the
+    /// next free name, as other downloads do, and leaves no part or lock file. A `.caidx` downloads
+    /// whole into its folder, and an older SHA-256 index works as a SHA-512/256 one does.
+    #[tokio::test]
+    async fn a_name_that_is_taken_is_numbered_and_a_tree_downloads_whole() {
+        let data = noise(50_000, 5);
+        let pack = |bytes: &[u8]| ruzstd::encoding::compress_to_vec(bytes, ruzstd::encoding::CompressionLevel::Fastest);
+        let mut files = HashMap::new();
+        for (index, blob, sha512) in [("/os.caibx", data.clone(), true), ("/tree.caidx", sample_archive(), true), ("/old/os.caibx", data.clone(), false)] {
+            let (bytes, found) = index_with(&blob, SIZES, sha512);
+            let store = index.rsplit_once('/').map_or("", |(dir, _)| dir).to_string();
+            files.insert(index.to_string(), bytes);
+            for (c, chunk) in found {
+                files.insert(format!("{store}/default.castr/{}", chunk_path(&c.id)), pack(&chunk));
+            }
+        }
+        let (addr, _) = serve(move |path, _| match files.get(path) {
+            Some(body) => (200, String::new(), body.clone()),
+            None => (404, String::new(), Vec::new()),
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("os"), b"mine").unwrap();
+        std::fs::create_dir(dir.path().join("tree")).unwrap();
+        std::fs::write(dir.path().join("tree").join("a.txt"), b"mine too").unwrap();
+        let get = |link: &str, into: PathBuf| {
+            let url = Url::parse(&format!("http://{addr}/{link}")).unwrap();
+            async move { download(&url, &DownloadOptions::default(), None, &into, None, CancellationToken::new()).await.unwrap() }
+        };
+
+        let (file, fresh) = get("os.caibx", dir.path().to_path_buf()).await;
+        assert_eq!((file.clone(), fresh), (dir.path().join("os (1)"), true));
+        assert_eq!(std::fs::read(&file).unwrap(), data);
+        let (tree, _) = get("tree.caidx", dir.path().to_path_buf()).await;
+        assert_eq!(tree, dir.path().join("tree (1)"));
+        assert_eq!(std::fs::read(tree.join("docs").join("a.txt")).unwrap(), b"hello");
+        assert_eq!(std::fs::read(tree.join("_")).unwrap(), b"up");
+        assert_eq!(std::fs::read(dir.path().join("os")).unwrap(), b"mine");
+        assert_eq!(std::fs::read(dir.path().join("tree").join("a.txt")).unwrap(), b"mine too");
+        let mut left: Vec<String> = std::fs::read_dir(dir.path()).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        left.sort();
+        assert_eq!(left, ["os", "os (1)", "tree", "tree (1)"]);
+
+        let (old, _) = get("old/os.caibx", dir.path().join("old")).await;
+        assert_eq!(std::fs::read(&old).unwrap(), data);
+    }
+
+    /// An index whose blob is larger than the free disk space, or than `max_filesize`, is refused
+    /// before anything is written.
+    #[tokio::test]
+    async fn an_index_larger_than_the_disk_or_the_limit_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (step, count) = (64u64 << 20, crate::media::free_space(dir.path()).unwrap() / (64 << 20) + 64);
+        let mut huge: Vec<u8> = [48, INDEX, SHA512_256, 16 << 20, 32 << 20, 64 << 20, u64::MAX, TABLE].iter().flat_map(|w| w.to_le_bytes()).collect();
+        for n in 1..=count {
+            huge.extend((n * step).to_le_bytes());
+            huge.extend([7u8; 32]);
+        }
+        huge.extend([0u64, 0, 48, 16 + 40 * (count + 1), TABLE_TAIL].iter().flat_map(|w| w.to_le_bytes()));
+        let small = index_of(&noise(5000, 1), SIZES).0;
+        let (addr, _) = serve(move |path, _| match path {
+            "/huge.caibx" => (200, String::new(), huge.clone()),
+            "/small.caibx" => (200, String::new(), small.clone()),
+            _ => (404, String::new(), Vec::new()),
+        })
+        .await;
+        let out = dir.path().join("out");
+        let url = |name: &str| Url::parse(&format!("http://{addr}/{name}")).unwrap();
+        let refused = download(&url("huge.caibx"), &DownloadOptions::default(), None, &out, None, CancellationToken::new()).await.unwrap_err();
+        assert!(refused.starts_with("Not enough disk space"), "{refused}");
+        let limited = DownloadOptions { max_filesize: Some(1000), ..DownloadOptions::default() };
+        let refused = download(&url("small.caibx"), &limited, None, &out, None, CancellationToken::new()).await.unwrap_err();
+        assert!(refused.starts_with("File is larger than the limit"), "{refused}");
+        assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0, "nothing is left on disk");
+    }
+
+    /// The cache drops its oldest chunks past its size, and never a file of the user's that sits
+    /// in the same folder.
+    #[test]
+    fn the_cache_trims_only_its_own_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let mine = ["notes.txt", "docs/notes.txt", "0101/readme.txt", &format!("abcd/{}.cacnk", hex(&[3; 32]))].map(|p| dir.path().join(p));
+        for path in &mine {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, [0u8; 5000]).unwrap();
+        }
+        let chunks = [[1u8; 32], [2; 32], [3; 32]].map(|id| dir.path().join(chunk_path(&id)));
+        for path in &chunks {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, [0u8; 1000]).unwrap();
+        }
+        trim_cache(dir.path(), 1500);
+        assert_eq!(chunks.iter().filter(|p| p.exists()).count(), 1);
+        trim_cache(dir.path(), 0);
+        assert!(chunks.iter().all(|p| !p.exists()));
+        assert!(mine.iter().all(|p| p.exists()), "the user's files stay");
+    }
+
+    /// The chunker's cuts and ids for a fixed input with casync's default sizes. They pin the
+    /// implementation that was checked, outside the repository, against desync's published test
+    /// vector (its 1 MiB input file is not kept here).
+    #[test]
+    fn the_chunker_cuts_a_fixed_input_where_it_always_has() {
+        let data = noise(1 << 20, 1);
+        let mut cuts = Vec::new();
+        chunks(&data[..], 16 * 1024, 64 * 1024, 256 * 1024, |start, bytes| cuts.push((start, bytes.len(), hex(&id_of(bytes, true))))).unwrap();
+        let first: Vec<(u64, usize, &str)> = cuts.iter().take(3).map(|(s, l, id)| (*s, *l, id.as_str())).collect();
+        assert_eq!(first, CUTS);
+    }
+    const CUTS: [(u64, usize, &str); 3] = [
+        (0, 95399, "5f59f82217d24f50583e7a5d9d8476fd82139da7f996d45aa0fcdc4538220ee8"),
+        (95399, 19035, "836115cb3538575e6f7fa55f8d09510eb4023c2d4ba1976de4aefa261cda9024"),
+        (114434, 74097, "77693b813b78e1a73c72a70fa0c039269fc9efae99ba1d50b3b04644e3249338"),
+    ];
 }

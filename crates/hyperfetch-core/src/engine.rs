@@ -2831,10 +2831,7 @@ impl DownloadEngine {
             let have: u64 = crate::range::merge_ranges(state.completed_ranges.clone()).iter().map(ByteRange::len).sum();
             let dir = final_path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new(".")).to_path_buf();
             let held = part.clone();
-            let (needs, free) = blocking(move || (space_needed(size, have, &held), crate::media::free_space(&dir))).await?;
-            if let Some(free) = free.filter(|&free| free < needs) {
-                return Err(format!("Not enough disk space: needs {}, {} free", size_text(needs), size_text(free)));
-            }
+            blocking(move || check_space(&dir, size, have, &held)).await??;
         }
         let mut prefetched = reference.prefetch.clone();
         if let Some(cipher) = &self.decrypt {
@@ -6036,6 +6033,16 @@ fn set_remote_time(path: &Path, http_date: &str) {
 fn space_needed(size: u64, have: u64, part: &Path) -> u64 {
     size.saturating_sub(have.max(allocated(part))).saturating_add(DISK_HEADROOM)
 }
+/// Fails when the disk of `dir` lacks the space a download of `size` bytes, `have` of them written
+/// to `part`, still needs (see [`space_needed`]). Blocking.
+pub(crate) fn check_space(dir: &Path, size: u64, have: u64, part: &Path) -> Result<(), String> {
+    let needs = space_needed(size, have, part);
+    match crate::media::free_space(dir) {
+        Some(free) if free < needs => Err(format!("Not enough disk space: needs {}, {} free", size_text(needs), size_text(free))),
+        _ => Ok(()),
+    }
+}
+
 
 /// The bytes `path` takes up on its disk: a sparse file only its written ranges; 0 when it isn't
 /// there. Blocking.
@@ -6061,7 +6068,7 @@ fn allocated(path: &Path) -> u64 {
 }
 
 /// What a download larger than `DownloadOptions::max_filesize` fails with; `size` when known.
-fn too_large(max: u64, size: Option<u64>) -> String {
+pub(crate) fn too_large(max: u64, size: Option<u64>) -> String {
     let size = size.map(|size| format!(" ({})", size_text(size))).unwrap_or_default();
     format!("File is larger than the limit of {}{size}", size_text(max))
 }
