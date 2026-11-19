@@ -38,6 +38,10 @@ pub struct Harness {
     pub ppp: f32,
     /// Whether the window is minimized (it keeps its size, as on Windows).
     pub minimized: bool,
+    /// Whether the window has the keyboard focus (the moving background stills without it).
+    pub focused: bool,
+    /// The window's size, in points ([`SCREEN`] at first).
+    pub size: Vec2,
     modifiers: Modifiers,
     hovered_files: Vec<egui::HoveredFile>,
     textures: HashMap<TextureId, Texture>,
@@ -57,13 +61,16 @@ impl Harness {
         let ctx = egui::Context::default();
         setup(&ctx);
         let save_dir = dir.path().to_string_lossy().into_owned();
-        let settings = Settings { save_dir, theme: 1, reduce_motion: Some(false), show_all_settings: true, welcomed: true, ..Settings::default() };
+        // The moving background is off unless a test turns it on: an idle window asks for no frames.
+        let settings = Settings { save_dir, theme: 1, reduce_motion: Some(false), show_all_settings: true, welcomed: true, moving_background: false, ..Settings::default() };
         Self {
             app: App::with(ctx, rt.handle().clone(), settings, DownloadQueue::new(), None),
             output: FullOutput::default(),
             time: 0.0,
             ppp: 1.0,
             minimized: false,
+            focused: true,
+            size: SCREEN,
             modifiers: Modifiers::NONE,
             hovered_files: Vec::new(),
             textures: HashMap::new(),
@@ -79,13 +86,13 @@ impl Harness {
     pub fn frame(&mut self, events: Vec<Event>) -> Duration {
         self.time += DT;
         let mut input = egui::RawInput {
-            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, SCREEN)),
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, self.size)),
             time: Some(self.time),
             predicted_dt: DT as f32,
             modifiers: self.modifiers,
             events,
             hovered_files: self.hovered_files.clone(),
-            focused: true,
+            focused: self.focused,
             system_theme: Some(Theme::Dark),
             ..Default::default()
         };
@@ -321,7 +328,7 @@ impl Harness {
     /// points) when given.
     pub fn shot(&self, area: Option<Rect>) -> RgbaImage {
         let ppp = self.output.pixels_per_point;
-        let [w, h] = [SCREEN.x, SCREEN.y].map(|side| (side * ppp).round() as usize);
+        let [w, h] = [self.size.x, self.size.y].map(|side| (side * ppp).round() as usize);
         let mut pixels = vec![rgba(self.app.ctx.style().visuals.panel_fill); w * h];
         let meshes: Vec<_> = (self.app.ctx.tessellate(self.output.shapes.clone(), ppp).into_iter())
             .filter_map(|clipped| {
@@ -480,8 +487,14 @@ fn fill(rows: &mut [[f32; 4]], w: usize, top: usize, clip: [usize; 4], mut corne
 mod tests {
     use super::*;
 
-    /// The rasterizer paints what egui draws: the sidebar's colour on the left, the page's on the
-    /// right, light text on the dark theme; at 150 % the picture is half as big again.
+    /// How far apart two colours are, the largest of their channels' differences.
+    fn apart(pixel: [u8; 4], color: Color32) -> u8 {
+        [pixel[0].abs_diff(color.r()), pixel[1].abs_diff(color.g()), pixel[2].abs_diff(color.b())].into_iter().max().unwrap()
+    }
+
+    /// The rasterizer paints what egui draws: the rail's colour on the left (over the still
+    /// background), the background's dark wash on the right, light text on the dark theme; at 150 % the picture is
+    /// half as big again.
     #[test]
     fn frames_paint_like_the_screen() {
         let mut h = Harness::new();
@@ -489,11 +502,12 @@ mod tests {
         let shot = h.shot(None);
         assert_eq!((shot.width(), shot.height()), (980, 720));
         let at = |x: u32, y: u32| shot.get_pixel(x, y).0;
-        assert_eq!(at(100, 400), [DARK.side.r(), DARK.side.g(), DARK.side.b(), 255]);
-        assert_eq!(at(970, 710), [DARK.bg.r(), DARK.bg.g(), DARK.bg.b(), 255]);
-        let title = h.find("Add a download").unwrap();
+        assert!(apart(at(100, 400), DARK.side) < 12, "the rail: {:?}", at(100, 400));
+        // The page shows the background's still wash through it: dark, a little blue.
+        assert!(at(970, 710)[..3].iter().all(|&c| c < 90) && at(970, 710)[2] >= at(970, 710)[0], "the page: {:?}", at(970, 710));
+        let title = h.find("Nothing downloading yet").unwrap();
         let brightest = (title.min.x as u32..title.max.x as u32).flat_map(|x| (title.min.y as u32..title.max.y as u32).map(move |y| (x, y)));
-        assert!(brightest.map(|(x, y)| at(x, y)[0]).max().unwrap() > 230, "the title's white text shows");
+        assert!(brightest.map(|(x, y)| at(x, y)[0]).max().unwrap() > 200, "the title's light text shows");
 
         h.ppp = 1.5;
         h.settle();
@@ -501,25 +515,132 @@ mod tests {
         assert_eq!((shot.width(), shot.height()), (150, 75));
     }
 
+    /// The moving background asks for a frame every 33 ms while it is on and the window is seen
+    /// and focused; none while the window is in the background, minimized, hidden, the background
+    /// off or motion reduced. An idle window with it off asks for none.
+    #[test]
+    fn the_background_moves_only_while_it_is_on_and_seen() {
+        let mut h = Harness::new();
+        assert!(h.settle());
+        assert_eq!(h.frames(10), Duration::MAX, "off: still");
+        h.app.settings.moving_background = true;
+        assert!(super::backdrop::tests::paced(h.frames(10)), "on and focused");
+        h.focused = false;
+        assert_eq!(h.frames(10), Duration::MAX, "in the background");
+        h.focused = true;
+        h.minimized = true;
+        assert_eq!(h.frames(10), Duration::MAX, "minimized");
+        h.minimized = false;
+        h.app.hide_window();
+        assert_eq!(h.frames(10), Duration::MAX, "hidden in the tray");
+        h.app.show_window();
+        h.app.settings.reduce_motion = Some(true);
+        assert_eq!(h.frames(10), Duration::MAX, "reduced");
+        h.app.settings.reduce_motion = Some(false);
+        assert!(super::backdrop::tests::paced(h.frames(10)), "on again");
+    }
+
     fn area(x0: f32, y0: f32, x1: f32, y1: f32) -> Option<Rect> {
         Some(Rect::from_min_max(Pos2::new(x0, y0), Pos2::new(x1, y1)))
     }
 
-    /// Every animation of the window as frame strips (see [`Harness::frame_strip`]; file names
-    /// end in the theme), and every page at 100, 125 and 150 %, into `ENDO_CAPTURE_DIR`, else
-    /// target/ui-captures.
+    /// Twenty downloads in every state: waiting, running at different speeds and places, paused,
+    /// failed, a link expired, done, a High and a Low one; long and right-to-left names.
+    fn busy(h: &mut Harness) {
+        let names = [
+            "ubuntu-24.04.2-desktop-amd64.iso",
+            "Big Buck Bunny 4K.mp4",
+            "fedora-workstation-41.iso",
+            "blender-4.3.2-windows-x64.zip",
+            "linux-6.12.tar.xz",
+            "debian-12.9.0-amd64-netinst.iso",
+            "podcast episode 214 - the long one.mp3",
+            "openstreetmap-monaco-latest.osm.pbf",
+            "gpt2-model.safetensors",
+            "LibreOffice_24.8.4_Win_x86-64.msi",
+            "archlinux-2025.01.01-x86_64.iso",
+            "pexels-sunset-timelapse.mov",
+            "rust-1.84.0-x86_64-pc-windows-msvc.msi",
+            "Attention Is All You Need.pdf",
+            "steam-deck-recovery-4.img.bz2",
+            "very long name of a file that goes on and on so that it has to be cut short somewhere.tar.gz",
+            "\u{627}\u{644}\u{62a}\u{642}\u{631}\u{64a}\u{631} 2024.pdf",
+            "node-v22.13.0-x64.msi",
+            "sodium-fabric-0.6.6.jar",
+            "photos-2024-backup.7z",
+        ];
+        let ids: Vec<usize> = names.iter().map(|name| h.add(&name.replace(' ', "%20"))).collect();
+        for (n, &id) in ids.iter().enumerate() {
+            match n % 10 {
+                0 | 3 | 6 => h.progress(id, 0.15 + 0.04 * n as f64),
+                1 => {
+                    h.progress(id, 1.0);
+                    h.finish(id, None);
+                }
+                2 => {
+                    h.progress(id, 0.4);
+                    h.finish(id, Some("The server answered 404 Not Found"));
+                }
+                4 => {
+                    h.app.queue.mark_started(id);
+                    h.app.queue.mark_pausing(id);
+                    h.app.queue.finish(id, Err(hyperfetch_core::engine::CANCELLED.to_string()));
+                }
+                5 => h.app.queue.get_item_mut(id).unwrap().priority = hyperfetch_core::queue::Priority::High,
+                7 => h.app.queue.get_item_mut(id).unwrap().priority = hyperfetch_core::queue::Priority::Low,
+                8 => {
+                    h.progress(id, 0.3);
+                    h.finish(id, Some("https://cdn.example/f?sig=old: HTTP 403 Forbidden"));
+                }
+                _ => {}
+            }
+        }
+        // Different speeds.
+        for (n, &id) in ids.iter().enumerate() {
+            if let Some(item) = h.app.queue.get_item_mut(id).filter(|item| item.status == QueueItemStatus::Downloading) {
+                item.speed_bytes_per_sec = 1.2e6 * (1 + n % 7) as f64;
+            }
+        }
+    }
+
+    /// A Library of `n` downloads over the last weeks, a few failed.
+    fn library(h: &mut Harness, n: usize) {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        for k in 0..n {
+            let name = format!("download-{k:03}.{}", ["iso", "zip", "mp4", "pdf", "tar.gz"][k % 5]);
+            let urls = vec![format!("https://mirror.example.org/{name}")];
+            let mut entry = HistoryEntry::new(name.clone(), std::env::temp_dir().join(&name), (k as u64 + 1) * (7 << 20), urls);
+            entry.completed_at = Some(now - (k as u64 * k as u64 * 1800));
+            entry.blake3_hash = Some("af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262".to_string());
+            if k % 9 == 4 {
+                entry.status = HistoryStatus::Failed("The server answered 404 Not Found".to_string());
+            }
+            h.app.history.push(entry);
+        }
+    }
+
+    /// The wheel turned `by` points down over the middle of the window, settled.
+    fn wheel(h: &mut Harness, by: f32) {
+        h.hover(Pos2::new(h.size.x * 0.6, h.size.y * 0.6));
+        h.frame(vec![egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: Vec2::new(0.0, -by), modifiers: Modifiers::NONE }]);
+        h.frames(40);
+        h.leave();
+    }
+
+    /// Every page, card and animation of the window as pictures into `ENDO_CAPTURE_DIR`, else
+    /// target/ui-captures: the pages at 100, 125 and 150 %, in both themes, busy and empty, wide
+    /// and narrow; the link bar's card for each kind of link; a download's details beside the list
+    /// and in its place; the moving background at each intensity; and frame strips of the motion
+    /// (file names end in the theme).
     #[test]
     #[ignore = "writes pictures to look at; run with --ignored"]
     fn capture_gallery() {
-        const SIDEBAR: Option<Rect> = Some(Rect { min: Pos2::ZERO, max: Pos2::new(196.0, 260.0) });
-        let top = area(196.0, 0.0, 980.0, 280.0);
-        let page = area(196.0, 0.0, 980.0, 720.0);
         for (theme, dark) in [(1, "dark"), (2, "light")] {
-            // A settled window in the theme, on `tab`, with `setup` done.
-            let scene = |tab: Tab, setup: &dyn Fn(&mut Harness)| {
+            // A settled window in the theme, `size` points big, with `setup` done.
+            let scene = |size: Vec2, setup: &dyn Fn(&mut Harness)| {
                 let mut h = Harness::new();
+                h.size = size;
                 h.app.settings.theme = theme;
-                h.app.tab = tab;
                 setup(&mut h);
                 // A second for things to come in (a running download never settles).
                 h.frames(60);
@@ -528,172 +649,166 @@ mod tests {
             let shoot = |h: &mut Harness, name: &str, ms: &[u64], area: Option<Rect>| {
                 save(&h.frame_strip(ms, area), &format!("{name}-{dark}"));
             };
-            let four = |h: &mut Harness| ["a.iso", "b.iso", "c.iso", "d.iso"].map(|name| h.add(name));
+            let still = |h: &mut Harness, name: &str| {
+                save(&h.shot(None), &format!("{name}-{dark}"));
+            };
+            let wide = Vec2::new(1440.0, 900.0);
 
-            // Shared: page change, theme cross-fade, buttons, icon buttons, switches, banners.
-            let mut h = scene(Tab::Downloader, &|_| {});
-            h.click("Queue");
-            shoot(&mut h, "page-change", &[0, 33, 67, 133, 250], top);
-            let mut h = scene(Tab::Downloader, &|_| {});
+            // Pages.
+            let mut h = scene(SCREEN, &|_| {});
+            still(&mut h, "downloads-empty");
+            let mut h = scene(SCREEN, &|h| h.app.settings.welcomed = false);
+            still(&mut h, "downloads-welcome");
+            let mut h = scene(SCREEN, &busy);
+            still(&mut h, "downloads-busy");
+            let mut h = scene(wide, &|h| {
+                busy(h);
+                h.app.settings.moving_background = true;
+            });
+            still(&mut h, "downloads-busy-wide");
+            let mut h = scene(wide, &|h| {
+                busy(h);
+                h.app.focused = Some(1);
+                h.app.selected = Some(1);
+            });
+            still(&mut h, "detail-beside");
+            let mut h = scene(SCREEN, &|h| {
+                busy(h);
+                h.app.focused = Some(1);
+            });
+            still(&mut h, "detail-in-place");
+            wheel(&mut h, 600.0);
+            still(&mut h, "detail-in-place-lower");
+            let mut h = scene(SCREEN, &|h| {
+                busy(h);
+                h.app.focused = Some(3);
+            });
+            still(&mut h, "detail-failed");
+            let mut h = scene(SCREEN, &|h| {
+                library(h, 60);
+                h.app.tab = Tab::Library;
+            });
+            still(&mut h, "library");
+            wheel(&mut h, 900.0);
+            still(&mut h, "library-scrolled");
+            let mut h = scene(SCREEN, &|h| h.app.tab = Tab::Library);
+            still(&mut h, "library-empty");
+            let mut h = scene(SCREEN, &|h| h.app.tab = Tab::Sources);
+            still(&mut h, "sources");
+            wheel(&mut h, 1100.0);
+            still(&mut h, "sources-lower");
+            let mut h = scene(SCREEN, &|h| h.app.tab = Tab::Settings);
+            still(&mut h, "settings");
+            let mut h = scene(SCREEN, &|h| {
+                h.app.tab = Tab::Settings;
+                h.app.settings_search = "speed".to_string();
+            });
+            still(&mut h, "settings-search");
+            let mut h = scene(SCREEN, &busy);
+            super::command::open(&h.app.ctx);
+            h.frames(2);
+            h.type_text("pa");
+            h.frames(30);
+            still(&mut h, "palette");
+            let mut h = scene(Vec2::new(760.0, 640.0), &busy);
+            still(&mut h, "narrow");
+            let mut h = scene(SCREEN, &busy);
+            h.app.notice = Some(Err("Could not reach the server: the connection timed out. Check your internet connection, then Retry.".to_string()));
+            h.frames(30);
+            still(&mut h, "error-banner");
+
+            // The link bar's card for each kind of link.
+            let links = [
+                ("file", "https://ftp.gnu.org/gnu/hello/hello-2.12.1.tar.gz"),
+                ("video", "https://www.youtube.com/watch?v=aqz-KE-bpKQ"),
+                ("playlist", "https://www.youtube.com/@BlenderOfficial/videos"),
+                ("torrent", "https://webtorrent.io/torrents/big-buck-bunny.torrent"),
+                ("magnet", "magnet:?xt=urn:btih:dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c&dn=Big+Buck+Bunny"),
+                ("stream", "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8"),
+                ("zip", "https://example.com/pack.zip"),
+                ("paper", "https://arxiv.org/abs/1706.03762"),
+                ("container", "docker.io/library/alpine:latest"),
+                ("several", "https://example.com/a.iso\nhttps://example.com/b.iso\nhttps://example.com/c.iso"),
+            ];
+            let top = area(0.0, 0.0, SCREEN.x, 420.0);
+            for (name, link) in links {
+                let h = scene(SCREEN, &|h| h.app.url_input = link.to_string());
+                save(&h.shot(top), &format!("preview-{name}-{dark}"));
+            }
+            let mut h = scene(SCREEN, &|h| {
+                h.app.url_input = links[0].1.to_string();
+                h.app.show_advanced = true;
+            });
+            still(&mut h, "preview-more-options");
+
+            // The moving background at each intensity, on the empty page.
+            for (intensity, name) in [(0, "calm"), (1, "normal"), (2, "lively")] {
+                let mut h = scene(Vec2::new(1280.0, 800.0), &|h| {
+                    h.app.settings.moving_background = true;
+                    h.app.settings.background_intensity = intensity;
+                });
+                still(&mut h, &format!("background-{name}"));
+            }
+            let mut h = scene(Vec2::new(1280.0, 800.0), &|h| {
+                h.app.settings.moving_background = true;
+                busy(h);
+                h.app.tab = Tab::Sources;
+            });
+            shoot(&mut h, "background-current", &[0, 500, 1000], None);
+
+            // Motion.
+            let mut h = scene(SCREEN, &|_| {});
+            h.click("Library");
+            shoot(&mut h, "page-change", &[0, 33, 67, 133, 250], None);
+            let mut h = scene(SCREEN, &|_| {});
             h.click(if theme == 1 { icon::SUN } else { icon::MOON });
             shoot(&mut h, "theme-switch", &[0, 50, 100, 200, 350], None);
-            let mut h = scene(Tab::Queue, &|_| {});
-            // The button, not the card's title of the same name.
-            let button = h.find(&format!("{} Add to queue", icon::PLUS)).unwrap();
-            h.hover(button.center());
-            shoot(&mut h, "button-hover", &[0, 33, 67, 150], Some(button.expand2(Vec2::new(70.0, 14.0))));
-            h.press(button.center());
-            shoot(&mut h, "button-press", &[0, 33, 100], Some(button.expand2(Vec2::new(70.0, 14.0))));
-            let mut h = scene(Tab::Queue, &|h| {
-                four(h);
-            });
-            let x = h.find_near("b.iso", icon::X).unwrap();
-            h.hover(x.center());
-            shoot(&mut h, "icon-button-hover", &[0, 33, 67, 150], Some(x.expand2(Vec2::new(120.0, 24.0))));
-            let mut h = scene(Tab::Settings, &|_| {});
-            let row = h.find("Run the queue automatically").unwrap();
-            h.click_at(h.find_near("Run the queue automatically", TOGGLE).unwrap().center());
-            shoot(&mut h, "toggle-and-row-flash", &[0, 50, 100, 200, 500, 900], area(196.0, row.min.y - 20.0, 980.0, row.max.y + 30.0));
-            let mut h = scene(Tab::Downloader, &|_| {});
-            h.paste("https://example.com/a.iso");
-            shoot(&mut h, "banner-added-badge", &[0, 33, 83, 167, 400, 1000], area(0.0, 0.0, 980.0, 260.0));
-            let mut h = scene(Tab::Downloader, &|h| h.app.notice = Some(Ok("Added #1 to the queue".to_string())));
-            h.click_at(h.find_near("Added #1 to the queue", icon::X).unwrap().center());
-            shoot(&mut h, "banner-dismiss", &[0, 50, 100, 150, 250], top);
-
-            // Sidebar: pill, hover, logo.
-            let mut h = scene(Tab::Downloader, &|_| {});
-            h.click("Settings");
-            shoot(&mut h, "sidebar-pill", &[0, 50, 100, 150, 250], SIDEBAR);
-            let mut h = scene(Tab::Downloader, &|_| {});
-            h.hover(h.find("History").unwrap().center());
-            shoot(&mut h, "nav-hover", &[0, 33, 67, 150], SIDEBAR);
-            let mut h = scene(Tab::Queue, &|h| {
-                let id = h.add("a.iso");
-                h.progress(id, 0.9);
-            });
-            h.finish(1, None);
-            shoot(&mut h, "logo-bob", &[0, 100, 200, 300, 450, 650], area(0.0, 0.0, 196.0, 64.0));
-
-            // Add page.
-            let mut h = scene(Tab::Downloader, &|_| {});
-            h.drag_files(true);
-            shoot(&mut h, "drop-zone", &[0, 67, 150, 600, 1200], None);
-            h.drag_files(false);
-            shoot(&mut h, "drop-zone-out", &[0, 50, 100, 200], None);
-            let mut h = scene(Tab::Downloader, &|h| {
-                let id = h.add("ubuntu.iso");
-                h.progress(id, 0.96);
-                h.app.focused = Some(id);
-            });
-            h.finish(1, None);
-            shoot(&mut h, "download-complete", &[0, 100, 200, 350, 600], top);
-            let mut h = scene(Tab::Downloader, &|h| {
-                let id = h.add("gone.bin");
-                h.progress(id, 0.4);
-                h.app.focused = Some(id);
-            });
-            h.finish(1, Some("The server answered 404 Not Found"));
-            shoot(&mut h, "download-fail-shake", &[0, 50, 100, 150, 250, 500], area(196.0, 60.0, 980.0, 360.0));
-            let mut h = scene(Tab::Downloader, &|_| {});
+            let mut h = scene(SCREEN, &|_| {});
             let input = h.app.ctx.read_response(egui::Id::new("url_input")).unwrap().rect;
+            h.click_at(input.center());
+            h.type_text("https://ftp.gnu.org/gnu/hello/hello-2.12.1.tar.gz");
+            shoot(&mut h, "preview-appears", &[0, 50, 100, 200, 350], top);
+            let mut h = scene(SCREEN, &|_| {});
             h.click_at(input.center());
             h.type_text("not a link");
             h.key(Key::Enter, Modifiers::NONE);
-            shoot(&mut h, "form-error-shake", &[0, 50, 100, 150, 250, 500], area(196.0, 60.0, 980.0, 300.0));
-            // Fixed, the alert fades out still.
-            h.click_at(input.center());
-            h.type_text("x");
-            shoot(&mut h, "form-error-cleared", &[0, 50, 100, 150, 250], area(196.0, 60.0, 980.0, 300.0));
-            let mut h = scene(Tab::Downloader, &|h| {
-                let page = "https://example.com/releases".to_string();
-                h.app.update = Some(hyperfetch_core::updater::Update { version: "9.9.0".into(), tag: "v9.9.0".into(), page });
-            });
-            // As Update and restart does, without fetching anything: the banner stays put.
-            h.app.updating = true;
-            shoot(&mut h, "update-banner-downloading", &[0, 50, 100, 250], area(196.0, 0.0, 980.0, 180.0));
-            let mut h = scene(Tab::Downloader, &|_| {});
-            h.click("Advanced options: checksum, older version and Authorization header");
-            shoot(&mut h, "advanced-options", &[0, 50, 100, 200], area(196.0, 120.0, 980.0, 420.0));
-            let mut h = Harness::new();
-            h.app.settings.theme = theme;
-            h.frame(Vec::new());
-            shoot(&mut h, "tips-first-sight", &[0, 50, 100, 200, 400], area(196.0, 200.0, 980.0, 480.0));
-
-            // Settings.
-            let mut h = scene(Tab::Downloader, &|_| {});
-            h.click("Settings");
-            shoot(&mut h, "settings-open", &[0, 50, 100, 200, 350, 600], page);
-
-            // Queue.
-            let list = area(196.0, 300.0, 980.0, 720.0);
-            let mut h = scene(Tab::Queue, &|h| {
+            shoot(&mut h, "form-error-shake", &[0, 50, 100, 150, 250, 500], top);
+            let list = area(0.0, 140.0, SCREEN.x, SCREEN.y);
+            let four = |h: &mut Harness| ["a.iso", "b.iso", "c.iso", "d.iso"].map(|name| h.add(name));
+            let mut h = scene(SCREEN, &|h| {
                 four(h);
             });
             h.paste("https://example.com/e.iso");
-            shoot(&mut h, "queue-row-added", &[0, 50, 100, 250], list);
-            let mut h = scene(Tab::Queue, &|h| {
+            shoot(&mut h, "card-added", &[0, 50, 100, 250], list);
+            let mut h = scene(SCREEN, &|h| {
                 four(h);
             });
             h.click_at(h.find_near("b.iso", icon::X).unwrap().center());
-            shoot(&mut h, "queue-row-removed", &[0, 67, 133, 200, 267, 400], list);
-            let mut h = scene(Tab::Queue, &|h| {
-                for name in ["a.iso", "b.iso", "c.iso"] {
-                    let id = h.add(name);
-                    h.progress(id, 1.0);
-                    h.finish(id, None);
-                }
-                let run = h.add("run.iso");
-                h.progress(run, 0.5);
-                h.app.selected = Some(run);
-            });
-            // The selected row slides up into the gap, its highlight on it.
-            h.app.clear_queue(true);
-            shoot(&mut h, "queue-clear-completed", &[0, 150, 230, 270, 310, 350, 450], list);
-            let mut h = scene(Tab::Queue, &|h| {
-                let [_, resolving, downloading, failed] = four(h);
-                h.app.queue.mark_started(resolving);
-                h.progress(downloading, 0.45);
-                h.progress(failed, 0.2);
-                h.finish(failed, Some("The server answered 404 Not Found"));
-                let done = h.add("e.iso");
-                h.progress(done, 1.0);
-                h.finish(done, None);
-            });
-            shoot(&mut h, "queue-status-icons", &[0, 250, 500, 750], list);
-            let mut h = scene(Tab::Queue, &|h| {
+            shoot(&mut h, "card-removed", &[0, 67, 133, 200, 267, 400], list);
+            let mut h = scene(SCREEN, &|h| {
                 let [a, b, ..] = four(h);
                 h.progress(a, 0.3);
                 h.progress(b, 0.95);
             });
             h.progress(1, 0.7);
             h.finish(2, None);
-            shoot(&mut h, "queue-progress-and-complete", &[0, 67, 133, 200, 350, 600], list);
-            let mut h = scene(Tab::Queue, &|h| {
+            shoot(&mut h, "card-progress-and-complete", &[0, 67, 133, 200, 350, 600], list);
+            let mut h = scene(SCREEN, &|h| {
                 let [_, b, ..] = four(h);
                 h.progress(b, 0.6);
             });
             h.finish(2, Some("The server answered 404 Not Found"));
-            shoot(&mut h, "queue-fail", &[0, 33, 67, 133, 250, 500], list);
-            let mut h = scene(Tab::Queue, &|h| {
+            shoot(&mut h, "card-fail", &[0, 33, 67, 133, 250, 500], list);
+            let mut h = scene(SCREEN, &|h| {
                 four(h);
             });
-            h.click("a.iso");
-            // Long enough apart not to make a double click.
-            h.frames(30);
-            h.click("d.iso");
-            shoot(&mut h, "queue-selection", &[0, 50, 100, 200], list);
-            h.hover(h.find("b.iso").unwrap().center());
-            shoot(&mut h, "queue-row-hover", &[0, 33, 67, 150], list);
-            let mut h = scene(Tab::Downloader, &|h| {
-                let id = h.add("ubuntu.iso");
-                h.progress(id, 0.3);
-                h.app.focused = Some(id);
-            });
-            h.progress(1, 0.6);
-            shoot(&mut h, "download-details", &[0, 100, 200, 400], page);
-            // Connection 4 takes over the last quarter of the second piece.
-            let mut h = scene(Tab::Downloader, &|h| {
+            h.key(Key::ArrowDown, Modifiers::NONE);
+            h.frames(20);
+            h.key(Key::ArrowDown, Modifiers::NONE);
+            shoot(&mut h, "focus-ring-glide", &[0, 50, 100, 200], list);
+            h.hover(h.find("c.iso").unwrap().center());
+            shoot(&mut h, "card-hover-lift", &[0, 50, 100, 200], list);
+            let mut h = scene(SCREEN, &|h| {
                 let id = h.add("ubuntu.iso");
                 h.progress(id, 0.5);
                 h.app.focused = Some(id);
@@ -703,29 +818,21 @@ mod tests {
             (chunks[1].range_end, chunks[1].total_bytes) = (quarter * 7 / 4 - 1, quarter * 3 / 4);
             let status = "Worker 4".to_string();
             chunks.push(ChunkSnapshot { id: 4, range_start: quarter * 7 / 4, range_end: 2 * quarter - 1, downloaded_bytes: 0, total_bytes: quarter / 4, status, worker_id: Some(4) });
-            let map = h.app.ctx.read_response(egui::Id::new(("chunk map", 1usize))).unwrap().rect;
-            shoot(&mut h, "chunk-map-split", &[0, 50, 100, 200, 450], Some(map.expand(8.0)));
-            let mut h = scene(Tab::Downloader, &|h| {
-                let link = "https://example.com/pack.zip".to_string();
-                h.app.url_input = link.clone();
-                h.app.zip_preview = Some((link, None));
-            });
-            shoot(&mut h, "link-reading-skeleton", &[0, 200, 400, 600, 800], area(196.0, 60.0, 980.0, 320.0));
-
-            // History.
-            let mut h = scene(Tab::Downloader, &|h| {
-                for n in 0..6 {
-                    let name = format!("file-{n}.zip");
-                    let mut entry = HistoryEntry::new(name.clone(), std::env::temp_dir().join(&name), 5 << 20, vec![format!("https://example.com/{name}")]);
-                    entry.blake3_hash = Some("af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262".to_string());
-                    h.app.history.push(entry);
-                }
-            });
-            h.click("History");
-            shoot(&mut h, "history-open", &[0, 50, 100, 200, 350, 500], page);
+            if let Some(map) = h.app.ctx.read_response(egui::Id::new(("chunk map", 1usize))) {
+                shoot(&mut h, "chunk-map-split", &[0, 50, 100, 200, 450], Some(map.rect.expand(8.0)));
+            }
+            let mut h = scene(SCREEN, &busy);
+            h.key(Key::K, Modifiers::COMMAND);
+            shoot(&mut h, "palette-opens", &[0, 50, 100, 250], None);
+            let mut h = scene(SCREEN, &|_| {});
+            h.drag_files(true);
+            shoot(&mut h, "drop-zone", &[0, 67, 150, 600], None);
+            let mut h = scene(SCREEN, &|h| library(h, 6));
+            h.click("Library");
+            shoot(&mut h, "library-open", &[0, 50, 100, 200, 350], None);
             h.app.verification = Some(crate::Verification {
                 result: hyperfetch_core::verify::BuildVerificationResult {
-                    file_path: std::env::temp_dir().join("file-1.zip"),
+                    file_path: std::env::temp_dir().join("download-001.zip"),
                     expected_size: Some(5 << 20),
                     actual_size: 3 << 20,
                     has_state_file: true,
@@ -734,23 +841,15 @@ mod tests {
                     checksum_match: None,
                     status_message: "2 MiB are missing; the download that made it can fill them in.".to_string(),
                 },
-                repair_urls: vec![url::Url::parse("https://example.com/file-1.zip").unwrap()],
+                repair_urls: vec![url::Url::parse("https://example.com/download-001.zip").unwrap()],
             });
-            shoot(&mut h, "verification", &[0, 50, 100, 250], top);
+            shoot(&mut h, "verification", &[0, 50, 100, 250], area(0.0, 0.0, SCREEN.x, 360.0));
 
             // Every page at each display scale.
             for ppp in [1.0, 1.25, 1.5] {
-                let mut h = scene(Tab::Queue, &|h| {
-                    let [a, b, c, _] = four(h);
-                    h.progress(a, 0.45);
-                    h.progress(b, 1.0);
-                    h.finish(b, None);
-                    h.progress(c, 0.2);
-                    h.finish(c, Some("The server answered 404 Not Found"));
-                    h.app.focused = Some(a);
-                });
+                let mut h = scene(SCREEN, &busy);
                 h.ppp = ppp;
-                let shots: Vec<RgbaImage> = [Tab::Downloader, Tab::Queue, Tab::History, Tab::Settings]
+                let shots: Vec<RgbaImage> = [Tab::Downloads, Tab::Library, Tab::Sources, Tab::Settings]
                     .into_iter()
                     .map(|tab| {
                         h.app.tab = tab;
@@ -760,6 +859,51 @@ mod tests {
                     .collect();
                 save(&side_by_side(&shots), &format!("pages-{}-{dark}", (ppp * 100.0) as u32));
             }
+        }
+    }
+
+    /// How long the window takes to draw a frame (its UI and the tessellation that turns it into
+    /// triangles, both on the UI thread) with twenty downloads, most running, and the moving
+    /// background on, over 600 frames. Printed, and added to the CI job's summary; run in release.
+    #[test]
+    #[ignore = "measures; run with --release --ignored --nocapture"]
+    fn frame_time() {
+        let mut h = Harness::new();
+        h.size = Vec2::new(1440.0, 900.0);
+        h.app.settings.moving_background = true;
+        busy(&mut h);
+        for id in 1..=20 {
+            if h.app.queue.get_item(id).is_some_and(|item| item.status == QueueItemStatus::Queued) && id % 3 != 0 {
+                h.progress(id, 0.05 * id as f64);
+            }
+        }
+        h.frames(60);
+        let mut times: Vec<f64> = (0..600)
+            .map(|n| {
+                // Bytes keep coming: every frame a download moves on.
+                let id = 1 + n % 20;
+                if let Some(item) = h.app.queue.get_item_mut(id).filter(|item| item.status == QueueItemStatus::Downloading) {
+                    item.downloaded_bytes += 1 << 16;
+                    item.progress_ratio = (item.progress_ratio + 0.0005).min(0.99);
+                }
+                let start = Instant::now();
+                h.frame(Vec::new());
+                let _ = h.app.ctx.tessellate(h.output.shapes.clone(), h.output.pixels_per_point);
+                start.elapsed().as_secs_f64() * 1000.0
+            })
+            .collect();
+        times.sort_by(f64::total_cmp);
+        let running = h.app.queue.items().iter().filter(|item| item.status == QueueItemStatus::Downloading).count();
+        let mean = times.iter().sum::<f64>() / times.len() as f64;
+        let build = if cfg!(debug_assertions) { "debug" } else { "release" };
+        let line = format!(
+            "Frame time over 600 frames, 20 downloads ({running} running), moving background on, 1440x900, {build} build: mean {mean:.2} ms, median {:.2} ms, 95th percentile {:.2} ms, worst {:.2} ms",
+            times[300], times[570], times[599]
+        );
+        println!("{line}");
+        if let Some(summary) = std::env::var_os("GITHUB_STEP_SUMMARY") {
+            use std::io::Write;
+            let _ = std::fs::OpenOptions::new().append(true).open(summary).and_then(|mut file| writeln!(file, "{line}"));
         }
     }
 }

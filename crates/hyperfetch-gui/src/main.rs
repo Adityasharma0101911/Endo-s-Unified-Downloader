@@ -70,10 +70,13 @@ const PREVIEW_LIMIT: Duration = Duration::from_secs(if cfg!(test) { 10 } else { 
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
-    /// The link form, and the download shown (see `App::focused`).
-    Downloader,
-    Queue,
-    History,
+    /// The front door (the link bar) and the downloads, the one shown in detail beside them (see
+    /// `App::focused`).
+    Downloads,
+    /// Finished downloads: the history.
+    Library,
+    /// What the app downloads from: kinds of links, accounts and tools, examples to try.
+    Sources,
     Settings,
 }
 
@@ -508,7 +511,7 @@ impl App {
             events_tx,
             events_rx,
             settings,
-            tab: Tab::Downloader,
+            tab: Tab::Downloads,
             url_input: String::new(),
             checksum_input: String::new(),
             auth_input: String::new(),
@@ -621,7 +624,7 @@ impl App {
         }
         let Some(&first) = ids.first() else { return };
         self.zip_preview = None;
-        self.tab = Tab::Downloader;
+        self.tab = Tab::Downloads;
         self.start_added(first);
         if ids.len() > 1 {
             self.notice = Some(Ok(format!("Started the first of {} files; the others wait in the queue", ids.len())));
@@ -1038,7 +1041,7 @@ impl App {
     /// .torrent, or a folder, feed or playlist link, is read first; the first download it lists
     /// starts, the others wait in the queue.
     fn download_now(&mut self, text: &str, checksum: &str, auth: &str) {
-        self.tab = Tab::Downloader;
+        self.tab = Tab::Downloads;
         let update = self.update_on_disk.take();
         // The first link of a paste with secrets starts, the others wait; the form clears as
         // it starts (it held the secrets).
@@ -1420,7 +1423,7 @@ impl App {
         self.focused = Some(id);
         self.form_error = None;
         self.notice = None;
-        self.tab = Tab::Downloader;
+        self.tab = Tab::Downloads;
     }
 
     fn drain_snapshots(&mut self) {
@@ -1486,7 +1489,7 @@ impl App {
         self.verifying = true;
         self.verification = None;
         self.verify_message = None;
-        self.tab = Tab::History;
+        self.tab = Tab::Library;
         self.verify_request = Some(request.clone());
         self.spawn_event(async move {
             let result = unblock(move || {
@@ -1782,7 +1785,7 @@ impl App {
         }
         match self.add_browser_download(&url, &payload) {
             Ok(id) if start_now => {
-                self.tab = Tab::Downloader;
+                self.tab = Tab::Downloads;
                 self.start_added(id);
                 // Unless it says the file is downloading already.
                 self.notice.get_or_insert_with(|| Ok(format!("Started remote download: {}", shown)));
