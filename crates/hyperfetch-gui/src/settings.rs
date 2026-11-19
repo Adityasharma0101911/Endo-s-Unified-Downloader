@@ -179,6 +179,9 @@ pub struct Settings {
     /// The email address Unpaywall asks for, to find a paper's legal open copy (see
     /// `hyperfetch_core::papers`); sent to Unpaywall alone.
     pub unpaywall_email: String,
+    /// The API key of the user's itch.io account (see `hyperfetch_core::itch`). Saved here, never
+    /// with the queue or in the history.
+    pub itch_key: String,
     /// Look each downloaded file's SHA-256 up on VirusTotal (the hash only, never the file).
     pub virustotal_check: bool,
     /// 0 follows the system, 1 dark, 2 light.
@@ -341,6 +344,7 @@ impl Default for Settings {
             curseforge_key: String::new(),
             nexus_key: String::new(),
             unpaywall_email: String::new(),
+            itch_key: String::new(),
             remote_time: engine.remote_time,
             adaptive: true,
             user_agent: String::new(),
@@ -582,7 +586,7 @@ impl Settings {
             ssh_key: self.ssh_key(),
             formats: self.archive_formats.split(',').map(str::trim).filter(|f| !f.is_empty()).map(str::to_string).collect(),
             max_items: None,
-            keys: hyperfetch_core::ingest::Keys { curseforge: non_empty(&self.curseforge_key), nexus: non_empty(&self.nexus_key), unpaywall_email: non_empty(&self.unpaywall_email) },
+            keys: hyperfetch_core::ingest::Keys { curseforge: non_empty(&self.curseforge_key), nexus: non_empty(&self.nexus_key), unpaywall_email: non_empty(&self.unpaywall_email), itch: non_empty(&self.itch_key) },
         }
     }
 

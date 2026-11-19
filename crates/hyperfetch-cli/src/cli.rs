@@ -476,7 +476,8 @@ pub struct Args {
 
     /// Most items of an Internet Archive collection, search or account (default 100), captures of a
     /// Wayback Machine listing (default 500) or files of a Common Crawl list (default 100) one run
-    /// lists; add the link again for the next ones
+    /// lists; add the link again for the next ones. Also the most games of an itch.io jam,
+    /// collection or library listed (default 50)
     #[arg(long = "max-items", value_name = "N", value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=10_000))]
     pub max_items: Option<usize>,
 
@@ -569,6 +570,11 @@ pub struct Args {
     /// paper's legal open copy that Unpaywall knows (without it, only one the DOI's own record links)
     #[arg(long = "unpaywall-email", value_name = "EMAIL", env = "ENDO_UNPAYWALL_EMAIL")]
     pub unpaywall_email: Option<String>,
+
+    /// Your itch.io API key (from itch.io/user/settings/api-keys), for itch.io games, jams,
+    /// collections and your library (itch.io/my-purchases): games you own and free ones
+    #[arg(long = "itch-key", value_name = "KEY", env = "ENDO_ITCH_KEY", hide_env_values = true)]
+    pub itch_key: Option<String>,
 
     /// Show download history and exit
     #[arg(long = "history", conflicts_with_all = ["urls", "input_file", "verify"])]
@@ -1455,6 +1461,7 @@ mod tests {
         let args = parse(&["--curseforge-key", "c", "--nexus-key", "n", "--unpaywall-email", "me@example.org", "u"]).unwrap();
         assert_eq!((args.curseforge_key.as_deref(), args.nexus_key.as_deref()), (Some("c"), Some("n")));
         assert_eq!(args.unpaywall_email.as_deref(), Some("me@example.org"));
+        assert_eq!(parse(&["--itch-key", "i", "u"]).unwrap().itch_key.as_deref(), Some("i"));
         assert!(parse(&["--latest", "0", "u"]).is_err());
         assert!(parse(&["--subs", " ", "u"]).is_err());
         assert!(parse(&["--subs", "en, es", "u"]).is_err());

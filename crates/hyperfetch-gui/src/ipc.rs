@@ -648,7 +648,7 @@ async fn check_link(_: Option<PathBuf>, size: u64, url: Url, _: DownloadOptions)
 /// file host's, share's, cloud folder's, repository's or gallery's page whose files it finds, else
 /// "none".
 fn page_kind(url: &Url) -> &'static str {
-    use hyperfetch_core::{archives, cloud, folders, gallery, iasearch, mega, mods, oci, packages, papers, repos, resolver::SmartResolver, shares, wayback};
+    use hyperfetch_core::{archives, cloud, folders, gallery, iasearch, itch, mega, mods, oci, packages, papers, repos, resolver::SmartResolver, shares, wayback};
     if media::is_supported_media_site(url) {
         "media"
     } else if SmartResolver::handles(url)
@@ -665,6 +665,7 @@ fn page_kind(url: &Url) -> &'static str {
         || oci::reference(url.as_str()).is_some()
         || papers::lists(url)
         || packages::lists(url)
+        || itch::lists(url)
     {
         "files"
     } else {
@@ -1074,6 +1075,7 @@ mod tests {
             ("https://doi.org/10.1371/journal.pone.0000308", "files"),
             ("https://central.sonatype.com/artifact/org.slf4j/slf4j-api", "files"),
             ("https://f-droid.org/en/packages/org.fdroid.fdroid/", "files"),
+            ("https://leafo.itch.io/x-moon", "files"),
             ("https://news.example/article", "none"),
         ] {
             let body = json!({ "url": url }).to_string();

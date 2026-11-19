@@ -155,6 +155,8 @@ pub struct Keys {
     pub nexus: Option<String>,
     /// The email address Unpaywall's terms ask for, which the user sets (see `crate::papers`).
     pub unpaywall_email: Option<String>,
+    /// The API key of the user's itch.io account (see `crate::itch`).
+    pub itch: Option<String>,
 }
 
 impl std::fmt::Debug for Keys {
@@ -325,6 +327,7 @@ pub fn might_list(url: &Url) -> bool {
         || crate::mods::lists(url)
         || crate::papers::lists(url)
         || crate::packages::lists(url)
+        || crate::itch::lists(url)
 }
 
 /// `token` as a link [`might_list`] takes, a "leaving this site" link replaced by its target.
@@ -679,6 +682,10 @@ async fn list(http: &reqwest::Client, url: &Url, options: &ListOptions) -> Optio
     // Packagist or F-Droid.
     if crate::packages::lists(url) {
         return Some(crate::packages::list(http, url, options).await);
+    }
+    // An itch.io game, jam, collection or the user's library, through its API with their key.
+    if crate::itch::lists(url) {
+        return Some(crate::itch::list(http, url, options).await);
     }
     if repos::lists(url) {
         let auth = options.auth.as_ref().filter(|(link, _)| link == url).map(|(_, header)| header.as_str());
