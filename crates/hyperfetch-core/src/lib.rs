@@ -54,6 +54,7 @@ pub mod muxer;
 pub mod doctor;
 pub mod nntp;
 pub mod mods;
+pub mod papers;
 pub mod helpers;
 pub mod accounts;
 pub mod rclone;

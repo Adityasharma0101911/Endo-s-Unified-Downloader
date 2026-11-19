@@ -648,7 +648,7 @@ async fn check_link(_: Option<PathBuf>, size: u64, url: Url, _: DownloadOptions)
 /// file host's, share's, cloud folder's, repository's or gallery's page whose files it finds, else
 /// "none".
 fn page_kind(url: &Url) -> &'static str {
-    use hyperfetch_core::{archives, cloud, folders, gallery, iasearch, mega, mods, oci, repos, resolver::SmartResolver, shares, wayback};
+    use hyperfetch_core::{archives, cloud, folders, gallery, iasearch, mega, mods, oci, papers, repos, resolver::SmartResolver, shares, wayback};
     if media::is_supported_media_site(url) {
         "media"
     } else if SmartResolver::handles(url)
@@ -663,6 +663,7 @@ fn page_kind(url: &Url) -> &'static str {
         || wayback::lists(url)
         || mods::lists(url)
         || oci::reference(url.as_str()).is_some()
+        || papers::lists(url)
     {
         "files"
     } else {
@@ -1069,6 +1070,7 @@ mod tests {
             ("https://modrinth.com/mod/sodium", "files"),
             ("https://www.nexusmods.com/skyrimspecialedition/mods/266", "files"),
             ("https://ollama.com/library/llama3.2:3b", "files"),
+            ("https://doi.org/10.1371/journal.pone.0000308", "files"),
             ("https://news.example/article", "none"),
         ] {
             let body = json!({ "url": url }).to_string();
