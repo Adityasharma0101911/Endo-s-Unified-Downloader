@@ -228,7 +228,7 @@ pub(super) fn library_page(app: &mut App, ui: &mut Ui) {
             let edge = ((rect.center().y - clip.top()).min(clip.bottom() - rect.center().y) / (line.height() * 0.5)).clamp(0.0, 1.0);
             let opacity = t * (0.35 + 0.65 * edge);
             match line {
-                Line::Heading(name, count) => heading(ui, rect, name, count, opacity),
+                Line::Heading(name, count) => heading(ui, rect, name, count, opacity, false),
                 Line::Entry(index) => {
                     let mut row = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(Layout::left_to_right(Align::Center)));
                     row.multiply_opacity(opacity);
@@ -243,7 +243,7 @@ pub(super) fn library_page(app: &mut App, ui: &mut Ui) {
             let next = listing.lines[at + 1..].iter().position(|line| matches!(line, Line::Heading(..))).map(|k| listing.tops[at + 1 + k]);
             let y = next.map_or(viewport.min.y, |next| viewport.min.y.min(next - HEADING - SPACE));
             let rect = Rect::from_min_size(origin + Vec2::new(0.0, y), Vec2::new(width, HEADING));
-            heading(ui, rect, name, count, 1.0);
+            heading(ui, rect, name, count, 1.0, true);
         }
     });
     if let Some(what) = action {
@@ -253,10 +253,12 @@ pub(super) fn library_page(app: &mut App, ui: &mut Ui) {
 
 /// A heading over the rows of a stretch of days, on a band of its own so that it reads over the
 /// rows it is pinned above.
-fn heading(ui: &mut Ui, rect: Rect, name: &str, count: usize, opacity: f32) {
+fn heading(ui: &mut Ui, rect: Rect, name: &str, count: usize, opacity: f32, pinned: bool) {
     let p = palette(ui);
     let painter = ui.painter();
-    painter.rect_filled(rect.shrink2(Vec2::new(0.0, 3.0)), 10.0, p.side.gamma_multiply(0.94 * opacity));
+    // Pinned, its band is solid and reaches the list's top edge: no row shows through or above it.
+    let band = if pinned { Rect::from_min_max(rect.min, rect.max - Vec2::new(0.0, 3.0)) } else { rect.shrink2(Vec2::new(0.0, 3.0)) };
+    painter.rect_filled(band, 10.0, if pinned { p.side } else { p.side.gamma_multiply(0.94 * opacity) });
     let text = painter.text(rect.left_center() + Vec2::new(14.0, 0.0), Align2::LEFT_CENTER, name, FontId::new(13.0, semibold()), p.text.gamma_multiply(opacity));
     let count = if count == 1 { "1 download".to_string() } else { format!("{count} downloads") };
     painter.text(text.right_center() + Vec2::new(10.0, 0.0), Align2::LEFT_CENTER, count, FontId::proportional(12.0), p.dim.gamma_multiply(opacity));
