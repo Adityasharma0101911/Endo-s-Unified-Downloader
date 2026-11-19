@@ -648,7 +648,7 @@ async fn check_link(_: Option<PathBuf>, size: u64, url: Url, _: DownloadOptions)
 /// file host's, share's, cloud folder's, repository's or gallery's page whose files it finds, else
 /// "none".
 fn page_kind(url: &Url) -> &'static str {
-    use hyperfetch_core::{archives, cloud, folders, gallery, iasearch, mega, repos, resolver::SmartResolver, shares, wayback};
+    use hyperfetch_core::{archives, cloud, folders, gallery, iasearch, mega, mods, repos, resolver::SmartResolver, shares, wayback};
     if media::is_supported_media_site(url) {
         "media"
     } else if SmartResolver::handles(url)
@@ -661,6 +661,7 @@ fn page_kind(url: &Url) -> &'static str {
         || iasearch::lists(url)
         || archives::lists(url)
         || wayback::lists(url)
+        || mods::lists(url)
     {
         "files"
     } else {
@@ -1064,6 +1065,8 @@ mod tests {
             ("https://arxiv.org/abs/2101.00001", "files"),
             ("https://web.archive.org/web/*/example.com/*", "files"),
             ("https://web.archive.org/web/2010/http://example.com/a.pdf", "files"),
+            ("https://modrinth.com/mod/sodium", "files"),
+            ("https://www.nexusmods.com/skyrimspecialedition/mods/266", "files"),
             ("https://news.example/article", "none"),
         ] {
             let body = json!({ "url": url }).to_string();

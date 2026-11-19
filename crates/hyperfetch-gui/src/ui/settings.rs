@@ -614,6 +614,13 @@ fn host_settings(app: &mut App, ui: &mut Ui) {
                  those before lack: nntps://USER:PASSWORD@news.example.com[:563][?connections=8], comma-separated (nntp:// \
                  without TLS). Saved in the settings only, never with the queue or in the history.";
     text_setting(ui, "Usenet servers", about, &mut app.settings.usenet_servers, "Optional: nntps://user:password@news.example.com", true);
+    let about = "Lists CurseForge mods, files and modpacks through CurseForge's API, which needs your own key \
+                 (console.curseforge.com). Sent only to CurseForge; saved in the settings only, never with the queue or in the history.";
+    text_setting(ui, "CurseForge API key", about, &mut app.settings.curseforge_key, "Optional", true);
+    let about = "Lists Nexus Mods files with the personal API key of your account. Nexus gives other apps download links \
+                 for premium accounts only; for others the file's page opens in the browser. Sent only to Nexus Mods; saved in \
+                 the settings only, never with the queue or in the history.";
+    text_setting(ui, "Nexus Mods API key", about, &mut app.settings.nexus_key, "Optional", true);
     setting(ui, "Browser cookies", "Sign in to sites as in this browser, for videos and folders that need it.", app.settings.browser_cookies, |ui| {
         combo(ui, "browser_cookies_combo", &mut app.settings.browser_cookies, &BROWSERS);
     });
@@ -666,7 +673,8 @@ fn media_settings(app: &mut App, ui: &mut Ui) {
     });
     let about = "Only these formats or extensions of an Internet Archive item's files and of a Project Gutenberg book, \
                  comma-separated; \"original\" or \"derivative\" picks archive.org's uploaded files or the copies it made. \
-                 Empty: the uploaded files, and every format of a book.";
+                 Empty: the uploaded files, and every format of a book. For a Modrinth or CurseForge project, the game \
+                 versions and loaders its version is picked by (1.21.1, fabric), and server for a modpack's server side.";
     text_setting(ui, "Archive formats", about, &mut s.archive_formats, "e.g. pdf, epub", false);
     let mut install = app.settings.install_ffmpeg == Some(true);
     if switch(ui, "Install ffmpeg when a video needs it", FFMPEG_ABOUT, &mut install) {

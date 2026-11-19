@@ -308,7 +308,7 @@ fn zip_of(repo: &Repo) -> Result<(Url, &str), String> {
 }
 
 /// `base` with `segments` added to its path, each percent-encoded as one segment.
-fn url_at<'a>(base: &str, segments: impl IntoIterator<Item = &'a str>) -> Result<Url, String> {
+pub(crate) fn url_at<'a>(base: &str, segments: impl IntoIterator<Item = &'a str>) -> Result<Url, String> {
     let mut url = Url::parse(base).map_err(|e| e.to_string())?;
     url.path_segments_mut().map_err(|_| format!("{} takes no path", base))?.pop_if_empty().extend(segments);
     Ok(url)
@@ -326,7 +326,7 @@ fn component(name: &str, fallback: &str) -> Result<PathBuf, String> {
 
 /// `path` (a listing's, so untrusted) as a relative path whose every part is a usable name;
 /// None leaves the file out (a part like "..", or an absolute path).
-fn relative(path: &str) -> Option<PathBuf> {
+pub(crate) fn relative(path: &str) -> Option<PathBuf> {
     let clean = clean_path(path.split('/')).ok();
     if clean.is_none() {
         tracing::warn!("left out {:?}: not a usable file name", path);
@@ -334,7 +334,7 @@ fn relative(path: &str) -> Option<PathBuf> {
     clean
 }
 
-fn checksum(algo: &str, hex: &str) -> Option<String> {
+pub(crate) fn checksum(algo: &str, hex: &str) -> Option<String> {
     Some(format!("{}:{}", algo, hex.to_ascii_lowercase())).filter(|c| crate::storage::validate_checksum(c).is_ok())
 }
 

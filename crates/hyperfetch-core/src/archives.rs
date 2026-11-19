@@ -248,7 +248,7 @@ fn checksum(algo: &str, hex: &str) -> Option<String> {
 }
 
 /// The body of `answer`, at most [`MAX_ANSWER`] bytes.
-async fn body(mut answer: Response, site: &str) -> Result<Vec<u8>, String> {
+pub(crate) async fn body(mut answer: Response, site: &str) -> Result<Vec<u8>, String> {
     let mut body = Vec::new();
     while let Some(chunk) = answer.chunk().await.map_err(|e| format!("Cannot reach {site}: {e}"))? {
         body.extend_from_slice(&chunk);

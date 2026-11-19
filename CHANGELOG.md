@@ -5,6 +5,7 @@ What changed in each release, newest first. Each release's page on [GitHub](http
 ## Unreleased
 
 - **Usenet.** An NZB (a file, one dropped on the window, or a link) adds one download per file it lists, fetched over NNTP from your own provider's servers (TLS or plain, with your user name and password; `--nntp-server`, `ENDO_NNTP_*`, or Settings > Usenet servers): several articles asked for at once on each connection, yEnc-decoded and checked by CRC-32, written in place out of order; an article one server lacks or holds damaged comes from the next; a download cut short goes on with the articles it lacks. Files are named by the NZB's subject, their yEnc header, or the PAR2 set beside them, and checked against that set (checked, not repaired).
+- **Game mods.** Modrinth projects, versions and modpacks (`.mrpack` links too), with their SHA-512, picked by game version and loader through `--formats`; a modpack's files to the paths it states, its overrides unpacked out of the pack. CurseForge files and modpacks through its API with your key (`--curseforge-key`); a file its author keeps to CurseForge's site is its page to open. Thunderstore packages with their dependencies. Nexus Mods files with your key (`--nexus-key`): direct links where its API gives them (premium accounts, `nxm://` links), else the file's page to open.
 
 ## 2.0.3 (2026-11-16)
 

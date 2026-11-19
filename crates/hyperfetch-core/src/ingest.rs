@@ -141,6 +141,24 @@ pub struct ListOptions {
     /// or captures of a Wayback Machine listing (see `crate::wayback`) one listing gives; None
     /// for their own default.
     pub max_items: Option<usize>,
+    /// The user's keys for services that need one (see [`Keys`]).
+    pub keys: Keys,
+}
+
+/// The user's own keys for the services that ask for one, from Settings or the command line: each
+/// sent to its service alone, never logged, nor saved with the queue or in the history.
+#[derive(Clone, Default)]
+pub struct Keys {
+    /// CurseForge's API key (see `crate::mods`).
+    pub curseforge: Option<String>,
+    /// The personal API key of the user's Nexus Mods account (see `crate::mods`).
+    pub nexus: Option<String>,
+}
+
+impl std::fmt::Debug for Keys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Keys { .. }")
+    }
 }
 
 impl ListOptions {
@@ -201,6 +219,7 @@ impl Default for ListOptions {
             ssh_key: None,
             formats: Vec::new(),
             max_items: None,
+            keys: Keys::default(),
         }
     }
 }
@@ -301,6 +320,7 @@ pub fn might_list(url: &Url) -> bool {
         || media::lists(url)
         || folders::directory_lists(url)
         || crate::sftp::handles(url)
+        || crate::mods::lists(url)
 }
 
 /// `token` as a link [`might_list`] takes, a "leaving this site" link replaced by its target.
@@ -308,7 +328,7 @@ fn listing_url(token: &str) -> Option<Url> {
     let url = match http_url(token) {
         Some(url) => resolver::unwrap_redirect(&url).unwrap_or(url),
         // A bucket's s3:// or gs:// link, a WebDAV one, or a Software Heritage ID (swh:1:...).
-        None => Url::parse(token).ok().filter(|u| matches!(u.scheme(), "s3" | "gs" | "webdav" | "webdavs" | "dav" | "davs" | "sftp" | "swh"))?,
+        None => Url::parse(token).ok().filter(|u| matches!(u.scheme(), "s3" | "gs" | "webdav" | "webdavs" | "dav" | "davs" | "sftp" | "swh" | "nxm"))?,
     };
     might_list(&url).then_some(url)
 }
@@ -604,6 +624,10 @@ async fn magnet_tasks(http: &reqwest::Client, token: &str, options: &ListOptions
 /// The downloads the folder, feed or playlist at `url` lists, from the first lister whose `lists`
 /// takes it and that finds a listing there; None when none does.
 async fn list(http: &reqwest::Client, url: &Url, options: &ListOptions) -> Option<Result<Vec<Task>, String>> {
+    // Mods and modpacks (a .mrpack link on any host too).
+    if crate::mods::lists(url) {
+        return Some(crate::mods::list(http, url, options).await);
+    }
     if crate::sftp::handles(url) {
         return crate::sftp::list(url, options).await;
     }

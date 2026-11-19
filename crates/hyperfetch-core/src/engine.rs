@@ -879,6 +879,11 @@ impl DownloadEngine {
             let done = crate::nntp::run(link, &self.options, self.limiter(), &self.save_dir(), snapshot_tx, self.cancel_token.clone()).await;
             return self.unless_rerun(done);
         }
+        // A modpack's overrides folders, unpacked out of the pack (see `crate::mods::run`).
+        if let Some(link) = self.urls.first().filter(|u| crate::mods::handles(u)) {
+            let done = crate::mods::run(link, &client, self.limiter(), &self.save_dir(), snapshot_tx, self.cancel_token.clone()).await;
+            return self.unless_rerun(done);
+        }
 
         if self.urls.first().is_some_and(crate::ftp::handles) {
             return Box::pin(self.fetch_ftp(client, snapshot_tx)).await;
