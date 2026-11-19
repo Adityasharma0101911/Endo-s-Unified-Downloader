@@ -683,6 +683,16 @@ fn host_settings(app: &mut App, ui: &mut Ui) {
     let about = "Kaggle competitions and private datasets sign in with your kaggle.json (from the Settings page of your Kaggle \
                  account); public datasets need none. Its key is sent only to Kaggle.";
     text_setting(ui, "kaggle.json", about, &mut app.settings.kaggle_json, "Optional: ~/.kaggle/kaggle.json", false);
+    let about = "The Library's Find subtitles looks a downloaded video's subtitles up on OpenSubtitles with your API key (from \
+                 the API consumers page of your account), and saves them beside it. Sent only to OpenSubtitles; saved in the \
+                 settings only, never with the queue or in the history.";
+    text_setting(ui, "OpenSubtitles API key", about, &mut app.settings.opensubtitles_key, "Optional", true);
+    let about = "Your OpenSubtitles account gives more subtitle downloads a day than none. The password is kept only while the \
+                 app runs, never saved.";
+    text_setting(ui, "OpenSubtitles user name", about, &mut app.settings.opensubtitles_user, "Optional", false);
+    text_setting(ui, "OpenSubtitles password", about, &mut app.settings.opensubtitles_password, "Optional, not saved", true);
+    let about = "The languages Find subtitles looks for, as OpenSubtitles writes them, comma-separated: en, fr, pt-br.";
+    text_setting(ui, "Subtitle languages", about, &mut app.settings.subtitle_languages, "en", false);
     setting(ui, "Browser cookies", "Sign in to sites as in this browser, for videos and folders that need it.", app.settings.browser_cookies, |ui| {
         combo(ui, "browser_cookies_combo", &mut app.settings.browser_cookies, &BROWSERS);
     });

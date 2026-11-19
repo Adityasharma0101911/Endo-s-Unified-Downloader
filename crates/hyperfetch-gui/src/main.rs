@@ -165,7 +165,8 @@ enum AppEvent {
     Queue { id: usize, action: ipc::QueueAction },
     /// A recording the browser extension finished, to be joined into the save folder.
     Recorded(recording::Finished),
-    /// The notice saying where a recording was saved, or why it could not be joined.
+    /// The notice saying where a recording was saved, or why it could not be joined; or which
+    /// subtitles were found.
     Merged(Result<String, String>),
     /// What looking for a newer release found; `manual` when the user asked (Check now), which
     /// says so also when there is none.
@@ -1481,6 +1482,21 @@ impl App {
     }
 
     // ---- verify & repair -----------------------------------------------------------------
+
+    /// Looks the downloaded video `video` up on OpenSubtitles (see `Settings::subtitles`), its
+    /// subtitles saved beside it; the notice says what was found.
+    fn find_subtitles(&mut self, video: PathBuf) {
+        let Some(subs) = self.settings.subtitles() else {
+            self.notice = Some(Err("Set your OpenSubtitles API key in Settings > Sources & accounts first".to_string()));
+            return;
+        };
+        let proxy = Some(self.settings.proxy.trim().to_string()).filter(|p| !p.is_empty());
+        self.spawn_event(async move {
+            let found = hyperfetch_core::subtitles::find(&video, &subs, proxy.as_deref()).await;
+            let names = |saved: Vec<PathBuf>| saved.iter().filter_map(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).collect::<Vec<_>>().join(", ");
+            AppEvent::Merged(found.map(|saved| format!("Subtitles saved: {}", names(saved))))
+        });
+    }
 
     fn verify(&mut self, request: VerifyRequest) {
         if self.verifying || self.repair.is_some() {

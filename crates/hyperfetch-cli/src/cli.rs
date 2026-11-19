@@ -581,6 +581,22 @@ pub struct Args {
     #[arg(long = "kaggle-json", value_name = "FILE", env = "ENDO_KAGGLE_JSON")]
     pub kaggle_json: Option<String>,
 
+    /// After each video downloads, find its subtitles in these languages on OpenSubtitles ("en,fr"),
+    /// by its hash and size, else by its title, saved beside it as <name>.<language>.srt; needs
+    /// --opensubtitles-key
+    #[arg(long = "find-subtitles", value_name = "LANGS", value_delimiter = ',')]
+    pub find_subtitles: Vec<String>,
+
+    /// Your OpenSubtitles API key (from the API consumers page of your account), for
+    /// --find-subtitles
+    #[arg(long = "opensubtitles-key", value_name = "KEY", env = "ENDO_OPENSUBTITLES_KEY", hide_env_values = true)]
+    pub opensubtitles_key: Option<String>,
+
+    /// Your OpenSubtitles user name, for more subtitle downloads a day; its password is read from
+    /// ENDO_OPENSUBTITLES_PASSWORD, never from the command line
+    #[arg(long = "opensubtitles-user", value_name = "USER", env = "ENDO_OPENSUBTITLES_USER")]
+    pub opensubtitles_user: Option<String>,
+
     /// Show download history and exit
     #[arg(long = "history", conflicts_with_all = ["urls", "input_file", "verify"])]
     pub history: bool,
@@ -1468,6 +1484,8 @@ mod tests {
         assert_eq!(args.unpaywall_email.as_deref(), Some("me@example.org"));
         assert_eq!(parse(&["--itch-key", "i", "u"]).unwrap().itch_key.as_deref(), Some("i"));
         assert_eq!(parse(&["--kaggle-json", "k.json", "u"]).unwrap().kaggle_json.as_deref(), Some("k.json"));
+        let args = parse(&["--find-subtitles", "en,fr", "--opensubtitles-key", "o", "u"]).unwrap();
+        assert_eq!((args.find_subtitles, args.opensubtitles_key.as_deref()), (vec!["en".to_string(), "fr".to_string()], Some("o")));
         assert!(parse(&["--latest", "0", "u"]).is_err());
         assert!(parse(&["--subs", " ", "u"]).is_err());
         assert!(parse(&["--subs", "en, es", "u"]).is_err());
