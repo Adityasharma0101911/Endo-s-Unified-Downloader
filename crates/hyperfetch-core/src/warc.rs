@@ -227,12 +227,25 @@ impl Writer {
         fields.push(("Content-Type", content_type.to_string()));
         let offset = self.file.metadata().map_err(error)?.len();
         let mut gz = flate2::write::GzEncoder::new(&mut self.file, flate2::Compression::default());
-        gz.write_all(frame_head(&fields, head.len() as u64 + payload_len).as_bytes()).map_err(error)?;
-        gz.write_all(head).map_err(error)?;
-        payload.seek(SeekFrom::Start(0)).map_err(error)?;
-        std::io::copy(&mut payload.take(payload_len), &mut gz).map_err(error)?;
-        gz.write_all(b"\r\n\r\n").map_err(error)?;
-        gz.finish().map_err(error)?;
+        let written = (|| {
+            gz.write_all(frame_head(&fields, head.len() as u64 + payload_len).as_bytes())?;
+            gz.write_all(head)?;
+            payload.seek(SeekFrom::Start(0))?;
+            if std::io::copy(&mut payload.take(payload_len), &mut gz)? != payload_len {
+                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "the payload got shorter while it was written"));
+            }
+            gz.write_all(b"\r\n\r\n")?;
+            gz.try_finish()
+        })();
+        drop(gz);
+        // A record goes in whole or not at all: one cut short would hide every record after it.
+        if let Err(e) = written {
+            // Through a handle of its own: one opened to append may not cut a file (Windows).
+            if let Err(cut) = std::fs::OpenOptions::new().write(true).open(&self.path).and_then(|f| f.set_len(offset)) {
+                return Err(format!("{} (and the record could not be taken out again: {cut})", error(e)));
+            }
+            return Err(error(e));
+        }
         let length = self.file.metadata().map_err(error)?.len() - offset;
         Ok((id, offset, length, digest))
     }
@@ -253,7 +266,8 @@ impl Writer {
     }
 
     /// Writes the answer to a GET of `url` (its `head`, and `payload` its body as received) as a
-    /// `response` record, and the request as one beside it.
+    /// `response` record, and beside it a `request` record: the request line with the host and
+    /// user agent this app sends, made again from them, not the request's every header as sent.
     pub(crate) fn response(&mut self, url: &Url, date: SystemTime, head: &Head, payload: &mut (impl Read + Seek)) -> Result<(), String> {
         let Head { status, version, headers } = head;
         let reason = reqwest::StatusCode::from_u16(*status).ok().and_then(|s| s.canonical_reason()).unwrap_or("");
@@ -458,5 +472,46 @@ pub(crate) mod tests {
                 assert_eq!(record.block, b"p{}");
             }
         }
+    }
+
+    /// A payload that gets shorter between the pass that hashes it and the one that copies it is an
+    /// error, and leaves no record cut short: the records before and after it read back.
+    #[test]
+    fn a_payload_that_shrinks_while_written_leaves_no_broken_record() {
+        struct Shrinking {
+            data: Vec<u8>,
+            at: usize,
+            passes: usize,
+        }
+        impl Read for Shrinking {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let len = if self.passes > 1 { self.data.len() / 2 } else { self.data.len() };
+                let n = buf.len().min(len.saturating_sub(self.at));
+                buf[..n].copy_from_slice(&self.data[self.at..self.at + n]);
+                self.at += n;
+                Ok(n)
+            }
+        }
+        impl Seek for Shrinking {
+            fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+                assert_eq!(to, SeekFrom::Start(0));
+                (self.at, self.passes) = (0, self.passes + 1);
+                Ok(0)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.warc.gz");
+        let head = Head { status: 200, version: "HTTP/1.1".to_string(), headers: Vec::new() };
+        let url = Url::parse("http://example.com/").unwrap();
+        let mut warc = Writer::open(&path).unwrap();
+        let refused = warc.response(&url, SystemTime::now(), &head, &mut Shrinking { data: vec![b'x'; 1000], at: 0, passes: 0 }).unwrap_err();
+        assert!(refused.contains("shorter"), "{refused}");
+        warc.response(&url, SystemTime::now(), &head, &mut std::io::Cursor::new(&b"whole"[..])).unwrap();
+        warc.finish().unwrap();
+        let mut all = Vec::new();
+        flate2::read::MultiGzDecoder::new(std::fs::File::open(&path).unwrap()).read_to_end(&mut all).unwrap();
+        let kinds: Vec<String> = records(&all).iter().map(|r| r.field("WARC-Type").unwrap().to_string()).collect();
+        assert_eq!(kinds, ["warcinfo", "response", "request"]);
+        assert!(records(&all)[1].block.ends_with(b"whole"));
     }
 }
