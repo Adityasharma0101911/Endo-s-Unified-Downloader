@@ -610,6 +610,10 @@ fn host_settings(app: &mut App, ui: &mut Ui) {
     text_setting(ui, "SSH private key", about, &mut app.settings.ssh_key_file, "Optional: the key file's path", false);
     let about = "For an encrypted private key. Saved in the settings only, never with the queue or in the history.";
     text_setting(ui, "SSH key passphrase", about, &mut app.settings.ssh_key_passphrase, "Optional", true);
+    let about = "NZB files download from these Usenet servers of your provider's account, asked in this order for the articles \
+                 those before lack: nntps://USER:PASSWORD@news.example.com[:563][?connections=8], comma-separated (nntp:// \
+                 without TLS). Saved in the settings only, never with the queue or in the history.";
+    text_setting(ui, "Usenet servers", about, &mut app.settings.usenet_servers, "Optional: nntps://user:password@news.example.com", true);
     setting(ui, "Browser cookies", "Sign in to sites as in this browser, for videos and folders that need it.", app.settings.browser_cookies, |ui| {
         combo(ui, "browser_cookies_combo", &mut app.settings.browser_cookies, &BROWSERS);
     });

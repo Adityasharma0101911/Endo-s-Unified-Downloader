@@ -716,6 +716,8 @@ fn tuning(args: &Args, connections: u64) -> DownloadOptions {
         s3: args.s3_key(),
         // Used only by sftp:// links.
         ssh_key: args.ssh_key(),
+        // Used only by the files of an NZB.
+        nntp: args.nntp_servers(),
         remote_time: args.remote_time,
         max_filesize: args.max_filesize,
         remote_checksum: !args.no_remote_checksum,

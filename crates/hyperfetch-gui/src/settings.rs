@@ -168,6 +168,10 @@ pub struct Settings {
     /// Look each downloaded file's SHA-256 up on VirusTotal (the hash only, never the file).
     pub virustotal_check: bool,
     /// 0 follows the system, 1 dark, 2 light.
+    /// The Usenet servers NZB files download from, as links (`nntps://USER:PASS@host[:port]
+    /// [?connections=N]`), comma-separated, asked in that order (see [`Settings::nntp_servers`]).
+    /// Saved here, never with the queue or in the history.
+    pub usenet_servers: String,
     pub theme: usize,
     /// Instant transitions and nothing moving by itself; None follows the system (see
     /// [`Settings::reduces_motion`]).
@@ -316,6 +320,7 @@ impl Default for Settings {
             schedule: Schedule::default(),
             categories: hyperfetch_core::postprocess::default_categories(),
             remote_checksum: engine.remote_checksum,
+            usenet_servers: String::new(),
             remote_time: engine.remote_time,
             adaptive: true,
             user_agent: String::new(),
@@ -502,6 +507,14 @@ impl Settings {
 
     /// The S3 key of these settings, when the access key and its secret are set; an endpoint that
     /// is no http(s) address is left out.
+        options.nntp = self.nntp_servers();
+    }
+
+    /// The Usenet servers of [`Settings::usenet_servers`], in their order; a link that is none is
+    /// left out.
+    pub fn nntp_servers(&self) -> Vec<hyperfetch_core::nntp::Server> {
+        let links = self.usenet_servers.split(',').map(str::trim).filter(|l| !l.is_empty());
+        links.enumerate().filter_map(|(n, link)| hyperfetch_core::nntp::Server::from_link(link, n as u32).ok()).collect()
     pub fn s3_key(&self) -> Option<hyperfetch_core::sigv4::S3Key> {
         Some(hyperfetch_core::sigv4::S3Key {
             access_key: non_empty(&self.s3_access_key)?,

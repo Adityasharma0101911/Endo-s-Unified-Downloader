@@ -231,6 +231,8 @@ impl ListOptions {
 enum Descriptor {
     Metalink,
     Torrent,
+    /// A Usenet NZB (see `crate::nntp`).
+    Nzb,
 }
 
 fn descriptor_kind(path: &str) -> Option<Descriptor> {
@@ -239,6 +241,8 @@ fn descriptor_kind(path: &str) -> Option<Descriptor> {
         Some(Descriptor::Metalink)
     } else if path.ends_with(".torrent") {
         Some(Descriptor::Torrent)
+    } else if path.ends_with(".nzb") {
+        Some(Descriptor::Nzb)
     } else {
         None
     }
@@ -529,8 +533,13 @@ pub async fn ingest(tokens: &[impl AsRef<str>], http: &reqwest::Client, options:
             return match source {
                 Source::Remote(typed) => remote_tasks(http, typed, kind, options).await,
                 Source::Local(path) => {
-                    let swarm = std::path::absolute(&path).ok().and_then(|p| Url::from_file_path(p).ok()).filter(|_| options.p2p);
-                    document_tasks(kind, &read_local(&path).await?, None, swarm.as_ref())
+                    let file = std::path::absolute(&path).ok().and_then(|p| Url::from_file_path(p).ok());
+                    let bytes = read_local(&path).await?;
+                    // An NZB's files read it again from where it is.
+                    if let (Descriptor::Nzb, Some(file)) = (kind, &file) {
+                        return crate::nntp::tasks(&bytes, file);
+                    }
+                    document_tasks(kind, &bytes, None, file.filter(|_| options.p2p).as_ref())
                 }
             };
         }
@@ -556,7 +565,7 @@ pub async fn ingest(tokens: &[impl AsRef<str>], http: &reqwest::Client, options:
         }
     }
     if let Some(token) = tokens.iter().map(|t| t.as_ref()).find(|t| descriptor_source(t).is_some()) {
-        return Err(format!("{}: a .metalink, .meta4 or .torrent input must be on its own", token));
+        return Err(format!("{}: a .metalink, .meta4, .torrent or .nzb input must be on its own", token));
     }
     link_task(tokens).map(|task| vec![task])
 }
@@ -737,11 +746,13 @@ async fn remote_tasks(http: &reqwest::Client, typed: Url, kind: Descriptor, opti
     }
 }
 
-/// The tasks the document `bytes` lists (see [`torrent_tasks`] for `remote` and `swarm`).
+/// The tasks the document `bytes` lists (see [`torrent_tasks`] for `remote` and `swarm`; an NZB
+/// is read again from `remote` by its files' downloads).
 fn document_tasks(kind: Descriptor, bytes: &[u8], remote: Option<&Url>, swarm: Option<&Url>) -> Result<Vec<Task>, String> {
     match kind {
         Descriptor::Metalink => metalink_tasks(bytes),
         Descriptor::Torrent => torrent_tasks(bytes, remote, swarm),
+        Descriptor::Nzb => crate::nntp::tasks(bytes, remote.ok_or("an NZB is read from a link or a file")?),
     }
 }
 
@@ -750,6 +761,7 @@ fn parses(kind: Descriptor, bytes: &[u8]) -> bool {
     match kind {
         Descriptor::Metalink => decode_text(bytes).and_then(|text| metalink::parse_metalink(&text)).is_ok(),
         Descriptor::Torrent => torrent::parse_torrent_bytes(bytes).is_ok(),
+        Descriptor::Nzb => crate::nntp::tasks(bytes, &Url::parse("file:///x.nzb").expect("a valid URL")).is_ok(),
     }
 }
 
@@ -791,7 +803,7 @@ async fn fetch(request: reqwest::RequestBuilder, url: &Url) -> Result<Option<(Ve
 
 /// A local document, read only if it is a file no larger than a remote one may be: a renamed
 /// disc image is not loaded into memory, and a pipe or device is not waited on.
-async fn read_local(path: &Path) -> Result<Vec<u8>, String> {
+pub(crate) async fn read_local(path: &Path) -> Result<Vec<u8>, String> {
     let fail = |e: std::io::Error| format!("Cannot read {}: {}", path.display(), e);
     let meta = tokio::fs::metadata(path).await.map_err(fail)?;
     if !meta.is_file() {

@@ -40,6 +40,11 @@ librqbit = { version = "9.0.1", default-features = false, features = ["rust-tls"
 # SFTP downloads (sftp.rs): pure-Rust SSH on the aws-lc-rs that rustls already builds; no compression.
 russh = { version = "0.65", default-features = false, features = ["aws-lc-rs", "rsa"] }
 russh-sftp = "3.0"
+# Usenet over TLS (nntp.rs) and yEnc's CRC-32: crates reqwest and flate2 already build.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+tokio-rustls = { version = "0.26", default-features = false }
+webpki-roots = "1"
+crc32fast = "1"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Time", "Win32_Security"] }
