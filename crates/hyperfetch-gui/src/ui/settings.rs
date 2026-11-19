@@ -677,10 +677,6 @@ fn host_settings(app: &mut App, ui: &mut Ui) {
     let about = "Lists CurseForge mods, files and modpacks through CurseForge's API, which needs your own key \
                  (console.curseforge.com). Sent only to CurseForge; saved in the settings only, never with the queue or in the history.";
     text_setting(ui, "CurseForge API key", about, &mut app.settings.curseforge_key, "Optional", true);
-    let about = "Lists Nexus Mods files with the personal API key of your account. Nexus gives other apps download links \
-                 for premium accounts only; for others the file's page opens in the browser. Sent only to Nexus Mods; saved in \
-                 the settings only, never with the queue or in the history.";
-    text_setting(ui, "Nexus Mods API key", about, &mut app.settings.nexus_key, "Optional", true);
     let about = "A DOI or a publisher's page downloads the paper's legal open copy that Unpaywall knows; Unpaywall asks for \
                  your email address with each request. Sent only to Unpaywall. Without it, only a copy the DOI's own record links.";
     text_setting(ui, "Unpaywall email", about, &mut app.settings.unpaywall_email, "Optional: you@example.org", false);

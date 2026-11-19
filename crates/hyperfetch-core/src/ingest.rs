@@ -151,8 +151,6 @@ pub struct ListOptions {
 pub struct Keys {
     /// CurseForge's API key (see `crate::mods`).
     pub curseforge: Option<String>,
-    /// The personal API key of the user's Nexus Mods account (see `crate::mods`).
-    pub nexus: Option<String>,
     /// The email address Unpaywall's terms ask for, which the user sets (see `crate::papers`).
     pub unpaywall_email: Option<String>,
     /// The API key of the user's itch.io account (see `crate::itch`).
@@ -343,7 +341,7 @@ fn listing_url(token: &str) -> Option<Url> {
         // Maven coordinates as typed (group:artifact[:version]).
         None if crate::packages::coordinates_link(token).is_some() => crate::packages::coordinates_link(token)?,
         // A bucket's s3:// or gs:// link, a WebDAV one, or a Software Heritage ID (swh:1:...).
-        None => Url::parse(token).ok().filter(|u| matches!(u.scheme(), "s3" | "gs" | "webdav" | "webdavs" | "dav" | "davs" | "sftp" | "swh" | "nxm"))?,
+        None => Url::parse(token).ok().filter(|u| matches!(u.scheme(), "s3" | "gs" | "webdav" | "webdavs" | "dav" | "davs" | "sftp" | "swh" | "nxm" | "modpack"))?,
     };
     might_list(&url).then_some(url)
 }
@@ -643,7 +641,7 @@ async fn magnet_tasks(http: &reqwest::Client, token: &str, options: &ListOptions
 /// The downloads the folder, feed or playlist at `url` lists, from the first lister whose `lists`
 /// takes it and that finds a listing there; None when none does.
 async fn list(http: &reqwest::Client, url: &Url, options: &ListOptions) -> Option<Result<Vec<Task>, String>> {
-    // Mods and modpacks (a .mrpack link on any host too).
+    // Mods and modpacks (a `modpack:` link to a .mrpack on any host too).
     if crate::mods::lists(url) {
         return Some(crate::mods::list(http, url, options).await);
     }

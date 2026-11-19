@@ -661,7 +661,7 @@ fn page_kind(url: &Url) -> &'static str {
         || iasearch::lists(url)
         || archives::lists(url)
         || wayback::lists(url)
-        || mods::lists(url)
+        || mods::finds_files(url)
         || oci::reference(url.as_str()).is_some()
         || papers::lists(url)
         || packages::lists(url)
@@ -1072,7 +1072,8 @@ mod tests {
             ("https://web.archive.org/web/*/example.com/*", "files"),
             ("https://web.archive.org/web/2010/http://example.com/a.pdf", "files"),
             ("https://modrinth.com/mod/sodium", "files"),
-            ("https://www.nexusmods.com/skyrimspecialedition/mods/266", "files"),
+            // Its own download button is the way, which the extension hands on.
+            ("https://www.nexusmods.com/skyrimspecialedition/mods/266", "none"),
             ("https://ollama.com/library/llama3.2:3b", "files"),
             ("https://doi.org/10.1371/journal.pone.0000308", "files"),
             ("https://central.sonatype.com/artifact/org.slf4j/slf4j-api", "files"),
