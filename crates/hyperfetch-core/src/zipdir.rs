@@ -424,6 +424,62 @@ fn dos_time(date: u16, time: u16) -> Option<String> {
     valid.then(|| format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}"))
 }
 
+/// Unpacks the whole ZIP `zip` (its bytes: a helper program's release, see `crate::helpers`,
+/// which GNU tar cannot unpack) into the folder `into`: stored and deflated entries only, each
+/// checked against its size and CRC-32. An entry whose path would leave the folder fails it.
+/// Blocking.
+pub(crate) fn unzip(zip: &[u8], into: &std::path::Path) -> Result<(), String> {
+    use std::io::Read;
+    let tail = &zip[zip.len().saturating_sub(TAIL as usize)..];
+    let dir = match end_of_directory(tail)? {
+        End::Directory(dir) => dir,
+        End::Zip64At(at) => zip64_end(usize::try_from(at).ok().and_then(|at| zip.get(at..)).ok_or_else(damaged)?)?,
+    };
+    dir.check(zip.len() as u64)?;
+    let listing = zip.get(dir.offset as usize..(dir.offset + dir.size) as usize).ok_or_else(damaged)?;
+    for entry in entries(listing, dir.entries)? {
+        let Some(path) = entry.local_path() else {
+            if entry.is_folder() {
+                continue;
+            }
+            return Err(format!("{} would be unpacked outside its folder", entry.name));
+        };
+        let target = into.join(path);
+        let write_error = |e: std::io::Error| format!("Cannot write {}: {e}", target.display());
+        if entry.is_folder() {
+            std::fs::create_dir_all(&target).map_err(write_error)?;
+            continue;
+        }
+        if let Some(why) = entry.unsupported() {
+            return Err(why);
+        }
+        let at = usize::try_from(entry.offset).map_err(|_| damaged())?;
+        if u32_at(zip, at) != Some(LOCAL_SIG) {
+            return Err(format!("The ZIP has no file where its directory puts {}", entry.name));
+        }
+        let skip = |offset| u16_at(zip, at + offset).map(usize::from).ok_or_else(damaged);
+        let start = at + LOCAL_LEN as usize + skip(26)? + skip(28)?;
+        let data = start.checked_add(entry.compressed as usize).and_then(|end| zip.get(start..end)).ok_or_else(damaged)?;
+        let mut bytes = Vec::with_capacity(entry.size.min(1 << 30) as usize);
+        if entry.method == DEFLATED {
+            let mut inflated = flate2::read::DeflateDecoder::new(data).take(entry.size + 1);
+            inflated.read_to_end(&mut bytes).map_err(|e| format!("{}'s data is damaged: {e}", entry.name))?;
+        } else {
+            bytes.extend_from_slice(data);
+        }
+        let mut crc = flate2::Crc::new();
+        crc.update(&bytes);
+        if bytes.len() as u64 != entry.size || crc.sum() != entry.crc32 {
+            return Err(format!("{} fails its size or CRC-32 check", entry.name));
+        }
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).map_err(write_error)?;
+        }
+        std::fs::write(&target, &bytes).map_err(write_error)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -557,6 +613,22 @@ mod tests {
     #[test]
     fn cp437_covers_the_high_half() {
         assert_eq!(CP437_HIGH.chars().count(), 128);
+    }
+
+    #[test]
+    fn unzip_unpacks_a_release_and_refuses_paths_out_of_its_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = b"#!/bin/sh\necho hi\n".repeat(50);
+        let zip = packed(&[("tool-1.0/", &b""[..], 0, 0), ("tool-1.0/tool", &program[..], DEFLATED, 0), ("tool-1.0/README.txt", &b"read me"[..], 0, 0)], false);
+        unzip(&zip, dir.path()).unwrap();
+        assert_eq!(std::fs::read(dir.path().join("tool-1.0").join("tool")).unwrap(), program);
+        assert_eq!(std::fs::read(dir.path().join("tool-1.0").join("README.txt")).unwrap(), b"read me");
+        let evil = packed(&[("../evil.txt", &b"x"[..], 0, 0)], false);
+        assert!(unzip(&evil, dir.path()).unwrap_err().contains("outside"));
+        let mut broken = packed(&[("a.txt", &b"abc"[..], 0, 0)], false);
+        let at = broken.windows(3).position(|w| w == b"abc").unwrap();
+        broken[at] = b'x';
+        assert!(unzip(&broken, dir.path()).unwrap_err().contains("CRC-32"));
     }
 
     #[tokio::test]

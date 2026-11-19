@@ -1,3 +1,4 @@
+mod accounts;
 mod cli;
 mod doctor;
 mod download;
@@ -85,7 +86,7 @@ fn run_cli() -> i32 {
         return 0;
     }
     let ran = match args.command {
-        Some(command) => run_detached(tools::execute_subcommand(command)),
+        Some(command) => run_detached(tools::execute_subcommand(command, args.proxy.clone())),
         None => run_detached(app(args)),
     };
     ran.unwrap_or_else(|e| {
@@ -568,6 +569,7 @@ fn job(args: &Args, connections: u64, dir: &Path, task: Task) -> Job {
         live_from_start: args.live_from_start,
         wait_for_video: args.wait_for_video,
         record_seconds: args.record_seconds,
+        streamlink: args.streamlink,
         sections: args.sections.clone(),
         sponsorblock: args.sponsorblock.clone(),
         merge_format: args.merge_format.clone(),

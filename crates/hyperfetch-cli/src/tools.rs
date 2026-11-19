@@ -22,9 +22,12 @@ pub fn preprocess_cli_args(args: Vec<OsString>) -> Vec<OsString> {
         .collect()
 }
 
-/// Execute a subcommand.
-pub async fn execute_subcommand(subcmd: SubCommand) -> i32 {
+/// Execute a subcommand, `proxy` being the one --proxy gave.
+pub async fn execute_subcommand(subcmd: SubCommand, proxy: Option<String>) -> i32 {
     match subcmd {
+        SubCommand::Accounts { action, service, answer, json } => {
+            crate::accounts::run(action, service.as_deref(), answer.as_deref(), json, proxy.as_deref()).await
+        }
         SubCommand::Concat { inputs, input_dir, pattern, output } => {
             run_concat(inputs, input_dir, &pattern, &output)
         }

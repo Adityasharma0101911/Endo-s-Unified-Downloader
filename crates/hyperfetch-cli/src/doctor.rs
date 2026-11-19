@@ -31,7 +31,7 @@ pub async fn run(args: &Args, data_folder: Option<PathBuf>, ui: &Ui) -> i32 {
     // Installed with ffmpeg, where it is.
     let ffprobe = ffmpeg.as_ref().map(|ffmpeg| ffmpeg.with_file_name(if cfg!(windows) { "ffprobe.exe" } else { "ffprobe" }));
     let wanted = [("yt-dlp", ytdlp, "--version"), ("ffmpeg", ffmpeg, "-version"), ("ffprobe", ffprobe.filter(|p| p.is_file()), "-version"), ("gallery-dl", gallery, "--version")];
-    let tools = futures_util::future::join_all(wanted.map(|(name, path, flag)| async move {
+    let mut tools = futures_util::future::join_all(wanted.map(|(name, path, flag)| async move {
         let version = match &path {
             Some(path) => version_of(path, &[flag], PROBE_TIMEOUT).await,
             None => Err("not found".to_string()),
@@ -39,6 +39,15 @@ pub async fn run(args: &Args, data_folder: Option<PathBuf>, ui: &Ui) -> i32 {
         Tool { name, path, version }
     }))
     .await;
+    // The helpers of `accounts`, installed only once a download needs one.
+    for helper in hyperfetch_core::accounts::Service::ALL.iter().filter_map(|s| s.tool()) {
+        let path = tokio::task::spawn_blocking(move || hyperfetch_core::helpers::find(helper)).await.ok().flatten();
+        let version = match &path {
+            Some(path) => version_of(path, helper.version_args, PROBE_TIMEOUT).await,
+            None => Err("not found (installed when first needed)".to_string()),
+        };
+        tools.push(Tool { name: helper.program, path, version });
+    }
     checkup(args, data_folder, &tools, std::env::vars_os(), ui);
     EXIT_OK
 }
