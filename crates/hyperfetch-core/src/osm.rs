@@ -60,17 +60,24 @@ pub async fn list(http: &Client, url: &Url, options: &ListOptions) -> Result<Vec
 }
 
 /// The task of `file`, named as it is, with the MD5 published beside it (`<file>.md5`, as
-/// `md5sum` writes it) when there is one.
+/// `md5sum` writes it) when there is one. An MD5 that cannot be had now leaves the file unchecked,
+/// as a link to it downloads anyway.
 async fn with_md5(http: &Client, file: Url, site: &str) -> Result<Task, String> {
     let name = file.path_segments().and_then(|mut s| s.next_back()).map(|n| percent_encoding::percent_decode_str(n).decode_utf8_lossy().into_owned()).unwrap_or_default();
     let sum = Url::parse(&format!("{file}.md5")).map_err(|e| e.to_string())?;
-    let answer = crate::polite::get(http, &sum, GAP).await?;
-    let checksum = match answer.status() {
-        StatusCode::NOT_FOUND => None,
-        status if !status.is_success() => return Err(crate::polite::refused(site, status)),
-        _ => {
-            let body = crate::archives::body(answer, site).await?;
+    let checksum = match crate::polite::get(http, &sum, GAP).await {
+        Ok(answer) if answer.status().is_success() => {
+            let body = crate::archives::body(answer, site).await.unwrap_or_default();
             String::from_utf8_lossy(&body).split_whitespace().next().and_then(|hex| crate::repos::checksum("md5", hex))
+        }
+        Ok(answer) if answer.status() == StatusCode::NOT_FOUND => None,
+        Ok(answer) => {
+            tracing::info!("{site} answered HTTP {} for {sum}: {name} downloads unchecked", answer.status().as_u16());
+            None
+        }
+        Err(e) => {
+            tracing::info!("{e}: {name} downloads unchecked");
+            None
         }
     };
     Ok(Task { urls: vec![file], name: Some(clean_path([name.as_str()])?), checksum, ..Task::default() })
@@ -117,7 +124,8 @@ async fn region(http: &Client, index: &Url, page: &Url, options: &ListOptions) -
     let mut tasks = Vec::new();
     for region in std::iter::once(this).chain(under.into_iter().take(MAX_REGIONS)) {
         if let Some(file) = region.urls.pbf.clone() {
-            tasks.push(with_md5(http, file, "Geofabrik").await?);
+            // Links its index gives, not the user: the user's headers, cookies and referer stay home.
+            tasks.push(Task { from_document: true, ..with_md5(http, file, "Geofabrik").await? });
         }
     }
     Ok(tasks)
@@ -142,12 +150,13 @@ async fn planet(http: &Client, file: Url, options: &ListOptions) -> Result<Vec<T
         mirrors.push(dated.clone());
     }
     let size = Some(info.total_length);
+    // The mirrors are the torrent's, hosts the user never named: their headers stay home.
     if options.swarm_with_http() && info.total_length >= crate::p2p::SWARM_MIN {
         options.note("Downloading from the planet's torrent swarm and its mirrors at once".to_string());
-        return Ok(vec![Task { urls: [vec![at], mirrors].concat(), name: Some(clean_path([info.name.as_str()])?), size, p2p: true, ..Task::default() }]);
+        return Ok(vec![Task { urls: [vec![at], mirrors].concat(), name: Some(clean_path([info.name.as_str()])?), size, p2p: true, from_document: true, ..Task::default() }]);
     }
     let task = with_md5(http, dated, "OpenStreetMap").await?;
-    Ok(vec![Task { urls: mirrors, size, ..task }])
+    Ok(vec![Task { urls: mirrors, size, from_document: true, ..task }])
 }
 
 #[cfg(test)]
@@ -183,7 +192,9 @@ mod tests {
                     {{"properties":{{"id":"europe","urls":{{"pbf":"{base}/europe-latest.osm.pbf"}}}}}},
                     {{"properties":{{"id":"germany","parent":"europe","urls":{{"pbf":"{base}/europe/germany-latest.osm.pbf"}}}}}},
                     {{"properties":{{"id":"bremen","parent":"germany","urls":{{"pbf":"{base}/europe/germany/bremen-latest.osm.pbf"}}}}}},
-                    {{"properties":{{"id":"berlin","parent":"germany","urls":{{"pbf":"{base}/europe/germany/berlin-latest.osm.pbf"}}}}}}]}}"#)),
+                    {{"properties":{{"id":"berlin","parent":"germany","urls":{{"pbf":"{base}/europe/germany/berlin-latest.osm.pbf"}}}}}},
+                    {{"properties":{{"id":"hamburg","parent":"germany","urls":{{"pbf":"{base}/europe/germany/hamburg-latest.osm.pbf"}}}}}}]}}"#)),
+                "/europe/germany/hamburg-latest.osm.pbf.md5" => (500, String::new(), Vec::new()),
                 "/europe/germany-latest.osm.pbf.md5" => ok("04a445a266cc62177eb37c3bc489268a  germany-latest.osm.pbf\n"),
                 "/europe/germany/bremen-latest.osm.pbf.md5" => ok("14a445a266cc62177eb37c3bc489268a  bremen-latest.osm.pbf\n"),
                 "/pbf/planet-latest.osm.pbf.torrent" => (302, format!("Location: {base}/pbf/planet-261109.osm.pbf.torrent\r\n"), Vec::new()),
@@ -208,10 +219,14 @@ mod tests {
             ("/europe/germany-latest.osm.pbf".to_string(), Some("md5:04a445a266cc62177eb37c3bc489268a".to_string())),
             ("/europe/germany/bremen-latest.osm.pbf".to_string(), Some("md5:14a445a266cc62177eb37c3bc489268a".to_string())),
             ("/europe/germany/berlin-latest.osm.pbf".to_string(), None),
+            // Its MD5 answered 500: the file downloads unchecked rather than not at all.
+            ("/europe/germany/hamburg-latest.osm.pbf".to_string(), None),
         ]);
+        assert!(tasks.iter().all(|t| t.from_document), "the user's headers go to no listed link");
 
         let planet = planet(&http, at("/pbf/planet-latest.osm.pbf"), &options).await.unwrap();
         let task = &planet[0];
+        assert!(task.from_document, "the mirrors are the torrent's");
         assert_eq!(task.urls.iter().map(Url::as_str).collect::<Vec<_>>(), [format!("{base}/mirror/planet-261109.osm.pbf"), format!("{base}/other/planet-261109.osm.pbf")]);
         assert_eq!((task.name.as_deref(), task.size, task.p2p), (Some(std::path::Path::new("planet-261109.osm.pbf")), Some(300), false));
         assert_eq!(task.checksum.as_deref(), Some("md5:62cc0443e92674d338d0a48668efd9b1"));

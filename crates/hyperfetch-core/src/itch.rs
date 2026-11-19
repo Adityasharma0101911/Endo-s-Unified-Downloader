@@ -85,11 +85,13 @@ pub(crate) fn unredirected(options: &ListOptions) -> Result<Client, String> {
     client.build().map_err(|e| format!("cannot create HTTP client: {e}"))
 }
 
-/// A game to list: its id, title and the user's download key for it.
+/// A game to list: its id, title and the user's download key for it, and its page when known
+/// (where its expired links are had again).
 struct Game {
     id: u64,
     title: String,
     key: Option<u64>,
+    page: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -111,6 +113,7 @@ struct ListedGame {
     id: u64,
     #[serde(default)]
     title: String,
+    url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -141,7 +144,7 @@ impl Api {
                 let data = Url::parse(&format!("{}/data.json", page.as_str().trim_end_matches('/'))).map_err(|e| e.to_string())?;
                 let game: Page = public(http, &data).await?.ok_or_else(|| format!("itch.io has no game at {page}"))?;
                 let owned: Value = self.call(&format!("profile/owned-keys?game_ids={}", game.id)).await?;
-                vec![Game { id: game.id, title: game.title, key: owned["owned_keys"][0]["id"].as_u64() }]
+                vec![Game { id: game.id, title: game.title, key: owned["owned_keys"][0]["id"].as_u64(), page: Some(page.to_string()) }]
             }
             Itch::Jam(page) => {
                 let html = crate::archives::body(crate::polite::get(http, &page, GAP).await?, "itch.io").await?;
@@ -176,7 +179,9 @@ impl Api {
                 }
                 let link = self.download(upload.id, &credentials).await?;
                 let name = clean_path([upload.filename.trim()]).or_else(|_| clean_path([upload.id.to_string().as_str()]))?;
-                tasks.push(Task { urls: vec![link], name: Some(name), folder: folder.clone(), size: upload.size, from_document: true, ..Task::default() });
+                // Its link expires: the page is where a download that stopped gets a new one.
+                let referer = game.page.clone();
+                tasks.push(Task { urls: vec![link], name: Some(name), folder: folder.clone(), size: upload.size, from_document: true, referer, ..Task::default() });
             }
         }
         Ok(tasks)
@@ -268,8 +273,9 @@ fn games(listed: Vec<Listed>, owned: bool, cap: usize, options: &ListOptions) ->
         .into_iter()
         .filter_map(|l| {
             let id = l.game.as_ref().map(|g| g.id).or(l.game_id)?;
+            let page = l.game.as_ref().and_then(|g| g.url.clone()).filter(|u| u.starts_with("https://") || u.starts_with("http://"));
             let title = l.game.map(|g| g.title).filter(|t| !t.trim().is_empty()).unwrap_or_else(|| id.to_string());
-            seen.insert(id).then_some(Game { id, title, key: l.id.filter(|_| owned) })
+            seen.insert(id).then_some(Game { id, title, key: l.id.filter(|_| owned), page })
         })
         .collect();
     if all.len() > cap {
@@ -365,6 +371,8 @@ mod tests {
             (format!("{base}/files/13?token=signed"), "soundtrack.zip".into(), Some(300)),
         ]);
         assert!(tasks.iter().all(|t| t.folder.as_deref() == Some(std::path::Path::new("X-Moon")) && t.from_document));
+        // The page goes with each, for the expired-link flow to open.
+        assert!(tasks.iter().all(|t| t.referer.as_deref() == Some(format!("{base}/x-moon").as_str())));
         assert_eq!(hits.lock().get("/private/uploads/11/download?download_key_id=90"), Some(&1), "the download key goes with the download");
 
         let paid = api("secret").list(&http, Itch::Game(Url::parse(&format!("{base}/paid")).unwrap()), &windows).await.unwrap_err();

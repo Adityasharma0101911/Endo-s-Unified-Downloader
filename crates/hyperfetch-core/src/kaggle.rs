@@ -70,8 +70,8 @@ struct Credentials {
 /// The `Authorization` header of the user's `kaggle.json` at `path`, else at its usual place;
 /// None when there is none there. A file the user named that cannot be read is an error.
 fn credentials(path: Option<&str>) -> Result<Option<HeaderValue>, String> {
-    let named = path.map(str::trim).filter(|p| !p.is_empty()).map(PathBuf::from);
     let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
+    let named = path.map(str::trim).filter(|p| !p.is_empty()).map(|p| expand(p, home.as_deref()));
     let Some(file) = named.clone().or_else(|| home.map(|h| PathBuf::from(h).join(".kaggle").join("kaggle.json"))) else { return Ok(None) };
     let text = match std::fs::read(&file) {
         Ok(text) => text,
@@ -83,6 +83,15 @@ fn credentials(path: Option<&str>) -> Result<Option<HeaderValue>, String> {
     let mut value = HeaderValue::from_str(&format!("Basic {basic}")).map_err(|_| format!("{} holds a key that cannot be sent", file.display()))?;
     value.set_sensitive(true);
     Ok(Some(value))
+}
+
+/// `path` with a leading `~` (`~/.kaggle/kaggle.json`, as the setting's hint shows) as `home`.
+fn expand(path: &str, home: Option<&std::ffi::OsStr>) -> PathBuf {
+    let rest = if path == "~" { Some("") } else { path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) };
+    match (rest, home) {
+        (Some(rest), Some(home)) => PathBuf::from(home).join(rest),
+        _ => PathBuf::from(path),
+    }
 }
 
 /// The task of `kaggle`'s archive: the link of Kaggle's storage its download endpoint redirects
@@ -112,7 +121,8 @@ async fn archive(http: &Client, api: &str, kaggle: &Kaggle, auth: Option<HeaderV
     let status = answer.status();
     if status.is_redirection() {
         let link = answer.headers().get(LOCATION).and_then(|l| l.to_str().ok()).and_then(|l| url.join(l).ok()).ok_or("Kaggle sent the download nowhere")?;
-        return Ok(Task { urls: vec![link], name: Some(clean_path([name.as_str()])?), from_document: true, ..Task::default() });
+        // Its link expires in days: the page is where a download that stopped gets a new one.
+        return Ok(Task { urls: vec![link], name: Some(clean_path([name.as_str()])?), from_document: true, referer: Some(page), ..Task::default() });
     }
     let said = crate::archives::body(answer, "Kaggle").await.ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()).and_then(|v| v["message"].as_str().map(str::to_string));
     Err(match (status, kaggle) {
@@ -145,6 +155,12 @@ mod tests {
         let auth = credentials(file.to_str()).unwrap().unwrap();
         assert_eq!(auth.to_str().unwrap(), "Basic bWU6aw==");
         assert!(credentials(dir.path().join("none.json").to_str()).unwrap_err().contains("Cannot read"));
+        // The setting's hint, ~/.kaggle/kaggle.json, as typed.
+        let home = Some(std::ffi::OsStr::new("/home/me"));
+        assert_eq!(expand("~/.kaggle/kaggle.json", home), std::path::Path::new("/home/me").join(".kaggle/kaggle.json"));
+        assert_eq!(expand("~\\k.json", home), std::path::Path::new("/home/me").join("k.json"));
+        assert_eq!(expand("~other/k.json", home), std::path::Path::new("~other/k.json"));
+        assert_eq!(expand("~/k.json", None), std::path::Path::new("~/k.json"));
     }
 
     /// A dataset's archive is where Kaggle redirects, without credentials when there are none; a
@@ -161,6 +177,7 @@ mod tests {
         let dataset = Kaggle::Dataset { owner: "uciml".into(), slug: "iris".into(), version: Some(2) };
         let task = archive(&http, &format!("http://{addr}/api"), &dataset, None).await.unwrap();
         assert_eq!((task.urls[0].as_str(), task.name.as_deref()), ("https://storage.example/iris.zip?sig=1", Some(std::path::Path::new("iris.zip"))));
+        assert_eq!(task.referer.as_deref(), Some("https://www.kaggle.com/datasets/uciml/iris"), "its page, for when its link expires");
 
         let titanic = Kaggle::Competition("titanic".into());
         assert!(archive(&http, &format!("http://{addr}/private"), &titanic, None).await.unwrap_err().contains("need your kaggle.json"));
