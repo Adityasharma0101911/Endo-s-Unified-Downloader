@@ -1282,6 +1282,9 @@ mod tests {
     fn a_changed_setting_flashes_its_row() {
         let mut h = Harness::new();
         h.app.tab = Tab::Settings;
+        // The accounts card reads its statuses off the UI thread; its call for a frame stays out of the check.
+        h.frame(Vec::new());
+        h.wait_for_background();
         assert_eq!(h.frames(40), Duration::MAX, "the cards are in");
         let lit = |h: &Harness| flash(&h.app.ctx, "Downloads at once", h.app.settings.max_concurrent);
         assert_eq!(lit(&h), 0.0);

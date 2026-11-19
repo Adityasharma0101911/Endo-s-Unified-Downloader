@@ -1152,6 +1152,7 @@ mod tests {
         h.app.show_window();
         assert!(h.frames(2) <= SOON, "shown");
         h.click("Settings");
+        h.wait_for_background();
         h.leave();
         assert_eq!(h.frames(40), Duration::MAX, "out of sight");
         h.click("Downloads");

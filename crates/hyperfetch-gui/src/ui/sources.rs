@@ -128,11 +128,10 @@ fn tile(app: &mut App, ui: &mut Ui, kind: &'static Kind) {
         ui.add(egui::Label::new(bold(kind.name).color(p.strong)).truncate());
     });
     ui.add_space(4.0);
-    // Two lines at most: the rest on hover.
-    let text = Rect::from_min_size(ui.cursor().min, Vec2::new(ui.available_width(), 34.0));
-    let mut about = ui.new_child(egui::UiBuilder::new().max_rect(text).layout(Layout::top_down(Align::LEFT)));
-    about.set_clip_rect(text.intersect(ui.clip_rect()));
-    about.add(egui::Label::new(RichText::new(kind.about).small().color(p.muted)).wrap()).on_hover_text(kind.about);
+    // Two lines at most, ending in "…": the rest on hover.
+    let mut about = egui::text::LayoutJob::single_section(kind.about.to_string(), egui::TextFormat::simple(egui::TextStyle::Small.resolve(ui.style()), p.muted));
+    about.wrap.max_rows = 2;
+    ui.add(egui::Label::new(about).wrap()).on_hover_text(kind.about);
     let bottom = Rect::from_min_max(Pos2::new(lifted.left() + 14.0, lifted.bottom() - 40.0), lifted.max - Vec2::splat(12.0));
     let mut row = ui.new_child(egui::UiBuilder::new().max_rect(bottom).layout(Layout::left_to_right(Align::Center)));
     match kind.needs {
