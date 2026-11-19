@@ -3,7 +3,7 @@
 //! lists every kind with an example to try and what it needs (your account, a helper tool). A new
 //! source is a new row of [`KINDS`], not a new screen.
 
-use hyperfetch_core::{archives, cloud, debrid, feeds, folders, gallery, iasearch, mega, oci, packages, repos, shares, torrent, wayback};
+use hyperfetch_core::{archives, cloud, debrid, feeds, folders, gallery, iasearch, itch, mega, oci, packages, repos, shares, torrent, wayback};
 use url::Url;
 
 use super::*;
@@ -110,6 +110,16 @@ pub const KINDS: &[Kind] = &[
         needs: Needs::Nothing,
         choice: Choice::Files,
         matches: |text, url| ends_with(text, url, &[".metalink", ".meta4"]),
+    },
+    Kind {
+        name: "A chunked image",
+        group: "Files & links",
+        glyph: icon::STACK,
+        about: "A casync or desync index: the file or folder it lists, each chunk checked, those already on disk not fetched again.",
+        example: "",
+        needs: Needs::Nothing,
+        choice: Choice::None,
+        matches: |text, url| ends_with(text, url, &[".caibx", ".caidx"]),
     },
     Kind {
         name: "A TV channel list",
@@ -306,6 +316,16 @@ pub const KINDS: &[Kind] = &[
         needs: Needs::Account("Accounts"),
         choice: Choice::Files,
         matches: |text, url| text.trim().starts_with("epic://") || host_is(url, &["store.steampowered.com", "gog.com"]),
+    },
+    Kind {
+        name: "A game from itch.io",
+        group: "Games & mods",
+        glyph: icon::GAME_CONTROLLER,
+        about: "A game's uploads, a jam's entries, a collection or your purchases, with your itch.io API key.",
+        example: "",
+        needs: Needs::Account("itch.io"),
+        choice: Choice::Files,
+        matches: |_, url| web(url).is_some_and(itch::lists),
     },
     Kind {
         name: "A mod or modpack",
