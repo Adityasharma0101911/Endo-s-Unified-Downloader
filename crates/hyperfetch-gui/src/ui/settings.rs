@@ -933,14 +933,15 @@ fn accounts_and_tools(app: &mut App, ui: &mut Ui) {
                 (None, None) => format!("Put {} on PATH ({}).", tool.program, tool.home),
             },
         };
-        if let Some(account) = &status.account {
-            about.push_str(&format!(" Signed in: {account}."));
-        }
         if let Some(note) = &status.note {
             about.push_str(&format!(" {note}"));
         }
         let installable = status.tool.as_ref().is_some_and(|t| t.path.is_none() && t.installs.is_some());
         setting(ui, service.name(), &about, (&status.account, installable), |ui| {
+            if let Some(account) = &status.account {
+                let chip = RichText::new(format!("{} {account}", icon::CHECK_CIRCLE)).small().color(p.green);
+                ui.add(egui::Label::new(chip).truncate()).on_hover_text("Signed in");
+            }
             let sign_in = if service == Service::Cloud { "Add a drive" } else { "Sign in" };
             if !accounts::steps(service).is_empty() && ui.add_enabled(!busy, button(sign_in)).clicked() {
                 let mut state = shared.lock().unwrap();
@@ -960,57 +961,68 @@ fn accounts_and_tools(app: &mut App, ui: &mut Ui) {
     }
     let signing = shared.lock().unwrap().signing;
     if let Some(service) = signing {
-        ui.separator();
-        ui.label(RichText::new(format!("Sign in: {}", service.name())).strong().color(p.text));
-        let (answer, shown) = {
-            let mut state = shared.lock().unwrap();
-            for step in accounts::steps(service) {
-                match step {
-                    Step::Open { url, why } => {
-                        ui.label(RichText::new(why).small().color(p.muted));
-                        ui.hyperlink(url);
-                    }
-                    Step::Paste { what } => {
-                        ui.label(RichText::new(what).small().color(p.muted));
-                        ui.add(egui::TextEdit::singleline(&mut state.answer).desired_width(ui.available_width()));
-                    }
-                    Step::Wait { why } | Step::Show { text: why } => {
-                        ui.label(RichText::new(why).small().color(p.muted));
+        // The sign-in as a card of numbered steps under the rows.
+        ui.add_space(8.0);
+        let frame = egui::Frame::none().fill(p.card).stroke(Stroke::new(1.0, p.border)).rounding(12.0).inner_margin(Margin::same(14.0));
+        frame.show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new(format!("{}  Sign in to {}", icon::KEY, service.name())).strong().color(p.text));
+            ui.add_space(4.0);
+            let step = |ui: &mut Ui, n: usize, text: &str| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(format!("{}.", n + 1)).small().strong().color(p.link));
+                    ui.label(RichText::new(text).small().color(p.muted));
+                });
+            };
+            let (answer, shown) = {
+                let mut state = shared.lock().unwrap();
+                for (n, each) in accounts::steps(service).into_iter().enumerate() {
+                    match each {
+                        Step::Open { url, why } => {
+                            step(ui, n, &why);
+                            ui.hyperlink(url);
+                        }
+                        Step::Paste { what } => {
+                            step(ui, n, &what);
+                            ui.add(egui::TextEdit::singleline(&mut state.answer).desired_width(ui.available_width()));
+                        }
+                        Step::Wait { why } | Step::Show { text: why } => step(ui, n, &why),
                     }
                 }
+                (state.answer.clone(), state.shown.clone())
+            };
+            for text in shown {
+                ui.label(RichText::new(text).monospace().color(p.text));
             }
-            (state.answer.clone(), state.shown.clone())
-        };
-        for text in shown {
-            ui.label(RichText::new(text).monospace().color(p.text));
-        }
-        ui.horizontal(|ui| {
-            if ui.add_enabled(!busy, button("Continue")).clicked() {
-                let (seen, ctx, proxy) = (shared.clone(), ui.ctx().clone(), proxy.clone());
-                let show = move |step: Step| {
-                    let text = match step {
-                        Step::Open { url, why } => format!("{why}: {url}"),
-                        Step::Show { text } => text,
-                        Step::Wait { why } | Step::Paste { what: why } => why,
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if ui.add_enabled(!busy, button("Continue")).clicked() {
+                    let (seen, ctx, proxy) = (shared.clone(), ui.ctx().clone(), proxy.clone());
+                    let show = move |step: Step| {
+                        let text = match step {
+                            Step::Open { url, why } => format!("{why}: {url}"),
+                            Step::Show { text } => text,
+                            Step::Wait { why } | Step::Paste { what: why } => why,
+                        };
+                        seen.lock().unwrap().shown.push(text);
+                        ctx.request_repaint();
                     };
-                    seen.lock().unwrap().shown.push(text);
-                    ctx.request_repaint();
-                };
-                let job = async move { accounts::sign_in(service, &answer, proxy.as_deref(), show).await.map(|who| format!("Signed in to {}: {who}", service.name())) };
-                run(Some(Box::pin(job)), ui.ctx());
-            }
-            if ui.add(button("Close")).clicked() {
-                shared.lock().unwrap().signing = None;
-            }
+                    let job = async move { accounts::sign_in(service, &answer, proxy.as_deref(), show).await.map(|who| format!("Signed in to {}: {who}", service.name())) };
+                    run(Some(Box::pin(job)), ui.ctx());
+                }
+                if ui.add(button("Close")).clicked() {
+                    shared.lock().unwrap().signing = None;
+                }
+            });
         });
     }
     let message = shared.lock().unwrap().message.clone();
     if let Some(message) = message {
-        let (text, color) = match message {
-            Ok(text) => (text, p.green),
-            Err(text) => (text, p.red),
+        let (glyph, text, color) = match message {
+            Ok(text) => (icon::CHECK_CIRCLE, text, p.green),
+            Err(text) => (icon::WARNING_CIRCLE, text, p.red),
         };
-        ui.label(RichText::new(text).small().color(color));
+        ui.add(egui::Label::new(RichText::new(format!("{glyph} {text}")).small().color(color)).wrap());
     }
 }
 

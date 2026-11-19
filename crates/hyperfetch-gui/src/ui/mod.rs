@@ -668,7 +668,9 @@ fn page_title(tab: Tab, ui: &mut Ui) {
 
 /// The speed of every download together over the last minute, a value a second (oldest first).
 fn total_speed_history(app: &App) -> [f64; 60] {
-    let now = Instant::now();
+    // Counted back from the newest sample: the graph moves when a reading comes, never between.
+    let newest = app.jobs.values().filter_map(|view| view.speed_history.back().map(|(at, _)| *at)).max();
+    let now = newest.unwrap_or_else(Instant::now);
     let mut buckets = [0.0f64; 60];
     for view in app.jobs.values() {
         let (mut sums, mut seen) = ([0.0f64; 60], [0u32; 60]);
