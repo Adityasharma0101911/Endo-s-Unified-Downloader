@@ -561,11 +561,6 @@ pub struct Args {
     #[arg(long = "curseforge-key", value_name = "KEY", env = "ENDO_CURSEFORGE_KEY", hide_env_values = true)]
     pub curseforge_key: Option<String>,
 
-    /// Your Nexus Mods personal API key, for Nexus Mods links and nxm:// links (direct links for
-    /// premium accounts; otherwise the file's page to open in the browser)
-    #[arg(long = "nexus-key", value_name = "KEY", env = "ENDO_NEXUS_KEY", hide_env_values = true)]
-    pub nexus_key: Option<String>,
-
     /// Your email address, which Unpaywall asks for: a DOI or a publisher's page then downloads the
     /// paper's legal open copy that Unpaywall knows (without it, only one the DOI's own record links)
     #[arg(long = "unpaywall-email", value_name = "EMAIL", env = "ENDO_UNPAYWALL_EMAIL")]
@@ -1479,8 +1474,9 @@ mod tests {
         assert!(parse(&["--install-ffmpeg", "--no-install-ffmpeg", "u"]).is_err());
         let args = parse(&["--latest", "5", "--subs", " en,es ", "--yes-playlist", "--google-api-key", "k", "u"]).unwrap();
         assert_eq!((args.latest, args.subs.as_deref(), args.google_api_key.as_deref()), (Some(5), Some("en,es"), Some("k")));
-        let args = parse(&["--curseforge-key", "c", "--nexus-key", "n", "--unpaywall-email", "me@example.org", "u"]).unwrap();
-        assert_eq!((args.curseforge_key.as_deref(), args.nexus_key.as_deref()), (Some("c"), Some("n")));
+        let args = parse(&["--curseforge-key", "c", "--unpaywall-email", "me@example.org", "u"]).unwrap();
+        assert_eq!(args.curseforge_key.as_deref(), Some("c"));
+        assert!(parse(&["--nexus-key", "n", "u"]).is_err(), "Nexus Mods' terms forbid a public app taking a personal key");
         assert_eq!(args.unpaywall_email.as_deref(), Some("me@example.org"));
         assert_eq!(parse(&["--itch-key", "i", "u"]).unwrap().itch_key.as_deref(), Some("i"));
         assert_eq!(parse(&["--kaggle-json", "k.json", "u"]).unwrap().kaggle_json.as_deref(), Some("k.json"));

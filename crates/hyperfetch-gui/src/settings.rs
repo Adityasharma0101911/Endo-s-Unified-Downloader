@@ -172,10 +172,9 @@ pub struct Settings {
     /// [?connections=N]`), comma-separated, asked in that order (see [`Settings::nntp_servers`]).
     /// Saved here, never with the queue or in the history.
     pub usenet_servers: String,
-    /// The user's CurseForge API key and Nexus Mods personal API key (see `ingest::Keys`). Saved
-    /// here, never with the queue or in the history.
+    /// The user's CurseForge API key (see `ingest::Keys`). Saved here, never with the queue or in
+    /// the history.
     pub curseforge_key: String,
-    pub nexus_key: String,
     /// The email address Unpaywall asks for, to find a paper's legal open copy (see
     /// `hyperfetch_core::papers`); sent to Unpaywall alone.
     pub unpaywall_email: String,
@@ -352,7 +351,6 @@ impl Default for Settings {
             remote_checksum: engine.remote_checksum,
             usenet_servers: String::new(),
             curseforge_key: String::new(),
-            nexus_key: String::new(),
             unpaywall_email: String::new(),
             itch_key: String::new(),
             kaggle_json: String::new(),
@@ -612,7 +610,7 @@ impl Settings {
             ssh_key: self.ssh_key(),
             formats: self.archive_formats.split(',').map(str::trim).filter(|f| !f.is_empty()).map(str::to_string).collect(),
             max_items: None,
-            keys: hyperfetch_core::ingest::Keys { curseforge: non_empty(&self.curseforge_key), nexus: non_empty(&self.nexus_key), unpaywall_email: non_empty(&self.unpaywall_email), itch: non_empty(&self.itch_key), kaggle: non_empty(&self.kaggle_json) },
+            keys: hyperfetch_core::ingest::Keys { curseforge: non_empty(&self.curseforge_key), unpaywall_email: non_empty(&self.unpaywall_email), itch: non_empty(&self.itch_key), kaggle: non_empty(&self.kaggle_json) },
         }
     }
 

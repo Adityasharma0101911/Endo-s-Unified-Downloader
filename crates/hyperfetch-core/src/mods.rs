@@ -1,12 +1,13 @@
-//! Game mods: Modrinth projects, versions and modpacks (`.mrpack`), CurseForge projects, files and
-//! modpacks through its official API with the user's own key, Thunderstore packages with their
-//! dependencies, and Nexus Mods files with the user's own key. Each file is a task with the size
-//! and hash its service publishes; a modpack's files go to the paths it states, and a task unpacks
-//! its `overrides` folders from the pack (see [`run`]).
+//! Game mods: Modrinth projects, versions and modpacks (a `modpack:` link to a `.mrpack` too),
+//! CurseForge projects, files and modpacks through its official API with the user's own key, and
+//! Thunderstore packages with their dependencies. Each file is a task with the size and hash its
+//! service publishes; a modpack's files go to the paths it states, and a task unpacks its
+//! `overrides` folders from the pack (see [`run`]).
 //!
 //! What a service keeps to its own site stays there: a CurseForge file whose author turned off
-//! downloads by other apps, and a Nexus Mods file for an account without premium (Nexus's API
-//! gives those no link), are reported with the page to open in the browser, not fetched otherwise.
+//! downloads by other apps is reported with the page to open in the browser, not fetched
+//! otherwise. So is every Nexus Mods file: Nexus's API is for the apps it registers, and its
+//! terms forbid a public app using a user's personal key.
 
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -31,7 +32,6 @@ use crate::zipdir::ZipEntry;
 const MODRINTH_API: &str = "https://api.modrinth.com/v2";
 const CURSEFORGE_API: &str = "https://api.curseforge.com/v1";
 const THUNDERSTORE: &str = "https://thunderstore.io";
-const NEXUS_API: &str = "https://api.nexusmods.com/v1";
 /// Between two requests to one of these APIs (Modrinth allows 300 a minute).
 const GAP: Duration = Duration::from_millis(250);
 /// The hosts a .mrpack's files may download from, as Modrinth's format allows.
@@ -42,9 +42,8 @@ const MAX_INDEX: u64 = 16 << 20;
 /// How deep and how many Thunderstore dependencies are followed.
 const MAX_DEPTH: usize = 5;
 const MAX_PACKAGES: usize = 100;
-/// Most files of one Nexus Mods mod asked for a download link.
-const MAX_NEXUS_FILES: usize = 20;
-/// The scheme of the task unpacking a modpack's overrides: `modpack:<the pack's link>#<folders>`.
+/// The scheme of the task unpacking a modpack's overrides, `modpack:<the pack's link>#<folders>`,
+/// and, with no `#`, of a link to a .mrpack the user asks to list (see [`Mod::Pack`]).
 const SCHEME: &str = "modpack";
 /// Modrinth's kinds of project, the first part of a project's path.
 const MODRINTH_KINDS: &[&str] = &["mod", "plugin", "datapack", "resourcepack", "shader", "modpack"];
@@ -57,28 +56,29 @@ const LOADERS: &[&str] = &[
 ];
 const CURSEFORGE_KEY: &str =
     "CurseForge's API needs your own API key (from console.curseforge.com): set it in Settings, or with --curseforge-key";
-const NEXUS_KEY: &str =
-    "Nexus Mods' API needs your own personal API key (from the API keys page of your account on nexusmods.com): set it in Settings, or with --nexus-key";
 
 /// What a mod link is, from its shape.
 #[derive(Debug, PartialEq)]
 enum Mod {
     /// modrinth.com/{mod|plugin|datapack|resourcepack|shader|modpack}/{slug}[/version/{id or number}]
     Modrinth { project: String, version: Option<String> },
-    /// A link to a .mrpack.
+    /// `modpack:<link to a .mrpack>`: a link straight to a .mrpack is a file to download, as any is.
     Pack(Url),
     /// curseforge.com/{game}/{class}/{slug}[/files/{id}]
     CurseForge { game: String, class: String, slug: String, file: Option<u64> },
     /// thunderstore.io/c/{community}/p/{namespace}/{name}[/v/{version}], or /package/{namespace}/{name}[/{version}]
     Thunderstore { namespace: String, name: String, version: Option<String> },
-    /// nexusmods.com/[games/]{game}/mods/{id}[?tab=files&file_id={file}]
+    /// nexusmods.com/[games/]{game}/mods/{id}[?tab=files&file_id={file}], or the
+    /// nxm://{game}/mods/{id}/files/{file}?key=.. link its site's download button makes.
     Nexus { game: String, id: u64, file: Option<u64> },
-    /// nxm://{game}/mods/{id}/files/{file}?key=..&expires=..: the link the download button of Nexus
-    /// Mods' site makes, whose key gives an account without premium its download link.
-    Nxm { game: String, id: u64, file: u64, key: String, expires: String },
 }
 
 fn mod_of(url: &Url) -> Option<Mod> {
+    // With a `#`, it is the task unpacking a pack's overrides (see `overrides_task`).
+    if url.scheme() == SCHEME && url.fragment().is_none() {
+        let pack = Url::parse(url.as_str().strip_prefix(SCHEME)?.strip_prefix(':')?).ok()?;
+        return matches!(pack.scheme(), "http" | "https").then_some(Mod::Pack(pack));
+    }
     let decoded: Vec<String> =
         url.path_segments()?.filter(|s| !s.is_empty()).map(|s| percent_decode_str(s).decode_utf8_lossy().into_owned()).collect();
     let segs: Vec<&str> = decoded.iter().map(String::as_str).collect();
@@ -86,8 +86,7 @@ fn mod_of(url: &Url) -> Option<Mod> {
     let owned = |s: &str| s.to_string();
     if url.scheme() == "nxm" {
         let ["mods", id, "files", file] = segs[..] else { return None };
-        let (key, expires) = (query("key")?, query("expires")?);
-        return Some(Mod::Nxm { game: url.host_str()?.to_string(), id: id.parse().ok()?, file: file.parse().ok()?, key, expires });
+        return Some(Mod::Nexus { game: url.host_str()?.to_string(), id: id.parse().ok()?, file: Some(file.parse().ok()?) });
     }
     if !matches!(url.scheme(), "http" | "https") {
         return None;
@@ -118,14 +117,18 @@ fn mod_of(url: &Url) -> Option<Mod> {
         ("nexusmods.com", [game, "mods", id] | ["games", game, "mods", id]) => {
             Some(Mod::Nexus { game: owned(game), id: id.parse().ok()?, file: query("file_id").and_then(|f| f.parse().ok()) })
         }
-        _ if url.path().to_ascii_lowercase().ends_with(".mrpack") => Some(Mod::Pack(url.clone())),
         _ => None,
     }
 }
 
-/// Whether `url` is a mod, modpack or `.mrpack` link [`list`] reads.
+/// Whether `url` is a mod or modpack link [`list`] reads.
 pub fn lists(url: &Url) -> bool {
     mod_of(url).is_some()
+}
+
+/// Whether [`list`] finds files at `url`, not only the page to open (a Nexus Mods link's).
+pub fn finds_files(url: &Url) -> bool {
+    mod_of(url).is_some_and(|found| !matches!(found, Mod::Nexus { .. }))
 }
 
 /// Whether `url` is the task unpacking a modpack's overrides (see [`run`]).
@@ -133,23 +136,21 @@ pub fn handles(url: &Url) -> bool {
     url.scheme() == SCHEME
 }
 
-/// The files the mod, modpack or `.mrpack` link `url` names: a project's newest version that
+/// The files the mod or modpack link `url` names: a project's newest version that
 /// `options.formats` picks (see [`Pick`]), a version's or file's own, a modpack's files.
 pub async fn list(http: &Client, url: &Url, options: &ListOptions) -> Result<Vec<Task>, String> {
     let pick = Pick::of(&options.formats);
-    let keys = &options.keys;
     let tasks = match mod_of(url) {
         Some(Mod::Modrinth { project, version }) => modrinth(http, MODRINTH_API, &project, version.as_deref(), &pick, options).await?,
-        Some(Mod::Pack(link)) => pack(http, &link, &pick, options).await?,
+        Some(Mod::Pack(link)) => pack(http, &link, &pick, None, options).await?,
         Some(Mod::CurseForge { game, class, slug, file }) => {
-            let cf = CurseForge { http, api: CURSEFORGE_API, key: key(&keys.curseforge, CURSEFORGE_KEY)? };
+            // The key goes to CurseForge's API alone, never on to where it redirects.
+            let keyed = crate::itch::unredirected(options)?;
+            let cf = CurseForge { http, keyed: &keyed, api: CURSEFORGE_API, key: key(&options.keys.curseforge, CURSEFORGE_KEY)? };
             cf.list(&game, &class, &slug, file, &pick, options).await?
         }
         Some(Mod::Thunderstore { namespace, name, version }) => thunderstore(http, THUNDERSTORE, &namespace, &name, version.as_deref(), options).await?,
-        Some(Mod::Nexus { game, id, file }) => nexus(http, NEXUS_API, key(&keys.nexus, NEXUS_KEY)?, &game, id, file, None, options).await?,
-        Some(Mod::Nxm { game, id, file, key: link_key, expires }) => {
-            nexus(http, NEXUS_API, key(&keys.nexus, NEXUS_KEY)?, &game, id, Some(file), Some((link_key.as_str(), expires.as_str())), options).await?
-        }
+        Some(Mod::Nexus { game, id, file }) => return Err(nexus_page(&game, id, file)),
         None => return Err(format!("{url} is not a mod link")),
     };
     if tasks.is_empty() {
@@ -278,7 +279,8 @@ async fn modrinth(http: &Client, api: &str, project: &str, version: Option<&str>
     };
     // A modpack's version is its .mrpack: the files it lists are the downloads.
     if let Some(mrpack) = found.files.iter().find(|f| f.filename.ends_with(".mrpack")) {
-        return pack(http, &mrpack.url, pick, options).await;
+        let sha512 = mrpack.hashes.sha512.as_deref().filter(|hex| hex.len() == 128 && hex.bytes().all(|b| b.is_ascii_hexdigit()));
+        return pack(http, &mrpack.url, pick, sha512, options).await;
     }
     found
         .files
@@ -313,10 +315,11 @@ struct Env {
 }
 
 /// The files of the .mrpack at `link`: its index's, at their paths in a folder named after the
-/// pack, with their hashes, and the task unpacking its overrides (see [`overrides_task`]). A file
-/// the side `pick` names does not use ("unsupported") is left out, and so is one whose links are
-/// all on hosts the format does not allow.
-async fn pack(http: &Client, link: &Url, pick: &Pick, options: &ListOptions) -> Result<Vec<Task>, String> {
+/// pack, with their hashes, and the task unpacking its overrides (see [`overrides_task`]), which
+/// checks the pack against the `sha512` Modrinth gives, if it gives one. A file the side `pick`
+/// names does not use ("unsupported") is left out, and so is one whose links are all on hosts the
+/// format does not allow.
+async fn pack(http: &Client, link: &Url, pick: &Pick, sha512: Option<&str>, options: &ListOptions) -> Result<Vec<Task>, String> {
     let entries = crate::zipdir::list_zip(http, link).await?;
     let index: Index = read_entry(http, link, &entries, "modrinth.index.json").await?;
     let folder = component(index.name.as_deref().unwrap_or("modpack")).or_else(|_| component("modpack"))?;
@@ -341,7 +344,7 @@ async fn pack(http: &Client, link: &Url, pick: &Pick, options: &ListOptions) -> 
     let side = format!("{}-overrides", if pick.server { "server" } else { "client" });
     let dirs = ["overrides", side.as_str()];
     if entries.iter().any(|e| !e.is_folder() && dirs.iter().any(|dir| inside(&e.name, dir).is_some())) {
-        tasks.push(overrides_task(link, &dirs, &folder)?);
+        tasks.push(overrides_task(link, &dirs, &folder, sha512)?);
     }
     Ok(tasks)
 }
@@ -362,23 +365,69 @@ fn inside<'a>(name: &'a str, dir: &str) -> Option<&'a str> {
     name.strip_prefix(dir)?.strip_prefix('/').filter(|rest| !rest.is_empty())
 }
 
-/// The task that unpacks the folders `dirs` of the pack at `link` into the pack's `folder`.
-fn overrides_task(link: &Url, dirs: &[&str], folder: &Path) -> Result<Task, String> {
+/// The task that unpacks the folders `dirs` of the pack at `link` into the pack's `folder`, once
+/// the pack matches `sha512` when given: `modpack:<link>#<dirs>[;sha512=<hex>]`.
+fn overrides_task(link: &Url, dirs: &[&str], folder: &Path, sha512: Option<&str>) -> Result<Task, String> {
     let mut zip = link.clone();
     zip.set_fragment(None);
-    let url = Url::parse(&format!("{SCHEME}:{zip}#{}", dirs.join(","))).map_err(|e| e.to_string())?;
+    let hash = sha512.map(|hex| format!(";sha512={hex}")).unwrap_or_default();
+    let url = Url::parse(&format!("{SCHEME}:{zip}#{}{hash}", dirs.join(","))).map_err(|e| e.to_string())?;
     Ok(Task { urls: vec![url], name: Some(PathBuf::from("overrides")), folder: Some(folder.to_path_buf()), from_document: true, ..Task::default() })
 }
 
-/// The pack's link and the folders an [`overrides_task`] link names.
-fn pack_link(link: &Url) -> Option<(Url, Vec<String>)> {
-    let (zip, dirs) = link.as_str().strip_prefix(SCHEME)?.strip_prefix(':')?.rsplit_once('#')?;
-    Some((Url::parse(zip).ok()?, dirs.split(',').map(|d| percent_decode_str(d).decode_utf8_lossy().into_owned()).collect()))
+/// The pack's link, the folders and the SHA-512 an [`overrides_task`] link names.
+fn pack_link(link: &Url) -> Option<(Url, Vec<String>, Option<String>)> {
+    let (zip, rest) = link.as_str().strip_prefix(SCHEME)?.strip_prefix(':')?.rsplit_once('#')?;
+    let (dirs, sha512) = match rest.split_once(";sha512=") {
+        Some((dirs, hex)) => (dirs, Some(hex.to_string())),
+        None => (rest, None),
+    };
+    Some((Url::parse(zip).ok()?, dirs.split(',').map(|d| percent_decode_str(d).decode_utf8_lossy().into_owned()).collect(), sha512))
+}
+
+/// Most of a pack read to check its SHA-512.
+const MAX_PACK: u64 = 4 << 30;
+
+/// Reads the pack at `zip` whole, writing nothing, and fails unless its SHA-512 is `expected`.
+// shortcut: the overrides are then read again by range, so a server could serve other bytes the second time; read the pack once into a file if that matters.
+async fn check_pack(http: &Client, zip: &Url, expected: &str, cancel: &CancellationToken) -> Result<(), String> {
+    use sha2::Digest;
+    let fail = |e: reqwest::Error| format!("Cannot read the modpack: {}", e.without_url());
+    // Asked as a range from its start, as the pack's other reads are, so that a server answers it
+    // as it answers those; one sending less than the whole pack says so in its Content-Range.
+    let range = format!("bytes=0-{}", MAX_PACK - 1);
+    let mut answer = http.get(zip.clone()).header(reqwest::header::RANGE, range).send().await.and_then(reqwest::Response::error_for_status).map_err(fail)?;
+    if answer.status() == StatusCode::PARTIAL_CONTENT {
+        let header = answer.headers().get(reqwest::header::CONTENT_RANGE).and_then(|v| v.to_str().ok()).unwrap_or_default();
+        let whole = crate::range::ByteRange::parse_content_range(header).is_ok_and(|(served, size)| served.start == 0 && size == Some(served.end + 1));
+        if !whole {
+            return Err("The modpack is larger than the app reads".to_string());
+        }
+    }
+    let (mut hasher, mut read) = (sha2::Sha512::new(), 0u64);
+    loop {
+        let chunk = tokio::select! {
+            _ = cancel.cancelled() => return Err(CANCELLED.to_string()),
+            got = answer.chunk() => got.map_err(fail)?,
+        };
+        let Some(chunk) = chunk else { break };
+        read += chunk.len() as u64;
+        if read > MAX_PACK {
+            return Err("The modpack is larger than the app reads".to_string());
+        }
+        hasher.update(&chunk);
+    }
+    if !format!("{:x}", hasher.finalize()).eq_ignore_ascii_case(expected) {
+        return Err("The modpack does not match the SHA-512 Modrinth gives for it: nothing of it is unpacked".to_string());
+    }
+    Ok(())
 }
 
 /// Unpacks the folders the link of an [`overrides_task`] names from its pack into `save_dir`, at
 /// their paths inside them: each file read out of the pack alone and checked against its CRC-32,
-/// a later folder's over an earlier one's (a side's own overrides over the shared ones).
+/// a later folder's over an earlier one's (a side's own overrides over the shared ones). A file
+/// already in the folder (the user's own settings, an earlier install's) is kept, never unpacked
+/// over, and said in a note.
 pub(crate) async fn run(
     link: &Url,
     http: &Client,
@@ -387,19 +436,33 @@ pub(crate) async fn run(
     snapshots: Option<broadcast::Sender<EngineSnapshot>>,
     cancel: CancellationToken,
 ) -> Result<(PathBuf, bool), String> {
-    let (zip, dirs) = pack_link(link).ok_or("not a modpack's overrides link")?;
+    let (zip, dirs, sha512) = pack_link(link).ok_or("not a modpack's overrides link")?;
+    if let Some(expected) = &sha512 {
+        check_pack(http, &zip, expected, &cancel).await?;
+    }
     let entries = crate::zipdir::list_zip(http, &zip).await?;
-    let chosen: Vec<(&ZipEntry, PathBuf)> = dirs
+    let all: Vec<(&ZipEntry, PathBuf)> = dirs
         .iter()
         .flat_map(|dir| entries.iter().filter(|e| !e.is_folder()).filter_map(move |e| Some((e, crate::repos::relative(inside(&e.name, dir)?)?))))
         .collect();
+    // Of two files for one path, the later folder's.
+    let mut seen = HashSet::new();
+    let mut chosen: Vec<(&ZipEntry, PathBuf)> = all.into_iter().rev().filter(|(_, path)| seen.insert(path.clone())).collect();
+    chosen.reverse();
     let total: u64 = chosen.iter().map(|(e, _)| e.size).sum();
-    let mut done = 0;
+    let (mut done, mut kept) = (0, Vec::new());
     for (entry, path) in chosen {
-        let target = save_dir.join(path);
+        let target = save_dir.join(&path);
         let failed = |e: std::io::Error| format!("Failed to write {}: {e}", target.display());
         if let Some(parent) = target.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(failed)?;
+        }
+        // Held while it is written: another download of the pack writes none of it at once.
+        let claim = crate::engine::claim_target(&target)?;
+        if claim.is_none() || target.exists() {
+            kept.push(path.display().to_string());
+            done += entry.size;
+            continue;
         }
         let part = crate::engine::part_path(&target);
         let mut file = tokio::fs::File::create(&part).await.map_err(failed)?;
@@ -415,11 +478,17 @@ pub(crate) async fn run(
             return Err(e);
         }
         tokio::fs::rename(&part, &target).await.map_err(failed)?;
+        drop(claim);
         done += entry.size;
         if let Some(tx) = &snapshots {
             let progress_ratio = if total > 0 { done as f64 / total as f64 } else { 1.0 };
             let _ = tx.send(EngineSnapshot { total_bytes: total, downloaded_bytes: done, progress_ratio, target_path: Some(save_dir.to_path_buf()), ..Default::default() });
         }
+    }
+    if let (Some(tx), false) = (&snapshots, kept.is_empty()) {
+        let more = if kept.len() > 10 { format!(" and {} more", kept.len() - 10) } else { String::new() };
+        let note = format!("Kept what was already in the folder instead of unpacking the modpack's files over it: {}{more}", kept[..kept.len().min(10)].join(", "));
+        let _ = tx.send(EngineSnapshot { total_bytes: total, downloaded_bytes: total, progress_ratio: 1.0, target_path: Some(save_dir.to_path_buf()), notes: vec![note], ..Default::default() });
     }
     Ok((save_dir.to_path_buf(), true))
 }
@@ -509,23 +578,25 @@ fn loader_id(loader: &str) -> Option<u32> {
     })
 }
 
-/// CurseForge's API at `api`, asked with the user's `key`.
+/// CurseForge's API at `api`, asked with the user's `key` through `keyed`, a client that follows
+/// no redirect (the key would go along); `http` fetches what the API links to.
 struct CurseForge<'a> {
     http: &'a Client,
+    keyed: &'a Client,
     api: &'a str,
     key: &'a str,
 }
 
 impl CurseForge<'_> {
     async fn get<T: DeserializeOwned>(&self, url: Url) -> Result<Option<T>, String> {
-        api(&url, "CurseForge", true, || self.http.get(url.clone()).header("x-api-key", secret(self.key))).await
+        api(&url, "CurseForge", true, || self.keyed.get(url.clone()).header("x-api-key", secret(self.key))).await
     }
 
     /// What CurseForge answers to `body` posted to `path` (its batch lookups).
     async fn post<T: DeserializeOwned>(&self, path: &[&str], body: serde_json::Value) -> Result<T, String> {
         let url = url_at(self.api, path.iter().copied())?;
         let (body, key) = (body.to_string(), secret(self.key));
-        let request = || self.http.post(url.clone()).header("x-api-key", key.clone()).header(CONTENT_TYPE, "application/json").body(body.clone());
+        let request = || self.keyed.post(url.clone()).header("x-api-key", key.clone()).header(CONTENT_TYPE, "application/json").body(body.clone());
         let found: Option<Data<T>> = api(&url, "CurseForge", true, request).await?;
         found.map(|d| d.data).ok_or_else(|| "CurseForge has no such files".to_string())
     }
@@ -617,7 +688,7 @@ impl CurseForge<'_> {
         }
         let overrides = manifest.overrides.as_deref().unwrap_or("overrides");
         if entries.iter().any(|e| !e.is_folder() && inside(&e.name, overrides).is_some()) {
-            tasks.push(overrides_task(&link, &[overrides], &folder)?);
+            tasks.push(overrides_task(&link, &[overrides], &folder, None)?);
         }
         Ok(tasks)
     }
@@ -689,94 +760,14 @@ async fn thunderstore(http: &Client, base: &str, namespace: &str, name: &str, ve
     Ok(tasks)
 }
 
-#[derive(Deserialize)]
-struct NxFiles {
-    files: Vec<NxFile>,
-}
-
-#[derive(Deserialize)]
-struct NxFile {
-    file_id: u64,
-    file_name: String,
-    category_name: Option<String>,
-    size_in_bytes: Option<u64>,
-}
-
-#[derive(Deserialize)]
-struct NxLink {
-    #[serde(rename = "URI")]
-    uri: Url,
-}
-
-/// Nexus Mods' files of the mod `id` of `game`: the file `file`, else its main files (else those
-/// not old or archived), each through the download link Nexus's API gives the user's `key`, or
-/// gives for the key and expiry of an `nxm` link. Those it gives no link (an account without
-/// premium) are reported with their page to open in the browser.
-#[allow(clippy::too_many_arguments)]
-async fn nexus(
-    http: &Client,
-    api_base: &str,
-    key: &str,
-    game: &str,
-    id: u64,
-    file: Option<u64>,
-    nxm: Option<(&str, &str)>,
-    options: &ListOptions,
-) -> Result<Vec<Task>, String> {
-    let site = "Nexus Mods";
-    let keyed = |request: RequestBuilder| {
-        request.header("apikey", secret(key)).header("Application-Name", "Endo's Unified Downloader").header("Application-Version", env!("CARGO_PKG_VERSION"))
-    };
-    let mod_id = id.to_string();
-    let url = url_at(api_base, ["games", game, "mods", &mod_id, "files.json"])?;
-    let listed: NxFiles = api(&url, site, true, || keyed(http.get(url.clone()))).await?.ok_or_else(|| format!("Nexus Mods has no mod {id} of {game}"))?;
-    let category = |f: &NxFile| f.category_name.clone().unwrap_or_default();
-    let main = listed.files.iter().any(|f| category(f) == "MAIN");
-    let chosen: Vec<&NxFile> = listed
-        .files
-        .iter()
-        .filter(|f| match file {
-            Some(wanted) => f.file_id == wanted,
-            None if main => category(f) == "MAIN",
-            None => !matches!(category(f).as_str(), "OLD_VERSION" | "ARCHIVED" | "DELETED"),
-        })
-        .take(MAX_NEXUS_FILES)
-        .collect();
-    if chosen.is_empty() {
-        return Err(format!("Nexus Mods lists no such file of mod {id} of {game}"));
-    }
-    let (mut tasks, mut browser) = (Vec::new(), Vec::new());
-    for f in chosen {
-        let file_id = f.file_id.to_string();
-        let mut link = url_at(api_base, ["games", game, "mods", &mod_id, "files", &file_id, "download_link.json"])?;
-        if let Some((link_key, expires)) = nxm {
-            link.query_pairs_mut().append_pair("key", link_key).append_pair("expires", expires);
-        }
-        let answer = crate::polite::send(&link, GAP, || keyed(http.get(link.clone()))).await?;
-        let links: Vec<NxLink> = match answer.status() {
-            // Its API gives links to premium accounts only, and for an nxm link's key.
-            StatusCode::FORBIDDEN | StatusCode::GONE => Vec::new(),
-            StatusCode::UNAUTHORIZED => return Err(format!("{site} refused your API key (HTTP 401): check it in Settings")),
-            status if !status.is_success() => return Err(crate::polite::refused(site, status)),
-            _ => serde_json::from_slice(&crate::archives::body(answer, site).await?).map_err(|_| format!("{site} answered with something the app cannot read"))?,
-        };
-        if links.is_empty() {
-            browser.push(format!("https://www.nexusmods.com/{game}/mods/{id}?tab=files&file_id={file_id}"));
-            continue;
-        }
-        tasks.push(Task { urls: links.into_iter().map(|l| l.uri).collect(), name: Some(component(&f.file_name)?), size: f.size_in_bytes, from_document: true, ..Task::default() });
-    }
-    if !browser.is_empty() {
-        let why = format!(
-            "Nexus Mods gives other apps download links only for premium accounts: open {} and use its download button (the browser extension then hands the file to the app)",
-            browser.join(", ")
-        );
-        if tasks.is_empty() {
-            return Err(why);
-        }
-        options.note(why);
-    }
-    Ok(tasks)
+/// Why a Nexus Mods link is not downloaded, and the page of its files (the file `file`'s, if
+/// given) to download it from in the browser: Nexus's API is for the apps Nexus registers, and
+/// its acceptable use policy forbids a public app using a user's personal API key.
+fn nexus_page(game: &str, id: u64, file: Option<u64>) -> String {
+    let file = file.map(|f| format!("&file_id={f}")).unwrap_or_default();
+    format!(
+        "Nexus Mods lets only the apps it registers use its API: open https://www.nexusmods.com/{game}/mods/{id}?tab=files{file} and use its download button (the browser extension then hands the file to the app)"
+    )
 }
 
 #[cfg(test)]
@@ -846,8 +837,12 @@ mod tests {
         assert_eq!(link("https://modrinth.com/mod/sodium"), modrinth("sodium", None));
         assert_eq!(link("https://modrinth.com/modpack/fabulously-optimized/versions?g=1.21.1"), modrinth("fabulously-optimized", None));
         assert_eq!(link("https://modrinth.com/plugin/luckperms/version/v5.4.145-bukkit"), modrinth("luckperms", Some("v5.4.145-bukkit")));
+        // A link straight to a .mrpack is a file to download; `modpack:` before it lists the pack.
         let pack = Url::parse("https://cdn.modrinth.com/data/1KVo5zza/versions/x/Pack%201.0.MRPACK").unwrap();
-        assert_eq!(mod_of(&pack), Some(Mod::Pack(pack.clone())));
+        assert_eq!(mod_of(&pack), None);
+        assert_eq!(link(&format!("modpack:{pack}")), Some(Mod::Pack(pack.clone())));
+        assert_eq!(link(&format!("modpack:{pack}#overrides")), None, "the overrides task");
+        assert_eq!(link("modpack:file:///C:/pack.mrpack"), None);
         assert_eq!(
             link("https://www.curseforge.com/minecraft/mc-mods/jei/files/5846880"),
             Some(Mod::CurseForge { game: "minecraft".into(), class: "mc-mods".into(), slug: "jei".into(), file: Some(5846880) })
@@ -861,8 +856,10 @@ mod tests {
         assert_eq!(link("https://www.nexusmods.com/games/stardewvalley/mods/2400"), Some(Mod::Nexus { game: "stardewvalley".into(), id: 2400, file: None }));
         assert_eq!(
             link("nxm://skyrimspecialedition/mods/266/files/1000172397?key=k1&expires=1700000000&user_id=1"),
-            Some(Mod::Nxm { game: "skyrimspecialedition".into(), id: 266, file: 1000172397, key: "k1".into(), expires: "1700000000".into() })
+            Some(Mod::Nexus { game: "skyrimspecialedition".into(), id: 266, file: Some(1000172397) })
         );
+        let url = |s: &str| Url::parse(s).unwrap();
+        assert!(!finds_files(&url("https://www.nexusmods.com/games/stardewvalley/mods/2400")) && finds_files(&url("https://modrinth.com/mod/sodium")));
         for other in [
             "https://modrinth.com/mods?q=sodium",
             "https://modrinth.com/mod/sodium/gallery",
@@ -872,8 +869,9 @@ mod tests {
             "https://thunderstore.io/package/download/RiskofThunder/HookGenPatcher/1.2.9/",
             "https://thunderstore.io/c/riskofrain2/p/RiskofThunder/HookGenPatcher/wiki/",
             "https://www.nexusmods.com/skyrimspecialedition/mods/",
-            "nxm://skyrimspecialedition/mods/266/files/1",
+            "nxm://skyrimspecialedition/mods/266",
             "https://example.com/pack.zip",
+            "https://example.com/pack.mrpack",
         ] {
             assert_eq!(link(other), None, "{other}");
         }
@@ -900,6 +898,7 @@ mod tests {
             {"path":"mods/elsewhere.jar","hashes":{"sha1":"0000000000000000000000000000000000000003"},"downloads":["https://example.com/e.jar"],"fileSize":30},
             {"path":"../escape.jar","hashes":{},"downloads":["https://cdn.modrinth.com/data/x/e.jar"]}]}"#;
         let mrpack = zip(&[("modrinth.index.json", &index[..]), ("overrides/config/a.toml", b"x = 1"), ("server-overrides/server.properties", b"motd=hi")]);
+        let sha512 = { use sha2::Digest; format!("{:x}", sha2::Sha512::digest(&mrpack)) };
         let host = Arc::new(std::sync::OnceLock::<String>::new());
         let named = Arc::clone(&host);
         let (addr, hits) = serve(move |path, range| match path {
@@ -931,7 +930,7 @@ mod tests {
         // A SHA-512 that is not one leaves the SHA-1.
         assert_eq!(tasks[0].checksum.as_deref(), Some("sha1:0000000000000000000000000000000000000001"));
         assert_eq!(tasks[2].urls[0].as_str(), format!("modpack:http://{addr}/tiny.mrpack#overrides,client-overrides"));
-        let server = pack(&http(), &link, &terms(&["server"]), &options).await.unwrap();
+        let server = pack(&http(), &link, &terms(&["server"]), None, &options).await.unwrap();
         assert_eq!(server.len(), 2, "the client-only file is left out");
         assert!(server[1].urls[0].as_str().ends_with("#overrides,server-overrides"));
 
@@ -942,6 +941,49 @@ mod tests {
         assert_eq!(std::fs::read(dir.path().join("config").join("a.toml")).unwrap(), b"x = 1");
         assert_eq!(std::fs::read(dir.path().join("server.properties")).unwrap(), b"motd=hi");
         assert!(hits.lock().get("/tiny.mrpack").is_some());
+
+        // With the SHA-512 Modrinth gives, a pack that does not match unpacks nothing.
+        let checked = pack(&http(), &link, &terms(&[]), Some(&sha512), &options).await.unwrap();
+        let overrides = &checked.last().unwrap().urls[0];
+        assert!(overrides.as_str().ends_with(&format!("#overrides,client-overrides;sha512={sha512}")));
+        let fresh = tempfile::tempdir().unwrap();
+        run(overrides, &http(), None, fresh.path(), None, CancellationToken::new()).await.unwrap();
+        assert!(fresh.path().join("config").join("a.toml").is_file());
+        let wrong = Url::parse(&overrides.as_str().replace(&sha512[..8], "00000000")).unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let refused = run(&wrong, &http(), None, other.path(), None, CancellationToken::new()).await.unwrap_err();
+        assert!(refused.contains("does not match the SHA-512"), "{refused}");
+        assert_eq!(std::fs::read_dir(other.path()).unwrap().count(), 0);
+    }
+
+    /// A modpack's overrides never go over a file already in the folder, which is kept and said in
+    /// a note; entries that would leave the folder (`..`) are left out, and of two folders' files
+    /// for one path the later folder's is unpacked.
+    #[tokio::test]
+    async fn overrides_keep_files_already_there_and_stay_in_their_folder() {
+        let pack = zip(&[
+            ("overrides/config/a.toml", b"pack's"),
+            ("overrides/options.txt", b"shared"),
+            ("overrides/../escape.txt", b"no"),
+            ("overrides/x/../../escape2.txt", b"no"),
+            ("client-overrides/options.txt", b"client's"),
+        ]);
+        let (addr, _) = serve(move |path, range| if path == "/p.mrpack" { part(&pack, range) } else { missing() }).await;
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("Pack");
+        std::fs::create_dir_all(folder.join("config")).unwrap();
+        std::fs::write(folder.join("config").join("a.toml"), b"mine").unwrap();
+        let link = Url::parse(&format!("modpack:http://{addr}/p.mrpack#overrides,client-overrides")).unwrap();
+        let (tx, mut rx) = broadcast::channel(64);
+        run(&link, &http(), None, &folder, Some(tx), CancellationToken::new()).await.unwrap();
+        assert_eq!(std::fs::read(folder.join("config").join("a.toml")).unwrap(), b"mine");
+        assert_eq!(std::fs::read(folder.join("options.txt")).unwrap(), b"client's");
+        assert!(!dir.path().join("escape.txt").exists() && !dir.path().join("escape2.txt").exists() && !folder.join("escape.txt").exists());
+        let mut notes = Vec::new();
+        while let Ok(snapshot) = rx.try_recv() {
+            notes.extend(snapshot.notes);
+        }
+        assert!(notes.iter().any(|n| n.starts_with("Kept what was already in the folder") && n.contains("a.toml")), "{notes:?}");
     }
 
     /// CurseForge answers with the user's key: a file link is that file with its SHA-1, a file its
@@ -972,7 +1014,8 @@ mod tests {
         .await;
         host.set(addr.to_string()).unwrap();
         let api = format!("http://{addr}/v1");
-        let cf = CurseForge { http: &http(), api: &api, key: "key" };
+        let keyed = crate::itch::unredirected(&ListOptions::default()).unwrap();
+        let cf = CurseForge { http: &http(), keyed: &keyed, api: &api, key: "key" };
         let (options, pick) = (ListOptions::default(), Pick::default());
         let [jar] = &cf.list("minecraft", "mc-mods", "jei", Some(5), &pick, &options).await.unwrap()[..] else { panic!("one file") };
         assert_eq!((jar.urls[0].as_str(), jar.size), ("https://edge.forgecdn.net/files/5/jei.jar", Some(42)));
@@ -988,6 +1031,14 @@ mod tests {
         assert_eq!(tasks[2].urls[0].as_str(), format!("modpack:http://{addr}/pack.zip#overrides"));
         let keyless = list(&http(), &Url::parse("https://www.curseforge.com/minecraft/mc-mods/jei").unwrap(), &ListOptions::default()).await.unwrap_err();
         assert_eq!(keyless, CURSEFORGE_KEY);
+
+        // The key goes to CurseForge's API alone: a redirect to another host is not followed.
+        let (elsewhere, seen) = serve(|_, _| json(r#"{"data":[]}"#)).await;
+        let (moved, _) = serve(move |_, _| (302, format!("Location: http://{elsewhere}/stolen\r\n"), Vec::new())).await;
+        let api = format!("http://{moved}/v1");
+        let cf = CurseForge { http: &http(), keyed: &keyed, api: &api, key: "key" };
+        assert!(cf.list("minecraft", "mc-mods", "jei", Some(5), &pick, &options).await.is_err());
+        assert!(seen.lock().is_empty(), "nothing reached the other host");
     }
 
     /// A Thunderstore package lists its dependencies' packages too, each once, at the versions it
@@ -1019,33 +1070,14 @@ mod tests {
         assert_eq!(thunderstore(&http(), &format!("http://{addr}"), "No", "Such", Some("1.0.0"), &options).await.unwrap_err(), "Thunderstore has no package No-Such 1.0.0");
     }
 
-    /// Nexus Mods lists a mod's main files; a file its API gives no link (no premium) is its page
-    /// to open, and an nxm link's key and expiry go with the request for its link.
+    /// A Nexus Mods link, or an nxm:// link, is its file's page to open in the browser: Nexus's API
+    /// is for the apps it registers, and nothing is asked of it.
     #[tokio::test]
-    async fn nexus_files_need_a_link_from_its_api() {
-        let (addr, hits) = serve(|path, _| match path {
-            "/v1/games/skyrim/mods/266/files.json" => json(
-                r#"{"files":[{"file_id":1,"file_name":"Main-1.7z","category_name":"MAIN","size_in_bytes":100},
-                    {"file_id":2,"file_name":"Old.7z","category_name":"OLD_VERSION"},{"file_id":3,"file_name":"Main-2.7z","category_name":"MAIN"}]}"#,
-            ),
-            "/v1/games/skyrim/mods/266/files/1/download_link.json" => json(r#"[{"name":"Nexus CDN","short_name":"Nexus CDN","URI":"https://cf-files.nexus-cdn.com/1/Main-1.7z?md5=x"}]"#),
-            "/v1/games/skyrim/mods/266/files/3/download_link.json" => (403, String::new(), br#"{"code":403,"message":"premium only"}"#.to_vec()),
-            "/v1/games/skyrim/mods/266/files/3/download_link.json?key=k&expires=9" => json(r#"[{"URI":"https://cf-files.nexus-cdn.com/3/Main-2.7z"}]"#),
-            _ => missing(),
-        })
-        .await;
-        let api = format!("http://{addr}/v1");
-        let (tx, notes) = std::sync::mpsc::channel();
-        let options = ListOptions { notes: Some(tx), ..ListOptions::default() };
-        let [main] = &nexus(&http(), &api, "key", "skyrim", 266, None, None, &options).await.unwrap()[..] else { panic!("one file has a link") };
-        assert_eq!((main.name.clone().unwrap(), main.size), (PathBuf::from("Main-1.7z"), Some(100)));
-        assert!(notes.try_iter().any(|n| n.text.contains("https://www.nexusmods.com/skyrim/mods/266?tab=files&file_id=3")));
-        let premium = nexus(&http(), &api, "key", "skyrim", 266, Some(3), None, &options).await.unwrap_err();
-        assert!(premium.starts_with("Nexus Mods gives other apps download links only for premium accounts"), "{premium}");
-        let [nxm] = &nexus(&http(), &api, "key", "skyrim", 266, Some(3), Some(("k", "9")), &options).await.unwrap()[..] else { panic!("the nxm key gives a link") };
-        assert_eq!(nxm.urls[0].as_str(), "https://cf-files.nexus-cdn.com/3/Main-2.7z");
-        assert!(hits.lock().get("/v1/games/skyrim/mods/266/files/2/download_link.json").is_none(), "an old file is not asked for");
-        let keyless = list(&http(), &Url::parse("https://www.nexusmods.com/skyrim/mods/266").unwrap(), &ListOptions::default()).await.unwrap_err();
-        assert_eq!(keyless, NEXUS_KEY);
+    async fn nexus_links_are_their_pages_to_open() {
+        let options = ListOptions::default();
+        let page = list(&http(), &Url::parse("https://www.nexusmods.com/skyrim/mods/266").unwrap(), &options).await.unwrap_err();
+        assert!(page.contains("open https://www.nexusmods.com/skyrim/mods/266?tab=files and use its download button"), "{page}");
+        let nxm = list(&http(), &Url::parse("nxm://skyrim/mods/266/files/3?key=k&expires=9").unwrap(), &options).await.unwrap_err();
+        assert!(nxm.contains("https://www.nexusmods.com/skyrim/mods/266?tab=files&file_id=3") && !nxm.contains("key=k"), "{nxm}");
     }
 }
