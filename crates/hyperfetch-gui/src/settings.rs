@@ -169,6 +169,10 @@ pub struct Settings {
     /// [?connections=N]`), comma-separated, asked in that order (see [`Settings::nntp_servers`]).
     /// Saved here, never with the queue or in the history.
     pub usenet_servers: String,
+    /// The user's CurseForge API key and Nexus Mods personal API key (see `ingest::Keys`). Saved
+    /// here, never with the queue or in the history.
+    pub curseforge_key: String,
+    pub nexus_key: String,
     /// Look each downloaded file's SHA-256 up on VirusTotal (the hash only, never the file).
     pub virustotal_check: bool,
     /// 0 follows the system, 1 dark, 2 light.
@@ -321,6 +325,8 @@ impl Default for Settings {
             categories: hyperfetch_core::postprocess::default_categories(),
             remote_checksum: engine.remote_checksum,
             usenet_servers: String::new(),
+            curseforge_key: String::new(),
+            nexus_key: String::new(),
             remote_time: engine.remote_time,
             adaptive: true,
             user_agent: String::new(),
@@ -562,6 +568,7 @@ impl Settings {
             ssh_key: self.ssh_key(),
             formats: self.archive_formats.split(',').map(str::trim).filter(|f| !f.is_empty()).map(str::to_string).collect(),
             max_items: None,
+            keys: hyperfetch_core::ingest::Keys { curseforge: non_empty(&self.curseforge_key), nexus: non_empty(&self.nexus_key) },
         }
     }
 

@@ -53,6 +53,7 @@ pub mod concat_server;
 pub mod muxer;
 pub mod doctor;
 pub mod nntp;
+pub mod mods;
 #[cfg(test)]
 pub(crate) mod netsim;
 #[cfg(test)]

@@ -448,7 +448,9 @@ pub struct Args {
     /// Only these files of an Internet Archive item, collection or search, or formats of a Project
     /// Gutenberg book: formats or extensions, comma-separated ("pdf,epub", "Text PDF"), and for the
     /// Internet Archive "original" (uploaded) or "derivative" (made by archive.org). By default an
-    /// item's uploaded files and a book's every format
+    /// item's uploaded files and a book's every format. For a mod project (Modrinth, CurseForge), the
+    /// game versions and loaders its newest version is picked by ("1.21.1,fabric"), and "server" for
+    /// a modpack's server side
     #[arg(long = "formats", value_name = "LIST", value_delimiter = ',')]
     pub formats: Vec<String>,
 
@@ -518,6 +520,15 @@ pub struct Args {
     /// checksums; without it the public folder page is read, which may not show every file
     #[arg(long = "google-api-key", value_name = "KEY", env = "ENDO_GOOGLE_API_KEY", hide_env_values = true)]
     pub google_api_key: Option<String>,
+
+    /// Your CurseForge API key (console.curseforge.com), for CurseForge mod, file and modpack links
+    #[arg(long = "curseforge-key", value_name = "KEY", env = "ENDO_CURSEFORGE_KEY", hide_env_values = true)]
+    pub curseforge_key: Option<String>,
+
+    /// Your Nexus Mods personal API key, for Nexus Mods links and nxm:// links (direct links for
+    /// premium accounts; otherwise the file's page to open in the browser)
+    #[arg(long = "nexus-key", value_name = "KEY", env = "ENDO_NEXUS_KEY", hide_env_values = true)]
+    pub nexus_key: Option<String>,
 
     /// Show download history and exit
     #[arg(long = "history", conflicts_with_all = ["urls", "input_file", "verify"])]
@@ -1372,6 +1383,8 @@ mod tests {
         assert!(parse(&["--install-ffmpeg", "--no-install-ffmpeg", "u"]).is_err());
         let args = parse(&["--latest", "5", "--subs", " en,es ", "--yes-playlist", "--google-api-key", "k", "u"]).unwrap();
         assert_eq!((args.latest, args.subs.as_deref(), args.google_api_key.as_deref()), (Some(5), Some("en,es"), Some("k")));
+        let args = parse(&["--curseforge-key", "c", "--nexus-key", "n", "u"]).unwrap();
+        assert_eq!((args.curseforge_key.as_deref(), args.nexus_key.as_deref()), (Some("c"), Some("n")));
         assert!(parse(&["--latest", "0", "u"]).is_err());
         assert!(parse(&["--subs", " ", "u"]).is_err());
         assert!(parse(&["--subs", "en, es", "u"]).is_err());
