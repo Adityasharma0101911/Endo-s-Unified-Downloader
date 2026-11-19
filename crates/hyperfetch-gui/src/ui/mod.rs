@@ -704,37 +704,12 @@ fn pulse_bar(app: &mut App, ui: &mut Ui) {
     let paused = items.iter().any(|item| item.status == QueueItemStatus::Paused);
     let shown = anim::roll(&ctx, egui::Id::new("total speed"), speed as f32).max(0.0);
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 52.0), Sense::hover());
-    let mut bar = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(Layout::left_to_right(Align::Center)));
-    let ui = &mut bar;
-    ui.spacing_mut().item_spacing.x = 10.0;
-    // The number: arrow, speed, unit; idle, a quiet word.
-    let (number, unit) = if running > 0 {
-        let text = format_bytes(shown as u64);
-        match text.rsplit_once(' ') {
-            Some((n, unit)) => (n.to_string(), format!("{unit}/s")),
-            None => (text, "/s".to_string()),
-        }
-    } else {
-        ("Idle".to_string(), String::new())
-    };
-    let arrow = if running > 0 { p.link } else { p.dim };
-    anim::icon(ui, icon::ARROW_DOWN, 20.0, arrow, 1.0, 0.0);
-    ui.add(egui::Label::new(RichText::new(number).font(FontId::new(26.0, semibold())).color(if running > 0 { p.strong } else { p.muted })).selectable(false));
-    if !unit.is_empty() {
-        ui.add(egui::Label::new(RichText::new(unit).color(p.muted)).selectable(false));
-    }
-    spark(ui, &total_speed_history(app), running > 0);
-    ui.add_space(8.0);
-    for (count, word, filter) in [(running, "running", 1usize), (waiting, "waiting", 2), (done, "done", 4)] {
-        let text = RichText::new(format!("{count} {word}")).color(if count > 0 { p.text } else { p.dim });
-        let tip = format!("Show the {word} downloads");
-        if ui.add(egui::Button::new(text).frame(false)).on_hover_text(tip).clicked() {
-            app.tab = Tab::Downloads;
-            app.focused = None;
-            app.queue_filter = filter;
-        }
-    }
-    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+    // The buttons on the right first: what they leave is the room for the rest, which gives up
+    // the graph first and then the counts, the last first, as the window narrows.
+    let mut right = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(Layout::right_to_left(Align::Center)));
+    right.spacing_mut().item_spacing.x = 10.0;
+    {
+        let ui = &mut right;
         let search = button(RichText::new(format!("{}  {}", icon::MAGNIFYING_GLASS, keys("Ctrl+K"))).color(p.muted));
         if ui.add(search).on_hover_text("Find an action, a setting or a download").clicked() {
             command::open(ui.ctx());
@@ -749,7 +724,60 @@ fn pulse_bar(app: &mut App, ui: &mut Ui) {
                 app.resume_all();
             }
         }
+    }
+    let end = (right.min_rect().left() - 16.0).max(rect.left());
+    let mut bar = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_max(rect.min, Pos2::new(end, rect.max.y))).layout(Layout::left_to_right(Align::Center)));
+    let ui = &mut bar;
+    ui.spacing_mut().item_spacing.x = 10.0;
+    // The number: arrow, speed, unit; idle, a quiet word.
+    let (number, unit) = if running > 0 {
+        let text = format_bytes(shown as u64);
+        match text.rsplit_once(' ') {
+            Some((n, unit)) => (n.to_string(), format!("{unit}/s")),
+            None => (text, "/s".to_string()),
+        }
+    } else {
+        ("Idle".to_string(), String::new())
+    };
+    let width = |text: &str, font: FontId| ui.painter().layout_no_wrap(text.to_string(), font, Color32::WHITE).size().x + 10.0;
+    let body = egui::TextStyle::Button.resolve(ui.style());
+    let counts = [(running, "running", 1usize), (waiting, "waiting", 2), (done, "done", 4)].map(|(count, word, filter)| {
+        let text = format!("{count} {word}");
+        let wide = width(&text, body.clone()) + 2.0 * ui.spacing().button_padding.x;
+        (count, word, filter, text, wide)
     });
+    let mut room = end - rect.left() - 30.0 - width(&number, FontId::new(26.0, semibold())) - if unit.is_empty() { 0.0 } else { width(&unit, body.clone()) };
+    let graph = room - 114.0 >= counts.iter().map(|count| count.4).sum::<f32>();
+    if graph {
+        room -= 114.0;
+    }
+    let mut fit = 0;
+    for count in &counts {
+        if count.4 > room {
+            break;
+        }
+        room -= count.4;
+        fit += 1;
+    }
+    let arrow = if running > 0 { p.link } else { p.dim };
+    anim::icon(ui, icon::ARROW_DOWN, 20.0, arrow, 1.0, 0.0);
+    ui.add(egui::Label::new(RichText::new(number).font(FontId::new(26.0, semibold())).color(if running > 0 { p.strong } else { p.muted })).selectable(false));
+    if !unit.is_empty() {
+        ui.add(egui::Label::new(RichText::new(unit).color(p.muted)).selectable(false));
+    }
+    if graph {
+        spark(ui, &total_speed_history(app), running > 0);
+        ui.add_space(8.0);
+    }
+    for (count, word, filter, text, _) in counts.into_iter().take(fit) {
+        let text = RichText::new(text).color(if count > 0 { p.text } else { p.dim });
+        let tip = format!("Show the {word} downloads");
+        if ui.add(egui::Button::new(text).frame(false)).on_hover_text(tip).clicked() {
+            app.tab = Tab::Downloads;
+            app.focused = None;
+            app.queue_filter = filter;
+        }
+    }
 }
 
 /// The last minute of `speeds` as a small filled line, 96 points wide; its newest point lit
@@ -758,7 +786,8 @@ fn pulse_bar(app: &mut App, ui: &mut Ui) {
 fn spark(ui: &mut Ui, speeds: &[f64; 60], live: bool) {
     let p = palette(ui);
     let (rect, _) = ui.allocate_exact_size(Vec2::new(96.0, 28.0), Sense::hover());
-    if !ui.is_rect_visible(rect) {
+    // A minute of nothing draws nothing: a flat line under "Idle" reads as an underline.
+    if !ui.is_rect_visible(rect) || speeds.iter().all(|&speed| speed <= 0.0) {
         return;
     }
     let peak = speeds.iter().copied().fold(0.0, f64::max).max(1.0);

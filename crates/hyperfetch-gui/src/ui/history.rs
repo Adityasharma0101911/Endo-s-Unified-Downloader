@@ -338,9 +338,6 @@ fn library_row(app: &App, ui: &mut Ui, entry: &HistoryEntry, today: i64, offset:
             ui.spacing_mut().item_spacing.y = 2.0;
             ui.add(egui::Label::new(bold(&entry.file_name).color(p.strong)).truncate()).on_hover_text(&entry.file_name);
             let mut meta = Vec::new();
-            if let Some(word) = word {
-                meta.push(word.to_string());
-            }
             if entry.file_size > 0 {
                 meta.push(format_bytes(entry.file_size));
             }
@@ -355,7 +352,17 @@ fn library_row(app: &App, ui: &mut Ui, entry: &HistoryEntry, today: i64, offset:
                 meta.push(format!("BLAKE3 {}", truncate_chars(hash, 12)));
             }
             let path = entry.file_path.display().to_string();
-            let line = egui::Label::new(RichText::new(meta.join("  ·  ")).small().color(if word.is_some() { color } else { p.muted })).truncate();
+            // Its state in its colour, the rest quiet.
+            let font = egui::TextStyle::Small.resolve(ui.style());
+            let mut job = egui::text::LayoutJob::default();
+            if let Some(word) = word {
+                job.append(word, 0.0, egui::TextFormat::simple(font.clone(), color));
+                if !meta.is_empty() {
+                    job.append("  ·  ", 0.0, egui::TextFormat::simple(font.clone(), p.muted));
+                }
+            }
+            job.append(&meta.join("  ·  "), 0.0, egui::TextFormat::simple(font, p.muted));
+            let line = egui::Label::new(job).truncate();
             ui.add(line).on_hover_text(match &entry.status {
                 HistoryStatus::Failed(error) => format!("{error}\n{path}"),
                 _ => path,
