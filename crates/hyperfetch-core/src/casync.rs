@@ -726,7 +726,7 @@ mod tests {
     #[tokio::test]
     async fn an_index_larger_than_the_disk_or_the_limit_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        let (step, count) = (64u64 << 20, crate::media::free_space(dir.path()).unwrap() / (64 << 20) + 64);
+        let (step, count) = (64u64 << 20, crate::media::free_space(dir.path()).unwrap() / (64 << 20) + 1024);
         let mut huge: Vec<u8> = [48, INDEX, SHA512_256, 16 << 20, 32 << 20, 64 << 20, u64::MAX, TABLE].iter().flat_map(|w| w.to_le_bytes()).collect();
         for n in 1..=count {
             huge.extend((n * step).to_le_bytes());
