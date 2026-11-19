@@ -356,6 +356,17 @@ mod tests {
         assert!(link_of("https://example.com/a.zip").is_none());
     }
 
+    /// Signing out of Steam says what stays: on Windows DepotDownloader's remembered sign-in, and
+    /// how to revoke it.
+    #[tokio::test]
+    async fn signing_out_of_steam_says_what_stays() {
+        let done = sign_out(Service::Steam, None, Proxy::default()).await.unwrap();
+        match cfg!(windows) {
+            true => assert!(done.starts_with("Signed out of Steam. ") && done.contains("stays") && done.contains("Deauthorize all other devices"), "{done}"),
+            false => assert_eq!(done, "Signed out of Steam"),
+        }
+    }
+
     /// The links of each account are refused before anything goes online when the proxy setting
     /// cannot be followed, and a drive's link only names a drive the app has set up.
     #[tokio::test]
