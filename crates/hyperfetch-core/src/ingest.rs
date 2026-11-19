@@ -157,6 +157,8 @@ pub struct Keys {
     pub unpaywall_email: Option<String>,
     /// The API key of the user's itch.io account (see `crate::itch`).
     pub itch: Option<String>,
+    /// Where the user's `kaggle.json` is (see `crate::kaggle`); its usual place when None.
+    pub kaggle: Option<String>,
 }
 
 impl std::fmt::Debug for Keys {
@@ -328,6 +330,8 @@ pub fn might_list(url: &Url) -> bool {
         || crate::papers::lists(url)
         || crate::packages::lists(url)
         || crate::itch::lists(url)
+        || crate::kaggle::lists(url)
+        || crate::osm::lists(url)
 }
 
 /// `token` as a link [`might_list`] takes, a "leaving this site" link replaced by its target.
@@ -686,6 +690,13 @@ async fn list(http: &reqwest::Client, url: &Url, options: &ListOptions) -> Optio
     // An itch.io game, jam, collection or the user's library, through its API with their key.
     if crate::itch::lists(url) {
         return Some(crate::itch::list(http, url, options).await);
+    }
+    // A Kaggle dataset or competition, a Geofabrik extract or region, or a planet file.
+    if crate::kaggle::lists(url) {
+        return Some(crate::kaggle::list(http, url, options).await);
+    }
+    if crate::osm::lists(url) {
+        return Some(crate::osm::list(http, url, options).await);
     }
     if repos::lists(url) {
         let auth = options.auth.as_ref().filter(|(link, _)| link == url).map(|(_, header)| header.as_str());
