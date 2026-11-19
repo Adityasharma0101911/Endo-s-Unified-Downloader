@@ -705,7 +705,8 @@ fn pulse_bar(app: &mut App, ui: &mut Ui) {
     let shown = anim::roll(&ctx, egui::Id::new("total speed"), speed as f32).max(0.0);
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 52.0), Sense::hover());
     // The buttons on the right first: what they leave is the room for the rest, which gives up
-    // the graph first and then the counts, the last first, as the window narrows.
+    // the counts, the last first, and then the graph as the window narrows (the list's filters
+    // count them too).
     let mut right = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(Layout::right_to_left(Align::Center)));
     right.spacing_mut().item_spacing.x = 10.0;
     {
@@ -747,7 +748,7 @@ fn pulse_bar(app: &mut App, ui: &mut Ui) {
         (count, word, filter, text, wide)
     });
     let mut room = end - rect.left() - 30.0 - width(&number, FontId::new(26.0, semibold())) - if unit.is_empty() { 0.0 } else { width(&unit, body.clone()) };
-    let graph = room - 114.0 >= counts.iter().map(|count| count.4).sum::<f32>();
+    let graph = room - 114.0 >= counts[0].4;
     if graph {
         room -= 114.0;
     }
@@ -770,7 +771,8 @@ fn pulse_bar(app: &mut App, ui: &mut Ui) {
         ui.add_space(8.0);
     }
     for (count, word, filter, text, _) in counts.into_iter().take(fit) {
-        let text = RichText::new(text).color(if count > 0 { p.text } else { p.dim });
+        // Over the background's brightest part dim text would fall under 4.5:1; muted keeps it.
+        let text = RichText::new(text).color(if count > 0 { p.text } else { p.muted });
         let tip = format!("Show the {word} downloads");
         if ui.add(egui::Button::new(text).frame(false)).on_hover_text(tip).clicked() {
             app.tab = Tab::Downloads;
@@ -825,7 +827,7 @@ fn limit_switch(app: &mut App, ui: &mut Ui) {
     let p = palette(ui);
     let s = &app.settings;
     let Some(limit) = crate::settings::speed_limit_bytes(s.max_speed, s.max_speed_in_mb) else {
-        if ui.add(egui::Button::new(RichText::new(format!("{} No speed limit", icon::GAUGE)).color(p.dim)).frame(false)).on_hover_text("Set one in Settings").clicked() {
+        if ui.add(egui::Button::new(RichText::new(format!("{} No speed limit", icon::GAUGE)).color(p.muted)).frame(false)).on_hover_text("Set one in Settings").clicked() {
             app.tab = Tab::Settings;
             app.settings_search = "Speed limit".to_string();
         }
@@ -850,7 +852,7 @@ fn limit_switch(app: &mut App, ui: &mut Ui) {
     if toggle(ui, &mut on).on_hover_text(tip).changed() {
         app.settings.speed_limit_on = on;
     }
-    ui.add(egui::Label::new(RichText::new(text).color(if on { p.text } else { p.dim })).selectable(false));
+    ui.add(egui::Label::new(RichText::new(text).color(if on { p.text } else { p.muted })).selectable(false));
 }
 
 /// Where it is kept whether the list of keyboard shortcuts shows.
