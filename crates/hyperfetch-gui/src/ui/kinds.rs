@@ -3,7 +3,7 @@
 //! lists every kind with an example to try and what it needs (your account, a helper tool). A new
 //! source is a new row of [`KINDS`], not a new screen.
 
-use hyperfetch_core::{archives, cloud, debrid, feeds, folders, gallery, iasearch, itch, mega, oci, packages, repos, shares, torrent, wayback};
+use hyperfetch_core::{archives, cloud, debrid, feeds, folders, gallery, iasearch, itch, kaggle, mega, oci, osm, packages, repos, shares, torrent, wayback};
 use url::Url;
 
 use super::*;
@@ -51,7 +51,7 @@ pub struct Kind {
 }
 
 /// The Sources page's groups, in order.
-pub const GROUPS: [&str; 7] = ["Files & links", "Video & audio", "Torrents & Usenet", "Code, packages & models", "Science & archives", "Cloud & accounts", "Games & mods"];
+pub const GROUPS: [&str; 7] = ["Files & links", "Video & audio", "Torrents & Usenet", "Code, packages & models", "Science, archives & maps", "Cloud & accounts", "Games & mods"];
 
 fn host_is(url: Option<&Url>, hosts: &[&str]) -> bool {
     url.and_then(Url::host_str).is_some_and(|host| {
@@ -235,7 +235,7 @@ pub const KINDS: &[Kind] = &[
     },
     Kind {
         name: "A paper",
-        group: "Science & archives",
+        group: "Science, archives & maps",
         glyph: icon::BOOK_OPEN,
         about: "The open-access PDF of a DOI, arXiv, PubMed Central or bioRxiv paper; no paywall is bypassed.",
         example: "https://arxiv.org/abs/1706.03762",
@@ -248,8 +248,28 @@ pub const KINDS: &[Kind] = &[
         },
     },
     Kind {
+        name: "A map extract",
+        group: "Science, archives & maps",
+        glyph: icon::MAP_TRIFOLD,
+        about: "OpenStreetMap regions from Geofabrik and the planet file, checked against their published MD5.",
+        example: "https://download.geofabrik.de/europe/monaco-latest.osm.pbf",
+        needs: Needs::Nothing,
+        choice: Choice::None,
+        matches: |_, url| web(url).is_some_and(osm::lists),
+    },
+    Kind {
+        name: "A dataset",
+        group: "Science, archives & maps",
+        glyph: icon::DATABASE,
+        about: "A Kaggle dataset as one archive, or a competition's data with your kaggle.json; public datasets need no sign-in.",
+        example: "",
+        needs: Needs::Account("kaggle.json"),
+        choice: Choice::None,
+        matches: |_, url| web(url).is_some_and(kaggle::lists),
+    },
+    Kind {
         name: "An archive item",
-        group: "Science & archives",
+        group: "Science, archives & maps",
         glyph: icon::ARCHIVE,
         about: "Internet Archive items, the Wayback Machine, Zenodo, Kiwix, Project Gutenberg and more.",
         example: "https://archive.org/details/BigBuckBunny_124",
