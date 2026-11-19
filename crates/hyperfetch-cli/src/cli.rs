@@ -535,6 +535,11 @@ pub struct Args {
     #[arg(long = "nexus-key", value_name = "KEY", env = "ENDO_NEXUS_KEY", hide_env_values = true)]
     pub nexus_key: Option<String>,
 
+    /// Your email address, which Unpaywall asks for: a DOI or a publisher's page then downloads the
+    /// paper's legal open copy that Unpaywall knows (without it, only one the DOI's own record links)
+    #[arg(long = "unpaywall-email", value_name = "EMAIL", env = "ENDO_UNPAYWALL_EMAIL")]
+    pub unpaywall_email: Option<String>,
+
     /// Show download history and exit
     #[arg(long = "history", conflicts_with_all = ["urls", "input_file", "verify"])]
     pub history: bool,
@@ -1417,8 +1422,9 @@ mod tests {
         assert!(parse(&["--install-ffmpeg", "--no-install-ffmpeg", "u"]).is_err());
         let args = parse(&["--latest", "5", "--subs", " en,es ", "--yes-playlist", "--google-api-key", "k", "u"]).unwrap();
         assert_eq!((args.latest, args.subs.as_deref(), args.google_api_key.as_deref()), (Some(5), Some("en,es"), Some("k")));
-        let args = parse(&["--curseforge-key", "c", "--nexus-key", "n", "u"]).unwrap();
+        let args = parse(&["--curseforge-key", "c", "--nexus-key", "n", "--unpaywall-email", "me@example.org", "u"]).unwrap();
         assert_eq!((args.curseforge_key.as_deref(), args.nexus_key.as_deref()), (Some("c"), Some("n")));
+        assert_eq!(args.unpaywall_email.as_deref(), Some("me@example.org"));
         assert!(parse(&["--latest", "0", "u"]).is_err());
         assert!(parse(&["--subs", " ", "u"]).is_err());
         assert!(parse(&["--subs", "en, es", "u"]).is_err());

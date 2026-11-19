@@ -1076,7 +1076,7 @@ async fn swisstransfer_list(http: &reqwest::Client, base: &str, link: &str, pass
 
 /// The `record` elements of an XML listing, each its child elements' text by name, and the text of
 /// the elements outside them (the next page's token, an error's code).
-fn xml_records(xml: &str, record: &[u8]) -> (Vec<HashMap<String, String>>, HashMap<String, String>) {
+pub(crate) fn xml_records(xml: &str, record: &[u8]) -> (Vec<HashMap<String, String>>, HashMap<String, String>) {
     let mut reader = Reader::from_str(xml.trim_start_matches('\u{feff}'));
     reader.config_mut().trim_text(true);
     let (mut records, mut outside, mut current, mut tag) = (Vec::new(), HashMap::new(), None::<HashMap<String, String>>, String::new());

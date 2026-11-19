@@ -153,6 +153,8 @@ pub struct Keys {
     pub curseforge: Option<String>,
     /// The personal API key of the user's Nexus Mods account (see `crate::mods`).
     pub nexus: Option<String>,
+    /// The email address Unpaywall's terms ask for, which the user sets (see `crate::papers`).
+    pub unpaywall_email: Option<String>,
 }
 
 impl std::fmt::Debug for Keys {
@@ -321,12 +323,15 @@ pub fn might_list(url: &Url) -> bool {
         || folders::directory_lists(url)
         || crate::sftp::handles(url)
         || crate::mods::lists(url)
+        || crate::papers::lists(url)
 }
 
 /// `token` as a link [`might_list`] takes, a "leaving this site" link replaced by its target.
 fn listing_url(token: &str) -> Option<Url> {
     let url = match http_url(token) {
         Some(url) => resolver::unwrap_redirect(&url).unwrap_or(url),
+        // A DOI as it is typed (10.xxxx/..., doi:10.xxxx/...).
+        None if crate::papers::doi_link(token).is_some() => crate::papers::doi_link(token)?,
         // A bucket's s3:// or gs:// link, a WebDAV one, or a Software Heritage ID (swh:1:...).
         None => Url::parse(token).ok().filter(|u| matches!(u.scheme(), "s3" | "gs" | "webdav" | "webdavs" | "dav" | "davs" | "sftp" | "swh" | "nxm"))?,
     };
@@ -662,6 +667,10 @@ async fn list(http: &reqwest::Client, url: &Url, options: &ListOptions) -> Optio
         if let Some(listed) = crate::wayback::list(http, url, options).await {
             return Some(listed);
         }
+    }
+    // A paper's DOI, its publisher's page, PubMed Central or a preprint: its legal open copy.
+    if crate::papers::lists(url) {
+        return Some(crate::papers::list(http, url, options).await);
     }
     if repos::lists(url) {
         let auth = options.auth.as_ref().filter(|(link, _)| link == url).map(|(_, header)| header.as_str());
