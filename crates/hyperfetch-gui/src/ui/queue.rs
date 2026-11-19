@@ -60,7 +60,10 @@ fn detail_contents(app: &mut App, ui: &mut Ui, item: &QueueItem, in_place: bool)
     progress_block(app, ui, item);
     ui.add_space(8.0);
     let (status, color) = status_line(app, item, &p);
-    ui.add(egui::Label::new(RichText::new(status).color(color)).wrap());
+    // A failure says itself in its alert above; an expired link says more here.
+    if !matches!(item.status, QueueItemStatus::Failed(_)) || item.link_expired() {
+        ui.add(egui::Label::new(RichText::new(status).color(color)).wrap());
+    }
     if takes_new_link(item) {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
