@@ -23,7 +23,7 @@ use hyperfetch_core::ingest::{
 use hyperfetch_core::TrackChoice;
 use hyperfetch_core::media::{self, find_ffmpeg_path, is_supported_media_site, BrowserCookieSource};
 use hyperfetch_core::p2p;
-use hyperfetch_core::{sitemirror, wayback};
+use hyperfetch_core::{savepage, sitemirror, wayback};
 use hyperfetch_core::paste::{self, PastedLink};
 use hyperfetch_core::postprocess::PostOptions;
 use hyperfetch_core::resolver::SmartResolver;
@@ -149,6 +149,9 @@ async fn app(mut args: Args) -> i32 {
             Err(e) => return usage(&e),
         }
     }
+    if args.warc.is_some() && args.mirror.is_none() && args.save_page.is_none() && args.wayback.is_none() {
+        return usage("--warc goes with --mirror, --save-page or --wayback");
+    }
     // Each prints or writes something else than the downloads of an interactive prompt.
     let other = args.json || args.spider || args.dry_run || args.preview || args.stdout || args.list_tracks || args.start_at.is_some();
     if args.urls.is_empty() && args.input_file.is_none() && other {
@@ -174,6 +177,9 @@ async fn app(mut args: Args) -> i32 {
     }
     if let Some(site) = &args.mirror {
         return mirror_site(&args, site, &ui, &shutdown, &http).await;
+    }
+    if let Some(page) = &args.save_page {
+        return save_page(&args, page, &ui, &shutdown, &http).await;
     }
     let code = if args.urls.is_empty() && args.input_file.is_none() {
         interactive(&args, &ui, &shutdown, &http, at_terminal().then_some(find_ffmpeg_path as Finder), prompt).await
@@ -898,8 +904,8 @@ async fn batch(args: &Args, ui: &Ui, shutdown: &Shutdown, http: &reqwest::Client
         return exit_code(None, failed);
     }
     if !captures.is_empty() {
-        let at = dir.clone();
-        if let Err(e) = tokio::task::spawn_blocking(move || wayback::write_manifest(&at, &captures)).await.map_err(|e| e.to_string()).and_then(|r| r.map_err(|e| e.to_string())) {
+        let (at, lines) = (dir.clone(), captures.clone());
+        if let Err(e) = tokio::task::spawn_blocking(move || wayback::write_manifest(&at, &lines)).await.map_err(|e| e.to_string()).and_then(|r| r.map_err(|e| e.to_string())) {
             ui.error(&format!("Cannot write {}: {e}", dir.join(wayback::MANIFEST).display()));
         }
     }
@@ -911,6 +917,18 @@ async fn batch(args: &Args, ui: &Ui, shutdown: &Shutdown, http: &reqwest::Client
     let can_ask = !ui.quiet() && !ui.json && args.input_file.as_deref() != Some(Path::new("-")) && !stdin && at_terminal();
     let ffmpeg = ffmpeg_question(args, &jobs, can_ask.then_some(find_ffmpeg_path as Finder), ui);
     failed += run_jobs(jobs, args.jobs as usize, ui, shutdown, ffmpeg).await;
+    // The captures downloaded go into the WARC file, dated when the Wayback Machine took them.
+    if let Some(warc) = args.warc.clone().filter(|_| !captures.is_empty()) {
+        let (at, shown) = (dir.clone(), warc.display().to_string());
+        match tokio::task::spawn_blocking(move || hyperfetch_core::warc::wayback_resources(&at, &captures, &warc)).await.map_err(|e| e.to_string()).and_then(|r| r) {
+            Ok(written) if !ui.quiet() => ui.error(&format!("[OK] {written} capture(s) in {shown}")),
+            Ok(_) => {}
+            Err(e) => {
+                ui.error(&format!("[FAILED] {shown}: {e}"));
+                failed += 1;
+            }
+        }
+    }
     exit_code(shutdown.requested(), failed)
 }
 
@@ -931,6 +949,7 @@ async fn mirror_site(args: &Args, site: &str, ui: &Ui, shutdown: &Shutdown, http
         delay: Duration::from_secs_f64(args.mirror_delay),
         max_pages: args.mirror_max_pages,
         max_bytes: args.mirror_max_size,
+        warc: args.warc.clone(),
     };
     let quiet = ui.quiet();
     let tell = |url: &str| {
@@ -962,6 +981,40 @@ async fn mirror_site(args: &Args, site: &str, ui: &Ui, shutdown: &Shutdown, http
         }
         Err(e) => {
             ui.error(&format!("[FAILED] {}: {}", redact_url(site), e));
+            shutdown.requested().unwrap_or(EXIT_FAILED)
+        }
+    }
+}
+
+/// --save-page: saves the web page at `page` as one HTML file in the download directory (see
+/// `savepage`).
+async fn save_page(args: &Args, page: &str, ui: &Ui, shutdown: &Shutdown, http: &reqwest::Client) -> i32 {
+    let url = match Url::parse(page.trim()) {
+        Ok(url) if matches!(url.scheme(), "http" | "https") => url,
+        _ => return usage(&format!("--save-page takes a web page's http(s) link, not '{}'", redact_url(page))),
+    };
+    let dir = match prepare_dir(args.dir.as_deref().unwrap_or(Path::new("."))).await {
+        Ok(dir) => dir,
+        Err(e) => return usage(&e),
+    };
+    let options = savepage::SaveOptions { keep_scripts: args.keep_scripts, max_bytes: args.max_filesize.unwrap_or(64 << 20), warc: args.warc.clone() };
+    let mut stop = shutdown.subscribe();
+    let saved = tokio::select! {
+        saved = savepage::save_page(http, &url, &dir, &options) => saved,
+        () = stop_requested(&mut stop) => Err("stopped".to_string()),
+    };
+    match saved {
+        Ok(saved) => {
+            if !ui.quiet() {
+                for (url, why) in &saved.left {
+                    ui.error(&format!("Left as a link: {} ({})", truncate(url, 80), why));
+                }
+                ui.error(&format!("[OK] {}, {}, {} file(s) put in", saved.file.display(), HumanBytes(saved.bytes), saved.inlined));
+            }
+            EXIT_OK
+        }
+        Err(e) => {
+            ui.error(&format!("[FAILED] {}: {}", redact_url(page), e));
             shutdown.requested().unwrap_or(EXIT_FAILED)
         }
     }

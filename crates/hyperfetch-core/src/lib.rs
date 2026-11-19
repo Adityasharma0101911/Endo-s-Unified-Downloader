@@ -62,6 +62,8 @@ pub mod epic;
 pub mod gog;
 pub mod steam;
 pub mod livestream;
+pub mod warc;
+pub mod savepage;
 #[cfg(test)]
 pub(crate) mod netsim;
 #[cfg(test)]

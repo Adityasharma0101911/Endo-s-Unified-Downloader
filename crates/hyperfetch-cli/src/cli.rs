@@ -512,6 +512,21 @@ pub struct Args {
     #[arg(long = "mirror-max-size", value_name = "SIZE", default_value = "1G", value_parser = parse_bytes, requires = "mirror")]
     pub mirror_max_size: u64,
 
+    /// Save the web page at URL as one HTML file that opens offline: its images, style sheets,
+    /// fonts and iframes put into it, its scripts left out (--keep-scripts keeps them), as its
+    /// robots.txt allows; at most --max-filesize (64M by default) fetched in all
+    #[arg(long = "save-page", value_name = "URL", conflicts_with_all = ["mirror", "wayback", "input_file", "urls", "dry_run", "spider", "preview", "stdout", "list_tracks"])]
+    pub save_page: Option<String>,
+
+    /// Keep the scripts of the page --save-page saves (put into it too)
+    #[arg(long = "keep-scripts", requires = "save_page")]
+    pub keep_scripts: bool,
+
+    /// Also write what --mirror, --save-page or --wayback downloads into the WARC file FILE
+    /// (.warc.gz, each answer as received; added to when it exists), with a CDXJ index beside it
+    #[arg(long = "warc", value_name = "FILE")]
+    pub warc: Option<PathBuf>,
+
     /// Record the channels of a channel list (an M3U of stream links) whose name or group PATTERN
     /// matches, in any case (* stands for any run of characters); repeat it for several
     #[arg(long = "channel", value_name = "PATTERN", value_parser = parse_pattern)]
