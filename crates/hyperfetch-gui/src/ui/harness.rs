@@ -751,7 +751,6 @@ mod tests {
             let mut h = scene(SCREEN, &|h| {
                 h.app.url_input = page.to_string();
                 h.app.saving_page = Some(page.to_string());
-                h.app.notice = Some(Ok("Saving the page from www.gnu.org as one file…".to_string()));
             });
             still(&mut h, "page-saving");
             let mut h = scene(SCREEN, &|h| {

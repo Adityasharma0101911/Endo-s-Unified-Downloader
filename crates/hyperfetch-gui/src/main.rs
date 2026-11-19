@@ -622,7 +622,6 @@ impl App {
         }
         let link = url.to_string();
         self.saving_page = Some(link.clone());
-        self.notice = Some(Ok(format!("Saving the page from {} as one file…", url.host_str().unwrap_or("the web"))));
         let options = self.settings.download_options(std::slice::from_ref(&url), "", "");
         let dir = PathBuf::from(&self.settings.save_dir);
         let save = hyperfetch_core::savepage::SaveOptions { keep_scripts: self.keep_scripts, ..Default::default() };

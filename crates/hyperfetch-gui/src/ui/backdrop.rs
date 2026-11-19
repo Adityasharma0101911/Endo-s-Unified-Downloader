@@ -97,13 +97,13 @@ pub fn depth(n: u32) -> (Layer, f32) {
 /// The colour of a mote of `layer` and its brightness at Normal, then at most, for the theme.
 /// The most is what text over the brightest wash still reads on at 4.5:1: muted text over a far
 /// and a mid mote at once, headings over a far and a near one (see the test).
-fn look(layer: Layer, dark: bool, warm: bool) -> (Color32, f32, f32) {
+fn look(layer: Layer, dark: bool) -> (Color32, f32, f32) {
     let (color, most) = match (layer, dark) {
         (Layer::Far, true) => (Color32::from_rgb(150, 175, 255), 0.07),
         (Layer::Mid, true) => (Color32::from_rgb(200, 215, 255), 0.08),
         (Layer::Near, true) => (Color32::from_rgb(235, 240, 255), 0.30),
-        // On paper: a pale blue or a warm out-of-focus disc at the back, blues nearer.
-        (Layer::Far, false) if warm => (Color32::from_rgb(232, 164, 156), 0.14),
+        // On paper: pale blue out-of-focus discs at the back (a warm one reads as a stain over
+        // the warm tone), deeper blues nearer.
         (Layer::Far, false) => (Color32::from_rgb(150, 176, 226), 0.14),
         (Layer::Mid, false) => (Color32::from_rgb(110, 140, 215), 0.13),
         (Layer::Near, false) => (Color32::from_rgb(70, 100, 190), 0.40),
@@ -276,7 +276,7 @@ fn motes(painter: &egui::Painter, rect: Rect, field: &Field, p: &Palette, dark: 
             pos += away / d * 16.0 * front * z;
             lit = front;
         }
-        let (color, normal, most) = look(layer, dark, hash(n, 10) < 0.3);
+        let (color, normal, most) = look(layer, dark);
         let color = color.lerp_to_gamma(pull, 0.6 * field.flow).lerp_to_gamma(p.red, 0.6 * tint);
         // How much of its light a mote shows: the near ones breathe the most.
         let (depth_of_twinkle, rate) = match layer {
@@ -413,13 +413,12 @@ pub(super) mod tests {
             // On paper the blue tone darkens the page more than the warm one.
             let tone = if dark { first } else { second };
             let wash = over(p.bg, tone.to_opaque(), tone.a() as f32 / 255.0);
-            let most = |layer| (look(layer, dark, false).0, look(layer, dark, false).2);
+            let most = |layer| (look(layer, dark).0, look(layer, dark).2);
             let (far, mid, near) = (most(Layer::Far), most(Layer::Mid), most(Layer::Near));
             let soft = over(over(wash, far.0, far.1), mid.0, mid.1);
             let glint = over(over(wash, far.0, far.1), near.0, near.1);
             assert!(contrast(soft, p.muted) >= 4.5, "dark {dark}: muted {}", contrast(soft, p.muted));
             assert!(contrast(glint, p.strong) >= 4.5, "dark {dark}: headings {}", contrast(glint, p.strong));
-            assert!(look(Layer::Far, dark, true).2 <= far.1, "the warm far disc is no brighter");
             assert!(far.1 < near.1 && mid.1 < near.1);
         }
         let layers: Vec<Layer> = (0..300).map(|n| depth(n).0).collect();
