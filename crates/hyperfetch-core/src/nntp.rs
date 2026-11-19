@@ -804,8 +804,11 @@ async fn work(job: Arc<Job>, s: usize, cancel: CancellationToken) {
             Take::Done => break,
             Take::Wait => {
                 // With nothing to ask, the connection's slot goes to a worker that waits for one:
-                // kept, two downloads each holding half the slots would wait for each other.
-                conn = None;
+                // kept, two downloads each holding half the slots would wait for each other. The
+                // server hears QUIT first, so it has counted the connection closed by then.
+                if let Some(open) = conn.take() {
+                    open.quit().await;
+                }
                 tokio::select! {
                     _ = cancel.cancelled() => break,
                     _ = tokio::time::sleep(WAIT) => continue,
