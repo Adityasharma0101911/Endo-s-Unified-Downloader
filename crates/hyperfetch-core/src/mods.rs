@@ -54,6 +54,7 @@ const LOADERS: &[&str] = &[
     "fabric", "forge", "neoforge", "quilt", "liteloader", "paper", "spigot", "bukkit", "purpur", "folia", "sponge", "velocity",
     "bungeecord", "waterfall", "iris", "optifine", "canvas", "datapack",
 ];
+const CURSEFORGE_PROXY: &str = "CurseForge's API terms do not allow reaching it through a proxy: turn the proxy off for this link";
 const CURSEFORGE_KEY: &str =
     "CurseForge's API needs your own API key (from console.curseforge.com): set it in Settings, or with --curseforge-key";
 
@@ -144,6 +145,10 @@ pub async fn list(http: &Client, url: &Url, options: &ListOptions) -> Result<Vec
         Some(Mod::Modrinth { project, version }) => modrinth(http, MODRINTH_API, &project, version.as_deref(), &pick, options).await?,
         Some(Mod::Pack(link)) => pack(http, &link, &pick, None, options).await?,
         Some(Mod::CurseForge { game, class, slug, file }) => {
+            // CurseForge's API terms (3.1e) forbid reaching it through a proxy.
+            if options.proxy.is_some() || options.proxy_pool || crate::engine::proxy_in_env() {
+                return Err(CURSEFORGE_PROXY.to_string());
+            }
             // The key goes to CurseForge's API alone, never on to where it redirects.
             let keyed = crate::itch::unredirected(options)?;
             let cf = CurseForge { http, keyed: &keyed, api: CURSEFORGE_API, key: key(&options.keys.curseforge, CURSEFORGE_KEY)? };
@@ -1031,6 +1036,9 @@ mod tests {
         assert_eq!(tasks[2].urls[0].as_str(), format!("modpack:http://{addr}/pack.zip#overrides"));
         let keyless = list(&http(), &Url::parse("https://www.curseforge.com/minecraft/mc-mods/jei").unwrap(), &ListOptions::default()).await.unwrap_err();
         assert_eq!(keyless, CURSEFORGE_KEY);
+        let proxied = ListOptions { proxy: Some("http://127.0.0.1:9".into()), ..Default::default() };
+        let refused = list(&http(), &Url::parse("https://www.curseforge.com/minecraft/mc-mods/jei").unwrap(), &proxied).await.unwrap_err();
+        assert_eq!(refused, CURSEFORGE_PROXY);
 
         // The key goes to CurseForge's API alone: a redirect to another host is not followed.
         let (elsewhere, seen) = serve(|_, _| json(r#"{"data":[]}"#)).await;
