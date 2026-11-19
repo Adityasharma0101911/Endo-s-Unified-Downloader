@@ -54,6 +54,13 @@ pub mod muxer;
 pub mod doctor;
 pub mod nntp;
 pub mod mods;
+pub mod helpers;
+pub mod accounts;
+pub mod rclone;
+pub mod epic;
+pub mod gog;
+pub mod steam;
+pub mod livestream;
 #[cfg(test)]
 pub(crate) mod netsim;
 #[cfg(test)]

@@ -361,6 +361,11 @@ pub struct Args {
     #[arg(long = "record-seconds", alias = "live-record-limit", value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
     pub record_seconds: Option<u64>,
 
+    /// Record live streams with streamlink rather than yt-dlp (installed if need be; streamlink is
+    /// also tried, when installed, for a live stream yt-dlp cannot follow)
+    #[arg(long = "streamlink")]
+    pub streamlink: bool,
+
     /// End an HLS or DASH recording, or an MPEG-TS stream's, once nothing new has come for SECS
     /// seconds
     #[arg(long = "live-idle-timeout", value_name = "SECS", value_parser = clap::value_parser!(u64).range(1..))]
@@ -1231,6 +1236,35 @@ pub enum SubCommand {
         #[arg(long = "decryption-binary-path", value_name = "PATH")]
         decryption_binary_path: Option<PathBuf>,
     },
+    /// Your accounts and the helper programs downloads use: cloud drives (rclone), Epic Games
+    /// (legendary), GOG, Steam (DepotDownloader), live streams (streamlink). Their links
+    /// (rclone://drive/path or drive:path, epic://APP, gog://game/ID, steam://app/ID, a Steam store
+    /// page) download like any other. The app never asks for a password
+    Accounts {
+        /// list (where each stands), sign-in, sign-out, library (what the account can download),
+        /// install (the helper, now)
+        #[arg(value_enum, default_value = "list")]
+        action: AccountAction,
+        /// cloud, epic, gog, steam or streams (list: all of them without it)
+        service: Option<String>,
+        /// sign-in: what it asks for (the code or address the service's page gives, a drive's name
+        /// and kind such as "work onedrive", your Steam account name), asked when left out;
+        /// sign-out of cloud: the drive to remove (all without it)
+        answer: Option<String>,
+        #[arg(long = "json")]
+        json: bool,
+    },
+}
+
+/// What `accounts` does.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum AccountAction {
+    #[default]
+    List,
+    SignIn,
+    SignOut,
+    Library,
+    Install,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Default)]

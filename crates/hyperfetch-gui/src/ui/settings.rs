@@ -207,7 +207,10 @@ fn settings_sections(app: &mut App, ui: &mut Ui) {
     section(ui, 1, icon::DESKTOP, "Desktop", |ui| desktop_settings(app, ui));
     section(ui, 2, icon::NETWORK, "Connections & networks", |ui| connection_settings(&mut app.settings, ui));
     section(ui, 3, icon::MAGNET, "BitTorrent", |ui| torrent_settings(app, ui));
-    section(ui, 4, icon::CLOUD_ARROW_DOWN, "Debrid & hosts", |ui| host_settings(app, ui));
+    section(ui, 4, icon::CLOUD_ARROW_DOWN, "Debrid & hosts", |ui| {
+        host_settings(app, ui);
+        accounts_and_tools(app, ui);
+    });
     section(ui, 5, icon::FILM_STRIP, "Media", |ui| media_settings(app, ui));
     section(ui, 6, icon::BROADCAST, "Streams", |ui| stream_settings(&mut app.settings, ui));
     section(ui, 7, icon::PACKAGE, "Post-processing", |ui| post_settings(app, ui));
@@ -796,6 +799,160 @@ fn category_settings(app: &mut App, ui: &mut Ui) {
             ui.label(RichText::new("No categories: nothing is sorted").small().color(p.muted));
         }
     });
+}
+
+// ==== Accounts & tools ======================================================================
+// One self-contained function over `hyperfetch_core::accounts` (status, sign-in steps, sign-out,
+// installing a helper); its state lives in egui's memory. Minimal on purpose: restyle freely.
+
+/// Accounts & tools: each source's helper program (its version, licence and place, or what is
+/// installed when first needed), who is signed in, and its sign-in as the steps the core gives,
+/// run on the app's runtime. Cloud drives are removed with `accounts sign-out cloud NAME`.
+fn accounts_and_tools(app: &mut App, ui: &mut Ui) {
+    use hyperfetch_core::accounts::{self, Service, Status, Step};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct State {
+        statuses: Vec<Status>,
+        loading: bool,
+        busy: bool,
+        /// The service being signed in to, what the user typed for it, what its sign-in showed.
+        signing: Option<Service>,
+        answer: String,
+        shown: Vec<String>,
+        message: Option<Result<String, String>>,
+    }
+    type Shared = Arc<Mutex<State>>;
+    let p = palette(ui);
+    let shared: Shared = ui.data_mut(|d| d.get_temp_mut_or_default::<Shared>(egui::Id::new("accounts and tools")).clone());
+    let proxy = Some(app.settings.proxy.trim().to_string()).filter(|p| !p.is_empty());
+    // Runs `job` (None: nothing but the reload), then reads every status again.
+    let run = |job: Option<std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>>>, ctx: &egui::Context| {
+        {
+            let mut state = shared.lock().unwrap();
+            state.loading = true;
+            state.busy |= job.is_some();
+        }
+        let (shared, ctx) = (shared.clone(), ctx.clone());
+        app.rt.spawn(async move {
+            let done = match job {
+                Some(job) => Some(job.await),
+                None => None,
+            };
+            let mut statuses = Vec::new();
+            for service in Service::ALL {
+                statuses.push(accounts::status(service).await);
+            }
+            let mut state = shared.lock().unwrap();
+            (state.statuses, state.loading) = (statuses, false);
+            if let Some(done) = done {
+                state.busy = false;
+                if done.is_ok() {
+                    state.signing = None;
+                }
+                state.message = Some(done);
+            }
+            ctx.request_repaint();
+        });
+    };
+    let (empty, loading, busy) = {
+        let state = shared.lock().unwrap();
+        (state.statuses.is_empty(), state.loading, state.busy)
+    };
+    if empty && !loading {
+        run(None, ui.ctx());
+    }
+    let statuses = shared.lock().unwrap().statuses.clone();
+    for status in statuses {
+        let service = status.service;
+        let mut about = match &status.tool {
+            None => "Built in.".to_string(),
+            Some(tool) => match (&tool.path, tool.installs) {
+                (Some(path), _) => format!("{} {} ({}), {}.", tool.program, tool.version.as_deref().unwrap_or(""), tool.licence, path.display()),
+                (None, Some((version, size))) => format!("{} {version} ({}, {:.0} MB) is installed when first needed.", tool.program, tool.licence, size as f64 / 1e6),
+                (None, None) => format!("Put {} on PATH ({}).", tool.program, tool.home),
+            },
+        };
+        if let Some(account) = &status.account {
+            about.push_str(&format!(" Signed in: {account}."));
+        }
+        if let Some(note) = &status.note {
+            about.push_str(&format!(" {note}"));
+        }
+        let installable = status.tool.as_ref().is_some_and(|t| t.path.is_none() && t.installs.is_some());
+        setting(ui, service.name(), &about, (&status.account, installable), |ui| {
+            let sign_in = if service == Service::Cloud { "Add a drive" } else { "Sign in" };
+            if !accounts::steps(service).is_empty() && ui.add_enabled(!busy, button(sign_in)).clicked() {
+                let mut state = shared.lock().unwrap();
+                (state.signing, state.answer, state.shown, state.message) = (Some(service), String::new(), Vec::new(), None);
+            }
+            if status.account.is_some() && service != Service::Cloud && ui.add_enabled(!busy, button("Sign out")).clicked() {
+                let proxy = proxy.clone();
+                run(Some(Box::pin(async move { accounts::sign_out(service, None, proxy.as_deref()).await.map(|()| format!("Signed out of {}", service.name())) })), ui.ctx());
+            }
+            if let Some(tool) = service.tool().filter(|_| installable) {
+                if ui.add_enabled(!busy, button("Install")).clicked() {
+                    let proxy = proxy.clone();
+                    run(Some(Box::pin(async move { hyperfetch_core::helpers::ensure(tool, proxy.as_deref()).await.map(|path| format!("Installed {}", path.display())) })), ui.ctx());
+                }
+            }
+        });
+    }
+    let signing = shared.lock().unwrap().signing;
+    if let Some(service) = signing {
+        ui.separator();
+        ui.label(RichText::new(format!("Sign in: {}", service.name())).strong().color(p.text));
+        let (answer, shown) = {
+            let mut state = shared.lock().unwrap();
+            for step in accounts::steps(service) {
+                match step {
+                    Step::Open { url, why } => {
+                        ui.label(RichText::new(why).small().color(p.muted));
+                        ui.hyperlink(url);
+                    }
+                    Step::Paste { what } => {
+                        ui.label(RichText::new(what).small().color(p.muted));
+                        ui.add(egui::TextEdit::singleline(&mut state.answer).desired_width(ui.available_width()));
+                    }
+                    Step::Wait { why } | Step::Show { text: why } => {
+                        ui.label(RichText::new(why).small().color(p.muted));
+                    }
+                }
+            }
+            (state.answer.clone(), state.shown.clone())
+        };
+        for text in shown {
+            ui.label(RichText::new(text).monospace().color(p.text));
+        }
+        ui.horizontal(|ui| {
+            if ui.add_enabled(!busy, button("Continue")).clicked() {
+                let (seen, ctx, proxy) = (shared.clone(), ui.ctx().clone(), proxy.clone());
+                let show = move |step: Step| {
+                    let text = match step {
+                        Step::Open { url, why } => format!("{why}: {url}"),
+                        Step::Show { text } => text,
+                        Step::Wait { why } | Step::Paste { what: why } => why,
+                    };
+                    seen.lock().unwrap().shown.push(text);
+                    ctx.request_repaint();
+                };
+                let job = async move { accounts::sign_in(service, &answer, proxy.as_deref(), show).await.map(|who| format!("Signed in to {}: {who}", service.name())) };
+                run(Some(Box::pin(job)), ui.ctx());
+            }
+            if ui.add(button("Close")).clicked() {
+                shared.lock().unwrap().signing = None;
+            }
+        });
+    }
+    let message = shared.lock().unwrap().message.clone();
+    if let Some(message) = message {
+        let (text, color) = match message {
+            Ok(text) => (text, p.green),
+            Err(text) => (text, p.red),
+        };
+        ui.label(RichText::new(text).small().color(color));
+    }
 }
 
 #[cfg(test)]

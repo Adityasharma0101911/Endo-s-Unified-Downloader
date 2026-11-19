@@ -339,7 +339,7 @@ fn listing_url(token: &str) -> Option<Url> {
 pub fn needs_reading(text: &str) -> bool {
     names_document(text)
         || might_be_channel_list(&unquote(text))
-        || matches!(&split_tokens(text)[..], [token] if listing_url(token).is_some() || torrent::is_magnet_uri(token) || might_be_channel_list(token))
+        || matches!(&split_tokens(text)[..], [token] if listing_url(token).is_some() || torrent::is_magnet_uri(token) || might_be_channel_list(token) || crate::accounts::takes(token))
 }
 
 /// A channel of a channel list (see [`parse_channels`]).
@@ -577,6 +577,10 @@ pub async fn ingest(tokens: &[impl AsRef<str>], http: &reqwest::Client, options:
         // A container image or a Send share is one download, whatever lister its site has.
         if crate::oci::reference(token.as_ref()).is_some() || http_url(token.as_ref()).is_some_and(|u| crate::send::handles(&u)) {
             return link_task(tokens).map(|task| vec![task]);
+        }
+        // A cloud drive's or a game library's link (see `crate::accounts`).
+        if let Some(listed) = crate::accounts::list(token.as_ref(), options).await {
+            return listed;
         }
         if let Some(url) = listing_url(token.as_ref()) {
             if let Some(listed) = list(http, &url, options).await {

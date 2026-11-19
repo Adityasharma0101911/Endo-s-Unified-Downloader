@@ -423,6 +423,9 @@ pub struct DownloadOptions {
     /// front ends fill them in each time the download starts.
     #[serde(skip)]
     pub nntp: Vec<crate::nntp::Server>,
+    /// The link is a live stream recorded with streamlink, not yt-dlp (see `crate::livestream`),
+    /// which is installed for it if need be.
+    pub streamlink: bool,
 }
 
 impl Default for DownloadOptions {
@@ -509,6 +512,7 @@ impl Default for DownloadOptions {
             ssh_key: None,
             platform: None,
             nntp: Vec::new(),
+            streamlink: false,
         }
     }
 }
@@ -884,6 +888,15 @@ impl DownloadEngine {
             let done = crate::mods::run(link, &client, self.limiter(), &self.save_dir(), snapshot_tx, self.cancel_token.clone()).await;
             return self.unless_rerun(done);
         }
+        // A link of an account's helper: a cloud drive's, a game library's (see `crate::accounts`).
+        if let Some(link) = self.urls.first().filter(|u| crate::accounts::handles(u)).cloned() {
+            return Box::pin(self.fetch_account(link, snapshot_tx)).await;
+        }
+        // A live stream the user sends to streamlink (see `crate::livestream`).
+        if self.options.streamlink {
+            let url = self.urls.first().ok_or("No URLs to download")?;
+            return self.unless_rerun(crate::livestream::run(url, &self.options, &self.save_dir(), snapshot_tx, self.cancel_token.clone()).await);
+        }
 
         if self.urls.first().is_some_and(crate::ftp::handles) {
             return Box::pin(self.fetch_ftp(client, snapshot_tx)).await;
@@ -915,6 +928,15 @@ impl DownloadEngine {
 
         if let Some(media_url) = self.media_target() {
             let result = self.run_media(media_url.clone(), None, snapshot_tx.clone()).await;
+            // A live stream yt-dlp could not follow, which a streamlink already installed takes.
+            let proxy = self.options.proxy.as_deref();
+            if result.is_err() && !self.cancel_token.is_cancelled() && crate::livestream::takes(&media_url, proxy).await {
+                let tx = snapshot_tx.clone();
+                match crate::livestream::run(&media_url, &self.options, &self.save_dir(), tx, self.cancel_token.clone()).await {
+                    Ok(done) => return self.unless_rerun(Ok(done)),
+                    Err(e) => tracing::info!("streamlink could not record {} either: {}", media_url, e),
+                }
+            }
             // An X or Reddit post of pictures: yt-dlp finds no video there, gallery-dl the pictures.
             match &result {
                 Err(e)
@@ -945,6 +967,22 @@ impl DownloadEngine {
             *self.already_done.lock().unwrap() = Some(path.clone());
         }
         Ok(path)
+    }
+
+    /// A link of an account's helper (see `crate::accounts::route`): downloaded by the helper, or
+    /// by this engine over HTTP from where the helper serves it, kept running meanwhile.
+    async fn fetch_account(&self, link: Url, snapshot_tx: Option<broadcast::Sender<EngineSnapshot>>) -> Result<PathBuf, String> {
+        let route = crate::accounts::route(&link, &self.options, &self.save_dir(), snapshot_tx.clone(), self.cancel_token.clone()).await?;
+        match route {
+            crate::accounts::Route::Done(done) => self.unless_rerun(Ok(done)),
+            crate::accounts::Route::Http { url, options, keep } => {
+                let client = build_client(&options);
+                let engine = self.alike(vec![url], options, client);
+                let done = Box::pin(engine.fetch_all(snapshot_tx)).await;
+                drop(keep);
+                done
+            }
+        }
     }
 
     /// Whether this download failed with `error` because a server refuses HTTP/1.1, which the
