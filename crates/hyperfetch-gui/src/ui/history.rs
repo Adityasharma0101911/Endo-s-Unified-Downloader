@@ -225,8 +225,7 @@ pub(super) fn library_page(app: &mut App, ui: &mut Ui) {
             let t = anim::ease(anim::progress(ui.ctx(), opened, anim::stagger(n - first), anim::APPEAR));
             let rect = rect.translate(anim::RISE * (1.0 - t));
             // Near the list's top and bottom edges a row fades, so that the list melts into the page.
-            let edge = ((rect.center().y - clip.top()).min(clip.bottom() - rect.center().y) / (line.height() * 0.5)).clamp(0.0, 1.0);
-            let opacity = t * (0.35 + 0.65 * edge);
+            let opacity = t * anim::edge_fade(rect, clip);
             match line {
                 Line::Heading(name, count) => heading(ui, rect, name, count, opacity, false),
                 Line::Entry(index) => {

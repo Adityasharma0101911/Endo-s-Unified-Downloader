@@ -1,5 +1,6 @@
 //! The ambient field behind every page: soft motes drifting over a slow two-tone wash, drawn
-//! with the painter (a few hundred small fans and two soft discs a frame). It reacts to the app:
+//! with the painter (a few hundred soft discs in three layers for depth, and two large ones for
+//! the wash, a frame). It reacts to the app:
 //! idle, the motes drift; while downloads run they gather a current in the accent colour whose
 //! pace follows the total speed (log-scaled, capped); a finished download sends one soft ripple
 //! out from the middle, a failed one tints the field red for a moment.
@@ -62,15 +63,52 @@ pub fn flow_for(speed: f64) -> f32 {
 }
 
 /// Mote count, pace and brightness of `intensity` (0 calm, 1 normal, 2 lively), for a window of
-/// `area` square points: more motes in a bigger window, never more than 270.
+/// `area` square points: more motes in a bigger window, never more than 300.
 pub fn character(intensity: usize, area: f32) -> (usize, f32, f32) {
     let (count, pace, light) = match intensity {
-        0 => (70.0, 0.6, 0.75),
-        2 => (180.0, 1.5, 1.2),
-        _ => (120.0, 1.0, 1.0),
+        0 => (90.0, 0.7, 0.8),
+        2 => (200.0, 1.4, 1.2),
+        _ => (140.0, 1.0, 1.0),
     };
     let scale = (area / (1280.0 * 800.0)).clamp(0.5, 1.5);
-    (((count * scale) as usize).min(270), pace, light)
+    (((count * scale) as usize).min(300), pace, light)
+}
+
+/// The three depths a mote can drift at.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Layer {
+    /// Large, dim and out of focus, drifting slowly at the back.
+    Far,
+    Mid,
+    /// Small and bright, at the front: they move the most.
+    Near,
+}
+
+/// Mote `n`'s layer and how near it is (0.15 far to 1.0 near): a fifth far, under half mid.
+pub fn depth(n: u32) -> (Layer, f32) {
+    let (which, within) = (hash(n, 3), hash(n, 8));
+    match which {
+        w if w < 0.2 => (Layer::Far, 0.15 + 0.15 * within),
+        w if w < 0.65 => (Layer::Mid, 0.45 + 0.25 * within),
+        _ => (Layer::Near, 0.8 + 0.2 * within),
+    }
+}
+
+/// The colour of a mote of `layer` and its brightness at Normal, then at most, for the theme.
+/// The most is what text over the brightest wash still reads on at 4.5:1: muted text over a far
+/// and a mid mote at once, headings over a far and a near one (see the test).
+fn look(layer: Layer, dark: bool, warm: bool) -> (Color32, f32, f32) {
+    let (color, most) = match (layer, dark) {
+        (Layer::Far, true) => (Color32::from_rgb(150, 175, 255), 0.07),
+        (Layer::Mid, true) => (Color32::from_rgb(200, 215, 255), 0.08),
+        (Layer::Near, true) => (Color32::from_rgb(235, 240, 255), 0.30),
+        // On paper: a pale blue or a warm out-of-focus disc at the back, blues nearer.
+        (Layer::Far, false) if warm => (Color32::from_rgb(232, 164, 156), 0.14),
+        (Layer::Far, false) => (Color32::from_rgb(150, 176, 226), 0.14),
+        (Layer::Mid, false) => (Color32::from_rgb(110, 140, 215), 0.13),
+        (Layer::Near, false) => (Color32::from_rgb(70, 100, 190), 0.40),
+    };
+    (color, most / 1.2, most)
 }
 
 /// A number in [0, 1) from `n` and `salt`: the motes' fixed traits.
@@ -87,10 +125,11 @@ fn hash(n: u32, salt: u32) -> f32 {
 /// Where mote `n` is in `rect` at the field's state, and how near it is (0.35 far to 1.0 near),
 /// moving at `pace`. A function of the state alone: the same frames give the same field.
 pub fn mote(n: u32, field: &Field, rect: Rect, pace: f32) -> (Pos2, f32) {
-    let (u, v, z) = (hash(n, 1), hash(n, 2), 0.35 + 0.65 * hash(n, 3));
+    let (u, v, z) = (hash(n, 1), hash(n, 2), depth(n).1);
     let (phase, wobble, rate) = (hash(n, 4) * std::f32::consts::TAU, 6.0 + 18.0 * z, 0.05 + 0.12 * hash(n, 5));
     let clock = field.clock as f32;
-    let margin = 24.0;
+    // Room for the biggest far mote to drift in and out of view whole.
+    let margin = 32.0;
     let (w, h) = (rect.width() + 2.0 * margin, rect.height() + 2.0 * margin);
     // Idle they drift right and a little up; the current carries the near ones further.
     let x = u * w + z * (clock * 6.0 * pace + field.carried) + wobble * (clock * rate * pace + phase).sin();
@@ -165,6 +204,35 @@ fn glow(mesh: &mut Mesh, center: Pos2, radius: f32, color: Color32, sides: u32) 
     }
 }
 
+/// A softer disc: `color` at `center`, `knee.1` of it at `knee.0` of the `radius`, nothing at the
+/// rim, widened `stretch` times along x (the current's pull).
+fn bloom(mesh: &mut Mesh, center: Pos2, radius: f32, stretch: f32, color: Color32, knee: (f32, f32), sides: u32) {
+    let first = mesh.vertices.len() as u32;
+    mesh.colored_vertex(center, color);
+    let (inner, ring) = (knee.0 * radius, color.gamma_multiply(knee.1));
+    for k in 0..sides {
+        let along = Vec2::angled(k as f32 / sides as f32 * std::f32::consts::TAU);
+        let along = Vec2::new(along.x * stretch, along.y);
+        mesh.colored_vertex(center + inner * along, ring);
+        mesh.colored_vertex(center + radius * along, Color32::TRANSPARENT);
+    }
+    for k in 0..sides {
+        let (a, b) = (first + 1 + 2 * k, first + 1 + 2 * ((k + 1) % sides));
+        mesh.add_triangle(first, a, b);
+        mesh.add_triangle(a, a + 1, b + 1);
+        mesh.add_triangle(a, b + 1, b);
+    }
+}
+
+/// The wash's two tones at their brightest, in the middle of their discs.
+fn tones(dark: bool) -> (Color32, Color32) {
+    if dark {
+        (Color32::from_rgba_unmultiplied(48, 70, 160, 70), Color32::from_rgba_unmultiplied(18, 96, 120, 52))
+    } else {
+        (Color32::from_rgba_unmultiplied(255, 205, 160, 80), Color32::from_rgba_unmultiplied(150, 176, 226, 70))
+    }
+}
+
 /// The two slow tones: a cool one high on the left, a second low on the right, orbiting a
 /// little as the field moves; the first takes the accent while downloads run, and the whole
 /// field reddens for a moment after a failure.
@@ -172,11 +240,7 @@ fn wash(painter: &egui::Painter, rect: Rect, field: &Field, p: &Palette, dark: b
     let t = field.clock as f32;
     let size = rect.width().max(rect.height());
     let at = |x: f32, y: f32| rect.min + Vec2::new(x * rect.width(), y * rect.height());
-    let (first, second) = if dark {
-        (Color32::from_rgba_unmultiplied(48, 70, 160, 70), Color32::from_rgba_unmultiplied(18, 96, 120, 52))
-    } else {
-        (Color32::from_rgba_unmultiplied(255, 205, 160, 80), Color32::from_rgba_unmultiplied(150, 176, 226, 70))
-    };
+    let (first, second) = tones(dark);
     let first = first.lerp_to_gamma(p.accent.gamma_multiply(if dark { 0.35 } else { 0.25 }), 0.6 * field.flow);
     let mut mesh = Mesh::default();
     glow(&mut mesh, at(0.16 + 0.05 * (t * 0.05).sin(), 0.1 + 0.05 * (t * 0.04).cos()), 0.78 * size, first, 32);
@@ -188,32 +252,48 @@ fn wash(painter: &egui::Painter, rect: Rect, field: &Field, p: &Palette, dark: b
     }
 }
 
-/// The motes, nearer ones bigger and brighter; the current turns them towards the accent, a
-/// ripple pushes them out and lights them as it passes.
+/// The motes in three layers, for depth: large dim out-of-focus discs at the back, soft mid ones,
+/// small bright ones at the front, each twinkling gently, the nearer the more. The current turns
+/// them towards the accent and draws the nearer ones out along it; a ripple pushes them out and
+/// lights them as it passes.
 fn motes(painter: &egui::Painter, rect: Rect, field: &Field, p: &Palette, dark: bool, intensity: usize) {
     let (count, pace, light) = character(intensity, rect.area());
     let ripple = field.ripple.map(|start| (field.clock - start) as f32).filter(|age| *age < RIPPLE as f32);
     let tint = fading(field, field.tint, TINT);
-    let base = if dark { Color32::from_rgb(178, 196, 255) } else { Color32::from_rgb(54, 62, 92) };
-    let color = base.lerp_to_gamma(p.accent, 0.7 * field.flow).lerp_to_gamma(p.red, 0.6 * tint);
-    let (near, far) = if dark { (0.42, 0.08) } else { (0.2, 0.04) };
+    let pull = if dark { p.link } else { p.accent };
+    let clock = field.clock as f32;
     let center = rect.center();
-    // Sized once: seven vertices and six triangles a mote.
-    let mut mesh = Mesh { indices: Vec::with_capacity(count * 18), vertices: Vec::with_capacity(count * 7), texture_id: Default::default() };
+    // Sized once for the largest (a far disc: 37 vertices, 54 triangles).
+    let mut mesh = Mesh { indices: Vec::with_capacity(count * 162), vertices: Vec::with_capacity(count * 37), texture_id: Default::default() };
     for n in 0..count as u32 {
         let (mut pos, z) = mote(n, field, rect, pace);
+        let (layer, size) = (depth(n).0, hash(n, 9));
         let mut lit = 0.0;
         if let Some(age) = ripple {
             let away = pos - center;
             let d = away.length().max(1.0);
             let front = (-((d - age * 520.0) / 50.0).powi(2)).exp() * (1.0 - age / RIPPLE as f32);
-            pos += away / d * 16.0 * front;
+            pos += away / d * 16.0 * front * z;
             lit = front;
         }
-        let twinkle = 0.85 + 0.15 * (field.clock as f32 * (0.4 + hash(n, 6)) + 6.0 * hash(n, 7)).sin();
-        let alpha = ((far + (near - far) * z) * light * twinkle + 0.35 * lit).clamp(0.0, 1.0);
-        let radius = (0.9 + 2.3 * z) * 2.2;
-        glow(&mut mesh, pos, radius, color.gamma_multiply(alpha), 6);
+        let (color, normal, most) = look(layer, dark, hash(n, 10) < 0.3);
+        let color = color.lerp_to_gamma(pull, 0.6 * field.flow).lerp_to_gamma(p.red, 0.6 * tint);
+        // How much of its light a mote shows: the near ones breathe the most.
+        let (depth_of_twinkle, rate) = match layer {
+            Layer::Far => (0.15, 0.15),
+            Layer::Mid => (0.3, 0.35),
+            Layer::Near => (0.5, 0.6),
+        };
+        let wave = 0.5 + 0.5 * (clock * (rate + 0.6 * rate * hash(n, 6)) + std::f32::consts::TAU * hash(n, 7)).sin();
+        let twinkle = 1.0 - depth_of_twinkle * wave;
+        let alpha = (normal * light * twinkle + 0.4 * most * lit).min(most);
+        let stretch = 1.0 + 1.8 * field.flow * z * z;
+        let color = color.gamma_multiply(alpha);
+        match layer {
+            Layer::Far => bloom(&mut mesh, pos, 14.0 + 16.0 * size, 1.0, color, (0.7, 0.8), 18),
+            Layer::Mid => bloom(&mut mesh, pos, 5.0 + 5.0 * size, stretch, color, (0.35, 0.45), 10),
+            Layer::Near => bloom(&mut mesh, pos, 4.0 + 3.0 * size, stretch, color, (0.22, 0.3), 8),
+        }
     }
     painter.add(Shape::mesh(mesh));
 }
@@ -276,7 +356,7 @@ pub(super) mod tests {
         let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(980.0, 720.0));
         let at = |field: &Field| (0..50).map(|n| mote(n, field, rect, 1.0).0).collect::<Vec<_>>();
         assert_ne!(at(&Field::default()), at(&a), "they moved");
-        assert!(at(&a).iter().all(|pos| rect.expand(24.0).contains(*pos)), "inside the window, give or take its margin");
+        assert!(at(&a).iter().all(|pos| rect.expand(32.0).contains(*pos)), "inside the window, give or take its margin");
 
         let mut h = Harness::new();
         h.app.settings.moving_background = true;
@@ -306,6 +386,45 @@ pub(super) mod tests {
         h.frames(2);
         let after = field(&h);
         assert!(after.ripple.is_some() && after.tint.is_some(), "{after:?}");
-        assert!(character(2, 1280.0 * 800.0).0 <= 270 && character(0, 1e9).0 <= 270);
+        assert!(character(2, 1e9).0 <= 300 && character(0, 1280.0 * 800.0).0 < character(2, 1280.0 * 800.0).0);
+    }
+
+    /// WCAG contrast of two colours.
+    fn contrast(a: Color32, b: Color32) -> f32 {
+        let lum = |c: Color32| {
+            let lin = |v: u8| {
+                let v = v as f32 / 255.0;
+                if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+            };
+            0.2126 * lin(c.r()) + 0.7152 * lin(c.g()) + 0.0722 * lin(c.b())
+        };
+        let (a, b) = (lum(a), lum(b));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    /// Text on the background keeps 4.5:1 where it is brightest (darkest on paper): over the
+    /// wash's middle, muted text with a far and a mid mote at their most behind it, headings
+    /// with a far and a near one. The layers stay in their order of size and of brightness.
+    #[test]
+    fn text_reads_over_the_brightest_field() {
+        for (dark, p) in [(true, super::super::DARK), (false, super::super::LIGHT)] {
+            let over = |under: Color32, color: Color32, alpha: f32| under.lerp_to_gamma(color, alpha);
+            let (first, second) = tones(dark);
+            // On paper the blue tone darkens the page more than the warm one.
+            let tone = if dark { first } else { second };
+            let wash = over(p.bg, tone.to_opaque(), tone.a() as f32 / 255.0);
+            let most = |layer| (look(layer, dark, false).0, look(layer, dark, false).2);
+            let (far, mid, near) = (most(Layer::Far), most(Layer::Mid), most(Layer::Near));
+            let soft = over(over(wash, far.0, far.1), mid.0, mid.1);
+            let glint = over(over(wash, far.0, far.1), near.0, near.1);
+            assert!(contrast(soft, p.muted) >= 4.5, "dark {dark}: muted {}", contrast(soft, p.muted));
+            assert!(contrast(glint, p.strong) >= 4.5, "dark {dark}: headings {}", contrast(glint, p.strong));
+            assert!(look(Layer::Far, dark, true).2 <= far.1, "the warm far disc is no brighter");
+            assert!(far.1 < near.1 && mid.1 < near.1);
+        }
+        let layers: Vec<Layer> = (0..300).map(|n| depth(n).0).collect();
+        for layer in [Layer::Far, Layer::Mid, Layer::Near] {
+            assert!(layers.iter().filter(|l| **l == layer).count() > 30, "{layer:?}: each layer has its share");
+        }
     }
 }

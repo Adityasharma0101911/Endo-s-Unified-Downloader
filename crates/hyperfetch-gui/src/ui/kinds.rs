@@ -31,6 +31,8 @@ pub enum Choice {
     Zip,
     /// The files of a list (a folder, a torrent, a playlist): asked once it is read.
     Files,
+    /// A web page: downloaded as it is, or saved as one file that opens offline.
+    Page,
 }
 
 /// One kind of thing to download.
@@ -375,19 +377,33 @@ pub const KINDS: &[Kind] = &[
         example: "https://ftp.gnu.org/gnu/hello/hello-2.12.1.tar.gz",
         needs: Needs::Nothing,
         choice: Choice::None,
-        matches: |_, url| web(url).is_some_and(|url| url.path_segments().and_then(|mut s| s.next_back()).is_some_and(|last| last.contains('.'))),
+        // A name with an extension, but not a page's (.html is a web page).
+        matches: |text, url| {
+            let named = web(url).is_some_and(|url| url.path_segments().and_then(|mut s| s.next_back()).is_some_and(|last| last.contains('.')));
+            named && !ends_with(text, url, PAGES)
+        },
     },
     Kind {
         name: "A web page",
         group: "Files & links",
         glyph: icon::GLOBE,
-        about: "Whatever it holds: its video, its files, or the page itself.",
-        example: "",
+        about: "Whatever it holds: its video or its files, or the page itself saved as one file that opens offline.",
+        example: "https://www.gnu.org/philosophy/free-sw.html",
         needs: Needs::Nothing,
-        choice: Choice::None,
+        choice: Choice::Page,
         matches: |_, url| web(url).is_some(),
     },
 ];
+
+/// What a web page's link ends in.
+const PAGES: &[&str] = &[".html", ".htm", ".xhtml", ".shtml"];
+
+/// Whether a link of `kind` names its file by its last part, as a file's link does: the link
+/// bar's card then shows that name. The others are named by their site once they start (a
+/// video page's link ends in `watch`, a playlist's in `videos`).
+pub fn named_by_link(kind: &Kind) -> bool {
+    matches!(kind.name, "A torrent" | "A Usenet download" | "A metalink" | "A chunked image" | "A file on a server" | "A map extract" | "A ZIP archive" | "A file")
+}
 
 /// What `text` (the link bar's input) is: its kind, and where it comes from (a host, or "this
 /// computer"); None for nothing, or text that is not a link. Several lines are "Several links".
@@ -447,6 +463,19 @@ mod tests {
         assert_eq!(name("https://a.example/f.iso https://b.example/f.iso").map(|(_, source)| source).as_deref(), Some("a.example and 1 more servers"));
         assert_eq!(name("https://a.example/1.iso\nhttps://a.example/2.iso").unwrap().0, "Several links");
         assert_eq!(name("ftp://ftp.example/pub/a.iso").unwrap().0, "A file on a server");
+        assert_eq!(name("https://example.com/about/index.html").unwrap().0, "A web page");
+        assert_eq!(name("https://example.com/report.php?id=3").unwrap().0, "A file");
+    }
+
+    /// Only kinds whose links end in their file's name show it; every name listed is a kind.
+    #[test]
+    fn only_file_links_are_named_by_their_link() {
+        let named: Vec<&str> = KINDS.iter().filter(|kind| named_by_link(kind)).map(|kind| kind.name).collect();
+        assert_eq!(named.len(), 8, "{named:?}");
+        for text in ["https://www.youtube.com/watch?v=aqz-KE-bpKQ", "https://www.youtube.com/@BlenderOfficial/videos", "https://arxiv.org/abs/1706.03762", "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8", "https://example.com/"] {
+            assert!(!named_by_link(recognise(text).unwrap().0), "{text}");
+        }
+        assert!(named_by_link(recognise("https://ftp.gnu.org/gnu/hello/hello-2.12.1.tar.gz").unwrap().0));
     }
 
     /// Every kind's example is named as that kind (or a more particular one in its group), and

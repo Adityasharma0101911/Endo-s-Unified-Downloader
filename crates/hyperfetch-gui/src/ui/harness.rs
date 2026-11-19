@@ -728,6 +728,7 @@ mod tests {
                 ("zip", "https://example.com/pack.zip"),
                 ("paper", "https://arxiv.org/abs/1706.03762"),
                 ("container", "docker.io/library/alpine:latest"),
+                ("page", "https://www.gnu.org/philosophy/free-sw.html"),
                 ("several", "https://example.com/a.iso\nhttps://example.com/b.iso\nhttps://example.com/c.iso"),
             ];
             let top = area(0.0, 0.0, SCREEN.x, 420.0);
@@ -740,6 +741,23 @@ mod tests {
                 h.app.show_advanced = true;
             });
             still(&mut h, "preview-more-options");
+            // Saving a web page as one file: its card with More options, while it saves, and done.
+            let page = "https://www.gnu.org/philosophy/free-sw.html";
+            let mut h = scene(SCREEN, &|h| {
+                h.app.url_input = page.to_string();
+                h.app.show_advanced = true;
+            });
+            still(&mut h, "page-more-options");
+            let mut h = scene(SCREEN, &|h| {
+                h.app.url_input = page.to_string();
+                h.app.saving_page = Some(page.to_string());
+                h.app.notice = Some(Ok("Saving the page from www.gnu.org as one file…".to_string()));
+            });
+            still(&mut h, "page-saving");
+            let mut h = scene(SCREEN, &|h| {
+                h.app.notice = Some(Ok("Saved the page as one file: What is Free Software.html (412.0 KiB; 9 images, styles and frames put in)".to_string()));
+            });
+            still(&mut h, "page-saved");
 
             // The moving background at each intensity, on the empty page.
             for (intensity, name) in [(0, "calm"), (1, "normal"), (2, "lively")] {

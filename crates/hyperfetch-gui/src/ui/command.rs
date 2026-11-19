@@ -49,6 +49,8 @@ enum Hit {
     Show(usize),
     Find(String),
     Link(String),
+    /// Save the web page at this link as one file.
+    SavePage(String),
     Settings(String),
 }
 
@@ -63,6 +65,14 @@ fn results(app: &App, query: &str) -> Vec<(&'static str, String, String, Hit)> {
     if let Some((kind, source)) = kinds::recognise(raw).filter(|_| raw.contains(':') || raw.contains('/')) {
         let about = if source.is_empty() { kind.name.to_string() } else { format!("{}, from {source}", kind.name) };
         out.push((kind.glyph, "Put it in the link bar".to_string(), about, Hit::Link(raw.to_string())));
+        if kind.choice == kinds::Choice::Page {
+            out.push((icon::FILE_HTML, "Save this page as one file".to_string(), "Opens offline".to_string(), Hit::SavePage(raw.to_string())));
+        }
+    }
+    // The page in the link bar, as one file.
+    let bar = app.url_input.trim();
+    if kinds::recognise(bar).is_some_and(|(kind, _)| kind.choice == kinds::Choice::Page) && !raw.contains('/') && (hit("Save this page as one file") || hit("offline")) {
+        out.push((icon::FILE_HTML, "Save this page as one file".to_string(), truncate_chars(bar, 48), Hit::SavePage(bar.to_string())));
     }
     let running = app.queue.items().iter().any(|item| item.status == QueueItemStatus::Downloading);
     let limit = crate::settings::speed_limit_bytes(app.settings.max_speed, app.settings.max_speed_in_mb).is_some();
@@ -149,6 +159,14 @@ fn run(app: &mut App, ctx: &egui::Context, what: Hit) {
             app.url_input = link;
             app.tab = Tab::Downloads;
             app.focused = None;
+        }
+        Hit::SavePage(link) => {
+            if let Ok(url) = url::Url::parse(&link) {
+                app.url_input = link;
+                app.tab = Tab::Downloads;
+                app.focused = None;
+                app.save_page(url);
+            }
         }
         Hit::Settings(text) => {
             app.settings_search = text;
