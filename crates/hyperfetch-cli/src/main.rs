@@ -640,7 +640,7 @@ fn list_options(args: &Args) -> ListOptions {
         ssh_key: args.ssh_key(),
         formats: args.formats.iter().map(|f| f.trim().to_string()).filter(|f| !f.is_empty()).collect(),
         max_items: args.max_items,
-        keys: hyperfetch_core::ingest::Keys { curseforge: args.curseforge_key.clone(), nexus: args.nexus_key.clone(), unpaywall_email: args.unpaywall_email.clone() },
+        keys: hyperfetch_core::ingest::Keys { curseforge: args.curseforge_key.clone(), nexus: args.nexus_key.clone(), unpaywall_email: args.unpaywall_email.clone(), itch: args.itch_key.clone() },
     }
 }
 

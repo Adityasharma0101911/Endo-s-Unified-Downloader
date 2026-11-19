@@ -56,6 +56,7 @@ pub mod nntp;
 pub mod mods;
 pub mod papers;
 pub mod packages;
+pub mod itch;
 pub mod helpers;
 pub mod accounts;
 pub mod rclone;

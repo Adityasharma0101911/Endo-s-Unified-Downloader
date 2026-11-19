@@ -676,6 +676,10 @@ fn host_settings(app: &mut App, ui: &mut Ui) {
     let about = "A DOI or a publisher's page downloads the paper's legal open copy that Unpaywall knows; Unpaywall asks for \
                  your email address with each request. Sent only to Unpaywall. Without it, only a copy the DOI's own record links.";
     text_setting(ui, "Unpaywall email", about, &mut app.settings.unpaywall_email, "Optional: you@example.org", false);
+    let about = "Lists itch.io games, jam entries, collections and your library (itch.io/my-purchases) through itch.io's API, \
+                 which needs your own key (itch.io/user/settings/api-keys): games you own and free ones. Sent only to itch.io; \
+                 saved in the settings only, never with the queue or in the history.";
+    text_setting(ui, "itch.io API key", about, &mut app.settings.itch_key, "Optional", true);
     setting(ui, "Browser cookies", "Sign in to sites as in this browser, for videos and folders that need it.", app.settings.browser_cookies, |ui| {
         combo(ui, "browser_cookies_combo", &mut app.settings.browser_cookies, &BROWSERS);
     });
