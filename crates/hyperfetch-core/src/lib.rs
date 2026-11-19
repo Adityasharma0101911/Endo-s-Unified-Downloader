@@ -59,6 +59,7 @@ pub mod packages;
 pub mod itch;
 pub mod kaggle;
 pub mod osm;
+pub mod subtitles;
 pub mod helpers;
 pub mod accounts;
 pub mod rclone;

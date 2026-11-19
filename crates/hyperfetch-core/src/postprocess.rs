@@ -1,5 +1,6 @@
 //! What happens to a download once it is on disk: Mark-of-the-Web, archive extraction, sorting
-//! into category folders, a VirusTotal lookup and the user's command, in that order.
+//! into category folders, a VirusTotal lookup, subtitles for a video and the user's command, in
+//! that order.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -30,11 +31,15 @@ pub struct PostOptions {
     /// The VirusTotal API key to look the file's hash up with. Never saved with the options.
     #[serde(skip)]
     pub virustotal_key: Option<String>,
+    /// Subtitles to find for a video once it is downloaded (see `crate::subtitles`). Never saved
+    /// with the options.
+    #[serde(skip)]
+    pub subtitles: Option<crate::subtitles::Subtitles>,
 }
 
 impl Default for PostOptions {
     fn default() -> Self {
-        Self { extract: false, delete_archive: false, sort: false, run_after: None, mark_of_the_web: true, virustotal_key: None }
+        Self { extract: false, delete_archive: false, sort: false, run_after: None, mark_of_the_web: true, virustotal_key: None, subtitles: None }
     }
 }
 
@@ -110,6 +115,12 @@ pub async fn after_download(path: &Path, post: &PostOptions, source: &Url, proxy
     if let (Some(key), Some(sha256)) = (key, sha256) {
         notes.push(virustotal(VIRUSTOTAL, &sha256, &key, proxy).await);
     }
+    if let Some(subs) = post.subtitles.as_ref().filter(|_| path.is_file() && is_video(&path)) {
+        notes.push(match crate::subtitles::find(&path, subs, proxy).await {
+            Ok(saved) => format!("Subtitles: {}", saved.iter().map(|p| file_name(p)).collect::<Vec<_>>().join(", ")),
+            Err(e) => format!("Subtitles: {e}"),
+        });
+    }
     if let Some(command) = post.run_after.as_deref().filter(|c| !c.trim().is_empty()) {
         notes.extend(run_after(command, &path, source).await);
     }
@@ -156,6 +167,12 @@ fn on_disk(mut path: PathBuf, post: &PostOptions, source: &Url, hash: bool, pass
         }
     }
     (path, notes, sha256)
+}
+
+/// Whether `path` names a video, by the extensions of the Video category.
+pub fn is_video(path: &Path) -> bool {
+    let ext = path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    CATEGORIES[0].1.contains(&ext.as_str())
 }
 
 fn file_name(path: &Path) -> String {

@@ -269,6 +269,7 @@ enum Act {
     Verify(std::path::PathBuf, u64),
     Reveal(std::path::PathBuf),
     Copy(String),
+    Subtitles(std::path::PathBuf),
 }
 
 fn act(app: &mut App, what: Act) {
@@ -288,6 +289,7 @@ fn act(app: &mut App, what: Act) {
         Act::Verify(path, size) => app.verify(VerifyRequest { path, expected_size: (size > 0).then_some(size), checksum: None }),
         Act::Reveal(path) => report(app, util::reveal_in_folder(&path)),
         Act::Copy(link) => app.copy_text(link),
+        Act::Subtitles(video) => app.find_subtitles(video),
     }
 }
 
@@ -328,7 +330,9 @@ fn library_row(app: &App, ui: &mut Ui, entry: &HistoryEntry, today: i64, offset:
     anim::paint_icon(ui.painter(), badge.center(), glyph, 16.0, color, 0.0);
     ui.add_space(4.0);
     let idle = !app.verifying && app.repair.is_none();
-    let buttons = 5.0 * 32.0 + 12.0;
+    // A finished video can look for its subtitles (see `App::find_subtitles`).
+    let video = matches!(entry.status, HistoryStatus::Completed) && hyperfetch_core::postprocess::is_video(&entry.file_path);
+    let buttons = if video { 6.0 } else { 5.0 } * 32.0 + 12.0;
     left_part(ui, buttons, |ui| {
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
@@ -371,6 +375,9 @@ fn library_row(app: &App, ui: &mut Ui, entry: &HistoryEntry, today: i64, offset:
         }
         if icon_button(ui, icon::FOLDER_OPEN, "Show in its folder", true).clicked() {
             *action = Some(Act::Reveal(entry.file_path.clone()));
+        }
+        if video && icon_button(ui, icon::SUBTITLES, "Find subtitles on OpenSubtitles", true).clicked() {
+            *action = Some(Act::Subtitles(entry.file_path.clone()));
         }
         if let Some(url) = entry.urls.first() {
             if icon_button(ui, icon::COPY, "Copy the link", true).clicked() {

@@ -605,6 +605,7 @@ fn job(args: &Args, connections: u64, dir: &Path, task: Task) -> Job {
             run_after: args.exec.clone(),
             mark_of_the_web: !args.no_mark_of_the_web,
             virustotal_key: args.virustotal_key.clone(),
+            subtitles: subtitles(args),
         },
         ..tuning(args, if media { args.concurrent_fragments } else { connections })
     };
@@ -612,6 +613,17 @@ fn job(args: &Args, connections: u64, dir: &Path, task: Task) -> Job {
 }
 
 /// How a link that lists many downloads (a folder, feed, playlist or channel) is read.
+/// What --find-subtitles asks of OpenSubtitles; the account's password comes from the
+/// environment alone.
+fn subtitles(args: &Args) -> Option<hyperfetch_core::subtitles::Subtitles> {
+    (!args.find_subtitles.is_empty()).then(|| hyperfetch_core::subtitles::Subtitles {
+        api_key: args.opensubtitles_key.clone().unwrap_or_default(),
+        languages: args.find_subtitles.clone(),
+        user: args.opensubtitles_user.clone(),
+        password: std::env::var("ENDO_OPENSUBTITLES_PASSWORD").ok(),
+    })
+}
+
 fn list_options(args: &Args) -> ListOptions {
     let cookies = match (args.cookies_from_browser, &args.load_cookies) {
         (Some(browser), _) => browser.into(),

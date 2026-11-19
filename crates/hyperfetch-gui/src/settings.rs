@@ -184,6 +184,14 @@ pub struct Settings {
     pub itch_key: String,
     /// Where the user's kaggle.json is (see `hyperfetch_core::kaggle`); its usual place when empty.
     pub kaggle_json: String,
+    /// OpenSubtitles, for the Library's Find subtitles (see `hyperfetch_core::subtitles`): the
+    /// user's API key and user name, saved here (never with the queue or in the history); the
+    /// password only for this run, never saved; the languages, comma-separated.
+    pub opensubtitles_key: String,
+    pub opensubtitles_user: String,
+    #[serde(skip)]
+    pub opensubtitles_password: String,
+    pub subtitle_languages: String,
     /// Look each downloaded file's SHA-256 up on VirusTotal (the hash only, never the file).
     pub virustotal_check: bool,
     /// 0 follows the system, 1 dark, 2 light.
@@ -348,6 +356,10 @@ impl Default for Settings {
             unpaywall_email: String::new(),
             itch_key: String::new(),
             kaggle_json: String::new(),
+            opensubtitles_key: String::new(),
+            opensubtitles_user: String::new(),
+            opensubtitles_password: String::new(),
+            subtitle_languages: "en".to_string(),
             remote_time: engine.remote_time,
             adaptive: true,
             user_agent: String::new(),
@@ -489,6 +501,7 @@ impl Settings {
                 mark_of_the_web: self.mark_of_the_web,
                 // Never saved with the queue: see `fill_keys`.
                 virustotal_key: None,
+                subtitles: None,
             },
             // What the Streams section shows as refused is left out.
             tracks: TrackChoice {
@@ -525,6 +538,16 @@ impl Settings {
         options.s3 = self.s3_key();
         options.ssh_key = self.ssh_key();
         options.nntp = self.nntp_servers();
+    }
+
+    /// What finding subtitles asks of OpenSubtitles, when its API key is set.
+    pub fn subtitles(&self) -> Option<hyperfetch_core::subtitles::Subtitles> {
+        Some(hyperfetch_core::subtitles::Subtitles {
+            api_key: non_empty(&self.opensubtitles_key)?,
+            languages: self.subtitle_languages.split(',').map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect(),
+            user: non_empty(&self.opensubtitles_user),
+            password: non_empty(&self.opensubtitles_password),
+        })
     }
 
     /// The Usenet servers of [`Settings::usenet_servers`], in their order; a link that is none is
