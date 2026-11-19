@@ -9,12 +9,14 @@
 //! the `.part` file, as the HTTP workers write their ranges out of order. An article a server lacks
 //! (430) or holds damaged goes to the next server by priority; one no server gives fails the
 //! download, which keeps what it has: which articles are done is saved beside the `.part`, and the
-//! next run asks only for the rest. The whole file's CRC-32 is checked when a header gives it.
+//! next run asks only for the rest. A file is done only when its parts cover it whole, and the
+//! whole file's CRC-32 is checked when a header gives it. A server's connections are counted
+//! across every download (see [`slots`]).
 //!
 //! A file is named by the NZB's subject, else by its yEnc header; when a PAR2 set is in its folder
 //! (`.par2`), the file is checked against it and given the name it has there when it was posted
 //! under another (an obfuscated post). PAR2 sets are checked, not repaired: a damaged file fails,
-//! saying how many blocks a PAR2 tool would have to repair.
+//! saying how many blocks a PAR2 tool would have to repair, and stays a `.part`.
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -22,7 +24,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -31,12 +33,12 @@ use parking_lot::Mutex;
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufStream};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-use crate::engine::{DownloadOptions, EngineSnapshot, CANCELLED};
+use crate::engine::{DownloadOptions, EngineSnapshot, TargetClaim, CANCELLED};
 use crate::ingest::{clean_path, Task};
 use crate::storage::DiskWriter;
 use crate::worker::RateLimiter;
@@ -51,8 +53,7 @@ const PIPELINE: usize = 4;
 const MAX_LINE: u64 = 16 * 1024;
 /// Largest article read (a yEnc part is usually under 1 MB).
 const MAX_ARTICLE: usize = 16 << 20;
-/// Largest NZB read, and most articles of all its files.
-const MAX_NZB: usize = 16 << 20;
+/// Most articles of all an NZB's files.
 const MAX_SEGMENTS: usize = 2_000_000;
 /// Segments of a file tried for its first part (its name and size) before giving up.
 const FIRST_TRIES: usize = 5;
@@ -63,6 +64,8 @@ const SAVE_EVERY: Duration = Duration::from_secs(2);
 /// How often a backup server's idle connection looks for articles the servers before it lacked.
 const WAIT: Duration = Duration::from_millis(50);
 pub const NO_SERVER: &str = "An NZB downloads from a Usenet server of your own provider's account: add one (host, user name, password) in the settings or with --nntp-server";
+/// Why a server answers 480 to an article: it is asked without a user name.
+const SIGN_IN: &str = "asks to sign in: add the user name and password of your account to this server";
 
 /// A Usenet server of the user's own account (see `DownloadOptions::nntp`).
 #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -74,7 +77,8 @@ pub struct Server {
     pub tls: bool,
     pub user: String,
     pub password: String,
-    /// Connections a download opens to it at once: the provider's limit is the user's to set.
+    /// Connections open to it at once, across every download (see [`slots`]): the provider's
+    /// limit is the user's to set.
     pub connections: usize,
     /// Servers are asked lowest first; a later one only for the articles those before it lack.
     pub priority: u32,
@@ -243,13 +247,26 @@ pub(crate) fn handles(url: &Url) -> bool {
     url.scheme() == SCHEME
 }
 
-/// One download per file of the NZB `bytes`, read from `source` (its link, or a local one's
-/// `file:` URL), in a folder named after its title (else after the NZB): `nzb:<source>#<n>`,
-/// which the download reads the NZB again by.
+fn parse_bytes(bytes: &[u8]) -> Result<Nzb, String> {
+    parse_nzb(&crate::ingest::decode_text(bytes).unwrap_or_else(|_| String::from_utf8_lossy(bytes).into_owned()))
+}
+
+/// Whether `bytes` read as an NZB.
+pub(crate) fn is_nzb(bytes: &[u8]) -> bool {
+    parse_bytes(bytes).is_ok()
+}
+
+/// One download per file of the NZB `bytes`, found at `source` (its link, or a local one's `file:`
+/// URL), in a folder named after its title (else after the NZB). The NZB is kept (see [`keep`])
+/// for the downloads to read.
 pub(crate) fn tasks(bytes: &[u8], source: &Url) -> Result<Vec<Task>, String> {
-    let nzb = parse_nzb(&crate::ingest::decode_text(bytes).unwrap_or_else(|_| String::from_utf8_lossy(bytes).into_owned()))?;
-    let mut source = source.clone();
-    source.set_fragment(None);
+    parse_bytes(bytes)?;
+    tasks_from(bytes, source, &keep(bytes)?)
+}
+
+/// [`tasks`], each `nzb:<kept>#<n>`: `kept` the `file:` URL the download reads the NZB from.
+fn tasks_from(bytes: &[u8], source: &Url, kept: &Url) -> Result<Vec<Task>, String> {
+    let nzb = parse_bytes(bytes)?;
     let stem = source.path_segments().and_then(|mut s| s.next_back()).map(|last| percent_encoding::percent_decode_str(last).decode_utf8_lossy().into_owned());
     let stem = stem.as_deref().map(|last| last.rsplit_once('.').map_or(last, |(stem, _)| stem).to_string());
     let folder = nzb.title.iter().chain(&stem).find_map(|name| clean_path([crate::ingest::truncate_chars(name.trim(), 100).as_str()]).ok());
@@ -258,7 +275,7 @@ pub(crate) fn tasks(bytes: &[u8], source: &Url) -> Result<Vec<Task>, String> {
         .enumerate()
         .map(|(n, file)| {
             Ok(Task {
-                urls: vec![Url::parse(&format!("{SCHEME}:{source}#{n}")).map_err(|e| format!("the NZB's link cannot be kept: {e}"))?],
+                urls: vec![Url::parse(&format!("{SCHEME}:{kept}#{n}")).map_err(|e| format!("the NZB's link cannot be kept: {e}"))?],
                 name: subject_name(&file.subject).and_then(|name| clean_path([name.as_str()]).ok()),
                 folder: folder.clone(),
                 // Its articles come from the user's Usenet servers, none of the hosts the user typed.
@@ -276,31 +293,39 @@ fn link_parts(link: &Url) -> Result<(Url, usize), String> {
     Ok((Url::parse(source).map_err(|_| broken())?, n.parse().map_err(|_| broken())?))
 }
 
-/// The NZB at `source`: a local file, or a link fetched as the download's options say.
-async fn read_source(source: &Url, options: &DownloadOptions) -> Result<Vec<u8>, String> {
-    if source.scheme() == "file" {
-        let path = source.to_file_path().map_err(|_| format!("{source} is no usable path"))?;
-        return crate::ingest::read_local(&path).await;
-    }
-    let http = crate::ingest::descriptor_client(options.proxy.as_deref())?;
-    let failed = |e: reqwest::Error| format!("Cannot fetch the NZB again: {}", e.without_url());
-    let answer = http.get(source.clone()).send().await.and_then(reqwest::Response::error_for_status).map_err(failed)?;
-    if answer.content_length().is_some_and(|n| n > MAX_NZB as u64) {
-        return Err("the NZB is larger than the app reads".to_string());
-    }
-    let bytes = answer.bytes().await.map_err(failed)?;
-    if bytes.len() > MAX_NZB {
-        return Err("the NZB is larger than the app reads".to_string());
-    }
-    Ok(bytes.to_vec())
+/// Keeps the NZB `bytes` in the app's data folder, once, for its files' downloads to read later:
+/// nothing is fetched again (an indexer counts every fetch, and its link may carry the account's
+/// key), and a local NZB moved or deleted meanwhile is no loss. Its `file:` URL.
+pub(crate) fn keep(bytes: &[u8]) -> Result<Url, String> {
+    let dir = crate::media::app_data_dir().ok_or("the app has no data folder to keep the NZB in")?.join("nzb");
+    keep_in(bytes, &dir)
 }
 
-/// A decoded yEnc part: the file's name and size from its header, where the part goes in it, its
-/// bytes, and the whole file's CRC-32 when the article gives it.
+/// [`keep`] into `dir`, the copy named by its SHA-256.
+fn keep_in(bytes: &[u8], dir: &Path) -> Result<Url, String> {
+    let path = dir.join(format!("{:x}.nzb", sha2::Sha256::digest(bytes)));
+    if !path.is_file() {
+        let fail = |e: std::io::Error| format!("Cannot keep the NZB in {}: {e}", dir.display());
+        std::fs::create_dir_all(dir).map_err(fail)?;
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, &path)).map_err(fail)?;
+    }
+    Url::from_file_path(&path).map_err(|()| format!("{} is no usable path", path.display()))
+}
+
+/// The NZB kept at `source` (see [`keep`]).
+async fn read_source(source: &Url) -> Result<Vec<u8>, String> {
+    let path = source.to_file_path().map_err(|()| format!("{source} is no NZB the app kept: add the NZB again"))?;
+    crate::ingest::read_local(&path).await
+}
+
+/// A decoded yEnc part: the file's name, size and count of parts from its header, where the part
+/// goes in it, its bytes, and the whole file's CRC-32 when the article gives it.
 #[derive(Debug, PartialEq)]
 struct Part {
     name: String,
     size: u64,
+    total: Option<u64>,
     offset: u64,
     data: Vec<u8>,
     file_crc: Option<u32>,
@@ -376,7 +401,7 @@ fn decode(body: &[u8]) -> Result<Part, String> {
         return Err("the yEnc part fails its CRC-32 check".to_string());
     }
     let file_crc = if range.is_none() { Some(crc) } else { key_crc(&tail, "crc32") };
-    Ok(Part { name, size, offset: begin - 1, data, file_crc })
+    Ok(Part { name, size, total: key_u64(&head, "total"), offset: begin - 1, data, file_crc })
 }
 
 /// Why a server did not give what it was asked.
@@ -412,15 +437,33 @@ fn tls_connector() -> Result<tokio_rustls::TlsConnector, String> {
     Ok(tokio_rustls::TlsConnector::from(Arc::new(config)))
 }
 
-/// A connection to a server, signed in.
+/// The connections each server (host, port and user) may have open, shared by every download: a
+/// provider's limit is the account's, not a download's.
+fn slots(server: &Server) -> Arc<Semaphore> {
+    static SLOTS: LazyLock<Mutex<HashMap<String, (usize, Arc<Semaphore>)>>> = LazyLock::new(Mutex::default);
+    let size = server.connections.clamp(1, MAX_CONNECTIONS);
+    let key = format!("{}:{}/{}", server.host.to_ascii_lowercase(), server.port(), server.user);
+    let mut slots = SLOTS.lock();
+    let slot = slots.entry(key).or_insert_with(|| (size, Arc::new(Semaphore::new(size))));
+    // shortcut: a changed setting starts a fresh count, so connections opened under the old one go uncounted until they close.
+    if slot.0 != size {
+        *slot = (size, Arc::new(Semaphore::new(size)));
+    }
+    Arc::clone(&slot.1)
+}
+
+/// A connection to a server, signed in, holding one of its [`slots`].
 struct Conn {
     io: BufStream<Box<dyn Stream>>,
     stall: Duration,
+    _slot: OwnedSemaphorePermit,
 }
 
 impl Conn {
+    /// Waits for a free slot of `server`, then connects and signs in.
     async fn open(server: &Server, stall: Duration) -> Result<Self, Failure> {
         server.check().map_err(Failure::Refused)?;
+        let slot = slots(server).acquire_owned().await.map_err(|e| Failure::Broken(e.to_string()))?;
         let host = &server.host;
         let broken = |why: String| Failure::Broken(format!("{host}: {why}"));
         let connect = tokio::net::TcpStream::connect((host.as_str(), server.port()));
@@ -433,7 +476,7 @@ impl Conn {
         } else {
             Box::new(tcp)
         };
-        let mut conn = Self { io: BufStream::new(io), stall };
+        let mut conn = Self { io: BufStream::new(io), stall, _slot: slot };
         match conn.reply().await.map_err(broken)? {
             (200 | 201, _) => {}
             (400 | 502, text) => return Err(Failure::Busy(format!("{host}: {text}"))),
@@ -496,7 +539,8 @@ impl Conn {
 
     /// Asks for every article of `ids` at once (`BODY`), then reads the answers in turn: each the
     /// part, or why not (the server lacks it: 430; it is damaged). The error that broke the
-    /// connection, if one did; the answers after it are unknown.
+    /// connection, if one did ([`SIGN_IN`] when it asks to sign in); the answers after it are
+    /// unknown.
     async fn bodies(&mut self, ids: &[&str]) -> (Vec<Result<Part, String>>, Option<String>) {
         let mut found = Vec::new();
         let asked: String = ids.iter().map(|id| format!("BODY <{id}>\r\n")).collect();
@@ -510,6 +554,7 @@ impl Conn {
                     Err(e) => return (found, Some(e)),
                 },
                 Ok((code @ (430 | 423), _)) => Err(format!("no such article ({code})")),
+                Ok((480, _)) => return (found, Some(SIGN_IN.to_string())),
                 Ok((code, text)) => return (found, Some(format!("answered {code} {text}"))),
                 Err(e) => return (found, Some(e)),
             };
@@ -547,7 +592,25 @@ struct Saved {
     size: u64,
     /// One bit per segment, base64.
     done: String,
+    /// The bytes of the file those segments wrote (see [`cover`]).
+    spans: Vec<(u64, u64)>,
     file_crc: Option<u32>,
+}
+
+/// Adds the bytes `start..end` to `spans`, the runs of bytes written (in order, apart), merging
+/// the runs it meets.
+fn cover(spans: &mut Vec<(u64, u64)>, start: u64, end: u64) {
+    let at = spans.partition_point(|run| run.1 < start);
+    let (mut start, mut end, mut stop) = (start, end, at);
+    while stop < spans.len() && spans[stop].0 <= end {
+        (start, end) = (start.min(spans[stop].0), end.max(spans[stop].1));
+        stop += 1;
+    }
+    spans.splice(at..stop, [(start, end)]);
+}
+
+fn covered(spans: &[(u64, u64)]) -> u64 {
+    spans.iter().map(|(start, end)| end - start).sum()
 }
 
 fn state_path(target: &Path) -> PathBuf {
@@ -564,18 +627,22 @@ fn bits(done: &[bool]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
+/// What a download has done: the file's size, the segments done, the bytes they wrote (see
+/// [`cover`]) and the whole file's CRC-32 when an article gave it.
+type State = (u64, Vec<bool>, Vec<(u64, u64)>, Option<u32>);
+
 /// The state of `file`'s download into `target`, when its `.part` is still there.
-fn load_state(target: &Path, file: &NzbFile) -> Option<(u64, Vec<bool>, Option<u32>)> {
+fn load_state(target: &Path, file: &NzbFile) -> Option<State> {
     if !crate::engine::part_path(target).is_file() {
         return None;
     }
     let saved: Saved = serde_json::from_slice(&std::fs::read(state_path(target)).ok()?).ok()?;
-    if saved.first != file.segments.first()?.id || saved.size == 0 {
+    if saved.first != file.segments.first()?.id || saved.size == 0 || saved.spans.iter().any(|&(start, end)| start >= end || end > saved.size) {
         return None;
     }
     let bytes = base64::engine::general_purpose::STANDARD.decode(saved.done).ok()?;
     let done = (0..file.segments.len()).map(|n| bytes.get(n / 8).is_some_and(|b| b & (1 << (n % 8)) != 0)).collect();
-    Some((saved.size, done, saved.file_crc))
+    Some((saved.size, done, saved.spans, saved.file_crc))
 }
 
 /// What the workers share: the segments, which server's turn each is, and the file.
@@ -604,8 +671,8 @@ struct Board {
     /// Broken connections a segment met on its server.
     tries: HashMap<usize, u32>,
     done: Vec<bool>,
-    /// Bytes of the file the done segments hold.
-    covered: u64,
+    /// The bytes of the file the done segments wrote (see [`cover`]).
+    spans: Vec<(u64, u64)>,
     /// Segments no server gave.
     missing: Vec<usize>,
     file_crc: Option<u32>,
@@ -674,12 +741,30 @@ impl Job {
 
     /// Server `s` is asked no more, for `why`: its segments go on to the next.
     fn server_out(&self, s: usize, why: String) {
+        Self::put_out(&mut self.board.lock(), s, why);
+    }
+
+    fn put_out(b: &mut Board, s: usize, why: String) {
         tracing::warn!("{why}");
-        let mut b = self.board.lock();
         b.out[s] = Some(why);
         while let Some(seg) = b.queues[s].pop_front() {
-            Self::pass_on(&mut b, s, seg);
+            Self::pass_on(b, s, seg);
         }
+    }
+
+    /// A worker of server `s` stops; with `if_others`, only while other workers of it are left.
+    /// The last one to stop for a failure (`why`) puts the server out, so that the segments left
+    /// to it go on instead of waiting for no one.
+    fn leave(&self, s: usize, why: Option<String>, if_others: bool) -> bool {
+        let mut b = self.board.lock();
+        if if_others && b.alive[s] <= 1 {
+            return false;
+        }
+        b.alive[s] -= 1;
+        if let Some(why) = why.filter(|_| b.alive[s] == 0 && b.out[s].is_none()) {
+            Self::put_out(&mut b, s, why);
+        }
+        true
     }
 
     /// Writes `part` where it goes and counts `seg` done.
@@ -695,10 +780,8 @@ impl Job {
             .map_err(|e| format!("Disk write error: {e}"))?;
         self.received.fetch_add(len, Ordering::Relaxed);
         let mut b = self.board.lock();
-        if !b.done[seg] {
-            b.done[seg] = true;
-            b.covered += len;
-        }
+        b.done[seg] = true;
+        cover(&mut b.spans, offset, offset + len);
         b.tries.remove(&seg);
         b.file_crc = b.file_crc.or(crc);
         Ok(())
@@ -706,7 +789,7 @@ impl Job {
 
     fn state(&self) -> Saved {
         let b = self.board.lock();
-        Saved { first: self.segments[0].id.clone(), size: self.size, done: bits(&b.done), file_crc: b.file_crc }
+        Saved { first: self.segments[0].id.clone(), size: self.size, done: bits(&b.done), spans: b.spans.clone(), file_crc: b.file_crc }
     }
 }
 
@@ -715,7 +798,7 @@ impl Job {
 /// what the others lack.
 async fn work(job: Arc<Job>, s: usize, cancel: CancellationToken) {
     let server = &job.servers[s];
-    let (mut conn, mut failures) = (None::<Conn>, 0u32);
+    let (mut conn, mut failures, mut left) = (None::<Conn>, 0u32, false);
     loop {
         let batch = match job.take(s) {
             Take::Done => break,
@@ -747,14 +830,14 @@ async fn work(job: Arc<Job>, s: usize, cancel: CancellationToken) {
                     let why = failure.text();
                     job.give_back(s, &batch, !busy);
                     failures += 1;
-                    let others = job.board.lock().alive[s] > 1;
                     // A server that takes fewer connections keeps those it took.
-                    if busy && others {
+                    if busy && job.leave(s, None, true) {
                         tracing::info!("{why}: one connection fewer");
+                        left = true;
                         break;
                     }
-                    if failures > job.max_retries && !others {
-                        job.server_out(s, why);
+                    if failures > job.max_retries {
+                        left = job.leave(s, Some(why), false);
                         break;
                     }
                     tokio::select! {
@@ -788,6 +871,11 @@ async fn work(job: Arc<Job>, s: usize, cancel: CancellationToken) {
             }
         }
         match broke {
+            Some(why) if why == SIGN_IN => {
+                job.give_back(s, &batch[answered..], false);
+                job.server_out(s, format!("{} {SIGN_IN}", server.host));
+                break;
+            }
             Some(why) => {
                 tracing::info!("{}: {why}; connecting again", server.host);
                 conn = None;
@@ -800,7 +888,9 @@ async fn work(job: Arc<Job>, s: usize, cancel: CancellationToken) {
     if let Some(open) = conn {
         open.quit().await;
     }
-    job.board.lock().alive[s] -= 1;
+    if !left {
+        job.leave(s, None, false);
+    }
 }
 
 /// The first part a server gives of the first few segments, and its segment: it names the file
@@ -813,7 +903,8 @@ async fn first_part(servers: &[Server], segments: &[Segment], stall: Duration) -
                 let mut conn = Conn::open(server, stall).await.map_err(Failure::text)?;
                 let (mut answers, broke) = conn.bodies(&[segment.id.as_str()]).await;
                 conn.quit().await;
-                answers.pop().unwrap_or_else(|| Err(broke.unwrap_or_default()))
+                let host = &server.host;
+                answers.pop().unwrap_or_else(|| Err(broke.unwrap_or_default())).map_err(|e| if e == SIGN_IN { format!("{host} {e}") } else { format!("{host}: {e}") })
             };
             match got.await {
                 Ok(part) => return Ok((at, part)),
@@ -821,7 +912,7 @@ async fn first_part(servers: &[Server], segments: &[Segment], stall: Duration) -
             }
         }
     }
-    let shown = why.iter().find(|e| e.contains("refused")).or(why.first()).cloned().unwrap_or_default();
+    let shown = why.iter().find(|e| e.contains("refused") || e.contains(SIGN_IN)).or(why.first()).cloned().unwrap_or_default();
     Err(format!("No Usenet server gave the file's first articles ({shown})"))
 }
 
@@ -872,41 +963,61 @@ async fn download(
     }
     servers.sort_by_key(|s| s.priority);
     let (source, n) = link_parts(link)?;
-    let bytes = read_source(&source, options).await?;
-    let nzb = parse_nzb(&crate::ingest::decode_text(&bytes).unwrap_or_else(|_| String::from_utf8_lossy(&bytes).into_owned()))?;
+    let nzb = parse_bytes(&read_source(&source).await?)?;
     let file = nzb.files.into_iter().nth(n).ok_or("the NZB no longer lists this file")?;
     let stall = Duration::from_secs(options.stall_timeout_secs.max(5));
     let named = options.output_path.clone().filter(|p| !crate::engine::is_dir_target(p));
 
     // A download begun before goes on where it stopped; else the first part names the file.
     let mut first = None;
-    let (target, (size, done, file_crc)) = match named.as_ref().and_then(|t| Some((t.clone(), load_state(t, &file)?))) {
-        Some(resumed) => resumed,
+    let (target, (size, done, spans, file_crc), _claim) = match named.as_ref().and_then(|t| Some((t.clone(), load_state(t, &file)?))) {
+        Some((target, state)) => {
+            let claim = take_target(&target)?;
+            (target, state, claim)
+        }
         None => {
             let (at, part) = tokio::select! {
                 _ = cancel.cancelled() => return Err(CANCELLED.to_string()),
                 got = first_part(&servers, &file.segments, stall) => got?,
             };
-            let target = named.unwrap_or_else(|| {
-                let name = Some(part.name.as_str()).filter(|n| !n.is_empty()).map(str::to_string).or_else(|| subject_name(&file.subject)).unwrap_or_else(|| "file".to_string());
-                save_dir.join(crate::engine::sanitize_component(&name))
+            let base = named.unwrap_or_else(|| {
+                let name = Some(part.name.as_str()).filter(|n| !n.is_empty()).map(str::to_string).or_else(|| subject_name(&file.subject)).unwrap_or_default();
+                // A name of nothing usable (`..`) would be the folder itself.
+                let clean = crate::engine::sanitize_component(&name);
+                save_dir.join(if clean.is_empty() { "file" } else { clean.as_str() })
             });
-            let resumed = load_state(&target, &file);
-            let target = if resumed.is_some() { target } else { crate::engine::free_path(&target) };
-            let state = resumed.unwrap_or_else(|| (part.size, vec![false; file.segments.len()], None));
+            let listed = file.segments.len() as u64;
+            if let Some(total) = part.total.filter(|&total| total > listed) {
+                return Err(format!(
+                    "The NZB lists {listed} of the {total} articles of {}: the file cannot come out whole, and another NZB of the post may list them all",
+                    file_label(&base)
+                ));
+            }
+            let (target, state, claim) = match load_state(&base, &file) {
+                Some(state) => {
+                    let claim = take_target(&base)?;
+                    (base, state, claim)
+                }
+                None => {
+                    let (target, claim) = take_free_target(&base)?;
+                    (target, (part.size, vec![false; file.segments.len()], Vec::new(), None), claim)
+                }
+            };
             first = Some((at, part)).filter(|(at, part)| !state.1[*at] && part.size == state.0);
-            (target, state)
+            (target, state, claim)
         }
     };
+    // No article holds more than MAX_ARTICLE: a larger size is a broken or hostile header, and
+    // its `.part` would take the disk.
+    if size > file.segments.len() as u64 * MAX_ARTICLE as u64 {
+        return Err(format!("{} claims {size} bytes, more than its {} articles can hold: the post is broken", file_label(&target), file.segments.len()));
+    }
     if options.max_filesize.is_some_and(|max| size > max) {
         return Err(format!("{} is larger than the most allowed ({size} bytes)", target.display()));
     }
     let part_path = crate::engine::part_path(&target);
     let writer = DiskWriter::open_or_create(&part_path, size).map_err(|e| format!("Cannot create {}: {e}", part_path.display()))?;
     let pending: Vec<usize> = (0..file.segments.len()).filter(|&n| !done[n] && first.as_ref().is_none_or(|(at, _)| *at != n)).collect();
-    // What earlier runs wrote, as the parts are about as long as the segments are many.
-    let done_before = done.iter().filter(|d| **d).count();
-    let covered = if done_before == done.len() { size } else { size / done.len().max(1) as u64 * done_before as u64 };
     let count = servers.len();
     let job = Arc::new(Job {
         board: Mutex::new(Board {
@@ -916,7 +1027,7 @@ async fn download(
             out: vec![None; count],
             tries: HashMap::new(),
             done,
-            covered,
+            spans,
             missing: Vec::new(),
             file_crc,
             failed: None,
@@ -935,7 +1046,10 @@ async fn download(
     }
     let mut notes = Vec::new();
     if !pending.is_empty() {
-        let (asked, absent) = sample(&job.servers, &job.segments, &pending, stall).await;
+        let (asked, absent) = tokio::select! {
+            _ = cancel.cancelled() => return Err(CANCELLED.to_string()),
+            got = sample(&job.servers, &job.segments, &pending, stall) => got,
+        };
         if asked >= 3 && absent == asked {
             save(&job, &target);
             return Err(format!("None of {asked} articles of {} checked is on your Usenet servers: the post has expired or was taken down", file_label(&target)));
@@ -959,7 +1073,7 @@ async fn download(
         };
         if let Some(tx) = &snapshots {
             let b = job.board.lock();
-            let covered = b.covered.min(size);
+            let covered = covered(&b.spans).min(size);
             let _ = tx.send(EngineSnapshot {
                 total_bytes: size,
                 downloaded_bytes: covered,
@@ -982,39 +1096,82 @@ async fn download(
     if cancel.is_cancelled() {
         return Err(CANCELLED.to_string());
     }
-    let (missing, failed, all_done, file_crc) = {
+    let (missing, failed, all_done, spans, file_crc, out, segments) = {
         let b = job.board.lock();
-        (b.missing.len(), b.failed.clone(), b.done.iter().all(|d| *d), b.file_crc)
+        (b.missing.len(), b.failed.clone(), b.done.iter().all(|d| *d), b.spans.clone(), b.file_crc, b.out.iter().flatten().cloned().collect::<Vec<_>>(), job.segments.len())
     };
+    // The `.part` is closed before it is checked, renamed or deleted.
+    drop(job);
     if let Some(e) = failed {
         return Err(e);
     }
     if missing > 0 || !all_done {
-        let out: Vec<String> = job.board.lock().out.iter().flatten().cloned().collect();
         let why = if out.is_empty() { String::new() } else { format!(" ({})", out.join("; ")) };
         return Err(format!(
-            "{missing} of {} articles of {} are missing or damaged on every Usenet server{why}; what came is kept, and another server can be tried",
-            job.segments.len(),
+            "{missing} of {segments} articles of {} are missing or damaged on every Usenet server{why}; what came is kept, and another server can be tried",
             file_label(&target)
         ));
     }
-    drop(job);
+    // What came is no use and a next try starts over, as these servers' articles may differ.
+    let discard = |why: String| async {
+        let _ = tokio::fs::remove_file(&part_path).await;
+        let _ = tokio::fs::remove_file(state_path(&target)).await;
+        why
+    };
+    if spans != [(0, size)] {
+        let left_out = size - covered(&spans);
+        return Err(discard(format!("The articles of {} leave {left_out} of its {size} bytes out: the NZB lists not all of its parts, or they overlap", file_label(&target))).await);
+    }
     if let Some(crc) = file_crc {
         let path = part_path.clone();
         let found = tokio::task::spawn_blocking(move || crc_of(&path)).await.map_err(|e| e.to_string())?.map_err(|e| format!("Cannot read {}: {e}", part_path.display()))?;
         if found != crc {
-            return Err(format!("{} fails the CRC-32 its posting gives", file_label(&target)));
+            return Err(discard(format!("{} fails the CRC-32 its posting gives; it is downloaded again on the next try", file_label(&target))).await);
         }
     }
     tokio::fs::rename(&part_path, &target).await.map_err(|e| format!("Cannot rename {}: {e}", part_path.display()))?;
-    let _ = tokio::fs::remove_file(state_path(&target)).await;
     let checked = target.clone();
-    let (path, checked_notes) = tokio::task::spawn_blocking(move || par2::check(&checked)).await.map_err(|e| e.to_string())??;
+    let (path, checked_notes) = match tokio::task::spawn_blocking(move || par2::check(&checked)).await.map_err(|e| e.to_string())? {
+        Ok(checked) => checked,
+        Err(damaged) => {
+            // Kept with its state, so that a next try checks it again rather than downloading it
+            // again under another name.
+            let _ = tokio::fs::rename(&target, &part_path).await;
+            return Err(format!("{damaged}. It is kept as {}", file_label(&part_path)));
+        }
+    };
+    let _ = tokio::fs::remove_file(state_path(&target)).await;
     notes.extend(checked_notes);
     if let (Some(tx), false) = (&snapshots, notes.is_empty()) {
         let _ = tx.send(EngineSnapshot { total_bytes: size, downloaded_bytes: size, progress_ratio: 1.0, target_path: Some(path.clone()), notes, ..Default::default() });
     }
     Ok((path, true))
+}
+
+/// Claims `target` for this download (see `engine::claim_target`): another download of it, in
+/// this process or another, is refused.
+fn take_target(target: &Path) -> Result<TargetClaim, String> {
+    if let Some(dir) = target.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("Cannot create {}: {e}", dir.display()))?;
+    }
+    crate::engine::claim_target(target)?.ok_or_else(|| format!("{} is being downloaded by another download", file_label(target)))
+}
+
+/// The first of `base`, `base (1)`, ... that neither a file nor another download has, claimed.
+pub(crate) fn take_free_target(base: &Path) -> Result<(PathBuf, TargetClaim), String> {
+    if let Some(dir) = base.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("Cannot create {}: {e}", dir.display()))?;
+    }
+    let free = |path: &Path| !path.exists() && !crate::engine::part_path(path).exists();
+    for n in 0.. {
+        let candidate = crate::engine::numbered(base, n);
+        if free(&candidate) {
+            if let Some(claim) = crate::engine::claim_target(&candidate)?.filter(|_| free(&candidate)) {
+                return Ok((candidate, claim));
+            }
+        }
+    }
+    unreachable!("an endless range")
 }
 
 fn file_label(target: &Path) -> String {
@@ -1195,24 +1352,25 @@ mod par2 {
     }
 
     /// `path` checked against `set`, and named as the set names it when it was posted under another
-    /// name and that one is free. Err when it is damaged.
+    /// name and that one is free. Err when it is damaged, left as it is.
     fn one(set: &Set, path: &Path, recovery: u64) -> Result<(PathBuf, Option<String>), String> {
         let Some(desc) = desc_of(set, path) else { return Ok((path.to_path_buf(), None)) };
-        let (mut path, mut note) = (path.to_path_buf(), None);
+        let label = super::file_label(path);
+        let unchecked = match verify(set, desc, path) {
+            Ok(Verdict::Intact) => None,
+            Ok(Verdict::Damaged { bad, total }) => {
+                return Err(format!(
+                    "{label} does not match its PAR2 set: {bad} of {total} blocks are damaged, and {recovery} recovery blocks are in its folder. The app checks PAR2 sets but does not repair them: a PAR2 tool can, with at least {bad} recovery blocks"
+                ))
+            }
+            Err(e) => Some(format!("{label} could not be checked against its PAR2 set: {e}")),
+        };
         let clean = crate::engine::sanitize_component(&desc.name);
         let named = path.with_file_name(&clean);
-        if !clean.is_empty() && named != path && !named.exists() && std::fs::rename(&path, &named).is_ok() {
-            note = Some(format!("Renamed {} to {clean}, its name in the PAR2 set", super::file_label(&path)));
-            path = named;
+        if !clean.is_empty() && named != path && !named.exists() && std::fs::rename(path, &named).is_ok() {
+            return Ok((named, unchecked.or_else(|| Some(format!("Renamed {label} to {clean}, its name in the PAR2 set")))));
         }
-        let label = super::file_label(&path);
-        match verify(set, desc, &path) {
-            Ok(Verdict::Intact) => Ok((path, note.or_else(|| Some(format!("{label} matches its PAR2 set"))))),
-            Ok(Verdict::Damaged { bad, total }) => Err(format!(
-                "{label} does not match its PAR2 set: {bad} of {total} blocks are damaged, and {recovery} recovery blocks are in its folder. The app checks PAR2 sets but does not repair them: a PAR2 tool can, with at least {bad} recovery blocks"
-            )),
-            Err(e) => Ok((path, Some(format!("{label} could not be checked against its PAR2 set: {e}")))),
-        }
+        Ok((path.to_path_buf(), unchecked.or_else(|| Some(format!("{label} matches its PAR2 set")))))
     }
 
     /// Checks `done`, a file just downloaded, against the PAR2 set of its folder when one is there
@@ -1327,6 +1485,89 @@ mod tests {
         assert!(decode(cut).is_err());
         assert!(decode(b"hello\r\n").unwrap_err().contains("no yEnc"));
         assert_eq!(key("size=10 name=size=3 x", "size"), Some("10"));
+        assert_eq!((part.total, whole.total), (Some(3), None));
+    }
+
+    /// Workers of a server that fail at once leave one at a time: the last stays to try again, and
+    /// when it too gives up, what is queued for the server goes on to the next one.
+    #[test]
+    fn the_last_worker_of_a_server_hands_its_segments_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let job = Job {
+            segments: (0..4).map(|n| Segment { number: n + 1, id: format!("s{n}@test") }).collect(),
+            servers: vec![Server::default(), Server::default()],
+            board: Mutex::new(Board {
+                queues: vec![(0..4).collect(), VecDeque::new()],
+                busy: vec![0, 0],
+                alive: vec![2, 2],
+                out: vec![None, None],
+                tries: HashMap::new(),
+                done: vec![false; 4],
+                spans: Vec::new(),
+                missing: Vec::new(),
+                file_crc: None,
+                failed: None,
+            }),
+            writer: DiskWriter::open_or_create(dir.path().join("x.part"), 4).unwrap(),
+            limiter: None,
+            size: 4,
+            received: AtomicU64::new(0),
+            stall: Duration::from_secs(1),
+            max_retries: 1,
+        };
+        assert!(job.leave(0, None, true));
+        assert!(!job.leave(0, None, true), "the last worker stays");
+        assert!(matches!(job.take(1), Take::Wait));
+        assert!(job.leave(0, Some("busy".into()), false));
+        assert!(matches!(job.take(1), Take::Batch(batch) if batch == [0, 1, 2, 3]));
+        assert_eq!(job.board.lock().out[0].as_deref(), Some("busy"));
+    }
+
+    #[test]
+    fn runs_of_bytes_merge_as_they_meet() {
+        let mut spans = Vec::new();
+        for (start, end) in [(10, 20), (0, 5), (30, 40), (5, 10)] {
+            cover(&mut spans, start, end);
+        }
+        assert_eq!(spans, [(0, 20), (30, 40)]);
+        cover(&mut spans, 12, 18);
+        assert_eq!((spans.as_slice(), covered(&spans)), (&[(0, 20), (30, 40)][..], 30));
+        cover(&mut spans, 15, 35);
+        assert_eq!(spans, [(0, 40)]);
+    }
+
+    /// A connection over `io`, as if to a server.
+    async fn over(io: tokio::io::DuplexStream) -> Conn {
+        let slot = Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap();
+        Conn { io: BufStream::new(Box::new(io) as Box<dyn Stream>), stall: Duration::from_secs(10), _slot: slot }
+    }
+
+    /// A line longer than the app reads as one is cut there, and an article larger than it reads
+    /// ends the connection: neither is read whole into memory.
+    #[tokio::test]
+    async fn oversized_lines_and_articles_are_not_read_whole() {
+        let (client, mut server) = tokio::io::duplex(64 << 10);
+        let mut conn = over(client).await;
+        tokio::spawn(async move {
+            let _ = server.write_all(&vec![b'a'; 1 << 20]).await;
+        });
+        let refused = conn.reply().await.unwrap_err();
+        assert!(refused.starts_with("the server answered") && refused.len() < 200, "{refused}");
+
+        let (client, mut server) = tokio::io::duplex(64 << 10);
+        let mut conn = over(client).await;
+        tokio::spawn(async move {
+            let line = [vec![b'b'; 998], b"\r\n".to_vec()].concat();
+            let _ = server.write_all(b"222 0 <a@b>\r\n").await;
+            for _ in 0..MAX_ARTICLE / line.len() + 10 {
+                if server.write_all(&line).await.is_err() {
+                    return;
+                }
+            }
+            let _ = server.write_all(b".\r\n").await;
+        });
+        let (answers, broke) = conn.bodies(&["a@b"]).await;
+        assert!(answers.is_empty() && broke.as_deref() == Some("an article larger than the app reads"), "{broke:?}");
     }
 
     const NZB: &str = r#"<?xml version="1.0" encoding="iso-8859-1" ?>
@@ -1359,12 +1600,19 @@ mod tests {
         assert_eq!(nzb.title.as_deref(), Some("My Show"));
         let ids: Vec<&str> = nzb.files[0].segments.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(ids, ["p1@test", "p2@test", "p3@test", "p4@test", "p5@test"]);
+        // The NZB is kept once, by its contents, and its files read that copy: the indexer's link
+        // (and the account's key in it) is in none of them.
         let source = Url::parse("https://indexer.example/get/show.nzb?apikey=k").unwrap();
-        let tasks = tasks(NZB.as_bytes(), &source).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let kept = keep_in(NZB.as_bytes(), dir.path()).unwrap();
+        assert_eq!(keep_in(NZB.as_bytes(), dir.path()).unwrap(), kept);
+        assert_eq!(std::fs::read(kept.to_file_path().unwrap()).unwrap(), NZB.as_bytes());
+        let tasks = tasks_from(NZB.as_bytes(), &source, &kept).unwrap();
         let names: Vec<Option<&str>> = tasks.iter().map(|t| t.name.as_deref().and_then(Path::to_str)).collect();
         assert_eq!(names, [Some("data.bin"), None, Some("abc-mr2a.r01")]);
         assert!(tasks.iter().all(|t| t.folder.as_deref() == Some(Path::new("My Show")) && t.from_document && handles(&t.urls[0])));
-        assert_eq!(link_parts(&tasks[2].urls[0]).unwrap(), (source, 2));
+        assert!(tasks.iter().all(|t| !t.urls[0].as_str().contains("apikey")));
+        assert_eq!(link_parts(&tasks[2].urls[0]).unwrap(), (kept, 2));
         assert_eq!(subject_name("\"x.part01.rar\" yEnc (1/9)").as_deref(), Some("x.part01.rar"));
         assert!(parse_nzb("<nzb></nzb>").is_err() && parse_nzb("<html>").is_err());
         let server = Server::from_link("nntps://me:p%40ss@news.example.com?connections=20", 1).unwrap();
@@ -1374,19 +1622,69 @@ mod tests {
         assert!(Server::from_link("https://x", 0).is_err() && Server::from_link("nntps://a%0d%0aQUIT@x", 0).is_err());
     }
 
+    /// What a test news server saw.
+    #[derive(Default)]
+    struct Counts {
+        /// BODY requests answered with an article.
+        bodies: AtomicUsize,
+        /// Connections open now, and the most open at once.
+        open: AtomicUsize,
+        peak: AtomicUsize,
+        accepted: AtomicUsize,
+    }
+
+    /// A connection a test news server counts open while it lives.
+    struct Open(Arc<Counts>);
+
+    impl Open {
+        fn new(counts: &Arc<Counts>) -> Self {
+            let now = counts.open.fetch_add(1, Ordering::SeqCst) + 1;
+            counts.peak.fetch_max(now, Ordering::SeqCst);
+            Self(Arc::clone(counts))
+        }
+    }
+
+    impl Drop for Open {
+        fn drop(&mut self) {
+            self.0.open.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// How a test news server behaves.
+    #[derive(Clone, Copy, Default)]
+    struct Behaviour {
+        /// The user name and password it takes.
+        login: Option<(&'static str, &'static str)>,
+        /// Connections it serves; every one after is told it takes no more (502).
+        serves: Option<usize>,
+        /// How long it takes over each article.
+        delay: Duration,
+    }
+
     /// An NNTP server on 127.0.0.1 serving `articles` (message-id, yEnc body), signed in to as
-    /// `login` when given; counts the BODY requests it answers with an article.
-    async fn news(articles: Vec<(&'static str, Vec<u8>)>, login: Option<(&'static str, &'static str)>) -> (Server, Arc<AtomicUsize>) {
+    /// `login` when given.
+    async fn news(articles: Vec<(String, Vec<u8>)>, login: Option<(&'static str, &'static str)>) -> (Server, Arc<Counts>) {
+        news_with(articles, Behaviour { login, ..Behaviour::default() }).await
+    }
+
+    async fn news_with(articles: Vec<(String, Vec<u8>)>, behaviour: Behaviour) -> (Server, Arc<Counts>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let articles: Arc<HashMap<&str, Vec<u8>>> = Arc::new(articles.into_iter().collect());
-        let bodies = Arc::new(AtomicUsize::new(0));
-        let counted = Arc::clone(&bodies);
+        let articles: Arc<HashMap<String, Vec<u8>>> = Arc::new(articles.into_iter().collect());
+        let counts = Arc::new(Counts::default());
+        let seen = Arc::clone(&counts);
+        let Behaviour { login, serves, delay } = behaviour;
         tokio::spawn(async move {
             while let Ok((socket, _)) = listener.accept().await {
-                let (articles, counted) = (Arc::clone(&articles), Arc::clone(&counted));
+                let (articles, counted) = (Arc::clone(&articles), Arc::clone(&seen));
                 tokio::spawn(async move {
                     let mut io = BufStream::new(socket);
+                    if serves.is_some_and(|n| counted.accepted.fetch_add(1, Ordering::SeqCst) >= n) {
+                        let _ = io.write_all(b"502 too many connections\r\n").await;
+                        let _ = io.flush().await;
+                        return;
+                    }
+                    let open = Open::new(&counted);
                     let _ = io.write_all(b"200 test news\r\n").await;
                     let _ = io.flush().await;
                     let (mut signed, mut line) = (login.is_none(), String::new());
@@ -1407,6 +1705,8 @@ mod tests {
                                 _ => b"481 no\r\n".to_vec(),
                             },
                             "QUIT" => {
+                                // Counted closed before the client hears it, which may then connect again.
+                                drop(open);
                                 let _ = io.write_all(b"205 bye\r\n").await;
                                 let _ = io.flush().await;
                                 return;
@@ -1414,7 +1714,8 @@ mod tests {
                             _ if !signed => b"480 sign in first\r\n".to_vec(),
                             "BODY" | "STAT" => match articles.get(arg.trim_matches(['<', '>'])) {
                                 Some(body) if verb == "BODY" => {
-                                    counted.fetch_add(1, Ordering::SeqCst);
+                                    tokio::time::sleep(delay).await;
+                                    counted.bodies.fetch_add(1, Ordering::SeqCst);
                                     let mut out = format!("222 0 {arg}\r\n").into_bytes();
                                     for line in body.split_inclusive(|&b| b == b'\n') {
                                         if line.starts_with(b".") {
@@ -1438,12 +1739,12 @@ mod tests {
             }
         });
         let server = Server { host: "127.0.0.1".into(), port, tls: false, connections: 2, ..Server::default() };
-        (server, bodies)
+        (server, counts)
     }
 
     /// The five articles of a 50 000-byte file, the second damaged and the fourth missing where
     /// `broken` says.
-    fn articles(file: &[u8], broken: bool) -> Vec<(&'static str, Vec<u8>)> {
+    fn articles(file: &[u8], broken: bool) -> Vec<(String, Vec<u8>)> {
         let ids = ["p1@test", "p2@test", "p3@test", "p4@test", "p5@test"];
         let mut out = Vec::new();
         for (n, id) in ids.iter().enumerate() {
@@ -1452,10 +1753,225 @@ mod tests {
                 damage(&mut article);
             }
             if !(broken && n == 3) {
-                out.push((*id, article));
+                out.push((id.to_string(), article));
             }
         }
         out
+    }
+
+    /// `file` posted in `parts` parts as `name`, the articles' ids `<name>.<n>@test`.
+    fn post(name: &str, file: &[u8], parts: usize) -> Vec<(String, Vec<u8>)> {
+        let len = file.len().div_ceil(parts);
+        file.chunks(len).enumerate().map(|(n, data)| (format!("{name}.{}@test", n + 1), yenc(name, file, n * len, data, Some((n as u32 + 1, parts as u32))))).collect()
+    }
+
+    fn ids(articles: &[(String, Vec<u8>)]) -> Vec<String> {
+        articles.iter().map(|(id, _)| id.clone()).collect()
+    }
+
+    /// `article` without the whole file's CRC-32 (its trailer's `crc32=`) and its count of parts
+    /// (its header's `total=`).
+    fn bare(article: &[u8]) -> Vec<u8> {
+        let head = article.iter().position(|&b| b == b'\n').unwrap() + 1;
+        let tail = article[..article.len() - 1].iter().rposition(|&b| b == b'\n').unwrap() + 1;
+        let strip = |line: &[u8], key: &str| {
+            let text = String::from_utf8(line.to_vec()).unwrap();
+            format!("{}\r\n", text.trim_end().split(' ').filter(|w| !w.starts_with(key)).collect::<Vec<_>>().join(" ")).into_bytes()
+        };
+        [strip(&article[..head], "total="), article[head..tail].to_vec(), strip(&article[tail..], "crc32=")].concat()
+    }
+
+    /// An NZB of `files`: each one's name and its segments' ids, in order.
+    fn nzb_of(files: &[(&str, Vec<String>)]) -> String {
+        let mut out = String::from("<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n");
+        for (name, ids) in files {
+            out += &format!(" <file poster=\"a\" date=\"1\" subject=\"&quot;{name}&quot; yEnc (1/{})\"><segments>\n", ids.len());
+            for (n, id) in ids.iter().enumerate() {
+                out += &format!("  <segment bytes=\"1\" number=\"{}\">{id}</segment>\n", n + 1);
+            }
+            out += " </segments></file>\n";
+        }
+        out + "</nzb>\n"
+    }
+
+    /// The downloads of the NZB `text`, saved in `dir` as `post.nzb` and read from there.
+    fn listed(dir: &Path, text: &str) -> Vec<Task> {
+        let path = dir.join("post.nzb");
+        std::fs::write(&path, text).unwrap();
+        let link = Url::from_file_path(&path).unwrap();
+        tasks_from(text.as_bytes(), &link, &link).unwrap()
+    }
+
+    /// Downloads file `n` of the NZB `text` (see [`listed`]) into `dir`.
+    async fn fetch_file(dir: &Path, text: &str, n: usize, options: DownloadOptions) -> Result<(PathBuf, bool), String> {
+        let tasks = listed(dir, text);
+        run(&tasks[n].urls[0], &options, None, dir, None, CancellationToken::new()).await
+    }
+
+    fn into(target: &Path, servers: Vec<Server>) -> DownloadOptions {
+        DownloadOptions { output_path: Some(target.to_path_buf()), nntp: servers, max_retries: 1, ..Default::default() }
+    }
+
+    /// A server that takes no more connections, refusing them all at once, neither hangs the
+    /// download nor has it say "0 articles missing": alone, it says how many are missing and why;
+    /// with a backup server, the backup gives them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_server_refusing_every_connection_at_once_hands_its_articles_on() {
+        let file = bytes(50_000);
+        let dir = tempfile::tempdir().unwrap();
+        let nzb = NZB.replace("&lt;p1@test&gt;", "p1@test");
+        for backup in [false, true] {
+            // The first connection (the file's first article) is served, every one after refused.
+            let (busy, _) = news_with(articles(&file, false), Behaviour { serves: Some(1), ..Behaviour::default() }).await;
+            let mut servers = vec![Server { connections: 8, ..busy }];
+            if backup {
+                let (spare, _) = news(articles(&file, false), None).await;
+                servers.push(Server { priority: 1, ..spare });
+            }
+            let target = dir.path().join(format!("{backup}.bin"));
+            let done = tokio::time::timeout(Duration::from_secs(60), fetch_file(dir.path(), &nzb, 0, into(&target, servers))).await.expect("the download ends");
+            if backup {
+                assert_eq!(std::fs::read(done.unwrap().0).unwrap(), file);
+            } else {
+                let why = done.unwrap_err();
+                assert!(why.contains("4 of 5 articles") && why.contains("too many connections"), "{why}");
+            }
+        }
+    }
+
+    /// Two downloads from one server at once open no more connections together than its setting
+    /// says: a provider's limit is the account's, not a download's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn downloads_at_once_share_their_servers_connections() {
+        let (one, two) = (bytes(48_000), bytes(36_000).iter().map(|b| b ^ 0x5a).collect::<Vec<u8>>());
+        let (a, b) = (post("one.bin", &one, 12), post("two.bin", &two, 12));
+        let nzb = nzb_of(&[("one.bin", ids(&a)), ("two.bin", ids(&b))]);
+        let (server, counts) = news_with([a, b].concat(), Behaviour { delay: Duration::from_millis(15), ..Behaviour::default() }).await;
+        let dir = tempfile::tempdir().unwrap();
+        let tasks = listed(dir.path(), &nzb);
+        let (first, second) = (into(&dir.path().join("one.bin"), vec![server.clone()]), into(&dir.path().join("two.bin"), vec![server.clone()]));
+        let both = async {
+            tokio::join!(
+                run(&tasks[0].urls[0], &first, None, dir.path(), None, CancellationToken::new()),
+                run(&tasks[1].urls[0], &second, None, dir.path(), None, CancellationToken::new())
+            )
+        };
+        let (x, y) = tokio::time::timeout(Duration::from_secs(60), both).await.expect("the downloads end");
+        assert_eq!(std::fs::read(x.unwrap().0).unwrap(), one);
+        assert_eq!(std::fs::read(y.unwrap().0).unwrap(), two);
+        let peak = counts.peak.load(Ordering::SeqCst);
+        assert!(peak <= server.connections, "{peak} connections at once");
+    }
+
+    /// A file is done only when its parts cover it whole: an NZB that leaves a part out, or parts
+    /// that overlap, fail even when no article gives the whole file's CRC-32, and so does a size
+    /// its articles cannot hold, before anything is written; a whole post without one downloads.
+    #[tokio::test]
+    async fn a_file_is_done_only_when_its_parts_cover_it() {
+        let file = bytes(50_000);
+        let dir = tempfile::tempdir().unwrap();
+        let mut articles: Vec<(String, Vec<u8>)> = post("data.bin", &file, 5).into_iter().map(|(id, a)| (id, bare(&a))).collect();
+        let whole = ids(&articles);
+        // A third part that says it goes where the second does.
+        articles.push(("over@test".into(), bare(&yenc("data.bin", &file, 10_000, &file[10_000..20_000], Some((3, 5))))));
+        // Parts that give their count (5) and the whole file's CRC-32.
+        let counted = post("full.bin", &file, 5);
+        let counted_ids = ids(&counted);
+        articles.extend(counted);
+        // One part of 100 bytes of a file it says is 10 TB.
+        let small = bytes(100);
+        let mut big = bare(&yenc("big.bin", &small, 0, &small, Some((1, 1))));
+        let at = big.windows(9).position(|w| w == b"size=100 ").unwrap();
+        big.splice(at..at + 9, *b"size=10995116277760 ");
+        articles.push(("big@test".into(), big));
+        let (server, _) = news(articles, None).await;
+        let get = |name: &str, ids: Vec<String>| {
+            let (dir, target, server, text) = (dir.path().to_path_buf(), dir.path().join(name), server.clone(), nzb_of(&[(name, ids)]));
+            async move { fetch_file(&dir, &text, 0, into(&target, vec![server])).await }
+        };
+
+        let (done, _) = get("whole.bin", whole.clone()).await.unwrap();
+        assert_eq!(std::fs::read(done).unwrap(), file);
+        let lacking = [&whole[..2], &whole[3..]].concat();
+        let gap = get("gap.bin", lacking).await.unwrap_err();
+        assert!(gap.contains("leave 10000 of its 50000 bytes out"), "{gap}");
+        let overlapping = [&whole[..2], &["over@test".to_string()], &whole[3..]].concat();
+        let overlap = get("overlap.bin", overlapping).await.unwrap_err();
+        assert!(overlap.contains("leave 10000 of its 50000 bytes out"), "{overlap}");
+        let short = get("short.bin", [&counted_ids[..2], &counted_ids[3..]].concat()).await.unwrap_err();
+        assert!(short.contains("lists 4 of the 5 articles"), "{short}");
+        assert!(!crate::engine::part_path(&dir.path().join("short.bin")).exists());
+        let huge = get("big.bin", vec!["big@test".into()]).await.unwrap_err();
+        assert!(huge.contains("claims 10995116277760 bytes"), "{huge}");
+        assert!(!crate::engine::part_path(&dir.path().join("big.bin")).exists());
+    }
+
+    /// A file that fails the CRC-32 its posting gives is not kept as done: the next try
+    /// downloads it again, under the same name.
+    #[tokio::test]
+    async fn a_file_failing_its_crc_downloads_again_on_the_next_try() {
+        let file = bytes(30_000);
+        let wrong: Vec<u8> = file.iter().map(|b| b ^ 1).collect();
+        let parts = |whole: &[u8]| (0..3).map(|n| (format!("c{n}@test"), yenc("c.bin", whole, n * 10_000, &file[n * 10_000..(n + 1) * 10_000], Some((n as u32 + 1, 3))))).collect::<Vec<_>>();
+        // Each part is sound, but the whole file's CRC-32 they give is another file's.
+        let (lying, _) = news(parts(&wrong), None).await;
+        let (honest, counts) = news(parts(&file), None).await;
+        let dir = tempfile::tempdir().unwrap();
+        let nzb = nzb_of(&[("c.bin", (0..3).map(|n| format!("c{n}@test")).collect())]);
+        let target = dir.path().join("c.bin");
+        let failed = fetch_file(dir.path(), &nzb, 0, into(&target, vec![lying])).await.unwrap_err();
+        assert!(failed.contains("fails the CRC-32"), "{failed}");
+        assert!(!crate::engine::part_path(&target).exists() && !state_path(&target).exists());
+        let (done, _) = fetch_file(dir.path(), &nzb, 0, into(&target, vec![honest])).await.unwrap();
+        assert_eq!((done.as_path(), std::fs::read(&done).unwrap()), (target.as_path(), file));
+        assert_eq!(counts.bodies.load(Ordering::SeqCst), 3);
+    }
+
+    /// A server that asks to sign in (480) when no user name is set says so, for the first
+    /// article and for those after.
+    #[tokio::test]
+    async fn a_server_asking_to_sign_in_says_so() {
+        let file = bytes(50_000);
+        let (locked, _) = news(articles(&file, false), Some(("me", "secret"))).await;
+        let (first_only, _) = news(articles(&file, false).into_iter().take(1).collect(), None).await;
+        let dir = tempfile::tempdir().unwrap();
+        let nzb = NZB.replace("&lt;p1@test&gt;", "p1@test");
+        for (n, servers) in [vec![locked.clone()], vec![first_only, Server { priority: 1, ..locked }]].into_iter().enumerate() {
+            let failed = fetch_file(dir.path(), &nzb, 0, into(&dir.path().join(format!("{n}.bin")), servers)).await.unwrap_err();
+            assert!(failed.contains("user name and password"), "{failed}");
+        }
+    }
+
+    /// A post naming its file ".." is saved as "file" in the folder chosen, not beside it.
+    #[tokio::test]
+    async fn a_file_named_dot_dot_stays_in_its_folder() {
+        let data = bytes(1000);
+        let (server, _) = news(vec![("q1@test".into(), yenc("..", &data, 0, &data, None))], None).await;
+        let dir = tempfile::tempdir().unwrap();
+        let save = dir.path().join("in");
+        let tasks = listed(dir.path(), NZB);
+        let options = DownloadOptions { nntp: vec![server], ..Default::default() };
+        let (done, _) = run(&tasks[1].urls[0], &options, None, &save, None, CancellationToken::new()).await.unwrap();
+        assert_eq!((done.as_path(), std::fs::read(&done).unwrap()), (save.join("file").as_path(), data));
+    }
+
+    /// A file that fails its PAR2 check stays a `.part` with its state, so the next try checks it
+    /// again instead of downloading it again under another name.
+    #[tokio::test]
+    async fn a_file_failing_its_par2_check_is_checked_again_not_downloaded_again() {
+        let file = bytes(50_000);
+        let (server, counts) = news(articles(&file, false), None).await;
+        let dir = tempfile::tempdir().unwrap();
+        let other: Vec<u8> = file.iter().map(|b| b ^ 1).collect();
+        std::fs::write(dir.path().join("set.par2"), par2_index(&[("data.bin", &other[..])])).unwrap();
+        let nzb = NZB.replace("&lt;p1@test&gt;", "p1@test");
+        let target = dir.path().join("data.bin");
+        for _ in 0..2 {
+            let damaged = fetch_file(dir.path(), &nzb, 0, into(&target, vec![server.clone()])).await.unwrap_err();
+            assert!(damaged.contains("does not match its PAR2 set") && damaged.contains("kept as data.bin.part"), "{damaged}");
+            assert!(!target.exists() && crate::engine::part_path(&target).exists() && state_path(&target).exists());
+        }
+        assert_eq!(counts.bodies.load(Ordering::SeqCst), 5, "the second try downloads nothing");
     }
 
     /// A file's articles come from the first server that has them whole: the one it lacks and
@@ -1472,25 +1988,31 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let nzb = dir.path().join("show.nzb");
         std::fs::write(&nzb, NZB.replace("&lt;p1@test&gt;", "p1@test")).unwrap();
-        let tasks = tasks(&std::fs::read(&nzb).unwrap(), &Url::from_file_path(&nzb).unwrap()).unwrap();
+        let link = Url::from_file_path(&nzb).unwrap();
+        let tasks = tasks_from(&std::fs::read(&nzb).unwrap(), &link, &link).unwrap();
         let target = dir.path().join("My Show").join("data.bin");
         let options = |servers: Vec<Server>| DownloadOptions { output_path: Some(target.clone()), nntp: servers, max_retries: 1, ..Default::default() };
 
         let cut = run(&tasks[0].urls[0], &options(vec![primary.clone()]), None, dir.path(), None, CancellationToken::new()).await.unwrap_err();
         assert!(cut.contains("2 of 5 articles of data.bin are missing or damaged"), "{cut}");
         assert!(crate::engine::part_path(&target).exists() && state_path(&target).exists());
+        // Another download holding the target: this one does not write into it.
+        let held = crate::engine::claim_target(&target).unwrap().unwrap();
+        let taken = run(&tasks[0].urls[0], &options(vec![backup.clone(), primary.clone()]), None, dir.path(), None, CancellationToken::new()).await.unwrap_err();
+        assert!(taken.contains("being downloaded"), "{taken}");
+        drop(held);
         let (done, fresh) = run(&tasks[0].urls[0], &options(vec![backup.clone(), primary.clone()]), None, dir.path(), None, CancellationToken::new()).await.unwrap();
         assert!(fresh);
         assert_eq!((done.as_path(), std::fs::read(&done).unwrap()), (target.as_path(), file.clone()));
-        assert_eq!(asked.load(Ordering::SeqCst), 2, "only the articles the first run lacked");
+        assert_eq!(asked.bodies.load(Ordering::SeqCst), 2, "only the articles the first run lacked");
         assert!(!state_path(&target).exists());
 
         // Both servers at once: the backup is asked for those two alone.
         std::fs::remove_file(&target).unwrap();
-        asked.store(0, Ordering::SeqCst);
+        asked.bodies.store(0, Ordering::SeqCst);
         let (done, _) = run(&tasks[0].urls[0], &options(vec![backup.clone(), primary.clone()].into_iter().rev().collect()), None, dir.path(), None, CancellationToken::new()).await.unwrap();
         assert_eq!(std::fs::read(&done).unwrap(), file);
-        assert_eq!(asked.load(Ordering::SeqCst), 2);
+        assert_eq!(asked.bodies.load(Ordering::SeqCst), 2);
 
         let wrong = Server { password: "guess".into(), ..primary };
         std::fs::remove_file(&target).unwrap();
