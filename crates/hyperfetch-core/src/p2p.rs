@@ -266,6 +266,21 @@ pub async fn run(
         Some(_) => false,
         None => fill_from_web_seeds(&seeded, &kept, &folder, &target, options, &snapshots, &cancel).await?,
     };
+    // A one-file torrent's older version (`--delta-from`) is copied into place: librqbit's first
+    // check keeps its pieces that still match, at the same offsets, and the swarm brings the rest.
+    let from_old = match (&options.delta_from, multi || resuming || filled) {
+        (Some(old), false) => {
+            let (old, file, len) = (old.clone(), target.clone(), kept.first().map_or(0, |f| f.1));
+            let copied = tokio::task::spawn_blocking(move || {
+                std::fs::create_dir_all(file.parent().unwrap_or(Path::new(".")))?;
+                std::fs::copy(&old, &file)?;
+                std::fs::OpenOptions::new().write(true).open(&file)?.set_len(len)
+            });
+            copied.await.map_err(|e| e.to_string())?.map_err(|e| format!("Cannot copy the older version: {e}"))?;
+            true
+        }
+        _ => false,
+    };
     let seeds = web.as_ref().map(|web| web.addrs.clone()).unwrap_or_default();
     let torrent = match proxied {
         true => http_trackers_only(&listed.torrent_bytes)?.into(),
@@ -273,7 +288,7 @@ pub async fn run(
     };
     let speed = options.max_speed.and_then(|bps| NonZeroU32::new(bps.min(u32::MAX.into()) as u32));
     let adding = AddTorrentOptions {
-        overwrite: resuming || filled,
+        overwrite: resuming || filled || from_old,
         output_folder: Some(folder.to_str().ok_or("The save folder's name is not valid Unicode")?.to_string()),
         initial_peers: Some([hints, listed.seen_peers, seeds].concat()),
         ratelimits: LimitsConfig { download_bps: speed, ..Default::default() },
@@ -917,6 +932,18 @@ mod tests {
         // Once more: all of it is there already, so nothing new arrives.
         let again = run(std::slice::from_ref(&magnet), &options, &out, None, CancellationToken::new()).await.unwrap();
         assert_eq!(again, (target, false));
+
+        // With an older version (--delta-from) holding the first half: only the rest comes from
+        // the swarm.
+        let (old, elsewhere) = (tmp.path().join("old.bin"), tmp.path().join("delta"));
+        std::fs::write(&old, [&payload[..1 << 20], &[0u8; 1000][..]].concat()).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let uploaded = seeding.stats().uploaded_bytes;
+        let delta = DownloadOptions { delta_from: Some(old), ..DownloadOptions::default() };
+        let (path, _) = run(std::slice::from_ref(&magnet), &delta, &elsewhere, None, CancellationToken::new()).await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), payload);
+        let sent = seeding.stats().uploaded_bytes - uploaded;
+        assert!(sent <= payload.len() as u64 / 2 + 64 * 1024, "sent {sent} bytes though the older version held half");
 
         // A file name with a drive in it is refused before anything is written.
         if cfg!(windows) {

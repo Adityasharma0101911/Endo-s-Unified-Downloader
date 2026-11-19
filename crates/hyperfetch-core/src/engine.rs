@@ -426,6 +426,13 @@ pub struct DownloadOptions {
     /// The link is a live stream recorded with streamlink, not yt-dlp (see `crate::livestream`),
     /// which is installed for it if need be.
     pub streamlink: bool,
+    /// The chunk store of a `.caibx`/`.caidx` index: a link or a folder (see `crate::casync`);
+    /// None for `default.castr` beside the index.
+    pub chunk_store: Option<String>,
+    /// A folder chunks fetched from chunk stores are kept in, for later downloads, and its most
+    /// bytes (the oldest go first).
+    pub chunk_cache: Option<PathBuf>,
+    pub chunk_cache_max: u64,
 }
 
 impl Default for DownloadOptions {
@@ -513,6 +520,9 @@ impl Default for DownloadOptions {
             platform: None,
             nntp: Vec::new(),
             streamlink: false,
+            chunk_store: None,
+            chunk_cache: None,
+            chunk_cache_max: 1 << 30,
         }
     }
 }
@@ -886,6 +896,11 @@ impl DownloadEngine {
         // A modpack's overrides folders, unpacked out of the pack (see `crate::mods::run`).
         if let Some(link) = self.urls.first().filter(|u| crate::mods::handles(u)) {
             let done = crate::mods::run(link, &client, self.limiter(), &self.save_dir(), snapshot_tx, self.cancel_token.clone()).await;
+            return self.unless_rerun(done);
+        }
+        // A chunk store's index: the file or folder tree it lists (see `crate::casync`).
+        if let Some(link) = self.urls.first().filter(|u| crate::casync::handles(u)) {
+            let done = crate::casync::download(link, &self.options, self.limiter(), &self.save_dir(), snapshot_tx, self.cancel_token.clone()).await;
             return self.unless_rerun(done);
         }
         // A link of an account's helper: a cloud drive's, a game library's (see `crate::accounts`).

@@ -95,9 +95,23 @@ pub struct Args {
     pub only_if_newer: bool,
 
     /// An older version of the file: the blocks the new one shares with it are copied from it, when
-    /// the server publishes the new version's block checksums (a metalink's pieces, or a zsync file)
+    /// the server publishes the new version's block checksums (a metalink's pieces, a zsync file, a
+    /// chunk store's index, or a one-file torrent's pieces)
     #[arg(long = "delta-from", value_name = "FILE", value_parser = existing_file)]
     pub delta_from: Option<PathBuf>,
+
+    /// The chunk store of a .caibx or .caidx link: a link or a folder (default: default.castr
+    /// beside the index)
+    #[arg(long = "chunk-store", value_name = "STORE")]
+    pub chunk_store: Option<String>,
+
+    /// Keep the chunks fetched from chunk stores in DIR, for later downloads
+    #[arg(long = "chunk-cache", value_name = "DIR")]
+    pub chunk_cache: Option<PathBuf>,
+
+    /// Most bytes --chunk-cache keeps (the oldest chunks go first), e.g. 500M or 2G
+    #[arg(long = "chunk-cache-size", value_name = "SIZE", default_value = "1G", value_parser = parse_bytes, requires = "chunk_cache")]
+    pub chunk_cache_size: u64,
 
     /// The new version's zsync control file, for --delta-from or -N, in place of <link>.zsync
     #[arg(long = "zsync", value_name = "URL", value_parser = parse_zsync)]
