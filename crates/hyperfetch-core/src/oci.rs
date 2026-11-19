@@ -43,6 +43,9 @@ const TOKEN_TRIES: u32 = 3;
 /// Ollama's registry, and the start of the media types of its models' layers.
 const OLLAMA: &str = "registry.ollama.ai";
 const OLLAMA_LAYER: &str = "application/vnd.ollama.image.";
+/// A Helm chart's layer, and its provenance's.
+const HELM_CHART: &str = "application/vnd.cncf.helm.chart.content.v1.tar+gzip";
+const HELM_PROV: &str = "application/vnd.cncf.helm.chart.provenance.v1.prov";
 /// First path parts of ollama.com that are its own pages, not users.
 const OLLAMA_PAGES: &[&str] = &["blog", "docs", "download", "models", "public", "search", "settings", "signin", "signup", "turbo", "api"];
 
@@ -99,13 +102,14 @@ impl Image {
 
 /// The `docker://` link of the image `token` names: a reference on Docker Hub, ghcr.io or Quay
 /// (`docker.io/library/alpine:3.20`, `ghcr.io/owner/name@sha256:...`), any registry's with
-/// `docker://`, or an image's web page on Docker Hub, GitHub or Quay. None for anything else.
+/// `docker://` (or `oci://`, as Helm names a chart), or an image's web page on Docker Hub, GitHub
+/// or Quay. None for anything else.
 pub fn reference(token: &str) -> Option<Url> {
     let token = token.trim();
     if let Some(model) = token.strip_prefix("ollama://") {
         return ollama(model.trim_end_matches('/'))?.link();
     }
-    let image = match token.strip_prefix("docker://") {
+    let image = match token.strip_prefix("docker://").or_else(|| token.strip_prefix("oci://")) {
         Some(rest) => {
             let (registry, path) = rest.split_once('/')?;
             parse(registry, path)?
@@ -123,6 +127,14 @@ pub fn reference(token: &str) -> Option<Url> {
 /// Whether `url` is an image's `docker://` link (see [`reference`]).
 pub(crate) fn handles(url: &Url) -> bool {
     url.scheme() == SCHEME
+}
+
+/// The `docker://` link of the one blob `digest` of `repo` on `registry`, saved as the file `name`
+/// (a Homebrew bottle on ghcr.io), through the registry's token flow as an image's blobs are.
+pub(crate) fn blob_link(registry: &str, repo: &str, digest: &str, name: &str) -> Option<Url> {
+    let mut url = Url::parse(&format!("{SCHEME}://{registry}/{repo}:latest")).ok()?;
+    url.query_pairs_mut().append_pair("blob", digest).append_pair("name", name);
+    Some(url)
 }
 
 /// The image `name[:tag][@digest]` on `registry`. Docker Hub's official images are under
@@ -353,6 +365,22 @@ async fn download(
     let image = parse(&host, &path).ok_or_else(|| format!("{source} names no container image"))?;
     let http = crate::ingest::descriptor_client(options.proxy.as_deref())?;
     let mut registry = Registry { http, image: &image, token: None, challenge: None };
+    // One blob saved as a file of its own (see `blob_link`).
+    let query = |key: &str| source.query_pairs().find(|(k, _)| k == key).map(|(_, v)| v.into_owned());
+    if let (Some(digest), Some(name)) = (query("blob").filter(|d| d.strip_prefix("sha256:").is_some_and(|h| h.len() == 64)), query("name")) {
+        let target = match &options.output_path {
+            Some(path) if !crate::engine::is_dir_target(path) => path.clone(),
+            _ => save_dir.join(crate::engine::sanitize_component(&name)),
+        };
+        if holds(&target, &digest["sha256:".len()..]).await {
+            return Ok((target, false));
+        }
+        // Its first answer, a 401, names the token's scope; nothing of it is read.
+        drop(registry.get(&format!("{}/v2/{}/blobs/{digest}", image.api(), image.repo)).await?);
+        let progress = crate::p2p::Progress { total: 0, before: 0, target: target.clone(), torrent: false };
+        fetch_blob(&mut registry, &digest, &target, options, progress, &snapshots, &cancel).await?;
+        return Ok((target, true));
+    }
     let (mut manifest, mut media) = registry.manifest(image.reference()).await?;
     let mut doc: Value = serde_json::from_slice(&manifest).map_err(|_| "the image's manifest cannot be read".to_string())?;
     let mut platform = Value::Null;
@@ -380,9 +408,10 @@ async fn download(
         .ok_or("the image's manifest names a blob without a SHA-256 digest and size")?;
 
     // An Ollama model goes into the Ollama models folder picked as the save folder, else into
-    // files of its own (see the module docs).
-    let model = blobs.iter().any(|(_, _, media)| media.starts_with(OLLAMA_LAYER));
-    let models = Some(save_dir).filter(|dir| model && dir.join("blobs").is_dir() && dir.join("manifests").is_dir());
+    // files of its own (see the module docs), as a Helm chart does.
+    let ollama = blobs.iter().any(|(_, _, media)| media.starts_with(OLLAMA_LAYER));
+    let model = ollama || blobs.iter().any(|(_, _, media)| *media == HELM_CHART);
+    let models = Some(save_dir).filter(|dir| ollama && dir.join("blobs").is_dir() && dir.join("manifests").is_dir());
     let folder = match (&options.output_path, models) {
         (_, Some(models)) => models.to_path_buf(),
         (Some(path), None) if !crate::engine::is_dir_target(path) => path.clone(),
@@ -416,10 +445,11 @@ async fn download(
     Ok((folder, fresh))
 }
 
-/// The file names an Ollama model's `blobs` (its config, then its layers) take outside an Ollama
-/// models folder: the model as `<name>-<tag>.gguf` (a projector or adapter beside it), its
-/// template, system prompt and licences as text, its parameters and messages as JSON, each name
-/// numbered when it comes again.
+/// The file names an Ollama model's or Helm chart's `blobs` (its config, then its layers) take
+/// outside an Ollama models folder: the model as `<name>-<tag>.gguf` (a projector or adapter
+/// beside it), its template, system prompt and licences as text, its parameters and messages as
+/// JSON; a chart as `<name>-<version>.tgz` with its provenance; each name numbered when it comes
+/// again.
 fn model_files(image: &Image, blobs: &[(String, u64, &str)]) -> Vec<String> {
     let last = image.repo.rsplit('/').next().unwrap_or(&image.repo);
     let base = crate::engine::sanitize_component(&format!("{last}-{}", image.tag));
@@ -434,6 +464,8 @@ fn model_files(image: &Image, blobs: &[(String, u64, &str)]) -> Vec<String> {
                 Some(kind @ ("projector" | "adapter")) => (format!("{base}-{kind}"), "gguf"),
                 Some(kind @ ("params" | "messages")) => (kind.to_string(), "json"),
                 Some(kind) => (crate::engine::sanitize_component(kind), "txt"),
+                None if *media == HELM_CHART => (base.clone(), "tgz"),
+                None if *media == HELM_PROV => (base.clone(), "tgz.prov"),
                 None => ("layer".to_string(), "bin"),
             };
             let count = seen.entry((stem.clone(), ext)).and_modify(|c| *c += 1).or_insert(1);
@@ -768,5 +800,34 @@ mod tests {
         }
         let kept = folder.join("manifests").join(crate::engine::sanitize_component(&host)).join("lib").join("app").join("1.0");
         assert_eq!(std::fs::read(kept).unwrap(), manifest);
+    }
+
+    /// A Helm chart (`oci://`) becomes `<name>-<version>.tgz` with its provenance; one blob of a
+    /// link from `blob_link` becomes the file it names, checked against its digest.
+    #[tokio::test]
+    async fn a_helm_chart_and_a_single_blob_download_as_files() {
+        let (config, chart, prov) = (br#"{"name":"app","version":"1.0"}"#.to_vec(), crate::netsim::file(40_000), b"-----BEGIN PGP SIGNED MESSAGE-----".to_vec());
+        let blob = |media: &str, bytes: &[u8]| json!({"mediaType": media, "digest": format!("sha256:{}", hex(bytes)), "size": bytes.len()});
+        let manifest = serde_json::to_vec(&json!({
+            "schemaVersion": 2, "config": blob("application/vnd.cncf.helm.config.v1+json", &config),
+            "layers": [blob(HELM_CHART, &chart), blob(HELM_PROV, &prov)],
+        }))
+        .unwrap();
+        let blobs = [&config, &chart, &prov].iter().map(|b| (format!("sha256:{}", hex(b)), b.to_vec())).collect();
+        let manifests = vec![("1.0".to_string(), ("application/vnd.oci.image.manifest.v1+json".to_string(), manifest))];
+        let host = registry(blobs, manifests, Arc::new(Seen::default())).await;
+        let options = DownloadOptions { num_connections: 2, max_retries: 1, ..Default::default() };
+        let dir = tempfile::tempdir().unwrap();
+
+        let (folder, _) = run(&reference(&format!("oci://{host}/lib/app:1.0")).unwrap(), &options, dir.path(), None, CancellationToken::new()).await.unwrap();
+        assert_eq!(std::fs::read(folder.join("app-1.0.tgz")).unwrap(), chart);
+        assert_eq!(std::fs::read(folder.join("app-1.0.tgz.prov")).unwrap(), prov);
+        assert!(!folder.join("index.json").exists());
+
+        let link = blob_link(&host, "lib/app", &format!("sha256:{}", hex(&chart)), "app.tgz").unwrap();
+        let (file, fresh) = run(&link, &options, dir.path(), None, CancellationToken::new()).await.unwrap();
+        assert!(fresh && file == dir.path().join("app.tgz"));
+        assert_eq!(std::fs::read(&file).unwrap(), chart);
+        assert!(!run(&link, &options, dir.path(), None, CancellationToken::new()).await.unwrap().1, "a blob already there is kept");
     }
 }

@@ -324,6 +324,7 @@ pub fn might_list(url: &Url) -> bool {
         || crate::sftp::handles(url)
         || crate::mods::lists(url)
         || crate::papers::lists(url)
+        || crate::packages::lists(url)
 }
 
 /// `token` as a link [`might_list`] takes, a "leaving this site" link replaced by its target.
@@ -332,6 +333,8 @@ fn listing_url(token: &str) -> Option<Url> {
         Some(url) => resolver::unwrap_redirect(&url).unwrap_or(url),
         // A DOI as it is typed (10.xxxx/..., doi:10.xxxx/...).
         None if crate::papers::doi_link(token).is_some() => crate::papers::doi_link(token)?,
+        // Maven coordinates as typed (group:artifact[:version]).
+        None if crate::packages::coordinates_link(token).is_some() => crate::packages::coordinates_link(token)?,
         // A bucket's s3:// or gs:// link, a WebDAV one, or a Software Heritage ID (swh:1:...).
         None => Url::parse(token).ok().filter(|u| matches!(u.scheme(), "s3" | "gs" | "webdav" | "webdavs" | "dav" | "davs" | "sftp" | "swh" | "nxm"))?,
     };
@@ -671,6 +674,11 @@ async fn list(http: &reqwest::Client, url: &Url, options: &ListOptions) -> Optio
     // A paper's DOI, its publisher's page, PubMed Central or a preprint: its legal open copy.
     if crate::papers::lists(url) {
         return Some(crate::papers::list(http, url, options).await);
+    }
+    // A package on Maven Central, NuGet, Go's proxy, Homebrew, Flathub, anaconda.org, RubyGems,
+    // Packagist or F-Droid.
+    if crate::packages::lists(url) {
+        return Some(crate::packages::list(http, url, options).await);
     }
     if repos::lists(url) {
         let auth = options.auth.as_ref().filter(|(link, _)| link == url).map(|(_, header)| header.as_str());

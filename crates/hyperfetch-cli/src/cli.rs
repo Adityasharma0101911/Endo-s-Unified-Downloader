@@ -455,7 +455,8 @@ pub struct Args {
     /// Internet Archive "original" (uploaded) or "derivative" (made by archive.org). By default an
     /// item's uploaded files and a book's every format. For a mod project (Modrinth, CurseForge), the
     /// game versions and loaders its newest version is picked by ("1.21.1,fabric"), and "server" for
-    /// a modpack's server side
+    /// a modpack's server side. For a Homebrew formula the bottle's platform ("arm64_sequoia",
+    /// "x86_64_linux"), for a conda package the build's ("linux-64,py312"); by default this machine's
     #[arg(long = "formats", value_name = "LIST", value_delimiter = ',')]
     pub formats: Vec<String>,
 
