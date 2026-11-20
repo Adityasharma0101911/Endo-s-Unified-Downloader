@@ -2370,6 +2370,9 @@ impl DownloadEngine {
             media_preset: None,
             browser_cookies: None,
             fsync_on_complete: false,
+            // Its client speaks HTTP/1.1 and carries the format's headers and cookies, which no
+            // client built from these options would (see `h2_routes`).
+            http2: false,
             ..self.options.clone()
         };
         let urls = vec![stream.url.clone(), stream.key.clone()];
@@ -3285,12 +3288,16 @@ impl DownloadEngine {
     /// lost packet then holds them all back: the routes a download of up to `workers` connections
     /// takes turns on, `client` and a client of its own for each further connection, up to
     /// `H2_CONNECTIONS`. They count against the host's budget as one, as a host's addresses do.
-    /// None over HTTP/1.1, where every request has a connection of its own, for one worker, or
-    /// with routes of another kind (a proxy pool, local addresses, FTP or SFTP).
+    /// Each is built from the options, as `client` is (see `build_client`), so only for a host
+    /// known to refuse HTTP/1.1 (see `run`), never for a client of another kind (a media stream's
+    /// carries its format's headers and cookies). None over HTTP/1.1, where every request has a
+    /// connection of its own, for one worker, or with routes of another kind (a proxy pool, local
+    /// addresses, FTP or SFTP).
     fn h2_routes(&self, client: &Client, workers: usize) -> Option<Vec<Client>> {
         let o = &self.options;
+        let h2 = o.http2 && self.urls.first().and_then(hosts::protocol) == Some(hosts::Protocol::H2);
         let other_routes = !o.proxy_pool.is_empty() || !o.bind_addresses.is_empty() || self.ftp.is_some() || self.sftp.is_some();
-        if !o.http2 || workers < 2 || other_routes {
+        if !h2 || workers < 2 || other_routes {
             return None;
         }
         let more = (1..H2_CONNECTIONS.min(workers)).filter_map(|_| build_route_client(o, o.proxy.as_deref(), None, None).ok());
@@ -8991,16 +8998,22 @@ mod tests {
     }
 
     /// Over HTTP/2 a download's requests are spread over a few connections, each a client of its
-    /// own, not multiplexed onto one; over HTTP/1.1 each request has a connection anyway.
+    /// own, not multiplexed onto one, from a host known to refuse HTTP/1.1; over HTTP/1.1 each
+    /// request has a connection anyway.
     #[test]
     fn test_a_download_over_http2_spreads_over_a_few_connections() {
-        let over = |http2| engine_with(DownloadOptions { http2, ..Default::default() });
+        let url = Url::parse("http://h2-routes.engine.invalid/file.bin").unwrap();
+        let on = |url: &Url, options| DownloadEngine::new(vec![url.clone()], options);
         let client = Client::new();
+        let unknown = on(&url, DownloadOptions { http2: true, ..Default::default() });
+        assert!(unknown.h2_routes(&client, 16).is_none(), "not known to refuse HTTP/1.1");
+        hosts::record_protocol(&url, hosts::Protocol::H2);
+        let over = |http2| on(&url, DownloadOptions { http2, ..Default::default() });
         assert_eq!(over(true).h2_routes(&client, 16).map(|routes| routes.len()), Some(H2_CONNECTIONS));
         assert_eq!(over(true).h2_routes(&client, 2).map(|routes| routes.len()), Some(2));
         assert!(over(true).h2_routes(&client, 1).is_none());
         assert!(over(false).h2_routes(&client, 16).is_none());
-        let bound = engine_with(DownloadOptions { http2: true, bind_addresses: vec![[127, 0, 0, 1].into()], ..Default::default() });
+        let bound = on(&url, DownloadOptions { http2: true, bind_addresses: vec![[127, 0, 0, 1].into()], ..Default::default() });
         assert!(bound.h2_routes(&client, 16).is_none(), "local addresses are routes of their own");
     }
 
