@@ -266,6 +266,12 @@ impl RateLimiter {
             if now.saturating_duration_since(since) >= 2 * SHARE_WINDOW {
                 continue;
             }
+    /// Whether this holds bytes back now, which turns off what a speed limit would confuse: a
+    /// download's own limit with no speed set and no other limit beneath it does not.
+    pub fn limits(&self) -> bool {
+        self.own.as_ref().is_none_or(|(live, shared)| live.speed().is_some() || shared.is_some())
+    }
+
             let owed = other.owed.lock();
             if owed.short(now) || took >= 0.8 * owed.rate {
                 held += other.weight();
@@ -727,7 +733,7 @@ impl HttpWorker {
             let answered_since = |m: usize, sent: Instant| racer.get_mirror(m).and_then(|m| m.answered_at).is_some_and(|at| at > sent);
             let found = match taken {
                 Some(chunk) => Some(Job::Chunk(chunk)),
-                None if s.limiter.is_none() => mgr.hedge(|m| hedge_after(racer.get_mirror(m)), answered_since).map(Job::Hedge),
+                None if !s.limiter.as_ref().is_some_and(|l| l.limits()) => mgr.hedge(|m| hedge_after(racer.get_mirror(m)), answered_since).map(Job::Hedge),
                 None => None,
             };
             match found {
@@ -1042,7 +1048,7 @@ impl HttpWorker {
     /// the new one may be refused, and the slowness may be the host's.
     fn lags(&self, chunk_id: usize, mirror_id: usize, rate: f64, now: Instant) -> bool {
         let s = &self.shared;
-        if s.limiter.is_some() {
+        if s.limiter.as_ref().is_some_and(|l| l.limits()) {
             return false;
         }
         let racer = s.mirrors.lock();

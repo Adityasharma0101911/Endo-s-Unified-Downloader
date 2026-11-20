@@ -5314,7 +5314,7 @@ async fn take_start(
     }
     // A speed limit would make every connection look capped.
     let watch = setup
-        .filter(|_| splits && limiter.is_none() && known.capped_per_connection.is_none())
+        .filter(|_| splits && !limiter.is_some_and(RateLimiter::limits) && known.capped_per_connection.is_none())
         .map(|setup| RateWatch::new(Pace { answered, setup }));
     // A web page's start may yet show it is a file (see `probe_all`), so that is read. A resumed
     // download with less than this left may start fewer connections than a measured cap would
@@ -8945,13 +8945,20 @@ mod tests {
     async fn test_a_request_left_unanswered_is_asked_for_again() {
         let data: Vec<u8> = (0..4 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
         let base = uncapped_file_server(data.clone(), Duration::from_millis(2)).await;
-        let dir = tempdir().unwrap();
-        let options =
-            DownloadOptions { output_path: Some(dir.path().join("f.bin")), num_connections: 4, remote_checksum: false, ..Default::default() };
-        let started = Instant::now();
-        let done = DownloadEngine::new(vec![base.join("hold/f.bin").unwrap()], options).run(None).await.unwrap();
-        assert!(std::fs::read(done).unwrap() == data);
-        assert!(started.elapsed() < Duration::from_secs(15), "took {:?}", started.elapsed());
+        for (name, live) in [("plain.bin", None), ("live.bin", Some(Arc::new(OwnLimits::default())))] {
+            let dir = tempdir().unwrap();
+            let options =
+                DownloadOptions { output_path: Some(dir.path().join(name)), num_connections: 4, remote_checksum: false, ..Default::default() };
+            let engine = DownloadEngine::new(vec![base.join(&format!("hold/{name}")).unwrap()], options);
+            let engine = match live {
+                Some(live) => engine.with_live(live),
+                None => engine,
+            };
+            let started = Instant::now();
+            let done = engine.run(None).await.unwrap();
+            assert!(std::fs::read(done).unwrap() == data);
+            assert!(started.elapsed() < Duration::from_secs(15), "{name} took {:?}", started.elapsed());
+        }
     }
 
     /// The connections a front end sets for a download while it runs (see `with_live`) are the
@@ -8977,6 +8984,7 @@ mod tests {
                 after = after.max(snapshot.active_workers);
             }
         }
+    /// So too with a front end's live limits attached and no limit set: that is no speed limit.
         assert!(std::fs::read(run.await.unwrap().unwrap()).unwrap() == data);
         assert_eq!(before, 1);
         assert!(after >= 3, "{after} connections after 4 were set");
