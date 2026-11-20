@@ -1651,7 +1651,8 @@ async fn test_connections_follow_the_size_of_the_file_on_a_fast_server() {
     let temp = tempdir().unwrap();
     let out = temp.path().join("three.bin");
 
-    let opts = DownloadOptions { num_connections: 16, output_path: Some(out.clone()), ..Default::default() };
+    // The checksum files looked for beside the download go over connections of their own.
+    let opts = DownloadOptions { num_connections: 16, output_path: Some(out.clone()), remote_checksum: false, ..Default::default() };
     let engine = DownloadEngine::new(vec![url], opts);
     run(&engine, None).await.expect("download should succeed");
 

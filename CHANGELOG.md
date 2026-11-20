@@ -2,6 +2,10 @@
 
 What changed in each release, newest first. Each release's page on [GitHub](https://github.com/Adityasharma0101911/Endo-s-Unified-Downloader/releases) has its files and the full notes.
 
+## Unreleased
+
+- **Small downloads finish sooner.** The checksum files a site may publish beside a download are asked for two at a time instead of one by one, so a file that has already arrived waits about half as long for them.
+
 ## 2.2.0 (2026-11-19)
 
 - **A new look for the app.** One bar at the top of Downloads takes anything pasted or dropped (Ctrl+V anywhere still adds a copied link at once), and a card under it says in plain words what it is, where it comes from and what it needs, with the two or three choices that matter for it and one Download button; More options holds the rest. Downloads are cards with their pieces filling in along the bar, a plain status line, and their details beside the list on a wide window (in its place on a narrow one): the connections with their servers, the mirrors and the fastest, what the file is checked against, where it came from, what happened to it, and a speed limit for it alone. A pulse bar over every page shows the speed of everything together, how many downloads run, wait and are done, Pause all and the speed limit's switch. The pages are Downloads, Library (the history, grouped by day, searchable, ten thousand rows as smooth as twenty), Sources (every kind of link the app takes, what each needs, an example to try, and the helper tools) and Settings (in groups, searchable, with Appearance new). Ctrl+K opens a command palette; Up, Down, Enter, Space and Delete drive the list from the keyboard. A web page's card can also save the page as one file that opens offline (Keep its scripts under More options), into the save folder and the Library. Behind the pages a slow moving background of soft lights at three depths follows your downloads, drawn out into a current while they run (Settings > Appearance: on by default, Calm, Normal or Lively); it keeps still while the window is in the background, minimized or hidden, and under Reduce motion, when an idle window asks for no frames at all.

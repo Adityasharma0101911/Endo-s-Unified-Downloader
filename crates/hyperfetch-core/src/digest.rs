@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use blake3::hazmat::HasherExt;
+use futures_util::StreamExt;
 use md5::Md5;
 use parking_lot::Mutex;
 use reqwest::header::{HeaderMap, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_RANGE};
@@ -29,6 +30,8 @@ use crate::worker::{authorize, send, Auth};
 
 /// How long the sidecar files are looked for, all of them together.
 const SIDECAR_BUDGET: Duration = Duration::from_secs(3);
+/// Sidecar files asked for at a time.
+const SIDECARS_AT_ONCE: usize = 2;
 /// Largest sidecar file read.
 const MAX_SIDECAR: usize = 64 * 1024;
 /// Bytes read at a time when a finished file is read back.
@@ -54,8 +57,9 @@ pub(crate) const FROM_PRIMARY: &str = "The file does not match its checksum; fet
 /// `x-ms-blob-content-md5`). Nothing is taken from an encoded answer, nor a content digest from a
 /// partial one, and an ETag never counts as a hash. Then the checksum files beside it, from the
 /// same site: `<url>.sha256`, `.sha512`, `.sha1`, `.md5`, then `SHA256SUMS`, `sha256sums.txt` and
-/// `CHECKSUMS` in its folder, by the line for its name. Those are fetched one after the other,
-/// with GET only, each at most 64 KiB, within 3 seconds in all.
+/// `CHECKSUMS` in its folder, by the line for its name. Those are fetched two at a time, the
+/// first in that order with a checksum taken, with GET only, each at most 64 KiB, within 3
+/// seconds in all.
 pub async fn published_checksum(client: &Client, url: &Url, probe_headers: &HeaderMap) -> Option<String> {
     published(client, None, 0, url, probe_headers, None).await
 }
@@ -170,17 +174,18 @@ async fn from_sidecars(client: &Client, auth: Option<&Auth>, limit: usize, url: 
         (sidecar, Some(ext))
     });
     let folder = ["SHA256SUMS", "sha256sums.txt", "CHECKSUMS"].map(|list| file.join(list).ok().map(|u| (u, None)));
-    // One at a time, over the connection the last one left open: a host that takes few
-    // connections keeps them for the download.
-    let lookups = async {
-        for (sidecar, ext) in beside.into_iter().chain(folder.into_iter().flatten()) {
-            if let Some(found) = fetch_small(client, auth, limit, sidecar).await.and_then(|text| checksum_line(&text, &name, ext)) {
-                return Some(found);
-            }
-        }
-        None
-    };
-    tokio::time::timeout(SIDECAR_BUDGET, lookups).await.ok().flatten()
+    // A few at a time, over the connections the probe left open: a finished download waits for
+    // them, and a host that takes few connections keeps the rest for the download. The first in
+    // this order that names a checksum wins, whichever answers first.
+    let name = &name;
+    let lookups: Vec<_> = beside
+        .into_iter()
+        .chain(folder.into_iter().flatten())
+        .map(|(sidecar, ext)| async move { fetch_small(client, auth, limit, sidecar).await.and_then(|text| checksum_line(&text, name, ext)) })
+        .collect();
+    let lookups = futures_util::stream::iter(lookups).buffered(SIDECARS_AT_ONCE).filter_map(std::future::ready);
+    let found = tokio::time::timeout(SIDECAR_BUDGET, std::pin::pin!(lookups).next()).await;
+    found.ok().flatten()
 }
 
 /// The body of `url`, unless it is no success, a web page or larger than `MAX_SIDECAR`.
@@ -598,8 +603,10 @@ mod tests {
         /// HEAD and one-byte probes, a mirror's beside the first, go unanswered: it takes part
         /// only as the first (or only) mirror, whose probe asks for the file's start.
         only_as_first: bool,
-        /// Sidecar answers wait this long.
+        /// Sidecar answers, a 404 too, wait this long.
         sidecars_wait: Duration,
+        /// The most sidecars that were waiting for their answer at once.
+        sidecars_at_once: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     /// Serves `content` at `/dir/file.bin` (HEAD, GET and ranges) and `site.files` beside it, any
@@ -610,9 +617,11 @@ mod tests {
         let log = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (content, site, seen) = (Arc::new(content), Arc::new(site), Arc::clone(&log));
         let damaged = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let busy = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         tokio::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
                 let (content, site, seen, damaged) = (Arc::clone(&content), Arc::clone(&site), Arc::clone(&seen), Arc::clone(&damaged));
+                let busy = Arc::clone(&busy);
                 tokio::spawn(async move {
                     let mut req = Vec::new();
                     let mut buf = [0u8; 2048];
@@ -661,12 +670,18 @@ mod tests {
                             resp.extend_from_slice(&body);
                         }
                         resp
-                    } else if let Some((_, kind, body)) = site.files.iter().find(|(p, _, _)| p.to_ascii_lowercase() == path) {
-                        tokio::time::sleep(site.sidecars_wait).await;
-                        format!("HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
-                            .into_bytes()
                     } else {
-                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+                        let waiting = busy.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        site.sidecars_at_once.fetch_max(waiting, std::sync::atomic::Ordering::SeqCst);
+                        tokio::time::sleep(site.sidecars_wait).await;
+                        busy.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        match site.files.iter().find(|(p, _, _)| p.to_ascii_lowercase() == path) {
+                            Some((_, kind, body)) => {
+                                format!("HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+                                    .into_bytes()
+                            }
+                            None => b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+                        }
                     };
                     let _ = sock.write_all(&resp).await;
                     let _ = sock.shutdown().await;
@@ -817,6 +832,20 @@ mod tests {
         assert_eq!(published_checksum(&Client::new(), &url, &HeaderMap::new()).await, None);
         assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
         assert!(log.lock().unwrap().iter().all(|(path, range)| path != "/dir/file.bin" && range.is_none()), "GET of the sidecars only");
+    }
+
+    #[tokio::test]
+    async fn sidecars_are_asked_for_two_at_a_time_and_the_first_in_order_wins() {
+        let data = content(100);
+        let hex = |c: String| c.split_once(':').unwrap().1.to_string();
+        let (sha1, md5) = (checksum("sha1", &Sha1::digest(&data)), checksum("md5", &Md5::digest(&data)));
+        let text = "text/plain".to_string();
+        let files = vec![("/dir/file.bin.sha1".to_string(), text.clone(), hex(sha1.clone())), ("/dir/file.bin.md5".to_string(), text, hex(md5))];
+        let at_once = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let site = Site { files, sidecars_wait: Duration::from_millis(200), sidecars_at_once: Arc::clone(&at_once), ..Site::default() };
+        let (url, _) = serve(data, site).await;
+        assert_eq!(published_checksum(&Client::new(), &url, &HeaderMap::new()).await, Some(sha1));
+        assert_eq!(at_once.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     /// Downloads `urls` (mirrors of one file) into `dir` with `options`; returns the result and
