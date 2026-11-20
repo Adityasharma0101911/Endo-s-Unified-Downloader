@@ -495,6 +495,7 @@ fn status_badge(app: &App, item: &QueueItem, p: &Palette) -> (&'static str, Colo
         QueueItemStatus::Queued => ("Waiting", p.muted),
         QueueItemStatus::Downloading if app.is_resolving(item.id) => ("Connecting", p.amber),
         QueueItemStatus::Downloading if item.is_finishing() => ("Finishing", p.cyan),
+        QueueItemStatus::Downloading if app.waits_for_network(item.id) => ("Waiting for the network", p.amber),
         QueueItemStatus::Downloading if app.stalled_for(item.id).is_some() => ("Stalled", p.amber),
         QueueItemStatus::Downloading => ("Downloading", p.link),
         QueueItemStatus::Pausing => ("Pausing", p.muted),

@@ -49,7 +49,7 @@ webpki-roots = "1"
 crc32fast = "1"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Power", "Win32_System_Threading", "Win32_System_Time", "Win32_Security"] }
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_LibraryLoader", "Win32_System_Power", "Win32_System_Threading", "Win32_System_Time", "Win32_Security"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

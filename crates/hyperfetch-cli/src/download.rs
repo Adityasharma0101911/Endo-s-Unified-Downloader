@@ -725,7 +725,11 @@ impl TaskView {
         let finished = s.total_bytes > 0 && s.downloaded_bytes >= s.total_bytes;
         let stalled = (!finished && idle >= STALL_AFTER).then_some(idle);
         let remaining = (s.total_bytes > 0).then(|| s.total_bytes.saturating_sub(s.downloaded_bytes));
-        let status = status_text(s.speed_bytes_per_sec, s.active_workers, remaining, stalled);
+        // Gone quiet while the system says the network is gone: the download waits for it.
+        let status = match stalled.is_some() && hyperfetch_core::network::is_offline() {
+            true => "waiting for the network".to_string(),
+            false => status_text(s.speed_bytes_per_sec, s.active_workers, remaining, stalled),
+        };
 
         if self.last_plain.is_some_and(|t| now.duration_since(t) >= PLAIN_INTERVAL) {
             let done = done_text(s.downloaded_bytes, s.total_bytes, self.bar.elapsed());

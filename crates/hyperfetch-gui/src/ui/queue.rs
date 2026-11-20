@@ -468,11 +468,16 @@ fn progress_block(app: &App, ui: &mut Ui, item: &QueueItem) {
 
     if let Some(stalled) = app.stalled_for(item.id).filter(|_| downloading) {
         ui.add_space(6.0);
-        let text = format!(
-            "Stalled: no data received for {}s. Stalled connections are retried after {}s without data.",
-            stalled.as_secs(),
-            item.options.stall_timeout_secs
-        );
+        let text = match app.waits_for_network(item.id) {
+            true => "Waiting for the network: the system says it is gone. The download goes on by itself once it is back, \
+                     without using up its retries."
+                .to_string(),
+            false => format!(
+                "Stalled: no data received for {}s. Stalled connections are retried after {}s without data.",
+                stalled.as_secs(),
+                item.options.stall_timeout_secs
+            ),
+        };
         ui.add(egui::Label::new(bold(text).color(p.amber)).wrap());
     }
 }
@@ -1065,7 +1070,9 @@ fn row_summary(app: &App, item: &QueueItem, ratio: f64) -> String {
         if let Some(eta) = util::eta_secs(item.total_bytes, item.downloaded_bytes, item.speed_bytes_per_sec) {
             parts.push(format!("{} left", format_duration(eta)));
         }
-        if let Some(stalled) = app.stalled_for(item.id) {
+        if app.waits_for_network(item.id) {
+            parts.push("waiting for the network".to_string());
+        } else if let Some(stalled) = app.stalled_for(item.id) {
             parts.push(format!("no data for {} s, retrying", stalled.as_secs()));
         } else if let Some(view) = view.filter(|view| view.active_workers > 0 && view.torrent.is_none()) {
             parts.push(match view.active_workers {
@@ -1082,6 +1089,7 @@ fn row_summary(app: &App, item: &QueueItem, ratio: f64) -> String {
         }
     }
     parts.extend(item.notes.iter().cloned());
+    parts.extend(app.rerun_text(item.id));
     parts.join("  ·  ")
 }
 

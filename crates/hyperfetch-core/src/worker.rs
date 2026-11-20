@@ -57,6 +57,9 @@ pub enum FailureKind {
     Denied,
     /// Retrying cannot help (disk write error, remote file changed): fail the download.
     Fatal,
+    /// No answer while the system says the network is gone (see [`crate::network::waits`]):
+    /// costs no try; the worker waits for the network.
+    Offline,
 }
 
 #[derive(Debug)]
@@ -641,14 +644,23 @@ impl HttpWorker {
             s.mirrors.lock().release_mirror(mirror_id);
             return false;
         }
+        // No answer while the network is gone costs no try: the worker waits for it to come back.
+        let offline = matches!(outcome, Err((FailureKind::Transient, _))) && !chunk.revoked.is_cancelled() && crate::network::waits(url);
+        let outcome = outcome.map_err(|(kind, error)| (if offline { FailureKind::Offline } else { kind }, error));
         // Settled before looking for more work, so nobody (including this worker) mistakes the
         // chunk for a live one to steal from. The event wakes the engine so it notices completion
         // or a fatal error.
         let event = self.settle(chunk, mirror_id, url, outcome, &slot);
         drop(slot);
-        match event {
+        let going = match event {
             Some(event) => s.events.send(event).await.is_ok(),
             None => true,
+        };
+        if going && offline {
+            tokio::select! {
+                _ = s.cancel.cancelled() => return false,
+                _ = crate::network::back(url) => {}
+            }
         }
     }
 
@@ -798,8 +810,8 @@ impl HttpWorker {
                     if let Some(failure) = banned(format!("no answer from a host that refused us just before: {e}")) {
                         return Err(failure);
                     }
-                    // A name that did not resolve says nothing of the route.
-                    if e.is_connect() && !format!("{e:?}").contains("dns error") {
+                    // A name that did not resolve says nothing of the route, nor does a network gone.
+                    if e.is_connect() && !format!("{e:?}").contains("dns error") && !crate::network::is_offline() {
                         s.drop_route(route, url);
                     }
                     let err_str = e.to_string();
@@ -1093,6 +1105,8 @@ fn record_failure(
         }
         // The host rests meanwhile; `hosts::BANNED_FOR` bounds how long this goes on.
         FailureKind::Banned(rest) => (rest, false),
+        // Neither the mirror's fault nor a try; `network::GIVE_UP_AFTER` bounds how long.
+        FailureKind::Offline => (Duration::ZERO, false),
     };
     if let Err(e) = chunks.mark_failed(chunk_id, error, delay, counts) {
         chunks.abort(chunk_id, &e.to_string());

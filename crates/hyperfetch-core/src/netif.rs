@@ -25,7 +25,7 @@ pub fn usable() -> Vec<NetInterface> {
 }
 
 /// An address a connection can leave from: not loopback, link-local or unspecified.
-fn bindable(address: IpAddr) -> bool {
+pub(crate) fn bindable(address: IpAddr) -> bool {
     !address.is_loopback()
         && !address.is_unspecified()
         && match address {

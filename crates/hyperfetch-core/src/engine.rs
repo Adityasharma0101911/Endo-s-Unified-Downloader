@@ -3314,6 +3314,14 @@ impl DownloadEngine {
                     _ = tokio::time::sleep(rest) => continue,
                 }
             }
+            // So is a network gone; `network::GIVE_UP_AFTER` bounds how long.
+            if kind == FailureKind::Transient && crate::network::waits(&remote.final_url) {
+                tracing::warn!("Download attempt failed ({}); waiting for the network", error);
+                tokio::select! {
+                    _ = self.cancel_token.cancelled() => return Err(CANCELLED.to_string()),
+                    _ = crate::network::back(&remote.final_url) => continue,
+                }
+            }
             failures += 1;
             if failures > self.options.max_retries {
                 return Err(format!("Download failed after {} attempts: {}", failures, error));

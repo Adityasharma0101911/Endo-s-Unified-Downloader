@@ -413,6 +413,9 @@ struct App {
     writer: desktop::Writer,
     /// Keeps the computer awake while there is work (see `App::keep_awake`).
     awake: hyperfetch_core::power::KeepAwake,
+    /// Downloads that failed for a network reason, to start again by itself (see
+    /// `App::note_rerun`): how many times so far, and when next.
+    reruns: HashMap<usize, (u32, Instant)>,
     /// The local time the schedule was last checked at (see `desktop::schedule_due`).
     schedule_seen: Option<(u8, u16)>,
     /// Paused downloads Resume all or the schedule's start resumes, first come first, as the
@@ -586,6 +589,7 @@ impl App {
             power: Box::new(desktop::power),
             writer: Box::new(desktop::write),
             awake: hyperfetch_core::power::KeepAwake::new(Box::new(desktop::stay_awake)),
+            reruns: HashMap::new(),
             schedule_seen: None,
             resuming: Vec::new(),
             restarting: HashSet::new(),
@@ -1679,6 +1683,7 @@ impl App {
                     }
                 }
                 self.queue.finish(id, result);
+                self.note_rerun(id);
                 self.note_ended(id);
                 if self.restarting.remove(&id) && self.queue.get_item(id).is_some_and(|item| item.status == QueueItemStatus::Paused) {
                     self.start_job(id, false);
@@ -2035,6 +2040,7 @@ impl App {
             self.schedule_seen = None;
         }
         self.keep_awake(desktop::local_now());
+        self.rerun_failed(Instant::now());
         if self.queue.active_count() == 0 {
             self.batch_failed = false;
         }
@@ -2176,15 +2182,69 @@ impl App {
         self.save_settings();
     }
 
-    /// Keeps the computer awake, as the setting allows, while downloads run, and while the
-    /// schedule's start at `now` is less than `desktop::AWAKE_BEFORE_START` away with downloads
-    /// waiting for it (ones its stop paused, or queued ones while the queue is stopped); lets it
-    /// sleep the moment there is neither.
+    /// Keeps the computer awake, as the setting allows, while downloads run (not while all that
+    /// run wait for the network), and while the schedule's start at `now` is less than
+    /// `desktop::AWAKE_BEFORE_START` away with downloads waiting for it (ones its stop paused, or
+    /// queued ones while the queue is stopped); lets it sleep the moment there is neither.
     fn keep_awake(&mut self, now: (u8, u16)) {
         let queued = self.queue.items().iter().any(|item| item.status == QueueItemStatus::Queued);
         let waiting = !self.settings.schedule_paused.is_empty() || !self.settings.auto_run_queue && queued;
         let due = desktop::minutes_to_start(&self.settings.schedule, now).is_some_and(|m| m <= desktop::AWAKE_BEFORE_START);
-        self.awake.set(self.settings.keep_awake && (self.queue.active_count() > 0 || waiting && due));
+        let running = self.queue.items().iter().any(|item| item.status.is_active() && !self.waits_for_network(item.id));
+        self.awake.set(self.settings.keep_awake && (running || waiting && due));
+    }
+
+    /// A running download that gets nothing while the system says the network is gone: it waits
+    /// for the network (see `hyperfetch_core::network`), and says so rather than Stalled.
+    fn waits_for_network(&self, id: usize) -> bool {
+        self.stalled_for(id).is_some() && hyperfetch_core::network::is_offline()
+    }
+
+    /// Notes download `id`, which just ended, to start again by itself while it fails for a
+    /// network reason (see `network::failed_for_network`), at most `network::RERUNS` times, each
+    /// after a longer wait; one that ended otherwise is forgotten.
+    fn note_rerun(&mut self, id: usize) {
+        use hyperfetch_core::network;
+        let tries = self.reruns.remove(&id).map_or(0, |(tries, _)| tries);
+        let failed = self.queue.get_item(id).is_some_and(|item| matches!(&item.status, QueueItemStatus::Failed(e) if network::failed_for_network(e)));
+        if failed && tries < network::RERUNS {
+            self.reruns.insert(id, (tries + 1, Instant::now() + network::rerun_after(tries + 1)));
+        }
+    }
+
+    /// Puts the failed downloads whose time has come back in the queue (see `App::note_rerun`),
+    /// once the system does not say the network is gone and while the queue runs; asks for a
+    /// frame for the next.
+    fn rerun_failed(&mut self, now: Instant) {
+        if self.reruns.is_empty() || !self.settings.auto_run_queue {
+            return;
+        }
+        let due: Vec<usize> = self.reruns.iter().filter(|(_, (_, at))| *at <= now).map(|(&id, _)| id).collect();
+        if !due.is_empty() && !hyperfetch_core::network::is_offline() {
+            for id in due {
+                match self.queue.get_item_mut(id) {
+                    Some(item) if matches!(item.status, QueueItemStatus::Failed(_)) => item.status = QueueItemStatus::Queued,
+                    // Removed, or started again by the user.
+                    _ => {
+                        self.reruns.remove(&id);
+                    }
+                }
+            }
+            self.run_scheduler();
+        }
+        if let Some(next) = self.reruns.values().map(|(_, at)| *at).min() {
+            self.ctx.request_repaint_after(next.saturating_duration_since(now).max(Duration::from_secs(5)));
+        }
+    }
+
+    /// When failed download `id` starts again by itself, as its card says.
+    fn rerun_text(&self, id: usize) -> Option<String> {
+        let (_, at) = self.reruns.get(&id).filter(|_| self.settings.auto_run_queue)?;
+        let left = at.saturating_duration_since(Instant::now()).as_secs();
+        Some(match left {
+            0 => "trying again once the network is back".to_string(),
+            left => format!("trying again by itself in {}", util::format_duration(left)),
+        })
     }
 
     /// Nothing runs, and nothing queued will start by itself.
@@ -4159,6 +4219,49 @@ mod tests {
         running(&mut app, &rt, a);
         app.keep_awake((0, 21 * 60));
         assert_eq!(*lock(&counts), (4, 4), "the setting off, nothing is held");
+    }
+
+    /// A download that failed for a network reason goes back in the queue by itself once its
+    /// wait is over, three times at most, each wait longer; one refused, or failing its checksum,
+    /// never does, nor anything while the queue is stopped.
+    #[test]
+    fn a_download_that_failed_for_the_network_starts_again_by_itself() {
+        use hyperfetch_core::network::{rerun_after, RERUNS};
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(&rt, dir.path());
+        app.engines = Arc::new(|_: Vec<Url>, _: DownloadOptions| Err("not downloaded here".to_string()));
+        let fail = |app: &mut App, id, error: &str| app.handle_event(AppEvent::JobFinished { id, result: Err(error.to_string()) });
+        let lost = "Download failed after 9 attempts: request failed: error sending request for url (https://example.com/a.iso)";
+        let [a, b, c] = ["a.iso", "b.iso", "c.iso"].map(|name| add(&mut app, name));
+        let mut now = Instant::now();
+        for tries in 1..=RERUNS {
+            app.queue.mark_started(a);
+            fail(&mut app, a, lost);
+            app.rerun_failed(now);
+            assert!(matches!(status(&app, a), QueueItemStatus::Failed(_)), "not yet");
+            assert!(app.rerun_text(a).is_some_and(|text| text.starts_with("trying again")));
+            now += rerun_after(tries) + Duration::from_secs(1);
+            app.rerun_failed(now);
+            assert_eq!(status(&app, a), QueueItemStatus::Downloading, "started again, the {tries}th time");
+        }
+        fail(&mut app, a, lost);
+        app.rerun_failed(now + Duration::from_secs(3600));
+        assert!(matches!(status(&app, a), QueueItemStatus::Failed(_)) && app.rerun_text(a).is_none(), "three times at most");
+
+        for (id, error) in [(b, "Download failed: every mirror failed; last error: HTTP 404 Not Found"), (c, "Checksum mismatch: expected sha256:ab")] {
+            app.queue.mark_started(id);
+            fail(&mut app, id, error);
+        }
+        app.rerun_failed(now + Duration::from_secs(3600));
+        assert!(app.reruns.is_empty(), "a refusal and a checksum are not the network's");
+
+        let d = add(&mut app, "d.iso");
+        app.queue.mark_started(d);
+        fail(&mut app, d, lost);
+        app.settings.auto_run_queue = false;
+        app.rerun_failed(now + Duration::from_secs(3600));
+        assert!(matches!(status(&app, d), QueueItemStatus::Failed(_)), "the queue is stopped");
     }
 
     /// The taskbar shows nothing while no download runs, else the share of their bytes done:
