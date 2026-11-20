@@ -192,6 +192,20 @@ enum AppEvent {
     /// The page at `link` saved as one file (see [`App::save_page`]), begun at Unix second
     /// `started`: the file, its size, how many things were put in and how many left as links.
     PageSaved { link: String, started: u64, result: Result<(PathBuf, u64, usize, usize), String> },
+    /// The size the server of new download `id` gives its file (None: it does not say, or could
+    /// not be asked), asked because another download has its name (see [`App::look_for_twin`]).
+    TwinProbed { id: usize, size: Option<u64> },
+}
+
+/// A download just added whose file another download in the queue has from another host (the
+/// same name, the same checksum where both have one): `of`, from `host`. It waits while the
+/// size of its file is asked for and, the same, while the user is offered to join them (see
+/// [`App::join_twin`]).
+struct Twin {
+    of: usize,
+    host: String,
+    /// The sizes are the same: the offer is on its card.
+    offered: bool,
 }
 
 /// The New link box of a stopped download (see `ui::queue`): what is typed in it, whether that is
@@ -432,6 +446,8 @@ struct App {
     /// Running downloads paused to start again at once with changed options (see
     /// `App::restart_with`).
     restarting: HashSet<usize>,
+    /// New downloads whose file another download has from another host, by id (see `Twin`).
+    twins: HashMap<usize, Twin>,
     /// The window's taskbar button (Windows), and the progress it shows.
     taskbar: Option<taskbar::Taskbar>,
     taskbar_shown: Option<taskbar::Progress>,
@@ -605,6 +621,7 @@ impl App {
             schedule_seen: None,
             resuming: Vec::new(),
             restarting: HashSet::new(),
+            twins: HashMap::new(),
             taskbar: None,
             taskbar_shown: None,
             batch_failed: false,
@@ -842,7 +859,73 @@ impl App {
     fn add_download(&mut self, text: &str, checksum: &str, auth: &str) -> Result<usize, String> {
         let task = ingest::link_task(&ingest::split_tokens(text))?;
         let options = task_options(&self.settings, &task, checksum, auth)?;
-        Ok(queue_task(&mut self.queue, task, options))
+        let id = queue_task(&mut self.queue, task, options);
+        self.look_for_twin(id);
+        Ok(id)
+    }
+
+    /// When another download not done yet has the file of new download `id` from another host
+    /// (the same name, its size known, the same checksum where both have one), asks `id`'s server
+    /// how big its file is, `id` waiting meanwhile (see `Twin`).
+    fn look_for_twin(&mut self, id: usize) {
+        let Some(item) = self.queue.get_item(id) else { return };
+        let host = |item: &QueueItem| item.urls.first().and_then(Url::host_str).unwrap_or_default().to_ascii_lowercase();
+        let sum = |item: &QueueItem| item.options.expected_checksum.as_deref().map(|sum| sum.trim().to_ascii_lowercase());
+        let twin = self.queue.items().iter().find(|other| {
+            other.id != id
+                && other.status != QueueItemStatus::Completed
+                && other.total_bytes > 0
+                && other.filename == item.filename
+                && host(other) != host(item)
+                && !other.urls.iter().any(|url| item.urls.contains(url))
+                && (sum(other).is_none() || sum(item).is_none() || sum(other) == sum(item))
+        });
+        let Some(twin) = twin else { return };
+        self.twins.insert(id, Twin { of: twin.id, host: host(twin), offered: false });
+        let (urls, options) = (item.urls.clone(), item.options.clone());
+        self.spawn_event(async move {
+            // Building an engine may read the cookies file and TLS roots.
+            let engine = tokio::task::spawn_blocking(move || DownloadEngine::new(urls, options)).await;
+            let size = match engine {
+                Ok(engine) => engine.probe().await.ok().and_then(|remote| remote.size),
+                Err(_) => None,
+            };
+            AppEvent::TwinProbed { id, size }
+        });
+    }
+
+    /// Offers to join new download `id` to the download with its file when its server says the
+    /// same size, `size`; else lets it start.
+    fn twin_probed(&mut self, id: usize, size: Option<u64>) {
+        let Some(twin) = self.twins.get_mut(&id) else { return };
+        let same = self.queue.get_item(twin.of).is_some_and(|other| size == Some(other.total_bytes));
+        if same {
+            twin.offered = true;
+        } else {
+            self.twins.remove(&id);
+        }
+    }
+
+    /// Joins new download `id` to the download with its file (see `Twin`): its links become that
+    /// one's further sources, which its engine checks against the first before it takes them, and
+    /// `id` leaves the queue. One running starts again from where it is, to take them.
+    fn join_twin(&mut self, id: usize) {
+        let Some(Twin { of, .. }) = self.twins.remove(&id) else { return };
+        let Some(urls) = self.queue.get_item(id).filter(|item| !item.status.is_active()).map(|item| item.urls.clone()) else { return };
+        let Some(other) = self.queue.get_item_mut(of) else { return };
+        let fresh: Vec<Url> = urls.into_iter().filter(|url| !other.urls.contains(url)).collect();
+        other.urls.extend(fresh);
+        let (name, hosts) = (other.filename.clone(), other.urls.len());
+        if self.remove_job(id) {
+            self.removed = None;
+        }
+        self.restart_with(of, |_| {});
+        self.notice = Some(Ok(format!("{name} now downloads from {hosts} servers together, as #{of}")));
+    }
+
+    /// Keeps new download `id` apart from the download with its file: it starts on its own.
+    fn keep_apart(&mut self, id: usize) {
+        self.twins.remove(&id);
     }
 
     /// Queues each link of `text` when it is a paste with a password, key or sign-in, or a copied
@@ -1319,6 +1402,8 @@ impl App {
             self.notice = Some(Err(format!("The file of download #{} is being repaired; wait for the repair to finish", id)));
             return false;
         }
+        // Started by hand, it is kept apart from a download of its file (see `Twin`).
+        self.twins.remove(&id);
         let Some(item) = self.queue.get_item(id) else { return false };
         let (urls, mut options, folder) = (item.urls.clone(), item.options.clone(), util::folder_to_create(item));
         options.priority = item.priority;
@@ -1607,7 +1692,8 @@ impl App {
                 self.start_job(id, false);
             }
         }
-        let mut held = HashSet::new();
+        // One offered to join the download of its file waits for the answer (see `Twin`).
+        let mut held: HashSet<usize> = self.twins.keys().copied().collect();
         let metered = self.settings.hold_metered && (self.is_metered)();
         let ok = self.metered_ok.clone();
         while let Some(id) = self.queue.next_to_start(max, |id| held.contains(&id) || metered && !ok.contains(&id)) {
@@ -1888,6 +1974,7 @@ impl App {
             AppEvent::TracksListed { item, link, result } => self.tracks_listed(item, link, result),
             AppEvent::Channels { origin, input, checksum, auth, result } => self.channels_read(origin, input, checksum, auth, result),
             AppEvent::Relinked { id, urls, options, result } => self.relinked(id, urls, options, result),
+            AppEvent::TwinProbed { id, size } => self.twin_probed(id, size),
             AppEvent::PageSaved { link, started, result } => self.page_saved(link, started, result),
         }
     }

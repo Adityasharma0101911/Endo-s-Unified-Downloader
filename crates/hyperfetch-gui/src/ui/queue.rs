@@ -983,6 +983,10 @@ enum RowAction {
     NewLink,
     /// Opens the page it came from in the browser.
     OpenPage,
+    /// Joins it to the download of its file from another host (see `App::join_twin`).
+    Join,
+    /// Keeps it apart from that download (see `App::keep_apart`).
+    KeepApart,
 }
 
 /// The order and priority of `item`, the `index`th of `len` downloads: Download next, Move up and
@@ -1081,6 +1085,9 @@ fn row_summary(app: &App, item: &QueueItem, ratio: f64) -> String {
                 n => format!("{n} connections"),
             });
         }
+    }
+    if let Some(twin) = app.twins.get(&item.id).filter(|twin| twin.offered) {
+        parts.push(format!("waits: #{} has this file from {}; download it from both?", twin.of, twin.host));
     }
     if let Some(torrent) = view.and_then(|view| view.torrent.as_ref()) {
         parts.push(format!("{} peers", torrent.peers));
@@ -1376,9 +1383,11 @@ fn queue_row(app: &App, ui: &mut Ui, line: &Line, action: &mut Option<(usize, Ro
     let actions = row_actions(&item.status);
     // A stream's card offers its track chooser too, left of the others.
     let tracks = crate::tracks::offered(item);
+    // One whose file another download has from another host offers to join them (see `Twin`).
+    let twin = app.twins.get(&item.id).filter(|twin| twin.offered);
     ui.horizontal(|ui| {
         status_icon(ui, item, waiting, app.stalled_for(item.id).is_some(), color, t);
-        left_part(ui, (actions.len() + usize::from(tracks) + 1) as f32 * 30.0, |ui| {
+        left_part(ui, (actions.len() + usize::from(tracks) + 2 * usize::from(twin.is_some()) + 1) as f32 * 30.0, |ui| {
             let mark = match item.priority {
                 Priority::High => Some((icon::CARET_DOUBLE_UP, p.amber, "High priority: starts before the other waiting downloads, and gets more of a speed limit")),
                 Priority::Low => Some((icon::CARET_DOUBLE_DOWN, p.dim, "Low priority: starts after the other waiting downloads, and gets less of a speed limit")),
@@ -1409,6 +1418,15 @@ fn queue_row(app: &App, ui: &mut Ui, line: &Line, action: &mut Option<(usize, Ro
             }
             if tracks && icon_button(ui, icon::SLIDERS_HORIZONTAL, "Choose tracks…", true).clicked() {
                 *action = Some((item.id, RowAction::Tracks));
+            }
+            if let Some(twin) = twin {
+                if icon_button(ui, icon::ARROWS_SPLIT, "Keep apart: download it on its own", true).clicked() {
+                    *action = Some((item.id, RowAction::KeepApart));
+                }
+                let tip = format!("Download from both: its link becomes a second server for #{}, which downloads one file from both", twin.of);
+                if icon_button(ui, icon::ARROWS_MERGE, &tip, true).clicked() {
+                    *action = Some((item.id, RowAction::Join));
+                }
             }
         });
     });
@@ -1800,6 +1818,8 @@ pub(super) fn queue_page(app: &mut App, ui: &mut Ui) {
                 app.list_tracks(Some(id), url);
             }
         }
+        RowAction::Join => app.join_twin(id),
+        RowAction::KeepApart => app.keep_apart(id),
     }
 }
 
@@ -1916,6 +1936,48 @@ mod tests {
         // Further down its page.
         let events = h.app.ctx.data(|d| d.get_temp::<Timeline>(timeline_id())).unwrap().events[&id].iter().map(|(_, what)| what.clone()).collect::<Vec<_>>();
         assert!(events.contains(&format!("Autopilot: {why}")), "in its timeline: {events:?}");
+    }
+
+    /// A link added while another download has its file from another host (the same name and
+    /// size) waits, its card offering to download the one file from both; joined, its link is the
+    /// other's second server and it leaves the queue. Another size is no twin; Keep apart lets
+    /// one start on its own.
+    #[test]
+    fn the_same_file_from_another_host_is_offered_to_join() {
+        let server = tokio::runtime::Runtime::new().unwrap();
+        let port = server.block_on(crate::tests::serve(std::sync::Arc::new(vec![7u8; 4096]))).port();
+        let mut h = Harness::new();
+        h.app.settings.auto_run_queue = false;
+        let first = h.app.add_download(&format!("http://127.0.0.1:{port}/same.bin"), "", "").unwrap();
+        assert!(h.app.twins.is_empty(), "nothing else has its file");
+        h.app.queue.get_item_mut(first).unwrap().total_bytes = 4096;
+        let twin = h.app.add_download(&format!("http://localhost:{port}/same.bin"), "", "").unwrap();
+        h.wait_for(|app| app.twins.get(&twin).is_some_and(|twin| twin.offered));
+        h.frames(10);
+        let lines: Vec<String> = h.texts().into_iter().map(|(text, _)| text).collect();
+        assert!(lines.iter().any(|text| text.contains(&format!("waits: #{first} has this file from 127.0.0.1; download it from both?"))), "{lines:?}");
+        h.click(icon::ARROWS_MERGE);
+        assert!(h.app.queue.get_item(twin).is_none());
+        let urls: Vec<String> = h.app.queue.get_item(first).unwrap().urls.iter().map(|url| url.to_string()).collect();
+        assert_eq!(urls, [format!("http://127.0.0.1:{port}/same.bin"), format!("http://localhost:{port}/same.bin")]);
+
+        // Another size: no offer.
+        h.app.queue.get_item_mut(first).unwrap().total_bytes = 1000;
+        let other = h.app.add_download(&format!("http://localhost:{port}/same.bin?v=2"), "", "").unwrap();
+        assert!(h.app.twins.contains_key(&other), "asked first");
+        h.wait_for(|app| !app.twins.contains_key(&other));
+        h.app.remove_job(other);
+        // Without its Undo banner, whose X closes it.
+        h.app.removed = None;
+
+        h.app.queue.get_item_mut(first).unwrap().total_bytes = 4096;
+        let apart = h.app.add_download(&format!("http://localhost:{port}/same.bin?v=3"), "", "").unwrap();
+        h.wait_for(|app| app.twins.get(&apart).is_some_and(|twin| twin.offered));
+        // The removed cards faded out and their gaps closed (see `GHOST`), so the card stays put.
+        h.frames(60);
+        h.click(icon::ARROWS_SPLIT);
+        assert!(h.app.twins.is_empty() && h.app.queue.get_item(apart).is_some());
+        h.wait_for_background();
     }
 
     /// A running download's own speed limit and connections, set in its details, are kept with it
