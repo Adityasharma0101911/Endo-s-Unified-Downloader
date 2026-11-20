@@ -32,6 +32,7 @@ use crate::{Answer, App, Dialog, Origin, Tab, VerifyRequest, GRAPH_WINDOW};
 
 use add::{add_link, channel_prompt, clipboard_banner, ffmpeg_notice, ffmpeg_prompt, front_door, listing_prompt, notice_banner, undo_toast, update_banner};
 use history::library_page;
+pub(crate) use queue::failure_text;
 use queue::{detail_page, queue_page};
 use settings::settings_page;
 use sidebar::sidebar;
@@ -550,6 +551,7 @@ pub fn render(app: &mut App, ctx: &egui::Context) {
     let p = palette_of(ctx);
     backdrop::paint(ctx, &p, ctx.theme() == Theme::Dark, app.settings.moving_background, app.settings.background_intensity, mood(app));
     queue::observe(app, ctx);
+    app.notify_ended(ctx);
     shortcuts(app, ctx);
     sidebar(app, ctx);
     let beside = wide(ctx) && app.tab == Tab::Downloads;

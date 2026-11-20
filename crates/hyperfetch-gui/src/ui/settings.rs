@@ -14,7 +14,7 @@ fn opened(ctx: &egui::Context) -> f32 {
 
 /// The settings most people change: the page shows only these until All settings is on or
 /// something is searched for.
-const COMMON: [&str; 22] = [
+const COMMON: [&str; 23] = [
     "Save folder",
     "Theme",
     "Reduce motion",
@@ -25,6 +25,7 @@ const COMMON: [&str; 22] = [
     "Close to the tray",
     "Start minimized",
     "Launch at startup",
+    "Notify when downloads end",
     "Connections per download",
     "Speed limit",
     "Browser cookies",
@@ -437,7 +438,8 @@ fn qr_code(ui: &mut Ui, text: &str) {
 /// The days of the week, as `Schedule::days` keeps them.
 const DAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 
-/// The tray, launch at startup, the queue's schedule and where the data and logs are.
+/// The tray, launch at startup, the queue's schedule, where the data and logs are, and the
+/// notifications.
 fn desktop_settings(app: &mut App, ui: &mut Ui) {
     let p = palette(ui);
     let s = &mut app.settings;
@@ -490,6 +492,13 @@ fn desktop_settings(app: &mut App, ui: &mut Ui) {
             }
         }
         ui.add(egui::Label::new(RichText::new(data.display().to_string()).small().color(p.muted)).truncate());
+    });
+    let s = &mut app.settings;
+    let about = "A notification from the system when a download finishes or fails while the window is not in front; \
+                 downloads that end together share one.";
+    switch(ui, "Notify when downloads end", about, &mut s.notify);
+    ui.add_enabled_ui(s.notify, |ui| {
+        switch(ui, "Only when one fails", "No notification for the downloads that finish.", &mut s.notify_failures_only);
     });
 }
 
@@ -1136,6 +1145,64 @@ mod tests {
         scroll_to(&mut h, "Keep the computer awake");
         switch(&mut h, "Keep the computer awake");
         assert!(!h.app.settings.keep_awake);
+    }
+
+    /// Downloads that end while the window is not in front are told through the app's sender:
+    /// those ending together in one notification with a count, a lone failure in its card's
+    /// words; none while the window is in front; with Only when one fails (switched on the page)
+    /// none for those that finish; none at all once turned off.
+    #[test]
+    fn ended_downloads_are_notified_together() {
+        use crate::notify::Notice;
+        let mut h = Harness::new();
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&sent);
+        h.app.notifier = Box::new(move |notice| lock(&log).push(notice));
+        let end = |h: &mut Harness, name: &str, error: Option<&str>| {
+            let id = h.add(name);
+            h.app.queue.mark_started(id);
+            let result = error.map_or_else(|| Ok((std::env::temp_dir().join(name), Some(1))), |e| Err(e.to_string()));
+            h.app.handle_event(crate::AppEvent::JobFinished { id, result });
+        };
+        // Time passes on the window's clock.
+        let wait = |h: &mut Harness, secs: f64| {
+            h.time += secs;
+            h.frame(Vec::new());
+        };
+        end(&mut h, "seen.iso", None);
+        wait(&mut h, 30.0);
+        assert!(lock(&sent).is_empty(), "the window was in front");
+
+        h.focused = false;
+        h.frame(Vec::new());
+        end(&mut h, "a.iso", None);
+        wait(&mut h, 1.0);
+        end(&mut h, "b.iso", Some("The server answered 404 Not Found"));
+        wait(&mut h, 2.0);
+        assert!(lock(&sent).is_empty(), "it waits for others to end with them");
+        assert!(h.delay() < Duration::from_secs(2), "and asks for the frame it is due in: {:?}", h.delay());
+        wait(&mut h, 1.5);
+        let both = Notice { title: "1 download finished, 1 failed".into(), body: "b.iso, a.iso".into() };
+        assert_eq!(*lock(&sent), [both]);
+        end(&mut h, "c.iso", Some("The server answered 404 Not Found"));
+        wait(&mut h, 25.0);
+        let hint = "Failed: The file is no longer at this link. Open its page and copy the link again.";
+        assert_eq!(lock(&sent).last(), Some(&Notice { title: "c.iso".into(), body: hint.into() }));
+        lock(&sent).clear();
+
+        h.app.tab = Tab::Settings;
+        assert!(h.settle());
+        scroll_to(&mut h, "Notify when downloads end");
+        click(&mut h, |h| h.find_near("Only when one fails", TOGGLE));
+        assert!(h.app.settings.notify_failures_only);
+        end(&mut h, "d.iso", None);
+        wait(&mut h, 25.0);
+        assert!(lock(&sent).is_empty(), "only failures");
+        click(&mut h, |h| h.find_near("Notify when downloads end", TOGGLE));
+        assert!(!h.app.settings.notify);
+        end(&mut h, "e.iso", Some("HTTP 500"));
+        wait(&mut h, 25.0);
+        assert!(lock(&sent).is_empty(), "turned off");
     }
 
     /// Scrolls the Settings page with the wheel until `title` shows near its top, under the

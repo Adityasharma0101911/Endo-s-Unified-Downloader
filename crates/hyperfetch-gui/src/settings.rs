@@ -208,6 +208,10 @@ pub struct Settings {
     pub start_minimized: bool,
     /// Start with the system, hidden (see `desktop::startup_entry`).
     pub launch_at_startup: bool,
+    /// A desktop notification when downloads end while the window is not in view (see `notify`);
+    /// only for failures with `notify_failures_only`. On by default.
+    pub notify: bool,
+    pub notify_failures_only: bool,
     /// When the queue starts and stops by itself.
     pub schedule: Schedule,
     /// The folders `sort_downloads` moves single files into, by extension, as typed (see
@@ -256,13 +260,13 @@ pub struct Settings {
     pub phone_token: crate::phone::Token,
     /// The address the QR code holds, of this computer's on local networks (empty: the first).
     pub phone_address: String,
+    /// The computer does not sleep by itself while downloads run, or before the schedule starts
+    /// waiting ones (see `desktop::wants_awake`). On by default.
+    pub keep_awake: bool,
 }
 
 /// When the queue runs by itself (see `desktop::schedule_due`): at `start` on the ticked days it
 /// starts, at `stop` the running downloads pause. Local time, "HH:MM".
-    /// The computer does not sleep by itself while downloads run, or before the schedule starts
-    /// waiting ones (see `desktop::wants_awake`). On by default.
-    pub keep_awake: bool,
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Schedule {
@@ -358,6 +362,8 @@ impl Default for Settings {
             close_to_tray: false,
             start_minimized: false,
             launch_at_startup: false,
+            notify: true,
+            notify_failures_only: false,
             schedule: Schedule::default(),
             categories: hyperfetch_core::postprocess::default_categories(),
             remote_checksum: engine.remote_checksum,
@@ -378,13 +384,13 @@ impl Default for Settings {
             phone_links: false,
             phone_token: Default::default(),
             phone_address: String::new(),
+            keep_awake: true,
         }
     }
 }
 
 /// The download history's file, which the GUI's own files sit next to.
 fn history_path() -> PathBuf {
-            keep_awake: true,
     // Tests never read or write the user's settings, queue or logs.
     #[cfg(test)]
     crate::tests::isolate_history();
@@ -1066,13 +1072,14 @@ mod tests {
     fn desktop_settings_start_off() {
         let saved: Settings = serde_json::from_str(r#"{"theme": 1, "schedule": {"enabled": true}}"#).unwrap();
         assert!(!saved.close_to_tray && !saved.start_minimized && !saved.launch_at_startup && saved.schedule_paused.is_empty());
+        assert!(saved.notify && !saved.notify_failures_only, "notifications are on, for every download");
         assert_eq!(saved.schedule, Schedule { enabled: true, ..Schedule::default() });
         assert_eq!(Settings::default().schedule, Schedule { enabled: false, start: None, stop: None, days: [true; 7] });
         let mut days = [true; 7];
         days[6] = false;
         let schedule = Schedule { enabled: true, start: Some("01:00".into()), stop: Some("07:00".into()), days };
         let paused = vec![3, 7];
-        let chosen = Settings { close_to_tray: true, start_minimized: true, launch_at_startup: true, schedule, schedule_paused: paused, ..saved };
+        let chosen = Settings { close_to_tray: true, start_minimized: true, launch_at_startup: true, schedule, schedule_paused: paused, notify: false, notify_failures_only: true, ..saved };
         assert_eq!(serde_json::from_str::<Settings>(&serde_json::to_string(&chosen).unwrap()).unwrap(), chosen);
     }
 }

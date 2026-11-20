@@ -14,6 +14,16 @@ fn page_of(item: &QueueItem) -> Option<&str> {
     item.options.referer.as_deref().filter(|page| page.starts_with("https://") || page.starts_with("http://"))
 }
 
+/// Why failed download `item` failed, as its card says it (a desktop notification too); None for
+/// one that did not fail.
+pub(crate) fn failure_text(item: &QueueItem) -> Option<String> {
+    match &item.status {
+        QueueItemStatus::Failed(_) if item.link_expired() => Some(LINK_EXPIRED.to_string()),
+        QueueItemStatus::Failed(error) => Some(util::error_hint(error).unwrap_or(error).to_string()),
+        _ => None,
+    }
+}
+
 /// Whether `item` is stopped and over plain links, so that it can take a new one.
 fn takes_new_link(item: &QueueItem) -> bool {
     matches!(item.status, QueueItemStatus::Paused | QueueItemStatus::Failed(_)) && item.relinkable()
@@ -1404,8 +1414,7 @@ fn queue_row(app: &App, ui: &mut Ui, line: &Line, action: &mut Option<(usize, Ro
         let chip = anim::color(&ctx, item_id.with("status chip"), color, 0.35);
         ui.add(egui::Label::new(bold(status).size(12.0).color(chip)).selectable(false));
         let (text, color) = match &item.status {
-            QueueItemStatus::Failed(_) if item.link_expired() => (LINK_EXPIRED.to_string(), p.amber),
-            QueueItemStatus::Failed(error) => (truncate_chars(util::error_hint(error).unwrap_or(error.as_str()), 200), p.red),
+            QueueItemStatus::Failed(_) => (truncate_chars(&failure_text(item).unwrap_or_default(), 200), if item.link_expired() { p.amber } else { p.red }),
             QueueItemStatus::AuthRequired => ("Authorization header not saved: open Details to enter it again and resume".to_string(), p.amber),
             _ => (row_summary(app, item, eased_progress(ui, item_id, item.progress_ratio as f32) as f64), p.muted),
         };

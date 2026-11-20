@@ -2,6 +2,7 @@
 
 mod desktop;
 mod ipc;
+mod notify;
 mod phone;
 mod queue_store;
 mod recording;
@@ -408,9 +409,9 @@ struct App {
     power: desktop::Power,
     /// Writes launch at startup and the `endo-dl:` link (see `desktop::write`).
     writer: desktop::Writer,
-    /// The local time the schedule was last checked at (see `desktop::schedule_due`).
     /// Keeps the computer awake while there is work (see `App::keep_awake`).
     awake: hyperfetch_core::power::KeepAwake,
+    /// The local time the schedule was last checked at (see `desktop::schedule_due`).
     schedule_seen: Option<(u8, u16)>,
     /// Paused downloads Resume all or the schedule's start resumes, first come first, as the
     /// queue has room for them (see `App::run_scheduler`).
@@ -440,6 +441,10 @@ struct App {
     phone_server: Option<phone::Server>,
     /// The New link box open on a stopped download's page.
     new_link: Option<NewLink>,
+    /// Shows desktop notifications (see `notify::sender`), and the downloads that ended and are
+    /// to be told in the next one.
+    notifier: notify::Sender,
+    ended: notify::Batch,
 }
 
 impl App {
@@ -466,6 +471,7 @@ impl App {
             &rt,
         );
         app.taskbar = taskbar::Taskbar::new(TITLE);
+        app.notifier = notify::sender(app.events_tx.clone(), cc.egui_ctx.clone(), rt.clone());
         if cfg!(windows) && links {
             app.register_protocol();
         }
@@ -577,13 +583,13 @@ impl App {
             countdown: None,
             power: Box::new(desktop::power),
             writer: Box::new(desktop::write),
+            awake: hyperfetch_core::power::KeepAwake::new(Box::new(desktop::stay_awake)),
             schedule_seen: None,
             resuming: Vec::new(),
             restarting: HashSet::new(),
             taskbar: None,
             taskbar_shown: None,
             batch_failed: false,
-            awake: hyperfetch_core::power::KeepAwake::new(Box::new(desktop::stay_awake)),
             zip_preview: None,
             keep_scripts: false,
             saving_page: None,
@@ -592,6 +598,8 @@ impl App {
             phone,
             phone_server: None,
             new_link: None,
+            notifier: Box::new(|_| {}),
+            ended: notify::Batch::default(),
         }
     }
 
@@ -1657,6 +1665,7 @@ impl App {
                     }
                 }
                 self.queue.finish(id, result);
+                self.note_ended(id);
                 if self.restarting.remove(&id) && self.queue.get_item(id).is_some_and(|item| item.status == QueueItemStatus::Paused) {
                     self.start_job(id, false);
                 }
@@ -2011,6 +2020,7 @@ impl App {
             // Turned on again, it starts from then, not from when it was turned off.
             self.schedule_seen = None;
         }
+        self.keep_awake(desktop::local_now());
         if self.queue.active_count() == 0 {
             self.batch_failed = false;
         }
@@ -2020,7 +2030,41 @@ impl App {
                 self.taskbar_shown = Some(progress);
             }
         }
-        self.keep_awake(desktop::local_now());
+    }
+
+    /// Whether the user sees the window now: in front, neither hidden nor minimized.
+    fn in_view(&self) -> bool {
+        !self.hidden && self.ctx.input(|i| i.focused && i.viewport().minimized != Some(true))
+    }
+
+    /// Gathers download `id`, which just ended, for a desktop notification (see `notify::Batch`)
+    /// as the settings say: not while the window is in view, where its card shows it.
+    fn note_ended(&mut self, id: usize) {
+        let Some(item) = self.queue.get_item(id).filter(|_| self.settings.notify && !self.in_view()) else { return };
+        let name = item.filename.clone();
+        let ended = match &item.status {
+            QueueItemStatus::Completed if !self.settings.notify_failures_only => {
+                let folder = item.target_path.as_deref().and_then(std::path::Path::parent).map(|f| f.display().to_string());
+                notify::Ended::Done { name, folder: folder.unwrap_or_default() }
+            }
+            QueueItemStatus::Failed(_) => notify::Ended::Failed { name, why: ui::failure_text(item).unwrap_or_default() },
+            _ => return,
+        };
+        self.ended.push(ended, self.ctx.input(|i| i.time));
+    }
+
+    /// Shows the notification of the downloads gathered once it is due, else asks for a frame
+    /// then; forgets them once the window is in view or notifications are turned off.
+    fn notify_ended(&mut self, ctx: &egui::Context) {
+        if !self.settings.notify || self.in_view() {
+            return self.ended.clear();
+        }
+        let now = ctx.input(|i| i.time);
+        if let Some(notice) = self.ended.take(now) {
+            (self.notifier)(notice);
+        } else if let Some(at) = self.ended.due_at() {
+            ctx.request_repaint_after(Duration::from_secs_f64(at - now));
+        }
     }
 
     fn tray_action(&mut self, action: TrayAction) {
@@ -2118,6 +2162,17 @@ impl App {
         self.save_settings();
     }
 
+    /// Keeps the computer awake, as the setting allows, while downloads run, and while the
+    /// schedule's start at `now` is less than `desktop::AWAKE_BEFORE_START` away with downloads
+    /// waiting for it (ones its stop paused, or queued ones while the queue is stopped); lets it
+    /// sleep the moment there is neither.
+    fn keep_awake(&mut self, now: (u8, u16)) {
+        let queued = self.queue.items().iter().any(|item| item.status == QueueItemStatus::Queued);
+        let waiting = !self.settings.schedule_paused.is_empty() || !self.settings.auto_run_queue && queued;
+        let due = desktop::minutes_to_start(&self.settings.schedule, now).is_some_and(|m| m <= desktop::AWAKE_BEFORE_START);
+        self.awake.set(self.settings.keep_awake && (self.queue.active_count() > 0 || waiting && due));
+    }
+
     /// Nothing runs, and nothing queued will start by itself.
     fn queue_done(&self) -> bool {
         let waiting = self.settings.auto_run_queue && self.queue.items().iter().any(|item| item.status == QueueItemStatus::Queued);
@@ -2162,17 +2217,6 @@ impl App {
         self.settings.clipboard_watch = self.clipboard_enabled.load(Ordering::Relaxed);
         if let Err(e) = self.settings.save() {
             tracing::warn!("Failed to save settings: {}", e);
-    /// Keeps the computer awake, as the setting allows, while downloads run, and while the
-    /// schedule's start at `now` is less than `desktop::AWAKE_BEFORE_START` away with downloads
-    /// waiting for it (ones its stop paused, or queued ones while the queue is stopped); lets it
-    /// sleep the moment there is neither.
-    fn keep_awake(&mut self, now: (u8, u16)) {
-        let queued = self.queue.items().iter().any(|item| item.status == QueueItemStatus::Queued);
-        let waiting = !self.settings.schedule_paused.is_empty() || !self.settings.auto_run_queue && queued;
-        let due = desktop::minutes_to_start(&self.settings.schedule, now).is_some_and(|m| m <= desktop::AWAKE_BEFORE_START);
-        self.awake.set(self.settings.keep_awake && (self.queue.active_count() > 0 || waiting && due));
-    }
-
         }
     }
 
@@ -4030,50 +4074,6 @@ mod tests {
         assert_eq!(status(&app, b), Downloading);
     }
 
-    /// The taskbar shows nothing while no download runs, else the share of their bytes done:
-    /// yellow when all are pausing, red once one failed until the queue stands still.
-    #[test]
-    fn the_taskbar_shows_the_running_downloads() {
-        use taskbar::Progress;
-        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let mut app = test_app(&rt, dir.path());
-        let [a, b] = ["a.iso", "b.iso"].map(|name| add(&mut app, name));
-        assert_eq!(app.overall_progress(), Progress::None);
-        running(&mut app, &rt, a);
-        running(&mut app, &rt, b);
-        app.queue.apply_snapshot(a, &EngineSnapshot { total_bytes: 1000, downloaded_bytes: 250, ..Default::default() });
-        assert_eq!(app.overall_progress(), Progress::Normal(250), "a size not known yet counts for nothing");
-        app.queue.apply_snapshot(b, &EngineSnapshot { total_bytes: 3000, downloaded_bytes: 3000, ..Default::default() });
-        assert_eq!(app.overall_progress(), Progress::Normal(812));
-        app.pause_job(a);
-        assert_eq!(app.overall_progress(), Progress::Normal(812));
-        app.pause_job(b);
-        assert_eq!(app.overall_progress(), Progress::Paused(812));
-        app.batch_failed = true;
-        assert_eq!(app.overall_progress(), Progress::Error(812));
-    }
-
-    /// Launch at startup is written where the system looks, through the writer the app holds,
-    /// and the setting changes only when that worked.
-    #[test]
-    fn launch_at_startup_is_registered_and_removed() {
-        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let mut app = test_app(&rt, dir.path());
-        let written = Arc::new(Mutex::new(Vec::new()));
-        let log = Arc::clone(&written);
-        app.writer = Box::new(move |place, value| {
-            lock(&log).push((place.clone(), value.map(str::to_string)));
-            Ok(())
-        });
-        app.set_launch_at_startup(true);
-        assert!(app.settings.launch_at_startup);
-        let (place, value) = desktop::startup_entry(&std::env::current_exe().unwrap(), &desktop::startup_root());
-        app.set_launch_at_startup(false);
-        assert!(!app.settings.launch_at_startup);
-        assert_eq!(*lock(&written), [(place.clone(), Some(value)), (place, None)]);
-
     /// The computer is held awake once while downloads run, through finishing, failing and
     /// pausing, and let go the moment none does; and while the schedule's start is due within
     /// twelve hours with downloads waiting for it. The setting off, it is never held.
@@ -4145,6 +4145,50 @@ mod tests {
         app.keep_awake((0, 21 * 60));
         assert_eq!(*lock(&counts), (4, 4), "the setting off, nothing is held");
     }
+
+    /// The taskbar shows nothing while no download runs, else the share of their bytes done:
+    /// yellow when all are pausing, red once one failed until the queue stands still.
+    #[test]
+    fn the_taskbar_shows_the_running_downloads() {
+        use taskbar::Progress;
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(&rt, dir.path());
+        let [a, b] = ["a.iso", "b.iso"].map(|name| add(&mut app, name));
+        assert_eq!(app.overall_progress(), Progress::None);
+        running(&mut app, &rt, a);
+        running(&mut app, &rt, b);
+        app.queue.apply_snapshot(a, &EngineSnapshot { total_bytes: 1000, downloaded_bytes: 250, ..Default::default() });
+        assert_eq!(app.overall_progress(), Progress::Normal(250), "a size not known yet counts for nothing");
+        app.queue.apply_snapshot(b, &EngineSnapshot { total_bytes: 3000, downloaded_bytes: 3000, ..Default::default() });
+        assert_eq!(app.overall_progress(), Progress::Normal(812));
+        app.pause_job(a);
+        assert_eq!(app.overall_progress(), Progress::Normal(812));
+        app.pause_job(b);
+        assert_eq!(app.overall_progress(), Progress::Paused(812));
+        app.batch_failed = true;
+        assert_eq!(app.overall_progress(), Progress::Error(812));
+    }
+
+    /// Launch at startup is written where the system looks, through the writer the app holds,
+    /// and the setting changes only when that worked.
+    #[test]
+    fn launch_at_startup_is_registered_and_removed() {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(&rt, dir.path());
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&written);
+        app.writer = Box::new(move |place, value| {
+            lock(&log).push((place.clone(), value.map(str::to_string)));
+            Ok(())
+        });
+        app.set_launch_at_startup(true);
+        assert!(app.settings.launch_at_startup);
+        let (place, value) = desktop::startup_entry(&std::env::current_exe().unwrap(), &desktop::startup_root());
+        app.set_launch_at_startup(false);
+        assert!(!app.settings.launch_at_startup);
+        assert_eq!(*lock(&written), [(place.clone(), Some(value)), (place, None)]);
 
         app.register_protocol();
         assert_eq!(lock(&written).len(), 5, "the endo-dl: key, its URL Protocol value and its command");

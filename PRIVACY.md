@@ -49,6 +49,8 @@ The sign-ins of those accounts stay in an `accounts` folder in the app's folder,
 
 Your keys, passwords and that code are saved only on your computer. They are never stored with the queue or the history.
 
+The notifications the app shows when downloads end (on by default) name a download and its folder, or why it failed, on this computer only: on Windows as toasts, for which the app registers its name and logo for your user (`HKCU\Software\Classes\AppUserModelId\EndosUnifiedDownloader`, the logo saved as `notification-icon.png` in its data folder); on macOS through `osascript`; on Linux through the desktop's notification server, over D-Bus.
+
 ## Deleting your data
 
 - Removing the extension deletes everything it stored.

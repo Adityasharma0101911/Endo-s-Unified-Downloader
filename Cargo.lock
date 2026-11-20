@@ -2832,8 +2832,10 @@ dependencies = [
  "tracing-subscriber",
  "tray-icon",
  "url",
+ "windows",
  "windows-sys 0.59.0",
  "winresource",
+ "zbus",
 ]
 
 [[package]]
