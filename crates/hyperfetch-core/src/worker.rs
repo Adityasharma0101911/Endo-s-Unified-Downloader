@@ -753,6 +753,9 @@ impl HttpWorker {
             .get_mirror(mirror_id)
             .filter(|m| m.score(Instant::now()) >= 0.0 && HostKey::routed(&m.url, route_id) == *slot.host())?;
         let (url, if_range, redirected) = (mirror.url.clone(), mirror.if_range.clone(), mirror.fallback.is_some());
+        // A host that refused a request lately limits how often it is asked: a running chunk is
+        // not split into another request to it.
+        let splits = !hosts::refused_lately(&url);
         let job = {
             let mut mgr = s.chunks.lock();
             let taken = mgr.get_next_work(self.worker_id, mirror_id).or_else(|| {
@@ -770,6 +773,7 @@ impl HttpWorker {
             };
             match found {
                 Some(job) => job,
+                None if !splits => return None,
                 None => {
                     let costs: Vec<StealTiming> =
                         racer.mirrors().iter().map(|m| StealTiming { startup: m.ttfb(), rate: m.speed_ewma }).collect();
@@ -866,6 +870,12 @@ impl HttpWorker {
                         _ => false,
                     };
                     record_failure(&mut racer, &mut chunks, chunk_id, mirror_id, url, kind, paced, &error);
+                    // A host that limits how often it is asked: what is left goes in no more
+                    // requests than the connections the download keeps.
+                    if matches!(kind, FailureKind::Throttled(_)) {
+                        let kept = racer.mirrors().iter().filter(|m| m.is_active).map(|m| m.max_connections).fold(0, usize::saturating_add);
+                        chunks.merge_pending(kept.min(s.width.load(Ordering::Relaxed)));
+                    }
                 } else if kind == FailureKind::Fatal {
                     chunks.abort(chunk_id, &error);
                 } else if let Some(mirror) = racer.get_mirror_mut(mirror_id) {

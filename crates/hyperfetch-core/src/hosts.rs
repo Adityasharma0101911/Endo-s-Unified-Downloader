@@ -143,6 +143,12 @@ pub fn profile(url: &Url) -> HostProfile {
     HOSTS.profile(&HostKey::of(url), Instant::now())
 }
 
+/// Whether `url`'s host refused a request (429/503) within `BANNED_FOR`, on any route: it limits
+/// how often it is asked, so it is asked only what is needed.
+pub fn refused_lately(url: &Url) -> bool {
+    HOSTS.refused_lately(&HostKey::of(url), clock())
+}
+
 /// Records what `url`'s host was seen to do: each fact given replaces the one known, and is
 /// trusted for `PROFILE_TTL` from now. Facts left `None` are kept as they are.
 pub fn record(url: &Url, seen: HostProfile) {
@@ -659,6 +665,13 @@ impl Hosts {
             prof.connection_cap = key.default_connection_cap();
         }
         prof
+    }
+
+    fn refused_lately(&self, key: &HostKey, now: Instant) -> bool {
+        self.entries.lock().iter().any(|(other, entry)| {
+            (&other.scheme, &other.host, other.port) == (&key.scheme, &key.host, key.port)
+                && entry.refused.is_some_and(|(at, _)| now.saturating_duration_since(at) < BANNED_FOR)
+        })
     }
 
     fn record(&self, key: &HostKey, seen: HostProfile, now: Instant) {

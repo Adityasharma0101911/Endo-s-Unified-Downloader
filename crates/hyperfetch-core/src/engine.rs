@@ -9688,6 +9688,22 @@ mod tests {
         assert_eq!((early, shut), (0, 0), "{refused} refused");
     }
 
+    /// A host that keeps a budget of requests (4 at once, then one a second; past it 429 with
+    /// Retry-After 1) and sends a client 4 MB/s, asked over up to 16 connections: once it refuses
+    /// one, what is left goes in no more requests than the connections kept need, and no running
+    /// chunk is split into another. One request per chunk asked it about 32 times.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_host_that_keeps_a_budget_of_requests_is_asked_little() {
+        let size = 8 * 1024 * 1024;
+        let budget = crate::netsim::Budget { burst: 4, every: Duration::from_secs(1), retry_after: 1 };
+        let (url, stats) = crate::netsim::serve(crate::netsim::Server { size, per_client: Some(4e6), budget: Some(budget), ..Default::default() }).await;
+        let dir = tempdir().unwrap();
+        let (got, _) = fetch_from_sim(&url, sim_options(dir.path(), 16, true)).await;
+        assert!(got == crate::netsim::file(size));
+        let (asked, refused) = (stats.asked.load(Ordering::SeqCst), stats.throttled.load(Ordering::SeqCst));
+        assert!(asked <= 16, "{asked} requests, {refused} refused");
+    }
+
     /// Time and requests for a 32 MiB file from a host that keeps a budget of requests (4 at
     /// once, then one every 3 s; past it 429 with Retry-After 3) and sends a client 8 MB/s: the
     /// download as the app makes it, three times, then one plain request.

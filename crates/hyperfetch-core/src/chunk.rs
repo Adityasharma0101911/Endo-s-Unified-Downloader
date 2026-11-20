@@ -70,6 +70,9 @@ pub enum ChunkStatus {
         reason: String,
         retries: u32,
     },
+    /// Its bytes went to another chunk's request (see `ChunkManager::merge_pending`): nothing is
+    /// left to do for it.
+    Merged,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -217,8 +220,10 @@ impl Chunk {
 
     /// The contiguous prefix already on disk, if any.
     fn written_prefix(&self) -> Option<ByteRange> {
-        if self.is_completed() {
-            return Some(self.range);
+        match self.status {
+            ChunkStatus::Completed => return Some(self.range),
+            ChunkStatus::Merged => return None,
+            _ => {}
         }
         let pos = self.current_offset.load(Ordering::SeqCst).min(self.range.end.saturating_add(1));
         (pos > self.range.start).then(|| ByteRange { start: self.range.start, end: pos - 1 })
@@ -269,6 +274,7 @@ pub struct ChunkManager {
     total_size: u64,
     base_chunk_size: u64,
     chunks: Vec<Chunk>,
+    /// Chunks with nothing left to do: completed, or merged into another.
     completed: usize,
     /// No `Unassigned` chunk exists below this index.
     next_fresh: usize,
@@ -670,6 +676,72 @@ impl ChunkManager {
         }
     }
 
+    /// Cuts what no worker has (chunks waiting for a first or another attempt) into about
+    /// `pieces` requests, for a host that limits how often it is asked: one request per chunk would
+    /// cost it far more than the connections kept need. Each run of such chunks side by side
+    /// becomes one request, or several of equal size while that gives fewer than `pieces` in all.
+    /// Chunks in flight or done, and what is on disk, are left as they are. When one of them waits
+    /// to be retried (a refusal's Retry-After, which the host rests anyway), every piece waits as
+    /// long as the longest such wait and keeps the most retries any of them had. The pieces get
+    /// the lowest ids of those chunks and are retried in the file's order, so its start is asked
+    /// for first; the other chunks are merged.
+    pub(crate) fn merge_pending(&mut self, pieces: usize) {
+        let mut pending: Vec<usize> =
+            self.chunks.iter().filter(|c| matches!(c.status, ChunkStatus::Unassigned | ChunkStatus::Failed { .. })).map(|c| c.id).collect();
+        pending.sort_by_key(|&id| self.chunks[id].range.start);
+        let mut runs: Vec<Vec<usize>> = Vec::new();
+        for &id in &pending {
+            match runs.last_mut() {
+                Some(run) if self.chunks[run[run.len() - 1]].range.end + 1 == self.chunks[id].range.start => run.push(id),
+                _ => runs.push(vec![id]),
+            }
+        }
+        let left: u64 = pending.iter().map(|&id| self.chunks[id].range.len()).sum();
+        let share = left.div_ceil(pieces.max(1) as u64).max(1);
+        // Each run's first byte, length and pieces.
+        let cuts: Vec<_> = runs
+            .iter()
+            .map(|run| {
+                let start = self.chunks[run[0]].range.start;
+                let len = self.chunks[run[run.len() - 1]].range.end - start + 1;
+                (start, len, len.div_ceil(share).clamp(1, run.len() as u64))
+            })
+            .collect();
+        if cuts.iter().map(|cut| cut.2).sum::<u64>() == pending.len() as u64 {
+            return;
+        }
+        let not_before = pending.iter().filter_map(|&id| self.chunks[id].not_before).max();
+        let retries = pending.iter().map(|&id| self.chunks[id].retries).max().unwrap_or(0);
+        let failed = pending.iter().find_map(|&id| match &self.chunks[id].status {
+            ChunkStatus::Failed { reason, .. } => Some(reason.clone()),
+            _ => None,
+        });
+        let mut ids = pending.clone();
+        ids.sort_unstable();
+        let mut ids = ids.into_iter();
+        self.retry_queue.retain(|id| !pending.contains(id));
+        for (start, len, n64) in cuts {
+            for i in 0..n64 {
+                let id = ids.next().expect("a run has no more pieces than chunks");
+                let mut piece = Chunk::new(id, ByteRange { start: start + len * i / n64, end: start + len * (i + 1) / n64 - 1 });
+                piece.retries = retries;
+                match &failed {
+                    Some(reason) => {
+                        piece.status = ChunkStatus::Failed { reason: reason.clone(), retries };
+                        piece.not_before = not_before;
+                        self.retry_queue.push(id);
+                    }
+                    None => self.next_fresh = self.next_fresh.min(id),
+                }
+                self.chunks[id] = piece;
+            }
+        }
+        for id in ids {
+            self.chunks[id].status = ChunkStatus::Merged;
+            self.completed += 1;
+        }
+    }
+
     /// Marks a chunk as completed.
     pub fn mark_completed(&mut self, chunk_id: usize) -> Result<(), ChunkError> {
         let chunk = self.get_chunk_mut(chunk_id)?;
@@ -758,14 +830,15 @@ impl ChunkManager {
     pub fn chunk_snapshots(&self) -> Vec<ChunkSnapshot> {
         self.chunks
             .iter()
-            .map(|c| {
+            .filter_map(|c| {
                 let (status_str, worker_id) = match &c.status {
                     ChunkStatus::Unassigned => ("Pending".to_string(), None),
                     ChunkStatus::Assigned { worker_id, .. } => (format!("Worker {}", worker_id), Some(*worker_id)),
                     ChunkStatus::Completed => ("Completed".to_string(), None),
                     ChunkStatus::Failed { reason, .. } => (format!("Failed: {}", reason), None),
+                    ChunkStatus::Merged => return None,
                 };
-                ChunkSnapshot {
+                Some(ChunkSnapshot {
                     id: c.id,
                     range_start: c.range.start,
                     range_end: c.range.end,
@@ -773,7 +846,7 @@ impl ChunkManager {
                     total_bytes: c.range.len(),
                     status: status_str,
                     worker_id,
-                }
+                })
             })
             .collect()
     }
@@ -1052,6 +1125,57 @@ mod tests {
         let rests: Vec<ByteRange> = (0..2).map(|_| manager.get_next_work(0, 0).unwrap().range).collect();
         assert_eq!(rests, [ByteRange::new(MB + 1, 2 * MB - 1).unwrap(), ByteRange::new(2 * MB + 1001, 3 * MB - 1).unwrap()]);
         assert!(manager.get_next_work(0, 0).is_none());
+    }
+
+    /// What no worker has is merged into as many requests as the connections kept: with one, the
+    /// chunks side by side after a refused one are a single request, which waits out the refusal's
+    /// Retry-After; chunks running or done, and what is on disk, stay. A later widening splits the
+    /// piece as any running chunk, and the pieces finish the file. With two kept, a fresh file
+    /// is two halves.
+    #[test]
+    fn test_pending_chunks_merge_into_as_many_requests_as_connections_kept() {
+        let mut manager = ChunkManager::new(10 * MB, MB).unwrap();
+        let [running, done, later, refused] = [0, 1, 2, 3].map(|worker| manager.get_next_work(worker, 0).unwrap());
+        manager.mark_completed(done.id).unwrap();
+        refused.current_offset.store(3 * MB + 1000, Ordering::SeqCst);
+        manager.mark_failed(refused.id, "HTTP 429", Duration::from_millis(100), false).unwrap();
+        let on_disk = manager.completed_ranges();
+        manager.merge_pending(1);
+        assert_eq!(manager.completed_ranges(), on_disk, "what is on disk stays");
+        assert_eq!(manager.chunk_snapshots().len(), 5, "two running, one done, what the refused one wrote, and one piece");
+        assert!(manager.get_next_work(4, 0).is_none(), "the piece waits out the Retry-After");
+        std::thread::sleep(Duration::from_millis(150));
+        let rest = manager.get_next_work(4, 0).unwrap();
+        assert_eq!((rest.id, rest.range), (refused.id, ByteRange::new(3 * MB + 1000, 10 * MB - 1).unwrap()));
+        assert!(manager.get_next_work(5, 0).is_none());
+        let (victim, stolen) = manager.steal_work(5, 0, MB).unwrap();
+        assert_eq!(victim, rest.id);
+        for id in [running.id, later.id, rest.id, stolen.id] {
+            manager.mark_completed(id).unwrap();
+        }
+        assert!(manager.is_all_completed());
+        assert_eq!(manager.completed_ranges(), [ByteRange::new(0, 10 * MB - 1).unwrap()]);
+
+        let mut fresh = ChunkManager::new(10 * MB, MB).unwrap();
+        fresh.merge_pending(2);
+        let halves: Vec<Chunk> = (0..2).map(|worker| fresh.get_next_work(worker, 0).unwrap()).collect();
+        let ranges: Vec<ByteRange> = halves.iter().map(|c| c.range).collect();
+        assert_eq!(ranges, [ByteRange::new(0, 5 * MB - 1).unwrap(), ByteRange::new(5 * MB, 10 * MB - 1).unwrap()]);
+        assert!(fresh.get_next_work(2, 0).is_none());
+        halves.iter().for_each(|c| fresh.mark_completed(c.id).unwrap());
+        assert!(fresh.is_all_completed());
+
+        // Two runs on either side of a running chunk, one refused: both wait out its Retry-After,
+        // and go in the file's order.
+        let mut split = ChunkManager::new(4 * MB, MB).unwrap();
+        let [first, _running] = [0, 1].map(|worker| split.get_next_work(worker, 0).unwrap());
+        split.mark_failed(first.id, "HTTP 429", Duration::from_millis(100), false).unwrap();
+        split.merge_pending(1);
+        assert!(split.get_next_work(2, 0).is_none(), "both wait");
+        std::thread::sleep(Duration::from_millis(150));
+        let order: Vec<u64> = (2..4).map(|worker| split.get_next_work(worker, 0).unwrap().range.start).collect();
+        assert_eq!(order, [0, 2 * MB]);
+        assert!(split.get_next_work(4, 0).is_none());
     }
 
     const SILENT: Duration = Duration::from_secs(2);
