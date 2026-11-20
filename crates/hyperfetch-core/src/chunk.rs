@@ -657,6 +657,29 @@ impl ChunkManager {
         true
     }
 
+    /// Cuts what the in-flight chunk with the most left has yet to receive into `parts` about equal
+    /// pieces, none under `min_bytes`: its worker keeps the first, and the rest wait as fresh
+    /// chunks for the workers about to start, each asking for one, instead of halving one
+    /// another's (see [`ChunkManager::steal_work`]). As a steal, it truncates the chunk.
+    pub(crate) fn spread(&mut self, parts: usize, min_bytes: u64) {
+        let Some(id) = self.chunks.iter().filter(|c| c.is_in_flight()).max_by_key(|c| c.unreceived()).map(|c| c.id) else { return };
+        let chunk = &mut self.chunks[id];
+        let left = chunk.unreceived();
+        let parts = (parts as u64).min(left / min_bytes.max(1));
+        if parts < 2 {
+            return;
+        }
+        let end = chunk.end_offset.load(Ordering::SeqCst);
+        let from = end + 1 - left;
+        let at = |i: u64| from + (left as u128 * i as u128 / parts as u128) as u64;
+        chunk.end_offset.store(at(1) - 1, Ordering::SeqCst);
+        chunk.range.end = at(1) - 1;
+        for i in 1..parts {
+            let piece = Chunk::new(self.chunks.len(), ByteRange { start: at(i), end: at(i + 1) - 1 });
+            self.chunks.push(piece);
+        }
+    }
+
     /// Hands back what the attempts of workers `from` and above have yet to receive, as fresh
     /// chunks for the others: a download whose connections were cut goes on without waiting for
     /// those attempts. Each keeps one byte, so it ends at its next, as a victim of a steal does.
@@ -1125,6 +1148,29 @@ mod tests {
         let rests: Vec<ByteRange> = (0..2).map(|_| manager.get_next_work(0, 0).unwrap().range).collect();
         assert_eq!(rests, [ByteRange::new(MB + 1, 2 * MB - 1).unwrap(), ByteRange::new(2 * MB + 1001, 3 * MB - 1).unwrap()]);
         assert!(manager.get_next_work(0, 0).is_none());
+    }
+
+    /// A lone stream that more connections join is cut into as many even pieces as there will be
+    /// connections, past what it already received: it keeps the first, each newcomer asks for one.
+    /// Never pieces under the least a connection is to carry.
+    #[test]
+    fn test_a_lone_stream_is_spread_over_the_connections_that_join_it() {
+        let mut manager = ChunkManager::new(10 * MB, 10 * MB).unwrap();
+        let stream = manager.get_next_work(0, 0).unwrap();
+        stream.received(MB);
+        manager.spread(4, 64 * 1024);
+        assert_eq!(stream.end_offset.load(Ordering::SeqCst), MB + 9 * MB / 4 - 1);
+        let pieces: Vec<ByteRange> = (1..4).map(|worker| manager.get_next_work(worker, 0).unwrap().range).collect();
+        let at = |i: u64| MB + 9 * MB * i / 4;
+        assert_eq!(pieces, (1..4).map(|i| ByteRange::new(at(i), at(i + 1) - 1).unwrap()).collect::<Vec<_>>());
+        assert!(manager.get_next_work(4, 0).is_none());
+        // Pieces of 4 MB at least: the 9 MB left make two.
+        let mut manager = ChunkManager::new(10 * MB, 10 * MB).unwrap();
+        let stream = manager.get_next_work(0, 0).unwrap();
+        stream.received(MB);
+        manager.spread(4, 4 * MB);
+        assert_eq!(stream.end_offset.load(Ordering::SeqCst), MB + 9 * MB / 2 - 1);
+        assert_eq!(manager.get_next_work(1, 0).unwrap().range, ByteRange::new(MB + 9 * MB / 2, 10 * MB - 1).unwrap());
     }
 
     /// What no worker has is merged into as many requests as the connections kept: with one, the

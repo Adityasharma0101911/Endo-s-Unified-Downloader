@@ -27,9 +27,11 @@ const HELD: f64 = 0.7;
 /// A download going at this share of the user's line fills it.
 const LINE_FULL: f64 = 0.9;
 /// How long a download that is its first request's one stream goes on alone before its speed
-/// decides whether more connections pay: what the probe's measurement of a connection took
-/// before it was the download (see `engine::PREFETCH_TIME`).
+/// decides whether more connections pay, unless `SHOWN` came sooner: what the probe's read of a
+/// connection's start waited for before it was the download (see `engine::PREFETCH_TIME`), and
+/// half the start it read, which the stream's start read is too.
 const ALONE: Duration = Duration::from_millis(250);
+pub(crate) const SHOWN: u64 = 512 * 1024;
 /// More connections pay only while what is left, at the one stream's speed, lasts this many
 /// windows: one for them to start, one to see what they bring, and the rest to gain from it.
 const OPEN_WINDOWS: f64 = 4.0;
@@ -152,17 +154,18 @@ impl Autopilot {
     }
 
     /// While alone, the width to open at `now`, with `downloaded` bytes in and `left` to come, once
-    /// the one stream has shown what it does; `startup` is what a new request takes to answer,
-    /// `cap` the connections the host serves at once. At once when each connection to the host is
-    /// seen held to `rate`, else `ALONE` after the stream began, at its speed so far. Then the one
-    /// stream goes on to the end, one request in all, if more would not pay: held to a rate, when
-    /// what is left takes no more than `OPEN_SETUPS` of their set-ups at it; else when it would not
-    /// last `OPEN_WINDOWS` windows at the stream's speed (a window is what more need to start and
-    /// show what they bring). Nor when the stream fills the line, or goes as fast as the host held
-    /// a download to before.
-    /// Otherwise more open: held to a rate, as many as fill the line (all it may, without the line
-    /// known), since more bring more; else the width it was made with, for the climb to go on
-    /// from. Call it every few hundred milliseconds.
+    /// the one stream has shown what it does; `startup` is what a new connection takes to answer
+    /// (the host's recipe's, else the first request's), `cap` the connections the host serves at
+    /// once. At once when each connection to the host is seen held to `rate`, else `ALONE` after
+    /// the stream began or once it brought `SHOWN`, at its speed so far. Then the one stream goes
+    /// on to the end, one request in all, if more would not pay: held to a rate, when what is left
+    /// takes no more than `OPEN_SETUPS` of their set-ups at it; else when it would not last
+    /// `OPEN_WINDOWS` of the climb's windows at the stream's speed, each `STARTUPS` set-ups (a
+    /// window is what more need to start and show what they bring). Nor when the stream fills the
+    /// line, or goes as fast as the host held a download to before. Otherwise more open: held to a
+    /// rate, as many as fill the line (all it may, without the line known), since more bring more;
+    /// else the width it was made with, for the climb to go on from. Call it every few hundred
+    /// milliseconds.
     pub(crate) fn open(&mut self, now: Instant, downloaded: u64, left: u64, startup: Duration, rate: Option<f64>, cap: Option<usize>) -> Option<usize> {
         let opening = self.opening?;
         self.cap = cap;
@@ -173,12 +176,17 @@ impl Autopilot {
         let pace = match rate {
             Some(rate) => rate,
             // Nothing in yet tells nothing: a stall is the stream's own to time out.
-            None if elapsed < ALONE || speed <= 0.0 => return None,
+            None if (elapsed < ALONE && downloaded.saturating_sub(from) < SHOWN) || speed <= 0.0 => return None,
             None => speed,
         };
         self.opening = None;
         self.best = self.best.max(speed.min(pace));
-        let window = startup.saturating_mul(STARTUPS).clamp(MIN_WINDOW, MAX_WINDOW);
+        // Not held to the least a compared window lasts: none is compared yet. Without a set-up
+        // known, as long as that.
+        let window = match startup.is_zero() {
+            true => MIN_WINDOW,
+            false => startup.saturating_mul(STARTUPS).min(MAX_WINDOW),
+        };
         let short = match rate {
             // Each held to the rate, more bring more: they pay once the rest takes over two of
             // their set-ups at it, as the probe's read of a capped connection judges.
@@ -564,8 +572,8 @@ mod tests {
 
     /// The first request's one stream opens more only once it showed what it does, and only if
     /// they pay: at once, to as many as fill the line, when each connection is seen held to a
-    /// rate; else after `ALONE`, unless the stream fills the line, goes as fast as the host held a
-    /// download to before, or would end before more could show what they bring.
+    /// rate; else after `ALONE` or `SHOWN`, unless the stream fills the line, goes as fast as the
+    /// host held a download to before, or would end before more could show what they bring.
     #[test]
     fn test_one_stream_opens_more_only_once_they_pay() {
         let (t0, startup) = (Instant::now(), Duration::from_millis(10));
@@ -575,6 +583,7 @@ mod tests {
         assert_eq!((pilot.width, pilot.is_alone()), (1, true));
         assert_eq!(pilot.why(), "1 connection while its speed shows; more are opened only if they pay");
         assert_eq!(pilot.open(at(100), 200_000, 1 << 30, startup, None, None), None, "not yet");
+        assert_eq!(alone(Start::default()).open(at(100), SHOWN, 1 << 30, startup, None, None), Some(8), "half a MiB in shows it sooner");
         assert_eq!(pilot.open(at(120), 240_000, 1 << 30, startup, Some(2.0 * MB), None), Some(16), "held to a rate: all it may");
         assert!(!pilot.is_alone() && pilot.next(at(700), 4_000_000, 1 << 30, startup, None).is_none(), "its first window is not compared");
         let mut pilot = alone(Start { line: Some(10.0 * MB), ..Default::default() });
@@ -588,7 +597,7 @@ mod tests {
         let mut pilot = alone(Start::default());
         assert_eq!(pilot.open(at(300), 3_000_000, 1 << 30, startup, None, None), Some(8), "a long way to go: the climb");
         let mut short = alone(Start::default());
-        assert_eq!(short.open(at(300), 3_000_000, 15_000_000, startup, None, None), None);
+        assert_eq!(short.open(at(300), 3_000_000, 1_000_000, startup, None, None), None, "four windows of 40 ms take 1.6 MB");
         assert!(short.done && short.width == 1 && short.settled.is_none(), "{}", short.why());
         assert_eq!(short.why(), "1 connection: too little is left to try more");
         let mut full = alone(Start { line: Some(10.0 * MB), ..Default::default() });

@@ -878,6 +878,9 @@ impl DownloadEngine {
             result = engine.boxed(|engine| engine.fetch_all(tx)).await;
         }
         let mut result = result.map_err(crate::digest::refetch_failed);
+        // What the download learned of its hosts outside its connections (a refusal, its checksum
+        // files, the User-Agent it answers) is kept for the next run, a small file's too.
+        let _ = blocking(hosts::save).await;
         let lines = &self.options.archive_lines;
         if result.is_ok() && !lines.is_empty() && !self.cancel_token.is_cancelled() {
             crate::media::archive_downloaded(crate::media::archive_file().as_deref(), lines.clone()).await;
@@ -3034,10 +3037,12 @@ impl DownloadEngine {
         let hashed = self.options.expected_checksum.clone().or_else(|| crate::digest::found(&self.site));
         let in_order = crate::storage::hashes_prefix(self.options.expected_checksum.as_deref());
         let throttled_host = mirrors.iter().any(|m| HostKey::of(&m.url).is_bitrate_throttled());
-        // The other connections take their pieces from the first stream's far end (see
-        // `ChunkManager::steal_work`), so a gap is one chunk, unless chunks are kept small for the
-        // reasons `effective_chunk_size` gives.
-        let whole_gaps = streaming.is_some() && self.options.base_chunk_size == DEFAULT_CHUNK_SIZE && !in_order && !throttled_host;
+        // A first stream that goes on alone, or the only one a host that limits how often it is
+        // asked gets, has a gap for one chunk, unless chunks are kept small for the reasons
+        // `effective_chunk_size` gives: what it has left is cut for the connections that join it
+        // (see `ChunkManager::spread`), or taken from its far end (see `ChunkManager::steal_work`).
+        let alone_first = streaming.is_some() && (limited || (start.rate.is_none() && best.is_none()));
+        let whole_gaps = alone_first && self.options.base_chunk_size == DEFAULT_CHUNK_SIZE && !in_order && !throttled_host;
         let chunk_size = match whole_gaps {
             true => size,
             false => effective_chunk_size(remaining, num_workers as u64, self.options.base_chunk_size, in_order, throttled_host),
@@ -3061,7 +3066,7 @@ impl DownloadEngine {
         };
         // That stream goes on alone until it shows what it does (see `Autopilot::alone`), unless
         // the host's recipe already says what it takes: a width more than one, or a capped rate.
-        let solo = streaming.filter(|_| seed.is_some() && !limited && start.rate.is_none() && best.is_none());
+        let solo = streaming.filter(|_| seed.is_some() && alone_first && !limited);
         let (opening, num_workers) = match solo {
             Some(_) => (counted.clamp(1, max_workers) as usize, 1),
             None => (num_workers, num_workers),
@@ -4444,9 +4449,16 @@ impl RangeJob {
                 pilot.hold();
                 return None;
             }
-            // The rate its connections are held to, once the stream's watch (see `Watched`) saw it.
-            let rate = urls.first().map(hosts::profile).filter(|p| p.capped_per_connection == Some(true)).and_then(|p| p.connection_rate);
-            return pilot.open(now, downloaded, left, startup, rate, cap);
+            // The rate its connections are held to, once the stream's watch (see `Watched`) saw it,
+            // and what a new connection to it takes, as its recipe says, else the first request.
+            let known = urls.first().map(hosts::profile).unwrap_or_default();
+            let rate = known.connection_rate.filter(|_| known.capped_per_connection == Some(true));
+            let opened = pilot.open(now, downloaded, left, known.setup_time.unwrap_or(startup), rate, cap);
+            // Each new connection asks for a piece of its own of what the stream has left.
+            if let Some(width) = opened {
+                self.chunks.lock().spread(width, MIN_STEAL);
+            }
+            return opened;
         }
         pilot.next(now, downloaded, left, startup, cap)
     }
@@ -5073,15 +5085,22 @@ async fn probe_with(
     // taken for quicker than it is gets its requests taken over and split before they can answer.
     info.answer_time = setup;
     let content_range = get.headers().get(CONTENT_RANGE).and_then(|v| v.to_str().ok());
-    // The last byte the answer brings, when it is ranged.
+    // The last byte the answer brings, when it is ranged, and how much of it is read before the
+    // download's connections start: all of a file of up to `PREFETCH`, else of the download's
+    // first stream as much as shows its speed.
     let mut end = asked - 1;
+    let read = |len: u64| match len > PREFETCH {
+        true if ask == Ask::Stream => crate::autopilot::SHOWN,
+        true => PREFETCH,
+        false => len,
+    };
     let holds = match get.status() {
         StatusCode::PARTIAL_CONTENT => match content_range.map(ByteRange::parse_content_range_cut) {
             Some(Ok((range, Some(total)))) if range.start == 0 => {
                 info.accepts_ranges = true;
                 info.size = Some(total);
                 end = range.end;
-                Some(Holds::Start(range.len().min(PREFETCH)))
+                Some(Holds::Start(read(range.len())))
             }
             // `bytes 0-0/*`: the length is unknown, so only a single stream can fetch the file.
             Some(Ok((range, None))) if range.start == 0 => None,
@@ -5095,7 +5114,7 @@ async fn probe_with(
                 // its host took ranges before, so the answer goes on as one for the whole file.
                 Some(size) if ask == Ask::Stream && hosts::profile(get.url()).accepts_ranges == Some(true) => {
                     info.accepts_ranges = true;
-                    Some(Holds::Start(size.min(PREFETCH)))
+                    Some(Holds::Start(read(size)))
                 }
                 _ => Some(whole_file(info.size)),
             }
@@ -9906,13 +9925,14 @@ mod tests {
     /// With the Autopilot, the download's first request is the one a single-stream tool sends, the
     /// file from its start to its end, and nothing else goes to the host while that stream shows
     /// what it does. A file that one stream brings before more connections could pay for
-    /// themselves takes that one request, no HEAD beside it: one that comes at once, and one that
-    /// takes a second and a half from a host known not to hold each connection to a speed (here
-    /// it holds each user to 2 MB/s, where more would gain nothing anyway).
+    /// themselves takes that one request, no HEAD beside it: from a host 150 ms away, one that
+    /// comes at once, and one that takes a second and a half from a host known not to hold each
+    /// connection to a speed (here it holds each user to 2 MB/s, where more would gain nothing).
     #[tokio::test(flavor = "multi_thread")]
     async fn test_a_file_one_stream_brings_soon_takes_one_request() {
         for (size, per_client) in [(4 * 1024 * 1024, None), (3_000_000, Some(2e6))] {
-            let (url, stats) = crate::netsim::serve(crate::netsim::Server { size, per_client, ..Default::default() }).await;
+            let server = crate::netsim::Server { size, per_client, first_byte: Duration::from_millis(150), ..Default::default() };
+            let (url, stats) = crate::netsim::serve(server).await;
             hosts::record(&url, HostProfile { capped_per_connection: Some(false), ..Default::default() });
             let dir = tempdir().unwrap();
             let (got, said) = fetch_from_sim(&url, sim_options(dir.path(), 16, true)).await;
