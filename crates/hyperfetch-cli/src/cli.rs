@@ -150,6 +150,11 @@ pub struct Args {
     #[arg(long = "fsync")]
     pub fsync: bool,
 
+    /// Let the computer go to sleep by itself while this runs. Without it, the computer stays awake
+    /// until the program ends (the screen may still turn off)
+    #[arg(long = "allow-sleep")]
+    pub allow_sleep: bool,
+
     /// Expected checksum (sha256:HEX, sha512:HEX, sha1:HEX, md5:HEX, blake3:HEX or bare hex); single download or --verify
     #[arg(long = "checksum", value_parser = parse_checksum)]
     pub checksum: Option<String>,

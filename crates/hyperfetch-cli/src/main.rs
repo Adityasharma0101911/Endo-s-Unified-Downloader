@@ -152,6 +152,11 @@ async fn app(mut args: Args) -> i32 {
     if args.warc.is_some() && args.mirror.is_none() && args.save_page.is_none() && args.wayback.is_none() {
         return usage("--warc goes with --mirror, --save-page or --wayback");
     }
+    // From here on there is work, a --start-at wait included: the computer stays awake until it ends.
+    let _awake = match args.allow_sleep {
+        false => hyperfetch_core::power::stay_awake().inspect_err(|e| tracing::debug!("Could not keep the computer awake: {}", e)).ok(),
+        true => None,
+    };
     // Each prints or writes something else than the downloads of an interactive prompt.
     let other = args.json || args.spider || args.dry_run || args.preview || args.stdout || args.list_tracks || args.start_at.is_some();
     if args.urls.is_empty() && args.input_file.is_none() && other {

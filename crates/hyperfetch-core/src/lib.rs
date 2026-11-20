@@ -24,6 +24,7 @@ pub mod p2p;
 pub(crate) mod webseed;
 pub mod debrid;
 pub mod netif;
+pub mod power;
 pub mod mega;
 pub mod shares;
 pub mod cloud;

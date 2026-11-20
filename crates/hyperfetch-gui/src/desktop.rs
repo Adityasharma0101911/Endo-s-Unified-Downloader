@@ -368,6 +368,34 @@ fn inside(schedule: &Schedule, (day, minute): (u8, u16)) -> bool {
     }
 }
 
+/// How long before the schedule starts waiting downloads the computer is kept awake for it (see
+/// `App::keep_awake`): from a working day's end to a night's start, not a week ahead.
+pub const AWAKE_BEFORE_START: u32 = 12 * 60;
+
+/// Minutes from `now` until the schedule next starts the queue, at a ticked day's start time;
+/// None when it is off or never starts it.
+pub fn minutes_to_start(schedule: &Schedule, (day, minute): (u8, u16)) -> Option<u32> {
+    let start = u32::from(schedule.start.as_deref().and_then(minute_of).filter(|_| schedule.enabled)?);
+    let now = u32::from(minute);
+    (0..=7u32)
+        .filter(|ahead| schedule.days[(usize::from(day) + *ahead as usize) % 7])
+        .map(|ahead| ahead * 24 * 60 + start)
+        .find(|at| *at > now)
+        .map(|at| at - now)
+}
+
+/// Asks the system not to sleep while held: [`hyperfetch_core::power::stay_awake`] in the app.
+#[cfg(not(test))]
+pub fn stay_awake() -> io::Result<Box<dyn Send>> {
+    Ok(Box::new(hyperfetch_core::power::stay_awake()?))
+}
+
+/// Tests never keep the computer they run on awake.
+#[cfg(test)]
+pub fn stay_awake() -> io::Result<Box<dyn Send>> {
+    Err(io::Error::other("tests never keep the computer awake"))
+}
+
 /// The local day of the week (Monday 0) and minute of the day.
 #[cfg(windows)]
 pub fn local_now() -> (u8, u16) {
@@ -560,6 +588,7 @@ mod tests {
         for action in [WhenDone::Sleep, WhenDone::ShutDown] {
             assert!(power(action).is_err());
         }
+        assert!(stay_awake().is_err());
     }
 
     #[test]
@@ -602,6 +631,22 @@ mod tests {
         assert_eq!(schedule_due(&both, Some((monday, 5 * 60)), (monday, 7 * 60)), Some(false), "the later one wins");
         assert_eq!(schedule_due(&Schedule { enabled: false, ..schedule.clone() }, None, (monday, 22 * 60)), None);
         assert_eq!(schedule_due(&Schedule { start: Some("soon".into()), ..schedule }, None, (monday, 22 * 60)), None);
+    }
+
+    /// The next start is the next ticked day's start time still to come, the week round.
+    #[test]
+    fn the_next_start_is_counted_in_minutes() {
+        let mut days = [false; 7];
+        days[0] = true;
+        let schedule = Schedule { enabled: true, start: Some("22:00".into()), stop: Some("06:30".into()), days };
+        let (monday, tuesday) = (0, 1);
+        assert_eq!(minutes_to_start(&schedule, (monday, 20 * 60)), Some(120));
+        assert_eq!(minutes_to_start(&schedule, (monday, 22 * 60)), Some(7 * 24 * 60), "the start that came is next week's");
+        assert_eq!(minutes_to_start(&schedule, (tuesday, 22 * 60)), Some(6 * 24 * 60));
+        assert_eq!(minutes_to_start(&Schedule { days: [true; 7], ..schedule.clone() }, (tuesday, 23 * 60)), Some(23 * 60));
+        assert_eq!(minutes_to_start(&Schedule { enabled: false, ..schedule.clone() }, (monday, 20 * 60)), None);
+        assert_eq!(minutes_to_start(&Schedule { start: None, ..schedule.clone() }, (monday, 20 * 60)), None);
+        assert_eq!(minutes_to_start(&Schedule { days: [false; 7], ..schedule }, (monday, 20 * 60)), None);
     }
 
     #[test]

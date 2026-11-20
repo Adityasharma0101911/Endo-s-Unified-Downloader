@@ -260,6 +260,9 @@ pub struct Settings {
 
 /// When the queue runs by itself (see `desktop::schedule_due`): at `start` on the ticked days it
 /// starts, at `stop` the running downloads pause. Local time, "HH:MM".
+    /// The computer does not sleep by itself while downloads run, or before the schedule starts
+    /// waiting ones (see `desktop::wants_awake`). On by default.
+    pub keep_awake: bool,
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Schedule {
@@ -381,6 +384,7 @@ impl Default for Settings {
 
 /// The download history's file, which the GUI's own files sit next to.
 fn history_path() -> PathBuf {
+            keep_awake: true,
     // Tests never read or write the user's settings, queue or logs.
     #[cfg(test)]
     crate::tests::isolate_history();

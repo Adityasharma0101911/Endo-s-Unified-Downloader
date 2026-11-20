@@ -478,6 +478,7 @@ fn desktop_settings(app: &mut App, ui: &mut Ui) {
             }
         }
     });
+    gentle_settings(&mut app.settings, ui);
     let data = crate::settings::data_dir();
     let about = "Settings, queue, history and logs. A file named portable next to the program keeps them in a data folder \
                  beside it; --data-dir DIR keeps them in DIR.";
@@ -490,6 +491,13 @@ fn desktop_settings(app: &mut App, ui: &mut Ui) {
         }
         ui.add(egui::Label::new(RichText::new(data.display().to_string()).small().color(p.muted)).truncate());
     });
+}
+
+/// How downloads keep to the computer and its network: keeping it awake.
+fn gentle_settings(s: &mut Settings, ui: &mut Ui) {
+    let about = "The computer does not go to sleep by itself while downloads run, nor in the 12 hours before the schedule \
+                 starts downloads waiting for it. The screen still turns off, and you can still put it to sleep.";
+    switch(ui, "Keep the computer awake", about, &mut s.keep_awake);
 }
 
 /// A text box for a time of day, kept as written, None when empty.
@@ -1124,6 +1132,10 @@ mod tests {
         assert_eq!((h.app.settings.schedule.start.as_deref(), h.app.settings.schedule.stop.as_deref()), (Some("7:30"), Some("25:00")));
         assert!(h.settle());
         assert!(h.find("25:00 is not a time like 08:30; it is left out").is_some());
+        assert!(h.app.settings.keep_awake, "on by default");
+        scroll_to(&mut h, "Keep the computer awake");
+        switch(&mut h, "Keep the computer awake");
+        assert!(!h.app.settings.keep_awake);
     }
 
     /// Scrolls the Settings page with the wheel until `title` shows near its top, under the

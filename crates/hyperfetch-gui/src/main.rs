@@ -409,6 +409,8 @@ struct App {
     /// Writes launch at startup and the `endo-dl:` link (see `desktop::write`).
     writer: desktop::Writer,
     /// The local time the schedule was last checked at (see `desktop::schedule_due`).
+    /// Keeps the computer awake while there is work (see `App::keep_awake`).
+    awake: hyperfetch_core::power::KeepAwake,
     schedule_seen: Option<(u8, u16)>,
     /// Paused downloads Resume all or the schedule's start resumes, first come first, as the
     /// queue has room for them (see `App::run_scheduler`).
@@ -581,6 +583,7 @@ impl App {
             taskbar: None,
             taskbar_shown: None,
             batch_failed: false,
+            awake: hyperfetch_core::power::KeepAwake::new(Box::new(desktop::stay_awake)),
             zip_preview: None,
             keep_scripts: false,
             saving_page: None,
@@ -2017,6 +2020,7 @@ impl App {
                 self.taskbar_shown = Some(progress);
             }
         }
+        self.keep_awake(desktop::local_now());
     }
 
     fn tray_action(&mut self, action: TrayAction) {
@@ -2158,6 +2162,17 @@ impl App {
         self.settings.clipboard_watch = self.clipboard_enabled.load(Ordering::Relaxed);
         if let Err(e) = self.settings.save() {
             tracing::warn!("Failed to save settings: {}", e);
+    /// Keeps the computer awake, as the setting allows, while downloads run, and while the
+    /// schedule's start at `now` is less than `desktop::AWAKE_BEFORE_START` away with downloads
+    /// waiting for it (ones its stop paused, or queued ones while the queue is stopped); lets it
+    /// sleep the moment there is neither.
+    fn keep_awake(&mut self, now: (u8, u16)) {
+        let queued = self.queue.items().iter().any(|item| item.status == QueueItemStatus::Queued);
+        let waiting = !self.settings.schedule_paused.is_empty() || !self.settings.auto_run_queue && queued;
+        let due = desktop::minutes_to_start(&self.settings.schedule, now).is_some_and(|m| m <= desktop::AWAKE_BEFORE_START);
+        self.awake.set(self.settings.keep_awake && (self.queue.active_count() > 0 || waiting && due));
+    }
+
         }
     }
 
@@ -4058,6 +4073,78 @@ mod tests {
         app.set_launch_at_startup(false);
         assert!(!app.settings.launch_at_startup);
         assert_eq!(*lock(&written), [(place.clone(), Some(value)), (place, None)]);
+
+    /// The computer is held awake once while downloads run, through finishing, failing and
+    /// pausing, and let go the moment none does; and while the schedule's start is due within
+    /// twelve hours with downloads waiting for it. The setting off, it is never held.
+    #[test]
+    fn the_computer_is_kept_awake_only_while_there_is_work() {
+        struct Hold(Arc<Mutex<(usize, usize)>>);
+        impl Drop for Hold {
+            fn drop(&mut self) {
+                lock(&self.0).1 += 1;
+            }
+        }
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(&rt, dir.path());
+        let counts = Arc::new(Mutex::new((0, 0)));
+        let log = Arc::clone(&counts);
+        app.awake = hyperfetch_core::power::KeepAwake::new(Box::new(move || {
+            lock(&log).0 += 1;
+            Ok(Box::new(Hold(Arc::clone(&log))) as Box<dyn Send>)
+        }));
+        let (monday_noon, ended) = ((0, 12 * 60), |app: &mut App, id, result| app.handle_event(AppEvent::JobFinished { id, result }));
+        let [a, b, c] = ["a.iso", "b.iso", "c.iso"].map(|name| add(&mut app, name));
+        app.settings.auto_run_queue = false;
+        app.keep_awake(monday_noon);
+        assert_eq!(*lock(&counts), (0, 0), "queued, nothing runs");
+
+        running(&mut app, &rt, a);
+        app.keep_awake(monday_noon);
+        running(&mut app, &rt, b);
+        app.keep_awake(monday_noon);
+        ended(&mut app, a, Ok((PathBuf::from("a.iso"), Some(1))));
+        app.keep_awake(monday_noon);
+        assert_eq!(*lock(&counts), (1, 0), "one hold while any runs");
+        ended(&mut app, b, Err("HTTP 404".to_string()));
+        app.keep_awake(monday_noon);
+        assert_eq!(*lock(&counts), (1, 1), "let go once the last one failed");
+
+        running(&mut app, &rt, c);
+        app.keep_awake(monday_noon);
+        app.pause_job(c);
+        app.keep_awake(monday_noon);
+        assert_eq!((*lock(&counts), status(&app, c)), ((2, 1), QueueItemStatus::Pausing), "held while it saves its state");
+        ended(&mut app, c, Err(hyperfetch_core::engine::CANCELLED.to_string()));
+        app.keep_awake(monday_noon);
+        assert_eq!(*lock(&counts), (2, 2), "paused, it holds nothing");
+
+        // A queued download and the stopped queue's start at 22:00: held from 10:00 on.
+        let d = add(&mut app, "d.iso");
+        app.settings.schedule = settings::Schedule { enabled: true, start: Some("22:00".into()), ..Default::default() };
+        app.keep_awake((0, 9 * 60 + 59));
+        assert_eq!(*lock(&counts), (2, 2), "more than twelve hours ahead");
+        app.keep_awake((0, 10 * 60));
+        assert_eq!(*lock(&counts), (3, 2));
+        app.settings.schedule.enabled = false;
+        app.keep_awake((0, 10 * 60));
+        assert_eq!(*lock(&counts), (3, 3), "nothing scheduled");
+        app.settings.schedule.enabled = true;
+        app.queue.remove_item(d);
+        app.queue.remove_item(c);
+        app.keep_awake((0, 21 * 60));
+        assert_eq!(*lock(&counts), (3, 3), "nothing waits for the start");
+        app.settings.schedule_paused = vec![b];
+        app.keep_awake((0, 21 * 60));
+        assert_eq!(*lock(&counts), (4, 3), "what its stop paused waits for it");
+
+        app.settings.keep_awake = false;
+        app.keep_awake((0, 21 * 60));
+        running(&mut app, &rt, a);
+        app.keep_awake((0, 21 * 60));
+        assert_eq!(*lock(&counts), (4, 4), "the setting off, nothing is held");
+    }
 
         app.register_protocol();
         assert_eq!(lock(&written).len(), 5, "the endo-dl: key, its URL Protocol value and its command");
