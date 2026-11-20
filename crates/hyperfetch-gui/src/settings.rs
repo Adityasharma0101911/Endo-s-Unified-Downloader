@@ -40,6 +40,9 @@ pub const BROWSERS: [&str; 7] = [
     "Vivaldi",
 ];
 
+/// How many folders saved to before the Add page offers (see [`Settings::set_save_dir`]).
+pub const RECENT_DIRS: usize = 5;
+
 /// The environment variable the command line takes the Google API key from too.
 pub const GOOGLE_API_KEY_VAR: &str = "ENDO_GOOGLE_API_KEY";
 
@@ -50,6 +53,8 @@ pub const GOOGLE_API_KEY_VAR: &str = "ENDO_GOOGLE_API_KEY";
 #[serde(default)]
 pub struct Settings {
     pub save_dir: String,
+    /// Folders downloads were saved to before, the latest first (see [`Settings::set_save_dir`]).
+    pub recent_dirs: Vec<String>,
     pub connections: usize,
     pub cookies_path: String,
     pub proxy: String,
@@ -329,6 +334,7 @@ impl Default for Settings {
         let engine = DownloadOptions::default();
         Self {
             save_dir: default_download_dir().to_string_lossy().into_owned(),
+            recent_dirs: Vec::new(),
             connections: 16,
             cookies_path: String::new(),
             proxy: String::new(),
@@ -703,6 +709,20 @@ impl Settings {
         self.categories.iter().map(category).collect()
     }
 
+    /// Saves downloads to `dir` from now on; the folder before goes first among the recent ones,
+    /// [`RECENT_DIRS`] at most, which leave out `dir` and the same folder twice.
+    pub fn set_save_dir(&mut self, dir: String) {
+        let before = std::mem::replace(&mut self.save_dir, dir);
+        let mut kept: Vec<String> = Vec::new();
+        for dir in std::iter::once(before).chain(std::mem::take(&mut self.recent_dirs)) {
+            if !dir.trim().is_empty() && dir.trim() != self.save_dir.trim() && !kept.iter().any(|other| other.trim() == dir.trim()) {
+                kept.push(dir);
+            }
+        }
+        kept.truncate(RECENT_DIRS);
+        self.recent_dirs = kept;
+    }
+
     /// The user's rule for `url`'s site: the first that takes it (see [`SiteRule`]).
     pub fn site_rule(&self, url: &Url) -> Option<&SiteRule> {
         self.site_rules.iter().find(|rule| rule.takes(url))
@@ -882,6 +902,19 @@ mod tests {
         assert_eq!(speed_limit_bytes(512.0, false), Some(512 * 1024));
         assert_eq!(speed_limit_bytes(1.5, true), Some(3 * 512 * 1024));
         assert_eq!(speed_limit_bytes(0.0001, false), Some(1));
+    }
+
+    /// Each folder chosen puts the one before first among the recent ones: the latest few, each
+    /// once, never the folder chosen.
+    #[test]
+    fn the_recent_folders_are_the_latest_few() {
+        let mut s = Settings { save_dir: "a".into(), ..Settings::default() };
+        for dir in ["b", "c", "a", "d", "e", "f", "g"] {
+            s.set_save_dir(dir.into());
+        }
+        assert_eq!((s.save_dir.as_str(), s.recent_dirs.clone()), ("g", vec!["f".to_string(), "e".into(), "d".into(), "a".into(), "c".into()]));
+        s.set_save_dir("d".into());
+        assert_eq!(s.recent_dirs, ["g", "f", "e", "a", "c"]);
     }
 
     /// A site's rule gives a download from it or a subdomain its connections, the site typed as

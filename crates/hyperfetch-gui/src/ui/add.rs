@@ -473,6 +473,23 @@ fn preview_card(app: &mut App, ui: &mut Ui, kind: &kinds::Kind, source: &str) {
             if ui.add_enabled(!app.dialog_open, button("Change…")).on_hover_text("Choose where downloads are saved").clicked() {
                 app.pending_dialog = Some(Dialog::SaveDir);
             }
+            // One click back to a folder saved to before.
+            let recent = app.settings.recent_dirs.clone();
+            if !recent.is_empty() {
+                let menu = ui.make_persistent_id("recent folders");
+                let open = icon_button(ui, icon::CLOCK_COUNTER_CLOCKWISE, "Recent folders", true);
+                if open.clicked() {
+                    ui.memory_mut(|m| m.toggle_popup(menu));
+                }
+                egui::popup_below_widget(ui, menu, &open, egui::PopupCloseBehavior::CloseOnClick, |ui| {
+                    ui.set_min_width(260.0);
+                    for dir in recent {
+                        if ui.selectable_label(false, &dir).clicked() {
+                            app.settings.set_save_dir(dir);
+                        }
+                    }
+                });
+            }
         });
         zip_preview(app, ui);
         update_offer(app, ui);
@@ -1117,6 +1134,22 @@ mod tests {
 
         h.paste("https://p.example/[1-2].iso");
         assert_eq!(names(&h)[123..], ["1.iso", "2.iso"]);
+    }
+
+    /// A folder saved to before is one click away beside Save to: picked, downloads go there, and
+    /// the folder it replaces becomes the recent one.
+    #[test]
+    fn a_recent_folder_is_one_click_away() {
+        let mut h = Harness::new();
+        let first = h.app.settings.save_dir.clone();
+        let other = std::env::temp_dir().join("elsewhere").to_string_lossy().into_owned();
+        h.app.settings.set_save_dir(other.clone());
+        h.app.url_input = "https://h.example/a.iso".into();
+        h.frames(30);
+        h.click(icon::CLOCK_COUNTER_CLOCKWISE);
+        h.frames(5);
+        h.click(&first);
+        assert_eq!((h.app.settings.save_dir.clone(), h.app.settings.recent_dirs.clone()), (first, vec![other]));
     }
 
     #[test]

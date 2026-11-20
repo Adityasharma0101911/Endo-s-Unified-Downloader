@@ -1948,7 +1948,7 @@ impl App {
                 self.dialog_open = false;
                 let Some(path) = path else { return };
                 match dialog {
-                    Dialog::SaveDir => self.settings.save_dir = path.to_string_lossy().into_owned(),
+                    Dialog::SaveDir => self.settings.set_save_dir(path.to_string_lossy().into_owned()),
                     Dialog::CookiesFile => self.settings.cookies_path = path.to_string_lossy().into_owned(),
                     Dialog::VerifyFile => self.verify(VerifyRequest { path, expected_size: None, checksum: None }),
                     Dialog::OlderVersion => self.delta_input = path.to_string_lossy().into_owned(),
