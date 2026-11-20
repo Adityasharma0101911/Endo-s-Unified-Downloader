@@ -66,6 +66,9 @@ struct Inner {
     hashes: Arc<Hashes>,
     /// Whether `file` has the low I/O priority hint (see `crate::gentle`).
     hinted: AtomicBool,
+    /// The handle [`DiskWriter::sync_separately`] flushes through, opened once: closing one after
+    /// each flush can have a virus scanner read the whole file again.
+    flush: std::sync::OnceLock<File>,
     #[cfg(test)]
     syncs: AtomicUsize,
 }
@@ -109,6 +112,7 @@ impl DiskWriter {
                 file: Arc::new(file),
                 hashes: Arc::new(Hashes::new(total_size, block)),
                 hinted: AtomicBool::new(false),
+                flush: std::sync::OnceLock::new(),
                 #[cfg(test)]
                 syncs: AtomicUsize::new(0),
             }),
@@ -348,7 +352,14 @@ impl DiskWriter {
     pub fn sync_separately(&self) -> Result<(), StorageError> {
         #[cfg(test)]
         self.inner.syncs.fetch_add(1, Ordering::Relaxed);
-        OpenOptions::new().write(true).open(&self.path)?.sync_data()?;
+        let file = match self.inner.flush.get() {
+            Some(file) => file,
+            None => {
+                let file = OpenOptions::new().write(true).open(&self.path)?;
+                self.inner.flush.get_or_init(|| file)
+            }
+        };
+        file.sync_data()?;
         Ok(())
     }
 
@@ -1731,6 +1742,21 @@ mod tests {
         // Once for SHA-256, plus the rest of the first block for its BLAKE3 when it was written.
         let block = writer.inner.hashes.block as usize;
         assert_eq!(writer.inner.hashes.read.load(Ordering::Relaxed), size as usize + block - fresh);
+    }
+
+    /// The flushes beside the writes go through one handle for the writer's life.
+    #[test]
+    fn test_flushes_beside_the_writes_keep_one_handle() {
+        let temp = NamedTempFile::new().unwrap();
+        let writer = DiskWriter::open_or_create(temp.path(), 4096).unwrap();
+        writer.write_chunk_slice(0, &[1; 4096]).unwrap();
+        writer.sync_separately().unwrap();
+        let first = writer.inner.flush.get().map(|file| file as *const File);
+        writer.write_chunk_slice(0, &[2; 4096]).unwrap();
+        writer.clone().sync_separately().unwrap();
+        assert!(first.is_some());
+        assert_eq!(writer.inner.flush.get().map(|file| file as *const File), first);
+        assert_eq!(std::fs::read(temp.path()).unwrap(), [2; 4096]);
     }
 
     #[test]
