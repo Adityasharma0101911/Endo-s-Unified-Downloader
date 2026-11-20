@@ -8941,6 +8941,7 @@ mod tests {
 
     /// A request whose answer never comes is asked for again once its server answered others, and
     /// the first answer brings its bytes: the download does not wait out the 30 s stall timeout.
+    /// So too with a front end's live limits attached and no limit set: that is no speed limit.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_a_request_left_unanswered_is_asked_for_again() {
         let data: Vec<u8> = (0..4 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
@@ -8984,7 +8985,6 @@ mod tests {
                 after = after.max(snapshot.active_workers);
             }
         }
-    /// So too with a front end's live limits attached and no limit set: that is no speed limit.
         assert!(std::fs::read(run.await.unwrap().unwrap()).unwrap() == data);
         assert_eq!(before, 1);
         assert!(after >= 3, "{after} connections after 4 were set");
