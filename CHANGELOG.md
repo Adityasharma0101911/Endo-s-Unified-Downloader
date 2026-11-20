@@ -4,7 +4,9 @@ What changed in each release, newest first. Each release's page on [GitHub](http
 
 ## Unreleased
 
+- **The computer stays awake for your downloads.** While downloads run, and in the 12 hours before the schedule starts downloads waiting for it, the computer no longer goes to sleep by itself; the moment there are none, it may again. The screen still turns off, and you can still put it to sleep. Settings > Desktop and schedule > "Keep the computer awake" (on by default); the command line keeps it awake while it runs, unless `--allow-sleep`.
 - **Small downloads finish sooner.** The checksum files a site may publish beside a download are asked for two at a time instead of one by one, so a file that has already arrived waits about half as long for them. A folder seen to publish none is remembered for ten minutes: the rest of a batch from it skips those requests.
+- **Saving the resume state no longer pauses a download.** The flush to disk every 2 seconds runs beside the download, through a file handle of its own, instead of holding up the connections' writes and the progress shown. On a local server at 256 MB/s a 768 MiB file came in 3.29 s instead of 3.39 s, and the progress no longer froze for up to half a second at each save.
 
 ## 2.2.0 (2026-11-19)
 

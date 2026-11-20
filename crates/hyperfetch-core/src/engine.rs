@@ -3069,6 +3069,7 @@ impl DownloadEngine {
         let mut tick = tokio::time::interval(SNAPSHOT_INTERVAL);
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut last_persist = Instant::now();
+        let mut saving: Option<tokio::task::JoinHandle<_>> = None;
         let outcome = loop {
             if job.chunks.lock().is_all_completed() {
                 break Ok(());
@@ -3122,10 +3123,13 @@ impl DownloadEngine {
                             spare = None;
                         }
                     }
-                    if last_persist.elapsed() >= PERSIST_INTERVAL {
-                        if let Err(e) = job.persist().await {
-                            tracing::warn!("Failed to save resume state: {}", e);
+                    // One save at a time, and the loop never waits for it: a tick that finds one
+                    // still running leaves it be.
+                    if last_persist.elapsed() >= PERSIST_INTERVAL && saving.as_ref().is_none_or(|s| s.is_finished()) {
+                        if let Some(done) = saving.take() {
+                            saved(done).await;
                         }
+                        saving = Some(job.save());
                         last_persist = Instant::now();
                     }
                 }
@@ -3140,6 +3144,11 @@ impl DownloadEngine {
         // Probes still out are given up, and the host slots they hold with them.
         drop((events, late, spare));
         while workers.join_next().await.is_some() {}
+        // A save still running ends before the last one, and before `finalize` renames or deletes
+        // the state file: a late one would bring it back.
+        if let Some(save) = saving {
+            saved(save).await;
+        }
         // What this download learned of its hosts and the line, for the next run too.
         if let Some(pilot) = pilot.filter(|_| outcome.is_ok()) {
             hosts::record_line(pilot.best);
@@ -3155,9 +3164,7 @@ impl DownloadEngine {
                 Ok(job.writer)
             }
             Err(e) => {
-                if let Err(save_err) = job.persist().await {
-                    tracing::warn!("Failed to save resume state: {}", save_err);
-                }
+                saved(job.save()).await;
                 Err(e)
             }
         }
@@ -4272,17 +4279,26 @@ impl RangeJob {
         }
     }
 
-    /// Snapshots the written ranges, makes those bytes durable, then records exactly those ranges.
-    async fn persist(&self) -> Result<(), String> {
+    /// Snapshots the written ranges, then on a blocking thread makes those bytes durable and
+    /// records exactly those ranges. The flush goes through a handle of its own, so the workers'
+    /// writes go on meanwhile.
+    fn save(&self) -> tokio::task::JoinHandle<Result<(), String>> {
         let mut state = self.state.clone();
         state.completed_ranges = self.chunks.lock().completed_ranges();
-        let writer = self.writer.clone();
-        let path = self.state_path.clone();
-        blocking(move || {
-            writer.sync().map_err(|e| e.to_string())?;
+        let (writer, path) = (self.writer.clone(), self.state_path.clone());
+        tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            let _slowed = tests::slow_save(&path);
+            writer.sync_separately().map_err(|e| e.to_string())?;
             state.save_atomic(&path).map_err(|e| e.to_string())
         })
-        .await?
+    }
+}
+
+/// Logs what a resume-state save that ended (see `RangeJob::save`) went wrong with.
+async fn saved(save: tokio::task::JoinHandle<Result<(), String>>) {
+    if let Err(e) = save.await.map_err(|e| e.to_string()).and_then(|saved| saved) {
+        tracing::warn!("Failed to save resume state: {}", e);
     }
 }
 
@@ -8866,6 +8882,159 @@ mod tests {
                 println!("{label}, {mode}: median {:?} (min {:?}, max {:?})", times[2], times[0], times[4]);
             }
         }
+    }
+
+    /// A local server of a `size`-byte file at every path, honouring `Range`, that sends each
+    /// answer at `rate` bytes a second, then ends it.
+    async fn rate_server(size: usize, rate: f64) -> Url {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = crate::hosts::unseen_listener().await;
+        let base = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let piece = Arc::new(vec![7u8; 256 * 1024]);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let piece = Arc::clone(&piece);
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => head.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
+                    let (start, end) = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("range: bytes=")?.trim().split_once('-'))
+                        .and_then(|(a, b)| Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?.min(size - 1))))
+                        .unwrap_or((0, size - 1));
+                    let len = end + 1 - start;
+                    let answer = format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{size}\r\nContent-Length: {len}\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n"
+                    );
+                    if socket.write_all(answer.as_bytes()).await.is_err() || head.starts_with("head") {
+                        return;
+                    }
+                    let (began, mut sent) = (tokio::time::Instant::now(), 0);
+                    while sent < len {
+                        let n = piece.len().min(len - sent);
+                        if socket.write_all(&piece[..n]).await.is_err() {
+                            return;
+                        }
+                        sent += n;
+                        tokio::time::sleep_until(began + Duration::from_secs_f64(sent as f64 / rate)).await;
+                    }
+                });
+            }
+        });
+        base
+    }
+
+    /// The longest time between two snapshots `rx` gets while the bytes come in.
+    async fn longest_gap(mut rx: broadcast::Receiver<EngineSnapshot>) -> Duration {
+        let (mut last, mut longest) = (None::<Instant>, Duration::ZERO);
+        loop {
+            match rx.recv().await {
+                Ok(snapshot) if snapshot.total_bytes > 0 && snapshot.downloaded_bytes < snapshot.total_bytes => {
+                    let now = Instant::now();
+                    longest = longest.max(last.map_or(Duration::ZERO, |last| now - last));
+                    last = Some(now);
+                }
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => return longest,
+            }
+        }
+    }
+
+    /// Not a test: how long a fast download takes, and the longest its control loop went without
+    /// a snapshot, with eight connections at 32 MB/s each from a local server (768 MiB, written to
+    /// the system's temporary folder).
+    /// `cargo test -p hyperfetch-core --lib bench_saves -- --ignored --nocapture`
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn bench_saves_during_a_fast_download() {
+        const MIB: usize = 1024 * 1024;
+        let mut runs = Vec::new();
+        for _ in 0..5 {
+            let base = rate_server(768 * MIB, 32e6).await;
+            let dir = tempdir().unwrap();
+            let options = DownloadOptions {
+                output_path: Some(dir.path().join("f.bin")),
+                num_connections: 8,
+                adaptive: false,
+                remote_checksum: false,
+                ..Default::default()
+            };
+            let (tx, rx) = broadcast::channel::<EngineSnapshot>(1024);
+            let gaps = tokio::spawn(longest_gap(rx));
+            let started = Instant::now();
+            DownloadEngine::new(vec![base.join("f.bin").unwrap()], options).run(Some(tx)).await.unwrap();
+            let took = started.elapsed();
+            let longest = gaps.await.unwrap();
+            println!("took {took:?} ({:.0} MB/s), longest gap between snapshots {longest:?}", (768 * MIB) as f64 / took.as_secs_f64() / 1e6);
+            runs.push((took, longest));
+        }
+        runs.sort();
+        println!("median {:?}, min {:?}, max {:?}", runs[2], runs[0], runs[4]);
+    }
+
+    /// Resume-state saves in these folders: how long each waits before it saves, how many
+    /// started and how many ended.
+    static SLOW_SAVES: Mutex<Vec<(PathBuf, Duration, usize, usize)>> = Mutex::new(Vec::new());
+
+    /// A save slowed by `slow_save`, counted as ended when dropped.
+    pub(super) struct SlowSave(Option<PathBuf>);
+
+    impl Drop for SlowSave {
+        fn drop(&mut self) {
+            if let Some(found) = SLOW_SAVES.lock().iter_mut().find(|e| Some(&e.0) == self.0.as_ref()) {
+                found.3 += 1;
+            }
+        }
+    }
+
+    /// Waits as `SLOW_SAVES` says for a save of the state at `path`.
+    pub(super) fn slow_save(path: &Path) -> SlowSave {
+        let found = SLOW_SAVES.lock().iter_mut().find(|e| path.starts_with(&e.0)).map(|e| {
+            e.2 += 1;
+            (e.0.clone(), e.1)
+        });
+        match found {
+            Some((dir, wait)) => {
+                std::thread::sleep(wait);
+                SlowSave(Some(dir))
+            }
+            None => SlowSave(None),
+        }
+    }
+
+    /// A save of the resume state that is slow to finish holds up neither the download nor its
+    /// snapshots, and the download waits for it before the state file goes, so that no late
+    /// save brings the file back.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_slow_save_holds_nothing_up() {
+        const MIB: usize = 1024 * 1024;
+        const SLOW: Duration = Duration::from_millis(1500);
+        // Four connections at 0.5 MB/s each: about five seconds, so a save starts after two and
+        // ends while the bytes still come in.
+        let base = rate_server(10 * MIB, 0.5e6).await;
+        let dir = tempdir().unwrap();
+        SLOW_SAVES.lock().push((dir.path().to_path_buf(), SLOW, 0, 0));
+        let target = dir.path().join("f.bin");
+        let options =
+            DownloadOptions { output_path: Some(target.clone()), num_connections: 4, adaptive: false, remote_checksum: false, ..Default::default() };
+        let (tx, rx) = broadcast::channel::<EngineSnapshot>(1024);
+        let gaps = tokio::spawn(longest_gap(rx));
+        let done = DownloadEngine::new(vec![base.join("f.bin").unwrap()], options).run(Some(tx)).await.unwrap();
+
+        let saves = SLOW_SAVES.lock().iter().find(|e| e.0 == dir.path()).map(|e| (e.2, e.3)).unwrap();
+        assert!(saves.0 > 0, "no save ran");
+        assert_eq!(saves.0, saves.1, "a save was still running when the download ended");
+        assert!(!DownloadState::state_file_path(&part_path(&target)).exists());
+        assert_eq!(std::fs::metadata(done).unwrap().len(), 10 * MIB as u64);
+        let longest = gaps.await.unwrap();
+        assert!(longest < SLOW / 2, "the snapshots waited {longest:?} for a save");
     }
 
     /// An adaptive download opens one more connection while that pays; a fixed one keeps to the
