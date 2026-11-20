@@ -68,7 +68,8 @@ pub(crate) const FROM_PRIMARY: &str = "The file does not match its checksum; fet
 /// same site: `<url>.sha256`, `.sha512`, `.sha1`, `.md5`, then `SHA256SUMS`, `sha256sums.txt` and
 /// `CHECKSUMS` in its folder, by the line for its name. Those are fetched two at a time, the
 /// first in that order with a checksum taken, with GET only, each at most 64 KiB, within 3
-/// seconds in all.
+/// seconds in all; none of a host that refused a request (429/503) lately, so none after the
+/// first it refuses.
 pub async fn published_checksum(client: &Client, url: &Url, probe_headers: &HeaderMap) -> Option<String> {
     published(client, None, 0, url, probe_headers, None).await
 }
@@ -89,7 +90,8 @@ async fn published(
     if let Some(found) = from_headers(probe_headers) {
         return Some(found);
     }
-    if let Some((metalink, size)) = described {
+    // Not of a host that limits how often it is asked (see `fetch_small`).
+    if let Some((metalink, size)) = described.filter(|(metalink, _)| !crate::hosts::refused_lately(metalink)) {
         // One of another size describes another file.
         let file = crate::metalink::described(client, &metalink, size, SIDECAR_BUDGET).await.filter(|f| f.size.is_none() || f.size == size);
         let found: Vec<_> = file.iter().flat_map(|f| &f.hashes).filter_map(|(algo, hex)| named(algo, hex)).collect();
@@ -258,12 +260,22 @@ fn note_missing(key: String) {
     *seen = (now, if seen.0.elapsed() < FOLDER_MEMORY { seen.1.saturating_add(1) } else { 1 });
 }
 
-/// The checksum file at `url`: one that is there, not a web page and at most `MAX_SIDECAR`.
+/// The checksum file at `url`: one that is there, not a web page and at most `MAX_SIDECAR`. Not
+/// asked for of a host that refused a request lately (see `hosts::refused_lately`): it limits how
+/// often it is asked, and the download's own requests need what it allows. A refusal (429/503)
+/// rests the host and so ends the lookups after it.
 async fn fetch_small(client: &Client, auth: Option<&Auth>, limit: usize, url: Url) -> Sidecar {
-    let _slot = crate::hosts::acquire(&url, limit).await;
+    let slot = crate::hosts::acquire(&url, limit).await;
+    if crate::hosts::refused_lately(&url) {
+        return Sidecar::Unknown;
+    }
     let request = |url: &Url| authorize(client.get(url.clone()), auth, url).header(ACCEPT_ENCODING, "identity");
     let Ok(mut resp) = send(request, &url).await else { return Sidecar::Unknown };
     let status = resp.status();
+    if matches!(status.as_u16(), 429 | 503) {
+        slot.throttled(crate::worker::retry_after(resp.headers()).unwrap_or_default());
+        return Sidecar::Unknown;
+    }
     // Busy (408, 429) is no answer about the file.
     if status.is_client_error() && !matches!(status.as_u16(), 408 | 429) {
         return Sidecar::Missing;
@@ -713,12 +725,14 @@ mod tests {
         sidecars_at_once: Arc<std::sync::atomic::AtomicUsize>,
         /// Every answer is sent 64 KiB at a time, each piece after this long.
         pace: Duration,
+        /// Sidecars are refused with 429.
+        sidecars_refused: bool,
     }
 
     /// Serves `content` at `/dir/file.bin` (HEAD, GET and ranges) and `site.files` beside it, any
     /// other path a 404. Returns the file's URL and every request's path and range, in order.
     async fn serve(content: Vec<u8>, site: Site) -> (Url, Arc<std::sync::Mutex<Vec<(String, Option<(u64, u64)>)>>>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = crate::hosts::unseen_listener().await;
         let addr = listener.local_addr().unwrap();
         let log = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (content, site, seen) = (Arc::new(content), Arc::new(site), Arc::clone(&log));
@@ -782,6 +796,9 @@ mod tests {
                         tokio::time::sleep(site.sidecars_wait).await;
                         busy.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                         match site.files.iter().find(|(p, _, _)| p.to_ascii_lowercase() == path) {
+                            _ if site.sidecars_refused => {
+                                b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+                            }
                             Some((_, kind, body)) => {
                                 format!("HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
                                     .into_bytes()
@@ -1000,6 +1017,22 @@ mod tests {
         let gone = Url::parse("http://127.0.0.1:9/dir/a.bin").unwrap();
         assert_eq!(published_checksum(&client, &gone, &HeaderMap::new()).await, None);
         assert!(!missing("http://127.0.0.1:9/dir/*.bin", 1) && !missing("http://127.0.0.1:9/dir/SHA256SUMS", 1));
+    }
+
+    /// A host that refuses a lookup (429) is asked for no more of them than were already on their
+    /// way (two at a time), not all seven; one that refused a request lately is asked for none.
+    #[tokio::test]
+    async fn sidecars_stop_at_a_refusal_and_skip_a_host_that_refused_lately() {
+        let sidecars = |log: &Arc<std::sync::Mutex<Vec<(String, Option<(u64, u64)>)>>>| log.lock().unwrap().len();
+        let (url, log) = serve(content(100), Site { sidecars_refused: true, ..Site::default() }).await;
+        assert_eq!(published_checksum(&Client::new(), &url, &HeaderMap::new()).await, None);
+        assert_eq!(sidecars(&log), SIDECARS_AT_ONCE, "{:?}", log.lock().unwrap());
+
+        let files = vec![("/dir/file.bin.sha256".to_string(), "text/plain".to_string(), format!("{}  file.bin", sha256_hex(&content(100))))];
+        let (url, log) = serve(content(100), Site { files, ..Site::default() }).await;
+        crate::hosts::acquire(&url, 0).await.throttled(Duration::ZERO);
+        assert_eq!(published_checksum(&Client::new(), &url, &HeaderMap::new()).await, None);
+        assert_eq!(sidecars(&log), 0);
     }
 
     /// Downloads `urls` (mirrors of one file) into `dir` with `options`; returns the result and
