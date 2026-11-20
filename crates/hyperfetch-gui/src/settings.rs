@@ -316,6 +316,12 @@ pub struct SiteRule {
 }
 
 impl SiteRule {
+    /// The rule with each number within what its row lets through (8 at once, 64 connections, an
+    /// hour's pause), as a hand-edited settings file may hold more.
+    pub fn in_range(self) -> Self {
+        Self { at_once: self.at_once.min(8), connections: self.connections.min(64), pause_secs: self.pause_secs.min(3600), ..self }
+    }
+
     /// The site as typed, lower case, without a scheme, path, port or leading `*.`; empty when
     /// none is typed.
     pub fn site(&self) -> String {
@@ -497,6 +503,7 @@ impl Settings {
         if let Some(key) = std::env::var(GOOGLE_API_KEY_VAR).ok().as_deref().and_then(non_empty) {
             settings.google_api_key = key;
         }
+        settings.site_rules = settings.site_rules.into_iter().map(SiteRule::in_range).collect();
         settings
     }
 
@@ -1072,6 +1079,17 @@ mod tests {
             assert_eq!(chosen.reduces_motion(), on);
             assert_eq!(serde_json::from_str::<Settings>(&serde_json::to_string(&chosen).unwrap()).unwrap(), chosen);
         }
+    }
+
+    /// A site rule from a hand-edited file is kept within what its row lets through: a pause of
+    /// years would overflow the clock.
+    #[test]
+    fn a_site_rule_is_kept_in_range() {
+        let rule: SiteRule = serde_json::from_str(&format!(r#"{{"host": "example.com", "at_once": 99, "connections": 1000, "pause_secs": {}}}"#, u64::MAX)).unwrap();
+        let kept = rule.in_range();
+        assert_eq!((kept.host.as_str(), kept.at_once, kept.connections, kept.pause_secs), ("example.com", 8, 64, 3600));
+        let within = SiteRule { host: "example.com".into(), at_once: 2, connections: 4, pause_secs: 30 };
+        assert_eq!(within.clone().in_range(), within);
     }
 
     #[test]
