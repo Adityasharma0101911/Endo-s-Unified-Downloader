@@ -519,7 +519,8 @@ impl App {
         // Asked before the queue first runs: on Linux the answer comes on a thread of its own.
         hyperfetch_core::network::metered();
         let settings = Settings::load();
-        let (queue, queue_problem) = queue_store::load(&queue_store::path());
+        let (mut queue, queue_problem) = queue_store::load(&queue_store::path());
+        carry_old_limits(&mut queue, settings.speed_limit());
         let queue_saver = queue_store::Saver::spawn(queue_store::path())
             .inspect_err(|e| tracing::warn!("Queue changes will only be saved on exit: {}", e))
             .ok();
@@ -2801,6 +2802,22 @@ impl eframe::App for App {
 /// never for a document downloaded itself, as it is for the file the document lists) and
 /// Authorization header (never for the hosts a document lists). A task that names its file is
 /// saved as that (sub)path of the save folder; one in a folder, in that folder of the save folder.
+/// Carries a speed limit set for one download by 2.2.0, which kept it in the download's
+/// `max_speed`, where the settings' limit is copied as a download is added, into its own limit,
+/// which its details show: a `max_speed` other than the settings' `limit`, on a download not done
+/// without a limit of its own. Its `max_speed` becomes the settings' limit, which now holds over
+/// its own. (One the settings' limit, changed since it was added, held to that speed is taken for
+/// its own too, so it keeps to it.)
+fn carry_old_limits(queue: &mut DownloadQueue, limit: Option<u64>) {
+    let old = |item: &QueueItem| item.status != QueueItemStatus::Completed && item.options.own_speed.is_none() && item.options.max_speed.is_some_and(|speed| Some(speed) != limit);
+    let ids: Vec<usize> = queue.items().iter().filter(|item| old(item)).map(|item| item.id).collect();
+    for id in ids {
+        if let Some(item) = queue.get_item_mut(id) {
+            (item.options.own_speed, item.options.max_speed) = (item.options.max_speed, limit);
+        }
+    }
+}
+
 fn task_options(settings: &Settings, task: &Task, checksum: &str, auth: &str) -> Result<DownloadOptions, String> {
     let checksum = if task.document_itself { "" } else { checksum };
     let checksum = match checksum.trim() {
@@ -3726,6 +3743,36 @@ mod tests {
         assert_eq!(more(&mut app, 100e6, true), 1);
         app.settings.more_at_once = false;
         assert_eq!(more(&mut app, 1e9, true), 0);
+    }
+
+    /// A limit 2.2.0 set for one download (its `max_speed`, not the settings' limit) becomes its
+    /// own, shown in its details, the settings' limit holding over it; one at the settings' limit,
+    /// one done and one with a limit of its own are left as they are.
+    #[test]
+    fn a_limit_set_for_one_download_by_2_2_0_is_carried_into_its_own() {
+        let mut queue = DownloadQueue::new();
+        let add = |queue: &mut DownloadQueue, max_speed: Option<u64>, own_speed: Option<u64>| {
+            let options = DownloadOptions { max_speed, own_speed, ..Default::default() };
+            queue.add_item(vec![Url::parse("https://h.example/f.bin").unwrap()], options)
+        };
+        let global = Some(1 << 20);
+        let own = add(&mut queue, Some(5 << 20), None);
+        let at_global = add(&mut queue, global, None);
+        let free = add(&mut queue, None, None);
+        let done = add(&mut queue, Some(5 << 20), None);
+        queue.get_item_mut(done).unwrap().status = QueueItemStatus::Completed;
+        let has_own = add(&mut queue, Some(5 << 20), Some(2 << 20));
+        carry_old_limits(&mut queue, global);
+        let limits = |id: usize| (queue.get_item(id).unwrap().options.max_speed, queue.get_item(id).unwrap().options.own_speed);
+        assert_eq!(limits(own), (global, Some(5 << 20)));
+        assert_eq!(limits(at_global), (global, None));
+        assert_eq!(limits(free), (None, None));
+        assert_eq!(limits(done), (Some(5 << 20), None));
+        assert_eq!(limits(has_own), (Some(5 << 20), Some(2 << 20)));
+        let mut off = DownloadQueue::new();
+        let alone = add(&mut off, Some(5 << 20), None);
+        carry_old_limits(&mut off, None);
+        assert_eq!((off.get_item(alone).unwrap().options.max_speed, off.get_item(alone).unwrap().options.own_speed), (None, Some(5 << 20)), "no limit in the settings");
     }
 
     /// A site's rule holds its queued downloads while as many of its own run as it allows, and
