@@ -76,6 +76,8 @@ pub struct Settings {
     pub max_concurrent: usize,
     /// More downloads than `max_concurrent` run while the line has room (see `crate::widen`).
     pub more_at_once: bool,
+    /// The user's rules per site (see [`SiteRule`]).
+    pub site_rules: Vec<SiteRule>,
     /// The user's Google API key, for listing whole Google Drive folders (empty = none). Never
     /// saved: [`Settings::load`] takes it from [`GOOGLE_API_KEY_VAR`], and one an older version
     /// saved is read and left out of the file the next time the settings are saved.
@@ -294,6 +296,34 @@ impl Default for Schedule {
     }
 }
 
+/// The user's rule for one site and its subdomains (see `App::site_holds`): how many of its
+/// downloads run at once, the connections of one added from it, and the seconds from one of its
+/// files starting or ending to the next starting. 0 leaves each as for every site.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SiteRule {
+    pub host: String,
+    pub at_once: usize,
+    pub connections: usize,
+    pub pause_secs: u64,
+}
+
+impl SiteRule {
+    /// The site as typed, lower case, without a scheme, path, port or leading `*.`; empty when
+    /// none is typed.
+    pub fn site(&self) -> String {
+        let typed = self.host.trim().to_ascii_lowercase();
+        let host = typed.rsplit("://").next().unwrap_or_default().split(['/', ':']).next().unwrap_or_default();
+        host.trim_start_matches("*.").trim_start_matches('.').to_string()
+    }
+
+    /// Whether `url` is of the site or one of its subdomains.
+    pub fn takes(&self, url: &Url) -> bool {
+        let (site, host) = (self.site(), url.host_str().unwrap_or_default().to_ascii_lowercase());
+        !site.is_empty() && host.strip_suffix(&site).is_some_and(|sub| sub.is_empty() || sub.ends_with('.'))
+    }
+}
+
 impl Default for Settings {
     fn default() -> Self {
         let engine = DownloadOptions::default();
@@ -317,6 +347,7 @@ impl Default for Settings {
             auto_run_queue: true,
             max_concurrent: 4,
             more_at_once: true,
+            site_rules: Vec::new(),
             google_api_key: String::new(),
             only_new: true,
             latest: 0,
@@ -536,6 +567,10 @@ impl Settings {
             live_idle_timeout: Some(self.live_idle_timeout).filter(|&secs| secs > 0),
             record_seconds: Some(self.record_minutes.saturating_mul(60)).filter(|&secs| secs > 0),
             name_pattern: non_empty(&self.name_pattern).filter(|pattern| check_name_pattern(pattern).is_ok()),
+            num_connections: match urls.first().and_then(|url| self.site_rule(url)) {
+                Some(rule) if rule.connections > 0 => rule.connections.min(64),
+                _ => self.connections.clamp(1, 64),
+            },
             ..self.tuning()
         })
     }
@@ -666,6 +701,11 @@ impl Settings {
             folder: c.folder.clone(),
         };
         self.categories.iter().map(category).collect()
+    }
+
+    /// The user's rule for `url`'s site: the first that takes it (see [`SiteRule`]).
+    pub fn site_rule(&self, url: &Url) -> Option<&SiteRule> {
+        self.site_rules.iter().find(|rule| rule.takes(url))
     }
 
     /// Whether to reduce motion: as set, else as the system's animation setting says.
@@ -842,6 +882,22 @@ mod tests {
         assert_eq!(speed_limit_bytes(512.0, false), Some(512 * 1024));
         assert_eq!(speed_limit_bytes(1.5, true), Some(3 * 512 * 1024));
         assert_eq!(speed_limit_bytes(0.0001, false), Some(1));
+    }
+
+    /// A site's rule gives a download from it or a subdomain its connections, the site typed as
+    /// a link or with `*.` too; other sites, and a rule left at 0, keep the setting for all.
+    #[test]
+    fn a_sites_rule_sets_the_connections_of_its_downloads() {
+        let rule = |host: &str, connections| SiteRule { host: host.into(), connections, ..SiteRule::default() };
+        let rules = vec![SiteRule::default(), rule("https://Example.com/files", 2), rule("*.other.org", 3), rule("zero.net", 0)];
+        let settings = Settings { connections: 16, site_rules: rules, ..Settings::default() };
+        let connections = |link: &str| settings.download_options(&[Url::parse(link).unwrap()], "", "").unwrap().num_connections;
+        assert_eq!(connections("https://example.com/a.bin"), 2);
+        assert_eq!(connections("https://dl.EXAMPLE.com/a.bin"), 2);
+        assert_eq!(connections("https://www.other.org/a.bin"), 3);
+        assert_eq!(connections("https://zero.net/a.bin"), 16);
+        assert_eq!(connections("https://notexample.com/a.bin"), 16);
+        assert_eq!(connections("https://example.com.else.net/a.bin"), 16);
     }
 
     #[test]

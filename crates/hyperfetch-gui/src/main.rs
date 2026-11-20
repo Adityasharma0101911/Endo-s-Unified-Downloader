@@ -451,6 +451,8 @@ struct App {
     twins: HashMap<usize, Twin>,
     /// How many more downloads than "at once" may run while the line has room (see `widen`).
     widening: widen::Widening,
+    /// When a file of each site of the user's rules last started or ended (see `App::site_holds`).
+    site_last: HashMap<String, Instant>,
     /// The window's taskbar button (Windows), and the progress it shows.
     taskbar: Option<taskbar::Taskbar>,
     taskbar_shown: Option<taskbar::Progress>,
@@ -626,6 +628,7 @@ impl App {
             restarting: HashSet::new(),
             twins: HashMap::new(),
             widening: widen::Widening::default(),
+            site_last: HashMap::new(),
             taskbar: None,
             taskbar_shown: None,
             batch_failed: false,
@@ -1447,6 +1450,7 @@ impl App {
                 ..JobView::default()
             },
         );
+        self.note_site(id);
         true
     }
 
@@ -1716,10 +1720,50 @@ impl App {
         let mut held: HashSet<usize> = self.twins.keys().copied().collect();
         let metered = self.settings.hold_metered && (self.is_metered)();
         let ok = self.metered_ok.clone();
-        while let Some(id) = self.queue.next_to_start(max, |id| held.contains(&id) || metered && !ok.contains(&id)) {
+        loop {
+            // Again after each start, which may fill its site.
+            let sites = self.site_holds(Instant::now());
+            let next = self.queue.next_to_start(max, |id| held.contains(&id) || sites.contains(&id) || metered && !ok.contains(&id));
+            let Some(id) = next else { break };
             if !self.start_job(id, false) {
                 held.insert(id);
             }
+        }
+    }
+
+    /// The queued downloads that wait for their site's rule (see `SiteRule`): as many of its
+    /// downloads run as it allows, or its pause since one of its files started or ended is not
+    /// over, a frame asked for when it is.
+    fn site_holds(&self, now: Instant) -> HashSet<usize> {
+        let mut held = HashSet::new();
+        if self.settings.site_rules.is_empty() {
+            return held;
+        }
+        let rule_of = |item: &QueueItem| item.urls.first().and_then(|url| self.settings.site_rule(url));
+        let mut running: HashMap<String, usize> = HashMap::new();
+        for rule in self.queue.items().iter().filter(|item| item.status.is_active()).filter_map(rule_of) {
+            *running.entry(rule.site()).or_default() += 1;
+        }
+        for item in self.queue.items().iter().filter(|item| item.status == QueueItemStatus::Queued) {
+            let Some(rule) = rule_of(item) else { continue };
+            let site = rule.site();
+            let full = rule.at_once > 0 && running.get(&site).copied().unwrap_or(0) >= rule.at_once;
+            let rest = self.site_last.get(&site).map_or(Duration::ZERO, |&at| (at + Duration::from_secs(rule.pause_secs)).saturating_duration_since(now));
+            if !rest.is_zero() {
+                self.ctx.request_repaint_after(rest);
+            }
+            if full || !rest.is_zero() {
+                held.insert(item.id);
+            }
+        }
+        held
+    }
+
+    /// Notes that a file of download `id`'s site, when a rule names it, started or ended now.
+    fn note_site(&mut self, id: usize) {
+        let site = self.queue.get_item(id).and_then(|item| item.urls.first()).and_then(|url| self.settings.site_rule(url)).map(settings::SiteRule::site);
+        if let Some(site) = site {
+            self.site_last.insert(site, Instant::now());
         }
     }
 
@@ -1837,6 +1881,7 @@ impl App {
                 self.queue.finish(id, result);
                 self.note_rerun(id);
                 self.note_ended(id);
+                self.note_site(id);
                 if self.restarting.remove(&id) && self.queue.get_item(id).is_some_and(|item| item.status == QueueItemStatus::Paused) {
                     self.start_job(id, false);
                 }
@@ -3576,6 +3621,28 @@ mod tests {
         assert_eq!(app.more_at_once(4, Some(50e6)), 0, "the line is full");
         app.settings.more_at_once = false;
         assert_eq!(app.more_at_once(4, Some(1e9)), 0);
+    }
+
+    /// A site's rule holds its queued downloads while as many of its own run as it allows, and
+    /// for its pause after one of its files started or ended; another site's are not held.
+    #[test]
+    fn a_sites_rule_holds_its_queued_downloads() {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(&rt, dir.path());
+        app.settings.site_rules = vec![settings::SiteRule { host: "example.com".into(), at_once: 1, ..Default::default() }];
+        let add = |app: &mut App, link: &str| app.queue.add_item(vec![Url::parse(link).unwrap()], DownloadOptions::default());
+        let running = add(&mut app, "https://a.example.com/1.bin");
+        let same = add(&mut app, "https://example.com/2.bin");
+        add(&mut app, "https://other.org/3.bin");
+        assert!(app.site_holds(Instant::now()).is_empty(), "none of the site runs");
+        app.queue.mark_started(running);
+        assert_eq!(app.site_holds(Instant::now()), HashSet::from([same]));
+        (app.settings.site_rules[0].at_once, app.settings.site_rules[0].pause_secs) = (0, 60);
+        assert!(app.site_holds(Instant::now()).is_empty(), "no limit");
+        app.note_site(running);
+        assert_eq!(app.site_holds(Instant::now()), HashSet::from([same]), "its pause");
+        assert!(app.site_holds(Instant::now() + Duration::from_secs(61)).is_empty());
     }
 
     /// The first link of each download queued.

@@ -564,9 +564,49 @@ fn speed_settings(s: &mut Settings, ui: &mut Ui) {
     let about = "Spread connections over every network this computer is on (Wi-Fi and Ethernet, say), or the ones chosen below.";
     switch(ui, "Use several networks", about, &mut s.multi_network);
     ui.add_enabled_ui(s.multi_network, |ui| network_choice(ui, &mut s.bind_addresses));
+    site_rules(s, ui);
 }
 
-/// Which way connections go: proxies, the IP version, timeouts and the user agent.
+/// The user's rules per site (see `SiteRule`), a line each under the row: the site, how many of
+/// its downloads run at once, the connections of one added from it and the pause between its
+/// files (0: as for every site), and Remove. Add a site puts an empty one last.
+fn site_rules(s: &mut Settings, ui: &mut Ui) {
+    let about = "For a site and its subdomains: how many of its downloads run at once, the connections of one added from \
+                 it, and the seconds from one of its files starting or ending to the next starting. 0 leaves one as set for all.";
+    let (mut shown, mut add) = (false, false);
+    setting(ui, "Rules per site", about, s.site_rules.len(), |ui| {
+        shown = true;
+        add = ui.add(button(format!("{} Add a site", icon::PLUS))).clicked();
+    });
+    if add {
+        s.site_rules.push(Default::default());
+    }
+    if !shown {
+        return;
+    }
+    let p = palette(ui);
+    let mut remove = None;
+    for (n, rule) in s.site_rules.iter_mut().enumerate() {
+        ui.horizontal(|ui| {
+            ui.add(egui::TextEdit::singleline(&mut rule.host).hint_text("example.com").desired_width(170.0));
+            ui.label(RichText::new("at once").small().color(p.muted));
+            ui.add(egui::DragValue::new(&mut rule.at_once).range(0..=8));
+            ui.label(RichText::new("connections").small().color(p.muted));
+            ui.add(egui::DragValue::new(&mut rule.connections).range(0..=64));
+            ui.label(RichText::new("pause").small().color(p.muted));
+            ui.add(egui::DragValue::new(&mut rule.pause_secs).range(0..=3600).suffix(" s"));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if icon_button(ui, icon::TRASH, "Remove this site's rules", true).clicked() {
+                    remove = Some(n);
+                }
+            });
+        });
+    }
+    if let Some(n) = remove {
+        s.site_rules.remove(n);
+    }
+}
+
 /// What the system's proxy switch says: which proxy downloads take now, as the app found it when
 /// it started.
 fn system_proxy_about(s: &Settings, seen: Option<&hyperfetch_core::sysproxy::Seen>) -> String {
@@ -585,6 +625,7 @@ fn system_proxy_about(s: &Settings, seen: Option<&hyperfetch_core::sysproxy::See
     format!("When neither the Proxy above nor the environment names one, the proxy this computer's settings name. In use: {now}. A change applies from the next start.")
 }
 
+/// Which way connections go: proxies, the IP version, timeouts and the user agent.
 fn network_settings(s: &mut Settings, ui: &mut Ui) {
     text_setting(ui, "Proxy", "Every connection goes through it.", &mut s.proxy, "http://127.0.0.1:8080 or socks5://127.0.0.1:1080", false);
     let about = "Several proxies, comma-separated; connections take turns over them.";
@@ -1210,6 +1251,23 @@ mod tests {
         let own = Settings { proxy: "socks5://127.0.0.1:1080".into(), ..Settings::default() };
         assert!(about(&own, &windows, false, true).contains("In use: the Proxy above."));
         assert!(Settings::default().system_proxy, "on by default");
+    }
+
+    /// Rules per site: Add a site puts an empty rule in a line under the row, and its Remove takes
+    /// it out again.
+    #[test]
+    fn rules_per_site_are_added_and_removed() {
+        let mut h = Harness::new();
+        h.app.tab = Tab::Settings;
+        h.app.settings_search = "rules per site".to_string();
+        h.frames(30);
+        assert!(h.settle());
+        h.click("Add a site");
+        h.frames(5);
+        assert_eq!(h.app.settings.site_rules, [crate::settings::SiteRule::default()]);
+        assert!(h.find("at once").is_some(), "{:?}", h.texts());
+        h.click(icon::TRASH);
+        assert!(h.app.settings.site_rules.is_empty());
     }
 
     /// Downloads that end while the window is not in front are told through the app's sender:
