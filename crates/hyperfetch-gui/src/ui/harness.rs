@@ -292,7 +292,7 @@ impl Harness {
         self.app.queue.apply_snapshot(id, &snapshot);
         let now = Instant::now();
         let speed_history = (0..60).map(|s| (now - Duration::from_secs(60 - s), 2e6 + 1.5e6 * (s as f64 / 6.0).sin().abs())).collect();
-        let running = crate::Running { cancel: Default::default(), task: self._rt.spawn(async {}), snapshot: Default::default() };
+        let running = crate::Running { cancel: Default::default(), task: self._rt.spawn(async {}), snapshot: Default::default(), live: Default::default() };
         let view = crate::JobView { running: Some(running), chunks, speed_history, active_workers: 4, got_snapshot: true, ..Default::default() };
         self.app.jobs.insert(id, view);
     }

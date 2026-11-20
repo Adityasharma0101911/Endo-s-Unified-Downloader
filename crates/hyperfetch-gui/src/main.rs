@@ -23,7 +23,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use eframe::egui;
 use hyperfetch_core::chunk::ChunkSnapshot;
-use hyperfetch_core::engine::{build_client, ClientKey, DownloadEngine, DownloadOptions, EngineSnapshot, SharedLimits};
+use hyperfetch_core::engine::{build_client, ClientKey, DownloadEngine, DownloadOptions, EngineSnapshot, OwnLimits, SharedLimits};
 use hyperfetch_core::history::{DownloadHistoryManager, HistoryEntry};
 use hyperfetch_core::ingest::{self, Channel, Task};
 use hyperfetch_core::media;
@@ -233,6 +233,8 @@ struct Running {
     task: JoinHandle<()>,
     /// Latest snapshot only; older ones are overwritten.
     snapshot: Arc<Mutex<Option<EngineSnapshot>>>,
+    /// Its own speed limit and connections, which it takes while it runs (see `App::set_own_limits`).
+    live: Arc<OwnLimits>,
 }
 
 /// Live telemetry of one download, kept by the GUI next to its queue item.
@@ -1288,12 +1290,13 @@ impl App {
 
         let cancel = Arc::new(Notify::new());
         let snapshot = Arc::new(Mutex::new(None));
+        let live = Arc::new(OwnLimits::new(options.own_speed));
         let task = {
-            let (cancel, snapshot, ctx, tx) =
-                (Arc::clone(&cancel), Arc::clone(&snapshot), self.ctx.clone(), self.events_tx.clone());
+            let (cancel, snapshot, live, ctx, tx) =
+                (Arc::clone(&cancel), Arc::clone(&snapshot), Arc::clone(&live), self.ctx.clone(), self.events_tx.clone());
             let engines = Arc::clone(&self.engines);
             self.rt.spawn(async move {
-                let result = run_job(&engines, urls, options, folder, leftovers_of, cancel, snapshot, ctx.clone()).await;
+                let result = run_job(&engines, urls, options, folder, leftovers_of, cancel, snapshot, live, ctx.clone()).await;
                 if tx.send(AppEvent::JobFinished { id, result }).is_ok() {
                     ctx.request_repaint();
                 }
@@ -1302,7 +1305,7 @@ impl App {
         self.jobs.insert(
             id,
             JobView {
-                running: Some(Running { cancel, task, snapshot }),
+                running: Some(Running { cancel, task, snapshot, live }),
                 started: Some(Instant::now()),
                 ..JobView::default()
             },
@@ -1399,6 +1402,17 @@ impl App {
         change(&mut item.options);
         self.restarting.insert(id);
         self.pause_job(id);
+    }
+
+    /// Gives download `id` its own speed limit (None: none), under the one for all downloads, and
+    /// its connections: kept with it, and taken at once while it runs, without starting it again.
+    fn set_own_limits(&mut self, id: usize, speed: Option<u64>, connections: usize) {
+        let Some(item) = self.queue.get_item_mut(id) else { return };
+        (item.options.own_speed, item.options.num_connections) = (speed, connections);
+        if let Some(running) = self.jobs.get(&id).and_then(|view| view.running.as_ref()) {
+            running.live.set_speed(speed);
+            running.live.set_connections(Some(connections));
+        }
     }
 
     /// Asks a running download to stop; it stays "Pausing" until the engine has saved its state.
@@ -2674,6 +2688,7 @@ async fn run_job(
     leftovers_of: Option<PathBuf>,
     cancel: Arc<Notify>,
     slot: Arc<Mutex<Option<EngineSnapshot>>>,
+    live: Arc<OwnLimits>,
     ctx: egui::Context,
 ) -> Result<(PathBuf, Option<u64>), String> {
     if let Some(final_path) = leftovers_of {
@@ -2688,7 +2703,7 @@ async fn run_job(
     // Building the engine may read the cookies file and TLS roots.
     let engine = {
         let engines = Arc::clone(engines);
-        unblock(move || engines(urls, options)).await??
+        unblock(move || engines(urls, options)).await??.with_live(live)
     };
 
     let (tx, mut rx) = broadcast::channel::<EngineSnapshot>(16);
@@ -2954,7 +2969,7 @@ mod tests {
         let job = tokio::spawn(async move {
             let engines = shared_clients();
             let folder = options.output_path.clone();
-            run_job(&engines, vec![url], options, folder, leftovers_of, cancel_job, job_slot, egui::Context::default()).await
+            run_job(&engines, vec![url], options, folder, leftovers_of, cancel_job, job_slot, Arc::default(), egui::Context::default()).await
         });
         if let Some(delay) = pause_after {
             // Paused `delay` after the first snapshot, which a slow machine may give late.
@@ -3025,7 +3040,7 @@ mod tests {
         let (live, file) = (queue.add_item(url(), DownloadOptions::default()), queue.add_item(url(), DownloadOptions::default()));
         assert!(queue.mark_started(live) && queue.mark_started(file));
         let running = |recording| JobView {
-            running: Some(Running { cancel: Arc::new(Notify::new()), task: tokio::spawn(std::future::pending()), snapshot: Arc::default() }),
+            running: Some(Running { cancel: Arc::new(Notify::new()), task: tokio::spawn(std::future::pending()), snapshot: Arc::default(), live: Arc::default() }),
             recording,
             ..JobView::default()
         };
@@ -3738,7 +3753,7 @@ mod tests {
 
         let (engines, cancel, slot) = (shared_clients(), Arc::new(Notify::new()), Arc::new(Mutex::new(None)));
         let folder = util::folder_to_create(&item);
-        let job = run_job(&engines, item.urls, item.options, folder, None, cancel, slot, egui::Context::default());
+        let job = run_job(&engines, item.urls, item.options, folder, None, cancel, slot, Arc::default(), egui::Context::default());
         let (path, size) = tokio::time::timeout(Duration::from_secs(60), job).await.unwrap().unwrap();
         assert_eq!(path, downloads.join("release").join("disc.iso"));
         assert_eq!(size, Some(body.len() as u64));
@@ -3837,7 +3852,7 @@ mod tests {
     /// Download `id` of `app` running, as far as the app can tell (no engine runs on `rt`).
     fn running(app: &mut App, rt: &tokio::runtime::Runtime, id: usize) {
         app.queue.mark_started(id);
-        let running = Running { cancel: Arc::default(), task: rt.spawn(async {}), snapshot: Arc::default() };
+        let running = Running { cancel: Arc::default(), task: rt.spawn(async {}), snapshot: Arc::default(), live: Arc::default() };
         app.jobs.insert(id, JobView { running: Some(running), ..JobView::default() });
     }
 

@@ -54,6 +54,10 @@ pub fn findings(item: &QueueItem, view: &JobView, on_host: usize, limited: f64) 
         let text = format!("Your speed limit holds it: the downloads under it run at its {}/s together.", format_bytes(limit));
         found.push(finding(text, Some(Fix::NoLimit)));
     }
+    if let Some(limit) = options.own_speed.filter(|&limit| item.speed_bytes_per_sec >= 0.9 * limit as f64) {
+        let text = format!("Its own speed limit holds it at {}/s: change it under For this download.", format_bytes(limit));
+        found.push(finding(text, None));
+    }
     // What its connections tell: only of a download over the engine's own HTTP connections.
     if let Some(host) = view.host {
         let (connections, wanted) = (view.active_workers, options.num_connections.clamp(1, MOST));
@@ -151,6 +155,12 @@ mod tests {
         assert!(found[0].text.starts_with("Your speed limit holds it") && found[0].text.contains("1.91 MiB/s"), "{found:?}");
         assert_eq!(found[0].fix, Some(Fix::NoLimit));
         assert_eq!(texts(&findings(&item(options), &view(4, HostProfile::default()), 4, 1e6)), Vec::<&str>::new());
+        // Its own limit, which it runs at (1 MB/s), holds it too; one well over its speed does not.
+        let own = DownloadOptions { num_connections: 4, own_speed: Some(1_000_000), ..Default::default() };
+        let found = findings(&item(own), &view(4, HostProfile::default()), 4, 1e6);
+        assert_eq!(texts(&found), ["Its own speed limit holds it at 976.56 KiB/s: change it under For this download."]);
+        let own = DownloadOptions { num_connections: 4, own_speed: Some(4_000_000), ..Default::default() };
+        assert!(findings(&item(own), &view(4, HostProfile::default()), 4, 1e6).is_empty());
     }
 
     /// A server that sends no parts of the file, or does not tell its size, gives it one
@@ -222,7 +232,7 @@ mod tests {
         silent.last_progress = Some(Instant::now() - Duration::from_secs(12));
         // Only a download whose engine runs can stall.
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
-        silent.running = Some(crate::Running { cancel: Default::default(), task: rt.spawn(async {}), snapshot: Default::default() });
+        silent.running = Some(crate::Running { cancel: Default::default(), task: rt.spawn(async {}), snapshot: Default::default(), live: Default::default() });
         let found = findings(&item(options), &silent, 4, 1e6);
         assert_eq!(texts(&found), ["No data has come for 12 s: a connection that stays silent for 30 s is replaced."]);
     }

@@ -36,6 +36,7 @@ use crate::worker::{
     authorize, content_length, retry_after, send, Auth, Body, FailureKind, HttpWorker, Ramp, RateLimiter, Seed, WorkerEvent,
     WorkerShared,
 };
+pub use crate::worker::OwnLimits;
 
 /// What a download stopped by [`DownloadEngine::cancel`] fails with.
 pub const CANCELLED: &str = "Download cancelled by user";
@@ -231,6 +232,9 @@ pub struct DownloadOptions {
     pub ytdlp_path: Option<PathBuf>,
     /// Global download speed cap in bytes/sec across all connections (None = unlimited).
     pub max_speed: Option<u64>,
+    /// This download's own speed cap in bytes/sec, under `max_speed`, which still holds; a front
+    /// end may change it while the download runs (see [`DownloadEngine::with_live`]).
+    pub own_speed: Option<u64>,
     /// The download's part of a `max_speed` it shares with others (see `sharing_limit`): a High
     /// one's is twice a Normal's, a Low one's half. Not saved: the queue sets it at each start.
     #[serde(skip)]
@@ -461,6 +465,7 @@ impl Default for DownloadOptions {
             browser_cookies: None,
             ytdlp_path: None,
             max_speed: None,
+            own_speed: None,
             max_retries: 8,
             stall_timeout_secs: 30,
             fsync_on_complete: false,
@@ -647,6 +652,8 @@ pub struct DownloadEngine {
     /// The speed limit, one for every connection of the download (and every stream of a media
     /// download, see `download_media_stream`), and for other downloads too (see `sharing_limit`).
     limiter: Option<Arc<RateLimiter>>,
+    /// The download's own limit and connections, which may change while it runs (see `with_live`).
+    live: Option<Arc<OwnLimits>>,
     cancel_flag: Arc<AtomicBool>,
     cancel_token: CancellationToken,
     /// What a MEGA download decrypts what it writes with (see `fetch_mega`).
@@ -701,6 +708,7 @@ impl DownloadEngine {
                 Ok(a) => Some(Arc::new(a.with_referer(referer.map(str::to_string)).with_headers(&scoped).with_s3(options.s3.clone()))),
                 Err(e) => return Self {
                     limiter: None,
+                    live: None,
                     options,
                     urls,
                     client: Err(e),
@@ -722,6 +730,7 @@ impl DownloadEngine {
         };
         Self {
             limiter: options.max_speed.filter(|&s| s > 0).map(|s| Arc::new(RateLimiter::new(s))),
+            live: options.own_speed.map(|speed| Arc::new(OwnLimits::new(Some(speed)))),
             options,
             urls,
             client,
@@ -751,6 +760,15 @@ impl DownloadEngine {
             };
             self.limiter = Some(RateLimiter::share(&whole, weight));
         }
+        self
+    }
+
+    /// Takes the download's own speed limit and connections from `live`, which a front end may
+    /// change while it runs: the limit at once, under the one it shares, which still holds; the
+    /// connections of a download over ranges within a few hundred milliseconds, as the Autopilot's
+    /// ceiling where it steers them. It replaces the options' `own_speed`.
+    pub fn with_live(mut self, live: Arc<OwnLimits>) -> Self {
+        self.live = Some(live);
         self
     }
 
@@ -1035,6 +1053,7 @@ impl DownloadEngine {
     fn alike(&self, urls: Vec<Url>, options: DownloadOptions, client: Result<Client, String>) -> Self {
         let mut engine = Self::with_client_result(urls, options, client);
         engine.limiter = self.limiter.clone();
+        engine.live = self.live.clone();
         engine.cancel_flag = Arc::clone(&self.cancel_flag);
         engine.cancel_token = self.cancel_token.clone();
         engine.already_done = Arc::clone(&self.already_done);
@@ -1112,14 +1131,14 @@ impl DownloadEngine {
             }
         }
         let write_error = |e: std::io::Error| format!("Write error: {e}");
-        let (mut body, mut written) = (response.bytes_stream(), 0u64);
+        let (mut body, mut written, limiter) = (response.bytes_stream(), 0u64, self.limiter());
         loop {
             let next = tokio::time::timeout(stall, body.next()).await;
             let bytes = match next.map_err(|_| format!("stalled: no data for {}s at offset {written}", stall.as_secs()))? {
                 None => break,
                 Some(bytes) => bytes.map_err(|e| format!("read error at offset {written}: {e}"))?,
             };
-            if let Some(limiter) = &self.limiter {
+            if let Some(limiter) = &limiter {
                 limiter.acquire(bytes.len() as u64).await;
             }
             written += bytes.len() as u64;
@@ -2356,6 +2375,7 @@ impl DownloadEngine {
         let urls = vec![stream.url.clone(), stream.key.clone()];
         let mut engine = DownloadEngine::with_client(urls, options, stream.client.clone());
         engine.limiter = self.limiter.clone();
+        engine.live = self.live.clone();
         let download = engine.fetch_media_stream(&stream, snapshot_tx);
         tokio::pin!(download);
         tokio::select! {
@@ -3060,11 +3080,14 @@ impl DownloadEngine {
         // A speed limit holds every width to the same speed.
         let mut pilot = adapts.then(|| Autopilot::new(num_workers, max_workers as usize, start, Instant::now(), job.chunks.lock().total_received()));
         let mut why = Some(pilot.as_ref().map_or_else(|| autopilot::off(num_workers, self.limiter.is_some()), Autopilot::why));
-        // What the workers the Autopilot adds share, kept only while it may add one: the download
-        // notices that its workers all stopped once nothing else holds it.
-        let mut spare = pilot.is_some().then_some(shared);
+        // What the workers the Autopilot (or the user, see `with_live`) adds share, kept only while
+        // one may be added: the download notices that its workers all stopped once nothing else
+        // holds it.
+        let mut spare = (pilot.is_some() || self.live.is_some()).then_some(shared);
         // Workers past the width wait until it takes them again, so each is spawned once.
         let mut spawned = num_workers;
+        // The connections the user last set for it while it runs.
+        let mut asked = None;
 
         let mut tick = tokio::time::interval(SNAPSHOT_INTERVAL);
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -3098,19 +3121,20 @@ impl DownloadEngine {
                         let left = size.saturating_sub(job.chunks.lock().total_downloaded());
                         limiter.nearly_done((left as f64) < meter.speed * NEARLY_DONE_SECS);
                     }
+                    // The connections the user set while it runs: the Autopilot's ceiling, else
+                    // the width itself.
+                    let mut next = None;
+                    if let Some(count) = self.live.as_ref().and_then(|live| live.connections()).filter(|&count| asked != Some(count)) {
+                        asked = Some(count);
+                        let most = count.clamp(1, MAX_CONNECTIONS).min(room).max(1);
+                        next = match pilot.as_mut() {
+                            Some(pilot) => pilot.cap_at(most),
+                            None => Some(most),
+                        };
+                        why = Some(pilot.as_ref().map_or_else(|| autopilot::set(most), Autopilot::why));
+                    }
                     if let Some(pilot) = pilot.as_mut().filter(|pilot| !pilot.done) {
-                        if let Some(next) = job.steer(pilot) {
-                            // Workers past a lower width hand back what they have yet to receive.
-                            if width.swap(next, Ordering::Relaxed) > next {
-                                job.chunks.lock().give_back(next);
-                            }
-                            if let Some(shared) = &spare {
-                                for worker_id in spawned..next {
-                                    spawn(&mut workers, worker_id, shared);
-                                }
-                            }
-                            spawned = spawned.max(next);
-                        }
+                        next = next.or_else(|| job.steer(pilot));
                         let now = pilot.why();
                         if why.as_ref() != Some(&now) {
                             tracing::info!("Autopilot: {}", now);
@@ -3120,6 +3144,27 @@ impl DownloadEngine {
                             if let Some(best) = pilot.settled {
                                 hosts::record_settled(&reference.final_url, best, pilot.limit());
                             }
+                            if self.live.is_none() {
+                                spare = None;
+                            }
+                        }
+                    }
+                    if let Some(next) = next.filter(|&next| next != width.load(Ordering::Relaxed)) {
+                        // Workers past a lower width hand back what they have yet to receive.
+                        if width.swap(next, Ordering::Relaxed) > next {
+                            job.chunks.lock().give_back(next);
+                        }
+                        if let Some(shared) = &spare {
+                            for worker_id in spawned..next {
+                                spawn(&mut workers, worker_id, shared);
+                            }
+                        }
+                        spawned = spawned.max(next);
+                    }
+                    // Kept for the user alone, the workers' share goes once they all stopped.
+                    if pilot.as_ref().is_none_or(|pilot| pilot.done) {
+                        while workers.try_join_next().is_some() {}
+                        if workers.is_empty() {
                             spare = None;
                         }
                     }
@@ -3691,11 +3736,11 @@ impl DownloadEngine {
                 emit(&snapshot_tx, || stream_snapshot(Some(entry.size), made, meter.update(made), &path));
             }
         };
-        let auth = self.auth.as_deref();
+        let (auth, limiter) = (self.auth.as_deref(), self.limiter());
         let extracted = tokio::select! {
             biased;
             _ = self.cancel_token.cancelled() => Err(CANCELLED.to_string()),
-            done = crate::zipdir::extract(client, auth, url, entry, &mut file, self.limiter.as_deref(), &mut written) => done,
+            done = crate::zipdir::extract(client, auth, url, entry, &mut file, limiter.as_deref(), &mut written) => done,
         };
         drop(file);
         let kept = match extracted {
@@ -3743,8 +3788,13 @@ impl DownloadEngine {
         self.urls.iter().map(Url::to_string).collect()
     }
 
+    /// What the download's bytes keep to: its own limit, as it changes (see `with_live`), then
+    /// the limit it shares or has, if any.
     fn limiter(&self) -> Option<Arc<RateLimiter>> {
-        self.limiter.clone()
+        match &self.live {
+            Some(live) => Some(RateLimiter::under(Arc::clone(live), self.limiter.clone())),
+            None => self.limiter.clone(),
+        }
     }
 
     fn stall_timeout(&self) -> Duration {
@@ -8840,6 +8890,34 @@ mod tests {
                 assert!(at_second.load(Ordering::SeqCst) > 0, "the second address serves its share");
             }
         }
+    }
+
+    /// The connections a front end sets for a download while it runs (see `with_live`) are the
+    /// ones it opens from the next snapshot on, without starting it again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_connections_set_while_it_runs_are_taken_at_once() {
+        let data: Vec<u8> = (0..6 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        // 3.2 MB/s a connection: two seconds over one.
+        let base = uncapped_file_server(data.clone(), Duration::from_millis(20)).await;
+        let dir = tempdir().unwrap();
+        let options =
+            DownloadOptions { output_path: Some(dir.path().join("f.bin")), num_connections: 1, remote_checksum: false, ..Default::default() };
+        let live = Arc::new(OwnLimits::default());
+        let engine = DownloadEngine::new(vec![base.join("f.bin").unwrap()], options).with_live(Arc::clone(&live));
+        let (tx, mut rx) = broadcast::channel(64);
+        let run = tokio::spawn(async move { engine.run(Some(tx)).await });
+        let (mut before, mut after, started) = (0, 0, Instant::now());
+        while let Ok(Ok(snapshot)) = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await {
+            if started.elapsed() < Duration::from_millis(500) {
+                before = before.max(snapshot.active_workers);
+            } else {
+                live.set_connections(Some(4));
+                after = after.max(snapshot.active_workers);
+            }
+        }
+        assert!(std::fs::read(run.await.unwrap().unwrap()).unwrap() == data);
+        assert_eq!(before, 1);
+        assert!(after >= 3, "{after} connections after 4 were set");
     }
 
     /// A file server (see `file_server`) whose host is known not to cap a connection's speed: the

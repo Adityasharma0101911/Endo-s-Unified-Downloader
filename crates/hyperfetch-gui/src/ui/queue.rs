@@ -126,7 +126,7 @@ fn detail_contents(app: &mut App, ui: &mut Ui, item: &QueueItem, in_place: bool)
     checks(ui, item);
     where_from(app, ui, item);
     timeline_view(ui, item);
-    limit_for_this(app, ui, item);
+    own_limits(app, ui, item);
 }
 
 /// A section of the details: its icon and title, and what it shows in a few words.
@@ -733,31 +733,34 @@ fn where_from(app: &mut App, ui: &mut Ui, item: &QueueItem) {
     }
 }
 
-/// Speed limit for this download alone: running, it starts again from where it is with the new
-/// limit; waiting or paused, it takes it when it starts.
-fn limit_for_this(app: &mut App, ui: &mut Ui, item: &QueueItem) {
-    if matches!(item.status, QueueItemStatus::Completed | QueueItemStatus::Pausing) {
+/// This download's own speed limit, under the one for all downloads, which still holds, and its
+/// connections, the Autopilot's ceiling: kept with it, and taken at once while it runs, without
+/// starting it again (see `App::set_own_limits`).
+fn own_limits(app: &mut App, ui: &mut Ui, item: &QueueItem) {
+    const MIB: f64 = 1024.0 * 1024.0;
+    if item.status == QueueItemStatus::Completed {
         return;
     }
     let p = palette(ui);
-    section_title(ui, icon::GAUGE, "Speed limit for this one", "");
-    let id = egui::Id::new(("own limit", item.id));
-    let current = item.options.max_speed.map_or(0.0, |bytes| bytes as f64 / (1024.0 * 1024.0));
-    let mut typed = ui.data(|d| d.get_temp::<f64>(id)).unwrap_or(current);
-    let mut apply = None;
+    section_title(ui, icon::GAUGE, "For this download", "under the limit for all downloads");
+    let id = egui::Id::new(("own limits", item.id));
+    let current = (item.options.own_speed.map_or(0.0, |bytes| bytes as f64 / MIB), item.options.num_connections);
+    let (mut speed, mut connections) = ui.data(|d| d.get_temp::<(f64, usize)>(id)).unwrap_or(current);
+    let mut apply = false;
     ui.horizontal(|ui| {
-        ui.add(egui::DragValue::new(&mut typed).range(0.0..=10_000.0).speed(0.1).max_decimals(1).suffix(" MB/s"));
+        ui.label(RichText::new("Speed limit").color(p.text));
+        ui.add(egui::DragValue::new(&mut speed).range(0.0..=10_000.0).speed(0.1).max_decimals(1).suffix(" MB/s"));
         ui.label(RichText::new("0 = none").small().color(p.muted));
-        if ui.add_enabled((typed - current).abs() > 0.05, button("Apply")).clicked() {
-            apply = Some((typed > 0.0).then(|| ((typed * 1024.0 * 1024.0) as u64).max(1)));
-        }
     });
-    ui.data_mut(|d| d.insert_temp(id, typed));
-    let Some(limit) = apply else { return };
-    if item.status == QueueItemStatus::Downloading {
-        app.restart_with(item.id, move |options| options.max_speed = limit);
-    } else if let Some(item) = app.queue.get_item_mut(item.id) {
-        item.options.max_speed = limit;
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Connections").color(p.text));
+        ui.add(egui::DragValue::new(&mut connections).range(1..=64));
+        let changed = (speed - current.0).abs() > 0.05 || connections != current.1;
+        apply = ui.add_enabled(changed, button("Apply")).on_hover_text("A running download takes it at once").clicked();
+    });
+    ui.data_mut(|d| d.insert_temp(id, (speed, connections)));
+    if apply {
+        app.set_own_limits(item.id, (speed > 0.0).then(|| ((speed * MIB) as u64).max(1)), connections);
     }
 }
 
@@ -1900,6 +1903,34 @@ mod tests {
         // Further down its page.
         let events = h.app.ctx.data(|d| d.get_temp::<Timeline>(timeline_id())).unwrap().events[&id].iter().map(|(_, what)| what.clone()).collect::<Vec<_>>();
         assert!(events.contains(&format!("Autopilot: {why}")), "in its timeline: {events:?}");
+    }
+
+    /// A running download's own speed limit and connections, set in its details, are kept with it
+    /// and handed to the running engine at once, without pausing it.
+    #[test]
+    fn a_running_downloads_own_limits_apply_at_once() {
+        let mut h = Harness::new();
+        let id = h.add("big.iso");
+        h.progress(id, 0.4);
+        h.app.focused = Some(id);
+        h.frames(10);
+        for _ in 0..20 {
+            if h.find("Apply").is_some() {
+                break;
+            }
+            h.hover(egui::Pos2::new(h.size.x * 0.8, h.size.y * 0.6));
+            h.frame(vec![egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::Vec2::new(0.0, -300.0), modifiers: egui::Modifiers::NONE }]);
+            h.frames(20);
+        }
+        assert!(h.find("For this download").is_some());
+        // As if 1 MB/s and 4 connections were typed into its boxes.
+        h.app.ctx.data_mut(|d| d.insert_temp(egui::Id::new(("own limits", id)), (1.0_f64, 4_usize)));
+        h.frames(2);
+        h.click("Apply");
+        let item = h.app.queue.get_item(id).unwrap();
+        assert_eq!((item.options.own_speed, item.options.num_connections, item.status.clone()), (Some(1 << 20), 4, QueueItemStatus::Downloading));
+        let live = &h.app.jobs[&id].running.as_ref().unwrap().live;
+        assert_eq!((live.speed(), live.connections()), (Some(1 << 20), Some(4)));
     }
 
     /// The timeline notes a download's news as it comes: added, started, finished; not its

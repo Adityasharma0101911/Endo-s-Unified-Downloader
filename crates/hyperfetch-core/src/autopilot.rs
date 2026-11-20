@@ -116,6 +116,22 @@ impl Autopilot {
         }
     }
 
+    /// Keeps to at most `most` connections from now on, the count the user set for the download:
+    /// at once when it has more, a trial under way given up; one that settled on the old ceiling
+    /// climbs again under a higher one. The width, if it changes.
+    pub(crate) fn cap_at(&mut self, most: usize) -> Option<usize> {
+        self.max = most.max(1);
+        if self.width > self.max {
+            self.width = self.max;
+            (self.trial, self.holding, self.settling) = (None, None, true);
+            return Some(self.width);
+        }
+        if self.done && self.why == Why::Most && self.width < self.max {
+            (self.done, self.settled, self.settling) = (false, None, true);
+        }
+        None
+    }
+
     /// The width to go on at, when it changes, with `downloaded` bytes in at `now` and `left` to
     /// come; `startup` is what a new request takes to answer, `cap` the connections the host serves
     /// at once (see `hosts`). Call it every few hundred milliseconds.
@@ -259,6 +275,11 @@ pub(crate) fn off(width: usize, limited: bool) -> String {
     }
 }
 
+/// What the Autopilot says of a download it does not steer whose connections the user set.
+pub(crate) fn set(width: usize) -> String {
+    format!("Off: {}, as you set for this download", connections(width))
+}
+
 fn connections(n: usize) -> String {
     if n == 1 { "1 connection".to_string() } else { format!("{n} connections") }
 }
@@ -279,7 +300,7 @@ mod tests {
     /// going at what `model` reads for its width, with the host's connection cap learned once a
     /// width went past it, as a refusal teaches it (see `hosts`). The widths it went through.
     fn drive(pilot: &mut Autopilot, model: &mut Model, windows: u64) -> Vec<usize> {
-        let (t0, mut downloaded, mut cap) = (pilot.began.0, 0u64, None);
+        let (t0, mut downloaded, mut cap) = (pilot.began.0, pilot.began.1, None);
         let mut widths = vec![pilot.width];
         for n in 1..=windows {
             if pilot.width > model.max_connections {
@@ -360,6 +381,21 @@ mod tests {
         let widths = drive(&mut pilot, &mut model, 20);
         assert!(widths[..3] == [4, 6, 12] && widths[3] > 12 && widths[4..] == [12], "{widths:?}");
         assert!(pilot.limit().is_some_and(|limit| (limit / (10.0 * MB) - 1.0).abs() < 0.05));
+    }
+
+    /// The count the user set is the ceiling: a climb stops at it, one that settled there climbs
+    /// again under a higher one, and a lower one takes the width down at once.
+    #[test]
+    fn test_the_users_count_is_the_ceiling() {
+        let mut model = Model { per_connection: 1.0 * MB, ..Default::default() };
+        let mut pilot = pilot(4, 32, Start::default());
+        assert_eq!(pilot.cap_at(8), None, "it has fewer");
+        assert_eq!(drive(&mut pilot, &mut model, 20), [4, 6, 8]);
+        assert_eq!(pilot.why(), "8 connections: each one added speed, and that is the most it may open");
+        assert_eq!(pilot.cap_at(16), None);
+        assert!(!pilot.done);
+        assert_eq!(drive(&mut pilot, &mut model, 20).last(), Some(&16));
+        assert_eq!((pilot.cap_at(2), pilot.width), (Some(2), 2));
     }
 
     /// The host's cap on connections at once bounds every trial once it is seen; the download
