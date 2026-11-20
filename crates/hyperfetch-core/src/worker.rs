@@ -131,7 +131,7 @@ pub struct RateLimiter {
     used: Mutex<(Instant, u64, f64)>,
     /// The shares of this limit.
     shares: Mutex<Vec<Weak<RateLimiter>>>,
-    /// A download's own limit, kept to before the limit it shares, if any (see [`RateLimiter::under`]).
+    /// A download's own limit, kept to as well as the limit it shares, if any (see [`RateLimiter::under`]).
     own: Option<(Arc<OwnLimits>, Option<Arc<RateLimiter>>)>,
 }
 
@@ -154,8 +154,21 @@ impl OwnLimits {
         live
     }
 
+    /// What is reserved under the old speed goes at the new one from now on, and at once without.
     pub fn set_speed(&self, bytes_per_sec: Option<u64>) {
-        self.speed.store(bytes_per_sec.unwrap_or(0), Ordering::Relaxed);
+        let new = bytes_per_sec.unwrap_or(0);
+        let old = self.speed.swap(new, Ordering::Relaxed);
+        let mut next = self.next_free.lock();
+        match (old, new) {
+            (_, 0) => *next = None,
+            (0, _) => {}
+            (old, new) => {
+                if let Some(at) = next.as_mut() {
+                    let now = Instant::now();
+                    *at = now + at.saturating_duration_since(now).mul_f64(old as f64 / new as f64);
+                }
+            }
+        }
     }
 
     pub fn speed(&self) -> Option<u64> {
@@ -170,10 +183,11 @@ impl OwnLimits {
         Some(self.connections.load(Ordering::Relaxed)).filter(|&n| n > 0)
     }
 
-    /// Waits until `bytes` more keep to the download's own limit, as it is now (none: at once).
+    /// Waits until `bytes` more keep to the download's own limit (none: at once), looking at it
+    /// again every `SHARE_LOOK`: a raised limit shortens the wait, a lifted one ends it.
     async fn acquire(&self, bytes: u64) {
-        let Some(speed) = self.speed() else { return };
-        let at = {
+        let Some(mut speed) = self.speed() else { return };
+        let mut at = {
             let now = Instant::now();
             let mut next = self.next_free.lock();
             // As the download-wide limit: a slot after the last, with at most 100 ms of idle credit.
@@ -182,7 +196,22 @@ impl OwnLimits {
             *next = Some(at);
             at
         };
-        tokio::time::sleep_until(at.into()).await;
+        loop {
+            let now = Instant::now();
+            if now >= at {
+                return;
+            }
+            tokio::time::sleep_until(at.min(now + SHARE_LOOK).into()).await;
+            match self.speed() {
+                None => return,
+                Some(new) if new != speed => {
+                    let now = Instant::now();
+                    at = now + at.saturating_duration_since(now).mul_f64(speed as f64 / new as f64);
+                    speed = new;
+                }
+                Some(_) => {}
+            }
+        }
     }
 }
 
@@ -231,7 +260,7 @@ impl RateLimiter {
         }
     }
 
-    /// What a download changed while it runs keeps to (see [`OwnLimits`]): its own limit, then
+    /// What a download changed while it runs keeps to (see [`OwnLimits`]): its own limit and
     /// `shared`, the limit it shares with others or one of its own that does not change, if any.
     pub fn under(live: Arc<OwnLimits>, shared: Option<Arc<RateLimiter>>) -> Arc<RateLimiter> {
         Arc::new(Self { own: Some((live, shared)), ..Self::new(1) })
@@ -295,9 +324,12 @@ impl RateLimiter {
     /// Waits until `bytes` more may be consumed without exceeding the rate.
     pub async fn acquire(&self, bytes: u64) {
         if let Some((live, shared)) = &self.own {
-            live.acquire(bytes).await;
-            if let Some(shared) = shared {
-                Box::pin(shared.acquire(bytes)).await;
+            // Reserved on both at once, the later slot waited for: the two limits do not add up.
+            match shared {
+                Some(shared) => {
+                    tokio::join!(live.acquire(bytes), Box::pin(shared.acquire(bytes)));
+                }
+                None => live.acquire(bytes).await,
             }
             return;
         }
@@ -2037,6 +2069,46 @@ mod tests {
         let shared = RateLimiter::under(Arc::new(OwnLimits::new(Some(10_000_000))), Some(Arc::new(RateLimiter::new(100_000))));
         let held = take(&shared, 50_000).await;
         assert!(held >= Duration::from_millis(350), "{held:?}");
+    }
+
+    /// What waits on a download's own limit goes as soon as the limit is lifted, and as fast as a
+    /// raised one says; with a limit it shares as well, a read waits for the later of the two
+    /// slots, not for one after the other.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_downloads_own_limit_changed_frees_what_waits_and_adds_to_no_other() {
+        // Eight reads of 50 KB at 50 KB/s, all waiting: eight seconds at that speed.
+        async fn eight(limiter: &Arc<RateLimiter>, own: &OwnLimits, then: Option<u64>) -> Duration {
+            let started = Instant::now();
+            let reads: Vec<_> = (0..8)
+                .map(|_| {
+                    let limiter = Arc::clone(limiter);
+                    tokio::spawn(async move { limiter.acquire(50_000).await })
+                })
+                .collect();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            own.set_speed(then);
+            for read in reads {
+                read.await.unwrap();
+            }
+            started.elapsed()
+        }
+        let own = Arc::new(OwnLimits::new(Some(50_000)));
+        let limiter = RateLimiter::under(Arc::clone(&own), None);
+        let lifted = eight(&limiter, &own, None).await;
+        assert!(lifted < Duration::from_millis(1000), "lifted: {lifted:?}");
+        own.set_speed(Some(50_000));
+        // The 7.7 s left go ten times as fast.
+        let raised = eight(&limiter, &own, Some(500_000)).await;
+        assert!(raised < Duration::from_millis(2000), "raised: {raised:?}");
+
+        // 150 KB under two limits of 100 KB/s: 1.5 s, not about 2.5.
+        let both = RateLimiter::under(Arc::new(OwnLimits::new(Some(100_000))), Some(Arc::new(RateLimiter::new(100_000))));
+        let started = Instant::now();
+        for _ in 0..3 {
+            both.acquire(50_000).await;
+        }
+        let took = started.elapsed();
+        assert!(took >= Duration::from_millis(1000) && took < Duration::from_millis(2000), "both: {took:?}");
     }
 
     /// Two shares of a 1 MB/s limit, four connections each, for a second: while both want more

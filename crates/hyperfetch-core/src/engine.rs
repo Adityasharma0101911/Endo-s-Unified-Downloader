@@ -3136,16 +3136,21 @@ impl DownloadEngine {
                         limiter.nearly_done((left as f64) < meter.speed * NEARLY_DONE_SECS);
                     }
                     // The connections the user set while it runs: the Autopilot's ceiling, else
-                    // the width itself.
+                    // the width itself; cleared, those the download had.
                     let mut next = None;
-                    if let Some(count) = self.live.as_ref().and_then(|live| live.connections()).filter(|&count| asked != Some(count)) {
-                        asked = Some(count);
-                        let most = count.clamp(1, MAX_CONNECTIONS).min(room).max(1);
+                    let set = self.live.as_ref().and_then(|live| live.connections());
+                    if set != asked {
+                        asked = set;
+                        let most = set.map_or(max_workers as usize, |count| count.clamp(1, MAX_CONNECTIONS).min(room).max(1));
                         next = match pilot.as_mut() {
                             Some(pilot) => pilot.cap_at(most),
-                            None => Some(most),
+                            None => Some(set.map_or(num_workers, |_| most)),
                         };
-                        why = Some(pilot.as_ref().map_or_else(|| autopilot::set(most), Autopilot::why));
+                        why = Some(match (pilot.as_ref(), set) {
+                            (Some(pilot), _) => pilot.why(),
+                            (None, Some(_)) => autopilot::set(most),
+                            (None, None) => autopilot::off(num_workers, self.limiter.is_some()),
+                        });
                     }
                     if let Some(pilot) = pilot.as_mut().filter(|pilot| !pilot.done) {
                         next = next.or_else(|| job.steer(pilot));
@@ -3836,7 +3841,7 @@ impl DownloadEngine {
         self.urls.iter().map(Url::to_string).collect()
     }
 
-    /// What the download's bytes keep to: its own limit, as it changes (see `with_live`), then
+    /// What the download's bytes keep to: its own limit, as it changes (see `with_live`), and
     /// the limit it shares or has, if any.
     fn limiter(&self) -> Option<Arc<RateLimiter>> {
         match &self.live {
@@ -8995,6 +9000,39 @@ mod tests {
         assert!(std::fs::read(run.await.unwrap().unwrap()).unwrap() == data);
         assert_eq!(before, 1);
         assert!(after >= 3, "{after} connections after 4 were set");
+    }
+
+    /// Connections set for a download and then cleared while it runs go back to those it had.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_connections_cleared_while_it_runs_go_back_to_those_it_had() {
+        let data: Vec<u8> = (0..6 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        // 1.6 MB/s a connection: about 1 s over four, 4 s over one.
+        let base = uncapped_file_server(data.clone(), Duration::from_millis(40)).await;
+        let dir = tempdir().unwrap();
+        let options = DownloadOptions {
+            output_path: Some(dir.path().join("f.bin")),
+            num_connections: 1,
+            adaptive: false,
+            remote_checksum: false,
+            ..Default::default()
+        };
+        let live = Arc::new(OwnLimits::default());
+        live.set_connections(Some(4));
+        let engine = DownloadEngine::new(vec![base.join("f.bin").unwrap()], options).with_live(Arc::clone(&live));
+        let (tx, mut rx) = broadcast::channel(64);
+        let run = tokio::spawn(async move { engine.run(Some(tx)).await });
+        let (mut set, mut later, started) = (0, Vec::new(), Instant::now());
+        while let Ok(Ok(snapshot)) = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await {
+            match started.elapsed() {
+                at if at < Duration::from_millis(450) => set = set.max(snapshot.active_workers),
+                at if at < Duration::from_millis(900) => live.set_connections(None),
+                _ if snapshot.downloaded_bytes < snapshot.total_bytes => later.push(snapshot.active_workers),
+                _ => {}
+            }
+        }
+        assert!(std::fs::read(run.await.unwrap().unwrap()).unwrap() == data);
+        assert!(set >= 3, "{set} connections while 4 were set");
+        assert!(!later.is_empty() && later.iter().all(|&n| n <= 1), "after clearing: {later:?}");
     }
 
     /// Over HTTP/2 a download's requests are spread over a few connections, each a client of its
