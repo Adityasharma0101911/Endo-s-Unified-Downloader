@@ -2549,7 +2549,8 @@ mod tests {
                     let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
                     let range = head.lines().find_map(|l| l.strip_prefix("range: bytes=")).and_then(|r| {
                         let (start, end) = r.trim().split_once('-')?;
-                        Some((start.parse::<usize>().ok()?, end.parse::<usize>().ok()?))
+                        // `bytes=0-`: to the end.
+                        Some((start.parse::<usize>().ok()?, if end.is_empty() { usize::MAX } else { end.parse::<usize>().ok()? }))
                     });
                     let response = match range {
                         Some((start, end)) if head.starts_with("get /ranged ") => {

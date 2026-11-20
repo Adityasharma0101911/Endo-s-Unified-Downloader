@@ -542,9 +542,9 @@ fn speed_settings(s: &mut Settings, ui: &mut Ui) {
                  than \"Downloads at once\" starts, another 15 s later, 3 more at most; none more once the line or the limit \
                  is full, nor while a download keeps to a limit of its own. Resume all keeps to \"Downloads at once\".";
     switch(ui, "More at once while the line has room", about, &mut s.more_at_once);
-    let about = "Each download finds its own number of connections, up to the one above: more while they make it faster, \
-                 and the fewest that reach what the server or your line allows. Its page says why. Off, a download keeps \
-                 the number it starts with.";
+    let about = "Each download starts as one stream and finds its own number of connections, up to the one above: more \
+                 once they pay and while they make it faster, and the fewest that reach what the server or your line \
+                 allows. Its page says why. Off, a download keeps the number it starts with.";
     switch(ui, "Autopilot", about, &mut s.adaptive);
     setting(ui, "Speed limit", "For all downloads together (0 = unlimited).", (s.max_speed_in_mb, s.max_speed.to_bits()), |ui| {
         let in_mb = &mut s.max_speed_in_mb;

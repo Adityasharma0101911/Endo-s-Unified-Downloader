@@ -26,6 +26,16 @@ const MAX_WINDOW: Duration = Duration::from_secs(5);
 const HELD: f64 = 0.7;
 /// A download going at this share of the user's line fills it.
 const LINE_FULL: f64 = 0.9;
+/// How long a download that is its first request's one stream goes on alone before its speed
+/// decides whether more connections pay: what the probe's measurement of a connection took
+/// before it was the download (see `engine::PREFETCH_TIME`).
+const ALONE: Duration = Duration::from_millis(250);
+/// More connections pay only while what is left, at the one stream's speed, lasts this many
+/// windows: one for them to start, one to see what they bring, and the rest to gain from it.
+const OPEN_WINDOWS: f64 = 4.0;
+/// More connections, each held to the rate one is, pay while what is left takes more than this
+/// many of their set-ups at it (see `engine::read_prefix`).
+const OPEN_SETUPS: f64 = 2.0;
 
 /// What the Autopilot starts from: what the probe and earlier downloads found of the host.
 #[derive(Debug, Clone, Copy, Default)]
@@ -58,6 +68,8 @@ enum Why {
     Line(f64),
     Short,
     Limited,
+    /// The first request's one stream, while it shows what it does.
+    Alone,
 }
 
 #[derive(Debug)]
@@ -87,6 +99,9 @@ pub(crate) struct Autopilot {
     why: Why,
     /// The fastest window, in bytes per second.
     pub(crate) best: f64,
+    /// The download is its first request's one stream, and opens this many once more pay (see
+    /// [`Autopilot::open`]); `None` once that is decided.
+    opening: Option<usize>,
 }
 
 impl Autopilot {
@@ -112,7 +127,90 @@ impl Autopilot {
                 _ => Why::Starting,
             },
             best: 0.0,
+            opening: None,
         }
+    }
+
+    /// Goes on as the download's first request, one stream which began at `since` with `from`
+    /// bytes in, until it shows what it does: then it opens the width it was made with, or as
+    /// many as some other rule says, if more pay (see [`Autopilot::open`]).
+    pub(crate) fn alone(mut self, since: Instant, from: u64) -> Self {
+        if !self.done {
+            (self.opening, self.width, self.began, self.settling, self.why) = (Some(self.width), 1, (since, from), false, Why::Alone);
+        }
+        self
+    }
+
+    /// Whether the download is still its first request's one stream (see [`Autopilot::alone`]).
+    pub(crate) fn is_alone(&self) -> bool {
+        self.opening.is_some()
+    }
+
+    /// Its host was found to limit how often it is asked: the one stream goes on to the end.
+    pub(crate) fn hold(&mut self) {
+        (self.opening, self.max, self.width, self.done, self.why) = (None, 1, 1, true, Why::Limited);
+    }
+
+    /// While alone, the width to open at `now`, with `downloaded` bytes in and `left` to come, once
+    /// the one stream has shown what it does; `startup` is what a new request takes to answer,
+    /// `cap` the connections the host serves at once. At once when each connection to the host is
+    /// seen held to `rate`, else `ALONE` after the stream began, at its speed so far. Then the one
+    /// stream goes on to the end, one request in all, if more would not pay: held to a rate, when
+    /// what is left takes no more than `OPEN_SETUPS` of their set-ups at it; else when it would not
+    /// last `OPEN_WINDOWS` windows at the stream's speed (a window is what more need to start and
+    /// show what they bring). Nor when the stream fills the line, or goes as fast as the host held
+    /// a download to before.
+    /// Otherwise more open: held to a rate, as many as fill the line (all it may, without the line
+    /// known), since more bring more; else the width it was made with, for the climb to go on
+    /// from. Call it every few hundred milliseconds.
+    pub(crate) fn open(&mut self, now: Instant, downloaded: u64, left: u64, startup: Duration, rate: Option<f64>, cap: Option<usize>) -> Option<usize> {
+        let opening = self.opening?;
+        self.cap = cap;
+        let most = cap.map_or(self.max, |cap| cap.clamp(1, self.max));
+        let (since, from) = self.began;
+        let elapsed = now.saturating_duration_since(since);
+        let speed = downloaded.saturating_sub(from) as f64 / elapsed.as_secs_f64().max(f64::MIN_POSITIVE);
+        let pace = match rate {
+            Some(rate) => rate,
+            // Nothing in yet tells nothing: a stall is the stream's own to time out.
+            None if elapsed < ALONE || speed <= 0.0 => return None,
+            None => speed,
+        };
+        self.opening = None;
+        self.best = self.best.max(speed.min(pace));
+        let window = startup.saturating_mul(STARTUPS).clamp(MIN_WINDOW, MAX_WINDOW);
+        let short = match rate {
+            // Each held to the rate, more bring more: they pay once the rest takes over two of
+            // their set-ups at it, as the probe's read of a capped connection judges.
+            Some(rate) => (left as f64) <= OPEN_SETUPS * rate * startup.as_secs_f64(),
+            // Else they must first show what they bring.
+            None => (left as f64) < OPEN_WINDOWS * speed * window.as_secs_f64(),
+        };
+        if short {
+            (self.done, self.why) = (true, Why::Short);
+            return None;
+        }
+        if self.fills_line(pace) {
+            return self.settle(1, Why::Line(pace));
+        }
+        if let Some(rate) = rate {
+            self.start.rate = Some(rate);
+            let fill = self.start.line.map_or(most, |line| (line / rate).ceil() as usize);
+            return self.open_to(fill.clamp(1, most), now, downloaded);
+        }
+        if self.start.limit.is_some_and(|limit| speed * GAIN >= limit) {
+            return self.settle(1, Why::Flat(speed));
+        }
+        self.open_to(opening.clamp(1, most), now, downloaded)
+    }
+
+    /// Opens `width` from the one stream at `now`, with `downloaded` bytes in: the climb goes on
+    /// from there, its first window not compared. The width, if more than the stream.
+    fn open_to(&mut self, width: usize, now: Instant, downloaded: u64) -> Option<usize> {
+        self.width = width;
+        self.step = if self.start.rate.is_some() { width } else { (width / 2).max(1) };
+        (self.began, self.settling, self.why) = ((now, downloaded), true, Why::Starting);
+        (width > 1).then_some(width)
     }
 
     /// The speed more connections did not raise the download past, once it settled on that: the
@@ -276,6 +374,7 @@ impl Autopilot {
             Why::Line(speed) => format!("{c}: that fills your line (about {})", per_sec(speed)),
             Why::Short => format!("{c}: too little is left to try more"),
             Why::Limited => format!("{c}: the server limits how often it is asked (429/503), so it is asked for the file alone"),
+            Why::Alone => format!("{c} while its speed shows; more are opened only if they pay"),
         }
     }
 }
@@ -461,6 +560,49 @@ mod tests {
         assert_eq!(one.limit(), None, "the line, not the host");
         let mut four = pilot(4, 16, line);
         assert_eq!(drive(&mut four, &mut model, 10), [4, 2, 1]);
+    }
+
+    /// The first request's one stream opens more only once it showed what it does, and only if
+    /// they pay: at once, to as many as fill the line, when each connection is seen held to a
+    /// rate; else after `ALONE`, unless the stream fills the line, goes as fast as the host held a
+    /// download to before, or would end before more could show what they bring.
+    #[test]
+    fn test_one_stream_opens_more_only_once_they_pay() {
+        let (t0, startup) = (Instant::now(), Duration::from_millis(10));
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let alone = |start: Start| Autopilot::new(8, 16, start, t0, 0).alone(t0, 0);
+        let mut pilot = alone(Start::default());
+        assert_eq!((pilot.width, pilot.is_alone()), (1, true));
+        assert_eq!(pilot.why(), "1 connection while its speed shows; more are opened only if they pay");
+        assert_eq!(pilot.open(at(100), 200_000, 1 << 30, startup, None, None), None, "not yet");
+        assert_eq!(pilot.open(at(120), 240_000, 1 << 30, startup, Some(2.0 * MB), None), Some(16), "held to a rate: all it may");
+        assert!(!pilot.is_alone() && pilot.next(at(700), 4_000_000, 1 << 30, startup, None).is_none(), "its first window is not compared");
+        let mut pilot = alone(Start { line: Some(10.0 * MB), ..Default::default() });
+        assert_eq!(pilot.open(at(120), 240_000, 1 << 30, startup, Some(2.0 * MB), None), Some(5), "as many as fill the line");
+        assert_eq!(alone(Start::default()).open(at(120), 240_000, 1 << 30, startup, Some(2.0 * MB), Some(3)), Some(3), "the host's cap");
+        // Held to a rate, but done within two set-ups of new connections: the one stream.
+        let mut soon = alone(Start::default());
+        assert_eq!((soon.open(at(20), 40_000, 30_000, startup, Some(2.0 * MB), None), soon.done, soon.width), (None, true, 1));
+
+        // Not held to a rate: its speed over its first quarter second decides.
+        let mut pilot = alone(Start::default());
+        assert_eq!(pilot.open(at(300), 3_000_000, 1 << 30, startup, None, None), Some(8), "a long way to go: the climb");
+        let mut short = alone(Start::default());
+        assert_eq!(short.open(at(300), 3_000_000, 15_000_000, startup, None, None), None);
+        assert!(short.done && short.width == 1 && short.settled.is_none(), "{}", short.why());
+        assert_eq!(short.why(), "1 connection: too little is left to try more");
+        let mut full = alone(Start { line: Some(10.0 * MB), ..Default::default() });
+        assert_eq!((full.open(at(300), 3_000_000, 1 << 30, startup, None, None), full.done, full.settled), (None, true, Some(1)));
+        assert!(full.why().starts_with("1 connection: that fills your line"), "{}", full.why());
+        let mut held = alone(Start { limit: Some(10.0 * MB), ..Default::default() });
+        assert_eq!((held.open(at(300), 3_000_000, 1 << 30, startup, None, None), held.settled), (None, Some(1)));
+        // A host that limits how often it is asked is never more than the stream.
+        let limited = alone(Start { limited: true, ..Default::default() });
+        assert!(!limited.is_alone() && limited.done && limited.width == 1);
+        let mut found = alone(Start::default());
+        found.hold();
+        assert!(!found.is_alone() && found.done && found.width == 1, "{}", found.why());
+        assert!(found.why().contains("limits how often it is asked"));
     }
 
     /// From the host's past: more are still tried, but not fewer; one more that made it slower is

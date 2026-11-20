@@ -144,7 +144,8 @@ pub struct Args {
     #[arg(long = "no-remote-checksum")]
     pub no_remote_checksum: bool,
 
-    /// Autopilot: each download finds its connections as it goes, up to -s: more while they make it
+    /// Autopilot: each download starts as one stream, the request a plain download sends, and
+    /// finds its connections as it goes, up to -s: more only once they pay and while they make it
     /// faster, and the fewest that reach what the server or the line allows; -v says why (the
     /// default; this undoes a --no-adaptive from the config file)
     #[arg(long = "adaptive", overrides_with = "no_adaptive")]

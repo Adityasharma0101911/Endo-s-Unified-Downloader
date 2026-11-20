@@ -275,7 +275,8 @@ async fn answer(
     let range = head
         .lines()
         .find_map(|l| l.strip_prefix("range: bytes=")?.trim().split_once('-'))
-        .and_then(|(a, b)| Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?.min(size - 1))))
+        // `bytes=0-`: to the end.
+        .and_then(|(a, b)| Some((a.parse::<usize>().ok()?, if b.is_empty() { size - 1 } else { b.parse::<usize>().ok()?.min(size - 1) })))
         .filter(|_| !server.no_ranges);
     tokio::time::sleep(server.first_byte).await;
     let ranges = if server.no_ranges { "" } else { "Accept-Ranges: bytes\r\n" };

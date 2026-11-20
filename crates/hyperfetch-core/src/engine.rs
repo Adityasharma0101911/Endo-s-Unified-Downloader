@@ -793,7 +793,7 @@ impl DownloadEngine {
     pub async fn probe(&self) -> Result<crate::relink::RemoteFile, String> {
         let client = self.client.clone()?;
         let url = self.urls.first().ok_or_else(|| "no link to ask".to_string())?;
-        let (info, _) = probe_url(&client, self.auth.as_deref(), url, false, true, self.options.max_connections_per_host, agent_is_ours(&self.options)).await?;
+        let (info, _) = probe_url(&client, self.auth.as_deref(), url, Ask::Byte, true, self.options.max_connections_per_host, agent_is_ours(&self.options)).await?;
         Ok(crate::relink::RemoteFile { size: info.size, accepts_ranges: info.accepts_ranges, etag: info.etag, last_modified: info.last_modified })
     }
 
@@ -2659,10 +2659,14 @@ impl DownloadEngine {
         let (reading, started) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
         // Owned, as the probes may still be out once this returns.
         let (client, auth, owned) = (client.clone(), self.auth.clone(), urls.to_vec());
-        // A file pinned by its hash (a listing's, or the user's) needs no HEAD beside the GET: what
-        // HEAD adds is hints, and each request counts against the host (a batch of small files
-        // otherwise asks twice per file).
-        let (head, as_app) = (self.options.expected_checksum.is_none(), agent_is_ours(&self.options));
+        // With the Autopilot, the first mirror's GET is the download's first stream (see
+        // `Ask::Stream`), and nothing else goes to its host while the stream shows what it does:
+        // HEAD goes out only when the GET is of no use. Without it, a file pinned by its hash (a
+        // listing's, or the user's) needs no HEAD beside the GET either: what HEAD adds is hints,
+        // and each request counts against the host (a batch of small files otherwise asks twice
+        // per file).
+        let streams = self.options.adaptive && self.limiter.is_none();
+        let (head, as_app) = (self.options.expected_checksum.is_none() && !streams, agent_is_ours(&self.options));
         let (flags, tell) = ((Arc::clone(&reading), Arc::clone(&started)), snapshot_tx.clone());
         let mut probes: ProbeStream = futures_util::stream::iter(owned.into_iter().enumerate())
             .map(move |(i, url)| {
@@ -2672,7 +2676,13 @@ impl DownloadEngine {
                     let probe = async {
                         // Only the first mirror fetches the file's start: the download uses one copy;
                         // none does when an older version may hold it (see `DownloadEngine::delta`).
-                        let (mut info, body) = probe_url(&client, auth.as_deref(), &url, i == 0 && !delta, head, limit, as_app).await?;
+                        // The others ask for a byte, what tells whether they serve the same file.
+                        let ask = match i == 0 && !delta {
+                            true if streams => Ask::Stream,
+                            true => Ask::Start,
+                            false => Ask::Byte,
+                        };
+                        let (mut info, body) = probe_url(&client, auth.as_deref(), &url, ask, head, limit, as_app).await?;
                         // A small file need not hold a batch's or queue's place while it comes (see
                         // `EngineSnapshot::small`); its later snapshots say so again, or that it
                         // was no file after all.
@@ -2995,7 +3005,14 @@ impl DownloadEngine {
         // An adaptive download starts where one from the host ended up fastest, also in an earlier
         // run, when the file gives each of those connections a MiB; the Autopilot goes on from there.
         let adapts = self.options.adaptive && self.limiter.is_none();
-        let best = hosts::best_connections(&reference.final_url).filter(|&best| adapts && remaining >= best as u64 * BYTES_PER_CONNECTION);
+        // The probe's answer that brings the file to its end is the download's first stream (see
+        // `Ask::Stream`), and when it answered: one connection remembered is that stream alone.
+        let streaming = match &live {
+            Some(Live::Range { end, since, .. }) if adapts && end + 1 == size => Some(since.into_std()),
+            _ => None,
+        };
+        let best = hosts::best_connections(&reference.final_url)
+            .filter(|&best| adapts && remaining >= best as u64 * BYTES_PER_CONNECTION && (best > 1 || streaming.is_none()));
         let known = hosts::profile(&reference.final_url);
         // A host that limits how often it is asked, this run or an earlier one found, is asked
         // for the file alone, over one connection (see `hosts::limits_requests`); unless other
@@ -3017,14 +3034,21 @@ impl DownloadEngine {
         let hashed = self.options.expected_checksum.clone().or_else(|| crate::digest::found(&self.site));
         let in_order = crate::storage::hashes_prefix(self.options.expected_checksum.as_deref());
         let throttled_host = mirrors.iter().any(|m| HostKey::of(&m.url).is_bitrate_throttled());
-        let chunk_size = effective_chunk_size(remaining, num_workers as u64, self.options.base_chunk_size, in_order, throttled_host);
+        // The other connections take their pieces from the first stream's far end (see
+        // `ChunkManager::steal_work`), so a gap is one chunk, unless chunks are kept small for the
+        // reasons `effective_chunk_size` gives.
+        let whole_gaps = streaming.is_some() && self.options.base_chunk_size == DEFAULT_CHUNK_SIZE && !in_order && !throttled_host;
+        let chunk_size = match whole_gaps {
+            true => size,
+            false => effective_chunk_size(remaining, num_workers as u64, self.options.base_chunk_size, in_order, throttled_host),
+        };
         let mut manager = ChunkManager::with_resumed_ranges(size, chunk_size, &have).map_err(|e| e.to_string())?;
         manager.set_max_retries(self.options.max_retries);
         // The probe's answer is worker 0's first attempt, its connection's rate watched on while no
         // other connection of the download has an answer.
         let alone = CancellationToken::new();
         let seed = match live {
-            Some(Live::Range { response, slot, end, watch }) => mirrors.iter().position(|m| m.url == reference.url).and_then(|mirror_id| {
+            Some(Live::Range { response, slot, end, watch, .. }) => mirrors.iter().position(|m| m.url == reference.url).and_then(|mirror_id| {
                 let chunk = manager.assign_at(0, mirror_id, prefetch.len() as u64, end)?;
                 let (body, url) = (response.bytes_stream().boxed(), reference.final_url.clone());
                 let body = match watch {
@@ -3035,6 +3059,14 @@ impl DownloadEngine {
             }),
             _ => None,
         };
+        // That stream goes on alone until it shows what it does (see `Autopilot::alone`), unless
+        // the host's recipe already says what it takes: a width more than one, or a capped rate.
+        let solo = streaming.filter(|_| seed.is_some() && !limited && start.rate.is_none() && best.is_none());
+        let (opening, num_workers) = match solo {
+            Some(_) => (counted.clamp(1, max_workers) as usize, 1),
+            None => (num_workers, num_workers),
+        };
+        let streamed = prefetch.len() as u64;
 
         let racer = build_racer(&mirrors);
 
@@ -3068,7 +3100,7 @@ impl DownloadEngine {
         // Workers stop when the user cancels or when this download is over.
         let stop = self.cancel_token.child_token();
         // One connection has nothing to spread; one the ramp adds stays on the system's choice.
-        let spread = if num_workers > 1 { self.address_routes(&client, &reference.final_url).await } else { None };
+        let spread = if opening > 1 { self.address_routes(&client, &reference.final_url).await } else { None };
         let spread = spread.or_else(|| self.h2_routes(&client, max_workers as usize));
         let addresses = spread.is_some();
         let pool_clients = match (spread, self.client_pool.as_ref()) {
@@ -3120,7 +3152,15 @@ impl DownloadEngine {
         }
         let width = Arc::clone(&shared.width);
         // A speed limit holds every width to the same speed.
-        let mut pilot = adapts.then(|| Autopilot::new(num_workers, max_workers as usize, start, Instant::now(), job.chunks.lock().total_received()));
+        let mut pilot = adapts.then(|| {
+            let received = job.chunks.lock().total_received();
+            let pilot = Autopilot::new(opening, max_workers as usize, start, Instant::now(), received);
+            match solo {
+                // What the stream brought counts from when it answered.
+                Some(since) => pilot.alone(since, received.saturating_sub(streamed)),
+                None => pilot,
+            }
+        });
         let mut why = Some(pilot.as_ref().map_or_else(|| autopilot::off(num_workers, self.limiter.is_some()), Autopilot::why));
         // What the workers the Autopilot (or the user, see `with_live`) adds share, kept only while
         // one may be added: the download notices that its workers all stopped once nothing else
@@ -3300,6 +3340,8 @@ impl DownloadEngine {
         let mut seen: Vec<Url> = mirrors.iter().flat_map(|m| [m.url.clone(), m.final_url.clone()]).collect();
         let (client, auth, limit, size) = (client.clone(), self.auth.clone(), self.options.max_connections_per_host, reference.size);
         let as_app = agent_is_ours(&self.options);
+        // A copy is asked for one byte, with HEAD beside only without the Autopilot (see `probe_all`).
+        let head = !(self.options.adaptive && self.limiter.is_none());
         let listed = {
             let client = client.clone();
             async move {
@@ -3317,7 +3359,7 @@ impl DownloadEngine {
         };
         let probes = futures_util::stream::once(listed).flatten().map(move |url| {
             let (client, auth) = (client.clone(), auth.clone());
-            async move { (0, probe_url(&client, auth.as_deref(), &url, false, true, limit, as_app).await.map(|(info, _)| (info, None))) }
+            async move { (0, probe_url(&client, auth.as_deref(), &url, Ask::Byte, head, limit, as_app).await.map(|(info, _)| (info, None))) }
         });
         Some(probes.buffer_unordered(PROBE_CONCURRENCY).boxed())
     }
@@ -4395,7 +4437,18 @@ impl RangeJob {
         // Each mirror's host has room of its own: the caps of them all, when each has one.
         let mut seen = std::collections::HashSet::new();
         let cap = urls.iter().filter(|url| seen.insert(HostKey::of(url))).map(|url| hosts::profile(url).connection_cap).sum();
-        pilot.next(Instant::now(), downloaded, size.saturating_sub(downloaded), startup.unwrap_or_default(), cap)
+        let (now, left, startup) = (Instant::now(), size.saturating_sub(downloaded), startup.unwrap_or_default());
+        if pilot.is_alone() {
+            // A host found meanwhile to limit how often it is asked is asked nothing more.
+            if self.limits_requests() {
+                pilot.hold();
+                return None;
+            }
+            // The rate its connections are held to, once the stream's watch (see `Watched`) saw it.
+            let rate = urls.first().map(hosts::profile).filter(|p| p.capped_per_connection == Some(true)).and_then(|p| p.connection_rate);
+            return pilot.open(now, downloaded, left, startup, rate, cap);
+        }
+        pilot.next(now, downloaded, left, startup, cap)
     }
 
     /// Adds the mirror a probe that came in after the download started found, if it serves the
@@ -4573,6 +4626,9 @@ struct ProbeBody {
     /// The host slot the response's request holds.
     slot: HostSlot,
     holds: Holds,
+    /// The last byte the answer brings, when it is ranged: past its `Holds::Start` when it is
+    /// the download's first stream (see `Ask::Stream`).
+    end: u64,
     /// When the answer arrived.
     answered: tokio::time::Instant,
     /// How long the request waited for it, when that was the first try: a retry may reuse the
@@ -4592,8 +4648,8 @@ enum Holds {
 /// A probe's answer whose body is still coming, with the host slot its request holds.
 enum Live {
     /// The rest of a ranged answer: the file's bytes from where the probe stopped reading up to
-    /// `end`, and the watch on its connection's rate while that told nothing yet.
-    Range { response: Response, slot: HostSlot, end: u64, watch: Option<RateWatch> },
+    /// `end`, the watch on its connection's rate while that told nothing yet, and when it answered.
+    Range { response: Response, slot: HostSlot, end: u64, watch: Option<RateWatch>, since: tokio::time::Instant },
     /// A server ignoring the probe's range sent the whole file, none of it read yet.
     Stream { response: Response, slot: HostSlot },
 }
@@ -4739,10 +4795,12 @@ struct Pace {
 /// HEAD's word is taken then (ranges included) and the download itself waits out the busy server;
 /// only without HEAD is it an error.
 ///
-/// With `prefetch` the GET asks for the first `PREFETCH` bytes instead of one, and its response
-/// comes back too when its body is of use: the start of the file (or all of it, if that small)
-/// under the validators found, which must be the response's own, or else the whole file from a
-/// server ignoring ranges, for a single stream to take up.
+/// The GET asks for what `ask` says: one byte, the first `PREFETCH` bytes, or the file from its
+/// start to its end, the download's first stream (see [`Ask`]). Unless it asks for one byte its
+/// response comes back too when its body is of use: the file from its start (all of it, if that
+/// small) under the validators found, which must be the response's own, or else the whole file from
+/// a server ignoring ranges, for a single stream to take up. A 200 to the GET for the whole file
+/// says nothing of ranges, unless its host was seen to take them before: then it is as a 206 for it.
 ///
 /// HEAD and GET each hold a slot of their host's budget under `limit` (see [`crate::hosts`]).
 /// The GET waits for its slot before the probe's time runs, since a host busy with other
@@ -4764,7 +4822,7 @@ async fn probe_url(
     client: &Client,
     auth: Option<&Auth>,
     url: &Url,
-    prefetch: bool,
+    ask: Ask,
     head: bool,
     limit: usize,
     as_app: bool,
@@ -4773,7 +4831,7 @@ async fn probe_url(
     let mut waits = 0u32;
     loop {
         let slot = hosts::acquire(url, limit).await;
-        let (message, asked) = match tokio::time::timeout(PROBE_TIMEOUT, probe_with(client, auth, url, prefetch, head, limit, as_app, slot)).await {
+        let (message, asked) = match tokio::time::timeout(PROBE_TIMEOUT, probe_with(client, auth, url, ask, head, limit, as_app, slot)).await {
             Ok(Ok(found)) => return Ok(found),
             Ok(Err(ProbeError::Busy(message, asked))) => (message, asked),
             Ok(Err(ProbeError::Failed(message))) => return Err(message),
@@ -4812,18 +4870,31 @@ fn hung_up(error: &reqwest::Error) -> bool {
     error.is_request() && !error.is_connect() && !error.is_timeout()
 }
 
+/// What a probe's GET asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ask {
+    /// One byte: what a mirror serves, when another's answer is the download's.
+    Byte,
+    /// The first `PREFETCH` bytes, read before the download's connections start.
+    Start,
+    /// The file from its start to its end: the download's first stream, which goes on as its
+    /// first connection (see `Autopilot::alone`), a single-stream download's one request.
+    Stream,
+}
+
 /// `probe_url` once the GET holds `slot`.
 #[allow(clippy::too_many_arguments)]
 async fn probe_with(
     client: &Client,
     auth: Option<&Auth>,
     url: &Url,
-    prefetch: bool,
+    ask: Ask,
     head: bool,
     limit: usize,
     as_app: bool,
     slot: HostSlot,
 ) -> Result<(ProbeInfo, Option<ProbeBody>), ProbeError> {
+    let prefetch = ask != Ask::Byte;
     let cold = slot.opens_connection();
     let send_head = || async move {
         match send(|url: &Url| authorize(client.head(url.clone()), auth, url), url).await {
@@ -4848,8 +4919,15 @@ async fn probe_with(
         send_head().await
     };
     // The bytes the GET asks for.
-    let asked = if prefetch { PREFETCH } else { 1 };
-    let range = format!("bytes=0-{}", asked - 1);
+    let asked = match ask {
+        Ask::Byte => 1,
+        Ask::Start => PREFETCH,
+        Ask::Stream => u64::MAX,
+    };
+    let range = match ask {
+        Ask::Stream => "bytes=0-".to_string(),
+        _ => format!("bytes=0-{}", asked - 1),
+    };
     // Also when it answered and, for a first try, how long that took: what a connection needs to start.
     let ranged = async {
         let mut attempt = 0;
@@ -4937,9 +5015,9 @@ async fn probe_with(
         head => head,
     };
     // A body is read under the GET's slot, which a redirect moves to the host it came from.
-    let body = |response: Response, holds: Holds| {
+    let body = |response: Response, holds: Holds, end: u64| {
         let slot = slot_at(slot, response.url(), limit)?;
-        Some(ProbeBody { response, slot, holds, answered, setup })
+        Some(ProbeBody { response, slot, holds, end, answered, setup })
     };
     let head_len = head.as_ref().and_then(|r| content_length(r.headers()));
 
@@ -4982,7 +5060,8 @@ async fn probe_with(
             }
             let mut info = ProbeInfo::describe(url, &[&plain]);
             info.size = content_length(plain.headers());
-            let body = if prefetch { body(plain, whole_file(info.size)) } else { None };
+            let end = info.size.unwrap_or(0).saturating_sub(1);
+            let body = if prefetch { body(plain, whole_file(info.size), end) } else { None };
             return Ok((info, body));
         }
     };
@@ -4994,11 +5073,14 @@ async fn probe_with(
     // taken for quicker than it is gets its requests taken over and split before they can answer.
     info.answer_time = setup;
     let content_range = get.headers().get(CONTENT_RANGE).and_then(|v| v.to_str().ok());
+    // The last byte the answer brings, when it is ranged.
+    let mut end = asked - 1;
     let holds = match get.status() {
         StatusCode::PARTIAL_CONTENT => match content_range.map(ByteRange::parse_content_range_cut) {
             Some(Ok((range, Some(total)))) if range.start == 0 => {
                 info.accepts_ranges = true;
                 info.size = Some(total);
+                end = range.end;
                 Some(Holds::Start(range.len().min(PREFETCH)))
             }
             // `bytes 0-0/*`: the length is unknown, so only a single stream can fetch the file.
@@ -5007,7 +5089,16 @@ async fn probe_with(
         },
         StatusCode::OK => {
             info.size = content_length(get.headers());
-            Some(whole_file(info.size))
+            end = info.size.map_or(end, |size| size.saturating_sub(1));
+            match info.size.filter(|&size| size > 0) {
+                // A server may answer a range that is the whole file with all of it, as it is:
+                // its host took ranges before, so the answer goes on as one for the whole file.
+                Some(size) if ask == Ask::Stream && hosts::profile(get.url()).accepts_ranges == Some(true) => {
+                    info.accepts_ranges = true;
+                    Some(Holds::Start(size.min(PREFETCH)))
+                }
+                _ => Some(whole_file(info.size)),
+            }
         }
         // Only an empty file cannot satisfy a range from byte 0.
         _ => {
@@ -5041,7 +5132,7 @@ async fn probe_with(
     // A stream that cannot resume goes by no validator.
     let body = holds
         .filter(|holds| prefetch && (own_validators || matches!(holds, Holds::Whole)))
-        .and_then(|holds| body(get, holds));
+        .and_then(|holds| body(get, holds, end));
     Ok((info, body))
 }
 
@@ -5329,20 +5420,24 @@ struct Prefix {
     bytes: Bytes,
     /// The connection's rate, as watched while reading.
     watch: Option<RateWatch>,
-    /// Whether reading stopped by choice, for a capped connection or at the deadline, while the
-    /// body is still coming: the rest of it can go on as the download's first chunk.
+    /// Whether reading stopped by choice, for a capped connection, at the deadline or with all it
+    /// was to read of an answer that brings more, while the body is still coming: the rest of it
+    /// can go on as the download's first chunk.
     live: bool,
 }
 
 /// Reads up to `len` bytes of a probe's body until `deadline`, giving up after `stall` without
-/// data. Whatever arrived is kept, even if the body ends early.
+/// data. Whatever arrived is kept, even if the body ends early, and past `len` up to `most`, the
+/// bytes the answer brings: the rest of a body that goes on starts where the read stopped.
 ///
 /// With `watch`, the connection's rate is watched for a cap (see `RateWatch`). Reading stops at
 /// one if the rest would take over two setup times: workers fetch it in parallel sooner, with this
 /// connection as one of them.
+#[allow(clippy::too_many_arguments)]
 async fn read_prefix(
     response: &mut Response,
     len: u64,
+    most: u64,
     deadline: Option<tokio::time::Instant>,
     mut watch: Option<RateWatch>,
     stall: Duration,
@@ -5364,7 +5459,7 @@ async fn read_prefix(
                 if let Some(limiter) = limiter {
                     limiter.acquire(bytes.len() as u64).await;
                 }
-                let take = bytes.len().min(len as usize - kept.len());
+                let take = bytes.len().min(most.max(len).saturating_sub(kept.len() as u64) as usize);
                 kept.extend_from_slice(&bytes[..take]);
                 last_byte_at = tokio::time::Instant::now();
                 if let Some(watch) = &mut watch {
@@ -5387,13 +5482,15 @@ async fn read_prefix(
             }
         }
         if let Some(watch) = &watch {
-            let rest = (len - kept.len() as u64) as f64;
+            let rest = len.saturating_sub(kept.len() as u64) as f64;
             if watch.capped_at.is_some_and(|rate| rest > 2.0 * rate * watch.pace.setup.as_secs_f64()) {
                 live = true;
                 break;
             }
         }
     }
+    // Or it read all it was to of an answer that brings more.
+    let live = live || ((kept.len() as u64) >= len && (kept.len() as u64) < most);
     Prefix { bytes: kept.into(), watch, live }
 }
 
@@ -5418,7 +5515,7 @@ async fn take_start(
     limiter: Option<&RateLimiter>,
     stall: Duration,
 ) -> Option<Live> {
-    let ProbeBody { mut response, slot, holds, answered, setup } = body;
+    let ProbeBody { mut response, slot, holds, end, answered, setup } = body;
     let len = match holds {
         Holds::Start(len) => len,
         Holds::Whole => return Some(Live::Stream { response, slot }),
@@ -5435,7 +5532,7 @@ async fn take_start(
         let whole_soon = info.size == Some(len) && per_setup.is_some_and(|bytes| len <= bytes.saturating_mul(2));
         if !whole_soon {
             info.per_setup = per_setup;
-            return Some(Live::Range { response, slot, end: len.saturating_sub(1), watch: None });
+            return Some(Live::Range { response, slot, end, watch: None, since: answered });
         }
     }
     // A speed limit would make every connection look capped.
@@ -5444,21 +5541,27 @@ async fn take_start(
         .map(|setup| RateWatch::new(Pace { answered, setup }));
     // A web page's start may yet show it is a file (see `probe_all`), so that is read. A resumed
     // download with less than this left may start fewer connections than a measured cap would
-    // give it; not worth holding every large download up for.
-    let maxed = info.size.is_some_and(|size| size.saturating_sub(len) >= connections as u64 * BYTES_PER_CONNECTION);
+    // give it; not worth holding every large download up for. The download's first stream (an
+    // answer that goes on past its start) waits for no other connection, unless its host's
+    // recipe says how many it takes (see `fetch_ranges`).
+    let left = info.size.map_or(0, |size| size.saturating_sub(len));
+    let maxed = match end >= len {
+        true => hosts::best_connections(&info.final_url).is_some_and(|best| best > 1 && left >= best as u64 * BYTES_PER_CONNECTION),
+        false => left >= connections as u64 * BYTES_PER_CONNECTION,
+    };
     if splits && maxed && !crate::resolver::html_type(&info.headers) {
-        return Some(Live::Range { response, slot, end: len.saturating_sub(1), watch });
+        return Some(Live::Range { response, slot, end, watch, since: answered });
     }
     // Only the start of a larger file keeps workers waiting.
     let deadline = (info.size != Some(len)).then(|| tokio::time::Instant::now() + PREFETCH_TIME);
-    let prefix = read_prefix(&mut response, len, deadline, watch, stall, limiter).await;
+    let prefix = read_prefix(&mut response, len, end.saturating_add(1), deadline, watch, stall, limiter).await;
     info.prefetch = prefix.bytes;
     info.per_setup = bytes_per_setup(prefix.watch.as_ref().and_then(|watch| watch.capped_at), setup);
     let mut watch = prefix.watch;
     if watch.as_ref().is_some_and(|watch| watch.record(&info.final_url)) {
         watch = None;
     }
-    prefix.live.then(|| Live::Range { response, slot, end: len.saturating_sub(1), watch })
+    prefix.live.then(|| Live::Range { response, slot, end, watch, since: answered })
 }
 
 /// Bytes a connection at `rate` carries in the time `setup` another needs to start.
@@ -6705,7 +6808,7 @@ mod tests {
     /// Reads all of `body` as a probe whose answer took 40 ms, so its rate ticks every 20 ms.
     async fn read_paced(body: &mut Response, len: u64, paced_read: bool) -> Prefix {
         let pace = Pace { answered: tokio::time::Instant::now(), setup: Duration::from_millis(40) };
-        read_prefix(body, len, None, paced_read.then(|| RateWatch::new(pace)), Duration::from_secs(1), None).await
+        read_prefix(body, len, len, None, paced_read.then(|| RateWatch::new(pace)), Duration::from_secs(1), None).await
     }
 
     /// What a read's connection told of its host.
@@ -6834,7 +6937,7 @@ mod tests {
         // 8 KiB per 10 ms, and 95 ms to read it: the rest of the answer goes on with the workers.
         let mut body = paced(std::iter::repeat_n((10, 8 * 1024), 32).collect());
         let deadline = tokio::time::Instant::now() + Duration::from_millis(95);
-        let prefix = read_prefix(&mut body, 256 * 1024, Some(deadline), None, Duration::from_secs(1), None).await;
+        let prefix = read_prefix(&mut body, 256 * 1024, 256 * 1024, Some(deadline), None, Duration::from_secs(1), None).await;
         assert!(prefix.live && prefix.watch.is_none());
         assert_eq!(prefix.bytes.len(), 72 * 1024);
         assert_eq!(rest_of(body).await, 184 * 1024);
@@ -6857,7 +6960,7 @@ mod tests {
     /// from `url`, whose request waited `setup` for them.
     fn probe_body(url: &Url, body: Response, len: u64, setup: Duration) -> ProbeBody {
         let slot = hosts::try_acquire(url, 0).unwrap();
-        ProbeBody { response: body, slot, holds: Holds::Start(len), answered: tokio::time::Instant::now(), setup: Some(setup) }
+        ProbeBody { response: body, slot, holds: Holds::Start(len), end: len - 1, answered: tokio::time::Instant::now(), setup: Some(setup) }
     }
 
     #[tokio::test(start_paused = true)]
@@ -6946,6 +7049,43 @@ mod tests {
             take_start(&mut info, body, 8, None, stall).await;
             assert!(!info.prefetch.is_empty(), "{}", info.url);
         }
+    }
+
+    /// The download's first stream, an answer that brings the file to its end: its start is read
+    /// as any probe's, with not a byte of the piece that went past it lost, and it goes on from
+    /// there to the end; unless the host's recipe has more connections, which start at once.
+    #[tokio::test(start_paused = true)]
+    async fn test_the_first_stream_goes_on_from_where_its_start_was_read() {
+        let stall = Duration::from_secs(1);
+        let size = 3 * PREFETCH + 5;
+        // Pieces of 300 KiB: the fourth goes past the start.
+        let pieces = || paced(std::iter::repeat_n((10, 300 * 1024), 10).chain([(10, 73_733)]).collect());
+        // No rate is watched for: the read stops for having read the start alone.
+        let stream = |info: &ProbeInfo| {
+            let mut body = probe_body(&info.final_url, pieces(), PREFETCH, Duration::from_millis(40));
+            (body.end, body.setup) = (size - 1, None);
+            body
+        };
+        let url = Url::parse("http://first-stream.engine.invalid/f").unwrap();
+        let mut info = probed(url.as_str(), size);
+        let body = stream(&info);
+        let Some(Live::Range { response, end, .. }) = take_start(&mut info, body, 8, None, stall).await else {
+            panic!("the stream goes on");
+        };
+        assert_eq!((info.prefetch.len(), end), (4 * 300 * 1024, size - 1));
+        assert_eq!((info.prefetch.len() + rest_of(response).await) as u64, size);
+
+        // Its host was fastest with two connections, which the 2 MiB left gives a MiB each: they
+        // start at once.
+        let url = Url::parse("http://first-stream-remembered.engine.invalid/f").unwrap();
+        hosts::record_settled(&url, 2, None);
+        let mut info = probed(url.as_str(), size);
+        let body = stream(&info);
+        let Some(Live::Range { response, end, .. }) = take_start(&mut info, body, 8, None, stall).await else {
+            panic!("the stream goes on");
+        };
+        assert_eq!((info.prefetch.len(), end), (0, size - 1));
+        assert_eq!(rest_of(response).await as u64, size);
     }
 
     #[tokio::test(start_paused = true)]
@@ -9755,7 +9895,84 @@ mod tests {
         assert!(std::fs::read(path).unwrap() == crate::netsim::file(size));
         let after = seen();
         assert_eq!(after.1, before.1, "refused nothing: {after:?} after {before:?}");
-        assert!(after.0 - before.0 <= 2, "{} requests", after.0 - before.0);
+        assert_eq!(after.0 - before.0, 1, "the file alone, in one request");
+    }
+
+    /// The (GETs, HEADs) a server saw.
+    fn asked(stats: &crate::netsim::Stats) -> (usize, usize) {
+        (stats.gets.load(Ordering::SeqCst), stats.heads.load(Ordering::SeqCst))
+    }
+
+    /// With the Autopilot, the download's first request is the one a single-stream tool sends, the
+    /// file from its start to its end, and nothing else goes to the host while that stream shows
+    /// what it does. A file that one stream brings before more connections could pay for
+    /// themselves takes that one request, no HEAD beside it: one that comes at once, and one that
+    /// takes a second and a half from a host known not to hold each connection to a speed (here
+    /// it holds each user to 2 MB/s, where more would gain nothing anyway).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_file_one_stream_brings_soon_takes_one_request() {
+        for (size, per_client) in [(4 * 1024 * 1024, None), (3_000_000, Some(2e6))] {
+            let (url, stats) = crate::netsim::serve(crate::netsim::Server { size, per_client, ..Default::default() }).await;
+            hosts::record(&url, HostProfile { capped_per_connection: Some(false), ..Default::default() });
+            let dir = tempdir().unwrap();
+            let (got, said) = fetch_from_sim(&url, sim_options(dir.path(), 16, true)).await;
+            assert!(got == crate::netsim::file(size));
+            assert_eq!(asked(&stats), (1, 0), "{size} bytes: {said:?}");
+        }
+    }
+
+    /// A host that holds each connection to 2 MB/s: once the stream shows that, or at once when an
+    /// earlier download found it, more connections open, as many as fill the line: 8 MiB in well
+    /// under the 4 s the one stream would take. One whose host was fastest with three starts those
+    /// at once. Neither asks HEAD.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_stream_more_connections_pay_for_widens() {
+        let size = 8 * 1024 * 1024;
+        for remembered in [None, Some(3)] {
+            let server = crate::netsim::Server { size, per_connection: Some(2e6), ..Default::default() };
+            let (url, stats) = crate::netsim::serve(server).await;
+            if let Some(best) = remembered {
+                hosts::record_settled(&url, best, None);
+            }
+            let dir = tempdir().unwrap();
+            let started = Instant::now();
+            let (got, said) = fetch_from_sim(&url, sim_options(dir.path(), 16, true)).await;
+            let took = started.elapsed();
+            assert!(got == crate::netsim::file(size));
+            assert!(took < Duration::from_secs(3), "{remembered:?}: {took:?}, {said:?}");
+            assert!(stats.peak.load(Ordering::SeqCst) >= 3, "{remembered:?}: {said:?}");
+            assert_eq!(asked(&stats).1, 0);
+        }
+    }
+
+    /// What the user set keeps the download as it was: with the Autopilot off, or under a speed
+    /// limit, the probe asks for the file's start alone, and other requests the rest.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_what_the_user_set_keeps_the_first_request_as_it_was() {
+        let size = 4 * 1024 * 1024;
+        let (off, limited) = (tempdir().unwrap(), tempdir().unwrap());
+        for options in [sim_options(off.path(), 16, false), DownloadOptions { max_speed: Some(100_000_000), ..sim_options(limited.path(), 16, true) }] {
+            let (url, stats) = crate::netsim::serve(crate::netsim::Server { size, ..Default::default() }).await;
+            let (got, _) = fetch_from_sim(&url, options).await;
+            assert!(got == crate::netsim::file(size));
+            assert!(asked(&stats).0 > 1, "{:?}", asked(&stats));
+        }
+    }
+
+    /// Of several links, only the first's request is the stream: each other's probe is a GET for
+    /// one byte, which tells whether it serves the same file, and no HEAD goes anywhere.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_only_the_first_link_is_asked_for_the_stream() {
+        let size = 2 * 1024 * 1024;
+        let (first, at_first) = crate::netsim::serve(crate::netsim::Server { size, ..Default::default() }).await;
+        let (other, at_other) = crate::netsim::serve(crate::netsim::Server { size, ..Default::default() }).await;
+        let dir = tempdir().unwrap();
+        let options = DownloadOptions { remote_checksum: false, ..sim_options(dir.path(), 16, true) };
+        let engine = DownloadEngine::new(vec![first, other], options);
+        let path = tokio::time::timeout(Duration::from_secs(60), engine.run(None)).await.expect("finished in a minute").unwrap();
+        assert!(std::fs::read(path).unwrap() == crate::netsim::file(size));
+        assert_eq!((asked(&at_first), asked(&at_other)), ((1, 0), (1, 0)));
+        assert_eq!(at_other.served.load(Ordering::SeqCst), 1);
     }
 
     /// Time and requests for a 32 MiB file from a host that keeps a budget of requests (4 at
@@ -10154,7 +10371,7 @@ mod tests {
         let client = Client::new();
         let probe = |path: &str| {
             let (client, url) = (client.clone(), base.join(path).unwrap());
-            async move { probe_url(&client, None, &url, false, true, 0, true).await.unwrap().0 }
+            async move { probe_url(&client, None, &url, Ask::Byte, true, 0, true).await.unwrap().0 }
         };
         // Chunk requests skip the redirect the probe went through: its wait overstates theirs, but
         // unlike an assumed one never makes a slow target look quick. What a new connection to the
@@ -10179,13 +10396,13 @@ mod tests {
         // One request to the host at a time, which the ranged GET holds: HEAD has no slot. A GET
         // naming the file without a validator would otherwise leave HEAD its grace.
         let started = std::time::Instant::now();
-        let (info, _) = probe_url(&client, None, &base.join("untagged/f.bin").unwrap(), false, true, 1, true).await.unwrap();
+        let (info, _) = probe_url(&client, None, &base.join("untagged/f.bin").unwrap(), Ask::Byte, true, 1, true).await.unwrap();
         assert!(started.elapsed() < HEAD_GRACE, "HEAD was waited for: {:?}", started.elapsed());
         assert_eq!((info.size, info.accepts_ranges, info.etag), (Some(4096), true, None));
         // A GET refused on every try leaves nothing to read: HEAD goes out after it, under its
         // slot, and says what the file is.
         let refused = base.join("refused/f.bin").unwrap();
-        let (info, body) = probe_url(&client, None, &refused, true, true, 1, true).await.expect("HEAD answers for the refused GET");
+        let (info, body) = probe_url(&client, None, &refused, Ask::Start, true, 1, true).await.expect("HEAD answers for the refused GET");
         assert_eq!((info.size, info.accepts_ranges, info.etag.as_deref()), (Some(4096), true, Some("\"v1\"")));
         assert!(body.is_none());
     }
@@ -10199,12 +10416,12 @@ mod tests {
         let client = Client::new();
         let (url, stats) = crate::netsim::serve(crate::netsim::Server { size: 4096, ..Default::default() }).await;
         hosts::acquire(&url, 0).await.throttled(Duration::ZERO);
-        let (info, _) = probe_url(&client, None, &url, false, true, 0, true).await.unwrap();
+        let (info, _) = probe_url(&client, None, &url, Ask::Byte, true, 0, true).await.unwrap();
         assert_eq!((info.size, info.accepts_ranges, info.etag.as_deref()), (Some(4096), true, Some("\"v1\"")));
         assert_eq!(stats.heads.load(Ordering::SeqCst), 0, "the ranged GET said it all");
         let base = file_server(vec![7u8; 4096], Duration::ZERO).await;
         hosts::acquire(&base, 0).await.throttled(Duration::ZERO);
-        let (info, _) = probe_url(&client, None, &base.join("untagged/f.bin").unwrap(), false, true, 0, true).await.unwrap();
+        let (info, _) = probe_url(&client, None, &base.join("untagged/f.bin").unwrap(), Ask::Byte, true, 0, true).await.unwrap();
         assert_eq!(info.etag.as_deref(), Some("\"v1\""), "HEAD's");
     }
 
@@ -10275,14 +10492,14 @@ mod tests {
         let client = Client::new();
         // Nothing went to the host before: the probe's connection is new, and its wait what a
         // new one needs.
-        let (probe, _) = probe_url(&client, None, &url, false, true, 0, true).await.unwrap();
+        let (probe, _) = probe_url(&client, None, &url, Ask::Byte, true, 0, true).await.unwrap();
         let seen = hosts::profile(&url);
         assert_eq!(seen.accepts_ranges, Some(true));
         assert!(seen.setup_time.is_some() && seen.setup_time == probe.answer_time, "{seen:?}");
         // Right after, a connection may be open for reuse: the next probe's wait tells nothing.
         let cold = Duration::from_secs(7);
         hosts::record(&url, HostProfile { setup_time: Some(cold), ..Default::default() });
-        probe_url(&client, None, &url, false, true, 0, true).await.unwrap();
+        probe_url(&client, None, &url, Ask::Byte, true, 0, true).await.unwrap();
         assert_eq!(hosts::profile(&url).setup_time, Some(cold));
     }
 
@@ -10314,7 +10531,7 @@ mod tests {
         let client = build_client_with_proxy(&DownloadOptions::default(), None).unwrap();
         let probe = |url: Url, as_app: bool| {
             let client = client.clone();
-            async move { tokio::time::timeout(Duration::from_secs(60), probe_url(&client, None, &url, false, true, 0, as_app)).await.expect("the probe ends") }
+            async move { tokio::time::timeout(Duration::from_secs(60), probe_url(&client, None, &url, Ask::Byte, true, 0, as_app)).await.expect("the probe ends") }
         };
         let picky = server(true).await;
         let (info, _) = probe(picky.clone(), true).await.expect("the app's own agent is answered");
