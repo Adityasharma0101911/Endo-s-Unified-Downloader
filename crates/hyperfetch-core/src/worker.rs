@@ -662,6 +662,7 @@ impl HttpWorker {
                 _ = crate::network::back(url) => {}
             }
         }
+        going
     }
 
     /// A slot on the host of a mirror that can take another connection: the best such mirror
