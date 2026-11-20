@@ -755,7 +755,7 @@ impl HttpWorker {
         let (url, if_range, redirected) = (mirror.url.clone(), mirror.if_range.clone(), mirror.fallback.is_some());
         // A host that refused a request lately limits how often it is asked: a running chunk is
         // not split into another request to it.
-        let splits = !hosts::refused_lately(&url);
+        let splits = !hosts::limits_requests(&url);
         let job = {
             let mut mgr = s.chunks.lock();
             let taken = mgr.get_next_work(self.worker_id, mirror_id).or_else(|| {

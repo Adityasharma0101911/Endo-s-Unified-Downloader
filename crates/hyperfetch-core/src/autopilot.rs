@@ -39,6 +39,9 @@ pub(crate) struct Start {
     pub limit: Option<f64>,
     /// The user's line speed, once known (see `hosts::line`).
     pub line: Option<f64>,
+    /// The host limits how often it is asked (see `hosts::limits_requests`): one connection, and
+    /// no more are tried.
+    pub limited: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -54,6 +57,7 @@ enum Why {
     /// It fills the user's line, at this speed.
     Line(f64),
     Short,
+    Limited,
 }
 
 #[derive(Debug)]
@@ -87,7 +91,7 @@ pub(crate) struct Autopilot {
 
 impl Autopilot {
     pub(crate) fn new(width: usize, max: usize, start: Start, now: Instant, downloaded: u64) -> Self {
-        let max = max.max(1);
+        let max = if start.limited { 1 } else { max.max(1) };
         let width = width.clamp(1, max);
         Self {
             width,
@@ -100,9 +104,13 @@ impl Autopilot {
             holding: None,
             climbed: false,
             cap: None,
-            done: false,
+            done: start.limited,
             settled: None,
-            why: if start.remembered { Why::Remembered } else { Why::Starting },
+            why: match start {
+                Start { limited: true, .. } => Why::Limited,
+                Start { remembered: true, .. } => Why::Remembered,
+                _ => Why::Starting,
+            },
             best: 0.0,
         }
     }
@@ -267,6 +275,7 @@ impl Autopilot {
             Why::Flat(speed) => format!("{c}: the server or your line holds it to about {}, so more would not help", per_sec(speed)),
             Why::Line(speed) => format!("{c}: that fills your line (about {})", per_sec(speed)),
             Why::Short => format!("{c}: too little is left to try more"),
+            Why::Limited => format!("{c}: the server limits how often it is asked (429/503), so it is asked for the file alone"),
         }
     }
 }

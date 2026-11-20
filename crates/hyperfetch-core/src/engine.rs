@@ -2997,15 +2997,20 @@ impl DownloadEngine {
         let adapts = self.options.adaptive && self.limiter.is_none();
         let best = hosts::best_connections(&reference.final_url).filter(|&best| adapts && remaining >= best as u64 * BYTES_PER_CONNECTION);
         let known = hosts::profile(&reference.final_url);
+        // A host that limits how often it is asked, this run or an earlier one found, is asked
+        // for the file alone, over one connection (see `hosts::limits_requests`); unless other
+        // mirrors share the work.
+        let limited = adapts && late.is_none() && mirrors.len() == 1 && hosts::limits_requests(&reference.final_url);
         let start = autopilot::Start {
             remembered: best.is_some(),
             rate: known.connection_rate.filter(|_| known.capped_per_connection == Some(true)),
             limit: hosts::limit(&reference.final_url),
             line: hosts::line(),
+            limited,
         };
         let counted = remaining.div_ceil(per_connection);
         let counted = if adapts && start.rate.is_none() { counted.min(AUTOPILOT_START as u64) } else { counted };
-        let num_workers = best.map_or(counted, |best| best as u64).clamp(1, max_workers) as usize;
+        let num_workers = if limited { 1 } else { best.map_or(counted, |best| best as u64).clamp(1, max_workers) as usize };
         // The site's checksum, when known by now, is hashed as the file arrives as the user's is;
         // one found later from then on (see `crate::digest::found`). Only the user's keeps chunks
         // small for it: a server's header checksum on a large file would cost many more requests.
@@ -3220,7 +3225,7 @@ impl DownloadEngine {
                         // Workers past a lower width hand back what they have yet to receive, but
                         // not to a host that refused a request lately: it limits how often it is
                         // asked, and what they already have it send they finish.
-                        if width.swap(next, Ordering::Relaxed) > next && (by_user || !job.refused_lately()) {
+                        if width.swap(next, Ordering::Relaxed) > next && (by_user || !job.limits_requests()) {
                             job.chunks.lock().give_back(next);
                         }
                         if let Some(shared) = &spare {
@@ -4369,9 +4374,9 @@ impl RangeJob {
         }
     }
 
-    /// Whether a host the download asks refused a request lately (see `hosts::refused_lately`).
-    fn refused_lately(&self) -> bool {
-        self.mirrors.lock().mirrors().iter().any(|m| m.is_active && hosts::refused_lately(&m.url))
+    /// Whether a host the download asks limits how often it is asked (see `hosts::limits_requests`).
+    fn limits_requests(&self) -> bool {
+        self.mirrors.lock().mirrors().iter().any(|m| m.is_active && hosts::limits_requests(&m.url))
     }
 
     /// The width `pilot` moves an adaptive download to, if it moves (see [`Autopilot::next`]);
@@ -4835,7 +4840,7 @@ async fn probe_with(
     };
     // A host that refused a request lately limits how often it is asked: HEAD goes to it only after
     // the GET, for what that answer left out. Without `head`, HEAD goes out only as the last resort.
-    let lean = hosts::refused_lately(url);
+    let lean = hosts::limits_requests(url);
     let head_slot = if head && !lean { hosts::try_acquire(url, limit) } else { None };
     let alongside = head_slot.is_some();
     let head_alongside = async {
@@ -5026,6 +5031,9 @@ async fn probe_with(
     };
     let setup_time = info.answer_time.filter(|_| cold && info.final_url == *url);
     hosts::record(get.url(), HostProfile { accepts_ranges: ranges, setup_time, ..Default::default() });
+    if get.version() == reqwest::Version::HTTP_2 {
+        hosts::record_h2(get.url());
+    }
 
     let own = |name: HeaderName| get.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_string);
     let own_validators =
@@ -9722,6 +9730,32 @@ mod tests {
         assert!(got == crate::netsim::file(size));
         let (asked, refused) = (stats.asked.load(Ordering::SeqCst), stats.throttled.load(Ordering::SeqCst));
         assert!(asked <= 16, "{asked} requests, {refused} refused");
+    }
+
+    /// What a host that keeps a budget of requests showed is kept for the next run: after a
+    /// restart, the next download from it, looking for the site's checksum files too, asks it
+    /// for the file alone, and is refused nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_host_that_refused_is_asked_little_after_a_restart_too() {
+        let size = 8 * 1024 * 1024;
+        let budget = crate::netsim::Budget { burst: 4, every: Duration::from_millis(250), retry_after: 1 };
+        let (url, stats) = crate::netsim::serve(crate::netsim::Server { size, per_client: Some(4e6), budget: Some(budget), ..Default::default() }).await;
+        let dir = tempdir().unwrap();
+        let (got, _) = fetch_from_sim(&url, sim_options(dir.path(), 16, true)).await;
+        assert!(got == crate::netsim::file(size));
+        let seen = || (stats.asked.load(Ordering::SeqCst), stats.throttled.load(Ordering::SeqCst));
+        assert!(seen().1 > 0, "the first download found the budget");
+        hosts::forget_run(&url);
+        // The budget fills again meanwhile.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let before = seen();
+        let again = tempdir().unwrap();
+        let engine = DownloadEngine::new(vec![url.clone()], sim_options(again.path(), 16, true));
+        let path = tokio::time::timeout(Duration::from_secs(60), engine.run(None)).await.expect("finished in a minute").unwrap();
+        assert!(std::fs::read(path).unwrap() == crate::netsim::file(size));
+        let after = seen();
+        assert_eq!(after.1, before.1, "refused nothing: {after:?} after {before:?}");
+        assert!(after.0 - before.0 <= 2, "{} requests", after.0 - before.0);
     }
 
     /// Time and requests for a 32 MiB file from a host that keeps a budget of requests (4 at
