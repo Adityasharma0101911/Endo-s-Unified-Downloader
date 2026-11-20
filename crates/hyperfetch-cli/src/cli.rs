@@ -206,7 +206,8 @@ pub struct Args {
     #[arg(long = "connect-timeout", value_name = "SECS", default_value_t = DownloadOptions::default().connect_timeout_secs, value_parser = clap::value_parser!(u64).range(1..=3600))]
     pub connect_timeout: u64,
 
-    /// Connect directly, ignoring the proxy variables of the environment
+    /// Connect directly, ignoring the proxy variables of the environment and the system's proxy
+    /// settings
     #[arg(long = "no-proxy", conflicts_with_all = ["proxy", "proxy_pool", "proxies_file"])]
     pub no_proxy: bool,
 

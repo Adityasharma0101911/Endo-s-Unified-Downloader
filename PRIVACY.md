@@ -51,6 +51,8 @@ Your keys, passwords and that code are saved only on your computer. They are nev
 
 The notifications the app shows when downloads end (on by default) name a download and its folder, or why it failed, on this computer only: on Windows as toasts, for which the app registers its name and logo for your user (`HKCU\Software\Classes\AppUserModelId\EndosUnifiedDownloader`, the logo saved as `notification-icon.png` in its data folder); on macOS through `osascript`; on Linux through the desktop's notification server, over D-Bus.
 
+When neither the app nor the environment names a proxy, the app reads the proxy this computer's settings name as it starts (on Windows from `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings`, on macOS with `scutil --proxy`, on Linux with `gsettings` or from KDE's `kioslaverc`), only reading them, and sends downloads through it, as it would through one you set; that proxy then sees what any proxy sees. It is kept nowhere: the setting "Use the system's proxy" turns it off.
+
 To wait for a network that went away rather than fail a download, the app asks the system, never another host, whether this computer has a network and the internet: on Windows its connectivity hint (no network, a local network only, or the internet), which also tells the app when that changes; on macOS and Linux whether a network interface is up with a gateway or an address. To hold queued downloads on a metered connection, it asks the system whether the connection is metered: on Windows the same hint, on Linux NetworkManager (with `busctl`). Nothing of it is stored or sent anywhere.
 
 ## Deleting your data

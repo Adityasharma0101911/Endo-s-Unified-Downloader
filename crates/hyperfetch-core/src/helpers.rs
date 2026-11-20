@@ -201,7 +201,7 @@ impl<'a> Proxy<'a> {
             return Err(format!("{tool} cannot go through a proxy: turn the proxy off for it"));
         }
         if !takes_proxy && !self.direct && env {
-            return Err(format!("{tool} cannot go through a proxy, and one is set in the environment (http_proxy or the like): unset it, or choose no proxy, for it"));
+            return Err(format!("{tool} cannot go through a proxy, and one is set in the environment (http_proxy or the like) or the system's settings: unset it, or choose no proxy, for it"));
         }
         Ok(())
     }

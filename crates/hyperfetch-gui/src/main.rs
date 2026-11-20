@@ -2981,6 +2981,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::set_var("ENDO_HISTORY_PATH", dir.join("history.json"));
         std::env::set_var("ENDO_ARCHIVE_PATH", dir.join("download-archive.txt"));
     }
+    // The system's proxy, for downloads when neither the settings nor the environment name one;
+    // into the environment, before any thread starts.
+    hyperfetch_core::sysproxy::start(Settings::load().system_proxy);
     let data = settings::data_dir();
     // What hosts were seen to do (the connections each went fastest with, a cap), from earlier runs.
     hyperfetch_core::hosts::keep_in(data.join("hosts.json"));

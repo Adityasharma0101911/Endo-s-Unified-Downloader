@@ -563,10 +563,30 @@ fn speed_settings(s: &mut Settings, ui: &mut Ui) {
 }
 
 /// Which way connections go: proxies, the IP version, timeouts and the user agent.
+/// What the system's proxy switch says: which proxy downloads take now, as the app found it when
+/// it started.
+fn system_proxy_about(s: &Settings, seen: Option<&hyperfetch_core::sysproxy::Seen>) -> String {
+    use hyperfetch_core::sysproxy::{describe, System};
+    let now = match seen {
+        _ if !s.proxy.trim().is_empty() || !s.proxy_pool.trim().is_empty() => "the Proxy above".to_string(),
+        Some(seen) if seen.in_env => "the environment's (http_proxy or the like)".to_string(),
+        Some(seen) => match &seen.system {
+            System::Proxy { from, .. } if seen.taken => format!("{} (from the {from} settings)", describe(&seen.system)),
+            System::Proxy { from, .. } => format!("none, connections go direct; the {from} settings name {}", describe(&seen.system)),
+            System::Script { url, from } => format!("none, connections go direct: the {from} settings use a setup script (PAC), {url}, which the app does not run"),
+            System::None => "none, connections go direct".to_string(),
+        },
+        None => "none, connections go direct".to_string(),
+    };
+    format!("When neither the Proxy above nor the environment names one, the proxy this computer's settings name. In use: {now}. A change applies from the next start.")
+}
+
 fn network_settings(s: &mut Settings, ui: &mut Ui) {
     text_setting(ui, "Proxy", "Every connection goes through it.", &mut s.proxy, "http://127.0.0.1:8080 or socks5://127.0.0.1:1080", false);
     let about = "Several proxies, comma-separated; connections take turns over them.";
     text_setting(ui, "Proxy pool", about, &mut s.proxy_pool, "http://p1:8080, http://p2:8080", false);
+    let about = system_proxy_about(s, hyperfetch_core::sysproxy::seen());
+    switch(ui, "Use the system's proxy", &about, &mut s.system_proxy);
     let about = "Connect over IPv4 or IPv6 only, or whichever works (Any). Videos yt-dlp fetches take either.";
     setting(ui, "IP version", about, s.ip_family, |ui| {
         for (value, name) in [(IpFamily::V6, "IPv6"), (IpFamily::V4, "IPv4"), (IpFamily::Any, "Any")] {
@@ -1168,6 +1188,24 @@ mod tests {
             switch(&mut h, "Wait on a metered connection");
             assert!(!h.app.settings.hold_metered);
         }
+    }
+
+    /// The system's proxy switch says which proxy downloads take: the setting's, the
+    /// environment's, the system's taken at start, or none, with why.
+    #[test]
+    fn the_system_proxy_switch_says_which_proxy_is_in_use() {
+        use hyperfetch_core::sysproxy::{Seen, System};
+        let windows = hyperfetch_core::sysproxy::from_windows(true, Some("p.example:8080"), None, None);
+        let about = |s: &Settings, system: &System, in_env, taken| system_proxy_about(s, Some(&Seen { system: system.clone(), in_env, taken }));
+        let s = Settings::default();
+        assert!(about(&s, &windows, false, true).contains("In use: http://p.example:8080 (from the Windows settings)."));
+        assert!(about(&s, &windows, false, false).contains("In use: none, connections go direct; the Windows settings name http://p.example:8080."));
+        assert!(about(&s, &System::None, true, false).contains("In use: the environment's"));
+        let script = System::Script { url: "http://w.example/p.pac".into(), from: "macOS" };
+        assert!(about(&s, &script, false, false).contains("setup script (PAC), http://w.example/p.pac, which the app does not run"));
+        let own = Settings { proxy: "socks5://127.0.0.1:1080".into(), ..Settings::default() };
+        assert!(about(&own, &windows, false, true).contains("In use: the Proxy above."));
+        assert!(Settings::default().system_proxy, "on by default");
     }
 
     /// Downloads that end while the window is not in front are told through the app's sender:

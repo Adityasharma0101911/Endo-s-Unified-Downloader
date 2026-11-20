@@ -49,6 +49,7 @@ pub mod delta;
 pub mod sigv4;
 pub mod sniff;
 pub mod stream;
+pub mod sysproxy;
 pub mod dash;
 pub mod subs;
 pub mod decrypt;

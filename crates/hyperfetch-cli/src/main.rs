@@ -86,6 +86,11 @@ fn run_cli() -> i32 {
         clap_complete::generate(shell, &mut Args::command(), name.into_owned(), &mut std::io::stdout());
         return 0;
     }
+    // The system's proxy, when the environment names none (--proxy still wins): into the
+    // environment, before the runtime's threads start.
+    if !args.no_proxy {
+        hyperfetch_core::sysproxy::start(true);
+    }
     let ran = match args.command {
         Some(command) => run_detached(tools::execute_subcommand(command, args.proxy.clone(), args.proxy_pool.is_some() || args.proxies_file.is_some(), args.no_proxy)),
         None => run_detached(app(args)),
