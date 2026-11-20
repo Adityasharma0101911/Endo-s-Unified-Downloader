@@ -74,6 +74,8 @@ pub struct Settings {
     pub welcomed: bool,
     pub auto_run_queue: bool,
     pub max_concurrent: usize,
+    /// More downloads than `max_concurrent` run while the line has room (see `crate::widen`).
+    pub more_at_once: bool,
     /// The user's Google API key, for listing whole Google Drive folders (empty = none). Never
     /// saved: [`Settings::load`] takes it from [`GOOGLE_API_KEY_VAR`], and one an older version
     /// saved is read and left out of the file the next time the settings are saved.
@@ -314,6 +316,7 @@ impl Default for Settings {
             welcomed: false,
             auto_run_queue: true,
             max_concurrent: 4,
+            more_at_once: true,
             google_api_key: String::new(),
             only_new: true,
             latest: 0,

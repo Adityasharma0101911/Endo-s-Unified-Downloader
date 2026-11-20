@@ -537,6 +537,10 @@ fn speed_settings(s: &mut Settings, ui: &mut Ui) {
     setting(ui, "Connections per server", "All running downloads together, to one server (0 = no limit).", s.max_connections_per_host, |ui| {
         ui.add(egui::DragValue::new(&mut s.max_connections_per_host).range(0..=256));
     });
+    let about = "While the downloads running take under half of what your line was seen to carry (servers that each cap \
+                 their speed leave it so) and more wait, one more than \"Downloads at once\" starts, another 15 s later, \
+                 3 more at most; none more once the line is full.";
+    switch(ui, "More at once while the line has room", about, &mut s.more_at_once);
     let about = "Each download finds its own number of connections, up to the one above: more while they make it faster, \
                  and the fewest that reach what the server or your line allows. Its page says why. Off, a download keeps \
                  the number it starts with.";

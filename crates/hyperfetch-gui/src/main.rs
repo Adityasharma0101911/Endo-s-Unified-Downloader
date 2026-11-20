@@ -13,6 +13,7 @@ mod tracks;
 mod tray;
 mod ui;
 mod util;
+mod widen;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -448,6 +449,8 @@ struct App {
     restarting: HashSet<usize>,
     /// New downloads whose file another download has from another host, by id (see `Twin`).
     twins: HashMap<usize, Twin>,
+    /// How many more downloads than "at once" may run while the line has room (see `widen`).
+    widening: widen::Widening,
     /// The window's taskbar button (Windows), and the progress it shows.
     taskbar: Option<taskbar::Taskbar>,
     taskbar_shown: Option<taskbar::Progress>,
@@ -622,6 +625,7 @@ impl App {
             resuming: Vec::new(),
             restarting: HashSet::new(),
             twins: HashMap::new(),
+            widening: widen::Widening::default(),
             taskbar: None,
             taskbar_shown: None,
             batch_failed: false,
@@ -1676,6 +1680,21 @@ impl App {
         }
     }
 
+    /// How many more downloads than `at_once` may run now, with "More at once while the line has
+    /// room" on, on a line of `line` bytes a second (see `widen`).
+    fn more_at_once(&mut self, at_once: usize, line: Option<f64>) -> usize {
+        if !self.settings.more_at_once {
+            self.widening.extra = 0;
+            return 0;
+        }
+        let items = self.queue.items();
+        let running: Vec<&QueueItem> = items.iter().filter(|item| item.status == QueueItemStatus::Downloading).collect();
+        let speed = running.iter().map(|item| item.speed_bytes_per_sec).sum();
+        let waiting = items.iter().any(|item| item.status == QueueItemStatus::Queued);
+        let started = self.jobs.values().filter_map(|view| view.started).max();
+        self.widening.update(Instant::now(), at_once, running.len(), speed, line, waiting, started)
+    }
+
     /// Starts the paused downloads waiting to resume (see `App::resuming`), then queued ones,
     /// while fewer than the configured number are running, small files beside them (see
     /// `queue::may_start`); none while the window waits to close.
@@ -1686,6 +1705,7 @@ impl App {
             return;
         }
         let max = self.settings.max_concurrent.max(1);
+        let max = max + self.more_at_once(max, hyperfetch_core::hosts::line());
         while self.queue.may_start(max) && !self.resuming.is_empty() {
             let id = self.resuming.remove(0);
             if self.queue.get_item(id).is_some_and(|item| item.status == QueueItemStatus::Paused) {
@@ -3536,6 +3556,26 @@ mod tests {
         isolate_history();
         let settings = Settings { save_dir: dir.to_string_lossy().into_owned(), ..Settings::default() };
         App::with(egui::Context::default(), rt.handle().clone(), settings, DownloadQueue::new(), None)
+    }
+
+    /// Four running downloads taking under half the line, and one waiting: one more may run;
+    /// none once they fill the line, nor with More at once off.
+    #[test]
+    fn more_run_at_once_while_the_line_has_room() {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(&rt, dir.path());
+        for n in 0..5 {
+            let id = app.queue.add_item(vec![Url::parse(&format!("https://h{n}.example/f.bin")).unwrap()], DownloadOptions::default());
+            if n < 4 {
+                app.queue.mark_started(id);
+                app.queue.apply_snapshot(id, &EngineSnapshot { speed_bytes_per_sec: 10e6, ..Default::default() });
+            }
+        }
+        assert_eq!(app.more_at_once(4, Some(100e6)), 1);
+        assert_eq!(app.more_at_once(4, Some(50e6)), 0, "the line is full");
+        app.settings.more_at_once = false;
+        assert_eq!(app.more_at_once(4, Some(1e9)), 0);
     }
 
     /// The first link of each download queued.
