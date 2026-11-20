@@ -3192,6 +3192,7 @@ impl DownloadEngine {
                             (None, None) => autopilot::off(num_workers, self.limiter.is_some()),
                         });
                     }
+                    let by_user = next.is_some();
                     if let Some(pilot) = pilot.as_mut().filter(|pilot| !pilot.done) {
                         // Nothing measured while the network is gone is the host's doing. A worker
                         // past the width stops after its wait, unheard from.
@@ -3215,8 +3216,10 @@ impl DownloadEngine {
                         }
                     }
                     if let Some(next) = next.filter(|&next| next != width.load(Ordering::Relaxed)) {
-                        // Workers past a lower width hand back what they have yet to receive.
-                        if width.swap(next, Ordering::Relaxed) > next {
+                        // Workers past a lower width hand back what they have yet to receive, but
+                        // not to a host that refused a request lately: it limits how often it is
+                        // asked, and what they already have it send they finish.
+                        if width.swap(next, Ordering::Relaxed) > next && (by_user || !job.refused_lately()) {
                             job.chunks.lock().give_back(next);
                         }
                         if let Some(shared) = &spare {
@@ -4363,6 +4366,11 @@ impl RangeJob {
             Some((_, reason)) => Err(format!("Download failed: {}", reason)),
             None => Ok(()),
         }
+    }
+
+    /// Whether a host the download asks refused a request lately (see `hosts::refused_lately`).
+    fn refused_lately(&self) -> bool {
+        self.mirrors.lock().mirrors().iter().any(|m| m.is_active && hosts::refused_lately(&m.url))
     }
 
     /// The width `pilot` moves an adaptive download to, if it moves (see [`Autopilot::next`]);
