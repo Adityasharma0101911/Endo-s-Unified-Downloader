@@ -9688,6 +9688,34 @@ mod tests {
         assert_eq!((early, shut), (0, 0), "{refused} refused");
     }
 
+    /// Time and requests for a 32 MiB file from a host that keeps a budget of requests (4 at
+    /// once, then one every 3 s; past it 429 with Retry-After 3) and sends a client 8 MB/s: the
+    /// download as the app makes it, three times, then one plain request.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "benchmark: cargo test --release -p hyperfetch-core --lib -- --ignored --nocapture bench_a_host_that_keeps_a_budget"]
+    async fn bench_a_host_that_keeps_a_budget_of_requests() {
+        let size = 32 * 1024 * 1024;
+        let budget = crate::netsim::Budget { burst: 4, every: Duration::from_secs(3), retry_after: 3 };
+        let server = crate::netsim::Server { size, per_client: Some(8e6), budget: Some(budget), ..Default::default() };
+        let seen = |stats: &crate::netsim::Stats| (stats.asked.load(Ordering::SeqCst), stats.throttled.load(Ordering::SeqCst));
+        for _ in 0..3 {
+            let (url, stats) = crate::netsim::serve(server.clone()).await;
+            let dir = tempdir().unwrap();
+            let started = Instant::now();
+            let path = tokio::time::timeout(Duration::from_secs(300), DownloadEngine::new(vec![url], sim_options(dir.path(), 8, true)).run(None)).await.unwrap().unwrap();
+            let took = started.elapsed();
+            assert!(std::fs::read(path).unwrap() == crate::netsim::file(size));
+            let (asked, refused) = seen(&stats);
+            println!("the app: {:.1} s, {asked} requests, {refused} refused", took.as_secs_f64());
+        }
+        let (url, stats) = crate::netsim::serve(server).await;
+        let started = Instant::now();
+        let body = reqwest::get(url).await.unwrap().bytes().await.unwrap();
+        assert_eq!(body.len(), size);
+        let (asked, refused) = seen(&stats);
+        println!("one plain request: {:.1} s, {asked} requests, {refused} refused", started.elapsed().as_secs_f64());
+    }
+
     /// A server that caps each connection at 256 KB/s: seen to, the download opens all it may at
     /// once, and keeps them.
     #[tokio::test(flavor = "multi_thread")]

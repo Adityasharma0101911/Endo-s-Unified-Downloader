@@ -66,6 +66,8 @@ pub(crate) struct Server {
     pub zsync: Option<Vec<u8>>,
     /// A limit on how fast requests (of any path, HEAD too) may come.
     pub rate: Option<RateLimit>,
+    /// A budget of requests (of any path, HEAD too) the client spends.
+    pub budget: Option<Budget>,
     /// Bytes from the first offset up to the second are sent inverted: another version of the
     /// file under the same size and ETag, as a stale mirror serves.
     pub corrupt: Option<(usize, usize)>,
@@ -83,6 +85,16 @@ pub(crate) struct RateLimit {
     pub ban: Duration,
 }
 
+/// The budget of requests a host that limits how often it is asked keeps for each client: `burst`
+/// at once, then one more every `every`, up to `burst` again. One past it is refused with 429 and
+/// Retry-After `retry_after` seconds.
+#[derive(Clone, Copy)]
+pub(crate) struct Budget {
+    pub burst: usize,
+    pub every: Duration,
+    pub retry_after: u64,
+}
+
 /// A request that comes this long after a 429, within the rest it asked for, came too early: one
 /// sent before the 429 arrived may come a little later.
 const EARLY_SLACK: Duration = Duration::from_millis(200);
@@ -94,6 +106,8 @@ struct Limiting {
     refusals: std::collections::VecDeque<tokio::time::Instant>,
     last_refusal: Option<tokio::time::Instant>,
     shut_until: Option<tokio::time::Instant>,
+    /// What is left of a [`Budget`], and when that was counted.
+    left: Option<(f64, tokio::time::Instant)>,
 }
 
 enum Verdict {
@@ -131,6 +145,24 @@ impl Limiting {
         }
         Verdict::Refused
     }
+
+    /// Whether a request may spend one of `budget` at `now`.
+    fn spend(&mut self, budget: &Budget, stats: &Stats, now: tokio::time::Instant) -> bool {
+        let rest = Duration::from_secs(budget.retry_after);
+        if self.last_refusal.is_some_and(|at| (EARLY_SLACK..rest).contains(&(now - at))) {
+            stats.early.fetch_add(1, Ordering::SeqCst);
+        }
+        let (left, counted) = self.left.get_or_insert((budget.burst as f64, now));
+        *left = (*left + (now - *counted).as_secs_f64() / budget.every.as_secs_f64()).min(budget.burst as f64);
+        *counted = now;
+        if *left >= 1.0 {
+            *left -= 1.0;
+            return true;
+        }
+        stats.throttled.fetch_add(1, Ordering::SeqCst);
+        self.last_refusal = Some(now);
+        false
+    }
 }
 
 /// A connection that slows down and then stalls.
@@ -147,6 +179,8 @@ pub(crate) struct Decay {
 /// What the server saw.
 #[derive(Default)]
 pub(crate) struct Stats {
+    /// Requests of any kind, refused ones among them.
+    pub asked: AtomicUsize,
     /// GETs answered, refused ones among them, and HEADs.
     pub gets: AtomicUsize,
     pub heads: AtomicUsize,
@@ -210,6 +244,14 @@ async fn answer(
         match socket.read(&mut buf).await {
             Ok(0) | Err(_) => return,
             Ok(n) => head.extend_from_slice(&buf[..n]),
+        }
+    }
+    stats.asked.fetch_add(1, Ordering::SeqCst);
+    if let Some(budget) = &server.budget {
+        if !limiting.lock().spend(budget, &stats, tokio::time::Instant::now()) {
+            let refusal = format!("HTTP/1.1 429 Too Many Requests\r\nRetry-After: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", budget.retry_after);
+            let _ = socket.write_all(refusal.as_bytes()).await;
+            return;
         }
     }
     if let Some(limit) = &server.rate {
@@ -425,6 +467,24 @@ mod tests {
         assert_eq!(stats.shut.load(Ordering::SeqCst), 1);
         tokio::time::sleep(Duration::from_millis(700)).await;
         assert_eq!(try_get().await.unwrap().status().as_u16(), 200, "the ban is over and the window starts afresh");
+    }
+
+    /// A budget of 2 requests and one more every 400 ms: a third at once is refused with its
+    /// Retry-After, one after 400 ms is served, and every request counts, HEAD too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_the_server_keeps_a_budget_of_requests() {
+        let budget = Budget { burst: 2, every: Duration::from_millis(400), retry_after: 3 };
+        let (url, stats) = serve(Server { size: 1000, budget: Some(budget), ..Default::default() }).await;
+        let client = reqwest::Client::new();
+        let status = |request: reqwest::RequestBuilder| async move { tokio::time::timeout(Duration::from_secs(10), request.send()).await.unwrap().unwrap().status().as_u16() };
+        assert_eq!(status(client.head(url.clone())).await, 200);
+        assert_eq!(status(client.get(url.clone())).await, 200);
+        let refused = tokio::time::timeout(Duration::from_secs(10), client.get(url.clone()).send()).await.unwrap().unwrap();
+        assert_eq!((refused.status().as_u16(), refused.headers()["retry-after"].to_str().unwrap()), (429, "3"));
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        assert_eq!(status(client.get(url.clone())).await, 200, "one more after 400 ms");
+        assert_eq!(status(client.get(url.clone())).await, 429, "and only one");
+        assert_eq!((stats.asked.load(Ordering::SeqCst), stats.throttled.load(Ordering::SeqCst)), (5, 2));
     }
 
     /// The first GET from the given offset slows down and then goes silent; or is cut off. Others
