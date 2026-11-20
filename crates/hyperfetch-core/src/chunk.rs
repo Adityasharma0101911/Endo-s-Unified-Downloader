@@ -101,6 +101,21 @@ pub struct Chunk {
     attempt: Arc<Mutex<Attempt>>,
     not_before: Option<Instant>,
     assigned_at: Option<Instant>,
+    /// Another worker asked for it again while its request had no answer (see
+    /// `ChunkManager::hedge`): once per chunk.
+    hedged: bool,
+}
+
+/// A second request for what is left of a chunk whose request has no answer yet (see
+/// [`ChunkManager::hedge`]): the first answer keeps the chunk.
+#[derive(Debug)]
+pub(crate) struct Hedge {
+    pub(crate) chunk_id: usize,
+    /// The range asked for again.
+    pub(crate) start: u64,
+    pub(crate) end: u64,
+    /// The attempt that has no answer.
+    attempt: Arc<Mutex<Attempt>>,
 }
 
 /// How an attempt at a chunk goes, as its worker tells it.
@@ -134,6 +149,7 @@ impl Chunk {
             attempt: Arc::default(),
             not_before: None,
             assigned_at: None,
+            hedged: false,
         }
     }
 
@@ -225,12 +241,15 @@ impl Chunk {
     }
 
     /// How the chunk's worker is expected to go on: seconds until its next byte, and bytes per
-    /// second from then on. Once it has a rate since its answer, that rate at once; before, what
-    /// a request to its mirror costs (`expected`), less the part of the startup already behind it.
-    /// `None` without either.
+    /// second from then on. Once it has a rate since its answer, that rate at once, or its last
+    /// `LAG_WINDOW`'s if slower: a connection that slowed down near its end, as a tail left to a
+    /// faltering route does, would take long to drag its average down; before, what a request to
+    /// its mirror costs (`expected`), less the part of the startup already behind it. `None`
+    /// without either.
     fn pace(&self, now: Instant, expected: Option<&StealTiming>) -> Option<(f64, f64)> {
         if let Some(rate) = self.rate(now) {
-            return Some((0.0, rate));
+            let recent = self.attempt.lock().window_rate;
+            return Some((0.0, recent.map_or(rate, |recent| recent.min(rate))));
         }
         let expected = expected.filter(|t| t.rate > 0.0)?;
         let waited = self.assigned_at.map_or(Duration::ZERO, |at| now.saturating_duration_since(at));
@@ -465,16 +484,78 @@ impl ChunkManager {
             self.chunks.push(done);
             self.completed += 1;
         }
+        Some(self.hand_over(id, pos, end, thief_worker_id, thief_mirror_id, now))
+    }
+
+    /// Assigns `[pos, end]` of chunk `id`, whose attempt was just revoked, to the thief, with new
+    /// offsets and a new token: the revoked worker, which still holds the old ones, can neither
+    /// move nor settle what the thief now owns.
+    fn hand_over(&mut self, id: usize, pos: u64, end: u64, thief_worker_id: usize, thief_mirror_id: usize, now: Instant) -> Chunk {
         let chunk = &mut self.chunks[id];
         chunk.current_offset = Arc::new(AtomicU64::new(pos));
         chunk.end_offset = Arc::new(AtomicU64::new(end));
         chunk.revoked = CancellationToken::new();
-        Some(self.assign(id, thief_worker_id, thief_mirror_id, now))
+        self.assign(id, thief_worker_id, thief_mirror_id, now)
+    }
+
+    /// What is left of the in-flight chunk whose request has waited longest for its answer, for an
+    /// idle worker to ask for again: once at most per chunk, after `after(chunk's mirror)` without
+    /// an answer, and only while `answered_since(that mirror, when the request went out)`, as a
+    /// server answering other requests meanwhile lost this one rather than being slow. The chunk
+    /// stays with its worker until the second answer comes first (see [`ChunkManager::claim`]).
+    pub(crate) fn hedge(
+        &mut self,
+        after: impl Fn(usize) -> Duration,
+        answered_since: impl Fn(usize, Instant) -> bool,
+    ) -> Option<Hedge> {
+        if self.fatal.is_some() {
+            return None;
+        }
+        let now = Instant::now();
+        let chunk = self
+            .chunks
+            .iter_mut()
+            .filter(|c| !c.hedged && c.remaining_bytes() > 0 && c.attempt.lock().answered.is_none())
+            .filter(|c| match (&c.status, c.assigned_at) {
+                (ChunkStatus::Assigned { mirror_id, .. }, Some(sent)) => {
+                    now.saturating_duration_since(sent) >= after(*mirror_id) && answered_since(*mirror_id, sent)
+                }
+                _ => false,
+            })
+            .min_by_key(|c| c.assigned_at)?;
+        chunk.hedged = true;
+        let start = chunk.current_offset.load(Ordering::SeqCst).max(chunk.range.start);
+        Some(Hedge { chunk_id: chunk.id, start, end: chunk.end_offset.load(Ordering::SeqCst), attempt: Arc::clone(&chunk.attempt) })
+    }
+
+    /// Whether `hedge`'s chunk is still with the attempt it was asked for again for, with no
+    /// answer and nothing written.
+    pub(crate) fn hedging(&self, hedge: &Hedge) -> bool {
+        self.chunks.get(hedge.chunk_id).is_some_and(|c| {
+            c.is_in_flight()
+                && Arc::ptr_eq(&c.attempt, &hedge.attempt)
+                && !c.revoked.is_cancelled()
+                && c.attempt.lock().answered.is_none()
+                && c.current_offset.load(Ordering::SeqCst).max(c.range.start) == hedge.start
+        })
+    }
+
+    /// The second request for `hedge`'s chunk was answered: unless the first was meanwhile (or
+    /// the chunk is no longer that attempt's), it revokes that attempt and hands the chunk, up to
+    /// its end now, to the thief.
+    pub(crate) fn claim(&mut self, hedge: &Hedge, thief_worker_id: usize, thief_mirror_id: usize) -> Option<Chunk> {
+        if self.fatal.is_some() || !self.hedging(hedge) {
+            return None;
+        }
+        let chunk = &self.chunks[hedge.chunk_id];
+        chunk.revoked.cancel();
+        let end = chunk.end_offset.load(Ordering::SeqCst);
+        Some(self.hand_over(hedge.chunk_id, hedge.start, end, thief_worker_id, thief_mirror_id, Instant::now()))
     }
 
     /// Splits the in-flight chunk expected to finish last (ties: most bytes left). Its worker is
-    /// expected to go on at the rate it has had since assignment, or before it has one, at its
-    /// mirror's rate once its mirror's startup is over. A timed steal splits where both sides
+    /// expected to go on at the rate it has had since its answer (or over its last window, if
+    /// slower), or before it has one, at its mirror's rate once its mirror's startup is over. A timed steal splits where both sides
     /// finish together, the thief starting after its mirror's startup at its mirror's rate, and
     /// leaves the chunk alone if its worker finishes within `STEAL_MIN_STARTUPS` of those startups
     /// anyway. Without timing the rest is split in half. Bytes the victim's worker received but
@@ -1043,6 +1124,49 @@ mod tests {
         manager.backdate(0, Duration::from_secs(3));
         assert!(manager.take_over_silent(2, 0, |_| SILENT).is_none());
         assert!(!retry.revoked.is_cancelled());
+    }
+
+    #[test]
+    fn test_a_request_without_an_answer_is_asked_for_again_once() {
+        let mut manager = ChunkManager::new(8 * MB, 4 * MB).unwrap();
+        let waiting = manager.get_next_work(0, 0).unwrap();
+        answering(&mut manager, 1, 0);
+        let after = |_| Duration::from_secs(3);
+        // Not before its time, nor while its mirror has answered nothing since it was sent.
+        assert!(manager.hedge(after, |_, _| true).is_none());
+        manager.backdate(0, Duration::from_secs(3));
+        assert!(manager.hedge(after, |_, _| false).is_none());
+        let hedge = manager.hedge(after, |_, _| true).unwrap();
+        assert_eq!((hedge.chunk_id, hedge.start, hedge.end), (0, 0, 4 * MB - 1));
+        assert!(manager.hedge(after, |_, _| true).is_none(), "once per chunk");
+        // The second request answered first: the chunk is its worker's, the first attempt revoked.
+        let taken = manager.claim(&hedge, 2, 0).unwrap();
+        assert!(waiting.revoked.is_cancelled() && !taken.revoked.is_cancelled());
+        assert_eq!(taken.status, ChunkStatus::Assigned { worker_id: 2, mirror_id: 0 });
+        assert!(manager.claim(&hedge, 3, 0).is_none(), "taken once");
+
+        // The first answered first: the second is dropped.
+        let mut manager = ChunkManager::new(4 * MB, 4 * MB).unwrap();
+        let waiting = manager.get_next_work(0, 0).unwrap();
+        manager.backdate(0, Duration::from_secs(3));
+        let hedge = manager.hedge(after, |_, _| true).unwrap();
+        waiting.answered(Instant::now());
+        assert!(!manager.hedging(&hedge));
+        assert!(manager.claim(&hedge, 1, 0).is_none());
+        assert!(!waiting.revoked.is_cancelled());
+    }
+
+    #[test]
+    fn test_a_connection_slowed_near_its_end_is_timed_by_its_last_window() {
+        // 64 MiB less 300 KB in 10 s, but its last window went at 10 KB/s: the 300 KB left take
+        // 30 s, not the 0.05 s its average says, and a thief that starts after 0.1 s at 5 MiB/s
+        // takes nearly all of them.
+        let mut manager = one_victim(64 * MB, 64 * MB - 300_000, 10);
+        let thief = [cost(0.1, 5.0 * MB as f64)];
+        assert!(manager.steal_work(1, 0, timed(64 * 1024, &thief)).is_none(), "by its average it is about done");
+        manager.chunks()[0].went_at(10_000.0);
+        let (_, stolen) = manager.steal_work(1, 0, timed(64 * 1024, &thief)).unwrap();
+        assert!(stolen.range.len() > 290_000, "{}", stolen.range.len());
     }
 
     #[test]

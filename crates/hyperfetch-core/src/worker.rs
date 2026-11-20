@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-use crate::chunk::{Chunk, ChunkManager, StealRule, StealTiming, LAG_WINDOW};
+use crate::chunk::{Chunk, ChunkManager, Hedge, StealRule, StealTiming, LAG_WINDOW};
 use crate::hosts::{self, HostKey, HostProfile, HostSlot};
 use crate::mirror::{Mirror, MirrorRacer};
 use crate::range::ByteRange;
@@ -36,6 +36,11 @@ const WRITE_INTERVAL: Duration = Duration::from_millis(250);
 const TAKEOVER_SILENCE: Duration = Duration::from_secs(2);
 /// ...or this many of the mirror's answer times, if longer.
 const TAKEOVER_TTFBS: u32 = 4;
+/// Wait for an answer after which an idle worker asks again for what a request asked for, while
+/// its mirror answers others (see `ChunkManager::hedge`)...
+const HEDGE_AFTER: Duration = Duration::from_secs(3);
+/// ...or this many of the mirror's answer times, if longer.
+const HEDGE_TTFBS: u32 = 8;
 /// How long an address a connection kept far slower on than the others is left alone.
 const ROUTE_REST: Duration = Duration::from_secs(30);
 
@@ -622,14 +627,26 @@ impl HttpWorker {
                 slot = self.take_slot() => slot,
             };
             let job = slot.and_then(|(mirror_id, slot)| Some((self.next_job(mirror_id, &slot)?, mirror_id, slot)));
-            let Some(((chunk, url, if_range, redirected), mirror_id, slot)) = job else {
+            let Some(((job, url, if_range, redirected), mirror_id, slot)) = job else {
                 tokio::select! {
                     _ = s.cancel.cancelled() => return,
                     _ = tokio::time::sleep(IDLE_POLL) => continue,
                 }
             };
 
-            let outcome = self.download_chunk(&chunk, mirror_id, &url, if_range, redirected, &slot).await;
+            let (chunk, outcome) = match job {
+                Job::Chunk(chunk) => {
+                    let outcome = self.download_chunk(&chunk, mirror_id, &url, if_range, redirected, &slot).await;
+                    (chunk, outcome)
+                }
+                Job::Hedge(hedge) => match self.hedge(&hedge, mirror_id, &url, if_range, &slot).await {
+                    Some(answered) => answered,
+                    None => {
+                        s.mirrors.lock().release_mirror(mirror_id);
+                        continue;
+                    }
+                },
+            };
             if !self.conclude(&chunk, mirror_id, &url, outcome, slot).await {
                 return;
             }
@@ -683,12 +700,13 @@ impl HttpWorker {
         Some((mirror_id, hosts::acquire_routed(&url, s.host_limit, route_id).await))
     }
 
-    /// A chunk for the mirror `slot` was taken for, if it can still take a connection there:
-    /// fresh work, else what is left of a chunk gone silent, else part of a slow chunk, timed by
-    /// what a new request to each mirror costs. Also where to send the request, with its If-Range
-    /// validator and whether that URL is the mirror's redirect target. Lock order: mirrors, then
-    /// chunks.
-    fn next_job(&self, mirror_id: usize, slot: &HostSlot) -> Option<(Chunk, Url, Option<String>, bool)> {
+    /// Work for the mirror `slot` was taken for, if it can still take a connection there: fresh
+    /// work, else what is left of a chunk gone silent, else a second request for one whose request
+    /// went unanswered while its mirror answered others (never under our own speed limit, which
+    /// holds answers back), else part of a slow chunk, timed by what a new request to each mirror
+    /// costs. Also where to send the request, with its If-Range validator and whether that URL is
+    /// the mirror's redirect target. Lock order: mirrors, then chunks.
+    fn next_job(&self, mirror_id: usize, slot: &HostSlot) -> Option<(Job, Url, Option<String>, bool)> {
         let s = &self.shared;
         let route_id = s.budget(s.route_for_worker(self.worker_id));
         let mut racer = s.mirrors.lock();
@@ -697,25 +715,85 @@ impl HttpWorker {
             .get_mirror(mirror_id)
             .filter(|m| m.score(Instant::now()) >= 0.0 && HostKey::routed(&m.url, route_id) == *slot.host())?;
         let (url, if_range, redirected) = (mirror.url.clone(), mirror.if_range.clone(), mirror.fallback.is_some());
-        let chunk = {
+        let job = {
             let mut mgr = s.chunks.lock();
-            mgr.get_next_work(self.worker_id, mirror_id)
-                .or_else(|| {
-                    let taken = mgr.take_over_silent(self.worker_id, mirror_id, |m| takeover_after(racer.get_mirror(m)));
-                    if let Some(chunk) = &taken {
-                        tracing::info!("Chunk {} went silent; worker {} takes over the rest", chunk.id, self.worker_id);
-                    }
-                    taken
-                })
-                .or_else(|| {
+            let taken = mgr.get_next_work(self.worker_id, mirror_id).or_else(|| {
+                let taken = mgr.take_over_silent(self.worker_id, mirror_id, |m| takeover_after(racer.get_mirror(m)));
+                if let Some(chunk) = &taken {
+                    tracing::info!("Chunk {} went silent; worker {} takes over the rest", chunk.id, self.worker_id);
+                }
+                taken
+            });
+            let answered_since = |m: usize, sent: Instant| racer.get_mirror(m).and_then(|m| m.answered_at).is_some_and(|at| at > sent);
+            let found = match taken {
+                Some(chunk) => Some(Job::Chunk(chunk)),
+                None if s.limiter.is_none() => mgr.hedge(|m| hedge_after(racer.get_mirror(m)), answered_since).map(Job::Hedge),
+                None => None,
+            };
+            match found {
+                Some(job) => job,
+                None => {
                     let costs: Vec<StealTiming> =
                         racer.mirrors().iter().map(|m| StealTiming { startup: m.ttfb(), rate: m.speed_ewma }).collect();
                     let steal = StealRule { min_bytes: s.min_steal, timing: Some(&costs) };
-                    mgr.steal_work(self.worker_id, mirror_id, steal).map(|(_, c)| c)
-                })?
+                    Job::Chunk(mgr.steal_work(self.worker_id, mirror_id, steal).map(|(_, c)| c)?)
+                }
+            }
         };
+        if let Job::Hedge(hedge) = &job {
+            tracing::info!("Chunk {} has had no answer for a while; worker {} asks for it again", hedge.chunk_id, self.worker_id);
+        }
         racer.acquire_mirror(mirror_id);
-        Some((chunk, url, if_range, redirected))
+        Some((job, url, if_range, redirected))
+    }
+
+    /// Asks `url` again for what `hedge` names, the rest of a chunk whose request has no answer
+    /// (see [`ChunkManager::hedge`]). An answer that comes first takes the chunk over and is
+    /// streamed as any other: the chunk, and how that went. Else, as when the chunk's own answer
+    /// came first or this one is a refusal, it is dropped, and nothing of it counts against the
+    /// host or the mirror: `None`.
+    async fn hedge(&self, hedge: &Hedge, mirror_id: usize, url: &Url, if_range: Option<String>, slot: &HostSlot) -> Option<(Chunk, Result<(), Failure>)> {
+        let s = &self.shared;
+        let route = s.route_for_worker(self.worker_id);
+        let client = s.clients.get(route).unwrap_or(&s.client);
+        let sent_at = Instant::now();
+        let request = |url: &Url| self.ranged(client, url, hedge.start, hedge.end, if_range.as_deref());
+        let answer = tokio::time::timeout(s.stall_timeout, send(request, url));
+        tokio::pin!(answer);
+        let response = loop {
+            tokio::select! {
+                biased;
+                _ = s.cancel.cancelled() => return None,
+                answer = &mut answer => break answer.ok()?.ok()?,
+                // The chunk's own answer may have come, or the chunk gone elsewhere.
+                _ = tokio::time::sleep(IDLE_POLL) => if !s.chunks.lock().hedging(hedge) {
+                    return None;
+                },
+            }
+        };
+        check_response(response.status(), response.headers(), hedge.start, hedge.end, s.file_size, if_range.as_deref()).ok()?;
+        let chunk = s.chunks.lock().claim(hedge, self.worker_id, mirror_id)?;
+        tracing::info!("Chunk {}: the second request was answered first; worker {} takes it over", chunk.id, self.worker_id);
+        slot.accepted();
+        s.ramp.answered();
+        s.reached(route, url);
+        let _ = s.events.try_send(WorkerEvent::Ttfb { worker_id: self.worker_id, mirror_id, ttfb: sent_at.elapsed() });
+        let outcome = self.receive(&chunk, mirror_id, response.bytes_stream(), hedge.start, route).await;
+        Some((chunk, outcome))
+    }
+
+    /// The request for bytes `start..=end` of the file at `url` on `client`, with `if_range`.
+    fn ranged(&self, client: &Client, url: &Url, start: u64, end: u64, if_range: Option<&str>) -> RequestBuilder {
+        let mut request = authorize(client.get(url.clone()), self.shared.auth.as_deref(), url)
+            .header(RANGE, format!("bytes={}-{}", start, end))
+            .header(ACCEPT_ENCODING, "identity");
+        if crate::hosts::HostKey::of(url).is_bitrate_throttled() {
+            request = request.header(reqwest::header::CONNECTION, "close");
+        }
+        if let Some(validator) = if_range {
+            request = request.header(IF_RANGE, validator);
+        }
+        request
     }
 
     /// Applies an attempt's outcome to mirror, host and chunk bookkeeping and returns the event to
@@ -782,18 +860,7 @@ impl HttpWorker {
 
         let route = s.route_for_worker(self.worker_id);
         let client = s.clients.get(route).unwrap_or(&s.client);
-        let request = |url: &Url| {
-            let mut request = authorize(client.get(url.clone()), s.auth.as_deref(), url)
-                .header(RANGE, format!("bytes={}-{}", start, end))
-                .header(ACCEPT_ENCODING, "identity");
-            if crate::hosts::HostKey::of(url).is_bitrate_throttled() {
-                request = request.header(reqwest::header::CONNECTION, "close");
-            }
-            if let Some(validator) = &if_range {
-                request = request.header(IF_RANGE, validator.as_str());
-            }
-            request
-        };
+        let request = |url: &Url| self.ranged(client, url, start, end, if_range.as_deref());
 
         let sent_at = Instant::now();
         // A host that refused us just before and now leaves us unanswered is shutting us out.
@@ -1127,6 +1194,18 @@ fn taken_over() -> Failure {
 /// since a server slow to answer is not a dead one.
 fn takeover_after(mirror: Option<&Mirror>) -> Duration {
     mirror.map_or(TAKEOVER_SILENCE, |m| TAKEOVER_SILENCE.max(m.ttfb().saturating_mul(TAKEOVER_TTFBS)))
+}
+
+/// How long a request to a mirror goes without an answer before an idle worker asks again for
+/// what it asked for: `HEDGE_AFTER`, or `HEDGE_TTFBS` of the mirror's answer times if longer.
+fn hedge_after(mirror: Option<&Mirror>) -> Duration {
+    mirror.map_or(HEDGE_AFTER, |m| HEDGE_AFTER.max(m.ttfb().saturating_mul(HEDGE_TTFBS)))
+}
+
+/// What a worker does next (see `HttpWorker::next_job`).
+enum Job {
+    Chunk(Chunk),
+    Hedge(Hedge),
 }
 
 /// Classifies the response to `Range: bytes=start-end` (with `If-Range: if_range` when set) for
@@ -1621,7 +1700,7 @@ mod tests {
             (mirror.ttfb_ewma_ms, mirror.speed_ewma) = (4000.0, 3.0 * MB as f64);
         }
         let thief = HttpWorker::new(1, worker.shared.clone());
-        let (stolen, ..) = thief.next_job(0, &slot(&url)).unwrap();
+        let Some((Job::Chunk(stolen), ..)) = thief.next_job(0, &slot(&url)) else { panic!("nothing stolen") };
         // The mirror's 4 s answers and 3 MB/s connections: both sides finish after 25.5 s.
         let split = 10 * MB + (25.5 * MB as f64) as u64;
         assert!(stolen.range.start.abs_diff(split) < MB, "split at {} instead of about {split}", stolen.range.start);

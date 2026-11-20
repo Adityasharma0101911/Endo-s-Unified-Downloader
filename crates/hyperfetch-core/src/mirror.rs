@@ -25,6 +25,8 @@ pub struct Mirror {
     pub cooldown_until: Option<Instant>,
     /// Concurrent connections the server tolerates; lowered when it throttles extra connections.
     pub max_connections: usize,
+    /// When it last answered a request (see [`Mirror::record_ttfb`]).
+    pub answered_at: Option<Instant>,
 }
 
 impl Mirror {
@@ -43,6 +45,7 @@ impl Mirror {
             is_active: true,
             cooldown_until: None,
             max_connections: usize::MAX,
+            answered_at: None,
         }
     }
 
@@ -84,7 +87,9 @@ impl Mirror {
         Duration::try_from_secs_f64(self.ttfb_ewma_ms / 1000.0).unwrap_or_default()
     }
 
+    /// A request was just answered after `ttfb`.
     pub fn record_ttfb(&mut self, ttfb: Duration) {
+        self.answered_at = Some(Instant::now());
         let ttfb_ms = ttfb.as_secs_f64() * 1000.0;
         const ALPHA: f64 = 0.25;
         self.ttfb_ewma_ms = (ALPHA * ttfb_ms) + ((1.0 - ALPHA) * self.ttfb_ewma_ms);

@@ -8794,8 +8794,8 @@ mod tests {
     /// A local server of `data` at every path: HEAD, and GETs honouring `Range` whose bodies come
     /// 64 KiB per `pace`. `/moved/<name>` redirects to `/<name>`, the first GET of `/busy/<name>`
     /// and every GET of `/refused/<name>` are refused with 503, GETs of `/untagged/<name>` carry
-    /// no ETag, and the first GET of `/stall/<name>` past the file's start goes silent after
-    /// 64 KiB.
+    /// no ETag, the first GET of `/stall/<name>` past the file's start goes silent after
+    /// 64 KiB, and the first of `/hold/<name>` past the file's start is never answered.
     async fn file_server(data: Vec<u8>, pace: Duration) -> Url {
         serve_file(crate::hosts::unseen_listener().await, data, pace).0
     }
@@ -8830,6 +8830,10 @@ mod tests {
                         .unwrap_or((0, data.len() - 1));
                     let stall = path.starts_with("/stall/");
                     let first = method == "get" && (!stall || start > 0) && seen.lock().insert(path.clone());
+                    if path.starts_with("/hold/") && method == "get" && start > 0 && seen.lock().insert(format!("held {path}")) {
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                        return;
+                    }
                     let answer = if let Some(name) = path.strip_prefix("/moved/") {
                         format!("HTTP/1.1 302 Found\r\nLocation: /{name}\r\nContent-Length: 0\r\n")
                     } else if (first && path.starts_with("/busy/")) || (method == "get" && path.starts_with("/refused/")) {
@@ -8908,6 +8912,21 @@ mod tests {
                 assert!(at_second.load(Ordering::SeqCst) > 0, "the second address serves its share");
             }
         }
+    }
+
+    /// A request whose answer never comes is asked for again once its server answered others, and
+    /// the first answer brings its bytes: the download does not wait out the 30 s stall timeout.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_request_left_unanswered_is_asked_for_again() {
+        let data: Vec<u8> = (0..4 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        let base = uncapped_file_server(data.clone(), Duration::from_millis(2)).await;
+        let dir = tempdir().unwrap();
+        let options =
+            DownloadOptions { output_path: Some(dir.path().join("f.bin")), num_connections: 4, remote_checksum: false, ..Default::default() };
+        let started = Instant::now();
+        let done = DownloadEngine::new(vec![base.join("hold/f.bin").unwrap()], options).run(None).await.unwrap();
+        assert!(std::fs::read(done).unwrap() == data);
+        assert!(started.elapsed() < Duration::from_secs(15), "took {:?}", started.elapsed());
     }
 
     /// The connections a front end sets for a download while it runs (see `with_live`) are the
