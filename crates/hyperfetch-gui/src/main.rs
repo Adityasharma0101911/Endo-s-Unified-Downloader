@@ -459,6 +459,8 @@ struct App {
     eco: bool,
     /// Whether the system says the connection is metered (`hyperfetch_core::network::metered`).
     is_metered: Box<dyn Fn() -> bool>,
+    /// Whether the internet is gone (`hyperfetch_core::network::is_offline`).
+    is_offline: Box<dyn Fn() -> bool>,
     /// Queued downloads wait for a connection that is not metered (see `App::watch_metered`).
     metered: bool,
     /// The queued downloads "Download all anyway" let start on a metered connection.
@@ -647,6 +649,7 @@ impl App {
             reruns: HashMap::new(),
             eco: false,
             is_metered: Box::new(desktop::metered),
+            is_offline: Box::new(desktop::is_offline),
             metered: false,
             metered_ok: HashSet::new(),
             schedule_seen: None,
@@ -2475,7 +2478,7 @@ impl App {
     /// A running download that gets nothing while the system says the network is gone: it waits
     /// for the network (see `hyperfetch_core::network`), and says so rather than Stalled.
     fn waits_for_network(&self, id: usize) -> bool {
-        self.stalled_for(id).is_some() && hyperfetch_core::network::is_offline()
+        self.stalled_for(id).is_some() && (self.is_offline)()
     }
 
     /// Notes download `id`, which just ended, to start again by itself while it fails for a
@@ -2498,7 +2501,7 @@ impl App {
             return;
         }
         let due: Vec<usize> = self.reruns.iter().filter(|(_, (_, at))| *at <= now).map(|(&id, _)| id).collect();
-        if !due.is_empty() && !hyperfetch_core::network::is_offline() {
+        if !due.is_empty() && !(self.is_offline)() {
             for id in due {
                 match self.queue.get_item_mut(id) {
                     Some(item) if matches!(item.status, QueueItemStatus::Failed(_)) => item.status = QueueItemStatus::Queued,
@@ -4636,7 +4639,7 @@ mod tests {
 
     /// A download that failed for a network reason goes back in the queue by itself once its
     /// wait is over, three times at most, each wait longer; one refused, or failing its checksum,
-    /// never does, nor anything while the queue is stopped.
+    /// never does, nor anything while the network is gone or the queue is stopped.
     #[test]
     fn a_download_that_failed_for_the_network_starts_again_by_itself() {
         use hyperfetch_core::network::{rerun_after, RERUNS};
@@ -4672,6 +4675,10 @@ mod tests {
         let d = add(&mut app, "d.iso");
         app.queue.mark_started(d);
         fail(&mut app, d, lost);
+        app.is_offline = Box::new(|| true);
+        app.rerun_failed(now + Duration::from_secs(3600));
+        assert!(matches!(status(&app, d), QueueItemStatus::Failed(_)), "the network is gone");
+        app.is_offline = Box::new(|| false);
         app.settings.auto_run_queue = false;
         app.rerun_failed(now + Duration::from_secs(3600));
         assert!(matches!(status(&app, d), QueueItemStatus::Failed(_)), "the queue is stopped");

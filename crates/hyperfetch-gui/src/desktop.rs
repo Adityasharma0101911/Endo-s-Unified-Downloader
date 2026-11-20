@@ -421,6 +421,18 @@ pub fn metered() -> bool {
     false
 }
 
+/// Whether the internet is gone: [`hyperfetch_core::network::is_offline`] in the app.
+#[cfg(not(test))]
+pub fn is_offline() -> bool {
+    hyperfetch_core::network::is_offline()
+}
+
+/// Tests never depend on the network of the computer they run on.
+#[cfg(test)]
+pub fn is_offline() -> bool {
+    false
+}
+
 /// The local day of the week (Monday 0) and minute of the day.
 #[cfg(windows)]
 pub fn local_now() -> (u8, u16) {
