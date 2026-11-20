@@ -426,6 +426,12 @@ mod tests {
                     let text = String::from_utf8_lossy(&request).to_ascii_lowercase();
                     let head = text.starts_with("head ");
                     if !head && gets.fetch_add(1, Ordering::SeqCst) > 0 && down.load(Ordering::SeqCst) {
+                        match refusal {
+                            Some(status) => {
+                                let _ = socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await;
+                            }
+                            None => tokio::time::sleep(Duration::from_secs(30)).await,
+                        }
                         return;
                     }
                     let last = body.len() - 1;
@@ -437,12 +443,6 @@ mod tests {
                     let (status, part) = match range {
                         Some(_) => ("206 Partial Content", format!("Content-Range: bytes {from}-{to}/{}\r\n", body.len())),
                         None => ("200 OK", String::new()),
-                        match refusal {
-                            Some(status) => {
-                                let _ = socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await;
-                            }
-                            None => tokio::time::sleep(Duration::from_secs(30)).await,
-                        }
                     };
                     let length = to + 1 - from;
                     let answer = format!("HTTP/1.1 {status}\r\n{part}Content-Length: {length}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n");
@@ -479,7 +479,13 @@ mod tests {
         };
         let limit = Duration::from_secs(60);
 
+        // A host on this computer is never waited for, whatever the system says.
         let down = Arc::new(AtomicBool::new(true));
+        let port = flaky_server(Arc::clone(&body), Arc::clone(&down), None).await;
+        assert!(!waits(&Url::parse(&format!("http://127.0.0.1:{port}/file.bin")).unwrap()));
+        let failed = tokio::time::timeout(limit, fetch(port).run(None)).await.unwrap();
+        assert!(failed.is_err(), "the network there, the server's silence fails it: {failed:?}");
+
         let port = flaky_server(Arc::clone(&body), Arc::clone(&down), Some("502 Bad Gateway")).await;
         fake::set(port, true);
         let failed = tokio::time::timeout(limit, fetch(port).run(None)).await.unwrap();
@@ -487,17 +493,11 @@ mod tests {
         assert!(failed.is_err(), "an answer counts as a try: {failed:?}");
 
         let port = flaky_server(Arc::clone(&body), Arc::clone(&down), None).await;
-        let failed = tokio::time::timeout(limit, fetch(port).run(None)).await.unwrap();
-        assert!(failed.is_err(), "the network there, the server's silence fails it: {failed:?}");
-
-        let port = flaky_server(Arc::clone(&body), Arc::clone(&down), None).await;
-        assert!(!waits(&Url::parse(&format!("http://127.0.0.1:{port}/file.bin")).unwrap()));
         fake::set(port, true);
         let back = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(3)).await;
             down.store(false, Ordering::SeqCst);
             fake::set(port, false);
-        // A host on this computer is never waited for, whatever the system says.
         });
         let started = Instant::now();
         let path = tokio::time::timeout(limit, fetch(port).run(None)).await.unwrap().expect("waited for the network");
