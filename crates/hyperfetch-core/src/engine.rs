@@ -3031,6 +3031,7 @@ impl DownloadEngine {
         let stop = self.cancel_token.child_token();
         // One connection has nothing to spread; one the ramp adds stays on the system's choice.
         let spread = if num_workers > 1 { self.address_routes(&client, &reference.final_url).await } else { None };
+        let spread = spread.or_else(|| self.h2_routes(&client, max_workers as usize));
         let addresses = spread.is_some();
         let pool_clients = match (spread, self.client_pool.as_ref()) {
             (Some(routes), _) => routes,
@@ -3278,6 +3279,26 @@ impl DownloadEngine {
         }
         tracing::info!("Spreading the connections over {} addresses of {}", routes.len(), host);
         Some(routes)
+    }
+
+    /// Over HTTP/2 a client's requests to a host share one connection, whose flow control or one
+    /// lost packet then holds them all back: the routes a download of up to `workers` connections
+    /// takes turns on, `client` and a client of its own for each further connection, up to
+    /// `H2_CONNECTIONS`. They count against the host's budget as one, as a host's addresses do.
+    /// None over HTTP/1.1, where every request has a connection of its own, for one worker, or
+    /// with routes of another kind (a proxy pool, local addresses, FTP or SFTP).
+    fn h2_routes(&self, client: &Client, workers: usize) -> Option<Vec<Client>> {
+        let o = &self.options;
+        let other_routes = !o.proxy_pool.is_empty() || !o.bind_addresses.is_empty() || self.ftp.is_some() || self.sftp.is_some();
+        if !o.http2 || workers < 2 || other_routes {
+            return None;
+        }
+        let more = (1..H2_CONNECTIONS.min(workers)).filter_map(|_| build_route_client(o, o.proxy.as_deref(), None, None).ok());
+        let routes: Vec<Client> = std::iter::once(client.clone()).chain(more).collect();
+        (routes.len() > 1).then(|| {
+            tracing::info!("Spreading the requests over {} HTTP/2 connections", routes.len());
+            routes
+        })
     }
 
     /// Single-connection download for servers without range support or without a known length.
@@ -4179,6 +4200,8 @@ fn basic_login(header: &str) -> Option<(String, String)> {
 
 /// Most routes (proxy × local address) one download spreads its connections over.
 const MAX_ROUTES: usize = 16;
+/// Connections a download over HTTP/2 spreads its requests over (see `DownloadEngine::h2_routes`).
+const H2_CONNECTIONS: usize = 4;
 
 /// One client per route the workers take turns on: every proxy of the pool (else the one
 /// `proxy`) through every local address of `bind_addresses` (else the OS's choice).
@@ -8957,6 +8980,20 @@ mod tests {
         assert!(std::fs::read(run.await.unwrap().unwrap()).unwrap() == data);
         assert_eq!(before, 1);
         assert!(after >= 3, "{after} connections after 4 were set");
+    }
+
+    /// Over HTTP/2 a download's requests are spread over a few connections, each a client of its
+    /// own, not multiplexed onto one; over HTTP/1.1 each request has a connection anyway.
+    #[test]
+    fn test_a_download_over_http2_spreads_over_a_few_connections() {
+        let over = |http2| engine_with(DownloadOptions { http2, ..Default::default() });
+        let client = Client::new();
+        assert_eq!(over(true).h2_routes(&client, 16).map(|routes| routes.len()), Some(H2_CONNECTIONS));
+        assert_eq!(over(true).h2_routes(&client, 2).map(|routes| routes.len()), Some(2));
+        assert!(over(true).h2_routes(&client, 1).is_none());
+        assert!(over(false).h2_routes(&client, 16).is_none());
+        let bound = engine_with(DownloadOptions { http2: true, bind_addresses: vec![[127, 0, 0, 1].into()], ..Default::default() });
+        assert!(bound.h2_routes(&client, 16).is_none(), "local addresses are routes of their own");
     }
 
     /// A file server (see `file_server`) whose host is known not to cap a connection's speed: the
