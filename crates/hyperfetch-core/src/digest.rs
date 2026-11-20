@@ -2,11 +2,13 @@
 //! through: that checksum when the user gave none, a metalink's piece hashes, and the BLAKE3
 //! piece hashes history keeps for `--verify` and repair (see `history::piece_size`).
 
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
 use std::path::Path;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use blake3::hazmat::HasherExt;
@@ -32,6 +34,13 @@ use crate::worker::{authorize, send, Auth};
 const SIDECAR_BUDGET: Duration = Duration::from_secs(3);
 /// Sidecar files asked for at a time.
 const SIDECARS_AT_ONCE: usize = 2;
+/// How long what a folder was seen not to publish is remembered (see `MISSING`).
+const FOLDER_MEMORY: Duration = Duration::from_secs(10 * 60);
+/// Files of one kind in a folder that had no checksum file of their own before the next of that
+/// kind there are taken to have none.
+const BARE_FILES: u8 = 3;
+/// Most lists and kinds remembered at once.
+const MAX_REMEMBERED: usize = 4096;
 /// Largest sidecar file read.
 const MAX_SIDECAR: usize = 64 * 1024;
 /// Bytes read at a time when a finished file is read back.
@@ -174,39 +183,108 @@ async fn from_sidecars(client: &Client, auth: Option<&Auth>, limit: usize, url: 
         (sidecar, Some(ext))
     });
     let folder = ["SHA256SUMS", "sha256sums.txt", "CHECKSUMS"].map(|list| file.join(list).ok().map(|u| (u, None)));
+    // The folder's files of this kind, by their extension: the next of them go by what these had.
+    let ext = name.rsplit_once('.').map_or("", |(_, ext)| ext).to_ascii_lowercase();
+    let kind = file.join(".").ok().map(|folder| format!("{folder}*.{ext}"));
+    let bare = kind.as_deref().is_some_and(|kind| missing(kind, BARE_FILES));
+    let own = beside.len() as u8;
+    let asked = beside.into_iter().filter(|_| !bare).chain(folder.into_iter().flatten().filter(|(list, _)| !missing(list.as_str(), 1)));
     // A few at a time, over the connections the probe left open: a finished download waits for
     // them, and a host that takes few connections keeps the rest for the download. The first in
     // this order that names a checksum wins, whichever answers first.
     let name = &name;
-    let lookups: Vec<_> = beside
-        .into_iter()
-        .chain(folder.into_iter().flatten())
-        .map(|(sidecar, ext)| async move { fetch_small(client, auth, limit, sidecar).await.and_then(|text| checksum_line(&text, name, ext)) })
+    // How many of the file's own were said not to be there, and whether one named its checksum.
+    let (none_beside, one_beside) = (&AtomicU8::new(0), &AtomicU8::new(0));
+    let lookups: Vec<_> = asked
+        .map(|(sidecar, ext)| async move {
+            match fetch_small(client, auth, limit, sidecar.clone()).await {
+                Sidecar::Text(text) => {
+                    let found = checksum_line(&text, name, ext);
+                    if found.is_some() && ext.is_some() {
+                        one_beside.store(1, Ordering::Relaxed);
+                    }
+                    found
+                }
+                Sidecar::Missing => {
+                    match ext {
+                        Some(_) => _ = none_beside.fetch_add(1, Ordering::Relaxed),
+                        None => note_missing(sidecar.into()),
+                    }
+                    None
+                }
+                Sidecar::Unknown => None,
+            }
+        })
         .collect();
     let lookups = futures_util::stream::iter(lookups).buffered(SIDECARS_AT_ONCE).filter_map(std::future::ready);
     let found = tokio::time::timeout(SIDECAR_BUDGET, std::pin::pin!(lookups).next()).await;
+    if let Some(kind) = kind {
+        if one_beside.load(Ordering::Relaxed) > 0 {
+            MISSING.lock().remove(&kind);
+        } else if found.is_ok() && none_beside.load(Ordering::Relaxed) == own {
+            note_missing(kind);
+        }
+    }
     found.ok().flatten()
 }
 
-/// The body of `url`, unless it is no success, a web page or larger than `MAX_SIDECAR`.
-async fn fetch_small(client: &Client, auth: Option<&Auth>, limit: usize, url: Url) -> Option<String> {
+/// What asking for a checksum file gave.
+enum Sidecar {
+    Text(String),
+    /// The server says it is not there, or sent a web page or more than `MAX_SIDECAR` in its place.
+    Missing,
+    /// Nothing to go by: no answer, or a server that is busy or failing.
+    Unknown,
+}
+
+/// What sites were seen not to publish, for the downloads that follow: a checksum list that is
+/// not in its folder (by its URL), and how many of a folder's files of one kind had no checksum
+/// file of their own (by `<folder>*.<extension>`). Each with when it was last seen so.
+static MISSING: LazyLock<Mutex<HashMap<String, (Instant, u8)>>> = LazyLock::new(Default::default);
+
+/// Whether `key` was seen missing `times` or more within `FOLDER_MEMORY`.
+fn missing(key: &str, times: u8) -> bool {
+    MISSING.lock().get(key).is_some_and(|(seen, count)| seen.elapsed() < FOLDER_MEMORY && *count >= times)
+}
+
+/// Counts `key` as seen missing once more.
+fn note_missing(key: String) {
+    let mut all = MISSING.lock();
+    if all.len() >= MAX_REMEMBERED {
+        all.clear();
+    }
+    let now = Instant::now();
+    let seen = all.entry(key).or_insert((now, 0));
+    *seen = (now, if seen.0.elapsed() < FOLDER_MEMORY { seen.1.saturating_add(1) } else { 1 });
+}
+
+/// The checksum file at `url`: one that is there, not a web page and at most `MAX_SIDECAR`.
+async fn fetch_small(client: &Client, auth: Option<&Auth>, limit: usize, url: Url) -> Sidecar {
     let _slot = crate::hosts::acquire(&url, limit).await;
     let request = |url: &Url| authorize(client.get(url.clone()), auth, url).header(ACCEPT_ENCODING, "identity");
-    let mut resp = send(request, &url).await.ok()?;
-    if !resp.status().is_success() || crate::resolver::html_type(resp.headers()) {
-        return None;
+    let Ok(mut resp) = send(request, &url).await else { return Sidecar::Unknown };
+    let status = resp.status();
+    // Busy (408, 429) is no answer about the file.
+    if status.is_client_error() && !matches!(status.as_u16(), 408 | 429) {
+        return Sidecar::Missing;
     }
-    if resp.content_length().is_some_and(|len| len > MAX_SIDECAR as u64) {
-        return None;
+    if !status.is_success() {
+        return Sidecar::Unknown;
+    }
+    if crate::resolver::html_type(resp.headers()) || resp.content_length().is_some_and(|len| len > MAX_SIDECAR as u64) {
+        return Sidecar::Missing;
     }
     let mut body = Vec::new();
-    while let Some(chunk) = resp.chunk().await.ok()? {
-        body.extend_from_slice(&chunk);
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+            Ok(None) => return Sidecar::Text(String::from_utf8_lossy(&body).into_owned()),
+            Err(_) => return Sidecar::Unknown,
+        }
         if body.len() > MAX_SIDECAR {
-            return None;
+            return Sidecar::Missing;
         }
     }
-    Some(String::from_utf8_lossy(&body).into_owned())
 }
 
 /// The checksum the checksum file `text` gives for the file `name`: a line `<hex>  <name>`
@@ -846,6 +924,49 @@ mod tests {
         let (url, _) = serve(data, site).await;
         assert_eq!(published_checksum(&Client::new(), &url, &HeaderMap::new()).await, Some(sha1));
         assert_eq!(at_once.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn what_a_folder_does_not_publish_is_not_asked_for_again() {
+        let client = Client::new();
+        // How many requests the file `name` in the folder of `url` costs.
+        let asked = |url: &Url, log: &Arc<std::sync::Mutex<Vec<(String, Option<(u64, u64)>)>>>, name: &str| {
+            let (client, url, log) = (client.clone(), url.join(name).unwrap(), Arc::clone(log));
+            async move {
+                assert_eq!(published_checksum(&client, &url, &HeaderMap::new()).await, None, "{url}");
+                std::mem::take(&mut *log.lock().unwrap()).len()
+            }
+        };
+        // No list in the folder: asked for once. The files' own: until three of a kind had none.
+        let (url, log) = serve(content(100), Site::default()).await;
+        for (name, requests) in [("a.bin", 7), ("b.bin", 4), ("c.bin", 4), ("d.bin", 0), ("e.BIN", 0), ("f.iso", 4)] {
+            assert_eq!(asked(&url, &log, name).await, requests, "{name}");
+        }
+        // A list that is there is read for every file, whatever it lists.
+        let files = vec![("/dir/SHA256SUMS".to_string(), "text/plain".to_string(), format!("{}  other.bin", "0".repeat(64)))];
+        let (url, log) = serve(content(100), Site { files, ..Site::default() }).await;
+        for (name, requests) in [("a.bin", 7), ("b.bin", 5), ("c.bin", 5), ("d.bin", 1)] {
+            assert_eq!(asked(&url, &log, name).await, requests, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_checksum_file_found_or_a_server_that_fails_is_no_sign_of_a_bare_folder() {
+        // The fourth file has one of its own, as the three before it had: they are asked for still.
+        let data = content(100);
+        let line = |name: &str| (format!("/dir/{name}.md5"), "text/plain".to_string(), checksum("md5", &Md5::digest(&data)).split_off(4));
+        let (url, log) = serve(data.clone(), Site { files: ["a.bin", "b.bin", "c.bin", "d.bin"].map(line).to_vec(), ..Site::default() }).await;
+        let client = Client::new();
+        for name in ["a.bin", "b.bin", "c.bin", "d.bin"] {
+            let found = published_checksum(&client, &url.join(name).unwrap(), &HeaderMap::new()).await;
+            assert_eq!(found, Some(checksum("md5", &Md5::digest(&data))), "{name}");
+        }
+        assert_eq!(log.lock().unwrap().iter().filter(|(path, _)| path.ends_with(".md5")).count(), 4);
+
+        // A server that does not answer tells nothing of its folder.
+        let gone = Url::parse("http://127.0.0.1:9/dir/a.bin").unwrap();
+        assert_eq!(published_checksum(&client, &gone, &HeaderMap::new()).await, None);
+        assert!(!missing("http://127.0.0.1:9/dir/*.bin", 1) && !missing("http://127.0.0.1:9/dir/SHA256SUMS", 1));
     }
 
     /// Downloads `urls` (mirrors of one file) into `dir` with `options`; returns the result and

@@ -4,7 +4,7 @@ What changed in each release, newest first. Each release's page on [GitHub](http
 
 ## Unreleased
 
-- **Small downloads finish sooner.** The checksum files a site may publish beside a download are asked for two at a time instead of one by one, so a file that has already arrived waits about half as long for them.
+- **Small downloads finish sooner.** The checksum files a site may publish beside a download are asked for two at a time instead of one by one, so a file that has already arrived waits about half as long for them. A folder seen to publish none is remembered for ten minutes: the rest of a batch from it skips those requests.
 
 ## 2.2.0 (2026-11-19)
 
