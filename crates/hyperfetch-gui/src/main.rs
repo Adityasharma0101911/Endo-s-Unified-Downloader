@@ -2393,11 +2393,13 @@ impl App {
 
     /// Keeps the computer awake, as the setting allows, while downloads run (not while all that
     /// run wait for the network), and while the schedule's start at `now` is less than
-    /// `desktop::AWAKE_BEFORE_START` away with downloads waiting for it (ones its stop paused, or
-    /// queued ones while the queue is stopped); lets it sleep the moment there is neither.
+    /// `desktop::AWAKE_BEFORE_START` away with downloads waiting for it (ones its stop paused that
+    /// are still in the queue and paused, or queued ones while the queue is stopped); lets it sleep
+    /// the moment there is neither.
     fn keep_awake(&mut self, now: (u8, u16)) {
         let queued = self.queue.items().iter().any(|item| item.status == QueueItemStatus::Queued);
-        let waiting = !self.settings.schedule_paused.is_empty() || !self.settings.auto_run_queue && queued;
+        let paused = |id: &usize| self.queue.get_item(*id).is_some_and(|item| item.status == QueueItemStatus::Paused);
+        let waiting = self.settings.schedule_paused.iter().any(paused) || !self.settings.auto_run_queue && queued;
         let due = desktop::minutes_to_start(&self.settings.schedule, now).is_some_and(|m| m <= desktop::AWAKE_BEFORE_START);
         let running = self.queue.items().iter().any(|item| item.status.is_active() && !self.waits_for_network(item.id));
         self.awake.set(self.settings.keep_awake && (running || waiting && due));
@@ -4501,16 +4503,23 @@ mod tests {
         assert_eq!(*lock(&counts), (3, 3), "nothing scheduled");
         app.settings.schedule.enabled = true;
         app.queue.remove_item(d);
-        app.queue.remove_item(c);
         app.keep_awake((0, 21 * 60));
         assert_eq!(*lock(&counts), (3, 3), "nothing waits for the start");
-        app.settings.schedule_paused = vec![b];
+        // Of what its stop paused, only what is still in the queue and paused waits for it: not
+        // what was resumed by hand and finished (a) or failed (b) since, nor what was removed (c).
+        app.settings.schedule_paused = vec![a, b];
+        app.keep_awake((0, 21 * 60));
+        assert_eq!(*lock(&counts), (3, 3), "finished or failed since");
+        app.settings.schedule_paused = vec![a, b, c];
         app.keep_awake((0, 21 * 60));
         assert_eq!(*lock(&counts), (4, 3), "what its stop paused waits for it");
+        app.queue.remove_item(c);
+        app.keep_awake((0, 21 * 60));
+        assert_eq!(*lock(&counts), (4, 4), "removed");
 
         app.settings.keep_awake = false;
-        app.keep_awake((0, 21 * 60));
-        running(&mut app, &rt, a);
+        let e = add(&mut app, "e.iso");
+        running(&mut app, &rt, e);
         app.keep_awake((0, 21 * 60));
         assert_eq!(*lock(&counts), (4, 4), "the setting off, nothing is held");
     }
