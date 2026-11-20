@@ -1593,7 +1593,8 @@ fn many_links(app: &mut App, ui: &mut Ui) {
         });
         let about = "One download per line; links to the same file from several servers go on one line, separated by \
                      spaces. A .torrent or .metalink (link, file path, or file dropped on the window) adds every file it \
-                     lists, a playlist or channel every video. Uses the save folder and Settings.";
+                     lists, a playlist or channel every video; a link with a range (img[001-120].jpg, [a-f], [0-100:10]) \
+                     every link it stands for. Uses the save folder and Settings.";
         ui.add(egui::Label::new(RichText::new(about).small().color(p.muted)).wrap());
         ui.add_space(4.0);
         ui.add(

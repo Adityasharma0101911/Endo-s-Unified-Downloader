@@ -31,11 +31,14 @@ pub struct Args {
     /// A paste works too: links with "Password: x", "Key: x" or a token, a
     /// user:pass@ link, or a copied curl/wget/fetch/PowerShell command (each link then is its
     /// own download, with its secrets, which are never shown or saved); "-" reads it from stdin.
+    /// A range in a link's path stands for each link of it, as curl's do: img[001-120].jpg
+    /// (zero padding kept), [a-f], [0-100:10] (a step); quote it for the shell.
     /// Without URLs and without -i an interactive prompt starts.
     #[arg(num_args = 0..)]
     pub urls: Vec<String>,
 
-    /// Batch file: one download per line (space-separated mirrors, # comments); "-" reads stdin
+    /// Batch file: one download per line (space-separated mirrors, # comments; a link with a range
+    /// such as [1-20] one for each of its links); "-" reads stdin
     #[arg(short = 'i', long = "input-file", value_name = "FILE")]
     pub input_file: Option<PathBuf>,
 

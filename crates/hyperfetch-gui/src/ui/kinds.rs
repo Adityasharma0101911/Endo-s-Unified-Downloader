@@ -442,6 +442,10 @@ pub fn recognise(text: &str) -> Option<(&'static Kind, String)> {
     // Links to one file from several servers, separated by spaces, are one download.
     let first = tokens.first().map(String::as_str).unwrap_or(text);
     let url = Url::parse(first).ok();
+    // A link with ranges (`img[001-120].jpg`) stands for several.
+    if ingest::expand_line(text).is_ok_and(|links| links.len() > 1) {
+        return Some((&SEVERAL, url.as_ref().and_then(Url::host_str).unwrap_or_default().trim_start_matches("www.").to_string()));
+    }
     let kind = KINDS.iter().find(|kind| (kind.matches)(first, url.as_ref()))?;
     let source = match url.as_ref().and_then(Url::host_str) {
         Some(host) => host.trim_start_matches("www.").to_string(),
@@ -457,7 +461,7 @@ pub static SEVERAL: Kind = Kind {
     name: "Several links",
     group: "Files & links",
     glyph: icon::LIST_DASHES,
-    about: "One download a line; links to the same file from several servers go on one line.",
+    about: "One download a line, one for each link a range in a link stands for ([1-20], [001-120], [a-f], [0-100:10]); links to the same file from several servers go on one line.",
     example: "",
     needs: Needs::Nothing,
     choice: Choice::None,
@@ -475,6 +479,8 @@ mod tests {
         assert_eq!(name(""), None);
         assert_eq!(name("  "), None);
         assert_eq!(name("https://example.com/a.iso"), Some(("A file", "example.com".to_string())));
+        assert_eq!(name("https://www.example.com/img[001-120].jpg"), Some(("Several links", "example.com".to_string())));
+        assert_eq!(name("https://example.com/a.iso?part[1-2]").unwrap().0, "A file");
         assert_eq!(name("https://example.com/pack.zip").unwrap().0, "A ZIP archive");
         assert_eq!(name("https://example.com/").unwrap().0, "A web page");
         assert_eq!(name("https://example.com/x.torrent").unwrap().0, "A torrent");

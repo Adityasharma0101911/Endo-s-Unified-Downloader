@@ -527,6 +527,99 @@ pub fn split_tokens(line: &str) -> Vec<String> {
     line.split_whitespace().map(unquote).filter(|t| !t.is_empty()).collect()
 }
 
+/// Most links the ranges of one link may stand for.
+pub const MOST_RANGE_LINKS: usize = 10_000;
+
+/// The links `link` stands for: each numbered or lettered range in its path, written as curl
+/// writes them (`[1-20]`, `[001-120]` keeping its zero padding, `[a-f]`, with a step after a
+/// colon `[0-100:10]`), takes each of its values in turn, the last range the fastest. A link with
+/// none is itself. Only the path of a `scheme://` link is read: an IPv6 host (`http://[::1]/`), a
+/// query string's brackets and a bracket that holds no such range stay as they are. Err for a
+/// range that counts down or steps by 0, and past [`MOST_RANGE_LINKS`].
+pub fn expand_ranges(link: &str) -> Result<Vec<String>, String> {
+    // A scheme first: a magnet's `tr=udp://` is no link of its own.
+    let scheme = |at: usize| at > 0 && link[..at].bytes().all(|b| b.is_ascii_alphanumeric() || b"+.-".contains(&b));
+    let Some(host) = link.find("://").filter(|&at| scheme(at)).map(|at| at + 3) else { return Ok(vec![link.to_string()]) };
+    let path = link[host..].find('/').map_or(link.len(), |at| host + at);
+    let end = link[path..].find(['?', '#']).map_or(link.len(), |at| path + at);
+    // The link in literal pieces and ranges' values, alternately.
+    let (mut pieces, mut ranges, mut from) = (Vec::new(), Vec::<Vec<String>>::new(), 0);
+    let mut at = path;
+    while let Some(open) = link[at..end].find('[').map(|n| at + n) {
+        let Some(close) = link[open..end].find(']').map(|n| open + n) else { break };
+        at = close + 1;
+        let Some(values) = range_values(&link[open + 1..close])? else { continue };
+        pieces.push(&link[from..open]);
+        ranges.push(values);
+        from = close + 1;
+    }
+    pieces.push(&link[from..]);
+    let count = ranges.iter().try_fold(1usize, |count, values| count.checked_mul(values.len())).filter(|&n| n <= MOST_RANGE_LINKS);
+    let Some(count) = count else {
+        return Err(format!("The ranges in {link} stand for more than {MOST_RANGE_LINKS} links: split them into smaller ranges"));
+    };
+    Ok((0..count)
+        .map(|mut n| {
+            // The last range the fastest, as an odometer turns.
+            let mut picks = Vec::with_capacity(ranges.len());
+            for values in ranges.iter().rev() {
+                picks.push(values[n % values.len()].as_str());
+                n /= values.len();
+            }
+            picks.reverse();
+            let mut out = pieces[0].to_string();
+            for (pick, piece) in picks.iter().zip(&pieces[1..]) {
+                out.push_str(pick);
+                out.push_str(piece);
+            }
+            out
+        })
+        .collect())
+}
+
+/// The values of the range `inside` a pair of brackets (see [`expand_ranges`]); None when it is
+/// no range. At most `MOST_RANGE_LINKS` and one more, which is enough to say there are too many.
+fn range_values(inside: &str) -> Result<Option<Vec<String>>, String> {
+    let (span, step) = match inside.split_once(':') {
+        Some((span, step)) if !step.is_empty() && step.bytes().all(|b| b.is_ascii_digit()) => (span, step.parse::<u64>().unwrap_or(u64::MAX)),
+        Some(_) => return Ok(None),
+        None => (inside, 1),
+    };
+    let Some((first, last)) = span.split_once('-') else { return Ok(None) };
+    let digits = |s: &str| !s.is_empty() && s.len() <= 18 && s.bytes().all(|b| b.is_ascii_digit());
+    let letter = |s: &str| s.len() == 1 && s.as_bytes()[0].is_ascii_alphabetic();
+    let (start, stop, width, letters) = if digits(first) && digits(last) {
+        let width = if first.len() > 1 && first.starts_with('0') { first.len() } else { 0 };
+        (first.parse::<u64>().unwrap_or(0), last.parse::<u64>().unwrap_or(0), width, false)
+    } else if letter(first) && letter(last) && first.as_bytes()[0].is_ascii_lowercase() == last.as_bytes()[0].is_ascii_lowercase() {
+        (first.as_bytes()[0] as u64, last.as_bytes()[0] as u64, 0, true)
+    } else {
+        return Ok(None);
+    };
+    if step == 0 {
+        return Err(format!("The range [{inside}] steps by 0: give a step of 1 or more"));
+    }
+    if start > stop {
+        let step = inside.split_once(':').map_or(String::new(), |(_, step)| format!(":{step}"));
+        return Err(format!("The range [{inside}] counts down: write it from the lower to the higher, [{last}-{first}{step}]"));
+    }
+    let values = (start..=stop).step_by(usize::try_from(step).unwrap_or(usize::MAX)).take(MOST_RANGE_LINKS + 1);
+    Ok(Some(values.map(|n| if letters { char::from(n as u8).to_string() } else { format!("{n:0width$}") }).collect()))
+}
+
+/// The lines one input `line` stands for once the ranges of its link are expanded (see
+/// [`expand_ranges`]): a line without one is itself, untouched. A link with ranges stands alone
+/// on its line: links to one file from several servers cannot have them.
+pub fn expand_line(line: &str) -> Result<Vec<String>, String> {
+    let tokens = split_tokens(line);
+    let expanded = tokens.iter().map(|token| expand_ranges(token)).collect::<Result<Vec<_>, String>>()?;
+    match &expanded[..] {
+        _ if expanded.iter().zip(&tokens).all(|(links, token)| links.len() == 1 && &links[0] == token) => Ok(vec![line.to_string()]),
+        [links] => Ok(links.clone()),
+        _ => Err("A link with a range ([1-20]) goes on a line of its own: links to one file from several servers cannot have one".to_string()),
+    }
+}
+
 /// Splits one line of input into mirror tokens. A line naming a single existing local file, or
 /// a local .metalink/.meta4/.torrent whether or not it exists (a path with spaces, possibly
 /// quoted by drag and drop), stays one token, so reading it reports the real error; quotes
@@ -997,6 +1090,42 @@ mod tests {
         assert_eq!(tasks[0].urls.len(), 2);
         assert_eq!(tasks[0].name, None);
         assert_eq!(tasks[0].label(), "f.iso");
+    }
+
+    /// Numbered and lettered ranges in a link's path expand as curl expands them; nothing else
+    /// in brackets does.
+    #[test]
+    fn ranges_in_a_link_expand_to_its_links() {
+        let links = |link: &str| expand_ranges(link).unwrap();
+        let padded = links("https://h.example/img[001-120].jpg");
+        assert_eq!((padded.len(), padded[0].as_str(), padded[9].as_str(), padded[119].as_str()), (120, "https://h.example/img001.jpg", "https://h.example/img010.jpg", "https://h.example/img120.jpg"));
+        assert_eq!(links("http://h.example/[1-3]/f")[2], "http://h.example/3/f");
+        assert_eq!(links("https://h.example/[0-100:25].bin"), ["0", "25", "50", "75", "100"].map(|n| format!("https://h.example/{n}.bin")));
+        assert_eq!(links("https://h.example/[A-C]x"), ["A", "B", "C"].map(|c| format!("https://h.example/{c}x")));
+        // The last range the fastest.
+        assert_eq!(links("ftp://h.example/[a-b]/[1-2]"), ["a/1", "a/2", "b/1", "b/2"].map(|p| format!("ftp://h.example/{p}")));
+        // Left as they are: an IPv6 host, a query string, brackets that hold no range, no link.
+        for same in [
+            "http://[::1]:8080/f.bin",
+            "http://[2001:db8::1]/[2024] report.pdf",
+            "https://h.example/f?ids[1-2]=x#[3-4]",
+            "https://h.example/[a-5]/[1-]/[x]",
+            "C:\\files\\a[1-2].txt",
+            "magnet:?xt=urn:btih:abc&tr=udp://t.example:80/[1-2]",
+        ] {
+            assert_eq!(links(same), [same], "{same}");
+        }
+        assert!(expand_ranges("https://h.example/[9-1]").unwrap_err().contains("[1-9]"));
+        assert!(expand_ranges("https://h.example/[1-9:0]").unwrap_err().contains("steps by 0"));
+        assert!(expand_ranges("https://h.example/[1-1000000].jpg").unwrap_err().contains("more than 10000 links"));
+        assert!(expand_ranges("https://h.example/[1-200]/[1-200].jpg").unwrap_err().contains("more than 10000 links"));
+        assert_eq!(expand_ranges("https://h.example/[1-100]/[1-100].jpg").unwrap().len(), MOST_RANGE_LINKS);
+
+        // A line: untouched without a range, its links with one, refused among mirrors.
+        let line = "  https://a.example/f.iso   'https://b.example/f.iso' ";
+        assert_eq!(expand_line(line).unwrap(), [line]);
+        assert_eq!(expand_line("https://a.example/[1-2].iso").unwrap(), ["https://a.example/1.iso", "https://a.example/2.iso"]);
+        assert!(expand_line("https://a.example/[1-2].iso https://b.example/[1-2].iso").unwrap_err().contains("line of its own"));
     }
 
     #[test]

@@ -23,11 +23,21 @@ pub(super) fn add_link(app: &mut App, text: &str) {
         }
         None => {}
     }
-    for link in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
-        if ingest::needs_reading(link) {
-            app.read_document(link.to_string(), Origin::Dropped, String::new(), String::new());
-        } else {
-            app.notice = Some(app.add_download(link, "", "").map(|id| format!("Added #{} to the queue", id)));
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        // A link with ranges stands for its links.
+        let links = match ingest::expand_line(line) {
+            Ok(links) => links,
+            Err(e) => {
+                app.notice = Some(Err(e));
+                continue;
+            }
+        };
+        for link in links {
+            if ingest::needs_reading(&link) {
+                app.read_document(link, Origin::Dropped, String::new(), String::new());
+            } else {
+                app.notice = Some(app.add_download(&link, "", "").map(|id| format!("Added #{} to the queue", id)));
+            }
         }
     }
 }
@@ -475,6 +485,17 @@ fn preview_card(app: &mut App, ui: &mut Ui, kind: &kinds::Kind, source: &str) {
 /// The name the input gives what it downloads, shown on the preview card: a magnet's own name, or
 /// the last part of a link of a `kind` that ends in its file's name (see `kinds::named_by_link`).
 fn shown_name(input: &str, kind: &kinds::Kind) -> Option<String> {
+    // A link with ranges: how many links, from the first file to the last.
+    if let Ok(links) = ingest::expand_line(input.trim()) {
+        if let [first, .., last] = &links[..] {
+            let name = |link: &str| Url::parse(link).ok().and_then(|url| url.path_segments()?.filter(|s| !s.is_empty()).next_back().map(percent_decoded));
+            let (from, to) = match (name(first), name(last)) {
+                (Some(from), Some(to)) if from != to => (from, to),
+                _ => (first.clone(), last.clone()),
+            };
+            return Some(format!("{} links, {from} to {to}", links.len()));
+        }
+    }
     let first = ingest::split_tokens(input.trim()).into_iter().next()?;
     let url = Url::parse(&first).ok()?;
     if url.scheme() == "magnet" {
@@ -1064,6 +1085,38 @@ mod tests {
         let item = h.app.queue.items().iter().find(|item| item.filename == "b.iso").unwrap();
         assert_eq!((item.options.delta_from.as_deref(), item.options.only_if_newer), (Some(copy.as_path()), false));
         assert!(h.app.delta_input.is_empty(), "the form clears as it starts");
+    }
+
+    /// A link with ranges in the link bar says how many links it stands for, and Download queues
+    /// each; so do the queue input and a paste. A range past the ceiling, or one that counts down,
+    /// says so.
+    #[test]
+    fn a_link_with_ranges_queues_each_of_its_links() {
+        let mut h = Harness::new();
+        h.app.settings.auto_run_queue = false;
+        h.app.url_input = "https://h.example/img[001-120].jpg".into();
+        h.frames(30);
+        assert!(h.find("Several links").is_some() && h.find("120 links, img001.jpg to img120.jpg").is_some());
+        h.click("Download");
+        let names = |h: &Harness| h.app.queue.items().iter().map(|item| item.filename.clone()).collect::<Vec<_>>();
+        let queued = names(&h);
+        assert_eq!((queued.len(), queued[0].as_str(), queued[9].as_str(), queued[119].as_str()), (120, "img001.jpg", "img010.jpg", "img120.jpg"));
+        assert!(h.app.url_input.is_empty());
+
+        h.app.url_input = "https://h.example/[1-20000].jpg".into();
+        start_from_form(&mut h.app);
+        assert!(h.app.form_error.as_deref().is_some_and(|e| e.contains("more than 10000 links")), "{:?}", h.app.form_error);
+        h.app.url_input.clear();
+        h.frames(5);
+
+        h.app.queue_input = "https://h.example/[a-c].bin\nhttps://h.example/[3-1].bin".into();
+        h.app.add_queue_input();
+        assert_eq!(names(&h)[120..], ["a.bin", "b.bin", "c.bin"]);
+        assert_eq!(h.app.queue_input, "https://h.example/[3-1].bin", "kept for correcting");
+        assert!(h.app.queue_error.as_deref().is_some_and(|e| e.starts_with("Line 2: The range [3-1] counts down")), "{:?}", h.app.queue_error);
+
+        h.paste("https://p.example/[1-2].iso");
+        assert_eq!(names(&h)[123..], ["1.iso", "2.iso"]);
     }
 
     #[test]

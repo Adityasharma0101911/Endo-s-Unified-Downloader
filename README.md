@@ -354,7 +354,11 @@ All `URLS` given on the command line are **mirrors of one file**, except a link 
 | `-v, --verbose` | More log output: `-v` info, `-vv` debug, `-vvv` trace. | warnings |
 | `-h, --help` / `-V, --version` | Show help or the version. | |
 
-**Batch files.** Each line is one download. Mirrors of the same file go on one line, separated by spaces. Blank lines and lines starting with `#` are ignored. A `.metalink`, `.meta4` or `.torrent` entry (a local path or a URL), or a folder, playlist, channel or feed link, must be on a line of its own and can expand into several downloads. The file may be UTF-8, with or without a BOM, or UTF-16 with a BOM (the default for Windows PowerShell 5 `>` redirects).
+**Batch files.** Each line is one download. Mirrors of the same file go on one line, separated by spaces. Blank lines and lines starting with `#` are ignored. A `.metalink`, `.meta4` or `.torrent` entry (a local path or a URL), or a folder, playlist, channel or feed link, must be on a line of its own and can expand into several downloads.
+
+**Ranges in a link.** A numbered or lettered range in a link's path stands for each link of it, written as curl writes them: `https://example.com/img[001-120].jpg` is `img001.jpg` to `img120.jpg` (zero padding kept as written), `[1-20]`, `[a-f]` or `[A-F]`, and with a step after a colon, `[0-100:10]`; several ranges in a link take every combination, the last changing fastest. This works for links on the command line (quote them for the shell), in a batch file, at the interactive prompt, and in the app's link bar, its Add many links… box, a paste and a dropped `.txt`. A link with a range stands alone on its line (mirrors cannot have one), and one link may stand for at most 10,000; a range that counts down or steps by 0 is refused, saying so. Only the path is read: an IPv6 host (`http://[::1]/`), brackets in the query string and brackets that hold no such range are left as they are.
+
+The batch file may be UTF-8, with or without a BOM, or UTF-16 with a BOM (the default for Windows PowerShell 5 `>` redirects).
 
 ```text
 # queue.txt

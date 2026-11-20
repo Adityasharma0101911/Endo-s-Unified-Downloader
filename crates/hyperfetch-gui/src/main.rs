@@ -1140,6 +1140,24 @@ impl App {
             Some(Err(e)) => return self.form_error = Some(e),
             None => {}
         }
+        // A link with ranges queues its links, as the queue input does; they start as the queue
+        // allows.
+        match ingest::expand_line(text.trim()) {
+            Err(e) => return self.form_error = Some(e),
+            Ok(links) if links.len() > 1 => {
+                let before = self.queue.items().len();
+                let (_, error, added) = self.add_lines(text, checksum, auth);
+                if added {
+                    self.url_input.clear();
+                    self.checksum_input.clear();
+                }
+                self.form_error = error;
+                let count = self.queue.items().len() - before;
+                self.notice = (count > 0).then(|| Ok(format!("Added {count} downloads to the queue")));
+                return;
+            }
+            Ok(_) => {}
+        }
         if ingest::needs_reading(text) {
             self.form_error = None;
             self.read_document(text.trim().to_string(), Origin::Form, checksum.trim().to_string(), auth.to_string());
@@ -1235,21 +1253,35 @@ impl App {
         if lines.is_empty() {
             return (String::new(), Some("Enter one download per line".to_string()), false);
         }
-        if lines.len() > 1 && !checksum.is_empty() {
+        // A link with ranges stands for its links, each queued as a line of its own.
+        let expanded: Vec<_> = lines.iter().map(|line| ingest::expand_line(line)).collect();
+        if expanded.iter().map(|links| links.as_ref().map_or(1, Vec::len)).sum::<usize>() > 1 && !checksum.is_empty() {
             return (text.to_string(), Some(SINGLE_CHECKSUM.to_string()), false);
         }
-        let mut errors = Vec::new();
-        let mut rejected = Vec::new();
-        for (n, &line) in lines.iter().enumerate() {
-            if ingest::needs_reading(line) {
-                self.read_document(line.to_string(), Origin::QueueLine(n + 1), checksum.to_string(), auth.to_string());
-            } else if let Err(e) = self.add_download(line, checksum, auth) {
-                errors.push(format!("Line {}: {}", n + 1, e));
-                rejected.push(line);
+        let (mut errors, mut rejected, mut tried) = (Vec::new(), Vec::new(), 0);
+        for (n, (&line, links)) in lines.iter().zip(expanded).enumerate() {
+            let links: Vec<Result<String, (String, String)>> = match links {
+                Ok(links) => links.into_iter().map(Ok).collect(),
+                Err(e) => vec![Err((line.to_string(), e))],
+            };
+            for link in links {
+                tried += 1;
+                let failed = match link {
+                    Ok(link) if ingest::needs_reading(&link) => {
+                        self.read_document(link, Origin::QueueLine(n + 1), checksum.to_string(), auth.to_string());
+                        None
+                    }
+                    Ok(link) => self.add_download(&link, checksum, auth).err().map(|e| (link, e)),
+                    Err(failed) => Some(failed),
+                };
+                if let Some((link, e)) = failed {
+                    errors.push(format!("Line {}: {}", n + 1, e));
+                    rejected.push(link);
+                }
             }
         }
         // Keep the lines that failed so they can be corrected.
-        (rejected.join("\n"), (!errors.is_empty()).then(|| errors.join("\n")), errors.len() < lines.len())
+        (rejected.join("\n"), (!errors.is_empty()).then(|| errors.join("\n")), errors.len() < tried)
     }
 
     /// Starts (or resumes) the engine for a queue item. `fresh` first deletes the item's partial

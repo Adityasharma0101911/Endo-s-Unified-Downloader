@@ -18,7 +18,8 @@ use hyperfetch_core::history::{
     is_redacted, redact_url, DownloadHistoryManager, HistoryEntry, HistoryStatus, REDACTED_LINK,
 };
 use hyperfetch_core::ingest::{
-    decode_text, descriptor_client, http_url, ingest, input_tokens, list_channels, might_be_channel_list, ListOptions, Task,
+    decode_text, descriptor_client, expand_line, http_url, ingest, input_tokens, list_channels, might_be_channel_list, split_tokens, ListOptions,
+    Task,
 };
 use hyperfetch_core::TrackChoice;
 use hyperfetch_core::media::{self, find_ffmpeg_path, is_supported_media_site, BrowserCookieSource};
@@ -815,6 +816,25 @@ async fn text_inputs(text: &str, ui: &Ui) -> Result<Vec<Input>, String> {
     Ok(inputs)
 }
 
+/// `inputs` with the ranges of their links expanded, an input per link (see
+/// `ingest::expand_ranges`); a pasted link's are its own.
+fn expand_inputs(inputs: Vec<Input>) -> Result<Vec<Input>, String> {
+    let mut out = Vec::with_capacity(inputs.len());
+    for (number, tokens, pasted) in inputs {
+        let joined = tokens.join(" ");
+        let lines = if pasted.is_some() { vec![joined.clone()] } else { expand_line(&joined).map_err(|e| match number {
+            Some(n) => format!("Line {n}: {e}"),
+            None => e,
+        })? };
+        match &lines[..] {
+            // Untouched: its tokens as they were, a path with spaces whole.
+            [line] if *line == joined => out.push((number, tokens, pasted)),
+            _ => out.extend(lines.iter().map(|line| (number, split_tokens(line), None))),
+        }
+    }
+    Ok(out)
+}
+
 /// The downloads `inputs` list, each with the input-file line it came from (None for the
 /// command-line URLs) and the pasted link it is, and how many inputs could not be read into
 /// downloads, or only in part
@@ -878,6 +898,10 @@ async fn batch(args: &Args, ui: &Ui, shutdown: &Shutdown, http: &reqwest::Client
             None => inputs.push((None, args.urls.clone(), None)),
         }
     }
+    let inputs = match expand_inputs(inputs) {
+        Ok(inputs) => inputs,
+        Err(e) => return usage(&e),
+    };
 
     let (tasks, mut failed) = read_tasks(&inputs, ui, http, &list_options(args)).await;
     let captures: Vec<String> = tasks.iter().filter_map(|(_, task, _)| wayback::manifest_line(task)).collect();
@@ -1185,8 +1209,26 @@ where
         if input.is_empty() {
             break;
         }
-        let tokens = input_tokens(&input).await;
-        let (result, missing) = listed(&tokens, http, &list_options(args)).await;
+        let lines = match expand_line(&input) {
+            Ok(lines) => lines,
+            Err(e) => {
+                stderr_line(&format!("[ERROR] {}", e));
+                continue;
+            }
+        };
+        // A link with ranges stands for several, each listed as one typed alone.
+        let (mut result, mut missing) = (Ok::<Vec<Task>, String>(Vec::new()), Vec::new());
+        for line in &lines {
+            let (listed_here, missed) = listed(&input_tokens(line).await, http, &list_options(args)).await;
+            missing.extend(missed);
+            result = result.and_then(|mut tasks| {
+                tasks.extend(listed_here?);
+                Ok(tasks)
+            });
+            if result.is_err() {
+                break;
+            }
+        }
         // A folder read in part: what was read is downloaded, and the run has failed.
         for e in &missing {
             stderr_line(&format!("[ERROR] {}", e));
@@ -2192,6 +2234,19 @@ mod tests {
             lines,
             [(Some(2), "a.bin".into()), (Some(2), "b.bin".into()), (Some(5), "c.bin".into()), (None, "d.bin".into())]
         );
+    }
+
+    /// A link with ranges, on the command line or a batch line, is an input per link, each from
+    /// its line; one among links to the same file is an error that names its line.
+    #[test]
+    fn ranges_expand_to_an_input_per_link() {
+        let input = |number, tokens: &[&str]| (number, tokens.iter().map(|t| t.to_string()).collect::<Vec<_>>(), None);
+        let expanded = expand_inputs(vec![input(Some(3), &["https://h.example/[1-2].bin"]), input(None, &["https://a.example/f", "https://b.example/f"])]);
+        let seen: Vec<_> = expanded.unwrap().into_iter().map(|(number, tokens, _)| (number, tokens.join(" "))).collect();
+        let want = [(Some(3), "https://h.example/1.bin"), (Some(3), "https://h.example/2.bin"), (None, "https://a.example/f https://b.example/f")];
+        assert_eq!(seen, want.map(|(number, line)| (number, line.to_string())));
+        let mirrors = expand_inputs(vec![input(Some(7), &["https://a.example/[1-2]", "https://b.example/[1-2]"])]);
+        assert!(mirrors.unwrap_err().starts_with("Line 7: A link with a range"));
     }
 
     /// A paste on the command line (a copied curl command, a user:pass@ link and its password)
