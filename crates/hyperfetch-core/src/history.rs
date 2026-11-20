@@ -135,6 +135,19 @@ pub fn is_redacted(url: &str) -> bool {
 
 /// `text` (an error message, say) with every link in it passed through [`redact_url`].
 pub fn redact_text(text: &str) -> String {
+    each_link(text, redact_url)
+}
+
+/// `text` (an error message, say) with every link in it as its host alone (`a link` for one
+/// without a host): what a notification, which the system keeps in its history and may show on
+/// the lock screen, says of a link, without its path or query.
+pub fn hosts_only(text: &str) -> String {
+    each_link(text, |link| Url::parse(link).ok().and_then(|url| url.host_str().map(str::to_string)).unwrap_or_else(|| "a link".to_string()))
+}
+
+/// `text` with every link in it (`scheme://` up to a space or a bracket, without the punctuation
+/// that ends a sentence) replaced by what `replace` makes of it.
+fn each_link(text: &str, replace: impl Fn(&str) -> String) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(at) = rest.find("://") {
@@ -145,7 +158,7 @@ pub fn redact_text(text: &str) -> String {
         let link = rest[start..at + len].trim_end_matches(['.', ',', ':', ';']);
         let end = (start + link.len()).max(at + 3);
         out.push_str(&rest[..start]);
-        out.push_str(&redact_url(&rest[start..end]));
+        out.push_str(&replace(&rest[start..end]));
         rest = &rest[end..];
     }
     out.push_str(rest);
@@ -1019,6 +1032,15 @@ mod tests {
         for same in ["connection reset", "odd :// here", "://", "é://x?token=1"] {
             assert_eq!(redact_text(same), same);
         }
+    }
+
+    /// A notification names a link's host alone: no path, query or sign-in.
+    #[test]
+    fn hosts_only_keeps_the_host_of_each_link() {
+        assert_eq!(hosts_only("https://cdn.example/a.bin?sig=1&exp=2: HTTP 403 Forbidden"), "cdn.example: HTTP 403 Forbidden");
+        assert_eq!(hosts_only("request for url (https://u:p@h.example/x?id=1), then ftp://f.example/y."), "request for url (h.example), then f.example.");
+        assert_eq!(hosts_only("odd://"), "a link");
+        assert_eq!(hosts_only("connection reset"), "connection reset");
     }
 
     #[test]

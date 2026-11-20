@@ -536,7 +536,7 @@ impl App {
             &rt,
         );
         app.taskbar = taskbar::Taskbar::new(TITLE);
-        app.notifier = notify::sender(app.events_tx.clone(), cc.egui_ctx.clone(), rt.clone());
+        app.notifier = notify::sender(app.events_tx.clone(), cc.egui_ctx.clone(), rt.clone(), links);
         if cfg!(windows) && links {
             app.register_protocol();
         }
@@ -2336,16 +2336,19 @@ impl App {
     }
 
     /// Gathers download `id`, which just ended, for a desktop notification (see `notify::Batch`)
-    /// as the settings say: not while the window is in view, where its card shows it.
+    /// as the settings say: not while the window is in view, where its card shows it, nor a
+    /// failure that starts again by itself (see `App::note_rerun`) until its last. A failure is told
+    /// in its card's words with the host alone of any link in them.
     fn note_ended(&mut self, id: usize) {
-        let Some(item) = self.queue.get_item(id).filter(|_| self.settings.notify && !self.in_view()) else { return };
+        let rerun = self.reruns.contains_key(&id) && self.settings.auto_run_queue;
+        let Some(item) = self.queue.get_item(id).filter(|_| self.settings.notify && !self.in_view() && !rerun) else { return };
         let name = item.filename.clone();
         let ended = match &item.status {
             QueueItemStatus::Completed if !self.settings.notify_failures_only => {
                 let folder = item.target_path.as_deref().and_then(std::path::Path::parent).map(|f| f.display().to_string());
                 notify::Ended::Done { name, folder: folder.unwrap_or_default() }
             }
-            QueueItemStatus::Failed(_) => notify::Ended::Failed { name, why: ui::failure_text(item).unwrap_or_default() },
+            QueueItemStatus::Failed(_) => notify::Ended::Failed { name, why: ui::failure_text(item).map(|why| hyperfetch_core::history::hosts_only(&why)).unwrap_or_default() },
             _ => return,
         };
         self.ended.push(ended, self.ctx.input(|i| i.time));
@@ -4722,9 +4725,13 @@ mod tests {
             app.rerun_failed(now);
             assert_eq!(status(&app, a), QueueItemStatus::Downloading, "started again, the {tries}th time");
         }
+        assert!(app.ended.take(f64::MAX).is_none(), "a failure that starts again by itself is not told");
         fail(&mut app, a, lost);
         app.rerun_failed(now + Duration::from_secs(3600));
         assert!(matches!(status(&app, a), QueueItemStatus::Failed(_)) && app.rerun_text(a).is_none(), "three times at most");
+        // The last is told, with the link's host alone.
+        let told = app.ended.take(f64::MAX).expect("told");
+        assert!(told.body.contains("(example.com)") && !told.body.contains("a.iso"), "{}", told.body);
 
         for (id, error) in [(b, "Download failed: every mirror failed; last error: HTTP 404 Not Found"), (c, "Checksum mismatch: expected sha256:ab")] {
             app.queue.mark_started(id);

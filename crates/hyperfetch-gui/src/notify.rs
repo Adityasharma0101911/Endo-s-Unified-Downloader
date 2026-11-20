@@ -105,14 +105,16 @@ pub fn notice(ended: &[Ended]) -> Notice {
 }
 
 /// Shows notices on this desktop, off the UI thread; a click on a Windows toast brings the window
-/// forward (as the tray's Show does, through `tx`).
-pub fn sender(tx: mpsc::Sender<crate::AppEvent>, ctx: egui::Context, rt: tokio::runtime::Handle) -> Sender {
+/// forward (as the tray's Show does, through `tx`). On Windows the app's name and logo for them
+/// are registered only with `registers` (not by a portable copy, which writes nothing to the
+/// registry: its toasts show under the installed copy's registration).
+pub fn sender(tx: mpsc::Sender<crate::AppEvent>, ctx: egui::Context, rt: tokio::runtime::Handle, registers: bool) -> Sender {
     Box::new(move |notice| {
         #[cfg(windows)]
         {
             let (tx, ctx) = (tx.clone(), ctx.clone());
             let _ = rt.spawn_blocking(move || {
-                if let Err(e) = windows_toast(&notice, move || {
+                if let Err(e) = windows_toast(&notice, registers, move || {
                     if tx.send(crate::AppEvent::Tray(crate::tray::TrayAction::Show)).is_ok() {
                         ctx.request_repaint();
                     }
@@ -143,6 +145,8 @@ pub fn sender(tx: mpsc::Sender<crate::AppEvent>, ctx: egui::Context, rt: tokio::
                 }
             });
         }
+        #[cfg(not(windows))]
+        let _ = registers;
         #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
         let _ = (notice, &tx, &ctx, &rt);
     })
@@ -152,9 +156,10 @@ pub fn sender(tx: mpsc::Sender<crate::AppEvent>, ctx: egui::Context, rt: tokio::
 #[cfg(windows)]
 const APP_ID: &str = "EndosUnifiedDownloader";
 
-/// Shows `notice` as a toast of the app; `clicked` runs when the user clicks it while the app runs.
+/// Shows `notice` as a toast of the app, registering it first when `registers` (see [`sender`]);
+/// `clicked` runs when the user clicks it while the app runs.
 #[cfg(windows)]
-fn windows_toast(notice: &Notice, clicked: impl Fn() + Send + 'static) -> windows::core::Result<()> {
+fn windows_toast(notice: &Notice, registers: bool, clicked: impl Fn() + Send + 'static) -> windows::core::Result<()> {
     use std::sync::Mutex;
     use windows::core::HSTRING;
     use windows::Data::Xml::Dom::XmlDocument;
@@ -164,7 +169,9 @@ fn windows_toast(notice: &Notice, clicked: impl Fn() + Send + 'static) -> window
     /// The toasts shown lately, kept so that a click on one still reaches the app.
     static SHOWN: Mutex<Vec<ToastNotification>> = Mutex::new(Vec::new());
     static REGISTERED: std::sync::Once = std::sync::Once::new();
-    REGISTERED.call_once(register);
+    if registers {
+        REGISTERED.call_once(register);
+    }
     let xml = format!(
         "<toast><visual><binding template=\"ToastGeneric\"><text>{}</text><text>{}</text></binding></visual></toast>",
         xml_text(&notice.title),

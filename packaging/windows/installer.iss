@@ -66,13 +66,14 @@ Type: files; Name: "{app}\*.old-*.exe"
 Type: files; Name: "{app}\*.exe.new"
 
 [Code]
-// The app writes these itself (launch at startup, and the endo-dl: link that starts it); they
-// would point at the programs just removed.
+// The app writes these itself (launch at startup, the endo-dl: link that starts it, and the name
+// its notifications show under); they would point at the programs just removed.
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if CurUninstallStep = usPostUninstall then
   begin
     RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', 'EndosUnifiedDownloader');
     RegDeleteKeyIncludingSubkeys(HKCU, 'Software\Classes\endo-dl');
+    RegDeleteKeyIncludingSubkeys(HKCU, 'Software\Classes\AppUserModelId\EndosUnifiedDownloader');
   end;
 end;
