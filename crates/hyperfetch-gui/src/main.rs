@@ -3363,11 +3363,13 @@ mod tests {
         addr
     }
 
+    /// Downloads `url`; with `pause`, pauses it once the snapshots show its first 16 KiB on disk,
+    /// however long a loaded machine takes to write them.
     async fn run(
         url: &Url,
         options: &DownloadOptions,
         leftovers_of: Option<PathBuf>,
-        pause_after: Option<Duration>,
+        pause: bool,
     ) -> Result<(PathBuf, Option<u64>), String> {
         let cancel = Arc::new(Notify::new());
         let slot = Arc::new(Mutex::new(None));
@@ -3377,14 +3379,13 @@ mod tests {
             let folder = options.output_path.clone();
             run_job(&engines, vec![url], options, folder, leftovers_of, cancel_job, job_slot, Arc::default(), egui::Context::default()).await
         });
-        if let Some(delay) = pause_after {
-            // Paused `delay` after the first snapshot, which a slow machine may give late.
+        if pause {
             let start = Instant::now();
-            while lock(&slot).is_none() {
-                assert!(start.elapsed() < Duration::from_secs(10), "snapshots reach the UI slot");
+            let written = |s: &EngineSnapshot| s.chunks.iter().any(|c| c.range_start == 0 && c.downloaded_bytes >= 16 * 1024);
+            while !lock(&slot).as_ref().is_some_and(written) {
+                assert!(start.elapsed() < Duration::from_secs(30), "the file's start reaches the disk");
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            tokio::time::sleep(delay).await;
             cancel.notify_one();
         }
         tokio::time::timeout(Duration::from_secs(60), job).await.unwrap().unwrap()
@@ -4271,13 +4272,13 @@ mod tests {
         let url = Url::parse(&format!("http://{}/file.bin", addr)).unwrap();
         let final_path = downloads.join("file.bin");
         let (hfstate, part) = part_files(&final_path);
-        assert!(run(&url, &options, None, Some(Duration::from_millis(700))).await.is_err());
+        assert!(run(&url, &options, None, true).await.is_err());
         assert!(part.exists() && !final_path.exists());
         let saved = DownloadState::load_from_path(&hfstate).unwrap().expect("resume state saved");
         assert!(!saved.completed_ranges.is_empty(), "progress was recorded");
 
         // Resume completes the same file.
-        let (path, size) = run(&url, &options, None, None).await.unwrap();
+        let (path, size) = run(&url, &options, None, false).await.unwrap();
         assert_eq!((path, size), (final_path.clone(), Some(body.len() as u64)));
         assert!(std::fs::read(&final_path).unwrap() == *body);
         assert!(!part.exists() && !hfstate.exists());
@@ -4289,12 +4290,12 @@ mod tests {
             let url = Url::parse(&format!("http://{}/{}", addr, name)).unwrap();
             let other = downloads.join(&name);
             let (_, other_part) = part_files(&other);
-            assert!(run(&url, &options, None, Some(Duration::from_millis(700))).await.is_err());
+            assert!(run(&url, &options, None, true).await.is_err());
             let mut file = std::fs::OpenOptions::new().write(true).open(&other_part).unwrap();
             std::io::Write::write_all(&mut file, &[0xAA; 16 * 1024]).unwrap();
             drop(file);
             let leftovers_of = start_over.then(|| other.clone());
-            run(&url, &options, leftovers_of, None).await.unwrap();
+            run(&url, &options, leftovers_of, false).await.unwrap();
             assert_eq!(std::fs::read(&other).unwrap() == *body, start_over);
         }
 
@@ -4302,9 +4303,9 @@ mod tests {
         let url = Url::parse(&format!("http://{}/held.bin", addr)).unwrap();
         let held = downloads.join("held.bin");
         let (held_state, held_part) = part_files(&held);
-        assert!(run(&url, &options, None, Some(Duration::from_millis(700))).await.is_err());
+        assert!(run(&url, &options, None, true).await.is_err());
         let claim = hyperfetch_core::claim_target(&held).unwrap().expect("nothing is downloading it");
-        let error = run(&url, &options, Some(held.clone()), None).await.unwrap_err();
+        let error = run(&url, &options, Some(held.clone()), false).await.unwrap_err();
         assert!(error.starts_with("Could not start over") && error.contains("still being downloaded"), "{}", error);
         assert!(held_part.exists() && held_state.exists(), "the partial file is kept");
         drop(claim);
