@@ -1,8 +1,10 @@
 //! What the system says of the network, so that a download waits for a network that went away
 //! instead of failing. Only the system is asked, never another host: on Windows its connectivity
 //! hint (no network, a local network without internet, internet), which also tells at once when
-//! it changes; elsewhere whether an interface that is up has a gateway. Where it cannot be told,
-//! the network counts as there, and downloads fail as they always did.
+//! it changes; elsewhere whether an interface that is up has a gateway. A host on the internet
+//! that answered lately outweighs a hint of a local network only, and hosts on this computer or a
+//! local network never wait. Where it cannot be told, the network counts as there, and downloads
+//! fail as they always did.
 
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -52,45 +54,61 @@ static CHANGED: LazyLock<tokio::sync::Notify> = LazyLock::new(|| {
 /// What the system says this computer reaches now (asked at most once a second).
 pub fn reach() -> Reach {
     let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    let now = Instant::now();
-    let reach = match state.seen {
-        Some((at, reach)) if now.duration_since(at) < FRESH => reach,
+    match state.seen {
+        Some((at, reach)) if at.elapsed() < FRESH => reach,
         _ => {
             let reach = imp::reach();
-            state.seen = Some((now, reach));
+            state.seen = Some((Instant::now(), reach));
             reach
         }
-    };
-    match reach {
-        Reach::Nothing | Reach::Local => {
-            state.gone_since.get_or_insert(now);
-        }
-        _ => state.gone_since = None,
     }
-    reach
 }
 
-/// The system says the internet cannot be reached now: there is no network, or only a local one.
+/// How long an answer from a host on the internet outweighs a system that says there is only a
+/// local network: its own probe of the internet is often blocked (a proxy, a VPN, a DNS filter).
+const ANSWERED_LATELY: Duration = Duration::from_secs(30);
+
+/// When a host on the internet last answered a request, with any answer.
+static ANSWERED: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// A host answered a request to `url` (see [`is_offline`]).
+pub(crate) fn answered(url: &Url) {
+    if !local(url) {
+        *ANSWERED.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+    }
+}
+
+/// The internet cannot be reached now: the system says there is no network, or only a local one
+/// while no host on the internet has answered for [`ANSWERED_LATELY`].
 pub fn is_offline() -> bool {
-    matches!(reach(), Reach::Nothing | Reach::Local)
+    let answered = ANSWERED.lock().unwrap_or_else(|e| e.into_inner()).is_some_and(|at| at.elapsed() < ANSWERED_LATELY);
+    let gone = match reach() {
+        Reach::Nothing => true,
+        Reach::Local => !answered,
+        _ => false,
+    };
+    let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    if gone {
+        state.gone_since.get_or_insert_with(Instant::now);
+    } else {
+        state.gone_since = None;
+    }
+    gone
 }
 
-/// Whether a request to `url` that failed for want of an answer is to wait for the network rather
-/// than count as a try: the system says the network is gone (for a host on this computer or a
-/// local network, only when there is no network at all), and has said so for less than
-/// [`GIVE_UP_AFTER`].
+/// Whether a request to `url` that got no answer at all is to wait for the network rather than
+/// count as a try: the internet is gone (see [`is_offline`]), and has been for less than
+/// [`GIVE_UP_AFTER`]. Never for a host on this computer or a local network: its silence is its own.
 pub fn waits(url: &Url) -> bool {
     #[cfg(test)]
     if let Some(gone) = fake::gone(url) {
         return gone;
     }
-    let gone = match reach() {
-        Reach::Nothing => true,
-        Reach::Local => !local(url),
-        _ => false,
-    };
+    if local(url) || !is_offline() {
+        return false;
+    }
     let since = STATE.lock().unwrap_or_else(|e| e.into_inner()).gone_since;
-    gone && since.is_some_and(|since| since.elapsed() < GIVE_UP_AFTER)
+    since.is_some_and(|since| since.elapsed() < GIVE_UP_AFTER)
 }
 
 /// Resolves once the system says the network is back for `url` (at once where it tells of
@@ -386,9 +404,10 @@ mod tests {
         assert_eq!(fake::gone(&url), None);
     }
 
-    /// A file server on this computer that answers HEAD and its first GET, then drops every
-    /// connection while `down`: as if the network went away once the download had started.
-    async fn flaky_server(body: Arc<Vec<u8>>, down: Arc<AtomicBool>) -> u16 {
+    /// A file server on this computer that answers HEAD and its first GET, then, while `down`,
+    /// leaves every request unanswered (as if the network went away once the download had
+    /// started), or answers it with `refusal` when there is one.
+    async fn flaky_server(body: Arc<Vec<u8>>, down: Arc<AtomicBool>, refusal: Option<&'static str>) -> u16 {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let gets = Arc::new(AtomicUsize::new(0));
@@ -418,6 +437,12 @@ mod tests {
                     let (status, part) = match range {
                         Some(_) => ("206 Partial Content", format!("Content-Range: bytes {from}-{to}/{}\r\n", body.len())),
                         None => ("200 OK", String::new()),
+                        match refusal {
+                            Some(status) => {
+                                let _ = socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await;
+                            }
+                            None => tokio::time::sleep(Duration::from_secs(30)).await,
+                        }
                     };
                     let length = to + 1 - from;
                     let answer = format!("HTTP/1.1 {status}\r\n{part}Content-Length: {length}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n");
@@ -431,9 +456,10 @@ mod tests {
         port
     }
 
-    /// A download whose network goes away once it has started waits for it, its one try allowed
-    /// untouched, and finishes once the network is back; with the network there, the same server
-    /// going silent fails it as before.
+    /// A download whose requests go unanswered once its network has gone waits for it, its one
+    /// try allowed untouched, and finishes once the network is back. With the network there, the
+    /// same server going silent fails it as before, and so does a server answering 502 while the
+    /// network is said to be gone: an answer is never the network's doing.
     #[tokio::test]
     async fn a_download_waits_for_the_network_to_come_back() {
         let body: Arc<Vec<u8>> = Arc::new((0..4u32 << 20).map(|i| (i % 251) as u8).collect());
@@ -445,7 +471,7 @@ mod tests {
                 output_path: Some(folder),
                 num_connections: 4,
                 max_retries: 1,
-                stall_timeout_secs: 5,
+                stall_timeout_secs: 2,
                 remote_checksum: false,
                 ..Default::default()
             };
@@ -454,16 +480,24 @@ mod tests {
         let limit = Duration::from_secs(60);
 
         let down = Arc::new(AtomicBool::new(true));
-        let port = flaky_server(Arc::clone(&body), Arc::clone(&down)).await;
+        let port = flaky_server(Arc::clone(&body), Arc::clone(&down), Some("502 Bad Gateway")).await;
+        fake::set(port, true);
+        let failed = tokio::time::timeout(limit, fetch(port).run(None)).await.unwrap();
+        fake::set(port, false);
+        assert!(failed.is_err(), "an answer counts as a try: {failed:?}");
+
+        let port = flaky_server(Arc::clone(&body), Arc::clone(&down), None).await;
         let failed = tokio::time::timeout(limit, fetch(port).run(None)).await.unwrap();
         assert!(failed.is_err(), "the network there, the server's silence fails it: {failed:?}");
 
-        let port = flaky_server(Arc::clone(&body), Arc::clone(&down)).await;
+        let port = flaky_server(Arc::clone(&body), Arc::clone(&down), None).await;
+        assert!(!waits(&Url::parse(&format!("http://127.0.0.1:{port}/file.bin")).unwrap()));
         fake::set(port, true);
         let back = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(3)).await;
             down.store(false, Ordering::SeqCst);
             fake::set(port, false);
+        // A host on this computer is never waited for, whatever the system says.
         });
         let started = Instant::now();
         let path = tokio::time::timeout(limit, fetch(port).run(None)).await.unwrap().expect("waited for the network");

@@ -3375,7 +3375,7 @@ impl DownloadEngine {
                 }
             }
             // So is a network gone; `network::GIVE_UP_AFTER` bounds how long.
-            if kind == FailureKind::Transient && crate::network::waits(&remote.final_url) {
+            if kind == FailureKind::Offline {
                 tracing::warn!("Download attempt failed ({}); waiting for the network", error);
                 tokio::select! {
                     _ = self.cancel_token.cancelled() => return Err(CANCELLED.to_string()),
@@ -3416,7 +3416,11 @@ impl DownloadEngine {
         let stall = self.stall_timeout();
         let transient = |msg: String| (FailureKind::Transient, msg);
         // No answer from a host that refused us just before: it shuts us out for a while.
-        let unanswered = |slot: &HostSlot, msg: String| slot.unanswered().map_or((FailureKind::Transient, msg.clone()), |rest| (FailureKind::Banned(rest), msg));
+        // Else one with no answer at all may wait for the network (see `worker::unanswered`).
+        let unanswered = |slot: &HostSlot, none: bool, msg: String| {
+            let kind = || if none { crate::worker::unanswered(&remote.final_url) } else { FailureKind::Transient };
+            (slot.unanswered().map_or_else(kind, FailureKind::Banned), msg)
+        };
         let (response, slot) = match answered {
             Some(answered) => answered,
             None => {
@@ -3434,8 +3438,8 @@ impl DownloadEngine {
                     biased;
                     _ = self.cancel_token.cancelled() => return Err(transient(CANCELLED.to_string())),
                     res = tokio::time::timeout(stall, request) => match res {
-                        Err(_) => return Err(unanswered(&slot, format!("no response within {}s", stall.as_secs()))),
-                        Ok(Err(e)) => return Err(unanswered(&slot, format!("request failed: {}", e))),
+                        Err(_) => return Err(unanswered(&slot, true, format!("no response within {}s", stall.as_secs()))),
+                        Ok(Err(e)) => return Err(unanswered(&slot, e.is_connect() || e.is_timeout(), format!("request failed: {}", e))),
                         Ok(Ok(resp)) => resp,
                     },
                 };

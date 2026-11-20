@@ -462,6 +462,7 @@ pub(crate) async fn send(build: impl Fn(&Url) -> RequestBuilder, url: &Url) -> r
             None => break,
         }
     }
+    crate::network::answered(response.url());
     Ok(response)
 }
 
@@ -700,8 +701,7 @@ impl HttpWorker {
             return false;
         }
         // No answer while the network is gone costs no try: the worker waits for it to come back.
-        let offline = matches!(outcome, Err((FailureKind::Transient, _))) && !chunk.revoked.is_cancelled() && crate::network::waits(url);
-        let outcome = outcome.map_err(|(kind, error)| (if offline { FailureKind::Offline } else { kind }, error));
+        let offline = matches!(outcome, Err((FailureKind::Offline, _))) && !chunk.revoked.is_cancelled();
         // Settled before looking for more work, so nobody (including this worker) mistakes the
         // chunk for a live one to steal from. The event wakes the engine so it notices completion
         // or a fatal error.
@@ -910,7 +910,7 @@ impl HttpWorker {
             res = tokio::time::timeout(s.stall_timeout, send(request, url)) => match res {
                 Err(_) => {
                     let error = format!("no response within {}s", s.stall_timeout.as_secs());
-                    return Err(banned(error.clone()).unwrap_or((FailureKind::Transient, error)));
+                    return Err(banned(error.clone()).unwrap_or_else(|| (unanswered(url), error)));
                 }
                 Ok(Err(e)) => {
                     if let Some(failure) = banned(format!("no answer from a host that refused us just before: {e}")) {
@@ -924,7 +924,8 @@ impl HttpWorker {
                     if err_str.contains("rate limited") || err_str.contains("too many") {
                         return Err((FailureKind::Throttled(Some(std::time::Duration::from_secs(5))), format!("request throttled: {}", e)));
                     }
-                    return Err((FailureKind::Transient, format!("request failed: {}", e)));
+                    let kind = if e.is_connect() || e.is_timeout() { unanswered(url) } else { FailureKind::Transient };
+                    return Err((kind, format!("request failed: {}", e)));
                 }
                 Ok(Ok(resp)) => {
                     s.reached(route, url);
@@ -1225,6 +1226,13 @@ fn cancelled() -> Failure {
 
 fn taken_over() -> Failure {
     (FailureKind::Transient, "no data for too long; another connection took over".to_string())
+}
+
+/// A request to `url` that got no answer at all (no connection, no name, no response in time):
+/// it waits for the network while the system says that is gone (see `network::waits`), and
+/// counts as a try otherwise. Anything that did answer always counts.
+pub(crate) fn unanswered(url: &Url) -> FailureKind {
+    if crate::network::waits(url) { FailureKind::Offline } else { FailureKind::Transient }
 }
 
 /// How long a chunk's worker may wait for a byte from its mirror before an idle worker takes over
