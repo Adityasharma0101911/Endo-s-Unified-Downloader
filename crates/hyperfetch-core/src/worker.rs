@@ -237,6 +237,12 @@ impl RateLimiter {
         Arc::new(Self { own: Some((live, shared)), ..Self::new(1) })
     }
 
+    /// Whether this holds bytes back now, which turns off what a speed limit would confuse: a
+    /// download's own limit with no speed set and no other limit beneath it does not.
+    pub fn limits(&self) -> bool {
+        self.own.as_ref().is_none_or(|(live, shared)| live.speed().is_some() || shared.is_some())
+    }
+
     /// A download's share of `whole`: the shares held back by it split what the others leave of
     /// it by their weights (a High download's is 4, a Normal's 2, a Low's 1), so a share that
     /// takes less leaves the rest to them, and `whole` still holds them all to its speed.
@@ -266,12 +272,6 @@ impl RateLimiter {
             if now.saturating_duration_since(since) >= 2 * SHARE_WINDOW {
                 continue;
             }
-    /// Whether this holds bytes back now, which turns off what a speed limit would confuse: a
-    /// download's own limit with no speed set and no other limit beneath it does not.
-    pub fn limits(&self) -> bool {
-        self.own.as_ref().is_none_or(|(live, shared)| live.speed().is_some() || shared.is_some())
-    }
-
             let owed = other.owed.lock();
             if owed.short(now) || took >= 0.8 * owed.rate {
                 held += other.weight();
