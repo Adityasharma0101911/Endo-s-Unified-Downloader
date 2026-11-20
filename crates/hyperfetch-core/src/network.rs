@@ -133,18 +133,29 @@ pub async fn back(url: &Url) {
 
 /// Whether the system says this computer's connection is metered (paid by the amount, or capped):
 /// on Windows its connectivity hint's cost, or roaming; on Linux NetworkManager's flag, a guess
-/// included; never elsewhere, or where it cannot tell. Asked at most every 5 seconds.
+/// included; never elsewhere, or where it cannot tell. Asked at most every 5 seconds; on Linux on
+/// a thread of its own, as `busctl` can take seconds, the last answer standing meanwhile.
 pub fn metered() -> bool {
     static SEEN: Mutex<Option<(Instant, bool)>> = Mutex::new(None);
-    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    match *seen {
-        Some((at, metered)) if at.elapsed() < Duration::from_secs(5) => metered,
-        _ => {
-            let metered = imp::metered();
-            *seen = Some((Instant::now(), metered));
-            metered
-        }
+    static ASKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    use std::sync::atomic::Ordering::SeqCst;
+    let seen = *SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.is_some_and(|(at, _)| at.elapsed() < Duration::from_secs(5)) || ASKING.swap(true, SeqCst) {
+        return seen.is_some_and(|(_, metered)| metered);
     }
+    let ask = || {
+        let metered = imp::metered();
+        *SEEN.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), metered));
+        ASKING.store(false, SeqCst);
+        metered
+    };
+    if !cfg!(target_os = "linux") {
+        return ask();
+    }
+    if std::thread::Builder::new().name("metered".into()).spawn(ask).is_err() {
+        ASKING.store(false, SeqCst);
+    }
+    seen.is_some_and(|(_, metered)| metered)
 }
 
 /// How many times the app's queue starts again by itself a download that failed for a network

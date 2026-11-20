@@ -487,6 +487,8 @@ impl App {
     /// registers the `endo-dl:` link when it takes `links` (see `desktop::takes_links`).
     fn new(cc: &eframe::CreationContext<'_>, rt: tokio::runtime::Handle, restart: Arc<Mutex<Option<PathBuf>>>, minimized: bool, links: bool) -> Self {
         ui::setup(&cc.egui_ctx);
+        // Asked before the queue first runs: on Linux the answer comes on a thread of its own.
+        hyperfetch_core::network::metered();
         let settings = Settings::load();
         let (queue, queue_problem) = queue_store::load(&queue_store::path());
         let queue_saver = queue_store::Saver::spawn(queue_store::path())
