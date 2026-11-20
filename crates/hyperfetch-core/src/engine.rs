@@ -68,7 +68,8 @@ const BUSY_PATIENCE: Duration = Duration::from_secs(5 * 60);
 const BUSY_BACKOFF: Duration = Duration::from_secs(2);
 /// Longest pause between probe tries, whatever Retry-After asks for.
 const PROBE_RETRY_CAP: Duration = Duration::from_secs(5);
-/// How long the probe still waits for HEAD once the ranged GET has answered.
+/// How long the probe waits for HEAD, past what the ranged GET's first try waited for its answer,
+/// when that answer left something out.
 const HEAD_GRACE: Duration = Duration::from_millis(500);
 /// How long the first mirror's probe is still waited for once another mirror answered: the first
 /// says which file is downloaded, but one that does not answer must not hold the download up.
@@ -4726,10 +4727,11 @@ struct Pace {
 
 /// Learns size, range support, name and validators. HEAD is only a hint: servers and proxies
 /// advertise ranges (and sizes) their GETs do not honour, so a ranged GET always decides range
-/// support and size, and supplies the name and validators wherever it has them. HEAD and GET go
-/// out together, so probing takes one round trip. A GET still busy or failing after its tries
-/// tells nothing, so HEAD's word is taken then (ranges included) and the download itself waits
-/// out the busy server; only without HEAD is it an error.
+/// support and size, and supplies the name and validators wherever it has them. HEAD goes out only
+/// once the GET's answer leaves out something it could add (see `says_it_all`), as every request
+/// counts against a host that limits how often it is asked. A GET still busy or failing after its
+/// tries tells nothing, so HEAD is asked then and its word taken (ranges included), and the
+/// download itself waits out the busy server; only without HEAD is it an error.
 ///
 /// With `prefetch` the GET asks for the first `PREFETCH` bytes instead of one, and its response
 /// comes back too when its body is of use: the start of the file (or all of it, if that small)
@@ -4738,10 +4740,10 @@ struct Pace {
 ///
 /// HEAD and GET each hold a slot of their host's budget under `limit` (see [`crate::hosts`]).
 /// The GET waits for its slot before the probe's time runs, since a host busy with other
-/// downloads is no dead mirror, and keeps it for as long as its answer is read. HEAD goes out
-/// alongside only with a slot free at once: waiting for one while the GET holds another could be
-/// waiting for the GET's own. Without one, HEAD goes out after a GET that left no body to read,
-/// under the GET's slot, and is left out otherwise.
+/// downloads is no dead mirror, and keeps it for as long as its answer is read. HEAD goes out only
+/// with a slot free at once: waiting for one while the GET holds another could be waiting for the
+/// GET's own. Without one, HEAD goes out after a GET that left no body to read, under the GET's
+/// slot, and is left out otherwise.
 ///
 /// A server still answering 429 or 503 after the GET's tries, with no HEAD to go by, is probed
 /// again once the wait its Retry-After asks for is over, else after `BUSY_BACKOFF`, doubling up
@@ -4830,13 +4832,6 @@ async fn probe_with(
             }
         }
     };
-    // Without `head`, HEAD goes out only as the last resort below.
-    let head_slot = if head { hosts::try_acquire(url, limit) } else { None };
-    let alongside = head_slot.is_some();
-    let head = async {
-        let _slot = head_slot?;
-        send_head().await
-    };
     // The bytes the GET asks for.
     let asked = if prefetch { PREFETCH } else { 1 };
     let range = format!("bytes=0-{}", asked - 1);
@@ -4884,18 +4879,7 @@ async fn probe_with(
             }
         }
     };
-    // Once the GET has answered, a HEAD that is still out only gets a short grace: some servers
-    // never answer HEAD, and the GET alone has everything needed. None at all once the GET has
-    // everything HEAD could add.
-    tokio::pin!(head, ranged);
-    let (head, (ranged, answered, setup)) = tokio::select! {
-        head = &mut head => (head, ranged.await),
-        ranged = &mut ranged => {
-            let complete = ranged.0.as_ref().is_ok_and(|r| says_it_all(r.status(), r.headers(), r.url()));
-            let head = if complete { None } else { tokio::time::timeout(HEAD_GRACE, head).await.ok().flatten() };
-            (head, ranged)
-        }
-    };
+    let (ranged, answered, setup) = ranged.await;
     // The GET's host answered, asked for a rest, or shuts us out for one (see `crate::hosts`).
     let shut_out = match &ranged {
         Ok(resp) if is_busy(resp.status()) => {
@@ -4913,11 +4897,18 @@ async fn probe_with(
     let usable = ranged.as_ref().is_ok_and(|resp| {
         matches!(resp.status(), StatusCode::PARTIAL_CONTENT | StatusCode::OK | StatusCode::RANGE_NOT_SATISFIABLE)
     });
-    // HEAD without a slot of its own goes out now if the GET left nothing to read under its slot:
-    // it is all the probe has to go by then.
-    let head = match head {
-        None if !alongside && !usable => send_head().await,
-        head => head,
+    // HEAD goes out only for what the GET's answer left out (see `says_it_all`), with a slot free
+    // at once, for a short grace past the GET's own wait: each request counts against a host that
+    // limits how often it is asked, and some servers never answer HEAD. If the GET left nothing to
+    // read, HEAD goes out under its slot, `head` or not: it is all the probe has to go by then.
+    let complete = ranged.as_ref().is_ok_and(|r| says_it_all(r.status(), r.headers(), r.url()));
+    let head = match (usable, head && !complete) {
+        (false, _) => send_head().await,
+        (true, true) => match hosts::try_acquire(url, limit) {
+            Some(_slot) => tokio::time::timeout(HEAD_GRACE + setup.unwrap_or_default(), send_head()).await.ok().flatten(),
+            None => None,
+        },
+        (true, false) => None,
     };
     // A body is read under the GET's slot, which a redirect moves to the host it came from.
     let body = |response: Response, holds: Holds| {
@@ -10142,6 +10133,21 @@ mod tests {
         let (info, body) = probe_url(&client, None, &refused, true, true, 1, true).await.expect("HEAD answers for the refused GET");
         assert_eq!((info.size, info.accepts_ranges, info.etag.as_deref()), (Some(4096), true, Some("\"v1\"")));
         assert!(body.is_none());
+    }
+
+    /// The probe asks HEAD only for what its ranged GET's answer left out: nothing of a server
+    /// whose 206 has the size, a strong ETag and a name in its link; the ETag of one whose GETs
+    /// carry none.
+    #[tokio::test]
+    async fn test_head_is_asked_only_for_what_the_get_left_out() {
+        let client = Client::new();
+        let (url, stats) = crate::netsim::serve(crate::netsim::Server { size: 4096, ..Default::default() }).await;
+        let (info, _) = probe_url(&client, None, &url, false, true, 0, true).await.unwrap();
+        assert_eq!((info.size, info.accepts_ranges, info.etag.as_deref()), (Some(4096), true, Some("\"v1\"")));
+        assert_eq!(stats.heads.load(Ordering::SeqCst), 0, "the ranged GET said it all");
+        let base = file_server(vec![7u8; 4096], Duration::ZERO).await;
+        let (info, _) = probe_url(&client, None, &base.join("untagged/f.bin").unwrap(), false, true, 0, true).await.unwrap();
+        assert_eq!(info.etag.as_deref(), Some("\"v1\""), "HEAD's");
     }
 
     #[tokio::test]
