@@ -792,7 +792,7 @@ impl DownloadEngine {
     pub async fn probe(&self) -> Result<crate::relink::RemoteFile, String> {
         let client = self.client.clone()?;
         let url = self.urls.first().ok_or_else(|| "no link to ask".to_string())?;
-        let (info, _) = probe_url(&client, self.auth.as_deref(), url, false, true, self.options.max_connections_per_host).await?;
+        let (info, _) = probe_url(&client, self.auth.as_deref(), url, false, true, self.options.max_connections_per_host, agent_is_ours(&self.options)).await?;
         Ok(crate::relink::RemoteFile { size: info.size, accepts_ranges: info.accepts_ranges, etag: info.etag, last_modified: info.last_modified })
     }
 
@@ -2661,7 +2661,7 @@ impl DownloadEngine {
         // A file pinned by its hash (a listing's, or the user's) needs no HEAD beside the GET: what
         // HEAD adds is hints, and each request counts against the host (a batch of small files
         // otherwise asks twice per file).
-        let head = self.options.expected_checksum.is_none();
+        let (head, as_app) = (self.options.expected_checksum.is_none(), agent_is_ours(&self.options));
         let (flags, tell) = ((Arc::clone(&reading), Arc::clone(&started)), snapshot_tx.clone());
         let mut probes: ProbeStream = futures_util::stream::iter(owned.into_iter().enumerate())
             .map(move |(i, url)| {
@@ -2671,7 +2671,7 @@ impl DownloadEngine {
                     let probe = async {
                         // Only the first mirror fetches the file's start: the download uses one copy;
                         // none does when an older version may hold it (see `DownloadEngine::delta`).
-                        let (mut info, body) = probe_url(&client, auth.as_deref(), &url, i == 0 && !delta, head, limit).await?;
+                        let (mut info, body) = probe_url(&client, auth.as_deref(), &url, i == 0 && !delta, head, limit, as_app).await?;
                         // A small file need not hold a batch's or queue's place while it comes (see
                         // `EngineSnapshot::small`); its later snapshots say so again, or that it
                         // was no file after all.
@@ -3290,6 +3290,7 @@ impl DownloadEngine {
         }
         let mut seen: Vec<Url> = mirrors.iter().flat_map(|m| [m.url.clone(), m.final_url.clone()]).collect();
         let (client, auth, limit, size) = (client.clone(), self.auth.clone(), self.options.max_connections_per_host, reference.size);
+        let as_app = agent_is_ours(&self.options);
         let listed = {
             let client = client.clone();
             async move {
@@ -3307,7 +3308,7 @@ impl DownloadEngine {
         };
         let probes = futures_util::stream::once(listed).flatten().map(move |url| {
             let (client, auth) = (client.clone(), auth.clone());
-            async move { (0, probe_url(&client, auth.as_deref(), &url, false, true, limit).await.map(|(info, _)| (info, None))) }
+            async move { (0, probe_url(&client, auth.as_deref(), &url, false, true, limit, as_app).await.map(|(info, _)| (info, None))) }
         });
         Some(probes.buffer_unordered(PROBE_CONCURRENCY).boxed())
     }
@@ -4739,6 +4740,10 @@ struct Pace {
 /// to eight times that, for up to `BUSY_PATIENCE` in all: a server that sheds load at first is
 /// common, and the download would otherwise fail at once. Each wait is logged; it holds no slot,
 /// and ends with the probe when the download is cancelled or paused.
+///
+/// With `as_app` (the User-Agent is the app's to choose, see `agent_is_ours`), a host that hangs
+/// up on the GET without an answer is asked once more with the app's own User-Agent in place of
+/// the browser one, and from then on when it answers that (see `crate::resolver::ask_as_app`).
 async fn probe_url(
     client: &Client,
     auth: Option<&Auth>,
@@ -4746,12 +4751,13 @@ async fn probe_url(
     prefetch: bool,
     head: bool,
     limit: usize,
+    as_app: bool,
 ) -> Result<(ProbeInfo, Option<ProbeBody>), String> {
     let deadline = tokio::time::Instant::now() + BUSY_PATIENCE;
     let mut waits = 0u32;
     loop {
         let slot = hosts::acquire(url, limit).await;
-        let (message, asked) = match tokio::time::timeout(PROBE_TIMEOUT, probe_with(client, auth, url, prefetch, head, limit, slot)).await {
+        let (message, asked) = match tokio::time::timeout(PROBE_TIMEOUT, probe_with(client, auth, url, prefetch, head, limit, as_app, slot)).await {
             Ok(Ok(found)) => return Ok(found),
             Ok(Err(ProbeError::Busy(message, asked))) => (message, asked),
             Ok(Err(ProbeError::Failed(message))) => return Err(message),
@@ -4780,7 +4786,18 @@ impl From<String> for ProbeError {
     }
 }
 
+/// Whether the User-Agent is the app's to choose: neither the user nor the browser's headers set one.
+fn agent_is_ours(options: &DownloadOptions) -> bool {
+    options.user_agent.is_none() && !options.headers.iter().chain(&options.extra_headers).any(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+}
+
+/// Whether the request went out on a connection that was then closed without an answer.
+fn hung_up(error: &reqwest::Error) -> bool {
+    error.is_request() && !error.is_connect() && !error.is_timeout()
+}
+
 /// `probe_url` once the GET holds `slot`.
+#[allow(clippy::too_many_arguments)]
 async fn probe_with(
     client: &Client,
     auth: Option<&Auth>,
@@ -4788,6 +4805,7 @@ async fn probe_with(
     prefetch: bool,
     head: bool,
     limit: usize,
+    as_app: bool,
     slot: HostSlot,
 ) -> Result<(ProbeInfo, Option<ProbeBody>), ProbeError> {
     let cold = slot.opens_connection();
@@ -4823,6 +4841,22 @@ async fn probe_with(
             let request =
                 |url: &Url| authorize(client.get(url.clone()), auth, url).header(RANGE, range.as_str()).header(ACCEPT_ENCODING, "identity");
             let sent = send(request, url).await;
+            // A host that hangs up on the browser User-Agent is asked once more as the app
+            // itself, and from then on when it answers that (see `crate::resolver::ask_as_app`).
+            let sent = match sent {
+                Err(e) if as_app && hung_up(&e) && crate::resolver::ask_as_app(url) => match send(request, url).await {
+                    Ok(resp) if resp.status().is_success() => {
+                        // Chunk requests go straight to the host a redirect led to.
+                        crate::resolver::ask_as_app(resp.url());
+                        Ok(resp)
+                    }
+                    _ => {
+                        crate::resolver::ask_as_browser(url);
+                        Err(e)
+                    }
+                },
+                sent => sent,
+            };
             let retry_in = match &sent {
                 Ok(resp) if is_busy(resp.status()) => Some(retry_after(resp.headers()).unwrap_or_default()),
                 Ok(_) => None,
@@ -10022,7 +10056,7 @@ mod tests {
         let client = Client::new();
         let probe = |path: &str| {
             let (client, url) = (client.clone(), base.join(path).unwrap());
-            async move { probe_url(&client, None, &url, false, true, 0).await.unwrap().0 }
+            async move { probe_url(&client, None, &url, false, true, 0, true).await.unwrap().0 }
         };
         // Chunk requests skip the redirect the probe went through: its wait overstates theirs, but
         // unlike an assumed one never makes a slow target look quick. What a new connection to the
@@ -10047,13 +10081,13 @@ mod tests {
         // One request to the host at a time, which the ranged GET holds: HEAD has no slot. A GET
         // naming the file without a validator would otherwise leave HEAD its grace.
         let started = std::time::Instant::now();
-        let (info, _) = probe_url(&client, None, &base.join("untagged/f.bin").unwrap(), false, true, 1).await.unwrap();
+        let (info, _) = probe_url(&client, None, &base.join("untagged/f.bin").unwrap(), false, true, 1, true).await.unwrap();
         assert!(started.elapsed() < HEAD_GRACE, "HEAD was waited for: {:?}", started.elapsed());
         assert_eq!((info.size, info.accepts_ranges, info.etag), (Some(4096), true, None));
         // A GET refused on every try leaves nothing to read: HEAD goes out after it, under its
         // slot, and says what the file is.
         let refused = base.join("refused/f.bin").unwrap();
-        let (info, body) = probe_url(&client, None, &refused, true, true, 1).await.expect("HEAD answers for the refused GET");
+        let (info, body) = probe_url(&client, None, &refused, true, true, 1, true).await.expect("HEAD answers for the refused GET");
         assert_eq!((info.size, info.accepts_ranges, info.etag.as_deref()), (Some(4096), true, Some("\"v1\"")));
         assert!(body.is_none());
     }
@@ -10125,15 +10159,62 @@ mod tests {
         let client = Client::new();
         // Nothing went to the host before: the probe's connection is new, and its wait what a
         // new one needs.
-        let (probe, _) = probe_url(&client, None, &url, false, true, 0).await.unwrap();
+        let (probe, _) = probe_url(&client, None, &url, false, true, 0, true).await.unwrap();
         let seen = hosts::profile(&url);
         assert_eq!(seen.accepts_ranges, Some(true));
         assert!(seen.setup_time.is_some() && seen.setup_time == probe.answer_time, "{seen:?}");
         // Right after, a connection may be open for reuse: the next probe's wait tells nothing.
         let cold = Duration::from_secs(7);
         hosts::record(&url, HostProfile { setup_time: Some(cold), ..Default::default() });
-        probe_url(&client, None, &url, false, true, 0).await.unwrap();
+        probe_url(&client, None, &url, false, true, 0, true).await.unwrap();
         assert_eq!(hosts::profile(&url).setup_time, Some(cold));
+    }
+
+    /// A host that hangs up on the browser User-Agent without a word is asked as the app itself,
+    /// and from then on. Not one that hangs up on the app too, nor when the agent is the user's.
+    #[tokio::test]
+    async fn test_a_host_that_hangs_up_on_a_browser_is_asked_as_the_app() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // Serves the first byte of a 4096-byte file to a GET that does not pass as a browser's
+        // (`picky`), and hangs up on everything else.
+        async fn server(picky: bool) -> Url {
+            let listener = hosts::unseen_listener().await;
+            let url = Url::parse(&format!("http://{}/file.bin", listener.local_addr().unwrap())).unwrap();
+            tokio::spawn(async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        let mut head = [0u8; 4096];
+                        let read = socket.read(&mut head).await.unwrap_or(0);
+                        let head = String::from_utf8_lossy(&head[..read]).to_ascii_lowercase();
+                        if picky && head.starts_with("get ") && !head.contains("user-agent: mozilla") {
+                            let answer = "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-0/4096\r\nContent-Length: 1\r\nConnection: close\r\n\r\n7";
+                            let _ = socket.write_all(answer.as_bytes()).await;
+                        }
+                    });
+                }
+            });
+            url
+        }
+        let client = build_client_with_proxy(&DownloadOptions::default(), None).unwrap();
+        let probe = |url: Url, as_app: bool| {
+            let client = client.clone();
+            async move { tokio::time::timeout(Duration::from_secs(60), probe_url(&client, None, &url, false, true, 0, as_app)).await.expect("the probe ends") }
+        };
+        let picky = server(true).await;
+        let (info, _) = probe(picky.clone(), true).await.expect("the app's own agent is answered");
+        assert_eq!(info.size, Some(4096));
+        assert!(crate::resolver::asked_as_app(&picky));
+        // The download's later requests go as the app too.
+        let request = authorize(client.get(picky.clone()), None, &picky).build().unwrap();
+        assert_eq!(request.headers().get(USER_AGENT).unwrap(), crate::resolver::APP_USER_AGENT);
+
+        let deaf = server(false).await;
+        assert!(probe(deaf.clone(), true).await.is_err());
+        assert!(!crate::resolver::asked_as_app(&deaf));
+
+        let chosen = server(true).await;
+        assert!(probe(chosen.clone(), false).await.is_err());
+        assert!(!crate::resolver::asked_as_app(&chosen));
     }
 
     #[test]

@@ -1570,13 +1570,36 @@ pub(crate) const APP_USER_AGENT: &str = concat!("EndosUnifiedDownloader/", env!(
 /// with a 403 page (its mirrors take either).
 const OWN_AGENT_HOSTS: &[&str] = &["codeberg.org", "sourceforge.net", "www.sourceforge.net", "downloads.sourceforge.net"];
 
+/// Hosts found to hang up on the browser User-Agent without an answer and to answer
+/// [`APP_USER_AGENT`] (see [`ask_as_app`]): some file servers drop every browser. Kept until the
+/// app is closed.
+static OWN_AGENT_FOUND: parking_lot::Mutex<Option<HashSet<crate::hosts::HostKey>>> = parking_lot::const_mutex(None);
+
+/// Whether `url`'s host is asked with [`APP_USER_AGENT`].
+pub(crate) fn asked_as_app(url: &Url) -> bool {
+    url.host_str().is_some_and(|host| OWN_AGENT_HOSTS.contains(&host.trim_end_matches('.')))
+        || OWN_AGENT_FOUND.lock().as_ref().is_some_and(|found| found.contains(&crate::hosts::HostKey::of(url)))
+}
+
+/// Has `url`'s host asked with [`APP_USER_AGENT`] from now on: false when it already is.
+pub(crate) fn ask_as_app(url: &Url) -> bool {
+    !asked_as_app(url) && OWN_AGENT_FOUND.lock().get_or_insert_with(HashSet::new).insert(crate::hosts::HostKey::of(url))
+}
+
+/// Takes [`ask_as_app`] back: `url`'s host did not answer the app either.
+pub(crate) fn ask_as_browser(url: &Url) {
+    if let Some(found) = OWN_AGENT_FOUND.lock().as_mut() {
+        found.remove(&crate::hosts::HostKey::of(url));
+    }
+}
+
 /// `request`, for `url`, with the User-Agent `url`'s host takes.
 pub(crate) fn with_agent_for(request: reqwest::RequestBuilder, url: &Url) -> reqwest::RequestBuilder {
     // The cookie a file share's download wants (see `crate::shares::with_cookie`).
     let request = crate::shares::with_cookie(request, url);
-    match url.host_str() {
-        Some(host) if OWN_AGENT_HOSTS.contains(&host.trim_end_matches('.')) => request.header(USER_AGENT, APP_USER_AGENT),
-        _ => request,
+    match asked_as_app(url) {
+        true => request.header(USER_AGENT, APP_USER_AGENT),
+        false => request,
     }
 }
 
