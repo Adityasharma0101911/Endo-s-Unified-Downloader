@@ -1220,8 +1220,9 @@ impl App {
     /// Adds a download, starts it immediately and shows it on the Downloader tab. A file that is
     /// already downloading is shown instead of being started twice. A .metalink, .meta4 or
     /// .torrent, or a folder, feed or playlist link, is read first; the first download it lists
-    /// starts, the others wait in the queue.
-    fn download_now(&mut self, text: &str, checksum: &str, auth: &str) {
+    /// starts, the others wait in the queue. With `ranges`, a link with ranges (one typed or
+    /// copied, not one the browser sent) stands for its links.
+    fn download_now(&mut self, text: &str, checksum: &str, auth: &str, ranges: bool) {
         self.tab = Tab::Downloads;
         let update = self.update_on_disk.take();
         // The first link of a paste with secrets starts, the others wait; the form clears as
@@ -1243,10 +1244,11 @@ impl App {
             None => {}
         }
         // A link with ranges queues its links, as the queue input does; they start as the queue
-        // allows.
-        match ingest::expand_line(text.trim()) {
+        // allows. One the browser sent is taken as it is.
+        match ingest::range_span(text.trim()) {
+            _ if !ranges => {}
             Err(e) => return self.form_error = Some(e),
-            Ok(links) if links.len() > 1 => {
+            Ok(Some(_)) => {
                 let before = self.queue.items().len();
                 let (_, error, added) = self.add_lines(text, checksum, auth);
                 if added {
@@ -1356,7 +1358,10 @@ impl App {
             return (String::new(), Some("Enter one download per line".to_string()), false);
         }
         // A link with ranges stands for its links, each queued as a line of its own.
-        let expanded: Vec<_> = lines.iter().map(|line| ingest::expand_line(line)).collect();
+        let expanded = match ingest::expand_lines(lines.iter().copied()) {
+            Ok(expanded) => expanded,
+            Err(e) => return (text.to_string(), Some(e), false),
+        };
         if expanded.iter().map(|links| links.as_ref().map_or(1, Vec::len)).sum::<usize>() > 1 && !checksum.is_empty() {
             return (text.to_string(), Some(SINGLE_CHECKSUM.to_string()), false);
         }
@@ -2083,7 +2088,7 @@ impl App {
         let shown = ingest::truncate_chars(&url, 60);
         if reads {
             if start_now {
-                self.download_now(&url, "", "");
+                self.download_now(&url, "", "", false);
                 self.notice = Some(Ok(format!("Started remote download: {}", shown)));
             } else {
                 self.read_document(url, Origin::Dropped, String::new(), String::new());

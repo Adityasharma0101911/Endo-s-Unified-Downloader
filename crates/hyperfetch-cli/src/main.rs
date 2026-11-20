@@ -827,17 +827,23 @@ async fn text_inputs(text: &str, ui: &Ui) -> Result<Vec<Input>, String> {
 }
 
 /// `inputs` with the ranges of their links expanded, an input per link (see
-/// `ingest::expand_ranges`); a pasted link's are its own.
-fn expand_inputs(inputs: Vec<Input>) -> Result<Vec<Input>, String> {
+/// `ingest::expand_lines`), all of them together at most `ingest::MOST_RANGE_LINKS`; a pasted
+/// link's are its own, and with `ranges` false (--no-ranges) every link is taken as written.
+fn expand_inputs(inputs: Vec<Input>, ranges: bool) -> Result<Vec<Input>, String> {
+    if !ranges {
+        return Ok(inputs);
+    }
+    // A pasted link as an empty line, which stands for itself.
+    let joined: Vec<String> = inputs.iter().map(|(_, tokens, pasted)| if pasted.is_some() { String::new() } else { tokens.join(" ") }).collect();
+    let expanded = hyperfetch_core::ingest::expand_lines(joined.iter().map(String::as_str))?;
     let mut out = Vec::with_capacity(inputs.len());
-    for (number, tokens, pasted) in inputs {
-        let joined = tokens.join(" ");
-        let lines = if pasted.is_some() { vec![joined.clone()] } else { expand_line(&joined).map_err(|e| match number {
+    for ((number, tokens, pasted), (joined, lines)) in inputs.into_iter().zip(joined.into_iter().zip(expanded)) {
+        let lines = lines.map_err(|e| match number {
             Some(n) => format!("Line {n}: {e}"),
             None => e,
-        })? };
+        })?;
         match &lines[..] {
-            // Untouched: its tokens as they were, a path with spaces whole.
+            // Untouched (a pasted link too): its tokens as they were, a path with spaces whole.
             [line] if *line == joined => out.push((number, tokens, pasted)),
             _ => out.extend(lines.iter().map(|line| (number, split_tokens(line), None))),
         }
@@ -908,7 +914,7 @@ async fn batch(args: &Args, ui: &Ui, shutdown: &Shutdown, http: &reqwest::Client
             None => inputs.push((None, args.urls.clone(), None)),
         }
     }
-    let inputs = match expand_inputs(inputs) {
+    let inputs = match expand_inputs(inputs, !args.no_ranges) {
         Ok(inputs) => inputs,
         Err(e) => return usage(&e),
     };
@@ -1220,6 +1226,7 @@ where
             break;
         }
         let lines = match expand_line(&input) {
+            _ if args.no_ranges => vec![input.clone()],
             Ok(lines) => lines,
             Err(e) => {
                 stderr_line(&format!("[ERROR] {}", e));
@@ -2251,12 +2258,17 @@ mod tests {
     #[test]
     fn ranges_expand_to_an_input_per_link() {
         let input = |number, tokens: &[&str]| (number, tokens.iter().map(|t| t.to_string()).collect::<Vec<_>>(), None);
-        let expanded = expand_inputs(vec![input(Some(3), &["https://h.example/[1-2].bin"]), input(None, &["https://a.example/f", "https://b.example/f"])]);
+        let expanded = expand_inputs(vec![input(Some(3), &["https://h.example/[1-2].bin"]), input(None, &["https://a.example/f", "https://b.example/f"])], true);
         let seen: Vec<_> = expanded.unwrap().into_iter().map(|(number, tokens, _)| (number, tokens.join(" "))).collect();
         let want = [(Some(3), "https://h.example/1.bin"), (Some(3), "https://h.example/2.bin"), (None, "https://a.example/f https://b.example/f")];
         assert_eq!(seen, want.map(|(number, line)| (number, line.to_string())));
-        let mirrors = expand_inputs(vec![input(Some(7), &["https://a.example/[1-2]", "https://b.example/[1-2]"])]);
+        let mirrors = expand_inputs(vec![input(Some(7), &["https://a.example/[1-2]", "https://b.example/[1-2]"])], true);
         assert!(mirrors.unwrap_err().starts_with("Line 7: A link with a range"));
+        // One ceiling for all of them, and --no-ranges takes every link as written.
+        let many = expand_inputs(vec![input(Some(1), &["https://h.example/[1-6000]"]), input(Some(2), &["https://h.example/[1-6000].x"])], true);
+        assert!(many.unwrap_err().contains("more than 10000 downloads together"));
+        let written = expand_inputs(vec![input(None, &["https://h.example/Hits%20[1990-1999].zip"])], false).unwrap();
+        assert_eq!(written[0].1, ["https://h.example/Hits%20[1990-1999].zip"]);
     }
 
     /// A paste on the command line (a copied curl command, a user:pass@ link and its password)

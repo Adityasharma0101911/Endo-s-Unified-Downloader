@@ -527,59 +527,122 @@ pub fn split_tokens(line: &str) -> Vec<String> {
     line.split_whitespace().map(unquote).filter(|t| !t.is_empty()).collect()
 }
 
-/// Most links the ranges of one link may stand for.
+/// Most links the ranges of one add may stand for, all its lines together.
 pub const MOST_RANGE_LINKS: usize = 10_000;
 
-/// The links `link` stands for: each numbered or lettered range in its path, written as curl
-/// writes them (`[1-20]`, `[001-120]` keeping its zero padding, `[a-f]`, with a step after a
-/// colon `[0-100:10]`), takes each of its values in turn, the last range the fastest. A link with
-/// none is itself. Only the path of a `scheme://` link is read: an IPv6 host (`http://[::1]/`), a
-/// query string's brackets and a bracket that holds no such range stay as they are. Err for a
-/// range that counts down or steps by 0, and past [`MOST_RANGE_LINKS`].
-pub fn expand_ranges(link: &str) -> Result<Vec<String>, String> {
-    // A scheme first: a magnet's `tr=udp://` is no link of its own.
-    let scheme = |at: usize| at > 0 && link[..at].bytes().all(|b| b.is_ascii_alphanumeric() || b"+.-".contains(&b));
-    let Some(host) = link.find("://").filter(|&at| scheme(at)).map(|at| at + 3) else { return Ok(vec![link.to_string()]) };
-    let path = link[host..].find('/').map_or(link.len(), |at| host + at);
-    let end = link[path..].find(['?', '#']).map_or(link.len(), |at| path + at);
-    // The link in literal pieces and ranges' values, alternately.
-    let (mut pieces, mut ranges, mut from) = (Vec::new(), Vec::<Vec<String>>::new(), 0);
+/// How a link with a range is taken as written: with its brackets as `%5B` and `%5D`.
+pub const AS_WRITTEN: &str = "to take a link as written, write its brackets as %5B and %5D";
+
+/// One range of a link (see [`expand_ranges`]): its first value, how many values it has, its
+/// step, the width numbers are padded to, and whether it counts letters.
+struct Range {
+    start: u64,
+    count: u64,
+    step: u64,
+    width: usize,
+    letters: bool,
+}
+
+impl Range {
+    fn value(&self, n: u64) -> String {
+        let value = self.start + n * self.step;
+        if self.letters {
+            char::from(value as u8).to_string()
+        } else {
+            format!("{value:0width$}", width = self.width)
+        }
+    }
+}
+
+/// `link` in literal pieces and ranges (see [`expand_ranges`]), a piece before each range and one
+/// after the last, and how many links they stand for, counted, not built. Err for a range that
+/// counts down or steps by 0, and as soon as the count passes [`MOST_RANGE_LINKS`].
+fn ranges_of(link: &str) -> Result<(Vec<&str>, Vec<Range>, usize), String> {
+    let Some((path, end)) = path_span(link) else { return Ok((vec![link], Vec::new(), 1)) };
+    let (mut pieces, mut ranges, mut from, mut count) = (Vec::new(), Vec::new(), 0, 1usize);
     let mut at = path;
     while let Some(open) = link[at..end].find('[').map(|n| at + n) {
         let Some(close) = link[open..end].find(']').map(|n| open + n) else { break };
         at = close + 1;
-        let Some(values) = range_values(&link[open + 1..close])? else { continue };
+        let Some(range) = range(&link[open + 1..close])? else { continue };
+        count = usize::try_from(range.count).ok().and_then(|n| count.checked_mul(n)).filter(|&n| n <= MOST_RANGE_LINKS).ok_or_else(|| {
+            format!("The ranges in {link} stand for more than {MOST_RANGE_LINKS} links: split them into smaller ranges, or, {AS_WRITTEN}")
+        })?;
         pieces.push(&link[from..open]);
-        ranges.push(values);
+        ranges.push(range);
         from = close + 1;
     }
     pieces.push(&link[from..]);
-    let count = ranges.iter().try_fold(1usize, |count, values| count.checked_mul(values.len())).filter(|&n| n <= MOST_RANGE_LINKS);
-    let Some(count) = count else {
-        return Err(format!("The ranges in {link} stand for more than {MOST_RANGE_LINKS} links: split them into smaller ranges"));
-    };
-    Ok((0..count)
-        .map(|mut n| {
-            // The last range the fastest, as an odometer turns.
-            let mut picks = Vec::with_capacity(ranges.len());
-            for values in ranges.iter().rev() {
-                picks.push(values[n % values.len()].as_str());
-                n /= values.len();
-            }
-            picks.reverse();
-            let mut out = pieces[0].to_string();
-            for (pick, piece) in picks.iter().zip(&pieces[1..]) {
-                out.push_str(pick);
-                out.push_str(piece);
-            }
-            out
-        })
-        .collect())
+    Ok((pieces, ranges, count))
 }
 
-/// The values of the range `inside` a pair of brackets (see [`expand_ranges`]); None when it is
-/// no range. At most `MOST_RANGE_LINKS` and one more, which is enough to say there are too many.
-fn range_values(inside: &str) -> Result<Option<Vec<String>>, String> {
+/// Where the path of the `scheme://` link `link` starts and ends (before a query or fragment);
+/// None for no such link.
+fn path_span(link: &str) -> Option<(usize, usize)> {
+    // A scheme first: a magnet's `tr=udp://` is no link of its own.
+    let scheme = |at: usize| at > 0 && link[..at].bytes().all(|b| b.is_ascii_alphanumeric() || b"+.-".contains(&b));
+    let host = link.find("://").filter(|&at| scheme(at))? + 3;
+    let path = link[host..].find('/').map_or(link.len(), |at| host + at);
+    Some((path, link[path..].find(['?', '#']).map_or(link.len(), |at| path + at)))
+}
+
+/// The link of `pieces` and `ranges` that is the `n`th of those they stand for.
+fn nth_link(pieces: &[&str], ranges: &[Range], mut n: u64) -> String {
+    // The last range the fastest, as an odometer turns.
+    let mut picks = Vec::with_capacity(ranges.len());
+    for range in ranges.iter().rev() {
+        picks.push(range.value(n % range.count));
+        n /= range.count;
+    }
+    picks.reverse();
+    let mut out = pieces[0].to_string();
+    for (pick, piece) in picks.iter().zip(&pieces[1..]) {
+        out.push_str(pick);
+        out.push_str(piece);
+    }
+    out
+}
+
+/// The links `link` stands for: each numbered or lettered range in its path (`[1-20]`,
+/// `[001-120]` keeping its zero padding, `[a-f]`, with a step after a colon `[0-100:10]`) takes
+/// each of its values in turn, the last range the fastest. A link with none is itself. Only the
+/// path of a `scheme://` link is read: an IPv6 host (`http://[::1]/`), a query string's brackets
+/// and a bracket that holds no such range stay as they are. Err for a range that counts down or
+/// steps by 0, and past [`MOST_RANGE_LINKS`].
+pub fn expand_ranges(link: &str) -> Result<Vec<String>, String> {
+    let (pieces, ranges, count) = ranges_of(link)?;
+    if ranges.is_empty() {
+        return Ok(vec![link.to_string()]);
+    }
+    Ok((0..count as u64).map(|n| nth_link(&pieces, &ranges, n)).collect())
+}
+
+/// What the ranges of one input `line` stand for, counted, not built: how many links, and the
+/// first and the last; None when it has no range. Err as [`expand_line`] refuses it.
+pub fn range_span(line: &str) -> Result<Option<(usize, String, String)>, String> {
+    let tokens = split_tokens(line);
+    let mut found = None;
+    for token in &tokens {
+        let (pieces, ranges, count) = ranges_of(token)?;
+        if ranges.is_empty() {
+            continue;
+        }
+        if tokens.len() > 1 {
+            return Err("A link with a range ([1-20]) goes on a line of its own: links to one file from several servers cannot have one".to_string());
+        }
+        let first = nth_link(&pieces, &ranges, 0);
+        // A folder, feed or list read for each link at once would be thousands of reads.
+        if needs_reading(&first) {
+            return Err(format!("{token} is a link that is read first (a folder, feed or list): a range ([1-20]) is taken only in links to files; {AS_WRITTEN}"));
+        }
+        found = Some((count, first, nth_link(&pieces, &ranges, count as u64 - 1)));
+    }
+    Ok(found)
+}
+
+/// The values of the range `inside` a pair of brackets (see [`expand_ranges`]), counted; None
+/// when it is no range.
+fn range(inside: &str) -> Result<Option<Range>, String> {
     let (span, step) = match inside.split_once(':') {
         Some((span, step)) if !step.is_empty() && step.bytes().all(|b| b.is_ascii_digit()) => (span, step.parse::<u64>().unwrap_or(u64::MAX)),
         Some(_) => return Ok(None),
@@ -603,21 +666,42 @@ fn range_values(inside: &str) -> Result<Option<Vec<String>>, String> {
         let step = inside.split_once(':').map_or(String::new(), |(_, step)| format!(":{step}"));
         return Err(format!("The range [{inside}] counts down: write it from the lower to the higher, [{last}-{first}{step}]"));
     }
-    let values = (start..=stop).step_by(usize::try_from(step).unwrap_or(usize::MAX)).take(MOST_RANGE_LINKS + 1);
-    Ok(Some(values.map(|n| if letters { char::from(n as u8).to_string() } else { format!("{n:0width$}") }).collect()))
+    Ok(Some(Range { start, count: (stop - start) / step + 1, step, width, letters }))
 }
 
 /// The lines one input `line` stands for once the ranges of its link are expanded (see
 /// [`expand_ranges`]): a line without one is itself, untouched. A link with ranges stands alone
-/// on its line: links to one file from several servers cannot have them.
+/// on its line (links to one file from several servers cannot have them), and is a link to a
+/// file: one read first (a folder, feed or list) cannot have them.
 pub fn expand_line(line: &str) -> Result<Vec<String>, String> {
-    let tokens = split_tokens(line);
-    let expanded = tokens.iter().map(|token| expand_ranges(token)).collect::<Result<Vec<_>, String>>()?;
-    match &expanded[..] {
-        _ if expanded.iter().zip(&tokens).all(|(links, token)| links.len() == 1 && &links[0] == token) => Ok(vec![line.to_string()]),
-        [links] => Ok(links.clone()),
-        _ => Err("A link with a range ([1-20]) goes on a line of its own: links to one file from several servers cannot have one".to_string()),
+    match range_span(line)? {
+        None => Ok(vec![line.to_string()]),
+        // A range's link stands alone on its line.
+        Some(_) => expand_ranges(&split_tokens(line)[0]),
     }
+}
+
+/// The lines each of `lines` stands for (see [`expand_line`]), or why that line cannot be taken;
+/// Err when together they stand for more than [`MOST_RANGE_LINKS`] links, counted before any is
+/// built.
+pub fn expand_lines<'a>(lines: impl IntoIterator<Item = &'a str>) -> Result<Vec<Result<Vec<String>, String>>, String> {
+    let lines: Vec<&str> = lines.into_iter().collect();
+    let total = lines.iter().map(|line| range_span(line).map_or(1, |span| span.map_or(1, |(count, ..)| count))).try_fold(0usize, usize::checked_add);
+    if total.is_none_or(|total| total > MOST_RANGE_LINKS) {
+        return Err(format!("These links stand for more than {MOST_RANGE_LINKS} downloads together: add fewer at a time"));
+    }
+    Ok(lines.into_iter().map(expand_line).collect())
+}
+
+/// `line` taken as written: the brackets in the path of its links as `%5B` and `%5D`, which stand
+/// for the same characters to a server, so that it holds no range (see [`expand_ranges`]).
+pub fn as_written(line: &str) -> String {
+    let written = |token: &String| match path_span(token) {
+        // The path's brackets; the host's (IPv6) and the query's stay.
+        Some((path, end)) => format!("{}{}{}", &token[..path], token[path..end].replace('[', "%5B").replace(']', "%5D"), &token[end..]),
+        None => token.clone(),
+    };
+    split_tokens(line).iter().map(written).collect::<Vec<_>>().join(" ")
 }
 
 /// Splits one line of input into mirror tokens. A line naming a single existing local file, or
@@ -1092,7 +1176,7 @@ mod tests {
         assert_eq!(tasks[0].label(), "f.iso");
     }
 
-    /// Numbered and lettered ranges in a link's path expand as curl expands them; nothing else
+    /// Numbered and lettered ranges in a link's path expand, the last the fastest; nothing else
     /// in brackets does.
     #[test]
     fn ranges_in_a_link_expand_to_its_links() {
@@ -1126,6 +1210,37 @@ mod tests {
         assert_eq!(expand_line(line).unwrap(), [line]);
         assert_eq!(expand_line("https://a.example/[1-2].iso").unwrap(), ["https://a.example/1.iso", "https://a.example/2.iso"]);
         assert!(expand_line("https://a.example/[1-2].iso https://b.example/[1-2].iso").unwrap_err().contains("line of its own"));
+    }
+
+    /// Ranges are counted before any link is built: a link that would stand for far too many is
+    /// refused at once, an add's lines together have one ceiling, and the card counts them with
+    /// the first and the last link. A link read first takes none; any link can be taken as
+    /// written.
+    #[test]
+    fn ranges_are_counted_before_they_are_built() {
+        let huge = format!("https://h.example/{}", "[0-99999]".repeat(1000));
+        let started = std::time::Instant::now();
+        assert!(expand_ranges(&huge).unwrap_err().contains("more than 10000 links"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1), "{:?}", started.elapsed());
+
+        assert_eq!(range_span("https://h.example/img[001-120].jpg").unwrap(), Some((120, "https://h.example/img001.jpg".into(), "https://h.example/img120.jpg".into())));
+        assert_eq!(range_span("https://h.example/[0-100:30]").unwrap().map(|(n, _, last)| (n, last)), Some((4, "https://h.example/90".into())));
+        assert_eq!(range_span("https://h.example/f.iso").unwrap(), None);
+
+        let lines = ["https://h.example/[1-6000].jpg", "https://h.example/[1-5000].png"];
+        assert!(expand_lines(lines).unwrap_err().contains("more than 10000 downloads together"));
+        let taken = expand_lines(["https://h.example/[1-3].jpg", "https://h.example/[9-1].jpg", "https://h.example/f.iso"]).unwrap();
+        assert_eq!((taken[0].as_ref().unwrap().len(), taken[1].is_err(), taken[2].as_ref().unwrap().len()), (3, true, 1));
+
+        for read_first in ["https://h.example/[1-3].torrent", "https://h.example/feeds/[1-3].metalink"] {
+            let e = expand_line(read_first).unwrap_err();
+            assert!(e.contains("read first") && e.contains("%5B"), "{e}");
+        }
+
+        let written = as_written("https://h.example/Hits%20[1990-1999].zip?x[1-2]=y");
+        assert_eq!(written, "https://h.example/Hits%20%5B1990-1999%5D.zip?x[1-2]=y");
+        assert_eq!(expand_line(&written).unwrap(), [written.clone()]);
+        assert_eq!(as_written("http://[::1]:8080/[1-2].bin"), "http://[::1]:8080/%5B1-2%5D.bin");
     }
 
     #[test]

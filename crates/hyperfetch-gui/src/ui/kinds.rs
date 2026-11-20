@@ -428,6 +428,24 @@ pub fn named_by_link(kind: &Kind) -> bool {
     matches!(kind.name, "A torrent" | "A Usenet download" | "A metalink" | "A chunked image" | "A file on a server" | "A map extract" | "A ZIP archive" | "A file")
 }
 
+/// What the ranges of the link bar's `text` stand for (see `ingest::range_span`), counted once
+/// for each text it holds rather than on every frame.
+pub fn range_span(text: &str) -> Result<Option<(usize, String, String)>, String> {
+    type Span = Result<Option<(usize, String, String)>, String>;
+    thread_local! {
+        static LAST: std::cell::RefCell<Option<(String, Span)>> = const { std::cell::RefCell::new(None) };
+    }
+    let text = text.trim();
+    LAST.with_borrow_mut(|last| {
+        if let Some((_, span)) = last.as_ref().filter(|(seen, _)| seen == text) {
+            return span.clone();
+        }
+        let span = ingest::range_span(text);
+        *last = Some((text.to_string(), span.clone()));
+        span
+    })
+}
+
 /// What `text` (the link bar's input) is: its kind, and where it comes from (a host, or "this
 /// computer"); None for nothing, or text that is not a link. Several lines are "Several links".
 pub fn recognise(text: &str) -> Option<(&'static Kind, String)> {
@@ -443,7 +461,7 @@ pub fn recognise(text: &str) -> Option<(&'static Kind, String)> {
     let first = tokens.first().map(String::as_str).unwrap_or(text);
     let url = Url::parse(first).ok();
     // A link with ranges (`img[001-120].jpg`) stands for several.
-    if ingest::expand_line(text).is_ok_and(|links| links.len() > 1) {
+    if range_span(text).is_ok_and(|span| span.is_some_and(|(count, ..)| count > 1)) {
         return Some((&SEVERAL, url.as_ref().and_then(Url::host_str).unwrap_or_default().trim_start_matches("www.").to_string()));
     }
     let kind = KINDS.iter().find(|kind| (kind.matches)(first, url.as_ref()))?;

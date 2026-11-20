@@ -31,8 +31,10 @@ pub struct Args {
     /// A paste works too: links with "Password: x", "Key: x" or a token, a
     /// user:pass@ link, or a copied curl/wget/fetch/PowerShell command (each link then is its
     /// own download, with its secrets, which are never shown or saved); "-" reads it from stdin.
-    /// A range in a link's path stands for each link of it, as curl's do: img[001-120].jpg
-    /// (zero padding kept), [a-f], [0-100:10] (a step); quote it for the shell.
+    /// A range in a link's path stands for each link of it: img[001-120].jpg (zero padding
+    /// kept), [a-f], [0-100:10] (a step), 10000 links at most; quote it for the shell. A link to
+    /// read first (a folder, feed or list) takes none. --no-ranges, or brackets written as %5B
+    /// and %5D, take a link as written.
     /// Without URLs and without -i an interactive prompt starts.
     #[arg(num_args = 0..)]
     pub urls: Vec<String>,
@@ -41,6 +43,11 @@ pub struct Args {
     /// such as [1-20] one for each of its links); "-" reads stdin
     #[arg(short = 'i', long = "input-file", value_name = "FILE")]
     pub input_file: Option<PathBuf>,
+
+    /// Take links as written: brackets in a link's path are no range ([1-20] stays as it is), on
+    /// the command line, in a batch file and at the prompt
+    #[arg(long = "no-ranges")]
+    pub no_ranges: bool,
 
     /// Connections per download (1-64)
     #[arg(short = 's', long = "split", default_value_t = 16, value_parser = clap::value_parser!(u64).range(1..=64))]

@@ -23,9 +23,13 @@ pub(super) fn add_link(app: &mut App, text: &str) {
         }
         None => {}
     }
-    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
-        // A link with ranges stands for its links.
-        let links = match ingest::expand_line(line) {
+    // A link with ranges stands for its links, all lines together at most so many.
+    let expanded = match ingest::expand_lines(text.lines().map(str::trim).filter(|l| !l.is_empty())) {
+        Ok(expanded) => expanded,
+        Err(e) => return app.notice = Some(Err(e)),
+    };
+    for links in expanded {
+        let links = match links {
             Ok(links) => links,
             Err(e) => {
                 app.notice = Some(Err(e));
@@ -254,7 +258,7 @@ pub(super) fn clipboard_banner(app: &mut App, ui: &mut Ui) {
             }
             if ui.add(primary_button("Download now", p.accent)).clicked() {
                 app.clipboard_banner = None;
-                app.download_now(&link, "", "");
+                app.download_now(&link, "", "", true);
             }
         })
         .on_hover_text(&shown);
@@ -454,6 +458,13 @@ fn preview_card(app: &mut App, ui: &mut Ui, kind: &kinds::Kind, source: &str) {
             if kind.choice == kinds::Choice::Files {
                 ui.label(RichText::new(format!("{} You pick its files once it is read", icon::LIST_CHECKS)).color(p.muted));
             }
+            // Brackets that are part of the file's name: the link as written, a range no more.
+            if kinds::range_span(&app.url_input).is_ok_and(|span| span.is_some()) {
+                let tip = "Its brackets are part of the link, not a range: they are written as %5B and %5D, which the server reads the same";
+                if ui.add(button(format!("{} Take as one link", icon::LINK))).on_hover_text(tip).clicked() {
+                    app.url_input = ingest::as_written(&app.url_input);
+                }
+            }
             // Beside Download (what the page holds): the page itself, as one file.
             if kind.choice == kinds::Choice::Page {
                 let link = Url::parse(app.url_input.trim()).ok();
@@ -503,14 +514,14 @@ fn preview_card(app: &mut App, ui: &mut Ui, kind: &kinds::Kind, source: &str) {
 /// the last part of a link of a `kind` that ends in its file's name (see `kinds::named_by_link`).
 fn shown_name(input: &str, kind: &kinds::Kind) -> Option<String> {
     // A link with ranges: how many links, from the first file to the last.
-    if let Ok(links) = ingest::expand_line(input.trim()) {
-        if let [first, .., last] = &links[..] {
+    if let Ok(Some((count, first, last))) = kinds::range_span(input) {
+        if count > 1 {
             let name = |link: &str| Url::parse(link).ok().and_then(|url| url.path_segments()?.filter(|s| !s.is_empty()).next_back().map(percent_decoded));
-            let (from, to) = match (name(first), name(last)) {
+            let (from, to) = match (name(&first), name(&last)) {
                 (Some(from), Some(to)) if from != to => (from, to),
-                _ => (first.clone(), last.clone()),
+                _ => (first, last),
             };
-            return Some(format!("{} links, {from} to {to}", links.len()));
+            return Some(format!("{count} links, {from} to {to}"));
         }
     }
     let first = ingest::split_tokens(input.trim()).into_iter().next()?;
@@ -796,7 +807,7 @@ fn download_button(app: &App, ui: &mut Ui) -> egui::Response {
 
 pub(super) fn start_from_form(app: &mut App) {
     let (text, checksum, auth) = (app.url_input.clone(), app.checksum_input.clone(), app.auth_input.clone());
-    app.download_now(&text, &checksum, &auth);
+    app.download_now(&text, &checksum, &auth, true);
 }
 
 /// The inputs that belong to one download and are never saved.
@@ -1105,8 +1116,8 @@ mod tests {
     }
 
     /// A link with ranges in the link bar says how many links it stands for, and Download queues
-    /// each; so do the queue input and a paste. A range past the ceiling, or one that counts down,
-    /// says so.
+    /// each; so do the queue input and a paste. A range past the ceiling, one that counts down, or
+    /// one in a link read first says so, and Take as one link takes it as written.
     #[test]
     fn a_link_with_ranges_queues_each_of_its_links() {
         let mut h = Harness::new();
@@ -1134,6 +1145,19 @@ mod tests {
 
         h.paste("https://p.example/[1-2].iso");
         assert_eq!(names(&h)[123..], ["1.iso", "2.iso"]);
+
+        // A link read first takes no range; brackets of a file's name are one click from taken
+        // as written.
+        h.app.url_input = "https://h.example/[1-3].torrent".into();
+        start_from_form(&mut h.app);
+        assert!(h.app.form_error.as_deref().is_some_and(|e| e.contains("read first")), "{:?}", h.app.form_error);
+        h.app.form_error = None;
+        h.app.url_input = "https://h.example/Hits%20[1990-1999].zip".into();
+        h.frames(30);
+        h.click("Take as one link");
+        assert_eq!(h.app.url_input, "https://h.example/Hits%20%5B1990-1999%5D.zip");
+        h.frames(5);
+        assert!(h.find("Several links").is_none() && h.find("Take as one link").is_none());
     }
 
     /// A folder saved to before is one click away beside Save to: picked, downloads go there, and
