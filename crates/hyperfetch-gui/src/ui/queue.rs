@@ -1938,10 +1938,11 @@ mod tests {
         assert!(events.contains(&format!("Autopilot: {why}")), "in its timeline: {events:?}");
     }
 
-    /// A link added while another download has its file from another host (the same name and
-    /// size) waits, its card offering to download the one file from both; joined, its link is the
-    /// other's second server and it leaves the queue. Another size is no twin; Keep apart lets
-    /// one start on its own.
+    /// A link added while another download, running or queued, has its file from another host
+    /// (the same name, size and bytes, neither with a credential) waits, its card offering to
+    /// download the one file from both; joined, its link is the other's second server and it
+    /// leaves the queue, which Undo takes back. Another size, other bytes, a credential or a
+    /// stopped download is no twin; Keep apart lets one start on its own.
     #[test]
     fn the_same_file_from_another_host_is_offered_to_join() {
         let server = tokio::runtime::Runtime::new().unwrap();
@@ -1960,6 +1961,31 @@ mod tests {
         assert!(h.app.queue.get_item(twin).is_none());
         let urls: Vec<String> = h.app.queue.get_item(first).unwrap().urls.iter().map(|url| url.to_string()).collect();
         assert_eq!(urls, [format!("http://127.0.0.1:{port}/same.bin"), format!("http://localhost:{port}/same.bin")]);
+        // Undo puts it back and takes its link back.
+        assert!(h.app.removed.is_some(), "Undo is offered");
+        h.app.undo_remove();
+        assert!(h.app.queue.get_item(twin).is_some());
+        assert_eq!(h.app.queue.get_item(first).unwrap().urls.len(), 1);
+        h.app.remove_job(twin);
+        h.app.removed = None;
+
+        // The same size, other bytes: no offer.
+        let other_port = server.block_on(crate::tests::serve(std::sync::Arc::new(vec![8u8; 4096]))).port();
+        let other_bytes = h.app.add_download(&format!("http://localhost:{other_port}/same.bin"), "", "").unwrap();
+        assert!(h.app.twins.contains_key(&other_bytes), "compared first");
+        h.wait_for(|app| !app.twins.contains_key(&other_bytes));
+        h.app.remove_job(other_bytes);
+        h.app.removed = None;
+        // A credential on either, or a download stopped: nothing is asked.
+        let signed = h.app.add_download(&format!("http://localhost:{port}/same.bin?v=4"), "", "Bearer secret").unwrap();
+        assert!(!h.app.twins.contains_key(&signed), "its credential would go to the other's server");
+        h.app.remove_job(signed);
+        h.app.queue.get_item_mut(first).unwrap().status = QueueItemStatus::Paused;
+        let stopped = h.app.add_download(&format!("http://localhost:{port}/same.bin?v=5"), "", "").unwrap();
+        assert!(!h.app.twins.contains_key(&stopped), "only into a download running or queued");
+        h.app.remove_job(stopped);
+        h.app.queue.get_item_mut(first).unwrap().status = QueueItemStatus::Queued;
+        h.app.removed = None;
 
         // Another size: no offer.
         h.app.queue.get_item_mut(first).unwrap().total_bytes = 1000;

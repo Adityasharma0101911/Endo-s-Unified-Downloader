@@ -99,9 +99,95 @@ pub async fn relink(target: Option<PathBuf>, size: u64, urls: Vec<Url>, options:
     Ok(())
 }
 
+/// Bytes in each part of a file that [`same_file`] compares.
+const SAMPLE: u64 = 32 << 10;
+
+/// Whether a download of `urls` with `options` carries a credential of any kind its servers are
+/// sent: a sign-in in a link, an Authorization header, headers from a paste or the browser, a
+/// password, cookies (a file, a browser's, pasted), S3 or SSH keys, a debrid key, news-server
+/// logins. Its links joined to another download, or that one's to it, would carry them to the
+/// other's servers (see [`same_file`]).
+pub fn carries_credentials(urls: &[Url], options: &DownloadOptions) -> bool {
+    urls.iter().any(|url| !url.username().is_empty() || url.password().is_some())
+        || options.auth_header.is_some()
+        || !options.secret_headers.is_empty()
+        || !options.headers.is_empty()
+        || !options.extra_headers.is_empty()
+        || options.password.is_some()
+        || options.cookies_path.is_some()
+        || options.browser_cookies.is_some()
+        || options.cookie_string.is_some()
+        || options.s3.is_some()
+        || options.ssh_key.is_some()
+        || options.debrid_api_key.is_some()
+        || !options.nntp.is_empty()
+}
+
+/// The parts (start, length) of a file of `size` bytes (1 or more) that [`same_file`] compares:
+/// its start, middle and end, or the whole of a small one.
+fn samples(size: u64) -> Vec<(u64, u64)> {
+    if size <= 3 * SAMPLE {
+        return vec![(0, size)];
+    }
+    vec![(0, SAMPLE), (size / 2 - SAMPLE / 2, SAMPLE), (size - SAMPLE, SAMPLE)]
+}
+
+/// Whether `new`, the engine of a download just added, names the file of `size` bytes that `old`,
+/// another download's, does: its server says that size, and the start, middle and end of the file
+/// (see [`samples`]) come byte for byte the same from both servers. Not when either cannot be
+/// asked or takes no ranges.
+pub async fn same_file(new: &DownloadEngine, old: &DownloadEngine, size: u64) -> bool {
+    if size == 0 || new.probe().await.ok().and_then(|remote| remote.size) != Some(size) {
+        return false;
+    }
+    for (start, len) in samples(size) {
+        match tokio::join!(new.sample(start, len), old.sample(start, len)) {
+            (Ok(a), Ok(b)) if a == b => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A small file is compared whole; a big one at its start, middle and end, inside it.
+    #[test]
+    fn a_file_is_sampled_at_its_start_middle_and_end() {
+        assert_eq!(samples(1), [(0, 1)]);
+        assert_eq!(samples(3 * SAMPLE), [(0, 3 * SAMPLE)]);
+        let size = (640 << 20) + 7;
+        let parts = samples(size);
+        assert_eq!(parts, [(0, SAMPLE), (size / 2 - SAMPLE / 2, SAMPLE), (size - SAMPLE, SAMPLE)]);
+        assert!(parts.iter().all(|&(start, len)| start + len <= size));
+    }
+
+    /// Any credential is found: in a link, a header, a password, cookies, keys.
+    #[test]
+    fn credentials_of_any_kind_are_found() {
+        let plain = [Url::parse("https://mirror.example/disk.img").unwrap()];
+        assert!(!carries_credentials(&plain, &DownloadOptions::default()));
+        assert!(carries_credentials(&[Url::parse("https://user:pass@private.example/disk.img").unwrap()], &DownloadOptions::default()));
+        assert!(carries_credentials(&[Url::parse("https://user@private.example/disk.img").unwrap()], &DownloadOptions::default()));
+        let with: [fn(&mut DownloadOptions); 9] = [
+            |o| o.auth_header = Some("Bearer x".into()),
+            |o| o.secret_headers = vec![("Cookie".into(), "a=b".into())],
+            |o| o.headers = vec![("X-Token".into(), "t".into())],
+            |o| o.extra_headers = vec![("X-Api-Key".into(), "k".into())],
+            |o| o.password = Some("p".into()),
+            |o| o.cookies_path = Some("cookies.txt".into()),
+            |o| o.cookie_string = Some("a=b".into()),
+            |o| o.debrid_api_key = Some("k".into()),
+            |o| o.nntp = vec![Default::default()],
+        ];
+        for (n, set) in with.into_iter().enumerate() {
+            let mut options = DownloadOptions::default();
+            set(&mut options);
+            assert!(carries_credentials(&plain, &options), "case {n}");
+        }
+    }
 
     fn state(size: u64, done: u64) -> DownloadState {
         let mut state = DownloadState::new("a.bin".into(), size, 256 << 10, vec!["https://cdn.example/old/a.bin?sig=1".into()]);

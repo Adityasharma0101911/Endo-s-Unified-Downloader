@@ -796,6 +796,34 @@ impl DownloadEngine {
         Ok(crate::relink::RemoteFile { size: info.size, accepts_ranges: info.accepts_ranges, etag: info.etag, last_modified: info.last_modified })
     }
 
+    /// Bytes `start..start + len` (`len` at least 1) of the first link's file, asked as
+    /// [`Self::probe`] asks: Err unless the server sends just those, as 206 Partial Content (see
+    /// `crate::relink::same_file`).
+    pub async fn sample(&self, start: u64, len: u64) -> Result<Vec<u8>, String> {
+        let client = self.client.clone()?;
+        let url = self.urls.first().ok_or_else(|| "no link to ask".to_string())?;
+        let range = format!("bytes={}-{}", start, start + len - 1);
+        let read = async {
+            let request = |url: &Url| authorize(client.get(url.clone()), self.auth.as_deref(), url).header(RANGE, range.as_str()).header(ACCEPT_ENCODING, "identity");
+            let mut resp = send(request, url).await.map_err(|e| format!("{url}: {e}"))?;
+            if resp.status() != StatusCode::PARTIAL_CONTENT {
+                return Err(format!("{url} answered HTTP {} to a range request", resp.status()));
+            }
+            let mut bytes = Vec::with_capacity(len as usize);
+            while let Some(chunk) = resp.chunk().await.map_err(|e| format!("{url}: {e}"))? {
+                bytes.extend_from_slice(&chunk);
+                if bytes.len() as u64 > len {
+                    break;
+                }
+            }
+            match bytes.len() as u64 == len {
+                true => Ok(bytes),
+                false => Err(format!("{url} sent {} bytes for a range of {len}", bytes.len())),
+            }
+        };
+        tokio::time::timeout(PROBE_TIMEOUT, read).await.map_err(|_| format!("{url}: no answer within {}s", PROBE_TIMEOUT.as_secs()))?
+    }
+
     /// Downloads the engine's URLs and returns the path of the finished file, adding the
     /// options' `archive_lines` to the download archive once it is (not for a recording stopped
     /// early: it is not the whole of it). A download that fails on a server refusing HTTP/1.1

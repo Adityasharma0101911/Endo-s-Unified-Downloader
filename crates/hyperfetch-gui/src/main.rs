@@ -193,19 +193,19 @@ enum AppEvent {
     /// The page at `link` saved as one file (see [`App::save_page`]), begun at Unix second
     /// `started`: the file, its size, how many things were put in and how many left as links.
     PageSaved { link: String, started: u64, result: Result<(PathBuf, u64, usize, usize), String> },
-    /// The size the server of new download `id` gives its file (None: it does not say, or could
-    /// not be asked), asked because another download has its name (see [`App::look_for_twin`]).
-    TwinProbed { id: usize, size: Option<u64> },
+    /// Whether new download `id` has the file of another download, as its server's size and
+    /// samples of its bytes tell (see [`App::look_for_twin`]).
+    TwinChecked { id: usize, same: bool },
 }
 
 /// A download just added whose file another download in the queue has from another host (the
-/// same name, the same checksum where both have one): `of`, from `host`. It waits while the
-/// size of its file is asked for and, the same, while the user is offered to join them (see
+/// same name, the same checksum where both have one): `of`, from `host`. It waits while its file
+/// is compared with that one's and, the same, while the user is offered to join them (see
 /// [`App::join_twin`]).
 struct Twin {
     of: usize,
     host: String,
-    /// The sizes are the same: the offer is on its card.
+    /// The files are the same: the offer is on its card.
     offered: bool,
 }
 
@@ -412,6 +412,9 @@ struct App {
     /// The downloads the last Remove or Clear took out of the queue, each with the place it had,
     /// and when (the window's clock): Undo puts them back for a few seconds.
     removed: Option<(Vec<(usize, QueueItem)>, f64)>,
+    /// When the last removal was a join (see [`App::join_twin`]): the download that took links,
+    /// and those links, which its Undo takes back.
+    joined: Option<(usize, Vec<Url>)>,
     verify_request: Option<VerifyRequest>,
     verifying: bool,
     verification: Option<Verification>,
@@ -625,6 +628,7 @@ impl App {
             queue_search: String::new(),
             queue_filter: 0,
             removed: None,
+            joined: None,
             verify_request: None,
             verifying: false,
             verification: None,
@@ -900,41 +904,52 @@ impl App {
         Ok(id)
     }
 
-    /// When another download not done yet has the file of new download `id` from another host
-    /// (the same name, its size known, the same checksum where both have one), asks `id`'s server
-    /// how big its file is, `id` waiting meanwhile (see `Twin`).
+    /// When another download, running or queued, has the file of new download `id` from another
+    /// host (the same name, its size known, the same checksum where both have one), and neither
+    /// carries a credential its servers are sent (see `relink::carries_credentials`: joined, one's
+    /// would go to the other's servers), compares the two files, `id` waiting meanwhile (see `Twin`
+    /// and `relink::same_file`).
     fn look_for_twin(&mut self, id: usize) {
         let Some(item) = self.queue.get_item(id) else { return };
         let host = |item: &QueueItem| item.urls.first().and_then(Url::host_str).unwrap_or_default().to_ascii_lowercase();
         let sum = |item: &QueueItem| item.options.expected_checksum.as_deref().map(|sum| sum.trim().to_ascii_lowercase());
+        // With the keys of the settings it would start with (see `Settings::fill_keys`).
+        let signed = |item: &QueueItem| {
+            let mut options = item.options.clone();
+            self.settings.fill_keys(&mut options);
+            relink::carries_credentials(&item.urls, &options)
+        };
+        if signed(item) {
+            return;
+        }
         let twin = self.queue.items().iter().find(|other| {
             other.id != id
-                && other.status != QueueItemStatus::Completed
+                && matches!(other.status, QueueItemStatus::Downloading | QueueItemStatus::Queued)
                 && other.total_bytes > 0
                 && other.filename == item.filename
                 && host(other) != host(item)
                 && !other.urls.iter().any(|url| item.urls.contains(url))
                 && (sum(other).is_none() || sum(item).is_none() || sum(other) == sum(item))
+                && !signed(other)
         });
         let Some(twin) = twin else { return };
         self.twins.insert(id, Twin { of: twin.id, host: host(twin), offered: false });
-        let (urls, options) = (item.urls.clone(), item.options.clone());
+        let (new, old, size) = ((item.urls.clone(), item.options.clone()), (twin.urls.clone(), twin.options.clone()), twin.total_bytes);
         self.spawn_event(async move {
-            // Building an engine may read the cookies file and TLS roots.
-            let engine = tokio::task::spawn_blocking(move || DownloadEngine::new(urls, options)).await;
-            let size = match engine {
-                Ok(engine) => engine.probe().await.ok().and_then(|remote| remote.size),
-                Err(_) => None,
+            // Building an engine may read TLS roots.
+            let engines = tokio::task::spawn_blocking(move || (DownloadEngine::new(new.0, new.1), DownloadEngine::new(old.0, old.1))).await;
+            let same = match engines {
+                Ok((new, old)) => relink::same_file(&new, &old, size).await,
+                Err(_) => false,
             };
-            AppEvent::TwinProbed { id, size }
+            AppEvent::TwinChecked { id, same }
         });
     }
 
-    /// Offers to join new download `id` to the download with its file when its server says the
-    /// same size, `size`; else lets it start.
-    fn twin_probed(&mut self, id: usize, size: Option<u64>) {
+    /// Offers to join new download `id` to the download with its file when they are the same file,
+    /// `same`; else lets it start.
+    fn twin_checked(&mut self, id: usize, same: bool) {
         let Some(twin) = self.twins.get_mut(&id) else { return };
-        let same = self.queue.get_item(twin.of).is_some_and(|other| size == Some(other.total_bytes));
         if same {
             twin.offered = true;
         } else {
@@ -942,18 +957,24 @@ impl App {
         }
     }
 
-    /// Joins new download `id` to the download with its file (see `Twin`): its links become that
-    /// one's further sources, which its engine checks against the first before it takes them, and
-    /// `id` leaves the queue. One running starts again from where it is, to take them.
+    /// Joins new download `id` to the download with its file (see `Twin`), while that one is
+    /// running or queued: its links become that one's further sources, which its engine checks
+    /// against the first before it takes them, and `id` leaves the queue, Undo putting it back and
+    /// taking them out again. One running starts again from where it is, to take them.
     fn join_twin(&mut self, id: usize) {
         let Some(Twin { of, .. }) = self.twins.remove(&id) else { return };
         let Some(urls) = self.queue.get_item(id).filter(|item| !item.status.is_active()).map(|item| item.urls.clone()) else { return };
         let Some(other) = self.queue.get_item_mut(of) else { return };
+        if !matches!(other.status, QueueItemStatus::Downloading | QueueItemStatus::Queued) {
+            // It stopped meanwhile: `id` starts on its own.
+            self.notice = Some(Err(format!("#{of} is no longer running or queued, so #{id} downloads on its own")));
+            return;
+        }
         let fresh: Vec<Url> = urls.into_iter().filter(|url| !other.urls.contains(url)).collect();
-        other.urls.extend(fresh);
+        other.urls.extend(fresh.iter().cloned());
         let (name, hosts) = (other.filename.clone(), other.urls.len());
         if self.remove_job(id) {
-            self.removed = None;
+            self.joined = Some((of, fresh));
         }
         self.restart_with(of, |_| {});
         self.notice = Some(Ok(format!("{name} now downloads from {hosts} servers together, as #{of}")));
@@ -1662,13 +1683,21 @@ impl App {
         let removed: Vec<_> = before.into_iter().enumerate().filter(|(_, item)| self.queue.get_item(item.id).is_none()).collect();
         if !removed.is_empty() {
             self.removed = Some((removed, self.ctx.input(|i| i.time)));
+            self.joined = None;
         }
     }
 
-    /// Puts the downloads last removed back in the queue, where they were.
+    /// Puts the downloads last removed back in the queue, where they were; one joined to another
+    /// (see [`Self::join_twin`]) takes its links back from that one.
     fn undo_remove(&mut self) {
         if let Some((removed, _)) = self.removed.take() {
             self.queue.restore(removed);
+            if let Some((of, urls)) = self.joined.take() {
+                if let Some(other) = self.queue.get_item_mut(of) {
+                    other.urls.retain(|url| !urls.contains(url));
+                    self.restart_with(of, |_| {});
+                }
+            }
         }
     }
 
@@ -2074,7 +2103,7 @@ impl App {
             AppEvent::TracksListed { item, link, result } => self.tracks_listed(item, link, result),
             AppEvent::Channels { origin, input, checksum, auth, result } => self.channels_read(origin, input, checksum, auth, result),
             AppEvent::Relinked { id, urls, options, result } => self.relinked(id, urls, options, result),
-            AppEvent::TwinProbed { id, size } => self.twin_probed(id, size),
+            AppEvent::TwinChecked { id, same } => self.twin_checked(id, same),
             AppEvent::PageSaved { link, started, result } => self.page_saved(link, started, result),
         }
     }
