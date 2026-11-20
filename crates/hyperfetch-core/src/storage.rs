@@ -1138,6 +1138,41 @@ fn preallocate_file(file: &File, size: u64) -> Result<(), StorageError> {
     Ok(())
 }
 
+/// Makes the file at `path`, written in full, an ordinary file again (not sparse; see
+/// `preallocate_file`), as copy, backup and virtual machine tools expect. A failure, as on a file
+/// system without sparse files, changes nothing. Blocking.
+#[cfg(windows)]
+pub(crate) fn unsparse(path: &Path) {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Ioctl::{FILE_SET_SPARSE_BUFFER, FSCTL_SET_SPARSE};
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    let Ok(file) = OpenOptions::new().write(true).open(path) else { return };
+    let clear = FILE_SET_SPARSE_BUFFER { SetSparse: 0 };
+    let mut returned = 0u32;
+    // SAFETY: the handle is owned by `file` and outlives this synchronous call; the input buffer
+    // is a live FILE_SET_SPARSE_BUFFER of the size given.
+    let ok = unsafe {
+        DeviceIoControl(
+            file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
+            FSCTL_SET_SPARSE,
+            std::ptr::from_ref(&clear).cast(),
+            std::mem::size_of::<FILE_SET_SPARSE_BUFFER>() as u32,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        tracing::debug!("Clearing the sparse flag of {} failed: {}", path.display(), std::io::Error::last_os_error());
+    }
+}
+
+/// Only Windows makes a file sparse to preallocate it.
+#[cfg(not(windows))]
+pub(crate) fn unsparse(_path: &Path) {}
+
 #[cfg(target_os = "linux")]
 fn preallocate_file(file: &File, size: u64) -> Result<(), StorageError> {
     use std::os::unix::io::AsRawFd;

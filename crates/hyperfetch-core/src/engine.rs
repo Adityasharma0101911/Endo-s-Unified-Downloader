@@ -3522,6 +3522,8 @@ impl DownloadEngine {
             // replaces the file only `replace` asks to replace, in one step.
             let target = if named.exists() && !(replace && named == final_path) { free_path(&named) } else { named };
             let size = std::fs::metadata(&part).map(|m| m.len()).map_err(|e| e.to_string())?;
+            // Made sparse to be preallocated (see `DiskWriter::open_or_create`), now written in full.
+            crate::storage::unsparse(&part);
             std::fs::rename(&part, &target)
                 .map_err(|e| format!("Failed to move {} to {}: {}", part.display(), target.display(), e))?;
             if let Err(e) = DownloadState::remove(&state_path) {
@@ -10358,6 +10360,21 @@ mod tests {
             assert_eq!(writer.sync_count(), usize::from(fsync), "fsync_on_complete: {fsync}");
             assert_eq!(std::fs::read(&target).unwrap(), b"abc");
         }
+    }
+
+    /// A finished file is an ordinary file, though its `.part` was made sparse to preallocate it.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_a_finished_file_is_not_sparse() {
+        use std::os::windows::fs::MetadataExt;
+        const SPARSE: u32 = 0x200; // FILE_ATTRIBUTE_SPARSE_FILE
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("whole.bin");
+        let writer = written_part(&target, &[5u8; 300_000]);
+        assert_ne!(std::fs::metadata(part_path(&target)).unwrap().file_attributes() & SPARSE, 0, "the .part is sparse");
+        let claim = Claim::try_take(&target).unwrap().unwrap();
+        let done = engine_with(DownloadOptions::default()).finalize(target, claim, Written::Writer(writer), unix_now(), &None, None, false).await;
+        assert_eq!(std::fs::metadata(done.unwrap()).unwrap().file_attributes() & SPARSE, 0);
     }
 
     #[tokio::test]
