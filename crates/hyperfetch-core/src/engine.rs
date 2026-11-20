@@ -4191,6 +4191,9 @@ fn build_route_client(
     } else if let Some(proxy_url) = proxy_url {
         let proxy = reqwest::Proxy::all(proxy_url).map_err(|e| format!("Invalid proxy URL {}: {}", proxy_url, e))?;
         builder = builder.proxy(proxy);
+    } else if let Some(proxy) = crate::sysproxy::local_direct() {
+        // The system's proxy, with the host names without a dot its settings keep direct.
+        builder = builder.proxy(proxy);
     }
 
     if let Some(cookies_path) = &options.cookies_path {
@@ -4283,9 +4286,8 @@ async fn server_addresses(host: &str, port: u16, family: IpFamily) -> Vec<std::n
     kept
 }
 
-/// Whether the environment names a proxy for the clients (they take `HTTP_PROXY` and the like).
-// shortcut: the system's own proxy settings (Windows' Internet Options, macOS's) are not looked
-// at, as reqwest is built here without them; look if it ever reads them.
+/// Whether the environment names a proxy for the clients (they take `HTTP_PROXY` and the like),
+/// the system's one included once `sysproxy::start` put it there.
 pub(crate) fn proxy_in_env() -> bool {
     ["http_proxy", "https_proxy", "all_proxy"]
         .iter()

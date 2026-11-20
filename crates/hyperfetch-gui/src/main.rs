@@ -3142,6 +3142,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     hyperfetch_core::sftp::keep_known_hosts_in(data.join("known_hosts"));
     let log = Mutex::new(desktop::LogFile::new(data.join("logs").join("endo.log"), desktop::LOG_LIMIT));
     let _ = tracing_subscriber::fmt().with_ansi(false).with_writer(std::io::stderr.and(log)).try_init();
+    hyperfetch_core::sysproxy::log();
     // One app per data folder, which it locks (two started at once): a second launch shows the
     // running one's window and ends, one started hidden (at startup, by a link) just ends. Not
     // the build an update started, which would find the app it replaces still closing.

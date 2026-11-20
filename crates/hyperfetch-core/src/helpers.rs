@@ -189,19 +189,24 @@ impl<'a> Proxy<'a> {
     /// itself; none can take turns through a pool. `takes_proxy` is false for a tool that goes
     /// through no proxy at all (DepotDownloader), which then runs only without one.
     pub fn check(self, tool: &str, takes_proxy: bool) -> Result<(), String> {
-        self.check_in(tool, takes_proxy, crate::engine::proxy_in_env())
+        let system = crate::sysproxy::seen().is_some_and(|seen| seen.taken);
+        self.check_in(tool, takes_proxy, crate::engine::proxy_in_env(), system)
     }
 
-    /// [`Proxy::check`], `env` telling whether the environment names a proxy.
-    fn check_in(self, tool: &str, takes_proxy: bool, env: bool) -> Result<(), String> {
+    /// [`Proxy::check`], `env` telling whether the environment names a proxy, and `system`
+    /// whether it is the one the system's settings name (see `sysproxy::start`).
+    fn check_in(self, tool: &str, takes_proxy: bool, env: bool, system: bool) -> Result<(), String> {
         if self.pool {
             return Err(format!("{tool} cannot take turns through a proxy pool: set one proxy for it, or none"));
         }
         if !takes_proxy && self.url.is_some() {
             return Err(format!("{tool} cannot go through a proxy: turn the proxy off for it"));
         }
+        if !takes_proxy && !self.direct && env && system {
+            return Err(format!("{tool} cannot go through a proxy, and the one this computer's settings name is in use: {}, for it", crate::sysproxy::TURN_OFF));
+        }
         if !takes_proxy && !self.direct && env {
-            return Err(format!("{tool} cannot go through a proxy, and one is set in the environment (http_proxy or the like) or the system's settings: unset it, or choose no proxy, for it"));
+            return Err(format!("{tool} cannot go through a proxy, and one is set in the environment (http_proxy or the like): unset it, or choose no proxy, for it"));
         }
         Ok(())
     }
@@ -659,12 +664,15 @@ pub(crate) mod tests {
         let one = Proxy::single(Some("http://127.0.0.1:8080"));
         let pool = Proxy { pool: true, ..Proxy::default() };
         let direct = Proxy { direct: true, ..Proxy::default() };
-        assert!(pool.check_in("rclone", true, false).unwrap_err().contains("proxy pool"));
-        assert!(pool.check_in("DepotDownloader", false, false).unwrap_err().contains("proxy pool"));
-        assert!(one.check_in("rclone", true, true).is_ok() && Proxy::default().check_in("rclone", true, true).is_ok());
-        assert!(one.check_in("DepotDownloader", false, false).unwrap_err().contains("cannot go through a proxy"));
-        assert!(Proxy::default().check_in("DepotDownloader", false, true).unwrap_err().contains("environment"));
-        assert!(direct.check_in("DepotDownloader", false, true).is_ok() && Proxy::default().check_in("DepotDownloader", false, false).is_ok());
+        assert!(pool.check_in("rclone", true, false, false).unwrap_err().contains("proxy pool"));
+        assert!(pool.check_in("DepotDownloader", false, false, false).unwrap_err().contains("proxy pool"));
+        assert!(one.check_in("rclone", true, true, false).is_ok() && Proxy::default().check_in("rclone", true, true, true).is_ok());
+        assert!(one.check_in("DepotDownloader", false, false, false).unwrap_err().contains("cannot go through a proxy"));
+        assert!(Proxy::default().check_in("DepotDownloader", false, true, false).unwrap_err().contains("environment"));
+        // The system's proxy: the refusal says how to turn it off.
+        let e = Proxy::default().check_in("DepotDownloader", false, true, true).unwrap_err();
+        assert!(e.contains("this computer's settings") && e.contains("Use the system's proxy") && e.contains("--system-proxy"), "{e}");
+        assert!(direct.check_in("DepotDownloader", false, true, true).is_ok() && Proxy::default().check_in("DepotDownloader", false, false, false).is_ok());
         // With no proxy at all, a helper gets none of the environment's either.
         let cmd = command(Path::new("helper"), &[], direct, Path::new("."));
         let removed: Vec<_> = cmd.as_std().get_envs().filter(|(_, value)| value.is_none()).map(|(name, _)| name.to_string_lossy().into_owned()).collect();

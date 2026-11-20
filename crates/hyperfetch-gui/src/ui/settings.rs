@@ -607,22 +607,29 @@ fn site_rules(s: &mut Settings, ui: &mut Ui) {
     }
 }
 
-/// What the system's proxy switch says: which proxy downloads take now, as the app found it when
-/// it started.
+/// What the system's proxy switch says: what it does and, while it is on, which proxy downloads
+/// take now, as the app found it when it started.
 fn system_proxy_about(s: &Settings, seen: Option<&hyperfetch_core::sysproxy::Seen>) -> String {
     use hyperfetch_core::sysproxy::{describe, System};
+    let what = "When neither the Proxy above nor the environment names one, the proxy this computer's settings name; none when \
+                they use a setup script or automatic detection, which the app does not run. A change applies from the next start.";
+    if !s.system_proxy {
+        return what.to_string();
+    }
     let now = match seen {
         _ if !s.proxy.trim().is_empty() || !s.proxy_pool.trim().is_empty() => "the Proxy above".to_string(),
         Some(seen) if seen.in_env => "the environment's (http_proxy or the like)".to_string(),
         Some(seen) => match &seen.system {
-            System::Proxy { from, .. } if seen.taken => format!("{} (from the {from} settings)", describe(&seen.system)),
-            System::Proxy { from, .. } => format!("none, connections go direct; the {from} settings name {}", describe(&seen.system)),
-            System::Script { url, from } => format!("none, connections go direct: the {from} settings use a setup script (PAC), {url}, which the app does not run"),
-            System::None => "none, connections go direct".to_string(),
+            System::Proxy { from, local, .. } if seen.taken => {
+                let local = if *local { "; names without a dot go direct" } else { "" };
+                format!("{} (from the {from} settings{local})", describe(&seen.system))
+            }
+            System::Script { from, .. } => format!("none, connections go direct: the {from} settings use {}, which the app does not run", describe(&seen.system)),
+            _ => "none, connections go direct".to_string(),
         },
         None => "none, connections go direct".to_string(),
     };
-    format!("When neither the Proxy above nor the environment names one, the proxy this computer's settings name. In use: {now}. A change applies from the next start.")
+    format!("{what} In use: {now}.")
 }
 
 /// Which way connections go: proxies, the IP version, timeouts and the user agent.
@@ -1235,22 +1242,26 @@ mod tests {
         }
     }
 
-    /// The system's proxy switch says which proxy downloads take: the setting's, the
-    /// environment's, the system's taken at start, or none, with why.
+    /// The system's proxy switch, off by default, says what it does; on, also which proxy
+    /// downloads take: the setting's, the environment's, the system's taken at start, or none,
+    /// with why.
     #[test]
     fn the_system_proxy_switch_says_which_proxy_is_in_use() {
         use hyperfetch_core::sysproxy::{Seen, System};
-        let windows = hyperfetch_core::sysproxy::from_windows(true, Some("p.example:8080"), None, None);
+        let windows = hyperfetch_core::sysproxy::from_windows(true, Some("p.example:8080"), Some("<local>"), None, false);
         let about = |s: &Settings, system: &System, in_env, taken| system_proxy_about(s, Some(&Seen { system: system.clone(), in_env, taken }));
-        let s = Settings::default();
-        assert!(about(&s, &windows, false, true).contains("In use: http://p.example:8080 (from the Windows settings)."));
-        assert!(about(&s, &windows, false, false).contains("In use: none, connections go direct; the Windows settings name http://p.example:8080."));
+        assert!(!Settings::default().system_proxy, "off by default");
+        assert!(!about(&Settings::default(), &System::None, false, false).contains("In use"));
+        let s = Settings { system_proxy: true, ..Settings::default() };
+        assert!(about(&s, &windows, false, true).contains("In use: http://p.example:8080 (from the Windows settings; names without a dot go direct)."));
+        assert!(about(&s, &System::None, false, false).contains("In use: none, connections go direct."));
         assert!(about(&s, &System::None, true, false).contains("In use: the environment's"));
         let script = System::Script { url: "http://w.example/p.pac".into(), from: "macOS" };
         assert!(about(&s, &script, false, false).contains("setup script (PAC), http://w.example/p.pac, which the app does not run"));
-        let own = Settings { proxy: "socks5://127.0.0.1:1080".into(), ..Settings::default() };
+        let detected = hyperfetch_core::sysproxy::from_windows(true, Some("p.example:8080"), None, None, true);
+        assert!(about(&s, &detected, false, false).contains("the Windows settings use automatic detection, which the app does not run"));
+        let own = Settings { proxy: "socks5://127.0.0.1:1080".into(), ..s.clone() };
         assert!(about(&own, &windows, false, true).contains("In use: the Proxy above."));
-        assert!(Settings::default().system_proxy, "on by default");
     }
 
     /// Rules per site: Add a site puts an empty rule in a line under the row, and its Remove takes

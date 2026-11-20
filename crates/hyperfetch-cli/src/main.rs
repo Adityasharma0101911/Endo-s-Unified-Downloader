@@ -86,9 +86,9 @@ fn run_cli() -> i32 {
         clap_complete::generate(shell, &mut Args::command(), name.into_owned(), &mut std::io::stdout());
         return 0;
     }
-    // The system's proxy, when the environment names none (--proxy still wins): into the
+    // --system-proxy, when the environment names none (--proxy still wins): into the
     // environment, before the runtime's threads start.
-    if !args.no_proxy {
+    if args.system_proxy {
         hyperfetch_core::sysproxy::start(true);
     }
     let ran = match args.command {
@@ -121,6 +121,7 @@ async fn app(mut args: Args) -> i32 {
         }
     }
     init_tracing(args.verbose, &ui);
+    hyperfetch_core::sysproxy::log();
     // The password is asked on stderr, so stdout may be a pipe (--json, --stdout).
     let typed = std::io::stdin().is_terminal() && in_foreground();
     if let Err(e) = sign_in(&mut args, typed.then_some(read_password as fn(&str) -> Option<String>)) {

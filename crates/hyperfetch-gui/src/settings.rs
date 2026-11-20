@@ -122,7 +122,8 @@ pub struct Settings {
     /// Comma-separated list of proxy URLs for multi-egress rotation across workers.
     pub proxy_pool: String,
     /// Downloads go through the proxy this computer's settings name, when neither `proxy` nor
-    /// the environment names one (see `hyperfetch_core::sysproxy`); from the next start.
+    /// the environment names one (see `hyperfetch_core::sysproxy`); from the next start. Off by
+    /// default: nothing of the system's is read without it.
     pub system_proxy: bool,
     /// Debrid API key for automatic high-speed CDN unrestricting. Saved here, never with the queue
     /// or in the history (see [`Settings::fill_keys`]).
@@ -368,7 +369,7 @@ impl Default for Settings {
             hls_to_mp4: true,
             referer: String::new(),
             proxy_pool: String::new(),
-            system_proxy: true,
+            system_proxy: false,
             debrid_api_key: String::new(),
             debrid_provider: String::new(),
             check_updates: true,

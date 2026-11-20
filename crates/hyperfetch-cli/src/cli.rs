@@ -206,10 +206,15 @@ pub struct Args {
     #[arg(long = "connect-timeout", value_name = "SECS", default_value_t = DownloadOptions::default().connect_timeout_secs, value_parser = clap::value_parser!(u64).range(1..=3600))]
     pub connect_timeout: u64,
 
-    /// Connect directly, ignoring the proxy variables of the environment and the system's proxy
-    /// settings
+    /// Connect directly, ignoring the proxy variables of the environment
     #[arg(long = "no-proxy", conflicts_with_all = ["proxy", "proxy_pool", "proxies_file"])]
     pub no_proxy: bool,
+
+    /// Use the proxy this computer's settings name (Windows, macOS, GNOME or KDE) when neither
+    /// --proxy nor the environment names one; none when they use a setup script or automatic
+    /// detection
+    #[arg(long = "system-proxy", conflicts_with = "no_proxy")]
+    pub system_proxy: bool,
 
     /// Password of a share, a video or an archive (over one given in a paste)
     #[arg(long = "password", value_name = "PASS", conflicts_with = "repair")]
@@ -1408,6 +1413,8 @@ mod tests {
         let args = parse(&["u"]).unwrap();
         assert!(!args.json && !args.spider && !args.server_response && !args.preview && !args.dry_run && !args.stdout);
         assert!(!args.insecure && !args.ipv4 && !args.ipv6 && !args.no_proxy && !args.no_clobber && !args.no_adaptive);
+        assert!(!args.system_proxy, "the system's proxy only when asked for");
+        assert!(parse(&["--system-proxy", "u"]).unwrap().system_proxy && parse(&["--system-proxy", "--no-proxy", "u"]).is_err());
         assert_eq!((args.connect_timeout, args.max_filesize, args.record_seconds), (15, None, None));
         let args = parse(&[
             "-S", "-k", "-4", "-N", "-U", "agent/1", "-u", "bob:pw", "--cookie", "a=b; c=d", "--header", "X-A: 1", "--header",

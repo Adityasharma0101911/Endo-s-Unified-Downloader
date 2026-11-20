@@ -147,7 +147,10 @@ pub async fn list(http: &Client, url: &Url, options: &ListOptions) -> Result<Vec
         Some(Mod::CurseForge { game, class, slug, file }) => {
             // CurseForge's API terms (3.1e) forbid reaching it through a proxy.
             if options.proxy.is_some() || options.proxy_pool || crate::engine::proxy_in_env() {
-                return Err(CURSEFORGE_PROXY.to_string());
+                return Err(match crate::sysproxy::seen().filter(|seen| seen.taken && options.proxy.is_none() && !options.proxy_pool) {
+                    Some(_) => format!("CurseForge's API terms do not allow reaching it through a proxy, and the one this computer's settings name is in use: {} for this link", crate::sysproxy::TURN_OFF),
+                    None => CURSEFORGE_PROXY.to_string(),
+                });
             }
             // The key goes to CurseForge's API alone, never on to where it redirects.
             let keyed = crate::itch::unredirected(options)?;
