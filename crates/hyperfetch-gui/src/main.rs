@@ -252,6 +252,30 @@ struct Running {
     live: Arc<OwnLimits>,
 }
 
+/// The computer's hold (see `App::keep_awake`) and how many engine tasks run.
+type Awake = Arc<Mutex<(hyperfetch_core::power::KeepAwake, usize)>>;
+
+/// One engine task counted in [`Awake`]: the last to end lets the computer sleep at once, as a
+/// window hidden in the tray may get no frame to do it.
+struct Working(Awake);
+
+impl Working {
+    fn new(awake: &Awake) -> Self {
+        lock(awake).1 += 1;
+        Self(Arc::clone(awake))
+    }
+}
+
+impl Drop for Working {
+    fn drop(&mut self) {
+        let mut awake = lock(&self.0);
+        awake.1 -= 1;
+        if awake.1 == 0 {
+            awake.0.set(false);
+        }
+    }
+}
+
 /// Live telemetry of one download, kept by the GUI next to its queue item.
 #[derive(Default)]
 struct JobView {
@@ -427,7 +451,7 @@ struct App {
     /// Writes launch at startup and the `endo-dl:` link (see `desktop::write`).
     writer: desktop::Writer,
     /// Keeps the computer awake while there is work (see `App::keep_awake`).
-    awake: hyperfetch_core::power::KeepAwake,
+    awake: Awake,
     /// Downloads that failed for a network reason, to start again by itself (see
     /// `App::note_rerun`): how many times so far, and when next.
     reruns: HashMap<usize, (u32, Instant)>,
@@ -619,7 +643,7 @@ impl App {
             countdown: None,
             power: Box::new(desktop::power),
             writer: Box::new(desktop::write),
-            awake: hyperfetch_core::power::KeepAwake::new(Box::new(desktop::stay_awake)),
+            awake: Arc::new(Mutex::new((hyperfetch_core::power::KeepAwake::new(Box::new(desktop::stay_awake)), 0))),
             reruns: HashMap::new(),
             eco: false,
             is_metered: Box::new(desktop::metered),
@@ -1441,8 +1465,9 @@ impl App {
         let task = {
             let (cancel, snapshot, live, ctx, tx) =
                 (Arc::clone(&cancel), Arc::clone(&snapshot), Arc::clone(&live), self.ctx.clone(), self.events_tx.clone());
-            let engines = Arc::clone(&self.engines);
+            let (engines, working) = (Arc::clone(&self.engines), Working::new(&self.awake));
             self.rt.spawn(async move {
+                let _working = working;
                 let result = run_job(&engines, urls, options, folder, leftovers_of, cancel, snapshot, live, ctx.clone()).await;
                 if tx.send(AppEvent::JobFinished { id, result }).is_ok() {
                     ctx.request_repaint();
@@ -2402,7 +2427,10 @@ impl App {
         let waiting = self.settings.schedule_paused.iter().any(paused) || !self.settings.auto_run_queue && queued;
         let due = desktop::minutes_to_start(&self.settings.schedule, now).is_some_and(|m| m <= desktop::AWAKE_BEFORE_START);
         let running = self.queue.items().iter().any(|item| item.status.is_active() && !self.waits_for_network(item.id));
-        self.awake.set(self.settings.keep_awake && (running || waiting && due));
+        // Under the lock the last task to end takes, so a hold is not taken again after it.
+        let mut awake = lock(&self.awake);
+        let work = self.settings.keep_awake && (running && awake.1 > 0 || waiting && due);
+        awake.0.set(work);
     }
 
     /// With "Go easy" on, downloads step aside (see `hyperfetch_core::gentle`), and the app is in
@@ -4208,7 +4236,9 @@ mod tests {
     /// Download `id` of `app` running, as far as the app can tell (no engine runs on `rt`).
     fn running(app: &mut App, rt: &tokio::runtime::Runtime, id: usize) {
         app.queue.mark_started(id);
-        let running = Running { cancel: Arc::default(), task: rt.spawn(async {}), snapshot: Arc::default(), live: Arc::default() };
+        let working = Working::new(&app.awake);
+        let task = rt.spawn(async move { drop(working) });
+        let running = Running { cancel: Arc::default(), task, snapshot: Arc::default(), live: Arc::default() };
         app.jobs.insert(id, JobView { running: Some(running), ..JobView::default() });
     }
 
@@ -4450,21 +4480,10 @@ mod tests {
     /// twelve hours with downloads waiting for it. The setting off, it is never held.
     #[test]
     fn the_computer_is_kept_awake_only_while_there_is_work() {
-        struct Hold(Arc<Mutex<(usize, usize)>>);
-        impl Drop for Hold {
-            fn drop(&mut self) {
-                lock(&self.0).1 += 1;
-            }
-        }
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let mut app = test_app(&rt, dir.path());
-        let counts = Arc::new(Mutex::new((0, 0)));
-        let log = Arc::clone(&counts);
-        app.awake = hyperfetch_core::power::KeepAwake::new(Box::new(move || {
-            lock(&log).0 += 1;
-            Ok(Box::new(Hold(Arc::clone(&log))) as Box<dyn Send>)
-        }));
+        let counts = counted_awake(&mut app);
         let (monday_noon, ended) = ((0, 12 * 60), |app: &mut App, id, result| app.handle_event(AppEvent::JobFinished { id, result }));
         let [a, b, c] = ["a.iso", "b.iso", "c.iso"].map(|name| add(&mut app, name));
         app.settings.auto_run_queue = false;
@@ -4522,6 +4541,44 @@ mod tests {
         running(&mut app, &rt, e);
         app.keep_awake((0, 21 * 60));
         assert_eq!(*lock(&counts), (4, 4), "the setting off, nothing is held");
+    }
+
+    /// `app`'s hold on the computer through a stand-in counting (taken, let go).
+    fn counted_awake(app: &mut App) -> Arc<Mutex<(usize, usize)>> {
+        struct Hold(Arc<Mutex<(usize, usize)>>);
+        impl Drop for Hold {
+            fn drop(&mut self) {
+                lock(&self.0).1 += 1;
+            }
+        }
+        let counts = Arc::new(Mutex::new((0, 0)));
+        let log = Arc::clone(&counts);
+        lock(&app.awake).0 = hyperfetch_core::power::KeepAwake::new(Box::new(move || {
+            lock(&log).0 += 1;
+            Ok(Box::new(Hold(Arc::clone(&log))) as Box<dyn Send>)
+        }));
+        counts
+    }
+
+    /// The last download to end lets the computer sleep by itself, with no frame (a window hidden
+    /// in the tray may get none), and a frame before its end is seen does not hold it again.
+    #[test]
+    fn the_computer_may_sleep_when_the_last_download_ends_without_a_frame() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(&rt, dir.path());
+        app.engines = Arc::new(|_: Vec<Url>, _: DownloadOptions| Err("not downloaded here".to_string()));
+        let counts = counted_awake(&mut app);
+        let a = add(&mut app, "a.iso");
+        assert!(app.start_job(a, false));
+        app.keep_awake((0, 12 * 60));
+        assert_eq!(*lock(&counts), (1, 0), "held while it runs");
+        let task = app.jobs.get_mut(&a).and_then(|job| job.running.take()).unwrap().task;
+        rt.block_on(async { tokio::time::timeout(Duration::from_secs(10), task).await }).unwrap().unwrap();
+        assert_eq!(*lock(&counts), (1, 1), "let go as it ended");
+        assert_eq!(status(&app, a), QueueItemStatus::Downloading, "no frame has seen it end");
+        app.keep_awake((0, 12 * 60));
+        assert_eq!(*lock(&counts), (1, 1), "not held again");
     }
 
     /// With "Go easy" on, the app is in efficiency mode only while its window is out of sight.
