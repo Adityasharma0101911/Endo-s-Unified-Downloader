@@ -3006,9 +3006,10 @@ impl DownloadEngine {
         let counted = if adapts && start.rate.is_none() { counted.min(AUTOPILOT_START as u64) } else { counted };
         let num_workers = best.map_or(counted, |best| best as u64).clamp(1, max_workers) as usize;
         // The site's checksum, when known by now, is hashed as the file arrives as the user's is;
-        // one found later from then on (see `crate::digest::found`).
+        // one found later from then on (see `crate::digest::found`). Only the user's keeps chunks
+        // small for it: a server's header checksum on a large file would cost many more requests.
         let hashed = self.options.expected_checksum.clone().or_else(|| crate::digest::found(&self.site));
-        let in_order = crate::storage::hashes_prefix(hashed.as_deref());
+        let in_order = crate::storage::hashes_prefix(self.options.expected_checksum.as_deref());
         let throttled_host = mirrors.iter().any(|m| HostKey::of(&m.url).is_bitrate_throttled());
         let chunk_size = effective_chunk_size(remaining, num_workers as u64, self.options.base_chunk_size, in_order, throttled_host);
         let mut manager = ChunkManager::with_resumed_ranges(size, chunk_size, &have).map_err(|e| e.to_string())?;

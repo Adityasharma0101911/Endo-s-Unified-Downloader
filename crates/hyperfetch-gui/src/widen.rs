@@ -27,8 +27,9 @@ pub struct Widening {
 
 impl Widening {
     /// How many more than `at_once` may run at `now`: `running` downloads run, `speed` bytes a
-    /// second together, on a line of `line` (None: not known yet), with downloads `waiting` or
-    /// not, the last of them started at `started`. One at a time stays one at a time.
+    /// second together, on a line of `line` (None: not known yet; the speed limit, when that is
+    /// less), with a download `waiting` that would start in one more place or not, the last of
+    /// them started at `started`. One at a time stays one at a time.
     #[allow(clippy::too_many_arguments)]
     pub fn update(&mut self, now: Instant, at_once: usize, running: usize, speed: f64, line: Option<f64>, waiting: bool, started: Option<Instant>) -> usize {
         let Some(line) = line.filter(|&line| line > 0.0 && at_once > 1) else {

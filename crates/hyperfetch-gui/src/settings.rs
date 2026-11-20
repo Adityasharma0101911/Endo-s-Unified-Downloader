@@ -80,6 +80,7 @@ pub struct Settings {
     pub auto_run_queue: bool,
     pub max_concurrent: usize,
     /// More downloads than `max_concurrent` run while the line has room (see `crate::widen`).
+    /// Off by default.
     pub more_at_once: bool,
     /// The user's rules per site (see [`SiteRule`]).
     pub site_rules: Vec<SiteRule>,
@@ -353,7 +354,7 @@ impl Default for Settings {
             welcomed: false,
             auto_run_queue: true,
             max_concurrent: 4,
-            more_at_once: true,
+            more_at_once: false,
             site_rules: Vec::new(),
             google_api_key: String::new(),
             only_new: true,
@@ -737,6 +738,12 @@ impl Settings {
     /// The engine settings shared by every download and repair: connections, speed limit,
     /// retries, timeouts, disk flushing, the per-host connection budget, the User-Agent and the
     /// IP version.
+    /// The speed limit in force for all downloads together, in bytes a second: None while it is
+    /// off or not set.
+    pub fn speed_limit(&self) -> Option<u64> {
+        speed_limit_bytes(self.max_speed, self.max_speed_in_mb).filter(|_| self.speed_limit_on)
+    }
+
     pub fn tuning(&self) -> DownloadOptions {
         let proxy_pool = self.proxy_pool
             .split(',')
@@ -747,7 +754,7 @@ impl Settings {
         let debrid_provider = (!self.debrid_provider.trim().is_empty()).then(|| self.debrid_provider.trim().to_string());
         DownloadOptions {
             num_connections: self.connections.clamp(1, 64),
-            max_speed: speed_limit_bytes(self.max_speed, self.max_speed_in_mb).filter(|_| self.speed_limit_on),
+            max_speed: self.speed_limit(),
             max_retries: self.max_retries,
             stall_timeout_secs: self.stall_timeout_secs.max(1),
             fsync_on_complete: self.fsync_on_complete,

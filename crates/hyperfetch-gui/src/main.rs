@@ -1749,8 +1749,11 @@ impl App {
     }
 
     /// How many more downloads than `at_once` may run now, with "More at once while the line has
-    /// room" on, on a line of `line` bytes a second (see `widen`).
-    fn more_at_once(&mut self, at_once: usize, line: Option<f64>) -> usize {
+    /// room" on, on a line of `line` bytes a second (see `widen`), one more only when a waiting
+    /// download would start in it (`would_start`). The room is measured against the line or the
+    /// speed limit in force, whichever is less (the setting's, or one a running download started
+    /// with); none more while a download runs under a limit of its own, which holds its speed.
+    fn more_at_once(&mut self, at_once: usize, line: Option<f64>, would_start: bool) -> usize {
         if !self.settings.more_at_once {
             self.widening.extra = 0;
             return 0;
@@ -1758,9 +1761,14 @@ impl App {
         let items = self.queue.items();
         let running: Vec<&QueueItem> = items.iter().filter(|item| item.status == QueueItemStatus::Downloading).collect();
         let speed = running.iter().map(|item| item.speed_bytes_per_sec).sum();
-        let waiting = items.iter().any(|item| item.status == QueueItemStatus::Queued);
+        let limit = running.iter().filter_map(|item| item.options.max_speed).chain(self.settings.speed_limit()).min();
+        let room = match (line, limit) {
+            (Some(line), Some(limit)) => Some(line.min(limit as f64)),
+            (line, limit) => line.or(limit.map(|limit| limit as f64)),
+        };
+        let own = running.iter().any(|item| item.options.own_speed.is_some());
         let started = self.jobs.values().filter_map(|view| view.started).max();
-        self.widening.update(Instant::now(), at_once, running.len(), speed, line, waiting, started)
+        self.widening.update(Instant::now(), at_once, running.len(), speed, room, would_start && !own, started)
     }
 
     /// Starts the paused downloads waiting to resume (see `App::resuming`), then queued ones,
@@ -1772,9 +1780,9 @@ impl App {
         if !self.settings.auto_run_queue || self.closing {
             return;
         }
-        let max = self.settings.max_concurrent.max(1);
-        let max = max + self.more_at_once(max, hyperfetch_core::hosts::line());
-        while self.queue.may_start(max) && !self.resuming.is_empty() {
+        let at_once = self.settings.max_concurrent.max(1);
+        // Resume all keeps to the user's own number.
+        while self.queue.may_start(at_once) && !self.resuming.is_empty() {
             let id = self.resuming.remove(0);
             if self.queue.get_item(id).is_some_and(|item| item.status == QueueItemStatus::Paused) {
                 self.start_job(id, false);
@@ -1784,6 +1792,10 @@ impl App {
         let mut held: HashSet<usize> = self.twins.keys().copied().collect();
         let metered = self.settings.hold_metered && (self.is_metered)();
         let ok = self.metered_ok.clone();
+        // One more at once only for a waiting download that is not held.
+        let sites = self.site_holds(Instant::now());
+        let would_start = self.queue.next_to_start(usize::MAX, |id| held.contains(&id) || sites.contains(&id) || metered && !ok.contains(&id)).is_some();
+        let max = at_once + self.more_at_once(at_once, hyperfetch_core::hosts::line(), would_start);
         loop {
             // Again after each start, which may fill its site.
             let sites = self.site_holds(Instant::now());
@@ -3673,24 +3685,44 @@ mod tests {
         App::with(egui::Context::default(), rt.handle().clone(), settings, DownloadQueue::new(), None)
     }
 
-    /// Four running downloads taking under half the line, and one waiting: one more may run;
-    /// none once they fill the line, nor with More at once off.
+    /// Four running downloads taking under half the line, and one waiting that would start: one
+    /// more may run; none when nothing would start, once they fill the line or the speed limit,
+    /// while one runs under a limit of its own, nor with More at once off, as it is by default.
     #[test]
     fn more_run_at_once_while_the_line_has_room() {
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let mut app = test_app(&rt, dir.path());
+        assert!(!app.settings.more_at_once, "off by default");
+        app.settings.more_at_once = true;
+        let mut running = Vec::new();
         for n in 0..5 {
             let id = app.queue.add_item(vec![Url::parse(&format!("https://h{n}.example/f.bin")).unwrap()], DownloadOptions::default());
             if n < 4 {
                 app.queue.mark_started(id);
                 app.queue.apply_snapshot(id, &EngineSnapshot { speed_bytes_per_sec: 10e6, ..Default::default() });
+                running.push(id);
             }
         }
-        assert_eq!(app.more_at_once(4, Some(100e6)), 1);
-        assert_eq!(app.more_at_once(4, Some(50e6)), 0, "the line is full");
+        let more = |app: &mut App, line: f64, would_start: bool| {
+            app.widening = widen::Widening::default();
+            app.more_at_once(4, Some(line), would_start)
+        };
+        assert_eq!(more(&mut app, 100e6, true), 1);
+        assert_eq!(more(&mut app, 100e6, false), 0, "nothing waiting would start");
+        assert_eq!(more(&mut app, 50e6, true), 0, "the line is full");
+        (app.settings.max_speed, app.settings.max_speed_in_mb, app.settings.speed_limit_on) = (40.0, true, true);
+        assert_eq!(more(&mut app, 100e6, true), 0, "the speed limit holds");
+        app.settings.speed_limit_on = false;
+        app.queue.get_item_mut(running[0]).unwrap().options.max_speed = Some(40 << 20);
+        assert_eq!(more(&mut app, 100e6, true), 0, "the limit a running download started with holds");
+        app.queue.get_item_mut(running[0]).unwrap().options.max_speed = None;
+        app.queue.get_item_mut(running[1]).unwrap().options.own_speed = Some(10_000_000);
+        assert_eq!(more(&mut app, 100e6, true), 0, "a download's own limit holds it");
+        app.queue.get_item_mut(running[1]).unwrap().options.own_speed = None;
+        assert_eq!(more(&mut app, 100e6, true), 1);
         app.settings.more_at_once = false;
-        assert_eq!(app.more_at_once(4, Some(1e9)), 0);
+        assert_eq!(more(&mut app, 1e9, true), 0);
     }
 
     /// A site's rule holds its queued downloads while as many of its own run as it allows, and
