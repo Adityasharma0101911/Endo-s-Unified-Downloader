@@ -3095,6 +3095,8 @@ impl DownloadEngine {
         let mut spawned = num_workers;
         // The connections the user last set for it while it runs.
         let mut asked = None;
+        // Workers waiting for the network (see `FailureKind::Offline`), until heard from again.
+        let mut offline = std::collections::HashSet::new();
 
         let mut tick = tokio::time::interval(SNAPSHOT_INTERVAL);
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -3116,6 +3118,15 @@ impl DownloadEngine {
                     Some(event) => {
                         if matches!(event, WorkerEvent::Ttfb { .. }) {
                             alone.cancel();
+                        }
+                        let (WorkerEvent::Ttfb { worker_id, .. }
+                        | WorkerEvent::Progress { worker_id, .. }
+                        | WorkerEvent::ChunkCompleted { worker_id, .. }
+                        | WorkerEvent::ChunkFailed { worker_id, .. }) = event;
+                        if matches!(event, WorkerEvent::ChunkFailed { kind: FailureKind::Offline, .. }) {
+                            offline.insert(worker_id);
+                        } else {
+                            offline.remove(&worker_id);
                         }
                         if let Err(e) = job.handle(event) {
                             break Err(e);
@@ -3153,6 +3164,12 @@ impl DownloadEngine {
                         });
                     }
                     if let Some(pilot) = pilot.as_mut().filter(|pilot| !pilot.done) {
+                        // Nothing measured while the network is gone is the host's doing. A worker
+                        // past the width stops after its wait, unheard from.
+                        offline.retain(|&id| id < width.load(Ordering::Relaxed));
+                        if !offline.is_empty() {
+                            pilot.waiting(Instant::now(), job.chunks.lock().total_received());
+                        }
                         next = next.or_else(|| job.steer(pilot));
                         let now = pilot.why();
                         if why.as_ref() != Some(&now) {

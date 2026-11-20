@@ -132,6 +132,12 @@ impl Autopilot {
         None
     }
 
+    /// The download waits for the network at `now`, with `downloaded` bytes in: the window under
+    /// way is not compared, nor the next, which its connections spend starting again.
+    pub(crate) fn waiting(&mut self, now: Instant, downloaded: u64) {
+        (self.began, self.settling) = ((now, downloaded), true);
+    }
+
     /// The width to go on at, when it changes, with `downloaded` bytes in at `now` and `left` to
     /// come; `startup` is what a new request takes to answer, `cap` the connections the host serves
     /// at once (see `hosts`). Call it every few hundred milliseconds.
@@ -317,6 +323,32 @@ mod tests {
 
     fn pilot(width: usize, max: usize, start: Start) -> Autopilot {
         Autopilot::new(width, max, start, Instant::now(), 0)
+    }
+
+    /// While the download waits for the network nothing is compared: a trial under way is neither
+    /// found slower nor settled on, so no poor count is kept for the host; it goes on after.
+    #[test]
+    fn test_a_wait_for_the_network_is_no_window() {
+        let (startup, mut pilot) = (Duration::from_millis(250), pilot(4, 32, Start::default()));
+        let (t0, mut downloaded) = (pilot.began.0, 0);
+        for n in 1..=2 {
+            downloaded += 4 * MB as u64;
+            pilot.next(t0 + Duration::from_secs(n), downloaded, 1 << 40, startup, None);
+        }
+        assert_eq!(pilot.width, 6, "a trial of more: {}", pilot.why());
+        // Three seconds without the network, told every tick; nothing comes in.
+        for tick in 1..=20 {
+            let now = t0 + Duration::from_secs(2) + Duration::from_millis(150 * tick);
+            pilot.waiting(now, downloaded);
+            pilot.next(now, downloaded, 1 << 40, startup, None);
+        }
+        assert!(!pilot.done && pilot.width == 6, "{}", pilot.why());
+        // Back: the start is not compared, then six go faster than four did.
+        for n in 1..=2 {
+            downloaded += 6 * MB as u64;
+            pilot.next(t0 + Duration::from_secs(5 + n), downloaded, 1 << 40, startup, None);
+        }
+        assert!(pilot.settled.is_none() && pilot.width > 6, "{}", pilot.why());
     }
 
     /// Over any seed: what more connections bring nothing past, a cap for each user, is reached
