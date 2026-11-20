@@ -36,6 +36,7 @@ pub mod wayback;
 pub mod sitemirror;
 pub(crate) mod polite;
 pub mod gallery;
+pub mod gentle;
 pub mod postprocess;
 pub mod paste;
 pub mod ftp;

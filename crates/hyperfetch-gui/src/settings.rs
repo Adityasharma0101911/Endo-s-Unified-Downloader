@@ -261,8 +261,11 @@ pub struct Settings {
     /// The address the QR code holds, of this computer's on local networks (empty: the first).
     pub phone_address: String,
     /// The computer does not sleep by itself while downloads run, or before the schedule starts
-    /// waiting ones (see `desktop::wants_awake`). On by default.
+    /// waiting ones (see `App::keep_awake`). On by default.
     pub keep_awake: bool,
+    /// Downloads step aside while the computer is in use (see `hyperfetch_core::gentle`), the app
+    /// in efficiency mode while its window is minimized or in the tray (see `App::go_easy`).
+    pub go_easy: bool,
 }
 
 /// When the queue runs by itself (see `desktop::schedule_due`): at `start` on the ticked days it
@@ -385,6 +388,7 @@ impl Default for Settings {
             phone_token: Default::default(),
             phone_address: String::new(),
             keep_awake: true,
+            go_easy: false,
         }
     }
 }

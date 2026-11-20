@@ -158,6 +158,11 @@ pub struct Args {
     #[arg(long = "allow-sleep")]
     pub allow_sleep: bool,
 
+    /// Go easy on the computer while it is in use (Windows): files are written and checked at low
+    /// disk and memory priority, so your own files stay in memory and games keep their speed
+    #[arg(long = "go-easy")]
+    pub go_easy: bool,
+
     /// Expected checksum (sha256:HEX, sha512:HEX, sha1:HEX, md5:HEX, blake3:HEX or bare hex); single download or --verify
     #[arg(long = "checksum", value_parser = parse_checksum)]
     pub checksum: Option<String>,

@@ -1,7 +1,7 @@
 use std::fs::{File, OpenOptions};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use blake3::hazmat::{merge_subtrees_non_root, merge_subtrees_root, ChainingValue, HasherExt, Mode};
@@ -64,6 +64,8 @@ pub struct DiskWriter {
 struct Inner {
     file: Arc<File>,
     hashes: Arc<Hashes>,
+    /// Whether `file` has the low I/O priority hint (see `crate::gentle`).
+    hinted: AtomicBool,
     #[cfg(test)]
     syncs: AtomicUsize,
 }
@@ -106,6 +108,7 @@ impl DiskWriter {
             inner: Arc::new(Inner {
                 file: Arc::new(file),
                 hashes: Arc::new(Hashes::new(total_size, block)),
+                hinted: AtomicBool::new(false),
                 #[cfg(test)]
                 syncs: AtomicUsize::new(0),
             }),
@@ -145,6 +148,8 @@ impl DiskWriter {
             }
             None => data,
         };
+        crate::gentle::hint(&self.inner.file, &self.inner.hinted);
+        let _easy = crate::gentle::Background::here();
         write_all_at(&self.inner.file, data, offset)?;
         self.inner.hashes.wrote(&self.inner.file, offset, data);
         Ok(())
@@ -172,7 +177,10 @@ impl DiskWriter {
             // Without the thread, `digest` hashes the whole file at the end, as it would anyway.
             state.follower = std::thread::Builder::new()
                 .name("prefix-hash".into())
-                .spawn(move || follow(&hashes, &file, prefix))
+                .spawn(move || {
+                    let _easy = crate::gentle::Background::here();
+                    follow(&hashes, &file, prefix)
+                })
                 .ok();
         }
     }

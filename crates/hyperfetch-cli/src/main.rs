@@ -158,6 +158,7 @@ async fn app(mut args: Args) -> i32 {
         false => hyperfetch_core::power::stay_awake().inspect_err(|e| tracing::debug!("Could not keep the computer awake: {}", e)).ok(),
         true => None,
     };
+    hyperfetch_core::gentle::set(args.go_easy);
     // Each prints or writes something else than the downloads of an interactive prompt.
     let other = args.json || args.spider || args.dry_run || args.preview || args.stdout || args.list_tracks || args.start_at.is_some();
     if args.urls.is_empty() && args.input_file.is_none() && other {

@@ -396,6 +396,18 @@ pub fn stay_awake() -> io::Result<Box<dyn Send>> {
     Err(io::Error::other("tests never keep the computer awake"))
 }
 
+/// Efficiency mode for the app, or not: [`hyperfetch_core::gentle::eco`] in the app.
+#[cfg(not(test))]
+pub fn eco(on: bool) -> bool {
+    hyperfetch_core::gentle::eco(on)
+}
+
+/// Tests never slow down the process they run in.
+#[cfg(test)]
+pub fn eco(_: bool) -> bool {
+    false
+}
+
 /// The local day of the week (Monday 0) and minute of the day.
 #[cfg(windows)]
 pub fn local_now() -> (u8, u16) {

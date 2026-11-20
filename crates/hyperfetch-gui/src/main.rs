@@ -416,6 +416,8 @@ struct App {
     /// Downloads that failed for a network reason, to start again by itself (see
     /// `App::note_rerun`): how many times so far, and when next.
     reruns: HashMap<usize, (u32, Instant)>,
+    /// Whether the app asked for efficiency mode (see `App::go_easy`).
+    eco: bool,
     /// The local time the schedule was last checked at (see `desktop::schedule_due`).
     schedule_seen: Option<(u8, u16)>,
     /// Paused downloads Resume all or the schedule's start resumes, first come first, as the
@@ -590,6 +592,7 @@ impl App {
             writer: Box::new(desktop::write),
             awake: hyperfetch_core::power::KeepAwake::new(Box::new(desktop::stay_awake)),
             reruns: HashMap::new(),
+            eco: false,
             schedule_seen: None,
             resuming: Vec::new(),
             restarting: HashSet::new(),
@@ -2073,6 +2076,7 @@ impl App {
         }
         self.keep_awake(desktop::local_now());
         self.rerun_failed(Instant::now());
+        self.go_easy(ctx.input(|i| i.viewport().minimized == Some(true)));
         if self.queue.active_count() == 0 {
             self.batch_failed = false;
         }
@@ -2224,6 +2228,17 @@ impl App {
         let due = desktop::minutes_to_start(&self.settings.schedule, now).is_some_and(|m| m <= desktop::AWAKE_BEFORE_START);
         let running = self.queue.items().iter().any(|item| item.status.is_active() && !self.waits_for_network(item.id));
         self.awake.set(self.settings.keep_awake && (running || waiting && due));
+    }
+
+    /// With "Go easy" on, downloads step aside (see `hyperfetch_core::gentle`), and the app is in
+    /// efficiency mode while its window is `minimized` or in the tray; out of it once in view.
+    fn go_easy(&mut self, minimized: bool) {
+        hyperfetch_core::gentle::set(self.settings.go_easy);
+        let eco = self.settings.go_easy && (self.hidden || minimized);
+        if eco != self.eco {
+            desktop::eco(eco);
+            self.eco = eco;
+        }
     }
 
     /// A running download that gets nothing while the system says the network is gone: it waits
@@ -4251,6 +4266,27 @@ mod tests {
         running(&mut app, &rt, a);
         app.keep_awake((0, 21 * 60));
         assert_eq!(*lock(&counts), (4, 4), "the setting off, nothing is held");
+    }
+
+    /// With "Go easy" on, the app is in efficiency mode only while its window is out of sight.
+    #[test]
+    fn efficiency_mode_only_while_out_of_sight() {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(&rt, dir.path());
+        app.go_easy(true);
+        assert!(!app.eco, "off by default");
+        app.settings.go_easy = true;
+        app.go_easy(false);
+        assert!(!app.eco, "in view");
+        app.go_easy(true);
+        assert!(app.eco, "minimized");
+        app.hidden = true;
+        app.go_easy(false);
+        assert!(app.eco, "in the tray");
+        app.settings.go_easy = false;
+        app.go_easy(false);
+        assert!(!app.eco);
     }
 
     /// A download that failed for a network reason goes back in the queue by itself once its

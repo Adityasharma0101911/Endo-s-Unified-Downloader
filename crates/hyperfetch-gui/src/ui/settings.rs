@@ -502,11 +502,16 @@ fn desktop_settings(app: &mut App, ui: &mut Ui) {
     });
 }
 
-/// How downloads keep to the computer and its network: keeping it awake.
+/// How downloads keep to the computer and its network: keeping it awake, going easy on it.
 fn gentle_settings(s: &mut Settings, ui: &mut Ui) {
     let about = "The computer does not go to sleep by itself while downloads run, nor in the 12 hours before the schedule \
                  starts downloads waiting for it. The screen still turns off, and you can still put it to sleep.";
     switch(ui, "Keep the computer awake", about, &mut s.keep_awake);
+    if cfg!(windows) {
+        let about = "Downloads are written and checked at low disk and memory priority, so your own files stay in memory and \
+                     games keep their speed; while the window is minimized or in the tray the app runs in efficiency mode.";
+        switch(ui, "Go easy while I use this PC", about, &mut s.go_easy);
+    }
 }
 
 /// A text box for a time of day, kept as written, None when empty.
@@ -1106,7 +1111,7 @@ mod tests {
         h.frames(60);
         h.leave();
         assert!(h.settle());
-        assert!(h.find("Data folder").is_some(), "{:?}", h.texts());
+        assert!(h.find("Keep the computer awake").is_some(), "{:?}", h.texts());
         // The pointer goes there first: a press that comes with a move drags the page.
         let click = |h: &mut Harness, at: Pos2| {
             h.hover(at);
@@ -1145,6 +1150,12 @@ mod tests {
         scroll_to(&mut h, "Keep the computer awake");
         switch(&mut h, "Keep the computer awake");
         assert!(!h.app.settings.keep_awake);
+        if cfg!(windows) {
+            assert!(!h.app.settings.go_easy, "off by default");
+            scroll_to(&mut h, "Go easy while I use this PC");
+            switch(&mut h, "Go easy while I use this PC");
+            assert!(h.app.settings.go_easy);
+        }
     }
 
     /// Downloads that end while the window is not in front are told through the app's sender:
