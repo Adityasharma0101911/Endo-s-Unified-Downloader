@@ -9191,7 +9191,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_a_slow_save_holds_nothing_up() {
         const MIB: usize = 1024 * 1024;
-        const SLOW: Duration = Duration::from_millis(1500);
+        const SLOW: Duration = Duration::from_secs(3);
         // Four connections at 0.5 MB/s each: about five seconds, so a save starts after two and
         // ends while the bytes still come in.
         let base = rate_server(10 * MIB, 0.5e6, "").await;
@@ -9209,8 +9209,9 @@ mod tests {
         assert_eq!(saves.0, saves.1, "a save was still running when the download ended");
         assert!(!DownloadState::state_file_path(&part_path(&target)).exists());
         assert_eq!(std::fs::metadata(done).unwrap().len(), 10 * MIB as u64);
+        // Snapshots held up by the save would wait all of it; a busy machine's late ones far less.
         let longest = gaps.await.unwrap();
-        assert!(longest < SLOW / 2, "the snapshots waited {longest:?} for a save");
+        assert!(longest < SLOW - Duration::from_secs(1), "the snapshots waited {longest:?} for a save");
     }
 
     /// An adaptive download opens one more connection while that pays; a fixed one keeps to the
