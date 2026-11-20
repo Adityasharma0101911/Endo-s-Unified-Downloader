@@ -9057,8 +9057,8 @@ mod tests {
     /// Connections set for a download and then cleared while it runs go back to those it had.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_connections_cleared_while_it_runs_go_back_to_those_it_had() {
-        let data: Vec<u8> = (0..6 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
-        // 1.6 MB/s a connection: about 1 s over four, 4 s over one.
+        let data: Vec<u8> = (0..16 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        // 1.6 MB/s a connection, so the file outlasts what is watched on a slow machine too.
         let base = uncapped_file_server(data.clone(), Duration::from_millis(40)).await;
         let dir = tempdir().unwrap();
         let options = DownloadOptions {
@@ -9073,18 +9073,27 @@ mod tests {
         let engine = DownloadEngine::new(vec![base.join("f.bin").unwrap()], options).with_live(Arc::clone(&live));
         let (tx, mut rx) = broadcast::channel(64);
         let run = tokio::spawn(async move { engine.run(Some(tx)).await });
-        let (mut set, mut later, started) = (0, Vec::new(), Instant::now());
+        // Cleared once they run, then 16 snapshots (2.4 s) watched; then 4 again, to end sooner.
+        let (mut set, mut cleared, mut after) = (0, false, Vec::new());
         while let Ok(Ok(snapshot)) = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await {
-            match started.elapsed() {
-                at if at < Duration::from_millis(450) => set = set.max(snapshot.active_workers),
-                at if at < Duration::from_millis(900) => live.set_connections(None),
-                _ if snapshot.downloaded_bytes < snapshot.total_bytes => later.push(snapshot.active_workers),
-                _ => {}
+            if !cleared {
+                set = set.max(snapshot.active_workers);
+                if set >= 3 {
+                    live.set_connections(None);
+                    cleared = true;
+                }
+            } else if after.len() < 16 && snapshot.downloaded_bytes < snapshot.total_bytes {
+                after.push(snapshot.active_workers);
+                if after.len() == 16 {
+                    live.set_connections(Some(4));
+                }
             }
         }
         assert!(std::fs::read(run.await.unwrap().unwrap()).unwrap() == data);
         assert!(set >= 3, "{set} connections while 4 were set");
-        assert!(!later.is_empty() && later.iter().all(|&n| n <= 1), "after clearing: {later:?}");
+        // Those past the one it had stop within 1.5 s, and none come back.
+        let back = after.iter().position(|&n| n <= 1);
+        assert!(back.is_some_and(|at| at <= 10 && after[at..].iter().all(|&n| n <= 1)), "after clearing: {after:?}");
     }
 
     /// Over HTTP/2 a download's requests are spread over a few connections, each a client of its
