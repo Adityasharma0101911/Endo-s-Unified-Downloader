@@ -577,6 +577,7 @@ pub fn render(app: &mut App, ctx: &egui::Context) {
             banner(ui, p.amber, icon::WARNING, RichText::new(text).color(p.text), |_| {});
         }
         countdown_banner(app, ui);
+        metered_banner(app, ui);
         update_banner(app, ui);
         clipboard_banner(app, ui);
         listing_prompt(app, ui);
@@ -911,6 +912,22 @@ fn countdown_banner(app: &mut App, ui: &mut Ui) {
     keyed_banner(ui, egui::Id::new("countdown"), p.amber, icon::POWER, RichText::new(text).color(p.text), |ui| {
         if ui.add(button("Cancel")).clicked() {
             app.countdown = None;
+        }
+    });
+}
+
+/// Why queued downloads wait on a metered connection, with Download all anyway.
+fn metered_banner(app: &mut App, ui: &mut Ui) {
+    let waiting = app.queue.items().iter().filter(|item| item.status == QueueItemStatus::Queued && app.metered_holds(item.id)).count();
+    if waiting == 0 {
+        return;
+    }
+    let p = palette(ui);
+    let which = if waiting == 1 { "1 queued download waits".to_string() } else { format!("{waiting} queued downloads wait") };
+    let text = format!("The system says this connection is metered, so {which} for one that is not.");
+    keyed_banner(ui, egui::Id::new("metered"), p.amber, icon::CELL_SIGNAL_HIGH, RichText::new(text).color(p.text), |ui| {
+        if ui.add(button("Download all anyway")).clicked() {
+            app.download_anyway();
         }
     });
 }

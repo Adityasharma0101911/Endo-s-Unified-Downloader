@@ -169,6 +169,9 @@ async fn app(mut args: Args) -> i32 {
             return usage(&e);
         }
     }
+    if !ui.quiet() && !args.dry_run && !args.spider && hyperfetch_core::network::metered() {
+        stderr_line("The system says this connection is metered; downloading anyway.");
+    }
     if args.stdout {
         return to_stdout(&args, &ui, &shutdown).await;
     }

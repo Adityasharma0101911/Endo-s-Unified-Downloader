@@ -113,6 +113,22 @@ pub async fn back(url: &Url) {
     }
 }
 
+/// Whether the system says this computer's connection is metered (paid by the amount, or capped):
+/// on Windows its connectivity hint's cost, or roaming; on Linux NetworkManager's flag, a guess
+/// included; never elsewhere, or where it cannot tell. Asked at most every 5 seconds.
+pub fn metered() -> bool {
+    static SEEN: Mutex<Option<(Instant, bool)>> = Mutex::new(None);
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    match *seen {
+        Some((at, metered)) if at.elapsed() < Duration::from_secs(5) => metered,
+        _ => {
+            let metered = imp::metered();
+            *seen = Some((Instant::now(), metered));
+            metered
+        }
+    }
+}
+
 /// How many times the app's queue starts again by itself a download that failed for a network
 /// reason (see [`failed_for_network`]).
 pub const RERUNS: u32 = 3;
@@ -225,6 +241,11 @@ mod imp {
         }
     }
 
+    pub fn metered() -> bool {
+        // NetworkConnectivityCostHintFixed or Variable: what "Set as metered connection" sets.
+        hint().is_some_and(|hint| matches!(hint.cost, 2 | 3) || hint.roaming != 0)
+    }
+
     /// Wakes the waiting downloads whenever the system's connectivity changes, for the rest of
     /// the process.
     pub fn watch() {
@@ -251,6 +272,21 @@ mod imp {
 
     /// The system is asked every few seconds instead.
     pub fn watch() {}
+
+    /// NetworkManager's flag, read with systemd's `busctl` (not metered without either).
+    #[cfg(target_os = "linux")]
+    pub fn metered() -> bool {
+        use std::process::{Command, Stdio};
+        let nm = ["org.freedesktop.NetworkManager", "/org/freedesktop/NetworkManager", "org.freedesktop.NetworkManager", "Metered"];
+        let answer = Command::new("busctl").args(["--system", "--timeout=2", "get-property"]).args(nm).stdin(Stdio::null()).stderr(Stdio::null()).output();
+        // NMMetered: 1 yes, 3 guessed yes (a phone's hotspot, a mobile modem).
+        answer.is_ok_and(|out| out.status.success() && matches!(String::from_utf8_lossy(&out.stdout).trim(), "u 1" | "u 3"))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn metered() -> bool {
+        false
+    }
 }
 
 /// The network as the interfaces tell it: none when no interface but loopback is up with a

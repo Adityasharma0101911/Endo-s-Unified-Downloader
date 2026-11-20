@@ -195,7 +195,8 @@ fn detail_actions(app: &mut App, ui: &mut Ui, item: &QueueItem) {
     let id = item.id;
     match &item.status {
         QueueItemStatus::Queued => {
-            if ui.add(primary_button(&format!("{} Start now", icon::PLAY), p.accent)).clicked() {
+            let start = if app.metered_holds(id) { "Download anyway" } else { "Start now" };
+            if ui.add(primary_button(&format!("{} {start}", icon::PLAY), p.accent)).clicked() {
                 app.start_job(id, false);
             }
         }
@@ -1087,6 +1088,9 @@ fn row_summary(app: &App, item: &QueueItem, ratio: f64) -> String {
         if torrent.seeding {
             parts.push("seeding".to_string());
         }
+    }
+    if item.status == QueueItemStatus::Queued && app.metered_holds(item.id) {
+        parts.push("waits: the connection is metered (Start downloads it anyway)".to_string());
     }
     parts.extend(item.notes.iter().cloned());
     parts.extend(app.rerun_text(item.id));

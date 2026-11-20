@@ -266,6 +266,9 @@ pub struct Settings {
     /// Downloads step aside while the computer is in use (see `hyperfetch_core::gentle`), the app
     /// in efficiency mode while its window is minimized or in the tray (see `App::go_easy`).
     pub go_easy: bool,
+    /// Queued downloads wait while the system says the connection is metered (see
+    /// `App::watch_metered`). On by default; it holds nothing where the system never says so.
+    pub hold_metered: bool,
 }
 
 /// When the queue runs by itself (see `desktop::schedule_due`): at `start` on the ticked days it
@@ -389,6 +392,7 @@ impl Default for Settings {
             phone_address: String::new(),
             keep_awake: true,
             go_easy: false,
+            hold_metered: true,
         }
     }
 }

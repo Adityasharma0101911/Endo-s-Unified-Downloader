@@ -502,7 +502,8 @@ fn desktop_settings(app: &mut App, ui: &mut Ui) {
     });
 }
 
-/// How downloads keep to the computer and its network: keeping it awake, going easy on it.
+/// How downloads keep to the computer and its network: keeping it awake, going easy on it,
+/// waiting on a metered connection.
 fn gentle_settings(s: &mut Settings, ui: &mut Ui) {
     let about = "The computer does not go to sleep by itself while downloads run, nor in the 12 hours before the schedule \
                  starts downloads waiting for it. The screen still turns off, and you can still put it to sleep.";
@@ -511,6 +512,11 @@ fn gentle_settings(s: &mut Settings, ui: &mut Ui) {
         let about = "Downloads are written and checked at low disk and memory priority, so your own files stay in memory and \
                      games keep their speed; while the window is minimized or in the tray the app runs in efficiency mode.";
         switch(ui, "Go easy while I use this PC", about, &mut s.go_easy);
+    }
+    if cfg!(any(windows, target_os = "linux")) {
+        let about = "While the system says the connection is metered (a phone's hotspot, a capped plan), queued downloads wait \
+                     for one that is not, unless you choose Download anyway.";
+        switch(ui, "Wait on a metered connection", about, &mut s.hold_metered);
     }
 }
 
@@ -1155,6 +1161,12 @@ mod tests {
             scroll_to(&mut h, "Go easy while I use this PC");
             switch(&mut h, "Go easy while I use this PC");
             assert!(h.app.settings.go_easy);
+        }
+        if cfg!(any(windows, target_os = "linux")) {
+            assert!(h.app.settings.hold_metered, "on by default");
+            scroll_to(&mut h, "Wait on a metered connection");
+            switch(&mut h, "Wait on a metered connection");
+            assert!(!h.app.settings.hold_metered);
         }
     }
 

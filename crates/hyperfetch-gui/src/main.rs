@@ -418,6 +418,12 @@ struct App {
     reruns: HashMap<usize, (u32, Instant)>,
     /// Whether the app asked for efficiency mode (see `App::go_easy`).
     eco: bool,
+    /// Whether the system says the connection is metered (`hyperfetch_core::network::metered`).
+    is_metered: Box<dyn Fn() -> bool>,
+    /// Queued downloads wait for a connection that is not metered (see `App::watch_metered`).
+    metered: bool,
+    /// The queued downloads "Download all anyway" let start on a metered connection.
+    metered_ok: HashSet<usize>,
     /// The local time the schedule was last checked at (see `desktop::schedule_due`).
     schedule_seen: Option<(u8, u16)>,
     /// Paused downloads Resume all or the schedule's start resumes, first come first, as the
@@ -593,6 +599,9 @@ impl App {
             awake: hyperfetch_core::power::KeepAwake::new(Box::new(desktop::stay_awake)),
             reruns: HashMap::new(),
             eco: false,
+            is_metered: Box::new(desktop::metered),
+            metered: false,
+            metered_ok: HashSet::new(),
             schedule_seen: None,
             resuming: Vec::new(),
             restarting: HashSet::new(),
@@ -1599,7 +1608,9 @@ impl App {
             }
         }
         let mut held = HashSet::new();
-        while let Some(id) = self.queue.next_to_start(max, |id| held.contains(&id)) {
+        let metered = self.settings.hold_metered && (self.is_metered)();
+        let ok = self.metered_ok.clone();
+        while let Some(id) = self.queue.next_to_start(max, |id| held.contains(&id) || metered && !ok.contains(&id)) {
             if !self.start_job(id, false) {
                 held.insert(id);
             }
@@ -2077,6 +2088,9 @@ impl App {
         self.keep_awake(desktop::local_now());
         self.rerun_failed(Instant::now());
         self.go_easy(ctx.input(|i| i.viewport().minimized == Some(true)));
+        if self.watch_metered() {
+            ctx.request_repaint_after(Duration::from_secs(5));
+        }
         if self.queue.active_count() == 0 {
             self.batch_failed = false;
         }
@@ -2239,6 +2253,34 @@ impl App {
             desktop::eco(eco);
             self.eco = eco;
         }
+    }
+
+    /// Whether queued downloads wait for a connection that is not metered: the queue runs, the
+    /// setting holds them, some are queued and the system says the connection is metered (asked
+    /// at most every few seconds). Once they no longer wait, "Download all anyway" is forgotten
+    /// and the queue starts what waited.
+    fn watch_metered(&mut self) -> bool {
+        let queued = self.queue.items().iter().any(|item| item.status == QueueItemStatus::Queued);
+        let metered = self.settings.auto_run_queue && self.settings.hold_metered && queued && (self.is_metered)();
+        if self.metered && !metered {
+            self.metered_ok.clear();
+            self.run_scheduler();
+        }
+        self.metered = metered;
+        metered
+    }
+
+    /// Whether queued download `id` waits for a connection that is not metered.
+    pub fn metered_holds(&self, id: usize) -> bool {
+        self.metered && !self.metered_ok.contains(&id)
+    }
+
+    /// "Download all anyway": the downloads queued now start on the metered connection as the
+    /// queue starts them.
+    pub fn download_anyway(&mut self) {
+        let queued = self.queue.items().iter().filter(|item| item.status == QueueItemStatus::Queued).map(|item| item.id);
+        self.metered_ok.extend(queued.collect::<Vec<_>>());
+        self.run_scheduler();
     }
 
     /// A running download that gets nothing while the system says the network is gone: it waits
@@ -4287,6 +4329,38 @@ mod tests {
         app.settings.go_easy = false;
         app.go_easy(false);
         assert!(!app.eco);
+    }
+
+    /// While the system says the connection is metered, queued downloads wait, until Download
+    /// all anyway (for those queued then), the setting is off, or the connection is not metered.
+    #[test]
+    fn queued_downloads_wait_on_a_metered_connection() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(&rt, dir.path());
+        app.engines = Arc::new(|_: Vec<Url>, _: DownloadOptions| Err("not downloaded here".to_string()));
+        let metered = Arc::new(AtomicBool::new(true));
+        let flag = Arc::clone(&metered);
+        app.is_metered = Box::new(move || flag.load(Ordering::Relaxed));
+        app.settings.max_concurrent = 1;
+        let [a, b] = ["a.iso", "b.iso"].map(|name| add(&mut app, name));
+        app.run_scheduler();
+        assert!(app.watch_metered() && app.metered_holds(a) && app.metered_holds(b));
+        assert_eq!(status(&app, a), QueueItemStatus::Queued, "held");
+
+        app.download_anyway();
+        assert_eq!((status(&app, a), status(&app, b)), (QueueItemStatus::Downloading, QueueItemStatus::Queued), "as the queue starts them");
+        assert!(!app.metered_holds(b));
+        let c = add(&mut app, "c.iso");
+        assert!(app.watch_metered() && app.metered_holds(c), "only those queued then");
+
+        app.settings.hold_metered = false;
+        assert!(!app.watch_metered() && !app.metered_holds(c), "the setting off");
+        app.settings.hold_metered = true;
+        assert!(app.watch_metered() && app.metered_holds(c) && app.metered_holds(b), "Download all anyway is forgotten");
+        metered.store(false, Ordering::Relaxed);
+        assert!(!app.watch_metered() && !app.metered_holds(c), "not metered");
     }
 
     /// A download that failed for a network reason goes back in the queue by itself once its

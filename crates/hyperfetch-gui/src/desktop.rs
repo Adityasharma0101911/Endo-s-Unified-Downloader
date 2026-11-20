@@ -408,6 +408,19 @@ pub fn eco(_: bool) -> bool {
     false
 }
 
+/// Whether the system says the connection is metered: [`hyperfetch_core::network::metered`] in
+/// the app.
+#[cfg(not(test))]
+pub fn metered() -> bool {
+    hyperfetch_core::network::metered()
+}
+
+/// Tests never depend on the connection of the computer they run on.
+#[cfg(test)]
+pub fn metered() -> bool {
+    false
+}
+
 /// The local day of the week (Monday 0) and minute of the day.
 #[cfg(windows)]
 pub fn local_now() -> (u8, u16) {
