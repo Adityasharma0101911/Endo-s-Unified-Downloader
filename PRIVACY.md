@@ -24,7 +24,7 @@ The extension finds videos, streams and downloadable links on the pages you visi
 
 ## The desktop app
 
-The app stores its settings, queue and download history in its own folder on your computer, along with the names of the sites it downloaded from, how many connections each was fastest with, how many it served at once, the speed it held a download to and whether it speaks HTTP/2 or HTTP/3, and the top speed your internet line reached (all forgotten after 30 days). It connects only to:
+The app stores its settings, queue and download history in its own folder on your computer, along with the names of the sites it downloaded from, how many connections each was fastest with, how many it served at once, the speed it held a download to and each connection to, whether it takes ranges, how long a new connection to it took, whether it speaks HTTP/2 or HTTP/3 and wants the app's own User-Agent, and the top speed your internet line reached (all forgotten after 30 days); whether it publishes checksum files (forgotten after 7 days); and that it refused a request because it was asked too often (forgotten after a day). It connects only to:
 
 - the sites you download from;
 - for a container image, its registry and the token service the registry names (for Docker Hub, `auth.docker.io`), asked for an anonymous pull token that names only the image; for an Ollama model, Ollama's registry (`registry.ollama.ai`) and the storage it sends the files from, which learn the model asked for;

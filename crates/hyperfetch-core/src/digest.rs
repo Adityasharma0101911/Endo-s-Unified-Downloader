@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
 use std::path::Path;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -91,7 +91,7 @@ async fn published(
         return Some(found);
     }
     // Not of a host that limits how often it is asked (see `fetch_small`).
-    if let Some((metalink, size)) = described.filter(|(metalink, _)| !crate::hosts::refused_lately(metalink)) {
+    if let Some((metalink, size)) = described.filter(|(metalink, _)| !crate::hosts::limits_requests(metalink)) {
         // One of another size describes another file.
         let file = crate::metalink::described(client, &metalink, size, SIDECAR_BUDGET).await.filter(|f| f.size.is_none() || f.size == size);
         let found: Vec<_> = file.iter().flat_map(|f| &f.hashes).filter_map(|(algo, hex)| named(algo, hex)).collect();
@@ -169,9 +169,12 @@ fn from_headers(headers: &HeaderMap) -> Option<String> {
     ALGOS.iter().find_map(|(algo, _)| found.iter().find(|(name, _)| name == algo)).map(|(algo, digest)| checksum(algo, digest))
 }
 
-/// The checksum the files beside `url` give for it (see [`published_checksum`]).
+/// The checksum the files beside `url` give for it (see [`published_checksum`]). None is asked
+/// for of a host that limits how often it is asked (see `hosts::limits_requests`), nor of one
+/// whose downloads found none beside them lately (see `hosts::checksums`); what they find is kept
+/// for that.
 async fn from_sidecars(client: &Client, auth: Option<&Auth>, limit: usize, url: &Url) -> Option<String> {
-    if !matches!(url.scheme(), "http" | "https") {
+    if !matches!(url.scheme(), "http" | "https") || crate::hosts::limits_requests(url) || crate::hosts::checksums(url) == Some(false) {
         return None;
     }
     let name = url.path_segments()?.next_back().filter(|n| !n.is_empty())?;
@@ -190,14 +193,17 @@ async fn from_sidecars(client: &Client, auth: Option<&Auth>, limit: usize, url: 
     let kind = file.join(".").ok().map(|folder| format!("{folder}*.{ext}"));
     let bare = kind.as_deref().is_some_and(|kind| missing(kind, BARE_FILES));
     let own = beside.len() as u8;
-    let asked = beside.into_iter().filter(|_| !bare).chain(folder.into_iter().flatten().filter(|(list, _)| !missing(list.as_str(), 1)));
+    let asked: Vec<_> = beside.into_iter().filter(|_| !bare).chain(folder.into_iter().flatten().filter(|(list, _)| !missing(list.as_str(), 1))).collect();
+    let asking = asked.len();
     // A few at a time, over the connections the probe left open: a finished download waits for
     // them, and a host that takes few connections keeps the rest for the download. The first in
     // this order that names a checksum wins, whichever answers first.
     let name = &name;
-    // How many of the file's own were said not to be there, and whether one named its checksum.
-    let (none_beside, one_beside) = (&AtomicU8::new(0), &AtomicU8::new(0));
+    // How many of the file's own were said not to be there, and whether one named its checksum;
+    // how many of all asked for were said not to be there.
+    let (none_beside, one_beside, none_at_all) = (&AtomicU8::new(0), &AtomicU8::new(0), &AtomicUsize::new(0));
     let lookups: Vec<_> = asked
+        .into_iter()
         .map(|(sidecar, ext)| async move {
             match fetch_small(client, auth, limit, sidecar.clone()).await {
                 Sidecar::Text(text) => {
@@ -208,6 +214,7 @@ async fn from_sidecars(client: &Client, auth: Option<&Auth>, limit: usize, url: 
                     found
                 }
                 Sidecar::Missing => {
+                    none_at_all.fetch_add(1, Ordering::Relaxed);
                     match ext {
                         Some(_) => _ = none_beside.fetch_add(1, Ordering::Relaxed),
                         None => note_missing(sidecar.into()),
@@ -220,14 +227,22 @@ async fn from_sidecars(client: &Client, auth: Option<&Auth>, limit: usize, url: 
         .collect();
     let lookups = futures_util::stream::iter(lookups).buffered(SIDECARS_AT_ONCE).filter_map(std::future::ready);
     let found = tokio::time::timeout(SIDECAR_BUDGET, std::pin::pin!(lookups).next()).await;
+    let none = found.is_ok() && none_beside.load(Ordering::Relaxed) == own;
     if let Some(kind) = kind {
         if one_beside.load(Ordering::Relaxed) > 0 {
             MISSING.lock().remove(&kind);
-        } else if found.is_ok() && none_beside.load(Ordering::Relaxed) == own {
+        } else if none {
             note_missing(kind);
         }
     }
-    found.ok().flatten()
+    // Every one asked for not there: the host publishes none, and the downloads from it after this
+    // one ask for none (see `hosts::checksums`); one found takes that back.
+    let all_missing = found.is_ok() && asking > 0 && none_at_all.load(Ordering::Relaxed) == asking;
+    let found = found.ok().flatten();
+    if found.is_some() || all_missing {
+        crate::hosts::record_checksums(url, found.is_some());
+    }
+    found
 }
 
 /// What asking for a checksum file gave.
@@ -261,12 +276,12 @@ fn note_missing(key: String) {
 }
 
 /// The checksum file at `url`: one that is there, not a web page and at most `MAX_SIDECAR`. Not
-/// asked for of a host that refused a request lately (see `hosts::refused_lately`): it limits how
-/// often it is asked, and the download's own requests need what it allows. A refusal (429/503)
+/// asked for of a host that limits how often it is asked (see `hosts::limits_requests`): the
+/// download's own requests need what it allows. A refusal (429/503)
 /// rests the host and so ends the lookups after it.
 async fn fetch_small(client: &Client, auth: Option<&Auth>, limit: usize, url: Url) -> Sidecar {
     let slot = crate::hosts::acquire(&url, limit).await;
-    if crate::hosts::refused_lately(&url) {
+    if crate::hosts::limits_requests(&url) {
         return Sidecar::Unknown;
     }
     let request = |url: &Url| authorize(client.get(url.clone()), auth, url).header(ACCEPT_ENCODING, "identity");
@@ -987,9 +1002,10 @@ mod tests {
                 std::mem::take(&mut *log.lock().unwrap()).len()
             }
         };
-        // No list in the folder: asked for once. The files' own: until three of a kind had none.
+        // No checksum file on the host at all: the first file asks for each, the next from the host
+        // none (see `hosts::checksums`).
         let (url, log) = serve(content(100), Site::default()).await;
-        for (name, requests) in [("a.bin", 7), ("b.bin", 4), ("c.bin", 4), ("d.bin", 0), ("e.BIN", 0), ("f.iso", 4)] {
+        for (name, requests) in [("a.bin", 7), ("b.bin", 0), ("f.iso", 0)] {
             assert_eq!(asked(&url, &log, name).await, requests, "{name}");
         }
         // A list that is there is read for every file, whatever it lists.
