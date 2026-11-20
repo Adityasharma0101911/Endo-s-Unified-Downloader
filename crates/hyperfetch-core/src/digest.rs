@@ -7,7 +7,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
 use std::path::Path;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -336,6 +336,9 @@ fn algo_name(algo: &str) -> String {
 #[derive(Default)]
 pub(crate) struct Site {
     search: Option<JoinHandle<Option<String>>>,
+    /// What `search` gives, as soon as it is found: the download's writer hashes the file with it
+    /// as the file arrives (see [`found`]).
+    found: Arc<OnceLock<String>>,
     pub(crate) note: Option<String>,
     /// The mirror the download went by, and the ranges written from others in its last run: a
     /// whole-file hash that fails has those fetched again from it alone (`primary_only`).
@@ -357,13 +360,24 @@ pub(crate) fn look_for(
     headers: &HeaderMap,
     described: Option<(Url, Option<u64>)>,
 ) {
+    let found = Arc::new(OnceLock::new());
     let search = (options.remote_checksum && options.expected_checksum.is_none()).then(|| {
-        let (client, url, headers, limit) = (client.clone(), url.clone(), headers.clone(), options.max_connections_per_host);
-        tokio::spawn(async move { published(&client, auth.as_deref(), limit, &url, &headers, described).await })
+        // One in the headers is known at once.
+        if let Some(checksum) = from_headers(headers) {
+            let _ = found.set(checksum);
+        }
+        let (client, url, headers, limit, slot) = (client.clone(), url.clone(), headers.clone(), options.max_connections_per_host, Arc::clone(&found));
+        tokio::spawn(async move {
+            let checksum = published(&client, auth.as_deref(), limit, &url, &headers, described).await;
+            if let Some(checksum) = &checksum {
+                let _ = slot.set(checksum.clone());
+            }
+            checksum
+        })
     });
     // What a run before left of the mirrors (`primary`, `primary_only`) holds for this one.
     let mut site = site.lock();
-    (site.search, site.note) = (search, None);
+    (site.search, site.found, site.note) = (search, found, None);
 }
 
 /// Holds the download to `checksum` (`algo:hex`) in place of what [`look_for`] looks for: the
@@ -373,7 +387,14 @@ pub(crate) fn expect(site: &Mutex<Site>, checksum: String) {
     if let Some(search) = site.search.take() {
         search.abort();
     }
+    site.found = Arc::new(OnceLock::from(checksum.clone()));
     site.search = Some(tokio::spawn(async move { Some(checksum) }));
+}
+
+/// The checksum the download is to be held to besides the user's (see [`look_for`] and
+/// [`expect`]), once it is known; the file is hashed with it as it arrives.
+pub(crate) fn found(site: &Mutex<Site>) -> Option<String> {
+    site.lock().found.get().cloned()
 }
 
 /// Why the engine does not keep a finished download (see [`finish`]).
@@ -396,8 +417,9 @@ pub(crate) enum Unfinished {
 /// download that finishes sooner waits for until its time is up. Also keeps the file's BLAKE3
 /// piece hashes for history: from the blocks `writer` hashed as it wrote them, else from a read
 /// the other checks make anyway (a download in one stream, which cannot be repaired by ranges
-/// from its server, has none otherwise). Reads the file once for all of them, and only when one
-/// is needed. Returns its BLAKE3 as hex.
+/// from its server, has none otherwise). The site's checksum comes from `writer` too when it
+/// hashed the file with it as it arrived (see [`found`]). Reads the file once for all of them,
+/// and only when one is needed. Returns its BLAKE3 as hex.
 pub(crate) async fn finish(
     part: &Path,
     verified: Result<String, VerifyError>,
@@ -425,9 +447,11 @@ pub(crate) async fn finish(
     let read = tokio::task::spawn_blocking(move || {
         let size = std::fs::metadata(&path)?.len();
         let piece = crate::history::piece_size(size);
+        let followed = wanted.as_deref().zip(writer.as_ref()).map(|(wanted, writer)| writer.followed(wanted)).transpose()?.flatten();
         let kept = piece.zip(writer).map(|(piece, writer)| writer.piece_hashes(piece)).transpose()?;
         let read_pieces = piece.filter(|_| kept.is_none() && (wanted.is_some() || metalink.is_some()));
-        let mut pass = read_pass(&path, wanted.as_deref(), metalink.as_ref(), read_pieces)?;
+        let mut pass = read_pass(&path, wanted.as_deref().filter(|_| followed.is_none()), metalink.as_ref(), read_pieces)?;
+        pass.published = followed.or(pass.published);
         if !pass.bad.is_empty() {
             return Ok(Err(refetch(&path, size, &pass.bad)));
         }
@@ -625,6 +649,8 @@ pub(crate) fn read_pass(path: &Path, published: Option<&str>, metalink: Option<&
     if whole_algo.is_none() && metalink.is_none() && piece.is_none() {
         return Ok(Pass::default());
     }
+    #[cfg(test)]
+    crate::storage::READ_BACK.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(path.to_path_buf());
     let mut file = File::open(path)?;
     let size = file.metadata()?.len();
     let mut whole = whole_algo.map(|new| Pieced::new(size, size, new));
@@ -685,6 +711,8 @@ mod tests {
         sidecars_wait: Duration,
         /// The most sidecars that were waiting for their answer at once.
         sidecars_at_once: Arc<std::sync::atomic::AtomicUsize>,
+        /// Every answer is sent 64 KiB at a time, each piece after this long.
+        pace: Duration,
     }
 
     /// Serves `content` at `/dir/file.bin` (HEAD, GET and ranges) and `site.files` beside it, any
@@ -761,7 +789,12 @@ mod tests {
                             None => b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
                         }
                     };
-                    let _ = sock.write_all(&resp).await;
+                    for piece in resp.chunks(if site.pace.is_zero() { resp.len().max(1) } else { 64 * 1024 }) {
+                        tokio::time::sleep(site.pace).await;
+                        if sock.write_all(piece).await.is_err() {
+                            return;
+                        }
+                    }
                     let _ = sock.shutdown().await;
                 });
             }
@@ -1023,6 +1056,40 @@ mod tests {
         let (done, checked) = download(vec![url], dir.path(), DownloadOptions::default()).await;
         assert!(done.is_ok(), "{done:?}");
         assert_eq!(checked.as_deref(), Some("the site's SHA-256"));
+    }
+
+    /// The site's checksum is taken as the file arrives, from the headers at once and from a
+    /// checksum file as soon as that is found: the finished file is not read again for it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_sites_checksum_is_taken_as_the_file_arrives() {
+        let data = content(4 * MIB);
+        let sums = |hex: &str| vec![("/dir/SHA256SUMS".to_string(), "text/plain".to_string(), format!("{hex}  file.bin"))];
+        let header = format!("Repr-Digest: sha-256=:{}:", b64(&Sha256::digest(&data)));
+        // 64 KiB every 25 ms over one connection: the file takes about 1.6 s. The list is asked
+        // for after the file's own four checksum files, two at a time, so it is found after
+        // about 80 ms, or 0.5 s when each answer waits 150 ms.
+        let pace = Duration::from_millis(25);
+        let one = || DownloadOptions { num_connections: 1, ..DownloadOptions::default() };
+        let read_back = |dir: &Path| crate::storage::READ_BACK.lock().unwrap().iter().filter(|p| p.starts_with(dir)).cloned().collect::<Vec<_>>();
+        for (label, site) in [
+            ("in its headers", Site { headers: vec![header], pace, ..Site::default() }),
+            ("in a list found at once", Site { files: sums(&sha256_hex(&data)), pace, ..Site::default() }),
+            ("in a list found halfway", Site { files: sums(&sha256_hex(&data)), pace, sidecars_wait: Duration::from_millis(150), ..Site::default() }),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (url, _) = serve(data.clone(), site).await;
+            let (done, checked) = download(vec![url], dir.path(), one()).await;
+            assert!(std::fs::read(done.unwrap()).unwrap() == data, "{label}");
+            assert_eq!(checked.as_deref(), Some("the site's SHA-256"), "{label}");
+            assert_eq!(read_back(dir.path()), Vec::<std::path::PathBuf>::new(), "{label}");
+        }
+        // A wrong one fails the download as it did, giving the file's digest.
+        let dir = tempfile::tempdir().unwrap();
+        let (url, _) = serve(data.clone(), Site { files: sums(&"0".repeat(64)), pace, ..Site::default() }).await;
+        let (failed, _) = download(vec![url], dir.path(), one()).await;
+        let wrong = format!("against the site's published SHA-256: expected {}, got {}", "0".repeat(64), sha256_hex(&data));
+        assert!(failed.as_ref().is_err_and(|e| e.contains(&wrong)), "{failed:?}");
+        assert_eq!(read_back(dir.path()), Vec::<std::path::PathBuf>::new());
     }
 
     /// Hashes of `data` in `length`-byte pieces, as a metalink lists them.

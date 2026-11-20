@@ -163,15 +163,29 @@ impl DiskWriter {
     /// it never hashed, so `digest` reads only the rest. That hashing stops once the last clone of
     /// this writer is dropped.
     pub fn track_digest(&self, on_disk: &[ByteRange], expected_checksum: Option<&str>) {
-        let extra = needs(expected_checksum).unwrap_or_default();
         let hashes = &self.inner.hashes;
-        let mut state = hashes.state.lock();
-        state.tracking = true;
-        for range in on_disk.iter().filter(|r| r.start < self.size) {
-            add(&mut state.written, range.start..range.end.saturating_add(1).min(self.size));
+        {
+            let mut state = hashes.state.lock();
+            state.tracking = true;
+            for range in on_disk.iter().filter(|r| r.start < self.size) {
+                add(&mut state.written, range.start..range.end.saturating_add(1).min(self.size));
+            }
         }
         hashes.changed.notify_all();
-        if extra.is_some() && state.follower.is_none() && !state.stopped {
+        if let Some(checksum) = expected_checksum {
+            self.hash_as_written(checksum);
+        }
+    }
+
+    /// Starts hashing the file's written prefix, as it grows, with the digest `checksum` needs
+    /// besides BLAKE3 (see [`DiskWriter::track_digest`]), unless that is already going on or
+    /// it needs none: the checksum the site publishes, found once writing began, as well. It
+    /// reads what was written before from the file. See [`DiskWriter::followed`].
+    pub(crate) fn hash_as_written(&self, checksum: &str) {
+        let extra = needs(Some(checksum)).unwrap_or_default();
+        let hashes = &self.inner.hashes;
+        let mut state = hashes.state.lock();
+        if extra.is_some() && state.tracking && state.follower.is_none() && !state.stopped {
             let (hashes, file) = (Arc::clone(hashes), Arc::clone(&self.inner.file));
             let prefix = PrefixHash::new(extra);
             // Without the thread, `digest` hashes the whole file at the end, as it would anyway.
@@ -189,15 +203,30 @@ impl DiskWriter {
     /// written, plus the digest `expected_checksum` needs besides. Reads each byte at most once,
     /// through this writer's handle: that digest goes on from where the prefix hasher stopped,
     /// hashing the blocks never hashed that it passes on the way, and whatever blocks are left
-    /// unhashed after that are read back on every core. Blocking.
+    /// unhashed after that are read back on every core. Without such a digest to take, the prefix
+    /// hasher goes on, for [`DiskWriter::followed`]. Blocking.
     pub fn digest(&self, expected_checksum: Option<&str>) -> std::io::Result<FileDigest> {
         let extra = needs(expected_checksum).unwrap_or_default();
+        let prefix = extra.and_then(|_| self.inner.hashes.stop_follower()).filter(|p| p.algo == extra);
+        self.digest_on(prefix.unwrap_or_else(|| PrefixHash::new(extra)))
+    }
+
+    /// The whole file's digest in the algorithm of `checksum` (`sha256:<hex>` and so on) as
+    /// lowercase hex, once writing is done, when the prefix hasher was taking it (see
+    /// [`DiskWriter::hash_as_written`]): only what that had yet to reach is read. None, reading
+    /// nothing, when it was not, or what it hashed was written again since. Blocking.
+    pub(crate) fn followed(&self, checksum: &str) -> std::io::Result<Option<String>> {
+        let extra = needs(Some(checksum)).unwrap_or_default();
+        match self.inner.hashes.stop_follower().filter(|p| extra.is_some() && p.algo == extra) {
+            Some(prefix) => Ok(self.digest_on(prefix)?.extra.map(|(_, hex)| hex)),
+            None => Ok(None),
+        }
+    }
+
+    /// [`DiskWriter::digest`], `prefix` going on with its own digest from where it stopped.
+    fn digest_on(&self, mut prefix: PrefixHash) -> std::io::Result<FileDigest> {
         let (hashes, file) = (&*self.inner.hashes, &*self.inner.file);
-        let mut prefix = hashes
-            .stop_follower()
-            .filter(|p| p.algo == extra)
-            .unwrap_or_else(|| PrefixHash::new(extra));
-        if extra.is_some() {
+        if prefix.algo.is_some() {
             // The prefix hasher stops on a block boundary, and these reads are whole blocks.
             let tail = prefix.len..self.size;
             let unhashed = hashes.unhashed(&hashes.state.lock(), tail.clone());
@@ -1667,6 +1696,29 @@ mod tests {
         // Once for SHA-256, plus the rest of the first block for its BLAKE3 when it was written.
         let block = writer.inner.hashes.block as usize;
         assert_eq!(writer.inner.hashes.read.load(Ordering::Relaxed), size as usize + block - fresh);
+    }
+
+    #[test]
+    fn test_a_checksum_found_while_writing_is_hashed_from_the_file_once() {
+        let size = 3 * 1024 * 1024 + 777u64;
+        let data = pattern(size);
+        let checksum = format!("md5:{}", hex::encode(&Md5::digest(&data)));
+        let temp = NamedTempFile::new().unwrap();
+        let writer = DiskWriter::open_or_create(temp.path(), size).unwrap();
+        writer.track_digest(&[], None);
+        writer.write_chunk_slice(0, &data[..2 * 1024 * 1024]).unwrap();
+        // Found with two thirds of the file written: it hashes those from the file, then the rest.
+        writer.hash_as_written(&checksum);
+        writer.write_chunk_slice(2 * 1024 * 1024, &data[2 * 1024 * 1024..]).unwrap();
+
+        // The digest without a checksum of its own leaves it be, and gives it nothing.
+        let digest = writer.digest(None).unwrap();
+        assert_eq!(digest.blake3, *blake3::hash(&data).as_bytes());
+        assert!(digest.extra.is_none());
+        assert_eq!(writer.followed(&checksum).unwrap().as_deref(), checksum.strip_prefix("md5:"));
+        assert_eq!(writer.inner.hashes.read.load(Ordering::Relaxed), size as usize, "each byte read once");
+        // Another algorithm than the one it hashed with is none of its business.
+        assert_eq!(writer.followed(&format!("sha1:{}", "0".repeat(40))).unwrap(), None);
     }
 
     #[test]

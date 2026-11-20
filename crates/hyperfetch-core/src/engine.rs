@@ -2974,7 +2974,10 @@ impl DownloadEngine {
         let counted = remaining.div_ceil(per_connection);
         let counted = if adapts && start.rate.is_none() { counted.min(AUTOPILOT_START as u64) } else { counted };
         let num_workers = best.map_or(counted, |best| best as u64).clamp(1, max_workers) as usize;
-        let in_order = crate::storage::hashes_prefix(self.options.expected_checksum.as_deref());
+        // The site's checksum, when known by now, is hashed as the file arrives as the user's is;
+        // one found later from then on (see `crate::digest::found`).
+        let hashed = self.options.expected_checksum.clone().or_else(|| crate::digest::found(&self.site));
+        let in_order = crate::storage::hashes_prefix(hashed.as_deref());
         let throttled_host = mirrors.iter().any(|m| HostKey::of(&m.url).is_bitrate_throttled());
         let chunk_size = effective_chunk_size(remaining, num_workers as u64, self.options.base_chunk_size, in_order, throttled_host);
         let mut manager = ChunkManager::with_resumed_ranges(size, chunk_size, &have).map_err(|e| e.to_string())?;
@@ -2999,7 +3002,7 @@ impl DownloadEngine {
 
         let writer = {
             let part = part.to_path_buf();
-            let (on_disk, checksum) = (state.completed_ranges.clone(), self.options.expected_checksum.clone());
+            let (on_disk, checksum) = (state.completed_ranges.clone(), hashed.clone());
             let decrypt = self.decrypt.clone();
             blocking(move || {
                 let writer = DiskWriter::open_or_create(&part, size)?.decrypting(decrypt);
@@ -3093,6 +3096,7 @@ impl DownloadEngine {
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut last_persist = Instant::now();
         let mut saving: Option<tokio::task::JoinHandle<_>> = None;
+        let mut hashing = hashed.is_some();
         let outcome = loop {
             if job.chunks.lock().is_all_completed() {
                 break Ok(());
@@ -3117,6 +3121,12 @@ impl DownloadEngine {
                 },
                 _ = tick.tick() => {
                     emit(snapshot_tx, || EngineSnapshot { autopilot: why.clone(), ..job.snapshot(size, &mut meter, final_path) });
+                    if !hashing {
+                        if let Some(checksum) = crate::digest::found(&self.site) {
+                            job.writer.hash_as_written(&checksum);
+                            hashing = true;
+                        }
+                    }
                     if let Some(limiter) = &self.limiter {
                         let left = size.saturating_sub(job.chunks.lock().total_downloaded());
                         limiter.nearly_done((left as f64) < meter.speed * NEARLY_DONE_SECS);
@@ -8970,16 +8980,18 @@ mod tests {
         }
     }
 
-    /// A local server of a `size`-byte file at every path, honouring `Range`, that sends each
-    /// answer at `rate` bytes a second, then ends it.
-    async fn rate_server(size: usize, rate: f64) -> Url {
+    /// A local server of a `size`-byte file of sevens at every path, honouring `Range`, that sends
+    /// each answer at `rate` bytes a second, then ends it; `headers` (lines ending in CRLF) go
+    /// with every answer.
+    async fn rate_server(size: usize, rate: f64, headers: &str) -> Url {
+        let headers = headers.to_string();
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = crate::hosts::unseen_listener().await;
         let base = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
         let piece = Arc::new(vec![7u8; 256 * 1024]);
         tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
-                let piece = Arc::clone(&piece);
+                let (piece, headers) = (Arc::clone(&piece), headers.clone());
                 tokio::spawn(async move {
                     let mut head = Vec::new();
                     let mut buf = [0u8; 4096];
@@ -8997,7 +9009,7 @@ mod tests {
                         .unwrap_or((0, size - 1));
                     let len = end + 1 - start;
                     let answer = format!(
-                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{size}\r\nContent-Length: {len}\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n"
+                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{size}\r\nContent-Length: {len}\r\nETag: \"v1\"\r\n{headers}Connection: close\r\n\r\n"
                     );
                     if socket.write_all(answer.as_bytes()).await.is_err() || head.starts_with("head") {
                         return;
@@ -9035,34 +9047,46 @@ mod tests {
 
     /// Not a test: how long a fast download takes, and the longest its control loop went without
     /// a snapshot, with eight connections at 32 MB/s each from a local server (768 MiB, written to
-    /// the system's temporary folder).
+    /// the system's temporary folder), without a checksum and with the site's SHA-256 in its
+    /// headers.
     /// `cargo test -p hyperfetch-core --lib bench_saves -- --ignored --nocapture`
     #[tokio::test(flavor = "multi_thread")]
     #[ignore]
     async fn bench_saves_during_a_fast_download() {
+        use base64::Engine as _;
+        use sha2::Digest;
         const MIB: usize = 1024 * 1024;
-        let mut runs = Vec::new();
-        for _ in 0..5 {
-            let base = rate_server(768 * MIB, 32e6).await;
-            let dir = tempdir().unwrap();
-            let options = DownloadOptions {
-                output_path: Some(dir.path().join("f.bin")),
-                num_connections: 8,
-                adaptive: false,
-                remote_checksum: false,
-                ..Default::default()
-            };
-            let (tx, rx) = broadcast::channel::<EngineSnapshot>(1024);
-            let gaps = tokio::spawn(longest_gap(rx));
-            let started = Instant::now();
-            DownloadEngine::new(vec![base.join("f.bin").unwrap()], options).run(Some(tx)).await.unwrap();
-            let took = started.elapsed();
-            let longest = gaps.await.unwrap();
-            println!("took {took:?} ({:.0} MB/s), longest gap between snapshots {longest:?}", (768 * MIB) as f64 / took.as_secs_f64() / 1e6);
-            runs.push((took, longest));
+        let mut sha256 = sha2::Sha256::new();
+        let block = vec![7u8; MIB];
+        (0..768).for_each(|_| sha256.update(&block));
+        let sha256 = sha256.finalize();
+        let header = format!("Repr-Digest: sha-256=:{}:\r\n", base64::engine::general_purpose::STANDARD.encode(sha256));
+        for (label, headers) in [("no checksum", ""), ("the site's SHA-256", header.as_str())] {
+            let mut runs = Vec::new();
+            for _ in 0..5 {
+                let base = rate_server(768 * MIB, 32e6, headers).await;
+                let dir = tempdir().unwrap();
+                let options = DownloadOptions {
+                    output_path: Some(dir.path().join("f.bin")),
+                    num_connections: 8,
+                    adaptive: false,
+                    remote_checksum: !headers.is_empty(),
+                    ..Default::default()
+                };
+                let (tx, rx) = broadcast::channel::<EngineSnapshot>(1024);
+                let gaps = tokio::spawn(longest_gap(rx));
+                let started = Instant::now();
+                let engine = DownloadEngine::new(vec![base.join("f.bin").unwrap()], options);
+                engine.run(Some(tx)).await.unwrap();
+                let took = started.elapsed();
+                let longest = gaps.await.unwrap();
+                assert_eq!(engine.checked_against().is_some(), !headers.is_empty());
+                println!("{label}: took {took:?} ({:.0} MB/s), longest gap between snapshots {longest:?}", (768 * MIB) as f64 / took.as_secs_f64() / 1e6);
+                runs.push((took, longest));
+            }
+            runs.sort();
+            println!("{label}: median {:?}, min {:?}, max {:?}", runs[2], runs[0], runs[4]);
         }
-        runs.sort();
-        println!("median {:?}, min {:?}, max {:?}", runs[2], runs[0], runs[4]);
     }
 
     /// Resume-state saves in these folders: how long each waits before it saves, how many
@@ -9104,7 +9128,7 @@ mod tests {
         const SLOW: Duration = Duration::from_millis(1500);
         // Four connections at 0.5 MB/s each: about five seconds, so a save starts after two and
         // ends while the bytes still come in.
-        let base = rate_server(10 * MIB, 0.5e6).await;
+        let base = rate_server(10 * MIB, 0.5e6, "").await;
         let dir = tempdir().unwrap();
         SLOW_SAVES.lock().push((dir.path().to_path_buf(), SLOW, 0, 0));
         let target = dir.path().join("f.bin");
