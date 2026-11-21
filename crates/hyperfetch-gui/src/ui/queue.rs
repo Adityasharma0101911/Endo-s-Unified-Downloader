@@ -37,6 +37,9 @@ fn takes_new_link(item: &QueueItem) -> bool {
 /// and what happened to it. `in_place` (a narrow window): drawn on a card of its own with a way
 /// back to the list; beside the list, the panel is its card.
 pub(super) fn detail_page(app: &mut App, ui: &mut Ui, item: &QueueItem, in_place: bool) {
+    // Done once its bytes are in (see `util::checking`).
+    let shown = util::shown(item);
+    let item = &*shown;
     if in_place {
         card(ui).show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -259,7 +262,9 @@ fn detail_actions(app: &mut App, ui: &mut Ui, item: &QueueItem) {
             app.copy_text(url.to_string());
         }
     }
-    if !item.status.is_active() && ui.add(button(format!("{} Remove", icon::X))).on_hover_text("Off the list; its files are kept (Undo brings it back)").clicked() {
+    // Not while its engine runs, also for one shown done while its checksum is checked.
+    let running = app.queue.get_item(id).is_some_and(|real| real.status.is_active());
+    if !running && ui.add(button(format!("{} Remove", icon::X))).on_hover_text("Off the list; its files are kept (Undo brings it back)").clicked() {
         app.remove_job(id);
         app.focused = None;
         app.selected = None;
@@ -1309,7 +1314,9 @@ fn segment_bar(ui: &mut Ui, id: egui::Id, item: &QueueItem, chunks: &[ChunkSnaps
 /// completion and shakes on failure. Returns the card's response.
 fn queue_row(app: &App, ui: &mut Ui, line: &Line, action: &mut Option<(usize, RowAction)>) -> egui::Response {
     let p = palette(ui);
-    let item = line.item;
+    // Done once its bytes are in (see `util::checking`).
+    let shown = util::shown(line.item);
+    let item = &*shown;
     let ctx = ui.ctx().clone();
     let (slot, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_HEIGHT), Sense::hover());
     let id = egui::Id::new(("queue row", item.id));
@@ -1380,7 +1387,11 @@ fn queue_row(app: &App, ui: &mut Ui, line: &Line, action: &mut Option<(usize, Ro
 
     let item_id = egui::Id::new(("item", item.id));
     let (status, color) = status_badge(app, item, &p);
-    let actions = row_actions(&item.status);
+    let actions = match util::checking(line.item) {
+        // Open, Show in its folder and Details: it leaves the list once its check is over.
+        true => &row_actions(&item.status)[..3],
+        false => row_actions(&item.status),
+    };
     // A stream's card offers its track chooser too, left of the others.
     let tracks = crate::tracks::offered(item);
     // One whose file another download has from another host offers to join them (see `Twin`).
@@ -1494,7 +1505,7 @@ fn in_group(group: usize, status: &QueueItemStatus) -> bool {
 /// in its name and its links.
 fn listed(item: &QueueItem, group: usize, search: &str) -> bool {
     let found = || item.filename.to_lowercase().contains(search) || item.urls.iter().any(|url| url.as_str().to_lowercase().contains(search));
-    in_group(group, &item.status) && (search.is_empty() || found())
+    in_group(group, &util::shown(item).status) && (search.is_empty() || found())
 }
 
 /// The downloads the list shows, top to bottom: for Up and Down.
@@ -1515,7 +1526,7 @@ fn many_links_id() -> egui::Id {
 fn toolbar(app: &mut App, ui: &mut Ui) {
     let p = palette(ui);
     let items = app.queue.items();
-    let counts: Vec<usize> = (0..FILTERS.len()).map(|group| items.iter().filter(|item| in_group(group, &item.status)).count()).collect();
+    let counts: Vec<usize> = (0..FILTERS.len()).map(|group| items.iter().filter(|item| in_group(group, &util::shown(item).status)).count()).collect();
     let running = app.queue.active_count();
     let finish = (running > 0).then(|| finish_time(app.queue.remaining(app.settings.auto_run_queue))).flatten();
     // On a narrow page the search and the buttons go on a line of their own, under the filters.
@@ -2004,6 +2015,24 @@ mod tests {
         h.click(icon::ARROWS_SPLIT);
         assert!(h.app.twins.is_empty() && h.app.queue.get_item(apart).is_some());
         h.wait_for_background();
+    }
+
+    /// A download whose bytes are in shows as done while the site's checksum is checked: its card
+    /// says Done and opens its file, with no Pause nor Remove, and the bar counts it done.
+    #[test]
+    fn a_download_in_place_shows_as_done() {
+        let mut h = Harness::new();
+        let id = h.add("disk.img");
+        h.progress(id, 1.0);
+        let path = std::env::temp_dir().join("disk.img");
+        let snapshot = hyperfetch_core::engine::EngineSnapshot { total_bytes: 100 << 20, downloaded_bytes: 100 << 20, target_path: Some(path), in_place: true, ..Default::default() };
+        h.app.queue.apply_snapshot(id, &snapshot);
+        h.app.tab = crate::Tab::Downloads;
+        h.frames(30);
+        let lines: Vec<String> = h.texts().into_iter().map(|(text, _)| text).collect();
+        assert!(lines.iter().any(|text| text == "Done") && !lines.iter().any(|text| text == "Downloading"), "{lines:?}");
+        assert!(lines.iter().any(|text| text.contains("1 done")), "{lines:?}");
+        assert!(h.find(icon::FILE).is_some() && h.find(icon::PAUSE).is_none() && h.find_near("disk.img", icon::X).is_none(), "{lines:?}");
     }
 
     /// A running download's own speed limit and connections, set in its details, are kept with it

@@ -1,12 +1,13 @@
 #[cfg(windows)]
 use std::ffi::OsString;
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, MutexGuard};
 
 use hyperfetch_core::history::{is_redacted, redact_url, DownloadHistoryManager, HistoryEntry, REDACTED_LINK};
 use hyperfetch_core::ingest;
-use hyperfetch_core::queue::QueueItem;
+use hyperfetch_core::queue::{QueueItem, QueueItemStatus};
 use hyperfetch_core::state::DownloadState;
 use hyperfetch_core::verify::BuildVerificationResult;
 use url::Url;
@@ -47,6 +48,22 @@ pub fn clipboard_offer(text: &str) -> Option<(String, String)> {
         n => format!(" and {} more", n - 1),
     };
     Some((format!("{}{}", shown, more), text.to_string()))
+}
+
+/// Whether `item` has its bytes in and its file under its final name while its engine still
+/// checks it against the site's published checksum (see `QueueItem::in_place`): done for the
+/// user and holding no place among the running downloads, but not finished for good until that
+/// verdict, which ends its run.
+pub fn checking(item: &QueueItem) -> bool {
+    item.in_place && item.status == QueueItemStatus::Downloading
+}
+
+/// `item` as the window shows it: done (`Completed`) while it is [`checking`].
+pub fn shown(item: &QueueItem) -> Cow<'_, QueueItem> {
+    match checking(item) {
+        true => Cow::Owned(QueueItem { status: QueueItemStatus::Completed, speed_bytes_per_sec: 0.0, ..item.clone() }),
+        false => Cow::Borrowed(item),
+    }
 }
 
 /// The folder to create before `item` starts, since the engine takes a missing folder for a file

@@ -701,9 +701,10 @@ fn pulse_bar(app: &mut App, ui: &mut Ui) {
     let p = palette(ui);
     let ctx = ui.ctx().clone();
     let items = app.queue.items();
-    let running = items.iter().filter(|item| item.status == QueueItemStatus::Downloading).count();
+    // One in place counts done (see `util::checking`).
+    let running = items.iter().filter(|item| item.status == QueueItemStatus::Downloading && !item.in_place).count();
     let waiting = items.iter().filter(|item| matches!(item.status, QueueItemStatus::Queued | QueueItemStatus::Paused)).count();
-    let done = items.iter().filter(|item| item.status == QueueItemStatus::Completed).count();
+    let done = items.iter().filter(|item| item.status == QueueItemStatus::Completed || crate::util::checking(item)).count();
     let speed: f64 = items.iter().filter(|item| item.status == QueueItemStatus::Downloading).map(|item| item.speed_bytes_per_sec.max(0.0)).sum();
     let paused = items.iter().any(|item| item.status == QueueItemStatus::Paused);
     let shown = anim::roll(&ctx, egui::Id::new("total speed"), speed as f32).max(0.0);
@@ -842,7 +843,7 @@ fn limit_switch(app: &mut App, ui: &mut Ui) {
         .queue
         .items()
         .iter()
-        .filter(|item| item.status == QueueItemStatus::Downloading && item.options.max_speed != wanted)
+        .filter(|item| item.status == QueueItemStatus::Downloading && !item.in_place && item.options.max_speed != wanted)
         .map(|item| item.id)
         .collect();
     if !stale.is_empty() && ui.add(button("Apply now")).on_hover_text("Restart the running downloads with this limit; they go on from where they are").clicked() {
