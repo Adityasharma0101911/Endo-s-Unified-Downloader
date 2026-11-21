@@ -2157,13 +2157,14 @@ async fn test_a_host_seen_capped_is_split_at_once() {
 }
 
 #[tokio::test]
-async fn test_a_busy_probe_goes_by_the_ranges_its_host_was_seen_to_take() {
+async fn test_a_busy_probe_takes_ranges_from_its_own_head_and_its_host_only_takes_them_away() {
     let _history = setup().await;
     let size = 2 * PREFETCH;
     let data = payload(size, 271);
     let done_len = size - 200 * KB;
     // Every try of the ranged probe finds the server busy, and HEAD leaves out Accept-Ranges:
-    // only what an earlier download saw says the server takes ranges.
+    // only what an earlier download of another file saw says the server takes ranges, which does
+    // not make this link take them. The partial file is kept for a later try.
     let mut mock = Mock::new(data.clone());
     mock.etag = Some("\"r1\"");
     mock.head_hides_ranges = true;
@@ -2183,9 +2184,11 @@ async fn test_a_busy_probe_goes_by_the_ranges_its_host_was_seen_to_take() {
     state.completed_ranges.push(ByteRange::new(0, done_len as u64 - 1).unwrap());
     state.save_atomic(&DownloadState::state_file_path(&part)).unwrap();
 
-    run(&DownloadEngine::new(vec![url], options(&out, 4, 64 * KB)), None).await.expect("the download resumes");
-    assert_file(&out, &data);
-    assert_eq!(mock.stats.body_bytes.load(Ordering::SeqCst), (size - done_len) as u64, "only the missing bytes");
+    let err = run(&DownloadEngine::new(vec![url], options(&out, 4, 64 * KB)), None).await.unwrap_err().to_string();
+    assert!(err.contains("cannot resume; it was kept"), "{err}");
+    assert_eq!(std::fs::read(&part).unwrap(), on_disk, "the partial file is kept as it was");
+    assert!(!out.exists());
+    assert_eq!(mock.stats.body_bytes.load(Ordering::SeqCst), 0, "nothing asked for as a range");
 
     // Nor is a server seen ignoring ranges taken at HEAD's word that it takes them.
     let mut liar = Mock::new(data.clone());

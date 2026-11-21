@@ -2539,7 +2539,7 @@ impl DownloadEngine {
     /// mismatch is an error; the file is left in place for the user to inspect.
     async fn finish_external(&self, path: PathBuf, started_at: u64, digest: Option<FileDigest>) -> Result<PathBuf, String> {
         let written = digest.map_or(Written::File, Written::Flushed);
-        let blake3_hex = self.verify_written(&path, written).await.map_err(|e| e.to_string())?;
+        let blake3_hex = self.verify_written(&path, written, &CancellationToken::new()).await.map_err(|e| e.to_string())?;
         if self.options.expected_checksum.is_some() {
             tracing::info!("Checksum verification passed for {}", path.display());
         }
@@ -2567,7 +2567,7 @@ impl DownloadEngine {
         }
         if self.options.expected_checksum.is_some() {
             let written = digest.clone().map_or(Written::File, Written::Flushed);
-            self.verify_written(&path, written).await.map_err(|e| e.to_string())?;
+            self.verify_written(&path, written, &CancellationToken::new()).await.map_err(|e| e.to_string())?;
             tracing::info!("Checksum verification passed for {}", path.display());
         }
         let Some(mp4) = self.remux_to_mp4(&path, &extras).await else {
@@ -2577,7 +2577,7 @@ impl DownloadEngine {
         let mut engine = self.clone();
         engine.options.expected_checksum = None;
         engine.options.fsync_on_complete = false;
-        let blake3_hex = engine.verify_written(&mp4, Written::File).await.map_err(|e| e.to_string())?;
+        let blake3_hex = engine.verify_written(&mp4, Written::File, &CancellationToken::new()).await.map_err(|e| e.to_string())?;
         self.record_completed(mp4.clone(), None, blake3_hex, started_at, Some(path), None).await;
         Ok(mp4)
     }
@@ -3759,7 +3759,7 @@ impl DownloadEngine {
             let site = self.site.lock();
             !site.primary_only && !site.copies.is_empty()
         };
-        let verified = self.verify_written(&part, written).await;
+        let verified = self.verify_written(&part, written, &self.cancel_token).await;
         let quiet = || {
             if !refetch {
                 emit(snapshot_tx, || checking(true));
@@ -3819,8 +3819,10 @@ impl DownloadEngine {
     /// fsync_on_complete the file is flushed to disk at the same time (unless its writer already
     /// did, see [`Written::Flushed`]), and both must succeed. A
     /// mismatch found without reading the whole file is confirmed by reading it before it counts:
-    /// only the file itself can condemn it.
-    async fn verify_written(&self, path: &Path, written: Written) -> Result<String, VerifyError> {
+    /// only the file itself can condemn it. `stop` ends it: the download's own token for its
+    /// `.part`, never for a file another engine finished, which a stop may have finished (a live
+    /// recording).
+    async fn verify_written(&self, path: &Path, written: Written, stop: &CancellationToken) -> Result<String, VerifyError> {
         let expected = self.options.expected_checksum.clone();
         let writer = match &written {
             Written::Writer(writer) => Some(writer.clone()),
@@ -3836,7 +3838,7 @@ impl DownloadEngine {
         });
         // Every read of the check ends once the download is stopped (the writer's too, see
         // `DiskWriter::stopping_on`); a flush under way is no longer waited for.
-        let stop = self.cancel_token.clone();
+        let stop = stop.clone();
         let reread = (!matches!(written, Written::File)).then(|| {
             let (path, expected, stop) = (path.to_path_buf(), expected.clone(), stop.clone());
             move || {
@@ -3870,13 +3872,13 @@ impl DownloadEngine {
         let hashed = hashed?;
         // A MEGA file is held to the MAC its key carries, as MEGA's own clients hold it.
         if let Some(cipher) = self.decrypt.clone() {
-            let (path, stop) = (path.to_path_buf(), stop.clone());
+            let (path, stopped) = (path.to_path_buf(), stop.clone());
             let checked = blocking(move || {
-                cipher.mac_matches(&path, &|| stop.is_cancelled()).map_err(|e| format!("Failed to read {}: {}", path.display(), e))
+                cipher.mac_matches(&path, &|| stopped.is_cancelled()).map_err(|e| format!("Failed to read {}: {}", path.display(), e))
             });
             let checked = tokio::select! {
                 biased;
-                _ = self.cancel_token.cancelled() => return Err(cancelled()),
+                _ = stop.cancelled() => return Err(cancelled()),
                 checked = checked => checked,
             };
             if !checked.and_then(|matched| matched).map_err(VerifyError::Io)? {
@@ -5285,13 +5287,15 @@ async fn probe_with(
         (Ok(resp), _) if usable => resp,
         // Go by HEAD. A refused range request means a single stream. An unanswered one is no
         // reason to demote the download to one stream that cannot resume, so range support is as
-        // this link's HEAD says (Accept-Ranges), not as another file of its host had it, and the
-        // download retries the busy server as Retry-After and max_retries allow. A HEAD
-        // Content-Length of 0 is common for dynamic content: it is no size.
+        // this link's HEAD says (Accept-Ranges), never granted by another file of its host, only
+        // taken away when its host was seen to ignore ranges; and the download retries the busy
+        // server as Retry-After and max_retries allow. A HEAD Content-Length of 0 is common for
+        // dynamic content: it is no size.
         (_, Some(head)) => {
             let mut info = ProbeInfo::describe(url, &[head]);
             info.size = head_len.filter(|&n| n > 0);
-            info.accepts_ranges = unanswered && info.size.is_some() && accepts_bytes(head.headers());
+            let ignored = hosts::profile(head.url()).accepts_ranges == Some(false);
+            info.accepts_ranges = unanswered && info.size.is_some() && accepts_bytes(head.headers()) && !ignored;
             return Ok((info, None));
         }
         (Ok(resp), None) if unanswered => {
@@ -9213,7 +9217,7 @@ mod tests {
         assert_eq!(flushed.unwrap(), path, "a file its engine flushed is not flushed again");
         let err = engine.finish_external(path.clone(), unix_now(), None).await.unwrap_err();
         assert!(err.contains("flush"), "any other is: {err}");
-        assert!(engine.verify_written(&path, Written::Digest(digest())).await.is_err(), "so is one with a digest alone");
+        assert!(engine.verify_written(&path, Written::Digest(digest()), &engine.cancel_token).await.is_err(), "so is one with a digest alone");
 
         #[allow(clippy::permissions_set_readonly_false)]
         permissions.set_readonly(false);
