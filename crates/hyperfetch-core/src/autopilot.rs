@@ -30,7 +30,7 @@ const LINE_FULL: f64 = 0.9;
 pub(crate) const SHOWN: u64 = 512 * 1024;
 /// The first stream's speed, and one more connection's beside it, is read over windows each as
 /// long as a new connection takes to answer (a few round trips), `SHOW_WINDOW` at least, or
-/// `QUICK_WINDOW` (the engine's shortest look at a rate) once one holds `SHOW_BYTES`: fewer bytes
+/// `QUICK_WINDOW` (the engine's quickest look) once one holds `SHOW_BYTES`: fewer bytes
 /// over less time are a few packets and a timer's tick, not a speed. The stream's is what it kept
 /// over two windows in a row: one may hold a burst (what waited in buffers while the answer came,
 /// or a server's idle credit). It is read once it stopped climbing, the fastest passed by none of
@@ -43,7 +43,7 @@ pub(crate) const SHOWN: u64 = 512 * 1024;
 /// is longer than `LONGEST_WINDOW`, however long the answer takes: a host far away has its speed
 /// read in as many windows as a near one, not in seconds of one stream.
 const SHOW_WINDOW: Duration = Duration::from_millis(100);
-const QUICK_WINDOW: Duration = Duration::from_millis(20);
+const QUICK_WINDOW: Duration = Duration::from_millis(10);
 const LONGEST_WINDOW: Duration = Duration::from_millis(300);
 const SHOW_BYTES: u64 = 1024 * 1024;
 const CALM: u32 = 2;
@@ -856,10 +856,12 @@ mod tests {
         assert_eq!(opened(&mut pilot, t0, 1000, 1 << 30, None, |ms| ms * 10_000), Some((300, 2)), "a long way to go");
         assert!(pilot.is_judging() && !pilot.is_alone() && target(&pilot) == Some(8), "{}", pilot.why());
         assert_eq!(pilot.why(), "2 connections: the first went at 9.5 MiB/s; a second shows whether more pay");
-        // Over a LAN, a MiB and more in each 20 ms: windows of 20 ms.
+        // Over a LAN, a MiB and more in each 10 ms, answers in 1 ms: windows of 10 ms, one after
+        // the best enough. At 2.5 GB/s, 128 MiB take 54 ms: more open while there is some left.
         let mut fast = alone(Start::default());
-        let found = (1..=20).map(|n| n * 20).find_map(|ms| fast.open(at(ms), ms * 300_000, 1 << 34, Some(startup), None, None).map(|width| (ms, width)));
-        assert_eq!(found, Some((60, 2)));
+        let lan_setup = Some(Duration::from_millis(1));
+        let found = (1..=20).map(|n| n * 10).find_map(|ms| fast.open(at(ms), ms * 2_500_000, 1 << 34, lan_setup, None, None).map(|width| (ms, width)));
+        assert_eq!(found, Some((30, 2)));
         // A set-up measured as next to nothing is the host's, so 64 MiB at 300 MB/s pay for more;
         // one not known is taken for 0.5 s, in which the stream brings more than is left.
         let lan = |setup: Option<Duration>| {

@@ -83,9 +83,11 @@ const PREFETCH_TIME: Duration = Duration::from_millis(250);
 /// Shortest interval over which the probe measures its rate: shorter ones see bursts, not a rate.
 const MIN_RATE_TICK: Duration = Duration::from_millis(20);
 /// How long a first stream alone, the one more beside it, or a widening is looked at every
-/// `MIN_RATE_TICK` at most, from the start or the widening's: one that shows no speed by then is
-/// looked at as often as any download.
+/// `QUICK_TICK` at most, from the start or the widening's: one that shows no speed by then is
+/// looked at as often as any download. Over a LAN a stream brings 128 MiB in some 50 ms, and its
+/// speed is read over three looks.
 const QUICK_TICKS_FOR: Duration = Duration::from_secs(3);
+const QUICK_TICK: Duration = Duration::from_millis(10);
 /// Missing bytes that justify one more connection when the probe measured no rate: for less, its
 /// handshakes cost more than it saves. Also the most one connection is asked to carry before
 /// another one pays off.
@@ -3441,7 +3443,7 @@ impl DownloadEngine {
                     // a step of the widening left waiting once its answers are in.
                     let quick = pilot.as_ref().is_some_and(|pilot| pilot.is_alone() || pilot.is_judging()) || job.ramp.is_widening();
                     if quick && Instant::now() < quick_until {
-                        tick.reset_after(MIN_RATE_TICK);
+                        tick.reset_after(QUICK_TICK);
                     }
                 }
             }
