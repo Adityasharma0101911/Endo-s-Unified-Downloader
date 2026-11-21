@@ -3137,9 +3137,9 @@ impl DownloadEngine {
         let writer = {
             let part = part.to_path_buf();
             let (on_disk, checksum) = (state.completed_ranges.clone(), hashed.clone());
-            let decrypt = self.decrypt.clone();
+            let (decrypt, stop) = (self.decrypt.clone(), self.cancel_token.clone());
             blocking(move || {
-                let writer = DiskWriter::open_or_create(&part, size)?.decrypting(decrypt);
+                let writer = DiskWriter::open_or_create(&part, size)?.decrypting(decrypt).stopping_on(stop);
                 writer.track_digest(&on_disk, checksum.as_deref());
                 for gap in unwritten {
                     writer.write_chunk_slice(gap.start, &prefetch[gap.start as usize..=gap.end as usize])?;
@@ -3817,8 +3817,11 @@ impl DownloadEngine {
                 None => OpenOptions::new().write(true).open(&path).and_then(|f| f.sync_data()).map_err(|e| e.to_string()),
             }
         });
+        // Every read of the check ends once the download is stopped (the writer's too, see
+        // `DiskWriter::stopping_on`); a flush under way is no longer waited for.
+        let stop = self.cancel_token.clone();
         let reread = (!matches!(written, Written::File)).then(|| {
-            let (path, expected) = (path.to_path_buf(), expected.clone());
+            let (path, expected, stop) = (path.to_path_buf(), expected.clone(), stop.clone());
             move || {
                 tracing::warn!(
                     "The digest of {} taken while writing it does not match; reading it back to be sure",
@@ -3826,26 +3829,40 @@ impl DownloadEngine {
                 );
                 match writer {
                     Some(writer) => checked(&path, writer.full_digest(expected.as_deref()), expected.as_deref()),
-                    None => crate::storage::hash_and_verify_file(&path, expected.as_deref()),
+                    None => crate::storage::hash_and_verify_file_until(&path, expected.as_deref(), &|| stop.is_cancelled()),
                 }
             }
         });
         let hash = {
-            let path = path.to_path_buf();
+            let (path, stop) = (path.to_path_buf(), stop.clone());
             move || match written {
-                Written::File => crate::storage::hash_and_verify_file(&path, expected.as_deref()),
+                Written::File => crate::storage::hash_and_verify_file_until(&path, expected.as_deref(), &|| stop.is_cancelled()),
                 Written::Writer(writer) => checked(&path, writer.digest(expected.as_deref()), expected.as_deref()),
                 Written::Digest(digest) | Written::Flushed(digest) => verify_digest(&digest, expected.as_deref()),
             }
         };
-        let hashed = hash_and_flush(hash, flush, reread).await?;
+        let cancelled = || VerifyError::Io(CANCELLED.to_string());
+        let hashed = tokio::select! {
+            biased;
+            _ = stop.cancelled() => return Err(cancelled()),
+            hashed = hash_and_flush(hash, flush, reread) => hashed,
+        };
+        if stop.is_cancelled() {
+            return Err(cancelled());
+        }
+        let hashed = hashed?;
         // A MEGA file is held to the MAC its key carries, as MEGA's own clients hold it.
         if let Some(cipher) = self.decrypt.clone() {
-            let path = path.to_path_buf();
+            let (path, stop) = (path.to_path_buf(), stop.clone());
             let checked = blocking(move || {
-                cipher.mac_matches(&path).map_err(|e| format!("Failed to read {}: {}", path.display(), e))
+                cipher.mac_matches(&path, &|| stop.is_cancelled()).map_err(|e| format!("Failed to read {}: {}", path.display(), e))
             });
-            if !checked.await.and_then(|matched| matched).map_err(VerifyError::Io)? {
+            let checked = tokio::select! {
+                biased;
+                _ = self.cancel_token.cancelled() => return Err(cancelled()),
+                checked = checked => checked,
+            };
+            if !checked.and_then(|matched| matched).map_err(VerifyError::Io)? {
                 return Err(VerifyError::Mismatch(
                     "The file MEGA sent does not match its MAC: it arrived damaged; download it again".to_string(),
                 ));

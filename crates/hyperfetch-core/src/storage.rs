@@ -11,7 +11,16 @@ use sha2::digest::DynDigest;
 use sha2::{Digest as Sha2Digest, Sha256, Sha512};
 use sha1::Sha1;
 use md5::Md5;
+use tokio_util::sync::CancellationToken;
 use crate::range::ByteRange;
+
+/// Whether a read for a digest is to end, with an `Interrupted` error (see [`stopped`]).
+type Stop<'a> = &'a (dyn Fn() -> bool + Sync);
+
+/// The error a read for a digest ends with when stopped.
+fn stopped() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::Interrupted, crate::engine::CANCELLED)
+}
 
 #[derive(Error, Debug)]
 pub enum StorageError {
@@ -57,6 +66,8 @@ pub struct DiskWriter {
     inner: Arc<Inner>,
     /// A MEGA file's key, which what is written is decrypted with first (see `decrypting`).
     decrypt: Option<Arc<crate::mega::Cipher>>,
+    /// Once cancelled, reads for a digest end (see `stopping_on`).
+    stop: Option<CancellationToken>,
 }
 
 /// Shared by a writer's clones. Once the last one is gone nothing writes any more, so the prefix
@@ -117,6 +128,7 @@ impl DiskWriter {
                 syncs: AtomicUsize::new(0),
             }),
             decrypt: None,
+            stop: None,
         })
     }
 
@@ -124,6 +136,16 @@ impl DiskWriter {
     /// at its offset before writing and hashing it, so the file and its digests hold plaintext.
     pub fn decrypting(self, cipher: Option<Arc<crate::mega::Cipher>>) -> Self {
         Self { decrypt: cipher, ..self }
+    }
+
+    /// This writer's reads for a digest ([`DiskWriter::digest`], `followed`, `full_digest`,
+    /// `piece_hashes`) ending with an `Interrupted` error, the file as it is, once `cancel` is.
+    pub fn stopping_on(self, cancel: CancellationToken) -> Self {
+        Self { stop: Some(cancel), ..self }
+    }
+
+    fn stopped(&self) -> bool {
+        self.stop.as_ref().is_some_and(CancellationToken::is_cancelled)
     }
 
     pub fn size(&self) -> u64 {
@@ -235,7 +257,7 @@ impl DiskWriter {
             let tail = prefix.len..self.size;
             let unhashed = hashes.unhashed(&hashes.state.lock(), tail.clone());
             let mut at = tail.start;
-            read_ahead(file, tail, FILE_HASH_BLOCK.max(hashes.block as usize), |data| {
+            read_ahead(file, tail, FILE_HASH_BLOCK.max(hashes.block as usize), &|| self.stopped(), |data| {
                 #[cfg(test)]
                 hashes.read.fetch_add(data.len(), Ordering::Relaxed);
                 std::thread::scope(|s| {
@@ -247,7 +269,7 @@ impl DiskWriter {
                 at += data.len() as u64;
             })?;
         }
-        Ok(FileDigest::new(hashes.root(file)?, prefix))
+        Ok(FileDigest::new(hashes.root(file, &|| self.stopped())?, prefix))
     }
 
     /// The file's digest from reading all of it back through this writer's handle, ignoring
@@ -263,7 +285,7 @@ impl DiskWriter {
     pub(crate) fn piece_hashes(&self, piece: u64) -> std::io::Result<Vec<ChainingValue>> {
         let hashes = &self.inner.hashes;
         let per = usize::try_from(piece / hashes.block).unwrap_or(usize::MAX).max(1);
-        let blocks = hashes.block_hashes(&self.inner.file)?;
+        let blocks = hashes.block_hashes(&self.inner.file, &|| self.stopped())?;
         Ok(blocks
             .chunks(per)
             .map(|piece| {
@@ -274,7 +296,7 @@ impl DiskWriter {
     }
 
     fn read_digest(&self, extra: Option<Algo>) -> std::io::Result<FileDigest> {
-        FileDigest::of_file(&self.inner.file, self.size, FILE_HASH_BLOCK, extra)
+        FileDigest::of_file(&self.inner.file, self.size, FILE_HASH_BLOCK, extra, &|| self.stopped())
     }
 
     /// Computes BLAKE3 hash for a specific range.
@@ -319,7 +341,7 @@ impl DiskWriter {
     /// Verifies an existing file against an expected checksum. Opens the file read-only and never modifies it.
     pub fn verify_file_checksum(path: &Path, expected: &str) -> Result<bool, String> {
         let checksum = Checksum::parse(expected)?;
-        let digests = FileDigest::of(path, checksum.algo.extra())
+        let digests = FileDigest::of(path, checksum.algo.extra(), &|| false)
             .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
         Ok(checksum.matches(&digests))
     }
@@ -568,13 +590,14 @@ impl Hashes {
     }
 
     /// The file's BLAKE3 hash: the blocks' hashes merged (see [`Hashes::block_hashes`]).
-    fn root(&self, file: &File) -> std::io::Result<[u8; 32]> {
-        Ok(merge(self.block_hashes(file)?))
+    fn root(&self, file: &File, stop: Stop) -> std::io::Result<[u8; 32]> {
+        Ok(merge(self.block_hashes(file, stop)?))
     }
 
     /// Every block's hash, once the blocks never hashed have been read back from `file` and
-    /// hashed, spread over every core; kept, unless the block was written again meanwhile.
-    fn block_hashes(&self, file: &File) -> std::io::Result<Vec<ChainingValue>> {
+    /// hashed, spread over every core; kept, unless the block was written again meanwhile. Ends
+    /// with an `Interrupted` error once `stop` says so.
+    fn block_hashes(&self, file: &File, stop: Stop) -> std::io::Result<Vec<ChainingValue>> {
         let (mut hashes, missing): (Vec<Option<ChainingValue>>, Vec<(usize, u32)>) = {
             let state = self.state.lock();
             let missing = state.blocks.iter().enumerate().filter(|(_, b)| b.hash.is_none()).map(|(i, b)| (i, b.version));
@@ -588,6 +611,9 @@ impl Hashes {
                     s.spawn(|| {
                         let (mut found, mut buf) = (Vec::new(), Vec::new());
                         while let Some(&(i, version)) = missing.get(next.fetch_add(1, Ordering::Relaxed)) {
+                            if stop() {
+                                return Err(stopped());
+                            }
                             let span = self.span(i);
                             buf.resize((span.end - span.start) as usize, 0);
                             read_exact_at(file, &mut buf, span.start)?;
@@ -787,8 +813,13 @@ pub(crate) fn hashes_prefix(expected_checksum: Option<&str>) -> bool {
 /// needs, all at once (see [`FileDigest::of`]). Opens the file read-only; call it from a blocking
 /// context.
 pub fn hash_and_verify_file(path: &Path, expected_checksum: Option<&str>) -> Result<String, VerifyError> {
+    hash_and_verify_file_until(path, expected_checksum, &|| false)
+}
+
+/// [`hash_and_verify_file`], its read ending once `stop` says so.
+pub(crate) fn hash_and_verify_file_until(path: &Path, expected_checksum: Option<&str>, stop: Stop) -> Result<String, VerifyError> {
     let extra = needs(expected_checksum).map_err(VerifyError::Io)?;
-    let digest = FileDigest::of(path, extra)
+    let digest = FileDigest::of(path, extra, stop)
         .map_err(|e| VerifyError::Io(format!("Failed to read {}: {}", path.display(), e)))?;
     verify_digest(&digest, expected_checksum)
 }
@@ -948,23 +979,23 @@ impl FileDigest {
     }
 
     /// Hashes the file at `path` without writing to it (see [`FileDigest::of_file`]). Blocking.
-    fn of(path: &Path, extra: Option<Algo>) -> std::io::Result<Self> {
+    fn of(path: &Path, extra: Option<Algo>, stop: Stop) -> std::io::Result<Self> {
         #[cfg(test)]
         READ_BACK.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(path.to_path_buf());
         let file = File::open(path)?;
         let len = file.metadata()?.len();
-        Self::of_file(&file, len, FILE_HASH_BLOCK, extra)
+        Self::of_file(&file, len, FILE_HASH_BLOCK, extra, stop)
     }
 
     /// Hashes the first `len` bytes of `file` in one sequential pass of `block`-sized reads, the
     /// next block read on another thread while this one is hashed: BLAKE3 on every core and the
     /// `extra` digest (see [`Algo::extra`]) on one more thread, so the pass takes about as long as
     /// the slowest of reading, BLAKE3 and that digest. A read error, or a file shorter than `len`,
-    /// is an `Err`.
-    fn of_file(file: &File, len: u64, block: usize, extra: Option<Algo>) -> std::io::Result<Self> {
+    /// is an `Err`, as is `stop` saying so.
+    fn of_file(file: &File, len: u64, block: usize, extra: Option<Algo>, stop: Stop) -> std::io::Result<Self> {
         let mut blake = blake3::Hasher::new();
         let mut rest = PrefixHash::new(extra);
-        read_ahead(file, 0..len, block, |data| {
+        read_ahead(file, 0..len, block, stop, |data| {
             std::thread::scope(|s| {
                 if extra.is_some() {
                     s.spawn(|| rest.update(data));
@@ -1008,7 +1039,7 @@ impl StreamHasher {
     /// has. Blocking.
     pub fn update_from_file(&mut self, file: &File, end: u64) -> std::io::Result<()> {
         let Self { blake3, rest } = self;
-        read_ahead(file, rest.len..end, FILE_HASH_BLOCK, |data| {
+        read_ahead(file, rest.len..end, FILE_HASH_BLOCK, &|| false, |data| {
             blake3.update_rayon(data);
             rest.update(data);
         })
@@ -1021,8 +1052,8 @@ impl StreamHasher {
 
 /// Streams `range` of `file` through `f` in `block`-sized pieces, in order, reading the next
 /// piece on another thread while `f` runs. Two buffers take turns, so at most two blocks are in
-/// memory.
-fn read_ahead(file: &File, range: Range<u64>, block: usize, mut f: impl FnMut(&[u8])) -> std::io::Result<()> {
+/// memory. Ends with an `Interrupted` error once `stop` says so.
+fn read_ahead(file: &File, range: Range<u64>, block: usize, stop: Stop, mut f: impl FnMut(&[u8])) -> std::io::Result<()> {
     // No slot: the reader hands over a block only when `f` is ready for it.
     let (full_tx, full_rx) = std::sync::mpsc::sync_channel::<std::io::Result<Vec<u8>>>(0);
     let (empty_tx, empty_rx) = std::sync::mpsc::channel::<Vec<u8>>();
@@ -1045,6 +1076,9 @@ fn read_ahead(file: &File, range: Range<u64>, block: usize, mut f: impl FnMut(&[
         // Returning early drops `full_rx`, which stops the reader; the scope then joins it.
         for data in full_rx {
             let data = data?;
+            if stop() {
+                return Err(stopped());
+            }
             f(&data);
             let _ = empty_tx.send(data);
         }
@@ -1385,7 +1419,7 @@ mod tests {
         assert_eq!(hash_and_verify_file(temp.path(), Some(&format!("sha512:{sha512}"))).unwrap(), blake);
         assert_eq!(hash_and_verify_file(temp.path(), Some(&format!("sha1:{sha1}"))).unwrap(), blake);
         for (algo, expected) in [(Algo::Sha256, &sha), (Algo::Md5, &md5), (Algo::Sha512, &sha512), (Algo::Sha1, &sha1)] {
-            let d = FileDigest::of_file(&file, data.len() as u64, 1024 * 1024 + 17, Some(algo)).unwrap();
+            let d = FileDigest::of_file(&file, data.len() as u64, 1024 * 1024 + 17, Some(algo), &|| false).unwrap();
             assert_eq!((&d.blake3_hex, d.extra(algo)), (&blake, Some(expected.as_str())), "{algo:?}");
         }
     }
@@ -1398,7 +1432,7 @@ mod tests {
         std::fs::write(temp.path(), vec![5u8; 3 * 4096 + 1]).unwrap();
         let file = File::open(temp.path()).unwrap();
         for block in [4096, FILE_HASH_BLOCK] {
-            let err = FileDigest::of_file(&file, 8 * 4096, block, Some(Algo::Sha256)).expect_err("truncated file hashed");
+            let err = FileDigest::of_file(&file, 8 * 4096, block, Some(Algo::Sha256), &|| false).expect_err("truncated file hashed");
             assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
         }
     }
@@ -1653,6 +1687,28 @@ mod tests {
         assert_eq!(writer.inner.hashes.read.load(Ordering::Relaxed), 0);
         // Its digest reads the file instead.
         assert_eq!(writer.digest(None).unwrap().blake3, *blake3::hash(&data).as_bytes());
+    }
+
+    #[test]
+    fn test_a_stopped_writer_reads_nothing_more() {
+        // A download stopped while its file is checked: no read of the check goes on.
+        let data = pattern(600 * 1024);
+        let temp = NamedTempFile::new().unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let writer = DiskWriter::open_or_create(temp.path(), data.len() as u64).unwrap().stopping_on(cancel.clone());
+        writer.write_chunk_slice(0, &data).unwrap();
+        let sha256 = format!("sha256:{}", hex::encode(&Sha256::digest(&data)));
+        writer.track_digest(&[], Some(&sha256));
+        cancel.cancel();
+        let stopped = [writer.digest(None).err(), writer.followed(&sha256).err(), writer.full_digest(Some(&sha256)).err()];
+        let stopped = stopped.into_iter().chain([writer.piece_hashes(256 * 1024).err()]);
+        assert!(stopped.into_iter().all(|e| e.is_some_and(|e| e.kind() == std::io::ErrorKind::Interrupted)));
+        assert_eq!(writer.inner.hashes.read.load(Ordering::Relaxed), 0, "nothing read back");
+        let file = hash_and_verify_file_until(temp.path(), Some(&sha256), &|| true);
+        assert!(matches!(file, Err(VerifyError::Io(e)) if e.contains(crate::engine::CANCELLED)), "a file without a writer too");
+        // Not stopped, it reads as before.
+        let going = DiskWriter::open_or_create(temp.path(), data.len() as u64).unwrap().stopping_on(Default::default());
+        assert_eq!(going.digest(None).unwrap().blake3, *blake3::hash(&data).as_bytes());
     }
 
     #[test]

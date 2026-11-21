@@ -649,10 +649,7 @@ async fn run_job(
                 deadline = (!recording).then(|| tokio::time::Instant::now() + STOP_TIMEOUT);
             }
             _ = sleep_until(deadline) => {
-                break Err(format!(
-                    "did not stop within {}s; progress since the last state save will be downloaded again",
-                    STOP_TIMEOUT.as_secs()
-                ));
+                break Err(format!("did not stop within {}s; {}", STOP_TIMEOUT.as_secs(), not_stopped(last.as_ref())));
             }
         }
     };
@@ -711,6 +708,15 @@ async fn run_job(
 /// second Ctrl+C still quits at once). Any other download without a size stops as all others do.
 fn is_recording(last: Option<&EngineSnapshot>) -> bool {
     last.is_some_and(EngineSnapshot::is_recording)
+}
+
+/// What a download that did not stop in time leaves, by `last`, its last snapshot: all of a file
+/// that was being checked is kept with its state, for the next run to check again.
+fn not_stopped(last: Option<&EngineSnapshot>) -> &'static str {
+    match last.is_some_and(|last| last.checking) {
+        true => "its file was being checked and is kept under its partial name: the next run checks it again, without downloading it",
+        false => "progress since the last state save will be downloaded again",
+    }
 }
 
 async fn sleep_until(deadline: Option<tokio::time::Instant>) {
@@ -842,6 +848,16 @@ mod tests {
             None => timeout.trim_end_matches('s').parse().unwrap(),
         };
         assert!(seconds >= 10 * 60, "{timeout}");
+    }
+
+    /// A stop that takes too long while the file is checked does not say it is downloaded again.
+    #[test]
+    fn a_stop_during_the_check_says_the_file_is_kept() {
+        let checking = EngineSnapshot { checking: true, ..EngineSnapshot::default() };
+        assert!(not_stopped(Some(&checking)).contains("checks it again, without downloading it"));
+        for last in [None, Some(&EngineSnapshot::default())] {
+            assert!(not_stopped(last).contains("downloaded again"));
+        }
     }
 
     /// Serves `body` at every path over keep-alive HTTP/1.1 (HEAD, and GET with or without a

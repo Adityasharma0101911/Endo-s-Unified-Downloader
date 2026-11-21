@@ -372,23 +372,27 @@ impl Cipher {
     }
 
     /// Whether the file at `path`, decrypted, matches the MAC its key carries. One sequential
-    /// read; blocking. An empty file has nothing to check.
-    pub fn mac_matches(&self, path: &Path) -> std::io::Result<bool> {
+    /// read; blocking. An empty file has nothing to check. Ends with an `Interrupted` error once
+    /// `stop` says so.
+    pub fn mac_matches(&self, path: &Path, stop: &dyn Fn() -> bool) -> std::io::Result<bool> {
         let file = std::fs::File::open(path)?;
         let len = file.metadata()?.len();
-        Ok(len == 0 || self.mac_of(file, len)? == self.mac)
+        Ok(len == 0 || self.mac_of(file, len, stop)? == self.mac)
     }
 
     /// The MAC of the `len` bytes of plaintext `data`, as MEGA's clients take it: the CBC-MAC of
     /// each chunk (128 KiB, 256 KiB, ... up to 1 MiB, then 1 MiB each; zero-padded, from the nonce
     /// twice), chained in another CBC-MAC, its halves' words XORed.
-    fn mac_of(&self, mut data: impl Read, len: u64) -> std::io::Result<[u8; 8]> {
+    fn mac_of(&self, mut data: impl Read, len: u64, stop: &dyn Fn() -> bool) -> std::io::Result<[u8; 8]> {
         let mut start = Block::default();
         start[..8].copy_from_slice(&self.nonce);
         start[8..].copy_from_slice(&self.nonce);
         let (mut meta, mut buf) = (Block::default(), vec![0u8; 1 << 20]);
         let (mut done, mut size) = (0u64, 128u64 << 10);
         while done < len {
+            if stop() {
+                return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, crate::engine::CANCELLED));
+            }
             let chunk = &mut buf[..size.min(len - done) as usize];
             data.read_exact(chunk)?;
             let mut mac = start;
@@ -430,7 +434,7 @@ pub(crate) mod tests {
             let tail: Vec<u8> = NONCE.iter().chain(&mac).copied().collect();
             std::array::from_fn(|i| if i < 16 { AES_KEY[i] ^ tail[i] } else { tail[i - 16] })
         };
-        let mac = Cipher::new(&compose([0; 8])).mac_of(plain, plain.len() as u64).unwrap();
+        let mac = Cipher::new(&compose([0; 8])).mac_of(plain, plain.len() as u64, &|| false).unwrap();
         compose(mac)
     }
 
@@ -643,16 +647,19 @@ pub(crate) mod tests {
         let key = file_key(&plain);
         let path = dir.path().join("file");
         std::fs::write(&path, &plain).unwrap();
-        assert!(Cipher::new(&key).mac_matches(&path).unwrap());
+        assert!(Cipher::new(&key).mac_matches(&path, &|| false).unwrap());
+        // A download stopped while it is checked reads no more of it.
+        let stopped = Cipher::new(&key).mac_matches(&path, &|| true).unwrap_err();
+        assert_eq!(stopped.kind(), std::io::ErrorKind::Interrupted);
         let mut damaged = plain;
         damaged[3 * 1024 * 1024] ^= 1;
         std::fs::write(&path, &damaged).unwrap();
-        assert!(!Cipher::new(&key).mac_matches(&path).unwrap());
+        assert!(!Cipher::new(&key).mac_matches(&path, &|| false).unwrap());
         // A file of one short block, as one of exactly one.
         for len in [5, 16] {
             let plain = plaintext(len);
             std::fs::write(&path, &plain).unwrap();
-            assert!(Cipher::new(&file_key(&plain)).mac_matches(&path).unwrap());
+            assert!(Cipher::new(&file_key(&plain)).mac_matches(&path, &|| false).unwrap());
         }
     }
 
