@@ -2,7 +2,7 @@
   "web_seed_torrent": { "min_share_of": "web_seed_http", "min_share": 0.6 },
   "web_seed_and_peer": { "min_share_of": "web_seed_http", "min_share": 0.6 },
   "lan": { "min_mb_per_s": 1200, "max_ttfb_ms": 200 },
-  "lan_autopilot": { "min_mb_per_s": 180, "max_ttfb_ms": 200, "min_requests": 2 },
+  "lan_autopilot": { "min_mb_per_s": 485, "max_ttfb_ms": 200, "min_requests": 2 },
   "per_connection": { "min_mb_per_s": 8.5, "max_ttfb_ms": 200 },
   "per_client": { "min_mb_per_s": 10.5, "max_ttfb_ms": 200 },
   "high_latency": { "min_mb_per_s": 8.5, "max_ttfb_ms": 650 },
