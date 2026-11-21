@@ -8,6 +8,7 @@ use hyperfetch_core::digest::published_checksum;
 use hyperfetch_core::engine::{build_client, file_name_from, request_header, DownloadOptions};
 use hyperfetch_core::history::{redact_text, redact_url};
 use hyperfetch_core::ingest::Channel;
+use hyperfetch_core::media::MediaInfo;
 use hyperfetch_core::resolver::SmartResolver;
 use hyperfetch_core::{StreamFormat, StreamInfo};
 use hyperfetch_core::torrent::parse_torrent_bytes;
@@ -411,6 +412,21 @@ pub fn track_lines(info: &StreamInfo) -> Vec<String> {
 
 /// --list-tracks' --json item for a stream: its link without secrets, then `format`, `live`,
 /// `duration`, `tracks` and `parts` as the engine gives them.
+/// --list-tracks for a media site's video (see `media::info`): its title, then its qualities as
+/// `--media-preset` names them, each with the size of its download; and the --json item, with
+/// `title` and `qualities` as the engine gives them. Err for a link without qualities to choose.
+pub fn quality_listing(link: &str, info: &MediaInfo) -> Result<(Vec<String>, Item), String> {
+    let qualities = info.qualities.as_ref().ok_or("it has no qualities to choose from (a list, or a single file)")?;
+    let lines = std::iter::once(format!("  {}", info.title)).chain(qualities.lines()).collect();
+    let item = vec![
+        ("status", "ok".into()),
+        ("url", redact_url(link).into()),
+        ("title", info.title.clone().into()),
+        ("qualities", serde_json::to_value(qualities).unwrap_or_default()),
+    ];
+    Ok((lines, item))
+}
+
 pub fn tracks_item(link: &str, info: &StreamInfo) -> Item {
     let value = |value: serde_json::Result<serde_json::Value>| value.unwrap_or_default();
     vec![
@@ -473,6 +489,22 @@ pub fn choose_channels(channels: &[Channel]) -> String {
 mod tests {
     use super::*;
     use hyperfetch_core::{Part, Track, TrackKind};
+
+    /// --list-tracks on a media site's video: its title, then its qualities under the names
+    /// --media-preset takes, with their sizes; --json gives them as the engine does. A list has
+    /// none to choose.
+    #[test]
+    fn a_videos_qualities_are_listed_with_their_sizes() {
+        let found = include_str!("../../hyperfetch-core/tests/data/media-4k60.json");
+        let info = hyperfetch_core::media::media_info(&serde_json::from_str(found).unwrap());
+        let (lines, item) = quality_listing("https://www.youtube.com/watch?v=sample4k60", &info).unwrap();
+        assert_eq!(lines[..2], ["  A 4K film at 60 fps", "  2160p:av1         AV1 · 60 fps · 689.2 MiB"]);
+        assert!(lines.contains(&"  original          Opus 129 kbps · 9.7 MiB".to_string()), "{lines:#?}");
+        let json: serde_json::Map<String, serde_json::Value> = item.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+        assert_eq!((&json["title"], &json["qualities"]["heights"][0]["options"][0]["id"]), (&serde_json::json!("A 4K film at 60 fps"), &serde_json::json!("401")));
+        let list = MediaInfo { title: "A list".into(), ..Default::default() };
+        assert!(quality_listing("https://www.youtube.com/playlist?list=x", &list).unwrap_err().contains("no qualities"));
+    }
 
     /// --list-tracks shows what a stream is, a line per track and per part (ads marked); a channel
     /// list's error names its first channels and how to choose.

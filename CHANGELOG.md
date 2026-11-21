@@ -2,6 +2,10 @@
 
 What changed in each release, newest first. Each release's page on [GitHub](https://github.com/Adityasharma0101911/Endo-s-Unified-Downloader/releases) has its files and the full notes.
 
+## Unreleased
+
+- **A quality picker on every media card.** A video's card, in the link bar and in the browser extension, lists what the link really has, from the one answer it asks yt-dlp for (a playlist's videos are not each asked): a row a height (2160p, 1440p, 1080p…) with each of its codecs, the frame rate when over 30, HDR, and the size of the download with its audio (exact, "about" when the site only estimates it, left out when it gives none); audio alone as Original (the site's own, not converted), M4A or MP3; and the audio language where there are several. What you choose is downloaded as shown and kept for the site as a rule, which its next videos take: the nearest height below when one lacks it, the card saying which it took. Settings > Video and audio > Quality per site lists them, each with Forget. On the command line, `--list-tracks` prints a video's qualities with their sizes and `--media-preset` takes them (`1440p:av1@de`, `original`). A link that cannot be listed keeps the card as before.
+
 ## 2.2.3 (2026-11-21)
 
 - **Servers that drop a browser.** Some file servers close the connection on any request that says it is a browser, without an answer, and 2.2.0 could not download from them at all. The app now asks such a server once more under its own name (`EndosUnifiedDownloader/x.y.z`) and keeps to it for that server until it is closed: once per server, never while it rests after refusing a request, and back to the browser's if it then refuses the app's. Not when you set a User-Agent yourself or the browser extension sent the browser's.

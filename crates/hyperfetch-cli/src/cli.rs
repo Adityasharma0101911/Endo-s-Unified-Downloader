@@ -9,6 +9,7 @@ use clap::parser::ValueSource;
 use clap::{Arg, ArgAction, ArgMatches, CommandFactory, FromArgMatches, Parser, ValueEnum};
 use hyperfetch_core::engine::DownloadOptions;
 use hyperfetch_core::media::{BrowserCookieSource, MediaQualityPreset};
+use hyperfetch_core::quality::MediaPick;
 use hyperfetch_core::{check_name_pattern, check_pattern, parse_part_ids, AudioSpec, LiveStart, VideoSpec};
 
 #[derive(Parser, Debug)]
@@ -366,8 +367,10 @@ pub struct Args {
     #[arg(long = "virustotal-key", value_name = "KEY", env = "VIRUSTOTAL_API_KEY", hide_env_values = true)]
     pub virustotal_key: Option<String>,
 
-    /// Media quality: best, 1080p, 720p, mp3, m4a, or any other yt-dlp format selector
-    /// (e.g. "bestvideo[height<=480]+bestaudio"). Also sends non-file page URLs to yt-dlp.
+    /// Media quality: best, 1080p, 720p, mp3, m4a; a quality --list-tracks lists, as 1440p:av1,
+    /// 2160p:vp9:hdr or original (the site's audio, not converted), with @<language> after for
+    /// that audio (1080p@de); or any other yt-dlp format selector (e.g.
+    /// "bestvideo[height<=480]+bestaudio"). Also sends non-file page URLs to yt-dlp.
     #[arg(long = "media-preset", value_name = "PRESET", value_parser = parse_media_preset)]
     pub media_preset: Option<MediaQualityPreset>,
 
@@ -454,7 +457,8 @@ pub struct Args {
     #[arg(long = "tracks", value_name = "IDS", value_delimiter = ',', value_parser = parse_track_id)]
     pub tracks: Vec<String>,
 
-    /// Print the tracks and parts of each HLS or DASH link, or the channels of a channel list,
+    /// Print the tracks and parts of each HLS or DASH link, the qualities of a media site's video
+    /// with the size of each (as --media-preset takes them), or the channels of a channel list,
     /// and download nothing
     #[arg(long = "list-tracks", alias = "vod-list-parts", conflicts_with_all = ["input_file", "dry_run", "spider", "preview", "stdout", "history", "update", "verify"])]
     pub list_tracks: bool,
@@ -1011,7 +1015,8 @@ pub fn parse_media_preset(s: &str) -> Result<MediaQualityPreset, String> {
         "720p" | "720" | "hd" => MediaQualityPreset::Hd720p,
         "mp3" => MediaQualityPreset::AudioMp3,
         "m4a" | "aac" => MediaQualityPreset::AudioM4a,
-        _ => MediaQualityPreset::Custom(s.to_string()),
+        // A quality as --list-tracks names it, else a format selector of yt-dlp's own.
+        _ => MediaPick::parse(s).map_or_else(|_| MediaQualityPreset::Custom(s.to_string()), MediaQualityPreset::Pick),
     })
 }
 
@@ -1466,6 +1471,14 @@ mod tests {
             Ok(MediaQualityPreset::Custom("bestaudio[ext=m4a]".to_string()))
         );
         assert!(parse_media_preset(" ").is_err());
+        // The qualities --list-tracks names; what is none of them goes to yt-dlp as it is.
+        for named in ["1440p", "2160p:vp9:hdr", "1080p:av1@de", "original", "mp3@en"] {
+            assert_eq!(parse_media_preset(named), Ok(MediaQualityPreset::Pick(MediaPick::parse(named).unwrap())), "{named}");
+        }
+        assert_eq!(parse_media_preset("720p"), Ok(MediaQualityPreset::Hd720p));
+        for custom in ["18", "b", "bv*+ba", "1080p:xvid"] {
+            assert_eq!(parse_media_preset(custom), Ok(MediaQualityPreset::Custom(custom.to_string())), "{custom}");
+        }
     }
 
     #[test]

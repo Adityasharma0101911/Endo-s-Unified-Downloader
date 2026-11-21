@@ -517,7 +517,8 @@ async fn wait_until(time: &str, ui: &Ui) -> Result<(), String> {
 }
 
 /// --list-tracks: the tracks and parts of each HLS or DASH link (see `list_tracks`), read as its
-/// download would read them, or the channels of a channel list. Nothing is downloaded.
+/// download would read them, the qualities of a media site's video (see `probe::quality_listing`),
+/// or the channels of a channel list. Nothing is downloaded.
 async fn list_tracks(args: &Args, ui: &Ui, http: &reqwest::Client) -> i32 {
     let mut failed = 0;
     for link in &args.urls {
@@ -529,6 +530,11 @@ async fn list_tracks(args: &Args, ui: &Ui, http: &reqwest::Client) -> i32 {
             }
             let url = Url::parse(link).map_err(|e| format!("not a link: {}", e))?;
             let options = job(args, 1, Path::new("."), Task { urls: vec![url.clone()], ..Default::default() }).options;
+            // A media site's video: its qualities, from one run of yt-dlp.
+            if is_supported_media_site(&url) {
+                let info = media::info(&url, options.cookies_path.as_deref(), options.proxy.as_deref()).await?;
+                return probe::quality_listing(link, &info);
+            }
             let info = hyperfetch_core::list_tracks(&url, &options).await?;
             Ok::<_, String>((probe::track_lines(&info), probe::tracks_item(link, &info)))
         }
