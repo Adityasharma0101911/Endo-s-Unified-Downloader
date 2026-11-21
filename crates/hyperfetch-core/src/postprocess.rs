@@ -314,19 +314,12 @@ fn extract(file: &Path, password: Option<&str>) -> Result<Option<PathBuf>, Strin
         }
         None => crate::media::system_tar(),
     };
-    let failed = |error: &str| {
-        let lower = error.to_ascii_lowercase();
-        match password {
-            _ if !["passphrase", "password", "encrypt"].iter().any(|w| lower.contains(w)) => {
-                // Should a tool ever echo the password.
-                format!("Could not unpack {name}: {}", password.map_or(error.to_string(), |p| error.replace(p, "••••")).trim())
-            }
-            None => format!("{name} is password-protected, so it was left packed"),
-            Some(_) if seven.is_none() && seven_or_rar => {
-                format!("{name} is password-protected and was left packed: opening it needs 7-Zip ({SEVEN_ZIP_FROM})")
-            }
-            Some(_) => format!("{name} was left packed: the password did not open it"),
-        }
+    let needs_seven = seven.is_none() && seven_or_rar;
+    let failed = |error: &str| failure_note(&name, error, password, needs_seven, false);
+    // The tool refused the archive: its directory, not its words, says whether a password is why.
+    let refused = |error: &str| {
+        let encrypted = lower.ends_with(".zip") && crate::zipdir::holds_encrypted(file);
+        failure_note(&name, error, password, needs_seven, encrypted)
     };
     // Never through a shell. On Windows 7-Zip reads it on its input when it asks, off its command
     // line, which other programs can read. shortcut: tar takes it only among its arguments, and so
@@ -345,7 +338,7 @@ fn extract(file: &Path, password: Option<&str>) -> Result<Option<PathBuf>, Strin
     };
     let listing = run_typing(&mut listing, typed).map_err(|e| failed(&e.to_string()))?;
     if !listing.status.success() {
-        return Err(failed(&String::from_utf8_lossy(&listing.stderr)));
+        return Err(refused(&String::from_utf8_lossy(&listing.stderr)));
     }
     let listed = String::from_utf8_lossy(&listing.stdout);
     let entries: Vec<String> = match seven {
@@ -385,7 +378,7 @@ fn extract(file: &Path, password: Option<&str>) -> Result<Option<PathBuf>, Strin
         // bsdtar takes the passphrase among the members too.
         None => crate::media::unpack(&tool, file, &folder, &pass),
     };
-    let unpacked = unpacked.map_err(|e| failed(&e.to_string()));
+    let unpacked = unpacked.map_err(|e| refused(&e.to_string()));
     let unpacked = unpacked.and_then(|()| match has_links(&folder) {
         true => Err(format!("{name} was left packed: it holds links, which could lead outside its folder")),
         false => Ok(Some(folder.clone())),
@@ -395,6 +388,24 @@ fn extract(file: &Path, password: Option<&str>) -> Result<Option<PathBuf>, Strin
         let _ = std::fs::remove_dir_all(&folder);
     }
     unpacked
+}
+
+/// The note an unpacking of archive `name` that failed with the tool's `error` leaves, opened with
+/// `password` if given: that it is password-protected, or the password did not open it, when the
+/// tool says so or the archive is known to be `encrypted` (its words differ from one version to
+/// the next); else the tool's error, without the password. `needs_seven`: an encrypted .7z or
+/// .rar, which tar cannot open.
+fn failure_note(name: &str, error: &str, password: Option<&str>, needs_seven: bool, encrypted: bool) -> String {
+    let lower = error.to_ascii_lowercase();
+    match password {
+        _ if !encrypted && !["passphrase", "password", "encrypt"].iter().any(|w| lower.contains(w)) => {
+            // Should a tool ever echo the password.
+            format!("Could not unpack {name}: {}", password.map_or(error.to_string(), |p| error.replace(p, "••••")).trim())
+        }
+        None => format!("{name} is password-protected, so it was left packed"),
+        Some(_) if needs_seven => format!("{name} is password-protected and was left packed: opening it needs 7-Zip ({SEVEN_ZIP_FROM})"),
+        Some(_) => format!("{name} was left packed: the password did not open it"),
+    }
 }
 
 /// Runs `command` to its end with `line` typed on its input (it reads it only if it asks), else
@@ -749,6 +760,7 @@ mod tests {
             let zip = dir.path().join("locked.zip");
             let options = ["--options", "zip:encryption=traditional", "--passphrase", "s3cret", "-C"];
             assert!(quiet_command(tar).args(["-a", "-cf"]).arg(&zip).args(options).arg(&src).arg("inner.txt").status().unwrap().success());
+            assert!(crate::zipdir::holds_encrypted(&zip) && !crate::zipdir::holds_encrypted(&src.join("inner.txt")));
             made.push(zip);
         }
         // Without a password a .7z goes to tar too, which on Linux only bsdtar reads.
@@ -776,6 +788,22 @@ mod tests {
             assert_eq!(std::fs::read(right.path.join("inner.txt")).unwrap(), b"hello", "{name}");
             std::fs::remove_dir_all(&right.path).unwrap();
         }
+    }
+
+    /// A wrong or missing password is told by what the archive is, not only by the tool's words:
+    /// macOS 15's tar says a ZIP's data failed to decompress. Another failure keeps the tool's
+    /// words, without the password.
+    #[test]
+    fn a_wrong_password_is_told_whatever_tar_says() {
+        let macos = "inner.txt: ZIP decompression failed (-3): Unknown error: -1\ntar: Error exit delayed from previous errors.";
+        let note = |password, encrypted| failure_note("locked.zip", macos, password, false, encrypted);
+        assert_eq!(note(Some("n0pe"), true), "locked.zip was left packed: the password did not open it");
+        assert_eq!(note(None, true), "locked.zip is password-protected, so it was left packed");
+        assert_eq!(note(None, false), format!("Could not unpack locked.zip: {}", macos.trim()));
+        let echoed = failure_note("a.zip", "disk full writing n0pe.txt", Some("n0pe"), false, false);
+        assert_eq!(echoed, "Could not unpack a.zip: disk full writing ••••.txt");
+        let older = failure_note("a.zip", "Incorrect passphrase", Some("n0pe"), false, false);
+        assert_eq!(older, "a.zip was left packed: the password did not open it");
     }
 
     #[test]

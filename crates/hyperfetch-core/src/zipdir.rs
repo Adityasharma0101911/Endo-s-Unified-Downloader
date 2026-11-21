@@ -355,6 +355,29 @@ fn end_of_directory(tail: &[u8]) -> Result<End, String> {
     Ok(End::Directory(Directory { offset: u64::from(offset), size: u64::from(size), entries: u64::from(entries) }))
 }
 
+/// Whether the ZIP file at `path` holds an encrypted file, as its central directory says; false
+/// for a file that is no ZIP or cannot be read.
+pub(crate) fn holds_encrypted(path: &std::path::Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let listed = || -> Result<bool, String> {
+        let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+        let size = file.metadata().map_err(|e| e.to_string())?.len();
+        let mut read = |start: u64, len: u64| -> Result<Vec<u8>, String> {
+            let mut bytes = vec![0; len as usize];
+            file.seek(SeekFrom::Start(start)).and_then(|_| file.read_exact(&mut bytes)).map_err(|e| e.to_string())?;
+            Ok(bytes)
+        };
+        let tail_start = size.saturating_sub(TAIL);
+        let dir = match end_of_directory(&read(tail_start, size - tail_start)?)? {
+            End::Directory(dir) => dir,
+            End::Zip64At(at) => zip64_end(&read(at, ZIP64_END_LEN)?)?,
+        };
+        dir.check(size)?;
+        Ok(entries(&read(dir.offset, dir.size)?, dir.entries)?.iter().any(|e| e.encrypted))
+    };
+    listed().unwrap_or(false)
+}
+
 /// The directory a ZIP64 end of central directory record names.
 fn zip64_end(record: &[u8]) -> Result<Directory, String> {
     if u32_at(record, 0) != Some(ZIP64_END_SIG) {
