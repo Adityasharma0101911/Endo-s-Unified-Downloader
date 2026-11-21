@@ -3113,7 +3113,10 @@ impl DownloadEngine {
         // (see `ChunkManager::steal_work`); also when the host's recipe says how many join it at
         // once. Not a resumed download: its gaps are split as they always were.
         let fresh_stream = streaming.is_some() && state.completed_ranges.is_empty();
-        let alone_first = fresh_stream && (limited || (start.rate.is_none() && best.is_none()));
+        // A host a download kept to one connection, one more there not paying, is the stream
+        // alone again, whatever rate its connections were seen held to.
+        let one = hosts::best_connections(&reference.final_url) == Some(1);
+        let alone_first = fresh_stream && (limited || one || (start.rate.is_none() && best.is_none()));
         let whole_gaps = fresh_stream && self.options.base_chunk_size == DEFAULT_CHUNK_SIZE && !in_order && !throttled_host;
         let chunk_size = match whole_gaps {
             true => size,
@@ -3351,6 +3354,7 @@ impl DownloadEngine {
                             pilot.waiting(Instant::now(), job.chunks.lock().total_received());
                         }
                         next = next.or_else(|| job.steer(pilot));
+                        job.ramp.judging(pilot.is_judging());
                         let now = pilot.why();
                         if why.as_ref() != Some(&now) {
                             tracing::info!("Autopilot: {}", now);
@@ -10535,7 +10539,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_a_stream_that_starts_slowly_is_judged_by_the_speed_it_reaches() {
         let (size, per_connection) = (12 * 1024 * 1024, 4e6);
-        let slow_start = Some(Duration::from_millis(600));
+        let slow_start = Some((1.0 / 16.0, Duration::from_millis(150)));
         let server = crate::netsim::Server { size, per_connection: Some(per_connection), slow_start, first_byte: Duration::from_millis(300), ..Default::default() };
         let (url, stats) = crate::netsim::serve(server).await;
         hosts::record_settled(&url, 0, Some(0.9 * per_connection));
@@ -10544,6 +10548,42 @@ mod tests {
         assert!(got == crate::netsim::file(size));
         assert_eq!((asked(&stats), stats.peak.load(Ordering::SeqCst)), ((1, 0), 1), "{said:?}");
         assert!(said.as_deref().is_some_and(|said| said.starts_with("1 connection: the server or your line holds it to about ")), "{said:?}");
+    }
+
+    /// A far host on a line one stream fills, each connection slow to climb, that refuses a fifth
+    /// request within 10 s (see `netsim::far_line`): the first stream's climb is not taken for
+    /// what a second brings, nor a second still climbing for one slow of its own. The download
+    /// keeps to the one stream, none of its requests refused, and ends within 15 % of the time
+    /// one GET of the file takes; the host is kept as one stream fills, so a later visit is that
+    /// one request alone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_far_line_one_stream_fills_gets_no_more() {
+        let size = 64 * 1024 * 1024;
+        let (url, _) = crate::netsim::serve(crate::netsim::far_line(size)).await;
+        let started = Instant::now();
+        let one_stream = async {
+            let mut response = reqwest::get(url).await.unwrap();
+            let mut got = 0;
+            while let Some(chunk) = response.chunk().await.unwrap() {
+                got += chunk.len();
+            }
+            assert_eq!(got, size);
+        };
+        tokio::time::timeout(Duration::from_secs(60), one_stream).await.expect("finished in a minute");
+        let one_stream = started.elapsed();
+        let (url, stats) = crate::netsim::serve(crate::netsim::far_line(size)).await;
+        for visit in 1..=2 {
+            let (dir, gets) = (tempdir().unwrap(), stats.gets.load(Ordering::SeqCst));
+            let started = Instant::now();
+            let (got, said) = fetch_told(&url, sim_options(dir.path(), 16, true)).await;
+            let took = started.elapsed();
+            let at = format!("visit {visit}: {took:?} against {one_stream:?} for one GET{}", told(&said, &stats));
+            assert!(got == crate::netsim::file(size), "{at}");
+            let refused = stats.throttled.load(Ordering::SeqCst) + stats.refused.load(Ordering::SeqCst);
+            assert!(refused == 0 && took <= one_stream * 115 / 100, "{refused} refused, {at}");
+            assert!(visit == 1 || stats.gets.load(Ordering::SeqCst) == gets + 1, "{at}");
+        }
+        assert_eq!(hosts::best_connections(&url), Some(1));
     }
 
     /// A host that serves k requests at once and refuses more with 429 and a rest of 6 s, each

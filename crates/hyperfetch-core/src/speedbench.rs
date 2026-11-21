@@ -29,6 +29,8 @@ const RUN_LIMIT: Duration = Duration::from_secs(90);
 #[derive(Clone, Copy)]
 enum Files {
     One(usize),
+    /// One GET of the whole file of `size` bytes, as a single-stream tool sends it (see [`stream_run`]).
+    Stream(usize),
     /// `count` files of `min` to `max` bytes, `at_once` at a time over one client, as a batch is;
     /// `hashed`: with each file's SHA-256, as a listing that gives them has.
     Many { count: usize, min: usize, max: usize, at_once: usize, hashed: bool },
@@ -121,6 +123,17 @@ fn scenarios() -> Vec<Scenario> {
             files: Files::One(32 * MIB),
             runs: 3,
         },
+        // A far host on a line one stream fills, slow to climb, that refuses a fifth request within
+        // 10 s (see `netsim::far_line`): `bench/sim-thresholds.json` holds the Autopilot to the time
+        // one stream takes there, none of its requests refused.
+        Scenario {
+            name: "far_line_stream",
+            what: "64 MiB in one GET, 110 ms away, climbing from little, 12 MB/s shared, 4 requests in 10 s",
+            server: netsim::far_line(0),
+            files: Files::Stream(64 * MIB),
+            runs: 3,
+        },
+        Scenario { name: "far_line", what: "the same with the Autopilot, a first visit", server: netsim::far_line(0), files: Files::One(64 * MIB), runs: 3 },
         Scenario {
             name: "h2_latency_hyper",
             what: "32 MiB over HTTP/2, 100 ms round trip, hyper's flow-control windows",
@@ -164,6 +177,9 @@ struct Measured {
     ttfb_ms: f64,
     /// Requests the server answered (HEAD and GET), in the median run.
     requests: usize,
+    /// Of those, the ones it refused.
+    #[serde(default)]
+    refused: usize,
     files_per_s: f64,
     /// What the Autopilot said last in the median run, of a single file.
     #[serde(default)]
@@ -179,6 +195,8 @@ struct Threshold {
     min_share: Option<f64>,
     /// At least this many requests: a download that widened.
     min_requests: Option<usize>,
+    /// At most this many requests refused.
+    max_refused: Option<usize>,
 }
 
 /// The sizes of a batch's files, the same every time (xorshift64 from a fixed seed).
@@ -213,13 +231,14 @@ fn options(dir: &std::path::Path, name: &str) -> DownloadOptions {
     DownloadOptions { output_path: Some(dir.join(name)), num_connections: 16, adaptive: true, remote_checksum: false, ..Default::default() }
 }
 
-/// One run: how long it took, the time to the first byte, the server's requests, and what the
-/// Autopilot said last of the last file.
-async fn run(scenario: &Scenario) -> (Duration, Duration, usize, String) {
+/// One run: how long it took, the time to the first byte, the server's requests and the refused
+/// ones among them, and what the Autopilot said last of the last file.
+async fn run(scenario: &Scenario) -> (Duration, Duration, (usize, usize), String) {
     let dir = tempfile::tempdir().unwrap();
     let size = match scenario.files {
         Files::One(size) => size,
         Files::Many { .. } => 1,
+        Files::Stream(size) => return with_nothing_said(stream_run(&scenario.server, size).await),
         Files::H2 { size, rtt, tuned } => return with_nothing_said(h2_run(size, rtt, tuned).await),
         Files::Torrent { size, piece, peer } => return with_nothing_said(torrent_run(&scenario.server, size, piece, peer).await),
     };
@@ -231,7 +250,7 @@ async fn run(scenario: &Scenario) -> (Duration, Duration, usize, String) {
             .enumerate()
             .map(|(i, size)| (url.join(&format!("/sized/{size}/{i}.bin")).unwrap(), size, dir.path().join(format!("{i}.bin"))))
             .collect(),
-        Files::H2 { .. } | Files::Torrent { .. } => unreachable!(),
+        Files::Stream(_) | Files::H2 { .. } | Files::Torrent { .. } => unreachable!(),
     };
     let hashed = matches!(scenario.files, Files::Many { hashed: true, .. });
     let checksum = |size: usize| {
@@ -284,15 +303,31 @@ async fn run(scenario: &Scenario) -> (Duration, Duration, usize, String) {
     (took, first_byte(&stats, started), requests(&stats), said)
 }
 
-fn with_nothing_said((took, first, requests): (Duration, Duration, usize)) -> (Duration, Duration, usize, String) {
+fn with_nothing_said((took, first, requests): (Duration, Duration, (usize, usize))) -> (Duration, Duration, (usize, usize), String) {
     (took, first, requests, String::new())
+}
+
+/// One GET of the whole file of `size` bytes from a `server`, as a single-stream tool sends it.
+async fn stream_run(server: &Server, size: usize) -> (Duration, Duration, (usize, usize)) {
+    let (url, stats) = netsim::serve(Server { size, ..server.clone() }).await;
+    let started = Instant::now();
+    let fetch = async {
+        let mut response = reqwest::get(url).await.unwrap();
+        let mut got = 0;
+        while let Some(chunk) = response.chunk().await.unwrap() {
+            got += chunk.len();
+        }
+        assert_eq!(got, size);
+    };
+    tokio::time::timeout(RUN_LIMIT, fetch).await.expect("within the time limit");
+    (started.elapsed(), first_byte(&stats, started), requests(&stats))
 }
 
 /// One GET of `size` bytes over HTTP/2 (cleartext, known to the client beforehand) through a link
 /// of `rtt` round trip, with the engine's HTTP/2 settings (`tuned`, see `engine::http2_tuned`) or
 /// hyper's: what one download gets from a server that speaks HTTP/2 alone, whose ranges share one
 /// connection (see `DownloadOptions::http2`).
-async fn h2_run(size: usize, rtt: Duration, tuned: bool) -> (Duration, Duration, usize) {
+async fn h2_run(size: usize, rtt: Duration, tuned: bool) -> (Duration, Duration, (usize, usize)) {
     let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let at = server.local_addr().unwrap();
     tokio::spawn(async move {
@@ -322,13 +357,13 @@ async fn h2_run(size: usize, rtt: Duration, tuned: bool) -> (Duration, Duration,
         first.unwrap_or_default()
     };
     let first = tokio::time::timeout(RUN_LIMIT, fetch).await.expect("within the time limit");
-    (started.elapsed(), first, 1)
+    (started.elapsed(), first, (1, 0))
 }
 
 /// `size` bytes of a one-file torrent of `piece`-byte pieces whose web seed is a `server`, through
 /// the swarm on a session of loopback alone (see `p2p::go_offline`), with a peer on this computer
 /// that sends `peer` bytes a second when there is one: from the start until the file is complete.
-async fn torrent_run(server: &Server, size: usize, piece: usize, peer: Option<u32>) -> (Duration, Duration, usize) {
+async fn torrent_run(server: &Server, size: usize, piece: usize, peer: Option<u32>) -> (Duration, Duration, (usize, usize)) {
     use sha1::Digest;
     let dir = tempfile::tempdir().unwrap();
     let (url, stats) = netsim::serve(Server { size, ..server.clone() }).await;
@@ -416,8 +451,10 @@ fn first_byte(stats: &Stats, started: Instant) -> Duration {
     stats.first_sent.get().map_or(Duration::ZERO, |at| at.saturating_duration_since(started))
 }
 
-fn requests(stats: &Stats) -> usize {
-    stats.gets.load(Ordering::SeqCst) + stats.heads.load(Ordering::SeqCst) + stats.throttled.load(Ordering::SeqCst)
+/// The requests the server saw, and the refused ones among them.
+fn requests(stats: &Stats) -> (usize, usize) {
+    let refused = stats.throttled.load(Ordering::SeqCst) + stats.refused.load(Ordering::SeqCst);
+    (stats.gets.load(Ordering::SeqCst) + stats.heads.load(Ordering::SeqCst) + stats.throttled.load(Ordering::SeqCst), refused)
 }
 
 async fn measure(scenario: &Scenario) -> Measured {
@@ -426,9 +463,9 @@ async fn measure(scenario: &Scenario) -> Measured {
         runs.push(run(scenario).await);
     }
     runs.sort_by_key(|run| run.0);
-    let (took, ttfb, requests, autopilot) = runs.swap_remove(runs.len() / 2);
+    let (took, ttfb, (requests, refused), autopilot) = runs.swap_remove(runs.len() / 2);
     let (bytes, files) = match scenario.files {
-        Files::One(size) | Files::H2 { size, .. } | Files::Torrent { size, .. } => (size as u64, 1),
+        Files::One(size) | Files::Stream(size) | Files::H2 { size, .. } | Files::Torrent { size, .. } => (size as u64, 1),
         Files::Many { count, min, max, .. } => (sizes(count, min, max).iter().sum::<usize>() as u64, count),
     };
     let seconds = took.as_secs_f64();
@@ -440,6 +477,7 @@ async fn measure(scenario: &Scenario) -> Measured {
         mb_per_s: bytes as f64 / 1e6 / seconds,
         ttfb_ms: ttfb.as_secs_f64() * 1e3,
         requests,
+        refused,
         files_per_s: files as f64 / seconds,
         autopilot,
     }
@@ -447,11 +485,13 @@ async fn measure(scenario: &Scenario) -> Measured {
 
 fn table(results: &[Measured], profile: &str) -> String {
     let label = std::env::var("ENDO_BENCH_LABEL").map(|l| format!(", {l}")).unwrap_or_default();
-    let mut out = format!("### Speed benchmark ({profile} build{label})\n\n| Scenario | What | Time | MB/s | First byte | Requests | Files/s |\n|---|---|---:|---:|---:|---:|---:|\n");
+    let mut out = format!(
+        "### Speed benchmark ({profile} build{label})\n\n| Scenario | What | Time | MB/s | First byte | Requests | Refused | Files/s |\n|---|---|---:|---:|---:|---:|---:|---:|\n"
+    );
     for m in results {
         out += &format!(
-            "| `{}` | {} | {:.2} s | {:.1} | {:.0} ms | {} | {:.1} |\n",
-            m.name, m.what, m.seconds, m.mb_per_s, m.ttfb_ms, m.requests, m.files_per_s
+            "| `{}` | {} | {:.2} s | {:.1} | {:.0} ms | {} | {} | {:.1} |\n",
+            m.name, m.what, m.seconds, m.mb_per_s, m.ttfb_ms, m.requests, m.refused, m.files_per_s
         );
     }
     out
@@ -470,6 +510,9 @@ fn regressions(results: &[Measured], thresholds: &std::collections::HashMap<Stri
         }
         if let Some(min) = t.min_requests.filter(|&min| m.requests < min) {
             found.push(format!("{}: {} requests, under the {min} allowed ({})", m.name, m.requests, m.autopilot));
+        }
+        if let Some(max) = t.max_refused.filter(|&max| m.refused > max) {
+            found.push(format!("{}: {} requests refused, over the {max} allowed ({})", m.name, m.refused, m.autopilot));
         }
         let base = t.min_share_of.as_ref().and_then(|of| results.iter().find(|b| &b.name == of));
         if let (Some(base), Some(share)) = (base, t.min_share) {
@@ -491,14 +534,18 @@ fn test_regressions_are_told_from_the_thresholds() {
         mb_per_s,
         ttfb_ms,
         requests: 1,
+        refused: 1,
         files_per_s: 0.0,
         autopilot: "1 connection: too little is left to try more".into(),
     };
-    let thresholds: std::collections::HashMap<String, Threshold> =
-        serde_json::from_str(r#"{"a": {"min_mb_per_s": 10}, "b": {"max_ttfb_ms": 100}, "d": {"min_share_of": "a", "min_share": 0.85}, "e": {"min_requests": 2}}"#).unwrap();
+    let thresholds: std::collections::HashMap<String, Threshold> = serde_json::from_str(
+        r#"{"a": {"min_mb_per_s": 10}, "b": {"max_ttfb_ms": 100}, "d": {"min_share_of": "a", "min_share": 0.85}, "e": {"min_requests": 2}, "f": {"max_refused": 0}}"#,
+    )
+    .unwrap();
     let found = regressions(&[m("a", 9.0, 999.0), m("b", 1.0, 101.0), m("c", 0.0, 1e9), m("a", 10.0, 0.0)], &thresholds);
     assert_eq!(found.len(), 2, "{found:?}");
     assert_eq!(regressions(&[m("e", 1.0, 0.0)], &thresholds), ["e: 1 requests, under the 2 allowed (1 connection: too little is left to try more)"]);
+    assert_eq!(regressions(&[m("f", 1.0, 0.0)], &thresholds), ["f: 1 requests refused, over the 0 allowed (1 connection: too little is left to try more)"]);
     assert!(found[0].starts_with("a:") && found[1].starts_with("b:"));
     // A share of another scenario's speed in the same run; none when that one did not run.
     assert_eq!(regressions(&[m("a", 20.0, 0.0), m("d", 17.0, 0.0)], &thresholds), Vec::<String>::new());
@@ -521,8 +568,8 @@ async fn speed_bench() {
     for scenario in scenarios().iter().filter(|s| only.as_deref().is_none_or(|only| only.split(',').any(|n| n == s.name))) {
         let measured = measure(scenario).await;
         eprintln!(
-            "{}: {:.2} s, {:.1} MB/s, first byte {:.0} ms, {} requests; the Autopilot: {}",
-            measured.name, measured.seconds, measured.mb_per_s, measured.ttfb_ms, measured.requests, measured.autopilot
+            "{}: {:.2} s, {:.1} MB/s, first byte {:.0} ms, {} requests ({} refused); the Autopilot: {}",
+            measured.name, measured.seconds, measured.mb_per_s, measured.ttfb_ms, measured.requests, measured.refused, measured.autopilot
         );
         results.push(measured);
     }

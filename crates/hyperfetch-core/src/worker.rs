@@ -545,6 +545,9 @@ pub struct Ramp {
     untaken: std::sync::atomic::AtomicBool,
     /// Newcomers whose pieces the requests they were cut from took back while the download widened.
     late: std::sync::atomic::AtomicUsize,
+    /// The Autopilot judges one more connection beside the first stream: no piece is split off
+    /// into a request of its own meanwhile (see [`Ramp::judging`]).
+    judging: std::sync::atomic::AtomicBool,
 }
 
 /// The bit of `Ramp::phase` that says a step is under way.
@@ -563,7 +566,14 @@ impl Ramp {
             refusal: false.into(),
             untaken: false.into(),
             late: 0.into(),
+            judging: false.into(),
         }
+    }
+
+    /// Whether the Autopilot judges one more connection beside the first stream: a third request
+    /// would count among what that one brings, and cost one the host may refuse.
+    pub(crate) fn judging(&self, judging: bool) {
+        self.judging.store(judging, Ordering::Relaxed);
     }
 
     /// Whether a step is under way, the workers running when it began, and which step it is.
@@ -942,8 +952,11 @@ impl HttpWorker {
         let (url, if_range, redirected) = (mirror.url.clone(), mirror.if_range.clone(), mirror.fallback.is_some());
         // A host that refused a request lately limits how often it is asked, and one that caps its
         // connections may refuse a new one as `lags` says: a running chunk is not split into
-        // another request to it, whose piece would wait out the host's rest.
+        // another request to it, whose piece would wait out the host's rest. Nor is one that goes
+        // on stolen from while one more connection is judged, nor at a host kept to one, where
+        // another brings nothing.
         let splits = !hosts::limits_requests(&url) && hosts::profile(&url).connection_cap.is_none();
+        let steals = splits && !s.ramp.judging.load(Ordering::Relaxed) && hosts::best_connections(&url) != Some(1);
         let job = {
             let mut mgr = s.chunks.lock();
             let taken = mgr.get_next_work(self.worker_id, mirror_id).or_else(|| {
@@ -968,7 +981,7 @@ impl HttpWorker {
                     let steal = StealRule { min_bytes: s.min_steal, timing: Some(&costs) };
                     // Under a speed limit a chunk is slow by the limit's doing, as for `hedge`.
                     let limited = s.limiter.as_ref().is_some_and(|l| l.limits());
-                    let stolen = mgr.steal_work(self.worker_id, mirror_id, steal).map(|(_, c)| c).or_else(|| {
+                    let stolen = steals.then(|| mgr.steal_work(self.worker_id, mirror_id, steal)).flatten().map(|(_, c)| c).or_else(|| {
                         if limited {
                             return None;
                         }

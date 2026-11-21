@@ -44,9 +44,9 @@ pub(crate) struct Server {
     pub size: usize,
     /// Bytes per second each connection is held to.
     pub per_connection: Option<f64>,
-    /// Each connection starts at a sixteenth of `per_connection` and doubles four times evenly over
-    /// this long to reach it, as a connection's congestion window grows on a far host.
-    pub slow_start: Option<Duration>,
+    /// Each connection starts at this share of `per_connection` and doubles every this long until
+    /// it reaches it, as a connection's congestion window grows on a far host.
+    pub slow_start: Option<(f64, Duration)>,
     /// Bytes per second all connections share: a cap that more connections do not raise.
     pub per_client: Option<f64>,
     /// GETs served at once; one more is refused with `refusal`.
@@ -103,6 +103,17 @@ pub(crate) struct Budget {
     pub burst: usize,
     pub every: Duration,
     pub retry_after: u64,
+}
+
+/// A far host on a line one stream fills, as the real one that took the Autopilot's first stream's
+/// climb for what a second brought: 110 ms away, so a connection's first byte comes 220 ms after
+/// it starts (its connect and its answer); each connection starts at a 128th of the line and
+/// doubles every 110 ms, as its congestion window grows; all of a client's connections share the
+/// line's 12 MB/s; and a fifth request within 10 s is refused with 429 and a rest of 10 s.
+pub(crate) fn far_line(size: usize) -> Server {
+    let rate = RateLimit { requests: 4, window: Duration::from_secs(10), retry_after: 10, ban_after: usize::MAX, ban: Duration::ZERO };
+    let slow_start = Some((1.0 / 128.0, Duration::from_millis(110)));
+    Server { size, per_connection: Some(12e6), per_client: Some(12e6), slow_start, first_byte: Duration::from_millis(220), rate: Some(rate), ..Default::default() }
 }
 
 /// A request that comes this long after a 429, within the rest it asked for, came too early: one
@@ -386,11 +397,12 @@ async fn answer(
                 }
                 None => {
                     // Paced by the bytes sent in all, which a coarse timer cannot make faster: at
-                    // `rate · 2^(4(t/T - 1))`, `B` bytes are out by `T · (1 + log2(4 ln2 · B / (rate · T) + 1/16) / 4)`.
-                    let due = server.slow_start.zip(server.per_connection).and_then(|(within, rate)| {
-                        let (t, b) = (within.as_secs_f64(), (sent + piece.len()) as f64);
-                        let at = t * (1.0 + (4.0 * std::f64::consts::LN_2 * b / (rate * t) + 1.0 / 16.0).log2() / 4.0);
-                        (at < t).then(|| began + Duration::from_secs_f64(at))
+                    // `r · 2^(t/d)` from `r`, the share of `rate`, `B` bytes are out by
+                    // `d · log2(ln2 · B / (r · d) + 1)`, until `rate` is reached after `d · log2(rate / r)`.
+                    let due = server.slow_start.zip(server.per_connection).and_then(|((share, doubling), rate)| {
+                        let (d, b) = (doubling.as_secs_f64(), (sent + piece.len()) as f64);
+                        let at = d * (std::f64::consts::LN_2 * b / (share * rate * d) + 1.0).log2();
+                        (at < d * (1.0 / share).log2()).then(|| began + Duration::from_secs_f64(at))
                     });
                     if let Some(due) = due {
                         tokio::time::sleep_until(due).await;

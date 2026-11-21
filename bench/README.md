@@ -8,7 +8,10 @@ Autopilot off, the engine's own speed, and again as the Autopilot's first visit,
 past one request), a server that caps each
 connection, one that caps all of a user's connections together, a long link (150 ms to answer, a
 cap per connection), a lossy one (one connection cut off, one fading out), a host that answers 429
-past 6 requests a second, 2,000 small files (with and without the SHA-256 a listing gives), and a
+past 6 requests a second, a far host on a line one stream fills (`far_line`: 220 ms to answer,
+each connection climbing from a 128th of the line's 12 MB/s by doubling every 110 ms, 429 with a
+rest of 10 s past 4 requests in 10 s; with the Autopilot, against `far_line_stream`, one GET of the
+file), 2,000 small files (with and without the SHA-256 a listing gives), and a
 single HTTP/2 download over a 100 ms round trip with hyper's flow-control windows and with the
 engine's. Every downloaded file is checked byte by byte; at most 128 MiB is on disk at once.
 
@@ -27,7 +30,8 @@ half what the CI runner measured, and each first-byte limit three times the meas
 a real regression (a scenario at half speed, a probe that waits a round trip more) fails the job,
 a slower runner does not. The web seed scenarios are held to a share of `web_seed_http` in the
 same run: 0.6, as the runner measures them at 0.68 when the torrent opens two
-connections where it mostly opens three. A debug build's numbers are not comparable: the dependencies are not
+connections where it mostly opens three. `far_line` is held to 0.87 of `far_line_stream`'s speed
+in the same run (within 15 % of its time), and none of its requests refused. A debug build's numbers are not comparable: the dependencies are not
 optimized there, and the thresholds are not checked.
 
 ### Results (2026-11-16, GitHub's ubuntu-latest runner, release build)

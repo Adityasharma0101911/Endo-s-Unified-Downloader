@@ -8,6 +8,7 @@
   "high_latency": { "min_mb_per_s": 8.5, "max_ttfb_ms": 650 },
   "lossy": { "min_mb_per_s": 4.8, "max_ttfb_ms": 450 },
   "rate_limited": { "min_mb_per_s": 7, "max_ttfb_ms": 200 },
+  "far_line": { "min_share_of": "far_line_stream", "min_share": 0.87, "max_refused": 0 },
   "h2_latency_hyper": { "min_mb_per_s": 8.5, "max_ttfb_ms": 600 },
   "h2_latency": { "min_mb_per_s": 11, "max_ttfb_ms": 600 },
   "small_files": { "min_mb_per_s": 8, "max_ttfb_ms": 240 },
