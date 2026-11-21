@@ -494,6 +494,7 @@ fn status_badge(app: &App, item: &QueueItem, p: &Palette) -> (&'static str, Colo
     match &item.status {
         QueueItemStatus::Queued => ("Waiting", p.muted),
         QueueItemStatus::Downloading if app.is_resolving(item.id) => ("Connecting", p.amber),
+        QueueItemStatus::Downloading if item.checking => ("Checking", p.cyan),
         QueueItemStatus::Downloading if item.is_finishing() => ("Finishing", p.cyan),
         QueueItemStatus::Downloading if app.waits_for_network(item.id) => ("Waiting for the network", p.amber),
         QueueItemStatus::Downloading if app.stalled_for(item.id).is_some() => ("Stalled", p.amber),
@@ -701,10 +702,10 @@ fn pulse_bar(app: &mut App, ui: &mut Ui) {
     let p = palette(ui);
     let ctx = ui.ctx().clone();
     let items = app.queue.items();
-    // One in place counts done (see `util::checking`).
-    let running = items.iter().filter(|item| item.status == QueueItemStatus::Downloading && !item.in_place).count();
+    // One whose place is free (see `QueueItem::place_free`) runs for none of the limits.
+    let running = items.iter().filter(|item| item.status == QueueItemStatus::Downloading && !item.place_free).count();
     let waiting = items.iter().filter(|item| matches!(item.status, QueueItemStatus::Queued | QueueItemStatus::Paused)).count();
-    let done = items.iter().filter(|item| item.status == QueueItemStatus::Completed || crate::util::checking(item)).count();
+    let done = items.iter().filter(|item| item.status == QueueItemStatus::Completed).count();
     let speed: f64 = items.iter().filter(|item| item.status == QueueItemStatus::Downloading).map(|item| item.speed_bytes_per_sec.max(0.0)).sum();
     let paused = items.iter().any(|item| item.status == QueueItemStatus::Paused);
     let shown = anim::roll(&ctx, egui::Id::new("total speed"), speed as f32).max(0.0);
@@ -843,7 +844,7 @@ fn limit_switch(app: &mut App, ui: &mut Ui) {
         .queue
         .items()
         .iter()
-        .filter(|item| item.status == QueueItemStatus::Downloading && !item.in_place && item.options.max_speed != wanted)
+        .filter(|item| item.status == QueueItemStatus::Downloading && !item.place_free && item.options.max_speed != wanted)
         .map(|item| item.id)
         .collect();
     if !stale.is_empty() && ui.add(button("Apply now")).on_hover_text("Restart the running downloads with this limit; they go on from where they are").clicked() {

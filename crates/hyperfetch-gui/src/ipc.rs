@@ -718,9 +718,6 @@ const MAX_LISTED: usize = 100;
 /// Keeps the downloads of `queue` as they are now, newest first, for `/queue`.
 pub fn set_queue(queue: &DownloadQueue) {
     let listed = queue.items().iter().rev().take(MAX_LISTED).map(|item| {
-        // Done once its bytes are in (see `util::checking`).
-        let shown = crate::util::shown(item);
-        let item = &*shown;
         let (status, error) = match &item.status {
             QueueItemStatus::Queued => ("queued", None),
             QueueItemStatus::Downloading => ("downloading", None),

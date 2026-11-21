@@ -37,9 +37,6 @@ fn takes_new_link(item: &QueueItem) -> bool {
 /// and what happened to it. `in_place` (a narrow window): drawn on a card of its own with a way
 /// back to the list; beside the list, the panel is its card.
 pub(super) fn detail_page(app: &mut App, ui: &mut Ui, item: &QueueItem, in_place: bool) {
-    // Done once its bytes are in (see `util::checking`).
-    let shown = util::shown(item);
-    let item = &*shown;
     if in_place {
         card(ui).show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -252,7 +249,8 @@ fn detail_actions(app: &mut App, ui: &mut Ui, item: &QueueItem) {
             app.list_tracks(Some(id), url.clone());
         }
     }
-    if let Some(path) = &item.target_path {
+    // Not while its file is checked: it has no name yet.
+    if let Some(path) = item.target_path.as_ref().filter(|_| !util::checking(item)) {
         if ui.add(button(format!("{} Show in folder", icon::FOLDER_OPEN))).clicked() {
             report(app, util::reveal_in_folder(path));
         }
@@ -262,9 +260,7 @@ fn detail_actions(app: &mut App, ui: &mut Ui, item: &QueueItem) {
             app.copy_text(url.to_string());
         }
     }
-    // Not while its engine runs, also for one shown done while its checksum is checked.
-    let running = app.queue.get_item(id).is_some_and(|real| real.status.is_active());
-    if !running && ui.add(button(format!("{} Remove", icon::X))).on_hover_text("Off the list; its files are kept (Undo brings it back)").clicked() {
+    if !item.status.is_active() && ui.add(button(format!("{} Remove", icon::X))).on_hover_text("Off the list; its files are kept (Undo brings it back)").clicked() {
         app.remove_job(id);
         app.focused = None;
         app.selected = None;
@@ -504,6 +500,9 @@ fn status_line(app: &App, item: &QueueItem, p: &Palette) -> (String, Color32) {
     match &item.status {
         QueueItemStatus::Queued => ("Waiting: starts when a download slot is free.".to_string(), p.muted),
         QueueItemStatus::Downloading if app.is_resolving(item.id) => ("Connecting to the server\u{2026}".to_string(), p.muted),
+        QueueItemStatus::Downloading if item.checking => {
+            (format!("Checking {}: it keeps its partial name until it passes.", item.filename), p.muted)
+        }
         QueueItemStatus::Downloading if item.is_finishing() => {
             (format!("Finishing {}: verifying the file and moving it into place...", item.filename), p.muted)
         }
@@ -1314,9 +1313,7 @@ fn segment_bar(ui: &mut Ui, id: egui::Id, item: &QueueItem, chunks: &[ChunkSnaps
 /// completion and shakes on failure. Returns the card's response.
 fn queue_row(app: &App, ui: &mut Ui, line: &Line, action: &mut Option<(usize, RowAction)>) -> egui::Response {
     let p = palette(ui);
-    // Done once its bytes are in (see `util::checking`).
-    let shown = util::shown(line.item);
-    let item = &*shown;
+    let item = line.item;
     let ctx = ui.ctx().clone();
     let (slot, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_HEIGHT), Sense::hover());
     let id = egui::Id::new(("queue row", item.id));
@@ -1387,11 +1384,7 @@ fn queue_row(app: &App, ui: &mut Ui, line: &Line, action: &mut Option<(usize, Ro
 
     let item_id = egui::Id::new(("item", item.id));
     let (status, color) = status_badge(app, item, &p);
-    let actions = match util::checking(line.item) {
-        // Open, Show in its folder and Details: it leaves the list once its check is over.
-        true => &row_actions(&item.status)[..3],
-        false => row_actions(&item.status),
-    };
+    let actions = row_actions(&item.status);
     // A stream's card offers its track chooser too, left of the others.
     let tracks = crate::tracks::offered(item);
     // One whose file another download has from another host offers to join them (see `Twin`).
@@ -1505,7 +1498,7 @@ fn in_group(group: usize, status: &QueueItemStatus) -> bool {
 /// in its name and its links.
 fn listed(item: &QueueItem, group: usize, search: &str) -> bool {
     let found = || item.filename.to_lowercase().contains(search) || item.urls.iter().any(|url| url.as_str().to_lowercase().contains(search));
-    in_group(group, &util::shown(item).status) && (search.is_empty() || found())
+    in_group(group, &item.status) && (search.is_empty() || found())
 }
 
 /// The downloads the list shows, top to bottom: for Up and Down.
@@ -1526,7 +1519,7 @@ fn many_links_id() -> egui::Id {
 fn toolbar(app: &mut App, ui: &mut Ui) {
     let p = palette(ui);
     let items = app.queue.items();
-    let counts: Vec<usize> = (0..FILTERS.len()).map(|group| items.iter().filter(|item| in_group(group, &util::shown(item).status)).count()).collect();
+    let counts: Vec<usize> = (0..FILTERS.len()).map(|group| items.iter().filter(|item| in_group(group, &item.status)).count()).collect();
     let running = app.queue.active_count();
     let finish = (running > 0).then(|| finish_time(app.queue.remaining(app.settings.auto_run_queue))).flatten();
     // On a narrow page the search and the buttons go on a line of their own, under the filters.
@@ -2017,22 +2010,51 @@ mod tests {
         h.wait_for_background();
     }
 
-    /// A download whose bytes are in shows as done while the site's checksum is checked: its card
-    /// says Done and opens its file, with no Pause nor Remove, and the bar counts it done.
+    /// A download whose bytes are in, its file checked under its partial name (here, while its
+    /// site's checksum files get no answer), shows "Checking" at 100 %: a running download, with
+    /// Pause, counted running and not done, and nothing to open or show in its folder, as the file
+    /// has no name yet. Clear completed keeps it. Once checked it is done, and opens.
     #[test]
-    fn a_download_in_place_shows_as_done() {
+    fn a_download_being_checked_shows_checking_and_opens_once_done() {
+        let server = tokio::runtime::Runtime::new().unwrap();
+        let held = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let addr = server.block_on(crate::tests::serve_holding(std::sync::Arc::new(vec![7; 64 * 1024]), Some(std::sync::Arc::clone(&held))));
         let mut h = Harness::new();
-        let id = h.add("disk.img");
-        h.progress(id, 1.0);
-        let path = std::env::temp_dir().join("disk.img");
-        let snapshot = hyperfetch_core::engine::EngineSnapshot { total_bytes: 100 << 20, downloaded_bytes: 100 << 20, target_path: Some(path), in_place: true, ..Default::default() };
-        h.app.queue.apply_snapshot(id, &snapshot);
+        let task = crate::Task { urls: vec![url::Url::parse(&format!("http://{addr}/dir/disk.img")).unwrap()], ..Default::default() };
+        let options = crate::task_options(&h.app.settings, &task, "", "").unwrap();
+        let id = crate::queue_task(&mut h.app.queue, task, options);
+        assert!(h.app.start_job(id, false));
+        // Its snapshots taken as each frame of the window takes them, until the check; then no
+        // more, so the window shows the check however long the frames take.
+        let start = Instant::now();
+        while !h.app.queue.get_item(id).is_some_and(|item| item.checking) {
+            assert!(start.elapsed() < Duration::from_secs(20), "timed out");
+            std::thread::sleep(Duration::from_millis(10));
+            h.app.drain_snapshots();
+        }
         h.app.tab = crate::Tab::Downloads;
         h.frames(30);
         let lines: Vec<String> = h.texts().into_iter().map(|(text, _)| text).collect();
-        assert!(lines.iter().any(|text| text == "Done") && !lines.iter().any(|text| text == "Downloading"), "{lines:?}");
-        assert!(lines.iter().any(|text| text.contains("1 done")), "{lines:?}");
-        assert!(h.find(icon::FILE).is_some() && h.find(icon::PAUSE).is_none() && h.find_near("disk.img", icon::X).is_none(), "{lines:?}");
+        assert!(lines.iter().any(|text| text == "Checking") && !lines.iter().any(|text| text == "Done"), "{lines:?}");
+        assert!(lines.iter().any(|text| text == "Running 1") && lines.iter().any(|text| text == "Done 0"), "{lines:?}");
+        let row = h.find("disk.img").unwrap();
+        let on_row: Vec<String> = h.texts().into_iter().filter(|(_, rect)| (rect.center().y - row.center().y).abs() < 24.0).map(|(text, _)| text).collect();
+        assert!(on_row.iter().any(|text| text == icon::PAUSE) && !on_row.iter().any(|text| text == icon::FOLDER_OPEN), "{on_row:?}");
+        h.app.clear_queue(true);
+        assert!(h.app.queue.get_item(id).is_some(), "Clear completed keeps it");
+
+        h.app.show_job(id);
+        h.frames(60);
+        let lines: Vec<String> = h.texts().into_iter().map(|(text, _)| text).collect();
+        assert!(lines.iter().any(|text| text == "100%") && lines.iter().any(|text| text == "Checking"), "{lines:?}");
+        assert!(h.find("Pause").is_some() && h.find("Open file").is_none() && h.find("Show in folder").is_none(), "{lines:?}");
+
+        held.store(false, std::sync::atomic::Ordering::SeqCst);
+        h.wait_for(|app| app.queue.get_item(id).is_some_and(|item| item.status == QueueItemStatus::Completed));
+        h.frames(30);
+        let lines: Vec<String> = h.texts().into_iter().map(|(text, _)| text).collect();
+        assert!(lines.iter().any(|text| text == "Done") && !lines.iter().any(|text| text == "Checking"), "{lines:?}");
+        assert!(h.find("Open file").is_some() && h.find("Show in folder").is_some(), "{lines:?}");
     }
 
     /// A running download's own speed limit and connections, set in its details, are kept with it

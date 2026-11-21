@@ -74,7 +74,7 @@ fn results(app: &App, query: &str) -> Vec<(&'static str, String, String, Hit)> {
     if kinds::recognise(bar).is_some_and(|(kind, _)| kind.choice == kinds::Choice::Page) && !raw.contains('/') && (hit("Save this page as one file") || hit("offline")) {
         out.push((icon::FILE_HTML, "Save this page as one file".to_string(), truncate_chars(bar, 48), Hit::SavePage(bar.to_string())));
     }
-    let running = app.queue.items().iter().any(|item| item.status == QueueItemStatus::Downloading && !item.in_place);
+    let running = app.queue.items().iter().any(|item| item.status == QueueItemStatus::Downloading && !item.place_free);
     let limit = crate::settings::speed_limit_bytes(app.settings.max_speed, app.settings.max_speed_in_mb).is_some();
     let actions = [
         (true, icon::PLUS, "New download", "Paste or drop anything", Hit::NewDownload),
