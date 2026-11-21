@@ -85,26 +85,22 @@ impl Dialer {
     }
 
     /// A TCP connection to `url`'s server at `port`, over an address the local addresses can
-    /// reach, for worker `worker`.
+    /// reach, for worker `worker`: its addresses raced as `crate::dial` does.
     pub(crate) async fn dial(&self, url: &Url, port: u16, worker: usize) -> Result<TcpStream, Failure> {
         let addrs: Vec<SocketAddr> = match url.host() {
             Some(Host::Ipv4(ip)) => vec![SocketAddr::new(ip.into(), port)],
             Some(Host::Ipv6(ip)) => vec![SocketAddr::new(ip.into(), port)],
-            Some(Host::Domain(name)) => match tokio::time::timeout(self.connect_timeout, tokio::net::lookup_host((name, port))).await {
-                Ok(Ok(found)) => found.collect(),
+            Some(Host::Domain(name)) => match tokio::time::timeout(self.connect_timeout, crate::dial::lookup(name, port)).await {
+                Ok(Ok(found)) => found,
                 Ok(Err(e)) => return Err(transient(format!("cannot resolve {name}: {e}"))),
                 Err(_) => return Err(transient(format!("cannot resolve {name} in time"))),
             },
             None => return Err((FailureKind::Fatal, format!("{url} names no server"))),
         };
-        let mut failed = None;
-        for addr in addrs.into_iter().filter(|a| self.takes(a)) {
-            match self.connect(addr, worker).await {
-                Ok(stream) => return Ok(stream),
-                Err(e) => failed = Some(e),
-            }
-        }
-        Err(failed.unwrap_or_else(|| transient(format!("{} has no address the local addresses can reach", url.host_str().unwrap_or("")))))
+        let addrs = addrs.into_iter().filter(|a| self.takes(a)).collect();
+        crate::dial::race(addrs, |addr| self.connect(addr, worker)).await.map_err(|failed| {
+            failed.unwrap_or_else(|| transient(format!("{} has no address the local addresses can reach", url.host_str().unwrap_or(""))))
+        })
     }
 
     /// Whether a connection may go to `addr`: of the IP version of one of the local addresses,

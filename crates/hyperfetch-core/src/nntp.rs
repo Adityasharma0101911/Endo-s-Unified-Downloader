@@ -466,8 +466,13 @@ impl Conn {
         let slot = slots(server).acquire_owned().await.map_err(|e| Failure::Broken(e.to_string()))?;
         let host = &server.host;
         let broken = |why: String| Failure::Broken(format!("{host}: {why}"));
-        let connect = tokio::net::TcpStream::connect((host.as_str(), server.port()));
-        let tcp = tokio::time::timeout(stall, connect).await.map_err(|_| broken("no answer".into()))?.map_err(|e| broken(e.to_string()))?;
+        // Its addresses raced, as `crate::dial` does.
+        let connect = async {
+            let addrs = crate::dial::lookup(host, server.port()).await.map_err(|e| e.to_string())?;
+            let race = crate::dial::race(addrs, tokio::net::TcpStream::connect).await;
+            race.map_err(|failed| failed.map_or_else(|| "no address".to_string(), |e| e.to_string()))
+        };
+        let tcp = tokio::time::timeout(stall, connect).await.map_err(|_| broken("no answer".into()))?.map_err(broken)?;
         let _ = tcp.set_nodelay(true);
         let io: Box<dyn Stream> = if server.tls {
             let name = rustls::pki_types::ServerName::try_from(host.clone()).map_err(|_| Failure::Refused(format!("{host} is no host name TLS can check")))?;

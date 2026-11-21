@@ -4275,6 +4275,7 @@ fn build_route_client(
         .local_address(local)
         .pool_max_idle_per_host(POOL_MAX_IDLE)
         .pool_idle_timeout(Some(POOL_IDLE))
+        .dns_resolver(Arc::new(crate::dial::KeptNames))
         .danger_accept_invalid_certs(options.insecure)
         .default_headers(headers);
     // The request keeps the host's name (Host, and TLS's server name and certificate check): only
@@ -4389,8 +4390,8 @@ pub fn build_client_pool(options: &DownloadOptions) -> Result<Vec<Client>, Strin
 async fn server_addresses(host: &str, port: u16, family: IpFamily) -> Vec<std::net::SocketAddr> {
     // The probe just resolved it: the system has it at hand, unless its resolver is in trouble.
     let looked_up = async {
-        match tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host((host, port))).await {
-            Ok(Ok(found)) => found.collect(),
+        match tokio::time::timeout(Duration::from_secs(5), crate::dial::lookup(host, port)).await {
+            Ok(Ok(found)) => found,
             _ => Vec::new(),
         }
     };

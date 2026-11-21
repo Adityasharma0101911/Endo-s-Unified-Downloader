@@ -16,6 +16,7 @@ pub mod history;
 pub mod verify;
 pub mod hosts;
 pub(crate) mod autopilot;
+pub(crate) mod dial;
 pub mod ingest;
 pub mod folders;
 pub mod feeds;
