@@ -4,7 +4,7 @@ use std::time::Duration;
 use url::Url;
 
 /// Largest Metalink a server's `Link` header points to that is read.
-const MAX_DESCRIBED: usize = 1 << 20;
+pub(crate) const MAX_DESCRIBED: usize = 1 << 20;
 
 #[derive(Debug, Clone)]
 pub struct MetalinkFile {
@@ -80,7 +80,12 @@ pub(crate) async fn described(client: &reqwest::Client, url: &Url, size: Option<
         String::from_utf8(body).ok()
     };
     let text = tokio::time::timeout(wait, fetched).await.ok().flatten()?;
-    let files = parse_metalink(&text).ok()?;
+    describes(&text, size)
+}
+
+/// The file of `size` bytes, or the only one, that the Metalink `text` describes.
+pub(crate) fn describes(text: &str, size: Option<u64>) -> Option<MetalinkFile> {
+    let files = parse_metalink(text).ok()?;
     let only = files.len() == 1;
     files.into_iter().find(|f| only || (f.size.is_some() && f.size == size))
 }

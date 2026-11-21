@@ -78,7 +78,9 @@ pub async fn published_checksum(client: &Client, url: &Url, probe_headers: &Head
 /// requests are (see `worker::authorize`): its credentials go to its own hosts alone. Each takes
 /// a slot of the host's `limit` (see `crate::hosts`), as every request of a download does. Between
 /// the headers and the checksum files comes the Metalink they name for the file (`described`, its
-/// link and the file's size; see `metalink::described`): its strongest hash of the whole file.
+/// link and the file's size; see `metalink::describes`): its strongest hash of the whole file. It
+/// is asked for as a checksum file is (see `fetch_small`), within 3 seconds; refused, nothing
+/// more is.
 async fn published(
     client: &Client,
     auth: Option<&Auth>,
@@ -91,8 +93,13 @@ async fn published(
         return Some(found);
     }
     if let Some((metalink, size)) = described {
+        let text = match tokio::time::timeout(SIDECAR_BUDGET, fetch_small(client, auth, limit, metalink, crate::metalink::MAX_DESCRIBED)).await {
+            Ok(Sidecar::Text(text)) => text,
+            Ok(Sidecar::Refused) => return None,
+            _ => String::new(),
+        };
         // One of another size describes another file.
-        let file = crate::metalink::described(client, &metalink, size, SIDECAR_BUDGET).await.filter(|f| f.size.is_none() || f.size == size);
+        let file = crate::metalink::describes(&text, size).filter(|f| f.size.is_none() || f.size == size);
         let found: Vec<_> = file.iter().flat_map(|f| &f.hashes).filter_map(|(algo, hex)| named(algo, hex)).collect();
         if let Some((algo, digest)) = ALGOS.iter().find_map(|(algo, _)| found.iter().find(|(name, _)| name == algo)) {
             return Some(checksum(algo, digest));
@@ -219,7 +226,7 @@ async fn from_sidecars(client: &Client, auth: Option<&Auth>, limit: usize, url: 
             if refused.load(Ordering::Relaxed) {
                 return None;
             }
-            match fetch_small(client, auth, limit, sidecar.clone()).await {
+            match fetch_small(client, auth, limit, sidecar.clone(), MAX_SIDECAR).await {
                 Sidecar::Text(text) => {
                     let found = checksum_line(&text, name, ext);
                     if found.is_some() && ext.is_some() {
@@ -313,9 +320,10 @@ fn note(memory: &Mutex<HashMap<String, (Instant, u8)>>, key: String) {
     *seen = (now, if seen.0.elapsed() < FOLDER_MEMORY { seen.1.saturating_add(1) } else { 1 });
 }
 
-/// The checksum file at `url`: one that is there, not a web page and at most `MAX_SIDECAR`. Its
-/// request takes a slot of the host's as the download's own do, and so waits out its rest.
-async fn fetch_small(client: &Client, auth: Option<&Auth>, limit: usize, url: Url) -> Sidecar {
+/// The checksum file (or Metalink) at `url`: one that is there, not a web page and at most `max`
+/// bytes. Its request takes a slot of the host's as the download's own do, and so waits out its
+/// rest.
+async fn fetch_small(client: &Client, auth: Option<&Auth>, limit: usize, url: Url, max: usize) -> Sidecar {
     let _slot = crate::hosts::acquire(&url, limit).await;
     let request = |url: &Url| authorize(client.get(url.clone()), auth, url).header(ACCEPT_ENCODING, "identity");
     let Ok(mut resp) = send(request, &url).await else { return Sidecar::Unknown };
@@ -330,7 +338,7 @@ async fn fetch_small(client: &Client, auth: Option<&Auth>, limit: usize, url: Ur
     if !status.is_success() {
         return Sidecar::Unknown;
     }
-    if crate::resolver::html_type(resp.headers()) || resp.content_length().is_some_and(|len| len > MAX_SIDECAR as u64) {
+    if crate::resolver::html_type(resp.headers()) || resp.content_length().is_some_and(|len| len > max as u64) {
         return Sidecar::Missing;
     }
     let mut body = Vec::new();
@@ -340,7 +348,7 @@ async fn fetch_small(client: &Client, auth: Option<&Auth>, limit: usize, url: Ur
             Ok(None) => return Sidecar::Text(String::from_utf8_lossy(&body).into_owned()),
             Err(_) => return Sidecar::Unknown,
         }
-        if body.len() > MAX_SIDECAR {
+        if body.len() > max {
             return Sidecar::Missing;
         }
     }
@@ -1173,6 +1181,27 @@ mod tests {
         assert_eq!(published_checksum(&Client::new(), &url, &HeaderMap::new()).await, Some(sha256));
         assert_eq!(sidecars(&log), 1, "the first, found, and no other: {:?}", log.lock().unwrap());
         // That refusal marked nothing kept about the host.
+        assert!(!crate::hosts::kept_limited(&url));
+    }
+
+    /// The Metalink a file's answer names is asked for as a checksum file is: refused (429), no
+    /// checksum file is asked for after it; of a host resting after a refusal, it waits for its
+    /// slot, here longer than the lookups have, so nothing is asked.
+    #[tokio::test]
+    async fn the_metalink_is_asked_for_as_a_checksum_file_is() {
+        let asked = |log: &Arc<std::sync::Mutex<Vec<(String, Option<(u64, u64)>)>>>| log.lock().unwrap().iter().map(|(p, _)| p.clone()).collect::<Vec<_>>();
+        let (url, log) = serve(content(100), Site { sidecars_refused: true, ..Site::default() }).await;
+        let metalink = Some((url.join("file.meta4").unwrap(), Some(100)));
+        assert_eq!(published(&Client::new(), None, 0, &url, &HeaderMap::new(), metalink).await, None);
+        assert_eq!(asked(&log), ["/dir/file.meta4"]);
+
+        let (url, log) = serve(content(100), Site::default()).await;
+        crate::hosts::acquire(&url, 0).await.throttled(Duration::from_secs(60));
+        let metalink = Some((url.join("file.meta4").unwrap(), Some(100)));
+        let (client, headers) = (Client::new(), HeaderMap::new());
+        let looked = tokio::time::timeout(Duration::from_secs(30), published(&client, None, 0, &url, &headers, metalink));
+        assert_eq!(looked.await.expect("within the lookups' time"), None);
+        assert!(asked(&log).is_empty(), "{:?}", asked(&log));
         assert!(!crate::hosts::kept_limited(&url));
     }
 
