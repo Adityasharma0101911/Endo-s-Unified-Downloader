@@ -691,9 +691,9 @@ pub struct DownloadEngine {
     /// Its file passed its checks and took its name (see `finalize`): a stop that came after
     /// takes nothing from it.
     finished: Arc<AtomicBool>,
-    /// Its first link's host refused another download within `hosts::BANNED_FOR` before this one
-    /// began asking it (see `hosts::refused_in_download`).
-    refused_before: Arc<AtomicBool>,
+    /// The hosts that had refused a request within `hosts::BANNED_FOR` when this download began
+    /// asking: one that refuses it too refused another download (see `hosts::refused_in_download`).
+    refused_before: Arc<Mutex<Vec<hosts::HostKey>>>,
 }
 
 impl DownloadEngine {
@@ -2684,7 +2684,8 @@ impl DownloadEngine {
     /// need it. A Google Drive answer that is a web page fails its mirror's probe.
     async fn probe_all(&self, client: &Client, urls: &[Url], snapshot_tx: &Option<broadcast::Sender<EngineSnapshot>>) -> Result<Probed, String> {
         // Before this download asks anything: a refusal of its own probe is no other download's.
-        self.refused_before.store(urls.first().is_some_and(hosts::refused_lately), Ordering::SeqCst);
+        // Every host, as the one a redirect leads to is not known yet.
+        *self.refused_before.lock() = hosts::refusing();
         // Fetching again from the mirror the download went by, the others are left out.
         let urls = if self.site.lock().primary_only { &urls[..urls.len().min(1)] } else { urls };
         let (limiter, stall) = (self.limiter(), self.stall_timeout());
@@ -3079,7 +3080,7 @@ impl DownloadEngine {
         let limited = adapts && late.is_none() && mirrors.len() == 1 && hosts::kept_limited(&reference.final_url);
         // Whether another download was refused by the host lately: one of this one refused too
         // keeps the host as limiting requests (see `hosts::refused_in_download`).
-        let refused_before = self.refused_before.load(Ordering::SeqCst);
+        let refused_before = hosts::among(&self.refused_before.lock(), &reference.final_url);
         let start = autopilot::Start {
             remembered: best.is_some(),
             rate: known.connection_rate.filter(|_| known.capped_per_connection == Some(true)),
@@ -10227,35 +10228,45 @@ mod tests {
     }
 
     /// What a host that keeps a budget of requests showed: one refusal is kept for this run alone.
-    /// Kept as limiting requests (it refused a download again after its rest, see
-    /// `hosts::refused_in_download`), the next download from it after a restart asks it for the
-    /// file alone, in one request it does not refuse, then for the site's checksum files one at a
-    /// time, none after the first it refuses.
+    /// Refused by a download after it had refused another (see `hosts::refused_in_download`), it
+    /// is kept as limiting requests, the host that refused and not the link's, which redirects to
+    /// it: the next download from it after a restart asks it for the file alone, in one request
+    /// it does not refuse.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_a_host_kept_as_limiting_requests_is_asked_little_after_a_restart_too() {
         let size = 8 * 1024 * 1024;
         let budget = crate::netsim::Budget { burst: 4, every: Duration::from_millis(250), retry_after: 1 };
-        let (url, stats) = crate::netsim::serve(crate::netsim::Server { size, per_client: Some(4e6), budget: Some(budget), ..Default::default() }).await;
-        let dir = tempdir().unwrap();
-        let (got, _) = fetch_from_sim(&url, sim_options(dir.path(), 16, true)).await;
-        assert!(got == crate::netsim::file(size));
-        let seen = || (stats.asked.load(Ordering::SeqCst), stats.throttled.load(Ordering::SeqCst));
-        assert!(seen().1 > 0, "the first download found the budget");
-        assert!(!hosts::kept_limited(&url), "one refusal is not kept");
-        hosts::refused_in_download(&url, true);
+        let (url, stats) = crate::netsim::serve(crate::netsim::Server { size, budget: Some(budget), ..Default::default() }).await;
+        let to = url.to_string();
+        let link = answering_server(move |head| match head.split_whitespace().nth(1) {
+            Some("/f.bin") => format!("HTTP/1.1 302 Found\r\nLocation: {to}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
+            _ => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+        })
+        .await
+        .join("f.bin")
+        .unwrap();
+        let refused = || stats.throttled.load(Ordering::SeqCst);
+        // Over all its connections at once, each download is refused.
+        for (download, kept) in [(1, false), (2, true)] {
+            let (dir, before) = (tempdir().unwrap(), refused());
+            let engine = DownloadEngine::new(vec![link.clone()], DownloadOptions { remote_checksum: false, ..sim_options(dir.path(), 16, false) });
+            let path = tokio::time::timeout(Duration::from_secs(60), engine.run(None)).await.expect("finished in a minute").unwrap();
+            assert!(std::fs::read(path).unwrap() == crate::netsim::file(size));
+            assert!(refused() > before, "download {download} found the budget");
+            assert_eq!(hosts::kept_limited(&url), kept, "kept after download {download}");
+            assert!(!hosts::kept_limited(&link), "the link's host refused nothing");
+        }
         hosts::forget_run(&url);
         // The budget fills again meanwhile, and the refusal's rest is over.
         let refilled = (budget.every * budget.burst as u32).max(Duration::from_secs(budget.retry_after));
         tokio::time::sleep(refilled).await;
         let before = stats.log.lock().len();
         let again = tempdir().unwrap();
-        let engine = DownloadEngine::new(vec![url.clone()], sim_options(again.path(), 16, true));
+        let engine = DownloadEngine::new(vec![link.clone()], sim_options(again.path(), 16, true));
         let path = tokio::time::timeout(Duration::from_secs(60), engine.run(None)).await.expect("finished in a minute").unwrap();
         assert!(std::fs::read(path).unwrap() == crate::netsim::file(size));
         let log = stats.log.lock()[before..].to_vec();
-        let file: Vec<_> = log.iter().filter(|(path, _)| path == "/f.bin").collect();
-        assert_eq!(file, [&("/f.bin".to_string(), false)], "the file alone, in one request: {log:?}");
-        assert!(log.iter().rev().skip(1).all(|(_, refused)| !refused), "none after a refusal: {log:?}");
+        assert_eq!(log, [("/f.bin".to_string(), false)], "the file alone, in one request");
     }
 
     /// The (GETs, HEADs) a server saw.

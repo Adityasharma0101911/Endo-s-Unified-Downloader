@@ -149,6 +149,22 @@ pub fn refused_lately(url: &Url) -> bool {
     HOSTS.refused_lately(&HostKey::of(url), clock())
 }
 
+/// The hosts that refused a request (429/503) within `BANNED_FOR`: a download takes them before
+/// it asks anything, to tell whether the host that refuses it, the one a redirect led to, had
+/// refused another download (see [`refused_in_download`], [`among`]).
+pub(crate) fn refusing() -> Vec<HostKey> {
+    let now = clock();
+    let entries = HOSTS.entries.lock();
+    let refused = entries.iter().filter(|(_, entry)| entry.refused.is_some_and(|(at, _)| now.saturating_duration_since(at) < BANNED_FOR));
+    refused.map(|(key, _)| key.clone()).collect()
+}
+
+/// Whether `url`'s host, on any route, is among `hosts`.
+pub(crate) fn among(hosts: &[HostKey], url: &Url) -> bool {
+    let key = HostKey::of(url);
+    hosts.iter().any(|other| (&other.scheme, &other.host, other.port) == (&key.scheme, &key.host, key.port))
+}
+
 /// How long `url`'s host, on any route, still rests after refusing a request: zero when it does not.
 pub(crate) fn rest_left(url: &Url) -> Duration {
     HOSTS.rest_left(&HostKey::of(url), clock())
@@ -182,7 +198,7 @@ pub(crate) fn refused_in_download(url: &Url, again: bool) {
     if last.is_some_and(|(until, _)| now < until) || !(again || last.is_some()) {
         return;
     }
-    let hours = last.map_or(LIMITED_HOURS, |(_, hours)| (hours * 2).min(MOST_LIMITED_HOURS));
+    let hours = last.map_or(LIMITED_HOURS, |(_, hours)| hours.saturating_mul(2).min(MOST_LIMITED_HOURS));
     HOSTS.keep(&key, now, |kept| kept.limited = Some((now + hours * 3600, hours)))
 }
 
@@ -710,17 +726,26 @@ struct Memory {
 
 impl Memory {
     /// Drops what is older than `KEPT_FOR` or tells nothing, and past `KEEP_KEPT` what was
-    /// learned first.
-    fn prune(&mut self, now: u64) {
-        self.hosts.retain(|_, kept| kept.trusted(now).tells());
+    /// learned first: what is kept is only what is trusted (see `Kept::trusted`). Whether that
+    /// changed anything.
+    fn prune(&mut self, now: u64) -> bool {
+        let before = self.hosts.clone();
+        for kept in self.hosts.values_mut() {
+            *kept = kept.trusted(now);
+        }
+        self.hosts.retain(|_, kept| kept.tells());
         if self.hosts.len() > KEEP_KEPT {
             let mut ages: Vec<u64> = self.hosts.values().map(Kept::newest).collect();
             ages.sort_unstable_by(|a, b| b.cmp(a));
             let oldest_kept = ages[KEEP_KEPT - 1];
             self.hosts.retain(|_, kept| kept.newest() >= oldest_kept);
         }
+        self.hosts != before
     }
 }
+
+/// Saves of `Memory` one at a time, each writing the file outside its lock (see `Hosts::save`).
+static SAVING: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Default)]
 struct Hosts {
@@ -735,20 +760,31 @@ impl Hosts {
     fn keep_in(&self, file: PathBuf, now: u64) {
         let read = std::fs::read(&file).ok().and_then(|bytes| serde_json::from_slice::<HashMap<String, Kept>>(&bytes).ok());
         let mut memory = self.kept.lock();
-        for (origin, kept) in read.unwrap_or_default() {
+        for (origin, mut kept) in read.unwrap_or_default() {
+            // A clock set wrong when it was kept, or an edit, holds a host no longer than a run would.
+            let most = now.saturating_add(MOST_LIMITED_HOURS * 3600);
+            kept.limited = kept.limited.map(|(until, hours)| (until.min(most), hours.min(MOST_LIMITED_HOURS)));
             memory.hosts.entry(origin).or_insert(kept);
         }
-        memory.prune(now);
+        // What is past its age leaves the file at the next save.
+        if memory.prune(now) {
+            memory.changed = true;
+        }
         memory.file = Some(file);
     }
 
     fn save(&self, now: u64) {
-        let mut memory = self.kept.lock();
-        let Some(file) = memory.file.clone().filter(|_| memory.changed) else { return };
-        memory.prune(now);
+        let _saving = SAVING.lock();
+        let (file, bytes) = {
+            let mut memory = self.kept.lock();
+            let Some(file) = memory.file.clone().filter(|_| memory.changed) else { return };
+            memory.prune(now);
+            memory.changed = false;
+            (file, serde_json::to_vec(&memory.hosts))
+        };
         // shortcut: the last process to save wins (the CLI's run beside the app's); merge with the
         // file first if what one learns going missing ever matters.
-        let written = serde_json::to_vec(&memory.hosts).map_err(std::io::Error::from).and_then(|bytes| {
+        let written = bytes.map_err(std::io::Error::from).and_then(|bytes| {
             if let Some(dir) = file.parent() {
                 std::fs::create_dir_all(dir)?;
             }
@@ -756,9 +792,9 @@ impl Hosts {
             std::fs::write(&tmp, bytes)?;
             std::fs::rename(&tmp, &file)
         });
-        match written {
-            Ok(()) => memory.changed = false,
-            Err(e) => tracing::warn!("Could not save what is known of hosts to {}: {}", file.display(), e),
+        if let Err(e) = written {
+            self.kept.lock().changed = true;
+            tracing::warn!("Could not save what is known of hosts to {}: {}", file.display(), e);
         }
     }
 
@@ -1485,6 +1521,27 @@ mod tests {
         assert_eq!(after.kept(&host, later).and_then(|kept| kept.ranges), Some((true, now)));
         // Each is found out again once its age is over.
         assert_eq!(after.kept(&host, now + KEPT_FOR.as_secs()), None);
+    }
+
+    /// What the file holds is held to what a run keeps: a host is kept as limiting requests no
+    /// longer than a day from now (after a clock set wrong, or an edit), and a fact past its age
+    /// leaves the file, also while another of the host's is still trusted.
+    #[test]
+    fn test_what_the_file_holds_is_held_to_its_age() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("hosts.json");
+        let now = unix_now();
+        let stale = now - KEPT_FOR.as_secs() - 1;
+        let kept = Kept { limited: Some((u64::MAX, u64::MAX)), ranges: Some((true, stale)), speed: Some((1e6, now)), at: now, ..Kept::default() };
+        let origin = key("https://clock.example/f.bin").origin().unwrap();
+        std::fs::write(&file, serde_json::to_vec(&HashMap::from([(origin.clone(), kept)])).unwrap()).unwrap();
+        let hosts = leaked();
+        hosts.keep_in(file.clone(), now);
+        let (until, hours) = hosts.kept(&key("https://clock.example/f.bin"), now).and_then(|kept| kept.limited).unwrap();
+        assert!(until <= now + MOST_LIMITED_HOURS * 3600 && hours == MOST_LIMITED_HOURS, "{until} {hours}");
+        hosts.save(now);
+        let saved: HashMap<String, Kept> = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert_eq!((saved[&origin].ranges, saved[&origin].speed), (None, Some((1e6, now))), "the stale fact left the file");
     }
 
     /// One refusal keeps nothing; a download refused after another was, once the host's rest was
