@@ -46,8 +46,8 @@ const SHOW_WINDOW: Duration = Duration::from_millis(100);
 const QUICK_WINDOW: Duration = Duration::from_millis(10);
 const LONGEST_WINDOW: Duration = Duration::from_millis(300);
 const SHOW_BYTES: u64 = 1024 * 1024;
-const CALM: u32 = 2;
-const CLIMB: f64 = 0.05;
+pub(crate) const CALM: u32 = 2;
+pub(crate) const CLIMB: f64 = 0.05;
 const MAX_SHOW: Duration = Duration::from_secs(5);
 /// One more connection beside the first stream pays when the two together go this many times as
 /// fast as the stream alone at its best: what one reading of a real line is off by, or the
@@ -381,7 +381,8 @@ impl Autopilot {
     /// `MAX_SHOW` after the answer. Over the windows from its fastest on, the width it goes to:
     /// all it was to open when the two together went `PAY` times as fast as the stream alone, for
     /// the climb to go on from, or when they did not but the stream kept its speed beside the new
-    /// connection, which was then slow of its own (one fading out, say) and not held with it; else
+    /// connection, which was then slow of its own and not held with it: it faded to half its
+    /// fastest or less (one cut off or fading out), where one on a full line climbs; else
     /// the stream alone, the line or the host being what holds them both, which is kept as the
     /// host's limit.
     pub(crate) fn judge(&mut self, now: Instant, downloaded: u64, first: u64, answered: bool, startup: Duration) -> Option<usize> {
@@ -411,7 +412,7 @@ impl Autopilot {
             _ => (beside.best, beside.calm) = (Some(((at, all, own), newcomer)), 0),
         }
         let settled = beside.calm >= Reading::calm(elapsed, startup) || now.saturating_duration_since(beside.since) >= MAX_SHOW;
-        let Some(((at, all, own), _)) = beside.best.filter(|_| settled) else {
+        let Some(((at, all, own), fastest)) = beside.best.filter(|_| settled) else {
             return None;
         };
         let secs = now.saturating_duration_since(at).as_secs_f64();
@@ -422,10 +423,23 @@ impl Autopilot {
         if both >= PAY * base {
             return self.open_to(target, now, downloaded, paid);
         }
-        if kept * (1.0 + AGREE) >= base {
+        // Slow of its own, the new connection faded after its start (cut off, or fading out): one
+        // that arrives on a line the stream fills gets little and climbs slowly, taking from the
+        // stream what it gains, and what the stream loses is then too little to tell.
+        if kept * (1.0 + AGREE) >= base && both - kept <= fastest / 2.0 {
             return self.open_to(target, now, downloaded, Why::Beside(base));
         }
         let why = self.held(both.max(base));
+        self.settle(1, why)
+    }
+
+    /// The first stream reached the piece of the connection beside it before the verdict, and
+    /// took it back (see `ChunkManager::overtaken`): the two did not make it faster, and the
+    /// stream goes on alone, the host kept as one stream fills. The width, if it changes.
+    pub(crate) fn overtaken(&mut self) -> Option<usize> {
+        let base = self.judging.take()?.base;
+        self.best = self.best.max(base);
+        let why = self.held(base);
         self.settle(1, why)
     }
 
@@ -959,8 +973,9 @@ mod tests {
     /// One more beside the stream is judged by what it brings of its own, once its own speed
     /// stopped climbing (see [`Autopilot::judge`]): all the rest open when the two together go
     /// `PAY` times as fast as the stream alone at its best, or when they do not but the stream kept
-    /// that speed beside a new connection slow of its own (one fading out, say); else the stream
-    /// alone goes on, and the speed it held is kept as the host's limit.
+    /// that speed beside a new connection slow of its own (one fading out, say), not one that climbs
+    /// slowly on a line the stream fills; else the stream alone goes on, and the speed it held is
+    /// kept as the host's limit. So too when the stream reaches the new connection's piece first.
     #[test]
     fn test_one_more_opens_the_rest_only_if_it_pays() {
         // A line of 4 MB/s the two share once the new connection's climb is over: a young one takes
@@ -988,6 +1003,18 @@ mod tests {
         assert_eq!(decided, Some((300, 8)), "{}", pilot.why());
         assert!(!pilot.done && pilot.limit().is_none(), "{}", pilot.why());
         assert!(pilot.why().starts_with("8 connections: the first kept its 3.8 MiB/s beside a second, which was slow of its own"), "{}", pilot.why());
+        // On a line the stream fills, the new connection gets 2 % of it and gains 2 % a second,
+        // taken from the stream: the stream keeps over 90 %, but the other climbs, not slow of its
+        // own.
+        let full: Vec<(f64, f64)> = (0..50).map(|k| 0.08 + 0.008 * k as f64).map(|newcomer| (4.0 - newcomer, newcomer)).collect();
+        let (pilot, decided) = judged(100, 4.0, &full);
+        assert!(decided.is_some_and(|(_, width)| width == 1), "{decided:?}: {}", pilot.why());
+        assert!(pilot.limit().is_some_and(|limit| (limit / 4e6 - 1.0).abs() < 0.05), "{:?}", pilot.limit());
+        // The stream reached the new connection's piece before the verdict: the stream alone.
+        let (mut pilot, _) = judged(100, 4.0, &full[..3]);
+        assert!(pilot.is_judging());
+        assert_eq!((pilot.overtaken(), pilot.done, pilot.settled, pilot.is_judging()), (Some(1), true, Some(1), false));
+        assert!(pilot.limit().is_some_and(|limit| (limit / 4e6 - 1.0).abs() < 0.05), "{:?}", pilot.limit());
         // Refused while it widened, the host serving two: those, and no more.
         let (mut pilot, _) = judged(100, 4.0, &[]);
         assert_eq!((pilot.took(2), pilot.done, pilot.settled), (None, true, Some(2)));

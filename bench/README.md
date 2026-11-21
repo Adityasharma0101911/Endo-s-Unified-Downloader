@@ -8,10 +8,11 @@ Autopilot off, the engine's own speed, and again as the Autopilot's first visit,
 past one request), a server that caps each
 connection, one that caps all of a user's connections together, a long link (150 ms to answer, a
 cap per connection), a lossy one (one connection cut off, one fading out), a host that answers 429
-past 6 requests a second, a far host on a line one stream fills (`far_line`: 220 ms to answer,
-each connection climbing from a 128th of the line's 12 MB/s by doubling every 110 ms, 429 with a
-rest of 10 s past 4 requests in 10 s; with the Autopilot, against `far_line_stream`, one GET of the
-file), 2,000 small files (with and without the SHA-256 a listing gives), and a
+past 6 requests a second, a far host on a line one stream fills (`far_line`: 220 ms to answer, a
+connection alone climbing from a 128th of the line's 12 MB/s by doubling every 110 ms, one more
+beside it getting 2 % of the line and gaining 2 % a second, taken from the first, as on a real
+line, 429 with a rest of 10 s past 4 requests in 10 s; with the Autopilot, against
+`far_line_stream`, one GET of the file), 2,000 small files (with and without the SHA-256 a listing gives), and a
 single HTTP/2 download over a 100 ms round trip with hyper's flow-control windows and with the
 engine's. Every downloaded file is checked byte by byte; at most 128 MiB is on disk at once.
 

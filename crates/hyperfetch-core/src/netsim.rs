@@ -49,6 +49,8 @@ pub(crate) struct Server {
     pub slow_start: Option<(f64, Duration)>,
     /// Bytes per second all connections share: a cap that more connections do not raise.
     pub per_client: Option<f64>,
+    /// A line the connections share as a real one does (see [`Line`]), in place of the caps above.
+    pub line: Option<Line>,
     /// GETs served at once; one more is refused with `refusal`.
     pub max_connections: Option<usize>,
     /// The status and Retry-After seconds of a refusal.
@@ -106,15 +108,100 @@ pub(crate) struct Budget {
 }
 
 /// A far host on a line one stream fills, as the real one that took the Autopilot's first stream's
-/// climb for what a second brought: 110 ms away, so a connection's first byte comes 220 ms after
-/// it starts (its connect and its answer); each connection starts at a 128th of the line and
-/// doubles every 110 ms, as its congestion window grows; all of a client's connections share the
-/// line's 12 MB/s; and a fifth request within 10 s is refused with 429 and a rest of 10 s.
+/// climb for what a second brought, and then left that second to crawl: 110 ms away, so a
+/// connection's first byte comes 220 ms after it starts (its connect and its answer); a line of
+/// 12 MB/s shared as a real one is (see [`Line`]): a connection on it alone starts at a 128th of it
+/// and doubles every 110 ms, one more beside a stream that fills it gets 2 % of it and gains 2 % a
+/// second; and a fifth request within 10 s is refused with 429 and a rest of 10 s.
 pub(crate) fn far_line(size: usize) -> Server {
     let rate = RateLimit { requests: 4, window: Duration::from_secs(10), retry_after: 10, ban_after: usize::MAX, ban: Duration::ZERO };
-    let slow_start = Some((1.0 / 128.0, Duration::from_millis(110)));
-    Server { size, per_connection: Some(12e6), per_client: Some(12e6), slow_start, first_byte: Duration::from_millis(220), rate: Some(rate), ..Default::default() }
+    let line = Line { rate: 12e6, start: 1.0 / 128.0, doubling: Duration::from_millis(110), late: 0.02, gain: 0.02 };
+    Server { size, line: Some(line), first_byte: Duration::from_millis(220), rate: Some(rate), ..Default::default() }
 }
+
+/// A line of `rate` bytes per second a client's connections share as a real one is, not in equal
+/// parts. A connection on a line with room starts at `start` of it and doubles every `doubling`, as
+/// its congestion window grows, until the line is full. One that comes on a full line loses packets
+/// at once and leaves that start with a small window: it gets `late` of the line, and from then on
+/// gains `gain` of it a second, taken from those there in proportion to what they have. So does
+/// every connection once the line was full, while there is room: one left alone when the others
+/// end goes on gaining as slowly.
+#[derive(Clone, Copy)]
+pub(crate) struct Line {
+    pub rate: f64,
+    pub start: f64,
+    pub doubling: Duration,
+    pub late: f64,
+    pub gain: f64,
+}
+
+/// A line counts as full for a connection that comes once those on it have this share of it.
+const FULL: f64 = 0.9;
+
+/// The connections on a [`Line`]: each one's id, speed, and whether it still doubles, as of `at`.
+#[derive(Default)]
+struct Flows {
+    flows: Vec<(u64, f64, bool)>,
+    at: Option<std::time::Instant>,
+    next: u64,
+}
+
+impl Flows {
+    /// Moves every connection's speed on to `now`.
+    fn advance(&mut self, line: &Line, now: std::time::Instant) {
+        let secs = self.at.map_or(0.0, |at| now.saturating_duration_since(at).as_secs_f64());
+        self.at = Some(now);
+        for (_, speed, doubling) in &mut self.flows {
+            *speed = match doubling {
+                true => *speed * 2f64.powf(secs / line.doubling.as_secs_f64()),
+                false => *speed + line.gain * line.rate * secs,
+            };
+        }
+        let total: f64 = self.flows.iter().map(|flow| flow.1).sum();
+        if total > line.rate {
+            for (_, speed, doubling) in &mut self.flows {
+                (*speed, *doubling) = (*speed * line.rate / total, false);
+            }
+        }
+    }
+
+    /// A connection comes on the line at `now`, what it gets taken from those there: its id.
+    fn join(&mut self, line: &Line, now: std::time::Instant) -> u64 {
+        self.advance(line, now);
+        let there = self.flows.iter().map(|flow| flow.1).sum::<f64>();
+        let (full, speed) = match there >= FULL * line.rate {
+            true => (true, line.late * line.rate),
+            false => (false, line.start * line.rate),
+        };
+        if there + speed > line.rate {
+            for flow in &mut self.flows {
+                flow.1 *= (line.rate - speed) / there;
+            }
+        }
+        self.next += 1;
+        self.flows.push((self.next, speed, !full));
+        self.next
+    }
+
+    /// Connection `id`'s speed at `now`.
+    fn speed(&mut self, line: &Line, id: u64, now: std::time::Instant) -> f64 {
+        self.advance(line, now);
+        self.flows.iter().find(|flow| flow.0 == id).map_or(line.rate, |flow| flow.1)
+    }
+}
+
+/// A connection on a [`Line`], which leaves it once dropped.
+struct OnLine<'a>(&'a parking_lot::Mutex<Flows>, u64);
+
+impl Drop for OnLine<'_> {
+    fn drop(&mut self) {
+        self.0.lock().flows.retain(|flow| flow.0 != self.1);
+    }
+}
+
+/// How far behind its due time a connection on a [`Line`] may be and catch up: a coarse timer wakes
+/// it late, which it must not lose.
+const CATCH_UP: Duration = Duration::from_millis(20);
 
 /// A request that comes this long after a 429, within the rest it asked for, came too early: one
 /// sent before the 429 arrived may come a little later.
@@ -259,6 +346,7 @@ pub(crate) async fn serve(server: Server) -> (Url, Arc<Stats>) {
     let (server, stats) = (Arc::new(server), Arc::new(Stats::default()));
     let shared = server.per_client.map(|rate| Arc::new(RateLimiter::new(rate as u64)));
     let limiting = Arc::new(parking_lot::Mutex::new(Limiting::default()));
+    let flows = Arc::new(parking_lot::Mutex::new(Flows::default()));
     let seen = Arc::clone(&stats);
     tokio::spawn(async move {
         while let Ok((socket, _)) = listener.accept().await {
@@ -266,7 +354,7 @@ pub(crate) async fn serve(server: Server) -> (Url, Arc<Stats>) {
                 seen.shut.fetch_add(1, Ordering::SeqCst);
                 continue;
             }
-            tokio::spawn(answer(socket, Arc::clone(&server), Arc::clone(&seen), shared.clone(), Arc::clone(&limiting)));
+            tokio::spawn(answer(socket, Arc::clone(&server), Arc::clone(&seen), shared.clone(), Arc::clone(&limiting), Arc::clone(&flows)));
         }
     });
     (url, stats)
@@ -278,6 +366,7 @@ async fn answer(
     stats: Arc<Stats>,
     shared: Option<Arc<RateLimiter>>,
     limiting: Arc<parking_lot::Mutex<Limiting>>,
+    flows: Arc<parking_lot::Mutex<Flows>>,
 ) {
     let mut head = Vec::new();
     let mut buf = [0u8; 4096];
@@ -376,6 +465,8 @@ async fn answer(
     let cut = server.cut.filter(|&(from, _)| first(from, &stats.cut)).map(|(_, after)| after);
     let own = server.per_connection.map(|rate| RateLimiter::new(rate as u64));
     let (mut sent, mut slowed, began) = (0, None, tokio::time::Instant::now());
+    let on_line = server.line.map(|line| (line, OnLine(&flows, flows.lock().join(&line, std::time::Instant::now()))));
+    let mut due = began;
     let (mut from_client, mut to_client) = socket.split();
     for offset in (start..=end).step_by(PIECE) {
         let mut piece = std::borrow::Cow::Borrowed(bytes_at(offset, end.min(offset + PIECE - 1) + 1 - offset));
@@ -394,6 +485,14 @@ async fn answer(
                     let rate = decay.rate / 2f64.powf(since.elapsed().as_secs_f64() / decay.every.as_secs_f64());
                     tokio::time::sleep(if rate < 1024.0 { HOLD } else { Duration::from_secs_f64(piece.len() as f64 / rate) }).await;
                     rate >= 1024.0
+                }
+                None if on_line.is_some() => {
+                    let (line, OnLine(flows, id)) = on_line.as_ref().expect("on a line");
+                    let speed = flows.lock().speed(line, *id, std::time::Instant::now());
+                    let now = tokio::time::Instant::now();
+                    due = due.max(now - CATCH_UP) + Duration::from_secs_f64(piece.len() as f64 / speed);
+                    tokio::time::sleep_until(due).await;
+                    true
                 }
                 None => {
                     // Paced by the bytes sent in all, which a coarse timer cannot make faster: at
@@ -575,6 +674,34 @@ mod tests {
         let (url, _) = serve(Server { size, cut: Some((0, 64 * 1024)), ..Default::default() }).await;
         assert!(get(&url, Some((0, size - 1))).await.bytes().await.is_err(), "cut off");
         assert_eq!(get(&url, Some((0, size - 1))).await.bytes().await.unwrap().len(), size);
+    }
+
+    /// On a line as `far_line` has it: a connection alone doubles from a 128th of it to all of it
+    /// in 0.77 s; one more then gets 2 % and gains 2 % a second, taken from the first; once the
+    /// first leaves, it goes on gaining as slowly. Two that come on a line with room both double
+    /// and share it as they reached it.
+    #[test]
+    fn test_a_line_is_shared_as_a_real_one_is() {
+        let line = far_line(0).line.unwrap();
+        let (t0, mut flows) = (std::time::Instant::now(), Flows::default());
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let first = flows.join(&line, at(0));
+        assert!((flows.speed(&line, first, at(0)) - 12e6 / 128.0).abs() < 1.0);
+        assert!((flows.speed(&line, first, at(440)) - 12e6 / 8.0).abs() < 1e3, "four doublings");
+        assert!((flows.speed(&line, first, at(1000)) - 12e6).abs() < 1.0, "the line is full");
+        let second = flows.join(&line, at(1000));
+        assert!((flows.speed(&line, second, at(1000)) - 240e3).abs() < 1.0);
+        let (two, one) = (flows.speed(&line, second, at(4000)), flows.speed(&line, first, at(4000)));
+        assert!((700e3..=960e3).contains(&two), "{two}: about 2 % more of the line a second");
+        assert!((two + one - 12e6).abs() < 1.0, "{one}: what it gains, the first loses");
+        flows.flows.remove(0);
+        let alone = flows.speed(&line, second, at(5000));
+        assert!((alone - two - 240e3).abs() < 1e3, "{alone}: alone, it still gains as slowly");
+
+        let mut flows = Flows::default();
+        let (a, b) = (flows.join(&line, at(0)), flows.join(&line, at(0)));
+        let (a, b) = (flows.speed(&line, a, at(2000)), flows.speed(&line, b, at(2000)));
+        assert!((a - 6e6).abs() < 1.0 && (b - 6e6).abs() < 1.0, "{a} {b}");
     }
 
     /// The model's readings: the least of its caps, off by its noise at most, the same for the

@@ -1956,6 +1956,38 @@ mod tests {
         assert!(std::fs::read(&path).unwrap().iter().all(|&b| b == 0));
     }
 
+    /// Two workers and one chunk of 8 MiB, from a server whose connections each start at a 128th of
+    /// 12 MB/s and double every 110 ms, the mirror known to go at 12 MB/s: the idle worker does not
+    /// take the chunk over while its connection still climbs, nor is its own taken in turn while it
+    /// does. One request brings the file, as its connection fills the line once it climbed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_connection_still_climbing_is_not_taken_over() {
+        let size = 8 * 1024 * 1024;
+        let server = crate::netsim::Server { size, per_connection: Some(12e6), slow_start: Some((1.0 / 128.0, Duration::from_millis(110))), ..Default::default() };
+        let (url, stats) = crate::netsim::serve(server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.part");
+        let (worker, _, mut events) = test_worker(&url, &path, size as u64);
+        let shared = worker.shared.clone();
+        *shared.chunks.lock() = ChunkManager::new(size as u64, size as u64).unwrap();
+        shared.mirrors.lock().get_mirror_mut(0).unwrap().speed_ewma = 12e6;
+        tokio::spawn(async move { while events.recv().await.is_some() {} });
+        let workers: Vec<_> = (0..2).map(|id| tokio::spawn(HttpWorker::new(id, shared.clone()).run(None))).collect();
+        let done = tokio::time::timeout(Duration::from_secs(20), async {
+            while !shared.chunks.lock().is_all_completed() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        let done = done.await.is_ok();
+        shared.cancel.cancel();
+        for worker in workers {
+            worker.await.unwrap();
+        }
+        let gets = stats.gets.load(Ordering::SeqCst);
+        assert!(done && gets == 1, "{gets} requests, done {done}:\n{}", stats.wire());
+        assert!(std::fs::read(&path).unwrap() == crate::netsim::file(size));
+    }
+
     /// A newcomer reads its 429 while the stream its piece was cut from takes the piece back: the
     /// refusal is still a fact about the host, kept against the mirror and told to the engine.
     #[test]

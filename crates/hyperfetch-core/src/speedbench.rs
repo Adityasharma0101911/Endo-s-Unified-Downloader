@@ -123,12 +123,13 @@ fn scenarios() -> Vec<Scenario> {
             files: Files::One(32 * MIB),
             runs: 3,
         },
-        // A far host on a line one stream fills, slow to climb, that refuses a fifth request within
-        // 10 s (see `netsim::far_line`): `bench/sim-thresholds.json` holds the Autopilot to the time
-        // one stream takes there, none of its requests refused.
+        // A far host on a line one stream fills, shared as a real one is (one more connection gets
+        // 2 % of it and gains 2 % a second), that refuses a fifth request within 10 s (see
+        // `netsim::far_line`): `bench/sim-thresholds.json` holds the Autopilot to the time one
+        // stream takes there, none of its requests refused.
         Scenario {
             name: "far_line_stream",
-            what: "64 MiB in one GET, 110 ms away, climbing from little, 12 MB/s shared, 4 requests in 10 s",
+            what: "64 MiB in one GET, 110 ms away, a 12 MB/s line shared as a real one, 4 requests in 10 s",
             server: netsim::far_line(0),
             files: Files::Stream(64 * MIB),
             runs: 3,

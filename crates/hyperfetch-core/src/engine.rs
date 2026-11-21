@@ -3355,8 +3355,14 @@ impl DownloadEngine {
                         if !offline.is_empty() {
                             pilot.waiting(Instant::now(), job.chunks.lock().total_received());
                         }
+                        let judged = pilot.is_judging();
                         next = next.or_else(|| job.steer(pilot));
                         job.ramp.judging(pilot.is_judging());
+                        // A "no" drops the connection on trial where the first stream brings its
+                        // piece sooner (see `ChunkManager::verdict`).
+                        if judged && !pilot.is_judging() && job.chunks.lock().verdict(!pilot.done) {
+                            tracing::info!("Autopilot: the connection beside the first stream is dropped; the stream goes on over its piece");
+                        }
                         let now = pilot.why();
                         if why.as_ref() != Some(&now) {
                             tracing::info!("Autopilot: {}", now);
@@ -3385,7 +3391,14 @@ impl DownloadEngine {
                         // last step, the far halves stay with the requests that stream them.
                         if next > was && job.ramp.may_widen() {
                             let setup = job.setup();
-                            let newcomers = job.chunks.lock().halve(next - was, MIN_STEAL, setup);
+                            let mut chunks = job.chunks.lock();
+                            let newcomers = chunks.halve(next - was, MIN_STEAL, setup);
+                            // One more beside the first stream, judged: its piece is the stream's
+                            // until the verdict (see `ChunkManager::on_trial`).
+                            if newcomers == 1 && pilot.as_ref().is_some_and(|pilot| pilot.is_judging()) {
+                                chunks.on_trial();
+                            }
+                            drop(chunks);
                             job.ramp.widen_from(was, newcomers);
                             quick_until = Instant::now() + QUICK_TICKS_FOR;
                         }
@@ -4803,6 +4816,9 @@ impl RangeJob {
             return pilot.open(now, downloaded, left, setup, rate, cap);
         }
         if pilot.is_judging() {
+            if self.chunks.lock().overtaken() {
+                return pilot.overtaken();
+            }
             return pilot.judge(now, downloaded, first, self.widened_to(2), setup.unwrap_or_default());
         }
         // Refused meanwhile, as its checksum files may be: the first stream's request brings what
@@ -10580,6 +10596,7 @@ mod tests {
             let (got, said) = fetch_told(&url, sim_options(dir.path(), 16, true)).await;
             let took = started.elapsed();
             let at = format!("visit {visit}: {took:?} against {one_stream:?} for one GET{}", told(&said, &stats));
+            eprintln!("{at}");
             assert!(got == crate::netsim::file(size), "{at}");
             let refused = stats.throttled.load(Ordering::SeqCst) + stats.refused.load(Ordering::SeqCst);
             assert!(refused == 0 && took <= one_stream * 115 / 100, "{refused} refused, {at}");
@@ -10806,11 +10823,11 @@ mod tests {
         let (url, stats) = crate::netsim::serve(server).await;
         let dir = tempdir().unwrap();
         let started = Instant::now();
-        let (got, said) = fetch_from_sim(&url, sim_options(dir.path(), 8, true)).await;
+        let (got, said) = fetch_told(&url, sim_options(dir.path(), 8, true)).await;
         let took = started.elapsed();
         assert!(got == crate::netsim::file(size));
         let one_stream = Duration::from_secs_f64(size as f64 / per_connection);
-        assert!(stats.peak.load(Ordering::SeqCst) > 2 && took < one_stream / 2, "{took:?} against {one_stream:?}, {said:?}");
+        assert!(stats.peak.load(Ordering::SeqCst) > 2 && took < one_stream / 2, "{took:?} against {one_stream:?}{}", told(&said, &stats));
     }
 
     /// A host 100 ms away met before, which took four requests at once and refused a fifth, and

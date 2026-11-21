@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use crate::autopilot::{CALM, CLIMB};
 use crate::range::{ByteRange, RangeError};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -142,6 +143,11 @@ struct Attempt {
     fastest: f64,
     /// Bytes per second over its worker's last `RECENT`.
     recent: Option<f64>,
+    /// Its fastest `RECENT` window (one more than `CLIMB` faster than the fastest before), and the
+    /// windows since that were not: fewer than `CALM`, its speed still climbs (see
+    /// [`Chunk::climbing`]).
+    lately_best: f64,
+    calm: u32,
     /// The last byte its request asked for (0 until told): the answer brings the bytes up to it
     /// whatever the chunk's end became since (see [`ChunkManager::strand_nothing`]).
     asked: u64,
@@ -212,7 +218,20 @@ impl Chunk {
 
     /// The attempt went at `rate` bytes per second over its worker's last `RECENT`.
     pub(crate) fn went_lately(&self, rate: f64) {
-        self.attempt.lock().recent = Some(rate);
+        let mut attempt = self.attempt.lock();
+        attempt.recent = Some(rate);
+        match rate > (1.0 + CLIMB) * attempt.lately_best {
+            true => (attempt.lately_best, attempt.calm) = (rate, 0),
+            false => attempt.calm += 1,
+        }
+    }
+
+    /// Whether the attempt's speed still climbs, as a new connection's does for a while after its
+    /// answer, on a line where others have their share for seconds: its fastest `RECENT` window
+    /// passed in none of the `CALM` after it yet, as `autopilot` reads a speed. Such a connection
+    /// is no crawling one, however little it brought since its answer.
+    fn climbing(&self) -> bool {
+        self.attempt.lock().calm < CALM
     }
 
     /// Bytes still to arrive before the (possibly stolen-from) end: what the worker holds to
@@ -320,6 +339,16 @@ pub struct ChunkManager {
     /// dropped without an answer, as its piece was taken back (see `take_after`). Every later cut
     /// and steal leaves the request it splits at least that much of its own.
     setup: Duration,
+    /// How long the first stream took from its answer to show its speed, when it was first halved
+    /// (see `halve`): a new connection to the host climbs as long before it goes at its mirror's
+    /// speed (see `take_over_slow`).
+    climb: Duration,
+    /// The piece cut off the first stream for one more connection the Autopilot judges, the
+    /// stream's until the verdict (see [`ChunkManager::on_trial`]).
+    trial: Option<usize>,
+    /// The first stream reached that piece before the verdict and took it back (see
+    /// [`ChunkManager::overtaken`]).
+    overtaken: bool,
 }
 
 impl ChunkManager {
@@ -378,6 +407,9 @@ impl ChunkManager {
             replaced_at: None,
             stream: None,
             setup: Duration::ZERO,
+            climb: Duration::ZERO,
+            trial: None,
+            overtaken: false,
         })
     }
 
@@ -529,17 +561,21 @@ impl ChunkManager {
     /// mirror's `timing`, would bring it `STEAL_MIN_STARTUPS` times sooner than the chunk's worker
     /// at its pace: a tail too short to split (see [`ChunkManager::steal_work`]), left to a
     /// connection fading out, which may never bring it, as [`ChunkManager::take_over_silent`].
+    /// Not one whose speed still climbs (see [`Chunk::climbing`]), as one just answered or just
+    /// taken over does: little since its answer is no crawl, and its thief's would climb as well.
+    /// The thief's request is reckoned at its mirror's speed only after that climb, as long as the
+    /// first stream's took (see `ChunkManager::climb`).
     pub(crate) fn take_over_slow(&mut self, thief_worker_id: usize, thief_mirror_id: usize, timing: &[StealTiming]) -> Option<Chunk> {
         let thief = timing.get(thief_mirror_id).filter(|t| t.rate > 0.0)?;
         let now = Instant::now();
         let (id, _) = self
             .chunks
             .iter()
-            .filter(|c| c.is_in_flight() && self.fatal.is_none())
+            .filter(|c| c.is_in_flight() && self.fatal.is_none() && !c.climbing())
             .filter_map(|c| {
                 let (left, pace) = (c.unreceived(), c.pace(now, None));
                 let theirs = eta_secs(left, pace);
-                let ours = thief.startup.as_secs_f64() + left as f64 / thief.rate;
+                let ours = (thief.startup + self.climb).as_secs_f64() + left as f64 / thief.rate;
                 (left > 0 && pace.is_some() && theirs > STEAL_MIN_STARTUPS * ours).then_some((c.id, theirs))
             })
             .max_by(|a, b| a.1.total_cmp(&b.1))?;
@@ -778,6 +814,7 @@ impl ChunkManager {
             chunk.end_offset.store(at - 1, Ordering::SeqCst);
             chunk.range.end = at - 1;
             if self.stream.is_none() {
+                self.climb = chunk.attempt.lock().answered.map_or(Duration::ZERO, |(at, _)| now.saturating_duration_since(at));
                 self.stream = Some((id, Arc::clone(&chunk.attempt)));
             }
             let piece = Chunk::new(self.chunks.len(), ByteRange { start: at, end });
@@ -861,12 +898,15 @@ impl ChunkManager {
 
     /// Merges into chunk `id` the pieces right after its end that start by `reach`, as far as its
     /// request asked, that failed, with `fresh` that no worker has taken yet, and with `back` whose
-    /// request has no answer yet (that request is dropped, see [`ChunkManager::run_on`]). Its end
-    /// then.
+    /// request has no answer yet (that request is dropped, see [`ChunkManager::run_on`]), or that
+    /// is on trial, as the first stream reached it before the verdict, if the stream brings it
+    /// sooner than its newcomer (see [`ChunkManager::outpaces`]). Its end then.
     fn take_after(&mut self, id: usize, reach: u64, fresh: bool, back: bool) -> u64 {
         let asked = self.chunks[id].attempt.lock().asked;
         let mut end = self.chunks[id].end_offset.load(Ordering::SeqCst);
         let now = Instant::now();
+        let first = self.stream.as_ref().is_some_and(|(stream, _)| *stream == id);
+        let trial = self.trial.filter(|&trial| back && first && self.outpaces(id, trial, now));
         // How long the request of a piece taken back had waited for its answer.
         let mut waited = Duration::ZERO;
         while let Some(next) = self.chunks.iter().position(|c| {
@@ -879,9 +919,12 @@ impl ChunkManager {
                     // Revoked under the attempt's lock, which its answer takes too: one or the other.
                     ChunkStatus::Assigned { .. } if back => {
                         let attempt = c.attempt.lock();
-                        attempt.answered.is_none() && c.current_offset.load(Ordering::SeqCst) <= c.range.start && {
+                        let unanswered = attempt.answered.is_none() && c.current_offset.load(Ordering::SeqCst) <= c.range.start;
+                        (unanswered || trial == Some(c.id)) && {
                             c.revoked.cancel();
-                            waited = waited.max(c.assigned_at.map_or(Duration::ZERO, |sent| now.saturating_duration_since(sent)));
+                            if unanswered {
+                                waited = waited.max(c.assigned_at.map_or(Duration::ZERO, |sent| now.saturating_duration_since(sent)));
+                            }
                             true
                         }
                     }
@@ -893,6 +936,10 @@ impl ChunkManager {
             self.completed += 1;
             self.retry_queue.retain(|&queued| queued != next);
         }
+        if let Some(trial) = trial.filter(|&trial| self.chunks[trial].status == ChunkStatus::Merged) {
+            (self.trial, self.overtaken) = (None, true);
+            tracing::info!("Chunk {trial}: the first stream reached the piece of the connection beside it first, and goes on over it");
+        }
         // A take-back is a measure: a new request takes longer than that to answer, so every later
         // cut and steal leaves the request it splits more of its own (see `ChunkManager::setup`).
         if !waited.is_zero() {
@@ -902,6 +949,59 @@ impl ChunkManager {
         chunk.range.end = end;
         chunk.end_offset.store(end, Ordering::SeqCst);
         end
+    }
+
+    /// The piece the last [`ChunkManager::halve`] cut off the first stream goes to one more
+    /// connection the Autopilot judges: it stays the stream's until the verdict, the stream's
+    /// request asking for it still (see [`ChunkManager::verdict`]). A stream that reaches it first
+    /// takes it back (see [`ChunkManager::run_on`]) where it brings it sooner (see
+    /// [`ChunkManager::outpaces`]), a "no" (see [`ChunkManager::overtaken`]).
+    pub(crate) fn on_trial(&mut self) {
+        let Some((stream, _)) = &self.stream else { return };
+        let end = self.chunks[*stream].end_offset.load(Ordering::SeqCst);
+        self.trial = self.chunks.last().filter(|c| c.range.start == end + 1 && c.status == ChunkStatus::Unassigned).map(|c| c.id);
+    }
+
+    /// Whether the first stream took the piece on trial back since this was last asked.
+    pub(crate) fn overtaken(&mut self) -> bool {
+        std::mem::take(&mut self.overtaken)
+    }
+
+    /// The Autopilot's verdict on the connection on trial (see [`ChunkManager::on_trial`]): where
+    /// more `pays`, its piece is its own from now on. Where not, it is dropped and the first stream
+    /// reads on over its piece, if that brings it sooner (see [`ChunkManager::outpaces`]): no new
+    /// request, and no connection given up that was up to speed. What it brought is written again,
+    /// the same bytes. Whether it was dropped.
+    pub(crate) fn verdict(&mut self, pays: bool) -> bool {
+        let (Some(trial), Some((stream, attempt))) = (self.trial.take(), &self.stream) else { return false };
+        let (stream, s, t) = (*stream, &self.chunks[*stream], &self.chunks[trial]);
+        let runs = s.is_in_flight() && Arc::ptr_eq(&s.attempt, attempt) && !s.revoked.is_cancelled() && s.attempt.lock().asked >= t.range.end;
+        let next = t.is_in_flight() && t.range.start == s.end_offset.load(Ordering::SeqCst) + 1;
+        if pays || !runs || !next || !self.outpaces(stream, trial, Instant::now()) {
+            return false;
+        }
+        t.revoked.cancel();
+        let end = t.range.end;
+        self.chunks[trial].status = ChunkStatus::Merged;
+        self.completed += 1;
+        let s = &mut self.chunks[stream];
+        s.range.end = end;
+        s.end_offset.store(end, Ordering::SeqCst);
+        true
+    }
+
+    /// Whether chunk `stream`, reading on over chunk `trial` right after it from where it is,
+    /// brings all that sooner than `trial`'s worker brings its piece: with `S` left of its own, the
+    /// piece's `W` in and `R` to come, at its pace `r_s` and the newcomer's `r_n`, and the line
+    /// theirs together once it is alone, `(S + W + R) / (r_s + r_n) < R / r_n`. Not where the
+    /// newcomer keeps pace, as on a line both share alike, whose piece would come twice for
+    /// nothing; a newcomer with no pace yet brought too little to count.
+    fn outpaces(&self, stream: usize, trial: usize, now: Instant) -> bool {
+        let (s, t) = (&self.chunks[stream], &self.chunks[trial]);
+        let Some((_, mine)) = s.pace(now, None) else { return false };
+        let theirs = t.pace(now, None).map_or(0.0, |(_, rate)| rate);
+        let (left, had, rest) = (s.unreceived() as f64, Self::has(t) as f64, t.unreceived() as f64);
+        (left + had + rest) * theirs < rest * (mine + theirs)
     }
 
     /// Hands back what the attempts of workers `from` and above have yet to receive, as fresh
@@ -1593,10 +1693,11 @@ mod tests {
         assert!(manager.steal_work(3, 0, 64 * 1024).is_none());
     }
 
-    /// However splits, steals, take-overs, second requests, merges, hand-backs, answers, refusals,
-    /// take-backs, finishes and failures follow one another, the chunks tile the file (no gap, no
-    /// overlap), every piece not done is under a request under way that asked for it or waits to
-    /// be asked for, and the file completes.
+    /// However splits, steals, take-overs (of silent and of slow chunks), second requests, merges,
+    /// hand-backs, answers, refusals, take-backs, pieces on trial and verdicts on them, finishes
+    /// and failures follow one another, the chunks tile the file (no gap, no overlap), every piece
+    /// not done is under a request under way that asked for it or waits to be asked for, and the
+    /// file completes.
     #[test]
     fn test_the_chunks_tile_the_file_whatever_comes_in_whatever_order() {
         let size = 4 * MB;
@@ -1630,7 +1731,7 @@ mod tests {
                     let some: Vec<usize> = (0..live.len()).filter(|&i| live[i].has_answer() == answered).collect();
                     (!some.is_empty()).then(|| some[roll(some.len())])
                 };
-                match roll(12) {
+                match roll(15) {
                     0 => {
                         manager.halve(1 + roll(3), 64 * 1024, Duration::from_millis(roll(3) as u64 * 100));
                     }
@@ -1649,6 +1750,7 @@ mod tests {
                                 let to = pos + 1 + roll((end - pos + 1) as usize) as u64;
                                 live[i].received(to);
                                 live[i].current_offset.store(to, Ordering::SeqCst);
+                                live[i].went_lately(roll(3) as f64);
                             } else if !manager.run_on(&live[i], roll(2) == 0) {
                                 manager.mark_completed(id).unwrap();
                                 live.remove(i);
@@ -1686,6 +1788,17 @@ mod tests {
                         }
                     }
                     10 => manager.merge_pending(1 + roll(3)),
+                    11 => manager.on_trial(),
+                    12 => {
+                        manager.verdict(roll(2) == 0);
+                        manager.overtaken();
+                    }
+                    13 => {
+                        workers += 1;
+                        if let Some(taken) = manager.take_over_slow(workers, 0, &[StealTiming { startup: Duration::ZERO, rate: 1e15 }]) {
+                            ask(taken, &mut live);
+                        }
+                    }
                     _ => manager.give_back(roll(workers + 1)),
                 }
                 let mut tiles: Vec<ByteRange> = manager.chunks().iter().filter(|c| c.status != ChunkStatus::Merged).map(|c| c.range).collect();
@@ -1893,7 +2006,8 @@ mod tests {
     }
 
     /// A tail too short to split, left to a connection that crawls, goes whole to a new request
-    /// that brings it well before; one going about as fast as a new request stays.
+    /// that brings it well before; one going about as fast as a new request stays, and so does one
+    /// whose speed may still climb: its fastest half second passed by none of the two after it.
     #[test]
     fn test_a_crawling_tail_is_taken_over() {
         let thief = [cost(0.1, 5.0 * MB as f64)];
@@ -1902,14 +2016,74 @@ mod tests {
         let crawling = manager.chunks()[0].clone();
         crawling.went_lately(25_000.0);
         assert!(manager.steal_work(1, 0, timed(64 * 1024, &thief)).is_none(), "too short to split");
+        crawling.went_lately(25_000.0);
+        assert!(manager.take_over_slow(1, 0, &thief).is_none(), "its speed may still climb");
+        crawling.went_lately(26_000.0);
         let taken = manager.take_over_slow(1, 0, &thief).unwrap();
         assert!(crawling.revoked.is_cancelled());
         assert_eq!(taken.range, ByteRange::new(64 * MB - 50_000, 64 * MB - 1).unwrap());
         assert_eq!(taken.status, ChunkStatus::Assigned { worker_id: 1, mirror_id: 0 });
         // At 1 MB/s of late they take 0.05 s.
         let mut manager = one_victim(64 * MB, 64 * MB - 50_000, 10);
-        manager.chunks()[0].went_lately(1e6);
+        for _ in 0..3 {
+            manager.chunks()[0].went_lately(1e6);
+        }
         assert!(manager.take_over_slow(1, 0, &thief).is_none());
+    }
+
+    /// One more connection judged beside the first stream (see `ChunkManager::on_trial`): its
+    /// piece stays the stream's until the verdict. Given 2 % of a full line, it is outpaced: the
+    /// stream that reaches its piece first takes it back, its few bytes written again, a "no"; a
+    /// "no" before that drops it at once, the stream reading on. Not one that keeps pace, as on a
+    /// line both share alike, nor once more pay.
+    #[test]
+    fn test_a_piece_on_trial_is_the_first_streams_until_the_verdict() {
+        // 64 MB; the stream halved at 20 MB for one more, then 30 MB in 3 s; the new connection's
+        // answer came 1 s ago, and it brought `brought` since.
+        let judged = |brought: u64| {
+            let mut manager = ChunkManager::new(64 * MB, 64 * MB).unwrap();
+            let stream = answering(&mut manager, 0, 0);
+            stream.asked(64 * MB - 1);
+            stream.current_offset.store(20 * MB, Ordering::SeqCst);
+            assert_eq!(manager.halve(1, 64 * 1024, Duration::ZERO), 1);
+            manager.on_trial();
+            let newcomer = manager.get_next_work(1, 0).unwrap();
+            assert_eq!(newcomer.range, ByteRange::new(42 * MB, 64 * MB - 1).unwrap());
+            newcomer.asked(64 * MB - 1);
+            newcomer.answered(Instant::now());
+            manager.backdate(1, Duration::from_secs(1));
+            newcomer.current_offset.store(42 * MB + brought, Ordering::SeqCst);
+            stream.current_offset.store(30 * MB, Ordering::SeqCst);
+            manager.backdate(0, Duration::from_secs(3));
+            (manager, stream, newcomer)
+        };
+        let (mut manager, stream, newcomer) = judged(240_000);
+        stream.current_offset.store(42 * MB, Ordering::SeqCst);
+        assert!(manager.run_on(&stream, false), "the stream goes on over the piece");
+        assert!(newcomer.revoked.is_cancelled() && manager.overtaken() && !manager.overtaken());
+        assert_eq!((stream.end_offset.load(Ordering::SeqCst), &manager.chunks()[1].status), (64 * MB - 1, &ChunkStatus::Merged));
+        assert!(!manager.verdict(false), "nothing left on trial");
+
+        let (mut manager, stream, newcomer) = judged(240_000);
+        assert!(manager.verdict(false), "dropped at the verdict");
+        assert!(newcomer.revoked.is_cancelled() && !manager.overtaken());
+        assert_eq!(stream.end_offset.load(Ordering::SeqCst), 64 * MB - 1);
+
+        // At 10 MB/s each, it keeps pace: a "no" leaves both going; and a stream that ends its own,
+        // the newcomer with 2 MB of its 22 MB left, ends there.
+        let (mut manager, _, newcomer) = judged(10 * MB);
+        assert!(!manager.verdict(false) && !newcomer.revoked.is_cancelled(), "both go on");
+        let (mut manager, stream, newcomer) = judged(10 * MB);
+        stream.current_offset.store(42 * MB, Ordering::SeqCst);
+        newcomer.current_offset.store(62 * MB, Ordering::SeqCst);
+        manager.backdate(0, Duration::from_secs(1));
+        manager.backdate(1, Duration::from_secs(1));
+        assert!(!manager.run_on(&stream, false) && !newcomer.revoked.is_cancelled() && !manager.overtaken(), "it ends at its own");
+
+        let (mut manager, stream, newcomer) = judged(240_000);
+        assert!(!manager.verdict(true));
+        stream.current_offset.store(42 * MB, Ordering::SeqCst);
+        assert!(!manager.run_on(&stream, false) && !newcomer.revoked.is_cancelled(), "once more pay, the piece is its own");
     }
 
     #[test]
