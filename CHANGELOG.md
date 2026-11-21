@@ -2,7 +2,7 @@
 
 What changed in each release, newest first. Each release's page on [GitHub](https://github.com/Adityasharma0101911/Endo-s-Unified-Downloader/releases) has its files and the full notes.
 
-## Unreleased
+## 2.2.3 (2026-11-21)
 
 - **Servers that drop a browser.** Some file servers close the connection on any request that says it is a browser, without an answer, and 2.2.0 could not download from them at all. The app now asks such a server once more under its own name (`EndosUnifiedDownloader/x.y.z`) and keeps to it for that server until it is closed: once per server, never while it rests after refusing a request, and back to the browser's if it then refuses the app's. Not when you set a User-Agent yourself or the browser extension sent the browser's.
 - **Recent folders.** Beside Save to on the Add page, the last 5 folders downloads were saved to are one click away.
