@@ -5112,7 +5112,7 @@ impl From<String> for ProbeError {
 }
 
 /// Whether the User-Agent is the app's to choose: neither the user nor the browser's headers set one.
-fn agent_is_ours(options: &DownloadOptions) -> bool {
+pub(crate) fn agent_is_ours(options: &DownloadOptions) -> bool {
     options.user_agent.is_none() && !options.headers.iter().chain(&options.extra_headers).any(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
 }
 
@@ -5284,14 +5284,13 @@ async fn probe_with(
         (Ok(resp), _) if usable => resp,
         // Go by HEAD. A refused range request means a single stream. An unanswered one is no
         // reason to demote the download to one stream that cannot resume, so range support is as
-        // a ranged GET to the host found before, else as HEAD's Accept-Ranges says, and the
+        // this link's HEAD says (Accept-Ranges), not as another file of its host had it, and the
         // download retries the busy server as Retry-After and max_retries allow. A HEAD
         // Content-Length of 0 is common for dynamic content: it is no size.
         (_, Some(head)) => {
             let mut info = ProbeInfo::describe(url, &[head]);
             info.size = head_len.filter(|&n| n > 0);
-            let ranges = hosts::profile(head.url()).accepts_ranges.unwrap_or_else(|| accepts_bytes(head.headers()));
-            info.accepts_ranges = unanswered && info.size.is_some() && ranges;
+            info.accepts_ranges = unanswered && info.size.is_some() && accepts_bytes(head.headers());
             return Ok((info, None));
         }
         (Ok(resp), None) if unanswered => {
@@ -11091,6 +11090,22 @@ mod tests {
         asked.lock().clear();
         assert!(fetch(url).await == body.as_bytes());
         assert_eq!(asked.lock().first().map(String::as_str), Some("0-"));
+    }
+
+    /// A probe whose GET finds the server busy goes by its HEAD: range support as this link's
+    /// HEAD says, not as another file of its host had it.
+    #[tokio::test]
+    async fn test_a_busy_probe_takes_range_support_from_its_own_head() {
+        let url = answering_server(|head| match head.to_ascii_lowercase().starts_with("head ") {
+            true => "HTTP/1.1 200 OK\r\nContent-Length: 5000\r\nConnection: close\r\n\r\n".to_string(),
+            false => "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 5\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+        })
+        .await
+        .join("f.bin")
+        .unwrap();
+        hosts::record(&url, HostProfile { accepts_ranges: Some(true), ..Default::default() });
+        let (info, _) = probe_url(&Client::new(), None, &url, Ask::Byte, true, 0, true).await.unwrap();
+        assert_eq!((info.size, info.accepts_ranges), (Some(5000), false));
     }
 
     #[test]

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use futures_util::StreamExt;
-use reqwest::header::{HeaderMap, CONTENT_RANGE, ETAG, IF_RANGE, LAST_MODIFIED, RANGE};
+use reqwest::header::{HeaderMap, HeaderValue, CONTENT_RANGE, ETAG, IF_RANGE, LAST_MODIFIED, RANGE};
 use reqwest::{Client, StatusCode};
 use tokio::sync::broadcast;
 use url::Url;
@@ -272,6 +272,7 @@ impl Version {
 #[allow(clippy::too_many_arguments)]
 async fn fetch_range(
     client: &Client,
+    ours: bool,
     url: &Url,
     seen: &mut Option<Version>,
     offset: &mut u64,
@@ -283,7 +284,7 @@ async fn fetch_range(
     let RepairTarget { state, writer, .. } = repair;
     let total_size = writer.size();
     let validator = seen.as_ref().and_then(Version::if_range).map(str::to_string);
-    let mut request = with_referer_for(with_agent_for(client.get(url.clone()), url, true), url, None).header(RANGE, format!("bytes={}-{}", *offset, end));
+    let mut request = with_referer_for(with_agent_for(client.get(url.clone()), url, ours), url, None).header(RANGE, format!("bytes={}-{}", *offset, end));
     if let Some(validator) = &validator {
         request = request.header(IF_RANGE, validator.as_str());
     }
@@ -540,11 +541,19 @@ where
         return Err(format!("Missing range {} lies outside the {}-byte file", r, total_size));
     }
 
+    // The User-Agent the user or the browser set, as the download had it: never replaced by the
+    // one a host takes (see `with_agent_for`), which only the app's own is.
+    let mut headers = crate::resolver::SmartResolver::default_anti_qos_headers();
+    let browsers = options.headers.iter().filter(|(name, _)| name.eq_ignore_ascii_case("user-agent")).map(|(_, value)| value);
+    if let Some(agent) = browsers.chain(&options.user_agent).last().and_then(|agent| HeaderValue::from_str(agent).ok()) {
+        headers.insert(reqwest::header::USER_AGENT, agent);
+    }
+    let ours = crate::engine::agent_is_ours(options);
     let client = Client::builder()
         .tcp_nodelay(true)
         .connect_timeout(CONNECT_TIMEOUT)
         .read_timeout(READ_TIMEOUT)
-        .default_headers(crate::resolver::SmartResolver::default_anti_qos_headers())
+        .default_headers(headers)
         .build()
         .map_err(|e| format!("Failed to build HTTP client for repair: {}", e))?;
 
@@ -570,11 +579,12 @@ where
     // yt-dlp or the HLS engine.
     let engine_urls = !urls.iter().any(|u| crate::media::is_supported_media_site(u) || u.as_str().contains(".m3u8"));
     if final_taken || !engine_urls {
-        return repair_in_place(&client, repair, &gaps, urls, cancel, &mut on_bytes).await;
+        return repair_in_place(&client, ours, repair, &gaps, urls, cancel, &mut on_bytes).await;
     }
 
     let check = VersionCheck {
         client: &client,
+        ours,
         recorded: Version::recorded(&repair.state),
         at: gaps.first().map_or(0, |g| g.start),
         total_size,
@@ -589,7 +599,7 @@ where
     };
     let Some(mirror) = serving.iter().find(|m| m.engine).map(|m| m.url.clone()) else {
         let urls: Vec<Url> = serving.into_iter().map(|m| m.url).collect();
-        return repair_in_place(&client, repair, &gaps, &urls, cancel, &mut on_bytes).await;
+        return repair_in_place(&client, ours, repair, &gaps, &urls, cancel, &mut on_bytes).await;
     };
     let final_path = repair.final_path.clone();
     // The engine takes the claim itself.
@@ -623,6 +633,8 @@ struct Serving {
 /// version `recorded`.
 struct VersionCheck<'a> {
     client: &'a Client,
+    /// The User-Agent is the app's to choose (see `with_agent_for`).
+    ours: bool,
     recorded: Version,
     at: u64,
     total_size: u64,
@@ -651,7 +663,7 @@ impl VersionCheck<'_> {
     /// The version `url` serves, once its answer shows it is byte `at` of the file in the
     /// recorded version.
     async fn serves(&self, url: &Url) -> Result<Version, FetchError> {
-        let request = with_referer_for(with_agent_for(self.client.get(url.clone()), url, true), url, None).header(RANGE, format!("bytes={}-{}", self.at, self.at));
+        let request = with_referer_for(with_agent_for(self.client.get(url.clone()), url, self.ours), url, None).header(RANGE, format!("bytes={}-{}", self.at, self.at));
         let resp = until_cancelled(request.send(), self.cancel)
             .await?
             .map_err(|e| FetchError::Retry(format!("request to {} failed: {}", url, e)))?;
@@ -683,7 +695,7 @@ impl VersionCheck<'_> {
     /// have. A server honoring If-Range sends the whole file instead; that body is not read.
     async fn ignores_if_range(&self, url: &Url, validator: &str) -> Result<bool, FetchError> {
         let other = if validator.starts_with('"') { "\"endo-if-range-check\"" } else { "Thu, 01 Jan 1970 00:00:00 GMT" };
-        let request = with_referer_for(with_agent_for(self.client.get(url.clone()), url, true), url, None)
+        let request = with_referer_for(with_agent_for(self.client.get(url.clone()), url, self.ours), url, None)
             .header(RANGE, format!("bytes={}-{}", self.at, self.at))
             .header(IF_RANGE, other);
         let resp = until_cancelled(request.send(), self.cancel)
@@ -861,9 +873,10 @@ async fn repair_with_engine(
 
 /// Fetches `gaps` range by range from `urls` into the prepared `.part`, holding each mirror to the
 /// version it first served (see [`fetch_range`]), then records the progress; a complete `.part`
-/// whose final name is free gets that name.
+/// whose final name is free gets that name. With `ours`, the User-Agent is the app's to choose.
 async fn repair_in_place(
     client: &Client,
+    ours: bool,
     mut repair: RepairTarget,
     gaps: &[ByteRange],
     urls: &[Url],
@@ -889,7 +902,7 @@ async fn repair_in_place(
             let mirror = usable[(range_idx + failures) % usable.len()];
             let before = offset;
             let result =
-                fetch_range(client, &urls[mirror], &mut seen[mirror], &mut offset, range.end, &repair, cancel, on_bytes).await;
+                fetch_range(client, ours, &urls[mirror], &mut seen[mirror], &mut offset, range.end, &repair, cancel, on_bytes).await;
             if offset > before {
                 repair.state.completed_ranges.push(ByteRange { start: before, end: offset - 1 });
                 failures = 0;
@@ -1316,6 +1329,23 @@ mod tests {
         assert_eq!(gaps_on_disk(&part), vec![ByteRange::new(130, 199).unwrap()]);
         assert_eq!(std::fs::read(&part).unwrap()[100..130], content[100..130]);
         assert_eq!(std::fs::read(dir.path().join("build.bin")).unwrap(), b"a newer finished download");
+    }
+
+    /// A repair sends the User-Agent the user set, also to a host that takes the app's.
+    #[tokio::test]
+    async fn a_repair_keeps_the_users_agent() {
+        let dir = tempdir().unwrap();
+        let content = content();
+        let part = damaged_part_beside_final(dir.path(), &content, None);
+        let url = mock_server(content.clone(), |_, req, s, e, c| match req.contains("user-agent: theirs/1") {
+            true => partial(s, e, c, usize::MAX),
+            false => b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+        })
+        .await;
+        assert!(crate::resolver::ask_as_app(&url), "the host takes the app's");
+        let options = DownloadOptions { user_agent: Some("Theirs/1".into()), ..DownloadOptions::default() };
+        repair_missing_ranges(&part, 1000, &[ByteRange::new(100, 199).unwrap()], &[url], &options, None, |_, _| {}).await.unwrap();
+        assert_eq!(std::fs::read(&part).unwrap()[100..200], content[100..200]);
     }
 
     #[tokio::test]
