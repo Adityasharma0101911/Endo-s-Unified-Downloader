@@ -1406,8 +1406,8 @@ mod tests {
         }
     }
 
-    /// A newer version that fails the site's checksum, with `only_if_newer` (or a delta from the
-    /// file it replaces), leaves the old file as it was.
+    /// A newer version that fails the site's checksum, with `only_if_newer` (`-N`), a delta from
+    /// the file it replaces, or both, leaves the old file as it was.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_newer_version_that_fails_leaves_the_old_file() {
         let data = content(300 * 1024);
@@ -1416,18 +1416,20 @@ mod tests {
         std::fs::write(&old, b"the version the user has").unwrap();
         let files = vec![("/dir/SHA256SUMS".to_string(), "text/plain".to_string(), format!("{}  file.bin", "0".repeat(64)))];
         let (url, _) = serve(data, Site { files, sidecars_wait: Duration::from_millis(100), ..Site::default() }).await;
-        for delta in [false, true] {
+        for (only_if_newer, delta) in [(true, false), (false, true), (true, true)] {
             let options = DownloadOptions {
                 output_path: Some(old.clone()),
-                only_if_newer: !delta,
+                only_if_newer,
                 delta_from: delta.then(|| old.clone()),
                 ..DownloadOptions::default()
             };
-            let result = DownloadEngine::new(vec![url.clone()], options).run(None).await;
-            assert!(result.as_ref().is_err_and(|e| e.contains("the site's published SHA-256")), "{result:?}");
-            assert_eq!(std::fs::read(&old).unwrap(), b"the version the user has", "delta: {delta}");
+            let engine = DownloadEngine::new(vec![url.clone()], options);
+            let result = tokio::time::timeout(Duration::from_secs(60), engine.run(None)).await.expect("done in a minute");
+            let case = format!("-N: {only_if_newer}, delta: {delta}");
+            assert!(result.as_ref().is_err_and(|e| e.contains("the site's published SHA-256")), "{case}: {result:?}");
+            assert_eq!(std::fs::read(&old).unwrap(), b"the version the user has", "{case}");
             let left: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
-            assert_eq!(left, ["file.bin"], "delta: {delta}");
+            assert_eq!(left, ["file.bin"], "{case}");
         }
     }
 

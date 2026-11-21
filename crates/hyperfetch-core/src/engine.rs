@@ -11508,6 +11508,34 @@ mod tests {
         assert_eq!(std::fs::metadata(done.unwrap()).unwrap().file_attributes() & SPARSE, 0);
     }
 
+    /// The mark from the internet put on the `.part` is on the file under its final name: the
+    /// rename keeps Windows' Zone.Identifier stream and macOS's quarantine attribute.
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn test_the_mark_on_the_part_stays_through_the_rename() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("f.bin");
+        let part = part_path(&target);
+        std::fs::write(&part, b"x").unwrap();
+        crate::postprocess::mark_from_internet(&part, &Url::parse("https://example.com/f.bin").unwrap());
+        let (named, _) = put_in_place(&part, target.clone(), &DownloadState::state_file_path(&part), false, false).unwrap();
+        assert!(named == target && !part.exists());
+        #[cfg(windows)]
+        {
+            let zone = std::fs::read_to_string(format!("{}:Zone.Identifier", target.display())).unwrap();
+            assert!(zone.contains("ZoneId=3") && zone.contains("HostUrl=https://example.com/f.bin"), "{zone}");
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let (path, name) = (std::ffi::CString::new(target.as_os_str().as_bytes()).unwrap(), c"com.apple.quarantine");
+            let mut value = [0u8; 256];
+            // SAFETY: NUL-terminated strings and a buffer of the length given.
+            let n = unsafe { libc::getxattr(path.as_ptr(), name.as_ptr(), value.as_mut_ptr().cast(), value.len(), 0, 0) };
+            assert!(n > 0, "{} is not quarantined", target.display());
+        }
+    }
+
     #[tokio::test]
     async fn test_a_single_stream_is_hashed_from_its_first_byte_as_it_is_written() {
         use sha2::Digest;
