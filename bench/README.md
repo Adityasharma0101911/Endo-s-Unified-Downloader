@@ -8,7 +8,11 @@ connection, one that caps all of a user's connections together, a long link (150
 cap per connection), a lossy one (one connection cut off, one fading out), a host that answers 429
 past 6 requests a second, 2,000 small files (with and without the SHA-256 a listing gives), and a
 single HTTP/2 download over a 100 ms round trip with hyper's flow-control windows and with the
-engine's. Every downloaded file is checked byte by byte; at most 128 MiB is on disk at once.
+engine's. Every downloaded file is checked byte by byte; at most 512 MiB is on disk at once. The
+LAN is 512 MiB since the Autopilot looks at the first stream's speed and judges one more
+connection before it opens the rest (about 0.1 s on loopback): 128 MiB at a few GB/s was over in
+little more than that, and its result was mostly that look and the runner's noise. Its floor
+stays at 1200 MB/s, under half what 2.2.0 measured on the smaller file below.
 
 ```sh
 cargo test --release -p hyperfetch-core --lib speed_bench -- --ignored --nocapture

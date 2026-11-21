@@ -10,7 +10,7 @@
 //! `bench/sim-thresholds.json` allows; `ENDO_BENCH_ONLY=lan,lossy` runs those alone. Every server
 //! is new, on a port this process has not used, so no scenario starts with what another taught
 //! the Autopilot.
-//! At most 128 MiB is on disk at once (a temporary folder each run), and every run has a time limit.
+//! At most 512 MiB is on disk at once (a temporary folder each run), and every run has a time limit.
 
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -70,7 +70,9 @@ fn scenarios() -> Vec<Scenario> {
             runs: 3,
         },
         Scenario { name: "web_seed_and_peer", what: "the same and one peer sending 1 MB/s", server: seed, files: torrent(Some(1_000_000)), runs: 3 },
-        Scenario { name: "lan", what: "128 MiB, no cap", server: Server::default(), files: Files::One(128 * MIB), runs: 3 },
+        // Large enough that what the Autopilot takes to see the first stream's speed and judge one
+        // more (about 0.1 s on loopback) is not most of it, as it was of 128 MiB at a few GB/s.
+        Scenario { name: "lan", what: "512 MiB, no cap", server: Server::default(), files: Files::One(512 * MIB), runs: 3 },
         Scenario {
             name: "per_connection",
             what: "32 MiB, 2 MB/s per connection",
