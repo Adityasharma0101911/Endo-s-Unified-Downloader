@@ -614,12 +614,14 @@ fn update_offer(app: &mut App, ui: &mut Ui) {
 /// typed a letter at a time is read once.
 const LISTING_WAIT: f64 = 0.5;
 
-/// The link in `input` when it is a single http(s) link to a media site, whose qualities the card
-/// lists (see [`quality_picker`]).
+/// The link in `input` when it is a single http(s) link to a media site's video, whose qualities
+/// the card lists (see [`quality_picker`]); not a playlist's or a channel's, whose videos are not
+/// each asked about.
 fn media_link(input: &str) -> Option<Url> {
     let input = input.trim();
     let url = Url::parse(input).ok().filter(|u| matches!(u.scheme(), "http" | "https") && !input.contains(char::is_whitespace))?;
-    media::is_supported_media_site(&url).then_some(url)
+    let list = media::lists(&url) && !media::video_in_playlist(&url);
+    (media::is_supported_media_site(&url) && !list).then_some(url)
 }
 
 /// The title the site gave the media link in the box, once its qualities are read.
@@ -1129,13 +1131,23 @@ mod tests {
         let nearest = MediaPick { formats: Some("299+251".into()), ..MediaPick::parse("1080p:h264").unwrap() };
         assert_eq!(queued(&mut h, other), Some(Pick(nearest)));
 
+        // A video in a playlist is asked about alone, the list not read.
+        let in_list = "https://www.youtube.com/watch?v=sample4k60&list=PLsample&index=2";
+        show(&mut h, in_list);
+        assert!(shown(&h, "A 4K film at 60 fps") && asked(link) == 2 && asked(in_list) == 0, "{:?}", h.texts());
+
         // Nothing to list, or the listing failed: the Quality setting, as before.
-        for link in ["https://www.youtube.com/playlist?list=sample", "https://www.youtube.com/watch?v=fail"] {
-            h.app.settings.media_picks.clear();
+        h.app.settings.media_picks.clear();
+        for link in ["https://www.youtube.com/watch?v=nothing", "https://www.youtube.com/watch?v=fail"] {
             show(&mut h, link);
             assert!(shown(&h, MEDIA_PRESETS[1]) && !shown(&h, "Original · Opus 129 kbps · 9.7 MiB"), "{link}: {:?}", h.texts());
             assert_eq!(queued(&mut h, link), Some(hyperfetch_core::media::MediaQualityPreset::Fhd1080p));
         }
+        // A playlist's or channel's videos are not each asked about: it is not asked at all.
+        let list = "https://www.youtube.com/playlist?list=PLsample";
+        h.app.url_input = list.to_string();
+        h.frames(90);
+        assert!(asked(list) == 0 && shown(&h, MEDIA_PRESETS[1]) && h.find("Reading its qualities…").is_none(), "{:?}", h.texts());
     }
 
     /// A video page's link ends in "watch", a playlist's in "videos": the card names neither,

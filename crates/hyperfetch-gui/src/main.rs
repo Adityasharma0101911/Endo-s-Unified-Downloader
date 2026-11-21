@@ -728,8 +728,14 @@ impl App {
         self.media_card = Some(MediaCard { link: link.clone(), listed: None, pick: None });
         let given = |text: &str| Some(text.trim().to_string()).filter(|text| !text.is_empty());
         let (cookies, proxy) = (given(&self.settings.cookies_path).map(PathBuf::from), given(&self.settings.proxy));
+        // A video in a playlist is asked about alone: the list is read when it is downloaded.
+        let mut asked = url;
+        if media::video_in_playlist(&asked) {
+            let kept: Vec<(String, String)> = asked.query_pairs().filter(|(key, _)| key != "list" && key != "index").map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
+            asked.query_pairs_mut().clear().extend_pairs(kept);
+        }
         self.spawn_event(async move {
-            let result = media_listing(&url, cookies, proxy).await;
+            let result = media_listing(&asked, cookies, proxy).await;
             AppEvent::MediaListed { link, result }
         });
     }
