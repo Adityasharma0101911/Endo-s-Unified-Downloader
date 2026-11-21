@@ -3241,9 +3241,11 @@ fn spawn_clipboard_watcher(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Started again to stop a live recording (a debug build has a console), this only does that.
+    // Started again to clear finished files' sparse flags, or to stop a live recording (a debug
+    // build has a console), this only does that.
     use tracing_subscriber::fmt::writer::MakeWriterExt;
 
+    hyperfetch_core::storage::serve_clears();
     hyperfetch_core::media::serve_ctrl_c();
     hyperfetch_core::media::prepare_macos();
     let launch = desktop::Launch::parse(std::env::args_os().skip(1));
@@ -3309,6 +3311,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Downloads were stopped in `on_exit`; leftover blocking work (e.g. hashing for a verify)
     // must not keep the process alive.
     runtime.shutdown_background();
+    // A finished file still being made an ordinary file is left to a copy of this program.
+    hyperfetch_core::storage::hand_over_clears();
     // An update was installed: the new build takes over, the data folder unlocked for it.
     if let Some(exe) = lock(&restart).take() {
         drop(instance);
