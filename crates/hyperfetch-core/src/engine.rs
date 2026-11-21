@@ -3007,6 +3007,7 @@ impl DownloadEngine {
                 if let Some(size) = reference.size.filter(|&size| size > 0) {
                     let (mut state, path, part) = (state, state_path.clone(), part.clone());
                     state.completed_ranges = ByteRange::from_len(0, size).into_iter().collect();
+                    state.streamed = true;
                     let saved = blocking(move || {
                         std::fs::OpenOptions::new().write(true).open(&part)?.sync_data()?;
                         state.save_atomic(&path).map_err(std::io::Error::other)
@@ -6097,17 +6098,18 @@ fn plan_target(
                     let same_file = remote.size.is_none_or(|size| size == state.file_size)
                         && validators_compatible(&state, remote)
                         && std::fs::metadata(&part).map(|m| m.len()).ok() == Some(state.file_size);
-                    // All of it there has nothing to fetch, ranges or not, when the server's
-                    // validators say it is the same file.
-                    let complete = all_there(&state.completed_ranges, state.file_size);
-                    if same_file && (remote.accepts_ranges || complete && remote.size.is_some() && validators_tell(&state, remote)) {
+                    // All of it there from one stream has nothing to fetch, ranges or not, when the
+                    // server's validators say it is the same file.
+                    let streamed = state.streamed && all_there(&state.completed_ranges, state.file_size);
+                    if same_file && (remote.accepts_ranges || streamed && remote.size.is_some() && validators_tell(&state, remote)) {
                         return Ok(Plan::Fetch { final_path: candidate, resume: Some(Box::new(state)), claim });
                     }
                     // Downloaded bytes go only once they are proven stale, or the probe brought the
                     // whole file anyway: without range support now, they may still resume later.
-                    // All of it, the server unable to tell whether it changed, is downloaded again.
+                    // All of it from one stream, the server unable to tell whether it changed, is
+                    // downloaded again: one stream could not have resumed it either.
                     let whole_file_fetched = remote.size == Some(remote.prefetch.len() as u64);
-                    if same_file && !state.completed_ranges.is_empty() && !whole_file_fetched && !complete {
+                    if same_file && !state.completed_ranges.is_empty() && !whole_file_fetched && !streamed {
                         return Err(format!(
                             "{} does not accept range requests right now, so the partial download {} cannot \
                              resume; it was kept. Try again later, or delete it to download from the start.",
@@ -10309,7 +10311,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_a_host_kept_as_limiting_requests_is_asked_little_after_a_restart_too() {
         let size = 8 * 1024 * 1024;
-        let budget = crate::netsim::Budget { burst: 4, every: Duration::from_millis(250), retry_after: 1 };
+        // Two requests at once and one more a second: each download sends more than that within
+        // a second of its first answer (over 16 connections, they go out as each is answered),
+        // however slowly the machine runs.
+        let budget = crate::netsim::Budget { burst: 2, every: Duration::from_secs(1), retry_after: 1 };
         let (url, stats) = crate::netsim::serve(crate::netsim::Server { size, budget: Some(budget), ..Default::default() }).await;
         let to = url.to_string();
         let link = answering_server(move |head| match head.split_whitespace().nth(1) {
@@ -11398,6 +11403,38 @@ mod tests {
             plan_target(&base, &remote(1000), &urls(), &history, None, false).unwrap(),
             Plan::Fetch { ref final_path, .. } if *final_path == dir.path().join("file (1).bin")
         ));
+    }
+
+    /// All of a file there, stopped while it was checked, from a server that takes no ranges now:
+    /// one that came over ranges is kept, as one at 99 % is; one that came as one stream is checked
+    /// again only when the server's validators say it is the same file, else downloaded again.
+    #[test]
+    fn test_a_complete_part_goes_only_when_one_stream_brought_it_and_nothing_says_it_is_the_same() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().join("file.bin");
+        let (part, history) = (part_path(&base), dir.path().join("h.json"));
+        let part_state = DownloadState::state_file_path(&part);
+        let complete = |streamed| {
+            std::fs::write(&part, vec![1u8; 1000]).unwrap();
+            let mut state = state_for(1000, "\"v1\"", urls());
+            state.completed_ranges = vec![ByteRange::new(0, 999).unwrap()];
+            state.streamed = streamed;
+            state.save_atomic(&part_state).unwrap();
+        };
+        let mut silent = remote(1000);
+        (silent.accepts_ranges, silent.etag) = (false, None);
+
+        complete(false);
+        let err = plan_target(&base, &silent, &urls(), &history, None, false).unwrap_err();
+        assert!(err.contains("kept"), "{err}");
+        assert!(part.exists() && part_state.exists());
+
+        complete(true);
+        let mut same = remote(1000);
+        same.accepts_ranges = false;
+        assert!(matches!(plan_target(&base, &same, &urls(), &history, None, false).unwrap(), Plan::Fetch { resume: Some(_), .. }));
+        assert!(matches!(plan_target(&base, &silent, &urls(), &history, None, false).unwrap(), Plan::Fetch { resume: None, .. }));
+        assert!(!part.exists() && !part_state.exists());
     }
 
     #[test]

@@ -26,6 +26,10 @@ pub struct DownloadState {
     pub etag: Option<String>,
     pub last_modified: Option<String>,
     pub blake3_root: Option<[u8; 32]>,
+    /// All of it came as one stream, not over ranges. Saved as a byte after the rest, which an
+    /// older build reads past and a state it saved lacks (`false`).
+    #[serde(skip)]
+    pub streamed: bool,
 }
 
 impl DownloadState {
@@ -44,6 +48,7 @@ impl DownloadState {
             etag: None,
             last_modified: None,
             blake3_root: None,
+            streamed: false,
         }
     }
 
@@ -64,8 +69,10 @@ impl DownloadState {
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer)?;
 
-        let state: Self = bincode::deserialize(&buffer)
+        let mut state: Self = bincode::deserialize(&buffer)
             .map_err(|e| StateError::Corrupted(e.to_string()))?;
+        let read = bincode::serialized_size(&state)? as usize;
+        state.streamed = buffer.get(read) == Some(&1);
 
         Ok(Some(state))
     }
@@ -75,7 +82,8 @@ impl DownloadState {
         let mut tmp_path = state_path.to_path_buf();
         tmp_path.set_extension("hfstate.tmp");
 
-        let serialized = bincode::serialize(self)?;
+        let mut serialized = bincode::serialize(self)?;
+        serialized.push(self.streamed as u8);
 
         {
             let mut file = File::create(&tmp_path)?;
@@ -128,5 +136,20 @@ mod tests {
 
         DownloadState::remove(&state_path).unwrap();
         assert!(!state_path.exists());
+    }
+
+    /// Whether it came as one stream is kept, and a state saved before that was kept loads as
+    /// one that did not.
+    #[test]
+    fn a_state_says_whether_it_came_as_one_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.part.hfstate");
+        let mut state = DownloadState::new("f".into(), 10, 10, vec!["https://example.com/f".into()]);
+        state.streamed = true;
+        state.save_atomic(&path).unwrap();
+        assert!(DownloadState::load_from_path(&path).unwrap().unwrap().streamed);
+        std::fs::write(&path, bincode::serialize(&state).unwrap()).unwrap();
+        let older = DownloadState::load_from_path(&path).unwrap().unwrap();
+        assert!(!older.streamed && older.file_name == "f");
     }
 }

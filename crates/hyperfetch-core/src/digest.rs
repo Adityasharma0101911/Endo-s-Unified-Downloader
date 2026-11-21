@@ -837,6 +837,8 @@ mod tests {
         sidecars_refused: bool,
         /// The file is answered whole, 200, whatever range is asked for.
         no_ranges: bool,
+        /// Once set, a GET of the file is answered 503, and a HEAD with its length alone.
+        busy: Arc<std::sync::atomic::AtomicBool>,
         /// Bytes of the file's body sent so far.
         served: Arc<std::sync::atomic::AtomicUsize>,
     }
@@ -878,7 +880,13 @@ mod tests {
                         return;
                     }
                     let range = range.filter(|_| !site.no_ranges);
-                    let (resp, body) = if path == "/dir/file.bin" {
+                    let (resp, body) = if path == "/dir/file.bin" && site.busy.load(std::sync::atomic::Ordering::SeqCst) {
+                        let resp = match method.as_str() {
+                            "head" => format!("HTTP/1.1 200 OK\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n"),
+                            _ => "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+                        };
+                        (resp.into_bytes(), Vec::new())
+                    } else if path == "/dir/file.bin" {
                         let (s, e) = range.unwrap_or((0, len - 1));
                         let mut body = content[s as usize..=e as usize].to_vec();
                         if let Some(bad) = site.damaged_once.as_ref().filter(|_| method != "head") {
@@ -1347,15 +1355,17 @@ mod tests {
     /// resume state, all of it there, also one that came as one stream from a server without
     /// ranges; run again, it only checks the file again, and no second copy. Of the file's body the
     /// server sends a byte for the probe; one without ranges answers that with the file, of which
-    /// the download takes nothing.
+    /// the download takes nothing. Run again while the server is busy, its HEAD saying neither
+    /// ranges nor a validator, a file that came over ranges is kept for a later try, as one at
+    /// 99 % is.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_download_stopped_while_it_is_checked_only_checks_again() {
-        for no_ranges in [false, true] {
-            stopped_while_checked(no_ranges).await;
+        for (no_ranges, busy) in [(false, false), (true, false), (false, true)] {
+            stopped_while_checked(no_ranges, busy).await;
         }
     }
 
-    async fn stopped_while_checked(no_ranges: bool) {
+    async fn stopped_while_checked(no_ranges: bool, busy: bool) {
         let data = content(2 * MIB);
         let dir = tempfile::tempdir().unwrap();
         let wait = Duration::from_secs(2);
@@ -1364,7 +1374,7 @@ mod tests {
         // a server without ranges has the same file.
         let headers = vec!["ETag: \"v1\"".to_string()];
         let site = Site { files, headers, sidecars_wait: wait, pace: Duration::from_millis(5), no_ranges, ..Site::default() };
-        let served = Arc::clone(&site.served);
+        let (served, busy_now) = (Arc::clone(&site.served), Arc::clone(&site.busy));
         let (url, log) = serve(data.clone(), site).await;
         let options = || DownloadOptions { output_path: Some(dir.path().join("")), ..DownloadOptions::default() };
         let (tx, mut rx) = broadcast::channel::<EngineSnapshot>(1024);
@@ -1389,7 +1399,15 @@ mod tests {
         assert!(!dir.path().join("file.bin").exists());
 
         let before = (log.lock().unwrap().len(), served.load(std::sync::atomic::Ordering::SeqCst));
+        busy_now.store(busy, std::sync::atomic::Ordering::SeqCst);
         let (done, checked) = tokio::time::timeout(Duration::from_secs(60), download(vec![url], dir.path(), options())).await.expect("done in a minute");
+        if busy {
+            assert!(done.as_ref().is_err_and(|e| e.contains("cannot resume; it was kept")), "{done:?}");
+            assert!(part.exists() && crate::state::DownloadState::state_file_path(&part).exists());
+            assert_eq!(std::fs::read(&part).unwrap(), data, "kept as it was");
+            assert!(!dir.path().join("file.bin").exists());
+            return;
+        }
         assert_eq!(done.unwrap(), dir.path().join("file.bin"));
         assert_eq!(checked.as_deref(), Some("the site's SHA-256"));
         assert_eq!(std::fs::read(dir.path().join("file.bin")).unwrap(), data);
