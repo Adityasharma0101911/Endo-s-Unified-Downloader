@@ -413,6 +413,15 @@ impl CountedSmall<'_> {
             _ if snapshot.small => Counted::Small,
             _ => Counted::No,
         };
+        self.set(now);
+    }
+
+    /// The download ended: waiting for its turn, it holds no place.
+    fn free(&mut self) {
+        self.set(Counted::Free);
+    }
+
+    fn set(&mut self, now: Counted) {
         if now == self.1 {
             return;
         }
@@ -442,7 +451,8 @@ impl Drop for CountedSmall<'_> {
 /// shutdown request no new job starts and running ones stop with their state saved. Running
 /// several at once, results arrive in completion order, so each result line names its input; one
 /// at a time, they come in the order of the input, though the next download starts once the one
-/// before has nothing more to send (its file is read and checked on disk meanwhile).
+/// before has nothing more to send (its file is read and checked on disk meanwhile). A link
+/// listed again starts once the download of it before has ended, and finds its file there.
 pub async fn run_jobs(jobs: Vec<Job>, concurrency: usize, ui: &Ui, shutdown: &Shutdown, ffmpeg: Option<FfmpegAnswer>) -> usize {
     let overall = (jobs.len() > 1 && !ui.quiet).then(|| {
         let bar = ui.multi.add(ProgressBar::new(jobs.len() as u64).with_style(style(OVERALL)).with_prefix("Total"));
@@ -452,10 +462,15 @@ pub async fn run_jobs(jobs: Vec<Job>, concurrency: usize, ui: &Ui, shutdown: &Sh
     let named = concurrency > 1 && jobs.len() > 1;
     let clients = Clients::for_jobs(&jobs).await;
     let small = Small::default();
-    // How many results of a batch run one at a time are out, in its order (see `Turn`).
-    let (printed, mut started) = (tokio::sync::watch::Sender::new(0), 0);
+    // How many results of a batch run one at a time are out, in the order of the input (see
+    // `Turn`): each job's place in it is its turn.
+    let printed = tokio::sync::watch::Sender::new(0);
     let mut stop = shutdown.subscribe();
-    let (mut waiting, mut running) = (VecDeque::from(jobs), FuturesUnordered::new());
+    let turns = jobs.into_iter().enumerate().map(|(n, job)| (job, (concurrency <= 1).then(|| Turn { n, printed: &printed })));
+    let (mut waiting, mut running) = (turns.collect::<VecDeque<_>>(), FuturesUnordered::new());
+    // The links of the downloads running: a link listed again waits for its download to end,
+    // and then finds its file there.
+    let mut working = std::collections::HashSet::new();
     let mut failed = 0;
     loop {
         // A download with nothing more to send to any host holds no place, one at a time too:
@@ -463,19 +478,24 @@ pub async fn run_jobs(jobs: Vec<Job>, concurrency: usize, ui: &Ui, shutdown: &Sh
         while may_start(running.len().saturating_sub(small.free.load(Ordering::SeqCst)), small.count.load(Ordering::SeqCst), concurrency) {
             // None when nothing is asked; Some(None) while it is not answered.
             let answer = ffmpeg.as_ref().map(|answer| answer.peek().copied());
-            let next = waiting.iter().position(|job| answer != Some(None) || !job.needs_ffmpeg());
-            let Some(mut job) = next.and_then(|at| waiting.remove(at)) else { break };
+            let free = |job: &Job| job.urls.first().is_none_or(|url| !working.contains(url));
+            let next = waiting.iter().position(|(job, _)| (answer != Some(None) || !job.needs_ffmpeg()) && free(job));
+            let Some((mut job, turn)) = next.and_then(|at| waiting.remove(at)) else { break };
             if let Some(Some(install)) = answer {
                 job.options.install_ffmpeg = install;
             }
             let input = named.then(|| input_name(job.line, &job.urls)).flatten();
-            let turn = (concurrency <= 1).then(|| Turn { n: started, printed: &printed });
-            started += 1;
-            running.push(run_job(job, input, &clients, ui, shutdown, overall.as_ref(), &small, turn));
+            let link = job.urls.first().cloned();
+            working.extend(link.clone());
+            let run = run_job(job, input, &clients, ui, shutdown, overall.as_ref(), &small, turn);
+            running.push(async move { (run.await, link) });
         }
         let unanswered = ffmpeg.clone().filter(|answer| answer.peek().is_none() && !waiting.is_empty());
         tokio::select! {
-            Some(outcome) = running.next() => {
+            Some((outcome, link)) = running.next() => {
+                if let Some(link) = link {
+                    working.remove(&link);
+                }
                 match outcome {
                     Outcome::Done => {}
                     Outcome::Failed => failed += 1,
@@ -611,6 +631,7 @@ async fn run_job(
     let engine = match clients.engine(job.urls, job.options) {
         Ok(engine) => engine,
         Err(err) => {
+            small.free();
             my_turn().await;
             ui.error(&format!("[FAILED] {}: {}", input.as_deref().unwrap_or(&job.label), err));
             ui.report(failed(None, None, &err));
@@ -654,6 +675,7 @@ async fn run_job(
         }
     };
     view.bar.finish_and_clear();
+    small.free();
     my_turn().await;
 
     match result {
@@ -664,6 +686,8 @@ async fn run_job(
                 let mut line = done_line(input.as_deref(), &path);
                 if up_to_date {
                     line.push_str(" (up to date)");
+                } else if engine.kept_existing() {
+                    line.push_str(" (already downloaded)");
                 }
                 if let Some(whose) = &checked_against {
                     line.push_str(&format!(" (checked against {})", whose));
@@ -1126,6 +1150,73 @@ mod tests {
         std::fs::remove_file(dir.join("file.bin")).unwrap();
         let answered: FfmpegAnswer = async { false }.boxed().shared();
         assert_eq!(run_jobs(jobs(), 1, &Ui::new(true), &Shutdown::install(), Some(answered)).await, 1, "the video started, and failed");
+    }
+
+    /// One at a time, results come in the order of the input also while the ffmpeg question
+    /// waits; a download that ended meanwhile, failed or done, waits for its turn without holding
+    /// the place, so the next goes on.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_at_a_time_results_keep_the_input_order_while_the_question_waits() {
+        use futures_util::FutureExt;
+        let dir = crate::tests::test_dir("order");
+        let body: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
+        let (server, _) = keep_alive_server(body).await;
+        let no_cookies = Some(dir.join("missing-cookies.txt"));
+        let job = |label: &str, url: String, cookies_path: Option<std::path::PathBuf>| Job {
+            label: label.to_string(),
+            urls: vec![Url::parse(&url).unwrap()],
+            options: DownloadOptions { output_path: Some(dir.join("")), cookies_path, ..Default::default() },
+            line: None,
+        };
+        let video = "https://www.youtube.com/watch?v=jNQXAC9IVRw".to_string();
+        let jobs = vec![job("video", video, no_cookies.clone()), job("broken", format!("{server}/broken.bin"), no_cookies), job("file", format!("{server}/file.bin"), None)];
+        let log = dir.join("out.log");
+        let mut ui = Ui::new(true);
+        ui.json = true;
+        ui.log = Some(Arc::new(std::fs::File::create(&log).unwrap()));
+        let file = dir.join("file.bin");
+        // Answered once the last download is done: the failed one before it gave up the place.
+        let answer: FfmpegAnswer = async move {
+            while !file.exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            false
+        }
+        .boxed()
+        .shared();
+        let shutdown = Shutdown::install();
+        let ran = tokio::time::timeout(Duration::from_secs(60), run_jobs(jobs, 1, &ui, &shutdown, Some(answer)));
+        assert_eq!(ran.await.expect("the file downloads while the question waits"), 2);
+        drop(ui);
+        let text = std::fs::read_to_string(&log).unwrap();
+        let urls: Vec<String> = text.lines().filter(|line| line.starts_with('{')).map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["url"].to_string()).collect();
+        let order = ["youtube", "broken.bin", "file.bin"];
+        assert!(urls.len() == 3 && urls.iter().zip(order).all(|(url, name)| url.contains(name)), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A link listed twice gives one file, at any -j: the second waits for the first and finds
+    /// it there.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_link_listed_twice_gives_one_file() {
+        let body: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
+        let (server, _) = keep_alive_server(body.clone()).await;
+        for concurrency in [1, 2] {
+            let dir = crate::tests::test_dir(&format!("twice-{concurrency}"));
+            let job = || Job {
+                label: "f".to_string(),
+                urls: vec![Url::parse(&format!("{server}/twice.bin")).unwrap()],
+                options: DownloadOptions { output_path: Some(dir.join("")), ..Default::default() },
+                line: None,
+            };
+            let (ui, shutdown) = (Ui::new(true), Shutdown::install());
+            let ran = tokio::time::timeout(Duration::from_secs(60), run_jobs(vec![job(), job()], concurrency, &ui, &shutdown, None));
+            assert_eq!(ran.await.expect("done in a minute"), 0);
+            let names: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+            assert_eq!(names, ["twice.bin"], "-j {concurrency}");
+            assert_eq!(std::fs::read(dir.join("twice.bin")).unwrap(), body);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     /// What the downloads print while a question waits for its answer (a finished file, a log

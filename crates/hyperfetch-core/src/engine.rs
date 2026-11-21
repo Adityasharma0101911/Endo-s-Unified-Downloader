@@ -1123,6 +1123,7 @@ impl DownloadEngine {
         engine.already_done = Arc::clone(&self.already_done);
         engine.reused = Arc::clone(&self.reused);
         engine.site = Arc::clone(&self.site);
+        engine.finished = Arc::clone(&self.finished);
         engine
     }
 
@@ -3788,10 +3789,11 @@ impl DownloadEngine {
             put_in_place(&part, final_path, &state_path, by_content, replace)
         })
         .await??;
-        drop(claim);
         self.finished.store(true, Ordering::SeqCst);
         tracing::info!("Download completed: {} (BLAKE3 {})", target.display(), blake3_hex);
         self.record_completed(target.clone(), Some(size), blake3_hex, started_at, None, etag).await;
+        // Only now: a download of the same link that looks for its name finds it in history.
+        drop(claim);
 
         emit(snapshot_tx, || EngineSnapshot { checked_against: self.checked_against(), place_free: true, ..done_snapshot(size, &target) });
         Ok(target)
@@ -9992,6 +9994,17 @@ mod tests {
         let (from_copy, from_first) = (at_copy.served.load(Ordering::SeqCst), at_first.served.load(Ordering::SeqCst));
         assert!(from_copy > 0, "the copy served ranges");
         assert!(from_first >= size, "the first server sent again what the copy had: {from_first} of {size}");
+    }
+
+    /// A download run again as another (over HTTP/2, a round of pieces fetched again) tells the
+    /// one it stands for that its file passed its checks: stopped after that, it keeps its
+    /// download-archive line.
+    #[tokio::test]
+    async fn test_a_download_run_again_says_its_file_passed() {
+        let engine = DownloadEngine::new(vec![Url::parse("http://a.test/f.bin").unwrap()], DownloadOptions::default());
+        let again = engine.alike(engine.urls.clone(), engine.options.clone(), engine.client.clone());
+        again.finished.store(true, Ordering::SeqCst);
+        assert!(engine.finished.load(Ordering::SeqCst));
     }
 
     /// The whole-file hash of the Metalink a server's `Link` header names checks the file as a
