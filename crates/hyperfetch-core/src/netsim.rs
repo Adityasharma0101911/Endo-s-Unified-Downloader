@@ -44,6 +44,9 @@ pub(crate) struct Server {
     pub size: usize,
     /// Bytes per second each connection is held to.
     pub per_connection: Option<f64>,
+    /// Each connection starts at a sixteenth of `per_connection` and doubles four times evenly over
+    /// this long to reach it, as a connection's congestion window grows on a far host.
+    pub slow_start: Option<Duration>,
     /// Bytes per second all connections share: a cap that more connections do not raise.
     pub per_client: Option<f64>,
     /// GETs served at once; one more is refused with `refusal`.
@@ -325,7 +328,7 @@ async fn answer(
     let decay = server.decay.filter(|decay| first(decay.from, &stats.decayed));
     let cut = server.cut.filter(|&(from, _)| first(from, &stats.cut)).map(|(_, after)| after);
     let own = server.per_connection.map(|rate| RateLimiter::new(rate as u64));
-    let (mut sent, mut slowed) = (0, None);
+    let (mut sent, mut slowed, began) = (0, None, tokio::time::Instant::now());
     let (mut from_client, mut to_client) = socket.split();
     for offset in (start..=end).step_by(PIECE) {
         let mut piece = std::borrow::Cow::Borrowed(bytes_at(offset, end.min(offset + PIECE - 1) + 1 - offset));
@@ -346,7 +349,16 @@ async fn answer(
                     rate >= 1024.0
                 }
                 None => {
-                    if let Some(own) = &own {
+                    // Paced by the bytes sent in all, which a coarse timer cannot make faster: at
+                    // `rate · 2^(4(t/T - 1))`, `B` bytes are out by `T · (1 + log2(4 ln2 · B / (rate · T) + 1/16) / 4)`.
+                    let due = server.slow_start.zip(server.per_connection).and_then(|(within, rate)| {
+                        let (t, b) = (within.as_secs_f64(), (sent + piece.len()) as f64);
+                        let at = t * (1.0 + (4.0 * std::f64::consts::LN_2 * b / (rate * t) + 1.0 / 16.0).log2() / 4.0);
+                        (at < t).then(|| began + Duration::from_secs_f64(at))
+                    });
+                    if let Some(due) = due {
+                        tokio::time::sleep_until(due).await;
+                    } else if let Some(own) = &own {
                         own.acquire(piece.len() as u64).await;
                     }
                     if let Some(shared) = &shared {

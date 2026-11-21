@@ -125,10 +125,6 @@ const DISK_HEADROOM: u64 = 64 * 1024 * 1024;
 /// connection or ended up fastest with more: the Autopilot adds more as they pay, and a server
 /// that serves few well is not opened every connection the user allows at once.
 const AUTOPILOT_START: usize = 8;
-/// Opening its connections one at a time from its first stream, each once the last was answered,
-/// may cost a download this share of what it takes at full width, against two more for each
-/// answer (see `Ramp::one_at_a_time`).
-const ONE_AT_A_TIME: f64 = 0.1;
 
 #[derive(Debug, Clone, Default)]
 pub struct EngineSnapshot {
@@ -3099,13 +3095,14 @@ impl DownloadEngine {
         let hashed = self.options.expected_checksum.clone().or_else(|| crate::digest::found(&self.site));
         let in_order = crate::storage::hashes_prefix(self.options.expected_checksum.as_deref());
         let throttled_host = mirrors.iter().any(|m| HostKey::of(&m.url).is_bitrate_throttled());
-        // A first stream that goes on alone, or the only one a host that limits how often it is
-        // asked gets, has a gap for one chunk, unless chunks are kept small for the reasons
-        // `effective_chunk_size` gives: what it has left is cut for the connections that join it
-        // (see `ChunkManager::spread`), or taken from its far end (see `ChunkManager::steal_work`).
-        // Not a resumed download: its gaps are split as they always were.
-        let alone_first = streaming.is_some() && state.completed_ranges.is_empty() && (limited || (start.rate.is_none() && best.is_none()));
-        let whole_gaps = alone_first && self.options.base_chunk_size == DEFAULT_CHUNK_SIZE && !in_order && !throttled_host;
+        // A first stream has a gap for one chunk, unless chunks are kept small for the reasons
+        // `effective_chunk_size` gives: what it has left is cut for the connections that join it,
+        // the farthest piece for the first (see `ChunkManager::spread`), or taken from its far end
+        // (see `ChunkManager::steal_work`); also when the host's recipe says how many join it at
+        // once. Not a resumed download: its gaps are split as they always were.
+        let fresh_stream = streaming.is_some() && state.completed_ranges.is_empty();
+        let alone_first = fresh_stream && (limited || (start.rate.is_none() && best.is_none()));
+        let whole_gaps = fresh_stream && self.options.base_chunk_size == DEFAULT_CHUNK_SIZE && !in_order && !throttled_host;
         let chunk_size = match whole_gaps {
             true => size,
             false => effective_chunk_size(remaining, num_workers as u64, self.options.base_chunk_size, in_order, throttled_host),
@@ -3118,6 +3115,7 @@ impl DownloadEngine {
         let seed = match live {
             Some(Live::Range { response, slot, end, watch, .. }) => mirrors.iter().position(|m| m.url == reference.url).and_then(|mirror_id| {
                 let chunk = manager.assign_at(0, mirror_id, prefetch.len() as u64, end)?;
+                chunk.asked(end);
                 let (body, url) = (response.bytes_stream().boxed(), reference.final_url.clone());
                 let body = match watch {
                     Some(watch) => Watched { body, watch: Some(watch), alone: alone.clone(), url: url.clone() }.boxed(),
@@ -3134,6 +3132,12 @@ impl DownloadEngine {
             Some(_) => (counted.clamp(1, max_workers) as usize, 1),
             None => (num_workers, num_workers),
         };
+        // Joined at once by what the host's recipe says, the stream's far pieces go first, one
+        // connection at a time (see `Ramp::widen_from`).
+        let joined = adapts && solo.is_none() && whole_gaps && seed.is_some() && num_workers > 1;
+        if joined {
+            manager.spread(num_workers, MIN_STEAL);
+        }
         let streamed = prefetch.len() as u64;
 
         let racer = build_racer(&mirrors);
@@ -3162,6 +3166,9 @@ impl DownloadEngine {
             // FTP and SFTP sessions are no requests a host counts.
             ramp: Arc::new(Ramp::new(if self.ftp.is_some() || self.sftp.is_some() { usize::MAX } else { 2 })),
         };
+        if joined {
+            job.ramp.widen_from(1);
+        }
 
         let mut meter = SpeedMeter::new(job.chunks.lock().total_downloaded());
         emit(snapshot_tx, || job.snapshot(size, &mut meter, final_path));
@@ -3351,9 +3358,21 @@ impl DownloadEngine {
                     if let Some(next) = next.filter(|&next| next != width.load(Ordering::Relaxed)) {
                         // Workers past a lower width hand back what they have yet to receive, but
                         // not to a host that refused a request lately: it limits how often it is
-                        // asked, and what they already have it send they finish.
-                        if width.swap(next, Ordering::Relaxed) > next && (by_user || !job.limits_requests()) {
+                        // asked, and what they already have it send they finish. Nor when the
+                        // Autopilot comes back to the first stream: it brings what no other
+                        // connection has (see `ChunkManager::strand_nothing`), and one that joined
+                        // it finishes its piece. More go one at a time, the farthest piece first,
+                        // the ramp set before any of them may go (see `Ramp::widen_from`).
+                        let was = width.load(Ordering::Relaxed);
+                        if next > was {
+                            job.ramp.widen_from(was);
+                        }
+                        width.store(next, Ordering::Relaxed);
+                        if was > next && (by_user || (next > 1 && !job.limits_requests())) {
                             job.chunks.lock().give_back(next);
+                        }
+                        if next == 1 && !by_user {
+                            job.chunks.lock().strand_nothing(None);
                         }
                         if let Some(shared) = &spare {
                             for worker_id in spawned..next {
@@ -3368,7 +3387,11 @@ impl DownloadEngine {
                     // of a host that refused one. A stream the file ends in while it still shows its
                     // speed leaves them for its last byte (see `digest::finish`).
                     let wide = width.load(Ordering::Relaxed);
-                    if !looking && pilot.as_ref().is_none_or(|pilot| !pilot.is_alone()) && !job.limits_requests() && job.widened_to(wide) {
+                    if job.ramp.is_widening() && job.done_widening(wide) {
+                        job.ramp.widened();
+                    }
+                    let opening = pilot.as_ref().is_some_and(|pilot| pilot.is_alone() || pilot.is_judging());
+                    if !looking && !opening && !job.limits_requests() && job.widened_to(wide) {
                         crate::digest::go(&self.site);
                         looking = true;
                     }
@@ -3390,7 +3413,7 @@ impl DownloadEngine {
                     }
                     // The first stream shows its speed well within a snapshot's interval on a fast
                     // host: looked at this often, it is not left alone longer than it must be.
-                    if pilot.as_ref().is_some_and(|pilot| pilot.is_alone()) && Instant::now() < quick_until {
+                    if pilot.as_ref().is_some_and(|pilot| pilot.is_alone() || pilot.is_judging()) && Instant::now() < quick_until {
                         tick.reset_after(MIN_RATE_TICK);
                     }
                 }
@@ -4654,6 +4677,16 @@ impl RangeJob {
             && (answered >= width || !all.iter().any(|c| matches!(c.status, ChunkStatus::Unassigned | ChunkStatus::Failed { .. })))
     }
 
+    /// Whether the download is done widening to `width` (see `Ramp::widen_from`): its requests were
+    /// answered, and the last worker up to `width` had its answer, or no piece is left for one.
+    fn done_widening(&self, width: usize) -> bool {
+        let all_answered = || {
+            let chunks = self.chunks.lock();
+            chunks.answered() == chunks.chunks().iter().filter(|c| c.is_in_flight()).count()
+        };
+        self.widened_to(width) || (self.ramp.lets_go(width) && all_answered())
+    }
+
     /// The width `pilot` moves an adaptive download to, if it moves (see [`Autopilot::next`]);
     /// call it every few hundred milliseconds.
     fn steer(&self, pilot: &mut Autopilot) -> Option<usize> {
@@ -4671,31 +4704,36 @@ impl RangeJob {
         let mut seen = std::collections::HashSet::new();
         let cap = urls.iter().filter(|url| seen.insert(HostKey::of(url))).map(|url| hosts::profile(url).connection_cap).sum();
         let (now, left, startup) = (Instant::now(), size.saturating_sub(downloaded), startup.unwrap_or_default());
+        // Refused while it widened: it keeps the connections the host served (see `Ramp::refused`).
+        if let Some(took) = self.ramp.took() {
+            return pilot.took(took);
+        }
+        // The rate its connections are held to, once the stream's watch (see `Watched`) saw it,
+        // and what a new connection to it takes, as its recipe says, else the first request.
+        let known = urls.first().map(hosts::profile).unwrap_or_default();
+        let setup = known.setup_time.unwrap_or(startup);
         if pilot.is_alone() {
             // A host found meanwhile to limit how often it is asked is asked nothing more.
             if self.limits_requests() {
                 pilot.hold();
                 return None;
             }
-            // The rate its connections are held to, once the stream's watch (see `Watched`) saw it,
-            // and what a new connection to it takes, as its recipe says, else the first request.
-            let known = urls.first().map(hosts::profile).unwrap_or_default();
             let rate = known.connection_rate.filter(|_| known.capped_per_connection == Some(true));
-            let setup = known.setup_time.unwrap_or(startup);
             let opened = pilot.open(now, downloaded, left, setup, rate, cap);
-            // Each new connection asks for a piece of its own of what the stream has left; one at
-            // a time while that costs the download little of what it takes at full width.
+            // Each new connection asks for a piece of its own of what the stream has left, the
+            // farthest first, one at a time (see `Ramp::widen_from`).
             if let Some(width) = opened {
                 self.chunks.lock().spread(width, MIN_STEAL);
-                // The n-th newcomer starts n - 1 set-ups late, where twice as many a round start
-                // all within a few: the download loses about (n - 1)(n - 2) / 2n set-ups of its
-                // time at full width.
-                let (n, full) = (width as f64, left as f64 / (rate.unwrap_or(pilot.best).max(1.0) * width as f64));
-                if (n - 1.0) * (n - 2.0) / (2.0 * n) * setup.as_secs_f64() <= ONE_AT_A_TIME * full {
-                    self.ramp.one_at_a_time();
-                }
             }
             return opened;
+        }
+        if pilot.is_judging() {
+            let judged = pilot.judge(now, downloaded, self.widened_to(2), setup);
+            // The one more keeps its half; the rest take theirs from the far end of what is left.
+            if let Some(width) = judged {
+                self.chunks.lock().spread(width - 1, MIN_STEAL);
+            }
+            return judged;
         }
         // Refused meanwhile, as its checksum files may be: the first stream's request brings what
         // no connection has yet, where it reaches it within the host's rest (see `ChunkManager::rejoin`).
@@ -10252,14 +10290,16 @@ mod tests {
     }
 
     /// A server that shuts out a client at its first refusal, for 3 s: the requests it then leaves
-    /// unanswered are waited out without costing retries, of which the download has one.
+    /// unanswered are waited out without costing retries, of which the download has one. Eight
+    /// connections the user set, opened in rounds, provoke it; the Autopilot would ask for no
+    /// more once refused (see `test_a_refusal_while_widening_strands_nothing`).
     #[tokio::test(flavor = "multi_thread")]
     async fn test_a_host_that_shuts_us_out_for_a_while_is_waited_for() {
         let size = 4 * 1024 * 1024;
         let rate = crate::netsim::RateLimit { requests: 3, window: Duration::from_secs(1), retry_after: 1, ban_after: 1, ban: Duration::from_secs(3) };
         let (url, stats) = crate::netsim::serve(crate::netsim::Server { size, per_connection: Some(1e6), rate: Some(rate), ..Default::default() }).await;
         let dir = tempdir().unwrap();
-        let (got, _) = fetch_from_sim(&url, DownloadOptions { max_retries: 1, ..sim_options(dir.path(), 8, true) }).await;
+        let (got, _) = fetch_from_sim(&url, DownloadOptions { max_retries: 1, ..sim_options(dir.path(), 8, false) }).await;
         assert!(got == crate::netsim::file(size));
         let (refused, _, shut) = refusals(&stats);
         assert!(refused >= 1 && shut >= 1, "the server shut us out ({refused} refused, {shut} shut out)");
@@ -10346,6 +10386,81 @@ mod tests {
         assert!(std::fs::read(path).unwrap() == crate::netsim::file(size));
         let log = stats.log.lock()[before..].to_vec();
         assert_eq!(log, [("/f.bin".to_string(), false)], "the file alone, in one request");
+    }
+
+    /// A stream from a host 300 ms away starts at a sixteenth of its 4 MB/s and reaches it after
+    /// 600 ms, and the host held an earlier download to about that speed whatever its
+    /// connections: judged by the speed it reaches, not by what it brought while it started, the
+    /// stream goes on alone, the one request the download makes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_stream_that_starts_slowly_is_judged_by_the_speed_it_reaches() {
+        let (size, per_connection) = (12 * 1024 * 1024, 4e6);
+        let slow_start = Some(Duration::from_millis(600));
+        let server = crate::netsim::Server { size, per_connection: Some(per_connection), slow_start, first_byte: Duration::from_millis(300), ..Default::default() };
+        let (url, stats) = crate::netsim::serve(server).await;
+        hosts::record_settled(&url, 0, Some(0.9 * per_connection));
+        let dir = tempdir().unwrap();
+        let (got, said) = fetch_from_sim(&url, sim_options(dir.path(), 8, true)).await;
+        assert!(got == crate::netsim::file(size));
+        assert_eq!((asked(&stats), stats.peak.load(Ordering::SeqCst)), ((1, 0), 1), "{said:?}");
+        assert!(said.as_deref().is_some_and(|said| said.starts_with("1 connection: the server or your line holds it to about ")), "{said:?}");
+    }
+
+    /// A host that serves k requests at once and refuses more with 429 and a rest of 6 s, each
+    /// connection held to 4 MB/s: the download widens one request at a time, the far pieces
+    /// first, so the first refused ends it, and what that request was to bring comes over the
+    /// first stream's. It never waits out the rest: it ends within one and a half times what one
+    /// stream takes, and the host refuses one request at most. Many times over, as the fault was
+    /// one of timing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_refusal_while_widening_strands_nothing() {
+        let (size, per_connection) = (4 * 1024 * 1024, 4e6);
+        let one_stream = Duration::from_secs_f64(size as f64 / per_connection);
+        for k in 1..=3 {
+            for run in 0..4 {
+                let server = crate::netsim::Server { size, per_connection: Some(per_connection), max_connections: Some(k), refusal: (429, Some(6)), ..Default::default() };
+                let (url, stats) = crate::netsim::serve(server).await;
+                let dir = tempdir().unwrap();
+                let started = Instant::now();
+                let (got, said) = fetch_from_sim(&url, sim_options(dir.path(), 8, true)).await;
+                let took = started.elapsed();
+                assert!(got == crate::netsim::file(size), "k {k}, run {run}");
+                let refused = stats.refused.load(Ordering::SeqCst);
+                assert!(took < one_stream * 3 / 2, "k {k}, run {run}: {took:?} against {one_stream:?}, {refused} refused, {said:?}");
+                assert!(refused <= 1, "k {k}, run {run}: {refused} refused, {said:?}");
+            }
+        }
+    }
+
+    /// A host that shares 4 MB/s among a client's connections: the one more beside the first
+    /// stream brings nothing, so no more open, and the download keeps the two it had at most.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_one_more_that_does_not_pay_opens_no_more() {
+        let size = 8 * 1024 * 1024;
+        let (url, stats) = crate::netsim::serve(crate::netsim::Server { size, per_client: Some(4e6), ..Default::default() }).await;
+        let dir = tempdir().unwrap();
+        let (got, said) = fetch_from_sim(&url, sim_options(dir.path(), 8, true)).await;
+        assert!(got == crate::netsim::file(size));
+        assert!(asked(&stats).0 <= 2 && stats.peak.load(Ordering::SeqCst) <= 2, "{:?}, {said:?}", asked(&stats));
+        assert_eq!(hosts::best_connections(&url), Some(1), "{said:?}");
+    }
+
+    /// A host 100 ms away met before, which took four requests at once and refused a fifth, and
+    /// keeps a budget of requests (4 at once, then one every 3 s, past it 429 with Retry-After 3):
+    /// the download starts with its four, sent one after another, and splits no running piece
+    /// into another request when the first ends before the last, which the host would refuse.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_host_that_refused_more_at_once_gets_no_piece_split_off() {
+        let size = 16 * 1024 * 1024;
+        let budget = crate::netsim::Budget { burst: 4, every: Duration::from_secs(3), retry_after: 3 };
+        let server = crate::netsim::Server { size, per_connection: Some(8e6), budget: Some(budget), first_byte: Duration::from_millis(100), ..Default::default() };
+        let (url, stats) = crate::netsim::serve(server).await;
+        hosts::record(&url, HostProfile { connection_cap: Some(4), ..Default::default() });
+        hosts::record_settled(&url, 4, None);
+        let dir = tempdir().unwrap();
+        let (got, said) = fetch_from_sim(&url, sim_options(dir.path(), 8, true)).await;
+        assert!(got == crate::netsim::file(size));
+        assert_eq!((asked(&stats).0, stats.throttled.load(Ordering::SeqCst)), (4, 0), "{said:?}");
     }
 
     /// The (GETs, HEADs) a server saw.

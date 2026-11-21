@@ -399,7 +399,7 @@ fn http_date(mdtm: &str) -> Option<String> {
 pub(crate) async fn work(worker_id: usize, shared: WorkerShared, net: Arc<Net>) {
     let s = &shared;
     loop {
-        if !s.within_width(worker_id).await {
+        if !s.within_width(worker_id, usize::MAX).await {
             return;
         }
         let taken = tokio::select! {

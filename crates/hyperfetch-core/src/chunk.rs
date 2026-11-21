@@ -142,6 +142,9 @@ struct Attempt {
     fastest: f64,
     /// Bytes per second over its worker's last `RECENT`.
     recent: Option<f64>,
+    /// The last byte its request asked for (0 until told): the answer brings the bytes up to it
+    /// whatever the chunk's end became since (see [`ChunkManager::strand_nothing`]).
+    asked: u64,
 }
 
 impl Chunk {
@@ -167,6 +170,11 @@ impl Chunk {
         let mut attempt = self.attempt.lock();
         attempt.answered = Some((at, from));
         attempt.waiting = Some(at);
+    }
+
+    /// The attempt's request asked for the bytes up to `end`.
+    pub(crate) fn asked(&self, end: u64) {
+        self.attempt.lock().asked = end;
     }
 
     /// The attempt's worker waits for the server from `since` on.
@@ -755,6 +763,47 @@ impl ChunkManager {
         stream.end_offset.store(end, Ordering::SeqCst);
     }
 
+    /// Gives each request under way the pieces no worker has right after its chunk's end, as far
+    /// as the request asked: when a refusal ended the download's widening, or the width came back
+    /// to one, what no connection is to take comes over an answer already on its way (the first
+    /// stream's runs to the file's end) instead of a new request after the host's rest. A piece
+    /// further than any request asked is left for one. With `wait`, the host's rest after a
+    /// refusal at another time (a piece cut off a request and refused, say), only the pieces it
+    /// reaches at its pace within that rest, as [`ChunkManager::rejoin`] gives the first stream:
+    /// past them, a new request once the host takes one again brings a piece sooner.
+    pub(crate) fn strand_nothing(&mut self, wait: Option<Duration>) {
+        let now = Instant::now();
+        for id in 0..self.chunks.len() {
+            let chunk = &self.chunks[id];
+            let asked = chunk.attempt.lock().asked;
+            if !chunk.is_in_flight() || chunk.revoked.is_cancelled() || chunk.unreceived() == 0 {
+                continue;
+            }
+            let mut end = chunk.end_offset.load(Ordering::SeqCst);
+            let reach = match wait {
+                None => u64::MAX,
+                Some(wait) => match chunk.pace(now, None) {
+                    Some((_, rate)) => (end + 1 - chunk.unreceived()).saturating_add((rate * wait.as_secs_f64()) as u64),
+                    None => continue,
+                },
+            };
+            while let Some(next) = self.chunks.iter().position(|c| {
+                c.range.start == end + 1
+                    && c.range.end <= asked
+                    && c.range.start <= reach
+                    && matches!(c.status, ChunkStatus::Unassigned | ChunkStatus::Failed { .. })
+            }) {
+                end = self.chunks[next].range.end;
+                self.chunks[next].status = ChunkStatus::Merged;
+                self.completed += 1;
+                self.retry_queue.retain(|&queued| queued != next);
+            }
+            let chunk = &mut self.chunks[id];
+            chunk.range.end = end;
+            chunk.end_offset.store(end, Ordering::SeqCst);
+        }
+    }
+
     /// Hands back what the attempts of workers `from` and above have yet to receive, as fresh
     /// chunks for the others: a download whose connections were cut goes on without waiting for
     /// those attempts. Each keeps one byte, so it ends at its next, as a victim of a steal does.
@@ -1289,6 +1338,35 @@ mod tests {
         assert_eq!(retried.id, first.id);
         manager.rejoin(Duration::from_secs(10));
         assert_eq!(retried.end_offset.load(Ordering::SeqCst), at(1) - 1);
+    }
+
+    /// A piece cut off a request under way and refused goes back to that request, which asked for
+    /// it already: at once when a refusal ended a widening, else only where the request reaches it
+    /// at its pace within the host's rest.
+    #[test]
+    fn test_a_refused_piece_goes_back_to_the_request_that_asked_for_it() {
+        let cut = || {
+            let mut manager = ChunkManager::new(10 * MB, 10 * MB).unwrap();
+            let stream = manager.get_next_work(0, 0).unwrap();
+            stream.asked(10 * MB - 1);
+            // 1 MB in its first second.
+            stream.answered(Instant::now() - Duration::from_secs(1));
+            stream.current_offset.store(MB, Ordering::SeqCst);
+            let (_, stolen) = manager.steal_work(1, 1, MB).unwrap();
+            manager.mark_failed(stolen.id, "HTTP 429", Duration::from_secs(3), false).unwrap();
+            (manager, stream)
+        };
+        let (mut manager, stream) = cut();
+        manager.strand_nothing(Some(Duration::from_secs(3)));
+        assert_eq!(stream.end_offset.load(Ordering::SeqCst), MB + 9 * MB / 2 - 1, "out of reach in 3 s");
+        manager.strand_nothing(Some(Duration::from_secs(10)));
+        assert_eq!(stream.end_offset.load(Ordering::SeqCst), 10 * MB - 1);
+        assert!(manager.get_next_work(2, 0).is_none(), "nothing is left to ask for");
+        let (mut manager, stream) = cut();
+        manager.strand_nothing(None);
+        assert_eq!(stream.end_offset.load(Ordering::SeqCst), 10 * MB - 1);
+        manager.mark_completed(stream.id).unwrap();
+        assert!(manager.is_all_completed());
     }
 
     /// What no worker has is merged into as many requests as the connections kept: with one, the
