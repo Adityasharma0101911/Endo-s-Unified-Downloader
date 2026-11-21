@@ -517,19 +517,27 @@ pub struct WorkerShared {
 /// burst, and some then shut out whoever sent it.
 pub struct Ramp {
     open: std::sync::atomic::AtomicUsize,
+    /// Workers each answer lets go: 2, or 1 once [`Ramp::one_at_a_time`].
+    step: std::sync::atomic::AtomicUsize,
     widened: tokio::sync::Notify,
 }
 
 impl Ramp {
     /// `open` workers may send requests from the start.
     pub fn new(open: usize) -> Self {
-        Self { open: open.into(), widened: tokio::sync::Notify::new() }
+        Self { open: open.into(), step: 2.into(), widened: tokio::sync::Notify::new() }
     }
 
-    /// A request was answered: two more workers may send theirs.
+    /// From now on each answer lets one more worker go: a host that keeps a budget of requests
+    /// refuses one of them at most, where twice as many each round may have it refuse half.
+    pub(crate) fn one_at_a_time(&self) {
+        self.step.store(1, Ordering::Relaxed);
+    }
+
+    /// A request was answered: two more workers may send theirs (one, see [`Ramp::one_at_a_time`]).
     fn answered(&self) {
         // A ramp that lets every worker go stays so (atomics wrap).
-        if self.open.fetch_add(2, Ordering::Relaxed) > usize::MAX - 2 {
+        if self.open.fetch_add(self.step.load(Ordering::Relaxed), Ordering::Relaxed) > usize::MAX - 2 {
             self.open.store(usize::MAX, Ordering::Relaxed);
         }
         self.widened.notify_waiters();

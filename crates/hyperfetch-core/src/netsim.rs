@@ -198,6 +198,9 @@ pub(crate) struct Stats {
     pub shut: AtomicUsize,
     /// When the first byte of a body went out.
     pub first_sent: std::sync::OnceLock<std::time::Instant>,
+    /// The path of each GET answered and each request refused for `Server::budget`, in order,
+    /// with whether it was refused.
+    pub log: parking_lot::Mutex<Vec<(String, bool)>>,
     decayed: AtomicBool,
     cut: AtomicBool,
 }
@@ -247,8 +250,10 @@ async fn answer(
         }
     }
     stats.asked.fetch_add(1, Ordering::SeqCst);
+    let asked_for = String::from_utf8_lossy(&head).split_whitespace().nth(1).unwrap_or("/").to_string();
     if let Some(budget) = &server.budget {
         if !limiting.lock().spend(budget, &stats, tokio::time::Instant::now()) {
+            stats.log.lock().push((asked_for, true));
             let refusal = format!("HTTP/1.1 429 Too Many Requests\r\nRetry-After: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", budget.retry_after);
             let _ = socket.write_all(refusal.as_bytes()).await;
             return;
@@ -296,6 +301,7 @@ async fn answer(
         return;
     }
     stats.gets.fetch_add(1, Ordering::SeqCst);
+    stats.log.lock().push((asked_for, false));
     let open = stats.open.fetch_add(1, Ordering::SeqCst) + 1;
     let _open = Open(&stats.open);
     if server.max_connections.is_some_and(|most| open > most) {

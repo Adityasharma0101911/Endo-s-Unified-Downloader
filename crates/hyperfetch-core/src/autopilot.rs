@@ -70,6 +70,10 @@ enum Why {
     Limited,
     /// The first request's one stream, while it shows what it does.
     Alone,
+    /// Opened from that stream, which went this fast, as what was left paid for more.
+    Opened(f64),
+    /// Opened from that stream, each connection seen held to this rate.
+    Held(f64),
 }
 
 #[derive(Debug)]
@@ -197,20 +201,21 @@ impl Autopilot {
         if let Some(rate) = rate {
             self.start.rate = Some(rate);
             let fill = self.start.line.map_or(most, |line| (line / rate).ceil() as usize);
-            return self.open_to(fill.clamp(1, most), now, downloaded);
+            return self.open_to(fill.clamp(1, most), now, downloaded, Why::Held(rate));
         }
         if self.start.limit.is_some_and(|limit| speed * GAIN >= limit) {
             return self.settle(1, Why::Flat(speed));
         }
-        self.open_to(opening.clamp(1, most), now, downloaded)
+        self.open_to(opening.clamp(1, most), now, downloaded, Why::Opened(speed))
     }
 
-    /// Opens `width` from the one stream at `now`, with `downloaded` bytes in: the climb goes on
-    /// from there, its first window not compared. The width, if more than the stream.
-    fn open_to(&mut self, width: usize, now: Instant, downloaded: u64) -> Option<usize> {
+    /// Opens `width` from the one stream at `now`, with `downloaded` bytes in, for `why`: the
+    /// climb goes on from there, its first window not compared. The width, if more than the
+    /// stream.
+    fn open_to(&mut self, width: usize, now: Instant, downloaded: u64, why: Why) -> Option<usize> {
         self.width = width;
         self.step = if self.start.rate.is_some() { width } else { (width / 2).max(1) };
-        (self.began, self.settling, self.why) = ((now, downloaded), true, Why::Starting);
+        (self.began, self.settling, self.why) = ((now, downloaded), true, why);
         (width > 1).then_some(width)
     }
 
@@ -376,6 +381,10 @@ impl Autopilot {
             Why::Short => format!("{c}: too little is left to try more"),
             Why::Limited => format!("{c}: the server limits how often it is asked (429/503), so it is asked for the file alone"),
             Why::Alone => format!("{c} while its speed shows; more are opened only if they pay"),
+            Why::Opened(speed) => {
+                format!("{c}: the first went at {}, and what is left pays for more; more are tried while they make it faster", per_sec(speed))
+            }
+            Why::Held(rate) => format!("{c}: each connection is held to {}, so more bring more", per_sec(rate)),
         }
     }
 }

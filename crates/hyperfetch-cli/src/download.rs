@@ -374,36 +374,63 @@ impl Clients {
     }
 }
 
-/// The running downloads of a batch known to be small (see `EngineSnapshot::small`), and a wake-up
-/// for the batch when one becomes so: it may start another (see [`may_start`]).
+/// The running downloads of a batch known to be small (see `EngineSnapshot::small`), those whose
+/// file is in place (see `EngineSnapshot::in_place`), and a wake-up for the batch when one becomes
+/// either: it may start another (see [`may_start`]).
 #[derive(Default)]
 struct Small {
     count: AtomicUsize,
+    in_place: AtomicUsize,
     found: Notify,
 }
 
-/// A download counted among the small ones while its last snapshot says it is, until it ends.
-struct CountedSmall<'a>(&'a Small, bool);
+impl Small {
+    fn counter(&self, counted: Counted) -> Option<&AtomicUsize> {
+        match counted {
+            Counted::No => None,
+            Counted::Small => Some(&self.count),
+            Counted::InPlace => Some(&self.in_place),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Counted {
+    No,
+    Small,
+    InPlace,
+}
+
+/// A download counted among the small ones while its last snapshot says it is, and among those
+/// in place from the first that says so, until it ends.
+struct CountedSmall<'a>(&'a Small, Counted);
 
 impl CountedSmall<'_> {
     fn see(&mut self, snapshot: &EngineSnapshot) {
-        if snapshot.small == self.1 {
+        let now = match self.1 {
+            Counted::InPlace => Counted::InPlace,
+            _ if snapshot.in_place => Counted::InPlace,
+            _ if snapshot.small => Counted::Small,
+            _ => Counted::No,
+        };
+        if now == self.1 {
             return;
         }
-        self.1 = snapshot.small;
-        if self.1 {
-            self.0.count.fetch_add(1, Ordering::SeqCst);
-            self.0.found.notify_one();
-        } else {
-            self.0.count.fetch_sub(1, Ordering::SeqCst);
+        if let Some(was) = self.0.counter(self.1) {
+            was.fetch_sub(1, Ordering::SeqCst);
         }
+        if let Some(counter) = self.0.counter(now) {
+            counter.fetch_add(1, Ordering::SeqCst);
+            self.0.found.notify_one();
+        }
+        self.1 = now;
     }
 }
 
 impl Drop for CountedSmall<'_> {
     fn drop(&mut self) {
-        if self.1 {
-            self.0.count.fetch_sub(1, Ordering::SeqCst);
+        if let Some(was) = self.0.counter(self.1) {
+            was.fetch_sub(1, Ordering::SeqCst);
         }
     }
 }
@@ -427,7 +454,9 @@ pub async fn run_jobs(jobs: Vec<Job>, concurrency: usize, ui: &Ui, shutdown: &Sh
     let (mut waiting, mut running) = (VecDeque::from(jobs), FuturesUnordered::new());
     let mut failed = 0;
     loop {
-        while may_start(running.len(), small.count.load(Ordering::SeqCst), concurrency) {
+        // A download whose file is in place holds no place, one at a time too: what is left of it
+        // is the site's checksum, checked behind it.
+        while may_start(running.len().saturating_sub(small.in_place.load(Ordering::SeqCst)), small.count.load(Ordering::SeqCst), concurrency) {
             // None when nothing is asked; Some(None) while it is not answered.
             let answer = ffmpeg.as_ref().map(|answer| answer.peek().copied());
             let next = waiting.iter().position(|job| answer != Some(None) || !job.needs_ffmpeg());
@@ -535,7 +564,7 @@ async fn run_job(
     overall: Option<&ProgressBar>,
     small: &Small,
 ) -> Outcome {
-    let mut small = CountedSmall(small, false);
+    let mut small = CountedSmall(small, Counted::No);
     let mut stop = shutdown.subscribe();
     if stop.borrow().is_some() {
         return Outcome::Interrupted;
@@ -889,16 +918,20 @@ mod tests {
         let text = std::fs::read_to_string(&log).unwrap();
         let items: Vec<serde_json::Value> =
             text.lines().filter(|line| line.starts_with('{')).map(|line| serde_json::from_str(line).unwrap()).collect();
-        let statuses: Vec<&str> = items.iter().map(|item| item["status"].as_str().unwrap()).collect();
-        assert_eq!(statuses, ["ok", "failed", "up-to-date"], "{text}");
+        let mut statuses: Vec<&str> = items.iter().map(|item| item["status"].as_str().unwrap()).collect();
+        // A file in place frees its place, so the next one may end before its checksum is checked.
+        statuses[..2].sort();
+        assert_eq!(statuses, ["failed", "ok", "up-to-date"], "{text}");
+        let with = |status: &str| items.iter().find(|item| item["status"] == status).unwrap();
+        let (ok, failed) = (with("ok"), with("failed"));
         // The keys in their documented order.
-        let failed = text.lines().find(|line| line.starts_with(r#"{"status":"failed","url":"#)).unwrap();
-        assert!(failed.contains(r#","path":null,"size":null,"checksum":null,"checked_against":null,"error":""#), "{failed}");
+        let line = text.lines().find(|line| line.starts_with(r#"{"status":"failed","url":"#)).unwrap();
+        assert!(line.contains(r#","path":null,"size":null,"checksum":null,"checked_against":null,"error":""#), "{line}");
         let path = dir.join("a.bin").display().to_string();
-        assert_eq!((items[0]["path"].as_str(), items[0]["size"].as_u64()), (Some(path.as_str()), Some(body.len() as u64)));
-        assert!(items[0]["url"].as_str().unwrap().ends_with("/dated/a.bin?token=REDACTED"), "{}", items[0]);
-        assert!(items[0]["error"].is_null() && items[0]["checksum"].is_null() && items[0]["checked_against"].is_null());
-        assert!(items[1]["error"].as_str().unwrap().contains("cookies"), "{}", items[1]);
+        assert_eq!((ok["path"].as_str(), ok["size"].as_u64()), (Some(path.as_str()), Some(body.len() as u64)));
+        assert!(ok["url"].as_str().unwrap().ends_with("/dated/a.bin?token=REDACTED"), "{ok}");
+        assert!(ok["error"].is_null() && ok["checksum"].is_null() && ok["checked_against"].is_null());
+        assert!(failed["error"].as_str().unwrap().contains("cookies"), "{failed}");
         assert_eq!(items[2]["path"].as_str(), Some(path.as_str()));
         assert!(text.contains("[FAILED] b: "), "the human lines too: {text}");
         assert!(!text.contains("secret"), "{text}");

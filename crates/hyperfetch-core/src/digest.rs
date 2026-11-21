@@ -363,6 +363,8 @@ fn algo_name(algo: &str) -> String {
 #[derive(Default)]
 pub(crate) struct Site {
     search: Option<JoinHandle<Option<String>>>,
+    /// Lets `search` ask the site for anything (see [`go`]).
+    go: Option<tokio::sync::watch::Sender<bool>>,
     /// What `search` gives, as soon as it is found: the download's writer hashes the file with it
     /// as the file arrives (see [`found`]).
     found: Arc<OnceLock<String>>,
@@ -375,9 +377,10 @@ pub(crate) struct Site {
 }
 
 /// Starts looking for the site's published checksum of the download at `url`, whose probe
-/// answered with `headers`, alongside the download (its checksum files asked for with `auth`; the
-/// Metalink they name, `described`, read too), unless the user gave a checksum or turned this off
-/// (`DownloadOptions::remote_checksum`).
+/// answered with `headers`, unless the user gave a checksum or turned this off
+/// (`DownloadOptions::remote_checksum`): at once in the headers, then, once the download lets it
+/// (see [`go`]), in its checksum files, asked for with `auth`, and the Metalink they name
+/// (`described`). The download's own requests come first: those are optional.
 pub(crate) fn look_for(
     site: &Mutex<Site>,
     options: &DownloadOptions,
@@ -388,13 +391,17 @@ pub(crate) fn look_for(
     described: Option<(Url, Option<u64>)>,
 ) {
     let found = Arc::new(OnceLock::new());
+    let (go, mut gate) = tokio::sync::watch::channel(false);
     let search = (options.remote_checksum && options.expected_checksum.is_none()).then(|| {
-        // One in the headers is known at once.
+        // One in the headers is known at once, and nothing need be asked.
         if let Some(checksum) = from_headers(headers) {
-            let _ = found.set(checksum);
+            let _ = found.set(checksum.clone());
+            return tokio::spawn(async move { Some(checksum) });
         }
         let (client, url, headers, limit, slot) = (client.clone(), url.clone(), headers.clone(), options.max_connections_per_host, Arc::clone(&found));
         tokio::spawn(async move {
+            // A download that ends without letting it (see `go`) asks nothing.
+            gate.wait_for(|&go| go).await.ok()?;
             let checksum = published(&client, auth.as_deref(), limit, &url, &headers, described).await;
             if let Some(checksum) = &checksum {
                 let _ = slot.set(checksum.clone());
@@ -404,7 +411,16 @@ pub(crate) fn look_for(
     });
     // What a run before left of the mirrors (`primary`, `primary_only`) holds for this one.
     let mut site = site.lock();
-    (site.search, site.found, site.note) = (search, found, None);
+    (site.search, site.go, site.found, site.note) = (search, Some(go), found, None);
+}
+
+/// Lets the search [`look_for`] started ask the site for the checksum files and Metalink: once
+/// the download sent the requests it widens with, or has every byte. Those still go to no host
+/// that limits how often it is asked or was seen to publish none (see `from_sidecars`).
+pub(crate) fn go(site: &Mutex<Site>) {
+    if let Some(go) = &site.lock().go {
+        go.send_replace(true);
+    }
 }
 
 /// Holds the download to `checksum` (`algo:hex`) in place of what [`look_for`] looks for: the
@@ -464,6 +480,8 @@ pub(crate) async fn finish(
         Err(VerifyError::Mismatch(e)) if options.metalink_pieces.is_some() => (None, Some(e)),
         Err(VerifyError::Mismatch(e)) => return Err(from_primary(part, copies, e).await),
     };
+    // Every byte is in: nothing of the download's own is left to ask for.
+    go(site);
     let search = site.lock().search.take();
     let published = match search {
         Some(search) => search.await.ok().flatten(),
@@ -1105,6 +1123,52 @@ mod tests {
         let (done, checked) = download(vec![url], dir.path(), DownloadOptions::default()).await;
         assert!(done.is_ok(), "{done:?}");
         assert_eq!(checked.as_deref(), Some("the site's SHA-256"));
+    }
+
+    /// Once its bytes are in, the file has its name and the download says so, while the site's
+    /// checksum file is still on its way; `run` resolves only with the verdict. One the file
+    /// fails fails the download as it always did, and the file is removed. A user's own checksum
+    /// is checked before the file takes its name.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_file_is_in_place_while_the_sites_checksum_is_checked() {
+        let data = content(1000);
+        for (hex, own) in [(sha256_hex(&data), None), ("0".repeat(64), None), (sha256_hex(&data), Some("0".repeat(64)))] {
+            let dir = tempfile::tempdir().unwrap();
+            let files = vec![("/dir/SHA256SUMS".to_string(), "text/plain".to_string(), format!("{hex}  file.bin"))];
+            let (url, _) = serve(data.clone(), Site { files, sidecars_wait: Duration::from_millis(500), ..Site::default() }).await;
+            let options = DownloadOptions { output_path: Some(dir.path().join("")), expected_checksum: own.clone().map(|hex| format!("sha256:{hex}")), ..DownloadOptions::default() };
+            let (tx, mut rx) = broadcast::channel::<EngineSnapshot>(1024);
+            let started = std::time::Instant::now();
+            let engine = DownloadEngine::new(vec![url], options);
+            let run = tokio::spawn(async move { engine.run(Some(tx)).await });
+            // The first snapshot that says the file is in place, and what was on disk then.
+            let mut placed = None;
+            while let Ok(snapshot) = rx.recv().await {
+                if snapshot.in_place {
+                    let target = snapshot.target_path.clone().unwrap();
+                    placed = Some((started.elapsed(), std::fs::read(&target).ok(), run.is_finished()));
+                    break;
+                }
+            }
+            let result = run.await.unwrap();
+            let gone = std::fs::read_dir(dir.path()).unwrap().count() == 0;
+            match (own, hex == sha256_hex(&data)) {
+                (None, true) => {
+                    let (at, on_disk, resolved) = placed.expect("in place");
+                    assert!(at < Duration::from_millis(400) && on_disk.as_deref() == Some(&data[..]) && !resolved, "{at:?} {resolved}");
+                    assert!(result.is_ok() && started.elapsed() >= Duration::from_millis(500), "the verdict waits for the checksum file");
+                }
+                (None, false) => {
+                    assert!(placed.is_some_and(|(_, on_disk, _)| on_disk.is_some()));
+                    assert!(result.as_ref().is_err_and(|e| e.contains("the site's published SHA-256")), "{result:?}");
+                    assert!(gone, "the file is removed");
+                }
+                (Some(_), _) => {
+                    assert!(placed.is_none(), "a file that fails the user's checksum never takes its name");
+                    assert!(result.is_err() && gone, "{result:?}");
+                }
+            }
+        }
     }
 
     /// The site's checksum is taken as the file arrives, from the headers at once and from a

@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::autopilot::{self, Autopilot};
-use crate::chunk::{ChunkManager, ChunkSnapshot};
+use crate::chunk::{ChunkManager, ChunkSnapshot, ChunkStatus};
 use crate::digest::Unfinished;
 use crate::history::{is_redacted, redact_url, DownloadHistoryManager, HistoryEntry, HistoryStatus};
 use crate::hls::HlsError;
@@ -122,6 +122,10 @@ const DISK_HEADROOM: u64 = 64 * 1024 * 1024;
 /// connection or ended up fastest with more: the Autopilot adds more as they pay, and a server
 /// that serves few well is not opened every connection the user allows at once.
 const AUTOPILOT_START: usize = 8;
+/// Opening its connections one at a time from its first stream, each once the last was answered,
+/// may cost a download this share of what it takes at full width, against two more for each
+/// answer (see `Ramp::one_at_a_time`).
+const ONE_AT_A_TIME: f64 = 0.1;
 
 #[derive(Debug, Clone, Default)]
 pub struct EngineSnapshot {
@@ -149,6 +153,12 @@ pub struct EngineSnapshot {
     /// Why a download over ranges has the connections it has, in a line for the user: what the
     /// Autopilot chose and why (see `crate::autopilot`), or that it is off. None for others.
     pub autopilot: Option<String>,
+    /// Every byte is in and the file has its final name (`target_path`): the download is done
+    /// for the user, and its place in a batch or queue is free. Set from the first snapshot that
+    /// says so to the last. The check against the site's published checksum may still go on: the
+    /// download's `run` resolves only with that verdict, and one the file fails fails it as it
+    /// always did (the same message, the file removed).
+    pub in_place: bool,
 }
 
 impl EngineSnapshot {
@@ -3096,6 +3106,8 @@ impl DownloadEngine {
             writer,
             state,
             state_path: state_path.to_path_buf(),
+            // FTP and SFTP sessions are no requests a host counts.
+            ramp: Arc::new(Ramp::new(if self.ftp.is_some() || self.sftp.is_some() { usize::MAX } else { 2 })),
         };
 
         let mut meter = SpeedMeter::new(job.chunks.lock().total_downloaded());
@@ -3133,8 +3145,7 @@ impl DownloadEngine {
             stall_timeout: self.stall_timeout(),
             body_idle: self.stall_timeout().min(BODY_IDLE),
             width: Arc::new(num_workers.into()),
-            // FTP and SFTP sessions are no requests a host counts.
-            ramp: Arc::new(Ramp::new(if self.ftp.is_some() || self.sftp.is_some() { usize::MAX } else { 2 })),
+            ramp: Arc::clone(&job.ramp),
             primary: mirrors.iter().position(|m| m.url == reference.url).unwrap_or(usize::MAX),
             from_copies: Default::default(),
         };
@@ -3177,6 +3188,11 @@ impl DownloadEngine {
         let mut asked = None;
         // Workers waiting for the network (see `FailureKind::Offline`), until heard from again.
         let mut offline = std::collections::HashSet::new();
+        // The site's checksum files are asked for (see `crate::digest::go`).
+        let mut looking = false;
+        if let Some(why) = &why {
+            tracing::info!("Autopilot: {}", why);
+        }
 
         let mut tick = tokio::time::interval(SNAPSHOT_INTERVAL);
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -3279,6 +3295,15 @@ impl DownloadEngine {
                             }
                         }
                         spawned = spawned.max(next);
+                    }
+                    // The download's own requests go first: the checksum files beside it are asked
+                    // for once it sent those it widens with, or knows it will not widen, and never
+                    // of a host that refused one. A stream the file ends in while it still shows its
+                    // speed leaves them for its last byte (see `digest::finish`).
+                    let wide = width.load(Ordering::Relaxed);
+                    if !looking && pilot.as_ref().is_none_or(|pilot| !pilot.is_alone()) && !job.limits_requests() && job.widened_to(wide) {
+                        crate::digest::go(&self.site);
+                        looking = true;
                     }
                     // Kept for the user alone, the workers' share goes once they all stopped.
                     if pilot.as_ref().is_none_or(|pilot| pilot.done) {
@@ -3641,12 +3666,36 @@ impl DownloadEngine {
             _ => None,
         };
         let verified = self.verify_written(&part, written).await;
-        let blake3_hex = match crate::digest::finish(&part, verified, &self.options, &self.site, writer).await {
+        // A name from the server without a real extension takes the one its contents show.
+        let by_content = self.options.output_path.as_deref().is_none_or(is_dir_target);
+        let place = {
+            let (part, state_path) = (part.clone(), state_path.clone());
+            move || blocking(move || put_in_place(&part, final_path, &state_path, by_content, replace))
+        };
+        // With only the site's checksum left to check, which a file can only fail and be removed
+        // over (not a metalink's pieces, nor what other mirrors sent, fetched again into the
+        // `.part`), the file takes its name first: the download is done for the user, and frees
+        // its place, while that check goes on.
+        let early = verified.is_ok() && self.options.metalink_pieces.is_none() && {
+            let site = self.site.lock();
+            site.primary_only || site.copies.is_empty()
+        };
+        let placed = match early {
+            true => {
+                let (target, size) = place.clone()().await??;
+                tracing::info!("In place: {}; the site's checksum, if it has one, is checked behind it", target.display());
+                emit(snapshot_tx, || EngineSnapshot { in_place: true, ..done_snapshot(size, &target) });
+                Some((target, size))
+            }
+            false => None,
+        };
+        let checked = placed.as_ref().map_or_else(|| part.clone(), |(target, _)| target.clone());
+        let blake3_hex = match crate::digest::finish(&checked, verified, &self.options, &self.site, writer).await {
             Ok(hash) => hash,
             Err(Unfinished::Wrong(e)) => {
                 // Resuming would only reproduce the same bytes, so start from scratch next time.
                 let _ = blocking(move || {
-                    let _ = std::fs::remove_file(&part);
+                    let _ = std::fs::remove_file(&checked);
                     let _ = DownloadState::remove(&state_path);
                     drop(claim);
                 })
@@ -3658,30 +3707,15 @@ impl DownloadEngine {
             Err(Unfinished::Refetch) => return Err(crate::digest::REFETCH.to_string()),
             Err(Unfinished::FromPrimary) => return Err(crate::digest::FROM_PRIMARY.to_string()),
         };
-
-        // A name from the server without a real extension takes the one its contents show.
-        let by_content = self.options.output_path.as_deref().is_none_or(is_dir_target);
-        let (target, size) = blocking(move || -> Result<(PathBuf, u64), String> {
-            let named = if by_content { crate::sniff::named_by_content(&part, final_path.clone()) } else { final_path.clone() };
-            // Someone may have created the final name while we were downloading. The rename
-            // replaces the file only `replace` asks to replace, in one step.
-            let target = if named.exists() && !(replace && named == final_path) { free_path(&named) } else { named };
-            let size = std::fs::metadata(&part).map(|m| m.len()).map_err(|e| e.to_string())?;
-            // Made sparse to be preallocated (see `DiskWriter::open_or_create`), now written in full.
-            crate::storage::unsparse(&part);
-            std::fs::rename(&part, &target)
-                .map_err(|e| format!("Failed to move {} to {}: {}", part.display(), target.display(), e))?;
-            if let Err(e) = DownloadState::remove(&state_path) {
-                tracing::warn!("Failed to remove {}: {}", state_path.display(), e);
-            }
-            drop(claim);
-            Ok((target, size))
-        })
-        .await??;
+        let (target, size) = match placed {
+            Some(placed) => placed,
+            None => place().await??,
+        };
+        drop(claim);
         tracing::info!("Download completed: {} (BLAKE3 {})", target.display(), blake3_hex);
         self.record_completed(target.clone(), Some(size), blake3_hex, started_at, None, etag).await;
 
-        emit(snapshot_tx, || EngineSnapshot { checked_against: self.checked_against(), ..done_snapshot(size, &target) });
+        emit(snapshot_tx, || EngineSnapshot { checked_against: self.checked_against(), in_place: true, ..done_snapshot(size, &target) });
         Ok(target)
     }
 
@@ -4397,6 +4431,8 @@ struct RangeJob {
     /// Template for saves; `completed_ranges` is replaced each time.
     state: DownloadState,
     state_path: PathBuf,
+    /// The workers that may have sent a request (see `WorkerShared::ramp`).
+    ramp: Arc<Ramp>,
 }
 
 impl RangeJob {
@@ -4431,6 +4467,15 @@ impl RangeJob {
         self.mirrors.lock().mirrors().iter().any(|m| m.is_active && hosts::limits_requests(&m.url))
     }
 
+    /// Whether the requests the download widens to `width` with were answered: none waits for its
+    /// answer, and each of those connections streams its piece, or no piece is left for one.
+    fn widened_to(&self, width: usize) -> bool {
+        let chunks = self.chunks.lock();
+        let (answered, all) = (chunks.answered(), chunks.chunks());
+        answered == all.iter().filter(|c| c.is_in_flight()).count()
+            && (answered >= width || !all.iter().any(|c| matches!(c.status, ChunkStatus::Unassigned | ChunkStatus::Failed { .. })))
+    }
+
     /// The width `pilot` moves an adaptive download to, if it moves (see [`Autopilot::next`]);
     /// call it every few hundred milliseconds.
     fn steer(&self, pilot: &mut Autopilot) -> Option<usize> {
@@ -4458,10 +4503,19 @@ impl RangeJob {
             // and what a new connection to it takes, as its recipe says, else the first request.
             let known = urls.first().map(hosts::profile).unwrap_or_default();
             let rate = known.connection_rate.filter(|_| known.capped_per_connection == Some(true));
-            let opened = pilot.open(now, downloaded, left, known.setup_time.unwrap_or(startup), rate, cap);
-            // Each new connection asks for a piece of its own of what the stream has left.
+            let setup = known.setup_time.unwrap_or(startup);
+            let opened = pilot.open(now, downloaded, left, setup, rate, cap);
+            // Each new connection asks for a piece of its own of what the stream has left; one at
+            // a time while that costs the download little of what it takes at full width.
             if let Some(width) = opened {
                 self.chunks.lock().spread(width, MIN_STEAL);
+                // The n-th newcomer starts n - 1 set-ups late, where twice as many a round start
+                // all within a few: the download loses about (n - 1)(n - 2) / 2n set-ups of its
+                // time at full width.
+                let (n, full) = (width as f64, left as f64 / (rate.unwrap_or(pilot.best).max(1.0) * width as f64));
+                if (n - 1.0) * (n - 2.0) / (2.0 * n) * setup.as_secs_f64() <= ONE_AT_A_TIME * full {
+                    self.ramp.one_at_a_time();
+                }
             }
             return opened;
         }
@@ -6067,6 +6121,23 @@ fn emit(tx: &Option<broadcast::Sender<EngineSnapshot>>, make: impl FnOnce() -> E
     if let Some(tx) = tx {
         let _ = tx.send(make());
     }
+}
+
+/// Moves the finished `part` to its final name, `final_path` or one free beside it (by its
+/// contents' type with `by_content`), and removes its resume state at `state_path`: the final
+/// name and the file's size. Someone may have created the final name while it downloaded: the
+/// rename replaces a file only `replace` asks to replace, in one step. Blocking.
+fn put_in_place(part: &Path, final_path: PathBuf, state_path: &Path, by_content: bool, replace: bool) -> Result<(PathBuf, u64), String> {
+    let named = if by_content { crate::sniff::named_by_content(part, final_path.clone()) } else { final_path.clone() };
+    let target = if named.exists() && !(replace && named == final_path) { free_path(&named) } else { named };
+    let size = std::fs::metadata(part).map(|m| m.len()).map_err(|e| e.to_string())?;
+    // Made sparse to be preallocated (see `DiskWriter::open_or_create`), now written in full.
+    crate::storage::unsparse(part);
+    std::fs::rename(part, &target).map_err(|e| format!("Failed to move {} to {}: {}", part.display(), target.display(), e))?;
+    if let Err(e) = DownloadState::remove(state_path) {
+        tracing::warn!("Failed to remove {}: {}", state_path.display(), e);
+    }
+    Ok((target, size))
 }
 
 fn done_snapshot(size: u64, path: &Path) -> EngineSnapshot {
@@ -10007,6 +10078,32 @@ mod tests {
         assert_eq!(at_other.served.load(Ordering::SeqCst), 1);
     }
 
+    /// The checksum files beside a download wait for its own requests: from a host that holds
+    /// each connection to 2 MB/s, the stream and the connections it opens are all answered before
+    /// the first is asked for. From one that keeps a budget of requests (4 at once, then one every
+    /// 3 s), which refuses some of them, none is asked for at all: what it refuses is the file.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_the_checksum_files_wait_for_the_downloads_own_requests() {
+        let budget = crate::netsim::Budget { burst: 4, every: Duration::from_secs(3), retry_after: 3 };
+        let capped = crate::netsim::Server { size: 8 * 1024 * 1024, per_connection: Some(2e6), ..Default::default() };
+        for server in [capped.clone(), crate::netsim::Server { size: 32 * 1024 * 1024, per_connection: Some(8e6), budget: Some(budget), ..capped }] {
+            let (url, stats) = crate::netsim::serve(server.clone()).await;
+            let dir = tempdir().unwrap();
+            let engine = DownloadEngine::new(vec![url.clone()], sim_options(dir.path(), 8, true));
+            let path = tokio::time::timeout(Duration::from_secs(60), engine.run(None)).await.expect("finished in a minute").unwrap();
+            assert!(std::fs::read(path).unwrap() == crate::netsim::file(server.size));
+            let log = stats.log.lock().clone();
+            let first_lookup = log.iter().position(|(path, _)| path != "/f.bin");
+            match server.budget {
+                None => assert!(first_lookup.is_some_and(|at| at >= 8), "{log:?}"),
+                Some(_) => {
+                    assert!(log.iter().any(|(_, refused)| *refused), "{log:?}");
+                    assert_eq!(first_lookup, None, "{log:?}");
+                }
+            }
+        }
+    }
+
     /// Time and requests for a 32 MiB file from a host that keeps a budget of requests (4 at
     /// once, then one every 3 s; past it 429 with Retry-After 3) and sends a client 8 MB/s: the
     /// download as the app makes it, three times, then one plain request.
@@ -10088,10 +10185,11 @@ mod tests {
         assert!(stats.gets.load(Ordering::SeqCst) >= 3, "the probe's, the slowing one's, and its replacement's");
     }
 
-    /// A count the user fixed is left alone: all four connections, whatever the server's cap.
+    /// A count the user fixed is left alone: all four connections, whatever the server's cap. The
+    /// file gives each of them a MiB however much of it the probe read.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_a_fixed_connection_count_is_left_alone() {
-        let size = 4 * 1024 * 1024;
+        let size = 8 * 1024 * 1024;
         let (url, _) = crate::netsim::serve(crate::netsim::Server { size, per_client: Some(4e6), ..Default::default() }).await;
         let dir = tempdir().unwrap();
         let (got, said) = fetch_from_sim(&url, sim_options(dir.path(), 4, false)).await;

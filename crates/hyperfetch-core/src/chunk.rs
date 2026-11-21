@@ -378,6 +378,11 @@ impl ChunkManager {
         &self.chunks
     }
 
+    /// Chunks in flight whose request was answered.
+    pub(crate) fn answered(&self) -> usize {
+        self.chunks.iter().filter(|c| c.is_in_flight() && c.attempt.lock().answered.is_some()).count()
+    }
+
     pub fn is_all_completed(&self) -> bool {
         self.completed == self.chunks.len()
     }
