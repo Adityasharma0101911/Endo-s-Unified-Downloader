@@ -156,9 +156,6 @@ pub struct EngineSnapshot {
     /// Why a download over ranges has the connections it has, in a line for the user: what the
     /// Autopilot chose and why (see `crate::autopilot`), or that it is off. None for others.
     pub autopilot: Option<String>,
-    /// Never set any more: a file takes its final name only once its checks are done (see
-    /// `checking`, `place_free`). Kept until the front ends stop reading it.
-    pub in_place: bool,
     /// Every byte is written and the file, still under its partial name, is being checked (the
     /// user's checksum, the site's, a metalink's pieces): it is at 100 %, not done. The download is
     /// done once `run` resolves.

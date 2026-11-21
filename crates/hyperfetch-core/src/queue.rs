@@ -86,9 +86,6 @@ pub struct QueueItem {
     /// Running, it is known small (see `EngineSnapshot::small`).
     #[serde(skip)]
     pub small: bool,
-    /// Never set any more (see `EngineSnapshot::in_place`). Kept until the app stops reading it.
-    #[serde(skip)]
-    pub in_place: bool,
     /// Running, every byte is in and its file is being checked (see `EngineSnapshot::checking`):
     /// at 100 %, not done.
     #[serde(skip)]
@@ -208,7 +205,6 @@ impl DownloadQueue {
             notes: Vec::new(),
             priority: Priority::Normal,
             small: false,
-            in_place: false,
             checking: false,
             place_free: false,
         });
@@ -336,7 +332,7 @@ impl DownloadQueue {
                 }
                 item.status = QueueItemStatus::Downloading;
                 item.speed_bytes_per_sec = 0.0;
-                (item.small, item.in_place, item.checking, item.place_free) = (false, false, false, false);
+                (item.small, item.checking, item.place_free) = (false, false, false);
                 true
             }
             _ => false,
@@ -359,7 +355,7 @@ impl DownloadQueue {
     /// own from the resume state, and the queue saved on exit has it.
     pub fn apply_snapshot(&mut self, id: usize, snapshot: &EngineSnapshot) {
         let Some(item) = self.items.iter_mut().find(|i| i.id == id) else { return };
-        (item.small, item.in_place) = (snapshot.small, item.in_place || snapshot.in_place);
+        item.small = snapshot.small;
         (item.checking, item.place_free) = (snapshot.checking, item.place_free || snapshot.place_free);
         if snapshot.from_probe() {
             return;
