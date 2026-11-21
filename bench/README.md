@@ -3,7 +3,9 @@
 ## Simulated links (runs in CI)
 
 `crates/hyperfetch-core/src/speedbench.rs` downloads from in-process servers (`netsim.rs`) that
-behave as common links do, and times each scenario: a LAN with no cap, a server that caps each
+behave as common links do, and times each scenario: a LAN with no cap (at 16 connections with the
+Autopilot off, the engine's own speed, and again as the Autopilot's first visit, which must widen
+past one request), a server that caps each
 connection, one that caps all of a user's connections together, a long link (150 ms to answer, a
 cap per connection), a lossy one (one connection cut off, one fading out), a host that answers 429
 past 6 requests a second, 2,000 small files (with and without the SHA-256 a listing gives), and a
@@ -15,10 +17,12 @@ cargo test --release -p hyperfetch-core --lib speed_bench -- --ignored --nocaptu
 ENDO_BENCH_ONLY=lan,small_files cargo test --release -p hyperfetch-core --lib speed_bench -- --ignored --nocapture
 ```
 
-It prints JSON (or writes it to `ENDO_BENCH_OUT`) and a markdown table (or `ENDO_BENCH_SUMMARY`).
+It prints JSON (or writes it to `ENDO_BENCH_OUT`) and a markdown table (or `ENDO_BENCH_SUMMARY`),
+and a line for each scenario with what the Autopilot said last of it.
 The `speed` job of `.github/workflows/ci.yml` runs it on every push on Linux, puts the table in
 the job's summary and fails when `ENDO_BENCH_CHECK` finds a scenario under its floor in
-`sim-thresholds.json` (MB/s, and the most milliseconds to the first byte). Each floor is about
+`sim-thresholds.json` (MB/s, the most milliseconds to the first byte, and for `lan_autopilot` at
+least two requests, its floor about 30 % under what the runner measured). Each other floor is about
 half what the CI runner measured, and each first-byte limit three times the measured plus 200 ms:
 a real regression (a scenario at half speed, a probe that waits a round trip more) fails the job,
 a slower runner does not. The web seed scenarios are held to a share of `web_seed_http` in the

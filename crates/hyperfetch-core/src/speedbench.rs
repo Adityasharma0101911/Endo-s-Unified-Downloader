@@ -49,6 +49,14 @@ struct Scenario {
     runs: usize,
 }
 
+impl Scenario {
+    /// Whether the Autopilot steers it: all but `lan`, the gate on the engine's own speed at 16
+    /// connections, as 2.2.0 downloaded; `lan_autopilot` is that file on a first visit.
+    fn autopilot(&self) -> bool {
+        self.name != "lan"
+    }
+}
+
 fn scenarios() -> Vec<Scenario> {
     let rate_limit = RateLimit { requests: 6, window: Duration::from_secs(1), retry_after: 1, ban_after: 8, ban: Duration::from_secs(5) };
     let decay = Decay { from: 8 * MIB, full: 256 * 1024, rate: 64e3, every: Duration::from_secs(1) };
@@ -70,7 +78,8 @@ fn scenarios() -> Vec<Scenario> {
             runs: 3,
         },
         Scenario { name: "web_seed_and_peer", what: "the same and one peer sending 1 MB/s", server: seed, files: torrent(Some(1_000_000)), runs: 3 },
-        Scenario { name: "lan", what: "128 MiB, no cap", server: Server::default(), files: Files::One(128 * MIB), runs: 3 },
+        Scenario { name: "lan", what: "128 MiB, no cap, 16 connections, the Autopilot off", server: Server::default(), files: Files::One(128 * MIB), runs: 3 },
+        Scenario { name: "lan_autopilot", what: "the same with the Autopilot, a first visit", server: Server::default(), files: Files::One(128 * MIB), runs: 3 },
         Scenario {
             name: "per_connection",
             what: "32 MiB, 2 MB/s per connection",
@@ -156,6 +165,9 @@ struct Measured {
     /// Requests the server answered (HEAD and GET), in the median run.
     requests: usize,
     files_per_s: f64,
+    /// What the Autopilot said last in the median run, of a single file.
+    #[serde(default)]
+    autopilot: String,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -165,6 +177,8 @@ struct Threshold {
     /// At least `min_share` of the speed the scenario `min_share_of` had in the same run.
     min_share_of: Option<String>,
     min_share: Option<f64>,
+    /// At least this many requests: a download that widened.
+    min_requests: Option<usize>,
 }
 
 /// The sizes of a batch's files, the same every time (xorshift64 from a fixed seed).
@@ -199,14 +213,15 @@ fn options(dir: &std::path::Path, name: &str) -> DownloadOptions {
     DownloadOptions { output_path: Some(dir.join(name)), num_connections: 16, adaptive: true, remote_checksum: false, ..Default::default() }
 }
 
-/// One run: how long it took, the time to the first byte, the server's requests.
-async fn run(scenario: &Scenario) -> (Duration, Duration, usize) {
+/// One run: how long it took, the time to the first byte, the server's requests, and what the
+/// Autopilot said last of the last file.
+async fn run(scenario: &Scenario) -> (Duration, Duration, usize, String) {
     let dir = tempfile::tempdir().unwrap();
     let size = match scenario.files {
         Files::One(size) => size,
         Files::Many { .. } => 1,
-        Files::H2 { size, rtt, tuned } => return h2_run(size, rtt, tuned).await,
-        Files::Torrent { size, piece, peer } => return torrent_run(&scenario.server, size, piece, peer).await,
+        Files::H2 { size, rtt, tuned } => return with_nothing_said(h2_run(size, rtt, tuned).await),
+        Files::Torrent { size, piece, peer } => return with_nothing_said(torrent_run(&scenario.server, size, piece, peer).await),
     };
     let (url, stats) = netsim::serve(Server { size, ..scenario.server.clone() }).await;
     let files: Vec<(Url, usize, std::path::PathBuf)> = match scenario.files {
@@ -230,23 +245,47 @@ async fn run(scenario: &Scenario) -> (Duration, Duration, usize) {
     // One client for all the files, as a batch has (see the command line's `run_jobs`).
     let client = build_client(&options(dir.path(), "")).unwrap();
     let started = Instant::now();
+    let adaptive = scenario.autopilot();
     let downloads = futures_util::stream::iter(files.iter().cloned())
         .map(|(url, size, path)| {
-            let options = DownloadOptions { output_path: Some(path), expected_checksum: checksum(size), ..options(dir.path(), "") };
+            let options = DownloadOptions { output_path: Some(path), expected_checksum: checksum(size), adaptive, ..options(dir.path(), "") };
             let engine = DownloadEngine::with_client(vec![url], options, client.clone());
-            async move { engine.run(None).await }
+            async move {
+                // What the Autopilot said is one file's: a batch's files run as they would unheard.
+                if at_once > 1 {
+                    return (engine.run(None).await, String::new());
+                }
+                let (tx, mut rx) = tokio::sync::broadcast::channel::<crate::engine::EngineSnapshot>(16);
+                let listen = async {
+                    let mut said = String::new();
+                    loop {
+                        match rx.recv().await {
+                            Ok(snapshot) => said = snapshot.autopilot.unwrap_or(said),
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => return said,
+                        }
+                    }
+                };
+                tokio::join!(engine.run(Some(tx)), listen)
+            }
         })
         .buffer_unordered(at_once)
         .collect::<Vec<_>>();
     let done = tokio::time::timeout(RUN_LIMIT, downloads).await;
     let took = started.elapsed();
-    for result in done.unwrap_or_else(|_| panic!("{} took over {RUN_LIMIT:?}", scenario.name)) {
+    let mut said = String::new();
+    for (result, last) in done.unwrap_or_else(|_| panic!("{} took over {RUN_LIMIT:?}", scenario.name)) {
         result.unwrap();
+        said = last;
     }
     for (_, size, path) in &files {
         assert!(holds(path, *size), "{}: {} is wrong", scenario.name, path.display());
     }
-    (took, first_byte(&stats, started), requests(&stats))
+    (took, first_byte(&stats, started), requests(&stats), said)
+}
+
+fn with_nothing_said((took, first, requests): (Duration, Duration, usize)) -> (Duration, Duration, usize, String) {
+    (took, first, requests, String::new())
 }
 
 /// One GET of `size` bytes over HTTP/2 (cleartext, known to the client beforehand) through a link
@@ -387,7 +426,7 @@ async fn measure(scenario: &Scenario) -> Measured {
         runs.push(run(scenario).await);
     }
     runs.sort_by_key(|run| run.0);
-    let (took, ttfb, requests) = runs[runs.len() / 2];
+    let (took, ttfb, requests, autopilot) = runs.swap_remove(runs.len() / 2);
     let (bytes, files) = match scenario.files {
         Files::One(size) | Files::H2 { size, .. } | Files::Torrent { size, .. } => (size as u64, 1),
         Files::Many { count, min, max, .. } => (sizes(count, min, max).iter().sum::<usize>() as u64, count),
@@ -402,6 +441,7 @@ async fn measure(scenario: &Scenario) -> Measured {
         ttfb_ms: ttfb.as_secs_f64() * 1e3,
         requests,
         files_per_s: files as f64 / seconds,
+        autopilot,
     }
 }
 
@@ -428,6 +468,9 @@ fn regressions(results: &[Measured], thresholds: &std::collections::HashMap<Stri
         if let Some(max) = t.max_ttfb_ms.filter(|&max| m.ttfb_ms > max) {
             found.push(format!("{}: first byte after {:.0} ms, over the {max} ms allowed", m.name, m.ttfb_ms));
         }
+        if let Some(min) = t.min_requests.filter(|&min| m.requests < min) {
+            found.push(format!("{}: {} requests, under the {min} allowed ({})", m.name, m.requests, m.autopilot));
+        }
         let base = t.min_share_of.as_ref().and_then(|of| results.iter().find(|b| &b.name == of));
         if let (Some(base), Some(share)) = (base, t.min_share) {
             if m.mb_per_s < share * base.mb_per_s {
@@ -447,13 +490,15 @@ fn test_regressions_are_told_from_the_thresholds() {
         seconds: 1.0,
         mb_per_s,
         ttfb_ms,
-        requests: 0,
+        requests: 1,
         files_per_s: 0.0,
+        autopilot: "1 connection: too little is left to try more".into(),
     };
     let thresholds: std::collections::HashMap<String, Threshold> =
-        serde_json::from_str(r#"{"a": {"min_mb_per_s": 10}, "b": {"max_ttfb_ms": 100}, "d": {"min_share_of": "a", "min_share": 0.85}}"#).unwrap();
+        serde_json::from_str(r#"{"a": {"min_mb_per_s": 10}, "b": {"max_ttfb_ms": 100}, "d": {"min_share_of": "a", "min_share": 0.85}, "e": {"min_requests": 2}}"#).unwrap();
     let found = regressions(&[m("a", 9.0, 999.0), m("b", 1.0, 101.0), m("c", 0.0, 1e9), m("a", 10.0, 0.0)], &thresholds);
     assert_eq!(found.len(), 2, "{found:?}");
+    assert_eq!(regressions(&[m("e", 1.0, 0.0)], &thresholds), ["e: 1 requests, under the 2 allowed (1 connection: too little is left to try more)"]);
     assert!(found[0].starts_with("a:") && found[1].starts_with("b:"));
     // A share of another scenario's speed in the same run; none when that one did not run.
     assert_eq!(regressions(&[m("a", 20.0, 0.0), m("d", 17.0, 0.0)], &thresholds), Vec::<String>::new());
@@ -475,7 +520,10 @@ async fn speed_bench() {
     let mut results = Vec::new();
     for scenario in scenarios().iter().filter(|s| only.as_deref().is_none_or(|only| only.split(',').any(|n| n == s.name))) {
         let measured = measure(scenario).await;
-        eprintln!("{}: {:.2} s, {:.1} MB/s, first byte {:.0} ms, {} requests", measured.name, measured.seconds, measured.mb_per_s, measured.ttfb_ms, measured.requests);
+        eprintln!(
+            "{}: {:.2} s, {:.1} MB/s, first byte {:.0} ms, {} requests; the Autopilot: {}",
+            measured.name, measured.seconds, measured.mb_per_s, measured.ttfb_ms, measured.requests, measured.autopilot
+        );
         results.push(measured);
     }
     let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
