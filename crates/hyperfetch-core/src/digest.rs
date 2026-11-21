@@ -1311,6 +1311,38 @@ mod tests {
         }
     }
 
+    /// A small file whose state could not be saved (a folder in its place here; as it happens, a
+    /// name too long for it) and that is stopped while it is checked leaves no `.part`, which a
+    /// run would only pass over: run again, it takes its own name.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_file_stopped_while_checked_without_its_state_leaves_no_part() {
+        let data = content(1000);
+        let dir = tempfile::tempdir().unwrap();
+        let files = vec![("/dir/file.bin.sha256".to_string(), "text/plain".to_string(), sha256_hex(&data))];
+        let (url, _) = serve(data.clone(), Site { files, sidecars_wait: Duration::from_secs(2), ..Site::default() }).await;
+        let part = crate::engine::part_path(&dir.path().join("file.bin"));
+        std::fs::create_dir(crate::state::DownloadState::state_file_path(&part)).unwrap();
+        let options = || DownloadOptions { output_path: Some(dir.path().join("")), ..DownloadOptions::default() };
+        let (tx, mut rx) = broadcast::channel::<EngineSnapshot>(1024);
+        let engine = Arc::new(DownloadEngine::new(vec![url.clone()], options()));
+        let run = tokio::spawn({
+            let engine = Arc::clone(&engine);
+            async move { engine.run(Some(tx)).await }
+        });
+        while let Ok(snapshot) = rx.recv().await {
+            if snapshot.checking {
+                break;
+            }
+        }
+        engine.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(30), run).await.expect("it stops").unwrap();
+        assert_eq!(result.as_deref().map_err(String::as_str), Err(crate::engine::CANCELLED));
+        assert!(!part.exists(), "no .part without its state");
+        let (done, _) = tokio::time::timeout(Duration::from_secs(60), download(vec![url], dir.path(), options())).await.expect("done in a minute");
+        assert_eq!(done.unwrap(), dir.path().join("file.bin"));
+        assert_eq!(std::fs::read(dir.path().join("file.bin")).unwrap(), data);
+    }
+
     /// A download stopped while its file is checked keeps the file under its partial name with its
     /// resume state, all of it there, also one that came as one stream from a server without
     /// ranges; run again, it only checks the file again, and no second copy. Of the file's body the

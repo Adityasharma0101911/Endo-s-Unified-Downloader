@@ -3773,8 +3773,18 @@ impl DownloadEngine {
                 .await;
                 return Err(e);
             }
-            // The `.part` and its state stay: run again, the download checks it again.
-            Err(Unfinished::Io(e)) => return Err(e),
+            // The `.part` and its state stay: run again, the download checks it again. One whose
+            // state could not be saved would only be passed over, and goes.
+            Err(Unfinished::Io(e)) => {
+                let _ = blocking(move || {
+                    if !state_path.is_file() {
+                        let _ = std::fs::remove_file(&part);
+                    }
+                    drop(claim);
+                })
+                .await;
+                return Err(e);
+            }
             // The `.part` and its state stay, for `run` to fetch those pieces again.
             Err(Unfinished::Refetch) => return Err(crate::digest::REFETCH.to_string()),
             Err(Unfinished::FromPrimary) => return Err(crate::digest::FROM_PRIMARY.to_string()),
