@@ -154,46 +154,46 @@ pub(crate) fn rest_left(url: &Url) -> Duration {
     HOSTS.rest_left(&HostKey::of(url), clock())
 }
 
-/// Whether `url`'s host limits how often it is asked, so a download from it asks for the file
-/// alone, over one connection: it refused a request (429/503) within `BANNED_FOR` in this run, or
-/// one while others of ours were open within `REFUSAL_KEPT_FOR`, in this run or an earlier one.
+/// Whether `url`'s host limits how often it is asked, so a download from it asks only what it
+/// needs (no HEAD beside its GET, no piece split for another request), and its checksum files
+/// after its last byte, one at a time: it refused a request (429/503) within `BANNED_FOR` in this
+/// run, or it is kept as limiting requests (see [`kept_limited`]).
 pub fn limits_requests(url: &Url) -> bool {
-    refused_lately(url) || HOSTS.refused_kept(&HostKey::of(url), unix_now())
+    refused_lately(url) || kept_limited(url)
 }
 
-/// Whether `url`'s host was found, in this run or an earlier one (within `KEPT_FOR`), to hang up
-/// on a browser's User-Agent and answer the app's own (see `crate::resolver::ask_as_app`).
-pub(crate) fn own_agent(url: &Url) -> bool {
-    HOSTS.own_agent(&HostKey::of(url), unix_now())
-}
-
-/// Keeps whether `url`'s host answers the app's own User-Agent where it drops a browser's.
-pub(crate) fn record_own_agent(url: &Url, found: bool) {
+/// Whether `url`'s host is kept as limiting how often it is asked, in this run or an earlier one,
+/// so a download from it asks for the file alone, over one connection: a download from it was
+/// refused after another had been, once the host's rest was over (see [`refused_in_download`]).
+/// For an hour the first time, twice as long each time a wider try is refused again, up to a day.
+pub(crate) fn kept_limited(url: &Url) -> bool {
     let now = unix_now();
-    HOSTS.keep(&HostKey::of(url), now, |kept| kept.own_agent = found.then_some(now))
+    HOSTS.kept(&HostKey::of(url), now).and_then(|kept| kept.limited).is_some_and(|(until, _)| now < until)
 }
 
-/// Whether a download from `url`'s host found a checksum file beside the file (`Some(true)`) or
-/// none at all (`Some(false)`), within `CHECKSUMS_KEPT_FOR`; `None` when not known.
-pub(crate) fn checksums(url: &Url) -> Option<bool> {
-    HOSTS.checksums(&HostKey::of(url), unix_now())
-}
-
-/// Keeps whether a download from `url`'s host `found` a checksum file beside the file.
-pub(crate) fn record_checksums(url: &Url, found: bool) {
+/// A download from `url`'s host was refused (429/503). When `again` (the host refused another
+/// download within `BANNED_FOR` before this one began), or the host was kept as limiting requests
+/// and that time is up, it is kept so (see [`kept_limited`]): an hour, or twice as long as the last
+/// time, up to a day. One refusal alone keeps nothing past this run's memory of it.
+pub(crate) fn refused_in_download(url: &Url, again: bool) {
     let now = unix_now();
-    HOSTS.keep(&HostKey::of(url), now, |kept| kept.checksums = Some((found, now)))
+    let key = HostKey::of(url);
+    let last = HOSTS.kept(&key, now).and_then(|kept| kept.limited);
+    if last.is_some_and(|(until, _)| now < until) || !(again || last.is_some()) {
+        return;
+    }
+    let hours = last.map_or(LIMITED_HOURS, |(_, hours)| (hours * 2).min(MOST_LIMITED_HOURS));
+    HOSTS.keep(&key, now, |kept| kept.limited = Some((now + hours * 3600, hours)))
 }
 
-/// Whether `url`'s host answered over HTTP/2 within `KEPT_FOR`.
-pub fn speaks_h2(url: &Url) -> bool {
-    HOSTS.speaks_h2(&HostKey::of(url), unix_now())
-}
-
-/// Keeps that `url`'s host answered over HTTP/2.
-pub(crate) fn record_h2(url: &Url) {
+/// A download from `url`'s host went over more than one connection and was refused nothing: a
+/// host kept as limiting requests whose time is up is no longer.
+pub(crate) fn widened_unrefused(url: &Url) {
     let now = unix_now();
-    HOSTS.keep(&HostKey::of(url), now, |kept| kept.h2 = Some(now))
+    let key = HostKey::of(url);
+    if HOSTS.kept(&key, now).and_then(|kept| kept.limited).is_some_and(|(until, _)| now >= until) {
+        HOSTS.keep(&key, now, |kept| kept.limited = None)
+    }
 }
 
 /// Forgets what this run saw of `url`'s host (scheme, host and port, every route), as a restart
@@ -251,10 +251,20 @@ pub fn speed(url: &Url) -> Option<f64> {
     kept.filter(|&(_, at)| Kept::fresh(at, now, SPEED_KEPT_FOR)).map(|(speed, _)| speed)
 }
 
-/// Keeps that one connection to `url`'s host brought `speed` bytes per second.
+/// Keeps that one connection to `url`'s host brought `speed` bytes per second, unless about that
+/// is kept already.
 pub(crate) fn record_speed(url: &Url, speed: f64) {
     let now = unix_now();
-    HOSTS.keep(&HostKey::of(url), now, |kept| kept.speed = Some((speed, now)))
+    HOSTS.keep(&HostKey::of(url), now, |kept| {
+        if kept.speed.is_none_or(|(was, at)| !about(was, speed) || !Kept::fresh(at, now, SPEED_KEPT_FOR)) {
+            kept.speed = Some((speed, now));
+        }
+    })
+}
+
+/// Whether `a` and `b` are within a quarter of each other: the same fact seen again.
+fn about(a: f64, b: f64) -> bool {
+    (a - b).abs() <= 0.25 * a.abs().max(b.abs())
 }
 
 /// What `url`'s host was seen to speak besides HTTP/1.1, if that is kept.
@@ -605,21 +615,12 @@ struct Kept {
     /// The HTTP version it is asked in (see [`protocol`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     protocol: Option<Protocol>,
+    /// Until when it is kept as limiting how often it is asked, and how many hours that was (see
+    /// [`kept_limited`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    limited: Option<(u64, u64)>,
     /// The facts below each come with when they were learned, and are trusted for an age of their
-    /// own (see [`Kept::fresh`]). When it last refused a request (429/503) while others of ours
-    /// were open, and the Retry-After it gave (seconds, if any): it limits how often it is asked.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    refused: Option<(u64, Option<u64>)>,
-    /// When it was found to hang up on a browser's User-Agent and answer the app's own.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    own_agent: Option<u64>,
-    /// Whether a download from it found a checksum file beside the file (or none at all).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    checksums: Option<(bool, u64)>,
-    /// When it last answered over HTTP/2.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    h2: Option<u64>,
-    /// Whether it honours ranged GETs.
+    /// own (see [`Kept::fresh`]). Whether it honours ranged GETs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     ranges: Option<(bool, u64)>,
     /// How long a new connection to it took to its first answer, in milliseconds.
@@ -636,10 +637,9 @@ struct Kept {
     at: u64,
 }
 
-/// How long a refusal is kept across restarts: a host's budget may be a passing state.
-const REFUSAL_KEPT_FOR: Duration = Duration::from_secs(24 * 60 * 60);
-/// How long whether a host publishes checksum files is kept: its folders may differ.
-const CHECKSUMS_KEPT_FOR: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// Hours a host is first kept as limiting requests (see [`refused_in_download`]), and the most.
+const LIMITED_HOURS: u64 = 1;
+const MOST_LIMITED_HOURS: u64 = 24;
 /// How long a host's speed is kept: a mirror's load changes with the week.
 const SPEED_KEPT_FOR: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
@@ -650,14 +650,34 @@ impl Kept {
             || self.limit.is_some()
             || self.line.is_some()
             || self.protocol.is_some()
-            || self.refused.is_some()
-            || self.own_agent.is_some()
-            || self.checksums.is_some()
-            || self.h2.is_some()
+            || self.limited.is_some()
             || self.ranges.is_some()
             || self.setup_ms.is_some()
             || self.per_connection.is_some()
             || self.speed.is_some()
+    }
+
+    /// What of it is still trusted `now`: the facts without an age of their own for `KEPT_FOR`
+    /// after the last change to them (`at`), the others each for `KEPT_FOR` after it was learned
+    /// (the speed for `SPEED_KEPT_FOR`), and that it limits requests for `KEPT_FOR` after that
+    /// ended (a wider try refused then is kept twice as long).
+    fn trusted(mut self, now: u64) -> Self {
+        let fresh = |at: u64| Kept::fresh(at, now, KEPT_FOR);
+        if !fresh(self.at) {
+            (self.connections, self.cap, self.limit, self.line, self.protocol) = (None, None, None, None, None);
+        }
+        self.limited = self.limited.filter(|&(until, _)| fresh(until));
+        self.ranges = self.ranges.filter(|&(_, at)| fresh(at));
+        self.setup_ms = self.setup_ms.filter(|&(_, at)| fresh(at));
+        self.per_connection = self.per_connection.filter(|&(_, at)| fresh(at));
+        self.speed = self.speed.filter(|&(_, at)| Kept::fresh(at, now, SPEED_KEPT_FOR));
+        self
+    }
+
+    /// When anything of it was last learned.
+    fn newest(&self) -> u64 {
+        let aged = [self.ranges.map(|r| r.1), self.setup_ms.map(|s| s.1), self.per_connection.map(|p| p.1), self.speed.map(|s| s.1)];
+        aged.into_iter().flatten().chain([self.at]).max().unwrap_or(0)
     }
 
     /// Whether a fact learned at `at` (seconds since the Unix epoch) is still trusted `now`, `age`
@@ -692,12 +712,12 @@ impl Memory {
     /// Drops what is older than `KEPT_FOR` or tells nothing, and past `KEEP_KEPT` what was
     /// learned first.
     fn prune(&mut self, now: u64) {
-        self.hosts.retain(|_, kept| kept.tells() && now.saturating_sub(kept.at) < KEPT_FOR.as_secs());
+        self.hosts.retain(|_, kept| kept.trusted(now).tells());
         if self.hosts.len() > KEEP_KEPT {
-            let mut ages: Vec<u64> = self.hosts.values().map(|kept| kept.at).collect();
+            let mut ages: Vec<u64> = self.hosts.values().map(Kept::newest).collect();
             ages.sort_unstable_by(|a, b| b.cmp(a));
             let oldest_kept = ages[KEEP_KEPT - 1];
-            self.hosts.retain(|_, kept| kept.at >= oldest_kept);
+            self.hosts.retain(|_, kept| kept.newest() >= oldest_kept);
         }
     }
 }
@@ -749,8 +769,8 @@ impl Hosts {
 
     /// What is kept under `name`, if anything and not too old.
     fn kept_as(&self, name: &str, now: u64) -> Option<Kept> {
-        let kept = *self.kept.lock().hosts.get(name)?;
-        (now.saturating_sub(kept.at) < KEPT_FOR.as_secs()).then_some(kept)
+        let kept = self.kept.lock().hosts.get(name)?.trusted(now);
+        kept.tells().then_some(kept)
     }
 
     /// Changes what is kept of `key`'s host, learned `now`.
@@ -778,11 +798,20 @@ impl Hosts {
         self.keep_as(LINE.to_string(), now, |kept| kept.line = Some(line))
     }
 
+    /// Changes what is kept of `name`. Only a change is written out (see `save`), and only a change
+    /// of the facts without an age of their own makes the host's `at` `now`.
     fn keep_as(&self, name: String, now: u64, change: impl FnOnce(&mut Kept)) {
         let mut memory = self.kept.lock();
         let kept = memory.hosts.entry(name).or_default();
+        let before = *kept;
         change(kept);
-        kept.at = now;
+        if *kept == before {
+            return;
+        }
+        let ageless = |k: &Kept| (k.connections, k.cap, k.limit, k.line, k.protocol, k.limited);
+        if ageless(kept) != ageless(&before) || before.at == 0 {
+            kept.at = now;
+        }
         memory.changed = true;
     }
 
@@ -839,42 +868,34 @@ impl Hosts {
             self.entry(&mut entries, key, now).facts.record(seen, now);
             forget_idle(&mut entries, now);
         }
-        // What the host is like is kept for the next run too.
+        // What the host is like is kept for the next run too, each fact with when it was learned:
+        // seen again about the same while it is trusted, it keeps that age.
         if seen.accepts_ranges.is_some() || seen.setup_time.is_some() || seen.capped_per_connection.is_some() {
             let unix = unix_now();
+            let fresh = |at: u64| Kept::fresh(at, unix, KEPT_FOR);
             self.keep(key, unix, |kept| {
-                if let Some(ranges) = seen.accepts_ranges {
+                if let Some(ranges) = seen.accepts_ranges.filter(|&ranges| kept.ranges.is_none_or(|(was, at)| was != ranges || !fresh(at))) {
                     kept.ranges = Some((ranges, unix));
                 }
-                if let Some(setup) = seen.setup_time {
-                    kept.setup_ms = Some((setup.as_millis() as u64, unix));
+                let setup = seen.setup_time.map(|setup| setup.as_millis() as u64);
+                if let Some(ms) = setup.filter(|&ms| kept.setup_ms.is_none_or(|(was, at)| !about(was as f64, ms as f64) || !fresh(at))) {
+                    kept.setup_ms = Some((ms, unix));
                 }
                 if let Some(capped) = seen.capped_per_connection {
-                    kept.per_connection = Some((seen.connection_rate.filter(|_| capped), unix));
+                    let rate = seen.connection_rate.filter(|_| capped);
+                    let same = |was: Option<f64>| match (was, rate) {
+                        (Some(was), Some(rate)) => about(was, rate),
+                        (was, rate) => was.is_none() && rate.is_none(),
+                    };
+                    if kept.per_connection.is_none_or(|(was, at)| !same(was) || !fresh(at)) {
+                        kept.per_connection = Some((rate, unix));
+                    }
                 }
             });
         }
         if seen.connection_cap.is_some() {
             self.freed.notify_waiters();
         }
-    }
-
-    /// Whether `key`'s host refused a request (429/503) while others of ours were open within
-    /// `REFUSAL_KEPT_FOR`, in this run or an earlier one.
-    fn refused_kept(&self, key: &HostKey, now: u64) -> bool {
-        self.kept(key, now).and_then(|kept| kept.refused).is_some_and(|(at, _)| Kept::fresh(at, now, REFUSAL_KEPT_FOR))
-    }
-
-    fn own_agent(&self, key: &HostKey, now: u64) -> bool {
-        self.kept(key, now).and_then(|kept| kept.own_agent).is_some_and(|at| Kept::fresh(at, now, KEPT_FOR))
-    }
-
-    fn checksums(&self, key: &HostKey, now: u64) -> Option<bool> {
-        self.kept(key, now).and_then(|kept| kept.checksums).filter(|&(_, at)| Kept::fresh(at, now, CHECKSUMS_KEPT_FOR)).map(|(found, _)| found)
-    }
-
-    fn speaks_h2(&self, key: &HostKey, now: u64) -> bool {
-        self.kept(key, now).and_then(|kept| kept.h2).is_some_and(|at| Kept::fresh(at, now, KEPT_FOR))
     }
 
     fn try_acquire(&'static self, key: &HostKey, limit: usize, now: Instant) -> Option<HostSlot> {
@@ -996,7 +1017,6 @@ impl Hosts {
             let unix = unix_now();
             self.keep(key, unix, |kept| {
                 kept.cap = Some(others);
-                kept.refused = Some((unix, Some(pause.as_secs()).filter(|&secs| secs > 0)));
                 // A download that settled while a slot it had just freed still counted settled past
                 // what the host serves at once: no later one starts there.
                 kept.connections = kept.connections.map(|n| n.min(others));
@@ -1428,10 +1448,10 @@ mod tests {
         assert!(!memory.hosts.contains_key("http://h9.example:80") && memory.hosts.contains_key("http://h10.example:80"));
     }
 
-    /// What a host is like outlives the run, each fact for an age of its own: that it refused a
-    /// request while others were open (with its Retry-After) for a day, whether it publishes
-    /// checksum files for a week, the rest for thirty days. A new run's first look at the host
-    /// starts from it.
+    /// What a host is like outlives the run, each fact for an age of its own from when it was
+    /// learned: the connections it served when it refused one more, whether it honours ranges, how
+    /// long a connection takes to start and what it holds one to, for thirty days. A refusal
+    /// itself keeps nothing more. A new run's first look at the host starts from it.
     #[test]
     fn test_what_a_host_is_like_is_kept_across_restarts_each_for_its_own_age() {
         let dir = tempfile::tempdir().unwrap();
@@ -1442,27 +1462,58 @@ mod tests {
         let alone = before.try_acquire(&host, 32, Instant::now()).unwrap();
         alone.throttled(Duration::ZERO);
         drop(alone);
-        assert!(!before.refused_kept(&host, now), "refused with nothing else open, it was only busy");
+        assert_eq!(before.kept(&host, now), None, "refused with nothing else open, it was only busy");
         let three: Vec<HostSlot> = (0..3).map(|_| answered(before.try_acquire(&host, 32, Instant::now()).unwrap())).collect();
         three[2].throttled(Duration::from_secs(3));
         drop(three);
         let seen = HostProfile { accepts_ranges: Some(true), setup_time: Some(Duration::from_millis(120)), capped_per_connection: Some(true), connection_rate: Some(2e6), ..Default::default() };
         before.record(&host, seen, Instant::now());
-        before.keep(&host, now, |kept| (kept.own_agent, kept.checksums, kept.h2) = (Some(now), Some((false, now)), Some(now)));
         before.save(now);
+        let saved = std::fs::read_to_string(&file).unwrap();
+        assert!(!saved.contains("limited") && !saved.contains("refused"), "{saved}");
 
         let after = leaked();
-        after.keep_in(file, now);
-        assert_eq!(after.kept(&host, now).and_then(|kept| kept.refused), Some((now, Some(3))));
-        assert!(after.refused_kept(&host, now) && after.own_agent(&host, now) && after.speaks_h2(&host, now));
-        assert_eq!(after.checksums(&host, now), Some(false));
+        after.keep_in(file.clone(), now);
+        assert_eq!(after.kept(&host, now).map(|kept| kept.limited), Some(None));
         let first = after.profile(&host, Instant::now());
         assert_eq!(first, HostProfile { connection_cap: Some(2), ..seen });
+        // Seen the same again later, nothing changes: the file is not written again, and each fact
+        // keeps the age it had.
+        let later = now + 3600;
+        after.record(&host, seen, Instant::now());
+        assert!(!after.kept.lock().changed, "nothing new");
+        assert_eq!(after.kept(&host, later).and_then(|kept| kept.ranges), Some((true, now)));
         // Each is found out again once its age is over.
-        let (day, week) = (now + REFUSAL_KEPT_FOR.as_secs(), now + CHECKSUMS_KEPT_FOR.as_secs());
-        assert!(!after.refused_kept(&host, day) && after.own_agent(&host, day));
-        assert_eq!((after.checksums(&host, day), after.checksums(&host, week)), (Some(false), None));
-        assert!(after.own_agent(&host, week) && after.speaks_h2(&host, week));
+        assert_eq!(after.kept(&host, now + KEPT_FOR.as_secs()), None);
+    }
+
+    /// One refusal keeps nothing; a download refused after another was, once the host's rest was
+    /// over, keeps the host as limiting requests for an hour. When that is up, a download that
+    /// widens and is refused keeps it twice as long, up to a day; one that widens and is refused
+    /// nothing takes the mark away.
+    #[test]
+    fn test_a_host_is_kept_as_limiting_requests_only_once_refused_again_and_that_wears_off() {
+        let url = Url::parse("https://wears-off.example/f.bin").unwrap();
+        let limited = || HOSTS.kept(&HostKey::of(&url), unix_now()).and_then(|kept| kept.limited);
+        refused_in_download(&url, false);
+        assert!(!kept_limited(&url) && limited().is_none(), "one refusal keeps nothing");
+        refused_in_download(&url, true);
+        let (until, hours) = limited().unwrap();
+        assert!(kept_limited(&url) && hours == 1 && until.abs_diff(unix_now() + 3600) <= 2, "{until} {hours}");
+        widened_unrefused(&url);
+        refused_in_download(&url, true);
+        assert_eq!(limited().map(|(_, hours)| hours), Some(1), "neither while it holds");
+        // Its time up, a refused wider try doubles it; up to a day.
+        let expire = || HOSTS.keep(&HostKey::of(&url), unix_now(), |kept| kept.limited = kept.limited.map(|(_, hours)| (unix_now() - 1, hours)));
+        for hours in [2, 4, 8, 16, 24, 24] {
+            expire();
+            assert!(!kept_limited(&url));
+            refused_in_download(&url, false);
+            assert_eq!(limited().map(|(_, hours)| hours), Some(hours));
+        }
+        expire();
+        widened_unrefused(&url);
+        assert!(limited().is_none() && !limits_requests(&url), "gone once a wider download went through");
     }
 
     /// What a download settled on is kept by host, the speed that held it among it; the line's

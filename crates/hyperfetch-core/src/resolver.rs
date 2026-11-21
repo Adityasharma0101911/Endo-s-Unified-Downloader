@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1570,42 +1570,50 @@ pub(crate) const APP_USER_AGENT: &str = concat!("EndosUnifiedDownloader/", env!(
 /// with a 403 page (its mirrors take either).
 const OWN_AGENT_HOSTS: &[&str] = &["codeberg.org", "sourceforge.net", "www.sourceforge.net", "downloads.sourceforge.net"];
 
-/// Hosts found to hang up on the browser User-Agent without an answer and to answer
-/// [`APP_USER_AGENT`] (see [`ask_as_app`]): some file servers drop every browser. Kept until the
-/// app is closed.
-static OWN_AGENT_FOUND: parking_lot::Mutex<Option<HashSet<crate::hosts::HostKey>>> = parking_lot::const_mutex(None);
+/// Hosts this run asked with [`APP_USER_AGENT`] after they hung up on the browser one (see
+/// [`ask_as_app`]), with whether they answer it: some file servers drop every browser. Each host
+/// is tried once a run; nothing of it is kept past the run.
+static OWN_AGENT_FOUND: parking_lot::Mutex<Option<HashMap<crate::hosts::HostKey, bool>>> = parking_lot::const_mutex(None);
 
 /// Whether `url`'s host is asked with [`APP_USER_AGENT`]: one known to want it, or found to in
-/// this run or an earlier one (see `crate::hosts::own_agent`).
+/// this run (see [`found_as_app`]).
 pub(crate) fn asked_as_app(url: &Url) -> bool {
-    url.host_str().is_some_and(|host| OWN_AGENT_HOSTS.contains(&host.trim_end_matches('.')))
-        || OWN_AGENT_FOUND.lock().as_ref().is_some_and(|found| found.contains(&crate::hosts::HostKey::of(url)))
-        || crate::hosts::own_agent(url)
+    url.host_str().is_some_and(|host| OWN_AGENT_HOSTS.contains(&host.trim_end_matches('.'))) || found_as_app(url)
 }
 
-/// Has `url`'s host asked with [`APP_USER_AGENT`] from now on, in later runs too: false when it
-/// already is.
+/// Whether this run found `url`'s host to answer [`APP_USER_AGENT`] where it hung up on a browser's.
+pub(crate) fn found_as_app(url: &Url) -> bool {
+    OWN_AGENT_FOUND.lock().as_ref().is_some_and(|found| found.get(&crate::hosts::HostKey::of(url)) == Some(&true))
+}
+
+/// Has `url`'s host asked with [`APP_USER_AGENT`] for the rest of the run: false when it already
+/// is, or was tried once this run.
 pub(crate) fn ask_as_app(url: &Url) -> bool {
-    let asked = !asked_as_app(url) && OWN_AGENT_FOUND.lock().get_or_insert_with(HashSet::new).insert(crate::hosts::HostKey::of(url));
-    if asked {
-        crate::hosts::record_own_agent(url, true);
+    if asked_as_app(url) {
+        return false;
     }
-    asked
+    let mut found = OWN_AGENT_FOUND.lock();
+    let found = found.get_or_insert_with(HashMap::new);
+    let key = crate::hosts::HostKey::of(url);
+    if found.contains_key(&key) {
+        return false;
+    }
+    found.insert(key, true);
+    true
 }
 
-/// Takes [`ask_as_app`] back: `url`'s host did not answer the app either.
+/// Takes [`ask_as_app`] back: `url`'s host did not answer the app either, or refused it (403). It
+/// is not tried again this run.
 pub(crate) fn ask_as_browser(url: &Url) {
-    if let Some(found) = OWN_AGENT_FOUND.lock().as_mut() {
-        found.remove(&crate::hosts::HostKey::of(url));
-    }
-    crate::hosts::record_own_agent(url, false);
+    OWN_AGENT_FOUND.lock().get_or_insert_with(HashMap::new).insert(crate::hosts::HostKey::of(url), false);
 }
 
-/// `request`, for `url`, with the User-Agent `url`'s host takes.
-pub(crate) fn with_agent_for(request: reqwest::RequestBuilder, url: &Url) -> reqwest::RequestBuilder {
+/// `request`, for `url`, with the User-Agent `url`'s host takes, when the agent is `ours` to
+/// choose: one the user or the browser set is never replaced.
+pub(crate) fn with_agent_for(request: reqwest::RequestBuilder, url: &Url, ours: bool) -> reqwest::RequestBuilder {
     // The cookie a file share's download wants (see `crate::shares::with_cookie`).
     let request = crate::shares::with_cookie(request, url);
-    match asked_as_app(url) {
+    match ours && asked_as_app(url) {
         true => request.header(USER_AGENT, APP_USER_AGENT),
         false => request,
     }
@@ -2369,7 +2377,7 @@ mod tests {
         let client = Client::builder().default_headers(SmartResolver::default_anti_qos_headers()).build().unwrap();
         let agent = |link: &str| {
             let url = Url::parse(link).unwrap();
-            let request = with_agent_for(client.get(url.clone()), &url).build().unwrap();
+            let request = with_agent_for(client.get(url.clone()), &url, true).build().unwrap();
             request.headers().get(USER_AGENT).map(|v| v.to_str().unwrap().to_string())
         };
         let app = Some(APP_USER_AGENT.to_string());
@@ -2796,7 +2804,7 @@ mod tests {
             .unwrap();
         let url = Url::parse("https://downloads.sourceforge.net/project/sevenzip/7-Zip/24.09/7z2409-x64.exe?use_mirror=netix").unwrap();
         assert_eq!(client.get(url.clone()).send().await.unwrap().status(), 403);
-        let answer = with_agent_for(client.get(url.clone()), &url).send().await.unwrap();
+        let answer = with_agent_for(client.get(url.clone()), &url, true).send().await.unwrap();
         assert_eq!(answer.status(), 302);
         assert!(answer.headers()["location"].to_str().unwrap().starts_with("https://netix.dl.sourceforge.net/"));
         let page = Url::parse("https://sourceforge.net/projects/sevenzip/files/7-Zip/24.09/7z2409-x64.exe/download").unwrap();

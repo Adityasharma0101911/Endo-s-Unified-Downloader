@@ -82,6 +82,9 @@ const PREFETCH: u64 = 1024 * 1024;
 const PREFETCH_TIME: Duration = Duration::from_millis(250);
 /// Shortest interval over which the probe measures its rate: shorter ones see bursts, not a rate.
 const MIN_RATE_TICK: Duration = Duration::from_millis(20);
+/// How long a first stream alone is looked at every `MIN_RATE_TICK` at most: one that shows no
+/// speed by then is looked at as often as any download.
+const QUICK_TICKS_FOR: Duration = Duration::from_secs(3);
 /// Missing bytes that justify one more connection when the probe measured no rate: for less, its
 /// handshakes cost more than it saves. Also the most one connection is asked to carry before
 /// another one pays off.
@@ -691,6 +694,9 @@ pub struct DownloadEngine {
     /// Its file passed its checks and took its name (see `finalize`): a stop that came after
     /// takes nothing from it.
     finished: Arc<AtomicBool>,
+    /// Its first link's host refused another download within `hosts::BANNED_FOR` before this one
+    /// began asking it (see `hosts::refused_in_download`).
+    refused_before: Arc<AtomicBool>,
 }
 
 impl DownloadEngine {
@@ -725,7 +731,7 @@ impl DownloadEngine {
         };
         let auth = match (options.auth_header.as_deref(), options.referer.as_deref()) {
             (Some(value), referer) => match Auth::new(value, &urls) {
-                Ok(a) => Some(Arc::new(a.with_referer(referer.map(str::to_string)).with_headers(&scoped).with_s3(options.s3.clone()))),
+                Ok(a) => Some(Arc::new(a.with_referer(referer.map(str::to_string)).with_headers(&scoped).with_s3(options.s3.clone()).with_agent(agent_is_ours(&options)))),
                 Err(e) => return Self {
                     limiter: None,
                     live: None,
@@ -743,11 +749,14 @@ impl DownloadEngine {
                     reused: Arc::default(),
                     site: Arc::default(),
                     finished: Arc::default(),
+                    refused_before: Arc::default(),
                 },
             },
             // A password alone adds no header, but is scoped as they are (see `media_options_for`).
-            (None, None) if scoped.is_empty() && options.password.is_none() && options.s3.is_none() => None,
-            (None, referer) => Some(Arc::new(Auth::only_referer(referer, &urls).with_headers(&scoped).with_s3(options.s3.clone()))),
+            (None, None) if scoped.is_empty() && options.password.is_none() && options.s3.is_none() && agent_is_ours(&options) => None,
+            (None, referer) => {
+                Some(Arc::new(Auth::only_referer(referer, &urls).with_headers(&scoped).with_s3(options.s3.clone()).with_agent(agent_is_ours(&options))))
+            }
         };
         Self {
             limiter: options.max_speed.filter(|&s| s > 0).map(|s| Arc::new(RateLimiter::new(s))),
@@ -766,6 +775,7 @@ impl DownloadEngine {
             reused: Arc::default(),
             site: Arc::default(),
             finished: Arc::default(),
+            refused_before: Arc::default(),
         }
     }
 
@@ -899,8 +909,10 @@ impl DownloadEngine {
             result = engine.boxed(|engine| engine.fetch_all(tx)).await;
         }
         let mut result = result.map_err(crate::digest::refetch_failed);
-        // What the download learned of its hosts outside its connections (a refusal, its checksum
-        // files, the User-Agent it answers) is kept for the next run, a small file's too.
+        // A search for the site's checksum that a failed download left waiting ends with it.
+        crate::digest::stop(&self.site);
+        // What the download learned of its hosts outside its connections (a refusal again, a
+        // small file's ranges) is kept for the next run.
         let _ = blocking(hosts::save).await;
         let lines = &self.options.archive_lines;
         // A file that passed its checks is whole, whenever a stop came.
@@ -2673,6 +2685,8 @@ impl DownloadEngine {
     /// every probe is waited for, and no answer holds its host slot meanwhile: another probe may
     /// need it. A Google Drive answer that is a web page fails its mirror's probe.
     async fn probe_all(&self, client: &Client, urls: &[Url], snapshot_tx: &Option<broadcast::Sender<EngineSnapshot>>) -> Result<Probed, String> {
+        // Before this download asks anything: a refusal of its own probe is no other download's.
+        self.refused_before.store(urls.first().is_some_and(hosts::refused_lately), Ordering::SeqCst);
         // Fetching again from the mirror the download went by, the others are left out.
         let urls = if self.site.lock().primary_only { &urls[..urls.len().min(1)] } else { urls };
         let (limiter, stall) = (self.limiter(), self.stall_timeout());
@@ -3047,7 +3061,10 @@ impl DownloadEngine {
         // A host that limits how often it is asked, this run or an earlier one found, is asked
         // for the file alone, over one connection (see `hosts::limits_requests`); unless other
         // mirrors share the work.
-        let limited = adapts && late.is_none() && mirrors.len() == 1 && hosts::limits_requests(&reference.final_url);
+        let limited = adapts && late.is_none() && mirrors.len() == 1 && hosts::kept_limited(&reference.final_url);
+        // Whether another download was refused by the host lately: one of this one refused too
+        // keeps the host as limiting requests (see `hosts::refused_in_download`).
+        let refused_before = self.refused_before.load(Ordering::SeqCst);
         let start = autopilot::Start {
             remembered: best.is_some(),
             rate: known.connection_rate.filter(|_| known.capped_per_connection == Some(true)),
@@ -3068,7 +3085,8 @@ impl DownloadEngine {
         // asked gets, has a gap for one chunk, unless chunks are kept small for the reasons
         // `effective_chunk_size` gives: what it has left is cut for the connections that join it
         // (see `ChunkManager::spread`), or taken from its far end (see `ChunkManager::steal_work`).
-        let alone_first = streaming.is_some() && (limited || (start.rate.is_none() && best.is_none()));
+        // Not a resumed download: its gaps are split as they always were.
+        let alone_first = streaming.is_some() && state.completed_ranges.is_empty() && (limited || (start.rate.is_none() && best.is_none()));
         let whole_gaps = alone_first && self.options.base_chunk_size == DEFAULT_CHUNK_SIZE && !in_order && !throttled_host;
         let chunk_size = match whole_gaps {
             true => size,
@@ -3207,6 +3225,8 @@ impl DownloadEngine {
         let mut offline = std::collections::HashSet::new();
         // The site's checksum files are asked for (see `crate::digest::go`).
         let mut looking = false;
+        // Whether the host refused one of its requests, and the most connections it had.
+        let (mut refused, mut widest) = (false, num_workers);
         if let Some(why) = &why {
             tracing::info!("Autopilot: {}", why);
         }
@@ -3216,6 +3236,9 @@ impl DownloadEngine {
         let mut last_persist = Instant::now();
         let mut saving: Option<tokio::task::JoinHandle<_>> = None;
         let mut hashing = hashed.is_some();
+        // The quick ticks of a stream alone last this long at most, also one stalled at nothing,
+        // and send a snapshot no more often than the others.
+        let (quick_until, mut shown) = (Instant::now() + QUICK_TICKS_FOR, None::<Instant>);
         let outcome = loop {
             if job.chunks.lock().is_all_completed() {
                 break Ok(());
@@ -3231,6 +3254,10 @@ impl DownloadEngine {
                     Some(event) => {
                         if matches!(event, WorkerEvent::Ttfb { .. }) {
                             alone.cancel();
+                        }
+                        if matches!(event, WorkerEvent::ChunkFailed { kind: FailureKind::Throttled(_), .. }) && !refused {
+                            refused = true;
+                            hosts::refused_in_download(&reference.final_url, refused_before);
                         }
                         let (WorkerEvent::Ttfb { worker_id, .. }
                         | WorkerEvent::Progress { worker_id, .. }
@@ -3248,7 +3275,10 @@ impl DownloadEngine {
                     None => break Err("Download aborted: all workers stopped before the download completed".to_string()),
                 },
                 _ = tick.tick() => {
-                    emit(snapshot_tx, || EngineSnapshot { autopilot: why.clone(), ..job.snapshot(size, &mut meter, final_path) });
+                    if shown.is_none_or(|shown| shown.elapsed() >= SNAPSHOT_INTERVAL) {
+                        shown = Some(Instant::now());
+                        emit(snapshot_tx, || EngineSnapshot { autopilot: why.clone(), ..job.snapshot(size, &mut meter, final_path) });
+                    }
                     if !hashing {
                         if let Some(checksum) = crate::digest::found(&self.site) {
                             job.writer.hash_as_written(&checksum);
@@ -3312,6 +3342,7 @@ impl DownloadEngine {
                             }
                         }
                         spawned = spawned.max(next);
+                        widest = widest.max(next);
                     }
                     // The download's own requests go first: the checksum files beside it are asked
                     // for once it sent those it widens with, or knows it will not widen, and never
@@ -3340,7 +3371,7 @@ impl DownloadEngine {
                     }
                     // The first stream shows its speed well within a snapshot's interval on a fast
                     // host: looked at this often, it is not left alone longer than it must be.
-                    if pilot.as_ref().is_some_and(|pilot| pilot.is_alone()) {
+                    if pilot.as_ref().is_some_and(|pilot| pilot.is_alone()) && Instant::now() < quick_until {
                         tick.reset_after(MIN_RATE_TICK);
                     }
                 }
@@ -3363,6 +3394,11 @@ impl DownloadEngine {
         // What this download learned of its hosts and the line, for the next run too.
         if let Some(pilot) = pilot.filter(|_| outcome.is_ok()) {
             hosts::record_line(pilot.best);
+        }
+        // Wider than one connection and refused nothing: a host kept as limiting requests whose
+        // time is up is no longer.
+        if outcome.is_ok() && !refused && widest > 1 {
+            hosts::widened_unrefused(&reference.final_url);
         }
         // What one connection to each host brought, by its own link's host, not a redirect's: a
         // later download with several links starts its pieces on the fastest (see `add_mirror`).
@@ -5081,11 +5117,15 @@ async fn probe_with(
                 |url: &Url| authorize(client.get(url.clone()), auth, url).header(RANGE, range.as_str()).header(ACCEPT_ENCODING, "identity");
             let sent = send(request, url).await;
             // A host that hangs up on the browser User-Agent is asked once more as the app
-            // itself, and from then on when it answers that (see `crate::resolver::ask_as_app`).
+            // itself, and for the rest of the run when it answers that (see
+            // `crate::resolver::ask_as_app`): once a run, and not while it rests or refused us
+            // lately, when it is shutting us out, not hanging up on a browser. One that then
+            // refuses the app (403) is asked as the browser again.
+            let resting = hosts::refused_lately(url) || !hosts::rest_left(url).is_zero();
             let sent = match sent {
-                Err(e) if as_app && hung_up(&e) && crate::resolver::ask_as_app(url) => match send(request, url).await {
+                Err(e) if as_app && !resting && hung_up(&e) && crate::resolver::ask_as_app(url) => match send(request, url).await {
                     Ok(resp) if resp.status().is_success() => {
-                        // Chunk requests go straight to the host a redirect led to.
+                        // Chunk requests go straight to the host a redirect led to: it answered the app.
                         crate::resolver::ask_as_app(resp.url());
                         Ok(resp)
                     }
@@ -5094,6 +5134,10 @@ async fn probe_with(
                         Err(e)
                     }
                 },
+                Ok(resp) if as_app && resp.status() == StatusCode::FORBIDDEN && crate::resolver::found_as_app(url) => {
+                    crate::resolver::ask_as_browser(url);
+                    send(request, url).await
+                }
                 sent => sent,
             };
             let retry_in = match &sent {
@@ -5240,10 +5284,12 @@ async fn probe_with(
         StatusCode::OK => {
             info.size = content_length(get.headers());
             end = info.size.map_or(end, |size| size.saturating_sub(1));
-            match info.size.filter(|&size| size > 0) {
-                // A server may answer a range that is the whole file with all of it, as it is:
-                // its host took ranges before, so the answer goes on as one for the whole file.
-                Some(size) if ask == Ask::Stream && hosts::profile(get.url()).accepts_ranges == Some(true) => {
+            match info.size.filter(|&size| size > PREFETCH) {
+                // A server may answer a range that is the whole file with all of it, as it is.
+                // That this link takes ranges is then shown by a 206 alone, to one bounded request
+                // asked when the answer says it takes them, the stream held meanwhile; else the
+                // download is this one stream. What the host did for other links proves nothing.
+                Some(size) if ask == Ask::Stream && !lean && accepts_bytes(get.headers()) && takes_ranges(client, auth, get.url(), size, limit, setup).await => {
                     info.accepts_ranges = true;
                     Some(Holds::Start(read(size)))
                 }
@@ -5267,14 +5313,12 @@ async fn probe_with(
     // neither range support nor its lack, and nor does the whole file for a range that reaches
     // past its end: a server may send that as it is.
     let ranges = match get.status() {
+        StatusCode::OK if info.accepts_ranges => Some(true),
         StatusCode::OK => info.size.is_none_or(|size| size > asked).then_some(false),
         _ => info.accepts_ranges.then_some(true),
     };
     let setup_time = info.answer_time.filter(|_| cold && info.final_url == *url);
     hosts::record(get.url(), HostProfile { accepts_ranges: ranges, setup_time, ..Default::default() });
-    if get.version() == reqwest::Version::HTTP_2 {
-        hosts::record_h2(get.url());
-    }
 
     let own = |name: HeaderName| get.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_string);
     let own_validators =
@@ -5284,6 +5328,23 @@ async fn probe_with(
         .filter(|holds| prefetch && (own_validators || matches!(holds, Holds::Whole)))
         .and_then(|holds| body(get, holds, end));
     Ok((info, body))
+}
+
+/// Whether `url`, which answered `bytes=0-` with all `size` bytes of it, takes ranges after all: a
+/// 206 for its last byte, asked for with a slot of its host's free at once, within what a new
+/// connection takes to answer and a grace.
+async fn takes_ranges(client: &Client, auth: Option<&Auth>, url: &Url, size: u64, limit: usize, setup: Option<Duration>) -> bool {
+    let Some(slot) = hosts::try_acquire(url, limit) else { return false };
+    let last = format!("bytes={}-{}", size - 1, size - 1);
+    let request = |url: &Url| authorize(client.get(url.clone()), auth, url).header(RANGE, last.as_str()).header(ACCEPT_ENCODING, "identity");
+    let Ok(Ok(resp)) = tokio::time::timeout(HEAD_GRACE + setup.unwrap_or_default(), send(request, url)).await else { return false };
+    if is_busy(resp.status()) {
+        slot.throttled(retry_after(resp.headers()).unwrap_or_default());
+        return false;
+    }
+    slot.accepted();
+    let range = resp.headers().get(CONTENT_RANGE).and_then(|v| v.to_str().ok()).map(ByteRange::parse_content_range_cut);
+    resp.status() == StatusCode::PARTIAL_CONTENT && matches!(range, Some(Ok((range, Some(total)))) if range.start == size - 1 && total == size)
 }
 
 /// What a 200's body, the whole file, holds: read in advance when that is small enough.
@@ -8634,8 +8695,15 @@ mod tests {
             assert!(!says_http1_refused(other), "{other}");
         }
 
-        // Over plain HTTP the client speaks HTTP/1.1 all the same, so the second run fails too.
-        let options = |http2| DownloadOptions { output_path: Some(std::env::temp_dir()), http2, max_retries: 0, ..Default::default() };
+        // Over plain HTTP the client speaks HTTP/1.1 all the same, so the second run fails too. An
+        // agent of its own keeps the app's try under its own name (once a run) out of the count.
+        let options = |http2| DownloadOptions {
+            output_path: Some(std::env::temp_dir()),
+            http2,
+            max_retries: 0,
+            user_agent: Some("Test/1".into()),
+            ..Default::default()
+        };
         let tries = |http2| {
             let (requests, url) = (Arc::clone(&requests), url.clone());
             async move {
@@ -10082,11 +10150,13 @@ mod tests {
         assert!(asked <= 16, "{asked} requests, {refused} refused");
     }
 
-    /// What a host that keeps a budget of requests showed is kept for the next run: after a
-    /// restart, the next download from it, looking for the site's checksum files too, asks it
-    /// for the file alone, and is refused nothing.
+    /// What a host that keeps a budget of requests showed: one refusal is kept for this run alone.
+    /// Kept as limiting requests (it refused a download again after its rest, see
+    /// `hosts::refused_in_download`), the next download from it after a restart asks it for the
+    /// file alone, in one request it does not refuse, then for the site's checksum files one at a
+    /// time, none after the first it refuses.
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_a_host_that_refused_is_asked_little_after_a_restart_too() {
+    async fn test_a_host_kept_as_limiting_requests_is_asked_little_after_a_restart_too() {
         let size = 8 * 1024 * 1024;
         let budget = crate::netsim::Budget { burst: 4, every: Duration::from_millis(250), retry_after: 1 };
         let (url, stats) = crate::netsim::serve(crate::netsim::Server { size, per_client: Some(4e6), budget: Some(budget), ..Default::default() }).await;
@@ -10095,17 +10165,21 @@ mod tests {
         assert!(got == crate::netsim::file(size));
         let seen = || (stats.asked.load(Ordering::SeqCst), stats.throttled.load(Ordering::SeqCst));
         assert!(seen().1 > 0, "the first download found the budget");
+        assert!(!hosts::kept_limited(&url), "one refusal is not kept");
+        hosts::refused_in_download(&url, true);
         hosts::forget_run(&url);
-        // The budget fills again meanwhile.
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        let before = seen();
+        // The budget fills again meanwhile, and the refusal's rest is over.
+        let refilled = (budget.every * budget.burst as u32).max(Duration::from_secs(budget.retry_after));
+        tokio::time::sleep(refilled).await;
+        let before = stats.log.lock().len();
         let again = tempdir().unwrap();
         let engine = DownloadEngine::new(vec![url.clone()], sim_options(again.path(), 16, true));
         let path = tokio::time::timeout(Duration::from_secs(60), engine.run(None)).await.expect("finished in a minute").unwrap();
         assert!(std::fs::read(path).unwrap() == crate::netsim::file(size));
-        let after = seen();
-        assert_eq!(after.1, before.1, "refused nothing: {after:?} after {before:?}");
-        assert_eq!(after.0 - before.0, 1, "the file alone, in one request");
+        let log = stats.log.lock()[before..].to_vec();
+        let file: Vec<_> = log.iter().filter(|(path, _)| path == "/f.bin").collect();
+        assert_eq!(file, [&("/f.bin".to_string(), false)], "the file alone, in one request: {log:?}");
+        assert!(log.iter().rev().skip(1).all(|(_, refused)| !refused), "none after a refusal: {log:?}");
     }
 
     /// The (GETs, HEADs) a server saw.
@@ -10134,13 +10208,14 @@ mod tests {
 
     /// A host that holds each connection to 2 MB/s: once the stream shows that, or at once when an
     /// earlier download found it, more connections open, as many as fill the line: 8 MiB in well
-    /// under the 4 s the one stream would take. One whose host was fastest with three starts those
-    /// at once. Neither asks HEAD.
+    /// under the 4.2 s the one stream would take. One whose host was fastest with three starts
+    /// those at once. Neither asks HEAD.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_a_stream_more_connections_pay_for_widens() {
-        let size = 8 * 1024 * 1024;
+        let (size, per_connection) = (8 * 1024 * 1024, 2e6);
+        let one_stream = Duration::from_secs_f64(size as f64 / per_connection);
         for remembered in [None, Some(3)] {
-            let server = crate::netsim::Server { size, per_connection: Some(2e6), ..Default::default() };
+            let server = crate::netsim::Server { size, per_connection: Some(per_connection), ..Default::default() };
             let (url, stats) = crate::netsim::serve(server).await;
             if let Some(best) = remembered {
                 hosts::record_settled(&url, best, None);
@@ -10150,7 +10225,7 @@ mod tests {
             let (got, said) = fetch_from_sim(&url, sim_options(dir.path(), 16, true)).await;
             let took = started.elapsed();
             assert!(got == crate::netsim::file(size));
-            assert!(took < Duration::from_secs(3), "{remembered:?}: {took:?}, {said:?}");
+            assert!(took < one_stream * 3 / 4, "{remembered:?}: {took:?}, {said:?}");
             assert!(stats.peak.load(Ordering::SeqCst) >= 3, "{remembered:?}: {said:?}");
             assert_eq!(asked(&stats).1, 0);
         }
@@ -10191,7 +10266,8 @@ mod tests {
     /// The checksum files beside a download wait for its own requests: from a host that holds
     /// each connection to 2 MB/s, the stream and the connections it opens are all answered before
     /// the first is asked for. From one that keeps a budget of requests (4 at once, then one every
-    /// 3 s), which refuses some of them, none is asked for at all: what it refuses is the file.
+    /// 3 s), which refuses some of the file's, they come after the file's last request, one at a
+    /// time, and none after the first it refuses.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_the_checksum_files_wait_for_the_downloads_own_requests() {
         let budget = crate::netsim::Budget { burst: 4, every: Duration::from_secs(3), retry_after: 3 };
@@ -10208,7 +10284,10 @@ mod tests {
                 None => assert!(first_lookup.is_some_and(|at| at >= 8), "{log:?}"),
                 Some(_) => {
                     assert!(log.iter().any(|(_, refused)| *refused), "{log:?}");
-                    assert_eq!(first_lookup, None, "{log:?}");
+                    let last_of_file = log.iter().rposition(|(path, _)| path == "/f.bin");
+                    assert!(first_lookup.is_none_or(|at| last_of_file < Some(at)), "{log:?}");
+                    let lookups = &log[first_lookup.unwrap_or(log.len())..];
+                    assert!(lookups.iter().rev().skip(1).all(|(_, refused)| !refused), "{log:?}");
                 }
             }
         }
@@ -10780,6 +10859,11 @@ mod tests {
         // The download's later requests go as the app too.
         let request = authorize(client.get(picky.clone()), None, &picky).build().unwrap();
         assert_eq!(request.headers().get(USER_AGENT).unwrap(), crate::resolver::APP_USER_AGENT);
+        // An agent the user chose stays the only one, also to that host.
+        let options = DownloadOptions { user_agent: Some("Mine/1".into()), ..Default::default() };
+        let theirs = Auth::only_referer(None, &[]).with_agent(agent_is_ours(&options));
+        let request = authorize(client.get(picky.clone()), Some(&theirs), &picky).build().unwrap();
+        assert!(request.headers().get(USER_AGENT).is_none(), "the client's own, the user's, goes");
 
         let deaf = server(false).await;
         assert!(probe(deaf.clone(), true).await.is_err());
@@ -10788,6 +10872,68 @@ mod tests {
         let chosen = server(true).await;
         assert!(probe(chosen.clone(), false).await.is_err());
         assert!(!crate::resolver::asked_as_app(&chosen));
+    }
+
+    /// A 200 to the first request, `bytes=0-`, makes the download one stream, whatever its host did
+    /// for other links: only a 206 to a bounded request, asked once when the answer says the link
+    /// takes ranges, lets it split.
+    #[tokio::test]
+    async fn test_a_whole_file_answer_is_one_stream_unless_a_range_shows_otherwise() {
+        let size = 2 * 1024 * 1024;
+        let body: Arc<String> = Arc::new((0..size).map(|i| (b'a' + (i % 26) as u8) as char).collect());
+        // Answers `bytes=0-` and any GET without a bounded range with all of the file, saying it
+        // takes ranges when `offers`; a bounded range with a 206 for it when `bounded`. Also the
+        // ranges the file was asked for.
+        let serve = |offers: bool, bounded: bool| {
+            let (body, asked) = (Arc::clone(&body), Arc::new(Mutex::new(Vec::new())));
+            let log = Arc::clone(&asked);
+            async move {
+                let url = answering_server(move |head| {
+                    let range = head.lines().find_map(|l| l.strip_prefix("range: bytes=")).map(str::to_string);
+                    if head.starts_with("get /f.bin ") {
+                        log.lock().push(range.clone().unwrap_or_default());
+                    }
+                    let bounded = range.as_deref().filter(|_| bounded).and_then(|r| r.split_once('-'));
+                    match bounded.and_then(|(a, b)| Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?))) {
+                        Some((a, b)) => format!(
+                            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {a}-{b}/{size}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            b + 1 - a,
+                            &body[a..=b]
+                        ),
+                        None => {
+                            let offer = if offers { "Accept-Ranges: bytes\r\n" } else { "" };
+                            format!("HTTP/1.1 200 OK\r\n{offer}Content-Length: {size}\r\nConnection: close\r\n\r\n{body}")
+                        }
+                    }
+                })
+                .await
+                .join("f.bin")
+                .unwrap();
+                (url, asked)
+            }
+        };
+        let fetch = |url: Url| async move {
+            let dir = tempdir().unwrap();
+            let options = DownloadOptions { output_path: Some(dir.path().join("f.bin")), adaptive: true, remote_checksum: false, ..Default::default() };
+            let path = DownloadEngine::new(vec![url], options).run(None).await.expect("downloaded");
+            std::fs::read(path).unwrap()
+        };
+        // A host remembered as taking ranges, whose link does not: one stream, nothing failed.
+        let (url, asked) = serve(false, false).await;
+        hosts::record(&url, HostProfile { accepts_ranges: Some(true), ..Default::default() });
+        assert!(fetch(url).await == body.as_bytes());
+        assert_eq!(*asked.lock(), ["0-"]);
+        // A link that says it takes them, and does not: one bounded request shows it.
+        let (url, asked) = serve(true, false).await;
+        assert!(fetch(url).await == body.as_bytes());
+        assert_eq!(*asked.lock(), ["0-".to_string(), format!("{}-{}", size - 1, size - 1)]);
+        // One that does: the download may split.
+        let (url, asked) = serve(true, true).await;
+        let (info, _) = probe_url(&Client::new(), None, &url, Ask::Stream, false, 0, true).await.unwrap();
+        assert!(info.accepts_ranges && info.size == Some(size as u64));
+        asked.lock().clear();
+        assert!(fetch(url).await == body.as_bytes());
+        assert_eq!(asked.lock().first().map(String::as_str), Some("0-"));
     }
 
     #[test]

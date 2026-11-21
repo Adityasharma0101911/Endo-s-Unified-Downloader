@@ -382,13 +382,16 @@ pub struct Auth {
     /// The key requests to S3 hosts among them are signed with (see `crate::sigv4`).
     s3: Option<Arc<crate::sigv4::S3Key>>,
     user_urls: Vec<Url>,
+    /// The User-Agent is the app's to choose: neither the user nor the browser set one (see
+    /// `crate::resolver::with_agent_for`).
+    agent_ours: bool,
 }
 
 impl Auth {
     pub(crate) fn new(value: &str, user_urls: &[Url]) -> Result<Self, String> {
         let mut value = HeaderValue::from_str(value).map_err(|_| "Invalid Authorization header value".to_string())?;
         value.set_sensitive(true);
-        Ok(Self { value: Some(value), referer: None, headers: HeaderMap::new(), s3: None, user_urls: user_urls.to_vec() })
+        Ok(Self { value: Some(value), referer: None, headers: HeaderMap::new(), s3: None, user_urls: user_urls.to_vec(), agent_ours: true })
     }
 
     pub(crate) fn with_referer(mut self, referer: Option<String>) -> Self {
@@ -397,7 +400,13 @@ impl Auth {
     }
 
     pub(crate) fn only_referer(referer: Option<&str>, user_urls: &[Url]) -> Self {
-        Self { value: None, referer: referer.map(str::to_string), headers: HeaderMap::new(), s3: None, user_urls: user_urls.to_vec() }
+        Self { value: None, referer: referer.map(str::to_string), headers: HeaderMap::new(), s3: None, user_urls: user_urls.to_vec(), agent_ours: true }
+    }
+
+    /// With the User-Agent the app's to choose (`ours`) or not.
+    pub(crate) fn with_agent(mut self, ours: bool) -> Self {
+        self.agent_ours = ours;
+        self
     }
 
     pub(crate) fn with_s3(mut self, key: Option<crate::sigv4::S3Key>) -> Self {
@@ -428,7 +437,7 @@ impl Auth {
 /// (see [`crate::resolver::with_agent_for`]), and the appropriate `Referer` header (see
 /// [`crate::resolver::with_referer_for`]).
 pub(crate) fn authorize(request: RequestBuilder, auth: Option<&Auth>, url: &Url) -> RequestBuilder {
-    let request = crate::resolver::with_agent_for(request, url);
+    let request = crate::resolver::with_agent_for(request, url, auth.is_none_or(|a| a.agent_ours));
     let explicit_referer = auth.and_then(|a| a.referer.as_deref());
     let request = crate::resolver::with_referer_for(request, url, explicit_referer);
     let Some(auth) = auth.filter(|a| a.allows(url)) else { return request };
@@ -786,7 +795,12 @@ impl HttpWorker {
                     let costs: Vec<StealTiming> =
                         racer.mirrors().iter().map(|m| StealTiming { startup: m.ttfb(), rate: m.speed_ewma }).collect();
                     let steal = StealRule { min_bytes: s.min_steal, timing: Some(&costs) };
+                    // Under a speed limit a chunk is slow by the limit's doing, as for `hedge`.
+                    let limited = s.limiter.as_ref().is_some_and(|l| l.limits());
                     let stolen = mgr.steal_work(self.worker_id, mirror_id, steal).map(|(_, c)| c).or_else(|| {
+                        if limited {
+                            return None;
+                        }
                         let taken = mgr.take_over_slow(self.worker_id, mirror_id, &costs);
                         if let Some(chunk) = &taken {
                             tracing::info!("Chunk {} slowed to a crawl; worker {} takes over the rest", chunk.id, self.worker_id);

@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
 use std::path::Path;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -68,8 +68,8 @@ pub(crate) const FROM_PRIMARY: &str = "The file does not match its checksum; fet
 /// same site: `<url>.sha256`, `.sha512`, `.sha1`, `.md5`, then `SHA256SUMS`, `sha256sums.txt` and
 /// `CHECKSUMS` in its folder, by the line for its name. Those are fetched two at a time, the
 /// first in that order with a checksum taken, with GET only, each at most 64 KiB, within 3
-/// seconds in all; none of a host that refused a request (429/503) lately, so none after the
-/// first it refuses.
+/// seconds in all; one at a time of a host that limits how often it is asked, and none after the
+/// first it refuses (429/503).
 pub async fn published_checksum(client: &Client, url: &Url, probe_headers: &HeaderMap) -> Option<String> {
     published(client, None, 0, url, probe_headers, None).await
 }
@@ -90,8 +90,7 @@ async fn published(
     if let Some(found) = from_headers(probe_headers) {
         return Some(found);
     }
-    // Not of a host that limits how often it is asked (see `fetch_small`).
-    if let Some((metalink, size)) = described.filter(|(metalink, _)| !crate::hosts::limits_requests(metalink)) {
+    if let Some((metalink, size)) = described {
         // One of another size describes another file.
         let file = crate::metalink::described(client, &metalink, size, SIDECAR_BUDGET).await.filter(|f| f.size.is_none() || f.size == size);
         let found: Vec<_> = file.iter().flat_map(|f| &f.hashes).filter_map(|(algo, hex)| named(algo, hex)).collect();
@@ -169,15 +168,15 @@ fn from_headers(headers: &HeaderMap) -> Option<String> {
     ALGOS.iter().find_map(|(algo, _)| found.iter().find(|(name, _)| name == algo)).map(|(algo, digest)| checksum(algo, digest))
 }
 
-/// The checksum the files beside `url` give for it (see [`published_checksum`]). None is asked
-/// for of a host that limits how often it is asked (see `hosts::limits_requests`), nor of one
-/// whose downloads found none beside them lately (see `hosts::checksums`); what they find is kept
-/// for that. Until the host is known to publish some, the downloads of one folder ask in turn,
-/// each with what the one before learned: files that start together cost one set of lookups, not
-/// one each. The wait for a turn is part of the 3 seconds.
+/// The checksum the files beside `url` give for it (see [`published_checksum`]). What a folder
+/// was seen not to publish is not asked for again for a while (see `MISSING`). Until one of its
+/// files of that kind was found to have one, the downloads of one folder ask in turn, each with
+/// what the one before learned: files that start together cost about one set of lookups, not one
+/// each. The wait for a turn is part of the 3 seconds. A host that limits how often it is asked
+/// (see `hosts::limits_requests`) is asked one at a time; the first refusal (429/503) ends them,
+/// and tells nothing of the host: these requests are the download's to spare.
 async fn from_sidecars(client: &Client, auth: Option<&Auth>, limit: usize, url: &Url) -> Option<String> {
-    let skipped = || !matches!(url.scheme(), "http" | "https") || crate::hosts::limits_requests(url) || crate::hosts::checksums(url) == Some(false);
-    if skipped() {
+    if !matches!(url.scheme(), "http" | "https") {
         return None;
     }
     let name = url.path_segments()?.next_back().filter(|n| !n.is_empty())?;
@@ -186,38 +185,40 @@ async fn from_sidecars(client: &Client, auth: Option<&Auth>, limit: usize, url: 
     file.set_query(None);
     file.set_fragment(None);
     let deadline = tokio::time::Instant::now() + SIDECAR_BUDGET;
+    // The folder's files of this kind, by their extension: the next of them go by what these had.
+    let ext = name.rsplit_once('.').map_or("", |(_, ext)| ext).to_ascii_lowercase();
+    let kind = file.join(".").ok().map(|folder| format!("{folder}*.{ext}"));
+    let publishes = || kind.as_deref().is_some_and(|kind| seen(&PUBLISHES, kind, 1));
     let held = match file.join(".") {
-        Ok(folder) if crate::hosts::checksums(url) != Some(true) => Some(tokio::time::timeout_at(deadline, turn(folder.as_str()).lock_owned()).await.ok()?),
+        Ok(folder) if !publishes() => Some(tokio::time::timeout_at(deadline, turn(folder.as_str()).lock_owned()).await.ok()?),
         _ => None,
     };
-    if skipped() {
-        return None;
-    }
-    // Known meanwhile to publish some: the others go on at once.
-    let _held = held.filter(|_| crate::hosts::checksums(url) != Some(true));
+    // Found meanwhile to publish some: the others go on at once.
+    let _held = held.filter(|_| !publishes());
     let beside = ["sha256", "sha512", "sha1", "md5"].map(|ext| {
         let mut sidecar = file.clone();
         sidecar.set_path(&format!("{}.{ext}", file.path()));
         (sidecar, Some(ext))
     });
     let folder = ["SHA256SUMS", "sha256sums.txt", "CHECKSUMS"].map(|list| file.join(list).ok().map(|u| (u, None)));
-    // The folder's files of this kind, by their extension: the next of them go by what these had.
-    let ext = name.rsplit_once('.').map_or("", |(_, ext)| ext).to_ascii_lowercase();
-    let kind = file.join(".").ok().map(|folder| format!("{folder}*.{ext}"));
     let bare = kind.as_deref().is_some_and(|kind| missing(kind, BARE_FILES));
     let own = beside.len() as u8;
     let asked: Vec<_> = beside.into_iter().filter(|_| !bare).chain(folder.into_iter().flatten().filter(|(list, _)| !missing(list.as_str(), 1))).collect();
-    let asking = asked.len();
+    let at_once = if crate::hosts::limits_requests(url) { 1 } else { SIDECARS_AT_ONCE };
+    let refused = &AtomicBool::new(false);
     // A few at a time, over the connections the probe left open: a finished download waits for
     // them, and a host that takes few connections keeps the rest for the download. The first in
     // this order that names a checksum wins, whichever answers first.
     let name = &name;
     // How many of the file's own were said not to be there, and whether one named its checksum;
     // how many of all asked for were said not to be there.
-    let (none_beside, one_beside, none_at_all) = (&AtomicU8::new(0), &AtomicU8::new(0), &AtomicUsize::new(0));
+    let (none_beside, one_beside) = (&AtomicU8::new(0), &AtomicU8::new(0));
     let lookups: Vec<_> = asked
         .into_iter()
         .map(|(sidecar, ext)| async move {
+            if refused.load(Ordering::Relaxed) {
+                return None;
+            }
             match fetch_small(client, auth, limit, sidecar.clone()).await {
                 Sidecar::Text(text) => {
                     let found = checksum_line(&text, name, ext);
@@ -227,35 +228,32 @@ async fn from_sidecars(client: &Client, auth: Option<&Auth>, limit: usize, url: 
                     found
                 }
                 Sidecar::Missing => {
-                    none_at_all.fetch_add(1, Ordering::Relaxed);
                     match ext {
                         Some(_) => _ = none_beside.fetch_add(1, Ordering::Relaxed),
                         None => note_missing(sidecar.into()),
                     }
                     None
                 }
+                Sidecar::Refused => {
+                    refused.store(true, Ordering::Relaxed);
+                    None
+                }
                 Sidecar::Unknown => None,
             }
         })
         .collect();
-    let lookups = futures_util::stream::iter(lookups).buffered(SIDECARS_AT_ONCE).filter_map(std::future::ready);
+    let lookups = futures_util::stream::iter(lookups).buffered(at_once).filter_map(std::future::ready);
     let found = tokio::time::timeout_at(deadline, std::pin::pin!(lookups).next()).await;
     let none = found.is_ok() && none_beside.load(Ordering::Relaxed) == own;
     if let Some(kind) = kind {
-        if one_beside.load(Ordering::Relaxed) > 0 {
+        if one_beside.load(Ordering::Relaxed) > 0 || found.as_ref().is_ok_and(Option::is_some) {
             MISSING.lock().remove(&kind);
+            note(&PUBLISHES, kind);
         } else if none {
             note_missing(kind);
         }
     }
-    // Every one asked for not there: the host publishes none, and the downloads from it after this
-    // one ask for none (see `hosts::checksums`); one found takes that back.
-    let all_missing = found.is_ok() && asking > 0 && none_at_all.load(Ordering::Relaxed) == asking;
-    let found = found.ok().flatten();
-    if found.is_some() || all_missing {
-        crate::hosts::record_checksums(url, found.is_some());
-    }
-    found
+    found.ok().flatten()
 }
 
 /// What asking for a checksum file gave.
@@ -263,6 +261,8 @@ enum Sidecar {
     Text(String),
     /// The server says it is not there, or sent a web page or more than `MAX_SIDECAR` in its place.
     Missing,
+    /// The server refused it (429/503): the download asks for no more.
+    Refused,
     /// Nothing to go by: no answer, or a server that is busy or failing.
     Unknown,
 }
@@ -271,6 +271,10 @@ enum Sidecar {
 /// not in its folder (by its URL), and how many of a folder's files of one kind had no checksum
 /// file of their own (by `<folder>*.<extension>`). Each with when it was last seen so.
 static MISSING: LazyLock<Mutex<HashMap<String, (Instant, u8)>>> = LazyLock::new(Default::default);
+
+/// The kinds of a folder's files (`<folder>*.<extension>`) one of which was found to have a
+/// checksum, with when: the next of them need not wait for a turn (see `from_sidecars`).
+static PUBLISHES: LazyLock<Mutex<HashMap<String, (Instant, u8)>>> = LazyLock::new(Default::default);
 
 /// Whose turn it is to ask for a folder's checksum files, by the folder's URL (see `from_sidecars`).
 static TURNS: LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = LazyLock::new(Default::default);
@@ -285,12 +289,22 @@ fn turn(folder: &str) -> Arc<tokio::sync::Mutex<()>> {
 
 /// Whether `key` was seen missing `times` or more within `FOLDER_MEMORY`.
 fn missing(key: &str, times: u8) -> bool {
-    MISSING.lock().get(key).is_some_and(|(seen, count)| seen.elapsed() < FOLDER_MEMORY && *count >= times)
+    seen(&MISSING, key, times)
 }
 
 /// Counts `key` as seen missing once more.
 fn note_missing(key: String) {
-    let mut all = MISSING.lock();
+    note(&MISSING, key)
+}
+
+/// Whether `key` was noted in `memory` `times` or more within `FOLDER_MEMORY`.
+fn seen(memory: &Mutex<HashMap<String, (Instant, u8)>>, key: &str, times: u8) -> bool {
+    memory.lock().get(key).is_some_and(|(seen, count)| seen.elapsed() < FOLDER_MEMORY && *count >= times)
+}
+
+/// Notes `key` in `memory` once more.
+fn note(memory: &Mutex<HashMap<String, (Instant, u8)>>, key: String) {
+    let mut all = memory.lock();
     if all.len() >= MAX_REMEMBERED {
         all.clear();
     }
@@ -299,21 +313,15 @@ fn note_missing(key: String) {
     *seen = (now, if seen.0.elapsed() < FOLDER_MEMORY { seen.1.saturating_add(1) } else { 1 });
 }
 
-/// The checksum file at `url`: one that is there, not a web page and at most `MAX_SIDECAR`. Not
-/// asked for of a host that limits how often it is asked (see `hosts::limits_requests`): the
-/// download's own requests need what it allows. A refusal (429/503)
-/// rests the host and so ends the lookups after it.
+/// The checksum file at `url`: one that is there, not a web page and at most `MAX_SIDECAR`. Its
+/// request takes a slot of the host's as the download's own do, and so waits out its rest.
 async fn fetch_small(client: &Client, auth: Option<&Auth>, limit: usize, url: Url) -> Sidecar {
-    let slot = crate::hosts::acquire(&url, limit).await;
-    if crate::hosts::limits_requests(&url) {
-        return Sidecar::Unknown;
-    }
+    let _slot = crate::hosts::acquire(&url, limit).await;
     let request = |url: &Url| authorize(client.get(url.clone()), auth, url).header(ACCEPT_ENCODING, "identity");
     let Ok(mut resp) = send(request, &url).await else { return Sidecar::Unknown };
     let status = resp.status();
     if matches!(status.as_u16(), 429 | 503) {
-        slot.throttled(crate::worker::retry_after(resp.headers()).unwrap_or_default());
-        return Sidecar::Unknown;
+        return Sidecar::Refused;
     }
     // Busy (408, 429) is no answer about the file.
     if status.is_client_error() && !matches!(status.as_u16(), 408 | 429) {
@@ -439,12 +447,21 @@ pub(crate) fn look_for(
 }
 
 /// Lets the search [`look_for`] started ask the site for the checksum files and Metalink: once
-/// the download sent the requests it widens with, or has every byte. Those still go to no host
-/// that limits how often it is asked or was seen to publish none (see `from_sidecars`).
+/// the download sent the requests it widens with, or has every byte. Those go one at a time to a
+/// host that limits how often it is asked (see `from_sidecars`).
 pub(crate) fn go(site: &Mutex<Site>) {
     if let Some(go) = &site.lock().go {
         go.send_replace(true);
     }
+}
+
+/// Ends the search [`look_for`] started, when the download is over without having waited for it.
+pub(crate) fn stop(site: &Mutex<Site>) {
+    let mut site = site.lock();
+    if let Some(search) = site.search.take() {
+        search.abort();
+    }
+    site.go = None;
 }
 
 /// Holds the download to `checksum` (`algo:hex`) in place of what [`look_for`] looks for: the
@@ -1070,10 +1087,10 @@ mod tests {
                 std::mem::take(&mut *log.lock().unwrap()).len()
             }
         };
-        // No checksum file on the host at all: the first file asks for each, the next from the host
-        // none (see `hosts::checksums`).
+        // No checksum file in the folder at all: the first file asks for each, the next two of its
+        // kind for their own, the next none; a file of another kind for its own.
         let (url, log) = serve(content(100), Site::default()).await;
-        for (name, requests) in [("a.bin", 7), ("b.bin", 0), ("f.iso", 0)] {
+        for (name, requests) in [("a.bin", 7), ("b.bin", 4), ("c.bin", 4), ("d.bin", 0), ("f.iso", 4)] {
             assert_eq!(asked(&url, &log, name).await, requests, "{name}");
         }
         // A list that is there is read for every file, whatever it lists.
@@ -1084,11 +1101,11 @@ mod tests {
         }
     }
 
-    /// Files of one folder asked for at once take turns until the host is known: of a bare folder,
-    /// the first asks for each checksum file and the others none; once one found its own, the
-    /// others ask at once.
+    /// Files of one folder asked for at once take turns until one is found to have a checksum: of a
+    /// bare folder, the first asks for each checksum file, the next two for their own and the
+    /// others none; once one found its own, the others ask at once.
     #[tokio::test]
-    async fn the_files_of_a_folder_take_turns_until_its_host_is_known() {
+    async fn the_files_of_a_folder_take_turns_until_one_has_a_checksum() {
         let client = Client::new();
         let all = |url: &Url| {
             let asked = (0..12).map(|i| {
@@ -1099,7 +1116,7 @@ mod tests {
         };
         let (url, log) = serve(content(100), Site { sidecars_wait: Duration::from_millis(50), ..Site::default() }).await;
         assert!(all(&url).await.iter().all(Option::is_none));
-        assert_eq!(log.lock().unwrap().len(), 7);
+        assert_eq!(log.lock().unwrap().len(), 7 + 4 + 4);
 
         let data = content(100);
         let md5 = checksum("md5", &Md5::digest(&data));
@@ -1131,9 +1148,10 @@ mod tests {
     }
 
     /// A host that refuses a lookup (429) is asked for no more of them than were already on their
-    /// way (two at a time), not all seven; one that refused a request lately is asked for none.
+    /// way (two at a time), not all seven; one that refused a request lately is asked one at a
+    /// time, and still has its file checked.
     #[tokio::test]
-    async fn sidecars_stop_at_a_refusal_and_skip_a_host_that_refused_lately() {
+    async fn sidecars_stop_at_a_refusal_and_go_one_at_a_time_to_a_host_that_refused_lately() {
         let sidecars = |log: &Arc<std::sync::Mutex<Vec<(String, Option<(u64, u64)>)>>>| log.lock().unwrap().len();
         let (url, log) = serve(content(100), Site { sidecars_refused: true, ..Site::default() }).await;
         assert_eq!(published_checksum(&Client::new(), &url, &HeaderMap::new()).await, None);
@@ -1142,8 +1160,12 @@ mod tests {
         let files = vec![("/dir/file.bin.sha256".to_string(), "text/plain".to_string(), format!("{}  file.bin", sha256_hex(&content(100))))];
         let (url, log) = serve(content(100), Site { files, ..Site::default() }).await;
         crate::hosts::acquire(&url, 0).await.throttled(Duration::ZERO);
-        assert_eq!(published_checksum(&Client::new(), &url, &HeaderMap::new()).await, None);
-        assert_eq!(sidecars(&log), 0);
+        assert!(crate::hosts::limits_requests(&url));
+        let sha256 = checksum("sha256", &Sha256::digest(content(100)));
+        assert_eq!(published_checksum(&Client::new(), &url, &HeaderMap::new()).await, Some(sha256));
+        assert_eq!(sidecars(&log), 1, "the first, found, and no other: {:?}", log.lock().unwrap());
+        // That refusal marked nothing kept about the host.
+        assert!(!crate::hosts::kept_limited(&url));
     }
 
     /// Downloads `urls` (mirrors of one file) into `dir` with `options`; returns the result and
