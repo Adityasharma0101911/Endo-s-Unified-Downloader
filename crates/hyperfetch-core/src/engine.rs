@@ -3419,9 +3419,12 @@ impl DownloadEngine {
         }
         // What one connection to each host brought, by its own link's host, not a redirect's: a
         // later download with several links starts its pieces on the fastest (see `add_mirror`).
-        if outcome.is_ok() {
+        // Not under a speed limit, which it would only measure.
+        if outcome.is_ok() && !self.limiter().is_some_and(|limiter| limiter.limits()) {
             for mirror in job.mirrors.lock().mirrors().iter().filter(|m| m.measured >= SPEED_MEASURED) {
-                hosts::record_speed(mirror.fallback.as_ref().unwrap_or(&mirror.url), mirror.speed_ewma);
+                if let Some(speed) = mirror.measured_speed() {
+                    hosts::record_speed(mirror.fallback.as_ref().unwrap_or(&mirror.url), speed);
+                }
             }
         }
         let _ = blocking(hosts::save).await;
@@ -10176,15 +10179,22 @@ mod tests {
         DownloadOptions { output_path: Some(dir.join("f.bin")), num_connections: connections, adaptive, ..Default::default() }
     }
 
-    /// A finished download keeps what one connection to its host brought.
+    /// A finished download keeps what one connection to its host brought; one under a speed limit
+    /// keeps nothing, as it would only measure the limit.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_a_finished_download_keeps_its_hosts_speed() {
         let size = 4 * 1024 * 1024;
-        let (url, _) = crate::netsim::serve(crate::netsim::Server { size, ..Default::default() }).await;
+        let server = crate::netsim::Server { size, ..Default::default() };
+        let (url, _) = crate::netsim::serve(server.clone()).await;
         let dir = tempdir().unwrap();
         let (got, _) = fetch_from_sim(&url, sim_options(dir.path(), 2, false)).await;
         assert!(got == crate::netsim::file(size));
         assert!(hosts::speed(&url).is_some_and(|speed| speed > 0.0), "{:?}", hosts::speed(&url));
+        let (url, _) = crate::netsim::serve(server).await;
+        let limited = tempdir().unwrap();
+        let (got, _) = fetch_from_sim(&url, DownloadOptions { max_speed: Some(16_000_000), ..sim_options(limited.path(), 2, false) }).await;
+        assert!(got == crate::netsim::file(size));
+        assert_eq!(hosts::speed(&url), None);
     }
 
     /// Records that one connection to `url`'s host keeps to `rate`, as the probe's watch finds when

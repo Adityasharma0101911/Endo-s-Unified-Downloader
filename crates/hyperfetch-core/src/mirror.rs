@@ -18,6 +18,8 @@ pub struct Mirror {
     pub speed_ewma: f64,    // bytes per second
     /// Bytes `speed_ewma` was measured over (see [`Mirror::record_progress`]).
     pub measured: u64,
+    /// The time its connections took for those, added up (see [`Mirror::measured_speed`]).
+    pub measured_for: Duration,
     pub ttfb_ewma_ms: f64,  // milliseconds
     pub in_flight: usize,
     pub failures: u32,
@@ -40,6 +42,7 @@ impl Mirror {
             if_range: None,
             speed_ewma: 1_000_000.0, // Initial optimistic estimate: 1 MB/s
             measured: 0,
+            measured_for: Duration::ZERO,
             ttfb_ewma_ms: 100.0,     // Initial optimistic TTFB: 100ms
             in_flight: 0,
             failures: 0,
@@ -81,9 +84,16 @@ impl Mirror {
         }
         let instant_speed = (bytes as f64) / duration.as_secs_f64();
         self.measured += bytes;
+        self.measured_for += duration;
         // EWMA alpha = 0.3
         const ALPHA: f64 = 0.3;
         self.speed_ewma = (ALPHA * instant_speed) + ((1.0 - ALPHA) * self.speed_ewma);
+    }
+
+    /// What one connection to it brought: every byte measured over the time they took, unlike
+    /// `speed_ewma`, which starts from a guess and leans to the latest.
+    pub fn measured_speed(&self) -> Option<f64> {
+        (self.measured > 0 && !self.measured_for.is_zero()).then(|| self.measured as f64 / self.measured_for.as_secs_f64())
     }
 
     /// How long a request to this mirror waits for its answer, smoothed.
@@ -250,6 +260,20 @@ mod tests {
         // With every mirror unavailable there is no fallback to mirror 0.
         racer.get_mirror_mut(1).unwrap().cool_down(Instant::now() + Duration::from_secs(60));
         assert_eq!(racer.select_best_mirror(), None);
+    }
+
+    /// What a mirror is measured at is its bytes over their time, not pulled toward the guess its
+    /// smoothed speed starts from.
+    #[test]
+    fn test_a_mirrors_speed_is_its_bytes_over_their_time() {
+        let mut mirror = Mirror::new(0, Url::parse("https://m.example.com/f").unwrap());
+        assert_eq!(mirror.measured_speed(), None);
+        for _ in 0..4 {
+            mirror.record_progress(1 << 20, Duration::from_millis(100));
+        }
+        let speed = mirror.measured_speed().unwrap();
+        assert!((speed - 10.0 * (1 << 20) as f64).abs() < 1.0, "{speed}");
+        assert!(mirror.speed_ewma < 0.8 * speed, "the smoothed one still lags: {}", mirror.speed_ewma);
     }
 
     #[test]
