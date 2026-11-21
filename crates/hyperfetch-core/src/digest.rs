@@ -440,8 +440,14 @@ pub(crate) fn look_for(
         }
         let (client, url, headers, limit, slot) = (client.clone(), url.clone(), headers.clone(), options.max_connections_per_host, Arc::clone(&found));
         tokio::spawn(async move {
-            // A download that ends without letting it (see `go`) asks nothing.
+            // A download that ends without letting it (see `go`) asks nothing; nor one let go while
+            // its host rests after a refusal, which only every byte in does (the download lets
+            // nothing go to a host that refused it): the lookups would wait out the rest, and the
+            // finished file with them.
             gate.wait_for(|&go| go).await.ok()?;
+            if !crate::hosts::rest_left(&url).is_zero() {
+                return None;
+            }
             let checksum = published(&client, auth.as_deref(), limit, &url, &headers, described).await;
             if let Some(checksum) = &checksum {
                 let _ = slot.set(checksum.clone());

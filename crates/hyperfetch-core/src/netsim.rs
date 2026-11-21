@@ -74,6 +74,10 @@ pub(crate) struct Server {
     /// Bytes from the first offset up to the second are sent inverted: another version of the
     /// file under the same size and ETag, as a stale mirror serves.
     pub corrupt: Option<(usize, usize)>,
+    /// The GETs, counted from 0 in the order they come, whose answer waits this much longer.
+    pub hold: Vec<(usize, Duration)>,
+    /// The GETs, counted so, refused with `refusal` whatever else is open.
+    pub refuse: Vec<usize>,
 }
 
 /// At most `requests` requests in any `window`; one more is refused with 429 and Retry-After
@@ -187,7 +191,7 @@ pub(crate) struct Stats {
     /// GETs answered, refused ones among them, and HEADs.
     pub gets: AtomicUsize,
     pub heads: AtomicUsize,
-    /// GETs refused for `max_connections`.
+    /// GETs refused for `max_connections` or `Server::refuse`.
     pub refused: AtomicUsize,
     /// GETs being answered now, and the most ever at once.
     pub open: AtomicUsize,
@@ -204,8 +208,25 @@ pub(crate) struct Stats {
     /// The path of each GET answered and each request refused for `Server::budget`, in order,
     /// with whether it was refused.
     pub log: parking_lot::Mutex<Vec<(String, bool)>>,
+    /// Each request as it was answered: when after the first came, what it asked, and the status.
+    wire: parking_lot::Mutex<Vec<String>>,
+    began: std::sync::OnceLock<std::time::Instant>,
     decayed: AtomicBool,
     cut: AtomicBool,
+}
+
+impl Stats {
+    /// What the server saw, a request a line, for a failing test to tell.
+    pub(crate) fn wire(&self) -> String {
+        self.wire.lock().join("\n")
+    }
+
+    fn note(&self, head: &str, status: &str) {
+        let ms = self.began.get_or_init(std::time::Instant::now).elapsed().as_millis();
+        let method = head.split_whitespace().next().unwrap_or("?").to_ascii_uppercase();
+        let range = head.lines().find_map(|l| l.strip_prefix("range: ")).unwrap_or("-").trim().to_string();
+        self.wire.lock().push(format!("{ms:>6} ms  {method} {range} -> {status}"));
+    }
 }
 
 struct Open<'a>(&'a AtomicUsize);
@@ -253,9 +274,12 @@ async fn answer(
         }
     }
     stats.asked.fetch_add(1, Ordering::SeqCst);
+    stats.began.get_or_init(std::time::Instant::now);
     let asked_for = String::from_utf8_lossy(&head).split_whitespace().nth(1).unwrap_or("/").to_string();
+    let lower = String::from_utf8_lossy(&head).to_ascii_lowercase();
     if let Some(budget) = &server.budget {
         if !limiting.lock().spend(budget, &stats, tokio::time::Instant::now()) {
+            stats.note(&lower, "429 (budget)");
             stats.log.lock().push((asked_for, true));
             let refusal = format!("HTTP/1.1 429 Too Many Requests\r\nRetry-After: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", budget.retry_after);
             let _ = socket.write_all(refusal.as_bytes()).await;
@@ -267,10 +291,12 @@ async fn answer(
         match verdict {
             Verdict::Served => {}
             Verdict::Shut => {
+                stats.note(&lower, "shut out");
                 stats.shut.fetch_add(1, Ordering::SeqCst);
                 return;
             }
             Verdict::Refused => {
+                stats.note(&lower, "429 (rate)");
                 let refusal = format!("HTTP/1.1 429 Too Many Requests\r\nRetry-After: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", limit.retry_after);
                 let _ = socket.write_all(refusal.as_bytes()).await;
                 return;
@@ -299,17 +325,22 @@ async fn answer(
         return;
     }
     if head.starts_with("head ") {
+        stats.note(&head, "200");
         stats.heads.fetch_add(1, Ordering::SeqCst);
         let _ = socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {size}\r\n{ranges}{link}Connection: close\r\n\r\n").as_bytes()).await;
         return;
     }
-    stats.gets.fetch_add(1, Ordering::SeqCst);
+    let nth = stats.gets.fetch_add(1, Ordering::SeqCst);
     stats.log.lock().push((asked_for, false));
+    if let Some(&(_, wait)) = server.hold.iter().find(|(n, _)| *n == nth) {
+        tokio::time::sleep(wait).await;
+    }
     let open = stats.open.fetch_add(1, Ordering::SeqCst) + 1;
     let _open = Open(&stats.open);
-    if server.max_connections.is_some_and(|most| open > most) {
+    if server.max_connections.is_some_and(|most| open > most) || server.refuse.contains(&nth) {
         stats.refused.fetch_add(1, Ordering::SeqCst);
         let (status, after) = server.refusal;
+        stats.note(&head, &format!("{status} (GET {nth})"));
         let after = after.map(|secs| format!("Retry-After: {secs}\r\n")).unwrap_or_default();
         let _ = socket.write_all(format!("HTTP/1.1 {status} Busy\r\n{after}Content-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await;
         return;
@@ -320,6 +351,7 @@ async fn answer(
         Some(_) => format!("206 Partial Content\r\nContent-Range: bytes {start}-{end}/{size}"),
         None => "200 OK".to_string(),
     };
+    stats.note(&head, &format!("{} (GET {nth}, {} bytes)", if range.is_some() { 206 } else { 200 }, end + 1 - start));
     let reply = format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\n{ranges}{link}ETag: \"v1\"\r\nConnection: close\r\n\r\n", end + 1 - start);
     if socket.write_all(reply.as_bytes()).await.is_err() {
         return;

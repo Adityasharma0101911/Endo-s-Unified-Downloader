@@ -34,9 +34,12 @@ pub(crate) const SHOWN: u64 = 512 * 1024;
 /// fewer bytes over less time are a few packets and a timer's tick, not a speed. Until one is no
 /// more than `AGREE` faster than the one before: a connection's speed grows while it starts, and
 /// what it brings then says nothing of what it will. At most `MAX_SHOW` after the reading began,
-/// the last window's speed is taken, so a slow host still gets more.
+/// the last window's speed is taken, so a slow host still gets more. No window is longer than
+/// `LONGEST_WINDOW`, however long the answer takes: a host far away has its speed read in as many
+/// windows as a near one, not in seconds of one stream.
 const SHOW_WINDOW: Duration = Duration::from_millis(100);
 const QUICK_WINDOW: Duration = Duration::from_millis(20);
+const LONGEST_WINDOW: Duration = Duration::from_millis(300);
 const SHOW_BYTES: u64 = 1024 * 1024;
 const AGREE: f64 = 0.15;
 const MAX_SHOW: Duration = Duration::from_secs(5);
@@ -143,7 +146,7 @@ impl Reading {
     /// Whether `got` bytes over `elapsed` make a window of `length` (see `SHOW_WINDOW`) `times`.
     fn long_enough(got: u64, elapsed: Duration, length: Duration, times: u32) -> bool {
         let least = if got >= u64::from(times) * SHOW_BYTES { QUICK_WINDOW } else { SHOW_WINDOW };
-        got > 0 && elapsed >= times * length.max(least)
+        got > 0 && elapsed >= times * length.clamp(least, LONGEST_WINDOW)
     }
 
     /// The speed at `now`, with `downloaded` bytes in, since the reading began, once that is two
@@ -261,18 +264,19 @@ impl Autopilot {
     /// goes as fast as the host held a download to before. Otherwise one more opens, which shows
     /// whether the rest pay: held to a rate, as many as fill the line (all it may, without the
     /// line known); else the width it was made with. Call it every few tens of milliseconds.
-    pub(crate) fn open(&mut self, now: Instant, downloaded: u64, left: u64, startup: Duration, rate: Option<f64>, cap: Option<usize>) -> Option<usize> {
+    pub(crate) fn open(&mut self, now: Instant, downloaded: u64, left: u64, startup: Option<Duration>, rate: Option<f64>, cap: Option<usize>) -> Option<usize> {
         let opening = self.opening?;
         self.cap = cap;
         let most = cap.map_or(self.max, |cap| cap.clamp(1, self.max));
         // Nothing in yet tells nothing: a stall is the stream's own to time out.
-        let speed = self.reading.read(now, downloaded, startup).filter(|&speed| speed > 0.0)?;
+        let speed = self.reading.read(now, downloaded, startup.unwrap_or_default()).filter(|&speed| speed > 0.0)?;
         self.opening = None;
         self.best = self.best.max(speed);
         // Each held to the rate, more bring more: they pay once the rest takes over two of their
         // set-ups at it, as the probe's read of a capped connection judges. Else they may bring
-        // nothing, which costs requests, not time: a margin twice that.
-        let setup = if startup.is_zero() { MIN_WINDOW } else { startup };
+        // nothing, which costs requests, not time: a margin twice that. A set-up measured however
+        // short is the host's, not one unknown.
+        let setup = startup.unwrap_or(MIN_WINDOW);
         let margin = match rate {
             Some(rate) => OPEN_SETUPS * rate,
             None => 2.0 * OPEN_SETUPS * speed,
@@ -329,7 +333,8 @@ impl Autopilot {
             (None, None) => return None,
         };
         let elapsed = now.saturating_duration_since(reading.since.0).as_secs_f64();
-        let kept = first.saturating_sub(*first_from) as f64 * (1.0 + AGREE) >= base * elapsed;        let Judging { target, paid, .. } = *judging;
+        let kept = first.saturating_sub(*first_from) as f64 * (1.0 + AGREE) >= base * elapsed;
+        let Judging { target, paid, .. } = *judging;
         self.judging = None;
         self.best = self.best.max(speed);
         if speed >= base * GAIN {
@@ -719,7 +724,7 @@ mod tests {
     /// (ms) and to what, if it did.
     fn opened(pilot: &mut Autopilot, t0: Instant, until: u64, left: u64, rate: Option<f64>, bytes: impl Fn(u64) -> u64) -> Option<(u64, usize)> {
         let startup = Duration::from_millis(10);
-        (1..=until / 50).map(|n| n * 50).find_map(|ms| pilot.open(t0 + Duration::from_millis(ms), bytes(ms), left, startup, rate, None).map(|width| (ms, width)))
+        (1..=until / 50).map(|n| n * 50).find_map(|ms| pilot.open(t0 + Duration::from_millis(ms), bytes(ms), left, Some(startup), rate, None).map(|width| (ms, width)))
     }
 
     /// The first request's one stream opens more only once its speed stopped growing (a window
@@ -750,7 +755,7 @@ mod tests {
         assert_eq!(opened(&mut pilot, t0, 1000, 1 << 30, each, |ms| ms * 2_000), Some((200, 2)));
         assert_eq!(target(&pilot), Some(5), "as many as fill the line");
         let mut capped = alone(Start::default());
-        let at_cap = (1..=20).map(|n| n * 50).find_map(|ms| capped.open(at(ms), ms * 2_000, 1 << 30, startup, each, Some(3)));
+        let at_cap = (1..=20).map(|n| n * 50).find_map(|ms| capped.open(at(ms), ms * 2_000, 1 << 30, Some(startup), each, Some(3)));
         assert_eq!((at_cap, target(&capped)), (Some(2), Some(3)), "the host's cap");
         // Held to a rate, but done within two set-ups of new connections: the one stream.
         let mut soon = alone(Start::default());
@@ -766,8 +771,16 @@ mod tests {
         assert_eq!(pilot.why(), "2 connections: the first went at 9.5 MiB/s; a second shows whether more pay");
         // Over a LAN, a MiB and more in each 20 ms: windows of 20 ms.
         let mut fast = alone(Start::default());
-        let found = (1..=20).map(|n| n * 20).find_map(|ms| fast.open(at(ms), ms * 300_000, 1 << 34, startup, None, None).map(|width| (ms, width)));
+        let found = (1..=20).map(|n| n * 20).find_map(|ms| fast.open(at(ms), ms * 300_000, 1 << 34, Some(startup), None, None).map(|width| (ms, width)));
         assert_eq!(found, Some((40, 2)));
+        // A set-up measured as next to nothing is the host's, so 64 MiB at 300 MB/s pay for more;
+        // one not known is taken for 0.5 s, in which the stream brings more than is left.
+        let lan = |setup: Option<Duration>| {
+            let mut pilot = alone(Start::default());
+            ((1..=20).map(|n| n * 20).find_map(|ms| pilot.open(at(ms), ms * 300_000, 64 << 20, setup, None, None)), pilot.why())
+        };
+        assert_eq!(lan(Some(Duration::from_micros(200))).0, Some(2));
+        assert_eq!(lan(None), (None, "1 connection: too little is left to try more".to_string()));
         let mut short = alone(Start::default());
         assert_eq!(opened(&mut short, t0, 1000, 300_000, None, |ms| ms * 10_000), None, "four set-ups of 10 ms take 400 KB");
         assert!(short.done && short.width == 1 && short.settled.is_none(), "{}", short.why());
@@ -798,7 +811,7 @@ mod tests {
         let mut pilot = Autopilot::new(8, 16, Start { line: Some(8.5 * MB), ..Default::default() }, t0, 0).alone(t0, 0);
         let startup = Duration::from_millis(200);
         let decided = (1..=40).map(|n| n * 50).find(|&ms| {
-            pilot.open(t0 + Duration::from_millis(ms), bytes(ms), 1 << 30, startup, None, None);
+            pilot.open(t0 + Duration::from_millis(ms), bytes(ms), 1 << 30, Some(startup), None, None);
             !pilot.is_alone()
         });
         assert!(decided.is_some_and(|ms| ms >= 1000), "{decided:?}: {}", pilot.why());

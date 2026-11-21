@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-use crate::chunk::{Chunk, ChunkManager, Hedge, StealRule, StealTiming, LAG_WINDOW, RECENT};
+use crate::chunk::{Chunk, ChunkManager, ChunkStatus, Hedge, StealRule, StealTiming, LAG_WINDOW, RECENT};
 use crate::hosts::{self, HostKey, HostProfile, HostSlot};
 use crate::mirror::{Mirror, MirrorRacer};
 use crate::range::ByteRange;
@@ -523,19 +523,23 @@ pub struct WorkerShared {
 /// How many of a download's workers may have sent a request: twice the answers it had, the
 /// probe's among them. A download opens its connections in rounds, each twice the last once the
 /// host answered it, instead of all at once: a host that limits how fast requests come refuses a
-/// burst, and some then shut out whoever sent it. Widened by the Autopilot, one at a time (see
+/// burst, and some then shut out whoever sent it. Widened by the Autopilot in steps (see
 /// [`Ramp::widen_from`]).
 pub struct Ramp {
     open: std::sync::atomic::AtomicUsize,
-    /// Workers each answer lets go: 2, 1 while widening, 0 once a refusal ended that.
+    /// Workers each answer lets go: 2; 0 while the download widens (see [`Ramp::widen_from`]),
+    /// and once a refusal ended that.
     step: std::sync::atomic::AtomicUsize,
     widened: tokio::sync::Notify,
-    /// Workers go one at a time (see [`Ramp::widen_from`]).
+    /// A step is under way (see [`Ramp::widen_from`]).
     widening: std::sync::atomic::AtomicBool,
-    /// The connections the host served when it refused one while widening, until the Autopilot
-    /// takes it (see [`Ramp::took`]); `usize::MAX` for none.
-    took: std::sync::atomic::AtomicUsize,
-    /// The workers running when the download last began to widen, and how many times it did.
+    /// The newcomers of the step under way yet to have their answer.
+    waiting: std::sync::atomic::AtomicUsize,
+    /// A refusal ended the widening: nothing more is asked (see [`Ramp::refused`]); and the
+    /// Autopilot has yet to take it (see [`Ramp::took`]).
+    refused: std::sync::atomic::AtomicBool,
+    untaken: std::sync::atomic::AtomicBool,
+    /// The workers running when the download last began a step, and how many steps it took.
     from: std::sync::atomic::AtomicUsize,
     round: std::sync::atomic::AtomicUsize,
 }
@@ -548,28 +552,57 @@ impl Ramp {
             step: 2.into(),
             widened: tokio::sync::Notify::new(),
             widening: false.into(),
-            took: usize::MAX.into(),
+            waiting: 0.into(),
+            refused: false.into(),
+            untaken: false.into(),
             from: 0.into(),
             round: 0.into(),
         }
     }
 
-    /// The download widens from `running` workers: the next goes now, and each after it once the
-    /// one before was answered, so that the host refuses one at most, the last sent, whose piece
-    /// is the one nearest those running (see `ChunkManager::spread` and
-    /// `ChunkManager::strand_nothing`). Meanwhile no other request goes: those running, and each
-    /// newcomer once it sent its own, wait for the widening to end (see
-    /// `WorkerShared::within_width`). Not for a ramp that lets every worker go (FTP, SFTP).
-    pub(crate) fn widen_from(&self, running: usize) {
-        if self.open.load(Ordering::Relaxed) == usize::MAX {
+    /// The download widens from `running` workers by a step of `newcomers`, each with a piece of
+    /// its own (see `ChunkManager::halve`): they go at once, and the step is done once each had its
+    /// answer, failed, or was taken back (see [`Ramp::stepped`]). Meanwhile no other request goes:
+    /// those running, and each newcomer once it sent its own, wait for the widening to end (see
+    /// `WorkerShared::within_width`), so the requests a host may refuse are the step's alone, and
+    /// each of their pieces is cut off a request that streams it if they are (see
+    /// `ChunkManager::run_on`). Never once a refusal ended a widening, nor for a ramp that lets
+    /// every worker go (FTP, SFTP).
+    pub(crate) fn widen_from(&self, running: usize, newcomers: usize) {
+        if self.open.load(Ordering::Relaxed) == usize::MAX || self.refused.load(Ordering::Relaxed) {
             return;
         }
-        self.step.store(1, Ordering::Relaxed);
-        self.open.store(running + 1, Ordering::Relaxed);
+        self.step.store(0, Ordering::Relaxed);
+        self.open.store(running + newcomers, Ordering::Relaxed);
         self.from.store(running, Ordering::Relaxed);
+        self.waiting.store(newcomers, Ordering::Relaxed);
         self.round.fetch_add(1, Ordering::Relaxed);
         self.widening.store(true, Ordering::Relaxed);
         self.widened.notify_waiters();
+    }
+
+    /// The workers that may have sent a request.
+    pub(crate) fn open(&self) -> usize {
+        self.open.load(Ordering::Relaxed)
+    }
+
+    /// Whether each newcomer of the step under way had its answer, failed, or was taken back.
+    pub(crate) fn stepped(&self) -> bool {
+        self.waiting.load(Ordering::Relaxed) == 0
+    }
+
+    /// Worker `worker_id`'s request of the step under way has its outcome.
+    fn settled(&self, worker_id: usize) {
+        if self.is_widening() && (self.from.load(Ordering::Relaxed)..self.open()).contains(&worker_id) {
+            let mut n = self.waiting.load(Ordering::Relaxed);
+            while let Some(less) = n.checked_sub(1) {
+                match self.waiting.compare_exchange_weak(n, less, Ordering::Relaxed, Ordering::Relaxed) {
+                    Ok(_) => break,
+                    Err(now) => n = now,
+                }
+            }
+            self.widened.notify_waiters();
+        }
     }
 
     /// Which widening this is, for a worker to tell whether it sent a request in it.
@@ -588,57 +621,53 @@ impl Ramp {
         self.widening.load(Ordering::Relaxed)
     }
 
-    /// Every request the download widened with was answered: workers that had a piece before go on.
+    /// The last step is done and no other follows: workers that had a piece before go on, and each
+    /// answer lets two more go again, as before the download widened.
     pub(crate) fn widened(&self) {
         self.widening.store(false, Ordering::Relaxed);
+        self.step.store(2, Ordering::Relaxed);
         self.widened.notify_waiters();
     }
 
-    /// Whether every worker up to `width` was let go, the last answered.
-    pub(crate) fn lets_go(&self, width: usize) -> bool {
-        self.open.load(Ordering::Relaxed) > width
-    }
-
-    /// A request was refused (429/503) while the download widened, the host serving `took` of its
-    /// requests: that ends the widening, and no more go. Whether it was widening.
-    fn refused(&self, took: usize) -> bool {
+    /// A request was refused (429/503) while the download widened: that ends the widening, and no
+    /// more are asked for in it, its width what the host took (see [`Ramp::took`]). Whether it was
+    /// widening.
+    fn refused(&self) -> bool {
         if !self.widening.swap(false, Ordering::Relaxed) {
             return false;
         }
-        self.step.store(0, Ordering::Relaxed);
-        self.open.store(took.max(1), Ordering::Relaxed);
-        self.took.store(took.max(1), Ordering::Relaxed);
+        self.refused.store(true, Ordering::Relaxed);
+        self.untaken.store(true, Ordering::Relaxed);
         self.widened.notify_waiters();
         true
     }
 
-    /// Worker `worker_id`'s request failed otherwise while the download widened: its status is in,
-    /// so the next goes.
+    /// Whether a refusal ended the widening and the Autopilot has yet to take the connections the
+    /// host took, once `answered` (every request sent has its answer, so the count is what the host
+    /// took, not what it was yet to answer): then it takes it, once.
+    pub(crate) fn took(&self, answered: bool) -> bool {
+        self.untaken() && answered && self.untaken.swap(false, Ordering::Relaxed)
+    }
+
+    /// Whether a refusal ended the widening and the Autopilot has yet to take it.
+    pub(crate) fn untaken(&self) -> bool {
+        self.untaken.load(Ordering::Relaxed)
+    }
+
+    /// Worker `worker_id`'s request failed before its answer, or the request its piece was cut from
+    /// took the piece back (see `ChunkManager::run_on`): it counts as the step's.
     fn failed(&self, worker_id: usize) {
-        if self.step.load(Ordering::Relaxed) == 1 {
-            self.open.fetch_max(worker_id.saturating_add(2), Ordering::Relaxed);
-            self.widened.notify_waiters();
-        }
+        self.settled(worker_id);
     }
 
-    /// The connections the host served when it refused one while widening, once.
-    pub(crate) fn took(&self) -> Option<usize> {
-        Some(self.took.swap(usize::MAX, Ordering::Relaxed)).filter(|&took| took != usize::MAX)
-    }
-
-    /// Worker `worker_id`'s request was answered: two more workers may send theirs; while
-    /// widening, the one after it, whatever other answers came meanwhile.
+    /// Worker `worker_id`'s request was answered: two more workers may send theirs, before the
+    /// download first widened; while it widens, the step has one answer more.
     fn answered(&self, worker_id: usize) {
-        match self.step.load(Ordering::Relaxed) {
-            1 => {
-                self.open.fetch_max(worker_id.saturating_add(2), Ordering::Relaxed);
-            }
-            // A ramp that lets every worker go stays so (atomics wrap).
-            step => {
-                if self.open.fetch_add(step, Ordering::Relaxed) > usize::MAX - 2 {
-                    self.open.store(usize::MAX, Ordering::Relaxed);
-                }
-            }
+        self.settled(worker_id);
+        // A ramp that lets every worker go stays so (atomics wrap).
+        let step = self.step.load(Ordering::Relaxed);
+        if step > 0 && self.open.fetch_add(step, Ordering::Relaxed) > usize::MAX - 2 {
+            self.open.store(usize::MAX, Ordering::Relaxed);
         }
         self.widened.notify_waiters();
     }
@@ -983,6 +1012,20 @@ impl HttpWorker {
         let mut chunks = s.chunks.lock();
         let (worker_id, chunk_id) = (self.worker_id, chunk.id);
         let revoked = chunk.revoked.is_cancelled();
+        // The request its piece was cut from took that back before its answer (see
+        // `ChunkManager::run_on`): it is dropped, and counts against nobody; a refusal still rests
+        // the host and ends a widening.
+        let taken_back = revoked && chunks.chunks().get(chunk_id).is_some_and(|c| c.status == ChunkStatus::Merged);
+        if taken_back {
+            match outcome {
+                Err((FailureKind::Throttled(after), _)) => {
+                    slot.throttled(after.unwrap_or(THROTTLE_RETRY));
+                    s.ramp.refused();
+                }
+                _ => s.ramp.failed(worker_id),
+            }
+            return None;
+        }
         match outcome {
             Ok(()) if revoked => None,
             Ok(()) => {
@@ -1002,18 +1045,18 @@ impl HttpWorker {
                     // stream's request where it reaches it before the host's rest ends, else in no
                     // more requests than the connections the download keeps.
                     if let FailureKind::Throttled(after) = kind {
-                        // Refused while the download widened, its requests sent one at a time
-                        // from the far end: that ends it at what the host serves, and the pieces
-                        // no request has lie right after one that brings them. Refused at another
-                        // time (a piece cut off a request under way), it goes back to that request
-                        // where it reaches it before the rest ends.
+                        // Refused while the download widened, each piece of the step cut off a
+                        // request under way: that ends it at what the host serves, and the piece
+                        // goes back to that request at once. Refused at another time, it goes
+                        // back to the request it was cut from where that reaches it before the
+                        // rest ends.
                         let wait = after.unwrap_or(THROTTLE_RETRY);
-                        let widening = s.ramp.refused(chunks.answered());
+                        let widening = s.ramp.refused();
                         chunks.strand_nothing((!widening).then_some(wait));
                         chunks.rejoin(wait);
                         let kept = racer.mirrors().iter().filter(|m| m.is_active).map(|m| m.max_connections).fold(0, usize::saturating_add);
                         chunks.merge_pending(kept.min(s.width.load(Ordering::Relaxed)));
-                    } else {
+                    } else if !chunk.has_answer() {
                         s.ramp.failed(worker_id);
                     }
                 } else if kind == FailureKind::Fatal {
@@ -1087,6 +1130,10 @@ impl HttpWorker {
         check_response(response.status(), response.headers(), start, end, s.file_size, if_range.as_deref())
             .map_err(|failure| if redirected { at_redirect_target(response.status(), failure) } else { failure })?;
         slot.accepted();
+        // Taken back meanwhile by the request its piece was cut from: the answer is thrown away.
+        if !chunk.answered(Instant::now()) {
+            return Err(taken_over());
+        }
         s.ramp.answered(self.worker_id);
         let ttfb = sent_at.elapsed();
         // The host answering honours ranges (a 200 from the file's start says nothing) and, on a
@@ -1114,7 +1161,9 @@ impl HttpWorker {
     ) -> Result<(), Failure> {
         let s = &self.shared;
         // The wait before is the answer's: the chunk's rate, and its silence, count from here.
-        chunk.answered(Instant::now());
+        if !chunk.answered(Instant::now()) {
+            return Err(taken_over());
+        }
         let mut stream = std::pin::pin!(body);
         let mut batch = Batch { pos: start, buf: Vec::with_capacity(WRITE_BATCH), mirror: mirror_id };
         // Due `WRITE_INTERVAL` after the oldest byte in `batch` arrived.
@@ -1234,11 +1283,12 @@ impl HttpWorker {
         Ok(())
     }
 
-    /// Whether the request for `chunk`, at its end, goes on over the piece after it while the
-    /// download widens (see [`ChunkManager::run_on`]).
+    /// Whether the request for `chunk`, at its end, goes on over the piece after it (see
+    /// [`ChunkManager::run_on`]): not a worker past the width, which handed back its rest to stop
+    /// (see `ChunkManager::give_back`).
     fn runs_on(&self, chunk: &Chunk) -> bool {
         let s = &self.shared;
-        s.ramp.is_widening() && s.chunks.lock().run_on(chunk.id)
+        self.worker_id < s.width.load(Ordering::Relaxed) && s.chunks.lock().run_on(chunk.id, s.ramp.is_widening())
     }
 
     /// Whether the attempt at `chunk_id`, which went at `rate` over its last window, makes way for
@@ -1836,7 +1886,6 @@ mod tests {
 
     #[test]
     fn test_a_taken_over_chunk_is_left_to_its_new_owner() {
-        use crate::chunk::ChunkStatus;
         let dir = tempfile::tempdir().unwrap();
         let url = Url::parse("http://127.0.0.1:9/f").unwrap();
         let (worker, old, _events) = test_worker(&url, &dir.path().join("f.part"), 1 << 20);
@@ -2158,28 +2207,30 @@ mod tests {
         assert!(chunks.has_fatal_failure().unwrap().1.contains("every mirror failed"));
     }
 
-    /// While a download widens, those running and each newcomer that sent its request wait; the
-    /// next newcomer goes once the one before has its status in, whatever other answers came, and
-    /// a refusal ends the widening at what the host took.
+    /// A step's newcomers go at once, while those running and each newcomer that sent its request
+    /// wait; it is done once each newcomer had its answer or failed, whatever other answers came. A
+    /// refusal ends the widening, taken once every request has its answer, and none follows.
     #[test]
-    fn test_a_widening_sends_one_request_at_a_time() {
+    fn test_a_widening_goes_in_steps() {
         let ramp = Ramp::new(2);
-        let open = || ramp.open.load(Ordering::Relaxed);
-        ramp.widen_from(2);
-        assert_eq!(open(), 3);
-        assert!(ramp.holds(0, usize::MAX) && ramp.holds(1, usize::MAX) && !ramp.holds(2, usize::MAX));
+        ramp.widen_from(2, 2);
+        assert_eq!(ramp.open(), 4);
+        assert!(ramp.holds(0, usize::MAX) && ramp.holds(1, usize::MAX) && !ramp.holds(2, usize::MAX) && !ramp.holds(3, usize::MAX));
         let round = ramp.round();
         assert!(ramp.holds(2, round), "it sent its request");
         ramp.answered(1);
-        assert_eq!(open(), 3, "another answer lets no one more go");
         ramp.answered(2);
-        assert_eq!(open(), 4);
+        assert!(!ramp.stepped() && ramp.open() == 4, "another answer lets no one more go");
         ramp.failed(3);
-        assert_eq!(open(), 5);
-        assert!(ramp.refused(4) && ramp.took() == Some(4) && open() == 4 && !ramp.is_widening());
-        assert!(!ramp.holds(0, round) && !ramp.refused(4), "a refusal after it is no widening's");
-        ramp.widen_from(4);
-        assert!(!ramp.holds(4, round), "a newcomer of the next widening");
+        assert!(ramp.stepped());
+        ramp.widen_from(4, 4);
+        assert!(ramp.holds(2, round) && !ramp.holds(4, round), "a newcomer of the next step");
+        ramp.answered(4);
+        assert!(ramp.refused() && !ramp.is_widening() && !ramp.holds(0, round));
+        assert!(!ramp.took(false) && ramp.took(true) && !ramp.took(true), "once, with every answer in");
+        assert!(!ramp.refused(), "a refusal after it is no widening's");
+        ramp.widen_from(8, 8);
+        assert!(!ramp.is_widening() && ramp.open() == 8, "nothing more is asked");
     }
 
     #[tokio::test]

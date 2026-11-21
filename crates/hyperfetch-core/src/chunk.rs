@@ -164,12 +164,23 @@ impl Chunk {
         }
     }
 
-    /// The attempt's answer came at `at`: from then on its worker waits for the server's bytes.
-    pub(crate) fn answered(&self, at: Instant) {
+    /// The attempt's answer came at `at`: from then on its worker waits for the server's bytes, and
+    /// the chunk is its own. False when the request it was cut from took it back first (see
+    /// [`ChunkManager::run_on`]): the answer is thrown away.
+    pub(crate) fn answered(&self, at: Instant) -> bool {
         let from = self.current_offset.load(Ordering::SeqCst);
         let mut attempt = self.attempt.lock();
+        if self.revoked.is_cancelled() {
+            return false;
+        }
         attempt.answered = Some((at, from));
         attempt.waiting = Some(at);
+        true
+    }
+
+    /// Whether the attempt's answer came (see [`Chunk::answered`]).
+    pub(crate) fn has_answer(&self) -> bool {
+        self.attempt.lock().answered.is_some()
     }
 
     /// The attempt's request asked for the bytes up to `end`.
@@ -303,7 +314,7 @@ pub struct ChunkManager {
     fatal: Option<(usize, String)>,
     /// When a slow connection last made way for a new one (see `replaces`).
     replaced_at: Option<Instant>,
-    /// The first stream, whose answer runs to the file's end, and its attempt (see `spread`).
+    /// The first stream, whose answer runs to the file's end, and its attempt (see `halve`).
     stream: Option<(usize, Arc<Mutex<Attempt>>)>,
 }
 
@@ -389,8 +400,8 @@ impl ChunkManager {
         self.chunks.iter().map(Self::has).sum::<u64>().min(self.total_size)
     }
 
-    /// What the first stream (see [`ChunkManager::spread`]) has in, counted as
-    /// [`ChunkManager::total_received`] counts each chunk; all there is before it was spread.
+    /// What the first stream (see [`ChunkManager::halve`]) has in, counted as
+    /// [`ChunkManager::total_received`] counts each chunk; all there is before it was halved.
     pub(crate) fn first_received(&self) -> u64 {
         self.stream.as_ref().map_or_else(|| self.total_received(), |(id, _)| Self::has(&self.chunks[*id]))
     }
@@ -720,32 +731,45 @@ impl ChunkManager {
         true
     }
 
-    /// Cuts what the in-flight chunk with the most left has yet to receive into `parts` about equal
-    /// pieces, none under `min_bytes`: its worker keeps the first, and the rest wait as fresh
-    /// chunks for the workers about to start, each asking for one, the farthest first, instead of
-    /// halving one another's (see [`ChunkManager::steal_work`]). As a steal, it truncates the
-    /// chunk, which is kept as the first stream (see [`ChunkManager::rejoin`]).
-    pub(crate) fn spread(&mut self, parts: usize, min_bytes: u64) {
-        let Some(id) = self.chunks.iter().filter(|c| c.is_in_flight()).max_by_key(|c| c.unreceived()).map(|c| c.id) else { return };
-        let chunk = &mut self.chunks[id];
-        let left = chunk.unreceived();
-        let parts = (parts as u64).min(left / min_bytes.max(1));
-        if parts < 2 {
-            return;
-        }
-        let end = chunk.end_offset.load(Ordering::SeqCst);
-        let from = end + 1 - left;
-        let at = |i: u64| from + (left as u128 * i as u128 / parts as u128) as u64;
-        chunk.end_offset.store(at(1) - 1, Ordering::SeqCst);
-        chunk.range.end = at(1) - 1;
-        self.stream = Some((id, Arc::clone(&chunk.attempt)));
-        for i in (1..parts).rev() {
-            let piece = Chunk::new(self.chunks.len(), ByteRange { start: at(i), end: at(i + 1) - 1 });
+    /// Work for `newcomers` more requests: the pieces no worker has first, then the far half of
+    /// what each request under way has yet to receive, those with the most left first. Halves
+    /// that end together: the newcomer's is short by what the request brings in `setup`, the time
+    /// the newcomer's takes to answer, at its pace (that of the fastest request under way before
+    /// it has one); none under `min_bytes`, which would not pay a request of its own. As a steal,
+    /// it truncates each chunk, whose request keeps asking for that half until the newcomer's is
+    /// answered (see [`ChunkManager::run_on`]). The first chunk ever halved is kept as the first
+    /// stream (see [`ChunkManager::rejoin`]). How many requests have work.
+    pub(crate) fn halve(&mut self, newcomers: usize, min_bytes: u64, setup: Duration) -> usize {
+        let now = Instant::now();
+        let pace = |c: &Chunk| c.pace(now, None).map(|(_, rate)| rate);
+        let fastest = self.chunks.iter().filter(|c| c.is_in_flight()).filter_map(pace).fold(0.0, f64::max);
+        let given = |c: &Chunk| c.unreceived().saturating_sub((pace(c).unwrap_or(fastest) * setup.as_secs_f64()) as u64) / 2;
+        let pending = self.chunks.iter().filter(|c| matches!(c.status, ChunkStatus::Unassigned | ChunkStatus::Failed { .. })).count();
+        let mut halved: Vec<(usize, u64)> = self
+            .chunks
+            .iter()
+            .filter(|c| c.is_in_flight() && !c.revoked.is_cancelled())
+            .map(|c| (c.id, given(c)))
+            .filter(|&(_, given)| given >= min_bytes.max(1))
+            .collect();
+        halved.sort_by_key(|&(id, _)| std::cmp::Reverse(self.chunks[id].unreceived()));
+        halved.truncate(newcomers.saturating_sub(pending));
+        for &(id, given) in &halved {
+            let chunk = &mut self.chunks[id];
+            let end = chunk.end_offset.load(Ordering::SeqCst);
+            let at = end + 1 - given;
+            chunk.end_offset.store(at - 1, Ordering::SeqCst);
+            chunk.range.end = at - 1;
+            if self.stream.is_none() {
+                self.stream = Some((id, Arc::clone(&chunk.attempt)));
+            }
+            let piece = Chunk::new(self.chunks.len(), ByteRange { start: at, end });
             self.chunks.push(piece);
         }
+        pending.min(newcomers) + halved.len()
     }
 
-    /// Gives the first stream (see [`ChunkManager::spread`]) back the pieces no worker has right
+    /// Gives the first stream (see [`ChunkManager::halve`]) back the pieces no worker has right
     /// after it, for a host that limits how often it is asked: its answer runs to the file's end,
     /// so they come over the request already open instead of new ones. Only those it reaches at
     /// its pace within `wait`, the host's rest: past them, a new request once the host takes one
@@ -796,32 +820,48 @@ impl ChunkManager {
                     None => continue,
                 },
             };
-            self.take_after(id, reach);
+            self.take_after(id, reach, true, false);
         }
     }
 
-    /// While the download widens one request at a time (see `Ramp::widen_from`), chunk `id`'s
-    /// request, at its chunk's end, goes on over the piece right after it if no worker has that
-    /// and the request asked for it: the first stream brings the pieces nearest it, which the
-    /// requests widened with take last, at no cost, instead of ending (its connection cut, which a
-    /// host may count a moment longer) while one of those may yet be refused, its piece and those
-    /// between then left behind. Whether it goes on.
-    pub(crate) fn run_on(&mut self, id: usize) -> bool {
+    /// Chunk `id`'s request, at its chunk's end, goes on over the piece right after it that it
+    /// asked for, unless another request for that piece was answered: a piece cut off a request
+    /// under way changes hands when the newcomer's answer comes, and one whose newcomer was refused,
+    /// failed, or has no answer yet comes over the request already streaming instead (the
+    /// newcomer's is dropped, its answer thrown away, see [`Chunk::answered`]). So no piece is left
+    /// without a request that asked for it, as one refused after its stream ended would be, to
+    /// wait out the host's rest. While the download `widening`, over one no worker has taken yet
+    /// too, which the newcomers would; else that waits its turn as any other. Whether it goes on.
+    pub(crate) fn run_on(&mut self, id: usize, widening: bool) -> bool {
         let Some(chunk) = self.chunks.get(id).filter(|c| c.is_in_flight() && !c.revoked.is_cancelled()) else { return false };
         let end = chunk.end_offset.load(Ordering::SeqCst);
-        self.take_after(id, end + 1) > end
+        self.take_after(id, end + 1, widening, true) > end
     }
 
-    /// Merges into chunk `id` the pieces no worker has right after its end that start by `reach`,
-    /// as far as its request asked. Its end then.
-    fn take_after(&mut self, id: usize, reach: u64) -> u64 {
+    /// Merges into chunk `id` the pieces right after its end that start by `reach`, as far as its
+    /// request asked, that failed, with `fresh` that no worker has taken yet, and with `back` whose
+    /// request has no answer yet (that request is dropped, see [`ChunkManager::run_on`]). Its end
+    /// then.
+    fn take_after(&mut self, id: usize, reach: u64, fresh: bool, back: bool) -> u64 {
         let asked = self.chunks[id].attempt.lock().asked;
         let mut end = self.chunks[id].end_offset.load(Ordering::SeqCst);
         while let Some(next) = self.chunks.iter().position(|c| {
             c.range.start == end + 1
                 && c.range.end <= asked
                 && c.range.start <= reach
-                && matches!(c.status, ChunkStatus::Unassigned | ChunkStatus::Failed { .. })
+                && match c.status {
+                    ChunkStatus::Failed { .. } => true,
+                    ChunkStatus::Unassigned => fresh,
+                    // Revoked under the attempt's lock, which its answer takes too: one or the other.
+                    ChunkStatus::Assigned { .. } if back => {
+                        let attempt = c.attempt.lock();
+                        attempt.answered.is_none() && c.current_offset.load(Ordering::SeqCst) <= c.range.start && {
+                            c.revoked.cancel();
+                            true
+                        }
+                    }
+                    _ => false,
+                }
         }) {
             end = self.chunks[next].range.end;
             self.chunks[next].status = ChunkStatus::Merged;
@@ -1304,27 +1344,51 @@ mod tests {
         assert!(manager.get_next_work(0, 0).is_none());
     }
 
-    /// A lone stream that more connections join is cut into as many even pieces as there will be
-    /// connections, past what it already received: it keeps the first, each newcomer asks for one,
-    /// the farthest first. Never pieces under the least a connection is to carry.
+    /// A step gives each request under way one newcomer, for the far half of what it has yet to
+    /// receive, those with the most left first; pieces no worker has go first. Never a half under
+    /// the least a connection is to carry.
     #[test]
-    fn test_a_lone_stream_is_spread_over_the_connections_that_join_it() {
+    fn test_a_widening_halves_the_requests_under_way() {
         let mut manager = ChunkManager::new(10 * MB, 10 * MB).unwrap();
         let stream = manager.get_next_work(0, 0).unwrap();
         stream.received(MB);
-        manager.spread(4, 64 * 1024);
-        assert_eq!(stream.end_offset.load(Ordering::SeqCst), MB + 9 * MB / 4 - 1);
-        let pieces: Vec<ByteRange> = (1..4).map(|worker| manager.get_next_work(worker, 0).unwrap().range).collect();
-        let at = |i: u64| MB + 9 * MB * i / 4;
-        assert_eq!(pieces, (1..4).rev().map(|i| ByteRange::new(at(i), at(i + 1) - 1).unwrap()).collect::<Vec<_>>());
-        assert!(manager.get_next_work(4, 0).is_none());
-        // Pieces of 4 MB at least: the 9 MB left make two.
-        let mut manager = ChunkManager::new(10 * MB, 10 * MB).unwrap();
-        let stream = manager.get_next_work(0, 0).unwrap();
-        stream.received(MB);
-        manager.spread(4, 4 * MB);
+        assert_eq!(manager.halve(1, 64 * 1024, Duration::ZERO), 1);
         assert_eq!(stream.end_offset.load(Ordering::SeqCst), MB + 9 * MB / 2 - 1);
-        assert_eq!(manager.get_next_work(1, 0).unwrap().range, ByteRange::new(MB + 9 * MB / 2, 10 * MB - 1).unwrap());
+        let far = manager.get_next_work(1, 0).unwrap();
+        assert_eq!(far.range, ByteRange::new(MB + 9 * MB / 2, 10 * MB - 1).unwrap());
+        far.received(far.range.start + MB);
+        // The stream has 4.5 MB left, the far piece 3.5 MB: two newcomers at most, whatever is asked.
+        assert_eq!(manager.halve(6, 64 * 1024, Duration::ZERO), 2);
+        let halves: Vec<ByteRange> = (2..4).map(|worker| manager.get_next_work(worker, 0).unwrap().range).collect();
+        let (stream_cut, far_cut) = (MB + 9 * MB / 4, far.range.start + MB + 7 * MB / 4);
+        assert_eq!(halves, [ByteRange::new(stream_cut, MB + 9 * MB / 2 - 1).unwrap(), ByteRange::new(far_cut, 10 * MB - 1).unwrap()]);
+        assert_eq!(stream.end_offset.load(Ordering::SeqCst), stream_cut - 1);
+        // A piece no worker has is work already: it is handed out before anything is cut.
+        manager.mark_failed(3, "cut", Duration::ZERO, false).unwrap();
+        assert_eq!(manager.halve(1, 64 * 1024, Duration::ZERO), 1);
+        assert_eq!(manager.chunks().len(), 4, "nothing was cut");
+        // Halves of 4 MB at least: of the stream's 9 MB, one.
+        let mut manager = ChunkManager::new(10 * MB, 10 * MB).unwrap();
+        let stream = manager.get_next_work(0, 0).unwrap();
+        stream.received(MB);
+        assert_eq!(manager.halve(1, 4 * MB, Duration::ZERO), 1);
+        manager.get_next_work(1, 0).unwrap();
+        assert_eq!(manager.halve(1, 4 * MB, Duration::ZERO), 0, "2.25 MB halves do not pay");
+        // At 1 MB/s, a newcomer 2 s to answer: its half is short by the 2 MB the stream brings
+        // meanwhile, so both end together.
+        let mut manager = ChunkManager::new(10 * MB, 10 * MB).unwrap();
+        let stream = manager.get_next_work(0, 0).unwrap();
+        stream.answered(Instant::now() - Duration::from_secs(1));
+        stream.current_offset.store(MB, Ordering::SeqCst);
+        assert_eq!(manager.halve(1, 64 * 1024, Duration::from_secs(2)), 1);
+        // About: its pace is a hair under 1 MB/s by the time it is read.
+        let end = stream.end_offset.load(Ordering::SeqCst);
+        assert!(end.abs_diff(MB + 11 * MB / 2 - 1) < 16 * 1024, "{end}: the stream's 5.5 MB take as long as 2 s and 3.5 MB");
+        // Then at 4.5 MB/s, the stream with 2 MB left and the newcomer with 3.5 MB: what either
+        // has left goes in less than another's 2 s to answer, nothing to give it.
+        manager.get_next_work(1, 0).unwrap();
+        stream.current_offset.store(MB + 7 * MB / 2, Ordering::SeqCst);
+        assert_eq!(manager.halve(2, 64 * 1024, Duration::from_secs(2)), 0);
     }
 
     /// Once its host refuses a request, the first stream takes back the pieces right after it that
@@ -1340,34 +1404,37 @@ mod tests {
             // 1 MB in its first second.
             stream.answered(Instant::now() - Duration::from_secs(1));
             stream.current_offset.store(MB, Ordering::SeqCst);
-            manager.spread(4, 64 * 1024);
-            let far = manager.get_next_work(1, 0).unwrap();
-            let refused = manager.get_next_work(2, 0).unwrap();
+            manager.halve(1, 64 * 1024, Duration::ZERO);
+            let half = manager.get_next_work(1, 0).unwrap();
+            half.answered(Instant::now());
+            manager.halve(2, 64 * 1024, Duration::ZERO);
+            let [refused, far] = [2, 3].map(|worker| manager.get_next_work(worker, 0).unwrap());
             manager.mark_failed(refused.id, "HTTP 429", Duration::from_secs(3), false).unwrap();
             manager.rejoin(wait);
-            (manager, stream, far)
+            (manager, stream, [half, far])
         };
-        // In a 3 s rest it reaches the piece after its own, not the refused one past that.
-        let (_, stream, _) = refused(Duration::from_secs(3));
+        // In a 2 s rest it reaches 3 MB, short of the refused piece after its own.
+        let (_, stream, _) = refused(Duration::from_secs(2));
+        assert_eq!(stream.end_offset.load(Ordering::SeqCst), at(1) - 1);
+        let (mut manager, stream, others) = refused(Duration::from_secs(10));
         assert_eq!(stream.end_offset.load(Ordering::SeqCst), at(2) - 1);
-        let (mut manager, stream, far) = refused(Duration::from_secs(10));
-        assert_eq!(stream.end_offset.load(Ordering::SeqCst), at(3) - 1);
-        assert!(manager.get_next_work(3, 0).is_none(), "nothing is left to ask for");
-        manager.mark_completed(stream.id).unwrap();
-        manager.mark_completed(far.id).unwrap();
+        assert!(manager.get_next_work(4, 0).is_none(), "nothing is left to ask for");
+        for id in [stream.id, others[0].id, others[1].id] {
+            manager.mark_completed(id).unwrap();
+        }
         assert!(manager.is_all_completed());
         assert_eq!(manager.completed_ranges(), [ByteRange::new(0, 10 * MB - 1).unwrap()]);
 
         let mut manager = ChunkManager::new(10 * MB, 10 * MB).unwrap();
         let first = manager.get_next_work(0, 0).unwrap();
         first.received(MB);
-        manager.spread(4, 64 * 1024);
+        manager.halve(1, 64 * 1024, Duration::ZERO);
         first.current_offset.store(MB, Ordering::SeqCst);
         manager.mark_failed(first.id, "cut", Duration::ZERO, true).unwrap();
         let retried = manager.get_next_work(0, 0).unwrap();
         assert_eq!(retried.id, first.id);
         manager.rejoin(Duration::from_secs(10));
-        assert_eq!(retried.end_offset.load(Ordering::SeqCst), at(1) - 1);
+        assert_eq!(retried.end_offset.load(Ordering::SeqCst), at(2) - 1);
     }
 
     /// A piece cut off a request under way and refused goes back to that request, which asked for
@@ -1399,27 +1466,149 @@ mod tests {
         assert!(manager.is_all_completed());
     }
 
-    /// At the end of its piece while the download widens, the first stream goes on over the next
-    /// piece no worker has, one at a time, as far as its request asked; not over one a worker has.
+    /// A piece cut off a request under way changes hands when the newcomer's answer comes: the
+    /// request at its end goes on over it while it has none, the newcomer's then dropped (its
+    /// answer thrown away), or once it was refused; not once it was answered, nor past what the
+    /// request asked for, nor over a piece no worker has taken yet unless the download widens.
     #[test]
-    fn test_the_first_stream_runs_on_over_the_pieces_no_worker_has() {
-        let at = |i: u64| 10 * MB * i / 4;
+    fn test_a_piece_changes_hands_when_its_request_is_answered() {
+        let cut = || {
+            let mut manager = ChunkManager::new(10 * MB, 10 * MB).unwrap();
+            let stream = manager.get_next_work(0, 0).unwrap();
+            stream.asked(10 * MB - 1);
+            stream.answered(Instant::now());
+            manager.halve(1, 64 * 1024, Duration::ZERO);
+            let newcomer = manager.get_next_work(1, 0).unwrap();
+            newcomer.asked(10 * MB - 1);
+            (manager, stream, newcomer)
+        };
+        // No answer yet: the stream takes the piece back, and the newcomer's answer is thrown away.
+        let (mut manager, stream, newcomer) = cut();
+        assert!(manager.run_on(stream.id, false));
+        assert_eq!(stream.end_offset.load(Ordering::SeqCst), 10 * MB - 1);
+        assert!(newcomer.revoked.is_cancelled() && !newcomer.answered(Instant::now()));
+        manager.mark_completed(stream.id).unwrap();
+        assert!(manager.is_all_completed());
+        // Answered first: the piece is the newcomer's.
+        let (mut manager, stream, newcomer) = cut();
+        assert!(newcomer.answered(Instant::now()));
+        assert!(!manager.run_on(stream.id, true));
+        assert_eq!(stream.end_offset.load(Ordering::SeqCst), 5 * MB - 1);
+        // Refused: the piece waits out the rest unless the stream that asked for it reaches it.
+        let (mut manager, stream, newcomer) = cut();
+        manager.mark_failed(newcomer.id, "HTTP 429", Duration::from_secs(6), false).unwrap();
+        assert!(manager.run_on(stream.id, false));
+        assert!(manager.get_next_work(2, 0).is_none(), "nothing is left to ask for");
+        // A request that asked for less does not take it.
+        let (mut manager, stream, _) = cut();
+        stream.asked(5 * MB - 1);
+        assert!(!manager.run_on(stream.id, true));
+        // One no worker has taken yet waits its turn, unless the download widens.
         let mut manager = ChunkManager::new(10 * MB, 10 * MB).unwrap();
         let stream = manager.get_next_work(0, 0).unwrap();
         stream.asked(10 * MB - 1);
-        stream.answered(Instant::now());
-        manager.spread(4, 64 * 1024);
-        let far = manager.get_next_work(1, 0).unwrap();
-        assert_eq!((stream.end_offset.load(Ordering::SeqCst), far.range.start), (at(1) - 1, at(3)), "the farthest goes first");
-        assert!(manager.run_on(stream.id));
-        assert_eq!(stream.end_offset.load(Ordering::SeqCst), at(2) - 1, "one piece at a time");
-        assert!(manager.run_on(stream.id));
-        assert_eq!(stream.end_offset.load(Ordering::SeqCst), at(3) - 1);
-        assert!(!manager.run_on(stream.id), "not over a piece a worker has");
-        assert!(manager.get_next_work(2, 0).is_none(), "nothing is left to ask for");
-        manager.mark_completed(stream.id).unwrap();
-        manager.mark_completed(far.id).unwrap();
-        assert!(manager.is_all_completed());
+        manager.halve(1, 64 * 1024, Duration::ZERO);
+        assert!(!manager.run_on(stream.id, false) && manager.run_on(stream.id, true));
+    }
+
+    /// However splits, answers, refusals, take-backs, finishes and failures follow one another,
+    /// the chunks tile the file (no gap, no overlap), every piece not done is under a request
+    /// under way that asked for it or waits to be asked for, and the file completes.
+    #[test]
+    fn test_the_chunks_tile_the_file_whatever_comes_in_whatever_order() {
+        let size = 4 * MB;
+        for seed in 1..=3000u64 {
+            let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let mut roll = move |n: usize| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state % n as u64) as usize
+            };
+            let mut manager = ChunkManager::new(size, size).unwrap();
+            // The attempts under way, as their workers hold them.
+            let mut live: Vec<Chunk> = Vec::new();
+            let take = |manager: &mut ChunkManager, live: &mut Vec<Chunk>| {
+                if let Some(chunk) = manager.get_next_work(live.len(), 0) {
+                    chunk.asked(chunk.end_offset.load(Ordering::SeqCst));
+                    live.push(chunk);
+                }
+            };
+            take(&mut manager, &mut live);
+            for step in 0..60 {
+                // A worker whose piece was taken back drops its request.
+                live.retain(|c| !c.revoked.is_cancelled() || manager.chunks()[c.id].status != ChunkStatus::Merged);
+                let pick = |roll: &mut dyn FnMut(usize) -> usize, live: &[Chunk], answered: bool| {
+                    let some: Vec<usize> = (0..live.len()).filter(|&i| live[i].has_answer() == answered).collect();
+                    (!some.is_empty()).then(|| some[roll(some.len())])
+                };
+                match roll(7) {
+                    0 => {
+                        manager.halve(1 + roll(3), 64 * 1024, Duration::from_millis(roll(3) as u64 * 100));
+                    }
+                    1 => take(&mut manager, &mut live),
+                    2 => {
+                        if let Some(i) = pick(&mut roll, &live, false) {
+                            if !live[i].answered(Instant::now()) {
+                                live.remove(i);
+                            }
+                        }
+                    }
+                    3 | 4 => {
+                        if let Some(i) = pick(&mut roll, &live, true) {
+                            let (id, pos, end) = (live[i].id, live[i].current_offset.load(Ordering::SeqCst), live[i].end_offset.load(Ordering::SeqCst));
+                            if pos <= end {
+                                let to = pos + 1 + roll((end - pos + 1) as usize) as u64;
+                                live[i].received(to);
+                                live[i].current_offset.store(to, Ordering::SeqCst);
+                            } else if !manager.run_on(id, roll(2) == 0) {
+                                manager.mark_completed(id).unwrap();
+                                live.remove(i);
+                            }
+                        }
+                    }
+                    5 => {
+                        if let Some(i) = pick(&mut roll, &live, false) {
+                            manager.mark_failed(live.remove(i).id, "HTTP 429", Duration::ZERO, false).unwrap();
+                            manager.strand_nothing([None, Some(Duration::from_secs(1))][roll(2)]);
+                        }
+                    }
+                    _ => {
+                        if let Some(i) = pick(&mut roll, &live, true) {
+                            manager.mark_failed(live.remove(i).id, "cut", Duration::ZERO, false).unwrap();
+                        }
+                    }
+                }
+                let mut tiles: Vec<ByteRange> = manager.chunks().iter().filter(|c| c.status != ChunkStatus::Merged).map(|c| c.range).collect();
+                tiles.sort_by_key(|r| r.start);
+                let ends = tiles.iter().try_fold(0, |next, r| (r.start == next).then_some(r.end + 1));
+                assert_eq!(ends, Some(size), "seed {seed}, step {step}: {tiles:?}");
+                for c in manager.chunks().iter().filter(|c| c.is_in_flight()) {
+                    let held = live.iter().any(|l| l.id == c.id && Arc::ptr_eq(&l.attempt, &c.attempt) && !l.revoked.is_cancelled());
+                    assert!(held && c.attempt.lock().asked >= c.range.end, "seed {seed}, step {step}: chunk {} has no request that asked for it", c.id);
+                }
+            }
+            // Every attempt goes to its end, and what is left is asked for.
+            for _ in 0..1000 {
+                if manager.is_all_completed() {
+                    break;
+                }
+                match live.pop() {
+                    Some(chunk) if chunk.revoked.is_cancelled() => {}
+                    Some(chunk) => {
+                        chunk.answered(Instant::now());
+                        chunk.current_offset.store(chunk.end_offset.load(Ordering::SeqCst) + 1, Ordering::SeqCst);
+                        if manager.run_on(chunk.id, true) {
+                            live.push(chunk);
+                        } else {
+                            manager.mark_completed(chunk.id).unwrap();
+                        }
+                    }
+                    None => take(&mut manager, &mut live),
+                }
+            }
+            assert_eq!(manager.completed_ranges(), [ByteRange::new(0, size - 1).unwrap()], "seed {seed}");
+        }
     }
 
     /// What no worker has is merged into as many requests as the connections kept: with one, the
