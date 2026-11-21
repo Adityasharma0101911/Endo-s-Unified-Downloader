@@ -1183,16 +1183,113 @@ fn preallocate_file(file: &File, size: u64) -> Result<(), StorageError> {
     Ok(())
 }
 
-/// Makes the file at `path`, written in full, an ordinary file again (not sparse; see
-/// `preallocate_file`), as copy, backup and virtual machine tools expect. A failure, as on a file
-/// system without sparse files, changes nothing. Blocking.
+/// The sparse flags being cleared (see [`unsparse_later`]): each file's path and its clear.
 #[cfg(windows)]
-pub(crate) fn unsparse(path: &Path) {
+static CLEARING: Mutex<Vec<(PathBuf, JoinHandle<()>)>> = Mutex::new(Vec::new());
+
+/// Names the files a program started by [`hand_over_clears`] clears (see [`serve_clears`]), one
+/// per line.
+#[cfg(windows)]
+const CLEAR_FILES: &str = "HYPERFETCH_CLEAR_SPARSE";
+
+/// Opens the file at `path` to clear its sparse flag: a handle that only reads and writes its
+/// attributes, so it keeps no other program from opening the file.
+#[cfg(windows)]
+fn open_to_clear(path: &Path) -> std::io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_READ_ATTRIBUTES, FILE_WRITE_ATTRIBUTES};
+    OpenOptions::new().access_mode(FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES).open(path)
+}
+
+/// Makes the file at `path`, written in full and under its name, an ordinary file again (not
+/// sparse; see `preallocate_file`), as copy, backup and virtual machine tools expect, off the
+/// download's path: the system allocates a sparse file's cached writes only as they reach the
+/// disk, so clearing the flag waits for the disk to hold all of the file (on a fast local link,
+/// longer than the download took). On a thread of its own, through a handle opened here (see
+/// `open_to_clear`), which follows the file through a rename. Cut short when the program exits,
+/// it leaves the file sparse: a program that exits once its downloads end calls
+/// [`hand_over_clears`] first, which goes by `path`, so moving the file waits for
+/// [`finish_clears`]. A failure, as on a file system without sparse files, changes nothing.
+#[cfg(windows)]
+pub(crate) fn unsparse_later(path: &Path) {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_SPARSE_FILE;
+    let Ok(file) = open_to_clear(path) else { return };
+    if file.metadata().is_ok_and(|m| m.file_attributes() & FILE_ATTRIBUTE_SPARSE_FILE == 0) {
+        return;
+    }
+    if let Ok(clear) = std::thread::Builder::new().name("unsparse".into()).spawn(move || unsparse(&file)) {
+        let mut clearing = CLEARING.lock();
+        clearing.retain(|(_, clear)| !clear.is_finished());
+        clearing.push((path.to_path_buf(), clear));
+    }
+}
+
+/// For the `main` of a program that downloads, called first: started by [`hand_over_clears`],
+/// this clears the sparse flags of the files it was given and exits. Nothing on other systems.
+pub fn serve_clears() {
+    #[cfg(windows)]
+    if let Some(files) = std::env::var_os(CLEAR_FILES) {
+        clear_listed(&files);
+        std::process::exit(0);
+    }
+}
+
+/// Clears the sparse flags of the files `files` lists, one per line. Blocking.
+#[cfg(windows)]
+fn clear_listed(files: &std::ffi::OsStr) {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    let wide: Vec<u16> = files.encode_wide().collect();
+    for path in wide.split(|&c| c == u16::from(b'\n')).filter(|p| !p.is_empty()) {
+        if let Ok(file) = open_to_clear(Path::new(&std::ffi::OsString::from_wide(path))) {
+            unsparse(&file);
+        }
+    }
+}
+
+/// For a program about to exit: the sparse flags still being cleared (see [`unsparse_later`])
+/// are left to a copy of it started for them (see [`serve_clears`]), which it does not wait for:
+/// waiting would wait for the disk to hold the whole file, and a clear cut short at exit leaves it
+/// sparse. When the copy cannot be started they are waited for. Nothing on other systems.
+pub fn hand_over_clears() {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        let clearing: Vec<_> = std::mem::take(&mut *CLEARING.lock()).into_iter().filter(|(_, clear)| !clear.is_finished()).collect();
+        if clearing.is_empty() {
+            return;
+        }
+        let mut list: Vec<u16> = Vec::new();
+        for (path, _) in &clearing {
+            list.extend(path.as_os_str().encode_wide().chain([u16::from(b'\n')]));
+        }
+        let copy = std::env::current_exe().and_then(|exe| {
+            std::process::Command::new(exe)
+                .env(CLEAR_FILES, std::ffi::OsString::from_wide(&list))
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .creation_flags(DETACHED_PROCESS)
+                .spawn()
+        });
+        if let Err(e) = copy {
+            tracing::debug!("Could not leave the sparse flags to clear to another process: {e}");
+            for (_, clear) in clearing {
+                let _ = clear.join();
+            }
+        }
+    }
+}
+
+/// Clears the sparse flag of `file`. Blocking.
+#[cfg(windows)]
+fn unsparse(file: &File) {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::System::Ioctl::{FILE_SET_SPARSE_BUFFER, FSCTL_SET_SPARSE};
     use windows_sys::Win32::System::IO::DeviceIoControl;
 
-    let Ok(file) = OpenOptions::new().write(true).open(path) else { return };
     let clear = FILE_SET_SPARSE_BUFFER { SetSparse: 0 };
     let mut returned = 0u32;
     // SAFETY: the handle is owned by `file` and outlives this synchronous call; the input buffer
@@ -1210,13 +1307,22 @@ pub(crate) fn unsparse(path: &Path) {
         )
     };
     if ok == 0 {
-        tracing::debug!("Clearing the sparse flag of {} failed: {}", path.display(), std::io::Error::last_os_error());
+        tracing::debug!("Clearing a sparse flag failed: {}", std::io::Error::last_os_error());
     }
 }
 
 /// Only Windows makes a file sparse to preallocate it.
 #[cfg(not(windows))]
-pub(crate) fn unsparse(_path: &Path) {}
+pub(crate) fn unsparse_later(_path: &Path) {}
+
+/// Waits for the sparse flags being cleared (see [`unsparse_later`]), so that every file finished
+/// is an ordinary file. Blocking.
+pub fn finish_clears() {
+    #[cfg(windows)]
+    for (_, clear) in std::mem::take(&mut *CLEARING.lock()) {
+        let _ = clear.join();
+    }
+}
 
 #[cfg(target_os = "linux")]
 fn preallocate_file(file: &File, size: u64) -> Result<(), StorageError> {
@@ -1294,6 +1400,38 @@ mod hex {
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+
+    /// A finished file is cleared of its sparse flag by this process, though a rename took it
+    /// elsewhere meanwhile, and by the copy of it a clear under way is left to at exit, which is
+    /// given a list of paths.
+    #[cfg(windows)]
+    #[test]
+    fn test_a_sparse_flag_is_cleared_where_the_file_went() {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        use std::os::windows::fs::MetadataExt;
+        const SPARSE: u32 = 0x200; // FILE_ATTRIBUTE_SPARSE_FILE
+        let dir = tempfile::tempdir().unwrap();
+        let sparse =|path: &Path| std::fs::metadata(path).unwrap().file_attributes() & SPARSE != 0;
+        let written = |name: &str| {
+            let path = dir.path().join(name);
+            let writer = DiskWriter::open_or_create(&path, 1 << 20).unwrap();
+            writer.write_chunk_slice(0, &[3u8; 1 << 20]).unwrap();
+            assert!(sparse(&path), "written sparse");
+            (path, dir.path().join(format!("sorted-{name}")))
+        };
+
+        let (path, moved) = written("here.bin");
+        unsparse_later(&path);
+        std::fs::rename(&path, &moved).unwrap();
+        finish_clears();
+        assert!(!sparse(&moved));
+        assert_eq!(std::fs::read(&moved).unwrap(), vec![3u8; 1 << 20]);
+
+        let (left, other) = (written("left.bin").0, written("other.bin").0);
+        let list: Vec<u16> = [&left, &other].iter().flat_map(|p| p.as_os_str().encode_wide().chain([u16::from(b'\n')])).collect();
+        clear_listed(&std::ffi::OsString::from_wide(&list));
+        assert!(!sparse(&left) && !sparse(&other));
+    }
 
     #[test]
     fn test_disk_writer_write_and_hash() {

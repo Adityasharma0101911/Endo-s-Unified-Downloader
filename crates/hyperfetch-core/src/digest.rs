@@ -1430,6 +1430,32 @@ mod tests {
         }
     }
 
+    /// A check that takes a while (the checksum file's answer 2 s away) has the state with every
+    /// byte in saved meanwhile, so a download killed then only checks its file again; once the file
+    /// has its name the state is gone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_long_check_saves_every_byte_meanwhile() {
+        let data = content(2 * MIB);
+        let dir = tempfile::tempdir().unwrap();
+        let files = vec![("/dir/file.bin.sha256".to_string(), "text/plain".to_string(), sha256_hex(&data))];
+        let site = Site { files, sidecars_wait: Duration::from_secs(2), pace: Duration::from_millis(5), ..Site::default() };
+        let (url, _) = serve(data.clone(), site).await;
+        let options = DownloadOptions { output_path: Some(dir.path().join("")), ..DownloadOptions::default() };
+        let (tx, mut rx) = broadcast::channel::<EngineSnapshot>(1024);
+        let run = tokio::spawn(async move { DownloadEngine::new(vec![url], options).run(Some(tx)).await });
+        while let Ok(snapshot) = rx.recv().await {
+            if snapshot.checking {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let state_path = crate::state::DownloadState::state_file_path(&crate::engine::part_path(&dir.path().join("file.bin")));
+        let state = crate::state::DownloadState::load_from_path(&state_path).unwrap().unwrap();
+        assert_eq!(crate::range::merge_ranges(state.completed_ranges), [ByteRange::new(0, data.len() as u64 - 1).unwrap()]);
+        assert_eq!(run.await.unwrap().unwrap(), dir.path().join("file.bin"));
+        assert!(!state_path.exists());
+    }
+
     /// A newer version that fails the site's checksum, with `only_if_newer` (`-N`), a delta from
     /// the file it replaces, or both, leaves the old file as it was.
     #[tokio::test(flavor = "multi_thread")]

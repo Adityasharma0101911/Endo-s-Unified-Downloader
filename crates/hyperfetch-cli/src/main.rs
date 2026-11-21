@@ -42,7 +42,9 @@ use download::{
 };
 
 fn main() {
-    // Started again to stop a live recording, this only does that.
+    // Started again to clear finished files' sparse flags, or to stop a live recording, this only
+    // does that.
+    hyperfetch_core::storage::serve_clears();
     hyperfetch_core::media::serve_ctrl_c();
     media::prepare_macos();
     // What an earlier update left behind (the old programs) can be deleted once they have exited.
@@ -59,6 +61,8 @@ fn main() {
             EXIT_FAILED
         });
     let _ = std::io::stdout().flush();
+    // A finished file still being made an ordinary file is left to a copy of this program.
+    hyperfetch_core::storage::hand_over_clears();
     // Exit without waiting for a blocking stdin read that may still be pending.
     std::process::exit(code);
 }

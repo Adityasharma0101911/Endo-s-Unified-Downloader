@@ -531,18 +531,24 @@ pub struct Ramp {
     /// and once a refusal ended that.
     step: std::sync::atomic::AtomicUsize,
     widened: tokio::sync::Notify,
-    /// A step is under way (see [`Ramp::widen_from`]).
-    widening: std::sync::atomic::AtomicBool,
+    /// Whether a step is under way (bit 0), the workers running when the download last began one
+    /// (bits 1 to 31), and how many steps it took (bits 32 on): one value, so a worker never reads
+    /// a step's start beside another step's state (see [`Ramp::holds`]).
+    phase: std::sync::atomic::AtomicU64,
     /// The newcomers of the step under way yet to have their answer.
     waiting: std::sync::atomic::AtomicUsize,
-    /// A refusal ended the widening: nothing more is asked (see [`Ramp::refused`]); and the
-    /// Autopilot has yet to take it (see [`Ramp::took`]).
-    refused: std::sync::atomic::AtomicBool,
+    /// The widening ended before its last step: nothing more is asked (see [`Ramp::refused`],
+    /// [`Ramp::taken_back`]); whether a refusal ended it; and whether the Autopilot has yet to
+    /// take it (see [`Ramp::took`]).
+    ended: std::sync::atomic::AtomicBool,
+    refusal: std::sync::atomic::AtomicBool,
     untaken: std::sync::atomic::AtomicBool,
-    /// The workers running when the download last began a step, and how many steps it took.
-    from: std::sync::atomic::AtomicUsize,
-    round: std::sync::atomic::AtomicUsize,
+    /// Newcomers whose pieces the requests they were cut from took back while the download widened.
+    late: std::sync::atomic::AtomicUsize,
 }
+
+/// The bit of `Ramp::phase` that says a step is under way.
+const WIDENING: u64 = 1;
 
 impl Ramp {
     /// `open` workers may send requests from the start.
@@ -551,13 +557,19 @@ impl Ramp {
             open: open.into(),
             step: 2.into(),
             widened: tokio::sync::Notify::new(),
-            widening: false.into(),
+            phase: 0.into(),
             waiting: 0.into(),
-            refused: false.into(),
+            ended: false.into(),
+            refusal: false.into(),
             untaken: false.into(),
-            from: 0.into(),
-            round: 0.into(),
+            late: 0.into(),
         }
+    }
+
+    /// Whether a step is under way, the workers running when it began, and which step it is.
+    fn phase(&self) -> (bool, usize, usize) {
+        let phase = self.phase.load(Ordering::Relaxed);
+        (phase & WIDENING != 0, ((phase >> 1) & 0x7FFF_FFFF) as usize, (phase >> 32) as usize)
     }
 
     /// The download widens from `running` workers by a step of `newcomers`, each with a piece of
@@ -566,19 +578,24 @@ impl Ramp {
     /// those running, and each newcomer once it sent its own, wait for the widening to end (see
     /// `WorkerShared::within_width`), so the requests a host may refuse are the step's alone, and
     /// each of their pieces is cut off a request that streams it if they are (see
-    /// `ChunkManager::run_on`). Never once a refusal ended a widening, nor for a ramp that lets
-    /// every worker go (FTP, SFTP).
+    /// `ChunkManager::run_on`). Never once the widening ended before its last step (see
+    /// [`Ramp::may_widen`]), nor for a ramp that lets every worker go (FTP, SFTP).
     pub(crate) fn widen_from(&self, running: usize, newcomers: usize) {
-        if self.open.load(Ordering::Relaxed) == usize::MAX || self.refused.load(Ordering::Relaxed) {
+        if !self.may_widen() {
             return;
         }
         self.step.store(0, Ordering::Relaxed);
         self.open.store(running + newcomers, Ordering::Relaxed);
-        self.from.store(running, Ordering::Relaxed);
         self.waiting.store(newcomers, Ordering::Relaxed);
-        self.round.fetch_add(1, Ordering::Relaxed);
-        self.widening.store(true, Ordering::Relaxed);
+        let round = (self.phase.load(Ordering::Relaxed) >> 32) + 1;
+        self.phase.store(round << 32 | ((running as u64) & 0x7FFF_FFFF) << 1 | WIDENING, Ordering::Relaxed);
         self.widened.notify_waiters();
+    }
+
+    /// Whether a step may go: not once the widening ended before its last (a refusal, or answers
+    /// too late), nor for a ramp that lets every worker go. A piece is cut for a newcomer only then.
+    pub(crate) fn may_widen(&self) -> bool {
+        self.open.load(Ordering::Relaxed) != usize::MAX && !self.ended.load(Ordering::Relaxed)
     }
 
     /// The workers that may have sent a request.
@@ -593,7 +610,8 @@ impl Ramp {
 
     /// Worker `worker_id`'s request of the step under way has its outcome.
     fn settled(&self, worker_id: usize) {
-        if self.is_widening() && (self.from.load(Ordering::Relaxed)..self.open()).contains(&worker_id) {
+        let (widening, from, _) = self.phase();
+        if widening && (from..self.open()).contains(&worker_id) {
             let mut n = self.waiting.load(Ordering::Relaxed);
             while let Some(less) = n.checked_sub(1) {
                 match self.waiting.compare_exchange_weak(n, less, Ordering::Relaxed, Ordering::Relaxed) {
@@ -607,24 +625,28 @@ impl Ramp {
 
     /// Which widening this is, for a worker to tell whether it sent a request in it.
     pub(crate) fn round(&self) -> usize {
-        self.round.load(Ordering::Relaxed)
+        self.phase().2
     }
 
     /// Whether worker `worker_id`, which last sent a request in widening `sent` (see
-    /// [`Ramp::round`]), waits for the widening under way to end before it sends another.
+    /// [`Ramp::round`]), waits for the widening under way to end before it sends another. One
+    /// read of the phase; `open`, read apart by `WorkerShared::within_width`, is stored before it
+    /// when a step begins: a worker that sees the new `open` beside the phase before is let go as
+    /// it was an instant before, with a piece of its own, not one cut off a request under way.
     fn holds(&self, worker_id: usize, sent: usize) -> bool {
-        self.is_widening() && (worker_id < self.from.load(Ordering::Relaxed) || sent == self.round())
+        let (widening, from, round) = self.phase();
+        widening && (worker_id < from || sent == round)
     }
 
     /// Whether the download is widening (see [`Ramp::widen_from`]).
     pub(crate) fn is_widening(&self) -> bool {
-        self.widening.load(Ordering::Relaxed)
+        self.phase().0
     }
 
     /// The last step is done and no other follows: workers that had a piece before go on, and each
     /// answer lets two more go again, as before the download widened.
     pub(crate) fn widened(&self) {
-        self.widening.store(false, Ordering::Relaxed);
+        self.phase.fetch_and(!WIDENING, Ordering::Relaxed);
         self.step.store(2, Ordering::Relaxed);
         self.widened.notify_waiters();
     }
@@ -633,31 +655,52 @@ impl Ramp {
     /// more are asked for in it, its width what the host took (see [`Ramp::took`]). Whether it was
     /// widening.
     fn refused(&self) -> bool {
-        if !self.widening.swap(false, Ordering::Relaxed) {
+        self.end(true)
+    }
+
+    /// Ends the widening before its last step, by a refusal or not: whether it was widening.
+    fn end(&self, refusal: bool) -> bool {
+        if self.phase.fetch_and(!WIDENING, Ordering::Relaxed) & WIDENING == 0 {
             return false;
         }
-        self.refused.store(true, Ordering::Relaxed);
+        self.ended.store(true, Ordering::Relaxed);
+        self.refusal.store(refusal, Ordering::Relaxed);
         self.untaken.store(true, Ordering::Relaxed);
         self.widened.notify_waiters();
         true
     }
 
-    /// Whether a refusal ended the widening and the Autopilot has yet to take the connections the
-    /// host took, once `answered` (every request sent has its answer, so the count is what the host
-    /// took, not what it was yet to answer): then it takes it, once.
+    /// Whether the widening ended before its last step and the Autopilot has yet to take the
+    /// connections the host took, once `answered` (every request sent has its answer, so the count
+    /// is what the host took, not what it was yet to answer): then it takes it, once.
     pub(crate) fn took(&self, answered: bool) -> bool {
         self.untaken() && answered && self.untaken.swap(false, Ordering::Relaxed)
     }
 
-    /// Whether a refusal ended the widening and the Autopilot has yet to take it.
+    /// Whether the widening ended before its last step and the Autopilot has yet to take it.
     pub(crate) fn untaken(&self) -> bool {
         self.untaken.load(Ordering::Relaxed)
     }
 
-    /// Worker `worker_id`'s request failed before its answer, or the request its piece was cut from
-    /// took the piece back (see `ChunkManager::run_on`): it counts as the step's.
+    /// Whether a refusal, not answers too late, ended the widening.
+    pub(crate) fn by_refusal(&self) -> bool {
+        self.refusal.load(Ordering::Relaxed)
+    }
+
+    /// Worker `worker_id`'s request failed before its answer: it counts as the step's.
     fn failed(&self, worker_id: usize) {
         self.settled(worker_id);
+    }
+
+    /// The request worker `worker_id`'s piece was cut from took the piece back before the answer
+    /// (see `ChunkManager::run_on`): it counts as the step's, and a second while the download
+    /// widens ends the widening at the requests answered, as a refusal does, though the host
+    /// refused nothing.
+    fn taken_back(&self, worker_id: usize) {
+        self.settled(worker_id);
+        if self.is_widening() && self.late.fetch_add(1, Ordering::Relaxed) >= 1 {
+            self.end(false);
+        }
     }
 
     /// Worker `worker_id`'s request was answered: two more workers may send theirs, before the
@@ -970,8 +1013,9 @@ impl HttpWorker {
                 },
             }
         };
-        check_response(response.status(), response.headers(), hedge.start, hedge.end, s.file_size, if_range.as_deref()).ok()?;
+        let brings = check_response(response.status(), response.headers(), hedge.start, hedge.end, s.file_size, if_range.as_deref()).ok()?;
         let chunk = s.chunks.lock().claim(hedge, self.worker_id, mirror_id)?;
+        chunk.asked(brings);
         tracing::info!("Chunk {}: the second request was answered first; worker {} takes it over", chunk.id, self.worker_id);
         slot.accepted();
         s.ramp.answered(self.worker_id);
@@ -1013,18 +1057,26 @@ impl HttpWorker {
         let (worker_id, chunk_id) = (self.worker_id, chunk.id);
         let revoked = chunk.revoked.is_cancelled();
         // The request its piece was cut from took that back before its answer (see
-        // `ChunkManager::run_on`): it is dropped, and counts against nobody; a refusal still rests
-        // the host and ends a widening.
+        // `ChunkManager::run_on`): it is dropped, and counts against nobody. A refusal is a fact
+        // about the host whoever holds the piece now: it rests the host, lowers the mirror's cap,
+        // ends a widening, and the engine hears of it.
         let taken_back = revoked && chunks.chunks().get(chunk_id).is_some_and(|c| c.status == ChunkStatus::Merged);
         if taken_back {
-            match outcome {
-                Err((FailureKind::Throttled(after), _)) => {
+            return match outcome {
+                Err((kind @ FailureKind::Throttled(after), error)) => {
                     slot.throttled(after.unwrap_or(THROTTLE_RETRY));
+                    let serving = slot.serving();
+                    if let Some(mirror) = racer.get_mirror_mut(mirror_id) {
+                        mirror.record_throttled(mirror.in_flight.min(serving));
+                    }
                     s.ramp.refused();
+                    Some(WorkerEvent::ChunkFailed { worker_id, chunk_id, mirror_id, kind, error })
                 }
-                _ => s.ramp.failed(worker_id),
-            }
-            return None;
+                _ => {
+                    s.ramp.taken_back(worker_id);
+                    None
+                }
+            };
         }
         match outcome {
             Ok(()) if revoked => None,
@@ -1127,9 +1179,12 @@ impl HttpWorker {
                 }
             },
         };
-        check_response(response.status(), response.headers(), start, end, s.file_size, if_range.as_deref())
+        let brings = check_response(response.status(), response.headers(), start, end, s.file_size, if_range.as_deref())
             .map_err(|failure| if redirected { at_redirect_target(response.status(), failure) } else { failure })?;
         slot.accepted();
+        // The request goes on over what its answer brings, not what it asked for (see
+        // `ChunkManager::run_on`): a 206 may end short of that.
+        chunk.asked(brings);
         // Taken back meanwhile by the request its piece was cut from: the answer is thrown away.
         if !chunk.answered(Instant::now()) {
             return Err(taken_over());
@@ -1288,7 +1343,7 @@ impl HttpWorker {
     /// (see `ChunkManager::give_back`).
     fn runs_on(&self, chunk: &Chunk) -> bool {
         let s = &self.shared;
-        self.worker_id < s.width.load(Ordering::Relaxed) && s.chunks.lock().run_on(chunk.id, s.ramp.is_widening())
+        self.worker_id < s.width.load(Ordering::Relaxed) && s.chunks.lock().run_on(chunk, s.ramp.is_widening())
     }
 
     /// Whether the attempt at `chunk_id`, which went at `rate` over its last window, makes way for
@@ -1473,7 +1528,8 @@ enum Job {
 }
 
 /// Classifies the response to `Range: bytes=start-end` (with `If-Range: if_range` when set) for
-/// a file of `file_size` bytes.
+/// a file of `file_size` bytes: the last byte a usable one brings, which a 206 may put short of
+/// `end`.
 fn check_response(
     status: StatusCode,
     headers: &HeaderMap,
@@ -1481,7 +1537,7 @@ fn check_response(
     end: u64,
     file_size: u64,
     if_range: Option<&str>,
-) -> Result<(), Failure> {
+) -> Result<u64, Failure> {
     match status {
         StatusCode::PARTIAL_CONTENT => {
             let header = headers.get(CONTENT_RANGE).and_then(|v| v.to_str().ok());
@@ -1495,7 +1551,7 @@ fn check_response(
                             FailureKind::Fatal,
                             "remote file changed: server ignored If-Range and sent part of a different version".to_string(),
                         )),
-                        None => Ok(()),
+                        None => Ok(range.end),
                     }
                 }
                 _ => Err((
@@ -1521,7 +1577,7 @@ fn check_response(
                         FailureKind::BadMirror,
                         format!("200 response is {} bytes, expected {}", len, file_size),
                     )),
-                    _ => Ok(()),
+                    _ => Ok(file_size.saturating_sub(1)),
                 }
             } else if same_file {
                 Err((FailureKind::BadMirror, format!("server ignored Range and sent 200 for offset {}", start)))
@@ -1612,6 +1668,9 @@ mod tests {
     fn test_check_response_classification() {
         let cr = [("content-range", "bytes 100-199/1000")];
         assert_eq!(check(206, &cr, 100, 199, 1000, V1), None);
+        let short = HeaderMap::from_iter([(CONTENT_RANGE, HeaderValue::from_static("bytes 100-149/1000"))]);
+        assert_eq!(check_response(StatusCode::PARTIAL_CONTENT, &short, 100, 199, 1000, None).ok(), Some(149), "what a short answer brings");
+        assert_eq!(check_response(StatusCode::OK, &HeaderMap::new(), 0, 199, 1000, None).ok(), Some(999), "a whole file brings it all");
         // Wrong start, or a total from a different file.
         assert_eq!(check(206, &cr, 50, 199, 1000, V1), Some(FailureKind::BadMirror));
         assert_eq!(check(206, &[("content-range", "bytes 100-199/2000")], 100, 199, 1000, None), Some(FailureKind::BadMirror));
@@ -1882,6 +1941,33 @@ mod tests {
         assert!(started.elapsed() < WRITE_INTERVAL, "{:?}", started.elapsed());
         assert_eq!(offset.load(Ordering::SeqCst), 0, "the new owner fetches those bytes");
         assert!(std::fs::read(&path).unwrap().iter().all(|&b| b == 0));
+    }
+
+    /// A newcomer reads its 429 while the stream its piece was cut from takes the piece back: the
+    /// refusal is still a fact about the host, kept against the mirror and told to the engine.
+    #[test]
+    fn test_a_refusal_read_while_its_piece_is_taken_back_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        // A port of its own: the host rests after the refusal.
+        let url = Url::parse("http://127.0.0.1:19/f").unwrap();
+        let (worker, stream, _events) = test_worker(&url, &dir.path().join("f.part"), 16 << 20);
+        stream.asked((16 << 20) - 1);
+        stream.answered(Instant::now());
+        let newcomer = {
+            let mut chunks = worker.shared.chunks.lock();
+            chunks.halve(1, 64 * 1024, Duration::ZERO);
+            chunks.get_next_work(1, 0).unwrap()
+        };
+        let mut racer = worker.shared.mirrors.lock();
+        racer.acquire_mirror(0);
+        racer.acquire_mirror(0);
+        drop(racer);
+        stream.current_offset.store(stream.end_offset.load(Ordering::SeqCst) + 1, Ordering::SeqCst);
+        assert!(worker.shared.chunks.lock().run_on(&stream, false), "the stream takes the piece back");
+        let refused = (FailureKind::Throttled(Some(Duration::from_secs(6))), "HTTP 429".to_string());
+        let event = HttpWorker::new(1, worker.shared.clone()).settle(&newcomer, 0, &url, Err(refused), &slot(&url));
+        assert!(matches!(event, Some(WorkerEvent::ChunkFailed { kind: FailureKind::Throttled(_), .. })), "{event:?}");
+        assert_eq!(worker.shared.mirrors.lock().get_mirror(0).unwrap().max_connections, 1, "the host took the stream alone");
     }
 
     #[test]

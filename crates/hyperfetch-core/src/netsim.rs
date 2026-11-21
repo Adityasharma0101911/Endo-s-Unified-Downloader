@@ -78,6 +78,9 @@ pub(crate) struct Server {
     pub hold: Vec<(usize, Duration)>,
     /// The GETs, counted so, refused with `refusal` whatever else is open.
     pub refuse: Vec<usize>,
+    /// The GET, counted so, whose answer ends at this byte, as its Content-Range says, whatever
+    /// it asked for.
+    pub short: Option<(usize, usize)>,
 }
 
 /// At most `requests` requests in any `window`; one more is refused with 429 and Retry-After
@@ -347,6 +350,7 @@ async fn answer(
     }
     stats.peak.fetch_max(open, Ordering::SeqCst);
     let (start, end) = range.unwrap_or((0, size - 1));
+    let end = server.short.filter(|&(n, _)| n == nth && range.is_some()).map_or(end, |(_, at)| end.min(at));
     let status = match range {
         Some(_) => format!("206 Partial Content\r\nContent-Range: bytes {start}-{end}/{size}"),
         None => "200 OK".to_string(),

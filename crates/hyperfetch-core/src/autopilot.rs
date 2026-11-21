@@ -89,6 +89,9 @@ enum Why {
     Held(f64),
     /// Opened from that stream, which kept this speed beside one more that was slow of its own.
     Beside(f64),
+    /// New requests were answered too late, the streams they were cut from going on over their
+    /// pieces first.
+    Late,
 }
 
 #[derive(Debug)]
@@ -250,6 +253,15 @@ impl Autopilot {
         (self.opening, self.judging, self.trial, self.holding) = (None, None, None, None);
         self.cap = Some(took.max(1));
         self.settle(took.max(1), Why::Most)
+    }
+
+    /// The widening ended as the streams went on over the pieces of newcomers the host had yet to
+    /// answer (see `Ramp::taken_back`): the download keeps the `took` connections that were
+    /// answered, and goes no wider, but the host refused nothing and is not held to them.
+    pub(crate) fn answered_late(&mut self, took: usize) -> Option<usize> {
+        (self.opening, self.judging, self.trial, self.holding) = (None, None, None, None);
+        self.max = took.max(1);
+        self.settle(took.max(1), Why::Late)
     }
 
     /// While alone, the width to open at `now`, with `downloaded` bytes in and `left` to come, once
@@ -521,6 +533,7 @@ impl Autopilot {
             Why::Flat(speed) => format!("{c}: the server or your line holds it to about {}, so more would not help", per_sec(speed)),
             Why::Line(speed) => format!("{c}: that fills your line (about {})", per_sec(speed)),
             Why::Short => format!("{c}: too little is left to try more"),
+            Why::Late => format!("{c}: the server answers new requests too late for more to pay"),
             Why::Limited => format!("{c}: the server limits how often it is asked (429/503), so it is asked for the file alone"),
             Why::Alone => format!("{c} while its speed shows; more are opened only if they pay"),
             Why::Step(speed) => format!("{c}: the first went at {}; a second shows whether more pay", per_sec(speed)),

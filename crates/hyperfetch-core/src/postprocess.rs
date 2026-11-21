@@ -122,6 +122,8 @@ pub async fn after_download(path: &Path, post: &PostOptions, source: &Url, proxy
         });
     }
     if let Some(command) = post.run_after.as_deref().filter(|c| !c.trim().is_empty()) {
+        // It is given an ordinary file (see `storage::unsparse_later`).
+        let _ = tokio::task::spawn_blocking(crate::storage::finish_clears).await;
         notes.extend(run_after(command, &path, source).await);
     }
     PostOutcome { path, notes }
@@ -156,6 +158,8 @@ fn on_disk(mut path: PathBuf, post: &PostOptions, source: &Url, hash: bool, pass
         }
     }
     if post.sort && path.is_file() {
+        // Moved once it is an ordinary file, as a clear left to finish at exit goes by its path.
+        crate::storage::finish_clears();
         let chosen = CHOSEN.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
         match sort(&path, &chosen.unwrap_or_else(default_categories)) {
             Ok(Some(moved)) => {

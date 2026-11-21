@@ -316,6 +316,10 @@ pub struct ChunkManager {
     replaced_at: Option<Instant>,
     /// The first stream, whose answer runs to the file's end, and its attempt (see `halve`).
     stream: Option<(usize, Arc<Mutex<Attempt>>)>,
+    /// What a new request was seen to take to answer at least: twice the longest wait of one
+    /// dropped without an answer, as its piece was taken back (see `take_after`). Every later cut
+    /// and steal leaves the request it splits at least that much of its own.
+    setup: Duration,
 }
 
 impl ChunkManager {
@@ -373,6 +377,7 @@ impl ChunkManager {
             fatal: None,
             replaced_at: None,
             stream: None,
+            setup: Duration::ZERO,
         })
     }
 
@@ -660,8 +665,10 @@ impl ChunkManager {
         let (victim_id, _, pace) = self
             .chunks
             .iter()
+            // Not one whose request has no answer yet: the thief's would wait as long, and the
+            // piece go back to the request it was cut from (see `ChunkManager::run_on`).
             .filter_map(|c| match c.status {
-                ChunkStatus::Assigned { mirror_id, .. } => {
+                ChunkStatus::Assigned { mirror_id, .. } if c.has_answer() => {
                     let remaining = c.unreceived();
                     (remaining > min_bytes).then(|| (c.id, remaining, c.pace(now, expected(mirror_id))))
                 }
@@ -669,17 +676,26 @@ impl ChunkManager {
             })
             .max_by(|a, b| eta_secs(a.1, a.2).total_cmp(&eta_secs(b.1, b.2)).then(a.1.cmp(&b.1)))?;
 
+        let floor = self.setup.as_secs_f64();
         let victim = &mut self.chunks[victim_id];
         let cur_end = victim.end_offset.load(Ordering::SeqCst);
         let remaining = Some(victim.unreceived()).filter(|&n| n > 0)?;
         let keep = match (expected(thief_mirror_id).filter(|t| t.rate > 0.0), pace) {
             (Some(thief), Some((wait, victim_rate))) => {
-                let (startup, left) = (thief.startup.as_secs_f64(), remaining as f64);
+                let (startup, left) = (thief.startup.as_secs_f64().max(floor), remaining as f64);
                 if eta_secs(remaining, pace) <= STEAL_MIN_STARTUPS * startup {
                     return None;
                 }
                 // wait + keep / victim_rate == startup + (remaining - keep) / thief.rate
                 (((startup - wait) * thief.rate + left) * victim_rate / (victim_rate + thief.rate)) as u64
+            }
+            // Untimed, it halves, but the victim keeps what it brings while a new request waits
+            // as long as one was seen to.
+            (_, Some((_, victim_rate))) if floor > 0.0 => {
+                if eta_secs(remaining, pace) <= STEAL_MIN_STARTUPS * floor {
+                    return None;
+                }
+                (remaining / 2).max((victim_rate * floor) as u64)
             }
             _ => remaining / 2,
         };
@@ -735,12 +751,13 @@ impl ChunkManager {
     /// what each request under way has yet to receive, those with the most left first. Halves
     /// that end together: the newcomer's is short by what the request brings in `setup`, the time
     /// the newcomer's takes to answer, at its pace (that of the fastest request under way before
-    /// it has one); none under `min_bytes`, which would not pay a request of its own. As a steal,
+    /// it has one), and by no less than a request was seen to take (see `ChunkManager::setup`); none
+    /// under `min_bytes`, which would not pay a request of its own. As a steal,
     /// it truncates each chunk, whose request keeps asking for that half until the newcomer's is
     /// answered (see [`ChunkManager::run_on`]). The first chunk ever halved is kept as the first
     /// stream (see [`ChunkManager::rejoin`]). How many requests have work.
     pub(crate) fn halve(&mut self, newcomers: usize, min_bytes: u64, setup: Duration) -> usize {
-        let now = Instant::now();
+        let (now, setup) = (Instant::now(), setup.max(self.setup));
         let pace = |c: &Chunk| c.pace(now, None).map(|(_, rate)| rate);
         let fastest = self.chunks.iter().filter(|c| c.is_in_flight()).filter_map(pace).fold(0.0, f64::max);
         let given = |c: &Chunk| c.unreceived().saturating_sub((pace(c).unwrap_or(fastest) * setup.as_secs_f64()) as u64) / 2;
@@ -831,11 +848,15 @@ impl ChunkManager {
     /// newcomer's is dropped, its answer thrown away, see [`Chunk::answered`]). So no piece is left
     /// without a request that asked for it, as one refused after its stream ended would be, to
     /// wait out the host's rest. While the download `widening`, over one no worker has taken yet
-    /// too, which the newcomers would; else that waits its turn as any other. Whether it goes on.
-    pub(crate) fn run_on(&mut self, id: usize, widening: bool) -> bool {
-        let Some(chunk) = self.chunks.get(id).filter(|c| c.is_in_flight() && !c.revoked.is_cancelled()) else { return false };
+    /// too, which the newcomers would; else that waits its turn as any other. Only for the worker
+    /// whose attempt the chunk still is (`mine`, as it holds it). Whether it goes on.
+    pub(crate) fn run_on(&mut self, mine: &Chunk, widening: bool) -> bool {
+        let Some(chunk) = self.chunks.get(mine.id).filter(|c| c.is_in_flight() && Arc::ptr_eq(&c.attempt, &mine.attempt) && !c.revoked.is_cancelled())
+        else {
+            return false;
+        };
         let end = chunk.end_offset.load(Ordering::SeqCst);
-        self.take_after(id, end + 1, widening, true) > end
+        self.take_after(mine.id, end + 1, widening, true) > end
     }
 
     /// Merges into chunk `id` the pieces right after its end that start by `reach`, as far as its
@@ -845,6 +866,9 @@ impl ChunkManager {
     fn take_after(&mut self, id: usize, reach: u64, fresh: bool, back: bool) -> u64 {
         let asked = self.chunks[id].attempt.lock().asked;
         let mut end = self.chunks[id].end_offset.load(Ordering::SeqCst);
+        let now = Instant::now();
+        // How long the request of a piece taken back had waited for its answer.
+        let mut waited = Duration::ZERO;
         while let Some(next) = self.chunks.iter().position(|c| {
             c.range.start == end + 1
                 && c.range.end <= asked
@@ -857,6 +881,7 @@ impl ChunkManager {
                         let attempt = c.attempt.lock();
                         attempt.answered.is_none() && c.current_offset.load(Ordering::SeqCst) <= c.range.start && {
                             c.revoked.cancel();
+                            waited = waited.max(c.assigned_at.map_or(Duration::ZERO, |sent| now.saturating_duration_since(sent)));
                             true
                         }
                     }
@@ -867,6 +892,11 @@ impl ChunkManager {
             self.chunks[next].status = ChunkStatus::Merged;
             self.completed += 1;
             self.retry_queue.retain(|&queued| queued != next);
+        }
+        // A take-back is a measure: a new request takes longer than that to answer, so every later
+        // cut and steal leaves the request it splits more of its own (see `ChunkManager::setup`).
+        if !waited.is_zero() {
+            self.setup = (2 * waited).max(2 * self.setup);
         }
         let chunk = &mut self.chunks[id];
         chunk.range.end = end;
@@ -1117,7 +1147,7 @@ mod tests {
         assert_eq!(manager.chunks().len(), 1);
 
         // Worker 0 takes the only chunk and writes 2MB of it.
-        let work = manager.get_next_work(0, 0).unwrap();
+        let work = answering(&mut manager, 0, 0);
         assert_eq!(work.id, 0);
         work.current_offset.store(2 * MB, Ordering::SeqCst);
 
@@ -1142,9 +1172,12 @@ mod tests {
         let (victim, _) = manager.steal_work(2, 0, MB).unwrap();
         assert_eq!(victim, 1);
 
-        // An assigned chunk that has received nothing (e.g. stuck before headers) is stealable too.
+        // One whose request has no answer yet (stuck before headers, say) is not: the thief's would
+        // wait as long, and the piece go back to it (see `run_on`). Once answered, it is.
         let mut manager = ChunkManager::new(4 * MB, 4 * MB).unwrap();
-        manager.get_next_work(0, 0).unwrap();
+        let waiting = manager.get_next_work(0, 0).unwrap();
+        assert!(manager.steal_work(1, 0, MB).is_none());
+        waiting.answered(Instant::now());
         assert!(manager.steal_work(1, 0, MB).is_some());
     }
 
@@ -1213,11 +1246,11 @@ mod tests {
 
     #[test]
     fn test_a_chunk_without_a_rate_is_timed_by_what_a_request_to_its_mirror_costs() {
-        // Assigned to slow mirror 1 and still waiting for its answer: it is expected to start after
+        // Assigned to slow mirror 1 and answered, nothing in yet: it is expected to go on after
         // 0.5 s at 0.5 MB/s. A thief on mirror 0 starts after 0.1 s at 2 MB/s. Both finish after
         // 1.78 s: the victim with 0.64 MB, the thief with 3.36 MB.
         let mut manager = ChunkManager::new(4 * MB, 4 * MB).unwrap();
-        manager.get_next_work(0, 1).unwrap();
+        answering(&mut manager, 0, 1);
         let mirrors = [cost(0.1, 2.0 * MB as f64), cost(0.5, 0.5 * MB as f64)];
         let (_, stolen) = manager.steal_work(1, 0, timed(64 * 1024, &mirrors)).unwrap();
         let split = (0.64 * MB as f64) as u64;
@@ -1253,8 +1286,14 @@ mod tests {
         // request that starts after 0.3 s and then moves 2 MiB/s, as the straggler does.
         let mut manager = one_victim(20 * MB, 2 * MB, 1);
         let mirror = [cost(0.3, 2.0 * MB as f64)];
-        let victims: Vec<usize> =
-            (1..=7).map(|thief| manager.steal_work(thief, 0, timed(64 * 1024, &mirror)).unwrap().0).collect();
+        // Each thief's request is answered at once, nothing in yet.
+        let victims: Vec<usize> = (1..=7)
+            .map(|thief| {
+                let (victim, stolen) = manager.steal_work(thief, 0, timed(64 * 1024, &mirror)).unwrap();
+                stolen.answered(Instant::now());
+                victim
+            })
+            .collect();
         // The second thief finds the straggler, not the first thief's chunk that has yet to start,
         // still the one to finish last.
         assert_eq!(victims[..2], [0, 0], "{victims:?}");
@@ -1484,7 +1523,7 @@ mod tests {
         };
         // No answer yet: the stream takes the piece back, and the newcomer's answer is thrown away.
         let (mut manager, stream, newcomer) = cut();
-        assert!(manager.run_on(stream.id, false));
+        assert!(manager.run_on(&stream, false));
         assert_eq!(stream.end_offset.load(Ordering::SeqCst), 10 * MB - 1);
         assert!(newcomer.revoked.is_cancelled() && !newcomer.answered(Instant::now()));
         manager.mark_completed(stream.id).unwrap();
@@ -1492,28 +1531,72 @@ mod tests {
         // Answered first: the piece is the newcomer's.
         let (mut manager, stream, newcomer) = cut();
         assert!(newcomer.answered(Instant::now()));
-        assert!(!manager.run_on(stream.id, true));
+        assert!(!manager.run_on(&stream, true));
         assert_eq!(stream.end_offset.load(Ordering::SeqCst), 5 * MB - 1);
         // Refused: the piece waits out the rest unless the stream that asked for it reaches it.
         let (mut manager, stream, newcomer) = cut();
         manager.mark_failed(newcomer.id, "HTTP 429", Duration::from_secs(6), false).unwrap();
-        assert!(manager.run_on(stream.id, false));
+        assert!(manager.run_on(&stream, false));
         assert!(manager.get_next_work(2, 0).is_none(), "nothing is left to ask for");
         // A request that asked for less does not take it.
         let (mut manager, stream, _) = cut();
         stream.asked(5 * MB - 1);
-        assert!(!manager.run_on(stream.id, true));
+        assert!(!manager.run_on(&stream, true));
         // One no worker has taken yet waits its turn, unless the download widens.
         let mut manager = ChunkManager::new(10 * MB, 10 * MB).unwrap();
         let stream = manager.get_next_work(0, 0).unwrap();
         stream.asked(10 * MB - 1);
         manager.halve(1, 64 * 1024, Duration::ZERO);
-        assert!(!manager.run_on(stream.id, false) && manager.run_on(stream.id, true));
+        assert!(!manager.run_on(&stream, false) && manager.run_on(&stream, true));
     }
 
-    /// However splits, answers, refusals, take-backs, finishes and failures follow one another,
-    /// the chunks tile the file (no gap, no overlap), every piece not done is under a request
-    /// under way that asked for it or waits to be asked for, and the file completes.
+    /// A worker whose attempt was handed over (here its request asked for again, and the second
+    /// answered first) runs on over nothing: the chunk is the new owner's, as `rejoin` holds.
+    #[test]
+    fn test_a_worker_whose_attempt_was_handed_over_runs_on_over_nothing() {
+        let mut manager = ChunkManager::new(10 * MB, 5 * MB).unwrap();
+        let old = manager.get_next_work(0, 0).unwrap();
+        old.asked(10 * MB - 1);
+        let hedge = manager.hedge(|_| Duration::ZERO, |_, _| true).unwrap();
+        let thief = manager.claim(&hedge, 1, 0).unwrap();
+        thief.asked(10 * MB - 1);
+        assert!(!manager.run_on(&old, true));
+        assert_eq!(manager.chunks()[1].status, ChunkStatus::Unassigned, "the next piece is nobody's yet");
+        assert!(manager.run_on(&thief, true), "the new owner's request goes on over it");
+    }
+
+    /// A piece taken back from a newcomer with no answer (after 1 s) is a measure: a new request
+    /// takes at least twice that. The next cut leaves the stream what it brings meanwhile, and no
+    /// steal splits a request done within twice that, nor one whose request has no answer.
+    #[test]
+    fn test_a_take_back_tells_how_long_a_new_request_takes() {
+        let mut manager = ChunkManager::new(20 * MB, 20 * MB).unwrap();
+        let stream = manager.get_next_work(0, 0).unwrap();
+        stream.asked(20 * MB - 1);
+        stream.answered(Instant::now());
+        manager.halve(1, 64 * 1024, Duration::ZERO);
+        let newcomer = manager.get_next_work(1, 0).unwrap();
+        manager.backdate(newcomer.id, Duration::from_secs(1));
+        // 1 MB/s: 10 MB in its first 10 s, at the piece before the newcomer's answer.
+        manager.backdate(stream.id, Duration::from_secs(10));
+        stream.current_offset.store(10 * MB, Ordering::SeqCst);
+        assert!(manager.run_on(&stream, false));
+        assert!(newcomer.revoked.is_cancelled());
+        assert!(manager.setup >= Duration::from_secs(2), "{:?}", manager.setup);
+        // 10 MB left: the newcomer's half is short by the 2 MB the stream brings meanwhile.
+        assert_eq!(manager.halve(1, 64 * 1024, Duration::ZERO), 1);
+        let second = manager.get_next_work(2, 0).unwrap();
+        let given = second.range.len();
+        assert!((3_900_000..=4 * MB).contains(&given), "{given}");
+        // 3 MB left at 1.3 MB/s, done within twice 2 s: not split, nor the newcomer with no answer.
+        stream.current_offset.store(13 * MB, Ordering::SeqCst);
+        assert!(manager.steal_work(3, 0, 64 * 1024).is_none());
+    }
+
+    /// However splits, steals, take-overs, second requests, merges, hand-backs, answers, refusals,
+    /// take-backs, finishes and failures follow one another, the chunks tile the file (no gap, no
+    /// overlap), every piece not done is under a request under way that asked for it or waits to
+    /// be asked for, and the file completes.
     #[test]
     fn test_the_chunks_tile_the_file_whatever_comes_in_whatever_order() {
         let size = 4 * MB;
@@ -1526,27 +1609,32 @@ mod tests {
                 (state % n as u64) as usize
             };
             let mut manager = ChunkManager::new(size, size).unwrap();
-            // The attempts under way, as their workers hold them.
-            let mut live: Vec<Chunk> = Vec::new();
-            let take = |manager: &mut ChunkManager, live: &mut Vec<Chunk>| {
-                if let Some(chunk) = manager.get_next_work(live.len(), 0) {
-                    chunk.asked(chunk.end_offset.load(Ordering::SeqCst));
-                    live.push(chunk);
+            // The attempts under way, as their workers hold them, and the next worker's id.
+            let (mut live, mut workers): (Vec<Chunk>, usize) = (Vec::new(), 0);
+            let ask = |chunk: Chunk, live: &mut Vec<Chunk>| {
+                chunk.asked(chunk.end_offset.load(Ordering::SeqCst));
+                live.push(chunk);
+            };
+            let take = |manager: &mut ChunkManager, live: &mut Vec<Chunk>, workers: &mut usize| {
+                *workers += 1;
+                if let Some(chunk) = manager.get_next_work(*workers, 0) {
+                    ask(chunk, live);
                 }
             };
-            take(&mut manager, &mut live);
+            take(&mut manager, &mut live, &mut workers);
             for step in 0..60 {
-                // A worker whose piece was taken back drops its request.
-                live.retain(|c| !c.revoked.is_cancelled() || manager.chunks()[c.id].status != ChunkStatus::Merged);
+                // A worker whose attempt was revoked (its piece taken back, or taken over) stops
+                // at once and settles nothing.
+                live.retain(|c| !c.revoked.is_cancelled());
                 let pick = |roll: &mut dyn FnMut(usize) -> usize, live: &[Chunk], answered: bool| {
                     let some: Vec<usize> = (0..live.len()).filter(|&i| live[i].has_answer() == answered).collect();
                     (!some.is_empty()).then(|| some[roll(some.len())])
                 };
-                match roll(7) {
+                match roll(12) {
                     0 => {
                         manager.halve(1 + roll(3), 64 * 1024, Duration::from_millis(roll(3) as u64 * 100));
                     }
-                    1 => take(&mut manager, &mut live),
+                    1 => take(&mut manager, &mut live, &mut workers),
                     2 => {
                         if let Some(i) = pick(&mut roll, &live, false) {
                             if !live[i].answered(Instant::now()) {
@@ -1561,7 +1649,7 @@ mod tests {
                                 let to = pos + 1 + roll((end - pos + 1) as usize) as u64;
                                 live[i].received(to);
                                 live[i].current_offset.store(to, Ordering::SeqCst);
-                            } else if !manager.run_on(id, roll(2) == 0) {
+                            } else if !manager.run_on(&live[i], roll(2) == 0) {
                                 manager.mark_completed(id).unwrap();
                                 live.remove(i);
                             }
@@ -1573,11 +1661,32 @@ mod tests {
                             manager.strand_nothing([None, Some(Duration::from_secs(1))][roll(2)]);
                         }
                     }
-                    _ => {
+                    6 => {
                         if let Some(i) = pick(&mut roll, &live, true) {
                             manager.mark_failed(live.remove(i).id, "cut", Duration::ZERO, false).unwrap();
                         }
                     }
+                    7 => {
+                        workers += 1;
+                        if let Some((_, stolen)) = manager.steal_work(workers, 0, 64 * 1024) {
+                            ask(stolen, &mut live);
+                        }
+                    }
+                    8 => {
+                        workers += 1;
+                        if let Some(taken) = manager.take_over_silent(workers, 0, |_| Duration::ZERO) {
+                            ask(taken, &mut live);
+                        }
+                    }
+                    9 => {
+                        workers += 1;
+                        let hedge = manager.hedge(|_| Duration::ZERO, |_, _| true);
+                        if let Some(claimed) = hedge.and_then(|hedge| manager.claim(&hedge, workers, 0)) {
+                            ask(claimed, &mut live);
+                        }
+                    }
+                    10 => manager.merge_pending(1 + roll(3)),
+                    _ => manager.give_back(roll(workers + 1)),
                 }
                 let mut tiles: Vec<ByteRange> = manager.chunks().iter().filter(|c| c.status != ChunkStatus::Merged).map(|c| c.range).collect();
                 tiles.sort_by_key(|r| r.start);
@@ -1598,13 +1707,13 @@ mod tests {
                     Some(chunk) => {
                         chunk.answered(Instant::now());
                         chunk.current_offset.store(chunk.end_offset.load(Ordering::SeqCst) + 1, Ordering::SeqCst);
-                        if manager.run_on(chunk.id, true) {
+                        if manager.run_on(&chunk, true) {
                             live.push(chunk);
                         } else {
                             manager.mark_completed(chunk.id).unwrap();
                         }
                     }
-                    None => take(&mut manager, &mut live),
+                    None => take(&mut manager, &mut live, &mut workers),
                 }
             }
             assert_eq!(manager.completed_ranges(), [ByteRange::new(0, size - 1).unwrap()], "seed {seed}");
@@ -1632,6 +1741,7 @@ mod tests {
         let rest = manager.get_next_work(4, 0).unwrap();
         assert_eq!((rest.id, rest.range), (refused.id, ByteRange::new(3 * MB + 1000, 10 * MB - 1).unwrap()));
         assert!(manager.get_next_work(5, 0).is_none());
+        rest.answered(Instant::now());
         let (victim, stolen) = manager.steal_work(5, 0, MB).unwrap();
         assert_eq!(victim, rest.id);
         for id in [running.id, later.id, rest.id, stolen.id] {
@@ -1864,6 +1974,7 @@ mod tests {
             chunk.current_offset.store(chunk.range.end + 1, Ordering::SeqCst);
             manager.mark_completed(chunk.id).unwrap();
         }
+        live.answered(Instant::now());
         let (victim, stolen) = manager.steal_work(2, 0, 64 * 1024).unwrap();
         assert_eq!((victim, stolen.range.end), (live.id, MB - 1));
         assert_eq!(live.end_offset.load(Ordering::SeqCst), stolen.range.start - 1);
@@ -1884,7 +1995,7 @@ mod tests {
     #[test]
     fn test_victim_past_split_still_tiles_file() {
         let mut manager = ChunkManager::new(4 * MB, 4 * MB).unwrap();
-        let victim = manager.get_next_work(0, 0).unwrap();
+        let victim = answering(&mut manager, 0, 0);
         let (_, stolen) = manager.steal_work(1, 0, MB).unwrap();
         // The victim's worker raced past the split point before seeing the truncation.
         victim.current_offset.store(3 * MB, Ordering::SeqCst);

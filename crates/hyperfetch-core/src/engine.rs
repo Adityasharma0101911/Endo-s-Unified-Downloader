@@ -104,6 +104,12 @@ const SNAPSHOT_INTERVAL: Duration = Duration::from_millis(150);
 /// Bytes a single stream gathers before writing and hashing them on a blocking thread.
 const STREAM_BATCH: usize = 1024 * 1024;
 const PERSIST_INTERVAL: Duration = Duration::from_secs(2);
+/// A ranged download's resume state is saved with every byte in once its file's check has taken
+/// this long, so that a kill while it is checked does not download it again. A check over
+/// sooner never saves it: that save waits for the disk to hold the whole file first, on a fast
+/// local link as long as the download took. A stop saves it, at any time. Not a file whose pieces
+/// may be fetched again (a metalink's, or other mirrors'): its check marks them in the state.
+const SAVE_WHILE_CHECKED: Duration = Duration::from_millis(500);
 /// Time constant of the smoothed speed shown to the user.
 const SPEED_TAU_SECS: f64 = 2.0;
 const DEFAULT_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
@@ -689,6 +695,9 @@ pub struct DownloadEngine {
     /// Its file passed its checks and took its name (see `finalize`): a stop that came after
     /// takes nothing from it.
     finished: Arc<AtomicBool>,
+    /// The save of its resume state with every byte in that a ranged download leaves `finalize`,
+    /// which makes it only while the file is checked (see `SAVE_WHILE_CHECKED`).
+    last_save: Arc<Mutex<Option<StateSave>>>,
     /// The hosts that had refused a request within `hosts::BANNED_FOR` when this download began
     /// asking: one that refuses it too refused another download (see `hosts::refused_in_download`).
     refused_before: Arc<Mutex<Vec<hosts::HostKey>>>,
@@ -744,6 +753,7 @@ impl DownloadEngine {
                     reused: Arc::default(),
                     site: Arc::default(),
                     finished: Arc::default(),
+                    last_save: Arc::default(),
                     refused_before: Arc::default(),
                 },
             },
@@ -770,6 +780,7 @@ impl DownloadEngine {
             reused: Arc::default(),
             site: Arc::default(),
             finished: Arc::default(),
+            last_save: Arc::default(),
             refused_before: Arc::default(),
         }
     }
@@ -3364,7 +3375,9 @@ impl DownloadEngine {
                         // one newcomer its far half, the ramp set before any of them may go (see
                         // `Ramp::widen_from`).
                         let was = width.load(Ordering::Relaxed);
-                        if next > was {
+                        // No cut without a newcomer for it: once the widening ended before its
+                        // last step, the far halves stay with the requests that stream them.
+                        if next > was && job.ramp.may_widen() {
                             let setup = job.setup();
                             let newcomers = job.chunks.lock().halve(next - was, MIN_STEAL, setup);
                             job.ramp.widen_from(was, newcomers);
@@ -3464,17 +3477,21 @@ impl DownloadEngine {
         }
         let _ = blocking(hosts::save).await;
 
-        // Every byte on disk before the state says so, also when they are all in: stopped while
-        // its file is checked, the download only checks it again when it runs again.
-        saved(job.save()).await;
         match outcome {
+            // Its state with every byte is saved only while its file is checked (see
+            // `SAVE_WHILE_CHECKED`).
             Ok(()) => {
+                *self.last_save.lock() = Some(job.to_save());
                 let mut site = self.site.lock();
                 site.copies = crate::range::merge_ranges(std::mem::take(&mut *from_copies.lock()));
                 site.primary = Some(reference.url.clone());
                 Ok(job.writer)
             }
-            Err(e) => Err(e),
+            // Every byte on disk before the state says so.
+            Err(e) => {
+                saved(job.save()).await;
+                Err(e)
+            }
         }
     }
 
@@ -3762,8 +3779,9 @@ impl DownloadEngine {
     /// `crate::digest::finish`), marks it as downloaded from the internet (see
     /// `PostOptions::mark_of_the_web`), moves it to its final name and records it in history,
     /// with the server's `etag`. Until that verdict the file keeps its partial name and its resume
-    /// state, so a download stopped meanwhile only checks it again when it runs again, and a file
-    /// that fails is never seen under its name. Its snapshots say when every byte is in and it is
+    /// state, which says every byte is in once the check took a while or the download is stopped
+    /// (see `SAVE_WHILE_CHECKED`), so a download stopped meanwhile only checks it again when it
+    /// runs again, and a file that fails is never seen under its name. Its snapshots say when every byte is in and it is
     /// being checked ([`EngineSnapshot::checking`]), and when it has nothing more to send to any
     /// host ([`EngineSnapshot::place_free`]). The claim on the name is released only once the file
     /// is in place (or discarded). With `replace` (see `DownloadOptions::only_if_newer`) it takes
@@ -3793,17 +3811,41 @@ impl DownloadEngine {
             let site = self.site.lock();
             !site.primary_only && !site.copies.is_empty()
         };
-        let verified = self.verify_written(&part, written, &self.cancel_token).await;
         let quiet = || {
             if !refetch {
                 emit(snapshot_tx, || checking(true));
             }
         };
-        let blake3_hex = match crate::digest::finish(&part, verified, &self.options, &self.site, writer, &self.cancel_token, quiet).await {
+        let check = async {
+            let verified = self.verify_written(&part, written, &self.cancel_token).await;
+            crate::digest::finish(&part, verified, &self.options, &self.site, writer, &self.cancel_token, quiet).await
+        };
+        // The state with every byte in, saved once the check has taken a while (see
+        // `SAVE_WHILE_CHECKED`), and by a file that stays for another try. Not while pieces may be
+        // fetched again: the check marks them missing in the state itself.
+        let last = self.last_save.lock().take();
+        let mut saving = None;
+        let checked = match last.as_ref().filter(|_| !refetch) {
+            None => check.await,
+            Some(last) => {
+                tokio::pin!(check);
+                tokio::select! {
+                    checked = &mut check => checked,
+                    () = tokio::time::sleep(SAVE_WHILE_CHECKED) => {
+                        saving = Some(last.start());
+                        check.await
+                    }
+                }
+            }
+        };
+        let blake3_hex = match checked {
             Ok(hash) => hash,
             Err(Unfinished::Wrong(e)) => {
                 // Resuming would only reproduce the same bytes, so start from scratch next time.
                 let _ = blocking(move || {
+                    if let Some(last) = last {
+                        last.give_up();
+                    }
                     let _ = std::fs::remove_file(&part);
                     let _ = DownloadState::remove(&state_path);
                     drop(claim);
@@ -3814,6 +3856,7 @@ impl DownloadEngine {
             // The `.part` and its state stay: run again, the download checks it again. One whose
             // state could not be saved would only be passed over, and goes.
             Err(Unfinished::Io(e)) => {
+                save_kept(last, saving).await;
                 let _ = blocking(move || {
                     if !state_path.is_file() {
                         let _ = std::fs::remove_file(&part);
@@ -3832,6 +3875,10 @@ impl DownloadEngine {
         // Marked before it has a name anything opens it by (post-processing marks it again).
         let mark = self.urls.first().filter(|_| self.options.post.mark_of_the_web).cloned();
         let (target, size) = blocking(move || {
+            // Its state goes, not to be written again by the save under way.
+            if let Some(last) = last {
+                last.give_up();
+            }
             if let Some(source) = mark {
                 crate::postprocess::mark_from_internet(&part, &source);
             }
@@ -4725,14 +4772,16 @@ impl RangeJob {
         let mut seen = std::collections::HashSet::new();
         let cap = urls.iter().filter(|url| seen.insert(HostKey::of(url))).map(|url| hosts::profile(url).connection_cap).sum();
         let (now, left) = (Instant::now(), size.saturating_sub(downloaded));
-        // Refused while it widened: once every request it sent has its answer, it keeps the
-        // connections the host took (see `Ramp::refused`).
+        // Refused while it widened, or its newcomers answered too late twice: once every request
+        // it sent has its answer, it keeps the connections the host took (see `Ramp::refused`,
+        // `Ramp::taken_back`).
         if self.ramp.untaken() {
             let (answered, all) = {
                 let chunks = self.chunks.lock();
                 (chunks.answered(), chunks.chunks().iter().filter(|c| c.is_in_flight()).count())
             };
-            return self.ramp.took(answered == all).then(|| pilot.took(answered)).flatten();
+            let refused = self.ramp.by_refusal();
+            return self.ramp.took(answered == all).then(|| if refused { pilot.took(answered) } else { pilot.answered_late(answered) }).flatten();
         }
         // The rate its connections are held to, once the stream's watch (see `Watched`) saw it,
         // and what a new connection to it takes, as its recipe says, else the first request.
@@ -4813,18 +4862,59 @@ impl RangeJob {
     }
 
     /// Snapshots the written ranges, then on a blocking thread makes those bytes durable and
-    /// records exactly those ranges. The flush goes through a handle of its own, so the workers'
-    /// writes go on meanwhile.
+    /// records exactly those ranges (see [`StateSave`]).
     fn save(&self) -> tokio::task::JoinHandle<Result<(), String>> {
+        self.to_save().start()
+    }
+
+    /// A save of the state with the ranges written by now.
+    fn to_save(&self) -> StateSave {
         let mut state = self.state.clone();
         state.completed_ranges = self.chunks.lock().completed_ranges();
-        let (writer, path) = (self.writer.clone(), self.state_path.clone());
+        StateSave { state, path: self.state_path.clone(), writer: self.writer.clone(), over: Arc::default() }
+    }
+}
+
+/// A ranged download's resume state as it was when taken, to be saved once the bytes it says are
+/// written are on disk: they are flushed first, through a handle of the writer's own, so the
+/// workers' writes go on meanwhile.
+struct StateSave {
+    state: DownloadState,
+    path: PathBuf,
+    writer: DiskWriter,
+    /// Set once the state file is no longer wanted (see [`StateSave::give_up`]).
+    over: Arc<Mutex<bool>>,
+}
+
+impl StateSave {
+    /// Saves it on a blocking thread.
+    fn start(&self) -> tokio::task::JoinHandle<Result<(), String>> {
+        let (state, path, writer, over) = (self.state.clone(), self.path.clone(), self.writer.clone(), self.over.clone());
         tokio::task::spawn_blocking(move || {
             #[cfg(test)]
             let _slowed = tests::slow_save(&path);
             writer.sync_separately().map_err(|e| e.to_string())?;
+            let over = over.lock();
+            if *over {
+                return Ok(());
+            }
             state.save_atomic(&path).map_err(|e| e.to_string())
         })
+    }
+
+    /// Keeps it from writing the state file from now on, which the caller is about to delete (its
+    /// file took its name, or is wrong); a flush under way goes on, not waited for. Blocking.
+    fn give_up(&self) {
+        *self.over.lock() = true;
+    }
+}
+
+/// Saves `last`, the state with every byte in, or waits for `saving`, its save under way (see
+/// `DownloadEngine::finalize`): a file left for another try keeps a state that says all of it is
+/// there.
+async fn save_kept(last: Option<StateSave>, saving: Option<tokio::task::JoinHandle<Result<(), String>>>) {
+    if let Some(save) = saving.or_else(|| last.as_ref().map(StateSave::start)) {
+        saved(save).await;
     }
 }
 
@@ -6412,9 +6502,9 @@ fn put_in_place(part: &Path, final_path: PathBuf, state_path: &Path, by_content:
     let named = if by_content { crate::sniff::named_by_content(part, final_path.clone()) } else { final_path.clone() };
     let target = if named.exists() && !(replace && named == final_path) { free_path(&named) } else { named };
     let size = std::fs::metadata(part).map(|m| m.len()).map_err(|e| e.to_string())?;
-    // Made sparse to be preallocated (see `DiskWriter::open_or_create`), now written in full.
-    crate::storage::unsparse(part);
     std::fs::rename(part, &target).map_err(|e| format!("Failed to move {} to {}: {}", part.display(), target.display(), e))?;
+    // Made sparse to be preallocated (see `DiskWriter::open_or_create`), now written in full.
+    crate::storage::unsparse_later(&target);
     if let Err(e) = DownloadState::remove(state_path) {
         tracing::warn!("Failed to remove {}: {}", state_path.display(), e);
     }
@@ -9983,6 +10073,28 @@ mod tests {
         assert!(longest < SLOW - Duration::from_secs(1), "the snapshots waited {longest:?} for a save");
     }
 
+    /// A download whose check is over at once waits for no save of its state with every byte in,
+    /// which would first wait for the disk to hold the whole file (slowed to 3 s here): none is
+    /// made, and its state goes with the file in place.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_quick_check_waits_for_no_save() {
+        const MIB: usize = 1024 * 1024;
+        const SLOW: Duration = Duration::from_secs(3);
+        let base = rate_server(4 * MIB, 64e6, "").await;
+        let dir = tempdir().unwrap();
+        SLOW_SAVES.lock().push((dir.path().to_path_buf(), SLOW, 0, 0));
+        let target = dir.path().join("f.bin");
+        let options =
+            DownloadOptions { output_path: Some(target.clone()), num_connections: 4, adaptive: false, remote_checksum: false, ..Default::default() };
+        let started = Instant::now();
+        let done = DownloadEngine::new(vec![base.join("f.bin").unwrap()], options).run(None).await.unwrap();
+        assert!(started.elapsed() < SLOW, "it waited {:?}", started.elapsed());
+        let saves = SLOW_SAVES.lock().iter().find(|e| e.0 == dir.path()).map(|e| e.2).unwrap();
+        assert_eq!(saves, 0, "a save was made");
+        assert!(!DownloadState::state_file_path(&part_path(&target)).exists());
+        assert_eq!(std::fs::metadata(done).unwrap().len(), 4 * MIB as u64);
+    }
+
     /// An adaptive download opens one more connection while that pays; a fixed one keeps to the
     /// connections the probe chose (five here: one per MiB). Each connection held to 320 KB/s in
     /// 16 KiB pieces, about one each 50 ms, steady over any window the Autopilot reads: not 64 KiB
@@ -10525,6 +10637,106 @@ mod tests {
             let width = format!("{} connections: the server refused more at once", gets - refused);
             assert!(said.last().is_some_and(|(_, line)| line.starts_with(&width)), "{at}");
         }
+    }
+
+    /// A request whose answer ends short of what it asked for (the second connection's, for 8 to
+    /// 16 MiB, answered to 14 MiB): once the user widens to 4, that request reaches its cut before
+    /// the newcomer's answer (held 2.5 s), and does not take back a piece its answer will not
+    /// bring. The newcomer brings it, and nothing is asked for again from 14 MiB, as it would be
+    /// had the request taken the piece and left its far end behind.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_request_takes_back_no_piece_its_answer_will_not_bring() {
+        let (size, mib) = (16 * 1024 * 1024, 1024 * 1024);
+        let held = Duration::from_millis(2500);
+        let server = crate::netsim::Server {
+            size,
+            per_connection: Some(4e6),
+            short: Some((1, 14 * mib - 1)),
+            hold: vec![(3, held), (4, held)],
+            ..Default::default()
+        };
+        let (url, stats) = crate::netsim::serve(server).await;
+        let dir = tempdir().unwrap();
+        let live = Arc::new(OwnLimits::default());
+        let engine = DownloadEngine::new(vec![url.clone()], DownloadOptions { remote_checksum: false, ..sim_options(dir.path(), 2, false) }).with_live(Arc::clone(&live));
+        let started = Instant::now();
+        let run = tokio::spawn(async move { engine.run(None).await });
+        while !run.is_finished() && started.elapsed() < Duration::from_secs(30) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            if stats.gets.load(Ordering::SeqCst) >= 3 && live.connections().is_none() {
+                live.set_connections(Some(4));
+            }
+        }
+        let got = std::fs::read(run.await.unwrap().unwrap()).unwrap();
+        assert!(got == crate::netsim::file(size), "{}", stats.wire());
+        assert!(stats.wire().contains("GET bytes=8388608-16777215 -> 206 (GET 1, 6291456 bytes)"), "{}", stats.wire());
+        assert!(!stats.wire().contains(&format!("GET bytes={}-", 14 * mib)), "{}", stats.wire());
+    }
+
+    /// After a refused step, the user asks for more connections: nothing is cut that no newcomer
+    /// would take, so nothing more is sent to the host that refused (5 GETs: the probe, the two
+    /// connections' pieces, the step's two), and no piece waits out its 6 s rest.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_more_connections_asked_after_a_refusal_send_nothing() {
+        let size = 16 * 1024 * 1024;
+        let server = crate::netsim::Server { size, per_connection: Some(4e6), refuse: vec![3], refusal: (429, Some(6)), ..Default::default() };
+        let (url, stats) = crate::netsim::serve(server).await;
+        let dir = tempdir().unwrap();
+        let live = Arc::new(OwnLimits::default());
+        let engine = DownloadEngine::new(vec![url.clone()], DownloadOptions { remote_checksum: false, ..sim_options(dir.path(), 2, false) }).with_live(Arc::clone(&live));
+        let started = Instant::now();
+        let run = tokio::spawn(async move { engine.run(None).await });
+        let (mut wider, mut more) = (false, false);
+        while !run.is_finished() && started.elapsed() < Duration::from_secs(30) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            if !wider && stats.gets.load(Ordering::SeqCst) >= 3 {
+                live.set_connections(Some(4));
+                wider = true;
+            }
+            if !more && stats.refused.load(Ordering::SeqCst) >= 1 {
+                live.set_connections(Some(8));
+                more = true;
+            }
+        }
+        let got = std::fs::read(run.await.unwrap().unwrap()).unwrap();
+        let took = started.elapsed();
+        assert!(got == crate::netsim::file(size) && more, "{}", stats.wire());
+        assert_eq!((stats.gets.load(Ordering::SeqCst), stats.refused.load(Ordering::SeqCst)), (5, 1), "{}", stats.wire());
+        assert!(took < Duration::from_secs(6), "{took:?}\n{}", stats.wire());
+    }
+
+    /// A host that holds every request after the first 1.5 s, longer than the stream takes to
+    /// reach a newcomer's piece: each newcomer's piece is taken back, which tells how long a new
+    /// request takes. The second ends the widening, and no cut or steal follows that a request
+    /// would not pay: at most 3 GETs (the stream, the one more, one step), however wide it may go.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_host_slow_to_answer_new_requests_is_not_asked_again_and_again() {
+        let size = 8 * 1024 * 1024;
+        let hold = (1..200).map(|n| (n, Duration::from_millis(1500))).collect();
+        let server = crate::netsim::Server { size, per_connection: Some(4e6), hold, ..Default::default() };
+        let (url, stats) = crate::netsim::serve(server).await;
+        let dir = tempdir().unwrap();
+        let (got, said) = fetch_told(&url, sim_options(dir.path(), 8, true)).await;
+        let at = told(&said, &stats);
+        assert!(got == crate::netsim::file(size), "{at}");
+        assert!(stats.gets.load(Ordering::SeqCst) <= 3, "{at}");
+    }
+
+    /// The same host, the Autopilot off at 2 connections: the one that ends first steals from the
+    /// other, whose request reaches the stolen piece before the thief's answer. That take-back
+    /// tells how long a new request takes, and no steal follows that would not pay: at most 4
+    /// GETs (the probe, the two pieces, one steal).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_host_slow_to_answer_new_requests_is_not_stolen_from_again_and_again() {
+        let size = 8 * 1024 * 1024;
+        let hold = (3..200).map(|n| (n, Duration::from_millis(1500))).collect();
+        let server = crate::netsim::Server { size, per_connection: Some(4e6), hold, ..Default::default() };
+        let (url, stats) = crate::netsim::serve(server).await;
+        let dir = tempdir().unwrap();
+        let (got, said) = fetch_told(&url, sim_options(dir.path(), 2, false)).await;
+        let at = told(&said, &stats);
+        assert!(got == crate::netsim::file(size), "{at}");
+        assert!(stats.gets.load(Ordering::SeqCst) <= 4, "{at}");
     }
 
     /// A host that shares 4 MB/s among a client's connections: the one more beside the first
@@ -11775,6 +11987,7 @@ mod tests {
         assert_ne!(std::fs::metadata(part_path(&target)).unwrap().file_attributes() & SPARSE, 0, "the .part is sparse");
         let claim = Claim::try_take(&target).unwrap().unwrap();
         let done = engine_with(DownloadOptions::default()).finalize(target, claim, Written::Writer(writer), unix_now(), &None, None, false).await;
+        crate::storage::finish_clears();
         assert_eq!(std::fs::metadata(done.unwrap()).unwrap().file_attributes() & SPARSE, 0);
     }
 
