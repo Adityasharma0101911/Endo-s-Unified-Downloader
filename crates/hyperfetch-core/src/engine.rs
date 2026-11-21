@@ -2691,6 +2691,8 @@ impl DownloadEngine {
         // An older version given, or the file -N replaces when it is named: a delta may run.
         let replacing = self.options.only_if_newer && self.options.output_path.as_deref().is_some_and(Path::is_file);
         let (limit, delta) = (self.options.max_connections_per_host, self.options.delta_from.is_some() || replacing);
+        // A file stopped while it was checked has nothing to fetch: none of its start either.
+        let delta = delta || self.holds_all(urls.first()).await;
         // Whether the first mirror's start is being read, and whether the download went ahead
         // without its answer, which then has no start to read.
         let (reading, started) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
@@ -2989,13 +2991,30 @@ impl DownloadEngine {
                 .map_err(|e| format!("Failed to write {}: {}", part.display(), e))?;
                 Written::Digest(digest)
             }
-            Some(size) if reference.accepts_ranges => {
+            Some(size) if reference.accepts_ranges || all_there(&state.completed_ranges, size) => {
                 let probes = Probed { reference, mirrors, live, late };
                 let writer =
                     self.fetch_ranges(client, size, probes, state, &part, &state_path, &final_path, &snapshot_tx).await?;
                 Written::Writer(writer)
             }
-            _ => Written::Digest(self.fetch_stream(&client, &reference, live, &part, &final_path, &snapshot_tx).await?),
+            _ => {
+                let digest = self.fetch_stream(&client, &reference, live, &part, &final_path, &snapshot_tx).await?;
+                // All there, once on disk: stopped while it is checked, it is checked again (see
+                // `plan_target`). Without it, it is downloaded again: no reason to fail it.
+                if let Some(size) = reference.size.filter(|&size| size > 0) {
+                    let (mut state, path, part) = (state, state_path.clone(), part.clone());
+                    state.completed_ranges = ByteRange::from_len(0, size).into_iter().collect();
+                    let saved = blocking(move || {
+                        std::fs::OpenOptions::new().write(true).open(&part)?.sync_data()?;
+                        state.save_atomic(&path).map_err(std::io::Error::other)
+                    })
+                    .await?;
+                    if let Err(e) = saved {
+                        tracing::warn!("Could not save the state of {}: {}", part_path(&final_path).display(), e);
+                    }
+                }
+                Written::Digest(digest)
+            }
         };
         let done = this.finalize(final_path, claim, written, started_at, &snapshot_tx, etag, replace).await?;
         if let Some(modified) = modified {
@@ -4011,6 +4030,19 @@ impl DownloadEngine {
         }
         emit(&snapshot_tx, || done_snapshot(entry.size, &path));
         Ok(path)
+    }
+
+    /// Whether the `.part` the file at `url` most likely goes to (by its name in the link) holds
+    /// all of it (see `plan_target`).
+    async fn holds_all(&self, url: Option<&Url>) -> bool {
+        let Some(name) = url.and_then(filename_from_url) else { return false };
+        let part = part_path(&self.output_path_for(&name));
+        blocking(move || {
+            let state = DownloadState::load_from_path(&DownloadState::state_file_path(&part)).ok().flatten();
+            state.is_some_and(|s| all_there(&s.completed_ranges, s.file_size) && std::fs::metadata(&part).is_ok_and(|m| m.len() == s.file_size))
+        })
+        .await
+        .unwrap_or(false)
     }
 
     fn output_path_for(&self, filename: &str) -> PathBuf {
@@ -6017,13 +6049,17 @@ fn plan_target(
                     let same_file = remote.size.is_none_or(|size| size == state.file_size)
                         && validators_compatible(&state, remote)
                         && std::fs::metadata(&part).map(|m| m.len()).ok() == Some(state.file_size);
-                    if same_file && remote.accepts_ranges {
+                    // All of it there has nothing to fetch, ranges or not, when the server's
+                    // validators say it is the same file.
+                    let complete = all_there(&state.completed_ranges, state.file_size);
+                    if same_file && (remote.accepts_ranges || complete && remote.size.is_some() && validators_tell(&state, remote)) {
                         return Ok(Plan::Fetch { final_path: candidate, resume: Some(Box::new(state)), claim });
                     }
                     // Downloaded bytes go only once they are proven stale, or the probe brought the
                     // whole file anyway: without range support now, they may still resume later.
+                    // All of it, the server unable to tell whether it changed, is downloaded again.
                     let whole_file_fetched = remote.size == Some(remote.prefetch.len() as u64);
-                    if same_file && !state.completed_ranges.is_empty() && !whole_file_fetched {
+                    if same_file && !state.completed_ranges.is_empty() && !whole_file_fetched && !complete {
                         return Err(format!(
                             "{} does not accept range requests right now, so the partial download {} cannot \
                              resume; it was kept. Try again later, or delete it to download from the start.",
@@ -6135,6 +6171,20 @@ fn migrate_legacy(candidate: &Path, part: &Path, remote: &ProbeInfo, urls: &[Str
     std::fs::rename(candidate, part).map_err(fail)?;
     std::fs::rename(&legacy_state, DownloadState::state_file_path(part)).map_err(fail)?;
     Ok(true)
+}
+
+/// Whether `ranges` hold every byte of a file of `size` bytes.
+fn all_there(ranges: &[ByteRange], size: u64) -> bool {
+    size > 0 && ByteRange::new(0, size - 1).is_ok_and(|all| crate::range::merge_ranges(ranges.to_vec()) == [all])
+}
+
+/// Whether the server says the file is the one `state` was saved for: the same ETag, or with no
+/// ETag on both sides the same Last-Modified. Neither on both sides tells nothing.
+fn validators_tell(state: &DownloadState, remote: &ProbeInfo) -> bool {
+    match (state.etag.as_deref(), remote.etag.as_deref()) {
+        (Some(a), Some(b)) => a == b,
+        _ => matches!((state.last_modified.as_deref(), remote.last_modified.as_deref()), (Some(a), Some(b)) if a == b),
+    }
 }
 
 /// If both sides have an ETag they must match; otherwise, if both have Last-Modified, those must.

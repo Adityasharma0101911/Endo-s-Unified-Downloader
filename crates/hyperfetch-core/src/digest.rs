@@ -827,6 +827,10 @@ mod tests {
         pace: Duration,
         /// Sidecars are refused with 429.
         sidecars_refused: bool,
+        /// The file is answered whole, 200, whatever range is asked for.
+        no_ranges: bool,
+        /// Bytes of the file's body sent so far.
+        served: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     /// Serves `content` at `/dir/file.bin` (HEAD, GET and ranges) and `site.files` beside it, any
@@ -865,7 +869,8 @@ mod tests {
                         tokio::time::sleep(Duration::from_secs(60)).await;
                         return;
                     }
-                    let resp = if path == "/dir/file.bin" {
+                    let range = range.filter(|_| !site.no_ranges);
+                    let (resp, body) = if path == "/dir/file.bin" {
                         let (s, e) = range.unwrap_or((0, len - 1));
                         let mut body = content[s as usize..=e as usize].to_vec();
                         if let Some(bad) = site.damaged_once.as_ref().filter(|_| method != "head") {
@@ -878,24 +883,22 @@ mod tests {
                             }
                         }
                         let status = if range.is_some() { "206 Partial Content" } else { "200 OK" };
-                        let mut head = format!("HTTP/1.1 {status}\r\nAccept-Ranges: bytes\r\nContent-Length: {}\r\n", body.len());
+                        let ranges = if site.no_ranges { "" } else { "Accept-Ranges: bytes\r\n" };
+                        let mut head = format!("HTTP/1.1 {status}\r\n{ranges}Content-Length: {}\r\n", body.len());
                         if range.is_some() {
                             head += &format!("Content-Range: bytes {s}-{e}/{len}\r\n");
                         }
                         for line in &site.headers {
                             head += &format!("{line}\r\n");
                         }
-                        let mut resp = (head + "Connection: close\r\n\r\n").into_bytes();
-                        if method != "head" {
-                            resp.extend_from_slice(&body);
-                        }
-                        resp
+                        let body = if method == "head" { Vec::new() } else { body };
+                        ((head + "Connection: close\r\n\r\n").into_bytes(), body)
                     } else {
                         let waiting = busy.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                         site.sidecars_at_once.fetch_max(waiting, std::sync::atomic::Ordering::SeqCst);
                         tokio::time::sleep(site.sidecars_wait).await;
                         busy.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                        match site.files.iter().find(|(p, _, _)| p.to_ascii_lowercase() == path) {
+                        let resp = match site.files.iter().find(|(p, _, _)| p.to_ascii_lowercase() == path) {
                             _ if site.sidecars_refused => {
                                 b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
                             }
@@ -904,13 +907,18 @@ mod tests {
                                     .into_bytes()
                             }
                             None => b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
-                        }
+                        };
+                        (resp, Vec::new())
                     };
-                    for piece in resp.chunks(if site.pace.is_zero() { resp.len().max(1) } else { 64 * 1024 }) {
+                    if sock.write_all(&resp).await.is_err() {
+                        return;
+                    }
+                    for piece in body.chunks(if site.pace.is_zero() { body.len().max(1) } else { 64 * 1024 }) {
                         tokio::time::sleep(site.pace).await;
                         if sock.write_all(piece).await.is_err() {
                             return;
                         }
+                        site.served.fetch_add(piece.len(), std::sync::atomic::Ordering::SeqCst);
                     }
                     let _ = sock.shutdown().await;
                 });
@@ -1275,16 +1283,27 @@ mod tests {
     }
 
     /// A download stopped while its file is checked keeps the file under its partial name with its
-    /// resume state, all of it there; run again, it only checks the file again: no request for its
-    /// bytes but the probe's (its HEAD and the file's start), and no second copy.
+    /// resume state, all of it there, also one that came as one stream from a server without
+    /// ranges; run again, it only checks the file again, and no second copy. Of the file's body the
+    /// server sends a byte for the probe; one without ranges answers that with the file, of which
+    /// the download takes nothing.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_download_stopped_while_it_is_checked_only_checks_again() {
+        for no_ranges in [false, true] {
+            stopped_while_checked(no_ranges).await;
+        }
+    }
+
+    async fn stopped_while_checked(no_ranges: bool) {
         let data = content(2 * MIB);
         let dir = tempfile::tempdir().unwrap();
         let wait = Duration::from_secs(2);
         let files = vec![("/dir/file.bin.sha256".to_string(), "text/plain".to_string(), sha256_hex(&data))];
-        // 64 KiB a piece every 5 ms: about 160 ms for the file over one connection.
-        let site = Site { files, sidecars_wait: wait, pace: Duration::from_millis(5), ..Site::default() };
+        // 64 KiB a piece every 5 ms: about 160 ms for the file over one connection. The ETag tells
+        // a server without ranges has the same file.
+        let headers = vec!["ETag: \"v1\"".to_string()];
+        let site = Site { files, headers, sidecars_wait: wait, pace: Duration::from_millis(5), no_ranges, ..Site::default() };
+        let served = Arc::clone(&site.served);
         let (url, log) = serve(data.clone(), site).await;
         let options = || DownloadOptions { output_path: Some(dir.path().join("")), ..DownloadOptions::default() };
         let (tx, mut rx) = broadcast::channel::<EngineSnapshot>(1024);
@@ -1308,15 +1327,22 @@ mod tests {
         assert_eq!(crate::range::merge_ranges(state.completed_ranges), [ByteRange::new(0, data.len() as u64 - 1).unwrap()]);
         assert!(!dir.path().join("file.bin").exists());
 
-        let before = log.lock().unwrap().len();
-        let (done, checked) = download(vec![url], dir.path(), options()).await;
+        let before = (log.lock().unwrap().len(), served.load(std::sync::atomic::Ordering::SeqCst));
+        let (done, checked) = tokio::time::timeout(Duration::from_secs(60), download(vec![url], dir.path(), options())).await.expect("done in a minute");
         assert_eq!(done.unwrap(), dir.path().join("file.bin"));
         assert_eq!(checked.as_deref(), Some("the site's SHA-256"));
         assert_eq!(std::fs::read(dir.path().join("file.bin")).unwrap(), data);
         let left: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
         assert_eq!(left, ["file.bin"], "no second copy");
-        let asked: Vec<_> = log.lock().unwrap()[before..].iter().filter(|(path, _)| path == "/dir/file.bin").cloned().collect();
-        assert!(asked.iter().all(|(_, range)| range.is_none_or(|(start, _)| start == 0)), "only the probe's: {asked:?}");
+        let asked: Vec<_> = log.lock().unwrap()[before.0..].iter().filter(|(path, _)| path == "/dir/file.bin").cloned().collect();
+        // A HEAD beside it asks no range.
+        let gets: Vec<_> = asked.iter().filter(|(_, range)| range.is_some()).collect();
+        assert_eq!(gets, [&("/dir/file.bin".to_string(), Some((0, 0)))], "the probe's byte alone: {asked:?}");
+        let sent = served.load(std::sync::atomic::Ordering::SeqCst) - before.1;
+        match no_ranges {
+            false => assert_eq!(sent, 1, "the probe's byte"),
+            true => assert!(sent < data.len(), "{sent} of {} bytes: not downloaded again", data.len()),
+        }
     }
 
     /// A newer version that fails the site's checksum, with `only_if_newer` (or a delta from the
