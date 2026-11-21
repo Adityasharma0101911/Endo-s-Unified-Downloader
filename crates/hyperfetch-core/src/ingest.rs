@@ -955,7 +955,9 @@ pub fn descriptor_client(proxy: Option<&str>) -> Result<reqwest::Client, String>
     let mut builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(15))
         .timeout(Duration::from_secs(60))
-        .user_agent(resolver::APP_USER_AGENT);
+        .user_agent(resolver::APP_USER_AGENT)
+        // The answer a saved page's check for local addresses looked at is the one dialed.
+        .dns_resolver(std::sync::Arc::new(crate::dial::KeptNames));
     if let Some(proxy) = proxy {
         builder = builder.proxy(reqwest::Proxy::all(proxy).map_err(|e| format!("invalid proxy: {}", e))?);
     }
@@ -1576,6 +1578,24 @@ d6:lengthi4e4:pathl5:y.bineee4:name4:root12:piece lengthi16384e6:pieces20:aaaaaa
         assert_eq!(decode_text(&utf16be).unwrap(), "é");
         assert!(decode_text(&[0xFF, 0xFE, 0x41]).is_err());
         assert!(decode_text(&[0xC3]).is_err());
+    }
+
+    /// The command line saves a page through this client: it dials the answer kept for a name,
+    /// the one the page's check for local addresses looked at, not one of its own asking.
+    #[tokio::test]
+    async fn the_descriptor_client_dials_the_kept_answer() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let _ = socket.read(&mut [0u8; 1024]).await;
+                let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").await;
+            }
+        });
+        crate::dial::keep_name("kept.ingest.invalid", vec![[127, 0, 0, 1].into()]);
+        let answer = descriptor_client(None).unwrap().get(format!("http://kept.ingest.invalid:{port}/")).send().await;
+        assert_eq!(answer.expect("dialed the kept answer").text().await.unwrap(), "ok");
     }
 
     /// Fetching through the proxy is tested against a mock proxy in the integration tests.
