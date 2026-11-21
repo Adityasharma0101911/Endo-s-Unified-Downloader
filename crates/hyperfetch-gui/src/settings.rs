@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
@@ -6,6 +7,7 @@ use hyperfetch_core::history::DownloadHistoryManager;
 use hyperfetch_core::ingest::ListOptions;
 use hyperfetch_core::media::{is_supported_media_site, BrowserCookieSource, MediaQualityPreset};
 use hyperfetch_core::postprocess::{Category, PostOptions};
+use hyperfetch_core::quality::{self, MediaPick};
 use hyperfetch_core::{check_name_pattern, check_pattern, AudioSpec, TrackChoice};
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -59,6 +61,11 @@ pub struct Settings {
     pub cookies_path: String,
     pub proxy: String,
     pub media_preset: usize,
+    /// The quality last chosen on a media card of each site, kept as a rule (see
+    /// `quality::MediaPick`) by its site (see `quality::site`): over `media_preset` for its links.
+    /// Beside the speed rules per site, not among them: those the user types, and they limit
+    /// every download of a site; these come from the card, for its media alone.
+    pub media_picks: BTreeMap<String, MediaPick>,
     pub browser_cookies: usize,
     /// Speed cap in KB/s or MB/s (see `max_speed_in_mb`); 0 means unlimited.
     pub max_speed: f64,
@@ -347,6 +354,7 @@ impl Default for Settings {
             cookies_path: String::new(),
             proxy: String::new(),
             media_preset: 0,
+            media_picks: BTreeMap::new(),
             browser_cookies: 0,
             max_speed: 0.0,
             max_speed_in_mb: true,
@@ -457,6 +465,22 @@ fn history_path() -> PathBuf {
     DownloadHistoryManager::default_history_path()
 }
 
+/// The quality rule of a media link at `url`: the one kept for its site in `picks` (see
+/// `Settings::media_picks`), else the Quality setting `preset`'s (see [`MEDIA_PRESETS`]).
+pub fn media_rule(picks: &BTreeMap<String, MediaPick>, preset: usize, url: &Url) -> MediaPick {
+    let named = |text: &str| MediaPick::parse(text).unwrap_or_default();
+    match picks.get(&quality::site(url)) {
+        Some(pick) => pick.clone(),
+        None => match preset {
+            1 => named("1080p"),
+            2 => named("720p"),
+            3 => named("mp3"),
+            4 => named("m4a"),
+            _ => MediaPick::default(),
+        },
+    }
+}
+
 /// A file of the GUI's own, stored next to the download history.
 pub fn app_file(name: &str) -> PathBuf {
     #[cfg(test)]
@@ -504,6 +528,8 @@ impl Settings {
             settings.google_api_key = key;
         }
         settings.site_rules = settings.site_rules.into_iter().map(SiteRule::in_range).collect();
+        // A hand-edited file's: only a rule that passes the check.
+        settings.media_picks.retain(|_, pick| pick.formats.is_none() && pick.check().is_ok());
         settings
     }
 
@@ -523,12 +549,16 @@ impl Settings {
         if save_dir.is_empty() {
             return Err("Choose a folder to save downloads to".to_string());
         }
-        let quality = match self.media_preset {
-            1 => MediaQualityPreset::Fhd1080p,
-            2 => MediaQualityPreset::Hd720p,
-            3 => MediaQualityPreset::AudioMp3,
-            4 => MediaQualityPreset::AudioM4a,
-            _ => MediaQualityPreset::BestVideoAudio,
+        // The rule kept for the site, over the Quality setting.
+        let quality = match urls.first().and_then(|url| self.media_picks.get(&quality::site(url))) {
+            Some(pick) => MediaQualityPreset::Pick(pick.clone()),
+            None => match self.media_preset {
+                1 => MediaQualityPreset::Fhd1080p,
+                2 => MediaQualityPreset::Hd720p,
+                3 => MediaQualityPreset::AudioMp3,
+                4 => MediaQualityPreset::AudioM4a,
+                _ => MediaQualityPreset::BestVideoAudio,
+            },
         };
         // A preset sends every non-file URL to yt-dlp, so it is only set for known media sites;
         // any other link that turns out to be media takes the quality all the same.
@@ -735,6 +765,16 @@ impl Settings {
     /// The user's rule for `url`'s site: the first that takes it (see [`SiteRule`]).
     pub fn site_rule(&self, url: &Url) -> Option<&SiteRule> {
         self.site_rules.iter().find(|rule| rule.takes(url))
+    }
+
+    /// The quality rule of a media link at `url` (see [`media_rule`]).
+    pub fn media_pick(&self, url: &Url) -> MediaPick {
+        media_rule(&self.media_picks, self.media_preset, url)
+    }
+
+    /// Keeps `pick`, chosen on a media card of `url`, as the rule for its site.
+    pub fn remember_pick(&mut self, url: &Url, pick: &MediaPick) {
+        self.media_picks.insert(quality::site(url), pick.rule());
     }
 
     /// Whether to reduce motion: as set, else as the system's animation setting says.
@@ -1003,6 +1043,32 @@ mod tests {
         let partial: Settings = serde_json::from_str(r#"{"connections": 4}"#).unwrap();
         assert_eq!(partial.connections, 4);
         assert_eq!(partial.max_retries, Settings::default().max_retries);
+    }
+
+    /// A media card's choice is kept for its site as a rule, without the link's formats, over the
+    /// Quality setting for that site's links alone; one a hand-edited file spoils is dropped.
+    #[test]
+    fn a_sites_media_pick_wins_over_the_quality_setting() {
+        let mut settings = Settings { save_dir: "dl".into(), media_preset: 3, ..Settings::default() };
+        let (video, other) = (Url::parse("https://youtu.be/x").unwrap(), Url::parse("https://vimeo.com/1").unwrap());
+        let pick = |text: &str| MediaPick::parse(text).unwrap();
+        assert_eq!(settings.media_pick(&video), pick("mp3"));
+        let chosen = MediaPick { formats: Some("399+251".into()), ..pick("1080p:av1") };
+        settings.remember_pick(&Url::parse("https://www.youtube.com/watch?v=y").unwrap(), &chosen);
+        assert_eq!(settings.media_picks.iter().collect::<Vec<_>>(), [(&"youtube.com".to_string(), &pick("1080p:av1"))]);
+        assert_eq!((settings.media_pick(&video), settings.media_pick(&other)), (pick("1080p:av1"), pick("mp3")));
+        let rule = Some(MediaQualityPreset::Pick(pick("1080p:av1")));
+        let opts = settings.download_options(std::slice::from_ref(&video), "", "").unwrap();
+        assert_eq!((&opts.media_preset, &opts.page_media_preset), (&rule, &rule));
+        assert_eq!(settings.download_options(&[other], "", "").unwrap().media_preset, Some(MediaQualityPreset::AudioMp3));
+
+        let dir = tempfile::tempdir().unwrap();
+        crate::tests::OWN_DATA_DIR.with(|own| *own.borrow_mut() = Some(dir.path().to_path_buf()));
+        settings.media_picks.insert("bad.example".into(), MediaPick { language: Some("de]/b".into()), ..Default::default() });
+        settings.media_picks.insert("ids.example".into(), chosen);
+        settings.save().unwrap();
+        assert_eq!(Settings::load().media_picks.keys().collect::<Vec<_>>(), ["youtube.com"]);
+        crate::tests::OWN_DATA_DIR.with(|own| *own.borrow_mut() = None);
     }
 
     /// Listing and media settings saved by an older version take their defaults, and reach the

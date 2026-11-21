@@ -17,6 +17,7 @@ use std::time::Duration;
 use eframe::egui;
 use hyperfetch_core::engine::DownloadOptions;
 use hyperfetch_core::queue::{DownloadQueue, QueueItemStatus};
+use hyperfetch_core::quality::MediaPick;
 use hyperfetch_core::{engine, media, torrent, updater};
 use serde_json::json;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -151,6 +152,13 @@ pub struct MediaChoice {
     pub playlist: bool,
     /// Record a live stream from its start.
     pub live_from_start: bool,
+    /// A quality from the card's picker, as the command line writes it ("1080p:av1@de", see
+    /// `quality::MediaPick::parse`), over `quality`.
+    pub pick: Option<String>,
+    /// The formats the card showed for `pick` (yt-dlp ids, "399+251"), for the one video alone.
+    pub formats: Option<String>,
+    /// The user chose `pick` on the card: it is kept for the link's site.
+    pub remember: bool,
 }
 
 impl MediaChoice {
@@ -176,7 +184,17 @@ impl MediaChoice {
         if self.sections.len() > MAX_SECTIONS || !self.sections.iter().all(clip) {
             return Err(format!("media.sections takes at most {} [start, end] pairs with 0 ≤ start < end ≤ 86400", MAX_SECTIONS));
         }
-        Ok(())
+        if let Some(pick) = &self.pick {
+            MediaPick::parse(pick).map_err(|e| format!("media.pick: {e}"))?;
+        }
+        MediaPick { formats: self.formats.clone(), ..Default::default() }.check().map_err(|e| format!("media.formats: {e}"))
+    }
+
+    /// The quality the picker chose: with the formats it showed for the one video, without them
+    /// for its whole list (they differ from video to video).
+    pub fn media_pick(&self) -> Option<MediaPick> {
+        let pick = MediaPick::parse(self.pick.as_deref()?).ok()?;
+        Some(MediaPick { formats: self.formats.clone().filter(|_| !self.playlist), ..pick })
     }
 }
 
@@ -491,7 +509,7 @@ impl Server {
                 Ok((url, payload)) => {
                     let proxy = lock(&PROXY).clone();
                     match media_info(&url, payload.cookies_file(&url), proxy).await {
-                        Ok(info) => reply("200 OK", json!(info)),
+                        Ok(info) => reply("200 OK", info_reply(&url, info)),
                         Err(e) => Response::error("422 Unprocessable Entity", allow_origin.clone(), &e),
                     }
                 }
@@ -733,6 +751,35 @@ pub fn set_queue(queue: &DownloadQueue) {
     *lock(&QUEUE) = listed.collect();
 }
 
+/// `/info`'s answer about `url`: what it holds, and what the quality rule of its site (else the
+/// Quality setting, see [`set_media_rules`]) takes of its qualities, as `media.pick` names it,
+/// with the formats it is and what the card says when it is not the rule's own (`taken`).
+fn info_reply(url: &Url, info: media::MediaInfo) -> serde_json::Value {
+    let mut reply = json!(info);
+    if let Some(qualities) = &info.qualities {
+        let rule = {
+            let rules = lock(&MEDIA_RULES);
+            crate::settings::media_rule(&rules.0, rules.1, url)
+        };
+        let (taken, note) = qualities.take(&rule);
+        reply["taken"] = json!({"pick": taken.to_string(), "formats": taken.formats, "note": note});
+    }
+    reply
+}
+
+/// The quality kept per site and the Quality setting, which `/info` resolves (see
+/// [`set_media_rules`]).
+static MEDIA_RULES: Mutex<(BTreeMap<String, MediaPick>, usize)> = Mutex::new((BTreeMap::new(), 0));
+
+/// Keeps the quality rules `/info` resolves as the settings have them now: the one kept per site
+/// (`Settings::media_picks`) and the Quality setting (`Settings::media_preset`).
+pub fn set_media_rules(picks: &BTreeMap<String, MediaPick>, preset: usize) {
+    let mut shared = lock(&MEDIA_RULES);
+    if shared.0 != *picks || shared.1 != preset {
+        *shared = (picks.clone(), preset);
+    }
+}
+
 /// The proxy setting, which `/info` asks yt-dlp through (see [`set_proxy`]).
 static PROXY: Mutex<Option<String>> = Mutex::new(None);
 
@@ -754,11 +801,15 @@ async fn media_info(url: &Url, cookies: Option<String>, proxy: Option<String>) -
 }
 
 /// A stand-in for `media::info` that runs no yt-dlp and saves no cookies: it tells what it was
-/// asked with, and fails for a link to `fail.example`.
+/// asked with, fails for a link to `fail.example`, and gives the 4K sample's listing for a link
+/// that names it.
 #[cfg(test)]
 async fn media_info(url: &Url, cookies: Option<String>, proxy: Option<String>) -> Result<media::MediaInfo, String> {
     if url.host_str() == Some("fail.example") {
         return Err("Sign in to confirm your age.".to_string());
+    }
+    if url.as_str().contains("sample4k60") {
+        return Ok(media::media_info(&serde_json::from_str(include_str!("../../hyperfetch-core/tests/data/media-4k60.json")).unwrap()));
     }
     Ok(media::MediaInfo { title: url.to_string(), uploader: cookies, thumbnail: proxy, ..Default::default() })
 }
@@ -1241,6 +1292,23 @@ mod tests {
         let too_big = format!("POST /info HTTP/1.1\r\nContent-Length: {}\r\n\r\n", MAX_INFO_BODY + 1);
         assert_eq!(parts(&exchange(&server, too_big.as_bytes()).await).0, "HTTP/1.1 413 Payload Too Large");
         assert!(received.try_recv().is_err(), "nothing is added");
+        assert!(info.get("taken").is_none(), "nothing to choose from");
+
+        // The qualities from the same answer, and what the site's rule takes of them: the nearest
+        // height below its own, said.
+        let picks = BTreeMap::from([("youtube.com".to_string(), MediaPick::parse("1200p:h264").unwrap())]);
+        set_media_rules(&picks, 0);
+        let body = br#"{"url":"https://youtu.be/sample4k60"}"#;
+        let response = exchange(&server, &request("POST", "/info", ext, Some(body))).await;
+        let (status, info) = parts(&response);
+        assert_eq!((status, &info["title"], &info["qualities"]["heights"][0]["p"]), ("HTTP/1.1 200 OK", &json!("A 4K film at 60 fps"), &json!(2160)));
+        assert_eq!(info["qualities"]["heights"][2]["options"][0], json!({
+            "id": "399", "codec": "AV1", "fps": 60, "hdr": false, "size": {"bytes": 124_386_876, "exact": true}, "has_audio": false,
+        }));
+        assert_eq!(info["taken"], json!({"pick": "1080p:h264", "formats": "299+251", "note": "No 1200p here: 1080p is taken"}));
+        set_media_rules(&BTreeMap::new(), 3);
+        let response = exchange(&server, &request("POST", "/info", ext, Some(body))).await;
+        assert_eq!(parts(&response).1["taken"], json!({"pick": "mp3", "formats": "251", "note": null}), "the Quality setting");
     }
 
     /// `/expired` lists the downloads whose link expired, to the extension alone. `/relink` gives
@@ -1321,8 +1389,15 @@ mod tests {
             sponsorblock: Some("remove".into()),
             playlist: true,
             live_from_start: true,
+            ..Default::default()
         };
         assert_eq!(add(full).unwrap().media, Some(expected));
+        // The picker's choice: a quality as the command line writes it, and the formats shown.
+        let picked = add(json!({"pick": "1080p:av1@de", "formats": "399+251-1", "remember": true})).unwrap().media.unwrap();
+        let expected = MediaPick { formats: Some("399+251-1".into()), ..MediaPick::parse("1080p:av1@de").unwrap() };
+        assert_eq!((picked.media_pick(), picked.remember), (Some(expected), true));
+        let whole = add(json!({"pick": "mp3", "formats": "251", "playlist": true})).unwrap().media.unwrap();
+        assert_eq!(whole.media_pick(), Some(MediaPick::parse("mp3").unwrap()), "a list's videos have formats of their own");
         assert_eq!(add(json!({})).unwrap().media, Some(MediaChoice::default()));
         assert_eq!(parse_add(br#"{"url":"https://a.example/v"}"#).unwrap().media, None);
         for quality in QUALITIES {
@@ -1349,6 +1424,11 @@ mod tests {
             (json!({"sections": [90, 150]}), "invalid JSON"),
             (json!({"quality": 1080}), "invalid JSON"),
             (json!({"format": "bv*"}), "unknown field"),
+            (json!({"pick": "1080"}), "media.pick"),
+            (json!({"pick": "1080p:xvid"}), "media.pick"),
+            (json!({"pick": "best@de]/b"}), "media.pick"),
+            (json!({"formats": "399/b"}), "media.formats"),
+            (json!({"formats": "399+251 --exec x"}), "media.formats"),
         ] {
             let error = add(refused.clone()).unwrap_err();
             assert!(error.contains(why), "{refused}: {error}");

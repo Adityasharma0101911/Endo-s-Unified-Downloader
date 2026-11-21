@@ -610,6 +610,38 @@ fn site_rules(s: &mut Settings, ui: &mut Ui) {
     }
 }
 
+/// The quality kept for each site from its media cards (see `Settings::media_picks`), a line each
+/// under the row with Forget, after which the site's links take the Quality setting again. Beside
+/// the speed rules per site, not among them: those are typed here and hold every download of a
+/// site; these come from the card and hold its media alone.
+fn media_picks(s: &mut Settings, ui: &mut Ui) {
+    if s.media_picks.is_empty() {
+        return;
+    }
+    let about = "Chosen last on a video's card, and taken for the site's other videos: that height, else the nearest below.";
+    let mut shown = false;
+    setting(ui, "Quality per site", about, s.media_picks.len(), |_| shown = true);
+    if !shown {
+        return;
+    }
+    let p = palette(ui);
+    let mut forget = None;
+    for (site, pick) in &s.media_picks {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(site).color(p.text));
+            ui.label(RichText::new(pick.label()).color(p.muted));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if icon_button(ui, icon::TRASH, &format!("Forget the quality kept for {site}"), true).clicked() {
+                    forget = Some(site.clone());
+                }
+            });
+        });
+    }
+    if let Some(site) = forget {
+        s.media_picks.remove(&site);
+    }
+}
+
 /// What the system's proxy switch says: what it does and, while it is on, which proxy downloads
 /// take now, as the app found it when it started.
 fn system_proxy_about(s: &Settings, seen: Option<&hyperfetch_core::sysproxy::Seen>) -> String {
@@ -818,6 +850,7 @@ fn media_settings(app: &mut App, ui: &mut Ui) {
     setting(ui, "Quality", "For videos and audio from sites like YouTube.", app.settings.media_preset, |ui| {
         combo(ui, "media_preset_combo", &mut app.settings.media_preset, &MEDIA_PRESETS);
     });
+    media_picks(&mut app.settings, ui);
     let s = &mut app.settings;
     setting(ui, "Video format", "The container a video's picture and sound are merged into.", s.merge_format, |ui| {
         combo(ui, "merge_format_combo", &mut s.merge_format, &crate::settings::MERGE_FORMATS);
@@ -1282,6 +1315,24 @@ mod tests {
         assert!(h.find("at once").is_some(), "{:?}", h.texts());
         h.click(icon::TRASH);
         assert!(h.app.settings.site_rules.is_empty());
+    }
+
+    /// The quality a site's media card kept is listed in Video and audio as it reads, and Forget
+    /// takes it out; with none kept, the row is not there.
+    #[test]
+    fn the_quality_kept_per_site_is_listed_and_forgotten() {
+        use hyperfetch_core::quality::MediaPick;
+        let mut h = Harness::new();
+        h.app.tab = Tab::Settings;
+        h.app.settings_search = "quality per site".to_string();
+        h.frames(30);
+        assert!(h.find("Quality per site").is_none());
+        h.app.settings.media_picks.insert("youtube.com".into(), MediaPick::parse("1080p:av1@de").unwrap());
+        h.frames(30);
+        assert!(h.settle());
+        assert!(h.find("youtube.com").is_some() && h.find("Up to 1080p, AV1 first, audio in de").is_some(), "{:?}", h.texts());
+        h.click(icon::TRASH);
+        assert!(h.app.settings.media_picks.is_empty());
     }
 
     /// Downloads that end while the window is not in front are told through the app's sender:

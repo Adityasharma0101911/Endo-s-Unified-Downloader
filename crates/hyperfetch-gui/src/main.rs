@@ -29,6 +29,7 @@ use hyperfetch_core::history::{DownloadHistoryManager, HistoryEntry};
 use hyperfetch_core::ingest::{self, Channel, Task};
 use hyperfetch_core::media;
 use hyperfetch_core::paste;
+use hyperfetch_core::quality::{MediaPick, Qualities};
 use hyperfetch_core::queue::{DownloadQueue, QueueItem, QueueItemStatus};
 use hyperfetch_core::relink;
 use hyperfetch_core::updater::{self, Installed, Update};
@@ -181,6 +182,8 @@ enum AppEvent {
     Tray(TrayAction),
     /// What the ZIP at `link` holds (see [`App::preview_zip`]), or why it could not be listed.
     ZipListed { link: String, result: Result<Vec<ZipEntry>, String> },
+    /// What yt-dlp told of the media link `link` for its card (see [`App::list_media`]).
+    MediaListed { link: String, result: Result<media::MediaInfo, String> },
     /// What the stream at `link` holds, for the track chooser of `item` (see [`App::list_tracks`]).
     TracksListed { item: Option<usize>, link: String, result: Result<StreamInfo, String> },
     /// The channels of the channel list `input` may be (see [`App::read_document`]): None when it
@@ -207,6 +210,21 @@ struct Twin {
     host: String,
     /// The files are the same: the offer is on its card.
     offered: bool,
+}
+
+/// The media link the Add page's card lists the qualities of (see [`App::list_media`]): what it
+/// read (None meanwhile), and the choice made on the card, with the formats it showed.
+struct MediaCard {
+    link: String,
+    listed: Option<Result<media::MediaInfo, String>>,
+    pick: Option<MediaPick>,
+}
+
+impl MediaCard {
+    /// The qualities read, when there are any to choose from.
+    fn qualities(&self) -> Option<&Qualities> {
+        self.listed.as_ref()?.as_ref().ok()?.qualities.as_ref()
+    }
 }
 
 /// The New link box of a stopped download (see `ui::queue`): what is typed in it, whether that is
@@ -490,6 +508,8 @@ struct App {
     /// The ZIP link the Add page lists the contents of, and what it holds once read, each file
     /// with whether it is ticked to download (see [`App::download_zip_entries`]).
     zip_preview: Option<(String, Option<Result<Vec<(ZipEntry, bool)>, String>>)>,
+    /// The qualities of the media link in the link box (see [`App::list_media`]).
+    media_card: Option<MediaCard>,
     /// Keep a saved page's scripts (the link bar's More options), for this session.
     keep_scripts: bool,
     /// The link of the page being saved as one file (see [`App::save_page`]).
@@ -667,6 +687,7 @@ impl App {
             taskbar_shown: None,
             batch_failed: false,
             zip_preview: None,
+            media_card: None,
             keep_scripts: false,
             saving_page: None,
             tracks: None,
@@ -697,6 +718,38 @@ impl App {
             });
             AppEvent::ZipListed { link, result }
         });
+    }
+
+    /// Reads the qualities of media link `url` for its card, through the proxy and with the
+    /// cookies file of the settings: one run of yt-dlp, its answer kept 10 minutes (see
+    /// `media::info`), which a playlist's entries are not each asked of.
+    fn list_media(&mut self, url: Url) {
+        let link = url.to_string();
+        self.media_card = Some(MediaCard { link: link.clone(), listed: None, pick: None });
+        let given = |text: &str| Some(text.trim().to_string()).filter(|text| !text.is_empty());
+        let (cookies, proxy) = (given(&self.settings.cookies_path).map(PathBuf::from), given(&self.settings.proxy));
+        self.spawn_event(async move {
+            let result = media_listing(&url, cookies, proxy).await;
+            AppEvent::MediaListed { link, result }
+        });
+    }
+
+    /// What a download of `urls` takes from the media card listing its first link: the choice
+    /// made there, else what the site's rule takes of what it showed, with the formats it showed;
+    /// a choice made is kept for the site (see `Settings::remember_pick`).
+    fn card_pick(&mut self, urls: &[Url], options: &mut DownloadOptions) {
+        let Some(url) = urls.first() else { return };
+        let Some(card) = self.media_card.as_ref().filter(|card| card.link == url.as_str()) else { return };
+        let Some(qualities) = card.qualities() else { return };
+        let pick = match &card.pick {
+            Some(pick) => pick.clone(),
+            None => qualities.take(&self.settings.media_pick(url)).0,
+        };
+        if card.pick.is_some() {
+            self.settings.remember_pick(url, &pick);
+            self.save_settings();
+        }
+        options.media_preset = Some(media::MediaQualityPreset::Pick(pick));
     }
 
     /// Saves the web page at `url` as one HTML file in the save folder (see `savepage`: its
@@ -899,7 +952,8 @@ impl App {
     /// Adds the download described by `text` (links to one file) with the current settings.
     fn add_download(&mut self, text: &str, checksum: &str, auth: &str) -> Result<usize, String> {
         let task = ingest::link_task(&ingest::split_tokens(text))?;
-        let options = task_options(&self.settings, &task, checksum, auth)?;
+        let mut options = task_options(&self.settings, &task, checksum, auth)?;
+        self.card_pick(&task.urls, &mut options);
         let id = queue_task(&mut self.queue, task, options);
         self.look_for_twin(id);
         Ok(id)
@@ -2134,6 +2188,11 @@ impl App {
                     *listed = Some(result.map(|entries| entries.into_iter().map(|entry| (entry, false)).collect()));
                 }
             }
+            AppEvent::MediaListed { link, result } => {
+                if let Some(card) = self.media_card.as_mut().filter(|card| card.link == link) {
+                    card.listed = Some(result);
+                }
+            }
             AppEvent::TracksListed { item, link, result } => self.tracks_listed(item, link, result),
             AppEvent::Channels { origin, input, checksum, auth, result } => self.channels_read(origin, input, checksum, auth, result),
             AppEvent::Relinked { id, urls, options, result } => self.relinked(id, urls, options, result),
@@ -2150,7 +2209,8 @@ impl App {
     /// extension saw the page fetch, whatever its path looks like (`/feed/index.m3u8`), nor one
     /// sent with the playlist the page built, of which it is only the base. A link the media card
     /// sent that is only a list is read whatever it chose; a video link that names its playlist
-    /// too is the one video, unless the card chose the list.
+    /// too is the one video, unless the card chose the list. A quality the user chose on the
+    /// card's picker is kept for the site (see `Settings::remember_pick`).
     fn add_remote(&mut self, payload: ipc::RemoteAddPayload) {
         if !payload.urls.is_empty() {
             return self.add_remote_batch(&payload);
@@ -2167,6 +2227,12 @@ impl App {
         }
         let start_now = !self.focused_item().is_some_and(|item| item.status.is_active()) && self.url_input.trim().is_empty();
         let link = Url::parse(&url).ok();
+        // A quality the user chose on the card is kept for the site.
+        let chosen = payload.media.as_ref().filter(|choice| choice.remember).and_then(ipc::MediaChoice::media_pick);
+        if let (Some(pick), Some(at)) = (chosen, &link) {
+            self.settings.remember_pick(at, &pick);
+            self.save_settings();
+        }
         // The whole list is read as the link it is: YouTube refuses `playlist?list=` for its mixes.
         let reads = match &payload.media {
             Some(choice) => ingest::needs_reading(&url) && (choice.playlist || !link.as_ref().is_some_and(media::video_in_playlist)),
@@ -2752,6 +2818,7 @@ impl eframe::App for App {
 
         ui::render(self, ctx);
         ipc::set_proxy(&self.settings.proxy);
+        ipc::set_media_rules(&self.settings.media_picks, self.settings.media_preset);
         ipc::set_queue(&self.queue);
 
         if let Some(dialog) = self.pending_dialog.take() {
@@ -2930,6 +2997,10 @@ fn choose_media(options: &mut DownloadOptions, choice: &ipc::MediaChoice) {
     if preset.is_some() {
         (options.media_preset, options.height) = (preset, None);
     }
+    // The picker's choice, over the quality.
+    if let Some(pick) = choice.media_pick() {
+        (options.media_preset, options.height) = (Some(media::MediaQualityPreset::Pick(pick)), None);
+    }
     options.merge_format = choice.container.clone().or(options.merge_format.take());
     // The card's None ("") and Off are over the Settings too.
     if let Some(subtitles) = &choice.subtitles {
@@ -2942,6 +3013,28 @@ fn choose_media(options: &mut DownloadOptions, choice: &ipc::MediaChoice) {
         options.sections = choice.sections.clone();
     }
     options.live_from_start |= choice.live_from_start;
+}
+
+/// What `media::info` tells of the media link `url`, asked through `proxy` with `cookies`.
+#[cfg(not(test))]
+async fn media_listing(url: &Url, cookies: Option<PathBuf>, proxy: Option<String>) -> Result<media::MediaInfo, String> {
+    media::info(url, cookies.as_deref(), proxy.as_deref()).await
+}
+
+/// A stand-in for `media::info` that runs no yt-dlp: the 4K sample's listing for a link that
+/// names it, an answer without formats for another, a failure for one that says "fail"; each
+/// link asked kept in [`tests::MEDIA_ASKED`].
+#[cfg(test)]
+async fn media_listing(url: &Url, _cookies: Option<PathBuf>, _proxy: Option<String>) -> Result<media::MediaInfo, String> {
+    lock(&tests::MEDIA_ASKED).push(url.to_string());
+    if url.as_str().contains("fail") {
+        return Err("Sign in to confirm your age.".to_string());
+    }
+    let found = match url.as_str().contains("sample4k60") {
+        true => include_str!("../../hyperfetch-core/tests/data/media-4k60.json"),
+        false => r#"{"title": "A list"}"#,
+    };
+    Ok(media::media_info(&serde_json::from_str(found).map_err(|e| e.to_string())?))
 }
 
 /// Queues one download; one its input named is shown under that name at once. Its target is
@@ -3557,6 +3650,9 @@ mod tests {
         assert_eq!(clear, (1, vec![]));
         assert_eq!(refresh, (2, vec![]), "the refresh reads after the clear and is numbered after it");
     }
+
+    /// The links the stand-in for `media::info` was asked about (see `media_listing`).
+    pub(crate) static MEDIA_ASKED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
     thread_local! {
         /// A test's own folder for the settings, queue and logs (see `settings::app_file`), for a
@@ -4210,6 +4306,20 @@ mod tests {
         let (checksum, auth, notes) = (String::new(), String::new(), Vec::new());
         app.handle_event(AppEvent::Read { origin: Origin::Dropped, input: channel.to_string(), checksum, auth, result: Ok(Vec::new()), notes });
         assert!(app.media_lists.is_empty() && app.queue.items().len() == 3);
+
+        // The picker's choice: the formats it showed, over the height the browser saw; kept for
+        // the site when the user made it, and not otherwise.
+        use hyperfetch_core::quality::MediaPick;
+        let one = "https://www.youtube.com/watch?v=jNQXAC9IVRw";
+        let media = serde_json::json!({"quality": "720", "pick": "1080p:vp9", "formats": "303+251"});
+        app.handle_event(remote(serde_json::json!({"url": one, "height": 720, "media": media})));
+        let item = app.queue.items().last().unwrap();
+        let pick = MediaPick { formats: Some("303+251".into()), ..MediaPick::parse("1080p:vp9").unwrap() };
+        assert_eq!((&item.options.media_preset, item.options.height), (&Some(media::MediaQualityPreset::Pick(pick)), None));
+        assert!(app.settings.media_picks.is_empty());
+        let media = serde_json::json!({"pick": "m4a@de", "formats": "140", "remember": true});
+        app.handle_event(remote(serde_json::json!({"url": "https://youtu.be/jNQXAC9IVRw", "media": media})));
+        assert_eq!(app.settings.media_picks.get("youtube.com"), Some(&MediaPick::parse("m4a@de").unwrap()));
     }
 
     /// The link grabber's batch is queued whole, each link with the page's referer and User-Agent

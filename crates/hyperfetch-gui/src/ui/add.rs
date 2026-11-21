@@ -425,8 +425,9 @@ fn preview_card(app: &mut App, ui: &mut Ui, kind: &kinds::Kind, source: &str) {
                         ui.label(RichText::new(format!("from {source}")).color(p.muted));
                     }
                 });
-                // A file's link ends in its name; a video page's ends in "watch": the site names it.
-                match shown_name(&app.url_input, kind) {
+                // A file's link ends in its name; a video page's ends in "watch": the site names it,
+                // as soon as its qualities are read.
+                match listed_title(app).or_else(|| shown_name(&app.url_input, kind)) {
                     Some(name) => {
                         ui.add(egui::Label::new(RichText::new(&name).color(p.text)).truncate()).on_hover_text(&name);
                     }
@@ -449,9 +450,10 @@ fn preview_card(app: &mut App, ui: &mut Ui, kind: &kinds::Kind, source: &str) {
             });
         });
         ui.add_space(8.0);
+        let picker = kind.choice == kinds::Choice::Quality && quality_picker(app, ui);
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
-            if kind.choice == kinds::Choice::Quality {
+            if kind.choice == kinds::Choice::Quality && !picker {
                 ui.label(RichText::new(icon::FILM_STRIP).size(16.0).color(p.muted)).on_hover_text("Quality");
                 combo(ui, "media_preset_combo", &mut app.settings.media_preset, &MEDIA_PRESETS);
             }
@@ -606,6 +608,122 @@ fn update_offer(app: &mut App, ui: &mut Ui) {
             start_from_form(app);
         }
     });
+}
+
+/// How long, in seconds, a media link stands still in the box before its qualities are read: one
+/// typed a letter at a time is read once.
+const LISTING_WAIT: f64 = 0.5;
+
+/// The link in `input` when it is a single http(s) link to a media site, whose qualities the card
+/// lists (see [`quality_picker`]).
+fn media_link(input: &str) -> Option<Url> {
+    let input = input.trim();
+    let url = Url::parse(input).ok().filter(|u| matches!(u.scheme(), "http" | "https") && !input.contains(char::is_whitespace))?;
+    media::is_supported_media_site(&url).then_some(url)
+}
+
+/// The title the site gave the media link in the box, once its qualities are read.
+fn listed_title(app: &App) -> Option<String> {
+    let url = media_link(&app.url_input)?;
+    let card = app.media_card.as_ref().filter(|card| card.link == url.as_str() && card.qualities().is_some())?;
+    Some(card.listed.as_ref()?.as_ref().ok()?.title.clone()).filter(|title| !title.is_empty())
+}
+
+/// For a media link in the box, its qualities, read once it has stood still for half a second
+/// (see `App::list_media`): a row a height, each of its codecs with its frame rate over 30, HDR
+/// and the size of its download; audio alone as the site has it, as M4A or as MP3; the audio
+/// language where there are several; and, until a choice is made, what the site's rule (else the
+/// Quality setting) took when the link lacks its own. False, with no more than a line while they
+/// are read, when there are none to show: the card then offers the Quality setting, as before.
+fn quality_picker(app: &mut App, ui: &mut Ui) -> bool {
+    use hyperfetch_core::quality::{self, AudioForm, MediaPick};
+    let Some(url) = media_link(&app.url_input) else { return false };
+    let p = palette(ui);
+    let Some(card) = app.media_card.as_ref().filter(|card| card.link == url.as_str()) else {
+        let (id, now) = (egui::Id::new("media link seen"), ui.input(|i| i.time));
+        match ui.data(|d| d.get_temp::<(String, f64)>(id)) {
+            Some((seen, at)) if seen == url.as_str() && now - at >= LISTING_WAIT => app.list_media(url),
+            Some((seen, at)) if seen == url.as_str() => ui.ctx().request_repaint_after(Duration::from_secs_f64(LISTING_WAIT - (now - at))),
+            _ => {
+                ui.data_mut(|d| d.insert_temp(id, (url.to_string(), now)));
+                ui.ctx().request_repaint_after(Duration::from_secs_f64(LISTING_WAIT));
+            }
+        }
+        return false;
+    };
+    if card.listed.is_none() {
+        ui.horizontal(|ui| {
+            anim::spinner(ui, 14.0, p.muted);
+            ui.label(RichText::new("Reading its qualities…").color(p.muted));
+        });
+        ui.add_space(4.0);
+        return false;
+    }
+    let Some(q) = card.qualities().cloned() else { return false };
+    let (taken, note) = q.take(&app.settings.media_pick(&url));
+    let made = card.pick.is_some();
+    let chosen = card.pick.clone().unwrap_or(taken);
+    let language = chosen.language.as_deref();
+    let mut clicked = None;
+    let row = |ui: &mut Ui, name: &str| {
+        ui.add_sized([62.0, 22.0], egui::Label::new(bold(name).color(p.text)));
+    };
+    for height in &q.heights {
+        ui.horizontal_wrapped(|ui| {
+            row(ui, &format!("{}p", height.p));
+            for option in &height.options {
+                let codec = quality::codec_key(&option.codec).map(str::to_string);
+                let on = chosen.audio.is_none() && chosen.up_to == Some(height.p) && chosen.codec == codec && chosen.hdr == option.hdr;
+                if ui.selectable_label(on, q.video_text(option, language)).clicked() {
+                    clicked = Some(MediaPick { up_to: Some(height.p), codec, hdr: option.hdr, language: chosen.language.clone(), ..Default::default() });
+                }
+            }
+        });
+    }
+    if !q.audio.is_empty() {
+        ui.horizontal_wrapped(|ui| {
+            row(ui, "Audio");
+            for (name, form) in [("Original", AudioForm::Original), ("M4A", AudioForm::M4a), ("MP3", AudioForm::Mp3)] {
+                let text = format!("{name} · {}", q.audio_text(form, language));
+                if ui.selectable_label(chosen.audio == Some(form), text).clicked() {
+                    clicked = Some(MediaPick { audio: Some(form), language: chosen.language.clone(), ..Default::default() });
+                }
+            }
+        });
+    }
+    if !q.languages.is_empty() {
+        let original = |code: &str| q.audio.iter().any(|a| a.original && a.language.as_deref() == Some(code));
+        let name = |code: &str| if original(code) { format!("{code} (original)") } else { code.to_string() };
+        let shown = match language {
+            Some(code) => name(code),
+            None => q.languages.iter().find(|code| original(code)).map_or_else(|| "Original".to_string(), |code| name(code)),
+        };
+        ui.horizontal(|ui| {
+            row(ui, "Language");
+            egui::ComboBox::from_id_salt("media_language").selected_text(shown).show_ui(ui, |ui| {
+                for code in &q.languages {
+                    let on = language.map_or_else(|| original(code), |language| language == code);
+                    if ui.selectable_label(on, name(code)).clicked() {
+                        clicked = Some(MediaPick { language: Some(code.clone()).filter(|code| !original(code)), ..chosen.clone() });
+                    }
+                }
+            });
+        });
+    }
+    if !made {
+        let site = quality::site(&url);
+        if app.settings.media_picks.contains_key(&site) {
+            ui.label(RichText::new(format!("As chosen last on {site}")).small().color(p.muted));
+        }
+        if let Some(note) = note {
+            ui.label(RichText::new(note).small().color(p.amber));
+        }
+    }
+    ui.add_space(4.0);
+    if let (Some(pick), Some(card)) = (clicked, app.media_card.as_mut()) {
+        card.pick = Some(q.take(&pick).0);
+    }
+    true
 }
 
 /// The link in `input` when it is a single http(s) link to a .zip, whose contents can be listed.
@@ -934,6 +1052,90 @@ mod tests {
         let kept = std::fs::read_to_string(std::path::Path::new(&h.app.settings.save_dir).join("About us (1).html")).unwrap();
         assert!(kept.contains("<script>"), "{kept}");
         h.wait_for_background();
+    }
+
+    /// A media link's card lists what the link has, from one answer of yt-dlp once the link has
+    /// stood still for half a second: the title, a row a height with its codecs and the size of
+    /// each download, audio as a choice of its own. The site's rule (else the Quality setting)
+    /// takes the nearest height below its own and says so; a choice made downloads the formats
+    /// it showed and is kept for the site. A link without qualities keeps the Quality setting.
+    #[test]
+    fn a_media_card_lists_the_qualities_the_link_has() {
+        use hyperfetch_core::media::MediaQualityPreset::Pick;
+        use hyperfetch_core::quality::MediaPick;
+        let asked = |link: &str| crate::util::lock(&crate::tests::MEDIA_ASKED).iter().filter(|asked| *asked == link).count();
+        let mut h = Harness::new();
+        h.app.settings.auto_run_queue = false;
+        h.app.settings.media_preset = 1;
+        let show = |h: &mut Harness, link: &str| {
+            h.app.url_input = link.to_string();
+            h.frames(20);
+            assert_eq!(asked(link), 0, "not before the link stands still");
+            let listing = |app: &App| app.media_card.as_ref().is_some_and(|card| card.link == link);
+            for _ in 0..60 {
+                if listing(&h.app) {
+                    break;
+                }
+                h.frames(1);
+            }
+            h.wait_for(|app| listing(app) && app.media_card.as_ref().is_some_and(|card| card.listed.is_some()));
+            assert!(h.settle());
+        };
+        let link = "https://www.youtube.com/watch?v=sample4k60";
+        show(&mut h, link);
+        let shown = |h: &Harness, text: &str| h.find(text).is_some();
+        for text in [
+            "A 4K film at 60 fps",
+            "2160p",
+            "AV1 · 60 fps · 689.2 MiB",
+            "1080p",
+            "VP9 · 60 fps · 170.6 MiB",
+            "H.264 · 60 fps · 255.4 MiB",
+            "Original · Opus 129 kbps · 9.7 MiB",
+            "M4A · AAC 129 kbps, not converted",
+            "MP3 · converted from Opus",
+        ] {
+            assert!(shown(&h, text), "{text} in {:?}", h.texts());
+        }
+        assert!(!shown(&h, MEDIA_PRESETS[1]) && !shown(&h, "Its title comes from the site once it starts"));
+
+        // What a download of the link takes; it leaves the queue, so the page keeps its look.
+        let queued = |h: &mut Harness, link: &str| {
+            let id = h.app.add_download(link, "", "").unwrap();
+            let preset = h.app.queue.get_item(id).unwrap().options.media_preset.clone();
+            h.app.queue.remove_item(id);
+            assert!(h.settle());
+            preset
+        };
+        // Untouched, the Quality setting's 1080p takes the card's first codec there, and is not kept.
+        let taken = MediaPick { formats: Some("399+251".into()), ..MediaPick::parse("1080p:av1").unwrap() };
+        assert_eq!(queued(&mut h, link), Some(Pick(taken)));
+        assert!(h.app.settings.media_picks.is_empty());
+        // Chosen, it is downloaded and kept for the site as a rule.
+        h.click("VP9 · 60 fps · 170.6 MiB");
+        let chosen = MediaPick { formats: Some("303+251".into()), ..MediaPick::parse("1080p:vp9").unwrap() };
+        assert_eq!(queued(&mut h, link), Some(Pick(chosen)));
+        assert_eq!(h.app.settings.media_picks.get("youtube.com"), Some(&MediaPick::parse("1080p:vp9").unwrap()));
+        h.click("MP3 · converted from Opus");
+        let mp3 = MediaPick { formats: Some("251".into()), ..MediaPick::parse("mp3").unwrap() };
+        assert_eq!(queued(&mut h, link), Some(Pick(mp3)));
+        assert_eq!(asked(link), 1, "one run for the link, however often its card is drawn");
+
+        // The site's rule on a link without its height: the nearest below, said.
+        h.app.settings.media_picks.insert("youtube.com".into(), MediaPick::parse("1200p:h264").unwrap());
+        let other = "https://youtu.be/sample4k60";
+        show(&mut h, other);
+        assert!(shown(&h, "As chosen last on youtube.com") && shown(&h, "No 1200p here: 1080p is taken"), "{:?}", h.texts());
+        let nearest = MediaPick { formats: Some("299+251".into()), ..MediaPick::parse("1080p:h264").unwrap() };
+        assert_eq!(queued(&mut h, other), Some(Pick(nearest)));
+
+        // Nothing to list, or the listing failed: the Quality setting, as before.
+        for link in ["https://www.youtube.com/playlist?list=sample", "https://www.youtube.com/watch?v=fail"] {
+            h.app.settings.media_picks.clear();
+            show(&mut h, link);
+            assert!(shown(&h, MEDIA_PRESETS[1]) && !shown(&h, "Original · Opus 129 kbps · 9.7 MiB"), "{link}: {:?}", h.texts());
+            assert_eq!(queued(&mut h, link), Some(hyperfetch_core::media::MediaQualityPreset::Fhd1080p));
+        }
     }
 
     /// A video page's link ends in "watch", a playlist's in "videos": the card names neither,
