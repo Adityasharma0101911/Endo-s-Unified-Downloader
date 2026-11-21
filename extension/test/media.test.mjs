@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { isMediaPage, mediaPayload, parseTime, pickQuality, rememberedChoice, subtitleChoices, videoChoices } from "../lib/media.js";
+import { isMediaPage, mediaPayload, parseTime, pickerRows, pickQuality, rememberedChoice, sizeText, subtitleChoices, videoChoices } from "../lib/media.js";
 
 const video = {
   title: "A video",
@@ -84,6 +84,54 @@ test("subtitles: uploaded languages, then automatic ones they lack; no live chat
     { code: "de", auto: true },
   ]);
   assert.deepEqual(subtitleChoices({}), []);
+});
+
+test("the picker words /info's qualities as the app's card does, each with its pick and formats", () => {
+  // The app's answer for the 4K sample (crates/hyperfetch-core/tests/data/media-4k60.json), trimmed.
+  const opus = { id: "251", codec: "Opus", kbps: 129, size: { bytes: 10202210, exact: true }, language: null, original: false };
+  const aac = { id: "140", codec: "AAC", kbps: 129, size: { bytes: 10271496, exact: true }, language: null, original: false };
+  const av1 = { id: "399", codec: "AV1", fps: 60, hdr: false, size: { bytes: 124386876, exact: true }, has_audio: false };
+  const vp9 = { id: "303", codec: "VP9", fps: 60, hdr: false, size: { bytes: 168736189, exact: true }, has_audio: false };
+  const qualities = { heights: [{ p: 1080, options: [av1, vp9] }], audio: [opus, aac], languages: [] };
+  assert.deepEqual(pickerRows(qualities), {
+    heights: [
+      {
+        label: "1080p",
+        options: [
+          { value: "1080p:av1", label: "AV1 · 60 fps · 128.4 MiB", formats: "399+251" },
+          { value: "1080p:vp9", label: "VP9 · 60 fps · 170.6 MiB", formats: "303+251" },
+        ],
+      },
+    ],
+    audio: [
+      { value: "original", label: "Original · Opus 129 kbps · 9.7 MiB", formats: "251" },
+      { value: "m4a", label: "M4A · AAC 129 kbps, not converted", formats: "140" },
+      { value: "mp3", label: "MP3 · converted from Opus", formats: "251" },
+    ],
+  });
+  // An estimate is "about"; an unknown size is left out; HDR and 30 fps or less as the app says them; dubbed audio.
+  const de = { ...opus, id: "a-de", language: "de", original: true, size: { bytes: 1000000, exact: true } };
+  const en = { ...opus, id: "a-en", language: "en", size: { bytes: 1100000, exact: false } };
+  const sdr = { id: "v1", codec: "VP9", fps: 30, hdr: false, size: { bytes: 50000000, exact: false }, has_audio: false };
+  const hdr = { id: "v2", codec: "VP9", fps: 30, hdr: true, size: null, has_audio: false };
+  const dubbed = { heights: [{ p: 1080, options: [sdr, hdr] }], audio: [de, en], languages: ["de", "en"] };
+  assert.deepEqual(pickerRows(dubbed).heights[0].options.map((o) => [o.value, o.label, o.formats]), [
+    ["1080p:vp9", "VP9 · about 48.6 MiB", "v1+a-de"],
+    ["1080p:vp9:hdr", "VP9 · HDR", "v2+a-de"],
+  ]);
+  assert.equal(pickerRows(dubbed, "en").heights[0].options[0].label, "VP9 · about 48.7 MiB");
+  assert.equal(pickerRows(dubbed, "en").audio[1].label, "M4A · converted from Opus");
+  assert.deepEqual(pickerRows({}), { heights: [], audio: [] });
+  assert.equal(sizeText({ bytes: 900, exact: true }), "900 bytes");
+  assert.equal(sizeText(null), "");
+});
+
+test("the picker's choice becomes /add's pick, with its formats for the one video", () => {
+  const choice = { pick: "1080p:vp9@de", formats: "303+251", remember: true, container: "mkv", subtitles: "en", start: "", end: "", sponsorblock: "remove" };
+  assert.deepEqual(mediaPayload(choice, video).media, { pick: "1080p:vp9@de", formats: "303+251", remember: true, container: "mkv", subtitles: "en", sponsorblock: "remove" });
+  assert.deepEqual(mediaPayload({ ...choice, pick: "mp3", formats: "251", remember: false }, video).media, { pick: "mp3", formats: "251", sponsorblock: "remove" });
+  const list = mediaPayload({ ...choice, playlist: true }, { ...video, playlist: { title: "L", count: 3 } }).media;
+  assert.equal(list.formats, undefined, "a list's videos have formats of their own");
 });
 
 test("a remembered choice keeps only what /add takes", () => {

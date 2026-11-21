@@ -60,6 +60,54 @@ export function videoChoices(info) {
   ];
 }
 
+/** A size /info gives ({bytes, exact}) as the app writes it: "128.4 MiB", "about 48.6 MiB"; "" for none. */
+export function sizeText(size) {
+  if (!size || !(Number(size.bytes) > 0)) return "";
+  let [value, unit] = [Number(size.bytes), 0];
+  while (value >= 1024 && unit < 4) [value, unit] = [value / 1024, unit + 1];
+  const text = unit === 0 ? `${size.bytes} bytes` : `${value.toFixed(1)} ${["KiB", "MiB", "GiB", "TiB"][unit - 1]}`;
+  return size.exact ? text : `about ${text}`;
+}
+
+const CODEC_KEYS = { AV1: "av1", VP9: "vp9", HEVC: "hevc", "H.264": "h264" };
+
+/**
+ * The picker for /info's `qualities` (crates/hyperfetch-core/src/quality.rs), its audio in `language` (null: the
+ * original): a row a height, each of its codecs a choice whose value is the pick /add's `media.pick` takes ("1080p:av1",
+ * ":hdr" for HDR) and whose label says its codec, frame rate over 30, HDR and the size of its download with its audio;
+ * then audio alone as the site has it, as M4A (an AAC format kept as it is) or as MP3. Each choice with the formats it
+ * is. The app's own card words them the same.
+ */
+export function pickerRows(qualities, language = null) {
+  const audio = Array.isArray(qualities?.audio) ? qualities.audio : [];
+  const inLanguage = (a) => !language || a.language === language;
+  const best = audio.find(inLanguage) || audio[0] || null;
+  const aac = audio.find((a) => a.codec === "AAC" && inLanguage(a)) || null;
+  const said = (a) => [a.codec, a.kbps ? `${a.kbps} kbps` : ""].filter(Boolean).join(" ");
+  const total = (o) => {
+    if (o.has_audio || !best) return o.size;
+    if (!o.size || !best.size) return null;
+    return { bytes: o.size.bytes + best.size.bytes, exact: o.size.exact && best.size.exact };
+  };
+  const heights = (Array.isArray(qualities?.heights) ? qualities.heights : []).map((h) => ({
+    label: `${h.p}p`,
+    options: h.options.map((o) => ({
+      value: `${h.p}p${CODEC_KEYS[o.codec] ? `:${CODEC_KEYS[o.codec]}` : ""}${o.hdr ? ":hdr" : ""}`,
+      label: [o.codec, o.fps > 30 ? `${o.fps} fps` : "", o.hdr ? "HDR" : "", sizeText(total(o))].filter(Boolean).join(" · "),
+      formats: o.has_audio || !best ? o.id : `${o.id}+${best.id}`,
+    })),
+  }));
+  const converted = best ? `converted from ${best.codec}` : "converted";
+  const alone = !best
+    ? []
+    : [
+        { value: "original", label: `Original · ${[said(best), sizeText(best.size)].filter(Boolean).join(" · ")}`, formats: best.id },
+        { value: "m4a", label: `M4A · ${aac ? `${said(aac)}, not converted` : converted}`, formats: (aac || best).id },
+        { value: "mp3", label: `MP3 · ${converted}`, formats: best.id },
+      ];
+  return { heights, audio: alone };
+}
+
 /** The remembered quality when it is offered, else the tallest offered under it, else "best". */
 export function pickQuality(remembered, offered) {
   if (offered.includes(remembered)) return remembered;
@@ -89,14 +137,20 @@ export function rememberedChoice(raw) {
 
 /**
  * The `media` POST /add takes for a choice ({quality, container, subtitles, start, end, sponsorblock, playlist,
- * fromStart}) on what /info said, or {error} when the clip is not one: the quality; for video the container and
+ * fromStart}, or the picker's {pick, formats, remember} in place of quality) on what /info said, or {error} when the
+ * clip is not one: the quality, or the pick with its formats (not for a whole list); for video the container and
  * subtitles ("" for None); a clip from start to end (m:ss; left empty, the video's start or end; past the end, cut to
  * it); SponsorBlock where /info offers it ("off" too); the whole list; a live stream from its start. None and Off are
  * sent as such: left out, the app's Settings would apply.
  */
 export function mediaPayload(choice, info = {}) {
-  const media = { quality: QUALITIES.includes(choice.quality) ? choice.quality : "best" };
-  if (!media.quality.startsWith("audio-")) {
+  // The picker's choice (see pickerRows): its pick and formats, and whether the user made it, to keep for the site.
+  const picked = typeof choice.pick === "string" && choice.pick !== "";
+  const media = picked ? { pick: choice.pick } : { quality: QUALITIES.includes(choice.quality) ? choice.quality : "best" };
+  if (picked && typeof choice.formats === "string" && choice.formats && !(info.playlist && choice.playlist)) media.formats = choice.formats;
+  if (picked && choice.remember) media.remember = true;
+  const audioAlone = picked ? /^(original|mp3|m4a)(@|$)/.test(choice.pick) : media.quality.startsWith("audio-");
+  if (!audioAlone) {
     if (CONTAINERS.includes(choice.container)) media.container = choice.container;
     if (typeof choice.subtitles === "string") media.subtitles = choice.subtitles;
   }

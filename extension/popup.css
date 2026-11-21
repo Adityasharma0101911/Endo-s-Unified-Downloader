@@ -401,6 +401,10 @@ button.chip[aria-pressed="true"] { --c: var(--accent); --ct: var(--accent-text);
 .field.stack { display: grid; gap: 6px; }
 .field-label { flex: none; width: 84px; color: var(--muted); font-size: 12px; }
 .field > select { flex: 1; }
+/* The quality picker: a row a height, its codecs with their sizes. */
+.q-rows { display: grid; gap: 4px; }
+.q-row { display: flex; align-items: center; gap: 8px; }
+.q-height { flex: none; width: 46px; color: var(--muted); font-size: 12px; }
 .seg-group { display: flex; flex: 1; flex-wrap: wrap; gap: 2px; min-width: 0; padding: 2px; border: 1px solid var(--border); border-radius: 8px; background: var(--field); }
 .seg {
   position: relative;

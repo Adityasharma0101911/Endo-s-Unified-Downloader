@@ -3,7 +3,7 @@
 import { parseSites, parseTypes } from "./lib/capture.js";
 import { NO_YOUTUBE, formatDuration, isMediaSiteHost, isOffLimits, sanitizeFilename, suggestFilename } from "./lib/detect.js";
 import { LINK_KINDS, MAX_BATCH, fullSizeImages, largestSrcset, linkFilter, normalizeLinks, siteOf, textMatcher } from "./lib/links.js";
-import { isMediaPage, mediaPayload, pickQuality, rememberedChoice, subtitleChoices, videoChoices } from "./lib/media.js";
+import { isMediaPage, mediaPayload, pickerRows, pickQuality, rememberedChoice, subtitleChoices, videoChoices } from "./lib/media.js";
 import { drmNote, isProtected, itemChips, itemMeta, itemNote, linkName, logView, queueView, recordingView, variantLabel } from "./lib/view.js";
 
 const $ = (id) => document.getElementById(id);
@@ -453,6 +453,8 @@ async function block(row) {
 /** What /info said of the tab's page, and the choice the card opened with (the last one sent). */
 let info = null;
 let last = rememberedChoice(null);
+/** The picker's audio language (null: the original), the formats each of its choices is, and whether the user chose. */
+let picker = { language: null, formats: {}, touched: false };
 
 /** Asks the app what the page holds (a skeleton meanwhile), then shows it, or why it can't and a plain download. */
 async function loadMediaCard() {
@@ -507,10 +509,22 @@ function renderMediaCard(info) {
   const length = Number(info.duration) > 0 ? formatDuration(info.duration) : "";
   Object.assign($("mc-length"), { textContent: length, hidden: !length });
 
-  const video = videoChoices(info);
-  $("mc-quality").replaceChildren(...video.map((choice) => segment("quality", choice.value, choice.label, choice.marks)));
-  $("mc-audio-row").hidden = !info.audio;
-  tick("quality", pickQuality(last.quality, [...video.map((choice) => choice.value), ...(info.audio ? ["audio-m4a", "audio-mp3"] : [])]));
+  if (info.qualities) {
+    // What the app's rule for the site takes of what the link has, and what it says when that is not the rule's own.
+    const [taken, language] = String(info.taken?.pick || "").split("@");
+    picker = { language: language || null, formats: {}, touched: false };
+    renderPicker(taken);
+    const languages = Array.isArray(info.qualities.languages) ? info.qualities.languages : [];
+    $("mc-lang").replaceChildren(el("option", { value: "", textContent: "Original" }), ...languages.map((code) => el("option", { value: code, textContent: languageName(code) })));
+    $("mc-lang").value = picker.language || "";
+    $("mc-lang-row").hidden = languages.length < 2;
+    Object.assign($("mc-note"), { textContent: info.taken?.note || "", hidden: !info.taken?.note });
+  } else {
+    const video = videoChoices(info);
+    $("mc-quality").replaceChildren(...video.map((choice) => segment("quality", choice.value, choice.label, choice.marks)));
+    $("mc-audio-row").hidden = !info.audio;
+    tick("quality", pickQuality(last.quality, [...video.map((choice) => choice.value), ...(info.audio ? ["audio-m4a", "audio-mp3"] : [])]));
+  }
   tick("container", last.container);
 
   const subs = subtitleChoices(info);
@@ -532,10 +546,32 @@ function renderMediaCard(info) {
   updateMediaForm();
 }
 
+/** Shows the picker for /info's qualities in the picker's language (see lib/media.js pickerRows), `value` ticked. */
+function renderPicker(value) {
+  const rows = pickerRows(info.qualities, picker.language);
+  picker.formats = Object.fromEntries([...rows.heights.flatMap((height) => height.options), ...rows.audio].map((choice) => [choice.value, choice.formats]));
+  const row = (height) => el("div", { className: "q-row" }, el("span", { className: "q-height", textContent: height.label }), el("div", { className: "seg-group" }, ...height.options.map((o) => segment("quality", o.value, o.label))));
+  $("mc-quality").className = "q-rows";
+  $("mc-quality").replaceChildren(...rows.heights.map(row));
+  $("mc-audio").replaceChildren(...rows.audio.map((choice) => segment("quality", choice.value, choice.label)));
+  $("mc-audio-row").hidden = rows.audio.length === 0;
+  tick("quality", value);
+}
+
+/** A choice on the picker is the user's: it is kept for the site. Another language words the picker anew. */
+function pickerChanged(event) {
+  if (!info?.qualities) return;
+  if (event.target.name === "quality" || event.target.id === "mc-lang") picker.touched = true;
+  if (event.target.id === "mc-lang") {
+    picker.language = $("mc-lang").value || null;
+    renderPicker($("mc-form").elements.quality.value);
+  }
+}
+
 /** Shows what the choice so far allows: container and subtitles for video, a clip for one video that is not live. */
 function updateMediaForm() {
   const form = $("mc-form").elements;
-  const audio = form.quality.value.startsWith("audio-");
+  const audio = form.quality.value.startsWith("audio-") || ["original", "m4a", "mp3"].includes(form.quality.value);
   $("mc-format-row").hidden = audio;
   $("mc-subs-row").hidden = audio || $("mc-subs").options.length < 2;
   $("mc-clip-row").hidden = info.live === "live" || info.live === "upcoming" || (!!info.playlist && form.scope.value === "playlist");
@@ -576,8 +612,12 @@ async function sendMedia(media, button) {
 function downloadMedia(event) {
   event.preventDefault();
   const form = $("mc-form").elements;
+  const picked = Object.hasOwn(picker.formats, form.quality.value);
   const choice = {
     quality: form.quality.value,
+    pick: picked ? `${form.quality.value}${picker.language ? `@${picker.language}` : ""}` : undefined,
+    formats: picked ? picker.formats[form.quality.value] : undefined,
+    remember: picked && picker.touched,
     container: form.container.value,
     subtitles: $("mc-subs").value,
     start: $("mc-start").value,
@@ -590,7 +630,7 @@ function downloadMedia(event) {
   if (error) return say($("mc-msg"), error, "err");
   // The next card opens with this quality, and the container and subtitles when they were on show.
   last = {
-    quality: choice.quality,
+    quality: picked ? last.quality : choice.quality,
     container: $("mc-format-row").hidden ? last.container : choice.container,
     subtitles: $("mc-subs-row").hidden ? last.subtitles : choice.subtitles,
   };
@@ -1431,7 +1471,10 @@ async function init() {
   $("site-always").addEventListener("click", () => setSiteCapture("captureAlwaysSites"));
   $("site-never").addEventListener("click", () => setSiteCapture("captureExcludedSites"));
   $("start-app").addEventListener("click", startApp);
-  $("mc-form").addEventListener("change", updateMediaForm);
+  $("mc-form").addEventListener("change", (event) => {
+    pickerChanged(event);
+    updateMediaForm();
+  });
   $("mc-form").addEventListener("submit", downloadMedia);
   $("mc-start-now").addEventListener("click", () => useCurrentTime($("mc-start")));
   $("mc-end-now").addEventListener("click", () => useCurrentTime($("mc-end")));
