@@ -4520,9 +4520,10 @@ impl RangeJob {
             return opened;
         }
         // Refused meanwhile, as its checksum files may be: the first stream's request brings what
-        // no connection has yet, where it can (see `ChunkManager::rejoin`).
+        // no connection has yet, where it reaches it within the host's rest (see `ChunkManager::rejoin`).
         if self.limits_requests() {
-            self.chunks.lock().rejoin();
+            let rest = self.mirrors.lock().mirrors().iter().filter(|m| m.is_active).map(|m| hosts::rest_left(&m.url)).max();
+            self.chunks.lock().rejoin(rest.unwrap_or_default());
         }
         pilot.next(now, downloaded, left, startup, cap)
     }

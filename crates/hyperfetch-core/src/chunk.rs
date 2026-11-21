@@ -17,6 +17,9 @@ const STEAL_MIN_STARTUPS: f64 = 2.0;
 /// slow start, not a route. Also the least time between two replaced connections of a download
 /// (see `ChunkManager::replaces`).
 pub(crate) const LAG_WINDOW: Duration = Duration::from_secs(5);
+/// A steal also goes by a connection's speed over this much of its last bytes: one fading out
+/// shows there at once, where its average since its answer, or over `LAG_WINDOW`, takes long to.
+pub(crate) const RECENT: Duration = Duration::from_millis(500);
 /// A connection going at under this share of the median of the others makes way for a new one.
 const LAG_SHARE: f64 = 0.3;
 /// Fewest connections to a mirror, the slow one included, for their median to say anything.
@@ -137,6 +140,8 @@ struct Attempt {
     /// Bytes per second over its worker's last full `LAG_WINDOW`, and over the fastest of them.
     window_rate: Option<f64>,
     fastest: f64,
+    /// Bytes per second over its worker's last `RECENT`.
+    recent: Option<f64>,
 }
 
 impl Chunk {
@@ -184,6 +189,11 @@ impl Chunk {
         let mut attempt = self.attempt.lock();
         attempt.window_rate = Some(rate);
         attempt.fastest = attempt.fastest.max(rate);
+    }
+
+    /// The attempt went at `rate` bytes per second over its worker's last `RECENT`.
+    pub(crate) fn went_lately(&self, rate: f64) {
+        self.attempt.lock().recent = Some(rate);
     }
 
     /// Bytes still to arrive before the (possibly stolen-from) end: what the worker holds to
@@ -247,14 +257,15 @@ impl Chunk {
 
     /// How the chunk's worker is expected to go on: seconds until its next byte, and bytes per
     /// second from then on. Once it has a rate since its answer, that rate at once, or its last
-    /// `LAG_WINDOW`'s if slower: a connection that slowed down near its end, as a tail left to a
-    /// faltering route does, would take long to drag its average down; before, what a request to
+    /// `LAG_WINDOW`'s or `RECENT`'s if slower: a connection that slowed down near its end, as a
+    /// tail left to a faltering route does, would take long to drag its average down, and a tail
+    /// it keeps at that average may never come; before, what a request to
     /// its mirror costs (`expected`), less the part of the startup already behind it. `None`
     /// without either.
     fn pace(&self, now: Instant, expected: Option<&StealTiming>) -> Option<(f64, f64)> {
         if let Some(rate) = self.rate(now) {
-            let recent = self.attempt.lock().window_rate;
-            return Some((0.0, recent.map_or(rate, |recent| recent.min(rate))));
+            let attempt = self.attempt.lock();
+            return Some((0.0, [attempt.window_rate, attempt.recent].into_iter().flatten().fold(rate, f64::min)));
         }
         let expected = expected.filter(|t| t.rate > 0.0)?;
         let waited = self.assigned_at.map_or(Duration::ZERO, |at| now.saturating_duration_since(at));
@@ -477,7 +488,33 @@ impl ChunkManager {
                 _ => None,
             })
             .max_by_key(|&(_, silent)| silent)?;
+        self.take_over(id, thief_worker_id, thief_mirror_id, now)
+    }
 
+    /// Hands everything left of the in-flight chunk to an idle thief whose request, at its
+    /// mirror's `timing`, would bring it `STEAL_MIN_STARTUPS` times sooner than the chunk's worker
+    /// at its pace: a tail too short to split (see [`ChunkManager::steal_work`]), left to a
+    /// connection fading out, which may never bring it, as [`ChunkManager::take_over_silent`].
+    pub(crate) fn take_over_slow(&mut self, thief_worker_id: usize, thief_mirror_id: usize, timing: &[StealTiming]) -> Option<Chunk> {
+        let thief = timing.get(thief_mirror_id).filter(|t| t.rate > 0.0)?;
+        let now = Instant::now();
+        let (id, _) = self
+            .chunks
+            .iter()
+            .filter(|c| c.is_in_flight() && self.fatal.is_none())
+            .filter_map(|c| {
+                let (left, pace) = (c.unreceived(), c.pace(now, None));
+                let theirs = eta_secs(left, pace);
+                let ours = thief.startup.as_secs_f64() + left as f64 / thief.rate;
+                (left > 0 && pace.is_some() && theirs > STEAL_MIN_STARTUPS * ours).then_some((c.id, theirs))
+            })
+            .max_by(|a, b| a.1.total_cmp(&b.1))?;
+        self.take_over(id, thief_worker_id, thief_mirror_id, now)
+    }
+
+    /// Revokes chunk `id`'s attempt and hands what is left of it to the thief: what it wrote
+    /// becomes a completed chunk.
+    fn take_over(&mut self, id: usize, thief_worker_id: usize, thief_mirror_id: usize, now: Instant) -> Option<Chunk> {
         let chunk = &mut self.chunks[id];
         chunk.revoked.cancel();
         // Read after revoking: whatever the old worker records from now on is its own business.
@@ -692,18 +729,21 @@ impl ChunkManager {
 
     /// Gives the first stream (see [`ChunkManager::spread`]) back the pieces no worker has right
     /// after it, for a host that limits how often it is asked: its answer runs to the file's end,
-    /// so they come over the request already open instead of new ones. Only while that attempt
-    /// goes on and has yet to reach its end; one that reaches the old end first fails there, and
-    /// is retried as any connection cut short.
-    pub(crate) fn rejoin(&mut self) {
+    /// so they come over the request already open instead of new ones. Only those it reaches at
+    /// its pace within `wait`, the host's rest: past them, a new request once the host takes one
+    /// again brings a piece sooner. Only while that attempt goes on and has yet to reach its end;
+    /// one that reaches the old end first fails there, and is retried as any connection cut short.
+    pub(crate) fn rejoin(&mut self, wait: Duration) {
         let Some((id, attempt)) = &self.stream else { return };
         let (id, stream) = (*id, &self.chunks[*id]);
         if !stream.is_in_flight() || !Arc::ptr_eq(&stream.attempt, attempt) || stream.revoked.is_cancelled() || stream.unreceived() == 0 {
             return;
         }
+        let Some((_, rate)) = stream.pace(Instant::now(), None) else { return };
         let mut end = stream.end_offset.load(Ordering::SeqCst);
+        let reach = (end + 1 - stream.unreceived()).saturating_add((rate * wait.as_secs_f64()) as u64);
         while let Some(next) = self.chunks.iter().position(|c| {
-            c.range.start == end + 1 && matches!(c.status, ChunkStatus::Unassigned | ChunkStatus::Failed { .. })
+            c.range.start == end + 1 && c.range.start <= reach && matches!(c.status, ChunkStatus::Unassigned | ChunkStatus::Failed { .. })
         }) {
             end = self.chunks[next].range.end;
             self.chunks[next].status = ChunkStatus::Merged;
@@ -1210,19 +1250,28 @@ mod tests {
 
     /// Once its host refuses a request, the first stream takes back the pieces right after it that
     /// no worker has, a refused one too, and its request brings them; a piece a worker has, and
-    /// what lies past it, stay. Not a stream retried over a new request, whose answer ends where
-    /// it asked.
+    /// what lies past it, stay. Only those it reaches within the host's rest, at its pace. Not a
+    /// stream retried over a new request, whose answer ends where it asked.
     #[test]
     fn test_the_first_stream_takes_back_what_a_refusing_host_left() {
         let at = |i: u64| MB + 9 * MB * i / 4;
-        let mut manager = ChunkManager::new(10 * MB, 10 * MB).unwrap();
-        let stream = manager.get_next_work(0, 0).unwrap();
-        stream.received(MB);
-        manager.spread(4, 64 * 1024);
-        let far = manager.get_next_work(1, 0).unwrap();
-        let refused = manager.get_next_work(2, 0).unwrap();
-        manager.mark_failed(refused.id, "HTTP 429", Duration::from_secs(3), false).unwrap();
-        manager.rejoin();
+        let refused = |wait: Duration| {
+            let mut manager = ChunkManager::new(10 * MB, 10 * MB).unwrap();
+            let stream = manager.get_next_work(0, 0).unwrap();
+            // 1 MB in its first second.
+            stream.answered(Instant::now() - Duration::from_secs(1));
+            stream.current_offset.store(MB, Ordering::SeqCst);
+            manager.spread(4, 64 * 1024);
+            let far = manager.get_next_work(1, 0).unwrap();
+            let refused = manager.get_next_work(2, 0).unwrap();
+            manager.mark_failed(refused.id, "HTTP 429", Duration::from_secs(3), false).unwrap();
+            manager.rejoin(wait);
+            (manager, stream, far)
+        };
+        // In a 3 s rest it reaches the piece after its own, not the refused one past that.
+        let (_, stream, _) = refused(Duration::from_secs(3));
+        assert_eq!(stream.end_offset.load(Ordering::SeqCst), at(2) - 1);
+        let (mut manager, stream, far) = refused(Duration::from_secs(10));
         assert_eq!(stream.end_offset.load(Ordering::SeqCst), at(3) - 1);
         assert!(manager.get_next_work(3, 0).is_none(), "nothing is left to ask for");
         manager.mark_completed(stream.id).unwrap();
@@ -1238,7 +1287,7 @@ mod tests {
         manager.mark_failed(first.id, "cut", Duration::ZERO, true).unwrap();
         let retried = manager.get_next_work(0, 0).unwrap();
         assert_eq!(retried.id, first.id);
-        manager.rejoin();
+        manager.rejoin(Duration::from_secs(10));
         assert_eq!(retried.end_offset.load(Ordering::SeqCst), at(1) - 1);
     }
 
@@ -1406,6 +1455,31 @@ mod tests {
         manager.chunks()[0].went_at(10_000.0);
         let (_, stolen) = manager.steal_work(1, 0, timed(64 * 1024, &thief)).unwrap();
         assert!(stolen.range.len() > 290_000, "{}", stolen.range.len());
+        // As by its last half second, before a whole window: one fading out shows there first.
+        let mut manager = one_victim(64 * MB, 64 * MB - 300_000, 10);
+        manager.chunks()[0].went_lately(10_000.0);
+        let (_, stolen) = manager.steal_work(1, 0, timed(64 * 1024, &thief)).unwrap();
+        assert!(stolen.range.len() > 290_000, "{}", stolen.range.len());
+    }
+
+    /// A tail too short to split, left to a connection that crawls, goes whole to a new request
+    /// that brings it well before; one going about as fast as a new request stays.
+    #[test]
+    fn test_a_crawling_tail_is_taken_over() {
+        let thief = [cost(0.1, 5.0 * MB as f64)];
+        // 50 KB left: at its 25 KB/s of late they take 2 s, a new request 0.11 s.
+        let mut manager = one_victim(64 * MB, 64 * MB - 50_000, 10);
+        let crawling = manager.chunks()[0].clone();
+        crawling.went_lately(25_000.0);
+        assert!(manager.steal_work(1, 0, timed(64 * 1024, &thief)).is_none(), "too short to split");
+        let taken = manager.take_over_slow(1, 0, &thief).unwrap();
+        assert!(crawling.revoked.is_cancelled());
+        assert_eq!(taken.range, ByteRange::new(64 * MB - 50_000, 64 * MB - 1).unwrap());
+        assert_eq!(taken.status, ChunkStatus::Assigned { worker_id: 1, mirror_id: 0 });
+        // At 1 MB/s of late they take 0.05 s.
+        let mut manager = one_victim(64 * MB, 64 * MB - 50_000, 10);
+        manager.chunks()[0].went_lately(1e6);
+        assert!(manager.take_over_slow(1, 0, &thief).is_none());
     }
 
     #[test]

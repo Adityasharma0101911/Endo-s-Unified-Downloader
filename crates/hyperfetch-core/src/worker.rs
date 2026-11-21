@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-use crate::chunk::{Chunk, ChunkManager, Hedge, StealRule, StealTiming, LAG_WINDOW};
+use crate::chunk::{Chunk, ChunkManager, Hedge, StealRule, StealTiming, LAG_WINDOW, RECENT};
 use crate::hosts::{self, HostKey, HostProfile, HostSlot};
 use crate::mirror::{Mirror, MirrorRacer};
 use crate::range::ByteRange;
@@ -786,7 +786,14 @@ impl HttpWorker {
                     let costs: Vec<StealTiming> =
                         racer.mirrors().iter().map(|m| StealTiming { startup: m.ttfb(), rate: m.speed_ewma }).collect();
                     let steal = StealRule { min_bytes: s.min_steal, timing: Some(&costs) };
-                    Job::Chunk(mgr.steal_work(self.worker_id, mirror_id, steal).map(|(_, c)| c)?)
+                    let stolen = mgr.steal_work(self.worker_id, mirror_id, steal).map(|(_, c)| c).or_else(|| {
+                        let taken = mgr.take_over_slow(self.worker_id, mirror_id, &costs);
+                        if let Some(chunk) = &taken {
+                            tracing::info!("Chunk {} slowed to a crawl; worker {} takes over the rest", chunk.id, self.worker_id);
+                        }
+                        taken
+                    });
+                    Job::Chunk(stolen?)
                 }
             }
         };
@@ -879,10 +886,10 @@ impl HttpWorker {
                     };
                     record_failure(&mut racer, &mut chunks, chunk_id, mirror_id, url, kind, paced, &error);
                     // A host that limits how often it is asked: what is left goes over the first
-                    // stream's request where it can, else in no more requests than the
-                    // connections the download keeps.
-                    if matches!(kind, FailureKind::Throttled(_)) {
-                        chunks.rejoin();
+                    // stream's request where it reaches it before the host's rest ends, else in no
+                    // more requests than the connections the download keeps.
+                    if let FailureKind::Throttled(after) = kind {
+                        chunks.rejoin(after.unwrap_or(THROTTLE_RETRY));
                         let kept = racer.mirrors().iter().filter(|m| m.is_active).map(|m| m.max_connections).fold(0, usize::saturating_add);
                         chunks.merge_pending(kept.min(s.width.load(Ordering::Relaxed)));
                     }
@@ -996,6 +1003,7 @@ impl HttpWorker {
         let mut last_report = Instant::now();
         // The window the attempt's speed is measured over: since when, from which byte.
         let mut window = (tokio::time::Instant::now(), start);
+        let mut lately = window;
         let result = loop {
             // Only time spent waiting on the server counts as the chunk's silence, not writing or
             // rate limiting what arrived.
@@ -1063,6 +1071,10 @@ impl HttpWorker {
                 break Ok(());
             }
             let now = tokio::time::Instant::now();
+            if now - lately.0 >= RECENT {
+                chunk.went_lately((batch.end() - lately.1) as f64 / (now - lately.0).as_secs_f64());
+                lately = (now, batch.end());
+            }
             if now - window.0 >= LAG_WINDOW {
                 let rate = (batch.end() - window.1) as f64 / (now - window.0).as_secs_f64();
                 window = (now, batch.end());

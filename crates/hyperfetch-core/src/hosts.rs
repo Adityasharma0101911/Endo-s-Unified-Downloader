@@ -149,6 +149,11 @@ pub fn refused_lately(url: &Url) -> bool {
     HOSTS.refused_lately(&HostKey::of(url), clock())
 }
 
+/// How long `url`'s host, on any route, still rests after refusing a request: zero when it does not.
+pub(crate) fn rest_left(url: &Url) -> Duration {
+    HOSTS.rest_left(&HostKey::of(url), clock())
+}
+
 /// Whether `url`'s host limits how often it is asked, so a download from it asks for the file
 /// alone, over one connection: it refused a request (429/503) within `BANNED_FOR` in this run, or
 /// one while others of ours were open within `REFUSAL_KEPT_FOR`, in this run or an earlier one.
@@ -784,6 +789,12 @@ impl Hosts {
             (&other.scheme, &other.host, other.port) == (&key.scheme, &key.host, key.port)
                 && entry.refused.is_some_and(|(at, _)| now.saturating_duration_since(at) < BANNED_FOR)
         })
+    }
+
+    fn rest_left(&self, key: &HostKey, now: Instant) -> Duration {
+        let entries = self.entries.lock();
+        let same = entries.iter().filter(|(other, _)| (&other.scheme, &other.host, other.port) == (&key.scheme, &key.host, key.port));
+        same.filter_map(|(_, entry)| entry.rest_until).map(|until| until.saturating_duration_since(now)).max().unwrap_or_default()
     }
 
     fn record(&self, key: &HostKey, seen: HostProfile, now: Instant) {
