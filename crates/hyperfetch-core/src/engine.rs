@@ -3296,6 +3296,11 @@ impl DownloadEngine {
                         saving = Some(job.save());
                         last_persist = Instant::now();
                     }
+                    // The first stream shows its speed well within a snapshot's interval on a fast
+                    // host: looked at this often, it is not left alone longer than it must be.
+                    if pilot.as_ref().is_some_and(|pilot| pilot.is_alone()) {
+                        tick.reset_after(MIN_RATE_TICK);
+                    }
                 }
             }
         };
@@ -4459,6 +4464,11 @@ impl RangeJob {
                 self.chunks.lock().spread(width, MIN_STEAL);
             }
             return opened;
+        }
+        // Refused meanwhile, as its checksum files may be: the first stream's request brings what
+        // no connection has yet, where it can (see `ChunkManager::rejoin`).
+        if self.limits_requests() {
+            self.chunks.lock().rejoin();
         }
         pilot.next(now, downloaded, left, startup, cap)
     }
@@ -9925,13 +9935,13 @@ mod tests {
     /// With the Autopilot, the download's first request is the one a single-stream tool sends, the
     /// file from its start to its end, and nothing else goes to the host while that stream shows
     /// what it does. A file that one stream brings before more connections could pay for
-    /// themselves takes that one request, no HEAD beside it: from a host 150 ms away, one that
+    /// themselves takes that one request, no HEAD beside it: from a host 600 ms away, one that
     /// comes at once, and one that takes a second and a half from a host known not to hold each
     /// connection to a speed (here it holds each user to 2 MB/s, where more would gain nothing).
     #[tokio::test(flavor = "multi_thread")]
     async fn test_a_file_one_stream_brings_soon_takes_one_request() {
         for (size, per_client) in [(4 * 1024 * 1024, None), (3_000_000, Some(2e6))] {
-            let server = crate::netsim::Server { size, per_client, first_byte: Duration::from_millis(150), ..Default::default() };
+            let server = crate::netsim::Server { size, per_client, first_byte: Duration::from_millis(600), ..Default::default() };
             let (url, stats) = crate::netsim::serve(server).await;
             hosts::record(&url, HostProfile { capped_per_connection: Some(false), ..Default::default() });
             let dir = tempdir().unwrap();
@@ -9979,13 +9989,15 @@ mod tests {
         }
     }
 
-    /// Of several links, only the first's request is the stream: each other's probe is a GET for
-    /// one byte, which tells whether it serves the same file, and no HEAD goes anywhere.
+    /// Of several links from hosts 50 ms away, only the first's request is the stream: each
+    /// other's probe is a GET for one byte, which tells whether it serves the same file, and no
+    /// HEAD goes anywhere.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_only_the_first_link_is_asked_for_the_stream() {
         let size = 2 * 1024 * 1024;
-        let (first, at_first) = crate::netsim::serve(crate::netsim::Server { size, ..Default::default() }).await;
-        let (other, at_other) = crate::netsim::serve(crate::netsim::Server { size, ..Default::default() }).await;
+        let server = crate::netsim::Server { size, first_byte: Duration::from_millis(50), ..Default::default() };
+        let (first, at_first) = crate::netsim::serve(server.clone()).await;
+        let (other, at_other) = crate::netsim::serve(server).await;
         let dir = tempdir().unwrap();
         let options = DownloadOptions { remote_checksum: false, ..sim_options(dir.path(), 16, true) };
         let engine = DownloadEngine::new(vec![first, other], options);

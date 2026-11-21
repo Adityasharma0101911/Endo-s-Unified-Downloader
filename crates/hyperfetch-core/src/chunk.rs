@@ -284,6 +284,8 @@ pub struct ChunkManager {
     fatal: Option<(usize, String)>,
     /// When a slow connection last made way for a new one (see `replaces`).
     replaced_at: Option<Instant>,
+    /// The first stream, whose answer runs to the file's end, and its attempt (see `spread`).
+    stream: Option<(usize, Arc<Mutex<Attempt>>)>,
 }
 
 impl ChunkManager {
@@ -340,6 +342,7 @@ impl ChunkManager {
             max_retries: 8,
             fatal: None,
             replaced_at: None,
+            stream: None,
         })
     }
 
@@ -659,8 +662,9 @@ impl ChunkManager {
 
     /// Cuts what the in-flight chunk with the most left has yet to receive into `parts` about equal
     /// pieces, none under `min_bytes`: its worker keeps the first, and the rest wait as fresh
-    /// chunks for the workers about to start, each asking for one, instead of halving one
-    /// another's (see [`ChunkManager::steal_work`]). As a steal, it truncates the chunk.
+    /// chunks for the workers about to start, each asking for one, the farthest first, instead of
+    /// halving one another's (see [`ChunkManager::steal_work`]). As a steal, it truncates the
+    /// chunk, which is kept as the first stream (see [`ChunkManager::rejoin`]).
     pub(crate) fn spread(&mut self, parts: usize, min_bytes: u64) {
         let Some(id) = self.chunks.iter().filter(|c| c.is_in_flight()).max_by_key(|c| c.unreceived()).map(|c| c.id) else { return };
         let chunk = &mut self.chunks[id];
@@ -674,10 +678,36 @@ impl ChunkManager {
         let at = |i: u64| from + (left as u128 * i as u128 / parts as u128) as u64;
         chunk.end_offset.store(at(1) - 1, Ordering::SeqCst);
         chunk.range.end = at(1) - 1;
-        for i in 1..parts {
+        self.stream = Some((id, Arc::clone(&chunk.attempt)));
+        for i in (1..parts).rev() {
             let piece = Chunk::new(self.chunks.len(), ByteRange { start: at(i), end: at(i + 1) - 1 });
             self.chunks.push(piece);
         }
+    }
+
+    /// Gives the first stream (see [`ChunkManager::spread`]) back the pieces no worker has right
+    /// after it, for a host that limits how often it is asked: its answer runs to the file's end,
+    /// so they come over the request already open instead of new ones. Only while that attempt
+    /// goes on and has yet to reach its end; one that reaches the old end first fails there, and
+    /// is retried as any connection cut short.
+    pub(crate) fn rejoin(&mut self) {
+        let Some((id, attempt)) = &self.stream else { return };
+        let (id, stream) = (*id, &self.chunks[*id]);
+        if !stream.is_in_flight() || !Arc::ptr_eq(&stream.attempt, attempt) || stream.revoked.is_cancelled() || stream.unreceived() == 0 {
+            return;
+        }
+        let mut end = stream.end_offset.load(Ordering::SeqCst);
+        while let Some(next) = self.chunks.iter().position(|c| {
+            c.range.start == end + 1 && matches!(c.status, ChunkStatus::Unassigned | ChunkStatus::Failed { .. })
+        }) {
+            end = self.chunks[next].range.end;
+            self.chunks[next].status = ChunkStatus::Merged;
+            self.completed += 1;
+            self.retry_queue.retain(|&queued| queued != next);
+        }
+        let stream = &mut self.chunks[id];
+        stream.range.end = end;
+        stream.end_offset.store(end, Ordering::SeqCst);
     }
 
     /// Hands back what the attempts of workers `from` and above have yet to receive, as fresh
@@ -1151,8 +1181,8 @@ mod tests {
     }
 
     /// A lone stream that more connections join is cut into as many even pieces as there will be
-    /// connections, past what it already received: it keeps the first, each newcomer asks for one.
-    /// Never pieces under the least a connection is to carry.
+    /// connections, past what it already received: it keeps the first, each newcomer asks for one,
+    /// the farthest first. Never pieces under the least a connection is to carry.
     #[test]
     fn test_a_lone_stream_is_spread_over_the_connections_that_join_it() {
         let mut manager = ChunkManager::new(10 * MB, 10 * MB).unwrap();
@@ -1162,7 +1192,7 @@ mod tests {
         assert_eq!(stream.end_offset.load(Ordering::SeqCst), MB + 9 * MB / 4 - 1);
         let pieces: Vec<ByteRange> = (1..4).map(|worker| manager.get_next_work(worker, 0).unwrap().range).collect();
         let at = |i: u64| MB + 9 * MB * i / 4;
-        assert_eq!(pieces, (1..4).map(|i| ByteRange::new(at(i), at(i + 1) - 1).unwrap()).collect::<Vec<_>>());
+        assert_eq!(pieces, (1..4).rev().map(|i| ByteRange::new(at(i), at(i + 1) - 1).unwrap()).collect::<Vec<_>>());
         assert!(manager.get_next_work(4, 0).is_none());
         // Pieces of 4 MB at least: the 9 MB left make two.
         let mut manager = ChunkManager::new(10 * MB, 10 * MB).unwrap();
@@ -1171,6 +1201,40 @@ mod tests {
         manager.spread(4, 4 * MB);
         assert_eq!(stream.end_offset.load(Ordering::SeqCst), MB + 9 * MB / 2 - 1);
         assert_eq!(manager.get_next_work(1, 0).unwrap().range, ByteRange::new(MB + 9 * MB / 2, 10 * MB - 1).unwrap());
+    }
+
+    /// Once its host refuses a request, the first stream takes back the pieces right after it that
+    /// no worker has, a refused one too, and its request brings them; a piece a worker has, and
+    /// what lies past it, stay. Not a stream retried over a new request, whose answer ends where
+    /// it asked.
+    #[test]
+    fn test_the_first_stream_takes_back_what_a_refusing_host_left() {
+        let at = |i: u64| MB + 9 * MB * i / 4;
+        let mut manager = ChunkManager::new(10 * MB, 10 * MB).unwrap();
+        let stream = manager.get_next_work(0, 0).unwrap();
+        stream.received(MB);
+        manager.spread(4, 64 * 1024);
+        let far = manager.get_next_work(1, 0).unwrap();
+        let refused = manager.get_next_work(2, 0).unwrap();
+        manager.mark_failed(refused.id, "HTTP 429", Duration::from_secs(3), false).unwrap();
+        manager.rejoin();
+        assert_eq!(stream.end_offset.load(Ordering::SeqCst), at(3) - 1);
+        assert!(manager.get_next_work(3, 0).is_none(), "nothing is left to ask for");
+        manager.mark_completed(stream.id).unwrap();
+        manager.mark_completed(far.id).unwrap();
+        assert!(manager.is_all_completed());
+        assert_eq!(manager.completed_ranges(), [ByteRange::new(0, 10 * MB - 1).unwrap()]);
+
+        let mut manager = ChunkManager::new(10 * MB, 10 * MB).unwrap();
+        let first = manager.get_next_work(0, 0).unwrap();
+        first.received(MB);
+        manager.spread(4, 64 * 1024);
+        first.current_offset.store(MB, Ordering::SeqCst);
+        manager.mark_failed(first.id, "cut", Duration::ZERO, true).unwrap();
+        let retried = manager.get_next_work(0, 0).unwrap();
+        assert_eq!(retried.id, first.id);
+        manager.rejoin();
+        assert_eq!(retried.end_offset.load(Ordering::SeqCst), at(1) - 1);
     }
 
     /// What no worker has is merged into as many requests as the connections kept: with one, the

@@ -32,11 +32,9 @@ const LINE_FULL: f64 = 0.9;
 /// half the start it read, which the stream's start read is too.
 const ALONE: Duration = Duration::from_millis(250);
 pub(crate) const SHOWN: u64 = 512 * 1024;
-/// More connections pay only while what is left, at the one stream's speed, lasts this many
-/// windows: one for them to start, one to see what they bring, and the rest to gain from it.
-const OPEN_WINDOWS: f64 = 4.0;
 /// More connections, each held to the rate one is, pay while what is left takes more than this
-/// many of their set-ups at it (see `engine::read_prefix`).
+/// many of their set-ups at it (see `engine::read_prefix`); twice as many when nothing says they
+/// bring more than the stream already gets.
 const OPEN_SETUPS: f64 = 2.0;
 
 /// What the Autopilot starts from: what the probe and earlier downloads found of the host.
@@ -158,14 +156,13 @@ impl Autopilot {
     /// (the host's recipe's, else the first request's), `cap` the connections the host serves at
     /// once. At once when each connection to the host is seen held to `rate`, else `ALONE` after
     /// the stream began or once it brought `SHOWN`, at its speed so far. Then the one stream goes
-    /// on to the end, one request in all, if more would not pay: held to a rate, when what is left
-    /// takes no more than `OPEN_SETUPS` of their set-ups at it; else when it would not last
-    /// `OPEN_WINDOWS` of the climb's windows at the stream's speed, each `STARTUPS` set-ups (a
-    /// window is what more need to start and show what they bring). Nor when the stream fills the
-    /// line, or goes as fast as the host held a download to before. Otherwise more open: held to a
-    /// rate, as many as fill the line (all it may, without the line known), since more bring more;
-    /// else the width it was made with, for the climb to go on from. Call it every few hundred
-    /// milliseconds.
+    /// on to the end, one request in all, if more would not pay: when what is left takes no more
+    /// than `OPEN_SETUPS` of their set-ups at the rate, or twice as many at the stream's speed when
+    /// nothing says more bring more (a set-up not known taken for `MIN_WINDOW`). Nor when the
+    /// stream fills the line, or goes as fast as the host held a download to before. Otherwise
+    /// more open: held to a rate, as many as fill the line (all it may, without the line known),
+    /// since more bring more; else the width it was made with, for the climb to go on from. Call
+    /// it every few hundred milliseconds.
     pub(crate) fn open(&mut self, now: Instant, downloaded: u64, left: u64, startup: Duration, rate: Option<f64>, cap: Option<usize>) -> Option<usize> {
         let opening = self.opening?;
         self.cap = cap;
@@ -181,19 +178,15 @@ impl Autopilot {
         };
         self.opening = None;
         self.best = self.best.max(speed.min(pace));
-        // Not held to the least a compared window lasts: none is compared yet. Without a set-up
-        // known, as long as that.
-        let window = match startup.is_zero() {
-            true => MIN_WINDOW,
-            false => startup.saturating_mul(STARTUPS).min(MAX_WINDOW),
+        // Each held to the rate, more bring more: they pay once the rest takes over two of their
+        // set-ups at it, as the probe's read of a capped connection judges. Else they may bring
+        // nothing, which costs requests, not time: a margin twice that.
+        let setup = if startup.is_zero() { MIN_WINDOW } else { startup };
+        let margin = match rate {
+            Some(rate) => OPEN_SETUPS * rate,
+            None => 2.0 * OPEN_SETUPS * speed,
         };
-        let short = match rate {
-            // Each held to the rate, more bring more: they pay once the rest takes over two of
-            // their set-ups at it, as the probe's read of a capped connection judges.
-            Some(rate) => (left as f64) <= OPEN_SETUPS * rate * startup.as_secs_f64(),
-            // Else they must first show what they bring.
-            None => (left as f64) < OPEN_WINDOWS * speed * window.as_secs_f64(),
-        };
+        let short = (left as f64) <= margin * setup.as_secs_f64();
         if short {
             (self.done, self.why) = (true, Why::Short);
             return None;
@@ -597,7 +590,7 @@ mod tests {
         let mut pilot = alone(Start::default());
         assert_eq!(pilot.open(at(300), 3_000_000, 1 << 30, startup, None, None), Some(8), "a long way to go: the climb");
         let mut short = alone(Start::default());
-        assert_eq!(short.open(at(300), 3_000_000, 1_000_000, startup, None, None), None, "four windows of 40 ms take 1.6 MB");
+        assert_eq!(short.open(at(300), 3_000_000, 300_000, startup, None, None), None, "four set-ups of 10 ms take 400 KB");
         assert!(short.done && short.width == 1 && short.settled.is_none(), "{}", short.why());
         assert_eq!(short.why(), "1 connection: too little is left to try more");
         let mut full = alone(Start { line: Some(10.0 * MB), ..Default::default() });

@@ -870,9 +870,11 @@ impl HttpWorker {
                         _ => false,
                     };
                     record_failure(&mut racer, &mut chunks, chunk_id, mirror_id, url, kind, paced, &error);
-                    // A host that limits how often it is asked: what is left goes in no more
-                    // requests than the connections the download keeps.
+                    // A host that limits how often it is asked: what is left goes over the first
+                    // stream's request where it can, else in no more requests than the
+                    // connections the download keeps.
                     if matches!(kind, FailureKind::Throttled(_)) {
+                        chunks.rejoin();
                         let kept = racer.mirrors().iter().filter(|m| m.is_active).map(|m| m.max_connections).fold(0, usize::saturating_add);
                         chunks.merge_pending(kept.min(s.width.load(Ordering::Relaxed)));
                     }
