@@ -44,6 +44,12 @@ pub(crate) async fn lookup(host: &str, port: u16) -> std::io::Result<Vec<SocketA
     Ok(found)
 }
 
+/// Keeps `ips` as `host`'s answer, as a look-up would.
+#[cfg(test)]
+pub(crate) fn keep_name(host: &str, ips: Vec<IpAddr>) {
+    NAMES.lock().insert(host.to_ascii_lowercase(), (Instant::now(), ips));
+}
+
 /// The downloads' HTTP clients' resolver: the system's, its answers kept (see [`lookup`]).
 pub(crate) struct KeptNames;
 
@@ -123,8 +129,8 @@ mod tests {
     }
 
     /// One that never answers holds the next back `NEXT_ADDRESS`, not its whole timeout; one that
-    /// fails at once not at all; with none answering, the last error.
-    #[tokio::test]
+    /// fails at once not at all; with none answering, the last error. On the test's own clock.
+    #[tokio::test(start_paused = true)]
     async fn the_next_address_is_tried_beside_one_that_does_not_answer() {
         let (dead, refusing, live) = (at("10.0.0.1:80"), at("10.0.0.2:80"), at("10.0.0.3:80"));
         let connect = |addr: SocketAddr| async move {
@@ -136,11 +142,10 @@ mod tests {
         };
         let started = tokio::time::Instant::now();
         assert_eq!(race(vec![dead, live], connect).await, Ok(live));
-        let waited = started.elapsed();
-        assert!(waited >= NEXT_ADDRESS && waited < NEXT_ADDRESS * 2, "{waited:?}");
+        assert_eq!(started.elapsed(), NEXT_ADDRESS);
         let started = tokio::time::Instant::now();
         assert_eq!(race(vec![refusing, live], connect).await, Ok(live));
-        assert!(started.elapsed() < NEXT_ADDRESS, "{:?}", started.elapsed());
+        assert_eq!(started.elapsed(), Duration::ZERO);
         assert_eq!(race(vec![refusing, refusing], connect).await, Err(Some(format!("{refusing} refused"))));
         assert_eq!(race(Vec::new(), connect).await, Err(None));
     }

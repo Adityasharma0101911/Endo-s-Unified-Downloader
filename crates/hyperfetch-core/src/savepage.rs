@@ -226,9 +226,11 @@ fn local_ip(ip: IpAddr) -> bool {
 }
 
 /// Whether `url`'s host is this computer or on its local network: `localhost`, or an address
-/// (named, or what DNS answers for its name) [`local_ip`] says is.
-// shortcut: DNS may answer otherwise when the request connects (rebinding); checking the connected
-// address needs a resolver of our own in the client, worth it if pages are saved unattended.
+/// (named, or what DNS answers for its name) [`local_ip`] says is. A name's answer is the one the
+/// client dials (see `dial::KeptNames`), kept for a minute: asked right before a request, it is
+/// the answer that request connects to.
+// shortcut: an answer that expires between this and the connect is looked up again by the client;
+// a resolver that refuses local addresses on a client of the save's own would close that too.
 async fn local_host(url: &Url) -> bool {
     match url.host() {
         Some(url::Host::Ipv4(ip)) => local_ip(ip.into()),
@@ -236,7 +238,7 @@ async fn local_host(url: &Url) -> bool {
         Some(url::Host::Domain(name)) => {
             let name = name.trim_end_matches('.').to_ascii_lowercase();
             let port = url.port_or_known_default().unwrap_or(80);
-            name == "localhost" || name.ends_with(".localhost") || tokio::net::lookup_host((name.as_str(), port)).await.is_ok_and(|mut found| found.any(|a| local_ip(a.ip())))
+            name == "localhost" || name.ends_with(".localhost") || crate::dial::lookup(&name, port).await.is_ok_and(|found| found.iter().any(|a| local_ip(a.ip())))
         }
         None => false,
     }
@@ -274,10 +276,8 @@ struct Saver<'a> {
     spliced: u64,
     capped: HashSet<String>,
     requests: usize,
-    /// Whether what is on this computer or its local network may be put in (the page is there
-    /// too), and what each host was found to be.
+    /// Whether what is on this computer or its local network may be put in (the page is there too).
     local_ok: bool,
-    local: HashMap<String, bool>,
 }
 
 impl<'a> Saver<'a> {
@@ -295,22 +295,13 @@ impl<'a> Saver<'a> {
             capped: HashSet::new(),
             requests: 0,
             local_ok: true,
-            local: HashMap::new(),
         }
     }
 
-    /// Whether `url` is on this computer or its local network while the page is not.
+    /// Whether `url` is on this computer or its local network while the page is not; asked before
+    /// each request, by the answer it connects to (see [`local_host`]).
     async fn off_limits(&mut self, url: &Url) -> bool {
-        if self.local_ok {
-            return false;
-        }
-        let host = url.host_str().unwrap_or_default().to_string();
-        if let Some(&local) = self.local.get(&host) {
-            return local;
-        }
-        let local = local_host(url).await;
-        self.local.insert(host, local);
-        local
+        !self.local_ok && local_host(url).await
     }
 
     /// `uri` to put in for `url`, or none (it stays a link) once the saved file would pass its cap.
@@ -738,6 +729,9 @@ mod tests {
         ] {
             assert_eq!(local_host(&Url::parse(link).unwrap()).await, local, "{link}");
         }
+        // A name is held to the answer the client dials, not one of its own asking.
+        crate::dial::keep_name("rebinding.savepage.invalid", vec![[127, 0, 0, 1].into()]);
+        assert!(local_host(&Url::parse("http://rebinding.savepage.invalid/").unwrap()).await);
         let (addr, hits) = serve(site).await;
         let http = reqwest::Client::builder().no_proxy().build().unwrap();
         let options = SaveOptions::default();
