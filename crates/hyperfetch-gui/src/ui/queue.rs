@@ -249,8 +249,7 @@ fn detail_actions(app: &mut App, ui: &mut Ui, item: &QueueItem) {
             app.list_tracks(Some(id), url.clone());
         }
     }
-    // Not while its file is checked: it has no name yet.
-    if let Some(path) = item.target_path.as_ref().filter(|_| !util::checking(item)) {
+    if let Some(path) = &item.target_path {
         if ui.add(button(format!("{} Show in folder", icon::FOLDER_OPEN))).clicked() {
             report(app, util::reveal_in_folder(path));
         }
@@ -504,7 +503,7 @@ fn status_line(app: &App, item: &QueueItem, p: &Palette) -> (String, Color32) {
             (format!("Checking {}: it keeps its partial name until it passes.", item.filename), p.muted)
         }
         QueueItemStatus::Downloading if item.is_finishing() => {
-            (format!("Finishing {}: verifying the file and moving it into place...", item.filename), p.muted)
+            (format!("Finishing {}: every byte is in; the steps after the download run...", item.filename), p.muted)
         }
         QueueItemStatus::Downloading => (format!("Downloading {}", item.filename), p.muted),
         QueueItemStatus::Pausing if app.is_recording(item.id) => ("Stopping: yt-dlp is finishing the recording...".to_string(), p.muted),
@@ -1194,7 +1193,7 @@ struct Line<'a> {
 /// The lines of the list: `items`, ghosts fading out where they were, the cards under a ghost
 /// closing its gap pushed down by what is left of it, and cards that changed places on their
 /// way; and how many rows of gap are still closing under the last line.
-// ponytail: ghosts of separate removals less than GHOST apart may land a row off; placing them
+// shortcut: ghosts of separate removals less than GHOST apart may land a row off; placing them
 // by their neighbours would be exact.
 fn lines<'a>(items: &'a [QueueItem], rows: &'a Rows, new: &[usize], now: f64) -> (Vec<Line<'a>>, f32) {
     let mut lines: Vec<Line> = items.iter().map(|item| Line { item, ghost: None, new: new.contains(&item.id), drop: 0.0 }).collect();
@@ -2012,13 +2011,13 @@ mod tests {
 
     /// A download whose bytes are in, its file checked under its partial name (here, while its
     /// site's checksum files get no answer), shows "Checking" at 100 %: a running download, with
-    /// Pause, counted running and not done, and nothing to open or show in its folder, as the file
-    /// has no name yet. Clear completed keeps it. Once checked it is done, and opens.
+    /// Pause, counted running and not done, and no file to open, as it has no name yet. Clear
+    /// completed keeps it. Once checked it is done, and opens.
     #[test]
     fn a_download_being_checked_shows_checking_and_opens_once_done() {
         let server = tokio::runtime::Runtime::new().unwrap();
         let held = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let addr = server.block_on(crate::tests::serve_holding(std::sync::Arc::new(vec![7; 64 * 1024]), Some(std::sync::Arc::clone(&held))));
+        let (addr, _) = server.block_on(crate::tests::serve_holding(std::sync::Arc::new(vec![7; 64 * 1024]), Some(std::sync::Arc::clone(&held))));
         let mut h = Harness::new();
         let task = crate::Task { urls: vec![url::Url::parse(&format!("http://{addr}/dir/disk.img")).unwrap()], ..Default::default() };
         let options = crate::task_options(&h.app.settings, &task, "", "").unwrap();
@@ -2047,7 +2046,7 @@ mod tests {
         h.frames(60);
         let lines: Vec<String> = h.texts().into_iter().map(|(text, _)| text).collect();
         assert!(lines.iter().any(|text| text == "100%") && lines.iter().any(|text| text == "Checking"), "{lines:?}");
-        assert!(h.find("Pause").is_some() && h.find("Open file").is_none() && h.find("Show in folder").is_none(), "{lines:?}");
+        assert!(h.find("Pause").is_some() && h.find("Open file").is_none(), "{lines:?}");
 
         held.store(false, std::sync::atomic::Ordering::SeqCst);
         h.wait_for(|app| app.queue.get_item(id).is_some_and(|item| item.status == QueueItemStatus::Completed));

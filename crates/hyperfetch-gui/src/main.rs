@@ -852,8 +852,8 @@ impl App {
         self.jobs.get(&id).is_none_or(|view| !view.got_snapshot)
     }
 
-    /// Once every byte has arrived the engine verifies and renames the file without progress
-    /// reports; that is not a stall.
+    /// Once every byte has arrived the engine checks the file under its partial name, names it and
+    /// runs the steps after the download, without progress reports; that is not a stall.
     fn stalled_for(&self, id: usize) -> Option<Duration> {
         if self.queue.get_item(id).is_some_and(QueueItem::is_finishing) {
             return None;
@@ -961,7 +961,8 @@ impl App {
     /// Joins new download `id` to the download with its file (see `Twin`), while that one is
     /// running or queued: its links become that one's further sources, which its engine checks
     /// against the first before it takes them, and `id` leaves the queue, Undo putting it back and
-    /// taking them out again. One running starts again from where it is, to take them.
+    /// taking them out again. One running starts again from where it is, to take them; one with
+    /// every byte in keeps them for a later try (see [`Self::restart_with`]).
     fn join_twin(&mut self, id: usize) {
         let Some(Twin { of, .. }) = self.twins.remove(&id) else { return };
         let Some(urls) = self.queue.get_item(id).filter(|item| !item.status.is_active()).map(|item| item.urls.clone()) else { return };
@@ -973,12 +974,15 @@ impl App {
         }
         let fresh: Vec<Url> = urls.into_iter().filter(|url| !other.urls.contains(url)).collect();
         other.urls.extend(fresh.iter().cloned());
-        let (name, hosts) = (other.filename.clone(), other.urls.len());
+        let (name, hosts, all_in) = (other.filename.clone(), other.urls.len(), other.is_finishing());
         if self.remove_job(id) {
             self.joined = Some((of, fresh));
         }
         self.restart_with(of, |_| {});
-        self.notice = Some(Ok(format!("{name} now downloads from {hosts} servers together, as #{of}")));
+        self.notice = Some(Ok(match all_in {
+            true => format!("#{of} already has all of {name}, so nothing more is downloaded; #{id}'s links are kept with it"),
+            false => format!("{name} now downloads from {hosts} servers together, as #{of}"),
+        }));
     }
 
     /// Keeps new download `id` apart from the download with its file: it starts on its own.
@@ -1595,9 +1599,14 @@ impl App {
 
     /// Starts running download `id` again from where it is with its options changed by `change`:
     /// it pauses, and starts again as soon as its state is saved (see `AppEvent::JobFinished`).
+    /// One with every byte in only takes the change: a restart would fetch nothing and throw
+    /// its check away.
     fn restart_with(&mut self, id: usize, change: impl FnOnce(&mut DownloadOptions)) {
         let Some(item) = self.queue.get_item_mut(id).filter(|item| item.status == QueueItemStatus::Downloading) else { return };
         change(&mut item.options);
+        if item.is_finishing() {
+            return;
+        }
         self.restarting.insert(id);
         self.pause_job(id);
     }
@@ -2438,7 +2447,7 @@ impl App {
     fn pause_all(&mut self) -> Vec<usize> {
         self.settings.auto_run_queue = false;
         let running: Vec<usize> =
-            self.queue.items().iter().filter(|item| item.status == QueueItemStatus::Downloading && !item.place_free).map(|item| item.id).collect();
+            self.queue.items().iter().filter(|item| item.status == QueueItemStatus::Downloading).map(|item| item.id).collect();
         for &id in &running {
             self.pause_job(id);
         }
@@ -2696,7 +2705,7 @@ impl App {
     /// bytes done, red when one failed since the queue last stood still, yellow when all that
     /// run are pausing or stalled.
     fn overall_progress(&self) -> taskbar::Progress {
-        let running: Vec<&QueueItem> = self.queue.items().iter().filter(|item| item.status.is_active() && !item.place_free).collect();
+        let running: Vec<&QueueItem> = self.queue.items().iter().filter(|item| item.status.is_active()).collect();
         if running.is_empty() {
             return taskbar::Progress::None;
         }
@@ -2781,7 +2790,7 @@ impl eframe::App for App {
         }
         // An update swapping the exes must not be cut off halfway; one still downloading is
         // dropped, which leaves nothing changed.
-        // ponytail: an install whose swap starts at the end of the grace can still be cut off;
+        // shortcut: an install whose swap starts at the end of the grace can still be cut off;
         // wait for the swap itself if that ever shows.
         tasks.extend(self.install_task.take());
         if !wait_for_tasks(&self.rt, tasks, EXIT_GRACE) {
@@ -3063,7 +3072,7 @@ fn shared_clients() -> EngineMaker {
 
 /// Clients [`cached_client`] keeps. A browser download brings its page's own headers and cookies,
 /// and so a key of its own: past this many the cache starts over rather than keep them all.
-// ponytail: emptied when full; evict the least recently used if rebuilding clients ever shows.
+// shortcut: emptied when full; evict the least recently used if rebuilding clients ever shows.
 const MAX_CLIENTS: usize = 16;
 
 /// The client `cache` holds for the key of `options`, built with `build` if there is none yet or
@@ -3327,18 +3336,21 @@ mod tests {
     /// Minimal HTTP/1.1 file server with range support (suffix ranges too), sending about 800 KB/s
     /// per connection; the same body for every path.
     pub(crate) async fn serve(body: Arc<Vec<u8>>) -> std::net::SocketAddr {
-        serve_holding(body, None).await
+        serve_holding(body, None).await.0
     }
 
     /// [`serve`], but for a file's checksum files (what `digest` asks for once its bytes are in):
     /// while `held` is set they get no answer (10 s at most), then 404. A finished download stays
-    /// in its check, its place held, until then (or its lookups' 3 s are up).
-    pub(crate) async fn serve_holding(body: Arc<Vec<u8>>, held: Option<Arc<AtomicBool>>) -> std::net::SocketAddr {
+    /// in its check, its place held, until then (or its lookups' 3 s are up). With what it was
+    /// asked, in order, as "get /dir/a.bin" (lower case).
+    pub(crate) async fn serve_holding(body: Arc<Vec<u8>>, held: Option<Arc<AtomicBool>>) -> (std::net::SocketAddr, Arc<Mutex<Vec<String>>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&asked);
         tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
-                let (body, held) = (Arc::clone(&body), held.clone());
+                let (body, held, log) = (Arc::clone(&body), held.clone(), Arc::clone(&log));
                 tokio::spawn(async move {
                     let mut request = Vec::new();
                     let mut buf = [0u8; 1024];
@@ -3350,7 +3362,8 @@ mod tests {
                     }
                     let request = String::from_utf8_lossy(&request).to_ascii_lowercase();
                     let path = request.split_whitespace().nth(1).unwrap_or_default();
-                    let sums = [".sha256", ".sha512", ".sha1", ".md5", "/sha256sums", "/sha256sums.txt", "/checksums"];
+                    lock(&log).push(request.split_whitespace().take(2).collect::<Vec<_>>().join(" "));
+                    let sums =[".sha256", ".sha512", ".sha1", ".md5", "/sha256sums", "/sha256sums.txt", "/checksums"];
                     if let Some(held) = held.filter(|_| sums.iter().any(|sum| path.ends_with(sum))) {
                         let since = Instant::now();
                         while held.load(Ordering::SeqCst) && since.elapsed() < Duration::from_secs(10) {
@@ -3389,7 +3402,7 @@ mod tests {
                 });
             }
         });
-        addr
+        (addr, asked)
     }
 
     /// Downloads `url`; with `pause`, pauses it once the snapshots show its first 16 KiB on disk,
@@ -4866,7 +4879,7 @@ mod tests {
         for by_site in [false, true] {
             let dir = tempfile::tempdir().unwrap();
             let held = Arc::new(AtomicBool::new(true));
-            let addr = rt.block_on(serve_holding(Arc::clone(&body), Some(Arc::clone(&held))));
+            let (addr, asked) = rt.block_on(serve_holding(Arc::clone(&body), Some(Arc::clone(&held))));
             let mut app = test_app(&rt, dir.path());
             app.settings.max_concurrent = if by_site { 3 } else { 1 };
             if by_site {
@@ -4874,32 +4887,44 @@ mod tests {
             }
             let [a, b] = ["a.bin", "b.bin"].map(|name| queue_from(&mut app, addr, name));
             let item = |app: &App, id: usize| app.queue.get_item(id).unwrap().clone();
+            let sums_asked = || lock(&asked).iter().any(|line| line.contains("/dir/a.bin.") || line.contains("sums") || line.ends_with("/checksums"));
+            let b_asked = || lock(&asked).iter().any(|line| line.ends_with("/dir/b.bin"));
 
-            // Its checksum files unanswered for longer than the site's pause.
-            let mut checked: Option<Instant> = None;
-            pump(&mut app, |app| {
+            // In every round: while the first is checked with its place held, the next waits; the
+            // next starts only once that place is free. Whenever the engine's 3 s for the checksum
+            // files run out, these hold.
+            let watch = |app: &mut App, held_seen: &mut Option<Instant>, freed: &mut Option<Instant>| {
                 let first = item(app, a);
-                if first.checking && !first.place_free {
-                    assert_eq!(first.status, QueueItemStatus::Downloading);
+                if first.checking && !first.place_free && first.status == QueueItemStatus::Downloading {
                     assert!(first.downloaded_bytes == body.len() as u64 && first.total_bytes == body.len() as u64);
                     assert_eq!(status(app, b), QueueItemStatus::Queued, "its place is held (by its site: {by_site})");
-                    checked.get_or_insert_with(Instant::now);
+                    held_seen.get_or_insert_with(Instant::now);
                 }
-                checked.is_some_and(|since| since.elapsed() > pause + Duration::from_millis(200))
-            });
-            assert!(item(&app, a).checking && !item(&app, a).place_free, "still checked");
-
-            held.store(false, Ordering::SeqCst);
-            let mut freed: Option<Instant> = None;
-            pump(&mut app, |app| {
-                let first = item(app, a);
                 if first.place_free || !first.status.is_active() {
                     freed.get_or_insert_with(Instant::now);
                 }
+                if status(app, b) != QueueItemStatus::Queued {
+                    assert!(freed.is_some(), "the next started while the first held its place");
+                }
+            };
+            // Held while the server has its checksum requests unanswered: a while, for a pause
+            // counted from the bytes coming in to show.
+            let (mut held_seen, mut freed) = (None, None);
+            pump(&mut app, |app| {
+                watch(app, &mut held_seen, &mut freed);
+                held_seen.is_some_and(|since: Instant| sums_asked() && since.elapsed() > Duration::from_millis(300)) || freed.is_some()
+            });
+            assert!(held_seen.is_some() && sums_asked(), "the place was held while the server held the first's checksum files");
+            assert!(freed.is_some() || !b_asked(), "the server saw nothing of the next while the place was held");
+
+            held.store(false, Ordering::SeqCst);
+            pump(&mut app, |app| {
+                watch(app, &mut held_seen, &mut freed);
                 status(app, b) != QueueItemStatus::Queued
             });
             let freed = freed.expect("the next starts only once the place is free");
             if by_site {
+                // Its pause counted from the place's freeing (a bound no slow machine can break).
                 assert!(freed.elapsed() >= pause - Duration::from_millis(50), "the site's pause starts once the place is free: {:?}", freed.elapsed());
             }
             pump(&mut app, |app| [a, b].iter().all(|&id| !app.queue.get_item(id).unwrap().status.is_active()));
@@ -4917,14 +4942,16 @@ mod tests {
     #[test]
     fn closing_while_a_file_is_checked_saves_a_queue_that_resumes_it() {
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
-        let dir = tempfile::tempdir().unwrap();
+        let (dir, data) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        // What closing saves goes to this test's own folder.
+        OWN_DATA_DIR.with(|own| *own.borrow_mut() = Some(data.path().to_path_buf()));
         let body: Arc<Vec<u8>> = Arc::new((0..64 * 1024u32).map(|i| (i % 251) as u8).collect());
         let held = Arc::new(AtomicBool::new(true));
-        let addr = rt.block_on(serve_holding(Arc::clone(&body), Some(Arc::clone(&held))));
+        let (addr, _) = rt.block_on(serve_holding(Arc::clone(&body), Some(Arc::clone(&held))));
         let mut app = test_app(&rt, dir.path());
         let id = queue_from(&mut app, addr, "disk.img");
         let checked = |app: &mut App| app.queue.get_item(id).is_some_and(|item| item.checking && !item.place_free);
-        let kept = |app: &App| {
+        let kept =|app: &App| {
             let path = app.queue.get_item(id).unwrap().target_path.clone().unwrap();
             let (state, part) = part_files(&path);
             assert!(state.exists() && std::fs::read(&part).unwrap() == *body && !path.exists(), "kept under its partial name");
@@ -4955,6 +4982,53 @@ mod tests {
         assert!(std::fs::read(&path).unwrap() == *body);
         let left: Vec<_> = std::fs::read_dir(path.parent().unwrap()).unwrap().map(|e| e.unwrap().file_name()).collect();
         assert_eq!(left, ["disk.img"], "no second copy, nothing left of the check");
+    }
+
+    /// A download whose file is being checked has nothing left to fetch: a twin joined to it, Undo
+    /// of that, and a new speed limit applied to it (Apply now) change what it keeps but never
+    /// start it again, so its check goes on: the server is asked nothing a second time. The
+    /// join's notice says nothing more is downloaded.
+    #[test]
+    fn a_download_being_checked_is_never_restarted() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let body: Arc<Vec<u8>> = Arc::new((0..64 * 1024u32).map(|i| (i % 251) as u8).collect());
+        let held = Arc::new(AtomicBool::new(true));
+        let (addr, asked) = rt.block_on(serve_holding(Arc::clone(&body), Some(Arc::clone(&held))));
+        let mut app = test_app(&rt, dir.path());
+        // Only `a` runs: the twin Undo brings back stays queued.
+        app.settings.auto_run_queue = false;
+        let a = queue_from(&mut app, addr, "a.bin");
+        assert!(app.start_job(a, false));
+        pump(&mut app, |app| app.queue.get_item(a).is_some_and(|item| item.checking && !item.place_free));
+        let in_check = lock(&asked).len();
+        let going =|app: &App| assert!(status(app, a) == QueueItemStatus::Downloading && !app.restarting.contains(&a), "restarted");
+
+        let mirror = Url::parse(&format!("http://{addr}/mirror/a.bin")).unwrap();
+        let task = Task { urls: vec![mirror.clone()], ..Task::default() };
+        let options = task_options(&app.settings, &task, "", "").unwrap();
+        let twin = queue_task(&mut app.queue, task, options);
+        app.twins.insert(twin, Twin { of: a, host: "mirror".into(), offered: true });
+        app.join_twin(twin);
+        going(&app);
+        assert!(app.queue.get_item(a).unwrap().urls.contains(&mirror) && app.queue.get_item(twin).is_none());
+        assert!(matches!(&app.notice, Some(Ok(n)) if n.contains("nothing more is downloaded")), "{:?}", app.notice);
+        app.undo_remove();
+        going(&app);
+        assert!(!app.queue.get_item(a).unwrap().urls.contains(&mirror) && app.queue.get_item(twin).is_some());
+        // What Apply now does to each running download with another limit.
+        app.restart_with(a, |options| options.max_speed = Some(1 << 20));
+        going(&app);
+        assert_eq!(app.queue.get_item(a).unwrap().options.max_speed, Some(1 << 20));
+
+        held.store(false, Ordering::SeqCst);
+        pump(&mut app, |app| !app.queue.get_item(a).unwrap().status.is_active());
+        assert_eq!((status(&app, a), status(&app, twin)), (QueueItemStatus::Completed, QueueItemStatus::Queued));
+        // A restart would ask for the file again, and for its checksum files a second time.
+        let asked = lock(&asked).clone();
+        let sums: Vec<&String> = asked.iter().filter(|line| !line.ends_with("/dir/a.bin")).collect();
+        let once: HashSet<&&String> = sums.iter().collect();
+        assert!(asked[in_check..].iter().all(|line| !line.ends_with("/dir/a.bin")) && once.len() == sums.len(), "asked again: {asked:?}");
     }
 
     /// The taskbar shows nothing while no download runs, else the share of their bytes done:

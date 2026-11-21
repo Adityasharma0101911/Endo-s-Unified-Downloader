@@ -702,8 +702,7 @@ fn pulse_bar(app: &mut App, ui: &mut Ui) {
     let p = palette(ui);
     let ctx = ui.ctx().clone();
     let items = app.queue.items();
-    // One whose place is free (see `QueueItem::place_free`) runs for none of the limits.
-    let running = items.iter().filter(|item| item.status == QueueItemStatus::Downloading && !item.place_free).count();
+    let running = items.iter().filter(|item| item.status == QueueItemStatus::Downloading).count();
     let waiting = items.iter().filter(|item| matches!(item.status, QueueItemStatus::Queued | QueueItemStatus::Paused)).count();
     let done = items.iter().filter(|item| item.status == QueueItemStatus::Completed).count();
     let speed: f64 = items.iter().filter(|item| item.status == QueueItemStatus::Downloading).map(|item| item.speed_bytes_per_sec.max(0.0)).sum();
@@ -844,7 +843,7 @@ fn limit_switch(app: &mut App, ui: &mut Ui) {
         .queue
         .items()
         .iter()
-        .filter(|item| item.status == QueueItemStatus::Downloading && !item.place_free && item.options.max_speed != wanted)
+        .filter(|item| item.status == QueueItemStatus::Downloading && item.options.max_speed != wanted)
         .map(|item| item.id)
         .collect();
     if !stale.is_empty() && ui.add(button("Apply now")).on_hover_text("Restart the running downloads with this limit; they go on from where they are").clicked() {
@@ -1377,6 +1376,24 @@ mod tests {
         h.double_click("site.iso");
         assert!(h.settle());
         assert!(h.texts().iter().filter(|(text, _)| text.contains("Checked against the site's SHA-256")).count() >= 1, "{:?}", h.texts());
+    }
+
+    /// A download whose place is free while its file is still checked (no server holds that
+    /// moment, so the engine's snapshot is made here) runs for what the window says: the bar
+    /// counts it and offers Pause all, the taskbar shows it, and Pause all pauses it.
+    #[test]
+    fn a_check_whose_place_is_free_still_runs_for_the_user() {
+        let mut h = Harness::new();
+        let id = h.add("disk.img");
+        h.progress(id, 1.0);
+        let all_in = EngineSnapshot { total_bytes: 100 << 20, downloaded_bytes: 100 << 20, progress_ratio: 1.0, checking: true, place_free: true, ..Default::default() };
+        h.app.queue.apply_snapshot(id, &all_in);
+        h.app.tab = Tab::Downloads;
+        h.frames(10);
+        assert!(h.find("1 running").is_some() && h.find("Pause all").is_some(), "{:?}", h.texts());
+        assert_eq!(h.app.overall_progress(), crate::taskbar::Progress::Normal(1000));
+        assert_eq!(h.app.pause_all(), [id]);
+        assert_eq!(h.app.queue.get_item(id).unwrap().status, QueueItemStatus::Pausing);
     }
 
     /// A download removed with Delete comes back in its place with Undo; so do those Clear all took.

@@ -6,7 +6,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use hyperfetch_core::history::{is_redacted, redact_url, DownloadHistoryManager, HistoryEntry, REDACTED_LINK};
 use hyperfetch_core::ingest;
-use hyperfetch_core::queue::{QueueItem, QueueItemStatus};
+use hyperfetch_core::queue::QueueItem;
 use hyperfetch_core::state::DownloadState;
 use hyperfetch_core::verify::BuildVerificationResult;
 use url::Url;
@@ -47,12 +47,6 @@ pub fn clipboard_offer(text: &str) -> Option<(String, String)> {
         n => format!(" and {} more", n - 1),
     };
     Some((format!("{}{}", shown, more), text.to_string()))
-}
-
-/// Whether `item` runs with every byte in while its file is checked, still under its partial
-/// name (see `QueueItem::checking`): at 100 %, "Checking", with no file to open yet.
-pub fn checking(item: &QueueItem) -> bool {
-    item.checking && item.status == QueueItemStatus::Downloading
 }
 
 /// The folder to create before `item` starts, since the engine takes a missing folder for a file
@@ -244,9 +238,13 @@ pub fn open_path(path: &Path) -> std::io::Result<()> {
     launch(command).map(|_| ())
 }
 
-/// Shows `path` selected in the system file manager (its folder where selecting isn't supported).
+/// Shows `path` selected in the system file manager (its folder where selecting isn't supported,
+/// or while there is no file at `path` yet: Explorer would open another folder).
 pub fn reveal_in_folder(path: &Path) -> std::io::Result<()> {
     let path = std::path::absolute(path)?;
+    if !path.exists() {
+        return open_path(path.parent().unwrap_or(&path));
+    }
     #[cfg(windows)]
     let command = {
         let mut arg = OsString::from("/select,\"");

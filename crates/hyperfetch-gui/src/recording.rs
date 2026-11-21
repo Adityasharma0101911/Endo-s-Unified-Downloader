@@ -47,7 +47,7 @@ pub fn valid_id(id: &str) -> bool {
 /// The recordings open now, each in its own folder under `root`.
 pub struct Recordings {
     root: PathBuf,
-    // ponytail: one lock for every recording keeps each track's chunks in arrival order; give
+    // shortcut: one lock for every recording keeps each track's chunks in arrival order; give
     // each recording its own lock if several recording at once ever wait on a slow disk.
     open: Mutex<HashMap<String, Recording>>,
     started: AtomicU64,
@@ -106,7 +106,7 @@ impl Recordings {
     /// recording), closed as a finish closes them; the folders of recordings open now are left
     /// alone, and so are those written to within [`STALE`]: another copy of the app (an older one
     /// the extension still talks to) may be recording into them. One too small to keep is deleted.
-    // ponytail: what a run that just crashed left is joined at the next start after STALE; add
+    // shortcut: what a run that just crashed left is joined at the next start after STALE; add
     // an instance lock if that wait ever matters.
     pub async fn recover(&self) -> Vec<Finished> {
         let open = self.open.lock().await;
