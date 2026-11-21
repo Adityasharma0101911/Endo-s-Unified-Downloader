@@ -1548,7 +1548,8 @@ async fn test_file_the_probe_brought_whole_is_written_plainly_without_state() {
     let url = serve(Arc::new(Mock::new(data.clone())), "whole.bin").await;
     let temp = tempdir().unwrap();
     let out = temp.path().join("whole.bin");
-    // Such a file has nothing to resume, so no state is saved: one that cannot be changes nothing.
+    // Such a file's state only lets a stop while it is checked check it again: one that cannot be
+    // saved changes nothing.
     std::fs::create_dir(DownloadState::state_file_path(&part_of(&out))).unwrap();
 
     let engine = DownloadEngine::new(vec![url], options(&out, 4, 64 * KB));

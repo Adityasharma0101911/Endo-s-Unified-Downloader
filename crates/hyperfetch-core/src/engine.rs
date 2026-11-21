@@ -2979,16 +2979,14 @@ impl DownloadEngine {
                 state.completed_ranges = ByteRange::from_len(0, prefetched.len() as u64).into_iter().collect();
                 let state_path = state_path.clone();
                 let digest = blocking(move || {
-                    let written = std::fs::write(&path, &prefetched).and_then(|()| state.save_atomic(&state_path).map_err(std::io::Error::other));
-                    if written.is_err() {
-                        // Without a state file nothing could resume it.
-                        let _ = std::fs::remove_file(&path);
+                    std::fs::write(&path, &prefetched)?;
+                    // Without it a stop while it is checked fetches it again: no reason to fail it.
+                    if let Err(e) = state.save_atomic(&state_path) {
+                        tracing::warn!("Could not save the state of {}: {}", path.display(), e);
                     }
-                    written.map(|()| {
-                        let mut hasher = StreamHasher::new(expected.as_deref());
-                        hasher.update(&prefetched);
-                        hasher.finish()
-                    })
+                    let mut hasher = StreamHasher::new(expected.as_deref());
+                    hasher.update(&prefetched);
+                    Ok::<_, std::io::Error>(hasher.finish())
                 })
                 .await?
                 .map_err(|e| format!("Failed to write {}: {}", part.display(), e))?;
@@ -3237,8 +3235,9 @@ impl DownloadEngine {
         let mut saving: Option<tokio::task::JoinHandle<_>> = None;
         let mut hashing = hashed.is_some();
         // The quick ticks of a stream alone last this long at most, also one stalled at nothing,
-        // and send a snapshot no more often than the others.
-        let (quick_until, mut shown) = (Instant::now() + QUICK_TICKS_FOR, None::<Instant>);
+        // and send a snapshot no more often than the others, but for a change of what the
+        // Autopilot says.
+        let (quick_until, mut shown, mut shown_why) = (Instant::now() + QUICK_TICKS_FOR, None::<Instant>, None::<String>);
         let outcome = loop {
             if job.chunks.lock().is_all_completed() {
                 break Ok(());
@@ -3275,8 +3274,8 @@ impl DownloadEngine {
                     None => break Err("Download aborted: all workers stopped before the download completed".to_string()),
                 },
                 _ = tick.tick() => {
-                    if shown.is_none_or(|shown| shown.elapsed() >= SNAPSHOT_INTERVAL) {
-                        shown = Some(Instant::now());
+                    if shown.is_none_or(|shown| shown.elapsed() >= SNAPSHOT_INTERVAL) || why != shown_why {
+                        (shown, shown_why) = (Some(Instant::now()), why.clone());
                         emit(snapshot_tx, || EngineSnapshot { autopilot: why.clone(), ..job.snapshot(size, &mut meter, final_path) });
                     }
                     if !hashing {
