@@ -160,10 +160,11 @@ pub struct EngineSnapshot {
     /// user's checksum, the site's, a metalink's pieces): it is at 100 %, not done. The download is
     /// done once `run` resolves.
     pub checking: bool,
-    /// The download has nothing more to send to any host: every byte is in and its checksum
-    /// lookups have their answers or ran out of time, so what is left of it (reading the file,
-    /// post-processing) is local. Its place in a batch or queue is free: the next may start. Set
-    /// from the first snapshot that says so to the last.
+    /// The download has nothing more to send to any host it downloads from: every byte is in and
+    /// its checksum lookups have their answers or ran out of time, so what is left of it is
+    /// reading the file and post-processing (which may still go out: a VirusTotal lookup, a
+    /// command run after). Its place in a batch or queue is free: the next may start. Set from
+    /// the first snapshot that says so to the last.
     pub place_free: bool,
 }
 
@@ -4423,7 +4424,7 @@ fn build_route_client(
             && attempt.previous().last().is_some_and(|prev| prev.scheme() == "https");
         // What reqwest takes for another host, to which it drops Authorization and Cookie but
         // would send the rest of a paste's headers: `worker::send` follows that redirect itself.
-        // ponytail: every cross-host redirect on such a client stops, also a resolver's request
+        // shortcut: every cross-host redirect on such a client stops, also a resolver's request
         // that carries none of them (it then sees the 3xx); give the policy the user's hosts if
         // a pasted link that lands on a page to resolve ever needs it.
         let elsewhere = attempt.previous().last().is_some_and(|prev| {

@@ -447,7 +447,7 @@ button.chip[aria-pressed="true"] { --c: var(--accent); --ct: var(--accent-text);
 .links > li:has(input:checked) { background: color-mix(in srgb, var(--accent) 9%, var(--card)); }
 .links label { display: flex; flex: 1; align-items: center; gap: 10px; min-width: 0; cursor: pointer; }
 /* A row's checkbox scrolls clear of the sticky filter bar (138 px) and Send footer (59 px) when it takes focus.
-   ponytail: fixed heights; measure them in JS if those bars ever change height. */
+   shortcut: fixed heights; measure them in JS if those bars ever change height. */
 .links input { scroll-margin: 152px 0 73px; }
 .link-text { display: grid; min-width: 0; line-height: 1.3; }
 .link-text > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

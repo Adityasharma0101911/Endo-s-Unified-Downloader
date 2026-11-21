@@ -48,7 +48,7 @@ const PERSIST_INTERVAL: Duration = Duration::from_secs(2);
 /// need not wait for all of it.
 const PART_HASH_STEP: u64 = if cfg!(test) { 16 * 1024 } else { 64 * 1024 * 1024 };
 /// Largest segment or init section held in memory. Real segments are a few MiB.
-// ponytail: up to WINDOW_PER_CONNECTION x connections segments, one second request and
+// shortcut: up to WINDOW_PER_CONNECTION x connections segments, one second request and
 // WRITE_QUEUE + 1 segments on their way to the disk are held at once, so peak memory is that many
 // times this; spool segments to disk if streams with huge segments must work.
 const MAX_SEGMENT_BYTES: u64 = if cfg!(test) { 64 * 1024 } else { 256 * 1024 * 1024 };

@@ -268,7 +268,7 @@ function makeRow() {
   row.menu = el("div", { className: "menu" }, row.via, row.copy, row.block);
   row.menu.popover = "auto";
   row.more.popoverTargetElement = row.menu;
-  // ponytail: placed under the button, or over it when ~170 px (the tallest menu: a live item's) don't fit below;
+  // shortcut: placed under the button, or over it when ~170 px (the tallest menu: a live item's) don't fit below;
   // measure the menu if it grows.
   row.menu.addEventListener("beforetoggle", (event) => {
     if (event.newState !== "open") return;

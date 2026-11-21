@@ -106,7 +106,7 @@
 
   /**
    * Puts the menu or the note under the button, or over it where `height` px don't fit below, inside the window.
-   * ponytail: the menu's height is a constant (~250 px); measure it if the menu grows.
+   * shortcut: the menu's height is a constant (~250 px); measure it if the menu grows.
    */
   function place(box, height) {
     const at = main.getBoundingClientRect();

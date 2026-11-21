@@ -2953,7 +2953,7 @@ fn hide_console(cmd: &mut Command) {
 }
 
 async fn wait_cancelled(flag: Option<Arc<AtomicBool>>) {
-    // ponytail: polls because the engine exposes cancellation only as an AtomicBool;
+    // shortcut: polls because the engine exposes cancellation only as an AtomicBool;
     // switch to a Notify/CancellationToken if the engine grows one.
     match flag {
         Some(flag) => {
@@ -4810,7 +4810,7 @@ fn joined_time(parts: &[(f64, f64)], at: f64) -> f64 {
 }
 
 /// ISO 639-1 codes and the ISO 639-2 ones an MP4 track's language is written in.
-// ponytail: common languages only; another two-letter code is written "und", add it here.
+// shortcut: common languages only; another two-letter code is written "und", add it here.
 const LANGUAGES: [(&str, &str); 53] = [
     ("ar", "ara"), ("bg", "bul"), ("bn", "ben"), ("ca", "cat"), ("cs", "ces"), ("cy", "cym"), ("da", "dan"),
     ("de", "deu"), ("el", "ell"), ("en", "eng"), ("es", "spa"), ("et", "est"), ("eu", "eus"), ("fa", "fas"),

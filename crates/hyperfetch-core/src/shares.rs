@@ -31,7 +31,7 @@ const GOFILE_API: &str = "https://api.gofile.io";
 /// What Gofile is told the browser is: its website token is made of them (see [`website_token`]).
 const GOFILE_AGENT: &str = "Mozilla/5.0";
 const GOFILE_LANGUAGE: &str = "en-US";
-/// The key in Gofile's `wt.obf.js` (read 2026-10). ponytail: hardcoded; when Gofile changes it,
+/// The key in Gofile's `wt.obf.js` (read 2026-10). shortcut: hardcoded; when Gofile changes it,
 /// listings fail with "error-notPremium" until this is updated.
 const GOFILE_WT_KEY: &str = "12af056dacea0b";
 
@@ -394,7 +394,7 @@ async fn gofile_contents(http: &reqwest::Client, api: &str, token: &str, id: &st
 }
 
 /// Every file under Gofile's folder `id` (subfolders kept), each a task for its download link.
-/// ponytail: one page of 1000 children per folder; page on when someone shares more.
+/// shortcut: one page of 1000 children per folder; page on when someone shares more.
 async fn gofile_list(http: &reqwest::Client, api: &str, id: &str, password: Option<&str>) -> Result<Vec<Task>, String> {
     let token = gofile_token(http, api).await?;
     let mut queue = VecDeque::from([(id.to_string(), None::<PathBuf>)]);
@@ -480,7 +480,7 @@ fn between<'a>(s: &'a str, start: &str, end: &str) -> Option<&'a str> {
 
 /// The download link of the one file of Terabox's share `short` (at `base`, the link's scheme and
 /// host), which Terabox gives only to a signed-in account: `client` is the engine's, with the
-/// user's cookies file. ponytail: single-file shares only; a multi-file share needs `list` to get
+/// user's cookies file. shortcut: single-file shares only; a multi-file share needs `list` to get
 /// the user's cookies.
 async fn terabox_file(client: &reqwest::Client, base: &str, short: &str) -> Result<Url, String> {
     let page = client.get(format!("{}/sharing/link?surl={}", base, short)).send().await.map_err(|e| format!("Cannot reach Terabox: {}", e))?;

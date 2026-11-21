@@ -325,7 +325,7 @@ fn extract(file: &Path, password: Option<&str>) -> Result<Option<PathBuf>, Strin
         }
     };
     // Never through a shell. On Windows 7-Zip reads it on its input when it asks, off its command
-    // line, which other programs can read. ponytail: tar takes it only among its arguments, and so
+    // line, which other programs can read. shortcut: tar takes it only among its arguments, and so
     // does 7-Zip elsewhere (it would ask the terminal); a password holding `"` does not reach 7-Zip
     // whole there (it reads its command line its own way) and "did not open it".
     let typed = password.filter(|_| seven.is_some() && cfg!(windows));
@@ -450,7 +450,7 @@ fn sort(file: &Path, categories: &[Category]) -> std::io::Result<Option<PathBuf>
     }
     std::fs::create_dir_all(&dir)?;
     let base = dir.join(name);
-    // ponytail: checks then renames, so a file appearing in between is replaced; claim the name
+    // shortcut: checks then renames, so a file appearing in between is replaced; claim the name
     // with a hard link if two downloads ever race for one.
     let target = (0..).map(|n| crate::engine::numbered(&base, n)).find(|p| !p.exists()).unwrap_or(base);
     std::fs::rename(file, &target)?;

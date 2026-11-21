@@ -41,7 +41,7 @@ export function linkKind(url) {
 export function largestSrcset(srcset, base) {
   let best = "";
   let bestSize = -1;
-  // ponytail: candidates split at a comma followed by a space or by a descriptor, not the full HTML parser; a URL
+  // shortcut: candidates split at a comma followed by a space or by a descriptor, not the full HTML parser; a URL
   // holding ", " splits wrongly.
   for (const candidate of String(srcset || "").split(/,\s+|(?<=\d[wx]),/)) {
     const [url, descriptor = "1x"] = candidate.trim().replace(/,+$/, "").split(/\s+/);
@@ -106,7 +106,7 @@ export function fullSizeImages(images, minPixels = 0) {
 /**
  * The site a host belongs to, for the same-site filter: its last two labels, or three under a short second-level
  * label of a country (bbc.co.uk); an IP address is its own site.
- * ponytail: a guess, not the Public Suffix List; a short name under a ccTLD (t.co) counts its subdomain.
+ * shortcut: a guess, not the Public Suffix List; a short name under a ccTLD (t.co) counts its subdomain.
  */
 export function siteOf(host) {
   const labels = String(host || "").toLowerCase().replace(/\.$/, "").split(".");

@@ -212,7 +212,7 @@ struct Node {
 }
 
 /// The last folder listed, which the downloads of its files share.
-// ponytail: one folder kept; files of several MEGA folders downloading at once list theirs again.
+// shortcut: one folder kept; files of several MEGA folders downloading at once list theirs again.
 #[allow(clippy::type_complexity)]
 static LISTED: Mutex<Option<(String, [u8; 16], Instant, Arc<Vec<Node>>)>> = Mutex::new(None);
 

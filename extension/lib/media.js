@@ -12,7 +12,7 @@ const MAX_END = 86400;
 /**
  * Whether `url` is a page the media card is for: a media site (see isMediaSiteHost) past its home page; on YouTube a
  * video, Short, live, list or channel page, not the home page, search or a feed.
- * ponytail: paths, not yt-dlp's extractor list; a site page with no video in it gets the card's error state.
+ * shortcut: paths, not yt-dlp's extractor list; a site page with no video in it gets the card's error state.
  */
 export function isMediaPage(url) {
   let u;
