@@ -44,13 +44,15 @@ pub enum MediaQualityPreset {
     AudioM4a,
     /// Custom yt-dlp format selector string
     Custom(String),
+    /// A quality picked from what a link has, or kept for its site (see `quality::MediaPick`)
+    Pick(crate::quality::MediaPick),
 }
 
 /// Keeps ffmpeg from rewriting a merged mp4 a second time just to move its index (the moov atom)
 /// to the front. yt-dlp asks for that pass on every output (`-movflags +faststart`); a later
 /// `-movflags` replaces it. Players read the index wherever it is; only a file streamed over the
 /// web while it downloads wants it in front.
-const NO_FASTSTART: [&str; 2] = ["--postprocessor-args", "Merger+ffmpeg_o:-movflags -faststart"];
+pub(crate) const NO_FASTSTART: [&str; 2] = ["--postprocessor-args", "Merger+ffmpeg_o:-movflags -faststart"];
 
 impl MediaQualityPreset {
     /// Convert preset to yt-dlp arguments
@@ -83,12 +85,14 @@ impl MediaQualityPreset {
                 "-f".to_string(),
                 fmt.clone(),
             ],
+            Self::Pick(pick) => pick.to_args(),
         }
     }
 
     /// Whether yt-dlp converts the download to an audio file.
     fn extracts_audio(&self) -> bool {
-        matches!(self, Self::AudioMp3 | Self::AudioM4a)
+        use crate::quality::AudioForm::{M4a, Mp3};
+        matches!(self, Self::AudioMp3 | Self::AudioM4a) || matches!(self, Self::Pick(pick) if matches!(pick.audio, Some(Mp3 | M4a)))
     }
 }
 
@@ -5336,6 +5340,9 @@ pub struct MediaInfo {
     pub playlist: Option<MediaPlaylist>,
     /// Whether SponsorBlock knows its segments: a YouTube video.
     pub sponsorblock: bool,
+    /// Its video qualities and audio to choose from, read from the same answer; None for a list
+    /// or a link without formats to choose from.
+    pub qualities: Option<crate::quality::Qualities>,
 }
 
 /// The list a media link names: its title and how many entries it has.
@@ -5445,7 +5452,7 @@ async fn info_with(url: &Url, options: &MediaDownloadOptions, tools: &Tools<'_>,
 
 /// What yt-dlp found at a link (its `-J` output) as [`info`] tells it: a video, or a list with as
 /// many entries as yt-dlp printed (a list of lists counts those).
-fn media_info(found: &Value) -> MediaInfo {
+pub fn media_info(found: &Value) -> MediaInfo {
     let text = |key: &str| found[key].as_str().filter(|text| !text.is_empty()).map(str::to_string);
     let title = text("title").or_else(|| text("id")).unwrap_or_default();
     let live = match found["live_status"].as_str() {
@@ -5477,6 +5484,7 @@ fn media_info(found: &Value) -> MediaInfo {
     // YouTube lists a stream's chat among its subtitles.
     let langs = |key: &str| found[key].as_object().map_or_else(Vec::new, |subs| subs.keys().filter(|l| *l != "live_chat").cloned().collect());
     (info.subtitles, info.auto_subtitles) = (langs("subtitles"), langs("automatic_captions"));
+    info.qualities = crate::quality::Qualities::of(found);
     let formats: Vec<&Value> = found["formats"].as_array().map_or_else(|| vec![found], |formats| formats.iter().collect());
     let (mut heights, mut hdr, mut fps60) = (BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
     for format in formats.into_iter().filter(|f| !is_set(f.get("has_drm"))) {
@@ -5561,12 +5569,13 @@ pub(crate) mod tests {
             chapters: 12,
             playlist: Some(MediaPlaylist { title: "List".into(), count: 42 }),
             sponsorblock: true,
+            qualities: None,
         };
         let expected = serde_json::json!({
             "title": "Talk", "uploader": "Channel", "duration": 213.0, "thumbnail": "https://i.example/t.jpg",
             "live": "was_live", "heights": [2160, 1080, 720], "hdr": [2160], "fps60": [1080], "audio": true,
             "subtitles": ["en", "es"], "auto_subtitles": ["en"], "chapters": 12,
-            "playlist": {"title": "List", "count": 42}, "sponsorblock": true,
+            "playlist": {"title": "List", "count": 42}, "sponsorblock": true, "qualities": null,
         });
         assert_eq!(serde_json::to_value(&info).unwrap(), expected);
         let none = serde_json::to_value(MediaInfo::default()).unwrap();
@@ -5621,8 +5630,13 @@ pub(crate) mod tests {
             chapters: 3,
             playlist: None,
             sponsorblock: true,
+            qualities: crate::quality::Qualities::of(&zoo_video()),
         };
         assert_eq!(media_info(&zoo_video()), expected);
+        // From the same answer: the HDR 1080p, the 240p in two codecs, the 144p; not the locked 2160p.
+        let qualities = expected.qualities.unwrap();
+        let kinds: Vec<(u32, usize)> = qualities.heights.iter().map(|h| (h.p, h.options.len())).collect();
+        assert_eq!((kinds, qualities.audio.len()), (vec![(1080, 1), (240, 2), (144, 1)], 1));
 
         let live = media_info(&serde_json::json!({
             "_type": "video", "id": "M3HKLzjvKPc", "title": "Live Video from the International Space Station", "channel": "NASA",
@@ -5895,7 +5909,8 @@ pub(crate) mod tests {
         assert_eq!(args[at + 1], "8");
         // dashy drops the formats YouTube gives no size for (format 18, often), which a custom
         // selection may name; our presets pick adaptive formats.
-        for preset in [MediaQualityPreset::Hd720p, MediaQualityPreset::AudioMp3, MediaQualityPreset::AudioM4a] {
+        let pick = MediaQualityPreset::Pick(crate::quality::MediaPick::parse("1080p:av1").unwrap());
+        for preset in [MediaQualityPreset::Hd720p, MediaQualityPreset::AudioMp3, MediaQualityPreset::AudioM4a, pick] {
             let options = MediaDownloadOptions { preset, ..options.clone() };
             assert!(build_ytdlp_args(Source::Url(&url), &options, RunKind::Download, &[], None, None, None).contains(&YOUTUBE_DASHY[1].to_string()));
         }
