@@ -875,7 +875,8 @@ mod tests {
         let job = |name: &str| Job {
             label: name.to_string(),
             urls: vec![Url::parse(&format!("{}/{}.bin", server, name)).unwrap()],
-            options: DownloadOptions { output_path: Some(dir.join("")), ..Default::default() },
+            // Without the site's checksum read behind each file, whose connections the next one could not reuse.
+            options: DownloadOptions { output_path: Some(dir.join("")), remote_checksum: false, ..Default::default() },
             line: None,
         };
         let mut jobs: Vec<Job> = ["a", "b", "c"].iter().map(|name| job(name)).collect();
