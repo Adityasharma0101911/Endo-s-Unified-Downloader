@@ -16,6 +16,8 @@ pub struct Mirror {
     /// Validator this mirror issued (strong ETag, else Last-Modified), sent back as `If-Range`.
     pub if_range: Option<String>,
     pub speed_ewma: f64,    // bytes per second
+    /// Bytes `speed_ewma` was measured over (see [`Mirror::record_progress`]).
+    pub measured: u64,
     pub ttfb_ewma_ms: f64,  // milliseconds
     pub in_flight: usize,
     pub failures: u32,
@@ -37,6 +39,7 @@ impl Mirror {
             fallback: None,
             if_range: None,
             speed_ewma: 1_000_000.0, // Initial optimistic estimate: 1 MB/s
+            measured: 0,
             ttfb_ewma_ms: 100.0,     // Initial optimistic TTFB: 100ms
             in_flight: 0,
             failures: 0,
@@ -77,6 +80,7 @@ impl Mirror {
             return;
         }
         let instant_speed = (bytes as f64) / duration.as_secs_f64();
+        self.measured += bytes;
         // EWMA alpha = 0.3
         const ALPHA: f64 = 0.3;
         self.speed_ewma = (ALPHA * instant_speed) + ((1.0 - ALPHA) * self.speed_ewma);

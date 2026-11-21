@@ -3347,6 +3347,13 @@ impl DownloadEngine {
         if let Some(pilot) = pilot.filter(|_| outcome.is_ok()) {
             hosts::record_line(pilot.best);
         }
+        // What one connection to each host brought, by its own link's host, not a redirect's: a
+        // later download with several links starts its pieces on the fastest (see `add_mirror`).
+        if outcome.is_ok() {
+            for mirror in job.mirrors.lock().mirrors().iter().filter(|m| m.measured >= SPEED_MEASURED) {
+                hosts::record_speed(mirror.fallback.as_ref().unwrap_or(&mirror.url), mirror.speed_ewma);
+            }
+        }
         let _ = blocking(hosts::save).await;
 
         match outcome {
@@ -4341,6 +4348,9 @@ fn build_route_client(
 /// round trip (BDP pings), where hyper's fixed ones (5 MB a connection, 2 MB a stream) would hold
 /// a download over a long link to 5 MB per round trip (25 MB/s at 200 ms); see the speed
 /// benchmark's `h2_latency` scenarios.
+/// Fewest bytes a mirror's speed is measured over before it is kept (see `hosts::record_speed`).
+const SPEED_MEASURED: u64 = 1024 * 1024;
+
 /// The HTTP/2 clients of this process, one per [`ClientKey`], with when each was built (see
 /// [`h2_client`]).
 static H2_CLIENTS: std::sync::LazyLock<Mutex<std::collections::HashMap<ClientKey, (Instant, Client)>>> = std::sync::LazyLock::new(Default::default);
@@ -5276,8 +5286,9 @@ fn slot_at(slot: HostSlot, url: &Url, limit: usize) -> Option<HostSlot> {
 
 /// The racer over the mirrors serving the download. Requests go straight to where each probe was
 /// redirected, saving a redirect per request, with the mirror's own URL to fall back to. Each
-/// mirror starts from the answer time its probe measured, where it measured one, instead of an
-/// assumed one, so the first requests already favour near mirrors.
+/// mirror starts from the answer time its probe measured, where it measured one, and from the speed
+/// one connection to its host brought lately (see `hosts::speed`), instead of assumed ones, so the
+/// first requests already favour near and fast mirrors. The first link still says which file it is.
 fn build_racer(mirrors: &[ProbeInfo]) -> MirrorRacer {
     let mut racer = MirrorRacer::new(Vec::new());
     for probe in mirrors {
@@ -5293,6 +5304,9 @@ fn add_mirror(racer: &mut MirrorRacer, probe: &ProbeInfo) {
     mirror.if_range = probe.if_range();
     if let Some(answer) = probe.answer_time {
         mirror.ttfb_ewma_ms = answer.as_secs_f64() * 1000.0;
+    }
+    if let Some(speed) = hosts::speed(&probe.url) {
+        mirror.speed_ewma = speed;
     }
 }
 
@@ -9170,6 +9184,14 @@ mod tests {
         assert_eq!(even.select_best_mirror(), Some(0));
         let unmeasured = build_racer(&[mirror("a.example", None), mirror("b.example", None)]);
         assert_eq!(unmeasured.select_best_mirror(), Some(0));
+        // A connection to the second mirror's host went three times as fast lately: the first
+        // request after the probes goes there; the first mirror still says which file it is.
+        let (slow, fast) = (mirror("slow.speeds.example", Some(30)), mirror("fast.speeds.example", Some(30)));
+        hosts::record_speed(&slow.url, 1e6);
+        hosts::record_speed(&fast.url, 3e6);
+        let racer = build_racer(&[slow, fast]);
+        assert_eq!(racer.select_best_mirror(), Some(1));
+        assert_eq!(racer.get_mirror(1).unwrap().speed_ewma, 3e6);
     }
 
     #[test]
@@ -9927,6 +9949,17 @@ mod tests {
 
     fn sim_options(dir: &Path, connections: usize, adaptive: bool) -> DownloadOptions {
         DownloadOptions { output_path: Some(dir.join("f.bin")), num_connections: connections, adaptive, ..Default::default() }
+    }
+
+    /// A finished download keeps what one connection to its host brought.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_finished_download_keeps_its_hosts_speed() {
+        let size = 4 * 1024 * 1024;
+        let (url, _) = crate::netsim::serve(crate::netsim::Server { size, ..Default::default() }).await;
+        let dir = tempdir().unwrap();
+        let (got, _) = fetch_from_sim(&url, sim_options(dir.path(), 2, false)).await;
+        assert!(got == crate::netsim::file(size));
+        assert!(hosts::speed(&url).is_some_and(|speed| speed > 0.0), "{:?}", hosts::speed(&url));
     }
 
     /// Records that one connection to `url`'s host keeps to `rate`, as the probe's watch finds when

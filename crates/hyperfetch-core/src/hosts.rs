@@ -242,6 +242,21 @@ pub fn record_settled(url: &Url, connections: usize, limit: Option<f64>) {
     })
 }
 
+/// Bytes per second one connection to `url`'s host brought in the last download that measured one,
+/// within `SPEED_KEPT_FOR`: a download with several links asks the fastest for its pieces first
+/// (see `engine::add_mirror`).
+pub fn speed(url: &Url) -> Option<f64> {
+    let now = unix_now();
+    let kept = HOSTS.kept(&HostKey::of(url), now)?.speed;
+    kept.filter(|&(_, at)| Kept::fresh(at, now, SPEED_KEPT_FOR)).map(|(speed, _)| speed)
+}
+
+/// Keeps that one connection to `url`'s host brought `speed` bytes per second.
+pub(crate) fn record_speed(url: &Url, speed: f64) {
+    let now = unix_now();
+    HOSTS.keep(&HostKey::of(url), now, |kept| kept.speed = Some((speed, now)))
+}
+
 /// What `url`'s host was seen to speak besides HTTP/1.1, if that is kept.
 pub fn protocol(url: &Url) -> Option<Protocol> {
     HOSTS.kept(&HostKey::of(url), unix_now()).and_then(|kept| kept.protocol)
@@ -600,6 +615,10 @@ struct Kept {
     /// for any cap to matter (see `HostProfile::capped_per_connection`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     per_connection: Option<(Option<f64>, u64)>,
+    /// Bytes per second one connection to it brought in the last download that measured one (see
+    /// [`speed`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    speed: Option<(f64, u64)>,
     at: u64,
 }
 
@@ -607,6 +626,8 @@ struct Kept {
 const REFUSAL_KEPT_FOR: Duration = Duration::from_secs(24 * 60 * 60);
 /// How long whether a host publishes checksum files is kept: its folders may differ.
 const CHECKSUMS_KEPT_FOR: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// How long a host's speed is kept: a mirror's load changes with the week.
+const SPEED_KEPT_FOR: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 impl Kept {
     fn tells(&self) -> bool {
@@ -622,6 +643,7 @@ impl Kept {
             || self.ranges.is_some()
             || self.setup_ms.is_some()
             || self.per_connection.is_some()
+            || self.speed.is_some()
     }
 
     /// Whether a fact learned at `at` (seconds since the Unix epoch) is still trusted `now`, `age`
