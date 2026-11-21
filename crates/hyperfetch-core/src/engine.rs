@@ -1086,7 +1086,7 @@ impl DownloadEngine {
     /// the same speed limit and stopped by the same `cancel`.
     fn over_http2(&self) -> Self {
         let options = DownloadOptions { http2: true, ..self.options.clone() };
-        let client = build_client(&options);
+        let client = h2_client(&options);
         self.alike(self.urls.clone(), options, client)
     }
 
@@ -4341,6 +4341,41 @@ fn build_route_client(
 /// round trip (BDP pings), where hyper's fixed ones (5 MB a connection, 2 MB a stream) would hold
 /// a download over a long link to 5 MB per round trip (25 MB/s at 200 ms); see the speed
 /// benchmark's `h2_latency` scenarios.
+/// The HTTP/2 clients of this process, one per [`ClientKey`], with when each was built (see
+/// [`h2_client`]).
+static H2_CLIENTS: std::sync::LazyLock<Mutex<std::collections::HashMap<ClientKey, (Instant, Client)>>> = std::sync::LazyLock::new(Default::default);
+/// Most HTTP/2 clients kept: one per set of client options in use.
+const MAX_H2_CLIENTS: usize = 16;
+/// How long an HTTP/2 client is shared: the downloads of a batch start within it, and one built
+/// later reads the cookies file and the system's proxy as they are then.
+const H2_KEPT: Duration = Duration::from_secs(60);
+
+/// The client of downloads with `options` over HTTP/2 (see `DownloadEngine::over_http2`), shared
+/// for `H2_KEPT` by those whose options build the same client: the downloads from a host that
+/// refuses HTTP/1.1, the small files of a batch above all, go as streams on one connection to it
+/// instead of each opening its own. A large one still spreads over connections of its own beside
+/// it (see `DownloadEngine::h2_routes`).
+fn h2_client(options: &DownloadOptions) -> Result<Client, String> {
+    let key = ClientKey::of(options);
+    if let Some((_, client)) = H2_CLIENTS.lock().get(&key).filter(|(built, _)| built.elapsed() < H2_KEPT) {
+        return Ok(client.clone());
+    }
+    let client = build_client(options)?;
+    let mut clients = H2_CLIENTS.lock();
+    if clients.len() >= MAX_H2_CLIENTS {
+        clients.retain(|_, (built, _)| built.elapsed() < H2_KEPT);
+    }
+    if clients.len() >= MAX_H2_CLIENTS {
+        clients.clear();
+    }
+    // One another download built meanwhile is shared instead.
+    let kept = clients.entry(key).or_insert_with(|| (Instant::now(), client.clone()));
+    if kept.0.elapsed() >= H2_KEPT {
+        *kept = (Instant::now(), client);
+    }
+    Ok(kept.1.clone())
+}
+
 pub(crate) fn http2_tuned(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
     builder.http2_adaptive_window(true)
 }
@@ -9418,6 +9453,26 @@ mod tests {
         assert!(over(false).h2_routes(&client, 16).is_none());
         let bound = on(&url, DownloadOptions { http2: true, bind_addresses: vec![[127, 0, 0, 1].into()], ..Default::default() });
         assert!(bound.h2_routes(&client, 16).is_none(), "local addresses are routes of their own");
+    }
+
+    /// Downloads over HTTP/2 whose options build the same client share it for a minute, and with
+    /// it its connection; other options, another client.
+    #[test]
+    fn test_downloads_over_http2_share_a_client() {
+        let url = Url::parse("https://h2-shared.engine.invalid/file.bin").unwrap();
+        let agent = |agent: &str| DownloadOptions { user_agent: Some(agent.to_string()), ..Default::default() };
+        let kept = |agent: &str| {
+            let clients = H2_CLIENTS.lock();
+            clients.iter().filter(|(key, _)| key.user_agent.as_deref() == Some(agent)).map(|(_, (built, _))| *built).collect::<Vec<_>>()
+        };
+        let _ = DownloadEngine::new(vec![url.clone()], agent("shared-a")).over_http2();
+        let built = kept("shared-a");
+        let _ = DownloadEngine::new(vec![url.clone()], agent("shared-a")).over_http2();
+        let _ = DownloadEngine::new(vec![url.clone()], agent("shared-b")).over_http2();
+        assert_eq!((kept("shared-a"), kept("shared-b").len()), (built.clone(), 1), "the first one's, not built again");
+        H2_CLIENTS.lock().values_mut().for_each(|(at, _)| *at -= H2_KEPT);
+        let _ = DownloadEngine::new(vec![url], agent("shared-a")).over_http2();
+        assert!(kept("shared-a")[0] > built[0], "built again after a minute");
     }
 
     /// A file server (see `file_server`) whose host is known not to cap a connection's speed: the
