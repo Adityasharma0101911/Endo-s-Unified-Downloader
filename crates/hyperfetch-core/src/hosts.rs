@@ -377,6 +377,8 @@ pub struct HostSlot {
     opens_connection: bool,
     /// Its request has no answer yet (counted in `Entry::asking`).
     asking: std::sync::atomic::AtomicBool,
+    /// Its request was answered and the host serves it (counted in `Entry::serving`).
+    served: std::sync::atomic::AtomicBool,
 }
 
 impl HostSlot {
@@ -395,19 +397,29 @@ impl HostSlot {
     }
 
     /// The host refused this request with 429/503, asking for a `pause` (its Retry-After): no
-    /// request goes to it until that is over. With other requests to it open at the time, it
-    /// serves no more than those at once: every download to it is held to that, for
-    /// `PROFILE_TTL`. With none, the host was just busy. Whether it answered a request within
+    /// request goes to it until that is over. With other requests to it served at the time (see
+    /// [`HostSlot::serving`]), it serves no more than those at once: every download to it is held
+    /// to that, for `PROFILE_TTL`. With none, the host was just busy. Whether it answered a request within
     /// `BANNED_FOR`: then it paces us rather than refusing everything.
     pub fn throttled(&self, pause: Duration) -> bool {
-        self.hosts.throttled(&self.key, self.answer(), pause, clock())
+        let served = self.served.swap(false, std::sync::atomic::Ordering::SeqCst);
+        self.hosts.throttled(&self.key, self.answer(), served, pause, clock())
     }
 
     /// The host accepted this request. Serving as many as the cap it was seen to enforce, it is
     /// offered one more, at most once per `CAP_PROBE_INTERVAL` after the cap was learned or last
     /// raised: a host that means its cap refuses each request offered past it.
     pub fn accepted(&self) {
-        self.hosts.accepted(&self.key, self.answer(), clock())
+        let asked = self.answer();
+        self.served.fetch_or(asked, std::sync::atomic::Ordering::SeqCst);
+        self.hosts.accepted(&self.key, asked, clock())
+    }
+
+    /// Requests to this slot's host that it answered and still serves, of every download: what it
+    /// was seen to serve at once. A request still waiting for its answer is not counted, as the
+    /// answer may be a refusal.
+    pub fn serving(&self) -> usize {
+        self.hosts.entries.lock().get(&self.key).map_or(0, |entry| entry.serving)
     }
 
     /// This request got no answer: its connection failed or was dropped. Within `BANNED_FOR` of
@@ -426,7 +438,7 @@ impl HostSlot {
 
 impl Drop for HostSlot {
     fn drop(&mut self) {
-        self.hosts.release(&self.key, self.limit, self.answer(), clock())
+        self.hosts.release(&self.key, self.limit, self.answer(), self.served.load(std::sync::atomic::Ordering::SeqCst), clock())
     }
 }
 
@@ -519,6 +531,8 @@ struct Entry {
     cap_raised: Option<Instant>,
     /// Requests open that have no answer yet.
     asking: usize,
+    /// Requests open whose answer was accepted: those the host serves at once.
+    serving: usize,
     /// No request goes out before this.
     rest_until: Option<Instant>,
     /// When the host last refused a request (429/503), and the answers it gave since: while it
@@ -884,7 +898,7 @@ impl Hosts {
         }
         entry.idle.retain(|&at| now.saturating_duration_since(at) < POOL_IDLE);
         let opens_connection = entry.idle.pop().is_none();
-        Ok(HostSlot { hosts: self, key: key.clone(), limit, opens_connection, asking: true.into() })
+        Ok(HostSlot { hosts: self, key: key.clone(), limit, opens_connection, asking: true.into(), served: false.into() })
     }
 
     async fn acquire(&'static self, key: HostKey, limit: usize) -> HostSlot {
@@ -942,11 +956,14 @@ impl Hosts {
         }
     }
 
-    fn release(&self, key: &HostKey, limit: usize, asked: bool, now: Instant) {
+    fn release(&self, key: &HostKey, limit: usize, asked: bool, served: bool, now: Instant) {
         {
             let mut entries = self.entries.lock();
             if let Some(entry) = entries.get_mut(key) {
                 Self::answered(entry, asked);
+                if served {
+                    entry.serving = entry.serving.saturating_sub(1);
+                }
                 entry.open = entry.open.saturating_sub(1);
                 remove_limit(&mut entry.held, limit);
                 if entry.idle.len() >= POOL_MAX_IDLE {
@@ -959,15 +976,21 @@ impl Hosts {
         self.freed.notify_waiters();
     }
 
-    fn throttled(&self, key: &HostKey, asked: bool, pause: Duration, now: Instant) -> bool {
+    fn throttled(&self, key: &HostKey, asked: bool, served: bool, pause: Duration, now: Instant) -> bool {
         let mut entries = self.entries.lock();
         let Some(entry) = entries.get_mut(key) else { return false };
         Self::answered(entry, asked);
+        if served {
+            entry.serving = entry.serving.saturating_sub(1);
+        }
         Self::rest(entry, now + pause);
         entry.refused = Some((now, 0));
         entry.unanswered = 0;
-        // The refused request still holds its slot.
-        let others = entry.open.saturating_sub(1);
+        // Not `open` less the refused one: requests of ours still waiting for their answer (another
+        // of the same round, say) may be refused as well, and the host was then taken to serve
+        // more than it does. A served one whose answer is still on its way counts for less instead,
+        // which the cap's probing upward (see `accepted`) makes good.
+        let others = entry.serving;
         if others > 0 {
             entry.facts.connection_cap = Some((others, now));
             let unix = unix_now();
@@ -1003,6 +1026,7 @@ impl Hosts {
     fn accepted(&self, key: &HostKey, asked: bool, now: Instant) {
         let raised = self.entries.lock().get_mut(key).is_some_and(|entry| {
             Self::answered(entry, asked);
+            entry.serving += usize::from(asked);
             entry.unanswered = 0;
             entry.answered_at = Some(now);
             // Each answer since a refusal lets one more request wait for its answer at once.
@@ -1164,8 +1188,9 @@ mod tests {
         assert!(hosts.try_acquire(&host, 32, probe).is_none(), "the cap was just raised");
         // Refused again: back to what it served, and the next offer waits a full interval from then.
         let refused = probe + Duration::from_secs(5);
-        hosts.throttled(&host, false, Duration::ZERO, refused);
-        drop(later.pop());
+        let last = later.pop().unwrap();
+        hosts.throttled(&host, last.answer(), last.served.swap(false, std::sync::atomic::Ordering::SeqCst), Duration::ZERO, refused);
+        drop(last);
         hosts.accepted(&host, false, probe + CAP_PROBE_INTERVAL);
         assert_eq!(hosts.profile(&host, refused).connection_cap, Some(2));
         hosts.accepted(&host, false, refused + CAP_PROBE_INTERVAL);
@@ -1179,11 +1204,28 @@ mod tests {
         slot
     }
 
+    /// Refused while two more requests of ours wait for their answers, a host that serves three
+    /// was taken to serve four: those two may be refused as well (here both are, the second before
+    /// the first gives its slot back). Only the requests it answered and still serves count.
+    #[test]
+    fn test_a_refusal_counts_only_the_requests_being_served() {
+        let (hosts, host, t0) = (leaked(), key("http://still-asking.example/"), Instant::now());
+        let served: Vec<HostSlot> = (0..3).map(|_| answered(hosts.try_acquire(&host, 32, t0).unwrap())).collect();
+        let (first, second) = (hosts.try_acquire(&host, 32, t0).unwrap(), hosts.try_acquire(&host, 32, t0).unwrap());
+        first.throttled(Duration::ZERO);
+        assert_eq!(hosts.profile(&host, Instant::now()).connection_cap, Some(3));
+        second.throttled(Duration::ZERO);
+        assert_eq!(hosts.profile(&host, Instant::now()).connection_cap, Some(3));
+        assert_eq!(hosts.kept(&host, unix_now()).and_then(|kept| kept.cap), Some(3));
+        drop((first, second, served));
+        assert_eq!(hosts.entries.lock()[&host].serving, 0, "every answered slot is given back");
+    }
+
     #[tokio::test]
     async fn test_a_refusal_rests_the_host_and_requests_come_back_one_at_a_time() {
         let (hosts, host) = (leaked(), key("http://resting.example/"));
         let refused = hosts.try_acquire(&host, 0, clock()).unwrap();
-        hosts.throttled(&host, refused.answer(), Duration::from_millis(300), clock());
+        hosts.throttled(&host, refused.answer(), false, Duration::from_millis(300), clock());
         drop(refused);
         assert!(hosts.try_acquire(&host, 0, clock()).is_none(), "no request goes out while it rests");
         let started = tokio::time::Instant::now();
@@ -1207,7 +1249,7 @@ mod tests {
         drop(slot);
         let (out, also) = (hosts.try_acquire(&host, 0, t0).unwrap(), hosts.try_acquire(&host, 0, t0).unwrap());
         let refused = hosts.try_acquire(&host, 0, t0).unwrap();
-        assert!(!hosts.throttled(&host, refused.answer(), Duration::from_secs(1), t0), "it never answered: it does not pace us");
+        assert!(!hosts.throttled(&host, refused.answer(), false, Duration::from_secs(1), t0), "it never answered: it does not pace us");
         drop(refused);
         // Two requests out when it shut us out fail alike: one sign, one rest.
         let at = t0 + Duration::from_secs(1);
@@ -1237,10 +1279,10 @@ mod tests {
         drop(slot);
         // A refusal by a host that answered lately paces us; long after its last answer it does not.
         let slot = hosts.try_acquire(&host, 0, late).unwrap();
-        assert!(hosts.throttled(&host, slot.answer(), Duration::ZERO, late));
+        assert!(hosts.throttled(&host, slot.answer(), false, Duration::ZERO, late));
         drop(slot);
         let slot = hosts.try_acquire(&host, 0, at + BANNED_FOR).unwrap();
-        assert!(!hosts.throttled(&host, slot.answer(), Duration::ZERO, at + BANNED_FOR));
+        assert!(!hosts.throttled(&host, slot.answer(), false, Duration::ZERO, at + BANNED_FOR));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1351,6 +1393,7 @@ mod tests {
         let before = leaked();
         before.keep_in(file.clone(), now);
         let three: Vec<HostSlot> = (0..3).map(|_| before.try_acquire(&host, 32, Instant::now()).unwrap()).collect();
+        three[..2].iter().for_each(HostSlot::accepted);
         three[2].throttled(Duration::ZERO);
         drop(three);
         before.keep(&host, now, |kept| kept.connections = Some(6));

@@ -880,11 +880,11 @@ impl HttpWorker {
             }
             Err((kind, error)) => {
                 if !revoked {
-                    let paced = match kind {
-                        FailureKind::Throttled(after) => slot.throttled(after.unwrap_or(THROTTLE_RETRY)),
-                        _ => false,
+                    let (paced, serving) = match kind {
+                        FailureKind::Throttled(after) => (slot.throttled(after.unwrap_or(THROTTLE_RETRY)), slot.serving()),
+                        _ => (false, usize::MAX),
                     };
-                    record_failure(&mut racer, &mut chunks, chunk_id, mirror_id, url, kind, paced, &error);
+                    record_failure(&mut racer, &mut chunks, chunk_id, mirror_id, url, kind, paced, serving, &error);
                     // A host that limits how often it is asked: what is left goes over the first
                     // stream's request where it reaches it before the host's rest ends, else in no
                     // more requests than the connections the download keeps.
@@ -1183,7 +1183,8 @@ impl HttpWorker {
 /// bad mirrors are dropped after repeated bad answers, though a redirect target that refuses
 /// first sends the mirror back to its own URL; throttling while other connections are being
 /// served lowers the connection cap instead of costing retries, and so does throttling by a host
-/// `paced` us with (it answered a request lately: see [`HostSlot::throttled`]).
+/// `paced` us with (it answered a request lately: see [`HostSlot::throttled`]). The cap is no more
+/// than the requests to the host `serving` then (see [`HostSlot::serving`]).
 /// `mirror.in_flight` must already exclude the failed connection.
 #[allow(clippy::too_many_arguments)]
 fn record_failure(
@@ -1194,6 +1195,7 @@ fn record_failure(
     url: &Url,
     kind: FailureKind,
     paced: bool,
+    serving: usize,
     error: &str,
 ) {
     let Some(mirror) = racer.get_mirror_mut(mirror_id) else {
@@ -1229,9 +1231,9 @@ fn record_failure(
             (Duration::ZERO, false)
         }
         FailureKind::Throttled(after) if mirror.in_flight > 0 => {
-            // The server limits connections; the ones it accepts can still finish the job.
-            let others = mirror.in_flight;
-            mirror.record_throttled(others);
+            // The server limits connections; the ones it accepts can still finish the job. Those
+            // still waiting for their answer may be refused as well, and do not count.
+            mirror.record_throttled(mirror.in_flight.min(serving));
             (after.unwrap_or(THROTTLE_RETRY), false)
         }
         FailureKind::Throttled(after) => {
@@ -1735,13 +1737,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let url = Url::parse("http://refusing.worker.example/f").unwrap();
         let (worker, chunk, _events) = test_worker(&url, &dir.path().join("f.part"), 1 << 20);
-        let mut open: Vec<HostSlot> = (0..4).map(|_| slot(&url)).collect();
+        let mut open: Vec<HostSlot> = (0..5).map(|_| slot(&url)).collect();
         open[..3].iter().for_each(HostSlot::accepted);
+        (0..5).for_each(|_| worker.shared.mirrors.lock().acquire_mirror(0));
+        // The fourth request still waits for its answer, which may be a refusal too: it counts for
+        // neither the host nor the mirror.
         let refused = FailureKind::Throttled(None);
-        worker.settle(&chunk, 0, &url, Err((refused, "HTTP 503".into())), &open[3]);
-        open.pop();
+        worker.settle(&chunk, 0, &url, Err((refused, "HTTP 503".into())), &open[4]);
+        open.truncate(3);
 
         assert_eq!(hosts::profile(&url).connection_cap, Some(3));
+        assert_eq!(worker.shared.mirrors.lock().get_mirror(0).unwrap().max_connections, 3);
         assert!(hosts::try_acquire(&url, 0).is_none(), "three are open");
         open.pop();
         assert!(hosts::try_acquire(&url, 0).is_none(), "the host rests a moment after a refusal");
@@ -1938,7 +1944,7 @@ mod tests {
     /// A failed request to the mirror's current URL.
     fn fail(racer: &mut MirrorRacer, chunks: &mut ChunkManager, chunk: usize, mirror: usize, kind: FailureKind, error: &str) {
         let url = racer.get_mirror(mirror).unwrap().url.clone();
-        record_failure(racer, chunks, chunk, mirror, &url, kind, false, error);
+        record_failure(racer, chunks, chunk, mirror, &url, kind, false, usize::MAX, error);
     }
 
     #[test]
@@ -1971,7 +1977,7 @@ mod tests {
         let (mut racer, mut chunks) = setup(1);
         chunks.get_next_work(0, 0).unwrap();
         let url = racer.get_mirror(0).unwrap().url.clone();
-        record_failure(&mut racer, &mut chunks, 0, 0, &url, busy, true, "HTTP 503");
+        record_failure(&mut racer, &mut chunks, 0, 0, &url, busy, true, usize::MAX, "HTTP 503");
         assert_eq!(chunks.chunks()[0].retries, 0);
     }
 
@@ -2001,7 +2007,7 @@ mod tests {
         // Every connection finds the signed target expired at once: none of that counts.
         for _ in 0..3 {
             let chunk = chunks.get_next_work(0, 0).unwrap().id;
-            record_failure(&mut racer, &mut chunks, chunk, 0, &target, FailureKind::Denied, false, "HTTP 403");
+            record_failure(&mut racer, &mut chunks, chunk, 0, &target, FailureKind::Denied, false, usize::MAX, "HTTP 403");
         }
         let mirror = racer.get_mirror(0).unwrap();
         assert_eq!((&mirror.url, &mirror.fallback), (&own, &None));
@@ -2012,7 +2018,7 @@ mod tests {
         // The mirror's own URL refusing is a bad mirror, as always.
         for _ in 0..2 {
             let chunk = chunks.get_next_work(0, 0).unwrap().id;
-            record_failure(&mut racer, &mut chunks, chunk, 0, &own, FailureKind::Denied, false, "HTTP 404");
+            record_failure(&mut racer, &mut chunks, chunk, 0, &own, FailureKind::Denied, false, usize::MAX, "HTTP 404");
         }
         assert!(racer.all_inactive());
         assert!(chunks.has_fatal_failure().unwrap().1.contains("every mirror failed"));

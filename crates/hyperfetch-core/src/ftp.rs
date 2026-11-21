@@ -646,7 +646,8 @@ pub(crate) fn settle(s: &WorkerShared, worker_id: usize, chunk: &Chunk, mirror_i
         FailureKind::Throttled(_) => {
             let others = mirror.in_flight;
             slot.throttled(if others > 0 { THROTTLE_RETRY } else { THROTTLE_COOLDOWN });
-            mirror.record_throttled(others);
+            // Connections still waiting for their answer may be refused as well.
+            mirror.record_throttled(others.min(slot.serving()));
             if others > 0 {
                 (THROTTLE_RETRY, false)
             } else {
