@@ -486,14 +486,20 @@ pub(crate) enum Unfinished {
 /// the other checks make anyway (a download in one stream, which cannot be repaired by ranges
 /// from its server, has none otherwise). The site's checksum comes from `writer` too when it
 /// hashed the file with it as it arrived (see [`found`]). Reads the file once for all of them,
-/// and only when one is needed. Returns its BLAKE3 as hex.
+/// and only when one is needed. `quiet` is called once nothing more is to be asked of any host:
+/// the search has its answer (or ran out of time), and what is left is read from disk. Gives up
+/// with [`CANCELLED`](crate::engine::CANCELLED) as soon as `cancel` is, the file left as it is.
+/// Returns its BLAKE3 as hex.
 pub(crate) async fn finish(
     part: &Path,
     verified: Result<String, VerifyError>,
     options: &DownloadOptions,
     site: &Mutex<Site>,
     writer: Option<DiskWriter>,
+    cancel: &tokio_util::sync::CancellationToken,
+    quiet: impl FnOnce(),
 ) -> Result<String, Unfinished> {
+    let cancelled = || Unfinished::Io(crate::engine::CANCELLED.to_string());
     let copies = {
         let mut site = site.lock();
         if site.primary_only { Vec::new() } else { std::mem::take(&mut site.copies) }
@@ -508,18 +514,26 @@ pub(crate) async fn finish(
     go(site);
     let search = site.lock().search.take();
     let published = match search {
-        Some(search) => search.await.ok().flatten(),
+        Some(mut search) => tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                search.abort();
+                return Err(cancelled());
+            }
+            found = &mut search => found.ok().flatten(),
+        },
         None => None,
     };
+    quiet();
     let metalink = options.metalink_pieces.clone().filter(|_| whole_failed.is_some() || options.expected_checksum.is_none());
-    let (path, wanted) = (part.to_path_buf(), published.clone());
+    let (path, wanted, stop) = (part.to_path_buf(), published.clone(), cancel.clone());
     let read = tokio::task::spawn_blocking(move || {
         let size = std::fs::metadata(&path)?.len();
         let piece = crate::history::piece_size(size);
         let followed = wanted.as_deref().zip(writer.as_ref()).map(|(wanted, writer)| writer.followed(wanted)).transpose()?.flatten();
         let kept = piece.zip(writer).map(|(piece, writer)| writer.piece_hashes(piece)).transpose()?;
         let read_pieces = piece.filter(|_| kept.is_none() && (wanted.is_some() || metalink.is_some()));
-        let mut pass = read_pass(&path, wanted.as_deref().filter(|_| followed.is_none()), metalink.as_ref(), read_pieces)?;
+        let mut pass = read_pass_until(&path, wanted.as_deref().filter(|_| followed.is_none()), metalink.as_ref(), read_pieces, &|| stop.is_cancelled())?;
         pass.published = followed.or(pass.published);
         if !pass.bad.is_empty() {
             return Ok(Err(refetch(&path, size, &pass.bad)));
@@ -528,6 +542,9 @@ pub(crate) async fn finish(
         Ok(Ok((pass, piece)))
     });
     let read = read.await.map_err(|e| Unfinished::Io(format!("Background task failed: {e}")))?;
+    if cancel.is_cancelled() {
+        return Err(cancelled());
+    }
     let (pass, piece) = read.map_err(|e: io::Error| Unfinished::Io(format!("Failed to read {}: {}", part.display(), e)))??;
     if let Some(e) = whole_failed {
         return Err(Unfinished::Wrong(e));
@@ -714,6 +731,12 @@ pub(crate) struct Pass {
 /// do not fit its size), and its BLAKE3 hashes of `piece`-byte pieces, which must be a power of
 /// two of at least 1 KiB, smaller than the file. Blocking.
 pub(crate) fn read_pass(path: &Path, published: Option<&str>, metalink: Option<&Pieces>, piece: Option<u64>) -> io::Result<Pass> {
+    read_pass_until(path, published, metalink, piece, &|| false)
+}
+
+/// [`read_pass`], given up with an `Interrupted` error once `stop` says so, looked at before each
+/// block.
+fn read_pass_until(path: &Path, published: Option<&str>, metalink: Option<&Pieces>, piece: Option<u64>, stop: &dyn Fn() -> bool) -> io::Result<Pass> {
     let whole_algo = published.and_then(|c| flat(c.split_once(':')?.0));
     if whole_algo.is_none() && metalink.is_none() && piece.is_none() {
         return Ok(Pass::default());
@@ -729,6 +752,9 @@ pub(crate) fn read_pass(path: &Path, published: Option<&str>, metalink: Option<&
     let mut buf = vec![0; READ_BLOCK];
     let mut at = 0;
     while at < size {
+        if stop() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, crate::engine::CANCELLED));
+        }
         let n = (size - at).min(READ_BLOCK as u64) as usize;
         file.read_exact(&mut buf[..n])?;
         for hashed in [&mut whole, &mut pieces, &mut blake].into_iter().flatten() {
@@ -1176,49 +1202,123 @@ mod tests {
         assert_eq!(checked.as_deref(), Some("the site's SHA-256"));
     }
 
-    /// Once its bytes are in, the file has its name and the download says so, while the site's
-    /// checksum file is still on its way; `run` resolves only with the verdict. One the file
-    /// fails fails the download as it always did, and the file is removed. A user's own checksum
-    /// is checked before the file takes its name.
+    /// Once its bytes are in, the download says it is being checked, the file still under its
+    /// partial name with its resume state; it says it has nothing more to send once the site's
+    /// checksum file has its answer, and asks for nothing after that. The file takes its name only
+    /// with the verdict: one it fails (the site's, or the user's) fails the download and leaves
+    /// nothing behind.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_file_is_in_place_while_the_sites_checksum_is_checked() {
+    async fn a_file_keeps_its_partial_name_until_its_checks_are_done() {
         let data = content(1000);
         for (hex, own) in [(sha256_hex(&data), None), ("0".repeat(64), None), (sha256_hex(&data), Some("0".repeat(64)))] {
             let dir = tempfile::tempdir().unwrap();
             let files = vec![("/dir/SHA256SUMS".to_string(), "text/plain".to_string(), format!("{hex}  file.bin"))];
-            let (url, _) = serve(data.clone(), Site { files, sidecars_wait: Duration::from_millis(500), ..Site::default() }).await;
+            let (url, log) = serve(data.clone(), Site { files, sidecars_wait: Duration::from_millis(300), ..Site::default() }).await;
             let options = DownloadOptions { output_path: Some(dir.path().join("")), expected_checksum: own.clone().map(|hex| format!("sha256:{hex}")), ..DownloadOptions::default() };
             let (tx, mut rx) = broadcast::channel::<EngineSnapshot>(1024);
-            let started = std::time::Instant::now();
             let engine = DownloadEngine::new(vec![url], options);
             let run = tokio::spawn(async move { engine.run(Some(tx)).await });
-            // The first snapshot that says the file is in place, and what was on disk then.
-            let mut placed = None;
+            // What was on disk when the download said it was checking, and the requests out when it
+            // said it had nothing more to send.
+            let (mut checking, mut free) = (None, None);
             while let Ok(snapshot) = rx.recv().await {
-                if snapshot.in_place {
-                    let target = snapshot.target_path.clone().unwrap();
-                    placed = Some((started.elapsed(), std::fs::read(&target).ok(), run.is_finished()));
-                    break;
+                let target = snapshot.target_path.clone().unwrap_or_default();
+                let part = crate::engine::part_path(&target);
+                if snapshot.checking && checking.is_none() {
+                    let state = crate::state::DownloadState::state_file_path(&part);
+                    checking = Some((target.exists(), std::fs::read(&part).ok(), state.exists()));
+                }
+                if snapshot.place_free && free.is_none() {
+                    free = Some((log.lock().unwrap().len(), target.exists() && snapshot.checking));
                 }
             }
             let result = run.await.unwrap();
-            let gone = std::fs::read_dir(dir.path()).unwrap().count() == 0;
+            let left: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+            let (named, on_disk, state) = checking.expect("it says when it checks");
+            assert!(!named && on_disk.as_deref() == Some(&data[..]) && state, "{named} {state}");
             match (own, hex == sha256_hex(&data)) {
                 (None, true) => {
-                    let (at, on_disk, resolved) = placed.expect("in place");
-                    assert!(at < Duration::from_millis(400) && on_disk.as_deref() == Some(&data[..]) && !resolved, "{at:?} {resolved}");
-                    assert!(result.is_ok() && started.elapsed() >= Duration::from_millis(500), "the verdict waits for the checksum file");
+                    let (asked, named) = free.expect("nothing more to send");
+                    assert!(!named, "still under its partial name");
+                    assert_eq!(asked, log.lock().unwrap().len(), "nothing asked after it said so");
+                    assert!(result.is_ok() && left == ["file.bin"], "{result:?} {left:?}");
                 }
                 (None, false) => {
-                    assert!(placed.is_some_and(|(_, on_disk, _)| on_disk.is_some()));
                     assert!(result.as_ref().is_err_and(|e| e.contains("the site's published SHA-256")), "{result:?}");
-                    assert!(gone, "the file is removed");
+                    assert!(left.is_empty(), "nothing left: {left:?}");
                 }
-                (Some(_), _) => {
-                    assert!(placed.is_none(), "a file that fails the user's checksum never takes its name");
-                    assert!(result.is_err() && gone, "{result:?}");
-                }
+                (Some(_), _) => assert!(result.is_err() && left.is_empty(), "{result:?} {left:?}"),
             }
+        }
+    }
+
+    /// A download stopped while its file is checked keeps the file under its partial name with its
+    /// resume state, all of it there; run again, it only checks the file again: no request for its
+    /// bytes but the probe's (its HEAD and the file's start), and no second copy.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_download_stopped_while_it_is_checked_only_checks_again() {
+        let data = content(2 * MIB);
+        let dir = tempfile::tempdir().unwrap();
+        let wait = Duration::from_secs(2);
+        let files = vec![("/dir/file.bin.sha256".to_string(), "text/plain".to_string(), sha256_hex(&data))];
+        // 64 KiB a piece every 5 ms: about 160 ms for the file over one connection.
+        let site = Site { files, sidecars_wait: wait, pace: Duration::from_millis(5), ..Site::default() };
+        let (url, log) = serve(data.clone(), site).await;
+        let options = || DownloadOptions { output_path: Some(dir.path().join("")), ..DownloadOptions::default() };
+        let (tx, mut rx) = broadcast::channel::<EngineSnapshot>(1024);
+        let engine = Arc::new(DownloadEngine::new(vec![url.clone()], options()));
+        let run = tokio::spawn({
+            let engine = Arc::clone(&engine);
+            async move { engine.run(Some(tx)).await }
+        });
+        while let Ok(snapshot) = rx.recv().await {
+            if snapshot.checking {
+                break;
+            }
+        }
+        let stopped = std::time::Instant::now();
+        engine.cancel();
+        let result = run.await.unwrap();
+        assert!(stopped.elapsed() < wait, "it stops at once, not after the checksum file's {wait:?}: {:?}", stopped.elapsed());
+        assert_eq!(result.as_deref().map_err(String::as_str), Err(crate::engine::CANCELLED));
+        let part = crate::engine::part_path(&dir.path().join("file.bin"));
+        let state = crate::state::DownloadState::load_from_path(&crate::state::DownloadState::state_file_path(&part)).unwrap().unwrap();
+        assert_eq!(crate::range::merge_ranges(state.completed_ranges), [ByteRange::new(0, data.len() as u64 - 1).unwrap()]);
+        assert!(!dir.path().join("file.bin").exists());
+
+        let before = log.lock().unwrap().len();
+        let (done, checked) = download(vec![url], dir.path(), options()).await;
+        assert_eq!(done.unwrap(), dir.path().join("file.bin"));
+        assert_eq!(checked.as_deref(), Some("the site's SHA-256"));
+        assert_eq!(std::fs::read(dir.path().join("file.bin")).unwrap(), data);
+        let left: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(left, ["file.bin"], "no second copy");
+        let asked: Vec<_> = log.lock().unwrap()[before..].iter().filter(|(path, _)| path == "/dir/file.bin").cloned().collect();
+        assert!(asked.iter().all(|(_, range)| range.is_none_or(|(start, _)| start == 0)), "only the probe's: {asked:?}");
+    }
+
+    /// A newer version that fails the site's checksum, with `only_if_newer` (or a delta from the
+    /// file it replaces), leaves the old file as it was.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_newer_version_that_fails_leaves_the_old_file() {
+        let data = content(300 * 1024);
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("file.bin");
+        std::fs::write(&old, b"the version the user has").unwrap();
+        let files = vec![("/dir/SHA256SUMS".to_string(), "text/plain".to_string(), format!("{}  file.bin", "0".repeat(64)))];
+        let (url, _) = serve(data, Site { files, sidecars_wait: Duration::from_millis(100), ..Site::default() }).await;
+        for delta in [false, true] {
+            let options = DownloadOptions {
+                output_path: Some(old.clone()),
+                only_if_newer: !delta,
+                delta_from: delta.then(|| old.clone()),
+                ..DownloadOptions::default()
+            };
+            let result = DownloadEngine::new(vec![url.clone()], options).run(None).await;
+            assert!(result.as_ref().is_err_and(|e| e.contains("the site's published SHA-256")), "{result:?}");
+            assert_eq!(std::fs::read(&old).unwrap(), b"the version the user has", "delta: {delta}");
+            let left: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+            assert_eq!(left, ["file.bin"], "delta: {delta}");
         }
     }
 

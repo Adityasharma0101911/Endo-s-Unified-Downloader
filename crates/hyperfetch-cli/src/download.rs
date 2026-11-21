@@ -374,13 +374,13 @@ impl Clients {
     }
 }
 
-/// The running downloads of a batch known to be small (see `EngineSnapshot::small`), those whose
-/// file is in place (see `EngineSnapshot::in_place`), and a wake-up for the batch when one becomes
-/// either: it may start another (see [`may_start`]).
+/// The running downloads of a batch known to be small (see `EngineSnapshot::small`), those with
+/// nothing more to send (see `EngineSnapshot::place_free`), and a wake-up for the batch when one
+/// becomes either: it may start another (see [`may_start`]).
 #[derive(Default)]
 struct Small {
     count: AtomicUsize,
-    in_place: AtomicUsize,
+    free: AtomicUsize,
     found: Notify,
 }
 
@@ -389,7 +389,7 @@ impl Small {
         match counted {
             Counted::No => None,
             Counted::Small => Some(&self.count),
-            Counted::InPlace => Some(&self.in_place),
+            Counted::Free => Some(&self.free),
         }
     }
 }
@@ -398,18 +398,18 @@ impl Small {
 enum Counted {
     No,
     Small,
-    InPlace,
+    Free,
 }
 
 /// A download counted among the small ones while its last snapshot says it is, and among those
-/// in place from the first that says so, until it ends.
+/// with nothing more to send from the first that says so, until it ends.
 struct CountedSmall<'a>(&'a Small, Counted);
 
 impl CountedSmall<'_> {
     fn see(&mut self, snapshot: &EngineSnapshot) {
         let now = match self.1 {
-            Counted::InPlace => Counted::InPlace,
-            _ if snapshot.in_place => Counted::InPlace,
+            Counted::Free => Counted::Free,
+            _ if snapshot.place_free => Counted::Free,
             _ if snapshot.small => Counted::Small,
             _ => Counted::No,
         };
@@ -440,7 +440,9 @@ impl Drop for CountedSmall<'_> {
 /// installed, is not known, the downloads that need it (see [`Job::needs_ffmpeg`]) wait for it and
 /// the others go ahead of them; every download that starts once it is known goes by it. After a
 /// shutdown request no new job starts and running ones stop with their state saved. Running
-/// several at once, results arrive in completion order, so each result line names its input.
+/// several at once, results arrive in completion order, so each result line names its input; one
+/// at a time, they come in the order of the input, though the next download starts once the one
+/// before has nothing more to send (its file is read and checked on disk meanwhile).
 pub async fn run_jobs(jobs: Vec<Job>, concurrency: usize, ui: &Ui, shutdown: &Shutdown, ffmpeg: Option<FfmpegAnswer>) -> usize {
     let overall = (jobs.len() > 1 && !ui.quiet).then(|| {
         let bar = ui.multi.add(ProgressBar::new(jobs.len() as u64).with_style(style(OVERALL)).with_prefix("Total"));
@@ -450,13 +452,15 @@ pub async fn run_jobs(jobs: Vec<Job>, concurrency: usize, ui: &Ui, shutdown: &Sh
     let named = concurrency > 1 && jobs.len() > 1;
     let clients = Clients::for_jobs(&jobs).await;
     let small = Small::default();
+    // How many results of a batch run one at a time are out, in its order (see `Turn`).
+    let (printed, mut started) = (tokio::sync::watch::Sender::new(0), 0);
     let mut stop = shutdown.subscribe();
     let (mut waiting, mut running) = (VecDeque::from(jobs), FuturesUnordered::new());
     let mut failed = 0;
     loop {
-        // A download whose file is in place holds no place, one at a time too: what is left of it
-        // is the site's checksum, checked behind it.
-        while may_start(running.len().saturating_sub(small.in_place.load(Ordering::SeqCst)), small.count.load(Ordering::SeqCst), concurrency) {
+        // A download with nothing more to send to any host holds no place, one at a time too:
+        // what is left of it is read from disk.
+        while may_start(running.len().saturating_sub(small.free.load(Ordering::SeqCst)), small.count.load(Ordering::SeqCst), concurrency) {
             // None when nothing is asked; Some(None) while it is not answered.
             let answer = ffmpeg.as_ref().map(|answer| answer.peek().copied());
             let next = waiting.iter().position(|job| answer != Some(None) || !job.needs_ffmpeg());
@@ -465,7 +469,9 @@ pub async fn run_jobs(jobs: Vec<Job>, concurrency: usize, ui: &Ui, shutdown: &Sh
                 job.options.install_ffmpeg = install;
             }
             let input = named.then(|| input_name(job.line, &job.urls)).flatten();
-            running.push(run_job(job, input, &clients, ui, shutdown, overall.as_ref(), &small));
+            let turn = (concurrency <= 1).then(|| Turn { n: started, printed: &printed });
+            started += 1;
+            running.push(run_job(job, input, &clients, ui, shutdown, overall.as_ref(), &small, turn));
         }
         let unanswered = ffmpeg.clone().filter(|answer| answer.peek().is_none() && !waiting.is_empty());
         tokio::select! {
@@ -493,6 +499,25 @@ pub async fn run_jobs(jobs: Vec<Job>, concurrency: usize, ui: &Ui, shutdown: &Sh
         bar.abandon();
     }
     failed
+}
+
+/// The place of a download's result in a batch run one at a time: the `n`th, printed once the
+/// results before it are (`printed` counts them), and counted out when dropped.
+struct Turn<'a> {
+    n: usize,
+    printed: &'a tokio::sync::watch::Sender<usize>,
+}
+
+impl Turn<'_> {
+    async fn wait(&self) {
+        let _ = self.printed.subscribe().wait_for(|&printed| printed >= self.n).await;
+    }
+}
+
+impl Drop for Turn<'_> {
+    fn drop(&mut self) {
+        self.printed.send_modify(|printed| *printed = (*printed).max(self.n + 1));
+    }
 }
 
 /// "line 3 https://host/path/file": the input-file line that listed the job, if one did, and its
@@ -555,6 +580,8 @@ pub fn item(
 pub type Item = Vec<(&'static str, serde_json::Value)>;
 
 /// `input` is what result lines call the download (see [`input_name`]); None uses its file name.
+/// With a `turn`, its result waits for those before it.
+#[allow(clippy::too_many_arguments)]
 async fn run_job(
     job: Job,
     input: Option<String>,
@@ -563,12 +590,18 @@ async fn run_job(
     shutdown: &Shutdown,
     overall: Option<&ProgressBar>,
     small: &Small,
+    turn: Option<Turn<'_>>,
 ) -> Outcome {
     let mut small = CountedSmall(small, Counted::No);
     let mut stop = shutdown.subscribe();
     if stop.borrow().is_some() {
         return Outcome::Interrupted;
     }
+    let my_turn = || async {
+        if let Some(turn) = &turn {
+            turn.wait().await;
+        }
+    };
     let started_at = unix_now();
     let urls: Vec<String> = job.urls.iter().map(Url::to_string).collect();
     let (url, checksum, only_if_newer) = (urls.first().cloned(), job.options.expected_checksum.clone(), job.options.only_if_newer);
@@ -578,6 +611,7 @@ async fn run_job(
     let engine = match clients.engine(job.urls, job.options) {
         Ok(engine) => engine,
         Err(err) => {
+            my_turn().await;
             ui.error(&format!("[FAILED] {}: {}", input.as_deref().unwrap_or(&job.label), err));
             ui.report(failed(None, None, &err));
             return Outcome::Failed;
@@ -623,6 +657,7 @@ async fn run_job(
         }
     };
     view.bar.finish_and_clear();
+    my_turn().await;
 
     match result {
         Ok(path) => {
@@ -875,8 +910,7 @@ mod tests {
         let job = |name: &str| Job {
             label: name.to_string(),
             urls: vec![Url::parse(&format!("{}/{}.bin", server, name)).unwrap()],
-            // Without the site's checksum read behind each file, whose connections the next one could not reuse.
-            options: DownloadOptions { output_path: Some(dir.join("")), remote_checksum: false, ..Default::default() },
+            options: DownloadOptions { output_path: Some(dir.join("")), ..Default::default() },
             line: None,
         };
         let mut jobs: Vec<Job> = ["a", "b", "c"].iter().map(|name| job(name)).collect();
@@ -919,20 +953,16 @@ mod tests {
         let text = std::fs::read_to_string(&log).unwrap();
         let items: Vec<serde_json::Value> =
             text.lines().filter(|line| line.starts_with('{')).map(|line| serde_json::from_str(line).unwrap()).collect();
-        let mut statuses: Vec<&str> = items.iter().map(|item| item["status"].as_str().unwrap()).collect();
-        // A file in place frees its place, so the next one may end before its checksum is checked.
-        statuses[..2].sort();
-        assert_eq!(statuses, ["failed", "ok", "up-to-date"], "{text}");
-        let with = |status: &str| items.iter().find(|item| item["status"] == status).unwrap();
-        let (ok, failed) = (with("ok"), with("failed"));
+        let statuses: Vec<&str> = items.iter().map(|item| item["status"].as_str().unwrap()).collect();
+        assert_eq!(statuses, ["ok", "failed", "up-to-date"], "{text}");
         // The keys in their documented order.
-        let line = text.lines().find(|line| line.starts_with(r#"{"status":"failed","url":"#)).unwrap();
-        assert!(line.contains(r#","path":null,"size":null,"checksum":null,"checked_against":null,"error":""#), "{line}");
+        let failed = text.lines().find(|line| line.starts_with(r#"{"status":"failed","url":"#)).unwrap();
+        assert!(failed.contains(r#","path":null,"size":null,"checksum":null,"checked_against":null,"error":""#), "{failed}");
         let path = dir.join("a.bin").display().to_string();
-        assert_eq!((ok["path"].as_str(), ok["size"].as_u64()), (Some(path.as_str()), Some(body.len() as u64)));
-        assert!(ok["url"].as_str().unwrap().ends_with("/dated/a.bin?token=REDACTED"), "{ok}");
-        assert!(ok["error"].is_null() && ok["checksum"].is_null() && ok["checked_against"].is_null());
-        assert!(failed["error"].as_str().unwrap().contains("cookies"), "{failed}");
+        assert_eq!((items[0]["path"].as_str(), items[0]["size"].as_u64()), (Some(path.as_str()), Some(body.len() as u64)));
+        assert!(items[0]["url"].as_str().unwrap().ends_with("/dated/a.bin?token=REDACTED"), "{}", items[0]);
+        assert!(items[0]["error"].is_null() && items[0]["checksum"].is_null() && items[0]["checked_against"].is_null());
+        assert!(items[1]["error"].as_str().unwrap().contains("cookies"), "{}", items[1]);
         assert_eq!(items[2]["path"].as_str(), Some(path.as_str()));
         assert!(text.contains("[FAILED] b: "), "the human lines too: {text}");
         assert!(!text.contains("secret"), "{text}");

@@ -57,8 +57,9 @@ pub struct Args {
     #[arg(short = 'c', long = "chunk-size", default_value_t = 4, value_parser = clap::value_parser!(u64).range(1..=1024))]
     pub chunk_size_mb: u64,
 
-    /// Downloads to run at the same time in batch mode (1-32); above 1, results are printed as
-    /// they finish, each naming its input
+    /// Downloads to run at the same time in batch mode (1-32). The next one starts once one has
+    /// nothing more to send (its file is still checked on disk). At 1, results come in the input's
+    /// order; above 1, as they finish, each naming its input
     #[arg(short = 'j', long = "max-concurrent-downloads", default_value_t = 4, value_parser = clap::value_parser!(u64).range(1..=32))]
     pub jobs: u64,
 
@@ -144,9 +145,10 @@ pub struct Args {
     #[arg(long = "no-remote-checksum")]
     pub no_remote_checksum: bool,
 
-    /// Autopilot: each download starts as one stream, the request a plain download sends, and
-    /// finds its connections as it goes, up to -s: more only once they pay and while they make it
-    /// faster, and the fewest that reach what the server or the line allows; -v says why (the
+    /// Autopilot: each download starts as one stream, the request a plain download sends (from a
+    /// server it learned is faster with more, with those at once), and finds its connections as it
+    /// goes, up to -s: more only once they pay and while they make it faster, and the fewest that
+    /// reach what the server or the line allows; -v says why. Off under a speed limit (the
     /// default; this undoes a --no-adaptive from the config file)
     #[arg(long = "adaptive", overrides_with = "no_adaptive")]
     pub adaptive: bool,

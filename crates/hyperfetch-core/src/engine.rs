@@ -153,12 +153,18 @@ pub struct EngineSnapshot {
     /// Why a download over ranges has the connections it has, in a line for the user: what the
     /// Autopilot chose and why (see `crate::autopilot`), or that it is off. None for others.
     pub autopilot: Option<String>,
-    /// Every byte is in and the file has its final name (`target_path`): the download is done
-    /// for the user, and its place in a batch or queue is free. Set from the first snapshot that
-    /// says so to the last. The check against the site's published checksum may still go on: the
-    /// download's `run` resolves only with that verdict, and one the file fails fails it as it
-    /// always did (the same message, the file removed).
+    /// Never set any more: a file takes its final name only once its checks are done (see
+    /// `checking`, `place_free`). Kept until the front ends stop reading it.
     pub in_place: bool,
+    /// Every byte is written and the file, still under its partial name, is being checked (the
+    /// user's checksum, the site's, a metalink's pieces): it is at 100 %, not done. The download is
+    /// done once `run` resolves.
+    pub checking: bool,
+    /// The download has nothing more to send to any host: every byte is in and its checksum
+    /// lookups have their answers or ran out of time, so what is left of it (reading the file,
+    /// post-processing) is local. Its place in a batch or queue is free: the next may start. Set
+    /// from the first snapshot that says so to the last.
+    pub place_free: bool,
 }
 
 impl EngineSnapshot {
@@ -682,6 +688,9 @@ pub struct DownloadEngine {
     /// The checksum the file's site publishes, being looked for, and whether it confirmed the
     /// file (see `DownloadOptions::remote_checksum`).
     site: Arc<Mutex<crate::digest::Site>>,
+    /// Its file passed its checks and took its name (see `finalize`): a stop that came after
+    /// takes nothing from it.
+    finished: Arc<AtomicBool>,
 }
 
 impl DownloadEngine {
@@ -733,6 +742,7 @@ impl DownloadEngine {
                     already_done: Arc::default(),
                     reused: Arc::default(),
                     site: Arc::default(),
+                    finished: Arc::default(),
                 },
             },
             // A password alone adds no header, but is scoped as they are (see `media_options_for`).
@@ -755,6 +765,7 @@ impl DownloadEngine {
             already_done: Arc::default(),
             reused: Arc::default(),
             site: Arc::default(),
+            finished: Arc::default(),
         }
     }
 
@@ -892,7 +903,9 @@ impl DownloadEngine {
         // files, the User-Agent it answers) is kept for the next run, a small file's too.
         let _ = blocking(hosts::save).await;
         let lines = &self.options.archive_lines;
-        if result.is_ok() && !lines.is_empty() && !self.cancel_token.is_cancelled() {
+        // A file that passed its checks is whole, whenever a stop came.
+        let whole = !self.cancel_token.is_cancelled() || self.finished.load(Ordering::SeqCst);
+        if result.is_ok() && !lines.is_empty() && whole {
             crate::media::archive_downloaded(crate::media::archive_file().as_deref(), lines.clone()).await;
         }
         let reused = result.as_ref().is_ok_and(|path| self.already_done.lock().unwrap().as_ref() == Some(path));
@@ -917,7 +930,7 @@ impl DownloadEngine {
             if !done.notes.is_empty() {
                 let size = crate::postprocess::size_of(&done.path);
                 let checked_against = self.checked_against();
-                emit(&snapshot_tx, || EngineSnapshot { notes: done.notes, checked_against, ..done_snapshot(size, &done.path) });
+                emit(&snapshot_tx, || EngineSnapshot { notes: done.notes, checked_against, place_free: true, ..done_snapshot(size, &done.path) });
             }
             result = Ok(done.path);
         }
@@ -2947,8 +2960,12 @@ impl DownloadEngine {
             // asks for one in `finalize`), hashed from memory.
             _ if whole => {
                 let (path, expected) = (part.clone(), self.options.expected_checksum.clone());
+                // Its state says it is all there: stopped while it is checked, it is checked again.
+                let mut state = state.clone();
+                state.completed_ranges = ByteRange::from_len(0, prefetched.len() as u64).into_iter().collect();
+                let state_path = state_path.clone();
                 let digest = blocking(move || {
-                    let written = std::fs::write(&path, &prefetched);
+                    let written = std::fs::write(&path, &prefetched).and_then(|()| state.save_atomic(&state_path).map_err(std::io::Error::other));
                     if written.is_err() {
                         // Without a state file nothing could resume it.
                         let _ = std::fs::remove_file(&path);
@@ -3356,18 +3373,17 @@ impl DownloadEngine {
         }
         let _ = blocking(hosts::save).await;
 
+        // Every byte on disk before the state says so, also when they are all in: stopped while
+        // its file is checked, the download only checks it again when it runs again.
+        saved(job.save()).await;
         match outcome {
-            // No flush here: `finalize` flushes (with fsync_on_complete) while it hashes.
             Ok(()) => {
                 let mut site = self.site.lock();
                 site.copies = crate::range::merge_ranges(std::mem::take(&mut *from_copies.lock()));
                 site.primary = Some(reference.url.clone());
                 Ok(job.writer)
             }
-            Err(e) => {
-                saved(job.save()).await;
-                Err(e)
-            }
+            Err(e) => Err(e),
         }
     }
 
@@ -3651,10 +3667,16 @@ impl DownloadEngine {
         }
     }
 
-    /// Verifies the finished `.part` of `final_path`, moves it to its final name and records it in
-    /// history, with the server's `etag`. The claim on the name is released only once the file is
-    /// in place (or discarded). With `replace` (see `DownloadOptions::only_if_newer`) it takes the
-    /// place of the file at `final_path`, if it keeps that name.
+    /// Checks the finished `.part` of `final_path` (the user's checksum, then the site's: see
+    /// `crate::digest::finish`), marks it as downloaded from the internet (see
+    /// `PostOptions::mark_of_the_web`), moves it to its final name and records it in history,
+    /// with the server's `etag`. Until that verdict the file keeps its partial name and its resume
+    /// state, so a download stopped meanwhile only checks it again when it runs again, and a file
+    /// that fails is never seen under its name. Its snapshots say when every byte is in and it is
+    /// being checked ([`EngineSnapshot::checking`]), and when it has nothing more to send to any
+    /// host ([`EngineSnapshot::place_free`]). The claim on the name is released only once the file
+    /// is in place (or discarded). With `replace` (see `DownloadOptions::only_if_newer`) it takes
+    /// the place of the file at `final_path`, if it keeps that name.
     #[allow(clippy::too_many_arguments)]
     async fn finalize(
         &self,
@@ -3672,57 +3694,55 @@ impl DownloadEngine {
             Written::Writer(writer) => Some(writer.clone()),
             _ => None,
         };
-        let verified = self.verify_written(&part, written).await;
-        // A name from the server without a real extension takes the one its contents show.
-        let by_content = self.options.output_path.as_deref().is_none_or(is_dir_target);
-        let place = {
-            let (part, state_path) = (part.clone(), state_path.clone());
-            move || blocking(move || put_in_place(&part, final_path, &state_path, by_content, replace))
-        };
-        // With only the site's checksum left to check, which a file can only fail and be removed
-        // over (not a metalink's pieces, nor what other mirrors sent, fetched again into the
-        // `.part`), the file takes its name first: the download is done for the user, and frees
-        // its place, while that check goes on.
-        let early = verified.is_ok() && self.options.metalink_pieces.is_none() && {
+        let size = tokio::fs::metadata(&part).await.map_or(0, |m| m.len());
+        let checking = |free: bool| EngineSnapshot { checking: true, place_free: free, ..done_snapshot(size, &final_path) };
+        emit(snapshot_tx, || checking(false));
+        // A metalink's pieces, or what other mirrors sent, may fail and be fetched again.
+        let refetch = self.options.metalink_pieces.is_some() || {
             let site = self.site.lock();
-            site.primary_only || site.copies.is_empty()
+            !site.primary_only && !site.copies.is_empty()
         };
-        let placed = match early {
-            true => {
-                let (target, size) = place.clone()().await??;
-                tracing::info!("In place: {}; the site's checksum, if it has one, is checked behind it", target.display());
-                emit(snapshot_tx, || EngineSnapshot { in_place: true, ..done_snapshot(size, &target) });
-                Some((target, size))
+        let verified = self.verify_written(&part, written).await;
+        let quiet = || {
+            if !refetch {
+                emit(snapshot_tx, || checking(true));
             }
-            false => None,
         };
-        let checked = placed.as_ref().map_or_else(|| part.clone(), |(target, _)| target.clone());
-        let blake3_hex = match crate::digest::finish(&checked, verified, &self.options, &self.site, writer).await {
+        let blake3_hex = match crate::digest::finish(&part, verified, &self.options, &self.site, writer, &self.cancel_token, quiet).await {
             Ok(hash) => hash,
             Err(Unfinished::Wrong(e)) => {
                 // Resuming would only reproduce the same bytes, so start from scratch next time.
                 let _ = blocking(move || {
-                    let _ = std::fs::remove_file(&checked);
+                    let _ = std::fs::remove_file(&part);
                     let _ = DownloadState::remove(&state_path);
                     drop(claim);
                 })
                 .await;
                 return Err(e);
             }
+            // The `.part` and its state stay: run again, the download checks it again.
             Err(Unfinished::Io(e)) => return Err(e),
             // The `.part` and its state stay, for `run` to fetch those pieces again.
             Err(Unfinished::Refetch) => return Err(crate::digest::REFETCH.to_string()),
             Err(Unfinished::FromPrimary) => return Err(crate::digest::FROM_PRIMARY.to_string()),
         };
-        let (target, size) = match placed {
-            Some(placed) => placed,
-            None => place().await??,
-        };
+        // A name from the server without a real extension takes the one its contents show.
+        let by_content = self.options.output_path.as_deref().is_none_or(is_dir_target);
+        // Marked before it has a name anything opens it by (post-processing marks it again).
+        let mark = self.urls.first().filter(|_| self.options.post.mark_of_the_web).cloned();
+        let (target, size) = blocking(move || {
+            if let Some(source) = mark {
+                crate::postprocess::mark_from_internet(&part, &source);
+            }
+            put_in_place(&part, final_path, &state_path, by_content, replace)
+        })
+        .await??;
         drop(claim);
+        self.finished.store(true, Ordering::SeqCst);
         tracing::info!("Download completed: {} (BLAKE3 {})", target.display(), blake3_hex);
         self.record_completed(target.clone(), Some(size), blake3_hex, started_at, None, etag).await;
 
-        emit(snapshot_tx, || EngineSnapshot { checked_against: self.checked_against(), in_place: true, ..done_snapshot(size, &target) });
+        emit(snapshot_tx, || EngineSnapshot { checked_against: self.checked_against(), place_free: true, ..done_snapshot(size, &target) });
         Ok(target)
     }
 

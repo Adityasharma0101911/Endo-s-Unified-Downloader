@@ -86,10 +86,17 @@ pub struct QueueItem {
     /// Running, it is known small (see `EngineSnapshot::small`).
     #[serde(skip)]
     pub small: bool,
-    /// Running, its file is complete under its final name (see `EngineSnapshot::in_place`): done
-    /// for the user, and holding no place in the queue, while the site's checksum is checked.
+    /// Never set any more (see `EngineSnapshot::in_place`). Kept until the app stops reading it.
     #[serde(skip)]
     pub in_place: bool,
+    /// Running, every byte is in and its file is being checked (see `EngineSnapshot::checking`):
+    /// at 100 %, not done.
+    #[serde(skip)]
+    pub checking: bool,
+    /// Running, it has nothing more to send to any host (see `EngineSnapshot::place_free`): it
+    /// holds no place in the queue, one at a time too.
+    #[serde(skip)]
+    pub place_free: bool,
 }
 
 impl QueueItem {
@@ -202,6 +209,8 @@ impl DownloadQueue {
             priority: Priority::Normal,
             small: false,
             in_place: false,
+            checking: false,
+            place_free: false,
         });
         id
     }
@@ -254,7 +263,7 @@ impl DownloadQueue {
     /// Whether the queue, running `max_concurrent` downloads at once, may start another (see
     /// [`may_start`]).
     pub fn may_start(&self, max_concurrent: usize) -> bool {
-        let running = || self.items.iter().filter(|i| i.status.is_active() && !i.in_place);
+        let running = || self.items.iter().filter(|i| i.status.is_active() && !i.place_free);
         may_start(running().count(), running().filter(|i| i.small).count(), max_concurrent)
     }
 
@@ -327,7 +336,7 @@ impl DownloadQueue {
                 }
                 item.status = QueueItemStatus::Downloading;
                 item.speed_bytes_per_sec = 0.0;
-                (item.small, item.in_place) = (false, false);
+                (item.small, item.in_place, item.checking, item.place_free) = (false, false, false, false);
                 true
             }
             _ => false,
@@ -351,6 +360,7 @@ impl DownloadQueue {
     pub fn apply_snapshot(&mut self, id: usize, snapshot: &EngineSnapshot) {
         let Some(item) = self.items.iter_mut().find(|i| i.id == id) else { return };
         (item.small, item.in_place) = (snapshot.small, item.in_place || snapshot.in_place);
+        (item.checking, item.place_free) = (snapshot.checking, item.place_free || snapshot.place_free);
         if snapshot.from_probe() {
             return;
         }
@@ -721,17 +731,21 @@ mod tests {
         assert!(!q.may_start(3), "started again, it takes a place until its snapshot tells");
     }
 
-    /// A download whose file is in place takes no place of the queue's while the site's checksum
-    /// is checked, a queue of one at a time too; started again, it takes one.
+    /// A download being checked holds its place while it may still ask a host anything; once it
+    /// has nothing more to send it takes no place of the queue's, a queue of one at a time too;
+    /// started again, it takes one.
     #[test]
-    fn a_file_in_place_frees_its_place() {
+    fn a_download_with_nothing_more_to_send_frees_its_place() {
         let (mut q, ids) = queue_of(&["https://e.com/a", "https://e.com/b"]);
         q.mark_started(ids[0]);
         assert!(!q.may_start(1));
-        q.apply_snapshot(ids[0], &EngineSnapshot { total_bytes: 1000, downloaded_bytes: 1000, in_place: true, ..Default::default() });
-        assert!(q.get_item(ids[0]).unwrap().in_place && q.may_start(1));
+        let all_in = EngineSnapshot { total_bytes: 1000, downloaded_bytes: 1000, checking: true, ..Default::default() };
+        q.apply_snapshot(ids[0], &all_in);
+        assert!(q.get_item(ids[0]).unwrap().checking && !q.may_start(1), "its checksum lookups may still be out");
+        q.apply_snapshot(ids[0], &EngineSnapshot { place_free: true, ..all_in.clone() });
+        assert!(q.get_item(ids[0]).unwrap().place_free && q.may_start(1));
         q.apply_snapshot(ids[0], &EngineSnapshot { total_bytes: 1000, downloaded_bytes: 1000, ..Default::default() });
-        assert!(q.may_start(1), "it stays in place");
+        assert!(q.may_start(1), "it stays free");
         q.finish(ids[0], Err(CANCELLED.into()));
         q.mark_started(ids[0]);
         assert!(!q.may_start(1));
