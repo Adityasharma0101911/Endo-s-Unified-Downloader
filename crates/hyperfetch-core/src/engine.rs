@@ -4690,9 +4690,9 @@ impl RangeJob {
     /// The width `pilot` moves an adaptive download to, if it moves (see [`Autopilot::next`]);
     /// call it every few hundred milliseconds.
     fn steer(&self, pilot: &mut Autopilot) -> Option<usize> {
-        let (downloaded, size) = {
+        let (downloaded, first, size) = {
             let chunks = self.chunks.lock();
-            (chunks.total_received(), chunks.total_size())
+            (chunks.total_received(), chunks.first_received(), chunks.total_size())
         };
         // What a new request takes to answer: the least of the mirrors in use.
         let (startup, urls) = {
@@ -4728,7 +4728,7 @@ impl RangeJob {
             return opened;
         }
         if pilot.is_judging() {
-            let judged = pilot.judge(now, downloaded, self.widened_to(2), setup);
+            let judged = pilot.judge(now, downloaded, first, self.widened_to(2), setup);
             // The one more keeps its half; the rest take theirs from the far end of what is left.
             if let Some(width) = judged {
                 self.chunks.lock().spread(width - 1, MIN_STEAL);
@@ -10411,23 +10411,29 @@ mod tests {
     /// first, so the first refused ends it, and what that request was to bring comes over the
     /// first stream's. It never waits out the rest: it ends within one and a half times what one
     /// stream takes, and the host refuses one request at most. Many times over, as the fault was
-    /// one of timing.
+    /// one of timing; from a host 50 ms away too, where the first stream reaches the end of its
+    /// own piece before the last request it widens with is answered, and goes on over the pieces
+    /// after it that no connection has yet.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_a_refusal_while_widening_strands_nothing() {
         let (size, per_connection) = (4 * 1024 * 1024, 4e6);
-        let one_stream = Duration::from_secs_f64(size as f64 / per_connection);
-        for k in 1..=3 {
-            for run in 0..4 {
-                let server = crate::netsim::Server { size, per_connection: Some(per_connection), max_connections: Some(k), refusal: (429, Some(6)), ..Default::default() };
-                let (url, stats) = crate::netsim::serve(server).await;
-                let dir = tempdir().unwrap();
-                let started = Instant::now();
-                let (got, said) = fetch_from_sim(&url, sim_options(dir.path(), 8, true)).await;
-                let took = started.elapsed();
-                assert!(got == crate::netsim::file(size), "k {k}, run {run}");
-                let refused = stats.refused.load(Ordering::SeqCst);
-                assert!(took < one_stream * 3 / 2, "k {k}, run {run}: {took:?} against {one_stream:?}, {refused} refused, {said:?}");
-                assert!(refused <= 1, "k {k}, run {run}: {refused} refused, {said:?}");
+        for first_byte in [Duration::ZERO, Duration::from_millis(50)] {
+            let one_stream = first_byte + Duration::from_secs_f64(size as f64 / per_connection);
+            for k in 1..=3 {
+                for run in 0..3 {
+                    let refusal = (429, Some(6));
+                    let server = crate::netsim::Server { size, per_connection: Some(per_connection), max_connections: Some(k), refusal, first_byte, ..Default::default() };
+                    let (url, stats) = crate::netsim::serve(server).await;
+                    let dir = tempdir().unwrap();
+                    let started = Instant::now();
+                    let (got, said) = fetch_from_sim(&url, sim_options(dir.path(), 8, true)).await;
+                    let took = started.elapsed();
+                    let at = format!("{first_byte:?} away, k {k}, run {run}");
+                    assert!(got == crate::netsim::file(size), "{at}");
+                    let refused = stats.refused.load(Ordering::SeqCst);
+                    assert!(took < one_stream * 3 / 2, "{at}: {took:?} against {one_stream:?}, {refused} refused, {said:?}");
+                    assert!(refused <= 1, "{at}: {refused} refused, {said:?}");
+                }
             }
         }
     }
@@ -10443,6 +10449,25 @@ mod tests {
         assert!(got == crate::netsim::file(size));
         assert!(asked(&stats).0 <= 2 && stats.peak.load(Ordering::SeqCst) <= 2, "{:?}, {said:?}", asked(&stats));
         assert_eq!(hosts::best_connections(&url), Some(1), "{said:?}");
+    }
+
+    /// A host that holds each connection to 4 MB/s, whose first request from 4 MiB on fades out
+    /// after 256 KiB: that is the one more the Autopilot tries beside the first stream, which
+    /// keeps its speed meanwhile. The fading connection, not what holds them both, was slow: the
+    /// rest open, and the download ends well before one stream would.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_one_more_that_fades_out_on_its_own_does_not_keep_the_download_alone() {
+        let (size, per_connection) = (16 * 1024 * 1024, 4e6);
+        let decay = crate::netsim::Decay { from: 4 * 1024 * 1024, full: 256 * 1024, rate: 64e3, every: Duration::from_secs(1) };
+        let server = crate::netsim::Server { size, per_connection: Some(per_connection), decay: Some(decay), ..Default::default() };
+        let (url, stats) = crate::netsim::serve(server).await;
+        let dir = tempdir().unwrap();
+        let started = Instant::now();
+        let (got, said) = fetch_from_sim(&url, sim_options(dir.path(), 8, true)).await;
+        let took = started.elapsed();
+        assert!(got == crate::netsim::file(size));
+        let one_stream = Duration::from_secs_f64(size as f64 / per_connection);
+        assert!(stats.peak.load(Ordering::SeqCst) > 2 && took < one_stream / 2, "{took:?} against {one_stream:?}, {said:?}");
     }
 
     /// A host 100 ms away met before, which took four requests at once and refused a fifth, and

@@ -1142,7 +1142,7 @@ impl HttpWorker {
                         break Err(e);
                     }
                     // A thief may have left this chunk nothing beyond what just went to disk.
-                    if batch.pos > chunk.end_offset.load(Ordering::SeqCst) {
+                    if batch.pos > chunk.end_offset.load(Ordering::SeqCst) && !self.runs_on(chunk) {
                         break Ok(());
                     }
                     continue;
@@ -1175,8 +1175,11 @@ impl HttpWorker {
                 }
             }
             // Re-read the end: a thief may have taken the tail of this chunk.
-            let end = chunk.end_offset.load(Ordering::SeqCst);
             let received = batch.end();
+            let mut end = chunk.end_offset.load(Ordering::SeqCst);
+            while received + bytes.len() as u64 > end + 1 && self.runs_on(chunk) {
+                end = chunk.end_offset.load(Ordering::SeqCst);
+            }
             if received > end {
                 break Ok(());
             }
@@ -1229,6 +1232,13 @@ impl HttpWorker {
             ));
         }
         Ok(())
+    }
+
+    /// Whether the request for `chunk`, at its end, goes on over the piece after it while the
+    /// download widens (see [`ChunkManager::run_on`]).
+    fn runs_on(&self, chunk: &Chunk) -> bool {
+        let s = &self.shared;
+        s.ramp.is_widening() && s.chunks.lock().run_on(chunk.id)
     }
 
     /// Whether the attempt at `chunk_id`, which went at `rate` over its last window, makes way for

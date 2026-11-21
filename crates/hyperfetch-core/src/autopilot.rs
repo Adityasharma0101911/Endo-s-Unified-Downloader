@@ -84,6 +84,8 @@ enum Why {
     Opened(f64),
     /// Opened from that stream, each connection seen held to this rate.
     Held(f64),
+    /// Opened from that stream, which kept this speed beside one more that was slow of its own.
+    Beside(f64),
 }
 
 #[derive(Debug)]
@@ -179,8 +181,8 @@ struct Judging {
     base: f64,
     /// Why the width opens if it pays.
     paid: Why,
-    /// The download's speed since that connection's answer came.
-    reading: Option<Reading>,
+    /// The download's speed since that connection's answer came, and the bytes the stream had in then.
+    reading: Option<(Reading, u64)>,
 }
 
 impl Autopilot {
@@ -309,26 +311,32 @@ impl Autopilot {
     /// its answer is in (`answered`), the download's speed is read as the stream's was, over
     /// windows as long as `startup`, or at once when its speed since the answer, the new
     /// connection's start and all, already is `GAIN` times the stream's alone. The width it goes
-    /// to: all it was to open when that pays, for the climb to go on from; else the stream alone,
-    /// the line or the host being what holds it, which is kept as the host's limit.
-    pub(crate) fn judge(&mut self, now: Instant, downloaded: u64, answered: bool, startup: Duration) -> Option<usize> {
+    /// to: all it was to open when that pays, for the climb to go on from, or when it does not
+    /// but the stream, with `first` bytes in, kept its speed beside the new connection, which was
+    /// then slow of its own (one fading out, say) and not held with it; else the stream alone,
+    /// the line or the host being what holds them both, which is kept as the host's limit.
+    pub(crate) fn judge(&mut self, now: Instant, downloaded: u64, first: u64, answered: bool, startup: Duration) -> Option<usize> {
         let judging = self.judging.as_mut()?;
         if !answered {
             judging.reading = None;
             return None;
         }
-        let (base, reading) = (judging.base, judging.reading.get_or_insert_with(|| Reading::new(now, downloaded)));
+        let (base, (reading, first_from)) = (judging.base, judging.reading.get_or_insert_with(|| (Reading::new(now, downloaded), first)));
         let average = reading.average(now, downloaded, startup).filter(|&average| average >= base * GAIN);
         let speed = match (reading.read(now, downloaded, startup), average) {
             (Some(steady), average) => steady.max(average.unwrap_or(0.0)),
             (None, Some(average)) => average,
             (None, None) => return None,
         };
-        let Judging { target, paid, .. } = *judging;
+        let elapsed = now.saturating_duration_since(reading.since.0).as_secs_f64();
+        let kept = first.saturating_sub(*first_from) as f64 * (1.0 + AGREE) >= base * elapsed;        let Judging { target, paid, .. } = *judging;
         self.judging = None;
         self.best = self.best.max(speed);
         if speed >= base * GAIN {
             return self.open_to(target, now, downloaded, paid);
+        }
+        if kept {
+            return self.open_to(target, now, downloaded, Why::Beside(base));
         }
         let why = self.held(speed.max(base));
         self.settle(1, why)
@@ -515,6 +523,10 @@ impl Autopilot {
                 format!("{c}: the first went at {}, and a second made it faster; more are tried while they make it faster", per_sec(speed))
             }
             Why::Held(rate) => format!("{c}: each connection is held to {}, so more bring more", per_sec(rate)),
+            Why::Beside(speed) => format!(
+                "{c}: the first kept its {} beside a second, which was slow of its own; more are tried while they make it faster",
+                per_sec(speed)
+            ),
         }
     }
 }
@@ -728,10 +740,10 @@ mod tests {
         assert_eq!(pilot.why(), "1 connection while its speed shows; more are opened only if they pay");
         assert_eq!(opened(&mut pilot, t0, 1000, 1 << 30, each, |ms| ms * 2_000), Some((200, 2)), "held to a rate: one more first");
         assert_eq!(target(&pilot), Some(16), "then all it may");
-        assert_eq!(pilot.judge(at(200), 400_000, true, startup), None);
-        assert_eq!(pilot.judge(at(210), 440_000, true, startup), None, "too soon to tell");
-        assert_eq!(pilot.judge(at(330), 920_000, true, startup), None, "one window tells nothing");
-        assert_eq!(pilot.judge(at(480), 1_520_000, true, startup), Some(16), "twice as fast: all it may");
+        assert_eq!(pilot.judge(at(200), 400_000, 400_000, true, startup), None);
+        assert_eq!(pilot.judge(at(210), 440_000, 420_000, true, startup), None, "too soon to tell");
+        assert_eq!(pilot.judge(at(330), 920_000, 660_000, true, startup), None, "one window tells nothing");
+        assert_eq!(pilot.judge(at(480), 1_520_000, 960_000, true, startup), Some(16), "twice as fast: all it may");
         assert_eq!(pilot.why(), "16 connections: each connection is held to 1.9 MiB/s, so more bring more");
         assert!(!pilot.is_alone() && pilot.next(at(1100), 4_000_000, 1 << 30, startup, None).is_none(), "its first window is not compared");
         let mut pilot = alone(Start { line: Some(10.0 * MB), ..Default::default() });
@@ -794,8 +806,9 @@ mod tests {
     }
 
     /// One more beside the stream is judged once its answer is in: all the rest open when it made
-    /// the download `GAIN` faster; else the stream alone goes on, and the speed it held is kept as
-    /// the host's limit.
+    /// the download `GAIN` faster, or when it did not but the stream kept its speed beside it (the
+    /// new connection was slow of its own, one fading out, say); else the stream alone goes on,
+    /// and the speed it held is kept as the host's limit.
     #[test]
     fn test_one_more_opens_the_rest_only_if_it_pays() {
         let (t0, startup) = (Instant::now(), Duration::from_millis(10));
@@ -807,18 +820,26 @@ mod tests {
         };
         // 4 MB/s alone; not answered yet, nothing is read.
         let mut pilot = stepped();
-        assert_eq!(pilot.judge(at(400), 1_600_000, false, startup), None);
-        // Answered at 400 ms; then 8 MB/s together.
-        let judged = |pilot: &mut Autopilot, per_ms: u64| (5..=20).map(|n| n * 100).find_map(|ms| pilot.judge(at(ms), 1_600_000 + (ms - 400) * per_ms, true, startup));
-        assert_eq!(judged(&mut pilot, 8_000), Some(8), "it paid: the rest open");
+        assert_eq!(pilot.judge(at(400), 1_600_000, 1_600_000, false, startup), None);
+        // Answered at 400 ms; then the download and its first stream go this many bytes a ms.
+        let judged = |pilot: &mut Autopilot, per_ms: u64, first_per_ms: u64| {
+            (5..=20).map(|n| n * 100).find_map(|ms| pilot.judge(at(ms), 1_600_000 + (ms - 400) * per_ms, 1_600_000 + (ms - 400) * first_per_ms, true, startup))
+        };
+        assert_eq!(judged(&mut pilot, 8_000, 4_000), Some(8), "it paid: the rest open");
         assert!(!pilot.is_judging() && !pilot.done, "{}", pilot.why());
         assert!(pilot.why().starts_with("8 connections: the first went at 3.8 MiB/s, and a second made it faster"), "{}", pilot.why());
-        // 4.2 MB/s together: the line or the host holds it.
+        // 4.2 MB/s together, the stream down to half: the line or the host holds them both.
         let mut pilot = stepped();
-        pilot.judge(at(400), 1_600_000, true, startup);
-        assert_eq!(judged(&mut pilot, 4_200), Some(1), "it did not: the stream alone");
+        pilot.judge(at(400), 1_600_000, 1_600_000, true, startup);
+        assert_eq!(judged(&mut pilot, 4_200, 2_100), Some(1), "it did not: the stream alone");
         assert_eq!((pilot.done, pilot.settled), (true, Some(1)));
         assert!(pilot.limit().is_some_and(|limit| (limit / 4.2e6 - 1.0).abs() < 0.05), "{:?}", pilot.limit());
+        // 4.2 MB/s together, the stream at its 4 MB/s: the new connection was slow of its own.
+        let mut pilot = stepped();
+        pilot.judge(at(400), 1_600_000, 1_600_000, true, startup);
+        assert_eq!(judged(&mut pilot, 4_200, 4_000), Some(8), "the rest open");
+        assert!(!pilot.done && pilot.limit().is_none(), "{}", pilot.why());
+        assert!(pilot.why().starts_with("8 connections: the first kept its 3.8 MiB/s beside a second, which was slow of its own"), "{}", pilot.why());
         // Refused while it widened, the host serving two: those, and no more.
         let mut pilot = stepped();
         assert_eq!((pilot.took(2), pilot.done, pilot.settled), (None, true, Some(2)));

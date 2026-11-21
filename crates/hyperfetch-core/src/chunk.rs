@@ -386,11 +386,21 @@ impl ChunkManager {
     /// Bytes in, on disk or held by their workers to be written: a steadier count than
     /// `total_downloaded`, which moves a batch at a time.
     pub(crate) fn total_received(&self) -> u64 {
-        let received = |c: &Chunk| match c.is_in_flight() {
+        self.chunks.iter().map(Self::has).sum::<u64>().min(self.total_size)
+    }
+
+    /// What the first stream (see [`ChunkManager::spread`]) has in, counted as
+    /// [`ChunkManager::total_received`] counts each chunk; all there is before it was spread.
+    pub(crate) fn first_received(&self) -> u64 {
+        self.stream.as_ref().map_or_else(|| self.total_received(), |(id, _)| Self::has(&self.chunks[*id]))
+    }
+
+    fn has(c: &Chunk) -> u64 {
+        let received = match c.is_in_flight() {
             true => c.attempt.lock().received.saturating_sub(c.range.start).min(c.range.len()),
             false => 0,
         };
-        self.chunks.iter().map(|c| c.done_bytes().max(received(c))).sum::<u64>().min(self.total_size)
+        c.done_bytes().max(received)
     }
 
     pub fn chunks(&self) -> &[Chunk] {
@@ -775,11 +785,10 @@ impl ChunkManager {
         let now = Instant::now();
         for id in 0..self.chunks.len() {
             let chunk = &self.chunks[id];
-            let asked = chunk.attempt.lock().asked;
             if !chunk.is_in_flight() || chunk.revoked.is_cancelled() || chunk.unreceived() == 0 {
                 continue;
             }
-            let mut end = chunk.end_offset.load(Ordering::SeqCst);
+            let end = chunk.end_offset.load(Ordering::SeqCst);
             let reach = match wait {
                 None => u64::MAX,
                 Some(wait) => match chunk.pace(now, None) {
@@ -787,21 +796,42 @@ impl ChunkManager {
                     None => continue,
                 },
             };
-            while let Some(next) = self.chunks.iter().position(|c| {
-                c.range.start == end + 1
-                    && c.range.end <= asked
-                    && c.range.start <= reach
-                    && matches!(c.status, ChunkStatus::Unassigned | ChunkStatus::Failed { .. })
-            }) {
-                end = self.chunks[next].range.end;
-                self.chunks[next].status = ChunkStatus::Merged;
-                self.completed += 1;
-                self.retry_queue.retain(|&queued| queued != next);
-            }
-            let chunk = &mut self.chunks[id];
-            chunk.range.end = end;
-            chunk.end_offset.store(end, Ordering::SeqCst);
+            self.take_after(id, reach);
         }
+    }
+
+    /// While the download widens one request at a time (see `Ramp::widen_from`), chunk `id`'s
+    /// request, at its chunk's end, goes on over the piece right after it if no worker has that
+    /// and the request asked for it: the first stream brings the pieces nearest it, which the
+    /// requests widened with take last, at no cost, instead of ending (its connection cut, which a
+    /// host may count a moment longer) while one of those may yet be refused, its piece and those
+    /// between then left behind. Whether it goes on.
+    pub(crate) fn run_on(&mut self, id: usize) -> bool {
+        let Some(chunk) = self.chunks.get(id).filter(|c| c.is_in_flight() && !c.revoked.is_cancelled()) else { return false };
+        let end = chunk.end_offset.load(Ordering::SeqCst);
+        self.take_after(id, end + 1) > end
+    }
+
+    /// Merges into chunk `id` the pieces no worker has right after its end that start by `reach`,
+    /// as far as its request asked. Its end then.
+    fn take_after(&mut self, id: usize, reach: u64) -> u64 {
+        let asked = self.chunks[id].attempt.lock().asked;
+        let mut end = self.chunks[id].end_offset.load(Ordering::SeqCst);
+        while let Some(next) = self.chunks.iter().position(|c| {
+            c.range.start == end + 1
+                && c.range.end <= asked
+                && c.range.start <= reach
+                && matches!(c.status, ChunkStatus::Unassigned | ChunkStatus::Failed { .. })
+        }) {
+            end = self.chunks[next].range.end;
+            self.chunks[next].status = ChunkStatus::Merged;
+            self.completed += 1;
+            self.retry_queue.retain(|&queued| queued != next);
+        }
+        let chunk = &mut self.chunks[id];
+        chunk.range.end = end;
+        chunk.end_offset.store(end, Ordering::SeqCst);
+        end
     }
 
     /// Hands back what the attempts of workers `from` and above have yet to receive, as fresh
@@ -1366,6 +1396,29 @@ mod tests {
         manager.strand_nothing(None);
         assert_eq!(stream.end_offset.load(Ordering::SeqCst), 10 * MB - 1);
         manager.mark_completed(stream.id).unwrap();
+        assert!(manager.is_all_completed());
+    }
+
+    /// At the end of its piece while the download widens, the first stream goes on over the next
+    /// piece no worker has, one at a time, as far as its request asked; not over one a worker has.
+    #[test]
+    fn test_the_first_stream_runs_on_over_the_pieces_no_worker_has() {
+        let at = |i: u64| 10 * MB * i / 4;
+        let mut manager = ChunkManager::new(10 * MB, 10 * MB).unwrap();
+        let stream = manager.get_next_work(0, 0).unwrap();
+        stream.asked(10 * MB - 1);
+        stream.answered(Instant::now());
+        manager.spread(4, 64 * 1024);
+        let far = manager.get_next_work(1, 0).unwrap();
+        assert_eq!((stream.end_offset.load(Ordering::SeqCst), far.range.start), (at(1) - 1, at(3)), "the farthest goes first");
+        assert!(manager.run_on(stream.id));
+        assert_eq!(stream.end_offset.load(Ordering::SeqCst), at(2) - 1, "one piece at a time");
+        assert!(manager.run_on(stream.id));
+        assert_eq!(stream.end_offset.load(Ordering::SeqCst), at(3) - 1);
+        assert!(!manager.run_on(stream.id), "not over a piece a worker has");
+        assert!(manager.get_next_work(2, 0).is_none(), "nothing is left to ask for");
+        manager.mark_completed(stream.id).unwrap();
+        manager.mark_completed(far.id).unwrap();
         assert!(manager.is_all_completed());
     }
 
