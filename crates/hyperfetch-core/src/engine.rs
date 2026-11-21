@@ -4458,10 +4458,6 @@ fn build_route_client(
     builder.build().map_err(|e| format!("Failed to build HTTP client: {}", e))
 }
 
-/// HTTP/2 as downloads speak it: the flow-control windows grow with what the link carries in a
-/// round trip (BDP pings), where hyper's fixed ones (5 MB a connection, 2 MB a stream) would hold
-/// a download over a long link to 5 MB per round trip (25 MB/s at 200 ms); see the speed
-/// benchmark's `h2_latency` scenarios.
 /// Fewest bytes a mirror's speed is measured over before it is kept (see `hosts::record_speed`).
 const SPEED_MEASURED: u64 = 1024 * 1024;
 
@@ -4500,8 +4496,23 @@ fn h2_client(options: &DownloadOptions) -> Result<Client, String> {
     Ok(kept.1.clone())
 }
 
+/// HTTP/2 as downloads speak it. A stream's flow-control window is as large as hyper's adaptive
+/// one grows (16 MiB), where hyper's fixed ones (5 MB a connection, 2 MB a stream) would hold a
+/// download over a long link to 5 MB per round trip (25 MB/s at 200 ms; see the speed benchmark's
+/// `h2_latency` scenarios). The connection's is eight times that: what a stream read slowly (a
+/// download under a speed limit) leaves unread fills its own window, not the connection's, so it
+/// holds back no other download sharing it (the adaptive one gives both the same size). A ping
+/// every 20 s while a request is out finds a connection that died without a word within 10 s.
+/// shortcut: eight streams left unread at once fill the connection's window too; read the body
+/// ahead of the limit if that is ever seen.
 pub(crate) fn http2_tuned(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
-    builder.http2_adaptive_window(true)
+    const STREAM_WINDOW: u32 = 16 * 1024 * 1024;
+    builder
+        .http2_initial_stream_window_size(STREAM_WINDOW)
+        .http2_initial_connection_window_size(8 * STREAM_WINDOW)
+        .http2_keep_alive_interval(Duration::from_secs(20))
+        .http2_keep_alive_timeout(Duration::from_secs(10))
+        .http2_keep_alive_while_idle(false)
 }
 
 /// `name: value` as a request header, if both are valid in one (see `DownloadOptions::headers`).
@@ -9659,6 +9670,45 @@ mod tests {
         H2_CLIENTS.lock().values_mut().for_each(|(at, _)| *at -= H2_KEPT);
         let _ = DownloadEngine::new(vec![url], agent("shared-a")).over_http2();
         assert!(kept("shared-a")[0] > built[0], "built again after a minute");
+    }
+
+    /// Two downloads on the connection the HTTP/2 client shares, one held to the lowest speed (it
+    /// reads one piece, then nothing): the other is not held back, and gets all of its file.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_slow_download_holds_back_no_other_on_a_shared_http2_connection() {
+        const BODY: usize = 6 * 1024 * 1024;
+        let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let at = server.local_addr().unwrap();
+        let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accepted = Arc::clone(&connections);
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = server.accept().await {
+                accepted.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let Ok(mut connection) = h2::server::handshake(socket).await else { return };
+                    // Accepting drives the connection, the bodies' frames too.
+                    while let Some(Ok((_, mut respond))) = connection.accept().await {
+                        let Ok(mut body) = respond.send_response(http::Response::new(()), false) else { return };
+                        let _ = body.send_data(bytes::Bytes::from(vec![7u8; BODY]), true);
+                    }
+                });
+            }
+        });
+        let client = http2_tuned(Client::builder().http2_prior_knowledge()).build().unwrap();
+        let url = format!("http://{at}/f.bin");
+        let mut slow = client.get(&url).send().await.unwrap();
+        assert!(slow.chunk().await.unwrap().is_some());
+        let other = async {
+            let mut response = client.get(&url).send().await.unwrap();
+            let mut got = 0;
+            while let Some(chunk) = response.chunk().await.unwrap() {
+                got += chunk.len();
+            }
+            got
+        };
+        assert_eq!(tokio::time::timeout(Duration::from_secs(30), other).await.expect("the other is not held back"), BODY);
+        assert_eq!(connections.load(Ordering::SeqCst), 1, "both on one connection");
+        drop(slow);
     }
 
     /// A file server (see `file_server`) whose host is known not to cap a connection's speed: the
