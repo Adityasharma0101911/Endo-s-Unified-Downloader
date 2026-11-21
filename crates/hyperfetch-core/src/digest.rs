@@ -172,9 +172,12 @@ fn from_headers(headers: &HeaderMap) -> Option<String> {
 /// The checksum the files beside `url` give for it (see [`published_checksum`]). None is asked
 /// for of a host that limits how often it is asked (see `hosts::limits_requests`), nor of one
 /// whose downloads found none beside them lately (see `hosts::checksums`); what they find is kept
-/// for that.
+/// for that. Until the host is known to publish some, the downloads of one folder ask in turn,
+/// each with what the one before learned: files that start together cost one set of lookups, not
+/// one each. The wait for a turn is part of the 3 seconds.
 async fn from_sidecars(client: &Client, auth: Option<&Auth>, limit: usize, url: &Url) -> Option<String> {
-    if !matches!(url.scheme(), "http" | "https") || crate::hosts::limits_requests(url) || crate::hosts::checksums(url) == Some(false) {
+    let skipped = || !matches!(url.scheme(), "http" | "https") || crate::hosts::limits_requests(url) || crate::hosts::checksums(url) == Some(false);
+    if skipped() {
         return None;
     }
     let name = url.path_segments()?.next_back().filter(|n| !n.is_empty())?;
@@ -182,6 +185,16 @@ async fn from_sidecars(client: &Client, auth: Option<&Auth>, limit: usize, url: 
     let mut file = url.clone();
     file.set_query(None);
     file.set_fragment(None);
+    let deadline = tokio::time::Instant::now() + SIDECAR_BUDGET;
+    let held = match file.join(".") {
+        Ok(folder) if crate::hosts::checksums(url) != Some(true) => Some(tokio::time::timeout_at(deadline, turn(folder.as_str()).lock_owned()).await.ok()?),
+        _ => None,
+    };
+    if skipped() {
+        return None;
+    }
+    // Known meanwhile to publish some: the others go on at once.
+    let _held = held.filter(|_| crate::hosts::checksums(url) != Some(true));
     let beside = ["sha256", "sha512", "sha1", "md5"].map(|ext| {
         let mut sidecar = file.clone();
         sidecar.set_path(&format!("{}.{ext}", file.path()));
@@ -226,7 +239,7 @@ async fn from_sidecars(client: &Client, auth: Option<&Auth>, limit: usize, url: 
         })
         .collect();
     let lookups = futures_util::stream::iter(lookups).buffered(SIDECARS_AT_ONCE).filter_map(std::future::ready);
-    let found = tokio::time::timeout(SIDECAR_BUDGET, std::pin::pin!(lookups).next()).await;
+    let found = tokio::time::timeout_at(deadline, std::pin::pin!(lookups).next()).await;
     let none = found.is_ok() && none_beside.load(Ordering::Relaxed) == own;
     if let Some(kind) = kind {
         if one_beside.load(Ordering::Relaxed) > 0 {
@@ -258,6 +271,17 @@ enum Sidecar {
 /// not in its folder (by its URL), and how many of a folder's files of one kind had no checksum
 /// file of their own (by `<folder>*.<extension>`). Each with when it was last seen so.
 static MISSING: LazyLock<Mutex<HashMap<String, (Instant, u8)>>> = LazyLock::new(Default::default);
+
+/// Whose turn it is to ask for a folder's checksum files, by the folder's URL (see `from_sidecars`).
+static TURNS: LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = LazyLock::new(Default::default);
+
+fn turn(folder: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let mut turns = TURNS.lock();
+    if turns.len() >= MAX_REMEMBERED {
+        turns.retain(|_, turn| Arc::strong_count(turn) > 1);
+    }
+    Arc::clone(turns.entry(folder.to_string()).or_default())
+}
 
 /// Whether `key` was seen missing `times` or more within `FOLDER_MEMORY`.
 fn missing(key: &str, times: u8) -> bool {
@@ -1032,6 +1056,33 @@ mod tests {
         for (name, requests) in [("a.bin", 7), ("b.bin", 5), ("c.bin", 5), ("d.bin", 1)] {
             assert_eq!(asked(&url, &log, name).await, requests, "{name}");
         }
+    }
+
+    /// Files of one folder asked for at once take turns until the host is known: of a bare folder,
+    /// the first asks for each checksum file and the others none; once one found its own, the
+    /// others ask at once.
+    #[tokio::test]
+    async fn the_files_of_a_folder_take_turns_until_its_host_is_known() {
+        let client = Client::new();
+        let all = |url: &Url| {
+            let asked = (0..12).map(|i| {
+                let (client, url) = (&client, url.join(&format!("f{i}.bin")).unwrap());
+                async move { published_checksum(client, &url, &HeaderMap::new()).await }
+            });
+            futures_util::future::join_all(asked)
+        };
+        let (url, log) = serve(content(100), Site { sidecars_wait: Duration::from_millis(50), ..Site::default() }).await;
+        assert!(all(&url).await.iter().all(Option::is_none));
+        assert_eq!(log.lock().unwrap().len(), 7);
+
+        let data = content(100);
+        let md5 = checksum("md5", &Md5::digest(&data));
+        let files = (0..12).map(|i| (format!("/dir/f{i}.bin.md5"), "text/plain".to_string(), md5.clone().split_off(4))).collect();
+        let (url, _) = serve(data.clone(), Site { files, sidecars_wait: Duration::from_millis(200), ..Site::default() }).await;
+        let started = Instant::now();
+        assert!(all(&url).await.iter().all(|found| found.as_ref() == Some(&md5)));
+        // Each takes two rounds of 0.2 s: the first alone, then the others together.
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
     }
 
     #[tokio::test]
