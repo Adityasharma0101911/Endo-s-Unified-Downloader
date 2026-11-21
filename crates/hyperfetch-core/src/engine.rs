@@ -10506,7 +10506,8 @@ mod tests {
     /// A host 4 MB/s a connection that refuses some requests of a step and takes the others (a
     /// 16 MiB file widens 1, 2, 4, 8; GETs 2 and 3 the second step, 4 to 7 the third): first,
     /// middle, last, or several. Each refused piece goes back to the request it was cut from,
-    /// nothing more is asked (no retry after the 6 s rest), and the width is what the host took.
+    /// nothing more is asked (no retry after the 6 s rest, nor a newcomer of the step whose request
+    /// was not out yet when the refusal came), and the width is what the host took.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_a_step_the_host_takes_in_part_ends_at_what_it_took() {
         let (size, per_connection) = (16 * 1024 * 1024, 4e6);
@@ -10519,8 +10520,9 @@ mod tests {
             let at = format!("refusing GETs {refuse:?}{}", told(&said, &stats));
             assert!(got == crate::netsim::file(size), "{at}");
             let (gets, refused) = (stats.gets.load(Ordering::SeqCst), stats.refused.load(Ordering::SeqCst));
-            assert_eq!((gets, refused), (asked, refuse.len()), "{at}");
-            let width = format!("{} connections: the server refused more at once", asked - refuse.len());
+            let reached = refuse.iter().filter(|&&n| n < gets).count();
+            assert!(gets > refuse[0] && gets <= asked && refused == reached, "{gets} asked, {refused} refused: {at}");
+            let width = format!("{} connections: the server refused more at once", gets - refused);
             assert!(said.last().is_some_and(|(_, line)| line.starts_with(&width)), "{at}");
         }
     }
