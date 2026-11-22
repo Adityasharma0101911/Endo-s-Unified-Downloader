@@ -164,6 +164,8 @@ pub struct Settings {
     pub bt_upnp: bool,
     /// Magnet links go through debrid when a debrid key is set.
     pub debrid_magnets: bool,
+    /// Prioritize torrent pieces sequentially for video streaming/preview.
+    pub torrent_sequential: bool,
     /// Image galleries go to gallery-dl.
     pub gallery_dl: bool,
     /// Unpack archives after download.
@@ -401,6 +403,7 @@ impl Default for Settings {
             bt_port: 0,
             bt_upnp: false,
             debrid_magnets: engine.debrid_magnets,
+            torrent_sequential: false,
             gallery_dl: engine.gallery_dl,
             auto_extract: false,
             delete_archives: false,
@@ -642,6 +645,7 @@ impl Settings {
     pub fn fill_keys(&self, options: &mut DownloadOptions) {
         options.insecure = false;
         options.bind_addresses = self.bind_addresses();
+        options.bond_adapters = self.multi_network;
         options.debrid_api_key = non_empty(&self.debrid_api_key);
         options.debrid_provider = non_empty(&self.debrid_provider);
         options.post.virustotal_key = non_empty(&self.virustotal_api_key).filter(|_| self.virustotal_check);
@@ -821,6 +825,8 @@ impl Settings {
             debrid_api_key,
             debrid_provider,
             bind_addresses: self.bind_addresses(),
+            bond_adapters: self.multi_network,
+            torrent_sequential: self.torrent_sequential,
             seed_ratio: self.seed_ratio.max(0.0),
             seed_minutes: self.seed_minutes,
             bt_port: Some(self.bt_port).filter(|&port| port > 0),

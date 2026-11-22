@@ -63,6 +63,10 @@ const MAX_BAN_REST: Duration = Duration::from_secs(60);
 /// A download within this share of the fastest one went as fast as the line lets it.
 const LINE_BAND: f64 = 0.1;
 
+/// Maximum chunk size allowed for this host, if the host throttles large ranges.
+/// For example, YouTube (`googlevideo.com`) severely throttles HTTP Range requests larger than 10 MiB (10,485,760 bytes).
+pub const YOUTUBE_MAX_CHUNK_SIZE: u64 = 10 * 1024 * 1024;
+
 static HOSTS: LazyLock<Hosts> = LazyLock::new(Hosts::default);
 /// Least time between the starts of two requests to a host (by [`HostKey::origin`]), as
 /// resolvers set it (see [`set_gap`]).
@@ -120,6 +124,21 @@ impl HostKey {
         let host = self.host.to_ascii_lowercase();
         host.contains("cloudatacdn") || host.contains("dood") || host.contains("ds2play") || host.contains("doodstream") || host.contains("streamtape")
     }
+
+    /// Whether the host is YouTube / GoogleVideo CDN.
+    pub fn is_googlevideo(&self) -> bool {
+        let host = self.host.to_ascii_lowercase();
+        host.ends_with(".googlevideo.com") || host == "googlevideo.com" || host.contains("googlevideo")
+    }
+
+    /// The maximum chunk size recommended for this host.
+    pub fn max_chunk_size(&self) -> Option<u64> {
+        if self.is_googlevideo() {
+            Some(YOUTUBE_MAX_CHUNK_SIZE)
+        } else {
+            None
+        }
+    }
 }
 
 /// What a host was seen to do. Each fact is `None` when it is unknown or older than `PROFILE_TTL`.
@@ -141,6 +160,11 @@ pub struct HostProfile {
 /// What is known about `url`'s host.
 pub fn profile(url: &Url) -> HostProfile {
     HOSTS.profile(&HostKey::of(url), Instant::now())
+}
+
+/// The maximum chunk size recommended for `url`'s host.
+pub fn max_chunk_size(url: &Url) -> Option<u64> {
+    HostKey::of(url).max_chunk_size()
 }
 
 /// Whether `url`'s host refused a request (429/503) within `BANNED_FOR`, on any route: it limits
@@ -1129,6 +1153,17 @@ mod tests {
 
     fn key(url: &str) -> HostKey {
         HostKey::of(&Url::parse(url).unwrap())
+    }
+
+    #[test]
+    fn test_youtube_googlevideo_chunk_bounding() {
+        let yt_url = Url::parse("https://rr4---sn-ab5sznzl.googlevideo.com/videoplayback?expire=123").unwrap();
+        assert!(HostKey::of(&yt_url).is_googlevideo());
+        assert_eq!(max_chunk_size(&yt_url), Some(10 * 1024 * 1024));
+
+        let generic_url = Url::parse("https://example.com/largefile.iso").unwrap();
+        assert!(!HostKey::of(&generic_url).is_googlevideo());
+        assert_eq!(max_chunk_size(&generic_url), None);
     }
 
     #[test]

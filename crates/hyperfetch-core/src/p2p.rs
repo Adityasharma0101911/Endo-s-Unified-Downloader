@@ -309,8 +309,33 @@ pub async fn run(
         (None, false) => (handle.output_folder().join(&files[0]), handle.output_folder().join(&files[0])),
     };
 
+    let sequential_task = if options.torrent_sequential {
+        let handle = handle.clone();
+        let cancel = cancel.clone();
+        let file_id = only.as_ref().and_then(|f| f.first().copied()).unwrap_or(0);
+        Some(tokio::spawn(async move {
+            if let Ok(mut stream) = handle.stream(file_id).await {
+                use tokio::io::AsyncReadExt;
+                let mut buf = [0u8; 64 * 1024];
+                while !cancel.is_cancelled() {
+                    match tokio::time::timeout(std::time::Duration::from_millis(500), stream.read(&mut buf)).await {
+                        Ok(Ok(0)) => break, // EOF
+                        Ok(Ok(_)) => {},
+                        Ok(Err(_)) => break,
+                        Err(_) => continue,
+                    }
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
     let mark = options.post.mark_of_the_web.then_some(source);
     let watched = watch_until_complete(&session, &handle, &target, (marked.as_path(), mark), &snapshots, &cancel).await;
+    if let Some(task) = sequential_task {
+        task.abort();
+    }
     if let Some(web) = web {
         tracing::debug!("{} bytes came from the web seeds", web.fetched());
     }

@@ -750,6 +750,8 @@ fn tuning(args: &Args, connections: u64) -> DownloadOptions {
         } else {
             args.bind_address.clone()
         },
+        bond_adapters: args.bond_adapters || args.all_networks,
+        torrent_sequential: args.torrent_sequential,
         // --seed-time alone seeds that long, whatever the ratio.
         seed_ratio: args.seed_ratio.unwrap_or(if args.seed_time.is_some() { f64::MAX } else { 0.0 }),
         seed_minutes: args.seed_time.unwrap_or(0),

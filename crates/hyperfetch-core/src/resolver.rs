@@ -96,7 +96,6 @@ const UNSUPPORTED_SHARES: &[(&str, &[&str])] = &[
         ],
     ),
     ("Gofile", &["gofile.io"]),
-    ("Pixeldrain", &["pixeldrain.com", "pixeldrain.net", "pixeldra.in"]),
     // And these, whose share links are `crate::cloud`'s: what is left here is their other pages,
     // and a Yandex Disk video or a Box share it hands back as given, which yt-dlp downloads.
     ("WeTransfer", &["wetransfer.com", "we.tl"]),
@@ -1350,6 +1349,252 @@ impl HostResolver for DropboxResolver {
     }
 }
 
+/// Pixeldrain Resolver (Converts view URLs to raw binary streaming links)
+pub struct PixeldrainResolver;
+
+impl HostResolver for PixeldrainResolver {
+    fn can_handle(&self, url: &Url) -> bool {
+        let host = url.host_str().unwrap_or("").trim_start_matches("www.");
+        matches!(host, "pixeldrain.com" | "pixeldrain.net" | "pixeldra.in")
+    }
+
+    async fn resolve(&self, client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
+        let path = url.path().trim_matches('/');
+        let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+
+        // Direct single file link: /u/{id} or /api/file/{id} or /file/{id}
+        let file_id = match segments.as_slice() {
+            ["u", id] => Some(*id),
+            ["api", "file", id] => Some(*id),
+            ["file", id] => Some(*id),
+            _ => None,
+        };
+
+        if let Some(id) = file_id {
+            let clean_id = id.split('?').next().unwrap_or(id);
+            let direct = Url::parse(&format!("https://pixeldrain.com/api/file/{}", clean_id))
+                .map_err(|e| ResolverError::Parse(e.to_string()))?;
+            return Ok(vec![direct]);
+        }
+
+        // List of files: /l/{list_id}
+        if let ["l", list_id] = segments.as_slice() {
+            let clean_id = list_id.split('?').next().unwrap_or(list_id);
+            let api_url = format!("https://pixeldrain.com/api/list/{}", clean_id);
+            if let Ok(resp) = client.get(&api_url).send().await {
+                if resp.status().is_success() {
+                    if let Ok(bytes) = resp.bytes().await {
+                        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                            if let Some(files) = json["files"].as_array() {
+                                let urls: Vec<Url> = files
+                                    .iter()
+                                    .filter_map(|f| {
+                                        let id = f["id"].as_str()?;
+                                        Url::parse(&format!("https://pixeldrain.com/api/file/{}", id)).ok()
+                                    })
+                                    .collect();
+                                if !urls.is_empty() {
+                                    return Ok(urls);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(vec![url.clone()])
+    }
+}
+
+/// Catbox and Litterbox Resolver (Normalizes files.catbox.moe / litterbox.catbox.moe / album links)
+pub struct CatboxResolver;
+
+impl HostResolver for CatboxResolver {
+    fn can_handle(&self, url: &Url) -> bool {
+        let host = url.host_str().unwrap_or("").trim_start_matches("www.");
+        host == "catbox.moe" || host == "files.catbox.moe" || host == "litterbox.catbox.moe"
+    }
+
+    async fn resolve(&self, client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
+        let host = url.host_str().unwrap_or("").trim_start_matches("www.");
+        if host == "files.catbox.moe" || host == "litterbox.catbox.moe" {
+            return Ok(vec![url.clone()]);
+        }
+
+        let path = url.path().trim_matches('/');
+        let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+
+        // Album: /c/{id}
+        if let ["c", _id] = segments.as_slice() {
+            if let Ok(resp) = client.get(url.clone()).send().await {
+                if resp.status().is_success() {
+                    if let Ok(html) = read_capped(resp, MAX_HTML_BYTES).await {
+                        let mut found_urls = Vec::new();
+                        for token in html.split(|c: char| c == '"' || c == '\'' || c == '<' || c == '>' || c.is_whitespace()) {
+                            if token.starts_with("https://files.catbox.moe/") {
+                                if let Ok(file_url) = Url::parse(token) {
+                                    if !found_urls.contains(&file_url) {
+                                        found_urls.push(file_url);
+                                    }
+                                }
+                            }
+                        }
+                        if !found_urls.is_empty() {
+                            return Ok(found_urls);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(vec![url.clone()])
+    }
+}
+
+/// Krakenfiles Resolver (Extracts direct high-speed CDN download links from krakenfiles.com)
+pub struct KrakenfilesResolver;
+
+impl HostResolver for KrakenfilesResolver {
+    fn can_handle(&self, url: &Url) -> bool {
+        let host = url.host_str().unwrap_or("").trim_start_matches("www.");
+        host == "krakenfiles.com"
+    }
+
+    async fn resolve(&self, client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
+        let resp = client
+            .get(url.clone())
+            .header(reqwest::header::USER_AGENT, APP_USER_AGENT)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(ResolverError::NotFound(format!("Krakenfiles returned HTTP {}", resp.status())));
+        }
+
+        if !is_html(&resp) {
+            return Ok(vec![resp.url().clone()]);
+        }
+
+        let page_url = resp.url().clone();
+        let html = read_capped(resp, MAX_HTML_BYTES).await?;
+
+        // 1. Direct audio/video source if embedded on preview page
+        if let Some(src) = extract_media_source(&html) {
+            if let Ok(direct_url) = page_url.join(&src) {
+                return Ok(vec![direct_url]);
+            }
+        }
+
+        // 2. Download form POST resolution: <form action="/download/{hash}"> and <input name="token" value="{token}">
+        if let Some((action_url, token)) = extract_kraken_form(&html, &page_url) {
+            let mut params = std::collections::HashMap::new();
+            params.insert("token", token);
+            if let Ok(post_resp) = client
+                .post(action_url)
+                .form(&params)
+                .header(reqwest::header::USER_AGENT, APP_USER_AGENT)
+                .header(reqwest::header::REFERER, page_url.as_str())
+                .send()
+                .await
+            {
+                if post_resp.status().is_success() {
+                    if let Ok(bytes) = post_resp.bytes().await {
+                        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                            if let Some(url_str) = json["url"].as_str() {
+                                if let Ok(direct_url) = Url::parse(url_str) {
+                                    return Ok(vec![direct_url]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Download link in HTML
+        if let Some(href) = extract_kraken_download_href(&html, &page_url) {
+            return Ok(vec![href]);
+        }
+
+        Ok(vec![url.clone()])
+    }
+}
+
+fn extract_media_source(html: &str) -> Option<String> {
+    for needle in ["<source", "<video", "<audio"] {
+        let mut rest = html;
+        while let Some(idx) = rest.find(needle) {
+            rest = &rest[idx + needle.len()..];
+            let tag_end = rest.find('>').unwrap_or(rest.len());
+            let tag = &rest[..tag_end];
+            if let Some(src_idx) = tag.find("src=") {
+                let after_src = tag[src_idx + 4..].trim_start();
+                let quote = after_src.chars().next()?;
+                if quote == '"' || quote == '\'' {
+                    let val = &after_src[1..];
+                    if let Some(end) = val.find(quote) {
+                        let link = &val[..end];
+                        if !link.is_empty() {
+                            return Some(link.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn extract_kraken_form(html: &str, base: &Url) -> Option<(Url, String)> {
+    let form_start = html.find("<form")?;
+    let form_slice = &html[form_start..];
+    let form_end = form_slice.find("</form>")?;
+    let form = &form_slice[..form_end];
+
+    // Find action="..."
+    let action_idx = form.find("action=")?;
+    let after_action = form[action_idx + 7..].trim_start();
+    let quote = after_action.chars().next()?;
+    let action_str = if quote == '"' || quote == '\'' {
+        let val = &after_action[1..];
+        let end = val.find(quote)?;
+        &val[..end]
+    } else {
+        after_action.split_whitespace().next()?
+    };
+    let action_url = base.join(action_str).ok()?;
+
+    // Find token value: name="token" ... value="..." or value="..." name="token"
+    let token_idx = form.find("name=\"token\"").or_else(|| form.find("name='token'"))?;
+    let window_start = token_idx.saturating_sub(100);
+    let window_end = (token_idx + 100).min(form.len());
+    let window = &form[window_start..window_end];
+    let val_idx = window.find("value=")?;
+    let after_val = window[val_idx + 6..].trim_start();
+    let vquote = after_val.chars().next()?;
+    let token = if vquote == '"' || vquote == '\'' {
+        let val = &after_val[1..];
+        let end = val.find(vquote)?;
+        &val[..end]
+    } else {
+        after_val.split_whitespace().next()?
+    };
+
+    Some((action_url, token.to_string()))
+}
+
+fn extract_kraken_download_href(html: &str, base: &Url) -> Option<Url> {
+    for token in html.split(|c: char| c == '"' || c == '\'' || c == '<' || c == '>' || c.is_whitespace()) {
+        if token.contains("/download/") {
+            if let Ok(u) = base.join(token) {
+                return Some(u);
+            }
+        }
+    }
+    None
+}
+
 /// SourceForge Resolver (Generates direct mirror-CDN download URLs)
 pub struct SourceForgeResolver;
 
@@ -1709,6 +1954,9 @@ impl SmartResolver {
             || GoogleDocsResolver.can_handle(url)
             || MediaFireResolver.can_handle(url)
             || DropboxResolver.can_handle(url)
+            || PixeldrainResolver.can_handle(url)
+            || CatboxResolver.can_handle(url)
+            || KrakenfilesResolver.can_handle(url)
             || SourceForgeResolver.can_handle(url)
             || CodeHostResolver.can_handle(url)
             || ArchiveOrgResolver.can_handle(url)
@@ -1799,6 +2047,15 @@ impl SmartResolver {
         }
         if DropboxResolver.can_handle(url) {
             return DropboxResolver.resolve(client, url).await;
+        }
+        if PixeldrainResolver.can_handle(url) {
+            return with_timeout(PixeldrainResolver.resolve(client, url)).await;
+        }
+        if CatboxResolver.can_handle(url) {
+            return with_timeout(CatboxResolver.resolve(client, url)).await;
+        }
+        if KrakenfilesResolver.can_handle(url) {
+            return with_timeout(KrakenfilesResolver.resolve(client, url)).await;
         }
         if SourceForgeResolver.can_handle(url) {
             return with_timeout(SourceForgeResolver.resolve(client, url)).await;
@@ -2256,6 +2513,51 @@ mod tests {
 
     fn local_client() -> Client {
         Client::builder().no_proxy().build().unwrap()
+    }
+
+    #[test]
+    fn test_pixeldrain_resolver_handling_and_normalization() {
+        let client = local_client();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let u = Url::parse("https://pixeldrain.com/u/abc12345").unwrap();
+        assert!(PixeldrainResolver.can_handle(&u));
+        let resolved = rt.block_on(PixeldrainResolver.resolve(&client, &u)).unwrap();
+        assert_eq!(resolved, vec![Url::parse("https://pixeldrain.com/api/file/abc12345").unwrap()]);
+
+        let direct = Url::parse("https://pixeldrain.com/api/file/xyz987").unwrap();
+        let resolved2 = rt.block_on(PixeldrainResolver.resolve(&client, &direct)).unwrap();
+        assert_eq!(resolved2, vec![direct]);
+    }
+
+    #[test]
+    fn test_catbox_resolver_handling() {
+        let client = local_client();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let direct = Url::parse("https://files.catbox.moe/testfile.mp4").unwrap();
+        assert!(CatboxResolver.can_handle(&direct));
+        let resolved = rt.block_on(CatboxResolver.resolve(&client, &direct)).unwrap();
+        assert_eq!(resolved, vec![direct]);
+
+        let litter = Url::parse("https://litterbox.catbox.moe/temp.zip").unwrap();
+        assert!(CatboxResolver.can_handle(&litter));
+        let resolved_litter = rt.block_on(CatboxResolver.resolve(&client, &litter)).unwrap();
+        assert_eq!(resolved_litter, vec![litter]);
+    }
+
+    #[test]
+    fn test_krakenfiles_form_extraction() {
+        let page_url = Url::parse("https://krakenfiles.com/view/test1234/file.html").unwrap();
+        let sample_html = r#"
+            <html><body>
+            <form id="dl-form" method="post" action="/download/abcdef123456">
+                <input type="hidden" name="token" value="sec_token_999888" />
+                <button type="submit">Download</button>
+            </form>
+            </body></html>
+        "#;
+        let (action, token) = extract_kraken_form(sample_html, &page_url).unwrap();
+        assert_eq!(action, Url::parse("https://krakenfiles.com/download/abcdef123456").unwrap());
+        assert_eq!(token, "sec_token_999888");
     }
 
     #[test]
@@ -2886,7 +3188,6 @@ mod tests {
             ("https://mega.nz/file/abc#key", "MEGA"),
             ("https://mega.nz/folder/abc#key", "MEGA"),
             // Pages of services `crate::shares` reads other links of.
-            ("https://pixeldrain.com/d/abc", "Pixeldrain"),
             ("https://www.terabox.com/web/share/link?surl=abc", "Terabox"),
             ("https://contoso.sharepoint.com/sites/team/SitePages/Home.aspx", "SharePoint"),
             ("https://we.tl/t-abc", "WeTransfer"),

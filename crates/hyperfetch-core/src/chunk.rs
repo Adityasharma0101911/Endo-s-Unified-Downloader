@@ -2336,4 +2336,15 @@ mod tests {
         assert!(m.is_all_completed());
         assert_eq!(m.completed_ranges(), vec![ByteRange::new(0, size - 1).unwrap()]);
     }
+
+    #[test]
+    fn test_youtube_chunk_bounding_in_chunk_manager() {
+        let max_chunk = 10 * 1024 * 1024;
+        let file_size = 50 * 1024 * 1024; // 50 MiB file
+        let manager = ChunkManager::new(file_size, max_chunk).unwrap();
+        assert_eq!(manager.chunks().len(), 5);
+        for chunk in manager.chunks() {
+            assert!(chunk.range.len() <= max_chunk);
+        }
+    }
 }

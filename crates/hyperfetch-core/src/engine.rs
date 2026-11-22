@@ -318,6 +318,9 @@ pub struct DownloadOptions {
     /// Local addresses the connections go out from, spread over them (several networks at once);
     /// empty lets the system choose.
     pub bind_addresses: Vec<std::net::IpAddr>,
+    /// Whether to bond multiple active network interfaces (e.g. Ethernet + Wi-Fi) by spreading
+    /// connections across detected active default gateways.
+    pub bond_adapters: bool,
     /// A download over ranges spreads its connections over the addresses its host's name has (a
     /// CDN's, one of which may be busy or throttled), taking turns as over `bind_addresses`: those
     /// of `ip_family`, else of the system's first choice's version (see `address_routes`). Not
@@ -325,6 +328,8 @@ pub struct DownloadOptions {
     pub spread_addresses: bool,
     /// The download is a BitTorrent swarm download (see `ingest::Task::p2p`).
     pub bittorrent: bool,
+    /// Prioritize torrent pieces in sequential order (from start to end) to enable video preview and streaming.
+    pub torrent_sequential: bool,
     /// Of a multi-file torrent, the files to download, by their paths in it (an archive.org
     /// item's, see `repos`); empty for all. They come into a hidden folder beside the torrent's,
     /// as the torrent library creates every file of a torrent, and move into its folder once
@@ -514,8 +519,10 @@ impl Default for DownloadOptions {
             debrid_api_key: None,
             debrid_provider: None,
             bind_addresses: Vec::new(),
+            bond_adapters: false,
             spread_addresses: true,
             bittorrent: false,
+            torrent_sequential: false,
             torrent_files: Vec::new(),
             seed_ratio: 0.0,
             seed_minutes: 0,
@@ -635,6 +642,7 @@ pub struct ClientKey {
     headers: Vec<(String, String)>,
     http2: bool,
     bind_addresses: Vec<std::net::IpAddr>,
+    bond_adapters: bool,
     insecure: bool,
     ip_family: IpFamily,
     connect_timeout_secs: u64,
@@ -654,6 +662,7 @@ impl ClientKey {
             headers: options.headers.clone(),
             http2: options.http2,
             bind_addresses: options.bind_addresses.clone(),
+            bond_adapters: options.bond_adapters,
             insecure: options.insecure,
             ip_family: options.ip_family,
             connect_timeout_secs: options.connect_timeout_secs,
@@ -737,7 +746,7 @@ impl DownloadEngine {
         options.remote_time |= options.only_if_newer;
         let client = client.and_then(|client| check_extra_headers(&options).map(|()| client));
         let scoped = scoped_headers(&options);
-        let client_pool = if options.proxy_pool.is_empty() && options.bind_addresses.is_empty() {
+        let client_pool = if options.proxy_pool.is_empty() && options.bind_addresses.is_empty() && !options.bond_adapters {
             client.as_ref().map(|c| vec![c.clone()]).map_err(|e| e.clone())
         } else {
             build_client_pool(&options)
@@ -3122,6 +3131,7 @@ impl DownloadEngine {
         let hashed = self.options.expected_checksum.clone().or_else(|| crate::digest::found(&self.site));
         let in_order = crate::storage::hashes_prefix(self.options.expected_checksum.as_deref());
         let throttled_host = mirrors.iter().any(|m| HostKey::of(&m.url).is_bitrate_throttled());
+        let host_chunk_cap = mirrors.iter().filter_map(|m| hosts::max_chunk_size(&m.url)).min();
         // A first stream has a gap for one chunk, unless chunks are kept small for the reasons
         // `effective_chunk_size` gives: what it has left is halved for the connections that join
         // it, its far half for the first (see `ChunkManager::halve`), or taken from its far end
@@ -3132,11 +3142,14 @@ impl DownloadEngine {
         // alone again, whatever rate its connections were seen held to.
         let one = hosts::best_connections(&reference.final_url) == Some(1);
         let alone_first = fresh_stream && (limited || one || (start.rate.is_none() && best.is_none()));
-        let whole_gaps = fresh_stream && self.options.base_chunk_size == DEFAULT_CHUNK_SIZE && !in_order && !throttled_host;
-        let chunk_size = match whole_gaps {
+        let whole_gaps = fresh_stream && self.options.base_chunk_size == DEFAULT_CHUNK_SIZE && !in_order && !throttled_host && host_chunk_cap.is_none();
+        let mut chunk_size = match whole_gaps {
             true => size,
             false => effective_chunk_size(remaining, num_workers as u64, self.options.base_chunk_size, in_order, throttled_host),
         };
+        if let Some(cap) = host_chunk_cap {
+            chunk_size = chunk_size.min(cap);
+        }
         let mut manager = ChunkManager::with_resumed_ranges(size, chunk_size, &have).map_err(|e| e.to_string())?;
         manager.set_max_retries(self.options.max_retries);
         // The probe's answer is worker 0's first attempt, its connection's rate watched on while no
@@ -3569,7 +3582,7 @@ impl DownloadEngine {
     async fn address_routes(&self, client: &Client, url: &Url) -> Option<Vec<Client>> {
         let o = &self.options;
         let direct = o.no_proxy || (o.proxy.is_none() && o.proxy_pool.is_empty() && !proxy_in_env());
-        let host = url.domain().filter(|_| o.spread_addresses && direct && o.bind_addresses.is_empty() && self.ftp.is_none() && self.sftp.is_none())?;
+        let host = url.domain().filter(|_| o.spread_addresses && direct && o.bind_addresses.is_empty() && !o.bond_adapters && self.ftp.is_none() && self.sftp.is_none())?;
         let addresses = server_addresses(host, url.port_or_known_default().unwrap_or(0), o.ip_family).await;
         let mut routes = vec![client.clone()];
         for address in addresses.into_iter().skip(1).take(MAX_ROUTES - 1) {
@@ -4661,9 +4674,19 @@ pub fn build_client_pool(options: &DownloadOptions) -> Result<Vec<Client>, Strin
         true => vec![options.proxy.as_deref()],
         false => options.proxy_pool.iter().map(|p| Some(p.trim())).collect(),
     };
-    let locals: Vec<Option<std::net::IpAddr>> = match options.bind_addresses.is_empty() {
+    let auto_adapters = if options.bond_adapters && options.bind_addresses.is_empty() {
+        crate::netif::usable().into_iter().map(|i| i.address).collect()
+    } else {
+        Vec::new()
+    };
+    let bind_addresses = if options.bind_addresses.is_empty() {
+        &auto_adapters
+    } else {
+        &options.bind_addresses
+    };
+    let locals: Vec<Option<std::net::IpAddr>> = match bind_addresses.is_empty() {
         true => vec![None],
-        false => options.bind_addresses.iter().copied().map(Some).collect(),
+        false => bind_addresses.iter().copied().map(Some).collect(),
     };
     proxies
         .iter()
@@ -9817,6 +9840,24 @@ mod tests {
         // Those past the one it had stop within 1.5 s, and none come back.
         let back = after.iter().position(|&n| n <= 1);
         assert!(back.is_some_and(|at| at <= 10 && after[at..].iter().all(|&n| n <= 1)), "after clearing: {after:?}");
+    }
+
+    #[test]
+    fn test_bond_adapters_client_pool_construction() {
+        let options = DownloadOptions {
+            bond_adapters: true,
+            ..Default::default()
+        };
+        let pool = build_client_pool(&options).unwrap();
+        assert!(!pool.is_empty());
+    }
+
+    #[test]
+    fn test_torrent_sequential_option_default_and_toggle() {
+        let mut options = DownloadOptions::default();
+        assert!(!options.torrent_sequential);
+        options.torrent_sequential = true;
+        assert!(options.torrent_sequential);
     }
 
     /// Over HTTP/2 a download's requests are spread over a few connections, each a client of its

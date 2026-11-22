@@ -3930,10 +3930,17 @@ fn plan_fast(info: &Value, have_ffmpeg: bool) -> Result<FastPlan, String> {
             headers.iter().filter_map(|(name, value)| Some((name.clone(), value.as_str()?.to_string()))).collect()
         });
         let codec = |key: &str| text(format, key).map(|codec| codec != "none");
+        let is_yt = extractor.starts_with("youtube") || url.host_str().map_or(false, |h| h.contains("googlevideo.com"));
+        let parsed_chunk_size = options.and_then(|o| o.get("http_chunk_size")).and_then(Value::as_u64).filter(|&n| n > 0);
+        let stream_chunk_size = if is_yt {
+            Some(parsed_chunk_size.map_or(crate::hosts::YOUTUBE_MAX_CHUNK_SIZE, |cs| cs.min(crate::hosts::YOUTUBE_MAX_CHUNK_SIZE)))
+        } else {
+            parsed_chunk_size
+        };
         streams.push(PlannedStream {
             hls: protocol.starts_with("m3u8"),
             cookies: text(format, "cookies").map_or_else(Vec::new, |c| format_cookies(&c)),
-            chunk_size: options.and_then(|o| o.get("http_chunk_size")).and_then(Value::as_u64).filter(|&n| n > 0),
+            chunk_size: stream_chunk_size,
             size: ["filesize", "filesize_approx"]
                 .iter()
                 .find_map(|key| format.get(*key).and_then(Value::as_f64))

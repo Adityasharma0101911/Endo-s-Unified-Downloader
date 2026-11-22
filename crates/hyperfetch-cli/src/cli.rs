@@ -311,6 +311,10 @@ pub struct Args {
     #[arg(long = "all-networks", conflicts_with = "bind_address")]
     pub all_networks: bool,
 
+    /// Bond multiple active network interfaces (e.g. Ethernet + Wi-Fi) to aggregate bandwidth
+    #[arg(long = "bond-adapters", visible_aliases = ["multi-nic", "bond-nic"])]
+    pub bond_adapters: bool,
+
     /// Keep each download's connections on one address of its server, instead of spreading them
     /// over the several a server's name often has
     #[arg(long = "no-spread-addresses")]
@@ -319,6 +323,10 @@ pub struct Args {
     /// Never download magnet links and .torrent files from the BitTorrent swarm
     #[arg(long = "no-p2p")]
     pub no_p2p: bool,
+
+    /// Prioritize BitTorrent pieces sequentially to enable video preview and streaming while downloading
+    #[arg(long = "sequential", visible_aliases = ["torrent-sequential"])]
+    pub torrent_sequential: bool,
 
     /// Seed a finished torrent until it has uploaded R times its size; the program waits for that
     /// before exiting [default: 0, no seeding]

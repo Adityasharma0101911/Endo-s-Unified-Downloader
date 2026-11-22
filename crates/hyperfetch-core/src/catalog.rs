@@ -15,6 +15,7 @@ pub enum Service {
     Spotify,
     Apple,
     Deezer,
+    Qobuz,
 }
 
 impl Service {
@@ -24,6 +25,7 @@ impl Service {
             Service::Spotify => "Spotify",
             Service::Apple => "Apple Music",
             Service::Deezer => "Deezer",
+            Service::Qobuz => "Qobuz",
         }
     }
 }
@@ -85,6 +87,15 @@ fn link(url: &Url) -> Option<Link> {
                 "track" => make(Service::Deezer, Kind::Song, id),
                 "album" => make(Service::Deezer, Kind::Album, id),
                 "playlist" => make(Service::Deezer, Kind::Playlist, id),
+                _ => None,
+            }
+        }
+        "qobuz.com" | "play.qobuz.com" | "open.qobuz.com" => {
+            let parts: Vec<&str> = parts.into_iter().skip_while(|part| part.contains('-') || part.len() == 2).collect();
+            match parts[..] {
+                ["track", id] => make(Service::Qobuz, Kind::Song, id),
+                ["album", id] | ["album", _, id] => make(Service::Qobuz, Kind::Album, id),
+                ["playlist", id] => make(Service::Qobuz, Kind::Playlist, id),
                 _ => None,
             }
         }
@@ -157,6 +168,7 @@ struct Bases {
     apple: String,
     itunes: String,
     deezer: String,
+    qobuz: String,
 }
 
 impl Default for Bases {
@@ -166,6 +178,7 @@ impl Default for Bases {
             apple: "https://music.apple.com".to_string(),
             itunes: "https://itunes.apple.com".to_string(),
             deezer: "https://api.deezer.com".to_string(),
+            qobuz: "https://www.qobuz.com/api.json/0.2".to_string(),
         }
     }
 }
@@ -282,6 +295,15 @@ async fn read_from(http: &reqwest::Client, url: &Url, bases: &Bases, library: Op
                 }
             }
             listing
+        }
+        Service::Qobuz => {
+            let endpoint = match link.kind {
+                Kind::Song => format!("{}/track/get?track_id={}&app_id={}", bases.qobuz, link.id, crate::qobuz::QOBUZ_APP_ID),
+                Kind::Album => format!("{}/album/get?album_id={}&app_id={}", bases.qobuz, link.id, crate::qobuz::QOBUZ_APP_ID),
+                _ => format!("{}/playlist/get?playlist_id={}&app_id={}", bases.qobuz, link.id, crate::qobuz::QOBUZ_APP_ID),
+            };
+            let found = get_json(http, &endpoint, service).await?;
+            qobuz_listing(&found, link.kind)?
         }
     };
     if listing.songs.is_empty() {
@@ -461,6 +483,44 @@ fn deezer(found: &Value, kind: Kind) -> Result<Listing, String> {
         listing.artist = text(&found["artist"], "name").filter(|_| kind == Kind::Album);
         listing.cover = text(found, "cover_xl").or_else(|| text(found, "picture_xl"));
         listing.songs = deezer_songs(&found["tracks"]);
+    }
+    Ok(listing)
+}
+
+/// A song of Qobuz's answers.
+fn qobuz_song(found: &Value) -> Option<Song> {
+    let track = crate::qobuz::parse_track_json(found)?;
+    Some(Song {
+        key: format!("qobuz {}", track.id),
+        title: track.title,
+        artists: vec![track.artist],
+        album: track.album,
+        seconds: Some(track.duration).filter(|&s| s > 0.0),
+        isrc: track.isrc,
+        track: found["track_number"].as_u64().and_then(|n| u32::try_from(n).ok()),
+        cover: track.cover,
+        ..Default::default()
+    })
+}
+
+/// What Qobuz's API tells of a track, an album or a playlist.
+fn qobuz_listing(found: &Value, kind: Kind) -> Result<Listing, String> {
+    if found["status"].as_str() == Some("error") {
+        return Err(format!("Qobuz answered: {}", found["message"].as_str().unwrap_or("error")));
+    }
+    let title = text(found, "title").ok_or_else(|| unreadable(Service::Qobuz))?;
+    let year = year_of(text(found, "release_date_original").or_else(|| text(found, "release_date_download")));
+    let mut listing = Listing { service: Service::Qobuz, kind, title, artist: None, year, cover: None, songs: Vec::new(), unread: None };
+    if kind == Kind::Song {
+        let song = qobuz_song(found).ok_or_else(|| unreadable(Service::Qobuz))?;
+        (listing.artist, listing.cover) = (song.artists.first().cloned(), song.cover.clone());
+        listing.songs.push(song);
+    } else {
+        listing.artist = text(&found["artist"], "name").filter(|_| kind == Kind::Album);
+        listing.cover = text(&found["image"], "large").or_else(|| text(&found["image"], "extralarge"));
+        if let Some(items) = found["tracks"]["items"].as_array() {
+            listing.songs = items.iter().filter_map(qobuz_song).collect();
+        }
     }
     Ok(listing)
 }
@@ -737,8 +797,35 @@ where
     Ok(verdicts)
 }
 
-/// Attempts to find a bit-perfect lossless match for `song` on Deezer via its ISRC or artist/title.
+/// Attempts to find a bit-perfect lossless match for `song`.
+/// Prioritizes Qobuz 24-bit Hi-Res audio (Tier 1), falling back to Deezer 16-bit FLAC (Tier 2).
 pub async fn find_lossless(http: &reqwest::Client, song: &Song) -> Option<Found> {
+    // Tier 1: Try Qobuz Hi-Res lossless (24-bit/96kHz - 192kHz) first via ISRC or search
+    if let Some(isrc) = &song.isrc {
+        if let Ok(Some(track)) = crate::qobuz::resolve_isrc(http, isrc).await {
+            return Some(Found {
+                id: format!("https://play.qobuz.com/track/{}", track.id),
+                title: track.title,
+                artist: track.artist,
+                seconds: Some(track.duration),
+            });
+        }
+    }
+    let artist = song.artists.first().map(String::as_str).unwrap_or("");
+    if let Ok(Some(track)) = crate::qobuz::search_track(http, artist, &song.title).await {
+        let alike = similarity(&core_title(&song.title), &core_title(&track.title));
+        let apart = song.seconds.map(|s| (s - track.duration).abs());
+        if alike >= 0.85 && apart.is_none_or(|a| a <= SURE_APART) {
+            return Some(Found {
+                id: format!("https://play.qobuz.com/track/{}", track.id),
+                title: track.title,
+                artist: track.artist,
+                seconds: Some(track.duration),
+            });
+        }
+    }
+
+    // Tier 2: Fall back to Deezer 16-bit lossless FLAC
     if let Some(isrc) = &song.isrc {
         if let Ok(Some(track)) = crate::deezer::resolve_isrc(http, isrc).await {
             return Some(Found {
@@ -749,7 +836,6 @@ pub async fn find_lossless(http: &reqwest::Client, song: &Song) -> Option<Found>
             });
         }
     }
-    let artist = song.artists.first().map(String::as_str).unwrap_or("");
     if let Ok(Some(track)) = crate::deezer::search_track(http, artist, &song.title).await {
         let alike = similarity(&core_title(&song.title), &core_title(&track.title));
         let apart = song.seconds.map(|s| (s - track.duration).abs());
@@ -932,7 +1018,7 @@ mod tests {
 
     /// The stand-in services at a local server's `base`.
     fn bases(base: &str) -> Bases {
-        Bases { spotify: base.to_string(), apple: base.to_string(), itunes: base.to_string(), deezer: base.to_string() }
+        Bases { spotify: base.to_string(), apple: base.to_string(), itunes: base.to_string(), deezer: base.to_string(), qobuz: base.to_string() }
     }
 
     /// The query of each of YouTube Music's searches `urls`.
@@ -956,6 +1042,10 @@ mod tests {
         assert_eq!(named("https://www.deezer.com/track/3"), deezer(Kind::Song, "3"));
         assert_eq!(named("https://www.deezer.com/fr/album/8"), deezer(Kind::Album, "8"));
         assert_eq!(named("https://deezer.com/playlist/7"), deezer(Kind::Playlist, "7"));
+        let qobuz = |kind, id: &str| Some((Service::Qobuz, kind, id.to_string(), String::new()));
+        assert_eq!(named("https://play.qobuz.com/track/12345678"), qobuz(Kind::Song, "12345678"));
+        assert_eq!(named("https://open.qobuz.com/album/abcdef"), qobuz(Kind::Album, "abcdef"));
+        assert_eq!(named("https://www.qobuz.com/us-en/album/album-title/1234567"), qobuz(Kind::Album, "1234567"));
         for other in [
             "https://open.spotify.com/artist/artist0001",
             "https://open.spotify.com/",
