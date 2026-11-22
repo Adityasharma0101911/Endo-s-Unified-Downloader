@@ -1154,7 +1154,10 @@ impl DeepUnshortener {
         let mut current = url.clone();
         let mut unwrapped_any = false;
         for _ in 0..MAX_UNWRAPS {
-            if let Some(target) = unwrap_redirect(&current).or_else(|| Self::unwrap_query_target(&current)) {
+            // A link in the query is the target only on a shortener: elsewhere it is the site's own
+            // (a proxy's `?url=`, a sign-in's `?next=`), and the link is downloaded as given.
+            let named = || Self::unwrap_query_target(&current).filter(|_| Self::is_shortener(&current));
+            if let Some(target) = unwrap_redirect(&current).or_else(named) {
                 if target == current {
                     break;
                 }
@@ -4181,8 +4184,21 @@ host.example.com\tFALSE\t/\tFALSE\t0\thostonly\t1
         let u2 = Url::parse("https://adfly-style.test/link?dest=aHR0cHM6Ly9maWxlcy50ZXN0L2RvYy5wZGY=").unwrap();
         assert_eq!(DeepUnshortener::unwrap_query_target(&u2).unwrap().as_str(), "https://files.test/doc.pdf");
 
-        let nested = Url::parse("https://steamcommunity.com/linkfilter/?url=https://linkprotector.test/go?r=aHR0cHM6Ly9maWxlcy50ZXN0L2RvYy5wZGY=").unwrap();
+        let nested = Url::parse("https://steamcommunity.com/linkfilter/?url=https://ouo.io/go?r=aHR0cHM6Ly9maWxlcy50ZXN0L2RvYy5wZGY=").unwrap();
         assert_eq!(DeepUnshortener::unwrap_in_memory(&nested).unwrap().as_str(), "https://files.test/doc.pdf");
+    }
+
+    /// A proxy, a sign-in page or a search keeps its link: only a shortener's query names where
+    /// the link goes.
+    #[test]
+    fn test_a_link_in_the_query_of_a_site_that_is_no_shortener_is_kept() {
+        for link in [
+            "https://proxy.test/m3u8-proxy?url=https://origin.test/video/master.m3u8",
+            "https://files.test/download?id=7&next=https://files.test/thanks",
+            "https://cdn.test/get?u=aHR0cHM6Ly9maWxlcy50ZXN0L2RvYy5wZGY=",
+        ] {
+            assert_eq!(DeepUnshortener::unwrap_in_memory(&Url::parse(link).unwrap()), None, "{link}");
+        }
     }
 
     #[test]

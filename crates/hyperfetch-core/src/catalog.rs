@@ -759,11 +759,38 @@ fn search_url(query: &str) -> Url {
 /// first): a card shows how far a list is a batch at a time.
 pub const BATCH: usize = 5;
 
-/// Each of `songs` (a [`BATCH`] or so) found on YouTube Music through the helper tool's search,
-/// read through `proxy`: sure, unsure or not found (see [`choose`]). Err when the helper tool
-/// could not search.
+/// Each of `songs` (a [`BATCH`] or so) found via bit-perfect lossless services (Qobuz 24-bit Hi-Res,
+/// Deezer 16-bit FLAC) and falling back to YouTube Music, read through `proxy`: sure, unsure or not found
+/// (see [`choose`]). Err when the helper tool could not search.
 pub async fn find(songs: &[Song], proxy: Option<&str>) -> Result<Vec<Verdict>, String> {
-    find_with(songs, |urls| youtube_music(urls, proxy.map(String::from))).await
+    let http = match proxy {
+        Some(p) => reqwest::Client::builder().proxy(reqwest::Proxy::all(p).map_err(|e| e.to_string())?).build().unwrap_or_else(|_| reqwest::Client::new()),
+        None => reqwest::Client::new(),
+    };
+    let mut verdicts: Vec<Option<Verdict>> = vec![None; songs.len()];
+    let mut needed: Vec<usize> = Vec::new();
+
+    // 1. Try bit-perfect lossless matching (Qobuz Hi-Res -> Deezer FLAC) for each song
+    for (i, song) in songs.iter().enumerate() {
+        if let Some(found) = find_lossless(&http, song).await {
+            verdicts[i] = Some(Verdict::Sure(found));
+        } else {
+            needed.push(i);
+        }
+    }
+
+    if needed.is_empty() {
+        return Ok(verdicts.into_iter().map(|v| v.unwrap_or(Verdict::NotFound)).collect());
+    }
+
+    // 2. Fall back to YouTube Music search for any songs not found losslessly
+    let remaining_songs: Vec<Song> = needed.iter().map(|&i| songs[i].clone()).collect();
+    let yt_verdicts = find_with(&remaining_songs, |urls| youtube_music(urls, proxy.map(String::from))).await?;
+    for (&i, verdict) in needed.iter().zip(yt_verdicts) {
+        verdicts[i] = Some(verdict);
+    }
+
+    Ok(verdicts.into_iter().map(|v| v.unwrap_or(Verdict::NotFound)).collect())
 }
 
 /// What the helper tool's searches `urls` find (see `media::search_music`), through `proxy`.
