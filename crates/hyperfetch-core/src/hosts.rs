@@ -110,6 +110,9 @@ impl HostKey {
         } else if host.contains("pixeldra") {
             // Answers 403 to a fifth or sixth connection from one address.
             Some(4)
+        } else if host == "archive.org" || host.ends_with(".archive.org") {
+            // Internet Archive rate limits aggressively and returns HTTP 429 when concurrency exceeds 4-5.
+            Some(4)
         } else if host == "export.arxiv.org" {
             // arXiv asks programs to use one connection to it, besides one request every 3 s
             // (see `crate::archives`, which sets that gap).
@@ -1643,5 +1646,13 @@ mod tests {
         record(&url, HostProfile { connection_cap: Some(6), ..Default::default() });
         let seen = profile(&Url::parse("https://profile-test.hosts.example/other.iso").unwrap());
         assert_eq!(seen.connection_cap, Some(6));
+    }
+
+    #[test]
+    fn test_archive_org_default_connection_cap() {
+        let direct = HostKey::of(&Url::parse("https://archive.org/download/item/file.mp4").unwrap());
+        assert_eq!(direct.default_connection_cap(), Some(4));
+        let server = HostKey::of(&Url::parse("https://ia800100.us.archive.org/items/item/file.mp4").unwrap());
+        assert_eq!(server.default_connection_cap(), Some(4));
     }
 }

@@ -375,6 +375,14 @@ pub struct Args {
     #[arg(long = "virustotal-key", value_name = "KEY", env = "VIRUSTOTAL_API_KEY", hide_env_values = true)]
     pub virustotal_key: Option<String>,
 
+    /// Normalize audio loudness to EBU R128 (-14 LUFS / ReplayGain) via ffmpeg
+    #[arg(long = "audio-normalize", aliases = ["normalize-audio", "loudnorm"])]
+    pub audio_normalize: bool,
+
+    /// Tag audio metadata (title, artist, album) via ffmpeg
+    #[arg(long = "audio-tag", aliases = ["tag-audio", "id3-tag"])]
+    pub audio_tag: bool,
+
     /// Media quality: best, 1080p, 720p, mp3, m4a; a quality --list-tracks lists, as 1440p:av1,
     /// 2160p:vp9:hdr or original (the site's audio, not converted), with @<language> after for
     /// that audio (1080p@de); or any other yt-dlp format selector (e.g.

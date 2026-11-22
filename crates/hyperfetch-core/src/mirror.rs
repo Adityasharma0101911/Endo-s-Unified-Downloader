@@ -196,6 +196,22 @@ impl MirrorRacer {
         usable.into_iter().map(|(id, _)| id).collect()
     }
 
+    /// Active mirrors scoring within `ratio` (e.g. 0.5) of the highest score.
+    /// When multiple mirrors are active with competitive scores, distributing chunk
+    /// downloads across them aggregates bandwidth from all mirror CDNs simultaneously.
+    pub fn swarm_mirrors(&self, ratio: f64) -> Vec<usize> {
+        let now = Instant::now();
+        let mut usable: Vec<(usize, f64)> =
+            self.mirrors.iter().map(|m| (m.id, m.score(now))).filter(|&(_, score)| score > 0.0).collect();
+        if usable.is_empty() {
+            return Vec::new();
+        }
+        usable.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let best_score = usable[0].1;
+        let threshold = best_score * ratio;
+        usable.into_iter().take_while(|(_, s)| *s >= threshold).map(|(id, _)| id).collect()
+    }
+
     pub fn get_mirror(&self, id: usize) -> Option<&Mirror> {
         self.mirrors.get(id)
     }
@@ -328,5 +344,23 @@ mod tests {
         assert_eq!(racer.select_best_mirror(), None, "at the cap");
         racer.get_mirror_mut(0).unwrap().record_success();
         assert_eq!(racer.select_best_mirror(), Some(0), "one more connection is allowed after a success");
+    }
+
+    #[test]
+    fn test_swarm_mirrors_selection() {
+        let mut racer = racer();
+        // Fast mirror: 10 MB/s, 20ms TTFB -> score ~ 500
+        racer.get_mirror_mut(0).unwrap().speed_ewma = 10_000_000.0;
+        racer.get_mirror_mut(0).unwrap().ttfb_ewma_ms = 20.0;
+        // Competitive mirror: 8 MB/s, 20ms TTFB -> score ~ 400 (80% of top)
+        racer.get_mirror_mut(1).unwrap().speed_ewma = 8_000_000.0;
+        racer.get_mirror_mut(1).unwrap().ttfb_ewma_ms = 20.0;
+        // Third mirror: very slow 100 KB/s, 500ms TTFB -> score ~ 0.2
+        racer.add(Url::parse("https://crawl.example.com/file.iso").unwrap());
+        racer.get_mirror_mut(2).unwrap().speed_ewma = 100_000.0;
+        racer.get_mirror_mut(2).unwrap().ttfb_ewma_ms = 500.0;
+
+        let swarm = racer.swarm_mirrors(0.5);
+        assert_eq!(swarm, vec![0, 1]);
     }
 }

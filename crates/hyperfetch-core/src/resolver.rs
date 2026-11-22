@@ -122,6 +122,8 @@ pub enum ResolverError {
     NotFound(String),
     #[error("Link resolution timed out after {0}s")]
     Timeout(u64),
+    #[error("Anti-bot challenge required for {host}: {message}")]
+    BrowserClearanceRequired { host: String, url: String, message: String },
 }
 
 /// Trait implemented by host-specific resolvers to unpack landing pages,
@@ -1084,6 +1086,282 @@ fn country_domain(domain: &str) -> bool {
     !tld.is_empty() && tld.bytes().all(|b| b.is_ascii_lowercase())
 }
 
+/// Known URL shorteners and intermediate redirect/protector services.
+const SHORTENER_DOMAINS: &[&str] = &[
+    "bit.ly", "bitly.com", "tinyurl.com", "t.co", "is.gd", "v.gd", "cutt.ly", "rb.gy",
+    "adf.ly", "ay.gy", "j.gs", "q.gs", "ouo.io", "ouo.press", "shrinkme.io", "shrinkme.net",
+    "shorturl.at", "goo.gl", "rebrand.ly", "trib.al", "t.ly", "tiny.cc", "lnkd.in", "qr.ae",
+    "adfoc.us", "bc.vc", "shorte.st", "linkvertise.com", "linkvertise.download", "link-to.net",
+    "up-to-down.net", "direct-link.net", "megaurl.in", "sck.pm", "clck.ru",
+];
+
+/// Query parameter names frequently used to wrap destination URLs.
+const QUERY_TARGET_PARAMS: &[&str] = &[
+    "url", "target", "dest", "destination", "link", "r", "redirect", "redirect_url",
+    "to", "goto", "next", "href", "u", "q", "out",
+];
+
+/// Deep Unshortener Engine (Tier 1)
+/// Unwraps direct native redirects, query wrappers, base64-encoded destinations, and shortlinks.
+pub struct DeepUnshortener;
+
+impl DeepUnshortener {
+    /// Whether `url` is on a recognized URL shortener domain.
+    pub fn is_shortener(url: &Url) -> bool {
+        let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+        let trimmed = host.trim_end_matches('.');
+        SHORTENER_DOMAINS.iter().any(|&domain| trimmed == domain || trimmed.ends_with(&format!(".{domain}")))
+    }
+
+    /// Extracts a destination URL from query parameters, including base64-encoded URLs.
+    pub fn unwrap_query_target(url: &Url) -> Option<Url> {
+        for (key, value) in url.query_pairs() {
+            let key_lower = key.to_ascii_lowercase();
+            if QUERY_TARGET_PARAMS.contains(&key_lower.as_str()) {
+                let trimmed = value.trim();
+                // 1. Plain HTTP(S) URL
+                if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+                    if let Ok(parsed) = Url::parse(trimmed) {
+                        if parsed.host_str() != url.host_str() || parsed.path() != url.path() {
+                            return Some(parsed);
+                        }
+                    }
+                }
+                // 2. Base64 encoded URL
+                if trimmed.len() >= 8 {
+                    let decoded_bytes = base64::engine::general_purpose::STANDARD.decode(trimmed)
+                        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(trimmed))
+                        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(trimmed))
+                        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(trimmed));
+                    if let Ok(bytes) = decoded_bytes {
+                        if let Ok(decoded_str) = std::str::from_utf8(&bytes) {
+                            let s = decoded_str.trim();
+                            if s.starts_with("http://") || s.starts_with("https://") {
+                                if let Ok(parsed) = Url::parse(s) {
+                                    return Some(parsed);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Unwraps leaving-site wrappers, query redirects, and nested base64 targets in memory.
+    pub fn unwrap_in_memory(url: &Url) -> Option<Url> {
+        let mut current = url.clone();
+        let mut unwrapped_any = false;
+        for _ in 0..MAX_UNWRAPS {
+            if let Some(target) = unwrap_redirect(&current).or_else(|| Self::unwrap_query_target(&current)) {
+                if target == current {
+                    break;
+                }
+                current = target;
+                unwrapped_any = true;
+            } else {
+                break;
+            }
+        }
+        unwrapped_any.then_some(current)
+    }
+
+    /// Resolves shortlink redirect chains (HTTP 301/302/307/308, HTML meta-refresh, and script redirects).
+    pub async fn resolve(client: &Client, url: &Url) -> Result<Url, ResolverError> {
+        if let Some(in_mem) = Self::unwrap_in_memory(url) {
+            if !Self::is_shortener(&in_mem) {
+                return Ok(in_mem);
+            }
+        }
+
+        let resp = client
+            .get(url.clone())
+            .header(USER_AGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+            .send()
+            .await?;
+
+        let final_url = resp.url().clone();
+        if final_url != *url && !Self::is_shortener(&final_url) {
+            if let Some(unwound) = Self::unwrap_in_memory(&final_url) {
+                return Ok(unwound);
+            }
+            return Ok(final_url);
+        }
+
+        // Inspect body snippet for anti-bot challenges or HTML meta-refresh redirects
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let snippet = read_capped(resp, 8192).await.unwrap_or_default();
+
+        if let Some(challenge) = detect_anti_bot_challenge(status, &headers, &snippet) {
+            return Err(ResolverError::BrowserClearanceRequired {
+                host: url.host_str().unwrap_or_default().to_string(),
+                url: url.to_string(),
+                message: challenge.to_string(),
+            });
+        }
+
+        // Meta refresh: <meta http-equiv="refresh" content="...;url=...">
+        if let Some(dest) = extract_meta_refresh(&snippet, &final_url) {
+            if let Some(unwound) = Self::unwrap_in_memory(&dest) {
+                return Ok(unwound);
+            }
+            return Ok(dest);
+        }
+
+        // JavaScript window.location or location.href
+        if let Some(dest) = extract_js_redirect(&snippet, &final_url) {
+            if let Some(unwound) = Self::unwrap_in_memory(&dest) {
+                return Ok(unwound);
+            }
+            return Ok(dest);
+        }
+
+        if html_type(&headers) && !is_attachment(&headers) && Self::is_shortener(&final_url) {
+            let host = final_url.host_str().unwrap_or_default();
+            return Err(ResolverError::NotFound(format!(
+                "{host} showed a page instead of redirecting (a preview or a warning): open the link in your browser"
+            )));
+        }
+
+        Ok(final_url)
+    }
+}
+
+/// Extracts destination URL from `<meta http-equiv="refresh" content="...;url=...">`
+fn extract_meta_refresh(html: &str, base_url: &Url) -> Option<Url> {
+    let lower = html.to_ascii_lowercase();
+    let refresh_idx = lower.find("http-equiv=\"refresh\"").or_else(|| lower.find("http-equiv='refresh'"))?;
+    let tag_start = html[..refresh_idx].rfind('<')?;
+    let tag_end = tag_start + html[tag_start..].find('>')?;
+    let tag = &html[tag_start..tag_end];
+    let tag_lower = tag.to_ascii_lowercase();
+    let url_idx = tag_lower.find("url=")?;
+    let raw_target = tag[url_idx + 4..].trim().trim_matches(['"', '\'', ' ']);
+    let clean_target = raw_target.split(['"', '\'', ' ', '>']).next()?;
+    base_url.join(clean_target).ok().filter(|u| matches!(u.scheme(), "http" | "https"))
+}
+
+/// Extracts destination URL from `window.location = "..."` or `location.href = "..."`
+fn extract_js_redirect(html: &str, base_url: &Url) -> Option<Url> {
+    for pattern in ["location.href", "window.location", "location.replace"] {
+        if let Some(idx) = html.find(pattern) {
+            let after = &html[idx + pattern.len()..];
+            let after_eq = if let Some(eq_idx) = after.find('=') {
+                &after[eq_idx + 1..]
+            } else if let Some(open_paren) = after.find('(') {
+                &after[open_paren + 1..]
+            } else {
+                continue;
+            };
+            let trimmed = after_eq.trim_start();
+            let quote = trimmed.chars().next()?;
+            if quote == '"' || quote == '\'' {
+                let inside = &trimmed[1..];
+                if let Some(close) = inside.find(quote) {
+                    let raw_url = &inside[..close];
+                    if let Ok(parsed) = base_url.join(raw_url) {
+                        if matches!(parsed.scheme(), "http" | "https") && parsed != *base_url {
+                            return Some(parsed);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Detects anti-bot protection gates (Cloudflare Turnstile, hCaptcha, Cloudflare challenge interstitial).
+pub fn detect_anti_bot_challenge(status: reqwest::StatusCode, headers: &HeaderMap, body_snippet: &str) -> Option<&'static str> {
+    if headers.get("cf-mitigated").and_then(|v| v.to_str().ok()) == Some("challenge") {
+        return Some("Cloudflare Turnstile challenge");
+    }
+    if status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+        if body_snippet.contains("challenges.cloudflare.com/turnstile") || body_snippet.contains("cf-turnstile-wrapper") {
+            return Some("Cloudflare Turnstile verification challenge");
+        }
+        if body_snippet.contains("hcaptcha.com/1/api.js") || body_snippet.contains("h-captcha") {
+            return Some("hCaptcha challenge");
+        }
+        if body_snippet.contains("cf-browser-verification")
+            || body_snippet.contains("_cf_chl_opt")
+            || body_snippet.contains("Just a moment...")
+            || body_snippet.contains("Attention Required! | Cloudflare")
+        {
+            return Some("Cloudflare anti-bot verification page");
+        }
+        if body_snippet.contains("g-recaptcha") || body_snippet.contains("google.com/recaptcha") {
+            return Some("Google reCAPTCHA verification challenge");
+        }
+        if body_snippet.contains("Verify you are human") || body_snippet.contains("Checking your browser before accessing") {
+            return Some("Anti-bot browser verification challenge");
+        }
+    }
+    None
+}
+
+/// Extracts confirmation URL from a Google Drive virus scan warning page if encountered.
+pub fn extract_google_drive_confirm_url(html: &str, base_url: &Url) -> Option<Url> {
+    if !html.contains("can't scan this file for viruses") && !html.contains("cannot scan this file") && !html.contains("uc-download-link") && !html.contains("download-form") {
+        return None;
+    }
+    // 1. Look for <a id="uc-download-link" href="...">
+    if let Some(idx) = html.find("uc-download-link") {
+        if let Some(tag_start) = html[..idx].rfind('<') {
+            if let Some(tag_len) = html[tag_start..].find('>') {
+                let tag = &html[tag_start..tag_start + tag_len];
+                if let Some(h_idx) = tag.find("href=") {
+                    if let Some(quote) = tag[h_idx + 5..].chars().next() {
+                        let inside = &tag[h_idx + 6..];
+                        if let Some(close) = inside.find(quote) {
+                            let link = &inside[..close];
+                            if let Ok(parsed) = base_url.join(link) {
+                                return Some(parsed);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // 2. Extract confirm and uuid tokens from hidden inputs
+    let mut confirm_token = None;
+    let mut uuid_token = None;
+    let mut file_id = None;
+    for part in html.split("<input") {
+        if let Some(end) = part.find('>') {
+            let tag = &part[..end];
+            let name = tag.find("name=\"").or_else(|| tag.find("name='")).and_then(|idx| {
+                let quote = tag.as_bytes()[idx + 5] as char;
+                let inside = &tag[idx + 6..];
+                inside.split(quote).next()
+            });
+            let val = tag.find("value=\"").or_else(|| tag.find("value='")).and_then(|idx| {
+                let quote = tag.as_bytes()[idx + 6] as char;
+                let inside = &tag[idx + 7..];
+                inside.split(quote).next()
+            });
+            match (name, val) {
+                (Some("confirm"), Some(v)) if !v.is_empty() => confirm_token = Some(v),
+                (Some("uuid"), Some(v)) if !v.is_empty() => uuid_token = Some(v),
+                (Some("id"), Some(v)) if !v.is_empty() => file_id = Some(v),
+                _ => {}
+            }
+        }
+    }
+    let resolved_id = file_id.map(str::to_string).or_else(|| extract_google_drive_id(base_url));
+    if let Some(id) = resolved_id {
+        let mut params = vec![("id", id.as_str()), ("export", "download"), ("confirm", confirm_token.unwrap_or("t"))];
+        if let Some(uuid) = uuid_token {
+            params.push(("uuid", uuid));
+        }
+        return Url::parse_with_params("https://drive.usercontent.google.com/download", params).ok();
+    }
+    None
+}
+
 /// Fails if the answer to `url` (which ended at `final_url`), with these headers, is a web page
 /// instead of the file it stands for: HTML not sent as an attachment (a hosted .html file is
 /// one) from Drive, from Google asking to sign in to a document, for a code-host folder, for a
@@ -1091,6 +1369,13 @@ fn country_domain(domain: &str) -> bool {
 /// into for a video.
 pub fn check_answer(url: &Url, final_url: &Url, headers: &HeaderMap) -> Result<(), ResolverError> {
     GoogleDriveResolver::check_answer(url, headers)?;
+    if headers.get("cf-mitigated").and_then(|v| v.to_str().ok()) == Some("challenge") {
+        return Err(ResolverError::BrowserClearanceRequired {
+            host: final_url.host_str().unwrap_or_default().to_string(),
+            url: final_url.to_string(),
+            message: "Cloudflare Turnstile challenge detected".to_string(),
+        });
+    }
     if !html_type(headers) || is_attachment(headers) {
         return Ok(());
     }
@@ -1986,25 +2271,32 @@ impl SmartResolver {
         debrid_provider: Option<&str>,
         proxy: Option<&str>,
     ) -> Result<Vec<Url>, ResolverError> {
-        // 0. Check Debrid unrestrictor if API key is provided or in environment
+        // Tier 1 (Best): Deep Unshortener Engine
+        // In-memory unwrap handles query redirects (?url=, ?dest=, ?target=, etc.), base64 targets, leaving-site wrappers
+        let in_mem = DeepUnshortener::unwrap_in_memory(url).unwrap_or_else(|| url.clone());
+        let target_url = in_mem;
+
+        // Tier 2 (First Fallback): Debrid Auto-Unrestrictor
         let key = debrid_key
             .map(str::to_string)
             .or_else(|| std::env::var("ENDO_DEBRID_KEY").ok())
             .or_else(|| std::env::var("REAL_DEBRID_KEY").ok())
             .or_else(|| std::env::var("ALLDEBRID_KEY").ok());
         if let Some(key) = key.filter(|k| !k.trim().is_empty()) {
-            if crate::debrid::supports(client, url, &key, debrid_provider).await {
-                match crate::debrid::unrestrict(client, url, &key, debrid_provider).await {
+            if crate::debrid::supports(client, &target_url, &key, debrid_provider).await {
+                match crate::debrid::unrestrict(client, &target_url, &key, debrid_provider).await {
                     Ok(unrestricted) => {
-                        tracing::info!("Debrid unlocked {}", url);
+                        tracing::info!("Debrid unlocked {}", target_url);
                         return Ok(vec![unrestricted]);
                     }
                     // A hoster nothing else here takes: the provider's answer is the error.
-                    Err(e) if crate::debrid::is_debrid_host(url) && !Self::handles(url) => return Err(e),
-                    Err(e) => tracing::warn!("{}; trying {} without debrid", e, url),
+                    Err(e) if crate::debrid::is_debrid_host(&target_url) && !Self::handles(&target_url) => return Err(e),
+                    Err(e) => tracing::warn!("{}; trying {} without debrid", e, target_url),
                 }
             }
         }
+
+        let url = &target_url;
 
         // File-sharing hosts, cloud storage and code or model repositories with resolvers of their
         // own (see `crate::mega`, `crate::shares`, `crate::cloud`, `crate::repos`).
@@ -3879,5 +4171,69 @@ host.example.com\tFALSE\t/\tFALSE\t0\thostonly\t1
         assert_eq!(cids.len(), 2);
         assert_eq!(cids[0], "QmXoypizjW3WknFiJnKLwHCnL72vedxjQkDDP1mXWo6uco");
         assert_eq!(cids[1], "bafykic733b5c3j26425a4d654274c5d63f25d62547d6e5c4b3a2a1z9y8x7w6");
+    }
+
+    #[test]
+    fn test_deep_unshortener_query_and_base64_unwrapping() {
+        let u1 = Url::parse("https://linkprotector.test/redirect?url=https://target.test/archive.zip").unwrap();
+        assert_eq!(DeepUnshortener::unwrap_query_target(&u1).unwrap().as_str(), "https://target.test/archive.zip");
+
+        let u2 = Url::parse("https://adfly-style.test/link?dest=aHR0cHM6Ly9maWxlcy50ZXN0L2RvYy5wZGY=").unwrap();
+        assert_eq!(DeepUnshortener::unwrap_query_target(&u2).unwrap().as_str(), "https://files.test/doc.pdf");
+
+        let nested = Url::parse("https://steamcommunity.com/linkfilter/?url=https://linkprotector.test/go?r=aHR0cHM6Ly9maWxlcy50ZXN0L2RvYy5wZGY=").unwrap();
+        assert_eq!(DeepUnshortener::unwrap_in_memory(&nested).unwrap().as_str(), "https://files.test/doc.pdf");
+    }
+
+    #[test]
+    fn test_deep_unshortener_is_shortener() {
+        assert!(DeepUnshortener::is_shortener(&Url::parse("https://bit.ly/xyz123").unwrap()));
+        assert!(DeepUnshortener::is_shortener(&Url::parse("https://tinyurl.com/abc").unwrap()));
+        assert!(DeepUnshortener::is_shortener(&Url::parse("https://linkvertise.com/123/file").unwrap()));
+        assert!(!DeepUnshortener::is_shortener(&Url::parse("https://archive.org/details/test").unwrap()));
+    }
+
+    #[test]
+    fn test_detect_anti_bot_challenge() {
+        use reqwest::StatusCode;
+        let mut headers = HeaderMap::new();
+        headers.insert("cf-mitigated", HeaderValue::from_static("challenge"));
+        assert!(detect_anti_bot_challenge(StatusCode::OK, &headers, "").is_some());
+
+        let empty_headers = HeaderMap::new();
+        let turnstile_html = r#"<html><div class="cf-turnstile-wrapper"><script src="https://challenges.cloudflare.com/turnstile/v0/api.js"></script></div></html>"#;
+        assert_eq!(
+            detect_anti_bot_challenge(StatusCode::FORBIDDEN, &empty_headers, turnstile_html),
+            Some("Cloudflare Turnstile verification challenge")
+        );
+
+        let hcaptcha_html = r#"<html><script src="https://hcaptcha.com/1/api.js"></script></html>"#;
+        assert_eq!(
+            detect_anti_bot_challenge(StatusCode::SERVICE_UNAVAILABLE, &empty_headers, hcaptcha_html),
+            Some("hCaptcha challenge")
+        );
+
+        assert!(detect_anti_bot_challenge(StatusCode::OK, &empty_headers, "<html>Normal page</html>").is_none());
+    }
+
+    #[test]
+    fn test_extract_google_drive_confirm_url() {
+        let base = Url::parse("https://drive.google.com/uc?id=1Abc_XYZ-12345&export=download").unwrap();
+        let html = r#"
+            <html>
+                <form id="download-form" action="https://drive.usercontent.google.com/download" method="get">
+                    <input type="hidden" name="id" value="1Abc_XYZ-12345">
+                    <input type="hidden" name="export" value="download">
+                    <input type="hidden" name="confirm" value="t_abc999">
+                    <input type="hidden" name="uuid" value="11112222-3333-4444-5555-666677778888">
+                </form>
+                <div>Google Drive can't scan this file for viruses.</div>
+            </html>
+        "#;
+        let confirm_url = extract_google_drive_confirm_url(html, &base).unwrap();
+        assert_eq!(confirm_url.host_str(), Some("drive.usercontent.google.com"));
+        assert_eq!(confirm_url.query_pairs().find(|(k, _)| k == "id").unwrap().1, "1Abc_XYZ-12345");
+        assert_eq!(confirm_url.query_pairs().find(|(k, _)| k == "confirm").unwrap().1, "t_abc999");
+        assert_eq!(confirm_url.query_pairs().find(|(k, _)| k == "uuid").unwrap().1, "11112222-3333-4444-5555-666677778888");
     }
 }

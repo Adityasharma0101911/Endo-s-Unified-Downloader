@@ -636,6 +636,8 @@ fn job(args: &Args, connections: u64, dir: &Path, task: Task) -> Job {
             mark_of_the_web: !args.no_mark_of_the_web,
             virustotal_key: args.virustotal_key.clone(),
             subtitles: subtitles(args),
+            audio_normalize: args.audio_normalize,
+            audio_tag: args.audio_tag,
         },
         ..tuning(args, if media { args.concurrent_fragments } else { connections })
     };

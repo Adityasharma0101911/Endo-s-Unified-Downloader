@@ -178,6 +178,10 @@ pub struct Settings {
     pub run_after: String,
     /// Mark downloaded files as from the internet (Windows).
     pub mark_of_the_web: bool,
+    /// Normalize audio loudness to EBU R128 (-14 LUFS / ReplayGain) via ffmpeg.
+    pub audio_normalize: bool,
+    /// Tag audio metadata (title, artist, album) via ffmpeg.
+    pub audio_tag: bool,
     /// VirusTotal API key. Saved here, never with the queue or in the history.
     pub virustotal_api_key: String,
     /// The access key S3 and S3-compatible servers' requests are signed with (see
@@ -410,6 +414,8 @@ impl Default for Settings {
             sort_downloads: false,
             run_after: String::new(),
             mark_of_the_web: engine.post.mark_of_the_web,
+            audio_normalize: false,
+            audio_tag: false,
             virustotal_api_key: String::new(),
             virustotal_check: false,
             s3_access_key: String::new(),
@@ -611,6 +617,8 @@ impl Settings {
                 // Never saved with the queue: see `fill_keys`.
                 virustotal_key: None,
                 subtitles: None,
+                audio_normalize: self.audio_normalize,
+                audio_tag: self.audio_tag,
             },
             // What the Streams section shows as refused is left out.
             tracks: TrackChoice {

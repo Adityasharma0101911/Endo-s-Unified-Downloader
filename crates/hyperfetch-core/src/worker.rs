@@ -922,16 +922,38 @@ impl HttpWorker {
     async fn take_slot(&self) -> Option<(usize, HostSlot)> {
         let s = &self.shared;
         let route_id = s.budget(s.route_for_worker(self.worker_id));
-        let ranked: Vec<(usize, Url)> = {
+        let (ranked, swarm): (Vec<(usize, Url)>, Vec<usize>) = {
             let racer = s.mirrors.lock();
-            racer.ranked().into_iter().filter_map(|id| Some((id, racer.get_mirror(id)?.url.clone()))).collect()
+            let ranked = racer.ranked().into_iter().filter_map(|id| Some((id, racer.get_mirror(id)?.url.clone()))).collect();
+            let swarm = racer.swarm_mirrors(0.5);
+            (ranked, swarm)
         };
-        for (mirror_id, url) in &ranked {
+        // Multi-Mirror Swarm Racing: when multiple top mirrors are healthy and competitive,
+        // rotate starting mirror based on worker_id to aggregate bandwidth concurrently across all top mirrors.
+        let candidates: Vec<(usize, Url)> = if swarm.len() > 1 {
+            let mut ordered = Vec::with_capacity(ranked.len());
+            let offset = self.worker_id % swarm.len();
+            for &id in swarm[offset..].iter().chain(&swarm[..offset]) {
+                if let Some((_, url)) = ranked.iter().find(|(rid, _)| *rid == id) {
+                    ordered.push((id, url.clone()));
+                }
+            }
+            for (id, url) in &ranked {
+                if !swarm.contains(id) {
+                    ordered.push((*id, url.clone()));
+                }
+            }
+            ordered
+        } else {
+            ranked
+        };
+
+        for (mirror_id, url) in &candidates {
             if let Some(slot) = hosts::try_acquire_routed(url, s.host_limit, route_id) {
                 return Some((*mirror_id, slot));
             }
         }
-        let (mirror_id, url) = ranked.into_iter().next()?;
+        let (mirror_id, url) = candidates.into_iter().next()?;
         Some((mirror_id, hosts::acquire_routed(&url, s.host_limit, route_id).await))
     }
 

@@ -35,11 +35,25 @@ pub struct PostOptions {
     /// with the options.
     #[serde(skip)]
     pub subtitles: Option<crate::subtitles::Subtitles>,
+    /// Normalize audio loudness using EBU R128 (-14 LUFS / ReplayGain) via ffmpeg.
+    pub audio_normalize: bool,
+    /// Tag audio file metadata (title, artist, album) via ffmpeg.
+    pub audio_tag: bool,
 }
 
 impl Default for PostOptions {
     fn default() -> Self {
-        Self { extract: false, delete_archive: false, sort: false, run_after: None, mark_of_the_web: true, virustotal_key: None, subtitles: None }
+        Self {
+            extract: false,
+            delete_archive: false,
+            sort: false,
+            run_after: None,
+            mark_of_the_web: true,
+            virustotal_key: None,
+            subtitles: None,
+            audio_normalize: false,
+            audio_tag: false,
+        }
     }
 }
 
@@ -121,6 +135,32 @@ pub async fn after_download(path: &Path, post: &PostOptions, source: &Url, proxy
             Err(e) => format!("Subtitles: {e}"),
         });
     }
+    if post.audio_normalize && path.is_file() && is_audio(&path) {
+        if let Some(ffmpeg) = crate::media::find_ffmpeg_path() {
+            let file_path = path.clone();
+            let norm = tokio::task::spawn_blocking(move || normalize_audio(&file_path, &ffmpeg)).await;
+            match norm {
+                Ok(Ok(())) => notes.push("Audio normalized (EBU R128 / -14 LUFS)".into()),
+                Ok(Err(e)) => notes.push(format!("Audio normalization failed: {e}")),
+                Err(_) => notes.push("Audio normalization task failed".into()),
+            }
+        } else {
+            notes.push("Audio normalization skipped (ffmpeg not found)".into());
+        }
+    }
+    if post.audio_tag && path.is_file() && is_audio(&path) {
+        if let Some(ffmpeg) = crate::media::find_ffmpeg_path() {
+            let file_path = path.clone();
+            let tag = tokio::task::spawn_blocking(move || tag_audio(&file_path, &ffmpeg, None, None, None)).await;
+            match tag {
+                Ok(Ok(())) => notes.push(format!("Audio metadata tagged for {}", file_name(&path))),
+                Ok(Err(e)) => notes.push(format!("Audio tagging failed: {e}")),
+                Err(_) => notes.push("Audio tagging task failed".into()),
+            }
+        } else {
+            notes.push("Audio tagging skipped (ffmpeg not found)".into());
+        }
+    }
     if let Some(command) = post.run_after.as_deref().filter(|c| !c.trim().is_empty()) {
         // It is given an ordinary file (see `storage::unsparse_later`).
         let _ = tokio::task::spawn_blocking(crate::storage::finish_clears).await;
@@ -177,6 +217,118 @@ fn on_disk(mut path: PathBuf, post: &PostOptions, source: &Url, hash: bool, pass
 pub fn is_video(path: &Path) -> bool {
     let ext = path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
     CATEGORIES[0].1.contains(&ext.as_str())
+}
+
+/// Whether `path` names an audio file, by the extensions of the Music category.
+pub fn is_audio(path: &Path) -> bool {
+    let ext = path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    CATEGORIES[1].1.contains(&ext.as_str())
+}
+
+/// Normalizes audio loudness to EBU R128 (-14 LUFS target, -1 dB true peak) using ffmpeg loudnorm.
+pub fn normalize_audio(path: &Path, ffmpeg: &Path) -> Result<(), String> {
+    if !path.is_file() {
+        return Err("file does not exist".into());
+    }
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("flac");
+    let temp_name = format!("{}.norm.tmp.{}", path.file_stem().and_then(|s| s.to_str()).unwrap_or("track"), ext);
+    let temp_path = path.with_file_name(temp_name);
+
+    let mut cmd = std::process::Command::new(ffmpeg);
+    cmd.args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+        .arg(path)
+        .args(["-af", "loudnorm=I=-14:LRA=11:TP=-1.0", "-map_metadata", "0"]);
+
+    match ext.to_ascii_lowercase().as_str() {
+        "flac" => { cmd.args(["-c:a", "flac"]); }
+        "mp3" => { cmd.args(["-c:a", "libmp3lame", "-q:a", "0"]); }
+        "m4a" | "aac" => { cmd.args(["-c:a", "aac", "-b:a", "320k"]); }
+        "opus" => { cmd.args(["-c:a", "libopus", "-b:a", "192k"]); }
+        "ogg" => { cmd.args(["-c:a", "libvorbis", "-q:a", "6"]); }
+        _ => {}
+    }
+    cmd.arg(&temp_path);
+
+    let output = cmd.output().map_err(|e| format!("failed to invoke ffmpeg: {e}"))?;
+    if !output.status.success() {
+        let _ = std::fs::remove_file(&temp_path);
+        let err = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("ffmpeg loudnorm error: {}", err.trim()));
+    }
+
+    if let Ok(meta) = std::fs::metadata(&temp_path) {
+        if meta.len() > 0 {
+            std::fs::rename(&temp_path, path).map_err(|e| {
+                let _ = std::fs::remove_file(&temp_path);
+                format!("failed to replace normalized file: {e}")
+            })?;
+            return Ok(());
+        }
+    }
+    let _ = std::fs::remove_file(&temp_path);
+    Err("normalized audio output was empty".into())
+}
+
+/// Tags audio file with metadata (title, artist, album) derived from filename or parameters.
+pub fn tag_audio(path: &Path, ffmpeg: &Path, title: Option<&str>, artist: Option<&str>, album: Option<&str>) -> Result<(), String> {
+    if !path.is_file() {
+        return Err("file does not exist".into());
+    }
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("flac");
+    let temp_name = format!("{}.tag.tmp.{}", path.file_stem().and_then(|s| s.to_str()).unwrap_or("track"), ext);
+    let temp_path = path.with_file_name(temp_name);
+
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let (parsed_artist, parsed_title) = if title.is_none() && artist.is_none() && stem.contains(" - ") {
+        let mut parts = stem.splitn(2, " - ");
+        let a = parts.next().map(str::trim);
+        let t = parts.next().map(str::trim);
+        (a, t)
+    } else {
+        (None, None)
+    };
+
+    let title_val = title.or(parsed_title).unwrap_or(stem);
+    let artist_val = artist.or(parsed_artist);
+
+    let mut cmd = std::process::Command::new(ffmpeg);
+    cmd.args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+        .arg(path)
+        .args(["-c", "copy"]);
+
+    if !title_val.is_empty() {
+        cmd.args(["-metadata", &format!("title={title_val}")]);
+    }
+    if let Some(art) = artist_val {
+        if !art.is_empty() {
+            cmd.args(["-metadata", &format!("artist={art}")]);
+        }
+    }
+    if let Some(alb) = album {
+        if !alb.is_empty() {
+            cmd.args(["-metadata", &format!("album={alb}")]);
+        }
+    }
+    cmd.arg(&temp_path);
+
+    let output = cmd.output().map_err(|e| format!("failed to invoke ffmpeg: {e}"))?;
+    if !output.status.success() {
+        let _ = std::fs::remove_file(&temp_path);
+        let err = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("ffmpeg tagging error: {}", err.trim()));
+    }
+
+    if let Ok(meta) = std::fs::metadata(&temp_path) {
+        if meta.len() > 0 {
+            std::fs::rename(&temp_path, path).map_err(|e| {
+                let _ = std::fs::remove_file(&temp_path);
+                format!("failed to replace tagged file: {e}")
+            })?;
+            return Ok(());
+        }
+    }
+    let _ = std::fs::remove_file(&temp_path);
+    Err("tagged audio output was empty".into())
 }
 
 fn file_name(path: &Path) -> String {
@@ -959,5 +1111,27 @@ mod tests {
         let file = dir.path().join("a");
         std::fs::write(&file, b"abc").unwrap();
         assert_eq!(sha256_of(&file).unwrap(), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    }
+
+    #[test]
+    fn test_is_audio_and_post_options() {
+        assert!(is_audio(Path::new("song.flac")));
+        assert!(is_audio(Path::new("track.mp3")));
+        assert!(is_audio(Path::new("audio.opus")));
+        assert!(is_audio(Path::new("music.m4a")));
+        assert!(!is_audio(Path::new("video.mp4")));
+        assert!(!is_audio(Path::new("doc.pdf")));
+
+        let default_post = PostOptions::default();
+        assert!(!default_post.audio_normalize);
+        assert!(!default_post.audio_tag);
+
+        let custom_post = PostOptions {
+            audio_normalize: true,
+            audio_tag: true,
+            ..Default::default()
+        };
+        assert!(custom_post.audio_normalize);
+        assert!(custom_post.audio_tag);
     }
 }
