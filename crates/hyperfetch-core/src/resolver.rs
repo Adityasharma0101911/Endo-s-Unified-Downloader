@@ -539,7 +539,7 @@ impl AnnaArchiveResolver {
         parsed.download_url.and_then(|u| Url::parse(&u).ok())
     }
 
-    /// Resolves a book metadata page (/md5/<MD5>) into fast IPFS and LibGen mirrors.
+    /// Resolves a book metadata page (/md5/<MD5>) into fast direct CDNs, IPFS gateways, and institutional mirrors.
     pub async fn resolve_book_page(
         client: &Client,
         url: &Url,
@@ -565,38 +565,65 @@ impl AnnaArchiveResolver {
         }
 
         let html = read_capped(resp, MAX_HTML_BYTES).await?;
-        let mut candidates = Vec::new();
 
-        // 1. IPFS Gateways
+        let mut direct_cdn_candidates = Vec::new();
+        let mut ipfs_candidates = Vec::new();
+        let mut institutional_candidates = Vec::new();
+
+        // 1. External Mirrors (LibGen, library.lol, etc.) - resolved concurrently in parallel
+        let mirrors = Self::extract_external_mirrors(&html, url);
+        if !mirrors.is_empty() {
+            tracing::info!("Anna's Archive: resolving {} external mirrors concurrently", mirrors.len());
+            let mut tasks = Vec::new();
+            for mirror in &mirrors {
+                let m = mirror.clone();
+                let cl = client.clone();
+                tasks.push(async move {
+                    if LibGenResolver.can_handle(&m) {
+                        if let Ok(Ok(resolved)) = tokio::time::timeout(Duration::from_secs(5), LibGenResolver.resolve(&cl, &m)).await {
+                            return resolved;
+                        }
+                    }
+                    vec![m]
+                });
+            }
+
+            let results = futures_util::future::join_all(tasks).await;
+            for links in results {
+                for link in links {
+                    let host = link.host_str().unwrap_or("").to_ascii_lowercase();
+                    if host.contains("download.library.lol") || host.contains("libgen.li") || link.path().contains("/get.php") {
+                        if !direct_cdn_candidates.contains(&link) {
+                            direct_cdn_candidates.push(link);
+                        }
+                    } else if host.contains("ipfs") {
+                        if !ipfs_candidates.contains(&link) {
+                            ipfs_candidates.push(link);
+                        }
+                    } else {
+                        if !institutional_candidates.contains(&link) {
+                            institutional_candidates.push(link);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. IPFS Gateways from page CIDs
         for cid in Self::extract_ipfs_cids(&html) {
             tracing::info!("Anna's Archive: extracted IPFS CID {}", cid);
             for gw in Self::construct_gateway_urls(&cid) {
-                if !candidates.contains(&gw) {
-                    candidates.push(gw);
+                if !ipfs_candidates.contains(&gw) {
+                    ipfs_candidates.push(gw);
                 }
             }
         }
 
-        // 2. External Mirrors (LibGen, library.lol, etc.)
-        let mirrors = Self::extract_external_mirrors(&html, url);
-        if !mirrors.is_empty() {
-            tracing::info!("Anna's Archive: extracted {} external mirrors", mirrors.len());
-            for mirror in mirrors {
-                if LibGenResolver.can_handle(&mirror) {
-                    if let Ok(Ok(resolved_links)) = tokio::time::timeout(Duration::from_secs(5), LibGenResolver.resolve(client, &mirror)).await {
-                        for link in resolved_links {
-                            if !candidates.contains(&link) {
-                                candidates.push(link);
-                            }
-                        }
-                        continue;
-                    }
-                }
-                if !candidates.contains(&mirror) {
-                    candidates.push(mirror);
-                }
-            }
-        }
+        // Hierarchy: Direct CDN links at the top -> High-Speed IPFS Gateways -> Institutional Mirrors
+        let mut candidates = Vec::new();
+        candidates.extend(direct_cdn_candidates);
+        candidates.extend(ipfs_candidates);
+        candidates.extend(institutional_candidates);
 
         Ok(candidates)
     }
@@ -895,16 +922,19 @@ impl LibGenResolver {
             || h == "libgen.me" || h.ends_with(".libgen.me")
     }
 
-    /// Extracts direct download links and IPFS gateway links from LibGen / library.lol HTML.
+    /// Extracts direct download links and IPFS gateway links from LibGen / library.lol HTML,
+    /// ordered with direct high-speed CDNs at the top, followed by IPFS gateways, and mirrors as fallback.
     pub fn extract_download_links(html: &str, base_url: &Url) -> Vec<Url> {
-        let mut links = Vec::new();
+        let mut direct_cdn = Vec::new();
+        let mut ipfs_gateways = Vec::new();
+        let mut other_mirrors = Vec::new();
         let lower = html.to_ascii_lowercase();
 
         // 1. Check for any IPFS CIDs mentioned on the page
         for cid in AnnaArchiveResolver::extract_ipfs_cids(html) {
             for gw in AnnaArchiveResolver::construct_gateway_urls(&cid) {
-                if !links.contains(&gw) {
-                    links.push(gw);
+                if !ipfs_gateways.contains(&gw) {
+                    ipfs_gateways.push(gw);
                 }
             }
         }
@@ -917,21 +947,21 @@ impl LibGenResolver {
                     continue;
                 }
 
-                // Check for library.lol direct CDN link (e.g. https://download.library.lol/main/...)
+                // Direct CDN link on library.lol (e.g. https://download.library.lol/main/...)
                 if href_trim.contains("download.library.lol") {
                     if let Ok(u) = base_url.join(href_trim) {
-                        if !links.contains(&u) {
-                            links.insert(0, u); // Direct CDN link at top priority
+                        if !direct_cdn.contains(&u) {
+                            direct_cdn.push(u);
                         }
                     }
                     continue;
                 }
 
-                // Check for libgen.li get.php (e.g. get.php?md5=...&key=...)
+                // Direct stream link on libgen.li (e.g. get.php?md5=...&key=...)
                 if href_trim.contains("get.php?") {
                     if let Ok(u) = base_url.join(href_trim) {
-                        if !links.contains(&u) {
-                            links.insert(0, u);
+                        if !direct_cdn.contains(&u) {
+                            direct_cdn.push(u);
                         }
                     }
                     continue;
@@ -947,13 +977,26 @@ impl LibGenResolver {
                         || FILE_EXTENSIONS.iter().any(|ext| path_lower.ends_with(&format!(".{ext}")));
 
                     let host = u.host_str().unwrap_or("").to_ascii_lowercase();
-                    if (is_file_or_get || host.contains("ipfs")) && !links.contains(&u) {
-                        links.push(u);
+                    if host.contains("ipfs") {
+                        if !ipfs_gateways.contains(&u) {
+                            ipfs_gateways.push(u);
+                        }
+                    } else if is_file_or_get {
+                        if !direct_cdn.contains(&u) {
+                            direct_cdn.push(u);
+                        }
+                    } else if !other_mirrors.contains(&u) {
+                        other_mirrors.push(u);
                     }
                 }
             }
         }
 
+        // Return ordered: Direct CDN at top -> IPFS Gateways -> Other mirrors
+        let mut links = Vec::new();
+        links.extend(direct_cdn);
+        links.extend(ipfs_gateways);
+        links.extend(other_mirrors);
         links
     }
 }
