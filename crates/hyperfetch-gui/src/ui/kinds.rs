@@ -33,6 +33,8 @@ pub enum Choice {
     Files,
     /// A web page: downloaded as it is, or saved as one file that opens offline.
     Page,
+    /// A Spotify, Apple Music or Deezer list: its songs as found on YouTube Music, to tick.
+    Songs,
 }
 
 /// One kind of thing to download.
@@ -142,6 +144,16 @@ pub const KINDS: &[Kind] = &[
         needs: Needs::Nothing,
         choice: Choice::Tracks,
         matches: |text, _| crate::tracks::stream_link(text).is_some(),
+    },
+    Kind {
+        name: "Songs to find",
+        group: "Video & audio",
+        glyph: icon::MUSIC_NOTES,
+        about: "A Spotify, Apple Music or Deezer song, album or playlist: each song found on YouTube Music and shown before anything downloads.",
+        example: "https://www.deezer.com/album/302127",
+        needs: Needs::Tool("yt-dlp"),
+        choice: Choice::Songs,
+        matches: |_, url| web(url).is_some_and(hyperfetch_core::catalog::lists),
     },
     Kind {
         name: "A playlist or channel",
@@ -522,6 +534,10 @@ mod tests {
         assert_eq!(name("nxm://skyrimspecialedition/mods/266/files/1000172397").unwrap().0, "A mod or modpack");
         assert_eq!(name("https://www.nexusmods.com/skyrimspecialedition/mods/266").unwrap().0, "A mod or modpack");
         assert_eq!(name("oci://ghcr.io/org/charts/app:1.0.0").unwrap().0, "A container image");
+        // A streaming service's list is found on YouTube Music; its artist's page is not.
+        assert_eq!(name("https://open.spotify.com/playlist/mix0001"), Some(("Songs to find", "open.spotify.com".to_string())));
+        assert_eq!(name("https://music.apple.com/us/album/sample-album/20").unwrap().0, "Songs to find");
+        assert_ne!(name("https://www.deezer.com/artist/27").unwrap().0, "Songs to find");
     }
 
     /// Only kinds whose links end in their file's name show it; every name listed is a kind.

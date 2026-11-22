@@ -721,6 +721,8 @@ impl Settings {
             max_items: None,
             keys: hyperfetch_core::ingest::Keys { curseforge: non_empty(&self.curseforge_key), unpaywall_email: non_empty(&self.unpaywall_email), itch: non_empty(&self.itch_key), kaggle: non_empty(&self.kaggle_json) },
             save_dir: non_empty(&self.save_dir).map(PathBuf::from),
+            // Unsure matches are ticked on the card, which a list read elsewhere has none of.
+            take_unsure: false,
         }
     }
 

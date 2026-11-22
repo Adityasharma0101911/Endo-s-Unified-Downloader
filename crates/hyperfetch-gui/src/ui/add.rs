@@ -451,6 +451,9 @@ fn preview_card(app: &mut App, ui: &mut Ui, kind: &kinds::Kind, source: &str) {
         });
         ui.add_space(8.0);
         let picker = kind.choice == kinds::Choice::Quality && quality_picker(app, ui);
+        if kind.choice == kinds::Choice::Songs {
+            songs_card(app, ui);
+        }
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
             if kind.choice == kinds::Choice::Quality && !picker {
@@ -757,6 +760,153 @@ fn quality_picker(app: &mut App, ui: &mut Ui) -> bool {
         card.pick = Some(q.take(&pick).0);
     }
     true
+}
+
+/// The link in `input` when it is one Spotify, Apple Music or Deezer song, album or playlist.
+fn songs_link(input: &str) -> Option<Url> {
+    let input = input.trim();
+    let url = Url::parse(input).ok().filter(|_| !input.contains(char::is_whitespace))?;
+    hyperfetch_core::catalog::lists(&url).then_some(url)
+}
+
+/// For a Spotify, Apple Music or Deezer link in the box, once it has stood still for half a
+/// second (see `App::read_songs`): what the list is and what its page did not show; each song
+/// with the match YouTube Music had for it, a sure one ticked, an unsure one marked and left
+/// unticked, one not found or in the library said so, the search's progress meanwhile; the audio
+/// to keep them as; and Download, which takes the ticked songs alone.
+fn songs_card(app: &mut App, ui: &mut Ui) {
+    use hyperfetch_core::catalog::Verdict;
+    use hyperfetch_core::quality::{AudioForm, MediaPick};
+    let Some(url) = songs_link(&app.url_input) else { return };
+    let p = palette(ui);
+    if !app.songs_card.as_ref().is_some_and(|card| card.link == url.as_str()) {
+        let (id, now) = (egui::Id::new("songs link seen"), ui.input(|i| i.time));
+        match ui.data(|d| d.get_temp::<(String, f64)>(id)) {
+            Some((seen, at)) if seen == url.as_str() && now - at >= LISTING_WAIT => app.read_songs(url),
+            Some((seen, at)) if seen == url.as_str() => ui.ctx().request_repaint_after(Duration::from_secs_f64(LISTING_WAIT - (now - at))),
+            _ => {
+                ui.data_mut(|d| d.insert_temp(id, (url.to_string(), now)));
+                ui.ctx().request_repaint_after(Duration::from_secs_f64(LISTING_WAIT));
+            }
+        }
+        return;
+    }
+    let chosen = app.songs_card.as_ref().and_then(|card| card.pick.clone()).unwrap_or_else(|| app.settings.media_pick(&crate::youtube_music()));
+    let Some(card) = app.songs_card.as_mut() else { return };
+    let crate::SongsCard { listing, rows, finding, error, pick, .. } = card;
+    let listing = match listing {
+        None => {
+            ui.horizontal(|ui| {
+                anim::spinner(ui, 14.0, p.muted);
+                ui.label(RichText::new("Reading its songs…").color(p.muted));
+            });
+            return;
+        }
+        Some(Err(e)) => return error_alert(ui, e),
+        Some(Ok(listing)) => listing,
+    };
+    let songs = if listing.songs.len() == 1 { "1 song".to_string() } else { format!("{} songs", listing.songs.len()) };
+    let what = match listing.kind {
+        hyperfetch_core::music::Kind::Album => format!("An album of {songs}{}", listing.artist.as_ref().map_or_else(String::new, |by| format!(" by {by}"))),
+        hyperfetch_core::music::Kind::Song => "A song".to_string(),
+        _ => format!("A playlist of {songs}"),
+    };
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new(icon::MUSIC_NOTES).color(p.accent));
+        ui.label(RichText::new(format!("{what} on {}, found on YouTube Music to download", listing.service.name())).color(p.text));
+    });
+    if let Some(unread) = &listing.unread {
+        ui.label(RichText::new(format!("{} {unread}", icon::WARNING)).small().color(p.amber));
+    }
+    let wanted = listing.songs.iter().filter(|song| !song.owned).count();
+    let looked = rows.iter().filter(|(verdict, _)| verdict.is_some()).count();
+    let mut again = false;
+    if *finding {
+        ui.horizontal(|ui| {
+            anim::spinner(ui, 14.0, p.muted);
+            ui.label(RichText::new(format!("Finding them on YouTube Music: {looked} of {wanted}")).color(p.muted));
+        });
+    } else if let Some(e) = error.as_ref() {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(format!("{} Stopped after {looked} of {wanted}: {e}", icon::WARNING)).color(p.red));
+            again = ui.add(button("Look again")).clicked();
+        });
+    }
+    ui.add_space(4.0);
+    let row = ui.spacing().interact_size.y;
+    let most = 10.0 * (row + ui.spacing().item_spacing.y);
+    egui::ScrollArea::vertical().id_salt("songs").max_height(most).auto_shrink([false, true]).show_rows(ui, row, listing.songs.len(), |ui, shown| {
+        for at in shown {
+            let (song, (verdict, on)) = (&listing.songs[at], &mut rows[at]);
+            ui.horizontal(|ui| {
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                let said = song.said();
+                let (status, color) = match verdict {
+                    _ if song.owned => (format!("{} In your library", icon::CHECK), p.green),
+                    Some(Verdict::Sure(found)) => (format!("{} {}", icon::ARROW_RIGHT, found.said()), p.muted),
+                    Some(Verdict::Unsure(found)) => (format!("Unsure: {}", found.said()), p.amber),
+                    Some(Verdict::NotFound) => ("Not found on YouTube Music".to_string(), p.muted),
+                    None => ("…".to_string(), p.dim),
+                };
+                match verdict {
+                    Some(Verdict::Sure(_) | Verdict::Unsure(_)) if !song.owned => {
+                        ui.checkbox(on, RichText::new(&said).color(p.text)).on_hover_text(&said);
+                    }
+                    _ => {
+                        ui.add_space(ui.spacing().icon_width + ui.spacing().icon_spacing);
+                        ui.label(RichText::new(&said).color(p.muted)).on_hover_text(&said);
+                    }
+                }
+                ui.label(RichText::new(status).small().color(color));
+            });
+        }
+    });
+    // Audio alone, as the site sends it, or converted.
+    let mut clicked = None;
+    ui.horizontal_wrapped(|ui| {
+        ui.add_sized([62.0, 22.0], egui::Label::new(bold("Audio").color(p.text)));
+        for (name, form) in [("Original", AudioForm::Original), ("M4A", AudioForm::M4a), ("MP3", AudioForm::Mp3)] {
+            if ui.selectable_label(chosen.audio.unwrap_or(AudioForm::Original) == form, name).clicked() {
+                clicked = Some(MediaPick { audio: Some(form), language: chosen.language.clone(), ..Default::default() });
+            }
+        }
+    });
+    if clicked.is_some() {
+        *pick = clicked;
+    }
+    let count = |want: fn(&Verdict) -> bool| rows.iter().filter(|(verdict, _)| verdict.as_ref().is_some_and(want)).count();
+    let (sure, unsure, missing) = (count(|v| matches!(v, Verdict::Sure(_))), count(|v| matches!(v, Verdict::Unsure(_))), count(|v| matches!(v, Verdict::NotFound)));
+    let owned = listing.songs.len() - wanted;
+    // With nothing new ticked, a playlist's file is still written again in its order now.
+    let rewrites = owned > 0 && listing.kind == hyperfetch_core::music::Kind::Playlist;
+    let ticked = rows.iter().filter(|(verdict, on)| *on && matches!(verdict, Some(Verdict::Sure(_) | Verdict::Unsure(_)))).count();
+    let mut go = false;
+    ui.horizontal(|ui| {
+        let mut parts = vec![format!("{sure} sure"), format!("{unsure} unsure"), format!("{missing} not found")];
+        if owned > 0 {
+            parts.push(format!("{owned} in your library"));
+        }
+        ui.label(RichText::new(parts.join(" · ")).small().color(p.muted));
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let label = match ticked {
+                0 if rewrites => "Update its playlist".to_string(),
+                1 => "Download 1 song".to_string(),
+                n => format!("Download {n} songs"),
+            };
+            let ready = !*finding && (ticked > 0 || rewrites);
+            let hint = "Download the ticked songs from YouTube Music into the music library, tagged, each folder an artist's and album's";
+            let download = primary_button(&format!("{} {label}", icon::DOWNLOAD_SIMPLE), p.accent);
+            let why = if *finding { "Wait until its songs are found" } else { "Tick the songs to download first" };
+            go = ui.add_enabled(ready, download).on_hover_text(hint).on_disabled_hover_text(why).clicked();
+        });
+    });
+    if again {
+        *error = None;
+        app.find_songs();
+    }
+    if go {
+        app.download_songs();
+    }
 }
 
 /// The link in `input` when it is a single http(s) link to a .zip, whose contents can be listed.
@@ -1222,6 +1372,53 @@ mod tests {
         let mut options = hyperfetch_core::engine::DownloadOptions::default();
         h.app.card_pick(&[Url::parse(album).unwrap()], &mut options);
         assert_eq!(options.media_preset, Some(Pick(MediaPick { audio: Some(AudioForm::M4a), ..Default::default() })));
+        assert_eq!(h.app.settings.media_picks.get("music.youtube.com").and_then(|pick| pick.audio), Some(AudioForm::M4a));
+    }
+
+    /// A Spotify, Apple Music or Deezer list: each song with what YouTube Music had for it, shown
+    /// before anything downloads; the sure ones ticked, the unsure ones marked and left for the
+    /// user, the others said; then the ticked ones queued from YouTube Music into the library.
+    #[test]
+    fn a_streaming_lists_songs_are_shown_as_found_before_they_download() {
+        use hyperfetch_core::quality::AudioForm;
+        let mut h = Harness::new();
+        h.app.settings.auto_run_queue = false;
+        let link = "https://www.deezer.com/playlist/7";
+        h.app.url_input = link.to_string();
+        // Read once the link has stood still for half a second of frames.
+        for _ in 0..90 {
+            if h.app.songs_card.is_some() {
+                break;
+            }
+            h.frames(1);
+        }
+        h.wait_for(|app| app.songs_card.as_ref().is_some_and(|card| card.link == link && card.listing.is_some() && !card.finding));
+        assert!(h.settle());
+        for text in [
+            "A playlist of 4 songs on Deezer, found on YouTube Music to download",
+            "Deezer listed 4 of its 5 songs",
+            "Sure Song by Sample Artist (3:20)",
+            "In your library",
+            "Unsure: Unsure Song (Live) by Sample Artist (3:21)",
+            "Not found on YouTube Music",
+            "1 sure · 1 unsure · 1 not found · 1 in your library",
+            "Download 1 song",
+        ] {
+            assert!(h.find(text).is_some(), "{text} in {:?}", h.texts());
+        }
+        // The unsure one ticked goes too; the audio chosen is kept for YouTube Music.
+        h.click("Unsure Song by Sample Artist (3:20)");
+        assert!(h.settle());
+        h.click("M4A");
+        assert!(h.settle());
+        h.click("Download 2 songs");
+        h.wait_for(|app| app.queue.items().len() == 2);
+        let urls: Vec<String> = h.app.queue.items().iter().map(|item| item.urls[0].to_string()).collect();
+        assert_eq!(urls, ["https://music.youtube.com/watch?v=sure0000001", "https://music.youtube.com/watch?v=unsure00001"]);
+        let music = h.app.queue.items()[0].options.music.clone().unwrap();
+        let playlist = std::path::Path::new(&h.app.settings.save_dir).join("Sample Mix.m3u8");
+        assert_eq!((music.key.as_deref(), music.playlist.as_deref()), (Some("deezer 1"), Some(playlist.as_path())));
+        assert!(std::fs::read_to_string(&playlist).unwrap().contains("# deezer 1\n# deezer 2\n# deezer 3\n# deezer 4\n"));
         assert_eq!(h.app.settings.media_picks.get("music.youtube.com").and_then(|pick| pick.audio), Some(AudioForm::M4a));
     }
 

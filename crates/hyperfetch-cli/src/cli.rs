@@ -398,6 +398,11 @@ pub struct Args {
     #[arg(long = "lyrics")]
     pub lyrics: bool,
 
+    /// Of a Spotify, Apple Music or Deezer link, download the songs whose match on YouTube Music
+    /// is unsure too, not only the sure ones (each unsure match is listed either way)
+    #[arg(long = "take-unsure")]
+    pub take_unsure: bool,
+
     /// Record a live stream from its start (where the site keeps it) instead of from now
     #[arg(long = "live-from-start")]
     pub live_from_start: bool,
@@ -1521,6 +1526,7 @@ mod tests {
         assert_eq!((args.latest, args.subs), (None, None));
         assert!(parse(&["--install-ffmpeg", "u"]).unwrap().install_ffmpeg);
         assert!(!args.lyrics && parse(&["--lyrics", "u"]).unwrap().lyrics);
+        assert!(!args.take_unsure && parse(&["--take-unsure", "u"]).unwrap().take_unsure);
         assert!(parse(&["--install-ffmpeg", "--no-install-ffmpeg", "u"]).is_err());
         let args = parse(&["--latest", "5", "--subs", " en,es ", "--yes-playlist", "--google-api-key", "k", "u"]).unwrap();
         assert_eq!((args.latest, args.subs.as_deref(), args.google_api_key.as_deref()), (Some(5), Some("en,es"), Some("k")));

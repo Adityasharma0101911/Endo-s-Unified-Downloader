@@ -60,6 +60,12 @@ pub struct Music {
     pub year: Option<u32>,
     /// The playlist file it is listed in, kept in the playlist's order (see [`refresh_playlist`]).
     pub playlist: Option<PathBuf>,
+    /// Its album's square cover, as the listing it came from shows it: embedded in place of the
+    /// song's own thumbnail.
+    pub cover: Option<String>,
+    /// What the library knows it by besides its download archive line: the Spotify, Apple Music
+    /// or Deezer song it was found for (see `crate::catalog`).
+    pub key: Option<String>,
 }
 
 /// The text of `key` in `value`, when it has any.
@@ -83,7 +89,10 @@ pub(crate) fn album_of(list: &Value) -> Option<Music> {
         let mut channels = list["entries"].as_array().into_iter().flatten().filter_map(|entry| text(entry, "channel")).map(|c| artist_name(&c));
         let first = channels.next();
         let album_artist = text(list, "channel").map(|c| artist_name(&c)).or_else(|| first.filter(|first| channels.all(|c| &c == first)));
-        return Some(Music { album: Some(album), album_artist, year, ..Default::default() });
+        // The album's own cover, the largest square one (1200 px): no frame of a song's to cut.
+        let square = list["thumbnails"].as_array().into_iter().flatten().filter(|t| t["width"].as_u64().is_some_and(|w| w >= 300 && t["height"].as_u64() == Some(w)));
+        let cover = square.max_by_key(|t| t["width"].as_u64()).and_then(|t| text(t, "url"));
+        return Some(Music { album: Some(album), album_artist, year, cover, ..Default::default() });
     }
     match list["album_type"].as_str() {
         Some("album" | "ep" | "single" | "compilation") => Some(Music {
@@ -116,7 +125,18 @@ pub(crate) fn resolve(info: &Value, given: &Music) -> Music {
         album_artist: given.album_artist.clone().or_else(|| first(&artists).map(|artist| artist_name(&artist))),
         year: given.year.or_else(year),
         playlist: given.playlist.clone(),
+        cover: given.cover.clone(),
+        key: given.key.clone(),
     }
+}
+
+/// What the helper tool found at a song (`info`), with `cover` as its only thumbnail: the one it
+/// embeds (see [`Music::cover`]).
+pub(crate) fn with_cover(info: &Value, cover: &str) -> Value {
+    let mut info = info.clone();
+    info["thumbnails"] = serde_json::json!([{ "url": cover, "id": "cover" }]);
+    info["thumbnail"] = Value::from(cover);
+    info
 }
 
 /// The helper tool's output template of a song placed as `music` says, under the save folder:
@@ -380,7 +400,20 @@ mod tests {
             "entries": [{"title": "First Song", "channel": "Sample Artist - Topic"}, {"title": "Second Song", "channel": "Sample Artist - Topic"}]
         });
         let want = Music { album: Some("Sample Album".into()), album_artist: Some("Sample Artist".into()), ..Default::default() };
-        assert_eq!(album_of(&ytm), Some(want));
+        assert_eq!(album_of(&ytm), Some(want.clone()));
+        // Its own square cover, the largest; a wide frame is none.
+        let mut covered = ytm.clone();
+        covered["thumbnails"] = json!([
+            {"url": "https://i.ytimg.test/s_p/a/mqdefault.jpg", "width": 180, "height": 180},
+            {"url": "https://i.ytimg.test/s_p/a/maxresdefault.jpg", "width": 1200, "height": 1200},
+            {"url": "https://i.ytimg.test/vi/a/hqdefault.jpg", "width": 1280, "height": 720},
+            {"url": "https://i.ytimg.test/s_p/a/sddefault.jpg", "width": 640, "height": 640}
+        ]);
+        let cover = Some("https://i.ytimg.test/s_p/a/maxresdefault.jpg".to_string());
+        assert_eq!(album_of(&covered), Some(Music { cover: cover.clone(), ..want }));
+        // What the helper tool found at a song then embeds that cover alone.
+        let found = with_cover(&song(), cover.as_deref().unwrap());
+        assert_eq!((found["thumbnail"].as_str(), found["thumbnails"].as_array().map(Vec::len)), (cover.as_deref(), Some(1)));
         // An EP; songs of several artists name none.
         let mut ep = ytm.clone();
         ep["title"] = "EP - Sample EP".into();
@@ -419,7 +452,7 @@ mod tests {
 
     #[test]
     fn a_songs_tags_and_square_cover_are_asked_of_the_helper_tool() {
-        let placed = Music { track: Some(2), album: Some("Sample Album".into()), album_artist: Some("Sample: Artist".into()), year: Some(2001), playlist: None };
+        let placed = Music { track: Some(2), album: Some("Sample Album".into()), album_artist: Some("Sample: Artist".into()), year: Some(2001), ..Default::default() };
         let args = ytdlp_args(&placed, false);
         let has = |pair: [&str; 2]| args.windows(2).any(|w| w[0] == pair[0] && w[1] == pair[1]);
         assert!(args.contains(&"-x".to_string()), "{args:?}");

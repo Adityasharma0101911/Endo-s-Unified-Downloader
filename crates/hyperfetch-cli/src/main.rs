@@ -441,6 +441,8 @@ fn init_tracing(verbose: u8, ui: &Ui) {
             stderr_line(&format!("warning: ignoring invalid RUST_LOG '{}': {}", spec, e));
             Targets::new().with_default(level)
         }),
+        // How far finding a Spotify, Apple Music or Deezer list's songs on YouTube Music is.
+        _ if !ui.quiet() => Targets::new().with_default(level).with_target("hyperfetch_core::catalog", level.max(LevelFilter::INFO)),
         _ => Targets::new().with_default(level),
     };
     let writer = ui.log_writer();
@@ -683,6 +685,7 @@ fn list_options(args: &Args) -> ListOptions {
         keys: hyperfetch_core::ingest::Keys { curseforge: args.curseforge_key.clone(), unpaywall_email: args.unpaywall_email.clone(), itch: args.itch_key.clone(), kaggle: args.kaggle_json.clone() },
         // A music playlist's .m3u8 goes where its songs' library is.
         save_dir: Some(args.dir.clone().unwrap_or_else(|| PathBuf::from("."))),
+        take_unsure: args.take_unsure,
     }
 }
 

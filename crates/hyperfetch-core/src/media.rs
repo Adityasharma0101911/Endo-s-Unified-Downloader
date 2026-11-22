@@ -2467,6 +2467,9 @@ enum RunKind {
     /// Writes only the subtitles of what an extraction found ([`Source::Info`]), for a video the
     /// engine downloaded (see [`subtitle_args`]).
     Subtitles,
+    /// Reads the first results of searches in full (see [`search_music`]): a result that fails
+    /// is left out, not the search.
+    Search,
 }
 
 /// Whether a Download run with `options` asks YouTube for its formats in fragments (see
@@ -2519,7 +2522,7 @@ fn build_ytdlp_args(
         // Only affects URLs that name both a video and a playlist (watch?v=..&list=..): the one
         // video, unless the playlist is listed. A URL that is only a playlist is still
         // downloaded as one.
-        if matches!(kind, RunKind::List(_)) { "--yes-playlist" } else { "--no-playlist" },
+        if matches!(kind, RunKind::List(_) | RunKind::Search) { "--yes-playlist" } else { "--no-playlist" },
     ]
     .map(String::from)
     .to_vec();
@@ -2554,6 +2557,7 @@ fn build_ytdlp_args(
             "16M",
         ],
         RunKind::Subtitles => &["--skip-download"],
+        RunKind::Search => &["-J", "--playlist-items", SEARCH_RESULTS, "--ignore-errors"],
     };
     args.extend(kind_args.iter().map(|a| a.to_string()));
     // yt-dlp reads no further into a channel than its newest; a playlist it reads whole.
@@ -2580,7 +2584,7 @@ fn build_ytdlp_args(
         // Asked for them, yt-dlp says which it cannot get as it finds the video (YouTube's that
         // need a PO token); `-J` writes none.
         RunKind::Extract | RunKind::Find => args.extend(subtitle_choice(options)),
-        RunKind::List(_) => {}
+        RunKind::List(_) | RunKind::Search => {}
     }
     if kind == RunKind::Download {
         args.extend(embed_args(options, ffmpeg_dir.is_some()));
@@ -5154,6 +5158,24 @@ async fn run_extraction(
     found
 }
 
+/// The results of a search that a Search run reads in full (see [`search_music`]).
+const SEARCH_RESULTS: &str = "1:3";
+
+/// How long a Search run may take: three songs read in full for each search.
+const SEARCH_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+/// What YouTube Music's searches `urls` (`https://music.youtube.com/search?q=...#songs`) find
+/// first: for each, its first three results read in full (title, artists, album, length), in one
+/// run of yt-dlp with `options`' proxy and yt-dlp; or why that search found nothing. Err when
+/// yt-dlp could not be run, or took over five minutes.
+pub(crate) async fn search_music(urls: &[Url], options: &MediaDownloadOptions) -> Result<Vec<Result<Vec<Value>, String>>, String> {
+    let (options, tools) = prepare(options, &None, false).await?;
+    let run = tokio::time::timeout(SEARCH_TIMEOUT, run_extraction(urls, &options, &tools, RunKind::Search, None));
+    let (json, ran) = run.await.map_err(|_| format!("yt-dlp took over {} minutes to search YouTube Music", SEARCH_TIMEOUT.as_secs() / 60))??;
+    let found = listed_each(urls, &json, ran.err());
+    Ok(found.into_iter().map(|each| each.map(|list| list["entries"].as_array().cloned().unwrap_or_default())).collect())
+}
+
 /// What a media download fails with when yt-dlp finds the video DRM-protected (see
 /// [`drm_refused`]).
 pub(crate) const DRM_REFUSED: &str = "DRM-protected: not supported";
@@ -5346,8 +5368,13 @@ async fn download_with(
                             // Found moments ago: yt-dlp downloads it as it is, where it can.
                             Err(FastError::Unsupported(why)) => {
                                 tracing::info!("Leaving {url} to yt-dlp: {why}");
-                                // A song's audio is one file, which fragments would not speed up.
+                                // A song's audio is one file, which fragments would not speed up;
+                                // its album's cover, given, is the thumbnail it embeds.
                                 if loads_found(&info, options) || options.music.is_some() {
+                                    let json = match options.music.as_ref().and_then(|music| music.cover.as_deref()) {
+                                        Some(cover) => serde_json::to_vec(&crate::music::with_cover(&info, cover)).unwrap_or(json),
+                                        None => json,
+                                    };
                                     found = tools.cookies.files.file(Some(json), "json").await.inspect_err(|e| tracing::debug!("{e}")).ok();
                                 }
                                 song = options.music.is_some().then_some(info);
@@ -5410,11 +5437,13 @@ async fn download_with(
 }
 
 /// After a song (see `MediaDownloadOptions::music`) was downloaded to `path`: the library index
-/// gets it under `ids` (its download archive lines), its playlist file names it in its place, and
+/// gets it under `ids` (its download archive lines) and the key of the Spotify, Apple Music or
+/// Deezer song it was found for (see `Music::key`), its playlist file names it in its place, and
 /// its synced lyrics are written next to it when asked for, from what yt-dlp found (`info`). A
 /// failure of any of these is only logged: the song itself is there.
 async fn song_downloaded(path: &Path, ids: Vec<String>, music: &crate::music::Music, info: Option<&Value>, options: &MediaDownloadOptions, library: Option<&Path>) {
     if let Some(library) = library.map(Path::to_path_buf).filter(|_| !ids.is_empty()) {
+        let ids: Vec<String> = ids.into_iter().chain(music.key.clone()).collect();
         let (song, playlist) = (path.to_path_buf(), music.playlist.clone());
         let recorded = tokio::task::spawn_blocking(move || {
             // Songs of one playlist finish together: one at a time writes the index and the playlist.
@@ -9081,6 +9110,34 @@ bbd8671c6c05eaa3ec29d690695aebadff0871faa3efe9051581afbf3c01e80e  ffmpeg-master-
         }
     }
 
+    /// YouTube Music's searches, several in one run: each its first three results read in full
+    /// (no flat listing, which has no lengths or artists), a result that fails left out; what
+    /// each found, or that it found nothing.
+    #[tokio::test]
+    async fn a_search_reads_its_first_three_results_in_full() {
+        let urls = ["https://music.youtube.com/search?q=Sample+Artist+First+Song#songs", "https://music.youtube.com/search?q=GBAAA0000001#songs"].map(|u| Url::parse(u).unwrap());
+        let options = MediaDownloadOptions { output_dir: std::env::temp_dir(), ..Default::default() };
+        let args = build_ytdlp_args(Source::Urls(&urls), &options, RunKind::Search, &[], None, None, Some("2026.08.19"));
+        for flag in ["--yes-playlist", "-J", "--ignore-errors"] {
+            assert!(args.contains(&flag.to_string()), "{flag} missing from {args:?}");
+        }
+        assert!(args.windows(2).any(|pair| pair == ["--playlist-items", "1:3"]), "{args:?}");
+        assert!(!args.contains(&"--flat-playlist".to_string()), "{args:?}");
+        assert_eq!(args[args.len() - 2..], urls.clone().map(|u| u.to_string()));
+        // A stand-in prints what each search found, `null` for one that failed.
+        let dir = tempfile::tempdir().unwrap();
+        let found = dir.path().join("found.jsonl");
+        std::fs::write(&found, "{\"_type\":\"playlist\",\"entries\":[{\"id\":\"aaaaaaaaaa1\",\"title\":\"First Song\"}]}\nnull\n").unwrap();
+        let windows = format!("if \"%~2\"==\"--version\" (echo 2026.08.19& exit /b 0)\ntype \"{}\"", found.display());
+        let unix = format!("if [ \"$2\" = --version ]; then echo 2026.08.19; exit 0; fi\ncat '{}'", found.display());
+        let bin = crate::helpers::tests::fake_tool(dir.path(), "yt-dlp", &windows, &unix);
+        let options = MediaDownloadOptions { custom_ytdlp_path: Some(bin), output_dir: dir.path().to_path_buf(), ..Default::default() };
+        let each = search_music(&urls, &options).await.unwrap();
+        assert_eq!(each.len(), 2);
+        assert_eq!(each[0].as_ref().map(|entries| entries.iter().map(|e| e["id"].clone()).collect::<Vec<_>>()), Ok(vec![Value::from("aaaaaaaaaa1")]));
+        assert!(each[1].is_err(), "{:?}", each[1]);
+    }
+
     /// A stand-in for yt-dlp that prints `dir/list.json` and notes the arguments of each run in
     /// `dir/runs.txt` (see [`runs_of`]).
     fn fake_lister(dir: &Path) -> PathBuf {
@@ -10388,7 +10445,7 @@ bbd8671c6c05eaa3ec29d690695aebadff0871faa3efe9051581afbf3c01e80e  ffmpeg-master-
             album: Some("Sample Album".into()),
             album_artist: Some("Sample Artist".into()),
             year: Some(2001),
-            playlist: None,
+            ..Default::default()
         };
         let pick = crate::quality::MediaPick { audio: Some(crate::quality::AudioForm::Original), ..Default::default() };
         let options = MediaDownloadOptions {
@@ -10423,13 +10480,17 @@ bbd8671c6c05eaa3ec29d690695aebadff0871faa3efe9051581afbf3c01e80e  ffmpeg-master-
         crate::music::write_playlist(&playlist, "Road Trip", &["vimeo 76979871".to_string()], &HashMap::new()).unwrap();
         let mut info = youtube_info(&out);
         (info["artist"], info["album"], info["release_year"]) = ("Sample Artist".into(), "Sample Album".into(), 2001.into());
-        let music = crate::music::Music { playlist: Some(playlist.clone()), ..Default::default() };
+        // Found for a Deezer song, whose album's cover it is given.
+        let cover = "https://covers.test/1000x1000.jpg";
+        let music = crate::music::Music { playlist: Some(playlist.clone()), cover: Some(cover.into()), key: Some("deezer 3".into()), ..Default::default() };
         let options = MediaDownloadOptions { music: Some(music), ..Default::default() };
         let path = fake_download_with(dir.path(), &info, &cookies, fetch, options).await.unwrap();
-        // Found once: a YouTube song too is downloaded from what was found.
+        // Found once: a YouTube song too is downloaded from what was found, its cover the album's.
         assert_eq!(runs_in(dir.path()), ["extract", "download info"]);
+        let loaded: Value = serde_json::from_slice(&std::fs::read(dir.path().join("loaded.json")).unwrap()).unwrap();
+        assert_eq!((loaded["thumbnail"].as_str(), loaded["thumbnails"][0]["url"].as_str()), (Some(cover), Some(cover)));
         let library = crate::music::read_library(&dir.path().join("library.txt"));
-        assert_eq!(library.get("vimeo 76979871"), Some(&path));
+        assert_eq!((library.get("vimeo 76979871"), library.get("deezer 3")), (Some(&path), Some(&path)));
         let text = std::fs::read_to_string(&playlist).unwrap();
         assert!(text.contains("# vimeo 76979871\nclip.mp4\n"), "{text}");
     }

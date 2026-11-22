@@ -148,6 +148,9 @@ pub struct ListOptions {
     /// The save folder, where a music playlist's `.m3u8` file is written (see `crate::music`);
     /// None writes none.
     pub save_dir: Option<PathBuf>,
+    /// A Spotify, Apple Music or Deezer song whose match on YouTube Music is unsure is downloaded
+    /// too, rather than only told of (see `crate::catalog`).
+    pub take_unsure: bool,
 }
 
 /// The user's own keys for the services that ask for one, from Settings or the command line: each
@@ -230,6 +233,7 @@ impl Default for ListOptions {
             max_items: None,
             keys: Keys::default(),
             save_dir: None,
+            take_unsure: false,
         }
     }
 }
@@ -336,6 +340,7 @@ pub fn might_list(url: &Url) -> bool {
         || crate::itch::lists(url)
         || crate::kaggle::lists(url)
         || crate::osm::lists(url)
+        || crate::catalog::lists(url)
 }
 
 /// `token` as a link [`might_list`] takes, a "leaving this site" link replaced by its target.
@@ -878,6 +883,10 @@ async fn list(http: &reqwest::Client, url: &Url, options: &ListOptions) -> Optio
     }
     if crate::osm::lists(url) {
         return Some(crate::osm::list(http, url, options).await);
+    }
+    // A Spotify, Apple Music or Deezer song, album or playlist: its songs, found on YouTube Music.
+    if crate::catalog::lists(url) {
+        return Some(crate::catalog::list(http, url, options).await);
     }
     if repos::lists(url) {
         let auth = options.auth.as_ref().filter(|(link, _)| link == url).map(|(_, header)| header.as_str());

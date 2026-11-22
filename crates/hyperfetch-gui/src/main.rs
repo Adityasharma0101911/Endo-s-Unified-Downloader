@@ -23,6 +23,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use eframe::egui;
+use hyperfetch_core::catalog;
 use hyperfetch_core::chunk::ChunkSnapshot;
 use hyperfetch_core::engine::{build_client, ClientKey, DownloadEngine, DownloadOptions, EngineSnapshot, OwnLimits, SharedLimits};
 use hyperfetch_core::history::{DownloadHistoryManager, HistoryEntry};
@@ -184,6 +185,12 @@ enum AppEvent {
     ZipListed { link: String, result: Result<Vec<ZipEntry>, String> },
     /// What yt-dlp told of the media link `link` for its card (see [`App::list_media`]).
     MediaListed { link: String, result: Result<media::MediaInfo, String> },
+    /// The songs the Spotify, Apple Music or Deezer link `link` shows (see [`App::read_songs`]).
+    SongsRead { link: String, result: Result<catalog::Listing, String> },
+    /// What YouTube Music has of the songs at `batch` of `link`'s list (see [`App::find_songs`]).
+    SongsFound { link: String, batch: Vec<usize>, result: Result<Vec<catalog::Verdict>, String> },
+    /// The downloads of the songs ticked on `link`'s card (see [`App::download_songs`]).
+    SongsQueued { link: String, title: String, result: Result<Vec<Task>, String> },
     /// What the stream at `link` holds, for the track chooser of `item` (see [`App::list_tracks`]).
     TracksListed { item: Option<usize>, link: String, result: Result<StreamInfo, String> },
     /// The channels of the channel list `input` may be (see [`App::read_document`]): None when it
@@ -229,6 +236,30 @@ impl MediaCard {
     /// Of a music link, what it is (see `MediaInfo::music`).
     fn music(&self) -> Option<&str> {
         self.listed.as_ref()?.as_ref().ok()?.music.as_deref()
+    }
+}
+
+/// The Spotify, Apple Music or Deezer link the Add page's card shows the songs of (see
+/// [`App::read_songs`]): what its page shows (None while it is read), each song's match on
+/// YouTube Music (None until it is looked for, and for one the library holds) and whether it is
+/// ticked, whether songs are being looked for, why that stopped, and the audio chosen.
+struct SongsCard {
+    link: String,
+    listing: Option<Result<catalog::Listing, String>>,
+    rows: Vec<(Option<catalog::Verdict>, bool)>,
+    finding: bool,
+    error: Option<String>,
+    pick: Option<MediaPick>,
+}
+
+impl SongsCard {
+    /// The songs ticked, each its place in the list and the song found for it.
+    fn picks(&self) -> Vec<(usize, catalog::Found)> {
+        let found = |(at, (verdict, on)): (usize, &(Option<catalog::Verdict>, bool))| match verdict {
+            Some(catalog::Verdict::Sure(found) | catalog::Verdict::Unsure(found)) if *on => Some((at, found.clone())),
+            _ => None,
+        };
+        self.rows.iter().enumerate().filter_map(found).collect()
     }
 }
 
@@ -515,6 +546,8 @@ struct App {
     zip_preview: Option<(String, Option<Result<Vec<(ZipEntry, bool)>, String>>)>,
     /// The qualities of the media link in the link box (see [`App::list_media`]).
     media_card: Option<MediaCard>,
+    /// The songs of the Spotify, Apple Music or Deezer link in the link box (see [`App::read_songs`]).
+    songs_card: Option<SongsCard>,
     /// Keep a saved page's scripts (the link bar's More options), for this session.
     keep_scripts: bool,
     /// The link of the page being saved as one file (see [`App::save_page`]).
@@ -693,6 +726,7 @@ impl App {
             batch_failed: false,
             zip_preview: None,
             media_card: None,
+            songs_card: None,
             keep_scripts: false,
             saving_page: None,
             tracks: None,
@@ -769,6 +803,119 @@ impl App {
             self.save_settings();
         }
         options.media_preset = Some(media::MediaQualityPreset::Pick(pick));
+    }
+
+    /// The proxy of the settings, when one is set.
+    fn proxy(&self) -> Option<String> {
+        Some(self.settings.proxy.trim().to_string()).filter(|proxy| !proxy.is_empty())
+    }
+
+    /// Reads the songs the Spotify, Apple Music or Deezer link `url` shows anyone, for its card,
+    /// through the proxy setting; then looks for them on YouTube Music (see [`App::find_songs`]).
+    fn read_songs(&mut self, url: Url) {
+        let link = url.to_string();
+        self.songs_card = Some(SongsCard { link: link.clone(), listing: None, rows: Vec::new(), finding: false, error: None, pick: None });
+        let proxy = self.proxy();
+        self.spawn_event(async move {
+            let result = songs_listing(&url, proxy).await;
+            AppEvent::SongsRead { link, result }
+        });
+    }
+
+    /// Takes what the card's link showed (see [`App::read_songs`]), and starts looking for its songs.
+    fn songs_read(&mut self, link: String, result: Result<catalog::Listing, String>) {
+        let Some(card) = self.songs_card.as_mut().filter(|card| card.link == link) else { return };
+        if let Ok(listing) = &result {
+            card.rows = vec![(None, false); listing.songs.len()];
+        }
+        card.listing = Some(result);
+        self.find_songs();
+    }
+
+    /// Looks for the card's next songs on YouTube Music, a batch in one run of yt-dlp (see
+    /// `catalog::find`); none that the library holds. Each batch found looks for the next.
+    fn find_songs(&mut self) {
+        let proxy = self.proxy();
+        let Some(card) = self.songs_card.as_mut() else { return };
+        let Some(Ok(listing)) = &card.listing else { return };
+        let rows = &card.rows;
+        let batch: Vec<usize> = (0..listing.songs.len()).filter(|&at| !listing.songs[at].owned && rows[at].0.is_none()).take(catalog::BATCH).collect();
+        let songs: Vec<catalog::Song> = batch.iter().map(|&at| listing.songs[at].clone()).collect();
+        card.finding = !batch.is_empty();
+        if batch.is_empty() {
+            return;
+        }
+        let link = card.link.clone();
+        self.spawn_event(async move {
+            let result = songs_found(songs, proxy).await;
+            AppEvent::SongsFound { link, batch, result }
+        });
+    }
+
+    /// Takes what YouTube Music had of a batch of the card's songs: a sure match ticked, an
+    /// unsure one left for the user to tick; then looks for the next batch. A failed search stops
+    /// there, and the card says why.
+    fn songs_found(&mut self, link: String, batch: Vec<usize>, result: Result<Vec<catalog::Verdict>, String>) {
+        let Some(card) = self.songs_card.as_mut().filter(|card| card.link == link) else { return };
+        match result {
+            Ok(verdicts) => {
+                for (at, verdict) in batch.into_iter().zip(verdicts) {
+                    let sure = matches!(verdict, catalog::Verdict::Sure(_));
+                    if let Some(row) = card.rows.get_mut(at) {
+                        *row = (Some(verdict), sure);
+                    }
+                }
+                self.find_songs();
+            }
+            Err(e) => (card.finding, card.error) = (false, Some(e)),
+        }
+    }
+
+    /// Downloads the songs ticked on the card into the music library (see `catalog::tasks`, which
+    /// also writes a playlist's file), off the UI thread, then adds them as the form adds a list.
+    /// The audio chosen there is kept for YouTube Music, where they come from.
+    fn download_songs(&mut self) {
+        let Some(card) = self.songs_card.as_ref() else { return };
+        let listing = match &card.listing {
+            Some(Ok(listing)) if !card.finding => listing.clone(),
+            Some(Ok(_)) => return self.form_error = Some("Its songs are still being looked for on YouTube Music".to_string()),
+            Some(Err(e)) => return self.form_error = Some(e.clone()),
+            None => return self.form_error = Some("Its songs are still being read".to_string()),
+        };
+        let picks = card.picks();
+        // With nothing ticked, a playlist the library holds songs of is written again (see `catalog::tasks`).
+        let rewrites = listing.kind == hyperfetch_core::music::Kind::Playlist && listing.songs.iter().any(|song| song.owned);
+        if picks.is_empty() && !rewrites {
+            return self.form_error = Some("Tick the songs to download first".to_string());
+        }
+        let (link, pick) = (card.link.clone(), card.pick.clone());
+        if let Some(pick) = pick {
+            self.settings.remember_pick(&youtube_music(), &pick);
+            self.save_settings();
+        }
+        let (title, dir) = (listing.title.clone(), PathBuf::from(&self.settings.save_dir));
+        self.form_error = None;
+        self.notice = Some(Ok(format!("Adding the songs of {}...", ingest::truncate_chars(&title, 60))));
+        self.spawn_event(async move {
+            let result = catalog::tasks(&listing, picks, Some(dir)).await;
+            AppEvent::SongsQueued { link, title, result }
+        });
+    }
+
+    /// Adds the downloads of the songs ticked on `link`'s card (see [`App::download_songs`]).
+    fn songs_queued(&mut self, link: String, title: String, result: Result<Vec<Task>, String>) {
+        self.notice = None;
+        match result {
+            Ok(tasks) if tasks.is_empty() => {
+                self.notice = Some(Ok(format!("Nothing new in {}: its songs are in the music library", ingest::truncate_chars(&title, 60))));
+            }
+            result => {
+                if self.add_listing(Origin::Form, &link, "", "", result) {
+                    self.tab = Tab::Downloads;
+                    self.songs_card = None;
+                }
+            }
+        }
     }
 
     /// Saves the web page at `url` as one HTML file in the save folder (see `savepage`: its
@@ -1351,6 +1498,13 @@ impl App {
     /// starts, the others wait in the queue. With `ranges`, a link with ranges (one typed or
     /// copied, not one the browser sent) stands for its links.
     fn download_now(&mut self, text: &str, checksum: &str, auth: &str, ranges: bool) {
+        // A Spotify, Apple Music or Deezer link: the songs ticked on its card.
+        if let Some(url) = ingest::http_url(text.trim()).filter(|url| catalog::lists(url)) {
+            if !self.songs_card.as_ref().is_some_and(|card| card.link == url.as_str()) {
+                self.read_songs(url);
+            }
+            return self.download_songs();
+        }
         self.tab = Tab::Downloads;
         let update = self.update_on_disk.take();
         // A music list's songs, listed later, take the audio chosen on its card: kept for the site.
@@ -2216,6 +2370,9 @@ impl App {
                     card.listed = Some(result);
                 }
             }
+            AppEvent::SongsRead { link, result } => self.songs_read(link, result),
+            AppEvent::SongsFound { link, batch, result } => self.songs_found(link, batch, result),
+            AppEvent::SongsQueued { link, title, result } => self.songs_queued(link, title, result),
             AppEvent::TracksListed { item, link, result } => self.tracks_listed(item, link, result),
             AppEvent::Channels { origin, input, checksum, auth, result } => self.channels_read(origin, input, checksum, auth, result),
             AppEvent::Relinked { id, urls, options, result } => self.relinked(id, urls, options, result),
@@ -3067,6 +3224,65 @@ async fn media_listing(url: &Url, _cookies: media::BrowserCookieSource, _proxy: 
     let info = media::media_info(&serde_json::from_str(found).map_err(|e| e.to_string())?);
     let music = hyperfetch_core::music::kind(url).map(|_| "A song by Sample Artist".to_string());
     Ok(media::MediaInfo { music, ..info })
+}
+
+/// YouTube Music, whose songs a Spotify, Apple Music or Deezer list's are: the audio chosen on its
+/// card is kept for it.
+fn youtube_music() -> Url {
+    Url::parse("https://music.youtube.com/").expect("a link")
+}
+
+/// The songs the Spotify, Apple Music or Deezer link `url` shows anyone, read through `proxy`.
+#[cfg(not(test))]
+async fn songs_listing(url: &Url, proxy: Option<String>) -> Result<catalog::Listing, String> {
+    let http = ingest::descriptor_client(proxy.as_deref())?;
+    catalog::read(&http, url).await
+}
+
+/// A stand-in for `catalog::read` that asks no service: a playlist of four songs, the second in
+/// the library, one more than its page showed; a failure for a link that says "fail".
+#[cfg(test)]
+async fn songs_listing(url: &Url, _proxy: Option<String>) -> Result<catalog::Listing, String> {
+    if url.as_str().contains("fail") {
+        return Err("Deezer answered: no data".to_string());
+    }
+    let song = |n: u32, title: &str, owned: bool| catalog::Song {
+        key: format!("deezer {n}"),
+        title: title.to_string(),
+        artists: vec!["Sample Artist".to_string()],
+        seconds: Some(200.0),
+        owned,
+        ..Default::default()
+    };
+    Ok(catalog::Listing {
+        service: catalog::Service::Deezer,
+        kind: hyperfetch_core::music::Kind::Playlist,
+        title: "Sample Mix".to_string(),
+        artist: None,
+        year: None,
+        cover: None,
+        songs: vec![song(1, "Sure Song", false), song(2, "Owned Song", true), song(3, "Unsure Song", false), song(4, "Missing Song", false)],
+        unread: Some("Deezer listed 4 of its 5 songs".to_string()),
+    })
+}
+
+/// What YouTube Music has of `songs` (see `catalog::find`), searched through `proxy`.
+#[cfg(not(test))]
+async fn songs_found(songs: Vec<catalog::Song>, proxy: Option<String>) -> Result<Vec<catalog::Verdict>, String> {
+    catalog::find(&songs, proxy.as_deref()).await
+}
+
+/// A stand-in for `catalog::find` that runs no yt-dlp: "Sure Song" found surely, "Unsure Song"
+/// unsurely, any other not found.
+#[cfg(test)]
+async fn songs_found(songs: Vec<catalog::Song>, _proxy: Option<String>) -> Result<Vec<catalog::Verdict>, String> {
+    let found = |id: &str, title: &str| catalog::Found { id: id.to_string(), title: title.to_string(), artist: "Sample Artist".to_string(), seconds: Some(201.0) };
+    let verdict = |song: &catalog::Song| match song.title.as_str() {
+        "Sure Song" => catalog::Verdict::Sure(found("sure0000001", "Sure Song")),
+        "Unsure Song" => catalog::Verdict::Unsure(found("unsure00001", "Unsure Song (Live)")),
+        _ => catalog::Verdict::NotFound,
+    };
+    Ok(songs.iter().map(verdict).collect())
 }
 
 /// Queues one download; one its input named is shown under that name at once. Its target is
