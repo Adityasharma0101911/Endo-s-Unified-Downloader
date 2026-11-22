@@ -219,7 +219,7 @@ pub(crate) fn list_sentence(kind: Kind, title: &str, count: usize, first: Option
 pub(crate) fn audio_preset(preset: &MediaQualityPreset) -> MediaQualityPreset {
     use crate::quality::{AudioForm, MediaPick};
     match preset {
-        MediaQualityPreset::AudioMp3 | MediaQualityPreset::AudioM4a | MediaQualityPreset::Custom(_) => preset.clone(),
+        MediaQualityPreset::AudioMp3 | MediaQualityPreset::AudioM4a | MediaQualityPreset::AudioFlac | MediaQualityPreset::Custom(_) => preset.clone(),
         MediaQualityPreset::Pick(pick) if pick.audio.is_some() => preset.clone(),
         MediaQualityPreset::Pick(pick) => {
             MediaQualityPreset::Pick(MediaPick { audio: Some(AudioForm::Original), language: pick.language.clone(), ..Default::default() })

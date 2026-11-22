@@ -14,6 +14,7 @@ pub mod relink;
 pub mod media;
 pub mod music;
 pub mod catalog;
+pub mod deezer;
 pub mod quality;
 pub mod history;
 pub mod verify;

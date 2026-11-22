@@ -476,8 +476,13 @@ pub struct Found {
 }
 
 impl Found {
-    /// Its link, a YouTube Music song's.
+    /// Its link, a YouTube Music song's (or direct streaming link).
     pub fn url(&self) -> Url {
+        if self.id.starts_with("http://") || self.id.starts_with("https://") {
+            if let Ok(url) = Url::parse(&self.id) {
+                return url;
+            }
+        }
         let mut url = Url::parse("https://music.youtube.com/watch").expect("a link");
         url.query_pairs_mut().append_pair("v", &self.id);
         url
@@ -485,7 +490,11 @@ impl Found {
 
     /// Its line in the download archive.
     fn archive_line(&self) -> String {
-        format!("youtube {}", self.id)
+        if self.id.starts_with("http://") || self.id.starts_with("https://") {
+            format!("url {}", self.id)
+        } else {
+            format!("youtube {}", self.id)
+        }
     }
 
     /// "Title by Artist (3:45)".
@@ -726,6 +735,34 @@ where
         }
     }
     Ok(verdicts)
+}
+
+/// Attempts to find a bit-perfect lossless match for `song` on Deezer via its ISRC or artist/title.
+pub async fn find_lossless(http: &reqwest::Client, song: &Song) -> Option<Found> {
+    if let Some(isrc) = &song.isrc {
+        if let Ok(Some(track)) = crate::deezer::resolve_isrc(http, isrc).await {
+            return Some(Found {
+                id: format!("https://www.deezer.com/track/{}", track.id),
+                title: track.title,
+                artist: track.artist,
+                seconds: Some(track.duration),
+            });
+        }
+    }
+    let artist = song.artists.first().map(String::as_str).unwrap_or("");
+    if let Ok(Some(track)) = crate::deezer::search_track(http, artist, &song.title).await {
+        let alike = similarity(&core_title(&song.title), &core_title(&track.title));
+        let apart = song.seconds.map(|s| (s - track.duration).abs());
+        if alike >= 0.85 && apart.is_none_or(|a| a <= SURE_APART) {
+            return Some(Found {
+                id: format!("https://www.deezer.com/track/{}", track.id),
+                title: track.title,
+                artist: track.artist,
+                seconds: Some(track.duration),
+            });
+        }
+    }
+    None
 }
 
 /// The downloads of the songs `picks` chose of `listing` (each its place in the list and the

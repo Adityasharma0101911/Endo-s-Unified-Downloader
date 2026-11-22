@@ -3161,7 +3161,7 @@ fn queue_listed(
 /// the tallest video), the container, subtitles, clips, SponsorBlock, and recording a live
 /// stream from its start (which "From now" cannot turn off when the Settings turn it on).
 fn choose_media(options: &mut DownloadOptions, choice: &ipc::MediaChoice) {
-    use media::MediaQualityPreset::{AudioM4a, AudioMp3, BestVideoAudio, Fhd1080p, Hd720p};
+    use media::MediaQualityPreset::{AudioFlac, AudioM4a, AudioMp3, BestVideoAudio, Fhd1080p, Hd720p};
     let preset = match choice.quality.as_deref() {
         None => None,
         Some("best") => Some(BestVideoAudio),
@@ -3169,6 +3169,7 @@ fn choose_media(options: &mut DownloadOptions, choice: &ipc::MediaChoice) {
         Some("720") => Some(Hd720p),
         Some("audio-m4a") => Some(AudioM4a),
         Some("audio-mp3") => Some(AudioMp3),
+        Some("audio-flac" | "flac") => Some(AudioFlac),
         // 2160, 1440, 480, 360 (see `ipc::MediaChoice::check`).
         Some(height) => {
             options.height = height.parse().ok();

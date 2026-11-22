@@ -1025,6 +1025,7 @@ pub fn parse_media_preset(s: &str) -> Result<MediaQualityPreset, String> {
         "720p" | "720" | "hd" => MediaQualityPreset::Hd720p,
         "mp3" => MediaQualityPreset::AudioMp3,
         "m4a" | "aac" => MediaQualityPreset::AudioM4a,
+        "flac" | "lossless" => MediaQualityPreset::AudioFlac,
         // A quality as --list-tracks names it, else a format selector of yt-dlp's own.
         _ => MediaPick::parse(s).map_or_else(|_| MediaQualityPreset::Custom(s.to_string()), MediaQualityPreset::Pick),
     })

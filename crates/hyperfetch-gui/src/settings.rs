@@ -12,12 +12,13 @@ use hyperfetch_core::{check_name_pattern, check_pattern, AudioSpec, TrackChoice}
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-pub const MEDIA_PRESETS: [&str; 5] = [
+pub const MEDIA_PRESETS: [&str; 6] = [
     "Best Available (Merged MP4)",
     "1080p FHD (Merged MP4)",
     "720p HD (Merged MP4)",
     "Audio Only (MP3)",
     "Audio Only (M4A)",
+    "Audio Only (FLAC Lossless)",
 ];
 
 /// What `Settings::sponsorblock` does with a YouTube video's SponsorBlock segments.
@@ -479,6 +480,7 @@ pub fn media_rule(picks: &BTreeMap<String, MediaPick>, preset: usize, url: &Url)
             2 => named("720p"),
             3 => named("mp3"),
             4 => named("m4a"),
+            5 => named("flac"),
             _ => MediaPick::default(),
         },
     }
@@ -560,6 +562,7 @@ impl Settings {
                 2 => MediaQualityPreset::Hd720p,
                 3 => MediaQualityPreset::AudioMp3,
                 4 => MediaQualityPreset::AudioM4a,
+                5 => MediaQualityPreset::AudioFlac,
                 _ => MediaQualityPreset::BestVideoAudio,
             },
         };

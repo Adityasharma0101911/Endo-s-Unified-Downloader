@@ -42,6 +42,8 @@ pub enum MediaQualityPreset {
     AudioMp3,
     /// Extract audio only as high quality M4A / AAC
     AudioM4a,
+    /// Extract audio as lossless FLAC (or download original lossless master)
+    AudioFlac,
     /// Custom yt-dlp format selector string
     Custom(String),
     /// A quality picked from what a link has, or kept for its site (see `quality::MediaPick`)
@@ -81,6 +83,13 @@ impl MediaQualityPreset {
                 "--audio-format".to_string(),
                 "m4a".to_string(),
             ],
+            Self::AudioFlac => vec![
+                "-f".to_string(),
+                "ba[acodec=flac]/ba/b".to_string(),
+                "-x".to_string(),
+                "--audio-format".to_string(),
+                "flac".to_string(),
+            ],
             Self::Custom(fmt) => vec![
                 "-f".to_string(),
                 fmt.clone(),
@@ -91,8 +100,8 @@ impl MediaQualityPreset {
 
     /// Whether yt-dlp converts the download to an audio file.
     fn extracts_audio(&self) -> bool {
-        use crate::quality::AudioForm::{M4a, Mp3};
-        matches!(self, Self::AudioMp3 | Self::AudioM4a) || matches!(self, Self::Pick(pick) if matches!(pick.audio, Some(Mp3 | M4a)))
+        use crate::quality::AudioForm::{Flac, M4a, Mp3};
+        matches!(self, Self::AudioMp3 | Self::AudioM4a | Self::AudioFlac) || matches!(self, Self::Pick(pick) if matches!(pick.audio, Some(Mp3 | M4a | Flac)))
     }
 }
 

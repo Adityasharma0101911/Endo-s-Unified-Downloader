@@ -684,7 +684,7 @@ fn quality_picker(app: &mut App, ui: &mut Ui) -> bool {
         let mut clicked = None;
         ui.horizontal_wrapped(|ui| {
             row(ui, "Audio");
-            for (name, form) in [("Original", AudioForm::Original), ("M4A", AudioForm::M4a), ("MP3", AudioForm::Mp3)] {
+            for (name, form) in [("Original", AudioForm::Original), ("M4A", AudioForm::M4a), ("MP3", AudioForm::Mp3), ("FLAC", AudioForm::Flac)] {
                 if ui.selectable_label(chosen.audio.unwrap_or(AudioForm::Original) == form, name).clicked() {
                     clicked = Some(MediaPick { audio: Some(form), language: chosen.language.clone(), ..Default::default() });
                 }
@@ -719,7 +719,7 @@ fn quality_picker(app: &mut App, ui: &mut Ui) -> bool {
     if !q.audio.is_empty() {
         ui.horizontal_wrapped(|ui| {
             row(ui, "Audio");
-            for (name, form) in [("Original", AudioForm::Original), ("M4A", AudioForm::M4a), ("MP3", AudioForm::Mp3)] {
+            for (name, form) in [("Original", AudioForm::Original), ("M4A", AudioForm::M4a), ("MP3", AudioForm::Mp3), ("FLAC", AudioForm::Flac)] {
                 let text = format!("{name} · {}", q.audio_text(form, language));
                 if ui.selectable_label(chosen.audio == Some(form), text).clicked() {
                     clicked = Some(MediaPick { audio: Some(form), language: chosen.language.clone(), ..Default::default() });
@@ -865,7 +865,7 @@ fn songs_card(app: &mut App, ui: &mut Ui) {
     let mut clicked = None;
     ui.horizontal_wrapped(|ui| {
         ui.add_sized([62.0, 22.0], egui::Label::new(bold("Audio").color(p.text)));
-        for (name, form) in [("Original", AudioForm::Original), ("M4A", AudioForm::M4a), ("MP3", AudioForm::Mp3)] {
+        for (name, form) in [("Original", AudioForm::Original), ("M4A", AudioForm::M4a), ("MP3", AudioForm::Mp3), ("FLAC", AudioForm::Flac)] {
             if ui.selectable_label(chosen.audio.unwrap_or(AudioForm::Original) == form, name).clicked() {
                 clicked = Some(MediaPick { audio: Some(form), language: chosen.language.clone(), ..Default::default() });
             }
@@ -1365,9 +1365,14 @@ mod tests {
         // An album: what it is, and its audio as a choice without sizes.
         let album = "https://music.youtube.com/playlist?list=OLAK5uy_sample";
         show(&mut h, album);
-        for text in ["An album of 3 songs by Sample Artist", "Original", "M4A", "MP3"] {
+        for text in ["An album of 3 songs by Sample Artist", "Original", "M4A", "MP3", "FLAC"] {
             assert!(shown(&h, text), "{text} in {:?}", h.texts());
         }
+        h.click("FLAC");
+        let mut options = hyperfetch_core::engine::DownloadOptions::default();
+        h.app.card_pick(&[Url::parse(album).unwrap()], &mut options);
+        assert_eq!(options.media_preset, Some(Pick(MediaPick { audio: Some(AudioForm::Flac), ..Default::default() })));
+        assert_eq!(h.app.settings.media_picks.get("music.youtube.com").and_then(|pick| pick.audio), Some(AudioForm::Flac));
         h.click("M4A");
         let mut options = hyperfetch_core::engine::DownloadOptions::default();
         h.app.card_pick(&[Url::parse(album).unwrap()], &mut options);

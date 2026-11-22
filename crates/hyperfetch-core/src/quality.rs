@@ -100,6 +100,8 @@ pub enum AudioForm {
     Original,
     Mp3,
     M4a,
+    /// Bit-perfect lossless FLAC or original master audio.
+    Flac,
 }
 
 /// A choice of quality: video up to a height, a codec first and HDR or not, or audio alone; in a
@@ -319,6 +321,10 @@ impl Qualities {
                 None => best.map_or_else(|| "converted".to_string(), |a| format!("converted from {}", a.codec)),
             },
             AudioForm::Mp3 => best.map_or_else(|| "converted".to_string(), |a| format!("converted from {}", a.codec)),
+            AudioForm::Flac => match self.audio.iter().find(|a| a.codec == "FLAC" && language.is_none_or(|l| a.language.as_deref() == Some(l))) {
+                Some(flac) => format!("{}, not converted", said(flac)),
+                None => best.map_or_else(|| "FLAC (lossless)".to_string(), |a| format!("FLAC (lossless) / from {}", a.codec)),
+            },
         }
     }
 
@@ -381,7 +387,7 @@ impl Qualities {
             }
         }
         if !self.audio.is_empty() {
-            for (name, form) in [("original", AudioForm::Original), ("m4a", AudioForm::M4a), ("mp3", AudioForm::Mp3)] {
+            for (name, form) in [("original", AudioForm::Original), ("m4a", AudioForm::M4a), ("mp3", AudioForm::Mp3), ("flac", AudioForm::Flac)] {
                 lines.push(format!("  {name:<18}{}", self.audio_text(form, None)));
             }
         }
@@ -408,8 +414,9 @@ impl MediaPick {
             "original" | "audio" => pick.audio = Some(AudioForm::Original),
             "mp3" => pick.audio = Some(AudioForm::Mp3),
             "m4a" => pick.audio = Some(AudioForm::M4a),
+            "flac" => pick.audio = Some(AudioForm::Flac),
             "best" => {}
-            height => pick.up_to = Some(height.strip_suffix('p').and_then(|n| n.parse().ok()).ok_or_else(|| format!("{height} is no quality: best, 1080p, original, mp3 or m4a"))?),
+            height => pick.up_to = Some(height.strip_suffix('p').and_then(|n| n.parse().ok()).ok_or_else(|| format!("{height} is no quality: best, 1080p, original, mp3, m4a or flac"))?),
         }
         for part in parts {
             let codec = match part.as_str() {
@@ -461,6 +468,7 @@ impl MediaPick {
             Some(AudioForm::Original) => "Audio as the site has it".to_string(),
             Some(AudioForm::Mp3) => "Audio as MP3".to_string(),
             Some(AudioForm::M4a) => "Audio as M4A".to_string(),
+            Some(AudioForm::Flac) => "Audio as FLAC (Lossless)".to_string(),
             None => {
                 let mut what = self.up_to.map_or_else(|| "The best video".to_string(), |n| format!("Up to {n}p"));
                 if let Some(codec) = &self.codec {
@@ -499,11 +507,22 @@ impl MediaPick {
         match self.audio {
             Some(form) => {
                 let aac = form == AudioForm::M4a;
-                let wanted = [aac.then(|| format!("ba[acodec^=mp4a]{language}")), Some(format!("ba{language}")), aac.then(|| "ba[acodec^=mp4a]".to_string())];
+                let flac = form == AudioForm::Flac;
+                let wanted = [
+                    aac.then(|| format!("ba[acodec^=mp4a]{language}")),
+                    flac.then(|| format!("ba[acodec=flac]{language}")),
+                    Some(format!("ba{language}")),
+                    aac.then(|| "ba[acodec^=mp4a]".to_string()),
+                    flac.then(|| "ba[acodec=flac]".to_string()),
+                ];
                 let rest = wanted.into_iter().flatten().chain(["ba".to_string(), "b".to_string()]).collect();
                 args.extend(["-f".to_string(), selector(rest)]);
                 if form != AudioForm::Original {
-                    let format = if aac { "m4a" } else { "mp3" };
+                    let format = match form {
+                        AudioForm::M4a => "m4a",
+                        AudioForm::Flac => "flac",
+                        _ => "mp3",
+                    };
                     args.extend(["-x", "--audio-format", format].map(String::from));
                 }
             }
@@ -537,6 +556,7 @@ impl fmt::Display for MediaPick {
             Some(AudioForm::Original) => f.write_str("original")?,
             Some(AudioForm::Mp3) => f.write_str("mp3")?,
             Some(AudioForm::M4a) => f.write_str("m4a")?,
+            Some(AudioForm::Flac) => f.write_str("flac")?,
             None => {
                 match self.up_to {
                     Some(n) => write!(f, "{n}p")?,
@@ -731,6 +751,14 @@ mod tests {
         let lines = Qualities::of(&listing("4k60")).unwrap().lines();
         assert_eq!(lines[0], "  2160p:av1         AV1 · 60 fps · 689.2 MiB");
         assert!(lines.contains(&"  1080p:h264        H.264 · 60 fps · 255.4 MiB".to_string()), "{lines:#?}");
-        assert_eq!(lines[lines.len() - 3..], ["  original          Opus 129 kbps · 9.7 MiB", "  m4a               AAC 129 kbps, not converted", "  mp3               converted from Opus"]);
+        assert_eq!(
+            lines[lines.len() - 4..],
+            [
+                "  original          Opus 129 kbps · 9.7 MiB",
+                "  m4a               AAC 129 kbps, not converted",
+                "  mp3               converted from Opus",
+                "  flac              FLAC (lossless) / from Opus"
+            ]
+        );
     }
 }

@@ -29,6 +29,7 @@ futures-util = "0.3"
 base64 = "0.22"
 aes = "0.8"
 cbc = "0.1"
+blowfish = "0.9"
 percent-encoding = "2.3"
 ring = "0.17"
 # Unpacks the files picked out of a remote ZIP as they arrive (zipdir.rs); already built for png.
