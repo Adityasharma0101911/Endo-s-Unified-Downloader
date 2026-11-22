@@ -849,6 +849,21 @@ impl HostResolver for AnnaArchiveResolver {
     }
 
     async fn resolve(&self, client: &Client, url: &Url) -> Result<Vec<Url>, ResolverError> {
+        // If the URL is already a direct book/document file, return it immediately
+        let path = url.path().to_ascii_lowercase();
+        if path.ends_with(".pdf")
+            || path.ends_with(".epub")
+            || path.ends_with(".mobi")
+            || path.ends_with(".azw3")
+            || path.ends_with(".djvu")
+            || path.ends_with(".cbr")
+            || path.ends_with(".cbz")
+            || path.ends_with(".zip")
+            || path.ends_with(".rar")
+        {
+            return Ok(vec![url.clone()]);
+        }
+
         let (cookie_header, user_agent) = extract_browser_cookies_for_domain(url.host_str().unwrap_or(""));
 
         let mut candidates = Vec::new();
@@ -866,45 +881,32 @@ impl HostResolver for AnnaArchiveResolver {
                 candidates.push(fast_url);
             }
 
-            // 1b. Fetch book metadata page (/md5/<MD5>) to find IPFS CIDs and external mirrors, trying mirror domains
-            let mut hosts_to_try = vec![host];
-            for alt in ["annas-archive.gd", "annas-archive.pk", "annas-archive.se", "annas-archive.pm", "annas-archive.org"] {
-                if !alt.eq_ignore_ascii_case(host) {
-                    hosts_to_try.push(alt);
-                }
-            }
-
-            for try_host in hosts_to_try {
-                let book_url_str = format!("{}://{}/md5/{}", url.scheme(), try_host, md5_hash);
-                if let Ok(book_url) = Url::parse(&book_url_str) {
-                    match Self::resolve_book_page(client, &book_url, cookie_header.as_deref(), user_agent.as_deref()).await {
-                        Ok(book_candidates) => {
-                            for c in book_candidates {
-                                if !candidates.contains(&c) {
-                                    candidates.push(c);
-                                }
-                            }
-                            if !candidates.is_empty() {
-                                break;
+            // 1b. Fetch book metadata page (/md5/<MD5>) to find IPFS CIDs and external mirrors
+            let book_url_str = format!("{}://{}/md5/{}", url.scheme(), host, md5_hash);
+            if let Ok(book_url) = Url::parse(&book_url_str) {
+                match tokio::time::timeout(Duration::from_millis(3000), Self::resolve_book_page(client, &book_url, cookie_header.as_deref(), user_agent.as_deref())).await {
+                    Ok(Ok(book_candidates)) => {
+                        for c in book_candidates {
+                            if !candidates.contains(&c) {
+                                candidates.push(c);
                             }
                         }
-                        Err(ResolverError::BrowserClearanceRequired { host: h, url: u, message: m }) => {
-                            if clearance_err.is_none() {
-                                clearance_err = Some(ResolverError::BrowserClearanceRequired { host: h, url: u, message: m });
-                            }
-                        }
-                        _ => {}
                     }
+                    Ok(Err(ResolverError::BrowserClearanceRequired { host: h, url: u, message: m })) => {
+                        clearance_err = Some(ResolverError::BrowserClearanceRequired { host: h, url: u, message: m });
+                    }
+                    _ => {}
                 }
             }
 
-            // 1c. If candidates are still empty, try resolving the MD5 directly against LibGen / library.lol
+            // 1c. If candidates are still empty (e.g. Anna's Archive blocked by DDoS-Guard / Cloudflare),
+            // resolve the MD5 directly against LibGen / library.lol to pull high-speed CDNs and IPFS gateways.
             if candidates.is_empty() {
-                let libgen_endpoints = ["https://library.lol/main/", "https://libgen.is/get.php?md5=", "https://libgen.li/ads.php?md5="];
+                let libgen_endpoints = ["https://libgen.li/ads.php?md5=", "https://library.lol/main/", "https://libgen.is/get.php?md5="];
                 for base in libgen_endpoints {
                     if let Ok(target) = Url::parse(&format!("{base}{md5_hash}")) {
                         if LibGenResolver.can_handle(&target) {
-                            if let Ok(Ok(resolved)) = tokio::time::timeout(Duration::from_secs(5), LibGenResolver.resolve(client, &target)).await {
+                            if let Ok(Ok(resolved)) = tokio::time::timeout(Duration::from_millis(4000), LibGenResolver.resolve(client, &target)).await {
                                 for c in resolved {
                                     if !candidates.contains(&c) {
                                         candidates.push(c);
